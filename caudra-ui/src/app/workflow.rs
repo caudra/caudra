@@ -21,6 +21,7 @@ use tracing::{debug, warn};
 use crate::app::App;
 use crate::components::Action;
 use crate::components::command::CommandAction;
+use crate::components::document_view::COPIED_SELECTION;
 use crate::components::logs_modal::LogsAction;
 use crate::components::workflow_catalog_picker::WorkflowCatalogAction;
 use crate::components::workflow_inspector::{InspectorAction, RunControl};
@@ -672,6 +673,15 @@ impl App {
             InspectorAction::Copy { text, label } => {
                 self.handle_logs_action(LogsAction::Copy { text, label });
             }
+            InspectorAction::Cut { text, inspect } => {
+                self.handle_logs_action(LogsAction::Copy {
+                    text,
+                    label: COPIED_SELECTION,
+                });
+                if let Some(run_id) = inspect {
+                    self.inspect_workflow(run_id);
+                }
+            }
             InspectorAction::Flash(message) => self.flash(message.into()),
         }
         Vec::new()
@@ -683,6 +693,10 @@ impl App {
     ) -> Vec<Action> {
         match action {
             WorkflowCatalogAction::Consumed | WorkflowCatalogAction::Close => Vec::new(),
+            WorkflowCatalogAction::Copy(text) => {
+                self.copy_to_clipboard(&text);
+                Vec::new()
+            }
             WorkflowCatalogAction::Launch(name) => self
                 .handle_command_action(CommandAction::Complete(format!("/workflow {name} ")))
                 .unwrap_or_default(),

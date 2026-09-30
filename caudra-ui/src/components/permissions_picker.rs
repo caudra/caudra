@@ -12,6 +12,7 @@ use caudra_storage::permission_patterns::{
     ArgumentDomain, ObservedTuple, OptionLikePolicy, PatternDefinition, PatternToken,
     SlotCombinations, SlotId,
 };
+use caudra_workbench::keys::{LIST_FIRST, LIST_LAST};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
@@ -101,6 +102,7 @@ pub(crate) enum PermissionsPickerAction {
     CancelDiscovery,
     Editor(EditorEvent),
     EditSource(VerifiedLocalSourceLocator),
+    Copy(String),
 }
 
 pub(crate) enum DiscoveryState {
@@ -682,17 +684,12 @@ impl PermissionsPicker {
             }
             return PermissionsPickerAction::Consumed;
         }
-        if matches!(
+        let moves_list = matches!(
             key.code,
-            KeyCode::Up
-                | KeyCode::Down
-                | KeyCode::PageUp
-                | KeyCode::PageDown
-                | KeyCode::Home
-                | KeyCode::End
-        ) && self.discovery_view
-            && self.picker.selected_item().is_some()
-        {
+            KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown
+        ) || LIST_FIRST.matches(key)
+            || LIST_LAST.matches(key);
+        if moves_list && self.discovery_view && self.picker.selected_item().is_some() {
             self.discovery_view = false;
             self.detail.scroll.reset();
         }
@@ -1289,6 +1286,7 @@ impl PermissionsPicker {
             }
             PickerAction::Close => PermissionsPickerAction::Close,
             PickerAction::Key(key) => self.handle_key(key),
+            PickerAction::Copy(text) => PermissionsPickerAction::Copy(text),
         }
     }
 

@@ -29,7 +29,6 @@ pub mod sandbox;
 mod selection;
 pub mod splash;
 mod storage_writer;
-mod text_buffer;
 mod theme;
 pub use theme::{BUNDLED_THEMES, DEFAULT_THEME, THEME_PAIRS};
 mod tty_query;

@@ -95,6 +95,7 @@ impl App {
                     runtime.shells().load_output(&id);
                 }
             }
+            ShellModalAction::Copy(text) => self.copy_to_clipboard(&text),
         }
         Vec::new()
     }

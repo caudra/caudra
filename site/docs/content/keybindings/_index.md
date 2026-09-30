@@ -15,7 +15,7 @@ Leader chords are written as two keys below, and every one of them is reachable 
 
 `PageUp`, `PageDown`, `Home`, and `End` act on whatever holds the keyboard. While you are typing they belong to the composer, so `Home` and `End` move the text cursor and the page keys scroll a draft too tall to fit. When the draft fits, a page key scrolls the transcript and hands it the focus, so `Home` and `End` then reach the top and bottom of the chat.
 
-Typing anything takes the focus back, and so does `Esc`. Clicking the transcript gives it the focus, and clicking the composer returns it. The wheel scrolls whatever the pointer is over and leaves the focus where it is. `Ctrl+U`, `Ctrl+Y`, `Ctrl+E`, `Ctrl+G`, and `Ctrl+B` scroll the transcript wherever the focus sits, and an open modal claims all four navigation keys for itself.
+Typing anything takes the focus back, and so does `Esc`. Clicking the transcript gives it the focus, and clicking the composer returns it. The wheel scrolls whatever the pointer is over and leaves the focus where it is. `Ctrl+U`, `Ctrl+G`, and `Ctrl+B` scroll the transcript wherever the focus sits, and an open modal claims all four navigation keys for itself.
 
 Anywhere a scrollbar is shown it can be dragged. Press the thumb and the surface follows the pointer, press the track anywhere else and the thumb jumps there and stays held. Hold `Alt` while dragging to cover an eighth of the distance, which is what makes a long transcript landable. Dragging the transcript bar shows which message the thumb is on.
 
@@ -48,7 +48,6 @@ Holding `Alt` while turning the wheel scrolls four times as far. A middle-click 
 | `Ctrl+X s` | Stash the current prompt |
 | `Ctrl+X p` | Restore the newest stashed prompt |
 | `Ctrl+X m` | Model picker |
-| `Ctrl+Z` | Suspend process (Unix only) |
 | `Shift+Left` / `Shift+Right` | Pan a modal too wide for the screen left / right |
 | `Ctrl+X w` | Open the workbench |
 
@@ -57,38 +56,48 @@ Holding `Alt` while turning the wheel scrolls four times as far. A middle-click 
 | Key | Action |
 |-----|--------|
 | `Enter` | Submit prompt |
-| `Shift+Enter` / `Ctrl+Enter` / `Ctrl+J` | Newline |
 | `Tab` | Toggle BUILD/PLAN mode |
 | `Ctrl+T` / `Shift+Tab` | Cycle reasoning effort |
 | `/command` | Open command palette |
-| `Ctrl+W` / `Ctrl+Backspace` | Delete the word or path component before the cursor |
-| `Ctrl+←` / `Ctrl+→` | Move word left / right |
-| `Ctrl+Del` | Delete the word or path component after the cursor |
-| `Ctrl+K` | Delete to end of line |
-| `Ctrl+A` | Select the whole draft |
-| `Ctrl+C` | Copy selection (clears the draft when nothing is selected) |
-| `Shift+Delete` | Cut selection |
-| `Ctrl+Z` / `Ctrl+Y` | Undo / redo the draft |
 | `Home` / `End` | Start / end of line or transcript |
 | `PageUp` / `PageDown` | Page the draft or the transcript |
 | `Ctrl+U` | Scroll half page up |
 | `Shift+Left` / `Shift+Right` | Pan a wide diagram left / right |
-| `Ctrl+E` | Jump to end of line |
 | `Ctrl+G` | Scroll to top |
 | `Ctrl+B` | Scroll to bottom |
 | `Ctrl+Q` / `Ctrl+X q` | Pop queue |
 | `Esc Esc` | Rewind |
 | `Ctrl+X e` | Edit the prompt in the workbench |
 
+## Text Fields
+
+These keys work the same in every text field: the composer, a picker's filter, forms and prompts, `/btw`, and the workbench editor with its fields. Where a surface binds one of them itself, the surface wins. `/btw` keeps `Ctrl+Y` to copy the answer, and the permissions picker keeps `Ctrl+E` to edit and `Ctrl+K` to revoke. In a list, `Home` and `End` move the cursor in its filter, and `Ctrl+Home` and `Ctrl+End` pick the first and last item.
+
+`Ctrl+Z` is undo everywhere, so it never suspends Caudra. A masked field, such as an API key, refuses to select all, copy, or cut. A terminal paste goes to the field that has focus. `Super` chords need a terminal that reports them, such as one with the kitty keyboard protocol.
+
+| Key | Action |
+|-----|--------|
+| `Ctrl+W` / `Ctrl+Backspace` | Delete the word or path component before the cursor, or the selection |
+| `Ctrl+Delete` | Delete the word or path component after the cursor, or the selection |
+| `Ctrl+K` | Delete to the end of the line, or join the next line at its end |
+| `Super+Backspace` | Delete to the start of the line |
+| `Ctrl+A` | Select all |
+| `Ctrl+Z` / `Ctrl+Y` | Undo / redo |
+| `Ctrl+C` | Copy the selection, or run the surface's own action when nothing is selected |
+| `Shift+Delete` | Cut the selection |
+| `Ctrl+←` / `Ctrl+→` | Move by word |
+| `Home` / `Super+←` | First character of the line, then column zero |
+| `End` / `Ctrl+E` / `Super+→` | End of the line |
+| `Ctrl+Home` / `Ctrl+End` | Start / end of the text |
+| `Shift+move` | Extend the selection with any move above |
+| `Shift+Enter` / `Ctrl+Enter` / `Ctrl+J` | Newline, in a field that takes more than one line |
+
 ## Pasted Text
 
 | Key | Action |
 |-----|--------|
 | `Enter` | Insert newline |
-| `Ctrl+A` | Select the whole text |
-| `Ctrl+C` / `Shift+Delete` / `Ctrl+V` | Copy, cut or paste the selection |
-| `Ctrl+Z` / `Ctrl+Y` | Undo or redo an edit |
-| `Ctrl+W` / `Ctrl+Backspace` | Delete the word or path component before the cursor |
+| `Ctrl+V` | Put back what this editor last copied or cut |
 | `Ctrl+S` | Save pasted text |
 | `Esc` | Cancel editing |
 
@@ -100,7 +109,6 @@ Holding `Alt` while turning the wheel scrolls four times as far. A middle-click 
 | `Shift+↑` / `Shift+↓` / `Shift+←` / `Shift+→` | Select part of the passage |
 | `Ctrl+A` | Select the whole passage |
 | `Ctrl+C` | Copy the selection |
-| `Ctrl+W` / `Ctrl+Backspace` | Delete the word or path component before the cursor |
 | `Enter` | Write a note on the selection |
 | `e` / `d` | Edit or delete the note under the cursor |
 | `n` / `p` | Jump between notes |
@@ -133,7 +141,7 @@ Holding `Alt` while turning the wheel scrolls four times as far. A middle-click 
 | `Esc` | Close |
 | `Type` | Filter |
 | `PageUp` / `PageDown` | Scroll page up / down |
-| `Home` / `End` | First / last item |
+| `Ctrl+Home` / `Ctrl+End` | First / last item |
 | `Ctrl+U` | Scroll page up |
 
 ## Docs
@@ -171,7 +179,6 @@ These keys exist only with `sandboxes = true` under `[experimental]`. See [Exper
 | `g` / `t` | Browse and edit reusable Network or Transfer policies from Profiles |
 | `i` / `x` | Import a strict configuration draft or preview a reference-only export |
 | `c` / `r` / `a` | Compare baseline/draft/external file, reload, or save as a new private file |
-| `Ctrl+Z` / `Ctrl+Y` | Undo/redo sandbox field text; paste and mouse selection use the shared editor |
 | `a` / `u` / `p` / `e` | Instances: review Attach, Resume, Pause or Extend |
 | `v` / `r` / `z` | Profiles: Create VM; Instances: Reconcile or explicitly Cancel create |
 | `h` / `k` | Doctor; Providers: edit lifecycle credential in its purpose store |
@@ -245,14 +252,10 @@ Some pickers add extra bindings on top of the defaults:
 | Workbench Explorer | `C` | Fold the tree back to its top level |
 | Workbench Editor | `Ctrl+S` | Save the active file |
 | Workbench Editor | `Ctrl+R` | Discard edits and take what is on disk |
-| Workbench Editor | `Ctrl+Z` / `Ctrl+Y` | Undo / redo |
 | Workbench Editor | `Ctrl+F` / `Ctrl+G` | Find in file / go to line |
 | Workbench Editor | `F3` / `Shift+F3` | Next / previous match, with or without the find bar |
-| Workbench Editor | `Ctrl+C` / `Ctrl+V` | Copy / paste |
-| Workbench Editor | `Shift+Delete` / `Ctrl+X x` | Cut the selection |
-| Workbench Editor | `Ctrl+A` | Select the whole buffer |
-| Workbench Editor | `Ctrl+K` | Delete to the end of the line |
-| Workbench Editor | `Ctrl+W` / `Ctrl+Backspace` | Delete the word or path component before the cursor |
+| Workbench Editor | `Ctrl+V` | Put back what the workbench last copied or cut |
+| Workbench Editor | `Ctrl+X x` | Cut the selection |
 | Workbench Editor | `Ctrl+X z` | Wrap long lines onto more rows |
 | Workbench Editor | `Ctrl+PageUp` / `Ctrl+PageDown` | Previous / next tab |
 | Workbench Editor | `Ctrl+X k` | Close the active tab |
@@ -307,10 +310,9 @@ With [Lua plugins](/docs/configuration/#experimental-features) turned on, plugin
 
 Precedence, high to low:
 
-1. **Suspend** (`Ctrl+Z`, Unix). Always wins, non-remappable.
-2. **Modal and overlay keys.** An open modal or picker consumes its keys first, so they cannot be shadowed while open.
-3. **Lua overrides** from `caudra.keymap.set`. Last set wins; binding the same key twice warns.
-4. **Built-in defaults.** An override on the same key shadows them; `caudra.keymap.del` lifts the override so the default returns. Suspend is the only binding outside this layer, so every key is remappable except `Ctrl+Z`.
+1. **Modal and overlay keys.** An open modal or picker consumes its keys first, so they cannot be shadowed while open.
+2. **Lua overrides** from `caudra.keymap.set`. Last set wins, and binding the same key twice warns.
+3. **Built-in defaults.** An override on the same key shadows them, and `caudra.keymap.del` lifts the override so the default returns. Every built-in key can be remapped this way.
 
 Only single-key bindings can be overridden. Multi-key combinations and non-key rows (like `Type` to filter) cannot.
 

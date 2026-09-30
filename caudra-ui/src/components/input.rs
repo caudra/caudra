@@ -5,8 +5,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::app::shell::parse_shell_prefix;
 use crate::components::keybindings::leader;
 use crate::highlight;
-use crate::input_document::{InputDocument, InputDraft, PasteId, should_summarize_paste};
-use crate::text_buffer::{EditResult, TextBuffer, is_newline_key};
+use crate::input_document::{
+    InputDocument, InputDraft, PasteId, char_to_byte, should_summarize_paste,
+};
 use crate::theme;
 
 use caudra_agent::PromptAdmission;
@@ -15,6 +16,7 @@ use caudra_agent::mentions::{self, Mention};
 use caudra_grab::grab_scope;
 use caudra_storage::input_history::InputHistory;
 use caudra_workbench::buffer::Cursor;
+use caudra_workbench::text_field::is_newline_key;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use std::mem;
 use std::ops::Range;
@@ -29,14 +31,13 @@ use ratatui::widgets::{Block, Paragraph};
 
 use super::commit_popup::CommitIndex;
 use super::scrollbar::{Scrollbar, ScrollbarMouse};
-use super::{apply_scroll_delta, hover_style};
+use super::{SELECTION, apply_scroll_delta, hover_style};
 
 #[cfg(test)]
 const CHEVRON: &str = super::CHEVRON;
 const NEWLINE_PAD: &str = "  ";
 const PREFIX_WIDTH: u16 = 2;
 const SPACE: char = ' ';
-const SELECTION: Style = Style::new().add_modifier(Modifier::REVERSED);
 const COMPOSER_RAIL_WIDTH: u16 = 1;
 const COMPOSER_VERTICAL_PADDING: u16 = 1;
 const ADMISSION_SEPARATOR: &str = "  ";
@@ -236,7 +237,7 @@ impl InputBox {
                 return InputAction::None;
             }
             KeyCode::Tab | KeyCode::Esc => return InputAction::Passthrough(key),
-            _ if is_newline_key(&key) => {
+            _ if is_newline_key(key) => {
                 self.buffer.add_line();
                 return InputAction::ContinueLine;
             }
@@ -256,9 +257,9 @@ impl InputBox {
             _ => {}
         }
 
-        match self.buffer.handle_key(key) {
-            EditResult::Changed => InputAction::PaletteSync(self.buffer.palette_text()),
-            EditResult::Moved | EditResult::Ignored => InputAction::None,
+        match self.buffer.handle_key(key).changed() {
+            true => InputAction::PaletteSync(self.buffer.palette_text()),
+            false => InputAction::None,
         }
     }
 
@@ -282,7 +283,7 @@ impl InputBox {
     /// "read /tmp/x"). This adds spaces around the paste only when needed.
     pub fn handle_paste_with_spaces(&mut self, text: &str) -> InputAction {
         let line = &self.buffer.lines()[self.buffer.y()];
-        let bx = TextBuffer::char_to_byte(line, self.buffer.x());
+        let bx = char_to_byte(line, self.buffer.x());
 
         let char_before = line[..bx].chars().next_back();
         let char_after = line[bx..].chars().next();
@@ -406,7 +407,7 @@ impl InputBox {
         if x == 0 {
             return false;
         }
-        let byte_idx = TextBuffer::char_to_byte(line, x - 1);
+        let byte_idx = char_to_byte(line, x - 1);
         line.as_bytes()[byte_idx] == b'\\'
     }
 
@@ -662,7 +663,17 @@ impl InputBox {
                         true => shell_spans,
                         false => Some(token_spans(line, &tokens)),
                     };
-                    if let Some(range) = self.buffer.selection_on_line(i) {
+                    // The caret keeps a cell of its own: under the selection's
+                    // reversal it would reverse back into plain text.
+                    if let Some(range) = self
+                        .buffer
+                        .selection_on_line(i)
+                        .map(|range| {
+                            let caret = is_cursor_line && range.start == cursor_x;
+                            range.start + usize::from(caret)..range.end
+                        })
+                        .filter(|range| !range.is_empty())
+                    {
                         let spans = styled_spans.unwrap_or_else(|| vec![Span::raw(line.clone())]);
                         styled_spans = Some(apply_selection(spans, &range));
                     }
@@ -895,7 +906,10 @@ impl InputBox {
 
 fn cursor_on_first_char(text: &'static str, base: Style, focused: bool) -> [Span<'static>; 2] {
     let (first, rest) = text.split_at(text.chars().next().map_or(0, char::len_utf8));
-    let cursor = if focused { base.reversed() } else { base };
+    let cursor = match focused {
+        true => base.patch(theme::current().cursor),
+        false => base,
+    };
     [Span::styled(first, cursor), Span::styled(rest, base)]
 }
 
@@ -1219,6 +1233,7 @@ pub(crate) fn apply_selection(
 }
 
 fn overlay_cursor(spans: Vec<Span<'static>>, cursor_char_pos: usize) -> Vec<Span<'static>> {
+    let caret = theme::current().cursor;
     let mut result = Vec::new();
     let mut pos = 0;
     let mut cursor_placed = false;
@@ -1226,7 +1241,7 @@ fn overlay_cursor(spans: Vec<Span<'static>>, cursor_char_pos: usize) -> Vec<Span
         let span_len = span.content.chars().count();
         if !cursor_placed && cursor_char_pos >= pos && cursor_char_pos < pos + span_len {
             let local = cursor_char_pos - pos;
-            let byte_pos = TextBuffer::char_to_byte(&span.content, local);
+            let byte_pos = char_to_byte(&span.content, local);
             let (before, after) = span.content.split_at(byte_pos);
             if !before.is_empty() {
                 result.push(Span::styled(before.to_string(), span.style));
@@ -1235,7 +1250,10 @@ fn overlay_cursor(spans: Vec<Span<'static>>, cursor_char_pos: usize) -> Vec<Span
             let Some(cursor_char) = cs.next() else {
                 break;
             };
-            result.push(Span::styled(cursor_char.to_string(), span.style.reversed()));
+            result.push(Span::styled(
+                cursor_char.to_string(),
+                span.style.patch(caret),
+            ));
             let rest: String = cs.collect();
             if !rest.is_empty() {
                 result.push(Span::styled(rest.to_string(), span.style));
@@ -1247,7 +1265,7 @@ fn overlay_cursor(spans: Vec<Span<'static>>, cursor_char_pos: usize) -> Vec<Span
         pos += span_len;
     }
     if !cursor_placed {
-        result.push(Span::styled(" ", Style::new().reversed()));
+        result.push(Span::styled(" ", caret));
     }
     result
 }
@@ -1340,6 +1358,9 @@ mod tests {
     const NOT_HOVERED: &str = "the pointer sat on the token without the composer noticing";
     const TOKEN_UNMARKED: &str = "the token under the pointer was drawn unmarked";
     const PROSE_MARKED: &str = "hover reached text outside the token";
+    const CARET_UNPAINTED: &str = "the caret was not drawn in the theme's cursor colours";
+    const SELECTION_UNMARKED: &str = "the selected text was drawn unmarked";
+    const EDIT_NOT_UNDONE: &str = "Ctrl+Z left the last edit in the draft";
 
     fn type_text(input: &mut InputBox, text: &str) {
         for c in text.chars() {
@@ -1727,6 +1748,48 @@ mod tests {
             !reversed(buffer, mention_x - 1, content.y),
             "{PROSE_MARKED}"
         );
+    }
+
+    /// A caret at the start of a selection keeps the cursor colours rather
+    /// than reversing back into plain text under the selection.
+    #[test]
+    fn the_caret_keeps_its_own_cell_inside_a_selection() {
+        let area = Rect::new(0, 0, 60, 3);
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        type_text(&mut input, "abc");
+        input.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::SHIFT));
+        let content = content_area(area);
+        let first_x = content.x + PREFIX_WIDTH;
+
+        let terminal = render_input_with(&mut input, area.width, area.height, Placeholder::Blank);
+        let buffer = terminal.backend().buffer();
+        let caret = buffer.cell((first_x, content.y)).unwrap();
+        assert_eq!(
+            Some(caret.bg),
+            theme::current().cursor.bg,
+            "{CARET_UNPAINTED}"
+        );
+        assert!(!reversed(buffer, first_x, content.y), "{CARET_UNPAINTED}");
+        assert!(
+            reversed(buffer, first_x + 1, content.y),
+            "{SELECTION_UNMARKED}"
+        );
+    }
+
+    #[test]
+    fn ctrl_z_undoes_the_last_edit() {
+        const DRAFT: &str = "read src";
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        type_text(&mut input, DRAFT);
+        input.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+
+        let action = input.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+
+        assert!(
+            matches!(action, InputAction::PaletteSync(ref text) if text == DRAFT),
+            "{EDIT_NOT_UNDONE}"
+        );
+        assert_eq!(input.buffer.display_text(), DRAFT, "{EDIT_NOT_UNDONE}");
     }
 
     fn reversed(buffer: &ratatui::buffer::Buffer, x: u16, y: u16) -> bool {

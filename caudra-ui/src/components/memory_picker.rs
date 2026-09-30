@@ -25,6 +25,7 @@ pub enum MemoryPickerAction {
     Open(String),
     Delete(String),
     Closed,
+    Copy(String),
 }
 
 struct MemoryItem {
@@ -166,6 +167,7 @@ impl MemoryPicker {
                 MemoryPickerAction::Closed
             }
             PickerAction::Key(key) => self.handle_key(key),
+            PickerAction::Copy(text) => MemoryPickerAction::Copy(text),
         }
     }
 }

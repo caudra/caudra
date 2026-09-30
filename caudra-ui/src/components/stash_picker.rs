@@ -22,6 +22,7 @@ pub enum StashPickerAction {
     Restore(Box<StashEntry>),
     Delete(String),
     Closed,
+    Copy(String),
 }
 
 struct StashItem {
@@ -155,6 +156,7 @@ impl StashPicker {
                 StashPickerAction::Closed
             }
             PickerAction::Key(key) => self.handle_key(key),
+            PickerAction::Copy(text) => StashPickerAction::Copy(text),
         }
     }
 }

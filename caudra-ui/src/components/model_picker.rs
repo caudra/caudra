@@ -66,6 +66,7 @@ pub enum ModelPickerAction {
     Bind(ModelPurpose, Binding),
     Unbind(ModelPurpose),
     Close,
+    Copy(String),
 }
 
 struct ModelEntry {
@@ -512,6 +513,7 @@ impl ModelPicker {
             PickerAction::Close => ModelPickerAction::Close,
             PickerAction::Toggle(..) => ModelPickerAction::Consumed,
             PickerAction::Key(key) => self.handle_key_inner(key),
+            PickerAction::Copy(text) => ModelPickerAction::Copy(text),
         }
     }
 

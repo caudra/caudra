@@ -18,9 +18,9 @@ use super::{
 };
 use crate::chrome::ELLIPSIS;
 use crate::view::{
-    CARET, COLLAPSED_MARK, ENTER_LABEL, EXPANDED_MARK, GUIDE, HINT_GAP, LEAF_INDENT, TAB_GAP,
-    emphasize, emphasized, hints, indent_guides, line_at, paint_tab, placeholder, scroll_column,
-    truncate,
+    COLLAPSED_MARK, ENTER_LABEL, EXPANDED_MARK, GUIDE, HINT_GAP, LEAF_INDENT, TAB_GAP, emphasize,
+    emphasized, hints, indent_guides, labelled_field, line_at, paint_tab, placeholder,
+    scroll_column, truncate,
 };
 use crate::{Workbench, WorkbenchStyles, chrome, keys};
 
@@ -323,16 +323,14 @@ impl Workbench {
             TransferSide::Local => LOCAL_PROMPT,
             TransferSide::Remote => SANDBOX_PROMPT,
         };
-        let caret = self.transfer.text_input_active();
-        let budget = usize::from(area.width).saturating_sub(label.width() + usize::from(caret));
-        let mut left = vec![
+        let left = labelled_field(
             Span::styled(label, styles.accent),
-            Span::styled(chrome::fit_end(&prompt.text, budget), styles.text),
-        ];
-        if caret {
-            left.push(Span::styled(CARET, styles.cursor));
-        }
-        let line = chrome::status_line(left, Vec::new(), area.width, styles.dim);
+            &prompt.text,
+            self.transfer.text_input_active(),
+            styles,
+            usize::from(area.width),
+        );
+        let line = chrome::status_line(left.spans, Vec::new(), area.width, styles.dim);
         chrome::render_line(buf, area, line);
     }
 

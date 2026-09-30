@@ -17,6 +17,7 @@ pub enum PromptProfilePickerAction {
     Consumed,
     Select(String),
     Closed,
+    Copy(String),
 }
 
 struct ProfileItem {
@@ -104,6 +105,7 @@ impl PromptProfilePicker {
             }
             PickerAction::Select(item) => PromptProfilePickerAction::Select(item.name),
             PickerAction::Close => PromptProfilePickerAction::Closed,
+            PickerAction::Copy(text) => PromptProfilePickerAction::Copy(text),
         }
     }
 }

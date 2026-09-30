@@ -18,6 +18,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::layout::Rect;
 
 use crate::editor::Tab;
+use crate::editor::text_field::{EditCommand, FieldKind, TextCommand, TextField, TextKey};
 use crate::scm::diff;
 use crate::{Drag, Focus, SCROLL_LINES, SidebarView, Workbench, WorkbenchAction, keys, taken};
 use tree::{
@@ -432,7 +433,7 @@ struct Visit {
 /// A root being typed. Nothing changes until it is confirmed.
 struct Prompt {
     side: TransferSide,
-    text: String,
+    text: TextField,
 }
 
 enum Notice {
@@ -834,7 +835,10 @@ impl TransferState {
             TransferSide::Local => self.roots.local.clone(),
             TransferSide::Remote => format!("{ROOT_SEPARATOR}{}", self.roots.remote),
         };
-        self.prompt = Some(Prompt { side, text });
+        self.prompt = Some(Prompt {
+            side,
+            text: TextField::with_text(FieldKind::Line, &text).limited_to(MAX_PATH_LENGTH),
+        });
     }
 
     /// Takes the typed root and compares under it. A typed root that cannot
@@ -846,9 +850,10 @@ impl TransferState {
             return WorkbenchAction::Consumed;
         };
         let mut roots = self.roots.clone();
+        let typed = prompt.text.text();
         *roots.side_mut(prompt.side) = match prompt.side {
-            TransferSide::Local => prompt.text.clone(),
-            TransferSide::Remote => prompt.text.trim_matches(ROOT_SEPARATOR).to_owned(),
+            TransferSide::Local => typed,
+            TransferSide::Remote => typed.trim_matches(ROOT_SEPARATOR).to_owned(),
         };
         roots.normalize();
         if let Some(problem) = root_problem(prompt.side, roots.side(prompt.side)) {
@@ -1137,22 +1142,24 @@ impl TransferState {
         if key.code == KeyCode::Enter {
             return self.apply_prompt();
         }
+        let Some(prompt) = &mut self.prompt else {
+            return WorkbenchAction::Consumed;
+        };
         if keys::CLEAR_ROOT.matches(key) {
-            if let Some(prompt) = &mut self.prompt {
-                prompt.text.clear();
-            }
-        } else if key.code == KeyCode::Backspace {
-            if let Some(prompt) = &mut self.prompt {
-                prompt.text.pop();
-            }
-        } else if let KeyCode::Char(ch) = key.code
-            && !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-        {
-            self.paste(ch.encode_utf8(&mut [0; 4]));
+            prompt.text.select_all();
+            prompt
+                .text
+                .perform(TextCommand::Edit(EditCommand::Delete), 1);
+            return WorkbenchAction::Consumed;
         }
-        WorkbenchAction::Consumed
+        match prompt.text.handle_key(key) {
+            TextKey::Copy(text) | TextKey::Cut(text) => WorkbenchAction::Copy(text),
+            TextKey::Refused => {
+                self.notice = Some(Notice::Error(INPUT_REJECTED.to_owned()));
+                WorkbenchAction::Consumed
+            }
+            TextKey::Changed | TextKey::Handled | TextKey::Ignored => WorkbenchAction::Consumed,
+        }
     }
 
     pub(crate) fn paste(&mut self, text: &str) {
@@ -1162,12 +1169,8 @@ impl TransferState {
         let Some(prompt) = &mut self.prompt else {
             return;
         };
-        if prompt.text.len().saturating_add(text.len()) > MAX_PATH_LENGTH
-            || text.chars().any(char::is_control)
-        {
+        if text.chars().any(char::is_control) || prompt.text.paste(text) == TextKey::Refused {
             self.notice = Some(Notice::Error(INPUT_REJECTED.to_owned()));
-        } else {
-            prompt.text.push_str(text);
         }
     }
 
@@ -1676,7 +1679,14 @@ impl Workbench {
                 false => self.transfer_switch(SidebarView::Explorer),
             };
         }
-        self.transfer.key(key)
+        if keys::PASTE.matches(key) {
+            self.transfer.paste(&self.clipboard);
+            return WorkbenchAction::Consumed;
+        }
+        match self.transfer.key(key) {
+            WorkbenchAction::Copy(text) => self.copy(text),
+            action => action,
+        }
     }
 
     pub(crate) fn transfer_mouse(&mut self, event: MouseEvent) -> WorkbenchAction {
@@ -1805,6 +1815,8 @@ mod tests {
     const CURSOR_LOST: &str =
         "the cursor must come back to the same path or the nearest folder still listed";
     const DRAFT_APPLIED: &str = "a root being typed must change nothing until it is confirmed";
+    const NOT_COPIED: &str = "a selected root must reach the host's clipboard and the workbench's";
+    const WRONG_DRAFT: &str = "copying must leave the draft alone and cutting must take it";
     const NO_TERMINAL: &str = "a test terminal";
     const NO_FRAME: &str = "a frame";
 
@@ -2046,11 +2058,8 @@ mod tests {
     }
 
     fn draft(workbench: &Workbench) -> Option<&str> {
-        workbench
-            .transfer
-            .prompt
-            .as_ref()
-            .map(|prompt| prompt.text.as_str())
+        let prompt = workbench.transfer.prompt.as_ref()?;
+        prompt.text.lines().first().map(String::as_str)
     }
 
     fn listed(paths: &[&str]) -> Vec<Row> {
@@ -2567,6 +2576,51 @@ mod tests {
                 skip_dotfiles: false,
             })
         );
+    }
+
+    #[test_case(keys::COPY, LOCAL_ROOT ; "copy keeps the draft")]
+    #[test_case(keys::CUT, "" ; "cut takes it")]
+    fn a_selected_root_leaves_for_both_clipboards(chord: keys::Bind, left: &str) {
+        let mut workbench = workbench();
+        compare(&mut workbench, project());
+        press(&mut workbench, keys::LOCAL_ROOT);
+        press(&mut workbench, keys::SELECT_ALL);
+
+        let copied = press(&mut workbench, chord);
+
+        assert_eq!(
+            copied,
+            WorkbenchAction::Copy(LOCAL_ROOT.to_owned()),
+            "{NOT_COPIED}"
+        );
+        assert_eq!(workbench.clipboard, LOCAL_ROOT, "{NOT_COPIED}");
+        assert_eq!(draft(&workbench), Some(left), "{WRONG_DRAFT}");
+    }
+
+    #[test]
+    fn a_cut_root_comes_back_with_the_paste_chord() {
+        let mut workbench = workbench();
+        compare(&mut workbench, project());
+        press(&mut workbench, keys::LOCAL_ROOT);
+        press(&mut workbench, keys::SELECT_ALL);
+        press(&mut workbench, keys::CUT);
+
+        press(&mut workbench, keys::PASTE);
+
+        assert_eq!(draft(&workbench), Some(LOCAL_ROOT), "{WRONG_DRAFT}");
+    }
+
+    #[test]
+    fn a_cleared_root_comes_back_with_undo() {
+        let mut workbench = workbench();
+        compare(&mut workbench, project());
+        press(&mut workbench, keys::LOCAL_ROOT);
+        press(&mut workbench, keys::CLEAR_ROOT);
+        assert_eq!(draft(&workbench), Some(""), "{WRONG_DRAFT}");
+
+        press(&mut workbench, keys::UNDO);
+
+        assert_eq!(draft(&workbench), Some(LOCAL_ROOT), "{WRONG_DRAFT}");
     }
 
     #[test]

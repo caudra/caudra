@@ -1,30 +1,30 @@
-//! A multi-line editor for the modals, built on the workbench's own buffer,
-//! undo history and row painter.
+//! A multi-line editor for the modals, built on the workbench's own text field
+//! and row painter.
 //!
 //! Everything below is the seam rather than the editing: selection, word and
 //! line motions, indent and undo coalescing all live in `caudra-workbench`, and
-//! the keymap is dispatched through its [`keys`] table, so a note or a pasted
-//! blob is edited exactly the way a file is and the two maps cannot drift.
+//! every key is read by [`caudra_workbench::text_field::decode`], so a note or a
+//! pasted blob is edited exactly the way a file is and the two maps cannot
+//! drift.
 //!
 //! Rows always wrap. A modal is narrow, and a window that pans sideways hides
 //! the start of the line the reader is in the middle of writing.
 
-use std::ops::Range;
+use std::mem;
 use std::time::Instant;
 
 use caudra_grab::grab_scope;
-use caudra_workbench::buffer::{Buffer, Cursor, Edit};
-use caudra_workbench::history::History;
+use caudra_workbench::buffer::Cursor;
+use caudra_workbench::text_field::{FieldKind, TextField, TextKey};
 use caudra_workbench::{Clicks, keys, render};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
-use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 
 use super::scrollbar::{self, Scrollbar, ScrollbarMouse};
-use crate::theme;
+use super::{field_styles, input_text_style};
 use unicode_width::UnicodeWidthChar;
 
 /// How far a drag that has run off the top or bottom of the body scrolls per
@@ -53,8 +53,7 @@ pub(crate) enum EditorMouse {
 }
 
 pub(crate) struct TextEditor {
-    buffer: Buffer,
-    history: History,
+    field: TextField,
     /// The editor's own clipboard, the way `Workbench` keeps one: a terminal
     /// delivers a real paste as a paste event, so `Ctrl+V` is only ever asked
     /// for what this editor last cut or copied.
@@ -78,8 +77,7 @@ impl Default for TextEditor {
 impl TextEditor {
     pub fn new() -> Self {
         Self {
-            buffer: Buffer::new(Vec::new()),
-            history: History::default(),
+            field: TextField::new(FieldKind::Document),
             clipboard: String::new(),
             scroll: 0,
             area: Rect::ZERO,
@@ -90,203 +88,102 @@ impl TextEditor {
         }
     }
 
+    /// Loads `text` with the caret at its start and nothing to undo.
     pub fn set_text(&mut self, text: String) {
-        self.buffer = Buffer::new(text.split('\n').map(str::to_owned).collect());
-        self.history = History::default();
+        self.field.set_text(&text);
+        self.field.set_cursor(Cursor::default(), false);
         self.scroll = 0;
         self.cancel_selection();
         self.follow_cursor = true;
     }
 
     pub fn text(&self) -> String {
-        self.buffer.lines().join("\n")
+        self.field.text()
+    }
+
+    /// Masks the text and keeps it off the clipboard: no select-all, copy, cut
+    /// or drag-release copy.
+    pub fn set_secret(&mut self, secret: bool) {
+        self.field.set_secret(secret);
+    }
+
+    pub fn is_secret(&self) -> bool {
+        self.field.is_secret()
     }
 
     pub fn move_to_end(&mut self) {
-        self.buffer.move_document_end(false);
+        self.field.move_to_end();
         self.follow_cursor = true;
     }
 
-    fn byte_len(&self) -> usize {
-        self.buffer.lines().iter().map(String::len).sum::<usize>()
-            + self.buffer.line_count().saturating_sub(1)
-    }
-
-    fn admits_insert(&self, bytes: usize, limit: usize) -> bool {
-        let removed = self.buffer.selected_text().map_or(0, |text| text.len());
-        self.byte_len()
-            .saturating_sub(removed)
-            .saturating_add(bytes)
-            <= limit
-    }
-
+    /// [`Self::handle_paste`], refused whole when it would grow the text past
+    /// `limit` bytes.
     pub fn handle_paste_bounded(&mut self, text: &str, limit: usize) -> bool {
-        if !text.is_empty() && !self.admits_insert(text.len(), limit) {
-            return false;
-        }
-        self.handle_paste(text);
-        true
+        self.within(limit, |editor| editor.paste(text)) != TextKey::Refused
     }
 
+    /// [`Self::handle_key`], with `Err` for an edit that would have grown the
+    /// text past `limit` bytes and was taken back.
     pub fn handle_key_bounded(&mut self, key: KeyEvent, limit: usize) -> Result<EditorKey, ()> {
-        let typing = (key.modifiers - KeyModifiers::SHIFT).is_empty();
-        if keys::PASTE.matches(key) {
-            if !self.clipboard.is_empty() && !self.admits_insert(self.clipboard.len(), limit) {
-                return Err(());
-            }
-        } else if let KeyCode::Char(character) = key.code {
-            if typing && !self.admits_insert(character.len_utf8(), limit) {
-                return Err(());
-            }
-        } else if (key.code == KeyCode::Enter && typing) || key.code == KeyCode::Tab {
-            let before = self.byte_len();
-            let cursor = self.buffer.cursor();
-            let selection = self.buffer.selection();
-            let edit = if key.code == KeyCode::Enter {
-                self.buffer.insert_newline()
-            } else {
-                self.buffer.insert_indent()
-            };
-            if let Some(edit) = edit {
-                let after = before
-                    .saturating_sub(edit.removed.len())
-                    .saturating_add(edit.inserted.len());
-                if after > limit {
-                    self.buffer.replay(&edit.inverted());
-                    if let Some((start, end)) = selection {
-                        self.buffer
-                            .set_cursor(if cursor == start { end } else { start }, false);
-                        self.buffer.set_cursor(cursor, true);
-                    }
-                    return Err(());
-                }
-                self.record(Some(edit));
-            }
-            return Ok(EditorKey::Consumed);
-        }
-        Ok(self.handle_key(key))
+        self.within(limit, |editor| editor.key(key))
+    }
+
+    fn within<T>(&mut self, limit: usize, act: impl FnOnce(&mut Self) -> T) -> T {
+        self.field.set_limit(Some(limit));
+        let outcome = act(self);
+        self.field.set_limit(None);
+        outcome
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> EditorKey {
-        if keys::COPY.matches(key) {
+        self.key(key).unwrap_or(EditorKey::Consumed)
+    }
+
+    fn key(&mut self, key: KeyEvent) -> Result<EditorKey, ()> {
+        let page = usize::from(self.area.height.max(1));
+        let outcome = match self.field.handle_key_paged(key, page) {
+            TextKey::Ignored if keys::PASTE.matches(key) => {
+                let text = mem::take(&mut self.clipboard);
+                let pasted = self.paste(&text);
+                self.clipboard = text;
+                pasted
+            }
+            outcome => outcome,
+        };
+        match outcome {
+            TextKey::Changed | TextKey::Handled => {
+                self.follow_cursor = true;
+                Ok(EditorKey::Consumed)
+            }
+            TextKey::Cut(text) => {
+                self.follow_cursor = true;
+                self.clipboard.clone_from(&text);
+                Ok(EditorKey::Copy(text))
+            }
+            TextKey::Copy(text) => {
+                self.clipboard.clone_from(&text);
+                Ok(EditorKey::Copy(text))
+            }
+            TextKey::Refused => Err(()),
             // Nothing selected means nothing to copy, and the chord is the way
             // out of the session before it is an editor binding.
-            let Some(text) = self.buffer.selected_text() else {
-                return EditorKey::Passthrough;
-            };
-            self.clipboard.clone_from(&text);
-            return EditorKey::Copy(text);
+            TextKey::Ignored if keys::COPY.matches(key) => Ok(EditorKey::Passthrough),
+            TextKey::Ignored => Ok(EditorKey::Consumed),
         }
-        if keys::CUT.matches(key) {
-            return self.cut();
-        }
-        if keys::PASTE.matches(key) {
-            let text = std::mem::take(&mut self.clipboard);
-            self.handle_paste(&text);
-            self.clipboard = text;
-            return EditorKey::Consumed;
-        }
-        if keys::SELECT_ALL.matches(key) {
-            self.buffer.select_all();
-            self.follow_cursor = true;
-            return EditorKey::Consumed;
-        }
-        if keys::UNDO.matches(key) || keys::REDO.matches(key) {
-            let edit = match keys::UNDO.matches(key) {
-                true => self.history.undo(),
-                false => self.history.redo(),
-            };
-            if let Some(edit) = edit {
-                self.buffer.replay(&edit);
-                self.follow_cursor = true;
-            }
-            return EditorKey::Consumed;
-        }
-        if keys::KILL_LINE.matches(key) {
-            let edit = self.buffer.kill_to_end_of_line();
-            self.record(edit);
-            return EditorKey::Consumed;
-        }
-        if keys::DELETE_WORD.matches(key) {
-            let edit = self.buffer.delete_word_left();
-            self.record(edit);
-            return EditorKey::Consumed;
-        }
-        self.motion_key(key)
-    }
-
-    /// Motions, the keys that move the caret and extend the selection without
-    /// touching the text.
-    fn motion_key(&mut self, key: KeyEvent) -> EditorKey {
-        let extend = key.modifiers.contains(KeyModifiers::SHIFT);
-        let by_word = key.modifiers.contains(KeyModifiers::CONTROL);
-        let page = self.area.height.max(1) as isize;
-        match key.code {
-            KeyCode::Left if by_word => self.buffer.move_word_left(extend),
-            KeyCode::Left => self.buffer.move_left(extend),
-            KeyCode::Right if by_word => self.buffer.move_word_right(extend),
-            KeyCode::Right => self.buffer.move_right(extend),
-            KeyCode::Up => self.buffer.move_vertical(-1, extend),
-            KeyCode::Down => self.buffer.move_vertical(1, extend),
-            KeyCode::PageUp => self.buffer.move_vertical(-page, extend),
-            KeyCode::PageDown => self.buffer.move_vertical(page, extend),
-            KeyCode::Home if by_word => self.buffer.move_document_start(extend),
-            KeyCode::Home => self.buffer.move_home(extend),
-            KeyCode::End if by_word => self.buffer.move_document_end(extend),
-            KeyCode::End => self.buffer.move_end(extend),
-            _ => return self.text_key(key),
-        }
-        self.history.break_group();
-        self.follow_cursor = true;
-        EditorKey::Consumed
-    }
-
-    fn text_key(&mut self, key: KeyEvent) -> EditorKey {
-        let by_word = key.modifiers.contains(KeyModifiers::CONTROL);
-        let typing = (key.modifiers - KeyModifiers::SHIFT).is_empty();
-        let edit = match key.code {
-            KeyCode::Char(ch) if typing => self.buffer.insert(&ch.to_string()),
-            KeyCode::Enter if typing => self.buffer.insert_newline(),
-            KeyCode::Tab => self.buffer.insert_indent(),
-            KeyCode::BackTab => self.buffer.dedent(),
-            KeyCode::Backspace if by_word => self.buffer.delete_word_left(),
-            KeyCode::Backspace => self.buffer.backspace(),
-            KeyCode::Delete if by_word => self.buffer.delete_word_right(),
-            KeyCode::Delete => self.buffer.delete(),
-            _ => return EditorKey::Consumed,
-        };
-        self.record(edit);
-        EditorKey::Consumed
-    }
-
-    fn cut(&mut self) -> EditorKey {
-        let Some(text) = self.buffer.selected_text() else {
-            return EditorKey::Consumed;
-        };
-        self.clipboard.clone_from(&text);
-        let edit = self.buffer.delete();
-        self.record(edit);
-        EditorKey::Copy(text)
     }
 
     pub fn handle_paste(&mut self, text: &str) {
-        if text.is_empty() {
-            return;
-        }
-        let edit = self.buffer.insert(text);
-        self.record(edit);
-        self.history.break_group();
+        self.paste(text);
     }
 
-    fn record(&mut self, edit: Option<Edit>) {
-        if let Some(edit) = edit {
-            self.history.record(edit);
-            self.follow_cursor = true;
-        }
+    fn paste(&mut self, text: &str) -> TextKey {
+        let pasted = self.field.paste(text);
+        self.follow_cursor |= pasted.changed();
+        pasted
     }
 
     pub fn cancel_selection(&mut self) {
-        self.buffer.set_cursor(self.buffer.cursor(), false);
+        self.field.clear_selection();
         self.dragging = false;
         self.clicks = Clicks::default();
         self.scrollbar = Scrollbar::default();
@@ -322,14 +219,14 @@ impl TextEditor {
                     self.scroll(-EDGE_SCROLL_ROWS);
                 }
                 if let Some(cursor) = self.cursor_at(at) {
-                    self.buffer.set_cursor(cursor, true);
+                    self.field.set_cursor(cursor, true);
                 }
             }
             MouseEventKind::Up(MouseButton::Left) if self.dragging => {
                 self.dragging = false;
                 // The modal holds the mouse, so the terminal underneath can no
                 // longer copy a selection for the reader.
-                if let Some(text) = self.buffer.selected_text() {
+                if let Some(text) = self.field.selected_text() {
                     self.clipboard.clone_from(&text);
                     return EditorMouse::Copy(text);
                 }
@@ -349,9 +246,9 @@ impl TextEditor {
             return EditorMouse::Passthrough;
         };
         match self.clicks.press(at, Instant::now()) {
-            1 => self.buffer.set_cursor(cursor, false),
-            2 => self.buffer.select_word_at(cursor),
-            _ => self.buffer.select_line_at(cursor.line),
+            1 => self.field.set_cursor(cursor, false),
+            2 => self.field.select_word_at(cursor),
+            _ => self.field.select_line_at(cursor.line),
         }
         self.dragging = true;
         self.follow_cursor = false;
@@ -373,13 +270,12 @@ impl TextEditor {
             .get(self.scroll + usize::from(row - self.area.y))
             .or_else(|| rows.last())?;
         let reached = visual.start + usize::from(column - self.area.x).min(visual.span);
-        let col = render::char_index(self.buffer.line(visual.line), reached);
+        let line = self.field.shown_line(visual.line);
+        let col = render::char_index(&line, reached);
         if self.area.width == 1
             && column == self.area.right()
-            && col == render::char_index(self.buffer.line(visual.line), visual.start)
-            && self
-                .buffer
-                .line(visual.line)
+            && col == render::char_index(&line, visual.start)
+            && line
                 .chars()
                 .nth(col)
                 .and_then(UnicodeWidthChar::width)
@@ -398,18 +294,14 @@ impl TextEditor {
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) {
-        self.paint(frame, area, false, false);
+        self.paint(frame, area, false);
     }
 
     pub fn view_json(&mut self, frame: &mut Frame, area: Rect) {
-        self.paint(frame, area, false, true);
+        self.paint(frame, area, true);
     }
 
-    pub fn view_masked(&mut self, frame: &mut Frame, area: Rect) {
-        self.paint(frame, area, true, false);
-    }
-
-    fn paint(&mut self, frame: &mut Frame, area: Rect, masked: bool, json: bool) {
+    fn paint(&mut self, frame: &mut Frame, area: Rect, json: bool) {
         grab_scope!("text_editor", area);
         let height = usize::from(area.height.max(1));
         let full_rows = self.visual_rows_at(area.width);
@@ -448,9 +340,7 @@ impl TextEditor {
         }
         self.scroll = self.scroll.min(rows.len().saturating_sub(height));
 
-        let theme = theme::current();
-        let base = Style::new().fg(theme.foreground);
-        let selection = Style::new().add_modifier(Modifier::REVERSED);
+        let styles = field_styles(input_text_style());
         let mut syntax_line = None;
         let mut syntax = Vec::new();
         let painted = rows
@@ -458,17 +348,15 @@ impl TextEditor {
             .skip(self.scroll)
             .take(height)
             .map(|row| {
-                let text = self.buffer.line(row.line);
-                let hidden = masked.then(|| "*".repeat(text.chars().count()));
-                let text = hidden.as_deref().unwrap_or(text);
+                let text = self.field.shown_line(row.line);
                 if json && syntax_line != Some(row.line) {
                     syntax_line = Some(row.line);
-                    syntax = super::json_text::overlays(text);
+                    syntax = super::json_text::overlays(&text);
                 }
                 let mut overlays = syntax.clone();
-                overlays.extend(self.overlays(row.line, text, selection, theme.cursor));
+                overlays.extend(self.field.overlays(row.line, &styles, true));
                 if body.width == 1 {
-                    let index = render::char_index(text, row.start);
+                    let index = render::char_index(&text, row.start);
                     if text
                         .chars()
                         .nth(index)
@@ -478,14 +366,14 @@ impl TextEditor {
                         let style = overlays
                             .iter()
                             .filter(|(range, _)| range.contains(&index))
-                            .fold(base, |style, (_, overlay)| style.patch(*overlay));
+                            .fold(styles.text, |style, (_, overlay)| style.patch(*overlay));
                         return Line::styled(NARROW_GLYPH, style);
                     }
                 }
                 render::Row {
-                    text,
+                    text: &text,
                     segments: None,
-                    base,
+                    base: styles.text,
                     fill: None,
                     overlays: &overlays,
                 }
@@ -502,36 +390,9 @@ impl TextEditor {
         );
     }
 
-    /// The selection on this line, then the caret over it, the same order the
-    /// workbench paints a file's row in.
-    fn overlays(
-        &self,
-        line: usize,
-        text: &str,
-        selection: Style,
-        caret: Style,
-    ) -> Vec<(Range<usize>, Style)> {
-        let mut overlays = Vec::new();
-        if let Some((from, to)) = self.buffer.selection()
-            && (from.line..=to.line).contains(&line)
-        {
-            let start = if line == from.line { from.col } else { 0 };
-            let end = match line == to.line {
-                true => to.col,
-                false => text.chars().count() + 1,
-            };
-            overlays.push((start..end, selection));
-        }
-        let cursor = self.buffer.cursor();
-        if cursor.line == line {
-            overlays.push((cursor.col..cursor.col + 1, caret));
-        }
-        overlays
-    }
-
     fn reveal_cursor(&mut self, rows: &[VisualRow], height: usize) {
-        let cursor = self.buffer.cursor();
-        let column = render::display_column(self.buffer.line(cursor.line), cursor.col);
+        let cursor = self.field.cursor();
+        let column = render::display_column(&self.field.shown_line(cursor.line), cursor.col);
         let Some(at) = rows
             .iter()
             .rposition(|row| row.line == cursor.line && row.start <= column)
@@ -554,9 +415,10 @@ impl TextEditor {
 
     fn visual_rows_at(&self, width: u16) -> Vec<VisualRow> {
         let width = usize::from(width.max(1));
-        let mut rows = Vec::with_capacity(self.buffer.line_count());
-        for line in 0..self.buffer.line_count() {
-            let starts = render::wrap_columns(self.buffer.line(line), width);
+        let lines = self.field.lines().len();
+        let mut rows = Vec::with_capacity(lines);
+        for line in 0..lines {
+            let starts = render::wrap_columns(&self.field.shown_line(line), width);
             for (index, &start) in starts.iter().enumerate() {
                 let span = starts
                     .get(index + 1)
@@ -582,6 +444,7 @@ struct VisualRow {
 mod tests {
     use super::{EditorKey, EditorMouse, TextEditor};
     use crate::components::scrollbar;
+    use caudra_workbench::buffer::Cursor;
     use caudra_workbench::scroll::SCROLLBAR_THUMB;
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -662,8 +525,8 @@ mod tests {
             .unwrap();
         assert_eq!(editor.area.width, 5);
         press(&mut editor, column, 1);
-        assert_eq!(editor.buffer.cursor().col, expected);
-        assert_eq!(editor.buffer.cursor().line, 0);
+        assert_eq!(editor.field.cursor().col, expected);
+        assert_eq!(editor.field.cursor().line, 0);
     }
 
     #[test_case(0; "zero")]
@@ -812,7 +675,7 @@ mod tests {
         const LIMIT: usize = 4;
         let mut editor = editor(text);
         editor.move_to_end();
-        let cursor = editor.buffer.cursor();
+        let cursor = editor.field.cursor();
         assert_eq!(
             editor
                 .handle_key_bounded(KeyEvent::new(code, modifiers), LIMIT)
@@ -822,7 +685,7 @@ mod tests {
         assert!(editor.text().len() <= LIMIT);
         if !allowed {
             assert_eq!(editor.text(), text);
-            assert_eq!(editor.buffer.cursor(), cursor);
+            assert_eq!(editor.field.cursor(), cursor);
         }
     }
 
@@ -847,10 +710,10 @@ mod tests {
         };
         assert!(!paste(&mut editor));
         assert_eq!(editor.text(), TEXT);
-        editor.buffer.select_all();
-        let selection = editor.buffer.selection();
+        editor.field.select_all();
+        let selection = editor.field.selection();
         assert!(!editor.handle_paste_bounded("too long", TEXT.len()));
-        assert_eq!(editor.buffer.selection(), selection);
+        assert_eq!(editor.field.selection(), selection);
         assert!(paste(&mut editor));
         assert_eq!(editor.text(), TEXT);
     }
@@ -860,28 +723,24 @@ mod tests {
     fn bounded_indentation_preserves_selection_and_history_when_rejected(code: KeyCode) {
         const TEXT: &str = "    a\n    b";
         let mut editor = editor(TEXT);
-        editor.buffer.select_all();
-        let selection = editor.buffer.selection();
-        let limit = if code == KeyCode::Enter {
-            1
-        } else {
-            TEXT.len()
-        };
+        editor.field.set_cursor(Cursor::new(0, 4), false);
+        editor.field.set_cursor(Cursor::new(0, 5), true);
+        let selection = editor.field.selection();
         assert!(
             editor
-                .handle_key_bounded(KeyEvent::new(code, KeyModifiers::NONE), limit)
+                .handle_key_bounded(KeyEvent::new(code, KeyModifiers::NONE), TEXT.len())
                 .is_err()
         );
         assert_eq!(editor.text(), TEXT);
-        assert_eq!(editor.buffer.selection(), selection);
-        assert!(editor.history.undo().is_none());
+        assert_eq!(editor.field.selection(), selection);
+        assert!(!editor.field.undo());
     }
 
     #[test]
     fn bounded_editor_can_delete_and_undo_over_limit_text() {
         const TEXT: &str = "oversized";
         let mut editor = editor(TEXT);
-        editor.buffer.select_all();
+        editor.field.select_all();
         assert!(
             editor
                 .handle_key_bounded(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), 1)
@@ -894,7 +753,7 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(editor.text(), TEXT);
-        editor.buffer.select_all();
+        editor.field.select_all();
         assert!(
             editor
                 .handle_key_bounded(
@@ -982,7 +841,7 @@ mod tests {
     #[test_case("a\nb", 2, &[(0, 0, 10), (1, 0, 10)] ; "each line starts its own row")]
     fn visual_rows_follow_the_wrap(text: &str, lines: usize, expected: &[(usize, usize, usize)]) {
         let editor = editor(text);
-        assert_eq!(editor.buffer.line_count(), lines);
+        assert_eq!(editor.field.lines().len(), lines);
         let rows: Vec<(usize, usize, usize)> = editor
             .visual_rows()
             .iter()
@@ -1002,7 +861,7 @@ mod tests {
     ) {
         let mut editor = editor(WRAPPED);
         press(&mut editor, column, row);
-        let cursor = editor.buffer.cursor();
+        let cursor = editor.field.cursor();
         assert_eq!((cursor.line, cursor.col), expected);
     }
 
@@ -1019,10 +878,7 @@ mod tests {
         let mut editor = editor(WRAPPED);
         press(&mut editor, 0, 0);
         drag(&mut editor, 5, 1);
-        assert_eq!(
-            editor.buffer.selected_text().as_deref(),
-            Some("hello world")
-        );
+        assert_eq!(editor.field.selected_text().as_deref(), Some("hello world"));
     }
 
     #[test]
@@ -1045,7 +901,7 @@ mod tests {
         let mut editor = editor(WRAPPED);
         press(&mut editor, 2, 0);
         press(&mut editor, 2, 0);
-        assert_eq!(editor.buffer.selected_text().as_deref(), Some("hello"));
+        assert_eq!(editor.field.selected_text().as_deref(), Some("hello"));
     }
 
     #[test]
@@ -1054,7 +910,7 @@ mod tests {
         press(&mut editor, 1, 0);
         press(&mut editor, 1, 0);
         press(&mut editor, 1, 0);
-        assert_eq!(editor.buffer.selected_text().as_deref(), Some("one\n"));
+        assert_eq!(editor.field.selected_text().as_deref(), Some("one\n"));
     }
 
     #[test_case(2, "hello"; "word")]
@@ -1080,10 +936,9 @@ mod tests {
         const SECRET: &str = "masked-secret";
         let source = SECRET.repeat(100);
         let mut editor = editor(&source);
+        editor.set_secret(true);
         let mut terminal = Terminal::new(TestBackend::new(BODY.width, BODY.height)).unwrap();
-        terminal
-            .draw(|frame| editor.view_masked(frame, BODY))
-            .unwrap();
+        terminal.draw(|frame| editor.view(frame, BODY)).unwrap();
         for (kind, column, row) in [
             (
                 MouseEventKind::Down(MouseButton::Left),
@@ -1104,7 +959,7 @@ mod tests {
             assert!(editor.handle_scrollbar_mouse(&mouse(kind, column, row)));
         }
         assert!(editor.scroll > 0);
-        assert!(editor.buffer.selection().is_none());
+        assert!(editor.field.selection().is_none());
         assert!(editor.clipboard.is_empty());
         assert_eq!(editor.text(), source);
     }
@@ -1200,7 +1055,7 @@ mod tests {
         for _ in 0..2 {
             editor.handle_key(key(KeyCode::Right, KeyModifiers::SHIFT));
         }
-        assert_eq!(editor.buffer.selected_text().as_deref(), Some("he"));
+        assert_eq!(editor.field.selected_text().as_deref(), Some("he"));
     }
 
     #[test]
@@ -1217,5 +1072,39 @@ mod tests {
             editor.handle_key(key(KeyCode::Esc, KeyModifiers::NONE)),
             EditorKey::Consumed
         ));
+    }
+
+    #[test_case(KeyCode::Char('e'), KeyModifiers::CONTROL, "one!\ntwo"; "ctrl_e_reaches_the_line_end")]
+    #[test_case(KeyCode::Right, KeyModifiers::SUPER, "one!\ntwo"; "super_right_reaches_the_line_end")]
+    #[test_case(KeyCode::End, KeyModifiers::CONTROL, "one\ntwo!"; "ctrl_end_reaches_the_text_end")]
+    #[test_case(KeyCode::Char('@'), KeyModifiers::CONTROL | KeyModifiers::ALT, "@!one\ntwo"; "alt_gr_types_its_character")]
+    #[test_case(KeyCode::Char('x'), KeyModifiers::ALT, "!one\ntwo"; "bare_alt_types_nothing")]
+    fn the_shared_keymap_moves_and_types(code: KeyCode, modifiers: KeyModifiers, expected: &str) {
+        let mut editor = editor("one\ntwo");
+        editor.handle_key(key(code, modifiers));
+        editor.handle_key(key(KeyCode::Char('!'), KeyModifiers::NONE));
+        assert_eq!(editor.text(), expected);
+    }
+
+    #[test]
+    fn super_backspace_deletes_to_the_line_start() {
+        let mut editor = editor("one\ntwo three");
+        editor.move_to_end();
+        editor.handle_key(key(KeyCode::Backspace, KeyModifiers::SUPER));
+        assert_eq!(editor.text(), "one\n");
+    }
+
+    #[test]
+    fn a_secret_hands_nothing_to_the_clipboard() {
+        let mut editor = editor(WRAPPED);
+        editor.set_secret(true);
+        press(&mut editor, 0, 0);
+        drag(&mut editor, 5, 0);
+        assert!(copied(release(&mut editor, 5, 0)).is_none());
+        assert!(matches!(
+            editor.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            EditorKey::Passthrough
+        ));
+        assert!(editor.clipboard.is_empty());
     }
 }

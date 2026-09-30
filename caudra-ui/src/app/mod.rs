@@ -39,6 +39,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+use caudra_workbench::text_field::{self, FieldKind, TextCommand};
 use caudra_workbench::{
     DocumentKey, Layout as WorkbenchLayout, MutationGate, Workbench, WorkbenchAction,
 };
@@ -1775,7 +1776,11 @@ impl App {
     /// is parked on. A dismissal is an unparseable reply by design: the tool
     /// reads anything it cannot make answers of as "the user declined".
     fn handle_question_form_action(&mut self, action: QuestionFormAction) -> Vec<Action> {
-        if !matches!(action, QuestionFormAction::Consumed)
+        let answered = !matches!(
+            action,
+            QuestionFormAction::Consumed | QuestionFormAction::Copy(_)
+        );
+        if answered
             && self
                 .task_interactions
                 .question
@@ -1787,11 +1792,15 @@ impl App {
             self.task_interactions.question = None;
             return Vec::new();
         }
-        if !matches!(action, QuestionFormAction::Consumed) {
+        if answered {
             self.task_interactions.question = None;
         }
         let reply = match action {
             QuestionFormAction::Consumed => return Vec::new(),
+            QuestionFormAction::Copy(text) => {
+                self.copy_to_clipboard(&text);
+                return Vec::new();
+            }
             // Nothing is sent back: the parked tool ends on its own cancel
             // path, and the run only moves again when the user says so.
             QuestionFormAction::Cancel => {
@@ -1832,6 +1841,15 @@ impl App {
     /// was answered elsewhere, so both clear it too.
     pub(crate) fn apply_permission_decision(&mut self, decision: PermissionDecision) {
         self.request_permission_answer(decision);
+    }
+
+    pub(super) fn permission_prompt_key(&mut self, key: KeyEvent) {
+        if let Some(decision) = self.permission_prompt.handle_key(key) {
+            self.apply_permission_decision(decision);
+        }
+        if let Some(text) = self.permission_prompt.take_copied() {
+            self.copy_to_clipboard(&text);
+        }
     }
 
     fn scroll_at(&mut self, column: u16, row: u16, delta: i32) -> Option<SelectionZone> {
@@ -2258,7 +2276,7 @@ impl App {
         }
 
         if self.stream_modal.is_open() {
-            guard_repeat!(false);
+            guard_repeat!(self.stream_modal.text_input_active());
             match self.stream_modal.handle_key(key) {
                 StreamAction::Ignored | StreamAction::Consumed => {}
                 StreamAction::Copy(text) => self.copy_to_clipboard(&text),
@@ -2411,7 +2429,7 @@ impl App {
         }
 
         if self.login_picker.is_open() {
-            guard_repeat!(false);
+            guard_repeat!(self.login_picker.text_input_active());
             let action = self.login_picker.handle_key(key);
             return Some(self.handle_login_picker_action(action));
         }
@@ -2439,10 +2457,13 @@ impl App {
         }
 
         if self.question_form.is_open() {
-            guard_repeat!(self.question_form.text_input_active());
+            let typing = self.question_form.text_input_active();
+            guard_repeat!(typing);
             // The form is docked, not modal: keys that only move the
-            // transcript keep working while it waits for an answer.
-            if self.scroll_transcript(key) {
+            // transcript keep working while it waits for an answer, except
+            // `Home` and `End`, which move the caret of an answer being typed.
+            let caret_key = typing && (key::DOC_TOP.matches(key) || key::DOC_BOTTOM.matches(key));
+            if !caret_key && self.scroll_transcript(key) {
                 return Some(vec![]);
             }
             let action = self.question_form.handle_key(key);
@@ -2454,7 +2475,7 @@ impl App {
             return Some(self.handle_session_picker_action(action));
         }
         if self.session_relocation_picker.is_open() {
-            guard_repeat!(false);
+            guard_repeat!(self.session_relocation_picker.text_input_active());
             let action = self.session_relocation_picker.handle_key(key);
             return Some(self.handle_session_relocation_action(action));
         }
@@ -2479,7 +2500,7 @@ impl App {
             return Some(self.handle_memory_picker_action(action));
         }
         if self.workflow_inspector.is_open() {
-            guard_repeat!(false);
+            guard_repeat!(self.workflow_inspector.text_input_active());
             let action = self.workflow_inspector.handle_key(key);
             return Some(self.handle_workflow_inspector_action(action));
         }
@@ -2510,6 +2531,10 @@ impl App {
             ModelPickerAction::Select(spec) => vec![Action::ChangeModel(spec)],
             ModelPickerAction::Bind(purpose, binding) => vec![Action::Bind(purpose, binding)],
             ModelPickerAction::Unbind(purpose) => vec![Action::Unbind(purpose)],
+            ModelPickerAction::Copy(text) => {
+                self.copy_to_clipboard(&text);
+                vec![]
+            }
         }
     }
 
@@ -2535,6 +2560,10 @@ impl App {
         match action {
             CommandModalAction::Consumed | CommandModalAction::Closed => Vec::new(),
             CommandModalAction::Execute(cmd) => self.execute_command(cmd, 0),
+            CommandModalAction::Copy(text) => {
+                self.copy_to_clipboard(&text);
+                Vec::new()
+            }
         }
     }
 
@@ -2549,6 +2578,11 @@ impl App {
             }
             SearchAction::Navigate => {
                 sync_search_highlight(&self.search_modal, &mut self.chats[self.active_chat]);
+            }
+            SearchAction::Copy(text) => self.copy_to_clipboard(&text),
+            SearchAction::Cut(text) => {
+                self.copy_to_clipboard(&text);
+                return self.handle_search_action(SearchAction::QueryChanged);
             }
             SearchAction::Select(idx) => {
                 let chat = &mut self.chats[self.active_chat];
@@ -2634,6 +2668,7 @@ impl App {
                     self.sync_dropdowns(&val);
                 }
             }
+            FilePickerModalAction::Copy(text) => self.copy_to_clipboard(&text),
             FilePickerModalAction::Close => self.file_picker.close(),
         }
         Vec::new()
@@ -2643,10 +2678,17 @@ impl App {
         match action {
             RewindPickerAction::Consumed | RewindPickerAction::Close => Vec::new(),
             RewindPickerAction::Select(entry) => vec![Action::RewindSession(entry)],
+            RewindPickerAction::Copy(text) => {
+                self.copy_to_clipboard(&text);
+                Vec::new()
+            }
         }
     }
 
     fn handle_message_actions_action(&mut self, action: MessageActionsAction) -> Vec<Action> {
+        if let MessageActionsAction::Copy(text) = &action {
+            self.copy_to_clipboard(text);
+        }
         let MessageActionsAction::Select { source, kind } = action else {
             return Vec::new();
         };
@@ -2679,6 +2721,9 @@ impl App {
     }
 
     fn handle_queue_actions_action(&mut self, action: QueueActionsAction) -> Vec<Action> {
+        if let QueueActionsAction::Copy(text) = &action {
+            self.copy_to_clipboard(text);
+        }
         let QueueActionsAction::Select { id, kind } = action else {
             return Vec::new();
         };
@@ -2736,7 +2781,10 @@ impl App {
         }
     }
 
-    fn handle_theme_picker_action(&self, _action: ThemePickerAction) -> Vec<Action> {
+    fn handle_theme_picker_action(&mut self, action: ThemePickerAction) -> Vec<Action> {
+        if let ThemePickerAction::Copy(text) = action {
+            self.copy_to_clipboard(&text);
+        }
         Vec::new()
     }
 
@@ -2749,20 +2797,33 @@ impl App {
             PromptProfilePickerAction::Select(name) => {
                 vec![Action::ChangeSystemPromptProfile(name)]
             }
+            PromptProfilePickerAction::Copy(text) => {
+                self.copy_to_clipboard(&text);
+                Vec::new()
+            }
         }
     }
 
     fn handle_thinking_picker_action(&mut self, action: ThinkingPickerAction) -> Vec<Action> {
-        if let ThinkingPickerAction::Select(thinking) = action {
-            self.apply_thinking(thinking);
+        match action {
+            ThinkingPickerAction::Select(thinking) => self.apply_thinking(thinking),
+            ThinkingPickerAction::Copy(text) => self.copy_to_clipboard(&text),
+            ThinkingPickerAction::Consumed | ThinkingPickerAction::Closed => {}
         }
         Vec::new()
     }
 
     fn handle_login_picker_action(&mut self, action: LoginPickerAction) -> Vec<Action> {
-        let closed = !matches!(&action, LoginPickerAction::Consumed);
+        let closed = !matches!(
+            &action,
+            LoginPickerAction::Consumed | LoginPickerAction::Copy(_)
+        );
         let actions = match action {
             LoginPickerAction::Consumed | LoginPickerAction::Close => Vec::new(),
+            LoginPickerAction::Copy(text) => {
+                self.copy_to_clipboard(&text);
+                Vec::new()
+            }
             LoginPickerAction::Authenticated { model_spec } => {
                 vec![Action::ChangeModel(model_spec), Action::RefreshModels]
             }
@@ -2800,6 +2861,10 @@ impl App {
                 vec![Action::TrustMcpProject(server_name)]
             }
             McpPickerAction::Reject { server_name } => vec![Action::RejectMcp(server_name)],
+            McpPickerAction::Copy(text) => {
+                self.copy_to_clipboard(&text);
+                Vec::new()
+            }
         };
         if closed {
             self.mcp_picker.close();
@@ -2930,6 +2995,7 @@ impl App {
             }
             PermissionsPickerAction::Editor(event) => self.handle_permission_editor(event),
             PermissionsPickerAction::EditSource(locator) => self.open_permission_source(locator),
+            PermissionsPickerAction::Copy(text) => self.copy_to_clipboard(&text),
         }
         Vec::new()
     }
@@ -3115,9 +3181,7 @@ impl App {
 
     fn handle_key(&mut self, key: KeyEvent) -> Vec<Action> {
         if self.permission_prompt.is_open() {
-            if let Some(decision) = self.permission_prompt.handle_key(key) {
-                self.apply_permission_decision(decision);
-            }
+            self.permission_prompt_key(key);
             return vec![];
         }
         self.permission_prompt.handle_key(key);
@@ -3142,16 +3206,6 @@ impl App {
 
         if !key::EXIT.matches(key) {
             self.last_exit = None;
-        }
-
-        // Suspend is checked ahead of the overlays so a wedged UI can always be
-        // backgrounded. Editors that own Ctrl+Z for undo must win over SIGTSTP.
-        if key::SUSPEND.matches(key)
-            && cfg!(unix)
-            && !self.workbench.is_open()
-            && !self.sandbox_manager.is_open()
-        {
-            return vec![Action::Suspend];
         }
 
         // Ahead of the overlays: a pending chord owns the next key outright, so
@@ -3267,38 +3321,29 @@ impl App {
         }
     }
 
-    /// Shift is stripped before the modifiers are read, so a held
-    /// `Ctrl+Shift+←` keeps extending a selection the way a held `Ctrl+←`
-    /// keeps moving. Only the word chords repeat under Ctrl: every other one
-    /// runs a command, and a command must answer a press rather than a hold.
+    /// A held key keeps acting when holding it means something: a navigation
+    /// key, or, while a field is being typed in, whatever the field keymap
+    /// repeats. Reading the keymap keeps the two from drifting apart. Every
+    /// other chord runs a command, and a command must answer a press rather
+    /// than a hold.
     fn repeat_key_allowed(key: KeyEvent, editing: bool) -> bool {
-        let modifiers = key.modifiers - KeyModifiers::SHIFT;
-        if modifiers == KeyModifiers::CONTROL {
-            return editing
-                && matches!(
-                    key.code,
-                    KeyCode::Char('w')
-                        | KeyCode::Backspace
-                        | KeyCode::Delete
-                        | KeyCode::Left
-                        | KeyCode::Right
-                );
-        }
-        if !modifiers.is_empty() {
-            return false;
-        }
-        match key.code {
+        let navigation = matches!(
+            key.code,
             KeyCode::Up
-            | KeyCode::Down
-            | KeyCode::Left
-            | KeyCode::Right
-            | KeyCode::Home
-            | KeyCode::End
-            | KeyCode::PageUp
-            | KeyCode::PageDown => editing || key.modifiers.is_empty(),
-            KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete => editing,
-            _ => false,
+                | KeyCode::Down
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+        );
+        if navigation
+            && (key.modifiers.is_empty() || (editing && key.modifiers == KeyModifiers::SHIFT))
+        {
+            return true;
         }
+        editing && text_field::decode(key, FieldKind::Block).is_some_and(TextCommand::repeats)
     }
 
     /// The key the leader was waiting for. `Esc` and `Ctrl+C` back out

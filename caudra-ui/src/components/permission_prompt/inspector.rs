@@ -14,7 +14,7 @@ use super::scope::{ApprovalImpact, SHELL_REACH, ScopeSummary, complete_text};
 use super::{
     FooterRow, HINT_ENTER, HINT_ESC, KEY_ALLOW_ONCE, KeyCode, KeyEvent, KeyModifiers, Line, Panel,
     PermissionAnswer, PermissionDecision, PermissionPrompt, PermissionRowGrant,
-    PermissionRuleOption, PromptTarget, Span, TextBuffer, command_ladders,
+    PermissionRuleOption, PromptTarget, Span, TextField, command_ladders,
 };
 use crate::components::permission_scope::controls::{DOMAIN_COUNT, domain_for_mode, domain_index};
 pub(super) use crate::components::permission_scope::pattern::PatternControl as InspectorControl;
@@ -356,10 +356,10 @@ impl PatternInspector {
         }
     }
 
-    fn definition(&self, buffer: &TextBuffer) -> Box<PatternDefinition> {
+    fn definition(&self, field: &TextField) -> Box<PatternDefinition> {
         let mut definition = self.draft.clone();
         if let Some(editing) = &self.editing {
-            let text = buffer.value();
+            let text = field.text();
             match editing {
                 EditField::Name => definition.name = text,
                 EditField::SlotName => {
@@ -442,7 +442,7 @@ impl PermissionPrompt {
                 .and_then(|request| current_bindings(request, row, &option.id, proposal)),
         });
         self.panel = Panel::Scopes;
-        self.buffer.clear();
+        self.field.clear();
         self.scroll.reset();
         self.refresh_inspector(None);
     }
@@ -451,7 +451,7 @@ impl PermissionPrompt {
         let Some(inspector) = &self.inspector else {
             return;
         };
-        let definition = inspector.definition(&self.buffer);
+        let definition = inspector.definition(&self.field);
         let mut error = CompiledPattern::compile(&definition)
             .err()
             .map(|error| compile_error(&definition, error));
@@ -563,8 +563,7 @@ impl PermissionPrompt {
         };
         if let Some((field, value)) = edit {
             inspector.editing = Some(field);
-            self.buffer = TextBuffer::new(value);
-            self.buffer.move_end();
+            self.field.set_text(&value);
             self.refresh_inspector(Some(control));
             return;
         }
@@ -617,13 +616,13 @@ impl PermissionPrompt {
             match key.code {
                 KeyCode::Esc => {
                     self.inspector.as_mut()?.editing = None;
-                    self.buffer.clear();
+                    self.field.clear();
                 }
                 KeyCode::Enter | KeyCode::Tab | KeyCode::BackTab => {
                     self.apply_inspector_edit();
                 }
                 _ => {
-                    self.buffer.handle_key(key);
+                    self.edit_field(key);
                 }
             }
             self.refresh_inspector(Some(control));
@@ -643,7 +642,7 @@ impl PermissionPrompt {
         match key.code {
             KeyCode::Esc => {
                 self.inspector = None;
-                self.buffer.clear();
+                self.field.clear();
                 self.panel = Panel::Scopes;
                 self.scroll.reset();
                 self.invalidate_controls();
@@ -713,7 +712,7 @@ impl PermissionPrompt {
         let Some(request) = self.current() else {
             return;
         };
-        let definition = inspector.definition(&self.buffer);
+        let definition = inspector.definition(&self.field);
         if pattern_preview(request, inspector.row, &inspector.option_id, &definition).is_err() {
             self.refresh_inspector(None);
             return;
@@ -744,12 +743,12 @@ impl PermissionPrompt {
         if let Some(inspector) = &self.inspector
             && inspector.is_editing()
         {
-            let definition = inspector.definition(&self.buffer);
+            let definition = inspector.definition(&self.field);
             if let Some(inspector) = &mut self.inspector {
                 inspector.draft = definition;
                 inspector.editing = None;
             }
-            self.buffer.clear();
+            self.field.clear();
         }
     }
 
@@ -805,7 +804,7 @@ impl PermissionPrompt {
 
     pub(super) fn inspector_panel(&self) -> Option<PatternPanel> {
         let inspector = self.inspector.as_ref()?;
-        let definition = inspector.definition(&self.buffer);
+        let definition = inspector.definition(&self.field);
         let caution = unknown_role_caution(&definition).map(str::to_owned);
         let evidence = self
             .current()
@@ -1001,7 +1000,7 @@ pub(super) mod tests {
 
     fn edit(prompt: &mut PermissionPrompt, shortcut: char, text: &str) {
         prompt.handle_key(key(KeyCode::Char(shortcut)));
-        prompt.buffer.clear();
+        prompt.field.clear();
         assert!(prompt.handle_paste(text));
         prompt.handle_key(key(KeyCode::Enter));
         render(prompt, WIDE, TALL);
@@ -1285,7 +1284,7 @@ pub(super) mod tests {
         inspect(&mut prompt);
         prompt.handle_key(key(KeyCode::Char(mode)));
         prompt.handle_key(key(KeyCode::Char('e')));
-        prompt.buffer.clear();
+        prompt.field.clear();
         prompt.handle_paste(INVALID_EXPRESSION);
         assert!(prompt.inspector.as_ref().unwrap().error.is_some());
         prompt.handle_key(key(KeyCode::Enter));
@@ -1379,11 +1378,7 @@ pub(super) mod tests {
         let screen = render(&mut prompt, WIDE, TALL);
         assert!(screen.contains(EXPECTED_TUPLE));
         prompt.activate_inspector(InspectorControl::ObservedValue(0));
-        let edited = prompt
-            .inspector
-            .as_ref()
-            .unwrap()
-            .definition(&prompt.buffer);
+        let edited = prompt.inspector.as_ref().unwrap().definition(&prompt.field);
         assert!(
             matches!(&edited.combinations, SlotCombinations::ObservedTuples { tuples } if tuples.len() == 1)
         );
@@ -1401,7 +1396,7 @@ pub(super) mod tests {
                 .inspector
                 .as_ref()
                 .unwrap()
-                .definition(&prompt.buffer)
+                .definition(&prompt.field)
                 .combinations,
             definition.combinations
         );
@@ -1526,7 +1521,7 @@ pub(super) mod tests {
         edit(&mut prompt, 'e', UNOBSERVED_VALUE);
         let inspector = prompt.inspector.as_ref().unwrap();
         assert!(
-            matches!(inspector.definition(&prompt.buffer).combinations, SlotCombinations::ObservedTuples { tuples } if tuples.is_empty())
+            matches!(inspector.definition(&prompt.field).combinations, SlotCombinations::ObservedTuples { tuples } if tuples.is_empty())
         );
         assert!(inspector.error.is_some());
         assert!(prompt.handle_key(key(KeyCode::Char('p'))).is_none());
@@ -1731,7 +1726,7 @@ pub(super) mod tests {
             } else {
                 prompt.handle_key(key(KeyCode::Char('N')));
             }
-            prompt.buffer.clear();
+            prompt.field.clear();
             assert!(prompt.handle_paste(EDITED_NAME));
             let mut repeat = key(KeyCode::Enter);
             repeat.kind = KeyEventKind::Repeat;
@@ -1743,7 +1738,7 @@ pub(super) mod tests {
             assert_eq!(prompt.inspector.as_ref().unwrap().draft.name, EDITED_NAME);
 
             prompt.handle_key(key(KeyCode::Char('N')));
-            prompt.buffer.clear();
+            prompt.field.clear();
             assert!(prompt.handle_paste(DISCARDED_NAME));
             action(&mut prompt, KeyCode::Esc);
             assert_eq!(prompt.inspector.as_ref().unwrap().draft.name, EDITED_NAME);

@@ -17,6 +17,7 @@ use ratatui::widgets::Widget;
 use unicode_width::UnicodeWidthStr;
 
 use crate::editor::rendered::PaintMarkdown;
+use crate::editor::text_field::TextField;
 use crate::editor::{DiffKind, Editor, Tab, VisualRow, render};
 use crate::fs::backend::WorkbenchPath;
 use crate::fs::tree::{GitMark, Row as TreeRow};
@@ -30,8 +31,8 @@ use crate::scroll::ScrollHint;
 use crate::search::engine::Hit;
 use crate::search::{Field as SearchField, Row as SearchRow, Search};
 use crate::{
-    Ask, Bar, Choice, Focus, SidebarView, Workbench, WorkbenchStyles, chrome, keys, layout,
-    layout_sections,
+    Ask, Bar, Choice, Focus, FocusedField, SidebarView, Workbench, WorkbenchStyles, chrome, keys,
+    layout, layout_sections,
 };
 
 pub(crate) const HINT_GAP: &str = "  ";
@@ -49,7 +50,8 @@ const TRUNCATED: &str = " (truncated)";
 const CASE_TOGGLE: &str = "Aa";
 const WORD_TOGGLE: &str = "ab";
 const REGEX_TOGGLE: &str = ".*";
-pub(crate) const CARET: &str = "\u{2588}";
+/// Every workbench field has a label beside it to say what it wants instead.
+const NO_PLACEHOLDER: &str = "";
 pub(crate) const ENTER_LABEL: &str = "Enter";
 const SUMMARY_GAP: &str = " ";
 /// The two-column rail down the left of the graph. A commit on the chain of
@@ -377,24 +379,18 @@ impl Workbench {
         ])
         .areas(area);
 
-        let caret = focused && self.focus == Focus::Sidebar;
-        let search = self.search.query();
-        for (rect, label, text, field) in [
-            (query, SEARCH_PROMPT, &search.text, SearchField::Query),
-            (
-                include,
-                INCLUDE_PROMPT,
-                &search.include,
-                SearchField::Include,
-            ),
+        let typing = self.focused_field() == Some(FocusedField::Search);
+        for (rect, label, field) in [
+            (query, SEARCH_PROMPT, SearchField::Query),
+            (include, INCLUDE_PROMPT, SearchField::Include),
         ] {
             chrome::render_line(
                 buf,
                 rect,
                 field_row(
                     label,
-                    text,
-                    caret && self.search.field() == field,
+                    self.search.input(field),
+                    typing && self.search.field() == field,
                     &self.styles,
                     rect.width,
                 ),
@@ -609,19 +605,18 @@ impl Workbench {
 
     fn render_editor(&mut self, buf: &mut Surface, area: Rect) {
         grab_scope!("workbench_editor", area);
-        let prompt = self.prompt();
         let [tabs, body, bar] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(0),
-            Constraint::Length(u16::from(prompt.is_some())),
+            Constraint::Length(u16::from(self.prompt().is_some())),
         ])
         .areas(area);
 
         self.panes.tabs = tabs;
         self.render_tabs(buf, tabs);
         self.render_body(buf, body);
-        if let Some((label, input, caret)) = prompt {
-            self.render_prompt(buf, bar, &label, &input, caret);
+        if let Some((label, field, focused)) = self.prompt() {
+            self.render_prompt(buf, bar, label, field, focused);
         }
         self.render_palette(buf, area);
         self.render_confirm(buf, area);
@@ -660,10 +655,13 @@ impl Workbench {
         chrome::render_line(
             buf,
             query,
-            Line::from(vec![
+            labelled_field(
                 Span::styled(PALETTE_PROMPT, self.styles.accent),
-                Span::styled(self.palette.query().to_owned(), self.styles.text),
-            ]),
+                self.palette.query(),
+                self.focused_field() == Some(FocusedField::Palette),
+                &self.styles,
+                usize::from(query.width),
+            ),
         );
         let scroll = self.palette.scroll();
         let selected = self.palette.selected_index();
@@ -892,7 +890,7 @@ impl Workbench {
 
     fn render_body(&mut self, buf: &mut Surface, area: Rect) {
         grab_scope!("workbench_editor_body", area);
-        let focused = self.focus == Focus::Editor && self.goto.is_none() && !self.palette.is_open();
+        let focused = self.focus == Focus::Editor && self.focused_field().is_none();
         let Some(tab) = self.editor.active_mut() else {
             self.panes.text = Rect::default();
             placeholder(buf, area, EMPTY_EDITOR_HINT, self.styles.dim);
@@ -963,15 +961,15 @@ impl Workbench {
         self.scrollbar(buf, Bar::Text, bar, total, top);
     }
 
-    fn render_prompt(&self, buf: &mut Surface, area: Rect, label: &str, input: &str, caret: bool) {
+    fn render_prompt(
+        &self,
+        buf: &mut Surface,
+        area: Rect,
+        label: &'static str,
+        field: &TextField,
+        focused: bool,
+    ) {
         grab_scope!("workbench_prompt", area);
-        let mut left = vec![Span::styled(label.to_owned(), self.styles.accent)];
-        if !input.is_empty() {
-            left.push(Span::styled(input.to_owned(), self.styles.text));
-        }
-        if caret {
-            left.push(Span::styled(CARET, self.styles.cursor));
-        }
         let right = match self.editor.active().map(|tab| &tab.find) {
             Some(find) if find.is_open() && !find.query().is_empty() => match find.position() {
                 Some((at, total)) => vec![Span::styled(format!("{at}/{total}"), self.styles.dim)],
@@ -979,10 +977,18 @@ impl Workbench {
             },
             _ => Vec::new(),
         };
+        let room = usize::from(area.width).saturating_sub(right.iter().map(Span::width).sum());
+        let left = labelled_field(
+            Span::styled(label, self.styles.accent),
+            field,
+            focused,
+            &self.styles,
+            room,
+        );
         chrome::render_line(
             buf,
             area,
-            chrome::status_line(left, right, area.width, self.styles.dim),
+            chrome::status_line(left.spans, right, area.width, self.styles.dim),
         );
     }
 
@@ -1101,19 +1107,27 @@ impl Workbench {
     }
 
     /// The one-line field under the editor, when something is asking for
-    /// input, and whether it carries a caret. A name is the only one of these
-    /// with no other sign on screen that it is being typed into: find marks its
-    /// matches and go-to-line takes digits alone.
-    fn prompt(&self) -> Option<(String, String, bool)> {
+    /// input, and whether the keys go to it, which is when it shows a caret.
+    fn prompt(&self) -> Option<(&'static str, &TextField, bool)> {
+        let focused = self.focused_field();
         if let Some(input) = &self.input {
-            return Some((input.kind.label().to_owned(), input.value.clone(), true));
+            return Some((
+                input.kind.label(),
+                &input.value,
+                focused == Some(FocusedField::Name),
+            ));
         }
-        if let Some(input) = &self.goto {
-            return Some((GOTO_PROMPT.to_owned(), input.clone(), false));
+        if let Some(line) = &self.goto {
+            return Some((GOTO_PROMPT, line, focused == Some(FocusedField::Goto)));
         }
         let find = &self.editor.active()?.find;
-        find.is_open()
-            .then(|| (FIND_PROMPT.to_owned(), find.query().to_owned(), false))
+        find.is_open().then(|| {
+            (
+                FIND_PROMPT,
+                find.query(),
+                focused == Some(FocusedField::Find),
+            )
+        })
     }
 }
 
@@ -1819,19 +1833,31 @@ const fn rail_mark(rail: Rail) -> &'static str {
 
 fn field_row(
     label: &'static str,
-    text: &str,
-    caret: bool,
+    field: &TextField,
+    focused: bool,
     styles: &WorkbenchStyles,
     width: u16,
 ) -> Line<'static> {
-    let budget = (width as usize).saturating_sub(label.len() + usize::from(caret));
-    let mut spans = vec![
-        Span::styled(label, if caret { styles.accent } else { styles.dim }),
-        Span::styled(chrome::fit_end(text, budget), styles.text),
-    ];
-    if caret {
-        spans.push(Span::styled(CARET, styles.cursor));
-    }
+    let label = Span::styled(label, if focused { styles.accent } else { styles.dim });
+    labelled_field(label, field, focused, styles, usize::from(width))
+}
+
+/// `label`, then `field` panned into whatever of `width` columns the label
+/// leaves it.
+pub(crate) fn labelled_field(
+    label: Span<'static>,
+    field: &TextField,
+    focused: bool,
+    styles: &WorkbenchStyles,
+    width: usize,
+) -> Line<'static> {
+    let room = width.saturating_sub(label.width());
+    let mut spans = vec![label];
+    spans.extend(
+        field
+            .paint(room, &styles.field(), focused, NO_PLACEHOLDER)
+            .spans,
+    );
     Line::from(spans)
 }
 
@@ -1841,14 +1867,13 @@ fn toggle_row(
     styles: &WorkbenchStyles,
     width: u16,
 ) -> Line<'static> {
-    let query = search.query();
     let left = TOGGLES
         .into_iter()
         .flat_map(|(toggle, label)| {
             let on = match toggle {
-                Toggle::Case => query.case_sensitive,
-                Toggle::Word => query.whole_word,
-                Toggle::Regex => query.regex,
+                Toggle::Case => search.case_sensitive(),
+                Toggle::Word => search.whole_word(),
+                Toggle::Regex => search.regex(),
             };
             let mut style = if on { styles.selected } else { styles.dim };
             if pointed == Some(toggle) && !on {

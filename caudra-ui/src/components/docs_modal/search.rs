@@ -4,15 +4,15 @@
 use std::ops::Range;
 
 use caudra_docs::{Hit, Library, Search, Target};
+use caudra_workbench::text_field::{FieldKind, TextField};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::{PaneContext, Pick, clicked, crumb, list_move};
-use crate::components::{ModalScroll, hover_style, input_line_with_cursor, match_spans};
-use crate::text_buffer::{EditResult, TextBuffer};
+use super::{PaneContext, Pick, clicked, crumb, field_pick, list_move, prompt_line};
+use crate::components::{ModalScroll, hover_style, match_spans};
 use crate::theme::Theme;
 
 const SEARCH_LIMIT: usize = 100;
@@ -30,7 +30,7 @@ const SECTIONS: &str = " sections";
 const SHOWN_OF: &str = " of ";
 
 pub(super) struct SearchView {
-    query: TextBuffer,
+    query: TextField,
     found: Search,
     selected: usize,
     scroll: ModalScroll,
@@ -41,7 +41,7 @@ pub(super) struct SearchView {
 impl Default for SearchView {
     fn default() -> Self {
         Self {
-            query: TextBuffer::new(String::new()),
+            query: TextField::new(FieldKind::Line),
             found: Search::default(),
             selected: 0,
             scroll: ModalScroll::new_top(),
@@ -53,14 +53,18 @@ impl Default for SearchView {
 
 impl SearchView {
     pub(super) fn set_query(&mut self, query: &str, library: &Library) {
-        self.query = TextBuffer::new(query.to_owned());
-        self.query.move_to_end();
+        self.query.set_text(query);
         self.run(library);
     }
 
     pub(super) fn paste(&mut self, text: &str, library: &Library) {
-        self.query.insert_text(text);
-        self.run(library);
+        if self.query.paste(text).changed() {
+            self.run(library);
+        }
+    }
+
+    pub(super) fn selected_text(&self) -> Option<String> {
+        self.query.selected_text()
     }
 
     pub(super) fn scroll(&mut self, delta: i32) {
@@ -72,7 +76,7 @@ impl SearchView {
     pub(super) fn terms(&self) -> Vec<String> {
         let mut terms: Vec<String> = self
             .query
-            .value()
+            .text()
             .split_whitespace()
             .map(str::to_ascii_lowercase)
             .chain(
@@ -102,10 +106,11 @@ impl SearchView {
                 .map_or(Pick::Stay, |hit| Pick::Open(target(hit))),
             KeyCode::Esc => Pick::Leave,
             _ => {
-                if self.query.handle_key(key) == EditResult::Changed {
+                let edit = self.query.handle_key(key);
+                if edit.changed() {
                     self.run(library);
                 }
-                Pick::Stay
+                field_pick(edit)
             }
         }
     }
@@ -125,7 +130,7 @@ impl SearchView {
             Constraint::Fill(1),
         ])
         .areas(area);
-        frame.render_widget(Paragraph::new(input_line_with_cursor(&self.query)), query);
+        frame.render_widget(Paragraph::new(prompt_line(&self.query, query.width)), query);
         frame.render_widget(Paragraph::new(self.status(theme)), status);
         let rows = self.found.hits.len().saturating_mul(usize::from(HIT_ROWS));
         self.scroll
@@ -163,7 +168,7 @@ impl SearchView {
     }
 
     fn run(&mut self, library: &Library) {
-        let query = self.query.value();
+        let query = self.query.text();
         self.found = match query.trim().is_empty() {
             true => Search::default(),
             false => library.search(&query, SEARCH_LIMIT),
@@ -173,7 +178,7 @@ impl SearchView {
     }
 
     fn status(&self, theme: &Theme) -> Line<'static> {
-        if self.query.value().trim().is_empty() {
+        if self.query.text().trim().is_empty() {
             return Line::from(Span::styled(PROMPT, theme.tool_dim));
         }
         let mut parts: Vec<String> = self
@@ -193,7 +198,7 @@ impl SearchView {
 
     #[cfg(test)]
     pub(super) fn query(&self) -> String {
-        self.query.value()
+        self.query.text()
     }
 
     #[cfg(test)]

@@ -1502,7 +1502,7 @@ mod tests {
         assert!(app.sandbox_reply.is_none());
     }
 
-    #[test_case(key::UNDO.to_key_event(); "undo_is_not_suspend")]
+    #[test_case(key::UNDO.to_key_event(); "undo_never_reaches_composer")]
     #[test_case(key::SAVE.to_key_event(); "save_never_reaches_composer")]
     fn sandbox_owns_editor_keys(event: KeyEvent) {
         let mut app = test_app();

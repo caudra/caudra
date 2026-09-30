@@ -3,9 +3,11 @@
 //! [`crate::components::command`]; only the surface differs.
 
 use caudra_grab::grab_scope;
+use caudra_workbench::text_field::{FieldKind, TextField, TextKey};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::components::command::{CommandRow, ParsedCommand};
@@ -13,10 +15,10 @@ use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction};
 use crate::components::modal::Modal;
 use crate::components::{
-    CHEVRON, Hint, HintBar, Overlay, input_line_with_cursor, visual_line_count,
+    CHEVRON, Hint, HintBar, Overlay, chevron_span, field_styles, input_text_style,
+    visual_line_count,
 };
 use crate::repaint::Cadence;
-use crate::text_buffer::TextBuffer;
 use crate::theme;
 use unicode_width::UnicodeWidthStr;
 
@@ -30,13 +32,14 @@ pub enum CommandModalAction {
     Consumed,
     Closed,
     Execute(ParsedCommand),
+    Copy(String),
 }
 
 enum Stage {
     Closed,
     Pick(Box<ListPicker<CommandRow>>),
     Args {
-        input: TextBuffer,
+        input: Box<TextField>,
         row: CommandRow,
         footer: HintBar,
     },
@@ -50,6 +53,7 @@ enum StageAction {
     Back,
     AskArgs { row: Box<CommandRow>, query: String },
     Run(ParsedCommand),
+    Copy(String),
 }
 
 pub struct CommandModal {
@@ -108,14 +112,14 @@ impl CommandModal {
             Stage::Args { input, row, .. } => match key_event.code {
                 KeyCode::Enter => StageAction::Run(ParsedCommand {
                     name: row.name.clone(),
-                    args: input.value().trim().to_string(),
+                    args: input.text().trim().to_string(),
                 }),
                 KeyCode::Esc => StageAction::Back,
-                _ if key::QUIT.matches(key_event) => StageAction::Close,
-                _ => {
-                    input.handle_key(key_event);
-                    return CommandModalAction::Consumed;
-                }
+                _ => match input.handle_key(key_event) {
+                    TextKey::Copy(text) | TextKey::Cut(text) => StageAction::Copy(text),
+                    TextKey::Ignored if key::QUIT.matches(key_event) => StageAction::Close,
+                    _ => StageAction::None,
+                },
             },
         };
 
@@ -150,7 +154,7 @@ impl CommandModal {
             Stage::Closed => false,
             Stage::Pick(picker) => picker.handle_paste(text),
             Stage::Args { input, .. } => {
-                input.insert_text(text);
+                input.paste(text);
                 true
             }
         }
@@ -183,6 +187,7 @@ impl CommandModal {
                 args: String::new(),
             }),
             PickerAction::Close => StageAction::Close,
+            PickerAction::Copy(text) => StageAction::Copy(text),
             PickerAction::Consumed | PickerAction::Toggle(..) | PickerAction::Key(_) => {
                 StageAction::None
             }
@@ -192,10 +197,11 @@ impl CommandModal {
     fn transition(&mut self, action: StageAction) -> CommandModalAction {
         match action {
             StageAction::None => CommandModalAction::Consumed,
+            StageAction::Copy(text) => CommandModalAction::Copy(text),
             StageAction::AskArgs { row, query } => {
                 self.query = query;
                 self.stage = Stage::Args {
-                    input: TextBuffer::new(String::new()),
+                    input: Box::new(TextField::new(FieldKind::Line)),
                     row: *row,
                     footer: HintBar::default(),
                 };
@@ -235,8 +241,8 @@ impl CommandModal {
                 // heights; a fixed guess clips the input line out of view.
                 let width = modal_inner_width(area, ARGS_WIDTH_PERCENT);
                 let hint_rows = wrapped_rows(&row.description, width);
-                let input_rows =
-                    wrapped_rows(&input.value(), width - CHEVRON.width() as u16).max(1);
+                let input_lines = prompt_lines(input, width);
+                let input_rows = input_lines.len() as u16;
                 let (popup, inner) =
                     modal.render(frame, area, hint_rows + input_rows + FOOTER_ROWS);
 
@@ -253,12 +259,7 @@ impl CommandModal {
                         .wrap(Wrap { trim: true }),
                     hint_area,
                 );
-                frame.render_widget(
-                    Paragraph::new(input_line_with_cursor(input))
-                        .style(bg)
-                        .wrap(Wrap { trim: false }),
-                    input_area,
-                );
+                frame.render_widget(Paragraph::new(input_lines).style(bg), input_area);
                 frame.render_widget(
                     Paragraph::new(footer.line(footer_area, args_footer())).style(bg),
                     footer_area,
@@ -292,6 +293,23 @@ impl Overlay for CommandModal {
 /// always has somewhere to wrap into.
 fn modal_inner_width(area: Rect, width_percent: u16) -> u16 {
     Modal::inner_width(area.width, width_percent).max(CHEVRON.width() as u16 + 1)
+}
+
+/// The argument wrapped beside its chevron, every row after the first
+/// indented to line up under the text.
+fn prompt_lines(input: &TextField, width: u16) -> Vec<Line<'static>> {
+    let indent = CHEVRON.width();
+    let styles = field_styles(input_text_style());
+    let mut lines =
+        input.paint_wrapped(usize::from(width).saturating_sub(indent), &styles, true, "");
+    for (index, line) in lines.iter_mut().enumerate() {
+        let prefix = match index {
+            0 => chevron_span(),
+            _ => Span::raw(" ".repeat(indent)),
+        };
+        line.spans.insert(0, prefix);
+    }
+    lines
 }
 
 /// Zero for empty text, so a command with no description spends no row on it.
@@ -329,6 +347,7 @@ mod tests {
     const SUBSTRING_QUERY: &str = "view";
     const BETTER_MATCH: &str = "/view";
     const WORSE_MATCH: &str = "/review";
+    const ARGUMENT: &str = "why";
 
     fn row(name: &str, description: &str, max_args: usize) -> CommandRow {
         CommandRow {
@@ -531,7 +550,21 @@ mod tests {
         let Stage::Args { input, .. } = &modal.stage else {
             unreachable!()
         };
-        assert_eq!(input.value(), "pasted");
+        assert_eq!(input.text(), "pasted");
+    }
+
+    #[test]
+    fn ctrl_c_copies_a_selected_argument_and_keeps_the_prompt() {
+        let mut modal = opened();
+        type_text(&mut modal, "btw");
+        modal.handle_key(key(KeyCode::Enter));
+        type_text(&mut modal, ARGUMENT);
+        modal.handle_key(key::SELECT_ALL.to_key_event());
+
+        let action = modal.handle_key(key::QUIT.to_key_event());
+
+        assert!(matches!(action, CommandModalAction::Copy(ref text) if text == ARGUMENT));
+        assert_eq!(stage_name(&modal), "args");
     }
 
     #[test]
@@ -591,6 +624,6 @@ mod tests {
         let Stage::Args { input, .. } = &modal.stage else {
             panic!("expected args stage, got {}", stage_name(&modal));
         };
-        assert_eq!(input.value(), "h");
+        assert_eq!(input.text(), "h");
     }
 }

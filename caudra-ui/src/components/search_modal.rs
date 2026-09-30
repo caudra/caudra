@@ -1,13 +1,12 @@
 use std::cmp::Reverse;
 
-use crate::components::Overlay;
-use crate::components::keybindings::key;
-use crate::components::match_spans;
 use crate::components::modal::Modal;
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
-use crate::text_buffer::TextBuffer;
+use crate::components::{Overlay, field_styles, input_text_style, match_spans};
 use crate::theme;
 use caudra_grab::grab_scope;
+use caudra_workbench::keys::{LIST_FIRST, LIST_LAST};
+use caudra_workbench::text_field::{FieldKind, TextField, TextKey};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
@@ -43,11 +42,15 @@ pub enum SearchAction {
     QueryChanged,
     Navigate,
     Select(usize),
+    Copy(String),
+    /// The selection came out of the query: it goes on the clipboard, and the
+    /// matches are stale.
+    Cut(String),
     Close(Option<(u32, bool)>),
 }
 
 pub struct SearchModal {
-    search: TextBuffer,
+    search: TextField,
     matches: Vec<SearchMatch>,
     selected: usize,
     scroll_offset: usize,
@@ -66,7 +69,7 @@ pub struct SearchModal {
 impl SearchModal {
     pub fn new() -> Self {
         Self {
-            search: TextBuffer::new(String::new()),
+            search: TextField::new(FieldKind::Line),
             matches: Vec::new(),
             selected: 0,
             scroll_offset: 0,
@@ -128,7 +131,7 @@ impl SearchModal {
     }
 
     pub fn handle_paste(&mut self, text: &str) {
-        self.search.insert_text(text);
+        self.search.paste(text);
         self.invalidate_mouse_geometry();
     }
 
@@ -164,22 +167,27 @@ impl SearchModal {
                 self.page(1);
                 SearchAction::Navigate
             }
-            KeyCode::Home => {
+            _ if LIST_FIRST.matches(key) => {
                 self.select(0);
                 SearchAction::Navigate
             }
-            KeyCode::End => {
+            _ if LIST_LAST.matches(key) => {
                 self.select(self.matches.len().saturating_sub(1));
                 SearchAction::Navigate
             }
             _ => {
-                if key::DELETE_WORD.matches(key) {
-                    self.search.remove_word_before_cursor();
-                } else {
-                    self.search.handle_key(key);
+                let edit = self.search.handle_key(key);
+                if edit.changed() {
+                    self.invalidate_mouse_geometry();
                 }
-                self.invalidate_mouse_geometry();
-                SearchAction::QueryChanged
+                match edit {
+                    TextKey::Changed => SearchAction::QueryChanged,
+                    TextKey::Copy(text) => SearchAction::Copy(text),
+                    TextKey::Cut(text) => SearchAction::Cut(text),
+                    TextKey::Handled | TextKey::Refused | TextKey::Ignored => {
+                        SearchAction::Consumed
+                    }
+                }
             }
         }
     }
@@ -291,7 +299,7 @@ impl SearchModal {
 
     pub fn update_matches(&mut self, segment_texts: &[&str]) {
         self.invalidate_mouse_geometry();
-        let query = self.search.value();
+        let query = self.search.text();
         self.matches.clear();
         self.selected = 0;
         self.scroll_offset = 0;
@@ -346,7 +354,7 @@ impl SearchModal {
         }
         grab_scope!("search_modal", area);
 
-        let content_rows = if self.matches.is_empty() && !self.search.value().is_empty() {
+        let content_rows = if self.matches.is_empty() && !self.search.is_empty() {
             1
         } else {
             self.matches.len() as u16
@@ -400,7 +408,7 @@ impl SearchModal {
         let t = theme::current();
 
         if self.matches.is_empty() {
-            if !self.search.value().is_empty() {
+            if !self.search.is_empty() {
                 let line = Line::from(Span::styled(NO_MATCHES, t.item_desc));
                 frame.render_widget(Paragraph::new(vec![line]), area);
             }
@@ -429,22 +437,13 @@ impl SearchModal {
 
     fn render_search(&self, frame: &mut Frame, area: Rect) {
         grab_scope!("search_modal_search", area);
-        let t = theme::current();
-        let query = self.search.value();
-        let cursor_byte = TextBuffer::char_to_byte(&query, self.search.x());
-        let (before, rest) = query.split_at(cursor_byte);
-        let mut chars = rest.chars();
-        let cursor_char = chars.next().unwrap_or(' ');
-        let after = chars.as_str();
-
-        let text = super::input_text_style();
-        let line = Line::from(vec![
-            Span::styled(SEARCH_PREFIX, t.tool_dim),
-            Span::styled(before.to_owned(), text),
-            Span::styled(cursor_char.to_string(), t.cursor),
-            Span::styled(after.to_owned(), text),
-        ]);
-        frame.render_widget(Paragraph::new(vec![line]), area);
+        let prefix = Span::styled(SEARCH_PREFIX, theme::current().tool_dim);
+        let width = usize::from(area.width).saturating_sub(prefix.width());
+        let mut line = self
+            .search
+            .paint(width, &field_styles(input_text_style()), true, "");
+        line.spans.insert(0, prefix);
+        frame.render_widget(Paragraph::new(line), area);
     }
 }
 
@@ -497,12 +496,17 @@ fn build_highlighted_line<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::keybindings::key;
     use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
     use test_case::test_case;
 
     const BAR_LOST_THE_PRESS: &str = "the row under the scrollbar took the press";
     const QUERY_UNTOUCHED: &str = "the navigation key edited the query line";
     const EXPECT_NAVIGATE: &str = "moving the selection has to re-sync the transcript highlight";
+    const REFILTERED: &str = "a caret motion refiltered the results";
+    const NOT_COPIED: &str = "the selected query never reached the clipboard";
+    const ITEM: &str = "item";
+    const ITEM_COUNT: usize = 20;
     /// More matches than the 80x24 test terminal can show, so the bar has a
     /// track to press on.
     const OVERFLOWING_MATCHES: usize = 50;
@@ -538,9 +542,16 @@ mod tests {
     fn modal_with_query(query: &str, texts: &[&str]) -> SearchModal {
         let mut modal = SearchModal::new();
         modal.open(0, true);
-        modal.search = TextBuffer::new(query.into());
+        modal.search = TextField::with_text(FieldKind::Line, query);
         modal.update_matches(texts);
         modal
+    }
+
+    /// `ITEM` matching every one of `ITEM_COUNT` results.
+    fn modal_with_items() -> SearchModal {
+        let texts: Vec<String> = (0..ITEM_COUNT).map(|i| format!("{ITEM} {i}")).collect();
+        let borrowed: Vec<&str> = texts.iter().map(String::as_str).collect();
+        modal_with_query(ITEM, &borrowed)
     }
 
     #[test]
@@ -580,25 +591,55 @@ mod tests {
 
     /// A page is a jump, so it clamps where the arrows wrap, and all four
     /// navigation keys belong to the result list rather than to the query.
-    #[test_case(KeyCode::Home,     0  ; "home_selects_first")]
-    #[test_case(KeyCode::End,      19 ; "end_selects_last")]
-    #[test_case(KeyCode::PageUp,   5  ; "page_up_retreats_a_page")]
-    #[test_case(KeyCode::PageDown, 15 ; "page_down_advances_a_page")]
-    fn navigation_keys_move_the_result_list(code: KeyCode, expected: usize) {
-        let texts: Vec<String> = (0..20).map(|i| format!("item {i}")).collect();
-        let borrowed: Vec<&str> = texts.iter().map(String::as_str).collect();
-        let mut modal = modal_with_query("item", &borrowed);
+    #[test_case(LIST_FIRST.to_key_event(),   0  ; "ctrl_home_selects_first")]
+    #[test_case(LIST_LAST.to_key_event(),    19 ; "ctrl_end_selects_last")]
+    #[test_case(key_event(KeyCode::PageUp),   5  ; "page_up_retreats_a_page")]
+    #[test_case(key_event(KeyCode::PageDown), 15 ; "page_down_advances_a_page")]
+    fn navigation_keys_move_the_result_list(event: KeyEvent, expected: usize) {
+        let mut modal = modal_with_items();
         modal.viewport_height = 5;
         modal.selected = 10;
 
-        let action = modal.handle_key(key_event(code));
+        let action = modal.handle_key(event);
 
         assert!(
             matches!(action, SearchAction::Navigate),
             "{EXPECT_NAVIGATE}"
         );
         assert_eq!(modal.selected, expected);
-        assert_eq!(modal.search.value(), "item", "{QUERY_UNTOUCHED}");
+        assert_eq!(modal.search.text(), ITEM, "{QUERY_UNTOUCHED}");
+    }
+
+    /// Home and End move the caret without refiltering, which would throw the
+    /// selection back to the top.
+    #[test_case(KeyCode::Home, 0          ; "home")]
+    #[test_case(KeyCode::End,  ITEM.len() ; "end")]
+    fn home_and_end_move_the_query_caret(code: KeyCode, caret: usize) {
+        let mut modal = modal_with_items();
+        modal.search.set_cursor_offset(1);
+        modal.selected = 10;
+
+        let action = modal.handle_key(key_event(code));
+
+        assert!(matches!(action, SearchAction::Consumed), "{REFILTERED}");
+        assert_eq!(modal.search.cursor_offset(), caret);
+        assert_eq!(modal.selected, 10, "{REFILTERED}");
+    }
+
+    #[test_case(key::QUIT.to_key_event(), false ; "ctrl_c_copies")]
+    #[test_case(key::CUT.to_key_event(),  true  ; "shift_delete_cuts")]
+    fn clipboard_chords_hand_the_selected_query_back(event: KeyEvent, cut: bool) {
+        let mut modal = modal_with_items();
+        modal.handle_key(key::SELECT_ALL.to_key_event());
+
+        let copied = match modal.handle_key(event) {
+            SearchAction::Copy(text) if !cut => text,
+            SearchAction::Cut(text) if cut => text,
+            _ => panic!("{NOT_COPIED}"),
+        };
+
+        assert_eq!(copied, ITEM);
+        assert_eq!(modal.search.is_empty(), cut);
     }
 
     #[test]
@@ -628,7 +669,7 @@ mod tests {
         assert!(!modal.matches.is_empty());
         modal.close();
         assert!(modal.matches.is_empty());
-        assert!(modal.search.value().is_empty());
+        assert!(modal.search.is_empty());
         assert!(!modal.is_open());
     }
 

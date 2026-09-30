@@ -7,18 +7,20 @@ use crate::components::modal::{ESC_LABEL, FooterHits, FooterLine, Modal};
 use crate::components::prompt_progress::{self, PromptProgress, PromptRate};
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::components::streaming_content::StreamingContent;
-use crate::text_buffer::TextBuffer;
+use crate::components::{field_styles, input_text_style};
 use crate::theme;
 
 use caudra_agent::{CancelTrigger, format_live_duration, format_settled_duration};
 use caudra_grab::grab_scope;
 use caudra_providers::{Billing, TokenUsage};
 use caudra_storage::usage_ledger::LedgerPurpose;
+use caudra_workbench::text_field::{FieldKind, FieldStyles, TextField, TextKey};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
+use unicode_width::UnicodeWidthStr;
 
 use crate::repaint::{Cadence, Dirty};
 
@@ -242,7 +244,7 @@ pub struct StreamModal {
     footer: StreamFooter,
     exchanges: Vec<Exchange>,
     ms_per_char: u64,
-    input: TextBuffer,
+    input: TextField,
     scroll: ModalScroll,
     scrollbar: Scrollbar,
     footer_hits: FooterHits,
@@ -269,7 +271,7 @@ impl StreamModal {
             footer: StreamFooter::Close,
             exchanges: Vec::new(),
             ms_per_char,
-            input: TextBuffer::new(String::new()),
+            input: TextField::new(FieldKind::Line),
             scroll: ModalScroll::new(),
             scrollbar: Scrollbar::default(),
             footer_hits: FooterHits::default(),
@@ -469,19 +471,18 @@ impl StreamModal {
     }
 
     pub fn handle_key(&mut self, key_event: KeyEvent) -> StreamAction {
-        if key_event.modifiers.contains(KeyModifiers::CONTROL) {
-            match key_event.code {
-                // The global gesture stops what is running, so here it stops
-                // the answer and leaves the thread that asked for it.
-                KeyCode::Char('c') if self.is_streaming() => self.stop(),
-                KeyCode::Char('c') => self.close(),
-                KeyCode::Char('y') => return StreamAction::Copy(self.text().to_owned()),
-                _ => return StreamAction::Consumed,
-            }
-            return StreamAction::Consumed;
+        let chord = key_event.modifiers.contains(KeyModifiers::CONTROL);
+        if chord && key_event.code == KeyCode::Char('y') {
+            return StreamAction::Copy(self.text().to_owned());
         }
         if self.footer == StreamFooter::FollowUp {
             return self.handle_follow_up_key(key_event);
+        }
+        if chord {
+            if key_event.code == KeyCode::Char('c') {
+                self.interrupt();
+            }
+            return StreamAction::Consumed;
         }
         match key_event.code {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char(' ') => self.close(),
@@ -496,12 +497,13 @@ impl StreamModal {
     }
 
     /// The input owns every key but the ones that move the thread: `y` and
-    /// Space are text here.
+    /// Space are text here, and `Ctrl+C` copies what is selected in it before
+    /// it stops anything.
     fn handle_follow_up_key(&mut self, key_event: KeyEvent) -> StreamAction {
         match key_event.code {
             KeyCode::Esc => self.close(),
             KeyCode::Enter => {
-                if self.input.value().trim().is_empty() {
+                if self.input.text().trim().is_empty() {
                     self.close();
                 } else if let Some(question) = self.take_question() {
                     return StreamAction::Submit(question);
@@ -510,18 +512,40 @@ impl StreamModal {
             KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown => {
                 self.scroll.handle_key(key_event);
             }
-            _ => {
-                self.input.handle_key(key_event);
-            }
+            _ => match self.input.handle_key(key_event) {
+                TextKey::Copy(text) | TextKey::Cut(text) => return StreamAction::Copy(text),
+                TextKey::Ignored
+                    if key_event.code == KeyCode::Char('c')
+                        && key_event.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    self.interrupt();
+                }
+                _ => {}
+            },
         }
         StreamAction::Consumed
+    }
+
+    /// The global gesture stops what is running, so here it stops the answer
+    /// and leaves the thread that asked for it. With nothing running it
+    /// dismisses.
+    fn interrupt(&mut self) {
+        match self.is_streaming() {
+            true => self.stop(),
+            false => self.close(),
+        }
+    }
+
+    /// Whether keys are typing into the follow-up input.
+    pub fn text_input_active(&self) -> bool {
+        self.open && self.footer == StreamFooter::FollowUp
     }
 
     /// The typed follow-up, cleared from the input once taken. A question
     /// asked while the answer is still streaming is queued instead of sent,
     /// so it cannot cancel the answer it is following up.
     fn take_question(&mut self) -> Option<String> {
-        let question = self.input.value().trim().to_owned();
+        let question = self.input.text().trim().to_owned();
         if question.is_empty() {
             return None;
         }
@@ -563,11 +587,10 @@ impl StreamModal {
 
     /// A paste lands in the input, flattened to the one line it has.
     pub fn handle_paste(&mut self, text: &str) -> bool {
-        if !self.open || self.footer != StreamFooter::FollowUp {
+        if !self.text_input_active() {
             return false;
         }
-        let flat: Vec<&str> = text.lines().collect();
-        self.input.insert_text(&flat.join(" "));
+        self.input.paste(text);
         true
     }
 
@@ -650,7 +673,7 @@ impl StreamModal {
             self.draw_status(frame, status);
         }
         if let Some(input) = input {
-            frame.render_widget(Paragraph::new(self.input_line()), input);
+            frame.render_widget(Paragraph::new(self.input_line(input.width)), input);
         }
         let footer = self.footer_line();
         self.footer_hits.set(footer.hits(footer_row, 0, 1));
@@ -693,29 +716,18 @@ impl StreamModal {
         }
     }
 
-    fn input_line(&self) -> Line<'static> {
+    fn input_line(&self, width: u16) -> Line<'static> {
         let theme = theme::current();
-        let text = self.input.value();
-        if text.is_empty()
-            && let Some(placeholder) = self.placeholder()
-        {
-            return Line::from(vec![
-                Span::styled(INPUT_PREFIX, theme.tool_dim),
-                Span::styled(placeholder, theme.tool_dim),
-            ]);
-        }
-        let cursor_byte = TextBuffer::char_to_byte(&text, self.input.x());
-        let (before, rest) = text.split_at(cursor_byte);
-        let mut chars = rest.chars();
-        let cursor_char = chars.next().unwrap_or(' ');
-        let after = chars.as_str();
-        let style = super::input_text_style();
-        Line::from(vec![
-            Span::styled(INPUT_PREFIX, theme.tool_dim),
-            Span::styled(before.to_owned(), style),
-            Span::styled(cursor_char.to_string(), theme.cursor),
-            Span::styled(after.to_owned(), style),
-        ])
+        let styles = FieldStyles {
+            placeholder: theme.tool_dim,
+            ..field_styles(input_text_style())
+        };
+        let width = usize::from(width).saturating_sub(INPUT_PREFIX.width());
+        let placeholder = self.placeholder().unwrap_or_default();
+        let mut line = self.input.paint(width, &styles, true, &placeholder);
+        line.spans
+            .insert(0, Span::styled(INPUT_PREFIX, theme.tool_dim));
+        line
     }
 
     /// An empty input says why it is empty: what is already queued, or that
@@ -744,7 +756,7 @@ impl StreamModal {
 
     #[cfg(test)]
     pub(crate) fn input_text(&self) -> String {
-        self.input.value()
+        self.input.text()
     }
 }
 
@@ -1402,6 +1414,47 @@ mod tests {
 
         m.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(!m.is_open());
+    }
+
+    #[test_case(KeyCode::Char('w'), "one !"; "ctrl_w_deletes_the_word_before_the_caret")]
+    #[test_case(KeyCode::Backspace, "one !"; "ctrl_backspace_deletes_the_word_before_the_caret")]
+    #[test_case(KeyCode::Left, "one !two"; "ctrl_left_moves_back_a_word")]
+    fn the_follow_up_input_edits_like_the_composer(code: KeyCode, expected: &str) {
+        let mut m = StreamModal::new(0);
+        let (_tx, cancel) = open_modal(&mut m, HEADER, StreamFooter::FollowUp);
+        type_text(&mut m, "one two");
+        assert!(matches!(
+            m.handle_key(KeyEvent::new(code, KeyModifiers::CONTROL)),
+            StreamAction::Consumed
+        ));
+        type_text(&mut m, "!");
+        assert_eq!(m.input_text(), expected);
+        assert!(m.is_streaming() && !cancel.is_cancelled());
+    }
+
+    /// `Ctrl+C` copies a selection before it stops anything, and `Ctrl+Y`
+    /// stays the modal's: it copies the answer, never the selection.
+    #[test]
+    fn ctrl_c_copies_a_selected_follow_up_and_stops_nothing() {
+        const SELECTED: &str = "two";
+        let mut m = StreamModal::new(0);
+        let (tx, cancel) = open_modal(&mut m, HEADER, StreamFooter::FollowUp);
+        tx.send(StreamEvent::TextDelta(ANSWER.into())).unwrap();
+        let _ = m.poll();
+        type_text(&mut m, "one two");
+        for _ in SELECTED.chars() {
+            m.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+        }
+
+        assert!(matches!(
+            m.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            StreamAction::Copy(text) if text == SELECTED
+        ));
+        assert!(m.is_streaming() && !cancel.is_cancelled());
+        assert!(matches!(
+            m.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)),
+            StreamAction::Copy(text) if text == ANSWER
+        ));
     }
 
     /// Scrolling back through a thread, the price of an answer belongs beside

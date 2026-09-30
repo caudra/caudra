@@ -75,6 +75,10 @@ impl App {
     ) -> Vec<Action> {
         match action {
             MemoryPickerAction::Consumed | MemoryPickerAction::Closed => Vec::new(),
+            MemoryPickerAction::Copy(text) => {
+                self.copy_to_clipboard(&text);
+                Vec::new()
+            }
             MemoryPickerAction::Open(name) if self.workspace_session.is_some() => {
                 let reference = self
                     .remote_document_store()

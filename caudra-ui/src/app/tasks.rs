@@ -832,6 +832,7 @@ impl App {
         match action {
             TaskPickerAction::History { older } => self.load_task_history(older),
             TaskPickerAction::Consumed => {}
+            TaskPickerAction::Copy(text) => self.copy_to_clipboard(&text),
             TaskPickerAction::Opened(id) => self.preview_task(&id),
             TaskPickerAction::Control { task, promote } => {
                 self.start_task_control(*task, promote, ControlModal::Tasks);

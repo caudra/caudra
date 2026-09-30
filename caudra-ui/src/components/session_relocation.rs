@@ -7,6 +7,8 @@ use caudra_grab::grab_scope;
 use caudra_storage::id::CaudraId;
 use caudra_storage::paths;
 use caudra_storage::sessions::{SessionLocation, SessionRelocation};
+use caudra_workbench::keys::{LIST_FIRST, LIST_LAST};
+use caudra_workbench::text_field::{FieldKind, TextField, TextKey};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
@@ -15,7 +17,6 @@ use super::{Hint, Overlay};
 use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::repaint::Cadence;
-use crate::text_buffer::TextBuffer;
 
 const MAX_VISIBLE: u16 = 12;
 const WIDTH_PERCENT: u16 = 95;
@@ -58,6 +59,7 @@ pub enum SessionRelocationAction {
     Consumed,
     Closed,
     Confirm(SessionRelocation, Option<(CaudraId, String)>),
+    Copy(String),
 }
 
 enum EntryKind {
@@ -87,7 +89,7 @@ struct Target {
 enum Stage {
     Source(Option<Target>),
     Destination,
-    Custom(TextBuffer),
+    Custom(TextField),
     Confirm(SessionRelocation, Option<(CaudraId, String)>),
 }
 
@@ -173,7 +175,7 @@ impl SessionRelocationPicker {
         let Some(flow) = &mut self.flow else {
             return SessionRelocationAction::Consumed;
         };
-        if event.code == KeyCode::Esc || key::QUIT.matches(event) {
+        if event.code == KeyCode::Esc {
             self.close();
             return SessionRelocationAction::Closed;
         }
@@ -183,9 +185,9 @@ impl SessionRelocationPicker {
             return SessionRelocationAction::Consumed;
         }
         match &mut flow.stage {
-            Stage::Custom(buffer) => {
+            Stage::Custom(field) => {
                 if key::RENAME_SESSION.matches(event) {
-                    let directory = buffer.value();
+                    let directory = field.text();
                     if flow.source_cwd.is_some() {
                         self.show_sources(Some(Target {
                             directory,
@@ -195,11 +197,21 @@ impl SessionRelocationPicker {
                         self.show_destinations();
                     }
                 } else if event.code == KeyCode::Enter {
-                    let destination = buffer.value();
+                    let destination = field.text();
                     self.preview(destination, None);
                 } else {
-                    buffer.handle_key(event);
+                    let edit = field.handle_key(event);
                     self.sync_custom();
+                    match edit {
+                        TextKey::Copy(text) | TextKey::Cut(text) => {
+                            return SessionRelocationAction::Copy(text);
+                        }
+                        TextKey::Ignored if key::QUIT.matches(event) => {
+                            self.close();
+                            return SessionRelocationAction::Closed;
+                        }
+                        _ => {}
+                    }
                 }
                 return SessionRelocationAction::Consumed;
             }
@@ -231,16 +243,19 @@ impl SessionRelocationPicker {
                     }
                     return SessionRelocationAction::Consumed;
                 }
-                if !matches!(
+                // The list has nothing to search here, so it hears only the
+                // keys that move or answer it; `Ctrl+C` closes through it.
+                let for_list = matches!(
                     event.code,
                     KeyCode::Enter
                         | KeyCode::Up
                         | KeyCode::Down
                         | KeyCode::PageUp
                         | KeyCode::PageDown
-                        | KeyCode::Home
-                        | KeyCode::End
-                ) {
+                ) || LIST_FIRST.matches(event)
+                    || LIST_LAST.matches(event)
+                    || key::QUIT.matches(event);
+                if !for_list {
                     return SessionRelocationAction::Consumed;
                 }
             }
@@ -258,8 +273,8 @@ impl SessionRelocationPicker {
 
     pub fn handle_paste(&mut self, text: &str) -> bool {
         match self.flow.as_mut().map(|flow| &mut flow.stage) {
-            Some(Stage::Custom(buffer)) => {
-                buffer.insert_text(text);
+            Some(Stage::Custom(field)) => {
+                field.paste(text);
                 self.sync_custom();
                 true
             }
@@ -380,9 +395,7 @@ impl SessionRelocationPicker {
         let Some(flow) = &mut self.flow else {
             return;
         };
-        let mut buffer = TextBuffer::new(destination);
-        buffer.move_to_end();
-        flow.stage = Stage::Custom(buffer);
+        flow.stage = Stage::Custom(TextField::with_text(FieldKind::Line, &destination));
         self.picker.set_error_text(None);
         self.picker.set_info_text(Some(CUSTOM_HINT.into()));
         self.picker.set_empty_text(EMPTY_DESTINATION);
@@ -393,13 +406,20 @@ impl SessionRelocationPicker {
 
     fn sync_custom(&mut self) {
         if let Some(Flow {
-            stage: Stage::Custom(buffer),
+            stage: Stage::Custom(field),
             ..
         }) = &self.flow
         {
-            self.picker.set_search_text(&buffer.value());
-            self.picker.set_search_cursor(buffer.cursor_offset());
+            self.picker.mirror_search(field);
         }
+    }
+
+    /// Whether keys are typing into the custom directory.
+    pub fn text_input_active(&self) -> bool {
+        matches!(
+            self.flow.as_ref().map(|flow| &flow.stage),
+            Some(Stage::Custom(_))
+        )
     }
 
     fn preview(&mut self, input: String, donor: Option<(CaudraId, String)>) {
@@ -573,6 +593,7 @@ impl SessionRelocationPicker {
                 EntryKind::Confirm => return self.confirm(),
             },
             PickerAction::Key(key) => return self.handle_key(key),
+            PickerAction::Copy(text) => return SessionRelocationAction::Copy(text),
             PickerAction::Consumed | PickerAction::Toggle(..) => {}
         }
         SessionRelocationAction::Consumed
@@ -670,6 +691,7 @@ mod tests {
 
     use caudra_storage::id::CaudraId;
     use caudra_storage::sessions::SessionLocation;
+    use caudra_workbench::keys::LIST_LAST;
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
@@ -694,6 +716,7 @@ mod tests {
     const HOME: &str = "home";
     const OLD: &str = "deleted source";
     const TITLE: &str = "same title";
+    const COPY_KEEPS_FIELD: &str = "copying the custom directory left the field";
     const WRITE_VERSION: i64 = 7;
     const UPDATED_AT: u64 = 42;
     const CURRENT: u8 = 1;
@@ -1083,7 +1106,7 @@ mod tests {
                 .0
                 .contains(&format!("[x] {PROJECT_USAGE}"))
         );
-        picker.handle_key(press(KeyCode::End));
+        picker.handle_key(LIST_LAST.to_key_event());
         let SessionRelocationAction::Confirm(request, _) = picker.handle_key(press(KeyCode::Enter))
         else {
             panic!()
@@ -1344,6 +1367,41 @@ mod tests {
             SessionRelocationAction::Consumed
         ));
         assert!(!picker.handle_paste(TITLE));
+    }
+
+    #[test_case(0; "source")]
+    #[test_case(1; "destination")]
+    #[test_case(2; "custom")]
+    #[test_case(3; "confirmation")]
+    fn ctrl_c_with_nothing_selected_cancels_every_stage(stage: usize) {
+        let root = workspace();
+        let mut picker = opened(
+            root.path(),
+            stage == 0,
+            (stage == 3).then(|| path_string(&root.path().join(TARGET))),
+        );
+        if stage == 2 {
+            picker.handle_key(key::RELOCATION_CUSTOM.to_key_event());
+        }
+        assert!(matches!(
+            picker.handle_key(key::QUIT.to_key_event()),
+            SessionRelocationAction::Closed
+        ));
+        assert!(!picker.is_open());
+    }
+
+    #[test]
+    fn ctrl_c_copies_the_selected_custom_directory() {
+        let root = workspace();
+        let mut picker = opened(root.path(), false, None);
+        picker.handle_key(key::RELOCATION_CUSTOM.to_key_event());
+        picker.handle_paste(TITLE);
+        picker.handle_key(key::SELECT_ALL.to_key_event());
+
+        let action = picker.handle_key(key::QUIT.to_key_event());
+
+        assert!(matches!(action, SessionRelocationAction::Copy(text) if text == TITLE));
+        assert!(picker.text_input_active(), "{COPY_KEEPS_FIELD}");
     }
 
     #[test_case(false; "custom_entry")]

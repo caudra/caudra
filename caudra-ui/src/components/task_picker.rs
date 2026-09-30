@@ -70,6 +70,7 @@ pub enum TaskPickerAction {
     },
     /// Cancelled. The app restores whichever task was focused on open.
     Closed(Option<String>),
+    Copy(String),
 }
 
 #[derive(PartialEq)]
@@ -375,6 +376,7 @@ impl TaskPicker {
                 TaskPickerAction::Closed(origin)
             }
             PickerAction::Key(key) => self.handle_key(key),
+            PickerAction::Copy(text) => TaskPickerAction::Copy(text),
         }
     }
 }

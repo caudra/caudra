@@ -14,6 +14,7 @@ const MAX_VISIBLE: u16 = 15;
 pub enum ThemePickerAction {
     Consumed,
     Closed,
+    Copy(String),
 }
 
 pub struct ThemePicker {
@@ -93,6 +94,10 @@ impl ThemePicker {
                 ThemePickerAction::Closed
             }
             PickerAction::Toggle(..) | PickerAction::Key(_) => ThemePickerAction::Consumed,
+            PickerAction::Copy(text) => {
+                self.apply_preview();
+                ThemePickerAction::Copy(text)
+            }
         }
     }
 

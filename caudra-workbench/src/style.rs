@@ -6,6 +6,8 @@
 
 use ratatui::style::{Color, Modifier, Style};
 
+use crate::editor::text_field::FieldStyles;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorkbenchStyles {
     pub background: Style,
@@ -42,6 +44,19 @@ pub struct WorkbenchStyles {
     /// The match the cursor is on, told apart from the rest of them.
     pub current_match: Style,
     pub agent_touched: Style,
+}
+
+impl WorkbenchStyles {
+    /// A one-line field in the buffer's own caret and selection, so typing
+    /// anywhere in the workbench looks like typing in a file.
+    pub fn field(&self) -> FieldStyles {
+        FieldStyles {
+            text: self.text,
+            selection: self.selection,
+            caret: self.cursor,
+            placeholder: self.dim,
+        }
+    }
 }
 
 impl Default for WorkbenchStyles {

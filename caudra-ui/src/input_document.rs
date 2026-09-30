@@ -2,11 +2,11 @@ use std::ops::Range;
 
 use caudra_workbench::buffer::{Buffer, Cursor, Edit};
 use caudra_workbench::history::History;
+use caudra_workbench::text_field::{self, EditCommand, FieldKind, Motion, TextCommand, TextKey};
 use caudra_workbench::words::{component_boundary_left, component_boundary_right};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 
 use crate::highlight::TAB_SPACES;
-use crate::text_buffer::EditResult;
 
 pub(crate) const PASTE_TOKEN_MIN_CHARACTERS: usize = 150;
 pub(crate) const PASTE_TOKEN_MIN_LINES: usize = 3;
@@ -311,118 +311,95 @@ impl InputDocument {
         self.normalize_cursor(CursorDirection::Nearest);
     }
 
-    pub fn handle_key(&mut self, key: KeyEvent) -> EditResult {
-        let modifiers = key.modifiers;
-        // AltGr arrives as Ctrl+Alt and is text, not a chord, so Ctrl only
-        // counts on its own.
-        let control =
-            modifiers.contains(KeyModifiers::CONTROL) && !modifiers.contains(KeyModifiers::ALT);
-        let super_key = modifiers.contains(KeyModifiers::SUPER);
+    /// A key of the shared field keymap, run through the chip-aware edits so a
+    /// paste chip moves and deletes as the one glyph it is drawn as.
+    pub fn handle_key(&mut self, key: KeyEvent) -> TextKey {
+        text_field::decode(key, FieldKind::Block)
+            .map_or(TextKey::Ignored, |command| self.perform(command))
+    }
 
-        // Nothing binds bare Alt any more, and falling through would insert
-        // the chord's letter as stray text.
-        if modifiers.contains(KeyModifiers::ALT) && !modifiers.contains(KeyModifiers::CONTROL) {
-            return EditResult::Ignored;
-        }
-
-        if control {
-            return match key.code {
-                KeyCode::Backspace | KeyCode::Char('w') => {
-                    self.delete_word_before();
-                    EditResult::Changed
-                }
-                KeyCode::Delete => {
-                    self.delete_word_after();
-                    EditResult::Changed
-                }
-                KeyCode::Char('k') => {
-                    self.delete_to_line_end();
-                    EditResult::Changed
-                }
-                // Select-all displaces emacs' line-start, which `Home` still
-                // reaches. Nothing else in the composer can take a whole draft
-                // in one keystroke.
-                KeyCode::Char('a') => {
-                    self.select_all();
-                    EditResult::Moved
-                }
-                KeyCode::Char('z') => self.stepped(Self::undo),
-                KeyCode::Char('y') => self.stepped(Self::redo),
-                KeyCode::Left | KeyCode::Right | KeyCode::Char('e') => self.move_with_key(key),
-                _ => EditResult::Ignored,
-            };
-        }
-
-        if super_key {
-            return match key.code {
-                KeyCode::Backspace => {
-                    self.delete_to_line_start();
-                    EditResult::Changed
-                }
-                KeyCode::Left | KeyCode::Right => self.move_with_key(key),
-                _ => EditResult::Ignored,
-            };
-        }
-
-        match key.code {
-            KeyCode::Char(character) => {
-                self.insert_text(&character.to_string());
-                EditResult::Changed
+    fn perform(&mut self, command: TextCommand) -> TextKey {
+        match command {
+            TextCommand::Edit(edit) => self.edit(edit),
+            TextCommand::Move { motion, extend } => {
+                self.display.move_by(motion, extend, 1);
+                self.history.break_group();
+                self.normalize_cursor(CursorDirection::of(motion));
+                TextKey::Handled
             }
-            KeyCode::Backspace => {
-                self.remove_char();
-                EditResult::Changed
+            // Select-all displaces emacs' line-start, which `Home` still
+            // reaches. Nothing else in the composer can take a whole draft in
+            // one keystroke.
+            TextCommand::SelectAll => {
+                self.select_all();
+                TextKey::Handled
             }
-            KeyCode::Delete => {
-                let range = self.edit_range();
-                if !range.is_empty() {
-                    self.replace(range, "");
-                } else if range.end < self.display_text().chars().count() {
-                    self.replace(range.start..range.start + 1, "");
+            TextCommand::Undo => changed_if(self.undo()),
+            TextCommand::Redo => changed_if(self.redo()),
+            TextCommand::Copy => self.selected_text().map_or(TextKey::Ignored, TextKey::Copy),
+            TextCommand::Cut => match self.selected_text() {
+                Some(text) => {
+                    self.replace(self.edit_range(), "");
+                    TextKey::Cut(text)
                 }
-                EditResult::Changed
-            }
-            KeyCode::Left
-            | KeyCode::Right
-            | KeyCode::Home
-            | KeyCode::End
-            | KeyCode::Up
-            | KeyCode::Down => self.move_with_key(key),
-            _ => EditResult::Ignored,
+                None => TextKey::Handled,
+            },
         }
     }
 
-    fn stepped(&mut self, step: impl Fn(&mut Self) -> bool) -> EditResult {
-        match step(self) {
-            true => EditResult::Changed,
-            false => EditResult::Ignored,
+    fn edit(&mut self, command: EditCommand) -> TextKey {
+        match command {
+            EditCommand::Insert(character) => self.insert_text(character.encode_utf8(&mut [0; 4])),
+            EditCommand::Newline | EditCommand::IndentedNewline => self.add_line(),
+            EditCommand::Indent | EditCommand::Dedent => return TextKey::Ignored,
+            deletion => {
+                let range = self.deletion_range(deletion);
+                if range.is_empty() {
+                    return TextKey::Handled;
+                }
+                self.replace(range, "");
+            }
         }
+        TextKey::Changed
     }
 
-    /// Caret motions. Shift keeps the anchor so the motion grows a selection,
-    /// which is what every other editor in the app does.
-    fn move_with_key(&mut self, key: KeyEvent) -> EditResult {
-        let extend = key.modifiers.contains(KeyModifiers::SHIFT);
-        let control = key.modifiers.contains(KeyModifiers::CONTROL)
-            && !key.modifiers.contains(KeyModifiers::ALT);
-        let super_key = key.modifiers.contains(KeyModifiers::SUPER);
-        match key.code {
-            KeyCode::Left if control => self.display.move_word_left(extend),
-            KeyCode::Left if super_key => self.display.move_home(extend),
-            KeyCode::Left => self.display.move_left(extend),
-            KeyCode::Right if control => self.display.move_word_right(extend),
-            KeyCode::Right if super_key => self.display.move_end(extend),
-            KeyCode::Right => self.display.move_right(extend),
-            KeyCode::Char('e') => self.display.move_end(extend),
-            KeyCode::Up => self.display.move_vertical(-1, extend),
-            KeyCode::Down => self.display.move_vertical(1, extend),
-            KeyCode::Home => self.display.move_home(extend),
-            KeyCode::End => self.display.move_end(extend),
-            _ => return EditResult::Ignored,
+    /// The chars a delete takes: the selection when there is one, except for a
+    /// kill, which runs from the caret as it does in every other field. Words
+    /// go a path component at a time, and a delete forward from the end of a
+    /// line joins the next one.
+    fn deletion_range(&self, command: EditCommand) -> Range<usize> {
+        let kill = matches!(
+            command,
+            EditCommand::KillToLineEnd | EditCommand::KillToLineStart
+        );
+        if !kill && let Some(selection) = self.selection() {
+            return selection;
         }
-        self.history.break_group();
-        self.normalize_cursor(CursorDirection::from_key(key));
-        EditResult::Moved
+        let cursor = self.cursor_offset();
+        let x = self.x();
+        let chars: Vec<char> = self.lines()[self.y()].chars().collect();
+        let forward = matches!(
+            command,
+            EditCommand::Delete | EditCommand::DeleteWordAfter | EditCommand::KillToLineEnd
+        );
+        if forward && x == chars.len() {
+            let joins = self.y() + 1 < self.line_count();
+            return cursor..cursor + usize::from(joins);
+        }
+        match command {
+            EditCommand::Backspace => cursor.saturating_sub(1)..cursor,
+            EditCommand::DeleteWordBefore if x == 0 => cursor.saturating_sub(1)..cursor,
+            EditCommand::DeleteWordBefore => {
+                cursor - (x - component_boundary_left(&chars, x))..cursor
+            }
+            EditCommand::KillToLineStart => cursor - x..cursor,
+            EditCommand::Delete => cursor..cursor + 1,
+            EditCommand::DeleteWordAfter => {
+                cursor..cursor + component_boundary_right(&chars, x) - x
+            }
+            EditCommand::KillToLineEnd => cursor..cursor + chars.len() - x,
+            _ => cursor..cursor,
+        }
     }
 
     pub fn focused_paste(&self) -> Option<PasteId> {
@@ -654,44 +631,12 @@ impl InputDocument {
         let cursor = self.cursor_of(offset);
         self.display.set_cursor(cursor, extend);
     }
+}
 
-    fn delete_word_before(&mut self) {
-        let cursor = self.cursor_offset();
-        let x = self.x();
-        if x == 0 {
-            if cursor > 0 {
-                self.replace(cursor - 1..cursor, "");
-            }
-            return;
-        }
-        let chars: Vec<char> = self.lines()[self.y()].chars().collect();
-        let start = component_boundary_left(&chars, x);
-        self.replace(cursor - (x - start)..cursor, "");
-    }
-
-    fn delete_word_after(&mut self) {
-        let cursor = self.cursor_offset();
-        let x = self.x();
-        let chars: Vec<char> = self.lines()[self.y()].chars().collect();
-        if x == chars.len() {
-            if self.y() + 1 < self.line_count() {
-                self.replace(cursor..cursor + 1, "");
-            }
-            return;
-        }
-        let end = component_boundary_right(&chars, x);
-        self.replace(cursor..cursor + end - x, "");
-    }
-
-    fn delete_to_line_end(&mut self) {
-        let cursor = self.cursor_offset();
-        let remaining = self.lines()[self.y()].chars().count() - self.x();
-        self.replace(cursor..cursor + remaining, "");
-    }
-
-    fn delete_to_line_start(&mut self) {
-        let cursor = self.cursor_offset();
-        self.replace(cursor - self.x()..cursor, "");
+fn changed_if(changed: bool) -> TextKey {
+    match changed {
+        true => TextKey::Changed,
+        false => TextKey::Handled,
     }
 }
 
@@ -730,12 +675,10 @@ enum CursorDirection {
 }
 
 impl CursorDirection {
-    fn from_key(key: KeyEvent) -> Self {
-        match key.code {
-            KeyCode::Left => Self::Left,
-            KeyCode::Right => Self::Right,
-            KeyCode::Home if key.modifiers.contains(KeyModifiers::SUPER) => Self::Left,
-            KeyCode::End if key.modifiers.contains(KeyModifiers::SUPER) => Self::Right,
+    fn of(motion: Motion) -> Self {
+        match motion {
+            Motion::Left | Motion::WordLeft => Self::Left,
+            Motion::Right | Motion::WordRight => Self::Right,
             _ => Self::Nearest,
         }
     }
@@ -768,7 +711,7 @@ fn line_start(lines: &[String], y: usize) -> Option<usize> {
     })
 }
 
-fn char_to_byte(text: &str, chars: usize) -> usize {
+pub(crate) fn char_to_byte(text: &str, chars: usize) -> usize {
     text.char_indices()
         .nth(chars)
         .map_or(text.len(), |(offset, _)| offset)
@@ -884,6 +827,66 @@ mod tests {
             document.handle_key(key(KeyCode::Char('w'), KeyModifiers::CONTROL));
             assert_eq!(document.display_text(), expected);
         }
+    }
+
+    const FIRST_LINE: &str = "one";
+    const LAST_LINE: &str = "two three";
+    const DRAFT: &str = "one\ntwo three";
+    const SELECTED_TAIL: &str = "ree";
+    const SELECTED_HEAD: &str = "two";
+
+    fn draft_at(y: usize, x: usize) -> InputDocument {
+        let mut document = InputDocument::from_plain(DRAFT.into());
+        document.set_cursor(y, x);
+        document
+    }
+
+    #[test_case(KeyCode::Char('w'); "ctrl_w")]
+    #[test_case(KeyCode::Backspace; "ctrl_backspace")]
+    #[test_case(KeyCode::Delete; "ctrl_delete")]
+    fn a_word_delete_takes_a_selection_whole(code: KeyCode) {
+        let mut document = draft_at(1, LAST_LINE.len());
+        for _ in SELECTED_TAIL.chars() {
+            document.handle_key(key(KeyCode::Left, KeyModifiers::SHIFT));
+        }
+        document.handle_key(key(code, KeyModifiers::CONTROL));
+        assert_eq!(
+            document.display_text(),
+            DRAFT.strip_suffix(SELECTED_TAIL).unwrap()
+        );
+    }
+
+    /// A kill runs from the caret whatever is selected, as it does in every
+    /// other field, rather than taking the selection the way a delete does.
+    #[test]
+    fn a_kill_runs_from_the_caret_past_a_selection() {
+        let mut document = draft_at(1, 0);
+        for _ in SELECTED_HEAD.chars() {
+            document.handle_key(key(KeyCode::Right, KeyModifiers::SHIFT));
+        }
+        document.handle_key(key(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert_eq!(
+            document.display_text(),
+            format!("{FIRST_LINE}\n{SELECTED_HEAD}")
+        );
+    }
+
+    #[test_case(0, FIRST_LINE.len(), KeyCode::Char('k'), KeyModifiers::CONTROL, "onetwo three", FIRST_LINE.len(); "ctrl_k_at_a_line_end_joins_the_next_line")]
+    #[test_case(0, 0, KeyCode::Delete, KeyModifiers::SHIFT, DRAFT, 0; "shift_delete_with_nothing_selected_does_nothing")]
+    #[test_case(1, LAST_LINE.len(), KeyCode::Home, KeyModifiers::CONTROL, DRAFT, 0; "ctrl_home_reaches_the_start_of_the_draft")]
+    #[test_case(0, 0, KeyCode::End, KeyModifiers::CONTROL, DRAFT, DRAFT.len(); "ctrl_end_reaches_the_end_of_the_draft")]
+    fn keys_follow_the_shared_edge_rules(
+        y: usize,
+        x: usize,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+        text: &str,
+        caret: usize,
+    ) {
+        let mut document = draft_at(y, x);
+        document.handle_key(key(code, modifiers));
+        assert_eq!(document.display_text(), text);
+        assert_eq!(document.cursor_offset(), caret);
     }
 
     #[test]
@@ -1050,7 +1053,7 @@ mod tests {
     }
 
     /// The same crossing by keyboard, which reaches `normalize_cursor` through
-    /// `move_with_key` rather than through a drag.
+    /// `handle_key` rather than through a drag.
     #[test]
     fn shift_right_across_a_chip_keeps_what_came_before_it() {
         let mut document = with_one_paste();

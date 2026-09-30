@@ -5,6 +5,7 @@
 use std::mem;
 
 use caudra_docs::{Library, Target};
+use caudra_workbench::text_field::{FieldKind, TextField};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
@@ -13,9 +14,10 @@ use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::{Current, PaneContext, Pick, SECTION_LEVEL, clicked, list_move};
-use crate::components::{ModalScroll, hover_style, input_line_with_cursor, match_spans};
-use crate::text_buffer::{EditResult, TextBuffer};
+use super::{
+    Current, PaneContext, Pick, SECTION_LEVEL, clicked, field_pick, list_move, prompt_line,
+};
+use crate::components::{ModalScroll, hover_style, match_spans};
 use crate::theme::Theme;
 
 const MARK: &str = "▸ ";
@@ -57,7 +59,7 @@ struct Row {
 }
 
 pub(super) struct Contents {
-    filter: TextBuffer,
+    filter: TextField,
     /// Among the rows that open something, which group headers do not.
     selected: usize,
     /// The selection moved since the list was last drawn. The draw brings it
@@ -73,7 +75,7 @@ pub(super) struct Contents {
 impl Default for Contents {
     fn default() -> Self {
         Self {
-            filter: TextBuffer::new(String::new()),
+            filter: TextField::new(FieldKind::Line),
             selected: 0,
             reveal: false,
             scroll: ModalScroll::new_top(),
@@ -95,8 +97,12 @@ impl Contents {
     }
 
     pub(super) fn paste(&mut self, text: &str) {
-        self.filter.insert_text(text);
+        self.filter.paste(text);
         self.selected = 0;
+    }
+
+    pub(super) fn selected_text(&self) -> Option<String> {
+        self.filter.selected_text()
     }
 
     /// Selects where the reader is: its section, or else its page.
@@ -137,11 +143,12 @@ impl Contents {
             }
             KeyCode::Tab | KeyCode::BackTab => Pick::Leave,
             _ => {
-                if self.filter.handle_key(key) == EditResult::Changed {
+                let edit = self.filter.handle_key(key);
+                if edit.changed() {
                     self.selected = 0;
                     self.scroll.scroll_to(0);
                 }
-                Pick::Stay
+                field_pick(edit)
             }
         }
     }
@@ -173,15 +180,14 @@ impl Contents {
         if area.is_empty() {
             return;
         }
-        let filter = self.filter.value();
-        if focused || !filter.is_empty() {
-            let line = match focused {
-                true => input_line_with_cursor(&self.filter),
-                false => Line::from(Span::styled(filter, theme.tool_dim)),
-            };
+        if focused || !self.filter.is_empty() {
             let filter_area = Rect {
                 height: FILTER_ROWS,
                 ..area
+            };
+            let line = match focused {
+                true => prompt_line(&self.filter, filter_area.width),
+                false => Line::from(Span::styled(self.filter.text(), theme.tool_dim)),
             };
             frame.render_widget(Paragraph::new(line), filter_area);
             self.list = Rect {
@@ -230,7 +236,7 @@ impl Contents {
     /// read alone.
     fn rows(&mut self, library: &Library, current: Option<usize>) -> Vec<Row> {
         let pattern = Pattern::parse(
-            &self.filter.value(),
+            &self.filter.text(),
             CaseMatching::Ignore,
             Normalization::Smart,
         );

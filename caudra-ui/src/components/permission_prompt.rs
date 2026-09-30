@@ -5,6 +5,7 @@ use caudra_agent::permissions::{
     PermissionLifetime, PermissionRequest, PermissionRowGrant, PermissionRuleOption,
     ResourceCoverage, StructuredPermissionEffect, grade_command_pattern,
 };
+use caudra_workbench::text_field::{FieldKind, TextField, TextKey};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
@@ -18,7 +19,6 @@ use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::components::{
     ModalScroll, Overlay, escape_terminal_controls, hover_style, is_ctrl, visual_rows,
 };
-use crate::text_buffer::TextBuffer;
 use crate::theme;
 
 mod decision;
@@ -137,7 +137,11 @@ pub struct PermissionPrompt {
     requests: VecDeque<QueuedPermission>,
     request_ids: HashSet<String>,
     state: PromptState,
-    buffer: TextBuffer,
+    /// The guidance, prefix, phrase or pattern field being typed.
+    field: TextField,
+    /// What the field last copied or cut, until the host puts it on the
+    /// clipboard.
+    copied: Option<String>,
     scroll: ModalScroll,
     scrollbar: Scrollbar,
     selected_option: String,
@@ -201,7 +205,8 @@ impl PermissionPrompt {
             requests: VecDeque::new(),
             request_ids: HashSet::new(),
             state: PromptState::Normal,
-            buffer: TextBuffer::new(String::new()),
+            field: TextField::new(FieldKind::Line),
+            copied: None,
             scroll: ModalScroll::new_top(),
             scrollbar: Scrollbar::default(),
             selected_option: "allow_exact".into(),
@@ -336,7 +341,7 @@ impl PermissionPrompt {
         self.expanded_covered = false;
         self.focus = None;
         self.awaiting_review = true;
-        self.buffer = TextBuffer::new(String::new());
+        self.field.clear();
         self.scroll.reset();
         self.pending_reveal = None;
         self.row_hits.clear();

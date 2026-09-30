@@ -2,11 +2,14 @@
 //!
 //! `caudra-ui` dispatches overlays before its own global binds, so these chords
 //! are free to look like an editor's even where the transcript spends the same
-//! key on something else. Three exceptions are deliberate and live in
-//! [`crate::Workbench::handle_key`]: [`LEADER`] always, `Ctrl+C` without a
-//! selection, and `Ctrl+W` inside a buffer, all pass through, so the leader
-//! prefix, quitting and deleting a word never disappear behind an open
-//! workbench.
+//! key on something else. Two exceptions are deliberate and live in
+//! [`crate::Workbench::handle_key`]: [`LEADER`] always, and `Ctrl+C` with
+//! nothing selected, pass through, so the leader prefix and quitting never
+//! disappear behind an open workbench.
+//!
+//! The editing chords are read by [`crate::text_field::decode`] rather than
+//! matched against the binds below, so the buffer and every field over it
+//! edit alike, and whichever has focus spends them.
 //!
 //! [`LEADER_BINDS`] are the second halves of `Ctrl+X` chords, matched by
 //! [`crate::Workbench::handle_leader`] against the key that follows the prefix.
@@ -16,7 +19,7 @@
 //! `caudra-ui`'s `KEYBINDS` table quotes the `label` fields below, so the help
 //! modal and the generated docs cannot drift from what is dispatched here.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
 /// Spelled out here because a `concat!` label needs a literal. `caudra-ui` owns
 /// the prefix and asserts the two agree.
@@ -53,10 +56,20 @@ impl Bind {
     pub fn matches(self, key: KeyEvent) -> bool {
         key.code == self.code && key.modifiers == self.modifiers
     }
+
+    pub const fn to_key_event(self) -> KeyEvent {
+        KeyEvent {
+            code: self.code,
+            modifiers: self.modifiers,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
 }
 
 const CTRL: KeyModifiers = KeyModifiers::CONTROL;
 const NONE: KeyModifiers = KeyModifiers::NONE;
+const SUPER: KeyModifiers = KeyModifiers::SUPER;
 
 /// The prefix itself. The workbench binds nothing to it and always hands it
 /// back, so every chord under it stays reachable from every pane and every
@@ -99,6 +112,25 @@ pub const COPY: Bind = bind!(KeyCode::Char('c'), CTRL, "Ctrl+C");
 /// arrives as an unambiguous `CSI 3;2~` without the kitty protocol.
 pub const CUT: Bind = bind!(KeyCode::Delete, KeyModifiers::SHIFT, "Shift+Delete");
 pub const PASTE: Bind = bind!(KeyCode::Char('v'), CTRL, "Ctrl+V");
+
+/// The rest of the text-field keymap, spelled here so the help table quotes
+/// what [`crate::text_field::decode`] reads. A test there holds each one to
+/// the command it names.
+pub const DELETE_WORD_BACK: Bind = bind!(KeyCode::Backspace, CTRL, "Ctrl+Backspace");
+pub const DELETE_WORD_AFTER: Bind = bind!(KeyCode::Delete, CTRL, "Ctrl+Delete");
+pub const KILL_TO_LINE_START: Bind = bind!(KeyCode::Backspace, SUPER, "Super+Backspace");
+pub const LINE_END: Bind = bind!(KeyCode::Char('e'), CTRL, "Ctrl+E");
+pub const WORD_LEFT: Bind = bind!(KeyCode::Left, CTRL, "Ctrl+←");
+pub const WORD_RIGHT: Bind = bind!(KeyCode::Right, CTRL, "Ctrl+→");
+pub const SUPER_HOME: Bind = bind!(KeyCode::Left, SUPER, "Super+←");
+pub const SUPER_END: Bind = bind!(KeyCode::Right, SUPER, "Super+→");
+pub const TEXT_START: Bind = bind!(KeyCode::Home, CTRL, "Ctrl+Home");
+pub const TEXT_END: Bind = bind!(KeyCode::End, CTRL, "Ctrl+End");
+/// A list under a one-line field takes the text-start chords for its own
+/// ends, and leaves bare `Home` and `End` to the field's caret. On one line
+/// the two chords would only repeat `Home` and `End` anyway.
+pub const LIST_FIRST: Bind = TEXT_START;
+pub const LIST_LAST: Bind = TEXT_END;
 
 pub const STAGE_TOGGLE: Bind = bind!(KeyCode::Char(' '), NONE, "Space");
 pub const OPEN_DIFF: Bind = bind!(KeyCode::Char('d'), NONE, "D");
@@ -172,18 +204,36 @@ const GLOBAL_BINDS: &[Bind] = &[
     NEXT_TAB,
     SAVE,
     REVERT,
-    UNDO,
-    REDO,
     FIND,
     FIND_NEXT,
     FIND_PREV,
     GOTO_LINE,
+    PASTE,
+];
+
+/// The chords [`crate::text_field::decode`] reads, which the buffer and every
+/// field take. Checked with the direct set: a direct chord on one of them would
+/// take it from all of them. [`LIST_FIRST`] and [`LIST_LAST`] stay out, since
+/// a list sharing the text-start chords with its field is the point of them.
+#[cfg(test)]
+const TEXT_BINDS: &[Bind] = &[
+    UNDO,
+    REDO,
     SELECT_ALL,
     KILL_LINE,
     DELETE_WORD,
+    DELETE_WORD_BACK,
+    DELETE_WORD_AFTER,
+    KILL_TO_LINE_START,
+    LINE_END,
+    WORD_LEFT,
+    WORD_RIGHT,
+    SUPER_HOME,
+    SUPER_END,
+    TEXT_START,
+    TEXT_END,
     COPY,
     CUT,
-    PASTE,
 ];
 
 /// Binds that only reach the source control pane. They are bare characters, so
@@ -257,7 +307,7 @@ pub const LEADER_BINDS: &[Bind] = &[
 mod tests {
     use super::{
         Bind, EXPLORER_BINDS, GLOBAL_BINDS, KeyCode, KeyEvent, KeyModifiers, LEADER_BINDS,
-        LEADER_LABEL, NONE, SOURCE_CONTROL_BINDS, STAGE_TOGGLE, TRANSFER_BINDS,
+        LEADER_LABEL, NONE, SOURCE_CONTROL_BINDS, STAGE_TOGGLE, TEXT_BINDS, TRANSFER_BINDS,
     };
 
     const DUPLICATE: &str = "two workbench binds must not answer to the same chord";
@@ -270,6 +320,7 @@ mod tests {
     fn direct_binds() -> Vec<Bind> {
         GLOBAL_BINDS
             .iter()
+            .chain(TEXT_BINDS)
             .chain(SOURCE_CONTROL_BINDS)
             .chain(EXPLORER_BINDS)
             .copied()

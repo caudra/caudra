@@ -1,6 +1,6 @@
 use caudra_config::Feature;
 use caudra_ui::keybindings::{
-    ALT_SEP, KEYBINDS, KeyLabel, Keybind, KeybindContext, LEADER_PREFIX, Platform, all_contexts,
+    ALT_SEP, KEYBINDS, KeyLabel, Keybind, KeybindContext, LEADER_PREFIX, all_contexts,
 };
 
 const FRONTMATTER: &str = "\
@@ -11,9 +11,22 @@ weight = 9
 group = \"Reference\"
 +++";
 
+const TEXT_FIELDS_INTRO: &str = "\
+These keys work the same in every text field: the composer, a picker's filter, \
+forms and prompts, `/btw`, and the workbench editor with its fields. Where a \
+surface binds one of them itself, the surface wins. `/btw` keeps `Ctrl+Y` to copy \
+the answer, and the permissions picker keeps `Ctrl+E` to edit and `Ctrl+K` to \
+revoke. In a list, `Home` and `End` move the cursor in its filter, and `Ctrl+Home` \
+and `Ctrl+End` pick the first and last item.\n\n\
+`Ctrl+Z` is undo everywhere, so it never suspends Caudra. A masked field, such as \
+an API key, refuses to select all, copy, or cut. A terminal paste goes to the field \
+that has focus. `Super` chords need a terminal that reports them, such as one with \
+the kitty keyboard protocol.\n\n";
+
 const MAIN_CONTEXTS: &[KeybindContext] = &[
     KeybindContext::General,
     KeybindContext::Editing,
+    KeybindContext::TextFields,
     KeybindContext::PasteEditor,
     KeybindContext::Review,
     KeybindContext::Streaming,
@@ -33,16 +46,12 @@ fn label_str(label: KeyLabel) -> String {
 }
 
 fn description_str(kb: &Keybind) -> String {
-    let description = match kb.platform {
-        Platform::All => kb.description.to_string(),
-        Platform::UnixOnly => format!("{} (Unix only)", kb.description),
-    };
     match kb
         .feature()
         .filter(|&feature| kb.context.feature() != Some(feature))
     {
-        Some(feature) => format!("{description} (needs `{feature}`)"),
-        None => description,
+        Some(feature) => format!("{} (needs `{feature}`)", kb.description),
+        None => kb.description.to_string(),
     }
 }
 
@@ -67,6 +76,9 @@ fn write_section(out: &mut String, ctx: KeybindContext) {
     out.push_str(&format!("\n## {}\n\n", ctx.label()));
     if let Some(note) = experiment_note(ctx) {
         out.push_str(&note);
+    }
+    if ctx == KeybindContext::TextFields {
+        out.push_str(TEXT_FIELDS_INTRO);
     }
 
     let rows: Vec<_> = KEYBINDS
@@ -119,10 +131,9 @@ fn write_focus(out: &mut String) {
         "Typing anything takes the focus back, and so does `Esc`. Clicking \
          the transcript gives it the focus, and clicking the composer \
          returns it. The wheel scrolls whatever the pointer is over and \
-         leaves the focus where it is. `Ctrl+U`, `Ctrl+Y`, `Ctrl+E`, \
-         `Ctrl+G`, and `Ctrl+B` scroll the transcript wherever the focus \
-         sits, and an open modal claims all four navigation keys for \
-         itself.\n\n",
+         leaves the focus where it is. `Ctrl+U`, `Ctrl+G`, and `Ctrl+B` \
+         scroll the transcript wherever the focus sits, and an open modal \
+         claims all four navigation keys for itself.\n\n",
     );
     out.push_str(
         "Anywhere a scrollbar is shown it can be dragged. Press the thumb \
@@ -257,15 +268,13 @@ fn write_overrides(out: &mut String) {
     );
     out.push_str("Precedence, high to low:\n\n");
     out.push_str(
-        "1. **Suspend** (`Ctrl+Z`, Unix). Always wins, non-remappable.\n\
-         2. **Modal and overlay keys.** An open modal or picker consumes \
+        "1. **Modal and overlay keys.** An open modal or picker consumes \
          its keys first, so they cannot be shadowed while open.\n\
-         3. **Lua overrides** from `caudra.keymap.set`. Last set wins; \
+         2. **Lua overrides** from `caudra.keymap.set`. Last set wins, and \
          binding the same key twice warns.\n\
-         4. **Built-in defaults.** An override on the same key shadows \
-         them; `caudra.keymap.del` lifts the override so the default returns. \
-         Suspend is the only binding outside this layer, so every key is \
-         remappable except `Ctrl+Z`.\n\n",
+         3. **Built-in defaults.** An override on the same key shadows \
+         them, and `caudra.keymap.del` lifts the override so the default \
+         returns. Every built-in key can be remapped this way.\n\n",
     );
     out.push_str(
         "Only single-key bindings can be overridden. Multi-key combinations \

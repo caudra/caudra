@@ -924,6 +924,7 @@ impl App {
                 self.permission_ui.intent = None;
                 self.permission_ui.validated = None;
             }
+            EditorEvent::Copy(text) => self.copy_to_clipboard(&text),
         }
     }
 
@@ -2100,7 +2101,7 @@ pub(super) mod tests {
         let editor = app.permissions_picker.editor_mut().unwrap();
         assert!(editor.is_editing());
         editor.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
-        editor.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        editor.handle_key(KeyEvent::from(KeyCode::Backspace));
         editor.handle_paste(text);
         assert!(editor.handle_key(KeyEvent::from(KeyCode::Enter)).is_none());
         assert!(!editor.is_editing());

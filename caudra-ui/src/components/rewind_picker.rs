@@ -16,6 +16,7 @@ pub enum RewindPickerAction {
     Consumed,
     Select(RewindEntry),
     Close,
+    Copy(String),
 }
 
 pub struct RewindEntry {
@@ -114,6 +115,7 @@ impl RewindPicker {
             PickerAction::Select(entry) => RewindPickerAction::Select(entry),
             PickerAction::Close => RewindPickerAction::Close,
             PickerAction::Toggle(..) | PickerAction::Key(_) => RewindPickerAction::Consumed,
+            PickerAction::Copy(text) => RewindPickerAction::Copy(text),
         }
     }
 

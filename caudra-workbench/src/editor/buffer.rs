@@ -89,6 +89,7 @@ impl Indent {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct Buffer {
     lines: Vec<String>,
     cursor: Cursor,
@@ -383,6 +384,16 @@ impl Buffer {
             return None;
         }
         self.apply(self.cursor, end, "")
+    }
+
+    /// Kills back to the head of the line. Unlike its mirror it never joins
+    /// lines: a caret already at the head has nothing of its own line behind it.
+    pub fn kill_to_start_of_line(&mut self) -> Option<Edit> {
+        let start = Cursor::new(self.cursor.line, 0);
+        if start == self.cursor {
+            return None;
+        }
+        self.apply(start, self.cursor, "")
     }
 
     /// Replays an edit, for undo and redo. The cursor lands where the edit

@@ -22,7 +22,7 @@ use ratatui::buffer::{Cell, CellDiffOption};
 const FALLBACK_NOTIFICATION_MESSAGE: &str = "Caudra needs attention";
 const BELL_SEQUENCE: &str = "\u{7}";
 /// XTPUSHTITLE saves whatever title the shell left on the window, so the
-/// matching XTPOPTITLE on exit or suspend hands it back and no plugin
+/// matching XTPOPTITLE on exit or editor handoff hands it back and no plugin
 /// title outlives the session. Terminals without a title stack ignore both.
 const PUSH_WINDOW_TITLE_SEQUENCE: &str = "\u{1b}[22;2t";
 const POP_WINDOW_TITLE_SEQUENCE: &str = "\u{1b}[23;2t";
@@ -363,15 +363,6 @@ impl Drop for TerminalGuard {
             "terminal restored"
         );
     }
-}
-
-pub(crate) fn suspend(terminal: &mut ratatui::DefaultTerminal) {
-    teardown();
-    #[cfg(unix)]
-    unsafe {
-        libc::raise(libc::SIGTSTP);
-    }
-    resume(terminal);
 }
 
 pub(crate) fn with_normal_terminal<T>(

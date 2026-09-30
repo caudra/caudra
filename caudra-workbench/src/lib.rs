@@ -23,7 +23,7 @@ mod view;
 
 pub use action::WorkbenchAction;
 pub use editor::rendered::PaintMarkdown;
-pub use editor::{DocumentKey, TabLabel, buffer, history, render, words};
+pub use editor::{DocumentKey, TabLabel, buffer, history, render, text_field, words};
 pub use fs::backend::{
     BackendDriver, BackendError, BackendEvent, BackendRevision, ListResult, LoadedFile,
     LocalFilesystem, MutationGate, RequestId, ResourceEntry, SearchMatch, SearchResult,
@@ -35,6 +35,7 @@ pub use pointer::Clicks;
 pub use style::WorkbenchStyles;
 use unicode_width::UnicodeWidthStr;
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
@@ -50,6 +51,7 @@ use serde::{Deserialize, Serialize};
 use editor::Editor;
 use editor::Tab;
 use editor::buffer::Cursor;
+use editor::text_field::{EditCommand, FieldKind, TextCommand, TextField, TextKey, decode};
 use fs::ops;
 use fs::tree::Tree;
 use fs::watch::Watch;
@@ -115,15 +117,6 @@ const SOURCE_CHORDS: [keys::Bind; 4] = [
     keys::FIND_NEXT,
     keys::FIND_PREV,
     keys::GOTO_LINE,
-];
-/// Chords that change or select the text, which the rendered view refuses:
-/// what they did would happen out of sight.
-const EDIT_CHORDS: [keys::Bind; 5] = [
-    keys::UNDO,
-    keys::REDO,
-    keys::SELECT_ALL,
-    keys::KILL_LINE,
-    keys::DELETE_WORD,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -358,13 +351,33 @@ impl Confirm {
 /// A name the workbench is waiting for, and what it will do with it. It is
 /// typed into the status row, where a question about a path can be read beside
 /// the tree that answers it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct Input {
     kind: InputKind,
     /// What the answer is about: the path being renamed, or the folder a new
     /// path lands in.
     at: WorkbenchPath,
-    value: String,
+    value: TextField,
+}
+
+impl Input {
+    fn new(kind: InputKind, at: WorkbenchPath, value: &str) -> Self {
+        Self {
+            kind,
+            at,
+            value: TextField::with_text(FieldKind::Line, value),
+        }
+    }
+}
+
+/// The one-line field that keys, pastes and the caret go to while it is up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FocusedField {
+    Name,
+    Palette,
+    Goto,
+    Find,
+    Search,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -523,7 +536,7 @@ pub struct Workbench {
     /// Cut and copy also leave through [`WorkbenchAction::Copy`], but the host
     /// cannot read the system clipboard back, so paste comes from here.
     clipboard: String,
-    goto: Option<String>,
+    goto: Option<TextField>,
     /// The question standing over everything else, if there is one. What it is
     /// about is not kept: whatever raised it selected its target first, and the
     /// dialog is modal, so nothing can move the cursor underneath it.
@@ -1775,20 +1788,17 @@ impl Workbench {
         if !self.open {
             return false;
         }
-        if self.input.is_some() {
+        if self.focused_field().is_some() {
             return true;
         }
         if self.confirm.is_some() || self.menu.is_some() {
             return false;
         }
-        self.palette.is_open()
-            || self.goto.is_some()
-            || match self.focus {
-                Focus::Editor => self.editor.active().is_some_and(|tab| {
-                    tab.find.is_open() || (tab.is_editable() && !tab.is_rendered())
-                }),
-                Focus::Sidebar => self.sidebar == SidebarView::Search,
-            }
+        self.focus == Focus::Editor
+            && self
+                .editor
+                .active()
+                .is_some_and(|tab| tab.is_editable() && !tab.is_rendered())
     }
 
     /// Inserts text the host pulled out of a bracketed paste. Reports whether
@@ -1798,6 +1808,23 @@ impl Workbench {
     pub fn paste(&mut self, text: &str) -> bool {
         if self.transfer_input_active() {
             self.transfer.paste(text);
+            return true;
+        }
+        if let Some(field) = self.focused_field() {
+            let text = match field {
+                FocusedField::Goto => {
+                    Cow::Owned(text.chars().filter(char::is_ascii_digit).collect())
+                }
+                _ => Cow::Borrowed(text),
+            };
+            if let Some(pasted) = self.field_mut(field).map(|typing| typing.paste(&text)) {
+                self.typed(field, pasted);
+            }
+            return true;
+        }
+        // A question or a menu stands over the buffer and takes no text, and
+        // the composer behind the workbench must not take it either.
+        if self.confirm.is_some() || self.menu.is_some() {
             return true;
         }
         if self.focus != Focus::Editor {
@@ -2268,7 +2295,7 @@ impl Workbench {
             InputKind::Rename => at.file_name(),
             _ => String::new(),
         };
-        self.input = Some(Input { kind, at, value });
+        self.input = Some(Input::new(kind, at, &value));
     }
 
     /// Acts on the name that was typed. A refusal keeps the question up with
@@ -2286,12 +2313,13 @@ impl Workbench {
             self.flash = Some(BackendError::WrongBackend.to_string());
             return;
         };
+        let name = input.value.text();
         let done = match input.kind {
-            InputKind::Rename => self.rename_path(at, &input.value),
-            InputKind::NewFile => ops::create_file(at, &input.value).map(|path| {
+            InputKind::Rename => self.rename_path(at, &name),
+            InputKind::NewFile => ops::create_file(at, &name).map(|path| {
                 self.open_path(&path);
             }),
-            InputKind::NewFolder => ops::create_dir(at, &input.value).map(|path| {
+            InputKind::NewFolder => ops::create_dir(at, &name).map(|path| {
                 self.tree.reveal(&path);
             }),
         };
@@ -2305,13 +2333,14 @@ impl Workbench {
     }
 
     fn commit_remote_input(&mut self, input: Input) {
+        let name = input.value.text();
         let destination = match input.kind {
             InputKind::Rename => input
                 .at
                 .parent()
                 .unwrap_or_else(|| self.backend_root())
-                .join(&input.value),
-            InputKind::NewFile | InputKind::NewFolder => input.at.join(&input.value),
+                .join(&name),
+            InputKind::NewFile | InputKind::NewFolder => input.at.join(&name),
         };
         let destination = match destination {
             Ok(path) => path,
@@ -2752,8 +2781,9 @@ impl Workbench {
             return None;
         }
         // A plain click collapses the selection, so an idle press never
-        // clobbers what was copied before it.
-        let text = self.selected_text()?;
+        // clobbers what was copied before it. The press was in the text, so
+        // a selection standing in a field is not what it took.
+        let text = self.editor.active()?.buffer.selected_text()?;
         self.clipboard = text.clone();
         Some(text)
     }
@@ -2866,8 +2896,8 @@ impl Workbench {
         if let Some(action) = self.goto_key(key) {
             return action;
         }
-        if self.find_key(key) {
-            return WorkbenchAction::Consumed;
+        if let Some(action) = self.find_key(key) {
+            return action;
         }
         if let Some(action) = self.global_key(key) {
             return action;
@@ -3058,10 +3088,16 @@ impl Workbench {
         false
     }
 
-    /// Takes the selection out of the buffer. With nothing selected it is
-    /// inert rather than a forward delete, so a stray `Shift+Delete` never
-    /// destroys a character the user could not see was at risk.
+    /// Takes the selection out of the focused field, or else out of the
+    /// buffer. With nothing selected it is inert rather than a forward delete,
+    /// so a stray `Shift+Delete` never destroys a character the user could not
+    /// see was at risk.
     fn cut(&mut self) -> WorkbenchAction {
+        if let Some(field) = self.focused_field() {
+            return self
+                .field_key(field, keys::CUT.to_key_event())
+                .unwrap_or(WorkbenchAction::Consumed);
+        }
         let Some(text) = self.selected_text() else {
             return WorkbenchAction::Consumed;
         };
@@ -3095,26 +3131,10 @@ impl Workbench {
     }
 
     fn buffer_key(&mut self, key: KeyEvent) -> Option<WorkbenchAction> {
-        let rendered = self.editor.active().is_some_and(Tab::is_rendered);
-        if rendered && EDIT_CHORDS.iter().any(|bind| bind.matches(key)) {
-            self.flash = Some(RENDERED_READ_ONLY.to_owned());
-            return Some(WorkbenchAction::Consumed);
-        }
-        if rendered && SOURCE_CHORDS.iter().any(|bind| bind.matches(key)) {
+        if self.editor.active().is_some_and(Tab::is_rendered)
+            && SOURCE_CHORDS.iter().any(|bind| bind.matches(key))
+        {
             self.editor.active_mut()?.show_source();
-        }
-        if keys::UNDO.matches(key) || keys::REDO.matches(key) {
-            let undo = keys::UNDO.matches(key);
-            let tab = self.editor.active_mut()?;
-            let moved = if undo { tab.undo() } else { tab.redo() };
-            if moved {
-                self.follow_cursor();
-            }
-            return Some(WorkbenchAction::Consumed);
-        }
-        if keys::SELECT_ALL.matches(key) {
-            self.editor.active_mut()?.buffer.select_all();
-            return Some(WorkbenchAction::Consumed);
         }
         if keys::REVERT.matches(key) {
             // The only way out of a conflict that keeps the other writer's
@@ -3132,29 +3152,10 @@ impl Workbench {
             self.follow_cursor();
             return Some(WorkbenchAction::Consumed);
         }
-        if keys::KILL_LINE.matches(key) {
-            let tab = self.editor.active_mut()?;
-            if tab.is_editable() {
-                let edit = tab.buffer.kill_to_end_of_line();
-                tab.record(edit);
-                self.follow_cursor();
-            }
-            return Some(WorkbenchAction::Consumed);
-        }
-        if keys::DELETE_WORD.matches(key) {
-            let tab = self.editor.active_mut()?;
-            if tab.is_editable() {
-                let edit = tab.buffer.delete_word_left();
-                tab.record(edit);
-                self.follow_cursor();
-            }
-            return Some(WorkbenchAction::Consumed);
-        }
         if keys::FIND.matches(key) {
             let tab = self.editor.active_mut()?;
             tab.find.open();
-            let query = tab.find.query().to_owned();
-            tab.set_find_query(query);
+            tab.search_find();
             self.focus = Focus::Editor;
             return Some(WorkbenchAction::Consumed);
         }
@@ -3164,8 +3165,7 @@ impl Workbench {
                 // Closing the bar drops the matches, so stepping from a closed
                 // one has to rescan before there is anything left to step to.
                 if tab.find.current().is_none() {
-                    let query = tab.find.query().to_owned();
-                    tab.set_find_query(query);
+                    tab.search_find();
                 }
                 if let Some(found) = tab.find.step(delta) {
                     tab.buffer.set_cursor(found.cursor(), false);
@@ -3176,20 +3176,21 @@ impl Workbench {
         }
         if keys::GOTO_LINE.matches(key) {
             self.editor.active()?;
-            self.goto = Some(String::new());
+            self.goto = Some(TextField::new(FieldKind::Line));
             self.focus = Focus::Editor;
             return Some(WorkbenchAction::Consumed);
         }
         None
     }
 
-    /// The palette is modal while it is up: it is one field over a list, and
-    /// every key that is not navigation is part of the query.
+    /// The palette is modal while it is up: it is one field over a list. The
+    /// list takes its own keys and the field every key it decodes. The
+    /// workbench's chords still answer and act on the active tab as they
+    /// would without the palette, but no other key reaches the panes behind.
     fn palette_key(&mut self, key: KeyEvent) -> Option<WorkbenchAction> {
         if !self.palette.is_open() {
             return None;
         }
-        let typing = (key.modifiers - KeyModifiers::SHIFT).is_empty();
         let page = self.palette_rows().max(1) as isize;
         match key.code {
             KeyCode::Esc => self.palette.close(),
@@ -3213,19 +3214,14 @@ impl Workbench {
             KeyCode::Down => self.palette.move_selection(1),
             KeyCode::PageUp => self.palette.move_selection(-page),
             KeyCode::PageDown => self.palette.move_selection(page),
-            KeyCode::Home => self.palette.select_first(),
-            KeyCode::End => self.palette.select_last(),
-            KeyCode::Backspace if typing => {
-                let mut query = self.palette.query().to_owned();
-                query.pop();
-                self.palette.set_query(query);
+            _ if keys::LIST_FIRST.matches(key) => self.palette.select_first(),
+            _ if keys::LIST_LAST.matches(key) => self.palette.select_last(),
+            _ => {
+                return self
+                    .field_key(FocusedField::Palette, key)
+                    .or_else(|| self.global_key(key))
+                    .or(Some(WorkbenchAction::Consumed));
             }
-            KeyCode::Char(ch) if typing => {
-                let mut query = self.palette.query().to_owned();
-                query.push(ch);
-                self.palette.set_query(query);
-            }
-            _ => return None,
         }
         Some(WorkbenchAction::Consumed)
     }
@@ -3278,15 +3274,10 @@ impl Workbench {
     /// it does not take would otherwise reach the tree behind it.
     fn input_key(&mut self, key: KeyEvent) -> Option<WorkbenchAction> {
         self.input.as_ref()?;
-        let typing = (key.modifiers - KeyModifiers::SHIFT).is_empty();
         match key.code {
             KeyCode::Esc => self.input = None,
             KeyCode::Enter => self.commit_input(),
-            KeyCode::Backspace => {
-                self.input.as_mut()?.value.pop();
-            }
-            KeyCode::Char(typed) if typing => self.input.as_mut()?.value.push(typed),
-            _ => {}
+            _ => return self.modal_field_key(FocusedField::Name, key),
         }
         Some(WorkbenchAction::Consumed)
     }
@@ -3298,61 +3289,142 @@ impl Workbench {
         match key.code {
             KeyCode::Esc => self.goto = None,
             KeyCode::Enter => {
-                if let Ok(line) = self.goto.take()?.parse::<usize>() {
+                if let Ok(line) = self.goto.take()?.text().parse::<usize>() {
                     if let Some(tab) = self.editor.active_mut() {
                         tab.buffer.goto_line(line);
                     }
                     self.follow_cursor();
                 }
             }
-            KeyCode::Backspace => {
-                self.goto.as_mut()?.pop();
-            }
-            KeyCode::Char(digit) if digit.is_ascii_digit() => self.goto.as_mut()?.push(digit),
-            _ => {}
+            _ if types_non_digit(key) => {}
+            _ => return self.modal_field_key(FocusedField::Goto, key),
         }
         Some(WorkbenchAction::Consumed)
     }
 
     /// The find bar owns typing while it is open, and hands the buffer back on
-    /// Esc. Chords it does not know fall through, so saving still works.
-    fn find_key(&mut self, key: KeyEvent) -> bool {
-        if self.focus != Focus::Editor || self.goto.is_some() {
-            return false;
+    /// Esc. The workbench's chords still answer, so saving works, but a key
+    /// its one-line field declines never reaches the document keymap behind
+    /// it, where `Tab` or `Ctrl+J` would edit the file.
+    fn find_key(&mut self, key: KeyEvent) -> Option<WorkbenchAction> {
+        if self.focused_field() != Some(FocusedField::Find) {
+            return None;
         }
-        let Some(tab) = self.editor.active_mut() else {
-            return false;
-        };
-        if !tab.find.is_open() {
-            return false;
-        }
-        let typing = (key.modifiers - KeyModifiers::SHIFT).is_empty();
-        let mut query = tab.find.query().to_owned();
+        let tab = self.editor.active_mut()?;
         match key.code {
-            KeyCode::Esc => {
-                tab.find.close();
-                return true;
-            }
+            KeyCode::Esc => tab.find.close(),
             KeyCode::Enter | KeyCode::Down | KeyCode::Up => {
                 let back = key.code == KeyCode::Up || key.modifiers.contains(KeyModifiers::SHIFT);
                 if let Some(found) = tab.find.step(if back { -1 } else { 1 }) {
                     tab.buffer.set_cursor(found.cursor(), false);
                     self.follow_cursor();
                 }
-                return true;
             }
-            KeyCode::Backspace if typing => {
-                query.pop();
+            _ => {
+                return self
+                    .field_key(FocusedField::Find, key)
+                    .or_else(|| self.global_key(key))
+                    .or(Some(WorkbenchAction::Consumed));
             }
-            KeyCode::Char(ch) if typing => query.push(ch),
-            _ => return false,
         }
-        tab.set_find_query(query);
+        Some(WorkbenchAction::Consumed)
+    }
+
+    /// Searches the buffer for the find bar's query as it now reads, from the
+    /// caret, and lands on the first match.
+    fn find_again(&mut self) {
+        let Some(tab) = self.editor.active_mut() else {
+            return;
+        };
+        tab.search_find();
         if let Some(found) = tab.find.current() {
             tab.buffer.set_cursor(found.cursor(), false);
         }
         self.follow_cursor();
-        true
+    }
+
+    /// The field keys and pastes reach, if one is up. Asked in the order
+    /// [`Self::handle_key`] offers a key around, so it names the field the
+    /// next key lands in.
+    fn focused_field(&self) -> Option<FocusedField> {
+        if self.input.is_some() {
+            return Some(FocusedField::Name);
+        }
+        if self.confirm.is_some() || self.menu.is_some() {
+            return None;
+        }
+        if self.palette.is_open() {
+            return Some(FocusedField::Palette);
+        }
+        if self.goto.is_some() {
+            return Some(FocusedField::Goto);
+        }
+        match self.focus {
+            Focus::Editor => self
+                .editor
+                .active()
+                .is_some_and(|tab| tab.find.is_open())
+                .then_some(FocusedField::Find),
+            Focus::Sidebar => (self.sidebar == SidebarView::Search).then_some(FocusedField::Search),
+        }
+    }
+
+    fn field(&self, field: FocusedField) -> Option<&TextField> {
+        match field {
+            FocusedField::Name => self.input.as_ref().map(|input| &input.value),
+            FocusedField::Palette => Some(self.palette.query()),
+            FocusedField::Goto => self.goto.as_ref(),
+            FocusedField::Find => self.editor.active().map(|tab| tab.find.query()),
+            FocusedField::Search => Some(self.search.input(self.search.field())),
+        }
+    }
+
+    fn field_mut(&mut self, field: FocusedField) -> Option<&mut TextField> {
+        match field {
+            FocusedField::Name => self.input.as_mut().map(|input| &mut input.value),
+            FocusedField::Palette => Some(self.palette.query_mut()),
+            FocusedField::Goto => self.goto.as_mut(),
+            FocusedField::Find => self.editor.active_mut().map(|tab| tab.find.query_mut()),
+            FocusedField::Search => {
+                let typing = self.search.field();
+                Some(self.search.input_mut(typing))
+            }
+        }
+    }
+
+    /// Hands `key` to `field`. `None` when the field does not decode it, so
+    /// the key goes on to whatever stands behind the field.
+    fn field_key(&mut self, field: FocusedField, key: KeyEvent) -> Option<WorkbenchAction> {
+        let typed = self.field_mut(field)?.handle_key(key);
+        self.typed(field, typed)
+    }
+
+    /// Hands `key` to a prompt that holds every key while it is up. The
+    /// clipboard chords are the one way past it, since the internal paste
+    /// lands in the field too.
+    fn modal_field_key(&mut self, field: FocusedField, key: KeyEvent) -> Option<WorkbenchAction> {
+        self.field_key(field, key)
+            .or_else(|| self.clipboard_key(key))
+            .or(Some(WorkbenchAction::Consumed))
+    }
+
+    /// Follows an edit to `field`: the palette refilters and the find bar
+    /// searches again, and copied or cut text leaves for the clipboard.
+    fn typed(&mut self, field: FocusedField, typed: TextKey) -> Option<WorkbenchAction> {
+        if typed.changed() {
+            match field {
+                FocusedField::Palette => self.palette.rescan(),
+                FocusedField::Find => self.find_again(),
+                FocusedField::Name | FocusedField::Goto | FocusedField::Search => {}
+            }
+        }
+        match typed {
+            TextKey::Ignored => None,
+            TextKey::Copy(text) | TextKey::Cut(text) => Some(self.copy(text)),
+            TextKey::Changed | TextKey::Handled | TextKey::Refused => {
+                Some(WorkbenchAction::Consumed)
+            }
+        }
     }
 
     fn sidebar_key(&mut self, key: KeyEvent) -> WorkbenchAction {
@@ -3363,7 +3435,7 @@ impl Workbench {
         match self.sidebar {
             SidebarView::Explorer => self.explorer_key(key),
             SidebarView::SourceControl => self.source_control_key(key),
-            SidebarView::Search => self.search_key(key),
+            SidebarView::Search => return self.search_key(key),
             SidebarView::Transfer => return self.transfer.key(key),
         }
         WorkbenchAction::Consumed
@@ -3476,24 +3548,27 @@ impl Workbench {
         }
     }
 
-    /// The search pane is a form over a list: bare characters belong to
-    /// whichever field holds the caret, so navigation is arrows and every
-    /// command is a `Ctrl+X` chord handled in [`Workbench::handle_leader`].
-    fn search_key(&mut self, key: KeyEvent) {
-        let typing = (key.modifiers - KeyModifiers::SHIFT).is_empty();
+    /// The search pane is a form over a list: the field holding the caret
+    /// takes every key it decodes, so the list moves on the vertical keys and
+    /// every command is a `Ctrl+X` chord handled in
+    /// [`Workbench::handle_leader`].
+    fn search_key(&mut self, key: KeyEvent) -> WorkbenchAction {
         let page = self.sidebar_rows().max(1) as isize;
         match key.code {
             KeyCode::Up => self.search.move_selection(-1),
             KeyCode::Down => self.search.move_selection(1),
             KeyCode::PageUp => self.search.move_selection(-page),
             KeyCode::PageDown => self.search.move_selection(page),
-            KeyCode::Home => self.search.select_first(),
-            KeyCode::End => self.search.select_last(),
             KeyCode::Enter => self.run_or_open_search(),
-            KeyCode::Backspace if typing => self.search.pop_char(),
-            KeyCode::Char(ch) if typing => self.search.push_char(ch),
-            _ => {}
+            _ if keys::LIST_FIRST.matches(key) => self.search.select_first(),
+            _ if keys::LIST_LAST.matches(key) => self.search.select_last(),
+            _ => {
+                return self
+                    .field_key(FocusedField::Search, key)
+                    .unwrap_or(WorkbenchAction::Consumed);
+            }
         }
+        WorkbenchAction::Consumed
     }
 
     /// Enter means "search" while the fields have moved on from the results,
@@ -4285,8 +4360,11 @@ impl Workbench {
             .unwrap_or_default()
     }
 
+    /// The focused field's selection, or else the buffer's.
     fn selected_text(&self) -> Option<String> {
-        self.editor.active()?.buffer.selected_text()
+        self.focused_field()
+            .and_then(|field| self.field(field)?.selected_text())
+            .or_else(|| self.editor.active()?.buffer.selected_text())
     }
 
     /// How a path leaves for the composer, which is the same wherever the path
@@ -4439,6 +4517,14 @@ fn hand_back(tab: &Tab, close: bool) -> Option<WorkbenchAction> {
     })
 }
 
+/// Whether `key` types a character go-to-line has no use for.
+fn types_non_digit(key: KeyEvent) -> bool {
+    matches!(
+        decode(key, FieldKind::Line),
+        Some(TextCommand::Edit(EditCommand::Insert(typed))) if !typed.is_ascii_digit()
+    )
+}
+
 fn opaque_path_component(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len() * 2);
     for byte in value.bytes() {
@@ -4560,7 +4646,7 @@ mod tests {
     use crate::scroll::SCROLLBAR_THUMB;
     use crate::search;
     use crate::view::{
-        CARET, Control, MENU_HINTS, MENU_MARK, MORE_LEFT, MORE_RIGHT, NAME_HINTS, NOT_A_REPOSITORY,
+        Control, MENU_HINTS, MENU_MARK, MORE_LEFT, MORE_RIGHT, NAME_HINTS, NOT_A_REPOSITORY,
         OPEN_MARK, RENDERED_STATUS, REVERT_MARK, STAGE_MARK, TabHit, TabPart, UNSTAGE_MARK,
         button_at, confirm_at, header_at, on_menu_mark, tab_at, toggle_at, visible_range,
     };
@@ -4606,6 +4692,29 @@ mod tests {
     const LEADER_TRAPPED: &str =
         "the workbench must hand Ctrl+X back, or every chord under it goes dead";
     const BLIND_CUT: &str = "cut with nothing selected must not eat the character at the cursor";
+    const LEAKED_TO_FILE: &str = "what a field is given must never edit the file behind it";
+    const PASTE_UNDER_DIALOG: &str =
+        "a paste under a question must reach neither file nor composer";
+    const FIELD_NOT_EDITED: &str = "the focused field did not take the key or paste it was given";
+    const FIELD_INACTIVE: &str = "the host must be told a field is taking typing";
+    const FIELD_NOT_COPIED: &str =
+        "a selection in a field must reach the host's clipboard and the workbench's";
+    const COPY_TRAPPED: &str = "Ctrl+C over a field with nothing selected must reach the host";
+    const SAVE_TRAPPED: &str = "a chord the find bar does not take must still reach the workbench";
+    const LIST_KEY_MISSED: &str =
+        "the palette list takes the text-start chords and leaves Home and End to its field";
+    const NOT_DIGITS: &str = "go-to-line must keep the digits of what it is given and nothing else";
+    const GOTO_MISSED: &str = "go-to-line must land on the line its digits name";
+    const NO_FIELD: &str = "a field must have the focus";
+    const FIRST_WORD: &str = "one ";
+    const SECOND_WORD: &str = "two";
+    const FIELD_WORDS: &str = "one two";
+    const SECOND_WORD_LINE: usize = 1;
+    const GOTO_ENTRY: &str = "line 3";
+    const GOTO_DIGITS: &str = "3";
+    const GOTO_LINE_INDEX: usize = 2;
+    const PALETTE_QUERY: &str = "txt";
+    const PALETTE_PREFIX: &str = "b";
     const WRONG_REFERENCE: &str = "the composer reference does not point where the cursor is";
     const MENTION_NOT_OPENED: &str = "a mention must open the file it names";
     const MENTION_WRONG_LINES: &str = "a mention must land on the lines it names";
@@ -4863,6 +4972,13 @@ mod tests {
         Drag,
     }
 
+    /// A way text reaches the focused field.
+    enum Entry {
+        Typed,
+        Pasted,
+        Clipboard,
+    }
+
     /// Takes `action` from the menu that is up, which is what pressing its row
     /// of the panel does.
     fn menu_action(workbench: &mut Workbench, action: MenuAction) -> WorkbenchAction {
@@ -5038,11 +5154,11 @@ mod tests {
             workbench.scm.select(Section::Unstaged, Some(0));
             workbench.stage_selected();
         } else {
-            workbench.commit_remote_input(Input {
-                kind: InputKind::NewFile,
-                at: workbench.backend_root(),
-                value: MADE_NAME.to_owned(),
-            });
+            workbench.commit_remote_input(Input::new(
+                InputKind::NewFile,
+                workbench.backend_root(),
+                MADE_NAME,
+            ));
         }
 
         assert!(
@@ -5182,11 +5298,11 @@ mod tests {
         let resource = tab.resource.clone();
         let cursor = tab.buffer.cursor();
         let saved_remote = control.contents(REMOTE_FILE);
-        remote.commit_remote_input(Input {
-            kind: InputKind::NewFile,
-            at: remote.backend_root(),
-            value: MADE_NAME.to_owned(),
-        });
+        remote.commit_remote_input(Input::new(
+            InputKind::NewFile,
+            remote.backend_root(),
+            MADE_NAME,
+        ));
         let pending = remote.remote_pending.clone();
         let pending_create = remote.pending_create.clone();
         assert!(!pending.is_empty());
@@ -5553,6 +5669,26 @@ mod tests {
     }
 
     #[test]
+    fn a_paste_under_the_dialog_is_swallowed() {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        workbench.handle_key(key(KeyCode::Char('X')));
+        workbench.handle_leader(press(keys::CLOSE_TAB));
+        let before = workbench
+            .editor
+            .active()
+            .expect(NO_TAB)
+            .buffer
+            .lines()
+            .to_vec();
+
+        assert!(workbench.paste(FIRST_WORD), "{PASTE_UNDER_DIALOG}");
+
+        let tab = workbench.editor.active().expect(NO_TAB);
+        assert_eq!(tab.buffer.lines(), before, "{PASTE_UNDER_DIALOG}");
+    }
+
+    #[test]
     fn the_dialog_paints_the_file_and_every_answer() {
         let (dir, mut workbench) = project();
         open_file(&dir, &mut workbench);
@@ -5824,6 +5960,184 @@ mod tests {
             workbench.editor.active().expect(NO_TAB).buffer.text(),
             "one\ntwo\nthree",
             "the trailing newline belongs to the file, not to the buffer"
+        );
+    }
+
+    fn open_palette(workbench: &mut Workbench) {
+        workbench.handle_key(press(keys::QUICK_OPEN));
+    }
+
+    fn open_find(workbench: &mut Workbench) {
+        workbench.handle_key(press(keys::FIND));
+    }
+
+    fn open_search(workbench: &mut Workbench) {
+        workbench.handle_leader(press(keys::VIEW_SEARCH));
+    }
+
+    fn open_name(workbench: &mut Workbench) {
+        let at = WorkbenchPath::Local(workbench.root.clone());
+        workbench.ask_for_name(InputKind::NewFile, at);
+    }
+
+    /// What the field the next key lands in holds.
+    fn field_text(workbench: &Workbench) -> String {
+        let field = workbench.focused_field().expect(NO_FIELD);
+        workbench.field(field).expect(NO_FIELD).text()
+    }
+
+    /// The text chords used to leak through the palette, the find bar and the
+    /// search pane and edit the file behind them, and a paste skipped every
+    /// field for the file.
+    #[test_case(open_palette ; "the palette")]
+    #[test_case(open_find ; "the find bar")]
+    #[test_case(open_search ; "the search pane")]
+    #[test_case(open_name ; "the name prompt")]
+    fn a_field_takes_its_keys_and_pastes_and_the_file_behind_it_nothing(open: fn(&mut Workbench)) {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        open(&mut workbench);
+        assert!(workbench.text_input_active(), "{FIELD_INACTIVE}");
+
+        assert!(workbench.paste(FIRST_WORD), "{FIELD_NOT_EDITED}");
+        workbench.clipboard = SECOND_WORD.to_owned();
+        workbench.handle_key(press(keys::PASTE));
+        assert_eq!(field_text(&workbench), FIELD_WORDS, "{FIELD_NOT_EDITED}");
+
+        let deleted = workbench.handle_key(press(keys::DELETE_WORD));
+        assert_eq!(deleted, WorkbenchAction::Consumed, "{FIELD_NOT_EDITED}");
+        assert_eq!(field_text(&workbench), FIRST_WORD, "{FIELD_NOT_EDITED}");
+
+        for chord in [keys::SELECT_ALL, keys::KILL_LINE, keys::UNDO, keys::REDO] {
+            workbench.handle_key(press(chord));
+        }
+        let tab = workbench.editor.active().expect(NO_TAB);
+        assert!(!tab.is_dirty(), "{LEAKED_TO_FILE}");
+        assert!(!tab.buffer.has_selection(), "{LEAKED_TO_FILE}");
+    }
+
+    /// The find field is one line, so it declines `Tab` and `Ctrl+J`, and the
+    /// document keymap behind it would indent or break the file.
+    #[test_case(press(keys::FOCUS_NEXT) ; "tab")]
+    #[test_case(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL) ; "ctrl_j")]
+    fn a_key_the_find_bar_declines_never_edits_the_file(declined: KeyEvent) {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        open_find(&mut workbench);
+
+        let action = workbench.handle_key(declined);
+
+        assert_eq!(action, WorkbenchAction::Consumed, "{LEAKED_TO_FILE}");
+        let tab = workbench.editor.active().expect(NO_TAB);
+        assert!(!tab.is_dirty(), "{LEAKED_TO_FILE}");
+    }
+
+    #[test_case(keys::COPY, FIELD_WORDS ; "copy keeps the query")]
+    #[test_case(keys::CUT, "" ; "cut takes it")]
+    fn a_selection_in_a_field_leaves_for_both_clipboards(chord: keys::Bind, left: &str) {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        open_palette(&mut workbench);
+        workbench.paste(FIELD_WORDS);
+        workbench.handle_key(press(keys::SELECT_ALL));
+
+        let copied = workbench.handle_key(press(chord));
+
+        assert_eq!(
+            copied,
+            WorkbenchAction::Copy(FIELD_WORDS.to_owned()),
+            "{FIELD_NOT_COPIED}"
+        );
+        assert_eq!(workbench.clipboard, FIELD_WORDS, "{FIELD_NOT_COPIED}");
+        assert_eq!(field_text(&workbench), left, "{FIELD_NOT_EDITED}");
+        let tab = workbench.editor.active().expect(NO_TAB);
+        assert!(!tab.is_dirty(), "{LEAKED_TO_FILE}");
+    }
+
+    #[test]
+    fn copy_over_a_field_with_nothing_selected_passes_through() {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        open_find(&mut workbench);
+        workbench.paste(FIELD_WORDS);
+
+        let copied = workbench.handle_key(press(keys::COPY));
+
+        assert_eq!(copied, WorkbenchAction::Passthrough, "{COPY_TRAPPED}");
+    }
+
+    #[test]
+    fn a_chord_the_find_bar_does_not_take_still_saves() {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        workbench.handle_key(key(KeyCode::Char(EDIT)));
+        open_find(&mut workbench);
+
+        workbench.handle_key(press(keys::SAVE));
+
+        let tab = workbench.editor.active().expect(NO_TAB);
+        assert!(!tab.is_dirty(), "{SAVE_TRAPPED}");
+    }
+
+    #[test]
+    fn a_paste_into_the_find_bar_searches_for_it() {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        open_find(&mut workbench);
+
+        workbench.paste(SECOND_WORD);
+
+        let tab = workbench.editor.active().expect(NO_TAB);
+        assert_eq!(tab.find.query().text(), SECOND_WORD, "{FIELD_NOT_EDITED}");
+        assert_eq!(tab.buffer.cursor().line, SECOND_WORD_LINE, "{NOT_STEPPED}");
+        assert!(!tab.is_dirty(), "{LEAKED_TO_FILE}");
+    }
+
+    #[test_case(Entry::Typed ; "typed")]
+    #[test_case(Entry::Pasted ; "pasted")]
+    #[test_case(Entry::Clipboard ; "pasted from the workbench clipboard")]
+    fn go_to_line_keeps_only_the_digits(entry: Entry) {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        workbench.handle_key(press(keys::GOTO_LINE));
+
+        match entry {
+            Entry::Typed => type_query(&mut workbench, GOTO_ENTRY),
+            Entry::Pasted => {
+                workbench.paste(GOTO_ENTRY);
+            }
+            Entry::Clipboard => {
+                workbench.clipboard = GOTO_ENTRY.to_owned();
+                workbench.handle_key(press(keys::PASTE));
+            }
+        }
+        assert_eq!(field_text(&workbench), GOTO_DIGITS, "{NOT_DIGITS}");
+        workbench.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(cursor(&workbench).line, GOTO_LINE_INDEX, "{GOTO_MISSED}");
+        let tab = workbench.editor.active().expect(NO_TAB);
+        assert!(!tab.is_dirty(), "{LEAKED_TO_FILE}");
+    }
+
+    #[test]
+    fn the_palette_list_takes_ctrl_end_and_leaves_home_to_the_caret() {
+        let (_dir, mut workbench) = project();
+        open_palette(&mut workbench);
+        workbench.paste(PALETTE_QUERY);
+
+        workbench.handle_key(press(keys::LIST_LAST));
+        assert_eq!(
+            workbench.palette.selected_index() + 1,
+            workbench.palette.len(),
+            "{LIST_KEY_MISSED}"
+        );
+        workbench.handle_key(key(KeyCode::Home));
+        type_query(&mut workbench, PALETTE_PREFIX);
+
+        assert_eq!(
+            field_text(&workbench),
+            format!("{PALETTE_PREFIX}{PALETTE_QUERY}"),
+            "{LIST_KEY_MISSED}"
         );
     }
 
@@ -7467,7 +7781,7 @@ mod tests {
         assert_eq!(action, sent(OPENED_FILE, None), "{WRONG_REFERENCE}");
     }
 
-    /// Types `text` into whichever field the search pane has the caret in.
+    /// Types `text` into the focused field.
     fn type_query(workbench: &mut Workbench, text: &str) {
         for ch in text.chars() {
             workbench.handle_key(key(KeyCode::Char(ch)));
@@ -8442,10 +8756,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_press_that_selected_nothing_leaves_the_clipboard_alone() {
+    #[test_case(false ; "with no field up")]
+    #[test_case(true ; "over a selection standing in the find bar")]
+    fn a_press_that_selected_nothing_leaves_the_clipboard_alone(finding: bool) {
         let (dir, mut workbench) = project();
         open_file(&dir, &mut workbench);
+        if finding {
+            open_find(&mut workbench);
+            workbench.paste(FIELD_WORDS);
+            workbench.handle_key(press(keys::SELECT_ALL));
+        }
         draw(&mut workbench, 80, 24);
         let text = workbench.panes.text;
         workbench.clipboard = KEPT_CLIPBOARD.to_owned();
@@ -9150,7 +9470,7 @@ mod tests {
 
         assert!(dir.path().join(OPENED_FILE).is_file(), "{RENAMED_OVER}");
         let input = workbench.input.as_ref().expect(PROMPT_GONE);
-        assert_eq!(input.value, NESTED_DIR, "{PROMPT_GONE}");
+        assert_eq!(input.value.text(), NESTED_DIR, "{PROMPT_GONE}");
         assert!(workbench.flash.is_some(), "{NO_REASON}");
     }
 
@@ -9526,12 +9846,19 @@ mod tests {
             workbench.handle_key(key(KeyCode::Char(typed)));
         }
 
-        let frame = draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let surface = paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let typed = format!("{NEW_FILE_PROMPT}{MADE_NAME}");
+        let caret = (0..TERMINAL_HEIGHT)
+            .find_map(|row| {
+                let line = row_of(&surface, Rect::new(0, row, TERMINAL_WIDTH, 1), 0);
+                let start = line.find(&typed)?;
+                let column = line[..start].width() + typed.width();
+                Some(surface[(u16::try_from(column).ok()?, row)].style())
+            })
+            .expect(WRONG_PROMPT);
 
-        assert!(
-            frame.contains(&format!("{NEW_FILE_PROMPT}{MADE_NAME}{CARET}")),
-            "{WRONG_PROMPT}"
-        );
+        let cursor = WorkbenchStyles::default().cursor.add_modifier;
+        assert!(caret.add_modifier.contains(cursor), "{WRONG_PROMPT}");
     }
 
     #[test]
@@ -9727,11 +10054,11 @@ mod tests {
             .unwrap()
             .revision
             .clone();
-        workbench.commit_remote_input(Input {
-            kind: InputKind::Rename,
-            at: WorkbenchPath::Remote(WorkspacePath::new(REMOTE_TEST_DIRECTORY).unwrap()),
-            value: REMOTE_MOVED_DIRECTORY.into(),
-        });
+        workbench.commit_remote_input(Input::new(
+            InputKind::Rename,
+            WorkbenchPath::Remote(WorkspacePath::new(REMOTE_TEST_DIRECTORY).unwrap()),
+            REMOTE_MOVED_DIRECTORY,
+        ));
         settle_remote(&mut workbench, |workbench| !workbench.is_busy());
         let moved = WorkbenchPath::Remote(WorkspacePath::new(REMOTE_MOVED_NESTED).unwrap());
         assert_eq!(workbench.editor.active().unwrap().path, moved);
@@ -9794,11 +10121,11 @@ mod tests {
             workbench.editor_key(key(KeyCode::Char('X')));
         }
         let buffer = workbench.editor.active().unwrap().contents();
-        workbench.commit_remote_input(Input {
-            kind: InputKind::Rename,
-            at: WorkbenchPath::Remote(WorkspacePath::new(REMOTE_TEST_DIRECTORY).unwrap()),
-            value: REMOTE_MOVED_DIRECTORY.to_owned(),
-        });
+        workbench.commit_remote_input(Input::new(
+            InputKind::Rename,
+            WorkbenchPath::Remote(WorkspacePath::new(REMOTE_TEST_DIRECTORY).unwrap()),
+            REMOTE_MOVED_DIRECTORY,
+        ));
         let renamed_directory = reads.recv().unwrap();
         assert_eq!(renamed_directory.path.as_str(), REMOTE_MOVED_DIRECTORY);
         renamed_directory.reply.send(()).unwrap();
@@ -10026,11 +10353,11 @@ mod tests {
             settle_remote(&mut workbench, |workbench| workbench.confirm.is_some());
             workbench.resolve_delete(Choice::Discard);
         } else {
-            workbench.commit_remote_input(Input {
-                kind: InputKind::Rename,
-                at: path.clone(),
-                value: REMOTE_MOVED_DIRECTORY.into(),
-            });
+            workbench.commit_remote_input(Input::new(
+                InputKind::Rename,
+                path.clone(),
+                REMOTE_MOVED_DIRECTORY,
+            ));
         }
         settle_remote(&mut workbench, |workbench| !workbench.is_busy());
         let tab = workbench.editor.active().expect(NO_TAB);
@@ -10078,11 +10405,11 @@ mod tests {
         if changed {
             control.replace(REMOTE_TEST_NESTED, REMOTE_TEST_FILE);
         }
-        workbench.commit_remote_input(Input {
-            kind: InputKind::Rename,
-            at: WorkbenchPath::Remote(WorkspacePath::new(REMOTE_TEST_DIRECTORY).unwrap()),
-            value: REMOTE_MOVED_DIRECTORY.into(),
-        });
+        workbench.commit_remote_input(Input::new(
+            InputKind::Rename,
+            WorkbenchPath::Remote(WorkspacePath::new(REMOTE_TEST_DIRECTORY).unwrap()),
+            REMOTE_MOVED_DIRECTORY,
+        ));
         settle_remote(&mut workbench, |workbench| !workbench.is_busy());
         let tab = workbench.editor.active().expect(NO_TAB);
         let resource = tab.resource.as_ref().unwrap();
@@ -10378,7 +10705,7 @@ mod tests {
 
         let root = WorkbenchPath::Remote(caudra_workspace::WorkspacePath::root());
         workbench.ask_for_name(InputKind::NewFile, root.clone());
-        workbench.input.as_mut().unwrap().value = MADE.into();
+        workbench.input.as_mut().unwrap().value.set_text(MADE);
         workbench.commit_input();
         settle_remote(&mut workbench, |workbench| {
             workbench
@@ -10387,7 +10714,7 @@ mod tests {
                 .is_some_and(|tab| tab.path.file_name() == MADE)
         });
         workbench.ask_for_name(InputKind::NewFolder, root);
-        workbench.input.as_mut().unwrap().value = "folder".into();
+        workbench.input.as_mut().unwrap().value.set_text("folder");
         workbench.commit_input();
         settle_remote(&mut workbench, |workbench| {
             workbench.tree.rows().iter().any(|row| row.name == "folder")
@@ -10395,16 +10722,17 @@ mod tests {
 
         let made = WorkbenchPath::Remote(caudra_workspace::WorkspacePath::new(MADE).unwrap());
         workbench.ask_for_name(InputKind::Rename, made);
-        workbench.input.as_mut().unwrap().value = RENAMED.into();
+        workbench.input.as_mut().unwrap().value.set_text(RENAMED);
         workbench.commit_input();
         settle_remote(&mut workbench, |workbench| {
             workbench.tree.rows().iter().any(|row| row.name == RENAMED)
         });
 
         workbench.sidebar = SidebarView::Search;
-        for ch in "resynced".chars() {
-            workbench.search.push_char(ch);
-        }
+        workbench
+            .search
+            .input_mut(search::Field::Query)
+            .set_text("resynced");
         workbench.run_or_open_search();
         settle_remote(&mut workbench, |workbench| workbench.search.has_results());
         assert!(workbench.search.selection().is_some());

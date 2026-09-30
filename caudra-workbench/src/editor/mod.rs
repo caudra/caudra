@@ -6,13 +6,14 @@ pub mod highlight;
 pub mod history;
 pub mod render;
 pub mod rendered;
+pub mod text_field;
 pub mod words;
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 use tracing::info;
 
 use buffer::Buffer;
@@ -21,6 +22,7 @@ use find::Find;
 use highlight::ViewportHighlighter;
 use history::History;
 use rendered::{PaintMarkdown, Painting, Rendered};
+use text_field::{FieldKind, TextCommand, decode};
 
 use crate::fs::backend::{LoadedFile, ResourceEntry, WorkbenchPath};
 use crate::fs::read::{self, LineEnding, LoadError, ReadOnly, SaveError, Source};
@@ -463,59 +465,43 @@ impl Tab {
         true
     }
 
-    pub fn set_find_query(&mut self, query: String) {
+    /// Runs the find query from the caret, after the query changed.
+    pub fn search_find(&mut self) {
         let cursor = self.buffer.cursor();
-        self.find.set_query(query, self.buffer.lines(), cursor);
+        self.find.search(self.buffer.lines(), cursor);
     }
 
     pub fn refresh_find(&mut self) {
         self.find.refresh(self.buffer.lines());
     }
 
-    /// Motions and text edits, the keys that touch nothing but this buffer.
-    /// Reports whether the key was one of them.
+    /// Runs the document keymap against this buffer: motions, edits, select
+    /// all, undo and redo. Reports whether the caret may have moved, which is
+    /// what the pane follows. Selecting all leaves the reader where they are,
+    /// and copy and cut belong to the workbench's clipboard.
     pub fn edit_key(&mut self, key: KeyEvent, rows: usize) -> bool {
-        let extend = key.modifiers.contains(KeyModifiers::SHIFT);
-        let by_word = key.modifiers.contains(KeyModifiers::CONTROL);
-        let page = rows.max(1) as isize;
-        match key.code {
-            KeyCode::Left if by_word => self.buffer.move_word_left(extend),
-            KeyCode::Left => self.buffer.move_left(extend),
-            KeyCode::Right if by_word => self.buffer.move_word_right(extend),
-            KeyCode::Right => self.buffer.move_right(extend),
-            KeyCode::Up => self.buffer.move_vertical(-1, extend),
-            KeyCode::Down => self.buffer.move_vertical(1, extend),
-            KeyCode::PageUp => self.buffer.move_vertical(-page, extend),
-            KeyCode::PageDown => self.buffer.move_vertical(page, extend),
-            KeyCode::Home if by_word => self.buffer.move_document_start(extend),
-            KeyCode::Home => self.buffer.move_home(extend),
-            KeyCode::End if by_word => self.buffer.move_document_end(extend),
-            KeyCode::End => self.buffer.move_end(extend),
-            _ => return self.text_key(key),
-        }
-        self.break_undo_group();
-        true
-    }
-
-    fn text_key(&mut self, key: KeyEvent) -> bool {
-        if !self.is_editable() {
+        let Some(command) = decode(key, FieldKind::Document) else {
             return false;
-        }
-        let by_word = key.modifiers.contains(KeyModifiers::CONTROL);
-        let typing = (key.modifiers - KeyModifiers::SHIFT).is_empty();
-        let edit = match key.code {
-            KeyCode::Char(ch) if typing => self.buffer.insert(&ch.to_string()),
-            KeyCode::Enter if typing => self.buffer.insert_newline(),
-            KeyCode::Tab => self.buffer.insert_indent(),
-            KeyCode::BackTab => self.buffer.dedent(),
-            KeyCode::Backspace if by_word => self.buffer.delete_word_left(),
-            KeyCode::Backspace => self.buffer.backspace(),
-            KeyCode::Delete if by_word => self.buffer.delete_word_right(),
-            KeyCode::Delete => self.buffer.delete(),
-            _ => return false,
         };
-        self.record(edit);
-        true
+        match command {
+            TextCommand::Move { motion, extend } => {
+                self.buffer.move_by(motion, extend, rows);
+                self.break_undo_group();
+                true
+            }
+            TextCommand::Edit(command) if self.is_editable() => {
+                let edit = self.buffer.perform(command);
+                self.record(edit);
+                true
+            }
+            TextCommand::SelectAll => {
+                self.buffer.select_all();
+                false
+            }
+            TextCommand::Undo => self.undo(),
+            TextCommand::Redo => self.redo(),
+            TextCommand::Edit(_) | TextCommand::Copy | TextCommand::Cut => false,
+        }
     }
 
     pub fn save(&mut self) -> Result<(), SaveError> {
@@ -1028,6 +1014,8 @@ impl Editor {
 mod tests {
     use super::buffer::Cursor;
     use super::{DiffKind, DiffRow, Editor, Tab, WorkbenchPath};
+    use crate::keys;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
@@ -1046,6 +1034,12 @@ mod tests {
     const NO_ACTIVE: &str = "the tab just pushed must be the active one";
     const DIFF_READ_ONLY: &str = "a diff is not a file and must never be written back";
     const BUFFER_IS_THE_LINE: &str = "a diff row's buffer text is the line, not the patch line";
+    const FIRST_LINE: &str = "fn main() {}";
+    const PAGE_ROWS: usize = 10;
+    const ALT_GR_TEXT: char = '@';
+    const MOVED_WRONG: &str = "the chord did not take the caret where its motion points";
+    const MOTION_UNREPORTED: &str = "a motion must report that the caret may have moved";
+    const ALT_TYPED: &str = "AltGr types its character, and bare Alt, dead on macOS, types nothing";
 
     #[cfg(unix)]
     mod local_source {
@@ -1214,7 +1208,7 @@ mod tests {
     fn fixture() -> (TempDir, std::path::PathBuf) {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("main.rs");
-        fs::write(&path, "fn main() {}\n").unwrap();
+        fs::write(&path, format!("{FIRST_LINE}\n")).unwrap();
         (tmp, path)
     }
 
@@ -1270,6 +1264,37 @@ mod tests {
         assert_eq!(tab.buffer.text(), before);
         assert!(tab.redo());
         assert_eq!(tab.buffer.text(), after);
+    }
+
+    #[test_case(keys::LINE_END, 0, FIRST_LINE.len() ; "ctrl e goes to the line end")]
+    #[test_case(keys::SUPER_END, 0, FIRST_LINE.len() ; "super right goes to the line end")]
+    #[test_case(keys::SUPER_HOME, FIRST_LINE.len(), 0 ; "super left goes to the line start")]
+    fn a_line_chord_moves_the_caret_along_its_line(chord: keys::Bind, from: usize, to: usize) {
+        let (_tmp, path) = fixture();
+        let mut tab = Tab::open(&path, 0).unwrap();
+        tab.buffer.set_cursor(Cursor::new(0, from), false);
+
+        assert!(
+            tab.edit_key(chord.to_key_event(), PAGE_ROWS),
+            "{MOTION_UNREPORTED}"
+        );
+        assert_eq!(tab.buffer.cursor(), Cursor::new(0, to), "{MOVED_WRONG}");
+    }
+
+    #[test_case(KeyModifiers::CONTROL | KeyModifiers::ALT, true ; "altgr types")]
+    #[test_case(KeyModifiers::ALT, false ; "bare alt types nothing")]
+    fn only_altgr_types_through_alt(modifiers: KeyModifiers, types: bool) {
+        let (_tmp, path) = fixture();
+        let mut tab = Tab::open(&path, 0).unwrap();
+
+        let typed = KeyEvent::new(KeyCode::Char(ALT_GR_TEXT), modifiers);
+
+        assert_eq!(tab.edit_key(typed, PAGE_ROWS), types, "{ALT_TYPED}");
+        assert_eq!(
+            tab.buffer.text().starts_with(ALT_GR_TEXT),
+            types,
+            "{ALT_TYPED}"
+        );
     }
 
     #[test]

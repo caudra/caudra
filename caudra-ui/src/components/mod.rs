@@ -87,10 +87,11 @@ use caudra_agent::{
 use caudra_providers::model_registry::Binding;
 use caudra_providers::{CaudraId, HistoryItem, ModelPurpose, TaskEventOrigin};
 use caudra_storage::sessions::SessionRelocation;
+use caudra_workbench::text_field::FieldStyles;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -102,6 +103,8 @@ use modal::FooterHits;
 use worktree_picker::WorktreeView;
 
 pub(crate) const CHEVRON: &str = "❯ ";
+/// Selected text in every field, laid over whatever colour it already carries.
+pub(crate) const SELECTION: Style = Style::new().add_modifier(Modifier::REVERSED);
 const DIGIT_GROUP: usize = 3;
 /// Columns a modal pans per key press. Roughly one column of a token table, so
 /// a reader walks the table a field at a time rather than a glyph at a time.
@@ -120,6 +123,18 @@ pub(crate) fn chevron_span() -> ratatui::text::Span<'static> {
 /// foreground resolves to the terminal's default color instead of the theme's.
 pub(crate) fn input_text_style() -> Style {
     Style::new().fg(crate::theme::current().foreground)
+}
+
+/// How a text field is painted: `text` for what was typed, the selection
+/// reversed, and the caret in the theme's cursor colours.
+pub(crate) fn field_styles(text: Style) -> FieldStyles {
+    let theme = crate::theme::current();
+    FieldStyles {
+        text,
+        selection: SELECTION,
+        caret: theme.cursor,
+        placeholder: theme.input_placeholder,
+    }
 }
 
 /// The runs of `text` a fuzzy search matched, painted apart from the rest of it.
@@ -163,23 +178,6 @@ pub(crate) fn match_spans(
     }
 
     spans
-}
-
-/// A single-line prompt with the cursor painted onto the cell it occupies.
-/// The terminal cursor never moves, so end-of-line needs a space to style.
-pub(crate) fn input_line_with_cursor(input: &crate::text_buffer::TextBuffer) -> Line<'static> {
-    let value = input.value();
-    let cursor_byte = crate::text_buffer::TextBuffer::char_to_byte(&value, input.x());
-    let (before, rest) = value.split_at(cursor_byte);
-    let mut chars = rest.chars();
-    let cursor_char = chars.next().unwrap_or(' ');
-    let text = input_text_style();
-    Line::from(vec![
-        chevron_span(),
-        Span::styled(before.to_string(), text),
-        Span::styled(cursor_char.to_string(), crate::theme::current().cursor),
-        Span::styled(chars.as_str().to_string(), text),
-    ])
 }
 
 pub(crate) trait Overlay {
@@ -487,7 +485,7 @@ pub(crate) fn visual_rows(lines: &[Line<'static>], width: u16) -> VisualRows {
 /// button cannot invent its own idea of what hovered looks like.
 pub(crate) fn hover_style(style: Style, hovered: bool) -> Style {
     if hovered {
-        style.add_modifier(ratatui::style::Modifier::REVERSED)
+        style.add_modifier(Modifier::REVERSED)
     } else {
         style
     }
@@ -920,7 +918,6 @@ pub enum Action {
     OpenUrl(String),
     Btw(String),
     Extract,
-    Suspend,
 }
 
 pub struct ForkedSession {

@@ -5,6 +5,8 @@ use caudra_agent::worktree::{Changes, CreateRequest, RemoveRequest, Request, lab
 use caudra_grab::grab_scope;
 use caudra_storage::id::CaudraId;
 use caudra_storage::worktrees::CheckoutSessions;
+use caudra_workbench::keys::{LIST_FIRST, LIST_LAST};
+use caudra_workbench::text_field::{FieldKind, TextField, TextKey};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
@@ -14,7 +16,6 @@ use super::{Hint, Overlay};
 use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::repaint::Cadence;
-use crate::text_buffer::TextBuffer;
 
 const MAX_VISIBLE: u16 = 12;
 const WIDTH_PERCENT: u16 = 80;
@@ -82,6 +83,7 @@ pub enum WorktreeAction {
     /// The removal of this checkout needs to know whether it has changes.
     InspectRemoval(PathBuf),
     Run(Request),
+    Copy(String),
 }
 
 /// The repository as `/worktree` shows it.
@@ -114,7 +116,7 @@ struct Draft {
 enum Stage {
     List,
     Create(Draft),
-    Edit(Draft, Field, TextBuffer),
+    Edit(Draft, Field, Box<TextField>),
     Remove {
         root: PathBuf,
         branch: Option<String>,
@@ -260,19 +262,26 @@ impl WorktreePicker {
         let Some(flow) = &mut self.flow else {
             return WorktreeAction::Consumed;
         };
-        if event.code == KeyCode::Esc || key::QUIT.matches(event) {
+        if event.code == KeyCode::Esc {
             self.close();
             return WorktreeAction::Closed;
         }
         match &mut flow.stage {
-            Stage::Edit(_, _, buffer) => {
+            Stage::Edit(_, _, field) => {
                 if event.code == KeyCode::Enter {
                     self.finish_edit();
-                } else {
-                    buffer.handle_key(event);
-                    self.sync_edit();
+                    return WorktreeAction::Consumed;
                 }
-                return WorktreeAction::Consumed;
+                let edit = field.handle_key(event);
+                self.sync_edit();
+                return match edit {
+                    TextKey::Copy(text) | TextKey::Cut(text) => WorktreeAction::Copy(text),
+                    TextKey::Ignored if key::QUIT.matches(event) => {
+                        self.close();
+                        WorktreeAction::Closed
+                    }
+                    _ => WorktreeAction::Consumed,
+                };
             }
             Stage::List => {
                 if key::NEW_SESSION.matches(event) {
@@ -306,16 +315,19 @@ impl WorktreePicker {
                     self.toggle_carry();
                     return WorktreeAction::Consumed;
                 }
-                if !matches!(
+                // The list has nothing to search here, so it hears only the
+                // keys that move or answer it; `Ctrl+C` closes through it.
+                let for_list = matches!(
                     event.code,
                     KeyCode::Enter
                         | KeyCode::Up
                         | KeyCode::Down
                         | KeyCode::PageUp
                         | KeyCode::PageDown
-                        | KeyCode::Home
-                        | KeyCode::End
-                ) {
+                ) || LIST_FIRST.matches(event)
+                    || LIST_LAST.matches(event)
+                    || key::QUIT.matches(event);
+                if !for_list {
                     return WorktreeAction::Consumed;
                 }
             }
@@ -326,8 +338,8 @@ impl WorktreePicker {
 
     pub fn handle_paste(&mut self, text: &str) -> bool {
         match self.flow.as_mut().map(|flow| &mut flow.stage) {
-            Some(Stage::Edit(_, _, buffer)) => {
-                buffer.insert_text(text);
+            Some(Stage::Edit(_, _, field)) => {
+                field.paste(text);
                 self.sync_edit();
                 true
             }
@@ -444,9 +456,8 @@ impl WorktreePicker {
             Field::Branch => (draft.branch.clone(), BRANCH_TITLE, BRANCH_HINT),
             Field::Base => (draft.base.clone(), BASE_TITLE, BASE_HINT),
         };
-        let mut buffer = TextBuffer::new(value);
-        buffer.move_to_end();
-        flow.stage = Stage::Edit(draft, field, buffer);
+        let input = Box::new(TextField::with_text(FieldKind::Line, &value));
+        flow.stage = Stage::Edit(draft, field, input);
         self.picker.set_error_text(None);
         self.picker.set_info_text(Some(hint.into()));
         self.picker.set_footer_builder(edit_footer);
@@ -456,12 +467,11 @@ impl WorktreePicker {
 
     fn sync_edit(&mut self) {
         if let Some(Flow {
-            stage: Stage::Edit(_, _, buffer),
+            stage: Stage::Edit(_, _, field),
             ..
         }) = &self.flow
         {
-            self.picker.set_search_text(&buffer.value());
-            self.picker.set_search_cursor(buffer.cursor_offset());
+            self.picker.mirror_search(field);
         }
     }
 
@@ -469,11 +479,11 @@ impl WorktreePicker {
         let Some(flow) = &mut self.flow else {
             return;
         };
-        let Stage::Edit(mut draft, field, buffer) = mem::replace(&mut flow.stage, Stage::List)
+        let Stage::Edit(mut draft, field, input) = mem::replace(&mut flow.stage, Stage::List)
         else {
             return;
         };
-        let value = buffer.value().trim().to_owned();
+        let value = input.text().trim().to_owned();
         match field {
             Field::Branch => draft.branch = value,
             Field::Base if value.is_empty() => draft.base = HEAD.into(),
@@ -517,6 +527,7 @@ impl WorktreePicker {
                 EntryKind::Remove(changes) => self.confirm_removal(changes),
             },
             PickerAction::Key(key) => self.handle_key(key),
+            PickerAction::Copy(text) => WorktreeAction::Copy(text),
             PickerAction::Consumed | PickerAction::Toggle(..) => WorktreeAction::Consumed,
         }
     }

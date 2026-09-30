@@ -14,13 +14,13 @@ use caudra_storage::permission_patterns::{
 use caudra_storage::permission_state::{
     PermissionLifetime, PermissionRuleRecord, StructuredPermissionEffect,
 };
+use caudra_workbench::render::{self, Row};
+use caudra_workbench::text_field::{FieldKind, FieldStyles, TextField, TextKey, is_newline_key};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::Modifier;
-use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -42,7 +42,7 @@ use super::model::{
 use super::pattern::{PATTERN_CHIP_ROWS, PatternControl, PatternPanel};
 use super::view::ScopeView;
 use super::view::{Disclosure, ScopeControl};
-use crate::text_buffer::{TextBuffer, is_newline_key};
+use crate::components::field_styles;
 use crate::theme::{self, Theme};
 
 const MAX_BUFFER_BYTES: usize = 64 * 1024;
@@ -121,6 +121,8 @@ pub(crate) enum EditorEvent {
         acknowledged: BTreeSet<ConfirmationRequirement>,
     },
     Cancel,
+    /// Text the value field copied or cut, for the clipboard.
+    Copy(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -245,7 +247,7 @@ pub(crate) struct ScopeEditor {
     value: usize,
     tuple: usize,
     editing: Option<Control>,
-    buffer: TextBuffer,
+    field: TextField,
     source: TemplateSource,
     preview: Option<EditorPreview>,
     template_name: String,
@@ -320,7 +322,7 @@ impl ScopeEditor {
             value: 0,
             tuple: 0,
             editing: None,
-            buffer: TextBuffer::new(String::new()),
+            field: TextField::new(FieldKind::Block).limited_to(MAX_BUFFER_BYTES),
             source: TemplateSource {
                 command: String::new(),
                 workdir: PathBuf::new(),
@@ -721,16 +723,13 @@ impl ScopeEditor {
             match key.code {
                 KeyCode::Esc => {
                     self.editing = None;
-                    self.buffer.clear();
+                    self.field.clear();
                     self.blocked_key = self.last_key;
                 }
-                KeyCode::Enter if !is_newline_key(&key) => self.commit_field(control),
-                _ if is_newline_key(&key) && self.buffer.value().len() < MAX_BUFFER_BYTES => {
-                    self.buffer.add_line();
-                }
+                KeyCode::Enter if !is_newline_key(key) => self.commit_field(control),
                 _ => {
-                    if self.buffer.value().len() < MAX_BUFFER_BYTES {
-                        self.buffer.handle_key(key);
+                    if let TextKey::Copy(text) | TextKey::Cut(text) = self.field.handle_key(key) {
+                        return Some(EditorEvent::Copy(text));
                     }
                 }
             }
@@ -787,11 +786,8 @@ impl ScopeEditor {
     }
 
     pub(crate) fn handle_paste(&mut self, text: &str) {
-        if !self.suspended
-            && self.editing.is_some()
-            && self.buffer.value().len().saturating_add(text.len()) <= MAX_BUFFER_BYTES
-        {
-            self.buffer.insert_text(text);
+        if !self.suspended && self.editing.is_some() {
+            self.field.paste(text);
         }
     }
 
@@ -1201,7 +1197,7 @@ impl ScopeEditor {
             }
             Control::AddValue => {
                 self.editing = Some(Control::AddValue);
-                self.buffer.clear();
+                self.field.clear();
             }
             Control::RemoveValue => {
                 let (slot, value) = (self.slot, self.value);
@@ -1315,8 +1311,7 @@ impl ScopeEditor {
                     if let Control::Value(index) = control {
                         self.value = index;
                     }
-                    self.buffer = TextBuffer::new(text);
-                    self.buffer.move_to_end();
+                    self.field.set_text(&text);
                     self.editing = Some(control);
                 } else {
                     self.status = "Read-only in this mode. Preserved opaque values require an explicit replacement; host-derived facts require analysis.".into();
@@ -1463,7 +1458,7 @@ impl ScopeEditor {
     }
 
     fn commit_field(&mut self, control: Control) {
-        let text = self.buffer.value();
+        let text = self.field.text();
         if control == Control::TestInput {
             match serde_json::from_str(&text) {
                 Ok(value) => self.test_input = Some(value),
@@ -1475,7 +1470,7 @@ impl ScopeEditor {
             self.test_revision = self.test_revision.saturating_add(1);
             self.test_state = TestState::Idle;
             self.editing = None;
-            self.buffer.clear();
+            self.field.clear();
             self.blocked_key = self.last_key;
             return;
         }
@@ -1570,7 +1565,7 @@ impl ScopeEditor {
             }
         }
         self.editing = None;
-        self.buffer.clear();
+        self.field.clear();
         self.changed();
     }
 
@@ -2300,50 +2295,35 @@ impl ScopeEditor {
         ])
         .areas(area);
         frame.render_widget(Paragraph::new(INPUT_LABEL).style(theme.panel_title), label);
-        let mut cursor_width = 0;
+        let styles = FieldStyles {
+            caret: theme.cursor,
+            ..field_styles(theme.item)
+        };
+        let cursor = self.field.cursor();
+        let width = usize::from(value.width);
+        let height = usize::from(value.height);
+        let caret_column = render::display_column(&self.field.lines()[cursor.line], cursor.col);
+        let pan = (caret_column + 1).saturating_sub(width);
         let lines: Vec<_> = self
-            .buffer
+            .field
             .lines()
             .iter()
             .enumerate()
+            .skip((cursor.line + 1).saturating_sub(height))
+            .take(height)
             .map(|(index, line)| {
-                if index != self.buffer.y() {
-                    return Line::from(safe(line));
+                let overlays = self.field.overlays(index, &styles, true);
+                Row {
+                    text: line,
+                    segments: None,
+                    base: styles.text,
+                    fill: None,
+                    overlays: &overlays,
                 }
-                let mut chars = line.chars();
-                let before = safe(&chars.by_ref().take(self.buffer.x()).collect::<String>());
-                let caret = safe(&chars.next().unwrap_or(' ').to_string());
-                cursor_width = before.width() + caret.width();
-                Line::from(vec![
-                    Span::raw(before),
-                    Span::styled(caret, theme.item.add_modifier(Modifier::REVERSED)),
-                    Span::raw(safe(&chars.collect::<String>())),
-                ])
+                .paint(pan, width)
             })
             .collect();
-        let top = self
-            .buffer
-            .y()
-            .saturating_add(1)
-            .saturating_sub(usize::from(value.height));
-        let left = cursor_width.saturating_sub(usize::from(value.width));
-        let left = lines.get(self.buffer.y()).map_or(0, |line| {
-            let mut offset = 0;
-            for grapheme in line.styled_graphemes(theme.item) {
-                if offset >= left {
-                    break;
-                }
-                offset += grapheme.symbol.width();
-            }
-            offset
-        });
-        frame.render_widget(
-            Paragraph::new(lines).style(theme.item).scroll((
-                u16::try_from(top).unwrap_or(u16::MAX),
-                u16::try_from(left).unwrap_or(u16::MAX),
-            )),
-            value,
-        );
+        frame.render_widget(Paragraph::new(lines).style(theme.item), value);
     }
 
     fn buttons(
@@ -2593,9 +2573,8 @@ mod tests {
     };
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use ratatui::buffer::Buffer;
+    use ratatui::buffer::{Buffer, Cell};
     use ratatui::layout::{Position, Rect};
-    use ratatui::style::Modifier;
     use ratatui::text::Line;
     use ratatui::widgets::{Paragraph, Widget, Wrap};
     use std::collections::BTreeSet;
@@ -2604,9 +2583,10 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        Control, EditorEvent, EditorLaunch, EditorPreview, INPUT_HELP, PREVIEW_DEBOUNCE,
-        PROTECTION_LABEL, STALE_PREVIEW, ScopeEditor, Section, TEMPLATE_SOURCE_REQUIRED,
-        TEMPLATE_TARGET_REQUIRED, TestState, UNPROTECTED_ONLY, WORKDIR_ATTRIBUTE,
+        Control, EditorEvent, EditorLaunch, EditorPreview, INPUT_HELP, MAX_BUFFER_BYTES,
+        PREVIEW_DEBOUNCE, PROTECTION_LABEL, STALE_PREVIEW, ScopeEditor, Section,
+        TEMPLATE_SOURCE_REQUIRED, TEMPLATE_TARGET_REQUIRED, TestState, UNPROTECTED_ONLY,
+        WORKDIR_ATTRIBUTE,
     };
     use crate::components::buffer_text;
     use crate::components::permission_scope::changes::{DetailControl, Side};
@@ -2643,6 +2623,7 @@ mod tests {
     const SEED_COMMAND: &str = "rg -n ''";
     const INPUT_TAIL: &str = "cursor-tail";
     const WIDE_CHARACTER: &str = "界";
+    const LIMIT_FILL: &str = "a";
     const INPUT_LINE_COUNT: usize = 6;
     const PENDING_REQUIREMENT: &str = "MayReleasePendingRequests";
     const LONG_VALUE_PARTS: usize = 48;
@@ -3162,9 +3143,9 @@ mod tests {
         assert!(editor.is_suspended());
         assert_eq!(editor.revision(), suspended_revision);
         assert!(editor.poll_preview(PREVIEW_DEBOUNCE * 10).is_none());
-        let buffer = editor.buffer.value();
+        let text = editor.field.text();
         editor.handle_paste(MANUAL);
-        assert_eq!(editor.buffer.value(), buffer);
+        assert_eq!(editor.field.text(), text);
         editor.set_visible(true);
         editor.receive_preview(revision, Ok(preview()));
         assert!(editor.preview.is_none());
@@ -3173,7 +3154,7 @@ mod tests {
         if committed {
             assert_eq!(editor.draft().label.as_deref(), Some(LABEL));
         } else {
-            assert_eq!(editor.buffer.value(), LABEL);
+            assert_eq!(editor.field.text(), LABEL);
             assert!(editor.editing.is_some());
         }
     }
@@ -3492,7 +3473,7 @@ mod tests {
         let before = editor.draft().clone();
         editor.activate(Control::Section(section));
         editor.activate(control);
-        editor.buffer.clear();
+        editor.field.clear();
         editor.handle_paste(INVALID_JSON);
         assert!(editor.handle_key(KeyEvent::from(KeyCode::Enter)).is_none());
         assert!(editor.is_editing());
@@ -3518,7 +3499,7 @@ mod tests {
         );
         editor.activate(Control::Section(Section::Template));
         editor.activate(Control::TemplateName);
-        editor.buffer.clear();
+        editor.field.clear();
         editor.handle_paste(LABEL);
         editor.handle_key(KeyEvent::from(KeyCode::Enter));
         editor.source.command = SEED_COMMAND.into();
@@ -3682,7 +3663,7 @@ mod tests {
     fn multiline_fields_accept_newlines_without_committing(modifiers: KeyModifiers) {
         let mut editor = review_editor();
         editor.activate(Control::Pointers);
-        editor.buffer.clear();
+        editor.field.clear();
         editor.handle_paste(COMMAND_POINTER);
         assert!(
             editor
@@ -3737,11 +3718,11 @@ mod tests {
             editor.activate(Control::AddTuple);
         }
         editor.activate(Control::TupleValue(QUERY));
-        editor.buffer.clear();
+        editor.field.clear();
         editor.handle_paste(SORTED_LAST_VALUE);
         editor.handle_key(KeyEvent::from(KeyCode::Enter));
         editor.activate(Control::TupleValue(PATH_SLOT));
-        editor.buffer.clear();
+        editor.field.clear();
         editor.handle_paste(MANUAL);
         editor.handle_key(KeyEvent::from(KeyCode::Enter));
         let SlotCombinations::ObservedTuples { tuples } = editor.template().unwrap().combinations
@@ -3762,22 +3743,20 @@ mod tests {
             let mut editor = review_editor();
             editor.activate(Control::Section(Section::Test));
             editor.activate(Control::TestInput);
-            editor.buffer.clear();
+            editor.field.clear();
             let input = format!(
                 "{}{}{INPUT_TAIL}",
                 format!("{WORKDIR_POINTER}\n").repeat(INPUT_LINE_COUNT),
                 WIDE_CHARACTER.repeat(usize::from(width)),
             );
             editor.handle_paste(&input);
+            let caret =
+                |cell: &Cell| Some(cell.fg) == theme.cursor.fg && Some(cell.bg) == theme.cursor.bg;
             let buffer = render_size(&mut editor, width, HEIGHT, &theme);
             let text = buffer_text(&buffer);
             assert!(text.contains(INPUT_TAIL));
             assert!(INPUT_HELP.lines().all(|line| text.contains(line)));
-            let carets: Vec<_> = buffer
-                .content
-                .iter()
-                .filter(|cell| cell.modifier.contains(Modifier::REVERSED))
-                .collect();
+            let carets: Vec<_> = buffer.content.iter().filter(|cell| caret(cell)).collect();
             assert_eq!(carets.len(), 1, "{buffer:#?}");
             assert_eq!(carets[0].symbol(), " ");
             editor.handle_key(KeyEvent::from(KeyCode::Home));
@@ -3786,8 +3765,7 @@ mod tests {
                 buffer
                     .content
                     .iter()
-                    .any(|cell| cell.symbol() == WIDE_CHARACTER
-                        && cell.modifier.contains(Modifier::REVERSED))
+                    .any(|cell| cell.symbol() == WIDE_CHARACTER && caret(cell))
             );
             editor.handle_key(KeyEvent::from(KeyCode::Up));
             let buffer = render_size(&mut editor, width, HEIGHT, &theme);
@@ -3796,11 +3774,26 @@ mod tests {
                 buffer
                     .content
                     .iter()
-                    .any(|cell| cell.symbol() == "/" && cell.modifier.contains(Modifier::REVERSED))
+                    .any(|cell| cell.symbol() == "/" && caret(cell))
             );
-            assert_eq!(editor.buffer.value(), input);
+            assert_eq!(editor.field.text(), input);
             assert!(editor.is_editing());
         }
+    }
+
+    #[test_case(KeyCode::Backspace, KeyModifiers::NONE, true; "backspace_deletes")]
+    #[test_case(KeyCode::Char('w'), KeyModifiers::CONTROL, true; "word_delete_deletes")]
+    #[test_case(KeyCode::Char('x'), KeyModifiers::NONE, false; "typing_is_refused")]
+    #[test_case(KeyCode::Enter, KeyModifiers::SHIFT, false; "newline_is_refused")]
+    fn input_at_the_byte_limit_only_shrinks(code: KeyCode, modifiers: KeyModifiers, shrinks: bool) {
+        let mut editor = editor();
+        editor.activate(Control::Label);
+        editor.handle_paste(&LIMIT_FILL.repeat(MAX_BUFFER_BYTES));
+        editor.handle_paste(LIMIT_FILL);
+        assert_eq!(editor.field.byte_len(), MAX_BUFFER_BYTES);
+        assert!(editor.handle_key(KeyEvent::new(code, modifiers)).is_none());
+        assert_eq!(editor.field.byte_len() < MAX_BUFFER_BYTES, shrinks);
+        assert!(editor.is_editing());
     }
 
     #[test_case(40; "narrow")]

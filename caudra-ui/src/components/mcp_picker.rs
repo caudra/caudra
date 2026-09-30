@@ -79,6 +79,7 @@ pub enum McpPickerAction {
     TrustProject { server_name: String },
     Reject { server_name: String },
     Close,
+    Copy(String),
 }
 
 struct McpEntry {
@@ -269,6 +270,7 @@ impl McpPicker {
             }
             PickerAction::Select(..) | PickerAction::Close => McpPickerAction::Close,
             PickerAction::Key(_) => McpPickerAction::Consumed,
+            PickerAction::Copy(text) => McpPickerAction::Copy(text),
         }
     }
 

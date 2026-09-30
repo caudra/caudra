@@ -1,11 +1,12 @@
+use caudra_workbench::text_field::{TextCommand, decode};
 use crossterm::event::KeyEventKind;
 
 use super::details::sensitive_text;
 use super::{
-    HINT_ENTER, HINT_ESC, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-    Overlay, Panel, PermissionAnswer, PermissionDecision, PermissionLifetime, PermissionPrompt,
-    Position, PromptMouse, PromptState, PromptTarget, ScrollbarMouse, TextBuffer, command_ladders,
-    grade_command_pattern, is_ctrl,
+    FieldKind, HINT_ENTER, HINT_ESC, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind, Overlay, Panel, PermissionAnswer, PermissionDecision, PermissionLifetime,
+    PermissionPrompt, Position, PromptMouse, PromptState, PromptTarget, ScrollbarMouse, TextKey,
+    command_ladders, grade_command_pattern, is_ctrl,
 };
 
 #[derive(Default)]
@@ -159,20 +160,12 @@ impl PermissionPrompt {
     }
 
     fn handle_repeat(&mut self, key: KeyEvent) {
+        let edits = decode(key, FieldKind::Line).is_some_and(TextCommand::repeats);
         if let Some(inspector) = &self.inspector
             && self.panel != Panel::Details
         {
             let allowed = if inspector.is_editing() {
-                matches!(
-                    key.code,
-                    KeyCode::Char(_)
-                        | KeyCode::Backspace
-                        | KeyCode::Delete
-                        | KeyCode::Left
-                        | KeyCode::Right
-                        | KeyCode::Home
-                        | KeyCode::End
-                )
+                edits
             } else {
                 matches!(
                     key.code,
@@ -191,51 +184,74 @@ impl PermissionPrompt {
             }
             return;
         }
-        let editing = matches!(
-            self.state,
-            PromptState::DenyEditing | PromptState::PatternEditing
-        ) || self.confirmation.as_ref().is_some_and(|confirmation| {
+        if (self.field_focused() && edits)
+            || matches!(
+                key.code,
+                KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Left
+                    | KeyCode::Right
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+                    | KeyCode::Home
+                    | KeyCode::End
+                    | KeyCode::Tab
+                    | KeyCode::BackTab
+            )
+        {
+            self.handle_press(key);
+        }
+    }
+
+    /// Whether typing lands in the text field: guidance, a prefix or a phrase
+    /// being typed, or an inspector field being edited.
+    fn field_focused(&self) -> bool {
+        match &self.inspector {
+            Some(inspector) if self.panel != Panel::Details => inspector.is_editing(),
+            _ => {
+                matches!(
+                    self.state,
+                    PromptState::DenyEditing | PromptState::PatternEditing
+                ) || self.phrase_focused()
+            }
+        }
+    }
+
+    /// Whether a confirmation is waiting on its phrase being typed.
+    fn phrase_focused(&self) -> bool {
+        self.confirmation.as_ref().is_some_and(|confirmation| {
             confirmation.phrase.is_some()
                 && confirmation.complete
                 && !self.awaiting_review
                 && self.panel != Panel::Details
-        });
-        if editing
-            && matches!(
-                key.code,
-                KeyCode::Char(_)
-                    | KeyCode::Backspace
-                    | KeyCode::Delete
-                    | KeyCode::Left
-                    | KeyCode::Right
-                    | KeyCode::Home
-                    | KeyCode::End
-            )
-            && !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-        {
-            self.buffer.handle_key(key);
-        } else if matches!(
-            key.code,
-            KeyCode::Up
-                | KeyCode::Down
-                | KeyCode::Left
-                | KeyCode::Right
-                | KeyCode::PageUp
-                | KeyCode::PageDown
-                | KeyCode::Home
-                | KeyCode::End
-                | KeyCode::Tab
-                | KeyCode::BackTab
-        ) {
-            self.handle_press(key);
+        })
+    }
+
+    /// Hands `key` to the text field, keeping whatever it copies or cuts for
+    /// the host's clipboard. False when the key is not the field's.
+    pub(super) fn edit_field(&mut self, key: KeyEvent) -> bool {
+        match self.field.handle_key(key) {
+            TextKey::Ignored => false,
+            TextKey::Copy(text) | TextKey::Cut(text) => {
+                self.copied = Some(text);
+                true
+            }
+            _ => true,
         }
+    }
+
+    pub(crate) fn take_copied(&mut self) -> Option<String> {
+        self.copied.take()
     }
 
     fn handle_press(&mut self, key: KeyEvent) -> Option<PermissionDecision> {
         let request_id = self.request_id()?.to_owned();
         if is_ctrl(&key) && key.code == KeyCode::Char('c') {
+            // A focused field copies its selection; only with nothing to copy
+            // does the chord deny.
+            if self.field_focused() && self.edit_field(key) {
+                return None;
+            }
             return Some(PermissionDecision {
                 request_id,
                 answer: PermissionAnswer::Deny,
@@ -265,7 +281,7 @@ impl PermissionPrompt {
         if self.state == PromptState::DenyEditing {
             return match key.code {
                 KeyCode::Enter => {
-                    let text = self.buffer.value().trim().to_string();
+                    let text = self.field.text().trim().to_string();
                     Some(PermissionDecision {
                         request_id,
                         answer: if text.is_empty() {
@@ -280,7 +296,7 @@ impl PermissionPrompt {
                     None
                 }
                 _ => {
-                    self.buffer.handle_key(key);
+                    self.edit_field(key);
                     None
                 }
             };
@@ -290,7 +306,7 @@ impl PermissionPrompt {
                 KeyCode::Enter => self.commit_written_pattern(),
                 KeyCode::Esc => self.leave_editor(),
                 _ => {
-                    self.buffer.handle_key(key);
+                    self.edit_field(key);
                 }
             }
             return None;
@@ -300,7 +316,7 @@ impl PermissionPrompt {
                 self.panel = Panel::Main;
             } else if self.confirmation.take().is_some() {
                 self.state = PromptState::Normal;
-                self.buffer = TextBuffer::new(String::new());
+                self.field.clear();
             } else {
                 return Some(PermissionDecision {
                     request_id,
@@ -315,6 +331,19 @@ impl PermissionPrompt {
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
         {
+            if self.phrase_focused() {
+                // A phrase being typed keeps bare Home and End for its caret,
+                // so Ctrl takes the review to either end instead.
+                match key.code {
+                    KeyCode::Home | KeyCode::End => {
+                        self.scroll
+                            .handle_key(KeyEvent::new(key.code, KeyModifiers::NONE));
+                    }
+                    _ => {
+                        self.edit_field(key);
+                    }
+                }
+            }
             return None;
         }
         if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
@@ -357,15 +386,12 @@ impl PermissionPrompt {
             return None;
         }
         if let Some(confirmation) = &self.confirmation {
-            if matches!(
-                key.code,
-                KeyCode::PageUp
-                    | KeyCode::PageDown
-                    | KeyCode::Up
-                    | KeyCode::Down
-                    | KeyCode::Home
-                    | KeyCode::End
-            ) {
+            let scrolls = match key.code {
+                KeyCode::PageUp | KeyCode::PageDown | KeyCode::Up | KeyCode::Down => true,
+                KeyCode::Home | KeyCode::End => !self.phrase_focused(),
+                _ => false,
+            };
+            if scrolls {
                 self.scroll.handle_key(key);
                 return None;
             }
@@ -373,13 +399,13 @@ impl PermissionPrompt {
                 return None;
             }
             if let Some(phrase) = &confirmation.phrase {
-                if key.code == KeyCode::Enter && self.buffer.value().trim() == phrase {
+                if key.code == KeyCode::Enter && self.field.text().trim() == phrase {
                     return Some(PermissionDecision {
                         request_id,
                         answer: confirmation.answer.clone(),
                     });
                 }
-                self.buffer.handle_key(key);
+                self.edit_field(key);
                 return None;
             }
             return matches!(key.code, KeyCode::Char('y') | KeyCode::Enter).then(|| {
@@ -431,7 +457,7 @@ impl PermissionPrompt {
             KeyCode::Char('a') => self.approve(PermissionLifetime::Project),
             KeyCode::Char('g' | 'n') => {
                 self.state = PromptState::DenyEditing;
-                self.buffer = TextBuffer::new(String::new());
+                self.field.clear();
                 self.invalidate_controls();
                 None
             }
@@ -441,7 +467,7 @@ impl PermissionPrompt {
 
     fn leave_editor(&mut self) {
         self.state = PromptState::Normal;
-        self.buffer = TextBuffer::new(String::new());
+        self.field.clear();
         self.invalidate_controls();
     }
 
@@ -587,8 +613,7 @@ impl PermissionPrompt {
         } else {
             seed
         };
-        self.buffer = TextBuffer::new(seed);
-        self.buffer.move_end();
+        self.field.set_text(&seed);
         self.state = PromptState::PatternEditing;
         self.invalidate_controls();
         true
@@ -598,7 +623,7 @@ impl PermissionPrompt {
         let Some(row) = self.command_row() else {
             return;
         };
-        let pattern = self.buffer.value().trim().to_owned();
+        let pattern = self.field.text().trim().to_owned();
         let usable = self
             .current()
             .and_then(|request| request.resources.get(row))
@@ -619,7 +644,7 @@ impl PermissionPrompt {
             if !inspector.is_editing() || self.panel == Panel::Details {
                 return false;
             }
-            self.buffer.insert_text(text);
+            self.field.paste(text);
             self.input_freshness = InputFreshness::default();
             self.refresh_inspector(None);
             return true;
@@ -636,7 +661,7 @@ impl PermissionPrompt {
         {
             return false;
         }
-        self.buffer.insert_text(text);
+        self.field.paste(text);
         self.input_freshness = InputFreshness::default();
         true
     }
@@ -720,7 +745,7 @@ mod tests {
     use std::{thread, time::Duration};
 
     use crossterm::event::{
-        KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
     use serde_json::json;
     use test_case::test_case;
@@ -1115,7 +1140,7 @@ mod tests {
         prompt.handle_paste(GUIDANCE);
         assert!(prompt.handle_key(key(KeyCode::Esc)).is_none());
         assert_eq!(prompt.state, PromptState::Normal);
-        assert!(prompt.buffer.value().is_empty());
+        assert!(prompt.field.is_empty());
         prompt.handle_key(key(KeyCode::Char(shortcut)));
         prompt.handle_paste(GUIDANCE);
         assert_eq!(
@@ -1167,11 +1192,11 @@ mod tests {
         let mut prompt = open_prompt();
         prompt.open_scope_editor();
         prompt.handle_key(key(KeyCode::Char('e')));
-        prompt.buffer.clear();
+        prompt.field.clear();
         prompt.handle_paste("git *");
         prompt.handle_key(key(KeyCode::Enter));
         assert_eq!(prompt.state, PromptState::PatternEditing);
-        prompt.buffer.clear();
+        prompt.field.clear();
         prompt.handle_paste("cargo *");
         prompt.handle_key(key(KeyCode::Enter));
         assert_eq!(prompt.state, PromptState::Normal);
@@ -1193,7 +1218,7 @@ mod tests {
         request.resources[0].value = SENSITIVE_COMMAND.into();
         prompt.open_scope_editor();
         prompt.handle_key(key(KeyCode::Char('e')));
-        assert!(prompt.buffer.value().is_empty());
+        assert!(prompt.field.is_empty());
         let screen = render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT);
         assert!(!screen.contains(SECRET));
         assert!(screen.contains("rm -rf /project"));
@@ -1215,7 +1240,7 @@ mod tests {
         event.code = KeyCode::Backspace;
         event.kind = KeyEventKind::Repeat;
         prompt.handle_key(event);
-        assert_eq!(prompt.buffer.value(), "ab");
+        assert_eq!(prompt.field.text(), "ab");
         event.code = KeyCode::Enter;
         assert!(prompt.handle_key(event).is_none());
         assert_eq!(prompt.state, PromptState::DenyEditing);
@@ -1251,6 +1276,47 @@ mod tests {
         event.kind = KeyEventKind::Repeat;
         prompt.handle_key(event);
         assert!(!prompt.handle_paste("x"));
-        assert!(prompt.buffer.value().is_empty());
+        assert!(prompt.field.is_empty());
+    }
+
+    #[test]
+    fn ctrl_w_edits_the_guidance_instead_of_being_dropped() {
+        let mut prompt = open_prompt();
+        prompt.handle_key(key(KeyCode::Char('g')));
+        prompt.handle_paste(GUIDANCE);
+        let chord = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
+        assert!(prompt.handle_key(chord).is_none());
+        assert_eq!(
+            prompt.field.text(),
+            GUIDANCE
+                .rsplit_once(' ')
+                .map_or("", |(head, _)| head)
+                .to_owned()
+                + " "
+        );
+        assert_eq!(prompt.state, PromptState::DenyEditing);
+    }
+
+    #[test_case(true; "selection_copies")]
+    #[test_case(false; "no_selection_denies")]
+    fn ctrl_c_copies_a_selected_field_before_denying(selected: bool) {
+        let mut prompt = open_prompt();
+        prompt.handle_key(key(KeyCode::Char('g')));
+        prompt.handle_paste(GUIDANCE);
+        if selected {
+            prompt.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        }
+        let decision = prompt.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        match selected {
+            true => {
+                assert!(decision.is_none());
+                assert_eq!(prompt.take_copied().as_deref(), Some(GUIDANCE));
+                assert_eq!(prompt.state, PromptState::DenyEditing);
+            }
+            false => {
+                assert_eq!(decision.unwrap().answer, PermissionAnswer::Deny);
+                assert!(prompt.take_copied().is_none());
+            }
+        }
     }
 }

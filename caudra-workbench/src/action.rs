@@ -15,7 +15,7 @@ pub enum WorkbenchAction {
     /// The workbench handled the event.
     Consumed,
     /// The workbench wants nothing to do with the event. The host resumes its
-    /// own dispatch, which is what keeps quit and suspend reachable.
+    /// own dispatch, which is what keeps quit reachable.
     Passthrough,
     /// Hand the workbench back to the transcript.
     Close,

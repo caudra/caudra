@@ -457,11 +457,7 @@ impl App {
         });
         if owned_prompt {
             match msg {
-                Msg::Key(key) => {
-                    if let Some(decision) = self.permission_prompt.handle_key(key) {
-                        self.apply_permission_decision(decision);
-                    }
-                }
+                Msg::Key(key) => self.permission_prompt_key(key),
                 Msg::Mouse(event) => {
                     if let PromptMouse::Decided(decision) =
                         self.permission_prompt.handle_mouse(event)

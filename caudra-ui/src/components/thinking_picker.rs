@@ -22,6 +22,7 @@ pub enum ThinkingPickerAction {
     Consumed,
     Select(ThinkingConfig),
     Closed,
+    Copy(String),
 }
 
 struct ThinkingItem {
@@ -203,6 +204,7 @@ impl ThinkingPicker {
             }
             PickerAction::Select(item) => ThinkingPickerAction::Select(item.config),
             PickerAction::Close => ThinkingPickerAction::Closed,
+            PickerAction::Copy(text) => ThinkingPickerAction::Copy(text),
         }
     }
 }

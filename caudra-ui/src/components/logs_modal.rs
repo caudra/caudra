@@ -14,6 +14,7 @@ use caudra_grab::grab_scope;
 use caudra_storage::log::record::{Entry, Filter, Level, Record};
 use caudra_storage::log::tail::{LogTail, ScanOutcome};
 use caudra_storage::log::{self, DEFAULT_MAX_FILES};
+use caudra_workbench::text_field::{FieldKind, TextField, TextKey};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
@@ -21,16 +22,16 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use crate::components::document_view::COPIED_SELECTION;
 use crate::components::keybindings::key;
 use crate::components::modal::Modal;
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::components::{
-    Hint, HintBar, Overlay, bar_area, escape_terminal_controls, format_bytes, hover_style,
-    input_line_with_cursor, is_ctrl,
+    Hint, HintBar, Overlay, bar_area, chevron_span, escape_terminal_controls, field_styles,
+    format_bytes, hover_style, input_text_style, is_ctrl,
 };
 use crate::repaint::{Cadence, Dirty};
 use crate::selection::wrap_breaks;
-use crate::text_buffer::TextBuffer;
 use crate::theme::Theme;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -110,7 +111,7 @@ pub struct LogsModal {
     tail: Option<LogTail>,
     follow: bool,
     filter: Filter,
-    query: TextBuffer,
+    query: TextField,
     query_focused: bool,
     /// Index into the tail window, not into the file.
     selected: usize,
@@ -145,7 +146,7 @@ impl LogsModal {
             tail: None,
             follow: true,
             filter: Filter::default(),
-            query: TextBuffer::new(String::new()),
+            query: TextField::new(FieldKind::Line),
             query_focused: false,
             selected: 0,
             view_top: 0,
@@ -312,17 +313,22 @@ impl LogsModal {
         match event.code {
             KeyCode::Esc => {
                 self.query_focused = false;
-                if !self.query.value().is_empty() {
+                if !self.query.is_empty() {
                     self.query.clear();
                     self.apply_query();
                 }
             }
             KeyCode::Enter => self.query_focused = false,
             _ => {
-                let before = self.query.value().to_owned();
-                self.query.handle_key(event);
-                if self.query.value() != before {
+                let edit = self.query.handle_key(event);
+                if edit.changed() {
                     self.apply_query();
+                }
+                if let TextKey::Copy(text) | TextKey::Cut(text) = edit {
+                    return LogsAction::Copy {
+                        text,
+                        label: COPIED_SELECTION,
+                    };
                 }
             }
         }
@@ -330,14 +336,13 @@ impl LogsModal {
     }
 
     pub fn handle_paste(&mut self, text: &str) {
-        if self.query_focused {
-            self.query.insert_text(text);
+        if self.query_focused && self.query.paste(text).changed() {
             self.apply_query();
         }
     }
 
     fn apply_query(&mut self) {
-        self.filter = Filter::new(self.filter.min_level, &self.query.value());
+        self.filter = Filter::new(self.filter.min_level, &self.query.text());
         self.reload();
     }
 
@@ -348,7 +353,7 @@ impl LogsModal {
         let Some(id) = self.current().and_then(|line| correlation_id(&line.entry)) else {
             return LogsAction::Flash(NO_FOCUS);
         };
-        self.query = TextBuffer::new(id);
+        self.query.set_text(&id);
         self.query_focused = false;
         self.apply_query();
         LogsAction::Consumed
@@ -369,7 +374,7 @@ impl LogsModal {
     }
 
     fn cycle_level(&mut self) {
-        self.filter = Filter::new(self.filter.min_level.next(), &self.query.value());
+        self.filter = Filter::new(self.filter.min_level.next(), &self.query.text());
         self.reload();
     }
 
@@ -572,7 +577,7 @@ impl LogsModal {
             width: inner.width.saturating_sub(H_PAD.saturating_mul(2)),
             ..inner
         };
-        let searching = self.query_focused || !self.query.value().is_empty();
+        let searching = self.query_focused || !self.query.is_empty();
         let chrome = CHROME_ROWS + u16::from(searching);
         let body_height = padded.height.saturating_sub(chrome);
         self.resize(usize::from(body_height));
@@ -604,10 +609,13 @@ impl LogsModal {
             area
         };
         if searching {
-            frame.render_widget(
-                Paragraph::new(input_line_with_cursor(&self.query)),
-                next_row(),
-            );
+            let area = next_row();
+            let chevron = chevron_span();
+            let width = usize::from(area.width).saturating_sub(chevron.width());
+            let styles = field_styles(input_text_style());
+            let mut line = self.query.paint(width, &styles, self.query_focused, "");
+            line.spans.insert(0, chevron);
+            frame.render_widget(Paragraph::new(line), area);
         }
         let hints = self.hints();
         self.hints.draw(frame, next_row(), hints);
@@ -1120,6 +1128,7 @@ mod tests {
     use super::*;
     use caudra_workbench::scroll::SCROLLBAR_THUMB_HORIZONTAL;
 
+    use crate::components::keybindings::key as kb;
     use crate::components::{buffer_text, key};
     use crate::theme;
     use test_case::test_case;
@@ -1458,6 +1467,8 @@ mod tests {
     const FRAME_W: u16 = 120;
     const FRAME_H: u16 = 30;
     const NOT_DRAWN: &str = "the row never reached the frame";
+    const QUERY: &str = "retry";
+    const COPY_UNFOCUSED: &str = "copying the query took the focus off it";
 
     fn drawn(modal: &mut LogsModal) -> String {
         let backend = ratatui::backend::TestBackend::new(FRAME_W, FRAME_H);
@@ -1511,6 +1522,21 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_c_copies_the_selected_query_and_keeps_it_focused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut modal = seeded_modal(tmp.path());
+        modal.handle_key(key(KeyCode::Char('/')));
+        modal.handle_paste(QUERY);
+        modal.handle_key(kb::SELECT_ALL.to_key_event());
+
+        assert!(matches!(
+            modal.handle_key(kb::QUIT.to_key_event()),
+            LogsAction::Copy { text, label: COPIED_SELECTION } if text == QUERY
+        ));
+        assert!(modal.text_input_active(), "{COPY_UNFOCUSED}");
+    }
+
+    #[test]
     fn the_search_row_only_takes_a_line_while_it_is_in_use() {
         let tmp = tempfile::tempdir().unwrap();
         let mut modal = seeded_modal(tmp.path());
@@ -1556,7 +1582,7 @@ mod tests {
             modal.handle_key(key(KeyCode::Tab)),
             LogsAction::Consumed
         ));
-        assert_eq!(modal.query.value(), "tu-9");
+        assert_eq!(modal.query.text(), "tu-9");
     }
 
     #[test]

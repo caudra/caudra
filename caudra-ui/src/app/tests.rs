@@ -5421,6 +5421,8 @@ fn transcript_scroll_binds_use_the_navigation_keys() {
 const QUESTION_TEXT: &str = "Which one?";
 const QUESTION_HEADER: &str = "Pick";
 const QUESTION_OPTION: &str = "First";
+const QUESTION_ANSWER: &str = "typed answer";
+const QUESTION_ANSWER_HEAD: char = '>';
 const EXPECT_RUN_LEFT_ALONE: &str = "only a cancel may stop the run that asked";
 
 fn open_question(app: &mut App) {
@@ -5466,6 +5468,31 @@ fn the_transcript_scrolls_by_key_while_a_question_is_open() {
     app.update(Msg::Key(kb::DOC_BOTTOM.to_key_event()));
     assert!(app.chats[0].auto_scroll(), "End");
     assert!(app.question_form.is_open(), "and the question still stands");
+}
+
+/// An answer being typed keeps `Home` and `End` for its caret, while the page
+/// keys go on moving the transcript behind the form.
+#[test]
+fn an_answer_being_typed_keeps_home_and_end() {
+    let mut app = question_app();
+    let _ = rendered(&mut app);
+    app.update(Msg::Key(key(KeyCode::Down)));
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(app.question_form.text_input_active());
+    app.update(Msg::Paste(QUESTION_ANSWER.into()));
+    app.active_chat().enable_auto_scroll();
+
+    app.update(Msg::Key(kb::DOC_TOP.to_key_event()));
+    assert!(app.chats[0].auto_scroll(), "Home stays with the answer");
+    app.update(Msg::Key(key(KeyCode::Char(QUESTION_ANSWER_HEAD))));
+    assert!(rendered(&mut app).contains(&format!("{QUESTION_ANSWER_HEAD}{QUESTION_ANSWER}")));
+
+    app.update(Msg::Key(kb::PAGE_UP.to_key_event()));
+    assert!(
+        !app.chats[0].auto_scroll(),
+        "PageUp still moves the transcript"
+    );
+    assert!(app.question_form.text_input_active());
 }
 
 /// The keys the form owns must not be handed over with them.
@@ -14201,12 +14228,11 @@ fn deleting_a_stored_session_drops_it_from_the_open_picker() {
     assert_eq!(app.refresh_session_picker(), Dirty::NO, "{QUIET}");
 }
 
-/// Home and End used to reach the picker's filter line, because the transcript
-/// binds hand every key to the open overlay and the overlay passed on what its
-/// list did not name. This walks the whole chain, not just the list.
+/// The transcript binds hand every key to the open overlay, so this walks the
+/// whole chain, not just the list. Bare `Home` and `End` are the filter's.
 #[test_case(KeyEventKind::Press; "press")]
 #[test_case(KeyEventKind::Repeat; "repeat")]
-fn the_navigation_keys_reach_an_open_picker_list(kind: KeyEventKind) {
+fn the_list_end_keys_reach_an_open_picker_list(kind: KeyEventKind) {
     let (_temp, storage, _writer, mut app) = tempdir_app();
     for _ in 0..PICKER_ROWS {
         let mut stored = AppSession::new(&app.state.session.model, &app.state.session.cwd);
@@ -14216,10 +14242,13 @@ fn the_navigation_keys_reach_an_open_picker_list(kind: KeyEventKind) {
     let last = app.session_picker.ids().len() - 1;
     assert!(last > 0, "{PICKER_NEEDS_ROWS}");
 
-    dispatch_reported_key(&mut app, key(KeyCode::End), kind);
+    dispatch_reported_key(&mut app, workbench_keys::LIST_LAST.to_key_event(), kind);
     assert_eq!(app.session_picker.selected_index(), Some(last));
 
     dispatch_reported_key(&mut app, key(KeyCode::Home), kind);
+    assert_eq!(app.session_picker.selected_index(), Some(last));
+
+    dispatch_reported_key(&mut app, workbench_keys::LIST_FIRST.to_key_event(), kind);
     assert_eq!(app.session_picker.selected_index(), Some(0));
 }
 
@@ -15650,7 +15679,10 @@ fn trusting_project_permission_config_refreshes_picker() {
         assert!(screen.contains(word), "{word}: {screen}");
     }
     assert!(app.permissions.project_permission_config_trusted());
-    assert!(app.update(Msg::Key(key(KeyCode::Home))).is_empty());
+    assert!(
+        app.update(Msg::Key(workbench_keys::LIST_FIRST.to_key_event()))
+            .is_empty()
+    );
 
     assert!(app.update(Msg::Key(key(KeyCode::Enter))).is_empty());
     assert!(app.update(Msg::Key(key(KeyCode::Enter))).is_empty());
@@ -15824,10 +15856,26 @@ fn btw_modal_key_routing_and_animation() {
     );
     assert_eq!(app.stream_modal.input_text(), "x");
 
+    app.update(Msg::Key(kb::DELETE_WORD.to_key_event()));
+    assert_eq!(app.stream_modal.input_text(), "", "{BTW_CHORD_SWALLOWED}");
+    assert!(app.stream_modal.is_open(), "{BTW_CHORD_SWALLOWED}");
+
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
     assert!(actions.is_empty());
     assert!(!app.stream_modal.is_open());
     assert_eq!(app.stream_modal.cadence(), Cadence::IDLE);
+}
+
+/// A held `Backspace` keeps deleting in the follow-up, as it does in the
+/// composer, rather than stopping after the first character.
+#[test_case(KeyEventKind::Press; "legacy_autorepeat")]
+#[test_case(KeyEventKind::Repeat; "reported_autorepeat")]
+fn a_held_backspace_keeps_deleting_the_btw_follow_up(kind: KeyEventKind) {
+    let mut app = btw_awaiting_follow_up();
+    for _ in 0..2 {
+        dispatch_reported_key(&mut app, key(KeyCode::Backspace), kind);
+    }
+    assert_eq!(app.stream_modal.input_text(), BTW_FOLLOW_UP_TRIMMED);
 }
 
 fn btw_ready_app() -> App {
@@ -15894,6 +15942,8 @@ fn btw_marks_the_cutoff_and_clears_it_when_the_modal_closes() {
 const BTW_QUESTION: &str = "why sqlite?";
 const BTW_HEADER: &str = "Q: why sqlite?";
 const BTW_FOLLOW_UP: &str = "and postgres?";
+const BTW_FOLLOW_UP_TRIMMED: &str = "and postgre";
+const BTW_CHORD_SWALLOWED: &str = "an editing chord at /btw must edit the follow-up field";
 const BTW_FOLLOW_UP_HEADER: &str = "Q: and postgres?";
 
 fn btw_answer() -> StreamEvent {
@@ -17220,21 +17270,6 @@ fn override_shadows_esc_builtin() {
     );
 }
 
-#[cfg(unix)]
-#[test]
-fn override_does_not_shadow_suspend() {
-    let mut app = test_app();
-    let probe = install_override(&mut app, kb::SUSPEND.code, kb::SUSPEND.modifiers);
-
-    let actions = app.update(Msg::Key(kb::SUSPEND.to_key_event()));
-
-    assert!(
-        actions.iter().any(|a| matches!(a, Action::Suspend)),
-        "suspend is non-remappable: override must not shadow Ctrl+Z"
-    );
-    assert!(probe.try_recv().is_none(), "{OVERRIDE_NOT_DISPATCHED}");
-}
-
 #[test]
 fn builtin_runs_when_no_override() {
     let mut app = test_app();
@@ -18472,8 +18507,8 @@ fn physical_release_between_requests_rearms_the_next_prompt(code: KeyCode) {
     assert!(!app.permission_prompt.is_open());
 }
 
-#[test_case(KeyEventKind::Repeat; "repeat_cannot_suspend_or_run_a_leader_action")]
-#[test_case(KeyEventKind::Release; "release_cannot_suspend_or_run_a_leader_action")]
+#[test_case(KeyEventKind::Repeat; "repeat_cannot_quit_or_run_a_leader_action")]
+#[test_case(KeyEventKind::Release; "release_cannot_quit_or_run_a_leader_action")]
 fn reported_permission_key_kinds_never_activate_global_shortcuts(kind: KeyEventKind) {
     let mut app = test_app();
     app.permission_prompt.open(
@@ -18483,11 +18518,7 @@ fn reported_permission_key_kinds_never_activate_global_shortcuts(kind: KeyEventK
         None,
     );
     app.which_key.arm();
-    for key in [
-        kb::SUSPEND.to_key_event(),
-        kb::QUIT.to_key_event(),
-        chord::HELP.to_key_event(),
-    ] {
+    for key in [kb::QUIT.to_key_event(), chord::HELP.to_key_event()] {
         assert!(dispatch_reported_key(&mut app, key, kind).is_empty());
         assert!(app.permission_prompt.is_open());
         assert!(app.which_key.is_armed());
@@ -18535,8 +18566,8 @@ fn a_held_word_motion_keeps_crossing_words() {
     assert_eq!(app.input_box.buffer.value(), REPEAT_WORDS_CARET_HOME);
 }
 
-/// Shift is stripped before a repeat is judged, so a held selection chord
-/// keeps extending instead of stopping after the first word.
+/// A held selection chord keeps extending instead of stopping after the first
+/// word: the field keymap reads Shift as extending, and a motion repeats.
 #[test]
 fn a_held_word_selection_keeps_extending() {
     let mut app = test_app();
@@ -18873,7 +18904,6 @@ fn reported_ctrl_c_cannot_cancel_a_run_after_denying_its_last_prompt(kind: KeyEv
     assert_eq!(app.exit_request, ExitRequest::None);
 }
 
-#[test_case(kb::SUSPEND.to_key_event(); "suspend")]
 #[test_case(kb::LEADER.to_key_event(); "leader")]
 #[test_case(kb::EXIT.to_key_event(); "exit")]
 #[test_case(kb::QUIT.to_key_event(); "quit")]
@@ -21034,8 +21064,8 @@ fn restoring_is_refused_while_a_queued_prompt_is_being_edited() {
 
 const WORKBENCH_OPENS: &str = "the workbench chord must put the workbench on screen";
 const WORKBENCH_CLOSES: &str = "the workbench chord must hand the screen back to the transcript";
-const SUSPEND_TRAPPED: &str =
-    "Ctrl+Z must reach the workbench as undo instead of backgrounding the process";
+const UNDO_MISSED: &str = "Ctrl+Z must undo the last edit wherever the draft is";
+const UNDO_DRAFT: &str = "undo this";
 const QUIT_REACHABLE: &str =
     "Ctrl+C without a selection must still reach quit, or the workbench traps the session";
 const WHEEL_MISROUTED: &str =
@@ -21083,20 +21113,23 @@ fn esc_leaves_the_workbench() {
 }
 
 #[test]
-fn ctrl_z_suspends_only_while_the_workbench_is_closed() {
+fn ctrl_z_undoes_the_draft() {
+    let undo = kb::UNDO.to_key_event();
     let mut app = test_app();
-    let suspend = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL);
-    assert!(
-        matches!(app.update(Msg::Key(suspend)).as_slice(), [Action::Suspend]),
-        "a closed workbench must leave suspend alone"
-    );
+    app.update(Msg::Paste(UNDO_DRAFT.into()));
+    app.update(Msg::Key(kb::DELETE_WORD.to_key_event()));
+    assert!(app.update(Msg::Key(undo)).is_empty(), "{UNDO_MISSED}");
+    assert_eq!(app.input_box.buffer.value(), UNDO_DRAFT, "{UNDO_MISSED}");
 
-    let mut app = open_workbench();
+    let (_dir, _path, mut app) = workbench_repeat_editor();
+    app.update(Msg::Key(key(KeyCode::End)));
+    app.update(Msg::Key(key(KeyCode::Char('X'))));
+    assert!(app.update(Msg::Key(undo)).is_empty(), "{UNDO_MISSED}");
+    assert!(app.workbench.is_open(), "{UNDO_MISSED}");
     assert!(
-        app.update(Msg::Key(suspend)).is_empty(),
-        "{SUSPEND_TRAPPED}"
+        !rendered(&mut app).contains(&format!("{REPEAT_FIELD_TEXT}X")),
+        "{UNDO_MISSED}"
     );
-    assert!(app.workbench.is_open(), "{SUSPEND_TRAPPED}");
 }
 
 /// The wheel is aggregated into `Msg::Scroll` before `handle_mouse` runs, so

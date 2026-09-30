@@ -18,6 +18,7 @@ use caudra_config::sandbox::{
 };
 use caudra_sandbox::Ownership;
 use caudra_storage::id::CaudraId;
+use caudra_workbench::text_field::{self, FieldKind, TextCommand};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -1435,7 +1436,6 @@ impl Manager {
             self.pending_seed = None;
         }
         if event.kind == KeyEventKind::Repeat
-            && (self.confirmation.is_some() || !self.form.as_ref().is_some_and(|form| form.editing))
             && !matches!(
                 event.code,
                 KeyCode::Up
@@ -1445,6 +1445,9 @@ impl Manager {
                     | KeyCode::Home
                     | KeyCode::End
             )
+            && !(self.confirmation.is_none()
+                && self.form.as_ref().is_some_and(|form| form.editing)
+                && text_field::decode(event, FieldKind::Document).is_some_and(TextCommand::repeats))
         {
             return SandboxAction::None;
         }
@@ -1492,17 +1495,6 @@ impl Manager {
             return SandboxAction::None;
         }
         if self.live_form.is_some() {
-            if self
-                .live_form
-                .as_ref()
-                .and_then(|form| form.fields.get(form.focus))
-                .is_some_and(|field| field.secret)
-                && ((event.modifiers.contains(KeyModifiers::CONTROL)
-                    && matches!(event.code, KeyCode::Char('a' | 'c' | 'x')))
-                    || (event.modifiers.contains(KeyModifiers::SHIFT) && read_only_key(event)))
-            {
-                return SandboxAction::None;
-            }
             return self.live_key(event);
         }
         if self.references.is_some() {
@@ -1786,7 +1778,7 @@ impl Manager {
                 return;
             }
             let field = &mut form.fields[form.focus];
-            if field.secret && !text.bytes().all(|byte| byte.is_ascii_graphic()) {
+            if field.secret() && !text.bytes().all(|byte| byte.is_ascii_graphic()) {
                 self.status =
                     "API key must be visible ASCII without whitespace; paste only the key.".into();
                 return;
@@ -2218,7 +2210,7 @@ impl Manager {
             .live_form
             .as_mut()
             .and_then(|form| form.fields.get_mut(form.focus))
-            && field.secret
+            && field.secret()
         {
             field.editor.handle_scrollbar_mouse(&event);
             return SandboxAction::None;

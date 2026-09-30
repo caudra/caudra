@@ -14,12 +14,14 @@ use unicode_width::UnicodeWidthStr;
 
 use caudra_agent::types::AskedQuestion;
 use caudra_grab::grab_scope;
+use caudra_workbench::buffer::Cursor;
+use caudra_workbench::render::Row;
+use caudra_workbench::text_field::{FieldKind, FieldStyles, TextField, TextKey, is_newline_key};
 
 use super::form::render_form;
 use super::keybindings::{Bind, key};
-use super::{Hint, Overlay, VisualRows, hanging_lines, visual_rows};
+use super::{Hint, Overlay, VisualRows, field_styles, hanging_lines, visual_rows};
 use crate::repaint::Cadence;
-use crate::text_buffer::TextBuffer;
 use crate::theme;
 
 const TITLE: &str = " Question ";
@@ -38,6 +40,9 @@ const CUSTOM_PROMPT: &str = "  ❯ ";
 /// Two borders, the blank row above the hint, and the hint row.
 const CHROME_ROWS: u16 = 4;
 const MAX_HEIGHT_PERCENT: u16 = 75;
+/// The form wraps the answer box itself, so a painted line is never clipped.
+const UNCLIPPED: usize = usize::MAX;
+const LINE_BREAK: &str = "\n";
 
 const SHIFT_ENTER: Bind = Bind {
     code: KeyCode::Enter,
@@ -79,6 +84,8 @@ pub enum QuestionFormAction {
     Dismiss,
     /// Stop the agent that asked, so only a new message moves it again.
     Cancel,
+    /// Text the answer box copied or cut, for the clipboard.
+    Copy(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,7 +101,7 @@ pub struct QuestionForm {
     tab: usize,
     cursor: usize,
     answers: Vec<Vec<String>>,
-    custom: TextBuffer,
+    custom: TextField,
     scroll: u16,
     /// Whether the viewport is tracking the cursor. A keystroke turns it back
     /// on, the wheel turns it off: a reader looking around a long option list
@@ -180,7 +187,7 @@ impl QuestionForm {
             tab: 0,
             cursor: 0,
             answers: Vec::new(),
-            custom: TextBuffer::new(String::new()),
+            custom: TextField::new(FieldKind::Block),
             scroll: 0,
             follow_cursor: true,
             hover: None,
@@ -196,7 +203,7 @@ impl QuestionForm {
         self.mode = Mode::Selecting;
         self.tab = 0;
         self.cursor = 0;
-        self.custom = TextBuffer::new(String::new());
+        self.custom.clear();
         self.scroll = 0;
         self.follow_cursor = true;
         self.row_hits.clear();
@@ -237,7 +244,7 @@ impl QuestionForm {
         if self.mode != Mode::EditingCustom {
             return false;
         }
-        self.custom.insert_text(text);
+        self.custom.paste(text);
         true
     }
 
@@ -433,8 +440,8 @@ impl QuestionForm {
                 let wrap_row = usize::from(event.row.saturating_sub(hit.area.y));
                 let column = usize::from(event.column.saturating_sub(hit.area.x));
                 let cell = wrap_row * width + column;
-                self.custom
-                    .set_cursor(line, cell.saturating_sub(CUSTOM_PROMPT.chars().count()));
+                let col = cell.saturating_sub(CUSTOM_PROMPT.chars().count());
+                self.custom.set_cursor(Cursor::new(line, col), false);
             }
             _ => {}
         }
@@ -559,40 +566,38 @@ impl QuestionForm {
     /// empty one.
     fn start_editing(&mut self) {
         let existing = self.custom_answer().cloned().unwrap_or_default();
-        self.custom = TextBuffer::new(existing);
-        let end = self.custom.value().chars().count();
-        self.custom.set_cursor_offset(end);
+        self.custom.set_text(&existing);
         self.mode = Mode::EditingCustom;
     }
 
+    /// The box sees every key before the form, so `Ctrl+C` copies a selection
+    /// and only cancels when there is nothing to copy.
     fn key_editing(&mut self, key: KeyEvent) -> QuestionFormAction {
-        let newline = matches!(key.code, KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL))
-            || (key.code == KeyCode::Enter && key.modifiers.intersects(NEWLINE_MODIFIERS));
-        if newline {
-            self.custom.add_line();
-            return QuestionFormAction::Consumed;
-        }
+        let submit = key.code == KeyCode::Enter && !is_newline_key(key);
         match key.code {
             // A trailing backslash is the plain-terminal way to ask for a
-            // newline where the modifier combination never arrives.
-            KeyCode::Enter if ends_with_backslash(&self.custom) => {
-                self.custom.remove_char();
-                self.custom.add_line();
+            // newline where the modifier combination never arrives. The break
+            // is typed over the backslash, so one undo brings it back.
+            KeyCode::Enter if submit && ends_with_backslash(&self.custom) => {
+                let caret = self.custom.cursor();
+                self.custom
+                    .set_cursor(Cursor::new(caret.line, caret.col - 1), false);
+                self.custom.set_cursor(caret, true);
+                self.custom.insert_text(LINE_BREAK);
             }
-            KeyCode::Enter => return self.commit_custom(),
+            KeyCode::Enter if submit => return self.commit_custom(),
             KeyCode::Esc => self.mode = Mode::Selecting,
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                return QuestionFormAction::Cancel;
-            }
-            _ => {
-                self.custom.handle_key(key);
-            }
+            _ => match self.custom.handle_key(key) {
+                TextKey::Copy(text) | TextKey::Cut(text) => return QuestionFormAction::Copy(text),
+                TextKey::Ignored if key::QUIT.matches(key) => return QuestionFormAction::Cancel,
+                _ => {}
+            },
         }
         QuestionFormAction::Consumed
     }
 
     fn commit_custom(&mut self) -> QuestionFormAction {
-        let text = self.custom.value().trim().to_owned();
+        let text = self.custom.text().trim().to_owned();
         self.mode = Mode::Selecting;
         let existing = self.custom_answer().cloned();
         match (text.is_empty(), existing) {
@@ -840,17 +845,15 @@ impl QuestionForm {
         Line::from(spans)
     }
 
-    /// The answer box, caret and all. A `TextBuffer` always keeps a line, so
+    /// The answer box, caret and all. A `TextField` always keeps a line, so
     /// an emptied box still draws its prompt row rather than losing a line as
     /// the user clears what they typed.
     fn custom_editor_lines(&self) -> Vec<Line<'static>> {
         let t = theme::current();
+        let styles = field_styles(Style::default());
         let indent = " ".repeat(CUSTOM_PROMPT.chars().count());
-        self.custom
-            .lines()
-            .iter()
-            .enumerate()
-            .map(|(index, line)| {
+        (0..self.custom.lines().len())
+            .map(|index| {
                 let mut spans = vec![Span::styled(
                     if index == 0 {
                         CUSTOM_PROMPT.to_owned()
@@ -859,11 +862,7 @@ impl QuestionForm {
                     },
                     t.active,
                 )];
-                if index == self.custom.y() {
-                    spans.extend(caret_spans(line, self.custom.x()));
-                } else {
-                    spans.push(Span::raw(line.to_owned()));
-                }
+                spans.extend(caret_spans(&self.custom, index, &styles));
                 Line::from(spans)
             })
             .collect()
@@ -903,33 +902,31 @@ impl QuestionForm {
     }
 }
 
-/// Where every line ends up once the paragraph has wrapped it. A long option
-/// occupies more than one row, so the line the form counts in and the row the
-/// terminal draws in are not the same number; scrolling and click targets both
-/// need the second one.
-const NEWLINE_MODIFIERS: KeyModifiers = KeyModifiers::SHIFT.union(KeyModifiers::CONTROL);
-
 /// A trailing backslash is the plain-terminal way to ask for a newline where
 /// the modifier combination never reaches the process.
-fn ends_with_backslash(buffer: &TextBuffer) -> bool {
-    buffer
-        .x()
+fn ends_with_backslash(field: &TextField) -> bool {
+    let caret = field.cursor();
+    caret
+        .col
         .checked_sub(1)
-        .and_then(|index| buffer.lines()[buffer.y()].chars().nth(index))
+        .and_then(|index| field.lines()[caret.line].chars().nth(index))
         == Some('\\')
 }
 
-/// A line with the character under the caret reversed. Nothing places a
-/// terminal cursor over the form, so the caret is painted like the composer's.
-fn caret_spans(line: &str, caret: usize) -> [Span<'static>; 3] {
-    let before: String = line.chars().take(caret).collect();
-    let mut rest = line.chars().skip(caret);
-    let under = rest.next().unwrap_or(' ');
-    [
-        Span::raw(before),
-        Span::styled(under.to_string(), Style::new().reversed()),
-        Span::raw(rest.collect::<String>()),
-    ]
+/// Line `index` of the box with its selection and caret painted on. Nothing
+/// places a terminal cursor over the form, so the caret is painted like the
+/// composer's.
+fn caret_spans(field: &TextField, index: usize, styles: &FieldStyles) -> Vec<Span<'static>> {
+    let overlays = field.overlays(index, styles, true);
+    Row {
+        text: &field.lines()[index],
+        segments: None,
+        base: styles.text,
+        fill: None,
+        overlays: &overlays,
+    }
+    .paint(0, UNCLIPPED)
+    .spans
 }
 
 fn tab_label(index: usize, question: &AskedQuestion) -> String {
@@ -1524,9 +1521,9 @@ mod tests {
     #[test_case("…\n\\", 3, true ; "later_line")]
     #[test_case("…\\\ntail", 3, false ; "start_of_later_line")]
     fn backslash_detection_uses_character_positions(text: &str, cursor: usize, expected: bool) {
-        let mut buffer = TextBuffer::new(text.to_owned());
-        buffer.set_cursor_offset(cursor);
-        assert_eq!(ends_with_backslash(&buffer), expected);
+        let mut field = TextField::with_text(FieldKind::Block, text);
+        field.set_cursor_offset(cursor);
+        assert_eq!(ends_with_backslash(&field), expected);
     }
 
     #[test_case("plain\\", 6, "plain\n" ; "ascii")]
@@ -1541,15 +1538,21 @@ mod tests {
         expected: &str,
     ) {
         let mut form = typing(false);
-        form.custom = TextBuffer::new(text.to_owned());
+        form.custom.set_text(text);
         form.custom.set_cursor_offset(cursor);
 
         let action = press(&mut form, KeyCode::Enter);
 
         assert!(matches!(action, QuestionFormAction::Consumed));
         assert_eq!(form.mode, Mode::EditingCustom);
-        assert_eq!(form.custom.value(), expected);
+        assert_eq!(form.custom.text(), expected);
         assert_eq!(form.custom.cursor_offset(), cursor);
+        chord(&mut form, KeyCode::Char('z'), KeyModifiers::CONTROL);
+        assert_eq!(
+            form.custom.text(),
+            text,
+            "one undo brings the backslash back"
+        );
     }
 
     #[test]
@@ -1562,7 +1565,7 @@ mod tests {
         press(&mut form, KeyCode::Enter);
 
         press(&mut form, KeyCode::Enter);
-        assert_eq!(form.custom.value(), TYPED, "the box is prefilled to edit");
+        assert_eq!(form.custom.text(), TYPED, "the box is prefilled to edit");
     }
 
     #[test]
@@ -1595,13 +1598,30 @@ mod tests {
         assert_eq!(form.picked(), [YES.to_owned(), TYPED.to_owned()]);
     }
 
-    /// The answer box is a `TextBuffer`, so it answers to the same editing
+    /// The answer box is a `TextField`, so it answers to the same editing
     /// keys as the composer rather than a subset of them.
     #[test]
     fn ctrl_w_deletes_the_word_before_the_cursor() {
         let mut form = typing(false);
         chord(&mut form, KeyCode::Char('w'), KeyModifiers::CONTROL);
-        assert_eq!(form.custom.value(), TYPED_HEAD);
+        assert_eq!(form.custom.text(), TYPED_HEAD);
+    }
+
+    /// `Ctrl+C` is the box's copy while something is selected, and the form's
+    /// cancel only once there is nothing to copy.
+    #[test_case(true ; "selection_copies")]
+    #[test_case(false ; "no_selection_cancels")]
+    fn ctrl_c_in_the_box_copies_a_selection_before_cancelling(selected: bool) {
+        let mut form = typing(false);
+        if selected {
+            chord(&mut form, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        }
+        let action = chord(&mut form, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        match selected {
+            true => assert!(matches!(&action, QuestionFormAction::Copy(text) if text == TYPED)),
+            false => assert!(matches!(action, QuestionFormAction::Cancel)),
+        }
+        assert_eq!(form.custom.text(), TYPED);
     }
 
     #[test]
@@ -1621,14 +1641,18 @@ mod tests {
         let mut form = typing(false);
         render(&mut form);
         let editor = hit_area(&form, FormTarget::Editor(0));
-        let caret = reversed_cells(&mut form);
+        let caret = caret_cells(&mut form);
         assert_eq!(caret.len(), 1, "the caret is the only marked cell");
+        assert!(
+            reversed_cells(&mut form).is_empty(),
+            "the caret is not a selection"
+        );
         let typed_width = (CUSTOM_PROMPT.chars().count() + TYPED.chars().count()) as u16;
         assert_eq!(caret[0], (editor.x + typed_width, editor.y));
 
         chord(&mut form, KeyCode::Left, KeyModifiers::CONTROL);
         render(&mut form);
-        let moved = reversed_cells(&mut form);
+        let moved = caret_cells(&mut form);
         let head_width = (CUSTOM_PROMPT.chars().count() + TYPED_HEAD.chars().count()) as u16;
         assert_eq!(
             moved,
@@ -1835,11 +1859,15 @@ mod tests {
         press(&mut form, KeyCode::Enter);
         type_text(&mut form, TYPED);
         render(&mut form);
-        assert_eq!(form.custom.x(), TYPED.chars().count());
+        assert_eq!(form.custom.cursor().col, TYPED.chars().count());
         let area = hit_area(&form, FormTarget::Editor(0));
         let column = area.x + CUSTOM_PROMPT.chars().count() as u16 + 3;
         click(&mut form, column, area.y);
-        assert_eq!(form.custom.x(), 3, "the cursor lands on the clicked cell");
+        assert_eq!(
+            form.custom.cursor().col,
+            3,
+            "the cursor lands on the clicked cell"
+        );
     }
 
     /// Past the end of the text there is no cell to land on, so the cursor
@@ -1855,7 +1883,7 @@ mod tests {
         render(&mut form);
         let area = hit_area(&form, FormTarget::Editor(0));
         click(&mut form, area.right() - 1, area.y);
-        assert_eq!(form.custom.x(), TYPED.chars().count());
+        assert_eq!(form.custom.cursor().col, TYPED.chars().count());
     }
 
     #[test]
@@ -1929,10 +1957,22 @@ mod tests {
     const EXPECT_MARKED: &str = "the control under the pointer has to be marked";
     const EXPECT_UNMARKED: &str = "nothing else may be marked";
 
+    use ratatui::buffer::Cell;
     use ratatui::style::Modifier;
     use test_case::test_case;
 
     fn reversed_cells(form: &mut QuestionForm) -> Vec<(u16, u16)> {
+        painted_cells(form, |cell| cell.modifier.contains(Modifier::REVERSED))
+    }
+
+    fn caret_cells(form: &mut QuestionForm) -> Vec<(u16, u16)> {
+        let caret = theme::current().cursor;
+        painted_cells(form, |cell| {
+            Some(cell.fg) == caret.fg && Some(cell.bg) == caret.bg
+        })
+    }
+
+    fn painted_cells(form: &mut QuestionForm, marked: impl Fn(&Cell) -> bool) -> Vec<(u16, u16)> {
         let backend = ratatui::backend::TestBackend::new(TERMINAL_WIDTH, TERMINAL_HEIGHT);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         let area = docked(form);
@@ -1940,7 +1980,7 @@ mod tests {
         let buffer = terminal.backend().buffer().clone();
         (0..TERMINAL_HEIGHT)
             .flat_map(|y| (0..TERMINAL_WIDTH).map(move |x| (x, y)))
-            .filter(|(x, y)| buffer[(*x, *y)].modifier.contains(Modifier::REVERSED))
+            .filter(|(x, y)| marked(&buffer[(*x, *y)]))
             .collect()
     }
 

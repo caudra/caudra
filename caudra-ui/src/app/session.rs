@@ -3000,6 +3000,10 @@ impl App {
     ) -> Vec<Action> {
         match action {
             SessionPickerAction::Consumed | SessionPickerAction::Closed => Vec::new(),
+            SessionPickerAction::Copy(text) => {
+                self.copy_to_clipboard(&text);
+                Vec::new()
+            }
             SessionPickerAction::Focus(id) => vec![Action::FocusSession(id)],
             SessionPickerAction::FocusElsewhere { id, cwd } => {
                 vec![Action::OpenSessionElsewhere { id, cwd }]
@@ -3044,6 +3048,10 @@ impl App {
     ) -> Vec<Action> {
         match action {
             SessionRelocationAction::Consumed | SessionRelocationAction::Closed => Vec::new(),
+            SessionRelocationAction::Copy(text) => {
+                self.copy_to_clipboard(&text);
+                Vec::new()
+            }
             SessionRelocationAction::Confirm(request, donor) => {
                 vec![Action::RelocateSessions { request, donor }]
             }
@@ -3061,6 +3069,10 @@ impl App {
     pub(super) fn handle_worktree_action(&mut self, action: WorktreeAction) -> Vec<Action> {
         match action {
             WorktreeAction::Consumed | WorktreeAction::Closed => Vec::new(),
+            WorktreeAction::Copy(text) => {
+                self.copy_to_clipboard(&text);
+                Vec::new()
+            }
             WorktreeAction::Refresh => vec![Action::OpenWorktrees(WorktreeView::List)],
             WorktreeAction::Open(root) => vec![Action::OpenWorktree(root)],
             WorktreeAction::InspectRemoval(root) => vec![Action::InspectWorktreeRemoval(root)],

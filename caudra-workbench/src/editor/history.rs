@@ -38,6 +38,7 @@ impl Gesture {
     }
 }
 
+#[derive(Debug, Clone)]
 struct Entry {
     edit: Edit,
     gesture: Gesture,
@@ -45,7 +46,7 @@ struct Entry {
     seq: u64,
 }
 
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct History {
     undo: Vec<Entry>,
     redo: Vec<Edit>,

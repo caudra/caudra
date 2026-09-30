@@ -17,6 +17,11 @@ const MESSAGE_BACKGROUND_TINT: f32 = 0.08;
 const ELEMENT_BACKGROUND_TINT: f32 = 0.1;
 const PANEL_BACKGROUND_TINT: f32 = 0.04;
 const RESERVED_KEYS: &[&str] = &["palette", "ui", "inherits"];
+const CURSOR_KEY: &str = "cursor";
+/// The caret of a theme that names no `cursor`: the cell under it reversed,
+/// which shows on any palette. Every text field draws its caret in `cursor`,
+/// so an unset one would leave the composer with no caret at all.
+const CURSOR_FALLBACK: Style = Style::new().add_modifier(Modifier::REVERSED);
 
 /// Minimum contrast ratio for roles that carry text a user has to read.
 const MIN_CONTRAST_TEXT: f32 = 3.0;
@@ -1082,7 +1087,10 @@ impl Theme {
             item_match_selected: match_style("item_match_selected", style("item_selected")),
             panel_border: style("panel_border"),
             panel_title: style("panel_title"),
-            cursor: style("cursor"),
+            cursor: match ui.contains_key(CURSOR_KEY) {
+                true => style(CURSOR_KEY),
+                false => CURSOR_FALLBACK,
+            },
             input_border: style("input_border"),
             accent: style("accent"),
             active: {
@@ -1472,6 +1480,18 @@ mod tests {
 "#;
         let theme = Theme::from_toml(toml).unwrap();
         assert_eq!(theme.user, Style::default());
+    }
+
+    const CARET_HIDDEN: &str = "a theme that names no cursor must still draw a visible caret";
+
+    #[test]
+    fn a_theme_without_a_cursor_still_shows_the_caret() {
+        let toml = r#"
+[palette]
+[ui]
+"#;
+        let theme = Theme::from_toml(toml).unwrap();
+        assert_eq!(theme.cursor, CURSOR_FALLBACK, "{CARET_HIDDEN}");
     }
 
     #[test]

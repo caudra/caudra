@@ -117,6 +117,7 @@ pub enum ShellModalAction {
     Stop(ShellStop),
     /// The details page needs what an earlier runtime kept of this execution.
     LoadOutput(String),
+    Copy(String),
 }
 
 /// Exactly the execution the row showed, so a stop can never land on another.
@@ -594,6 +595,7 @@ impl ShellModal {
                 ShellModalAction::Consumed
             }
             PickerAction::Key(key) => self.handle_key(key),
+            PickerAction::Copy(text) => ShellModalAction::Copy(text),
         }
     }
 }

@@ -49,7 +49,7 @@ impl InputReader {
         &self.rx
     }
 
-    /// Park the reader so another process (editor, suspended shell) can own
+    /// Park the reader so something else (an editor, a terminal query) can own
     /// the tty. Blocks until the reader acknowledges it is out of
     /// `event::read`; the guard resumes reading on drop.
     pub(crate) fn pause(&self) -> PauseGuard<'_> {

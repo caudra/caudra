@@ -41,6 +41,7 @@ pub enum MessageActionsAction {
         kind: MessageActionKind,
     },
     Close,
+    Copy(String),
 }
 
 pub struct MessageActions {
@@ -120,6 +121,7 @@ impl MessageActions {
                 self.source = None;
                 MessageActionsAction::Close
             }
+            PickerAction::Copy(text) => MessageActionsAction::Copy(text),
         }
     }
 

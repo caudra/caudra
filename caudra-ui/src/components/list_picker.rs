@@ -8,12 +8,13 @@ use crate::animation::{animation_elapsed_ms, spinner_str};
 use crate::components::keybindings::key;
 use crate::components::modal::Modal;
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
-use crate::components::{Hint, HintBar, Overlay};
+use crate::components::{Hint, HintBar, Overlay, chevron_span, field_styles, input_text_style};
 use crate::repaint::Cadence;
-use crate::text_buffer::{EditResult, TextBuffer};
 use crate::theme;
 
 use caudra_grab::grab_scope;
+use caudra_workbench::keys::{LIST_FIRST, LIST_LAST};
+use caudra_workbench::text_field::{FieldKind, TextField, TextKey};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
@@ -79,6 +80,8 @@ pub enum PickerAction<T> {
     /// A footer hint was clicked. The picker does not know what its owner's
     /// keys mean, so the owner feeds this back into its own `handle_key`.
     Key(KeyEvent),
+    /// Text copied or cut from the search line, for the clipboard.
+    Copy(String),
 }
 
 /// The footer a picker draws under its search row. Built on every frame
@@ -101,7 +104,7 @@ struct State<T> {
     items: Vec<T>,
     filtered: Vec<usize>,
     selected: usize,
-    search: TextBuffer,
+    search: TextField,
     scroll_offset: usize,
     viewport_height: usize,
     popup_area: Rect,
@@ -143,7 +146,7 @@ impl<T: PickerItem> State<T> {
             items,
             filtered,
             selected: 0,
-            search: TextBuffer::new(String::new()),
+            search: TextField::new(FieldKind::Line),
             scroll_offset: 0,
             viewport_height: 20,
             popup_area: Rect::default(),
@@ -171,7 +174,7 @@ impl<T: PickerItem> State<T> {
     }
 
     fn rebuild_filter(&mut self) {
-        let query = self.search.value();
+        let query = self.search.text();
         if query.is_empty() {
             self.filtered = (0..self.items.len()).collect();
             return;
@@ -458,21 +461,23 @@ impl<T: PickerItem> ListPicker<T> {
     pub fn search_text(&self) -> String {
         self.state
             .as_ref()
-            .map(|state| state.search.value())
+            .map(|state| state.search.text())
             .unwrap_or_default()
     }
 
     pub fn set_search_text(&mut self, text: &str) {
         if let Some(state) = self.state.as_mut() {
-            state.search = TextBuffer::new(text.to_string());
-            state.search.move_to_end();
+            state.search.set_text(text);
             state.update_search_and_clamp();
         }
     }
 
-    pub fn set_search_cursor(&mut self, offset: usize) {
+    /// Shows a field its owner edits in the search line, caret and selection
+    /// included, and filters by its text.
+    pub fn mirror_search(&mut self, field: &TextField) {
         if let Some(state) = self.state.as_mut() {
-            state.search.set_cursor_offset(offset);
+            state.search = field.clone();
+            state.update_search_and_clamp();
         }
     }
 
@@ -624,12 +629,16 @@ impl<T: PickerItem> ListPicker<T> {
             .expect("handle_ready_key called without state");
         s.invalidate_mouse_geometry();
 
-        if key::QUIT.matches(key) {
-            self.state = None;
-            return PickerAction::Close;
-        }
         if key::SCROLL_HALF_UP.matches(key) {
             s.page_up();
+            return PickerAction::Consumed;
+        }
+        if LIST_FIRST.matches(key) {
+            s.select_first();
+            return PickerAction::Consumed;
+        }
+        if LIST_LAST.matches(key) {
+            s.select_last();
             return PickerAction::Consumed;
         }
         match key.code {
@@ -647,14 +656,6 @@ impl<T: PickerItem> ListPicker<T> {
             }
             KeyCode::PageDown => {
                 s.page_down();
-                PickerAction::Consumed
-            }
-            KeyCode::Home => {
-                s.select_first();
-                PickerAction::Consumed
-            }
-            KeyCode::End => {
-                s.select_last();
                 PickerAction::Consumed
             }
             KeyCode::Enter => {
@@ -685,12 +686,21 @@ impl<T: PickerItem> ListPicker<T> {
                 PickerAction::Close
             }
             // Everything the list itself does not claim edits the search
-            // line, which owns the whole editing keymap.
+            // line, which owns the whole editing keymap. `Ctrl+C` copies what
+            // it has selected, and closes the picker when nothing is.
             _ => {
-                if s.search.handle_key(key) == EditResult::Changed {
+                let edit = s.search.handle_key(key);
+                if edit.changed() {
                     s.update_search_and_clamp();
                 }
-                PickerAction::Consumed
+                match edit {
+                    TextKey::Copy(text) | TextKey::Cut(text) => PickerAction::Copy(text),
+                    TextKey::Ignored if key::QUIT.matches(key) => {
+                        self.state = None;
+                        PickerAction::Close
+                    }
+                    _ => PickerAction::Consumed,
+                }
             }
         }
     }
@@ -712,8 +722,9 @@ impl<T: PickerItem> ListPicker<T> {
         let Some(s) = self.state.as_mut() else {
             return false;
         };
-        s.search.insert_text(text);
-        s.update_search_and_clamp();
+        if s.search.paste(text).changed() {
+            s.update_search_and_clamp();
+        }
         true
     }
 
@@ -1176,24 +1187,13 @@ fn render_list<T: PickerItem>(
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn render_search(frame: &mut Frame, area: Rect, search: &TextBuffer) {
+fn render_search(frame: &mut Frame, area: Rect, search: &TextField) {
     grab_scope!("list_picker_search", area);
-    let query = search.value();
-    let cursor_x = search.x();
-    let chars: Vec<char> = query.chars().collect();
-    let before: String = chars[..cursor_x].iter().collect();
-    let cursor_char = chars.get(cursor_x).copied().unwrap_or(' ');
-    let after_start = cursor_x.saturating_add(1).min(chars.len());
-    let after: String = chars[after_start..].iter().collect();
-
-    let text = super::input_text_style();
-    let line = Line::from(vec![
-        super::chevron_span(),
-        Span::styled(before, text),
-        Span::styled(cursor_char.to_string(), theme::current().cursor),
-        Span::styled(after, text),
-    ]);
-    frame.render_widget(Paragraph::new(vec![line]), area);
+    let chevron = chevron_span();
+    let width = usize::from(area.width).saturating_sub(chevron.width());
+    let mut line = search.paint(width, &field_styles(input_text_style()), true, "");
+    line.spans.insert(0, chevron);
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 #[cfg(test)]
@@ -1201,6 +1201,7 @@ mod tests {
     use super::*;
     use crate::components::key;
     use crate::components::keybindings::key as kb;
+    use caudra_workbench::keys::Bind;
     use crossterm::event::{KeyCode, KeyModifiers};
     use test_case::test_case;
 
@@ -1208,6 +1209,10 @@ mod tests {
     const SECTION_B: &str = "B";
     const BAR_LOST_THE_PRESS: &str = "the row under the scrollbar took the press";
     const QUERY_UNTOUCHED: &str = "the navigation key edited the filter line";
+    const SELECTION_UNTOUCHED: &str = "a caret key moved the list selection";
+    const COPY_KEEPS_PICKER: &str = "copying from the search line closed the picker";
+    const WORDS: &str = "alpha beta";
+    const FIRST_WORD: &str = "alpha ";
     /// More items than the 80x24 test terminal can show, so the bar has a
     /// track to press on.
     const OVERFLOWING_ITEMS: usize = 50;
@@ -1328,7 +1333,7 @@ mod tests {
 
         assert!(p.select_item_by(|entry| entry.label == "Alpine"));
         assert_eq!(p.selected_item().unwrap().label, "Alpine");
-        assert_eq!(ready_state(&p).search.value(), "al");
+        assert_eq!(ready_state(&p).search.text(), "al");
         assert!(!p.select_item_by(|entry| entry.label == "Beta"));
         assert_eq!(p.selected_item().unwrap().label, "Alpine");
     }
@@ -1379,11 +1384,11 @@ mod tests {
         assert_eq!(ready_state(&p).selected, 0);
     }
 
-    /// The list owns the navigation keys, so the query they used to edit has
-    /// to come back untouched.
-    #[test_case(KeyCode::Home, 0  ; "home_selects_first")]
-    #[test_case(KeyCode::End,  49 ; "end_selects_last")]
-    fn home_and_end_reach_the_ends_of_the_list(code: KeyCode, expected: usize) {
+    /// The list takes the text-start chords for its ends, so the query they
+    /// would move through has to come back untouched.
+    #[test_case(LIST_FIRST, 0  ; "ctrl_home_selects_first")]
+    #[test_case(LIST_LAST,  49 ; "ctrl_end_selects_last")]
+    fn ctrl_home_and_ctrl_end_reach_the_ends_of_the_list(bind: Bind, expected: usize) {
         let items: Vec<Entry> = (0..50).map(|i| Entry::new(&format!("Item {i}"))).collect();
         let mut p = ListPicker::new();
         p.open(items, " Test ");
@@ -1391,24 +1396,43 @@ mod tests {
         s.viewport_height = 10;
         s.selected = 25;
         p.handle_key(key(KeyCode::Char('I')));
+        ready_state_mut(&mut p).search.set_cursor_offset(0);
 
-        p.handle_key(key(code));
+        p.handle_key(bind.to_key_event());
 
         let s = ready_state(&p);
         assert_eq!(s.selected, expected);
-        assert_eq!(s.search.value(), "I", "{QUERY_UNTOUCHED}");
+        assert_eq!(s.search.text(), "I", "{QUERY_UNTOUCHED}");
+        assert_eq!(s.search.cursor_offset(), 0, "{QUERY_UNTOUCHED}");
     }
 
     #[test]
-    fn home_and_end_on_an_empty_list_do_nothing() {
+    fn list_ends_on_an_empty_list_do_nothing() {
         let mut p = ListPicker::new();
         p.open(entries(&["A"]), " Test ");
         p.handle_key(key(KeyCode::Char('z')));
         assert!(ready_state(&p).filtered.is_empty());
 
-        p.handle_key(key(KeyCode::Home));
-        p.handle_key(key(KeyCode::End));
+        p.handle_key(LIST_FIRST.to_key_event());
+        p.handle_key(LIST_LAST.to_key_event());
         assert_eq!(ready_state(&p).selected, 0);
+    }
+
+    /// Bare `Home` and `End` belong to the search line's caret.
+    #[test_case(KeyCode::Home, 0                 ; "home_reaches_the_query_start")]
+    #[test_case(KeyCode::End,  FIRST_WORD.len()  ; "end_reaches_the_query_end")]
+    fn home_and_end_move_the_search_caret(code: KeyCode, expected: usize) {
+        let mut p = ListPicker::new();
+        p.open(entries(&["alpha 1", "alpha 2"]), " Test ");
+        p.handle_paste(FIRST_WORD);
+        ready_state_mut(&mut p).search.set_cursor_offset(1);
+        p.handle_key(key(KeyCode::Down));
+
+        p.handle_key(key(code));
+
+        let s = ready_state(&p);
+        assert_eq!(s.search.cursor_offset(), expected);
+        assert_eq!(s.selected, 1, "{SELECTION_UNTOUCHED}");
     }
 
     #[test]
@@ -1473,19 +1497,20 @@ mod tests {
         assert!(ready_state(&p).filtered.is_empty());
 
         p.handle_key(kb::DELETE_WORD.to_key_event());
-        assert_eq!(ready_state(&p).search.value(), "");
+        assert_eq!(ready_state(&p).search.text(), "");
         assert_eq!(ready_state(&p).filtered, vec![0, 1]);
     }
 
-    #[test]
-    fn ctrl_left_moves_the_search_caret_by_word() {
+    /// Word stops are the editor's: a word and the blank that follows it.
+    #[test_case(KeyCode::Left,  WORDS.len() ; "ctrl_left")]
+    #[test_case(KeyCode::Right, 0           ; "ctrl_right")]
+    fn ctrl_arrows_move_the_search_caret_by_word(code: KeyCode, from: usize) {
         let mut p = ListPicker::new();
         p.open(entries(&["Alpha"]), " Test ");
-        for c in "alpha beta".chars() {
-            p.handle_key(key(KeyCode::Char(c)));
-        }
-        p.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL));
-        assert_eq!(ready_state(&p).search.x(), "alpha ".len());
+        p.handle_paste(WORDS);
+        ready_state_mut(&mut p).search.set_cursor_offset(from);
+        p.handle_key(KeyEvent::new(code, KeyModifiers::CONTROL));
+        assert_eq!(ready_state(&p).search.cursor_offset(), FIRST_WORD.len());
     }
 
     #[test]
@@ -1664,6 +1689,24 @@ mod tests {
         assert!(!p.is_open());
     }
 
+    /// With a selection in the search line, `Ctrl+C` copies it and the picker
+    /// stays; `Shift+Delete` cuts it and refilters.
+    #[test_case(kb::QUIT.to_key_event(), WORDS, &[] ; "ctrl_c_copies")]
+    #[test_case(kb::CUT.to_key_event(), "", &[0, 1] ; "shift_delete_cuts")]
+    fn clipboard_chords_hand_the_selection_back(chord: KeyEvent, left: &str, filtered: &[usize]) {
+        let mut p = ListPicker::new();
+        p.open(entries(&["Alpha", "Beta"]), " Test ");
+        p.handle_paste(WORDS);
+        p.handle_key(kb::SELECT_ALL.to_key_event());
+
+        let action = p.handle_key(chord);
+
+        assert!(matches!(action, PickerAction::Copy(ref text) if text == WORDS));
+        assert!(p.is_open(), "{COPY_KEEPS_PICKER}");
+        assert_eq!(p.search_text(), left);
+        assert_eq!(ready_state(&p).filtered, filtered);
+    }
+
     #[test]
     fn enter_on_empty_results_consumed() {
         let mut p = ListPicker::new();
@@ -1696,10 +1739,10 @@ mod tests {
         p.open(entries(&["A", "B"]), " Test ");
         p.handle_key(key(KeyCode::Char('h')));
         p.handle_key(key(KeyCode::Char('i')));
-        assert_eq!(ready_state(&p).search.value(), "hi");
+        assert_eq!(ready_state(&p).search.text(), "hi");
 
         p.handle_key(kb::DELETE_WORD.to_key_event());
-        assert_eq!(ready_state(&p).search.value(), "");
+        assert_eq!(ready_state(&p).search.text(), "");
     }
 
     struct SectionEntry {

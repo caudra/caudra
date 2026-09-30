@@ -6,6 +6,7 @@
 //! contains an upper-case character it means it.
 
 use super::buffer::Cursor;
+use super::text_field::{FieldKind, TextField};
 
 /// A match, in character columns, matching how [`Cursor::col`] counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,12 +26,23 @@ impl Match {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Find {
-    query: String,
+    query: TextField,
     matches: Vec<Match>,
     current: Option<usize>,
     open: bool,
+}
+
+impl Default for Find {
+    fn default() -> Self {
+        Self {
+            query: TextField::new(FieldKind::Line),
+            matches: Vec::new(),
+            current: None,
+            open: false,
+        }
+    }
 }
 
 impl Find {
@@ -50,8 +62,14 @@ impl Find {
         self.current = None;
     }
 
-    pub fn query(&self) -> &str {
+    pub fn query(&self) -> &TextField {
         &self.query
+    }
+
+    /// The query to edit. What it matches is only rescanned by
+    /// [`Self::search`], once the edit is done.
+    pub fn query_mut(&mut self) -> &mut TextField {
+        &mut self.query
     }
 
     pub fn current(&self) -> Option<Match> {
@@ -64,8 +82,9 @@ impl Find {
         self.current.map(|index| (index + 1, self.matches.len()))
     }
 
-    pub fn set_query(&mut self, query: String, lines: &[String], from: Cursor) {
-        self.query = query;
+    /// Rescans for the query as it stands, making the first match at or after
+    /// `from` the current one.
+    pub fn search(&mut self, lines: &[String], from: Cursor) {
         self.scan(lines);
         self.current = self.locate((from.line, from.col));
     }
@@ -113,8 +132,8 @@ impl Find {
         if self.query.is_empty() {
             return;
         }
-        let needle: Vec<char> = self.query.chars().collect();
-        let sensitive = self.query.chars().any(char::is_uppercase);
+        let needle: Vec<char> = self.query.text().chars().collect();
+        let sensitive = needle.iter().any(|ch| ch.is_uppercase());
         let mut haystack: Vec<char> = Vec::new();
         for (line, text) in lines.iter().enumerate() {
             haystack.clear();
@@ -171,10 +190,15 @@ mod tests {
             .collect()
     }
 
-    fn search(query: &str, rows: &[&str]) -> Find {
+    fn search_from(query: &str, rows: &[&str], from: Cursor) -> Find {
         let mut find = Find::default();
-        find.set_query(query.to_owned(), &lines(rows), Cursor::default());
+        find.query_mut().set_text(query);
+        find.search(&lines(rows), from);
         find
+    }
+
+    fn search(query: &str, rows: &[&str]) -> Find {
+        search_from(query, rows, Cursor::default())
     }
 
     #[test_case("fn", &["fn a() {}", "  fn b() {}"], &[(0, 0, 2), (1, 2, 4)] ; "every line is scanned")]
@@ -199,9 +223,7 @@ mod tests {
 
     #[test]
     fn the_first_match_at_or_after_the_cursor_is_selected() {
-        let rows = lines(&["a", "a", "a"]);
-        let mut find = Find::default();
-        find.set_query("a".to_owned(), &rows, Cursor::new(1, 0));
+        let find = search_from("a", &["a", "a", "a"], Cursor::new(1, 0));
 
         assert_eq!(
             find.current(),
@@ -217,9 +239,7 @@ mod tests {
 
     #[test]
     fn selection_wraps_to_the_top_when_the_cursor_is_past_the_last_match() {
-        let rows = lines(&["a", "b"]);
-        let mut find = Find::default();
-        find.set_query("a".to_owned(), &rows, Cursor::new(1, 0));
+        let find = search_from("a", &["a", "b"], Cursor::new(1, 0));
 
         assert_eq!(
             find.current(),
@@ -302,7 +322,7 @@ mod tests {
         find.close();
 
         assert!(!find.is_open(), "{WRONG_MATCHES}");
-        assert_eq!(find.query(), "a", "{WRONG_MATCHES}");
+        assert_eq!(find.query().text(), "a", "{WRONG_MATCHES}");
         assert!(found(&find).is_empty(), "{WRONG_MATCHES}");
         assert_eq!(find.position(), None, "{WRONG_POSITION}");
     }

@@ -9,6 +9,7 @@ pub mod engine;
 
 use std::path::Path;
 
+use crate::editor::text_field::{FieldKind, TextField};
 use crate::fs::backend::{RequestId, ResourceEntry, SearchResult, WorkbenchPath};
 use engine::{Event, Hit, Query, Run};
 
@@ -28,10 +29,16 @@ pub enum Row {
     Hit(usize),
 }
 
-#[derive(Default)]
 pub struct Search {
-    query: Query,
+    text: TextField,
+    include: TextField,
     field: Field,
+    regex: bool,
+    case_sensitive: bool,
+    whole_word: bool,
+    /// Whether the last run walked hidden files. Only a run takes the host's
+    /// current answer, so turning them on marks nothing stale by itself.
+    hidden: bool,
     files: Vec<WorkbenchPath>,
     hits: Vec<Hit>,
     rows: Vec<Row>,
@@ -46,13 +53,59 @@ pub struct Search {
     remote_request: Option<RequestId>,
 }
 
+impl Default for Search {
+    fn default() -> Self {
+        Self {
+            text: TextField::new(FieldKind::Line),
+            include: TextField::new(FieldKind::Line),
+            field: Field::default(),
+            regex: false,
+            case_sensitive: false,
+            whole_word: false,
+            hidden: false,
+            files: Vec::new(),
+            hits: Vec::new(),
+            rows: Vec::new(),
+            selected: 0,
+            scroll: 0,
+            run: None,
+            truncated: false,
+            error: None,
+            ran: None,
+            remote_request: None,
+        }
+    }
+}
+
 impl Search {
     pub fn field(&self) -> Field {
         self.field
     }
 
-    pub fn query(&self) -> &Query {
-        &self.query
+    pub fn input(&self, field: Field) -> &TextField {
+        match field {
+            Field::Query => &self.text,
+            Field::Include => &self.include,
+        }
+    }
+
+    pub fn input_mut(&mut self, field: Field) -> &mut TextField {
+        match field {
+            Field::Query => &mut self.text,
+            Field::Include => &mut self.include,
+        }
+    }
+
+    /// What the fields and the toggles ask for, in the shape a run takes.
+    pub fn query(&self) -> Query {
+        Query {
+            text: self.text.text(),
+            include: self.include.text(),
+            regex: self.regex,
+            case_sensitive: self.case_sensitive,
+            whole_word: self.whole_word,
+            hidden: self.hidden,
+        }
     }
 
     pub fn rows(&self) -> &[Row] {
@@ -87,9 +140,41 @@ impl Search {
         self.run.is_some() || self.remote_request.is_some()
     }
 
-    /// Whether the fields have moved on from the results below them.
+    pub fn regex(&self) -> bool {
+        self.regex
+    }
+
+    pub fn case_sensitive(&self) -> bool {
+        self.case_sensitive
+    }
+
+    pub fn whole_word(&self) -> bool {
+        self.whole_word
+    }
+
+    /// Whether the fields have moved on from the results below them. Asked
+    /// on every frame, so it compares in place instead of building a query.
     pub fn is_stale(&self) -> bool {
-        self.ran.as_ref() != Some(&self.query)
+        let Some(Query {
+            text,
+            include,
+            regex,
+            case_sensitive,
+            whole_word,
+            hidden,
+        }) = &self.ran
+        else {
+            return true;
+        };
+        !self.text.holds(text)
+            || !self.include.holds(include)
+            || (*regex, *case_sensitive, *whole_word, *hidden)
+                != (
+                    self.regex,
+                    self.case_sensitive,
+                    self.whole_word,
+                    self.hidden,
+                )
     }
 
     pub fn has_results(&self) -> bool {
@@ -103,37 +188,30 @@ impl Search {
         };
     }
 
-    pub fn push_char(&mut self, ch: char) {
-        self.focused_field().push(ch);
-    }
-
-    pub fn pop_char(&mut self) {
-        self.focused_field().pop();
-    }
-
     pub fn toggle_case(&mut self) {
-        self.query.case_sensitive = !self.query.case_sensitive;
+        self.case_sensitive = !self.case_sensitive;
     }
 
     pub fn toggle_word(&mut self) {
-        self.query.whole_word = !self.query.whole_word;
+        self.whole_word = !self.whole_word;
     }
 
     pub fn toggle_regex(&mut self) {
-        self.query.regex = !self.query.regex;
+        self.regex = !self.regex;
     }
 
     /// Starts a fresh walk, cancelling whatever the last one was still doing.
     /// An empty query clears the pane instead, so deleting the text does not
     /// leave stale results sitting under it.
     pub fn start(&mut self, root: &Path, hidden: bool) {
-        self.query.hidden = hidden;
+        self.hidden = hidden;
         self.clear();
-        self.ran = Some(self.query.clone());
-        if self.query.text.is_empty() {
+        let query = self.query();
+        self.ran = Some(query.clone());
+        if query.text.is_empty() {
             return;
         }
-        match Run::start(root, &self.query) {
+        match Run::start(root, &query) {
             Ok(run) => self.run = Some(run),
             Err(error) => self.error = Some(error.to_string()),
         }
@@ -141,12 +219,13 @@ impl Search {
 
     pub fn prepare_remote(&mut self) -> Option<(String, Option<String>)> {
         self.clear();
-        self.ran = Some(self.query.clone());
-        if self.query.text.is_empty() {
+        let query = self.query();
+        self.ran = Some(query.clone());
+        if query.text.is_empty() {
             return None;
         }
-        let include = (!self.query.include.trim().is_empty()).then(|| self.query.include.clone());
-        Some((self.query.text.clone(), include))
+        let include = (!query.include.trim().is_empty()).then_some(query.include);
+        Some((query.text, include))
     }
 
     pub fn begin_remote(&mut self, request: RequestId) {
@@ -273,13 +352,6 @@ impl Search {
         (self.hits.len(), self.files.len())
     }
 
-    fn focused_field(&mut self) -> &mut String {
-        match self.field {
-            Field::Query => &mut self.query.text,
-            Field::Include => &mut self.query.include,
-        }
-    }
-
     fn clear(&mut self) {
         self.run = None;
         self.remote_request = None;
@@ -312,8 +384,11 @@ mod tests {
 
     const GROUPING_WRONG: &str = "hits must be grouped under one heading per file";
     const SELECTION_WRONG: &str = "the cursor is not on the row the test put it on";
-    const FIELD_WRONG: &str = "typing went into the wrong field";
     const STALE_WRONG: &str = "the pane disagrees about whether its results are current";
+
+    fn type_query(search: &mut Search, text: &str) {
+        search.input_mut(Field::Query).insert_text(text);
+    }
 
     fn hit(path: &str, line: u64) -> Hit {
         Hit {
@@ -388,36 +463,22 @@ mod tests {
     }
 
     #[test]
-    fn typing_lands_in_whichever_field_holds_the_caret() {
-        let mut search = Search::default();
-        search.push_char('a');
-        search.next_field();
-        search.push_char('b');
-        assert_eq!(search.query().text, "a", "{FIELD_WRONG}");
-        assert_eq!(search.query().include, "b", "{FIELD_WRONG}");
-        assert_eq!(search.field(), Field::Include, "{FIELD_WRONG}");
-
-        search.pop_char();
-        assert!(search.query().include.is_empty(), "{FIELD_WRONG}");
-    }
-
-    #[test]
     fn a_fresh_pane_is_stale_so_the_first_enter_searches() {
         let mut search = Search::default();
         assert!(search.is_stale(), "{STALE_WRONG}");
 
-        search.push_char('x');
+        type_query(&mut search, "x");
         search.start(&PathBuf::from("/nowhere-at-all"), false);
         assert!(!search.is_stale(), "{STALE_WRONG}");
 
-        search.push_char('y');
+        type_query(&mut search, "y");
         assert!(search.is_stale(), "{STALE_WRONG}");
     }
 
     #[test]
     fn a_toggle_makes_the_results_stale() {
         let mut search = Search::default();
-        search.push_char('x');
+        type_query(&mut search, "x");
         search.start(&PathBuf::from("/nowhere-at-all"), false);
 
         search.toggle_regex();
@@ -436,9 +497,7 @@ mod tests {
     fn an_invalid_pattern_is_reported_instead_of_run() {
         let mut search = Search::default();
         search.toggle_regex();
-        for ch in "a(".chars() {
-            search.push_char(ch);
-        }
+        type_query(&mut search, "a(");
         search.start(&PathBuf::from("/nowhere-at-all"), false);
         assert!(search.error().is_some(), "{STALE_WRONG}");
         assert!(!search.is_running(), "{STALE_WRONG}");

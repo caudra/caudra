@@ -15,7 +15,7 @@ use super::{
     AuthorityRow, CHIP_ONCE, COMPOSABLE_SHELL_OPTIONS, Panel, PermissionAnswer, PermissionDecision,
     PermissionLifetime, PermissionPrompt, PermissionRequest, PermissionRowGrant,
     PermissionRuleOption, PromptState, PromptTarget, RowChoice, StructuredPermissionEffect,
-    TextBuffer, grade_command_pattern,
+    grade_command_pattern,
 };
 
 const PATTERN_COVERAGE_UNAVAILABLE: &str =
@@ -142,7 +142,7 @@ impl PermissionPrompt {
         self.inspector = None;
         self.state = state;
         self.panel = Panel::Main;
-        self.buffer = TextBuffer::new(String::new());
+        self.field.clear();
         self.scroll.reset();
         self.invalidate_controls();
     }
@@ -910,7 +910,7 @@ pub(super) mod tests {
         assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());
         prompt.handle_paste("NOT THE REQUIRED PHRASE");
         assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());
-        prompt.buffer.clear();
+        prompt.field.clear();
         prompt.handle_paste(SHELL_PHRASE);
         assert_eq!(
             prompt.handle_key(key(KeyCode::Enter)).unwrap().answer,
@@ -931,7 +931,7 @@ pub(super) mod tests {
         assert!(!summary.contains("allow_exact_resources"));
         render(&mut prompt, 40, 10);
         assert!(prompt.handle_key(key(KeyCode::Char('y'))).is_none());
-        prompt.buffer.clear();
+        prompt.field.clear();
         prompt.handle_paste(WRITE_PHRASE);
         assert!(prompt.handle_key(key(KeyCode::Enter)).is_some());
     }

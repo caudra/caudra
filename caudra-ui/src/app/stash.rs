@@ -82,6 +82,7 @@ impl App {
     pub(super) fn handle_stash_picker_action(&mut self, action: StashPickerAction) -> Vec<Action> {
         match action {
             StashPickerAction::Consumed | StashPickerAction::Closed => {}
+            StashPickerAction::Copy(text) => self.copy_to_clipboard(&text),
             StashPickerAction::Restore(entry) => {
                 if !self.composer_ready_for_restore() {
                     return Vec::new();

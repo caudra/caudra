@@ -47,6 +47,7 @@ pub enum QueueActionsAction {
         kind: QueueActionKind,
     },
     Close,
+    Copy(String),
 }
 
 pub struct QueueActions {
@@ -140,6 +141,7 @@ impl QueueActions {
                 self.id = None;
                 QueueActionsAction::Close
             }
+            PickerAction::Copy(text) => QueueActionsAction::Copy(text),
         }
     }
 

@@ -4330,11 +4330,6 @@ impl<'t> EventLoop<'t> {
                     .app
                     .start_extract(self.ctx.timeouts, &chat);
             }
-            Action::Suspend => {
-                let _pause = self.input.pause();
-                terminal::suspend(self.terminal);
-                self.terminal_focused = false;
-            }
             Action::RefreshModels => self.refresh_models(),
             Action::RefreshUsage => self.refresh_usage(),
             Action::RefreshStorage => self.refresh_storage(),

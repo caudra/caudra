@@ -16,6 +16,7 @@ mod timeline;
 use caudra_agent::SubagentProgress;
 use caudra_agent::types::{PhaseMark, WorkflowRunCard};
 use caudra_grab::grab_scope;
+use caudra_workbench::text_field::{FieldKind, TextField, TextKey};
 use caudra_workflow::{
     AgentRosterEntry, CallKind, CallState, MAX_AGENT_BUDGET, RosterState, RunCall, RunCallBody,
     RunDetail, RunHistoryEntry, RunSnapshot, RunStatus,
@@ -30,6 +31,7 @@ use serde_json::Value;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::animation::{animation_elapsed_ms, spinner_str};
+use crate::components::document_view::COPIED_SELECTION;
 use crate::components::modal::{FooterHits, FooterLine, Modal};
 use crate::components::scrollbar::{ScrollHint, Scrollbar, ScrollbarMouse};
 use crate::components::tool_display::{
@@ -42,12 +44,12 @@ use crate::components::workflow_card::{
 use crate::components::workflow_inspector::json::JsonRow;
 use crate::components::workflow_inspector::timeline::{TimelineRow, span_bar, timeline};
 use crate::components::{
-    ModalScroll, Overlay, ToolProgress, escape_terminal_controls, format_compact, format_elapsed,
-    format_integer, hover_style, input_line_with_cursor, now_secs, visual_rows,
+    ModalScroll, Overlay, ToolProgress, chevron_span, escape_terminal_controls, field_styles,
+    format_compact, format_elapsed, format_integer, hover_style, input_text_style, now_secs,
+    visual_rows,
 };
 use crate::markdown::text_to_painted;
 use crate::repaint::Cadence;
-use crate::text_buffer::TextBuffer;
 use crate::theme;
 
 const TITLE: &str = " Workflows ";
@@ -235,7 +237,7 @@ impl RunControl {
 struct BudgetPrompt {
     run_id: String,
     admitted: u32,
-    input: TextBuffer,
+    input: TextField,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -372,6 +374,12 @@ pub enum InspectorAction {
         text: String,
         label: &'static str,
     },
+    /// The filter's selection went to the clipboard, and the run to inspect
+    /// when the shorter filter moved the selection.
+    Cut {
+        text: String,
+        inspect: Option<String>,
+    },
     Flash(&'static str),
 }
 
@@ -382,7 +390,7 @@ pub struct WorkflowInspector {
     selected: Option<String>,
     section: Section,
     detail: Option<RunDetail>,
-    filter: TextBuffer,
+    filter: TextField,
     filter_focused: bool,
     budget: Option<BudgetPrompt>,
     pane: Pane,
@@ -472,7 +480,7 @@ impl WorkflowInspector {
             selected: None,
             section: Section::Overview,
             detail: None,
-            filter: TextBuffer::new(String::new()),
+            filter: TextField::new(FieldKind::Line),
             filter_focused: false,
             budget: None,
             pane: Pane::Runs,
@@ -675,14 +683,19 @@ impl WorkflowInspector {
             return None;
         }
         if let Some(prompt) = &mut self.budget {
-            prompt.input.insert_text(text);
+            prompt.input.paste(text);
             return Some(InspectorAction::Consumed);
         }
         if !self.filter_focused {
             return None;
         }
-        self.filter.insert_text(text);
+        self.filter.paste(text);
         Some(self.settle_selection())
+    }
+
+    /// Whether keys are typing into the filter or the budget prompt.
+    pub fn text_input_active(&self) -> bool {
+        self.open && (self.filter_focused || self.budget.is_some())
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> InspectorAction {
@@ -734,8 +747,13 @@ impl WorkflowInspector {
             KeyCode::Esc => self.budget = None,
             KeyCode::Enter => return self.resume_with_budget(),
             _ => {
-                if let Some(prompt) = &mut self.budget {
-                    prompt.input.handle_key(key);
+                if let Some(prompt) = &mut self.budget
+                    && let TextKey::Copy(text) | TextKey::Cut(text) = prompt.input.handle_key(key)
+                {
+                    return InspectorAction::Copy {
+                        text,
+                        label: COPIED_SELECTION,
+                    };
                 }
             }
         }
@@ -748,7 +766,7 @@ impl WorkflowInspector {
         let Some(prompt) = &self.budget else {
             return InspectorAction::Consumed;
         };
-        let asked = prompt.input.value().trim().parse::<u32>().ok();
+        let asked = prompt.input.text().trim().parse::<u32>().ok();
         let Some(agent_budget) =
             asked.filter(|budget| *budget > prompt.admitted && *budget <= MAX_AGENT_BUDGET)
         else {
@@ -770,13 +788,23 @@ impl WorkflowInspector {
                 return self.settle_selection();
             }
             KeyCode::Enter => self.filter_focused = false,
-            _ => {
-                let before = self.filter.value();
-                self.filter.handle_key(key);
-                if self.filter.value() != before {
-                    return self.settle_selection();
+            _ => match self.filter.handle_key(key) {
+                TextKey::Changed => return self.settle_selection(),
+                TextKey::Copy(text) => {
+                    return InspectorAction::Copy {
+                        text,
+                        label: COPIED_SELECTION,
+                    };
                 }
-            }
+                TextKey::Cut(text) => {
+                    let inspect = match self.settle_selection() {
+                        InspectorAction::Inspect(run_id) => Some(run_id),
+                        _ => None,
+                    };
+                    return InspectorAction::Cut { text, inspect };
+                }
+                TextKey::Handled | TextKey::Refused | TextKey::Ignored => {}
+            },
         }
         InspectorAction::Consumed
     }
@@ -1354,15 +1382,13 @@ impl WorkflowInspector {
             .saturating_add(BUDGET_STEP)
             .min(MAX_AGENT_BUDGET)
             .to_string();
-        let mut input = TextBuffer::new(suggested.clone());
-        // Behind the suggestion, so accepting it is Enter and replacing it is
-        // backspace rather than a cursor trip.
-        input.set_cursor(0, suggested.chars().count());
         self.filter_focused = false;
         self.budget = Some(BudgetPrompt {
             run_id,
             admitted,
-            input,
+            // The caret lands behind the suggestion, so accepting it is Enter
+            // and replacing it is backspace rather than a cursor trip.
+            input: TextField::with_text(FieldKind::Line, &suggested),
         });
         InspectorAction::Consumed
     }
@@ -1532,7 +1558,7 @@ impl WorkflowInspector {
 
     /// The run rows in list order, narrowed by the filter.
     fn entries(&self) -> Vec<Entry<'_>> {
-        let needle = self.filter.value().to_lowercase();
+        let needle = self.filter.text().to_lowercase();
         let matches = |run: &RunSnapshot, title: Option<&str>| {
             needle.is_empty()
                 || run.display_name.to_lowercase().contains(&needle)
@@ -1580,7 +1606,7 @@ impl WorkflowInspector {
             ..inner
         };
         let (list, detail) = self.panes(padded);
-        let filtering = self.filter_focused || !self.filter.value().is_empty();
+        let filtering = self.filter_focused || !self.filter.is_empty();
         let input_row = filtering || self.budget.is_some();
         let footer_rows = 1 + u16::from(input_row);
         let panes_height = padded.height.saturating_sub(footer_rows);
@@ -1603,22 +1629,24 @@ impl WorkflowInspector {
 
         let mut row = padded.y.saturating_add(panes_height);
         if input_row {
-            let line = match &self.budget {
-                Some(prompt) => {
-                    let mut spans = vec![Span::styled(BUDGET_LABEL, theme::current().tool_dim)];
-                    spans.extend(input_line_with_cursor(&prompt.input).spans);
-                    Line::from(spans)
-                }
-                None => input_line_with_cursor(&self.filter),
+            let area = Rect {
+                y: row,
+                height: 1,
+                ..padded
             };
-            frame.render_widget(
-                Paragraph::new(line),
-                Rect {
-                    y: row,
-                    height: 1,
-                    ..padded
-                },
-            );
+            let (mut spans, field, focused) = match &self.budget {
+                Some(prompt) => (
+                    vec![Span::styled(BUDGET_LABEL, theme::current().tool_dim)],
+                    &prompt.input,
+                    true,
+                ),
+                None => (Vec::new(), &self.filter, self.filter_focused),
+            };
+            spans.push(chevron_span());
+            let width = usize::from(area.width).saturating_sub(spans.iter().map(Span::width).sum());
+            let styles = field_styles(input_text_style());
+            spans.extend(field.paint(width, &styles, focused, "").spans);
+            frame.render_widget(Paragraph::new(Line::from(spans)), area);
             row = row.saturating_add(1);
         }
         let footer = Rect {
@@ -2592,6 +2620,7 @@ mod tests {
     use super::*;
     use crate::components::buffer_text;
     use crate::components::key as key_event;
+    use crate::components::keybindings::key as kb;
 
     const FRAME_WIDTH: u16 = 100;
     const FRAME_HEIGHT: u16 = 24;
@@ -2620,6 +2649,8 @@ mod tests {
     const BODY_WINS: &str = "a landed body replaces the row's preview";
     const STALE_BODY: &str = "a body for a run that is no longer selected must be dropped";
     const SESSION_TITLE: &str = "yesterday's research";
+    /// Names the earlier session's run and nothing else.
+    const TITLE_FILTER: &str = "yesterday";
     const WRONG_RUN: &str = "a control must name the selected run";
     const INERT_KEY: &str = "a control the run cannot take must do nothing";
     const TRANSCRIPT: &str = "Enter on an agent row opens its transcript";
@@ -3246,7 +3277,7 @@ mod tests {
         let mut inspector = open_with(vec![budget_limited(ADMITTED)]);
 
         let asked = inspector.handle_key(key_event(KeyCode::Char(RESUME_KEY)));
-        let prompt = inspector.budget.as_ref().map(|prompt| prompt.input.value());
+        let prompt = inspector.budget.as_ref().map(|prompt| prompt.input.text());
 
         assert_eq!(asked, InspectorAction::Consumed);
         assert_eq!(
@@ -4339,6 +4370,36 @@ mod tests {
 
         assert_eq!(action, InspectorAction::Inspect(OLD_RUN_ID.into()));
         assert_eq!(inspector.entries().len(), 1);
+    }
+
+    /// Cutting the filter widens the list around the run it narrowed to, so
+    /// that run stays selected and nothing new needs inspecting.
+    #[test]
+    fn clipboard_chords_hand_the_selected_filter_back() {
+        let mut inspector = open_with(vec![run(RUN_ID, RunStatus::Active, Vec::new())]);
+        assert!(inspector.fill_history(history()).is_none());
+        let _ = inspector.handle_key(key_event(KeyCode::Char(FILTER_KEY)));
+        assert_eq!(
+            inspector.handle_paste(TITLE_FILTER),
+            Some(InspectorAction::Inspect(OLD_RUN_ID.into()))
+        );
+        let _ = inspector.handle_key(kb::SELECT_ALL.to_key_event());
+
+        assert_eq!(
+            inspector.handle_key(kb::QUIT.to_key_event()),
+            InspectorAction::Copy {
+                text: TITLE_FILTER.into(),
+                label: COPIED_SELECTION,
+            }
+        );
+        assert_eq!(
+            inspector.handle_key(kb::CUT.to_key_event()),
+            InspectorAction::Cut {
+                text: TITLE_FILTER.into(),
+                inspect: None,
+            }
+        );
+        assert_eq!(inspector.selected(), Some(OLD_RUN_ID));
     }
 
     #[test]

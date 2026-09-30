@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use caudra_grab::grab_scope;
 use caudra_storage::id::CaudraId;
+use caudra_workbench::text_field::{FieldKind, TextField, TextKey};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
@@ -20,7 +21,6 @@ use super::{Hint, Overlay};
 use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::repaint::Cadence;
-use crate::text_buffer::TextBuffer;
 
 const TITLE: &str = " Sessions ";
 const MAX_VISIBLE: u16 = 15;
@@ -90,6 +90,7 @@ pub enum SessionPickerAction {
     MoveCurrent,
     MigrateDirectory,
     Closed,
+    Copy(String),
 }
 
 struct SessionItem {
@@ -135,7 +136,7 @@ pub struct SessionPicker {
     /// `Some` while the rename box is up. Renaming borrows the whole picker
     /// rather than opening a second overlay, so `Esc` cannot leave a form
     /// stranded over a list that has moved on.
-    rename: Option<(CaudraId, TextBuffer)>,
+    rename: Option<(CaudraId, TextField)>,
     pending_delete: Option<CaudraId>,
     now: u64,
 }
@@ -305,8 +306,9 @@ impl SessionPicker {
 
     pub fn handle_paste(&mut self, text: &str) -> bool {
         match &mut self.rename {
-            Some((_, buffer)) => {
-                buffer.insert_text(text);
+            Some((_, field)) => {
+                field.paste(text);
+                self.sync_rename_text();
                 true
             }
             None => self.picker.handle_paste(text),
@@ -331,10 +333,7 @@ impl SessionPicker {
         let Some(item) = self.picker.selected_item() else {
             return SessionPickerAction::Consumed;
         };
-        let mut buffer = TextBuffer::new(item.title.clone());
-        let end = buffer.value().chars().count();
-        buffer.set_cursor_offset(end);
-        self.rename = Some((item.id, buffer));
+        self.rename = Some((item.id, TextField::with_text(FieldKind::Line, &item.title)));
         self.picker.set_title(RENAME_TITLE);
         self.picker.set_footer_builder(rename_footer);
         self.sync_rename_text();
@@ -342,24 +341,21 @@ impl SessionPicker {
     }
 
     /// The rename box is the picker's own search line, so what the user types
-    /// is echoed there rather than in a second widget. The caret is mirrored
-    /// too, because `set_search_text` parks it at the end of the line.
+    /// is echoed there, caret and selection too, rather than in a second
+    /// widget.
     fn sync_rename_text(&mut self) {
-        let Some((_, buffer)) = &self.rename else {
-            return;
-        };
-        let (text, cursor) = (buffer.value(), buffer.cursor_offset());
-        self.picker.set_search_text(&text);
-        self.picker.set_search_cursor(cursor);
+        if let Some((_, field)) = &self.rename {
+            self.picker.mirror_search(field);
+        }
     }
 
     fn key_renaming(&mut self, key: KeyEvent) -> SessionPickerAction {
-        let Some((id, buffer)) = &mut self.rename else {
+        let Some((id, field)) = &mut self.rename else {
             return SessionPickerAction::Consumed;
         };
         match key.code {
             KeyCode::Enter => {
-                let title = buffer.value().trim().to_owned();
+                let title = field.text().trim().to_owned();
                 let id = *id;
                 self.end_rename();
                 if title.is_empty() {
@@ -372,9 +368,12 @@ impl SessionPicker {
                 SessionPickerAction::Consumed
             }
             _ => {
-                buffer.handle_key(key);
+                let edit = field.handle_key(key);
                 self.sync_rename_text();
-                SessionPickerAction::Consumed
+                match edit {
+                    TextKey::Copy(text) | TextKey::Cut(text) => SessionPickerAction::Copy(text),
+                    _ => SessionPickerAction::Consumed,
+                }
             }
         }
     }
@@ -427,6 +426,7 @@ impl SessionPicker {
                 SessionPickerAction::Closed
             }
             PickerAction::Key(key) => self.handle_key(key),
+            PickerAction::Copy(text) => SessionPickerAction::Copy(text),
         }
     }
 }
@@ -523,6 +523,7 @@ mod tests {
     const OTHER_ROOT: &str = "/work/app-login";
     const OTHER_BRANCH: &str = "feature/login";
     const OTHER_SECTION: &str = "feature/login · /work/app-login";
+    const COPY_KEEPS_RENAME: &str = "copying from the rename box closed it";
 
     fn char_key(c: char) -> KeyEvent {
         key_event(KeyCode::Char(c))
@@ -776,6 +777,34 @@ mod tests {
             picker.handle_key(key_event(KeyCode::Enter)),
             SessionPickerAction::Rename { title, .. } if title == kept
         ));
+    }
+
+    /// A paste lands in the rename box and in its echo alike, as typing does.
+    #[test]
+    fn a_paste_into_the_rename_reaches_the_echo() {
+        let mut picker = opened(vec![row(FIRST, TITLE_A, 10, None)]);
+        picker.handle_key(key::RENAME_SESSION.to_key_event());
+        picker.handle_key(key::SELECT_ALL.to_key_event());
+
+        assert!(picker.handle_paste(TITLE_B));
+
+        assert_eq!(picker.picker.search_text(), TITLE_B);
+        assert!(matches!(
+            picker.handle_key(key_event(KeyCode::Enter)),
+            SessionPickerAction::Rename { title, .. } if title == TITLE_B
+        ));
+    }
+
+    #[test]
+    fn ctrl_c_copies_the_selected_rename_and_keeps_the_box() {
+        let mut picker = opened(vec![row(FIRST, TITLE_A, 10, None)]);
+        picker.handle_key(key::RENAME_SESSION.to_key_event());
+        picker.handle_key(key::SELECT_ALL.to_key_event());
+
+        let action = picker.handle_key(key::QUIT.to_key_event());
+
+        assert!(matches!(action, SessionPickerAction::Copy(text) if text == TITLE_A));
+        assert!(picker.rename.is_some(), "{COPY_KEEPS_RENAME}");
     }
 
     #[test]

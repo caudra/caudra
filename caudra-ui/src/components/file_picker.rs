@@ -15,20 +15,20 @@ use ratatui::widgets::Paragraph;
 use tracing::warn;
 
 use caudra_grab::grab_scope;
+use caudra_workbench::keys::{LIST_FIRST, LIST_LAST};
+use caudra_workbench::text_field::{FieldKind, TextField, TextKey};
 use caudra_workbench::{
     BackendDriver, BackendError, BackendEvent, ResourceEntry, WorkbenchBackend, WorkbenchPath,
 };
 use caudra_workspace::{WorkspacePath, WorkspaceSession};
 
 use crate::animation::spinner_frame;
-use crate::components::Overlay;
 use crate::components::file_walk::{self, Walk};
 use crate::components::keybindings::key;
-use crate::components::match_spans;
 use crate::components::modal::Modal;
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
+use crate::components::{Overlay, chevron_span, field_styles, input_text_style, match_spans};
 use crate::repaint::{Cadence, Dirty};
-use crate::text_buffer::{EditResult, TextBuffer};
 use crate::theme;
 
 const TITLE: &str = " Files ";
@@ -49,6 +49,7 @@ const MAX_MATERIALIZED: u32 = 640;
 pub enum FilePickerModalAction {
     Consumed,
     Select(String),
+    Copy(String),
     Close,
 }
 
@@ -69,7 +70,7 @@ struct Session {
     matches: Vec<Match>,
     total_matches: u32,
 
-    search: TextBuffer,
+    search: TextField,
     selected: usize,
     scroll_offset: usize,
     viewport_height: usize,
@@ -145,7 +146,7 @@ impl FilePickerModal {
             matcher: Matcher::new(Config::DEFAULT.match_paths()),
             matches: Vec::new(),
             total_matches: 0,
-            search: TextBuffer::new(String::new()),
+            search: TextField::new(FieldKind::Line),
             selected: 0,
             scroll_offset: 0,
             viewport_height: 0,
@@ -177,7 +178,7 @@ impl FilePickerModal {
             matcher: Matcher::new(Config::DEFAULT.match_paths()),
             matches: Vec::new(),
             total_matches: 0,
-            search: TextBuffer::new(String::new()),
+            search: TextField::new(FieldKind::Line),
             selected: 0,
             scroll_offset: 0,
             viewport_height: 0,
@@ -233,8 +234,9 @@ impl FilePickerModal {
         let Some(s) = &mut self.session else {
             return false;
         };
-        s.search.insert_text(text);
-        reparse_pattern(s);
+        if s.search.paste(text).changed() {
+            reparse_pattern(s);
+        }
         true
     }
 
@@ -267,15 +269,17 @@ impl FilePickerModal {
             }
             // A whole list's worth of steps lands on the end it was aimed at,
             // because `move_selection` clamps.
-            _ if key::DOC_TOP.matches(key) => move_selection(s, -(s.matches.len() as isize)),
-            _ if key::DOC_BOTTOM.matches(key) => move_selection(s, s.matches.len() as isize),
-            _ if key::SCROLL_LINE_UP.matches(key) => move_selection(s, -1),
-            _ if key::SCROLL_LINE_DOWN.matches(key) => move_selection(s, 1),
+            _ if LIST_FIRST.matches(key) => move_selection(s, -(s.matches.len() as isize)),
+            _ if LIST_LAST.matches(key) => move_selection(s, s.matches.len() as isize),
             // Everything the list itself does not claim edits the search
             // line, which owns the whole editing keymap.
             _ => {
-                if s.search.handle_key(key) == EditResult::Changed {
+                let edit = s.search.handle_key(key);
+                if edit.changed() {
                     reparse_pattern(s);
+                }
+                if let TextKey::Copy(text) | TextKey::Cut(text) = edit {
+                    return FilePickerModalAction::Copy(text);
                 }
             }
         }
@@ -453,7 +457,7 @@ impl FilePickerModal {
             TITLE
         };
 
-        let has_query_without_matches = s.matches.is_empty() && !s.search.value().is_empty();
+        let has_query_without_matches = s.matches.is_empty() && !s.search.is_empty();
         let max_visible = area.height.saturating_sub(SEARCH_ROW + 2);
         let content_rows = if has_query_without_matches {
             1
@@ -501,7 +505,7 @@ impl Overlay for FilePickerModal {
 
 fn reparse_pattern(s: &mut Session) {
     invalidate_mouse_geometry(s);
-    let query = s.search.value();
+    let query = s.search.text();
     s.nucleo
         .pattern
         .reparse(0, &query, CaseMatching::Smart, Normalization::Smart, false);
@@ -597,7 +601,7 @@ fn render_list(frame: &mut Frame, area: Rect, s: &mut Session) {
     let t = theme::current();
 
     if s.matches.is_empty() {
-        if !s.search.value().is_empty() {
+        if !s.search.is_empty() {
             frame.render_widget(
                 Paragraph::new(vec![Line::from(Span::styled(NO_MATCHES, t.item_desc))]),
                 area,
@@ -645,29 +649,17 @@ fn render_list(frame: &mut Frame, area: Rect, s: &mut Session) {
 
 fn render_search(frame: &mut Frame, area: Rect, s: &Session) {
     grab_scope!("file_picker_search", area);
-    let t = theme::current();
-    let query = s.search.value();
-    let cursor_byte = TextBuffer::char_to_byte(&query, s.search.x());
-    let (before, rest) = query.split_at(cursor_byte);
-    let mut chars = rest.chars();
-    let cursor_char = chars.next().unwrap_or(' ');
-    let after = chars.as_str();
-
-    let mut spans = vec![super::chevron_span()];
-
+    let mut spans = vec![chevron_span()];
     if s.walk == Walk::Running {
         let ch = spinner_frame(s.started_at.elapsed().as_millis());
-        spans.push(Span::styled(format!("{ch} "), t.item_desc));
+        spans.push(Span::styled(format!("{ch} "), theme::current().item_desc));
     }
-
-    let text = super::input_text_style();
-    spans.extend([
-        Span::styled(before.to_owned(), text),
-        Span::styled(cursor_char.to_string(), t.cursor),
-        Span::styled(after.to_owned(), text),
-    ]);
-
-    frame.render_widget(Paragraph::new(vec![Line::from(spans)]), area);
+    let width = usize::from(area.width).saturating_sub(spans.iter().map(Span::width).sum());
+    let field = s
+        .search
+        .paint(width, &field_styles(input_text_style()), true, "");
+    spans.extend(field.spans);
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn build_highlighted_line<'a>(
@@ -711,6 +703,9 @@ mod tests {
 
     const BAR_LOST_THE_PRESS: &str = "the row under the scrollbar took the press";
     const QUERY_UNTOUCHED: &str = "the navigation key edited the search line";
+    const SELECTION_MOVED: &str = "a caret motion moved the match selection";
+    const COPY_CLOSED: &str = "copying the query closed the picker";
+    const QUERY: &str = "src main";
     /// More matches than the 80x24 test terminal can show, so the bar has a
     /// track to press on.
     const OVERFLOWING_MATCHES: usize = 50;
@@ -778,7 +773,7 @@ mod tests {
             matcher: Matcher::new(Config::DEFAULT.match_paths()),
             matches: Vec::new(),
             total_matches: 0,
-            search: TextBuffer::new(String::new()),
+            search: TextField::new(FieldKind::Line),
             selected: 0,
             scroll_offset: 0,
             viewport_height: 0,
@@ -987,7 +982,7 @@ mod tests {
         let (mut picker, _done_tx) = pending_picker();
         picker.handle_key(key(KeyCode::Char('m')));
         picker.handle_key(key(KeyCode::Char('a')));
-        assert_eq!(picker.session.as_ref().unwrap().search.value(), "ma");
+        assert_eq!(picker.session.as_ref().unwrap().search.text(), "ma");
     }
 
     #[test]
@@ -1085,23 +1080,52 @@ mod tests {
         assert_eq!(s.selected, expected);
     }
 
-    /// The four navigation keys belong to the list, not to the search line
-    /// they used to edit.
-    #[test_case(KeyCode::Home,     25, 0  ; "home_selects_first")]
-    #[test_case(KeyCode::End,      25, 49 ; "end_selects_last")]
-    #[test_case(KeyCode::PageUp,   25, 20 ; "page_up_retreats_a_half_page")]
-    #[test_case(KeyCode::PageDown, 25, 30 ; "page_down_advances_a_half_page")]
-    fn navigation_keys_move_the_match_list(code: KeyCode, start: usize, expected: usize) {
+    #[test_case(LIST_FIRST.to_key_event(), 25, 0  ; "ctrl_home_selects_first")]
+    #[test_case(LIST_LAST.to_key_event(),  25, 49 ; "ctrl_end_selects_last")]
+    #[test_case(key(KeyCode::PageUp),      25, 20 ; "page_up_retreats_a_half_page")]
+    #[test_case(key(KeyCode::PageDown),    25, 30 ; "page_down_advances_a_half_page")]
+    fn navigation_keys_move_the_match_list(event: KeyEvent, start: usize, expected: usize) {
         let mut picker = picker_with_matches(50);
         let s = picker.session.as_mut().unwrap();
         s.viewport_height = 10;
         s.selected = start;
 
-        picker.handle_key(key(code));
+        picker.handle_key(event);
 
         let s = picker.session.as_ref().unwrap();
         assert_eq!(s.selected, expected);
-        assert!(s.search.value().is_empty(), "{QUERY_UNTOUCHED}");
+        assert!(s.search.is_empty(), "{QUERY_UNTOUCHED}");
+    }
+
+    /// Home and End move the caret, and the selection stays where it was.
+    #[test_case(KeyCode::Home, 0            ; "home")]
+    #[test_case(KeyCode::End,  QUERY.len() ; "end")]
+    fn home_and_end_move_the_search_caret(code: KeyCode, caret: usize) {
+        let mut picker = picker_with_matches(50);
+        let s = picker.session.as_mut().unwrap();
+        s.viewport_height = 10;
+        s.search.set_text(QUERY);
+        s.search.set_cursor_offset(1);
+        s.selected = 25;
+
+        picker.handle_key(key(code));
+
+        let s = picker.session.as_ref().unwrap();
+        assert_eq!(s.search.cursor_offset(), caret);
+        assert_eq!(s.selected, 25, "{SELECTION_MOVED}");
+    }
+
+    #[test]
+    fn ctrl_c_copies_the_selected_query_and_keeps_the_picker() {
+        let (mut picker, _done_tx) = pending_picker();
+        picker.handle_paste(QUERY);
+        picker.handle_key(kb::SELECT_ALL.to_key_event());
+
+        assert!(matches!(
+            picker.handle_key(kb::QUIT.to_key_event()),
+            FilePickerModalAction::Copy(text) if text == QUERY
+        ));
+        assert!(picker.is_open(), "{COPY_CLOSED}");
     }
 
     #[test]
@@ -1129,7 +1153,7 @@ mod tests {
         let (mut picker, _done_tx) = pending_picker();
         picker.handle_key(key(KeyCode::Char('a')));
         assert!(picker.handle_paste("bc"));
-        assert_eq!(picker.session.as_ref().unwrap().search.value(), "abc");
+        assert_eq!(picker.session.as_ref().unwrap().search.text(), "abc");
     }
 
     #[test]
@@ -1163,7 +1187,7 @@ mod tests {
         picker.handle_key(key(KeyCode::Char('a')));
         picker.handle_key(key(KeyCode::Char('b')));
         picker.handle_key(key(KeyCode::Backspace));
-        assert_eq!(picker.session.as_ref().unwrap().search.value(), "a");
+        assert_eq!(picker.session.as_ref().unwrap().search.text(), "a");
     }
 
     #[test]
@@ -1173,7 +1197,7 @@ mod tests {
             picker.handle_key(key(KeyCode::Char(c)));
         }
         picker.handle_key(kb::DELETE_WORD.to_key_event());
-        assert_eq!(picker.session.as_ref().unwrap().search.value(), "src ");
+        assert_eq!(picker.session.as_ref().unwrap().search.text(), "src ");
     }
 
     #[test_case(10, 0, 6 ; "scrolls_down_when_below")]

@@ -13,6 +13,8 @@ mod search;
 
 use caudra_docs::{DocsLibrary, Library, Target};
 use caudra_grab::grab_scope;
+use caudra_workbench::keys::{LIST_FIRST, LIST_LAST};
+use caudra_workbench::text_field::{TextField, TextKey};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
@@ -23,7 +25,10 @@ use crate::components::document_view::{COPIED_SELECTION, Jump};
 use crate::components::keybindings::key;
 use crate::components::list_picker::truncate_label;
 use crate::components::modal::{CLOSE_HINT, ESC_LABEL, FooterHits, FooterLine, Modal, SEPARATOR};
-use crate::components::{Overlay, PAN_STEP, escape_terminal_controls, plain_char};
+use crate::components::{
+    Overlay, PAN_STEP, chevron_span, escape_terminal_controls, field_styles, input_text_style,
+    plain_char,
+};
 use crate::theme::{self, Theme};
 use contents::Contents;
 use reader::{Reader, ReaderMouse};
@@ -120,11 +125,12 @@ struct Current {
 }
 
 /// What a key did to a list: nothing the modal sees, a way back to the
-/// reader, or a place to open.
+/// reader, a place to open, or text its field handed to the clipboard.
 enum Pick {
     Stay,
     Leave,
     Open(Target),
+    Copy(String),
 }
 
 /// What every pane is drawn with.
@@ -242,17 +248,15 @@ impl DocsModal {
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DocsAction {
         // Before the panes, because a sweep the reader can see is what the
-        // chord is for. With nothing swept, or the sweep out of sight with the
-        // reader, it is the way out.
+        // chord is for, and after it a selection in the focused field. With
+        // neither, or the sweep out of sight with the reader, it is the way out.
         if key::QUIT.matches(key) {
             return self
                 .reader_shown()
                 .then(|| self.reader.selected_text())
                 .flatten()
-                .map_or(DocsAction::Close, |text| DocsAction::Copy {
-                    text,
-                    label: COPIED_SELECTION,
-                });
+                .or_else(|| self.field_selection())
+                .map_or(DocsAction::Close, copied);
         }
         match self.pane {
             Pane::Reader => self.reader_key(key),
@@ -417,6 +421,7 @@ impl DocsModal {
             Pick::Stay => {}
             Pick::Leave => self.pane = Pane::Reader,
             Pick::Open(target) => self.open_entry(target),
+            Pick::Copy(text) => return copied(text),
         }
         DocsAction::Consumed
     }
@@ -426,8 +431,17 @@ impl DocsModal {
             Pick::Stay => {}
             Pick::Leave => self.pane = Pane::Reader,
             Pick::Open(target) => self.open_hit(target),
+            Pick::Copy(text) => return copied(text),
         }
         DocsAction::Consumed
+    }
+
+    fn field_selection(&self) -> Option<String> {
+        match self.pane {
+            Pane::Reader => None,
+            Pane::Contents => self.contents.selected_text(),
+            Pane::Search => self.search.selected_text(),
+        }
     }
 
     fn step_link(&mut self, forward: bool) -> DocsAction {
@@ -687,7 +701,9 @@ fn clicked(pressed: &mut Option<usize>, kind: MouseEventKind, row: Option<usize>
 
 /// Where a list's selection goes for a movement key, or `None` for a key that
 /// moves nothing. `page` is how far the paging keys move. A selection left past
-/// the end of a list that lost rows moves from its last row.
+/// the end of a list that lost rows moves from its last row. Every list here
+/// sits under a field, which keeps the editing keys: `Home` and `End` among
+/// them, so the list's ends are a `Ctrl` away.
 fn list_move(key: KeyEvent, selected: usize, count: usize, page: usize) -> Option<usize> {
     let last = count.saturating_sub(1);
     let selected = selected.min(last);
@@ -699,12 +715,35 @@ fn list_move(key: KeyEvent, selected: usize, count: usize, page: usize) -> Optio
         KeyCode::Down => down(1),
         _ if key::PAGE_UP.matches(key) || key::SCROLL_HALF_UP.matches(key) => up(page),
         _ if key::PAGE_DOWN.matches(key) => down(page),
-        _ if key::SCROLL_LINE_UP.matches(key) => up(1),
-        _ if key::SCROLL_LINE_DOWN.matches(key) => down(1),
-        _ if key::DOC_TOP.matches(key) || key::SCROLL_TOP.matches(key) => 0,
-        _ if key::DOC_BOTTOM.matches(key) || key::SCROLL_BOTTOM.matches(key) => last,
+        _ if LIST_FIRST.matches(key) || key::SCROLL_TOP.matches(key) => 0,
+        _ if LIST_LAST.matches(key) || key::SCROLL_BOTTOM.matches(key) => last,
         _ => return None,
     })
+}
+
+/// What a key the list left to its field did: a copy or a cut goes to the
+/// clipboard, and anything else leaves the list where it is.
+fn field_pick(edit: TextKey) -> Pick {
+    match edit {
+        TextKey::Copy(text) | TextKey::Cut(text) => Pick::Copy(text),
+        _ => Pick::Stay,
+    }
+}
+
+/// A focused field behind the prompt chevron, panned to keep its caret shown.
+fn prompt_line(field: &TextField, width: u16) -> Line<'static> {
+    let chevron = chevron_span();
+    let width = usize::from(width).saturating_sub(chevron.width());
+    let mut line = field.paint(width, &field_styles(input_text_style()), true, "");
+    line.spans.insert(0, chevron);
+    line
+}
+
+fn copied(text: String) -> DocsAction {
+    DocsAction::Copy {
+        text,
+        label: COPIED_SELECTION,
+    }
 }
 
 #[cfg(test)]
@@ -805,6 +844,7 @@ mod tests {
     /// links to the modes.
     const OPENING_LINES: usize = 3;
     const STALE_SELECTION: usize = 5;
+    const MIDDLE_ROW: usize = 1;
     const SHRUNK_TO: usize = 3;
     const LIST_PAGE: usize = 2;
     const FILTER: &str = "prm";
@@ -838,6 +878,7 @@ mod tests {
     const HIDDEN_FOLLOWED: &str = "Enter followed a link scrolled out of sight";
     const NOT_MARKDOWN: &str = "the copy is not the Markdown behind the rows swept";
     const WRONG_CTRL_C: &str = "Ctrl+C copies a sweep the reader shows, and closes otherwise";
+    const FIELD_NOT_COPIED: &str = "the focused field's selection did not reach the clipboard";
     const PLACE_LOST: &str = "a resize moved the reading position";
 
     fn modal() -> DocsModal {
@@ -1402,6 +1443,14 @@ mod tests {
         );
     }
 
+    #[test_case(LIST_FIRST.to_key_event(), Some(0) ; "ctrl_home_selects_the_first_row")]
+    #[test_case(LIST_LAST.to_key_event(), Some(SHRUNK_TO - 1) ; "ctrl_end_selects_the_last_row")]
+    #[test_case(press(KeyCode::Home), None ; "home_is_left_to_the_field")]
+    #[test_case(press(KeyCode::End), None ; "end_is_left_to_the_field")]
+    fn only_ctrl_takes_a_list_to_its_ends(event: KeyEvent, expected: Option<usize>) {
+        assert_eq!(list_move(event, MIDDLE_ROW, SHRUNK_TO, LIST_PAGE), expected);
+    }
+
     #[test]
     fn enter_leaves_a_selected_link_scrolled_out_of_sight_alone() {
         let mut modal = modal();
@@ -1472,5 +1521,20 @@ mod tests {
 
         let action = modal.handle_key(key::QUIT.to_key_event());
         assert_eq!(action != DocsAction::Close, copies, "{WRONG_CTRL_C}");
+    }
+
+    #[test_case('c', key::QUIT.to_key_event() ; "ctrl_c_in_the_contents_filter")]
+    #[test_case('/', key::QUIT.to_key_event() ; "ctrl_c_in_the_search_query")]
+    #[test_case('/', key::CUT.to_key_event() ; "a_cut_from_the_search_query")]
+    fn the_focused_fields_selection_goes_to_the_clipboard(pane: char, chord: KeyEvent) {
+        let mut modal = modal();
+        modal.handle_key(press(KeyCode::Char(pane)));
+        typed(&mut modal, FILTER);
+        modal.handle_key(key::SELECT_ALL.to_key_event());
+        assert_eq!(
+            modal.handle_key(chord),
+            copied(FILTER.to_owned()),
+            "{FIELD_NOT_COPIED}"
+        );
     }
 }

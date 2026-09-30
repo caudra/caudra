@@ -54,7 +54,6 @@ pub(super) fn fields(kind: &Kind, provider: String, template: Option<&Template>)
         fields.push(LiveField {
             label,
             editor,
-            secret: false,
             choices,
         });
     };

@@ -177,8 +177,8 @@ pub mod key {
     };
     pub const COMMAND_PALETTE: Bind = ctrl_bind!('p');
     pub const SCROLL_HALF_UP: Bind = ctrl_bind!('u');
-    /// Shift is the only free arrow modifier: plain, Ctrl, Alt and Super all
-    /// move the input cursor, and neither text buffer inspects Shift.
+    /// Text fields take plain, Ctrl, Super and Shift arrows, and Alt cannot be
+    /// a default, so these pan only while something on screen can move.
     pub const PAN_LEFT: Bind = Bind {
         code: KeyCode::Left,
         modifiers: KeyModifiers::SHIFT,
@@ -283,10 +283,7 @@ pub mod key {
         label: "Space",
     };
     pub const REFRESH: Bind = ctrl_bind!('r');
-    pub const SUSPEND: Bind = ctrl_bind!('z');
     pub const DELETE: Bind = ctrl_bind!('d');
-    pub const KILL_LINE: Bind = ctrl_bind!('k');
-    pub const LINE_END: Bind = ctrl_bind!('e');
     /// The editor chords the composer, the paste editor and the review note
     /// share with the workbench.
     pub const DELETE_WORD: Bind = Bind::from_workbench(wb::DELETE_WORD);
@@ -359,6 +356,7 @@ pub mod leader {
 pub enum KeybindContext {
     General,
     Editing,
+    TextFields,
     Streaming,
     Picker,
     FormInput,
@@ -395,6 +393,7 @@ impl KeybindContext {
         match self {
             Self::General => "General",
             Self::Editing => "Editing",
+            Self::TextFields => "Text Fields",
             Self::Streaming => "While Streaming",
             Self::Picker => "Pickers",
             Self::FormInput => "Form",
@@ -458,21 +457,6 @@ impl KeybindContext {
             | Self::WorkbenchSearch
             | Self::WorkbenchTransfer => Some(Self::Workbench),
             _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Platform {
-    All,
-    UnixOnly,
-}
-
-impl Platform {
-    pub const fn is_visible(self) -> bool {
-        match self {
-            Self::All => true,
-            Self::UnixOnly => cfg!(unix),
         }
     }
 }
@@ -561,7 +545,6 @@ pub struct Keybind {
     pub label: KeyLabel,
     pub description: &'static str,
     pub context: KeybindContext,
-    pub platform: Platform,
 }
 
 /// Chords in a shared context that still open one experiment's surface.
@@ -579,13 +562,11 @@ const FEATURE_CHORDS: &[(KeybindContext, &str, Feature)] = &[
 ];
 
 impl Keybind {
-    /// Whether help and the leader panel list this binding: it runs on this
-    /// platform and needs no experiment this process left off.
+    /// Whether help and the leader panel list this binding: it needs no
+    /// experiment this process left off.
     pub fn is_visible(&self, features: FeatureFlags) -> bool {
-        self.platform.is_visible()
-            && self
-                .feature()
-                .is_none_or(|feature| features.enabled(feature))
+        self.feature()
+            .is_none_or(|feature| features.enabled(feature))
     }
 
     pub fn feature(&self) -> Option<Feature> {
@@ -605,1321 +586,1075 @@ pub const KEYBINDS: &[Keybind] = &[
         label: KeyLabel::Single(key::SAVE.label),
         description: "Validate and save sandbox defaults; export preview saves as a new file",
         context: KeybindContext::SandboxManager,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt("Tab", "Shift+Tab"),
         description: "Move focus between sandbox list and form fields (never insert a tab)",
         context: KeybindContext::SandboxManager,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("Enter"),
         description: "Inspect/edit; confirmations default to Keep, not Accept",
         context: KeybindContext::SandboxManager,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(key::SANDBOX_APPLY.label),
         description: "Apply to draft, or preview a live action for separate confirmation",
         context: KeybindContext::SandboxManager,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("F2"),
         description: "Choose provider, image, policy or purpose-store credential reference",
         context: KeybindContext::SandboxManager,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("Esc"),
         description: "Close, not cancel operations; retain live drafts; offer Save/Discard for configuration",
         context: KeybindContext::SandboxManager,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Multi(&["1", "2", "3", "4"]),
         description: "Switch Instances, Profiles, Images, Providers when not editing text",
         context: KeybindContext::SandboxManager,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("/"),
         description: "Search the sandbox master list",
         context: KeybindContext::SandboxManager,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Multi(&["n", "d", "Delete"]),
         description: "Profiles: new, duplicate or stage deletion; Instances: d detaches, Delete reviews deletion",
         context: KeybindContext::SandboxManager,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt("g", "t"),
         description: "Browse and edit reusable Network or Transfer policies from Profiles",
         context: KeybindContext::SandboxManager,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt("i", "x"),
         description: "Import a strict configuration draft or preview a reference-only export",
         context: KeybindContext::SandboxManager,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Multi(&["c", "r", "a"]),
         description: "Compare baseline/draft/external file, reload, or save as a new private file",
         context: KeybindContext::SandboxManager,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Alt(key::UNDO.label, "Ctrl+Y"),
-        description: "Undo/redo sandbox field text; paste and mouse selection use the shared editor",
-        context: KeybindContext::SandboxManager,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Multi(&["a", "u", "p", "e"]),
         description: "Instances: review Attach, Resume, Pause or Extend",
         context: KeybindContext::SandboxManager,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Multi(&["v", "r", "z"]),
         description: "Profiles: Create VM; Instances: Reconcile or explicitly Cancel create",
         context: KeybindContext::SandboxManager,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt("h", "k"),
         description: "Doctor; Providers: edit lifecycle credential in its purpose store",
         context: KeybindContext::SandboxManager,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Multi(&["i", "b", "g", "l"]),
         description: "Images: approved offline Import, Build, GC or Inspect",
         context: KeybindContext::SandboxManager,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Multi(&["g", "F4", "F6"]),
         description: "Live network preview/apply; Test rules (no probe); discard action draft",
         context: KeybindContext::SandboxManager,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(key::QUIT.label),
         description: "Quit / clear input (copies instead when text is selected)",
         context: KeybindContext::General,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("Ctrl+D Ctrl+D"),
         description: "Exit",
         context: KeybindContext::General,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(key::COMMAND_PALETTE.label),
         description: "Command palette",
         context: KeybindContext::General,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(key::LEADER.label),
         description: "Leader: lists the chords below, then runs the one you press",
         context: KeybindContext::General,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt(key::HELP.label, leader::HELP.label),
         description: "Show keybindings",
         context: KeybindContext::General,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(key::SEARCH.label),
         description: "Search messages",
         context: KeybindContext::General,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(leader::COPY_MESSAGE.label),
         description: "Copy last reply as markdown",
         context: KeybindContext::General,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(leader::REVIEW.label),
         description: "Review the last reply",
         context: KeybindContext::General,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt(key::FILE_PICKER.label, leader::FILE_PICKER.label),
         description: "File picker",
         context: KeybindContext::General,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt(key::OPEN_EDITOR.label, leader::PLAN_EDITOR.label),
         description: "Open the plan in the workbench",
         context: KeybindContext::General,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(leader::PLAN_TOGGLE.label),
         description: "Toggle plan / todo panel",
         context: KeybindContext::General,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(leader::TASKS.label),
         description: "Open tasks",
         context: KeybindContext::General,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(leader::WORKFLOWS.label),
         description: "Open the workflow inspector",
         context: KeybindContext::General,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(leader::SESSION_PICKER.label),
         description: "Browse sessions",
         context: KeybindContext::General,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(leader::NEW_SESSION.label),
         description: "Start a new session",
         context: KeybindContext::General,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(leader::VIEW_TOGGLE.label),
         description: "Toggle compact / expanded transcript",
         context: KeybindContext::General,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(leader::STASH_PUSH.label),
         description: "Stash the current prompt",
         context: KeybindContext::General,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(leader::STASH_POP.label),
         description: "Restore the newest stashed prompt",
         context: KeybindContext::General,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(leader::MODEL_PICKER.label),
         description: "Model picker",
         context: KeybindContext::General,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single(key::SUSPEND.label),
-        description: "Suspend process",
-        context: KeybindContext::General,
-        platform: Platform::UnixOnly,
     },
     Keybind {
         label: KeyLabel::Alt(key::PAN_LEFT.label, key::PAN_RIGHT.label),
         description: "Pan a modal too wide for the screen left / right",
         context: KeybindContext::General,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("Enter"),
         description: "Submit prompt",
         context: KeybindContext::Editing,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Multi(&["Shift+Enter", "Ctrl+Enter", "Ctrl+J"]),
-        description: "Newline",
-        context: KeybindContext::Editing,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("Tab"),
         description: "Toggle BUILD/PLAN mode",
         context: KeybindContext::Editing,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt(key::THINKING.label, SHIFT_TAB_LABEL),
         description: "Cycle reasoning effort",
         context: KeybindContext::Editing,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("/command"),
         description: "Open command palette",
         context: KeybindContext::Editing,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Alt(key::DELETE_WORD.label, mod_key!("Backspace")),
-        description: "Delete the word or path component before the cursor",
-        context: KeybindContext::Editing,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Multi(&[mod_key!("←"), mod_key!("→")]),
-        description: "Move word left / right",
-        context: KeybindContext::Editing,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single(mod_key!("Del")),
-        description: "Delete the word or path component after the cursor",
-        context: KeybindContext::Editing,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single(key::KILL_LINE.label),
-        description: "Delete to end of line",
-        context: KeybindContext::Editing,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single(wb::SELECT_ALL.label),
-        description: "Select the whole draft",
-        context: KeybindContext::Editing,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single(wb::COPY.label),
-        description: "Copy selection (clears the draft when nothing is selected)",
-        context: KeybindContext::Editing,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single(wb::CUT.label),
-        description: "Cut selection",
-        context: KeybindContext::Editing,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Alt(wb::UNDO.label, wb::REDO.label),
-        description: "Undo / redo the draft",
-        context: KeybindContext::Editing,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt(key::DOC_TOP.label, key::DOC_BOTTOM.label),
         description: "Start / end of line or transcript",
         context: KeybindContext::Editing,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt(key::PAGE_UP.label, key::PAGE_DOWN.label),
         description: "Page the draft or the transcript",
         context: KeybindContext::Editing,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(key::SCROLL_HALF_UP.label),
         description: "Scroll half page up",
         context: KeybindContext::Editing,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt(key::PAN_LEFT.label, key::PAN_RIGHT.label),
         description: "Pan a wide diagram left / right",
         context: KeybindContext::Editing,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single(key::LINE_END.label),
-        description: "Jump to end of line",
-        context: KeybindContext::Editing,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(key::SCROLL_TOP.label),
         description: "Scroll to top",
         context: KeybindContext::Editing,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(key::SCROLL_BOTTOM.label),
         description: "Scroll to bottom",
         context: KeybindContext::Editing,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt(key::POP_QUEUE.label, leader::POP_QUEUE.label),
         description: "Pop queue",
         context: KeybindContext::Editing,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("Esc Esc"),
         description: "Rewind",
         context: KeybindContext::Editing,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(leader::EDIT_INPUT.label),
         description: "Edit the prompt in the workbench",
         context: KeybindContext::Editing,
-        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt(wb::DELETE_WORD.label, wb::DELETE_WORD_BACK.label),
+        description: "Delete the word or path component before the cursor, or the selection",
+        context: KeybindContext::TextFields,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::DELETE_WORD_AFTER.label),
+        description: "Delete the word or path component after the cursor, or the selection",
+        context: KeybindContext::TextFields,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::KILL_LINE.label),
+        description: "Delete to the end of the line, or join the next line at its end",
+        context: KeybindContext::TextFields,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::KILL_TO_LINE_START.label),
+        description: "Delete to the start of the line",
+        context: KeybindContext::TextFields,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::SELECT_ALL.label),
+        description: "Select all",
+        context: KeybindContext::TextFields,
+    },
+    Keybind {
+        label: KeyLabel::Alt(wb::UNDO.label, wb::REDO.label),
+        description: "Undo / redo",
+        context: KeybindContext::TextFields,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::COPY.label),
+        description: "Copy the selection, or run the surface's own action when nothing is selected",
+        context: KeybindContext::TextFields,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::CUT.label),
+        description: "Cut the selection",
+        context: KeybindContext::TextFields,
+    },
+    Keybind {
+        label: KeyLabel::Alt(wb::WORD_LEFT.label, wb::WORD_RIGHT.label),
+        description: "Move by word",
+        context: KeybindContext::TextFields,
+    },
+    Keybind {
+        label: KeyLabel::Alt(key::DOC_TOP.label, wb::SUPER_HOME.label),
+        description: "First character of the line, then column zero",
+        context: KeybindContext::TextFields,
+    },
+    Keybind {
+        label: KeyLabel::Multi(&[
+            key::DOC_BOTTOM.label,
+            wb::LINE_END.label,
+            wb::SUPER_END.label,
+        ]),
+        description: "End of the line",
+        context: KeybindContext::TextFields,
+    },
+    Keybind {
+        label: KeyLabel::Alt(wb::TEXT_START.label, wb::TEXT_END.label),
+        description: "Start / end of the text",
+        context: KeybindContext::TextFields,
+    },
+    Keybind {
+        label: KeyLabel::Single("Shift+move"),
+        description: "Extend the selection with any move above",
+        context: KeybindContext::TextFields,
+    },
+    Keybind {
+        label: KeyLabel::Multi(&["Shift+Enter", "Ctrl+Enter", "Ctrl+J"]),
+        description: "Newline, in a field that takes more than one line",
+        context: KeybindContext::TextFields,
     },
     Keybind {
         label: KeyLabel::Single("Enter"),
         description: "Insert newline",
         context: KeybindContext::PasteEditor,
-        platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single(wb::SELECT_ALL.label),
-        description: "Select the whole text",
+        label: KeyLabel::Single(wb::PASTE.label),
+        description: "Put back what this editor last copied or cut",
         context: KeybindContext::PasteEditor,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Multi(&[wb::COPY.label, wb::CUT.label, wb::PASTE.label]),
-        description: "Copy, cut or paste the selection",
-        context: KeybindContext::PasteEditor,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Multi(&[wb::UNDO.label, wb::REDO.label]),
-        description: "Undo or redo an edit",
-        context: KeybindContext::PasteEditor,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Alt(wb::DELETE_WORD.label, mod_key!("Backspace")),
-        description: "Delete the word or path component before the cursor",
-        context: KeybindContext::PasteEditor,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("Ctrl+S"),
         description: "Save pasted text",
         context: KeybindContext::PasteEditor,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("Esc"),
         description: "Cancel editing",
         context: KeybindContext::PasteEditor,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt("↑", "↓"),
         description: "Move the caret through the passage",
         context: KeybindContext::Review,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Multi(&["Shift+↑", "Shift+↓", "Shift+←", "Shift+→"]),
         description: "Select part of the passage",
         context: KeybindContext::Review,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::SELECT_ALL.label),
         description: "Select the whole passage",
         context: KeybindContext::Review,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::COPY.label),
         description: "Copy the selection",
         context: KeybindContext::Review,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Alt(wb::DELETE_WORD.label, mod_key!("Backspace")),
-        description: "Delete the word or path component before the cursor",
-        context: KeybindContext::Review,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("Enter"),
         description: "Write a note on the selection",
         context: KeybindContext::Review,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Multi(&["e", "d"]),
         description: "Edit or delete the note under the cursor",
         context: KeybindContext::Review,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Multi(&["n", "p"]),
         description: "Jump between notes",
         context: KeybindContext::Review,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("Ctrl+S"),
         description: "Send notes to the prompt",
         context: KeybindContext::Review,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt("↑", "↓"),
         description: "Navigate input history",
         context: KeybindContext::Streaming,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("Esc Esc"),
         description: "Cancel agent",
         context: KeybindContext::Streaming,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("Enter"),
         description: "Send prompt next",
         context: KeybindContext::Streaming,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(leader::STEER_PROMPT.label),
         description: "Guide current run",
         context: KeybindContext::Streaming,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(leader::INTERRUPT_PROMPT.label),
         description: "Stop and replace current run",
         context: KeybindContext::Streaming,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt("↑", "↓"),
         description: "Navigate options",
         context: KeybindContext::FormInput,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("Enter"),
         description: "Select option",
         context: KeybindContext::FormInput,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("Esc"),
         description: "Close",
         context: KeybindContext::FormInput,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt("↑", "↓"),
         description: "Move between records",
         context: KeybindContext::Logs,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("Enter"),
         description: "Expand or collapse the selected record",
         context: KeybindContext::Logs,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("Tab"),
         description: "Filter to the selected record's tool call, request, or session",
         context: KeybindContext::Logs,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("f"),
         description: "Follow new records or pause",
         context: KeybindContext::Logs,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("w"),
         description: "Wrap long records onto more rows",
         context: KeybindContext::Logs,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt("\u{2190}", "\u{2192}"),
         description: "Pan across a record too wide for the pane",
         context: KeybindContext::Logs,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("Home"),
         description: "Back to the left margin",
         context: KeybindContext::Logs,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("l"),
         description: "Cycle the minimum level, or click it in the footer",
         context: KeybindContext::Logs,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("/"),
         description: "Fuzzy filter, space separates terms",
         context: KeybindContext::Logs,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt("y", "Y"),
         description: "Copy the record or its raw JSON",
         context: KeybindContext::Logs,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("Esc"),
         description: "Close",
         context: KeybindContext::Logs,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt("↑", "↓"),
         description: "Scroll the page, or move through the contents or the results",
         context: KeybindContext::Docs,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt("\u{2190}", "\u{2192}"),
         description: "Pan across a row too wide for the reader",
         context: KeybindContext::Docs,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt("n", "p"),
         description: "Next or previous heading",
         context: KeybindContext::Docs,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt("Tab", SHIFT_TAB_LABEL),
         description: "Select the next or previous link on screen",
         context: KeybindContext::Docs,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("Enter"),
         description: "Follow the link, or open the page or result; links out open in the browser",
         context: KeybindContext::Docs,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt("Backspace", "["),
         description: "Back to the place a link or result was opened from",
         context: KeybindContext::Docs,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("]"),
         description: "Forward again",
         context: KeybindContext::Docs,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("/"),
         description: "Search every page; Esc returns to the page",
         context: KeybindContext::Docs,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt(key::FIND_NEXT.label, key::FIND_PREV.label),
         description: "Next or previous search highlight",
         context: KeybindContext::Docs,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("c"),
         description: "Contents; typing filters them, Esc clears the filter",
         context: KeybindContext::Docs,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(key::QUIT.label),
         description: "Copy the selection, or close",
         context: KeybindContext::Docs,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt("Esc", "q"),
         description: "Close, keeping the place for the next /docs",
         context: KeybindContext::Docs,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("y"),
         description: "Copy the requirements list, even while it is still streaming",
         context: KeybindContext::Extract,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("Ctrl+C"),
         description: "Stop the extraction and keep what has streamed",
         context: KeybindContext::Extract,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("Esc"),
         description: "Close",
         context: KeybindContext::Extract,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("Enter"),
         description: "Send what you typed as a follow-up, or queue it while the answer streams",
         context: KeybindContext::Btw,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("Ctrl+Y"),
         description: "Copy the answer, even while it is still streaming",
         context: KeybindContext::Btw,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("Ctrl+C"),
         description: "Stop the answer and keep the thread",
         context: KeybindContext::Btw,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("Esc"),
         description: "Close and forget the thread",
         context: KeybindContext::Btw,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt("↑", "↓"),
         description: "Navigate",
         context: KeybindContext::Picker,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("Enter"),
         description: "Select",
         context: KeybindContext::Picker,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("Esc"),
         description: "Close",
         context: KeybindContext::Picker,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("Type"),
         description: "Filter",
         context: KeybindContext::Picker,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt(key::PAGE_UP.label, key::PAGE_DOWN.label),
         description: "Scroll page up / down",
         context: KeybindContext::Picker,
-        platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Alt(key::DOC_TOP.label, key::DOC_BOTTOM.label),
+        label: KeyLabel::Alt(wb::LIST_FIRST.label, wb::LIST_LAST.label),
         description: "First / last item",
         context: KeybindContext::Picker,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(key::SCROLL_HALF_UP.label),
         description: "Scroll page up",
         context: KeybindContext::Picker,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt("Shift+Up", "Shift+Down"),
         description: "Move item up / down",
         context: KeybindContext::QueueFocus,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("Enter"),
         description: "Edit item",
         context: KeybindContext::QueueFocus,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt("d", "Delete"),
         description: "Delete item",
         context: KeybindContext::QueueFocus,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("m"),
         description: "Move unsent item to Main",
         context: KeybindContext::QueueFocus,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("g"),
         description: "Guide current run",
         context: KeybindContext::QueueFocus,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("n"),
         description: "Move prompt to Up next",
         context: KeybindContext::QueueFocus,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("b"),
         description: "Toggle send together",
         context: KeybindContext::QueueFocus,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("."),
         description: "Open item actions",
         context: KeybindContext::QueueFocus,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("r"),
         description: "Replace current run",
         context: KeybindContext::QueueFocus,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("Tab"),
         description: "Complete command",
         context: KeybindContext::CommandPalette,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("R"),
         description: "Clear job binding",
         context: KeybindContext::ModelPicker,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(key::NEW_SESSION.label),
         description: "New session",
         context: KeybindContext::SessionPicker,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(key::MOVE_SESSION.label),
         description: "Move current session",
         context: KeybindContext::SessionPicker,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(key::MIGRATE_SESSIONS.label),
         description: "Migrate directory sessions",
         context: KeybindContext::SessionPicker,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(key::RELOCATION_CUSTOM.label),
         description: "Enter a custom destination directory",
         context: KeybindContext::SessionRelocation,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(key::RENAME_SESSION.label),
         description: "Change relocation source or destination selection",
         context: KeybindContext::SessionRelocation,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(key::RELOCATION_USAGE.label),
         description: "Toggle the selected historical project usage row in bulk confirmation",
         context: KeybindContext::SessionRelocation,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(key::NEW_SESSION.label),
         description: "New worktree",
         context: KeybindContext::WorktreePicker,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(key::DELETE.label),
         description: "Remove the selected worktree",
         context: KeybindContext::WorktreePicker,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(key::RENAME_SESSION.label),
         description: "Refresh the worktree list",
         context: KeybindContext::WorktreePicker,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(key::RELOCATION_USAGE.label),
         description: "Toggle carrying uncommitted changes into a new worktree",
         context: KeybindContext::WorktreePicker,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(key::RENAME_SESSION.label),
         description: "Rename session",
         context: KeybindContext::SessionPicker,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(key::GENERATE_TITLE.label),
         description: "Generate session title",
         context: KeybindContext::SessionPicker,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(key::DELETE.label),
         description: "Delete session (press twice)",
         context: KeybindContext::SessionPicker,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(key::DELETE.label),
         description: "Delete stash entry (press twice)",
         context: KeybindContext::StashPicker,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(workflow_inspector::PAUSE_LABEL),
         description: "Pause the selected run",
         context: KeybindContext::WorkflowInspector,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(workflow_inspector::RESUME_LABEL),
         description: "Resume the selected run",
         context: KeybindContext::WorkflowInspector,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(workflow_inspector::STOP_LABEL),
         description: "Stop the selected run",
         context: KeybindContext::WorkflowInspector,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt("Tab", SHIFT_TAB_LABEL),
         description: "Next or previous section",
         context: KeybindContext::WorkflowInspector,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("1-4"),
         description: "Jump to a section",
         context: KeybindContext::WorkflowInspector,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt("Left", "Right"),
         description: "Focus the run list or the section",
         context: KeybindContext::WorkflowInspector,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("Enter"),
         description: "Open the row under the cursor: a phase's agents, a scratch file, or a call's prompt and result",
         context: KeybindContext::WorkflowInspector,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(workflow_inspector::TRANSCRIPT_LABEL),
         description: "Open the transcript of the agent under the cursor",
         context: KeybindContext::WorkflowInspector,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(workflow_inspector::SCRIPT_LABEL),
         description: "Open the script the selected run executed",
         context: KeybindContext::WorkflowInspector,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(workflow_inspector::EXPORT_LABEL),
         description: "Copy the whole run as markdown, every prompt and result included",
         context: KeybindContext::WorkflowInspector,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(workflow_inspector::COPY_LABEL),
         description: "Copy the visible section",
         context: KeybindContext::WorkflowInspector,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(workflow_inspector::FILTER_LABEL),
         description: "Filter the run list",
         context: KeybindContext::WorkflowInspector,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("Enter"),
         description: "Launch a trusted workflow, or trust an untrusted one",
         context: KeybindContext::WorkflowCatalogPicker,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(leader::WORKBENCH.label),
         description: "Open the workbench",
         context: KeybindContext::General,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt(wb::CLOSE.label, leader::WORKBENCH.label),
         description: "Back to the transcript",
         context: KeybindContext::Workbench,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::TOGGLE_SIDEBAR.label),
         description: "Show or hide the sidebar",
         context: KeybindContext::Workbench,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt(wb::SHRINK_SIDEBAR.label, wb::GROW_SIDEBAR.label),
         description: "Narrow / widen the sidebar",
         context: KeybindContext::Workbench,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::VIEW_EXPLORER.label),
         description: "Explorer",
         context: KeybindContext::Workbench,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::VIEW_SOURCE_CONTROL.label),
         description: "Source control",
         context: KeybindContext::Workbench,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::VIEW_SEARCH.label),
         description: "Search",
         context: KeybindContext::Workbench,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::VIEW_TRANSFER.label),
         description: "Transfer files with the attached sandbox",
         context: KeybindContext::Workbench,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt(wb::FOCUS_NEXT.label, wb::FOCUS_PREV.label),
         description: "Leave the sidebar for the editor",
         context: KeybindContext::Workbench,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::QUICK_OPEN.label),
         description: "Open a file by name",
         context: KeybindContext::Workbench,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::REFRESH.label),
         description: "Reread the tree and the repository",
         context: KeybindContext::Workbench,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::SEND_TO_COMPOSER.label),
         description: "Send the file or selection to the composer",
         context: KeybindContext::Workbench,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::MENU.label),
         description: "Open the context menu for the row or tab under the cursor",
         context: KeybindContext::Workbench,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::TOGGLE_HIDDEN.label),
         description: "Show hidden files",
         context: KeybindContext::WorkbenchExplorer,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::COLLAPSE_ALL.label),
         description: "Fold the tree back to its top level",
         context: KeybindContext::WorkbenchExplorer,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::SAVE.label),
         description: "Save the active file",
         context: KeybindContext::WorkbenchEditor,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::REVERT.label),
         description: "Discard edits and take what is on disk",
         context: KeybindContext::WorkbenchEditor,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Alt(wb::UNDO.label, wb::REDO.label),
-        description: "Undo / redo",
-        context: KeybindContext::WorkbenchEditor,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt(wb::FIND.label, wb::GOTO_LINE.label),
         description: "Find in file / go to line",
         context: KeybindContext::WorkbenchEditor,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt(wb::FIND_NEXT.label, wb::FIND_PREV.label),
         description: "Next / previous match, with or without the find bar",
         context: KeybindContext::WorkbenchEditor,
-        platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Multi(&[wb::COPY.label, wb::PASTE.label]),
-        description: "Copy / paste",
+        label: KeyLabel::Single(wb::PASTE.label),
+        description: "Put back what the workbench last copied or cut",
         context: KeybindContext::WorkbenchEditor,
-        platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Alt(wb::CUT.label, wb::CUT_CHORD.label),
+        label: KeyLabel::Single(wb::CUT_CHORD.label),
         description: "Cut the selection",
         context: KeybindContext::WorkbenchEditor,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single(wb::SELECT_ALL.label),
-        description: "Select the whole buffer",
-        context: KeybindContext::WorkbenchEditor,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single(wb::KILL_LINE.label),
-        description: "Delete to the end of the line",
-        context: KeybindContext::WorkbenchEditor,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Alt(wb::DELETE_WORD.label, mod_key!("Backspace")),
-        description: "Delete the word or path component before the cursor",
-        context: KeybindContext::WorkbenchEditor,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::TOGGLE_WRAP.label),
         description: "Wrap long lines onto more rows",
         context: KeybindContext::WorkbenchEditor,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt(wb::PREV_TAB.label, wb::NEXT_TAB.label),
         description: "Previous / next tab",
         context: KeybindContext::WorkbenchEditor,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::CLOSE_TAB.label),
         description: "Close the active tab",
         context: KeybindContext::WorkbenchEditor,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::TOGGLE_RENDERED.label),
         description: "Show a Markdown file rendered, or its source again",
         context: KeybindContext::WorkbenchEditor,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::STAGE_TOGGLE.label),
         description: "Stage or unstage the file, folder, or whole section",
         context: KeybindContext::WorkbenchSourceControl,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::OPEN_DIFF.label),
         description: "Open the diff, or the commit under the cursor",
         context: KeybindContext::WorkbenchSourceControl,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::DISCARD.label),
         description: "Discard changes (press twice)",
         context: KeybindContext::WorkbenchSourceControl,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::TOGGLE_TREE.label),
         description: "Switch the change sections between tree and flat",
         context: KeybindContext::WorkbenchSourceControl,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt(wb::SHRINK_SECTION.label, wb::GROW_SECTION.label),
         description: "Shrink / grow the section the cursor is in",
         context: KeybindContext::WorkbenchSourceControl,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("Enter"),
         description: "Run the search, then open the file at the match",
         context: KeybindContext::WorkbenchSearch,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::NEXT_FIELD.label),
         description: "Move between the query and the file globs",
         context: KeybindContext::WorkbenchSearch,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::TOGGLE_CASE.label),
         description: "Match case",
         context: KeybindContext::WorkbenchSearch,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::TOGGLE_WORD.label),
         description: "Match whole words",
         context: KeybindContext::WorkbenchSearch,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::TOGGLE_REGEX.label),
         description: "Read the query as a regular expression",
         context: KeybindContext::WorkbenchSearch,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Multi(&["↑", "↓", wb::PREVIOUS_ROW.label, wb::NEXT_ROW.label]),
         description: "Move through the aligned tree",
         context: KeybindContext::WorkbenchTransfer,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Multi(&["PgUp", "PgDn", "Home", "End"]),
         description: "Move a page at a time, or to the first or last row",
         context: KeybindContext::WorkbenchTransfer,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt("→", "Enter"),
         description: "Unfold a folder, open a file's diff, or run a note's action",
         context: KeybindContext::WorkbenchTransfer,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("←"),
         description: "Fold the folder, or step out to the one above",
         context: KeybindContext::WorkbenchTransfer,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::COLLAPSE_ALL.label),
         description: "Fold the tree back to its top level",
         context: KeybindContext::WorkbenchTransfer,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt(wb::FOCUS_NEXT.label, wb::FOCUS_PREV.label),
         description: "Focus the local or the sandbox pane",
         context: KeybindContext::WorkbenchTransfer,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::SELECT.label),
         description: "Choose the row, and everything under a folder",
         context: KeybindContext::WorkbenchTransfer,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt(wb::UPLOAD.label, wb::DOWNLOAD.label),
         description: "Review an upload / download of the chosen rows, or of the cursor row",
         context: KeybindContext::WorkbenchTransfer,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::APPROVE.label),
         description: "Approve the review on screen, exactly as shown",
         context: KeybindContext::WorkbenchTransfer,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt(wb::COMPARE.label, wb::REFRESH.label),
         description: "Compare the roots again",
         context: KeybindContext::WorkbenchTransfer,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::INCLUDE_IGNORED.label),
         description: "Include or leave out ignored files until Transfer closes",
         context: KeybindContext::WorkbenchTransfer,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::SKIP_DOTFILES.label),
         description: "Skip or include dotfiles until Transfer closes",
         context: KeybindContext::WorkbenchTransfer,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::CHANGES_ONLY.label),
         description: "Show only what differs",
         context: KeybindContext::WorkbenchTransfer,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Alt(wb::LOCAL_ROOT.label, wb::SANDBOX_ROOT.label),
         description: "Edit the local / sandbox root",
         context: KeybindContext::WorkbenchTransfer,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::CLEAR_ROOT.label),
         description: "Clear the root being edited",
         context: KeybindContext::WorkbenchTransfer,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::PREVIOUS_ROOTS.label),
         description: "Go back to the previous root pair",
         context: KeybindContext::WorkbenchTransfer,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::REPORT.label),
         description: "Show the last transfer report",
         context: KeybindContext::WorkbenchTransfer,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::RECONCILE.label),
         description: "Reconcile a publication whose outcome is unknown",
         context: KeybindContext::WorkbenchTransfer,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::STOP.label),
         description: "Stop the running operation",
         context: KeybindContext::WorkbenchTransfer,
-        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single(wb::CLOSE.label),
         description: "Close the prompt or panel, then leave Transfer once cleanup ends",
         context: KeybindContext::WorkbenchTransfer,
-        platform: Platform::All,
     },
 ];
 
@@ -1973,9 +1708,13 @@ pub(crate) fn key_event_to_string(key: &KeyEvent) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use caudra_workbench::text_field::{self, FieldKind};
     use crossterm::event::KeyEvent;
     use test_case::test_case;
 
+    const TEXT_FIELD_CHORD_UNLISTED: &str =
+        "a chord every field decodes is missing from Text Fields";
+    const TEXT_FIELD_CHORD_UNDECODED: &str = "Text Fields lists a chord the fields do not decode";
     const ALT_LABEL: &str = "Alt+";
     const ALT_IS_UNREACHABLE: &str = "macOS never reports Option as Alt, so no default may need it";
     const AMBIGUOUS_CONTROL_CODE: &str =
@@ -2142,6 +1881,36 @@ mod tests {
         for kb in KEYBINDS.iter().filter(|kb| kb.context.feature().is_some()) {
             assert!(!kb.is_visible(FeatureFlags::NONE), "{}", kb.description);
         }
+    }
+
+    #[test_case(wb::DELETE_WORD ; "delete_word")]
+    #[test_case(wb::DELETE_WORD_BACK ; "delete_word_back")]
+    #[test_case(wb::DELETE_WORD_AFTER ; "delete_word_after")]
+    #[test_case(wb::KILL_LINE ; "kill_line")]
+    #[test_case(wb::KILL_TO_LINE_START ; "kill_to_line_start")]
+    #[test_case(wb::SELECT_ALL ; "select_all")]
+    #[test_case(wb::UNDO ; "undo")]
+    #[test_case(wb::REDO ; "redo")]
+    #[test_case(wb::COPY ; "copy")]
+    #[test_case(wb::CUT ; "cut")]
+    #[test_case(wb::WORD_LEFT ; "word_left")]
+    #[test_case(wb::WORD_RIGHT ; "word_right")]
+    #[test_case(wb::LINE_END ; "line_end")]
+    #[test_case(wb::SUPER_HOME ; "super_home")]
+    #[test_case(wb::SUPER_END ; "super_end")]
+    #[test_case(wb::TEXT_START ; "text_start")]
+    #[test_case(wb::TEXT_END ; "text_end")]
+    fn text_fields_lists_what_every_field_decodes(bind: wb::Bind) {
+        let listed = KEYBINDS.iter().any(|kb| {
+            kb.context == KeybindContext::TextFields
+                && kb.label.parts().any(|part| part == bind.label)
+        });
+        assert!(listed, "{TEXT_FIELD_CHORD_UNLISTED}: {}", bind.label);
+        assert!(
+            text_field::decode(bind.to_key_event(), FieldKind::Line).is_some(),
+            "{TEXT_FIELD_CHORD_UNDECODED}: {}",
+            bind.label
+        );
     }
 
     #[test]

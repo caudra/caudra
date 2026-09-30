@@ -2,7 +2,7 @@ use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Wrap;
+use ratatui::widgets::Paragraph;
 
 use caudra_config::providers::{
     self, Protocol, ProviderDef, ProviderSlugError, ProvidersConfig, custom_provider_slug,
@@ -14,15 +14,20 @@ use caudra_storage::auth::{
     ProviderAuthKind, ProviderCredentials, save_provider_credentials, try_load_provider_auth,
 };
 use caudra_storage::model::persist_model_for_every_mode;
+use caudra_workbench::text_field::{FieldKind, TextField, TextKey};
 
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::components::modal::Modal;
-use crate::components::{Overlay, SubscriptionProvider, input_line_with_cursor};
-use crate::text_buffer::TextBuffer;
+use crate::components::{
+    Overlay, SubscriptionProvider, chevron_span, field_styles, input_text_style,
+};
 use crate::theme;
 
 const TITLE: &str = " Login ";
 const CATALOG_UNAVAILABLE_SLUG: &str = "catalog-unavailable";
+const PROMPT_WIDTH_PERCENT: u16 = 65;
+const PROMPT_HEIGHT_PERCENT: u16 = 40;
+const PROMPT_ROWS: u16 = 2;
 
 const PROTOCOLS: &[(&str, &str)] = &[
     ("openai", "OpenAI Chat Completions"),
@@ -128,24 +133,24 @@ enum Step {
         slug: String,
     },
     CustomName {
-        input: TextBuffer,
+        input: TextField,
     },
     CustomProtocol {
         picker: ListPicker<ProtocolItem>,
         slug: String,
     },
     CustomUrl {
-        input: TextBuffer,
+        input: TextField,
         slug: String,
         protocol: String,
     },
     BuiltinUrl {
-        input: TextBuffer,
+        input: TextField,
         slug: String,
         display_name: String,
     },
     EnterKey {
-        input: TextBuffer,
+        input: TextField,
         slug: String,
         plan: Option<String>,
         display_name: String,
@@ -197,6 +202,7 @@ enum StepAction {
     GoError {
         message: String,
     },
+    Copy(String),
     Back,
     Close,
 }
@@ -309,15 +315,29 @@ impl LoginPicker {
 
     pub fn handle_paste(&mut self, text: &str) -> bool {
         match &mut self.step {
+            Step::PickProvider(picker) => picker.handle_paste(text),
+            Step::PickAuthMethod { picker, .. } => picker.handle_paste(text),
+            Step::PickPlan { picker, .. } => picker.handle_paste(text),
+            Step::CustomProtocol { picker, .. } => picker.handle_paste(text),
             Step::EnterKey { input, .. }
             | Step::CustomName { input }
             | Step::CustomUrl { input, .. }
             | Step::BuiltinUrl { input, .. } => {
-                input.insert_text(text);
+                input.paste(text);
                 true
             }
-            _ => false,
+            Step::Closed | Step::Done { .. } => false,
         }
+    }
+
+    pub fn text_input_active(&self) -> bool {
+        matches!(
+            self.step,
+            Step::CustomName { .. }
+                | Step::CustomUrl { .. }
+                | Step::BuiltinUrl { .. }
+                | Step::EnterKey { .. }
+        )
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> LoginPickerAction {
@@ -329,7 +349,7 @@ impl LoginPicker {
             }
             Step::PickPlan { picker, slug } => Self::map_plan_action(picker.handle_key(key), slug),
             Step::CustomName { input } => match key.code {
-                KeyCode::Enter => match custom_provider_slug(&input.value()) {
+                KeyCode::Enter => match custom_provider_slug(&input.text()) {
                     Ok(slug) => StepAction::GoCustomProtocol { slug },
                     Err(ProviderSlugError::Empty) => return LoginPickerAction::Consumed,
                     Err(error) => StepAction::GoError {
@@ -337,10 +357,7 @@ impl LoginPicker {
                     },
                 },
                 KeyCode::Esc => StepAction::Back,
-                _ => {
-                    input.handle_key(key);
-                    return LoginPickerAction::Consumed;
-                }
+                _ => return Self::edit(input, key),
             },
             Step::CustomProtocol { picker, slug } => {
                 Self::map_protocol_action(picker.handle_key(key), slug)
@@ -351,7 +368,7 @@ impl LoginPicker {
                 protocol,
             } => match key.code {
                 KeyCode::Enter => {
-                    let base_url = input.value().trim().to_string();
+                    let base_url = input.text().trim().to_string();
                     if base_url.is_empty() {
                         return LoginPickerAction::Consumed;
                     }
@@ -368,10 +385,7 @@ impl LoginPicker {
                     }
                 }
                 KeyCode::Esc => StepAction::Back,
-                _ => {
-                    input.handle_key(key);
-                    return LoginPickerAction::Consumed;
-                }
+                _ => return Self::edit(input, key),
             },
             Step::EnterKey {
                 input,
@@ -383,7 +397,7 @@ impl LoginPicker {
                 api_key_optional,
             } => match key.code {
                 KeyCode::Enter => {
-                    let api_key = input.value().trim().to_string();
+                    let api_key = input.text().trim().to_string();
                     if api_key.is_empty() && !*api_key_optional {
                         return LoginPickerAction::Consumed;
                     }
@@ -484,10 +498,7 @@ impl LoginPicker {
                     }
                 }
                 KeyCode::Esc => StepAction::Back,
-                _ => {
-                    input.handle_key(key);
-                    return LoginPickerAction::Consumed;
-                }
+                _ => return Self::edit(input, key),
             },
             Step::BuiltinUrl {
                 input,
@@ -495,7 +506,7 @@ impl LoginPicker {
                 display_name,
             } => match key.code {
                 KeyCode::Enter => {
-                    let mut base_url = input.value().trim().to_string();
+                    let mut base_url = input.text().trim().to_string();
                     if base_url.is_empty() {
                         base_url = providers::resolve_base_url(slug, None).unwrap_or_default();
                     }
@@ -509,10 +520,7 @@ impl LoginPicker {
                     }
                 }
                 KeyCode::Esc => StepAction::Back,
-                _ => {
-                    input.handle_key(key);
-                    return LoginPickerAction::Consumed;
-                }
+                _ => return Self::edit(input, key),
             },
             Step::Done { .. } => {
                 if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
@@ -524,6 +532,13 @@ impl LoginPicker {
         };
 
         self.transition(action)
+    }
+
+    fn edit(input: &mut TextField, key: KeyEvent) -> LoginPickerAction {
+        match input.handle_key(key) {
+            TextKey::Copy(text) | TextKey::Cut(text) => LoginPickerAction::Copy(text),
+            _ => LoginPickerAction::Consumed,
+        }
     }
 
     pub fn handle_mouse(&mut self, event: MouseEvent) -> LoginPickerAction {
@@ -624,6 +639,7 @@ impl LoginPicker {
                 }
             }
             PickerAction::Close => StepAction::Close,
+            PickerAction::Copy(text) => StepAction::Copy(text),
             PickerAction::Consumed | PickerAction::Toggle(..) | PickerAction::Key(_) => {
                 StepAction::None
             }
@@ -647,6 +663,7 @@ impl LoginPicker {
                 },
             },
             PickerAction::Close => StepAction::Back,
+            PickerAction::Copy(text) => StepAction::Copy(text),
             PickerAction::Consumed | PickerAction::Toggle(..) | PickerAction::Key(_) => {
                 StepAction::None
             }
@@ -667,6 +684,7 @@ impl LoginPicker {
                 }
             }
             PickerAction::Close => StepAction::Back,
+            PickerAction::Copy(text) => StepAction::Copy(text),
             PickerAction::Consumed | PickerAction::Toggle(..) | PickerAction::Key(_) => {
                 StepAction::None
             }
@@ -680,6 +698,7 @@ impl LoginPicker {
                 protocol: item.0.to_string(),
             },
             PickerAction::Close => StepAction::Back,
+            PickerAction::Copy(text) => StepAction::Copy(text),
             PickerAction::Consumed | PickerAction::Toggle(..) | PickerAction::Key(_) => {
                 StepAction::None
             }
@@ -704,7 +723,7 @@ impl LoginPicker {
                     tracing::warn!(error = %e, url, "failed to open browser");
                 }
                 self.step = Step::EnterKey {
-                    input: TextBuffer::new(String::new()),
+                    input: TextField::new(FieldKind::Line).secret(),
                     slug,
                     plan,
                     display_name,
@@ -761,7 +780,7 @@ impl LoginPicker {
                 let default =
                     providers::resolve_base_url(&slug, config.get(&slug)).unwrap_or_default();
                 self.step = Step::BuiltinUrl {
-                    input: TextBuffer::new(default),
+                    input: TextField::with_text(FieldKind::Line, &default),
                     slug,
                     display_name,
                 };
@@ -789,7 +808,7 @@ impl LoginPicker {
             }
             StepAction::GoCustomName => {
                 self.step = Step::CustomName {
-                    input: TextBuffer::new(String::new()),
+                    input: TextField::new(FieldKind::Line),
                 };
                 LoginPickerAction::Consumed
             }
@@ -805,7 +824,7 @@ impl LoginPicker {
             }
             StepAction::GoCustomUrl { slug, protocol } => {
                 self.step = Step::CustomUrl {
-                    input: TextBuffer::new(String::new()),
+                    input: TextField::new(FieldKind::Line),
                     slug,
                     protocol,
                 };
@@ -827,6 +846,7 @@ impl LoginPicker {
                 self.step = Step::Done { message };
                 LoginPickerAction::Consumed
             }
+            StepAction::Copy(text) => LoginPickerAction::Copy(text),
             StepAction::Back => {
                 let mut picker = ListPicker::new();
                 picker.open(self.provider_items.clone(), TITLE);
@@ -847,92 +867,44 @@ impl LoginPicker {
             Step::PickProvider(picker) => picker.view(frame, area),
             Step::PickAuthMethod { picker, .. } => picker.view(frame, area),
             Step::PickPlan { picker, .. } => picker.view(frame, area),
-            Step::CustomName { input } => {
-                let modal = Modal {
-                    title: " Provider name ",
-                    width_percent: 65,
-                    max_height_percent: 40,
-                };
-                let (popup, inner) = modal.render(frame, area, 2);
-                let t = theme::current();
-                let hint = Span::styled("Enter provider name, then Enter", t.input_placeholder);
-                let input_line = input_line_with_cursor(input);
-                frame.render_widget(
-                    ratatui::widgets::Paragraph::new(vec![Line::from(hint), input_line])
-                        .style(t.surface_style())
-                        .wrap(Wrap { trim: true }),
-                    inner,
-                );
-                popup
-            }
+            Step::CustomName { input } => render_prompt(
+                frame,
+                area,
+                " Provider name ",
+                "Enter provider name, then Enter",
+                input,
+            ),
             Step::CustomProtocol { picker, .. } => picker.view(frame, area),
-            Step::CustomUrl { input, .. } => {
-                let modal = Modal {
-                    title: " Base URL ",
-                    width_percent: 65,
-                    max_height_percent: 40,
-                };
-                let (popup, inner) = modal.render(frame, area, 2);
-                let t = theme::current();
-                let hint = Span::styled("Enter base URL, then Enter", t.input_placeholder);
-                let input_line = input_line_with_cursor(input);
-                frame.render_widget(
-                    ratatui::widgets::Paragraph::new(vec![Line::from(hint), input_line])
-                        .style(t.surface_style())
-                        .wrap(Wrap { trim: true }),
-                    inner,
-                );
-                popup
-            }
+            Step::CustomUrl { input, .. } => render_prompt(
+                frame,
+                area,
+                " Base URL ",
+                "Enter base URL, then Enter",
+                input,
+            ),
             Step::BuiltinUrl {
                 input,
                 display_name,
                 ..
-            } => {
-                let modal = Modal {
-                    title: &format!(" {display_name} "),
-                    width_percent: 65,
-                    max_height_percent: 40,
-                };
-                let (popup, inner) = modal.render(frame, area, 2);
-                let t = theme::current();
-                let hint = Span::styled("Edit host URL, or Enter to confirm", t.input_placeholder);
-                let input_line = input_line_with_cursor(input);
-                frame.render_widget(
-                    ratatui::widgets::Paragraph::new(vec![Line::from(hint), input_line])
-                        .style(t.surface_style())
-                        .wrap(Wrap { trim: true }),
-                    inner,
-                );
-                popup
-            }
+            } => render_prompt(
+                frame,
+                area,
+                &format!(" {display_name} "),
+                "Edit host URL, or Enter to confirm",
+                input,
+            ),
             Step::EnterKey {
                 input,
                 display_name,
                 api_key_optional,
                 ..
             } => {
-                let modal = Modal {
-                    title: &format!(" {display_name} "),
-                    width_percent: 65,
-                    max_height_percent: 40,
-                };
-                let (popup, inner) = modal.render(frame, area, 2);
-                let t = theme::current();
-                let hint_text = if *api_key_optional {
+                let hint = if *api_key_optional {
                     "Paste API key, or Enter to skip"
                 } else {
                     "Paste API key, then Enter"
                 };
-                let hint = Span::styled(hint_text, t.input_placeholder);
-                let input_line = input_line_with_cursor(input);
-                frame.render_widget(
-                    ratatui::widgets::Paragraph::new(vec![Line::from(hint), input_line])
-                        .style(t.surface_style())
-                        .wrap(Wrap { trim: true }),
-                    inner,
-                );
-                popup
+                render_prompt(frame, area, &format!(" {display_name} "), hint, input)
             }
             Step::Done { message } => {
                 let modal = Modal {
@@ -942,7 +914,7 @@ impl LoginPicker {
                 };
                 let (popup, inner) = modal.render(frame, area, 1);
                 frame.render_widget(
-                    ratatui::widgets::Paragraph::new(Line::from(message.clone()))
+                    Paragraph::new(Line::from(message.clone()))
                         .style(theme::current().surface_style()),
                     inner,
                 );
@@ -950,6 +922,36 @@ impl LoginPicker {
             }
         }
     }
+}
+
+/// A hint over a single-line field, the field panned to keep its caret shown.
+fn render_prompt(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    hint: &str,
+    input: &TextField,
+) -> Rect {
+    let modal = Modal {
+        title,
+        width_percent: PROMPT_WIDTH_PERCENT,
+        max_height_percent: PROMPT_HEIGHT_PERCENT,
+    };
+    let (popup, inner) = modal.render(frame, area, PROMPT_ROWS);
+    let t = theme::current();
+    let chevron = chevron_span();
+    let width = usize::from(inner.width).saturating_sub(chevron.width());
+    let mut field = input.paint(width, &field_styles(input_text_style()), true, "");
+    field.spans.insert(0, chevron);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(hint, t.input_placeholder)),
+            field,
+        ])
+        .style(t.surface_style()),
+        inner,
+    );
+    popup
 }
 
 impl Overlay for LoginPicker {
@@ -975,6 +977,7 @@ pub enum LoginPickerAction {
         provider: SubscriptionProvider,
         model_spec: String,
     },
+    Copy(String),
 }
 
 fn subscription_provider(slug: &str) -> Option<SubscriptionProvider> {
@@ -988,10 +991,18 @@ fn subscription_provider(slug: &str) -> Option<SubscriptionProvider> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::buffer_text;
+    use crate::components::keybindings::key;
     use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+    use test_case::test_case;
 
     const TEST_WIDTH: u16 = 80;
     const TEST_HEIGHT: u16 = 24;
+    const CUSTOM_SLUG: &str = "custom";
+    const API_KEY: &str = "sk-live-secret";
+    const KEY_SHOWN: &str = "the API key is painted in the clear";
+    const KEY_COPIED: &str = "the API key reached the clipboard";
+    const KEY_CUT: &str = "a blocked cut still took the API key out";
 
     fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
         MouseEvent {
@@ -1002,7 +1013,7 @@ mod tests {
         }
     }
 
-    fn render(picker: &mut LoginPicker) -> Rect {
+    fn render(picker: &mut LoginPicker) -> (Rect, String) {
         let backend = ratatui::backend::TestBackend::new(TEST_WIDTH, TEST_HEIGHT);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         let mut popup = Rect::default();
@@ -1011,7 +1022,48 @@ mod tests {
                 popup = picker.view(frame, frame.area());
             })
             .unwrap();
-        popup
+        (popup, buffer_text(terminal.backend().buffer()))
+    }
+
+    /// The key step for a custom provider, which opens no login page.
+    fn entering_key() -> LoginPicker {
+        let mut picker = LoginPicker::new();
+        picker.transition(StepAction::GoEnterKey {
+            slug: CUSTOM_SLUG.into(),
+            plan: None,
+            display_name: CUSTOM_SLUG.into(),
+            custom: Some(CustomInfo {
+                base_url: String::new(),
+                protocol: String::new(),
+            }),
+            builtin_url: None,
+            api_key_optional: false,
+        });
+        picker
+    }
+
+    #[test_case(key::SELECT_ALL.to_key_event() ; "select_all")]
+    #[test_case(KeyEvent::new(KeyCode::Home, KeyModifiers::SHIFT) ; "shift_home")]
+    fn the_api_key_is_masked_and_never_copied(select: KeyEvent) {
+        let mut picker = entering_key();
+        picker.handle_paste(API_KEY);
+        picker.handle_key(select);
+
+        for chord in [key::QUIT, key::CUT] {
+            assert!(
+                matches!(
+                    picker.handle_key(chord.to_key_event()),
+                    LoginPickerAction::Consumed
+                ),
+                "{KEY_COPIED}"
+            );
+        }
+        assert!(
+            matches!(&picker.step, Step::EnterKey { input, .. } if input.text() == API_KEY),
+            "{KEY_CUT}"
+        );
+        let (_, screen) = render(&mut picker);
+        assert!(!screen.contains(API_KEY), "{KEY_SHOWN}");
     }
 
     #[test]
@@ -1030,7 +1082,7 @@ mod tests {
         );
         let mut picker = LoginPicker::new();
         picker.step = Step::PickProvider(provider_picker);
-        let popup = render(&mut picker);
+        let (popup, _) = render(&mut picker);
         let column = popup.x + 1;
         let row = popup.y + 1;
 
@@ -1103,7 +1155,7 @@ mod tests {
     fn reserved_custom_name_explains_the_refusal() {
         let mut picker = LoginPicker::new();
         picker.step = Step::CustomName {
-            input: TextBuffer::new(" Version ".into()),
+            input: TextField::with_text(FieldKind::Line, " Version "),
         };
 
         picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -1118,7 +1170,7 @@ mod tests {
     fn mouse_is_consumed_without_changing_non_list_steps() {
         let mut picker = LoginPicker::new();
         picker.step = Step::CustomName {
-            input: TextBuffer::new("unchanged".into()),
+            input: TextField::with_text(FieldKind::Line, "unchanged"),
         };
 
         assert!(matches!(
@@ -1127,7 +1179,7 @@ mod tests {
         ));
         assert!(matches!(
             &picker.step,
-            Step::CustomName { input } if input.value() == "unchanged"
+            Step::CustomName { input } if input.text() == "unchanged"
         ));
 
         picker.step = Step::Done {

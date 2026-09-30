@@ -2,6 +2,7 @@ use std::path::Path;
 
 use caudra_agent::permissions::PermissionAdvisory;
 use caudra_grab::grab_scope;
+use caudra_workbench::text_field::FieldStyles;
 use ratatui::buffer::Buffer;
 use ratatui::style::Modifier;
 use ratatui::widgets::Widget;
@@ -13,13 +14,15 @@ use super::scope::{
 };
 use super::{
     Block, BorderType, Borders, CHIP_COVERED, COVERAGE_SEPARATOR, Constraint,
-    DEFAULT_DENY_GUIDANCE, FooterRow, Frame, HINT_CONFIRM, HINT_ENTER, HINT_ESC, KEY_ALLOW_GLOBAL,
-    KEY_ALLOW_LOCAL, KEY_ALLOW_ONCE, KEY_ALLOW_SESSION, KEY_COVERED, KEY_DENY_GLOBAL,
-    KEY_DENY_LOCAL, KEY_DETAILS, KEY_GUIDE_DENY, Layout, Line, MIN_REVIEW_HEIGHT, MIN_REVIEW_WIDTH,
-    Panel, Paragraph, PermissionCaution, PermissionLifetime, PermissionPrompt, PromptBody,
-    PromptHit, PromptState, PromptTarget, Rect, ResourceCoverage, Span, Style, Wrap,
-    command_ladders, grade_command_pattern, hint_key, hover_style, theme, visual_rows,
+    DEFAULT_DENY_GUIDANCE, FieldKind, FooterRow, Frame, HINT_CONFIRM, HINT_ENTER, HINT_ESC,
+    KEY_ALLOW_GLOBAL, KEY_ALLOW_LOCAL, KEY_ALLOW_ONCE, KEY_ALLOW_SESSION, KEY_COVERED,
+    KEY_DENY_GLOBAL, KEY_DENY_LOCAL, KEY_DETAILS, KEY_GUIDE_DENY, Layout, Line, MIN_REVIEW_HEIGHT,
+    MIN_REVIEW_WIDTH, Panel, Paragraph, PermissionCaution, PermissionLifetime, PermissionPrompt,
+    PromptBody, PromptHit, PromptState, PromptTarget, Rect, ResourceCoverage, Span, Style,
+    TextField, Wrap, command_ladders, grade_command_pattern, hint_key, hover_style, theme,
+    visual_rows,
 };
+use crate::components::field_styles;
 use crate::components::permission_scope::pattern::PatternPanel;
 use crate::components::permission_scope::{
     model::ScopeModel,
@@ -468,7 +471,6 @@ impl PermissionPrompt {
                 height: 1,
                 ..footer_area
             };
-            let editing = matches!(row, FooterRow::Guidance | FooterRow::ConfirmationInput);
             let line = match row {
                 FooterRow::Hints(pairs) => {
                     let mut x = area.x;
@@ -514,24 +516,12 @@ impl PermissionPrompt {
                     }
                     Line::from(spans)
                 }
-                FooterRow::Guidance => self.guidance_line(t),
-                FooterRow::ConfirmationInput => self.input_line(t),
+                FooterRow::Guidance => self.guidance_line(area.width, t),
+                FooterRow::ConfirmationInput => self.input_line(area.width, t),
                 FooterRow::InspectorStatus => self.inspector_status_line(t),
                 FooterRow::Rearm => Line::styled(REARM_MESSAGE, t.status_notice),
             };
-            let horizontal_scroll = if editing {
-                let cursor = line
-                    .spans
-                    .iter()
-                    .take_while(|span| !span.style.add_modifier.contains(Modifier::REVERSED))
-                    .map(Span::width)
-                    .sum::<usize>();
-                u16::try_from(cursor.saturating_sub(usize::from(area.width.saturating_sub(1))))
-                    .unwrap_or(u16::MAX)
-            } else {
-                0
-            };
-            frame.render_widget(Paragraph::new(line).scroll((0, horizontal_scroll)), area);
+            frame.render_widget(Paragraph::new(line), area);
         }
         self.awaiting_review = false;
         if let Some(pressed_area) = pressed_area
@@ -586,7 +576,7 @@ impl PermissionPrompt {
             return layout;
         }
         if self.state == PromptState::PatternEditing {
-            let mut lines = vec![self.input_line(t)];
+            let mut lines = vec![self.input_line(width.saturating_sub(CARD_INSET * 2), t)];
             if let Some(row) = self.command_row() {
                 lines.push(Line::styled(self.pattern_feedback(row), t.tool_warning));
             }
@@ -876,7 +866,7 @@ impl PermissionPrompt {
     }
 
     fn pattern_feedback(&self, row: usize) -> String {
-        let pattern = self.buffer.value();
+        let pattern = self.field.text();
         let Some(command) = self
             .current()
             .and_then(|request| request.resources.get(row))
@@ -1041,37 +1031,39 @@ impl PermissionPrompt {
         wrapped
     }
 
-    fn guidance_line(&self, t: &Theme) -> Line<'static> {
-        self.editor_line("Guidance: ", DEFAULT_DENY_GUIDANCE, t)
+    fn guidance_line(&self, width: u16, t: &Theme) -> Line<'static> {
+        self.editor_line("Guidance: ", DEFAULT_DENY_GUIDANCE, width, t)
     }
 
-    fn input_line(&self, t: &Theme) -> Line<'static> {
-        self.editor_line("> ", "", t)
+    fn input_line(&self, width: u16, t: &Theme) -> Line<'static> {
+        self.editor_line("> ", "", width, t)
     }
 
-    fn editor_line(&self, prefix: &'static str, placeholder: &str, t: &Theme) -> Line<'static> {
-        let input = self.buffer.value();
-        let source = if input.is_empty() {
-            placeholder
-        } else {
-            &input
+    /// The field after `prefix` in `width` columns, panned to keep its caret
+    /// in sight. Text review would redact or escape is shown as review shows
+    /// it, with the caret after it.
+    fn editor_line(
+        &self,
+        prefix: &'static str,
+        placeholder: &str,
+        width: u16,
+        t: &Theme,
+    ) -> Line<'static> {
+        let styles = FieldStyles {
+            caret: t.cursor,
+            placeholder: t.input_placeholder,
+            ..field_styles(Style::new().fg(t.foreground))
         };
-        let display = review_text(source);
-        let cursor = if display == source {
-            self.buffer.cursor_offset()
+        let width = usize::from(width).saturating_sub(prefix.width());
+        let text = self.field.text();
+        let display = review_text(&text);
+        let mut line = if display == text {
+            self.field.paint(width, &styles, true, placeholder)
         } else {
-            display.chars().count()
+            TextField::with_text(FieldKind::Line, &display).paint(width, &styles, true, placeholder)
         };
-        let mut chars = display.chars();
-        let before = chars.by_ref().take(cursor).collect::<String>();
-        let caret = chars.next().unwrap_or(' ');
-        let after = chars.collect::<String>();
-        Line::from(vec![
-            Span::styled(prefix, t.tool_dim),
-            Span::styled(before, Style::new().fg(t.foreground)),
-            Span::styled(caret.to_string(), Style::new().reversed()),
-            Span::styled(after, Style::new().fg(t.foreground)),
-        ])
+        line.spans.insert(0, Span::styled(prefix, t.tool_dim));
+        line
     }
 }
 
@@ -3368,12 +3360,13 @@ pub(super) mod tests {
         prompt.handle_paste("界 test");
         prompt.handle_key(key(KeyCode::Home));
         prompt.handle_key(key(KeyCode::Right));
-        let line = prompt.guidance_line(&theme::current());
+        let theme = theme::current();
+        let line = prompt.guidance_line(ROOMY_WIDTH, &theme);
         assert_eq!(line.to_string(), "Guidance: 界 test");
         let cursor = line
             .spans
             .iter()
-            .find(|span| span.style.add_modifier.contains(Modifier::REVERSED))
+            .find(|span| span.style.bg == theme.cursor.bg)
             .unwrap();
         assert_eq!(cursor.content, " ");
         assert_eq!(line.spans[1].content, "界");

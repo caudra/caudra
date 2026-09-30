@@ -19,6 +19,7 @@ use caudra_sandbox::{
     local_admin::{AdminOperation, AdminRequest, ImageProbe, ProbedImage},
 };
 use caudra_storage::sandbox_auth::{SandboxApiKey, SandboxCredentialRef};
+use caudra_workbench::text_field::{self, EditCommand, FieldKind, TextCommand};
 use caudra_workspace::WorkspacePath;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
@@ -102,8 +103,13 @@ pub(super) enum Kind {
 pub(super) struct LiveField {
     pub label: &'static str,
     pub editor: TextEditor,
-    pub secret: bool,
     pub choices: &'static [&'static str],
+}
+
+impl LiveField {
+    pub(super) fn secret(&self) -> bool {
+        self.editor.is_secret()
+    }
 }
 
 pub(super) struct LiveForm {
@@ -302,10 +308,10 @@ impl Manager {
         let mut field = |label, value: String, secret| {
             let mut editor = TextEditor::new();
             editor.set_text(value);
+            editor.set_secret(secret);
             fields.push(LiveField {
                 label,
                 editor,
-                secret,
                 choices: &[],
             });
         };
@@ -869,12 +875,7 @@ impl Manager {
             field.editor.set_text(field.choices[next].into());
             return SandboxAction::None;
         }
-        if field.secret
-            && matches!(event.code, KeyCode::Char(character) if (event.modifiers - KeyModifiers::SHIFT).is_empty() && !character.is_ascii_graphic())
-        {
-            return SandboxAction::None;
-        }
-        if field.secret && event.code == KeyCode::Enter {
+        if field.secret() && unfit_for_secret(event) {
             return SandboxAction::None;
         }
         let Ok(result) = field
@@ -884,7 +885,7 @@ impl Manager {
             self.status = super::TOO_LARGE.into();
             return SandboxAction::None;
         };
-        if field.secret {
+        if field.secret() {
             SandboxAction::None
         } else {
             editor_action(result)
@@ -1020,11 +1021,21 @@ impl Manager {
             .title(format!("{} ({}/{})", field.label, form.focus + 1, count));
         self.editor_area = block.inner(editor);
         frame.render_widget(block, editor);
-        if field.secret {
-            field.editor.view_masked(frame, self.editor_area);
+        if field.secret() {
+            field.editor.view(frame, self.editor_area);
         } else {
             field.editor.view_json(frame, self.editor_area);
         }
+    }
+}
+
+/// Whether `event` would put more than printable ASCII into a secret, which is
+/// one line of it.
+fn unfit_for_secret(event: KeyEvent) -> bool {
+    match text_field::decode(event, FieldKind::Document) {
+        Some(TextCommand::Edit(EditCommand::Insert(character))) => !character.is_ascii_graphic(),
+        Some(TextCommand::Edit(EditCommand::Newline | EditCommand::IndentedNewline)) => true,
+        _ => false,
     }
 }
 
@@ -1334,7 +1345,6 @@ mod tests {
             LiveField {
                 label,
                 editor,
-                secret: false,
                 choices: &[],
             }
         })

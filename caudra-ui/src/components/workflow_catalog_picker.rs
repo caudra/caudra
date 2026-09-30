@@ -37,6 +37,7 @@ pub enum WorkflowCatalogAction {
         digest: String,
     },
     Close,
+    Copy(String),
 }
 
 pub struct CatalogRow {
@@ -218,6 +219,7 @@ impl WorkflowCatalogPicker {
                 WorkflowCatalogAction::Close
             }
             PickerAction::Key(key) => self.handle_key(key),
+            PickerAction::Copy(text) => WorkflowCatalogAction::Copy(text),
         }
     }
 

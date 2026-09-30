@@ -1691,7 +1691,7 @@ mod tests {
         let state = manager.state.as_mut().unwrap();
         state.open_live(Kind::Credential);
         let form = state.live_form.as_mut().unwrap();
-        form.focus = form.fields.iter().position(|field| field.secret).unwrap();
+        form.focus = form.fields.iter().position(|field| field.secret()).unwrap();
         let source = SECRET.repeat(100);
         form.fields[form.focus].editor.set_text(source.clone());
         let mut terminal = Terminal::new(TestBackend::new(48, 18)).unwrap();
@@ -2107,7 +2107,7 @@ mod tests {
                 form.focus = form
                     .fields
                     .iter()
-                    .position(|field| field.secret == (surface == "secret"))
+                    .position(|field| field.secret() == (surface == "secret"))
                     .unwrap();
                 form.fields[form.focus].editor.set_text(TEXT.into());
             }

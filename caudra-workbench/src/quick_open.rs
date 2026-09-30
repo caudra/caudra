@@ -13,6 +13,7 @@ use ignore::WalkBuilder;
 use nucleo::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo::{Config, Matcher, Utf32Str};
 
+use crate::editor::text_field::{FieldKind, TextField};
 use crate::fs::backend::{ResourceEntry, WorkbenchPath};
 
 const MAX_FILES: usize = 20_000;
@@ -20,7 +21,7 @@ const MAX_MATCHES: usize = 200;
 
 pub struct QuickOpen {
     open: bool,
-    query: String,
+    query: TextField,
     /// Paths relative to the root, which is what is matched and shown.
     files: Vec<String>,
     /// Paths to list first while nothing has been typed, which is the open
@@ -38,7 +39,7 @@ impl Default for QuickOpen {
     fn default() -> Self {
         Self {
             open: false,
-            query: String::new(),
+            query: TextField::new(FieldKind::Line),
             files: Vec::new(),
             priority: Vec::new(),
             matches: Vec::new(),
@@ -112,8 +113,13 @@ impl QuickOpen {
         self.priority = priority;
     }
 
-    pub fn query(&self) -> &str {
+    pub fn query(&self) -> &TextField {
         &self.query
+    }
+
+    /// The query to edit. The matches only follow it at [`Self::rescan`].
+    pub fn query_mut(&mut self) -> &mut TextField {
+        &mut self.query
     }
 
     pub fn rows(&self) -> impl Iterator<Item = &str> {
@@ -162,11 +168,6 @@ impl QuickOpen {
         self.rescan();
     }
 
-    pub fn set_query(&mut self, query: String) {
-        self.query = query;
-        self.rescan();
-    }
-
     pub fn move_selection(&mut self, delta: isize) {
         if self.matches.is_empty() {
             return;
@@ -206,9 +207,10 @@ impl QuickOpen {
         self.scroll = top.min(self.matches.len().saturating_sub(viewport));
     }
 
-    /// An empty query lists the priority paths and then the rest as walked, so
-    /// the palette is useful before anything is typed.
-    fn rescan(&mut self) {
+    /// Matches the query as it stands. An empty one lists the priority paths
+    /// and then the rest as walked, so the palette is useful before anything
+    /// is typed.
+    pub fn rescan(&mut self) {
         self.selected = 0;
         self.scroll = 0;
         self.matches.clear();
@@ -225,7 +227,11 @@ impl QuickOpen {
             return;
         }
 
-        let pattern = Pattern::parse(&self.query, CaseMatching::Smart, Normalization::Smart);
+        let pattern = Pattern::parse(
+            &self.query.text(),
+            CaseMatching::Smart,
+            Normalization::Smart,
+        );
         let mut scored: Vec<(u32, usize)> = Vec::new();
         for (index, path) in self.files.iter().enumerate() {
             let haystack = Utf32Str::new(path, &mut self.scratch);
@@ -287,6 +293,11 @@ mod tests {
 
     fn rows(palette: &QuickOpen) -> Vec<String> {
         palette.rows().map(str::to_owned).collect()
+    }
+
+    fn type_query(palette: &mut QuickOpen, query: &str) {
+        palette.query_mut().set_text(query);
+        palette.rescan();
     }
 
     #[test]
@@ -355,7 +366,7 @@ mod tests {
     #[test]
     fn home_and_end_hold_still_with_nothing_to_select() {
         let (_tmp, mut palette) = opened();
-        palette.set_query("nosuchfile".to_owned());
+        type_query(&mut palette, "nosuchfile");
 
         palette.select_last();
         assert_eq!(palette.selected_index(), 0, "{WRONG_END}");
@@ -375,7 +386,7 @@ mod tests {
     #[test]
     fn a_query_narrows_and_ranks_the_matches() {
         let (_tmp, mut palette) = opened();
-        palette.set_query("deep".to_owned());
+        type_query(&mut palette, "deep");
 
         let found = rows(&palette);
         assert_eq!(found.len(), 1, "{NOT_FOUND}");
@@ -385,7 +396,7 @@ mod tests {
     #[test]
     fn a_path_fragment_matches_across_separators() {
         let (_tmp, mut palette) = opened();
-        palette.set_query("srmain".to_owned());
+        type_query(&mut palette, "srmain");
 
         assert!(
             rows(&palette)
@@ -398,7 +409,7 @@ mod tests {
     #[test]
     fn the_selection_resolves_to_a_path_under_the_root() {
         let (tmp, mut palette) = opened();
-        palette.set_query("main".to_owned());
+        type_query(&mut palette, "main");
 
         assert_eq!(
             palette.selected(tmp.path()),
@@ -410,7 +421,7 @@ mod tests {
     #[test]
     fn a_query_that_matches_nothing_leaves_no_selection() {
         let (tmp, mut palette) = opened();
-        palette.set_query("zzzz".to_owned());
+        type_query(&mut palette, "zzzz");
 
         assert_eq!(palette.len(), 0);
         assert_eq!(palette.selected(tmp.path()), None);
