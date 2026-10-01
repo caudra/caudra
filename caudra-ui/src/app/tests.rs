@@ -25,7 +25,9 @@ use crate::components::storage_modal::{
 };
 use crate::components::stream_modal::{StreamDone, StreamEvent, StreamFooter, StreamUsage};
 use crate::components::usage_modal::SCOPE_KEY;
-use crate::components::{DisplaySource, ExitRequest, ToolProgress, buffer_text, key, test_model};
+use crate::components::{
+    DisplaySource, ExitRequest, SubscriptionProvider, ToolProgress, buffer_text, key, test_model,
+};
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{SelectableZone, SelectionState, SelectionZone};
 use crate::test_pattern_discovery_report;
@@ -112,6 +114,10 @@ use tempfile::TempDir;
 use test_case::test_case;
 
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const OPENAI_SETUP_MODEL: &str = "openai/gpt-6.1-sol";
+const SETUP_MEDIUM_EFFORT: &str = "medium";
+const SETUP_HIGH_EFFORT: &str = "high";
+const SETUP_OFF: &str = "off";
 const DECISIONS_COMMAND: &str = "/decisions";
 const DECISIONS_TEST_BASE_URL: &str = "http://127.0.0.1:9";
 const DECISIONS_TEST_MODEL: &str = "test-decision-model";
@@ -17711,6 +17717,105 @@ fn switching_models_restores_the_level_chosen_for_that_model() {
         app.state.thinking,
         ThinkingConfig::Effort("high".into()),
         "{LEVEL_LOST_ON_RETURN}"
+    );
+}
+
+#[test_case(None, None, SETUP_MEDIUM_EFFORT ; "first_setup_uses_medium")]
+#[test_case(Some(SETUP_HIGH_EFFORT), None, SETUP_HIGH_EFFORT ; "remembered_effort_wins")]
+#[test_case(Some(SETUP_OFF), None, SETUP_OFF ; "remembered_off_wins")]
+#[test_case(None, Some(SETUP_OFF), SETUP_OFF ; "explicit_session_or_config_off_wins")]
+#[test_case(Some(SETUP_HIGH_EFFORT), Some(SETUP_OFF), SETUP_OFF ; "explicit_override_beats_remembered")]
+fn openai_setup_selects_model_and_restores_thinking(
+    remembered: Option<&str>,
+    explicit: Option<&str>,
+    expected: &str,
+) {
+    let (_tmp, dir, _writer, mut app) = tempdir_app();
+    let model = Model::from_spec(OPENAI_SETUP_MODEL).unwrap();
+    if let Some(remembered) = remembered {
+        caudra_storage::thinking::persist(
+            &dir,
+            OPENAI_SETUP_MODEL,
+            &StoredThinking::parse_setting(remembered).unwrap(),
+        );
+    }
+    if let Some(explicit) = explicit {
+        app.state.session_mut().meta.thinking =
+            Some(StoredThinking::parse_setting(explicit).unwrap());
+        app.state = SessionState::from_session(
+            app.state.session.as_ref().clone(),
+            &app.state.model,
+            &dir,
+            &ModelPolicy::default(),
+        );
+    }
+    app.checkpoint();
+
+    let actions = app.handle_login_picker_action(LoginPickerAction::Authenticated {
+        model_spec: OPENAI_SETUP_MODEL.into(),
+    });
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::CompleteProviderSetup(spec), Action::RefreshModels] if spec == OPENAI_SETUP_MODEL
+    ));
+    app.select_setup_model(&model);
+
+    let expected: ThinkingConfig = StoredThinking::parse_setting(expected).unwrap().into();
+    assert_eq!(app.state.model.spec(), OPENAI_SETUP_MODEL);
+    assert_eq!(app.state.thinking, expected);
+    app.checkpoint();
+    let restored = SessionState::from_session(
+        app.state.session.as_ref().clone(),
+        &model,
+        &dir,
+        &ModelPolicy::default(),
+    );
+    assert_eq!(restored.thinking, expected);
+    assert_eq!(
+        caudra_storage::thinking::read(&dir, OPENAI_SETUP_MODEL),
+        Some(StoredThinking::parse_setting(remembered.unwrap_or(SETUP_MEDIUM_EFFORT)).unwrap()),
+    );
+}
+
+#[test_case(SETUP_OFF ; "off")]
+#[test_case(SETUP_HIGH_EFFORT ; "high")]
+fn openai_setup_preserves_live_explicit_thinking(effort: &str) {
+    let (_tmp, _dir, _writer, mut app) = tempdir_app();
+    let model = Model::from_spec(OPENAI_SETUP_MODEL).unwrap();
+    app.set_thinking(effort).unwrap();
+    app.checkpoint();
+
+    app.select_setup_model(&model);
+
+    assert_eq!(
+        app.state.thinking,
+        StoredThinking::parse_setting(effort).unwrap().into(),
+    );
+}
+
+#[test_case(false ; "cancelled_login")]
+#[test_case(true ; "oauth_not_yet_successful")]
+fn unfinished_openai_setup_does_not_seed_thinking(oauth: bool) {
+    let (_tmp, dir, _writer, mut app) = tempdir_app();
+    let action = if oauth {
+        LoginPickerAction::AuthenticateProvider {
+            provider: SubscriptionProvider::OpenAi,
+            model_spec: OPENAI_SETUP_MODEL.into(),
+        }
+    } else {
+        LoginPickerAction::Close
+    };
+
+    let actions = app.handle_login_picker_action(action);
+
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, Action::CompleteProviderSetup(_)))
+    );
+    assert_eq!(
+        caudra_storage::thinking::read(&dir, OPENAI_SETUP_MODEL),
+        None
     );
 }
 

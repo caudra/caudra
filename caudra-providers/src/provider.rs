@@ -9,6 +9,8 @@ use strum::{Display, EnumIter, EnumString};
 use tracing::{debug, warn};
 
 use caudra_config::ModelPolicy;
+use caudra_storage::StateDir;
+use caudra_storage::thinking::{self, StoredThinking};
 
 use crate::model::{Model, ModelFamily, ModelInfo};
 use crate::providers::Timeouts;
@@ -24,7 +26,7 @@ use crate::providers::dynamic;
 use crate::providers::google::Google;
 use crate::providers::local::{LLAMACPP, LocalEndpoint, OLLAMA};
 use crate::providers::mistral::Mistral;
-use crate::providers::openai::OpenAi;
+use crate::providers::openai::{OpenAi, SETUP_MODEL_SPEC};
 use crate::providers::opencode::Opencode;
 use crate::providers::openrouter::OpenRouter;
 use crate::providers::synthetic::Synthetic;
@@ -40,6 +42,7 @@ const STATIC_FALLBACK_NOTE: &str = "using static fallback";
 const NO_FALLBACK_NOTE: &str = "no models listed";
 const NO_WIRE_BODY: &str = "this provider does not describe its wire body";
 const POST: &str = "POST";
+const SETUP_THINKING_EFFORT: &str = "medium";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display, EnumString, EnumIter)]
 #[strum(serialize_all = "kebab-case")]
@@ -337,6 +340,18 @@ pub trait Provider: Send + Sync {
 
     fn reasoning_transport(&self, _model: &Model) -> ReasoningTransport {
         ReasoningTransport::Other
+    }
+}
+
+pub fn seed_setup_thinking(storage: &StateDir, model_spec: &str) {
+    if model_spec == SETUP_MODEL_SPEC && thinking::read(storage, model_spec).is_none() {
+        thinking::persist(
+            storage,
+            model_spec,
+            &StoredThinking::Effort {
+                level: SETUP_THINKING_EFFORT.into(),
+            },
+        );
     }
 }
 
@@ -685,6 +700,9 @@ pub async fn fetch_all_models(
 mod tests {
     use std::future::pending;
 
+    use caudra_storage::StateClass;
+    use caudra_storage::state::{self, SCOPE_GLOBAL, StateKey};
+    use tempfile::TempDir;
     use test_case::test_case;
 
     use super::*;
@@ -694,6 +712,56 @@ mod tests {
         "a model both declared and discovered must reach the picker once, not twice";
     const DISCOVERED_SLUG: &str = "test-dynamic-model-registry";
     const TEST_MODEL: &str = "anthropic/claude-opus-4-8";
+    const LEGACY_THINKING: StateKey = StateKey {
+        name: "thinking.selected",
+        class: StateClass::Persistent,
+    };
+
+    #[test_case("openai/gpt-6.1-sol", Some("medium") ; "setup_model_gets_medium")]
+    #[test_case("openai/gpt-5.5", None ; "previous_setup_model_is_unchanged")]
+    #[test_case("openai/gpt-6-astra", None ; "best_model_is_unchanged")]
+    #[test_case("copilot/gpt-6.1-sol", None ; "other_provider_is_unchanged")]
+    #[test_case(TEST_MODEL, None ; "unrelated_model_is_unchanged")]
+    fn setup_thinking_seeds_only_the_setup_model(model_spec: &str, expected: Option<&str>) {
+        let tmp = TempDir::new().unwrap();
+        let storage = StateDir::from_path(tmp.path().to_path_buf());
+
+        seed_setup_thinking(&storage, model_spec);
+        seed_setup_thinking(&storage, model_spec);
+
+        assert_eq!(
+            thinking::read(&storage, model_spec),
+            expected.map(|level| StoredThinking::Effort {
+                level: level.into()
+            })
+        );
+        if model_spec != SETUP_MODEL_SPEC {
+            assert_eq!(thinking::read(&storage, SETUP_MODEL_SPEC), None);
+        }
+    }
+
+    #[test_case(StoredThinking::Off, false ; "saved_off")]
+    #[test_case(StoredThinking::Effort { level: "high".into() }, false ; "saved_high")]
+    #[test_case(StoredThinking::Off, true ; "legacy_off")]
+    #[test_case(StoredThinking::Effort { level: "high".into() }, true ; "legacy_high")]
+    #[test_case(StoredThinking::Adaptive, true ; "legacy_adaptive")]
+    fn setup_thinking_preserves_saved_choices(saved: StoredThinking, legacy: bool) {
+        let tmp = TempDir::new().unwrap();
+        let storage = StateDir::from_path(tmp.path().to_path_buf());
+        if legacy {
+            state::set(&storage, SCOPE_GLOBAL, LEGACY_THINKING, &saved).unwrap();
+        } else {
+            thinking::persist(&storage, SETUP_MODEL_SPEC, &saved);
+        }
+
+        seed_setup_thinking(&storage, SETUP_MODEL_SPEC);
+
+        assert_eq!(thinking::read(&storage, SETUP_MODEL_SPEC), Some(saved));
+        if legacy {
+            state::delete(&storage, SCOPE_GLOBAL, LEGACY_THINKING).unwrap();
+            assert_eq!(thinking::read(&storage, SETUP_MODEL_SPEC), None);
+        }
+    }
 
     /// A provider that can only send, as every provider is until it learns to
     /// describe its body.

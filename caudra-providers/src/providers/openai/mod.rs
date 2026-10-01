@@ -12,6 +12,8 @@ use crate::model::{
     StaticReasoningOption,
 };
 
+pub(crate) const SETUP_MODEL_SPEC: &str = "openai/gpt-6.1-sol";
+
 /// Working window for the long-context OpenAI models, gpt-5.6 and gpt-6.
 /// Deliberately below what the API accepts — gpt-6 advertises 1,050,000 —
 /// because the window is what caudra fills before compacting, and cost and
@@ -30,7 +32,7 @@ inventory::submit!(caudra_config::providers::BuiltInProvider {
     protocol: caudra_config::providers::Protocol::Openai,
     default_base_url: "https://api.openai.com/v1",
     default_api_key_env: "OPENAI_API_KEY",
-    default_model: "openai/gpt-5.5",
+    default_model: SETUP_MODEL_SPEC,
     plans: None,
     login_url: Some("https://platform.openai.com/api-keys"),
     needs_url: false,
@@ -613,6 +615,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
 
 #[cfg(test)]
 mod tests {
+    use caudra_config::providers::{ProviderDef, resolve_default_model};
     use test_case::test_case;
 
     use super::*;
@@ -626,6 +629,16 @@ mod tests {
     const LONG_CONTEXT_RULE: &str =
         "past 272K OpenAI bills twice the input and cache rates and 1.5x the output rate";
     const FAST_RULE: &str = "OpenAI's fast mode costs twice whichever rate applies";
+
+    #[test_case(None, "openai/gpt-6.1-sol" ; "builtin_setup_default")]
+    #[test_case(Some(ProviderDef::default()), "openai/gpt-6.1-sol" ; "unconfigured_model_uses_builtin")]
+    #[test_case(Some(ProviderDef { default_model: Some("openai/gpt-5.5".into()), ..ProviderDef::default() }), "openai/gpt-5.5" ; "configured_model_takes_precedence")]
+    fn setup_default_respects_provider_configuration(def: Option<ProviderDef>, expected: &str) {
+        assert_eq!(
+            resolve_default_model("openai", def.as_ref()).as_deref(),
+            Some(expected)
+        );
+    }
 
     fn base(pricing: &ModelPricing) -> [f64; 4] {
         [

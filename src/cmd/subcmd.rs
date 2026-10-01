@@ -21,7 +21,7 @@ use caudra_config::providers::{
 };
 use caudra_config::{Config, DefaultEffect, ModelPolicy, PermissionsConfig, ToolKey};
 use caudra_providers::model_registry::{self, Binding};
-use caudra_providers::provider::fetch_all_models;
+use caudra_providers::provider::{fetch_all_models, seed_setup_thinking};
 use caudra_providers::{
     Model, ModelMarker, ModelPurpose, ProviderData, Timeouts, catalog_providers,
 };
@@ -251,6 +251,7 @@ fn login_provider(slug: &str, storage: &StateDir) -> Result<()> {
         resolve_default_model(slug, config.get(slug))
     };
     if let Some(model) = &default_model {
+        seed_setup_thinking(storage, model);
         persist_model_for_every_mode(storage, model);
     }
 

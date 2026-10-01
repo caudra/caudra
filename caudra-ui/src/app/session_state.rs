@@ -43,6 +43,7 @@ pub(crate) struct SessionState {
     pub plan: PlanState,
     pub warnings: Vec<String>,
     pub thinking: ThinkingConfig,
+    pub thinking_explicit: bool,
     pub fast: bool,
     pub system_prompt_profile_name: String,
     pub system_prompt_profile: Option<Arc<SystemPromptProfile>>,
@@ -169,6 +170,7 @@ impl SessionState {
                 .map(Into::into)
                 .filter(|_| model.supports_thinking())
                 .unwrap_or_default(),
+            thinking_explicit: session.meta.thinking.is_some(),
             fast,
             system_prompt_profile_name: BUILTIN_PROFILE_NAME.to_owned(),
             system_prompt_profile: None,

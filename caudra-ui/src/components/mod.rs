@@ -884,6 +884,7 @@ pub enum Action {
     ChangeRemoteWorkingDirectory(caudra_workspace::DirectoryNavigation),
     RemoteControl(String),
     ChangeModel(String),
+    CompleteProviderSetup(String),
     ChangeSystemPromptProfile(String),
     RefreshProvider {
         slug: String,

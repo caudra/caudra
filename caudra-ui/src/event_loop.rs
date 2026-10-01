@@ -4169,6 +4169,11 @@ impl<'t> EventLoop<'t> {
                     self.focused_app().flash(e);
                 }
             }
+            Action::CompleteProviderSetup(spec) => {
+                if let Err(error) = self.change_model_with(&spec, App::select_setup_model) {
+                    self.focused_app().flash(error);
+                }
+            }
             Action::ChangeSystemPromptProfile(name) => {
                 self.change_system_prompt_profile(idx, &name);
             }
@@ -4198,8 +4203,9 @@ impl<'t> EventLoop<'t> {
 
                 match result {
                     Ok(()) => {
-                        self.refresh_provider(provider.slug().into());
-                        if let Err(error) = self.change_model(&model_spec) {
+                        if let Err(error) =
+                            self.change_model_with(&model_spec, App::select_setup_model)
+                        {
                             self.sessions[idx].app.flash(error);
                         }
                         self.refresh_models();
@@ -4338,6 +4344,14 @@ impl<'t> EventLoop<'t> {
     }
 
     fn change_model(&mut self, spec: &str) -> Result<(), String> {
+        self.change_model_with(spec, App::select_model)
+    }
+
+    fn change_model_with(
+        &mut self,
+        spec: &str,
+        select: fn(&mut App, &Model),
+    ) -> Result<(), String> {
         if !self.ctx.model_policy.allows(spec) {
             return Err(format!("{MODEL_POLICY_ERR}: {spec}"));
         }
@@ -4346,7 +4360,7 @@ impl<'t> EventLoop<'t> {
         let new_provider = from_model(&mut new_model, self.ctx.timeouts)
             .map_err(|e| format!("{PROVIDER_INIT_ERR}: {e}"))?;
         let app = self.focused_app();
-        app.select_model(&new_model);
+        select(app, &new_model);
         app.record_recent_model(spec);
         app.usage_slot.store(None);
         self.ctx.model_slot.store(Arc::new(ModelSlot {

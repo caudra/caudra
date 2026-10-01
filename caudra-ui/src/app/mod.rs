@@ -145,6 +145,7 @@ use caudra_docs::DocsLibrary;
 use caudra_lua::{
     BuiltinAction, EventHandle, HintReader, HintSnapshot, KeymapReader, LuaCommandReader, WinView,
 };
+use caudra_providers::provider::seed_setup_thinking;
 use caudra_providers::{
     Billing, CacheKey, ContentBlock, Message, Model, ModelPurpose, RequestOptions,
     ResolvedThinking, ThinkingConfig, TokenUsage, add_cost, project_messages,
@@ -1550,12 +1551,25 @@ impl App {
         }
     }
 
+    pub(crate) fn select_setup_model(&mut self, model: &Model) {
+        let thinking = self
+            .state
+            .thinking_explicit
+            .then(|| self.state.thinking.clone());
+        seed_setup_thinking(&self.storage, &model.spec());
+        self.select_model(model);
+        if let Some(thinking) = thinking.filter(|_| model.supports_thinking()) {
+            self.state.thinking = thinking;
+        }
+    }
+
     /// The one place a chosen level lands, so every spelling of the choice
     /// reaches the next session. A level the model forces off goes through
     /// [`SessionState::update_model`] instead, which must not overwrite what
     /// the user asked for on a model that could honor it.
     fn apply_thinking(&mut self, thinking: ThinkingConfig) {
         self.state.thinking = thinking;
+        self.state.thinking_explicit = true;
         caudra_storage::thinking::persist(
             &self.storage,
             &self.state.model.spec(),
@@ -2825,7 +2839,10 @@ impl App {
                 Vec::new()
             }
             LoginPickerAction::Authenticated { model_spec } => {
-                vec![Action::ChangeModel(model_spec), Action::RefreshModels]
+                vec![
+                    Action::CompleteProviderSetup(model_spec),
+                    Action::RefreshModels,
+                ]
             }
             LoginPickerAction::Configured { slug } => {
                 vec![Action::RefreshProvider { slug }, Action::RefreshModels]
