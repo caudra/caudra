@@ -599,14 +599,9 @@ fn render_block(
             }
             let segments: Vec<_> = state.highlighters[state.code_idx].update(code).to_vec();
             let start = lines.len();
-            let last = segments.len().saturating_sub(1);
-            // Highlighting expands tabs, so segment lengths do not track
-            // source bytes. Line ranges come from `code` itself, and the
-            // fences ride on the first and last rows so a full selection
-            // copies back a complete fenced block.
             let mut at = *code_start;
             let mut src_lines = code.split('\n');
-            for (i, segs) in segments.into_iter().enumerate() {
+            for segs in segments {
                 let src_len = src_lines.next().map_or(0, str::len) as u32;
                 let mut spans = vec![Span::chrome(CODE_BAR, StyleToken::CodeBar)];
                 // Tab expansion breaks the byte correspondence, so those
@@ -624,12 +619,10 @@ fn render_block(
                     spans.push(Span::sourced(seg.text, style, Emphasis::default(), source));
                 }
                 coalesce_adjacent_spans(&mut spans);
-                let from = if i == 0 { source.start } else { at };
-                let to = if i == last { source.end } else { at + src_len };
                 lines.push(Line {
                     kind: LineKind::Code,
                     spans,
-                    source: Some(from..to),
+                    source: Some(source.clone()),
                 });
                 at += src_len + 1;
             }
@@ -860,8 +853,6 @@ fn wrap_code_lines(lines: &mut Vec<Line>, start: usize, width: u16) {
         } else {
             let source = line.source.clone();
             lines.extend(split_line_with_bar(line, width).into_iter().map(|mut l| {
-                // Continuation rows stand for the same source line, so a
-                // selection across the wrap copies it once.
                 l.source = source.clone();
                 l
             }));
@@ -1301,6 +1292,8 @@ mod tests {
     use test_case::test_case;
 
     const TEST_WIDTH: u16 = 80;
+    const CODE_BODY: &str = "let x = \"é界\";\n\n    x";
+    const CODE_FENCE: &str = "```rust\nlet x = \"é界\";\n\n    x\n```";
 
     fn lines_text(lines: &[Line]) -> Vec<String> {
         lines
@@ -1381,6 +1374,53 @@ mod tests {
             }
         }
         assert!(checked > 0, "expected verbatim spans to check");
+    }
+
+    #[test_case(CODE_FENCE, TEST_WIDTH; "multiline")]
+    #[test_case(CODE_FENCE, 8; "wrapped")]
+    #[test_case("```sh\necho hi\n```", 8; "single_line")]
+    #[test_case("```sh\necho hi\necho bye", 8; "unclosed")]
+    #[test_case("````text\na\n```\n\tb\n````", 8; "longer_fence_and_tabs")]
+    fn code_rows_share_the_entire_fence_source(input: &str, width: u16) {
+        let lines = render(input, width);
+        let code: Vec<_> = lines
+            .iter()
+            .filter(|line| line.kind == LineKind::Code)
+            .collect();
+        assert!(!code.is_empty());
+        for line in code {
+            assert_eq!(line.source, Some(0..input.len() as u32));
+        }
+        assert_eq!(rebuild_from_line_sources(input, width), input);
+    }
+
+    #[test_case(TEST_WIDTH, &["let x = \"é界\";", "", "    x"]; "wide")]
+    #[test_case(8, &["let x ", "= \"é界\"", ";", "", "    x"]; "wrapped")]
+    fn grouped_code_rows_keep_precise_body_spans(width: u16, expected: &[&str]) {
+        let lines = render(CODE_FENCE, width);
+        let mut rows = Vec::new();
+        let mut ranges = Vec::new();
+        for line in lines.iter().filter(|line| line.kind == LineKind::Code) {
+            let mut body = String::new();
+            for span in &line.spans {
+                if span.source == SpanSource::Chrome {
+                    continue;
+                }
+                let SpanSource::Range(source) = &span.source else {
+                    panic!("{span:?}");
+                };
+                assert!(source.verbatim);
+                assert_eq!(
+                    &CODE_FENCE[source.range.start as usize..source.range.end as usize],
+                    span.text
+                );
+                ranges.push(source.range.clone());
+                body.push_str(&span.text);
+            }
+            rows.push(body);
+        }
+        assert_eq!(rows, expected);
+        assert_eq!(source_text(CODE_FENCE, ranges), CODE_BODY);
     }
 
     fn math_spans(lines: &[Line]) -> Vec<&str> {

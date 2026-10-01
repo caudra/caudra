@@ -33,6 +33,34 @@ impl LineProvenance {
             spans: vec![SpanSource::Chrome; span_count],
         }
     }
+
+    pub fn keep_rows(lines: &[Self], kept: Range<usize>) -> Option<Vec<Self>> {
+        let mut rows = lines.get(kept.clone())?.to_vec();
+        let mut start = kept.start;
+        for group in rows.chunk_by_mut(|a, b| a.line.is_some() && a.line == b.line) {
+            let end = start + group.len();
+            let cut = group[0].line.as_ref().is_some_and(|range| {
+                (start > 0 && lines[start - 1].line.as_ref() == Some(range))
+                    || lines
+                        .get(end)
+                        .is_some_and(|row| row.line.as_ref() == Some(range))
+            });
+            if cut {
+                let range =
+                    bridged(group.iter().flat_map(|row| &row.spans).filter_map(
+                        |span| match span {
+                            SpanSource::Range(source) => Some(source.range.clone()),
+                            SpanSource::Chrome | SpanSource::Unknown => None,
+                        },
+                    ));
+                for row in group {
+                    row.line = range.clone();
+                }
+            }
+            start = end;
+        }
+        Some(rows)
+    }
 }
 
 /// Provenance for a rendered message, plus the exact text its ranges index.
@@ -65,6 +93,10 @@ impl Provenance {
     /// painted lines they belong to somewhere else.
     pub fn lines_in(&self, range: Range<usize>) -> Option<Vec<LineProvenance>> {
         self.lines.get(range).map(<[LineProvenance]>::to_vec)
+    }
+
+    pub fn kept_lines(&self, range: Range<usize>) -> Option<Vec<LineProvenance>> {
+        LineProvenance::keep_rows(&self.lines, range)
     }
 
     /// Replaces the rows of a spliced line range. A re-highlighted body changes
@@ -190,7 +222,7 @@ impl Provenance {
                 }
             }
             match block {
-                Some(_) => ranges.extend(bridged(&spans)),
+                Some(_) => ranges.extend(bridged(spans.into_iter())),
                 None => ranges.extend(spans),
             }
         }
@@ -218,10 +250,8 @@ fn char_count(line: &Line<'_>) -> usize {
 }
 
 /// One slice from the first byte `spans` cover to the last.
-fn bridged(spans: &[Range<u32>]) -> Option<Range<u32>> {
-    let start = spans.iter().map(|span| span.start).min()?;
-    let end = spans.iter().map(|span| span.end).max()?;
-    Some(start..end)
+fn bridged(spans: impl Iterator<Item = Range<u32>>) -> Option<Range<u32>> {
+    spans.reduce(|a, b| a.start.min(b.start)..a.end.max(b.end))
 }
 
 /// Char index at which each display row of a wrapped line starts.
@@ -327,6 +357,14 @@ fn span_ranges(
         let (start, end) = (at, at + len);
         at = end;
 
+        if len == 0
+            && covered.start == 0
+            && covered.end == char_count(line)
+            && let SpanSource::Range(source) = source
+        {
+            out.push(source.range.clone());
+            continue;
+        }
         if end <= covered.start || start >= covered.end {
             continue;
         }
@@ -355,7 +393,9 @@ mod tests {
     use super::*;
     use crate::markdown::{text_to_painted, text_to_rows};
     use crate::selection::line_text;
+    use caudra_markdown::render::CODE_BAR;
     use ratatui::style::Style;
+    use test_case::test_case;
 
     const WIDTH: u16 = 40;
     const WRONG_BYTE: &str = "the cell does not name the source byte behind it";
@@ -377,6 +417,10 @@ mod tests {
     const UNWRAPPED: &str = "the paragraph has to wrap for this to test anything";
     const NO_ROW: &str = "no row starts with";
     const NO_COPY: &str = "the sweep copied nothing";
+    const CLIPPED_CODE: &str = "```text\nalpha\nbeta\ngamma\ndelta\n```";
+    const BLANK_CODE: &str = "```text\nalpha\n\nbeta\n\ngamma\n```";
+    const CODE_FIRST: &str = "alpha";
+    const INVALID_ROWS: &str = "the retained rows are outside the source";
 
     fn painted(text: &str, width: u16) -> (Vec<Line<'static>>, Provenance) {
         let (painted, parsed) = text_to_painted(
@@ -410,6 +454,205 @@ mod tests {
 
     fn end_of(lines: &[Line<'_>], row: usize) -> (usize, usize) {
         (row, line_text(&lines[row]).chars().count())
+    }
+
+    fn copy_all(lines: &[Line<'_>], provenance: &Provenance, width: u16) -> String {
+        let copied = provenance
+            .extract_rows(lines, (0, 0), end_of(lines, lines.len() - 1))
+            .expect(NO_COPY);
+        let selection = ScreenSelection {
+            start_row: 0,
+            start_col: 0,
+            end_row: lines.len() as u16 - 1,
+            end_col: width - 1,
+        };
+        assert_eq!(
+            provenance.extract(lines, width, &selection, 0, lines.len() as u16),
+            Some(copied.clone()),
+            "{SOURCE_LOST}"
+        );
+        copied
+    }
+
+    #[test_case(CLIPPED_CODE, 0..2, 0, "alpha\nbeta"; "prefix")]
+    #[test_case(CLIPPED_CODE, 2..4, 0, "gamma\ndelta"; "suffix")]
+    #[test_case(CLIPPED_CODE, 1..3, 0, "beta\ngamma"; "middle")]
+    #[test_case(CLIPPED_CODE, 0..4, CODE_BAR.chars().count(), "alpha\nbeta\ngamma\ndelta"; "body_only")]
+    #[test_case(CLIPPED_CODE, 0..4, CODE_BAR.chars().count() + 2, "pha\nbeta\ngamma\ndelta"; "partial_word")]
+    #[test_case(BLANK_CODE, 1..3, 0, "\nbeta"; "leading_blank_row")]
+    #[test_case(BLANK_CODE, 2..4, 0, "beta\n"; "trailing_blank_row")]
+    #[test_case(BLANK_CODE, 1..4, 0, "\nbeta\n"; "both_blank_rows")]
+    #[test_case(BLANK_CODE, 1..3, CODE_BAR.chars().count() - 1, "beta"; "partial_blank_gutter")]
+    fn partial_code_selections_copy_no_fences(
+        text: &str,
+        selected: Range<usize>,
+        start_col: usize,
+        expected: &str,
+    ) {
+        let (lines, provenance) = painted(text, WIDTH);
+        let first = row_with(&lines, &format!("{CODE_BAR}{CODE_FIRST}"));
+        let start = first + selected.start;
+        let last = first + selected.end - 1;
+        let selection = ScreenSelection {
+            start_row: start as u16,
+            start_col: start_col as u16,
+            end_row: last as u16,
+            end_col: WIDTH - 1,
+        };
+
+        assert_eq!(
+            provenance
+                .extract_rows(&lines, (start, start_col), end_of(&lines, last))
+                .as_deref(),
+            Some(expected),
+            "{OVER_COPIED}"
+        );
+        assert_eq!(
+            provenance
+                .extract(&lines, WIDTH, &selection, start as u16, last as u16 + 1)
+                .as_deref(),
+            Some(expected),
+            "{OVER_COPIED}"
+        );
+    }
+
+    #[test_case("alpha\n\nbeta", true; "blank_lines")]
+    #[test_case("\talpha\n\t\tbeta", true; "tabs")]
+    #[test_case("é界\n    beta", true; "unicode_and_indentation")]
+    #[test_case("alpha\n```\nbeta", true; "literal_backticks")]
+    #[test_case("alpha\nbeta", false; "streaming")]
+    fn selecting_code_text_preserves_its_body_bytes(body: &str, closed: bool) {
+        let text = format!("````text\n{body}{}", if closed { "\n````" } else { "" });
+        let (lines, provenance) = painted(&text, WIDTH);
+        let first = row_with(&lines, CODE_BAR);
+
+        assert_eq!(
+            provenance
+                .extract_rows(
+                    &lines,
+                    (first, CODE_BAR.chars().count()),
+                    end_of(&lines, lines.len() - 1),
+                )
+                .as_deref(),
+            Some(body),
+            "{SOURCE_LOST}"
+        );
+    }
+
+    #[test_case(0..2, "alpha\nbeta"; "prefix")]
+    #[test_case(2..4, "gamma\ndelta"; "suffix")]
+    #[test_case(1..3, "beta\ngamma"; "middle")]
+    #[test_case(0..4, CLIPPED_CODE; "whole_block")]
+    fn retained_code_rows_copy_only_their_source(kept: Range<usize>, expected: &str) {
+        let (lines, provenance) = painted(CLIPPED_CODE, WIDTH);
+        let first = row_with(&lines, &format!("{CODE_BAR}{CODE_FIRST}"));
+        let kept = first + kept.start..first + kept.end;
+        let retained = Provenance::new(
+            Arc::clone(provenance.source()),
+            provenance.kept_lines(kept.clone()).expect(INVALID_ROWS),
+        );
+
+        assert_eq!(
+            copy_all(&lines[kept], &retained, WIDTH),
+            expected,
+            "{OVER_COPIED}"
+        );
+    }
+
+    #[test_case(0..1, "alpha"; "prefix")]
+    #[test_case(1..2, "beta"; "middle")]
+    #[test_case(2..3, "gamma"; "suffix")]
+    fn repeated_clipping_narrows_the_code_again(kept: Range<usize>, expected: &str) {
+        let (lines, provenance) = painted(CLIPPED_CODE, WIDTH);
+        let first = row_with(&lines, &format!("{CODE_BAR}{CODE_FIRST}"));
+        let outer = first..first + 3;
+        let retained = Provenance::new(
+            Arc::clone(provenance.source()),
+            provenance.kept_lines(outer.clone()).expect(INVALID_ROWS),
+        );
+        let narrowed = Provenance::new(
+            Arc::clone(provenance.source()),
+            retained.kept_lines(kept.clone()).expect(INVALID_ROWS),
+        );
+
+        assert_eq!(
+            copy_all(&lines[outer][kept], &narrowed, WIDTH),
+            expected,
+            "{OVER_COPIED}"
+        );
+    }
+
+    #[test_case(0..1; "prefix")]
+    #[test_case(1..2; "middle")]
+    #[test_case(2..3; "suffix")]
+    fn clipping_a_wrapped_code_line_does_not_restore_its_other_rows(kept: Range<usize>) {
+        const CODE: &str = "```text\nabcdefghijklmnopqrstuvwxyz0123456789\n```";
+        let (lines, provenance) = painted(CODE, ROWS_WIDTH);
+        let first = row_with(&lines, &format!("{CODE_BAR}abc"));
+        let kept = first + kept.start..first + kept.end;
+        let expected: String = lines[kept.start]
+            .spans
+            .iter()
+            .zip(&provenance.lines[kept.start].spans)
+            .filter(|(_, source)| matches!(source, SpanSource::Range(_)))
+            .map(|(span, _)| span.content.as_ref())
+            .collect();
+        let retained = Provenance::new(
+            Arc::clone(provenance.source()),
+            provenance.kept_lines(kept.clone()).expect(INVALID_ROWS),
+        );
+
+        assert_eq!(
+            copy_all(&lines[kept], &retained, ROWS_WIDTH),
+            expected,
+            "{OVER_COPIED}"
+        );
+    }
+
+    #[test_case(0..0; "empty")]
+    #[test_case(0..usize::MAX; "past_end")]
+    fn retaining_invalid_or_empty_rows_is_bounded(kept: Range<usize>) {
+        let (_, provenance) = painted(CLIPPED_CODE, WIDTH);
+        let rows = provenance.kept_lines(kept.clone());
+        assert_eq!(rows.as_ref().map(Vec::len), kept.is_empty().then_some(0));
+    }
+
+    #[test_case(false; "blank_body")]
+    #[test_case(true; "atomic_tab_body")]
+    fn clipped_rows_preserve_blank_and_atomic_sources(tab: bool) {
+        let middle = if tab { "\tbeta" } else { "" };
+        let text = format!("```text\nalpha\n{middle}\ngamma\n```");
+        let (lines, provenance) = painted(&text, WIDTH);
+        let first = row_with(&lines, &format!("{CODE_BAR}{CODE_FIRST}"));
+        let kept = first + 1..first + 2;
+        let retained = Provenance::new(
+            Arc::clone(provenance.source()),
+            provenance.kept_lines(kept.clone()).expect(INVALID_ROWS),
+        );
+
+        assert_eq!(
+            copy_all(&lines[kept], &retained, WIDTH),
+            middle,
+            "{OVER_COPIED}"
+        );
+    }
+
+    #[test_case(ROWS_WIDTH; "wrapped")]
+    #[test_case(WIDTH; "wide")]
+    fn clipping_prose_keeps_a_complete_inner_fence(width: u16) {
+        let text = format!("{PARAGRAPH}\n\n{FENCE}\n\n{PARAGRAPH}");
+        let (painted, source) = text_to_rows(&text, Style::default(), width, Vec::new());
+        let provenance = Provenance::new(source, painted.provenance);
+        let lines = painted.lines;
+        let kept = 1..lines.len() - 1;
+        let retained = Provenance::new(
+            Arc::clone(provenance.source()),
+            provenance.kept_lines(kept.clone()).expect(INVALID_ROWS),
+        );
+
+        let copied = copy_all(&lines[kept], &retained, width);
+        assert!(copied.contains(FENCE), "{SOURCE_LOST}: {copied}");
+        assert!(!copied.contains(PARAGRAPH), "{OVER_COPIED}: {copied}");
     }
 
     #[test]

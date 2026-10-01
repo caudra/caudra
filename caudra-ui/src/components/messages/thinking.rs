@@ -86,7 +86,7 @@ pub(super) fn assemble(
         .collect();
     chrome.push(LineProvenance::chrome(0));
     let mut provenance = body.provenance.and_then(|source| {
-        chrome.extend(source.lines_in(start..end)?);
+        chrome.extend(source.kept_lines(start..end)?);
         Some(Provenance::new(Arc::clone(source.source()), chrome))
     });
     let diagrams = body
@@ -139,6 +139,8 @@ pub(super) fn assemble(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::markdown::text_to_rows;
+    use ratatui::style::Style;
     use std::ops::Range;
     use test_case::test_case;
 
@@ -155,6 +157,49 @@ mod tests {
     const DIAGRAM_ID: u16 = 7;
     const DIAGRAM_ROWS: Range<usize> = 2..5;
     const DIAGRAM_WIDTH: u16 = 120;
+    const COPY_FENCE: &str = "```text\nalpha\nbeta\ngamma\ndelta\n```";
+    const COPY_WIDTH: u16 = 40;
+    const COPY_WINDOW_ROWS: usize = 2;
+    const COPY_SOURCE_MISSING: &str = "the reasoning window lost its source";
+    const COPY_HIDDEN_ROWS: &str = "the copy included code outside the reasoning window";
+
+    #[test_case(None, COPY_FENCE; "complete_block")]
+    #[test_case(Some((0, false)), "alpha"; "prefix")]
+    #[test_case(Some((2, false)), "beta\ngamma"; "middle")]
+    #[test_case(Some((0, true)), "gamma\ndelta"; "suffix")]
+    fn copying_a_reasoning_window_keeps_only_visible_code(
+        window: Option<(usize, bool)>,
+        expected: &str,
+    ) {
+        let (painted, source) = text_to_rows(COPY_FENCE, Style::default(), COPY_WIDTH, Vec::new());
+        let provenance = Provenance::new(source, painted.provenance);
+        let built = assemble(
+            vec![Line::from(HEADER)],
+            Body {
+                lines: &painted.lines,
+                links: &painted.links,
+                provenance: Some(&provenance),
+                diagrams: &painted.diagrams,
+            },
+            window.map(|(offset, follow)| ScrollWindow {
+                height: COPY_WINDOW_ROWS,
+                offset,
+                follow,
+            }),
+            ScrollTail::Settled,
+        );
+        let provenance = built.provenance.expect(COPY_SOURCE_MISSING);
+        let last = built.lines.len() - 1;
+        let end = (last, built.lines[last].to_string().chars().count());
+
+        assert_eq!(
+            provenance
+                .extract_rows(&built.lines, (0, 0), end)
+                .as_deref(),
+            Some(expected),
+            "{COPY_HIDDEN_ROWS}"
+        );
+    }
 
     fn body_lines() -> Vec<Line<'static>> {
         (0..BODY_ROWS)

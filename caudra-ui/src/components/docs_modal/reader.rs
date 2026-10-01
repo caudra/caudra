@@ -463,9 +463,11 @@ fn source_lines(provenance: &[LineProvenance], starts: &[usize]) -> Vec<usize> {
         .iter()
         .map(|row| {
             if let Some(byte) = source_byte(row) {
-                line = starts
-                    .partition_point(|&start| start <= byte)
-                    .saturating_sub(1);
+                line = line.max(
+                    starts
+                        .partition_point(|&start| start <= byte)
+                        .saturating_sub(1),
+                );
             }
             line
         })
@@ -473,12 +475,14 @@ fn source_lines(provenance: &[LineProvenance], starts: &[usize]) -> Vec<usize> {
 }
 
 fn source_byte(row: &LineProvenance) -> Option<usize> {
-    let byte = row.line.as_ref().map(|range| range.start).or_else(|| {
-        row.spans.iter().find_map(|span| match span {
+    let byte = row
+        .spans
+        .iter()
+        .find_map(|span| match span {
             SpanSource::Range(source) => Some(source.range.start),
             SpanSource::Chrome | SpanSource::Unknown => None,
         })
-    })?;
+        .or_else(|| row.line.as_ref().map(|range| range.start))?;
     usize::try_from(byte).ok()
 }
 
@@ -632,6 +636,8 @@ mod tests {
     const MIXED_CASE: &str = "A Timeout, then a TIMEOUT.";
     const SPAN_HEAD: &str = "A Time";
     const SPAN_TAIL: &str = "out, then";
+    const MULTILINE_CODE: &str = "```text\nabcdefghij\nklmnop\n```";
+    const BLANK_CODE: &str = "```text\nabcdefghij\n\nklmnop\n```";
     /// Where "Timeout" sits in the two spans joined, straddling their seam.
     const ACROSS_SPANS: Range<usize> = 2..9;
     /// The source line each of five rows shows, with no row for lines 1 and 3.
@@ -690,5 +696,32 @@ mod tests {
     #[test_case(9, 4 ; "a_line_past_the_last_row")]
     fn a_line_lands_on_the_first_row_at_or_after_it(line: usize, expected: usize) {
         assert_eq!(row_of_line(&ROW_LINES, line), expected);
+    }
+
+    #[test_case(MULTILINE_CODE, 80, &[0, 1, 2]; "multiline")]
+    #[test_case(MULTILINE_CODE, 8, &[0, 1, 1, 2]; "wrapped")]
+    #[test_case(BLANK_CODE, 80, &[0, 1, 2, 3]; "blank")]
+    #[test_case(BLANK_CODE, 8, &[0, 1, 1, 2, 3]; "wrapped_blank")]
+    fn code_rows_map_to_body_source_lines(input: &str, width: u16, expected: &[usize]) {
+        let (painted, source) = text_to_rows(input, Style::default(), width, Vec::new());
+        assert_eq!(
+            source_lines(&painted.provenance, &line_starts(&source)),
+            expected
+        );
+    }
+
+    #[test_case(80, &[0, 1, 1, 3]; "wide")]
+    #[test_case(8, &[0, 1, 1, 1, 3]; "wrapped")]
+    fn chrome_only_code_rows_do_not_jump_back_to_the_fence(width: u16, expected: &[usize]) {
+        let (mut painted, source) = text_to_rows(BLANK_CODE, Style::default(), width, Vec::new());
+        for row in &mut painted.provenance {
+            row.spans.retain(
+                |span| !matches!(span, SpanSource::Range(source) if source.range.is_empty()),
+            );
+        }
+        assert_eq!(
+            source_lines(&painted.provenance, &line_starts(&source)),
+            expected
+        );
     }
 }

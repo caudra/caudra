@@ -63,6 +63,20 @@ const JOB_COMMAND: &str = "cargo nextest run -p caudra-ui";
 const JOB_TIMEOUT_MS: u64 = 1_200_000;
 const TASK_CONTROL_TOOL: &str = "task_control";
 const ONE_COMMAND_MSG: &str = "a background shell job shows its command once";
+const FENCED_COPY_WIDTH: u16 = 80;
+const FENCED_COPY_NARROW: u16 = 32;
+const FENCED_COPY_HEIGHT: u16 = 60;
+const GDBUS_COMMAND: &str = "gdbus call --session \\\n        --dest org.freedesktop.portal.Desktop \\\n        --object-path /org/freedesktop/portal/desktop \\\n        --method org.freedesktop.portal.Settings.Read \\\n        org.freedesktop.appearance color-scheme";
+const GDBUS_START: &str = "gdbus";
+const GDBUS_END: &str = "color-scheme";
+const SECOND_CODE: &str = "literal ``` stays\n\n  café\t界\n  second_done";
+const SECOND_CODE_START: &str = "literal";
+const SECOND_CODE_END: &str = "second_done";
+const BETWEEN_CODE_BLOCKS: &str = "Between **blocks**.";
+const FENCED_COPY_ROW_MSG: &str = "the rendered fixture must contain the selected text";
+const FENCED_COPY_WRAP_MSG: &str = "only the narrow fixture must soft-wrap the command";
+const FENCED_COMMAND_COPY_MSG: &str = "a command selection copies exact code without hidden fences";
+const FENCED_SOURCE_COPY_MSG: &str = "a complete block selection keeps the original Markdown";
 
 fn live_task_card(call: &str, state: &str) -> TaskCard {
     serde_json::from_value(serde_json::json!({
@@ -2245,6 +2259,120 @@ fn panel_with_msgs(texts: &[&str], width: u16, height: u16) -> MessagesPanel {
     }
     render(&mut panel, width, height);
     panel
+}
+
+fn message_selection_ends(shown: &str, needle: &str) -> ((u32, u16), (u32, u16)) {
+    shown
+        .lines()
+        .enumerate()
+        .find_map(|(row, line)| {
+            let byte = line.find(needle)?;
+            let start = line[..byte].width() as u16;
+            let end = start + needle.width() as u16 - 1;
+            Some(((row as u32, start), (row as u32, end)))
+        })
+        .expect(FENCED_COPY_ROW_MSG)
+}
+
+#[test_case(FENCED_COPY_WIDTH, false, true; "wide_settled")]
+#[test_case(FENCED_COPY_NARROW, false, true; "wrapped_settled")]
+#[test_case(FENCED_COPY_WIDTH, true, true; "wide_streaming_closed")]
+#[test_case(FENCED_COPY_NARROW, true, true; "wrapped_streaming_closed")]
+#[test_case(FENCED_COPY_WIDTH, true, false; "wide_streaming_unclosed")]
+#[test_case(FENCED_COPY_NARROW, true, false; "wrapped_streaming_unclosed")]
+fn copying_a_multiline_command_does_not_copy_hidden_fences(
+    width: u16,
+    streaming: bool,
+    closed: bool,
+) {
+    let mut source = format!("```sh\n{GDBUS_COMMAND}");
+    if closed {
+        source.push_str("\n```");
+    }
+    let mut panel = if streaming {
+        let mut panel = MessagesPanel::new(
+            UiConfig {
+                typewriter_ms_per_char: 0,
+                ..UiConfig::default()
+            },
+            EventHandle::disconnected_for_test(),
+        );
+        panel.streaming_text.set_buffer(&source);
+        panel
+    } else {
+        panel_with_msgs(&[&source], width, FENCED_COPY_HEIGHT)
+    };
+    let area = Rect::new(0, 0, width, FENCED_COPY_HEIGHT);
+    let shown = buffer_text(&render(&mut panel, width, FENCED_COPY_HEIGHT));
+    let (start, _) = message_selection_ends(&shown, GDBUS_START);
+    let (_, last) = message_selection_ends(&shown, GDBUS_END);
+    assert_eq!(
+        last.0 - start.0 + 1 > GDBUS_COMMAND.lines().count() as u32,
+        width == FENCED_COPY_NARROW,
+        "{FENCED_COPY_WRAP_MSG}"
+    );
+
+    for end in [last, (last.0, width - 1), (last.0 + 1, width - 1)] {
+        for (anchor, cursor) in [(start, end), (end, start)] {
+            let selection = make_sel(area, anchor, cursor);
+            assert_eq!(
+                panel.extract_selection_text(&selection, area),
+                GDBUS_COMMAND,
+                "{FENCED_COMMAND_COPY_MSG}: {anchor:?} to {cursor:?}"
+            );
+        }
+    }
+    let start = (start.0, 0);
+    let end = (last.0, width - 1);
+    for (anchor, cursor) in [(start, end), (end, start)] {
+        let selection = make_sel(area, anchor, cursor);
+        assert_eq!(
+            panel.extract_selection_text(&selection, area),
+            source,
+            "{FENCED_SOURCE_COPY_MSG}"
+        );
+    }
+}
+
+#[test_case(FENCED_COPY_WIDTH; "wide")]
+#[test_case(FENCED_COPY_NARROW; "wrapped")]
+fn copying_two_code_blocks_and_prose_preserves_source_markdown(width: u16) {
+    let first = format!("```sh\n{GDBUS_COMMAND}\n```");
+    let second = format!("````text\n{SECOND_CODE}\n````");
+    let blocks = format!("{first}\n\n{BETWEEN_CODE_BLOCKS}\n\n{second}");
+    let source = format!("Before.\n\n{blocks}\n\nAfter.");
+    let mut panel = panel_with_msgs(&[&source], width, FENCED_COPY_HEIGHT);
+    let area = Rect::new(0, 0, width, FENCED_COPY_HEIGHT);
+    let shown = buffer_text(&render(&mut panel, width, FENCED_COPY_HEIGHT));
+    let (first_start, _) = message_selection_ends(&shown, GDBUS_START);
+    let (_, first_end) = message_selection_ends(&shown, GDBUS_END);
+    let (second_start, _) = message_selection_ends(&shown, SECOND_CODE_START);
+    let (_, second_end) = message_selection_ends(&shown, SECOND_CODE_END);
+
+    for (start, end, expected) in [
+        ((0, 0), (panel.last_total_lines, width - 1), source.as_str()),
+        ((first_start.0, 0), (first_end.0, width - 1), first.as_str()),
+        (
+            (second_start.0, 0),
+            (second_end.0, width - 1),
+            second.as_str(),
+        ),
+        (
+            (first_start.0, 0),
+            (second_end.0, width - 1),
+            blocks.as_str(),
+        ),
+        (second_start, second_end, SECOND_CODE),
+    ] {
+        for (anchor, cursor) in [(start, end), (end, start)] {
+            let selection = make_sel(area, anchor, cursor);
+            assert_eq!(
+                panel.extract_selection_text(&selection, area),
+                expected,
+                "{FENCED_SOURCE_COPY_MSG}: {anchor:?} to {cursor:?}"
+            );
+        }
+    }
 }
 
 #[test]

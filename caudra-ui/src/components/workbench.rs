@@ -97,6 +97,10 @@ mod tests {
     const HEADING: &str = "## Heading";
     const PARAGRAPH: &str = "Some **bold** words and a [link](./target) that wrap.";
     const FENCE: &str = "```rust\nlet x = 1;\n```";
+    const MULTILINE_CODE: &str =
+        "gdbus call --session \\\n  --dest org.gnome.ScreenSaver \\\n  true";
+    const MULTILINE_START: &str = "gdbus";
+    const MULTILINE_END: &str = "true";
     const TABLE: &str = "| left | right |\n| --- | --- |\n| alpha | beta |";
     const DIAGRAM: &str = "```mermaid\nflowchart LR\n    Start --> Finish\n```";
     const LIST: &str = "- first\n- **second**";
@@ -212,6 +216,40 @@ mod tests {
             Some(expected),
             "{NO_COPY}"
         );
+    }
+
+    #[test_case(WIDTH, false; "wide_exact_end")]
+    #[test_case(WIDTH, true; "wide_past_end")]
+    #[test_case(NARROW, false; "wrapped_exact_end")]
+    #[test_case(NARROW, true; "wrapped_past_end")]
+    fn a_multiline_code_selection_copies_no_hidden_fences(width: u16, past_end: bool) {
+        let block = format!("```sh\n{MULTILINE_CODE}\n```");
+        let source = format!("{HEAD}\n\n{block}\n\n{TAIL}");
+        let painted = paint_markdown(&source, width);
+        let (start, _) = ends(&painted, MULTILINE_START);
+        let (_, end) = ends(&painted, MULTILINE_END);
+        let end = if past_end {
+            (end.0, usize::from(width))
+        } else {
+            end
+        };
+        for (anchor, cursor) in [(start, end), (end, start)] {
+            assert_eq!(
+                painted.selected_text(anchor, cursor).as_deref(),
+                Some(MULTILINE_CODE),
+                "{NO_COPY}"
+            );
+        }
+
+        let start = (start.0, 0);
+        let end = (end.0, painted.lines()[end.0].to_string().chars().count());
+        for (anchor, cursor) in [(start, end), (end, start)] {
+            assert_eq!(
+                painted.selected_text(anchor, cursor).as_deref(),
+                Some(block.as_str()),
+                "{NO_COPY}"
+            );
+        }
     }
 
     #[test_case(FENCE, CODE_BAR ; "code gutter")]

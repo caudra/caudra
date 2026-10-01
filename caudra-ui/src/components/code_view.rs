@@ -214,7 +214,7 @@ impl BodySource {
     /// longer be told to line up. The blocks move with them, or a fence would
     /// land around rows the window never drew.
     pub(crate) fn keep_rows(mut self, kept: Range<usize>) -> Option<Self> {
-        self.rows = self.rows.get(kept.clone())?.to_vec();
+        self.rows = LineProvenance::keep_rows(&self.rows, kept.clone())?;
         self.code = self
             .code
             .into_iter()
@@ -3717,6 +3717,7 @@ mod tests {
     use crate::animation::test_clock::FrozenClock;
     use crate::components::tool_display::{AWAITING_APPROVAL, WRITING_COMMAND};
     use crate::markdown::{EXPAND_AFFORDANCE, TRUNCATION_PREFIX};
+    use crate::provenance::Provenance;
     use caudra_agent::tools::{
         BATCH_TOOL_NAME, FILE_GREP_TOOL_NAME, FILE_READ_TOOL_NAME, SKILL_TOOL_NAME, ToolEffect,
     };
@@ -5196,6 +5197,39 @@ mod tests {
         "found the middleware, the router, and the two call sites that bypass both";
     const CODE_GUTTER: &str = caudra_markdown::render::CODE_BAR_WRAP;
     const NARROW_BODY_WIDTH: u16 = 24;
+    const COPY_FENCE: &str = "```text\nalpha\nbeta\ngamma\ndelta\nepsilon\nzeta\n```";
+    const COPY_WINDOW_ROWS: usize = 2;
+    const COPY_SOURCE_MISSING: &str = "the Markdown child lost its source";
+    const COPY_HIDDEN_ROWS: &str = "the copy included code outside the child's visible rows";
+
+    #[test_case(None, 3, "alpha\nbeta"; "capped_head")]
+    #[test_case(Some((2, false)), usize::MAX, "beta\ngamma"; "middle_window")]
+    #[test_case(Some((0, true)), usize::MAX, "epsilon\nzeta"; "following_tail")]
+    #[test_case(None, usize::MAX, COPY_FENCE; "complete_block")]
+    fn copying_a_markdown_child_keeps_only_visible_code(
+        scroll: Option<(usize, bool)>,
+        budget: usize,
+        expected: &str,
+    ) {
+        let limits = RenderLimits::new(false, budget, BatchViews::default(), TOOL_LINES)
+            .with_width(NARROW_BODY_WIDTH)
+            .with_scroll(scroll.map(|(offset, follow)| ScrollWindow {
+                height: COPY_WINDOW_ROWS,
+                offset,
+                follow,
+            }));
+        let body = child_body(&markdown_entry(COPY_FENCE), false, &limits, None);
+        let source = body.source.expect(COPY_SOURCE_MISSING);
+        let provenance = Provenance::new(source.text.into(), source.rows);
+        let last = body.lines.len() - 1;
+        let end = (last, body.lines[last].to_string().chars().count());
+
+        assert_eq!(
+            provenance.extract_rows(&body.lines, (0, 0), end).as_deref(),
+            Some(expected),
+            "{COPY_HIDDEN_ROWS}"
+        );
+    }
 
     /// A fenced block the line budget cut before its closing fence, which is
     /// what `truncate_output` hands the card for any structured task result.
