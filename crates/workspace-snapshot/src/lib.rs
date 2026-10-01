@@ -1,64 +1,59 @@
 #![forbid(unsafe_code)]
 
-//! Workspace snapshots for Workcell hosts: bounded captures of the session directory into a
-//! private git object store, and journaled restores between any two of them.
+//! Workspace change records for Workcell hosts. A record captures one call's scope before and
+//! after the call into a private git object store and keeps what changed; any of a holder's
+//! records can then be reverted, journaled so a crash never leaves a revert unaccounted for.
+//!
+//! Several processes may share one store: every operation takes the store's lock for as long as
+//! it runs, and never longer.
 
 mod capture;
 mod cleanup;
-mod restore;
+mod format;
+mod holders;
+mod recording;
+mod revert;
 mod snapshot;
 mod store;
 
-pub use capture::{SnapshotCapturePhase, SnapshotCaptureProgress, SnapshotCaptureProgressSink};
-
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::BTreeSet,
     fmt::Write as _,
+    future::{self, Future},
     mem::size_of,
     path::{Component, Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 use workcell_host_contract::{
-    ContractVersion, Cursor, Identifier, MAX_PAGE_SIZE, MAX_SNAPSHOT_CAPTURE_ENTRIES,
-    MAX_SNAPSHOT_CAPTURE_PATH_BYTES, MAX_SNAPSHOT_CLEANUP, MAX_SNAPSHOT_COUNT,
-    MAX_SNAPSHOT_FILE_BYTES, MAX_SNAPSHOT_FILES, MAX_SNAPSHOT_STORAGE_BYTES,
-    MAX_SNAPSHOT_TOTAL_BYTES, ResourceId, Revision, SnapshotAcknowledgeResponse,
-    SnapshotCaptureLimits, SnapshotCaptureResponse, SnapshotCleanupPreview,
-    SnapshotCleanupResponse, SnapshotInspectResponse, SnapshotLimit, SnapshotRestorePreview,
-    SnapshotRestoreStatus, SnapshotStatusResponse, WorkspacePath, WorkspaceSnapshotCapability,
-    WorkspaceSnapshotLimits, WorkspaceSnapshotMethods,
+    ChangeInventory, CleanupPreview, CleanupSummary, ContractVersion, HolderSummary, Identifier,
+    MAX_OPEN_RECORDS, MAX_RECORD_CLIENT_BYTES, MAX_RECORD_HOLDER_BYTES, MAX_RECORD_PAGE_SIZE,
+    MAX_RECORD_SCOPE_PATHS, MAX_REVERT_RECORDS, MAX_SNAPSHOT_CAPTURE_ENTRIES,
+    MAX_SNAPSHOT_CAPTURE_PATH_BYTES, MAX_SNAPSHOT_FILE_BYTES, MAX_SNAPSHOT_FILES,
+    MAX_SNAPSHOT_STORAGE_BYTES, MAX_SNAPSHOT_TOTAL_BYTES, OpenRecord, RecordHolder, RecordPage,
+    RecordRequest, RecordSummary, ReleaseSelection, ReleaseSummary, RevertDirection, RevertPreview,
+    RevertStatus, SnapshotLimit, WorkspaceChangesCapability, WorkspaceChangesLimits,
+    WorkspaceChangesMethods, WorkspacePath,
 };
-use workcell_mcp_files::{
-    RootResourceKind, SnapshotTreeError, SnapshotTreeLimit, WorkspaceSnapshotAccess,
-    WorkspaceSnapshotScope, root_relative_resource_id,
-};
-use workcell_snapshot_store::{Meta, SnapshotId};
+use workcell_mcp_files::{SnapshotTreeError, SnapshotTreeLimit, WorkspaceSnapshotAccess};
+use workcell_snapshot_store::within;
 
 use crate::{
-    capture::{CaptureProgress, capture_response, validate_limits},
     cleanup::CleanupPlan,
-    restore::{JOURNAL_VERSION, LEGACY_JOURNAL_VERSIONS, RestorePlan, StoredJournal},
-    snapshot::{parse_snapshot_id, store_error, summary},
-    store::{CHECKPOINTS, DIGEST_PREFIX, JOURNALS, Store},
+    format::{StoredState, count},
+    revert::RevertPlan,
+    store::{DIGEST_PREFIX, OPEN, RECORDS, REVERTS, Store, probe_umask},
 };
 
-const CHECKPOINT_VERSION: &str = "workspace-snapshot-checkpoint.v2";
-/// What earlier releases wrote, which nothing reads any more.
-const LEGACY_CHECKPOINT_VERSIONS: [&str; 1] = ["workspace-snapshot-checkpoint.v1"];
-const CAPTURE_ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
+const ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
 const CAPTURE_EXECUTION_BUDGET: Duration = Duration::from_secs(15 * 60);
-const MAX_PRIVATE_METADATA_BYTES: u64 = 2 * 1_024 * 1_024;
 const MAX_EXCLUSIONS: usize = 32;
-const LEASE_PREFIX: &str = "lease_";
-const CLEANUP_SCOPE_PREFIX: &str = "snapshot-store:cleanup:";
-const CURSOR_SEPARATOR: char = ':';
+const CLEANUP_SCOPE_PREFIX: &str = "workspace-changes:cleanup:";
 const DEFAULT_EXCLUSIONS: &[&str] = &[
     ".git",
     ".ssh",
@@ -68,72 +63,8 @@ const DEFAULT_EXCLUSIONS: &[&str] = &[
     ".pypirc",
     ".netrc",
 ];
-
-#[derive(Clone)]
-pub struct SnapshotManager {
-    inner: Arc<SnapshotInner>,
-}
-
-struct SnapshotInner {
-    workspace: WorkspaceSnapshotAccess,
-    store: Store,
-    exclusions: Vec<String>,
-    capture: Arc<AsyncMutex<()>>,
-    publication: Arc<AsyncMutex<()>>,
-    state: Mutex<RuntimeState>,
-}
-
-#[derive(Default)]
-struct RuntimeState {
-    journals: HashMap<String, StoredJournal>,
-    /// Snapshots each prepared restore reads, kept from cleanup until it is executed or dropped.
-    pending: HashMap<String, BTreeSet<String>>,
-}
-
-pub struct PreparedSnapshotRestore {
-    manager: SnapshotManager,
-    lease_id: String,
-    plan: Arc<RestorePlan>,
-}
-
-pub struct PreparedSnapshotCapture {
-    manager: SnapshotManager,
-    checkpoint_id: Identifier,
-    scope: WorkspaceSnapshotScope,
-    limits: SnapshotCaptureLimits,
-}
-
-pub struct PreparedSnapshotCleanup {
-    manager: SnapshotManager,
-    plan: Arc<CleanupPlan>,
-    preview: SnapshotCleanupPreview,
-    resource_scope: String,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StoredCheckpoint {
-    version: String,
-    checkpoint_id: String,
-    snapshot_id: String,
-    /// When the snapshot was first captured, which every checkpoint naming it reports.
-    created_at_unix_ms: u64,
-    /// So a retry can hold the snapshot to its own limits without reading every file's size.
-    largest_file_bytes: u64,
-}
-
-/// Only what tells one checkpoint or journal format from another.
-#[derive(Deserialize)]
-struct StoredVersion {
-    version: String,
-}
-
-/// A checkpoint as read back, with the snapshot it names.
-struct Checkpoint {
-    stored: StoredCheckpoint,
-    id: SnapshotId,
-    meta: Meta,
-}
+/// Records one store keeps before retention evicts the oldest, however small they are.
+pub(crate) const MAX_STORE_RECORDS: usize = 10_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum SnapshotError {
@@ -143,19 +74,21 @@ pub enum SnapshotError {
     UnhealthyStorage,
     #[error("snapshot request is invalid")]
     InvalidRequest,
-    #[error("snapshot was not found")]
+    #[error("snapshot record was not found")]
     NotFound,
     #[error("snapshot data failed integrity verification")]
     IntegrityFailure,
-    #[error("the snapshot scope or a restored path is not a plain workspace entry")]
+    #[error("a recorded scope or a reverted path is not a plain workspace entry")]
     UnsupportedFile,
     #[error("workspace snapshots need descriptor-relative traversal this host does not support")]
     UnsupportedPlatform,
+    /// The workspace is past a ceiling of the record or the host.
     #[error("snapshot {limit} limit was exceeded")]
     LimitExceeded {
         limit: SnapshotLimit,
         maximum: Option<u64>,
     },
+    /// The store is full with nothing it may evict.
     #[error("snapshot {limit} quota was exceeded")]
     QuotaExceeded {
         limit: SnapshotLimit,
@@ -165,16 +98,12 @@ pub enum SnapshotError {
     Busy,
     #[error("snapshot capture execution budget was exhausted")]
     TimedOut,
-    #[error("the workspace no longer matches what the snapshot operation expects")]
+    #[error("the workspace or the store no longer matches what the snapshot operation expects")]
     Conflict,
-    #[error("another restore awaits acknowledgement")]
-    AcknowledgementRequired,
     #[error("snapshot operation was cancelled")]
     Cancelled,
     #[error("snapshot operation failed")]
     OperationFailed,
-    #[error("snapshot capture rollback could not be confirmed")]
-    RollbackFailed,
 }
 
 impl SnapshotError {
@@ -193,10 +122,8 @@ impl SnapshotError {
             Self::Busy => "busy",
             Self::TimedOut => "timed_out",
             Self::Conflict => "conflict",
-            Self::AcknowledgementRequired => "acknowledgement_required",
             Self::Cancelled => "cancelled",
             Self::OperationFailed => "operation_failed",
-            Self::RollbackFailed => "rollback_failed",
         }
     }
 
@@ -212,164 +139,451 @@ impl SnapshotError {
     }
 }
 
-impl SnapshotManager {
+/// A store of change records, opened without the workspace it records: enough to list, hold,
+/// release, acknowledge and clean up, never to capture or revert.
+#[derive(Clone)]
+pub struct ChangeStore {
+    shared: Arc<Shared>,
+}
+
+/// A store of change records bound to the workspace it records.
+#[derive(Clone)]
+pub struct SnapshotManager {
+    store: ChangeStore,
+}
+
+pub struct PreparedRevert {
+    store: ChangeStore,
+    plan: Arc<RevertPlan>,
+}
+
+pub struct PreparedCleanup {
+    store: ChangeStore,
+    plan: Arc<CleanupPlan>,
+    resource_scope: String,
+}
+
+struct Shared {
+    inner: Inner,
+    /// Orders this process's operations; the store lock orders them against other processes.
+    gate: Arc<AsyncMutex<()>>,
+}
+
+pub(crate) struct Inner {
+    store: Store,
+    workspace: Option<Workspace>,
+}
+
+/// The workspace a manager records, as every capture and revert sees it.
+pub(crate) struct Workspace {
+    access: WorkspaceSnapshotAccess,
+    /// Root-relative paths no record ever holds.
+    exclusions: Vec<String>,
+    umask: u32,
+}
+
+impl ChangeStore {
+    /// Opens the existing store beneath `private_root` that belongs to one workspace binding.
     pub async fn open(
-        workspace: WorkspaceSnapshotAccess,
         private_root: impl AsRef<Path>,
-        excluded_paths: &[PathBuf],
+        binding: &str,
     ) -> Result<Self, SnapshotError> {
-        Self::open_validated(workspace, private_root.as_ref(), excluded_paths, None).await
+        let private_root = private_root.as_ref().to_path_buf();
+        let binding = binding.to_owned();
+        let inner = tokio::task::spawn_blocking(move || {
+            Inner::open(Store::open(&private_root, None, &binding, false)?, None)
+        })
+        .await
+        .map_err(|_| SnapshotError::OperationFailed)??;
+        Ok(Self::new(inner))
     }
 
-    /// Opens the store beneath `private_root` that belongs to one workspace binding.
-    pub async fn open_bound(
-        workspace: WorkspaceSnapshotAccess,
-        private_root: impl AsRef<Path>,
-        excluded_paths: &[PathBuf],
-        workspace_binding: &Identifier,
-    ) -> Result<Self, SnapshotError> {
-        Self::open_validated(
-            workspace,
-            private_root.as_ref(),
-            excluded_paths,
-            Some(workspace_binding),
-        )
+    fn new(inner: Inner) -> Self {
+        Self {
+            shared: Arc::new(Shared {
+                inner,
+                gate: Arc::default(),
+            }),
+        }
+    }
+
+    /// What the store holds and who holds it.
+    pub async fn inventory(&self) -> Result<ChangeInventory, SnapshotError> {
+        self.run_store(|inner, _| inner.inventory()).await
+    }
+
+    /// One page of `holder`'s records in seq order, starting after `after_seq`.
+    pub async fn records(
+        &self,
+        holder: &RecordHolder,
+        after_seq: Option<u64>,
+        page_size: u32,
+    ) -> Result<RecordPage, SnapshotError> {
+        let holder = holder.as_str().to_owned();
+        self.run_store(move |inner, _| inner.records_of(&holder, after_seq, page_size))
+            .await
+    }
+
+    /// One page of every holder, in holder order, with the `after` of the next page.
+    pub async fn holders(
+        &self,
+        after: Option<&RecordHolder>,
+        page_size: u32,
+    ) -> Result<(Vec<HolderSummary>, Option<RecordHolder>), SnapshotError> {
+        let after = after.map(|holder| holder.as_str().to_owned());
+        self.run_store(move |inner, _| inner.holders_page(after.as_deref(), page_size))
+            .await
+    }
+
+    /// Has `to` hold every record `from` holds, as a fork inherits its parent's history. Returns
+    /// how many that is.
+    pub async fn hold(&self, from: &RecordHolder, to: &RecordHolder) -> Result<u32, SnapshotError> {
+        let (from, to) = (from.as_str().to_owned(), to.as_str().to_owned());
+        self.run_store(move |inner, _| inner.hold(&from, &to)).await
+    }
+
+    /// Drops `holder`'s hold on the selected records. A record no holder holds is deleted.
+    pub async fn release(
+        &self,
+        holder: &RecordHolder,
+        selection: &ReleaseSelection,
+    ) -> Result<ReleaseSummary, SnapshotError> {
+        if matches!(selection, ReleaseSelection::Seqs(seqs) if seqs.len() > MAX_REVERT_RECORDS) {
+            return Err(SnapshotError::InvalidRequest);
+        }
+        let holder = holder.as_str().to_owned();
+        let selection = selection.clone();
+        self.run_store(move |inner, _| inner.release(&holder, &selection))
+            .await
+    }
+
+    pub async fn open_records(
+        &self,
+        holder: &RecordHolder,
+    ) -> Result<Vec<OpenRecord>, SnapshotError> {
+        let holder = holder.as_str().to_owned();
+        self.run_store(move |inner, _| inner.open_records_of(&holder))
+            .await
+    }
+
+    /// Deletes an open record, reporting whether there was one.
+    pub async fn abandon_record(&self, ticket: &Identifier) -> Result<bool, SnapshotError> {
+        let ticket = ticket.as_str().to_owned();
+        self.run_store(move |inner, _| inner.abandon(&ticket)).await
+    }
+
+    /// Deletes every open record `holder` began, returning how many.
+    pub async fn abandon_open_records(&self, holder: &RecordHolder) -> Result<u32, SnapshotError> {
+        let holder = holder.as_str().to_owned();
+        self.run_store(move |inner, _| inner.abandon_open_records_of(&holder))
+            .await
+    }
+
+    /// Settles `holder`'s pending reverts. The records they reverted are deleted for every
+    /// holder, since what those records changed is gone from the workspace.
+    pub async fn acknowledge(&self, holder: &RecordHolder) -> Result<RevertStatus, SnapshotError> {
+        let holder = holder.as_str().to_owned();
+        self.run_store(move |inner, _| inner.acknowledge(&holder))
+            .await
+    }
+
+    /// `holder`'s reverts awaiting acknowledgement.
+    pub async fn status(&self, holder: &RecordHolder) -> Result<RevertStatus, SnapshotError> {
+        let holder = holder.as_str().to_owned();
+        self.run_store(move |inner, _| {
+            inner.settle()?;
+            inner.status(&holder)
+        })
         .await
     }
 
-    async fn open_validated(
-        workspace: WorkspaceSnapshotAccess,
-        private_root: &Path,
+    /// Plans abandoning open records older than any call may run and evicting the oldest records
+    /// until the store is within `retention_bytes`, then collecting what nothing names.
+    pub async fn prepare_cleanup(
+        &self,
+        retention_bytes: u64,
+        maximum_retained_bytes: usize,
+    ) -> Result<(PreparedCleanup, CleanupPreview), SnapshotError> {
+        let plan = self
+            .run_store(move |inner, _| inner.plan_cleanup(retention_bytes))
+            .await?;
+        let preview = plan.preview.clone();
+        let prepared = PreparedCleanup {
+            store: self.clone(),
+            resource_scope: format!("{CLEANUP_SCOPE_PREFIX}{}", digest_serializable(&plan)?),
+            plan: Arc::new(plan),
+        };
+        if prepared.retained_bytes() > maximum_retained_bytes {
+            return Err(limit_error(
+                SnapshotLimit::PreparedBytes,
+                maximum_retained_bytes,
+            ));
+        }
+        Ok((prepared, preview))
+    }
+
+    pub async fn execute_cleanup(
+        &self,
+        prepared: &PreparedCleanup,
+        token: &CancellationToken,
+    ) -> Result<CleanupSummary, SnapshotError> {
+        if !Arc::ptr_eq(&self.shared, &prepared.store.shared) {
+            return Err(SnapshotError::InvalidRequest);
+        }
+        let plan = Arc::clone(&prepared.plan);
+        self.run(token, future::ready(Ok(())), move |inner, token| {
+            inner.execute_cleanup(&plan, token)
+        })
+        .await
+    }
+
+    async fn run_store<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&Inner, &CancellationToken) -> Result<T, SnapshotError> + Send + 'static,
+    ) -> Result<T, SnapshotError> {
+        self.run(&CancellationToken::new(), future::ready(Ok(())), work)
+            .await
+    }
+
+    /// Runs `work` off the executor once this process's earlier operations, `guard` and the store
+    /// lock admit it, all within one admission deadline. Everything it holds is released only
+    /// when it finishes, even if the caller stops waiting, so nothing overlaps it.
+    async fn run<G, T>(
+        &self,
+        token: &CancellationToken,
+        guard: impl Future<Output = Result<G, SnapshotError>>,
+        work: impl FnOnce(&Inner, &CancellationToken) -> Result<T, SnapshotError> + Send + 'static,
+    ) -> Result<T, SnapshotError>
+    where
+        G: Send + 'static,
+        T: Send + 'static,
+    {
+        let deadline = Instant::now() + self.shared.inner.store.admission(ADMISSION_TIMEOUT);
+        let admission = async {
+            let gate = Arc::clone(&self.shared.gate).lock_owned().await;
+            Ok::<_, SnapshotError>((gate, guard.await?))
+        };
+        let guards = tokio::select! {
+            biased;
+            () = token.cancelled() => return Err(SnapshotError::Cancelled),
+            admitted = tokio::time::timeout_at(deadline.into(), admission) => {
+                admitted.map_err(|_| SnapshotError::Busy)??
+            }
+        };
+        let shared = Arc::clone(&self.shared);
+        let token = token.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guards = guards;
+            let _lock = shared.inner.store.lock(deadline, &token)?;
+            work(&shared.inner, &token)
+        })
+        .await
+        .map_err(|_| SnapshotError::OperationFailed)?
+    }
+}
+
+impl SnapshotManager {
+    /// Opens, creating it if need be, the store beneath `private_root` that belongs to one
+    /// workspace binding. `private_root` must be an absolute private directory outside the
+    /// workspace; `excluded_paths` are left out of every record besides the defaults.
+    pub async fn open_bound(
+        access: WorkspaceSnapshotAccess,
+        private_root: impl AsRef<Path>,
         excluded_paths: &[PathBuf],
-        workspace_binding: Option<&Identifier>,
+        binding: &str,
     ) -> Result<Self, SnapshotError> {
-        if !workspace.allow_write() {
+        if !access.allow_write() {
             return Err(SnapshotError::InvalidConfiguration);
         }
-        let private_root = private_root.to_path_buf();
+        let private_root = private_root.as_ref().to_path_buf();
         let excluded_paths = excluded_paths.to_vec();
-        let binding = workspace_binding.map(|binding| binding.as_str().to_owned());
+        let binding = binding.to_owned();
         let inner = tokio::task::spawn_blocking(move || {
-            let store = Store::open(&private_root, workspace.root(), binding.as_deref())?;
-            let exclusions = configured_exclusions(workspace.root(), &excluded_paths)?;
-            let inner = SnapshotInner {
-                workspace,
-                store,
-                exclusions,
-                capture: Arc::default(),
-                publication: Arc::default(),
-                state: Mutex::default(),
-            };
-            inner.store.remove_temporaries()?;
-            inner.remove_superseded()?;
-            inner.load_journals()?;
-            Ok::<_, SnapshotError>(inner)
+            let store = Store::open(&private_root, Some(access.root()), &binding, true)?;
+            let exclusions = configured_exclusions(access.root(), &excluded_paths)?;
+            Inner::open(store, Some((access, exclusions)))
         })
         .await
         .map_err(|_| SnapshotError::OperationFailed)??;
         Ok(Self {
-            inner: Arc::new(inner),
+            store: ChangeStore::new(inner),
         })
     }
 
     #[must_use]
-    pub fn capability() -> WorkspaceSnapshotCapability {
-        WorkspaceSnapshotCapability {
+    pub fn capability() -> WorkspaceChangesCapability {
+        WorkspaceChangesCapability {
             version: ContractVersion::V1,
-            methods: WorkspaceSnapshotMethods {
-                capture: true,
-                prepare_capture: true,
-                checkpoint: true,
-                inspect: true,
-                status: true,
-                prepare_restore: true,
+            methods: WorkspaceChangesMethods {
+                begin_record: true,
+                finish_record: true,
+                abandon_record: true,
+                open_records: true,
+                abandon_open_records: true,
+                records: true,
+                holders: true,
+                hold: true,
+                release: true,
+                prepare_revert: true,
                 prepare_unrevert: true,
                 acknowledge: true,
+                status: true,
                 prepare_cleanup: true,
             },
-            limits: WorkspaceSnapshotLimits {
-                max_files: u32::try_from(MAX_SNAPSHOT_FILES).unwrap_or(u32::MAX),
+            limits: WorkspaceChangesLimits {
+                max_files: count(MAX_SNAPSHOT_FILES),
                 max_file_bytes: MAX_SNAPSHOT_FILE_BYTES,
                 max_total_bytes: MAX_SNAPSHOT_TOTAL_BYTES,
-                max_capture_entries: u32::try_from(MAX_SNAPSHOT_CAPTURE_ENTRIES)
-                    .unwrap_or(u32::MAX),
+                max_capture_entries: count(MAX_SNAPSHOT_CAPTURE_ENTRIES),
                 max_capture_path_bytes: MAX_SNAPSHOT_CAPTURE_PATH_BYTES,
-                max_snapshots: u32::try_from(MAX_SNAPSHOT_COUNT).unwrap_or(u32::MAX),
                 max_storage_bytes: MAX_SNAPSHOT_STORAGE_BYTES,
-                max_concurrent_captures: 1,
-                max_cleanup_checkpoints: u32::try_from(MAX_SNAPSHOT_CLEANUP).unwrap_or(u32::MAX),
+                max_scope_paths: count(MAX_RECORD_SCOPE_PATHS),
+                max_client_bytes: count(MAX_RECORD_CLIENT_BYTES),
+                max_holder_bytes: count(MAX_RECORD_HOLDER_BYTES),
+                max_page_size: MAX_RECORD_PAGE_SIZE,
+                max_open_records: count(MAX_OPEN_RECORDS),
+                max_revert_records: count(MAX_REVERT_RECORDS),
             },
-            atomic_across_files: false,
-            durable_per_file_journal: false,
         }
     }
 
-    /// Captures the root-relative directory `scope` as `checkpoint_id`, or returns the capture
-    /// that checkpoint already names.
-    pub async fn capture(
+    /// The store alone, for what needs no workspace.
+    #[must_use]
+    pub const fn store(&self) -> &ChangeStore {
+        &self.store
+    }
+
+    /// Captures the request's scope before its call. The ticket finishes or abandons the record,
+    /// and outlives this process.
+    pub async fn begin_record(
         &self,
-        checkpoint_id: &Identifier,
-        scope: &WorkspacePath,
-        limits: &SnapshotCaptureLimits,
+        request: RecordRequest,
         token: &CancellationToken,
-    ) -> Result<SnapshotCaptureResponse, SnapshotError> {
-        validate_limits(limits)?;
-        let scope = self
-            .inner
-            .workspace
-            .snapshot_scope(scope)
+    ) -> Result<Identifier, SnapshotError> {
+        recording::validate(&request)?;
+        let ticket = self
+            .capture(token, move |inner, token| inner.begin(request, token))
+            .await?;
+        identifier(&ticket)
+    }
+
+    /// Captures the record's scope after its call and commits what the call changed, if
+    /// anything did.
+    pub async fn finish_record(
+        &self,
+        ticket: &Identifier,
+        token: &CancellationToken,
+    ) -> Result<Option<RecordSummary>, SnapshotError> {
+        let ticket = ticket.as_str().to_owned();
+        self.capture(token, move |inner, token| inner.finish(&ticket, token))
             .await
-            .map_err(|_| SnapshotError::UnsupportedFile)?;
-        let prepared = self.prepare_capture(checkpoint_id, &scope, limits)?;
-        self.execute_capture(&prepared, token, None).await
     }
 
-    pub fn prepare_capture(
+    /// Plans taking `seqs` back out of the workspace. `holder` must hold each, and no pending
+    /// revert may name any.
+    pub async fn prepare_revert(
         &self,
-        checkpoint_id: &Identifier,
-        scope: &WorkspaceSnapshotScope,
-        limits: &SnapshotCaptureLimits,
-    ) -> Result<PreparedSnapshotCapture, SnapshotError> {
-        validate_limits(limits)?;
-        Ok(PreparedSnapshotCapture {
-            manager: self.clone(),
-            checkpoint_id: checkpoint_id.clone(),
-            scope: scope.clone(),
-            limits: limits.clone(),
-        })
-    }
-
-    pub async fn execute_capture(
-        &self,
-        prepared: &PreparedSnapshotCapture,
+        holder: &RecordHolder,
+        seqs: &[u64],
+        maximum_retained_bytes: usize,
         token: &CancellationToken,
-        progress: Option<Arc<dyn SnapshotCaptureProgressSink>>,
-    ) -> Result<SnapshotCaptureResponse, SnapshotError> {
-        if !Arc::ptr_eq(&self.inner, &prepared.manager.inner) {
+    ) -> Result<(PreparedRevert, RevertPreview), SnapshotError> {
+        if seqs.len() > MAX_REVERT_RECORDS {
             return Err(SnapshotError::InvalidRequest);
         }
-        let mut progress = CaptureProgress::new(progress);
+        let access = self.access()?;
+        let holder = holder.as_str().to_owned();
+        let seqs = seqs.to_vec();
+        let plan = self
+            .store
+            .run(
+                token,
+                async { Ok(access.capture_guard().await) },
+                move |inner, token| inner.prepare_revert(&holder, &seqs, token),
+            )
+            .await?;
+        self.prepared(plan, maximum_retained_bytes)
+    }
+
+    /// Plans re-applying every revert `holder` has pending.
+    pub async fn prepare_unrevert(
+        &self,
+        holder: &RecordHolder,
+        maximum_retained_bytes: usize,
+        token: &CancellationToken,
+    ) -> Result<(PreparedRevert, RevertPreview), SnapshotError> {
+        let access = self.access()?;
+        let holder = holder.as_str().to_owned();
+        let plan = self
+            .store
+            .run(
+                token,
+                async { Ok(access.capture_guard().await) },
+                move |inner, token| inner.prepare_unrevert(&holder, token),
+            )
+            .await?;
+        self.prepared(plan, maximum_retained_bytes)
+    }
+
+    /// Publishes a prepared revert or unrevert whose records and stack are still as planned.
+    pub async fn execute_revert(
+        &self,
+        prepared: &PreparedRevert,
+        token: &CancellationToken,
+    ) -> Result<RevertStatus, SnapshotError> {
+        if !Arc::ptr_eq(&self.store.shared, &prepared.store.shared) {
+            return Err(SnapshotError::InvalidRequest);
+        }
+        let access = self.access()?;
+        let plan = Arc::clone(&prepared.plan);
+        self.store
+            .run(
+                token,
+                async {
+                    access
+                        .mutation_guard()
+                        .await
+                        .map_err(|_| SnapshotError::OperationFailed)
+                },
+                move |inner, token| inner.execute_revert(&plan, token),
+            )
+            .await
+    }
+
+    fn prepared(
+        &self,
+        plan: RevertPlan,
+        maximum_retained_bytes: usize,
+    ) -> Result<(PreparedRevert, RevertPreview), SnapshotError> {
+        let preview = plan.preview.clone();
+        let prepared = PreparedRevert {
+            store: self.store.clone(),
+            plan: Arc::new(plan),
+        };
+        if prepared.retained_bytes() > maximum_retained_bytes {
+            return Err(limit_error(
+                SnapshotLimit::PreparedBytes,
+                maximum_retained_bytes,
+            ));
+        }
+        Ok((prepared, preview))
+    }
+
+    /// Runs a capture within its execution budget, with workspace mutations held off while it
+    /// reads.
+    async fn capture<T: Send + 'static>(
+        &self,
+        token: &CancellationToken,
+        work: impl FnOnce(&Inner, &CancellationToken) -> Result<T, SnapshotError> + Send + 'static,
+    ) -> Result<T, SnapshotError> {
+        let access = self.access()?;
         let cancellation = token.child_token();
         let _cancel_on_drop = cancellation.clone().drop_guard();
-        let execution = async {
-            let guards = match self.acquire_capture_guards(&cancellation).await {
-                Ok(guards) => guards,
-                Err(error) => {
-                    progress.phase(SnapshotCapturePhase::Finished);
-                    return Err(error);
-                }
-            };
-            let checkpoint_id = prepared.checkpoint_id.as_str().to_owned();
-            let scope = prepared.scope.clone();
-            let limits = prepared.limits.clone();
-            let token = cancellation.clone();
-            self.blocking(guards, move |inner| {
-                let result = inner.capture(&checkpoint_id, &scope, &limits, &token, &mut progress);
-                progress.phase(SnapshotCapturePhase::Finished);
-                result
-            })
-            .await
-        };
+        let execution = self.store.run(
+            &cancellation,
+            async { Ok(access.capture_guard().await) },
+            work,
+        );
         tokio::pin!(execution);
         tokio::select! {
             biased;
@@ -384,485 +598,127 @@ impl SnapshotManager {
         }
     }
 
-    pub async fn checkpoint(
-        &self,
-        checkpoint_id: &Identifier,
-        scope: &WorkspacePath,
-    ) -> Result<SnapshotCaptureResponse, SnapshotError> {
-        let checkpoint_id = checkpoint_id.as_str().to_owned();
-        let scope = scope.as_str().to_owned();
-        let publication = Arc::clone(&self.inner.publication)
-            .try_lock_owned()
-            .map_err(|_| SnapshotError::Busy)?;
-        self.blocking(publication, move |inner| {
-            let checkpoint = inner
-                .load_checkpoint(&checkpoint_id)?
-                .ok_or(SnapshotError::NotFound)?;
-            capture_response(&checkpoint, &scope, true)
-        })
-        .await
-    }
-
-    pub async fn inspect(
-        &self,
-        snapshot_id: &Identifier,
-        page_size: u32,
-        cursor: Option<&Cursor>,
-    ) -> Result<SnapshotInspectResponse, SnapshotError> {
-        if page_size == 0 || page_size > MAX_PAGE_SIZE {
-            return Err(SnapshotError::InvalidRequest);
-        }
-        let snapshot_id = snapshot_id.as_str().to_owned();
-        let cursor = cursor.cloned();
-        self.blocking((), move |inner| {
-            inner.inspect(&snapshot_id, page_size, cursor.as_ref())
-        })
-        .await
-    }
-
-    pub fn status(&self, restore_id: &Identifier) -> Result<SnapshotStatusResponse, SnapshotError> {
-        Ok(SnapshotStatusResponse {
-            version: ContractVersion::V1,
-            restore: self.inner.journal(restore_id.as_str())?.status()?,
-        })
-    }
-
-    /// Plans restoring `snapshot_id` over a workspace believed to match `source_snapshot_id`.
-    pub async fn prepare_restore(
-        &self,
-        snapshot_id: &Identifier,
-        source_snapshot_id: &Identifier,
-        maximum_retained_bytes: usize,
-        token: &CancellationToken,
-    ) -> Result<(PreparedSnapshotRestore, SnapshotRestorePreview), SnapshotError> {
-        let guards = self.capture_guards(token).await?;
-        let manager = self.clone();
-        let target = snapshot_id.as_str().to_owned();
-        let source = source_snapshot_id.as_str().to_owned();
-        let token = token.clone();
-        self.blocking(guards, move |inner| {
-            let plan = inner.prepare_restore(&target, &source, None, &token)?;
-            manager.lease(plan, maximum_retained_bytes)
-        })
-        .await
-    }
-
-    /// Plans undoing a restore that still awaits acknowledgement.
-    pub async fn prepare_unrevert(
-        &self,
-        restore_id: &Identifier,
-        maximum_retained_bytes: usize,
-        token: &CancellationToken,
-    ) -> Result<(PreparedSnapshotRestore, SnapshotRestorePreview), SnapshotError> {
-        let guards = self.capture_guards(token).await?;
-        let manager = self.clone();
-        let restore_id = restore_id.as_str().to_owned();
-        let token = token.clone();
-        self.blocking(guards, move |inner| {
-            let plan = inner.prepare_unrevert(&restore_id, &token)?;
-            manager.lease(plan, maximum_retained_bytes)
-        })
-        .await
-    }
-
-    pub async fn acknowledge(
-        &self,
-        restore_id: &Identifier,
-    ) -> Result<SnapshotAcknowledgeResponse, SnapshotError> {
-        let publication = Arc::clone(&self.inner.publication).lock_owned().await;
-        let restore_id = restore_id.as_str().to_owned();
-        self.blocking(publication, move |inner| inner.acknowledge(&restore_id))
-            .await
-    }
-
-    /// Plans deleting `checkpoint_ids` and everything only they kept.
-    pub async fn prepare_cleanup(
-        &self,
-        checkpoint_ids: &[Identifier],
-        maximum_retained_bytes: usize,
-    ) -> Result<(PreparedSnapshotCleanup, SnapshotCleanupPreview), SnapshotError> {
-        let requested = checkpoint_ids
-            .iter()
-            .map(|id| id.as_str().to_owned())
-            .collect::<BTreeSet<_>>();
-        if checkpoint_ids.len() > MAX_SNAPSHOT_CLEANUP || requested.len() != checkpoint_ids.len() {
-            return Err(SnapshotError::InvalidRequest);
-        }
-        let publication = Arc::clone(&self.inner.publication).lock_owned().await;
-        let plan = self
-            .blocking(publication, move |inner| {
-                inner.plan_cleanup(&requested).map(|(plan, _)| plan)
-            })
-            .await?;
-        let preview = plan.preview()?;
-        let prepared = PreparedSnapshotCleanup {
-            manager: self.clone(),
-            resource_scope: format!("{CLEANUP_SCOPE_PREFIX}{}", digest_serializable(&plan)?),
-            plan: Arc::new(plan),
-            preview: preview.clone(),
-        };
-        if prepared.retained_bytes() > maximum_retained_bytes {
-            return Err(limit_error(
-                SnapshotLimit::PreparedBytes,
-                maximum_retained_bytes,
-            ));
-        }
-        Ok((prepared, preview))
-    }
-
-    pub async fn execute_restore(
-        &self,
-        prepared: &PreparedSnapshotRestore,
-        token: &CancellationToken,
-    ) -> Result<SnapshotRestoreStatus, SnapshotError> {
-        if !Arc::ptr_eq(&self.inner, &prepared.manager.inner) {
-            return Err(SnapshotError::InvalidRequest);
-        }
-        let publication = Arc::clone(&self.inner.publication).lock_owned().await;
-        let workspace = self
-            .inner
-            .workspace
-            .mutation_guard()
-            .await
-            .map_err(|_| SnapshotError::OperationFailed)?;
-        let plan = Arc::clone(&prepared.plan);
-        let token = token.clone();
-        self.blocking((publication, workspace), move |inner| {
-            inner.execute_restore(&plan, &token)
-        })
-        .await
-    }
-
-    pub async fn execute_cleanup(
-        &self,
-        prepared: &PreparedSnapshotCleanup,
-        token: &CancellationToken,
-    ) -> Result<SnapshotCleanupResponse, SnapshotError> {
-        if !Arc::ptr_eq(&self.inner, &prepared.manager.inner) {
-            return Err(SnapshotError::InvalidRequest);
-        }
-        let publication = Arc::clone(&self.inner.publication).lock_owned().await;
-        let plan = Arc::clone(&prepared.plan);
-        let token = token.clone();
-        self.blocking(publication, move |inner| {
-            inner.execute_cleanup(&plan, &token)
-        })
-        .await
-    }
-
-    /// Runs `work` off the executor. `guards` are released only when it finishes, even if the
-    /// caller stops waiting, so no other operation overlaps it.
-    async fn blocking<G, T>(
-        &self,
-        guards: G,
-        work: impl FnOnce(&SnapshotInner) -> Result<T, SnapshotError> + Send + 'static,
-    ) -> Result<T, SnapshotError>
-    where
-        G: Send + 'static,
-        T: Send + 'static,
-    {
-        let inner = Arc::clone(&self.inner);
-        tokio::task::spawn_blocking(move || {
-            let _guards = guards;
-            work(&inner)
-        })
-        .await
-        .map_err(|_| SnapshotError::OperationFailed)?
-    }
-
-    /// One admission deadline covers every lock a capture or restore preparation holds.
-    async fn capture_guards(
-        &self,
-        token: &CancellationToken,
-    ) -> Result<[OwnedMutexGuard<()>; 3], SnapshotError> {
-        tokio::time::timeout(
-            CAPTURE_ADMISSION_TIMEOUT,
-            self.acquire_capture_guards(token),
-        )
-        .await
-        .map_err(|_| SnapshotError::Busy)?
-    }
-
-    async fn acquire_capture_guards(
-        &self,
-        token: &CancellationToken,
-    ) -> Result<[OwnedMutexGuard<()>; 3], SnapshotError> {
-        let acquire = async {
-            let capture = Arc::clone(&self.inner.capture).lock_owned().await;
-            let publication = Arc::clone(&self.inner.publication).lock_owned().await;
-            let workspace = self.inner.workspace.capture_guard().await;
-            [capture, publication, workspace]
-        };
-        tokio::select! {
-            biased;
-            () = token.cancelled() => Err(SnapshotError::Cancelled),
-            guards = acquire => Ok(guards),
-        }
-    }
-
-    /// Keeps the plan's snapshots from cleanup for as long as the prepared restore lives. Runs
-    /// under the preparation's locks, so no cleanup sees the plan unprotected.
-    fn lease(
-        &self,
-        plan: RestorePlan,
-        maximum_retained_bytes: usize,
-    ) -> Result<(PreparedSnapshotRestore, SnapshotRestorePreview), SnapshotError> {
-        let lease_id = format!("{LEASE_PREFIX}{}", Uuid::new_v4());
-        lock(&self.inner.state).pending.insert(
-            lease_id.clone(),
-            BTreeSet::from([
-                plan.target_snapshot_id.clone(),
-                plan.source_snapshot_id.clone(),
-            ]),
-        );
-        let preview = plan.preview.clone();
-        let prepared = PreparedSnapshotRestore {
-            manager: self.clone(),
-            lease_id,
-            plan: Arc::new(plan),
-        };
-        if prepared.retained_bytes() > maximum_retained_bytes {
-            return Err(limit_error(
-                SnapshotLimit::PreparedBytes,
-                maximum_retained_bytes,
-            ));
-        }
-        Ok((prepared, preview))
+    fn access(&self) -> Result<&WorkspaceSnapshotAccess, SnapshotError> {
+        Ok(&self.store.shared.inner.workspace()?.access)
     }
 }
 
-impl SnapshotInner {
-    /// Removes what an earlier store format left, which nothing reads any more: its blob and
-    /// manifest directories, and checkpoints and journals of an earlier version. A version no
-    /// release before this one wrote is a later release's, and refuses the store rather than lose
-    /// what it holds.
-    fn remove_superseded(&self) -> Result<(), SnapshotError> {
-        let directories = self.store.remove_legacy_directories()?;
-        let checkpoints = self.remove_legacy_versions(
-            CHECKPOINTS,
-            CHECKPOINT_VERSION,
-            &LEGACY_CHECKPOINT_VERSIONS,
-        )?;
-        let journals =
-            self.remove_legacy_versions(JOURNALS, JOURNAL_VERSION, &LEGACY_JOURNAL_VERSIONS)?;
-        if directories + checkpoints + journals > 0 {
-            tracing::info!(
-                directories,
-                checkpoints,
-                journals,
-                "removed workspace snapshot data an earlier store format left"
-            );
-        }
-        Ok(())
-    }
-
-    fn remove_legacy_versions(
-        &self,
-        directory: &str,
-        current: &str,
-        legacy: &[&str],
-    ) -> Result<usize, SnapshotError> {
-        let mut removed = 0;
-        for name in self.store.names(directory)? {
-            let path = self.store.directory(directory).join(name);
-            let Ok(stored) = serde_json::from_slice::<StoredVersion>(
-                &self.store.read(&path, MAX_PRIVATE_METADATA_BYTES)?,
-            ) else {
-                continue;
-            };
-            if legacy.contains(&stored.version.as_str()) {
-                self.store.remove(&path)?;
-                removed += 1;
-            } else if stored.version != current {
-                tracing::warn!(
-                    directory,
-                    version = %stored.version,
-                    "workspace snapshot storage holds a format this release does not know"
-                );
-                return Err(SnapshotError::UnhealthyStorage);
-            }
-        }
-        if removed > 0 {
-            self.store.sync(directory)?;
-        }
-        Ok(removed)
-    }
-
-    fn read_checkpoint(
-        &self,
-        path: &Path,
-    ) -> Result<(StoredCheckpoint, SnapshotId), SnapshotError> {
-        let checkpoint: StoredCheckpoint =
-            serde_json::from_slice(&self.store.read(path, MAX_PRIVATE_METADATA_BYTES)?)
-                .map_err(|_| SnapshotError::IntegrityFailure)?;
-        if checkpoint.version != CHECKPOINT_VERSION
-            || self.store.checkpoint_path(&checkpoint.checkpoint_id) != path
-        {
-            return Err(SnapshotError::IntegrityFailure);
-        }
-        let id = parse_snapshot_id(&checkpoint.snapshot_id)?;
-        Ok((checkpoint, id))
-    }
-
-    fn load_checkpoint(&self, checkpoint_id: &str) -> Result<Option<Checkpoint>, SnapshotError> {
-        let (stored, id) = match self.read_checkpoint(&self.store.checkpoint_path(checkpoint_id)) {
-            Ok(checkpoint) => checkpoint,
-            Err(SnapshotError::NotFound) => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        let meta = self
-            .store
-            .objects()
-            .meta(&id)
-            .map_err(|error| store_error(error, &[]))?;
-        self.store.sync(CHECKPOINTS)?;
-        Ok(Some(Checkpoint { stored, id, meta }))
-    }
-
-    /// Every checkpoint with the snapshot it names, skipping any removed while listing.
-    fn checkpoints(&self) -> Result<Vec<(StoredCheckpoint, SnapshotId)>, SnapshotError> {
-        let mut checkpoints = Vec::new();
-        for name in self.store.names(CHECKPOINTS)? {
-            match self.read_checkpoint(&self.store.directory(CHECKPOINTS).join(name)) {
-                Ok(checkpoint) => checkpoints.push(checkpoint),
-                Err(SnapshotError::NotFound) => {}
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(checkpoints)
-    }
-
-    /// When the earliest checkpoint naming `id` captured it. Equal content has one snapshot
-    /// whenever it is captured, so the snapshot itself records no time.
-    fn created_at(&self, id: &SnapshotId) -> Result<Option<u64>, SnapshotError> {
-        Ok(self
-            .checkpoints()?
-            .into_iter()
-            .filter(|(_, named)| named == id)
-            .map(|(checkpoint, _)| checkpoint.created_at_unix_ms)
-            .min())
-    }
-
-    fn inspect(
-        &self,
-        snapshot_id: &str,
-        page_size: u32,
-        cursor: Option<&Cursor>,
-    ) -> Result<SnapshotInspectResponse, SnapshotError> {
-        let id = parse_snapshot_id(snapshot_id)?;
-        let objects = self.store.objects();
-        let meta = objects
-            .meta(&id)
-            .map_err(|error| store_error(error, &[&id]))?;
-        let entries = objects
-            .entries(&id)
-            .map_err(|error| store_error(error, &[&id]))?;
-        let offset = parse_cursor(cursor, snapshot_id, entries.len())?;
-        let end = offset
-            .saturating_add(usize::try_from(page_size).unwrap_or(usize::MAX))
-            .min(entries.len());
-        let next_cursor = (end < entries.len())
-            .then(|| Cursor::new(format!("{snapshot_id}{CURSOR_SEPARATOR}{end}")))
-            .transpose()
-            .map_err(|_| SnapshotError::OperationFailed)?;
-        let files = entries[offset..end]
-            .iter()
-            .map(|entry| {
-                let size = objects
-                    .blob_size(&entry.content.oid)
-                    .map_err(|error| store_error(error, &[]))?;
-                snapshot::file(entry, size)
-            })
-            .collect::<Result<_, _>>()?;
-        Ok(SnapshotInspectResponse {
-            version: ContractVersion::V1,
-            snapshot: summary(&id, &meta, None, self.created_at(&id)?.unwrap_or_default())?,
-            files,
-            exclusions: meta
-                .exclusions
-                .iter()
-                .map(|path| WorkspacePath::new(path.clone()))
-                .collect::<Result<_, _>>()
-                .map_err(|_| SnapshotError::IntegrityFailure)?,
-            next_cursor,
-        })
-    }
-}
-
-impl PreparedSnapshotRestore {
-    /// Conservative retained bytes, excluding the snapshot manager shared with the host.
+impl PreparedRevert {
+    /// Conservative retained bytes, excluding the store shared with the host.
     #[must_use]
     pub fn retained_bytes(&self) -> usize {
-        size_of::<Self>()
-            .saturating_add(self.lease_id.capacity())
-            .saturating_add(self.plan.retained_bytes())
+        size_of::<Self>().saturating_add(self.plan.retained_bytes())
     }
 
     #[must_use]
-    pub fn restore_id(&self) -> &str {
-        &self.plan.restore_id
+    pub fn revert_id(&self) -> &str {
+        &self.plan.revert_id
     }
 
-    /// The root-relative directory, `.` for the root, beneath which the restore changes entries.
     #[must_use]
-    pub fn scope(&self) -> &str {
-        &self.plan.scope
+    pub fn holder(&self) -> &str {
+        &self.plan.holder
     }
 
-    /// The restore this one undoes, whose journal it settles once it completes.
     #[must_use]
-    pub fn unrevert_of(&self) -> Option<&str> {
-        self.plan.unrevert_of.as_deref()
+    pub fn direction(&self) -> RevertDirection {
+        self.plan.direction
+    }
+
+    #[must_use]
+    pub fn seqs(&self) -> &[u64] {
+        &self.plan.seqs
+    }
+
+    #[must_use]
+    pub fn preview(&self) -> &RevertPreview {
+        &self.plan.preview
+    }
+
+    /// Every path the revert writes, the directories it creates first.
+    pub fn paths(&self) -> impl Iterator<Item = &WorkspacePath> {
+        self.plan.paths()
     }
 }
 
-impl PreparedSnapshotCapture {
-    #[must_use]
-    pub fn retained_bytes(&self) -> usize {
-        size_of::<Self>()
-            .saturating_add(self.checkpoint_id.as_str().len())
-            .saturating_add(self.scope.retained_bytes())
-    }
-
-    #[must_use]
-    pub fn scope(&self) -> &str {
-        self.scope.path()
-    }
-}
-
-impl Drop for PreparedSnapshotRestore {
-    fn drop(&mut self) {
-        lock(&self.manager.inner.state)
-            .pending
-            .remove(&self.lease_id);
-    }
-}
-
-impl PreparedSnapshotCleanup {
-    /// Conservative retained bytes, excluding the snapshot manager shared with the host.
+impl PreparedCleanup {
+    /// Conservative retained bytes, excluding the store shared with the host.
     #[must_use]
     pub fn retained_bytes(&self) -> usize {
         size_of::<Self>()
             .saturating_add(self.plan.retained_bytes())
             .saturating_add(self.resource_scope.capacity())
-            .saturating_add(
-                self.preview
-                    .checkpoint_ids
-                    .iter()
-                    .chain(&self.preview.missing_checkpoint_ids)
-                    .map(Identifier::retained_bytes)
-                    .fold(0, usize::saturating_add),
-            )
     }
 
     #[must_use]
-    pub const fn preview(&self) -> &SnapshotCleanupPreview {
-        &self.preview
+    pub fn preview(&self) -> &CleanupPreview {
+        &self.plan.preview
     }
 
+    /// Names exactly what the cleanup would abandon and evict.
     #[must_use]
     pub fn resource_scope(&self) -> &str {
         &self.resource_scope
+    }
+}
+
+impl Inner {
+    /// Readies a store under its lock: removes what earlier formats and crashes left, creates the
+    /// state of a new store, and reconciles any revert a crash interrupted.
+    fn open(
+        store: Store,
+        workspace: Option<(WorkspaceSnapshotAccess, Vec<String>)>,
+    ) -> Result<Self, SnapshotError> {
+        let deadline = Instant::now() + store.admission(ADMISSION_TIMEOUT);
+        let _lock = store.lock(deadline, &CancellationToken::new())?;
+        let removed = store.remove_legacy()?;
+        if removed > 0 {
+            tracing::info!(
+                removed,
+                "removed workspace snapshot data an earlier store format left"
+            );
+        }
+        store.remove_temporaries()?;
+        let workspace = match workspace {
+            Some((access, exclusions)) => Some(Workspace {
+                umask: probe_umask(store.root())?,
+                access,
+                exclusions,
+            }),
+            None => None,
+        };
+        let inner = Self { store, workspace };
+        inner.initialize()?;
+        inner.settle()?;
+        Ok(inner)
+    }
+
+    /// Writes the state of a store that has none. One that has records without a state has lost
+    /// its seqs and is refused rather than reuse them.
+    fn initialize(&self) -> Result<(), SnapshotError> {
+        match self.store.state() {
+            Err(SnapshotError::NotFound) => {}
+            state => return state.map(drop),
+        }
+        for directory in [OPEN, RECORDS, REVERTS] {
+            if !self.store.names(directory)?.is_empty() {
+                return Err(SnapshotError::UnhealthyStorage);
+            }
+        }
+        self.store.write_state(&StoredState::new())
+    }
+
+    fn workspace(&self) -> Result<&Workspace, SnapshotError> {
+        self.workspace.as_ref().ok_or(SnapshotError::InvalidRequest)
+    }
+}
+
+impl Workspace {
+    /// Whether an exclusion covers `path`, which no record then holds.
+    fn excluded(&self, path: &str) -> bool {
+        self.exclusions
+            .iter()
+            .any(|exclusion| within(exclusion, path))
     }
 }
 
@@ -940,37 +796,14 @@ fn configured_exclusion(workspace: &Path, requested: &Path) -> Result<String, Sn
     Ok(relative)
 }
 
-fn parse_cursor(
-    cursor: Option<&Cursor>,
-    snapshot_id: &str,
-    length: usize,
-) -> Result<usize, SnapshotError> {
-    let Some(cursor) = cursor else { return Ok(0) };
-    let offset = cursor
-        .as_str()
-        .strip_prefix(snapshot_id)
-        .and_then(|rest| rest.strip_prefix(CURSOR_SEPARATOR))
-        .ok_or(SnapshotError::InvalidRequest)?
-        .parse::<usize>()
-        .map_err(|_| SnapshotError::InvalidRequest)?;
-    if offset == 0 || offset >= length {
-        return Err(SnapshotError::InvalidRequest);
-    }
-    Ok(offset)
-}
-
 fn digest_serializable(value: &impl Serialize) -> Result<String, SnapshotError> {
     let bytes = serde_json::to_vec(value).map_err(|_| SnapshotError::OperationFailed)?;
     Ok(format!("{DIGEST_PREFIX}{}", hex_sha256(&bytes)))
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
-    hex(Sha256::digest(bytes))
-}
-
-fn hex(bytes: impl IntoIterator<Item = u8>) -> String {
     let mut output = String::new();
-    for byte in bytes {
+    for byte in Sha256::digest(bytes) {
         let _ = write!(output, "{byte:02x}");
     }
     output
@@ -978,19 +811,6 @@ fn hex(bytes: impl IntoIterator<Item = u8>) -> String {
 
 fn identifier(value: &str) -> Result<Identifier, SnapshotError> {
     Identifier::new(value.to_owned()).map_err(|_| SnapshotError::IntegrityFailure)
-}
-
-fn identifiers(values: &[String]) -> Result<Vec<Identifier>, SnapshotError> {
-    values.iter().map(|value| identifier(value)).collect()
-}
-
-fn revision(value: &str) -> Result<Revision, SnapshotError> {
-    Revision::new(value.to_owned()).map_err(|_| SnapshotError::IntegrityFailure)
-}
-
-fn path_resource_id(path: &str) -> Result<ResourceId, SnapshotError> {
-    root_relative_resource_id(RootResourceKind::Path, path)
-        .map_err(|_| SnapshotError::IntegrityFailure)
 }
 
 fn check_cancelled(token: &CancellationToken) -> Result<(), SnapshotError> {
@@ -1049,80 +869,88 @@ fn unix_ms() -> u64 {
         })
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
 #[cfg(all(test, unix))]
 mod tests {
     use std::{
-        ffi::OsStr,
+        collections::BTreeMap,
         fs,
         io::Write as _,
-        os::unix::{
-            ffi::OsStrExt,
-            fs::{OpenOptionsExt, PermissionsExt, symlink},
-            net::UnixListener,
-        },
-        sync::{atomic::Ordering, mpsc},
-        task::Poll,
-        time::Instant,
+        os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink},
+        sync::atomic::Ordering,
     };
 
-    use rustix::fs::{CWD, FileType, Mode, mknodat};
+    use serde_json::json;
     use tempfile::TempDir;
     use test_case::test_case;
-    use tokio::sync::Notify;
     use workcell_host_contract::{
-        MAX_SNAPSHOT_JOURNALS, SnapshotChangeCounts, SnapshotChangeKind, SnapshotEntryKind,
-        SnapshotRestoreState, SnapshotSkipReason, SnapshotSkipped, SnapshotSummary,
+        RecordClientMetadata, RecordLimits, RecordListing, RecordScope, RecordState,
+        RevertConflictKind, RevertState, UnrecordedReason,
     };
     use workcell_mcp_files::FileToolGroup;
-    use workcell_snapshot_store::blob_id;
+    use workcell_snapshot_store::{ObjectId, blob_id};
 
     use super::*;
     use crate::{
-        snapshot::{PERMISSION_BITS, SYMLINK_MODE, blob_revision},
-        store::{CHECKPOINTS, JOURNALS, REPOSITORY, TestHooks},
+        format::{StoredJournal, StoredRecord, encode, revert_id},
+        snapshot::OWNER_EXECUTABLE,
+        store::TestHooks,
     };
 
+    const BINDING: &str = "0123456789abcdef";
     const ROOT: &str = ".";
-    /// Where git keeps loose objects within the repository.
-    const OBJECTS: &str = "objects";
-    /// Git's id for the blob `AGENTS.md`, as `git hash-object` computes it.
-    const AGENTS_LINK_REVISION: &str = "gitoid:blob:sha1:47dc3e3d863cfb5727b87d785d09abf9743c0a72";
-    const LEGACY_DIRECTORIES: [&str; 2] = ["blobs", "manifests"];
+    const HOLDER: &str = "session-a";
+    const OTHER_HOLDER: &str = "session-b";
+    const FILE: &str = "file.txt";
+    const OTHER: &str = "other.txt";
+    const THIRD: &str = "third.txt";
+    const LINK: &str = "link";
+    const DIRECTORY: &str = "dir";
+    const NESTED: &str = "dir/nested.txt";
+    const SECOND_NESTED: &str = "dir/second.txt";
+    const DEEPER: &str = "dir/new/deeper.txt";
+    const LINKED_DIRECTORY: &str = "linked";
+    const THROUGH_LINKED_DIRECTORY: &str = "linked/nested.txt";
+    const IGNORE_RULES: &str = "target/\n*.log\n";
+    const IGNORED_FILE: &str = "build.log";
+    const IGNORED_DIRECTORY: &str = "target";
+    const BENEATH_IGNORED: &str = "target/debug";
+    const BUILD_OUTPUT: &str = "target/debug/out.o";
+    const NEW_BUILD_OUTPUT: &str = "target/debug/new.o";
+    const INNER_REPOSITORY: &str = "target/inner";
+    const INNER_REPOSITORY_MARKER: &str = "target/inner/.git";
+    const INNER_OUTPUT: &str = "target/inner/out.o";
+    const IGNORED_NESTED: &str = "dir/debug.log";
+    const ONE_FILE: u32 = 1;
+    const BEFORE: &str = "before";
+    const AFTER: &str = "after";
+    const LATER: &str = "later";
+    const CANARY: &str = "written by someone else";
+    const STAGED_SAVE: &str = "other.txt.save";
+    const LARGE: &str = "larger than the record's file limit allows";
+    const LARGER: &str = "larger still than the record's file limit allows";
+    const GARBAGE: &str = "named by an abandoned record only";
+    const SMALL_FILE_BYTES: u64 = 16;
     const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
     const PRIVATE_FILE_MODE: u32 = 0o600;
     const EXECUTABLE_MODE: u32 = 0o755;
-    const BARRIER_TIMEOUT: Duration = Duration::from_secs(10);
-    const BENCHMARK_FILES: usize = 20_000;
-    const BENCHMARK_DIRECTORIES: usize = 100;
-    const BENCHMARK_FILE_BYTES: usize = 128;
-    const QUOTA_FILES: [&str; 2] = ["first file", "second file"];
-    /// Each of [`QUOTA_FILES`] is charged its length, 64 bytes of framing and an eighth of both:
-    /// 84 and 85 bytes.
-    const ROOM_FOR_NO_FILE: u64 = 10;
-    const ROOM_FOR_ONE_FILE: u64 = 100;
-    const NOTHING_STAGED: &str = "a failed capture must delete what it staged";
+    /// Older than any call may run.
+    const STALE_AGE_MS: u64 = 13 * 60 * 60 * 1_000;
+    const CONCURRENT_RECORDS: u64 = 24;
+    const ADMISSION_MS: u64 = 50;
+    const HELD_LOCK: Duration = Duration::from_secs(60);
+    const LEGACY_DIRECTORIES: [&str; 2] = ["blobs", "manifests"];
+    const LEGACY_FILES: [(&str, &str); 5] = [
+        ("checkpoints", "workspace-snapshot-checkpoint.v1"),
+        ("checkpoints", "workspace-snapshot-checkpoint.v2"),
+        ("journals", "workspace-restore-journal.v1"),
+        ("journals", "workspace-restore-journal.v2"),
+        ("journals", "workspace-restore-journal.v3"),
+    ];
     const LATER_CHECKPOINT_VERSION: &str = "workspace-snapshot-checkpoint.v3";
-
-    struct CaptureBarrier {
-        entered: Notify,
-        release: Mutex<mpsc::Receiver<()>>,
-        phase: SnapshotCapturePhase,
-    }
-
-    impl SnapshotCaptureProgressSink for CaptureBarrier {
-        fn publish(&self, progress: SnapshotCaptureProgress) {
-            if progress.phase == self.phase {
-                self.entered.notify_one();
-                lock(&self.release).recv_timeout(BARRIER_TIMEOUT).unwrap();
-            }
-        }
-    }
+    const RECORDED: &str = "the call changed its scope, so it leaves a record";
+    const NOTHING_WRITTEN: &str = "a refused revert must leave the workspace as it was";
+    const LEFT_TO_WRITER: &str = "a revert must leave what another writer wrote while it ran";
+    const KEPT: &str = "collection must keep what a record, an open record or a revert needs";
 
     struct Fixture {
         workspace: TempDir,
@@ -1130,11 +958,45 @@ mod tests {
         manager: SnapshotManager,
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum Edit {
+        Create,
+        Modify,
+        Delete,
+        Relink,
+        MakeExecutable,
+        ChangeSubtree,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Unreadable {
+        Record,
+        OpenRecord,
+        Journal,
+    }
+
+    /// A named path a write goes through to land on another one.
+    #[derive(Clone, Copy, Debug)]
+    enum Alias {
+        Symlink,
+        LinkedDirectory,
+        HardLink,
+    }
+
+    /// Another writer acting on `OTHER` once a revert has published `FILE`.
+    #[derive(Clone, Copy, Debug)]
+    enum Race {
+        /// Writes other bytes into the file `OTHER` shares with `FILE` through a hard link.
+        Rewrite,
+        /// Saves the bytes a separate `OTHER` already holds over it, as an editor saves.
+        Resave,
+    }
+
     impl Fixture {
         async fn new() -> Self {
             let workspace = tempfile::tempdir().unwrap();
             let storage = private_directory();
-            let manager = open_manager(workspace.path(), storage.path(), &[])
+            let manager = open_manager(workspace.path(), storage.path())
                 .await
                 .unwrap();
             Self {
@@ -1144,10 +1006,23 @@ mod tests {
             }
         }
 
-        async fn reopen(&mut self) {
-            self.manager = open_manager(self.workspace.path(), self.storage.path(), &[])
+        /// Another process's view of the same store.
+        async fn another(&self) -> SnapshotManager {
+            open_manager(self.workspace.path(), self.storage.path())
                 .await
-                .unwrap();
+                .unwrap()
+        }
+
+        async fn reopen(&mut self) {
+            self.manager = self.another().await;
+        }
+
+        fn inner(&self) -> &Inner {
+            &self.manager.store.shared.inner
+        }
+
+        fn hooks(&self) -> &TestHooks {
+            &self.inner().store.hooks
         }
 
         fn path(&self, relative: &str) -> PathBuf {
@@ -1160,170 +1035,221 @@ mod tests {
             fs::write(path, contents).unwrap();
         }
 
-        fn read(&self, relative: &str) -> String {
-            fs::read_to_string(self.path(relative)).unwrap()
+        fn read(&self, relative: &str) -> Option<String> {
+            fs::read_to_string(self.path(relative)).ok()
         }
 
-        fn stored(&self, directory: &str) -> usize {
-            fs::read_dir(self.storage.path().join(directory))
-                .unwrap()
-                .count()
+        /// Every file and link in the workspace with what a record keeps of it.
+        fn tree(&self) -> BTreeMap<String, String> {
+            let mut entries = BTreeMap::new();
+            let mut pending = vec![PathBuf::new()];
+            while let Some(relative) = pending.pop() {
+                for entry in fs::read_dir(self.workspace.path().join(&relative)).unwrap() {
+                    let entry = entry.unwrap();
+                    let path = relative.join(entry.file_name());
+                    let metadata = fs::symlink_metadata(entry.path()).unwrap();
+                    let key = path.to_str().unwrap().to_owned();
+                    if metadata.is_dir() {
+                        pending.push(path);
+                    } else if metadata.file_type().is_symlink() {
+                        let target = fs::read_link(entry.path()).unwrap();
+                        entries.insert(key, format!("link to {}", target.display()));
+                    } else {
+                        let executable = metadata.permissions().mode() & OWNER_EXECUTABLE != 0;
+                        let content = fs::read_to_string(entry.path()).unwrap();
+                        entries.insert(key, format!("{content} executable={executable}"));
+                    }
+                }
+            }
+            entries
         }
 
-        fn objects(&self) -> u64 {
-            self.manager.inner.store.objects().usage().unwrap().objects
-        }
-
-        /// What the object store occupies, whatever captures left staged included.
-        fn object_bytes(&self) -> u64 {
-            self.manager.inner.store.objects().usage().unwrap().bytes
-        }
-
-        fn object_path(&self, hex: &str) -> PathBuf {
-            self.storage
-                .path()
-                .join(REPOSITORY)
-                .join(OBJECTS)
-                .join(&hex[..2])
-                .join(&hex[2..])
-        }
-
-        /// Overwrites a loose object, which git stores read-only.
-        fn tamper(&self, hex: &str) {
-            let path = self.object_path(hex);
-            set_mode(&path, PRIVATE_FILE_MODE);
-            fs::write(path, "tampered").unwrap();
-        }
-
-        fn hooks(&self) -> &TestHooks {
-            &self.manager.inner.store.hooks
-        }
-
-        async fn try_capture(
-            &self,
-            checkpoint: &str,
-            scope: &str,
-            limits: &SnapshotCaptureLimits,
-        ) -> Result<SnapshotCaptureResponse, SnapshotError> {
+        async fn begin(&self, holder_id: &str, scope: RecordScope) -> Identifier {
             self.manager
-                .capture(
-                    &id(checkpoint),
-                    &WorkspacePath::new(scope).unwrap(),
-                    limits,
-                    &CancellationToken::new(),
-                )
-                .await
-        }
-
-        async fn capture(&self, checkpoint: &str) -> SnapshotSummary {
-            self.try_capture(checkpoint, ROOT, &limits())
+                .begin_record(request(holder_id, scope), &token())
                 .await
                 .unwrap()
-                .snapshot
         }
 
-        async fn capture_scope(&self, checkpoint: &str, scope: &str) -> SnapshotSummary {
-            self.try_capture(checkpoint, scope, &limits())
+        async fn finish(&self, ticket: &Identifier) -> Option<u64> {
+            self.manager
+                .finish_record(ticket, &token())
                 .await
                 .unwrap()
-                .snapshot
+                .map(|summary| summary.seq)
+        }
+
+        /// Records `paths` around `change`, returning the record's seq if it left one.
+        async fn record(&self, holder_id: &str, paths: &[&str], change: impl FnOnce(&Self)) -> u64 {
+            let ticket = self.begin(holder_id, named(paths)).await;
+            change(self);
+            self.finish(&ticket).await.expect(RECORDED)
         }
 
         async fn prepare(
             &self,
-            target: &SnapshotSummary,
-            source: &SnapshotSummary,
-        ) -> Result<(PreparedSnapshotRestore, SnapshotRestorePreview), SnapshotError> {
+            holder_id: &str,
+            seqs: &[u64],
+        ) -> Result<(PreparedRevert, RevertPreview), SnapshotError> {
             self.manager
-                .prepare_restore(
-                    &target.snapshot_id,
-                    &source.snapshot_id,
-                    usize::MAX,
-                    &CancellationToken::new(),
-                )
+                .prepare_revert(&holder(holder_id), seqs, usize::MAX, &token())
                 .await
         }
 
-        async fn execute(
-            &self,
-            prepared: &PreparedSnapshotRestore,
-        ) -> Result<SnapshotRestoreStatus, SnapshotError> {
-            self.manager
-                .execute_restore(prepared, &CancellationToken::new())
-                .await
+        async fn execute(&self, prepared: &PreparedRevert) -> Result<RevertStatus, SnapshotError> {
+            self.manager.execute_revert(prepared, &token()).await
         }
 
-        async fn restore(
-            &self,
-            target: &SnapshotSummary,
-            source: &SnapshotSummary,
-        ) -> SnapshotRestoreStatus {
-            let (prepared, _) = self.prepare(target, source).await.unwrap();
+        async fn revert(&self, holder_id: &str, seqs: &[u64]) -> RevertStatus {
+            let (prepared, _) = self.prepare(holder_id, seqs).await.unwrap();
             self.execute(&prepared).await.unwrap()
         }
 
-        async fn cleanup(&self, checkpoints: &[&str]) -> SnapshotCleanupResponse {
-            let checkpoint_ids = checkpoints
-                .iter()
-                .map(|checkpoint| id(checkpoint))
-                .collect::<Vec<_>>();
+        async fn unrevert(&self, holder_id: &str) -> RevertStatus {
             let (prepared, _) = self
                 .manager
-                .prepare_cleanup(&checkpoint_ids, usize::MAX)
+                .prepare_unrevert(&holder(holder_id), usize::MAX, &token())
+                .await
+                .unwrap();
+            self.execute(&prepared).await.unwrap()
+        }
+
+        async fn listing(&self, holder_id: &str) -> Vec<RecordListing> {
+            self.manager
+                .store()
+                .records(&holder(holder_id), None, MAX_RECORD_PAGE_SIZE)
+                .await
+                .unwrap()
+                .records
+        }
+
+        async fn cleanup(&self, retention_bytes: u64) -> CleanupSummary {
+            let (prepared, _) = self
+                .manager
+                .store()
+                .prepare_cleanup(retention_bytes, usize::MAX)
                 .await
                 .unwrap();
             self.manager
-                .execute_cleanup(&prepared, &CancellationToken::new())
+                .store()
+                .execute_cleanup(&prepared, &token())
                 .await
                 .unwrap()
         }
 
-        async fn paths(&self, snapshot: &SnapshotSummary) -> Vec<String> {
-            let mut paths = Vec::new();
-            let mut cursor = None;
-            loop {
-                let page = self
-                    .manager
-                    .inspect(&snapshot.snapshot_id, MAX_PAGE_SIZE, cursor.as_ref())
-                    .await
-                    .unwrap();
-                paths.extend(page.files.iter().map(|file| file.path.as_str().to_owned()));
-                cursor = page.next_cursor;
-                if cursor.is_none() {
-                    return paths;
-                }
+        fn stored(&self, seq: u64) -> Option<StoredRecord> {
+            self.inner().store.record(seq).unwrap()
+        }
+
+        fn contains(&self, content: &str) -> bool {
+            self.inner()
+                .store
+                .objects()
+                .read_blob(&blob(content))
+                .is_ok()
+        }
+    }
+
+    impl Edit {
+        fn named(self) -> &'static str {
+            match self {
+                Self::Relink => LINK,
+                Self::ChangeSubtree => DIRECTORY,
+                _ => FILE,
             }
         }
 
-        fn journals(&self) -> usize {
-            lock(&self.manager.inner.state).journals.len()
+        fn prepare(self, fixture: &Fixture) {
+            match self {
+                Self::Create => {}
+                Self::Modify | Self::Delete | Self::MakeExecutable => fixture.write(FILE, BEFORE),
+                Self::Relink => symlink(BEFORE, fixture.path(LINK)).unwrap(),
+                Self::ChangeSubtree => fixture.write(NESTED, BEFORE),
+            }
+        }
+
+        fn apply(self, fixture: &Fixture) {
+            match self {
+                Self::Create | Self::Modify => fixture.write(FILE, AFTER),
+                Self::Delete => fs::remove_file(fixture.path(FILE)).unwrap(),
+                Self::Relink => {
+                    fs::remove_file(fixture.path(LINK)).unwrap();
+                    symlink(AFTER, fixture.path(LINK)).unwrap();
+                }
+                Self::MakeExecutable => set_mode(&fixture.path(FILE), EXECUTABLE_MODE),
+                Self::ChangeSubtree => {
+                    fixture.write(NESTED, AFTER);
+                    fixture.write(DEEPER, AFTER);
+                }
+            }
         }
     }
 
-    fn id(value: &str) -> Identifier {
-        Identifier::new(value).unwrap()
+    impl Alias {
+        fn prepare(self, fixture: &Fixture) {
+            fixture.write(self.real(), BEFORE);
+            match self {
+                Self::Symlink => symlink(FILE, fixture.path(LINK)).unwrap(),
+                Self::LinkedDirectory => {
+                    symlink(DIRECTORY, fixture.path(LINKED_DIRECTORY)).unwrap();
+                }
+                Self::HardLink => fs::hard_link(fixture.path(FILE), fixture.path(OTHER)).unwrap(),
+            }
+        }
+
+        fn named(self) -> &'static str {
+            match self {
+                Self::Symlink => LINK,
+                Self::LinkedDirectory => THROUGH_LINKED_DIRECTORY,
+                Self::HardLink => OTHER,
+            }
+        }
+
+        /// Where a write through the named path lands.
+        fn real(self) -> &'static str {
+            match self {
+                Self::Symlink | Self::HardLink => FILE,
+                Self::LinkedDirectory => NESTED,
+            }
+        }
     }
 
-    fn limits() -> SnapshotCaptureLimits {
-        SnapshotCaptureLimits {
-            max_files: u32::try_from(MAX_SNAPSHOT_FILES).unwrap(),
-            max_file_bytes: MAX_SNAPSHOT_FILE_BYTES,
-            max_total_bytes: MAX_SNAPSHOT_TOTAL_BYTES,
+    impl Race {
+        fn prepare(self, fixture: &Fixture) {
+            fixture.write(FILE, BEFORE);
+            match self {
+                Self::Rewrite => fs::hard_link(fixture.path(FILE), fixture.path(OTHER)).unwrap(),
+                Self::Resave => fixture.write(OTHER, BEFORE),
+            }
+        }
+
+        fn written(self) -> &'static str {
+            match self {
+                Self::Rewrite => CANARY,
+                Self::Resave => AFTER,
+            }
+        }
+
+        fn run(self, other: &Path, staged: &Path) {
+            match self {
+                Self::Rewrite => fs::write(other, self.written()).unwrap(),
+                Self::Resave => {
+                    fs::write(staged, self.written()).unwrap();
+                    fs::rename(staged, other).unwrap();
+                }
+            }
         }
     }
 
     fn private_directory() -> TempDir {
         let directory = tempfile::tempdir().unwrap();
-        fs::set_permissions(
-            directory.path(),
-            fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE),
-        )
-        .unwrap();
+        set_mode(directory.path(), PRIVATE_DIRECTORY_MODE);
         directory
     }
 
-    fn versioned(version: &str) -> Vec<u8> {
-        serde_json::to_vec(&serde_json::json!({ "version": version })).unwrap()
+    fn private_subdirectory(path: &Path) {
+        fs::create_dir(path).unwrap();
+        set_mode(path, PRIVATE_DIRECTORY_MODE);
     }
 
     fn write_private(path: &Path, contents: &[u8]) {
@@ -1337,1792 +1263,1178 @@ mod tests {
             .unwrap();
     }
 
-    async fn open_manager(
-        workspace: &Path,
-        storage: &Path,
-        exclusions: &[PathBuf],
-    ) -> Result<SnapshotManager, SnapshotError> {
-        let files = FileToolGroup::new(workspace, true, None).await.unwrap();
-        SnapshotManager::open(files.workspace_snapshot_access(), storage, exclusions).await
-    }
-
-    fn digest(content: &[u8]) -> Revision {
-        blob_revision(&blob_id(content).unwrap()).unwrap()
-    }
-
-    fn mode(path: &Path) -> u32 {
-        fs::symlink_metadata(path).unwrap().permissions().mode() & PERMISSION_BITS
+    fn versioned(version: &str) -> Vec<u8> {
+        serde_json::to_vec(&json!({ "version": version })).unwrap()
     }
 
     fn set_mode(path: &Path, mode: u32) {
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
     }
 
-    fn samples(snapshot: &SnapshotSummary) -> Vec<(&str, SnapshotSkipReason)> {
-        snapshot
-            .skipped
-            .samples
+    async fn open_manager(
+        workspace: &Path,
+        storage: &Path,
+    ) -> Result<SnapshotManager, SnapshotError> {
+        let files = FileToolGroup::new(workspace, true, None).await.unwrap();
+        SnapshotManager::open_bound(files.workspace_snapshot_access(), storage, &[], BINDING).await
+    }
+
+    fn token() -> CancellationToken {
+        CancellationToken::new()
+    }
+
+    fn holder(value: &str) -> RecordHolder {
+        RecordHolder::new(value).unwrap()
+    }
+
+    fn named(paths: &[&str]) -> RecordScope {
+        RecordScope::Paths {
+            paths: paths
+                .iter()
+                .map(|path| WorkspacePath::new(*path).unwrap())
+                .collect(),
+        }
+    }
+
+    fn whole(directory: &str) -> RecordScope {
+        RecordScope::Workspace {
+            directory: WorkspacePath::new(directory).unwrap(),
+        }
+    }
+
+    fn client(value: serde_json::Value) -> RecordClientMetadata {
+        RecordClientMetadata::new(value).unwrap()
+    }
+
+    fn request(holder_id: &str, scope: RecordScope) -> RecordRequest {
+        RecordRequest {
+            scope,
+            holder: holder(holder_id),
+            client: client(json!({ "holder": holder_id })),
+            limits: RecordLimits {
+                max_files: count(MAX_SNAPSHOT_FILES),
+                max_file_bytes: MAX_SNAPSHOT_FILE_BYTES,
+                max_total_bytes: MAX_SNAPSHOT_TOTAL_BYTES,
+            },
+        }
+    }
+
+    fn blob(content: &str) -> ObjectId {
+        blob_id(content.as_bytes()).unwrap()
+    }
+
+    fn byte_len(content: &str) -> u64 {
+        u64::try_from(content.len()).unwrap()
+    }
+
+    fn changed(record: &StoredRecord) -> Vec<&str> {
+        record
+            .changes
             .iter()
-            .map(|sample| (sample.path.as_str(), sample.reason))
+            .map(|change| change.path.as_str())
             .collect()
     }
 
-    fn state(status: &SnapshotRestoreStatus) -> (SnapshotRestoreState, u32, u32, bool, bool) {
-        (
-            status.state,
-            status.applied_files,
-            status.total_files,
-            status.acknowledgement_required,
-            status.reconciliation_required,
-        )
-    }
+    type Edge<'a> = (&'a str, Option<ObjectId>, Option<ObjectId>);
 
-    #[tokio::test]
-    async fn bound_snapshot_stores_are_isolated_by_workspace_binding() {
-        let workspace = tempfile::tempdir().unwrap();
-        let storage = private_directory();
-        fs::write(workspace.path().join("file.txt"), "content").unwrap();
-        let files = FileToolGroup::new(workspace.path(), true, None)
-            .await
-            .unwrap();
-        let first_binding = id("workspace_generation_a");
-        let first = SnapshotManager::open_bound(
-            files.workspace_snapshot_access(),
-            storage.path(),
-            &[],
-            &first_binding,
-        )
-        .await
-        .unwrap();
-        let captured = first
-            .capture(
-                &id("checkpoint"),
-                &WorkspacePath::new(ROOT).unwrap(),
-                &limits(),
-                &CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        let second = SnapshotManager::open_bound(
-            files.workspace_snapshot_access(),
-            storage.path(),
-            &[],
-            &id("workspace_generation_b"),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            second
-                .inspect(&captured.snapshot.snapshot_id, 1, None)
-                .await
-                .unwrap_err(),
-            SnapshotError::NotFound
-        );
-        assert!(storage.path().join(first_binding.as_str()).is_dir());
-    }
-
-    #[tokio::test]
-    async fn a_checkpoint_keeps_naming_its_first_capture() {
-        let fixture = Fixture::new().await;
-        fixture.write("file.txt", "one");
-        let first = fixture
-            .try_capture("checkpoint", ROOT, &limits())
-            .await
-            .unwrap();
-        fixture.write("file.txt", "two");
-        let second = fixture
-            .try_capture("checkpoint", ROOT, &limits())
-            .await
-            .unwrap();
-
-        assert!(!first.reused_checkpoint);
-        assert!(second.reused_checkpoint);
-        assert_eq!(first.snapshot, second.snapshot);
-        assert_eq!(
-            fixture
-                .manager
-                .inspect(&first.snapshot.snapshot_id, 1, None)
-                .await
-                .unwrap()
-                .files[0]
-                .resource_id,
-            root_relative_resource_id(RootResourceKind::Path, "file.txt").unwrap()
-        );
-    }
-
-    #[tokio::test]
-    async fn equal_content_has_one_snapshot_identity_across_checkpoints() {
-        let fixture = Fixture::new().await;
-        fixture.write("file.txt", "one");
-        let first = fixture.capture("first").await;
-        let objects = fixture.objects();
-        let second = fixture.capture("second").await;
-
-        assert_eq!(first.snapshot_id, second.snapshot_id);
-        assert_eq!(first.created_at_unix_ms, second.created_at_unix_ms);
-        assert_eq!(fixture.objects(), objects);
-        assert_eq!(fixture.stored(CHECKPOINTS), 2);
-    }
-
-    #[tokio::test]
-    async fn a_capture_reads_only_files_changed_since_the_last_one() {
-        let fixture = Fixture::new().await;
-        fixture.hooks().settled.store(true, Ordering::SeqCst);
-        fixture.write("kept", "kept");
-        fixture.write("edited", "one");
-        let reads = || fixture.hooks().content_reads.load(Ordering::SeqCst);
-        let first = fixture.capture("first").await;
-        assert_eq!(reads(), 2);
-
-        let unchanged = fixture.capture("unchanged").await;
-        assert_eq!(unchanged.snapshot_id, first.snapshot_id);
-        assert_eq!(reads(), 2);
-        fixture.write("edited", "three");
-        let edited = fixture.capture("edited").await;
-
-        assert_eq!(reads(), 3);
-        assert_eq!(edited.total_bytes, first.total_bytes + 2);
-        fixture.restore(&first, &edited).await;
-        assert_eq!(fixture.read("edited"), "one");
-    }
-
-    #[tokio::test]
-    async fn a_file_the_stat_cache_vouches_for_keeps_its_executable_bit() {
-        let fixture = Fixture::new().await;
-        fixture.hooks().settled.store(true, Ordering::SeqCst);
-        fixture.write("script", "run");
-        set_mode(&fixture.path("script"), EXECUTABLE_MODE);
-        let first = fixture.capture("first").await;
-
-        let cached = fixture.capture("cached").await;
-
-        assert_eq!(fixture.hooks().content_reads.load(Ordering::SeqCst), 1);
-        assert_eq!(cached.snapshot_id, first.snapshot_id);
-    }
-
-    #[tokio::test]
-    async fn a_capture_reads_again_a_file_whose_cached_content_is_gone_from_the_store() {
-        let fixture = Fixture::new().await;
-        fixture.hooks().settled.store(true, Ordering::SeqCst);
-        fixture.write("file.txt", "content");
-        fixture.capture("first").await;
-        let blob = fixture.object_path(&blob_id(b"content").unwrap().to_string());
-        fs::remove_file(&blob).unwrap();
-
-        fixture.capture("second").await;
-        assert_eq!(fixture.hooks().content_reads.load(Ordering::SeqCst), 2);
-        assert!(blob.exists());
-    }
-
-    #[tokio::test]
-    #[ignore = "local 20,000-file snapshot persistence benchmark"]
-    async fn capture_persistence_benchmark() {
-        let fixture = Fixture::new().await;
-        fixture.hooks().settled.store(true, Ordering::SeqCst);
-        for index in 0..BENCHMARK_FILES {
-            fixture.write(
-                &format!("dir-{}/file-{index}", index % BENCHMARK_DIRECTORIES),
-                &format!("{index:0width$}", width = BENCHMARK_FILE_BYTES),
-            );
-        }
-        let started = Instant::now();
-        let first = fixture.capture("first").await;
-        let first_elapsed = started.elapsed();
-        let started = Instant::now();
-        let unchanged = fixture.capture("unchanged").await;
-        eprintln!(
-            "files={} bytes_per_file={} first_seconds={:.3} unchanged_seconds={:.3}",
-            BENCHMARK_FILES,
-            BENCHMARK_FILE_BYTES,
-            first_elapsed.as_secs_f64(),
-            started.elapsed().as_secs_f64()
-        );
-        assert_eq!(first.snapshot_id, unchanged.snapshot_id);
-        assert_eq!(first.file_count as usize, BENCHMARK_FILES);
-        assert_eq!(
-            first.total_bytes,
-            (BENCHMARK_FILES * BENCHMARK_FILE_BYTES) as u64
-        );
-        assert_eq!(
-            fixture.hooks().content_reads.load(Ordering::SeqCst),
-            BENCHMARK_FILES
-        );
-    }
-
-    #[tokio::test]
-    async fn a_capture_whose_objects_are_not_durable_publishes_nothing_and_deletes_what_it_staged()
-    {
-        let fixture = Fixture::new().await;
-        fixture.write("original.txt", "original");
-        let original = fixture.capture("original").await;
-        let objects = fixture.objects();
-        let bytes = fixture.object_bytes();
-        fixture.write("new.txt", "new");
-        fixture.hooks().object_sync.store(true, Ordering::SeqCst);
-
-        assert_eq!(
-            fixture
-                .try_capture("failed", ROOT, &limits())
-                .await
-                .unwrap_err(),
-            SnapshotError::OperationFailed
-        );
-        assert_eq!(fixture.stored(CHECKPOINTS), 1);
-        let scope = WorkspacePath::new(ROOT).unwrap();
-        assert_eq!(
-            fixture
-                .manager
-                .checkpoint(&id("failed"), &scope)
-                .await
-                .unwrap_err(),
-            SnapshotError::NotFound
-        );
-        fixture.hooks().object_sync.store(false, Ordering::SeqCst);
-        assert_eq!(fixture.objects(), objects);
-        assert_eq!(fixture.object_bytes(), bytes, "{NOTHING_STAGED}");
-        fs::remove_file(fixture.path("new.txt")).unwrap();
-        assert_eq!(
-            fixture.capture("failed").await,
-            SnapshotSummary {
-                checkpoint_id: Some(id("failed")),
-                ..original
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn checkpoint_lookup_recovers_only_the_original_published_scope_after_restart() {
-        let mut fixture = Fixture::new().await;
-        fixture.write("file.txt", "original");
-        let checkpoint = id("receipt");
-        let scope = WorkspacePath::new(ROOT).unwrap();
-        assert_eq!(
-            fixture
-                .manager
-                .checkpoint(&checkpoint, &scope)
-                .await
-                .unwrap_err(),
-            SnapshotError::NotFound
-        );
-        assert_eq!(fixture.stored(CHECKPOINTS), 0);
-        let original = fixture.capture(checkpoint.as_str()).await;
-        fixture.write("file.txt", "changed after lost reply");
-        fixture.reopen().await;
-        let receipt = fixture
-            .manager
-            .checkpoint(&checkpoint, &scope)
-            .await
-            .unwrap();
-        assert_eq!(receipt.snapshot, original);
-        assert!(receipt.reused_checkpoint);
-        fixture.write("other/file.txt", "different scope");
-        let other = WorkspacePath::new("other").unwrap();
-        assert_eq!(
-            fixture
-                .manager
-                .checkpoint(&checkpoint, &other)
-                .await
-                .unwrap_err(),
-            SnapshotError::InvalidRequest
-        );
-        assert_eq!(
-            fixture
-                .try_capture(checkpoint.as_str(), "other", &limits())
-                .await
-                .unwrap_err(),
-            SnapshotError::InvalidRequest
-        );
-        assert_eq!(
-            fixture
-                .manager
-                .checkpoint(&checkpoint, &scope)
-                .await
-                .unwrap()
-                .snapshot,
-            original
-        );
-    }
-
-    #[tokio::test]
-    async fn uncertain_publication_and_failed_rollback_preserve_sources_until_receipt_sync_succeeds()
-     {
-        let mut fixture = Fixture::new().await;
-        fixture.write("file.txt", "original");
-        let original = fixture.capture("original").await;
-        fixture.write("file.txt", "interrupted");
-        let store = &fixture.manager.inner.store;
-        store.hooks.checkpoint_sync.store(true, Ordering::SeqCst);
-        store.hooks.checkpoint_remove.store(true, Ordering::SeqCst);
-        let failed = fixture.try_capture("interrupted", ROOT, &limits()).await;
-        assert_eq!(fixture.stored(CHECKPOINTS), 2);
-        assert_eq!(failed.unwrap_err(), SnapshotError::RollbackFailed);
-        let checkpoint = id("interrupted");
-        let scope = WorkspacePath::new(ROOT).unwrap();
-        let (stored, snapshot) = fixture
-            .manager
-            .inner
-            .read_checkpoint(&store.checkpoint_path(checkpoint.as_str()))
-            .unwrap();
-        let expected = summary(
-            &snapshot,
-            &store.objects().meta(&snapshot).unwrap(),
-            Some(checkpoint.as_str()),
-            stored.created_at_unix_ms,
-        )
-        .unwrap();
-        assert_eq!(
-            fixture
-                .manager
-                .checkpoint(&checkpoint, &scope)
-                .await
-                .unwrap_err(),
-            SnapshotError::OperationFailed
-        );
-        assert_eq!(
-            store.remove_temporaries().unwrap_err(),
-            SnapshotError::OperationFailed
-        );
-        store.hooks.checkpoint_sync.store(false, Ordering::SeqCst);
-        let receipt = fixture
-            .manager
-            .checkpoint(&checkpoint, &scope)
-            .await
-            .unwrap();
-        assert_eq!(receipt.snapshot, expected);
-        fixture.reopen().await;
-        assert_eq!(
-            fixture
-                .manager
-                .checkpoint(&checkpoint, &scope)
-                .await
-                .unwrap()
-                .snapshot,
-            expected
-        );
-        assert_eq!(
-            fixture
-                .manager
-                .checkpoint(&id("original"), &scope)
-                .await
-                .unwrap()
-                .snapshot,
-            original
-        );
-    }
-
-    #[tokio::test]
-    async fn prepared_capture_refuses_replaced_directory_after_admission_but_accepts_content_changes()
-     {
-        for replace in [false, true] {
-            let fixture = Fixture::new().await;
-            fixture.write("sub/original.txt", "original");
-            let path = WorkspacePath::new("sub").unwrap();
-            let scope = fixture
-                .manager
-                .inner
-                .workspace
-                .snapshot_scope(&path)
-                .await
-                .unwrap();
-            let prepared = fixture
-                .manager
-                .prepare_capture(&id("bound"), &scope, &limits())
-                .unwrap();
-            let admission = fixture.manager.inner.publication.lock().await;
-            let token = CancellationToken::new();
-            let execution = fixture.manager.execute_capture(&prepared, &token, None);
-            tokio::pin!(execution);
-            std::future::poll_fn(|cx| {
-                assert!(execution.as_mut().poll(cx).is_pending());
-                Poll::Ready(())
-            })
-            .await;
-            if replace {
-                fs::rename(fixture.path("sub"), fixture.path("moved")).unwrap();
-            }
-            fixture.write("sub/new.txt", "new");
-            drop(admission);
-            let result = execution.await;
-            if replace {
-                assert_eq!(result.unwrap_err(), SnapshotError::Conflict);
-                assert_eq!(fixture.stored(CHECKPOINTS), 0);
-            } else {
-                assert_eq!(result.unwrap().snapshot.file_count, 2);
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn checkpoint_reuse_refuses_lowered_limits_without_replacing_the_receipt() {
-        let fixture = Fixture::new().await;
-        fixture.write("first.txt", "original");
-        fixture.write("second.txt", "original");
-        let original = fixture.capture("limits").await;
-        for lowered in [
-            SnapshotCaptureLimits {
-                max_files: 1,
-                ..limits()
-            },
-            SnapshotCaptureLimits {
-                max_total_bytes: 1,
-                ..limits()
-            },
-            SnapshotCaptureLimits {
-                max_file_bytes: 1,
-                ..limits()
-            },
-        ] {
-            assert!(fixture.try_capture("limits", ROOT, &lowered).await.is_err());
-        }
-        assert_eq!(fixture.capture("limits").await, original);
-    }
-
-    #[tokio::test]
-    async fn dropping_the_capture_task_cancels_the_blocking_worker_even_without_its_timer() {
-        let fixture = Fixture::new().await;
-        fixture.write("file.txt", "must roll back");
-        let (release, receiver) = mpsc::channel();
-        let barrier = Arc::new(CaptureBarrier {
-            entered: Notify::new(),
-            release: Mutex::new(receiver),
-            phase: SnapshotCapturePhase::Publishing,
-        });
-        let manager = fixture.manager.clone();
-        let scope = manager
-            .inner
-            .workspace
-            .snapshot_scope(&WorkspacePath::new(ROOT).unwrap())
-            .await
-            .unwrap();
-        let prepared = manager
-            .prepare_capture(&id("dropped"), &scope, &limits())
-            .unwrap();
-        let progress = barrier.clone();
-        let task = tokio::spawn(async move {
-            manager
-                .execute_capture(&prepared, &CancellationToken::new(), Some(progress))
-                .await
-        });
-        barrier.entered.notified().await;
-        task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
-        assert!(fixture.manager.inner.capture.try_lock().is_err());
-        release.send(()).unwrap();
-        let _settled = fixture.manager.inner.capture.lock().await;
-        assert_eq!(fixture.stored(CHECKPOINTS), 0);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn capture_cancellation_and_budget_wait_for_worker_rollback_before_releasing_locks() {
-        for expire in [false, true] {
-            let fixture = Fixture::new().await;
-            fixture.write("file.txt", "captured before cancellation");
-            let checkpoint = id("barrier");
-            let scope = WorkspacePath::new(ROOT).unwrap();
-            let admission = fixture.manager.inner.capture.lock().await;
-            let bound = fixture
-                .manager
-                .inner
-                .workspace
-                .snapshot_scope(&scope)
-                .await
-                .unwrap();
-            let prepared = fixture
-                .manager
-                .prepare_capture(&checkpoint, &bound, &limits())
-                .unwrap();
-            assert_eq!(fixture.objects(), 0);
-            assert_eq!(fixture.stored(CHECKPOINTS), 0);
-            drop(admission);
-            let (release, receiver) = mpsc::channel();
-            let barrier = Arc::new(CaptureBarrier {
-                entered: Notify::new(),
-                release: Mutex::new(receiver),
-                phase: SnapshotCapturePhase::Publishing,
-            });
-            let manager = fixture.manager.clone();
-            let token = CancellationToken::new();
-            let execution_token = token.clone();
-            let progress = barrier.clone();
-            let task = tokio::spawn(async move {
-                manager
-                    .execute_capture(&prepared, &execution_token, Some(progress))
-                    .await
-            });
-            barrier.entered.notified().await;
-            assert!(fixture.object_bytes() > 0);
-            assert_eq!(
-                fixture
-                    .manager
-                    .checkpoint(&checkpoint, &scope)
-                    .await
-                    .unwrap_err(),
-                SnapshotError::Busy
-            );
-            if expire {
-                tokio::time::advance(CAPTURE_EXECUTION_BUDGET).await;
-            } else {
-                token.cancel();
-            }
-            assert!(!task.is_finished());
-            assert!(fixture.manager.inner.capture.try_lock().is_err());
-            assert!(fixture.manager.inner.publication.try_lock().is_err());
-            let workspace = fixture.manager.inner.workspace.capture_guard();
-            tokio::pin!(workspace);
-            std::future::poll_fn(|cx| {
-                assert!(workspace.as_mut().poll(cx).is_pending());
-                Poll::Ready(())
-            })
-            .await;
-            release.send(()).unwrap();
-            assert_eq!(
-                task.await.unwrap().unwrap_err(),
-                if expire {
-                    SnapshotError::TimedOut
-                } else {
-                    SnapshotError::Cancelled
-                }
-            );
-            assert_eq!(fixture.stored(CHECKPOINTS), 0);
-            assert!(fixture.manager.inner.capture.try_lock().is_ok());
-            assert!(fixture.manager.inner.publication.try_lock().is_ok());
-            drop(workspace.await);
-            assert_eq!(
-                fixture
-                    .manager
-                    .checkpoint(&checkpoint, &scope)
-                    .await
-                    .unwrap_err(),
-                SnapshotError::NotFound
-            );
-            fixture.capture(checkpoint.as_str()).await;
-        }
-    }
-
-    #[tokio::test]
-    async fn cancellation_after_durable_capture_keeps_the_successful_receipt() {
-        let fixture = Fixture::new().await;
-        fixture.write("file.txt", "published");
-        let (release, receiver) = mpsc::channel();
-        let barrier = Arc::new(CaptureBarrier {
-            entered: Notify::new(),
-            release: Mutex::new(receiver),
-            phase: SnapshotCapturePhase::Finished,
-        });
-        let manager = fixture.manager.clone();
-        let checkpoint = id("published");
-        let scope = WorkspacePath::new(ROOT).unwrap();
-        let bound = manager
-            .inner
-            .workspace
-            .snapshot_scope(&scope)
-            .await
-            .unwrap();
-        let prepared = manager
-            .prepare_capture(&checkpoint, &bound, &limits())
-            .unwrap();
-        let token = CancellationToken::new();
-        let execution_token = token.clone();
-        let progress = barrier.clone();
-        let task = tokio::spawn(async move {
-            manager
-                .execute_capture(&prepared, &execution_token, Some(progress))
-                .await
-        });
-        barrier.entered.notified().await;
-        assert_eq!(fixture.stored(CHECKPOINTS), 1);
-        token.cancel();
-        release.send(()).unwrap();
-        let result = task.await.unwrap().unwrap();
-        assert_eq!(
-            fixture
-                .manager
-                .checkpoint(&checkpoint, &scope)
-                .await
-                .unwrap()
-                .snapshot,
-            result.snapshot
-        );
-    }
-
-    #[tokio::test]
-    async fn concurrent_captures_of_one_checkpoint_wait_and_reuse() {
-        let fixture = Fixture::new().await;
-        let checkpoint = id("concurrent");
-        let scope = WorkspacePath::new(ROOT).unwrap();
-        let limits = limits();
-        let token = CancellationToken::new();
-        let publication = fixture.manager.inner.publication.lock().await;
-        let first = fixture
-            .manager
-            .capture(&checkpoint, &scope, &limits, &token);
-        let second = fixture
-            .manager
-            .capture(&checkpoint, &scope, &limits, &token);
-        tokio::pin!(first, second);
-        std::future::poll_fn(|cx| {
-            assert!(first.as_mut().poll(cx).is_pending());
-            assert!(second.as_mut().poll(cx).is_pending());
-            Poll::Ready(())
-        })
-        .await;
-        drop(publication);
-        let (first, second) = tokio::join!(first, second);
-        let (first, second) = (first.unwrap(), second.unwrap());
-
-        assert_ne!(first.reused_checkpoint, second.reused_checkpoint);
-        assert_eq!(first.snapshot.snapshot_id, second.snapshot.snapshot_id);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn capture_admission_is_cancellable_and_bounded_at_every_lock() {
-        for held_lock in ["capture", "publication", "workspace"] {
-            for cancel in [true, false] {
-                let fixture = Fixture::new().await;
-                let manager = &fixture.manager;
-                let checkpoint = id("waiting");
-                let scope = WorkspacePath::new(ROOT).unwrap();
-                let limits = limits();
-                let token = CancellationToken::new();
-                let capture = if held_lock == "capture" {
-                    Some(manager.inner.capture.lock().await)
-                } else {
-                    None
-                };
-                let publication = if held_lock == "publication" {
-                    Some(manager.inner.publication.lock().await)
-                } else {
-                    None
-                };
-                let workspace = if held_lock == "workspace" {
-                    Some(manager.inner.workspace.capture_guard().await)
-                } else {
-                    None
-                };
-                let pending = manager.capture(&checkpoint, &scope, &limits, &token);
-                tokio::pin!(pending);
-                std::future::poll_fn(|cx| {
-                    assert!(pending.as_mut().poll(cx).is_pending());
-                    Poll::Ready(())
-                })
-                .await;
-                let expected = if cancel {
-                    token.cancel();
-                    SnapshotError::Cancelled
-                } else {
-                    tokio::time::advance(CAPTURE_EXECUTION_BUDGET).await;
-                    SnapshotError::TimedOut
-                };
-
-                assert_eq!(pending.await.unwrap_err(), expected);
-                assert!(
-                    manager
-                        .inner
-                        .load_checkpoint(checkpoint.as_str())
-                        .unwrap()
-                        .is_none()
-                );
-                drop((capture, publication, workspace));
-                assert!(manager.inner.capture.try_lock().is_ok());
-                assert!(manager.inner.publication.try_lock().is_ok());
-                manager
-                    .capture(&checkpoint, &scope, &limits, &CancellationToken::new())
-                    .await
-                    .unwrap();
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn a_cancelled_capture_publishes_nothing() {
-        let fixture = Fixture::new().await;
-        fixture.write("file.txt", "content");
-        let token = CancellationToken::new();
-        token.cancel();
-
-        assert_eq!(
-            fixture
-                .manager
-                .capture(
-                    &id("cancelled"),
-                    &WorkspacePath::new(ROOT).unwrap(),
-                    &limits(),
-                    &token,
+    fn edges(record: &StoredRecord) -> Vec<Edge<'_>> {
+        record
+            .changes
+            .iter()
+            .map(|change| {
+                (
+                    change.path.as_str(),
+                    change.before.map(|content| content.0.oid),
+                    change.after.map(|content| content.0.oid),
                 )
-                .await
-                .unwrap_err(),
-            SnapshotError::Cancelled
-        );
-        assert_eq!((fixture.stored(CHECKPOINTS), fixture.objects()), (0, 0));
+            })
+            .collect()
     }
 
-    #[tokio::test]
-    async fn a_capture_past_a_client_limit_names_the_limit_and_publishes_nothing() {
-        let fixture = Fixture::new().await;
-        fixture.write("a", "abc");
-        fixture.write("b", "def");
-        let refusals = [
-            (
-                SnapshotCaptureLimits {
-                    max_files: 1,
-                    ..limits()
-                },
-                SnapshotError::LimitExceeded {
-                    limit: SnapshotLimit::Files,
-                    maximum: Some(1),
-                },
-            ),
-            (
-                SnapshotCaptureLimits {
-                    max_total_bytes: 5,
-                    ..limits()
-                },
-                SnapshotError::LimitExceeded {
-                    limit: SnapshotLimit::TotalBytes,
-                    maximum: Some(5),
-                },
-            ),
-        ];
-
-        for (limits, refusal) in refusals {
-            assert_eq!(
-                fixture
-                    .try_capture("limited", ROOT, &limits)
-                    .await
-                    .unwrap_err(),
-                refusal
-            );
-            assert_eq!(fixture.stored(CHECKPOINTS), 0);
-        }
+    fn conflicts(preview: &RevertPreview) -> Vec<(&str, RevertConflictKind)> {
+        preview
+            .conflicts
+            .iter()
+            .map(|conflict| (conflict.path.as_str(), conflict.kind))
+            .collect()
     }
 
-    #[test_case(ROOM_FOR_NO_FILE ; "before storing a file")]
-    #[test_case(ROOM_FOR_ONE_FILE ; "after storing a file")]
-    #[tokio::test]
-    async fn a_capture_refused_by_the_storage_quota_stores_nothing(room: u64) {
-        let fixture = Fixture::new().await;
-        fixture.write("a", QUOTA_FILES[0]);
-        fixture.write("b", QUOTA_FILES[1]);
-        let filler = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(PRIVATE_FILE_MODE)
-            .open(fixture.storage.path().join(JOURNALS).join("filler"))
-            .unwrap();
-        filler.set_len(MAX_SNAPSHOT_STORAGE_BYTES - room).unwrap();
+    fn seqs(listings: &[RecordListing]) -> Vec<u64> {
+        listings.iter().map(|listing| listing.seq).collect()
+    }
 
-        assert_eq!(
-            fixture
-                .try_capture("over-quota", ROOT, &limits())
-                .await
-                .unwrap_err(),
-            SnapshotError::QuotaExceeded {
-                limit: SnapshotLimit::StorageBytes,
-                maximum: Some(MAX_SNAPSHOT_STORAGE_BYTES),
+    #[test_case(Edit::Create ; "creating a file")]
+    #[test_case(Edit::Modify ; "modifying a file")]
+    #[test_case(Edit::Delete ; "deleting a file")]
+    #[test_case(Edit::Relink ; "retargeting a link")]
+    #[test_case(Edit::MakeExecutable ; "making a file executable")]
+    #[test_case(Edit::ChangeSubtree ; "changing a directory subtree")]
+    #[tokio::test]
+    async fn a_named_path_records_its_call_and_reverts_to_what_it_held(edit: Edit) {
+        let fixture = Fixture::new().await;
+        edit.prepare(&fixture);
+        let before = fixture.tree();
+
+        let seq = fixture
+            .record(HOLDER, &[edit.named()], |fixture| edit.apply(fixture))
+            .await;
+        assert_ne!(fixture.tree(), before);
+        let status = fixture.revert(HOLDER, &[seq]).await;
+
+        assert_eq!(status.pending[0].state, RevertState::Completed);
+        assert_eq!(fixture.tree(), before);
+    }
+
+    #[test_case(IGNORED_FILE, &[IGNORED_FILE, NESTED] ; "a named ignored file is recorded")]
+    #[test_case(IGNORED_DIRECTORY, &[NESTED] ; "a named ignored directory holds nothing")]
+    #[test_case(BENEATH_IGNORED, &[NESTED] ; "a named directory beneath an ignored one holds nothing")]
+    #[test_case(INNER_REPOSITORY, &[NESTED, INNER_OUTPUT] ; "a named repository beneath an ignored directory answers to its own rules")]
+    #[tokio::test]
+    async fn ignore_rules_apply_beneath_a_named_path_as_git_applies_them(
+        path: &str,
+        recorded: &[&str],
+    ) {
+        let fixture = Fixture::new().await;
+        fixture.write(".gitignore", IGNORE_RULES);
+        fixture.write(BUILD_OUTPUT, BEFORE);
+        fixture.write(INNER_REPOSITORY_MARKER, "");
+
+        let seq = fixture
+            .record(HOLDER, &[path, DIRECTORY], |fixture| {
+                for written in [
+                    IGNORED_FILE,
+                    BUILD_OUTPUT,
+                    NEW_BUILD_OUTPUT,
+                    INNER_OUTPUT,
+                    IGNORED_NESTED,
+                    NESTED,
+                ] {
+                    fixture.write(written, AFTER);
+                }
+            })
+            .await;
+
+        assert_eq!(changed(&fixture.stored(seq).unwrap()), recorded);
+    }
+
+    #[test_case(Alias::Symlink ; "a named link to a file")]
+    #[test_case(Alias::LinkedDirectory ; "a named path behind a linked directory")]
+    #[test_case(Alias::HardLink ; "a named file with a second hard link")]
+    #[tokio::test]
+    async fn a_write_through_a_named_path_is_recorded_where_it_lands(alias: Alias) {
+        let mut fixture = Fixture::new().await;
+        alias.prepare(&fixture);
+        let before = fixture.tree();
+
+        let ticket = fixture.begin(HOLDER, named(&[alias.named()])).await;
+        fixture.reopen().await;
+        fs::write(fixture.path(alias.named()), AFTER).unwrap();
+        let seq = fixture.finish(&ticket).await.expect(RECORDED);
+
+        assert!(changed(&fixture.stored(seq).unwrap()).contains(&alias.real()));
+        let status = fixture.revert(HOLDER, &[seq]).await;
+        assert_eq!(status.pending[0].state, RevertState::Completed);
+        assert_eq!(fixture.tree(), before);
+    }
+
+    #[test_case(Race::Rewrite ; "other bytes in a file the revert replaced under another name")]
+    #[test_case(Race::Resave ; "the same bytes saved over a separate file")]
+    #[tokio::test]
+    async fn a_revert_stops_at_a_path_another_writer_changes_while_it_runs(race: Race) {
+        let fixture = Fixture::new().await;
+        race.prepare(&fixture);
+        let seq = fixture
+            .record(HOLDER, &[FILE, OTHER], |fixture| {
+                fixture.write(FILE, AFTER);
+                fixture.write(OTHER, AFTER);
+            })
+            .await;
+        let (other, staged) = (fixture.path(OTHER), fixture.path(STAGED_SAVE));
+        *fixture.hooks().publication.lock().unwrap() = Some(Box::new(move |published: &str| {
+            if published == FILE {
+                race.run(&other, &staged);
             }
+        }));
+
+        let status = fixture.revert(HOLDER, &[seq]).await;
+
+        let pending = &status.pending[0];
+        assert_eq!(
+            (
+                pending.state,
+                pending.applied_files,
+                pending.stopped_at.as_ref().map(WorkspacePath::as_str)
+            ),
+            (RevertState::Partial, 1, Some(OTHER))
         );
-        assert_eq!((fixture.stored(CHECKPOINTS), fixture.objects()), (0, 0));
-        assert_eq!(fixture.object_bytes(), 0, "{NOTHING_STAGED}");
+        assert_eq!(
+            fs::read(fixture.path(OTHER)).unwrap(),
+            race.written().as_bytes(),
+            "{LEFT_TO_WRITER}"
+        );
+        assert_eq!(fixture.read(FILE).as_deref(), Some(BEFORE));
     }
 
+    #[test_case(SnapshotLimit::Files ; "more files than it allows")]
+    #[test_case(SnapshotLimit::TotalBytes ; "more bytes than it allows")]
     #[tokio::test]
-    async fn a_store_holding_the_most_checkpoints_refuses_another_and_names_the_quota() {
+    async fn a_named_directory_past_a_record_limit_is_refused_and_leaves_nothing_behind(
+        limit: SnapshotLimit,
+    ) {
         let fixture = Fixture::new().await;
-        for index in 0..MAX_SNAPSHOT_COUNT {
-            fixture.capture(&format!("checkpoint-{index}")).await;
+        for path in [NESTED, SECOND_NESTED] {
+            fixture.write(path, BEFORE);
         }
+        let mut request = request(HOLDER, named(&[DIRECTORY]));
+        let maximum = match limit {
+            SnapshotLimit::Files => {
+                request.limits.max_files = ONE_FILE;
+                u64::from(ONE_FILE)
+            }
+            _ => {
+                request.limits.max_total_bytes = byte_len(BEFORE);
+                byte_len(BEFORE)
+            }
+        };
+        let usage = fixture.inner().store.usage().unwrap();
+
+        let refused = fixture
+            .manager
+            .begin_record(request, &token())
+            .await
+            .unwrap_err();
 
         assert_eq!(
-            fixture
-                .try_capture("one-more", ROOT, &limits())
-                .await
-                .unwrap_err(),
-            SnapshotError::QuotaExceeded {
-                limit: SnapshotLimit::Checkpoints,
-                maximum: Some(u64::try_from(MAX_SNAPSHOT_COUNT).unwrap()),
+            refused,
+            SnapshotError::LimitExceeded {
+                limit,
+                maximum: Some(maximum)
             }
         );
         assert!(
             fixture
-                .try_capture("checkpoint-0", ROOT, &limits())
+                .manager
+                .store()
+                .open_records(&holder(HOLDER))
                 .await
                 .unwrap()
-                .reused_checkpoint
+                .is_empty()
         );
+        assert_eq!(fixture.inner().store.usage().unwrap(), usage);
     }
 
+    #[test_case(&[DIRECTORY, NESTED], &[NESTED, SECOND_NESTED] ; "a path named inside a named directory")]
+    #[test_case(&[LINK], &[FILE, LINK, NESTED, SECOND_NESTED] ; "a named link the widened record walks again")]
     #[tokio::test]
-    async fn an_oversized_file_is_skipped_and_left_alone_by_a_restore() {
+    async fn a_path_captured_twice_counts_once_against_the_record_limits(
+        paths: &[&str],
+        held: &[&str],
+    ) {
         let fixture = Fixture::new().await;
-        let limits = SnapshotCaptureLimits {
-            max_file_bytes: 4,
-            ..limits()
-        };
-        fixture.write("grown", "abc");
-        fixture.write("small", "abc");
-        let before = fixture
-            .try_capture("before", ROOT, &limits)
-            .await
-            .unwrap()
-            .snapshot;
-        fixture.write("grown", "0123456789");
-        fixture.write("small", "xyz");
-        let after = fixture
-            .try_capture("after", ROOT, &limits)
-            .await
-            .unwrap()
-            .snapshot;
-
-        assert_eq!(after.skipped.oversized_files, 1);
-        assert_eq!(samples(&after), [("grown", SnapshotSkipReason::Oversized)]);
-        assert_eq!(fixture.paths(&after).await, ["small"]);
-        let (prepared, preview) = fixture.prepare(&before, &after).await.unwrap();
-        assert_eq!(
-            preview.counts,
-            SnapshotChangeCounts {
-                replace: 1,
-                ..SnapshotChangeCounts::default()
-            }
-        );
-        fixture.execute(&prepared).await.unwrap();
-        assert_eq!(fixture.read("small"), "abc");
-        assert_eq!(fixture.read("grown"), "0123456789");
-    }
-
-    #[tokio::test]
-    async fn oversized_link_targets_are_skipped_and_identical_checkpoint_retries_succeed() {
-        let fixture = Fixture::new().await;
-        symlink("abc", fixture.path("oversized-link")).unwrap();
-        symlink("a", fixture.path("bounded-link")).unwrap();
-        let limits = SnapshotCaptureLimits {
-            max_file_bytes: 1,
-            ..limits()
-        };
-        let first = fixture
-            .try_capture("link-limits", ROOT, &limits)
-            .await
-            .unwrap();
-        let retry = fixture
-            .try_capture("link-limits", ROOT, &limits)
-            .await
-            .unwrap();
-        assert!(!first.reused_checkpoint);
-        assert!(retry.reused_checkpoint);
-        assert_eq!(first.snapshot, retry.snapshot);
-        assert_eq!(first.snapshot.skipped.oversized_files, 1);
-        assert_eq!(first.snapshot.file_count, 1);
-        let entries = fixture
-            .manager
-            .inspect(&first.snapshot.snapshot_id, MAX_PAGE_SIZE, None)
-            .await
-            .unwrap()
-            .files;
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].path.as_str(), "bounded-link");
-        assert_eq!(entries[0].kind, SnapshotEntryKind::Symlink);
-        assert_eq!(entries[0].size_bytes, limits.max_file_bytes);
-    }
-
-    #[tokio::test]
-    async fn a_link_is_captured_as_the_link_itself() {
-        let fixture = Fixture::new().await;
-        fixture.write("AGENTS.md", "instructions");
-        symlink("AGENTS.md", fixture.path("CLAUDE.md")).unwrap();
-        symlink("/nonexistent/target", fixture.path("dangling")).unwrap();
-        let snapshot = fixture.capture("links").await;
-        let files = fixture
-            .manager
-            .inspect(&snapshot.snapshot_id, MAX_PAGE_SIZE, None)
-            .await
-            .unwrap()
-            .files;
-
-        assert_eq!(
-            files
-                .iter()
-                .map(|file| (file.path.as_str(), file.kind))
-                .collect::<Vec<_>>(),
-            [
-                ("AGENTS.md", SnapshotEntryKind::File),
-                ("CLAUDE.md", SnapshotEntryKind::Symlink),
-                ("dangling", SnapshotEntryKind::Symlink),
-            ]
-        );
-        assert_eq!(files[1].digest.as_str(), AGENTS_LINK_REVISION);
-        assert_eq!(files[1].size_bytes, 9);
-        assert_eq!(files[1].mode, SYMLINK_MODE);
-        assert_eq!(snapshot.skipped, SnapshotSkipped::default());
-    }
-
-    #[tokio::test]
-    async fn a_restore_recreates_links_and_never_writes_through_one() {
-        let fixture = Fixture::new().await;
-        let outside = tempfile::tempdir().unwrap();
-        let secret = outside.path().join("secret");
-        fs::write(&secret, "secret").unwrap();
-        fixture.write("config", "original");
-        symlink("AGENTS.md", fixture.path("CLAUDE.md")).unwrap();
-        let before = fixture.capture("before").await;
-        fs::remove_file(fixture.path("config")).unwrap();
-        symlink(&secret, fixture.path("config")).unwrap();
-        fs::remove_file(fixture.path("CLAUDE.md")).unwrap();
-        symlink("README.md", fixture.path("CLAUDE.md")).unwrap();
-        let after = fixture.capture("after").await;
-
-        fixture.restore(&before, &after).await;
-
-        assert_eq!(
-            fs::read_link(fixture.path("CLAUDE.md")).unwrap(),
-            Path::new("AGENTS.md")
-        );
-        assert!(
-            fs::symlink_metadata(fixture.path("config"))
-                .unwrap()
-                .is_file()
-        );
-        assert_eq!(fixture.read("config"), "original");
-        assert_eq!(fs::read_to_string(&secret).unwrap(), "secret");
-    }
-
-    #[tokio::test]
-    async fn special_files_are_skipped_with_their_reason() {
-        let fixture = Fixture::new().await;
-        fixture.write("file.txt", "content");
-        let _socket = UnixListener::bind(fixture.path("socket")).unwrap();
-        mknodat(
-            CWD,
-            fixture.path("fifo").as_path(),
-            FileType::Fifo,
-            Mode::from_raw_mode(PRIVATE_FILE_MODE),
-            0,
-        )
-        .unwrap();
-        let snapshot = fixture.capture("special").await;
-
-        assert_eq!(snapshot.skipped.special_files, 2);
-        assert_eq!(
-            samples(&snapshot),
-            [
-                ("fifo", SnapshotSkipReason::Special),
-                ("socket", SnapshotSkipReason::Special),
-            ]
-        );
-        assert_eq!(fixture.paths(&snapshot).await, ["file.txt"]);
-    }
-
-    #[tokio::test]
-    async fn a_name_that_is_not_utf8_is_counted_and_never_recorded() {
-        let fixture = Fixture::new().await;
-        fs::write(
-            fixture
-                .workspace
-                .path()
-                .join(OsStr::from_bytes(b"invalid-\xff")),
-            "content",
-        )
-        .unwrap();
-        fixture.write("valid", "content");
-        let snapshot = fixture.capture("names").await;
-
-        assert_eq!(snapshot.skipped.unrepresentable_names, 1);
-        assert_eq!(
-            samples(&snapshot),
-            [("invalid-\u{fffd}", SnapshotSkipReason::Unrepresentable)]
-        );
-        assert_eq!(fixture.paths(&snapshot).await, ["valid"]);
-    }
-
-    #[tokio::test]
-    async fn a_nested_repository_is_skipped_and_never_touched_by_a_restore() {
-        let fixture = Fixture::new().await;
-        fixture.write(".git/HEAD", "ref: refs/heads/main\n");
-        fixture.write("vendor/lib/.git/HEAD", "ref: refs/heads/main\n");
-        fixture.write("vendor/lib/src.rs", "one");
-        fixture.write("main.rs", "one");
-        let before = fixture.capture("before").await;
-        fixture.write("vendor/lib/src.rs", "two");
-        fixture.write("main.rs", "two");
-        let after = fixture.capture("after").await;
-
-        assert_eq!(after.skipped.nested_repositories, 1);
-        assert_eq!(
-            samples(&after),
-            [("vendor/lib", SnapshotSkipReason::NestedRepository)]
-        );
-        assert_eq!(fixture.paths(&after).await, ["main.rs"]);
-        fixture.restore(&before, &after).await;
-        assert_eq!(fixture.read("main.rs"), "one");
-        assert_eq!(fixture.read("vendor/lib/src.rs"), "two");
-    }
-
-    #[tokio::test]
-    async fn ignored_entries_are_left_out_of_a_capture() {
-        let fixture = Fixture::new().await;
-        fixture.write(".gitignore", "target/\n*.log\n");
-        fixture.write("target/debug/app", "binary");
-        fixture.write("run.log", "log");
-        fixture.write("src/.gitignore", "generated.rs\n");
-        fixture.write("src/generated.rs", "generated");
-        fixture.write("src/lib.rs", "code");
-        let snapshot = fixture.capture("ignored").await;
-
-        assert_eq!(
-            fixture.paths(&snapshot).await,
-            [".gitignore", "src/.gitignore", "src/lib.rs"]
-        );
-        assert_eq!(snapshot.skipped, SnapshotSkipped::default());
-    }
-
-    #[tokio::test]
-    async fn a_scope_that_is_not_a_plain_directory_is_refused() {
-        let fixture = Fixture::new().await;
-        fixture.write("real/file.txt", "content");
-        symlink("real", fixture.path("linked")).unwrap();
-
-        for scope in ["missing", "linked", "real/file.txt"] {
-            assert_eq!(
-                fixture
-                    .try_capture("scoped", scope, &limits())
-                    .await
-                    .unwrap_err(),
-                SnapshotError::UnsupportedFile
-            );
+        for path in [FILE, NESTED, SECOND_NESTED] {
+            fixture.write(path, BEFORE);
         }
-    }
+        symlink(FILE, fixture.path(LINK)).unwrap();
+        let mut request = request(HOLDER, named(paths));
+        request.limits.max_files = u32::try_from(held.len()).unwrap();
+        request.limits.max_total_bytes = held
+            .iter()
+            .map(|path| fs::symlink_metadata(fixture.path(path)).unwrap().len())
+            .sum();
 
-    #[tokio::test]
-    async fn a_restore_changes_only_the_deeper_of_its_two_scopes() {
-        let fixture = Fixture::new().await;
-        fixture.write("app/main.rs", "one");
-        fixture.write("notes.md", "one");
-        let root = fixture.capture("root").await;
-        let app = fixture.capture_scope("app", "app").await;
-        fixture.write("app/main.rs", "two");
-        fixture.write("notes.md", "two");
-        let app_after = fixture.capture_scope("app-after", "app").await;
-
-        assert_eq!(app.scope.as_str(), "app");
-        assert_eq!(fixture.paths(&app).await, ["app/main.rs"]);
-        let (prepared, _) = fixture.prepare(&root, &app_after).await.unwrap();
-        assert_eq!(prepared.scope(), "app");
-        let status = fixture.execute(&prepared).await.unwrap();
-        assert_eq!(fixture.read("app/main.rs"), "one");
-        assert_eq!(fixture.read("notes.md"), "two");
         fixture
             .manager
-            .acknowledge(&status.restore_id)
+            .begin_record(request, &token())
             .await
             .unwrap();
-        fixture.write("docs/guide.md", "guide");
-        let docs = fixture.capture_scope("docs", "docs").await;
-        assert_eq!(
-            fixture.prepare(&docs, &app_after).await.err(),
-            Some(SnapshotError::InvalidRequest)
-        );
     }
 
+    #[test_case(NESTED, UnrecordedReason::Blocked ; "behind a directory the call replaced with a link")]
+    #[test_case(FILE, UnrecordedReason::Oversized ; "over the file limit")]
     #[tokio::test]
-    async fn a_restore_publishes_exactly_the_differences_between_its_two_captures() {
+    async fn a_named_path_a_record_cannot_store_is_unrecorded(
+        path: &str,
+        reason: UnrecordedReason,
+    ) {
         let fixture = Fixture::new().await;
-        fixture.write("deleted", "one");
-        fixture.write("edited", "one");
-        fixture.write("kept", "same");
-        fixture.write("script", "run");
-        fs::set_permissions(fixture.path("script"), fs::Permissions::from_mode(0o755)).unwrap();
-        let before = fixture.capture("before").await;
-        fs::remove_file(fixture.path("deleted")).unwrap();
-        fixture.write("edited", "two");
-        fixture.write("created/new", "new");
-        fs::set_permissions(fixture.path("script"), fs::Permissions::from_mode(0o644)).unwrap();
-        let after = fixture.capture("after").await;
-        fixture.write("untracked", "later");
+        fixture.write(NESTED, BEFORE);
+        fixture.write(FILE, LARGE);
+        let mut request = request(HOLDER, named(&[path]));
+        request.limits.max_file_bytes = SMALL_FILE_BYTES;
 
-        let (prepared, preview) = fixture.prepare(&before, &after).await.unwrap();
-        assert_eq!(
-            preview.counts,
-            SnapshotChangeCounts {
-                create: 1,
-                replace: 2,
-                delete: 1,
-                ..SnapshotChangeCounts::default()
-            }
-        );
-        let status = fixture.execute(&prepared).await.unwrap();
-        assert_eq!(
-            state(&status),
-            (SnapshotRestoreState::Completed, 4, 4, true, false)
-        );
-        assert_eq!(fixture.read("deleted"), "one");
-        assert_eq!(fixture.read("edited"), "one");
-        assert_eq!(fixture.read("kept"), "same");
-        assert_eq!(mode(&fixture.path("script")), 0o755);
-        assert!(!fixture.path("created/new").exists());
-        assert_eq!(fixture.read("untracked"), "later");
-    }
-
-    #[tokio::test]
-    async fn a_restore_keeps_permission_bits_and_changes_only_whether_a_file_is_executable() {
-        let fixture = Fixture::new().await;
-        for (path, permissions) in [("script", 0o640), ("private", 0o600), ("removed", 0o600)] {
-            fixture.write(path, path);
-            set_mode(&fixture.path(path), permissions);
-        }
-        let before = fixture.capture("before").await;
-        set_mode(&fixture.path("script"), 0o750);
-        set_mode(&fixture.path("private"), 0o400);
-        fs::remove_file(fixture.path("removed")).unwrap();
-        let after = fixture.capture("after").await;
-        fixture.write("created by the process", "");
-
-        let (prepared, preview) = fixture.prepare(&before, &after).await.unwrap();
-        assert_eq!(
-            preview.counts,
-            SnapshotChangeCounts {
-                create: 1,
-                replace: 1,
-                ..SnapshotChangeCounts::default()
-            }
-        );
-        fixture.execute(&prepared).await.unwrap();
-
-        assert_eq!(mode(&fixture.path("script")), 0o640);
-        assert_eq!(mode(&fixture.path("private")), 0o400);
-        assert_eq!(
-            mode(&fixture.path("removed")),
-            mode(&fixture.path("created by the process"))
-        );
-    }
-
-    #[tokio::test]
-    async fn a_restore_never_overwrites_an_edit_made_after_it_was_prepared() {
-        let fixture = Fixture::new().await;
-        fixture.write("file.txt", "before");
-        let before = fixture.capture("before").await;
-        fixture.write("file.txt", "after");
-        let after = fixture.capture("after").await;
-        let (prepared, preview) = fixture.prepare(&before, &after).await.unwrap();
-        fixture.write("file.txt", "edited later");
-
-        assert_eq!(preview.counts.replace, 1);
-        assert_eq!(
-            fixture.execute(&prepared).await.unwrap_err(),
-            SnapshotError::Conflict
-        );
-        assert_eq!(fixture.read("file.txt"), "edited later");
-        assert_eq!(fixture.journals(), 0);
-        assert_eq!(fixture.stored(JOURNALS), 0);
-    }
-
-    #[tokio::test]
-    async fn an_entry_matching_neither_capture_is_a_conflict_that_blocks_the_restore() {
-        let fixture = Fixture::new().await;
-        fixture.write("file.txt", "before");
-        let before = fixture.capture("before").await;
-        fixture.write("file.txt", "after");
-        let after = fixture.capture("after").await;
-        fixture.write("file.txt", "edited later");
-
-        let (prepared, preview) = fixture.prepare(&before, &after).await.unwrap();
-        assert_eq!(
-            preview.counts,
-            SnapshotChangeCounts {
-                conflict: 1,
-                ..SnapshotChangeCounts::default()
-            }
-        );
-        assert_eq!(preview.changes[0].kind, SnapshotChangeKind::Conflict);
-        assert_eq!(
-            preview.changes[0].current_revision,
-            Some(digest(b"edited later"))
-        );
-        assert_eq!(
-            fixture.execute(&prepared).await.unwrap_err(),
-            SnapshotError::Conflict
-        );
-        assert_eq!(fixture.read("file.txt"), "edited later");
-    }
-
-    #[tokio::test]
-    async fn a_directory_where_the_target_has_a_file_is_a_conflict() {
-        let fixture = Fixture::new().await;
-        fixture.write("entry", "file");
-        let before = fixture.capture("before").await;
-        fs::remove_file(fixture.path("entry")).unwrap();
-        fixture.write("entry/child", "child");
-        let after = fixture.capture("after").await;
-
-        let (prepared, preview) = fixture.prepare(&before, &after).await.unwrap();
-        assert_eq!(
-            preview.counts,
-            SnapshotChangeCounts {
-                delete: 1,
-                conflict: 1,
-                ..SnapshotChangeCounts::default()
-            }
-        );
-        assert_eq!(
-            fixture.execute(&prepared).await.unwrap_err(),
-            SnapshotError::Conflict
-        );
-        assert_eq!(fixture.read("entry/child"), "child");
-    }
-
-    #[tokio::test]
-    async fn a_restore_creates_only_the_missing_ancestor_directories() {
-        let fixture = Fixture::new().await;
-        fixture.write("one/kept", "kept");
-        fixture.write("one/two/three/file.txt", "before");
-        let before = fixture.capture("before").await;
-        fs::remove_dir_all(fixture.path("one/two")).unwrap();
-        let after = fixture.capture("after").await;
-
-        let (prepared, preview) = fixture.prepare(&before, &after).await.unwrap();
-        assert_eq!(
-            preview
-                .created_directories
-                .iter()
-                .map(WorkspacePath::as_str)
-                .collect::<Vec<_>>(),
-            ["one/two", "one/two/three"]
-        );
-        assert_eq!(
-            preview.counts,
-            SnapshotChangeCounts {
-                create: 1,
-                created_directories: 2,
-                ..SnapshotChangeCounts::default()
-            }
-        );
-        fixture.execute(&prepared).await.unwrap();
-        assert_eq!(fixture.read("one/two/three/file.txt"), "before");
-    }
-
-    #[tokio::test]
-    async fn a_cancelled_restore_changes_nothing() {
-        let fixture = Fixture::new().await;
-        fixture.write("file.txt", "before");
-        let before = fixture.capture("before").await;
-        fixture.write("file.txt", "after");
-        let after = fixture.capture("after").await;
-        let (prepared, _) = fixture.prepare(&before, &after).await.unwrap();
-        let token = CancellationToken::new();
-        token.cancel();
-
-        assert_eq!(
-            fixture
-                .manager
-                .execute_restore(&prepared, &token)
-                .await
-                .unwrap_err(),
-            SnapshotError::Cancelled
-        );
-        assert_eq!(fixture.read("file.txt"), "after");
-        assert_eq!(fixture.journals(), 0);
-    }
-
-    #[tokio::test]
-    async fn a_restore_refused_midway_reports_what_it_published_and_awaits_a_decision() {
-        let fixture = Fixture::new().await;
-        fixture.write("a", "one");
-        fixture.write("b", "one");
-        let before = fixture.capture("before").await;
-        fixture.write("a", "two");
-        fixture.write("b", "two");
-        let after = fixture.capture("after").await;
-        let (prepared, _) = fixture.prepare(&before, &after).await.unwrap();
-        fixture.write("b", "edited later");
-
-        let status = fixture.execute(&prepared).await.unwrap();
-        assert_eq!(
-            state(&status),
-            (SnapshotRestoreState::Partial, 1, 2, true, false)
-        );
-        assert_eq!(fixture.read("a"), "one");
-        assert_eq!(fixture.read("b"), "edited later");
-        assert_eq!(
-            fixture.prepare(&after, &before).await.err(),
-            Some(SnapshotError::AcknowledgementRequired)
-        );
-    }
-
-    #[tokio::test]
-    async fn an_unrevert_restores_the_source_and_settles_the_original_as_reverted() {
-        let fixture = Fixture::new().await;
-        fixture.write("file.txt", "before");
-        let before = fixture.capture("before").await;
-        fixture.write("file.txt", "after");
-        let after = fixture.capture("after").await;
-        let restored = fixture.restore(&before, &after).await;
-
-        assert_eq!(fixture.read("file.txt"), "before");
-        assert_eq!(
-            fixture.prepare(&after, &before).await.err(),
-            Some(SnapshotError::AcknowledgementRequired)
-        );
-        let (unrevert, preview) = fixture
+        let ticket = fixture
             .manager
-            .prepare_unrevert(&restored.restore_id, usize::MAX, &CancellationToken::new())
+            .begin_record(request, &token())
             .await
             .unwrap();
+        fs::rename(fixture.path(DIRECTORY), fixture.path(LINKED_DIRECTORY)).unwrap();
+        symlink(LINKED_DIRECTORY, fixture.path(DIRECTORY)).unwrap();
+        fixture.write(FILE, LARGER);
+        let seq = fixture.finish(&ticket).await.expect(RECORDED);
+
+        let record = fixture.stored(seq).unwrap();
+        assert!(record.changes.is_empty());
         assert_eq!(
-            (&preview.target_snapshot_id, &preview.source_snapshot_id),
-            (&after.snapshot_id, &before.snapshot_id)
+            record
+                .unrecorded
+                .iter()
+                .map(|unrecorded| (unrecorded.path.as_str(), unrecorded.reason))
+                .collect::<Vec<_>>(),
+            [(path, reason)]
         );
-        let unreverted = fixture.execute(&unrevert).await.unwrap();
-        assert_eq!(fixture.read("file.txt"), "after");
-        assert_eq!(unreverted.unrevert_of.as_ref(), Some(&restored.restore_id));
-        assert_eq!(
-            state(
-                &fixture
-                    .manager
-                    .status(&restored.restore_id)
-                    .unwrap()
-                    .restore
-            ),
-            (SnapshotRestoreState::Reverted, 1, 1, false, false)
-        );
+    }
+
+    #[test_case("../outside" ; "above the root")]
+    #[test_case("dir/../../outside" ; "through a parent")]
+    #[test_case("." ; "the root itself")]
+    #[test_case("dir//file.txt" ; "with an empty component")]
+    #[tokio::test]
+    async fn a_named_path_that_is_not_plainly_inside_the_root_is_refused(path: &str) {
+        let fixture = Fixture::new().await;
+
         assert_eq!(
             fixture
                 .manager
-                .acknowledge(&unreverted.restore_id)
+                .begin_record(request(HOLDER, named(&[path])), &token())
                 .await
-                .unwrap()
-                .restore
-                .state,
-            SnapshotRestoreState::Acknowledged
-        );
-        assert!(fixture.prepare(&before, &after).await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn a_restore_interrupted_by_a_crash_reopens_reconciled_against_the_workspace() {
-        let mut fixture = Fixture::new().await;
-        fixture.write("a", "one");
-        fixture.write("b", "one");
-        let before = fixture.capture("before").await;
-        fixture.write("a", "two");
-        fixture.write("b", "two");
-        let after = fixture.capture("after").await;
-        let restored = fixture.restore(&before, &after).await;
-        let journal = fixture
-            .storage
-            .path()
-            .join(JOURNALS)
-            .join(format!("{}.json", restored.restore_id.as_str()));
-        let interrupt = || {
-            let mut started: serde_json::Value =
-                serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
-            started["state"] = "publishing".into();
-            started["applied_files"] = 0.into();
-            fs::write(&journal, serde_json::to_vec(&started).unwrap()).unwrap();
-        };
-
-        fixture.write("b", "two");
-        interrupt();
-        fixture.reopen().await;
-        assert_eq!(
-            state(
-                &fixture
-                    .manager
-                    .status(&restored.restore_id)
-                    .unwrap()
-                    .restore
-            ),
-            (SnapshotRestoreState::Partial, 1, 2, true, false)
-        );
-        fixture.write("b", "edited later");
-        interrupt();
-        fixture.reopen().await;
-        assert_eq!(
-            state(
-                &fixture
-                    .manager
-                    .status(&restored.restore_id)
-                    .unwrap()
-                    .restore
-            ),
-            (SnapshotRestoreState::Indeterminate, 0, 2, true, true)
+                .unwrap_err(),
+            SnapshotError::InvalidRequest
         );
     }
 
     #[tokio::test]
-    async fn restores_that_change_nothing_leave_bounded_queryable_journals() {
-        let mut fixture = Fixture::new().await;
-        fixture.write("file.txt", "content");
-        let snapshot = fixture.capture("no-op").await;
-        let mut latest = None;
-        for _ in 0..=MAX_SNAPSHOT_JOURNALS {
-            let status = fixture.restore(&snapshot, &snapshot).await;
-            assert_eq!(
-                state(&status),
-                (SnapshotRestoreState::Completed, 0, 0, false, false)
-            );
-            latest = Some(status.restore_id);
+    async fn a_workspace_record_holds_only_what_changed() {
+        let fixture = Fixture::new().await;
+        for path in [FILE, OTHER, NESTED] {
+            fixture.write(path, BEFORE);
         }
 
-        assert!(fixture.stored(JOURNALS) <= MAX_SNAPSHOT_JOURNALS);
-        fixture.reopen().await;
-        let latest = latest.unwrap();
-        assert_eq!(
-            fixture.manager.status(&latest).unwrap().restore.restore_id,
-            latest
+        let ticket = fixture.begin(HOLDER, whole(ROOT)).await;
+        fixture.write(OTHER, AFTER);
+        let seq = fixture.finish(&ticket).await.expect(RECORDED);
+
+        assert_eq!(changed(&fixture.stored(seq).unwrap()), [OTHER]);
+    }
+
+    #[test_case(named(&[FILE]) ; "for named paths")]
+    #[test_case(whole(ROOT) ; "for the workspace")]
+    #[tokio::test]
+    async fn a_call_that_changes_nothing_leaves_no_record(scope: RecordScope) {
+        let fixture = Fixture::new().await;
+        fixture.write(FILE, BEFORE);
+
+        let ticket = fixture.begin(HOLDER, scope).await;
+
+        assert_eq!(fixture.finish(&ticket).await, None);
+        assert!(fixture.listing(HOLDER).await.is_empty());
+        assert!(
+            fixture
+                .manager
+                .store()
+                .open_records(&holder(HOLDER))
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 
     #[tokio::test]
-    async fn tampered_objects_fail_integrity_verification() {
+    async fn overlapping_records_that_saw_the_same_change_leave_it_with_one_owner() {
         let fixture = Fixture::new().await;
-        fixture.write("file.txt", "before");
-        let before = fixture.capture("before").await;
-        fixture.write("file.txt", "after");
-        let after = fixture.capture("after").await;
-        fixture.tamper(&blob_id(b"before").unwrap().to_string());
-        let (prepared, _) = fixture.prepare(&before, &after).await.unwrap();
+        fixture.write(FILE, BEFORE);
+        let outer = fixture.begin(HOLDER, whole(ROOT)).await;
+        let inner = fixture.begin(HOLDER, named(&[FILE])).await;
 
+        fixture.write(FILE, AFTER);
+        let seq = fixture.finish(&inner).await.expect(RECORDED);
+
+        assert_eq!(fixture.finish(&outer).await, None);
+        assert_eq!(changed(&fixture.stored(seq).unwrap()), [FILE]);
+    }
+
+    #[tokio::test]
+    async fn overlapping_records_with_consecutive_changes_form_a_chain() {
+        let fixture = Fixture::new().await;
+        fixture.write(FILE, BEFORE);
+        let outer = fixture.begin(HOLDER, named(&[FILE])).await;
+        let inner = fixture.begin(HOLDER, named(&[FILE])).await;
+
+        fixture.write(FILE, AFTER);
+        let first = fixture.finish(&inner).await.expect(RECORDED);
+        fixture.write(FILE, LATER);
+        let second = fixture.finish(&outer).await.expect(RECORDED);
+
+        assert_eq!(
+            edges(&fixture.stored(first).unwrap()),
+            [(FILE, Some(blob(BEFORE)), Some(blob(AFTER)))]
+        );
+        assert_eq!(
+            edges(&fixture.stored(second).unwrap()),
+            [(FILE, Some(blob(AFTER)), Some(blob(LATER)))]
+        );
+        fixture.revert(HOLDER, &[first, second]).await;
+        assert_eq!(fixture.read(FILE).as_deref(), Some(BEFORE));
+    }
+
+    #[test_case(&[0, 1], BEFORE ; "both records")]
+    #[test_case(&[1], AFTER ; "the newer record")]
+    #[tokio::test]
+    async fn reverting_records_composes_them_newest_first(selected: &[usize], expected: &str) {
+        let fixture = Fixture::new().await;
+        fixture.write(FILE, BEFORE);
+        let records = [
+            fixture
+                .record(HOLDER, &[FILE], |fixture| fixture.write(FILE, AFTER))
+                .await,
+            fixture
+                .record(HOLDER, &[FILE], |fixture| fixture.write(FILE, LATER))
+                .await,
+        ];
+        let selected = selected
+            .iter()
+            .map(|index| records[*index])
+            .collect::<Vec<_>>();
+
+        let (prepared, preview) = fixture.prepare(HOLDER, &selected).await.unwrap();
+        assert_eq!(preview.counts.replace, 1);
+        fixture.execute(&prepared).await.unwrap();
+
+        assert_eq!(fixture.read(FILE).as_deref(), Some(expected));
+    }
+
+    #[tokio::test]
+    async fn a_canary_on_an_unrecorded_path_is_never_written() {
+        let fixture = Fixture::new().await;
+        fixture.write(FILE, BEFORE);
+        fixture.write(OTHER, LARGE);
+        let mut request = request(HOLDER, named(&[FILE, OTHER]));
+        request.limits.max_file_bytes = SMALL_FILE_BYTES;
+        let ticket = fixture
+            .manager
+            .begin_record(request, &token())
+            .await
+            .unwrap();
+        fixture.write(FILE, AFTER);
+        fixture.write(OTHER, LARGER);
+        let seq = fixture.finish(&ticket).await.expect(RECORDED);
+        fixture.write(OTHER, CANARY);
+
+        let (prepared, preview) = fixture.prepare(HOLDER, &[seq]).await.unwrap();
+
+        assert_eq!(
+            conflicts(&preview),
+            [(OTHER, RevertConflictKind::Unrecorded)]
+        );
         assert_eq!(
             fixture.execute(&prepared).await.unwrap_err(),
-            SnapshotError::IntegrityFailure
+            SnapshotError::Conflict
         );
-        assert_eq!(fixture.read("file.txt"), "after");
-        fixture.tamper(
-            &parse_snapshot_id(before.snapshot_id.as_str())
-                .unwrap()
-                .to_string(),
-        );
+        assert_eq!(fixture.read(OTHER).as_deref(), Some(CANARY));
+        assert_eq!(fixture.read(FILE).as_deref(), Some(AFTER));
+    }
+
+    #[test_case(RevertConflictKind::ChangedSince ; "a path changed since")]
+    #[test_case(RevertConflictKind::Interleaved ; "a path changed between records")]
+    #[test_case(RevertConflictKind::Unrecorded ; "a path a record could not store")]
+    #[tokio::test]
+    async fn any_conflict_refuses_the_whole_revert_and_names_every_conflicting_path(
+        kind: RevertConflictKind,
+    ) {
+        let fixture = Fixture::new().await;
+        let troubled = [OTHER, THIRD];
+        let initial = if kind == RevertConflictKind::Unrecorded {
+            LARGE
+        } else {
+            BEFORE
+        };
+        fixture.write(FILE, BEFORE);
+        for path in troubled {
+            fixture.write(path, initial);
+        }
+        let mut request = request(HOLDER, named(&[FILE, OTHER, THIRD]));
+        request.limits.max_file_bytes = SMALL_FILE_BYTES;
+        let ticket = fixture
+            .manager
+            .begin_record(request, &token())
+            .await
+            .unwrap();
+        fixture.write(FILE, AFTER);
+        for path in troubled {
+            fixture.write(
+                path,
+                if kind == RevertConflictKind::Unrecorded {
+                    LARGER
+                } else {
+                    AFTER
+                },
+            );
+        }
+        let mut selected = vec![fixture.finish(&ticket).await.expect(RECORDED)];
+        match kind {
+            RevertConflictKind::ChangedSince => {
+                for path in troubled {
+                    fixture.write(path, CANARY);
+                }
+            }
+            RevertConflictKind::Interleaved => {
+                for path in troubled {
+                    fixture.write(path, CANARY);
+                }
+                selected.push(
+                    fixture
+                        .record(HOLDER, &troubled, |fixture| {
+                            for path in troubled {
+                                fixture.write(path, LATER);
+                            }
+                        })
+                        .await,
+                );
+            }
+            RevertConflictKind::Unrecorded => {}
+        }
+        let before = fixture.tree();
+
+        let (prepared, preview) = fixture.prepare(HOLDER, &selected).await.unwrap();
+
+        assert_eq!(conflicts(&preview), [(OTHER, kind), (THIRD, kind)]);
+        assert_eq!(preview.counts.conflicts, 2);
         assert_eq!(
+            fixture.execute(&prepared).await.unwrap_err(),
+            SnapshotError::Conflict
+        );
+        assert_eq!(fixture.tree(), before, "{NOTHING_WRITTEN}");
+        assert!(
             fixture
                 .manager
-                .inspect(&before.snapshot_id, 1, None)
+                .store()
+                .status(&holder(HOLDER))
+                .await
+                .unwrap()
+                .pending
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_path_already_back_where_it_started_is_left_unchanged() {
+        let fixture = Fixture::new().await;
+        fixture.write(FILE, BEFORE);
+        let seq = fixture
+            .record(HOLDER, &[FILE], |fixture| fixture.write(FILE, AFTER))
+            .await;
+        fixture.write(FILE, BEFORE);
+
+        let (prepared, preview) = fixture.prepare(HOLDER, &[seq]).await.unwrap();
+        let status = fixture.execute(&prepared).await.unwrap();
+
+        assert_eq!(
+            (
+                preview.counts.unchanged,
+                preview.planned.len(),
+                preview.conflicts.len()
+            ),
+            (1, 0, 0)
+        );
+        assert_eq!(status.pending[0].state, RevertState::Completed);
+        assert_eq!(fixture.read(FILE).as_deref(), Some(BEFORE));
+    }
+
+    #[tokio::test]
+    async fn an_unrevert_reapplies_every_pending_revert() {
+        let fixture = Fixture::new().await;
+        fixture.write(FILE, BEFORE);
+        fixture.write(OTHER, BEFORE);
+        let first = fixture
+            .record(HOLDER, &[FILE], |fixture| fixture.write(FILE, AFTER))
+            .await;
+        let second = fixture
+            .record(HOLDER, &[OTHER], |fixture| fixture.write(OTHER, AFTER))
+            .await;
+        fixture.revert(HOLDER, &[second]).await;
+        let stacked = fixture.revert(HOLDER, &[first]).await;
+        assert_eq!(stacked.pending.len(), 2);
+        assert_eq!(fixture.read(FILE).as_deref(), Some(BEFORE));
+
+        let status = fixture.unrevert(HOLDER).await;
+
+        assert!(status.pending.is_empty());
+        assert_eq!(fixture.read(FILE).as_deref(), Some(AFTER));
+        assert_eq!(fixture.read(OTHER).as_deref(), Some(AFTER));
+        assert!(
+            fixture
+                .listing(HOLDER)
+                .await
+                .iter()
+                .all(|listing| listing.state == RecordState::Applied)
+        );
+    }
+
+    #[tokio::test]
+    async fn acknowledging_deletes_the_reverted_records_for_every_holder() {
+        let fixture = Fixture::new().await;
+        fixture.write(FILE, BEFORE);
+        let seq = fixture
+            .record(HOLDER, &[FILE], |fixture| fixture.write(FILE, AFTER))
+            .await;
+        let store = fixture.manager.store();
+        store
+            .hold(&holder(HOLDER), &holder(OTHER_HOLDER))
+            .await
+            .unwrap();
+        fixture.revert(HOLDER, &[seq]).await;
+
+        let status = store.acknowledge(&holder(HOLDER)).await.unwrap();
+
+        assert!(status.pending.is_empty());
+        assert!(fixture.listing(HOLDER).await.is_empty());
+        assert!(fixture.listing(OTHER_HOLDER).await.is_empty());
+        assert!(fixture.stored(seq).is_none());
+        assert_eq!(fixture.read(FILE).as_deref(), Some(BEFORE));
+    }
+
+    #[tokio::test]
+    async fn a_pending_revert_keeps_its_records_from_every_other_holder() {
+        let fixture = Fixture::new().await;
+        fixture.write(FILE, BEFORE);
+        let seq = fixture
+            .record(HOLDER, &[FILE], |fixture| fixture.write(FILE, AFTER))
+            .await;
+        let store = fixture.manager.store();
+        store
+            .hold(&holder(HOLDER), &holder(OTHER_HOLDER))
+            .await
+            .unwrap();
+
+        fixture.revert(HOLDER, &[seq]).await;
+
+        assert_eq!(
+            fixture.listing(OTHER_HOLDER).await[0].state,
+            RecordState::Reverted
+        );
+        assert_eq!(
+            fixture.prepare(OTHER_HOLDER, &[seq]).await.err(),
+            Some(SnapshotError::Conflict)
+        );
+        assert_eq!(
+            store
+                .release(&holder(OTHER_HOLDER), &ReleaseSelection::Seqs(vec![seq]))
                 .await
                 .unwrap_err(),
-            SnapshotError::IntegrityFailure
+            SnapshotError::Conflict
         );
     }
 
+    #[test_case(&[], SnapshotError::InvalidRequest ; "naming nothing")]
+    #[test_case(&[1, 2], SnapshotError::NotFound ; "naming a record that does not exist")]
     #[tokio::test]
-    async fn cleanup_deletes_nothing_while_a_retained_snapshot_cannot_be_read() {
+    async fn a_revert_of_records_the_holder_does_not_hold_is_refused(
+        extra: &[u64],
+        expected: SnapshotError,
+    ) {
         let fixture = Fixture::new().await;
-        fixture.write("file.txt", "kept");
-        let kept = fixture.capture("kept").await;
-        fixture.write("file.txt", "dropped");
-        fixture.capture("dropped").await;
-        fixture.tamper(
-            &parse_snapshot_id(kept.snapshot_id.as_str())
-                .unwrap()
-                .to_string(),
-        );
-        let objects = fixture.objects();
+        fixture.write(FILE, BEFORE);
+        fixture
+            .record(HOLDER, &[FILE], |fixture| fixture.write(FILE, AFTER))
+            .await;
 
-        assert_eq!(
-            fixture
-                .manager
-                .prepare_cleanup(&[id("dropped")], usize::MAX)
-                .await
-                .err(),
-            Some(SnapshotError::IntegrityFailure)
-        );
-        assert_eq!(fixture.objects(), objects);
+        let refused = fixture.prepare(OTHER_HOLDER, &[1]).await.err();
+        let selected = fixture.prepare(HOLDER, extra).await.err();
+
+        assert_eq!(refused, Some(SnapshotError::NotFound));
+        assert_eq!(selected, Some(expected));
     }
 
+    #[test_case(true, RevertState::Completed, 2 ; "after publishing everything")]
+    #[test_case(false, RevertState::Partial, 1 ; "midway")]
     #[tokio::test]
-    async fn opening_a_store_an_earlier_host_wrote_removes_what_nothing_reads_any_more() {
+    async fn an_interrupted_revert_is_reconciled_when_the_store_opens(
+        published_everything: bool,
+        state: RevertState,
+        applied: u32,
+    ) {
         let mut fixture = Fixture::new().await;
-        fixture.write("file.txt", "current");
-        let current = fixture.capture("current").await;
-        let storage = fixture.storage.path();
-        for directory in LEGACY_DIRECTORIES {
-            fs::create_dir(storage.join(directory)).unwrap();
-            write_private(&storage.join(directory).join("entry"), b"legacy");
-        }
-        let store = &fixture.manager.inner.store;
-        for (index, version) in LEGACY_CHECKPOINT_VERSIONS.into_iter().enumerate() {
-            write_private(
-                &store.checkpoint_path(&format!("legacy-{index}")),
-                &versioned(version),
-            );
-        }
-        for (index, version) in LEGACY_JOURNAL_VERSIONS.into_iter().enumerate() {
-            write_private(
-                &store
-                    .journal_path(&format!("restore_legacy-{index}"))
-                    .unwrap(),
-                &versioned(version),
-            );
+        fixture.write(FILE, BEFORE);
+        fixture.write(OTHER, BEFORE);
+        let seq = fixture
+            .record(HOLDER, &[FILE, OTHER], |fixture| {
+                fixture.write(FILE, AFTER);
+                fixture.write(OTHER, AFTER);
+            })
+            .await;
+        let journal = StoredJournal::new(
+            revert_id(),
+            HOLDER,
+            0,
+            RevertDirection::Revert,
+            vec![seq],
+            2,
+            0,
+        );
+        fixture.inner().store.write_journal(&journal).unwrap();
+        fixture.write(FILE, BEFORE);
+        if published_everything {
+            fixture.write(OTHER, BEFORE);
         }
 
         fixture.reopen().await;
-        for directory in LEGACY_DIRECTORIES {
-            assert!(!fixture.storage.path().join(directory).exists());
-        }
-        assert_eq!(fixture.stored(CHECKPOINTS), 1);
-        assert_eq!(fixture.stored(JOURNALS), 0);
-        let scope = WorkspacePath::new(ROOT).unwrap();
+        let status = fixture
+            .manager
+            .store()
+            .status(&holder(HOLDER))
+            .await
+            .unwrap();
+
+        let pending = &status.pending[0];
         assert_eq!(
-            fixture
-                .manager
-                .checkpoint(&id("legacy-0"), &scope)
-                .await
-                .unwrap_err(),
-            SnapshotError::NotFound
+            (
+                pending.state,
+                pending.applied_files,
+                pending.reconciliation_required
+            ),
+            (state, applied, false)
         );
-        assert_eq!(
-            fixture
-                .manager
-                .checkpoint(&id("current"), &scope)
-                .await
-                .unwrap()
-                .snapshot,
-            current
-        );
+        assert!(fixture.unrevert(HOLDER).await.pending.is_empty());
+        assert_eq!(fixture.read(FILE).as_deref(), Some(AFTER));
+        assert_eq!(fixture.read(OTHER).as_deref(), Some(AFTER));
     }
 
     #[tokio::test]
-    async fn a_legacy_directory_that_is_a_link_is_removed_without_following_it() {
+    async fn an_open_record_survives_a_reopen_and_still_finishes() {
         let mut fixture = Fixture::new().await;
-        let outside = TempDir::new().unwrap();
-        let kept = outside.path().join("entry");
-        fs::write(&kept, "outside").unwrap();
-        for directory in LEGACY_DIRECTORIES {
-            symlink(outside.path(), fixture.storage.path().join(directory)).unwrap();
-        }
+        fixture.write(FILE, BEFORE);
+        let ticket = fixture.begin(HOLDER, named(&[FILE])).await;
 
         fixture.reopen().await;
+        let open = fixture
+            .manager
+            .store()
+            .open_records(&holder(HOLDER))
+            .await
+            .unwrap();
+        fixture.write(FILE, AFTER);
+        let seq = fixture.finish(&ticket).await.expect(RECORDED);
 
-        for directory in LEGACY_DIRECTORIES {
-            assert!(fs::symlink_metadata(fixture.storage.path().join(directory)).is_err());
-        }
-        assert!(kept.exists());
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].ticket, ticket);
+        fixture.revert(HOLDER, &[seq]).await;
+        assert_eq!(fixture.read(FILE).as_deref(), Some(BEFORE));
     }
 
     #[tokio::test]
-    async fn opening_a_store_a_later_release_wrote_is_refused_and_keeps_what_it_holds() {
+    async fn cleanup_abandons_open_records_older_than_any_call_runs() {
         let fixture = Fixture::new().await;
-        let checkpoint = fixture.manager.inner.store.checkpoint_path("later");
-        write_private(&checkpoint, &versioned(LATER_CHECKPOINT_VERSION));
-
-        assert_eq!(
-            open_manager(fixture.workspace.path(), fixture.storage.path(), &[])
-                .await
-                .err(),
-            Some(SnapshotError::UnhealthyStorage)
-        );
-        assert!(checkpoint.exists());
-    }
-
-    #[tokio::test]
-    async fn cleanup_deletes_checkpoints_and_collects_only_what_no_other_checkpoint_reaches() {
-        let fixture = Fixture::new().await;
-        fixture.write("shared", "shared");
-        fixture.write("file.txt", "one");
-        let first = fixture.capture("first").await;
-        fixture.write("file.txt", "two");
-        let second = fixture.capture("second").await;
-        let objects = fixture.objects();
+        let stale = fixture.begin(HOLDER, named(&[FILE])).await;
+        let fresh = fixture.begin(HOLDER, named(&[OTHER])).await;
+        let store = &fixture.inner().store;
+        let mut open = store.open_record(stale.as_str()).unwrap();
+        open.opened_at_unix_ms -= STALE_AGE_MS;
+        store
+            .write_atomic(
+                &store.open_path(stale.as_str()).unwrap(),
+                &encode(&open).unwrap(),
+            )
+            .unwrap();
 
         let (prepared, preview) = fixture
             .manager
-            .prepare_cleanup(&[id("first"), id("missing")], usize::MAX)
+            .store()
+            .prepare_cleanup(u64::MAX, usize::MAX)
             .await
             .unwrap();
-        assert_eq!(preview.checkpoint_ids, [id("first")]);
-        assert_eq!(preview.missing_checkpoint_ids, [id("missing")]);
-        let result = fixture
+        let summary = fixture
             .manager
-            .execute_cleanup(&prepared, &CancellationToken::new())
+            .store()
+            .execute_cleanup(&prepared, &token())
             .await
             .unwrap();
-        assert_eq!(result.deleted_checkpoint_ids, [id("first")]);
-        assert_eq!(result.deleted_snapshots, 1);
+
+        assert_eq!(preview.stale_open_records, 1);
+        assert_eq!(summary.abandoned_open_records, 1);
+        let remaining = fixture
+            .manager
+            .store()
+            .open_records(&holder(HOLDER))
+            .await
+            .unwrap();
         assert_eq!(
-            u64::from(result.deleted_objects),
-            objects - fixture.objects()
+            remaining
+                .iter()
+                .map(|open| &open.ticket)
+                .collect::<Vec<_>>(),
+            [&fresh]
         );
-        assert!(
-            !fixture
-                .object_path(&blob_id(b"one").unwrap().to_string())
-                .exists()
-        );
-        assert_eq!(
-            fixture
-                .manager
-                .inspect(&first.snapshot_id, 1, None)
-                .await
-                .unwrap_err(),
-            SnapshotError::NotFound
-        );
-        assert_eq!(fixture.paths(&second).await, ["file.txt", "shared"]);
     }
 
     #[tokio::test]
-    async fn cleanup_keeps_every_snapshot_a_pending_or_undecided_restore_reads() {
+    async fn a_record_moves_between_holders_and_goes_with_its_last() {
         let fixture = Fixture::new().await;
-        fixture.write("file.txt", "before");
-        let before = fixture.capture("before").await;
-        fixture.write("file.txt", "after");
-        let after = fixture.capture("after").await;
-        let (prepared, _) = fixture.prepare(&before, &after).await.unwrap();
+        fixture.write(FILE, BEFORE);
+        let seq = fixture
+            .record(HOLDER, &[FILE], |fixture| fixture.write(FILE, AFTER))
+            .await;
+        let store = fixture.manager.store();
 
+        let held = store
+            .hold(&holder(HOLDER), &holder(OTHER_HOLDER))
+            .await
+            .unwrap();
+        let first = store
+            .release(&holder(HOLDER), &ReleaseSelection::All)
+            .await
+            .unwrap();
+        assert!(fixture.listing(HOLDER).await.is_empty());
+        assert_eq!(seqs(&fixture.listing(OTHER_HOLDER).await), [seq]);
+        let last = store
+            .release(&holder(OTHER_HOLDER), &ReleaseSelection::Seqs(vec![seq]))
+            .await
+            .unwrap();
+
+        assert_eq!(held, 1);
         assert_eq!(
-            fixture
-                .cleanup(&["before", "after"])
-                .await
-                .deleted_snapshots,
-            0
+            first,
+            ReleaseSummary {
+                released: 1,
+                deleted: 0
+            }
         );
-        let status = fixture.execute(&prepared).await.unwrap();
-        drop(prepared);
-        assert_eq!(fixture.read("file.txt"), "before");
-        assert_eq!(fixture.cleanup(&[]).await.deleted_snapshots, 0);
+        assert_eq!(
+            last,
+            ReleaseSummary {
+                released: 1,
+                deleted: 1
+            }
+        );
+        assert!(fixture.stored(seq).is_none());
+    }
+
+    #[tokio::test]
+    async fn collection_keeps_what_open_finished_and_pending_records_need() {
+        let fixture = Fixture::new().await;
+        let content = |path: &str, state: &str| format!("{path} {state}");
+        for path in [FILE, OTHER, THIRD] {
+            fixture.write(path, &content(path, BEFORE));
+        }
+        fixture.write(NESTED, GARBAGE);
+        let finished = fixture
+            .record(HOLDER, &[FILE], |fixture| {
+                fixture.write(FILE, &content(FILE, AFTER));
+            })
+            .await;
+        let pending = fixture
+            .record(HOLDER, &[OTHER], |fixture| {
+                fixture.write(OTHER, &content(OTHER, AFTER));
+            })
+            .await;
+        fixture.revert(HOLDER, &[pending]).await;
+        let abandoned = fixture.begin(HOLDER, named(&[NESTED])).await;
+        assert!(
+            fixture
+                .manager
+                .store()
+                .abandon_record(&abandoned)
+                .await
+                .unwrap()
+        );
+        fs::remove_file(fixture.path(NESTED)).unwrap();
+        let open = fixture.begin(HOLDER, named(&[THIRD])).await;
+        fixture.write(THIRD, &content(THIRD, AFTER));
+
+        let collected = fixture.cleanup(u64::MAX).await;
+
+        assert!(collected.deleted_objects > 0);
+        assert!(!fixture.contains(GARBAGE));
+        for (path, state) in [
+            (FILE, BEFORE),
+            (FILE, AFTER),
+            (OTHER, BEFORE),
+            (OTHER, AFTER),
+            (THIRD, BEFORE),
+        ] {
+            assert!(
+                fixture.contains(&content(path, state)),
+                "{KEPT}: {path} {state}"
+            );
+        }
+        let evicted = fixture.cleanup(0).await;
+        assert_eq!(evicted.evicted_records, 1);
+        assert!(fixture.stored(finished).is_none());
+        for (path, state) in [(OTHER, BEFORE), (OTHER, AFTER), (THIRD, BEFORE)] {
+            assert!(
+                fixture.contains(&content(path, state)),
+                "{KEPT}: {path} {state}"
+            );
+        }
+        let third = fixture.finish(&open).await.expect(RECORDED);
         fixture
             .manager
-            .acknowledge(&status.restore_id)
+            .store()
+            .acknowledge(&holder(HOLDER))
             .await
             .unwrap();
-        let objects = fixture.objects();
-        let result = fixture.cleanup(&[]).await;
-        assert_eq!(result.deleted_snapshots, 2);
-        assert_eq!(u64::from(result.deleted_objects), objects);
-        assert_eq!(fixture.objects(), 0);
-        assert_eq!(fixture.stored(JOURNALS), 0);
+        fixture.revert(HOLDER, &[third]).await;
+        assert_eq!(fixture.read(THIRD), Some(content(THIRD, BEFORE)));
     }
 
+    #[test_case(Unreadable::Record ; "a record")]
+    #[test_case(Unreadable::OpenRecord ; "an open record")]
+    #[test_case(Unreadable::Journal ; "a revert journal")]
     #[tokio::test]
-    async fn cleanup_refuses_a_deletion_set_the_store_would_no_longer_plan() {
+    async fn collection_refuses_to_run_when_anything_it_keeps_cannot_be_read(
+        unreadable: Unreadable,
+    ) {
         let fixture = Fixture::new().await;
-        fixture.write("file.txt", "content");
-        let first = fixture.capture("first").await;
-        let (prepared, _) = fixture
+        fixture.write(FILE, BEFORE);
+        let seq = fixture
+            .record(HOLDER, &[FILE], |fixture| fixture.write(FILE, AFTER))
+            .await;
+        let store = &fixture.inner().store;
+        let damaged = match unreadable {
+            Unreadable::Record => store.record_path(seq),
+            Unreadable::OpenRecord => {
+                let ticket = fixture.begin(HOLDER, named(&[OTHER])).await;
+                store.open_path(ticket.as_str()).unwrap()
+            }
+            Unreadable::Journal => {
+                let journal = StoredJournal::new(
+                    revert_id(),
+                    HOLDER,
+                    0,
+                    RevertDirection::Revert,
+                    vec![seq],
+                    1,
+                    0,
+                );
+                store.write_journal(&journal).unwrap();
+                store.journal_path(&journal.revert_id).unwrap()
+            }
+        };
+        fs::write(&damaged, "damaged").unwrap();
+        let objects = store.object_count().unwrap();
+
+        let refused = fixture
             .manager
-            .prepare_cleanup(&[id("first")], usize::MAX)
+            .store()
+            .prepare_cleanup(0, usize::MAX)
+            .await
+            .err();
+
+        assert_eq!(refused, Some(SnapshotError::UnhealthyStorage));
+        assert_eq!(store.object_count().unwrap(), objects);
+    }
+
+    #[tokio::test]
+    async fn retention_evicts_the_oldest_records_and_reports_the_newest_it_evicted() {
+        let fixture = Fixture::new().await;
+        fixture.write(FILE, BEFORE);
+        let mut records = Vec::new();
+        for call in 0..3 {
+            let mut request = request(HOLDER, named(&[FILE]));
+            request.client = client(json!({ "call": call }));
+            let ticket = fixture
+                .manager
+                .begin_record(request, &token())
+                .await
+                .unwrap();
+            fixture.write(FILE, &call.to_string());
+            records.push(fixture.finish(&ticket).await.expect(RECORDED));
+        }
+        fixture.cleanup(u64::MAX).await;
+        let usage = fixture.manager.store().inventory().await.unwrap().bytes;
+
+        let summary = fixture.cleanup(usage - 1).await;
+        let page = fixture
+            .manager
+            .store()
+            .records(&holder(HOLDER), None, MAX_RECORD_PAGE_SIZE)
             .await
             .unwrap();
-        fixture.capture("later").await;
+
+        assert_eq!(summary.evicted_records, 1);
+        assert_eq!(seqs(&page.records), records[1..]);
+        assert_eq!(page.evicted_through, Some(client(json!({ "call": 0 }))));
+    }
+
+    #[tokio::test]
+    async fn retention_keeps_every_record_an_open_record_may_still_rebase_onto() {
+        let fixture = Fixture::new().await;
+        fixture.write(FILE, BEFORE);
+        fixture.write(OTHER, BEFORE);
+        let older = fixture
+            .record(HOLDER, &[OTHER], |fixture| fixture.write(OTHER, AFTER))
+            .await;
+        let open = fixture.begin(HOLDER, named(&[FILE])).await;
+        let inside = fixture
+            .record(OTHER_HOLDER, &[FILE], |fixture| fixture.write(FILE, AFTER))
+            .await;
+
+        let summary = fixture.cleanup(0).await;
+
+        assert_eq!(summary.evicted_records, 1);
+        assert!(fixture.stored(older).is_none());
+        assert!(fixture.stored(inside).is_some());
+        assert_eq!(fixture.finish(&open).await, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_stores_on_one_binding_commit_unique_seqs_without_gaps() {
+        let fixture = Fixture::new().await;
+        let managers = [fixture.manager.clone(), fixture.another().await];
+        let tasks = managers.into_iter().enumerate().map(|(process, manager)| {
+            let workspace = fixture.workspace.path().to_path_buf();
+            tokio::spawn(async move {
+                let mut seqs = Vec::new();
+                for call in 0..CONCURRENT_RECORDS {
+                    let path = format!("{process}-{call}.txt");
+                    let ticket = manager
+                        .begin_record(request(HOLDER, named(&[&path])), &token())
+                        .await
+                        .unwrap();
+                    fs::write(workspace.join(&path), &path).unwrap();
+                    let summary = manager.finish_record(&ticket, &token()).await.unwrap();
+                    seqs.push(summary.expect(RECORDED).seq);
+                }
+                seqs
+            })
+        });
+        let mut committed = Vec::new();
+        for task in tasks.collect::<Vec<_>>() {
+            committed.extend(task.await.unwrap());
+        }
+        committed.sort_unstable();
+
+        assert_eq!(committed, (1..=2 * CONCURRENT_RECORDS).collect::<Vec<_>>());
+        assert_eq!(
+            seqs(&fixture.listing(HOLDER).await).len(),
+            usize::try_from(2 * CONCURRENT_RECORDS).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_store_another_process_holds_is_busy_once_admission_times_out() {
+        let fixture = Fixture::new().await;
+        let other = fixture.another().await;
+        let _held = other
+            .store
+            .shared
+            .inner
+            .store
+            .lock(Instant::now() + HELD_LOCK, &token())
+            .unwrap();
+        fixture
+            .hooks()
+            .admission_ms
+            .store(ADMISSION_MS, Ordering::SeqCst);
 
         assert_eq!(
-            fixture
-                .manager
-                .execute_cleanup(&prepared, &CancellationToken::new())
-                .await
-                .unwrap_err(),
-            SnapshotError::Conflict
+            fixture.manager.store().inventory().await.unwrap_err(),
+            SnapshotError::Busy
         );
-        assert!(
-            fixture
-                .manager
-                .inspect(&first.snapshot_id, 1, None)
-                .await
-                .is_ok()
-        );
-        assert_eq!(fixture.stored(CHECKPOINTS), 2);
     }
 
     #[tokio::test]
-    async fn private_storage_rejects_overlap_symlinks_and_shared_permissions() {
-        let workspace = tempfile::tempdir().unwrap();
-        let inside = workspace.path().join("snapshots");
-        fs::create_dir(&inside).unwrap();
-        fs::set_permissions(&inside, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE)).unwrap();
-        let shared = tempfile::tempdir().unwrap();
-        fs::set_permissions(shared.path(), fs::Permissions::from_mode(0o755)).unwrap();
-        let parent = tempfile::tempdir().unwrap();
-        let target = private_directory();
-        let linked = parent.path().join("linked-storage");
-        symlink(target.path(), &linked).unwrap();
-
-        for storage in [inside.as_path(), shared.path(), linked.as_path()] {
-            assert_eq!(
-                open_manager(workspace.path(), storage, &[]).await.err(),
-                Some(SnapshotError::InvalidConfiguration)
+    async fn listing_pages_through_records_in_seq_order() {
+        let fixture = Fixture::new().await;
+        let mut records = Vec::new();
+        for path in [FILE, OTHER, THIRD] {
+            records.push(
+                fixture
+                    .record(HOLDER, &[path], |fixture| fixture.write(path, AFTER))
+                    .await,
             );
         }
+        let store = fixture.manager.store();
+
+        let first = store.records(&holder(HOLDER), None, 2).await.unwrap();
+        let second = store
+            .records(&holder(HOLDER), first.next_after_seq, 2)
+            .await
+            .unwrap();
+
+        assert_eq!(seqs(&first.records), records[..2]);
+        assert_eq!(first.next_after_seq, Some(records[1]));
+        assert_eq!(seqs(&second.records), records[2..]);
+        assert_eq!(second.next_after_seq, None);
     }
 
     #[tokio::test]
-    async fn startup_removes_abandoned_temporaries() {
-        let mut fixture = Fixture::new().await;
-        for directory in [CHECKPOINTS, JOURNALS] {
+    async fn a_store_opens_without_its_workspace_to_list_and_release() {
+        let fixture = Fixture::new().await;
+        fixture.write(FILE, BEFORE);
+        fixture
+            .record(HOLDER, &[FILE], |fixture| fixture.write(FILE, AFTER))
+            .await;
+
+        let store = ChangeStore::open(fixture.storage.path(), BINDING)
+            .await
+            .unwrap();
+        let inventory = store.inventory().await.unwrap();
+        let released = store
+            .release(&holder(HOLDER), &ReleaseSelection::All)
+            .await
+            .unwrap();
+
+        assert_eq!((inventory.records, inventory.holders.len()), (1, 1));
+        assert_eq!(
+            released,
+            ReleaseSummary {
+                released: 1,
+                deleted: 1
+            }
+        );
+        assert_eq!(
+            ChangeStore::open(fixture.storage.path(), "absent")
+                .await
+                .err(),
+            Some(SnapshotError::NotFound)
+        );
+    }
+
+    #[tokio::test]
+    async fn what_earlier_formats_left_is_deleted_when_the_store_opens() {
+        let workspace = tempfile::tempdir().unwrap();
+        let storage = private_directory();
+        let root = storage.path().join(BINDING);
+        private_subdirectory(&root);
+        for directory in LEGACY_DIRECTORIES
+            .into_iter()
+            .chain(LEGACY_FILES.map(|(directory, _)| directory))
+        {
+            if !root.join(directory).exists() {
+                private_subdirectory(&root.join(directory));
+            }
+        }
+        for (index, (directory, version)) in LEGACY_FILES.into_iter().enumerate() {
             write_private(
-                &fixture
-                    .storage
-                    .path()
-                    .join(directory)
-                    .join(".abandoned.tmp"),
-                b"partial",
+                &root.join(directory).join(format!("{index}.json")),
+                &versioned(version),
             );
         }
 
-        fixture.reopen().await;
-        for directory in [CHECKPOINTS, JOURNALS] {
-            assert_eq!(fixture.stored(directory), 0);
+        open_manager(workspace.path(), storage.path())
+            .await
+            .unwrap();
+
+        for (directory, _) in LEGACY_FILES {
+            assert!(!root.join(directory).exists());
+        }
+        for directory in LEGACY_DIRECTORIES {
+            assert!(!root.join(directory).exists());
         }
     }
 
     #[tokio::test]
-    async fn later_created_configured_exclusions_remain_excluded() {
+    async fn a_store_holding_a_format_this_release_does_not_know_is_refused() {
         let workspace = tempfile::tempdir().unwrap();
         let storage = private_directory();
-        let excluded = workspace.path().join("generated/private");
-        let manager = open_manager(
-            workspace.path(),
-            storage.path(),
-            std::slice::from_ref(&excluded),
-        )
-        .await
-        .unwrap();
-        fs::create_dir_all(&excluded).unwrap();
-        fs::write(excluded.join("secret"), "secret").unwrap();
-        fs::write(workspace.path().join("visible"), "visible").unwrap();
-        let capture = manager
-            .capture(
-                &id("exclusion"),
-                &WorkspacePath::new(ROOT).unwrap(),
-                &limits(),
-                &CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        let inspected = manager
-            .inspect(&capture.snapshot.snapshot_id, 10, None)
-            .await
-            .unwrap();
+        let root = storage.path().join(BINDING);
+        private_subdirectory(&root);
+        private_subdirectory(&root.join("checkpoints"));
+        let later = root.join("checkpoints").join("later.json");
+        write_private(&later, &versioned(LATER_CHECKPOINT_VERSION));
 
-        assert_eq!(
-            inspected
-                .files
-                .iter()
-                .map(|file| file.path.as_str())
-                .collect::<Vec<_>>(),
-            ["visible"]
-        );
-        assert!(
-            inspected
-                .exclusions
-                .iter()
-                .any(|path| path.as_str() == "generated/private")
-        );
-    }
+        let refused = open_manager(workspace.path(), storage.path()).await.err();
 
-    #[tokio::test]
-    async fn configured_exclusions_reject_escape_and_parent_components() {
-        let workspace = tempfile::tempdir().unwrap();
-        let storage = private_directory();
-        let outside = tempfile::tempdir().unwrap();
-
-        assert_eq!(
-            open_manager(
-                workspace.path(),
-                storage.path(),
-                &[outside.path().join("later")]
-            )
-            .await
-            .err(),
-            Some(SnapshotError::InvalidConfiguration)
-        );
-        assert_eq!(
-            configured_exclusions(workspace.path(), &[PathBuf::from("safe/../escape")])
-                .unwrap_err(),
-            SnapshotError::InvalidConfiguration
-        );
+        assert_eq!(refused, Some(SnapshotError::UnhealthyStorage));
+        assert!(later.exists());
     }
 }

@@ -230,7 +230,8 @@ impl Iterator for SnapshotTreeWalk {
 impl WorkspaceSnapshotAccess {
     /// Walks `scope`, a root-relative directory. Protected paths, `exclusions` (root-relative
     /// prefixes) and ignored paths are left out silently; everything else is yielded, if only as a
-    /// skip with its reason. Blocking: run it off the async executor.
+    /// skip with its reason. A scope that is ignored, or beneath a directory its own repository
+    /// ignores, yields nothing. Blocking: run it off the async executor.
     #[cfg(unix)]
     pub fn walk_tree(
         &self,
@@ -442,6 +443,7 @@ impl WalkState {
         };
         let mut prefix = String::new();
         let mut rules = None;
+        let mut ignored_scope = false;
         let components = scope
             .split('/')
             .filter(|component| *component != ".")
@@ -454,16 +456,27 @@ impl WalkState {
             if component.is_empty() || component == ".." {
                 return Err(SnapshotTreeError::ScopeUnavailable);
             }
-            rules = state.read_rules(&directory, &prefix, rules)?;
+            if !ignored_scope {
+                rules = state.read_rules(&directory, &prefix, rules)?;
+            }
             directory = open_child(&directory, component, DIRECTORY_FLAGS)
                 .map_err(|_| SnapshotTreeError::ScopeUnavailable)?;
             prefix = join(&prefix, component);
             if state.core.policy.protects_relative(&prefix) {
                 return Err(SnapshotTreeError::ScopeUnavailable);
             }
+            ignored_scope = ignored_scope
+                || ignored(
+                    rules.as_deref(),
+                    &prefix,
+                    true,
+                    &mut state.budget,
+                    &mut state.scratch,
+                )?;
             // An inner repository answers to its own rules only, as it does to git.
             if reject_repository(&directory).is_err() {
                 rules = None;
+                ignored_scope = false;
             }
         }
         if let Some(expected) = expected {
@@ -479,7 +492,10 @@ impl WalkState {
                 return Err(SnapshotTreeError::Changed);
             }
         }
-        state.enter(directory, prefix, rules)?;
+        // Git ignores everything beneath an ignored directory, wherever a walk starts.
+        if !ignored_scope {
+            state.enter(directory, prefix, rules)?;
+        }
         Ok(state)
     }
 

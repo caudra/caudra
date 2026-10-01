@@ -203,7 +203,7 @@ pub struct RawOptions {
     #[arg(long)]
     pub remote_principal_id: Option<String>,
 
-    /// Existing private directory used for server-side workspace snapshots.
+    /// Existing private directory used for server-side workspace change records.
     #[arg(long)]
     pub snapshot_root: Option<PathBuf>,
     /// Existing private directory for reviewed-transfer staging and durable outcomes (Unix).

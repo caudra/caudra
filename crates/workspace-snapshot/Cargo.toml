@@ -1,6 +1,6 @@
 [package]
 name = "workcell-workspace-snapshot"
-description = "Protocol-neutral bounded workspace snapshots and journaled restore for Workcell hosts"
+description = "Protocol-neutral per-call workspace change records and journaled revert for Workcell hosts"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

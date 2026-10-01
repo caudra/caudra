@@ -187,6 +187,7 @@ workcell-mcp-web = { workspace = true, features = ["mcp"] }
 [dev-dependencies]
 reqwest.workspace = true
 tempfile.workspace = true
+test-case.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 workcell-mcp-code = { workspace = true, features = ["mcp"] }
 

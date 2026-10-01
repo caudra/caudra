@@ -23,7 +23,6 @@ use workcell_host_contract::{
     WatchState, WorkspaceRequestBinding,
 };
 
-use workcell_host_contract::SNAPSHOT_CAPTURE_CONTRACT_ID;
 pub use workcell_host_contract::{
     CANCEL_METHOD, CancelRequest, CancelResponse, DISCOVER_PROJECT_ASSETS_METHOD,
     DiscoverProjectAssetsRequest, EXECUTE_METHOD, EXTENSION_ID, LIST_METHOD, ListRequest,
@@ -47,9 +46,7 @@ use workcell_mcp_files::{
 use workcell_mcp_shell::PreparedShell;
 use workcell_mcp_web::{PreparedWebfetchOperation, PreparedWebsearchOperation};
 use workcell_workspace_scm::PreparedScmMutation;
-use workcell_workspace_snapshot::{
-    PreparedSnapshotCapture, PreparedSnapshotCleanup, PreparedSnapshotRestore,
-};
+use workcell_workspace_snapshot::{PreparedCleanup, PreparedRevert};
 
 use crate::execution_environment::{
     PreparedExecutionEnvironment, TOOL_NAME as EXECUTION_ENVIRONMENT_TOOL,
@@ -143,19 +140,14 @@ pub(crate) enum PreparedRemoteOperation {
     #[cfg(unix)]
     DirectoryPublication(crate::transfer::reviewed::PreparedDirectoryTransfer),
     ScmMutation(PreparedScmMutation),
-    SnapshotCapture(PreparedSnapshotCapture),
-    SnapshotRestore(PreparedSnapshotRestore),
-    SnapshotUnrevert(PreparedSnapshotRestore),
-    SnapshotCleanup(PreparedSnapshotCleanup),
+    /// A revert or an unrevert, which its direction tells apart.
+    ChangesRevert(PreparedRevert),
+    ChangesCleanup(PreparedCleanup),
     #[cfg(test)]
     Test(Vec<u8>),
 }
 
 impl PreparedRemoteOperation {
-    pub fn is_detached(&self) -> bool {
-        matches!(self, Self::SnapshotCapture(_))
-    }
-
     pub fn supports(name: &str) -> bool {
         matches!(
             name,
@@ -205,11 +197,8 @@ impl PreparedRemoteOperation {
             #[cfg(unix)]
             Self::DirectoryPublication(prepared) => prepared.retained_bytes(),
             Self::ScmMutation(prepared) => prepared.retained_bytes(),
-            Self::SnapshotCapture(prepared) => prepared.retained_bytes(),
-            Self::SnapshotRestore(prepared) | Self::SnapshotUnrevert(prepared) => {
-                prepared.retained_bytes()
-            }
-            Self::SnapshotCleanup(prepared) => prepared.retained_bytes(),
+            Self::ChangesRevert(prepared) => prepared.retained_bytes(),
+            Self::ChangesCleanup(prepared) => prepared.retained_bytes(),
             #[cfg(test)]
             Self::Test(bytes) => size_of::<Self>().saturating_add(bytes.capacity()),
         }
@@ -279,6 +268,7 @@ impl RemoteHostState {
         self.prepare_reserved(reservation, operation, binding, intent)
     }
 
+    #[cfg(test)]
     pub fn reserve_preparation(
         &self,
         bytes: usize,
@@ -400,45 +390,6 @@ impl RemoteHostState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .begin(request, cancellation, self.ledger.clone(), Instant::now())
-    }
-
-    pub fn cancel_captures(&self) {
-        let mut ledger = self
-            .ledger
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        ledger.captures_closed = true;
-        for record in ledger.records.values() {
-            if record.binding.contract.id.as_str() == SNAPSHOT_CAPTURE_CONTRACT_ID
-                && let Some(token) = &record.cancellation
-            {
-                token.cancel();
-            }
-        }
-    }
-
-    pub async fn drain_captures(&self) {
-        let changed = self
-            .ledger
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .capture_finished
-            .clone();
-        loop {
-            let notified = changed.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self
-                .ledger
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .running_captures
-                == 0
-            {
-                return;
-            }
-            notified.await;
-        }
     }
 
     pub fn finish(
@@ -982,7 +933,6 @@ pub(crate) struct ExecutionLease {
     bytes: usize,
     preparation_id: Identifier,
     invocation_id: Identifier,
-    capture: bool,
 }
 
 impl Drop for ExecutionLease {
@@ -999,10 +949,6 @@ impl Drop for ExecutionLease {
             ledger.finish_indeterminate(&self.preparation_id, &self.invocation_id, Instant::now());
         }
         ledger.running_bytes = ledger.running_bytes.saturating_sub(self.bytes);
-        if self.capture {
-            ledger.running_captures = ledger.running_captures.saturating_sub(1);
-            ledger.capture_finished.notify_waiters();
-        }
     }
 }
 
@@ -1118,9 +1064,6 @@ struct Ledger {
     bytes: usize,
     reserved_bytes: usize,
     running_bytes: usize,
-    running_captures: usize,
-    captures_closed: bool,
-    capture_finished: Arc<Notify>,
     reservations: usize,
     /// Wall clock of the newest tombstone this ledger has evicted. Eviction is
     /// oldest first, so every dropped tombstone was forgotten at or before this
@@ -1270,20 +1213,8 @@ impl Ledger {
         if now >= record.expires_at {
             return Err(RemoteOperationError::Expired);
         }
-        let capture = record
-            .operation
-            .as_ref()
-            .is_some_and(PreparedRemoteOperation::is_detached);
-        if capture && self.captures_closed {
-            return Err(RemoteOperationError::Cancelled);
-        }
         let Some(operation) = record.operation.take() else {
             return Err(RemoteOperationError::Internal);
-        };
-        let cancellation = if operation.is_detached() {
-            CancellationToken::new()
-        } else {
-            cancellation
         };
         record.invocation_id = Some(request.invocation_id.clone());
         record.execution_id = Some(request.invocation_id.clone());
@@ -1293,13 +1224,11 @@ impl Ledger {
             .prepared_bytes
             .saturating_add(EXECUTION_LEASE_OVERHEAD_BYTES);
         self.running_bytes = self.running_bytes.saturating_add(lease_bytes);
-        self.running_captures += usize::from(capture);
         let start = BeginExecution::Start {
             operation: Box::new(operation),
             cancellation,
             lease: ExecutionLease {
                 ledger,
-                capture,
                 bytes: lease_bytes,
                 preparation_id: request.preparation_id.clone(),
                 invocation_id: request.invocation_id.clone(),
@@ -1885,38 +1814,6 @@ mod tests {
         fn assert_send_static<T: Send + 'static>() {}
 
         assert_send_static::<PreparedRemoteOperation>();
-    }
-
-    #[tokio::test]
-    async fn closing_capture_admission_does_not_cancel_or_drain_other_operations() {
-        let state = state();
-        let prepared = prepare(&state).unwrap();
-        let request = ExecuteRequest {
-            version: ContractVersion::V1,
-            preparation_id: prepared.preparation_id,
-            invocation_id: Identifier::new("non-capture").unwrap(),
-            host: state.binding.clone(),
-        };
-        let parent = CancellationToken::new();
-        let BeginExecution::Start {
-            cancellation,
-            lease,
-            ..
-        } = state.begin(&request, parent.child_token()).unwrap()
-        else {
-            panic!("expected start")
-        };
-        state.cancel_captures();
-        assert!(!cancellation.is_cancelled());
-        let mut drain = Box::pin(state.drain_captures());
-        std::future::poll_fn(|cx| {
-            assert!(drain.as_mut().poll(cx).is_ready());
-            std::task::Poll::Ready(())
-        })
-        .await;
-        parent.cancel();
-        assert!(cancellation.is_cancelled());
-        drop(lease);
     }
 
     #[test]
@@ -3328,7 +3225,7 @@ mod tests {
                 workspace_mutation: None,
                 direct_exec: None,
                 scm: None,
-                snapshots: None,
+                changes: None,
                 control_plane: false,
                 control_plane_missing: Vec::new(),
             },

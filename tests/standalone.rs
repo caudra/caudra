@@ -14,6 +14,19 @@ use sha2::{Digest, Sha256};
 use std::{fmt::Write as _, path::Path};
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
+use workcell_host_contract::{
+    CHANGES_ABANDON_OPEN_RECORDS_METHOD, CHANGES_ABANDON_RECORD_METHOD, CHANGES_ACKNOWLEDGE_METHOD,
+    CHANGES_BEGIN_RECORD_METHOD, CHANGES_CLEANUP_CONTRACT_ID, CHANGES_FINISH_RECORD_METHOD,
+    CHANGES_HOLD_METHOD, CHANGES_HOLDERS_METHOD, CHANGES_OPEN_RECORDS_METHOD,
+    CHANGES_PREPARE_CLEANUP_METHOD, CHANGES_PREPARE_REVERT_METHOD, CHANGES_PREPARE_UNREVERT_METHOD,
+    CHANGES_RECORDS_METHOD, CHANGES_RELEASE_METHOD, CHANGES_REVERT_CONTRACT_ID,
+    CHANGES_STATUS_METHOD, CHANGES_UNREVERT_CONTRACT_ID, EXECUTE_METHOD, MAX_OPEN_RECORDS,
+    MAX_RECORD_CLIENT_BYTES, MAX_RECORD_HOLDER_BYTES, MAX_RECORD_PAGE_SIZE, MAX_RECORD_SCOPE_PATHS,
+    MAX_REVERT_RECORDS, MAX_SNAPSHOT_CAPTURE_ENTRIES, MAX_SNAPSHOT_CAPTURE_PATH_BYTES,
+    MAX_SNAPSHOT_FILE_BYTES, MAX_SNAPSHOT_FILES, MAX_SNAPSHOT_STORAGE_BYTES,
+    MAX_SNAPSHOT_TOTAL_BYTES,
+};
 use workcell_mcp::{
     cli::{HttpBindMode, ToolGroup},
     remote_host::RemoteHostConfiguration,
@@ -28,7 +41,18 @@ const ACCEPT: &str = "application/json, text/event-stream";
 const PROTOCOL_VERSION: &str = "2026-07-28";
 const LEGACY_PROTOCOL_VERSION: &str = "2025-11-25";
 const TOKEN: &str = "workcell-integration-token-with-more-than-32-bytes";
-const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(unix)]
+const CHANGED_FILE: &str = "state.txt";
+#[cfg(unix)]
+const BEFORE_CHANGE: &str = "before";
+#[cfg(unix)]
+const AFTER_CHANGE: &str = "after";
+#[cfg(unix)]
+const CHANGES_HOLDER: &str = "session-http";
+#[cfg(unix)]
+const FORK_HOLDER: &str = "session-fork";
+#[cfg(unix)]
+const CHANGES_PAGE_SIZE: u32 = 10;
 
 async fn fixture_server() -> (TempDir, WorkcellServer) {
     fixture_server_with_policy(ShellPermissionPolicy::restricted()).await
@@ -139,11 +163,11 @@ async fn stdio_supports_legacy_initialization_and_shell_progress() {
     assert_eq!(scm_refusal["error"]["code"], -32601);
     write_json(
         &mut write,
-        &legacy_request(22, "ai.workcell/snapshot-capture", json!({})),
+        &legacy_request(22, CHANGES_BEGIN_RECORD_METHOD, json!({})),
     )
     .await;
-    let snapshot_refusal = read_json(&mut read).await;
-    assert_eq!(snapshot_refusal["error"]["code"], -32601);
+    let changes_refusal = read_json(&mut read).await;
+    assert_eq!(changes_refusal["error"]["code"], -32601);
     write_json(
         &mut write,
         &legacy_request(
@@ -725,9 +749,9 @@ async fn authenticated_http_discovers_one_opt_in_remote_environment() {
     assert_eq!(descriptor["capabilities"]["controlPlane"], false);
     assert_eq!(
         descriptor["capabilities"]["controlPlaneMissing"],
-        json!(["workspaceMutation", "snapshots"])
+        json!(["workspaceMutation", "changes"])
     );
-    assert!(descriptor["capabilities"]["snapshots"].is_null());
+    assert!(descriptor["capabilities"]["changes"].is_null());
     assert_eq!(descriptor["capabilities"]["scm"]["version"], "v1");
     assert_eq!(
         descriptor["capabilities"]["scm"]["limits"]["maxConcurrentOperations"],
@@ -803,22 +827,12 @@ async fn authenticated_http_discovers_one_opt_in_remote_environment() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn authenticated_snapshot_restore_is_negotiated_and_uses_the_common_ledger() {
+async fn authenticated_change_records_round_trip_every_method_and_use_the_common_ledger() {
     let root = tempfile::tempdir().expect("temporary root");
-    let snapshot_root = tempfile::tempdir().expect("snapshot root");
-    std::fs::set_permissions(snapshot_root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    tokio::fs::write(root.path().join("state.txt"), "before")
-        .await
-        .unwrap();
-    std::os::unix::fs::symlink("state.txt", root.path().join("link")).unwrap();
-    std::fs::create_dir(root.path().join("sub")).unwrap();
-    tokio::fs::write(root.path().join("sub/leaf.txt"), "leaf")
-        .await
-        .unwrap();
-    std::fs::create_dir_all(root.path().join("nested/.git")).unwrap();
-    tokio::fs::write(root.path().join("nested/inner.txt"), "inner")
-        .await
-        .unwrap();
+    let change_root = tempfile::tempdir().expect("change root");
+    std::fs::set_permissions(change_root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let file = root.path().join(CHANGED_FILE);
+    std::fs::write(&file, BEFORE_CHANGE).unwrap();
     let server = WorkcellServer::configured(
         Some(root.path()),
         &[ToolGroup::Files, ToolGroup::Shell],
@@ -841,101 +855,96 @@ async fn authenticated_snapshot_restore_is_negotiated_and_uses_the_common_ledger
                 type_check: true,
             },
             max_transfer_bytes: workcell_mcp::cli::DEFAULT_MAX_TRANSFER_BYTES,
-            snapshot_root: Some(snapshot_root.path()),
+            snapshot_root: Some(change_root.path()),
             transfer_root: None,
             snapshot_exclusions: &[],
         },
     )
     .await
     .unwrap();
-    let http = HttpServer::start(
-        server,
-        0,
-        HttpConfiguration {
-            bind_mode: HttpBindMode::Loopback,
-            allowed_hosts: vec!["127.0.0.1".into()],
-            authentication: Some(HttpAuthentication::new(TOKEN).unwrap()),
-            remote_host: Some(
-                RemoteHostConfiguration::new(
-                    "server-snapshot".into(),
-                    "workspace-snapshot".into(),
-                    "generation-snapshot".into(),
-                    "project-snapshot".into(),
-                    "principal-snapshot".into(),
-                )
-                .unwrap(),
-            ),
-        },
-    )
-    .await
-    .unwrap();
+    let http = HttpServer::start(server, 0, transfer_http_configuration())
+        .await
+        .unwrap();
     let endpoint = format!("http://{}/mcp", http.address());
     let client = Client::new();
-    let discovery = final_sse_json(
-        post_rpc(
-            &client,
-            &endpoint,
-            Some(TOKEN),
-            discover_request(
-                1,
-                json!({"extensions":{"ai.workcell/remote-host":{"versions":["v1"]}}}),
-            ),
-        )
-        .await,
-    )
-    .await;
-    let descriptor = &discovery["result"]["capabilities"]["extensions"]["ai.workcell/remote-host"];
+    let descriptor = reviewed_discovery(&client, &endpoint).await;
     assert_eq!(descriptor["capabilities"]["controlPlane"], true);
     assert_eq!(descriptor["capabilities"]["controlPlaneMissing"], json!([]));
-    assert_eq!(descriptor["capabilities"]["snapshots"]["version"], "v1");
+    assert!(descriptor["capabilities"].get("snapshots").is_none());
+    let changes = &descriptor["capabilities"]["changes"];
+    assert_eq!(changes["version"], "v1");
     assert_eq!(
-        descriptor["capabilities"]["snapshots"]["methods"],
+        changes["methods"],
         json!({
-            "capture":true,"prepareCapture":true,"checkpoint":true,"inspect":true,"status":true,
-            "prepareRestore":true,"prepareUnrevert":true,"acknowledge":true,"prepareCleanup":true
+            "beginRecord":true, "finishRecord":true, "abandonRecord":true, "openRecords":true,
+            "abandonOpenRecords":true, "records":true, "holders":true, "hold":true,
+            "release":true, "prepareRevert":true, "prepareUnrevert":true, "acknowledge":true,
+            "status":true, "prepareCleanup":true
         })
     );
     assert_eq!(
-        descriptor["capabilities"]["snapshots"]["atomicAcrossFiles"],
-        false
+        changes["limits"],
+        json!({
+            "maxFiles":MAX_SNAPSHOT_FILES,
+            "maxFileBytes":MAX_SNAPSHOT_FILE_BYTES,
+            "maxTotalBytes":MAX_SNAPSHOT_TOTAL_BYTES,
+            "maxCaptureEntries":MAX_SNAPSHOT_CAPTURE_ENTRIES,
+            "maxCapturePathBytes":MAX_SNAPSHOT_CAPTURE_PATH_BYTES,
+            "maxStorageBytes":MAX_SNAPSHOT_STORAGE_BYTES,
+            "maxScopePaths":MAX_RECORD_SCOPE_PATHS,
+            "maxClientBytes":MAX_RECORD_CLIENT_BYTES,
+            "maxHolderBytes":MAX_RECORD_HOLDER_BYTES,
+            "maxPageSize":MAX_RECORD_PAGE_SIZE,
+            "maxOpenRecords":MAX_OPEN_RECORDS,
+            "maxRevertRecords":MAX_REVERT_RECORDS
+        })
     );
-    assert_eq!(
-        descriptor["capabilities"]["snapshots"]["limits"]["maxCaptureEntries"],
-        workcell_host_contract::MAX_SNAPSHOT_CAPTURE_ENTRIES
-    );
-    assert_eq!(
-        descriptor["capabilities"]["snapshots"]["limits"]["maxCapturePathBytes"],
-        workcell_host_contract::MAX_SNAPSHOT_CAPTURE_PATH_BYTES
-    );
-    assert_eq!(descriptor["capabilities"]["watch"]["methods"]["poll"], true);
-    assert_eq!(descriptor["capabilities"]["scm"]["methods"]["status"], true);
 
-    let capture_request = |checkpoint: &str, max_files: usize| {
-        json!({
-            "version":"v1",
-            "host":remote_host_binding(descriptor),
-            "cwdHandle":descriptor["cwd"]["handle"],
-            "checkpointId":checkpoint,
-            "limits":{
-                "maxFiles":max_files,
-                "maxFileBytes":workcell_host_contract::MAX_SNAPSHOT_FILE_BYTES,
-                "maxTotalBytes":workcell_host_contract::MAX_SNAPSHOT_TOTAL_BYTES
-            }
-        })
+    let bound = |fields: Value| {
+        let mut params = json!({
+            "version":"v1", "host":remote_host_binding(&descriptor),
+            "cwdHandle":descriptor["cwd"]["handle"]
+        });
+        params
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        params
     };
-    let capture_params = capture_request(
-        "checkpoint-http",
-        workcell_host_contract::MAX_SNAPSHOT_FILES,
-    );
+    let call = |method: &'static str, fields: Value| {
+        let params = bound(fields);
+        let client = &client;
+        let endpoint = &endpoint;
+        async move { reviewed_rpc(client, endpoint, method, params).await }
+    };
+    let execute = |preparation: &Value, invocation: &str| {
+        let params = json!({
+            "version":"v1", "host":remote_host_binding(&descriptor),
+            "preparationId":preparation["result"]["operation"]["preparationId"],
+            "invocationId":invocation
+        });
+        let client = &client;
+        let endpoint = &endpoint;
+        async move { reviewed_rpc(client, endpoint, EXECUTE_METHOD, params).await }
+    };
+    let holder = json!({"holder":CHANGES_HOLDER});
+    let client_metadata = json!({"call":"edit"});
+    let begin = json!({"record":{
+        "scope":{"kind":"paths","paths":[CHANGED_FILE]},
+        "holder":CHANGES_HOLDER,
+        "client":client_metadata,
+        "limits":{
+            "maxFiles":MAX_SNAPSHOT_FILES,
+            "maxFileBytes":MAX_SNAPSHOT_FILE_BYTES,
+            "maxTotalBytes":MAX_SNAPSHOT_TOTAL_BYTES
+        }
+    }});
+
     let unauthenticated = post_rpc(
         &client,
         &endpoint,
         None,
-        remote_request(
-            2,
-            "ai.workcell/snapshot-prepare-capture",
-            capture_params.clone(),
-        ),
+        remote_request(1, CHANGES_BEGIN_RECORD_METHOD, bound(begin.clone())),
     )
     .await;
     assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
@@ -944,184 +953,98 @@ async fn authenticated_snapshot_restore_is_negotiated_and_uses_the_common_ledger
             &client,
             &endpoint,
             Some(TOKEN),
-            mcp_request(
-                3,
-                "ai.workcell/snapshot-prepare-capture",
-                capture_params.clone(),
-            ),
+            mcp_request(1, CHANGES_BEGIN_RECORD_METHOD, bound(begin.clone())),
         )
         .await,
     )
     .await;
     assert_eq!(unnegotiated["error"]["code"], -32601);
-    let preparation = final_sse_json(
-        post_rpc(
-            &client,
-            &endpoint,
-            Some(TOKEN),
-            remote_request(4, "ai.workcell/snapshot-prepare-capture", capture_params),
-        )
-        .await,
-    )
-    .await;
+
+    let ticket = call(CHANGES_BEGIN_RECORD_METHOD, begin.clone()).await["result"]["ticket"].clone();
+    let open = call(CHANGES_OPEN_RECORDS_METHOD, holder.clone()).await;
     assert_eq!(
-        preparation["result"]["binding"]["contract"]["id"], "workcell.snapshot.capture.v2",
-        "{preparation}"
+        (
+            &open["result"]["records"][0]["ticket"],
+            &open["result"]["records"][0]["client"]
+        ),
+        (&ticket, &client_metadata),
+        "{open}"
     );
-    let lookup_params = json!({
-        "version":"v1", "host":remote_host_binding(descriptor),
-        "cwdHandle":descriptor["cwd"]["handle"], "checkpointId":"checkpoint-http"
-    });
-    let missing = final_sse_json(
-        post_rpc(
-            &client,
-            &endpoint,
-            Some(TOKEN),
-            remote_request(40, "ai.workcell/snapshot-checkpoint", lookup_params.clone()),
-        )
-        .await,
-    )
-    .await;
-    assert_eq!(missing["error"]["data"]["code"], "not_found");
-    let selector = json!({
-        "version":"v1", "host":remote_host_binding(descriptor),
-        "preparationId":preparation["result"]["preparationId"], "invocationId":"capture-http"
-    });
-    let accepted = final_sse_json(
-        post_rpc(
-            &client,
-            &endpoint,
-            Some(TOKEN),
-            remote_request(41, "ai.workcell/execute", selector.clone()),
-        )
-        .await,
-    )
-    .await;
-    assert_eq!(accepted["result"]["state"], "running", "{accepted}");
-    let settled = tokio::time::timeout(CAPTURE_TIMEOUT, async {
-        loop {
-            let status = final_sse_json(
-                post_rpc(
-                    &client,
-                    &endpoint,
-                    Some(TOKEN),
-                    remote_request(42, "ai.workcell/status", selector.clone()),
-                )
-                .await,
-            )
-            .await;
-            if status["result"]["state"] != "running" {
-                break status;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    assert_eq!(settled["result"]["state"], "completed", "{settled}");
-    let capture = final_sse_json(
-        post_rpc(
-            &client,
-            &endpoint,
-            Some(TOKEN),
-            remote_request(43, "ai.workcell/snapshot-checkpoint", lookup_params.clone()),
-        )
-        .await,
-    )
-    .await;
-    assert_eq!(capture["result"]["reusedCheckpoint"], true);
-    let snapshot = &capture["result"]["snapshot"];
+    std::fs::write(&file, AFTER_CHANGE).unwrap();
+    let finished = call(CHANGES_FINISH_RECORD_METHOD, json!({"ticket":ticket})).await;
+    let seq = finished["result"]["record"]["seq"].clone();
     assert_eq!(
-        snapshot,
-        &settled["result"]["outcome"]["result"]["structuredContent"]["snapshot"]
+        finished["result"]["record"],
+        json!({"seq":seq, "paths":1, "unrecorded":0}),
+        "{finished}"
     );
-    assert_eq!(snapshot["state"], "complete", "{capture}");
-    assert_eq!(snapshot["scope"], ".");
-    assert_eq!(snapshot["fileCount"], 3);
-    assert_eq!(snapshot["skipped"]["nestedRepositories"], 1);
-    assert_eq!(
-        snapshot["skipped"]["samples"],
-        json!([{"path":"nested","reason":"nestedRepository"}])
-    );
-    let snapshot_id = snapshot["snapshotId"].clone();
-    let refused = final_sse_json(
-        post_rpc(
-            &client,
-            &endpoint,
-            Some(TOKEN),
-            remote_request(
-                5,
-                "ai.workcell/snapshot-capture",
-                capture_request("checkpoint-refused", 1),
-            ),
-        )
-        .await,
+    let abandoned_ticket =
+        call(CHANGES_BEGIN_RECORD_METHOD, begin.clone()).await["result"]["ticket"].clone();
+    let abandoned = call(
+        CHANGES_ABANDON_RECORD_METHOD,
+        json!({"ticket":abandoned_ticket}),
+    )
+    .await;
+    assert_eq!(abandoned["result"]["abandoned"], true, "{abandoned}");
+    call(CHANGES_BEGIN_RECORD_METHOD, begin).await;
+    let abandoned_open = call(CHANGES_ABANDON_OPEN_RECORDS_METHOD, holder.clone()).await;
+    assert_eq!(abandoned_open["result"]["abandoned"], 1, "{abandoned_open}");
+
+    let held = call(
+        CHANGES_HOLD_METHOD,
+        json!({"from":CHANGES_HOLDER, "to":FORK_HOLDER}),
+    )
+    .await;
+    assert_eq!(held["result"]["held"], 1, "{held}");
+    let holders = call(
+        CHANGES_HOLDERS_METHOD,
+        json!({"pageSize":CHANGES_PAGE_SIZE}),
     )
     .await;
     assert_eq!(
-        refused["error"]["data"],
-        json!({"code":"limit_exceeded","limit":"files","maximum":1})
+        holders["result"],
+        json!({
+            "version":"v1",
+            "holders":[
+                {"holder":FORK_HOLDER, "records":1, "openRecords":0, "pendingReverts":0},
+                {"holder":CHANGES_HOLDER, "records":1, "openRecords":0, "pendingReverts":0}
+            ],
+            "nextAfter":null
+        })
+    );
+    let released = call(
+        CHANGES_RELEASE_METHOD,
+        json!({"holder":FORK_HOLDER, "selection":"all"}),
+    )
+    .await;
+    assert_eq!(
+        released["result"]["release"],
+        json!({"released":1, "deleted":0})
     );
 
-    tokio::fs::write(root.path().join("state.txt"), "after")
-        .await
-        .unwrap();
-    let source = final_sse_json(
-        post_rpc(
-            &client,
-            &endpoint,
-            Some(TOKEN),
-            remote_request(
-                6,
-                "ai.workcell/snapshot-capture",
-                capture_request(
-                    "checkpoint-after",
-                    workcell_host_contract::MAX_SNAPSHOT_FILES,
-                ),
-            ),
-        )
-        .await,
+    let prepared = call(
+        CHANGES_PREPARE_REVERT_METHOD,
+        json!({"holder":CHANGES_HOLDER, "seqs":[seq]}),
     )
     .await;
-    let prepare = final_sse_json(
-        post_rpc(
-            &client,
-            &endpoint,
-            Some(TOKEN),
-            remote_request(
-                7,
-                "ai.workcell/snapshot-prepare-restore",
-                json!({
-                    "version":"v1",
-                    "host":remote_host_binding(descriptor),
-                    "cwdHandle":descriptor["cwd"]["handle"],
-                    "snapshotId":snapshot_id,
-                    "sourceSnapshotId":source["result"]["snapshot"]["snapshotId"]
-                }),
-            ),
-        )
-        .await,
-    )
-    .await;
-    let preview = &prepare["result"]["preview"];
     assert_eq!(
-        preview["counts"],
-        json!({
-            "create":0,
-            "replace":1,
-            "delete":0,
-            "conflict":0,
-            "unchanged":0,
-            "createdDirectories":0
-        }),
-        "{prepare}"
+        prepared["result"]["operation"]["binding"]["contract"]["id"], CHANGES_REVERT_CONTRACT_ID,
+        "{prepared}"
     );
-    assert_eq!(preview["changes"][0]["path"], "state.txt");
-    assert_eq!(preview["changes"][0]["kind"], "replace");
-    let restore_id = preview["restoreId"].clone();
-    assert!(restore_id.as_str().unwrap().starts_with("restore_"));
-    let journal = format!("snapshot-store:journal:{}", restore_id.as_str().unwrap());
-    let disclosed = prepare["result"]["operation"]["intent"]["resources"]
+    assert_eq!(
+        prepared["result"]["preview"]["counts"],
+        json!({
+            "create":0, "replace":1, "delete":0, "unchanged":0, "conflicts":0,
+            "createdDirectories":0
+        })
+    );
+    assert_eq!(
+        prepared["result"]["preview"]["planned"],
+        json!([{"path":CHANGED_FILE, "kind":"replace"}])
+    );
+    let holder_resource = format!("workspace-changes:holder:{CHANGES_HOLDER}");
+    let changed_resource = format!("file:{CHANGED_FILE}");
+    let disclosed = prepared["result"]["operation"]["intent"]["resources"]
         .as_array()
         .unwrap()
         .iter()
@@ -1135,214 +1058,91 @@ async fn authenticated_snapshot_restore_is_negotiated_and_uses_the_common_ledger
     assert_eq!(
         disclosed,
         [
-            ("file:.", "write"),
-            (journal.as_str(), "write"),
-            ("snapshot-store:settled-restore-journals", "delete"),
+            (changed_resource.as_str(), "write"),
+            (holder_resource.as_str(), "write")
         ]
     );
-    let execute = remote_request(
-        8,
-        "ai.workcell/execute",
+    let reverted = execute(&prepared, "revert-http").await;
+    assert_eq!(reverted["result"]["state"], "completed", "{reverted}");
+    let pending = &reverted["result"]["outcome"]["result"]["structuredContent"]["pending"];
+    assert_eq!(
+        (&pending[0]["direction"], &pending[0]["state"]),
+        (&json!("revert"), &json!("completed")),
+        "{reverted}"
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), BEFORE_CHANGE);
+    assert_eq!(
+        execute(&prepared, "revert-http").await["result"],
+        reverted["result"]
+    );
+    let status = call(CHANGES_STATUS_METHOD, holder.clone()).await;
+    assert_eq!(status["result"]["status"]["pending"], *pending);
+    let records = call(
+        CHANGES_RECORDS_METHOD,
+        json!({"holder":CHANGES_HOLDER, "pageSize":CHANGES_PAGE_SIZE}),
+    )
+    .await;
+    assert_eq!(
+        records["result"]["page"],
         json!({
-            "version":"v1",
-            "preparationId":prepare["result"]["operation"]["preparationId"],
-            "invocationId":"snapshot-restore-http",
-            "host":remote_host_binding(descriptor)
-        }),
+            "records":[{
+                "seq":seq, "client":client_metadata, "state":"reverted", "paths":1,
+                "unrecorded":0
+            }],
+            "nextAfterSeq":null,
+            "evictedThrough":null
+        })
     );
-    let completed =
-        final_sse_json(post_rpc(&client, &endpoint, Some(TOKEN), execute.clone()).await).await;
-    assert_eq!(completed["result"]["state"], "completed", "{completed}");
+
+    let unrevert = call(CHANGES_PREPARE_UNREVERT_METHOD, holder.clone()).await;
     assert_eq!(
-        completed["result"]["outcome"]["result"]["structuredContent"]["state"],
-        "completed"
+        unrevert["result"]["operation"]["binding"]["contract"]["id"], CHANGES_UNREVERT_CONTRACT_ID,
+        "{unrevert}"
     );
+    let unreverted = execute(&unrevert, "unrevert-http").await;
+    assert_eq!(unreverted["result"]["state"], "completed", "{unreverted}");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), AFTER_CHANGE);
     assert_eq!(
-        completed["result"]["outcome"]["result"]["structuredContent"]["restoreId"],
-        restore_id
+        call(CHANGES_STATUS_METHOD, holder.clone()).await["result"]["status"]["pending"],
+        json!([])
     );
+
+    let again = call(
+        CHANGES_PREPARE_REVERT_METHOD,
+        json!({"holder":CHANGES_HOLDER, "seqs":[seq]}),
+    )
+    .await;
+    execute(&again, "revert-again-http").await;
+    let acknowledged = call(CHANGES_ACKNOWLEDGE_METHOD, holder).await;
     assert_eq!(
-        tokio::fs::read_to_string(root.path().join("state.txt"))
-            .await
-            .unwrap(),
-        "before"
+        acknowledged["result"]["status"],
+        json!({"holder":CHANGES_HOLDER, "pending":[]}),
+        "{acknowledged}"
     );
-    let duplicate = final_sse_json(post_rpc(&client, &endpoint, Some(TOKEN), execute).await).await;
-    assert_eq!(duplicate["result"], completed["result"]);
-    let directory = final_sse_json(
-        post_rpc(
-            &client,
-            &endpoint,
-            Some(TOKEN),
-            remote_request(
-                9,
-                "ai.workcell/resolve-directory",
-                json!({
-                    "version":"v1",
-                    "host":remote_host_binding(descriptor),
-                    "cwdHandle":descriptor["cwd"]["handle"],
-                    "path":"sub"
-                }),
-            ),
-        )
-        .await,
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), BEFORE_CHANGE);
+    let gone = call(
+        CHANGES_PREPARE_REVERT_METHOD,
+        json!({"holder":CHANGES_HOLDER, "seqs":[seq]}),
     )
     .await;
-    let mut scoped_params =
-        capture_request("checkpoint-sub", workcell_host_contract::MAX_SNAPSHOT_FILES);
-    scoped_params["cwdHandle"] = directory["result"]["directory"]["handle"].clone();
-    let scoped = final_sse_json(
-        post_rpc(
-            &client,
-            &endpoint,
-            Some(TOKEN),
-            remote_request(10, "ai.workcell/snapshot-capture", scoped_params),
-        )
-        .await,
+    assert_eq!(gone["error"]["data"], json!({"code":"not_found"}), "{gone}");
+
+    let cleanup = call(
+        CHANGES_PREPARE_CLEANUP_METHOD,
+        json!({"retentionBytes":MAX_SNAPSHOT_STORAGE_BYTES}),
     )
     .await;
-    assert_eq!(scoped["result"]["snapshot"]["scope"], "sub", "{scoped}");
-    assert_eq!(scoped["result"]["snapshot"]["fileCount"], 1);
-    let mut wrong_scope = lookup_params;
-    wrong_scope["cwdHandle"] = directory["result"]["directory"]["handle"].clone();
-    let refused_scope = final_sse_json(
-        post_rpc(
-            &client,
-            &endpoint,
-            Some(TOKEN),
-            remote_request(44, "ai.workcell/snapshot-checkpoint", wrong_scope),
-        )
-        .await,
-    )
-    .await;
-    assert_eq!(refused_scope["error"]["data"]["code"], "invalid_request");
-    let cleanup = final_sse_json(
-        post_rpc(
-            &client,
-            &endpoint,
-            Some(TOKEN),
-            remote_request(
-                46,
-                "ai.workcell/snapshot-prepare-cleanup",
-                json!({
-                    "version":"v1", "host":remote_host_binding(descriptor),
-                    "cwdHandle":descriptor["cwd"]["handle"], "checkpointIds":["checkpoint-sub"]
-                }),
-            ),
-        )
-        .await,
-    )
-    .await;
-    let cleaned = final_sse_json(post_rpc(&client, &endpoint, Some(TOKEN),
-        remote_request(47, "ai.workcell/execute", json!({
-            "version":"v1", "host":remote_host_binding(descriptor),
-            "preparationId":cleanup["result"]["operation"]["preparationId"], "invocationId":"cleanup-http"
-        }))).await).await;
+    assert_eq!(
+        cleanup["result"]["operation"]["binding"]["contract"]["id"], CHANGES_CLEANUP_CONTRACT_ID,
+        "{cleanup}"
+    );
+    let cleaned = execute(&cleanup, "cleanup-http").await;
     assert_eq!(cleaned["result"]["state"], "completed", "{cleaned}");
     assert_eq!(
-        cleaned["result"]["outcome"]["result"]["structuredContent"]["deletedCheckpointIds"],
-        json!(["checkpoint-sub"])
+        cleaned["result"]["outcome"]["result"]["structuredContent"]["evictedRecords"],
+        0
     );
     assert_eq!(http.shutdown().await, ShutdownOutcome::Completed);
-
-    let reopened = WorkcellServer::configured(
-        Some(root.path()),
-        &[ToolGroup::Files, ToolGroup::Shell],
-        ServerBehavior {
-            expose_execution_environment: false,
-            modern_only: true,
-        },
-        ToolConfiguration {
-            allow_write: true,
-            web: WebsearchExecutionConfiguration::unconfigured(),
-            web_icons: false,
-            proxy: ProxyConfiguration::direct(),
-            shell_policy: ShellPermissionPolicy::restricted(),
-            shell_output_filter: true,
-            honor_gitignore: true,
-            code: CodeConfiguration {
-                worker: WorkerSource::Discover {
-                    bundled_cache_root: None,
-                },
-                type_check: true,
-            },
-            max_transfer_bytes: workcell_mcp::cli::DEFAULT_MAX_TRANSFER_BYTES,
-            snapshot_root: Some(snapshot_root.path()),
-            transfer_root: None,
-            snapshot_exclusions: &[],
-        },
-    )
-    .await
-    .unwrap();
-    let reopened_http = HttpServer::start(
-        reopened,
-        0,
-        HttpConfiguration {
-            bind_mode: HttpBindMode::Loopback,
-            allowed_hosts: vec!["127.0.0.1".into()],
-            authentication: Some(HttpAuthentication::new(TOKEN).unwrap()),
-            remote_host: Some(
-                RemoteHostConfiguration::new(
-                    "server-snapshot".into(),
-                    "workspace-snapshot".into(),
-                    "generation-snapshot".into(),
-                    "project-snapshot".into(),
-                    "principal-snapshot".into(),
-                )
-                .unwrap(),
-            ),
-        },
-    )
-    .await
-    .unwrap();
-    let reopened_endpoint = format!("http://{}/mcp", reopened_http.address());
-    let reopened_discovery = final_sse_json(
-        post_rpc(
-            &client,
-            &reopened_endpoint,
-            Some(TOKEN),
-            discover_request(
-                7,
-                json!({"extensions":{"ai.workcell/remote-host":{"versions":["v1"]}}}),
-            ),
-        )
-        .await,
-    )
-    .await;
-    let reopened_descriptor =
-        &reopened_discovery["result"]["capabilities"]["extensions"]["ai.workcell/remote-host"];
-    let recovered = final_sse_json(post_rpc(&client, &reopened_endpoint, Some(TOKEN),
-        remote_request(45, "ai.workcell/snapshot-checkpoint", json!({
-            "version":"v1", "host":remote_host_binding(reopened_descriptor),
-            "cwdHandle":reopened_descriptor["cwd"]["handle"], "checkpointId":"checkpoint-http"
-        }))).await).await;
-    assert_eq!(recovered["result"]["snapshot"], *snapshot);
-    assert_eq!(recovered["result"]["reusedCheckpoint"], true);
-    let restored_status = final_sse_json(
-        post_rpc(
-            &client,
-            &reopened_endpoint,
-            Some(TOKEN),
-            remote_request(
-                8,
-                "ai.workcell/snapshot-status",
-                json!({
-                    "version":"v1",
-                    "host":remote_host_binding(reopened_descriptor),
-                    "cwdHandle":reopened_descriptor["cwd"]["handle"],
-                    "restoreId":restore_id
-                }),
-            ),
-        )
-        .await,
-    )
-    .await;
-    assert_eq!(restored_status["result"]["restore"]["state"], "completed");
-    assert_eq!(
-        restored_status["result"]["restore"]["restoreId"],
-        restore_id
-    );
-    assert_eq!(reopened_http.shutdown().await, ShutdownOutcome::Completed);
 }
 
 #[tokio::test]

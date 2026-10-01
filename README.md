@@ -222,7 +222,7 @@ private storage may require operator reconciliation.
 
 The operation preview includes canonical target and ancestor resource IDs/scopes, the existing target
 revision when replacing, and parent write effects for same-filesystem staging. Publication shares the
-file/workspace/snapshot mutation lock, checks ancestor identities and the destination again, and uses
+file/workspace/revert mutation lock, checks ancestor identities and the destination again, and uses
 atomic no-replace creation or atomic replacement. Replacement is **not** a filesystem compare-and-swap
 against external writers: a write between the final revision check and rename remains a race. An
 ancestor moved after descriptor validation may receive the publication at its moved location, but a
@@ -454,7 +454,7 @@ flag reports skipped vanished, unreadable, symlink, or special entries. Protecte
 excluded. Listing verifies the opened cwd descriptor against the handle's directory identity, then
 opens the requested scope relative to that descriptor. Directory enumeration and metadata inspection
 stay beneath the pinned scope without following symlinks or magic links. Ordinary mounts remain
-visible; snapshot and transfer mount restrictions do not apply to browsing. Non-enumerated ancestors
+visible; change-record and transfer mount restrictions do not apply to browsing. Non-enumerated ancestors
 need search permission, not read permission; unsupported kernels fail closed. A refused listing root
 is an error, not an empty inventory. Each page revalidates cwd and scope descriptors, so replacing a
 scope or rebinding a cwd still refuses the request.
@@ -541,7 +541,7 @@ bounded command/timeout options. It passes through the same startup-frozen shell
 the ordinary `shell` tool, then uses the common execute/status/progress/cancel lifecycle. It is absent
 when shell is disabled and has no input field that can approve or bypass policy. Cancellation before
 dispatch is a clean `cancelled` outcome with `sideEffectsPossible: false`. Once a direct child,
-file, workspace, or SCM mutation, snapshot restore or unrevert, or snapshot cleanup may have started, a
+file, workspace, or SCM mutation, change revert or unrevert, or change cleanup may have started, a
 failed or cancelled operation reports `sideEffectsPossible: true` and status is `indeterminate`
 unless a pre-effect rejection or successful atomic rollback proves otherwise. Killing a process
 cannot prove that its earlier effects were absent. Prepared-operation bytes remain charged to the
@@ -583,151 +583,150 @@ terminal output. Every diff pass disables external diff, text conversion, and co
 environment variables are removed; repository filters and diff-driver configuration are rejected;
 hooks and filesystem monitors are disabled for those calls.
 
-Workspace snapshots are disabled unless an authenticated remote host, writable files group, and an
-existing operator-owned private directory are configured together with `--snapshot-root` or
-`WORKCELL_MCP_SNAPSHOT_ROOT`. The directory must be absolute, owned by the process identity, inaccessible
-to group and other users on Unix, free of symlink components, and disjoint from the exposed workspace.
-It has no shared temporary-directory default. The snapshot object repository, checkpoint mappings,
-and restore journals remain beneath a directory keyed by the complete durable workspace identity under
-that private root. They never cross workspace generations and are never returned as byte payloads or
-exposed by an HTTP route.
+Workspace change records are disabled unless an authenticated remote host, writable files group, and
+an existing operator-owned private directory are configured together with `--snapshot-root` or
+`WORKCELL_MCP_SNAPSHOT_ROOT`. The directory must be absolute, owned by the process identity,
+inaccessible to group and other users on Unix, free of symlink components, and disjoint from the
+exposed workspace. It has no shared temporary-directory default. The object store, records, and revert
+journals remain beneath a directory keyed by the complete durable workspace identity under that
+private root. They never cross workspace generations and are never returned as byte payloads or
+exposed by an HTTP route. Several processes may open one store: every operation holds an exclusive
+`flock` on the store's `lock` file for as long as it runs and never longer, and answers `busy` after
+waiting 30 seconds for it. Discovery advertises the `changes` capability with its methods and limits.
 
-`ai.workcell/snapshot-prepare-capture` accepts `version`, the workspace binding, `checkpointId`, and
-`limits`, returning the common `PrepareResponse` with contract `workcell.snapshot.capture.v2`.
-Preparation validates bounded input and retains the cwd handle's directory identity without scanning
-or waiting for capture admission. Execution checks that identity against the opened scope descriptor
-after admission, before traversing it; replacing the directory refuses the capture, while changing its
-contents does not. Capture alone returns `running` promptly from `execute`; poll the existing operation
-`status` for its `SnapshotCaptureResponse` in `outcome.result.structuredContent`. The accepted capture
-is operation-owned: dropping or cancelling the execute request does not cancel it. Explicit operation
-`cancel` and a fixed 15-minute host budget covering queueing and work request cooperative cancellation.
-Locks and the ledger execution lease remain held until the blocking worker finishes publication or
-rollback, even past that budget if a filesystem call has not returned. A durable publication wins a
-cancellation race. Host shutdown closes capture admission, cancels accepted captures through the ledger,
-and drains their execution leases. HTTP shutdown reports completion only after workers have settled;
-forced or timed-out shutdown does not claim completion. Restore and cleanup executions still wait for
-their outcome.
+A record holds what one tool call changed. `ai.workcell/changes-begin-record` accepts `version`, the
+workspace binding, and a `record` naming its `scope`, `holder`, opaque `client` metadata, and `limits`.
+It captures the scope before the call and returns a `ticket`. `changes-finish-record` captures the
+scope again after the call and commits what changed as the next record of one store-wide sequence,
+returning its `seq` and path counts, or no record when the call changed nothing another record does
+not already hold. The open record survives lost replies and host restarts until it is finished or
+abandoned: `changes-abandon-record` drops one, `changes-open-records` lists a holder's open records,
+and `changes-abandon-open-records` drops them all. A holder is an opaque string of at most 128 bytes,
+and client metadata is JSON of at most 4 KiB, stored and returned exactly as given. Beginning and
+finishing each have a 15-minute budget, past which the call reports `timed_out`.
 
-`snapshot-checkpoint` accepts the binding and `checkpointId` and returns the original
-`SnapshotCaptureResponse` with `reusedCheckpoint: true`, without capturing anything. It checks the
-stored scope against the requested cwd. `not_found` means no published receipt was found, not that a
-running or lost operation has settled; `busy` means publication is locked and lookup should be retried.
-A lookup syncs the checkpoint directory before returning a recovered receipt. Startup syncs store
-directories even when a crash after rename left no temporary file. Failed publication rollback keeps
-referents until reference removal is durable, so lookup may finish committing an intact receipt after
-an earlier sync/unlink failure; a continuing sync failure returns an error, not completion.
-A published checkpoint survives lost execute replies and host restarts; reconnect with a fresh cwd
-handle. Clients gate the new flow on snapshot `capture`, `prepareCapture`, and `checkpoint` methods.
-The synchronous `snapshot-capture` method remains available to existing callers.
+A `paths` scope names up to 512 root-relative paths, each with everything beneath it. `.` and any
+path that is not plain, such as one with `..`, are refused. A named file or link is recorded even
+when a `.gitignore` ignores it. Beneath a named directory, ignore rules apply as Git applies them,
+so a named directory that is ignored, or that lies beneath a directory its own repository ignores,
+contributes nothing. A call can write through a named path to a path the record does not name:
+through a named symlink, through a symlinked or non-directory ancestor of a named path, or through a
+named file with more than one hard link. Any such named path widens the record to the whole tree as
+well, for both of its captures, so the write is recorded wherever it lands inside the root. A
+`workspace` scope records the tree beneath a directory, `.` for the root. The client lowers
+`maxFiles`, `maxFileBytes`, and `maxTotalBytes` per record below the advertised 50,000 files,
+100 MiB, and 512 MiB. A file over `maxFileBytes` is unrecorded. The file-count and total-byte limits
+refuse the record in either scope, because silently dropping files past a count would record an
+arbitrary subset. `maxTotalBytes` is also the store size retention keeps after the record commits.
 
-Capture records the directory its `cwdHandle` names as the snapshot's `scope`, under a client
-checkpoint ID. Reusing that ID in the same scope returns its first capture; a different scope is refused.
-Reuse also refuses a receipt exceeding the new request's file-count, total-byte, or per-file ceiling;
-it never replaces the original checkpoint. Lookup has no limits input, so clients check its summary
-against their current policy.
-One descriptor-relative walk that never follows a link or crosses a
-mount visits the scope, holding the filesystem mutation lock so Workcell's own writes cannot interleave.
-Regular files are stored by content. A symlink is stored as the link itself, its raw target as the blob,
-because following it would capture something outside the scope or capture the same file twice. The
-walk honours per-directory `.gitignore` files, and a directory that holds its own repository is a
-different worktree: it is reported and never entered. Mounts, sockets, FIFOs, devices, files over the
-per-file limit, entries that cannot be opened, and files whose content changed during three consecutive
-reads are left out and reported, never refusing the capture; a single entry a snapshot cannot hold is
-not a reason to lose revert for the rest of the tree. A name that is not UTF-8 is counted but cannot be
-named on the wire. The summary carries a count per reason and up to 32 sampled paths. Protected paths
-(Git metadata, `.ssh`, `.workcell`, `.env*`, `.npmrc`, `.pypirc`, `.netrc`, and private-key names) and
-root-relative exclusions, such as an in-workspace code-worker cache that may not exist yet, are left
-out silently.
-
-The client lowers `maxFiles`, `maxFileBytes`, and `maxTotalBytes` per capture below the advertised
-50,000 files, 100 MiB, and 512 MiB. The per-file limit skips oversized files and symlink targets;
-symlinks are measured by their raw target bytes, not the destination's contents. The file-count and
-total-byte limits refuse the capture, because silently dropping files past a count would restore an arbitrary
-subset. The walk also stops at 250,000 directory entries, 64 MiB of retained path bytes, or a depth of
-128, and a snapshot's metadata is at most 32 MiB. Every limit and quota refusal carries `data.limit`,
+Captures use one descriptor-relative walk that never follows a link or crosses a mount, holding the
+filesystem mutation lock so Workcell's own writes cannot interleave. Regular files are stored by
+content. A symlink is stored as the link itself, its raw target as the blob. The walk honours
+per-directory `.gitignore` files, and a directory that holds its own repository is a different
+worktree that is never entered. Nested repositories, mounts, and special files a walk meets are left
+out of the record. Protected paths (Git metadata, `.ssh`, `.workcell`, `.env*`, `.npmrc`, `.pypirc`,
+`.netrc`, and private-key names) and root-relative exclusions, such as an in-workspace code-worker
+cache that may not exist yet, are left out silently. The walk also stops at 250,000 directory entries,
+64 MiB of retained path bytes, or a depth of 128. Every limit and quota refusal carries `data.limit`,
 naming the limit, and `data.maximum` where it has one, so a client can say which setting to change.
 
-A snapshot is a git tree in a private bare repository that reads no system, global, or environment Git
-configuration. Git can inspect it, but `git gc`, `git prune`, and `git repack` must never run there: the
-store names no refs and reads only loose objects, so they would delete or pack away every snapshot.
-Each entry records its root-relative path, whether it is a file, an executable file, or
-a link, and its content as a blob; a metadata blob records the scope, exclusions, skip counts and
-samples, and every pruned path with its reason. The snapshot ID is `snap_` and the ID of the tree
-holding both, and revisions are prefixed Git object IDs, such as `gitoid:blob:sha1:` and 40 hex digits.
-Equal content therefore has one snapshot and one blob however often it is captured. Every object,
-checkpoint, and journal is charged against the store quota while holding the publication lock, and
-every object is verified against its ID when read. `snapshot-inspect` pages the tree. Snapshot data
-written by earlier releases is deleted when the store opens; those checkpoints are not restorable. A
-checkpoint or journal in a format this release does not know, such as a later release's, fails the
-open with `unhealthy_storage` rather than being deleted.
+A path a record saw but could not store is kept as `unrecorded` with its reason, and reverting it is
+a conflict. The reasons are `oversized`, `unstable` for a file whose content changed during three
+consecutive reads, `unreadable`, `blocked` for a named path the call itself put behind a link or a
+non-directory ancestor, `special` for a named special file or mount, and `interleaved`. A single path
+a record cannot hold is not a reason to lose revert for the rest of the call.
 
-A capture reads only the files that changed. A stat cache in Git's index format keeps each file's
-device, inode, owner, size, and change and modification times to the nanosecond, with the blob it
-held, for files that had not changed for five seconds before the capture that read them started, so
-an edit within one timestamp tick is never mistaken for no edit. A file matching every field is not
-read again; any other is read until the stat taken around the read agrees. New
-objects are written compressed under temporary names, and each is flushed before it takes its name, so
-a crash leaves only temporary files for cleanup, never a partial object a later capture would reuse.
-One pass flushes every new object and the directories naming it, and those naming objects the capture
-found already stored, before any checkpoint names them. A failed or cancelled capture removes the
-checkpoint it wrote, if any, and deletes what it staged; objects it had already named are left for
-cleanup to collect. The opt-in `capture_persistence_benchmark` test measures first and
-unchanged captures of 20,000 unique 128-byte files across 100 directories.
+Calls may overlap. When a record finishes, it is rebased onto the records other calls committed since
+it began, in sequence order. A change both observed belongs to the earlier record, a later change
+starts where those records left the path, and a path whose history cannot be told apart from theirs
+becomes `interleaved`. Overlapping records therefore chain rather than claim the same change twice.
 
-`snapshot-prepare-restore` names a target snapshot and a source snapshot the workspace is believed to
-match. The restore touches only paths whose entries differ between the two and that both captures
-covered, beneath the deeper of their scopes: a path either side pruned or excluded is left alone. A
-path a capture's `.gitignore` rules left out is not recorded, only absent, so as in Git a restore
-removes a path the target ignored and the source captured. As in Git, a file's content and whether it
-is executable count; its other permission bits do not. Each such path is observed now. One that
-already matches the target counts as unchanged, one that matches the source is planned as a create,
-replace, or delete, and anything else is a conflict. A missing ancestor directory is planned for
-creation; one that is not a plain directory is a conflict. Conflicts refuse execution, since
-restoring over an edit nobody captured would destroy it. The preview carries complete counts and
-bounded samples, conflicts first. Authorization discloses write and delete intents on the scope for
-the effects those counts include, the restore's own journal, and the settled journals it may reclaim
-for room. Execution journals the restore, then publishes each path only while its live entry still
-matches what preparation observed, by device, inode, size, mode, and timestamps.
-A restored file keeps the permission bits of the file it replaces, gaining execute permission for its
-owner and wherever it has read permission, or losing it everywhere; a file the restore creates gets
-Git's default mode under the process umask. Each publication is atomic for one entry, but a portable
-transaction across files does not exist: discovery reports `atomicAcrossFiles: false`. The first
-refusal stops the restore; if nothing was published yet the journal is removed and the refusal
-returned, otherwise the restore is `partial`. An I/O outcome that cannot be known makes it
-`indeterminate` with `reconciliation_required`. The journal records state transitions and counts, not
-paths, and a restore that a crash left publishing is recomputed from its two captures and the live
-workspace at startup. Nothing is replayed.
+Captures are git trees in a private bare repository that reads no system, global, or environment Git
+configuration. Git can inspect it, but `git gc`, `git prune`, and `git repack` must never run there:
+the store names no refs and reads only loose objects, so they would delete or pack away every record.
+Equal content has one blob however often it is captured, and every object is verified against its ID
+when read. A whole-tree capture reads only the files that changed. A stat cache in Git's index format
+keeps each file's device, inode, owner, size, and change and modification times to the nanosecond,
+with the blob it held, for files that had not changed for five seconds before the capture that read
+them started, so an edit within one timestamp tick is never mistaken for no edit. A file matching
+every field is not read again; any other is read until the stat taken around the read agrees. New
+objects are written compressed under temporary names, and each is flushed before it takes its name,
+so a crash leaves only temporary files for cleanup, never a partial object a later capture would
+reuse. A failed or cancelled capture deletes what it staged; objects it had already named are left for
+collection. The opt-in `capture_persistence_benchmark` test measures first and unchanged captures of
+20,000 unique 128-byte files across 100 directories.
 
-`snapshot-status` reads the durable restore journal. A completed, partial, or indeterminate restore
-awaits a decision: `snapshot-acknowledge` accepts it, and `snapshot-prepare-unrevert` restores the same
-two captures the other way round through the same preview, ledger execution, and per-path check. An
-unrevert that completes marks the original restore reverted and itself awaits acknowledgement. While one
-restore awaits a decision, every other restore is refused. Journal count and byte quotas are checked
-before execution, and pressure reclaims only settled journals.
+`changes-records` pages one holder's records in sequence order, each with its client metadata, path
+counts, and whether a pending revert names it. `evictedThrough` carries the client metadata of the
+newest of the holder's records retention evicted. `changes-holders` pages every holder with its
+counts. `changes-hold` makes one holder hold every record another holds, as a fork does, and
+`changes-release` drops a holder's hold on all or selected records. A record goes with its last
+holder, unless an open record may still rebase onto it: then it stays, held by nobody, until cleanup
+or retention removes it. Releasing everything settles the holder's pending reverts first; releasing a
+record a pending revert names is refused with `conflict`.
 
-`snapshot-prepare-cleanup` deletes checkpoints, never snapshots directly, because one
-content-addressed snapshot may back the checkpoints of several sessions, and snapshots share every
-object they can. It names up to 128 checkpoint IDs; the preview separates the ones that exist from the
-missing ones and counts reclaimable checkpoint, journal, and object bytes. Preparation retains one
-exact plan: the checkpoints, the settled journals, the snapshots nothing else names, and a digest of
-exactly the objects that no remaining checkpoint, awaiting restore, pending preparation, or stat cache
-entry reaches. Authorization is one server-state delete intent bound to that plan's digest. Execution
-refuses unless the store would still plan exactly that, removes references before referents, then
-deletes those objects, which `deletedObjects` counts. Cancellation leaves them to a later cleanup.
+`changes-prepare-revert` names up to 10,000 records the holder holds. Their changes are composed per
+path in sequence order and must chain: a path they do not chain on is an `interleaved` conflict, and a
+path any of them could not store an `unrecorded` one. Each remaining path is observed now. One that
+already holds what the revert would write counts as unchanged, one that still holds what the records
+left there is planned as a create, replace, or delete, and anything else was changed since: a
+`changedSince` conflict. A missing ancestor directory is planned for creation; one that is not a plain
+directory is a conflict. Any conflict refuses the whole revert before anything is written, since
+reverting over an edit no record holds would destroy it. The preview carries complete counts and up to
+500 sampled paths, naming each conflict's kind. Authorization discloses write and delete intents on
+the deepest path holding every path the revert touches, for the effects its counts include, and a
+write intent on `workspace-changes:holder:<holder>`, the holder's stack of pending reverts. Execution
+under contract `workspace.changes.revert.v1` journals the revert, then publishes each path only while
+its live entry still matches what preparation observed, by device, inode, size, mode, and timestamps.
+A path that shares its file with one the revert already published, a hard link, is read again instead
+and published only if it still holds what the records left there. A restored file keeps the
+permission bits of the file it replaces, gaining execute permission for its owner and wherever it has
+read permission, or losing it everywhere; a file the revert creates gets Git's default mode under the
+process umask. Each publication is atomic for one entry, but a portable transaction across files does
+not exist. The first refusal stops the revert; if nothing was published yet the journal is removed
+and the refusal returned, otherwise the revert is `partial`. An I/O outcome that cannot be known
+makes it `indeterminate` with `reconciliationRequired`. Either way, `stoppedAt` in its status names
+the path whose publication stopped it. The journal records state transitions and counts, never
+content: records hold both sides of every change, so a revert a crash left publishing is re-planned
+from its records and the live workspace when the store next opens. Nothing is replayed.
 
-Preparations, terminal outcomes, shell progress, and capture phase/counter progress are held in a
-bounded in-process ledger. Capture progress is emitted at phase transitions and at most once per second
-within a phase, with elapsed time, entry/file counts, and bytes, never paths or contents.
+While a revert is pending, its records show as `reverted` to every holder, and no other revert or
+release may name them. A holder's reverts stack. `changes-status` lists them, oldest first.
+`changes-prepare-unrevert` re-applies the whole stack under `workspace.changes.unrevert.v1`, through
+the same preview, conflict rules, ledger execution, and per-path check, and an unrevert that completes
+clears the stack. `changes-acknowledge` accepts the stack and deletes its records for every holder,
+since what they changed is gone from the workspace.
+
+Retention runs after every commit. When the store holds more than the record's `maxTotalBytes` or
+10,000 records, it first collects unreferenced objects and then evicts the oldest records until it
+fits, noting each holder's newest evicted record before deleting. It never evicts a record a pending
+revert names or one an open record may still rebase onto. A capture that would carry the store past
+the advertised 2 GiB, and a record beyond 10,000 that nothing may make room for, are refused with
+`quota_exceeded`. `changes-prepare-cleanup` accepts `retentionBytes`. Its preview counts the open
+records older than 12 hours, which no call outlives and which cleanup abandons, the records it evicts
+to reach that size, and the bytes it reclaims. Authorization is one server-state delete intent bound
+to the plan's digest. Execution under `workspace.changes.cleanup.v1` does at most what the preview
+named, then deletes every object nothing names, which `deletedObjects` counts. Collection keeps every
+object an open record, a record, a pending revert, or the stat cache names; a store whose references
+cannot all be read collects nothing.
+
+Store data written by earlier releases, such as checkpoints and restore journals, is deleted when the
+store opens. A file in a format this release does not know, such as a later release's, fails the open
+with `unhealthy_storage` rather than being deleted.
+
+Preparations, terminal outcomes, and shell progress are held in a bounded in-process ledger.
 Status therefore reports an instance mismatch as `indeterminate`, and a released, expired, or evicted
 record as `forgotten` while its bounded tombstone remains. Restarting the process intentionally loses
-the generic ledger; published checkpoints retain capture receipts, and snapshot restore journals retain only reconciliation status and publication
-progress. Every retained outcome carries `sideEffectsPossible`; an uncertain post-start cancellation
-is retained as `indeterminate`, not as a clean cancellation. There are no user, tenant, ticket, signing,
-lease-broker, controller, or administrative APIs.
+the generic ledger; change records and open records persist in their store, and revert journals retain
+only reconciliation status and publication progress. Every retained outcome carries
+`sideEffectsPossible`; an uncertain post-start cancellation is retained as `indeterminate`, not as a
+clean cancellation. There are no user, tenant, ticket, signing, lease-broker, controller, or
+administrative APIs.
 Discovery sets `controlPlane: true` only when workspace reads, watch, project assets, writable prepared
-mutation, direct exec, SCM, operations, and healthy configured snapshots are all present. Otherwise it
-stays false and `controlPlaneMissing` names the absent subcapabilities. The optional `/files` byte route
-is unchanged: every request still presents the process bearer and is re-resolved and reauthorized.
+mutation, direct exec, SCM, operations, and healthy configured change records are all present.
+Otherwise it stays false and `controlPlaneMissing` names the absent subcapabilities, such as `changes`.
+The optional `/files` byte route is unchanged: every request still presents the process bearer and is
+re-resolved and reauthorized.
 
 ## Web Configuration
 

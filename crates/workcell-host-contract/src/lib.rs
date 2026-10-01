@@ -32,22 +32,26 @@ pub const SCM_LOG_METHOD: &str = "ai.workcell/scm-log";
 pub const SCM_DIFF_METHOD: &str = "ai.workcell/scm-diff";
 pub const SCM_READ_SIDE_METHOD: &str = "ai.workcell/scm-read-side";
 pub const SCM_PREPARE_MUTATION_METHOD: &str = "ai.workcell/scm-prepare-mutation";
-pub const SNAPSHOT_CAPTURE_METHOD: &str = "ai.workcell/snapshot-capture";
-pub const SNAPSHOT_PREPARE_CAPTURE_METHOD: &str = "ai.workcell/snapshot-prepare-capture";
-pub const SNAPSHOT_CHECKPOINT_METHOD: &str = "ai.workcell/snapshot-checkpoint";
-pub const SNAPSHOT_INSPECT_METHOD: &str = "ai.workcell/snapshot-inspect";
-pub const SNAPSHOT_STATUS_METHOD: &str = "ai.workcell/snapshot-status";
-pub const SNAPSHOT_PREPARE_RESTORE_METHOD: &str = "ai.workcell/snapshot-prepare-restore";
-pub const SNAPSHOT_PREPARE_UNREVERT_METHOD: &str = "ai.workcell/snapshot-prepare-unrevert";
-pub const SNAPSHOT_ACKNOWLEDGE_METHOD: &str = "ai.workcell/snapshot-acknowledge";
-pub const SNAPSHOT_PREPARE_CLEANUP_METHOD: &str = "ai.workcell/snapshot-prepare-cleanup";
+pub const CHANGES_BEGIN_RECORD_METHOD: &str = "ai.workcell/changes-begin-record";
+pub const CHANGES_FINISH_RECORD_METHOD: &str = "ai.workcell/changes-finish-record";
+pub const CHANGES_ABANDON_RECORD_METHOD: &str = "ai.workcell/changes-abandon-record";
+pub const CHANGES_OPEN_RECORDS_METHOD: &str = "ai.workcell/changes-open-records";
+pub const CHANGES_ABANDON_OPEN_RECORDS_METHOD: &str = "ai.workcell/changes-abandon-open-records";
+pub const CHANGES_RECORDS_METHOD: &str = "ai.workcell/changes-records";
+pub const CHANGES_HOLDERS_METHOD: &str = "ai.workcell/changes-holders";
+pub const CHANGES_HOLD_METHOD: &str = "ai.workcell/changes-hold";
+pub const CHANGES_RELEASE_METHOD: &str = "ai.workcell/changes-release";
+pub const CHANGES_PREPARE_REVERT_METHOD: &str = "ai.workcell/changes-prepare-revert";
+pub const CHANGES_PREPARE_UNREVERT_METHOD: &str = "ai.workcell/changes-prepare-unrevert";
+pub const CHANGES_ACKNOWLEDGE_METHOD: &str = "ai.workcell/changes-acknowledge";
+pub const CHANGES_STATUS_METHOD: &str = "ai.workcell/changes-status";
+pub const CHANGES_PREPARE_CLEANUP_METHOD: &str = "ai.workcell/changes-prepare-cleanup";
 pub const WORKSPACE_MUTATION_CONTRACT_ID: &str = "workspace.mutation.v1";
 pub const DIRECT_EXEC_CONTRACT_ID: &str = "workspace.exec.v1";
 pub const SCM_MUTATION_CONTRACT_ID: &str = "workspace.scm.mutation.v1";
-pub const SNAPSHOT_RESTORE_CONTRACT_ID: &str = "workspace.snapshot.restore.v3";
-pub const SNAPSHOT_CAPTURE_CONTRACT_ID: &str = "workcell.snapshot.capture.v2";
-pub const SNAPSHOT_UNREVERT_CONTRACT_ID: &str = "workspace.snapshot.unrevert.v3";
-pub const SNAPSHOT_CLEANUP_CONTRACT_ID: &str = "workspace.snapshot.cleanup.v3";
+pub const CHANGES_REVERT_CONTRACT_ID: &str = "workspace.changes.revert.v1";
+pub const CHANGES_UNREVERT_CONTRACT_ID: &str = "workspace.changes.unrevert.v1";
+pub const CHANGES_CLEANUP_CONTRACT_ID: &str = "workspace.changes.cleanup.v1";
 pub const MAX_ARGUMENT_BYTES: usize = 1_048_576;
 pub const MAX_ID_BYTES: usize = 128;
 pub const MAX_DISPLAY_TEXT_BYTES: usize = 65_536;
@@ -106,13 +110,16 @@ pub const MAX_SNAPSHOT_FILE_BYTES: u64 = 100 * 1_024 * 1_024;
 pub const MAX_SNAPSHOT_TOTAL_BYTES: u64 = 512 * 1_024 * 1_024;
 pub const MAX_SNAPSHOT_CAPTURE_ENTRIES: usize = 250_000;
 pub const MAX_SNAPSHOT_CAPTURE_PATH_BYTES: u64 = 64 * 1_024 * 1_024;
-pub const MAX_SNAPSHOT_COUNT: usize = 256;
 pub const MAX_SNAPSHOT_STORAGE_BYTES: u64 = 2 * 1_024 * 1_024 * 1_024;
-pub const MAX_SNAPSHOT_CLEANUP: usize = 128;
-pub const MAX_SNAPSHOT_JOURNALS: usize = 256;
-pub const MAX_SNAPSHOT_PREVIEW_CHANGES: usize = MAX_PAGE_SIZE as usize;
-pub const MAX_SNAPSHOT_SKIPPED_SAMPLES: usize = 32;
 pub const MAX_SNAPSHOT_DEPTH: usize = 128;
+pub const MAX_RECORD_SCOPE_PATHS: usize = 512;
+pub const MAX_RECORD_CLIENT_BYTES: usize = 4_096;
+pub const MAX_RECORD_HOLDER_BYTES: usize = MAX_ID_BYTES;
+pub const MAX_RECORD_PAGE_SIZE: u32 = MAX_PAGE_SIZE;
+pub const MAX_OPEN_RECORDS: usize = 1_024;
+pub const MAX_REVERT_RECORDS: usize = 10_000;
+pub const MAX_REVERT_JOURNALS: usize = 256;
+pub const MAX_REVERT_PREVIEW_PATHS: usize = MAX_PAGE_SIZE as usize;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -213,6 +220,7 @@ bounded_opaque_string!(Revision, MAX_ID_BYTES);
 bounded_opaque_string!(ToolName, MAX_ID_BYTES);
 bounded_opaque_string!(ResourceId, MAX_ID_BYTES);
 bounded_opaque_string!(Cursor, MAX_CURSOR_BYTES);
+bounded_opaque_string!(RecordHolder, MAX_RECORD_HOLDER_BYTES);
 bounded_text!(DisplayText, MAX_DISPLAY_TEXT_BYTES, false, false);
 bounded_text!(ErrorText, MAX_ERROR_TEXT_BYTES, false, false);
 bounded_text!(ProgressChunkText, MAX_PROGRESS_CHUNK_BYTES, true, true);
@@ -434,51 +442,58 @@ pub struct RemoteHostCapabilities {
     pub workspace_mutation: Option<WorkspaceMutationCapability>,
     pub direct_exec: Option<DirectExecCapability>,
     pub scm: Option<ScmCapability>,
-    pub snapshots: Option<WorkspaceSnapshotCapability>,
+    pub changes: Option<WorkspaceChangesCapability>,
     pub control_plane: bool,
     #[serde(deserialize_with = "deserialize_control_plane_missing")]
     pub control_plane_missing: Vec<Identifier>,
 }
 
+/// Per-call change records: what each tool call changed, and reverts that undo exactly that.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct WorkspaceSnapshotCapability {
+pub struct WorkspaceChangesCapability {
     pub version: ContractVersion,
-    pub methods: WorkspaceSnapshotMethods,
-    pub limits: WorkspaceSnapshotLimits,
-    pub atomic_across_files: bool,
-    pub durable_per_file_journal: bool,
+    pub methods: WorkspaceChangesMethods,
+    pub limits: WorkspaceChangesLimits,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct WorkspaceSnapshotMethods {
-    pub capture: bool,
-    #[serde(default)]
-    pub prepare_capture: bool,
-    #[serde(default)]
-    pub checkpoint: bool,
-    pub inspect: bool,
-    pub status: bool,
-    pub prepare_restore: bool,
+pub struct WorkspaceChangesMethods {
+    pub begin_record: bool,
+    pub finish_record: bool,
+    pub abandon_record: bool,
+    pub open_records: bool,
+    pub abandon_open_records: bool,
+    pub records: bool,
+    pub holders: bool,
+    pub hold: bool,
+    pub release: bool,
+    pub prepare_revert: bool,
     pub prepare_unrevert: bool,
     pub acknowledge: bool,
+    pub status: bool,
     pub prepare_cleanup: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct WorkspaceSnapshotLimits {
+pub struct WorkspaceChangesLimits {
+    /// Files one capture of a record may hold, and [`Self::max_total_bytes`] their bytes.
     pub max_files: u32,
+    /// A larger file is recorded as unrecorded rather than stored.
     pub max_file_bytes: u64,
     pub max_total_bytes: u64,
     pub max_capture_entries: u32,
     pub max_capture_path_bytes: u64,
-    pub max_snapshots: u32,
-    /// Compressed objects on disk, plus journals and the stat cache.
+    /// Compressed objects on disk, plus records, journals and the stat cache.
     pub max_storage_bytes: u64,
-    pub max_concurrent_captures: u32,
-    pub max_cleanup_checkpoints: u32,
+    pub max_scope_paths: u32,
+    pub max_client_bytes: u32,
+    pub max_holder_bytes: u32,
+    pub max_page_size: u32,
+    pub max_open_records: u32,
+    pub max_revert_records: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -929,45 +944,7 @@ pub struct ScmMutationResponse {
     pub revisions: ScmRepositoryRevisions,
 }
 
-/// Per-capture ceilings a client may lower below the host's advertised limits.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct SnapshotCaptureLimits {
-    pub max_files: u32,
-    pub max_file_bytes: u64,
-    pub max_total_bytes: u64,
-}
-
-/// Captures the directory named by `binding.cwd_handle`, the session's working directory.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct SnapshotCaptureRequest {
-    pub version: ContractVersion,
-    #[serde(flatten)]
-    pub binding: WorkspaceRequestBinding,
-    pub checkpoint_id: Identifier,
-    pub limits: SnapshotCaptureLimits,
-}
-
-pub type SnapshotPrepareCaptureRequest = SnapshotCaptureRequest;
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct SnapshotCheckpointRequest {
-    pub version: ContractVersion,
-    #[serde(flatten)]
-    pub binding: WorkspaceRequestBinding,
-    pub checkpoint_id: Identifier,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum SnapshotState {
-    Complete,
-    Corrupt,
-}
-
-/// The limit or quota a snapshot operation reached, carried in `limit_exceeded` and
+/// The limit or quota a change-record operation reached, carried in `limit_exceeded` and
 /// `quota_exceeded` error data beside its `maximum` where the limit has one.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -978,13 +955,13 @@ pub enum SnapshotLimit {
     CapturePathBytes,
     Depth,
     IgnoreRules,
-    /// The recorded scope, pruned paths and exclusions of one snapshot.
+    /// The recorded scope, pruned paths and exclusions of one whole-tree capture.
     MetadataBytes,
     PreparedBytes,
-    Snapshots,
-    Checkpoints,
     StorageBytes,
     Journals,
+    OpenRecords,
+    Records,
 }
 
 impl SnapshotLimit {
@@ -999,10 +976,10 @@ impl SnapshotLimit {
             Self::IgnoreRules => "ignoreRules",
             Self::MetadataBytes => "metadataBytes",
             Self::PreparedBytes => "preparedBytes",
-            Self::Snapshots => "snapshots",
-            Self::Checkpoints => "checkpoints",
             Self::StorageBytes => "storageBytes",
             Self::Journals => "journals",
+            Self::OpenRecords => "openRecords",
+            Self::Records => "records",
         }
     }
 }
@@ -1013,7 +990,7 @@ impl fmt::Display for SnapshotLimit {
     }
 }
 
-/// Why a capture left an entry out. A restore never touches an entry left out of either side.
+/// Why a whole-tree walk left an entry out. No record ever holds such an entry.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SnapshotSkipReason {
@@ -1026,265 +1003,480 @@ pub enum SnapshotSkipReason {
     Unrepresentable,
 }
 
+/// Ceilings for one record, which a client may lower below the host's advertised limits.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct SnapshotSkippedEntry {
-    /// Lossy for an unrepresentable name, so it is for display only.
-    pub path: DisplayText,
-    pub reason: SnapshotSkipReason,
+pub struct RecordLimits {
+    /// Files one capture of the record may hold, in either scope; more refuses the record.
+    pub max_files: u32,
+    /// A larger file is unrecorded rather than stored, in either scope.
+    pub max_file_bytes: u64,
+    /// Bytes one capture of the record may hold, in either scope, and what retention trims the
+    /// store to after a commit.
+    pub max_total_bytes: u64,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct SnapshotSkipped {
-    pub nested_repositories: u32,
-    pub mounts: u32,
-    pub special_files: u32,
-    pub oversized_files: u32,
-    pub unreadable_entries: u32,
-    pub unstable_files: u32,
-    pub unrepresentable_names: u32,
-    #[serde(deserialize_with = "deserialize_snapshot_skipped_samples")]
-    pub samples: Vec<SnapshotSkippedEntry>,
+/// What one record compares before and after its call.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "kind")]
+pub enum RecordScope {
+    /// Root-relative paths, each with everything beneath it that Git's ignore rules leave in. A
+    /// named file or link is recorded even when ignored; a named directory that is ignored, or
+    /// beneath a directory its own repository ignores, holds nothing. A named path a call can
+    /// write through to another path, such as a link, a path behind a link or a non-directory, or
+    /// a file with another hard link, widens the record to the whole tree for both captures.
+    Paths {
+        #[serde(deserialize_with = "deserialize_record_paths")]
+        paths: Vec<WorkspacePath>,
+    },
+    /// The tree beneath a root-relative directory, `.` for the root, as a capture sees it.
+    Workspace { directory: WorkspacePath },
+}
+
+/// Opaque client JSON, stored and returned as given and never interpreted.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct RecordClientMetadata(Value);
+
+impl RecordClientMetadata {
+    pub fn new(value: Value) -> Result<Self, ValidationError> {
+        validate_value_bytes("RecordClientMetadata", &value, MAX_RECORD_CLIENT_BYTES)?;
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub const fn as_value(&self) -> &Value {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for RecordClientMetadata {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::new(Value::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct SnapshotSummary {
-    pub snapshot_id: Identifier,
-    pub checkpoint_id: Option<Identifier>,
-    pub state: SnapshotState,
-    pub manifest_revision: Revision,
-    pub scope: WorkspacePath,
-    pub file_count: u32,
-    pub total_bytes: u64,
-    pub skipped: SnapshotSkipped,
-    pub created_at_unix_ms: u64,
+pub struct RecordRequest {
+    pub scope: RecordScope,
+    pub holder: RecordHolder,
+    pub client: RecordClientMetadata,
+    pub limits: RecordLimits,
+}
+
+/// Why a record holds a path it could not store. Reverting such a path is a conflict.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UnrecordedReason {
+    /// Larger than the record's file limit.
+    Oversized,
+    /// Every read overlapped a change to it.
+    Unstable,
+    Unreadable,
+    /// Behind an ancestor that is a link or not a plain directory.
+    Blocked,
+    /// A special file or mount point.
+    Special,
+    /// Another record changed it while this call ran, in a way the two cannot be told apart.
+    Interleaved,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct SnapshotCaptureResponse {
-    pub version: ContractVersion,
-    pub snapshot: SnapshotSummary,
-    pub reused_checkpoint: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct SnapshotInspectRequest {
-    pub version: ContractVersion,
-    #[serde(flatten)]
-    pub binding: WorkspaceRequestBinding,
-    pub snapshot_id: Identifier,
-    pub page_size: u32,
-    pub cursor: Option<Cursor>,
+pub struct RecordSummary {
+    pub seq: u64,
+    pub paths: u32,
+    pub unrecorded: u32,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub enum SnapshotEntryKind {
-    File,
-    /// Captured as the link itself: `digest` covers the raw target and it is never followed.
-    Symlink,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct SnapshotFile {
-    pub path: WorkspacePath,
-    pub resource_id: ResourceId,
-    pub kind: SnapshotEntryKind,
-    /// The prefixed git object id of the content, or of the raw target for a link.
-    pub digest: Revision,
-    /// Git's mode semantics: `0o644`, `0o755` when executable, or `0o777` for a link. Only the
-    /// executable bit is recorded.
-    pub mode: u32,
-    pub size_bytes: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct SnapshotInspectResponse {
-    pub version: ContractVersion,
-    pub snapshot: SnapshotSummary,
-    #[serde(deserialize_with = "deserialize_snapshot_files")]
-    pub files: Vec<SnapshotFile>,
-    #[serde(deserialize_with = "deserialize_snapshot_paths")]
-    pub exclusions: Vec<WorkspacePath>,
-    pub next_cursor: Option<Cursor>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct SnapshotPrepareRestoreRequest {
-    pub version: ContractVersion,
-    #[serde(flatten)]
-    pub binding: WorkspaceRequestBinding,
-    pub snapshot_id: Identifier,
-    /// The capture the workspace is believed to match. Only paths that differ between it and the
-    /// target are restored, and each must still match this side when it is replaced.
-    pub source_snapshot_id: Identifier,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct SnapshotPrepareUnrevertRequest {
-    pub version: ContractVersion,
-    #[serde(flatten)]
-    pub binding: WorkspaceRequestBinding,
-    pub restore_id: Identifier,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum SnapshotChangeKind {
-    Create,
-    Replace,
-    Delete,
-    Conflict,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct SnapshotChange {
-    pub path: WorkspacePath,
-    pub resource_id: ResourceId,
-    pub kind: SnapshotChangeKind,
-    pub current_revision: Option<Revision>,
-    pub target_revision: Option<Revision>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct SnapshotChangeCounts {
-    pub create: u32,
-    pub replace: u32,
-    pub delete: u32,
-    pub conflict: u32,
-    /// Paths that differ between the two captures but already match the target.
-    pub unchanged: u32,
-    pub created_directories: u32,
-}
-
-/// `changes` and `created_directories` are bounded samples, conflicts first; `counts` is complete.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct SnapshotRestorePreview {
-    pub restore_id: Identifier,
-    pub target_snapshot_id: Identifier,
-    pub source_snapshot_id: Identifier,
-    pub counts: SnapshotChangeCounts,
-    #[serde(deserialize_with = "deserialize_snapshot_changes")]
-    pub changes: Vec<SnapshotChange>,
-    #[serde(deserialize_with = "deserialize_snapshot_restore_directories")]
-    pub created_directories: Vec<WorkspacePath>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct SnapshotPrepareRestoreResponse {
-    pub version: ContractVersion,
-    pub operation: PrepareResponse,
-    pub preview: SnapshotRestorePreview,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum SnapshotRestoreState {
-    Publishing,
-    Completed,
-    Partial,
-    Indeterminate,
-    Acknowledged,
+pub enum RecordState {
+    Applied,
+    /// Named by a revert that awaits acknowledgement, whichever holder made it.
     Reverted,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct SnapshotRestoreStatus {
-    pub restore_id: Identifier,
-    pub state: SnapshotRestoreState,
-    pub target_snapshot_id: Identifier,
-    pub source_snapshot_id: Identifier,
+pub struct RecordListing {
+    pub seq: u64,
+    pub client: RecordClientMetadata,
+    pub state: RecordState,
+    pub paths: u32,
+    pub unrecorded: u32,
+}
+
+/// One holder's records in seq order.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct RecordPage {
+    #[serde(deserialize_with = "deserialize_record_listings")]
+    pub records: Vec<RecordListing>,
+    /// The `afterSeq` of the next page, absent on the last one.
+    pub next_after_seq: Option<u64>,
+    /// The client metadata of the newest of this holder's records retention evicted.
+    pub evicted_through: Option<RecordClientMetadata>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct OpenRecord {
+    pub ticket: Identifier,
+    pub client: RecordClientMetadata,
+    pub opened_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct HolderSummary {
+    pub holder: RecordHolder,
+    pub records: u32,
+    pub open_records: u32,
+    pub pending_reverts: u32,
+}
+
+/// What one store holds, read without workspace access.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeInventory {
+    /// Everything the store occupies on disk: objects, records, journals and the stat cache.
+    pub bytes: u64,
+    pub objects: u64,
+    pub records: u32,
+    pub open_records: u32,
+    pub pending_reverts: u32,
+    pub holders: Vec<HolderSummary>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ReleaseSelection {
+    All,
+    Seqs(#[serde(deserialize_with = "deserialize_revert_seqs")] Vec<u64>),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ReleaseSummary {
+    /// Records the holder held and no longer does.
+    pub released: u32,
+    /// Of those, the records no holder holds any more, which are deleted.
+    pub deleted: u32,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RevertDirection {
+    Revert,
+    Unrevert,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RevertChangeKind {
+    Create,
+    Replace,
+    Delete,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct RevertPath {
+    pub path: WorkspacePath,
+    pub kind: RevertChangeKind,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RevertConflictKind {
+    /// The live entry matches neither side: something changed it since.
+    ChangedSince,
+    /// The selected records do not chain on this path: something changed it between them.
+    Interleaved,
+    /// A selected record could not store this path.
+    Unrecorded,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct RevertConflict {
+    pub path: WorkspacePath,
+    pub kind: RevertConflictKind,
+    /// Why the path went unrecorded, for an unrecorded conflict.
+    pub reason: Option<UnrecordedReason>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct RevertCounts {
+    pub create: u32,
+    pub replace: u32,
+    pub delete: u32,
+    /// Paths the records changed that already hold what the operation would write.
+    pub unchanged: u32,
+    pub conflicts: u32,
+    pub created_directories: u32,
+}
+
+/// Any conflict refuses the whole operation, which then writes nothing. `planned`, `conflicts`
+/// and `created_directories` are bounded samples, and `counts` is complete.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct RevertPreview {
+    pub revert_id: Identifier,
+    pub holder: RecordHolder,
+    pub direction: RevertDirection,
+    pub records: u32,
+    pub counts: RevertCounts,
+    #[serde(deserialize_with = "deserialize_revert_paths")]
+    pub planned: Vec<RevertPath>,
+    #[serde(deserialize_with = "deserialize_revert_conflicts")]
+    pub conflicts: Vec<RevertConflict>,
+    #[serde(deserialize_with = "deserialize_revert_directories")]
+    pub created_directories: Vec<WorkspacePath>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RevertState {
+    Publishing,
+    Completed,
+    /// Refused midway, after publishing part of its plan.
+    Partial,
+    /// Interrupted where an entry may or may not have changed.
+    Indeterminate,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct PendingRevert {
+    pub revert_id: Identifier,
+    pub direction: RevertDirection,
+    pub state: RevertState,
+    pub records: u32,
     pub applied_files: u32,
     pub total_files: u32,
-    pub acknowledgement_required: bool,
     pub reconciliation_required: bool,
-    pub unrevert_of: Option<Identifier>,
+    /// The path whose publication stopped a revert short: left as it was when `partial`, possibly
+    /// changed when `indeterminate`. Absent when cancellation or a crash stopped it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped_at: Option<WorkspacePath>,
+}
+
+/// A holder's reverts awaiting acknowledgement, oldest first, with any unrevert that stopped
+/// short. Acknowledging settles them all; an unrevert that completes undoes them all.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct RevertStatus {
+    pub holder: RecordHolder,
+    #[serde(deserialize_with = "deserialize_pending_reverts")]
+    pub pending: Vec<PendingRevert>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct SnapshotStatusRequest {
-    pub version: ContractVersion,
-    #[serde(flatten)]
-    pub binding: WorkspaceRequestBinding,
-    pub restore_id: Identifier,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct SnapshotStatusResponse {
-    pub version: ContractVersion,
-    pub restore: SnapshotRestoreStatus,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct SnapshotAcknowledgeRequest {
-    pub version: ContractVersion,
-    #[serde(flatten)]
-    pub binding: WorkspaceRequestBinding,
-    pub restore_id: Identifier,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct SnapshotAcknowledgeResponse {
-    pub version: ContractVersion,
-    pub restore: SnapshotRestoreStatus,
-}
-
-/// Deletes checkpoints, never snapshots: a content-addressed snapshot may back checkpoints of other
-/// sessions. Snapshots and blobs nothing references any more are collected afterwards.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct SnapshotPrepareCleanupRequest {
-    pub version: ContractVersion,
-    #[serde(flatten)]
-    pub binding: WorkspaceRequestBinding,
-    #[serde(deserialize_with = "deserialize_checkpoint_ids")]
-    pub checkpoint_ids: Vec<Identifier>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct SnapshotCleanupPreview {
-    #[serde(deserialize_with = "deserialize_checkpoint_ids")]
-    pub checkpoint_ids: Vec<Identifier>,
-    #[serde(deserialize_with = "deserialize_checkpoint_ids")]
-    pub missing_checkpoint_ids: Vec<Identifier>,
+pub struct CleanupPreview {
+    /// Open records older than any call may run, which are abandoned.
+    pub stale_open_records: u32,
+    /// The oldest records retention evicts to bring the store within its target.
+    pub evicted_records: u32,
     pub reclaimable_bytes: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct SnapshotPrepareCleanupResponse {
-    pub version: ContractVersion,
-    pub operation: PrepareResponse,
-    pub preview: SnapshotCleanupPreview,
+pub struct CleanupSummary {
+    pub abandoned_open_records: u32,
+    pub evicted_records: u32,
+    pub deleted_objects: u32,
+    pub reclaimed_bytes: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct SnapshotCleanupResponse {
+pub struct ChangesBeginRecordRequest {
     pub version: ContractVersion,
-    #[serde(deserialize_with = "deserialize_checkpoint_ids")]
-    pub deleted_checkpoint_ids: Vec<Identifier>,
-    pub deleted_snapshots: u32,
-    pub deleted_objects: u32,
-    pub reclaimed_bytes: u64,
+    #[serde(flatten)]
+    pub binding: WorkspaceRequestBinding,
+    pub record: RecordRequest,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ChangesBeginRecordResponse {
+    pub version: ContractVersion,
+    pub ticket: Identifier,
+}
+
+/// Finishes or abandons the open record a begin returned.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ChangesTicketRequest {
+    pub version: ContractVersion,
+    #[serde(flatten)]
+    pub binding: WorkspaceRequestBinding,
+    pub ticket: Identifier,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ChangesFinishRecordResponse {
+    pub version: ContractVersion,
+    /// Absent when the call changed nothing that another record does not already hold.
+    pub record: Option<RecordSummary>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ChangesAbandonRecordResponse {
+    pub version: ContractVersion,
+    pub abandoned: bool,
+}
+
+/// Reads or settles what one holder holds.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ChangesHolderRequest {
+    pub version: ContractVersion,
+    #[serde(flatten)]
+    pub binding: WorkspaceRequestBinding,
+    pub holder: RecordHolder,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ChangesOpenRecordsResponse {
+    pub version: ContractVersion,
+    #[serde(deserialize_with = "deserialize_open_records")]
+    pub records: Vec<OpenRecord>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ChangesAbandonOpenRecordsResponse {
+    pub version: ContractVersion,
+    pub abandoned: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ChangesRecordsRequest {
+    pub version: ContractVersion,
+    #[serde(flatten)]
+    pub binding: WorkspaceRequestBinding,
+    pub holder: RecordHolder,
+    pub after_seq: Option<u64>,
+    pub page_size: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ChangesRecordsResponse {
+    pub version: ContractVersion,
+    pub page: RecordPage,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ChangesHoldersRequest {
+    pub version: ContractVersion,
+    #[serde(flatten)]
+    pub binding: WorkspaceRequestBinding,
+    pub after: Option<RecordHolder>,
+    pub page_size: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ChangesHoldersResponse {
+    pub version: ContractVersion,
+    #[serde(deserialize_with = "deserialize_holder_summaries")]
+    pub holders: Vec<HolderSummary>,
+    /// The `after` of the next page, absent on the last one.
+    pub next_after: Option<RecordHolder>,
+}
+
+/// Has `to` hold every record `from` holds, as a fork does.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ChangesHoldRequest {
+    pub version: ContractVersion,
+    #[serde(flatten)]
+    pub binding: WorkspaceRequestBinding,
+    pub from: RecordHolder,
+    pub to: RecordHolder,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ChangesHoldResponse {
+    pub version: ContractVersion,
+    pub held: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ChangesReleaseRequest {
+    pub version: ContractVersion,
+    #[serde(flatten)]
+    pub binding: WorkspaceRequestBinding,
+    pub holder: RecordHolder,
+    pub selection: ReleaseSelection,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ChangesReleaseResponse {
+    pub version: ContractVersion,
+    pub release: ReleaseSummary,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ChangesPrepareRevertRequest {
+    pub version: ContractVersion,
+    #[serde(flatten)]
+    pub binding: WorkspaceRequestBinding,
+    pub holder: RecordHolder,
+    #[serde(deserialize_with = "deserialize_revert_seqs")]
+    pub seqs: Vec<u64>,
+}
+
+/// Answers both a revert and an unrevert preparation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ChangesPrepareRevertResponse {
+    pub version: ContractVersion,
+    pub operation: PrepareResponse,
+    pub preview: RevertPreview,
+}
+
+/// Answers both a status and an acknowledgement.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ChangesStatusResponse {
+    pub version: ContractVersion,
+    pub status: RevertStatus,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ChangesPrepareCleanupRequest {
+    pub version: ContractVersion,
+    #[serde(flatten)]
+    pub binding: WorkspaceRequestBinding,
+    /// The store size retention evicts the oldest records to reach.
+    pub retention_bytes: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ChangesPrepareCleanupResponse {
+    pub version: ContractVersion,
+    pub operation: PrepareResponse,
+    pub preview: CleanupPreview,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2440,54 +2632,67 @@ where
     deserialize_bounded_vec(deserializer, MAX_SCM_DIFF_LINES as usize, "lines")
 }
 
-fn deserialize_snapshot_files<'de, D>(deserializer: D) -> Result<Vec<SnapshotFile>, D::Error>
+fn deserialize_record_paths<'de, D>(deserializer: D) -> Result<Vec<WorkspacePath>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    deserialize_bounded_vec(deserializer, MAX_PAGE_SIZE as usize, "files")
+    deserialize_bounded_vec(deserializer, MAX_RECORD_SCOPE_PATHS, "paths")
 }
 
-fn deserialize_snapshot_skipped_samples<'de, D>(
-    deserializer: D,
-) -> Result<Vec<SnapshotSkippedEntry>, D::Error>
+fn deserialize_record_listings<'de, D>(deserializer: D) -> Result<Vec<RecordListing>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    deserialize_bounded_vec(deserializer, MAX_SNAPSHOT_SKIPPED_SAMPLES, "samples")
+    deserialize_bounded_vec(deserializer, MAX_RECORD_PAGE_SIZE as usize, "records")
 }
 
-fn deserialize_snapshot_changes<'de, D>(deserializer: D) -> Result<Vec<SnapshotChange>, D::Error>
+fn deserialize_open_records<'de, D>(deserializer: D) -> Result<Vec<OpenRecord>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    deserialize_bounded_vec(deserializer, MAX_SNAPSHOT_PREVIEW_CHANGES, "changes")
+    deserialize_bounded_vec(deserializer, MAX_OPEN_RECORDS, "records")
 }
 
-fn deserialize_snapshot_restore_directories<'de, D>(
-    deserializer: D,
-) -> Result<Vec<WorkspacePath>, D::Error>
+fn deserialize_holder_summaries<'de, D>(deserializer: D) -> Result<Vec<HolderSummary>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    deserialize_bounded_vec(
-        deserializer,
-        MAX_SNAPSHOT_PREVIEW_CHANGES,
-        "createdDirectories",
-    )
+    deserialize_bounded_vec(deserializer, MAX_RECORD_PAGE_SIZE as usize, "holders")
 }
 
-fn deserialize_checkpoint_ids<'de, D>(deserializer: D) -> Result<Vec<Identifier>, D::Error>
+fn deserialize_revert_seqs<'de, D>(deserializer: D) -> Result<Vec<u64>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    deserialize_bounded_vec(deserializer, MAX_SNAPSHOT_CLEANUP, "checkpointIds")
+    deserialize_bounded_vec(deserializer, MAX_REVERT_RECORDS, "seqs")
 }
 
-fn deserialize_snapshot_paths<'de, D>(deserializer: D) -> Result<Vec<WorkspacePath>, D::Error>
+fn deserialize_revert_paths<'de, D>(deserializer: D) -> Result<Vec<RevertPath>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    deserialize_bounded_vec(deserializer, 32, "exclusions")
+    deserialize_bounded_vec(deserializer, MAX_REVERT_PREVIEW_PATHS, "planned")
+}
+
+fn deserialize_revert_conflicts<'de, D>(deserializer: D) -> Result<Vec<RevertConflict>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(deserializer, MAX_REVERT_PREVIEW_PATHS, "conflicts")
+}
+
+fn deserialize_revert_directories<'de, D>(deserializer: D) -> Result<Vec<WorkspacePath>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(deserializer, MAX_REVERT_PREVIEW_PATHS, "createdDirectories")
+}
+
+fn deserialize_pending_reverts<'de, D>(deserializer: D) -> Result<Vec<PendingRevert>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(deserializer, MAX_REVERT_JOURNALS, "pending")
 }
 
 fn deserialize_control_plane_missing<'de, D>(deserializer: D) -> Result<Vec<Identifier>, D::Error>
@@ -2684,6 +2889,7 @@ mod tests {
     }
 
     use serde_json::json;
+    use test_case::test_case;
 
     use super::*;
 
@@ -2711,35 +2917,64 @@ mod tests {
         );
     }
 
+    fn begin_record_wire() -> Value {
+        json!({
+            "version":"v1", "host":binding(), "cwdHandle":"cwd", "record":{
+                "scope":{"kind":"paths","paths":["src/lib.rs","notes"]},
+                "holder":"session",
+                "client":{"callId":"call","at":"0192"},
+                "limits":{"maxFiles":100,"maxFileBytes":1024,"maxTotalBytes":4096}
+            }
+        })
+    }
+
+    #[test_case(json!({"kind":"workspace","directory":"."}) ; "a workspace scope")]
+    #[test_case(json!({"kind":"paths","paths":["a","b/c"]}) ; "a paths scope")]
+    fn begin_record_requests_round_trip(scope: Value) {
+        let mut wire = begin_record_wire();
+        wire["record"]["scope"] = scope;
+        let request: ChangesBeginRecordRequest = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(request).unwrap(), wire);
+    }
+
+    #[test_case("/record/scope/paths", json!(vec!["a"; MAX_RECORD_SCOPE_PATHS + 1]) ; "too many paths")]
+    #[test_case("/record/scope/paths", json!(["/etc/passwd"]) ; "an absolute path")]
+    #[test_case("/record/client", json!("x".repeat(MAX_RECORD_CLIENT_BYTES)) ; "oversized client metadata")]
+    #[test_case("/record/holder", json!("h".repeat(MAX_RECORD_HOLDER_BYTES + 1)) ; "an oversized holder")]
+    #[test_case("/record/holder", json!("") ; "an empty holder")]
+    #[test_case("/record/scope/kind", json!("tree") ; "an unknown scope kind")]
+    fn begin_record_requests_reject_unbounded_inputs(pointer: &str, value: Value) {
+        let mut wire = begin_record_wire();
+        *wire.pointer_mut(pointer).unwrap() = value;
+        assert!(serde_json::from_value::<ChangesBeginRecordRequest>(wire).is_err());
+    }
+
     #[test]
-    fn capture_wire_contracts_use_the_common_preparation_and_lookup_has_no_work_inputs() {
+    fn change_methods_contracts_and_selections_have_fixed_wire_values() {
         assert_eq!(
-            SNAPSHOT_PREPARE_CAPTURE_METHOD,
-            "ai.workcell/snapshot-prepare-capture"
+            CHANGES_BEGIN_RECORD_METHOD,
+            "ai.workcell/changes-begin-record"
         );
+        assert_eq!(CHANGES_REVERT_CONTRACT_ID, "workspace.changes.revert.v1");
         assert_eq!(
-            SNAPSHOT_CHECKPOINT_METHOD,
-            "ai.workcell/snapshot-checkpoint"
+            serde_json::to_value(ReleaseSelection::All).unwrap(),
+            json!("all")
         );
-        assert_eq!(SNAPSHOT_CAPTURE_CONTRACT_ID, "workcell.snapshot.capture.v2");
-        let lookup = json!({
-            "version":"v1", "host":binding(), "cwdHandle":"cwd", "checkpointId":"checkpoint"
-        });
-        let checkpoint: SnapshotCheckpointRequest = serde_json::from_value(lookup.clone()).unwrap();
-        assert_eq!(serde_json::to_value(checkpoint).unwrap(), lookup);
-        let mut capture = lookup.clone();
-        capture["limits"] = json!({"maxFiles":100,"maxFileBytes":1024,"maxTotalBytes":4096});
-        let prepared: SnapshotPrepareCaptureRequest =
-            serde_json::from_value(capture.clone()).unwrap();
-        assert_eq!(serde_json::to_value(prepared).unwrap(), capture);
-        assert!(serde_json::from_value::<SnapshotCheckpointRequest>(capture).is_err());
-        assert!(serde_json::from_value::<SnapshotPrepareCaptureRequest>(lookup).is_err());
+        let seqs = json!({"seqs":[3,5]});
+        let selection: ReleaseSelection = serde_json::from_value(seqs.clone()).unwrap();
+        assert_eq!(selection, ReleaseSelection::Seqs(vec![3, 5]));
+        assert_eq!(serde_json::to_value(selection).unwrap(), seqs);
+        let conflict = json!({"path":"a","kind":"unrecorded","reason":"oversized"});
+        let parsed: RevertConflict = serde_json::from_value(conflict.clone()).unwrap();
+        assert_eq!(parsed.reason, Some(UnrecordedReason::Oversized));
+        assert_eq!(serde_json::to_value(parsed).unwrap(), conflict);
         let methods = json!({
-            "capture":true,"prepareCapture":true,"checkpoint":true,"inspect":true,"status":true,
-            "prepareRestore":true,"prepareUnrevert":true,"acknowledge":true,"prepareCleanup":true
+            "beginRecord":true,"finishRecord":true,"abandonRecord":true,"openRecords":true,
+            "abandonOpenRecords":true,"records":true,"holders":true,"hold":true,"release":true,
+            "prepareRevert":true,"prepareUnrevert":true,"acknowledge":true,"status":true,
+            "prepareCleanup":true
         });
-        let advertised: WorkspaceSnapshotMethods = serde_json::from_value(methods.clone()).unwrap();
-        assert!(advertised.prepare_capture && advertised.checkpoint);
+        let advertised: WorkspaceChangesMethods = serde_json::from_value(methods.clone()).unwrap();
         assert_eq!(serde_json::to_value(advertised).unwrap(), methods);
     }
 

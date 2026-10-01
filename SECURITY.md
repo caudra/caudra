@@ -109,7 +109,7 @@ operator reconciliation. There is no cross-file transaction or implicit undo.
 Atomic no-replace publication refuses a destination created at the last instant. Replacement still has
 a revision-check/rename race against external writers; descriptor anchoring prevents following a
 rebound symlink but cannot stop an ancestor being moved. The mutation lock coordinates this server's
-file, workspace, snapshot, and reviewed-publication paths, not shell children or other processes. Streaming
+file, workspace, revert, and reviewed-publication paths, not shell children or other processes. Streaming
 downloads validate a selected revision/digest and implement strong If-Match and single-range semantics
 without full buffering. An external writer can still change an open inode during the stream. A client
 must verify the complete digest and length before local publication. Same-UID hostile processes and
@@ -129,7 +129,7 @@ cancel methods remain on authenticated `POST /mcp` and require modern per-reques
 negotiation. Every preparation is bound to the process instance, principal, workspace, configured
 generation, root project, immutable current-directory handle, catalog and policy revisions, tool
 contract, and argument digest. Generation mismatches are rejected before an instance mismatch can be
-treated as volatile state loss. Durable workspace, session, project-resource, and snapshot-store
+treated as volatile state loss. Durable workspace, session, project-resource, and change-store
 identity consists of server ID, workspace ID, generation, resource namespace version, root-project ID,
 and principal ID; instance ID is used only for volatile operation and watch loss detection.
 Preparation resolves resource intents without executing the tool. A bounded volatile ledger gives
@@ -167,7 +167,7 @@ listing compares the opened cwd descriptor's directory identity with the origina
 Child creation and directory timestamp changes do not invalidate that identity. Scope resolution stays
 relative to the verified cwd descriptor, even if the pathname is subsequently replaced. Listing uses
 its own `BENEATH | NO_SYMLINKS | NO_MAGICLINKS` resolver for enumeration and metadata: ordinary mounts
-and bind mounts remain visible, while snapshot and transfer resolvers retain their `NO_XDEV` policy.
+and bind mounts remain visible, while change-record and transfer resolvers retain their `NO_XDEV` policy.
 Non-enumerated ancestors use search-only descriptors; only directories being listed require read
 permission. Replacing an ancestor with a symlink cannot redirect metadata reads into a protected or
 external tree; unsupported kernels have no pathname fallback. Blocking enumeration checks a child
@@ -272,107 +272,106 @@ Retries with the same invocation ID reuse the retained outcome. Discard invokes 
 restore for the prepared paths; it does not remove untracked content and no clean/reset operation is
 available. A process crash during a Git index update remains a repository recovery boundary.
 
-Snapshot support is an explicit authenticated-HTTP, writable-files opt-in. `--snapshot-root` or
+Change-record support is an explicit authenticated-HTTP, writable-files opt-in. `--snapshot-root` or
 `WORKCELL_MCP_SNAPSHOT_ROOT` must name an existing absolute directory outside the configured workspace.
 Startup rejects a symlink component, ownership by another identity, group/other access on Unix, a path
-that contains the workspace or is contained by it, an unsupported private entry, an oversized journal,
-or more journals than the recovery bound. Workcell never falls back to a shared temporary path. The
+that contains the workspace or is contained by it, an unsupported private entry, or more private
+entries than the store's quotas allow. Workcell never falls back to a shared temporary path. The
 private root is operator state: do not mount it into the exposed workspace or serve it independently.
 
-Prepared capture uses the existing authenticated operation ledger and its count/byte ceilings, not a
-separate job registry. Preparation discloses scope reads and private capture-store read/write/rollback
-effects without scanning. Execute returns `running` before admission. Its cancellation token is owned
-by the operation, so a disconnected or cancelled request cannot abandon accepted capture work.
-Explicit operation cancellation and the fixed 15-minute overall host budget signal cooperative
-cancellation; neither releases locks or reports a terminal outcome while blocking work still runs.
-Rollback failure is indeterminate. Successful durable publication wins cancellation. Checkpoint lookup
-is read-only, validates the stored scope, and returns `busy` rather than reading across publication;
-`not_found` cannot prove that a missing operation did not run. Receipts remain within the existing
-durable workspace binding and storage quotas. Phase telemetry contains counters and timing only.
+Several processes may share one store. Every store operation holds an exclusive `flock` on the store's
+`lock` file for as long as it runs, taken through a fresh descriptor on a blocking thread and never
+held for the process lifetime; one that cannot take it within 30 seconds reports `busy`. Store files
+are owner-only and published by same-directory create, sync, and rename, so each appears whole or not
+at all. A commit writes the store state, which carries the next sequence number, before the record,
+and deletes the open record last: two processes never commit the same `seq`, and a crash between the
+steps leaves at most an unused number and an open record that can still be finished. A store whose
+state is missing while it holds records, or whose files are in a format this release does not know,
+refuses to open. Data of earlier releases is deleted at open, never interpreted.
 
-The prepared cwd revision is checked against the scope descriptor used by traversal, not a separate
-path existence check. The host closes capture admission and cancels and drains the ledger's accepted
-captures during shutdown. HTTP cannot report graceful completion while a capture worker holds its
-execution lease. If an execution task is forcibly dropped, its worker token is cancelled even though
-its async budget timer no longer exists; blocked OS I/O remains non-preemptible.
+Recording is not a prepared operation. Beginning, finishing, and abandoning a record read the
+workspace and write only the private store, under the same authenticated remote-host binding as other
+workspace reads. Holders and client metadata are bounded opaque values that Workcell stores and never
+interprets. A holder is a grouping, not an authorization boundary: any authenticated caller of the
+host may name any holder.
+
+A capture walks the paths a record names, or the directory its workspace scope names, beneath the
+configured root. Every name is opened beneath an already open directory with
+`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV`, so however the tree changes during a walk,
+capture never follows a link or crosses a mount. A symlink is data: the link's raw target is stored
+and never resolved. A named path must be plain and root-relative and is never read through a link. A
+named symlink, a named path behind a link or a non-directory ancestor, or a named file with more than
+one hard link widens its record to the whole tree for both captures, so a write through it is recorded
+where it lands inside the root; a named path the call itself puts behind such an ancestor is kept as
+`blocked`. Protected paths (Git metadata, `.ssh`, `.workcell`, credential-bearing names) and
+configured exclusions are left out whether named or walked; gitignored paths, and everything beneath a
+directory its own repository ignores, wherever a walk starts, are left out of walks, while a named
+file or link is recorded even when ignored. A configured exclusion is resolved through its nearest
+existing ancestor, so a later-created suffix remains excluded; escaping and malformed suffixes fail
+startup. A directory that holds its own repository is never entered, and mounts and special files a
+walk meets are left out. Oversized, unreadable, and unstable files, and named special files, are kept
+as unrecorded paths, which no revert ever writes. Entry-count, path-byte, depth, ignore-rule,
+file-count, total-byte, metadata, open-record, record, journal, and total-storage limits are fixed and
+advertised; a client can only lower the per-record ones, which bound a record in either scope. Objects
+are charged prospectively at the worst case of Git's compression; content the store already holds is
+not charged again. A failed or cancelled capture deletes what it staged; objects it had already named
+reach nothing until collection removes them.
 
 Every object is written under a temporary name and flushed before it takes its name, so a crash leaves
 temporary files for cleanup, never a partial object a later capture would reuse. Every object a
-checkpoint names is synced, with its directory, before the checkpoint is written, including objects an
-earlier capture stored. Lookup re-syncs checkpoint references before exposing completion. Rollback
-deletes what the capture staged and removes its checkpoint reference, stopping on an uncertain unlink
-or sync; it never deletes a named object, which only cleanup's reachability collection removes. An
-intact receipt whose earlier publication and rollback both failed can therefore be made durable by a
-later successful lookup sync; a failed sync refuses the receipt. Store layout directories are synced
-at open as well.
+capture names is synced, with its directory, before the open record or record naming it is written,
+including objects an earlier capture stored. Captures live in a private bare Git repository that reads
+no system, global, or environment Git configuration and that no Git process runs against. Objects are
+named by their Git object IDs and every object is verified against its ID when read, so a tampered
+object fails integrity instead of reverting to altered content. Content that Git's collision detection
+recognizes as a SHA-1 collision attack is refused, and such a file is kept as unreadable. The stat cache
+that spares a whole-tree capture from reading unchanged files trusts only an exact match of device,
+inode, owner, size, and nanosecond change and modification times. It records only files that had not
+changed for five seconds before their capture started, so a write racing a read cannot hide behind an
+unchanged stamp, and a file whose cached object the store no longer holds is read again.
 
-Capture walks the directory named by the request's cwd handle, which must still resolve to the
-directory the host issued it for. Every name is opened beneath an already open directory with
-`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV`, so however the tree changes during a walk,
-capture never follows a link or crosses a mount. A symlink is data: the link's raw target is stored and
-never resolved. Protected paths (Git metadata, `.ssh`, `.workcell`, credential-bearing names),
-gitignored paths, and configured exclusions are left out. A configured exclusion
-is resolved through its nearest existing ancestor, so a later-created suffix remains excluded; escaping
-and malformed suffixes fail startup. A directory that holds its own repository is never entered. Mounts,
-special files, oversized files, unreadable entries, files that never read the same twice, and names
-that are not UTF-8 are left out and counted rather than failing the capture, and a restore never
-touches a path either capture pruned or excluded. Gitignored and protected paths are not recorded,
-only absent, so as in Git a restore removes a path the target ignored and the source captured, and
-only while it still matches the source. Entry-count, path-byte, depth, ignore-rule, file-count,
-total-byte, metadata, retained snapshot and checkpoint, journal, and total-storage limits are fixed and
-advertised; a client can only lower the per-capture ones. Object, checkpoint, and journal bytes are
-charged prospectively under one publication lock, objects at the worst case of Git's compression;
-content the store already holds is not charged again. A failed capture publishes no checkpoint and
-deletes what it staged; objects it had already named reach nothing until cleanup collects them.
-Private files use owner-only modes and same-directory create/sync/rename publication. Snapshot data of
-earlier releases is deleted at open, never interpreted; data in a format this release does not know
-refuses the store instead.
+Records that overlap in time are rebased when they finish: a change another record already holds is
+dropped, a later change starts where that record left the path, and a path whose history the two
+cannot tell apart is kept as `interleaved`. No record therefore claims a change it did not observe
+alone, and a revert of one record cannot silently undo another's change.
 
-Snapshots live in a private bare Git repository that reads no system, global, or environment Git
-configuration and that no Git process runs against. Objects are named by their Git object IDs and
-every object is verified against its ID when read, so a tampered object fails integrity instead of
-restoring altered content. Content that Git's collision detection recognizes as a SHA-1 collision
-attack is refused, and such a file is skipped as unreadable. The stat cache that spares a capture from
-reading unchanged files trusts only an exact match of device, inode, owner, size, and nanosecond change
-and modification times. It records only files that had not changed for five seconds before their
-capture started, so a write racing a read cannot hide behind an unchanged stamp, and a file whose
-cached object the store no longer holds is read again.
+A revert is authorized against its prepared plan in the existing operation ledger: write and delete
+intents on the deepest path holding every path it touches, for the effects its complete counts
+include, and a write intent on the holder's stack of pending reverts. It changes only paths its
+selected records changed, composed per path, and only where the live entry held what the records left
+there when prepared. A path the records do not chain on, a path a record could not store, and a path
+changed since are conflicts, and a conflict anywhere refuses execution before anything is written.
+Execution refuses unless the records and the holder's stack are still as planned. Each path is
+published through a staged entry beside it and only while the live entry still carries the device,
+inode, size, mode, and timestamps preparation observed; a mismatch stops the revert rather than
+choosing the record over a later edit. No write, link, or unlink goes through a symlinked or
+non-directory ancestor. A reverted file gains no permission the file it replaces lacked, except
+execute for its owner and wherever read was allowed, and a created file gets Git's default mode under
+the umask, which is learned at open from a probe file rather than by changing the process-wide umask.
+Each publication is atomic for one entry, but the complete revert is not. The journal is durable
+before the first effect and records transitions, never paths or content. Termination can happen after
+a publication and before its journal update, so a revert left `publishing` is recomputed from its
+records and the live workspace, under the store lock, when the store next opens or before the next
+revert: fully applied becomes `completed`, one whose remaining paths all still hold what the records
+left there `partial`, and anything else `indeterminate` with reconciliation required. It never replays
+an incomplete revert.
 
-A restore is authorized against its prepared plan in the existing operation ledger: write and delete
-intents on the scope for the effects its complete counts include, its own journal, the journal an
-unrevert settles, and the settled journals it may reclaim. It changes only paths that differ between
-its source and target captures, both of which covered them, and only where the live entry matched the
-source when prepared. A conflict anywhere refuses execution. Each path is published through a staged
-entry beside it and only while the live entry still carries the device, inode, size, mode, and
-timestamps preparation observed; a mismatch stops the restore rather than choosing the snapshot over a
-later edit. No write, link, or unlink goes through a symlinked or non-directory ancestor. A restored
-file gains no permission the file it replaces lacked, except execute for its owner and wherever read
-was allowed, and a created file gets Git's default mode under the umask, which is learned at open from
-a probe file rather than by changing the process-wide umask. Each publication is atomic for one entry,
-but the complete restore is not. The journal is durable before the first effect and records
-transitions, never paths. Termination can happen after a publication and before its journal update, so
-startup recomputes a restore left `publishing` from its two captures and the live workspace: fully
-applied becomes `completed`, one whose remaining paths all still match the source `partial`, and
-anything else `indeterminate` with reconciliation required. It never replays an incomplete restore.
+While a revert is pending, its records count as reverted for every holder: no other revert may name
+them and no release may drop them, so two reverts cannot interleave over the same records. Unrevert
+re-applies the holder's whole stack through the same prepared execution, conflict rules, and status
+path, and refuses unless the stack is still the one it planned. Acknowledgement deletes the stack's
+records for every holder. Retention after each commit and prepared cleanup never evict a record a
+pending revert names or one an open record may still rebase onto. Cleanup uses the common ledger: it
+retains the exact stale open records it abandons and records it evicts, binds one server-state
+resource intent to that plan's digest, does at most what it named where that still applies, and then
+deletes only objects nothing reaches. Every open record, every record, and the stat cache remain
+reachability roots, read in full: one that cannot be read fails the collection and nothing is deleted,
+so no object it names is ever mistaken for garbage.
 
-Unrevert restores the same two captures the other way round through the same prepared execution and
-status path, and settles the original restore as reverted once it completes. While one restore awaits
-acknowledgement or unrevert, every other restore is refused, so two restores cannot interleave over the
-same paths. Journal count and byte limits are enforced before execution; only settled journals are
-reclaimable under pressure. Prepared cleanup also uses the common ledger. It names checkpoints, never
-snapshots, retains the exact checkpoint, settled-journal, and snapshot deletion set with a digest of
-the exact objects to collect, and binds one server-state resource intent to that plan's digest.
-Execution refuses unless the store would still plan the same set, removes references before referents,
-and then deletes only objects nothing reaches; an unreadable tree might reach any object, so then the
-plan fails and nothing is deleted, while a missing tree reaches nothing, since no restore can pass
-through it. Pending preparations, retained checkpoints, every unsettled journal, and the stat cache
-remain reachability roots, so cleanup cannot remove state needed for restore, recovery, unrevert, or
-the next capture.
-
-Discovery reports snapshots only after private-store validation and startup recovery succeed. It sets
+Discovery reports `changes` only after private-store validation and startup recovery succeed. It sets
 `controlPlane: true` only when operations, workspace reads, watch, project assets, writable prepared
-mutation, direct exec, SCM, and snapshots are all enabled; otherwise `controlPlaneMissing` identifies
-the absent slice. This is a capability summary, not a deployment controller. Snapshot methods add no
+mutation, direct exec, SCM, and changes are all enabled; otherwise `controlPlaneMissing` identifies
+the absent slice. This is a capability summary, not a deployment controller. Change methods add no
 route, user, tenant, signed ticket, bearer, or authority beyond authenticated `POST /mcp`.
 
 Shell requests are parsed into command scopes before execution. Without `--shell-policy` or `--yolo`,

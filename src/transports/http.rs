@@ -116,12 +116,6 @@ impl HttpServerInner {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
-
-    fn cancel_captures(&self) {
-        if let Some(server) = self.server() {
-            server.cancel_captures();
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -133,7 +127,6 @@ pub struct HttpServer {
 
 impl Drop for HttpServerInner {
     fn drop(&mut self) {
-        self.cancel_captures();
         self.shutdown.cancel();
     }
 }
@@ -269,7 +262,6 @@ impl HttpServer {
     }
 
     pub async fn shutdown(&self) -> ShutdownOutcome {
-        self.inner.cancel_captures();
         self.inner.shutdown.cancel();
         let task = self.inner.task.lock().await.take();
         let Some(mut task) = task else {
@@ -315,7 +307,6 @@ impl HttpServer {
     }
 
     pub async fn force(&self) {
-        self.inner.cancel_captures();
         self.inner.shutdown.cancel();
         self.inner.abort.abort();
         self.inner.state_tx.send_replace(ServeState::Forced);

@@ -29,26 +29,29 @@ use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use workcell_host_contract::{
+    CHANGES_ABANDON_OPEN_RECORDS_METHOD, CHANGES_ABANDON_RECORD_METHOD, CHANGES_ACKNOWLEDGE_METHOD,
+    CHANGES_BEGIN_RECORD_METHOD, CHANGES_CLEANUP_CONTRACT_ID, CHANGES_FINISH_RECORD_METHOD,
+    CHANGES_HOLD_METHOD, CHANGES_HOLDERS_METHOD, CHANGES_OPEN_RECORDS_METHOD,
+    CHANGES_PREPARE_CLEANUP_METHOD, CHANGES_PREPARE_REVERT_METHOD, CHANGES_PREPARE_UNREVERT_METHOD,
+    CHANGES_RECORDS_METHOD, CHANGES_RELEASE_METHOD, CHANGES_REVERT_CONTRACT_ID,
+    CHANGES_STATUS_METHOD, CHANGES_UNREVERT_CONTRACT_ID, ChangesAbandonOpenRecordsResponse,
+    ChangesAbandonRecordResponse, ChangesBeginRecordRequest, ChangesBeginRecordResponse,
+    ChangesFinishRecordResponse, ChangesHoldRequest, ChangesHoldResponse, ChangesHolderRequest,
+    ChangesHoldersRequest, ChangesHoldersResponse, ChangesOpenRecordsResponse,
+    ChangesPrepareCleanupRequest, ChangesPrepareCleanupResponse, ChangesPrepareRevertRequest,
+    ChangesPrepareRevertResponse, ChangesRecordsRequest, ChangesRecordsResponse,
+    ChangesReleaseRequest, ChangesReleaseResponse, ChangesStatusResponse, ChangesTicketRequest,
     ContractBinding, ContractVersion, DIRECT_EXEC_CONTRACT_ID, DirectExecCapability, DisplayText,
     ErrorText, HostBinding, Identifier, MAX_ARGUMENT_BYTES, OperationBinding, OperationIntent,
-    OperationKind, OutcomeKind, PROJECT_ASSET_MANIFEST_VERSION, PrepareResponse,
-    ProjectAssetCapability, ProjectAssetLimits, ProjectAssetMethods, RemoteHostCapabilities,
-    RemoteHostCwd, RemoteHostDescriptor, RemoteHostRevisions, RemoteHostToolCapability,
-    RemoteHostToolLimits, RemoteOperationCapability, RemoteOperationMethods, ResourceAccess,
-    ResourceId, ResourceIntent, Revision, SCM_DIFF_METHOD, SCM_DISCOVER_METHOD, SCM_LOG_METHOD,
-    SCM_MUTATION_CONTRACT_ID, SCM_PREPARE_MUTATION_METHOD, SCM_READ_SIDE_METHOD, SCM_STATUS_METHOD,
-    SNAPSHOT_ACKNOWLEDGE_METHOD, SNAPSHOT_CAPTURE_CONTRACT_ID, SNAPSHOT_CAPTURE_METHOD,
-    SNAPSHOT_CHECKPOINT_METHOD, SNAPSHOT_CLEANUP_CONTRACT_ID, SNAPSHOT_INSPECT_METHOD,
-    SNAPSHOT_PREPARE_CAPTURE_METHOD, SNAPSHOT_PREPARE_CLEANUP_METHOD,
-    SNAPSHOT_PREPARE_RESTORE_METHOD, SNAPSHOT_PREPARE_UNREVERT_METHOD,
-    SNAPSHOT_RESTORE_CONTRACT_ID, SNAPSHOT_STATUS_METHOD, SNAPSHOT_UNREVERT_CONTRACT_ID,
-    ScmCapability, ScmDiffRequest, ScmDiscoverRequest, ScmLimits, ScmLogRequest, ScmMethods,
-    ScmMutation, ScmPrepareMutationRequest, ScmPrepareMutationResponse, ScmReadSideRequest,
-    ScmStatusRequest, SnapshotAcknowledgeRequest, SnapshotCaptureRequest,
-    SnapshotCheckpointRequest, SnapshotInspectRequest, SnapshotPrepareCaptureRequest,
-    SnapshotPrepareCleanupRequest, SnapshotPrepareCleanupResponse, SnapshotPrepareRestoreRequest,
-    SnapshotPrepareRestoreResponse, SnapshotPrepareUnrevertRequest, SnapshotRestorePreview,
-    SnapshotStatusRequest, StructuredOutcome, ToolResultContent, ToolResultEnvelope,
+    OperationKind, OutcomeKind, PROJECT_ASSET_MANIFEST_VERSION, ProjectAssetCapability,
+    ProjectAssetLimits, ProjectAssetMethods, RemoteHostCapabilities, RemoteHostCwd,
+    RemoteHostDescriptor, RemoteHostRevisions, RemoteHostToolCapability, RemoteHostToolLimits,
+    RemoteOperationCapability, RemoteOperationMethods, ResourceAccess, ResourceId, ResourceIntent,
+    RevertCounts, RevertDirection, RevertPreview, Revision, SCM_DIFF_METHOD, SCM_DISCOVER_METHOD,
+    SCM_LOG_METHOD, SCM_MUTATION_CONTRACT_ID, SCM_PREPARE_MUTATION_METHOD, SCM_READ_SIDE_METHOD,
+    SCM_STATUS_METHOD, ScmCapability, ScmDiffRequest, ScmDiscoverRequest, ScmLimits, ScmLogRequest,
+    ScmMethods, ScmMutation, ScmPrepareMutationRequest, ScmPrepareMutationResponse,
+    ScmReadSideRequest, ScmStatusRequest, StructuredOutcome, ToolResultContent, ToolResultEnvelope,
     ToolResultText, WORKSPACE_MUTATION_CONTRACT_ID, WorkspaceCapability, WorkspaceLimits,
     WorkspaceMethods, WorkspaceMutationCapability, WorkspacePath, WorkspaceRequestBinding,
     WorkspaceWatchCapability, WorkspaceWatchLimits, WorkspaceWatchMethods,
@@ -75,9 +78,7 @@ use workcell_mcp_web::{
 };
 use workcell_tool_contract::{CatalogRevision, ToolManifest, ToolSpec};
 use workcell_workspace_scm::{ScmError, ScmGroup};
-use workcell_workspace_snapshot::{
-    SnapshotCaptureProgress, SnapshotCaptureProgressSink, SnapshotError, SnapshotManager,
-};
+use workcell_workspace_snapshot::{PreparedRevert, SnapshotError, SnapshotManager};
 
 #[cfg(unix)]
 #[path = "transfer/host.rs"]
@@ -95,13 +96,14 @@ use crate::{
         DiscoverProjectAssetsRequest, EXECUTE_METHOD, EXTENSION_ID,
         LARGE_PREPARATION_RESERVATION_BYTES, LIST_METHOD, ListRequest,
         MAX_PREPARED_OPERATION_BYTES, MEDIUM_PREPARATION_RESERVATION_BYTES, PREPARE_EXEC_METHOD,
-        PREPARE_METHOD, PREPARE_MUTATION_METHOD, PrepareExecRequest, PrepareMutationRequest,
-        PrepareRequest, PreparedRemoteOperation, READ_PROJECT_ASSET_METHOD, READ_TEXT_METHOD,
-        RELEASE_METHOD, RESOLVE_DIRECTORY_METHOD, ReadProjectAssetRequest, ReadTextRequest,
-        ReleaseRequest, RemoteHostConfiguration, RemoteHostState, ResolveDirectoryRequest,
-        SEARCH_TEXT_METHOD, SMALL_PREPARATION_RESERVATION_BYTES, STAT_METHOD, STATUS_METHOD,
-        SearchTextRequest, StatRequest, StatusRequest, WATCH_CLOSE_METHOD, WATCH_OPEN_METHOD,
-        WATCH_POLL_METHOD, WatchCloseRequest, WatchOpenRequest, WatchPollRequest,
+        PREPARE_METHOD, PREPARE_MUTATION_METHOD, PreparationReservation, PrepareExecRequest,
+        PrepareMutationRequest, PrepareRequest, PreparedRemoteOperation, READ_PROJECT_ASSET_METHOD,
+        READ_TEXT_METHOD, RELEASE_METHOD, RESOLVE_DIRECTORY_METHOD, ReadProjectAssetRequest,
+        ReadTextRequest, ReleaseRequest, RemoteHostConfiguration, RemoteHostState,
+        ResolveDirectoryRequest, SEARCH_TEXT_METHOD, SMALL_PREPARATION_RESERVATION_BYTES,
+        STAT_METHOD, STATUS_METHOD, SearchTextRequest, StatRequest, StatusRequest,
+        WATCH_CLOSE_METHOD, WATCH_OPEN_METHOD, WATCH_POLL_METHOD, WatchCloseRequest,
+        WatchOpenRequest, WatchPollRequest,
     },
     transfer::TransferGroup,
 };
@@ -122,10 +124,8 @@ const WEB_PREPARATION_FAILED_CODE: &str = "web_preparation_failed";
 const SHELL_COMMAND_REFUSED_CODE: &str = "shell_command_refused";
 const PYTHON_PREPARATION_FAILED_CODE: &str = "python_preparation_failed";
 const PREPARATION_INTERNAL_CODE: &str = "preparation_internal_error";
-const SNAPSHOT_JOURNAL_RESOURCE_PREFIX: &str = "snapshot-store:journal:";
-const SNAPSHOT_SETTLED_JOURNALS_RESOURCE: &str = "snapshot-store:settled-restore-journals";
-const SNAPSHOT_CAPTURE_RESOURCE: &str = "snapshot-store:captures";
-const SNAPSHOT_PROGRESS_KIND: &str = "snapshotCapture";
+/// A holder's stack of pending reverts, which a revert extends and an unrevert settles.
+const CHANGES_HOLDER_RESOURCE_PREFIX: &str = "workspace-changes:holder:";
 static PROCESS_INSTANCE_ID: OnceLock<Arc<str>> = OnceLock::new();
 
 pub(crate) fn protocol_versions(modern_only: bool) -> &'static [ProtocolVersion] {
@@ -256,7 +256,7 @@ impl WorkcellServer {
             "shellOutputFilter": groups.contains(&ToolGroup::Shell).then_some(tools.shell_output_filter),
             "codeTypeCheck": groups.contains(&ToolGroup::PythonExecution).then_some(tools.code.type_check),
             "maxTransferBytes": groups.contains(&ToolGroup::Transfer).then_some(tools.max_transfer_bytes),
-            "snapshots": tools.snapshot_root.is_some(),
+            "changes": tools.snapshot_root.is_some(),
             "reviewedTransfer": tools.transfer_root.is_some(),
         }))
         .map_err(|_| ServerBuildError::CatalogSerialization)?;
@@ -421,18 +421,8 @@ impl WorkcellServer {
         })
     }
 
-    pub(crate) fn cancel_captures(&self) {
-        if let Some(remote) = &self.remote_host {
-            remote.cancel_captures();
-        }
-    }
-
     /// Releases pooled worker processes during graceful shutdown.
     pub async fn shutdown(&self) {
-        self.cancel_captures();
-        if let Some(remote) = &self.remote_host {
-            remote.drain_captures().await;
-        }
         if let Some(code) = &self.code {
             code.shutdown().await;
         }
@@ -511,7 +501,7 @@ impl WorkcellServer {
             control_plane_missing.push("directExec");
         }
         if snapshots.is_none() {
-            control_plane_missing.push("snapshots");
+            control_plane_missing.push("changes");
         }
         if scm.is_none() {
             control_plane_missing.push("scm");
@@ -783,7 +773,7 @@ impl WorkcellServer {
                     prepared_mutations: workspace_files.allow_write(),
                     discard_untracked: false,
                 }),
-                snapshots: snapshots.as_ref().map(|_| SnapshotManager::capability()),
+                changes: snapshots.as_ref().map(|_| SnapshotManager::capability()),
                 control_plane,
                 control_plane_missing,
             },
@@ -1161,199 +1151,107 @@ impl WorkcellServer {
         })
     }
 
-    /// The root-relative directory a snapshot request is bound to. A capture records it as its
-    /// scope; every other snapshot method only requires the handle to still resolve.
-    async fn snapshot_scope(
+    /// The change store, once the request is bound to this workspace and its cwd handle still
+    /// resolves. Records outlive the process and belong to the whole workspace, so the binding
+    /// may name an earlier instance and any directory.
+    async fn changes(
         &self,
+        remote: &RemoteHostState,
         binding: &WorkspaceRequestBinding,
-    ) -> Result<WorkspacePath, ErrorData> {
-        let path = self
-            .workspace_files
+    ) -> Result<&SnapshotManager, ErrorData> {
+        remote
+            .validate_workspace_host(&binding.host)
+            .map_err(remote_error)?;
+        self.workspace_files
             .as_ref()
             .ok_or_else(method_not_found)?
             .workspace_directory_path(&binding.cwd_handle)
             .await
             .map_err(workspace_error)?;
-        WorkspacePath::new(path).map_err(|_| remote_invalid())
+        self.snapshots.as_ref().ok_or_else(method_not_found)
     }
 
-    async fn prepare_snapshot_capture(
+    async fn prepare_changes_revert(
         &self,
         remote: &RemoteHostState,
-        request: SnapshotPrepareCaptureRequest,
-    ) -> Result<PrepareResponse, ErrorData> {
-        remote
-            .validate_host(&request.binding.host)
-            .map_err(remote_error)?;
-        let scope = self
-            .workspace_files
-            .as_ref()
-            .ok_or_else(method_not_found)?
-            .workspace_snapshot_scope(&request.binding.cwd_handle)
-            .await
-            .map_err(workspace_error)?;
-        let encoded = serde_json::to_value(&request).map_err(|_| remote_invalid())?;
-        let reservation = remote
-            .reserve_preparation(SMALL_PREPARATION_RESERVATION_BYTES)
-            .map_err(remote_error)?;
-        let prepared = self
-            .snapshots
-            .as_ref()
-            .ok_or_else(method_not_found)?
-            .prepare_capture(&request.checkpoint_id, &scope, &request.limits)
-            .map_err(snapshot_error)?;
-        let resources = vec![
-            ResourceIntent {
-                scope: root_relative_resource_scope(RootResourceKind::Path, prepared.scope())
-                    .map_err(workspace_error)?,
-                resource_id: root_relative_resource_id(RootResourceKind::Path, prepared.scope())
-                    .map_err(workspace_error)?,
-                display: DisplayText::new(format!("file:{}", prepared.scope()))
-                    .map_err(|_| remote_invalid())?,
-                access: ResourceAccess::Read,
-                revision: None,
-            },
-            resource_intent(SNAPSHOT_CAPTURE_RESOURCE, ResourceAccess::Read)?,
-            resource_intent(SNAPSHOT_CAPTURE_RESOURCE, ResourceAccess::Write)?,
-            resource_intent(SNAPSHOT_CAPTURE_RESOURCE, ResourceAccess::Delete)?,
-        ];
-        remote
-            .prepare_reserved(
-                reservation,
-                PreparedRemoteOperation::SnapshotCapture(prepared),
-                OperationBinding {
-                    host: request.binding.host,
-                    contract: fixed_contract(SNAPSHOT_CAPTURE_CONTRACT_ID)?,
-                    argument_digest: argument_digest(&encoded)?,
-                },
-                OperationIntent {
-                    kind: OperationKind::Mutate,
-                    mutating: true,
-                    resources,
-                },
-            )
-            .map_err(remote_error)
-    }
-
-    async fn prepare_snapshot_restore(
-        &self,
-        remote: &RemoteHostState,
-        request: SnapshotPrepareRestoreRequest,
+        request: ChangesPrepareRevertRequest,
         token: &CancellationToken,
-    ) -> Result<SnapshotPrepareRestoreResponse, ErrorData> {
+    ) -> Result<ChangesPrepareRevertResponse, ErrorData> {
         remote
             .validate_host(&request.binding.host)
             .map_err(remote_error)?;
-        self.snapshot_scope(&request.binding).await?;
+        let changes = self.changes(remote, &request.binding).await?;
         let encoded = serde_json::to_value(&request).map_err(|_| remote_invalid())?;
         let reservation = remote
             .reserve_preparation_wait(LARGE_PREPARATION_RESERVATION_BYTES, token)
             .await
             .map_err(remote_error)?;
-        let (prepared, preview) = self
-            .snapshots
-            .as_ref()
-            .ok_or_else(method_not_found)?
-            .prepare_restore(
-                &request.snapshot_id,
-                &request.source_snapshot_id,
+        let (prepared, preview) = changes
+            .prepare_revert(
+                &request.holder,
+                &request.seqs,
                 MAX_PREPARED_OPERATION_BYTES,
                 token,
             )
             .await
             .map_err(snapshot_error)?;
-        let resources =
-            snapshot_restore_intents(prepared.scope(), &preview, prepared.unrevert_of())?;
-        let operation = remote
-            .prepare_reserved(
-                reservation,
-                PreparedRemoteOperation::SnapshotRestore(prepared),
-                OperationBinding {
-                    host: request.binding.host,
-                    contract: fixed_contract(SNAPSHOT_RESTORE_CONTRACT_ID)?,
-                    argument_digest: argument_digest(&encoded)?,
-                },
-                OperationIntent {
-                    kind: OperationKind::Mutate,
-                    mutating: true,
-                    resources,
-                },
-            )
-            .map_err(remote_error)?;
-        Ok(SnapshotPrepareRestoreResponse {
-            version: ContractVersion::V1,
-            operation,
+        register_revert(
+            remote,
+            reservation,
+            request.binding.host,
+            &encoded,
+            prepared,
             preview,
-        })
+        )
     }
 
-    async fn prepare_snapshot_unrevert(
+    async fn prepare_changes_unrevert(
         &self,
         remote: &RemoteHostState,
-        request: SnapshotPrepareUnrevertRequest,
+        request: ChangesHolderRequest,
         token: &CancellationToken,
-    ) -> Result<SnapshotPrepareRestoreResponse, ErrorData> {
+    ) -> Result<ChangesPrepareRevertResponse, ErrorData> {
         remote
             .validate_host(&request.binding.host)
             .map_err(remote_error)?;
-        self.snapshot_scope(&request.binding).await?;
+        let changes = self.changes(remote, &request.binding).await?;
         let encoded = serde_json::to_value(&request).map_err(|_| remote_invalid())?;
         let reservation = remote
             .reserve_preparation_wait(LARGE_PREPARATION_RESERVATION_BYTES, token)
             .await
             .map_err(remote_error)?;
-        let (prepared, preview) = self
-            .snapshots
-            .as_ref()
-            .ok_or_else(method_not_found)?
-            .prepare_unrevert(&request.restore_id, MAX_PREPARED_OPERATION_BYTES, token)
+        let (prepared, preview) = changes
+            .prepare_unrevert(&request.holder, MAX_PREPARED_OPERATION_BYTES, token)
             .await
             .map_err(snapshot_error)?;
-        let resources =
-            snapshot_restore_intents(prepared.scope(), &preview, prepared.unrevert_of())?;
-        let operation = remote
-            .prepare_reserved(
-                reservation,
-                PreparedRemoteOperation::SnapshotUnrevert(prepared),
-                OperationBinding {
-                    host: request.binding.host,
-                    contract: fixed_contract(SNAPSHOT_UNREVERT_CONTRACT_ID)?,
-                    argument_digest: argument_digest(&encoded)?,
-                },
-                OperationIntent {
-                    kind: OperationKind::Mutate,
-                    mutating: true,
-                    resources,
-                },
-            )
-            .map_err(remote_error)?;
-        Ok(SnapshotPrepareRestoreResponse {
-            version: ContractVersion::V1,
-            operation,
+        register_revert(
+            remote,
+            reservation,
+            request.binding.host,
+            &encoded,
+            prepared,
             preview,
-        })
+        )
     }
 
-    async fn prepare_snapshot_cleanup(
+    async fn prepare_changes_cleanup(
         &self,
         remote: &RemoteHostState,
-        request: SnapshotPrepareCleanupRequest,
+        request: ChangesPrepareCleanupRequest,
         token: &CancellationToken,
-    ) -> Result<SnapshotPrepareCleanupResponse, ErrorData> {
+    ) -> Result<ChangesPrepareCleanupResponse, ErrorData> {
         remote
             .validate_host(&request.binding.host)
             .map_err(remote_error)?;
-        self.snapshot_scope(&request.binding).await?;
+        let changes = self.changes(remote, &request.binding).await?;
         let encoded = serde_json::to_value(&request).map_err(|_| remote_invalid())?;
         let reservation = remote
             .reserve_preparation_wait(LARGE_PREPARATION_RESERVATION_BYTES, token)
             .await
             .map_err(remote_error)?;
-        let (prepared, preview) = self
-            .snapshots
-            .as_ref()
-            .ok_or_else(method_not_found)?
-            .prepare_cleanup(&request.checkpoint_ids, MAX_PREPARED_OPERATION_BYTES)
+        let (prepared, preview) = changes
+            .store()
+            .prepare_cleanup(request.retention_bytes, MAX_PREPARED_OPERATION_BYTES)
             .await
             .map_err(snapshot_error)?;
         let resources = vec![resource_intent(
@@ -1363,10 +1261,10 @@ impl WorkcellServer {
         let operation = remote
             .prepare_reserved(
                 reservation,
-                PreparedRemoteOperation::SnapshotCleanup(prepared),
+                PreparedRemoteOperation::ChangesCleanup(prepared),
                 OperationBinding {
                     host: request.binding.host,
-                    contract: fixed_contract(SNAPSHOT_CLEANUP_CONTRACT_ID)?,
+                    contract: fixed_contract(CHANGES_CLEANUP_CONTRACT_ID)?,
                     argument_digest: argument_digest(&encoded)?,
                 },
                 OperationIntent {
@@ -1376,7 +1274,7 @@ impl WorkcellServer {
                 },
             )
             .map_err(remote_error)?;
-        Ok(SnapshotPrepareCleanupResponse {
+        Ok(ChangesPrepareCleanupResponse {
             version: ContractVersion::V1,
             operation,
             preview,
@@ -1401,15 +1299,6 @@ impl WorkcellServer {
                 cancellation,
                 lease,
             } => {
-                let initial_status = operation.is_detached().then(|| {
-                    remote
-                        .status(
-                            &request.preparation_id,
-                            Some(&request.invocation_id),
-                            &request.host,
-                        )
-                        .map_err(remote_error)
-                });
                 #[cfg(unix)]
                 if let PreparedRemoteOperation::TransferPublication(prepared) = operation.as_mut() {
                     prepared.bind_execution(
@@ -1456,9 +1345,6 @@ impl WorkcellServer {
                         Err(_) => guard.indeterminate(),
                     }
                 });
-                if let Some(status) = initial_status {
-                    return status;
-                }
                 let _ = task.await;
                 remote
                     .status(
@@ -1481,22 +1367,6 @@ impl WorkcellServer {
             return cancelled_outcome(None, false);
         }
         let failure_policy = FailureEffectPolicy::for_operation(&operation);
-        if operation.is_detached() {
-            let result = self
-                .execute_prepared_operation(operation, cancellation, progress)
-                .await;
-            let side_effects_possible = failure_policy.side_effects_possible(self, &result);
-            return if result_error_code(&result) == Some(CANCELLED_CODE) {
-                cancelled_outcome(
-                    result
-                        .ok()
-                        .and_then(|result| neutral_tool_result(result).ok()),
-                    side_effects_possible,
-                )
-            } else {
-                execution_outcome(result, side_effects_possible)
-            };
-        }
         let execution = self.execute_prepared_operation(operation, cancellation.clone(), progress);
         tokio::pin!(execution);
         tokio::select! {
@@ -2115,44 +1985,34 @@ impl WorkcellServer {
                     Err(error) => scm_mutation_error_result(error),
                 }
             }
-            PreparedRemoteOperation::SnapshotCapture(prepared) => {
-                let sink = Arc::new(CaptureProgressSink {
-                    remote: progress.and_then(|progress| progress.remote),
-                    sequence: AtomicU64::new(1),
-                });
+            PreparedRemoteOperation::ChangesRevert(prepared) => {
+                let completed = match prepared.direction() {
+                    RevertDirection::Revert => "Workspace revert completed",
+                    RevertDirection::Unrevert => "Workspace unrevert completed",
+                };
                 match self
                     .snapshots
                     .as_ref()
                     .ok_or_else(remote_invalid)?
-                    .execute_capture(&prepared, &cancellation, Some(sink))
+                    .execute_revert(&prepared, &cancellation)
                     .await
                 {
-                    Ok(output) => typed_tool_result(&output, "Snapshot capture completed".into()),
+                    Ok(output) => typed_tool_result(&output, completed.into()),
                     Err(error) => snapshot_error_result(error),
                 }
             }
-            PreparedRemoteOperation::SnapshotRestore(prepared)
-            | PreparedRemoteOperation::SnapshotUnrevert(prepared) => {
+            PreparedRemoteOperation::ChangesCleanup(prepared) => {
                 match self
                     .snapshots
                     .as_ref()
                     .ok_or_else(remote_invalid)?
-                    .execute_restore(&prepared, &cancellation)
-                    .await
-                {
-                    Ok(output) => typed_tool_result(&output, "Workspace restore completed".into()),
-                    Err(error) => snapshot_error_result(error),
-                }
-            }
-            PreparedRemoteOperation::SnapshotCleanup(prepared) => {
-                match self
-                    .snapshots
-                    .as_ref()
-                    .ok_or_else(remote_invalid)?
+                    .store()
                     .execute_cleanup(&prepared, &cancellation)
                     .await
                 {
-                    Ok(output) => typed_tool_result(&output, "Snapshot cleanup completed".into()),
+                    Ok(output) => {
+                        typed_tool_result(&output, "Workspace change cleanup completed".into())
+                    }
                     Err(error) => snapshot_error_result(error),
                 }
             }
@@ -2375,15 +2235,20 @@ impl ServerHandler for WorkcellServer {
                     | SCM_DIFF_METHOD
                     | SCM_READ_SIDE_METHOD
                     | SCM_PREPARE_MUTATION_METHOD
-                    | SNAPSHOT_CAPTURE_METHOD
-                    | SNAPSHOT_PREPARE_CAPTURE_METHOD
-                    | SNAPSHOT_CHECKPOINT_METHOD
-                    | SNAPSHOT_INSPECT_METHOD
-                    | SNAPSHOT_STATUS_METHOD
-                    | SNAPSHOT_PREPARE_RESTORE_METHOD
-                    | SNAPSHOT_PREPARE_UNREVERT_METHOD
-                    | SNAPSHOT_ACKNOWLEDGE_METHOD
-                    | SNAPSHOT_PREPARE_CLEANUP_METHOD
+                    | CHANGES_BEGIN_RECORD_METHOD
+                    | CHANGES_FINISH_RECORD_METHOD
+                    | CHANGES_ABANDON_RECORD_METHOD
+                    | CHANGES_OPEN_RECORDS_METHOD
+                    | CHANGES_ABANDON_OPEN_RECORDS_METHOD
+                    | CHANGES_RECORDS_METHOD
+                    | CHANGES_HOLDERS_METHOD
+                    | CHANGES_HOLD_METHOD
+                    | CHANGES_RELEASE_METHOD
+                    | CHANGES_PREPARE_REVERT_METHOD
+                    | CHANGES_PREPARE_UNREVERT_METHOD
+                    | CHANGES_ACKNOWLEDGE_METHOD
+                    | CHANGES_STATUS_METHOD
+                    | CHANGES_PREPARE_CLEANUP_METHOD
             )
         {
             return Err(ErrorData::new(
@@ -2660,106 +2525,156 @@ impl ServerHandler for WorkcellServer {
                         .await?,
                 )
             }
-            SNAPSHOT_PREPARE_CAPTURE_METHOD => {
-                let request = parse_custom::<SnapshotPrepareCaptureRequest>(params)?;
-                serde_json::to_value(self.prepare_snapshot_capture(remote, request).await?)
-            }
-            SNAPSHOT_CHECKPOINT_METHOD => {
-                let request = parse_custom::<SnapshotCheckpointRequest>(params)?;
-                remote
-                    .validate_workspace_host(&request.binding.host)
-                    .map_err(remote_error)?;
-                let scope = self.snapshot_scope(&request.binding).await?;
-                serde_json::to_value(
-                    self.snapshots
-                        .as_ref()
-                        .ok_or_else(method_not_found)?
-                        .checkpoint(&request.checkpoint_id, &scope)
+            CHANGES_BEGIN_RECORD_METHOD => {
+                let request = parse_custom::<ChangesBeginRecordRequest>(params)?;
+                let changes = self.changes(remote, &request.binding).await?;
+                serde_json::to_value(ChangesBeginRecordResponse {
+                    version: ContractVersion::V1,
+                    ticket: changes
+                        .begin_record(request.record, &context.ct)
                         .await
                         .map_err(snapshot_error)?,
-                )
+                })
             }
-            SNAPSHOT_CAPTURE_METHOD => {
-                let request = parse_custom::<SnapshotCaptureRequest>(params)?;
-                remote
-                    .validate_workspace_host(&request.binding.host)
-                    .map_err(remote_error)?;
-                let scope = self.snapshot_scope(&request.binding).await?;
-                serde_json::to_value(
-                    self.snapshots
-                        .as_ref()
-                        .ok_or_else(method_not_found)?
-                        .capture(&request.checkpoint_id, &scope, &request.limits, &context.ct)
+            CHANGES_FINISH_RECORD_METHOD => {
+                let request = parse_custom::<ChangesTicketRequest>(params)?;
+                let changes = self.changes(remote, &request.binding).await?;
+                serde_json::to_value(ChangesFinishRecordResponse {
+                    version: ContractVersion::V1,
+                    record: changes
+                        .finish_record(&request.ticket, &context.ct)
                         .await
                         .map_err(snapshot_error)?,
-                )
+                })
             }
-            SNAPSHOT_INSPECT_METHOD => {
-                let request = parse_custom::<SnapshotInspectRequest>(params)?;
-                remote
-                    .validate_workspace_host(&request.binding.host)
-                    .map_err(remote_error)?;
-                self.snapshot_scope(&request.binding).await?;
-                serde_json::to_value(
-                    self.snapshots
-                        .as_ref()
-                        .ok_or_else(method_not_found)?
-                        .inspect(
-                            &request.snapshot_id,
-                            request.page_size,
-                            request.cursor.as_ref(),
-                        )
+            CHANGES_ABANDON_RECORD_METHOD => {
+                let request = parse_custom::<ChangesTicketRequest>(params)?;
+                let changes = self.changes(remote, &request.binding).await?;
+                serde_json::to_value(ChangesAbandonRecordResponse {
+                    version: ContractVersion::V1,
+                    abandoned: changes
+                        .store()
+                        .abandon_record(&request.ticket)
                         .await
                         .map_err(snapshot_error)?,
-                )
+                })
             }
-            SNAPSHOT_STATUS_METHOD => {
-                let request = parse_custom::<SnapshotStatusRequest>(params)?;
-                remote
-                    .validate_workspace_host(&request.binding.host)
-                    .map_err(remote_error)?;
-                self.snapshot_scope(&request.binding).await?;
-                serde_json::to_value(
-                    self.snapshots
-                        .as_ref()
-                        .ok_or_else(method_not_found)?
-                        .status(&request.restore_id)
+            CHANGES_OPEN_RECORDS_METHOD => {
+                let request = parse_custom::<ChangesHolderRequest>(params)?;
+                let changes = self.changes(remote, &request.binding).await?;
+                serde_json::to_value(ChangesOpenRecordsResponse {
+                    version: ContractVersion::V1,
+                    records: changes
+                        .store()
+                        .open_records(&request.holder)
+                        .await
                         .map_err(snapshot_error)?,
-                )
+                })
             }
-            SNAPSHOT_PREPARE_RESTORE_METHOD => {
-                let request = parse_custom::<SnapshotPrepareRestoreRequest>(params)?;
+            CHANGES_ABANDON_OPEN_RECORDS_METHOD => {
+                let request = parse_custom::<ChangesHolderRequest>(params)?;
+                let changes = self.changes(remote, &request.binding).await?;
+                serde_json::to_value(ChangesAbandonOpenRecordsResponse {
+                    version: ContractVersion::V1,
+                    abandoned: changes
+                        .store()
+                        .abandon_open_records(&request.holder)
+                        .await
+                        .map_err(snapshot_error)?,
+                })
+            }
+            CHANGES_RECORDS_METHOD => {
+                let request = parse_custom::<ChangesRecordsRequest>(params)?;
+                let changes = self.changes(remote, &request.binding).await?;
+                serde_json::to_value(ChangesRecordsResponse {
+                    version: ContractVersion::V1,
+                    page: changes
+                        .store()
+                        .records(&request.holder, request.after_seq, request.page_size)
+                        .await
+                        .map_err(snapshot_error)?,
+                })
+            }
+            CHANGES_HOLDERS_METHOD => {
+                let request = parse_custom::<ChangesHoldersRequest>(params)?;
+                let changes = self.changes(remote, &request.binding).await?;
+                let (holders, next_after) = changes
+                    .store()
+                    .holders(request.after.as_ref(), request.page_size)
+                    .await
+                    .map_err(snapshot_error)?;
+                serde_json::to_value(ChangesHoldersResponse {
+                    version: ContractVersion::V1,
+                    holders,
+                    next_after,
+                })
+            }
+            CHANGES_HOLD_METHOD => {
+                let request = parse_custom::<ChangesHoldRequest>(params)?;
+                let changes = self.changes(remote, &request.binding).await?;
+                serde_json::to_value(ChangesHoldResponse {
+                    version: ContractVersion::V1,
+                    held: changes
+                        .store()
+                        .hold(&request.from, &request.to)
+                        .await
+                        .map_err(snapshot_error)?,
+                })
+            }
+            CHANGES_RELEASE_METHOD => {
+                let request = parse_custom::<ChangesReleaseRequest>(params)?;
+                let changes = self.changes(remote, &request.binding).await?;
+                serde_json::to_value(ChangesReleaseResponse {
+                    version: ContractVersion::V1,
+                    release: changes
+                        .store()
+                        .release(&request.holder, &request.selection)
+                        .await
+                        .map_err(snapshot_error)?,
+                })
+            }
+            CHANGES_PREPARE_REVERT_METHOD => {
+                let request = parse_custom::<ChangesPrepareRevertRequest>(params)?;
                 serde_json::to_value(
-                    self.prepare_snapshot_restore(remote, request, &context.ct)
+                    self.prepare_changes_revert(remote, request, &context.ct)
                         .await?,
                 )
             }
-            SNAPSHOT_PREPARE_UNREVERT_METHOD => {
-                let request = parse_custom::<SnapshotPrepareUnrevertRequest>(params)?;
+            CHANGES_PREPARE_UNREVERT_METHOD => {
+                let request = parse_custom::<ChangesHolderRequest>(params)?;
                 serde_json::to_value(
-                    self.prepare_snapshot_unrevert(remote, request, &context.ct)
+                    self.prepare_changes_unrevert(remote, request, &context.ct)
                         .await?,
                 )
             }
-            SNAPSHOT_ACKNOWLEDGE_METHOD => {
-                let request = parse_custom::<SnapshotAcknowledgeRequest>(params)?;
-                remote
-                    .validate_workspace_host(&request.binding.host)
-                    .map_err(remote_error)?;
-                self.snapshot_scope(&request.binding).await?;
-                serde_json::to_value(
-                    self.snapshots
-                        .as_ref()
-                        .ok_or_else(method_not_found)?
-                        .acknowledge(&request.restore_id)
+            CHANGES_ACKNOWLEDGE_METHOD => {
+                let request = parse_custom::<ChangesHolderRequest>(params)?;
+                let changes = self.changes(remote, &request.binding).await?;
+                serde_json::to_value(ChangesStatusResponse {
+                    version: ContractVersion::V1,
+                    status: changes
+                        .store()
+                        .acknowledge(&request.holder)
                         .await
                         .map_err(snapshot_error)?,
-                )
+                })
             }
-            SNAPSHOT_PREPARE_CLEANUP_METHOD => {
-                let request = parse_custom::<SnapshotPrepareCleanupRequest>(params)?;
+            CHANGES_STATUS_METHOD => {
+                let request = parse_custom::<ChangesHolderRequest>(params)?;
+                let changes = self.changes(remote, &request.binding).await?;
+                serde_json::to_value(ChangesStatusResponse {
+                    version: ContractVersion::V1,
+                    status: changes
+                        .store()
+                        .status(&request.holder)
+                        .await
+                        .map_err(snapshot_error)?,
+                })
+            }
+            CHANGES_PREPARE_CLEANUP_METHOD => {
+                let request = parse_custom::<ChangesPrepareCleanupRequest>(params)?;
                 serde_json::to_value(
-                    self.prepare_snapshot_cleanup(remote, request, &context.ct)
+                    self.prepare_changes_cleanup(remote, request, &context.ct)
                         .await?,
                 )
             }
@@ -2784,9 +2699,8 @@ enum FailureEffectPolicy {
     Shell,
     WorkspaceMutation,
     ScmMutation,
-    SnapshotCapture,
-    SnapshotRestore,
-    SnapshotCleanup,
+    ChangesRevert,
+    ChangesCleanup,
     #[cfg(unix)]
     TransferPublication,
 }
@@ -2803,10 +2717,8 @@ impl FailureEffectPolicy {
             PreparedRemoteOperation::Shell(_) => Self::Shell,
             PreparedRemoteOperation::WorkspaceMutation(_) => Self::WorkspaceMutation,
             PreparedRemoteOperation::ScmMutation(_) => Self::ScmMutation,
-            PreparedRemoteOperation::SnapshotCapture(_) => Self::SnapshotCapture,
-            PreparedRemoteOperation::SnapshotRestore(_)
-            | PreparedRemoteOperation::SnapshotUnrevert(_) => Self::SnapshotRestore,
-            PreparedRemoteOperation::SnapshotCleanup(_) => Self::SnapshotCleanup,
+            PreparedRemoteOperation::ChangesRevert(_) => Self::ChangesRevert,
+            PreparedRemoteOperation::ChangesCleanup(_) => Self::ChangesCleanup,
             _ => Self::None,
         }
     }
@@ -2838,12 +2750,8 @@ impl FailureEffectPolicy {
                     Some("cancelled" | "timed_out" | "operation_failed") | None
                 )
             }),
-            Self::SnapshotRestore => true,
-            Self::SnapshotCapture => matches!(
-                error_code,
-                Some("rollback_failed" | "operation_failed") | None
-            ),
-            Self::SnapshotCleanup => {
+            Self::ChangesRevert => true,
+            Self::ChangesCleanup => {
                 matches!(error_code, Some("cancelled" | "operation_failed") | None)
             }
         }
@@ -2919,35 +2827,6 @@ struct RemoteProgressContext {
 struct CombinedShellProgressSink {
     mcp: Option<Arc<dyn ShellProgressSink>>,
     remote: Option<RemoteProgressContext>,
-}
-
-struct CaptureProgressSink {
-    remote: Option<RemoteProgressContext>,
-    sequence: AtomicU64,
-}
-
-impl SnapshotCaptureProgressSink for CaptureProgressSink {
-    fn publish(&self, progress: SnapshotCaptureProgress) {
-        tracing::info!(
-            phase = ?progress.phase,
-            entries = progress.entries,
-            files = progress.files,
-            bytes = progress.bytes,
-            elapsed_ms = progress.elapsed_ms,
-            "snapshot capture progress"
-        );
-        if let Some(remote) = &self.remote
-            && let Ok(message) = serde_json::to_string(&progress)
-        {
-            remote.state.capture_progress(
-                &remote.preparation_id,
-                &remote.invocation_id,
-                self.sequence.fetch_add(1, Ordering::Relaxed),
-                SNAPSHOT_PROGRESS_KIND,
-                message,
-            );
-        }
-    }
 }
 
 struct CombinedGraphProgressSink {
@@ -3250,16 +3129,57 @@ fn operation_file_intents(
     }
 }
 
-/// Discloses what a restore may touch: entries beneath `scope`, one intent per kind of effect its
-/// complete counts include, then its own journal, the journal an unrevert settles, and the settled
-/// journals it may reclaim to make room.
-fn snapshot_restore_intents(
-    scope: &str,
-    preview: &SnapshotRestorePreview,
-    unrevert_of: Option<&str>,
+/// Registers a prepared revert or unrevert under the contract its direction names.
+fn register_revert(
+    remote: &RemoteHostState,
+    reservation: PreparationReservation,
+    host: HostBinding,
+    encoded: &Value,
+    prepared: PreparedRevert,
+    preview: RevertPreview,
+) -> Result<ChangesPrepareRevertResponse, ErrorData> {
+    let contract = match prepared.direction() {
+        RevertDirection::Revert => CHANGES_REVERT_CONTRACT_ID,
+        RevertDirection::Unrevert => CHANGES_UNREVERT_CONTRACT_ID,
+    };
+    let resources = revert_intents(
+        &preview.counts,
+        prepared.paths().map(WorkspacePath::as_str),
+        prepared.holder(),
+    )?;
+    let operation = remote
+        .prepare_reserved(
+            reservation,
+            PreparedRemoteOperation::ChangesRevert(prepared),
+            OperationBinding {
+                host,
+                contract: fixed_contract(contract)?,
+                argument_digest: argument_digest(encoded)?,
+            },
+            OperationIntent {
+                kind: OperationKind::Mutate,
+                mutating: true,
+                resources,
+            },
+        )
+        .map_err(remote_error)?;
+    Ok(ChangesPrepareRevertResponse {
+        version: ContractVersion::V1,
+        operation,
+        preview,
+    })
+}
+
+/// Discloses what a revert may touch: one intent per kind of effect its complete counts include,
+/// on the deepest path holding every one of `paths`, then the holder's stack of pending reverts,
+/// which a revert extends and an unrevert settles.
+fn revert_intents<'a>(
+    counts: &RevertCounts,
+    paths: impl Iterator<Item = &'a str>,
+    holder: &str,
 ) -> Result<Vec<ResourceIntent>, ErrorData> {
-    let counts = &preview.counts;
     let writes = counts.create > 0 || counts.replace > 0 || counts.created_directories > 0;
+    let scope = common_scope(paths);
     let mut resources = Vec::new();
     for access in [
         writes.then_some(ResourceAccess::Write),
@@ -3278,17 +3198,29 @@ fn snapshot_restore_intents(
             revision: None,
         });
     }
-    for restore_id in std::iter::once(preview.restore_id.as_str()).chain(unrevert_of) {
-        resources.push(resource_intent(
-            &format!("{SNAPSHOT_JOURNAL_RESOURCE_PREFIX}{restore_id}"),
-            ResourceAccess::Write,
-        )?);
-    }
     resources.push(resource_intent(
-        SNAPSHOT_SETTLED_JOURNALS_RESOURCE,
-        ResourceAccess::Delete,
+        &format!("{CHANGES_HOLDER_RESOURCE_PREFIX}{holder}"),
+        ResourceAccess::Write,
     )?);
     Ok(resources)
+}
+
+/// The deepest root-relative path that is or holds every one of `paths`, `.` when they share none.
+fn common_scope<'a>(mut paths: impl Iterator<Item = &'a str>) -> &'a str {
+    let Some(first) = paths.next() else {
+        return ".";
+    };
+    let common = paths.fold(first, |common, path| {
+        let (components, bytes) = common
+            .split('/')
+            .zip(path.split('/'))
+            .take_while(|(left, right)| left == right)
+            .fold((0_usize, 0_usize), |(components, bytes), (component, _)| {
+                (components + 1, bytes + component.len())
+            });
+        &common[..bytes + components.saturating_sub(1)]
+    });
+    if common.is_empty() { "." } else { common }
 }
 
 fn resource_intent(scope: &str, access: ResourceAccess) -> Result<ResourceIntent, ErrorData> {
@@ -3712,12 +3644,14 @@ fn year_from_unix_days(days: i64) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, task::Poll, time::Duration};
+    use std::path::PathBuf;
 
     use tempfile::TempDir;
+    use test_case::test_case;
     use workcell_host_contract::{
-        ExecuteRequest, OperationState, SnapshotCaptureLimits, SnapshotCaptureResponse,
-        SnapshotChangeCounts, SnapshotLimit,
+        ExecuteRequest, MAX_SNAPSHOT_FILE_BYTES, MAX_SNAPSHOT_FILES, MAX_SNAPSHOT_TOTAL_BYTES,
+        OperationState, RecordClientMetadata, RecordHolder, RecordLimits, RecordRequest,
+        RecordScope, RevertCounts, SnapshotLimit,
     };
     use workcell_mcp_code::{WORKER_FILE_NAME, WorkerSource};
     use workcell_mcp_files::{
@@ -3734,7 +3668,18 @@ mod tests {
     const OPERATION_FAILED_CODE: &str = "operation_failed";
     const WEB_REQUEST_DENIED_CODE: &str = "web_request_denied";
     const SHELL_PREPARATION_FAILED_CODE: &str = "shell_preparation_failed";
-    const CAPTURE_TEST_TIMEOUT: Duration = Duration::from_secs(10);
+    #[cfg(unix)]
+    const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+    #[cfg(unix)]
+    const CHANGED_FILE: &str = "changed.txt";
+    #[cfg(unix)]
+    const BEFORE_CHANGE: &str = "before\n";
+    #[cfg(unix)]
+    const AFTER_CHANGE: &str = "after\n";
+    const CHANGES_HOLDER: &str = "session_one";
+    const INTENT_SCOPE: &str = "one/two";
+    const SCOPED_FILE: &str = "one/two/file";
+    const SIBLING_FILE: &str = "one/two/other";
 
     #[test]
     fn watch_refusals_serialize_safe_diagnostics_and_keep_the_stable_error_code() {
@@ -3803,214 +3748,13 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn capture_execute_returns_running_before_admission_and_only_operation_cancel_stops_it() {
+    async fn changes_test_server(root: &Path, storage: &Path) -> WorkcellServer {
         use std::os::unix::fs::PermissionsExt;
-
-        for explicit_cancel in [false, true] {
-            let root = tempfile::tempdir().unwrap();
-            let storage = tempfile::tempdir().unwrap();
-            std::fs::set_permissions(storage.path(), std::fs::Permissions::from_mode(0o700))
-                .unwrap();
-            tokio::fs::write(root.path().join("file.txt"), "original")
-                .await
-                .unwrap();
-            let server = WorkcellServer::configured(
-                Some(root.path()),
-                &[ToolGroup::Files],
-                ServerBehavior::default(),
-                ToolConfiguration {
-                    allow_write: true,
-                    snapshot_root: Some(storage.path()),
-                    ..test_tools()
-                },
-            )
-            .await
-            .unwrap()
-            .with_remote_host(remote_configuration())
-            .await
-            .unwrap();
-            let remote = server.remote_host.as_ref().unwrap();
-            let workspace = server
-                .workspace_files
-                .as_ref()
-                .unwrap()
-                .workspace_snapshot_access();
-            let admission = workspace.capture_guard().await;
-            let request = SnapshotPrepareCaptureRequest {
-                version: ContractVersion::V1,
-                binding: WorkspaceRequestBinding {
-                    host: remote.binding.clone(),
-                    cwd_handle: remote.binding.cwd_handle.clone(),
-                },
-                checkpoint_id: Identifier::new("capture-operation").unwrap(),
-                limits: SnapshotCaptureLimits {
-                    max_files: 10,
-                    max_file_bytes: 1024,
-                    max_total_bytes: 4096,
-                },
-            };
-            let prepared = server
-                .prepare_snapshot_capture(remote, request.clone())
-                .await
-                .unwrap();
-            assert_eq!(
-                prepared.binding.contract,
-                fixed_contract(SNAPSHOT_CAPTURE_CONTRACT_ID).unwrap()
-            );
-            let disclosed = prepared
-                .intent
-                .resources
-                .iter()
-                .map(|resource| (resource.display.as_str(), resource.access.clone()))
-                .collect::<Vec<_>>();
-            assert_eq!(
-                disclosed,
-                [
-                    ("file:.", ResourceAccess::Read),
-                    (SNAPSHOT_CAPTURE_RESOURCE, ResourceAccess::Read),
-                    (SNAPSHOT_CAPTURE_RESOURCE, ResourceAccess::Write),
-                    (SNAPSHOT_CAPTURE_RESOURCE, ResourceAccess::Delete),
-                ]
-            );
-            let execute = ExecuteRequest {
-                version: ContractVersion::V1,
-                preparation_id: prepared.preparation_id,
-                invocation_id: Identifier::new("capture-invocation").unwrap(),
-                host: remote.binding.clone(),
-            };
-            let request_token = CancellationToken::new();
-            let mut pending = Box::pin(server.execute_remote(
-                remote,
-                execute.clone(),
-                request_token.clone(),
-                None,
-            ));
-            let running = std::future::poll_fn(|cx| match pending.as_mut().poll(cx) {
-                Poll::Ready(result) => Poll::Ready(result.unwrap()),
-                Poll::Pending => panic!("capture execute waited for admission"),
-            })
-            .await;
-            assert_eq!(running.state, OperationState::Running);
-            drop(pending);
-            request_token.cancel();
-            drop(request_token);
-            let status = || {
-                remote
-                    .status(
-                        &execute.preparation_id,
-                        Some(&execute.invocation_id),
-                        &execute.host,
-                    )
-                    .unwrap()
-            };
-            tokio::time::timeout(CAPTURE_TEST_TIMEOUT, async {
-                loop {
-                    let current = status();
-                    assert_eq!(current.state, OperationState::Running);
-                    if !current.progress.is_empty() {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
-            assert_eq!(
-                server
-                    .execute_remote(remote, execute.clone(), CancellationToken::new(), None)
-                    .await
-                    .unwrap()
-                    .state,
-                OperationState::Running
-            );
-            assert!(
-                remote
-                    .release(
-                        &execute.preparation_id,
-                        Some(&execute.invocation_id),
-                        &execute.host
-                    )
-                    .is_err()
-            );
-            if explicit_cancel {
-                let cancellation = remote
-                    .cancel(&CancelRequest {
-                        version: ContractVersion::V1,
-                        preparation_id: execute.preparation_id.clone(),
-                        invocation_id: execute.invocation_id.clone(),
-                        host: execute.host.clone(),
-                    })
-                    .unwrap();
-                assert!(cancellation.cancellation_requested);
-                assert_eq!(cancellation.state, OperationState::Running);
-            }
-            drop(admission);
-            let terminal = tokio::time::timeout(CAPTURE_TEST_TIMEOUT, async {
-                loop {
-                    let current = status();
-                    if current.state != OperationState::Running {
-                        break current;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
-            assert_eq!(
-                terminal.state,
-                if explicit_cancel {
-                    OperationState::Cancelled
-                } else {
-                    OperationState::Completed
-                }
-            );
-            assert!(!terminal.outcome.as_ref().unwrap().side_effects_possible);
-            let lookup = server
-                .snapshots
-                .as_ref()
-                .unwrap()
-                .checkpoint(&request.checkpoint_id, &WorkspacePath::new(".").unwrap())
-                .await;
-            if explicit_cancel {
-                assert_eq!(lookup.unwrap_err(), SnapshotError::NotFound);
-            } else {
-                let capture: SnapshotCaptureResponse = serde_json::from_value(
-                    terminal
-                        .outcome
-                        .as_ref()
-                        .unwrap()
-                        .result
-                        .as_ref()
-                        .unwrap()
-                        .structured_content
-                        .clone()
-                        .unwrap(),
-                )
-                .unwrap();
-                assert_eq!(lookup.unwrap().snapshot, capture.snapshot);
-                tokio::fs::write(root.path().join("file.txt"), "changed")
-                    .await
-                    .unwrap();
-                let replay = server
-                    .execute_remote(remote, execute.clone(), CancellationToken::new(), None)
-                    .await
-                    .unwrap();
-                assert_eq!(replay, terminal);
-                assert!(
-                    terminal
-                        .progress
-                        .iter()
-                        .all(|event| event.kind.as_str() == SNAPSHOT_PROGRESS_KIND)
-                );
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    async fn snapshot_test_server(root: &Path, storage: &Path) -> WorkcellServer {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(storage, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            storage,
+            std::fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE),
+        )
+        .unwrap();
         WorkcellServer::configured(
             Some(root),
             &[ToolGroup::Files],
@@ -4029,222 +3773,135 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn snapshot_test_request(remote: &RemoteHostState) -> SnapshotPrepareCaptureRequest {
-        SnapshotPrepareCaptureRequest {
-            version: ContractVersion::V1,
-            binding: WorkspaceRequestBinding {
-                host: remote.binding.clone(),
-                cwd_handle: remote.binding.cwd_handle.clone(),
-            },
-            checkpoint_id: Identifier::new("owned-capture").unwrap(),
-            limits: SnapshotCaptureLimits {
-                max_files: workcell_host_contract::MAX_SNAPSHOT_FILES as u32,
-                max_file_bytes: workcell_host_contract::MAX_SNAPSHOT_FILE_BYTES,
-                max_total_bytes: workcell_host_contract::MAX_SNAPSHOT_TOTAL_BYTES,
-            },
-        }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_prepared_remote_capture_keeps_the_cwd_handle_identity_until_descriptor_validation() {
-        use workcell_host_contract::DirectoryNavigation;
-        let root = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        std::fs::create_dir(root.path().join("sub")).unwrap();
-        let server = snapshot_test_server(root.path(), storage.path()).await;
+    async fn execute_changes(
+        server: &WorkcellServer,
+        preparation_id: Identifier,
+        invocation: &str,
+    ) -> workcell_host_contract::StatusResponse {
         let remote = server.remote_host.as_ref().unwrap();
-        let directory = server
-            .workspace_files
-            .as_ref()
-            .unwrap()
-            .workspace_resolve_directory(
-                &remote.binding.cwd_handle,
-                &DirectoryNavigation::new("sub").unwrap(),
-            )
-            .await
-            .unwrap();
-        let mut request = snapshot_test_request(remote);
-        request.binding.cwd_handle = directory.handle;
-        let prepared = server
-            .prepare_snapshot_capture(remote, request)
-            .await
-            .unwrap();
-        std::fs::rename(root.path().join("sub"), root.path().join("moved")).unwrap();
-        std::fs::create_dir(root.path().join("sub")).unwrap();
-        std::fs::write(root.path().join("sub/replacement.txt"), "replacement").unwrap();
-        let execute = ExecuteRequest {
-            version: ContractVersion::V1,
-            preparation_id: prepared.preparation_id,
-            invocation_id: Identifier::new("stale-cwd").unwrap(),
-            host: remote.binding.clone(),
-        };
-        let BeginExecution::Start {
-            operation,
-            cancellation,
-            lease,
-        } = remote.begin(&execute, CancellationToken::new()).unwrap()
-        else {
-            panic!("expected start")
-        };
-        let _lease = lease;
-        let result = server
-            .execute_prepared_operation(*operation, cancellation, None)
-            .await;
-        assert_eq!(
-            result_error_code(&result),
-            Some(SnapshotError::Conflict.code())
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn http_shutdown_cancels_and_drains_capture_workers_before_reporting_completion() {
-        use crate::{
-            cli::HttpBindMode,
-            transports::http::{
-                HttpAuthentication, HttpConfiguration, HttpServer, ShutdownOutcome,
-            },
-        };
-        use std::sync::{Mutex, mpsc};
-        use tokio::sync::Notify;
-        use workcell_workspace_snapshot::SnapshotCapturePhase;
-
-        struct Barrier {
-            entered: Notify,
-            release: Mutex<mpsc::Receiver<()>>,
-        }
-        impl SnapshotCaptureProgressSink for Barrier {
-            fn publish(&self, progress: SnapshotCaptureProgress) {
-                if progress.phase == SnapshotCapturePhase::Publishing {
-                    self.entered.notify_one();
-                    self.release
-                        .lock()
-                        .unwrap()
-                        .recv_timeout(CAPTURE_TEST_TIMEOUT)
-                        .unwrap();
-                }
-            }
-        }
-        let root = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("file.txt"), "owned").unwrap();
-        let server = snapshot_test_server(root.path(), storage.path()).await;
-        let remote = server.remote_host.as_ref().unwrap();
-        let request = snapshot_test_request(remote);
-        let prepared = server
-            .prepare_snapshot_capture(remote, request.clone())
-            .await
-            .unwrap();
-        let execute = ExecuteRequest {
-            version: ContractVersion::V1,
-            preparation_id: prepared.preparation_id,
-            invocation_id: Identifier::new("shutdown-capture").unwrap(),
-            host: remote.binding.clone(),
-        };
-        let BeginExecution::Start {
-            operation,
-            cancellation,
-            lease,
-        } = remote.begin(&execute, CancellationToken::new()).unwrap()
-        else {
-            panic!("expected start")
-        };
-        let PreparedRemoteOperation::SnapshotCapture(capture) = *operation else {
-            panic!("expected capture")
-        };
-        let http = HttpServer::start(
-            server.clone(),
-            0,
-            HttpConfiguration {
-                bind_mode: HttpBindMode::Loopback,
-                allowed_hosts: vec!["127.0.0.1".into()],
-                authentication: Some(
-                    HttpAuthentication::new("capture-shutdown-test-authentication-token").unwrap(),
-                ),
-                remote_host: None,
-            },
-        )
-        .await
-        .unwrap();
-        let (release, receiver) = mpsc::channel();
-        let barrier = Arc::new(Barrier {
-            entered: Notify::new(),
-            release: Mutex::new(receiver),
-        });
-        let worker_barrier = barrier.clone();
-        let manager = server.snapshots.as_ref().unwrap().clone();
-        let worker_token = cancellation.clone();
-        let guard = RemoteExecutionGuard::new(
-            remote.clone(),
-            execute.preparation_id.clone(),
-            execute.invocation_id.clone(),
-            lease,
-        );
-        let worker = tokio::spawn(async move {
-            let result = manager
-                .execute_capture(&capture, &worker_token, Some(worker_barrier))
-                .await;
-            assert_eq!(result.unwrap_err(), SnapshotError::Cancelled);
-            guard.finish(cancelled_outcome(None, false));
-        });
-        barrier.entered.notified().await;
-        let mut shutdown = Box::pin(http.shutdown());
-        std::future::poll_fn(|cx| {
-            assert!(shutdown.as_mut().poll(cx).is_pending());
-            Poll::Ready(())
-        })
-        .await;
-        assert!(cancellation.is_cancelled());
-        assert!(!worker.is_finished());
-        let mut draining = Box::pin(server.shutdown());
-        std::future::poll_fn(|cx| {
-            assert!(draining.as_mut().poll(cx).is_pending());
-            Poll::Ready(())
-        })
-        .await;
-        assert_eq!(
-            remote
-                .status(
-                    &execute.preparation_id,
-                    Some(&execute.invocation_id),
-                    &execute.host
-                )
-                .unwrap()
-                .state,
-            OperationState::Running
-        );
-        let another = server
-            .prepare_snapshot_capture(remote, request.clone())
-            .await
-            .unwrap();
-        let rejected = remote
-            .begin(
-                &ExecuteRequest {
-                    preparation_id: another.preparation_id,
-                    ..execute.clone()
+        server
+            .execute_remote(
+                remote,
+                ExecuteRequest {
+                    version: ContractVersion::V1,
+                    preparation_id,
+                    invocation_id: Identifier::new(invocation).unwrap(),
+                    host: remote.binding.clone(),
                 },
                 CancellationToken::new(),
+                None,
             )
-            .unwrap_err();
+            .await
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_revert_and_its_unrevert_run_through_the_operation_ledger_under_their_own_contracts()
+    {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let file = root.path().join(CHANGED_FILE);
+        std::fs::write(&file, BEFORE_CHANGE).unwrap();
+        let server = changes_test_server(root.path(), storage.path()).await;
+        let remote = server.remote_host.as_ref().unwrap();
+        let changes = server.snapshots.as_ref().unwrap();
+        let holder = RecordHolder::new(CHANGES_HOLDER).unwrap();
+        let ticket = changes
+            .begin_record(
+                RecordRequest {
+                    scope: RecordScope::Paths {
+                        paths: vec![WorkspacePath::new(CHANGED_FILE).unwrap()],
+                    },
+                    holder: holder.clone(),
+                    client: RecordClientMetadata::new(json!({})).unwrap(),
+                    limits: RecordLimits {
+                        max_files: u32::try_from(MAX_SNAPSHOT_FILES).unwrap(),
+                        max_file_bytes: MAX_SNAPSHOT_FILE_BYTES,
+                        max_total_bytes: MAX_SNAPSHOT_TOTAL_BYTES,
+                    },
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        std::fs::write(&file, AFTER_CHANGE).unwrap();
+        let seq = changes
+            .finish_record(&ticket, &CancellationToken::new())
+            .await
+            .unwrap()
+            .unwrap()
+            .seq;
+        let binding = WorkspaceRequestBinding {
+            host: remote.binding.clone(),
+            cwd_handle: remote.binding.cwd_handle.clone(),
+        };
+
+        let revert = server
+            .prepare_changes_revert(
+                remote,
+                ChangesPrepareRevertRequest {
+                    version: ContractVersion::V1,
+                    binding: binding.clone(),
+                    holder: holder.clone(),
+                    seqs: vec![seq],
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let reverted = execute_changes(&server, revert.operation.preparation_id, "revert").await;
+        let unrevert = server
+            .prepare_changes_unrevert(
+                remote,
+                ChangesHolderRequest {
+                    version: ContractVersion::V1,
+                    binding,
+                    holder,
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let reverted_content = std::fs::read_to_string(&file).unwrap();
+        let unreverted =
+            execute_changes(&server, unrevert.operation.preparation_id, "unrevert").await;
+
         assert_eq!(
-            rejected,
-            crate::remote_host::RemoteOperationError::Cancelled
+            [
+                &revert.operation.binding.contract,
+                &unrevert.operation.binding.contract
+            ],
+            [
+                &fixed_contract(CHANGES_REVERT_CONTRACT_ID).unwrap(),
+                &fixed_contract(CHANGES_UNREVERT_CONTRACT_ID).unwrap()
+            ]
         );
-        release.send(()).unwrap();
-        assert_eq!(shutdown.await, ShutdownOutcome::Completed);
-        draining.await;
-        worker.await.unwrap();
         assert_eq!(
-            server
-                .snapshots
-                .as_ref()
-                .unwrap()
-                .checkpoint(&request.checkpoint_id, &WorkspacePath::new(".").unwrap())
-                .await
-                .unwrap_err(),
-            SnapshotError::NotFound
+            revert
+                .operation
+                .intent
+                .resources
+                .iter()
+                .map(|resource| (resource.display.as_str(), resource.access.clone()))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    format!("file:{CHANGED_FILE}").as_str(),
+                    ResourceAccess::Write
+                ),
+                (
+                    format!("{CHANGES_HOLDER_RESOURCE_PREFIX}{CHANGES_HOLDER}").as_str(),
+                    ResourceAccess::Write
+                ),
+            ]
         );
+        assert_eq!(
+            [reverted.state, unreverted.state],
+            [OperationState::Completed, OperationState::Completed]
+        );
+        assert_eq!(reverted_content, BEFORE_CHANGE);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), AFTER_CHANGE);
     }
 
     #[tokio::test]
@@ -4273,21 +3930,9 @@ mod tests {
                 false,
             ),
             (FailureEffectPolicy::ScmMutation, "operation_failed", true),
-            (FailureEffectPolicy::SnapshotRestore, "conflict", true),
-            (FailureEffectPolicy::SnapshotCleanup, "conflict", false),
-            (FailureEffectPolicy::SnapshotCleanup, "cancelled", true),
-            (FailureEffectPolicy::SnapshotCapture, "cancelled", false),
-            (FailureEffectPolicy::SnapshotCapture, "timed_out", false),
-            (
-                FailureEffectPolicy::SnapshotCapture,
-                "rollback_failed",
-                true,
-            ),
-            (
-                FailureEffectPolicy::SnapshotCapture,
-                "operation_failed",
-                true,
-            ),
+            (FailureEffectPolicy::ChangesRevert, "conflict", true),
+            (FailureEffectPolicy::ChangesCleanup, "conflict", false),
+            (FailureEffectPolicy::ChangesCleanup, "cancelled", true),
         ] {
             let result = operation_error_result(code, code).unwrap();
             assert_eq!(
@@ -4511,100 +4156,77 @@ mod tests {
         );
     }
 
-    #[test]
-    fn restore_intents_disclose_exactly_the_effects_the_complete_counts_include() {
-        const SCOPE: &str = "one/two";
-        const SUBTREE: &str = "file:one/two";
-        const RESTORE_ID: &str = "restore_intent";
-        const ORIGINAL_ID: &str = "restore_original";
-        let journal = format!("{SNAPSHOT_JOURNAL_RESOURCE_PREFIX}{RESTORE_ID}");
-        let original = format!("{SNAPSHOT_JOURNAL_RESOURCE_PREFIX}{ORIGINAL_ID}");
-        let settled = SNAPSHOT_SETTLED_JOURNALS_RESOURCE.to_owned();
-        let bookkeeping = [
-            (journal.clone(), ResourceAccess::Write),
-            (settled.clone(), ResourceAccess::Delete),
-        ];
-        let subtree = |access| (SUBTREE.to_owned(), access);
-        let cases = [
-            (SnapshotChangeCounts::default(), None, bookkeeping.to_vec()),
-            (
-                SnapshotChangeCounts {
-                    conflict: 1,
-                    unchanged: 1,
-                    ..SnapshotChangeCounts::default()
-                },
-                None,
-                bookkeeping.to_vec(),
-            ),
-            (
-                SnapshotChangeCounts {
-                    created_directories: 1,
-                    ..SnapshotChangeCounts::default()
-                },
-                None,
-                [vec![subtree(ResourceAccess::Write)], bookkeeping.to_vec()].concat(),
-            ),
-            (
-                SnapshotChangeCounts {
-                    create: 1,
-                    ..SnapshotChangeCounts::default()
-                },
-                None,
-                [vec![subtree(ResourceAccess::Write)], bookkeeping.to_vec()].concat(),
-            ),
-            (
-                SnapshotChangeCounts {
-                    delete: 1,
-                    ..SnapshotChangeCounts::default()
-                },
-                None,
-                [vec![subtree(ResourceAccess::Delete)], bookkeeping.to_vec()].concat(),
-            ),
-            (
-                SnapshotChangeCounts {
-                    replace: 1,
-                    delete: 1,
-                    ..SnapshotChangeCounts::default()
-                },
-                Some(ORIGINAL_ID),
-                vec![
-                    subtree(ResourceAccess::Write),
-                    subtree(ResourceAccess::Delete),
-                    (journal.clone(), ResourceAccess::Write),
-                    (original, ResourceAccess::Write),
-                    (settled, ResourceAccess::Delete),
-                ],
-            ),
-        ];
-        for (counts, unrevert_of, expected) in cases {
-            let preview = SnapshotRestorePreview {
-                restore_id: Identifier::new(RESTORE_ID).unwrap(),
-                target_snapshot_id: Identifier::new(format!("snap_{}", "0".repeat(64))).unwrap(),
-                source_snapshot_id: Identifier::new(format!("snap_{}", "1".repeat(64))).unwrap(),
-                counts: counts.clone(),
-                changes: Vec::new(),
-                created_directories: Vec::new(),
-            };
-            let intents = snapshot_restore_intents(SCOPE, &preview, unrevert_of).unwrap();
-            let disclosed = intents
+    #[test_case(RevertCounts::default(), &[] ; "no effect discloses only the holder stack")]
+    #[test_case(
+        RevertCounts { conflicts: 1, unchanged: 1, ..RevertCounts::default() },
+        &[] ;
+        "conflicts and unchanged paths disclose no effect"
+    )]
+    #[test_case(
+        RevertCounts { created_directories: 1, ..RevertCounts::default() },
+        &[ResourceAccess::Write] ;
+        "a created directory discloses a write"
+    )]
+    #[test_case(
+        RevertCounts { create: 1, ..RevertCounts::default() },
+        &[ResourceAccess::Write] ;
+        "a create discloses a write"
+    )]
+    #[test_case(
+        RevertCounts { delete: 1, ..RevertCounts::default() },
+        &[ResourceAccess::Delete] ;
+        "a delete discloses a delete"
+    )]
+    #[test_case(
+        RevertCounts { replace: 1, delete: 1, ..RevertCounts::default() },
+        &[ResourceAccess::Write, ResourceAccess::Delete] ;
+        "a replace and a delete disclose both"
+    )]
+    fn revert_intents_disclose_exactly_the_effects_the_complete_counts_include(
+        counts: RevertCounts,
+        effects: &[ResourceAccess],
+    ) {
+        let intents = revert_intents(
+            &counts,
+            [SCOPED_FILE, SIBLING_FILE].into_iter(),
+            CHANGES_HOLDER,
+        )
+        .unwrap();
+        let expected = effects
+            .iter()
+            .map(|access| (format!("file:{INTENT_SCOPE}"), access.clone()))
+            .chain([(
+                format!("{CHANGES_HOLDER_RESOURCE_PREFIX}{CHANGES_HOLDER}"),
+                ResourceAccess::Write,
+            )])
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            intents
                 .iter()
                 .map(|intent| (intent.display.as_str().to_owned(), intent.access.clone()))
-                .collect::<Vec<_>>();
-            assert_eq!(disclosed, expected, "{counts:?}");
-            for intent in intents
-                .iter()
-                .filter(|intent| intent.display.as_str() == SUBTREE)
-            {
-                assert_eq!(
-                    intent.resource_id,
-                    root_relative_resource_id(RootResourceKind::Path, SCOPE).unwrap()
-                );
-                assert_eq!(
-                    intent.scope,
-                    root_relative_resource_scope(RootResourceKind::Path, SCOPE).unwrap()
-                );
-            }
+                .collect::<Vec<_>>(),
+            expected
+        );
+        for intent in &intents[..effects.len()] {
+            assert_eq!(
+                (&intent.resource_id, &intent.scope),
+                (
+                    &root_relative_resource_id(RootResourceKind::Path, INTENT_SCOPE).unwrap(),
+                    &root_relative_resource_scope(RootResourceKind::Path, INTENT_SCOPE).unwrap()
+                )
+            );
         }
+    }
+
+    #[test_case(&[], "." ; "no path scopes the root")]
+    #[test_case(&[SCOPED_FILE], SCOPED_FILE ; "a single path is its own scope")]
+    #[test_case(&[SCOPED_FILE, SIBLING_FILE], INTENT_SCOPE ; "siblings share their parent")]
+    #[test_case(&[INTENT_SCOPE, SCOPED_FILE], INTENT_SCOPE ; "an ancestor holds its descendants")]
+    #[test_case(&["one/twofold", INTENT_SCOPE], "one" ; "a shared name prefix is no shared component")]
+    #[test_case(&["one/file", "two/file"], "." ; "disjoint trees share only the root")]
+    fn common_scope_is_the_deepest_path_holding_every_path(paths: &[&str], expected: &str) {
+        assert_eq!(common_scope(paths.iter().copied()), expected);
     }
 
     #[test]

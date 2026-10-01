@@ -5793,6 +5793,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "test-case",
 ]
 
 [[package]]
@@ -5812,6 +5813,7 @@ dependencies = [
  "sha2",
  "subtle",
  "tempfile",
+ "test-case",
  "thiserror",
  "tokio",
  "tokio-util",

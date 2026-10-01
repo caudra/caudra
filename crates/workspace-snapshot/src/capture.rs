@@ -1,45 +1,41 @@
-//! Capture: one descriptor-relative walk of the scope into the object store. A file the stat cache
-//! vouches for is not read again; any other is read until the stamps taken around the read agree.
-//! Every entry left out is counted and recorded, so a restore never touches it.
+//! Capture: the state of a record's scope, stored as a snapshot tree. A file the stat cache vouches
+//! for is not read again; any other is read until the stamps taken around the read agree. A path the
+//! capture sees but cannot store is blind: pruned from the tree and listed, so no diff ever mistakes
+//! it for an absent one.
 
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs::{File, Metadata},
-    io::{Read, Seek, SeekFrom},
+    io::{self, Read, Seek, SeekFrom},
     mem,
-    path::PathBuf,
-    sync::Arc,
-    time::{Duration, Instant, SystemTime},
 };
 
-use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 use workcell_host_contract::{
-    ContractVersion, DisplayText, MAX_SNAPSHOT_CAPTURE_ENTRIES, MAX_SNAPSHOT_CAPTURE_PATH_BYTES,
-    MAX_SNAPSHOT_COUNT, MAX_SNAPSHOT_FILE_BYTES, MAX_SNAPSHOT_FILES, MAX_SNAPSHOT_SKIPPED_SAMPLES,
-    MAX_SNAPSHOT_STORAGE_BYTES, MAX_SNAPSHOT_TOTAL_BYTES, SnapshotCaptureLimits,
-    SnapshotCaptureResponse, SnapshotLimit, SnapshotSkipReason,
+    MAX_SNAPSHOT_CAPTURE_ENTRIES, MAX_SNAPSHOT_CAPTURE_PATH_BYTES, MAX_SNAPSHOT_STORAGE_BYTES,
+    RecordLimits, RecordScope, SnapshotLimit, SnapshotSkipReason, UnrecordedReason,
 };
 use workcell_mcp_files::{
-    SnapshotTreeFile, SnapshotTreeLimits, SnapshotTreeLink, SnapshotTreeNode, SnapshotTreeStamp,
-    WorkspaceSnapshotScope,
+    SnapshotTreeError, SnapshotTreeFile, SnapshotTreeLimits, SnapshotTreeNode,
+    SnapshotTreeObserved, SnapshotTreeStamp, SnapshotTreeWalk,
 };
 use workcell_snapshot_store::{
-    Content, Entry, EntryKind, FileStamp, Meta, ObjectId, SkipReason, Skipped, SkippedPath,
-    StatCache, StoreError, blob_id,
+    Content, Entry, EntryKind, FileStamp, Meta, ObjectId, ROOT_SCOPE, Skipped, SkippedPath,
+    SnapshotId, StatCache, StoreError, blob_id,
 };
 
 use crate::{
-    CHECKPOINT_VERSION, Checkpoint, SnapshotError, SnapshotInner, StoredCheckpoint,
-    check_cancelled, limit_error, quota_error,
-    snapshot::{file_kind, skip_reason, snapshot_identifier, store_error, summary},
-    store::{CHECKPOINTS, MAX_METADATA_BYTES, TREE_ENTRY_OVERHEAD},
-    tree_error, unix_ms,
+    SnapshotError, Workspace, check_cancelled,
+    format::{Blind, Stamp},
+    limit_error, quota_error,
+    snapshot::{blind_skip, file_kind, store_error, walk_skip, workspace_path},
+    store::{MAX_METADATA_BYTES, Store, TREE_ENTRY_OVERHEAD},
+    tree_error,
 };
 
 const STABLE_READ_ATTEMPTS: usize = 3;
-const PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 /// Git's object header and zlib's fixed cost for one object, with room to spare.
 const OBJECT_OVERHEAD: u64 = 64;
 /// The wrapper tree naming the file tree and the metadata, and the metadata's own framing.
@@ -47,79 +43,22 @@ const WRAPPER_BYTES: u64 = 4 * OBJECT_OVERHEAD;
 /// A stat cache entry besides its path: git's index entry, padding included.
 const STAT_ENTRY_OVERHEAD: u64 = 72;
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum SnapshotCapturePhase {
-    Queued,
-    Scanning,
-    Persisting,
-    Publishing,
-    Rollback,
-    Finished,
+/// Whether a paths capture holds the whole tree as well as the paths it names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Widening {
+    /// A begin widens when a named path is one a call can write through to another path.
+    Decide,
+    /// A finish covers what its begin did.
+    Decided(bool),
 }
 
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SnapshotCaptureProgress {
-    pub phase: SnapshotCapturePhase,
-    pub entries: u64,
-    pub files: u64,
-    pub bytes: u64,
-    pub elapsed_ms: u64,
-}
-
-pub trait SnapshotCaptureProgressSink: Send + Sync {
-    fn publish(&self, progress: SnapshotCaptureProgress);
-}
-
-pub(crate) struct CaptureProgress {
-    sink: Option<Arc<dyn SnapshotCaptureProgressSink>>,
-    started: Instant,
-    emitted: Instant,
-    progress: SnapshotCaptureProgress,
-}
-
-impl CaptureProgress {
-    pub(crate) fn new(sink: Option<Arc<dyn SnapshotCaptureProgressSink>>) -> Self {
-        let now = Instant::now();
-        let mut progress = Self {
-            sink,
-            started: now,
-            emitted: now,
-            progress: SnapshotCaptureProgress {
-                phase: SnapshotCapturePhase::Queued,
-                entries: 0,
-                files: 0,
-                bytes: 0,
-                elapsed_ms: 0,
-            },
-        };
-        progress.emit(now);
-        progress
-    }
-
-    pub(crate) fn phase(&mut self, phase: SnapshotCapturePhase) {
-        self.progress.phase = phase;
-        self.emit(Instant::now());
-    }
-
-    fn entry(&mut self, files: usize, bytes: u64, now: Instant) {
-        self.progress.entries += 1;
-        self.progress.files = u64::try_from(files).unwrap_or(u64::MAX);
-        self.progress.bytes = bytes;
-        if now.duration_since(self.emitted) >= PROGRESS_INTERVAL {
-            self.emit(now);
-        }
-    }
-
-    fn emit(&mut self, now: Instant) {
-        self.emitted = now;
-        self.progress.elapsed_ms =
-            u64::try_from(now.duration_since(self.started).as_millis()).unwrap_or(u64::MAX);
-        if let Some(sink) = &self.sink {
-            sink.publish(self.progress.clone());
-        }
-    }
+/// A captured scope: its snapshot tree and the paths it could not store.
+pub(crate) struct Captured {
+    pub(crate) tree: SnapshotId,
+    pub(crate) blind: Vec<Blind>,
+    /// What the store may occupy now, an upper bound.
+    pub(crate) usage: u64,
+    pub(crate) widened: bool,
 }
 
 pub(crate) enum Stability {
@@ -134,138 +73,227 @@ pub(crate) enum Stability {
 }
 
 struct Capture<'a> {
-    inner: &'a SnapshotInner,
-    limits: &'a SnapshotCaptureLimits,
+    store: &'a Store,
+    workspace: &'a Workspace,
+    limits: &'a RecordLimits,
     token: &'a CancellationToken,
-    progress: &'a mut CaptureProgress,
-    cache: StatCache,
-    /// Storage bytes in use, counting everything this capture reserved.
+    may_widen: bool,
+    widened: bool,
+    cache: Option<StatCache>,
+    /// What the store may occupy, counting everything this capture reserved.
     usage: u64,
-    entries: Vec<Entry>,
+    measured: bool,
+    entries: BTreeMap<String, Content>,
+    blind: BTreeMap<String, Blind>,
     pruned: Vec<SkippedPath>,
-    skipped: Skipped,
+    seen: usize,
+    path_bytes: u64,
     total_bytes: u64,
-    largest_file_bytes: u64,
     /// What the trees naming the entries can occupy, as if no directory were shared.
     tree_bytes: u64,
-    /// What saving the stat cache can add to it.
+    /// What saving the stat cache can add to the store.
     cached_bytes: u64,
-    stored_checkpoint: Option<PathBuf>,
 }
 
-impl SnapshotInner {
-    /// Captures `scope` as `checkpoint_id`. An existing checkpoint is returned as it was captured.
-    pub(crate) fn capture(
-        &self,
-        checkpoint_id: &str,
-        scope: &WorkspaceSnapshotScope,
-        limits: &SnapshotCaptureLimits,
-        token: &CancellationToken,
-        progress: &mut CaptureProgress,
-    ) -> Result<SnapshotCaptureResponse, SnapshotError> {
-        check_cancelled(token)?;
-        progress.phase(SnapshotCapturePhase::Scanning);
-        if let Some(checkpoint) = self.load_checkpoint(checkpoint_id)? {
-            if checkpoint.meta.file_count > u64::from(limits.max_files) {
-                return Err(limit_error(SnapshotLimit::Files, limits.max_files));
+/// Captures `scope` into the store, whose usage so far is at most `usage`. Whatever a failed
+/// capture staged is deleted; objects it named stay for collection.
+pub(crate) fn capture(
+    store: &Store,
+    workspace: &Workspace,
+    scope: &RecordScope,
+    widening: Widening,
+    limits: &RecordLimits,
+    usage: u64,
+    token: &CancellationToken,
+) -> Result<Captured, SnapshotError> {
+    let started = store.capture_started();
+    let mut capture = Capture {
+        store,
+        workspace,
+        limits,
+        token,
+        may_widen: widening == Widening::Decide,
+        widened: widening == Widening::Decided(true),
+        cache: None,
+        usage,
+        measured: false,
+        entries: BTreeMap::new(),
+        blind: BTreeMap::new(),
+        pruned: Vec::new(),
+        seen: 0,
+        path_bytes: 0,
+        total_bytes: 0,
+        tree_bytes: 0,
+        cached_bytes: 0,
+    };
+    let built = capture.scope(scope).and_then(|root| capture.build(root));
+    match built {
+        Ok(tree) => {
+            let walked = match scope {
+                RecordScope::Workspace { directory } => Some(directory.as_str()),
+                RecordScope::Paths { .. } => capture.widened.then_some(ROOT_SCOPE),
+            };
+            if let Some(walked) = walked {
+                capture.save_cache(walked, started);
             }
-            if checkpoint.meta.total_bytes > limits.max_total_bytes {
-                return Err(limit_error(
-                    SnapshotLimit::TotalBytes,
-                    limits.max_total_bytes,
-                ));
-            }
-            if checkpoint.stored.largest_file_bytes > limits.max_file_bytes {
-                return Err(SnapshotError::InvalidRequest);
-            }
-            return capture_response(&checkpoint, scope.path(), true);
+            Ok(Captured {
+                tree,
+                blind: capture.blind.into_values().collect(),
+                usage: capture.usage,
+                widened: capture.widened,
+            })
         }
-        let inventory = self.store.capture_inventory(token)?;
-        if inventory.checkpoints >= MAX_SNAPSHOT_COUNT {
-            return Err(quota_error(SnapshotLimit::Checkpoints, MAX_SNAPSHOT_COUNT));
-        }
-        let started = self.store.capture_started();
-        let mut capture = Capture {
-            inner: self,
-            limits,
-            token,
-            progress,
-            cache: self.store.objects().stat_cache(),
-            usage: inventory.bytes,
-            entries: Vec::new(),
-            pruned: Vec::new(),
-            skipped: Skipped::default(),
-            total_bytes: 0,
-            largest_file_bytes: 0,
-            tree_bytes: 0,
-            cached_bytes: 0,
-            stored_checkpoint: None,
-        };
-        let captured = capture
-            .walk(scope)
-            .and_then(|()| capture.publish(scope.path(), checkpoint_id));
-        match captured {
-            Ok(checkpoint) => {
-                capture.save_cache(scope.path(), started);
-                capture_response(&checkpoint, scope.path(), false)
+        Err(error) => {
+            if let Err(abandoned) = store.objects().abandon() {
+                tracing::warn!(error = %abandoned, "staged workspace change objects were not deleted");
             }
-            Err(error) => {
-                capture.progress.phase(SnapshotCapturePhase::Rollback);
-                capture.discard()?;
-                Err(error)
-            }
+            Err(error)
         }
     }
 }
 
 impl Capture<'_> {
-    fn walk(&mut self, scope: &WorkspaceSnapshotScope) -> Result<(), SnapshotError> {
-        self.progress.phase(SnapshotCapturePhase::Persisting);
-        check_cancelled(self.token)?;
-        let tree_limits = SnapshotTreeLimits {
+    /// Captures the scope and returns the directory its tree covers.
+    fn scope(&mut self, scope: &RecordScope) -> Result<String, SnapshotError> {
+        match scope {
+            RecordScope::Workspace { directory } => {
+                self.walk(directory.as_str())?;
+                Ok(directory.as_str().to_owned())
+            }
+            RecordScope::Paths { paths } => {
+                let named = paths
+                    .iter()
+                    .map(|path| path.as_str())
+                    .collect::<BTreeSet<_>>();
+                for path in named {
+                    check_cancelled(self.token)?;
+                    self.named(path)?;
+                }
+                if self.widened {
+                    self.walk(ROOT_SCOPE)?;
+                }
+                Ok(ROOT_SCOPE.to_owned())
+            }
+        }
+    }
+
+    /// A path the record names, captured even when ignored. An excluded or protected one is left
+    /// out silently, as a walk leaves it out.
+    fn named(&mut self, path: &str) -> Result<(), SnapshotError> {
+        if self.workspace.excluded(path) || self.captured(path) {
+            return Ok(());
+        }
+        self.charge(path)?;
+        let observed = self
+            .workspace
+            .access
+            .observe_tree_entry(&workspace_path(path)?);
+        match observed {
+            Ok(SnapshotTreeObserved::Absent) | Err(SnapshotTreeError::Protected) => Ok(()),
+            Ok(SnapshotTreeObserved::File(file)) => {
+                if hard_linked(&file.metadata) {
+                    self.widen();
+                }
+                self.file(path.to_owned(), file)
+            }
+            Ok(SnapshotTreeObserved::Symlink(link)) => {
+                self.widen();
+                self.symlink(path.to_owned(), &link.target)
+            }
+            Ok(SnapshotTreeObserved::Directory) => match self.open_walk(path) {
+                Ok(walk) => self.take(walk),
+                Err(SnapshotTreeError::ScopeUnavailable) => {
+                    self.blind(path.to_owned(), UnrecordedReason::Unreadable, None);
+                    Ok(())
+                }
+                Err(error) => Err(tree_error(error)),
+            },
+            Ok(SnapshotTreeObserved::Other) => {
+                self.blind(path.to_owned(), UnrecordedReason::Special, None);
+                Ok(())
+            }
+            Err(SnapshotTreeError::Blocked) => {
+                self.widen();
+                if !self.widened {
+                    self.blind(path.to_owned(), UnrecordedReason::Blocked, None);
+                }
+                Ok(())
+            }
+            Err(SnapshotTreeError::Failed(error))
+                if error.kind() == io::ErrorKind::PermissionDenied =>
+            {
+                self.blind(path.to_owned(), UnrecordedReason::Unreadable, None);
+                Ok(())
+            }
+            Err(error) => Err(tree_error(error)),
+        }
+    }
+
+    /// A call can write through this named path to another one, so a begin takes the whole tree
+    /// as well: wherever the write lands inside the root, the record holds it. A widened record
+    /// leaves a blocked named path to that walk.
+    fn widen(&mut self) {
+        self.widened |= self.may_widen;
+    }
+
+    fn captured(&self, path: &str) -> bool {
+        self.entries.contains_key(path) || self.blind.contains_key(path)
+    }
+
+    fn walk(&mut self, directory: &str) -> Result<(), SnapshotError> {
+        let walk = self.open_walk(directory).map_err(tree_error)?;
+        self.take(walk)
+    }
+
+    fn open_walk(&self, directory: &str) -> Result<SnapshotTreeWalk, SnapshotTreeError> {
+        let limits = SnapshotTreeLimits {
             max_entries: MAX_SNAPSHOT_CAPTURE_ENTRIES,
             max_path_bytes: usize::try_from(MAX_SNAPSHOT_CAPTURE_PATH_BYTES).unwrap_or(usize::MAX),
         };
-        let walk = self
-            .inner
-            .workspace
-            .walk_tree_bound(
-                scope,
-                self.inner.exclusions.clone(),
-                tree_limits,
-                self.token.clone(),
-            )
-            .map_err(tree_error)?;
+        self.workspace.access.walk_tree(
+            directory,
+            self.workspace.exclusions.clone(),
+            limits,
+            self.token.clone(),
+        )
+    }
+
+    /// Captures what a walk yields that this capture does not already hold.
+    fn take(&mut self, walk: SnapshotTreeWalk) -> Result<(), SnapshotError> {
+        check_cancelled(self.token)?;
         for entry in walk {
             let entry = entry.map_err(tree_error)?;
+            if self.captured(&entry.path) {
+                continue;
+            }
+            self.charge(&entry.path)?;
             match entry.node {
                 SnapshotTreeNode::File(file) => self.file(entry.path, file)?,
-                SnapshotTreeNode::Symlink(link) => self.symlink(entry.path, link)?,
+                SnapshotTreeNode::Symlink(link) => self.symlink(entry.path, &link.target)?,
                 SnapshotTreeNode::Skipped(reason) => self.skip(entry.path, reason),
             }
-            self.progress
-                .entry(self.entries.len(), self.total_bytes, Instant::now());
         }
         Ok(())
     }
 
     fn file(&mut self, path: String, mut file: SnapshotTreeFile) -> Result<(), SnapshotError> {
-        if file.metadata.len() > self.limits.max_file_bytes {
-            self.skip(path, SnapshotSkipReason::Oversized);
+        let stamp = Stamp::of(&file.metadata);
+        let size = file.metadata.len();
+        if size > self.limits.max_file_bytes {
+            self.blind(path, UnrecordedReason::Oversized, Some(stamp));
             return Ok(());
         }
-        let stamp = FileStamp::of(&file.metadata);
-        if let Some(oid) = self.cache.lookup(&path, &stamp)
-            && self.inner.store.objects().contains(&oid)
+        let file_stamp = FileStamp::of(&file.metadata);
+        if let Some(oid) = self.cache().lookup(&path, &file_stamp)
+            && self.store.objects().contains(&oid)
         {
-            self.admit(file.metadata.len())?;
-            self.cached(&path, stamp, oid);
-            self.record(path, file_kind(&file.metadata), oid, file.metadata.len());
+            self.admit(size)?;
+            self.cached(&path, file_stamp, oid);
+            self.record(path, file_kind(&file.metadata), oid, size);
             return Ok(());
         }
         #[cfg(test)]
-        self.inner
-            .store
+        self.store
             .hooks
             .content_reads
             .fetch_add(1, Ordering::SeqCst);
@@ -273,18 +301,18 @@ impl Capture<'_> {
             match read_stable(&mut file.file, self.limits.max_file_bytes, self.token)? {
                 Stability::Stable { content, metadata } => (content, metadata),
                 Stability::Oversized => {
-                    self.skip(path, SnapshotSkipReason::Oversized);
+                    self.blind(path, UnrecordedReason::Oversized, Some(stamp));
                     return Ok(());
                 }
                 Stability::Unstable => {
-                    self.skip(path, SnapshotSkipReason::Unstable);
+                    self.blind(path, UnrecordedReason::Unstable, Some(stamp));
                     return Ok(());
                 }
             };
-        let size = u64::try_from(content.len()).unwrap_or(u64::MAX);
+        let size = byte_count(content.len());
         self.admit(size)?;
-        let Some(oid) = self.store(&content)? else {
-            self.skip(path, SnapshotSkipReason::Unreadable);
+        let Some(oid) = self.write(&content)? else {
+            self.blind(path, UnrecordedReason::Unreadable, Some(stamp));
             return Ok(());
         };
         self.cached(&path, FileStamp::of(&metadata), oid);
@@ -292,45 +320,66 @@ impl Capture<'_> {
         Ok(())
     }
 
-    fn symlink(&mut self, path: String, link: SnapshotTreeLink) -> Result<(), SnapshotError> {
-        let size = u64::try_from(link.target.len()).unwrap_or(u64::MAX);
+    fn symlink(&mut self, path: String, target: &[u8]) -> Result<(), SnapshotError> {
+        let size = byte_count(target.len());
         if size > self.limits.max_file_bytes {
-            self.skip(path, SnapshotSkipReason::Oversized);
+            self.blind(path, UnrecordedReason::Oversized, None);
             return Ok(());
         }
         self.admit(size)?;
-        let Some(oid) = self.store(&link.target)? else {
-            self.skip(path, SnapshotSkipReason::Unreadable);
+        let Some(oid) = self.write(target)? else {
+            self.blind(path, UnrecordedReason::Unreadable, None);
             return Ok(());
         };
         self.record(path, EntryKind::Symlink, oid, size);
         Ok(())
     }
 
+    /// What a walk left out is left out of the record too: no diff reports it.
     fn skip(&mut self, path: String, reason: SnapshotSkipReason) {
-        let reason = skip_reason(reason);
-        let count = self.skipped.counts.entry(reason).or_default();
-        *count = count.saturating_add(1);
-        if self.skipped.samples.len() < MAX_SNAPSHOT_SKIPPED_SAMPLES
-            && DisplayText::new(path.clone()).is_ok()
-        {
-            self.skipped.samples.push(SkippedPath {
-                path: path.clone(),
-                reason,
+        if reason != SnapshotSkipReason::Unrepresentable {
+            self.pruned.push(SkippedPath {
+                path,
+                reason: walk_skip(reason),
             });
-        }
-        if reason != SkipReason::Unrepresentable {
-            self.pruned.push(SkippedPath { path, reason });
         }
     }
 
-    /// Refuses an entry that would carry the capture past the client's limits.
+    fn blind(&mut self, path: String, reason: UnrecordedReason, stamp: Option<Stamp>) {
+        self.blind.insert(
+            path.clone(),
+            Blind {
+                path,
+                reason,
+                stamp,
+            },
+        );
+    }
+
+    /// Counts one entry against the ceilings every capture shares, however many walks it takes.
+    fn charge(&mut self, path: &str) -> Result<(), SnapshotError> {
+        self.seen += 1;
+        self.path_bytes = self.path_bytes.saturating_add(byte_count(path.len()));
+        if self.seen > MAX_SNAPSHOT_CAPTURE_ENTRIES {
+            return Err(limit_error(
+                SnapshotLimit::CaptureEntries,
+                MAX_SNAPSHOT_CAPTURE_ENTRIES,
+            ));
+        }
+        if self.path_bytes > MAX_SNAPSHOT_CAPTURE_PATH_BYTES {
+            return Err(limit_error(
+                SnapshotLimit::CapturePathBytes,
+                MAX_SNAPSHOT_CAPTURE_PATH_BYTES,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Refuses an entry that would carry the record past its file or byte limit, in either scope:
+    /// one named directory must not pull an unbounded subtree into the store.
     fn admit(&self, size: u64) -> Result<(), SnapshotError> {
         if self.entries.len() >= usize::try_from(self.limits.max_files).unwrap_or(usize::MAX) {
-            return Err(limit_error(
-                SnapshotLimit::Files,
-                u64::from(self.limits.max_files),
-            ));
+            return Err(limit_error(SnapshotLimit::Files, self.limits.max_files));
         }
         if self.total_bytes.saturating_add(size) > self.limits.max_total_bytes {
             return Err(limit_error(
@@ -342,38 +391,38 @@ impl Capture<'_> {
     }
 
     fn record(&mut self, path: String, kind: EntryKind, oid: ObjectId, size: u64) {
-        let components = u64::try_from(path.split('/').count()).unwrap_or(u64::MAX);
+        let components = byte_count(path.split('/').count());
         self.tree_bytes = self.tree_bytes.saturating_add(
             (TREE_ENTRY_OVERHEAD + OBJECT_OVERHEAD)
                 .saturating_mul(components)
-                .saturating_add(u64::try_from(path.len()).unwrap_or(u64::MAX)),
+                .saturating_add(byte_count(path.len())),
         );
         self.total_bytes = self.total_bytes.saturating_add(size);
-        self.largest_file_bytes = self.largest_file_bytes.max(size);
-        self.entries.push(Entry {
-            path,
-            content: Content { kind, oid },
-        });
+        self.entries.insert(path, Content { kind, oid });
     }
 
+    fn cache(&mut self) -> &StatCache {
+        self.cache
+            .get_or_insert_with(|| self.store.objects().stat_cache())
+    }
+
+    /// Notes what the capture read, which saving the cache after a whole-tree capture keeps for
+    /// the next one.
     fn cached(&mut self, path: &str, stamp: FileStamp, oid: ObjectId) {
-        self.cached_bytes = self.cached_bytes.saturating_add(
-            STAT_ENTRY_OVERHEAD.saturating_add(u64::try_from(path.len()).unwrap_or(u64::MAX)),
-        );
-        self.cache.record(path.to_owned(), stamp, oid);
+        self.cached_bytes = self
+            .cached_bytes
+            .saturating_add(STAT_ENTRY_OVERHEAD.saturating_add(byte_count(path.len())));
+        if let Some(cache) = &mut self.cache {
+            cache.record(path.to_owned(), stamp, oid);
+        }
     }
 
-    /// Stores content, charging the quota only for what is new: content the store already holds
-    /// costs nothing more. `None` is content git refuses to name, a known SHA-1 collision.
-    fn store(&mut self, content: &[u8]) -> Result<Option<ObjectId>, SnapshotError> {
-        let objects = self.inner.store.objects();
-        let bound = compressed_bound(
-            u64::try_from(content.len())
-                .unwrap_or(u64::MAX)
-                .saturating_add(OBJECT_OVERHEAD),
-        );
-        let reservation = self.reserve(bound);
-        if let Err(refusal) = reservation {
+    /// Stores content, charging the store only for what is new. `None` is content git refuses to
+    /// name, a known SHA-1 collision.
+    fn write(&mut self, content: &[u8]) -> Result<Option<ObjectId>, SnapshotError> {
+        let objects = self.store.objects();
+        let bound = compressed_bound(byte_count(content.len()).saturating_add(OBJECT_OVERHEAD));
+        if let Err(refusal) = self.reserve(bound) {
             return match blob_id(content) {
                 Ok(oid) if objects.contains(&oid) => Ok(Some(oid)),
                 Ok(_) => Err(refusal),
@@ -391,11 +440,17 @@ impl Capture<'_> {
                 self.usage = self.usage.saturating_sub(bound);
                 Ok(None)
             }
-            Err(error) => Err(store_error(error, &[])),
+            Err(error) => Err(store_error(error)),
         }
     }
 
+    /// Charges `bytes` against the store's ceiling. An estimate past it is measured once before
+    /// the capture is refused: the store is full only when nothing more fits.
     fn reserve(&mut self, bytes: u64) -> Result<(), SnapshotError> {
+        if self.usage.saturating_add(bytes) > MAX_SNAPSHOT_STORAGE_BYTES && !self.measured {
+            self.measured = true;
+            self.usage = self.store.usage()?;
+        }
         self.usage = self
             .usage
             .checked_add(bytes)
@@ -407,26 +462,36 @@ impl Capture<'_> {
         Ok(())
     }
 
-    /// Builds the snapshot, makes every object it names durable, then names it by the checkpoint.
-    fn publish(&mut self, scope: &str, checkpoint_id: &str) -> Result<Checkpoint, SnapshotError> {
-        self.progress.phase(SnapshotCapturePhase::Publishing);
+    /// Builds the tree of what was captured and makes every object it names durable.
+    fn build(&mut self, scope: String) -> Result<SnapshotId, SnapshotError> {
         check_cancelled(self.token)?;
-        let mut entries = mem::take(&mut self.entries);
-        entries.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+        for path in self.blind.keys() {
+            self.entries.remove(path);
+        }
+        let entries = mem::take(&mut self.entries)
+            .into_iter()
+            .map(|(path, content)| Entry { path, content })
+            .collect::<Vec<_>>();
         let mut pruned = mem::take(&mut self.pruned);
+        pruned.extend(self.blind.values().map(|blind| SkippedPath {
+            path: blind.path.clone(),
+            reason: blind_skip(blind.reason),
+        }));
         pruned.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+        pruned.dedup_by(|left, right| left.path == right.path);
         let meta = Meta {
-            scope: scope.to_owned(),
+            scope,
             pruned,
-            exclusions: self.inner.exclusions.clone(),
-            skipped: mem::take(&mut self.skipped),
-            file_count: u64::try_from(entries.len()).unwrap_or(u64::MAX),
+            exclusions: self.workspace.exclusions.clone(),
+            skipped: Skipped::default(),
+            file_count: byte_count(entries.len()),
             total_bytes: self.total_bytes,
         };
-        let meta_bytes = serde_json::to_vec(&meta)
-            .map_err(|_| SnapshotError::OperationFailed)?
-            .len();
-        let meta_bytes = u64::try_from(meta_bytes).unwrap_or(u64::MAX);
+        let meta_bytes = byte_count(
+            serde_json::to_vec(&meta)
+                .map_err(|_| SnapshotError::OperationFailed)?
+                .len(),
+        );
         if meta_bytes > MAX_METADATA_BYTES {
             return Err(limit_error(
                 SnapshotLimit::MetadataBytes,
@@ -438,61 +503,32 @@ impl Capture<'_> {
                 .saturating_add(meta_bytes)
                 .saturating_add(WRAPPER_BYTES),
         ))?;
-        let store = &self.inner.store;
-        let id = store
+        let tree = self
+            .store
             .objects()
             .build(&entries, &meta)
-            .map_err(|error| store_error(error, &[]))?;
-        store.sync_objects()?;
-        let stored = StoredCheckpoint {
-            version: CHECKPOINT_VERSION.to_owned(),
-            checkpoint_id: checkpoint_id.to_owned(),
-            snapshot_id: snapshot_identifier(&id),
-            created_at_unix_ms: self.inner.created_at(&id)?.unwrap_or_else(unix_ms),
-            largest_file_bytes: self.largest_file_bytes,
-        };
-        let bytes = serde_json::to_vec(&stored).map_err(|_| SnapshotError::OperationFailed)?;
-        self.reserve(u64::try_from(bytes.len()).unwrap_or(u64::MAX))?;
-        check_cancelled(self.token)?;
-        let path = store.checkpoint_path(checkpoint_id);
-        self.stored_checkpoint = Some(path.clone());
-        store.write_atomic(&path, &bytes)?;
-        Ok(Checkpoint { stored, id, meta })
+            .map_err(store_error)?;
+        self.store.sync_objects()?;
+        Ok(tree)
     }
 
-    /// Saves what this capture read, so the next one need not read it again. Only a cache: when
-    /// it does not fit the quota or cannot be written, the next capture reads everything.
-    fn save_cache(self, scope: &str, started: SystemTime) {
-        let fits = self
+    /// Saves what a whole-tree capture read, so the next one need not read it again. Only a cache:
+    /// when it does not fit the store or cannot be written, the next capture reads everything.
+    fn save_cache(&mut self, scope: &str, started: std::time::SystemTime) {
+        let Some(cache) = self.cache.take() else {
+            return;
+        };
+        let Some(usage) = self
             .usage
             .checked_add(self.cached_bytes)
-            .is_some_and(|usage| usage <= MAX_SNAPSHOT_STORAGE_BYTES);
-        if fits
-            && let Err(error) = self
-                .inner
-                .store
-                .objects()
-                .save_stat_cache(self.cache, scope, started)
-        {
-            tracing::warn!(%error, "workspace snapshot stat cache was not saved");
+            .filter(|usage| *usage <= MAX_SNAPSHOT_STORAGE_BYTES)
+        else {
+            return;
+        };
+        match self.store.objects().save_stat_cache(cache, scope, started) {
+            Ok(()) => self.usage = usage,
+            Err(error) => tracing::warn!(%error, "workspace change stat cache was not saved"),
         }
-    }
-
-    /// Deletes what this capture staged and removes the checkpoint should its write have become
-    /// visible before failing. Objects it named stay for collection: nothing names those this
-    /// capture added, and anything may name the others.
-    fn discard(&self) -> Result<(), SnapshotError> {
-        let store = &self.inner.store;
-        if let Err(error) = store.objects().abandon() {
-            tracing::warn!(%error, "staged workspace snapshot objects were not deleted");
-        }
-        if let Some(path) = &self.stored_checkpoint {
-            store
-                .remove(path)
-                .and_then(|()| store.sync(CHECKPOINTS))
-                .map_err(|_| SnapshotError::RollbackFailed)?;
-        }
-        Ok(())
     }
 }
 
@@ -501,6 +537,23 @@ impl Capture<'_> {
 /// content; `OBJECT_OVERHEAD` covers each object's framing.
 const fn compressed_bound(bytes: u64) -> u64 {
     bytes.saturating_add(bytes.div_ceil(8))
+}
+
+fn byte_count(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+/// Whether another name shares the file's inode, so a write through one changes the other.
+#[cfg(unix)]
+fn hard_linked(metadata: &Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    metadata.nlink() > 1
+}
+
+#[cfg(not(unix))]
+fn hard_linked(_metadata: &Metadata) -> bool {
+    false
 }
 
 /// Reads `file` from its start until the metadata taken around one read agrees, so the content is
@@ -538,108 +591,4 @@ pub(crate) fn read_stable(
         }
     }
     Ok(Stability::Unstable)
-}
-
-pub(crate) fn validate_limits(limits: &SnapshotCaptureLimits) -> Result<(), SnapshotError> {
-    let files = usize::try_from(limits.max_files).unwrap_or(usize::MAX);
-    if files == 0
-        || files > MAX_SNAPSHOT_FILES
-        || limits.max_file_bytes == 0
-        || limits.max_file_bytes > MAX_SNAPSHOT_FILE_BYTES
-        || limits.max_total_bytes == 0
-        || limits.max_total_bytes > MAX_SNAPSHOT_TOTAL_BYTES
-    {
-        return Err(SnapshotError::InvalidRequest);
-    }
-    Ok(())
-}
-
-pub(crate) fn capture_response(
-    checkpoint: &Checkpoint,
-    scope: &str,
-    reused_checkpoint: bool,
-) -> Result<SnapshotCaptureResponse, SnapshotError> {
-    if checkpoint.meta.scope != scope {
-        return Err(SnapshotError::InvalidRequest);
-    }
-    Ok(SnapshotCaptureResponse {
-        version: ContractVersion::V1,
-        snapshot: summary(
-            &checkpoint.id,
-            &checkpoint.meta,
-            Some(&checkpoint.stored.checkpoint_id),
-            checkpoint.stored.created_at_unix_ms,
-        )?,
-        reused_checkpoint,
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Mutex;
-
-    use workcell_snapshot_store::{ObjectStore, StoreOptions};
-
-    use super::*;
-
-    const ENTRIES: usize = 20_000;
-    const INCOMPRESSIBLE_BYTES: usize = 1_024 * 1_024;
-    const XORSHIFT_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
-
-    #[derive(Default)]
-    struct ProgressSink(Mutex<Vec<SnapshotCaptureProgress>>);
-
-    impl SnapshotCaptureProgressSink for ProgressSink {
-        fn publish(&self, progress: SnapshotCaptureProgress) {
-            self.0.lock().unwrap().push(progress);
-        }
-    }
-
-    #[test]
-    fn capture_progress_is_rate_bounded_without_losing_final_counters() {
-        let sink = Arc::new(ProgressSink::default());
-        let mut progress = CaptureProgress::new(Some(sink.clone()));
-        progress.phase(SnapshotCapturePhase::Persisting);
-        let now = progress.emitted;
-        for files in 1..=ENTRIES {
-            progress.entry(files, files as u64, now);
-        }
-        assert_eq!(sink.0.lock().unwrap().len(), 2);
-        progress.entry(ENTRIES + 1, ENTRIES as u64 + 1, now + PROGRESS_INTERVAL);
-        assert_eq!(sink.0.lock().unwrap().len(), 3);
-        progress.phase(SnapshotCapturePhase::Publishing);
-        let events = sink.0.lock().unwrap();
-        assert_eq!(events.len(), 4);
-        assert_eq!(events[3].files, ENTRIES as u64 + 1);
-        assert_eq!(events[3].entries, ENTRIES as u64 + 1);
-        assert_eq!(events[3].bytes, ENTRIES as u64 + 1);
-    }
-
-    #[test]
-    fn the_quota_charge_for_an_object_covers_what_storing_incompressible_content_takes() {
-        let storage = tempfile::tempdir().unwrap();
-        let objects = ObjectStore::open(
-            storage.path(),
-            StoreOptions {
-                private: false,
-                max_object_bytes: None,
-            },
-        )
-        .unwrap();
-        let empty = objects.usage().unwrap().bytes;
-        let mut state = XORSHIFT_SEED;
-        let content = (0..INCOMPRESSIBLE_BYTES)
-            .map(|_| {
-                state ^= state << 13;
-                state ^= state >> 7;
-                state ^= state << 17;
-                state.to_le_bytes()[0]
-            })
-            .collect::<Vec<_>>();
-        objects.write_blob(&content).unwrap();
-
-        let stored = objects.usage().unwrap().bytes - empty;
-        assert!(stored > content.len() as u64);
-        assert!(stored <= compressed_bound(content.len() as u64 + OBJECT_OVERHEAD));
-    }
 }
