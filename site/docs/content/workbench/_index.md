@@ -145,6 +145,8 @@ A Markdown file can be read the way the transcript shows Markdown, with headings
 
 The rendered view is for reading. The arrow keys, `PageUp`, `PageDown`, `Home`, `End`, the wheel, and the scrollbar move it, and typing flashes that it is read-only. Each view opens at the same point through the document that the other one showed, and the cursor stays where you left it in the source. A reload, a theme change, or a resize shows up in the view at once. On a file, `Ctrl+X Enter` sends a mention without a line number, because the rendered view has no cursor.
 
+Select in the rendered view the way you select in the source: drag, click twice for a word, or click three times for a drawn row. Letting go copies the [Markdown source](/docs/markdown/#copying) behind the selection, as in the transcript, and `Ctrl+C` copies it again. After `Ctrl+A`, a copy gives back the tab's text exactly as it stands, with unsaved edits and its own line endings. `Esc` drops the selection. `Shift+Delete` and `Ctrl+X x` flash that the view is read-only, because a cut would delete source you cannot see.
+
 `Ctrl+X v` switches the transcript view everywhere else, and only belongs to the rendered view while the workbench is open.
 
 ## Source control
@@ -326,7 +328,7 @@ Two clones of the same repository keep separate layouts.
 
 ## Limits
 
-The workbench is an editor beside an agent, not a replacement for your own. There is no language server, no completion, no split panes, and no modal editing. Search does not replace. Staging is per file. The rendered view is read-only and has no selection, so copy from the source.
+The workbench is an editor beside an agent, not a replacement for your own. There is no language server, no completion, no split panes, and no modal editing. Search does not replace. Staging is per file. The rendered view is read-only, so edit in the source.
 
 ## Keys
 

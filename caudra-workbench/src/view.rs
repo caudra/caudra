@@ -31,8 +31,8 @@ use crate::scroll::ScrollHint;
 use crate::search::engine::Hit;
 use crate::search::{Field as SearchField, Row as SearchRow, Search};
 use crate::{
-    Ask, Bar, Choice, Focus, FocusedField, SidebarView, Workbench, WorkbenchStyles, chrome, keys,
-    layout, layout_sections,
+    Ask, Bar, Choice, Drag, Focus, FocusedField, SidebarView, Workbench, WorkbenchStyles, chrome,
+    keys, layout, layout_sections,
 };
 
 pub(crate) const HINT_GAP: &str = "  ";
@@ -950,9 +950,18 @@ impl Workbench {
         else {
             return;
         };
+        if self.drag == Drag::Text && !view.is_selecting() {
+            self.drag = Drag::None;
+        }
         let (top, total) = (view.top(rows), view.lines().len());
         for (offset, line) in view.lines()[top..].iter().take(rows).enumerate() {
             line.render(line_at(text, offset), buf);
+            if let Some(columns) = view.selection_columns(top + offset) {
+                for column in columns.start..columns.end.min(text.width as usize) {
+                    buf[(text.x + column as u16, text.y + offset as u16)]
+                        .set_style(self.styles.selection);
+                }
+            }
         }
         let (_, bar) = scroll_column(self.scrollbars, area, total);
         self.bars

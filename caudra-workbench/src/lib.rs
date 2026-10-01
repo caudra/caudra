@@ -22,7 +22,7 @@ pub mod transfer;
 mod view;
 
 pub use action::WorkbenchAction;
-pub use editor::rendered::PaintMarkdown;
+pub use editor::rendered::{PaintMarkdown, PaintedMarkdown};
 pub use editor::{DocumentKey, TabLabel, buffer, history, render, text_field, words};
 pub use fs::backend::{
     BackendDriver, BackendError, BackendEvent, BackendRevision, ListResult, LoadedFile,
@@ -643,6 +643,7 @@ impl Workbench {
             self.sidebar = SidebarView::Explorer;
         }
         self.open = false;
+        self.drag = Drag::None;
         self.cancel_pending_opens();
         for tab in self.editor.tabs_mut() {
             tab.remote_reload = false;
@@ -929,6 +930,7 @@ impl Workbench {
     /// The host opens the workbench itself, because only it knows whether
     /// that means a local root or a workspace session.
     pub fn open_document(&mut self, key: DocumentKey, label: TabLabel, text: &str) {
+        self.drag = Drag::None;
         match self.editor.document(&key) {
             Some(index) => {
                 self.editor.select(index);
@@ -1384,6 +1386,7 @@ impl Workbench {
         let path = loaded.entry.path.clone();
         match purpose {
             OpenPurpose::Open | OpenPurpose::Preview => {
+                self.drag = Drag::None;
                 let tab = Tab::from_backend(loaded, self.theme_generation);
                 self.editor
                     .push_backend(tab, purpose == OpenPurpose::Preview);
@@ -1850,6 +1853,9 @@ impl Workbench {
     /// Routes a mouse event by the pane it landed in, using the geometry the
     /// last frame recorded. Anything outside a pane is left alone.
     pub fn handle_mouse(&mut self, event: MouseEvent) -> WorkbenchAction {
+        if event.kind == MouseEventKind::Down(MouseButton::Left) {
+            self.drag = Drag::None;
+        }
         if self.transfer_input_active()
             && event.kind == MouseEventKind::Down(MouseButton::Left)
             && let Some((_, view)) = self
@@ -2637,24 +2643,24 @@ impl Workbench {
         }
     }
 
-    /// A press on the buffer. One click drops the cursor and starts a drag,
-    /// two take the word under it, three take the whole line. The rendered
-    /// view has no caret to drop, so a press there only focuses it.
+    /// A press on the buffer. Every press starts a drag, so its release can
+    /// copy what it took: one click drops the cursor, two take the word under
+    /// it, three take the whole line. The rendered view has no caret, so there
+    /// the press anchors a selection of its painted rows instead.
     fn press_text(&mut self, at: (u16, u16), clicks: u8) {
         self.focus = Focus::Editor;
-        if self.editor.active().is_some_and(Tab::is_rendered) {
-            return;
-        }
         let Some(cursor) = self.cursor_at(at) else {
             return;
         };
-        if clicks == 1 {
-            self.drag = Drag::Text;
-            self.drag_at = at;
-        }
+        self.drag = Drag::Text;
+        self.drag_at = at;
         let Some(tab) = self.editor.active_mut() else {
             return;
         };
+        if let Some(view) = tab.rendered_mut() {
+            view.select_at(cursor, clicks);
+            return;
+        }
         match clicks {
             1 => tab.buffer.set_cursor(cursor, false),
             2 => tab.buffer.select_word_at(cursor),
@@ -2777,13 +2783,13 @@ impl Workbench {
         }
         let held = self.drag;
         self.drag = Drag::None;
-        if held == Drag::Menu || !self.panes.text.contains(self.drag_from.into()) {
+        if held != Drag::Text || !self.panes.text.contains(self.drag_from.into()) {
             return None;
         }
         // A plain click collapses the selection, so an idle press never
         // clobbers what was copied before it. The press was in the text, so
         // a selection standing in a field is not what it took.
-        let text = self.editor.active()?.buffer.selected_text()?;
+        let text = self.editor.active()?.selected_text()?;
         self.clipboard = text.clone();
         Some(text)
     }
@@ -2793,7 +2799,10 @@ impl Workbench {
             return;
         };
         if let Some(tab) = self.editor.active_mut() {
-            tab.buffer.set_cursor(cursor, true);
+            match tab.rendered_mut() {
+                Some(view) => view.extend_to(cursor),
+                None => tab.buffer.set_cursor(cursor, true),
+            }
         }
     }
 
@@ -2806,6 +2815,13 @@ impl Workbench {
         }
         let tab = self.editor.active()?;
         let row = at.1.clamp(text.y, text.bottom() - 1);
+        if let Some(view) = tab.rendered_view() {
+            let column = at.0.clamp(text.x, text.right());
+            return view.position_at(
+                view.top(text.height as usize) + (row - text.y) as usize,
+                (column - text.x) as usize,
+            );
+        }
         let column = at.0.clamp(text.x, text.right() - 1);
         // The same walk the frame was painted from, so a press on a wrapped
         // row cannot land on a different half of the line than it points at.
@@ -2841,9 +2857,24 @@ impl Workbench {
         let Some(tab) = self.editor.active_mut() else {
             return false;
         };
-        let before = tab.scroll();
-        tab.scroll_by(delta, text.height as usize, text.width as usize, wrap);
-        if tab.scroll() == before {
+        let moved = match tab.rendered_mut() {
+            Some(view) => {
+                if !view.is_selecting() {
+                    self.drag = Drag::None;
+                    return false;
+                }
+                let rows = text.height as usize;
+                let before = view.top(rows);
+                view.scroll_by(delta, rows);
+                view.top(rows) != before
+            }
+            None => {
+                let before = tab.scroll();
+                tab.scroll_by(delta, text.height as usize, text.width as usize, wrap);
+                tab.scroll() != before
+            }
+        };
+        if !moved {
             return false;
         }
         self.extend_to(self.drag_at);
@@ -2861,6 +2892,7 @@ impl Workbench {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> WorkbenchAction {
+        self.drag = Drag::None;
         if self.transfer_input_active() {
             return self.transfer_key(key);
         }
@@ -2923,9 +2955,8 @@ impl Workbench {
             // selection is the editor's own transient state and goes first.
             if self.focus == Focus::Editor
                 && let Some(tab) = self.editor.active_mut()
-                && tab.buffer.has_selection()
+                && tab.clear_selection()
             {
-                tab.buffer.clear_selection();
                 return Some(WorkbenchAction::Consumed);
             }
             return Some(WorkbenchAction::Close);
@@ -2984,6 +3015,7 @@ impl Workbench {
     /// state, so this only has to answer for the second half, and hands back
     /// `Passthrough` when the chord belongs to the transcript instead.
     pub fn handle_leader(&mut self, key: KeyEvent) -> WorkbenchAction {
+        self.drag = Drag::None;
         self.flash = None;
         // A chord acts on the pane behind them, so they go first rather than
         // staying on screen over a workbench that has moved on.
@@ -3097,6 +3129,10 @@ impl Workbench {
             return self
                 .field_key(field, keys::CUT.to_key_event())
                 .unwrap_or(WorkbenchAction::Consumed);
+        }
+        if self.editor.active().is_some_and(Tab::is_rendered) {
+            self.flash = Some(RENDERED_READ_ONLY.to_owned());
+            return WorkbenchAction::Consumed;
         }
         let Some(text) = self.selected_text() else {
             return WorkbenchAction::Consumed;
@@ -3736,6 +3772,7 @@ impl Workbench {
         let (change, rendered) = diff;
         let side = if change.staged { STAGED } else { WORKING };
         let title = format!("{} \u{2194} {side}", self.relative(&change.path).display());
+        self.drag = Drag::None;
         self.editor.push(Tab::synthetic(
             &change.path,
             title,
@@ -3778,6 +3815,7 @@ impl Workbench {
         let Some(path) = self.commit_detail_path(&commit.id) else {
             return;
         };
+        self.drag = Drag::None;
         self.editor.push(Tab::synthetic_backend(
             path,
             format!("{}{}", scm::commit::TITLE, commit.id),
@@ -3827,6 +3865,7 @@ impl Workbench {
         let (commit, file, rendered) = opened;
         let title = format!("{} \u{2194} {}", file.relative, commit.id);
         let path = workdir.join(&commit.id).join(&file.relative);
+        self.drag = Drag::None;
         self.editor.push(Tab::synthetic(
             &path,
             title,
@@ -3940,6 +3979,7 @@ impl Workbench {
         if let Some(warning) = warnings.last() {
             self.flash = Some(warning.clone());
         }
+        self.drag = Drag::None;
         self.editor.push(Tab::synthetic_backend(
             tab_path,
             title,
@@ -4040,8 +4080,16 @@ impl Workbench {
         let Some(tab) = self.editor.active_mut() else {
             return WorkbenchAction::Consumed;
         };
+        if keys::SELECT_ALL.matches(key)
+            && let Some(paint) = self.markdown
+        {
+            let (text, _) = view::scroll_column(self.scrollbars, self.panes.editor, usize::MAX);
+            tab.rendered(text.width, self.theme_generation, paint);
+        }
         if let Some(view) = tab.rendered_mut() {
-            if !view.scroll_key(key, rows) {
+            if keys::SELECT_ALL.matches(key) {
+                view.select_all();
+            } else if !view.scroll_key(key, rows) {
                 self.flash = Some(RENDERED_READ_ONLY.to_owned());
             }
             return WorkbenchAction::Consumed;
@@ -4066,6 +4114,7 @@ impl Workbench {
     }
 
     fn toggle_rendered(&mut self) {
+        self.drag = Drag::None;
         if !self.editor.active_mut().is_some_and(Tab::toggle_rendered) {
             self.flash = Some(NO_RENDERED_VIEW.to_owned());
         }
@@ -4303,6 +4352,7 @@ impl Workbench {
     /// reader's choice, and opening a tab is not a reason to overrule it; the
     /// point is that the pane they do go back to is already in the right place.
     fn reveal_active(&mut self) {
+        self.drag = Drag::None;
         let Some(path) = self.editor.active().map(|tab| tab.path.clone()) else {
             return;
         };
@@ -4364,7 +4414,7 @@ impl Workbench {
     fn selected_text(&self) -> Option<String> {
         self.focused_field()
             .and_then(|field| self.field(field)?.selected_text())
-            .or_else(|| self.editor.active()?.buffer.selected_text())
+            .or_else(|| self.editor.active()?.selected_text())
     }
 
     /// How a path leaves for the composer, which is the same wherever the path
@@ -4631,18 +4681,20 @@ mod tests {
         Ask, Choice, Confirm, Cursor, DEFAULT_SIDEBAR_WIDTH, DISCARD_LABEL, DocumentKey, Drag,
         EDGE_SCROLL_LINES, Focus, Input, InputKind, Layout, LocalSourceError, MAX_SIDEBAR_WIDTH,
         MIN_EDITOR_WIDTH, MIN_SECTION_ROWS, MIN_SIDEBAR_WIDTH, MenuAction, NEW_FILE_PROMPT,
-        NO_RENDERED_VIEW, RENDERED_READ_ONLY, SCROLL_COLUMNS, SCROLL_LINES, ScmLayout, Section,
-        SidebarView, Tab, TabLabel, Target, Toggle, Workbench, WorkbenchAction, WorkbenchPath,
-        WorkbenchStyles, keys, layout, layout_sections, scm,
+        NO_RENDERED_VIEW, PaintedMarkdown, RENDERED_READ_ONLY, SCROLL_COLUMNS, SCROLL_LINES,
+        ScmLayout, Section, SidebarView, Tab, TabLabel, Target, Toggle, Workbench, WorkbenchAction,
+        WorkbenchPath, WorkbenchStyles, keys, layout, layout_sections, scm,
     };
     use crate::chrome::ELLIPSIS;
-    use crate::editor::{VisualRow, render};
+    use crate::editor::{VisualRow, buffer::Buffer, render};
     use crate::fs::backend::tests::{
         RemoteControl, SCOPED_CONTENTS, SCOPED_FILE, SCOPED_ROOT, SHADOW_CONTENTS, SHADOW_FILE,
         scoped_widget_fixture,
     };
     use crate::fs::tree::GitMark;
     use crate::menu::Item as MenuItem;
+    use crate::scm::backend::DiffResult;
+    use crate::scm::repo::Commit;
     use crate::scroll::SCROLLBAR_THUMB;
     use crate::search;
     use crate::view::{
@@ -4650,7 +4702,7 @@ mod tests {
         OPEN_MARK, RENDERED_STATUS, REVERT_MARK, STAGE_MARK, TabHit, TabPart, UNSTAGE_MARK,
         button_at, confirm_at, header_at, on_menu_mark, tab_at, toggle_at, visible_range,
     };
-    use caudra_workspace::{ResourceKind, WorkspaceError, WorkspacePath};
+    use caudra_workspace::{ResourceKind, ScmDiffTarget, WorkspaceError, WorkspacePath};
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
@@ -4659,7 +4711,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::buffer::{Buffer as Surface, Cell};
     use ratatui::layout::Rect;
-    use ratatui::style::Style;
+    use ratatui::style::{Color, Style};
     use ratatui::text::Line;
     use std::cell::Cell as Counter;
     use std::collections::BTreeMap;
@@ -4878,7 +4930,14 @@ mod tests {
     const READ_TO: usize = 30;
     const WIDE_TERMINAL_WIDTH: u16 = 160;
     const NOT_RENDERED: &str = "the tab is not showing what the painter made of it";
-    const EDITED_RENDERED: &str = "the rendered view let a key change or select the text";
+    const EDITED_RENDERED: &str = "the rendered view changed the source buffer";
+    const RENDERED_COPIED: &str = "one\ntw";
+    const RENDERED_WORDS: &str = "one two\nthree\n";
+    const WIDE_GLYPH: &str = "界";
+    const COMBINED_GLYPH: &str = "e\u{301}";
+    const SELECTION_COLOUR: Color = Color::Magenta;
+    const SELECTION_UNPAINTED: &str = "the selected rendered cells were not highlighted";
+    const SELECTION_STALE: &str = "a rendered selection survived a change to its source or layout";
     const NOT_REFUSED: &str = "a refused key did not say why";
     const STILL_RENDERED: &str = "the tab did not go back to its source";
     const CHORD_TAKEN: &str = "without a painter the chord and the view must stay out of sight";
@@ -8074,8 +8133,20 @@ mod tests {
 
     /// Stands in for the host's renderer, marking every row it paints so a
     /// frame shows which view drew it.
-    fn painter(text: &str, _width: u16) -> Vec<Line<'static>> {
-        text.lines().map(|line| Line::from(painted(line))).collect()
+    fn painter(text: &str, _width: u16) -> PaintedMarkdown {
+        let source = text.to_owned();
+        let lines = text.lines().map(|line| Line::from(painted(line))).collect();
+        PaintedMarkdown::new(lines, move |rows, start, end| {
+            let last = rows.last()?;
+            if start == (0, 0) && end == (rows.len() - 1, last.to_string().chars().count()) {
+                return Some(source.clone());
+            }
+            let prefix = PAINTED.chars().count();
+            let mut buffer = Buffer::new(source.lines().map(str::to_owned).collect());
+            buffer.set_cursor(Cursor::new(start.0, start.1.saturating_sub(prefix)), false);
+            buffer.set_cursor(Cursor::new(end.0, end.1.saturating_sub(prefix)), true);
+            buffer.selected_text()
+        })
     }
 
     /// A project holding one Markdown file, open in a workbench lent a painter.
@@ -8160,17 +8231,27 @@ mod tests {
     #[test_case(key(KeyCode::Enter) ; "a new line")]
     #[test_case(key(KeyCode::Backspace) ; "a deletion")]
     #[test_case(press(keys::UNDO) ; "undo")]
+    #[test_case(press(keys::REDO) ; "redo")]
     #[test_case(press(keys::KILL_LINE) ; "a kill")]
-    #[test_case(press(keys::SELECT_ALL) ; "a selection")]
+    #[test_case(press(keys::CUT) ; "a cut")]
     #[test_case(press(keys::PASTE) ; "a paste")]
     fn the_rendered_view_refuses_what_would_edit_it(refused: KeyEvent) {
         let (_dir, mut workbench) = markdown_project(INDEXED_TEXT);
         workbench.clipboard = REWRITTEN_TEXT.to_owned();
         toggle_rendered(&mut workbench);
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        workbench.handle_key(press(keys::SELECT_ALL));
+        let tab = workbench.editor.active().expect(NO_TAB);
+        let before = (tab.contents(), tab.revision(), tab.buffer.cursor());
 
         assert_eq!(workbench.handle_key(refused), WorkbenchAction::Consumed);
 
         let tab = workbench.editor.active().expect(NO_TAB);
+        assert_eq!(
+            (tab.contents(), tab.revision(), tab.buffer.cursor()),
+            before,
+            "{EDITED_RENDERED}"
+        );
         assert!(!tab.is_dirty(), "{EDITED_RENDERED}");
         assert!(!tab.buffer.has_selection(), "{EDITED_RENDERED}");
         assert_eq!(
@@ -8248,20 +8329,404 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_drag_across_the_rendered_view_selects_and_copies_nothing() {
+    #[test_case(false ; "forward")]
+    #[test_case(true ; "backward")]
+    fn a_drag_across_the_rendered_view_copies_source(reverse: bool) {
         let (_dir, mut workbench) = markdown_project(INDEXED_TEXT);
         toggle_rendered(&mut workbench);
         paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
         let text = workbench.panes.text;
+        let prefix = PAINTED.width() as u16;
+        let start = (text.x + prefix, text.y);
+        let end = (text.x + prefix + 2, text.y + 1);
+        let (start, end) = if reverse { (end, start) } else { (start, end) };
+        let tab = workbench.editor.active().expect(NO_TAB);
+        let before = (tab.contents(), tab.revision(), tab.buffer.cursor());
 
-        workbench.handle_mouse(click(text.x, text.y));
-        workbench.handle_mouse(drag(text.right() - 1, text.y + 1));
-        let released = workbench.handle_mouse(release(text.right() - 1, text.y + 1));
+        workbench.handle_mouse(click(start.0, start.1));
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        workbench.handle_mouse(drag(end.0, end.1));
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let released = workbench.handle_mouse(release(end.0, end.1));
 
-        assert_eq!(released, WorkbenchAction::Consumed, "{EDITED_RENDERED}");
+        assert_eq!(
+            released,
+            WorkbenchAction::Copy(RENDERED_COPIED.to_owned()),
+            "{SELECTION_UNCOPIED}"
+        );
+        assert_eq!(workbench.clipboard, RENDERED_COPIED, "{SELECTION_UNCOPIED}");
+        assert_eq!(
+            workbench.handle_key(press(keys::COPY)),
+            released,
+            "{SELECTION_UNCOPIED}"
+        );
         let tab = workbench.editor.active().expect(NO_TAB);
         assert!(!tab.buffer.has_selection(), "{EDITED_RENDERED}");
+        assert_eq!(
+            (tab.contents(), tab.revision(), tab.buffer.cursor()),
+            before,
+            "{EDITED_RENDERED}"
+        );
+    }
+
+    #[test]
+    fn select_all_in_rendered_view_copies_the_source_and_esc_clears_it() {
+        let (_dir, mut workbench) = markdown_project(INDEXED_TEXT);
+        toggle_rendered(&mut workbench);
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+
+        workbench.handle_key(press(keys::SELECT_ALL));
+
+        assert_eq!(
+            workbench.handle_key(press(keys::COPY)),
+            WorkbenchAction::Copy(INDEXED_TEXT.to_owned()),
+            "{SELECTION_UNCOPIED}"
+        );
+        assert_eq!(
+            workbench.handle_key(press(keys::CLOSE)),
+            WorkbenchAction::Consumed,
+            "{ESC_LEFT}"
+        );
+        assert_eq!(
+            workbench.handle_key(press(keys::COPY)),
+            WorkbenchAction::Passthrough,
+            "{COPY_TRAPPED}"
+        );
+        assert_eq!(
+            workbench.handle_key(press(keys::CLOSE)),
+            WorkbenchAction::Close,
+            "{ESC_LEFT}"
+        );
+    }
+
+    #[test_case(2, FIRST_LINE ; "word")]
+    #[test_case(3, FIELD_WORDS ; "row")]
+    fn repeated_clicks_in_rendered_view_copy_the_word_or_row(clicks: usize, expected: &str) {
+        let (_dir, mut workbench) = markdown_project(RENDERED_WORDS);
+        toggle_rendered(&mut workbench);
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let text = workbench.panes.text;
+        let column = text.x + PAINTED.width() as u16 + 1;
+
+        for _ in 0..clicks {
+            workbench.handle_mouse(click(column, text.y));
+        }
+
+        assert_eq!(
+            workbench.handle_mouse(release(column, text.y)),
+            WorkbenchAction::Copy(expected.to_owned()),
+            "{SELECTION_UNCOPIED}"
+        );
+    }
+
+    #[test]
+    fn a_plain_rendered_click_clears_selection_without_copying() {
+        let (_dir, mut workbench) = markdown_project(INDEXED_TEXT);
+        toggle_rendered(&mut workbench);
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        workbench.handle_key(press(keys::SELECT_ALL));
+        workbench.clipboard = KEPT_CLIPBOARD.to_owned();
+        let text = workbench.panes.text;
+
+        workbench.handle_mouse(click(text.x, text.y));
+
+        assert_eq!(
+            workbench.handle_mouse(release(text.x, text.y)),
+            WorkbenchAction::Consumed,
+            "{IDLE_CLICK_COPIED}"
+        );
+        assert!(workbench.selected_text().is_none(), "{IDLE_CLICK_COPIED}");
+        assert_eq!(workbench.clipboard, KEPT_CLIPBOARD, "{IDLE_CLICK_COPIED}");
+    }
+
+    #[test]
+    fn the_leader_cut_cannot_edit_a_rendered_selection() {
+        let (_dir, mut workbench) = markdown_project(INDEXED_TEXT);
+        toggle_rendered(&mut workbench);
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        workbench.handle_key(press(keys::SELECT_ALL));
+        let tab = workbench.editor.active().expect(NO_TAB);
+        let before = (tab.contents(), tab.revision(), tab.buffer.cursor());
+
+        assert_eq!(
+            workbench.handle_leader(press(keys::CUT_CHORD)),
+            WorkbenchAction::Consumed
+        );
+
+        let tab = workbench.editor.active().expect(NO_TAB);
+        assert_eq!(
+            (tab.contents(), tab.revision(), tab.buffer.cursor()),
+            before,
+            "{EDITED_RENDERED}"
+        );
+        assert!(!tab.is_dirty(), "{EDITED_RENDERED}");
+        assert_eq!(
+            workbench.flash.as_deref(),
+            Some(RENDERED_READ_ONLY),
+            "{NOT_REFUSED}"
+        );
+    }
+
+    #[test]
+    fn a_rendered_drag_scrolls_and_extends_outside_the_pane() {
+        let (_dir, mut workbench) = markdown_project(&tall_markdown());
+        toggle_rendered(&mut workbench);
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let text = workbench.panes.text;
+        workbench.handle_mouse(click(text.x, text.y));
+        workbench.handle_mouse(drag(text.right() - 1, text.bottom()));
+        let before = workbench.selected_text().expect(SELECTION_UNCOPIED);
+
+        assert!(workbench.is_busy(), "{WRONG_CLICK}");
+        let (changed, _) = workbench.tick();
+
+        assert!(changed, "{WRONG_CLICK}");
+        let after = workbench.selected_text().expect(SELECTION_UNCOPIED);
+        assert!(after.len() > before.len(), "{SELECTION_UNCOPIED}");
+        assert_eq!(
+            workbench.handle_mouse(release(text.right() - 1, text.bottom())),
+            WorkbenchAction::Copy(after),
+            "{SELECTION_UNCOPIED}"
+        );
+    }
+
+    #[test]
+    fn a_rendered_selection_is_invalidated_before_a_reloaded_file_is_painted() {
+        let (dir, mut workbench) = markdown_project(INDEXED_TEXT);
+        toggle_rendered(&mut workbench);
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        workbench.handle_key(press(keys::SELECT_ALL));
+        let file = dir.path().join(MARKDOWN_FILE);
+        fs::write(&file, REWRITTEN_TEXT).expect(STALE_TAB);
+
+        workbench.reload_paths([file.as_path()]);
+
+        assert!(workbench.selected_text().is_none(), "{SELECTION_STALE}");
+        assert_eq!(
+            workbench.handle_key(press(keys::COPY)),
+            WorkbenchAction::Passthrough,
+            "{COPY_TRAPPED}"
+        );
+    }
+
+    #[test]
+    fn rendered_selection_survives_theme_changes_but_not_reflow() {
+        let (_dir, mut workbench) = markdown_project(INDEXED_TEXT);
+        toggle_rendered(&mut workbench);
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        workbench.handle_key(press(keys::SELECT_ALL));
+
+        workbench.set_styles(WorkbenchStyles::default());
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+
+        assert_eq!(
+            workbench.selected_text().as_deref(),
+            Some(INDEXED_TEXT),
+            "{SELECTION_UNCOPIED}"
+        );
+        paint(&mut workbench, WIDE_TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        assert!(workbench.selected_text().is_none(), "{SELECTION_STALE}");
+    }
+
+    #[test]
+    fn selecting_all_before_the_first_rendered_frame_uses_current_contents() {
+        let (_dir, mut workbench) = markdown_project(INDEXED_TEXT);
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        toggle_rendered(&mut workbench);
+
+        workbench.handle_key(press(keys::SELECT_ALL));
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+
+        assert_eq!(
+            workbench.selected_text().as_deref(),
+            Some(INDEXED_TEXT),
+            "{SELECTION_UNCOPIED}"
+        );
+    }
+
+    #[test]
+    fn replacing_a_rendered_document_cancels_its_offscreen_drag() {
+        let (_dir, mut workbench) = markdown_project(INDEXED_TEXT);
+        let document = DocumentKey(DRAFT_KEY.to_owned());
+        workbench.open_document(
+            document.clone(),
+            TabLabel {
+                title: DRAFT_TITLE.to_owned(),
+                status: DRAFT_STATUS.to_owned(),
+            },
+            &tall_markdown(),
+        );
+        toggle_rendered(&mut workbench);
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let text = workbench.panes.text;
+        workbench.handle_mouse(click(text.x, text.y));
+        workbench.handle_mouse(drag(text.x, text.bottom()));
+
+        assert!(
+            workbench.replace_document(&document, NEWER_DRAFT),
+            "{STALE_DOCUMENT}"
+        );
+        workbench.tick();
+
+        assert_eq!(workbench.drag, Drag::None, "{SELECTION_STALE}");
+        assert!(workbench.selected_text().is_none(), "{SELECTION_STALE}");
+        assert_eq!(
+            workbench.handle_mouse(release(text.x, text.bottom())),
+            WorkbenchAction::Consumed,
+            "{IDLE_CLICK_COPIED}"
+        );
+    }
+
+    #[test]
+    fn changing_tabs_during_a_rendered_drag_never_copies_another_tabs_selection() {
+        let (dir, mut workbench) = markdown_project(INDEXED_TEXT);
+        fs::write(dir.path().join(NEWER_PLAN_FILE), REWRITTEN_TEXT).expect(NO_TAB);
+        workbench.open_path(&dir.path().join(NEWER_PLAN_FILE));
+        toggle_rendered(&mut workbench);
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        workbench.handle_key(press(keys::SELECT_ALL));
+        workbench.handle_key(press(keys::PREV_TAB));
+        toggle_rendered(&mut workbench);
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let text = workbench.panes.text;
+        workbench.handle_mouse(click(text.x, text.y));
+        workbench.handle_mouse(drag(text.right() - 1, text.y));
+
+        workbench.handle_key(press(keys::NEXT_TAB));
+        let action = workbench.handle_mouse(release(text.right() - 1, text.y));
+
+        assert_eq!(action, WorkbenchAction::Consumed, "{IDLE_CLICK_COPIED}");
+        assert_eq!(
+            workbench.selected_text().as_deref(),
+            Some(REWRITTEN_TEXT),
+            "{SELECTION_UNCOPIED}"
+        );
+    }
+
+    #[test]
+    fn a_rendered_selection_is_highlighted_after_scrolling() {
+        let (_dir, mut workbench) = markdown_project(&tall_markdown());
+        workbench.styles.selection = Style::new().bg(SELECTION_COLOUR);
+        toggle_rendered(&mut workbench);
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        workbench.handle_key(press(keys::SELECT_ALL));
+        workbench.handle_key(key(KeyCode::PageDown));
+
+        let surface = paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+
+        let text = workbench.panes.text;
+        assert_eq!(
+            surface[(text.x, text.y)].bg,
+            SELECTION_COLOUR,
+            "{SELECTION_UNPAINTED}"
+        );
+        assert_eq!(
+            workbench.selected_text().as_deref(),
+            Some(tall_markdown().as_str()),
+            "{SELECTION_UNCOPIED}"
+        );
+    }
+
+    #[test]
+    fn an_off_pane_rendered_drag_includes_the_rightmost_character() {
+        let (_dir, mut workbench) = markdown_project(INDEXED_TEXT);
+        toggle_rendered(&mut workbench);
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let width = workbench.panes.text.width as usize;
+        let source: String = FIRST_LINE
+            .repeat(width)
+            .chars()
+            .take(width - PAINTED.width())
+            .collect();
+        workbench
+            .editor
+            .active_mut()
+            .expect(NO_TAB)
+            .replace_text(&source);
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let text = workbench.panes.text;
+        workbench.handle_mouse(click(text.x, text.y));
+        workbench.handle_mouse(drag(text.right(), text.y));
+
+        assert_eq!(
+            workbench.handle_mouse(release(text.right(), text.y)),
+            WorkbenchAction::Copy(source),
+            "{SELECTION_UNCOPIED}"
+        );
+    }
+
+    #[test_case(false ; "commit details")]
+    #[test_case(true ; "remote diff")]
+    fn an_async_scm_tab_cancels_the_previous_rendered_drag(diff: bool) {
+        let (_dir, mut workbench) = markdown_project(INDEXED_TEXT);
+        toggle_rendered(&mut workbench);
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let text = workbench.panes.text;
+        workbench.handle_mouse(click(text.x, text.y));
+        workbench.handle_mouse(drag(text.right() - 1, text.y));
+
+        if diff {
+            workbench.open_remote_diff(DiffResult {
+                path: WorkspacePath::new(MARKDOWN_FILE).expect(NO_TAB),
+                target: ScmDiffTarget::Unstaged,
+                lines: Vec::new(),
+                old: INDEXED_TEXT.to_owned(),
+                new: REWRITTEN_TEXT.to_owned(),
+                warnings: Vec::new(),
+            });
+        } else {
+            workbench.push_commit_detail(&Commit {
+                id: INITIAL_MESSAGE.to_owned(),
+                summary: SUBJECT.to_owned(),
+                body: None,
+                author: FIRST_LINE.to_owned(),
+                email: String::new(),
+                committed: 0,
+                parents: Vec::new(),
+            });
+        }
+
+        assert_eq!(workbench.drag, Drag::None, "{SELECTION_STALE}");
+        assert_eq!(
+            workbench.handle_mouse(release(text.right() - 1, text.y)),
+            WorkbenchAction::Consumed,
+            "{IDLE_CLICK_COPIED}"
+        );
+    }
+
+    #[test]
+    fn rendered_selection_highlights_wide_and_combining_characters() {
+        let (_dir, mut workbench) =
+            markdown_project(&format!("{WIDE_GLYPH}{COMBINED_GLYPH}{SHORT_LINE}\n"));
+        workbench.styles.selection = Style::new().bg(SELECTION_COLOUR);
+        toggle_rendered(&mut workbench);
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let text = workbench.panes.text;
+        let wide = text.x + PAINTED.width() as u16;
+        let combined = wide + WIDE_GLYPH.width() as u16;
+        let after = combined + COMBINED_GLYPH.width() as u16;
+        workbench.handle_mouse(click(wide, text.y));
+        workbench.handle_mouse(drag(after, text.y));
+
+        let surface = paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+
+        for column in [wide, combined] {
+            assert_eq!(
+                surface[(column, text.y)].bg,
+                SELECTION_COLOUR,
+                "{SELECTION_UNPAINTED}"
+            );
+        }
+        assert_ne!(
+            surface[(after, text.y)].bg,
+            SELECTION_COLOUR,
+            "{SELECTION_UNPAINTED}"
+        );
+        assert_eq!(
+            workbench.selected_text(),
+            Some(format!("{WIDE_GLYPH}{COMBINED_GLYPH}")),
+            "{SELECTION_UNCOPIED}"
+        );
     }
 
     #[test]

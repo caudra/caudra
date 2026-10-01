@@ -308,16 +308,39 @@ impl Tab {
         self.rendered.is_some()
     }
 
+    pub(crate) fn rendered_view(&self) -> Option<&Rendered> {
+        self.rendered.as_ref()
+    }
+
     pub(crate) fn rendered_mut(&mut self) -> Option<&mut Rendered> {
         self.rendered.as_mut()
+    }
+
+    pub fn selected_text(&self) -> Option<String> {
+        match &self.rendered {
+            Some(view) => view.selected_text(self.revision),
+            None => self.buffer.selected_text(),
+        }
+    }
+
+    pub fn clear_selection(&mut self) -> bool {
+        match &mut self.rendered {
+            Some(view) => view.clear_selection(),
+            None => {
+                let selected = self.buffer.has_selection();
+                self.buffer.clear_selection();
+                selected
+            }
+        }
     }
 
     /// Flips between the source and the rendered view, keeping the reader at
     /// about the same point through the document. Reports whether it could:
     /// a tab with no Markdown in it has nothing to render.
     ///
-    /// The rendered view has no caret, so a selection or a find bar left open
-    /// over the source would act on text the reader cannot see.
+    /// A find bar left open over the source would act on text the reader
+    /// cannot see. The source selection stays, since the rendered view keeps
+    /// its own.
     pub fn toggle_rendered(&mut self) -> bool {
         if self.is_rendered() {
             self.show_source();
@@ -326,7 +349,6 @@ impl Tab {
         if !self.is_markdown() {
             return false;
         }
-        self.buffer.clear_selection();
         self.find.close();
         self.rendered = Some(Rendered::entered_at(self.scroll, self.buffer.line_count()));
         true
@@ -356,7 +378,11 @@ impl Tab {
             theme_generation,
         };
         let view = self.rendered.as_mut()?;
-        view.paint(painting, || self.buffer.lines().join("\n"), paint);
+        view.paint(
+            painting,
+            || read::encode(self.buffer.lines(), self.line_ending, self.trailing_newline),
+            paint,
+        );
         Some(view)
     }
 
@@ -441,7 +467,7 @@ impl Tab {
         };
         self.highlighter.invalidate_from(edit.at.line);
         self.history.record(edit);
-        self.revision += 1;
+        self.changed();
         true
     }
 
@@ -451,7 +477,7 @@ impl Tab {
         };
         self.highlighter.invalidate_from(edit.at.line);
         self.buffer.replay(&edit);
-        self.revision += 1;
+        self.changed();
         true
     }
 
@@ -461,8 +487,15 @@ impl Tab {
         };
         self.highlighter.invalidate_from(edit.at.line);
         self.buffer.replay(&edit);
-        self.revision += 1;
+        self.changed();
         true
+    }
+
+    fn changed(&mut self) {
+        self.revision += 1;
+        if let Some(view) = &mut self.rendered {
+            view.clear_selection();
+        }
     }
 
     /// Runs the find query from the caret, after the query changed.
@@ -601,7 +634,7 @@ impl Tab {
         self.notice = loaded.read_only;
         self.modified = loaded.modified;
         self.buffer = Buffer::new(loaded.lines);
-        self.revision += 1;
+        self.changed();
         self.buffer.set_cursor(cursor, false);
         self.scroll = scroll.min(self.buffer.line_count().saturating_sub(1));
         self.scroll_row = 0;
@@ -639,7 +672,7 @@ impl Tab {
         self.line_ending = loaded.line_ending;
         self.trailing_newline = loaded.trailing_newline;
         self.buffer = Buffer::new(loaded.lines);
-        self.revision += 1;
+        self.changed();
         self.buffer.set_cursor(cursor, false);
         self.scroll = scroll.min(self.buffer.line_count().saturating_sub(1));
         self.scroll_row = 0;
@@ -1013,9 +1046,14 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::buffer::Cursor;
-    use super::{DiffKind, DiffRow, Editor, Tab, WorkbenchPath};
+    use super::rendered::PaintedMarkdown;
+    use super::{DiffKind, DiffRow, DocumentKey, Editor, Tab, TabLabel, WorkbenchPath};
+    use crate::fs::backend::{LoadedFile, ResourceEntry};
+    use crate::fs::read;
     use crate::keys;
+    use caudra_workspace::{ResourceKind, WorkspacePath};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::text::Line;
     use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
@@ -1040,6 +1078,306 @@ mod tests {
     const MOVED_WRONG: &str = "the chord did not take the caret where its motion points";
     const MOTION_UNREPORTED: &str = "a motion must report that the caret may have moved";
     const ALT_TYPED: &str = "AltGr types its character, and bare Alt, dead on macOS, types nothing";
+    const PAINT_WIDTH: u16 = 40;
+    const PAINT_THEME: u64 = 7;
+    const ADDITION: &str = "draft ";
+    const REPLACEMENT: &str = "# Replacement\n\nNew *contents*.\n";
+    const CRLF_MARKDOWN: &str = "\r\n# Title\r\n\r\nSome *prose*.\r\n\r\n";
+    const NO_FINAL_NEWLINE: &str = "\n# Title\nSome *prose*.  ";
+    const BLANK_MARKDOWN: &str = "\n\n";
+    const SPACE_MARKDOWN: &str = " \t\n  ";
+    const EMPTY_MARKDOWN: &str = "";
+    const SOURCE_DISTURBED: &str =
+        "rendered selection disturbed the source cursor, selection or history";
+    const STALE_SELECTION: &str =
+        "source changes retained a rendered selection or anchor before repaint";
+    const WRONG_SOURCE: &str = "rendered copy did not preserve the complete current document";
+    const NO_RENDERED: &str = "the Markdown tab has no rendered view";
+    const DOCUMENT_STATUS: &str = "draft";
+
+    enum SourceEdit {
+        Insert,
+        Undo,
+        Redo,
+    }
+
+    fn markdown_tab(text: &str) -> Tab {
+        Tab::from_load(
+            Path::new(MARKDOWN_FILE),
+            read::decode(text, None),
+            PAINT_THEME,
+        )
+    }
+
+    fn paint_source(text: &str, _width: u16) -> PaintedMarkdown {
+        let lines = text
+            .lines()
+            .map(|line| Line::from(line.to_owned()))
+            .collect();
+        let source = text.to_owned();
+        PaintedMarkdown::new(lines, move |_, _, _| Some(source.clone()))
+    }
+
+    fn paint_placeholder(text: &str, _width: u16) -> PaintedMarkdown {
+        let source = text.to_owned();
+        PaintedMarkdown::new(vec![Line::default()], move |rows, start, end| {
+            assert_eq!(rows.len(), 1, "{WRONG_SOURCE}");
+            assert!(rows[0].spans.is_empty(), "{WRONG_SOURCE}");
+            assert_eq!(start, (0, 0), "{WRONG_SOURCE}");
+            assert_eq!(end, (0, 0), "{WRONG_SOURCE}");
+            Some(source.clone())
+        })
+    }
+
+    fn select_rendered(tab: &mut Tab) {
+        if !tab.is_rendered() {
+            assert!(tab.toggle_rendered(), "{NO_RENDERED}");
+        }
+        tab.rendered(PAINT_WIDTH, PAINT_THEME, paint_source)
+            .expect(NO_RENDERED);
+        tab.rendered_mut().expect(NO_RENDERED).select_all();
+        assert_eq!(tab.selected_text(), Some(tab.contents()), "{WRONG_SOURCE}");
+    }
+
+    fn assert_rendered_selection_invalidated(tab: &mut Tab) {
+        assert_eq!(tab.selected_text(), None, "{STALE_SELECTION}");
+        let view = tab.rendered_mut().expect(NO_RENDERED);
+        assert!(!view.is_selecting(), "{STALE_SELECTION}");
+        view.extend_to(Cursor::new(usize::MAX, usize::MAX));
+        assert!(!view.is_selecting(), "{STALE_SELECTION}");
+        assert_eq!(view.selection_columns(0), None, "{STALE_SELECTION}");
+        assert!(!tab.clear_selection(), "{STALE_SELECTION}");
+    }
+
+    fn remote_markdown(text: &str) -> LoadedFile {
+        let loaded = read::decode(text, None);
+        LoadedFile {
+            entry: ResourceEntry {
+                path: WorkbenchPath::Remote(WorkspacePath::new(MARKDOWN_FILE).unwrap()),
+                resource_id: None,
+                revision: None,
+                kind: ResourceKind::File,
+                size_bytes: None,
+            },
+            lines: loaded.lines,
+            line_ending: loaded.line_ending,
+            trailing_newline: loaded.trailing_newline,
+        }
+    }
+
+    #[test_case(MARKDOWN ; "lf_and_final_newline")]
+    #[test_case(CRLF_MARKDOWN ; "crlf_and_blank_boundaries")]
+    #[test_case(NO_FINAL_NEWLINE ; "unterminated_and_trailing_spaces")]
+    fn rendered_copy_uses_unsaved_source_with_original_line_endings(source: &str) {
+        let mut tab = markdown_tab(source);
+        let edit = tab.buffer.insert(ADDITION);
+        assert!(tab.record(edit));
+        select_rendered(&mut tab);
+
+        assert!(tab.is_dirty(), "{DIRTY_AFTER_EDIT}");
+        assert_eq!(
+            tab.selected_text(),
+            Some(format!("{ADDITION}{source}")),
+            "{WRONG_SOURCE}"
+        );
+    }
+
+    #[test_case(BLANK_MARKDOWN, true ; "blank_lines")]
+    #[test_case(SPACE_MARKDOWN, true ; "spaces_and_tabs")]
+    #[test_case(EMPTY_MARKDOWN, false ; "empty_source")]
+    fn select_all_can_copy_invisible_source_but_plain_clicks_cannot(source: &str, nonempty: bool) {
+        let mut tab = markdown_tab(source);
+        assert!(tab.toggle_rendered(), "{NO_RENDERED}");
+        tab.rendered(PAINT_WIDTH, PAINT_THEME, paint_placeholder)
+            .expect(NO_RENDERED);
+        tab.rendered_mut().expect(NO_RENDERED).select_all();
+
+        assert_eq!(
+            tab.selected_text().as_deref(),
+            nonempty.then_some(source),
+            "{WRONG_SOURCE}"
+        );
+        assert_eq!(
+            tab.rendered_view().expect(NO_RENDERED).is_selecting(),
+            nonempty,
+            "{WRONG_SOURCE}"
+        );
+        assert_eq!(
+            tab.rendered_view().expect(NO_RENDERED).selection_columns(0),
+            None,
+            "{WRONG_SOURCE}"
+        );
+        tab.rendered(PAINT_WIDTH, PAINT_THEME + 1, paint_placeholder)
+            .expect(NO_RENDERED);
+        assert_eq!(
+            tab.selected_text().as_deref(),
+            nonempty.then_some(source),
+            "{WRONG_SOURCE}"
+        );
+        assert_eq!(tab.clear_selection(), nonempty, "{WRONG_SOURCE}");
+
+        let view = tab.rendered_mut().expect(NO_RENDERED);
+        view.select_all();
+        view.select_at(Cursor::default(), 1);
+        view.extend_to(Cursor::default());
+        assert_eq!(tab.selected_text(), None, "{WRONG_SOURCE}");
+        assert!(!tab.clear_selection(), "{WRONG_SOURCE}");
+
+        tab.rendered_mut().expect(NO_RENDERED).select_all();
+        tab.replace_text(EMPTY_MARKDOWN);
+        assert_rendered_selection_invalidated(&mut tab);
+        tab.rendered(PAINT_WIDTH, PAINT_THEME, paint_placeholder)
+            .expect(NO_RENDERED);
+        tab.rendered_mut().expect(NO_RENDERED).select_all();
+        assert_eq!(tab.selected_text(), None, "{WRONG_SOURCE}");
+        assert!(!tab.clear_selection(), "{WRONG_SOURCE}");
+    }
+
+    #[test_case(false ; "clear_rendered_selection")]
+    #[test_case(true ; "leave_rendered_selection")]
+    fn toggling_rendered_preserves_source_selection_cursor_and_history(leave_selected: bool) {
+        let mut tab = markdown_tab(MARKDOWN);
+        let edit = tab.buffer.insert(ADDITION);
+        assert!(tab.record(edit));
+        tab.buffer.select_word_at(Cursor::default());
+        let selection = tab.buffer.selection();
+        let source_selection = tab.selected_text();
+        let cursor = tab.buffer.cursor();
+        let revision = tab.revision();
+        let contents = tab.contents();
+
+        assert!(tab.toggle_rendered(), "{NO_RENDERED}");
+        assert_eq!(tab.selected_text(), None, "{SOURCE_DISTURBED}");
+        select_rendered(&mut tab);
+        if !leave_selected {
+            assert!(tab.clear_selection(), "{SOURCE_DISTURBED}");
+            assert!(!tab.clear_selection(), "{SOURCE_DISTURBED}");
+        }
+        assert!(tab.toggle_rendered(), "{NO_RENDERED}");
+
+        assert_eq!(tab.buffer.cursor(), cursor, "{SOURCE_DISTURBED}");
+        assert_eq!(tab.buffer.selection(), selection, "{SOURCE_DISTURBED}");
+        assert_eq!(tab.selected_text(), source_selection, "{SOURCE_DISTURBED}");
+        assert_eq!(tab.revision(), revision, "{SOURCE_DISTURBED}");
+        assert_eq!(tab.contents(), contents, "{SOURCE_DISTURBED}");
+        assert!(tab.is_dirty(), "{SOURCE_DISTURBED}");
+        assert!(tab.clear_selection(), "{SOURCE_DISTURBED}");
+        assert!(!tab.clear_selection(), "{SOURCE_DISTURBED}");
+        assert_eq!(tab.buffer.cursor(), cursor, "{SOURCE_DISTURBED}");
+
+        assert!(tab.toggle_rendered(), "{NO_RENDERED}");
+        assert!(
+            !tab.rendered_view().expect(NO_RENDERED).is_selecting(),
+            "{STALE_SELECTION}"
+        );
+        tab.show_source();
+        assert!(tab.undo(), "{SOURCE_DISTURBED}");
+        assert_eq!(tab.contents(), MARKDOWN, "{SOURCE_DISTURBED}");
+        assert!(tab.redo(), "{SOURCE_DISTURBED}");
+        assert_eq!(tab.contents(), contents, "{SOURCE_DISTURBED}");
+    }
+
+    #[test_case(SourceEdit::Insert ; "record")]
+    #[test_case(SourceEdit::Undo ; "undo")]
+    #[test_case(SourceEdit::Redo ; "redo")]
+    fn source_edits_invalidate_rendered_selection_before_repaint(change: SourceEdit) {
+        let mut tab = markdown_tab(MARKDOWN);
+        let edit = tab.buffer.insert(ADDITION);
+        assert!(tab.record(edit));
+        if matches!(change, SourceEdit::Redo) {
+            assert!(tab.undo());
+        }
+        select_rendered(&mut tab);
+        let revision = tab.revision();
+
+        assert!(match change {
+            SourceEdit::Insert => {
+                let edit = tab.buffer.insert(ADDITION);
+                tab.record(edit)
+            }
+            SourceEdit::Undo => tab.undo(),
+            SourceEdit::Redo => tab.redo(),
+        });
+
+        assert_eq!(tab.revision(), revision + 1);
+        assert_rendered_selection_invalidated(&mut tab);
+    }
+
+    #[test_case(REPLACEMENT ; "host_document_replacement")]
+    fn host_replacement_invalidates_rendered_selection_before_repaint(replacement: &str) {
+        let mut tab = Tab::document(
+            Path::new(MARKDOWN_FILE),
+            DocumentKey(MARKDOWN_FILE.to_owned()),
+            TabLabel {
+                title: MARKDOWN_FILE.to_owned(),
+                status: DOCUMENT_STATUS.to_owned(),
+            },
+            MARKDOWN,
+            PAINT_THEME,
+        );
+        let cursor = Cursor::new(0, 3);
+        tab.buffer.set_cursor(cursor, false);
+        select_rendered(&mut tab);
+
+        tab.replace_text(replacement);
+
+        assert_rendered_selection_invalidated(&mut tab);
+        assert_eq!(tab.contents(), replacement, "{WRONG_SOURCE}");
+        assert_eq!(tab.buffer.cursor(), cursor, "{SOURCE_DISTURBED}");
+        select_rendered(&mut tab);
+        assert_eq!(
+            tab.selected_text().as_deref(),
+            Some(replacement),
+            "{WRONG_SOURCE}"
+        );
+    }
+
+    #[test_case(false ; "clean_remote_reload")]
+    #[test_case(true ; "discard_dirty_remote_reload")]
+    fn remote_replacement_invalidates_rendered_selection_before_repaint(discard: bool) {
+        let mut tab = Tab::from_backend(remote_markdown(MARKDOWN), PAINT_THEME);
+        if discard {
+            let edit = tab.buffer.insert(ADDITION);
+            assert!(tab.record(edit));
+        }
+        select_rendered(&mut tab);
+        let cursor = tab.buffer.cursor();
+
+        if discard {
+            tab.discard_backend(remote_markdown(REPLACEMENT));
+        } else {
+            assert!(tab.apply_backend_reload(remote_markdown(REPLACEMENT)));
+        }
+
+        assert_rendered_selection_invalidated(&mut tab);
+        assert_eq!(tab.contents(), REPLACEMENT, "{WRONG_SOURCE}");
+        assert_eq!(tab.buffer.cursor(), cursor, "{SOURCE_DISTURBED}");
+        assert!(!tab.is_dirty(), "{CLEAN_START}");
+    }
+
+    #[test_case(false ; "clean_local_reload")]
+    #[test_case(true ; "discard_dirty_local_reload")]
+    fn disk_reload_invalidates_rendered_selection_before_repaint(discard: bool) {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(MARKDOWN_FILE);
+        fs::write(&path, MARKDOWN).unwrap();
+        let mut tab = Tab::open(&path, PAINT_THEME).unwrap();
+        if discard {
+            let edit = tab.buffer.insert(ADDITION);
+            assert!(tab.record(edit));
+        }
+        select_rendered(&mut tab);
+        fs::write(&path, REPLACEMENT).unwrap();
+
+        if discard {
+            tab.discard_and_reload().unwrap();
+        } else {
+            assert!(tab.reload_from_disk().unwrap());
+        }
+
+        assert_rendered_selection_invalidated(&mut tab);
+        assert_eq!(tab.contents(), REPLACEMENT, "{WRONG_SOURCE}");
+    }
 
     #[cfg(unix)]
     mod local_source {
