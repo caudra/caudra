@@ -47,7 +47,8 @@ use crate::app::background_delivery::DeliveryFence;
 use self::agent_loop::AgentLoop;
 use self::command_router::spawn_command_router;
 pub(crate) use self::shared_queue::{QueueSender, QueuedMessage};
-use self::workflow::{SharedMode, WorkflowSession, WorkflowSpawn, answer_channel};
+pub(crate) use self::workflow::SharedMode;
+use self::workflow::{WorkflowSession, WorkflowSpawn, answer_channel};
 
 const TRANSITION_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 const BACKGROUND_TRANSITION_BUSY: &str =
@@ -112,6 +113,7 @@ pub(crate) struct AgentHandles {
     pub(crate) context_store: ContextStore,
     /// Resolved for the active lane without replacing the selected Chat slot.
     pub(crate) effective_model_slot: Arc<ArcSwap<ModelSlot>>,
+    pub(crate) execution_mode: SharedMode,
     pub(crate) mcp_handle: Option<McpHandle>,
     pub(crate) mcp_config_errors: McpConfigErrors,
     pub(crate) queue: QueueSender,
@@ -191,6 +193,8 @@ impl AgentHandles {
         spawn_agent_internal(
             flume::unbounded(),
             model_slot,
+            Arc::new(ArcSwap::new(model_slot.load_full())),
+            Arc::new(ArcSwap::from_pointee(AgentMode::default())),
             initial_history,
             archived_history,
             todos,
@@ -253,8 +257,10 @@ impl AgentHandles {
             .workspace_binding()
             .and_then(|binding| binding.sandbox_record());
         let gate = app.sandbox_live.network_gate.clone();
+        let fence = Arc::clone(&self.delivery_fence);
         self.queue.set_dispatch_guard(Arc::new(move || {
-            sandbox.is_none_or(|id| gate.lock().is_ok_and(|gate| gate.blocker(id).is_none()))
+            fence.dispatch_allowed()
+                && sandbox.is_none_or(|id| gate.lock().is_ok_and(|gate| gate.blocker(id).is_none()))
         }));
         app.answer_tx = Some(self.answer_tx.clone());
         app.cmd_tx = Some(self.cmd_tx.clone());
@@ -262,6 +268,17 @@ impl AgentHandles {
         app.forget_merged_history();
         app.btw_prompt = Some(Arc::clone(&self.btw_prompt));
         app.context_store = Some(self.context_store.clone());
+        if app
+            .execution_mode
+            .as_ref()
+            .is_none_or(|mode| !Arc::ptr_eq(mode, &self.execution_mode))
+        {
+            self.execution_mode
+                .store(Arc::new(app.execution_agent_mode()));
+        }
+        app.execution_mode = Some(Arc::clone(&self.execution_mode));
+        self.queue
+            .set_execution_mode(AgentMode::clone(&self.execution_mode.load()));
         app.effective_model_slot = Some(Arc::clone(&self.effective_model_slot));
         app.queue.set_shared(self.queue.clone());
         if self.goal.status().is_none() {
@@ -397,6 +414,16 @@ impl AgentHandles {
         let new = spawn_agent_internal(
             (self.agent_tx.clone(), self.agent_rx.clone()),
             model_slot,
+            if same_session {
+                Arc::clone(&self.effective_model_slot)
+            } else {
+                Arc::new(ArcSwap::new(model_slot.load_full()))
+            },
+            if same_session {
+                Arc::clone(&self.execution_mode)
+            } else {
+                Arc::new(ArcSwap::from_pointee(app.execution_agent_mode()))
+            },
             history,
             archived,
             todos,
@@ -433,6 +460,9 @@ impl AgentHandles {
         let old = mem::replace(self, new);
         // Repoint the app at the new queue before dropping `old`, otherwise the app keeps
         // the last old `QueueSender` alive and the old loop parks in `recv_notify` forever.
+        if same_session {
+            app.execution_mode = Some(Arc::clone(&self.execution_mode));
+        }
         self.apply_to_app(app);
         app.refresh_workflow_cards();
         app.flush_restored_queue();
@@ -498,6 +528,8 @@ enum WorkflowSlot {
 fn spawn_agent_internal(
     (agent_tx, agent_rx): (flume::Sender<Envelope>, flume::Receiver<Envelope>),
     model_slot: &Arc<ArcSwap<ModelSlot>>,
+    effective_model_slot: Arc<ArcSwap<ModelSlot>>,
+    execution_mode: SharedMode,
     initial_history: Vec<HistoryItem>,
     archived_history: Vec<HistoryItem>,
     todos: Option<Vec<TodoItem>>,
@@ -551,7 +583,7 @@ fn spawn_agent_internal(
     let shared_history: SharedHistory = Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(
         initial_history.clone(),
     )));
-    let initial_model = model_slot.load();
+    let initial_model = effective_model_slot.load();
     let btw_prompt: SharedBtwPrompt = Arc::new(ArcSwap::from_pointee(BtwPrompt {
         provider: Arc::clone(&initial_model.provider),
         model: initial_model.model.clone(),
@@ -573,10 +605,6 @@ fn spawn_agent_internal(
             .as_ref()
             .map_or(BUILTIN_PROFILE_NAME, |profile| profile.name()),
     );
-    let effective_model_slot = match &workflow {
-        WorkflowSlot::Reuse(current) => current.effective_model_slot(),
-        WorkflowSlot::Fresh(_) => Arc::new(ArcSwap::new(model_slot.load_full())),
-    };
     // Before the loop, so its `workflow` tool reaches the runtime from the
     // first turn.
     let workflow = match workflow {
@@ -589,8 +617,8 @@ fn spawn_agent_internal(
                         background: background.clone(),
                         state_dir,
                         session_id: session_id.id(),
-                        model_slot,
                         effective_model_slot: &effective_model_slot,
+                        execution_mode: &execution_mode,
                         config: &config,
                         tool_output_lines,
                         permissions,
@@ -614,11 +642,6 @@ fn spawn_agent_internal(
                 })
         }
     };
-    let mode: SharedMode = workflow.as_ref().map_or_else(
-        || Arc::new(ArcSwap::from_pointee(AgentMode::default())),
-        WorkflowSession::mode,
-    );
-
     spawn_command_router(
         cmd_rx,
         Arc::clone(&cancel_map),
@@ -659,7 +682,7 @@ fn spawn_agent_internal(
         workflow.as_ref().map(WorkflowSession::handle),
         background.clone(),
         Arc::clone(&delivery_fence),
-        mode,
+        Arc::clone(&execution_mode),
         Arc::clone(&path_locks),
         baseline,
         workspace_session.clone(),
@@ -682,6 +705,7 @@ fn spawn_agent_internal(
         btw_prompt,
         context_store,
         effective_model_slot,
+        execution_mode,
         mcp_handle,
         mcp_config_errors,
         queue: queue_tx,
@@ -825,12 +849,20 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Instant;
 
-    use caudra_agent::AgentEvent;
-    use caudra_config::{PermissionsConfig, SnapshotsConfig};
+    use caudra_agent::{AgentEvent, AgentInput, PromptAdmission};
+    use caudra_config::{Feature, FeatureFlags, PermissionsConfig, SnapshotsConfig};
     use caudra_providers::provider::BoxFuture;
     use caudra_providers::{
         AgentError, CacheKey, ModelInfo, ProviderEvent, RequestOptions, StreamResponse,
     };
+    use caudra_storage::sessions::PermissionMode;
+    use caudra_workflow::{LaunchRequest, WorkflowRequest, WorkflowResponse};
+    use caudra_workspace::PlanRef;
+    use test_case::test_case;
+
+    use crate::app::{Mode, PlanState};
+
+    use super::shared_queue::QueueItem;
 
     use super::*;
 
@@ -840,13 +872,20 @@ mod tests {
     const RESTORED_TEXT: &str = "restored-queued-message";
     const RESUMED_HISTORY_TEXT: &str = "resumed-conversation";
     const STUB_SNAPSHOT_KEY: &str = "stub";
+    const PLAN_PATH: &str = ".caudra/plans/runtime-mode.md";
+    const PLAN_REF: &str = "plan-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const COMMITTED_MODEL: &str = "committed-model";
+    const SELECTED_MODEL: &str = "pending-model";
+    const ROUTE_REQUEST_MISSING: &str = "runtime did not request the expected model route";
+    const REVIEW_WORKFLOW: &str = "review-changes";
+    const WORKFLOW_BUDGET: u32 = 1;
 
-    struct StubProvider;
+    struct StubProvider(Option<flume::Sender<String>>);
 
     impl Provider for StubProvider {
         fn stream_message<'a>(
             &'a self,
-            _model: &'a Model,
+            model: &'a Model,
             _messages: &'a [Message],
             _system: &'a str,
             _tools: &'a serde_json::Value,
@@ -854,7 +893,14 @@ mod tests {
             _opts: RequestOptions,
             _cache_key: Option<&'a CacheKey>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-            Box::pin(std::future::pending())
+            Box::pin(async move {
+                if let Some(requests) = &self.0 {
+                    requests
+                        .send(model.id.clone())
+                        .map_err(|_| AgentError::Channel)?;
+                }
+                future::pending().await
+            })
         }
 
         fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
@@ -877,13 +923,14 @@ mod tests {
         Arc<ArcSwap<ModelSlot>>,
         Arc<PermissionManager>,
     ) {
-        stub_spawn_with_session(initial_history, None, None)
+        stub_spawn_with_session(initial_history, None, None, None)
     }
 
     fn stub_spawn_with_session(
         initial_history: Vec<Message>,
         session_id: Option<SessionRef>,
         session_lease: Option<Arc<SessionLease>>,
+        state_dir: Option<StateDir>,
     ) -> (
         AgentHandles,
         Arc<ArcSwap<ModelSlot>>,
@@ -891,7 +938,7 @@ mod tests {
     ) {
         let model_slot = Arc::new(ArcSwap::from_pointee(ModelSlot {
             model: crate::components::test_model(),
-            provider: Arc::new(StubProvider),
+            provider: Arc::new(StubProvider(None)),
         }));
         let permissions = Arc::new(PermissionManager::new_nonpersistent(
             PermissionsConfig::default(),
@@ -903,7 +950,14 @@ mod tests {
             crate::history_items(&initial_history),
             Vec::new(),
             None,
-            AgentConfig::default(),
+            AgentConfig {
+                features: if state_dir.is_some() {
+                    FeatureFlags::NONE.with(Feature::Workflows)
+                } else {
+                    FeatureFlags::NONE
+                },
+                ..Default::default()
+            },
             ToolOutputLines::default(),
             &permissions,
             session_id,
@@ -917,7 +971,7 @@ mod tests {
             SubagentHistoryStore::default(),
             None,
             Arc::new(PromptProfileCatalog::default()),
-            None,
+            state_dir,
             WorkspaceBaseline::new(
                 Arc::new(caudra_agent::snapshots::SnapshotStore::new(
                     &std::env::temp_dir().join("caudra-agent-test-snapshots"),
@@ -946,6 +1000,7 @@ mod tests {
             Vec::new(),
             Some(SessionRef::from(id)),
             Some(Arc::clone(&lease)),
+            None,
         );
         drop(lease);
 
@@ -967,7 +1022,10 @@ mod tests {
         handles.respawn(
             Vec::new(),
             model_slot,
-            AgentConfig::default(),
+            AgentConfig {
+                features: FeatureFlags::NONE,
+                ..Default::default()
+            },
             ToolOutputLines::default(),
             permissions,
             app,
@@ -993,6 +1051,7 @@ mod tests {
         app.state.session_mut().meta.queued_messages =
             vec![caudra_storage::sessions::StoredQueuedPrompt {
                 text: RESTORED_TEXT.into(),
+                mode: None,
                 images: Vec::new(),
                 paste_ranges: Vec::new(),
             }];
@@ -1051,6 +1110,193 @@ mod tests {
         let mut app = crate::app::tests::test_app();
         respawn(&mut handles, &model_slot, &permissions, &mut app);
         assert!(Arc::ptr_eq(&handles.path_locks, &before));
+    }
+
+    #[test_case(false; "build_with_pending_plan")]
+    #[test_case(true; "plan_with_pending_build")]
+    fn first_binding_seeds_execution_mode_and_rebinding_preserves_live_mode(planning: bool) {
+        let (handles, _, _) = stub_spawn();
+        let mut app = crate::app::tests::test_app();
+        app.state.mode = if planning { Mode::Build } else { Mode::Plan };
+        app.state.applied_mode = if planning { Mode::Plan } else { Mode::Build };
+        app.state.plan = PlanState::Drafting(PLAN_PATH.into());
+        let restored_mode = if planning {
+            AgentMode::Plan(PLAN_PATH.into())
+        } else {
+            AgentMode::Build
+        };
+
+        handles.apply_to_app(&mut app);
+        assert_eq!(**handles.execution_mode.load(), restored_mode);
+        let admitted_mode = if planning {
+            AgentMode::Build
+        } else {
+            AgentMode::Plan(PLAN_PATH.into())
+        };
+        handles
+            .execution_mode
+            .store(Arc::new(admitted_mode.clone()));
+        handles.apply_to_app(&mut app);
+        assert_eq!(app.execution_agent_mode(), admitted_mode);
+        assert!(Arc::ptr_eq(
+            app.execution_mode.as_ref().unwrap(),
+            &handles.execution_mode
+        ));
+    }
+
+    #[test_case(AgentMode::Build; "build")]
+    #[test_case(AgentMode::ReadOnly; "read_only")]
+    #[test_case(AgentMode::Plan(PLAN_PATH.into()); "local_plan")]
+    #[test_case(AgentMode::RemotePlan(PlanRef::new(PLAN_REF).unwrap()); "remote_plan")]
+    fn respawn_without_workflows_keeps_execution_mode_and_route(mode: AgentMode) {
+        let mut app = crate::app::tests::test_app();
+        let (mut handles, model_slot, permissions) = stub_spawn_with_session(
+            Vec::new(),
+            Some(SessionRef::from(app.state.session.id)),
+            None,
+            None,
+        );
+        handles.apply_to_app(&mut app);
+        handles.execution_mode.store(Arc::new(mode.clone()));
+        let execution_mode = Arc::clone(&handles.execution_mode);
+        let route = Arc::clone(&handles.effective_model_slot);
+        let committed = route.load_full();
+        let mut selected_model = committed.model.clone();
+        selected_model.id = SELECTED_MODEL.into();
+        model_slot.store(Arc::new(ModelSlot {
+            model: selected_model,
+            provider: Arc::clone(&committed.provider),
+        }));
+        app.state.mode = if mode.is_planning() {
+            Mode::Build
+        } else {
+            Mode::Plan
+        };
+        app.state.applied_mode = app.state.mode;
+        app.state.plan = PlanState::Drafting(PLAN_PATH.into());
+        app.execution_mode = None;
+
+        respawn(&mut handles, &model_slot, &permissions, &mut app);
+
+        assert!(handles.workflow_handle().is_none());
+        assert!(Arc::ptr_eq(&handles.execution_mode, &execution_mode));
+        assert!(Arc::ptr_eq(&handles.effective_model_slot, &route));
+        assert!(Arc::ptr_eq(
+            &handles.effective_model_slot.load_full(),
+            &committed
+        ));
+        assert_eq!(app.execution_agent_mode(), mode);
+    }
+
+    #[test_case(false; "build_session")]
+    #[test_case(true; "plan_session")]
+    fn new_session_replaces_execution_mode_and_route(planning: bool) {
+        let (mut handles, model_slot, permissions) = stub_spawn();
+        let old_mode = Arc::clone(&handles.execution_mode);
+        let old_route = Arc::clone(&handles.effective_model_slot);
+        let mut app = crate::app::tests::test_app();
+        app.state.mode = if planning { Mode::Plan } else { Mode::Build };
+        app.state.applied_mode = app.state.mode;
+        app.state.plan = PlanState::Drafting(PLAN_PATH.into());
+        let expected = app.execution_agent_mode();
+
+        respawn(&mut handles, &model_slot, &permissions, &mut app);
+
+        assert!(!Arc::ptr_eq(&handles.execution_mode, &old_mode));
+        assert!(!Arc::ptr_eq(&handles.effective_model_slot, &old_route));
+        assert_eq!(app.execution_agent_mode(), expected);
+    }
+
+    #[test_case(AgentMode::Build, true, false; "build_automatic_keeps_committed_route")]
+    #[test_case(AgentMode::Plan(PLAN_PATH.into()), true, false; "plan_automatic_keeps_committed_route")]
+    #[test_case(AgentMode::Build, false, false; "explicit_input_uses_selected_route")]
+    #[test_case(AgentMode::Build, true, true; "workflow_keeps_committed_route")]
+    fn respawned_runtime_selects_route_at_admission(
+        mode: AgentMode,
+        automatic: bool,
+        workflow: bool,
+    ) {
+        let mut app = crate::app::tests::test_app();
+        if workflow {
+            Arc::make_mut(&mut app.state.session)
+                .save(&app.storage)
+                .unwrap();
+        }
+        let (mut handles, model_slot, permissions) = stub_spawn_with_session(
+            Vec::new(),
+            Some(SessionRef::from(app.state.session.id)),
+            None,
+            workflow.then(|| app.storage.clone()),
+        );
+        handles.apply_to_app(&mut app);
+        handles.execution_mode.store(Arc::new(mode.clone()));
+        let (requests, received) = flume::unbounded();
+        let provider: Arc<dyn Provider> = Arc::new(StubProvider(Some(requests)));
+        let mut committed_model = crate::components::test_model();
+        committed_model.id = COMMITTED_MODEL.into();
+        handles.effective_model_slot.store(Arc::new(ModelSlot {
+            model: committed_model.clone(),
+            provider: Arc::clone(&provider),
+        }));
+        let mut selected_model = committed_model;
+        selected_model.id = SELECTED_MODEL.into();
+        model_slot.store(Arc::new(ModelSlot {
+            model: selected_model,
+            provider,
+        }));
+        respawn(&mut handles, &model_slot, &permissions, &mut app);
+        if workflow {
+            permissions.set_session_mode(Some(PermissionMode::Yolo));
+            let response = smol::block_on(handles.workflow_handle().unwrap().request(
+                WorkflowRequest::Start(LaunchRequest {
+                    name: REVIEW_WORKFLOW.into(),
+                    args: serde_json::json!({"scope": PROBE_TEXT}),
+                    agent_budget: Some(WORKFLOW_BUDGET),
+                }),
+            ))
+            .unwrap();
+            assert!(matches!(response, WorkflowResponse::Started(_)));
+        } else {
+            let text = if automatic {
+                String::new()
+            } else {
+                PROBE_TEXT.into()
+            };
+            handles.queue.push(QueueItem::Message {
+                text: text.clone(),
+                image_count: 0,
+                paste_ranges: Vec::new(),
+                input: Box::new(AgentInput {
+                    message: text,
+                    mode: app.execution_agent_mode(),
+                    images: Vec::new(),
+                    mentions: Vec::new(),
+                    commits: Vec::new(),
+                    preamble: vec![Message::observation(PROBE_TEXT.into())],
+                    thinking: Default::default(),
+                    fast: false,
+                    prompt: None,
+                    resume: false,
+                }),
+                run_id: app.run_id,
+                admission: PromptAdmission::Queue,
+                displayed: true,
+            });
+        }
+
+        assert_eq!(
+            received
+                .recv_timeout(LONG_TIMEOUT)
+                .expect(ROUTE_REQUEST_MISSING),
+            if automatic {
+                COMMITTED_MODEL
+            } else {
+                SELECTED_MODEL
+            }
+        );
+        assert_eq!(app.execution_agent_mode(), mode);
+        handles.shutdown_workflow();
+        smol::block_on(handles.into_task().cancel());
     }
 
     /// If the seeded empty snapshot ever outlived `spawn`, the next checkpoint

@@ -417,7 +417,7 @@ impl App {
         };
         let factory = Arc::clone(factory);
         let project = self.permissions.project_cwd();
-        let mode = self.agent_mode();
+        let mode = self.execution_agent_mode();
         let model = self.permission_authority_model();
         let model_spec = model.spec();
         let workspace = self.workspace_session.clone();
@@ -469,7 +469,7 @@ impl App {
             .is_some_and(|context| {
                 !context.matches_runtime(
                     &self.permissions.project_cwd(),
-                    &self.agent_mode(),
+                    &self.execution_agent_mode(),
                     &self.permission_authority_model(),
                     &self.workspace_session,
                 )
@@ -591,7 +591,7 @@ impl App {
         let factory = self.permission_authority_factory.clone();
         let previous = self.permission_ui.authority_context.clone();
         let project = self.permissions.project_cwd();
-        let mode = self.agent_mode();
+        let mode = self.execution_agent_mode();
         let model = self.permission_authority_model();
         let workspace = self.workspace_session.clone();
         self.permission_job(revision, mutation, move |manager| {
@@ -1166,7 +1166,7 @@ impl App {
                 *published == context
                     && authority.matches_runtime(
                         &self.permissions.project_cwd(),
-                        &self.agent_mode(),
+                        &self.execution_agent_mode(),
                         &self.permission_authority_model(),
                         &self.workspace_session,
                     )

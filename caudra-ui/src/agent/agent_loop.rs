@@ -295,17 +295,11 @@ impl AgentLoop {
             }
             QueueItem::Compact { .. } => self.do_compact(&event_tx).await,
         };
-        self.queue.clear_active_run();
-
+        let proceed = self.queue.finish_run(run_id, result.is_err());
         if let Err(error) = result {
-            let superseded = self.queue.has_newer_interrupt(run_id);
-            if !superseded {
-                self.queue.pause();
-            }
             self.emit_error(run_id, error);
-            return superseded;
         }
-        true
+        proceed
     }
 
     async fn process_batch(
@@ -346,21 +340,16 @@ impl AgentLoop {
             inputs.push(*input);
         }
         if inputs.is_empty() {
-            self.queue.clear_active_run();
+            self.queue.finish_run(run_id, false);
             return true;
         }
         let _ = event_tx.send(AgentEvent::QueueBatchConsumed { items: consumed });
         let result = self.do_agent_batch(inputs, event_tx, run_id, initial).await;
-        self.queue.clear_active_run();
+        let proceed = self.queue.finish_run(run_id, result.is_err());
         if let Err(error) = result {
-            let superseded = self.queue.has_newer_interrupt(run_id);
-            if !superseded {
-                self.queue.pause();
-            }
             self.emit_error(run_id, error);
-            return superseded;
         }
-        true
+        proceed
     }
 
     async fn initialize(&mut self) -> bool {
@@ -398,7 +387,7 @@ impl AgentLoop {
         }
         // Built once MCP has settled, so a `/btw` fired before the first prompt
         // carries the same tools the live request will.
-        let slot = self.model_slot.load();
+        let slot = self.effective_model_slot.load();
         self.rebuild_tools(
             &slot.model,
             &slot.model,
@@ -487,19 +476,28 @@ impl AgentLoop {
         run_id: u64,
         initial_batch: bool,
     ) -> Result<(), AgentError> {
+        let automatic = inputs.iter().all(is_automatic_input);
         let Some(input) = inputs.last_mut() else {
             return Ok(());
         };
         let delivery_fence = Arc::clone(&self.delivery_fence);
         let _parent = delivery_fence.enter().await;
-        if (!input.message.is_empty() || !input.images.is_empty() || input.resume)
-            && let Some(background) = &self.background
-        {
+        if let Some(message) = delivery_fence.admission_error() {
+            return Err(AgentError::Tool {
+                tool: "session_stop".into(),
+                message: message.into(),
+            });
+        }
+        if !automatic && let Some(background) = &self.background {
             background.rearm();
         }
-        let selected_slot = self.model_slot.load_full();
+        let selected_slot = if automatic {
+            self.effective_model_slot.load_full()
+        } else {
+            self.model_slot.load_full()
+        };
         let purpose = model_purpose(&input.mode);
-        let effective_slot = if purpose == ModelPurpose::Plan {
+        let effective_slot = if !automatic && purpose == ModelPurpose::Plan {
             let (provider, model) = agent::resolve_model_for_purpose(
                 agent::ModelRoute {
                     provider: &selected_slot.provider,
@@ -960,6 +958,15 @@ impl AgentLoop {
     }
 }
 
+fn is_automatic_input(input: &AgentInput) -> bool {
+    input.message.is_empty()
+        && input.images.is_empty()
+        && input.mentions.is_empty()
+        && input.commits.is_empty()
+        && input.prompt.is_none()
+        && !input.resume
+}
+
 fn model_purpose(mode: &AgentMode) -> ModelPurpose {
     match mode {
         AgentMode::Plan(_) | AgentMode::RemotePlan(_) => ModelPurpose::Plan,
@@ -1017,11 +1024,45 @@ fn spawn_oauth_for_needs_auth(handle: &McpHandle) {
 mod tests {
     use std::path::PathBuf;
 
+    use caudra_agent::McpPromptRef;
     use test_case::test_case;
 
     use super::*;
 
     const PLAN_PATH: &str = ".caudra/plans/test.md";
+    const USER_MESSAGE: &str = "explicit submission";
+    const AUTOMATIC_REPORT: &str = "background result";
+    const MCP_PROMPT: &str = "test/prompt";
+
+    #[test_case("", false, false, true; "automatic_report")]
+    #[test_case(USER_MESSAGE, false, false, false; "explicit_message")]
+    #[test_case("", true, false, false; "explicit_resume")]
+    #[test_case("", false, true, false; "explicit_mcp_prompt")]
+    fn only_automatic_input_uses_committed_route(
+        message: &str,
+        resume: bool,
+        prompt: bool,
+        automatic: bool,
+    ) {
+        let input = AgentInput {
+            message: message.into(),
+            mode: AgentMode::Build,
+            images: Vec::new(),
+            mentions: Vec::new(),
+            commits: Vec::new(),
+            preamble: vec![Message::observation(AUTOMATIC_REPORT.into())],
+            thinking: Default::default(),
+            fast: false,
+            prompt: prompt.then(|| {
+                Box::new(McpPromptRef {
+                    qualified_name: MCP_PROMPT.into(),
+                    arguments: Default::default(),
+                })
+            }),
+            resume,
+        };
+        assert_eq!(is_automatic_input(&input), automatic);
+    }
 
     #[test_case(AgentMode::Build, ModelPurpose::Chat ; "build_uses_chat")]
     #[test_case(AgentMode::ReadOnly, ModelPurpose::Chat ; "read_only_uses_chat")]

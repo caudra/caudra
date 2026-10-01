@@ -330,6 +330,8 @@ pub struct StoredQueuedDraft {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredQueuedPrompt {
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<StoredMode>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<StoredImage>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -359,6 +361,8 @@ pub struct SessionMeta {
     pub mode: Option<StoredMode>,
     #[serde(default)]
     pub plan_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_mode: Option<StoredMode>,
     #[serde(default)]
     pub plan_target: Option<StoredPlanTarget>,
     #[serde(default)]
@@ -1616,6 +1620,37 @@ mod tests {
     const TITLE_PROMPT: &str = "add refresh token support";
     const FORK_TITLE: &str = "Renamed by hand (fork #1)";
     const MODE_UNCHOSEN: &str = "a new session must not pretend it picked a mode";
+    const QUEUED_PROMPT: &str = "queued prompt";
+
+    #[test_case(None; "legacy_default")]
+    #[test_case(Some(StoredMode::Build); "build")]
+    #[test_case(Some(StoredMode::Plan); "plan")]
+    fn queued_prompt_mode_roundtrips_without_defaulting(mode: Option<StoredMode>) {
+        let prompt = StoredQueuedPrompt {
+            text: QUEUED_PROMPT.into(),
+            mode,
+            images: Vec::new(),
+            paste_ranges: Vec::new(),
+        };
+        let serialized = serde_json::to_value(&prompt).unwrap();
+        assert_eq!(serialized.get("mode").is_some(), mode.is_some());
+        let restored: StoredQueuedPrompt = serde_json::from_value(serialized).unwrap();
+        assert_eq!(restored, prompt);
+    }
+
+    #[test_case(false; "absent_mode")]
+    #[test_case(true; "null_mode")]
+    fn legacy_queued_prompt_has_no_captured_mode(explicit_null: bool) {
+        let mut serialized = serde_json::json!({"text": QUEUED_PROMPT});
+        if explicit_null {
+            serialized["mode"] = Value::Null;
+        }
+        let restored: StoredQueuedPrompt = serde_json::from_value(serialized).unwrap();
+        assert_eq!(restored.text, QUEUED_PROMPT);
+        assert_eq!(restored.mode, None);
+        assert!(restored.images.is_empty());
+        assert!(restored.paste_ranges.is_empty());
+    }
 
     #[test_case(None; "absent_intent")]
     #[test_case(Some(PermissionMode::Ask); "ask")]
@@ -2647,6 +2682,7 @@ mod tests {
         session.meta.queued_messages = vec![
             StoredQueuedPrompt {
                 text: "guide".into(),
+                mode: Some(StoredMode::Build),
                 images: vec![StoredImage {
                     media_type: "image/png".into(),
                     data: "aW1hZ2U=".into(),
@@ -2655,6 +2691,7 @@ mod tests {
             },
             StoredQueuedPrompt {
                 text: "next".into(),
+                mode: Some(StoredMode::Plan),
                 images: Vec::new(),
                 paste_ranges: Vec::new(),
             },

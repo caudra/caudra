@@ -1,5 +1,5 @@
 use super::*;
-use crate::agent::shared_queue;
+use crate::agent::shared_queue::{self, QueueReceiver};
 use crate::app::sandbox::attached_sandbox_instance;
 use crate::app::session::REVERT_SNAPSHOT_PENDING_MSG;
 use crate::app::tasks::{MAIN_TASK_ID, TaskStatus};
@@ -114,6 +114,9 @@ use tempfile::TempDir;
 use test_case::test_case;
 
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const REJECTED_DRAFT_PREFIX: &str = "  review ";
+const REJECTED_DRAFT_PASTE: &str = "pasted context\nsecond line";
+const REJECTED_DRAFT_IMAGE: &str = "iVBORw0KGgo=";
 const OPENAI_SETUP_MODEL: &str = "openai/gpt-6.1-sol";
 const SETUP_MEDIUM_EFFORT: &str = "medium";
 const SETUP_HIGH_EFFORT: &str = "high";
@@ -818,6 +821,7 @@ mod background_runtime {
     use crate::app::SubmitOutcome;
     use crate::app::tasks::TaskActivity;
     use crate::chat::Chat;
+    use crate::components::mode_submission::{ModeSubmissionAction, ModeSubmissionChoice};
     use crate::components::status_bar::StatusBarHitTarget;
     use crate::components::{Action, DisplayRole, key};
     use crate::repaint::{Dirty, expect::OWED};
@@ -825,6 +829,7 @@ mod background_runtime {
     const PARENT: &str = "Implement the change and launch the independent audit.";
     const CHILD: &str = "Audit the implementation independently.";
     const TASK: &str = "background-audit";
+    const SUCCEEDED: &str = "succeeded";
     const REPORT_CALL: &str = "audit-report";
     const REPORT: &str = "The audit found a missing input validation check.";
     const SHELL_CALL: &str = "owned-shell";
@@ -1368,9 +1373,10 @@ mod background_runtime {
         }));
     }
 
-    #[test_case(false; "next_after_result")]
-    #[test_case(true; "guide_wakes_parked_parent")]
-    fn parked_parent_keeps_next_until_background_result_is_processed(guide: bool) {
+    #[test_case(false, false; "next_after_result")]
+    #[test_case(true, false; "guide_wakes_parked_parent")]
+    #[test_case(false, true; "queued_plan_after_build_result")]
+    fn parked_parent_keeps_next_until_background_result_is_processed(guide: bool, plan: bool) {
         const NEXT: &str = "Start the next independent change.";
         const GUIDE: &str = "Include the audit finding in the current change.";
         smol::block_on(bounded(async {
@@ -1384,10 +1390,23 @@ mod background_runtime {
                 commits: Vec::new(),
                 paste_ranges: Vec::new(),
             };
-            assert!(matches!(
-                fixture.app.submit_prompt(prompt(NEXT)),
-                SubmitOutcome::Queued
-            ));
+            if plan {
+                fixture.app.enter_plan();
+                let outcome = fixture.app.submit_prompt(prompt(NEXT));
+                assert!(matches!(outcome, SubmitOutcome::NeedsModeDecision(_)));
+                fixture.app.handle_submit_outcome(outcome);
+                fixture
+                    .app
+                    .handle_mode_submission(ModeSubmissionAction::Select(
+                        ModeSubmissionChoice::Queue,
+                    ));
+                fixture.app.toggle_mode();
+            } else {
+                assert!(matches!(
+                    fixture.app.submit_prompt(prompt(NEXT)),
+                    SubmitOutcome::Queued
+                ));
+            }
             assert_eq!(fixture.handles.queue.len(), 1);
             assert!(fixture.requests.is_empty());
             if guide {
@@ -1416,6 +1435,7 @@ mod background_runtime {
             let actions = fixture.app.start_mailbox_run(messages);
             enqueue(&fixture.app, &fixture.handles, actions);
             let request = fixture.requests.recv_async().await.unwrap();
+            assert!(!fixture.handles.execution_mode.load().is_planning());
             assert!(
                 request
                     .messages
@@ -1435,6 +1455,7 @@ mod background_runtime {
             assert!(!fixture.app.has_session_work());
             fixture.handles.queue.allow_next_turn(true);
             let request = fixture.requests.recv_async().await.unwrap();
+            assert_eq!(fixture.handles.execution_mode.load().is_planning(), plan);
             assert!(request.messages.iter().any(|message| {
                 message
                     .first_text_content()
@@ -2056,22 +2077,32 @@ mod background_runtime {
     }
 
     #[test]
-    fn workspace_reservation_and_plan_transition_drain_owned_children() {
+    fn mode_selection_preserves_owned_children_and_result_delivery() {
         smol::block_on(bounded(async {
             let mut fixture = Fixture::after_final().await;
             let background = fixture.handles.background.as_ref().unwrap().clone();
             assert!(reserve_background_transition(&background).is_err());
             let task_id = background.list()[0].task_id.clone();
+            let generation = background.generation();
             assert!(background.promote(&task_id).await.is_ok());
             fixture.app.enter_plan();
             assert_eq!(fixture.app.state.mode, super::Mode::Plan);
-            assert_eq!(background.active_count(), 0);
-            let transition = reserve_background_transition(&background).unwrap();
-            background.rearm();
-            assert!(background.promote(&task_id).await.is_err());
-            drop(transition);
-            background.rearm();
-            assert!(background.suspend().is_ok());
+            assert_eq!(background.active_count(), 1);
+            assert_eq!(background.generation(), generation);
+            assert!(!fixture.app.automatic_wakes_suppressed);
+            assert!(reserve_background_transition(&background).is_err());
+            fixture.child.reply.send(final_response()).unwrap();
+            background.notified().await;
+            let messages = background.claim_messages().unwrap();
+            assert!(!messages.is_empty());
+            let actions = fixture.app.start_mailbox_run(messages);
+            enqueue(&fixture.app, &fixture.handles, actions);
+            let request = fixture.requests.recv_async().await.unwrap();
+            assert!(!fixture.handles.execution_mode.load().is_planning());
+            request.reply.send(final_response()).unwrap();
+            fixture.drain_parent().await;
+            assert_eq!(background.status(&task_id).unwrap().state, SUCCEEDED);
+            assert_eq!(fixture.app.state.mode, super::Mode::Plan);
             fixture.close().await;
         }));
     }
@@ -2645,6 +2676,7 @@ fn the_steer_chord_steers_the_active_run() {
     assert_eq!(
         app.queue.pending_prompts(),
         [shared_queue::PendingPrompt {
+            mode: Some(StoredMode::Plan),
             text: "guide this run".into(),
             images: Vec::new(),
             paste_ranges: Vec::new(),
@@ -2936,11 +2968,42 @@ fn submit_prompt_rejects(mk: fn() -> App, text: &str, expected: &str) {
     }
 }
 
+#[test_case(PromptAdmission::Queue; "queue")]
+#[test_case(PromptAdmission::Steer; "guide")]
+#[test_case(PromptAdmission::Interrupt; "replacement")]
+fn rejected_submission_preserves_rich_draft(admission: PromptAdmission) {
+    let mut app = streaming_app_without_queue();
+    app.input_box.buffer.insert_text(REJECTED_DRAFT_PREFIX);
+    app.input_box.buffer.insert_paste(REJECTED_DRAFT_PASTE);
+    let image = ImageSource::new(ImageMediaType::Png, Arc::from(REJECTED_DRAFT_IMAGE));
+    app.input_box.attach_image(image.clone());
+    let draft = app.input_box.draft();
+    let display = app.input_box.buffer.display_text();
+    let submission = app.input_box.take_submission().unwrap();
+
+    assert!(
+        app.handle_submit_with_admission(submission, admission)
+            .is_empty()
+    );
+
+    assert_eq!(app.status_bar.flash_text(), Some(queue::NO_QUEUE_ERR));
+    assert_eq!(app.input_box.draft(), draft);
+    assert_eq!(app.input_box.buffer.display_text(), display);
+    assert_eq!(app.input_box.pending_images(), [image]);
+}
+
 fn streaming_app_without_queue() -> App {
     let dir = test_state_dir();
     let mut app = build_app(dir.clone(), Arc::new(test_writer(dir)));
     app.status = Status::Streaming;
     app
+}
+
+fn attach_processing_queue(app: &mut App) -> QueueReceiver {
+    let (sender, receiver) = shared_queue::queue();
+    receiver.set_active_run(app.run_id);
+    app.queue.set_shared(sender);
+    receiver
 }
 
 fn queued_msg(text: &str) -> QueuedMessage {
@@ -2955,6 +3018,7 @@ fn queued_msg(text: &str) -> QueuedMessage {
 
 fn stored_queued_prompt(text: &str) -> StoredQueuedPrompt {
     StoredQueuedPrompt {
+        mode: Some(StoredMode::Plan),
         text: text.into(),
         images: Vec::new(),
         paste_ranges: Vec::new(),
@@ -4463,6 +4527,7 @@ fn turn_complete_accumulates_usage_by_model() {
 #[test]
 fn cancel_resets_all_chats_and_indices() {
     let mut app = app_with_subagent();
+    let _receiver = attach_processing_queue(&mut app);
     app.update(subagent_msg(
         AgentEvent::ToolStart(Box::new(ToolStartEvent {
             id: "sub_t1".into(),
@@ -6160,6 +6225,7 @@ fn double_esc_cancels_flushes_and_fails_tools() {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
+    let _receiver = attach_processing_queue(&mut app);
     app.update(agent_msg(AgentEvent::TextDelta {
         text: "partial".into(),
     }));
@@ -6212,6 +6278,7 @@ fn ctrl_c_while_streaming_cancels_instead_of_quitting() {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
+    let _receiver = attach_processing_queue(&mut app);
 
     let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
     assert!(matches!(&actions[0], Action::CancelAgent { .. }));
@@ -8996,9 +9063,12 @@ fn stale_events_ignored_after_run_id_increment() {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
+    let receiver = attach_processing_queue(&mut app);
 
     cancel_app(&mut app);
     let current_run = app.run_id;
+    receiver.clear_active_run();
+    smol::block_on(app.flush_background_delivery(false)).unwrap();
     app.update(agent_msg_with_run_id(
         AgentEvent::Done {
             usage: TokenUsage::default(),
@@ -9034,6 +9104,7 @@ fn stale_done_does_not_drain_queue() {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
+    let _receiver = attach_processing_queue(&mut app);
 
     cancel_app(&mut app);
     app.queue_and_notify(queued_msg("next"));
@@ -9556,6 +9627,7 @@ fn checkpoint_persists_queued_submission_images_and_paste_ranges() {
     assert_eq!(
         saved.meta.queued_messages,
         [StoredQueuedPrompt {
+            mode: Some(StoredMode::Plan),
             text: QUEUED_TEXT.into(),
             images: vec![StoredImage {
                 media_type: "image/png".into(),
@@ -9578,6 +9650,7 @@ fn restore_resumed_session_flushes_complete_queued_prompts_and_round_trips() {
     let mut app = test_app();
     let stored_prompts = vec![
         StoredQueuedPrompt {
+            mode: Some(StoredMode::Plan),
             text: "q1".into(),
             images: vec![StoredImage {
                 media_type: "image/png".into(),
@@ -9596,12 +9669,14 @@ fn restore_resumed_session_flushes_complete_queued_prompts_and_round_trips() {
         app.queue.pending_prompts(),
         [
             shared_queue::PendingPrompt {
+                mode: Some(StoredMode::Plan),
                 text: "q1".into(),
                 images: vec![ImageSource::new(ImageMediaType::Png, Arc::from("aW1hZ2U="))],
                 paste_ranges: std::iter::once(0..2).collect(),
                 admission: caudra_agent::PromptAdmission::Steer,
             },
             shared_queue::PendingPrompt {
+                mode: Some(StoredMode::Plan),
                 text: "q2".into(),
                 images: Vec::new(),
                 paste_ranges: Vec::new(),
@@ -10230,7 +10305,7 @@ fn goal_command_sets_condition_and_starts_work() {
         app.state.goal.snapshot().unwrap().condition.as_ref(),
         "all focused tests pass"
     );
-    assert_eq!(app.status_bar.flash_text(), Some("Goal set"));
+    assert_eq!(app.status_bar.flash_text(), Some(queue::GOAL_SET));
     assert!(actions.iter().any(|action| matches!(
         action,
         Action::SendMessage(input) if input.message == "all focused tests pass"
@@ -12654,10 +12729,11 @@ fn cancellation_stays_non_quiescent_until_the_matching_top_level_terminal_event(
     app.shared_history = Some(Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(
         history,
     ))));
-    let (shared_queue, _receiver) = shared_queue::queue();
+    let (shared_queue, receiver) = shared_queue::queue();
     app.queue.set_shared(shared_queue);
     app.status = Status::Streaming;
     app.run_id = 7;
+    receiver.set_active_run(app.run_id);
     arm_revert_point(&app);
 
     let actions = app.handle_cancel();
@@ -14451,6 +14527,7 @@ fn revert_and_unrevert_are_rejected_while_cancellation_is_pending() {
     let original_head = crate::session_history_head(&reverting.state.session);
     reverting.status = Status::Streaming;
     reverting.run_id = 1;
+    let _reverting_receiver = attach_processing_queue(&mut reverting);
     reverting.handle_cancel();
 
     assert!(
@@ -14469,6 +14546,7 @@ fn revert_and_unrevert_are_rejected_while_cancellation_is_pending() {
     let reverted_head = crate::session_history_head(&unreverting.state.session);
     unreverting.status = Status::Streaming;
     unreverting.run_id = 1;
+    let _unreverting_receiver = attach_processing_queue(&mut unreverting);
     unreverting.handle_cancel();
 
     assert!(unreverting.unrevert().is_empty());
@@ -16970,6 +17048,7 @@ fn tool_done_write_opens_plan_form(mode: Mode, expect_form: bool) {
     app.status = Status::Streaming;
     app.run_id = 1;
     app.state.mode = mode;
+    app.state.applied_mode = mode;
     app.state.plan = PlanState::Drafting(PathBuf::from("/tmp/plans/test.md"));
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         id: "t1".into(),
@@ -17328,6 +17407,7 @@ fn streaming_cancel_wins_over_quit_override() {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
+    let _receiver = attach_processing_queue(&mut app);
     let probe = install_override(&mut app, kb::QUIT.code, kb::QUIT.modifiers);
 
     let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
@@ -17361,6 +17441,7 @@ fn streaming_cancel_wins_over_esc_override() {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
+    let _receiver = attach_processing_queue(&mut app);
     app.status_bar.flash_duration = Duration::from_secs(3600);
     app.last_esc = Some(Instant::now());
     let probe = install_override(&mut app, KeyCode::Esc, KeyModifiers::NONE);
@@ -17434,8 +17515,8 @@ fn a_toggled_mode_reads_as_pending_until_a_message_carries_it() {
         commits: Vec::new(),
         paste_ranges: Vec::new(),
     });
-    assert_eq!(&*app.mode_label().full, "[BUILD]");
-    assert_eq!(&*app.mode_label().short, "[B]");
+    assert_eq!(&*app.mode_label().full, "[PLAN\u{2192}BUILD]");
+    assert_eq!(&*app.mode_label().short, "[P\u{2192}B]");
 }
 
 /// Toggling back is not a pending transition, it is no transition at all.
@@ -17565,10 +17646,8 @@ fn a_disallowed_remembered_model_is_not_asked_for() {
     assert_eq!(asked_for(&actions), None, "{POLICY_IGNORED}");
 }
 
-/// Both halves of the switch reach the agent on the same message, so both stop
-/// being pending there.
 #[test]
-fn sending_a_message_settles_the_model_alongside_the_mode() {
+fn preparing_a_message_keeps_mode_and_model_pending() {
     let mut app = test_app();
     let other = other_model();
     tab(&mut app);
@@ -17583,8 +17662,8 @@ fn sending_a_message_settles_the_model_alongside_the_mode() {
         paste_ranges: Vec::new(),
     });
 
-    assert_eq!(app.state.applied_mode, Mode::Build);
-    assert_eq!(
+    assert_eq!(app.state.applied_mode, Mode::Plan);
+    assert_ne!(
         app.state.applied_model,
         other.spec(),
         "{BASELINE_UNSETTLED}"

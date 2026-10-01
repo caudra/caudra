@@ -19,13 +19,27 @@ Queued prompts appear above the input. A section header names each group and cou
 
 Every row opens with a `⋯` handle. Click it, or press `.` on the focused row, to open the item menu. The menu carries Edit, Move up, Move down, Move to Guide, Move to Up next, Replace current run, Move to Main, and Delete, filtered to what that item allows right now. `Shift+Up` and `Shift+Down` also reorder the focused item. A prompt stays within its Replacing, Guide, or Up next group and cannot cross a compact operation. The same controls reorder live subagent guidance and unsent guidance on completed tasks without crossing between those collections. `Ctrl+Q` removes the first item. Press `g` to move an Up next item to Guide, or `n` to defer guidance to Up next.
 
-Press `b` while the queue is focused or click its mode control to toggle Together. Together sends the pending next-run prompts as separate user messages in one model turn. The setting resets after that batch is claimed.
+Press `b` while the queue is focused or click its mode control to toggle Together. Together sends compatible pending next-run prompts as separate user messages in one model turn. Prompts with different execution modes run in separate turns. The setting resets after those batches are claimed.
+
+## Selecting Plan while work runs
+
+Cycling Build and Plan selects the mode for your next submission. It does not stop running agents or shell jobs. The mode indicator shows the pending transition until the new mode runs. Background reports and results continue to be processed in the current execution mode.
+
+When you submit in Plan while Build work is outstanding, choose:
+
+- **Keep editing** preserves the draft and leaves work running. This is the default, and `Escape` does the same.
+- **Queue in Plan** waits for existing work and its result processing to finish, then runs the prompt in Plan. Later mode cycling does not change that queued prompt.
+- **Stop work and submit in Plan** cancels and drains the current session work before starting the prompt. Other Up next prompts remain queued.
+
+Work continues while you decide. Stop includes tasks, shell jobs, and workflows, and suppresses late automatic results. It does not undo edits already made. With no conflicting work, a Plan submission starts without this choice.
+
+If stopping fails, the Plan prompt stays blocked. Retry Stop to finish draining the work before the prompt can start.
 
 ## Guide the current run
 
 Press `Ctrl+X g` or click `guide` to send the input as guidance. Caudra waits for the current provider response and any tool calls to settle, then adds all waiting guidance before the next model request. An in-flight response is never modified.
 
-A late guide may arrive after the run's final boundary. It then starts before queued next-run prompts instead of being lost. If a replacement is pending, all waiting guides enter its first model request before the replacement message.
+A late guide may arrive after the run's final boundary. It then starts before queued next-run prompts instead of being lost. If a replacement is pending, compatible waiting guides enter its first model request before the replacement message. Guidance in a different execution mode waits for its own turn.
 
 When the main agent is waiting for background work, guide wakes it without cancelling the running tasks or commands. Main-chat guidance goes to the main agent, not to every child. Open a task chat to guide that child directly.
 
@@ -43,4 +57,4 @@ Replacing a main run also stops and drains its session tasks, shell commands, an
 
 ## Recovery
 
-Unclaimed prompts and their delivery modes are saved with the session. A provider or tool error pauses delivery so the next prompt cannot race error recovery. Resume the session to retry or edit the preserved queue.
+Unclaimed prompts, their delivery modes, and their captured Build or Plan modes are saved with the session. Editing or reordering a prompt keeps its captured mode. A provider or tool error pauses delivery so the next prompt cannot race error recovery. Resume the session to retry or edit the preserved queue.

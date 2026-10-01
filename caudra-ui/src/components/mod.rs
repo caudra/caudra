@@ -26,6 +26,7 @@ pub(crate) mod mention_popup;
 pub(crate) mod message_actions;
 pub mod messages;
 pub(crate) mod modal;
+pub(crate) mod mode_submission;
 pub(crate) mod model_picker;
 pub(crate) mod paste_editor;
 pub(crate) mod permission_prompt;

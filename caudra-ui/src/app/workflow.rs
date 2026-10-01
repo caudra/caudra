@@ -11,9 +11,11 @@ use std::collections::HashSet;
 use caudra_agent::workflow::WorkflowHandle;
 use caudra_config::Feature;
 use caudra_providers::{Message, WorkflowEventOrigin};
+#[cfg(test)]
+use caudra_workflow::RunStatus;
 use caudra_workflow::{
-    LaunchRequest, LogLine, MAX_AGENT_BUDGET, MAX_RUN_LOG_ENTRIES, RunSnapshot, RunStatus,
-    WorkflowError, WorkflowEvent, WorkflowRequest, WorkflowResponse,
+    LaunchRequest, LogLine, MAX_AGENT_BUDGET, MAX_RUN_LOG_ENTRIES, RunSnapshot, WorkflowError,
+    WorkflowEvent, WorkflowRequest, WorkflowResponse,
 };
 use serde_json::{Value, json};
 use tracing::{debug, warn};
@@ -390,26 +392,6 @@ impl WorkflowUi {
         self.ready.clear();
         self.suppressed
             .extend(self.runs.iter().map(|run| run.run_id.clone()));
-    }
-
-    pub(crate) fn stop_all(&mut self) -> Result<(), String> {
-        self.suppress_completions();
-        let Some(handle) = self.handle.clone() else {
-            return Ok(());
-        };
-        for run in &handle.state().runs {
-            self.suppressed.insert(run.run_id.clone());
-            if matches!(
-                run.status,
-                RunStatus::Active | RunStatus::Paused | RunStatus::BudgetLimited
-            ) {
-                smol::block_on(handle.request(WorkflowRequest::Stop {
-                    run_id: run.run_id.clone(),
-                }))
-                .map_err(|error| error.to_string())?;
-            }
-        }
-        Ok(())
     }
 
     fn poll(&self) -> Option<Reply> {
@@ -1423,6 +1405,8 @@ mod tests {
         let reply = smol::block_on(app.background_delivery.replies.recv_async()).unwrap();
         app.handle_cancel();
         assert!(app.apply_delivery_reply(reply).is_ok());
+        let stopped = smol::block_on(app.background_delivery.replies.recv_async()).unwrap();
+        app.apply_delivery_reply(stopped).unwrap();
         assert!(!app.background_delivery.pending());
     }
 

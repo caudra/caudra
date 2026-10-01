@@ -66,6 +66,16 @@ fn autoscroll_rows(distance: i32) -> i32 {
 
 impl App {
     pub(super) fn handle_mouse(&mut self, event: MouseEvent) -> Vec<Action> {
+        if self.mode_submission.is_open()
+            && !self.permission_prompt.is_open()
+            && !self.question_form.is_open()
+        {
+            self.clear_control_hovers();
+            self.autoscroll = None;
+            self.selection_state = None;
+            let action = self.mode_submission.handle_mouse(event);
+            return self.handle_mode_submission(action);
+        }
         if self.sandbox_manager.is_open() {
             self.clear_control_hovers();
             self.autoscroll = None;

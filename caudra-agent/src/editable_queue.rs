@@ -330,6 +330,14 @@ impl<T> EditableQueueReceiver<T> {
     }
 
     pub fn claim(&self, eligible: impl Fn(&T) -> bool) -> Vec<(QueueItemId, T)> {
+        self.claim_compatible(eligible, |_, _| true)
+    }
+
+    pub fn claim_compatible(
+        &self,
+        eligible: impl Fn(&T) -> bool,
+        compatible: impl Fn(&T, &T) -> bool,
+    ) -> Vec<(QueueItemId, T)> {
         let mut state = lock(&self.state);
         let Some(front) = state.items.front() else {
             return Vec::new();
@@ -345,15 +353,22 @@ impl<T> EditableQueueReceiver<T> {
                 .unwrap_or_default();
         }
 
-        let count = state
+        let count = 1 + state
             .items
             .iter()
-            .take_while(|item| eligible(&item.value))
+            .skip(1)
+            .take_while(|item| eligible(&item.value) && compatible(&front.value, &item.value))
             .count();
         if state.items.iter().take(count).any(|item| item.editing) {
             return Vec::new();
         }
-        state.delivery = QueueDelivery::Separate;
+        if !state
+            .items
+            .get(count)
+            .is_some_and(|item| eligible(&item.value))
+        {
+            state.delivery = QueueDelivery::Separate;
+        }
         state
             .items
             .drain(..count)
@@ -397,12 +412,23 @@ impl<T> EditableQueueReceiver<T> {
     }
 
     pub fn claim_all_matching(&self, matches: impl Fn(&T) -> bool) -> Vec<(QueueItemId, T)> {
+        self.claim_matching_with_anchor(|_| true, |_, item| matches(item))
+    }
+
+    pub fn claim_matching_with_anchor(
+        &self,
+        anchor: impl Fn(&T) -> bool,
+        matches: impl Fn(&T, &T) -> bool,
+    ) -> Vec<(QueueItemId, T)> {
         let mut state = lock(&self.state);
+        let Some(anchor) = state.items.iter().find(|item| anchor(&item.value)) else {
+            return Vec::new();
+        };
         let indices = state
             .items
             .iter()
             .enumerate()
-            .filter_map(|(index, item)| matches(&item.value).then_some(index))
+            .filter_map(|(index, item)| matches(&anchor.value, &item.value).then_some(index))
             .collect::<Vec<_>>();
         if indices.is_empty() || indices.iter().any(|index| state.items[*index].editing) {
             return Vec::new();
@@ -546,6 +572,47 @@ impl InterruptSource for SteeringQueueReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_case::test_case;
+
+    #[test_case(false; "editing_later_partition")]
+    #[test_case(true; "editing_current_partition")]
+    fn compatible_claim_keeps_partitions_and_edit_barriers(edit_current: bool) {
+        let (queue, receiver) = editable_queue();
+        let first = queue.push(false);
+        let second = queue.push(false);
+        let third = queue.push(true);
+        let fourth = queue.push(true);
+        queue.set_delivery(QueueDelivery::TogetherNextTurn);
+        let editing = if edit_current { second } else { third };
+        assert_eq!(queue.begin_edit(editing, |_| Some(())), Some(()));
+
+        if edit_current {
+            assert!(
+                receiver
+                    .claim_compatible(|_| true, |a, b| a == b)
+                    .is_empty()
+            );
+            assert!(queue.cancel_edit(editing));
+        }
+        assert_eq!(
+            receiver.claim_compatible(|_| true, |a, b| a == b),
+            [(first, false), (second, false)]
+        );
+        assert_eq!(queue.delivery(), QueueDelivery::TogetherNextTurn);
+        if !edit_current {
+            assert!(
+                receiver
+                    .claim_compatible(|_| true, |a, b| a == b)
+                    .is_empty()
+            );
+            assert!(queue.cancel_edit(editing));
+        }
+        assert_eq!(
+            receiver.claim_compatible(|_| true, |a, b| a == b),
+            [(third, true), (fourth, true)]
+        );
+        assert_eq!(queue.delivery(), QueueDelivery::Separate);
+    }
 
     #[test]
     fn editing_front_blocks_consumption_until_released() {

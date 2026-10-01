@@ -1,15 +1,18 @@
 //! Queue for messages typed while the agent is busy.
 
 use std::borrow::Cow;
+use std::ops::Range;
 
-use caudra_agent::AgentInput;
+use caudra_agent::{AgentInput, AgentMode};
 use caudra_agent::{PromptAdmission, QueueDelivery, QueueItemId, is_run_failure_marker};
 use caudra_providers::{HistoryItemKind, ImageMediaType, ImageSource};
+use caudra_storage::id::CaudraId;
 
 use super::{Action, App, Status, format_with_images};
 
 use crate::agent::shared_queue::{QueueItem, QueueSender};
 use crate::components::input::{InputAction, InputState, Submission};
+use crate::components::mode_submission::{ModeSubmissionAction, ModeSubmissionChoice};
 use crate::components::queue_panel::{QueueEntry, set_movement_flags};
 use crate::input_document::InputDraft;
 use crate::theme;
@@ -24,12 +27,52 @@ pub(crate) const CONTINUE_BUSY_ERR: &str = "session is already working";
 pub(crate) const CONTINUE_EMPTY_ERR: &str = "nothing to continue";
 pub(crate) const CONTINUE_HINT: &str = "/continue resumes the turn";
 pub(crate) const PERMISSION_PUBLISH_ERR: &str = "Failed to initialize conversation permissions";
+pub(crate) const MODE_DECISION_ERR: &str =
+    "Plan submission needs a choice: keep editing, queue in Plan, or stop work and submit in Plan";
+const MODE_DECISION_STALE: &str = "Session work changed; submit again to choose how to enter Plan";
+const PLAN_TARGET_ERR: &str = "Plan target is unavailable; select Plan again before submitting";
+const GOAL_SUBMISSION_ERR: &str = "Could not set the submitted goal";
+pub(crate) const GOAL_SET: &str = "Goal set";
+const MODE_DECISION_PENDING: &str = "Finish the pending Plan submission choice first";
 
 pub(crate) enum SubmitOutcome {
     Started(Vec<Action>),
     Queued,
     Replacing(Vec<Action>),
+    NeedsModeDecision(Box<PromptSubmission>),
     Rejected(&'static str),
+}
+
+pub(crate) struct PromptSubmission {
+    input: Box<AgentInput>,
+    text: String,
+    paste_ranges: Vec<Range<usize>>,
+    goal: Option<String>,
+}
+
+pub(super) struct PendingPlanSubmission {
+    submission: PlanSubmissionSource,
+    session: CaudraId,
+    generation: Option<u64>,
+}
+
+enum PlanSubmissionSource {
+    Draft(Box<PromptSubmission>),
+    Queued(QueueItemId),
+}
+
+impl PromptSubmission {
+    fn into_queue_item(self, run_id: u64, admission: PromptAdmission) -> QueueItem {
+        QueueItem::Message {
+            image_count: self.input.images.len(),
+            text: self.text,
+            paste_ranges: self.paste_ranges,
+            input: self.input,
+            run_id,
+            admission,
+            displayed: false,
+        }
+    }
 }
 
 pub(super) struct QueueEditor {
@@ -51,6 +94,11 @@ pub(crate) struct MessageQueue {
 }
 
 impl MessageQueue {
+    pub(super) fn wake_dispatch(&self) {
+        if let Some(shared) = &self.shared {
+            shared.wake_dispatch();
+        }
+    }
     pub(crate) fn set_shared(&mut self, shared: QueueSender) {
         self.shared = Some(shared);
     }
@@ -171,6 +219,7 @@ impl MessageQueue {
             .map_or(QueueDelivery::Separate, QueueSender::delivery)
     }
 
+    #[cfg(test)]
     pub(crate) fn set_delivery(&self, delivery: QueueDelivery) {
         if let Some(shared) = &self.shared {
             shared.set_delivery(delivery);
@@ -243,6 +292,16 @@ impl MessageQueue {
 }
 
 impl App {
+    pub(super) fn cancel_main_run(&mut self) -> u64 {
+        let shared = self.queue.shared.clone();
+        let _dispatch = shared.as_ref().map(QueueSender::lock_dispatch);
+        self.stop_background_work();
+        self.begin_main_cancel(
+            false,
+            self.status == Status::Streaming && self.queue.is_processing(),
+        )
+    }
+
     pub(super) fn active_queue_entries(&self) -> Vec<QueueEntry<'static>> {
         if self.is_main_chat() {
             return self.queue.panel_entries();
@@ -637,6 +696,32 @@ impl App {
         if !self.is_main_chat() || !self.is_lane_changeable(id) {
             return Vec::new();
         }
+        if self
+            .queue
+            .shared
+            .as_ref()
+            .and_then(|queue| queue.input_mode(id))
+            .is_some_and(|mode| self.plan_mode_conflicts(&mode))
+        {
+            self.pending_plan_submission = Some(PendingPlanSubmission {
+                submission: PlanSubmissionSource::Queued(id),
+                session: self.state.session.id,
+                generation: self
+                    .background
+                    .as_ref()
+                    .map(|background| background.generation()),
+            });
+            self.mode_submission.open();
+            return Vec::new();
+        }
+        self.replace_queued_submission(id)
+    }
+
+    fn replace_queued_submission(&mut self, id: QueueItemId) -> Vec<Action> {
+        if self.cancelling_run.is_some() && self.replacement_item.is_none() {
+            self.flash(REPLACE_BUSY_ERR.into());
+            return Vec::new();
+        }
         let Some(QueueItem::Message {
             text,
             paste_ranges,
@@ -648,22 +733,19 @@ impl App {
             self.flash(ALREADY_SENT_ERR.into());
             return Vec::new();
         };
-        let message = || QueuedMessage {
-            text: text.clone(),
-            images: input.images.clone(),
-            mentions: input.mentions.clone(),
-            commits: input.commits.clone(),
-            paste_ranges: paste_ranges.clone(),
+        let submission = PromptSubmission {
+            text,
+            paste_ranges,
+            input,
+            goal: None,
         };
-        match self.submit_prompt_with_admission(message(), PromptAdmission::Interrupt) {
-            SubmitOutcome::Started(actions) | SubmitOutcome::Replacing(actions) => actions,
-            SubmitOutcome::Queued => Vec::new(),
-            SubmitOutcome::Rejected(error) => {
-                self.queue_with_admission(message(), admission);
-                self.flash(error.into());
-                Vec::new()
-            }
+        if let Some(error) = self.submission_error(&submission) {
+            self.queue_submission(submission, admission);
+            self.flash(error.into());
+            return Vec::new();
         }
+        let outcome = self.submit_prepared(submission, PromptAdmission::Interrupt);
+        self.handle_submit_outcome(outcome)
     }
 
     pub(super) fn pop_active_queue(&mut self) {
@@ -885,11 +967,55 @@ impl App {
         msg: QueuedMessage,
         admission: PromptAdmission,
     ) -> SubmitOutcome {
-        if let Some(reason) = self.sandbox_network_dispatch_blocker() {
-            return SubmitOutcome::Rejected(reason);
+        let submission = self.prepare_submission(msg);
+        self.admit_submission(submission, admission)
+    }
+
+    fn prepare_submission(&self, msg: QueuedMessage) -> PromptSubmission {
+        PromptSubmission {
+            input: Box::new(self.build_agent_input(&msg)),
+            text: msg.text,
+            paste_ranges: msg.paste_ranges,
+            goal: None,
         }
-        if msg.text.trim().is_empty() && msg.images.is_empty() {
-            return SubmitOutcome::Rejected(EMPTY_PROMPT_ERR);
+    }
+
+    pub(super) fn plan_submission_conflicts(&self, input: &AgentInput) -> bool {
+        self.plan_mode_conflicts(&input.mode)
+    }
+
+    fn plan_mode_conflicts(&self, mode: &AgentMode) -> bool {
+        mode.is_planning()
+            && !self.execution_agent_mode().is_planning()
+            && (self.status == Status::Streaming
+                || self.has_session_work()
+                || self.queue.is_processing())
+    }
+
+    fn submission_error(&self, submission: &PromptSubmission) -> Option<&'static str> {
+        if self.pending_plan_submission.is_some() {
+            return Some(MODE_DECISION_PENDING);
+        }
+        if let Some(error) = self.background_delivery.fence.admission_error() {
+            return Some(error);
+        }
+        if let Some(reason) = self.sandbox_network_dispatch_blocker() {
+            return Some(reason);
+        }
+        if submission.input.message.trim().is_empty()
+            && submission.input.images.is_empty()
+            && !submission.input.resume
+            && submission.input.prompt.is_none()
+        {
+            return Some(EMPTY_PROMPT_ERR);
+        }
+        if submission.input.mode.is_read_only() && self.state.mode == super::Mode::Plan {
+            return Some(PLAN_TARGET_ERR);
+        }
+        if submission.input.mode.is_planning()
+            && submission.input.mode != self.agent_mode_for(super::Mode::Plan)
+        {
+            return Some(PLAN_TARGET_ERR);
         }
         if self
             .state
@@ -899,24 +1025,76 @@ impl App {
             .as_ref()
             .is_some_and(|pending| pending.restore_operation.is_some())
         {
-            return SubmitOutcome::Rejected(super::REVERT_BUSY_MSG);
+            return Some(super::REVERT_BUSY_MSG);
         }
-        if self.status == Status::Streaming
+        None
+    }
+
+    fn admit_submission(
+        &mut self,
+        submission: PromptSubmission,
+        admission: PromptAdmission,
+    ) -> SubmitOutcome {
+        if let Some(error) = self.submission_error(&submission) {
+            return SubmitOutcome::Rejected(error);
+        }
+        if self.plan_submission_conflicts(&submission.input) {
+            return SubmitOutcome::NeedsModeDecision(Box::new(submission));
+        }
+        self.submit_prepared(submission, admission)
+    }
+
+    fn submit_prepared(
+        &mut self,
+        submission: PromptSubmission,
+        admission: PromptAdmission,
+    ) -> SubmitOutcome {
+        if let Some(error) = self.submission_error(&submission) {
+            return SubmitOutcome::Rejected(error);
+        }
+        let deferred = self.status == Status::Streaming
             || (self.status == Status::Idle
                 && (self.has_session_work()
                     || self.queue.is_processing()
-                    || !self.queue.is_empty()))
+                    || !self.queue.is_empty()));
+        if deferred && !self.queue.is_connected() {
+            return SubmitOutcome::Rejected(NO_QUEUE_ERR);
+        }
+        if self.cancelling_run.is_some()
+            && (!deferred
+                || (admission == PromptAdmission::Interrupt && self.replacement_item.is_none()))
         {
-            if admission == PromptAdmission::Interrupt {
-                return self.replace_and_notify(msg);
+            return SubmitOutcome::Rejected(REPLACE_BUSY_ERR);
+        }
+        if submission.goal.is_some()
+            && !deferred
+            && let Err(error) = self.publish_conversation_permissions()
+        {
+            tracing::warn!(%error, "failed to initialize goal conversation permissions");
+            return SubmitOutcome::Rejected(PERMISSION_PUBLISH_ERR);
+        }
+        if let Some(goal) = &submission.goal {
+            if self.state.goal.set(goal).is_err() {
+                return SubmitOutcome::Rejected(GOAL_SUBMISSION_ERR);
             }
-            if self.queue_with_admission(msg, admission) {
+            self.flash(GOAL_SET.into());
+        }
+        if deferred {
+            if admission == PromptAdmission::Interrupt {
+                return self.replace_submission(submission);
+            }
+            if self.queue_submission(submission, admission) {
                 SubmitOutcome::Queued
             } else {
                 SubmitOutcome::Rejected(NO_QUEUE_ERR)
             }
         } else {
-            SubmitOutcome::Started(self.start_from_queue(&msg))
+            let display = if submission.input.resume {
+                String::new()
+            } else {
+                format_with_images(&submission.text, submission.input.images.len())
+            };
+            SubmitOutcome::Started(self.start_run(*submission.input, display))
         }
     }
 
@@ -931,15 +1109,108 @@ impl App {
         msg: QueuedMessage,
         admission: PromptAdmission,
     ) -> Vec<Action> {
-        match self.submit_prompt_with_admission(msg, admission) {
+        let outcome = self.submit_prompt_with_admission(msg, admission);
+        self.handle_submit_outcome(outcome)
+    }
+
+    pub(super) fn handle_submit_outcome(&mut self, outcome: SubmitOutcome) -> Vec<Action> {
+        match outcome {
             SubmitOutcome::Started(actions) => actions,
             SubmitOutcome::Queued => vec![],
             SubmitOutcome::Replacing(actions) => actions,
+            SubmitOutcome::NeedsModeDecision(submission) => {
+                let text = if let Some(goal) = &submission.goal {
+                    format!("/goal {goal}")
+                } else if submission.input.resume {
+                    "/continue".into()
+                } else {
+                    submission.text.clone()
+                };
+                self.input_box.set_state(InputState::new(
+                    InputDraft {
+                        text,
+                        paste_ranges: submission.paste_ranges.clone(),
+                    },
+                    submission.input.images.clone(),
+                ));
+                self.pending_plan_submission = Some(PendingPlanSubmission {
+                    submission: PlanSubmissionSource::Draft(submission),
+                    session: self.state.session.id,
+                    generation: self
+                        .background
+                        .as_ref()
+                        .map(|background| background.generation()),
+                });
+                self.mode_submission.open();
+                Vec::new()
+            }
             SubmitOutcome::Rejected(e) => {
                 self.flash(e.into());
                 vec![]
             }
         }
+    }
+
+    pub(super) fn submit_explicit_input(&mut self, input: AgentInput, text: String) -> Vec<Action> {
+        let outcome = self.admit_submission(
+            PromptSubmission {
+                input: Box::new(input),
+                text,
+                paste_ranges: Vec::new(),
+                goal: None,
+            },
+            PromptAdmission::Queue,
+        );
+        self.handle_submit_outcome(outcome)
+    }
+
+    pub(super) fn handle_mode_submission(&mut self, action: ModeSubmissionAction) -> Vec<Action> {
+        let choice = match action {
+            ModeSubmissionAction::Consumed => return Vec::new(),
+            ModeSubmissionAction::Copy(text) => {
+                self.copy_to_clipboard(&text);
+                return Vec::new();
+            }
+            ModeSubmissionAction::Close => ModeSubmissionChoice::KeepEditing,
+            ModeSubmissionAction::Select(choice) => choice,
+        };
+        self.mode_submission.close();
+        let Some(pending) = self.pending_plan_submission.take() else {
+            return Vec::new();
+        };
+        if matches!(choice, ModeSubmissionChoice::KeepEditing) {
+            return Vec::new();
+        }
+        if pending.session != self.state.session.id
+            || pending.generation
+                != self
+                    .background
+                    .as_ref()
+                    .map(|background| background.generation())
+        {
+            self.flash(MODE_DECISION_STALE.into());
+            return Vec::new();
+        }
+        let admission = match choice {
+            ModeSubmissionChoice::Queue => PromptAdmission::Queue,
+            ModeSubmissionChoice::Stop => PromptAdmission::Interrupt,
+            ModeSubmissionChoice::KeepEditing => unreachable!(),
+        };
+        let submission = match pending.submission {
+            PlanSubmissionSource::Draft(submission) => submission,
+            PlanSubmissionSource::Queued(id) => {
+                if matches!(choice, ModeSubmissionChoice::Queue) {
+                    self.queue.set_admission(id, PromptAdmission::Queue);
+                    return Vec::new();
+                }
+                return self.replace_queued_submission(id);
+            }
+        };
+        let outcome = self.submit_prepared(*submission, admission);
+        if !matches!(outcome, SubmitOutcome::Rejected(_)) {
+            self.input_box.discard();
+        }
+        self.handle_submit_outcome(outcome)
     }
 
     pub(super) fn submit_goal(&mut self, condition: &str) -> Vec<Action> {
@@ -950,29 +1221,16 @@ impl App {
             commits: Vec::new(),
             paste_ranges: Vec::new(),
         };
-        let mut input = self.build_agent_input(&msg);
-        input.preamble.push(caudra_providers::Message::synthetic(
-            caudra_agent::goal_kickoff_message(condition),
-        ));
-        if self.status == Status::Streaming {
-            let Some(shared) = self.queue.shared.clone() else {
-                self.flash(NO_QUEUE_ERR.into());
-                return vec![];
-            };
-            self.rearm_background();
-            shared.push(QueueItem::Message {
-                text: msg.text,
-                image_count: 0,
-                paste_ranges: msg.paste_ranges,
-                input: Box::new(input),
-                run_id: self.run_id,
-                admission: PromptAdmission::Queue,
-                displayed: false,
-            });
-            vec![]
-        } else {
-            self.start_run(input, msg.text)
-        }
+        let mut submission = self.prepare_submission(msg);
+        submission.goal = Some(condition.into());
+        submission
+            .input
+            .preamble
+            .push(caudra_providers::Message::synthetic(
+                caudra_agent::goal_kickoff_message(condition),
+            ));
+        let outcome = self.admit_submission(submission, PromptAdmission::Queue);
+        self.handle_submit_outcome(outcome)
     }
 
     /// Deferred path: the agent is busy, so park the message and let
@@ -988,39 +1246,30 @@ impl App {
         msg: QueuedMessage,
         admission: PromptAdmission,
     ) -> bool {
+        let submission = self.prepare_submission(msg);
+        self.queue_submission(submission, admission)
+    }
+
+    fn queue_submission(
+        &mut self,
+        submission: PromptSubmission,
+        admission: PromptAdmission,
+    ) -> bool {
         let Some(shared) = self.queue.shared.clone() else {
             return false;
         };
-        let input = self.build_agent_input(&msg);
         if self.automatic_wakes_suppressed {
             self.rearm_background();
         }
-        shared.push(QueueItem::Message {
-            text: msg.text,
-            image_count: msg.images.len(),
-            paste_ranges: msg.paste_ranges,
-            input: Box::new(input),
-            run_id: self.run_id,
-            admission,
-            displayed: false,
-        });
+        shared.push(submission.into_queue_item(self.run_id, admission));
         true
     }
 
-    fn replace_and_notify(&mut self, msg: QueuedMessage) -> SubmitOutcome {
+    fn replace_submission(&mut self, submission: PromptSubmission) -> SubmitOutcome {
         let Some(shared) = self.queue.shared.clone() else {
             return SubmitOutcome::Rejected(NO_QUEUE_ERR);
         };
-        let input = self.build_agent_input(&msg);
-        let mut replacement = QueueItem::Message {
-            text: msg.text,
-            image_count: msg.images.len(),
-            paste_ranges: msg.paste_ranges,
-            input: Box::new(input),
-            run_id: self.run_id,
-            admission: PromptAdmission::Interrupt,
-            displayed: false,
-        };
+        let mut replacement = submission.into_queue_item(self.run_id, PromptAdmission::Interrupt);
         if self.replacement_item.is_some() {
             match shared.update_pending_replacement(self.run_id, replacement) {
                 Ok(id) => {
@@ -1057,12 +1306,15 @@ impl App {
         // snapshot must stop overriding it on save.
         self.recoverable_queue.clear();
         self.recoverable_queue_together = false;
-        if self.state.session.meta.queued_messages_together {
-            self.queue.set_delivery(QueueDelivery::TogetherNextTurn);
-        }
-        if !self.state.session.meta.queued_messages.is_empty() {
-            self.status = Status::Streaming;
-        }
+        let Some(shared) = self.queue.shared.clone() else {
+            return;
+        };
+        let delivery = if self.state.session.meta.queued_messages_together {
+            QueueDelivery::TogetherNextTurn
+        } else {
+            QueueDelivery::Separate
+        };
+        let mut entries = Vec::with_capacity(self.state.session.meta.queued_messages.len());
         // Read, not taken: the live queue is what the next checkpoint mirrors
         // back into the session, so emptying it here changes nothing on disk.
         for (index, prompt) in self
@@ -1103,21 +1355,39 @@ impl App {
                     Some(ImageSource::new(media_type, image.data.into()))
                 })
                 .collect();
-            self.queue_with_admission(
-                QueuedMessage {
-                    mentions: self.scan_mentions(&prompt.text),
-                    commits: self.scan_commits(&prompt.text),
-                    text: prompt.text,
-                    images,
-                    paste_ranges: prompt
-                        .paste_ranges
-                        .into_iter()
-                        .map(|range| range.start..range.end)
-                        .collect(),
-                },
-                admission,
-            );
+            let mode = prompt.mode.map_or(self.state.mode, Into::into);
+            if mode == super::Mode::Plan && matches!(self.state.plan, super::mode::PlanState::None)
+            {
+                let selected = self.state.mode;
+                self.enter_plan();
+                self.state.mode = selected;
+            }
+            let mut submission = self.prepare_submission(QueuedMessage {
+                mentions: self.scan_mentions(&prompt.text),
+                commits: self.scan_commits(&prompt.text),
+                text: prompt.text,
+                images,
+                paste_ranges: prompt
+                    .paste_ranges
+                    .into_iter()
+                    .map(|range| range.start..range.end)
+                    .collect(),
+            });
+            submission.input.mode = self.agent_mode_for(mode);
+            entries.push(submission.into_queue_item(self.run_id, admission));
         }
+        if !entries.is_empty() && self.automatic_wakes_suppressed {
+            self.rearm_background();
+        }
+        let ready = self.status == Status::Idle
+            && !self.awaiting_input()
+            && !self.has_session_work()
+            && !self.automatic_wakes_suppressed
+            && self.shell.active_ids().is_empty();
+        if ready && !entries.is_empty() {
+            self.status = Status::Streaming;
+        }
+        shared.restore_pending(entries, delivery, ready);
     }
 
     pub(super) fn queue_compact(&mut self) {
@@ -1184,13 +1454,7 @@ impl App {
         if self.automatic_wakes_suppressed || self.status != Status::Idle {
             return Vec::new();
         }
-        let mut input = self.build_agent_input(&QueuedMessage {
-            text: String::new(),
-            images: Vec::new(),
-            mentions: Vec::new(),
-            commits: Vec::new(),
-            paste_ranges: Vec::new(),
-        });
+        let mut input = self.continuation_input();
         input.preamble = preamble;
         self.start_run(input, String::new())
     }
@@ -1211,7 +1475,11 @@ impl App {
     /// reaches the transcript. What the request tail still needs is the
     /// agent's call, since it is the only side that owns history.
     pub(super) fn continue_run(&mut self) -> Vec<Action> {
-        if self.status == Status::Streaming || self.cancelling_run.is_some() {
+        if self.cancelling_run.is_some()
+            || (self.status == Status::Streaming
+                && !(self.state.mode == super::Mode::Plan
+                    && !self.execution_agent_mode().is_planning()))
+        {
             self.flash(CONTINUE_BUSY_ERR.into());
             return Vec::new();
         }
@@ -1231,7 +1499,7 @@ impl App {
             paste_ranges: Vec::new(),
         });
         input.resume = true;
-        self.start_run(input, String::new())
+        self.submit_explicit_input(input, String::new())
     }
 
     pub(crate) fn start_goal_checkin(&mut self) -> Vec<Action> {
@@ -1239,13 +1507,7 @@ impl App {
             self.goal_deferred = false;
             return vec![];
         };
-        let mut input = self.build_agent_input(&QueuedMessage {
-            text: String::new(),
-            images: Vec::new(),
-            mentions: Vec::new(),
-            commits: Vec::new(),
-            paste_ranges: Vec::new(),
-        });
+        let mut input = self.continuation_input();
         input.preamble.push(caudra_providers::Message::synthetic(
             caudra_agent::goal_checkin_message(&goal.condition),
         ));

@@ -45,6 +45,7 @@ use caudra_workbench::{
 };
 
 use crate::agent::ModelSlot;
+use crate::agent::SharedMode;
 use crate::app::tasks::TaskOutcome;
 use crate::app::workbench::StoredDocument;
 use crate::chat::Chat;
@@ -59,7 +60,7 @@ use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::goal_modal::GoalModal;
 use crate::components::help_modal::HelpModal;
 use crate::components::input::{
-    AdmissionHit, ChordHint, ChordHintHit, InputAction, InputBox, Submission,
+    AdmissionHit, ChordHint, ChordHintHit, InputAction, InputBox, InputState, Submission,
 };
 use crate::components::keybindings::{self, KeybindContext, key, leader};
 use crate::components::login_picker::{LoginPicker, LoginPickerAction};
@@ -70,6 +71,7 @@ use crate::components::memory_picker::MemoryPicker;
 use crate::components::mention_popup::{MentionAction, MentionPopup};
 use crate::components::message_actions::{MessageActionKind, MessageActions, MessageActionsAction};
 use crate::components::messages::MessageActionTarget;
+use crate::components::mode_submission::ModeSubmission;
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::paste_editor::{PasteEditor, PasteEditorAction, PasteEditorTarget};
 use crate::components::permission_prompt::{PermissionDecision, PermissionPrompt, PromptMouse};
@@ -175,7 +177,7 @@ use mouse::Autoscroll;
 #[cfg(test)]
 use mouse::EDGE_SCROLL_LINES;
 pub(crate) use permission_editor::ConversationPermissions;
-pub(crate) use queue::{MessageQueue, SubmitOutcome};
+pub(crate) use queue::{MODE_DECISION_ERR, MessageQueue, SubmitOutcome};
 #[cfg(test)]
 pub(crate) use session::LEGACY_RESTORE_CLEARED;
 use session::{MergedHistory, Sent};
@@ -390,6 +392,8 @@ pub struct App {
     pub(super) rewind_picker: RewindPicker,
     pub(super) message_actions: MessageActions,
     pub(super) queue_actions: QueueActions,
+    pub(super) mode_submission: ModeSubmission,
+    pending_plan_submission: Option<queue::PendingPlanSubmission>,
     pub(super) review: ReviewModal,
     pub(super) help_modal: HelpModal,
     pub(super) which_key: WhichKey,
@@ -544,6 +548,7 @@ pub struct App {
     pub(super) btw_thread: Option<btw::BtwThread>,
     pub(crate) context_store: Option<ContextStore>,
     pub(crate) effective_model_slot: Option<Arc<ArcSwap<ModelSlot>>>,
+    pub(crate) execution_mode: Option<SharedMode>,
     pub(crate) image_paste_rx: Vec<flume::Receiver<Result<ImageSource, String>>>,
     storage_writer: Arc<StorageWriter>,
     last_sent: Option<Sent>,
@@ -662,6 +667,8 @@ impl App {
             rewind_picker: RewindPicker::new(),
             message_actions: MessageActions::new(),
             queue_actions: QueueActions::new(),
+            mode_submission: ModeSubmission::new(),
+            pending_plan_submission: None,
             review: ReviewModal::new(),
             help_modal: HelpModal::new(),
             which_key: WhichKey::new(ui_config.which_key_delay()),
@@ -784,6 +791,7 @@ impl App {
             btw_thread: None,
             context_store: None,
             effective_model_slot: None,
+            execution_mode: None,
             image_paste_rx: vec![],
             storage_writer,
             last_sent: None,
@@ -1699,6 +1707,7 @@ impl App {
     }
 
     pub fn update(&mut self, msg: Msg) -> Vec<Action> {
+        self.sync_execution_mode();
         if crate::sandbox::transfer::active() && !matches!(msg, Msg::Agent(_)) {
             return self.transfer_input(msg);
         }
@@ -1712,6 +1721,12 @@ impl App {
                 self.handle_key(key)
             }
             Msg::Paste(text) => {
+                if self.mode_submission.is_open()
+                    && !self.permission_prompt.is_open()
+                    && !self.question_form.is_open()
+                {
+                    return Vec::new();
+                }
                 self.sync_subagent_input_target();
                 let text = text.replace("\r\n", "\n").replace('\r', "\n");
                 if self.permission_prompt.is_open() {
@@ -2163,6 +2178,13 @@ impl App {
     }
 
     fn dispatch_overlay(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
+        if self.mode_submission.is_open()
+            && !self.permission_prompt.is_open()
+            && !self.question_form.is_open()
+        {
+            let action = self.mode_submission.handle_key(key);
+            return Some(self.handle_mode_submission(action));
+        }
         if self.sandbox_manager.is_open() {
             let action = self.sandbox_manager.handle_key(key);
             self.handle_sandbox_action(action);
@@ -4025,14 +4047,32 @@ impl App {
                 visible: prefix.visible,
             }];
         }
-        self.submit_or_queue_with_admission(sub.into(), admission)
+        let draft = sub.draft.clone();
+        let images = sub.images.clone();
+        let outcome = self.submit_prompt_with_admission(sub.into(), admission);
+        let preserve_draft = matches!(
+            outcome,
+            SubmitOutcome::NeedsModeDecision(_) | SubmitOutcome::Rejected(_)
+        ) || matches!(&outcome, SubmitOutcome::Started(actions) if actions.is_empty());
+        let actions = self.handle_submit_outcome(outcome);
+        if preserve_draft {
+            self.input_box.set_state(InputState::new(draft, images));
+        }
+        actions
     }
 
     fn handle_cancel(&mut self) -> Vec<Action> {
+        if let Err(error) = self.poll_background_delivery() {
+            self.flash(error);
+        }
+        if self.background_delivery.fence.admission_error().is_some() {
+            self.stop_background_work();
+            return Vec::new();
+        }
         if self.cancelling_run.is_some() {
             return Vec::new();
         }
-        let cancelled_run = self.begin_main_cancel(false, self.status == Status::Streaming);
+        let cancelled_run = self.cancel_main_run();
         vec![Action::CancelAgent {
             run_id: cancelled_run,
         }]
@@ -4065,6 +4105,9 @@ impl App {
         if !preserve_queue {
             self.queue.clear();
             self.replacement_item = None;
+            if !await_terminal {
+                self.status = Status::Idle;
+            }
         }
         self.recoverable_queue.clear();
         self.recoverable_queue_together = false;
@@ -4546,7 +4589,7 @@ impl App {
             if subagent_id.is_none() {
                 self.discard_pending_delegations_under(&e.id);
             }
-            if self.state.mode == Mode::Plan
+            if self.execution_agent_mode() == self.agent_mode_for(Mode::Plan)
                 && (self.state.plan.path().is_some_and(|pp| e.wrote_to(pp))
                     || self
                         .state
@@ -5347,24 +5390,7 @@ impl App {
             return self.clear_goal();
         }
 
-        let replacing = self.state.goal.snapshot().is_some();
-        match self.state.goal.set(condition) {
-            Ok(_) => {
-                self.flash(
-                    if replacing {
-                        "Goal replaced"
-                    } else {
-                        "Goal set"
-                    }
-                    .into(),
-                );
-                self.submit_goal(condition)
-            }
-            Err(error) => {
-                self.flash(error.to_string());
-                vec![]
-            }
-        }
+        self.submit_goal(condition)
     }
 
     fn open_goal_model_picker(&mut self) -> Vec<Action> {
@@ -5418,12 +5444,7 @@ impl App {
         });
         input.prompt = Some(Box::new(prompt_ref));
 
-        if self.status == Status::Streaming {
-            self.flash("Agent is busy, try again later".into());
-            vec![]
-        } else {
-            self.start_run(input, display_text)
-        }
+        self.submit_explicit_input(input, display_text)
     }
 
     fn parse_prompt_args(prompt: &McpPromptInfo, args: &str) -> HashMap<String, String> {
@@ -5648,7 +5669,7 @@ impl App {
         }
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 41] {
+    fn overlays(&self) -> [&dyn Overlay; 42] {
         [
             &self.workbench,
             &self.logs_modal,
@@ -5670,6 +5691,7 @@ impl App {
             &self.rewind_picker,
             &self.message_actions,
             &self.queue_actions,
+            &self.mode_submission,
             &self.review,
             &self.command_modal,
             &self.theme_picker,
@@ -5694,7 +5716,7 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 41] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 42] {
         [
             &mut self.workbench,
             &mut self.logs_modal,
@@ -5716,6 +5738,7 @@ impl App {
             &mut self.rewind_picker,
             &mut self.message_actions,
             &mut self.queue_actions,
+            &mut self.mode_submission,
             &mut self.review,
             &mut self.command_modal,
             &mut self.theme_picker,
@@ -5877,6 +5900,7 @@ impl App {
     }
 
     pub fn close_all_overlays(&mut self) {
+        self.pending_plan_submission = None;
         self.suspend_permission_editor();
         self.overlays_mut().iter_mut().for_each(|o| o.close());
     }
@@ -6267,6 +6291,12 @@ impl App {
     }
 
     fn route_text_paste(&mut self, text: &str) {
+        if self.mode_submission.is_open()
+            && !self.permission_prompt.is_open()
+            && !self.question_form.is_open()
+        {
+            return;
+        }
         if self.sandbox_manager.handle_paste(text) {
             return;
         }

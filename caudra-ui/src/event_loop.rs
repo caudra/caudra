@@ -3227,6 +3227,7 @@ impl<'t> EventLoop<'t> {
                 Ok(json!("replacing"))
             }
             SubmitOutcome::Rejected(e) => Err(e.into()),
+            SubmitOutcome::NeedsModeDecision(_) => Err(crate::app::MODE_DECISION_ERR.into()),
         }
     }
 
@@ -5765,6 +5766,7 @@ mod tests {
         let cwd = canonical_cwd(&std::env::current_dir().unwrap()).unwrap();
         let mut session = AppSession::new("test-model", &cwd.to_string_lossy());
         session.meta.queued_messages = vec![caudra_storage::sessions::StoredQueuedPrompt {
+            mode: None,
             text: "still queued".into(),
             images: Vec::new(),
             paste_ranges: Vec::new(),
@@ -5795,6 +5797,7 @@ mod tests {
                 .meta
                 .queued_messages,
             [caudra_storage::sessions::StoredQueuedPrompt {
+                mode: None,
                 text: "still queued".into(),
                 images: Vec::new(),
                 paste_ranges: Vec::new(),

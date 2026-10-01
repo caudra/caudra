@@ -16,6 +16,7 @@ use caudra_agent::{
     ImageSource, InterruptSource, Mention, PromptAdmission, QueueDelivery, QueueItemId,
     QueuedInterrupt, editable_queue,
 };
+use caudra_storage::sessions::StoredMode;
 
 use crate::components::input::{InputState, Submission};
 use crate::components::queue_panel::QueueEntry;
@@ -38,6 +39,7 @@ pub(crate) struct PendingPrompt {
     pub(crate) images: Vec<ImageSource>,
     pub(crate) paste_ranges: Vec<Range<usize>>,
     pub(crate) admission: PromptAdmission,
+    pub(crate) mode: Option<StoredMode>,
 }
 
 impl From<Submission> for QueuedMessage {
@@ -91,12 +93,6 @@ enum MovementLane {
     Hidden,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ModelLane {
-    Chat,
-    Plan,
-}
-
 impl QueueItem {
     pub(crate) fn run_id(&self) -> u64 {
         match self {
@@ -131,14 +127,16 @@ impl QueueItem {
         }
     }
 
-    fn model_lane(&self) -> Option<ModelLane> {
+    fn mode(&self) -> Option<&AgentMode> {
         match self {
-            Self::Message { input, .. } => Some(match input.mode {
-                AgentMode::Plan(_) | AgentMode::RemotePlan(_) => ModelLane::Plan,
-                AgentMode::Build | AgentMode::ReadOnly => ModelLane::Chat,
-            }),
+            Self::Message { input, .. } => Some(&input.mode),
             Self::Compact { .. } => None,
         }
+    }
+
+    fn guide_ready(&self, next_ready: bool, execution_mode: &AgentMode) -> bool {
+        self.admission() == PromptAdmission::Steer
+            && (next_ready || self.mode() == Some(execution_mode))
     }
 
     fn as_queue_entry(&self, id: QueueItemId) -> QueueEntry<'static> {
@@ -198,6 +196,7 @@ pub(crate) struct QueueSender {
     claim_gate: Arc<Mutex<()>>,
     active: Arc<AtomicBool>,
     active_run_id: Arc<AtomicU64>,
+    execution_mode: Arc<Mutex<AgentMode>>,
     processing: Arc<AtomicBool>,
 }
 
@@ -209,7 +208,7 @@ pub(crate) struct QueueReceiver {
     claim_gate: Arc<Mutex<()>>,
     active: Arc<AtomicBool>,
     active_run_id: Arc<AtomicU64>,
-    active_plan: AtomicBool,
+    execution_mode: Arc<Mutex<AgentMode>>,
     processing: Arc<AtomicBool>,
 }
 
@@ -221,6 +220,7 @@ pub(crate) fn queue() -> (QueueSender, QueueReceiver) {
     let claim_gate = Arc::new(Mutex::new(()));
     let active = Arc::new(AtomicBool::new(false));
     let active_run_id = Arc::new(AtomicU64::new(0));
+    let execution_mode = Arc::new(Mutex::new(AgentMode::Build));
     let processing = Arc::new(AtomicBool::new(false));
     let dispatch_guard = SharedDispatchGuard::default();
     let next_ready = Arc::new(AtomicBool::new(true));
@@ -233,6 +233,7 @@ pub(crate) fn queue() -> (QueueSender, QueueReceiver) {
             claim_gate: Arc::clone(&claim_gate),
             active: Arc::clone(&active),
             active_run_id: Arc::clone(&active_run_id),
+            execution_mode: Arc::clone(&execution_mode),
             processing: Arc::clone(&processing),
         },
         QueueReceiver {
@@ -243,7 +244,7 @@ pub(crate) fn queue() -> (QueueSender, QueueReceiver) {
             claim_gate,
             active,
             active_run_id,
-            active_plan: AtomicBool::new(false),
+            execution_mode,
             processing,
         },
     )
@@ -268,6 +269,11 @@ impl QueueSender {
     }
 
     pub(crate) fn has_priority_input(&self) -> bool {
+        let execution_mode = self
+            .execution_mode
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let next_ready = self.next_ready.load(Ordering::Acquire);
         self.queue.has_matching(|item| {
             matches!(
                 item,
@@ -275,11 +281,18 @@ impl QueueSender {
                     displayed: true,
                     ..
                 }
-            ) || matches!(
-                item.admission(),
-                PromptAdmission::Steer | PromptAdmission::Interrupt
-            )
+            ) || item.admission() == PromptAdmission::Interrupt
+                || item.guide_ready(next_ready, &execution_mode)
         })
+    }
+
+    pub(crate) fn set_execution_mode(&self, mode: AgentMode) {
+        let _claim = self.lock_dispatch();
+        *self
+            .execution_mode
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = mode;
+        self.queue.wake();
     }
 
     pub(crate) fn set_dispatch_guard(&self, guard: Arc<dyn Fn() -> bool + Send + Sync>) {
@@ -308,6 +321,22 @@ impl QueueSender {
         }
     }
 
+    pub(crate) fn restore_pending(
+        &self,
+        entries: impl IntoIterator<Item = QueueItem>,
+        delivery: QueueDelivery,
+        ready: bool,
+    ) {
+        let _claim = self.lock_dispatch();
+        self.next_ready
+            .store(ready && !self.is_processing(), Ordering::Release);
+        self.queue.set_delivery(delivery);
+        for entry in entries {
+            self.queue.push(entry);
+        }
+        self.queue.wake();
+    }
+
     pub(crate) fn remove_id(&self, id: QueueItemId) -> Option<QueueItem> {
         self.queue.remove_with_delivery_guard(id, |item| {
             matches!(
@@ -319,6 +348,22 @@ impl QueueSender {
                 }
             )
         })
+    }
+
+    pub(crate) fn input_mode(&self, id: QueueItemId) -> Option<AgentMode> {
+        self.queue
+            .entries(|candidate, item, _| {
+                if candidate != id {
+                    return None;
+                }
+                match item {
+                    QueueItem::Message { input, .. } => Some(input.mode.clone()),
+                    QueueItem::Compact { .. } => None,
+                }
+            })
+            .into_iter()
+            .flatten()
+            .next()
     }
 
     pub(crate) fn begin_edit(&self, id: QueueItemId) -> Option<InputState> {
@@ -477,6 +522,7 @@ impl QueueSender {
         self.queue.delivery()
     }
 
+    #[cfg(test)]
     pub(crate) fn set_delivery(&self, delivery: QueueDelivery) {
         self.queue.set_delivery(delivery);
     }
@@ -508,6 +554,11 @@ impl QueueSender {
                     images: input.images.clone(),
                     paste_ranges: paste_ranges.clone(),
                     admission: *admission,
+                    mode: Some(if input.mode.is_planning() {
+                        StoredMode::Plan
+                    } else {
+                        StoredMode::Build
+                    }),
                 }),
                 QueueItem::Message { .. } | QueueItem::Compact { .. } => None,
             })
@@ -555,6 +606,11 @@ impl QueueReceiver {
             return Vec::new();
         }
         self.processing.store(true, Ordering::Release);
+        let next_ready = self.next_ready.load(Ordering::Acquire);
+        let mut execution_mode = self
+            .execution_mode
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         loop {
             let immediate = self.queue.claim_one_matching(|item| {
                 matches!(
@@ -571,12 +627,15 @@ impl QueueReceiver {
                 .queue
                 .has_matching(|item| item.admission() == PromptAdmission::Interrupt)
             {
-                let mut replacement = self.queue.claim_all_matching(|item| {
-                    matches!(
-                        item.admission(),
-                        PromptAdmission::Steer | PromptAdmission::Interrupt
-                    )
-                });
+                let mut replacement = self.queue.claim_matching_with_anchor(
+                    |item| item.admission() == PromptAdmission::Interrupt,
+                    |replacement, item| {
+                        matches!(
+                            item.admission(),
+                            PromptAdmission::Steer | PromptAdmission::Interrupt
+                        ) && item.mode() == replacement.mode()
+                    },
+                );
                 replacement.sort_by_key(|(_, item)| {
                     usize::from(item.admission() == PromptAdmission::Interrupt)
                 });
@@ -584,26 +643,29 @@ impl QueueReceiver {
             } else {
                 let steered = self
                     .queue
-                    .claim_one_matching(|item| item.admission() == PromptAdmission::Steer);
+                    .claim_one_matching(|item| item.guide_ready(next_ready, &execution_mode));
                 if !steered.is_empty() {
                     steered
                 } else if self
                     .queue
-                    .has_matching(|item| item.admission() == PromptAdmission::Steer)
+                    .has_matching(|item| item.guide_ready(next_ready, &execution_mode))
                 {
                     self.processing.store(false, Ordering::Release);
                     return Vec::new();
-                } else if self.next_ready.load(Ordering::Acquire) {
-                    self.queue.claim(|item| {
-                        matches!(
-                            item,
-                            QueueItem::Message {
-                                admission: PromptAdmission::Queue,
-                                displayed: false,
-                                ..
-                            }
-                        )
-                    })
+                } else if next_ready {
+                    self.queue.claim_compatible(
+                        |item| {
+                            matches!(
+                                item,
+                                QueueItem::Message {
+                                    admission: PromptAdmission::Queue,
+                                    displayed: false,
+                                    ..
+                                }
+                            )
+                        },
+                        |first, item| first.mode() == item.mode(),
+                    )
                 } else {
                     self.queue
                         .claim_front_matching(|item| matches!(item, QueueItem::Compact { .. }))
@@ -620,12 +682,11 @@ impl QueueReceiver {
             if claimed.is_empty() {
                 continue;
             }
-            if let Some((run_id, lane)) = claimed.iter().rev().find_map(|(_, item)| match item {
-                QueueItem::Message { run_id, .. } => item.model_lane().map(|lane| (*run_id, lane)),
+            if let Some((run_id, mode)) = claimed.iter().rev().find_map(|(_, item)| match item {
+                QueueItem::Message { run_id, input, .. } => Some((*run_id, &input.mode)),
                 QueueItem::Compact { .. } => None,
             }) {
-                self.active_plan
-                    .store(lane == ModelLane::Plan, Ordering::Relaxed);
+                execution_mode.clone_from(mode);
                 self.active_run_id.store(run_id, Ordering::Relaxed);
                 self.active.store(true, Ordering::Release);
             }
@@ -645,15 +706,14 @@ impl QueueReceiver {
             return Vec::new();
         }
         let run_id = self.active_run_id.load(Ordering::Relaxed);
-        let lane = if self.active_plan.load(Ordering::Relaxed) {
-            ModelLane::Plan
-        } else {
-            ModelLane::Chat
-        };
+        let execution_mode = self
+            .execution_mode
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.queue.claim_all_matching(|item| {
             item.admission() == PromptAdmission::Steer
                 && item.run_id() == run_id
-                && item.model_lane() == Some(lane)
+                && item.mode() == Some(&*execution_mode)
         })
     }
 
@@ -663,14 +723,31 @@ impl QueueReceiver {
 
     #[cfg(test)]
     pub(crate) fn set_active_run(&self, run_id: u64) {
-        self.active_plan.store(false, Ordering::Relaxed);
+        *self
+            .execution_mode
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = AgentMode::Build;
         self.active_run_id.store(run_id, Ordering::Relaxed);
         self.active.store(true, Ordering::Release);
+        self.processing.store(true, Ordering::Release);
     }
 
     pub(crate) fn clear_active_run(&self) {
         self.active.store(false, Ordering::Release);
         self.processing.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn finish_run(&self, run_id: u64, failed: bool) -> bool {
+        let _claim = self
+            .claim_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let proceed = !failed || self.has_newer_interrupt(run_id);
+        if !proceed {
+            self.pause();
+        }
+        self.clear_active_run();
+        proceed
     }
 
     pub(crate) fn has_newer_interrupt(&self, run_id: u64) -> bool {
@@ -736,10 +813,314 @@ mod tests {
     use std::thread;
 
     use super::*;
+    use caudra_workspace::PlanRef;
     use test_case::test_case;
 
     const PADDED_DRAFT: &str = "  ab cd  ";
     const PLAN_PATH: &str = ".caudra/plans/test.md";
+    const OTHER_PLAN_PATH: &str = ".caudra/plans/other.md";
+    const REMOTE_PLAN: &str = "plan-1";
+    const OTHER_REMOTE_PLAN: &str = "plan-2";
+    const EDITED_PROMPT: &str = "edited prompt";
+
+    fn remote_plan(reference: &str) -> AgentMode {
+        AgentMode::RemotePlan(PlanRef::new(reference).unwrap())
+    }
+
+    #[test_case(PromptAdmission::Interrupt, QueueDelivery::Separate, true, &[&[2, 3], &[0], &[1]]; "replacement_priority")]
+    #[test_case(PromptAdmission::Interrupt, QueueDelivery::Separate, false, &[&[2, 3], &[0], &[1]]; "replacement_while_next_held")]
+    #[test_case(PromptAdmission::Interrupt, QueueDelivery::TogetherNextTurn, true, &[&[2, 3], &[0, 1]]; "replacement_preserves_together")]
+    #[test_case(PromptAdmission::Interrupt, QueueDelivery::TogetherNextTurn, false, &[&[2, 3], &[0, 1]]; "held_replacement_preserves_together")]
+    #[test_case(PromptAdmission::Steer, QueueDelivery::Separate, true, &[&[2], &[3], &[0], &[1]]; "guide_priority")]
+    #[test_case(PromptAdmission::Steer, QueueDelivery::Separate, false, &[&[], &[2], &[3], &[0], &[1]]; "incompatible_guides_wait")]
+    #[test_case(PromptAdmission::Queue, QueueDelivery::Separate, true, &[&[0], &[1], &[2], &[3]]; "separate_mixed_modes")]
+    #[test_case(PromptAdmission::Queue, QueueDelivery::TogetherNextTurn, true, &[&[0, 1], &[2, 3]]; "together_mixed_modes")]
+    #[test_case(PromptAdmission::Queue, QueueDelivery::TogetherNextTurn, false, &[&[], &[0, 1], &[2, 3]]; "together_waits_for_readiness")]
+    fn restore_is_atomic_for_live_receiver(
+        admission: PromptAdmission,
+        delivery: QueueDelivery,
+        ready: bool,
+        expected_batches: &[&[u64]],
+    ) {
+        let (sender, receiver) = queue();
+        let (notified_tx, notified_rx) = flume::bounded(0);
+        let (receiver, mut claimed) = thread::scope(|scope| {
+            let worker = scope.spawn(move || {
+                smol::block_on(receiver.recv_notify()).unwrap();
+                assert!(receiver.claim_gate.try_lock().is_err());
+                assert_eq!(receiver.next_ready.load(Ordering::Acquire), ready);
+                notified_tx.send(()).unwrap();
+                let claimed = receiver.claim_idle(0);
+                (receiver, claimed)
+            });
+            let entries = [
+                AgentMode::Build,
+                AgentMode::Build,
+                AgentMode::Plan(PLAN_PATH.into()),
+                AgentMode::Plan(PLAN_PATH.into()),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, mode)| {
+                if index == 1 {
+                    notified_rx.recv().unwrap();
+                }
+                let planning = mode.is_planning();
+                let mut item = msg_with_mode(false, mode);
+                item.set_run_id(index as u64);
+                if planning
+                    && let QueueItem::Message {
+                        admission: current, ..
+                    } = &mut item
+                {
+                    *current = admission;
+                }
+                item
+            });
+            sender.restore_pending(entries, delivery, ready);
+            worker.join().unwrap()
+        });
+
+        for (index, expected) in expected_batches.iter().enumerate() {
+            if index != 0 {
+                receiver.hold_next_turn();
+                receiver.clear_active_run();
+                sender.allow_next_turn(true);
+                claimed = receiver.claim_idle(0);
+            }
+            assert_eq!(
+                claimed
+                    .iter()
+                    .map(|(_, item)| item.run_id())
+                    .collect::<Vec<_>>(),
+                *expected
+            );
+            if let Some((_, first)) = claimed.first() {
+                assert!(claimed.iter().all(|(_, item)| item.mode() == first.mode()));
+            }
+        }
+        assert!(sender.is_empty());
+        assert_eq!(sender.delivery(), QueueDelivery::Separate);
+    }
+
+    #[test_case(false; "idle")]
+    #[test_case(true; "processing")]
+    fn restore_cannot_reopen_next_while_processing(processing: bool) {
+        let (sender, receiver) = queue();
+        if processing {
+            sender.push(msg(false));
+            assert_eq!(receiver.claim_idle(0).len(), 1);
+        }
+
+        sender.restore_pending([msg(false)], QueueDelivery::Separate, true);
+        assert_eq!(sender.next_ready.load(Ordering::Acquire), !processing);
+        receiver.clear_active_run();
+        assert_eq!(receiver.claim_idle(0).is_empty(), processing);
+        if processing {
+            sender.allow_next_turn(true);
+            assert_eq!(receiver.claim_idle(0).len(), 1);
+        }
+        assert!(sender.is_empty());
+    }
+
+    #[test_case(AgentMode::Build, AgentMode::Plan(PLAN_PATH.into()); "build_then_plan")]
+    #[test_case(AgentMode::Plan(PLAN_PATH.into()), AgentMode::Build; "plan_then_build")]
+    #[test_case(AgentMode::Plan(PLAN_PATH.into()), AgentMode::Plan(OTHER_PLAN_PATH.into()); "local_targets")]
+    #[test_case(remote_plan(REMOTE_PLAN), remote_plan(OTHER_REMOTE_PLAN); "remote_targets")]
+    #[test_case(AgentMode::Plan(PLAN_PATH.into()), remote_plan(REMOTE_PLAN); "local_and_remote")]
+    #[test_case(AgentMode::ReadOnly, AgentMode::Build; "read_only_and_build")]
+    fn together_batches_partition_at_captured_mode(first_mode: AgentMode, second_mode: AgentMode) {
+        let (sender, receiver) = queue();
+        let modes = [
+            first_mode.clone(),
+            first_mode.clone(),
+            second_mode.clone(),
+            second_mode.clone(),
+            first_mode.clone(),
+        ];
+        let ids = modes
+            .iter()
+            .map(|mode| sender.push(msg_with_mode(false, mode.clone())))
+            .collect::<Vec<_>>();
+        sender.set_delivery(QueueDelivery::TogetherNextTurn);
+
+        for partition in [0..2, 2..4, 4..5] {
+            let claimed = receiver.claim_idle(0);
+            assert_eq!(
+                claimed.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                ids[partition.clone()]
+            );
+            assert!(
+                claimed
+                    .iter()
+                    .all(|(_, item)| item.mode() == Some(&modes[partition.start]))
+            );
+            receiver.hold_next_turn();
+            receiver.clear_active_run();
+            assert!(receiver.claim_idle(0).is_empty());
+            sender.allow_next_turn(true);
+        }
+        assert!(sender.is_empty());
+        assert_eq!(sender.delivery(), QueueDelivery::Separate);
+    }
+
+    #[test_case(AgentMode::Build, AgentMode::Plan(PLAN_PATH.into()); "build_replacement")]
+    #[test_case(AgentMode::Plan(PLAN_PATH.into()), AgentMode::Build; "plan_replacement")]
+    #[test_case(AgentMode::Plan(PLAN_PATH.into()), AgentMode::Plan(OTHER_PLAN_PATH.into()); "local_targets")]
+    #[test_case(remote_plan(REMOTE_PLAN), remote_plan(OTHER_REMOTE_PLAN); "remote_targets")]
+    fn replacement_batches_only_compatible_guides(mode: AgentMode, other_mode: AgentMode) {
+        let (sender, receiver) = queue();
+        let next = sender.push(msg_with_mode(false, mode.clone()));
+        let other_guide = sender.push(steer(other_mode.clone()));
+        let first_guide = sender.push(steer(mode.clone()));
+        let later_other_guide = sender.push(steer(other_mode.clone()));
+        let second_guide = sender.push(steer(mode.clone()));
+        let mut replacement = steer(mode.clone());
+        if let QueueItem::Message { admission, .. } = &mut replacement {
+            *admission = PromptAdmission::Interrupt;
+        }
+        let (replacement, _) = sender.replace(0, 1, replacement);
+
+        let claimed = receiver.claim_idle(0);
+        assert_eq!(
+            claimed.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [first_guide, second_guide, replacement]
+        );
+        assert!(claimed.iter().all(|(_, item)| item.mode() == Some(&mode)));
+        receiver.hold_next_turn();
+        assert!(receiver.poll().is_none());
+        receiver.clear_active_run();
+        assert!(!sender.has_priority_input());
+        assert!(receiver.claim_idle(0).is_empty());
+        sender.allow_next_turn(true);
+        assert_eq!(receiver.claim_idle(0)[0].0, other_guide);
+        assert_eq!(receiver.claim_idle(0)[0].0, later_other_guide);
+        assert_eq!(receiver.claim_idle(0)[0].0, next);
+        assert!(sender.is_empty());
+    }
+
+    #[test_case(false; "editing_incompatible_guide")]
+    #[test_case(true; "editing_replacement")]
+    fn incompatible_guides_cannot_outrun_replacement(edit_replacement: bool) {
+        let (sender, receiver) = queue();
+        let guide = sender.push(steer(AgentMode::Build));
+        let mut replacement = steer(AgentMode::Plan(PLAN_PATH.into()));
+        if let QueueItem::Message { admission, .. } = &mut replacement {
+            *admission = PromptAdmission::Interrupt;
+        }
+        let (replacement, _) = sender.replace(0, 1, replacement);
+        let editing = if edit_replacement { replacement } else { guide };
+        assert!(sender.begin_edit(editing).is_some());
+        if edit_replacement {
+            assert!(receiver.claim_idle(0).is_empty());
+            assert!(sender.cancel_edit(editing));
+        }
+        let claimed = receiver.claim_idle(0);
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].0, replacement);
+        assert_eq!(sender.len(), 1);
+        if !edit_replacement {
+            assert!(sender.cancel_edit(editing));
+        }
+        assert_eq!(receiver.claim_idle(0)[0].0, guide);
+    }
+
+    #[test_case(false; "submitted_guide")]
+    #[test_case(true; "moved_from_next")]
+    fn mode_transition_guides_wait_for_next_ready(move_from_next: bool) {
+        let (sender, receiver) = queue();
+        sender.set_execution_mode(AgentMode::Build);
+        receiver.set_active_run(0);
+        receiver.hold_next_turn();
+        let mode = AgentMode::Plan(PLAN_PATH.into());
+        let plan = sender.push(if move_from_next {
+            msg_with_mode(false, mode.clone())
+        } else {
+            steer(mode.clone())
+        });
+        if move_from_next {
+            assert!(sender.set_admission(plan, PromptAdmission::Steer));
+        }
+        assert!(!sender.has_priority_input());
+        assert!(receiver.poll().is_none());
+        receiver.clear_active_run();
+        assert!(receiver.claim_idle(0).is_empty());
+
+        let guide = sender.push(steer(AgentMode::Build));
+        assert!(sender.has_priority_input());
+        assert_eq!(receiver.claim_idle(0)[0].0, guide);
+        receiver.clear_active_run();
+        let result = sender.push(msg(true));
+        assert_eq!(receiver.claim_idle(0)[0].0, result);
+        sender.allow_next_turn(true);
+        receiver.clear_active_run();
+        assert!(receiver.claim_idle(0).is_empty());
+        sender.allow_next_turn(false);
+        assert!(receiver.claim_idle(0).is_empty());
+        sender.allow_next_turn(true);
+        let claimed = receiver.claim_idle(0);
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].0, plan);
+        assert_eq!(claimed[0].1.mode(), Some(&mode));
+        assert!(sender.is_empty());
+    }
+
+    #[test_case(AgentMode::Plan(PLAN_PATH.into()); "local_plan")]
+    #[test_case(remote_plan(REMOTE_PLAN); "remote_target")]
+    fn restored_execution_mode_keeps_same_mode_guidance_ready(mode: AgentMode) {
+        let (sender, receiver) = queue();
+        sender.set_execution_mode(mode.clone());
+        receiver.hold_next_turn();
+        let incompatible = sender.push(steer(AgentMode::Build));
+        let compatible = sender.push(steer(mode.clone()));
+
+        assert!(sender.has_priority_input());
+        let claimed = receiver.claim_idle(0);
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].0, compatible);
+        assert_eq!(claimed[0].1.mode(), Some(&mode));
+        receiver.clear_active_run();
+        assert!(!sender.has_priority_input());
+        assert!(receiver.claim_idle(0).is_empty());
+        assert_eq!(sender.panel_entries()[0].id, incompatible);
+    }
+
+    #[test_case(AgentMode::Build, StoredMode::Build; "build")]
+    #[test_case(AgentMode::ReadOnly, StoredMode::Build; "read_only")]
+    #[test_case(AgentMode::Plan(PLAN_PATH.into()), StoredMode::Plan; "local_plan")]
+    #[test_case(remote_plan(REMOTE_PLAN), StoredMode::Plan; "remote_target")]
+    fn edit_reorder_and_snapshot_preserve_captured_mode(mode: AgentMode, stored: StoredMode) {
+        let (sender, _receiver) = queue();
+        sender.push(msg(false));
+        let id = sender.push(msg_with_mode(false, mode.clone()));
+        assert!(sender.move_up(id));
+        assert!(sender.begin_edit(id).is_some());
+        assert_eq!(sender.pending_prompts()[0].mode, Some(stored));
+        assert!(sender.finish_edit(
+            id,
+            QueuedMessage {
+                text: EDITED_PROMPT.into(),
+                images: Vec::new(),
+                mentions: Vec::new(),
+                commits: Vec::new(),
+                paste_ranges: vec![0..EDITED_PROMPT.len()],
+            },
+        ));
+        assert!(sender.move_down(id));
+        assert!(sender.set_admission(id, PromptAdmission::Steer));
+        assert_eq!(
+            sender.pending_prompts()[1],
+            PendingPrompt {
+                text: EDITED_PROMPT.into(),
+                images: Vec::new(),
+                paste_ranges: vec![0..EDITED_PROMPT.len()],
+                admission: PromptAdmission::Steer,
+                mode: Some(stored),
+            }
+        );
+        let item = sender.remove_id(id).unwrap();
+        assert_eq!(item.mode(), Some(&mode));
+    }
 
     #[test_case(QueueDelivery::Separate, 1; "separate")]
     #[test_case(QueueDelivery::TogetherNextTurn, 2; "together")]
@@ -1011,19 +1392,23 @@ mod tests {
         assert_eq!(tx.len(), 1);
     }
 
-    #[test]
-    fn active_chat_run_only_claims_non_plan_steers() {
+    #[test_case(AgentMode::Build; "build")]
+    #[test_case(AgentMode::ReadOnly; "read_only")]
+    #[test_case(AgentMode::Plan(PLAN_PATH.into()); "local_plan")]
+    #[test_case(remote_plan(REMOTE_PLAN); "remote_target")]
+    fn active_run_only_claims_same_mode_steers(mode: AgentMode) {
         let (tx, rx) = queue();
-        tx.push(msg_with_mode(false, AgentMode::ReadOnly));
+        tx.push(msg_with_mode(false, mode.clone()));
         assert_eq!(rx.claim_idle(0).len(), 1);
-        tx.push(steer(AgentMode::Plan(PathBuf::from(PLAN_PATH))));
-        tx.push(steer(AgentMode::Build));
+        let incompatible = tx.push(steer(AgentMode::Plan(OTHER_PLAN_PATH.into())));
+        let matching = tx.push(steer(mode.clone()));
 
-        let Some(ExtractedCommand::Interrupt(input, ..)) = rx.poll() else {
-            panic!("expected a chat-lane steer");
-        };
-        assert!(matches!(input.mode, AgentMode::Build));
+        let claimed = rx.claim_steers();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].0, matching);
+        assert_eq!(claimed[0].1.mode(), Some(&mode));
         assert_eq!(tx.len(), 1);
+        assert_eq!(tx.panel_entries()[0].id, incompatible);
     }
 
     #[test]

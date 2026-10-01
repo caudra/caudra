@@ -83,6 +83,7 @@ impl SessionState {
             Some(StoredMode::Build) => Mode::Build,
             _ => Mode::Plan,
         };
+        let applied_mode = session.meta.execution_mode.map_or(mode, Into::into);
 
         let mut warnings = Vec::new();
 
@@ -121,7 +122,7 @@ impl SessionState {
             },
         };
 
-        if mode == Mode::Plan {
+        if mode == Mode::Plan || applied_mode == Mode::Plan {
             plan.allocate_path(storage, Path::new(&session.cwd));
         }
 
@@ -184,7 +185,7 @@ impl SessionState {
             context_size,
             turns,
             mode,
-            applied_mode: mode,
+            applied_mode,
             applied_model,
             plan,
             warnings,
@@ -234,6 +235,15 @@ impl From<Mode> for StoredMode {
         match mode {
             Mode::Build => StoredMode::Build,
             Mode::Plan => StoredMode::Plan,
+        }
+    }
+}
+
+impl From<StoredMode> for Mode {
+    fn from(mode: StoredMode) -> Self {
+        match mode {
+            StoredMode::Build => Self::Build,
+            StoredMode::Plan => Self::Plan,
         }
     }
 }
@@ -291,6 +301,28 @@ mod tests {
         session.meta.mode = mode;
         session.meta.plan_path = plan_path;
         session
+    }
+
+    #[test_case(StoredMode::Plan, Some(StoredMode::Build), Mode::Build; "pending_plan")]
+    #[test_case(StoredMode::Build, Some(StoredMode::Plan), Mode::Plan; "pending_build")]
+    #[test_case(StoredMode::Plan, None, Mode::Plan; "legacy_plan")]
+    #[test_case(StoredMode::Build, None, Mode::Build; "legacy_build")]
+    fn restoration_keeps_selected_and_execution_modes_separate(
+        selected: StoredMode,
+        execution: Option<StoredMode>,
+        expected_execution: Mode,
+    ) {
+        let mut session = make_plan_session(Some(selected), None);
+        session.meta.execution_mode = execution;
+
+        let state = resumed(session, &test_model());
+
+        assert_eq!(state.mode, Mode::from(selected));
+        assert_eq!(state.applied_mode, expected_execution);
+        assert_eq!(
+            state.plan.path().is_some(),
+            selected == StoredMode::Plan || expected_execution == Mode::Plan
+        );
     }
 
     /// A resumed session opens on the bill it ran up, not on its counters

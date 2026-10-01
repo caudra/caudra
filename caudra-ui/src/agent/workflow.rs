@@ -53,8 +53,8 @@ pub(crate) struct WorkflowSpawn<'a> {
     pub(crate) background: Option<BackgroundTasks>,
     pub(crate) state_dir: StateDir,
     pub(crate) session_id: CaudraId,
-    pub(crate) model_slot: &'a Arc<ArcSwap<ModelSlot>>,
     pub(crate) effective_model_slot: &'a Arc<ArcSwap<ModelSlot>>,
+    pub(crate) execution_mode: &'a SharedMode,
     pub(crate) config: &'a AgentConfig,
     pub(crate) tool_output_lines: ToolOutputLines,
     pub(crate) permissions: &'a Arc<PermissionManager>,
@@ -100,8 +100,6 @@ pub(crate) struct WorkflowSession {
     session_id: CaudraId,
     runtime: WorkflowRuntime,
     handle: WorkflowHandle,
-    mode: SharedMode,
-    effective_model_slot: Arc<ArcSwap<ModelSlot>>,
     answer: AnswerChannel,
 }
 
@@ -123,7 +121,7 @@ impl WorkflowSession {
             },
             None => env::current_dir().unwrap_or_else(|_| spawn.permissions.project_cwd()),
         };
-        let slot = spawn.model_slot.load();
+        let slot = spawn.effective_model_slot.load();
         let tool_filter = ToolFilter::from_config(spawn.config, &slot.model, &[])
             .for_remote_workspace(spawn.workspace_session.is_some());
         let session_ref = SessionRef::from(spawn.session_id);
@@ -167,13 +165,12 @@ impl WorkflowSession {
             task_id: None,
         };
         drop(slot);
-        let mode: SharedMode = Arc::new(ArcSwap::from_pointee(AgentMode::default()));
         let mode_resolver: ModeResolver = Arc::new({
-            let mode = Arc::clone(&mode);
+            let mode = Arc::clone(spawn.execution_mode);
             move || AgentMode::clone(&mode.load())
         });
         let model_resolver: ModelResolver = Arc::new({
-            let model_slot = Arc::clone(spawn.model_slot);
+            let model_slot = Arc::clone(spawn.effective_model_slot);
             move || {
                 let slot = model_slot.load();
                 (Arc::clone(&slot.provider), Arc::new(slot.model.clone()))
@@ -240,8 +237,6 @@ impl WorkflowSession {
             session_id: spawn.session_id,
             handle: runtime.handle(),
             runtime,
-            mode,
-            effective_model_slot: Arc::clone(spawn.effective_model_slot),
             answer: spawn.answer,
         })
     }
@@ -256,14 +251,6 @@ impl WorkflowSession {
 
     pub(crate) fn handle(&self) -> WorkflowHandle {
         self.handle.clone()
-    }
-
-    pub(crate) fn mode(&self) -> SharedMode {
-        Arc::clone(&self.mode)
-    }
-
-    pub(crate) fn effective_model_slot(&self) -> Arc<ArcSwap<ModelSlot>> {
-        Arc::clone(&self.effective_model_slot)
     }
 
     /// Runs whose script is executing right now, which no agent turn owns.

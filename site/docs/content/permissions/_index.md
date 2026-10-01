@@ -186,6 +186,8 @@ Use [`caudra permissions discover`](/docs/cli/#discovering-patterns-from-history
 
 ## Plan mode
 
+Selecting Plan while Build work runs does not change that work. A conflicting submission offers a choice to keep editing, queue in Plan, or stop the work first. See [Selecting Plan while work runs](/docs/queue/#selecting-plan-while-work-runs).
+
 While plan mode is active, Caudra withholds the authority that would outlive the plan. Remembered project and global rules do not apply, allows from `permissions.toml` do not apply, and the prompt offers only the once and conversation lifetimes. Deny and ask rules still apply, because they only restrict access.
 
 A conversation grant made while planning does apply for the rest of the plan. Approving broad shell authority for the conversation lets the agent keep exploring with scripts and searches instead of asking about each command. The grant stays with the conversation after you leave plan mode. Allow once covers only the current call.

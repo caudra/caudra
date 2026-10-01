@@ -30,9 +30,9 @@ use caudra_storage::id::CaudraId;
 use caudra_storage::sessions::{
     PendingConversationRevert, PendingRestoreKind, PendingRestoreOperation, PendingRestorePhase,
     SessionDatabase, SessionLease, SessionLocation, SessionMeta, StoredActiveGoal,
-    StoredGoalResult, StoredImage, StoredPasteRange, StoredPlanTarget, StoredPromptAdmission,
-    StoredQueuedDraft, StoredQueuedPrompt, StoredSubagent, StoredSubagentOutcome,
-    StoredSubagentTaskSpec,
+    StoredGoalResult, StoredImage, StoredMode, StoredPasteRange, StoredPlanTarget,
+    StoredPromptAdmission, StoredQueuedDraft, StoredQueuedPrompt, StoredSubagent,
+    StoredSubagentOutcome, StoredSubagentTaskSpec,
 };
 use caudra_storage::tool_outputs::{ToolOutputId, ToolOutputRef, ToolOutputStore};
 use caudra_storage::worktrees::{self, CheckoutSessions};
@@ -422,6 +422,11 @@ impl App {
             history_head: state.session.meta.history_head,
             pending_revert: state.session.meta.pending_revert.clone(),
             mode: Some(state.mode.into()),
+            execution_mode: Some(if self.execution_agent_mode().is_planning() {
+                StoredMode::Plan
+            } else {
+                StoredMode::Build
+            }),
             plan_path: state.plan.path().map(|p| p.to_string_lossy().into_owned()),
             plan_target: plan_target(&state.plan),
             plan_written: state.plan.is_ready(),
@@ -450,6 +455,7 @@ impl App {
             queued_messages: queued_prompts
                 .iter()
                 .map(|prompt| StoredQueuedPrompt {
+                    mode: prompt.mode,
                     text: prompt.text.clone(),
                     images: prompt
                         .images
@@ -592,6 +598,7 @@ impl App {
     }
 
     pub(super) fn reset_ui_chrome(&mut self) {
+        self.execution_mode = None;
         self.release_background_claims();
         self.task_interactions = super::tasks::TaskInteractions::default();
         self.background_saved_revision = None;

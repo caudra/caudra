@@ -504,6 +504,9 @@ impl App {
         render_if_open!(self.session_relocation_picker);
         render_if_open!(self.worktree_picker);
         render_if_open!(self.sandbox_manager);
+        if !self.question_form.is_open() {
+            render_if_open!(self.mode_submission);
+        }
 
         overlay_rect
     }
