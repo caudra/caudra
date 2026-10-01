@@ -15,10 +15,10 @@ use crate::selection::wrap_breaks;
 use crate::theme;
 
 use super::tool_display::{
-    ScrollTail, TREE_BRANCH, TREE_GAP, TREE_LAST, TREE_TRUNK, annotation_spans, append_annotation,
-    batch_sigil_style, compact_args_for, header_spans, header_timeout, header_workdir,
-    inflected_header, names_tool, progress_lines, report_header, report_markdown, report_message,
-    scroll_footer_text, title,
+    ACTIVITY_BODY_PAD, ScrollTail, TREE_BRANCH, TREE_GAP, TREE_LAST, TREE_TRUNK, annotation_spans,
+    append_annotation, batch_sigil_style, compact_args_for, header_spans, header_timeout,
+    header_workdir, inflected_header, names_tool, progress_lines, report_header, report_markdown,
+    report_message, scroll_footer_text, title,
 };
 use super::{
     ToolProgress, environment_card, is_collapsible, memory_card, task_card, workflow_card,
@@ -1095,6 +1095,15 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
             true => (TREE_LAST, TREE_GAP),
             false => (TREE_BRANCH, TREE_TRUNK),
         };
+        let history = progress
+            .map(|progress| progress_lines(progress, continuation, limits.width))
+            .unwrap_or_default();
+        let body_pad = if history.is_empty() {
+            BATCH_BODY_PAD
+        } else {
+            ACTIVITY_BODY_PAD
+        };
+        let body_indent = format!("{continuation}{body_pad}");
         let (sigil, label, tense) = title(&entry.tool, entry.status.into(), entry.status.stage());
         let report_title = report_header(&entry.tool, &entry.summary, entry.raw_input.as_ref());
         let inflected = inflected_header(&entry.tool, &report_title, tense);
@@ -1160,12 +1169,7 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
         // Without it ten calls reach the clipboard as one undivided block.
         // A title too long for the card hangs under its own label, so the
         // connector and the sigil are said once and the tree stays legible.
-        let broken = wrap_styled(
-            spans,
-            2,
-            &format!("{continuation}{BATCH_BODY_PAD}"),
-            limits.width,
-        );
+        let broken = wrap_styled(spans, 2, &body_indent, limits.width);
         let heading = child_heading(index, entry);
         trace.record(lines.len(), heading_rows(&broken, heading));
         rows.resize(rows.len() + broken.len(), target);
@@ -1173,11 +1177,10 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
         // A child's own output is content and clears the trunk; what the child
         // dispatched hangs off it as nodes. Content first, so reading down a
         // child never steps back out to a shallower level than the row above.
-        let mut body = body.map(|body| body.indented(continuation));
-        if let Some(progress) = progress {
+        let mut body = body.map(|body| body.indented(&body_indent));
+        if !history.is_empty() {
             let mut combined =
                 body.unwrap_or_else(|| ChildBody::traced(Vec::new(), BodySource::default()));
-            let history = progress_lines(progress, continuation, limits.width);
             if let Some(source) = combined.source.as_mut() {
                 for line in &history {
                     source.push_chrome(line.spans.len());
@@ -1499,17 +1502,14 @@ impl ChildBody {
         self.source = self.source.take().and_then(|source| source.keep_rows(kept));
     }
 
-    fn indented(mut self, continuation: &str) -> Self {
+    fn indented(mut self, indent: &str) -> Self {
         for region in &mut self.highlights {
-            region.indent(
-                format!("{continuation}{BATCH_BODY_PAD}"),
-                theme::current().tool_dim,
-            );
+            region.indent(indent.to_owned(), theme::current().tool_dim);
         }
         for row in &mut self.links.rows {
             row.insert(0, None);
         }
-        self.lines = indent_all(self.lines, continuation);
+        self.lines = indent_all(self.lines, indent);
         self.source = self.source.map(BodySource::indented);
         self
     }
@@ -2248,13 +2248,12 @@ fn wrapped_ranges(line: &str, width: u16) -> Vec<Range<usize>> {
 /// Indents a child's body to sit under its label, carrying the trunk down the
 /// left of every row so the body reads as hanging off the connector above it
 /// rather than floating between two siblings.
-fn indent_all(lines: Vec<Line<'static>>, continuation: &str) -> Vec<Line<'static>> {
-    let indent = format!("{continuation}{BATCH_BODY_PAD}");
+fn indent_all(lines: Vec<Line<'static>>, indent: &str) -> Vec<Line<'static>> {
     let style = theme::current().tool_dim;
     lines
         .into_iter()
         .map(|mut line| {
-            line.spans.insert(0, Span::styled(indent.clone(), style));
+            line.spans.insert(0, Span::styled(indent.to_owned(), style));
             line
         })
         .collect()
@@ -4036,7 +4035,7 @@ mod tests {
         let mut body = ChildBody::traced(wrapped.lines, BodySource::default());
         body.span = Some(span);
         let shifted = body
-            .indented(TREE_TRUNK)
+            .indented(&format!("{TREE_TRUNK}{BATCH_BODY_PAD}"))
             .span
             .expect(WRAPPED_TRACK_MSG)
             .shifted(WINDOW_LINES, Some(0))
@@ -6308,6 +6307,310 @@ mod tests {
             .next()
             .unwrap_or_default()
             .to_owned()
+    }
+
+    const ADMITTED_CHILD: usize = 1;
+    const ADMITTED_NARROW_WIDTH: u16 = 32;
+    const ADMITTED_WIDE_WIDTH: u16 = 160;
+    const ADMITTED_LABEL: &str = "Investigate descendant connectors across background activity";
+    const ADMITTED_TASK_ID: &str = "background-task-retained-history";
+    const ADMITTED_ANNOTATION: &str = "background admission accepted and task remains active";
+    const ADMITTED_RUNNING: &str = "running";
+    const ADMITTED_SUCCEEDED: &str = "succeeded";
+    const ADMITTED_CANCELLED: &str = "cancelled";
+    const ADMITTED_LINK: &str = "https://example.com/report";
+    const ADMITTED_LINK_LABEL: &str = "report";
+    const ADMITTED_CONNECTOR_MSG: &str =
+        "live descendants stay connected through wrapped headings and successful task receipts";
+    const ADMITTED_METADATA_MSG: &str =
+        "the descendant gutter must preserve task targets, links, source, and highlight geometry";
+
+    fn admitted_task_entries(last: bool, state: &str) -> Vec<BatchToolEntry> {
+        let task = serde_json::from_value(serde_json::json!({
+            "task_id": ADMITTED_TASK_ID,
+            "invocation_id": "admitted-invocation",
+            "call_id": "batch:1",
+            "root_call_id": "batch",
+            "label": ADMITTED_LABEL,
+            "state": state,
+            "mode": "build",
+            "background": true,
+            "generation": 1,
+            "created_at": 1,
+            "updated_at": 2,
+            "reports": [format!("[{ADMITTED_LINK_LABEL}]({ADMITTED_LINK})")],
+        }))
+        .unwrap();
+        let mut entries = vec![
+            batch_entry(SHELL_CHILD, 0),
+            BatchToolEntry {
+                annotation: Some(ADMITTED_ANNOTATION.to_owned()),
+                output: Some(ToolOutput::Tasks(vec![task])),
+                ..batch_entry(TASK_TOOL_NAME, 0)
+            },
+        ];
+        if !last {
+            entries.push(batch_entry(SHELL_CHILD, 0));
+        }
+        entries
+    }
+
+    #[test_case(ADMITTED_NARROW_WIDTH, false, ADMITTED_RUNNING, true; "narrow_middle_live")]
+    #[test_case(ADMITTED_NARROW_WIDTH, true, ADMITTED_RUNNING, true; "narrow_last_live")]
+    #[test_case(ADMITTED_WIDE_WIDTH, false, ADMITTED_RUNNING, true; "wide_middle_live")]
+    #[test_case(ADMITTED_WIDE_WIDTH, true, ADMITTED_RUNNING, true; "wide_last_live")]
+    #[test_case(ADMITTED_NARROW_WIDTH, false, ADMITTED_RUNNING, false; "narrow_middle_no_progress")]
+    #[test_case(ADMITTED_NARROW_WIDTH, true, ADMITTED_RUNNING, false; "narrow_last_no_progress")]
+    #[test_case(ADMITTED_WIDE_WIDTH, false, ADMITTED_RUNNING, false; "wide_middle_no_progress")]
+    #[test_case(ADMITTED_WIDE_WIDTH, true, ADMITTED_RUNNING, false; "wide_last_no_progress")]
+    #[test_case(ADMITTED_NARROW_WIDTH, false, ADMITTED_SUCCEEDED, true; "narrow_middle_settled")]
+    #[test_case(ADMITTED_WIDE_WIDTH, true, ADMITTED_SUCCEEDED, true; "wide_last_settled")]
+    #[test_case(ADMITTED_NARROW_WIDTH, true, ADMITTED_CANCELLED, true; "narrow_last_cancelled")]
+    #[test_case(ADMITTED_WIDE_WIDTH, false, ADMITTED_CANCELLED, true; "wide_middle_cancelled")]
+    fn admitted_task_receipts_connect_to_retained_activity(
+        width: u16,
+        last: bool,
+        state: &str,
+        has_progress: bool,
+    ) {
+        let _clock = FrozenClock::at(Duration::ZERO);
+        let entries = admitted_task_entries(last, state);
+        let mut limits = limits(BatchViews::new([ADMITTED_CHILD])).with_width(width);
+        let receipt = render_tool_content(
+            None,
+            entries[ADMITTED_CHILD].output.as_ref(),
+            false,
+            limits
+                .child(ADMITTED_CHILD, &entries[ADMITTED_CHILD])
+                .unwrap(),
+        );
+        if has_progress {
+            let mut progress = retained_progress();
+            if state != ADMITTED_RUNNING {
+                progress.settle();
+            }
+            limits.progress = Arc::new(HashMap::from([(ADMITTED_CHILD, progress)]));
+        }
+        let output = ToolOutput::Batch {
+            entries,
+            text: String::new(),
+        };
+        let content = render_tool_content(None, Some(&output), false, limits.clone());
+        let continuation = if last { TREE_GAP } else { TREE_TRUNK };
+        let live = has_progress && state == ADMITTED_RUNNING;
+        let pad = if live {
+            ACTIVITY_BODY_PAD
+        } else {
+            BATCH_BODY_PAD
+        };
+        let indent = format!("{continuation}{pad}");
+        let heading = content
+            .rows
+            .iter()
+            .position(|row| *row == Some(RowTarget::Item(ADMITTED_CHILD)))
+            .unwrap();
+        let task_target = Some(RowTarget::Task {
+            child: ADMITTED_CHILD,
+            task: 0,
+        });
+        let first = content
+            .rows
+            .iter()
+            .position(|row| *row == task_target)
+            .unwrap();
+        let end = first + receipt.lines.len();
+        let child_end = content
+            .rows
+            .iter()
+            .rposition(|row| row.is_some_and(|row| row.index() == ADMITTED_CHILD))
+            .unwrap()
+            + 1;
+        let drawn: Vec<_> = content.lines.iter().map(line_text).collect();
+        assert_eq!(
+            first > heading + 1,
+            width == ADMITTED_NARROW_WIDTH,
+            "{TITLE_HANGS}: {drawn:?}"
+        );
+        assert!(
+            drawn[heading + 1..end]
+                .iter()
+                .all(|row| row.starts_with(&indent)),
+            "{ADMITTED_CONNECTOR_MSG}: {drawn:?}"
+        );
+        assert_eq!(
+            drawn[first..end],
+            receipt
+                .lines
+                .iter()
+                .map(|line| format!("{indent}{}", line_text(line)))
+                .collect::<Vec<_>>(),
+            "{ADMITTED_CONNECTOR_MSG}"
+        );
+        assert!(
+            content.rows[first..end]
+                .iter()
+                .all(|row| *row == task_target),
+            "{ADMITTED_METADATA_MSG}"
+        );
+        assert!(
+            drawn
+                .iter()
+                .all(|row| UnicodeWidthStr::width(row.as_str()) <= usize::from(width)),
+            "{ADMITTED_CONNECTOR_MSG}: {drawn:?}"
+        );
+        assert_eq!(
+            content.links.rows.len(),
+            content.lines.len(),
+            "{ADMITTED_METADATA_MSG}"
+        );
+        let mut linked = String::new();
+        for (line, links) in content.lines.iter().zip(&content.links.rows) {
+            assert_eq!(line.spans.len(), links.len(), "{ADMITTED_METADATA_MSG}");
+            for (span, link) in line.spans.iter().zip(links) {
+                if link.as_deref() == Some(ADMITTED_LINK) {
+                    linked.push_str(&span.content);
+                }
+            }
+        }
+        assert_eq!(linked, ADMITTED_LINK_LABEL, "{ADMITTED_METADATA_MSG}");
+        if !live {
+            assert_eq!(end, child_end, "{ADMITTED_CONNECTOR_MSG}");
+            return;
+        }
+        assert!(
+            drawn[end].starts_with(&format!("{continuation}{TREE_BRANCH}")),
+            "{ADMITTED_CONNECTOR_MSG}"
+        );
+        assert_eq!(
+            drawn[end..child_end],
+            progress_lines(&limits.progress[&ADMITTED_CHILD], continuation, width)
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>(),
+            "{HISTORY_REACHABLE_MSG}"
+        );
+        let total = child_end - first;
+        for offset in 0..total {
+            let window = ScrollWindow {
+                height: HISTORY_WINDOW as usize,
+                offset,
+                follow: false,
+            };
+            let (start, stop) = window.range(total);
+            let windowed = render_tool_content(
+                None,
+                Some(&output),
+                false,
+                limits.clone().with_policy(
+                    CardPolicy::default(),
+                    Arc::new(HashMap::from([(ADMITTED_CHILD, window)])),
+                ),
+            );
+            assert_eq!(windowed.scroll_spans.len(), 1, "{HISTORY_WINDOW_MSG}");
+            let span = windowed.scroll_spans[0];
+            assert_eq!(
+                (
+                    span.child,
+                    span.first,
+                    span.lines,
+                    span.extent_lines,
+                    span.total,
+                    span.offset,
+                    span.history_start
+                ),
+                (
+                    Some(ADMITTED_CHILD),
+                    first,
+                    stop - start,
+                    stop - start,
+                    total,
+                    start,
+                    Some(receipt.lines.len())
+                ),
+                "{HISTORY_WINDOW_MSG}"
+            );
+            let shown = span.first..span.first + span.lines;
+            let expected = first + start..first + stop;
+            assert_eq!(
+                windowed.lines[shown.clone()]
+                    .iter()
+                    .map(line_text)
+                    .collect::<Vec<_>>(),
+                drawn[expected.clone()],
+                "{HISTORY_REACHABLE_MSG}"
+            );
+            assert_eq!(
+                windowed.rows[shown.clone()],
+                content.rows[expected.clone()],
+                "{ADMITTED_METADATA_MSG}"
+            );
+            assert_eq!(
+                windowed.links.rows[shown], content.links.rows[expected],
+                "{ADMITTED_METADATA_MSG}"
+            );
+        }
+    }
+
+    #[test_case(ADMITTED_NARROW_WIDTH, false; "narrow_middle")]
+    #[test_case(ADMITTED_NARROW_WIDTH, true; "narrow_last")]
+    #[test_case(ADMITTED_WIDE_WIDTH, false; "wide_middle")]
+    #[test_case(ADMITTED_WIDE_WIDTH, true; "wide_last")]
+    fn admitted_task_input_highlights_keep_the_descendant_gutter(width: u16, last: bool) {
+        let _clock = FrozenClock::at(Duration::ZERO);
+        let mut entries = admitted_task_entries(last, ADMITTED_RUNNING);
+        let input = ToolInput::Code {
+            language: "markdown".to_owned(),
+            code: LONG_PARAGRAPH.to_owned(),
+        };
+        entries[ADMITTED_CHILD].input = Some(input.clone());
+        let output = ToolOutput::Batch {
+            entries,
+            text: String::new(),
+        };
+        let limits = limits(BatchViews::new([ADMITTED_CHILD]))
+            .with_width(width)
+            .with_progress(
+                Arc::new(HashMap::from([(ADMITTED_CHILD, retained_progress())])),
+                Arc::default(),
+                Arc::default(),
+            );
+        let content = render_tool_content(None, Some(&output), false, limits);
+        assert_eq!(content.highlights.len(), 1, "{ADMITTED_METADATA_MSG}");
+        let region = &content.highlights[0];
+        assert_eq!(region.path, [ADMITTED_CHILD], "{ADMITTED_METADATA_MSG}");
+        let replacement = region.render(Some(&input), None);
+        assert_eq!(
+            replacement.lines.iter().map(line_text).collect::<Vec<_>>(),
+            content.lines[region.range.clone()]
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>(),
+            "{ADMITTED_METADATA_MSG}"
+        );
+        let continuation = if last { TREE_GAP } else { TREE_TRUNK };
+        let indent = format!("{continuation}{ACTIVITY_BODY_PAD}");
+        let source = replacement.source.as_ref().expect(ADMITTED_METADATA_MSG);
+        assert_eq!(source.text, LONG_PARAGRAPH, "{ADMITTED_METADATA_MSG}");
+        assert_eq!(
+            source.rows.len(),
+            replacement.lines.len(),
+            "{ROWS_PER_CARD_LINE}"
+        );
+        for ((line, row), links) in replacement
+            .lines
+            .iter()
+            .zip(&source.rows)
+            .zip(&replacement.links.rows)
+        {
+            assert!(
+                line_text(line).starts_with(&indent),
+                "{ADMITTED_CONNECTOR_MSG}"
+            );
+            assert_eq!(line.spans.len(), row.spans.len(), "{SPANS_PER_ROW}");
+            assert_eq!(line.spans.len(), links.len(), "{ADMITTED_METADATA_MSG}");
+            assert_eq!(row.spans[0], SpanSource::Chrome, "{ADMITTED_METADATA_MSG}");
+            assert_eq!(links[0], None, "{ADMITTED_METADATA_MSG}");
+        }
     }
 
     #[test]

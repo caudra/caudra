@@ -63,6 +63,20 @@ const JOB_COMMAND: &str = "cargo nextest run -p caudra-ui";
 const JOB_TIMEOUT_MS: u64 = 1_200_000;
 const TASK_CONTROL_TOOL: &str = "task_control";
 const ONE_COMMAND_MSG: &str = "a background shell job shows its command once";
+const RECEIPT_WIDTH: u16 = 48;
+const RECEIPT_WIDE_WIDTH: u16 = 127;
+const RECEIPT_HEADER_NOTE: &str =
+    "receipt heading continues across narrow rows while delegated work remains active";
+const RECEIPT_SETUP_MSG: &str = "the successful receipt must retain visible live task activity";
+const RECEIPT_GUTTER_MSG: &str =
+    "every receipt and wrapped header row must connect to the activity below it";
+const RECEIPT_COLUMNS_MSG: &str = "receipt text and activity branches must keep their columns";
+const RECEIPT_WRAP_MSG: &str = "the narrow receipt must wrap identity and task details";
+const RECEIPT_TARGET_MSG: &str = "receipt rows must still open the underlying task chat";
+const RECEIPT_LINKS_MSG: &str = "receipt gutters and highlighted spans must keep link rows aligned";
+const RECEIPT_CLOSED_MSG: &str = "a closed card must not leave a descendant connector behind";
+const RECEIPT_BOUNDARY_MSG: &str =
+    "one paused window must cross directly from the connected receipt into retained history";
 const FENCED_COPY_WIDTH: u16 = 80;
 const FENCED_COPY_NARROW: u16 = 32;
 const FENCED_COPY_HEIGHT: u16 = 60;
@@ -203,9 +217,11 @@ fn task_details_decode_output_and_only_show_missing_outcome_reference(truncated:
     );
 }
 
-#[test_case(false; "standalone")]
-#[test_case(true; "settled_batch")]
-fn task_receipt_keeps_current_execution_live_without_rewriting_output(child: bool) {
+#[test_case(false, false; "standalone")]
+#[test_case(true, false; "settled_batch")]
+#[test_case(false, true; "promoted_standalone")]
+#[test_case(true, true; "promoted_batch")]
+fn task_receipt_keeps_current_execution_live_without_rewriting_output(child: bool, promoted: bool) {
     let _clock = FrozenSpinner::at(0);
     let mut panel = panel_with_history_task(child, 0);
     let call = if child {
@@ -213,9 +229,27 @@ fn task_receipt_keeps_current_execution_live_without_rewriting_output(child: boo
     } else {
         TOOL_ID.to_owned()
     };
-    let task = live_task_card(&call, LIVE_STATE);
+    let mut task = live_task_card(&call, LIVE_STATE);
+    task.background = !promoted;
     panel.task_card_update(task.clone());
-    report_task_history(&mut panel, child, child_report());
+    report_task_history(
+        &mut panel,
+        child,
+        keyed_batching_report(HISTORY_FIRST_ID, 1, 1),
+    );
+    if promoted {
+        let foreground = visible_text(&render(&mut panel, RECEIPT_WIDE_WIDTH, SIBLING_VIEWPORT));
+        assert!(
+            foreground.contains(HISTORY_FIRST_ID),
+            "{RECEIPT_SETUP_MSG}: {foreground}"
+        );
+        assert!(
+            !foreground.contains(TASK_BADGE),
+            "{RECEIPT_SETUP_MSG}: {foreground}"
+        );
+        task.background = true;
+        panel.task_card_update(task.clone());
+    }
     let receipt = ToolOutput::Tasks(vec![task]);
     let output = if child {
         ToolOutput::Batch {
@@ -238,8 +272,7 @@ fn task_receipt_keeps_current_execution_live_without_rewriting_output(child: boo
         ..done(TOOL_ID)
     });
     let stored = serde_json::to_value(panel.messages[0].tool_output.as_ref()).unwrap();
-    let mut report = child_report();
-    report.tools += 1;
+    let report = keyed_batching_report(HISTORY_SECOND_ID, 1, 2);
     let expected_tools = report.tools;
     report_task_history(&mut panel, child, report);
     assert!(task_history_progress(&panel, child).is_live());
@@ -256,28 +289,344 @@ fn task_receipt_keeps_current_execution_live_without_rewriting_output(child: boo
     );
     assert!(!shown.contains(METADATA_SENTINEL), "{shown}");
     assert!(!shown.contains(LIVE_INVOCATION), "{shown}");
+    assert!(shown.contains(TASK_BADGE), "{RECEIPT_SETUP_MSG}: {shown}");
+    for id in [HISTORY_FIRST_ID, HISTORY_SECOND_ID] {
+        assert!(
+            shown.contains(&history_job(id, 0)),
+            "{RECEIPT_SETUP_MSG}: {shown}"
+        );
+    }
     panel.task_card_update(live_task_card(&call, FAILED_STATE));
     assert!(!task_history_progress(&panel, child).is_live());
+    assert!(
+        !task_history_progress(&panel, child).has_history(),
+        "{HISTORY_TERMINAL_MSG}"
+    );
     assert_eq!(
         serde_json::to_value(panel.messages[0].tool_output.as_ref()).unwrap(),
         stored
     );
     let shown = visible_text(&render(&mut panel, 127, 40));
     assert!(shown.contains(FAILED_STATE), "{shown}");
+    for id in [HISTORY_FIRST_ID, HISTORY_SECOND_ID] {
+        assert!(!shown.contains(id), "{HISTORY_TERMINAL_MSG}: {shown}");
+    }
+    let receipt_row = shown
+        .lines()
+        .find(|line| line.contains(LIVE_LABEL))
+        .unwrap();
+    let content_left = panel.cache.segments()[0].chrome(panel.viewport_width).left;
+    let inner_column = usize::from(content_left) + if child { 6 } else { 2 };
+    assert_ne!(
+        receipt_row.chars().nth(inner_column),
+        Some('│'),
+        "{HISTORY_TERMINAL_MSG}"
+    );
     if !child {
         assert!(
             !SPINNER_GLYPHS.chars().any(|glyph| shown.contains(glyph)),
             "{shown}"
         );
     }
+    let late = keyed_batching_report(HISTORY_LATE_ID, 1, expected_tools + 1);
     if child {
-        assert!(!panel.set_batch_child_progress(TOOL_ID, MIDDLE_CHILD, child_report()));
+        assert!(!panel.set_batch_child_progress(TOOL_ID, MIDDLE_CHILD, late));
     } else {
-        panel.set_tool_progress(TOOL_ID, child_report());
+        panel.set_tool_progress(TOOL_ID, late);
     }
     assert_eq!(
         task_history_progress(&panel, child).report.tools,
         expected_tools
+    );
+}
+
+fn panel_with_receipt_activity(
+    child: bool,
+    following_sibling: bool,
+    scroll_card_lines: u32,
+) -> MessagesPanel {
+    let mut panel = MessagesPanel::new(
+        UiConfig {
+            scroll_card_lines,
+            ..UiConfig::default()
+        },
+        EventHandle::disconnected_for_test(),
+    );
+    panel.set_view(ViewMode::Expanded);
+    let input = ToolInput::Code {
+        language: "bash".into(),
+        code: WRAPPED_SCRIPT.into(),
+    };
+    let mut event = start(
+        TOOL_ID,
+        if child {
+            BATCH_TOOL_NAME
+        } else {
+            TASK_TOOL_NAME
+        },
+    );
+    if child {
+        let mut entries = vec![BatchToolEntry {
+            input: Some(input),
+            annotation: Some(RECEIPT_HEADER_NOTE.into()),
+            ..running_child(TASK_TOOL_NAME)
+        }];
+        if following_sibling {
+            entries.push(BatchToolEntry {
+                summary: REPORTING_SIBLING.into(),
+                ..running_child(TASK_TOOL_NAME)
+            });
+        }
+        event.output = Some(ToolOutput::Batch {
+            entries,
+            text: String::new(),
+        });
+    } else {
+        event.input = Some(input);
+    }
+    panel.tool_start(event);
+    let call = if child {
+        format!("{TOOL_ID}:{MIDDLE_CHILD}")
+    } else {
+        TOOL_ID.to_owned()
+    };
+    let task = live_task_card(&call, LIVE_STATE);
+    panel.task_card_update(task.clone());
+    let receipt = ToolOutput::Tasks(vec![task]);
+    let output = if child {
+        let mut entries = roster(&panel).to_vec();
+        entries[MIDDLE_CHILD].status = BatchToolStatus::Success;
+        entries[MIDDLE_CHILD].output = Some(receipt);
+        ToolOutput::Batch {
+            entries,
+            text: String::new(),
+        }
+    } else {
+        receipt
+    };
+    panel.tool_done(ToolDoneEvent {
+        output,
+        ..done(TOOL_ID)
+    });
+    for (index, id) in [HISTORY_FIRST_ID, HISTORY_SECOND_ID]
+        .into_iter()
+        .enumerate()
+    {
+        report_task_history(
+            &mut panel,
+            child,
+            keyed_batching_report(id, 1, index as u32 + 1),
+        );
+    }
+    panel
+}
+
+#[test_case(false, false, ViewMode::Auto, RECEIPT_WIDTH; "standalone_auto")]
+#[test_case(false, false, ViewMode::Expanded, RECEIPT_WIDTH; "standalone_expanded")]
+#[test_case(false, false, ViewMode::Compact, RECEIPT_WIDTH; "standalone_open_compact")]
+#[test_case(true, true, ViewMode::Auto, RECEIPT_WIDTH; "middle_auto")]
+#[test_case(true, true, ViewMode::Expanded, RECEIPT_WIDTH; "middle_expanded")]
+#[test_case(true, true, ViewMode::Compact, RECEIPT_WIDTH; "middle_open_compact")]
+#[test_case(true, false, ViewMode::Auto, RECEIPT_WIDTH; "last_auto")]
+#[test_case(true, false, ViewMode::Expanded, RECEIPT_WIDTH; "last_expanded")]
+#[test_case(true, false, ViewMode::Compact, RECEIPT_WIDTH; "last_open_compact")]
+#[test_case(false, false, ViewMode::Expanded, RECEIPT_WIDE_WIDTH; "standalone_wide")]
+#[test_case(true, true, ViewMode::Expanded, RECEIPT_WIDE_WIDTH; "middle_wide")]
+fn receipt_rows_connect_to_retained_and_current_activity(
+    child: bool,
+    following_sibling: bool,
+    view: ViewMode,
+    width: u16,
+) {
+    let _clock = FrozenSpinner::at(0);
+    let _elapsed = FrozenClock::at(Duration::ZERO);
+    let mut panel = panel_with_receipt_activity(child, following_sibling, 0);
+    panel.set_view(view);
+    render(&mut panel, width, SIBLING_VIEWPORT);
+    if view == ViewMode::Compact {
+        if child {
+            panel.toggle_batch_child(TOOL_ID, MIDDLE_CHILD);
+        } else {
+            assert!(panel.toggle_expansion(TOOL_ID), "{RECEIPT_SETUP_MSG}");
+        }
+    }
+    let before = visible_text(&render(&mut panel, width, SIBLING_VIEWPORT));
+    let heights = panel.segment_heights();
+    wait_for_batch_header_highlights(&mut panel);
+    let seen = visible_text(&render(&mut panel, width, SIBLING_VIEWPORT));
+    assert_eq!(seen, before, "{HIGHLIGHT_GEOMETRY_MSG}");
+    assert_eq!(panel.segment_heights(), heights, "{HIGHLIGHT_GEOMETRY_MSG}");
+    assert_eq!(panel.scroll_top(), 0, "{SIBLING_VIEWPORT_MSG}");
+    assert_eq!(
+        msg_status(&panel, TOOL_ID),
+        ToolStatus::Success,
+        "{RECEIPT_SETUP_MSG}"
+    );
+    assert!(
+        task_history_progress(&panel, child).is_live(),
+        "{RECEIPT_SETUP_MSG}"
+    );
+    let segment = &panel.cache.segments()[0];
+    let left = usize::from(segment.chrome(panel.viewport_width).left);
+    assert!(
+        segment.links().is_aligned(segment.lines()),
+        "{RECEIPT_LINKS_MSG}"
+    );
+    assert_eq!(
+        script_token_styles(&panel, TOOL_ID).len(),
+        CHILD_SCRIPT_TOKENS.len(),
+        "{CHILD_SCRIPT_MSG}"
+    );
+    assert!(
+        segment
+            .lines()
+            .iter()
+            .all(|line| line.width() <= usize::from(segment.content_width(panel.viewport_width))),
+        "{RECEIPT_WRAP_MSG}"
+    );
+    let rows: Vec<String> = seen
+        .lines()
+        .map(|line| line.chars().skip(left).collect())
+        .collect();
+    let prefix = match (child, following_sibling) {
+        (false, _) => "  │ ",
+        (true, true) => "  │   │ ",
+        (true, false) => "      │ ",
+    };
+    let label = screen_row_of(&seen, LIVE_LABEL).expect(RECEIPT_SETUP_MSG);
+    let task = rows
+        .iter()
+        .position(|line| line.contains("Task"))
+        .expect(RECEIPT_SETUP_MSG);
+    let mode = rows
+        .iter()
+        .position(|line| line.contains("Mode"))
+        .expect(RECEIPT_SETUP_MSG);
+    let history = screen_row_of(&seen, HISTORY_FIRST_ID).expect(RECEIPT_SETUP_MSG);
+    let script = screen_row_of(&seen, "for file").expect(RECEIPT_SETUP_MSG);
+    let first = if child {
+        let key = format!("{TOOL_ID}:{MIDDLE_CHILD}");
+        let area = Rect::new(0, 0, width, SIBLING_VIEWPORT);
+        let heading = (0..SIBLING_VIEWPORT)
+            .find(|row| panel.dispatched_id_at(*row, area).as_deref() == Some(key.as_str()))
+            .expect(RECEIPT_SETUP_MSG) as usize;
+        if width == RECEIPT_WIDTH {
+            assert!(script > heading + 1, "{RECEIPT_WRAP_MSG}: {seen}");
+        }
+        heading + 1
+    } else {
+        script
+    };
+    for row in &rows[first..history] {
+        assert!(row.starts_with(prefix), "{RECEIPT_GUTTER_MSG}: {row:?}");
+    }
+    assert!(
+        rows[label].starts_with(&format!("{prefix}{LIVE_LABEL}")),
+        "{RECEIPT_COLUMNS_MSG}"
+    );
+    for (row, field) in [(task, "Task"), (mode, "Mode")] {
+        assert!(
+            rows[row].starts_with(&format!("{prefix}  {field}")),
+            "{RECEIPT_COLUMNS_MSG}"
+        );
+    }
+    assert_eq!(
+        mode - label > 2,
+        width == RECEIPT_WIDTH,
+        "{RECEIPT_WRAP_MSG}: {seen}"
+    );
+    let identity: String = rows[label..history]
+        .iter()
+        .flat_map(|row| row.chars())
+        .filter(|ch| !ch.is_whitespace() && *ch != '│')
+        .collect();
+    for marker in [LIVE_TASK_ID, LIVE_STATE, TASK_BADGE] {
+        assert!(identity.contains(marker), "{RECEIPT_WRAP_MSG}: {seen}");
+    }
+    let root = prefix.strip_suffix("│ ").unwrap();
+    assert!(
+        rows[history].starts_with(&format!("{root}├── ")),
+        "{RECEIPT_COLUMNS_MSG}"
+    );
+    let current = rows
+        .iter()
+        .position(|line| {
+            line.starts_with(&format!("{root}└── ")) && line.contains(HISTORY_SECOND_ID)
+        })
+        .expect(RECEIPT_SETUP_MSG);
+    assert!(current > history, "{HISTORY_RETAINED_MSG}");
+    for id in [HISTORY_FIRST_ID, HISTORY_SECOND_ID] {
+        assert!(
+            seen.contains(&history_job(id, 0)),
+            "{RECEIPT_SETUP_MSG}: {seen}"
+        );
+    }
+    for row in label..history {
+        assert_eq!(
+            panel
+                .task_hit_at(row as u16, Rect::new(0, 0, width, SIBLING_VIEWPORT))
+                .as_deref(),
+            Some(LIVE_TASK_ID),
+            "{RECEIPT_TARGET_MSG}"
+        );
+    }
+    if view == ViewMode::Compact {
+        panel.close_tool_card(TOOL_ID);
+        let closed = visible_text(&render(&mut panel, width, SIBLING_VIEWPORT));
+        assert!(!closed.contains(LIVE_LABEL), "{RECEIPT_CLOSED_MSG}");
+        assert!(
+            !closed.contains(['│', '├', '└']),
+            "{RECEIPT_CLOSED_MSG}: {closed}"
+        );
+    }
+}
+
+#[test_case(false; "standalone")]
+#[test_case(true; "batch_child")]
+fn admitted_task_window_scrolls_across_the_receipt_history_junction(child: bool) {
+    let _clock = FrozenSpinner::at(0);
+    let mut panel = panel_with_receipt_activity(child, child, HISTORY_SMALL_BUDGET);
+    render_task_history(&mut panel);
+    wait_for_batch_header_highlights(&mut panel);
+    render_task_history(&mut panel);
+    let whole = task_history_span(&panel, child);
+    let boundary = whole.history_start.expect(RECEIPT_BOUNDARY_MSG);
+    assert!(boundary > 0, "{RECEIPT_BOUNDARY_MSG}");
+    let key = task_history_key(child);
+    panel.jump_window(&key, boundary - 1);
+    let seen = visible_text(&render_task_history(&mut panel));
+    let span = task_history_span(&panel, child);
+    assert_eq!(span.offset, boundary - 1, "{RECEIPT_BOUNDARY_MSG}");
+    assert_eq!(span.total, whole.total, "{RECEIPT_BOUNDARY_MSG}");
+    assert_eq!(
+        span.lines, HISTORY_SMALL_BUDGET as usize,
+        "{HISTORY_CAP_MSG}"
+    );
+    assert!(!panel.card_scroll[&key].follow, "{RECEIPT_BOUNDARY_MSG}");
+    let mode = screen_row_of(&seen, "Mode").expect(RECEIPT_BOUNDARY_MSG);
+    let history = screen_row_of(&seen, HISTORY_FIRST_ID).expect(RECEIPT_BOUNDARY_MSG);
+    assert_eq!(history, mode + 1, "{RECEIPT_BOUNDARY_MSG}: {seen}");
+    let left = usize::from(panel.cache.segments()[0].chrome(panel.viewport_width).left);
+    let rows: Vec<String> = seen
+        .lines()
+        .map(|line| line.chars().skip(left).collect())
+        .collect();
+    let (body, branch) = if child {
+        ("  │   │   Mode", "  │   ├── ")
+    } else {
+        ("  │   Mode", "  ├── ")
+    };
+    assert!(rows[mode].starts_with(body), "{RECEIPT_GUTTER_MSG}: {seen}");
+    assert!(
+        rows[history].starts_with(branch),
+        "{RECEIPT_GUTTER_MSG}: {seen}"
+    );
+    assert_eq!(
+        panel
+            .task_hit_at(mode as u16, Rect::new(0, 0, READER_WIDTH, SIBLING_VIEWPORT))
+            .as_deref(),
+        Some(LIVE_TASK_ID),
+        "{RECEIPT_TARGET_MSG}"
     );
 }
 

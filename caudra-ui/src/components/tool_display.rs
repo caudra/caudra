@@ -267,7 +267,7 @@ pub(crate) const NOTICE_PREFIX: &str = "· ";
 pub(crate) const SPINNER_STYLE_NAME: &str = "spinner";
 pub(crate) const SPINNER_STYLE_PREFIX: &str = "spinner:";
 
-const CODE_OUTPUT_DIVIDER: &str = "  ────────────";
+const CODE_OUTPUT_DIVIDER: &str = "────────────";
 /// What separates the parts of a row that reports several things at once: a
 /// header's tally from its spend, each part of its annotation from the next,
 /// and a compact row's header from its activity.
@@ -283,6 +283,8 @@ pub(super) const TREE_BRANCH: &str = "├── ";
 pub(super) const TREE_LAST: &str = "└── ";
 pub(super) const TREE_TRUNK: &str = "│   ";
 pub(super) const TREE_GAP: &str = "    ";
+pub(super) const ACTIVITY_BODY_PAD: &str = "│ ";
+const ACTIVITY_BODY_INDENT: &str = "  │ ";
 /// A window still chasing the tail, and one the reader pinned by scrolling
 /// up. Named the way the log viewer names the same two states.
 pub(crate) const FOLLOWING: &str = "following";
@@ -1668,6 +1670,7 @@ struct ToolLineBuilder {
     rows: Vec<Option<RowTarget>>,
     source: SourceTrace,
     width: u16,
+    body_indent: &'static str,
     truncation: bool,
     limits: RenderLimits,
     markdown: bool,
@@ -1705,6 +1708,7 @@ impl ToolLineBuilder {
             rows: Vec::new(),
             source: SourceTrace::default(),
             width,
+            body_indent: TOOL_BODY_INDENT,
             truncation: false,
             limits,
             markdown: false,
@@ -1893,7 +1897,7 @@ impl ToolLineBuilder {
     /// The columns a body has once the card's own indent is taken off, which
     /// is what anything drawn under the header has to break itself to.
     fn body_width(&self) -> u16 {
-        self.width.saturating_sub(TOOL_BODY_INDENT_WIDTH)
+        self.width.saturating_sub(self.body_indent.width() as u16)
     }
 
     fn is_in_progress(&self) -> bool {
@@ -2010,7 +2014,8 @@ impl ToolLineBuilder {
             None => self.source.abandon(),
         }
         for (mut line, mut links) in content.lines.into_iter().zip(content.links.rows) {
-            line.spans.insert(0, Span::raw(TOOL_BODY_INDENT));
+            line.spans
+                .insert(0, Span::styled(self.body_indent, theme::current().tool_dim));
             links.insert(0, None);
             self.link_rows.push((self.lines.len(), links));
             self.lines.push(line);
@@ -2018,7 +2023,7 @@ impl ToolLineBuilder {
         self.highlights
             .extend(content.highlights.into_iter().map(|mut region| {
                 region.shift(start);
-                region.indent(TOOL_BODY_INDENT.into(), Style::default());
+                region.indent(self.body_indent.into(), theme::current().tool_dim);
                 region
             }));
         self.content_range = (start, self.lines.len());
@@ -2072,7 +2077,8 @@ impl ToolLineBuilder {
             let (rows, scrolled) =
                 limit.apply(code_view::render_live_body(body, self.body_width()));
             for mut line in rows {
-                line.spans.insert(0, Span::raw(TOOL_BODY_INDENT));
+                line.spans
+                    .insert(0, Span::styled(self.body_indent, theme::current().tool_dim));
                 self.lines.push(line);
             }
             scrolled
@@ -2096,7 +2102,8 @@ impl ToolLineBuilder {
         self.source.abandon();
         let start = self.lines.len();
         for mut line in code_view::render_live_body(code, self.body_width()) {
-            line.spans.insert(0, Span::raw(TOOL_BODY_INDENT));
+            line.spans
+                .insert(0, Span::styled(self.body_indent, theme::current().tool_dim));
             self.lines.push(line);
         }
         self.content_range = (start, self.lines.len());
@@ -2110,7 +2117,7 @@ impl ToolLineBuilder {
 
         if self.content_range.1 > self.content_range.0 {
             self.lines.push(Line::from(Span::styled(
-                CODE_OUTPUT_DIVIDER,
+                format!("{}{CODE_OUTPUT_DIVIDER}", self.body_indent),
                 theme::current().tool_dim,
             )));
         }
@@ -2131,7 +2138,7 @@ impl ToolLineBuilder {
                     Some((above, _)) => source.keep_rows(above..above + body.len()),
                     None => Some(source),
                 };
-                self.lines.extend(indented(body, TOOL_BODY_INDENT));
+                self.lines.extend(indented(body, self.body_indent));
                 match source {
                     Some(source) => self.source.record(body_start, source.indented()),
                     None => self.source.abandon(),
@@ -2218,7 +2225,7 @@ impl ToolLineBuilder {
             self.shell_toggle_line = Some(self.lines.len());
         }
         self.lines.push(Line::from(Span::styled(
-            format!("  {}", parts.join(" · ")),
+            format!("{}{}", self.body_indent, parts.join(" · ")),
             theme::current().tool_dim,
         )));
     }
@@ -2234,7 +2241,7 @@ impl ToolLineBuilder {
             "",
             style,
             style,
-            self.width.saturating_sub(TOOL_BODY_INDENT_WIDTH),
+            self.body_width(),
             Some(caudra_markdown::render::TOOL_OUTPUT_MAX_LINE_BYTES),
             Vec::new(),
         );
@@ -2243,7 +2250,8 @@ impl ToolLineBuilder {
         let painted: Vec<_> = painted.lines.into_iter().zip(painted.links.rows).collect();
         let (painted, scrolled) = limit.apply(painted);
         for (mut line, mut links) in painted {
-            line.spans.insert(0, Span::raw(TOOL_BODY_INDENT));
+            line.spans
+                .insert(0, Span::styled(self.body_indent, theme::current().tool_dim));
             links.insert(0, None);
             self.link_rows.push((self.lines.len(), links));
             self.lines.push(line);
@@ -2259,7 +2267,8 @@ impl ToolLineBuilder {
             self.truncation = true;
             let text = expand_notice(&format!("{withheld} rows"));
             let mut line = Line::from(Span::styled(text, theme::current().tool_dim));
-            line.spans.insert(0, Span::raw(TOOL_BODY_INDENT));
+            line.spans
+                .insert(0, Span::styled(self.body_indent, theme::current().tool_dim));
             self.lines.push(line);
         }
     }
@@ -2287,7 +2296,7 @@ impl ToolLineBuilder {
         let frame = spinner_str(started_at.elapsed().as_millis());
         let (lines, spinners) = snapshot_to_lines_range(
             snapshot,
-            TOOL_BODY_INDENT,
+            self.body_indent,
             start..end,
             frame,
             self.indicator,
@@ -2306,12 +2315,7 @@ impl ToolLineBuilder {
         }
     }
 
-    fn finish(
-        self,
-        input: Option<Arc<ToolInput>>,
-        output: Option<Arc<ToolOutput>>,
-        content_indent: &'static str,
-    ) -> ToolLines {
+    fn finish(self, input: Option<Arc<ToolInput>>, output: Option<Arc<ToolOutput>>) -> ToolLines {
         let source = self
             .source
             .finish(&self.lines)
@@ -2360,7 +2364,7 @@ impl ToolLineBuilder {
                 .into_iter()
                 .map(|span| wrapped.scroll_span(span))
                 .collect(),
-            content_indent,
+            content_indent: self.body_indent,
             truncation: self.truncation,
             rows: wrapped.expand(rows),
             source: source.map(|source| wrapped.body(source)),
@@ -2369,7 +2373,7 @@ impl ToolLineBuilder {
 }
 
 fn indented(lines: Vec<Line<'static>>, indent: &'static str) -> Vec<Line<'static>> {
-    let style = theme::current().tool;
+    let style = theme::current().tool_dim;
     lines
         .into_iter()
         .map(|mut line| {
@@ -2682,6 +2686,10 @@ pub fn build_tool_lines(
             (b.is_in_progress() || progress.is_live()) && (!rctx.compact || expansion.is_some())
         })
         .map(|progress| {
+            if b.is_in_progress() {
+                b.body_indent = ACTIVITY_BODY_INDENT;
+                b.limits.width = b.body_width();
+            }
             let window = b
                 .limits
                 .scroll
@@ -2711,18 +2719,14 @@ pub fn build_tool_lines(
         if let Some((progress, first, window)) = progress_body {
             b.push_progress_body(progress, first, window);
         }
-        return b.finish(
-            msg.tool_input.clone(),
-            msg.tool_output.clone(),
-            TOOL_BODY_INDENT,
-        );
+        return b.finish(msg.tool_input.clone(), msg.tool_output.clone());
     }
     if is_report {
         if let Some(message) = report_message(tool_name, msg.tool_raw_input.as_deref()) {
             let start = b.lines.len();
             let (lines, source, links) =
                 code_view::markdown_body(&report_markdown(message), b.body_width());
-            b.lines.extend(indented(lines, TOOL_BODY_INDENT));
+            b.lines.extend(indented(lines, b.body_indent));
             b.source.record(start, source.indented());
             for (index, mut row) in links.rows.into_iter().enumerate() {
                 row.insert(0, None);
@@ -2744,7 +2748,7 @@ pub fn build_tool_lines(
             false,
         );
         b.push_resolved_output(&resolved);
-        return b.finish(None, None, TOOL_BODY_INDENT);
+        return b.finish(None, None);
     }
     match live {
         Some(live) if draws_live_script(tool_name) => b.push_live_script(live),
@@ -2819,11 +2823,7 @@ pub fn build_tool_lines(
     if let Some((progress, first, window)) = progress_body {
         b.push_progress_body(progress, first, window);
     }
-    b.finish(
-        msg.tool_input.clone(),
-        msg.tool_output.clone(),
-        TOOL_BODY_INDENT,
-    )
+    b.finish(msg.tool_input.clone(), msg.tool_output.clone())
 }
 
 fn project_task_output(
@@ -3047,7 +3047,7 @@ pub fn build_instructions_lines(
             .join("\n\n"),
     );
 
-    b.finish(None, Some(output), TOOL_BODY_INDENT)
+    b.finish(None, Some(output))
 }
 
 fn compact_instruction_lines(blocks: &[InstructionBlock]) -> ToolLines {
@@ -6222,6 +6222,86 @@ mod tests {
         progress
     }
 
+    const RECEIPT_LABEL: &str = "Receipt with a description long enough to wrap at narrow widths";
+    const RECEIPT_RUNNING: &str = "running";
+    const RECEIPT_SUCCEEDED: &str = "succeeded";
+    const RECEIPT_GUTTER_MSG: &str =
+        "live receipt rows connect to activity without changing content or highlight targets";
+
+    #[test_case(48, true; "narrow_live_receipt")]
+    #[test_case(HISTORY_WIDTH, true; "wide_live_receipt")]
+    #[test_case(48, false; "narrow_settled_receipt")]
+    #[test_case(HISTORY_WIDTH, false; "wide_settled_receipt")]
+    fn standalone_receipt_gutter_survives_wrapping_and_highlighting(width: u16, active: bool) {
+        let task: TaskCard = serde_json::from_value(serde_json::json!({
+            "task_id": "receipt-task", "invocation_id": "invocation", "call_id": "t1",
+            "root_call_id": "t1", "label": RECEIPT_LABEL,
+            "state": if active { RECEIPT_RUNNING } else { RECEIPT_SUCCEEDED },
+            "mode": "build", "background": true, "generation": 1,
+            "created_at": 1, "updated_at": 2,
+            "result": {"output": format!("[history link]({HISTORY_LINK})")}
+        }))
+        .expect(RECEIPT_GUTTER_MSG);
+        let mut msg = task_msg(String::new());
+        msg.tool_input = code_input().map(Arc::new);
+        msg.tool_output = Some(Arc::new(ToolOutput::Tasks(vec![task])));
+        let mut progress = retained_task_progress();
+        if !active {
+            progress.settle();
+        }
+        msg.progress = Some(progress);
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(width),
+            Some(exp(true)),
+        );
+        let rows: Vec<_> = tl.lines.iter().map(line_text).collect();
+        let history = rows.iter().position(|row| row.contains(HISTORY_FIRST));
+        assert_eq!(history.is_some(), active, "{RECEIPT_GUTTER_MSG}");
+        let receipt = rows
+            .iter()
+            .position(|row| row.contains("Receipt"))
+            .expect(RECEIPT_GUTTER_MSG);
+        for row in &rows[receipt..history.unwrap_or(rows.len())] {
+            assert_eq!(
+                row.starts_with(ACTIVITY_BODY_INDENT),
+                active,
+                "{RECEIPT_GUTTER_MSG}: {row}"
+            );
+        }
+        assert_eq!(
+            tl.rows[receipt],
+            Some(RowTarget::Item(0)),
+            "{RECEIPT_GUTTER_MSG}"
+        );
+        assert!(
+            tl.lines
+                .iter()
+                .all(|line| line.width() <= usize::from(width)),
+            "{RECEIPT_GUTTER_MSG}"
+        );
+        assert!(tl.links.is_aligned(&tl.lines), "{RECEIPT_GUTTER_MSG}");
+        assert!(
+            tl.links
+                .rows
+                .iter()
+                .flatten()
+                .any(|link| link.as_deref() == Some(HISTORY_LINK)),
+            "{RECEIPT_GUTTER_MSG}"
+        );
+        assert_eq!(tl.highlight.len(), 1, "{RECEIPT_GUTTER_MSG}");
+        for request in &tl.highlight {
+            let (input, output) = request.sources();
+            let highlighted = request.region.render(input, output);
+            assert_eq!(
+                highlighted.lines.iter().map(line_text).collect::<Vec<_>>(),
+                rows[request.region.range.clone()],
+                "{RECEIPT_GUTTER_MSG}"
+            );
+        }
+    }
+
     fn history_msg() -> DisplayMessage {
         let mut msg = subagent_msg(ToolStatus::InProgress, None);
         if let DisplayRole::Tool(tool) = &mut msg.role {
@@ -6307,6 +6387,12 @@ mod tests {
             .map(history_text)
             .collect();
         let history_start = expected.len() - HISTORY_ROWS;
+        assert!(
+            expected[..history_start]
+                .iter()
+                .all(|row| row.starts_with(ACTIVITY_BODY_INDENT)),
+            "{HISTORY_TREE_MSG}"
+        );
         assert!(whole.scroll_spans.is_empty(), "{HISTORY_WINDOW_MSG}");
         for offset in 0..expected.len() {
             let window = ScrollWindow {
