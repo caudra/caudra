@@ -187,6 +187,8 @@ const FLASH_CANCEL: &str = "Press esc again to stop...";
 const FLASH_REWIND: &str = "Press esc again to rewind...";
 const FLASH_EXIT: &str = "Press Ctrl+D again to exit...";
 const FLASH_NO_CHORD: &str = "is not a chord";
+const RETRY_COUNTDOWN_UNAVAILABLE: &str =
+    "Retry countdown unavailable: delay exceeds the platform clock range";
 const CONTEXT_USAGE: &str = "Usage: /context [all]";
 const STORAGE_USAGE: &str = "Usage: /storage [all]";
 const TOOLS_USAGE: &str = "Usage: /tools";
@@ -4404,10 +4406,21 @@ impl App {
         {
             self.chats[chat_idx].stream_reset();
             self.discard_stream_delegations(chat_idx);
+            let Some(deadline) = Instant::now().checked_add(Duration::from_millis(delay_ms)) else {
+                self.chats[chat_idx].clear_retry();
+                tracing::warn!(
+                    delay_ms,
+                    attempt,
+                    chat_idx,
+                    "retry deadline is not representable"
+                );
+                self.flash(RETRY_COUNTDOWN_UNAVAILABLE.into());
+                return vec![];
+            };
             self.chats[chat_idx].set_retry(RetryInfo {
                 attempt,
                 message,
-                deadline: Instant::now() + Duration::from_millis(delay_ms),
+                deadline,
             });
             return vec![];
         }

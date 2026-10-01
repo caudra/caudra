@@ -31,6 +31,7 @@ const EVENT_RETRY_RECOVERED: &str = "provider_retry_recovered";
 const EVENT_KEY_ROTATED: &str = "provider_key_rotated";
 const EVENT_REQUEST_FAILED: &str = "provider_request_failed";
 const EVENT_REQUEST_FINISHED: &str = "provider_request_finished";
+const UNREPRESENTABLE_RETRY_DELAY: &str = "unrepresentable_delay";
 const OUTCOME_OK: &str = "ok";
 const OUTCOME_ERROR: &str = "error";
 const OUTCOME_CANCELLED: &str = "cancelled";
@@ -757,7 +758,9 @@ async fn stream_with_retry_inner(
                         "rotated API key after error"
                     );
                 }
-                let hint_ms = e.retry_after().map(|after| after.as_millis() as u64);
+                let hint_ms = e
+                    .retry_after()
+                    .and_then(|after| u64::try_from(after.as_millis()).ok());
                 let (attempt, delay, source) = match retry.decide(e.retry_after()) {
                     RetryDecision::Wait {
                         attempt,
@@ -783,7 +786,22 @@ async fn stream_with_retry_inner(
                         return Err(e.into());
                     }
                 };
-                let delay_ms = delay.as_millis() as u64;
+                let Some((deadline, delay_ms)) = retry_schedule(Instant::now(), delay) else {
+                    warn!(
+                        target: target::PROVIDER,
+                        event = EVENT_RETRY_EXHAUSTED,
+                        provider = %model.provider,
+                        model = %model.id,
+                        attempt,
+                        reason = UNREPRESENTABLE_RETRY_DELAY,
+                        delay_secs = delay.as_secs(),
+                        status = e.status(),
+                        error_kind = e.kind(),
+                        outcome = OUTCOME_ERROR,
+                        "provider retry delay cannot be scheduled"
+                    );
+                    return Err(e.into());
+                };
                 warn!(
                     target: target::PROVIDER,
                     event = EVENT_RETRY,
@@ -821,7 +839,7 @@ async fn stream_with_retry_inner(
                 let waited = async {
                     futures_lite::future::race(
                         async {
-                            smol::Timer::after(delay).await;
+                            smol::Timer::at(deadline).await;
                         },
                         async {
                             nudged.await;
@@ -864,6 +882,11 @@ async fn stream_with_retry_inner(
             }
         }
     }
+}
+
+fn retry_schedule(now: Instant, delay: Duration) -> Option<(Instant, u64)> {
+    let delay_ms = u64::try_from(delay.as_millis()).ok()?;
+    Some((now.checked_add(delay)?, delay_ms))
 }
 
 /// No telemetry gate: the event feeds the log file through the same call, and
@@ -941,6 +964,24 @@ mod tests {
     const EARLY_INPUT: &str = r#"{"path":"early"}"#;
     const LATE_INPUT: &str = r#"{"path":"late"}"#;
     const EARLY_FAILURE: &str = "earlier call failed";
+    const QUOTA_RESET: Duration = Duration::from_secs(13 * 3_600);
+    const WEEKLY_RESET: Duration = Duration::from_secs(7 * 24 * 3_600);
+
+    #[test_case(Duration::ZERO ; "immediate")]
+    #[test_case(QUOTA_RESET ; "subscription_quota_reset")]
+    #[test_case(WEEKLY_RESET ; "weekly_quota_reset")]
+    fn retry_schedule_preserves_the_full_delay(delay: Duration) {
+        let now = Instant::now();
+        let (deadline, delay_ms) = retry_schedule(now, delay).unwrap();
+        assert_eq!(deadline.duration_since(now), delay);
+        assert_eq!(u128::from(delay_ms), delay.as_millis());
+    }
+
+    #[test_case(Duration::MAX ; "duration_maximum")]
+    #[test_case(Duration::from_millis(u64::MAX) + Duration::from_millis(1) ; "millisecond_overflow")]
+    fn retry_schedule_rejects_unrepresentable_delays(delay: Duration) {
+        assert_eq!(retry_schedule(Instant::now(), delay), None);
+    }
 
     #[test_case(1 ; "bounded_source_prefix")]
     #[test_case(2 ; "distinct_source_slots")]

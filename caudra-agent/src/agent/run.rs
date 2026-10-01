@@ -3351,6 +3351,13 @@ mod tests {
     const DECISION_SKILL: &str = "test-helper";
     const DECISION_SKILL_TASK: &str = "effect-suggestion-regression";
     const EFFECT_TEST_TIMEOUT: Duration = Duration::from_secs(10);
+    const RETRY_STATUS: u16 = 429;
+    const LONG_RETRY_AFTER: Duration = Duration::from_secs(13 * 60 * 60);
+    const WEEKLY_RETRY_AFTER: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+    const RETRY_BODY: &str =
+        r#"{"error":{"type":"rate_limit_error","message":"input tokens per minute exceeded"}}"#;
+    const RETRY_REASON: &str = "Rate limited: rate_limit_error: input tokens per minute exceeded";
+    const EXPECTED_RETRY_BUDGET: u32 = 8;
 
     #[test]
     fn peer_wake_without_a_claim_does_not_request_the_model() {
@@ -4703,6 +4710,7 @@ mod tests {
     /// then fails with `fail_status` or hangs until cancelled.
     #[derive(Default)]
     struct StubStreamProvider {
+        calls: Arc<AtomicUsize>,
         delta: Option<&'static str>,
         delta_is_thinking: bool,
         cancel_after_delta: Mutex<Option<crate::cancel::CancelTrigger>>,
@@ -4723,6 +4731,7 @@ mod tests {
             _: Option<&'a CacheKey>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
                 if let Some(text) = self.delta {
                     let event = if self.delta_is_thinking {
                         ProviderEvent::ThinkingDelta { text: text.into() }
@@ -7870,29 +7879,36 @@ mod tests {
 
     /// The `Retry` event already made the view drop the failed attempt's
     /// text, so history must not resurrect it (see `StreamError`).
-    #[test]
-    fn cancel_during_retry_backoff_discards_failed_attempt_text() {
+    #[test_case(LONG_RETRY_AFTER ; "hours")]
+    #[test_case(WEEKLY_RETRY_AFTER ; "week")]
+    fn cancel_during_retry_backoff_discards_failed_attempt_text(retry_after: Duration) {
         const PARTIAL: &str = "doomed attempt";
         smol::block_on(async {
             let (trigger, cancel) = CancelToken::new();
             let provider = StubStreamProvider {
                 delta: Some(PARTIAL),
-                fail_status: Some(529),
+                fail_status: Some(RETRY_STATUS),
+                fail_body: Some(RETRY_BODY),
+                fail_retry_after: Some(retry_after),
                 ..Default::default()
             };
+            let calls = Arc::clone(&provider.calls);
             let mut history = History::new(Vec::new());
             let (agent, event_rx) = make_agent(provider, &mut history);
             let mut agent = agent.with_cancel(cancel);
 
             let mut trigger = Some(trigger);
             let pump = smol::spawn(async move {
+                let mut events = Vec::new();
                 while let Ok(envelope) = event_rx.recv_async().await {
                     if matches!(envelope.event, AgentEvent::Retry { .. })
                         && let Some(t) = trigger.take()
                     {
                         t.cancel();
                     }
+                    events.push(envelope);
                 }
+                events
             });
 
             assert_eq!(
@@ -7900,8 +7916,18 @@ mod tests {
                 DoneReason::Cancelled
             );
             drop(agent);
-            pump.await;
+            let events = pump.await;
 
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(has_event(&events, |event| matches!(
+                event,
+                AgentEvent::TextDelta { text } if text == PARTIAL
+            )));
+            assert!(has_event(&events, |event| matches!(
+                event,
+                AgentEvent::Retry { attempt: 1, message, delay_ms }
+                    if message == RETRY_REASON && u128::from(*delay_ms) == retry_after.as_millis()
+            )));
             assert_ends_with_cancel_marker(&history);
             assert!(
                 history
@@ -7917,42 +7943,40 @@ mod tests {
 
     /// The provider's own `Retry-After` sets the wait, and its explanation of
     /// why survives all the way to the event the status bar renders.
-    #[test]
-    fn retry_event_carries_the_provider_hint_and_reason() {
-        const RETRY_AFTER: Duration = Duration::from_secs(7);
-        const BODY: &str =
-            r#"{"error":{"type":"rate_limit_error","message":"input tokens per minute exceeded"}}"#;
-        const EXPECTED: &str = "Rate limited: rate_limit_error: input tokens per minute exceeded";
+    #[test_case(Duration::from_secs(7) ; "seconds")]
+    #[test_case(LONG_RETRY_AFTER ; "hours")]
+    #[test_case(WEEKLY_RETRY_AFTER ; "week")]
+    fn retry_event_carries_the_provider_hint_and_reason(retry_after: Duration) {
         smol::block_on(async {
             let (trigger, cancel) = CancelToken::new();
             let provider = StubStreamProvider {
-                fail_status: Some(429),
-                fail_body: Some(BODY),
-                fail_retry_after: Some(RETRY_AFTER),
+                fail_status: Some(RETRY_STATUS),
+                fail_body: Some(RETRY_BODY),
+                fail_retry_after: Some(retry_after),
                 ..Default::default()
             };
+            let calls = Arc::clone(&provider.calls);
             let mut history = History::new(Vec::new());
             let (agent, event_rx) = make_agent(provider, &mut history);
             let mut agent = agent.with_cancel(cancel);
 
-            let observed = Arc::new(Mutex::new(None));
-            let pump = smol::spawn({
-                let observed = Arc::clone(&observed);
+            let pump = smol::spawn(async move {
+                let mut observed = Vec::new();
                 let mut trigger = Some(trigger);
-                async move {
-                    while let Ok(envelope) = event_rx.recv_async().await {
-                        if let AgentEvent::Retry {
-                            attempt,
-                            message,
-                            delay_ms,
-                        } = envelope.event
-                            && let Some(t) = trigger.take()
-                        {
-                            *observed.lock().unwrap() = Some((attempt, message, delay_ms));
+                while let Ok(envelope) = event_rx.recv_async().await {
+                    if let AgentEvent::Retry {
+                        attempt,
+                        message,
+                        delay_ms,
+                    } = envelope.event
+                    {
+                        observed.push((attempt, message, delay_ms));
+                        if let Some(t) = trigger.take() {
                             t.cancel();
                         }
                     }
                 }
+                observed
             });
 
             assert_eq!(
@@ -7960,65 +7984,174 @@ mod tests {
                 DoneReason::Cancelled
             );
             drop(agent);
-            pump.await;
-
-            let (attempt, message, delay_ms) = observed.lock().unwrap().take().unwrap();
-            assert_eq!(attempt, 1);
-            assert_eq!(delay_ms, RETRY_AFTER.as_millis() as u64);
-            assert_eq!(message, EXPECTED);
+            assert_eq!(
+                pump.await,
+                vec![(
+                    1,
+                    RETRY_REASON.into(),
+                    u64::try_from(retry_after.as_millis()).unwrap()
+                )]
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
         });
     }
 
     /// A nudge cuts the backoff short. Without it the second attempt waits out
     /// the provider's full window, so reaching attempt two at all is the proof.
-    #[test]
-    fn a_nudge_retries_without_waiting_out_the_backoff() {
-        const LONG_WAIT: Duration = Duration::from_secs(60);
-        const GENEROUS_BOUND: Duration = Duration::from_secs(10);
-        const FIRST: u32 = 1;
-        const SECOND: u32 = 2;
+    #[test_case(LONG_RETRY_AFTER ; "hours")]
+    #[test_case(WEEKLY_RETRY_AFTER ; "week")]
+    fn a_nudge_retries_without_waiting_out_the_backoff(retry_after: Duration) {
         smol::block_on(async {
-            let (trigger, cancel) = CancelToken::new();
             let retry_now = Nudge::default();
-            let provider = StubStreamProvider {
-                fail_status: Some(429),
-                fail_retry_after: Some(LONG_WAIT),
-                ..Default::default()
-            };
+            let provider = MockProvider::with_results(vec![
+                Err(retry_error(retry_after)),
+                Ok(text_response(StopReason::EndTurn)),
+            ]);
+            let requests = Arc::clone(&provider.captured_messages);
             let mut history = History::new(Vec::new());
             let (agent, event_rx) = make_agent(provider, &mut history);
-            let mut agent = agent.with_cancel(cancel).with_retry_now(retry_now.clone());
+            let mut agent = agent.with_retry_now(retry_now.clone());
 
-            let attempts = Arc::new(Mutex::new(Vec::new()));
-            let pump = smol::spawn({
-                let attempts = Arc::clone(&attempts);
-                let mut trigger = Some(trigger);
-                async move {
-                    while let Ok(envelope) = event_rx.recv_async().await {
-                        let AgentEvent::Retry { attempt, .. } = envelope.event else {
-                            continue;
-                        };
-                        attempts.lock().unwrap().push(attempt);
-                        match attempt {
-                            FIRST => retry_now.notify(),
-                            _ => drop(trigger.take()),
-                        }
+            let pump = smol::spawn(async move {
+                let mut observed = Vec::new();
+                while let Ok(envelope) = event_rx.recv_async().await {
+                    if let AgentEvent::Retry {
+                        attempt,
+                        message,
+                        delay_ms,
+                    } = envelope.event
+                    {
+                        retry_now.notify();
+                        observed.push((attempt, message, delay_ms));
                     }
                 }
+                observed
             });
 
-            let started = Instant::now();
             assert_eq!(
                 agent.run(default_input()).await.unwrap(),
-                DoneReason::Cancelled
+                DoneReason::EndTurn
             );
+            assert_eq!(agent.response_text(), Some(VISIBLE_RESPONSE));
             drop(agent);
-            pump.await;
+            assert_eq!(
+                pump.await,
+                vec![(
+                    1,
+                    RETRY_REASON.into(),
+                    u64::try_from(retry_after.as_millis()).unwrap()
+                )]
+            );
+            assert_eq!(requests.lock().unwrap().len(), 2);
+        });
+    }
 
-            assert_eq!(*attempts.lock().unwrap(), vec![FIRST, SECOND]);
-            assert!(
-                started.elapsed() < GENEROUS_BOUND,
-                "the nudge must not wait out the provider's window"
+    fn retry_error(retry_after: Duration) -> AgentError {
+        AgentError::Api {
+            status: RETRY_STATUS,
+            message: RETRY_BODY.into(),
+            retry_after: Some(retry_after),
+        }
+    }
+
+    #[test_case(false; "without_tools")]
+    #[test_case(true; "completed_tool_is_not_replayed")]
+    fn an_immediately_ready_retry_timer_resumes_the_request(completed_tool: bool) {
+        smol::block_on(async {
+            let mut responses = Vec::new();
+            if completed_tool {
+                responses.push(Ok(tool_use_response(TEST_TOOL, json!({}))));
+            }
+            responses.extend([
+                Err(retry_error(Duration::ZERO)),
+                Ok(text_response(StopReason::EndTurn)),
+            ]);
+            let provider = MockProvider::with_results(responses);
+            let requests = Arc::clone(&provider.captured_messages);
+            let mut history = History::default();
+            let (mut agent, event_rx) = make_agent(provider, &mut history);
+            let tool_calls = Arc::new(AtomicUsize::new(0));
+            let executed = Arc::clone(&tool_calls);
+            agent.tools = json!([{"name": TEST_TOOL, "input_schema": {"type": "object"}}]);
+            agent.local_tools = Arc::new(HashMap::from([(
+                TEST_TOOL.into(),
+                local_tool(move |_, _| {
+                    executed.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async { Ok(TEST_TOOL_RESULT.into()) })
+                }),
+            )]));
+
+            assert_eq!(
+                agent.run(default_input()).await.unwrap(),
+                DoneReason::EndTurn
+            );
+            assert_eq!(agent.response_text(), Some(VISIBLE_RESPONSE));
+            drop(agent);
+
+            let retries: Vec<_> = drain_events(&event_rx)
+                .into_iter()
+                .filter_map(|envelope| match envelope.event {
+                    AgentEvent::Retry {
+                        attempt,
+                        message,
+                        delay_ms,
+                    } => Some((attempt, message, delay_ms)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(retries, vec![(1, RETRY_REASON.into(), 0)]);
+            assert_eq!(
+                requests.lock().unwrap().len(),
+                2 + usize::from(completed_tool)
+            );
+            assert_eq!(
+                tool_calls.load(Ordering::SeqCst),
+                usize::from(completed_tool)
+            );
+        });
+    }
+
+    #[test]
+    fn retry_budget_exhaustion_returns_the_provider_error() {
+        smol::block_on(async {
+            let provider = StubStreamProvider {
+                fail_status: Some(RETRY_STATUS),
+                fail_body: Some(RETRY_BODY),
+                fail_retry_after: Some(Duration::ZERO),
+                ..Default::default()
+            };
+            let calls = Arc::clone(&provider.calls);
+            let mut history = History::default();
+            let (mut agent, event_rx) = make_agent(provider, &mut history);
+
+            let error = agent.run(default_input()).await.unwrap_err();
+            assert!(matches!(
+                error,
+                AgentError::Api { status: RETRY_STATUS, message, retry_after: Some(Duration::ZERO) }
+                    if message == RETRY_BODY
+            ));
+            drop(agent);
+
+            let retries: Vec<_> = drain_events(&event_rx)
+                .into_iter()
+                .filter_map(|envelope| match envelope.event {
+                    AgentEvent::Retry {
+                        attempt,
+                        message,
+                        delay_ms,
+                    } => Some((attempt, message, delay_ms)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                retries,
+                (1..=EXPECTED_RETRY_BUDGET)
+                    .map(|attempt| (attempt, RETRY_REASON.into(), 0))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                EXPECTED_RETRY_BUDGET as usize + 1
             );
         });
     }

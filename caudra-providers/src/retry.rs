@@ -4,7 +4,6 @@ const INITIAL_DELAY: Duration = Duration::from_secs(2);
 const BACKOFF_FACTOR: u32 = 2;
 const JITTER_FACTOR: f64 = 0.25;
 const MAX_DELAY: Duration = Duration::from_secs(30);
-const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 pub const MAX_RETRIES: u32 = 8;
 
 /// Where the wait came from. A server hint and a locally computed backoff fail
@@ -28,14 +27,12 @@ impl DelaySource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GiveUpReason {
     AttemptsSpent,
-    RetryAfterTooLong,
 }
 
 impl GiveUpReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::AttemptsSpent => "attempts_spent",
-            Self::RetryAfterTooLong => "retry_after_too_long",
         }
     }
 }
@@ -65,14 +62,7 @@ impl RetryState {
         self.attempt
     }
 
-    /// The next wait, or why retrying is pointless: attempts are spent, or the
-    /// provider named a window further out than we are willing to sit on. A
-    /// quota that reopens in an hour is a refusal, and retrying at some shorter
-    /// cap would only burn the remaining attempts before it opens.
     pub fn decide(&mut self, hint: Option<Duration>) -> RetryDecision {
-        if hint.is_some_and(|after| after > MAX_RETRY_AFTER) {
-            return RetryDecision::GiveUp(GiveUpReason::RetryAfterTooLong);
-        }
         if self.attempt >= MAX_RETRIES {
             return RetryDecision::GiveUp(GiveUpReason::AttemptsSpent);
         }
@@ -106,6 +96,9 @@ fn exponential(attempt: u32, random: f64) -> Duration {
 mod tests {
     use super::*;
     use test_case::test_case;
+
+    const QUOTA_RESET: Duration = Duration::from_secs(13 * 3_600);
+    const WEEKLY_RESET: Duration = Duration::from_secs(7 * 24 * 3_600);
 
     #[test_case(1, 2  ; "first")]
     #[test_case(2, 4  ; "second")]
@@ -164,45 +157,48 @@ mod tests {
         ));
     }
 
-    #[test_case(MAX_RETRY_AFTER, true                             ; "at_the_limit")]
-    #[test_case(MAX_RETRY_AFTER + Duration::from_secs(1), false   ; "just_over")]
-    #[test_case(Duration::from_secs(3600), false                  ; "quota_reset")]
-    fn an_over_long_hint_ends_retrying(hint: Duration, usable: bool) {
+    #[test_case(Duration::from_secs(60) ; "former_limit")]
+    #[test_case(Duration::from_secs(61) ; "above_former_limit")]
+    #[test_case(QUOTA_RESET ; "subscription_quota_reset")]
+    #[test_case(WEEKLY_RESET ; "weekly_quota_reset")]
+    fn server_hint_is_not_shortened_or_refused(hint: Duration) {
         let mut state = RetryState::new();
-        let decision = state.decide(Some(hint));
-        assert_eq!(matches!(decision, RetryDecision::Wait { .. }), usable);
-        if !usable {
-            assert_eq!(
-                decision,
-                RetryDecision::GiveUp(GiveUpReason::RetryAfterTooLong)
-            );
-        }
+        assert_eq!(
+            state.decide(Some(hint)),
+            RetryDecision::Wait {
+                attempt: 1,
+                delay: hint,
+                source: DelaySource::ServerHint,
+            }
+        );
     }
 
-    #[test]
-    fn retrying_stops_after_max_retries() {
+    #[test_case(None ; "exponential")]
+    #[test_case(Some(QUOTA_RESET) ; "subscription_quota_reset")]
+    fn retrying_stops_after_max_retries(hint: Option<Duration>) {
         let mut state = RetryState::new();
         for expected in 1..=MAX_RETRIES {
             assert!(matches!(
-                state.decide(None),
+                state.decide(hint),
                 RetryDecision::Wait { attempt, .. } if attempt == expected
             ));
         }
         assert_eq!(
-            state.decide(None),
+            state.decide(hint),
             RetryDecision::GiveUp(GiveUpReason::AttemptsSpent)
         );
         assert_eq!(state.attempts(), MAX_RETRIES);
     }
 
-    #[test]
-    fn a_spent_state_stays_spent_even_with_a_hint() {
+    #[test_case(Duration::from_secs(1) ; "short_hint")]
+    #[test_case(QUOTA_RESET ; "subscription_quota_reset")]
+    fn a_spent_state_stays_spent_even_with_a_hint(hint: Duration) {
         let mut state = RetryState::new();
         for _ in 0..MAX_RETRIES {
             state.decide(None);
         }
         assert_eq!(
-            state.decide(Some(Duration::from_secs(1))),
+            state.decide(Some(hint)),
             RetryDecision::GiveUp(GiveUpReason::AttemptsSpent)
         );
     }

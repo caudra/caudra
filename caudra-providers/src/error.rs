@@ -17,9 +17,6 @@ const UNREADABLE_ERROR_BODY: &str = "unable to read error body";
 
 const HEADER_RETRY_AFTER: &str = "retry-after";
 const HEADER_RETRY_AFTER_MS: &str = "retry-after-ms";
-/// Keeps `Duration::from_secs_f64` away from its overflow panic; the retry loop
-/// clamps far harder than this before it ever waits.
-const MAX_PARSED_RETRY_AFTER_SECS: f64 = 86_400.0;
 const MINUTE_SECS: u64 = 60;
 const HOUR_SECS: u64 = 3_600;
 
@@ -468,8 +465,9 @@ fn parse_http_date(value: &str) -> Option<Duration> {
 }
 
 fn positive_secs(secs: f64) -> Option<Duration> {
-    (secs.is_finite() && secs > 0.0)
-        .then(|| Duration::from_secs_f64(secs.min(MAX_PARSED_RETRY_AFTER_SECS)))
+    Duration::try_from_secs_f64(secs)
+        .ok()
+        .filter(|after| !after.is_zero())
 }
 
 /// A non-200 body is untrusted input on a connection that has already
@@ -510,7 +508,9 @@ impl From<caudra_storage::StorageError> for AgentError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::retry::{DelaySource, RetryDecision, RetryState};
     use isahc::http::{HeaderName, HeaderValue};
+    use isahc::{AsyncBody, Response};
     use test_case::test_case;
 
     const BODY: &str = "bad input";
@@ -538,6 +538,10 @@ mod tests {
     const CREDIT_TEXT: &str = "Your credit balance is too low. Please try again later.";
     const HTTP_DATE_OFFSET_SECS: i64 = 300;
     const HTTP_DATE_TOLERANCE_SECS: u64 = 5;
+    const QUOTA_RESET: Duration = Duration::from_secs(13 * HOUR_SECS);
+    const QUOTA_RESET_HEADER: &str = "46800";
+    const QUOTA_RESET_BODY: &str = r#"{"error":{"type":"rate_limit_error","message":"This request would exceed your account's rate limit. Please try again later."}}"#;
+    const QUOTA_RESET_MESSAGE: &str = "rate limited: rate_limit_error: This request would exceed your account's rate limit. Please try again later. (retry after 13h)";
 
     #[test_case(STEERING_RULE)]
     fn steering_exhaustion_is_not_a_transport_retry(rule: &str) {
@@ -716,6 +720,11 @@ mod tests {
     #[test_case(&[("retry-after", "1.5")], 1_500                      ; "fractional_seconds")]
     #[test_case(&[("retry-after-ms", "250")], 250                     ; "millis")]
     #[test_case(&[("retry-after-ms", "250"), ("retry-after", "9")], 250 ; "millis_wins")]
+    #[test_case(&[("retry-after", QUOTA_RESET_HEADER)], 46_800_000 ; "subscription_quota_reset")]
+    #[test_case(&[("retry-after-ms", "46800000")], 46_800_000 ; "subscription_quota_reset_millis")]
+    #[test_case(&[("retry-after", "604800")], 604_800_000 ; "weekly_quota_reset")]
+    #[test_case(&[("retry-after-ms", "46800000"), ("retry-after", "604800")], 46_800_000 ; "long_millis_wins")]
+    #[test_case(&[("retry-after-ms", "NaN"), ("retry-after", QUOTA_RESET_HEADER)], 46_800_000 ; "invalid_millis_falls_back")]
     fn parse_retry_after_reads_the_hint(pairs: &[(&str, &str)], expected_millis: u64) {
         assert_eq!(
             parse_retry_after(&headers(pairs)),
@@ -727,21 +736,49 @@ mod tests {
     #[test_case(&[("retry-after", "later")]      ; "garbage")]
     #[test_case(&[("retry-after", "0")]          ; "zero")]
     #[test_case(&[("retry-after", "-5")]         ; "negative")]
+    #[test_case(&[("retry-after", "NaN")] ; "not_a_number")]
+    #[test_case(&[("retry-after", "inf")] ; "infinite")]
+    #[test_case(&[("retry-after", "1e30")] ; "duration_overflow")]
+    #[test_case(&[("retry-after", "1e-30")] ; "below_duration_precision")]
+    #[test_case(&[("retry-after-ms", "1e30")] ; "millis_duration_overflow")]
     #[test_case(&[("retry-after", "Mon, 1 Jan 2001 00:00:00 +0000")] ; "past_date")]
     fn parse_retry_after_rejects_unusable_values(pairs: &[(&str, &str)]) {
         assert_eq!(parse_retry_after(&headers(pairs)), None);
     }
 
-    #[test]
-    fn parse_retry_after_reads_http_dates() {
-        let target =
-            jiff::Timestamp::now() + jiff::SignedDuration::from_secs(HTTP_DATE_OFFSET_SECS);
+    #[test_case(HTTP_DATE_OFFSET_SECS ; "short_wait")]
+    #[test_case(604_800 ; "weekly_quota_reset")]
+    fn parse_retry_after_reads_http_dates(offset_secs: i64) {
+        let target = jiff::Timestamp::now() + jiff::SignedDuration::from_secs(offset_secs);
         let formatted =
             jiff::fmt::rfc2822::to_string(&target.to_zoned(jiff::tz::TimeZone::UTC)).unwrap();
         let parsed = parse_retry_after(&headers(&[("retry-after", &formatted)])).unwrap();
-        let offset = Duration::from_secs(HTTP_DATE_OFFSET_SECS as u64);
+        let offset = Duration::from_secs(offset_secs as u64);
         assert!(parsed <= offset);
         assert!(parsed > offset - Duration::from_secs(HTTP_DATE_TOLERANCE_SECS));
+    }
+
+    #[test_case(QUOTA_RESET_HEADER)]
+    fn subscription_quota_response_schedules_the_full_reset_window(header: &str) {
+        smol::block_on(async {
+            let response = Response::builder()
+                .status(429)
+                .header(HEADER_RETRY_AFTER, header)
+                .body(AsyncBody::from(QUOTA_RESET_BODY))
+                .unwrap();
+            let error = AgentError::from_response(response).await;
+            assert!(error.is_retryable());
+            assert_eq!(error.retry_after(), Some(QUOTA_RESET));
+            assert_eq!(error.user_message(), QUOTA_RESET_MESSAGE);
+            assert_eq!(
+                RetryState::new().decide(error.retry_after()),
+                RetryDecision::Wait {
+                    attempt: 1,
+                    delay: QUOTA_RESET,
+                    source: DelaySource::ServerHint,
+                }
+            );
+        });
     }
 
     #[test]

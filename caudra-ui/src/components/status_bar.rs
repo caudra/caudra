@@ -4,7 +4,7 @@ use std::path::{MAIN_SEPARATOR, Path};
 use std::time::{Duration, Instant};
 
 use super::command::ChatScope;
-use super::{RetryInfo, Status, escape_terminal_controls, hover_style};
+use super::{RetryInfo, Status, escape_terminal_controls, format_elapsed, hover_style};
 
 use crate::animation::spinner_frame;
 use crate::theme;
@@ -1032,7 +1032,7 @@ impl StatusBar {
                 theme::current().status_notice,
             ));
         }
-        push_retry(&mut left, ctx);
+        push_retry(&mut left, ctx, Instant::now());
         push_decisions_status(&mut left, ctx);
         shorten_mode(&mut left, ctx, area.width, false);
         let right = match ctx.status {
@@ -1102,7 +1102,7 @@ impl StatusBar {
             ));
         }
         push_resume(&mut messages, ctx);
-        push_retry(&mut messages, ctx);
+        push_retry(&mut messages, ctx, Instant::now());
         if let Status::Error { message, .. } = ctx.status {
             messages.push(error_span(message));
         }
@@ -1390,7 +1390,7 @@ fn push_activity(strip: &mut Strip<'_>, ctx: &StatusBarContext<'_>) {
 
 /// The error and its countdown answer as one control, and under the pointer
 /// the countdown says what a click does instead.
-fn push_retry(strip: &mut Strip<'_>, ctx: &StatusBarContext<'_>) {
+fn push_retry(strip: &mut Strip<'_>, ctx: &StatusBarContext<'_>, now: Instant) {
     let Some(retry) = ctx.retry_info else {
         return;
     };
@@ -1399,11 +1399,8 @@ fn push_retry(strip: &mut Strip<'_>, ctx: &StatusBarContext<'_>) {
     {
         RETRY_NOW_LABEL.to_owned()
     } else {
-        let secs = retry
-            .deadline
-            .saturating_duration_since(Instant::now())
-            .as_secs();
-        format!(" · retrying in {secs}s (#{})", retry.attempt)
+        let remaining = format_elapsed(retry.deadline.saturating_duration_since(now).as_secs());
+        format!(" · retrying in {remaining} (#{})", retry.attempt)
     };
     strip.chip(
         ctx,
@@ -2108,6 +2105,14 @@ mod tests {
     const RETRY_MESSAGE: &str = "Rate limited: rate_limit_error";
     const RETRY_ATTEMPT: u32 = 3;
     const RETRY_REMAINING: Duration = Duration::from_secs(9);
+    const MINUTES_RETRY_REMAINING: Duration = Duration::from_secs(134);
+    const LONG_RETRY_REMAINING: Duration = Duration::from_secs(46_800);
+    const WEEKLY_RETRY_REMAINING: Duration = Duration::from_secs(604_800);
+    const SECONDS_RETRY_TEXT: &str = "9s";
+    const MINUTES_RETRY_TEXT: &str = "2m14s";
+    const HOURS_RETRY_TEXT: &str = "13h00m";
+    const WEEKLY_RETRY_TEXT: &str = "168h00m";
+    const EXPIRED_RETRY_TEXT: &str = "0s";
     /// Asserted without the seconds: the deadline ticks down between
     /// construction and render, so the digit is not the test's business.
     const RETRY_COUNTDOWN_PREFIX: &str = "retrying in";
@@ -4386,11 +4391,44 @@ mod tests {
         assert!(bar.flash.is_none());
     }
 
-    fn render_retry(hovered: bool) -> (String, Vec<StatusBarHit>, Vec<Style>) {
+    #[test_case(RETRY_REMAINING, Duration::ZERO, SECONDS_RETRY_TEXT ; "seconds")]
+    #[test_case(MINUTES_RETRY_REMAINING, Duration::ZERO, MINUTES_RETRY_TEXT ; "minutes")]
+    #[test_case(LONG_RETRY_REMAINING, Duration::ZERO, HOURS_RETRY_TEXT ; "hours")]
+    #[test_case(WEEKLY_RETRY_REMAINING, Duration::ZERO, WEEKLY_RETRY_TEXT ; "week")]
+    #[test_case(LONG_RETRY_REMAINING, LONG_RETRY_REMAINING, EXPIRED_RETRY_TEXT ; "deadline")]
+    #[test_case(LONG_RETRY_REMAINING, LONG_RETRY_REMAINING + RETRY_REMAINING, EXPIRED_RETRY_TEXT ; "expired")]
+    fn retry_countdown_formats_remaining_time(delay: Duration, elapsed: Duration, expected: &str) {
+        let now = Instant::now();
         let retry = RetryInfo {
             attempt: RETRY_ATTEMPT,
             message: RETRY_MESSAGE.into(),
-            deadline: Instant::now() + RETRY_REMAINING,
+            deadline: now + delay,
+        };
+        let ctx = Fixture {
+            retry_info: Some(&retry),
+            ..Default::default()
+        }
+        .into_ctx();
+        let mut strip = Strip::default();
+
+        push_retry(&mut strip, &ctx, now + elapsed);
+
+        let text: String = strip
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(text.contains(RETRY_MESSAGE));
+        assert!(text.contains(&format!(
+            "{RETRY_COUNTDOWN_PREFIX} {expected} {RETRY_ATTEMPT_MARK}"
+        )));
+    }
+
+    fn render_retry(hovered: bool, remaining: Duration) -> (String, Vec<StatusBarHit>, Vec<Style>) {
+        let retry = RetryInfo {
+            attempt: RETRY_ATTEMPT,
+            message: RETRY_MESSAGE.into(),
+            deadline: Instant::now() + remaining,
         };
         render_at(Fixture {
             hovered: hovered.then_some(StatusBarHitTarget::Retry),
@@ -4399,9 +4437,11 @@ mod tests {
         })
     }
 
-    #[test]
-    fn a_retry_countdown_is_clickable() {
-        let (text, hits, _) = render_retry(false);
+    #[test_case(RETRY_REMAINING ; "short_wait")]
+    #[test_case(LONG_RETRY_REMAINING ; "thirteen_hours")]
+    #[test_case(WEEKLY_RETRY_REMAINING ; "week")]
+    fn a_retry_countdown_is_clickable(remaining: Duration) {
+        let (text, hits, _) = render_retry(false, remaining);
         assert!(text.contains(RETRY_MESSAGE));
         assert!(text.contains(RETRY_COUNTDOWN_PREFIX));
         assert!(text.contains(RETRY_ATTEMPT_MARK));
@@ -4413,17 +4453,21 @@ mod tests {
 
     /// The countdown is the only thing that changes: the error keeps saying
     /// what went wrong while the chip says what the click will do.
-    #[test]
-    fn hovering_a_retry_offers_to_retry_now() {
-        let (text, _, _) = render_retry(true);
+    #[test_case(RETRY_REMAINING ; "short_wait")]
+    #[test_case(LONG_RETRY_REMAINING ; "thirteen_hours")]
+    #[test_case(WEEKLY_RETRY_REMAINING ; "week")]
+    fn hovering_a_retry_offers_to_retry_now(remaining: Duration) {
+        let (text, _, _) = render_retry(true, remaining);
         assert!(text.contains(RETRY_MESSAGE));
         assert!(text.contains(RETRY_NOW_LABEL.trim()));
         assert!(!text.contains(RETRY_COUNTDOWN_PREFIX));
     }
 
-    #[test]
-    fn hovering_a_retry_highlights_the_whole_control() {
-        let (_, hits, styles) = render_retry(true);
+    #[test_case(RETRY_REMAINING ; "short_wait")]
+    #[test_case(LONG_RETRY_REMAINING ; "thirteen_hours")]
+    #[test_case(WEEKLY_RETRY_REMAINING ; "week")]
+    fn hovering_a_retry_highlights_the_whole_control(remaining: Duration) {
+        let (_, hits, styles) = render_retry(true, remaining);
         let hit = hits
             .iter()
             .find(|hit| hit.target == StatusBarHitTarget::Retry)

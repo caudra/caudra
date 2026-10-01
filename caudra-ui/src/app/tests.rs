@@ -241,8 +241,9 @@ const HINT_TEXT: &str = "2/4 staged";
 const HINT_STYLE: &str = "fg";
 const RETRY_MESSAGE: &str = "overloaded";
 const RETRY_ATTEMPT: u32 = 2;
-const RETRY_DELAY_MS: u64 = 5_000;
+const RETRY_DELAY_MS: u64 = 604_800_000;
 const RETRY_DELAY: Duration = Duration::from_millis(RETRY_DELAY_MS);
+const RETRY_SIBLING_TASK_ID: &str = "retry-sibling";
 const MAIN_RETRY_WIPED: &str = "a subagent's event must not clear the main chat's backoff";
 const MAIN_RETRY_STUCK: &str = "the main chat's own next event ends its backoff";
 const SUBAGENT_RETRY_MISSING: &str = "a task's own chat must show the backoff it is waiting out";
@@ -13709,26 +13710,39 @@ fn retry_clears_in_progress_tools() {
 /// The countdown is a control, not just a label: clicking it asks the agent to
 /// stop waiting, and the chip goes away so the click visibly landed.
 #[test]
-fn clicking_the_retry_countdown_asks_for_an_immediate_retry() {
-    const RETRY_DELAY_MS: u64 = 30_000;
-    let mut app = test_app();
+fn clicking_the_retry_countdown_only_nudges_the_main_chat() {
+    let mut app = app_with_retrying_subagent();
     let (cmd_tx, cmd_rx) = flume::unbounded();
     app.cmd_tx = Some(cmd_tx);
-    app.status = Status::Streaming;
-    app.run_id = 1;
-    app.update(agent_msg(AgentEvent::Retry {
-        attempt: 2,
-        message: "Rate limited".into(),
-        delay_ms: RETRY_DELAY_MS,
-    }));
+    app.update(agent_msg(retry_event()));
+    let main_deadline = app.chats[0].retry().unwrap().deadline;
+    let task_deadline = app.chats[1].retry().unwrap().deadline;
+    let hit = status_hit(&mut app, StatusBarHitTarget::Retry);
 
+    app.active_chat = 1;
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        assert!(
+            app.update(mouse_event(kind, hit.area.x, hit.area.y))
+                .is_empty()
+        );
+    }
+    assert!(cmd_rx.try_recv().is_err());
+    assert_eq!(app.chats[0].retry().unwrap().deadline, main_deadline);
+    assert_eq!(app.chats[1].retry().unwrap().deadline, task_deadline);
+
+    app.active_chat = 0;
     assert!(click_status(&mut app, StatusBarHitTarget::Retry).is_empty());
 
     assert!(app.chats[0].retry().is_none());
+    assert_eq!(app.chats[1].retry().unwrap().deadline, task_deadline);
     assert!(matches!(
         cmd_rx.try_recv(),
         Ok(crate::agent::AgentCommand::RetryNow)
     ));
+    assert!(cmd_rx.try_recv().is_err());
 }
 
 #[test]
@@ -13736,11 +13750,7 @@ fn hovering_the_retry_countdown_marks_it_hovered() {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
-    app.update(agent_msg(AgentEvent::Retry {
-        attempt: 1,
-        message: "Rate limited".into(),
-        delay_ms: 1_000,
-    }));
+    app.update(agent_msg(retry_event()));
     let hit = status_hit(&mut app, StatusBarHitTarget::Retry);
 
     app.update(mouse_event(MouseEventKind::Moved, hit.area.x, hit.area.y));
@@ -13810,12 +13820,65 @@ fn app_with_retrying_subagent() -> App {
 /// user opens to watch that task showed nothing at all.
 #[test]
 fn a_subagent_retry_is_recorded_on_the_chat_it_belongs_to() {
+    let before = Instant::now();
     let app = app_with_retrying_subagent();
+    let after = Instant::now();
 
     let retry = app.chats[1].retry().expect(SUBAGENT_RETRY_MISSING);
     assert_eq!(retry.message, RETRY_MESSAGE);
     assert_eq!(retry.attempt, RETRY_ATTEMPT);
+    assert!(retry.deadline >= before + RETRY_DELAY);
+    assert!(retry.deadline <= after + RETRY_DELAY);
     assert!(app.chats[0].retry().is_none(), "{SUBAGENT_RETRY_LEAKED}");
+}
+
+#[test_case(None ; "main_chat")]
+#[test_case(Some(RETRY_SIBLING_TASK_ID) ; "sibling_task")]
+fn another_chats_event_leaves_the_subagent_retry_standing(source: Option<&str>) {
+    let mut app = app_with_retrying_subagent();
+    let deadline = app.chats[1].retry().unwrap().deadline;
+    let event = AgentEvent::ToolPending {
+        id: SUB_TOOL_ID.into(),
+        name: SHELL_TOOL_NAME.into(),
+    };
+    app.update(match source {
+        Some(task) => subagent_msg(event, task, Some(RESEARCH_NAME)),
+        None => agent_msg(event),
+    });
+
+    assert_eq!(app.chats[1].retry().unwrap().deadline, deadline);
+
+    app.update(subagent_msg(
+        AgentEvent::StreamReset,
+        TASK_ID,
+        Some(RESEARCH_NAME),
+    ));
+    assert!(app.chats[1].retry().is_none());
+}
+
+#[test_case(false ; "cancel_main_run")]
+#[test_case(true ; "cancel_only_the_task")]
+fn cancelling_a_long_retry_clears_the_affected_countdowns(cancel_task: bool) {
+    let mut app = app_with_retrying_subagent();
+    app.update(agent_msg(retry_event()));
+    let main_deadline = app.chats[0].retry().unwrap().deadline;
+
+    if cancel_task {
+        assert!(matches!(
+            &app.cancel_subagent(TASK_ID.into())[..],
+            [Action::CancelSubagent { tool_use_id }] if tool_use_id == TASK_ID
+        ));
+        assert_eq!(app.chats[0].retry().unwrap().deadline, main_deadline);
+    } else {
+        let cancelled_run = app.run_id;
+        assert!(matches!(
+            &app.handle_cancel()[..],
+            [Action::CancelAgent { run_id }] if *run_id == cancelled_run
+        ));
+        assert!(app.chats[0].retry().is_none());
+    }
+    assert!(app.chats[1].retry().is_none());
+    assert_eq!(app.chats[1].task_outcome(), Some(TaskOutcome::Killed));
 }
 
 /// A running task publishes a digest on every activity change, so a single
@@ -13829,9 +13892,11 @@ fn a_subagents_event_leaves_the_main_retry_standing(event: AgentEvent) {
     app.status = Status::Streaming;
     app.run_id = 1;
     app.update(agent_msg(retry_event()));
+    let deadline = app.chats[0].retry().unwrap().deadline;
 
     app.update(subagent_msg(event, TASK_ID, Some(RESEARCH_NAME)));
     assert!(app.chats[0].retry().is_some(), "{MAIN_RETRY_WIPED}");
+    assert_eq!(app.chats[0].retry().unwrap().deadline, deadline);
 
     app.update(agent_msg(AgentEvent::ToolPending {
         id: "t1".into(),
@@ -13849,8 +13914,15 @@ fn a_backgrounded_tasks_backoff_keeps_the_loop_awake() {
     assert_eq!(app.active_chat, 0);
 
     assert!(app.has_lifecycle_work(), "{BACKOFF_SLEPT}");
+    assert!(app.chats[1].cadence().moves());
+    assert_eq!(app.chats[1].task_outcome(), None);
 
-    app.chats[1].clear_retry();
+    assert!(matches!(
+        &app.cancel_subagent(TASK_ID.into())[..],
+        [Action::CancelSubagent { tool_use_id }] if tool_use_id == TASK_ID
+    ));
+    assert!(app.chats[1].retry().is_none());
+    assert_eq!(app.chats[1].task_outcome(), Some(TaskOutcome::Killed));
     assert!(!app.has_lifecycle_work());
 }
 
