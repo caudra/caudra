@@ -52,9 +52,9 @@ const STAGE_CREATION_ATTEMPTS: usize = 8;
 const DEFAULT_OUTPUT_LABEL: &str = "output";
 const SCAN_BUFFER_BYTES: usize = 64 * 1024;
 #[cfg(unix)]
-const TEMP_FILE_MODE: u32 = 0o600;
+const TEMP_FILE_MODE: Mode = Mode::RUSR.union(Mode::WUSR);
 #[cfg(unix)]
-const DIRECTORY_MODE: u32 = 0o700;
+const DIRECTORY_MODE: Mode = TEMP_FILE_MODE.union(Mode::XUSR);
 const OMITTED: &str = "[...]";
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
@@ -538,7 +538,7 @@ impl OutputDirectory {
                         | OFlags::EXCL
                         | OFlags::NOFOLLOW
                         | OFlags::CLOEXEC,
-                    Mode::from_raw_mode(TEMP_FILE_MODE),
+                    TEMP_FILE_MODE,
                 ) {
                     Ok(fd) => {
                         return Ok(StagedOutput {
@@ -668,7 +668,7 @@ fn create_directory_at(dir: &OwnedFd, name: &str, create: bool) -> std::io::Resu
     if !create {
         return Ok(false);
     }
-    match rustix::fs::mkdirat(dir, name, Mode::from_raw_mode(DIRECTORY_MODE)) {
+    match rustix::fs::mkdirat(dir, name, DIRECTORY_MODE) {
         Ok(()) => Ok(true),
         Err(rustix::io::Errno::EXIST) => Ok(false),
         Err(error) => Err(error.into()),
@@ -2387,6 +2387,8 @@ mod tests {
     use std::env;
     use std::fs;
     use std::io;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::process::{Command, Stdio};
     use std::sync::Barrier;
     use std::thread;
@@ -2418,6 +2420,12 @@ mod tests {
     const LEGACY_ID: &str = "CNK1hV6GWoysH3KQMm5wv";
     const LEGACY_REF: &str = r#"{"id":"CNK1hV6GWoysH3KQMm5wv","byte_count":19,"line_count":4}"#;
     const READABLE_REF: &str = r#"{"id":"brisk-calm-otter","byte_count":19,"line_count":4}"#;
+    #[cfg(unix)]
+    const EXPECTED_FILE_MODE: u32 = 0o600;
+    #[cfg(unix)]
+    const EXPECTED_DIRECTORY_MODE: u32 = 0o700;
+    #[cfg(unix)]
+    const MODE_MASK: u32 = 0o777;
 
     fn test_store() -> (TempDir, ToolOutputStore) {
         let temp = tempfile::tempdir().unwrap();
@@ -2441,6 +2449,41 @@ mod tests {
         );
         assert_eq!(reference.byte_count, EXACT_TEXT.len());
         assert_eq!(reference.line_count, line_count(EXACT_TEXT));
+    }
+
+    #[cfg(unix)]
+    #[test_case(""; "empty")]
+    #[test_case(EXACT_TEXT; "with_content")]
+    fn staging_and_publication_preserve_owner_only_permissions(text: &str) {
+        let (_temp, store) = test_store();
+        let session_id = CaudraId::generate();
+        let mut sink = store.begin(session_id).unwrap();
+        sink.append(text).unwrap();
+
+        for directory in [store.root(), store.session_dir(session_id)] {
+            assert_eq!(
+                fs::metadata(directory).unwrap().permissions().mode() & MODE_MASK,
+                EXPECTED_DIRECTORY_MODE
+            );
+        }
+        assert_eq!(
+            fs::metadata(sink.file.as_ref().unwrap().path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & MODE_MASK,
+            EXPECTED_FILE_MODE
+        );
+
+        let reference = sink.finish().unwrap();
+        assert_eq!(
+            fs::metadata(store.output_path(session_id, reference.id))
+                .unwrap()
+                .permissions()
+                .mode()
+                & MODE_MASK,
+            EXPECTED_FILE_MODE
+        );
     }
 
     #[test_case("", 0 ; "empty")]

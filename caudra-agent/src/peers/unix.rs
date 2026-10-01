@@ -123,7 +123,7 @@ fn make_private_directory(path: &Path) -> Result<PathBuf, String> {
     let parent = checked_directory(path.parent().ok_or(UNSAFE_ENTRY)?)?;
     let name = c_string(Path::new(path.file_name().ok_or(UNSAFE_ENTRY)?))?;
     // SAFETY: parent fd and the terminated basename are valid for mkdirat.
-    let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), DIRECTORY_MODE) };
+    let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), libc::S_IRWXU) };
     if result != 0 && io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists {
         return Err(io::Error::last_os_error().to_string());
     }
@@ -187,7 +187,7 @@ impl Endpoint {
             libc::fchmodat(
                 dir.as_raw_fd(),
                 socket_component.as_ptr(),
-                FILE_MODE,
+                libc::S_IRUSR | libc::S_IWUSR,
                 libc::AT_SYMLINK_NOFOLLOW,
             )
         };

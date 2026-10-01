@@ -159,8 +159,8 @@ mod unix {
     use std::os::unix::fs::MetadataExt;
     use std::path::{Component, Path, PathBuf};
 
-    const FILE_MODE: u32 = 0o600;
-    const DIRECTORY_MODE: u32 = 0o700;
+    const FILE_MODE: Mode = Mode::RUSR.union(Mode::WUSR);
+    const DIRECTORY_MODE: Mode = FILE_MODE.union(Mode::XUSR);
     const OTHER_ACCESS: u32 = 0o077;
     const OTHER_WRITE: u32 = 0o022;
     const STICKY: u32 = 0o1000;
@@ -239,7 +239,7 @@ mod unix {
                 let child = match fs::openat(&directory, name, DIRECTORY_FLAGS, Mode::empty()) {
                     Ok(child) => child,
                     Err(Errno::NOENT) if create => {
-                        match fs::mkdirat(&directory, name, Mode::from_raw_mode(DIRECTORY_MODE)) {
+                        match fs::mkdirat(&directory, name, DIRECTORY_MODE) {
                             Ok(()) => directory.sync_all()?,
                             Err(Errno::EXIST) => {}
                             Err(error) => return Err(syscall(error)),
@@ -262,12 +262,7 @@ mod unix {
         }
 
         fn open_file(&self, name: &OsStr, flags: OFlags) -> Result<Option<File>, PrivateFileError> {
-            let file = match fs::openat(
-                &self.file,
-                name,
-                flags | FILE_FLAGS,
-                Mode::from_raw_mode(FILE_MODE),
-            ) {
+            let file = match fs::openat(&self.file, name, flags | FILE_FLAGS, FILE_MODE) {
                 Ok(file) => File::from(file),
                 Err(Errno::NOENT) => return Ok(None),
                 Err(error) => return Err(syscall(error)),
@@ -393,6 +388,18 @@ mod tests {
         assert_eq!(file.load().unwrap().data.as_deref(), Some(UPDATED));
         assert_eq!(
             fs::metadata(file.path()).unwrap().permissions().mode() & MODE_MASK,
+            OWNER_MODE
+        );
+        assert_eq!(
+            fs::metadata(&parent).unwrap().permissions().mode() & MODE_MASK,
+            DIRECTORY_MODE
+        );
+        assert_eq!(
+            fs::metadata(parent.join(format!("{FILE_NAME}.lock")))
+                .unwrap()
+                .permissions()
+                .mode()
+                & MODE_MASK,
             OWNER_MODE
         );
         assert_eq!(fs::read_dir(&parent).unwrap().count(), 2);
