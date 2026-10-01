@@ -235,6 +235,17 @@ Some pickers add extra bindings on top of the defaults:
 | Session Picker | `Ctrl+G` | Generate session title |
 | Session Picker | `Ctrl+D` | Delete session (press twice) |
 | Stash Picker | `Ctrl+D` | Delete stash entry (press twice) |
+| Peer Manager | `1` / `2` | Switch Sessions / Held messages outside filter editing |
+| Peer Manager | `/` | Edit the current view's filter; Enter keeps it, Esc clears it |
+| Peer Manager | `Tab` / `Shift+Tab` | Switch list/detail focus |
+| Peer Manager | `Enter` | Open the selected message review or inspect a peer; never approve from the list |
+| Peer Manager | `Ctrl+R` | Refresh peer discovery without blocking the interface |
+| Peer Manager | `Ctrl+B` | Copy the exact peer target outside filter editing |
+| Peer Manager | `y` | Approve the current rendered message review once |
+| Peer Manager | `n` | Confirm rejection of the current reviewed message |
+| Peer Manager | `p` | Manage this session's inbound policy outside filter editing |
+| Peer Manager | `a` | Apply the selected policy, confirming any relaxation |
+| Peer Manager | `Esc` | Cancel confirmation or policy editing, return to the list, then close |
 | Workflow Inspector | `p` | Pause the selected run |
 | Workflow Inspector | `r` | Resume the selected run |
 | Workflow Inspector | `s` | Stop the selected run |
@@ -293,6 +304,7 @@ Some pickers add extra bindings on top of the defaults:
 
 Some of these contexts belong to an [experimental feature](/docs/configuration/#experimental-features) and exist only while its switch is on:
 
+- Peer Manager: `cross_session_messaging`
 - Workflow Inspector: `workflows`
 - Workflow Catalog: `workflows`
 - Workbench Transfer: `sandboxes`
@@ -301,7 +313,7 @@ Some of these contexts belong to an [experimental feature](/docs/configuration/#
 
 Child contexts inherit their parent's bindings and add their own.
 
-- **Pickers** is the base for: Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker, Stash Picker, Session Picker, Session Relocation, Worktree Picker, Workflow Inspector, Workflow Catalog
+- **Pickers** is the base for: Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker, Stash Picker, Session Picker, Session Relocation, Worktree Picker, Peer Manager, Workflow Inspector, Workflow Catalog
 - **Workbench** is the base for: Workbench Explorer, Workbench Editor, Workbench Source Control, Workbench Search, Workbench Transfer
 
 ## Overriding Keybindings

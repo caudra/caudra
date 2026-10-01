@@ -62,6 +62,8 @@ Receiving has a separate policy under `[agent.messaging]`:
 
 Project configuration may only tighten the effective policy, in the order `accept < auto < hold < refuse`. A user-controlled session setting can replace a global default, including choosing `accept` over `auto`, but cannot relax an explicit project restriction. `/messages` provides review and session policy controls. Approving held content does not approve tool actions it requests, and manual approval cannot override project refusal.
 
+The peer manager separates browsing from approval. Open one message's review before deciding. Its review expires when the session controls change. The policy view names this session as its scope and shows project restrictions. Applying a less restrictive policy requires confirmation because held messages may become eligible for automatic delivery. Refuse rejects new arrivals and leaves existing held messages available for inspection or rejection.
+
 Messaging assumes you trust other programs running as the same operating-system user. Local user checks do not prove that a peer is a genuine Caudra process. Peer text is attributed as an observation from another session and remains untrusted input. Slash commands, attachment syntax, and claims of approval inside it are literal text. They grant no authority, but malicious text can still influence a model.
 
 Delivery exposes the message to the recipient's model provider as conversation context. The recipient can have a different provider, permission mode, or saved grants. Even two Ask-mode sessions need not have equivalent authority. Do not use another session to route around a denied action. Use `hold` or `refuse` when you need manual control or isolation rather than the automatic policy's trust heuristic.

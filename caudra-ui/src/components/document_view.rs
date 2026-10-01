@@ -14,7 +14,8 @@ use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::components::input::apply_selection;
 use crate::components::modal::{FooterHits, FooterLine, Modal};
@@ -57,6 +58,7 @@ pub(crate) struct Painted {
     gutter: Vec<Line<'static>>,
     anchors: Vec<usize>,
     content_width: u16,
+    continuations: Vec<bool>,
 }
 
 impl Painted {
@@ -72,7 +74,13 @@ impl Painted {
             gutter,
             anchors,
             content_width,
+            continuations: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_continuations(mut self, continuations: Vec<bool>) -> Self {
+        self.continuations = continuations;
+        self
     }
 
     fn row_text(&self, row: usize) -> Option<String> {
@@ -97,6 +105,13 @@ impl Painted {
             .splice(..dropped, [Line::from(Span::styled(TRUNCATED, notice))]);
         self.gutter
             .splice(..dropped.min(self.gutter.len()), [Line::default()]);
+        if !self.continuations.is_empty() {
+            self.continuations
+                .splice(..dropped.min(self.continuations.len()), [false]);
+            if let Some(first) = self.continuations.get_mut(NOTICE_ROWS) {
+                *first = false;
+            }
+        }
         self.anchors = self
             .anchors
             .iter()
@@ -386,7 +401,14 @@ impl<K: PartialEq> DocumentView<K> {
             let range = selection
                 .on_row(row, chars.len())
                 .unwrap_or(chars.len()..chars.len());
-            if row > start.0 {
+            if row > start.0
+                && !self
+                    .painted
+                    .continuations
+                    .get(row)
+                    .copied()
+                    .unwrap_or(false)
+            {
                 text.push('\n');
             }
             text.extend(&chars[range]);
@@ -557,13 +579,15 @@ fn widest(lines: &[Line<'static>]) -> u16 {
 /// sees the pointer rather than that many chars along a row of wide glyphs.
 fn char_at_column(text: &str, column: usize) -> usize {
     let mut width = 0;
-    for (index, character) in text.chars().enumerate() {
+    let mut index = 0;
+    for grapheme in text.graphemes(true) {
         if width >= column {
             return index;
         }
-        width += UnicodeWidthChar::width(character).unwrap_or(0);
+        width += grapheme.width();
+        index += grapheme.chars().count();
     }
-    text.chars().count()
+    index
 }
 
 #[cfg(test)]
@@ -697,6 +721,23 @@ mod tests {
             DocumentMouse::Consumed,
             "{CLICK_COPIED}"
         );
+    }
+
+    #[test_case("e\u{301}", 1; "combining_mark")]
+    #[test_case("\u{1f44d}\u{1f3fb}", 2; "emoji_modifier")]
+    #[test_case("\u{1f1eb}\u{1f1f7}", 2; "flag")]
+    #[test_case("\u{1f469}\u{200d}\u{1f4bb}", 2; "joined_emoji")]
+    fn mouse_selection_keeps_complete_graphemes(grapheme: &str, width: u16) {
+        let mut view = opened(Painted::new(
+            vec![Line::from(format!("{grapheme}x"))],
+            Vec::new(),
+            Vec::new(),
+        ));
+        draw(&mut view);
+        sweep(&mut view, (0, 0), (width, 0));
+        assert_eq!(view.selected_text().as_deref(), Some(grapheme));
+        sweep(&mut view, (width, 0), (width + 1, 0));
+        assert_eq!(view.selected_text().as_deref(), Some("x"));
     }
 
     #[test]

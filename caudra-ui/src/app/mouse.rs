@@ -97,6 +97,13 @@ impl App {
             let action = self.permissions_picker.handle_mouse(event);
             return self.handle_permissions_picker_action(action);
         }
+        if self.peer_manager.is_open() && !self.paste_editor.is_open() {
+            self.clear_control_hovers();
+            self.autoscroll = None;
+            self.selection_state = None;
+            let action = self.peer_manager.handle_mouse(event);
+            return self.handle_peer_manager_action(action);
+        }
         if self.session_relocation_picker.is_open() {
             self.clear_control_hovers();
             self.autoscroll = None;
@@ -820,7 +827,9 @@ impl App {
     /// `/logs` and `/docs` are absent because they answer the wheel in their own
     /// `handle_mouse`, which runs long before this.
     fn pan_modal(&mut self, delta: i32) {
-        if self.usage_modal.is_open() {
+        if self.peer_manager.is_open() {
+            self.peer_manager.pan(delta);
+        } else if self.usage_modal.is_open() {
             self.usage_modal.pan(delta);
         } else if self.tools_modal.is_open() {
             self.tools_modal.pan(delta);
@@ -842,6 +851,11 @@ impl App {
         if self.permissions_picker.is_open() {
             self.permissions_picker
                 .scroll_at(Position::new(column, row), delta);
+            return;
+        }
+        if self.peer_manager.is_open() && !self.paste_editor.is_open() {
+            self.scroll_at(column, row, delta);
+            self.clear_selection_unless_pending_copy();
             return;
         }
         if self.session_relocation_picker.is_open() {

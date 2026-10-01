@@ -45,7 +45,7 @@ use caudra_agent::permissions::{
     PermissionManager, PermissionRequest, PermissionResourceSelector, PermissionRuleRecord,
 };
 use caudra_agent::tools::{SHELL_TOOL_NAME, TODOWRITE_TOOL_NAME, ToolEffect};
-use caudra_agent::types::{TodoItem, TodoPriority, TodoStatus};
+use caudra_agent::types::{AskedQuestion, QuestionOption, TodoItem, TodoPriority, TodoStatus};
 use caudra_agent::{
     CallStage, DoneReason, GoalResult, GoalStatus, GoalVerdict, HistorySnapshot, ImageMediaType,
     McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader,
@@ -55,8 +55,8 @@ use caudra_agent::{
 use caudra_config::decisions::DecisionFeatures;
 use caudra_config::sandbox::SandboxName;
 use caudra_config::{
-    Effect, FeatureFlags, PermissionReviewCandidate, PermissionReviewKind, PermissionRule,
-    PermissionSource, PermissionsConfig, ToolKey, UiConfig,
+    Effect, FeatureFlags, InboundPolicy, PermissionReviewCandidate, PermissionReviewKind,
+    PermissionRule, PermissionSource, PermissionsConfig, ToolKey, UiConfig,
 };
 use caudra_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use caudra_lua::{BuiltinAction, HintReader, KeymapReader, LuaCommandInfo, LuaCommandReader};
@@ -108,6 +108,14 @@ const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const PEER_DELIVERED: usize = 11;
 const PEER_SENT: usize = 9;
 const PEER_CONTROL_PROMPT: &str = "Keep the peer controls across a reload.";
+const PEER_MANAGER_TITLE: &str = "Peers";
+const PEER_MANAGER_DRAFT: &str = "Preserve this unsent prompt.";
+const PEER_MANAGER_PASTE: &str = "peer filter";
+const PEER_MANAGER_IMAGE_PATH: &str = "/tmp/peer-manager-image.png";
+const PEER_MANAGER_MESSAGE: &str = "amber-brook";
+const PEER_MANAGER_ERROR: &str = "Peer manager test discovery failure";
+const PEER_MANAGER_OPEN_COUNT: usize = 1;
+const PEER_MANAGER_QUESTION_LINES: usize = 48;
 const REJECTED_DRAFT_PREFIX: &str = "  review ";
 const REJECTED_DRAFT_PASTE: &str = "pasted context\nsecond line";
 const REJECTED_DRAFT_IMAGE: &str = "iVBORw0KGgo=";
@@ -4727,7 +4735,266 @@ fn a_command_whose_experiment_is_off_names_the_switch(command: &str, feature: Fe
     assert_eq!(app.status_bar.flash_text(), Some(expected.as_str()));
     assert_eq!(app.run_cmdline(command, 0).err(), Some(expected));
     assert!(!app.sandbox_manager.is_open());
+    assert!(!app.peer_manager.is_open());
     assert_eq!(app.permissions.mode(), PermissionMode::Ask);
+}
+
+#[test_case("/peers", false; "sessions")]
+#[test_case("/messages", true; "held")]
+fn peer_commands_leave_runtime_eligibility_to_the_event_loop(command: &str, held: bool) {
+    let mut app = test_app();
+    let actions = app.run_cmdline(command, 0).unwrap();
+    if held {
+        assert!(matches!(&actions[..], [Action::PeerMessages(args)] if args.is_empty()));
+    } else {
+        assert!(matches!(&actions[..], [Action::ListPeers]));
+    }
+    assert!(!app.peer_manager.is_open());
+    assert!(app.state.session.messages().is_empty());
+}
+
+#[test_case(PeerView::Sessions; "sessions")]
+#[test_case(PeerView::Held; "held")]
+fn peer_manager_is_modal_and_replaces_browse_overlays(view: PeerView) {
+    let mut app = test_app();
+    app.input_box.set_input(PEER_MANAGER_DRAFT.into());
+    app.help_modal.toggle();
+    app.which_key.arm();
+    app.automatic_wakes_suppressed = true;
+    app.open_peer_manager(view);
+
+    assert!(app.peer_manager.is_open());
+    assert!(app.any_overlay_open());
+    assert!(app.has_modal_overlay());
+    assert!(!app.composer_holds_keys());
+    assert!(!app.help_modal.is_open());
+    assert!(!app.which_key.is_armed());
+    assert_eq!(
+        app.overlays()
+            .iter()
+            .filter(|overlay| overlay.is_open())
+            .count(),
+        PEER_MANAGER_OPEN_COUNT
+    );
+    assert!(rendered(&mut app).contains(PEER_MANAGER_TITLE));
+    assert_eq!(app.input_box.buffer.value(), PEER_MANAGER_DRAFT);
+    assert!(app.automatic_wakes_suppressed);
+}
+
+#[test_case(PeerView::Sessions, false, PEER_MANAGER_PASTE; "sessions_navigation")]
+#[test_case(PeerView::Sessions, true, PEER_MANAGER_PASTE; "sessions_filter")]
+#[test_case(PeerView::Held, false, PEER_MANAGER_PASTE; "held_navigation")]
+#[test_case(PeerView::Held, true, PEER_MANAGER_PASTE; "held_filter")]
+#[test_case(PeerView::Sessions, false, ""; "empty_clipboard")]
+#[test_case(PeerView::Sessions, true, PEER_MANAGER_IMAGE_PATH; "image_path_filter")]
+fn peer_manager_captures_paste_before_the_hidden_prompt_and_image_detection(
+    view: PeerView,
+    filtering: bool,
+    text: &str,
+) {
+    let mut app = test_app();
+    app.input_box.set_input(PEER_MANAGER_DRAFT.into());
+    app.open_peer_manager(view);
+    rendered(&mut app);
+    if filtering {
+        assert!(app.update(Msg::Key(key(KeyCode::Char('/')))).is_empty());
+    }
+    assert!(app.update(Msg::Paste(text.into())).is_empty());
+    assert!(app.peer_manager.is_open());
+    assert_eq!(app.input_box.buffer.value(), PEER_MANAGER_DRAFT);
+    assert!(app.image_paste_rx.is_empty());
+    assert!(app.input_box.pending_images().is_empty());
+    if filtering {
+        assert!(rendered(&mut app).contains(text));
+    }
+    app.route_text_paste(PEER_MANAGER_PASTE);
+    assert_eq!(app.input_box.buffer.value(), PEER_MANAGER_DRAFT);
+}
+
+#[test_case(false, KeyFocus::Composer; "escape_to_composer")]
+#[test_case(false, KeyFocus::Transcript; "escape_to_transcript")]
+#[test_case(true, KeyFocus::Composer; "close_all_to_composer")]
+fn closing_peer_manager_preserves_prompt_and_focus(close_all: bool, focus: KeyFocus) {
+    let mut app = test_app();
+    app.input_box.set_input(PEER_MANAGER_DRAFT.into());
+    app.key_focus = focus;
+    app.open_peer_manager(PeerView::Sessions);
+    rendered(&mut app);
+    if close_all {
+        app.close_all_overlays();
+    } else {
+        assert!(app.update(Msg::Key(key(KeyCode::Esc))).is_empty());
+    }
+    assert!(!app.peer_manager.is_open());
+    assert!(!app.any_overlay_open());
+    assert_eq!(app.input_box.buffer.value(), PEER_MANAGER_DRAFT);
+    assert_eq!(app.key_focus, focus);
+    assert_eq!(app.composer_holds_keys(), focus == KeyFocus::Composer);
+    assert_eq!(app.exit_request, ExitRequest::None);
+}
+
+#[test_case(KeyEventKind::Press; "press")]
+#[test_case(KeyEventKind::Repeat; "repeat")]
+#[test_case(KeyEventKind::Release; "release")]
+fn peer_manager_owns_keys_instead_of_the_hidden_prompt(kind: KeyEventKind) {
+    let mut app = test_app();
+    app.input_box.set_input(PEER_MANAGER_DRAFT.into());
+    app.open_peer_manager(PeerView::Sessions);
+    rendered(&mut app);
+    for event in [
+        key(KeyCode::Char('z')),
+        key(KeyCode::Enter),
+        kb::HELP.to_key_event(),
+        kb::LEADER.to_key_event(),
+        kb::EXIT.to_key_event(),
+    ] {
+        assert!(dispatch_reported_key(&mut app, event, kind).is_empty());
+    }
+    assert_eq!(app.input_box.buffer.value(), PEER_MANAGER_DRAFT);
+    assert!(app.peer_manager.is_open());
+    assert!(!app.which_key.is_armed());
+    assert!(!app.help_modal.is_open());
+    assert_eq!(app.exit_request, ExitRequest::None);
+}
+
+#[test_case(MouseEventKind::Down(MouseButton::Middle); "middle_click")]
+#[test_case(MouseEventKind::Down(MouseButton::Right); "right_click")]
+#[test_case(MouseEventKind::Drag(MouseButton::Left); "drag")]
+#[test_case(MouseEventKind::Up(MouseButton::Left); "release")]
+#[test_case(MouseEventKind::Moved; "hover")]
+#[test_case(MouseEventKind::ScrollUp; "wheel_up")]
+#[test_case(MouseEventKind::ScrollDown; "wheel_down")]
+#[test_case(MouseEventKind::ScrollLeft; "pan_left")]
+#[test_case(MouseEventKind::ScrollRight; "pan_right")]
+fn peer_manager_owns_pointer_events_outside_its_surface(kind: MouseEventKind) {
+    let mut app = test_app();
+    app.input_box.set_input(PEER_MANAGER_DRAFT.into());
+    app.open_peer_manager(PeerView::Sessions);
+    rendered(&mut app);
+    app.chats[0].restore_scroll(OVERLAY_SEED_SCROLL, false);
+    let (column, row) = OUTSIDE_MODAL;
+    assert!(app.update(mouse_event(kind, column, row)).is_empty());
+    assert!(
+        app.update(Msg::Scroll {
+            column,
+            row,
+            delta: EDGE_SCROLL_LINES
+        })
+        .is_empty()
+    );
+    assert_eq!(app.chats[0].scroll_top(), OVERLAY_SEED_SCROLL);
+    assert!(!app.chats[0].auto_scroll());
+    assert!(app.peer_manager.is_open());
+    assert!(app.selection_state.is_none());
+    assert!(app.autoscroll.is_none());
+    assert_eq!(app.input_box.buffer.value(), PEER_MANAGER_DRAFT);
+}
+
+#[test]
+fn peer_manager_discovery_cadence_and_reset_use_the_overlay_registry() {
+    let mut app = app_without_splash();
+    app.open_peer_manager(PeerView::Sessions);
+    app.peer_manager.start_discovery();
+    assert_eq!(app.cadence(), app.peer_manager.cadence());
+    assert_eq!(app.cadence(), Cadence::PENDING);
+    app.peer_manager.set_sessions(Ok(Vec::new()));
+    assert_eq!(app.cadence(), Cadence::IDLE);
+    app.peer_manager.start_discovery();
+    assert_eq!(app.cadence(), Cadence::PENDING);
+    app.close_all_overlays();
+    assert_eq!(app.cadence(), Cadence::IDLE);
+    app.open_peer_manager(PeerView::Held);
+    app.reset_ui_chrome();
+    assert!(!app.peer_manager.is_open());
+}
+
+#[test]
+fn peer_manager_operational_actions_are_handed_to_the_event_loop() {
+    let mut app = test_app();
+    app.open_peer_manager(PeerView::Sessions);
+    assert!(matches!(
+        &app.handle_peer_manager_action(PeerManagerAction::Refresh)[..],
+        [Action::RefreshPeers]
+    ));
+    assert!(matches!(
+        &app.handle_peer_manager_action(PeerManagerAction::Review(PEER_MANAGER_MESSAGE.into()))[..],
+        [Action::ReviewPeerMessage(message)] if message == PEER_MANAGER_MESSAGE
+    ));
+    assert!(matches!(
+        &app.handle_peer_manager_action(PeerManagerAction::SetInbound(InboundPolicy::Hold))[..],
+        [Action::SetPeerInbound(InboundPolicy::Hold)]
+    ));
+    assert!(app.peer_manager.is_open());
+    assert!(app.state.session.messages().is_empty());
+}
+
+#[test]
+fn a_permission_prompt_suppresses_peer_manager_without_discarding_it() {
+    let mut app = test_app();
+    app.open_peer_manager(PeerView::Sessions);
+    app.peer_manager.set_error(PEER_MANAGER_ERROR.into());
+    assert!(rendered(&mut app).contains(PEER_MANAGER_ERROR));
+    app.permission_prompt.open(
+        REPORTED_PERMISSION_FIRST.into(),
+        ToolKey::native("bash"),
+        vec![REPORTED_PERMISSION_COMMAND.into()],
+        None,
+    );
+    let screen = rendered(&mut app);
+    assert!(screen.contains(PERMISSION_TITLE));
+    assert!(!screen.contains(PEER_MANAGER_ERROR));
+    assert!(app.update(Msg::Key(kb::REFRESH.to_key_event())).is_empty());
+    assert!(app.peer_manager.is_open());
+    app.permission_prompt.close();
+    assert!(rendered(&mut app).contains(PEER_MANAGER_ERROR));
+}
+
+#[test]
+fn peer_manager_captures_wheel_above_a_question_that_arrives_later() {
+    let mut app = test_app();
+    app.open_peer_manager(PeerView::Sessions);
+    app.question_form.open(vec![AskedQuestion {
+        question: (0..PEER_MANAGER_QUESTION_LINES)
+            .map(|index| format!("{index}: {QUESTION_TEXT}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        header: QUESTION_HEADER.into(),
+        options: vec![QuestionOption {
+            label: QUESTION_OPTION.into(),
+            description: String::new(),
+        }],
+        multiple: false,
+    }]);
+    rendered(&mut app);
+    let (_, bottom, ..) = app.layout_geometry(TEST_AREA);
+    let position = (bottom.y..bottom.bottom())
+        .flat_map(|row| (bottom.x..bottom.right()).map(move |column| Position::new(column, row)))
+        .find(|position| {
+            app.peer_manager.contains(*position) && app.question_form.contains(*position)
+        })
+        .unwrap();
+    let render_question = |app: &mut App| {
+        let mut terminal =
+            Terminal::new(TestBackend::new(TEST_AREA.width, TEST_AREA.height)).unwrap();
+        terminal
+            .draw(|frame| app.question_form.view(frame, bottom))
+            .unwrap();
+        buffer_text(terminal.backend().buffer())
+    };
+    let before = render_question(&mut app);
+    for delta in [EDGE_SCROLL_LINES, -EDGE_SCROLL_LINES] {
+        assert!(
+            app.update(Msg::Scroll {
+                column: position.x,
+                row: position.y,
+                delta,
+            })
+            .is_empty()
+        );
+        assert_eq!(render_question(&mut app), before);
+    }
+    assert!(app.peer_manager.is_open());
+    assert!(app.question_form.is_open());
 }
 
 #[test]
@@ -5158,6 +5425,7 @@ const OVERLAY_SEED_SCROLL: u32 = 5;
 
 #[test_case(open_help as fn(&mut App) ; "help_modal")]
 #[test_case(open_search               ; "search_modal")]
+#[test_case(open_peer_manager         ; "peer_manager")]
 #[test_case(focus_queue               ; "queue_focus")]
 fn overlay_blocks_ctrl_shortcuts(setup: fn(&mut App)) {
     let mut app = app_with_subagent();
@@ -15548,6 +15816,10 @@ fn open_goal_modal(app: &mut App) {
     app.goal_modal.open();
 }
 
+fn open_peer_manager(app: &mut App) {
+    app.open_peer_manager(PeerView::Sessions);
+}
+
 fn open_model_picker(app: &mut App) {
     app.model_picker.open(&app.state.model, &app.model_policy);
 }
@@ -15577,6 +15849,7 @@ fn open_argument_prompt(app: &mut App) {
 #[test_case(open_model_picker  ; "model_picker")]
 #[test_case(open_command_modal ; "command_modal")]
 #[test_case(open_relocation_picker ; "relocation_picker")]
+#[test_case(open_peer_manager ; "peer_manager")]
 fn a_press_outside_a_modal_dismisses_it(open: fn(&mut App)) {
     let mut app = test_app();
     open(&mut app);
@@ -15607,6 +15880,7 @@ fn a_press_outside_a_modal_dismisses_it(open: fn(&mut App)) {
 #[test_case(open_goal_modal    ; "goal_modal")]
 #[test_case(open_model_picker  ; "model_picker")]
 #[test_case(open_command_modal ; "command_modal")]
+#[test_case(open_peer_manager ; "peer_manager")]
 fn a_press_inside_a_modal_leaves_it_standing(open: fn(&mut App)) {
     let mut app = test_app();
     open(&mut app);

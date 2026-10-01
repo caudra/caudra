@@ -73,6 +73,7 @@ use crate::components::messages::MessageActionTarget;
 use crate::components::mode_submission::ModeSubmission;
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::paste_editor::{PasteEditor, PasteEditorAction, PasteEditorTarget};
+use crate::components::peer_manager::{PeerManager, PeerManagerAction, PeerView};
 use crate::components::permission_prompt::{PermissionDecision, PermissionPrompt, PromptMouse};
 use crate::components::permissions_picker::{
     DiscoveryState, PermissionsPicker, PermissionsPickerAction,
@@ -413,6 +414,7 @@ pub struct App {
     pub(super) memory_picker: MemoryPicker,
     pub(super) task_picker: TaskPicker,
     pub(super) shell_modal: ShellModal,
+    pub(crate) peer_manager: PeerManager,
     pub(super) workflow_inspector: WorkflowInspector,
     /// The run a transcript was opened from, so reopening the inspector
     /// returns to it rather than to whichever run is newest.
@@ -683,6 +685,7 @@ impl App {
             memory_picker: MemoryPicker::new(),
             task_picker: TaskPicker::new(),
             shell_modal: ShellModal::new(),
+            peer_manager: PeerManager::new(),
             workflow_inspector: WorkflowInspector::new(),
             workflow_return: None,
             workflow_catalog_picker: WorkflowCatalogPicker::new(),
@@ -1502,6 +1505,10 @@ impl App {
                     }
                     return vec![];
                 }
+                if self.peer_manager.is_open() && !self.paste_editor.is_open() {
+                    self.peer_manager.handle_paste(&text);
+                    return vec![];
+                }
                 if self.session_relocation_picker.is_open()
                     || self.worktree_picker.is_open()
                     || self.logs_modal.is_open()
@@ -1647,6 +1654,12 @@ impl App {
         // drew: everywhere else it belongs to the transcript behind them.
         if self.permission_prompt.is_open() && self.permission_prompt.contains(pos) {
             self.permission_prompt.scroll(delta);
+            return None;
+        }
+        if self.peer_manager.is_open() {
+            if self.peer_manager.contains(pos) {
+                self.peer_manager.scroll(delta);
+            }
             return None;
         }
         if self.question_form.is_open() && self.question_form.contains(pos) {
@@ -1976,6 +1989,11 @@ impl App {
                 }
             }
             return Some(vec![]);
+        }
+
+        if self.peer_manager.is_open() {
+            let action = self.peer_manager.handle_key(key);
+            return Some(self.handle_peer_manager_action(action));
         }
 
         // plan_form is non-modal: Passthrough falls through to the rest of dispatch
@@ -2319,6 +2337,42 @@ impl App {
         }
 
         None
+    }
+
+    pub(crate) fn open_peer_manager(&mut self, view: PeerView) {
+        self.close_all_overlays();
+        self.command_palette.close();
+        self.mention_popup.close();
+        self.commit_popup.close();
+        self.which_key.disarm();
+        self.autoscroll = None;
+        self.selection_state = None;
+        self.status_mouse_down = None;
+        self.queue_mouse_down = None;
+        self.admission_mouse_down = None;
+        self.chord_hint_down = None;
+        self.message_action_mouse_down = None;
+        self.link_mouse_down = None;
+        self.mention_mouse_down = None;
+        self.commit_mouse_down = None;
+        self.last_esc = None;
+        self.last_exit = None;
+        self.peer_manager.open(view);
+    }
+
+    fn handle_peer_manager_action(&mut self, action: PeerManagerAction) -> Vec<Action> {
+        match action {
+            PeerManagerAction::Consumed => {}
+            PeerManagerAction::Close => self.peer_manager.close(),
+            PeerManagerAction::Copy(text) => self.copy_to_clipboard(&text),
+            PeerManagerAction::Refresh => return vec![Action::RefreshPeers],
+            PeerManagerAction::Review(message) => return vec![Action::ReviewPeerMessage(message)],
+            PeerManagerAction::Decide { token, decision } => {
+                return vec![Action::DecidePeerMessage { token, decision }];
+            }
+            PeerManagerAction::SetInbound(policy) => return vec![Action::SetPeerInbound(policy)],
+        }
+        vec![]
     }
 
     fn handle_model_picker_action(&mut self, action: ModelPickerAction) -> Vec<Action> {
@@ -2992,6 +3046,10 @@ impl App {
             return self.handle_permissions_picker_action(action);
         }
         match key.kind {
+            KeyEventKind::Release if self.peer_manager.is_open() => {
+                let action = self.peer_manager.handle_key(key);
+                return self.handle_peer_manager_action(action);
+            }
             KeyEventKind::Release => return vec![],
             KeyEventKind::Repeat => return self.handle_key_repeat(key),
             KeyEventKind::Press => {}
@@ -5441,7 +5499,7 @@ impl App {
         }
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 42] {
+    fn overlays(&self) -> [&dyn Overlay; 43] {
         [
             &self.workbench,
             &self.logs_modal,
@@ -5478,6 +5536,7 @@ impl App {
             &self.memory_picker,
             &self.task_picker,
             &self.shell_modal,
+            &self.peer_manager,
             &self.workflow_inspector,
             &self.workflow_catalog_picker,
             &self.question_form,
@@ -5488,7 +5547,7 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 42] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 43] {
         [
             &mut self.workbench,
             &mut self.logs_modal,
@@ -5525,6 +5584,7 @@ impl App {
             &mut self.memory_picker,
             &mut self.task_picker,
             &mut self.shell_modal,
+            &mut self.peer_manager,
             &mut self.workflow_inspector,
             &mut self.workflow_catalog_picker,
             &mut self.question_form,
@@ -6030,10 +6090,13 @@ impl App {
             return;
         }
         self.sync_subagent_input_target();
-        if self.plan_form_active() {
+        if self.permission_prompt.handle_paste(text) {
             return;
         }
-        if self.permission_prompt.handle_paste(text) {
+        if self.peer_manager.handle_paste(text) {
+            return;
+        }
+        if self.plan_form_active() {
             return;
         }
         if self.float_mgr.handle_paste(text) {

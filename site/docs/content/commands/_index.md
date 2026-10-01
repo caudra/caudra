@@ -35,8 +35,8 @@ A command with an Experiment entry exists only while that switch is on under `[e
 | `/memory` | View, edit, and delete memory files |  |  |
 | `/tasks` | Browse tasks and steer running subagents |  |  |
 | `/shells` | Browse shell commands and stop running ones |  |  |
-| `/peers` | List live local messaging peers (experimental) | Main only | `cross_session_messaging` |
-| `/messages` | Inspect held messages; approve/reject ID or set inbound POLICY | Main only | `cross_session_messaging` |
+| `/peers` | Browse live local messaging peers (experimental) | Main only | `cross_session_messaging` |
+| `/messages` | Review held peer messages and manage this session's inbound policy | Main only | `cross_session_messaging` |
 | `/workflows` | Browse, trust, and launch workflows | Main only | `workflows` |
 | `/workflow` | Start a workflow, or list, pause, resume, and stop runs | Main only | `workflows` |
 | `/deep-research` | Research a question with the deep-research workflow | Main only | `workflows` |

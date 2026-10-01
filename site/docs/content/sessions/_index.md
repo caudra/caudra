@@ -47,22 +47,33 @@ A project cannot enable the experiment. An inbound setting or saved session cann
 
 ### Find peers and review messages
 
-Use `/peers` to inspect live peers. `/messages` lets you review held messages, approve or reject them, and choose the session's inbound policy. See [inbound policy and trust](/docs/permissions/#cross-session-messages) before allowing automatic delivery.
+`/peers` opens the Sessions view of the peer manager. `/messages` opens its Held messages view. Switch between them with `1` and `2`. See [inbound policy and trust](/docs/permissions/#cross-session-messages) before allowing automatic delivery.
+
+Sessions shows a discovery snapshot of eligible live peers. Select a row to inspect its workspace, activity, inbound policy, and exact target. `Ctrl+R` refreshes without blocking the interface. `Ctrl+B` copies the target. A failed refresh keeps the previous snapshot visible with an error.
+
+Press `/` to filter the current list, then Enter to leave filter editing. Enter on a held message opens its review. Read the literal message body, then use `y` to approve once or `n` to review rejection. Rejecting removes the message from the live inbox. Browsing, filtering, and refreshing grant no approval. Tab switches list/detail focus. Esc backs out before closing. Narrow terminals show one pane at a time.
+
+The Held messages view contains messages waiting for this session's review or delivery limits. Recorded messages and send receipts remain in the transcript. Use the agent to send messages.
 
 | Command | Action |
 |---|---|
-| `/messages` | Show held messages and their IDs |
+| `/peers` | Open the Sessions view |
+| `/messages` | Open the Held messages view |
 | `/messages approve <id>` | Approve a message from the current review |
 | `/messages reject <id>` | Reject a message from the current review |
 | `/messages inbound auto\|accept\|hold\|refuse` | Set the session policy within project restrictions |
 
-Review again if the session's mode, workspace, or policy changes. An old review cannot approve a message under new controls.
+Open the individual message's review before using an approve or reject command. Review again if the session's mode, workspace, or policy changes. An old review cannot approve a message under new controls.
+
+Press `p` outside filter editing to manage this session's inbound policy. Select an option and press `a` to apply it. Relaxing the policy requires confirmation because it can release held messages and start billable turns. Project restrictions remain in force. This control never changes the selected peer's policy.
 
 You can also ask the agent to find a session and send it a message. It uses `list_sessions` for discovery and `send_message` for delivery. Discovery cards show session labels, word-based targets, workspaces, and availability, without transcript previews. A title is not a unique address.
 
 Use the exact target from discovery or an incoming reply address. Targets belong to your current live registration and are never reassigned to a replacement peer. Discover again after restarting or replacing your session. Message names also use generated words, including the names shown by `/messages` for approval or rejection.
 
 Accepted messages enter at a safe run boundary. They can also wake an eligible idle TUI session and start a billable model turn. They do not interrupt a running tool or bypass cancellation, permission review, or delivery limits. The recipient still applies its own tool permissions.
+
+Approval can leave a message held when its delivery budget is exhausted. Opening or closing the manager does not reset that budget or resume cancelled work. An idle session waits until the modal closes before starting a peer-triggered turn. Work already running keeps its existing safe-boundary delivery behavior.
 
 ### Delivery receipts and lifetime
 

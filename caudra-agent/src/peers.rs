@@ -64,6 +64,9 @@ const AMBIGUOUS_REPLY: &str = "Peer reply identity is ambiguous without its orig
 const SEND_BUDGET: &str = "Peer send budget exhausted; genuine local input must reset it";
 const NAME_FULL: &str = "Live peer name capacity reached; start a new registration";
 const NAME_COLLISION: &str = "Unable to allocate a unique peer name within the attempt limit";
+const STALE_REVIEW: &str = "Held message review is stale; inspect the current held messages again";
+const NOT_HELD: &str = "Held message no longer exists";
+const REJECTED: &str = "Rejected by the local receiver";
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 const UNAVAILABLE: &str = "Local peer messaging is unavailable on this platform";
 static REGISTRATIONS: OnceLock<Mutex<HashMap<CaudraId, Weak<SessionInner>>>> = OnceLock::new();
@@ -130,6 +133,54 @@ pub struct HeldMessage {
     pub epoch: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldMessageSummary {
+    pub message_id: String,
+    pub sender_name: String,
+    pub reply_target: String,
+    pub workspace: Option<PathBuf>,
+    pub mode: String,
+    pub reason: String,
+    pub epoch: u64,
+    pub approval_blocker: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PeerInboxSnapshot {
+    pub messages: Vec<HeldMessageSummary>,
+    pub inbound: InboundPolicy,
+    pub inbound_override: Option<InboundPolicy>,
+    pub project_floor: InboundPolicy,
+}
+
+#[derive(Debug, Clone)]
+pub struct HeldReview {
+    pub summary: HeldMessageSummary,
+    pub text: String,
+    pub token: PeerReviewToken,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerReviewToken {
+    registration: Route,
+    sender: Route,
+    message_id: String,
+    epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerDecision {
+    Approve,
+    Reject,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerDecisionResult {
+    Queued,
+    Held { reason: String },
+    Rejected,
+}
+
 #[derive(Clone)]
 pub struct PeerHost(Arc<HostInner>);
 
@@ -186,6 +237,31 @@ impl InboxItem {
     fn observation(&self) -> Message {
         Message::peer_observation(self.delivery.text.clone(), self.origin.clone())
     }
+
+    fn held_summary(
+        &self,
+        epoch: u64,
+        approval_blocker: Option<&str>,
+    ) -> Option<HeldMessageSummary> {
+        let ItemState::Held(reason) = &self.state else {
+            return None;
+        };
+        Some(HeldMessageSummary {
+            message_id: self.origin.message_id.clone(),
+            sender_name: self.delivery.sender.name.clone(),
+            reply_target: self.origin.reply_target.clone(),
+            workspace: self.delivery.sender.canonical_cwd.clone(),
+            mode: match self.delivery.sender.mode {
+                WireMode::Build => "build",
+                WireMode::Plan => "plan",
+                WireMode::ReadOnly => "read_only",
+            }
+            .into(),
+            reason: reason.clone(),
+            epoch,
+            approval_blocker: approval_blocker.map(str::to_owned),
+        })
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -223,7 +299,7 @@ pub struct PeerClaim {
     committed: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Route {
     host: String,
     session: CaudraId,
@@ -453,8 +529,8 @@ impl PeerHost {
         Ok(Self(host))
     }
 
-    #[cfg(all(test, unix))]
-    pub(crate) fn start_in(directory: PathBuf, bytes: Arc<AtomicUsize>) -> Result<Self, String> {
+    #[cfg(all(any(test, feature = "test-support"), unix))]
+    pub fn start_in(directory: PathBuf, bytes: Arc<AtomicUsize>) -> Result<Self, String> {
         Self::bind(directory, bytes)
     }
 
@@ -607,8 +683,8 @@ impl PeerSession {
         if policy < state.floor {
             return Err(POLICY_FLOOR.into());
         }
-        state.inbound_override = Some(policy.clone());
-        if policy != state.descriptor.inbound {
+        if state.inbound_override.as_ref() != Some(&policy) || policy != state.descriptor.inbound {
+            state.inbound_override = Some(policy.clone());
             state.epoch += 1;
             state.descriptor.inbound = policy;
             state.reevaluate();
@@ -868,57 +944,124 @@ impl PeerSession {
         held
     }
 
+    pub fn inbox_snapshot(&self) -> Result<PeerInboxSnapshot, String> {
+        let mut state = lock(&self.0.state);
+        state.ensure_open()?;
+        state.reevaluate();
+        Ok(PeerInboxSnapshot {
+            messages: state
+                .inbox
+                .iter()
+                .filter_map(|item| item.held_summary(state.epoch, state.approval_blocker()))
+                .collect(),
+            inbound: state.descriptor.inbound.clone(),
+            inbound_override: state.inbound_override.clone(),
+            project_floor: state.floor.clone(),
+        })
+    }
+
+    pub fn review_held(&self, message_id: &str) -> Result<HeldReview, String> {
+        let mut state = lock(&self.0.state);
+        state.ensure_open()?;
+        state.reevaluate();
+        let item = &state.inbox[state.held_index(message_id)?];
+        Ok(HeldReview {
+            summary: item
+                .held_summary(state.epoch, state.approval_blocker())
+                .ok_or(NOT_HELD)?,
+            text: item.delivery.text.clone(),
+            token: PeerReviewToken {
+                registration: self.0.route.clone(),
+                sender: item.delivery.sender.route.clone(),
+                message_id: item.delivery.message_id.clone(),
+                epoch: state.epoch,
+            },
+        })
+    }
+
+    pub fn decide_held(
+        &self,
+        token: &PeerReviewToken,
+        decision: PeerDecision,
+    ) -> Result<PeerDecisionResult, String> {
+        let mut state = lock(&self.0.state);
+        state.ensure_open()?;
+        if token.registration != self.0.route || token.epoch != state.epoch {
+            return Err(STALE_REVIEW.into());
+        }
+        state.reevaluate();
+        let index = state
+            .inbox
+            .iter()
+            .position(|item| {
+                item.delivery.sender.route == token.sender
+                    && item.delivery.message_id == token.message_id
+                    && matches!(item.state, ItemState::Held(_))
+            })
+            .ok_or(NOT_HELD)?;
+        if decision == PeerDecision::Approve
+            && let Some(blocker) = state.approval_blocker()
+        {
+            return Err(blocker.into());
+        }
+        self.decide_locked(&mut state, index, decision)
+    }
+
     pub fn approve(&self, message_id: &str) -> Result<(), String> {
         let mut state = lock(&self.0.state);
         state.ensure_open()?;
-        if state.descriptor.inbound == InboundPolicy::Refuse {
-            return Err(REFUSED_POLICY.into());
+        if let Some(blocker) = state.approval_blocker() {
+            return Err(blocker.into());
         }
-        if state.wakes_suppressed || state.descriptor.blocked {
-            return Err(HELD_BLOCKED.into());
+        if state.reviews.get(message_id) != Some(&state.epoch) {
+            return Err(STALE_REVIEW.into());
         }
-        let epoch = state.epoch;
-        if state.reviews.get(message_id) != Some(&epoch) {
-            return Err(
-                "Held message review is stale; inspect the current held messages again".into(),
-            );
-        }
-        let item = state
-            .inbox
-            .iter_mut()
-            .find(|item| {
-                item.origin.message_id == message_id && matches!(item.state, ItemState::Held(_))
-            })
-            .ok_or("Held message no longer exists")?;
-        item.approved_epoch = Some(epoch);
         state.reevaluate();
-        self.0.host.changed.notify(usize::MAX);
+        let index = state.held_index(message_id)?;
+        self.decide_locked(&mut state, index, PeerDecision::Approve)?;
         Ok(())
     }
 
     pub fn reject(&self, message_id: &str) -> Result<(), String> {
         let mut state = lock(&self.0.state);
         state.ensure_open()?;
-        let index = state
-            .inbox
-            .iter()
-            .position(|item| {
-                item.origin.message_id == message_id && matches!(item.state, ItemState::Held(_))
-            })
-            .ok_or("Held message no longer exists")?;
-        if let Some(item) = state.inbox.remove(index) {
-            state.bytes -= item.bytes;
-            self.0.host.bytes.fetch_sub(item.bytes, Ordering::AcqRel);
-            if let Some(entry) = state.dedup.get_mut(&item.delivery.dedup_key()) {
-                entry.receipt = SendReceipt::new(
-                    "refused",
-                    &item.delivery.message_id,
-                    Some("Rejected by the local receiver"),
-                );
-            }
-        }
-        state.reviews.remove(message_id);
+        state.reevaluate();
+        let index = state.held_index(message_id)?;
+        self.decide_locked(&mut state, index, PeerDecision::Reject)?;
         Ok(())
+    }
+
+    fn decide_locked(
+        &self,
+        state: &mut SessionState,
+        index: usize,
+        decision: PeerDecision,
+    ) -> Result<PeerDecisionResult, String> {
+        let result = match decision {
+            PeerDecision::Approve => {
+                state.inbox[index].approved_epoch = Some(state.epoch);
+                state.reevaluate();
+                match &state.inbox[index].state {
+                    ItemState::Held(reason) => PeerDecisionResult::Held {
+                        reason: reason.clone(),
+                    },
+                    _ => PeerDecisionResult::Queued,
+                }
+            }
+            PeerDecision::Reject => {
+                let item = state.inbox.remove(index).ok_or(NOT_HELD)?;
+                state.bytes -= item.bytes;
+                self.0.host.bytes.fetch_sub(item.bytes, Ordering::AcqRel);
+                if let Some(entry) = state.dedup.get_mut(&item.delivery.dedup_key()) {
+                    entry.receipt =
+                        SendReceipt::new("refused", &item.delivery.message_id, Some(REJECTED));
+                }
+                state.reviews.remove(&item.origin.message_id);
+                PeerDecisionResult::Rejected
+            }
+        };
+        self.0.host.changed.notify(usize::MAX);
+        Ok(result)
     }
 
     pub fn reset_budget(&self) {
@@ -926,6 +1069,9 @@ impl PeerSession {
         if state.open {
             state.delivered = 0;
             state.sends = 0;
+            if state.wakes_suppressed {
+                state.epoch += 1;
+            }
             state.wakes_suppressed = false;
             state.reevaluate();
             self.0.host.changed.notify(usize::MAX);
@@ -1069,16 +1215,32 @@ impl SessionState {
         }
     }
 
+    fn held_index(&self, message_id: &str) -> Result<usize, String> {
+        self.inbox
+            .iter()
+            .position(|item| {
+                item.origin.message_id == message_id && matches!(item.state, ItemState::Held(_))
+            })
+            .ok_or_else(|| NOT_HELD.into())
+    }
+
+    fn approval_blocker(&self) -> Option<&'static str> {
+        if self.descriptor.inbound == InboundPolicy::Refuse {
+            Some(REFUSED_POLICY)
+        } else if self.wakes_suppressed || self.descriptor.blocked {
+            Some(HELD_BLOCKED)
+        } else {
+            None
+        }
+    }
+
     fn hold_reason(
         &self,
         delivery: &Delivery,
         approved_epoch: Option<u64>,
     ) -> Option<&'static str> {
-        if self.descriptor.inbound == InboundPolicy::Refuse {
-            return Some(REFUSED_POLICY);
-        }
-        if self.wakes_suppressed || self.descriptor.blocked {
-            return Some(HELD_BLOCKED);
+        if let Some(blocker) = self.approval_blocker() {
+            return Some(blocker);
         }
         if self.delivered >= PEER_BUDGET {
             return Some(HELD_BUDGET);
@@ -1474,6 +1636,7 @@ mod tests {
     use std::fs::{self, Permissions};
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+    use std::slice::from_ref;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
@@ -1483,6 +1646,7 @@ mod tests {
     use caudra_providers::{Message, PeerMessageOrigin, expand_message};
     use caudra_storage::id::CaudraId;
     use caudra_storage::sessions::{PermissionMode, StoredInboundPolicy, StoredPeerControls};
+    use futures_lite::future::poll_once;
     use tempfile::{Builder, TempDir};
     use test_case::test_case;
 
@@ -1490,11 +1654,11 @@ mod tests {
         AMBIGUOUS_REPLY, CLAIM_BATCH, CLOSED, Delivery, FULL, HELD_BLOCKED, HELD_BUDGET,
         HELD_COHORT, HELD_POLICY, MAX_BODY_BYTES, MAX_DEDUP, MAX_HELD, MAX_MESSAGE_NAMES,
         MAX_NAME_ATTEMPTS, MAX_PEER_NAMES, MAX_PROCESS_BYTES, MAX_SESSION_BYTES, MESSAGE_WORDS,
-        MessageIdentity, NAME_COLLISION, NAME_FULL, Outgoing, PEER_BUDGET, PEER_WORDS,
-        POLICY_FLOOR, PeerDescriptor, PeerHost, PeerSession, PeerSummary, RATE_WINDOW,
-        REFUSED_POLICY, RETRY_FULL, RETRY_WINDOW, Route, SEND_BUDGET, STALE_TARGET, SendReceipt,
-        Sender, UNKNOWN_REPLY, UNKNOWN_TARGET, WireMode, allocate_name, lock, message_name, token,
-        valid_name, wall_ms,
+        MessageIdentity, NAME_COLLISION, NAME_FULL, NOT_HELD, Outgoing, PEER_BUDGET, PEER_WORDS,
+        POLICY_FLOOR, PeerDecision, PeerDecisionResult, PeerDescriptor, PeerHost, PeerSession,
+        PeerSummary, RATE_WINDOW, REFUSED_POLICY, REJECTED, RETRY_FULL, RETRY_WINDOW, Route,
+        SEND_BUDGET, STALE_REVIEW, STALE_TARGET, SendReceipt, Sender, UNKNOWN_REPLY,
+        UNKNOWN_TARGET, WireMode, allocate_name, lock, message_name, token, valid_name, wall_ms,
     };
     use crate::AgentMode;
 
@@ -1512,6 +1676,8 @@ mod tests {
     const REQUEST_ID: &str = "named-request";
     const REPLY_REQUEST_ID: &str = "named-reply";
     const ORIGINAL_REQUEST_ID: &str = "original-request";
+    const BUILD_MODE: &str = "build";
+    const PLAN_MODE: &str = "plan";
 
     pub(super) fn directory() -> TempDir {
         Builder::new()
@@ -2959,6 +3125,400 @@ mod tests {
         assert!(session.approve(&delivery.message_id).is_err());
         session.held();
         session.approve(&delivery.message_id).unwrap();
+    }
+
+    #[test_case(WireMode::Build, true, BUILD_MODE; "build_workspace")]
+    #[test_case(WireMode::Plan, false, PLAN_MODE; "plan_workspace_unavailable")]
+    fn inbox_snapshot_retains_metadata_without_authorizing(
+        mode: WireMode,
+        workspace: bool,
+        expected_mode: &str,
+    ) {
+        let (_directory, _host, session) = fixture(InboundPolicy::Hold);
+        let mut delivery = delivery(&session);
+        delivery.message_id = token().unwrap();
+        delivery.sender.mode = mode;
+        if !workspace {
+            delivery.sender.canonical_cwd = None;
+        }
+        session
+            .0
+            .receive(delivery.clone(), Instant::now(), wall_ms())
+            .unwrap();
+        let snapshot = session.inbox_snapshot().unwrap();
+        assert_eq!(snapshot.messages.len(), 1);
+        let summary = &snapshot.messages[0];
+        assert!(valid_name(&summary.message_id, MESSAGE_WORDS));
+        assert_ne!(summary.message_id, delivery.message_id);
+        assert_eq!(summary.sender_name, delivery.sender.name);
+        assert_eq!(summary.workspace, delivery.sender.canonical_cwd);
+        assert_eq!(summary.mode, expected_mode);
+        assert_eq!(summary.reason, HELD_POLICY);
+        assert_eq!(summary.approval_blocker, None);
+        assert_eq!(snapshot.inbound, InboundPolicy::Hold);
+        assert_eq!(snapshot.inbound_override, None);
+        assert_eq!(snapshot.project_floor, InboundPolicy::Accept);
+        assert_eq!(
+            lock(&session.0.state).peer_names.get(&summary.reply_target),
+            Some(&delivery.sender.route.target())
+        );
+        assert_eq!(session.inbox_snapshot().unwrap(), snapshot);
+        assert_eq!(
+            session.approve(&summary.message_id).unwrap_err(),
+            STALE_REVIEW
+        );
+        let review = session.review_held(&summary.message_id).unwrap();
+        assert_eq!(review.summary, *summary);
+        assert_eq!(review.text, delivery.text);
+        assert_eq!(session.inbox_snapshot().unwrap(), snapshot);
+        assert!(lock(&session.0.state).reviews.is_empty());
+        assert!(!session.has_pending());
+    }
+
+    #[test_case(PeerDecision::Approve, true; "approve_colliding_names")]
+    #[test_case(PeerDecision::Reject, true; "reject_colliding_names")]
+    #[test_case(PeerDecision::Approve, false; "approve_same_sender")]
+    #[test_case(PeerDecision::Reject, false; "reject_same_sender")]
+    fn single_review_does_not_authorize_other_messages(decision: PeerDecision, colliding: bool) {
+        let (_directory, host, session) = fixture(InboundPolicy::Hold);
+        let mut first = delivery(&session);
+        first.message_id = MESSAGE_NAME.into();
+        let mut second = first.clone();
+        if colliding {
+            second.sender.route.generation = token().unwrap();
+        } else {
+            second.message_id = OTHER_MESSAGE_NAME.into();
+        }
+        session.0.receive(first, Instant::now(), wall_ms()).unwrap();
+        let receipt = session
+            .0
+            .receive(second.clone(), Instant::now(), wall_ms())
+            .unwrap();
+        let snapshot = session.inbox_snapshot().unwrap();
+        let first_summary = &snapshot.messages[0];
+        let second_summary = &snapshot.messages[1];
+        assert_ne!(first_summary.message_id, second_summary.message_id);
+        let review = session.review_held(&second_summary.message_id).unwrap();
+        assert_eq!(review.summary, *second_summary);
+        assert_eq!(
+            session.approve(&first_summary.message_id).unwrap_err(),
+            STALE_REVIEW
+        );
+        let notified = host.notified();
+        assert_eq!(
+            session
+                .decide_held(&review.token, decision.clone())
+                .unwrap(),
+            if decision == PeerDecision::Approve {
+                PeerDecisionResult::Queued
+            } else {
+                PeerDecisionResult::Rejected
+            }
+        );
+        assert!(smol::block_on(poll_once(notified)).is_some());
+        assert_eq!(
+            session.inbox_snapshot().unwrap().messages,
+            from_ref(first_summary)
+        );
+        for decision in [PeerDecision::Approve, PeerDecision::Reject] {
+            assert_eq!(
+                session.decide_held(&review.token, decision).unwrap_err(),
+                NOT_HELD
+            );
+        }
+        let retry = session
+            .0
+            .receive(second.clone(), Instant::now(), wall_ms())
+            .unwrap();
+        if decision == PeerDecision::Approve {
+            assert_eq!(retry, receipt);
+            let claim = session.claim().unwrap();
+            assert_eq!(claim.messages().len(), 1);
+            assert_eq!(
+                claim.messages()[0].peer_event.as_ref().unwrap().message_id,
+                second_summary.message_id
+            );
+            claim.commit();
+        } else {
+            assert_eq!(
+                retry,
+                SendReceipt::new(REFUSED, &second.message_id, Some(REJECTED))
+            );
+            assert!(session.claim().is_none());
+        }
+        {
+            let state = lock(&session.0.state);
+            assert_eq!(state.inbox.len(), 1);
+            assert_eq!(state.bytes, state.inbox[0].bytes);
+            assert_eq!(host.0.bytes.load(Ordering::Acquire), state.bytes);
+            assert!(state.inbox[0].approved_epoch.is_none());
+        }
+        let review = session.review_held(&first_summary.message_id).unwrap();
+        assert_eq!(
+            session
+                .decide_held(&review.token, PeerDecision::Reject)
+                .unwrap(),
+            PeerDecisionResult::Rejected
+        );
+        assert_eq!(host.0.bytes.load(Ordering::Acquire), 0);
+        assert_eq!(lock(&session.0.state).bytes, 0);
+        assert_eq!(
+            session.review_held(&first_summary.message_id).unwrap_err(),
+            NOT_HELD
+        );
+    }
+
+    #[test_case(|session| { let mut descriptor = session.descriptor(); descriptor.mode = AgentMode::ReadOnly; session.update(descriptor).unwrap(); }; "mode")]
+    #[test_case(|session| { let mut descriptor = session.descriptor(); descriptor.permission_mode = PermissionMode::Yolo; session.update(descriptor).unwrap(); }; "permission_mode")]
+    #[test_case(|session| { let mut descriptor = session.descriptor(); descriptor.cwd = descriptor.cwd.join(MESSAGE_NAME); session.update(descriptor).unwrap(); }; "workspace")]
+    #[test_case(|session| { session.set_inbound(InboundPolicy::Refuse).unwrap(); session.set_inbound(InboundPolicy::Hold).unwrap(); }; "policy_round_trip")]
+    #[test_case(|session| session.set_inbound(InboundPolicy::Hold).unwrap(); "explicit_override")]
+    #[test_case(|session| { let mut descriptor = session.descriptor(); descriptor.blocked = true; session.update(descriptor).unwrap(); }; "blocked")]
+    #[test_case(PeerSession::suppress_wakes; "cancellation")]
+    fn snapshot_refresh_does_not_refresh_stale_review(change: fn(&PeerSession)) {
+        let (_directory, _host, session) = fixture(InboundPolicy::Hold);
+        let delivery = delivery(&session);
+        session
+            .0
+            .receive(delivery.clone(), Instant::now(), wall_ms())
+            .unwrap();
+        let review = session.review_held(&delivery.message_id).unwrap();
+        change(&session);
+        let snapshot = session.inbox_snapshot().unwrap();
+        assert!(snapshot.messages[0].epoch > review.summary.epoch);
+        for decision in [PeerDecision::Approve, PeerDecision::Reject] {
+            assert_eq!(
+                session.decide_held(&review.token, decision).unwrap_err(),
+                STALE_REVIEW
+            );
+        }
+        assert_eq!(session.inbox_snapshot().unwrap(), snapshot);
+        let current = session.review_held(&delivery.message_id).unwrap();
+        assert_ne!(review.token, current.token);
+        assert_eq!(
+            session
+                .decide_held(&current.token, PeerDecision::Reject)
+                .unwrap(),
+            PeerDecisionResult::Rejected
+        );
+    }
+
+    #[test_case(PeerDecision::Approve; "approve")]
+    #[test_case(PeerDecision::Reject; "reject")]
+    fn review_token_cannot_cross_registration(decision: PeerDecision) {
+        let (_directory, host, session) = fixture(InboundPolicy::Hold);
+        let mut delivery = delivery(&session);
+        session
+            .0
+            .receive(delivery.clone(), Instant::now(), wall_ms())
+            .unwrap();
+        let review = session.review_held(&delivery.message_id).unwrap();
+        session.close();
+        assert_eq!(session.inbox_snapshot().unwrap_err(), CLOSED);
+        assert_eq!(
+            session.review_held(&delivery.message_id).unwrap_err(),
+            CLOSED
+        );
+        assert_eq!(
+            session
+                .decide_held(&review.token, decision.clone())
+                .unwrap_err(),
+            CLOSED
+        );
+        let replacement = host.register(session.descriptor()).unwrap();
+        delivery.target = replacement.0.route.target();
+        replacement
+            .0
+            .receive(delivery.clone(), Instant::now(), wall_ms())
+            .unwrap();
+        let current = replacement.review_held(&delivery.message_id).unwrap();
+        assert_eq!(review.summary.message_id, current.summary.message_id);
+        assert_eq!(review.summary.epoch, current.summary.epoch);
+        assert_ne!(review.token, current.token);
+        assert_eq!(
+            replacement
+                .decide_held(&review.token, decision.clone())
+                .unwrap_err(),
+            STALE_REVIEW
+        );
+        assert!(replacement.decide_held(&current.token, decision).is_ok());
+    }
+
+    #[test_case(|session| session.set_inbound(InboundPolicy::Refuse).unwrap(), REFUSED_POLICY; "refused")]
+    #[test_case(|session| { let mut descriptor = session.descriptor(); descriptor.blocked = true; session.update(descriptor).unwrap(); }, HELD_BLOCKED; "blocked")]
+    #[test_case(PeerSession::suppress_wakes, HELD_BLOCKED; "cancelled")]
+    fn review_reports_hard_approval_blockers_without_resuming(
+        block: fn(&PeerSession),
+        reason: &str,
+    ) {
+        let (_directory, host, session) = fixture(InboundPolicy::Hold);
+        let delivery = delivery(&session);
+        session
+            .0
+            .receive(delivery.clone(), Instant::now(), wall_ms())
+            .unwrap();
+        block(&session);
+        let controls = session.controls();
+        let suppressed = session.wakes_suppressed();
+        let snapshot = session.inbox_snapshot().unwrap();
+        let review = session.review_held(&delivery.message_id).unwrap();
+        assert_eq!(review.summary, snapshot.messages[0]);
+        assert_eq!(review.summary.reason, reason);
+        assert_eq!(review.summary.approval_blocker.as_deref(), Some(reason));
+        assert_eq!(
+            session
+                .decide_held(&review.token, PeerDecision::Approve)
+                .unwrap_err(),
+            reason
+        );
+        assert_eq!(session.inbox_snapshot().unwrap(), snapshot);
+        assert!(session.claim().is_none());
+        assert_eq!(
+            session
+                .decide_held(&review.token, PeerDecision::Reject)
+                .unwrap(),
+            PeerDecisionResult::Rejected
+        );
+        assert_eq!(session.controls(), controls);
+        assert_eq!(session.wakes_suppressed(), suppressed);
+        assert_eq!(host.0.bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[test_case(PeerDecision::Approve; "approve_after_resume")]
+    #[test_case(PeerDecision::Reject; "reject_after_resume")]
+    fn resuming_cancellation_invalidates_blocked_review(decision: PeerDecision) {
+        let (_directory, _host, session) = fixture(InboundPolicy::Hold);
+        let delivery = delivery(&session);
+        session
+            .0
+            .receive(delivery.clone(), Instant::now(), wall_ms())
+            .unwrap();
+        session.suppress_wakes();
+        let review = session.review_held(&delivery.message_id).unwrap();
+        session.reset_budget();
+        assert_eq!(
+            session.decide_held(&review.token, decision).unwrap_err(),
+            STALE_REVIEW
+        );
+        assert_eq!(
+            session.inbox_snapshot().unwrap().messages[0].approval_blocker,
+            None
+        );
+    }
+
+    #[test_case(InboundPolicy::Hold; "hold_floor")]
+    #[test_case(InboundPolicy::Auto; "auto_floor")]
+    fn budget_held_approval_reports_actual_disposition_and_preserves_controls(
+        floor: InboundPolicy,
+    ) {
+        let directory = directory();
+        let host = host(directory.path());
+        let session = host
+            .register_with_controls(
+                descriptor(directory.path(), InboundPolicy::Auto),
+                Some(floor.clone()),
+                Some(StoredPeerControls {
+                    inbound: Some(StoredInboundPolicy::Hold),
+                    delivered: PEER_BUDGET,
+                    sends: PEER_BUDGET,
+                }),
+            )
+            .unwrap();
+        for _ in 0..2 {
+            session
+                .0
+                .receive(delivery(&session), Instant::now(), wall_ms())
+                .unwrap();
+        }
+        let controls = session.controls();
+        let snapshot = session.inbox_snapshot().unwrap();
+        assert_eq!(snapshot.project_floor, floor);
+        assert_eq!(snapshot.inbound, InboundPolicy::Hold);
+        assert_eq!(snapshot.inbound_override, Some(InboundPolicy::Hold));
+        assert_eq!(
+            session.set_inbound(InboundPolicy::Accept).unwrap_err(),
+            POLICY_FLOOR
+        );
+        let review = session
+            .review_held(&snapshot.messages[0].message_id)
+            .unwrap();
+        assert_eq!(review.summary.reason, HELD_BUDGET);
+        assert_eq!(review.summary.approval_blocker, None);
+        assert_eq!(
+            session
+                .decide_held(&review.token, PeerDecision::Approve)
+                .unwrap(),
+            PeerDecisionResult::Held {
+                reason: HELD_BUDGET.into()
+            }
+        );
+        assert_eq!(session.controls(), controls);
+        assert_eq!(session.inbox_snapshot().unwrap(), snapshot);
+        assert!(session.claim().is_none());
+        session.reset_budget();
+        assert_eq!(session.inbox_snapshot().unwrap().messages.len(), 1);
+        let claim = session.claim().unwrap();
+        assert_eq!(claim.messages().len(), 1);
+        assert_eq!(
+            claim.messages()[0].peer_event.as_ref().unwrap().message_id,
+            review.summary.message_id
+        );
+        claim.commit();
+        assert!(session.claim().is_none());
+    }
+
+    #[test_case(PeerDecision::Approve, true; "controls_before_approve")]
+    #[test_case(PeerDecision::Approve, false; "approve_before_controls")]
+    #[test_case(PeerDecision::Reject, true; "controls_before_reject")]
+    #[test_case(PeerDecision::Reject, false; "reject_before_controls")]
+    fn review_decisions_and_control_changes_are_serialized(
+        decision: PeerDecision,
+        controls_first: bool,
+    ) {
+        let (_directory, _host, session) = fixture(InboundPolicy::Hold);
+        let delivery = delivery(&session);
+        session
+            .0
+            .receive(delivery.clone(), Instant::now(), wall_ms())
+            .unwrap();
+        let review = session.review_held(&delivery.message_id).unwrap();
+        let (proceed_tx, proceed_rx) = flume::bounded(1);
+        let (changed_tx, changed_rx) = flume::bounded(1);
+        let other = session.clone();
+        let change = thread::spawn(move || {
+            proceed_rx.recv().unwrap();
+            other.set_inbound(InboundPolicy::Refuse).unwrap();
+            changed_tx.send(()).unwrap();
+        });
+        if controls_first {
+            proceed_tx.send(()).unwrap();
+            changed_rx.recv().unwrap();
+            assert_eq!(
+                session.decide_held(&review.token, decision).unwrap_err(),
+                STALE_REVIEW
+            );
+            assert_eq!(session.held_count(), 1);
+        } else {
+            let result = session
+                .decide_held(&review.token, decision.clone())
+                .unwrap();
+            assert_eq!(
+                result,
+                if decision == PeerDecision::Approve {
+                    PeerDecisionResult::Queued
+                } else {
+                    PeerDecisionResult::Rejected
+                }
+            );
+            proceed_tx.send(()).unwrap();
+            changed_rx.recv().unwrap();
+            assert_eq!(
+                session.held_count(),
+                usize::from(decision == PeerDecision::Approve)
+            );
+        }
+        change.join().unwrap();
+        assert!(session.claim().is_none());
     }
 
     #[test]

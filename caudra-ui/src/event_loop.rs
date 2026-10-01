@@ -1685,6 +1685,7 @@ impl<'t> EventLoop<'t> {
                 }) {
                     break Err(e.into());
                 }
+                self.sessions[self.focused].capture_peer_review();
             }
             let held = owed && !painted;
             if held {
@@ -3150,6 +3151,9 @@ impl<'t> EventLoop<'t> {
             // Reattaching a multiplexer to another terminal resizes the
             // viewport, and that terminal may not share the old background.
             Event::Resize(..) => {
+                for runtime in &mut self.sessions {
+                    runtime.app.peer_manager.invalidate_layout();
+                }
                 self.wake_appearance();
                 (None, None)
             }
@@ -3719,6 +3723,12 @@ impl<'t> EventLoop<'t> {
         match action {
             Action::ListPeers => self.list_peers(idx),
             Action::PeerMessages(args) => self.peer_messages(idx, &args),
+            Action::RefreshPeers => self.refresh_peers(idx),
+            Action::ReviewPeerMessage(id) => self.review_peer_message(idx, &id),
+            Action::DecidePeerMessage { token, decision } => {
+                self.decide_peer_message(idx, token, decision);
+            }
+            Action::SetPeerInbound(policy) => self.set_peer_inbound(idx, policy),
             Action::SendMessage(input) => {
                 let rt = &mut self.sessions[idx];
                 rt.reset_run_notifications();

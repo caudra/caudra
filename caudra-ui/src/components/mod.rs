@@ -30,6 +30,7 @@ pub(crate) mod mode_submission;
 pub(crate) mod model_picker;
 pub(crate) mod paste_editor;
 pub(crate) mod peer_card;
+pub(crate) mod peer_manager;
 pub(crate) mod permission_prompt;
 pub(crate) mod permission_scope;
 pub(crate) mod permissions_picker;
@@ -80,12 +81,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use caudra_agent::AgentInput;
+use caudra_agent::peers::{PeerDecision, PeerReviewToken};
 use caudra_agent::tools::{SHELL_TOOL_NAME, ToolEffect};
 use caudra_agent::worktree::Request as WorktreeRequest;
 use caudra_agent::{
     BufferSnapshot, CallStage, ImageSource, SubagentActivity, SubagentProgress, ToolInput,
     ToolOutput,
 };
+use caudra_config::InboundPolicy;
 use caudra_providers::model_registry::Binding;
 use caudra_providers::{CaudraId, HistoryItem, ModelPurpose, PeerMessageOrigin, TaskEventOrigin};
 use caudra_storage::sessions::SessionRelocation;
@@ -861,6 +864,13 @@ pub enum Action {
     RequestNewSession,
     ListPeers,
     PeerMessages(String),
+    RefreshPeers,
+    ReviewPeerMessage(String),
+    DecidePeerMessage {
+        token: PeerReviewToken,
+        decision: PeerDecision,
+    },
+    SetPeerInbound(InboundPolicy),
     NewSession(Arc<caudra_storage::sessions::SessionLease>),
     LoadSession(Box<LoadedSession>),
     ForkSession(Box<ForkedSession>),

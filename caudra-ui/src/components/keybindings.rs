@@ -377,6 +377,7 @@ pub enum KeybindContext {
     SessionPicker,
     SessionRelocation,
     WorktreePicker,
+    PeerManager,
     WorkflowInspector,
     WorkflowCatalogPicker,
     SandboxManager,
@@ -414,6 +415,7 @@ impl KeybindContext {
             Self::SessionPicker => "Session Picker",
             Self::SessionRelocation => "Session Relocation",
             Self::WorktreePicker => "Worktree Picker",
+            Self::PeerManager => "Peer Manager",
             Self::WorkflowInspector => "Workflow Inspector",
             Self::WorkflowCatalogPicker => "Workflow Catalog",
             Self::SandboxManager => "Sandbox Manager",
@@ -430,6 +432,7 @@ impl KeybindContext {
     /// that experiment is off.
     pub const fn feature(self) -> Option<Feature> {
         match self {
+            Self::PeerManager => Some(Feature::CrossSessionMessaging),
             Self::WorkflowInspector | Self::WorkflowCatalogPicker => Some(Feature::Workflows),
             Self::SandboxManager | Self::WorkbenchTransfer => Some(Feature::Sandboxes),
             _ => None,
@@ -449,6 +452,7 @@ impl KeybindContext {
             | Self::SessionPicker
             | Self::SessionRelocation
             | Self::WorktreePicker
+            | Self::PeerManager
             | Self::WorkflowInspector
             | Self::WorkflowCatalogPicker => Some(Self::Picker),
             Self::WorkbenchExplorer
@@ -1315,6 +1319,61 @@ pub const KEYBINDS: &[Keybind] = &[
         label: KeyLabel::Single(key::DELETE.label),
         description: "Delete stash entry (press twice)",
         context: KeybindContext::StashPicker,
+    },
+    Keybind {
+        label: KeyLabel::Multi(&["1", "2"]),
+        description: "Switch Sessions / Held messages outside filter editing",
+        context: KeybindContext::PeerManager,
+    },
+    Keybind {
+        label: KeyLabel::Single("/"),
+        description: "Edit the current view's filter; Enter keeps it, Esc clears it",
+        context: KeybindContext::PeerManager,
+    },
+    Keybind {
+        label: KeyLabel::Alt("Tab", SHIFT_TAB_LABEL),
+        description: "Switch list/detail focus",
+        context: KeybindContext::PeerManager,
+    },
+    Keybind {
+        label: KeyLabel::Single("Enter"),
+        description: "Open the selected message review or inspect a peer; never approve from the list",
+        context: KeybindContext::PeerManager,
+    },
+    Keybind {
+        label: KeyLabel::Single("Ctrl+R"),
+        description: "Refresh peer discovery without blocking the interface",
+        context: KeybindContext::PeerManager,
+    },
+    Keybind {
+        label: KeyLabel::Single("Ctrl+B"),
+        description: "Copy the exact peer target outside filter editing",
+        context: KeybindContext::PeerManager,
+    },
+    Keybind {
+        label: KeyLabel::Single("y"),
+        description: "Approve the current rendered message review once",
+        context: KeybindContext::PeerManager,
+    },
+    Keybind {
+        label: KeyLabel::Single("n"),
+        description: "Confirm rejection of the current reviewed message",
+        context: KeybindContext::PeerManager,
+    },
+    Keybind {
+        label: KeyLabel::Single("p"),
+        description: "Manage this session's inbound policy outside filter editing",
+        context: KeybindContext::PeerManager,
+    },
+    Keybind {
+        label: KeyLabel::Single("a"),
+        description: "Apply the selected policy, confirming any relaxation",
+        context: KeybindContext::PeerManager,
+    },
+    Keybind {
+        label: KeyLabel::Single("Esc"),
+        description: "Cancel confirmation or policy editing, return to the list, then close",
+        context: KeybindContext::PeerManager,
     },
     Keybind {
         label: KeyLabel::Single(workflow_inspector::PAUSE_LABEL),

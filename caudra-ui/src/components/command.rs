@@ -232,14 +232,14 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "/peers",
-        description: "List live local messaging peers (experimental)",
+        description: "Browse live local messaging peers (experimental)",
         max_args: 0,
         scope: ChatScope::MainOnly,
         features: &[Feature::CrossSessionMessaging],
     },
     BuiltinCommand {
         name: "/messages",
-        description: "Inspect held messages; approve/reject ID or set inbound POLICY",
+        description: "Review held peer messages and manage this session's inbound policy",
         max_args: usize::MAX,
         scope: ChatScope::MainOnly,
         features: &[Feature::CrossSessionMessaging],

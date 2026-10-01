@@ -615,6 +615,9 @@ impl App {
         if r.width > 0 {
             overlay_rect = r;
         }
+        if self.peer_manager.is_open() {
+            overlay_rect = self.peer_manager.view(frame, full);
+        }
         let r = self.paste_editor.view(frame, full);
         if r.width > 0 {
             overlay_rect = r;

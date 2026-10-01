@@ -1,26 +1,120 @@
 use std::collections::HashMap;
 
-use caudra_agent::{
-    PeerOutput,
-    peers::{HeldMessage, PeerDescriptor, PeerSession},
+use caudra_agent::peers::{
+    PeerDecision, PeerDecisionResult, PeerDescriptor, PeerReviewToken, PeerSession, PeerSummary,
 };
 use caudra_config::{Feature, InboundPolicy};
+use flume::{Receiver, TryRecvError};
+use smol::Task;
 
 use super::{EventLoop, SessionRuntime, SessionStatus, SpawnCtx};
 use crate::AppSession;
 use crate::app::App;
-use crate::components::{DisplayMessage, DisplayRole, ExitRequest, Status};
+use crate::components::{DisplayMessage, DisplayRole, ExitRequest, Status, peer_manager::PeerView};
 use crate::repaint::Dirty;
 
 const UNAVAILABLE: &str = "Cross-session messaging is unavailable for this runtime";
 const REVIEW_REQUIRED: &str =
-    "Message review expired or was not opened; run /messages and review the current message ID";
-const MESSAGES_HELP: &str = "Usage: /messages [help | approve ID | reject ID | inbound auto|accept|hold|refuse]\nRun /messages to inspect held content before approving or rejecting its ID. Approval accepts that message, not its requested tool actions. Accept can start billable model turns using this session's existing permissions. Hold requires review; refuse rejects arrivals. Project refusal cannot be overridden. Pending messages are live-only and expire when the runtime closes.";
+    "Message review expired or was not opened; run /messages and open that message's review";
+const MESSAGES_HELP: &str = "Usage: /messages [help | approve ID | reject ID | inbound auto|accept|hold|refuse]\nRun /messages to open the Held messages view. Enter opens one message's review before approval or rejection. Approval accepts that message, not its requested tool actions, and can start a billable model turn. Inbound policy applies to this session and cannot relax project restrictions. Pending messages are live-only and expire when the runtime closes.";
+const DISCOVERY_STOPPED: &str = "Peer discovery stopped before returning a result";
+const MODAL_BLOCKED: &str = "Finish the pending session review before opening the peer manager";
+const QUEUED: &str = "Message queued for the next safe boundary; an idle session may start after closing the manager";
+const REJECTED: &str = "Message rejected and removed from the live inbox";
+
+type DiscoveryResult = Result<Vec<PeerSummary>, String>;
 
 pub(super) struct PeerRegistration {
     session: PeerSession,
-    reviewed: HashMap<String, u64>,
+    reviewed: HashMap<String, PeerReviewToken>,
     held_count: usize,
+    discovery: Option<PeerDiscovery>,
+}
+
+struct PeerDiscovery {
+    generation: u64,
+    receiver: Receiver<DiscoveryResult>,
+    _task: Task<()>,
+}
+
+impl PeerRegistration {
+    fn new(session: PeerSession) -> Self {
+        Self {
+            session,
+            reviewed: HashMap::new(),
+            held_count: 0,
+            discovery: None,
+        }
+    }
+
+    fn discover(&mut self, generation: u64) -> bool {
+        if self
+            .discovery
+            .as_ref()
+            .is_some_and(|discovery| discovery.generation == generation)
+        {
+            return false;
+        }
+        let (sender, receiver) = flume::bounded(1);
+        let session = self.session.clone();
+        self.discovery = Some(PeerDiscovery {
+            generation,
+            receiver,
+            _task: smol::spawn(async move {
+                let result = session.list_named().await;
+                let _ = sender.try_send(result);
+            }),
+        });
+        true
+    }
+
+    fn sync_manager(&mut self, app: &mut App) -> Dirty {
+        let generation = app
+            .peer_manager
+            .is_open()
+            .then(|| app.peer_manager.generation());
+        let mut dirty = Dirty::NO;
+        if let Some(result) = poll_discovery(&mut self.discovery, generation) {
+            app.peer_manager.set_sessions(result);
+            dirty = Dirty::YES;
+        }
+        if generation.is_some() {
+            match self.session.inbox_snapshot() {
+                Ok(snapshot) => {
+                    self.reviewed.retain(|id, _| {
+                        snapshot
+                            .messages
+                            .iter()
+                            .any(|message| &message.message_id == id)
+                    });
+                    dirty |= Dirty::from(app.peer_manager.update_inbox(snapshot));
+                }
+                Err(error) => {
+                    app.peer_manager.set_error(error);
+                    dirty = Dirty::YES;
+                }
+            }
+        }
+        dirty
+    }
+}
+
+fn poll_discovery(
+    pending: &mut Option<PeerDiscovery>,
+    generation: Option<u64>,
+) -> Option<DiscoveryResult> {
+    let discovery = pending.as_ref()?;
+    if generation != Some(discovery.generation) {
+        *pending = None;
+        return None;
+    }
+    let result = match discovery.receiver.try_recv() {
+        Ok(result) => result,
+        Err(TryRecvError::Empty) => return None,
+        Err(TryRecvError::Disconnected) => Err(DISCOVERY_STOPPED.into()),
+    };
+    *pending = None;
+    Some(result)
 }
 
 impl Drop for PeerRegistration {
@@ -61,14 +155,28 @@ fn peer_blocked(app: &App) -> bool {
         || matches!(app.status, Status::Error { .. })
 }
 
-fn take_review(reviewed: &mut HashMap<String, u64>, held: &[HeldMessage], id: &str) -> bool {
-    reviewed.remove(id).is_some_and(|epoch| {
-        held.iter()
-            .any(|message| message.message_id == id && message.epoch == epoch)
-    })
+fn decision_notice(result: &PeerDecisionResult) -> String {
+    match result {
+        PeerDecisionResult::Queued => QUEUED.into(),
+        PeerDecisionResult::Held { reason } => {
+            format!(
+                "Approval recorded; message remains held: {}",
+                reason.escape_debug()
+            )
+        }
+        PeerDecisionResult::Rejected => REJECTED.into(),
+    }
 }
 
 impl SessionRuntime {
+    pub(super) fn capture_peer_review(&mut self) {
+        if let Some(peer) = &mut self.peer
+            && let Some((id, token)) = self.app.peer_manager.reviewed_message()
+        {
+            peer.reviewed.insert(id.to_owned(), token.clone());
+        }
+    }
+
     pub(super) fn display_status(&self) -> SessionStatus {
         if self.peer.as_ref().is_some_and(|peer| peer.held_count > 0) {
             SessionStatus::NeedsInput
@@ -110,11 +218,7 @@ impl SessionRuntime {
             self.app.state.session.meta.peer_controls.clone(),
         ) {
             Ok(session) => {
-                self.peer = Some(PeerRegistration {
-                    session,
-                    reviewed: HashMap::new(),
-                    held_count: 0,
-                });
+                self.peer = Some(PeerRegistration::new(session));
             }
             Err(error) => self.app.flash(format!("{UNAVAILABLE}: {error}")),
         }
@@ -141,6 +245,7 @@ impl SessionRuntime {
             self.app.checkpoint_now();
         }
         self.peer.take();
+        self.app.peer_manager.close();
     }
 
     fn sync_peer(&mut self, transition: bool) -> Dirty {
@@ -169,12 +274,14 @@ impl SessionRuntime {
             self.app.flash(format!("{UNAVAILABLE}: {error}"));
             return Dirty::YES;
         }
+        let dirty = peer.sync_manager(&mut self.app);
         let held_count = peer.session.held_count();
         if held_count == peer.held_count {
-            return Dirty::NO;
+            return dirty;
         }
+        let arrivals = held_count > peer.held_count;
         peer.held_count = held_count;
-        if held_count > 0 {
+        if arrivals && !self.app.peer_manager.is_open() {
             self.app.main_chat().push(DisplayMessage::new(
                 DisplayRole::Notice,
                 format!(
@@ -268,20 +375,106 @@ impl EventLoop<'_> {
     }
 
     pub(super) fn list_peers(&mut self, index: usize) {
+        self.open_peers(index, PeerView::Sessions);
+    }
+
+    fn open_peers(&mut self, index: usize, view: PeerView) {
         if !self.peer_command_ready(index) {
             return;
         }
         let runtime = &mut self.sessions[index];
-        let Some(peer) = &runtime.peer else { return };
-        match smol::block_on(peer.session.list_named()) {
-            Ok(peers) => {
-                let output = PeerOutput::Sessions { sessions: peers };
-                runtime.peer_notice(format!(
-                    "Live local peers (run /peers to refresh):\n{}",
-                    output.as_display_text(),
-                ));
+        if runtime.app.awaiting_input()
+            || runtime.app.lifecycle_blocker().is_some()
+            || runtime.app.holds_recovery_text()
+        {
+            runtime.app.flash(MODAL_BLOCKED.into());
+            return;
+        }
+        let discover = view == PeerView::Sessions;
+        runtime.app.open_peer_manager(view);
+        if let Some(peer) = &mut runtime.peer {
+            let _ = peer.sync_manager(&mut runtime.app);
+        }
+        if discover {
+            self.refresh_peers(index);
+        }
+    }
+
+    pub(super) fn refresh_peers(&mut self, index: usize) {
+        if !self.peer_command_ready(index) {
+            return;
+        }
+        let runtime = &mut self.sessions[index];
+        if !runtime.app.peer_manager.is_open() {
+            return;
+        }
+        if let Some(peer) = &mut runtime.peer
+            && peer.discover(runtime.app.peer_manager.generation())
+        {
+            runtime.app.peer_manager.start_discovery();
+        }
+    }
+
+    pub(super) fn review_peer_message(&mut self, index: usize, id: &str) {
+        if !self.peer_command_ready(index) {
+            return;
+        }
+        let runtime = &mut self.sessions[index];
+        if !runtime.app.peer_manager.is_open() {
+            return;
+        }
+        if let Some(peer) = &runtime.peer {
+            runtime
+                .app
+                .peer_manager
+                .set_review(peer.session.review_held(id));
+        }
+    }
+
+    pub(super) fn decide_peer_message(
+        &mut self,
+        index: usize,
+        token: PeerReviewToken,
+        decision: PeerDecision,
+    ) {
+        if !self.peer_command_ready(index) {
+            return;
+        }
+        let runtime = &mut self.sessions[index];
+        if let Some(peer) = &mut runtime.peer {
+            peer.reviewed.retain(|_, reviewed| reviewed != &token);
+            let result = peer.session.decide_held(&token, decision);
+            if runtime.app.peer_manager.is_open() {
+                runtime.app.peer_manager.finish_decision(result);
+                let _ = peer.sync_manager(&mut runtime.app);
+            } else {
+                runtime.app.flash(match result {
+                    Ok(result) => decision_notice(&result),
+                    Err(error) => error,
+                });
             }
-            Err(error) => runtime.app.flash(format!("Peer discovery failed: {error}")),
+        }
+    }
+
+    pub(super) fn set_peer_inbound(&mut self, index: usize, policy: InboundPolicy) {
+        if !self.peer_command_ready(index) {
+            return;
+        }
+        let runtime = &mut self.sessions[index];
+        if let Some(peer) = &mut runtime.peer {
+            let result = peer.session.set_inbound(policy.clone());
+            if result.is_ok() {
+                peer.reviewed.clear();
+            }
+            if runtime.app.peer_manager.is_open() {
+                runtime.app.peer_manager.finish_policy(result);
+                let _ = peer.sync_manager(&mut runtime.app);
+            } else {
+                runtime.app.flash(match result {
+                    Ok(()) => format!("Inbound peer policy for this session: {policy:?}"),
+                    Err(error) => error,
+                });
+            }
         }
     }
 
@@ -296,49 +489,24 @@ impl EventLoop<'_> {
         if !self.peer_command_ready(index) {
             return;
         }
-        let runtime = &mut self.sessions[index];
-        let Some(peer) = &mut runtime.peer else {
-            return;
-        };
         let args: Vec<_> = args.split_whitespace().collect();
         match args.as_slice() {
-            [] => {
-                let held = peer.session.held();
-                peer.reviewed = held
-                    .iter()
-                    .map(|message| (message.message_id.clone(), message.epoch))
-                    .collect();
-                let mut text = format!(
-                    "Peer messages · inbound {:?}\n{MESSAGES_HELP}\n",
-                    peer.session.descriptor().inbound
-                );
-                if held.is_empty() {
-                    text.push_str("\nNo held messages.");
-                }
-                for message in held {
-                    text.push_str(&format!(
-                        "\nID: {:?}\nFrom: {:?}\nHeld: {:?}\nText: {:?}\n",
-                        message.message_id, message.sender_name, message.reason, message.text
-                    ));
-                }
-                runtime.peer_notice(text);
-            }
+            [] => self.open_peers(index, PeerView::Held),
             [action @ ("approve" | "reject"), id] => {
-                if !take_review(&mut peer.reviewed, &peer.session.held(), id) {
-                    runtime.app.flash(REVIEW_REQUIRED.into());
+                let Some(token) = self.sessions[index]
+                    .peer
+                    .as_mut()
+                    .and_then(|peer| peer.reviewed.remove(*id))
+                else {
+                    self.sessions[index].app.flash(REVIEW_REQUIRED.into());
                     return;
-                }
-                let result = if *action == "approve" {
-                    peer.session.approve(id)
-                } else {
-                    peer.session.reject(id)
                 };
-                match result {
-                    Ok(()) => runtime
-                        .app
-                        .flash(format!("Peer message {id}: {action} accepted")),
-                    Err(error) => runtime.app.flash(error),
-                }
+                let decision = if *action == "approve" {
+                    PeerDecision::Approve
+                } else {
+                    PeerDecision::Reject
+                };
+                self.decide_peer_message(index, token, decision);
             }
             ["inbound", policy] => {
                 let policy = match *policy {
@@ -347,44 +515,50 @@ impl EventLoop<'_> {
                     "hold" => InboundPolicy::Hold,
                     "refuse" => InboundPolicy::Refuse,
                     _ => {
-                        runtime.app.flash(MESSAGES_HELP.into());
+                        self.sessions[index].app.flash(MESSAGES_HELP.into());
                         return;
                     }
                 };
-                match peer.session.set_inbound(policy.clone()) {
-                    Ok(()) => {
-                        peer.reviewed.clear();
-                        runtime.peer_notice(format!(
-                            "Inbound peer policy: {policy:?}\n{MESSAGES_HELP}"
-                        ));
-                    }
-                    Err(error) => runtime.app.flash(error),
-                }
+                self.set_peer_inbound(index, policy);
             }
-            _ => runtime.app.flash(MESSAGES_HELP.into()),
+            _ => self.sessions[index].app.flash(MESSAGES_HELP.into()),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::future::pending;
 
-    use caudra_agent::peers::HeldMessage;
+    use caudra_agent::peers::PeerDecisionResult;
     use caudra_config::{Feature, FeatureFlags, sandbox::SandboxName};
+    use flume::Sender;
     use test_case::test_case;
 
-    use super::{peer_blocked, peer_eligible, take_review};
+    use super::{
+        DISCOVERY_STOPPED, DiscoveryResult, PeerDiscovery, QUEUED, REJECTED, decision_notice,
+        peer_blocked, peer_eligible, poll_discovery,
+    };
     use crate::app::{App, tests::test_app};
     use crate::components::{ExitRequest, Status};
 
-    const MESSAGE_ID: &str = "reviewed-message";
-    const OTHER_ID: &str = "another-message";
-    const SENDER: &str = "reviewer";
-    const BODY: &str = "The validation failed.";
-    const HELD: &str = "Explicit hold policy";
     const ERROR: &str = "The model request failed";
-    const REVIEW_EPOCH: u64 = 7;
+    const GENERATION: u64 = 7;
+    const HELD_REASON: &str = "Automatic delivery budget exhausted";
+    const HELD_NOTICE: &str =
+        "Approval recorded; message remains held: Automatic delivery budget exhausted";
+
+    fn discovery() -> (Sender<DiscoveryResult>, Option<PeerDiscovery>) {
+        let (sender, receiver) = flume::bounded(1);
+        (
+            sender,
+            Some(PeerDiscovery {
+                generation: GENERATION,
+                receiver,
+                _task: smol::spawn(pending()),
+            }),
+        )
+    }
 
     #[test_case(false, false, false; "disabled_local")]
     #[test_case(false, true, false; "disabled_sandbox")]
@@ -416,30 +590,41 @@ mod tests {
         assert!(peer_blocked(&app));
     }
 
-    #[test_case(MESSAGE_ID, REVIEW_EPOCH, true; "current_review")]
-    #[test_case(MESSAGE_ID, REVIEW_EPOCH + 1, false; "control_epoch_changed")]
-    #[test_case(OTHER_ID, REVIEW_EPOCH, false; "different_message")]
-    fn held_decision_is_bound_to_inspected_id_and_epoch(id: &str, epoch: u64, expected: bool) {
-        let mut reviewed = HashMap::from([(MESSAGE_ID.into(), REVIEW_EPOCH)]);
-        let held = vec![HeldMessage {
-            message_id: id.into(),
-            sender_name: SENDER.into(),
-            text: BODY.into(),
-            reason: HELD.into(),
-            epoch,
-        }];
-        assert_eq!(take_review(&mut reviewed, &held, MESSAGE_ID), expected);
-        assert!(!take_review(&mut reviewed, &held, MESSAGE_ID));
+    #[test_case(Some(GENERATION), true; "current_opening")]
+    #[test_case(Some(GENERATION + 1), false; "reopened_modal")]
+    #[test_case(None, false; "closed_modal")]
+    fn discovery_results_belong_to_one_opening(generation: Option<u64>, accepted: bool) {
+        let (sender, mut discovery) = discovery();
+        sender.send(Ok(Vec::new())).unwrap();
+        let result = poll_discovery(&mut discovery, generation);
+        assert_eq!(result.is_some(), accepted);
+        assert!(discovery.is_none());
+        assert!(poll_discovery(&mut discovery, generation).is_none());
     }
 
-    #[test_case(true; "registration_replaced")]
-    #[test_case(false; "message_no_longer_held")]
-    fn stale_held_review_cannot_approve_or_reject(replaced: bool) {
-        let mut reviewed = if replaced {
-            HashMap::new()
+    #[test_case(false; "pending")]
+    #[test_case(true; "worker_disconnected")]
+    fn pending_discovery_is_nonblocking_and_reports_worker_loss(disconnect: bool) {
+        let (sender, mut discovery) = discovery();
+        let sender = (!disconnect).then_some(sender);
+        let result = poll_discovery(&mut discovery, Some(GENERATION));
+        if disconnect {
+            assert_eq!(result.unwrap().unwrap_err(), DISCOVERY_STOPPED);
+            assert!(discovery.is_none());
         } else {
-            HashMap::from([(MESSAGE_ID.into(), REVIEW_EPOCH)])
-        };
-        assert!(!take_review(&mut reviewed, &[], MESSAGE_ID));
+            assert!(result.is_none());
+            assert!(discovery.is_some());
+        }
+        drop(sender);
+    }
+
+    #[test_case(PeerDecisionResult::Queued, QUEUED; "queued_not_delivered")]
+    #[test_case(PeerDecisionResult::Rejected, REJECTED; "rejected")]
+    #[test_case(PeerDecisionResult::Held { reason: HELD_REASON.into() }, HELD_NOTICE; "approved_but_budget_held")]
+    fn decision_feedback_reports_the_actual_disposition(
+        result: PeerDecisionResult,
+        expected: &str,
+    ) {
+        assert_eq!(decision_notice(&result), expected);
     }
 }
