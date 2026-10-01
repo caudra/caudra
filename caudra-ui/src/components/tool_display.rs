@@ -30,10 +30,14 @@ use jiff::tz::TimeZone;
 use caudra_markdown::render::truncate_long_lines;
 
 use crate::markdown::{LinkMap, expand_notice, should_truncate, text_to_painted};
+use caudra_agent::tools::native::peers::{
+    LIST_NAME as LIST_SESSIONS_TOOL_NAME, SEND_NAME as SEND_MESSAGE_TOOL_NAME,
+};
 use caudra_agent::{
     ActivityChild, BatchToolStatus, BufferSnapshot, CallStage, IndexOutput, InstructionBlock,
-    NO_FILES_FOUND, ShellOutput, SnapshotSpan, SpanStyle, SubagentActivity, SubagentProgress,
-    TaskCard, ToolInput, ToolOutput, format_live_duration, format_settled_duration,
+    NO_FILES_FOUND, PeerOutput, ShellOutput, SnapshotSpan, SpanStyle, SubagentActivity,
+    SubagentProgress, TaskCard, ToolInput, ToolOutput, format_live_duration,
+    format_settled_duration,
     tools::{
         FILE_READ_TOOL_NAME, FILE_WRITE_TOOL_NAME, IMAGE_GENERATE_TOOL_NAME,
         LOCAL_DOCUMENT_WRITE_TOOL_NAME, MEMORY_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME,
@@ -487,6 +491,7 @@ const IMPACT: Inflection = ("Impact", "Assessing", "Assessed");
 const EXPAND: Inflection = ("Expand", "Expanding", "Expanded");
 const MEMORY: Inflection = ("Memory", "Memory", "Memory");
 const SESSIONS: Inflection = ("Sessions", "Sessions", "Sessions");
+const PEERS: Inflection = ("Peers", "Peers", "Peers");
 
 /// The verbs a store's header opens with. A tool reached by sub-command is the
 /// one case where the label cannot carry the tense, because the verb is an
@@ -541,6 +546,8 @@ const COMPACT_TOOLS: &[(&str, CompactTool)] = &[
     // because the header spells the verb in a tense the argument never had.
     tool_row("memory", '▤', MEMORY, &["content", "command", "path"]),
     tool_row("sessions", '▤', SESSIONS, &[]),
+    tool_row(LIST_SESSIONS_TOOL_NAME, '⇄', PEERS, &[]),
+    tool_row(SEND_MESSAGE_TOOL_NAME, '⇄', PEERS, &["text"]),
     tool_row("local_document_read", '→', READ, DOCUMENT_KEYS),
     tool_row("local_document_write", '←', WRITE, DOCUMENT_WRITE_KEYS),
     tool_row("local_document_apply_patch", '±', PATCH, DOCUMENT_KEYS),
@@ -988,6 +995,9 @@ pub(super) fn header_spans(
     base: Style,
     raw_input: Option<&serde_json::Value>,
 ) -> Vec<Span<'static>> {
+    if names_tool(SEND_MESSAGE_TOOL_NAME, tool) || names_tool(LIST_SESSIONS_TOOL_NAME, tool) {
+        return vec![Span::styled(escape_terminal_controls(header), base)];
+    }
     let query = query_key(tool)
         .and_then(|key| raw_input?.get(key)?.as_str())
         .filter(|query| !query.is_empty() && header.starts_with(query));
@@ -1075,7 +1085,14 @@ fn compact_args(
     }) {
         let scalar = match value {
             serde_json::Value::String(text) if header.contains(text.as_str()) => continue,
-            serde_json::Value::String(text) => one_line(text),
+            serde_json::Value::String(text) => {
+                let text = one_line(text);
+                if tool == Some(SEND_MESSAGE_TOOL_NAME) {
+                    escape_terminal_controls(&text)
+                } else {
+                    text
+                }
+            }
             serde_json::Value::Number(number) => duration_millis(tool, key, number).map_or_else(
                 || number.to_string(),
                 |millis| humanize_duration(Duration::from_millis(millis)),
@@ -1480,6 +1497,13 @@ impl Indicator {
             return Self::InProgress;
         }
         match (Self::from(status), output) {
+            (Self::Success, Some(ToolOutput::Peers(PeerOutput::Sent { receipt, .. }))) => {
+                match receipt.status.as_str() {
+                    "queued" => Self::Success,
+                    "refused" | "unavailable" => Self::Error,
+                    _ => Self::Warning,
+                }
+            }
             (Self::Success, Some(output)) if found_nothing(output) => Self::Warning,
             (indicator, _) => indicator,
         }
@@ -1602,25 +1626,28 @@ fn resolve_output<'a>(
     // that means to show more than the budget has to read the output itself.
     // A window means exactly that: it is free to sit anywhere in the body.
     let whole = expanded || limits.scroll.is_some();
-    let (raw_text, dropped): (Option<Cow<'a, str>>, usize) = if whole {
-        match &full_text {
-            Some(t) => (Some(t.clone()), 0),
-            None if output.is_some() => (None, 0),
-            None => match live_output {
-                Some(live) => (Some(Cow::Borrowed(live)), 0),
-                None => match body {
-                    Some(b) => (Some(Cow::Borrowed(b)), pre_truncated),
-                    None => (None, 0),
+    let (raw_text, dropped): (Option<Cow<'a, str>>, usize) =
+        if matches!(output, Some(ToolOutput::Peers(_))) {
+            (None, 0)
+        } else if whole {
+            match &full_text {
+                Some(t) => (Some(t.clone()), 0),
+                None if output.is_some() => (None, 0),
+                None => match live_output {
+                    Some(live) => (Some(Cow::Borrowed(live)), 0),
+                    None => match body {
+                        Some(b) => (Some(Cow::Borrowed(b)), pre_truncated),
+                        None => (None, 0),
+                    },
                 },
-            },
-        }
-    } else {
-        match (body, &full_text) {
-            (Some(b), _) => (Some(Cow::Borrowed(b)), pre_truncated),
-            (None, Some(t)) => (Some(t.clone()), 0),
-            (None, None) => (None, 0),
-        }
-    };
+            }
+        } else {
+            match (body, &full_text) {
+                (Some(b), _) => (Some(Cow::Borrowed(b)), pre_truncated),
+                (None, Some(t)) => (Some(t.clone()), 0),
+                (None, None) => (None, 0),
+            }
+        };
 
     // A window is the reader's own position in the body, so it outranks both
     // the budget and the expansion a click would otherwise have granted.
@@ -2572,7 +2599,11 @@ fn header_annotation(msg: &DisplayMessage) -> Option<String> {
         .progress
         .as_ref()
         .map(|progress| SubagentProgress::tally(progress.report.tools, progress.elapsed()));
-    match (tally, msg.annotation.clone()) {
+    let own = match msg.tool_output.as_deref() {
+        Some(ToolOutput::Peers(output)) => Some(output.annotation()),
+        _ => msg.annotation.clone(),
+    };
+    match (tally, own) {
         (Some(tally), Some(spend)) => Some(format!("{tally}{ACTIVITY_SEPARATOR}{spend}")),
         (Some(only), None) | (None, Some(only)) => Some(only),
         (None, None) => None,
@@ -3097,6 +3128,7 @@ mod tests {
     use crate::markdown::{TRUNCATION_PREFIX, truncate_output};
     use crate::provenance::Provenance;
     use crate::selection::ScreenSelection;
+    use caudra_agent::peers::SendReceipt;
     use caudra_agent::tools::{
         BATCH_TOOL_NAME, FILE_GREP_TOOL_NAME, FILE_READ_TOOL_NAME, SHELL_TOOL_NAME,
         SKILL_TOOL_NAME, TASK_TOOL_NAME, ToolEffect,
@@ -3817,6 +3849,116 @@ mod tests {
     }
 
     const NOTE_ONCE_MSG: &str = "a note is drawn from its structure, and only from it";
+
+    const PEER_TARGET: &str = "calm-blue-wren";
+    const PEER_MESSAGE: &str = "kind-amber-fox";
+    const PEER_REASON: &str = "Peer approval is required.";
+    const PEER_RAW: &str = "{\"status\":\"held\",\"session_id\":\"private-session-id\"}";
+    const PEER_STALE_ANNOTATION: &str = "1 lines";
+
+    fn peer_output(status: &str) -> ToolOutput {
+        ToolOutput::Peers(PeerOutput::Sent {
+            target: PEER_TARGET.into(),
+            receipt: SendReceipt {
+                status: status.into(),
+                message_id: PEER_MESSAGE.into(),
+                reason: Some(PEER_REASON.into()),
+            },
+        })
+    }
+
+    #[test_case(false, false; "resting")]
+    #[test_case(false, true; "expanded")]
+    #[test_case(true, false; "compact")]
+    fn peer_cards_ignore_stale_json_bodies_and_line_count_annotations(compact: bool, full: bool) {
+        let output = peer_output("held");
+        let mut msg = bash_msg(
+            &format!("send\n{PEER_RAW}"),
+            ToolStatus::Success,
+            None,
+            Some(output),
+        );
+        if let DisplayRole::Tool(role) = &mut msg.role {
+            role.name = SEND_MESSAGE_TOOL_NAME.into();
+        }
+        msg.annotation = Some(PEER_STALE_ANNOTATION.into());
+        let context = RenderCtx {
+            compact,
+            ..test_rctx(UNBROKEN)
+        };
+        let lines = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &context,
+            (!compact).then(|| exp(full)),
+        );
+        let drawn = lines_text(&lines);
+        assert!(!drawn.contains(PEER_STALE_ANNOTATION));
+        assert!(!drawn.contains(PEER_RAW));
+        assert!(!lines.search_text.contains(PEER_RAW));
+        assert!(drawn.contains("held for review"), "{drawn}");
+        if compact {
+            assert_eq!(lines.lines.len(), 1);
+            assert!(lines.truncation);
+        } else {
+            for expected in [PEER_TARGET, PEER_MESSAGE, PEER_REASON] {
+                assert!(drawn.contains(expected), "{drawn}");
+                assert!(lines.search_text.contains(expected));
+            }
+            assert_eq!(drawn.matches(PEER_REASON).count(), 1);
+        }
+    }
+
+    #[test_case("queued"; "accepted")]
+    #[test_case("held"; "held")]
+    #[test_case("refused"; "refused")]
+    #[test_case("rate_limited"; "rate_limited")]
+    #[test_case("unknown"; "unknown")]
+    #[test_case("unavailable"; "unavailable")]
+    #[test_case("unexpected"; "unrecognized")]
+    fn peer_header_outcomes_are_not_generic_tool_success(status: &str) {
+        let output = peer_output(status);
+        let expected = match status {
+            "queued" => theme::current().tool_success,
+            "refused" | "unavailable" => theme::current().tool_error,
+            _ => theme::current().tool_warning,
+        };
+        assert_eq!(
+            finished_style(Indicator::resolve(ToolStatus::Success, Some(&output))),
+            expected
+        );
+        assert_eq!(
+            batch_sigil_style(BatchToolStatus::Success, Some(&output)),
+            expected
+        );
+    }
+
+    #[test]
+    fn peer_headers_escape_controls_and_omit_message_payloads() {
+        const HEADER: &str = "send calm\x1b[31m-blue-wren";
+        const PAYLOAD: &str = "private body\x07";
+        let raw = serde_json::json!({"target": PEER_TARGET, "text": PAYLOAD});
+        let spans = header_spans(
+            SEND_MESSAGE_TOOL_NAME,
+            HEADER,
+            theme::current().tool,
+            Some(&raw),
+        );
+        assert!(
+            spans
+                .iter()
+                .all(|span| !span.content.chars().any(char::is_control))
+        );
+        assert_eq!(
+            compact_args_for(
+                SEND_MESSAGE_TOOL_NAME,
+                HEADER,
+                Some(&raw),
+                Some(&peer_output("held"))
+            ),
+            Some(format!(" [target={PEER_TARGET}]"))
+        );
+    }
 
     /// A browse used to settle as `ToolOutput::Markdown`, which put its text
     /// into the card's own `msg.text` as well. Drawing the structure while
@@ -6905,7 +7047,7 @@ mod tests {
     /// five verbs, the stores are one store with two, and read, write and patch
     /// each keep the cold members whose operation really is the same. Patching
     /// a document is patching a file that happens to live in a remote store.
-    const SHARED_SIGILS: &[char] = &['◇', '▤', '→', '←', '±'];
+    const SHARED_SIGILS: &[char] = &['◇', '▤', '→', '←', '±', '⇄'];
 
     #[test]
     fn every_sigil_occupies_one_cell() {

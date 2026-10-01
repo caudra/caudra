@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
-use caudra_agent::peers::{HeldMessage, PeerDescriptor, PeerSession};
+use caudra_agent::{
+    PeerOutput,
+    peers::{HeldMessage, PeerDescriptor, PeerSession},
+};
 use caudra_config::{Feature, InboundPolicy};
 
 use super::{EventLoop, SessionRuntime, SessionStatus, SpawnCtx};
@@ -270,28 +273,13 @@ impl EventLoop<'_> {
         }
         let runtime = &mut self.sessions[index];
         let Some(peer) = &runtime.peer else { return };
-        match smol::block_on(peer.session.list()) {
+        match smol::block_on(peer.session.list_named()) {
             Ok(peers) => {
-                let mut text = String::from("Live local peers (run /peers to refresh):\n");
-                if peers.is_empty() {
-                    text.push_str(
-                        "No reachable peers. Both processes must enable cross-session messaging.",
-                    );
-                }
-                for peer in peers {
-                    let state = if peer.blocked {
-                        "blocked"
-                    } else if peer.busy {
-                        "busy"
-                    } else {
-                        "idle"
-                    };
-                    text.push_str(&format!(
-                        "\n{:?} · {state} · inbound {:?}\nSession: {}\nWorkspace: {:?}\nTarget: {:?}\n",
-                        peer.name, peer.inbound, peer.session_id, peer.cwd, peer.target,
-                    ));
-                }
-                runtime.peer_notice(text);
+                let output = PeerOutput::Sessions { sessions: peers };
+                runtime.peer_notice(format!(
+                    "Live local peers (run /peers to refresh):\n{}",
+                    output.as_display_text(),
+                ));
             }
             Err(error) => runtime.app.flash(format!("Peer discovery failed: {error}")),
         }

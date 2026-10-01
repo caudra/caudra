@@ -21,7 +21,8 @@ use super::tool_display::{
     report_message, scroll_footer_text, title,
 };
 use super::{
-    ToolProgress, environment_card, is_collapsible, memory_card, task_card, workflow_card,
+    ToolProgress, environment_card, is_collapsible, memory_card, peer_card, task_card,
+    workflow_card,
 };
 use caudra_agent::tools::{
     PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME, timeout_annotation,
@@ -1330,7 +1331,11 @@ fn holds_a_body(entry: &BatchToolEntry) -> bool {
 /// node it would be a branch of the tree holding nothing but a clock, with the
 /// child's own body drawn to the left of it.
 fn child_annotation(entry: &BatchToolEntry, progress: Option<&ToolProgress>) -> Option<String> {
-    let own = entry.annotation.clone().or_else(|| match entry.status {
+    let own = match entry.output.as_ref() {
+        Some(ToolOutput::Peers(output)) => Some(output.annotation()),
+        _ => entry.annotation.clone(),
+    }
+    .or_else(|| match entry.status {
         BatchToolStatus::Pending => Some(QUEUED_ANNOTATION.to_owned()),
         BatchToolStatus::Success => entry.output.as_ref().and_then(ToolOutput::annotation),
         BatchToolStatus::Drafting
@@ -1422,7 +1427,7 @@ fn child_body(
     // itself, which is why structured output is the exception here rather than
     // a case alongside the others.
     let text = if entry.status == BatchToolStatus::Error
-        && !matches!(output, Some(ToolOutput::Tasks(_)))
+        && !matches!(output, Some(ToolOutput::Tasks(_) | ToolOutput::Peers(_)))
     {
         Some(plain_body(
             &output.map_or(String::new(), ToolOutput::as_text),
@@ -3497,6 +3502,9 @@ pub fn render_tool_content(
                 memory_card::render(output, limits.bounded_budget(), limits.width);
             output_rows = rows;
             (card_lines, truncated)
+        }
+        Some(ToolOutput::Peers(output)) => {
+            peer_card::render(output, limits.bounded_budget(), limits.width)
         }
         Some(ToolOutput::Skill(skill)) => {
             let body = skill_body(skill, &limits);

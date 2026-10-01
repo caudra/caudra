@@ -1381,13 +1381,15 @@ fn build_tool_results_map(items: &[HistoryItem]) -> HashMap<&str, ToolResultRef<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use caudra_agent::peers::{PeerSummary, SendReceipt};
+    use caudra_agent::tools::native::peers::{LIST_NAME, SEND_NAME};
     use caudra_agent::tools::{BATCH_TOOL_NAME, SHELL_TOOL_NAME, TOOL_OUTPUT_TOOL_NAME};
     use caudra_agent::{
         AgentEvent, BatchToolEntry, BatchToolStatus, IndexLine, IndexLineSemantic, IndexOutput,
-        IndexSourceRange, SharedBuf, TextOutput, ToolDoneEvent, ToolOutput, ToolStartEvent,
-        TurnCompleteEvent,
+        IndexSourceRange, PeerOutput, SharedBuf, TextOutput, ToolDoneEvent, ToolOutput,
+        ToolStartEvent, TurnCompleteEvent,
     };
-    use caudra_config::UiConfig;
+    use caudra_config::{InboundPolicy, UiConfig};
     use caudra_providers::{
         Billing, ContentBlock, Message, PeerMessageOrigin, Role, StandingReminderKind,
         TaskEventOrigin, estimate_tokens_cached, project_messages, token_label,
@@ -1481,6 +1483,10 @@ mod tests {
     const MENTION_BODY: &str = "<file path=\"a.rs\">fn main() {}</file>";
     const INDEX_SKELETON: &str = "fns:\n  pub run() [2]";
     const INDEX_ANNOTATION: &str = "2 lines";
+    const PEER_TARGET: &str = "calm-blue-wren";
+    const PEER_MESSAGE: &str = "kind-amber-fox";
+    const PEER_REASON: &str = "Needs local review.";
+    const PEER_MODEL_JSON: &str = "{\"session_id\":\"private-session-id\"}";
     const SESSION_CWD: &str = "/project";
     const TASK_OBSERVATION: &str = "neat-wanted-cowbird completed: All checks passed.";
     const PRIVATE_INVOCATION: &str = "private-invocation";
@@ -1873,6 +1879,70 @@ mod tests {
             Some(ToolOutput::Index(_))
         ));
         assert_eq!(display[0].annotation.as_deref(), Some(INDEX_ANNOTATION));
+    }
+
+    #[test_case(false; "discovery")]
+    #[test_case(true; "receipt")]
+    fn restored_peers_keep_typed_cards_and_display_text_without_lua(sent: bool) {
+        let peer = if sent {
+            PeerOutput::Sent {
+                target: PEER_TARGET.into(),
+                receipt: SendReceipt {
+                    status: "held".into(),
+                    message_id: PEER_MESSAGE.into(),
+                    reason: Some(PEER_REASON.into()),
+                },
+            }
+        } else {
+            PeerOutput::Sessions {
+                sessions: vec![PeerSummary {
+                    target: PEER_TARGET.into(),
+                    name: MAIN_NAME.into(),
+                    cwd: SESSION_CWD.into(),
+                    busy: false,
+                    blocked: false,
+                    inbound: InboundPolicy::Hold,
+                }],
+            }
+        };
+        let annotation = peer.annotation();
+        let serialized = serde_json::to_string(&ToolOutput::Peers(peer)).unwrap();
+        let restored: ToolOutput = serde_json::from_str(&serialized).unwrap();
+        let outputs = HashMap::from([("t1".into(), Arc::new(restored))]);
+        let (tool, input) = if sent {
+            (
+                SEND_NAME,
+                serde_json::json!({"target": PEER_TARGET, "text": PEER_REASON}),
+            )
+        } else {
+            (LIST_NAME, serde_json::json!({}))
+        };
+        let messages = tool_use_pair(tool, input, PEER_MODEL_JSON, false);
+        let (display, restores) = display_messages(&messages, &outputs);
+        assert!(restores.is_empty());
+        assert!(matches!(
+            display[0].tool_output.as_deref(),
+            Some(ToolOutput::Peers(_))
+        ));
+        assert_eq!(display[0].annotation.as_deref(), Some(annotation.as_str()));
+        assert!(!display[0].text.contains(PEER_MODEL_JSON));
+        assert!(restore_item_for(&display[0], ToolOutputLines::DEFAULT, 0).is_none());
+        let copied = display[0]
+            .tool_output
+            .as_deref()
+            .unwrap()
+            .structured_display_text()
+            .unwrap();
+        assert!(copied.contains(PEER_TARGET));
+        assert!(!copied.contains(PEER_MODEL_JSON));
+        assert!(!copied.contains("session_id"));
+        if sent {
+            assert!(copied.contains(PEER_MESSAGE));
+            assert!(copied.contains(PEER_REASON));
+        } else {
+            assert!(copied.contains(SESSION_CWD));
+            assert!(copied.contains(MAIN_NAME));
+        }
     }
 
     #[test]

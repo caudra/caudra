@@ -479,7 +479,7 @@ pub(super) async fn send(session: &PeerSession, delivery: Delivery, epoch: u64) 
     };
     let request = Request::Send {
         version: PROTOCOL_VERSION,
-        delivery,
+        delivery: Box::new(delivery),
     };
     if !serde_json::to_vec(&request).is_ok_and(|bytes| bytes.len() <= MAX_FRAME_BYTES) {
         return SendReceipt::new(
@@ -631,7 +631,9 @@ mod tests {
         Request, Response, UNSAFE_ENTRY, check_peer_uid, discover, read_frame, write_frame,
     };
     use crate::AgentMode;
-    use crate::peers::{PeerDescriptor, PeerHost, Route, tests::directory, token};
+    use crate::peers::{
+        MESSAGE_WORDS, PeerDescriptor, PeerHost, Route, lock, tests::directory, token, valid_name,
+    };
 
     const UNKNOWN: &str = "unknown";
     const REFUSED: &str = "refused";
@@ -766,7 +768,7 @@ mod tests {
     }
 
     #[test]
-    fn lost_response_is_unknown_and_retries_retain_identity() {
+    fn lost_response_is_unknown_and_named_retries_retain_identity() {
         smol::block_on(async {
             let directory = directory();
             let host =
@@ -791,9 +793,9 @@ mod tests {
                 session: CaudraId::generate(),
                 generation: token().unwrap(),
             };
-            let target = route.target();
+            let target = lock(&sender.0.state).peer_name(&route.target()).unwrap();
             let (receipt, first_id) =
-                future::zip(sender.send(&target, "text", None, "request"), async {
+                future::zip(sender.send_named(&target, "text", None, "request"), async {
                     let (mut stream, _) = listener.accept().await.unwrap();
                     match read_frame::<Request>(&mut stream).await.unwrap() {
                         Request::Send { delivery, .. } => delivery.message_id,
@@ -802,8 +804,9 @@ mod tests {
                 })
                 .await;
             assert_eq!(receipt.unwrap().status, UNKNOWN);
+            assert!(valid_name(&first_id, MESSAGE_WORDS));
             let (receipt, retry_id) =
-                future::zip(sender.send(&target, "text", None, "request"), async {
+                future::zip(sender.send_named(&target, "text", None, "request"), async {
                     let (mut stream, _) = listener.accept().await.unwrap();
                     match read_frame::<Request>(&mut stream).await.unwrap() {
                         Request::Send { delivery, .. } => delivery.message_id,
@@ -816,7 +819,7 @@ mod tests {
             let oversized = "\0".repeat(crate::peers::MAX_BODY_BYTES);
             assert_eq!(
                 sender
-                    .send(&target, &oversized, None, "oversized")
+                    .send_named(&target, &oversized, None, "oversized")
                     .await
                     .unwrap()
                     .status,

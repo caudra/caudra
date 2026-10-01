@@ -25,6 +25,7 @@ use serde_json::{Value, json};
 use strum::Display;
 
 use crate::agent::{GoalResult, GoalVerdict};
+use crate::peers::{PeerSummary, SendReceipt};
 use crate::permissions::PermissionRequest;
 use crate::tools::{TOOL_OUTPUT_TOOL_NAME, ToolEffect, ToolFailure};
 
@@ -68,6 +69,10 @@ const MEMORY_NOTE_NOUN: &str = "note";
 const MEMORY_TAG_NOUN: &str = "tag";
 const LINE_NOUN: &str = "line";
 const TOOL_OUTPUT_LOADED: &str = "loaded";
+const PEER_SESSION_NOUN: &str = "session";
+const PEER_SESSIONS_EMPTY: &str = "No other live local sessions.";
+const PEER_RECEIPT_ACCEPTED: &str = "Acceptance is not model delivery or completed work.";
+const PEER_RECEIPT_UNKNOWN: &str = "Acceptance is unconfirmed. Do not retry as a new message.";
 
 const STATE_KIND_FIELD: &str = "kind";
 /// Results sized by what they cost the model rather than by their lines: a
@@ -780,6 +785,96 @@ impl MemoryOutput {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PeerOutput {
+    Sessions {
+        sessions: Vec<PeerSummary>,
+    },
+    Sent {
+        target: String,
+        receipt: SendReceipt,
+    },
+}
+
+impl PeerOutput {
+    pub fn annotation(&self) -> String {
+        match self {
+            Self::Sessions { sessions } => counted(sessions.len(), PEER_SESSION_NOUN),
+            Self::Sent { receipt, .. } => match receipt.status.as_str() {
+                "queued" => "queued",
+                "held" => "held for review",
+                "refused" => "refused",
+                "rate_limited" => "rate limited",
+                "unavailable" => "unavailable",
+                _ => "unknown outcome",
+            }
+            .into(),
+        }
+    }
+
+    pub fn as_display_text(&self) -> String {
+        match self {
+            Self::Sessions { sessions } if sessions.is_empty() => PEER_SESSIONS_EMPTY.into(),
+            Self::Sessions { sessions } => sessions
+                .iter()
+                .map(|peer| {
+                    let state = if peer.blocked {
+                        "blocked"
+                    } else if peer.busy {
+                        "busy"
+                    } else {
+                        "idle"
+                    };
+                    format!(
+                        "{} · {state} · inbound {:?}\nTarget: {}\nWorkspace: {}",
+                        peer.name.escape_debug(),
+                        peer.inbound,
+                        peer.target.escape_debug(),
+                        peer.cwd.to_string_lossy().escape_debug(),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+            Self::Sent { target, receipt } => {
+                let mut text = format!(
+                    "{}\nTarget: {}\nMessage: {}",
+                    self.annotation(),
+                    target.escape_debug(),
+                    receipt.message_id.escape_debug(),
+                );
+                if let Some(reason) = &receipt.reason {
+                    text.push('\n');
+                    text.extend(reason.escape_debug());
+                }
+                let note = match receipt.status.as_str() {
+                    "queued" | "held" => Some(PEER_RECEIPT_ACCEPTED),
+                    "refused" | "rate_limited" | "unavailable" => None,
+                    _ => Some(PEER_RECEIPT_UNKNOWN),
+                };
+                if let Some(note) = note {
+                    text.push('\n');
+                    text.push_str(note);
+                }
+                text
+            }
+        }
+    }
+
+    fn model_text(&self) -> String {
+        match self {
+            Self::Sessions { sessions } => json!({"sessions": sessions}),
+            Self::Sent { target, receipt } => json!({
+                "target": target,
+                "status": receipt.status,
+                "message_id": receipt.message_id,
+                "reason": receipt.reason,
+            }),
+        }
+        .to_string()
+    }
+}
+
 /// A skill as it was loaded: where it came from, and its instructions with the
 /// frontmatter already stripped.
 ///
@@ -1263,6 +1358,7 @@ pub enum ToolOutput {
     /// A workflow run the transcript follows live and restores settled.
     WorkflowRun(Box<WorkflowRunCard>),
     Tasks(TaskOutput),
+    Peers(PeerOutput),
 }
 
 /// How far a search reached before a bound stopped it. Both counts are lower
@@ -1367,6 +1463,7 @@ impl ToolOutput {
                 format!("{total_count} entries")
             }),
             Self::Memory(output) => Some(output.annotation()),
+            Self::Peers(output) => Some(output.annotation()),
             Self::Skill(skill) => Some(skill.annotation()),
             Self::Shell(output) => Some(if output.timed_out {
                 "timed out".into()
@@ -1478,6 +1575,7 @@ impl ToolOutput {
             | Self::GrepResult { .. }
             | Self::Index(_)
             | Self::Memory(_)
+            | Self::Peers(_)
             | Self::Skill(_)
             | Self::CodeGraph { .. }
             | Self::Shell(_)
@@ -1497,6 +1595,7 @@ impl ToolOutput {
             Self::Index(IndexOutput::Directory { listing, .. }) => listing.is_empty(),
             Self::Shell(output) => output.stdout.is_empty() && output.stderr.is_empty(),
             Self::Memory(output) => output.is_empty(),
+            Self::Peers(PeerOutput::Sessions { sessions }) => sessions.is_empty(),
             Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) => t.text.is_empty(),
             _ => false,
         }
@@ -1511,6 +1610,7 @@ impl ToolOutput {
             Self::TodoList(_) => "ok".into(),
             Self::Shell(output) => output.model_text.clone(),
             Self::Skill(skill) => skill.model_text(),
+            Self::Peers(output) => output.model_text(),
             Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) => {
                 let mut out = t.text.clone();
                 if let Some(blocks) = &t.instructions {
@@ -1598,6 +1698,7 @@ impl ToolOutput {
             Self::Index(IndexOutput::File { skeleton, .. }) => skeleton.clone(),
             Self::Index(IndexOutput::Directory { listing, .. }) => listing.clone(),
             Self::Memory(output) => output.as_display_text(),
+            Self::Peers(output) => output.as_display_text(),
             Self::Skill(skill) => skill.display_text(),
             Self::Shell(output) => output.raw_text(),
             Self::ReadCode {
@@ -2922,6 +3023,7 @@ pub struct Envelope {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use caudra_config::InboundPolicy;
     use caudra_providers::estimate_tokens;
     use caudra_storage::StateDir;
     use caudra_storage::id::SessionRef;
@@ -3206,6 +3308,147 @@ mod tests {
                 token_label(1)
             )
         );
+    }
+
+    const PEER_TARGET: &str = "calm-quick-fox-kind-brave-owl";
+    const PEER_MESSAGE: &str = "clear-small-wren";
+    const PEER_NAME: &str = "Parser review";
+    const PEER_WORKSPACE: &str = "/workspace/parser";
+    const PEER_QUEUED: &str = "queued";
+    const PEER_HOSTILE: &str = "review\n\r\t\u{1b}[31m\u{202e}text";
+
+    fn peer_sessions(count: usize) -> ToolOutput {
+        ToolOutput::Peers(PeerOutput::Sessions {
+            sessions: (0..count)
+                .map(|_| PeerSummary {
+                    target: PEER_TARGET.into(),
+                    name: PEER_NAME.into(),
+                    cwd: PEER_WORKSPACE.into(),
+                    busy: true,
+                    blocked: false,
+                    inbound: InboundPolicy::Auto,
+                })
+                .collect(),
+        })
+    }
+
+    fn peer_receipt(status: &str) -> ToolOutput {
+        ToolOutput::Peers(PeerOutput::Sent {
+            target: PEER_TARGET.into(),
+            receipt: SendReceipt {
+                status: status.into(),
+                message_id: PEER_MESSAGE.into(),
+                reason: None,
+            },
+        })
+    }
+
+    #[test_case(0, "0 sessions"; "empty")]
+    #[test_case(1, "1 session"; "one")]
+    #[test_case(2, "2 sessions"; "multiple")]
+    fn peer_discovery_keeps_model_json_and_human_display_separate(count: usize, annotation: &str) {
+        let output = peer_sessions(count);
+        let model: Value = serde_json::from_str(&output.as_text()).unwrap();
+        let sessions = model["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), count);
+        for session in sessions {
+            assert_eq!(session["target"], PEER_TARGET);
+            assert_eq!(session["name"], PEER_NAME);
+            assert_eq!(session["cwd"], PEER_WORKSPACE);
+            assert_eq!(session["busy"], true);
+            assert_eq!(session["blocked"], false);
+            assert_eq!(session["inbound"], "auto");
+            assert_eq!(session.as_object().unwrap().len(), 6);
+        }
+        assert_eq!(output.annotation().as_deref(), Some(annotation));
+        assert_eq!(output.is_empty_result(), count == 0);
+        assert_ne!(output.as_text(), output.as_display_text());
+        if count == 0 {
+            assert_eq!(output.as_display_text(), PEER_SESSIONS_EMPTY);
+        } else {
+            assert!(output.as_display_text().contains(PEER_TARGET));
+        }
+    }
+
+    #[test_case("queued", "queued", Some(PEER_RECEIPT_ACCEPTED); "queued")]
+    #[test_case("held", "held for review", Some(PEER_RECEIPT_ACCEPTED); "held")]
+    #[test_case("refused", "refused", None; "refused")]
+    #[test_case("rate_limited", "rate limited", None; "rate_limited")]
+    #[test_case("unavailable", "unavailable", None; "unavailable")]
+    #[test_case("unknown", "unknown outcome", Some(PEER_RECEIPT_UNKNOWN); "unknown")]
+    #[test_case(PEER_HOSTILE, "unknown outcome", Some(PEER_RECEIPT_UNKNOWN); "unrecognized")]
+    fn peer_receipt_describes_acceptance_without_claiming_completion(
+        status: &str,
+        annotation: &str,
+        note: Option<&str>,
+    ) {
+        let output = peer_receipt(status);
+        let model: Value = serde_json::from_str(&output.as_text()).unwrap();
+        assert_eq!(
+            model,
+            json!({
+                "target": PEER_TARGET,
+                "status": status,
+                "message_id": PEER_MESSAGE,
+                "reason": null,
+            })
+        );
+        assert_eq!(output.annotation().as_deref(), Some(annotation));
+        assert!(!output.is_empty_result());
+        if let Some(note) = note {
+            assert!(output.as_display_text().contains(note));
+        }
+    }
+
+    #[test_case(peer_sessions(0); "empty_discovery")]
+    #[test_case(peer_sessions(2); "discovery")]
+    #[test_case(peer_receipt(PEER_QUEUED); "receipt")]
+    fn peer_output_survives_storage_with_both_projections(output: ToolOutput) {
+        let stored = serde_json::to_string(&output).unwrap();
+        let restored: ToolOutput = serde_json::from_str(&stored).unwrap();
+        assert!(matches!(restored, ToolOutput::Peers(_)));
+        assert_eq!(restored.as_text(), output.as_text());
+        assert_eq!(restored.annotation(), output.annotation());
+        assert_eq!(
+            restored.structured_display_text(),
+            Some(output.as_display_text())
+        );
+    }
+
+    #[test_case(true; "session_fields")]
+    #[test_case(false; "receipt_fields")]
+    fn peer_display_escapes_untrusted_fields_without_changing_model_values(sessions: bool) {
+        let output = ToolOutput::Peers(if sessions {
+            PeerOutput::Sessions {
+                sessions: vec![PeerSummary {
+                    target: PEER_HOSTILE.into(),
+                    name: PEER_HOSTILE.into(),
+                    cwd: PEER_HOSTILE.into(),
+                    busy: false,
+                    blocked: true,
+                    inbound: InboundPolicy::Hold,
+                }],
+            }
+        } else {
+            PeerOutput::Sent {
+                target: PEER_HOSTILE.into(),
+                receipt: SendReceipt {
+                    status: PEER_QUEUED.into(),
+                    message_id: PEER_HOSTILE.into(),
+                    reason: Some(PEER_HOSTILE.into()),
+                },
+            }
+        });
+        let display = output.as_display_text();
+        assert!(display.contains(&PEER_HOSTILE.escape_debug().to_string()));
+        assert!(!display.contains(['\r', '\t', '\u{1b}', '\u{202e}']));
+        let model: Value = serde_json::from_str(&output.as_text()).unwrap();
+        let value = if sessions {
+            &model["sessions"][0]
+        } else {
+            &model
+        };
+        assert_eq!(value["target"], PEER_HOSTILE);
     }
 
     const SKILL_LOCATION: &str = "builtin:herdr";

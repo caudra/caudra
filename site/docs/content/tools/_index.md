@@ -329,7 +329,7 @@ Experimental and off by default. Turn it on with `workflows = true` under `[expe
 
 ### `list_sessions` <span class="badge">experimental</span> {#list_sessions}
 
-Discover other live Caudra sessions on this machine. Returns bounded session metadata and exact reply targets, not conversation history. Use the returned target with send_message; titles are not unique. Cross-session messaging is experimental and requires each process to opt in.
+Discover other live Caudra sessions on this machine. Returns bounded session metadata and exact word-based reply targets, not conversation history. Use the returned target with send_message; titles are not unique. Targets are local to your live registration and are never reassigned to a replacement peer. Rediscover after restarting or replacing your session. Cross-session messaging is experimental and requires each process to opt in.
 
 Experimental and off by default. Turn it on with `cross_session_messaging = true` under `[experimental]` in the global `caudra.toml`. See [Experimental features](/docs/configuration/#experimental-features).
 
@@ -344,9 +344,9 @@ Experimental and off by default. Turn it on with `cross_session_messaging = true
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `target` | string | yes | Exact live target from list_sessions or a peer reply address. Never a title or filesystem path. |
+| `target` | string | yes | Exact word-based target from list_sessions or an incoming peer reply address in this live session. Never a title or filesystem path. |
 | `text` | string | yes | Plain text only; also limited to 32 KiB of UTF-8. |
-| `reply_to` | string | no | Optional incoming message ID for correlation. |
+| `reply_to` | string | no | Optional incoming message name for correlation with this target. |
 
 ### `todo_write` {#todo_write}
 

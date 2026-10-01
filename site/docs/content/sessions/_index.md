@@ -58,7 +58,9 @@ Use `/peers` to inspect live peers. `/messages` lets you review held messages, a
 
 Review again if the session's mode, workspace, or policy changes. An old review cannot approve a message under new controls.
 
-You can also ask the agent to find a session and send it a message. It uses `list_sessions` for discovery and `send_message` for delivery. Discovery shows session labels and availability, without transcript previews. Messages use an opaque target from discovery or an incoming reply address. A title is not a unique address.
+You can also ask the agent to find a session and send it a message. It uses `list_sessions` for discovery and `send_message` for delivery. Discovery cards show session labels, word-based targets, workspaces, and availability, without transcript previews. A title is not a unique address.
+
+Use the exact target from discovery or an incoming reply address. Targets belong to your current live registration and are never reassigned to a replacement peer. Discover again after restarting or replacing your session. Message names also use generated words, including the names shown by `/messages` for approval or rejection.
 
 Accepted messages enter at a safe run boundary. They can also wake an eligible idle TUI session and start a billable model turn. They do not interrupt a running tool or bypass cancellation, permission review, or delivery limits. The recipient still applies its own tool permissions.
 

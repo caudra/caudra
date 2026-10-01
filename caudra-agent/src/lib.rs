@@ -89,7 +89,7 @@ pub use types::{
     IndexSourceRange, InstructionBlock, LuaToolProvenance, MEMORY_DIRECTORY_LABEL,
     MEMORY_REFERENCE_LABEL, MEMORY_REVISION_LABEL, MEMORY_TAG_SEPARATOR, MemoryNote,
     MemoryNoteEntry, MemoryOrigin, MemoryOutput, MemoryTagGroup, NO_FILES_FOUND, PatchedFile,
-    QueueConsumedItem, SearchCap, SharedBuf, ShellFilterInfo, ShellOutput, SkillOutput,
+    PeerOutput, QueueConsumedItem, SearchCap, SharedBuf, ShellFilterInfo, ShellOutput, SkillOutput,
     SnapshotLine, SnapshotSpan, SpanStyle, SubagentActivity, SubagentInfo, SubagentProgress,
     TaskCard, TaskOutput, TaskProvenance, TextOutput, ToolAccounting, ToolDoneEvent, ToolInput,
     ToolOutput, ToolOutputLimits, ToolStartEvent, TurnCompleteEvent,
