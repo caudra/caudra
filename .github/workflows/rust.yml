@@ -134,6 +134,12 @@ jobs:
       - run: cargo test --locked -p caudra-agent directory_ancestry_respects_sticky_permissions
         env:
           WORKCELL_BUNDLED_MONTY_WORKER: ${{ github.workspace }}/target/code-worker/bin/monty
+      - name: Check sandbox platform guards
+        run: |
+          cargo clippy --locked -p caudra-sandbox --tests -- -D warnings
+          cargo test --locked -p caudra-sandbox local_admin::image
+        env:
+          WORKCELL_BUNDLED_MONTY_WORKER: ${{ github.workspace }}/target/code-worker/bin/monty
       - run: just build
 
   windows:

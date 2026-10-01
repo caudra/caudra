@@ -1,40 +1,54 @@
-use super::{HELPER_CWD, HELPER_ENV, require_local, run_helper, validate_path};
-use crate::{
-    Error, Result,
-    dto::{Image, MAX_IMAGE_BYTES, MAX_MIB},
-};
+#[cfg(target_os = "linux")]
+use super::{HELPER_CWD, HELPER_ENV, run_helper};
+use super::{require_local, validate_path};
+#[cfg(target_os = "linux")]
+use crate::dto::{MAX_IMAGE_BYTES, MAX_MIB};
+use crate::{Error, Result, dto::Image};
 use caudra_config::sandbox::{Revision, SandboxProvider};
-use serde::{Deserialize, Serialize};
+#[cfg(target_os = "linux")]
+use serde::Deserialize;
+use serde::Serialize;
+#[cfg(target_os = "linux")]
 use serde_json::json;
+#[cfg(target_os = "linux")]
 use sha2::{Digest, Sha256};
+use std::path::PathBuf;
 #[cfg(target_os = "linux")]
 use std::{
     ffi::CString,
+    fs::File,
+    io::{Error as IoError, Read, Seek, SeekFrom},
     os::{
         fd::{AsRawFd, FromRawFd},
         unix::process::CommandExt,
     },
-};
-use std::{
-    fs::File,
-    io::{Error as IoError, Read, Seek, SeekFrom},
-    path::{Path, PathBuf},
+    path::Path,
     process::Command,
     time::Duration,
 };
 
+#[cfg(target_os = "linux")]
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(target_os = "linux")]
 const HEADER_BYTES: usize = 104;
+#[cfg(target_os = "linux")]
 const QCOW_MAGIC: &[u8] = b"QFI\xfb";
+#[cfg(target_os = "linux")]
 const MIB: u64 = 1024 * 1024;
+#[cfg(target_os = "linux")]
 const HASH_BUFFER: usize = 64 * 1024;
+#[cfg(target_os = "linux")]
 const MAX_HELPER_BYTES: u64 = 128 * MIB;
 
 pub struct ImageProbe {
     pub source_path: PathBuf,
+    #[cfg(target_os = "linux")]
     qemu_img: PathBuf,
+    #[cfg(target_os = "linux")]
     source: File,
+    #[cfg(target_os = "linux")]
     executable: File,
+    #[cfg(target_os = "linux")]
     executable_sha256: Revision,
 }
 
@@ -48,6 +62,7 @@ pub struct ProbedImage {
 }
 
 impl ImageProbe {
+    #[cfg(target_os = "linux")]
     pub fn prepare(
         provider: &SandboxProvider,
         source_path: PathBuf,
@@ -65,6 +80,17 @@ impl ImageProbe {
             executable,
             executable_sha256,
         })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn prepare(
+        provider: &SandboxProvider,
+        source_path: PathBuf,
+        _qemu_img: PathBuf,
+    ) -> Result<Self> {
+        require_local(provider)?;
+        validate_path(&source_path)?;
+        Err(Error::LocalApproval)
     }
 
     #[cfg(target_os = "linux")]
@@ -167,6 +193,7 @@ impl ImageProbe {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Deserialize)]
 #[serde(rename_all = "kebab-case")]
 struct ProbeOutput {
@@ -184,11 +211,13 @@ struct ProbeOutput {
     #[serde(default)]
     format_specific: FormatSpecific,
 }
+#[cfg(target_os = "linux")]
 #[derive(Default, Deserialize)]
 struct FormatSpecific {
     #[serde(default)]
     data: SpecificData,
 }
+#[cfg(target_os = "linux")]
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 struct SpecificData {
@@ -198,35 +227,32 @@ struct SpecificData {
     corrupt: bool,
 }
 
-pub(super) fn open_regular(path: &Path) -> Result<File> {
+#[cfg(target_os = "linux")]
+fn open_regular(path: &Path) -> Result<File> {
     validate_path(path)?;
-    #[cfg(target_os = "linux")]
-    {
-        let mut file = File::open("/").map_err(|_| Error::LocalHelper)?;
-        let parts: Vec<_> = path.iter().skip(1).collect();
-        for (index, part) in parts.iter().enumerate() {
-            let name = CString::new(part.as_encoded_bytes()).map_err(|_| Error::LocalApproval)?;
-            let mut flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
-            if index + 1 < parts.len() {
-                flags |= libc::O_DIRECTORY;
-            }
-            let fd = unsafe { libc::openat(file.as_raw_fd(), name.as_ptr(), flags) };
-            if fd == -1 {
-                return Err(Error::ImageInput(
-                    "path must exist with no symlink components",
-                ));
-            }
-            file = unsafe { File::from_raw_fd(fd) };
+    let mut file = File::open("/").map_err(|_| Error::LocalHelper)?;
+    let parts: Vec<_> = path.iter().skip(1).collect();
+    for (index, part) in parts.iter().enumerate() {
+        let name = CString::new(part.as_encoded_bytes()).map_err(|_| Error::LocalApproval)?;
+        let mut flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+        if index + 1 < parts.len() {
+            flags |= libc::O_DIRECTORY;
         }
-        if !file.metadata().map_err(|_| Error::LocalHelper)?.is_file() {
-            return Err(Error::ImageInput("expected a regular file"));
+        let fd = unsafe { libc::openat(file.as_raw_fd(), name.as_ptr(), flags) };
+        if fd == -1 {
+            return Err(Error::ImageInput(
+                "path must exist with no symlink components",
+            ));
         }
-        Ok(file)
+        file = unsafe { File::from_raw_fd(fd) };
     }
-    #[cfg(not(target_os = "linux"))]
-    Err(Error::LocalApproval)
+    if !file.metadata().map_err(|_| Error::LocalHelper)?.is_file() {
+        return Err(Error::ImageInput("expected a regular file"));
+    }
+    Ok(file)
 }
 
+#[cfg(target_os = "linux")]
 fn digest(file: &mut File, limit: u64) -> Result<Revision> {
     let before = file.metadata().map_err(|_| Error::LocalHelper)?;
     if before.len() == 0 || before.len() > limit {
@@ -263,6 +289,7 @@ fn digest(file: &mut File, limit: u64) -> Result<Revision> {
     Ok(Revision::parse(&format!("sha256:{hex}"))?)
 }
 
+#[cfg(target_os = "linux")]
 fn header(file: &mut File) -> Result<(u64, u64)> {
     let mut bytes = [0; HEADER_BYTES];
     file.seek(SeekFrom::Start(0))
@@ -292,6 +319,40 @@ fn header(file: &mut File) -> Result<(u64, u64)> {
         ));
     }
     Ok((virtual_size, 1 << cluster_bits))
+}
+
+#[cfg(all(test, unix, not(target_os = "linux")))]
+mod unsupported_tests {
+    use super::ImageProbe;
+    use crate::Error;
+    use caudra_config::sandbox::{ProviderKind, SandboxOrigin, SandboxProvider};
+    use caudra_storage::sandbox_auth::SandboxCredentialRef;
+    use test_case::test_case;
+
+    #[test_case("/image.qcow2", true; "valid_path_is_unsupported")]
+    #[test_case("relative.qcow2", false; "invalid_path_is_still_validated")]
+    fn unsupported_probe_remains_unavailable(source: &str, valid_path: bool) {
+        let provider = SandboxProvider {
+            kind: ProviderKind::E2bLibvirt,
+            api_endpoint: SandboxOrigin::parse("http://127.0.0.1:1").unwrap(),
+            proxy_endpoint: SandboxOrigin::parse("http://127.0.0.1:2").unwrap(),
+            credential_ref: SandboxCredentialRef::new("test").unwrap(),
+        };
+        let probe = ImageProbe {
+            source_path: source.into(),
+        };
+        let result = ImageProbe::prepare(&provider, probe.source_path.clone(), "qemu-img".into());
+        if valid_path {
+            assert!(matches!(result, Err(Error::LocalApproval)));
+        } else {
+            assert!(matches!(result, Err(Error::ImageInput(_))));
+        }
+        assert!(matches!(probe.preview(), Err(Error::LocalApproval)));
+        assert!(matches!(
+            probe.execute_approved(),
+            Err(Error::LocalApproval)
+        ));
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
