@@ -16,9 +16,9 @@ use super::{
     TransferPhase, TransferPreview, TransferPreviewSide, TransferProgress, TransferReview,
     TransferScanLimit, TransferSide, TransferState, TransferStatus,
 };
-use crate::chrome::ELLIPSIS;
+use crate::chrome::{ELLIPSIS, spans_width};
 use crate::view::{
-    COLLAPSED_MARK, ENTER_LABEL, EXPANDED_MARK, GUIDE, HINT_GAP, LEAF_INDENT, TAB_GAP, emphasize,
+    COLLAPSED_MARK, EXPANDED_MARK, GUIDE, HINT_GAP, Hint, LEAF_INDENT, TAB_GAP, emphasize,
     emphasized, hints, indent_guides, labelled_field, line_at, paint_tab, placeholder,
     scroll_column, truncate,
 };
@@ -344,19 +344,16 @@ impl Workbench {
         }
     }
 
-    pub(crate) fn render_transfer_status(&self, buf: &mut Surface, area: Rect) {
+    pub(crate) fn render_transfer_status(&mut self, buf: &mut Surface, area: Rect) {
         grab_scope!("workbench_transfer_status", area);
-        let state = &self.transfer;
-        let styles = &self.styles;
-        let (text, style) = state.status(styles);
-        let (width, right) = if style == styles.error {
+        let (text, style) = self.transfer.status(&self.styles);
+        let (width, offered) = if style == self.styles.error {
             (area.width, Vec::new())
         } else {
-            (area.width / 2, hints(&state.hints(), styles))
+            (area.width / 2, self.transfer.hints())
         };
         let left = vec![Span::styled(chrome::fit(&text, usize::from(width)), style)];
-        let line = chrome::status_line(left, right, area.width, styles.dim);
-        chrome::render_line(buf, area, line);
+        self.render_status_row(buf, area, left, Vec::new(), &offered);
     }
 }
 
@@ -524,9 +521,9 @@ impl TransferState {
             // note is what explains the empty folder.
             Row::Note(folder) => {
                 let note = self.tree.note(folder, side, self.scan(side));
-                let offer = note
-                    .and_then(Note::action)
-                    .map_or_else(Vec::new, |action| hints(&[offer_hint(action)], styles));
+                let offer = note.and_then(Note::action).map_or_else(Vec::new, |action| {
+                    hints(&[offer_hint(action)], None, styles)
+                });
                 if let Some(note) = note {
                     let budget = usize::from(width).saturating_sub(spans_width(&left));
                     let text = format!("{LEAF_INDENT}{}", note.text());
@@ -876,31 +873,28 @@ impl TransferState {
     }
 
     /// What the next key can do, for whatever stands in front.
-    fn hints(&self) -> Vec<(&'static str, &'static str)> {
+    pub(crate) fn hints(&self) -> Vec<Hint> {
         if self.prompt.is_some() {
             return vec![
-                (ENTER_LABEL, "compare"),
-                (keys::CLEAR_ROOT.label, "clear"),
-                (keys::CLOSE.label, "cancel"),
+                (keys::ACCEPT, "compare"),
+                (keys::CLEAR_ROOT, "clear"),
+                (keys::CLOSE, "cancel"),
             ];
         }
         if self.pending || self.draining {
-            return vec![(keys::STOP.label, "stop")];
+            return vec![(keys::STOP, "stop")];
         }
         match &self.panel {
             Some(Panel::Review(review)) if review.executable => {
-                vec![
-                    (keys::APPROVE.label, "approve"),
-                    (keys::CLOSE.label, "close"),
-                ]
+                vec![(keys::APPROVE, "approve"), (keys::CLOSE, "close")]
             }
-            Some(_) => vec![(keys::CLOSE.label, "close")],
+            Some(_) => vec![(keys::CLOSE, "close")],
             None => vec![
-                (keys::SELECT.label, "select"),
-                (keys::UPLOAD.label, "upload"),
-                (keys::DOWNLOAD.label, "download"),
-                (keys::COMPARE.label, "compare"),
-                (keys::CLOSE.label, "back"),
+                (keys::SELECT, "select"),
+                (keys::UPLOAD, "upload"),
+                (keys::DOWNLOAD, "download"),
+                (keys::COMPARE, "compare"),
+                (keys::CLOSE, "back"),
             ],
         }
     }
@@ -935,10 +929,6 @@ fn columns(area: Rect, focus: TransferSide) -> ([Rect; 2], Option<Rect>) {
     ([local, remote], Some(rule))
 }
 
-fn spans_width(spans: &[Span<'_>]) -> usize {
-    spans.iter().map(|span| span.content.width()).sum()
-}
-
 fn section(
     title: &'static str,
     count: usize,
@@ -970,7 +960,7 @@ fn tally(
 fn recovery_lines(styles: &WorkbenchStyles) -> [Line<'static>; 2] {
     [
         Line::from(Span::styled(RECOVERY_REQUIRED, styles.error)),
-        Line::from(hints(&[(keys::RECONCILE.label, RECONCILE_OFFER)], styles)),
+        Line::from(hints(&[(keys::RECONCILE, RECONCILE_OFFER)], None, styles)),
     ]
 }
 
@@ -1001,11 +991,11 @@ fn noun(count: usize, one: &'static str, many: &'static str) -> &'static str {
     }
 }
 
-fn offer_hint(action: NoteAction) -> (&'static str, &'static str) {
+fn offer_hint(action: NoteAction) -> Hint {
     match action {
-        NoteAction::IncludeIgnored => (keys::INCLUDE_IGNORED.label, INCLUDE_IGNORED_OFFER),
-        NoteAction::IncludeDotfiles => (keys::SKIP_DOTFILES.label, INCLUDE_DOTFILES_OFFER),
-        NoteAction::CompareFolder => (ENTER_LABEL, COMPARE_FOLDER_OFFER),
+        NoteAction::IncludeIgnored => (keys::INCLUDE_IGNORED, INCLUDE_IGNORED_OFFER),
+        NoteAction::IncludeDotfiles => (keys::SKIP_DOTFILES, INCLUDE_DOTFILES_OFFER),
+        NoteAction::CompareFolder => (keys::ACCEPT, COMPARE_FOLDER_OFFER),
     }
 }
 

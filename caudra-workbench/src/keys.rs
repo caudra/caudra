@@ -81,6 +81,11 @@ pub const LEADER: Bind = Bind {
 };
 
 pub const CLOSE: Bind = bind!(KeyCode::Esc, NONE, "Esc");
+/// Takes whatever the focused pane offers: the highlighted answer, the menu
+/// item, the typed name, the search. Each pane reads the key itself, so this
+/// only exists for a status hint to name it and a click on that hint to press
+/// it.
+pub const ACCEPT: Bind = bind!(KeyCode::Enter, NONE, "Enter");
 pub const TOGGLE_SIDEBAR: Bind = bind!(KeyCode::Char('b'), CTRL, "Ctrl+B");
 pub const FOCUS_NEXT: Bind = bind!(KeyCode::Tab, NONE, "Tab");
 pub const FOCUS_PREV: Bind = bind!(KeyCode::BackTab, KeyModifiers::SHIFT, "Shift+Tab");
@@ -256,6 +261,7 @@ const TRANSFER_BINDS: &[Bind] = &[
     TOGGLE_SIDEBAR,
     QUICK_OPEN,
     CLOSE,
+    ACCEPT,
     FOCUS_NEXT,
     FOCUS_PREV,
     REFRESH,
@@ -281,6 +287,10 @@ const TRANSFER_BINDS: &[Bind] = &[
 
 /// Second keys of the `Ctrl+X` chords. Checked among themselves only: the
 /// prefix keeps them clear of every direct chord, whichever pane is up.
+///
+/// A click on a status hint reads this list to tell a chord's second half
+/// from a direct key, so a leader bind missing from it would be pressed as
+/// the bare key it shares.
 pub const LEADER_BINDS: &[Bind] = &[
     TOGGLE_HIDDEN,
     CUT_CHORD,

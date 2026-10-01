@@ -52,7 +52,6 @@ const WORD_TOGGLE: &str = "ab";
 const REGEX_TOGGLE: &str = ".*";
 /// Every workbench field has a label beside it to say what it wants instead.
 const NO_PLACEHOLDER: &str = "";
-pub(crate) const ENTER_LABEL: &str = "Enter";
 const SUMMARY_GAP: &str = " ";
 /// The two-column rail down the left of the graph. A commit on the chain of
 /// first parents sits on the trunk, one a merge brought in hangs beside it.
@@ -156,11 +155,18 @@ const MORE_PATHS: &str = " paths under it?";
 const CONFIRM_ROWS: u16 = 4;
 /// One column of air either side of the widest row.
 const CONFIRM_PADDING: u16 = 1;
-const CONFIRM_HINTS: [(&str, &str); 2] = [(ENTER_LABEL, "choose"), (keys::CLOSE.label, "cancel")];
-pub(crate) const MENU_HINTS: [(&str, &str); 2] =
-    [(ENTER_LABEL, "take"), (keys::CLOSE.label, "close")];
-pub(crate) const NAME_HINTS: [(&str, &str); 2] =
-    [(ENTER_LABEL, "confirm"), (keys::CLOSE.label, "cancel")];
+/// Between a hint's key and what pressing it does.
+const HINT_KEY_GAP: &str = " ";
+const CONFIRM_HINTS: [Hint; 2] = [(keys::ACCEPT, "choose"), (keys::CLOSE, "cancel")];
+pub(crate) const MENU_HINTS: [Hint; 2] = [(keys::ACCEPT, "take"), (keys::CLOSE, "close")];
+pub(crate) const NAME_HINTS: [Hint; 2] = [(keys::ACCEPT, "confirm"), (keys::CLOSE, "cancel")];
+pub(crate) const PALETTE_HINTS: [Hint; 2] = [(keys::ACCEPT, "open"), (keys::CLOSE, "close")];
+pub(crate) const GOTO_HINTS: [Hint; 2] = [(keys::ACCEPT, "go"), (keys::CLOSE, "cancel")];
+pub(crate) const FIND_HINTS: [Hint; 2] = [(keys::ACCEPT, "next"), (keys::CLOSE, "close")];
+
+/// A key the status row offers, and what pressing it does. The key travels
+/// with its label, so a click on a hint presses exactly the key it reads.
+pub(crate) type Hint = (keys::Bind, &'static str);
 
 /// One of the search view's three buttons.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,6 +211,9 @@ impl Workbench {
         };
         grab_scope!("workbench_menu", area);
         let panel = menu_panel(menu, area);
+        // A panel hung low enough lays its bottom rule over the status row, and
+        // a press on that rule belongs to the menu rather than the hint under it.
+        self.hint_hits.retain(|(hit, _)| !hit.intersects(panel));
         chrome::fill(buf, panel, self.styles.background);
         let [top, rows, bottom] = Layout::vertical([
             Constraint::Length(1),
@@ -1028,7 +1037,7 @@ impl Workbench {
             )],
         };
 
-        let mut right = match self.editor.active() {
+        let right = match self.editor.active() {
             Some(tab) if tab.is_rendered() => vec![Span::styled(RENDERED_STATUS, self.styles.dim)],
             Some(tab) => {
                 let cursor = tab.buffer.cursor();
@@ -1044,7 +1053,33 @@ impl Workbench {
             }
             None => Vec::new(),
         };
-        right.extend(hints(&self.status_hints(), &self.styles));
+        let offered = self.status_hints();
+        self.render_status_row(buf, area, left, right, &offered);
+    }
+
+    /// Lays `offered` out after `right`, at the end of the status row, and
+    /// records where each one landed so a click presses what the row says.
+    /// The hint under the pointer is lit whole, key and description together.
+    /// A row too narrow for its right group drops it, and with it every hint,
+    /// so nothing the reader cannot see is left to press.
+    pub(crate) fn render_status_row(
+        &mut self,
+        buf: &mut Surface,
+        area: Rect,
+        left: Vec<Span<'static>>,
+        mut right: Vec<Span<'static>>,
+        offered: &[Hint],
+    ) {
+        let rects = hint_rects(offered, area);
+        let lit = rects.iter().position(|rect| self.hovering(*rect).is_some());
+        right.extend(hints(offered, lit, &self.styles));
+        self.hint_hits = match chrome::fits(&left, &right, area.width) {
+            true => rects
+                .into_iter()
+                .zip(offered.iter().map(|(bind, _)| *bind))
+                .collect(),
+            false => Vec::new(),
+        };
         chrome::render_line(
             buf,
             area,
@@ -1052,18 +1087,30 @@ impl Workbench {
         );
     }
 
+    /// What the status row offers, whichever view is drawing it.
+    pub(crate) fn offered_hints(&self) -> Vec<Hint> {
+        match self.sidebar {
+            SidebarView::Transfer => self.transfer.hints(),
+            _ => self.status_hints(),
+        }
+    }
+
     /// What the status bar offers, which is whatever the focused pane can do.
-    /// Anything standing over the panes answers first, since that is what the
-    /// next key will reach.
-    fn status_hints(&self) -> Vec<(&'static str, &'static str)> {
-        if self.input.is_some() {
-            return NAME_HINTS.to_vec();
-        }
-        if self.confirm.is_some() {
-            return CONFIRM_HINTS.to_vec();
-        }
-        if self.menu.is_some() {
-            return MENU_HINTS.to_vec();
+    /// Anything standing over the panes answers first, in the order
+    /// [`Workbench::handle_key`] offers it a key, since that is what the next
+    /// key, or a click on one of these, will reach.
+    fn status_hints(&self) -> Vec<Hint> {
+        let standing = match self.focused_field() {
+            Some(FocusedField::Name) => Some(NAME_HINTS),
+            _ if self.confirm.is_some() => Some(CONFIRM_HINTS),
+            _ if self.menu.is_some() => Some(MENU_HINTS),
+            Some(FocusedField::Palette) => Some(PALETTE_HINTS),
+            Some(FocusedField::Goto) => Some(GOTO_HINTS),
+            Some(FocusedField::Find) => Some(FIND_HINTS),
+            Some(FocusedField::Search) | None => None,
+        };
+        if let Some(standing) = standing {
+            return standing.to_vec();
         }
         if self.focus == Focus::Sidebar && self.sidebar == SidebarView::SourceControl {
             let other = match self.scm.is_flat() {
@@ -1071,11 +1118,11 @@ impl Workbench {
                 false => FLAT_HINT,
             };
             return vec![
-                (keys::STAGE_TOGGLE.label, "stage"),
-                (keys::OPEN_DIFF.label, "diff"),
-                (keys::DISCARD.label, "discard"),
-                (keys::TOGGLE_TREE.label, other),
-                (keys::CLOSE.label, "back"),
+                (keys::STAGE_TOGGLE, "stage"),
+                (keys::OPEN_DIFF, "diff"),
+                (keys::DISCARD, "discard"),
+                (keys::TOGGLE_TREE, other),
+                (keys::CLOSE, "back"),
             ];
         }
         if self.focus == Focus::Sidebar && self.sidebar == SidebarView::Search {
@@ -1085,33 +1132,30 @@ impl Workbench {
                 "open"
             };
             return vec![
-                (ENTER_LABEL, enter),
-                (keys::NEXT_FIELD.label, "files"),
-                (keys::TOGGLE_CASE.label, "case"),
-                (keys::TOGGLE_WORD.label, "word"),
-                (keys::TOGGLE_REGEX.label, "regex"),
+                (keys::ACCEPT, enter),
+                (keys::NEXT_FIELD, "files"),
+                (keys::TOGGLE_CASE, "case"),
+                (keys::TOGGLE_WORD, "word"),
+                (keys::TOGGLE_REGEX, "regex"),
             ];
         }
         if self.focus == Focus::Editor {
-            let mut offered = vec![(keys::SAVE.label, "save"), (keys::FIND.label, "find")];
+            let mut offered = vec![(keys::SAVE, "save"), (keys::FIND, "find")];
             if let Some(tab) = self.editor.active().filter(|tab| self.renders(tab)) {
                 let other = match tab.is_rendered() {
                     true => "source",
                     false => "rendered",
                 };
-                offered.push((keys::TOGGLE_RENDERED.label, other));
+                offered.push((keys::TOGGLE_RENDERED, other));
             }
-            offered.extend([
-                (keys::SEND_TO_COMPOSER.label, "send"),
-                (keys::CLOSE.label, "back"),
-            ]);
+            offered.extend([(keys::SEND_TO_COMPOSER, "send"), (keys::CLOSE, "back")]);
             return offered;
         }
         vec![
-            (keys::VIEW_EXPLORER.label, "explorer"),
-            (keys::FIND.label, "find"),
-            (keys::SEND_TO_COMPOSER.label, "send"),
-            (keys::CLOSE.label, "back"),
+            (keys::VIEW_EXPLORER, "explorer"),
+            (keys::FIND, "find"),
+            (keys::SEND_TO_COMPOSER, "send"),
+            (keys::CLOSE, "back"),
         ]
     }
 
@@ -2232,17 +2276,51 @@ fn status_left(
     spans
 }
 
+/// The spans `offered` is drawn from, each behind the gap that parts it from
+/// whatever comes before. The hint at `lit` is lit whole, key and description
+/// together. The gap belongs to neither neighbour, so it never is.
 pub(crate) fn hints(
-    pairs: &[(&'static str, &'static str)],
+    offered: &[Hint],
+    lit: Option<usize>,
     styles: &WorkbenchStyles,
 ) -> Vec<Span<'static>> {
-    let mut spans = Vec::with_capacity(pairs.len() * 3);
-    for (key, label) in pairs {
+    let mut spans = Vec::with_capacity(offered.len() * 3);
+    for (index, (bind, description)) in offered.iter().enumerate() {
+        let hovered = lit == Some(index);
         spans.push(Span::styled(HINT_GAP, styles.dim));
-        spans.push(Span::styled(*key, styles.accent));
-        spans.push(Span::styled(format!(" {label}"), styles.dim));
+        spans.push(Span::styled(
+            bind.label,
+            emphasized(styles.accent, hovered, styles),
+        ));
+        spans.push(Span::styled(
+            format!("{HINT_KEY_GAP}{description}"),
+            emphasized(styles.dim, hovered, styles),
+        ));
     }
     spans
+}
+
+/// The columns a hint's own glyphs take once [`hints`] draws it: the key,
+/// then the description, without the gap in front.
+fn hint_width((bind, description): &Hint) -> u16 {
+    (bind.label.width() + HINT_KEY_GAP.width() + description.width()) as u16
+}
+
+/// Where each of `offered` lands when [`hints`] ends a row at the right edge
+/// of `area`, which is where [`chrome::status_line`] lays a right group out.
+/// A rect covers a hint's own glyphs and not the gap in front of it, so the
+/// pointer reaches a hint only once it is over one.
+fn hint_rects(offered: &[Hint], area: Rect) -> Vec<Rect> {
+    let gap = HINT_GAP.width() as u16;
+    let total: u16 = offered.iter().map(|hint| gap + hint_width(hint)).sum();
+    let mut x = area.right().saturating_sub(total);
+    let mut rects = Vec::with_capacity(offered.len());
+    for hint in offered {
+        let rect = Rect::new(x.saturating_add(gap), area.y, hint_width(hint), area.height);
+        x = rect.right();
+        rects.push(rect);
+    }
+    rects
 }
 
 #[cfg(test)]
@@ -2256,11 +2334,12 @@ mod tests {
     use super::menu_panel;
     use super::{
         CHANGE_TRAILING, COLLAPSED_MARK, Commit, CommitPath, Control, DiffColumns, DiffKind,
-        DiffRow, EXPANDED_MARK, Editor, Focus, GitMark, Line, MENU_MARK, MIN_CODE_COLUMNS,
-        RAIL_TRUNK, RAIL_UNDER_SIDE, RAIL_UNDER_TRUNK, Rail, ScmRow, Section, SidebarView, Style,
-        Tab, TabHit, TabPart, Toggle, TreeRow, Workbench, WorkbenchStyles, commit_file_row,
-        commit_row, control_at, diff_gutter, header_at, keys, on_menu_mark, scm_controls,
-        scroll_column, tab_at, toggle_at, tree_row, tree_style, visible_range,
+        DiffRow, EXPANDED_MARK, Editor, Focus, GOTO_HINTS, GitMark, Line, MENU_MARK,
+        MIN_CODE_COLUMNS, RAIL_TRUNK, RAIL_UNDER_SIDE, RAIL_UNDER_TRUNK, Rail, ScmRow, Section,
+        SidebarView, Style, Surface, Tab, TabHit, TabPart, Toggle, TreeRow, Workbench,
+        WorkbenchStyles, chrome, commit_file_row, commit_row, control_at, diff_gutter, header_at,
+        hint_rects, hints, keys, on_menu_mark, scm_controls, scroll_column, tab_at, toggle_at,
+        tree_row, tree_style, visible_range,
     };
     use crate::fs::backend::WorkbenchPath;
     use crate::fs::tree::EntryKind;
@@ -2273,6 +2352,9 @@ mod tests {
     const WRONG_VIEW: &str = "the column does not fall on the view the header painted there";
     const WRONG_TOGGLE: &str = "the column does not fall on the button the row painted there";
     const WRONG_HINT: &str = "the status bar is not offering what the focused pane needs most";
+    const WRONG_HINT_RECT: &str = "a hint's rect is not over the glyphs the row painted for it";
+    /// What each of [`GOTO_HINTS`] reads once painted.
+    const GOTO_PAINTED: [&str; 2] = ["Enter go", "Esc cancel"];
     const WRONG_PAINT: &str = "the row is not painted the way its standing asks for";
     const WRONG_GUIDES: &str = "the rules down the indent are not drawn as chrome";
     const WRONG_HANDLE: &str = "the handle on the menu is not drawn back the way chrome is";
@@ -2477,15 +2559,45 @@ mod tests {
         assert_eq!(header_at(column, 0), expected, "{WRONG_VIEW}");
     }
 
-    #[test_case(Focus::Editor, keys::SAVE.label ; "the editor is offered save")]
-    #[test_case(Focus::Sidebar, keys::VIEW_EXPLORER.label ; "the sidebar is offered its views")]
-    fn the_focused_pane_leads_the_status_hints(focus: Focus, expected: &str) {
+    #[test_case(Focus::Editor, keys::SAVE ; "the editor is offered save")]
+    #[test_case(Focus::Sidebar, keys::VIEW_EXPLORER ; "the sidebar is offered its views")]
+    fn the_focused_pane_leads_the_status_hints(focus: Focus, expected: keys::Bind) {
         let mut workbench = Workbench::new(WorkbenchStyles::default());
         workbench.focus = focus;
         assert_eq!(
             workbench.status_hints().first().map(|(bind, _)| *bind),
             Some(expected),
             "{WRONG_HINT}"
+        );
+    }
+
+    #[test]
+    fn hint_rects_cover_the_glyphs_and_not_the_gap_before_them() {
+        let row = Rect { height: 1, ..FRAME };
+        let styles = WorkbenchStyles::default();
+        let mut surface = Surface::empty(row);
+        let painted = hints(&GOTO_HINTS, None, &styles);
+        chrome::render_line(
+            &mut surface,
+            row,
+            chrome::status_line(Vec::new(), painted, row.width, styles.dim),
+        );
+
+        let rects = hint_rects(&GOTO_HINTS, row);
+
+        let covered: Vec<String> = rects
+            .iter()
+            .map(|rect| {
+                (rect.x..rect.right())
+                    .map(|column| surface[(column, rect.y)].symbol())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(covered, GOTO_PAINTED, "{WRONG_HINT_RECT}");
+        assert_eq!(
+            rects.last().map(|rect| rect.right()),
+            Some(row.right()),
+            "{WRONG_HINT_RECT}"
         );
     }
 

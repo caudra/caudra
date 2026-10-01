@@ -48,6 +48,7 @@ The workbench takes the mouse the way an IDE does.
 | Click `FOLD` | Fold the explorer back to its top level |
 | Click `TREE` or `FLAT` | Switch how source control lists paths |
 | Click `Aa`, `ab`, or `.*` | Turn that search toggle on or off |
+| Click a key in the status row | Press that key |
 | Click a source control header | Fold or unfold that section |
 | Click `+` or `-` on a source control row | Stage or unstage that path |
 | Click `↗` on a file | Open the file instead of its diff |
@@ -289,7 +290,7 @@ Empty-directory creation requires negotiated directory-publication support. Loca
 
 The sidebar sums up the changes, what the selection would carry each way, and the last transfer report. `Ctrl+B`, `Ctrl+X -` and `Ctrl+X =` hide and resize it as in the other views. `Ctrl+P` leaves Transfer for the Explorer and opens quick open once cleanup ends.
 
-The mouse follows the Explorer. Click a row to move the cursor, click its marker or double-click a folder to expand it, and click the check column to select. Double-click a file to open its diff. Toolbar buttons run their action, and clicking a pane header edits that root. While a root is being edited, the toolbar waits for it to be confirmed or cancelled.
+The mouse follows the Explorer. Click a row to move the cursor, click its marker or double-click a folder to expand it, and click the check column to select. Double-click a file to open its diff. Toolbar buttons run their action, and clicking a pane header edits that root. Clicking a key in the status row presses it. While a root is being edited, the toolbar waits for it to be confirmed or cancelled, and the status row offers the keys that do either.
 
 While a transfer connection holds the editing guard, ordinary editing, saves, source-control mutations and composer submission are blocked across Caudra sessions. Save or discard dirty buffers and let active work settle before connecting. Leaving Transfer cancels its worker and waits for cleanup before returning to editing. External editors and processes are outside this guard.
 

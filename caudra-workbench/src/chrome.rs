@@ -85,6 +85,17 @@ pub fn render_line(buf: &mut Buffer, area: Rect, line: Line<'_>) {
     line.render(row, buf);
 }
 
+pub fn spans_width(spans: &[Span<'_>]) -> usize {
+    spans.iter().map(Span::width).sum()
+}
+
+/// Whether [`status_line`] lays `right` out beside `left` rather than
+/// dropping it. Whatever records where the right group landed asks this too,
+/// so a group the row dropped leaves nothing behind for the pointer.
+pub fn fits(left: &[Span<'_>], right: &[Span<'_>], width: u16) -> bool {
+    spans_width(left) + spans_width(right) <= usize::from(width)
+}
+
 /// Lays a left group against a right group on one row, dropping the right group
 /// when the two would collide rather than letting it wrap. Filling the row
 /// exactly is not a collision: a caller that budgets its left group against the
@@ -95,20 +106,10 @@ pub fn status_line<'a>(
     width: u16,
     style: Style,
 ) -> Line<'a> {
-    let left_width: usize = left
-        .iter()
-        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
-        .sum();
-    let right_width: usize = right
-        .iter()
-        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
-        .sum();
     let mut spans = left;
-    if left_width + right_width <= width as usize {
-        spans.push(Span::styled(
-            " ".repeat(width as usize - left_width - right_width),
-            style,
-        ));
+    if fits(&spans, &right, width) {
+        let used = spans_width(&spans) + spans_width(&right);
+        spans.push(Span::styled(" ".repeat(usize::from(width) - used), style));
         spans.extend(right);
     }
     Line::from(spans).style(style)

@@ -553,6 +553,9 @@ pub struct Workbench {
     flash: Option<String>,
     transfer: transfer::TransferState,
     switcher: Vec<(Rect, SidebarView)>,
+    /// Where the status row's hints landed in the last frame, and the key a
+    /// press on each one stands in for.
+    hint_hits: Vec<(Rect, keys::Bind)>,
 }
 
 impl Workbench {
@@ -604,6 +607,7 @@ impl Workbench {
             flash: None,
             transfer: transfer::TransferState::default(),
             switcher: Vec::new(),
+            hint_hits: Vec::new(),
         }
     }
 
@@ -2056,7 +2060,13 @@ impl Workbench {
 
     /// A left press, told how many landed on this cell in a row. The panes are
     /// tried in painting order, so the palette gets the press it is covering.
+    /// The status row's hints go first, since they answer for whatever stands
+    /// in front, a panel included. A menu hung over the row has already taken
+    /// back the hints it covers.
     fn press(&mut self, at: (u16, u16), clicks: u8) -> WorkbenchAction {
+        if let Some(bind) = self.hint_at(at) {
+            return self.press_hint(bind);
+        }
         let position = at.into();
         if let Some(confirm) = self.confirm {
             if self.panes.confirm.contains(position)
@@ -2140,6 +2150,35 @@ impl Workbench {
             self.press_text(at, clicks);
         }
         WorkbenchAction::Consumed
+    }
+
+    /// The key the status hint under `at` stands in for, as the last frame
+    /// laid the hints out.
+    fn hint_at(&self, at: (u16, u16)) -> Option<keys::Bind> {
+        self.hint_hits
+            .iter()
+            .find(|(rect, _)| rect.contains(at.into()))
+            .map(|(_, bind)| *bind)
+    }
+
+    /// Presses the key a status hint names, through the same door the keyboard
+    /// uses, so the two cannot drift. The row is asked again first: the frame
+    /// that placed the hint can predate a key that changed what the row
+    /// offers, and a stale `U upload` would otherwise type into the root
+    /// prompt that key opened.
+    fn press_hint(&mut self, bind: keys::Bind) -> WorkbenchAction {
+        if !self
+            .offered_hints()
+            .iter()
+            .any(|(offered, _)| *offered == bind)
+        {
+            return WorkbenchAction::Consumed;
+        }
+        let key = bind.to_key_event();
+        match keys::LEADER_BINDS.contains(&bind) {
+            true => self.handle_leader(key),
+            false => self.handle_key(key),
+        }
     }
 
     /// Opens the menu on whatever the right button came down over. A press
@@ -4698,9 +4737,10 @@ mod tests {
     use crate::scroll::SCROLLBAR_THUMB;
     use crate::search;
     use crate::view::{
-        Control, MENU_HINTS, MENU_MARK, MORE_LEFT, MORE_RIGHT, NAME_HINTS, NOT_A_REPOSITORY,
-        OPEN_MARK, RENDERED_STATUS, REVERT_MARK, STAGE_MARK, TabHit, TabPart, UNSTAGE_MARK,
-        button_at, confirm_at, header_at, on_menu_mark, tab_at, toggle_at, visible_range,
+        Control, FIND_HINTS, GOTO_HINTS, Hint, MENU_HINTS, MENU_MARK, MORE_LEFT, MORE_RIGHT,
+        NAME_HINTS, NOT_A_REPOSITORY, OPEN_MARK, PALETTE_HINTS, RENDERED_STATUS, REVERT_MARK,
+        STAGE_MARK, TabHit, TabPart, UNSTAGE_MARK, button_at, confirm_at, header_at, on_menu_mark,
+        tab_at, toggle_at, visible_range,
     };
     use caudra_workspace::{ResourceKind, ScmDiffTarget, WorkspaceError, WorkspacePath};
     use crossterm::event::{
@@ -4904,6 +4944,19 @@ mod tests {
     const NOT_REVEALED: &str = "the sidebar is not showing the file it was pointed at";
     const STRAY_COPY: &str = "the release of a menu press was read as the end of a selection";
     const PANEL_OFF_BUFFER: &str = "the panel is not over the buffer, so the case is not covered";
+    const NO_HINT: &str = "the status row is not offering the key the test presses";
+    const HINT_UNLIT: &str =
+        "the hint under the pointer is not lit from its key to its description";
+    const GAP_LIT: &str = "the gap in front of a hint lit up with it";
+    const HINT_IGNORED: &str = "a click on a hint did not do what pressing its key does";
+    const HINT_REACHED_BEHIND: &str =
+        "a click on a hint reached past what stands in front of the panes";
+    const HIDDEN_HINT_PRESSED: &str = "a hint the row had no room to draw was pressed";
+    const PANEL_OFF_HINT: &str =
+        "the panel's rule is not over the hint, so the case is not covered";
+    const HINT_UNDER_MENU: &str = "a press on the menu's rule pressed the hint painted under it";
+    /// Too narrow for the editor's hints beside its path and cursor.
+    const NARROW_TERMINAL_WIDTH: u16 = 60;
     /// The file [`project`] opens, and the folder beside it.
     const OPENED_FILE: &str = "a.txt";
     const NESTED_DIR: &str = "sub";
@@ -10275,6 +10328,194 @@ mod tests {
             draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT).contains(NAME_HINTS[0].1),
             "{WRONG_HINT}"
         );
+    }
+
+    /// Where the last frame laid out the hint for `bind`, found the way the
+    /// pointer finds it.
+    pub(crate) fn hint_rect(workbench: &Workbench, bind: keys::Bind) -> Rect {
+        workbench
+            .hint_hits
+            .iter()
+            .find(|(_, offered)| *offered == bind)
+            .map(|(rect, _)| *rect)
+            .expect(NO_HINT)
+    }
+
+    fn open_goto(workbench: &mut Workbench) {
+        workbench.handle_key(press(keys::GOTO_LINE));
+    }
+
+    fn open_tab_menu(workbench: &mut Workbench) {
+        workbench.handle_leader(press(keys::MENU));
+    }
+
+    /// Leaves unsaved work in the tab and asks to close it, which stands the
+    /// dialog over the editor.
+    fn ask_to_close_edited(workbench: &mut Workbench) {
+        workbench.handle_key(key(KeyCode::Char(EDIT)));
+        workbench.handle_leader(press(keys::CLOSE_TAB));
+    }
+
+    #[test]
+    fn a_hint_under_the_pointer_is_lit_whole() {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let hint = hint_rect(&workbench, keys::CLOSE);
+
+        workbench.handle_mouse(moved(hint.right() - 1, hint.y));
+        let surface = paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+
+        let hover = WorkbenchStyles::default().hover.add_modifier;
+        let lit = |column: u16| surface[(column, hint.y)].modifier.contains(hover);
+        assert!((hint.x..hint.right()).all(lit), "{HINT_UNLIT}");
+        assert!(!lit(hint.x - 1), "{GAP_LIT}");
+    }
+
+    fn leaves(_: &Workbench, action: &WorkbenchAction) -> bool {
+        *action == WorkbenchAction::Close
+    }
+
+    fn sends(_: &Workbench, action: &WorkbenchAction) -> bool {
+        matches!(action, WorkbenchAction::SendToComposer { .. })
+    }
+
+    fn finds(workbench: &Workbench, _: &WorkbenchAction) -> bool {
+        workbench
+            .editor
+            .active()
+            .is_some_and(|tab| tab.find.is_open())
+    }
+
+    fn saves(workbench: &Workbench, _: &WorkbenchAction) -> bool {
+        let on_disk = fs::read_to_string(workbench.root.join(OPENED_FILE)).unwrap_or_default();
+        on_disk.starts_with(EDIT) && workbench.editor.active().is_some_and(|tab| !tab.is_dirty())
+    }
+
+    /// One keystroke of unsaved work is left in the tab first, so saving has
+    /// something to write.
+    #[test_case(keys::SAVE, saves ; "save writes the file")]
+    #[test_case(keys::FIND, finds ; "find opens the find bar")]
+    #[test_case(keys::SEND_TO_COMPOSER, sends ; "a chord is pressed as its second half")]
+    #[test_case(keys::CLOSE, leaves ; "esc leaves the workbench")]
+    fn a_click_on_a_hint_presses_the_key_it_names(
+        bind: keys::Bind,
+        pressed: fn(&Workbench, &WorkbenchAction) -> bool,
+    ) {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        workbench.handle_key(key(KeyCode::Char(EDIT)));
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let hint = hint_rect(&workbench, bind);
+
+        let action = workbench.handle_mouse(click(hint.x, hint.y));
+
+        assert!(pressed(&workbench, &action), "{HINT_IGNORED}: {action:?}");
+    }
+
+    /// A Markdown tab offers its other view as well, which only fits beside
+    /// the rest on a wide row.
+    #[test]
+    fn a_click_on_the_view_hint_shows_the_other_view() {
+        let (_dir, mut workbench) = markdown_project(INDEXED_TEXT);
+        paint(&mut workbench, WIDE_TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let hint = hint_rect(&workbench, keys::TOGGLE_RENDERED);
+
+        workbench.handle_mouse(click(hint.x, hint.y));
+
+        assert!(rendered(&workbench), "{HINT_IGNORED}");
+    }
+
+    /// Each of these takes `Esc` before the workbench would, so the hint has
+    /// to name what it closes, and the click has to stop there.
+    #[test_case(open_palette ; "the palette")]
+    #[test_case(open_goto ; "go to line")]
+    #[test_case(open_find ; "the find bar")]
+    #[test_case(open_tab_menu ; "the menu")]
+    #[test_case(ask_to_close_edited ; "the dialog")]
+    #[test_case(open_name ; "the name prompt")]
+    fn a_hint_answers_whatever_stands_in_front(open: fn(&mut Workbench)) {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        open(&mut workbench);
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let hint = hint_rect(&workbench, keys::CLOSE);
+
+        let action = workbench.handle_mouse(click(hint.x, hint.y));
+
+        assert_eq!(action, WorkbenchAction::Consumed, "{HINT_REACHED_BEHIND}");
+        assert!(
+            workbench.focused_field().is_none()
+                && workbench.menu.is_none()
+                && workbench.confirm.is_none(),
+            "{HINT_IGNORED}"
+        );
+        assert_eq!(workbench.editor.tabs().len(), 1, "{HINT_REACHED_BEHIND}");
+    }
+
+    #[test]
+    fn a_click_on_enter_takes_what_the_menu_has_selected() {
+        let (dir, mut workbench) = project();
+        open_row_menu(&dir, &mut workbench);
+        let hint = hint_rect(&workbench, keys::ACCEPT);
+
+        workbench.handle_mouse(click(hint.x, hint.y));
+
+        assert!(workbench.menu.is_none(), "{MENU_STUCK}");
+        assert_eq!(workbench.active_title(), OPENED_FILE, "{HINT_IGNORED}");
+    }
+
+    #[test_case(open_palette, &PALETTE_HINTS ; "the palette")]
+    #[test_case(open_goto, &GOTO_HINTS ; "go to line")]
+    #[test_case(open_find, &FIND_HINTS ; "the find bar")]
+    fn the_status_row_says_what_esc_does_over_a_field(open: fn(&mut Workbench), expected: &[Hint]) {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+
+        open(&mut workbench);
+
+        assert_eq!(workbench.offered_hints(), expected, "{WRONG_HINT}");
+    }
+
+    #[test]
+    fn hints_with_no_room_beside_the_path_cannot_be_pressed() {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        paint(&mut workbench, NARROW_TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let status = workbench.panes.status;
+
+        let action = workbench.handle_mouse(click(status.right() - 1, status.y));
+
+        assert!(workbench.hint_hits.is_empty(), "{HIDDEN_HINT_PRESSED}");
+        assert_eq!(action, WorkbenchAction::Consumed, "{HIDDEN_HINT_PRESSED}");
+    }
+
+    /// A row's menu opened low enough in a tall tree, and far enough right,
+    /// lays its bottom rule over the hints at the end of the status row.
+    #[test]
+    fn a_menu_over_the_status_row_keeps_its_presses() {
+        let (_dir, mut workbench) = tall_project();
+        workbench.sidebar_width = MAX_SIDEBAR_WIDTH;
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let rows = workbench.panes.rows;
+        let column = rows.right() - 1;
+        workbench.handle_mouse(right_click(column, rows.y));
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let take = hint_rect(&workbench, keys::ACCEPT);
+        let low = rows.y + take.y - workbench.panes.menu.bottom();
+        workbench.handle_mouse(right_click(column, low));
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let panel = workbench.panes.menu;
+        assert!(
+            panel.bottom() == take.y && (panel.x..panel.right()).contains(&take.x),
+            "{PANEL_OFF_HINT}"
+        );
+
+        let action = workbench.handle_mouse(click(take.x, take.y));
+
+        assert_eq!(action, WorkbenchAction::Consumed, "{HINT_UNDER_MENU}");
+        assert!(workbench.editor.tabs().is_empty(), "{HINT_UNDER_MENU}");
+        assert!(workbench.menu.is_none(), "{MENU_STUCK}");
     }
 
     #[test]

@@ -1702,6 +1702,9 @@ impl Workbench {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.hover = Some(at);
                 let clicks = self.clicks.press(at, Instant::now());
+                if let Some(bind) = self.hint_at(at) {
+                    return self.press_hint(bind);
+                }
                 return self.transfer.press(at, clicks);
             }
             MouseEventKind::ScrollUp => self.transfer.scroll(-SCROLL_LINES),
@@ -1754,6 +1757,7 @@ mod tests {
         TransferReviewEntry, TransferRoots, TransferScan, TransferScanLimit, TransferSide,
         TransferSnapshot, TransferStatus,
     };
+    use crate::tests::hint_rect;
     use crate::{
         DocumentKey, Layout, MIN_SIDEBAR_WIDTH, SidebarView, TabLabel, Workbench, WorkbenchAction,
         WorkbenchStyles, keys,
@@ -1819,6 +1823,8 @@ mod tests {
     const WRONG_DRAFT: &str = "copying must leave the draft alone and cutting must take it";
     const NO_TERMINAL: &str = "a test terminal";
     const NO_FRAME: &str = "a frame";
+    const PROMPT_STUCK: &str = "a click on the prompt's own hint did not close it";
+    const STALE_HINT_PRESSED: &str = "a hint the row no longer offers was pressed";
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -3499,6 +3505,59 @@ mod tests {
         assert_eq!(draft(&workbench), Some(SANDBOX_DRAFT));
         paint(&mut workbench, WIDE);
         assert!(enabled(&workbench).is_empty());
+    }
+
+    #[test]
+    fn a_status_hint_presses_the_transfer_key_it_names() {
+        let mut workbench = workbench();
+        paint(&mut workbench, WIDE);
+        let hint = hint_rect(&workbench, keys::COMPARE);
+
+        let action = workbench.handle_mouse(click(hint.x, hint.y));
+
+        assert!(
+            matches!(
+                action,
+                WorkbenchAction::Transfer(TransferAction::Compare { .. })
+            ),
+            "{NO_COMPARE}"
+        );
+    }
+
+    #[test]
+    fn a_status_hint_answers_the_root_prompt_in_front() {
+        let mut workbench = workbench();
+        press(&mut workbench, keys::SANDBOX_ROOT);
+        paint(&mut workbench, WIDE);
+        let hint = hint_rect(&workbench, keys::CLOSE);
+
+        let action = workbench.handle_mouse(click(hint.x, hint.y));
+
+        assert_eq!(action, WorkbenchAction::Consumed, "{PROMPT_STUCK}");
+        assert!(workbench.transfer.prompt.is_none(), "{PROMPT_STUCK}");
+        assert_eq!(
+            workbench.sidebar_view(),
+            SidebarView::Transfer,
+            "{PROMPT_STUCK}"
+        );
+    }
+
+    /// The frame that placed `U upload` predates the key that opened the
+    /// prompt, where pressing it would type into the root.
+    #[test]
+    fn a_hint_the_row_no_longer_offers_is_not_pressed() {
+        let mut workbench = workbench();
+        paint(&mut workbench, WIDE);
+        let upload = hint_rect(&workbench, keys::UPLOAD);
+        press(&mut workbench, keys::SANDBOX_ROOT);
+
+        workbench.handle_mouse(click(upload.x, upload.y));
+
+        assert_eq!(
+            draft(&workbench),
+            Some(SANDBOX_DRAFT),
+            "{STALE_HINT_PRESSED}"
+        );
     }
 
     #[test]
