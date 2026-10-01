@@ -1610,7 +1610,12 @@ async fn isolated_python_permissions(client: &RemoteWorkcellClient, root: &Path,
             },
         )
         .await;
-        assert_eq!(done.is_error, denied, "{}", done.output.as_text());
+        assert_eq!(
+            done.is_error,
+            denied || code != PYTHON_SUM,
+            "{}",
+            done.output.as_text()
+        );
         if code != PYTHON_SUM {
             let diagnostic = if code.starts_with("import") {
                 PYTHON_NO_SOCKET
