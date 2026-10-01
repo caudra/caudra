@@ -37,7 +37,8 @@ use caudra_agent::{
     tools::{
         FILE_READ_TOOL_NAME, FILE_WRITE_TOOL_NAME, IMAGE_GENERATE_TOOL_NAME,
         LOCAL_DOCUMENT_WRITE_TOOL_NAME, MEMORY_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME,
-        SHELL_TOOL_NAME, TASK_TOOL_NAME, humanize_duration, timeout_annotation,
+        SHELL_TOOL_NAME, TASK_TOOL_NAME, TOOL_OUTPUT_TOOL_NAME, humanize_duration,
+        timeout_annotation,
     },
 };
 use caudra_workcell::{CURRENT_WORKDIR, effective_timeout, requested_workdir};
@@ -315,6 +316,7 @@ const MARKDOWN_EXTENSIONS: &[&str] = &["md", "markdown", "mdx"];
 const QUERY_KEYS: &[(&str, &str)] = &[
     ("file_grep", "pattern"),
     ("file_glob", "pattern"),
+    (TOOL_OUTPUT_TOOL_NAME, "pattern"),
     ("code_context", "task"),
     ("code_refs", "symbol"),
     ("code_impact", "symbol"),
@@ -464,6 +466,7 @@ const PATCH: Inflection = ("Patch", "Patching", "Patched");
 const INDEX: Inflection = ("Index", "Indexing", "Indexed");
 const SEARCH: Inflection = ("Search", "Searching", "Searched");
 const FETCH: Inflection = ("Fetch", "Fetching", "Fetched");
+const RETRIEVE: Inflection = ("Retrieve output", "Retrieving output", "Retrieved output");
 const RUN: Inflection = ("Run", "Running", "Ran");
 const COMPUTE: Inflection = ("Compute", "Computing", "Computed");
 const INSPECT: Inflection = ("Inspect", "Inspecting", "Inspected");
@@ -514,6 +517,7 @@ const COMPACT_TOOLS: &[(&str, CompactTool)] = &[
     tool_row("file_index", '≡', INDEX, &["path"]),
     tool_row("websearch", '◈', SEARCH, &["query"]),
     tool_row("webfetch", '↓', FETCH, &["url"]),
+    tool_row(TOOL_OUTPUT_TOOL_NAME, '↩', RETRIEVE, &[]),
     tool_row("shell", '$', RUN, &["command", "timeoutSec", "workdir"]),
     tool_row("python_execution", 'λ', COMPUTE, &["code", "timeoutSec"]),
     tool_row("code_map", '◇', MAP, &["path"]),
@@ -4215,6 +4219,32 @@ mod tests {
         }
     }
 
+    const OUTPUT_ID: &str = "output-shell-1";
+
+    #[test_case(ToolStatus::InProgress, "Retrieving output" ; "running")]
+    #[test_case(ToolStatus::Success, "Retrieved output" ; "completed")]
+    #[test_case(ToolStatus::Error, "Retrieve output" ; "failed")]
+    fn retrieval_cards_name_their_state(status: ToolStatus, label: &str) {
+        for tool in [TOOL_OUTPUT_TOOL_NAME, "mcp_Tool_output", "srv.toolOutput"] {
+            let mut msg = bash_msg(OUTPUT_ID, status, None, None);
+            if let DisplayRole::Tool(role) = &mut msg.role {
+                role.name = tool.into();
+            }
+            for (rctx, expansion) in [
+                (compact_rctx(UNBROKEN), None),
+                (test_rctx(UNBROKEN), Some(exp(true))),
+            ] {
+                let lines = build_tool_lines(&msg, status, &rctx, expansion);
+                let header = line_text(&lines.lines[0]);
+                assert!(header.contains(&format!("{label} {OUTPUT_ID}")), "{header}");
+                assert!(!header.contains(tool), "{header}");
+                if !rctx.compact || status != ToolStatus::InProgress {
+                    assert!(header.contains('↩'), "{header}");
+                }
+            }
+        }
+    }
+
     /// A store's header opens on the verb the call asks for, and a call still
     /// waiting to be allowed has only asked.
     #[test]
@@ -6940,6 +6970,7 @@ mod tests {
     #[test_case("shell", "Running" ; "shell")]
     #[test_case("file_read", "Reading" ; "read")]
     #[test_case("file_grep", "Grepping" ; "grep")]
+    #[test_case(TOOL_OUTPUT_TOOL_NAME, "Retrieving output" ; "retrieval")]
     #[test_case("task", "Delegating" ; "task")]
     fn an_activity_names_its_tool_by_verb(tool: &str, expected: &str) {
         let activity = SubagentActivity::tool(Arc::from(tool), "");
@@ -6953,6 +6984,7 @@ mod tests {
     #[test_case("shell", "Ran" ; "shell")]
     #[test_case("file_read", "Read" ; "read")]
     #[test_case("file_grep", "Grepped" ; "grep")]
+    #[test_case(TOOL_OUTPUT_TOOL_NAME, "Retrieved output" ; "retrieval")]
     #[test_case("task", "Delegated" ; "task")]
     fn a_superseded_activity_names_its_tool_in_the_past(tool: &str, expected: &str) {
         let activity = SubagentActivity::tool(Arc::from(tool), "");
@@ -7395,27 +7427,42 @@ mod tests {
     /// would cut in the wrong place. The input is what still knows where the
     /// query ends.
     #[test_case(
-        "pub mod in caudra-agent/src", "pub mod",
+        GREP_TOOL, "pub mod in caudra-agent/src", "pub mod",
         &[(true, "pub mod"), (false, " in caudra-agent/src")]
         ; "the query is marked off from its root"
     )]
     #[test_case(
-        "mod in src in caudra-ui", "mod in src",
+        GREP_TOOL, "mod in src in caudra-ui", "mod in src",
         &[(true, "mod in src"), (false, " in caudra-ui")]
         ; "a pattern holding the joining word splits at its own end"
     )]
     #[test_case(
-        "fn main", "fn main",
+        GREP_TOOL, "fn main", "fn main",
         &[(true, "fn main")]
         ; "a rootless search is all query and gains no empty tail"
     )]
+    #[test_case(
+        TOOL_OUTPUT_TOOL_NAME, "error in context in output-shell-1", "error in context",
+        &[(true, "error in context"), (false, " in output-shell-1")]
+        ; "retrieval_marks_only_the_query"
+    )]
+    #[test_case(
+        "mcp_Tool_output", "error in output-shell-1", "error",
+        &[(true, "error"), (false, " in output-shell-1")]
+        ; "qualified_retrieval"
+    )]
+    #[test_case(
+        TOOL_OUTPUT_TOOL_NAME, "error", "error", &[(true, "error")]
+        ; "legacy_retrieval_summary"
+    )]
     fn a_search_header_marks_the_text_it_searched_for(
+        tool: &str,
         header: &str,
         pattern: &str,
         expected: &[(bool, &str)],
     ) {
         let parts = header_parts(
-            GREP_TOOL,
+            tool,
             header,
             Some(serde_json::json!({ "pattern": pattern })),
         );
@@ -7433,6 +7480,7 @@ mod tests {
     #[test_case(GREP_TOOL, "needle in src", None ; "a session that kept no input")]
     #[test_case(GREP_TOOL, "needle in src", Some(serde_json::json!({ "pattern": "other" })) ; "a header that does not open with the pattern")]
     #[test_case(GREP_TOOL, "needle in src", Some(serde_json::json!({ "pattern": "" })) ; "an empty pattern marks nothing")]
+    #[test_case(TOOL_OUTPUT_TOOL_NAME, OUTPUT_ID, Some(serde_json::json!({ "output_id": OUTPUT_ID })) ; "retrieval_without_a_query")]
     fn a_header_with_no_query_to_mark_stays_one_span(
         tool: &str,
         header: &str,
@@ -7528,6 +7576,30 @@ mod tests {
         "mcp_File_grep", "pub mod in src", serde_json::json!({ "pattern": "pub mod", "path": "src", "include": "*.rs" }),
         Some(" [include=*.rs]")
         ; "a search keeps only the filter its header omits"
+    )]
+    #[test_case(
+        TOOL_OUTPUT_TOOL_NAME, OUTPUT_ID,
+        serde_json::json!({ "output_id": OUTPUT_ID, "offset": 1, "limit": 20, "byte_offset": 8 }),
+        Some(" [byte_offset=8, limit=20, offset=1]")
+        ; "retrieval_keeps_pagination"
+    )]
+    #[test_case(
+        "mcp_Tool_output", "error in output-shell-1",
+        serde_json::json!({ "output_id": OUTPUT_ID, "pattern": "error", "limit": 20, "context_before": 1, "context_after": 2 }),
+        Some(" [context_after=2, context_before=1, limit=20]")
+        ; "retrieval_keeps_context_without_repeating_query_or_handle"
+    )]
+    #[test_case(
+        TOOL_OUTPUT_TOOL_NAME, "error",
+        serde_json::json!({ "output_id": OUTPUT_ID, "pattern": "error", "limit": 20 }),
+        Some(" [limit=20, output_id=output-shell-1]")
+        ; "legacy_retrieval_summary_keeps_its_handle"
+    )]
+    #[test_case(
+        TOOL_OUTPUT_TOOL_NAME, OUTPUT_ID,
+        serde_json::json!({ "output_id": OUTPUT_ID, "pattern": "error", "limit": 20 }),
+        Some(" [limit=20, pattern=error]")
+        ; "retrieval_keeps_a_query_missing_from_its_summary"
     )]
     fn the_brackets_never_repeat_the_header(
         tool: &str,

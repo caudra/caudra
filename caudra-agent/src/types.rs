@@ -25,7 +25,7 @@ use strum::Display;
 
 use crate::agent::{GoalResult, GoalVerdict};
 use crate::permissions::PermissionRequest;
-use crate::tools::{ToolEffect, ToolFailure};
+use crate::tools::{TOOL_OUTPUT_TOOL_NAME, ToolEffect, ToolFailure};
 
 pub const NO_FILES_FOUND: &str = "No files found";
 pub const INDEX_TRUNCATED: &str = "[truncated]";
@@ -66,6 +66,7 @@ const MEMORY_INDEX_SEPARATOR: &str = "\n";
 const MEMORY_NOTE_NOUN: &str = "note";
 const MEMORY_TAG_NOUN: &str = "tag";
 const LINE_NOUN: &str = "line";
+const TOOL_OUTPUT_LOADED: &str = "loaded";
 
 const STATE_KIND_FIELD: &str = "kind";
 /// Results sized by what they cost the model rather than by their lines: a
@@ -371,6 +372,11 @@ impl TextOutput {
             .and_then(|state| state.get(STATE_KIND_FIELD))
             .and_then(serde_json::Value::as_str);
         match kind {
+            Some(TOOL_OUTPUT_TOOL_NAME) => format!(
+                "{}{CARD_ANNOTATION_SEPARATOR}{} {TOOL_OUTPUT_LOADED}",
+                counted(self.text.lines().count(), LINE_NOUN),
+                token_label(estimate_tokens_cached(&self.text))
+            ),
             Some(kind) if TOKEN_SIZED_KINDS.contains(&kind) => {
                 token_label(estimate_tokens_cached(&self.text))
             }
@@ -3267,6 +3273,27 @@ mod tests {
     }
 
     const WEB_RESULT: &str = "# Title\n\nFirst paragraph.\nSecond paragraph.";
+    const EMPTY_SEARCH_RESULT: &str = "No matches.";
+    const UNICODE_PAGE: &str = "結果\nαβγ\n";
+
+    #[test_case(WEB_RESULT, "4 lines" ; "multiline_response")]
+    #[test_case(EMPTY_SEARCH_RESULT, "1 line" ; "empty_search")]
+    #[test_case(UNICODE_PAGE, "2 lines" ; "unicode_and_trailing_newline")]
+    fn retrieved_output_annotation_survives_serialization(text: &str, lines: &str) {
+        let output = ToolOutput::Plain(TextOutput {
+            state: Some(json!({ STATE_KIND_FIELD: TOOL_OUTPUT_TOOL_NAME })),
+            ..TextOutput::from(text)
+        });
+        let expected = format!(
+            "{lines}{CARD_ANNOTATION_SEPARATOR}{} {TOOL_OUTPUT_LOADED}",
+            token_label(estimate_tokens(text))
+        );
+        assert_eq!(output.annotation().as_deref(), Some(expected.as_str()));
+        let restored: ToolOutput =
+            serde_json::from_value(serde_json::to_value(&output).unwrap()).unwrap();
+        assert_eq!(restored.annotation().as_deref(), Some(expected.as_str()));
+        assert_eq!(restored.as_text(), text);
+    }
 
     /// A web result is sized by what the model pays for it. Other Workcell
     /// text, such as a `python_execution` result, keeps its line count.

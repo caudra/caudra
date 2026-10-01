@@ -1342,15 +1342,16 @@ fn build_tool_results_map(items: &[HistoryItem]) -> HashMap<&str, ToolResultRef<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use caudra_agent::tools::{BATCH_TOOL_NAME, SHELL_TOOL_NAME};
+    use caudra_agent::tools::{BATCH_TOOL_NAME, SHELL_TOOL_NAME, TOOL_OUTPUT_TOOL_NAME};
     use caudra_agent::{
         AgentEvent, BatchToolEntry, BatchToolStatus, IndexLine, IndexLineSemantic, IndexOutput,
-        IndexSourceRange, SharedBuf, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
+        IndexSourceRange, SharedBuf, TextOutput, ToolDoneEvent, ToolOutput, ToolStartEvent,
+        TurnCompleteEvent,
     };
     use caudra_config::UiConfig;
     use caudra_providers::{
         Billing, ContentBlock, Message, Role, StandingReminderKind, TaskEventOrigin,
-        project_messages,
+        estimate_tokens_cached, project_messages, token_label,
     };
     use ratatui::{Terminal, backend::TestBackend};
     use test_case::test_case;
@@ -1964,6 +1965,85 @@ mod tests {
         let outputs = HashMap::from([("t1".into(), Arc::new(write_output))]);
         let display = display_messages(&msgs, &outputs).0;
         assert!(display[0].annotation.is_some());
+    }
+
+    const RETRIEVED_OUTPUT_ID: &str = "output-shell-1";
+    const RETRIEVED_TEXT: &str = "Output ID: output-shell-1\n1: retrieved line";
+    const RETRIEVED_PATTERN: &str = "retrieved";
+    const RETRIEVED_ANNOTATION_MSG: &str =
+        "live and restored cards derive the loaded annotation from persisted output state";
+
+    #[test_case(false, false ; "read")]
+    #[test_case(false, true ; "search")]
+    #[test_case(true, true ; "batch_search")]
+    fn retrieval_annotations_survive_session_replay(batched: bool, search: bool) {
+        let output = ToolOutput::Plain(TextOutput {
+            state: Some(serde_json::json!({ "kind": TOOL_OUTPUT_TOOL_NAME })),
+            ..RETRIEVED_TEXT.into()
+        });
+        let mut input = serde_json::json!({ "output_id": RETRIEVED_OUTPUT_ID });
+        let summary = if search {
+            input["pattern"] = RETRIEVED_PATTERN.into();
+            format!("{RETRIEVED_PATTERN} in {RETRIEVED_OUTPUT_ID}")
+        } else {
+            RETRIEVED_OUTPUT_ID.into()
+        };
+        let (tool, input, output) = if batched {
+            let batch_input = serde_json::json!({
+                "tool_calls": [{ "tool": TOOL_OUTPUT_TOOL_NAME, "parameters": input }]
+            });
+            let output = ToolOutput::Batch {
+                entries: vec![BatchToolEntry {
+                    tool: TOOL_OUTPUT_TOOL_NAME.into(),
+                    effect: ToolEffect::Unknown,
+                    summary,
+                    status: BatchToolStatus::Success,
+                    input: None,
+                    raw_input: Some(input),
+                    output: Some(output),
+                    annotation: None,
+                    model_suffix: None,
+                }],
+                text: RETRIEVED_TEXT.into(),
+            };
+            (BATCH_TOOL_NAME, batch_input, output)
+        } else {
+            (TOOL_OUTPUT_TOOL_NAME, input, output)
+        };
+        let stored: ToolOutput =
+            serde_json::from_value(serde_json::to_value(&output).unwrap()).unwrap();
+        let mut live = chat();
+        live.handle_event(tool_start("t1", tool), None);
+        live.handle_event(tool_done("t1", tool, output), None);
+        let messages = tool_use_pair(tool, input, RETRIEVED_TEXT, false);
+        let outputs = HashMap::from([("t1".into(), Arc::new(stored))]);
+        let mut replayed = chat();
+        replayed.load_messages(display_messages(&messages, &outputs).0);
+        let annotation = format!(
+            "(2 lines · {} loaded)",
+            token_label(estimate_tokens_cached(RETRIEVED_TEXT))
+        );
+        let area = Rect::new(0, 0, 200, 20);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        for mut card in [live, replayed] {
+            card.set_view(ViewMode::Expanded);
+            terminal
+                .draw(|frame| card.view(frame, area, false, false))
+                .unwrap();
+            let shown: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(shown.contains("Retrieved output"), "{shown}");
+            assert_eq!(
+                shown.matches(&annotation).count(),
+                1,
+                "{RETRIEVED_ANNOTATION_MSG}: {shown}"
+            );
+        }
     }
 
     #[test]

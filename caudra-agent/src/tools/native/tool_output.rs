@@ -10,15 +10,15 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::tools::registry::{
     ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolError, ToolExecResult,
     ToolFailure, ToolInvocation,
 };
 use crate::tools::schema::{ParamKind, ParamSchema, Property, to_json_schema, validate};
-use crate::tools::{DescriptionContext, ToolAudience, ToolContext};
-use crate::types::ToolOutput;
+use crate::tools::{DescriptionContext, TOOL_OUTPUT_TOOL_NAME, ToolAudience, ToolContext};
+use crate::types::{TextOutput, ToolOutput};
 use caudra_providers::{estimate_tokens, token_label};
 use caudra_storage::id::CaudraId;
 use caudra_storage::tool_outputs::{
@@ -98,7 +98,7 @@ pub struct ToolOutputTool;
 
 impl Tool for ToolOutputTool {
     fn name(&self) -> &str {
-        crate::tools::TOOL_OUTPUT_TOOL_NAME
+        TOOL_OUTPUT_TOOL_NAME
     }
 
     fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
@@ -195,7 +195,10 @@ struct GrepCall {
 
 impl ToolInvocation for GrepCall {
     fn start_header(&self) -> HeaderFuture {
-        HeaderFuture::Ready(HeaderResult::plain(self.pattern.clone()))
+        HeaderFuture::Ready(HeaderResult::plain(format!(
+            "{} in {}",
+            self.pattern, self.output_id
+        )))
     }
 
     fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
@@ -226,7 +229,10 @@ impl GrepCall {
 
 fn page_result(page: Result<String, ToolError>) -> ToolExecResult {
     match page {
-        Ok(text) => ToolExecResult::from(Ok(ToolOutput::Plain(text.into()))),
+        Ok(text) => ToolExecResult::from(Ok(ToolOutput::Plain(TextOutput {
+            state: Some(json!({ "kind": TOOL_OUTPUT_TOOL_NAME })),
+            ..TextOutput::from(text)
+        }))),
         Err(error) => ToolExecResult::failed(error.failure, format!("error: {error}")),
     }
 }
@@ -295,7 +301,7 @@ fn line_count(text: &str) -> usize {
 }
 
 fn read_hint(output_id: &str, offset: usize, byte_offset: usize, limit: usize) -> String {
-    let tool = crate::tools::TOOL_OUTPUT_TOOL_NAME;
+    let tool = TOOL_OUTPUT_TOOL_NAME;
     if byte_offset > 0 {
         format!(
             "Next call: {tool}(output_id={output_id:?}, offset={offset}, byte_offset={byte_offset}, limit={limit})"
@@ -376,7 +382,7 @@ fn format_grep(call: &GrepCall, result: &ToolOutputGrepResult) -> String {
         parts.push(String::new());
         parts.push(format!(
             "Next call: {}(output_id={:?}, pattern={:?}, offset={next_offset}, limit={}, context_before={}, context_after={})",
-            crate::tools::TOOL_OUTPUT_TOOL_NAME,
+            TOOL_OUTPUT_TOOL_NAME,
             call.output_id,
             call.pattern,
             call.limit,
@@ -394,12 +400,15 @@ mod tests {
     use crate::tools::test_support::stub_ctx;
     use caudra_storage::StateDir;
     use caudra_storage::id::SessionRef;
-    use serde_json::json;
     use test_case::test_case;
 
     const SESSION: &str = "CNK1hV6GWoysH3KQMm5wv";
     const OTHER_SESSION: &str = "CNK1hV6GWoysH3KQMm5ww";
     const NO_MATCHES: &str = "No matches.";
+    const OUTPUT_ID: &str = "output-file-read-588";
+    const SEARCH_PATTERN: &str = "beta";
+    const SEARCH_HEADER: &str = "beta in output-file-read-588";
+    const PAGE_TEXT: &str = "alpha\nbeta\nbeta\n";
 
     struct Fixture {
         _temp: tempfile::TempDir,
@@ -431,6 +440,48 @@ mod tests {
             Ok(output) => Ok(output.as_text()),
             Err(error) => Err(error),
         }
+    }
+
+    #[test_case(None, OUTPUT_ID ; "read_handle")]
+    #[test_case(Some(SEARCH_PATTERN), SEARCH_HEADER ; "search_pattern_and_handle")]
+    fn headers_identify_the_output(pattern: Option<&str>, expected: &str) {
+        let mut input = json!({ "output_id": OUTPUT_ID });
+        if let Some(pattern) = pattern {
+            input["pattern"] = json!(pattern);
+        }
+        let invocation = ToolOutputTool.parse(&input).unwrap();
+        assert_eq!(invocation.start_header().into_ready().text(), expected);
+    }
+
+    #[test_case(PAGE_TEXT.to_owned(), json!({ "limit": 1 }) ; "partial_read")]
+    #[test_case(PAGE_TEXT.to_owned(), json!({ "pattern": SEARCH_PATTERN, "limit": 1, "context_before": 1 }) ; "search_with_context")]
+    #[test_case(PAGE_TEXT.to_owned(), json!({ "pattern": "absent" }) ; "no_matches")]
+    #[test_case(String::new(), json!({}) ; "empty_source")]
+    #[test_case("x".repeat(MAX_OUTPUT_BYTES * 2), json!({ "limit": 1 }) ; "bounded_long_line")]
+    fn successful_pages_preserve_their_presentation_kind(text: String, mut input: Value) {
+        let f = fixture(&text);
+        input["output_id"] = json!(f.output_id);
+        let invocation = ToolOutputTool.parse(&input).unwrap();
+        let result = smol::block_on(invocation.execute(&f.ctx));
+        assert!(!result.is_error);
+        assert!(result.annotation.is_none());
+        let output = result.output.unwrap();
+        assert_eq!(
+            output.state(),
+            Some(&json!({ "kind": TOOL_OUTPUT_TOOL_NAME }))
+        );
+        let response = output.as_text();
+        assert!(fits(&response));
+        assert!(
+            output
+                .annotation()
+                .unwrap()
+                .contains(&token_label(estimate_tokens(&response)))
+        );
+        let restored: ToolOutput =
+            serde_json::from_value(serde_json::to_value(&output).unwrap()).unwrap();
+        assert_eq!(restored.annotation(), output.annotation());
+        assert_eq!(restored.as_text(), response);
     }
 
     #[test]
@@ -489,6 +540,8 @@ mod tests {
         let result = smol::block_on(invocation.execute(&f.ctx));
         assert!(result.is_error);
         assert_eq!(result.failure, Some(expected));
+        assert!(result.output.is_err());
+        assert!(result.annotation.is_none());
     }
 
     #[test]
@@ -505,8 +558,7 @@ mod tests {
         assert!(
             first.contains(&format!(
                 "Next call: {}(output_id={:?}, offset=3, limit=2)",
-                crate::tools::TOOL_OUTPUT_TOOL_NAME,
-                f.output_id
+                TOOL_OUTPUT_TOOL_NAME, f.output_id
             )),
             "{first}"
         );
