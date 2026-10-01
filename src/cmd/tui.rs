@@ -22,6 +22,7 @@ use caudra_agent::permissions::pattern_recognition::{PatternCandidate, Recogniti
 use caudra_agent::prompt::profile::{PromptProfileCatalog, SystemPromptProfile};
 use caudra_agent::tools::{ToolAudience, ToolFilter, ToolRegistry};
 use caudra_agent::worktree::Backend;
+use caudra_config::providers::builtin_provider;
 use caudra_config::sandbox::SandboxName;
 use caudra_config::{Config, Feature, StorageConfig};
 use caudra_lua::PluginHost;
@@ -56,7 +57,9 @@ use crate::docs;
 use crate::progress::SandboxProgress;
 use crate::setup;
 
-const FALLBACK_MODEL_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
+const LOGIN_PLACEHOLDER_PROVIDER: &str = "anthropic";
+const LOGIN_PLACEHOLDER_UNAVAILABLE: &str = "built-in login placeholder provider is not registered";
+const LOGIN_PLACEHOLDER_INVALID: &str = "resolve built-in login placeholder model";
 const CONFIG_FALLBACK_WARNING: &str = "config reload failed, using previous config";
 const TIGHTENED_DIRS_WARNING: &str =
     "Caudra directories were group- or world-writable and have been set to owner-only";
@@ -587,6 +590,13 @@ fn discover_commands(disable: bool) -> Vec<CustomCommand> {
     command::discover_commands(&cwd)
 }
 
+fn login_placeholder_model() -> Result<Model> {
+    let provider = builtin_provider(LOGIN_PLACEHOLDER_PROVIDER)
+        .ok_or_else(|| eyre!(LOGIN_PLACEHOLDER_UNAVAILABLE))?;
+    Model::from_spec(provider.default_model)
+        .with_context(|| format!("{LOGIN_PLACEHOLDER_INVALID}: {}", provider.default_model))
+}
+
 fn config_or_fallback<T>(
     loaded: Result<T>,
     fallback: Option<T>,
@@ -678,10 +688,7 @@ fn build_stack(
             warnings.push(format!("{MODEL_FALLBACK_WARNING}: {e:#}"));
             (last_model, false)
         }
-        (Err(_), None) if !cli.print => {
-            let placeholder = Model::from_spec(FALLBACK_MODEL_SPEC).expect("fallback model");
-            (placeholder, true)
-        }
+        (Err(_), None) if !cli.print => (login_placeholder_model()?, true),
         (Err(e), None) => return Err(e),
     };
 
@@ -3776,6 +3783,15 @@ mod tests {
             "{:?}",
             resolved.warnings
         );
+    }
+
+    #[test_case("anthropic"; "anthropic_builtin")]
+    fn login_placeholder_uses_builtin_default(provider_slug: &str) {
+        let model = login_placeholder_model().unwrap();
+        let provider = builtin_provider(provider_slug).unwrap();
+
+        assert_eq!(model.provider.to_string(), provider_slug);
+        assert_eq!(model.spec(), provider.default_model);
     }
 
     fn test_config() -> Config {
