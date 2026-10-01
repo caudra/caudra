@@ -9,7 +9,7 @@ group = "Guides"
 
 Caudra stores conversation history as parent-linked items. User prompts, assistant text, reasoning, tool calls, and tool results are separate items. A session head selects the active path through those items. Moving the head keeps the abandoned path available for unrevert and later forks.
 
-For remote sessions, transcripts stay on the client and workspace snapshots stay on the Workcell server. Resume requires the original remote workspace identity and generation. See [Remote session identity and recovery](/docs/remote-workspaces/#cwd-and-resume) before moving an endpoint, replacing a workspace, or recovering an interrupted mutation. The `storage` subcommand is disabled when a remote Workcell selector is supplied.
+For remote sessions, transcripts stay on the client and [file change records](#file-revert) stay on the Workcell host. Resume requires the original remote workspace identity and generation. See [Remote session identity and recovery](/docs/remote-workspaces/#cwd-and-resume) before moving an endpoint, replacing a workspace, or recovering an interrupted mutation. The `storage` subcommand is disabled when a remote Workcell selector is supplied.
 
 Managed sandbox sessions retain their sandbox source. `caudra --session ID` resolves it before validating the remote workspace, and a paused VM requires explicit resume approval. See [sandbox conversation and VM resume](/docs/sandboxes/#resume-a-conversation-or-vm). Saving or deleting conversation history does not delete the VM or extend its disk-retention deadline.
 
@@ -130,7 +130,7 @@ A single-session move retains that session's own counters but leaves the shared 
 
 Before a whole-project rename, stop other Caudra processes using the source directory, including ephemeral runs. Caudra drains the invoking runtime's usage writes before committing the move and aborts if that drain fails. Only ledger rows present at the relocation transaction are reattributed. There is no permanent redirect, so new work started at the old directory records usage there again.
 
-Session IDs and conversations are preserved. Active source plans and approvals are detached. Files and old workspace snapshots are not moved. If moving live tabs requires a project environment reload, Caudra exits after committing and asks you to run `caudra --continue` from the destination.
+Session IDs and conversations are preserved. Active source plans and approvals are detached. Files are not moved, and file changes made before the move can no longer be reverted. If moving live tabs requires a project environment reload, Caudra exits after committing and asks you to run `caudra --continue` from the destination.
 
 ### Other checkouts of a repository
 
@@ -140,7 +140,7 @@ Checkouts of one git repository share memory notes and plans. `/sessions` lists 
 
 Run `caudra --ephemeral` for a session that leaves no session record behind. Set `storage.ephemeral = true` to make this the default.
 
-Caudra creates a private temporary state root under `XDG_RUNTIME_DIR` or the [scratch directory](/docs/configuration/#directory-layout). Session rows, tool outputs, snapshots, input history, and stashed prompts use that root. It is removed when Caudra exits through its normal success or error paths. A forced process kill can leave the temporary root for the operating system to clean up.
+Caudra creates a private temporary state root under `XDG_RUNTIME_DIR` or the [scratch directory](/docs/configuration/#directory-layout). Session rows, tool outputs, file change records, input history, and stashed prompts use that root. It is removed when Caudra exits through its normal success or error paths. A forced process kill can leave the temporary root for the operating system to clean up.
 
 Credentials, configuration, trust, model preferences, plans, memory notes, and logs keep their normal persistent locations. Project and global permission decisions remain durable. Ephemeral mode starts with an empty session store, so saved sessions and the persisted tab layout are unavailable during that run.
 
@@ -165,12 +165,12 @@ Click `⋮` in the gutter beside a message to open Message Actions. Right-clicki
 The menu offers:
 
 - **Fork here** creates and focuses a new session.
-- **Revert both** moves the conversation head and restores files.
+- **Revert both** moves the conversation head and reverts the file changes recorded after the message.
 - **Revert conversation** moves only the conversation head.
-- **Revert files** restores only the workspace.
-- **Unrevert** restores the head and workspace captured before the last revert.
+- **Revert files** reverts only the recorded file changes.
+- **Unrevert** puts back the head and the files from before the revert.
 
-Revert and unrevert require every live session in the workspace to be idle. Active shell commands and subagents also block them. Forking never starts a model request.
+**Revert both** and **Revert files** appear only when a [file revert](#file-revert) can run from that message. Otherwise the menu title says why. Revert and unrevert require every live session in the workspace to be idle. Active shell commands and subagents also block them. Forking never starts a model request.
 
 ## Fork boundaries
 
@@ -182,7 +182,7 @@ Revert and unrevert require every live session in the workspace to be idle. Acti
 | Completed tool | Includes the call and result | Empty |
 | Incomplete tool call | Includes the call; history repair supplies an unavailable result | Empty |
 
-The child receives a new session ID and a title such as `Original title (fork #1)`. It copies the selected ancestor path, reachable tool outputs and subagent histories, model and execution settings, and the snapshot pointers for that path. The snapshots themselves stay in the shared workspace store, so a fork copies no file data. Usage totals, goals, queues, pending revert state, conversation permission rules, and explicit YOLO state start clean.
+The child receives a new session ID and a title such as `Original title (fork #1)`. It copies the selected ancestor path, reachable tool outputs and subagent histories, and model and execution settings. It also holds the parent's [file change records](#file-revert), so the child can revert files too, and it copies no file data. Usage totals, goals, queues, pending revert state, conversation permission rules, and explicit YOLO state start clean.
 
 Subtasks are different from user-created forks. They share the root conversation's permission rules. Resuming that root restores its rules, while `/new` starts a clean root.
 
@@ -206,7 +206,7 @@ Saving carries no such cap, so a long session can grow past one that is set too 
 
 ## Retention
 
-Sessions have two tiers. A **full** session keeps everything: the conversation, rich tool output records, retained tool output files, rewind archives, and file snapshots. A **transcript** session keeps the conversation, subagent transcripts, usage, model, mode, drafts, queue, and permission rules, and can still be resumed. It has no file revert, no `tool_output_read` access to old outputs, and renders old tool calls from their model-facing text. Small structured records such as todo lists stay.
+Sessions have two tiers. A **full** session keeps everything: the conversation, rich tool output records, retained tool output files, rewind archives, and its file change records. A **transcript** session keeps the conversation, subagent transcripts, usage, model, mode, drafts, queue, and permission rules, and can still be resumed. It cannot revert files to its earlier messages, has no `tool_output_read` access to old outputs, and renders old tool calls from their model-facing text. Small structured records such as todo lists stay.
 
 Trimming moves a session from full to transcript. Forgetting deletes it. A trimmed session that runs again becomes full for its new work and is trimmed again later.
 
@@ -235,7 +235,7 @@ forget = {}
 
 To keep the twenty most recently active sessions of every directory in full and strip the artifacts of anything older than ninety days, set `trim = { keep_last = 20, keep_within = "90d" }`. To delete sessions after two years, set `forget = { keep_within = "2y" }`. Set `sweep_interval_hours = 0` to run retention only through the CLI.
 
-The sweep runs on a background thread once per interval while the TUI is open. It trims, forgets, and then prunes: due cleanup jobs run, orphaned artifact directories older than seven days are removed, the write-ahead log is checkpointed, and free pages are returned to the filesystem. With the policies left empty the sweep only prunes, which reclaims space and leaves session data alone. Every step is transactional or idempotent, so an interrupted sweep leaves nothing inconsistent.
+The sweep runs on a background thread once per interval while the TUI is open. It trims, forgets, and then prunes: due cleanup jobs run, orphaned artifact directories older than seven days are removed, the file change records of deleted sessions older than seven days are released, each change store is trimmed to its size budget, the write-ahead log is checkpointed, and free pages are returned to the filesystem. With the policies left empty the sweep only prunes, which reclaims space and leaves session data alone. Every step is transactional or idempotent, so an interrupted sweep leaves nothing inconsistent.
 
 A schema migration prunes as its last step. Rewriting rows puts the pages they occupied on the free list, so an upgrade that skipped this could leave the file larger than the data it holds until the next sweep came due.
 
@@ -245,13 +245,13 @@ Retention never removes spending records. What a session cost is written to a se
 
 ## What the state directory holds
 
-`/storage` shows where the disk went. A proportional bar splits the state directory between the session database, tool output files, workspace snapshots, and archives, and a legend gives each one its exact size. Below it, the database section reports file and write-ahead log sizes, free pages that a prune would reclaim, and the session and item counts behind them.
+`/storage` shows where the disk went. A proportional bar splits the state directory between the session database, tool output files, file change records, and archives, and a legend gives each one its exact size. Below it, the database section reports file and write-ahead log sizes, free pages that a prune would reclaim, and the session and item counts behind them.
 
-The snapshot section lists workspace stores largest first with their size, object count, and the number of sessions and snapshots that use them. A store whose workspace root is gone is marked rather than hidden, because an orphaned store is usually the one worth deleting. `/storage all` lists every store instead of the largest few; the footer command toggles between them.
+The change record section lists the stores largest first, one per workspace directory, with their size, object count, records, holding sessions, open records, and pending reverts. A store whose directory is gone, or that no session works in any more, shows its key instead. A store that no existing session holds is marked as orphaned rather than hidden. `/storage all` lists every store instead of the largest few, and the footer command toggles between them. When file revert is unavailable for the current session, the modal says why.
 
-Measuring walks the snapshot stores on disk, so the modal opens immediately and fills in when the walk finishes. The same figures are available without the TUI from `caudra storage stats` and `caudra storage snapshots`.
+Measuring walks the stores on disk, so the modal opens immediately and fills in when the walk finishes. The same figures are available without the TUI from `caudra storage stats` and `caudra storage snapshots`.
 
-To reclaim space in a store the modal named, trim the sessions that use it: `caudra storage trim <ID>`. Trimming drops the session's workspace snapshots, retained tool output files, rewind archives, and the journals and timelines of its workflow runs while the conversation stays and stays resumable, so it is the right answer when a single session has grown out of proportion and you still want its transcript. Snapshot objects that another session still uses stay in the shared store, and the rest are deleted right away. Pinned sessions are refused and a session open in another process is skipped, so the command is safe to run while Caudra is up. Add `--dry-run` to see the session and its artifact size first.
+Recording keeps each store near its [size budget](#limits) on its own. To reclaim more, trim the sessions that use a store: `caudra storage trim <ID>`. Trimming releases the session's local file change records and drops its retained tool output files, rewind archives, and the journals and timelines of its workflow runs. The conversation stays and stays resumable. Records that another session still holds, such as a fork, stay in the store, and the rest are deleted. Pinned sessions are refused and a session open in another process is skipped, so the command is safe to run while Caudra is up. Add `--dry-run` to see the session and its artifact size first.
 
 ## Conversation revert
 
@@ -261,25 +261,56 @@ Sending a prompt after revert creates a new branch from that point. The abandone
 
 `Esc Esc` with no session work left uses the same conversation-only mechanism through the rewind picker. If tasks or workflows are still active, it stops that work instead.
 
-## File snapshots
+## File revert
 
-Caudra captures the session-start snapshot on the first tool call that may change a file, together with the history head that call's run started from. A turn that only talks, and a turn whose tools only read, capture nothing and leave no store on disk. After each run completes or is cancelled, Caudra snapshots the resulting head, and it does the same on exit, in both cases only for a session that already has a session-start snapshot to bracket.
+File revert undoes the file changes that this session's tool calls made after the chosen message, newest first. Files that no record names stay as they are, including your own edits. If the agent edits `a.rs` and `b.rs` and you then edit `c.rs`, reverting to the prompt that started the agent's turn restores `a.rs` and `b.rs` and leaves `c.rs` alone.
 
-A capture must finish before the call that triggered it runs, so the file it is about to overwrite is recorded first. If the capture fails, that one tool call fails and the rest of the turn continues. Parallel calls share one capture: the first to arrive takes it and the others wait.
+The chosen message sets the boundary as in a [conversation revert](#conversation-revert). A user prompt reverts the changes of its own turn too, and any other item keeps the changes made up to it. A message that compaction rewrote counts from its original. Caudra refuses a file revert at a rewritten message whose original it cannot find.
 
-A file restore selects the nearest available snapshot at or before the chosen item, so several parallel tool calls share one safe run checkpoint.
+The first **Revert files** or **Revert both** only previews. It counts the files the revert would create, replace, and delete, and the later calls that ran without a record and keep their changes. Repeat the same action to run it. Any other revert or an unrevert drops the preview.
 
-A remote session captures on the Workcell host instead. See [Remote workspaces](/docs/remote-workspaces/#file-snapshots) for how that walk and its retention differ.
+Before writing anything, the revert checks every path it would touch. A path is a conflict when the file changed since it was recorded (`changed`), when another change landed between two of the records (`interleaved`), or when a record could not store it (`unrecorded`). One conflict aborts the whole revert, conversation half included, and the notice lists the conflicts by kind and path. **Revert conversation** still works.
 
-Snapshots are stored as Git objects under the Caudra state directory. Each workspace has one object store in `workspace-snapshots/<workspace-hash>/`, shared by every session that works in it. Objects are zlib-compressed and named by their Git object ID, and a snapshot is a Git tree. An unchanged file or directory reuses the object from an earlier snapshot, so a checkpoint costs about the size of what changed, and a second session in the same workspace stores almost nothing new. Each session keeps small pointer files in `session-snapshots/<session-id>/<workspace-hash>/` that name its snapshots. Git can read any snapshot: `git --git-dir=<store> ls-tree -r <snapshot-id>`.
+Caudra also refuses a file revert, and names the reason, when the records it needs were dropped to keep the store within its [size budget](#limits), when calls of this session are still changing files, or when an earlier file revert did not finish.
 
-A capture reads only files that changed. A Git index file beside the objects records the size, timestamps, inode, and owner each file had when it was last read, and a file whose values all still match reuses its stored object. A file modified in the few seconds before a capture starts is always read again, so a write that lands during a capture cannot hide behind an unchanged timestamp.
+A session's records reach back only to the point where its current store took over. That point moves forward when recording comes back on after being off, including after a local `--print`, SDK, or ACP run, and when the session moves to another directory or remote workspace. A session saved by an older version starts at its first load. A fork starts where its parent does. A file revert to a message before that point is refused.
 
-Snapshots from releases before the Git format are not migrated. A session's old store is deleted the first time it captures or restores, and `caudra storage prune` deletes the rest. A file restore that an older release left unfinished is cleared when its session loads, and Caudra shows a notice because some files may be partly restored.
+**Unrevert** puts the reverted files back, then moves the conversation head back. Reverts made one after another stack, and Unrevert undoes all of them. A file that changed since the revert is a conflict, and then nothing is unreverted. New work in the session keeps the reverted files as they are and ends unrevert.
 
-### Disable automatic snapshots
+If Caudra stops during a file revert, the store works out from the records and the files how far it got the next time it opens. The session keeps that revert pending: Unrevert puts back what it changed, and new work keeps the files as they are. A revert that finished after Caudra stopped is adopted with a notice, and the conversation stays where it was. A call that was still running when Caudra stopped counts as a call without a record.
 
-Run `caudra --no-snapshots` to disable automatic snapshots for one process. The flag applies to local and remote workspaces, including TUI, `--print`, SDK, and ACP sessions. It skips session-start, pre-mutation, run-completion, cancellation, and final captures, including when resuming a session with old snapshots.
+Records are not migrated from the workspace snapshots of earlier versions. A file revert that an older version left pending is cleared when its session loads, with a notice, and can no longer be unreverted. If Caudra stopped during that revert, some files may be partly restored. `caudra storage prune` and the TUI sweep delete the old `session-snapshots/` and `workspace-snapshots/` directories.
+
+File revert covers regular files and symbolic links in the session directory. It cannot reverse running processes, databases, network calls, Git branches or index state, nested repository state, or changes outside the session directory. `/cd` changes the process workspace for every live session and is blocked while any session is busy or has a pending revert.
+
+A remote session records on the Workcell host. See [Remote workspaces](/docs/remote-workspaces/#file-revert) for what differs.
+
+### Recording
+
+The TUI records every session. `--print`, the SDK, and ACP record only on a remote workspace. Locally they record nothing.
+
+Before a tool call that may change files, Caudra records what the call can change. After the call it records the same scope again and keeps only what changed, with the content before and after. A call that changes nothing leaves no record.
+
+| Call | What its record covers |
+| --- | --- |
+| File tools | The paths they write |
+| Shell lines that only read, such as `git status`, `rg`, or `ls` | Nothing |
+| Shell lines whose writes are all literal paths | The paths that `rm`, `mv`, `cp`, `touch`, `mkdir`, `ln`, `tee`, and `sed -i` change, and the targets of output redirects |
+| Other shell lines, MCP tools, and plugin tools | The whole session directory |
+
+A glob, a variable, a heredoc, an unlisted option, or any other program sends a shell line to the whole directory. `cp` and `ln` record only the destination, and `mv` or `cp` into a directory records that whole directory. Paths outside the session directory are not recorded. Your own edits, including `!` commands from the composer, get no record of their own.
+
+A whole-directory record cannot tell who made a change. An edit that you or another program make while such a call runs counts as that call's change, and a file revert undoes it. Long background shell commands widen this window.
+
+When a record cannot be made, the reason decides what happens. If the store refuses it, for example because the record would pass a [limit](#limits), the store is full, or the workspace keeps no change records, the call runs without a record. Caudra shows the reason once, and later previews count the call. If the store is busy, the connection to a remote host is lost, or another error occurs, Caudra blocks the call and names the reason, so no change runs without its record. A local store that fails to open with a transient error blocks calls until a later call opens it.
+
+Records are stored in the Git object format under the Caudra state directory, in `workspace-changes/<workspace-hash>/`. Each workspace has one store, shared by every session that works there. Every new record trims the store back to `max_bytes_mb`, dropping the oldest records first, whichever session made them.
+
+Records never include the Caudra state directory. A session whose directory contains the stores, such as one started in your home directory, records nothing, and Caudra says so once.
+
+### Disable change recording
+
+Run `caudra --no-snapshots` to turn change recording off for one process. The flag applies to local and remote workspaces, including TUI, `--print`, SDK, and ACP sessions.
 
 For a persistent setting, add this to your `caudra.toml`:
 
@@ -290,35 +321,23 @@ enabled = false
 
 `--no-snapshots` overrides the configured value without saving it. Remote sessions read this setting from the client user configuration, not from the remote project.
 
-File revert is unavailable while snapshots are disabled. Conversation revert still works. Existing snapshots remain stored and become available for file revert when snapshots are enabled again. An existing file revert can still be unreverted.
-
-Disabling capture does not bypass restore recovery. An unresolved remote restore still blocks mutations, and recovery may query its status. Unknown or partial mutations are not silently acknowledged or cleared.
+File revert is unavailable while recording is off. Conversation revert still works. Records already made stay in the store, but a file revert cannot reach back past the point where recording comes back on. An existing file revert can still be unreverted.
 
 ### Limits
 
-Snapshot walks follow `.gitignore`, `.ignore`, the global Git ignore file, and `.git/info/exclude`, whether or not the workspace is a Git repository. Symbolic links are captured as links: the snapshot stores the link target and a restore recreates the link without following it. Nested repositories, `.git`, special files, files over `max_file_bytes_mb`, and paths outside the session directory are not captured, and the walk does not cross a filesystem boundary. A snapshot records the paths it skipped, and a restore leaves such a path alone when either snapshot skipped it. An ignored path is not recorded, so changing a path between captured and ignored state is outside the restore guarantee.
+A whole-directory record walks the session directory. The walk applies the `.gitignore` file of each directory, whether or not the workspace is a Git repository, and does not read `.git/info/exclude` or the global Git ignore file. It stores symbolic links as links and never follows them. It leaves out nested repositories, special files such as sockets and devices, and other filesystems. A path that a call names is recorded even when `.gitignore` ignores it. Records never hold `.git`, `.ssh`, `.workcell`, `.env`, `.npmrc`, `.pypirc`, or `.netrc` at the top of the session directory. A change to anything left out is not recorded, and a revert leaves it alone.
 
-Caudra measures the tree while walking it and refuses one that does not fit before reading any file:
+Each whole-directory record walks the tree twice, before and after its call, and reads again only the files that changed.
 
 | Setting | Default | Effect |
 | --- | --- | --- |
-| `storage.snapshots.enabled` | `true` | `false` turns capture off for every workspace |
-| `storage.snapshots.max_bytes_mb` | `512` | The walk ceiling on file bytes, and the retention target for the compressed store of each workspace |
-| `storage.snapshots.max_files` | `50000` | Walk ceiling on file count |
-| `storage.snapshots.max_file_bytes_mb` | `100` | Files above this are skipped, and the rest of the tree is still captured |
+| `storage.snapshots.enabled` | `true` | `false` turns change recording off |
+| `storage.snapshots.max_bytes_mb` | `512` | The most file data one record may cover, and the size each workspace store is trimmed to |
+| `storage.snapshots.max_files` | `50000` | The most files one record may cover |
+| `storage.snapshots.max_file_bytes_mb` | `100` | Larger files are not stored |
 
-Caudra also refuses a filesystem root and a home directory outright.
+A record that would cover more is refused, and its call runs without a record. Every covered file counts, changed or not. In a session directory over these limits, only file tools and shell lines with literal paths are recorded, and a named directory over them, such as the target of `rm -r`, is refused too. A file over `max_file_bytes_mb` is not stored. When a call changes one, a revert across that call stops with an `unrecorded` conflict.
 
-A refusal costs file revert rather than the user's work: the tool call proceeds, Caudra reports the reason once, and `/storage` shows it alongside the empty store. The verdict is decided once per workspace and is not re-paid on later calls. Conversation revert is unaffected.
+A value above what the store accepts is lowered to it. Locally that is the default, and a remote host may accept less. Zero is rejected when the configuration loads.
 
-When a workspace store passes its retention target, Caudra removes the oldest checkpoints across all sessions of that workspace, then deletes the objects no remaining snapshot uses. Each session keeps its session-start snapshot and its newest checkpoint, and data needed by an active revert remains available, so protected data can exceed the target.
-
-Snapshots record only the executable bit of a file, as Git does. A restored file keeps its other permission bits, and a recreated file gets default permissions from your umask.
-
-Restore compares the current content and executable bit of each path with the source snapshot. If a tracked path changed outside the captured run, restore aborts and reports a conflict. Caudra does not overwrite it automatically. Conversation-only revert remains available when file restore cannot proceed.
-
-Only paths that differ between the source and target snapshots are touched. Files created after the target are deleted, deleted files are recreated, and unrelated files remain in place. Each file replacement is atomic. A restore spanning several files completes through the journal.
-
-Before applying changes, Caudra captures the current state of every affected path. Unrevert restores this state before moving the conversation head back. A restore journal records prepare, apply, and verification phases so a later restore can finish an interrupted transaction.
-
-Snapshots cover regular files and symbolic links. They cannot reverse running processes, databases, network calls, Git branches or index state, nested repository state, or commands that changed files outside the session directory. Changes from manual shell commands can appear as conflicts. `/cd` changes the process workspace for every live session and is blocked while any session is busy or has a pending revert.
+Records keep only the executable bit of a file, as Git does. A reverted file keeps its other permission bits, and a recreated file gets default permissions from your umask. Each file is replaced atomically, but a revert of several files is not atomic as a whole.

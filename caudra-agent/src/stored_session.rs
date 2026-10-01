@@ -1,7 +1,6 @@
 use caudra_providers::{HistoryItem, TokenUsage};
 use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
-use caudra_storage::remote_snapshots::RemoteSnapshotMetadataStore;
 use caudra_storage::sessions::{
     Session, SessionCursor, SessionDatabase, SessionError, mark_opened,
 };
@@ -152,16 +151,10 @@ pub async fn resolve_resume_workspace(
 
 pub async fn resume_workspace_session(
     session: &mut StoredSession,
-    storage: &StateDir,
     workspace: &WorkspaceSession,
 ) -> Result<WorkspaceSession, String> {
     let (workspace, binding) =
         resolve_resume_workspace(session.workspace_binding(), &session.cwd, workspace).await?;
-    if let Some(previous) = session.workspace_binding() {
-        RemoteSnapshotMetadataStore::new(storage.clone(), session.id, previous.clone())
-            .carry_to_binding(binding.clone())
-            .map_err(|error| error.to_string())?;
-    }
     session
         .replace_workspace_cursor(binding)
         .map_err(|error| error.to_string())?;
@@ -604,7 +597,7 @@ pub(crate) mod tests {
             let mut session = StoredSession::new_with_workspace(MODEL, "nested", binding);
             session.save(&storage).unwrap();
             let (fresh, _) = remote_workspace("fresh", "");
-            let resumed = resume_workspace_session(&mut session, &storage, &fresh)
+            let resumed = resume_workspace_session(&mut session, &fresh)
                 .await
                 .unwrap();
             session.save(&storage).unwrap();

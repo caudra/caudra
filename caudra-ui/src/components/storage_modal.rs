@@ -1,7 +1,7 @@
 use arc_swap::ArcSwapOption;
-use caudra_agent::snapshots::StoreEntry;
 use caudra_grab::grab_scope;
 use caudra_storage::sessions::SessionStorageStats;
+use caudra_storage::sessions::change_stores::StoreSummary;
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
@@ -34,20 +34,21 @@ const COLLAPSED_STORES: usize = 6;
 const LEGEND_GAP: &str = "   ";
 const SIZE_WIDTH: usize = 10;
 const OBJECTS_WIDTH: usize = 8;
-const SESSIONS_WIDTH: usize = 8;
-const SNAPS_WIDTH: usize = 6;
-const ORPHANED_STORE: &str = "(workspace root missing)";
+const COUNT_WIDTH: usize = 8;
+/// Enough of a store's key to tell the stores apart.
+const KEY_WIDTH: usize = 12;
+const ORPHANED_STORE: &str = "(no holder has a session)";
 const LOADING: &str = "Measuring the state directory…";
-const LOADING_HINT: &str = "Snapshot stores are walked on disk, so this takes a moment.";
-const NO_STORES: &str = "No workspace snapshots have been captured.";
+const LOADING_HINT: &str = "Change record stores are read on disk, so this takes a moment.";
+const NO_STORES: &str = "No file changes have been recorded.";
 /// The footer's targets in the order [`footer`] lays them out: the view
 /// switch, then the close control.
 const SWITCH_TARGET: usize = 0;
 const CLOSE_TARGET: usize = 1;
 
 /// What the background measurement produced. Held in a slot rather than
-/// computed in `view` because sizing the snapshot stores walks the whole state
-/// directory, which no frame can afford.
+/// computed in `view` because reading the change record stores walks the
+/// state directory, which no frame can afford.
 pub enum StorageFetchState {
     Loading,
     Ready(Box<StorageReport>),
@@ -56,9 +57,10 @@ pub enum StorageFetchState {
 
 pub struct StorageReport {
     pub stats: SessionStorageStats,
-    pub stores: Vec<StoreEntry>,
-    /// Why this workspace has no store, when that is a verdict rather than an
-    /// absence. Without it an empty list reads as "nothing written yet".
+    pub stores: Vec<StoreSummary>,
+    /// Why this session's file changes are not recorded, when that is a
+    /// verdict rather than an absence. Without it an empty list reads as
+    /// "nothing recorded yet".
     pub unavailable: Option<String>,
 }
 
@@ -235,12 +237,12 @@ impl Overlay for StorageModal {
 
 /// What the state directory spends its bytes on. The split exists because the
 /// two costs have entirely different remedies: the database shrinks by trimming
-/// sessions, the stores shrink by forgetting workspaces.
+/// sessions, the change stores by releasing the sessions that hold records.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Consumer {
     Database,
     ToolOutputs,
-    Snapshots,
+    ChangeRecords,
     Archives,
 }
 
@@ -249,7 +251,7 @@ impl Consumer {
         match self {
             Self::Database => "D",
             Self::ToolOutputs => "O",
-            Self::Snapshots => "W",
+            Self::ChangeRecords => "C",
             Self::Archives => "A",
         }
     }
@@ -258,7 +260,7 @@ impl Consumer {
         match self {
             Self::Database => "Database",
             Self::ToolOutputs => "Tool outputs",
-            Self::Snapshots => "Workspace snapshots",
+            Self::ChangeRecords => "File change records",
             Self::Archives => "Archives",
         }
     }
@@ -267,7 +269,7 @@ impl Consumer {
         match self {
             Self::Database => theme.heading,
             Self::ToolOutputs => theme.tool,
-            Self::Snapshots => theme.accent,
+            Self::ChangeRecords => theme.accent,
             Self::Archives => theme.todo_pending,
         }
     }
@@ -277,7 +279,7 @@ fn consumers(stats: &SessionStorageStats) -> [(Consumer, u64); CATEGORY_COUNT] {
     [
         (Consumer::Database, database_bytes(stats)),
         (Consumer::ToolOutputs, stats.tool_output_file_bytes),
-        (Consumer::Snapshots, stats.snapshot_bytes),
+        (Consumer::ChangeRecords, stats.snapshot_bytes),
         (Consumer::Archives, stats.archive_bytes),
     ]
 }
@@ -408,8 +410,8 @@ fn database_lines(stats: &SessionStorageStats, theme: &Theme) -> Vec<Line<'stati
     ]
 }
 
-fn store_lines(stores: &[StoreEntry], expanded: bool, theme: &Theme) -> Vec<Line<'static>> {
-    let mut lines = vec![section_line(Consumer::Snapshots.label(), theme)];
+fn store_lines(stores: &[StoreSummary], expanded: bool, theme: &Theme) -> Vec<Line<'static>> {
+    let mut lines = vec![section_line(Consumer::ChangeRecords.label(), theme)];
     if stores.is_empty() {
         lines.push(Line::from(Span::styled(NO_STORES, theme.tool_dim)));
         return lines;
@@ -422,9 +424,9 @@ fn store_lines(stores: &[StoreEntry], expanded: bool, theme: &Theme) -> Vec<Line
     };
     lines.extend(stores[..shown].iter().map(|entry| store_row(entry, theme)));
     if let Some(hidden) = stores.len().checked_sub(shown).filter(|count| *count > 0) {
-        let hidden_bytes = stores[shown..]
-            .iter()
-            .fold(0_u64, |total, entry| total.saturating_add(entry.bytes));
+        let hidden_bytes = stores[shown..].iter().fold(0_u64, |total, store| {
+            total.saturating_add(store.usage.bytes)
+        });
         lines.push(Line::from(Span::styled(
             format!(
                 "{} more {} holding {}",
@@ -441,28 +443,37 @@ fn store_lines(stores: &[StoreEntry], expanded: bool, theme: &Theme) -> Vec<Line
 fn store_header(theme: &Theme) -> Line<'static> {
     Line::from(Span::styled(
         format!(
-            "{:>SIZE_WIDTH$} {:>OBJECTS_WIDTH$} {:>SESSIONS_WIDTH$} {:>SNAPS_WIDTH$}  Workspace",
-            "Size", "Objects", "Sessions", "Snaps"
+            "{:>SIZE_WIDTH$} {:>OBJECTS_WIDTH$} {:>COUNT_WIDTH$} {:>COUNT_WIDTH$} \
+             {:>COUNT_WIDTH$} {:>COUNT_WIDTH$}  Workspace",
+            "Size", "Objects", "Records", "Holders", "Open", "Pending"
         ),
         theme.tool_dim,
     ))
 }
 
-fn store_row(entry: &StoreEntry, theme: &Theme) -> Line<'static> {
-    let (workspace, workspace_style) = entry.root.as_ref().map_or_else(
-        || (ORPHANED_STORE.to_owned(), theme.error),
-        |root| (root.display().to_string(), theme.tool_path),
+fn store_row(store: &StoreSummary, theme: &Theme) -> Line<'static> {
+    let usage = &store.usage;
+    let name = store.workspace.as_ref().map_or_else(
+        || store.key.chars().take(KEY_WIDTH).collect(),
+        |root| root.display().to_string(),
     );
-    Line::from(vec![
+    let mut spans = vec![
         Span::raw(format!(
-            "{:>SIZE_WIDTH$} {:>OBJECTS_WIDTH$} {:>SESSIONS_WIDTH$} {:>SNAPS_WIDTH$}  ",
-            format_iec_bytes(entry.bytes),
-            format_integer(entry.objects),
-            format_usize(entry.sessions.len()),
-            format_usize(entry.snapshot_count())
+            "{:>SIZE_WIDTH$} {:>OBJECTS_WIDTH$} {:>COUNT_WIDTH$} {:>COUNT_WIDTH$} \
+             {:>COUNT_WIDTH$} {:>COUNT_WIDTH$}  ",
+            format_iec_bytes(usage.bytes),
+            format_integer(usage.objects),
+            format_integer(u64::from(usage.records)),
+            format_usize(store.holders.len()),
+            format_integer(u64::from(usage.open_records)),
+            format_integer(u64::from(usage.pending_reverts)),
         )),
-        Span::styled(escape_terminal_controls(&workspace), workspace_style),
-    ])
+        Span::styled(escape_terminal_controls(&name), theme.tool_path),
+    ];
+    if store.orphaned {
+        spans.push(Span::styled(format!(" {ORPHANED_STORE}"), theme.error));
+    }
+    Line::from(spans)
 }
 
 fn labeled_line(label: &str, value: String, theme: &Theme) -> Line<'static> {
@@ -599,7 +610,8 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use caudra_agent::snapshots::SessionSnapshots;
+    use caudra_storage::sessions::change_stores::StoreUsage;
+    use caudra_workspace::{HolderSummary, RecordHolder};
     use crossterm::event::{MouseButton, MouseEventKind};
     use ratatui::backend::TestBackend;
     use ratatui::style::Modifier;
@@ -611,21 +623,27 @@ mod tests {
     const WAL_BYTES: u64 = 4 * 1024 * 1024;
     const SHM_BYTES: u64 = 32 * 1024;
     const PAGE_SIZE: u64 = 4_096;
-    const SNAPSHOT_BYTES: u64 = 7 * 1024 * 1024 * 1024;
+    const CHANGE_RECORD_BYTES: u64 = 7 * 1024 * 1024 * 1024;
     const TOOL_OUTPUT_BYTES: u64 = 128 * 1024 * 1024;
     const ARCHIVE_BYTES: u64 = 512 * 1024;
     const WORKFLOW_RUN_COUNT: u64 = 24;
     const WORKFLOW_CALL_COUNT: u64 = 960;
     const WORKFLOW_BYTES: u64 = 3 * 1024 * 1024;
-    const BIG_STORE: &str = "/workspace/atlas";
-    const SMALL_STORE: &str = "/workspace/small";
-    const WORKSPACE_KEY: &str = "workspace-key";
+    const BIG_STORE: &str = "atlas-key";
+    const SMALL_STORE: &str = "small-key";
+    const ORPHAN_STORE: &str = "orphan-key";
     const SESSION_ID: &str = "store-session";
-    const START_POINTER: &str = "start";
+    const OBJECTS: u64 = 444;
+    const RECORDS: u32 = 111;
+    const OPEN_RECORDS: u32 = 222;
+    const PENDING_REVERTS: u32 = 333;
     const MISSING_TOTAL: &str = "grid must spend every cell";
     const MISSING_ORPHAN: &str = "an orphaned store must be named, not hidden";
     const MISSING_HIDDEN: &str = "a collapsed list must account for what it hid";
-    const MISSING_SNAPSHOTS: &str = "the snapshot total must be visible";
+    const MISSING_CHANGE_RECORDS: &str = "the change record total must be visible";
+    const MISSING_COUNT: &str = "a store's row must show every count it keeps";
+    const MISSING_NAME: &str = "a store is named by its workspace directory, else by its key";
+    const WORKSPACE_ROOT: &str = "/home/user/atlas";
     const HOVER_MISSED: &str = "the footer command must reverse under the pointer";
     const BAR_IGNORED: &str = "a press on the bar's column must scroll the body";
 
@@ -652,41 +670,50 @@ mod tests {
             background_invocation_count: 0,
             background_bytes: 0,
             tool_output_file_bytes: TOOL_OUTPUT_BYTES,
-            snapshot_bytes: SNAPSHOT_BYTES,
+            snapshot_bytes: CHANGE_RECORD_BYTES,
             archive_bytes: ARCHIVE_BYTES,
             pending_cleanup_jobs: 0,
         }
     }
 
-    fn store(bytes: u64, root: Option<&str>) -> StoreEntry {
-        StoreEntry {
-            workspace_key: WORKSPACE_KEY.to_owned(),
-            root: root.map(PathBuf::from),
-            bytes,
-            objects: 12,
-            sessions: vec![SessionSnapshots {
-                session_id: SESSION_ID.to_owned(),
-                snapshots: vec![START_POINTER.to_owned()],
+    fn store(key: &str, bytes: u64, orphaned: bool) -> StoreSummary {
+        StoreSummary {
+            key: key.to_owned(),
+            workspace: None,
+            usage: StoreUsage {
+                bytes,
+                objects: OBJECTS,
+                records: RECORDS,
+                open_records: OPEN_RECORDS,
+                pending_reverts: PENDING_REVERTS,
+            },
+            holders: vec![HolderSummary {
+                holder: RecordHolder::new(SESSION_ID).unwrap(),
+                records: RECORDS,
+                open_records: OPEN_RECORDS,
+                pending_reverts: PENDING_REVERTS,
             }],
+            orphaned,
         }
     }
 
-    fn stores(count: usize) -> Vec<StoreEntry> {
+    fn stores(count: usize) -> Vec<StoreSummary> {
         (0..count)
             .map(|index| {
                 store(
+                    &format!("store-{index}"),
                     u64::try_from(count - index).unwrap_or(1) * 1024,
-                    Some(&format!("/workspace/store-{index}")),
+                    false,
                 )
             })
             .collect()
     }
 
-    fn report(stores: Vec<StoreEntry>) -> StorageFetchState {
+    fn report(stores: Vec<StoreSummary>) -> StorageFetchState {
         report_with(stores, None)
     }
 
-    fn report_with(stores: Vec<StoreEntry>, unavailable: Option<String>) -> StorageFetchState {
+    fn report_with(stores: Vec<StoreSummary>, unavailable: Option<String>) -> StorageFetchState {
         StorageFetchState::Ready(Box::new(StorageReport {
             stats: stats(),
             stores,
@@ -767,13 +794,42 @@ mod tests {
     #[test]
     fn an_orphaned_store_is_named_not_hidden() {
         let entries = vec![
-            store(4096, Some(BIG_STORE)),
-            store(2048, None),
-            store(1024, Some(SMALL_STORE)),
+            store(BIG_STORE, 4096, false),
+            store(ORPHAN_STORE, 2048, true),
+            store(SMALL_STORE, 1024, false),
         ];
         let rendered = text(&store_lines(&entries, false, &theme::current()));
         assert!(rendered.contains(ORPHANED_STORE), "{MISSING_ORPHAN}");
         assert!(rendered.contains(SMALL_STORE), "{MISSING_ORPHAN}");
+    }
+
+    /// What fills a store and what still depends on it: records, the
+    /// sessions holding them, and the work in flight against them.
+    #[test]
+    fn a_store_row_shows_every_count_the_store_keeps() {
+        let row = text(&[store_row(&store(BIG_STORE, 4096, false), &theme::current())]);
+        for count in [
+            OBJECTS,
+            u64::from(RECORDS),
+            u64::from(OPEN_RECORDS),
+            u64::from(PENDING_REVERTS),
+        ] {
+            assert!(row.contains(&count.to_string()), "{MISSING_COUNT}: {row}");
+        }
+        assert!(row.contains(BIG_STORE), "{MISSING_COUNT}: {row}");
+    }
+
+    #[test_case(Some(WORKSPACE_ROOT), WORKSPACE_ROOT ; "a_known_workspace_by_its_directory")]
+    #[test_case(None, BIG_STORE ; "an_unknown_one_by_its_key")]
+    fn a_store_row_names_its_workspace_or_else_its_key(workspace: Option<&str>, named: &str) {
+        let row = text(&[store_row(
+            &StoreSummary {
+                workspace: workspace.map(PathBuf::from),
+                ..store(BIG_STORE, 4096, false)
+            },
+            &theme::current(),
+        )]);
+        assert!(row.trim_end().ends_with(named), "{MISSING_NAME}: {row}");
     }
 
     #[test]
@@ -783,12 +839,12 @@ mod tests {
         assert!(!rendered.contains("Objects"));
     }
 
-    /// An empty list reads as "nothing written yet", which is the wrong story
-    /// when the workspace was refused.
+    /// An empty list reads as "nothing recorded yet", which is the wrong
+    /// story when the session's file changes cannot be recorded.
     #[test]
-    fn a_refused_workspace_says_why_it_has_no_store() {
-        const REASON: &str = "workspace is too large to snapshot";
-        const MISSING_REASON: &str = "a refused workspace must explain its empty store list";
+    fn an_unrecorded_session_says_why_it_has_no_store() {
+        const REASON: &str = "file change recording is turned off";
+        const MISSING_REASON: &str = "an unrecorded session must explain its empty store list";
         const WIDTH: u16 = 100;
         let state = report_with(Vec::new(), Some(REASON.to_owned()));
         let rendered = text(&build_lines(Some(&state), false, WIDTH, &theme::current()));
@@ -800,10 +856,10 @@ mod tests {
         const WIDTH: u16 = 100;
         let state = report(stores(2));
         let rendered = text(&build_lines(Some(&state), false, WIDTH, &theme::current()));
-        assert!(rendered.contains("7.0 GiB"), "{MISSING_SNAPSHOTS}");
-        assert!(rendered.contains("44.0 MiB"), "{MISSING_SNAPSHOTS}");
+        assert!(rendered.contains("7.0 GiB"), "{MISSING_CHANGE_RECORDS}");
+        assert!(rendered.contains("44.0 MiB"), "{MISSING_CHANGE_RECORDS}");
         assert!(rendered.contains(Consumer::Database.label()));
-        assert!(rendered.contains(Consumer::Snapshots.label()));
+        assert!(rendered.contains(Consumer::ChangeRecords.label()));
     }
 
     #[test]

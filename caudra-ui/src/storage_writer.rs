@@ -2085,35 +2085,6 @@ mod tests {
     }
 
     #[test]
-    fn delete_removes_all_workspace_snapshot_roots_for_the_session() {
-        let (_tmp, dir) = state_dir();
-        let (writer, _warn_rx) = writer(&dir);
-        let mut session = AppSession::new(MODEL, CWD);
-        crate::push_history_message(&mut session, user_message(0));
-        let id = session.id;
-        writer.save_sync(Arc::new(session)).unwrap();
-        let snapshots = dir
-            .path()
-            .join(caudra_agent::snapshots::SESSION_SNAPSHOTS_DIR)
-            .join(id.to_string());
-        fs::create_dir_all(snapshots.join("workspace-a")).unwrap();
-        fs::write(
-            snapshots.join("workspace-a").join("journal.json"),
-            "pending",
-        )
-        .unwrap();
-        let (done_tx, done_rx) = flume::bounded(1);
-
-        writer.delete(id, move |result| {
-            let _ = done_tx.send(result);
-        });
-
-        done_rx.recv_timeout(DRAIN_TIMEOUT).unwrap().unwrap();
-        assert!(!snapshots.exists());
-        writer.shutdown(DRAIN_TIMEOUT);
-    }
-
-    #[test]
     fn newer_save_resolves_superseded_delete_callback_once() {
         let pending: Pending = Arc::default();
         let session = Arc::new(AppSession::new(MODEL, CWD));

@@ -5,14 +5,17 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use caudra_workspace::RecordHolder;
 use jiff::Zoned;
 use serde::Serialize;
 use tracing::{info, warn};
 
-use super::database::{SESSION_SNAPSHOT_DIR, WORKSPACE_SNAPSHOT_DIR, directory_bytes};
+use super::change_stores::ChangeStores;
+use super::database::{WORKSPACE_CHANGES_DIR, directory_bytes, history_uuid_timestamp};
 use super::lease::SessionLease;
 use super::progress::{PRUNE, PruneEvent};
 use super::{
@@ -27,15 +30,17 @@ const SWEEP_LOCK_FILE: &str = "caudra.sqlite.sweep.lock";
 const LAST_SWEEP_KEY: &str = "retention.last_sweep_at";
 const CLEANUP_JOBS_PHASE: &str = "completing cleanup jobs";
 const ORPHAN_SCAN_PHASE: &str = "scanning orphaned artifacts";
+const CHANGE_STORES_PHASE: &str = "cleaning change stores";
 const TOOL_OUTPUT_PHASE: &str = "cleaning orphaned tool output";
 const CHECKPOINT_PHASE: &str = "checkpointing the WAL";
 const OWNER_FILE_MODE: u32 = 0o600;
 /// Orphaned artifact directories younger than this may belong to a session
 /// whose first save has not committed yet.
 const ORPHAN_GRACE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-/// Only a session's snapshot store from before snapshots were git objects
-/// holds this directory.
-const LEGACY_SNAPSHOT_OBJECTS_DIR: &str = "objects";
+/// The snapshot directories from before change records, which nothing reads.
+pub(super) const LEGACY_SNAPSHOT_DIRS: [&str; 2] = ["session-snapshots", "workspace-snapshots"];
+/// The file in a change store that every write to it rewrites.
+const CHANGE_STORE_STATE_FILE: &str = "state";
 const SKIP_OPEN: &str = "open in another Caudra instance";
 const SKIP_PINNED: &str = "pinned";
 
@@ -180,6 +185,13 @@ pub struct PruneReport {
     pub orphan_directories: u64,
     pub orphan_bytes: u64,
     pub orphan_tool_output_entries: u64,
+    /// Change store holders with no session, released once past the grace
+    /// period.
+    pub orphan_record_holders: u64,
+    /// What cleaning each change store down to its budget reclaimed.
+    pub record_bytes_reclaimed: u64,
+    /// Change stores that could not be pruned. The others still were.
+    pub change_store_failures: u64,
     pub checkpoint: Option<CheckpointResult>,
     pub freelist_pages_before: u64,
     pub freelist_pages_after: u64,
@@ -191,6 +203,8 @@ pub struct SweepPolicy {
     pub interval: Duration,
     pub trim: KeepPolicy,
     pub forget: KeepPolicy,
+    /// The size each change store is cleaned down to.
+    pub store_budget: NonZeroU64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -351,11 +365,14 @@ pub fn apply_ids(
 }
 
 /// Reclaims space that no session references any more: due cleanup jobs,
-/// orphaned artifact directories past their grace period, the WAL, and
-/// freelist pages. Session rows are never touched.
+/// orphaned artifact directories past their grace period, the snapshot
+/// directories from before change records, the change stores (see
+/// [`StorePrune`]), the WAL, and freelist pages. Session rows are never
+/// touched.
 pub fn prune(
     database: &mut SessionDatabase,
     state_dir: &StateDir,
+    store_budget: NonZeroU64,
     dry_run: bool,
 ) -> Result<PruneReport, SessionError> {
     let mut report = PruneReport {
@@ -375,20 +392,29 @@ pub fn prune(
     });
     let known = database.persisted_session_ids()?;
     let now = SystemTime::now();
-    for components in [
-        [SESSION_SNAPSHOT_DIR].as_slice(),
-        [SESSIONS_DIR, ARCHIVE_DIR].as_slice(),
-    ] {
-        let mut root = state_dir.path().to_path_buf();
-        root.extend(components);
-        let (directories, bytes) =
-            remove_orphan_directories(state_dir, &root, &known, now, dry_run)?;
-        report.orphan_directories += directories;
-        report.orphan_bytes += bytes;
-    }
-    let (directories, bytes) = remove_orphan_snapshot_stores(state_dir, &known, now, dry_run)?;
+    let archives = state_dir.path().join(SESSIONS_DIR).join(ARCHIVE_DIR);
+    let (directories, bytes) =
+        remove_orphan_directories(state_dir, &archives, &known, now, dry_run)?;
     report.orphan_directories += directories;
     report.orphan_bytes += bytes;
+    let (directories, bytes) = remove_legacy_snapshot_dirs(state_dir, dry_run)?;
+    report.orphan_directories += directories;
+    report.orphan_bytes += bytes;
+    if let Some(stores) = database.change_stores.clone() {
+        PRUNE.report(PruneEvent::Phase {
+            label: CHANGE_STORES_PHASE,
+        });
+        StorePrune {
+            stores: stores.as_ref(),
+            state_dir,
+            known: known.iter().copied().collect(),
+            covered: database.record_coverage_stores()?,
+            now,
+            budget: store_budget,
+            dry_run,
+        }
+        .run(&mut report)?;
+    }
     PRUNE.report(PruneEvent::Phase {
         label: TOOL_OUTPUT_PHASE,
     });
@@ -459,7 +485,7 @@ pub fn sweep_if_due(
         )?;
         report.forget = execute(&mut database, state_dir, &plan)?;
     }
-    report.prune = prune(&mut database, state_dir, false)?;
+    report.prune = prune(&mut database, state_dir, policy.store_budget, false)?;
     database.global_state_set(LAST_SWEEP_KEY, &now_epoch)?;
     info!(
         trimmed = report.trim.acted(),
@@ -497,52 +523,122 @@ fn remove_orphan_directories(
     Ok((directories, bytes))
 }
 
-/// Removes the snapshot stores nothing can read again: a session's store in
-/// the format from before snapshots were git objects, and a workspace's shared
-/// repository that no session directory names once it is past the grace
-/// period. The artifact lock is held across the scan, because every capture
-/// holds it while it names a repository. A session directory the orphan pass
-/// removes names nothing, so a dry run skips it the same way.
-fn remove_orphan_snapshot_stores(
+/// Removes the snapshot directories from before change records whole. Nothing
+/// reads them, so they need no grace period. Returns directories and bytes,
+/// counted rather than removed in a dry run.
+fn remove_legacy_snapshot_dirs(
     state_dir: &StateDir,
-    known: &[CaudraId],
-    now: SystemTime,
     dry_run: bool,
 ) -> Result<(u64, u64), SessionError> {
-    let _artifact_lock = (!dry_run)
-        .then(|| lock_session_artifacts(state_dir))
-        .transpose()?;
-    let mut named = HashSet::new();
-    let mut orphans = Vec::new();
-    for (session, metadata) in child_directories(&state_dir.path().join(SESSION_SNAPSHOT_DIR))? {
-        if is_orphan(&session, &metadata, known, now)? {
+    let mut directories = 0;
+    let mut bytes = 0;
+    for (path, _) in child_directories(state_dir.path())? {
+        if !path
+            .file_name()
+            .is_some_and(|name| LEGACY_SNAPSHOT_DIRS.iter().any(|legacy| name == *legacy))
+        {
             continue;
         }
-        for (store, _) in child_directories(&session)? {
-            if store.join(LEGACY_SNAPSHOT_OBJECTS_DIR).is_dir() {
-                orphans.push(store);
-            } else if let Some(key) = store.file_name() {
-                named.insert(key.to_owned());
+        directories += 1;
+        bytes += directory_bytes(&path);
+        if !dry_run {
+            fs::remove_dir_all(&path).map_err(StorageError::from)?;
+        }
+    }
+    Ok((directories, bytes))
+}
+
+/// One pass over the local change stores. In each store it releases every
+/// holder whose session the database does not know, once the holder's id is
+/// past the grace period, then cleans the store down to `budget`, then removes
+/// the store when it keeps nothing, no session's file revert reads it, and it
+/// was last written before the grace period. A holder that is not a session id
+/// is never released. A store that fails is counted and skipped.
+struct StorePrune<'a> {
+    stores: &'a dyn ChangeStores,
+    state_dir: &'a StateDir,
+    known: HashSet<CaudraId>,
+    /// An empty store still tells these sessions which of their records
+    /// retention evicted.
+    covered: HashSet<String>,
+    now: SystemTime,
+    budget: NonZeroU64,
+    dry_run: bool,
+}
+
+impl StorePrune<'_> {
+    fn run(&self, report: &mut PruneReport) -> Result<(), SessionError> {
+        let keys = self
+            .stores
+            .keys(self.state_dir)
+            .map_err(StorageError::from)?;
+        for key in keys {
+            if let Err(error) = self.prune(&key, report) {
+                warn!(store = key, %error, "change store not pruned");
+                report.change_store_failures += 1;
             }
         }
+        Ok(())
     }
-    for (repository, metadata) in child_directories(&state_dir.path().join(WORKSPACE_SNAPSHOT_DIR))?
-    {
-        if repository
-            .file_name()
-            .is_some_and(|key| !named.contains(key))
-            && is_past_grace(&metadata, now)?
+
+    fn prune(&self, key: &str, report: &mut PruneReport) -> Result<(), SessionError> {
+        let store = self.state_dir.path().join(WORKSPACE_CHANGES_DIR).join(key);
+        // Read first: releasing and cleaning both rewrite the state file.
+        let idle = match fs::symlink_metadata(store.join(CHANGE_STORE_STATE_FILE)) {
+            Ok(metadata) => is_past_grace(&metadata, self.now)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => return Err(StorageError::from(error).into()),
+        };
+        let holders = self
+            .stores
+            .holders(self.state_dir, key)
+            .map_err(StorageError::from)?;
+        for summary in holders {
+            if !self.is_orphan(&summary.holder) {
+                continue;
+            }
+            report.orphan_record_holders += 1;
+            if !self.dry_run {
+                self.stores
+                    .release(self.state_dir, key, &summary.holder)
+                    .map_err(StorageError::from)?;
+            }
+        }
+        report.record_bytes_reclaimed += self
+            .stores
+            .clean_up(self.state_dir, key, self.budget, self.dry_run)
+            .map_err(StorageError::from)?;
+        // Holders hold records, open records, or pending reverts, so a store
+        // that keeps none of them has no holder either.
+        if !idle
+            || self.covered.contains(key)
+            || !self
+                .stores
+                .usage(self.state_dir, key)
+                .map_err(StorageError::from)?
+                .keeps_nothing()
         {
-            orphans.push(repository);
+            return Ok(());
         }
-    }
-    let bytes = orphans.iter().map(|orphan| directory_bytes(orphan)).sum();
-    if !dry_run {
-        for orphan in &orphans {
-            fs::remove_dir_all(orphan).map_err(StorageError::from)?;
+        report.orphan_directories += 1;
+        report.orphan_bytes += directory_bytes(&store);
+        if !self.dry_run {
+            fs::remove_dir_all(&store).map_err(StorageError::from)?;
         }
+        Ok(())
     }
-    Ok((orphans.len() as u64, bytes))
+
+    fn is_orphan(&self, holder: &RecordHolder) -> bool {
+        let Ok(id) = holder.as_str().parse::<CaudraId>() else {
+            return false;
+        };
+        !self.known.contains(&id)
+            && history_uuid_timestamp(id).is_some_and(|millis| {
+                self.now
+                    .duration_since(UNIX_EPOCH + Duration::from_millis(millis))
+                    .is_ok_and(|age| age >= ORPHAN_GRACE)
+            })
+    }
 }
 
 /// The real directories directly in `dir`, none when it is absent. A symlink
@@ -591,19 +687,39 @@ fn is_past_grace(metadata: &fs::Metadata, now: SystemTime) -> Result<bool, Sessi
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use jiff::civil::date;
     use jiff::tz::TimeZone;
     use serde_json::{Value, json};
     use tempfile::TempDir;
+    use test_case::test_case;
 
     use super::*;
     use crate::retention::Duration as RetentionDuration;
-    use crate::sessions::{Session, TitleSource};
+    use crate::sessions::change_stores::StoreUsage;
+    use crate::sessions::change_stores::fake::{FakeStore, FakeStores};
+    use crate::sessions::{RecordCoverage, Session, TitleSource};
 
     const CWD: &str = "/project";
     const MODEL: &str = "test/model";
     const OPEN_SESSION_SKIPPED: &str = "an open session must be skipped, not trimmed";
     const PLAN_IS_READ_ONLY: &str = "planning must not modify the repository";
+    const PREVIEW_IS_READ_ONLY: &str = "a dry run must not change anything";
+    const ONLY_STALE_ORPHANS: &str =
+        "only a session id past the grace period with no session may be released";
+    const CLEANED_TO_BUDGET: &str = "every store must be cleaned to the budget, once";
+    const EMPTY_STALE_STORES_GO: &str = "a store goes once it keeps nothing, no session's file \
+                                         revert reads it, and it was last written before the \
+                                         grace period";
+    const LEGACY_REMOVED: &str = "the snapshot directories go whole, whatever their age";
+    const STORE: &str = "workspace-key";
+    const STORE_KEYS: [&str; 2] = [STORE, "other-workspace-key"];
+    const STORE_BUDGET: NonZeroU64 = NonZeroU64::new(64 * 1024 * 1024).unwrap();
+    /// How far past the grace period an old artifact is.
+    const MARGIN: Duration = Duration::from_secs(60);
+    /// The bytes of a UUIDv7 that carry its millisecond timestamp.
+    const UUID_TIMESTAMP_BYTES: usize = 6;
 
     #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
     struct TestMessage(String);
@@ -650,6 +766,21 @@ mod tests {
         }
     }
 
+    /// A session id generated before the grace period.
+    fn stale_id() -> CaudraId {
+        let generated = SystemTime::now() - ORPHAN_GRACE - MARGIN;
+        let millis = generated.duration_since(UNIX_EPOCH).unwrap().as_millis();
+        let millis = u64::try_from(millis).unwrap().to_be_bytes();
+        let mut bytes = *CaudraId::generate().as_bytes();
+        bytes[..UUID_TIMESTAMP_BYTES]
+            .copy_from_slice(&millis[millis.len() - UUID_TIMESTAMP_BYTES..]);
+        CaudraId::from_bytes(bytes)
+    }
+
+    fn with_stores(database: &mut SessionDatabase, stores: &Arc<FakeStores>) {
+        database.change_stores = Some(stores.clone());
+    }
+
     #[test]
     fn plan_reports_keep_act_and_skip_without_writing() {
         let (_temp, state_dir) = state_dir();
@@ -661,10 +792,7 @@ mod tests {
         reverting.meta.pending_revert = Some(crate::sessions::PendingConversationRevert {
             original_head: None,
             target_head: None,
-            original_workspace_head: None,
-            workspace_head: None,
             file_status: None,
-            restore_operation: None,
         });
         reverting.updated_at = epoch(&now, 300);
         database.save(&reverting, None).unwrap();
@@ -757,6 +885,7 @@ mod tests {
         let now = now();
         let newest = saved_session(&mut database, CWD, epoch(&now, 1));
         let old = saved_session(&mut database, CWD, epoch(&now, 200));
+        with_stores(&mut database, &Arc::default());
         let plan = plan(
             &database,
             Action::Forget,
@@ -814,23 +943,21 @@ mod tests {
     /// conversation: that is the whole reason to trim one session by hand
     /// rather than forget it.
     #[test]
-    fn trimming_by_id_releases_the_snapshot_store_and_keeps_the_session() {
-        const STORE_CONTENT: &[u8] = b"snapshot object";
-
-        let (temp, state_dir) = state_dir();
+    fn trimming_by_id_releases_the_change_records_and_keeps_the_session() {
+        let (_temp, state_dir) = state_dir();
         let mut database = SessionDatabase::open(&state_dir).unwrap();
         let session = saved_session(&mut database, CWD, epoch(&now(), 1));
-        let store = temp
-            .path()
-            .join(SESSION_SNAPSHOT_DIR)
-            .join(session.id.to_string());
-        fs::create_dir_all(&store).unwrap();
-        fs::write(store.join("object"), STORE_CONTENT).unwrap();
+        let held = FakeStore {
+            holders: vec![session.id.to_string()],
+            ..FakeStore::default()
+        };
+        let stores = Arc::new(FakeStores::with([(STORE, held)]));
+        with_stores(&mut database, &stores);
 
         let report = apply_ids(&mut database, &state_dir, Action::Trim, &[session.id]).unwrap();
 
         assert_eq!(report.acted(), 1);
-        assert!(!store.exists());
+        assert!(stores.store(STORE).holders.is_empty());
         assert_eq!(
             database.persisted_session_ids().unwrap(),
             vec![session.id],
@@ -844,27 +971,26 @@ mod tests {
         let mut database = SessionDatabase::open(&state_dir).unwrap();
         let now = now();
         let known = saved_session(&mut database, CWD, epoch(&now, 1));
-        let snapshots = state_dir.path().join(SESSION_SNAPSHOT_DIR);
-        let known_dir = snapshots.join(known.id.to_string());
-        let stale_dir = snapshots.join(CaudraId::generate().to_string());
-        let fresh_dir = snapshots.join(CaudraId::generate().to_string());
+        let archives = state_dir.path().join(SESSIONS_DIR).join(ARCHIVE_DIR);
+        let known_dir = archives.join(known.id.to_string());
+        let stale_dir = archives.join(CaudraId::generate().to_string());
+        let fresh_dir = archives.join(CaudraId::generate().to_string());
         for dir in [&known_dir, &stale_dir, &fresh_dir] {
             fs::create_dir_all(dir).unwrap();
             fs::write(dir.join("object"), b"bytes").unwrap();
         }
-        let old = SystemTime::now() - ORPHAN_GRACE - Duration::from_secs(60);
         fs::File::open(&stale_dir)
             .unwrap()
-            .set_modified(old)
+            .set_modified(SystemTime::now() - ORPHAN_GRACE - MARGIN)
             .unwrap();
 
-        let preview = prune(&mut database, &state_dir, true).unwrap();
+        let preview = prune(&mut database, &state_dir, STORE_BUDGET, true).unwrap();
         assert!(preview.dry_run);
         assert_eq!(preview.orphan_directories, 1);
         assert_eq!(preview.orphan_bytes, 5);
         assert!(stale_dir.exists());
 
-        let report = prune(&mut database, &state_dir, false).unwrap();
+        let report = prune(&mut database, &state_dir, STORE_BUDGET, false).unwrap();
 
         assert_eq!(report.orphan_directories, 1);
         assert!(!stale_dir.exists());
@@ -873,50 +999,138 @@ mod tests {
         assert!(report.checkpoint.is_some());
     }
 
-    /// A workspace repository is shared, so only the absence of every session
-    /// directory naming it makes it an orphan; a legacy store can never be
-    /// read again, so its age does not matter.
     #[test]
-    fn prune_removes_unnamed_workspace_repositories_and_legacy_stores() {
-        const NAMED: &str = "named";
-        const STALE: &str = "unnamed-stale";
-        const FRESH: &str = "unnamed-fresh";
-        const LEGACY: &str = "legacy";
-        const ORPHANED_MSG: &str = "unnamed stale repositories and legacy stores are orphans";
-
+    fn prune_removes_the_snapshot_directories_from_before_change_records() {
         let (_temp, state_dir) = state_dir();
         let mut database = SessionDatabase::open(&state_dir).unwrap();
-        let known = saved_session(&mut database, CWD, epoch(&now(), 1));
-        let session_dir = state_dir
-            .path()
-            .join(SESSION_SNAPSHOT_DIR)
-            .join(known.id.to_string());
-        fs::create_dir_all(session_dir.join(NAMED)).unwrap();
-        let legacy = session_dir.join(LEGACY);
-        fs::create_dir_all(legacy.join(LEGACY_SNAPSHOT_OBJECTS_DIR)).unwrap();
-        let repositories = state_dir.path().join(WORKSPACE_SNAPSHOT_DIR);
-        let old = SystemTime::now() - ORPHAN_GRACE - Duration::from_secs(60);
-        for key in [NAMED, STALE, FRESH] {
-            fs::create_dir_all(repositories.join(key)).unwrap();
+        let legacy = LEGACY_SNAPSHOT_DIRS.map(|name| state_dir.path().join(name).join(STORE));
+        for dir in &legacy {
+            fs::create_dir_all(dir).unwrap();
+            fs::write(dir.join("object"), b"bytes").unwrap();
         }
-        for key in [NAMED, STALE] {
-            fs::File::open(repositories.join(key))
+
+        let preview = prune(&mut database, &state_dir, STORE_BUDGET, true).unwrap();
+        assert_eq!(preview.orphan_directories, legacy.len() as u64);
+        assert!(
+            legacy.iter().all(|dir| dir.exists()),
+            "{PREVIEW_IS_READ_ONLY}"
+        );
+
+        prune(&mut database, &state_dir, STORE_BUDGET, false).unwrap();
+
+        for name in LEGACY_SNAPSHOT_DIRS {
+            assert!(!state_dir.path().join(name).exists(), "{LEGACY_REMOVED}");
+        }
+    }
+
+    #[test]
+    fn prune_releases_only_stale_holders_without_a_session() {
+        const NOT_A_SESSION: &str = "not-a-session";
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let mut live = TestSession::new(MODEL, CWD);
+        live.id = stale_id();
+        database.save(&live, None).unwrap();
+        let kept = [
+            live.id.to_string(),
+            CaudraId::generate().to_string(),
+            NOT_A_SESSION.to_owned(),
+        ];
+        let held = FakeStore {
+            holders: [stale_id().to_string()]
+                .into_iter()
+                .chain(kept.clone())
+                .collect(),
+            ..FakeStore::default()
+        };
+        let stores = Arc::new(FakeStores::with([(STORE, held.clone())]));
+        with_stores(&mut database, &stores);
+
+        let preview = prune(&mut database, &state_dir, STORE_BUDGET, true).unwrap();
+        assert_eq!(preview.orphan_record_holders, 1);
+        assert_eq!(
+            stores.store(STORE).holders,
+            held.holders,
+            "{PREVIEW_IS_READ_ONLY}"
+        );
+
+        let report = prune(&mut database, &state_dir, STORE_BUDGET, false).unwrap();
+
+        assert_eq!(report.orphan_record_holders, 1);
+        assert_eq!(stores.store(STORE).holders, kept, "{ONLY_STALE_ORPHANS}");
+    }
+
+    #[test]
+    fn prune_cleans_every_store_down_to_the_budget() {
+        const RECLAIMABLE: u64 = 4096;
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let store = FakeStore {
+            reclaimable: RECLAIMABLE,
+            ..FakeStore::default()
+        };
+        let stores = Arc::new(FakeStores::with(STORE_KEYS.map(|key| (key, store.clone()))));
+        with_stores(&mut database, &stores);
+        let reclaimable = RECLAIMABLE * STORE_KEYS.len() as u64;
+
+        let preview = prune(&mut database, &state_dir, STORE_BUDGET, true).unwrap();
+        assert_eq!(preview.record_bytes_reclaimed, reclaimable);
+        let report = prune(&mut database, &state_dir, STORE_BUDGET, false).unwrap();
+
+        assert_eq!(report.record_bytes_reclaimed, reclaimable);
+        for key in STORE_KEYS {
+            assert_eq!(
+                stores.store(key).cleaned_to,
+                [STORE_BUDGET.get()],
+                "{CLEANED_TO_BUDGET}"
+            );
+        }
+    }
+
+    #[test_case(true, 0, false, true ; "an empty store last written before the grace period goes")]
+    #[test_case(false, 0, false, false ; "a store written within the grace period stays")]
+    #[test_case(true, 1, false, false ; "a store that keeps records stays")]
+    #[test_case(true, 0, true, false ; "a store a session's file revert reads stays")]
+    fn prune_removes_a_store_once_it_is_empty_and_stale(
+        stale: bool,
+        records: u32,
+        covered: bool,
+        removed: bool,
+    ) {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        if covered {
+            let mut session = TestSession::new(MODEL, CWD);
+            session.push_message(TestMessage("prompt".into()));
+            session.meta.record_coverage = Some(RecordCoverage {
+                store: STORE.to_owned(),
+                since: None,
+            });
+            database.save(&session, None).unwrap();
+        }
+        let path = state_dir.path().join(WORKSPACE_CHANGES_DIR).join(STORE);
+        fs::create_dir_all(&path).unwrap();
+        let state = path.join(CHANGE_STORE_STATE_FILE);
+        fs::write(&state, b"state").unwrap();
+        if stale {
+            fs::File::open(&state)
                 .unwrap()
-                .set_modified(old)
+                .set_modified(SystemTime::now() - ORPHAN_GRACE - MARGIN)
                 .unwrap();
         }
+        let store = FakeStore {
+            usage: StoreUsage {
+                records,
+                ..StoreUsage::default()
+            },
+            ..FakeStore::default()
+        };
+        with_stores(&mut database, &Arc::new(FakeStores::with([(STORE, store)])));
 
-        let preview = prune(&mut database, &state_dir, true).unwrap();
-        assert_eq!(preview.orphan_directories, 2, "{ORPHANED_MSG}");
-        assert!(repositories.join(STALE).exists(), "{ORPHANED_MSG}");
+        let report = prune(&mut database, &state_dir, STORE_BUDGET, false).unwrap();
 
-        let report = prune(&mut database, &state_dir, false).unwrap();
-
-        assert_eq!(report.orphan_directories, 2, "{ORPHANED_MSG}");
-        assert!(!repositories.join(STALE).exists(), "{ORPHANED_MSG}");
-        assert!(!legacy.exists(), "{ORPHANED_MSG}");
-        assert!(repositories.join(NAMED).exists(), "{ORPHANED_MSG}");
-        assert!(repositories.join(FRESH).exists(), "{ORPHANED_MSG}");
+        assert_eq!(path.exists(), !removed, "{EMPTY_STALE_STORES_GO}");
+        assert_eq!(report.orphan_directories, u64::from(removed));
     }
 
     #[test]
@@ -939,6 +1153,7 @@ mod tests {
                 ..KeepPolicy::default()
             },
             forget: KeepPolicy::default(),
+            store_budget: STORE_BUDGET,
         };
 
         let first = sweep_if_due(&state_dir, &policy, &now).unwrap().unwrap();
@@ -959,6 +1174,7 @@ mod tests {
             interval: Duration::ZERO,
             trim: keep_last(1),
             forget: KeepPolicy::default(),
+            store_budget: STORE_BUDGET,
         };
         assert!(sweep_if_due(&state_dir, &policy, &now()).unwrap().is_none());
     }

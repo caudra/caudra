@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{self, Write};
 use std::fs;
 use std::mem;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -109,6 +110,13 @@ pub const DEFAULT_SNAPSHOTS_ENABLED: bool = true;
 pub const DEFAULT_SNAPSHOT_MAX_BYTES_MB: u64 = 512;
 pub const DEFAULT_SNAPSHOT_MAX_FILES: u64 = 50_000;
 pub const DEFAULT_SNAPSHOT_MAX_FILE_BYTES_MB: u64 = 100;
+/// The change store refuses a zero limit, which would leave every call
+/// unrecorded, so each `[storage.snapshots]` limit is at least this.
+pub const MIN_SNAPSHOT_LIMIT: u64 = 1;
+const SNAPSHOTS_SECTION: &str = "storage.snapshots";
+const BYTES_PER_MB: u64 = 1024 * 1024;
+const DEFAULT_STORE_BUDGET: NonZeroU64 =
+    NonZeroU64::new(DEFAULT_SNAPSHOT_MAX_BYTES_MB * BYTES_PER_MB).unwrap();
 
 pub const MIN_OUTPUT_BYTES: usize = 1024;
 pub const MIN_OUTPUT_LINES: usize = 10;
@@ -2623,13 +2631,12 @@ impl StorageConfig {
     }
 }
 
-/// What one workspace capture may cost before Caudra refuses the workspace and
-/// turns file revert off for it.
+/// Whether each tool call's file changes are recorded for file revert, and
+/// what one change record may cover.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotsConfig {
     pub enabled: bool,
-    /// Also the retention target for the compressed object store each
-    /// workspace shares across its sessions.
+    /// Also the size each workspace's change store is trimmed to.
     pub max_bytes: u64,
     pub max_files: u64,
     pub max_file_bytes: u64,
@@ -2655,36 +2662,54 @@ impl SnapshotsConfig {
             min: None,
             max: None,
             env: None,
-            description: "Capture automatic workspace snapshots locally and remotely, including session-start and final captures. `false` disables capture and file revert without deleting existing snapshots or bypassing restore recovery. `--no-snapshots` overrides this for one run",
+            description: "Record each tool call's file changes so file revert can undo them, locally and remotely. `false` turns recording and file revert off and keeps records already made. `--no-snapshots` overrides this for one run",
         },
         ConfigField {
             name: "max_bytes_mb",
             ty: "u64",
             default: ConfigValue::U64(DEFAULT_SNAPSHOT_MAX_BYTES_MB),
-            min: None,
+            min: Some(MIN_SNAPSHOT_LIMIT),
             max: None,
             env: None,
-            description: "Largest working tree a capture will take, and the retention target for the compressed object store each workspace shares across its sessions. A workspace above it loses file revert rather than paying for a snapshot the store cannot keep",
+            description: "Most file data one change record may cover, and the size each workspace's change store is trimmed to. A record over it is refused and its call runs unrecorded. Values above the store's limit are lowered to it, and locally that limit is the default",
         },
         ConfigField {
             name: "max_files",
             ty: "u64",
             default: ConfigValue::U64(DEFAULT_SNAPSHOT_MAX_FILES),
-            min: None,
+            min: Some(MIN_SNAPSHOT_LIMIT),
             max: None,
             env: None,
-            description: "Most files a capture will take, counted after ignore rules",
+            description: "Most files one change record may cover, counted after ignore rules. A record over it is refused and its call runs unrecorded. Values above the store's limit are lowered to it, and locally that limit is the default",
         },
         ConfigField {
             name: "max_file_bytes_mb",
             ty: "u64",
             default: ConfigValue::U64(DEFAULT_SNAPSHOT_MAX_FILE_BYTES_MB),
-            min: None,
+            min: Some(MIN_SNAPSHOT_LIMIT),
             max: None,
             env: None,
-            description: "Largest single file a capture will take. A bigger one is left out of the snapshot and left alone on disk, so it cannot be reverted",
+            description: "Largest file a change record stores. A larger file is left unrecorded, and a file revert across a call that changed it stops with a conflict. Values above the store's limit are lowered to it, and locally that limit is the default",
         },
     ];
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        for (field, value) in [
+            ("max_bytes_mb", self.max_bytes / BYTES_PER_MB),
+            ("max_files", self.max_files),
+            ("max_file_bytes_mb", self.max_file_bytes / BYTES_PER_MB),
+        ] {
+            check(SNAPSHOTS_SECTION, field, value, MIN_SNAPSHOT_LIMIT)?;
+        }
+        Ok(())
+    }
+
+    /// The size each workspace's change store is cleaned down to. Load
+    /// refuses zero, which would evict every record, so the default stands in
+    /// only for a config that skipped validation.
+    pub fn store_budget(&self) -> NonZeroU64 {
+        NonZeroU64::new(self.max_bytes).unwrap_or(DEFAULT_STORE_BUDGET)
+    }
 
     fn from_file(f: SnapshotsFileConfig) -> Self {
         Self {
@@ -2739,7 +2764,7 @@ impl RetentionConfig {
             min: None,
             max: None,
             env: None,
-            description: "Sessions outside this policy lose snapshots, tool output files, archives, and large rich outputs but stay resumable. Empty means never trim automatically",
+            description: "Sessions outside this policy lose file revert, tool output files, archives, and large rich outputs but stay resumable. Empty means never trim automatically",
         },
         ConfigField {
             name: "forget",
@@ -3046,6 +3071,7 @@ impl Config {
         self.agent.steering.validate()?;
         self.provider.validate()?;
         self.storage.validate()?;
+        self.storage.snapshots.validate()?;
         Ok(())
     }
 }
@@ -5463,6 +5489,25 @@ mod tests {
         let snapshots = base.into_config(false).unwrap().storage.snapshots;
         assert_eq!(snapshots.enabled, expected);
         assert_eq!(snapshots.max_files, 1);
+    }
+
+    /// The change store refuses a zero limit, so a zero would leave every
+    /// call unrecorded without saying why.
+    #[test_case("max_bytes_mb"; "total_bytes")]
+    #[test_case("max_files"; "files")]
+    #[test_case("max_file_bytes_mb"; "file_bytes")]
+    fn a_zero_snapshot_limit_is_refused(field: &str) {
+        let raw: RawConfig =
+            toml::from_str(&format!("[storage.snapshots]\n{field} = 0\n")).unwrap();
+        let error = raw.into_config(false).unwrap().validate().unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ConfigError::BelowMinimum { section: SNAPSHOTS_SECTION, field: refused, .. }
+                    if refused == field
+            ),
+            "{error}"
+        );
     }
 
     #[test]

@@ -10,7 +10,6 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -30,9 +29,7 @@ use caudra_agent::permissions::PermissionManager;
 use caudra_agent::prompt::profile::{
     BUILTIN_PROFILE_NAME, PromptProfileCatalog, SystemPromptProfile,
 };
-use caudra_agent::snapshots::{SESSION_SNAPSHOTS_DIR, SnapshotLimits, SnapshotStore};
 use caudra_agent::workflow::WorkflowTransition;
-use caudra_agent::workspace_baseline::WorkspaceBaseline;
 use caudra_agent::worktree::git::Git;
 use caudra_agent::worktree::{Backend, Request as WorktreeRequest, counterpart, label};
 use caudra_agent::{
@@ -53,6 +50,7 @@ use caudra_storage::StorageError;
 use caudra_storage::checkout;
 use caudra_storage::id::{CaudraId, CaudraIdParseError, SessionRef};
 use caudra_storage::remote_operation_journal::RemoteOperationJournal;
+use caudra_storage::sessions::change_stores::{registered_change_stores, store_summaries};
 use caudra_storage::sessions::{
     SessionDatabase, SessionError, SessionLease, SessionLocation, SessionRelocation, StoredImage,
     TitleSource, normalize_title,
@@ -73,6 +71,7 @@ use tracing::{info, warn};
 
 use crate::agent::{AgentCommand, AgentHandles, ModelSlot, shared_queue::QueueItem};
 use crate::app::background_delivery::DeliveryReply;
+use crate::app::file_revert::{self, RecorderSlot};
 use crate::app::permission_editor::{ConversationPermissions, attach_session_permissions};
 use crate::app::shell::{
     RemoteShellTarget, ShellEvent, spawn_remote_cd, spawn_remote_control, spawn_remote_shell,
@@ -97,8 +96,8 @@ use crate::input::InputReader;
 use crate::repaint::{Dirty, FrameLimiter, IDLE_POLL};
 use crate::theme;
 use crate::{
-    AppSession, PatternSuggestionLoader, PermissionAuthorityFactory, SessionRelocationHandoff,
-    SessionTab,
+    AppSession, ChangeServiceFactory, PatternSuggestionLoader, PermissionAuthorityFactory,
+    SessionRelocationHandoff, SessionTab,
 };
 use crate::{load_app_session, open_app_session_with_cursor};
 
@@ -112,7 +111,6 @@ const FAST_SCROLL_FACTOR: u32 = 4;
 /// One row of finger travel moves the content one row.
 const TOUCH_SCROLL_LINES: u32 = 1;
 const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
-const SHUTDOWN_SNAPSHOT_BUDGET: Duration = Duration::from_secs(3);
 const DELETE_FOCUSED_ERR: &str = "cannot delete the focused session";
 const DELETE_BUSY_ERR: &str = "wait for the session to become idle before deleting it";
 const MODEL_POLICY_ERR: &str = "Model is not allowed by policy";
@@ -139,6 +137,7 @@ const WORKTREE_REPOSITORY_ERR: &str =
     "Worktrees need a git repository, and this session works outside one";
 const SESSION_OPEN_ELSEWHERE: &str =
     "Another Caudra has that session open, so only its workspace was focused";
+const NO_CHANGE_STORES: &str = "The file change record stores could not be opened";
 
 /// The prompt that opened a session, which is what its title is about.
 fn opening_prompt<M: TitleSource>(messages: &[M]) -> Result<String, String> {
@@ -177,6 +176,8 @@ pub struct EventLoopParams {
     pub config: AgentConfig,
     pub ui_config: UiConfig,
     pub snapshots: SnapshotsConfig,
+    /// Opens the change records of a local session's directory.
+    pub change_factory: Option<ChangeServiceFactory>,
     pub allow_workspace_recovery: bool,
     pub input_history_size: usize,
     pub max_log_files: u32,
@@ -458,16 +459,7 @@ impl SessionRuntime {
     }
 
     fn parent_ready(&self) -> bool {
-        self.delivery_idle()
-            && !self.app.holds_recovery_text()
-            && !self
-                .app
-                .state
-                .session
-                .meta
-                .pending_revert
-                .as_ref()
-                .is_some_and(|pending| pending.restore_operation.is_some())
+        self.delivery_idle() && !self.app.holds_recovery_text()
     }
 
     fn herdr_observation(&self) -> HerdrObservation {
@@ -511,14 +503,12 @@ fn runtime_state_quiescent(
     background_tasks: usize,
     shell_commands: usize,
     holds_recovery_text: bool,
-    restore_operation_pending: bool,
 ) -> bool {
     status == SessionStatus::Idle
         && queue_empty
         && background_tasks == 0
         && shell_commands == 0
         && !holds_recovery_text
-        && !restore_operation_pending
 }
 
 fn cwd_change_blocker(states: impl IntoIterator<Item = (bool, bool)>) -> Option<&'static str> {
@@ -627,46 +617,10 @@ fn check_relocation_destination(storage: &StateDir, destination: &Path) -> Resul
         .session_facts(None)
         .map_err(|error| error.to_string())?
     {
-        if ids.contains(&facts.id) {
-            if facts.pending_revert {
-                return Err(format!(
-                    "Destination session {} has a pending restore; resolve it before moving sessions",
-                    facts.id
-                ));
-            }
-            check_relocation_journals(storage, facts.id)?;
-        }
-    }
-    Ok(())
-}
-
-fn check_relocation_journals(storage: &StateDir, id: CaudraId) -> Result<(), String> {
-    let root = storage
-        .path()
-        .join(SESSION_SNAPSHOTS_DIR)
-        .join(id.to_string());
-    let entries = match fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
+        if ids.contains(&facts.id) && facts.pending_revert {
             return Err(format!(
-                "Cannot inspect snapshots for session {id}: {error}"
-            ));
-        }
-    };
-    for entry in entries {
-        let entry = entry.map_err(|error| error.to_string())?;
-        if entry
-            .file_type()
-            .map_err(|error| error.to_string())?
-            .is_dir()
-            && SnapshotStore::new(storage.path(), id, &entry.file_name().to_string_lossy())
-                .journal_state()
-                .map_err(|error| format!("Cannot inspect snapshots for session {id}: {error}"))?
-                .is_some()
-        {
-            return Err(format!(
-                "Session {id} has an unfinished workspace restore; resolve it before moving"
+                "Destination session {} has a pending restore; resolve it before moving sessions",
+                facts.id
             ));
         }
     }
@@ -812,11 +766,19 @@ fn validate_session_cwd(session: &AppSession, process_cwd: &Path) -> Result<(), 
 /// because the question `/storage` answers is which of the two is spending the
 /// disk, and one half without the other cannot answer it.
 fn measure_storage(storage: &StateDir, unavailable: Option<String>) -> StorageFetchState {
-    let stats = match SessionDatabase::open_read_only(storage).and_then(|db| db.stats()) {
-        Ok(stats) => stats,
+    let measured = SessionDatabase::open_read_only(storage)
+        .and_then(|database| Ok((database.stats()?, database.session_directories()?)));
+    let (stats, sessions) = match measured {
+        Ok(measured) => measured,
         Err(error) => return StorageFetchState::Error(error.to_string()),
     };
-    let stores = SnapshotStore::store_entries(storage.path());
+    let Some(stores) = registered_change_stores() else {
+        return StorageFetchState::Error(NO_CHANGE_STORES.to_owned());
+    };
+    let stores = match store_summaries(stores.as_ref(), storage, &sessions) {
+        Ok(stores) => stores,
+        Err(error) => return StorageFetchState::Error(error.to_string()),
+    };
     StorageFetchState::Ready(Box::new(StorageReport {
         stats,
         stores,
@@ -825,13 +787,10 @@ fn measure_storage(storage: &StateDir, unavailable: Option<String>) -> StorageFe
 }
 
 fn prepare_session_for_runtime(
-    storage: &StateDir,
-    storage_writer: &StorageWriter,
     mut session: AppSession,
-    limits: SnapshotLimits,
     workspace: Option<&caudra_workspace::WorkspaceSession>,
     allow_workspace_recovery: bool,
-) -> Result<(AppSession, Arc<SnapshotStore>, Option<&'static str>), String> {
+) -> Result<AppSession, String> {
     validate_session_focus(&session, workspace)?;
     if let Some(workspace) = workspace {
         let binding = StoredWorkspaceBinding::new_with_cursor(
@@ -845,190 +804,20 @@ fn prepare_session_for_runtime(
         session
             .replace_workspace_cursor(binding)
             .map_err(|error| error.to_string())?;
-        let placeholder = App::remote_snapshot_placeholder(storage, session.id);
-        return Ok((session, placeholder, None));
+        return Ok(session);
     }
     let process_cwd = canonical_cwd(
         &std::env::current_dir()
             .map_err(|error| format!("failed to read current directory: {error}"))?,
     )?;
     validate_session_cwd(&session, &process_cwd)?;
-    if !allow_workspace_recovery {
-        if session.meta.pending_revert.is_some() {
-            return Err(format!(
-                "Session {} has a pending restore; resolve it before moving sessions",
-                session.id
-            ));
-        }
-        check_relocation_journals(storage, session.id)?;
+    if !allow_workspace_recovery && session.meta.pending_revert.is_some() {
+        return Err(format!(
+            "Session {} has a pending restore; resolve it before moving sessions",
+            session.id
+        ));
     }
-    let snapshot_store = App::snapshot_store_for(storage, session.id, &process_cwd, limits)
-        .map_err(|error| format!("Failed to initialize workspace snapshots: {error}"))?;
-    let restore_notice = if allow_workspace_recovery {
-        crate::app::recover_pending_workspace_restore(
-            &mut session,
-            &snapshot_store,
-            storage_writer,
-        )?
-    } else {
-        None
-    };
-    Ok((session, snapshot_store, restore_notice))
-}
-
-pub(crate) fn reconcile_remote_session_restore(
-    session: &mut AppSession,
-    storage_writer: &StorageWriter,
-    baseline: &WorkspaceBaseline,
-    status: Option<caudra_workspace::SnapshotRestoreStatus>,
-) -> Result<(), String> {
-    let Some(mut pending) = session.meta.pending_revert.clone() else {
-        return Ok(());
-    };
-    let Some(operation) = pending.restore_operation.clone() else {
-        return Ok(());
-    };
-    let Some(status) = status else {
-        pending.restore_operation = None;
-        let head = crate::session_history_head(session);
-        session.set_conversation_state(head, Some(pending));
-        storage_writer
-            .save_sync(Arc::new(session.clone()))
-            .map_err(|error| format!("Failed to clear an undispatched remote restore: {error}"))?;
-        return Ok(());
-    };
-    pending.file_status = serde_json::to_value(&status).ok();
-    let definitive = matches!(
-        status.state,
-        caudra_workspace::SnapshotRestoreState::Completed
-            | caudra_workspace::SnapshotRestoreState::Acknowledged
-    ) && !status.reconciliation_required;
-    if !definitive {
-        let head = crate::session_history_head(session);
-        session.set_conversation_state(head, Some(pending));
-        storage_writer
-            .save_sync(Arc::new(session.clone()))
-            .map_err(|error| format!("Failed to save remote restore recovery state: {error}"))?;
-        return Ok(());
-    }
-
-    pending.workspace_head = Some(operation.target_workspace_head.clone());
-    if let Some(operation) = pending.restore_operation.as_mut() {
-        operation.phase = caudra_storage::sessions::PendingRestorePhase::FilesApplied;
-    }
-    let transition_head = match operation.kind {
-        caudra_storage::sessions::PendingRestoreKind::Revert => operation
-            .conversation_target
-            .as_ref()
-            .map(|head| head.head)
-            .unwrap_or_else(|| crate::session_history_head(session)),
-        caudra_storage::sessions::PendingRestoreKind::Unrevert => pending.original_head,
-    };
-    session.set_conversation_state(transition_head, Some(pending.clone()));
-    storage_writer
-        .save_sync(Arc::new(session.clone()))
-        .map_err(|error| format!("Failed to commit recovered remote restore: {error}"))?;
-    if operation.kind == caudra_storage::sessions::PendingRestoreKind::Unrevert
-        || status.state == caudra_workspace::SnapshotRestoreState::Acknowledged
-    {
-        if status.state == caudra_workspace::SnapshotRestoreState::Acknowledged {
-            baseline
-                .mark_remote_restore_acknowledged(&status.restore_id)
-                .map_err(|error| {
-                    format!("Failed to record remote restore acknowledgement: {error}")
-                })?;
-        } else {
-            smol::block_on(baseline.acknowledge_remote_restore(&status.restore_id)).map_err(
-                |error| format!("Failed to acknowledge recovered remote restore: {error}"),
-            )?;
-        }
-    }
-    match operation.kind {
-        caudra_storage::sessions::PendingRestoreKind::Revert => {
-            pending.restore_operation = None;
-            session.set_conversation_state(transition_head, Some(pending));
-        }
-        caudra_storage::sessions::PendingRestoreKind::Unrevert => {
-            session.set_conversation_state(transition_head, None);
-        }
-    }
-    storage_writer
-        .save_sync(Arc::new(session.clone()))
-        .map_err(|error| format!("Failed to finalize recovered remote restore: {error}"))?;
-    Ok(())
-}
-
-fn prepare_workspace_for_runtime(
-    storage: &StateDir,
-    storage_writer: &StorageWriter,
-    cwd: &Path,
-    active: &HashSet<CaudraId>,
-    limits: SnapshotLimits,
-    allow_workspace_recovery: bool,
-) -> Result<(), String> {
-    if allow_workspace_recovery {
-        recover_stored_sessions_in_cwd(storage, storage_writer, cwd, active, limits)
-    } else {
-        check_relocation_destination(storage, cwd)
-    }
-}
-
-fn recover_stored_sessions_in_cwd(
-    storage: &StateDir,
-    storage_writer: &StorageWriter,
-    cwd: &Path,
-    active: &std::collections::HashSet<CaudraId>,
-    limits: SnapshotLimits,
-) -> Result<(), String> {
-    let cwd_text = cwd.to_string_lossy();
-    let facts = SessionDatabase::open_state(storage)
-        .and_then(|database| database.session_facts(Some(&cwd_text)))
-        .map_err(|error| format!("Failed to scan sessions for workspace recovery: {error}"))?;
-    for facts in facts {
-        if active.contains(&facts.id) {
-            continue;
-        }
-        let snapshot_store = App::snapshot_store_for(storage, facts.id, cwd, limits)
-            .map_err(|error| format!("Failed to initialize workspace snapshots: {error}"))?;
-        // Loading a session is proportional to its whole transcript, and a
-        // workspace accumulates hundreds. `recover_pending_workspace_restore`
-        // reads the history only once one of these two says there is something
-        // to recover: `pending_revert` comes out of the facts query, and a
-        // journal without it is the crash between writing one and saving the
-        // other. Both are cheap, and on a healthy workspace both are false for
-        // every session, so nothing is deserialized at all.
-        if !facts.pending_revert
-            && snapshot_store
-                .journal_state()
-                .map_err(|error| format!("Failed to inspect workspace restore journal: {error}"))?
-                .is_none()
-        {
-            continue;
-        }
-        let _lease = match SessionLease::acquire(storage, facts.id) {
-            Ok(lease) => lease,
-            Err(SessionError::SessionInUse { .. }) => continue,
-            Err(error) => {
-                return Err(format!(
-                    "Failed to reserve session {} for workspace recovery: {error}",
-                    facts.id
-                ));
-            }
-        };
-        let mut session = load_app_session(facts.id, storage).map_err(|error| {
-            format!(
-                "Failed to load session {} for workspace recovery: {error}",
-                facts.id
-            )
-        })?;
-        validate_session_cwd(&session, cwd)?;
-        crate::app::recover_pending_workspace_restore(
-            &mut session,
-            &snapshot_store,
-            storage_writer,
-        )?;
-    }
-    Ok(())
+    Ok(session)
 }
 
 /// Everything needed to bring up a new session runtime after startup.
@@ -1038,6 +827,7 @@ struct SpawnCtx {
     config: AgentConfig,
     ui_config: UiConfig,
     snapshots: SnapshotsConfig,
+    change_factory: Option<ChangeServiceFactory>,
     allow_workspace_recovery: bool,
     input_history_size: usize,
     max_log_files: u32,
@@ -1135,7 +925,6 @@ impl SpawnCtx {
         let workspace_session = if let Some(workspace) = &self.workspace_session {
             let workspace = smol::block_on(caudra_agent::resume_workspace_session(
                 &mut session,
-                &self.storage,
                 workspace,
             ))?;
             Some(workspace)
@@ -1154,15 +943,12 @@ impl SpawnCtx {
                 .map_err(|error| error.to_string())
             })
             .transpose()?;
-        let (mut session, snapshot_store, restore_notice) = prepare_session_for_runtime(
-            &self.storage,
-            &self.storage_writer,
+        let mut session = prepare_session_for_runtime(
             session,
-            self.snapshots.into(),
             workspace_session.as_ref(),
             self.allow_workspace_recovery,
         )?;
-        let workspace_baseline = if let Some(workspace) = workspace_session.clone() {
+        if let Some(workspace) = &workspace_session {
             let stored =
                 caudra_storage::workspace_binding::StoredWorkspaceBinding::new_with_cursor(
                     workspace.binding().clone(),
@@ -1171,40 +957,21 @@ impl SpawnCtx {
                         .workspace_binding()
                         .and_then(|binding| binding.cursor_label().map(str::to_owned)),
                 )
-                .map_err(|error| {
-                    format!("Remote workspace snapshot identity is invalid: {error}")
-                })?;
+                .map_err(|error| format!("Remote workspace identity is invalid: {error}"))?;
             if let Some(binding) = session.workspace_binding()
                 && !binding.exact_scope_eq(&stored)
             {
                 return Err("Remote session belongs to a different workspace cursor".into());
             }
-            let baseline = WorkspaceBaseline::new_workspace_session(
-                self.storage.clone(),
-                session.id,
-                workspace,
-                stored,
-                self.snapshots,
-            );
-            let recovered =
-                smol::block_on(baseline.reconcile_remote_restore()).map_err(|error| {
-                    format!("Remote workspace snapshot recovery is unavailable: {error}")
-                })?;
-            reconcile_remote_session_restore(
-                &mut session,
-                &self.storage_writer,
-                &baseline,
-                recovered,
-            )?;
-            baseline
-        } else {
-            WorkspaceBaseline::new(
-                Arc::clone(&snapshot_store),
-                PathBuf::from(&session.cwd),
-                self.snapshots,
-            )
-        };
-        workspace_baseline.set_current_head(crate::session_history_head(&session));
+        }
+        let changes = file_revert::session_changes(
+            &mut session,
+            workspace_session.as_ref(),
+            self.change_factory.as_ref(),
+            &self.snapshots,
+        );
+        let change_recorder =
+            RecorderSlot::new(ArcSwapOption::from(changes.recorder.map(Arc::new)));
         let prepare_ms = lap();
         let initial_history = match crate::active_session_history(&session) {
             Ok(history) => history,
@@ -1262,7 +1029,7 @@ impl SpawnCtx {
             system_prompt_profile.clone(),
             Arc::clone(&self.prompt_profiles),
             Some(self.storage.clone()),
-            Arc::clone(&workspace_baseline),
+            Arc::clone(&change_recorder),
             workspace_session.clone(),
             remote_project_context.clone(),
             self.host_cwd.clone(),
@@ -1274,8 +1041,6 @@ impl SpawnCtx {
             &self.model_slot.load().model,
             session,
             self.storage.clone(),
-            snapshot_store,
-            workspace_baseline,
             Arc::clone(&self.available_models),
             handles.mcp_reader(),
             handles.mcp_config_errors.clone(),
@@ -1322,6 +1087,12 @@ impl SpawnCtx {
         app.reconcile_plan_target();
         let app_new_ms = lap();
         app.snapshots_config = self.snapshots;
+        app.change_factory = self.change_factory.clone();
+        app.local_changes = changes.local;
+        app.change_recorder = change_recorder;
+        // Publishing already saved the coverage of a session worth saving.
+        app.reconcile_loaded_session(changes.first, false);
+        app.refresh_record_index();
         app.live_sessions = Arc::clone(&self.live_sessions);
         app.state.system_prompt_profile_name = system_prompt_profile_name;
         app.state.system_prompt_profile = system_prompt_profile;
@@ -1329,7 +1100,6 @@ impl SpawnCtx {
         if let Some(warning) = profile_warning {
             app.state.warnings.push(warning);
         }
-        app.state.warnings.extend(restore_notice.map(str::to_owned));
         handles.apply_to_app(&mut app);
         if restore_session {
             app.restore_resumed_session();
@@ -1635,6 +1405,7 @@ impl<'t> EventLoop<'t> {
             config,
             ui_config,
             snapshots,
+            change_factory,
             allow_workspace_recovery,
             input_history_size,
             max_log_files,
@@ -1725,6 +1496,7 @@ impl<'t> EventLoop<'t> {
             config,
             ui_config,
             snapshots,
+            change_factory,
             allow_workspace_recovery,
             input_history_size,
             max_log_files,
@@ -1761,16 +1533,9 @@ impl<'t> EventLoop<'t> {
 
         let provider_ms = lap();
 
-        let active = sessions.iter().map(|tab| tab.session.id).collect();
-        prepare_workspace_for_runtime(
-            &ctx.storage,
-            &ctx.storage_writer,
-            &cwd,
-            &active,
-            ctx.snapshots.into(),
-            ctx.allow_workspace_recovery,
-        )
-        .map_err(|error| eyre!(error))?;
+        if !ctx.allow_workspace_recovery {
+            check_relocation_destination(&ctx.storage, &cwd).map_err(|error| eyre!(error))?;
+        }
         let recover_sessions_ms = lap();
 
         let mut runtimes: Vec<SessionRuntime> = sessions
@@ -2202,7 +1967,6 @@ impl<'t> EventLoop<'t> {
             {
                 return Err("Reconcile pending Workcell mutations before a sandbox action".into());
             }
-            check_relocation_journals(&self.ctx.storage, runtime.id())?;
         }
         let mut workflows = Vec::new();
         for runtime in &self.sessions {
@@ -3574,7 +3338,7 @@ impl<'t> EventLoop<'t> {
             || self
                 .sessions
                 .iter()
-                .any(|runtime| runtime.app.workspace_baseline.is_remote())
+                .any(|runtime| runtime.app.workspace_session.is_some())
         {
             return Err(RELOCATION_LOCAL_ERR.into());
         }
@@ -3647,7 +3411,6 @@ impl<'t> EventLoop<'t> {
                         .map_err(|error| error.to_string())?,
                 ));
             }
-            check_relocation_journals(&self.ctx.storage, id)?;
         }
         let mut workflows = Vec::new();
         for runtime in &self.sessions {
@@ -3713,40 +3476,6 @@ impl<'t> EventLoop<'t> {
                 }
             }
         }
-        let mut stores = Vec::with_capacity(self.sessions.len());
-        for runtime_index in 0..self.sessions.len() {
-            let session_id = self.sessions[runtime_index].id();
-            let store = match App::snapshot_store_for(
-                &self.ctx.storage,
-                session_id,
-                &cwd,
-                self.ctx.snapshots.into(),
-            ) {
-                Ok(store) => store,
-                Err(error) => {
-                    self.sessions[idx].app.flash(format!("cd: {error}"));
-                    return false;
-                }
-            };
-            match store.journal_state() {
-                Ok(None) => stores.push(store),
-                Ok(Some(_)) => {
-                    self.sessions[idx].app.flash(format!(
-                        "cd: session {} has an unfinished workspace restore in {}",
-                        session_id,
-                        cwd.display()
-                    ));
-                    return false;
-                }
-                Err(error) => {
-                    self.sessions[idx]
-                        .app
-                        .flash(format!("cd: failed to inspect workspace restore: {error}"));
-                    return false;
-                }
-            }
-        }
-
         if let Err(error) = std::env::set_current_dir(&cwd) {
             self.sessions[idx].app.flash(format!("cd: {error}"));
             return false;
@@ -3755,11 +3484,11 @@ impl<'t> EventLoop<'t> {
         self.ctx
             .permissions
             .set_project_with_config(&cwd, permissions.clone());
-        for (runtime, store) in self.sessions.iter_mut().zip(stores) {
+        for runtime in &mut self.sessions {
             runtime.handles.shutdown_workflow();
             runtime
                 .app
-                .install_working_directory(&cwd, store, permissions.clone());
+                .install_working_directory(&cwd, permissions.clone());
             runtime.app.checkpoint_now();
         }
         for index in 0..self.sessions.len() {
@@ -3912,7 +3641,6 @@ impl<'t> EventLoop<'t> {
             return Err(RELOCATION_WORKBENCH_ERR.into());
         }
         if let WorktreeRequest::Create(create) = &request {
-            check_relocation_journals(&self.ctx.storage, create.session)?;
             let database = SessionDatabase::open_state(&self.ctx.storage)
                 .map_err(|error| error.to_string())?;
             refuse_resumable_workflows(&database, create.session)?;
@@ -4286,14 +4014,8 @@ impl<'t> EventLoop<'t> {
                 let (trigger, cancel) = CancelToken::new();
                 rt.app.shell.add_trigger(trigger);
                 if let Some(workspace) = rt.app.workspace_session.clone() {
-                    rt.app
-                        .workspace_baseline
-                        .set_current_head(rt.app.history_head());
                     spawn_remote_shell(
-                        RemoteShellTarget {
-                            workspace,
-                            baseline: Arc::clone(&rt.app.workspace_baseline),
-                        },
+                        RemoteShellTarget { workspace },
                         command,
                         id,
                         visible,
@@ -4440,13 +4162,13 @@ impl<'t> EventLoop<'t> {
         .detach();
     }
 
-    /// Sizing the snapshot stores walks every object on disk, so the whole
+    /// Reading the change record stores walks them on disk, so the whole
     /// measurement goes to a blocking thread and the database is opened
     /// read-only: a diagnostic must never contend with the session writer.
     fn refresh_storage(&mut self) {
         let storage = self.ctx.storage.clone();
         let app = self.focused_app();
-        let unavailable = app.file_revert_blocker();
+        let unavailable = app.record_index_blocker();
         let slot = Arc::clone(&app.storage_slot);
         slot.store(Some(Arc::new(StorageFetchState::Loading)));
         smol::spawn(async move {
@@ -4570,10 +4292,9 @@ impl<'t> EventLoop<'t> {
         let join_agents_ms = lap();
 
         let mut tabs = Vec::with_capacity(apps.len());
-        // Split across the three operations so a slow exit points at one of
+        // Split across the two operations so a slow exit points at one of
         // them instead of at the whole phase.
-        let (mut snapshot_ms, mut checkpoint_ms, mut session_clone_ms) = (0, 0, 0);
-        let snapshot_deadline = Instant::now() + SHUTDOWN_SNAPSHOT_BUDGET;
+        let (mut checkpoint_ms, mut session_clone_ms) = (0, 0);
         for (mut app, lease) in apps {
             let mut step = Instant::now();
             let mut step_ms = || {
@@ -4581,25 +4302,6 @@ impl<'t> EventLoop<'t> {
                 step = Instant::now();
                 elapsed
             };
-            // Only a session that captured a baseline has a bracket to close.
-            // Exiting one that never wrote must not walk the tree on the way
-            // out for a revert point nothing can reach.
-            match app.has_revert_point().then(|| {
-                app.snapshot_history_head_within(
-                    snapshot_deadline.saturating_duration_since(Instant::now()),
-                )
-            }) {
-                None | Some(Ok(true)) => {}
-                Some(Ok(false)) => warn!(
-                    session_id = %app.state.session.id,
-                    budget = ?SHUTDOWN_SNAPSHOT_BUDGET,
-                    "snapshot budget expired or capture unavailable, skipping final workspace snapshot"
-                ),
-                Some(Err(error)) => {
-                    warn!(session_id = %app.state.session.id, %error, "final workspace snapshot failed")
-                }
-            }
-            snapshot_ms += step_ms();
             app.checkpoint_now();
             if relocating
                 && let Err(error) = self
@@ -4649,7 +4351,6 @@ impl<'t> EventLoop<'t> {
             kill_mcp_ms,
             join_agents_ms,
             save_sessions_ms,
-            snapshot_ms,
             checkpoint_ms,
             session_clone_ms,
             mcp_shutdown_ms,
@@ -4731,16 +4432,11 @@ mod tests {
     use crate::components::{key, test_model};
     use crate::sandbox::transfer::{TransferCommand, TransferLink, TransferScope};
     use caudra_agent::background::BackgroundTasks;
-    use caudra_agent::snapshots::{
-        ConflictPolicy, JournalState, PathOutcomeKind, RestoreTarget, SnapshotKey, workspace_key,
-    };
     use caudra_agent::{DoneReason, McpSnapshotReader};
     use caudra_config::sandbox::Revision;
     use caudra_config::{FeatureFlags, PermissionsConfig};
     use caudra_providers::{ImageMediaType, ImageSource, TokenUsage};
-    use caudra_storage::sessions::{
-        PendingConversationRevert, PendingRestoreKind, PendingRestoreOperation, PendingRestorePhase,
-    };
+    use caudra_storage::sessions::PendingConversationRevert;
     use caudra_workspace::WorkspacePath;
     use crossterm::event::KeyCode;
     use tempfile::TempDir;
@@ -4836,32 +4532,16 @@ mod tests {
     const RELOCATION_DRAFT: &str = "draft before moving";
     const RELOCATION_EXTERNAL_TITLE: &str = "external writer";
     const RELOCATION_VERSION: i64 = 7;
-    const RELOCATION_JOURNAL: &str = "restore-journal.json";
-    const RELOCATION_FILE: &str = "tracked.txt";
-    const RELOCATION_BEFORE: &str = "before restore";
-    const RELOCATION_AFTER: &str = "after restore";
-    const RELOCATION_INSPECT_ERR: &str = "Cannot inspect snapshots for session";
-    const RELOCATION_RESTORE_ERR: &str =
-        "has an unfinished workspace restore; resolve it before moving";
     const RELOCATION_PENDING_ERR: &str = "has a pending restore; resolve it before moving sessions";
     const RELOCATION_INPUT_HISTORY: usize = 100;
     const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
     fn relocation_app(storage: StateDir, cwd: &Path, writer: Arc<StorageWriter>) -> App {
         let session = AppSession::new(RELOCATION_MODEL, cwd.to_str().unwrap());
-        let store =
-            App::snapshot_store_for(&storage, session.id, cwd, SnapshotLimits::default()).unwrap();
-        let baseline = WorkspaceBaseline::new(
-            Arc::clone(&store),
-            cwd.to_path_buf(),
-            SnapshotsConfig::default(),
-        );
         App::new(
             &test_model(),
             session,
             storage,
-            store,
-            baseline,
             Arc::new(ArcSwapOption::empty()),
             McpSnapshotReader::empty(),
             McpConfigErrors::new(PathBuf::new()),
@@ -5117,308 +4797,42 @@ mod tests {
         assert_eq!(expected, unchanged);
     }
 
-    #[test_case("missing"; "missing_source_snapshot_state_allowed")]
-    #[test_case("clean"; "clean_destination_allowed")]
-    #[test_case("pending"; "destination_donor_pending_revert_refused")]
-    #[test_case("corrupt"; "corrupt_destination_journal_refused")]
-    #[test_case("unfinished"; "unfinished_destination_journal_refused")]
-    fn relocation_startup_rechecks_destination_without_recovery_or_mutation(state: &str) {
+    #[test_case(false; "clean_destination_allowed")]
+    #[test_case(true; "destination_donor_pending_revert_refused")]
+    fn relocation_startup_rechecks_destination_without_mutation(pending: bool) {
         let temp = TempDir::new().unwrap();
         let storage = StateDir::from_path(temp.path().to_path_buf());
         let workspace = TempDir::new().unwrap();
         let cwd = workspace.path().canonicalize().unwrap();
         let mut donor = AppSession::new(RELOCATION_MODEL, cwd.to_str().unwrap());
-        let file = cwd.join(RELOCATION_FILE);
-        fs::write(&file, RELOCATION_BEFORE).unwrap();
-        donor.save(&storage).unwrap();
-        check_relocation_destination(&storage, &cwd).unwrap();
-        if state == "pending" {
+        if pending {
             donor.meta.pending_revert = Some(PendingConversationRevert {
                 original_head: None,
                 target_head: None,
-                original_workspace_head: None,
-                workspace_head: None,
                 file_status: None,
-                restore_operation: None,
             });
         }
         donor.save(&storage).unwrap();
-        let root = storage
-            .path()
-            .join(SESSION_SNAPSHOTS_DIR)
-            .join(donor.id.to_string());
-        let journal = root
-            .join(workspace_key(&cwd).unwrap())
-            .join(RELOCATION_JOURNAL);
-        if state != "missing" {
-            let store =
-                App::snapshot_store_for(&storage, donor.id, &cwd, SnapshotLimits::default())
-                    .unwrap();
-            store.snapshot_session_start(&cwd).unwrap();
-            if state == "corrupt" {
-                corrupt_restore_journal(&storage, &donor, &cwd);
-            } else if state == "unfinished" {
-                let source = CaudraId::generate();
-                let target = CaudraId::generate();
-                store.snapshot(&cwd, source).unwrap();
-                fs::write(&file, RELOCATION_AFTER).unwrap();
-                store.snapshot(&cwd, target).unwrap();
-                fs::write(&file, RELOCATION_BEFORE).unwrap();
-                store
-                    .restore_transaction_with_policy(
-                        &cwd,
-                        &[source],
-                        &[target],
-                        ConflictPolicy::Abort,
-                        CaudraId::generate(),
-                    )
-                    .unwrap();
-                assert!(store.journal_state().unwrap().is_some());
-            }
-        }
-        let journal_before = fs::read(&journal).ok();
-        let file_before = fs::read(&file).unwrap();
         let session_before =
             serde_json::to_value(load_app_session(donor.id, &storage).unwrap()).unwrap();
-        let version_before = SessionDatabase::open_state(&storage)
-            .unwrap()
-            .local_session_locations()
-            .unwrap();
-        let writer = StorageWriter::new(storage.clone(), flume::unbounded().0);
-        let result = prepare_workspace_for_runtime(
-            &storage,
-            &writer,
-            &cwd,
-            &HashSet::new(),
-            SnapshotLimits::default(),
-            false,
-        );
-        match state {
-            "pending" => assert_eq!(
+
+        let result = check_relocation_destination(&storage, &cwd);
+
+        if pending {
+            assert_eq!(
                 result,
                 Err(format!(
                     "Destination session {} {RELOCATION_PENDING_ERR}",
                     donor.id
                 ))
-            ),
-            "corrupt" => assert!(result.unwrap_err().starts_with(RELOCATION_INSPECT_ERR)),
-            "unfinished" => assert_eq!(
-                result,
-                Err(format!("Session {} {RELOCATION_RESTORE_ERR}", donor.id))
-            ),
-            _ => result.unwrap(),
+            );
+        } else {
+            result.unwrap();
         }
-        if state == "missing" {
-            check_relocation_journals(&storage, donor.id).unwrap();
-            assert!(!root.exists());
-        }
-        assert_eq!(fs::read(&journal).ok(), journal_before);
-        assert_eq!(fs::read(&file).unwrap(), file_before);
         assert_eq!(
             serde_json::to_value(load_app_session(donor.id, &storage).unwrap()).unwrap(),
             session_before
         );
-        assert_eq!(
-            SessionDatabase::open_state(&storage)
-                .unwrap()
-                .local_session_locations()
-                .unwrap(),
-            version_before
-        );
-        writer.shutdown(WRITER_DRAIN_TIMEOUT);
-    }
-
-    #[test_case(false, true, false; "relocation_refuses_pending_restore")]
-    #[test_case(false, false, false; "relocation_refuses_destination_journal")]
-    #[test_case(false, false, true; "relocation_refuses_source_journal")]
-    #[test_case(true, true, false; "normal_prepare_recovers_files_and_history")]
-    #[test_case(true, false, false; "normal_prepare_recovers_journal_without_pending_restore")]
-    fn runtime_preparation_gates_restore_recovery(
-        allow_workspace_recovery: bool,
-        pending_restore: bool,
-        source_journal: bool,
-    ) {
-        let temp = TempDir::new().unwrap();
-        let storage = StateDir::from_path(temp.path().to_path_buf());
-        let cwd = canonical_cwd(&std::env::current_dir().unwrap()).unwrap();
-        let workspace = TempDir::new_in(&cwd).unwrap();
-        let source = canonical_cwd(workspace.path()).unwrap();
-        let root = if source_journal { &source } else { &cwd };
-        let file = source.join(RELOCATION_FILE);
-        fs::write(&file, RELOCATION_BEFORE).unwrap();
-        let mut session = AppSession::new(RELOCATION_MODEL, cwd.to_str().unwrap());
-        let items = crate::history_items(&[
-            Message::user(RELOCATION_BEFORE.into()),
-            Message::user(RELOCATION_AFTER.into()),
-        ]);
-        let target_head = items[0].id;
-        let source_head = items[1].id;
-        session.replace_messages(items);
-        session.save(&storage).unwrap();
-        check_relocation_destination(&storage, &cwd).unwrap();
-        let operation_id = pending_restore.then(CaudraId::generate);
-        if let Some(id) = operation_id {
-            session.set_conversation_state(
-                Some(source_head),
-                Some(PendingConversationRevert {
-                    original_head: Some(source_head),
-                    target_head: Some(target_head),
-                    original_workspace_head: Some(Some(source_head).into()),
-                    workspace_head: Some(Some(source_head).into()),
-                    file_status: None,
-                    restore_operation: Some(PendingRestoreOperation {
-                        id,
-                        kind: PendingRestoreKind::Revert,
-                        phase: PendingRestorePhase::Intent,
-                        target_workspace_head: Some(target_head).into(),
-                        conversation_target: Some(Some(target_head).into()),
-                        overwrite: true,
-                    }),
-                }),
-            );
-            session.save(&storage).unwrap();
-        }
-        let store_dir = storage
-            .path()
-            .join(SESSION_SNAPSHOTS_DIR)
-            .join(session.id.to_string())
-            .join(workspace_key(root).unwrap());
-        fs::create_dir_all(&store_dir).unwrap();
-        let journal = store_dir.join(RELOCATION_JOURNAL);
-        fs::write(
-            &journal,
-            serde_json::to_vec(&json!({
-                "state": JournalState::Prepare,
-                "root": root,
-                "paths": [{
-                    "path": file.strip_prefix(root).unwrap(),
-                    "before": null,
-                    "target": null,
-                    "outcome": PathOutcomeKind::Deleted,
-                }],
-                "destination": RestoreTarget::Snapshot(SnapshotKey::Checkpoint(target_head)),
-                "policy": ConflictPolicy::Overwrite,
-                "operation_id": operation_id,
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let journal_before = fs::read(&journal).unwrap();
-        let session_before =
-            serde_json::to_value(load_app_session(session.id, &storage).unwrap()).unwrap();
-        let writer = StorageWriter::new(storage.clone(), flume::unbounded().0);
-        let result = prepare_session_for_runtime(
-            &storage,
-            &writer,
-            session.clone(),
-            SnapshotLimits::default(),
-            None,
-            allow_workspace_recovery,
-        );
-        if allow_workspace_recovery {
-            let (recovered, store, notice) = result.unwrap();
-            assert_eq!(notice, None);
-            assert!(!file.exists());
-            assert_eq!(store.journal_state().unwrap(), None);
-            let expected_head = if pending_restore {
-                target_head
-            } else {
-                source_head
-            };
-            assert_eq!(crate::session_history_head(&recovered), Some(expected_head));
-            let stored = load_app_session(session.id, &storage).unwrap();
-            assert_eq!(crate::session_history_head(&stored), Some(expected_head));
-            assert!(
-                stored
-                    .meta
-                    .pending_revert
-                    .as_ref()
-                    .is_none_or(|pending| { pending.restore_operation.is_none() })
-            );
-        } else {
-            let error = result.err().unwrap();
-            let expected = if pending_restore {
-                RELOCATION_PENDING_ERR
-            } else {
-                RELOCATION_RESTORE_ERR
-            };
-            assert_eq!(error, format!("Session {} {expected}", session.id));
-            assert_eq!(fs::read_to_string(&file).unwrap(), RELOCATION_BEFORE);
-            assert_eq!(fs::read(&journal).unwrap(), journal_before);
-            assert_eq!(
-                serde_json::to_value(load_app_session(session.id, &storage).unwrap()).unwrap(),
-                session_before
-            );
-        }
-        writer.shutdown(WRITER_DRAIN_TIMEOUT);
-    }
-
-    /// Nothing can read a journal or snapshot the store kept before snapshots
-    /// were git objects, so a restore it began cannot be finished. It must
-    /// cost the restore, not the session.
-    #[test]
-    fn a_restore_begun_by_a_legacy_store_is_cleared_with_a_notice() {
-        const LEGACY_OBJECTS: &str = "objects";
-        const LEGACY_JOURNAL: &str = r#"{"state":"prepare","before":{},"target":{}}"#;
-        let temp = TempDir::new().unwrap();
-        let storage = StateDir::from_path(temp.path().to_path_buf());
-        let cwd = canonical_cwd(&std::env::current_dir().unwrap()).unwrap();
-        let mut session = AppSession::new(RELOCATION_MODEL, cwd.to_str().unwrap());
-        let items = crate::history_items(&[
-            Message::user(RELOCATION_BEFORE.into()),
-            Message::user(RELOCATION_AFTER.into()),
-        ]);
-        let target_head = items[0].id;
-        let source_head = items[1].id;
-        session.replace_messages(items);
-        session.set_conversation_state(
-            Some(source_head),
-            Some(PendingConversationRevert {
-                original_head: Some(source_head),
-                target_head: Some(target_head),
-                original_workspace_head: Some(Some(source_head).into()),
-                workspace_head: Some(Some(source_head).into()),
-                file_status: None,
-                restore_operation: Some(PendingRestoreOperation {
-                    id: CaudraId::generate(),
-                    kind: PendingRestoreKind::Revert,
-                    phase: PendingRestorePhase::Intent,
-                    target_workspace_head: Some(target_head).into(),
-                    conversation_target: Some(Some(target_head).into()),
-                    overwrite: false,
-                }),
-            }),
-        );
-        session.save(&storage).unwrap();
-        let store_dir = storage
-            .path()
-            .join(SESSION_SNAPSHOTS_DIR)
-            .join(session.id.to_string())
-            .join(workspace_key(&cwd).unwrap());
-        fs::create_dir_all(store_dir.join(LEGACY_OBJECTS)).unwrap();
-        fs::write(store_dir.join(RELOCATION_JOURNAL), LEGACY_JOURNAL).unwrap();
-        let writer = StorageWriter::new(storage.clone(), flume::unbounded().0);
-
-        let (loaded, _, notice) = prepare_session_for_runtime(
-            &storage,
-            &writer,
-            session.clone(),
-            SnapshotLimits::default(),
-            None,
-            true,
-        )
-        .unwrap();
-
-        assert_eq!(notice, Some(crate::app::LEGACY_RESTORE_CLEARED));
-        assert_eq!(crate::session_history_head(&loaded), Some(source_head));
-        let stored = load_app_session(session.id, &storage).unwrap();
-        assert!(
-            stored
-                .meta
-                .pending_revert
-                .is_some_and(|pending| pending.restore_operation.is_none())
-        );
-        writer.shutdown(WRITER_DRAIN_TIMEOUT);
     }
 
     #[test_case(KeyModifiers::NONE, 3 ; "a plain notch is the configured size")]
@@ -5588,7 +5002,6 @@ mod tests {
             background_tasks,
             shell_commands,
             false,
-            false,
         ));
     }
 
@@ -5745,182 +5158,5 @@ mod tests {
 
         assert!(error.contains("Use /cd"), "{error}");
         assert!(error.contains(&session.id.to_string()), "{error}");
-    }
-
-    fn corrupt_restore_journal(storage: &StateDir, session: &AppSession, cwd: &Path) {
-        let store =
-            App::snapshot_store_for(storage, session.id, cwd, SnapshotLimits::default()).unwrap();
-        store.snapshot_session_start(cwd).unwrap();
-        let store_dir = storage
-            .path()
-            .join(caudra_agent::snapshots::SESSION_SNAPSHOTS_DIR)
-            .join(session.id.to_string())
-            .join(caudra_agent::snapshots::workspace_key(cwd).unwrap());
-        std::fs::write(store_dir.join("restore-journal.json"), "not json").unwrap();
-    }
-
-    #[test]
-    fn runtime_preparation_returns_recovery_error_without_flushing_stored_queue() {
-        let temp = TempDir::new().unwrap();
-        let storage = StateDir::from_path(temp.path().to_path_buf());
-        let cwd = canonical_cwd(&std::env::current_dir().unwrap()).unwrap();
-        let mut session = AppSession::new("test-model", &cwd.to_string_lossy());
-        session.meta.queued_messages = vec![caudra_storage::sessions::StoredQueuedPrompt {
-            mode: None,
-            text: "still queued".into(),
-            images: Vec::new(),
-            paste_ranges: Vec::new(),
-        }];
-        session.save(&storage).unwrap();
-        corrupt_restore_journal(&storage, &session, &cwd);
-        let writer = StorageWriter::new(storage.clone(), flume::unbounded().0);
-
-        let error = match prepare_session_for_runtime(
-            &storage,
-            &writer,
-            session.clone(),
-            SnapshotLimits::default(),
-            None,
-            true,
-        ) {
-            Ok(_) => panic!("corrupt recovery journal unexpectedly allowed runtime preparation"),
-            Err(error) => error,
-        };
-
-        assert!(
-            error.contains("inspect workspace restore journal"),
-            "{error}"
-        );
-        assert_eq!(
-            load_app_session(session.id, &storage)
-                .unwrap()
-                .meta
-                .queued_messages,
-            [caudra_storage::sessions::StoredQueuedPrompt {
-                mode: None,
-                text: "still queued".into(),
-                images: Vec::new(),
-                paste_ranges: Vec::new(),
-            }]
-        );
-        writer.shutdown(Duration::from_secs(30));
-    }
-
-    #[test]
-    fn startup_scans_unopened_sessions_for_restore_journals() {
-        let temp = TempDir::new().unwrap();
-        let storage = StateDir::from_path(temp.path().to_path_buf());
-        let cwd = TempDir::new().unwrap();
-        let cwd = canonical_cwd(cwd.path()).unwrap();
-        let mut resumed = AppSession::new("test-model", &cwd.to_string_lossy());
-        crate::push_history_message(&mut resumed, Message::user("resumed".into()));
-        resumed.save(&storage).unwrap();
-        let mut unopened = AppSession::new("test-model", &cwd.to_string_lossy());
-        crate::push_history_message(&mut unopened, Message::user("unopened".into()));
-        unopened.save(&storage).unwrap();
-        corrupt_restore_journal(&storage, &unopened, &cwd);
-        let writer = StorageWriter::new(storage.clone(), flume::unbounded().0);
-
-        let error = recover_stored_sessions_in_cwd(
-            &storage,
-            &writer,
-            &cwd,
-            &std::collections::HashSet::new(),
-            SnapshotLimits::default(),
-        )
-        .unwrap_err();
-
-        assert!(
-            error.contains("inspect workspace restore journal"),
-            "{error}"
-        );
-        writer.shutdown(Duration::from_secs(30));
-    }
-
-    #[test]
-    fn startup_recovers_an_interrupted_restore_for_an_unopened_session() {
-        use caudra_storage::sessions::{
-            PendingConversationRevert, PendingRestoreKind, PendingRestoreOperation,
-            PendingRestorePhase,
-        };
-
-        let temp = TempDir::new().unwrap();
-        let storage = StateDir::from_path(temp.path().to_path_buf());
-        let workspace = TempDir::new().unwrap();
-        let cwd = canonical_cwd(workspace.path()).unwrap();
-        let file = cwd.join("tracked.txt");
-        let mut resumed = AppSession::new("test-model", &cwd.to_string_lossy());
-        crate::push_history_message(&mut resumed, Message::user("resumed".into()));
-        resumed.save(&storage).unwrap();
-
-        let mut unopened = AppSession::new("test-model", &cwd.to_string_lossy());
-        let items = crate::history_items(&[
-            Message::user("target".into()),
-            Message::user("source".into()),
-        ]);
-        let target_head = items[0].id;
-        let source_head = items[1].id;
-        unopened.replace_messages(items);
-        let store = App::snapshot_store_for(&storage, unopened.id, &cwd, SnapshotLimits::default())
-            .unwrap();
-        std::fs::write(&file, "root").unwrap();
-        store.snapshot_session_start(&cwd).unwrap();
-        std::fs::write(&file, "target").unwrap();
-        store.snapshot(&cwd, target_head).unwrap();
-        std::fs::write(&file, "source").unwrap();
-        store.snapshot(&cwd, source_head).unwrap();
-        let operation_id = CaudraId::generate();
-        unopened.set_conversation_state(
-            Some(source_head),
-            Some(PendingConversationRevert {
-                original_head: Some(source_head),
-                target_head: Some(target_head),
-                original_workspace_head: Some(Some(source_head).into()),
-                workspace_head: Some(Some(source_head).into()),
-                file_status: None,
-                restore_operation: Some(PendingRestoreOperation {
-                    id: operation_id,
-                    kind: PendingRestoreKind::Revert,
-                    phase: PendingRestorePhase::Intent,
-                    target_workspace_head: Some(target_head).into(),
-                    conversation_target: Some(Some(target_head).into()),
-                    overwrite: false,
-                }),
-            }),
-        );
-        unopened.save(&storage).unwrap();
-        store
-            .restore_transaction_with_policy(
-                &cwd,
-                &[source_head],
-                &[target_head],
-                caudra_agent::snapshots::ConflictPolicy::Abort,
-                operation_id,
-            )
-            .unwrap();
-        let writer = StorageWriter::new(storage.clone(), flume::unbounded().0);
-
-        prepare_workspace_for_runtime(
-            &storage,
-            &writer,
-            &cwd,
-            &std::collections::HashSet::new(),
-            SnapshotLimits::default(),
-            true,
-        )
-        .unwrap();
-
-        let recovered = load_app_session(unopened.id, &storage).unwrap();
-        assert_eq!(crate::session_history_head(&recovered), Some(target_head));
-        assert!(
-            recovered
-                .meta
-                .pending_revert
-                .as_ref()
-                .is_some_and(|pending| pending.restore_operation.is_none())
-        );
-        assert_eq!(std::fs::read_to_string(file).unwrap(), "target");
-        assert_eq!(store.journal_state().unwrap(), None);
-        writer.shutdown(Duration::from_secs(30));
     }
 }

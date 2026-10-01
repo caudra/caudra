@@ -41,13 +41,15 @@ use caudra_workflow::{
 };
 use caudra_workspace::{
     CommandText, DirectoryNavigation, ExecRequest, LocalDocumentRef, OperationProgressKind,
-    OperationState, OperationStatus, WorkspaceCursor, WorkspaceError, WorkspaceSession,
+    OperationState, OperationStatus, RecordHolder, UNREVEALED_ROOT, WorkspaceCursor,
+    WorkspaceError, WorkspaceSession,
 };
 use flume::Receiver;
 use serde::Deserialize;
 use serde_json::Value;
 use tracing::{error, warn};
 
+use crate::agent::change_recording::{ChangeRecorder, ChangeSource, cover_records};
 use crate::agent::task_runner::{
     HostExtras, ModeResolver, ModelResolver, SubagentTaskRunner, WorkflowHostContext,
 };
@@ -69,10 +71,9 @@ use crate::types::{BACKGROUND_EVENT_RUN_ID, TodoItem};
 use crate::workflow::{RuntimeDeps, WorkflowHandle, WorkflowRuntime, WorkspaceRebind};
 use crate::{
     Agent, AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams,
-    BaselineGate, DoneReason, Envelope, EventSender, GoalHandle, ImageSource, McpHandle,
-    McpSession, PermissionsConfig, SessionMailbox, StoredSession, SubagentHistorySnapshot,
-    SubagentHistoryStore, ThinkingConfig, ToolOutput, ToolOutputLines, WorkspaceBaseline,
-    open_stored_session,
+    DoneReason, Envelope, EventSender, GoalHandle, ImageSource, McpHandle, McpSession,
+    PermissionsConfig, SessionMailbox, StoredSession, SubagentHistorySnapshot,
+    SubagentHistoryStore, ThinkingConfig, ToolOutput, ToolOutputLines, open_stored_session,
 };
 
 /// Bytes of a run's report or result carried into the next prompt.
@@ -145,13 +146,6 @@ struct SessionStore {
 }
 
 impl SessionStore {
-    fn history_head(&self) -> Option<CaudraId> {
-        self.session
-            .meta
-            .history_head
-            .or_else(|| self.session.messages().last().map(|item| item.id))
-    }
-
     /// The todo list the selected transcript last committed, read back across
     /// its compaction seams; see [`agent::stored_todos`].
     fn todos(&self) -> Option<Vec<TodoItem>> {
@@ -901,6 +895,44 @@ fn remote_output_line_count(text: &str) -> usize {
     text.bytes().filter(|byte| *byte == b'\n').count() + usize::from(!text.ends_with('\n'))
 }
 
+/// What a headless run records through. A remote run records on the host for
+/// its session; a local one records nothing, since no headless mode offers a
+/// file revert.
+fn remote_recorder(
+    remote: bool,
+    session_id: CaudraId,
+    config: &SnapshotsConfig,
+) -> Option<ChangeRecorder> {
+    if !remote {
+        return None;
+    }
+    let holder = RecordHolder::new(session_id.to_string())
+        .inspect_err(|error| warn!(%session_id, %error, "session id is not a record holder"))
+        .ok()?;
+    ChangeRecorder::new(
+        ChangeSource::Remote,
+        holder,
+        PathBuf::from(UNREVEALED_ROOT),
+        config,
+    )
+}
+
+/// [`remote_recorder`] for a stored session, whose record coverage follows
+/// where it records.
+fn session_recorder(
+    session: &mut StoredSession,
+    remote: bool,
+    config: &SnapshotsConfig,
+) -> Option<ChangeRecorder> {
+    let recorder = remote_recorder(remote, session.id, config);
+    let store = recorder
+        .as_ref()
+        .and(session.workspace_binding())
+        .map(StoredWorkspaceBinding::change_store_key);
+    cover_records(session, store);
+    recorder
+}
+
 pub fn direct_shell_command(prompt: &str) -> Option<&str> {
     let command = prompt
         .strip_prefix("!!")
@@ -911,19 +943,12 @@ pub fn direct_shell_command(prompt: &str) -> Option<&str> {
 
 pub async fn execute_remote_command(
     workspace: &WorkspaceSession,
-    baseline: &WorkspaceBaseline,
     command: &str,
     cancel: &CancelToken,
     max_output_lines: usize,
     max_output_bytes: usize,
     mut progress: impl FnMut(&str),
 ) -> RemoteCommandOutput {
-    if let Err(error) = baseline.ensure_current().await.into_result() {
-        return RemoteCommandOutput {
-            output: error.to_string(),
-            is_error: true,
-        };
-    }
     let result = run_remote_command(
         workspace,
         command,
@@ -1431,44 +1456,11 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
                 });
                 return;
             }
-            let workspace_baseline = match params.workspace_session.as_ref() {
-                Some(workspace) => {
-                    let binding = match StoredWorkspaceBinding::new_with_cursor(
-                        workspace.binding().clone(),
-                        workspace.cursor().clone(),
-                        None,
-                    ) {
-                        Ok(binding) => binding,
-                        Err(error) => {
-                            let _ = error_tx.send(AgentEvent::Error {
-                                message: format!(
-                                    "Remote workspace snapshot identity is invalid: {error}"
-                                ),
-                            });
-                            return;
-                        }
-                    };
-                    let storage = match StateDir::resolve() {
-                        Ok(storage) => storage,
-                        Err(error) => {
-                            let _ = error_tx.send(AgentEvent::Error {
-                                message: format!(
-                                    "Remote workspace snapshot storage is unavailable: {error}"
-                                ),
-                            });
-                            return;
-                        }
-                    };
-                    Some(WorkspaceBaseline::new_workspace_session(
-                        storage,
-                        session_id,
-                        workspace.clone(),
-                        binding,
-                        params.snapshots,
-                    ))
-                }
-                None => None,
-            };
+            let changes = remote_recorder(
+                params.workspace_session.is_some(),
+                session_id,
+                &params.snapshots,
+            );
             let mut agent = Agent::new(
                 AgentParams {
                     provider: Arc::clone(&provider),
@@ -1492,7 +1484,7 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
                     timeouts: params.timeouts,
                     file_tracker: FileReadTracker::fresh(),
                     path_locks: PathLocks::fresh(),
-                    baseline: workspace_baseline.map(|baseline| BaselineGate::new(baseline, None)),
+                    changes,
                     prompt_slots: Arc::new(params.prompt_slots),
                     prompt_profiles: Arc::clone(&params.prompt_profiles),
                     default_task_prompt_profile_name: Arc::clone(&active_prompt_profile_name),
@@ -1645,7 +1637,6 @@ pub struct InteractiveHandle {
     mode_route: Arc<InteractiveModeRoute>,
     workspace_change_tx: flume::Sender<WorkspaceChangeRequest>,
     remote_workspace: Option<Arc<StdMutex<RemoteWorkspaceState>>>,
-    workspace_baseline: Option<Arc<WorkspaceBaseline>>,
     pub task: smol::Task<()>,
 }
 
@@ -1754,7 +1745,6 @@ impl InteractiveHandle {
             mode_route: Arc::default(),
             workspace_change_tx: flume::unbounded().0,
             remote_workspace: None,
-            workspace_baseline: None,
             task: smol::spawn(async {}),
         }
     }
@@ -1767,10 +1757,6 @@ impl InteractiveHandle {
         self.remote_workspace
             .as_ref()
             .and_then(|state| state.lock().ok().map(|state| state.session.clone()))
-    }
-
-    pub fn remote_workspace_baseline(&self) -> Option<Arc<WorkspaceBaseline>> {
-        self.workspace_baseline.clone()
     }
 
     pub async fn set_model(&self, model: Model) -> Result<Model, AgentError> {
@@ -1945,7 +1931,7 @@ pub struct PreparedInteractive {
     model: Model,
     provider: Arc<dyn Provider>,
     store: SessionStore,
-    workspace_baseline: Option<Arc<WorkspaceBaseline>>,
+    changes: Option<ChangeRecorder>,
 }
 
 impl PreparedInteractive {
@@ -1997,7 +1983,7 @@ pub async fn prepare_interactive(
             params.workspace_binding.as_ref(),
         )
         .map_err(|error| InteractiveStartError(error.to_string()))?;
-        let workspace = crate::resume_workspace_session(&mut session, &dir, &workspace)
+        let workspace = crate::resume_workspace_session(&mut session, &workspace)
             .await
             .map_err(InteractiveStartError)?;
         params.initial_wd = session.cwd.clone().into();
@@ -2034,45 +2020,21 @@ pub async fn prepare_interactive(
             InteractiveStartError(format!("Session changed before startup: {error}"))
         })?;
     store.set_system_prompt_profile(params.system_prompt_profile_name.as_deref());
+    let changes = session_recorder(
+        &mut store.session,
+        params.workspace_session.is_some(),
+        &params.snapshots,
+    );
     store
         .save()
         .map_err(|error| InteractiveStartError(format!("Failed to persist session: {error}")))?;
-    let workspace_baseline = match (
-        params.workspace_session.clone(),
-        params.workspace_binding.clone(),
-    ) {
-        (Some(workspace), Some(binding)) => Some(WorkspaceBaseline::new_workspace_session(
-            store.dir.clone(),
-            session_id,
-            workspace,
-            binding,
-            params.snapshots,
-        )),
-        (None, None) => None,
-        _ => {
-            return Err(InteractiveStartError(
-                "Remote workspace snapshot identity is unavailable".into(),
-            ));
-        }
-    };
-    if let Some(baseline) = &workspace_baseline {
-        baseline.set_current_head(store.history_head());
-        if let Some(status) = baseline.reconcile_remote_restore().await.map_err(|error| {
-            InteractiveStartError(format!("Remote snapshot recovery failed: {error}"))
-        })? {
-            return Err(InteractiveStartError(format!(
-                "Remote snapshot recovery is required before this session can mutate ({:?})",
-                status.state
-            )));
-        }
-    }
     Ok(PreparedInteractive {
         params,
         history: history.with_todos(store.todos()),
         model,
         provider,
         store,
-        workspace_baseline,
+        changes,
     })
 }
 
@@ -2098,7 +2060,7 @@ async fn spawn_prepared_session(
         mut model,
         mut provider,
         mut store,
-        workspace_baseline,
+        changes,
     } = prepared;
     let decisions = initialize_decisions(
         params.decisions_config.clone(),
@@ -2154,7 +2116,6 @@ async fn spawn_prepared_session(
     let session_lease = Arc::clone(&params.session_lease);
     let subagent_history = store.subagent_history.clone();
     let state_dir = store.dir.clone();
-    let initial_history_head = store.history_head();
     let background = if background_enabled {
         Some(
             BackgroundTasks::spawn(state_dir.clone(), session_id)
@@ -2256,9 +2217,7 @@ async fn spawn_prepared_session(
         timeouts: params.timeouts,
         file_tracker: FileReadTracker::fresh(),
         path_locks: PathLocks::fresh(),
-        baseline: workspace_baseline
-            .as_ref()
-            .map(|baseline| BaselineGate::new(Arc::clone(baseline), initial_history_head)),
+        changes,
         prompt_slots: Arc::clone(&params.prompt_slots),
         prompt_profiles: Arc::clone(&params.prompt_profiles),
         default_task_prompt_profile_name: Arc::clone(&active_prompt_profile_name),
@@ -2362,7 +2321,6 @@ async fn spawn_prepared_session(
         ..base
     };
 
-    let handle_workspace_baseline = workspace_baseline.clone();
     let task = smol::spawn({
         let mode_route = Arc::clone(&mode_route);
         let permissions = Arc::clone(&permissions);
@@ -2374,7 +2332,6 @@ async fn spawn_prepared_session(
             let event_forwarder = smol::spawn({
                 let store = Arc::clone(&store);
                 let raw_tx = raw_tx.clone();
-                let workspace_baseline = workspace_baseline.clone();
                 let background = background.clone();
                 let workflow_wake_tx = workflow_wake_tx.clone();
                 async move {
@@ -2387,11 +2344,7 @@ async fn spawn_prepared_session(
                             continue;
                         }
                         let persistence_error = if let Some(store) = &mut *store.lock().await {
-                            let result = store.record_event(&envelope).err();
-                            if let Some(baseline) = &workspace_baseline {
-                                baseline.set_current_head(store.history_head());
-                            }
-                            result
+                            store.record_event(&envelope).err()
                         } else {
                             None
                         };
@@ -2589,14 +2542,6 @@ async fn spawn_prepared_session(
                                 Err("cd: session persistence is unavailable".to_owned())
                             };
                             if persisted.is_ok() {
-                                if let Some(baseline) = &workspace_baseline {
-                                    baseline.rebind_workspace_session(
-                                        state_dir.clone(),
-                                        session_id,
-                                        change.session.clone(),
-                                        change.binding.clone(),
-                                    );
-                                }
                                 vars = vars.clone().set("{cwd}", change.cwd.clone());
                                 base.workspace_session = Some(change.session.clone());
                                 base.remote_project_context = Some(Arc::clone(&change.context));
@@ -2971,18 +2916,6 @@ async fn spawn_prepared_session(
                     system.push_str(append);
                 }
 
-                let history_head = store
-                    .lock()
-                    .await
-                    .as_ref()
-                    .and_then(SessionStore::history_head);
-                if let Some(workspace_baseline) = &workspace_baseline {
-                    workspace_baseline.set_current_head(history_head);
-                }
-                base.baseline = workspace_baseline
-                    .as_ref()
-                    .map(|baseline| BaselineGate::new(Arc::clone(baseline), history_head));
-
                 let mut agent = Agent::new(
                     AgentParams {
                         provider: turn_provider,
@@ -3117,7 +3050,6 @@ async fn spawn_prepared_session(
         mode_route,
         workspace_change_tx,
         remote_workspace,
-        workspace_baseline: handle_workspace_baseline,
         task,
     })
 }
@@ -3309,7 +3241,7 @@ mod tests {
     use caudra_storage::permission_state::mutation::{
         PermissionMutation, PermissionRecordIdentity, prepare_mutation,
     };
-    use caudra_storage::sessions::generate_title;
+    use caudra_storage::sessions::{RecordCoverage, generate_title};
     use caudra_storage::workflow::WorkflowRunStatus;
     use caudra_workflow::{RunStatus, WorkflowError, WorkflowEvent};
     use tempfile::TempDir;
@@ -3322,6 +3254,7 @@ mod tests {
     use crate::permissions::{
         PermissionAnswer, PermissionError, PermissionLifetime, PermissionRequest, RevokedRuleScope,
     };
+    use crate::remote_project_context::tests::AssetService;
     use crate::tools::registry::BoxFuture;
     use crate::tools::test_support::stub_ctx_with;
     use crate::tools::{PermissionScopes, TODOWRITE_TOOL_NAME};
@@ -3342,7 +3275,47 @@ mod tests {
     const REVISED_TODO_CALL: &str = "todo-2";
     const FIRST_TODO: &str = "draft the schema";
     const REVISED_TODO: &str = "backfill the rows";
+    const CHANGE_PROMPT: &str = "change the files";
     const ENGINE_ON: FeatureFlags = FeatureFlags::NONE.with(Feature::DecisionEngine);
+
+    #[test_case(true ; "a_remote_run_records_on_its_host")]
+    #[test_case(false ; "a_local_run_records_nothing")]
+    fn only_a_remote_run_records_changes(remote: bool) {
+        let recorder = remote_recorder(remote, session_id(), &SnapshotsConfig::default());
+
+        assert_eq!(
+            recorder.as_ref().map(ChangeRecorder::root),
+            remote.then_some(Path::new(UNREVEALED_ROOT))
+        );
+    }
+
+    #[test_case(true ; "a_remote_run_keeps_what_its_host_covers")]
+    #[test_case(false ; "a_local_run_covers_nothing")]
+    fn a_run_covers_only_what_it_records(remote: bool) {
+        let binding = if remote {
+            let (workspace, _) = AssetService::permission_fixture();
+            StoredWorkspaceBinding::new_with_cursor(
+                workspace.binding().clone(),
+                workspace.cursor().clone(),
+                None,
+            )
+            .unwrap()
+        } else {
+            StoredWorkspaceBinding::local_from_cwd(CWD)
+        };
+        let coverage = Some(RecordCoverage {
+            store: binding.change_store_key(),
+            since: None,
+        });
+        let mut session = StoredSession::new_with_workspace(MODEL_SPEC, CWD, binding);
+        session
+            .replace_messages(History::new(vec![Message::user(CHANGE_PROMPT.into())]).into_items());
+        session.meta.record_coverage = coverage.clone();
+
+        session_recorder(&mut session, remote, &SnapshotsConfig::default());
+
+        assert_eq!(session.meta.record_coverage, coverage.filter(|_| remote));
+    }
 
     #[test_case(false; "passive_config")]
     #[test_case(true; "restricted_without_endpoint")]
@@ -4905,7 +4878,7 @@ complete(#{ report: first.output });
                     model: Model::from_spec(MODEL_SPEC).unwrap(),
                     provider: Arc::clone(&self.provider) as Arc<dyn Provider>,
                     store,
-                    workspace_baseline: None,
+                    changes: None,
                 },
                 background,
             )

@@ -20,9 +20,9 @@ use caudra_agent::tools::PathLocks;
 use caudra_agent::types::TodoItem;
 use caudra_agent::workflow::WorkflowHandle;
 use caudra_agent::{
-    AgentConfig, AgentMode, BaselineGate, CancelMap, CancelToken, Envelope, HistorySnapshot,
-    McpCommand, McpConfigErrors, McpHandle, McpSnapshotReader, Nudge, SessionMailbox,
-    SharedHistory, SubagentHistoryStore, ToolOutputLines, WorkspaceBaseline,
+    AgentConfig, AgentMode, CancelMap, CancelToken, Envelope, HistorySnapshot, McpCommand,
+    McpConfigErrors, McpHandle, McpSnapshotReader, Nudge, SessionMailbox, SharedHistory,
+    SubagentHistoryStore, ToolOutputLines,
 };
 use caudra_config::ModelPolicy;
 use caudra_lua::EventHandle;
@@ -43,6 +43,7 @@ use tracing::{info, warn};
 
 use crate::app::App;
 use crate::app::background_delivery::DeliveryFence;
+use crate::app::file_revert::RecorderSlot;
 
 use self::agent_loop::AgentLoop;
 use self::command_router::spawn_command_router;
@@ -172,7 +173,7 @@ impl AgentHandles {
         system_prompt_profile: Option<Arc<SystemPromptProfile>>,
         prompt_profiles: Arc<PromptProfileCatalog>,
         state_dir: Option<StateDir>,
-        baseline: Arc<WorkspaceBaseline>,
+        change_recorder: RecorderSlot,
         workspace_session: Option<WorkspaceSession>,
         remote_project_context: Option<
             Arc<caudra_agent::remote_project_context::RemoteProjectContext>,
@@ -218,7 +219,7 @@ impl AgentHandles {
             background_enabled,
             Arc::default(),
             PathLocks::fresh(),
-            baseline,
+            change_recorder,
             workspace_session,
             remote_project_context,
             host_cwd,
@@ -451,7 +452,7 @@ impl AgentHandles {
                 Arc::default()
             },
             Arc::clone(&self.path_locks),
-            Arc::clone(&app.workspace_baseline),
+            Arc::clone(&app.change_recorder),
             self.workspace_session.clone(),
             self.remote_project_context.clone(),
             self.host_cwd.clone(),
@@ -553,7 +554,7 @@ fn spawn_agent_internal(
     background_enabled: bool,
     delivery_fence: Arc<DeliveryFence>,
     path_locks: Arc<PathLocks>,
-    baseline: Arc<WorkspaceBaseline>,
+    change_recorder: RecorderSlot,
     workspace_session: Option<WorkspaceSession>,
     remote_project_context: Option<Arc<caudra_agent::remote_project_context::RemoteProjectContext>>,
     host_cwd: Option<PathBuf>,
@@ -633,7 +634,7 @@ fn spawn_agent_internal(
                         answer: (answer_tx.clone(), Arc::clone(&answer_rx)),
                         events: agent_tx.clone(),
                         path_locks: Arc::clone(&path_locks),
-                        baseline: Some(BaselineGate::new(Arc::clone(&baseline), None)),
+                        changes: change_recorder.load_full().as_deref().cloned(),
                         workspace_session: workspace_session.clone(),
                         remote_project_context: remote_project_context.clone(),
                         host_cwd: host_cwd.clone(),
@@ -684,7 +685,7 @@ fn spawn_agent_internal(
         Arc::clone(&delivery_fence),
         Arc::clone(&execution_mode),
         Arc::clone(&path_locks),
-        baseline,
+        change_recorder,
         workspace_session.clone(),
         remote_project_context.clone(),
         host_cwd.clone(),
@@ -850,7 +851,7 @@ mod tests {
     use std::time::Instant;
 
     use caudra_agent::{AgentEvent, AgentInput, PromptAdmission};
-    use caudra_config::{Feature, FeatureFlags, PermissionsConfig, SnapshotsConfig};
+    use caudra_config::{Feature, FeatureFlags, PermissionsConfig};
     use caudra_providers::provider::BoxFuture;
     use caudra_providers::{
         AgentError, CacheKey, ModelInfo, ProviderEvent, RequestOptions, StreamResponse,
@@ -871,7 +872,6 @@ mod tests {
     const PROBE_TEXT: &str = "probe-through-old-sender";
     const RESTORED_TEXT: &str = "restored-queued-message";
     const RESUMED_HISTORY_TEXT: &str = "resumed-conversation";
-    const STUB_SNAPSHOT_KEY: &str = "stub";
     const PLAN_PATH: &str = ".caudra/plans/runtime-mode.md";
     const PLAN_REF: &str = "plan-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const COMMITTED_MODEL: &str = "committed-model";
@@ -972,15 +972,7 @@ mod tests {
             None,
             Arc::new(PromptProfileCatalog::default()),
             state_dir,
-            WorkspaceBaseline::new(
-                Arc::new(caudra_agent::snapshots::SnapshotStore::new(
-                    &std::env::temp_dir().join("caudra-agent-test-snapshots"),
-                    CaudraId::generate(),
-                    STUB_SNAPSHOT_KEY,
-                )),
-                PathBuf::from("/tmp"),
-                SnapshotsConfig::default(),
-            ),
+            RecorderSlot::default(),
             None,
             None,
             None,

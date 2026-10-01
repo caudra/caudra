@@ -1,15 +1,18 @@
 #![forbid(unsafe_code)]
 
+mod changes;
 pub mod editor_adapter;
 mod native_redirect;
 mod pattern_analysis;
 mod read_only_shell;
 mod remote;
+mod shell_record_scope;
 mod transfer;
 mod transfer_authorization;
 mod transfer_inventory;
 mod transfer_session;
 
+pub use changes::{ChangeInventory, LocalChangeStore, LocalChangeStores, PreparedStoreCleanup};
 pub use pattern_analysis::{
     BashContextAssumptions, BashContextIssue, BashOperatorKind, BashSpan,
     COMMAND_OBSERVATION_ATTRIBUTE, MAX_PATTERN_DIAGNOSTIC_DETAILS, PatternCallAnalysis,
@@ -33,7 +36,7 @@ pub use transfer_session::{
 pub use workcell::host_contract;
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
@@ -66,12 +69,14 @@ use caudra_agent::{
     TextOutput, ToolInput, ToolOutput,
 };
 use caudra_config::ShellNativeRedirect;
+use caudra_storage::StateDir;
 use caudra_storage::permission_state::{
     BROWSE_DIRECT, BROWSE_RECURSION_ATTRIBUTE, BROWSE_RECURSIVE,
 };
 use caudra_workspace::{
     OperationError, OperationProgressKind, OperationState, OperationStatus, PreparedToolCall,
-    ToolPrepareRequest, WorkspaceError,
+    RecordScope, RecordedPath, ToolPrepareRequest, UNREVEALED_ROOT, WorkspaceChangeService,
+    WorkspaceError,
 };
 use futures_lite::future;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -99,6 +104,7 @@ use workcell::files::{
     PreparedFileRead,
 };
 use workcell::output_filter::RowRenderer;
+use workcell::shell::bash::{BashCommandContexts, BashProgram};
 use workcell::shell::{
     MAX_TIMEOUT_MS as SHELL_MAX_TIMEOUT_MS, PreparedShell, ShellExecution,
     ShellFilterInfo as WorkcellShellFilterInfo, ShellInput, ShellOutput as WorkcellShellOutput,
@@ -183,6 +189,19 @@ const REMOTE_PREPARATION_RENEWAL: Duration = Duration::from_secs(15);
 const REMOTE_PREPARATION_LAPSED: &str =
     "Remote Workcell preparation expired before dispatch and could not be renewed";
 const REMOTE_PREPARATION_CHANGED: &str = "Remote Workcell preparation expired before dispatch and the renewed request no longer matches the reviewed intent";
+/// What a remote host promises about the shell it runs a line in. A prepared
+/// call reporting anything else is not one Caudra can review.
+const REMOTE_SHELL_ASSUMPTIONS: BashContextAssumptions = BashContextAssumptions {
+    startup_preserves_cwd: true,
+    no_aliases_functions_or_command_not_found_hook: true,
+    no_traps: true,
+    default_shell_options: true,
+    standard_builtins: true,
+    directory_variables_are_standard: true,
+    cdpath_empty: true,
+    lastpipe_disabled: true,
+    logical_pwd_matches_initial: true,
+};
 /// Caudra owns authorization, so Workcell always hands over the mutation
 /// tools and every write still passes through the permission layer first.
 /// Withholding them here would hide tools the user is allowed to approve.
@@ -497,6 +516,14 @@ impl WorkcellHost {
 
     pub fn warnings(&self) -> &[String] {
         &self.warnings
+    }
+
+    /// The change records of the session directory `cwd`, kept beneath
+    /// `state` and bound to the file tools of `cwd`, so a revert waits on the
+    /// same lock as their writes. The store opens on the first call that
+    /// needs it.
+    pub fn change_service(&self, cwd: &Path, state: &StateDir) -> Arc<dyn WorkspaceChangeService> {
+        changes::bound(Arc::clone(&self.inner), cwd, state)
     }
 
     pub fn register(&self, registry: &ToolRegistry) -> Result<(), RegistryError> {
@@ -1986,42 +2013,42 @@ fn remote_cancellation(ctx: &ToolContext, deadline: Instant) -> ToolFailure {
     }
 }
 
-fn remote_shell_plan_access(call: &RemotePreparedToolCall) -> PlanModeAccess {
-    let resources = &call.intent.resources;
-    let [cwd, command, startup] = resources.as_slice() else {
-        return PlanModeAccess::Refused;
+/// The cwd and command of a remote shell call, when the host prepared it in the
+/// shape Caudra reviews.
+fn remote_shell_line(resources: &[host_contract::ResourceIntent]) -> Option<(&str, &str)> {
+    let [cwd, command, startup] = resources else {
+        return None;
     };
     if cwd.access != host_contract::ResourceAccess::Traverse
         || command.access != host_contract::ResourceAccess::Execute
         || startup.access != host_contract::ResourceAccess::Inspect
+        || serde_json::from_str::<Value>(startup.display.as_str()).ok()
+            != serde_json::to_value(REMOTE_SHELL_ASSUMPTIONS).ok()
     {
-        return PlanModeAccess::Refused;
+        return None;
     }
-    let assumptions = BashContextAssumptions {
-        startup_preserves_cwd: true,
-        no_aliases_functions_or_command_not_found_hook: true,
-        no_traps: true,
-        default_shell_options: true,
-        standard_builtins: true,
-        directory_variables_are_standard: true,
-        cdpath_empty: true,
-        lastpipe_disabled: true,
-        logical_pwd_matches_initial: true,
+    Some((cwd.display.as_str(), command.display.as_str()))
+}
+
+/// Where each command of a remote line runs, under the root the host keeps to
+/// itself.
+fn remote_shell_contexts(program: &BashProgram, cwd: &str) -> BashCommandContexts {
+    program.command_contexts_with_assumptions(
+        &Path::new(UNREVEALED_ROOT).join(cwd),
+        REMOTE_SHELL_ASSUMPTIONS,
+    )
+}
+
+fn remote_shell_plan_access(call: &RemotePreparedToolCall) -> PlanModeAccess {
+    let Some((cwd, command)) = remote_shell_line(&call.intent.resources) else {
+        return PlanModeAccess::Refused;
     };
-    if serde_json::from_str::<Value>(startup.display.as_str()).ok()
-        != serde_json::to_value(&assumptions).ok()
-    {
-        return PlanModeAccess::Refused;
-    }
-    let read_only = workcell::shell::bash::parse_bash(command.display.as_str())
+    let read_only = workcell::shell::bash::parse_bash(command)
         .ok()
         .is_some_and(|program| {
-            let contexts = program.command_contexts_with_assumptions(
-                &Path::new("/").join(cwd.display.as_str()),
-                assumptions,
-            );
+            let contexts = remote_shell_contexts(&program, cwd);
             let facts = pattern_analysis::shell_facts(&program, &contexts);
-            !facts.opaque
+            !facts.opaque()
                 && !facts.commands.is_empty()
                 && facts
                     .commands
@@ -2033,6 +2060,35 @@ fn remote_shell_plan_access(call: &RemotePreparedToolCall) -> PlanModeAccess {
     } else {
         PlanModeAccess::Prompted
     }
+}
+
+fn remote_shell_scope(resources: &[host_contract::ResourceIntent]) -> Option<RecordScope> {
+    let Some((cwd, command)) = remote_shell_line(resources) else {
+        return Some(RecordScope::Workspace);
+    };
+    match workcell::shell::bash::parse_bash(command) {
+        Ok(program) => shell_record_scope::remote_shell_record_scope(
+            &program,
+            &remote_shell_contexts(&program, cwd),
+        ),
+        Err(_) => Some(RecordScope::Workspace),
+    }
+}
+
+/// The record a remote write needs. Only a spelling relative to the cursor
+/// can be placed, because the host never reveals where its root is.
+fn remote_write_scope(input: &Input, cwd: &str) -> RecordScope {
+    let root = Path::new(UNREVEALED_ROOT);
+    let base = root.join(cwd);
+    remote_write_paths(input)
+        .into_iter()
+        .map(|path| match RecordedPath::of(&base.join(path), root) {
+            RecordedPath::Inside(path) => Some(path),
+            RecordedPath::Outside | RecordedPath::Unplaced => None,
+        })
+        .collect::<Option<BTreeSet<_>>>()
+        .filter(|paths| !paths.is_empty())
+        .map_or(RecordScope::Workspace, RecordScope::Paths)
 }
 
 struct RemoteExecutionCleanup {
@@ -2192,6 +2248,32 @@ impl ToolInvocation for RemoteWorkcellInvocation {
                     .ok()
             })
             .map_or_else(Vec::new, |cwd| remote_write_keys(&self.input, cwd.as_str()))
+    }
+
+    /// The host runs the call under a root it keeps to itself, which `root`, a
+    /// directory on this machine, does not name.
+    fn record_scope(&self, ctx: &ToolContext, _root: &Path) -> Option<RecordScope> {
+        if self.kind == ToolKind::Shell {
+            return self
+                .prepared
+                .try_lock()
+                .ok()
+                .and_then(|state| {
+                    state
+                        .call
+                        .as_ref()
+                        .map(|call| remote_shell_scope(&call.intent.resources))
+                })
+                .unwrap_or(Some(RecordScope::Workspace));
+        }
+        let cwd = ctx.workspace_session.as_ref().and_then(|session| {
+            self.client
+                .cursor_path(session.binding(), session.cursor())
+                .ok()
+        });
+        Some(cwd.map_or(RecordScope::Workspace, |cwd| {
+            remote_write_scope(&self.input, cwd.as_str())
+        }))
     }
 
     fn preflight<'a>(
@@ -2758,6 +2840,26 @@ impl ToolInvocation for WorkcellInvocation {
 
     fn mutation_targets(&self, _ctx: &ToolContext) -> Vec<PathBuf> {
         self.prepared_targets(|prepared| &prepared.mutation_targets)
+    }
+
+    /// A shell line records what its text names it writing. Every other tool
+    /// records the files it declared.
+    fn record_scope(&self, ctx: &ToolContext, root: &Path) -> Option<RecordScope> {
+        if !matches!(self.input, Input::Shell(_)) {
+            return RecordScope::of_files(&self.mutation_targets(ctx), root);
+        }
+        match self
+            .prepared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map(|prepared| &prepared.execution)
+        {
+            Some(PreparedExecution::Shell(_, shell)) => {
+                shell_record_scope::prepared_shell_record_scope(shell, root)
+            }
+            _ => Some(RecordScope::Workspace),
+        }
     }
 
     fn read_targets(&self, _ctx: &ToolContext) -> Vec<PathBuf> {
@@ -3687,7 +3789,7 @@ fn shell_prepared(
             .bash_command_contexts()
             .unwrap_or_else(|_| program.command_contexts(shell.workdir()));
         let facts = pattern_analysis::shell_facts(program, &contexts);
-        opaque = facts.opaque;
+        opaque = facts.opaque();
         if !opaque
             && redirect != ShellNativeRedirect::Off
             && let Some(natives) = native_redirect::detect(&facts.commands)
@@ -4875,6 +4977,7 @@ mod tests {
         PackageManagerDescriptor, PrivilegeDescriptor, RuntimeDescriptor,
         SystemPackageManagerDescriptor, WorkspaceDescriptor,
     };
+    use workcell::shell::bash::MAX_BASH_DEPTH;
     use workcell::shell::{
         DEFAULT_TIMEOUT_MS as SHELL_DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_SECS as SHELL_MAX_TIMEOUT_SECS,
     };
@@ -6513,6 +6616,78 @@ mod tests {
     ) -> ToolEffect {
         let root = TempDir::new().expect("tempdir");
         shell_call_effect(root.path(), command, preflight)
+    }
+
+    const RECORDED_FILE: &str = "notes.md";
+    const REMOTE_SUBDIRECTORY: &str = "sub";
+
+    fn recorded(paths: &[&str]) -> Option<RecordScope> {
+        Some(RecordScope::Paths(
+            paths
+                .iter()
+                .map(|path| caudra_workspace::WorkspacePath::new(*path).expect("workspace path"))
+                .collect(),
+        ))
+    }
+
+    fn too_deep_to_parse() -> String {
+        let depth = MAX_BASH_DEPTH + 1;
+        format!(
+            "{}rm {RECORDED_FILE}{}",
+            "( ".repeat(depth),
+            " )".repeat(depth)
+        )
+    }
+
+    #[test_case(SHELL_TOOL_NAME, json!({"command": "rm notes.md"}), true => recorded(&[RECORDED_FILE]) ; "a_shell_line_records_what_it_names")]
+    #[test_case(SHELL_TOOL_NAME, json!({"command": "ls /tmp"}), true => None ; "a_shell_read_records_nothing")]
+    #[test_case(SHELL_TOOL_NAME, json!({"command": "cargo fmt"}), true => Some(RecordScope::Workspace) ; "an_opaque_line_records_everything")]
+    #[test_case(SHELL_TOOL_NAME, json!({"command": "rm notes.md"}), false => Some(RecordScope::Workspace) ; "an_unprepared_line_records_everything")]
+    #[test_case(SHELL_TOOL_NAME, json!({"command": too_deep_to_parse()}), true => Some(RecordScope::Workspace) ; "an_unparsed_line_records_everything")]
+    #[test_case("file_write", json!({"filePath": RECORDED_FILE, "content": ""}), true => recorded(&[RECORDED_FILE]) ; "a_file_tool_records_its_target")]
+    fn a_call_records_what_it_names(
+        tool: &str,
+        input: Value,
+        preflight: bool,
+    ) -> Option<RecordScope> {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let (_host, registry) = host_and_registry(&root);
+        let ctx = context(&root, Arc::clone(&registry), CancelToken::none());
+        let invocation = registry
+            .get(tool)
+            .expect("registered tool")
+            .tool
+            .parse(&input)
+            .expect("valid input");
+        if preflight {
+            smol::block_on(invocation.preflight(&ctx)).expect("preflight");
+        }
+        invocation.record_scope(&ctx, &root)
+    }
+
+    #[test_case(REMOTE_SUBDIRECTORY, "rm x" => recorded(&["sub/x"]) ; "a_target_lands_under_the_cursor")]
+    #[test_case(CURRENT_WORKDIR, "rm /workspace/x" => Some(RecordScope::Workspace) ; "an_absolute_target_is_unplaced")]
+    #[test_case(CURRENT_WORKDIR, "ls /tmp" => None ; "a_read_records_nothing")]
+    #[test_case(CURRENT_WORKDIR, "cargo fmt" => Some(RecordScope::Workspace) ; "an_opaque_line_records_everything")]
+    #[test_case(CURRENT_WORKDIR, &too_deep_to_parse() => Some(RecordScope::Workspace) ; "an_unparsed_line_records_everything")]
+    fn a_remote_line_records_what_it_names_under_its_cursor(
+        cwd: &str,
+        command: &str,
+    ) -> Option<RecordScope> {
+        let startup = serde_json::to_string(&REMOTE_SHELL_ASSUMPTIONS).expect("assumptions");
+        let resources: Vec<host_contract::ResourceIntent> = serde_json::from_value(json!([
+            {"resourceId": "cwd", "scope": ["cwd"], "display": cwd, "access": "traverse", "revision": null},
+            {"resourceId": "command", "scope": ["command"], "display": command, "access": "execute", "revision": null},
+            {"resourceId": "startup", "scope": ["startup"], "display": startup, "access": "inspect", "revision": null},
+        ]))
+        .expect("resource intents");
+        remote_shell_scope(&resources)
+    }
+
+    #[test]
+    fn a_remote_line_in_an_unreviewed_shape_records_everything() {
+        assert_eq!(remote_shell_scope(&[]), Some(RecordScope::Workspace));
     }
 
     fn confined_read_preflight_rows(root: &Path, command: &str) -> Vec<bool> {
@@ -9124,6 +9299,19 @@ mod tests {
             .map(|path| LockKey::Remote((*path).to_owned()))
             .collect::<Vec<_>>();
         assert_eq!(remote_write_keys(&input, REMOTE_CWD), expected);
+    }
+
+    #[test_case(ToolKind::FileWrite, json!({"filePath": "src/lib.rs", "content": ""}) => recorded(&["project/src/lib.rs"]) ; "a_relative_write_lands_under_the_cursor")]
+    #[test_case(ToolKind::FileApplyPatch, json!({"patchText": REMOTE_MOVE_PATCH}) => recorded(&["project/src/lib.rs", "project/src/moved.rs"]) ; "a_patch_records_every_file")]
+    #[test_case(ToolKind::FileEdit, json!({"filePath": REMOTE_ABSOLUTE, "oldString": "a", "newString": "b"}) => Some(RecordScope::Workspace) ; "an_absolute_write_is_unplaced")]
+    #[test_case(ToolKind::FileEdit, json!({"filePath": "./src/../src/lib.rs", "oldString": "a", "newString": "b"}) => Some(RecordScope::Workspace) ; "a_parent_step_is_unplaced")]
+    #[test_case(ToolKind::Code, json!({"code": "1"}) => Some(RecordScope::Workspace) ; "a_call_naming_no_file_records_everything")]
+    fn a_remote_write_records_the_files_it_names(
+        kind: ToolKind,
+        input: Value,
+    ) -> Option<RecordScope> {
+        let input = Input::parse(kind, input).expect("valid input");
+        Some(remote_write_scope(&input, REMOTE_CWD))
     }
 
     const REMOTE_RELATIVE_TARGET: &str = "src/lib.rs";

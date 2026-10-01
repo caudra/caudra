@@ -207,7 +207,7 @@ impl PermissionAuthorityLease for WorkcellAuthorityLease<'_> {
             .bash_command_contexts()
             .map_err(|_| unavailable(NO_TEMPLATE))?;
         let facts = pattern_analysis::shell_facts(program, &contexts);
-        if facts.opaque || facts.commands.len() != 1 || !source.workdir.is_absolute() {
+        if facts.opaque() || facts.commands.len() != 1 || !source.workdir.is_absolute() {
             return Err(unavailable(NO_TEMPLATE));
         }
         let observation = pattern_analysis::command_observation(
@@ -485,7 +485,7 @@ pub(super) fn shell_plan_access(shell: &PreparedShell) -> PlanModeAccess {
     let read_only = shell.bash_program().ok().is_some_and(|program| {
         shell.bash_command_contexts().ok().is_some_and(|contexts| {
             let facts = pattern_analysis::shell_facts(program, &contexts);
-            !facts.opaque
+            !facts.opaque()
                 && facts
                     .commands
                     .iter()
@@ -1080,7 +1080,7 @@ mod tests {
         let program = prepared.bash_program().unwrap();
         let contexts = prepared.bash_command_contexts().unwrap();
         let facts = shell_facts(program, &contexts);
-        assert_eq!(facts.opaque, opaque);
+        assert_eq!(facts.opaque(), opaque);
         assert!(!facts.commands.is_empty());
         assert_eq!(
             facts.commands.iter().all(|command| {

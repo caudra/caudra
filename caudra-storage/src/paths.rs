@@ -296,7 +296,7 @@ fn ensure(path: &Path) -> Result<PathBuf, std::io::Error> {
 /// race and leaves a symlink behind would redirect all three. `create_dir_all`
 /// follows such a link without complaint, so every directory Caudra owns is
 /// created one at a time through this instead.
-pub(crate) fn ensure_private_dir(path: &Path) -> Result<PathBuf, std::io::Error> {
+pub fn ensure_private_dir(path: &Path) -> Result<PathBuf, std::io::Error> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {

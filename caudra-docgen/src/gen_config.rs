@@ -358,10 +358,11 @@ fn write_snapshots_section(out: &mut String) {
     write_section(out, "[storage.snapshots]", SnapshotsConfig::FIELDS);
     writeln!(
         out,
-        "A workspace over `max_bytes_mb` or `max_files` is refused rather than captured, \
-         and individual files over `max_file_bytes_mb` are skipped while the rest of the \
-         tree is still captured. A refusal costs file revert and lets the tool call \
-         proceed. See [Sessions](/docs/sessions/#limits) for what a capture covers.\n"
+        "A change record that would cover more than `max_files` files or `max_bytes_mb` of \
+         file data is refused, and its call runs without a record. A file over \
+         `max_file_bytes_mb` is left unrecorded. Values above the store's limits are lowered \
+         to them, and zero is rejected. See [Sessions](/docs/sessions/#limits) for what a \
+         record covers.\n"
     )
     .unwrap();
 }

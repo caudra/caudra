@@ -12,9 +12,10 @@
 //! not capped: diagnostics and warnings must not delete canonical sessions or
 //! reject otherwise valid writes.
 //!
-//! Managed full tool outputs, rewind archives, and workspace snapshots remain
-//! external. Deletes enqueue their idempotent cleanup in the same transaction as
-//! the structured delete because SQLite cannot atomically remove those files.
+//! Managed full tool outputs, rewind archives, and the change records a session
+//! holds remain external. Deletes enqueue their idempotent cleanup in the same
+//! transaction as the structured delete because SQLite cannot atomically remove
+//! those files.
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -50,6 +51,7 @@ use serde_json::Value;
 use tempfile::NamedTempFile;
 use tracing::warn;
 
+use super::change_stores::{ChangeStores, registered_change_stores, release_everywhere};
 use super::lease::{SessionLease, held_session_ids};
 use super::progress::{MIGRATION, MigrationEvent, PRUNE, PruneEvent};
 use super::{
@@ -138,12 +140,26 @@ const OTHER_USER_PERMISSIONS: u32 = 0o077;
 const WAL_SUFFIX: &str = "-wal";
 const SHM_SUFFIX: &str = "-shm";
 const DATABASE_SIDECAR_SUFFIXES: [&str; 3] = [WAL_SUFFIX, SHM_SUFFIX, "-journal"];
-pub(super) const SESSION_SNAPSHOT_DIR: &str = "session-snapshots";
-pub(super) const WORKSPACE_SNAPSHOT_DIR: &str = "workspace-snapshots";
+/// The private root of the local change stores, one per workspace key.
+pub const WORKSPACE_CHANGES_DIR: &str = "workspace-changes";
 const CLEANUP_RETRY_DELAY_MS: i64 = 60_000;
 const PENDING_ARCHIVE_ORPHAN_GRACE: Duration = Duration::from_secs(60 * 60);
-const ARTIFACT_CLEANUP_KINDS: [&str; 4] =
-    ["tool_output", "archive", "snapshot", "workflow_scratch"];
+/// Frees what a deleted or trimmed session holds in the local change stores.
+const CHANGE_RECORDS_CLEANUP: &str = "change_records";
+/// Queued before change records. Prune removes the snapshot directories these
+/// named whole, so a pending one is dropped.
+const LEGACY_SNAPSHOT_CLEANUP: &str = "snapshot";
+const ARTIFACT_CLEANUP_KINDS: [&str; 4] = [
+    "tool_output",
+    "archive",
+    CHANGE_RECORDS_CLEANUP,
+    "workflow_scratch",
+];
+const NO_CHANGE_STORES: &str =
+    "this process cannot reach the change stores; a Caudra session or storage command will";
+/// What a session's file revert relies on, which the transcript tier drops.
+const RECORD_COVERAGE_FIELD: &str = "record_coverage";
+const RECORD_COVERAGE_STORE_PATH: &str = "$.record_coverage.store";
 const STATE_SCOPE_GLOBAL: &str = "global";
 const PERMISSION_RULES_KEY: &str = "permission.rules";
 const PERMISSION_METADATA_KEY: &str = "structured_permission_rules";
@@ -187,7 +203,7 @@ const RELOCATION_PLAN_FIELDS: [&str; 3] = ["plan_path", "plan_target", "plan_wri
 const RELOCATION_WORKSPACE_FIELDS: [&str; 3] = [
     "structured_permission_rules",
     "permission_mode",
-    "snapshots_unavailable",
+    RECORD_COVERAGE_FIELD,
 ];
 
 static EAGER_LOAD_LIMIT: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_EAGER_LOAD_BYTES);
@@ -1075,6 +1091,9 @@ impl SessionRecreation {
 pub struct SessionDatabase {
     connection: Connection,
     state_dir: StateDir,
+    /// What runs the `change_records` jobs and the store sweep. The
+    /// registered stores, except in tests, which supply their own.
+    pub(super) change_stores: Option<Arc<dyn ChangeStores>>,
     _migration_lock: File,
 }
 
@@ -1112,6 +1131,7 @@ pub struct SessionStorageStats {
     pub background_invocation_count: u64,
     pub background_bytes: u64,
     pub tool_output_file_bytes: u64,
+    /// What the local change record stores occupy.
     pub snapshot_bytes: u64,
     pub archive_bytes: u64,
     pub pending_cleanup_jobs: u64,
@@ -1314,6 +1334,7 @@ impl SessionDatabase {
         let mut database = Self {
             connection,
             state_dir: state_dir.clone(),
+            change_stores: registered_change_stores(),
             _migration_lock: migration_lock,
         };
         database.process_cleanup_jobs()?;
@@ -1362,6 +1383,7 @@ impl SessionDatabase {
         Ok(Self {
             connection,
             state_dir: state_dir.clone(),
+            change_stores: registered_change_stores(),
             _migration_lock: migration_lock,
         })
     }
@@ -1412,6 +1434,7 @@ impl SessionDatabase {
         Ok(Self {
             connection,
             state_dir: state_dir.clone(),
+            change_stores: registered_change_stores(),
             _migration_lock: migration_lock,
         })
     }
@@ -1496,6 +1519,7 @@ impl SessionDatabase {
         Ok(Self {
             connection,
             state_dir: state_dir.clone(),
+            change_stores: registered_change_stores(),
             _migration_lock: migration_lock,
         })
     }
@@ -1881,8 +1905,7 @@ impl SessionDatabase {
             )?,
             background_bytes: from_i64(background_bytes, "background bytes")?,
             tool_output_file_bytes: directory_bytes(&state_path.join(TOOL_OUTPUT_DIR)),
-            snapshot_bytes: directory_bytes(&state_path.join(SESSION_SNAPSHOT_DIR))
-                + directory_bytes(&state_path.join(WORKSPACE_SNAPSHOT_DIR)),
+            snapshot_bytes: directory_bytes(&state_path.join(WORKSPACE_CHANGES_DIR)),
             archive_bytes: directory_bytes(
                 &state_path
                     .join(super::SESSIONS_DIR)
@@ -2112,8 +2135,12 @@ impl SessionDatabase {
         let workflow = trim_workflow_runs(&transaction, id)?;
         let removed_rows = from_i64_usize(rows, "trimmed tool output rows")?;
         let removed_bytes = from_i64_usize(bytes, "trimmed tool output bytes")?;
+        let metadata = metadata_without(&root.metadata, [RECORD_COVERAGE_FIELD])?;
         let tool_output_count = root.tool_output_count.checked_sub(removed_rows);
-        let logical_bytes = root.logical_bytes.checked_sub(removed_bytes);
+        let logical_bytes = root
+            .logical_bytes
+            .checked_sub(removed_bytes + root.metadata.len())
+            .map(|bytes| bytes + metadata.len());
         let (Some(tool_output_count), Some(logical_bytes)) = (tool_output_count, logical_bytes)
         else {
             return Err(SessionError::CorruptDatabaseValue {
@@ -2122,7 +2149,7 @@ impl SessionDatabase {
             });
         };
         transaction.execute(
-            "UPDATE sessions SET tool_output_count = ?2, logical_bytes = ?3,\
+            "UPDATE sessions SET tool_output_count = ?2, logical_bytes = ?3, metadata = ?5,\
                  trimmed_at = unixepoch(), write_version = write_version + 1 \
              WHERE id = ?1 AND write_version = ?4",
             params![
@@ -2130,6 +2157,7 @@ impl SessionDatabase {
                 to_i64(tool_output_count, "tool output count")?,
                 to_i64(logical_bytes, "logical_bytes")?,
                 root.write_version,
+                metadata,
             ],
         )?;
         enqueue_cleanup_jobs(&transaction, id)?;
@@ -2151,13 +2179,13 @@ impl SessionDatabase {
         })
     }
 
-    /// Bytes under every external artifact directory of one session.
+    /// Bytes under every external artifact directory of one session. Change
+    /// records are shared between sessions, so none of them count.
     pub fn artifact_bytes(&self, id: CaudraId) -> u64 {
         let state_path = self.state_dir.path();
         let name = id.to_string();
         let directories: u64 = [
             state_path.join(TOOL_OUTPUT_DIR).join(&name),
-            state_path.join(SESSION_SNAPSHOT_DIR).join(&name),
             state_path
                 .join(super::SESSIONS_DIR)
                 .join(super::ARCHIVE_DIR)
@@ -2807,23 +2835,18 @@ impl SessionDatabase {
             if crate::background::protects_session(&transaction, expected.id)? {
                 return Err(SessionError::BackgroundTasksPending { id: expected.id });
             }
-            let mut metadata: Value = deserialize_json(&root.metadata, "session metadata")?;
-            let object =
-                metadata
-                    .as_object_mut()
-                    .ok_or_else(|| SessionError::CorruptDatabaseValue {
-                        field: "session metadata",
-                        reason: "expected an object".into(),
-                    })?;
             let plan_fields: &[&str] = if request.keep_plan {
                 &[]
             } else {
                 &RELOCATION_PLAN_FIELDS
             };
-            for field in RELOCATION_WORKSPACE_FIELDS.iter().chain(plan_fields) {
-                object.remove(*field);
-            }
-            let metadata = serialize_json(&metadata, "session metadata", MAX_METADATA_BYTES)?;
+            let metadata = metadata_without(
+                &root.metadata,
+                RELOCATION_WORKSPACE_FIELDS
+                    .iter()
+                    .chain(plan_fields)
+                    .copied(),
+            )?;
             let changed = transaction.execute(
                 "UPDATE sessions SET cwd = ?1, write_version = write_version + 1, \
                  metadata = ?2, logical_bytes = logical_bytes - length(CAST(metadata AS BLOB)) \
@@ -3075,6 +3098,33 @@ impl SessionDatabase {
         Ok(ids)
     }
 
+    /// Every session with the directory it works in.
+    pub fn session_directories(&self) -> Result<Vec<(CaudraId, String)>, SessionError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, cwd FROM sessions ORDER BY id")?;
+        let mut rows = statement.query([])?;
+        let mut sessions = Vec::new();
+        while let Some(row) = rows.next()? {
+            sessions.push((id_from_row(row, 0)?, row.get(1)?));
+        }
+        Ok(sessions)
+    }
+
+    /// The change stores some session's file revert reads, by store key.
+    pub(super) fn record_coverage_stores(&self) -> Result<HashSet<String>, SessionError> {
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT json_extract(metadata, ?1) FROM sessions \
+             WHERE json_extract(metadata, ?1) IS NOT NULL",
+        )?;
+        let mut rows = statement.query(params![RECORD_COVERAGE_STORE_PATH])?;
+        let mut stores = HashSet::new();
+        while let Some(row) = rows.next()? {
+            stores.insert(row.get(0)?);
+        }
+        Ok(stores)
+    }
+
     pub(crate) fn visit_payload_json(
         &self,
         id: CaudraId,
@@ -3136,6 +3186,10 @@ impl SessionDatabase {
         };
         let mut completed = 0;
         for (id, kind) in jobs {
+            if kind == LEGACY_SNAPSHOT_CLEANUP {
+                self.remove_cleanup_job(id, &kind)?;
+                continue;
+            }
             if !ARTIFACT_CLEANUP_KINDS.contains(&kind.as_str()) {
                 self.record_cleanup_failure(id, &kind, UNKNOWN_CLEANUP_KIND)?;
                 continue;
@@ -3205,7 +3259,10 @@ impl SessionDatabase {
                 &[super::SESSIONS_DIR, super::ARCHIVE_DIR],
                 id,
             ),
-            "snapshot" => remove_state_directory(&self.state_dir, &[SESSION_SNAPSHOT_DIR], id),
+            CHANGE_RECORDS_CLEANUP => match &self.change_stores {
+                Some(stores) => release_everywhere(stores.as_ref(), &self.state_dir, id),
+                None => Err(io::Error::other(NO_CHANGE_STORES)),
+            },
             "workflow_scratch" => remove_scratch_session(&self.state_dir, id),
             _ => unreachable!("cleanup kind validated"),
         };
@@ -3662,7 +3719,8 @@ fn history_record_identity(payload: &Value) -> Option<(CaudraId, u64)> {
     Some((id, history_uuid_timestamp(id)?))
 }
 
-fn history_uuid_timestamp(id: CaudraId) -> Option<u64> {
+/// The UNIX millisecond an id was generated at, when it is a UUIDv7.
+pub(super) fn history_uuid_timestamp(id: CaudraId) -> Option<u64> {
     let bytes = id.as_bytes();
     if bytes[UUID_VERSION_BYTE] >> UUID_VERSION_SHIFT != UUID_V7
         || bytes[UUID_VARIANT_BYTE] >> UUID_VARIANT_SHIFT != UUID_RFC4122_VARIANT
@@ -5287,6 +5345,24 @@ fn validate_json_depth(value: &str) -> Result<(), SessionError> {
     Ok(())
 }
 
+/// Session metadata without `fields`.
+fn metadata_without<'a>(
+    metadata: &str,
+    fields: impl IntoIterator<Item = &'a str>,
+) -> Result<String, SessionError> {
+    let mut value: Value = deserialize_json(metadata, "session metadata")?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| SessionError::CorruptDatabaseValue {
+            field: "session metadata",
+            reason: "expected an object".into(),
+        })?;
+    for field in fields {
+        object.remove(field);
+    }
+    serialize_json(&value, "session metadata", MAX_METADATA_BYTES)
+}
+
 fn deserialize_json<T: DeserializeOwned>(
     value: &str,
     field: &'static str,
@@ -6184,6 +6260,7 @@ mod tests {
     #[cfg(unix)]
     use std::ffi::OsString;
     use std::fs::{self, TryLockError};
+    use std::iter;
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
     use std::sync::Barrier;
@@ -6191,7 +6268,11 @@ mod tests {
     use super::*;
     use crate::background::{JobPayload, ShellJobMetadata, TaskEvent, TaskRecord};
     use crate::permission_state::StructuredPermissionEffect;
-    use crate::sessions::{PermissionMode, Session, StoredSubagentOutcome, TitleSource};
+    use crate::sessions::change_stores::fake::{FakeStore, FakeStores, REFUSED};
+    use crate::sessions::sweep::LEGACY_SNAPSHOT_DIRS;
+    use crate::sessions::{
+        PermissionMode, RecordCoverage, Session, StoredSubagentOutcome, TitleSource,
+    };
     use crate::shell_durations::{
         CommandDigest, DurationOutcome, DurationSource, ShellDurationKey,
     };
@@ -6267,6 +6348,17 @@ mod tests {
     const TRIM_KEEPS_SMALL: &str = "trim must keep rich outputs at or below the threshold";
     const TRIM_DROPS_LARGE: &str = "trim must drop rich outputs above the threshold";
     const ARTIFACTS_REMOVED: &str = "trim must remove every artifact directory";
+    const CHANGE_STORE_KEYS: [&str; 2] = ["workspace-key", "other-workspace-key"];
+    const CHANGE_RECORD_DATA: &[u8] = b"change record";
+    const STATS_COUNT_CHANGE_STORES: &str =
+        "snapshot_bytes must count the change stores and no legacy snapshot directory";
+    const RECORDS_BELONG_TO_NO_SESSION: &str =
+        "change records are shared, so no session's artifacts may count them";
+    const DELETE_QUEUES_RELEASE: &str = "deleting a session must queue the release of its records";
+    const RELEASE_AWAITS_STORES: &str =
+        "a release must stay pending while the process cannot reach the stores";
+    const RELEASED: &str = "the release must drop the session's hold in every store, only";
+    const TRIM_DROPS_COVERAGE: &str = "the transcript tier must not keep record coverage";
     const VERSION_UNCHANGED: &str = "mark_opened must not bump write_version";
     const RELOCATION_DESTINATION: &str = "/destination with spaces";
     const RELOCATION_NESTED: &str = "/project/nested";
@@ -6274,6 +6366,7 @@ mod tests {
     const RELOCATION_PLAN: &str = "/project/plan.md";
     const RELOCATION_FAILURE: &str = "injected relocation failure";
     const RELOCATION_RUN: &str = "relocation-run";
+    const RELOCATION_STORE: &str = "source-workspace-key";
     const LEDGER_PROVIDER: &str = "test/provider";
     const OTHER_LEDGER_PROVIDER: &str = "other/provider";
     const OTHER_LEDGER_MODEL: &str = "other/model";
@@ -6481,7 +6574,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         let removed = removed_session.id;
         let artifact = state_dir
             .path()
-            .join(SESSION_SNAPSHOT_DIR)
+            .join(TOOL_OUTPUT_DIR)
             .join(removed.to_string());
         fs::create_dir_all(&artifact).unwrap();
         fs::write(artifact.join(ARTIFACT_NAME), ARTIFACT_NAME).unwrap();
@@ -8268,6 +8361,10 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         session.meta.plan_path = Some(RELOCATION_PLAN.into());
         session.meta.plan_written = true;
         session.meta.permission_mode = Some(permission_mode);
+        session.meta.record_coverage = Some(RecordCoverage {
+            store: RELOCATION_STORE.into(),
+            since: None,
+        });
         database.save(&session, None).unwrap();
         database
             .connection
@@ -8307,6 +8404,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         assert_eq!(loaded.subagents(), session.subagents());
         assert_eq!(loaded.meta.input_draft, session.meta.input_draft);
         assert!(loaded.meta.permission_mode.is_none());
+        assert!(loaded.meta.record_coverage.is_none());
         assert_eq!(
             after.logical_bytes + before.metadata.len(),
             before.logical_bytes + after.metadata.len()
@@ -8659,7 +8757,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         if sibling {
             database.save(&blocker, None).unwrap();
         }
-        database.connection.execute("UPDATE sessions SET metadata = json_set(metadata, '$.pending_revert', json(?1)) WHERE id = ?2", params![if sibling { r#"{"restore_operation":{}}"# } else { "{}" }, blocker.id.as_bytes().as_slice()]).unwrap();
+        database.connection.execute("UPDATE sessions SET metadata = json_set(metadata, '$.pending_revert', json(?1)) WHERE id = ?2", params![if sibling { r#"{"file_status":{}}"# } else { "{}" }, blocker.id.as_bytes().as_slice()]).unwrap();
         let before = database.local_session_locations().unwrap();
         assert!(
             matches!(database.relocate_sessions(&request), Err(SessionError::RelocationBlocked { id, reason: RELOCATION_PENDING_REVERT }) if id == blocker.id)
@@ -9386,36 +9484,125 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         let mut database = SessionDatabase::open(&state_dir).unwrap();
         let session = TestSession::new(MODEL, CWD);
         database.save(&session, None).unwrap();
-        let paths = [
-            state_dir
-                .path()
-                .join(TOOL_OUTPUT_DIR)
-                .join(session.id.to_string()),
-            state_dir
-                .path()
-                .join(super::super::SESSIONS_DIR)
-                .join(super::super::ARCHIVE_DIR)
-                .join(session.id.to_string()),
-            state_dir
-                .path()
-                .join(SESSION_SNAPSHOT_DIR)
-                .join(session.id.to_string()),
-        ];
-        for path in &paths {
-            fs::create_dir_all(path).unwrap();
-            fs::write(path.join("artifact"), b"data").unwrap();
-        }
+        let paths = seed_artifacts(&state_dir, session.id);
         database.delete(session.id, Some(0)).unwrap();
         drop(database);
 
         let database = SessionDatabase::open(&state_dir).unwrap();
 
         assert!(paths.iter().all(|path| !path.exists()));
-        let jobs: i64 = database
+        let jobs: Vec<String> = database
             .connection
-            .query_row("SELECT count(*) FROM cleanup_jobs", [], |row| row.get(0))
+            .prepare("SELECT kind FROM cleanup_jobs")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
             .unwrap();
-        assert_eq!(jobs, 0);
+        assert_eq!(jobs, [CHANGE_RECORDS_CLEANUP], "{RELEASE_AWAITS_STORES}");
+    }
+
+    #[test]
+    fn a_change_records_job_waits_for_the_stores_then_releases_the_session_everywhere() {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let session = TestSession::new(MODEL, CWD);
+        database.save(&session, None).unwrap();
+        let other = CaudraId::generate().to_string();
+        let stores = held_stores(&[session.id.to_string(), other.clone()]);
+
+        database.delete(session.id, Some(0)).unwrap();
+        assert_eq!(
+            change_records_job(&database, session.id),
+            Some(None),
+            "{DELETE_QUEUES_RELEASE}"
+        );
+        database.process_cleanup_jobs().unwrap();
+        assert_eq!(
+            change_records_job(&database, session.id),
+            Some(Some(NO_CHANGE_STORES.to_owned())),
+            "{RELEASE_AWAITS_STORES}"
+        );
+
+        database.change_stores = Some(stores.clone());
+        retry_cleanup_now(&database);
+        assert_eq!(database.process_cleanup_jobs().unwrap(), 1);
+
+        assert_eq!(change_records_job(&database, session.id), None);
+        for key in CHANGE_STORE_KEYS {
+            assert_eq!(stores.store(key).holders, [other.as_str()], "{RELEASED}");
+        }
+    }
+
+    #[test]
+    fn a_refused_release_stays_pending_until_it_succeeds() {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let session = TestSession::new(MODEL, CWD);
+        database.save(&session, None).unwrap();
+        let stores = held_stores(&[session.id.to_string()]);
+        stores.refusing.store(true, Ordering::SeqCst);
+        database.change_stores = Some(stores.clone());
+        database.delete(session.id, Some(0)).unwrap();
+
+        database.process_cleanup_jobs().unwrap();
+
+        let error = change_records_job(&database, session.id).flatten().unwrap();
+        assert!(error.contains(REFUSED), "{error}");
+        stores.refusing.store(false, Ordering::SeqCst);
+        retry_cleanup_now(&database);
+        assert_eq!(database.process_cleanup_jobs().unwrap(), 1);
+        assert_eq!(change_records_job(&database, session.id), None);
+        for key in CHANGE_STORE_KEYS {
+            assert!(stores.store(key).holders.is_empty(), "{RELEASED}");
+        }
+    }
+
+    #[test]
+    fn a_pending_snapshot_job_is_dropped() {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let session = CaudraId::generate();
+        database
+            .connection
+            .execute(
+                "INSERT INTO cleanup_jobs (session_id, kind, next_attempt_ms) VALUES (?1, ?2, 0)",
+                params![session.as_bytes().as_slice(), LEGACY_SNAPSHOT_CLEANUP],
+            )
+            .unwrap();
+
+        database.process_cleanup_jobs().unwrap();
+
+        assert_eq!(database.stats().unwrap().pending_cleanup_jobs, 0);
+    }
+
+    #[test]
+    fn trimming_to_the_transcript_tier_drops_record_coverage() {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let mut session = session_with_outputs();
+        session.meta.record_coverage = Some(RecordCoverage {
+            store: RELOCATION_STORE.into(),
+            since: None,
+        });
+        database.save(&session, None).unwrap();
+        let before = root_on(&database.connection, session.id).unwrap();
+        let lease = SessionLease::acquire(&state_dir, session.id).unwrap();
+
+        let report = database.trim(&lease).unwrap();
+
+        let loaded: TestSession = database.load(session.id).unwrap();
+        assert!(
+            loaded.meta.record_coverage.is_none(),
+            "{TRIM_DROPS_COVERAGE}"
+        );
+        let after = root_on(&database.connection, session.id).unwrap();
+        assert_eq!(
+            after.logical_bytes
+                + before.metadata.len()
+                + usize::try_from(report.tool_output_row_bytes).unwrap(),
+            before.logical_bytes + after.metadata.len()
+        );
     }
 
     #[test]
@@ -9530,6 +9717,36 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         assert_eq!(stats.schema_version, SCHEMA_VERSION);
         assert_eq!(stats.page_size, PAGE_SIZE as u64);
         database.quick_check().unwrap();
+    }
+
+    #[test]
+    fn change_stores_count_toward_the_state_but_toward_no_session() {
+        let (_temp, state_dir) = state_dir();
+        let database = SessionDatabase::open(&state_dir).unwrap();
+        let id = CaudraId::generate();
+        seed_artifacts(&state_dir, id);
+        let session_bytes = database.artifact_bytes(id);
+        let store = state_dir
+            .path()
+            .join(WORKSPACE_CHANGES_DIR)
+            .join(CHANGE_STORE_KEYS[0]);
+        let legacy =
+            LEGACY_SNAPSHOT_DIRS.map(|name| state_dir.path().join(name).join(id.to_string()));
+        for directory in iter::once(&store).chain(&legacy) {
+            fs::create_dir_all(directory).unwrap();
+            fs::write(directory.join(ARTIFACT_NAME), CHANGE_RECORD_DATA).unwrap();
+        }
+
+        assert_eq!(
+            database.stats().unwrap().snapshot_bytes,
+            CHANGE_RECORD_DATA.len() as u64,
+            "{STATS_COUNT_CHANGE_STORES}"
+        );
+        assert_eq!(
+            database.artifact_bytes(id),
+            session_bytes,
+            "{RECORDS_BELONG_TO_NO_SESSION}"
+        );
     }
 
     const LCG_MULTIPLIER: u64 = 6364136223846793005;
@@ -9990,7 +10207,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         assert_eq!(database_file_snapshot(&state_dir), before);
     }
 
-    fn artifact_paths(state_dir: &StateDir, id: CaudraId) -> [PathBuf; 4] {
+    fn artifact_paths(state_dir: &StateDir, id: CaudraId) -> [PathBuf; 3] {
         let name = id.to_string();
         [
             state_dir.path().join(TOOL_OUTPUT_DIR).join(&name),
@@ -9999,18 +10216,48 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
                 .join(super::super::SESSIONS_DIR)
                 .join(super::super::ARCHIVE_DIR)
                 .join(&name),
-            state_dir.path().join(SESSION_SNAPSHOT_DIR).join(&name),
             state_dir.path().join(WORKFLOW_SCRATCH_DIR).join(&name),
         ]
     }
 
-    fn seed_artifacts(state_dir: &StateDir, id: CaudraId) -> [PathBuf; 4] {
+    fn seed_artifacts(state_dir: &StateDir, id: CaudraId) -> [PathBuf; 3] {
         let paths = artifact_paths(state_dir, id);
         for path in &paths {
             fs::create_dir_all(path).unwrap();
             fs::write(path.join(ARTIFACT_NAME), b"data").unwrap();
         }
         paths
+    }
+
+    /// Every store in [`CHANGE_STORE_KEYS`], each held by `holders`.
+    fn held_stores(holders: &[String]) -> Arc<FakeStores> {
+        Arc::new(FakeStores::with(CHANGE_STORE_KEYS.map(|key| {
+            let store = FakeStore {
+                holders: holders.to_vec(),
+                ..FakeStore::default()
+            };
+            (key, store)
+        })))
+    }
+
+    /// The `change_records` job of `id` and its last error, if it is queued.
+    fn change_records_job(database: &SessionDatabase, id: CaudraId) -> Option<Option<String>> {
+        database
+            .connection
+            .query_row(
+                "SELECT last_error FROM cleanup_jobs WHERE session_id = ?1 AND kind = ?2",
+                params![id.as_bytes().as_slice(), CHANGE_RECORDS_CLEANUP],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    fn retry_cleanup_now(database: &SessionDatabase) {
+        database
+            .connection
+            .execute("UPDATE cleanup_jobs SET next_attempt_ms = 0", [])
+            .unwrap();
     }
 
     fn session_with_outputs() -> TestSession {
@@ -11375,6 +11622,8 @@ CREATE TABLE subagents (
         let session = session_with_outputs();
         let cursor = database.save(&session, None).unwrap();
         let paths = seed_artifacts(&state_dir, session.id);
+        let stores = held_stores(&[session.id.to_string()]);
+        database.change_stores = Some(stores.clone());
         let lease = SessionLease::acquire(&state_dir, session.id).unwrap();
 
         let report = database.trim(&lease).unwrap();
@@ -11386,6 +11635,9 @@ CREATE TABLE subagents (
             paths.iter().all(|path| !path.exists()),
             "{ARTIFACTS_REMOVED}"
         );
+        for key in CHANGE_STORE_KEYS {
+            assert!(stores.store(key).holders.is_empty(), "{RELEASED}");
+        }
         let loaded = database
             .load::<TestMessage, Value, Value>(session.id)
             .unwrap();
@@ -11477,6 +11729,7 @@ CREATE TABLE subagents (
         let mut database = SessionDatabase::open(&state_dir).unwrap();
         let session = session_with_outputs();
         database.save(&session, None).unwrap();
+        database.change_stores = Some(held_stores(&[session.id.to_string()]));
         let lease = SessionLease::acquire(&state_dir, session.id).unwrap();
         let transaction = database
             .connection
@@ -11545,10 +11798,7 @@ CREATE TABLE subagents (
         reverting.meta.pending_revert = Some(super::super::PendingConversationRevert {
             original_head: None,
             target_head: None,
-            original_workspace_head: None,
-            workspace_head: None,
             file_status: None,
-            restore_operation: None,
         });
         database.save(&reverting, None).unwrap();
         database

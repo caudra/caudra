@@ -501,6 +501,7 @@ mod tests {
             id: CaudraId::generate(),
             parent_id: None,
             supersedes: None,
+            stands_for: None,
             group_id: CaudraId::generate(),
             kind,
         }

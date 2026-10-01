@@ -32,6 +32,7 @@ use serde_json::Value;
 use tracing::info;
 
 use crate::agent::LoadedInstructions;
+use crate::agent::change_recording::ChangeRecorder;
 use crate::agent::run::AgentParams;
 use crate::agent::subagent::{self, STRUCTURED_OUTPUT_TOOL, Subagent, TaskIdentity};
 use crate::background::JobScope;
@@ -52,7 +53,6 @@ use crate::tools::{
 };
 use crate::types::WorkflowProvenance;
 use crate::workflow::WorkspaceRebind;
-use crate::workspace_baseline::BaselineGate;
 use crate::{AgentConfig, AgentMode, EventSender};
 
 const STRUCTURED_OUTPUT_DESCRIPTION: &str =
@@ -588,9 +588,7 @@ pub struct WorkflowHostContext {
     pub model: ModelResolver,
     pub permissions: Arc<PermissionManager>,
     pub path_locks: Arc<PathLocks>,
-    /// The session's revert point, so an agent a workflow launches captures it
-    /// before its first write just like one the user's run launched.
-    pub baseline: Option<BaselineGate>,
+    pub changes: Option<ChangeRecorder>,
     pub subagent_history: SubagentHistoryStore,
     pub registry: Arc<ToolRegistry>,
     pub config: AgentConfig,
@@ -647,7 +645,7 @@ impl WorkflowHostContext {
                 .clone()
                 .or_else(|| params.background.as_ref().map(|tasks| tasks.main_scope())),
             path_locks: Arc::clone(&params.path_locks),
-            baseline: params.baseline.clone(),
+            changes: params.changes.clone(),
             subagent_history: params.subagent_history.clone(),
             registry: Arc::clone(&params.registry),
             config: params.config.clone(),
@@ -687,7 +685,7 @@ impl WorkflowHostContext {
             permissions: Arc::clone(&ctx.permissions),
             jobs: ctx.job_scope(),
             path_locks: Arc::clone(&ctx.path_locks),
-            baseline: ctx.baseline.clone(),
+            changes: ctx.changes.clone(),
             subagent_history: ctx.subagent_history.clone(),
             registry: Arc::clone(&ctx.registry),
             config: ctx.config.clone(),
@@ -776,7 +774,7 @@ impl WorkflowHostContext {
             timeouts: self.timeouts,
             file_tracker: FileReadTracker::fresh(),
             path_locks: Arc::clone(&self.path_locks),
-            baseline: self.baseline.clone(),
+            changes: self.changes.clone(),
             prompt_slots: Arc::clone(&self.prompt_slots),
             prompt_profiles: Arc::clone(&self.prompt_profiles),
             default_task_prompt_profile_name: Arc::clone(&self.default_task_prompt_profile_name),

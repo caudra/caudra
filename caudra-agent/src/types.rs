@@ -11,6 +11,7 @@ use caudra_providers::{
 };
 use caudra_storage::background::{JobKind, JobOwner, ShellJobMetadata};
 use caudra_storage::id::CaudraId;
+use caudra_storage::sessions::UnrecordedCall;
 use caudra_storage::tool_ledger::ToolOutcome;
 use caudra_storage::tool_outputs::ToolOutputRef;
 use caudra_storage::usage_ledger::LedgerPurpose;
@@ -2109,6 +2110,13 @@ pub enum AgentEvent {
     /// cache prefix is invalidated and the next request re-reads the history.
     ToolsLoaded {
         names: Vec<String>,
+    },
+    /// A call ran without a change record, so a file revert cannot undo it.
+    /// `notice` marks the first gap of a session's recorder, the one worth
+    /// telling the user about.
+    Unrecorded {
+        gap: UnrecordedCall,
+        notice: bool,
     },
     /// A subagent's progress moved. Only ever stamped with [`SubagentInfo`],
     /// so the parent knows which task header to update.

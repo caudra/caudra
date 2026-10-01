@@ -89,7 +89,7 @@ pub struct Cli {
     #[arg(
         long,
         global = true,
-        help = "Disable automatic workspace snapshots and file revert for this run (local and remote)"
+        help = "Turn off file change recording and file revert for this run, locally and remotely"
     )]
     pub no_snapshots: bool,
 
@@ -755,14 +755,14 @@ pub enum StorageAction {
         #[arg(long)]
         json: bool,
     },
-    /// Show per-workspace working-tree snapshot stores, largest first
+    /// Show per-workspace file change record stores, largest first
     Snapshots {
         /// Emit JSON
         #[arg(long)]
         json: bool,
-        /// Also list, per session, the start and checkpoint snapshots it names
+        /// Also list each holding session with its record count
         #[arg(long)]
-        checkpoints: bool,
+        records: bool,
     },
     /// Check database and foreign-key integrity
     Check,
@@ -789,10 +789,11 @@ pub enum StorageAction {
     /// Demote sessions outside a keep policy, or the given session IDs, to the
     /// transcript tier
     ///
-    /// Trimming removes workspace snapshots, retained tool output files, rewind
-    /// archives, and large rich tool output records. The conversation stays
-    /// and the session can still be resumed. Without any --keep-* flag the
-    /// configured storage.retention.trim policy applies.
+    /// Trimming releases the session's local file change records and removes
+    /// retained tool output files, rewind archives, and large rich tool output
+    /// records. The conversation stays and the session can still be resumed.
+    /// Without any --keep-* flag the configured storage.retention.trim policy
+    /// applies.
     Trim {
         /// Session IDs to trim regardless of policy
         #[arg(value_name = "ID", conflicts_with_all = ["directory", "group_by"])]
@@ -1215,6 +1216,7 @@ mod tests {
     const CONFIG_EXAMPLE_NOT_PARSED: &str = "expected the config example subcommand";
     const MODELS_NOT_PARSED: &str = "expected the models subcommand";
     const TRIM_NOT_PARSED: &str = "expected the storage trim subcommand";
+    const SNAPSHOTS_NOT_PARSED: &str = "expected the storage snapshots subcommand";
     const MODEL_SPEC: &str = "openai/gpt-5";
     const PERMISSIONS_NOT_PARSED: &str = "expected permission rebind subcommand";
     const PERMISSION_DATABASE: &str = "/explicit-copy/caudra.sqlite";
@@ -1581,9 +1583,9 @@ mod tests {
         );
     }
 
-    /// Naming a session is how a snapshot store gets reclaimed by hand, so the
-    /// IDs must reach `trim` and must not be silently mixed with a scope that
-    /// selects a different set of sessions.
+    /// Naming a session is how its change records get released by hand, so
+    /// the IDs must reach `trim` and must not be silently mixed with a scope
+    /// that selects a different set of sessions.
     #[test]
     fn trim_accepts_session_ids_and_rejects_a_conflicting_scope() {
         const SESSION_ID: &str = "CessP4gmzDyKuw7PHSTkd";
@@ -1607,6 +1609,24 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test_case(&[], false; "stores_only")]
+    #[test_case(&["--records"], true; "with_holders")]
+    fn storage_snapshots_lists_holders_only_when_asked(args: &[&str], expected: bool) {
+        let cli = Cli::try_parse_from(
+            ["caudra", "storage", "snapshots"]
+                .into_iter()
+                .chain(args.iter().copied()),
+        )
+        .unwrap();
+        let Some(Command::Storage {
+            action: StorageAction::Snapshots { records, .. },
+        }) = cli.command
+        else {
+            panic!("{SNAPSHOTS_NOT_PARSED}");
+        };
+        assert_eq!(records, expected);
     }
 
     #[test]

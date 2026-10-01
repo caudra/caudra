@@ -14,9 +14,14 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
 use std::io::{self, Write};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use caudra_workspace::{ProjectKey, SessionWorkspaceBinding};
+use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
 use crate::checkout::{self, Checkout};
@@ -172,6 +177,33 @@ pub fn project_id(root: &Path) -> String {
 
 fn named_id(name: &str, root: &Path) -> String {
     format!("{name}-{}", fnv1a_64(&root.to_string_lossy()))
+}
+
+/// Names the store of change records kept for the directory `cwd` resolves
+/// to: the SHA-256 of its canonical path, in lowercase hex. The store is found
+/// by this name alone, so the digest is as pinned as [`fnv1a_64`].
+pub fn workspace_key(cwd: &Path) -> io::Result<String> {
+    let root = fs::canonicalize(cwd)?;
+    if !root.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            root.display().to_string(),
+        ));
+    }
+    let mut hasher = Sha256::new();
+    #[cfg(unix)]
+    hasher.update(root.as_os_str().as_bytes());
+    #[cfg(windows)]
+    for unit in root.as_os_str().encode_wide() {
+        hasher.update(unit.to_le_bytes());
+    }
+    #[cfg(not(any(unix, windows)))]
+    hasher.update(root.to_string_lossy().as_bytes());
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 /// The same readable prefix, then a phrase in place of the hash.
@@ -615,6 +647,45 @@ mod tests {
     #[test]
     fn a_rootless_path_still_produces_an_id() {
         assert!(project_id(Path::new("/")).starts_with("root-"));
+    }
+
+    /// Pinned, not computed: the name of an existing store of change records.
+    #[cfg(unix)]
+    #[test]
+    fn a_workspace_key_is_the_digest_of_the_canonical_root() {
+        const ROOT_DIGEST: &str =
+            "8a5edab282632443219e051e4ade2d1d5bbc671c781051bf1437897cbdfea0f1";
+        assert_eq!(workspace_key(Path::new("/")).unwrap(), ROOT_DIGEST);
+    }
+
+    #[test]
+    fn workspace_keys_are_canonical_and_distinguish_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        let other = temp.path().join("other");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+
+        assert_eq!(
+            workspace_key(&root).unwrap(),
+            workspace_key(&root.join(".")).unwrap()
+        );
+        assert_ne!(
+            workspace_key(&root).unwrap(),
+            workspace_key(&other).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_file_has_no_workspace_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join(NEW_NOTE);
+        std::fs::write(&file, NEW_CONTENT).unwrap();
+
+        assert_eq!(
+            workspace_key(&file).unwrap_err().kind(),
+            io::ErrorKind::NotADirectory
+        );
     }
 
     #[test]

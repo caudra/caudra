@@ -71,8 +71,8 @@ Labels are partial evidence, not a complete evaluation dataset. Tool-search actu
 |------|-------------|
 | `-p`, `--print` | Non-interactive run. See [Headless Mode](/docs/headless/) |
 | `--prompt <TEXT>` | First message of the session. Piped stdin is appended after it when both are present. Distinct from `-p`, which selects non-interactive output |
-| `--ephemeral` | Store the session, outputs, snapshots, input history, and stash in a temporary root removed at exit. Credentials, trust, and preferences remain persistent |
-| `--no-snapshots` | Disable automatic local and remote workspace snapshots and file revert for this process, including startup and exit captures. Also applies to ACP. Existing snapshots and restore recovery remain available. See [Disabling snapshots](/docs/sessions/#disable-automatic-snapshots) |
+| `--ephemeral` | Store the session, outputs, file change records, input history, and stash in a temporary root removed at exit. Credentials, trust, and preferences remain persistent |
+| `--no-snapshots` | Turn off file change recording and file revert for this process, locally and remotely. Also applies to ACP. Records already made stay stored, and an existing file revert can still be unreverted. See [Disable change recording](/docs/sessions/#disable-change-recording) |
 | `--image <PATH>` | Attach an image in `--print` mode (repeatable). Paths must be png, jpeg, gif, or webp |
 | `-m`, `--model <SPEC>` | Model as `provider/model-id`. Fallback: last used → `provider.default_model` in config → auto-detect from available providers |
 | `--verbose` | Full turn-by-turn messages in `--print` output |
@@ -487,7 +487,7 @@ caudra storage path                       # session database path
 caudra storage stats [--json]             # rows, bytes, artifacts, pending cleanup
 caudra storage check                      # integrity check
 caudra storage sessions [--directory DIR] # list sessions with activity, size, state
-caudra storage snapshots [--json] [--checkpoints]  # workspace snapshot stores, largest first
+caudra storage snapshots [--json] [--records]  # change record stores, largest first
 caudra storage trim   [POLICY | ID...] [--dry-run]
 caudra storage forget [POLICY | ID...] [--dry-run] [--prune]
 caudra storage prune  [--dry-run]
@@ -499,11 +499,11 @@ caudra storage usage  [--group-by GROUP] [--since DURATION] [--json]
 caudra storage usage  --prune-older-than DURATION
 ```
 
-`snapshots` lists the workspace snapshot stores largest first, one row per workspace with its size, object count, and the sessions and snapshots that use it, so a store that has grown out of proportion to its repository is visible. `--checkpoints` also lists each session with its `start` snapshot and checkpoint ids. A store whose workspace marker is gone is reported as orphaned rather than skipped. Snapshots stop at a nested repository the way git does, so a checkout inside your worktree is not captured with it.
+`snapshots` lists the [file change record](/docs/sessions/#file-revert) stores largest first, one row per workspace directory with its size, object count, records, holding sessions, open records, and pending reverts. A store whose directory is gone, or that no session works in any more, shows its key instead, and `--json` always gives both. `--records` also lists each holding session with its record count. A store that no existing session holds is reported as orphaned rather than skipped.
 
-`trim` demotes sessions to the transcript tier and `forget` deletes them. Both take a keep policy in `restic forget` terms and fall back to the configured `storage.retention` policy when no `--keep-*` flag is given. `prune` reclaims space that no session references, including workspace snapshot stores that no session uses any more and stores left in the format from before snapshots were git objects. After `trim`, `forget`, or `prune`, the snapshot objects that no remaining session names are deleted, and `--json` reports the bytes freed as `snapshot_garbage_bytes`. See [Sessions](/docs/sessions/#retention) for the policy rules and what each tier keeps.
+`trim` demotes sessions to the transcript tier and `forget` deletes them. Both take a keep policy in `restic forget` terms and fall back to the configured `storage.retention` policy when no `--keep-*` flag is given. Both release the local change records of the sessions they trim or delete, and records that no other session holds are deleted. `prune` reclaims space that no session references. It releases the change records of deleted sessions older than seven days, trims each change store to its size budget, removes stores left empty and unused for seven days once no session's file revert reads them, and deletes the `session-snapshots/` and `workspace-snapshots/` directories of earlier versions. Its `--json` output reports the bytes it reclaimed from the change stores as `record_bytes_reclaimed`. In the `--json` output of `trim` and `forget`, `snapshot_garbage_bytes` reports the bytes that a prune would then reclaim from the change stores. See [Sessions](/docs/sessions/#retention) for the policy rules and what each tier keeps.
 
-Both also take session IDs instead of a policy. `caudra storage trim <ID>` is how one session's workspace snapshots are reclaimed by hand while its conversation stays resumable, which is what `/storage` points you at when a store has grown out of proportion. Snapshot objects that another session in the same workspace still uses stay in the shared store. IDs and `--keep-*` rules cannot be combined, pinned sessions are still refused, and a session open in another process is skipped rather than raced.
+Both also take session IDs instead of a policy. `caudra storage trim <ID>` releases one session's local change records by hand while its conversation stays resumable. Records that another session, such as a fork, still holds stay in the store. IDs and `--keep-*` rules cannot be combined, pinned sessions are still refused, and a session open in another process is skipped rather than raced.
 
 | Flag | Description |
 |------|-------------|
@@ -518,7 +518,7 @@ Both also take session IDs instead of a policy. `caudra storage trim <ID>` is ho
 | `--prune` | `forget` only: run `prune` when at least one session was forgotten |
 | `--unsafe-allow-remove-all` | Allow an empty policy, which keeps nothing. Requires `--directory` |
 
-A session is kept when any rule matches. Pinned sessions, sessions open in any Caudra process, and sessions with a pending revert are never trimmed or forgotten by policy. `forget <ID>` refuses pinned sessions.
+A session is kept when any rule matches. Pinned sessions, sessions open in any Caudra process, and sessions with a pending revert are never trimmed or forgotten by policy. `forget <ID>` refuses pinned sessions. Trimming or forgetting a local session with a pending file revert by ID ends that revert, and the files stay as reverted.
 
 `usage` reports spend from a ledger that outlives the sessions that produced it, so trimming and forgetting leave the numbers intact. Group by `model` (default), `provider`, `project`, `purpose`, `day`, `month`, or `total`, narrow with `--since 30d`, and trim the ledger itself with `--prune-older-than`, which takes no other flag. [Token Economy](/docs/token-economy/#lifetime-spend) explains what the columns mean.
 

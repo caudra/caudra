@@ -896,6 +896,7 @@ mod tests {
             id,
             parent_id: None,
             supersedes: None,
+            stands_for: None,
             group_id: id,
             kind: HistoryItemKind::ToolCall {
                 call_id: call_id.into(),
@@ -1033,6 +1034,7 @@ mod tests {
             id: caudra_storage::id::CaudraId::generate(),
             parent_id: None,
             supersedes: None,
+            stands_for: None,
             group_id: caudra_storage::id::CaudraId::generate(),
             kind: HistoryItemKind::ToolCall {
                 call_id: call_id.into(),
@@ -1059,6 +1061,7 @@ mod tests {
             id: caudra_storage::id::CaudraId::generate(),
             parent_id: None,
             supersedes: None,
+            stands_for: None,
             group_id: caudra_storage::id::CaudraId::generate(),
             kind: HistoryItemKind::ToolCall {
                 call_id: "batch-call".into(),

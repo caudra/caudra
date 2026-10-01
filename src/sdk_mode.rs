@@ -1057,22 +1057,16 @@ pub fn run(params: SdkParams) -> Result<()> {
                         && let Some(command) = headless::direct_shell_command(&prompt)
                     {
                         let started = Instant::now();
-                        let output = match (
-                            handle.remote_workspace_session(),
-                            handle.remote_workspace_baseline(),
-                        ) {
-                            (Some(workspace), Some(baseline)) => {
-                                smol::block_on(headless::execute_remote_command(
-                                    &workspace,
-                                    &baseline,
-                                    command,
-                                    &caudra_agent::CancelToken::none(),
-                                    max_output_lines,
-                                    max_output_bytes,
-                                    |_| {},
-                                ))
-                            }
-                            _ => headless::RemoteCommandOutput {
+                        let output = match handle.remote_workspace_session() {
+                            Some(workspace) => smol::block_on(headless::execute_remote_command(
+                                &workspace,
+                                command,
+                                &caudra_agent::CancelToken::none(),
+                                max_output_lines,
+                                max_output_bytes,
+                                |_| {},
+                            )),
+                            None => headless::RemoteCommandOutput {
                                 output: "Remote command execution is unavailable".into(),
                                 is_error: true,
                             },
@@ -2459,6 +2453,7 @@ impl EventPump {
             | AgentEvent::Nudge { .. }
             | AgentEvent::Injected { .. }
             | AgentEvent::ToolsLoaded { .. }
+            | AgentEvent::Unrecorded { .. }
             | AgentEvent::PromptProgress { .. } => {}
             AgentEvent::TaskAdmitted(task) => {
                 self.writer.emit_system(

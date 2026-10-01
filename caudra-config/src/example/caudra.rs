@@ -28,6 +28,8 @@ const STEERING_ABOUT: &str = "Automatic steering repairs unusable model output a
      bounded guidance about repeated behavior. Each rule has its own table below.";
 const RETENTION_ABOUT: &str = "`trim` and `forget` take keep policies in `restic forget` terms, \
      such as `{ keep_last = 50, keep_within = \"90d\" }`. A session is kept when any rule matches.";
+const SNAPSHOTS_ABOUT: &str = "Each tool call that changes files leaves a change record, which \
+     file revert undoes. A record over a limit is refused and its call runs unrecorded.";
 const TELEMETRY_ABOUT: &str = "Each setting that names an environment variable gives way to it.";
 const DECISIONS_ABOUT: &str = "The typed decision engine. It needs `decision_engine = true` under \
      [experimental]. Connection settings and thresholds are global-only.";
@@ -103,7 +105,8 @@ fn tables() -> Vec<Table> {
         Table::of(
             Header::Fixed("storage.snapshots".into()),
             SnapshotsConfig::FIELDS,
-        ),
+        )
+        .about(SNAPSHOTS_ABOUT),
         Table::of(Header::Fixed("telemetry".into()), TelemetryConfig::FIELDS)
             .about(TELEMETRY_ABOUT),
         Table::of(Header::Fixed("worktrees".into()), WorktreesConfig::FIELDS),

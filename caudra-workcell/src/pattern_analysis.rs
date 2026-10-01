@@ -14,9 +14,12 @@ use workcell::shell::{
     ShellCommandScope, ShellWord,
     bash::{
         BashCommand, BashCommandContext, BashCommandContexts, BashCoverageKind, BashCwdSet,
-        BashDiagnosticKind, BashParseError, BashProgram, BashRedirectKind, parse_bash,
+        BashDiagnosticKind, BashParseError, BashProgram, BashRedirect, BashRedirectKind,
+        parse_bash,
     },
 };
+
+use crate::read_only_shell::decimal;
 
 pub use caudra_agent::permissions::COMMAND_OBSERVATION_ATTRIBUTE;
 pub use workcell::shell::bash::{
@@ -299,7 +302,7 @@ pub fn analyze_pattern_calls(
         omission_counts: BTreeMap::new(),
         omissions: Vec::new(),
         omissions_truncated: 0,
-        obligations: source_obligations(&program, &contexts, facts.opaque),
+        obligations: source_obligations(&program, &contexts, facts.opaque()),
     };
     let mut observations = Vec::new();
     for span in spans {
@@ -316,13 +319,13 @@ pub fn analyze_pattern_calls(
                 )
             });
         match result {
-            Ok(observation) if !facts.opaque => observations.push(observation),
+            Ok(observation) if !facts.opaque() => observations.push(observation),
             Ok(_) => diagnostics.omit(span, PatternOmissionReason::ExactSourceRequired),
             Err(reason) => diagnostics.omit(span, reason),
         }
     }
     diagnostics.observed_command_count = observations.len();
-    let requires_exact_source = facts.opaque;
+    let requires_exact_source = facts.opaque();
     Ok(PatternCallAnalysis {
         observations,
         contexts,
@@ -399,7 +402,30 @@ pub(crate) struct CommandFacts<'a> {
 
 pub(crate) struct ShellFacts<'a> {
     pub commands: Vec<CommandFacts<'a>>,
-    pub opaque: bool,
+    /// Part of the line is beyond the analysis: syntax it does not model, a
+    /// command it cannot scope or place, a wrapper, or a word, assignment or
+    /// redirect it cannot read.
+    pub unaccounted: bool,
+    /// A redirect opens a file, which no command scope shows.
+    pub redirects_to_files: bool,
+}
+
+impl ShellFacts<'_> {
+    /// Whether the reviewed commands describe less than the line does.
+    pub fn opaque(&self) -> bool {
+        self.unaccounted || self.redirects_to_files
+    }
+}
+
+/// What a redirect reaches beyond the descriptors the command already holds.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RedirectEffect<'a> {
+    /// Duplicates or closes a descriptor, or opens the null device.
+    Inert,
+    Reads(&'a str),
+    Writes(&'a str),
+    /// A descriptor or target the source does not spell out.
+    Unknown,
 }
 
 pub(crate) fn shell_facts<'a>(
@@ -412,18 +438,27 @@ pub(crate) fn shell_facts<'a>(
         .map(|context| (context.command.0, context))
         .collect();
     let mut commands = Vec::new();
-    let mut opaque = !program.is_complete() || !contexts.complete;
+    let mut unaccounted = !program.is_complete() || !contexts.complete;
+    let mut redirects_to_files = false;
     for (id, command) in program.commands() {
         let Some(scope) = command_scope(program, command) else {
-            opaque = true;
+            unaccounted = true;
             continue;
         };
         let context = contexts_by_node.get(&id.0).copied();
-        opaque |= context.is_none_or(|context| {
+        unaccounted |= context.is_none_or(|context| {
             !context.complete
                 || !matches!(&context.incoming, BashCwdSet::Known(paths) if !paths.is_empty())
-        }) || !reviewable_effects(program, command)
+        }) || command.static_argv().is_none()
+            || !command.assignments.is_empty()
             || OPAQUE_WRAPPERS.contains(&scope.executable.as_str());
+        for redirect in &command.redirects {
+            match redirect_effect(program, redirect) {
+                RedirectEffect::Inert => {}
+                RedirectEffect::Reads(_) | RedirectEffect::Writes(_) => redirects_to_files = true,
+                RedirectEffect::Unknown => unaccounted = true,
+            }
+        }
         commands.push(CommandFacts {
             span: &program.nodes()[id.0].span,
             command,
@@ -432,8 +467,12 @@ pub(crate) fn shell_facts<'a>(
         });
     }
     commands.sort_by_key(|command| command.span.start);
-    opaque |= commands.is_empty() || commands.len() != contexts_by_node.len();
-    ShellFacts { commands, opaque }
+    unaccounted |= commands.is_empty() || commands.len() != contexts_by_node.len();
+    ShellFacts {
+        commands,
+        unaccounted,
+        redirects_to_files,
+    }
 }
 
 fn command_scope(program: &BashProgram, command: &BashCommand) -> Option<ShellCommandScope> {
@@ -473,41 +512,43 @@ fn command_scope(program: &BashProgram, command: &BashCommand) -> Option<ShellCo
     })
 }
 
-fn reviewable_effects(program: &BashProgram, command: &BashCommand) -> bool {
-    command.static_argv().is_some()
-        && command.assignments.is_empty()
-        && command.redirects.iter().all(|redirect| {
-            if redirect.descriptor.as_ref().is_some_and(|span| {
-                program.text(span).is_none_or(|text| {
-                    text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit())
-                })
-            }) {
-                return false;
+pub(crate) fn redirect_effect<'a>(
+    program: &BashProgram,
+    redirect: &'a BashRedirect,
+) -> RedirectEffect<'a> {
+    let numbered = redirect
+        .descriptor
+        .as_ref()
+        .is_none_or(|span| program.text(span).is_some_and(decimal));
+    if !numbered {
+        return RedirectEffect::Unknown;
+    }
+    let Some(target) = &redirect.target else {
+        return match redirect.kind {
+            BashRedirectKind::CloseInput | BashRedirectKind::CloseOutput => RedirectEffect::Inert,
+            _ => RedirectEffect::Unknown,
+        };
+    };
+    let Some(target) = target.literal.as_deref() else {
+        return RedirectEffect::Unknown;
+    };
+    match redirect.kind {
+        BashRedirectKind::CloseInput | BashRedirectKind::CloseOutput => RedirectEffect::Unknown,
+        BashRedirectKind::DuplicateInput | BashRedirectKind::DuplicateOutput => {
+            if target == "-" || decimal(target.strip_suffix('-').unwrap_or(target)) {
+                RedirectEffect::Inert
+            } else {
+                RedirectEffect::Unknown
             }
-            let target = redirect
-                .target
-                .as_ref()
-                .and_then(|word| word.literal.as_deref());
-            match redirect.kind {
-                BashRedirectKind::DuplicateInput | BashRedirectKind::DuplicateOutput => target
-                    .is_some_and(|target| {
-                        if target == "-" {
-                            return true;
-                        }
-                        let target = target.strip_suffix('-').unwrap_or(target);
-                        !target.is_empty() && target.bytes().all(|byte| byte.is_ascii_digit())
-                    }),
-                BashRedirectKind::CloseInput | BashRedirectKind::CloseOutput => {
-                    redirect.target.is_none()
-                }
-                BashRedirectKind::Read
-                | BashRedirectKind::Write
-                | BashRedirectKind::Append
-                | BashRedirectKind::WriteBoth
-                | BashRedirectKind::AppendBoth
-                | BashRedirectKind::Clobber => target == Some(NULL_DEVICE),
-            }
-        })
+        }
+        _ if target == NULL_DEVICE => RedirectEffect::Inert,
+        BashRedirectKind::Read => RedirectEffect::Reads(target),
+        BashRedirectKind::Write
+        | BashRedirectKind::Append
+        | BashRedirectKind::WriteBoth
+        | BashRedirectKind::AppendBoth
+        | BashRedirectKind::Clobber => RedirectEffect::Writes(target),
+    }
 }
 
 pub(crate) fn singleton_workdir<'a>(facts: &CommandFacts<'a>) -> Option<&'a Path> {
@@ -877,7 +918,7 @@ mod tests {
         let native_count = facts
             .commands
             .iter()
-            .filter(|_| !facts.opaque)
+            .filter(|_| !facts.opaque())
             .filter_map(|command| {
                 command_observation(&program, command, root, root, ObservationProvenance::Native)
             })

@@ -31,7 +31,7 @@ Maki provided the native Rust TUI, Lua plugin system, provider integrations, MCP
 
 ## Branchable and reversible sessions
 
-**What changed:** [Sessions](/docs/sessions/) use parent-linked history, so a fork or revert keeps the abandoned path available. Revert can restore the conversation, workspace files, or both. Session leases reject a second active writer for the same session ID.
+**What changed:** [Sessions](/docs/sessions/) use parent-linked history, so a fork or revert keeps the abandoned path available. Revert can restore the conversation, the files the session changed, or both. Session leases reject a second active writer for the same session ID.
 
 **Why:** Experiments need a safe return path. Parent-linked history preserves alternatives, crash-safe file restoration protects the workspace, and single ownership prevents two runtimes from silently overwriting one session.
 

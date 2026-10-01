@@ -17,7 +17,7 @@ Managed sandboxes are experimental and off by default. Turn them on with `sandbo
 
 Caudra pins its Workcell dependency in `Cargo.toml`. Reviewed transfers require compatible remote contracts, and empty-directory publication requires its additional negotiated capability. Matching version labels alone do not establish compatibility. There is no raw-transfer fallback.
 
-Use compatible Caudra, e2b-libvirt and in-guest Workcell builds. Image manifests require `protocolVersion = "2026-07-28"`, `transferProtocol = "workcell-reviewed-v1"`, `remoteWorkspace = true` and `reviewedTransfer = true`. Caudra also validates workspace identity and the [required live capabilities](/docs/remote-workspaces/#prepare-the-server), including durable snapshots, reviewed publication and the complete operation lifecycle, before attachment. Doctor reads provider metadata but does not boot-test an image.
+Use compatible Caudra, e2b-libvirt and in-guest Workcell builds. Image manifests require `protocolVersion = "2026-07-28"`, `transferProtocol = "workcell-reviewed-v1"`, `remoteWorkspace = true` and `reviewedTransfer = true`. Caudra also validates workspace identity and the [required live capabilities](/docs/remote-workspaces/#prepare-the-server), including file change records, reviewed publication and the complete operation lifecycle, before attachment. Doctor reads provider metadata but does not boot-test an image.
 
 Current persisted shapes are sandbox configuration and instance-store version `1`, remote workspace binding version `2`, remote operation journal version `5`, and transfer journal/archive version `3`. File-only version `2` transfer records remain readable and are upgraded on a journal write. Existing version `2` archive pages remain readable. Other incompatible journal versions are refused. Lifecycle intents require explicit postcondition fields for their action: the requested policy and revision, or the requested lease with a minimum deadline when that lease is finite. Directory recovery metadata is required. Incompatible configuration, remote bindings and incomplete intents fail without rewriting their state. Inspect unresolved effects with the originating build before adopting a current workspace. Existing local embedded sessions still load, including sessions without a stored workspace binding.
 
@@ -60,7 +60,7 @@ caudra --sandbox dev --sandbox-resume --session SESSION_ID
 
 `--session` restores the saved sandbox source before resolving Workcell. `--continue` can recover the last saved sandbox source for the client directory. It is a resume preference, not an automatic sandbox default for fresh runs. A paused VM requires explicit approval through `--sandbox-resume` or a separate `sandbox resume` command. Conversation resume and cold-boot VM resume are different operations.
 
-Caudra validates the original authority, principal, workspace generation and cursor. Missing records, changed identity or an unavailable provider stop resume. No new VM is substituted under old history. Resuming a sandbox session also needs `experimental.sandboxes`. Without it, resume fails with an error, never falls back to local execution, and leaves the session intact. SDK `--fork-session` is a history-only fork and does not implicitly recover the source sandbox. See [Sessions](/docs/sessions/) for transcript and snapshot behavior.
+Caudra validates the original authority, principal, workspace generation and cursor. Missing records, changed identity or an unavailable provider stop resume. No new VM is substituted under old history. Resuming a sandbox session also needs `experimental.sandboxes`. Without it, resume fails with an error, never falls back to local execution, and leaves the session intact. SDK `--fork-session` is a history-only fork and does not implicitly recover the source sandbox. See [Sessions](/docs/sessions/) for transcript and [file revert](/docs/sessions/#file-revert) behavior.
 
 ## Configuration schema
 
@@ -299,7 +299,7 @@ Use Reconcile in Transfer or `sandbox transfer reconcile` with the original root
 
 Keep the persistent client transfer journal and its archive pages. They retain operation receipts and last-confirmed transfer bases across restarts. Do not delete them to bypass recovery blocks. There is no transfer-specific force-acknowledgement command.
 
-Transfers never delete destination-only files. No bidirectional mirroring, transfer-on-exit, rollback or whole-project undo is provided. `RollbackCoverage` is `None`. Publication is not atomic across multiple files, and replacement is not an atomic compare-and-swap against arbitrary external writers. Keep other writers out of the destination while transferring. Workspace snapshots are a separate feature, not transfer backup coverage.
+Transfers never delete destination-only files. No bidirectional mirroring, transfer-on-exit, rollback or whole-project undo is provided. `RollbackCoverage` is `None`. Publication is not atomic across multiple files, and replacement is not an atomic compare-and-swap against arbitrary external writers. Keep other writers out of the destination while transferring. [File revert](/docs/sessions/#file-revert) is a separate feature, not transfer backup coverage.
 
 ## Lifecycle controls and failure recovery
 

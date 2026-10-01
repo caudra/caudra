@@ -406,21 +406,21 @@ Disabling the master switch or setting `rules.truncation.enabled = false` stops 
 |-------|------|---------|-------------|
 | `group_by` | string | `directory` | Evaluate policies per working directory (`directory`) or across every session (`none`) |
 | `sweep_interval_hours` | u64 | `24` | Hours between background sweeps. A sweep reclaims freed space, and applies `trim` and `forget` when they are set. `0` disables the sweep; `caudra storage` commands still work |
-| `trim` | table | `{}` | Sessions outside this policy lose snapshots, tool output files, archives, and large rich outputs but stay resumable. Empty means never trim automatically |
+| `trim` | table | `{}` | Sessions outside this policy lose file revert, tool output files, archives, and large rich outputs but stay resumable. Empty means never trim automatically |
 | `forget` | table | `{}` | Sessions outside this policy are deleted. Empty means never delete automatically |
 
 `trim` and `forget` are keep policies in `restic forget` terms: `keep_last`, `keep_hourly`, `keep_daily`, `keep_weekly`, `keep_monthly`, `keep_yearly` take a count, and `keep_within` plus `keep_within_hourly` through `keep_within_yearly` take a duration such as `"90d"` or `"2y5m7d3h"`. A session is kept when any rule matches. An empty `forget` policy disables automatic deletion. See [Sessions](/docs/sessions/#retention) for what each tier keeps and how the sweep runs.
 
 ### `[storage.snapshots]`
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `enabled` | bool | `true` | Capture automatic workspace snapshots locally and remotely, including session-start and final captures. `false` disables capture and file revert without deleting existing snapshots or bypassing restore recovery. `--no-snapshots` overrides this for one run |
-| `max_bytes_mb` | u64 | `512` | Largest working tree a capture will take, and the retention target for the compressed object store each workspace shares across its sessions. A workspace above it loses file revert rather than paying for a snapshot the store cannot keep |
-| `max_files` | u64 | `50000` | Most files a capture will take, counted after ignore rules |
-| `max_file_bytes_mb` | u64 | `100` | Largest single file a capture will take. A bigger one is left out of the snapshot and left alone on disk, so it cannot be reverted |
+| Field | Type | Default | Min | Description |
+|-------|------|---------|-----|-------------|
+| `enabled` | bool | `true` | - | Record each tool call's file changes so file revert can undo them, locally and remotely. `false` turns recording and file revert off and keeps records already made. `--no-snapshots` overrides this for one run |
+| `max_bytes_mb` | u64 | `512` | 1 | Most file data one change record may cover, and the size each workspace's change store is trimmed to. A record over it is refused and its call runs unrecorded. Values above the store's limit are lowered to it, and locally that limit is the default |
+| `max_files` | u64 | `50000` | 1 | Most files one change record may cover, counted after ignore rules. A record over it is refused and its call runs unrecorded. Values above the store's limit are lowered to it, and locally that limit is the default |
+| `max_file_bytes_mb` | u64 | `100` | 1 | Largest file a change record stores. A larger file is left unrecorded, and a file revert across a call that changed it stops with a conflict. Values above the store's limit are lowered to it, and locally that limit is the default |
 
-A workspace over `max_bytes_mb` or `max_files` is refused rather than captured, and individual files over `max_file_bytes_mb` are skipped while the rest of the tree is still captured. A refusal costs file revert and lets the tool call proceed. See [Sessions](/docs/sessions/#limits) for what a capture covers.
+A change record that would cover more than `max_files` files or `max_bytes_mb` of file data is refused, and its call runs without a record. A file over `max_file_bytes_mb` is left unrecorded. Values above the store's limits are lowered to them, and zero is rejected. See [Sessions](/docs/sessions/#limits) for what a record covers.
 
 ### `[telemetry]`
 

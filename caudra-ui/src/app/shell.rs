@@ -10,7 +10,7 @@ use std::os::unix::process::CommandExt;
 use async_process::{Command, Stdio};
 use caudra_agent::{
     AgentConfig, CancelToken, CancelTrigger, ToolAccounting, ToolDoneEvent, ToolInput, ToolOutput,
-    ToolStartEvent, WorkspaceBaseline,
+    ToolStartEvent,
 };
 use caudra_config::FeatureFlags;
 use caudra_providers::Message;
@@ -106,7 +106,6 @@ pub(crate) struct RemoteDirectoryChange {
 
 pub(crate) struct RemoteShellTarget {
     pub workspace: WorkspaceSession,
-    pub baseline: Arc<WorkspaceBaseline>,
 }
 
 #[derive(Default)]
@@ -348,18 +347,6 @@ pub(crate) fn spawn_remote_shell(
             id: id.clone(),
             command: command.clone(),
         });
-        if let Err(error) = target.baseline.ensure_current().await.into_result() {
-            let _ = tx.send(ShellEvent::Done {
-                id,
-                command,
-                output: error.to_string(),
-                is_error: true,
-                visible,
-                max_output_lines: config.max_output_lines,
-                max_output_bytes: config.max_output_bytes,
-            });
-            return;
-        }
         let result = run_remote_command(
             &target.workspace,
             &command,

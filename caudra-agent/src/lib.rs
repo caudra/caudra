@@ -47,7 +47,6 @@ pub mod permissions;
 pub mod prompt;
 pub mod remote_project_context;
 pub mod scratch;
-pub mod snapshots;
 mod stored_session;
 mod subagent_history;
 pub mod template;
@@ -56,7 +55,6 @@ pub mod tools;
 pub use tools::ToolFilter;
 pub mod types;
 pub mod workflow;
-pub mod workspace_baseline;
 pub mod workspace_transfer;
 pub mod worktree;
 pub use stored_session::{
@@ -70,7 +68,6 @@ pub use subagent_history::{
     active_task_history_versions, active_task_history_versions_with_batch_state,
     active_task_history_versions_with_outputs, batch_task_history_versions, history_tool_call_ids,
 };
-pub use workspace_baseline::{BaselineGate, BaselineOutcome, WorkspaceBaseline};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

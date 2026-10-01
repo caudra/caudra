@@ -714,6 +714,11 @@ impl<T: PickerItem> ListPicker<T> {
         self.state.as_ref().and_then(|s| s.selected_item_index())
     }
 
+    #[cfg(test)]
+    pub(crate) fn title(&self) -> &str {
+        &self.title
+    }
+
     pub fn item(&self, idx: usize) -> Option<&T> {
         self.state.as_ref().and_then(|s| s.items.get(idx))
     }

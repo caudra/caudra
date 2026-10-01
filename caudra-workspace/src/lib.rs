@@ -4,6 +4,7 @@
 
 mod attachment;
 mod capability;
+mod changes;
 mod error;
 mod identity;
 mod path;
@@ -16,6 +17,14 @@ pub use attachment::{
     PlanRef,
 };
 pub use capability::{WorkspaceCapabilities, WorkspaceCapability};
+pub use changes::{
+    ChangeOperationPreview, ChangeOperationResult, CleanupPreview, CleanupSummary, HolderPage,
+    HolderSummary, OpenRecord, PendingRevert, PreparedChangeOperation, RecordLimits, RecordListing,
+    RecordPage, RecordRequest, RecordScope, RecordState, RecordSummary, RecordedPath,
+    ReleaseSelection, ReleaseSummary, RevertChangeKind, RevertConflict, RevertConflictKind,
+    RevertCounts, RevertDirection, RevertPath, RevertPreview, RevertState, RevertStatus,
+    UNREVEALED_ROOT, UnrecordedReason, WorkspaceChangeBinder, WorkspaceChangeService,
+};
 pub use error::{InvalidResponseKind, TransportErrorKind, WorkspaceError};
 pub use identity::{
     AuthenticatedPrincipalId, AuthorityIdentity, IdentifierError, ProjectIdentity, ProjectKey,
@@ -23,9 +32,9 @@ pub use identity::{
 };
 pub use path::{DirectoryNavigation, WorkspacePath, WorkspacePathError};
 pub use resource::{
-    CheckpointId, CollectionRevision, ContinuationToken, CwdHandle, OperationId, ResourceId,
-    ResourceKind, ResourceRevision, ResourceScope, ResourceScopeError, RestoreId, ScmRevision,
-    SessionBindingId, SessionWorkspaceBinding, SnapshotId, WatchCursor, WatchSubscriptionId,
+    CollectionRevision, ContinuationToken, CwdHandle, OperationId, RecordHolder, RecordTicket,
+    ResourceId, ResourceKind, ResourceRevision, ResourceScope, ResourceScopeError, RevertId,
+    ScmRevision, SessionBindingId, SessionWorkspaceBinding, WatchCursor, WatchSubscriptionId,
     WorkspaceCursor, WorkspaceResource,
 };
 pub use service::*;

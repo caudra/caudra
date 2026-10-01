@@ -23,7 +23,7 @@ Live discovery must advertise these capabilities. Capability contracts use versi
 
 | Capability | Required methods and guarantees |
 |------------|---------------------------------|
-| Control plane | `controlPlane = true`, empty `controlPlaneMissing`, and `executionEnvironment` disclosure |
+| Control plane | `controlPlane = true` with an empty `controlPlaneMissing`, or `controlPlane = false` with only `changes` missing, and `executionEnvironment` disclosure |
 | `operations` | `exactPreparation`, methods `prepare`, `execute`, `status`, `cancel`, `release`, and nonzero ledger and bounded progress-replay limits |
 | `workspace` | `resolveDirectory`, `stat`, `list`, `readText`, `searchText` |
 | `workspaceMutation` | `prepared` and `rollbackOnFailure` |
@@ -31,14 +31,14 @@ Live discovery must advertise these capabilities. Capability contracts use versi
 | `watch` | `open`, `poll`, `close`, and `recursive` |
 | `projectAssets` | `discover` and `read` |
 | `scm` | `discover`, `status`, `log`, `diff`, `readSide`, `stage`, `unstage`, `discard`, and `preparedMutations` |
-| `snapshots` | `capture`, `prepareCapture`, `checkpoint`, `inspect`, `status`, `prepareRestore`, `prepareUnrevert`, `acknowledge`, and `prepareCleanup` |
+| `changes` | `beginRecord`, `finishRecord`, `abandonRecord`, `openRecords`, `abandonOpenRecords`, `records`, `holders`, `hold`, `release`, `prepareRevert`, `prepareUnrevert`, `acknowledge`, `status`, `prepareCleanup`, and a bounded `maxPageSize`. Optional for a direct host, required to attach a sandbox. See [File revert](#file-revert) |
 | `reviewedTransfer` | `privateStaging`, `sealedPublication`, `conditionalDownload`, `singleRange`, `durableOutcomes`, `createsDirectories`, and `safeInventory` |
 
 Reviewed transfer also requires positive file, staging, I/O, lifetime, buffer and journal limits, with `maxJournalStorageBytes >= maxJournalBytes`. Binary reads use reviewed downloads. The old raw upload/download tools cannot substitute for these capabilities.
 
 Missing capabilities fail startup, even if you disable the corresponding model tools. Keep execution-environment disclosure enabled. Do not pass `--no-expose-execution-environment`.
 
-On the server, create private snapshot and transfer directories outside the exposed workspace. The paths below are examples to replace with your deployment paths. The token file must contain a bearer token of at least 32 bytes, supplied through your secret-management process.
+On the server, create private change record and transfer directories outside the exposed workspace. The paths below are examples to replace with your deployment paths. The token file must contain a bearer token of at least 32 bytes, supplied through your secret-management process.
 
 ```bash
 install -d -m 700 /var/lib/workcell/snapshots /var/lib/workcell/transfers
@@ -57,7 +57,7 @@ workcell-mcp /srv/workspaces \
   --transfer-root /var/lib/workcell/transfers
 ```
 
-The snapshot directory must already exist, be absolute, belong to the server process identity, have no symlink components, and be inaccessible to group and other users on Unix. It must not overlap the workspace. Snapshot objects and restore journals stay there, separate from client session records.
+The `--snapshot-root` directory must already exist, be absolute, belong to the server process identity, have no symlink components, and be inaccessible to group and other users on Unix. It must not overlap the workspace. It holds one change record store per workspace, with its revert journals, separate from client session records. Without it the host keeps no change records, so its sessions have no file revert.
 
 All five `--remote-*` identifiers and HTTP authentication are required for remote discovery. Keep the workspace generation stable across ordinary process restarts. Change it whenever you replace or reset the workspace. The server generates a separate process-instance identifier to detect lost volatile operation state.
 
@@ -197,24 +197,16 @@ Resuming a direct remote session also needs `experimental.remote_workcell`, whet
 
 An ordinary server restart preserves durable identity but changes the process instance. Caudra must refresh volatile handles and reconcile pending operations. Reusing a generation after a workspace reset defeats this distinction, so generation management is the operator's responsibility.
 
-## File snapshots
+## File revert
 
-A remote session captures its snapshots on the Workcell host, in the store behind `--snapshot-root`. Each capture covers the session directory. The host uses the same Git object format as a [local store](/docs/sessions/#file-snapshots), with one private object store per workspace, and reads only the files whose size, timestamps, or inode changed since the last capture. A rewind works like a [local file restore](/docs/sessions/#file-snapshots): it touches only the paths that differ between the capture nearest the current head and the capture nearest the target, and a path changed since the first capture is a conflict.
+A remote session records its [file changes](/docs/sessions/#file-revert) on the Workcell host, in the store behind `--snapshot-root`. The host keeps one store for each workspace identity, including its generation, and every client of that workspace shares it. Recording, preview, conflicts, unrevert, and recovery after an interrupted revert work as they do locally. What differs:
 
-Capture is a prepared operation. Caudra starts it and polls status through short requests, so a large capture can outlast an ordinary RPC deadline. The host reports capture phases and applies a 15-minute cooperative budget. Cancellation waits for active filesystem work to publish or roll back. A timeout does not prove that the worker stopped. After a lost reply, Caudra looks up the original checkpoint instead of assuming success or creating a different checkpoint.
+- A shell line or file tool that names an absolute path records the whole session directory, because the host does not reveal where the workspace lives.
+- Protected paths such as Git metadata, `.env*` files, and private keys are never recorded, wherever they are in the tree.
+- Record limits above what the host advertises are lowered to it.
+- Deleting, trimming, or forgetting a session leaves its records on the host. They stay until newer records push them out of the store's size budget.
 
-Run-completion captures run in the background without blocking the terminal UI. File rewind and unrevert wait until a pending final capture settles, so their preview cannot use an unfinished source snapshot. Shutdown gives final captures a shared, bounded wait and requests cancellation when it expires.
-
-Captures use the `storage.snapshots` settings, lowered to the limits the host advertises. `enabled = false` or `--no-snapshots` [disables automatic capture](/docs/sessions/#disable-automatic-snapshots), including session-start and final snapshots, without bypassing restore recovery. The host walk differs from a local one:
-
-- Per-directory `.gitignore` files apply. `.git/info/exclude` and the global Git ignore file do not.
-- Nested repositories, mounts, sockets, FIFOs, devices, unreadable entries, files over `max_file_bytes_mb`, and files that keep changing while they are read are left out and left alone.
-- A name that is not UTF-8 is counted and left out.
-- Protected paths such as Git metadata, `.env*` files, and private keys are never captured.
-
-Some refusals turn file revert off for the rest of the session: a tree over `max_files` or `max_bytes_mb`, a full host store with nothing of this session left to delete, or a host without snapshot support. The tool call proceeds, and Caudra reports the host's reason once. A busy host, a lost connection, or a policy denial says nothing about the workspace itself. Those block the call and name the reason, so no change runs without its revert point.
-
-The host store is shared by every session on the machine, so Caudra deletes the checkpoints of a remote session as they age. It keeps the session start, the current head, and the 32 newest captures, and deletes the older ones once 16 of them have piled up. When the host reports a full store, Caudra deletes every checkpoint of the session except the session start and tries the capture once more. Nothing is deleted while a restore awaits acknowledgement, and checkpoints of other sessions are never touched. A rewind to a head whose capture was deleted falls back to the nearest earlier capture, and finally to the session start.
+A host that does not offer `changes`, such as one started without `--snapshot-root`, still connects. Its tool calls run without records, Caudra says so once, and file revert is unavailable. A [managed sandbox](/docs/sandboxes/) refuses to attach to a Workcell without change records.
 
 ## Interrupted operations
 
@@ -234,7 +226,7 @@ An operation recorded against an earlier generation of the workspace is listed u
 
 Use the recovery controller without asking the model to repeat the command:
 
-1. Preserve the client state directory and the server snapshot store.
+1. Preserve the client state directory and the server's `--snapshot-root` directory.
 2. Run `/remote pending` to inspect the recorded operation IDs and states.
 3. Run `/remote reconnect` after a connection loss, or `/remote reconcile` to query retained status on the current connection.
 4. Inspect the remote files and process state before considering another mutation or acknowledgement.
@@ -272,7 +264,3 @@ In [SDK stream mode](/docs/headless/), send a text-only user message containing 
 ```
 
 Caudra handles it before model dispatch and emits a `system` message with subtype `remote` and a `status` string, or subtype `remote_error` and an `error` string. To acknowledge through the SDK, send `/remote acknowledge OPERATION_ID --accept-possible-effects` as the content. These are user-message commands, not SDK `control_request` subtypes. One-shot `--print` is not this controller. Use the `remote` CLI subcommand for scripts that only need recovery.
-
-### Snapshot recovery
-
-Snapshot restore has its own durable journal on the host. A restore interrupted by a crash is recomputed from its two captures and the live workspace, and nothing is replayed. Remote rewind first prepares a preview that counts the files it would replace, create, and delete, and asks you to repeat rewind to confirm. Conflicts are not overwritten automatically. A restore the host refuses before it changes a file leaves the session as it was. A partial or indeterminate restore requires recovery before more changes, and transcript updates and restore acknowledgement must also reconcile. Snapshots are not atomic across all files. See [Sessions](/docs/sessions/) for the conversation operations.

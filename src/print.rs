@@ -337,6 +337,7 @@ pub fn run(
             | AgentEvent::Nudge { .. }
             | AgentEvent::Injected { .. }
             | AgentEvent::ToolsLoaded { .. }
+            | AgentEvent::Unrecorded { .. }
             | AgentEvent::PromptProgress { .. } => {}
             // One-shot print spawns no workflow runtime (`workflow: None`), so
             // nothing can launch a run here and the event has no consumer.

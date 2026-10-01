@@ -638,8 +638,9 @@ version = 1
 # Type: u64.
 # sweep_interval_hours = 24
 
-# Sessions outside this policy lose snapshots, tool output files, archives, and
-# large rich outputs but stay resumable. Empty means never trim automatically.
+# Sessions outside this policy lose file revert, tool output files, archives,
+# and large rich outputs but stay resumable. Empty means never trim
+# automatically.
 # Type: table.
 # trim = {}
 
@@ -649,28 +650,32 @@ version = 1
 # forget = {}
 
 [storage.snapshots]
+# Each tool call that changes files leaves a change record, which file revert
+# undoes. A record over a limit is refused and its call runs unrecorded.
 
-# Capture automatic workspace snapshots locally and remotely, including
-# session-start and final captures. `false` disables capture and file revert
-# without deleting existing snapshots or bypassing restore recovery.
-# `--no-snapshots` overrides this for one run.
+# Record each tool call's file changes so file revert can undo them, locally
+# and remotely. `false` turns recording and file revert off and keeps records
+# already made. `--no-snapshots` overrides this for one run.
 # Type: bool.
 # enabled = true
 
-# Largest working tree a capture will take, and the retention target for the
-# compressed object store each workspace shares across its sessions. A
-# workspace above it loses file revert rather than paying for a snapshot the
-# store cannot keep.
-# Type: u64.
+# Most file data one change record may cover, and the size each workspace's
+# change store is trimmed to. A record over it is refused and its call runs
+# unrecorded. Values above the store's limit are lowered to it, and locally
+# that limit is the default.
+# Type: u64, at least 1.
 # max_bytes_mb = 512
 
-# Most files a capture will take, counted after ignore rules.
-# Type: u64.
+# Most files one change record may cover, counted after ignore rules. A record
+# over it is refused and its call runs unrecorded. Values above the store's
+# limit are lowered to it, and locally that limit is the default.
+# Type: u64, at least 1.
 # max_files = 50000
 
-# Largest single file a capture will take. A bigger one is left out of the
-# snapshot and left alone on disk, so it cannot be reverted.
-# Type: u64.
+# Largest file a change record stores. A larger file is left unrecorded, and a
+# file revert across a call that changed it stops with a conflict. Values above
+# the store's limit are lowered to it, and locally that limit is the default.
+# Type: u64, at least 1.
 # max_file_bytes_mb = 100
 
 [telemetry]

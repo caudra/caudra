@@ -49,6 +49,7 @@ use ignore::WalkBuilder;
 use serde_json::Value;
 
 use crate::agent::LoadedInstructions;
+use crate::agent::change_recording::ChangeRecorder;
 use crate::background::{JobScope, ShellLive};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::context::ContextPublisher;
@@ -56,7 +57,6 @@ use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
 use crate::template::Vars;
 use crate::workflow::WorkflowHandle;
-use crate::workspace_baseline::BaselineGate;
 use crate::{
     AgentConfig, AgentMode, EventSender, SharedBuf, SubagentHistoryStore, SubagentProgress,
 };
@@ -538,10 +538,10 @@ pub struct ToolContext {
     /// a subagent inherits its parent's handle: staleness is per-agent, but two
     /// concurrent agents must not write one file at once.
     pub path_locks: Arc<PathLocks>,
-    /// Captures the workspace before the first call that could change it.
-    /// Inherited by subagents like `path_locks`, and `None` where nothing can
-    /// revert files anyway, such as headless runs and the `caudra index` one-shot.
-    pub baseline: Option<BaselineGate>,
+    /// Records what each call changes in the session directory. Inherited by
+    /// subagents like `path_locks`, and `None` where recording is off or
+    /// nothing reverts files, such as local headless runs.
+    pub changes: Option<ChangeRecorder>,
     pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
     pub prompt_profiles: Arc<crate::prompt::profile::PromptProfileCatalog>,
     pub default_task_prompt_profile_name: Arc<str>,
@@ -832,7 +832,7 @@ pub fn interpreter_ctx(
         file_tracker,
         // Every caller is a one-shot or a test, so nothing shares these.
         path_locks: PathLocks::fresh(),
-        baseline: None,
+        changes: None,
         prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
         prompt_profiles: Arc::new(crate::prompt::profile::PromptProfileCatalog::default()),
         default_task_prompt_profile_name: Arc::from(crate::prompt::profile::BUILTIN_PROFILE_NAME),

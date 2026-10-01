@@ -324,7 +324,8 @@ impl Chat {
             AgentEvent::StreamReset
             | AgentEvent::TaskAdmitted(_)
             | AgentEvent::Retry { .. }
-            | AgentEvent::SubagentProgress { .. } => {
+            | AgentEvent::SubagentProgress { .. }
+            | AgentEvent::Unrecorded { .. } => {
                 unreachable!("handled before handle_event")
             }
             AgentEvent::Done { .. } => {

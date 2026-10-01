@@ -39,6 +39,7 @@ use super::steering::{
 use super::streaming::{StreamError, stream_with_retry};
 use super::title;
 use super::tool_dispatch::{self, RecentCalls, ResponseObservations};
+use crate::agent::change_recording::ChangeRecorder;
 use crate::background::{BackgroundTasks, JobScope, SessionWork};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::context::{
@@ -59,7 +60,6 @@ use crate::tools::{BuiltinDeferral, DeferralSession, DeferredTool};
 use crate::tools::{Deadline, FileReadTracker, LocalTools, PathLocks, ToolAudience, ToolContext};
 use crate::types::TodoItem;
 use crate::workflow::WorkflowHandle;
-use crate::workspace_baseline::BaselineGate;
 use crate::{
     AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, BackgroundReminderContext,
     CommitRef, DoneReason, EventSender, ExtractedCommand, InterruptSource, Mention,
@@ -311,8 +311,7 @@ pub struct AgentParams {
     pub timeouts: caudra_providers::Timeouts,
     pub file_tracker: Arc<FileReadTracker>,
     pub path_locks: Arc<PathLocks>,
-    /// The run's revert point, captured on its first mutating tool call.
-    pub baseline: Option<BaselineGate>,
+    pub changes: Option<ChangeRecorder>,
     pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
     pub prompt_profiles: Arc<crate::prompt::profile::PromptProfileCatalog>,
     pub default_task_prompt_profile_name: Arc<str>,
@@ -409,7 +408,7 @@ pub struct Agent<'h> {
     timeouts: caudra_providers::Timeouts,
     file_tracker: Arc<FileReadTracker>,
     path_locks: Arc<PathLocks>,
-    baseline: Option<BaselineGate>,
+    changes: Option<ChangeRecorder>,
     prompt_slots: Arc<crate::prompt::ResolvedSlots>,
     prompt_profiles: Arc<crate::prompt::profile::PromptProfileCatalog>,
     default_task_prompt_profile_name: Arc<str>,
@@ -530,7 +529,7 @@ impl<'h> Agent<'h> {
             context_publisher: params.context_publisher,
             file_tracker: params.file_tracker,
             path_locks: params.path_locks,
-            baseline: params.baseline,
+            changes: params.changes,
             prompt_slots: params.prompt_slots,
             prompt_profiles: params.prompt_profiles,
             default_task_prompt_profile_name: params.default_task_prompt_profile_name,
@@ -2354,7 +2353,7 @@ impl<'h> Agent<'h> {
             timeouts: self.timeouts,
             file_tracker: Arc::clone(&self.file_tracker),
             path_locks: Arc::clone(&self.path_locks),
-            baseline: self.baseline.clone(),
+            changes: self.changes.clone(),
             prompt_slots: Arc::clone(&self.prompt_slots),
             prompt_profiles: Arc::clone(&self.prompt_profiles),
             default_task_prompt_profile_name: Arc::clone(&self.default_task_prompt_profile_name),
@@ -4797,7 +4796,7 @@ mod tests {
                 timeouts: caudra_providers::Timeouts::default(),
                 file_tracker: FileReadTracker::fresh(),
                 path_locks: PathLocks::fresh(),
-                baseline: None,
+                changes: None,
                 prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
                 prompt_profiles: Arc::new(crate::prompt::profile::PromptProfileCatalog::default()),
                 default_task_prompt_profile_name: Arc::from(

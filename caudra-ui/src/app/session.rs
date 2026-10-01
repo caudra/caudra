@@ -17,10 +17,6 @@ use crate::input_document::InputDraft;
 use crate::repaint::{Dirty, Watch};
 use caudra_agent::HistorySnapshot;
 use caudra_agent::agent::estimate_message_tokens;
-use caudra_agent::snapshots::{
-    ConflictPolicy, RestoreReport, RestoreStatus, RestoreTarget, SnapshotError, SnapshotStore,
-};
-use caudra_agent::workspace_baseline::{BaselineError, WorkspaceBaseline};
 use caudra_agent::{GoalHandle, GoalStatus};
 use caudra_providers::{
     HistoryItem, HistoryItemKind, HistoryProjectionError, ImageSource, Model, TokenUsage,
@@ -28,19 +24,17 @@ use caudra_providers::{
 };
 use caudra_storage::id::CaudraId;
 use caudra_storage::sessions::{
-    PendingConversationRevert, PendingRestoreKind, PendingRestoreOperation, PendingRestorePhase,
-    SessionDatabase, SessionLease, SessionLocation, SessionMeta, StoredActiveGoal,
-    StoredGoalResult, StoredImage, StoredMode, StoredPasteRange, StoredPlanTarget,
-    StoredPromptAdmission, StoredQueuedDraft, StoredQueuedPrompt, StoredSubagent,
+    PendingConversationRevert, SessionDatabase, SessionLease, SessionLocation, SessionMeta,
+    StoredActiveGoal, StoredGoalResult, StoredImage, StoredMode, StoredPasteRange,
+    StoredPlanTarget, StoredPromptAdmission, StoredQueuedDraft, StoredQueuedPrompt, StoredSubagent,
     StoredSubagentOutcome, StoredSubagentTaskSpec,
 };
 use caudra_storage::tool_outputs::{ToolOutputId, ToolOutputRef, ToolOutputStore};
 use caudra_storage::worktrees::{self, CheckoutSessions};
-use caudra_workspace::{PreparedSnapshotOperation, SnapshotOperationPreview};
 
 use crate::AppSession;
-use crate::storage_writer::StorageWriter;
 
+use super::file_revert::{self, FileRevert, SETTLE_FAILED};
 use super::permission_editor::{
     ConversationPermissions, PERMISSION_WORKER_BUSY, attach_session_permissions,
 };
@@ -53,11 +47,6 @@ const SOFT_SAVE_DELAY: Duration = Duration::from_millis(1000);
 const PARALLEL_RESTORE_MIN_CHATS: usize = 4;
 const RENAME_USAGE: &str = "Usage: /rename <title>";
 pub(crate) const REVERT_BUSY_MSG: &str = "Wait for the session to become idle before reverting";
-pub(super) const REVERT_SNAPSHOT_PENDING_MSG: &str =
-    "Wait for the remote workspace snapshot to finish, then retry the file restore";
-const NO_REMOTE_FILE_CHANGES: &str = "no file changes";
-pub(crate) const LEGACY_RESTORE_CLEARED: &str = "An unfinished file restore was saved by an older \
-    snapshot format and was cleared; files may be partly restored";
 
 /// Saturates rather than wraps: a goal left open for longer than `u64`
 /// milliseconds is not a number worth panicking over.
@@ -99,17 +88,23 @@ fn restored_subagent_outcome(outcome: StoredSubagentOutcome) -> (TaskOutcome, &'
 }
 
 #[derive(Clone)]
-struct RevertTarget {
-    head: Option<CaudraId>,
+pub(super) struct RevertTarget {
+    pub(super) head: Option<CaudraId>,
+    /// The item a file revert is measured from: the prompt itself for a user
+    /// prompt, else the kept head.
+    pub(super) boundary: Option<CaudraId>,
     draft: Option<(String, Vec<ImageSource>)>,
 }
 
-pub(super) struct RemoteRestoreConfirmation {
-    conversation_source: Option<CaudraId>,
-    target: RevertTarget,
-    pending: PendingConversationRevert,
-    mode: RestoreMode,
-    pub(super) prepared: PreparedSnapshotOperation,
+impl RevertTarget {
+    /// A target that keeps `head` and everything before it.
+    fn kept(head: CaudraId) -> Self {
+        Self {
+            head: Some(head),
+            boundary: Some(head),
+            draft: None,
+        }
+    }
 }
 
 /// What `App::checkpoint` last handed to the writer: which session, how far
@@ -232,36 +227,14 @@ impl App {
                     }
                 };
             let actual_work_added = added && !sanitizer_only;
-            let commits_file_revert = actual_work_added
+            let settles_file_revert = actual_work_added
                 && meta
                     .pending_revert
                     .as_ref()
-                    .and_then(|pending| pending.file_status.as_ref())
-                    .is_some_and(file_restore_succeeded);
-            if commits_file_revert {
-                let committed = if self.workspace_baseline.is_remote() {
-                    self.workspace_baseline
-                        .pending_remote_restore()
-                        .map_err(|error| error.to_string())
-                        .and_then(|restore| {
-                            restore.map_or(Ok(()), |restore| {
-                                smol::block_on(
-                                    self.workspace_baseline
-                                        .acknowledge_remote_restore(&restore.restore_id),
-                                )
-                                .map(drop)
-                                .map_err(|error| error.to_string())
-                            })
-                        })
-                } else {
-                    self.discard_workspace_unrevert()
-                        .map_err(|error| error.to_string())
-                };
-                if let Err(error) = committed {
-                    self.status_bar
-                        .flash(format!("Failed to commit reverted workspace: {error}"));
-                    return;
-                }
+                    .is_some_and(file_revert::files_pending);
+            if settles_file_revert && let Err(error) = self.acknowledge_reverts() {
+                self.status_bar.flash(format!("{SETTLE_FAILED}: {error}"));
+                return;
             }
             match self.merge_snapshot(&snapshot, appended) {
                 Ok(()) => {
@@ -288,8 +261,6 @@ impl App {
             }
         }
         AppSession::checkpoint(&mut self.state.session, None, meta, self.state.token_usage);
-        self.workspace_baseline
-            .set_current_head(self.history_head());
 
         if !self.has_content() {
             // A published session is fenced against its own row, so the row
@@ -557,7 +528,8 @@ impl App {
             },
             goal_continuation_limit: Some(state.goal.continuation_limit()),
             permission_mode: self.permissions.persisted_mode(),
-            snapshots_unavailable: self.snapshots_unavailable.clone(),
+            unrecorded: state.session.meta.unrecorded.clone(),
+            record_coverage: state.session.meta.record_coverage.clone(),
         };
         if let Some(snapshot) = self.conversation_permissions.published() {
             let snapshot = snapshot.load();
@@ -991,23 +963,6 @@ impl App {
                 return Vec::new();
             }
         };
-        let replacement_store = if self.workspace_baseline.is_remote() {
-            Self::remote_snapshot_placeholder(&self.storage, replacement.id)
-        } else {
-            match Self::snapshot_store_for(
-                &self.storage,
-                replacement.id,
-                Path::new(&replacement.cwd),
-                self.snapshots_config.into(),
-            ) {
-                Ok(store) => store,
-                Err(error) => {
-                    self.status_bar
-                        .flash(format!("Failed to initialize workspace snapshots: {error}"));
-                    return Vec::new();
-                }
-            }
-        };
         let permissions = Arc::new(self.permissions.fork_session());
         let conversation_permissions = self.conversation_permissions.deferred();
         if let Err(error) = self.retire_current_session() {
@@ -1030,27 +985,14 @@ impl App {
         // that just ended needs its id, and the stamp always reads
         // whichever session is current.
         self.fire_session_autocmd("SessionReset", serde_json::json!({}));
-        let replacement_cwd = PathBuf::from(&replacement.cwd);
         self.state.session = Arc::new(replacement);
         // After the swap: a remote plan document is filed under the session id
         // that will own it, and the retiring session must not be handed one.
         if self.state.mode == Mode::Plan {
             self.enter_plan();
         }
-        if let (Some(workspace), Some(binding)) = (
-            self.workspace_session.clone(),
-            self.state.session.workspace_binding().cloned(),
-        ) {
-            self.workspace_baseline.rebind_workspace_session(
-                self.storage.clone(),
-                self.state.session.id,
-                workspace,
-                binding,
-            );
-            self.snapshot_store = replacement_store;
-        } else {
-            self.rebind_workspace_baseline(replacement_store, replacement_cwd);
-        }
+        self.bind_change_recorder();
+        self.refresh_record_index();
         caudra_otel::emit::session_started(
             caudra_otel::emit::START_FRESH,
             Some(&self.state.session.id.to_string()),
@@ -1094,48 +1036,11 @@ impl App {
         self.revert_to(selected.id, RestoreMode::Conversation)
     }
 
+    /// Reverts to `item_id`. A file revert previews first and runs when the
+    /// same action is repeated; a conflict aborts both halves.
     pub fn revert_to(&mut self, item_id: CaudraId, mode: RestoreMode) -> Vec<Action> {
-        self.revert_to_with_policy(item_id, mode, ConflictPolicy::Abort)
-    }
-
-    pub fn revert_at(&mut self, source: DisplaySource, mode: RestoreMode) -> Vec<Action> {
-        self.revert_to(source_target_id(source), mode)
-    }
-
-    pub fn revert_to_with_policy(
-        &mut self,
-        item_id: CaudraId,
-        mode: RestoreMode,
-        policy: ConflictPolicy,
-    ) -> Vec<Action> {
-        if self.status == Status::Streaming
-            || self.awaiting_input()
-            || self.cancelling_run.is_some()
-            || self
-                .state
-                .session
-                .meta
-                .pending_revert
-                .as_ref()
-                .is_some_and(|pending| pending.restore_operation.is_some())
-        {
+        if self.is_reverting_blocked() {
             self.status_bar.flash(REVERT_BUSY_MSG.into());
-            return Vec::new();
-        }
-        // Say why the files cannot move, then do the half that can. A raw
-        // not-found out of the store names a missing manifest rather than the
-        // reason there is no manifest to miss.
-        let mode = match self.file_revert_blocker().filter(|_| mode.restores_files()) {
-            None => mode,
-            Some(blocker) => {
-                self.status_bar.flash(blocker);
-                if !mode.restores_conversation() {
-                    return Vec::new();
-                }
-                RestoreMode::Conversation
-            }
-        };
-        if mode.restores_files() && self.snapshot_blocks_file_restore() {
             return Vec::new();
         }
         self.checkpoint_now();
@@ -1151,368 +1056,84 @@ impl App {
                 return Vec::new();
             }
         };
-        let previous = self.state.session.meta.pending_revert.clone();
-        if !self.workspace_baseline.is_remote()
-            && previous.is_none()
-            && mode.restores_files()
-            && let Err(error) = self.discard_workspace_unrevert()
-        {
-            self.status_bar
-                .flash(format!("Failed to begin workspace revert: {error}"));
-            return Vec::new();
-        }
-        let workspace_source = previous.as_ref().map_or(conversation_source, |pending| {
-            pending_workspace_head(pending)
-        });
-        let original_head = previous
-            .as_ref()
-            .map_or(conversation_source, |pending| pending.original_head);
-        let original_workspace_head = previous
-            .as_ref()
-            .map(pending_original_workspace_head)
-            .unwrap_or(workspace_source);
-        let previous_file_status = previous
-            .as_ref()
-            .and_then(|pending| pending.file_status.clone());
-        let file_status = if mode == RestoreMode::Conversation {
-            previous_file_status.filter(file_restore_succeeded)
-        } else {
-            previous_file_status
-        };
-        let mut pending = PendingConversationRevert {
-            original_head,
-            target_head: target.head,
-            original_workspace_head: Some(original_workspace_head.into()),
-            workspace_head: Some(workspace_source.into()),
-            file_status,
-            restore_operation: None,
-        };
-
-        if self.workspace_baseline.is_remote() && mode.restores_files() {
-            return self.revert_remote_workspace(
-                conversation_source,
-                target,
-                pending,
-                mode,
-                policy,
-            );
-        }
-
-        if !mode.restores_files() {
-            let actual_head = if mode.restores_conversation() {
-                target.head
-            } else {
-                conversation_source
-            };
-            self.state
-                .session_mut()
-                .set_conversation_state(actual_head, Some(pending));
-            if mode.restores_conversation() {
-                return self.finish_conversation_restore(conversation_source, target);
-            }
-            self.checkpoint_now();
-            return Vec::new();
-        }
-
-        let source_chain = match checkpoint_chain(self.state.session.messages(), workspace_source) {
-            Ok(chain) => chain,
-            Err(error) => {
-                self.status_bar.flash(error);
-                return Vec::new();
-            }
-        };
-        let target_chain = match checkpoint_chain(self.state.session.messages(), target.head) {
-            Ok(chain) => chain,
-            Err(error) => {
-                self.status_bar.flash(error);
-                return Vec::new();
-            }
-        };
-        let operation_id = CaudraId::generate();
-        pending.restore_operation = Some(PendingRestoreOperation {
-            id: operation_id,
-            kind: PendingRestoreKind::Revert,
-            phase: PendingRestorePhase::Intent,
-            target_workspace_head: target.head.into(),
-            conversation_target: mode.restores_conversation().then_some(target.head.into()),
-            overwrite: policy == ConflictPolicy::Overwrite,
-        });
-        let before_intent = Arc::clone(&self.state.session);
-        self.state
-            .session_mut()
-            .set_conversation_state(conversation_source, Some(pending));
-        if let Err(error) = self.save_session_barrier() {
-            self.state.session = before_intent;
-            self.status_bar
-                .flash(format!("Failed to save workspace restore intent: {error}"));
-            return Vec::new();
-        }
-
-        let cwd = std::path::PathBuf::from(&self.state.session.cwd);
-        let result = self.snapshot_store.restore_transaction_with_policy(
-            &cwd,
-            &source_chain,
-            &target_chain,
-            policy,
-            operation_id,
-        );
-        let report = match result {
-            Ok(report) => report,
-            Err(error) => {
-                let message = error.to_string();
-                self.finish_failed_restore(operation_id, error, false);
-                self.status_bar
-                    .flash(format!("Failed to restore workspace: {message}"));
-                return Vec::new();
-            }
-        };
-
-        let intent_state = Arc::clone(&self.state.session);
-        let Some(mut applied) = self.state.session.meta.pending_revert.clone() else {
-            self.status_bar
-                .flash("Workspace restore intent disappeared".into());
-            return Vec::new();
-        };
-        applied.workspace_head = Some(target.head.into());
-        applied.file_status = Some(restore_status_value(&Ok(report)));
-        let Some(operation) = applied.restore_operation.as_mut() else {
-            self.status_bar
-                .flash("Workspace restore operation disappeared".into());
-            return Vec::new();
-        };
-        operation.phase = PendingRestorePhase::FilesApplied;
-        let conversation_target = if mode.restores_conversation() {
-            target.head
-        } else {
-            conversation_source
-        };
-        self.state
-            .session_mut()
-            .set_conversation_state(conversation_target, Some(applied));
-        if let Err(error) = self.save_session_barrier() {
-            self.state.session = intent_state;
-            self.status_bar
-                .flash(format!("Failed to commit workspace restore: {error}"));
-            return Vec::new();
-        }
-        if let Err(error) = self
-            .snapshot_store
-            .acknowledge_operation(&cwd, operation_id)
-        {
-            self.status_bar
-                .flash(format!("Failed to finish workspace restore: {error}"));
-            return Vec::new();
-        }
-        let applied_state = Arc::clone(&self.state.session);
-        let Some(mut completed) = self.state.session.meta.pending_revert.clone() else {
-            self.status_bar
-                .flash("Applied workspace restore state disappeared".into());
-            return Vec::new();
-        };
-        completed.restore_operation = None;
-        self.state
-            .session_mut()
-            .set_conversation_state(conversation_target, Some(completed));
-        if let Err(error) = self.save_session_barrier() {
-            self.state.session = applied_state;
-            self.status_bar
-                .flash(format!("Failed to finalize workspace restore: {error}"));
-            return Vec::new();
-        }
-
-        if !mode.restores_conversation() {
-            return Vec::new();
-        }
-        self.finish_conversation_restore(conversation_source, target)
-    }
-
-    fn snapshot_blocks_file_restore(&mut self) -> bool {
-        let _ = self.poll_snapshot_capture();
-        if self.pending_snapshot.is_none() {
-            return false;
-        }
-        self.status_bar.flash(REVERT_SNAPSHOT_PENDING_MSG.into());
-        true
-    }
-
-    fn revert_remote_workspace(
-        &mut self,
-        conversation_source: Option<CaudraId>,
-        target: RevertTarget,
-        mut pending: PendingConversationRevert,
-        mode: RestoreMode,
-        policy: ConflictPolicy,
-    ) -> Vec<Action> {
-        if policy == ConflictPolicy::Overwrite {
-            self.status_bar
-                .flash("Remote snapshot conflicts cannot be overwritten automatically".into());
-            return Vec::new();
-        }
-        let prepared = match self.remote_restore_confirmation.take() {
-            Some(confirmation)
-                if confirmation.conversation_source == conversation_source
-                    && confirmation.target.head == target.head
-                    && confirmation.mode == mode =>
-            {
-                pending = confirmation.pending;
-                confirmation.prepared
-            }
-            previous => {
-                if let Some(previous) = previous {
-                    let _ = smol::block_on(
-                        self.workspace_baseline
-                            .release_remote_prepared(&previous.prepared),
-                    );
+        let mut blocked = None;
+        if mode.restores_files() {
+            match self.revert_files(conversation_source, &target, mode) {
+                FileRevert::Reverted if mode.restores_conversation() => {
+                    return self.finish_conversation_restore(conversation_source, target);
                 }
-                let messages = self.state.session.messages();
-                let (source_chain, target_chain) = match (
-                    checkpoint_chain(messages, pending_workspace_head(&pending)),
-                    checkpoint_chain(messages, target.head),
-                ) {
-                    (Ok(source_chain), Ok(target_chain)) => (source_chain, target_chain),
-                    (Err(error), _) | (_, Err(error)) => {
-                        self.status_bar.flash(error);
-                        return Vec::new();
-                    }
-                };
-                let prepared = match smol::block_on(
-                    self.workspace_baseline
-                        .prepare_remote_restore(&source_chain, &target_chain),
-                ) {
-                    Ok(prepared) => prepared,
-                    Err(error) => {
-                        self.status_bar
-                            .flash(format!("Remote workspace restore preview failed: {error}"));
-                        return Vec::new();
-                    }
-                };
-                let Some(changes) = remote_restore_changes(&prepared) else {
-                    self.status_bar
-                        .flash("Remote workspace restore preview was invalid".into());
+                FileRevert::Reverted | FileRevert::Held => return Vec::new(),
+                FileRevert::Blocked(reason) if mode.restores_conversation() => {
+                    blocked = Some(reason);
+                }
+                FileRevert::Blocked(reason) => {
+                    self.status_bar.flash(reason);
                     return Vec::new();
-                };
-                self.remote_restore_confirmation = Some(RemoteRestoreConfirmation {
-                    conversation_source,
-                    target,
-                    pending,
-                    mode,
-                    prepared,
-                });
-                self.status_bar.flash(format!(
-                    "Remote restore preview: {changes}. Repeat rewind to confirm"
-                ));
-                return Vec::new();
+                }
             }
+        }
+        self.release_revert_confirmation();
+        let previous = self.state.session.meta.pending_revert.clone();
+        let pending = PendingConversationRevert {
+            original_head: previous
+                .as_ref()
+                .map_or(conversation_source, |pending| pending.original_head),
+            target_head: target.head,
+            file_status: previous.and_then(|pending| pending.file_status),
         };
-        let Some(changes) = remote_restore_changes(&prepared) else {
-            self.status_bar
-                .flash("Remote workspace restore preview was invalid".into());
-            return Vec::new();
-        };
-        let operation_id = CaudraId::generate();
-        pending.restore_operation = Some(PendingRestoreOperation {
-            id: operation_id,
-            kind: PendingRestoreKind::Revert,
-            phase: PendingRestorePhase::Intent,
-            target_workspace_head: target.head.into(),
-            conversation_target: mode.restores_conversation().then_some(target.head.into()),
-            overwrite: false,
-        });
-        let before_intent = Arc::clone(&self.state.session);
         self.state
             .session_mut()
-            .set_conversation_state(conversation_source, Some(pending));
-        if let Err(error) = self.save_session_barrier() {
-            self.state.session = before_intent;
-            let _ = smol::block_on(self.workspace_baseline.release_remote_prepared(&prepared));
-            self.status_bar.flash(format!(
-                "Failed to save remote workspace restore intent: {error}"
-            ));
-            return Vec::new();
+            .set_conversation_state(target.head, Some(pending));
+        let actions = self.finish_conversation_restore(conversation_source, target);
+        if let Some(reason) = blocked {
+            self.status_bar.flash(reason);
         }
-        self.status_bar
-            .flash(format!("Restoring remote workspace: {changes}"));
-        let status = match smol::block_on(
-            self.workspace_baseline
-                .execute_remote_restore(prepared, target.head),
-        ) {
-            Ok(status) => status,
-            Err(error) if error.left_workspace_unchanged() => {
-                return self.abandon_remote_restore(before_intent, &error);
-            }
-            Err(error) => {
-                self.status_bar.flash(format!(
-                    "Remote workspace restore requires recovery before more changes: {error}"
-                ));
-                return Vec::new();
-            }
-        };
-        let definitive = matches!(
-            status.state,
-            caudra_workspace::SnapshotRestoreState::Completed
-                | caudra_workspace::SnapshotRestoreState::Acknowledged
-        ) && !status.reconciliation_required;
-        if !definitive {
-            if let Some(mut pending) = self.state.session.meta.pending_revert.clone() {
-                pending.file_status = serde_json::to_value(&status).ok();
-                self.state
-                    .session_mut()
-                    .set_conversation_state(conversation_source, Some(pending));
-                let _ = self.save_session_barrier();
-            }
-            let state = match status.state {
-                caudra_workspace::SnapshotRestoreState::Partial => "partial",
-                caudra_workspace::SnapshotRestoreState::Indeterminate => "indeterminate",
-                _ => "still in progress",
-            };
-            self.status_bar.flash(format!(
-                "Remote workspace restore is {state}; recovery is required before more changes"
-            ));
-            return Vec::new();
-        }
+        actions
+    }
 
-        let Some(mut applied) = self.state.session.meta.pending_revert.clone() else {
+    fn is_reverting_blocked(&self) -> bool {
+        self.status == Status::Streaming || self.awaiting_input() || self.cancelling_run.is_some()
+    }
+
+    pub fn unrevert(&mut self) -> Vec<Action> {
+        if self.is_reverting_blocked() {
+            self.status_bar.flash(REVERT_BUSY_MSG.into());
+            return Vec::new();
+        }
+        let Some(pending) = self.state.session.meta.pending_revert.clone() else {
+            return Vec::new();
+        };
+        self.release_revert_confirmation();
+        if let Err(error) =
+            active_history_items(self.state.session.messages(), pending.original_head)
+        {
             self.status_bar
-                .flash("Remote workspace restore intent disappeared".into());
+                .flash(format!("Failed to read session history: {error}"));
             return Vec::new();
-        };
-        applied.workspace_head = Some(target.head.into());
-        applied.file_status = serde_json::to_value(&status).ok();
-        if let Some(operation) = applied.restore_operation.as_mut() {
-            operation.phase = PendingRestorePhase::FilesApplied;
         }
-        let conversation_target = if mode.restores_conversation() {
-            target.head
-        } else {
-            conversation_source
-        };
+        if file_revert::files_pending(&pending) && !self.unrevert_files() {
+            return Vec::new();
+        }
+        let current_head = crate::session_history_head(&self.state.session);
         self.state
             .session_mut()
-            .set_conversation_state(conversation_target, Some(applied));
+            .set_conversation_state(pending.original_head, None);
+        self.update_context_for_head(current_head);
         if let Err(error) = self.save_session_barrier() {
-            self.status_bar.flash(format!(
-                "Remote workspace restore completed, but transcript recovery is required: {error}"
-            ));
-            return Vec::new();
+            self.status_bar
+                .flash(format!("Failed to save the unreverted session: {error}"));
         }
-        let Some(mut completed) = self.state.session.meta.pending_revert.clone() else {
-            return Vec::new();
-        };
-        completed.restore_operation = None;
-        self.state
-            .session_mut()
-            .set_conversation_state(conversation_target, Some(completed));
-        if let Err(error) = self.save_session_barrier() {
-            self.status_bar.flash(format!(
-                "Remote workspace restore acknowledgement needs recovery: {error}"
-            ));
-            return Vec::new();
-        }
-        if mode.restores_conversation() {
-            self.finish_conversation_restore(conversation_source, target)
-        } else {
-            Vec::new()
-        }
+        self.refresh_record_index();
+        self.reset_ui_chrome();
+        self.restore_display();
+        self.input_box.discard();
+        let loaded = self.install_local_history();
+        self.checkpoint_now();
+        vec![Action::LoadSession(Box::new(loaded))]
+    }
+
+    pub fn revert_at(&mut self, source: DisplaySource, mode: RestoreMode) -> Vec<Action> {
+        self.revert_to(source_target_id(source), mode)
     }
 
     fn finish_conversation_restore(
@@ -1537,278 +1158,7 @@ impl App {
         vec![Action::LoadSession(Box::new(loaded))]
     }
 
-    pub fn unrevert(&mut self) -> Vec<Action> {
-        if self.status == Status::Streaming
-            || self.awaiting_input()
-            || self.cancelling_run.is_some()
-        {
-            self.status_bar.flash(REVERT_BUSY_MSG.into());
-            return Vec::new();
-        }
-        let Some(mut pending) = self.state.session.meta.pending_revert.clone() else {
-            return Vec::new();
-        };
-        if pending.restore_operation.is_some() {
-            self.status_bar.flash(REVERT_BUSY_MSG.into());
-            return Vec::new();
-        }
-
-        if let Err(error) = checkpoint_chain(self.state.session.messages(), pending.original_head) {
-            self.status_bar.flash(error);
-            return Vec::new();
-        }
-        if self.workspace_baseline.is_remote() {
-            return self.unrevert_remote_workspace(pending);
-        }
-        if let Some(file_status) = &pending.file_status {
-            let Ok(status) = serde_json::from_value::<RestoreStatus>(file_status.clone()) else {
-                self.status_bar.flash(
-                    "Workspace revert status is invalid; conversation was not changed".into(),
-                );
-                return Vec::new();
-            };
-            if !status.worktree_is_reverted() {
-                self.status_bar.flash(
-                    "Workspace revert did not complete; conversation was not changed".into(),
-                );
-                return Vec::new();
-            }
-            self.checkpoint_now();
-            let current_head = crate::session_history_head(&self.state.session);
-            let operation_id = CaudraId::generate();
-            pending.restore_operation = Some(PendingRestoreOperation {
-                id: operation_id,
-                kind: PendingRestoreKind::Unrevert,
-                phase: PendingRestorePhase::Intent,
-                target_workspace_head: pending_original_workspace_head(&pending).into(),
-                conversation_target: Some(pending.original_head.into()),
-                overwrite: false,
-            });
-            let before_intent = Arc::clone(&self.state.session);
-            self.state
-                .session_mut()
-                .set_conversation_state(current_head, Some(pending));
-            if let Err(error) = self.save_session_barrier() {
-                self.state.session = before_intent;
-                self.status_bar
-                    .flash(format!("Failed to save workspace restore intent: {error}"));
-                return Vec::new();
-            }
-            let cwd = std::path::PathBuf::from(&self.state.session.cwd);
-            let result = self.snapshot_store.unrevert_transaction_with_policy(
-                &cwd,
-                ConflictPolicy::Abort,
-                operation_id,
-            );
-            if let Err(error) = result {
-                let message = error.to_string();
-                self.finish_failed_restore(operation_id, error, true);
-                self.status_bar
-                    .flash(format!("Failed to restore workspace: {message}"));
-                return Vec::new();
-            }
-
-            let intent_state = Arc::clone(&self.state.session);
-            let Some(mut applied) = self.state.session.meta.pending_revert.clone() else {
-                self.status_bar
-                    .flash("Workspace unrevert intent disappeared".into());
-                return Vec::new();
-            };
-            applied.workspace_head = applied.original_workspace_head.clone();
-            let Some(operation) = applied.restore_operation.as_mut() else {
-                self.status_bar
-                    .flash("Workspace unrevert operation disappeared".into());
-                return Vec::new();
-            };
-            operation.phase = PendingRestorePhase::FilesApplied;
-            self.state
-                .session_mut()
-                .set_conversation_state(applied.original_head, Some(applied));
-            self.update_context_for_head(current_head);
-            self.sync_live_meta();
-            if let Err(error) = self.save_session_barrier() {
-                self.state.session = intent_state;
-                self.status_bar
-                    .flash(format!("Failed to commit workspace restore: {error}"));
-                return Vec::new();
-            }
-            if let Err(error) = self
-                .snapshot_store
-                .acknowledge_operation(&cwd, operation_id)
-            {
-                self.status_bar
-                    .flash(format!("Failed to finish workspace restore: {error}"));
-                return Vec::new();
-            }
-            let applied_state = Arc::clone(&self.state.session);
-            let original_head = applied_state
-                .meta
-                .pending_revert
-                .as_ref()
-                .map(|pending| pending.original_head)
-                .unwrap_or(current_head);
-            self.state
-                .session_mut()
-                .set_conversation_state(original_head, None);
-            if let Err(error) = self.save_session_barrier() {
-                self.state.session = applied_state;
-                self.status_bar
-                    .flash(format!("Failed to finalize workspace restore: {error}"));
-                return Vec::new();
-            }
-        } else {
-            let current_head = crate::session_history_head(&self.state.session);
-            self.state
-                .session_mut()
-                .set_conversation_state(pending.original_head, None);
-            self.update_context_for_head(current_head);
-        }
-
-        self.reset_ui_chrome();
-        self.restore_display();
-        self.input_box.discard();
-
-        let loaded = self.install_local_history();
-        self.checkpoint_now();
-        vec![Action::LoadSession(Box::new(loaded))]
-    }
-
-    fn unrevert_remote_workspace(&mut self, mut pending: PendingConversationRevert) -> Vec<Action> {
-        let Some(file_status) = pending.file_status.as_ref() else {
-            let current_head = crate::session_history_head(&self.state.session);
-            self.state
-                .session_mut()
-                .set_conversation_state(pending.original_head, None);
-            self.update_context_for_head(current_head);
-            return self.finish_remote_unrevert_display();
-        };
-        if self.snapshot_blocks_file_restore() {
-            return Vec::new();
-        }
-        let status = match serde_json::from_value::<caudra_workspace::SnapshotRestoreStatus>(
-            file_status.clone(),
-        ) {
-            Ok(status)
-                if matches!(
-                    status.state,
-                    caudra_workspace::SnapshotRestoreState::Completed
-                        | caudra_workspace::SnapshotRestoreState::Acknowledged
-                ) && !status.reconciliation_required =>
-            {
-                status
-            }
-            _ => {
-                self.status_bar
-                    .flash("Remote workspace restore is not complete; recovery is required".into());
-                return Vec::new();
-            }
-        };
-        let prepared = match smol::block_on(
-            self.workspace_baseline
-                .prepare_remote_unrevert(&status.restore_id),
-        ) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                self.status_bar
-                    .flash(format!("Remote workspace unrevert preview failed: {error}"));
-                return Vec::new();
-            }
-        };
-        self.checkpoint_now();
-        let current_head = crate::session_history_head(&self.state.session);
-        pending.restore_operation = Some(PendingRestoreOperation {
-            id: CaudraId::generate(),
-            kind: PendingRestoreKind::Unrevert,
-            phase: PendingRestorePhase::Intent,
-            target_workspace_head: pending_original_workspace_head(&pending).into(),
-            conversation_target: Some(pending.original_head.into()),
-            overwrite: false,
-        });
-        let before_intent = Arc::clone(&self.state.session);
-        self.state
-            .session_mut()
-            .set_conversation_state(current_head, Some(pending.clone()));
-        if let Err(error) = self.save_session_barrier() {
-            self.state.session = before_intent;
-            let _ = smol::block_on(self.workspace_baseline.release_remote_prepared(&prepared));
-            self.status_bar.flash(format!(
-                "Failed to save remote workspace unrevert intent: {error}"
-            ));
-            return Vec::new();
-        }
-        let restore = match smol::block_on(self.workspace_baseline.execute_remote_unrevert(
-            prepared,
-            pending_original_workspace_head(&pending),
-            status.restore_id,
-        )) {
-            Ok(status) => status,
-            Err(error) if error.left_workspace_unchanged() => {
-                return self.abandon_remote_restore(before_intent, &error);
-            }
-            Err(error) => {
-                self.status_bar.flash(format!(
-                    "Remote workspace unrevert requires recovery before more changes: {error}"
-                ));
-                return Vec::new();
-            }
-        };
-        if !matches!(
-            restore.state,
-            caudra_workspace::SnapshotRestoreState::Completed
-                | caudra_workspace::SnapshotRestoreState::Acknowledged
-        ) || restore.reconciliation_required
-        {
-            if let Some(mut pending) = self.state.session.meta.pending_revert.clone() {
-                pending.file_status = serde_json::to_value(&restore).ok();
-                self.state
-                    .session_mut()
-                    .set_conversation_state(current_head, Some(pending));
-                let _ = self.save_session_barrier();
-            }
-            self.status_bar.flash(
-                "Remote workspace unrevert is partial or indeterminate; recovery is required"
-                    .into(),
-            );
-            return Vec::new();
-        }
-        self.state
-            .session_mut()
-            .set_conversation_state(pending.original_head, None);
-        self.update_context_for_head(current_head);
-        if let Err(error) = self.save_session_barrier() {
-            self.state.session = before_intent;
-            self.status_bar.flash(format!(
-                "Remote workspace unrevert completed, but transcript recovery is required: {error}"
-            ));
-            return Vec::new();
-        }
-        if let Err(error) = smol::block_on(
-            self.workspace_baseline
-                .acknowledge_remote_restore(&restore.restore_id),
-        ) {
-            self.status_bar.flash(format!(
-                "Remote workspace unrevert completed, but acknowledgement is required: {error}"
-            ));
-            return Vec::new();
-        }
-        self.finish_remote_unrevert_display()
-    }
-
-    fn finish_remote_unrevert_display(&mut self) -> Vec<Action> {
-        self.reset_ui_chrome();
-        self.restore_display();
-        self.input_box.discard();
-        let loaded = self.install_local_history();
-        self.checkpoint_now();
-        vec![Action::LoadSession(Box::new(loaded))]
-    }
-
-    fn sync_live_meta(&mut self) {
-        let meta = self.build_meta();
-        AppSession::checkpoint(&mut self.state.session, None, meta, self.state.token_usage);
-    }
-
-    fn save_session_barrier(&mut self) -> Result<(), String> {
+    pub(super) fn save_session_barrier(&mut self) -> Result<(), String> {
         self.storage_writer
             .save_sync(Arc::clone(&self.state.session))
             .map_err(|error| error.to_string())?;
@@ -1822,74 +1172,8 @@ impl App {
         Ok(())
     }
 
-    fn finish_failed_restore(
-        &mut self,
-        operation_id: CaudraId,
-        error: SnapshotError,
-        unrevert: bool,
-    ) {
-        match self.snapshot_store.journal_operation_id() {
-            Ok(Some(journal_id)) if journal_id == operation_id => return,
-            Ok(_) => {}
-            Err(journal_error) => {
-                self.status_bar.flash(format!(
-                    "Failed to inspect workspace restore journal: {journal_error}"
-                ));
-                return;
-            }
-        }
-        let intent_state = Arc::clone(&self.state.session);
-        let Some(mut pending) = self.state.session.meta.pending_revert.clone() else {
-            return;
-        };
-        pending.restore_operation = None;
-        let result = Err(error);
-        pending.file_status = Some(if unrevert {
-            unrevert_failure_status_value(&result)
-        } else {
-            restore_status_value(&result)
-        });
-        let current_head = crate::session_history_head(&self.state.session);
-        self.state
-            .session_mut()
-            .set_conversation_state(current_head, Some(pending));
-        if let Err(save_error) = self.save_session_barrier() {
-            self.state.session = intent_state;
-            self.status_bar.flash(format!(
-                "Failed to save workspace restore failure: {save_error}"
-            ));
-        }
-    }
-
-    /// The host refused the restore before it touched a file, so the session
-    /// goes back to how it stood before the intent was saved. A failed save
-    /// heals on the next load: recovery finds no record of the restore.
-    fn abandon_remote_restore(
-        &mut self,
-        before_intent: Arc<AppSession>,
-        error: &BaselineError,
-    ) -> Vec<Action> {
-        self.state.session = before_intent;
-        let message = match self.save_session_barrier() {
-            Ok(()) => format!("Remote workspace unchanged: {error}"),
-            Err(save_error) => format!(
-                "Remote workspace unchanged: {error}; failed to clear the restore intent: {save_error}"
-            ),
-        };
-        self.status_bar.flash(message);
-        Vec::new()
-    }
-
     pub fn fork_at(&self, source: DisplaySource) -> Result<ForkedSession, String> {
-        if self.cancelling_run.is_some()
-            || self
-                .state
-                .session
-                .meta
-                .pending_revert
-                .as_ref()
-                .is_some_and(|pending| pending.restore_operation.is_some())
-        {
+        if self.cancelling_run.is_some() {
             return Err(REVERT_BUSY_MSG.into());
         }
         let current_head = crate::session_history_head(&self.state.session);
@@ -1930,6 +1214,8 @@ impl App {
             plan_written: self.state.plan.is_ready(),
             thinking: Some(self.state.thinking.clone().into()),
             fast: self.state.fast,
+            unrecorded: self.state.session.meta.unrecorded.clone(),
+            record_coverage: self.state.session.meta.record_coverage.clone(),
             ..SessionMeta::default()
         };
         if matches!(
@@ -2098,21 +1384,7 @@ impl App {
                 })?;
         }
 
-        if !self.workspace_baseline.is_remote() {
-            let child_snapshots = Self::snapshot_store_for(
-                &self.storage,
-                child.id,
-                Path::new(&child.cwd),
-                self.snapshots_config.into(),
-            )
-            .map_err(|error| format!("Failed to initialize workspace snapshots: {error}"))?;
-            self.snapshot_store
-                .copy_ancestry_to(
-                    &child_snapshots,
-                    &ancestor.iter().map(|item| item.id).collect::<Vec<_>>(),
-                )
-                .map_err(|error| format!("Failed to copy workspace snapshots: {error}"))?;
-        }
+        self.hold_records_for(child.id);
 
         Ok(ForkedSession {
             session: child,
@@ -2125,7 +1397,7 @@ impl App {
 
     fn next_fork_title(&self) -> Result<String, String> {
         let (base, own_number) = split_fork_title(&self.state.session.title);
-        let sessions = if self.workspace_baseline.is_remote() {
+        let sessions = if self.workspace_session.is_some() {
             let binding = self
                 .state
                 .session
@@ -2178,9 +1450,9 @@ impl App {
             )
             .map_err(|error| error.to_string())?;
         }
-        let remote_target = self
+        let remote_binding = self
             .workspace_session
-            .clone()
+            .as_ref()
             .map(|workspace| {
                 let binding =
                     caudra_storage::workspace_binding::StoredWorkspaceBinding::new_with_cursor(
@@ -2190,53 +1462,21 @@ impl App {
                             .workspace_binding()
                             .and_then(|binding| binding.cursor_label().map(str::to_owned)),
                     )
-                    .map_err(|error| {
-                        format!("Remote workspace snapshot identity is invalid: {error}")
-                    })?;
+                    .map_err(|error| format!("Remote workspace identity is invalid: {error}"))?;
                 if session
                     .workspace_binding()
                     .is_none_or(|stored| !stored.exact_scope_eq(&binding))
                 {
                     return Err("Session belongs to a different remote workspace cursor".to_owned());
                 }
-                Ok((workspace, binding))
+                Ok(binding)
             })
             .transpose()?;
-        let (snapshot_store, restore_notice) = if let Some((workspace, binding)) = &remote_target {
+        if let Some(binding) = remote_binding {
             session
-                .replace_workspace_cursor(binding.clone())
+                .replace_workspace_cursor(binding)
                 .map_err(|error| error.to_string())?;
-            let baseline = WorkspaceBaseline::new_workspace_session(
-                self.storage.clone(),
-                session.id,
-                workspace.clone(),
-                binding.clone(),
-                self.snapshots_config,
-            );
-            let recovered = smol::block_on(baseline.reconcile_remote_restore())
-                .map_err(|error| format!("Remote workspace snapshot recovery failed: {error}"))?;
-            crate::event_loop::reconcile_remote_session_restore(
-                &mut session,
-                &self.storage_writer,
-                &baseline,
-                recovered,
-            )?;
-            (
-                Self::remote_snapshot_placeholder(&self.storage, session.id),
-                None,
-            )
-        } else {
-            let store = Self::snapshot_store_for(
-                &self.storage,
-                session.id,
-                Path::new(&session.cwd),
-                self.snapshots_config.into(),
-            )
-            .map_err(|error| format!("Failed to initialize workspace snapshots: {error}"))?;
-            let notice =
-                recover_pending_workspace_restore(&mut session, &store, &self.storage_writer)?;
-            (store, notice)
-        };
+        }
         let permissions = Arc::new(self.permissions.fork_session());
         // A loaded session that holds nothing owns no row worth publishing
         // against, so it waits for its first run like a fresh one.
@@ -2264,22 +1504,12 @@ impl App {
         self.apply_stored_permission_mode(&session.meta);
         self.state =
             SessionState::from_session(session, fallback_model, &self.storage, &self.model_policy);
-        if let Some((workspace, binding)) = remote_target {
-            self.workspace_baseline.rebind_workspace_session(
-                self.storage.clone(),
-                self.state.session.id,
-                workspace,
-                binding,
-            );
-            self.snapshot_store = snapshot_store;
-        } else {
-            let cwd = PathBuf::from(&self.state.session.cwd);
-            self.rebind_workspace_baseline(snapshot_store, cwd);
-        }
+        let coverage = self.state.session.meta.record_coverage.clone();
+        let first = self.bind_change_recorder();
+        let covered_anew = self.state.session.meta.record_coverage != coverage;
+        self.reconcile_loaded_session(first, covered_anew);
+        self.refresh_record_index();
         self.reconcile_plan_target();
-        self.state
-            .warnings
-            .extend(restore_notice.map(str::to_owned));
         for w in self.state.warnings.drain(..) {
             self.status_bar.flash(w);
         }
@@ -2291,7 +1521,7 @@ impl App {
     }
 
     fn retire_current_session(&mut self) -> Result<(), caudra_storage::sessions::SessionError> {
-        self.release_remote_restore_confirmation();
+        self.release_revert_confirmation();
         self.checkpoint_now();
         if self.has_content() {
             self.storage_writer
@@ -2321,182 +1551,7 @@ impl App {
     }
 }
 
-/// Finishes a restore the session recorded but never saw complete. Answers a
-/// notice for the status bar when the restore had to be dropped instead.
-pub(crate) fn recover_pending_workspace_restore(
-    session: &mut AppSession,
-    snapshot_store: &SnapshotStore,
-    storage_writer: &StorageWriter,
-) -> Result<Option<&'static str>, String> {
-    let cwd = std::path::PathBuf::from(&session.cwd);
-    let Some(mut pending) = session.meta.pending_revert.clone() else {
-        if snapshot_store
-            .journal_state()
-            .map_err(|error| format!("Failed to inspect workspace restore journal: {error}"))?
-            .is_none()
-        {
-            return Ok(None);
-        }
-        if let Some(report) = snapshot_store
-            .recover(&cwd)
-            .map_err(|error| format!("Failed to recover workspace restore: {error}"))?
-            && let Some(operation_id) = report.operation_id
-        {
-            return Err(format!(
-                "Workspace restore journal {operation_id} has no matching session operation"
-            ));
-        }
-        return Ok(None);
-    };
-    let Some(operation) = pending.restore_operation.clone() else {
-        if snapshot_store
-            .journal_state()
-            .map_err(|error| format!("Failed to inspect workspace restore journal: {error}"))?
-            .is_none()
-        {
-            return Ok(None);
-        }
-        if let Some(report) = snapshot_store
-            .recover(&cwd)
-            .map_err(|error| format!("Failed to recover workspace restore: {error}"))?
-            && let Some(operation_id) = report.operation_id
-        {
-            return Err(format!(
-                "Workspace restore journal {operation_id} has no matching session operation"
-            ));
-        }
-        return Ok(None);
-    };
-
-    if operation.phase == PendingRestorePhase::Intent && snapshot_store.is_legacy() {
-        return clear_legacy_restore(session, pending, storage_writer);
-    }
-    if operation.phase == PendingRestorePhase::Intent {
-        let recovered = snapshot_store
-            .recover(&cwd)
-            .map_err(|error| format!("Failed to recover workspace restore: {error}"))?;
-        let report = if let Some(report) = recovered {
-            validate_restore_report(&operation, &report)?;
-            report
-        } else {
-            let policy = if operation.overwrite {
-                ConflictPolicy::Overwrite
-            } else {
-                ConflictPolicy::Abort
-            };
-            let result = match operation.kind {
-                PendingRestoreKind::Revert => {
-                    let source_chain =
-                        checkpoint_chain(session.messages(), pending_workspace_head(&pending))?;
-                    let target_chain =
-                        checkpoint_chain(session.messages(), operation.target_workspace_head.head)?;
-                    snapshot_store.restore_transaction_with_policy(
-                        &cwd,
-                        &source_chain,
-                        &target_chain,
-                        policy,
-                        operation.id,
-                    )
-                }
-                PendingRestoreKind::Unrevert => {
-                    snapshot_store.unrevert_transaction_with_policy(&cwd, policy, operation.id)
-                }
-            };
-            result.map_err(|error| format!("Failed to recover workspace restore: {error}"))?
-        };
-        validate_restore_report(&operation, &report)?;
-        pending.workspace_head = Some(operation.target_workspace_head.clone());
-        if operation.kind == PendingRestoreKind::Revert {
-            pending.file_status = Some(restore_status_value(&Ok(report)));
-        }
-        let Some(applied_operation) = pending.restore_operation.as_mut() else {
-            return Err("Workspace restore operation disappeared during recovery".into());
-        };
-        applied_operation.phase = PendingRestorePhase::FilesApplied;
-        let conversation_head = operation
-            .conversation_target
-            .as_ref()
-            .map_or_else(|| crate::session_history_head(session), |head| head.head);
-        session.set_conversation_state(conversation_head, Some(pending));
-        storage_writer
-            .save_sync(Arc::new(session.clone()))
-            .map_err(|error| format!("Failed to commit recovered workspace restore: {error}"))?;
-    } else if let Some(report) = snapshot_store
-        .recover(&cwd)
-        .map_err(|error| format!("Failed to recover workspace restore: {error}"))?
-    {
-        validate_restore_report(&operation, &report)?;
-    }
-
-    snapshot_store
-        .acknowledge_operation(&cwd, operation.id)
-        .map_err(|error| format!("Failed to acknowledge recovered workspace restore: {error}"))?;
-    if operation.kind == PendingRestoreKind::Unrevert {
-        let conversation_head = operation
-            .conversation_target
-            .as_ref()
-            .map_or(session.meta.history_head, |head| head.head);
-        session.set_conversation_state(conversation_head, None);
-    } else {
-        let Some(mut completed) = session.meta.pending_revert.clone() else {
-            return Err("Recovered workspace restore state disappeared".into());
-        };
-        completed.restore_operation = None;
-        let current_head = crate::session_history_head(session);
-        session.set_conversation_state(current_head, Some(completed));
-    }
-    storage_writer
-        .save_sync(Arc::new(session.clone()))
-        .map_err(|error| format!("Failed to finalize recovered workspace restore: {error}"))?;
-    Ok(None)
-}
-
-/// A restore intent recorded against a store from before snapshots were git
-/// objects cannot be resumed, because nothing can read its journal or its
-/// snapshots any more. Only the operation is dropped, so the session loads as
-/// it stood before the restore began.
-fn clear_legacy_restore(
-    session: &mut AppSession,
-    mut pending: PendingConversationRevert,
-    storage_writer: &StorageWriter,
-) -> Result<Option<&'static str>, String> {
-    let operation = pending
-        .restore_operation
-        .take()
-        .map(|operation| operation.id);
-    tracing::info!(session_id = %session.id, ?operation, "cleared a restore saved by an older snapshot format");
-    let head = crate::session_history_head(session);
-    session.set_conversation_state(head, Some(pending));
-    storage_writer
-        .save_sync(Arc::new(session.clone()))
-        .map_err(|error| format!("Failed to clear an unrecoverable workspace restore: {error}"))?;
-    Ok(Some(LEGACY_RESTORE_CLEARED))
-}
-
-fn validate_restore_report(
-    operation: &PendingRestoreOperation,
-    report: &RestoreReport,
-) -> Result<(), String> {
-    if report.operation_id != Some(operation.id) {
-        return Err(format!(
-            "Workspace restore journal belongs to {:?}, expected {}",
-            report.operation_id, operation.id
-        ));
-    }
-    let target_matches = match operation.kind {
-        PendingRestoreKind::Revert => matches!(report.target, RestoreTarget::Snapshot(_)),
-        PendingRestoreKind::Unrevert => report.target == RestoreTarget::Unrevert,
-    };
-    if !target_matches {
-        return Err(format!(
-            "Workspace restore journal has the wrong target for operation {}",
-            operation.id
-        ));
-    }
-    Ok(())
-}
-
-fn source_target_id(source: DisplaySource) -> CaudraId {
+pub(super) fn source_target_id(source: DisplaySource) -> CaudraId {
     match source {
         DisplaySource::User(id)
         | DisplaySource::AssistantText(id)
@@ -2692,7 +1747,7 @@ fn split_fork_title(title: &str) -> (&str, Option<u32>) {
     (base, Some(number))
 }
 
-fn resolve_revert_target(
+pub(super) fn resolve_revert_target(
     items: &[HistoryItem],
     current_head: Option<CaudraId>,
     item_id: CaudraId,
@@ -2737,6 +1792,7 @@ fn resolve_revert_target(
                 .collect();
             Ok(RevertTarget {
                 head: first.parent_id,
+                boundary: Some(first.id),
                 draft: Some((text, images)),
             })
         }
@@ -2757,24 +1813,17 @@ fn resolve_revert_target(
                         )
                     })
                 });
-            Ok(RevertTarget {
-                head: Some(match result {
-                    Some(result) => complete_tool_result_group_head(items, result.id)?,
-                    None => complete_group_head(items, selected.id)?,
-                }),
-                draft: None,
-            })
+            Ok(RevertTarget::kept(match result {
+                Some(result) => complete_tool_result_group_head(items, result.id)?,
+                None => complete_group_head(items, selected.id)?,
+            }))
         }
         HistoryItemKind::AssistantText { .. } | HistoryItemKind::Reasoning { .. } => {
-            Ok(RevertTarget {
-                head: Some(selected.id),
-                draft: None,
-            })
+            Ok(RevertTarget::kept(selected.id))
         }
-        HistoryItemKind::ToolResult { .. } => Ok(RevertTarget {
-            head: Some(complete_tool_result_group_head(items, selected.id)?),
-            draft: None,
-        }),
+        HistoryItemKind::ToolResult { .. } => Ok(RevertTarget::kept(
+            complete_tool_result_group_head(items, selected.id)?,
+        )),
     }
 }
 
@@ -2818,19 +1867,6 @@ fn complete_group_head(items: &[HistoryItem], item_id: CaudraId) -> Result<Caudr
         head = next;
     }
     Ok(head.id)
-}
-
-fn checkpoint_chain(
-    items: &[HistoryItem],
-    head: Option<CaudraId>,
-) -> Result<Vec<CaudraId>, String> {
-    let mut chain = active_history_items(items, head)
-        .map_err(|error| format!("Failed to read session history: {error}"))?
-        .into_iter()
-        .map(|item| item.id)
-        .collect::<Vec<_>>();
-    chain.reverse();
-    Ok(chain)
 }
 
 fn is_sanitizer_only_unavailable_extension(
@@ -2880,56 +1916,6 @@ fn is_sanitizer_only_unavailable_extension(
         && candidate.starts_with(original)
 }
 
-fn pending_workspace_head(pending: &PendingConversationRevert) -> Option<CaudraId> {
-    pending
-        .workspace_head
-        .as_ref()
-        .map(|head| head.head)
-        .unwrap_or_else(|| {
-            if pending
-                .file_status
-                .as_ref()
-                .is_some_and(file_restore_succeeded)
-            {
-                pending.target_head
-            } else {
-                pending.original_head
-            }
-        })
-}
-
-/// What a remote rewind would do, from the host's complete counts rather than
-/// its bounded sample of paths.
-fn remote_restore_changes(prepared: &PreparedSnapshotOperation) -> Option<String> {
-    let SnapshotOperationPreview::Restore(preview) = &prepared.preview else {
-        return None;
-    };
-    let counts = &preview.counts;
-    let parts = [
-        (counts.replace, "to replace"),
-        (counts.create, "to create"),
-        (counts.delete, "to delete"),
-    ]
-    .into_iter()
-    .filter(|(count, _)| *count > 0)
-    .map(|(count, action)| format!("{count} {action}"))
-    .collect::<Vec<_>>();
-    if parts.is_empty() {
-        return Some(NO_REMOTE_FILE_CHANGES.to_owned());
-    }
-    let files = counts.applied();
-    let plural = if files == 1 { "" } else { "s" };
-    Some(format!("{files} file{plural} ({})", parts.join(", ")))
-}
-
-fn pending_original_workspace_head(pending: &PendingConversationRevert) -> Option<CaudraId> {
-    pending
-        .original_workspace_head
-        .as_ref()
-        .map(|head| head.head)
-        .unwrap_or(pending.original_head)
-}
-
 fn history_tokens(items: &[HistoryItem], head: Option<CaudraId>) -> u32 {
     let Ok(history) = active_history_items(items, head) else {
         return 0;
@@ -2939,47 +1925,6 @@ fn history_tokens(items: &[HistoryItem], head: Option<CaudraId>) -> u32 {
     messages
         .map(|messages| estimate_message_tokens(&messages))
         .unwrap_or_default()
-}
-
-fn restore_status_value(result: &Result<RestoreReport, SnapshotError>) -> serde_json::Value {
-    let status = RestoreStatus::from_result(result);
-    serde_json::to_value(&status).unwrap_or_else(|error| {
-        tracing::error!(%error, "failed to serialize workspace restore status");
-        serde_json::json!({
-            "status": "failed",
-            "kind": "other",
-            "message": error.to_string(),
-        })
-    })
-}
-
-fn file_restore_succeeded(status: &serde_json::Value) -> bool {
-    serde_json::from_value::<RestoreStatus>(status.clone())
-        .is_ok_and(|status| status.worktree_is_reverted())
-        || serde_json::from_value::<caudra_workspace::SnapshotRestoreStatus>(status.clone())
-            .is_ok_and(|status| {
-                matches!(
-                    status.state,
-                    caudra_workspace::SnapshotRestoreState::Completed
-                        | caudra_workspace::SnapshotRestoreState::Acknowledged
-                ) && !status.reconciliation_required
-            })
-}
-
-fn unrevert_failure_status_value(
-    result: &Result<RestoreReport, SnapshotError>,
-) -> serde_json::Value {
-    let mut status = RestoreStatus::from_result(result);
-    status.mark_worktree_reverted();
-    serde_json::to_value(&status).unwrap_or_else(|error| {
-        tracing::error!(%error, "failed to serialize workspace unrevert status");
-        serde_json::json!({
-            "status": "failed",
-            "kind": "other",
-            "message": error.to_string(),
-            "worktree_reverted": true,
-        })
-    })
 }
 
 /// The picker merges two sources: sessions this process has open (which the
@@ -3122,7 +2067,7 @@ impl App {
     /// Catches a worktree removed while Caudra runs, so its sessions are
     /// listed where they now live.
     pub(crate) fn move_back_from_removed_worktrees(&mut self) {
-        if self.workspace_baseline.is_remote() {
+        if self.workspace_session.is_some() {
             return;
         }
         match worktrees::reconcile(&self.storage, Path::new(&self.state.session.cwd)) {
@@ -3143,7 +2088,7 @@ impl App {
     fn session_rows(&self) -> Vec<SessionRow> {
         let live = self.live_sessions.load();
         let seen: HashSet<CaudraId> = live.iter().map(|row| row.id).collect();
-        let stored = if self.workspace_baseline.is_remote() {
+        let stored = if self.workspace_session.is_some() {
             let Some(binding) = self.state.session.workspace_binding() else {
                 tracing::warn!("failed to list remote sessions without a workspace identity");
                 return live.iter().cloned().collect();
@@ -3157,7 +2102,7 @@ impl App {
             tracing::warn!(%error, "failed to list stored sessions");
             Vec::new()
         });
-        let elsewhere = if self.workspace_baseline.is_remote() {
+        let elsewhere = if self.workspace_session.is_some() {
             Vec::new()
         } else {
             self.other_checkout_rows(&seen)

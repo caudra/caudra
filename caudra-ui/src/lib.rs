@@ -39,7 +39,7 @@ mod event_loop;
 mod input;
 mod terminal;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
@@ -61,7 +61,7 @@ use caudra_storage::id::CaudraId;
 use caudra_storage::sessions::{
     HistoryReadLimits, HistoryReadReport, SessionLease, SessionRelocation,
 };
-use caudra_workspace::WorkspaceSession;
+use caudra_workspace::{WorkspaceChangeService, WorkspaceSession};
 use color_eyre::Result;
 use color_eyre::eyre::Context;
 use flume::Receiver;
@@ -95,6 +95,12 @@ pub type PermissionAuthorityFactory = Arc<
         + Send
         + Sync,
 >;
+
+/// The change records of a local session directory, `None` where the runtime
+/// keeps none. Doing no I/O, it is called whenever a session or its directory
+/// changes.
+pub type ChangeServiceFactory =
+    Arc<dyn Fn(&Path) -> Option<Arc<dyn WorkspaceChangeService>> + Send + Sync>;
 
 /// Enqueues bounded discovery, never performs it on the UI thread. Dropping the
 /// reply receiver cancels interest; replies are proposals, not permission rules.

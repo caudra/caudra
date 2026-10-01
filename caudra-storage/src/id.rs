@@ -28,7 +28,10 @@ pub enum CaudraIdParseError {
 /// chronologically. Nothing in caudra sorts by the string form today; storage
 /// uses the embedded timestamp directly. See issue #264 for future
 /// tree-ordered history work.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+///
+/// Ids compare by their bytes, which is the order this process generated
+/// them in, so "after a message" is `id > message`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CaudraId([u8; UUID_BYTES]);
 
 impl CaudraId {
@@ -170,6 +173,11 @@ mod tests {
     use super::*;
     use test_case::test_case;
 
+    /// Enough to generate many ids within one millisecond, where only the
+    /// generator's counter keeps them in order.
+    const MONOTONIC_SAMPLES: usize = 10_000;
+    const NOT_MONOTONIC: &str = "ids generated in sequence must sort in that sequence";
+
     fn parse(s: &str) -> CaudraId {
         s.parse().unwrap()
     }
@@ -179,6 +187,19 @@ mod tests {
         let id = CaudraId::generate();
         let uuid = Uuid::from_bytes(id.0);
         assert_eq!(uuid.get_version(), Some(uuid::Version::SortRand));
+    }
+
+    /// A change record is selected by comparing its id with a message's, which
+    /// holds only while ids generated in one process never go backwards.
+    #[test]
+    fn generate_is_strictly_increasing() {
+        let ids: Vec<CaudraId> = (0..MONOTONIC_SAMPLES)
+            .map(|_| CaudraId::generate())
+            .collect();
+        assert!(
+            ids.windows(2).all(|pair| pair[0] < pair[1]),
+            "{NOT_MONOTONIC}"
+        );
     }
 
     #[test]

@@ -1,3 +1,4 @@
+pub mod change_recording;
 pub mod commit_preamble;
 mod compaction;
 mod goal;

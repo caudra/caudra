@@ -28,6 +28,8 @@ use serde_json::Value;
 
 use crate::{StateDir, StorageError, now_epoch};
 
+#[path = "sessions/change_stores.rs"]
+pub mod change_stores;
 #[path = "sessions/database.rs"]
 mod database;
 #[path = "sessions/lease.rs"]
@@ -43,8 +45,8 @@ pub use database::{
     CheckpointResult, HistoryReadLimits, HistoryReadReport, HistoryRecord,
     HistorySessionReadReport, LedgerEntry, RuntimeRetry, SESSIONS_DB_FILE, SESSIONS_DB_LOCK_FILE,
     SessionCursor, SessionDatabase, SessionRecreation, SessionStorageStats, ToolBucket,
-    ToolLedgerEntry, TrimReport, UsageBucket, WAL_RETENTION_LIMIT_BYTES, eager_load_limit,
-    set_eager_load_limit,
+    ToolLedgerEntry, TrimReport, UsageBucket, WAL_RETENTION_LIMIT_BYTES, WORKSPACE_CHANGES_DIR,
+    eager_load_limit, set_eager_load_limit,
 };
 pub(crate) use database::{from_i64, to_i64};
 pub use lease::SessionLease;
@@ -64,6 +66,9 @@ const ARCHIVE_KEEP: usize = 3;
 /// Three copies of a log full of tool output add up fast, so the bytes get a
 /// strict budget of their own. A candidate larger than the budget is skipped.
 const ARCHIVE_MAX_BYTES: u64 = 32 * 1024 * 1024;
+/// Unrecorded calls a session remembers. Past it the oldest are forgotten, so
+/// a file revert can only say how many at least ran unrecorded since then.
+pub const MAX_UNRECORDED_CALLS: usize = 512;
 
 /// Hands out the token that tags one append-only run of a message list.
 /// Process wide, so two runs never pick the same number.
@@ -404,11 +409,47 @@ pub struct SessionMeta {
     pub goal_continuation_limit: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<PermissionMode>,
-    /// Why this workspace has no file revert, once something decided so. Kept
-    /// on the session because the verdict is worth reporting after a restart
-    /// and is not worth re-deciding by walking the tree again.
+    /// Calls that ran without a change record, whose changes a file revert
+    /// leaves in place. Oldest first, and only the newest
+    /// [`MAX_UNRECORDED_CALLS`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unrecorded: Vec<UnrecordedCall>,
+    /// `None` while nothing records the session's calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub snapshots_unavailable: Option<String>,
+    pub record_coverage: Option<RecordCoverage>,
+}
+
+impl SessionMeta {
+    /// Files `gap` by when it happened, dropping the oldest once the list is
+    /// full so a long session's meta stays bounded.
+    pub fn push_unrecorded(&mut self, gap: UnrecordedCall) {
+        let index = self.unrecorded.partition_point(|known| known.at <= gap.at);
+        self.unrecorded.insert(index, gap);
+        let excess = self.unrecorded.len().saturating_sub(MAX_UNRECORDED_CALLS);
+        self.unrecorded.drain(..excess);
+    }
+}
+
+/// A call that ran without a change record, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnrecordedCall {
+    /// When the record would have been opened, on the clock history ids use.
+    pub at: CaudraId,
+    pub call_id: String,
+    pub reason: String,
+}
+
+/// Where the session's calls record their changes, and since when. A file
+/// revert reaches no further back than `since`: what came before was recorded
+/// elsewhere, or not at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordCoverage {
+    /// The local workspace key, or the remote workspace's identity.
+    pub store: String,
+    /// When the store took over, on the clock history ids use. `None` when it
+    /// holds every record the session made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<CaudraId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -417,52 +458,10 @@ pub struct PendingConversationRevert {
     pub original_head: Option<CaudraId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_head: Option<CaudraId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub original_workspace_head: Option<StoredHistoryHead>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace_head: Option<StoredHistoryHead>,
+    /// The session's copy of the change store's pending reverts, which stay
+    /// the truth for the file half.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_status: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub restore_operation: Option<PendingRestoreOperation>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StoredHistoryHead {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub head: Option<CaudraId>,
-}
-
-impl From<Option<CaudraId>> for StoredHistoryHead {
-    fn from(head: Option<CaudraId>) -> Self {
-        Self { head }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PendingRestoreKind {
-    Revert,
-    Unrevert,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PendingRestorePhase {
-    Intent,
-    FilesApplied,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PendingRestoreOperation {
-    pub id: CaudraId,
-    pub kind: PendingRestoreKind,
-    pub phase: PendingRestorePhase,
-    pub target_workspace_head: StoredHistoryHead,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub conversation_target: Option<StoredHistoryHead>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub overwrite: bool,
 }
 
 /// Messages plus the token of the run they belong to. Comparing tokens tells
@@ -1588,8 +1587,9 @@ mod tests {
         meta_record, next_epoch, persisted_session_ids, write_full_session,
     };
     use super::{
-        HistorySnapshot, PendingConversationRevert, PermissionMode, Session, SessionCursor,
-        SessionDatabase, SessionError, SessionMeta, StorageError, TitleSource,
+        HistorySnapshot, MAX_UNRECORDED_CALLS, PendingConversationRevert, PermissionMode, Session,
+        SessionCursor, SessionDatabase, SessionError, SessionMeta, StorageError, TitleSource,
+        UnrecordedCall,
     };
     use crate::StateDir;
     use crate::id::CaudraId;
@@ -1793,17 +1793,7 @@ mod tests {
             pending_revert: Some(PendingConversationRevert {
                 original_head: Some(original_head),
                 target_head: Some(target_head),
-                original_workspace_head: Some(Some(original_head).into()),
-                workspace_head: Some(Some(target_head).into()),
-                file_status: None,
-                restore_operation: Some(super::PendingRestoreOperation {
-                    id: CaudraId::generate(),
-                    kind: super::PendingRestoreKind::Revert,
-                    phase: super::PendingRestorePhase::Intent,
-                    target_workspace_head: Some(target_head).into(),
-                    conversation_target: Some(Some(target_head).into()),
-                    overwrite: true,
-                }),
+                file_status: Some(serde_json::json!({"pending": []})),
             }),
             ..SessionMeta::default()
         };
@@ -1812,6 +1802,31 @@ mod tests {
             serde_json::from_value(serde_json::to_value(&meta).unwrap()).unwrap();
 
         assert_eq!(restored, meta);
+    }
+
+    #[test_case(false ; "in_order")]
+    #[test_case(true ; "out_of_order")]
+    fn unrecorded_calls_keep_the_newest_by_when_they_happened(reversed: bool) {
+        const GAP_REASON: &str = "refused";
+        let mut ats: Vec<_> = (0..=MAX_UNRECORDED_CALLS)
+            .map(|_| CaudraId::generate())
+            .collect();
+        let newest = ats[1..].to_vec();
+        if reversed {
+            ats.reverse();
+        }
+        let mut meta = SessionMeta::default();
+        for at in ats {
+            meta.push_unrecorded(UnrecordedCall {
+                at,
+                call_id: at.to_string(),
+                reason: GAP_REASON.into(),
+            });
+        }
+        assert_eq!(
+            meta.unrecorded.iter().map(|gap| gap.at).collect::<Vec<_>>(),
+            newest
+        );
     }
 
     impl TitleSource for Value {

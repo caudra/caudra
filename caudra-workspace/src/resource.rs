@@ -94,14 +94,17 @@ opaque_id!(
     ScmRevision,
     "Opaque source-control repository, collection, or commit revision."
 );
-opaque_id!(SnapshotId, "Opaque backend-issued snapshot identity.");
 opaque_id!(
-    CheckpointId,
-    "Caller-issued idempotency identity for snapshot capture."
+    RecordTicket,
+    "Backend-issued identity of a change record opened before a call and finished after it."
 );
 opaque_id!(
-    RestoreId,
-    "Opaque durable snapshot restore journal identity."
+    RecordHolder,
+    "Caller-issued identity a change record is kept for; Caudra holds records for a root session."
+);
+opaque_id!(
+    RevertId,
+    "Opaque durable identity of a revert or unrevert of change records."
 );
 opaque_id!(
     SessionBindingId,

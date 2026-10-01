@@ -369,7 +369,7 @@ fn git_read_arguments(arguments: &[&str]) -> bool {
     true
 }
 
-fn decimal(value: &str) -> bool {
+pub(crate) fn decimal(value: &str) -> bool {
     !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 

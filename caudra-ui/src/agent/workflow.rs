@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use async_lock::Mutex as AsyncMutex;
+use caudra_agent::agent::change_recording::ChangeRecorder;
 use caudra_agent::agent::task_runner::{
     HostExtras, ModeResolver, ModelResolver, SubagentTaskRunner, WorkflowHostContext,
 };
@@ -20,8 +21,8 @@ use caudra_agent::prompt::profile::PromptProfileCatalog;
 use caudra_agent::tools::{FileReadTracker, PathLocks, ToolAudience, ToolFilter, ToolRegistry};
 use caudra_agent::workflow::{RuntimeDeps, WorkflowHandle, WorkflowRuntime};
 use caudra_agent::{
-    AgentConfig, AgentMode, AgentParams, BaselineGate, CancelMap, Envelope, McpHandle,
-    SubagentHistoryStore, ToolOutputLines, agent,
+    AgentConfig, AgentMode, AgentParams, CancelMap, Envelope, McpHandle, SubagentHistoryStore,
+    ToolOutputLines, agent,
 };
 use caudra_config::{Feature, ModelPolicy};
 use caudra_lua::EventHandle;
@@ -71,9 +72,10 @@ pub(crate) struct WorkflowSpawn<'a> {
     /// The agent loop's own, or a workflow agent and the user's run could
     /// both edit one file at once and the later write would drop the other.
     pub(crate) path_locks: Arc<PathLocks>,
-    /// The session's, not the runtime's: a workflow agent's write has to be
-    /// recoverable through the same revert point as the user's own run.
-    pub(crate) baseline: Option<BaselineGate>,
+    /// The session's recorder when the runtime starts, so a workflow agent's
+    /// write reverts with the user's own run. A workspace change restarts the
+    /// runtime, which picks up the rebound one.
+    pub(crate) changes: Option<ChangeRecorder>,
     pub(crate) workspace_session: Option<WorkspaceSession>,
     pub(crate) remote_project_context:
         Option<Arc<caudra_agent::remote_project_context::RemoteProjectContext>>,
@@ -148,7 +150,7 @@ impl WorkflowSession {
             timeouts: spawn.timeouts,
             file_tracker: FileReadTracker::fresh(),
             path_locks: spawn.path_locks,
-            baseline: spawn.baseline.clone(),
+            changes: spawn.changes,
             prompt_slots: Arc::new(spawn.lua_handle.collect_prompt_slots(spawn.config)),
             prompt_profiles: Arc::clone(spawn.prompt_profiles),
             default_task_prompt_profile_name: Arc::clone(&spawn.task_prompt_profile_name),

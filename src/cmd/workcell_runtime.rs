@@ -261,8 +261,16 @@ impl WorkcellRuntime {
         };
         let workspace_session = WorkspaceSession::new(workspace, session_binding, root_cursor)
             .map_err(WorkcellRuntimeError::Workspace)?;
-        require_remote_snapshot_lifecycle(&workspace_session)
-            .map_err(WorkcellRuntimeError::Workspace)?;
+        // A sandbox runs the Workcell its image ships, so one without change
+        // records is out of date. Any other host may lack them: its calls run
+        // unrecorded and file revert is unavailable.
+        if sandbox_lifecycle.is_some() {
+            workspace_session
+                .workspace()
+                .capabilities()
+                .require(WorkspaceCapability::ChangeRecords)
+                .map_err(WorkcellRuntimeError::Workspace)?;
+        }
         let local_documents = Arc::new(LocalDocumentStore::remote(
             storage.clone(),
             workspace_session.binding(),
@@ -633,27 +641,6 @@ pub fn connect_control(
         workspace,
         _lifecycle: lifecycle,
     })
-}
-
-fn require_remote_snapshot_lifecycle(workspace: &WorkspaceSession) -> Result<(), WorkspaceError> {
-    for capability in [
-        WorkspaceCapability::SnapshotCapture,
-        WorkspaceCapability::SnapshotStatus,
-        WorkspaceCapability::SnapshotPrepareRestore,
-        WorkspaceCapability::SnapshotPrepareUnrevert,
-        WorkspaceCapability::SnapshotAcknowledge,
-        WorkspaceCapability::SnapshotPrepareCleanup,
-        WorkspaceCapability::SnapshotExecute,
-        WorkspaceCapability::SnapshotOperationStatus,
-        WorkspaceCapability::SnapshotRelease,
-    ] {
-        workspace.workspace().capabilities().require(capability)?;
-    }
-    let services = workspace.workspace().services();
-    if services.snapshot_read.is_none() || services.snapshot_mutation.is_none() {
-        return Err(WorkspaceError::Unavailable);
-    }
-    Ok(())
 }
 
 #[cfg(test)]

@@ -18,7 +18,7 @@ use std::sync::{LazyLock, Mutex};
 
 use caudra_providers::estimate_tokens;
 use caudra_storage::local_documents::{LocalDocument, LocalDocumentStore};
-use caudra_workspace::{LocalDocumentRef, MemoryRef};
+use caudra_workspace::{LocalDocumentRef, MemoryRef, RecordScope};
 use serde_json::Value;
 
 use crate::permissions::{PermissionResource, PermissionResourceKind, PermissionRisk};
@@ -721,6 +721,11 @@ impl ToolInvocation for MemoryCall {
         }
     }
 
+    /// Notes are Caudra's own state, which no session's file revert covers.
+    fn record_scope(&self, _ctx: &ToolContext, _root: &Path) -> Option<RecordScope> {
+        None
+    }
+
     fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
         Box::pin(async move {
             let answer = match self.run_for_context(ctx) {
@@ -1382,6 +1387,19 @@ mod tests {
         assert_eq!(write.mutation_targets(&ctx), vec![temp.path().join("a.md")]);
         let list = call_in(json!({ "command": "list" }), temp.path());
         assert!(list.mutation_targets(&ctx).is_empty());
+    }
+
+    #[test]
+    fn a_note_is_never_recorded_even_inside_the_session_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let write = call_in(
+            json!({ "command": "write", "path": "a.md", "content": "x" }),
+            temp.path(),
+        );
+        assert_eq!(
+            write.record_scope(&stub_ctx(&AgentMode::Build), temp.path()),
+            None
+        );
     }
 
     /// The registration is mutating so a write is gated; browsing has to

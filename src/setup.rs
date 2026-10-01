@@ -1,4 +1,5 @@
 use std::fmt::Display;
+use std::sync::Arc;
 use std::time::Duration;
 
 use color_eyre::Result;
@@ -11,7 +12,9 @@ use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
 use caudra_storage::log::{LogSinkGuard, RotatingFileWriter};
 use caudra_storage::model::read_model;
+use caudra_storage::sessions::change_stores;
 use caudra_storage::sessions::{StoredMode, set_eager_load_limit};
+use caudra_workcell::LocalChangeStores;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
@@ -215,6 +218,17 @@ pub fn apply_storage_limits(storage_config: &caudra_config::StorageConfig) {
         },
     };
     set_eager_load_limit(megabytes.saturating_mul(1024 * 1024) as usize);
+}
+
+/// Hands storage the local change stores, which it cannot reach itself:
+/// `caudra-workcell` depends on it. Deleting or trimming a session queues the
+/// release of its records, and the job waits for a process that has done
+/// this. Call it once, after `init_logging`.
+pub fn register_change_stores() {
+    match LocalChangeStores::new() {
+        Ok(stores) => change_stores::register_change_stores(Arc::new(stores)),
+        Err(error) => tracing::warn!(%error, "change stores unreachable; record releases wait"),
+    }
 }
 
 /// Headless runs without a session id still count, they just stay

@@ -22,7 +22,7 @@ use caudra_agent::prompt::profile::{PromptProfileCatalog, SystemPromptProfile};
 use caudra_agent::tools::{ToolAudience, ToolFilter, ToolRegistry};
 use caudra_agent::worktree::Backend;
 use caudra_config::sandbox::SandboxName;
-use caudra_config::{Config, Feature, RetentionConfig};
+use caudra_config::{Config, Feature, StorageConfig};
 use caudra_lua::PluginHost;
 use caudra_providers::model::Model;
 use caudra_storage::id::CaudraId;
@@ -35,9 +35,9 @@ use caudra_storage::state::{WorkspaceTabs, read_workspace_tabs};
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
 use caudra_storage::{StateClass, StateDir};
 use caudra_ui::{
-    AppSession, ExitSummary, HerdrReporter, PatternDiscoveryMode, PatternDiscoveryOutcome,
-    PatternDiscoveryReport, PatternSuggestionLoader, PermissionAuthorityBinding, RunOutcome,
-    SessionRelocationHandoff, SessionTab,
+    AppSession, ChangeServiceFactory, ExitSummary, HerdrReporter, PatternDiscoveryMode,
+    PatternDiscoveryOutcome, PatternDiscoveryReport, PatternSuggestionLoader,
+    PermissionAuthorityBinding, RunOutcome, SessionRelocationHandoff, SessionTab,
 };
 use caudra_workcell::editor_adapter::{
     PermissionEditorContext, PermissionEditorRuntime, permission_authority_provider,
@@ -83,6 +83,10 @@ const RELOCATION_USAGE_EMPTY: &str =
 const RELOCATION_PLANS_DETACHED: &str = "Active source plans and approvals were detached";
 const RELOCATION_APPROVALS_DETACHED: &str =
     "Approvals were detached; plans stay attached, since both directories share project state";
+/// Relocation clears record coverage, so file revert cannot reach a change
+/// recorded in the old directory's store.
+const RELOCATION_FILES_UNMOVED: &str =
+    "Files were not moved, and file changes made before the move can no longer be reverted";
 const PATTERN_LOAD_QUEUE: usize = 32;
 const PATTERN_CACHE_PROJECTS: usize = 8;
 const PATTERN_CACHE_BYTES_PER_PROJECT: usize = 256 * 1024;
@@ -476,15 +480,17 @@ struct RetentionSweeper {
 }
 
 impl RetentionSweeper {
-    fn spawn(storage: StateDir, retention: RetentionConfig) -> Self {
+    fn spawn(storage: StateDir, config: StorageConfig) -> Self {
         if storage.is_ephemeral() {
             return Self { _stop: None };
         }
+        let retention = config.retention;
         let policy = SweepPolicy {
             group_by: retention.group_by,
             interval: Duration::from_secs(retention.sweep_interval_hours * SECONDS_PER_HOUR),
             trim: retention.trim,
             forget: retention.forget,
+            store_budget: config.snapshots.store_budget(),
         };
         if policy.interval.is_zero() {
             return Self { _stop: None };
@@ -973,7 +979,7 @@ fn relocate_stopped_sessions(
         RELOCATION_PLANS_DETACHED
     };
     let committed = format!(
-        "Relocation committed: moved {} session(s) to {}. {usage}. {detached}. Files and old workspace snapshots were not moved",
+        "Relocation committed: moved {} session(s) to {}. {usage}. {detached}. {RELOCATION_FILES_UNMOVED}",
         result.sessions_moved, relocation.request.destination
     );
     let mut retained = Vec::new();
@@ -1348,6 +1354,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
     let _logging = setup::init_logging(&stack.config.storage);
     let init_logging_ms = lap();
     setup::apply_storage_limits(&stack.config.storage);
+    setup::register_change_stores();
     setup::init_telemetry(&stack.config.telemetry);
     setup::install_panic_log_hook();
     setup::warn_ignored_provider_fields();
@@ -1507,7 +1514,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
     }
     let mut teardown = Teardown::default();
     let mut herdr_reporter = HerdrReporter::from_env();
-    let mut sweeper = RetentionSweeper::spawn(storage.clone(), stack.config.storage.retention);
+    let mut sweeper = RetentionSweeper::spawn(storage.clone(), stack.config.storage);
     let mut committed_relocation: Option<String> = None;
     let sandboxes = cli.startup.features.enabled(Feature::Sandboxes);
 
@@ -1597,6 +1604,17 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                 })
             })
         };
+        let change_factory: Option<ChangeServiceFactory> =
+            workcell_runtime.local_host().is_some().then(|| {
+                let runtime = Arc::clone(&workcell_runtime);
+                let state = storage.clone();
+                let factory: ChangeServiceFactory = Arc::new(move |cwd: &Path| {
+                    runtime
+                        .local_host()
+                        .map(|host| host.change_service(cwd, &state))
+                });
+                factory
+            });
         let worktrees = Backend::select(&stack.config.worktrees, HerdrEnv::detect());
         let outcome = caudra_ui::run(
             caudra_ui::EventLoopParams {
@@ -1611,6 +1629,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                 config: stack.config.agent.clone(),
                 ui_config: stack.config.ui.clone(),
                 snapshots: stack.config.storage.snapshots,
+                change_factory,
                 allow_workspace_recovery: committed_relocation.is_none(),
                 input_history_size: stack.config.storage.input_history_size,
                 max_log_files: stack.config.storage.max_log_files,
@@ -1794,7 +1813,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                 warnings = new_warnings;
                 warnings.push(format!("Attached {} in a new session. Source sessions are saved; no history, grants or files were copied. Exit detaches only.", attachment.name));
                 stack = new_stack;
-                sweeper = RetentionSweeper::spawn(storage.clone(), stack.config.storage.retention);
+                sweeper = RetentionSweeper::spawn(storage.clone(), stack.config.storage);
                 committed_relocation = None;
                 drop(stopped);
                 continue;
@@ -1989,7 +2008,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
         if tabs.is_empty() {
             tabs.push(fresh_tab(&new_stack.model.spec(), &reload_cwd, &storage)?);
         }
-        sweeper = RetentionSweeper::spawn(storage.clone(), new_stack.config.storage.retention);
+        sweeper = RetentionSweeper::spawn(storage.clone(), new_stack.config.storage);
         stack = new_stack;
         warnings.extend(new_warnings);
         focused = focused.min(tabs.len() - 1);
@@ -2614,6 +2633,7 @@ mod tests {
                 id,
                 parent_id: None,
                 supersedes: None,
+                stands_for: None,
                 group_id: id,
                 kind: HistoryItemKind::ToolCall {
                     call_id: id.to_string(),
@@ -3447,7 +3467,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let storage = StateDir::split(temp.path().join("volatile"), temp.path().join("persistent"));
 
-        let sweeper = RetentionSweeper::spawn(storage, RetentionConfig::default());
+        let sweeper = RetentionSweeper::spawn(storage, StorageConfig::default());
 
         assert!(sweeper._stop.is_none());
     }

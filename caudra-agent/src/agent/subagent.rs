@@ -1480,7 +1480,7 @@ fn build(
             // Shared, not fresh: a subagent tracks its own reads but must not
             // write a file a sibling agent is writing.
             path_locks: Arc::clone(&ctx.path_locks),
-            baseline: ctx.baseline.clone(),
+            changes: ctx.changes.clone(),
             prompt_slots: Arc::clone(&ctx.prompt_slots),
             prompt_profiles: Arc::clone(&ctx.prompt_profiles),
             default_task_prompt_profile_name: resolved.default_task_prompt_profile_name,
@@ -1567,6 +1567,8 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::agent::change_recording::ChangeRecorder;
+    use crate::agent::change_recording::fixture::{FakeChanges, holder};
     use crate::context::{
         ContextInventory, ContextKey, ContextReadiness, ContextSnapshot, ContextStore,
         ContextUsage, ContextWindow,
@@ -1591,6 +1593,7 @@ mod tests {
     const ROUTING_FAST: &str = "anthropic/claude-haiku-4-5";
     const EFFECT_TEST_TIMEOUT: Duration = Duration::from_secs(10);
     const DUPLICATE_CALL_ERROR: &str = "duplicates call ID";
+    const SUBAGENT_ROOT: &str = "/work/project";
 
     struct RevisionChangingProvider {
         permissions: Arc<PermissionManager>,
@@ -2042,6 +2045,22 @@ mod tests {
 
             assert_eq!(subagent.params.model.spec(), ctx.model.spec());
             assert!(Arc::ptr_eq(&subagent.params.provider, &ctx.provider));
+            subagent.close();
+        });
+    }
+
+    #[test]
+    fn a_subagent_records_for_the_root_session() {
+        smol::block_on(async {
+            let mut ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            ctx.changes = Some(Arc::new(FakeChanges::default()).recorder(Path::new(SUBAGENT_ROOT)));
+
+            let mut subagent = open_task(&ctx, task_options(None)).await.unwrap();
+
+            assert_eq!(
+                subagent.params.changes.as_ref().map(ChangeRecorder::holder),
+                Some(&holder())
+            );
             subagent.close();
         });
     }

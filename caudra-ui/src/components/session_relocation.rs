@@ -40,8 +40,8 @@ const SOURCE_HINT: &str =
     "Choose one exact stored cwd, including missing directories. Descendants are not included.";
 const DESTINATION_HINT: &str =
     "A destination session supplies its directory only; its conversation is not merged or changed.";
-const FILES_UNCHANGED: &str =
-    "No files or old workspace snapshots are moved. Destination sessions stay intact.";
+const FILES_UNCHANGED: &str = "No files are moved. Destination sessions stay intact.";
+const NO_REVERT_ACROSS_MOVE: &str = "File changes made before the move can no longer be reverted.";
 const CLOSING_LABEL: &str = "Other open tabs to save and close";
 const AFFECTED_LABEL: &str = "Affected sessions";
 const DESTINATIONS_LABEL: &str = "destinations";
@@ -492,7 +492,7 @@ impl SessionRelocationPicker {
             flow.other_open_count
         };
         let mut info = format!(
-            "Source: {source}\nDestination: {}\n{AFFECTED_LABEL}: {}\n{CLOSING_LABEL}: {closing}\n{FILES_UNCHANGED}",
+            "Source: {source}\nDestination: {}\n{AFFECTED_LABEL}: {}\n{CLOSING_LABEL}: {closing}\n{FILES_UNCHANGED}\n{NO_REVERT_ACROSS_MOVE}",
             request.destination,
             request.sessions.len(),
         );
@@ -704,10 +704,10 @@ mod tests {
     use super::{
         AFFECTED_LABEL, CANNOT_OPEN, CLOSING_LABEL, CONFIRM, CUSTOM_DIRECTORY, DESTINATIONS_LABEL,
         EMPTY_DESTINATION, EMPTY_SELECTION, EntryKind, FILES_UNCHANGED, MISSING_HOME,
-        NOT_DIRECTORY, PROJECT_USAGE, PROJECT_USAGE_AGGREGATED, PROJECT_USAGE_PRECONDITION,
-        PROJECT_USAGE_SCOPE, PROJECT_USAGE_UNCHANGED, SAME_DIRECTORY, SESSION_USAGE_UNCHANGED,
-        SessionRelocationAction, SessionRelocationPicker, Stage, UNSUPPORTED_TILDE,
-        resolve_destination,
+        NO_REVERT_ACROSS_MOVE, NOT_DIRECTORY, PROJECT_USAGE, PROJECT_USAGE_AGGREGATED,
+        PROJECT_USAGE_PRECONDITION, PROJECT_USAGE_SCOPE, PROJECT_USAGE_UNCHANGED, SAME_DIRECTORY,
+        SESSION_USAGE_UNCHANGED, SessionRelocationAction, SessionRelocationPicker, Stage,
+        UNSUPPORTED_TILDE, resolve_destination,
     };
     use crate::components::keybindings::key;
 
@@ -910,6 +910,7 @@ mod tests {
         let mut picker = opened(root.path(), false, Some(destination.clone()));
         let (text, confirm) = render(&mut picker);
         assert!(text.contains(FILES_UNCHANGED));
+        assert!(text.contains(NO_REVERT_ACROSS_MOVE));
         assert!(text.contains(SESSION_USAGE_UNCHANGED));
         assert!(!text.contains(PROJECT_USAGE));
         assert!(matches!(

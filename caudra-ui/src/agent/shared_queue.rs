@@ -808,6 +808,7 @@ impl InterruptSource for QueueReceiver {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::iter::once;
     use std::path::PathBuf;
     use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
@@ -1103,7 +1104,7 @@ mod tests {
                 images: Vec::new(),
                 mentions: Vec::new(),
                 commits: Vec::new(),
-                paste_ranges: vec![0..EDITED_PROMPT.len()],
+                paste_ranges: once(0..EDITED_PROMPT.len()).collect(),
             },
         ));
         assert!(sender.move_down(id));
@@ -1113,7 +1114,7 @@ mod tests {
             PendingPrompt {
                 text: EDITED_PROMPT.into(),
                 images: Vec::new(),
-                paste_ranges: vec![0..EDITED_PROMPT.len()],
+                paste_ranges: once(0..EDITED_PROMPT.len()).collect(),
                 admission: PromptAdmission::Steer,
                 mode: Some(stored),
             }

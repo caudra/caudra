@@ -9,9 +9,8 @@ use std::{
 use async_trait::async_trait;
 use caudra_agent::agent::tool_dispatch::{self, Emit};
 use caudra_agent::tools::{
-    FileReadTracker, ToolContext, ToolEffect, ToolRegistry, interpreter_ctx, stale_read_message,
+    FileReadTracker, ToolEffect, ToolRegistry, interpreter_ctx, stale_read_message,
 };
-use caudra_agent::workspace_baseline::{BaselineGate, WorkspaceBaseline};
 use caudra_agent::{
     AgentEvent, AgentMode, CancelToken, EventSender, ToolOutput,
     permissions::{
@@ -30,13 +29,10 @@ use caudra_config::sandbox::TransferPolicy;
 use caudra_config::workcell::{
     ExpectedWorkcellId, RemoteWorkcellSelection, WorkcellEndpoint, WorkcellSourceRef,
 };
-use caudra_config::{
-    Effect, FeatureFlags, PermissionRule, PermissionsConfig, SnapshotsConfig, ToolKey,
-};
+use caudra_config::{Effect, FeatureFlags, PermissionRule, PermissionsConfig, ToolKey};
 use caudra_storage::{
     StateDir,
     auth::{WorkcellCredential, WorkcellCredentialName, WorkcellCredentialRef},
-    id::CaudraId,
     remote_operation_journal::{RemoteOperationJournal, RemoteOperationState},
 };
 use caudra_workbench::{
@@ -61,13 +57,13 @@ use caudra_workspace::{
     WorkspaceMutationService, WorkspaceTransferService, WriteContent,
 };
 use caudra_workspace::{
-    CheckpointId, DirectoryNavigation, ListRequest, MutationResult, OperationState,
-    OperationStatus, ReadBytesRequest, ReadTextRequest, ResourceRevision, ResourceSelector,
-    ScmDiscoverRequest, ScmStatusRequest, SearchRequest, SessionBindingId, SnapshotCaptureLimits,
-    SnapshotCaptureRequest, SnapshotInspectRequest, SnapshotOperationPreview, ToolPrepareRequest,
-    WatchOpenRequest, WatchPollRequest, WatchPollState, WorkspaceAssetService, WorkspaceCursor,
-    WorkspacePath, WorkspaceReadService, WorkspaceScmReadService, WorkspaceSearchService,
-    WorkspaceSnapshotMutationService, WorkspaceSnapshotReadService, WorkspaceWatchService,
+    ChangeOperationPreview, ChangeOperationResult, DirectoryNavigation, ListRequest,
+    MutationResult, OperationState, OperationStatus, ReadBytesRequest, ReadTextRequest,
+    RecordHolder, RecordLimits, RecordRequest, RecordScope, RecordState, ResourceRevision,
+    ResourceSelector, ScmDiscoverRequest, ScmStatusRequest, SearchRequest, SessionBindingId,
+    ToolPrepareRequest, WatchOpenRequest, WatchPollRequest, WatchPollState, WorkspaceAssetService,
+    WorkspaceChangeService, WorkspaceCursor, WorkspacePath, WorkspaceReadService,
+    WorkspaceScmReadService, WorkspaceSearchService, WorkspaceWatchService,
 };
 use caudra_workspace::{ResourceKind, WorkspaceSession};
 use caudra_workspace::{
@@ -190,20 +186,31 @@ const EDITOR_NAMESPACE: &str =
     "a byte read must report the revision a conditional write is checked against";
 const EDITOR_SAVE_REFUSED: &str = "an edited remote buffer must save against the revision it read";
 const EDITOR_STALE_ACCEPTED: &str = "a concurrent remote modification must refuse the save";
-/// A full operation ledger names no limit. Only snapshot refusals do.
+/// A full operation ledger names no limit. Only store refusals do.
 const LEDGER_FULL: WorkspaceError = WorkspaceError::QuotaExceeded {
     limit: None,
     maximum: None,
 };
-const CAPTURE_LIMITS: SnapshotCaptureLimits = SnapshotCaptureLimits {
+const CHANGE_LIMITS: RecordLimits = RecordLimits {
     max_files: 10_000,
     max_file_bytes: 16 * 1024 * 1024,
     max_total_bytes: 256 * 1024 * 1024,
 };
+const CHANGE_HOLDER: &str = "integration-holder";
+const CHANGE_DIRECTORY: &str = "nested";
+const CHANGE_FILE: &str = "recorded.txt";
+const CHANGE_CREATED: &str = "recorded-created.txt";
+/// Beside the record's directory, so a record of that directory leaves it alone.
+const CHANGE_CANARY: &str = "recorded-canary.txt";
+const CHANGE_BEFORE: &str = "before the recorded call\n";
+const CHANGE_AFTER: &str = "after the recorded call\n";
+const CHANGE_PATHS_CALL: &str = "paths-call";
+const CHANGE_WORKSPACE_CALL: &str = "workspace-call";
+const UNRECORDED_FILE: &str = "unrecorded.txt";
 const CAPTURE_WORKLOAD_FILES: u32 = 20_000;
 const CAPTURE_WORKLOAD_DIRECTORIES: u32 = 100;
 const CAPTURE_WORKLOAD_FILE_BYTES: usize = 128;
-const CAPTURE_WORKLOAD_CHECKPOINTS: [&str; 2] = ["workload-first", "workload-unchanged"];
+const CAPTURE_WORKLOAD_ROUNDS: [&str; 2] = ["workload-first", "workload-unchanged"];
 const METADATA_SMALL: &str = "small.txt";
 const METADATA_NESTED: &str = "nested/other.txt";
 const METADATA_BINARY: &str = "huge.bin";
@@ -1765,8 +1772,6 @@ async fn concurrent_registry_regressions(
     let fault = PathBuf::from(env::var_os("WORKCELL_TEST_FAULT").unwrap());
     let gate = fault.with_file_name("batch-execute-gate");
     let trace = fault.with_file_name(RPC_REQUEST_TRACE);
-    let baseline_state = tempfile::tempdir().unwrap();
-    let baseline = with_remote_baseline(&mut ctx, client, baseline_state.path());
     let first = json!({"command":format!("printf '{BATCH_CONTENT}' > {BATCH_FIRST}; printf '{BATCH_CONTENT}'")});
     let second = json!({"command":format!("printf '{BATCH_CONTENT}' > {BATCH_SECOND}; printf '{BATCH_CONTENT}'")});
     let write = json!({"filePath":BATCH_WRITE,"content":BATCH_CONTENT});
@@ -1937,10 +1942,6 @@ async fn concurrent_registry_regressions(
             BATCH_CONTENT
         );
         assert!(client.pending_remote_operations().is_empty());
-        assert!(baseline.is_captured());
-        let mut next_ctx = ctx.clone();
-        let next_head = Some(CaudraId::generate());
-        next_ctx.baseline = Some(BaselineGate::new(baseline.clone(), next_head));
         fs::write(
             fault.with_file_name("batch-prepare-barrier"),
             "three concurrent preparations",
@@ -1952,7 +1953,7 @@ async fn concurrent_registry_regressions(
             "batch-rewrite".into(),
             "file_write",
             &write,
-            &next_ctx,
+            &ctx,
             Emit::Silent,
         );
         let (first_result, (second_result, write_result)) = futures_lite::future::zip(
@@ -1967,12 +1968,11 @@ async fn concurrent_registry_regressions(
         ] {
             assert!(
                 !done.is_error,
-                "fresh snapshot concurrent {name}: {}",
+                "second concurrent {name}: {}",
                 done.output.as_text()
             );
         }
         assert!(client.pending_remote_operations().is_empty());
-        assert!(baseline.remote_capture(next_head).unwrap().is_some());
         assert!(
             permissions
                 .structured_conversation_rules_snapshot()
@@ -1989,7 +1989,7 @@ async fn concurrent_registry_regressions(
     })
     .await;
     eprintln!(
-        "PASS concurrent two-shell/file_write batch: nothing queues behind an in-flight shell, all artifacts and shell output, no unresolved rows, unsynchronized fresh automatic snapshot"
+        "PASS concurrent two-shell/file_write batch: nothing queues behind an in-flight shell, all artifacts and shell output, no unresolved rows"
     );
     let beside_running = async {
         fs::write(root.join(SHARED_EDIT_FILE), SHARED_EDIT_ORIGINAL).unwrap();
@@ -2086,8 +2086,6 @@ async fn lapsed_preparation_regression(client: &RemoteWorkcellClient, root: &Pat
         )
         .unwrap(),
     );
-    let baseline_state = tempfile::tempdir().unwrap();
-    with_remote_baseline(&mut ctx, client, baseline_state.path());
     let fault = PathBuf::from(env::var_os("WORKCELL_TEST_FAULT").unwrap());
     let shorten = fault.with_file_name("short-preparation-ttl");
     let expiry = fault.with_file_name("short-preparation-expiry");
@@ -2176,24 +2174,6 @@ async fn lapsed_preparation_regression(client: &RemoteWorkcellClient, root: &Pat
     eprintln!(
         "PASS a command approved after its preparation lapsed renews it, runs exactly once, and leaves no unresolved row"
     );
-}
-
-/// Gives `ctx` the revert point a mutating remote call captures first, kept in
-/// `state`.
-fn with_remote_baseline(
-    ctx: &mut ToolContext,
-    client: &RemoteWorkcellClient,
-    state: &Path,
-) -> Arc<WorkspaceBaseline> {
-    let baseline = WorkspaceBaseline::new_workspace_session(
-        StateDir::from_path(state.into()),
-        CaudraId::generate(),
-        ctx.workspace_session.clone().unwrap(),
-        client.stored_binding().clone(),
-        SnapshotsConfig::default(),
-    );
-    ctx.baseline = Some(BaselineGate::new(baseline.clone(), None));
-    baseline
 }
 
 fn unix_millis() -> u128 {
@@ -2401,8 +2381,6 @@ async fn canonical_registry_regressions(client: &RemoteWorkcellClient, root: &Pa
     .await;
     let pending = client.pending_remote_operations();
     assert_eq!(pending.len(), 1);
-    let baseline_state = tempfile::tempdir().unwrap();
-    with_remote_baseline(&mut ctx, client, baseline_state.path());
     for (id, name, input) in [
         ("index-beside-uncertain", "file_index", json!({"path":"."})),
         (
@@ -3423,7 +3401,250 @@ fn unsupported_server() {
     eprintln!("PASS unsupported server refused before catalog or transfer downgrade");
 }
 
-async fn capture_workload(client: &RemoteWorkcellClient, root: &Path) {
+/// A host started without a change store: file revert is unavailable and
+/// calls still run.
+#[test]
+fn unrecorded_server() {
+    if env::var("WORKCELL_TEST_UNRECORDED").as_deref() != Ok("1") {
+        return;
+    }
+    smol::block_on(async {
+        let state = tempfile::tempdir().unwrap();
+        let client = metadata_client(state.path(), "unrecorded-session").await;
+        let session = WorkspaceSession::new(
+            client.workspace_handle().unwrap(),
+            client.session_binding().clone(),
+            client.root_cursor().clone(),
+        )
+        .unwrap();
+        assert!(session.changes().is_none());
+        tool(
+            &client,
+            client.root_cursor(),
+            "file_write",
+            json!({"filePath":UNRECORDED_FILE,"content":CHANGE_AFTER}),
+        )
+        .await;
+        let root = PathBuf::from(env::var_os("WORKCELL_TEST_ROOT").unwrap());
+        assert_eq!(
+            fs::read_to_string(root.join(UNRECORDED_FILE)).unwrap(),
+            CHANGE_AFTER
+        );
+        fs::remove_file(root.join(UNRECORDED_FILE)).unwrap();
+        eprintln!("PASS a host without change records has no change service and its calls run");
+    });
+}
+
+fn change_service(
+    client: &RemoteWorkcellClient,
+    cursor: &WorkspaceCursor,
+) -> Arc<dyn WorkspaceChangeService> {
+    client
+        .workspace_handle()
+        .unwrap()
+        .services()
+        .changes
+        .as_ref()
+        .expect("the host keeps change records")
+        .bind(client.session_binding(), cursor)
+}
+
+fn change_request(scope: RecordScope, call: &str) -> RecordRequest {
+    RecordRequest {
+        scope,
+        holder: RecordHolder::new(CHANGE_HOLDER).unwrap(),
+        client: json!({"call":call}),
+        limits: CHANGE_LIMITS,
+    }
+}
+
+/// Records made at a nested cursor: one of named paths around a write, one of
+/// the whole directory around a shell, then revert, unrevert, acknowledge and
+/// cleanup.
+async fn change_records(client: &RemoteWorkcellClient, root: &Path) {
+    let nested = client
+        .resolve_directory_cursor(
+            client.session_binding(),
+            client.root_cursor(),
+            &WorkspacePath::new(CHANGE_DIRECTORY).unwrap(),
+        )
+        .await
+        .unwrap()
+        .cursor;
+    let changes = change_service(client, &nested);
+    let holder = RecordHolder::new(CHANGE_HOLDER).unwrap();
+    let directory = root.join(CHANGE_DIRECTORY);
+    fs::write(directory.join(CHANGE_FILE), CHANGE_BEFORE).unwrap();
+    fs::write(root.join(CHANGE_CANARY), CHANGE_BEFORE).unwrap();
+
+    let ticket = changes
+        .begin(&change_request(
+            RecordScope::Paths(BTreeSet::from([WorkspacePath::new(CHANGE_FILE).unwrap()])),
+            CHANGE_PATHS_CALL,
+        ))
+        .await
+        .unwrap();
+    tool(
+        client,
+        &nested,
+        "file_write",
+        json!({"filePath":CHANGE_FILE,"content":CHANGE_AFTER}),
+    )
+    .await;
+    let named = changes
+        .finish(&ticket)
+        .await
+        .unwrap()
+        .expect("the write is recorded");
+    assert_eq!((named.paths, named.unrecorded), (1, 0));
+    let ticket = changes
+        .begin(&change_request(
+            RecordScope::Workspace,
+            CHANGE_WORKSPACE_CALL,
+        ))
+        .await
+        .unwrap();
+    tool(
+        client,
+        &nested,
+        "shell",
+        json!({
+            "command":format!("printf '{CHANGE_AFTER}' > {CHANGE_CREATED}; printf '{CHANGE_AFTER}' > ../{CHANGE_CANARY}"),
+            "timeoutSec":1,
+        }),
+    )
+    .await;
+    let whole = changes
+        .finish(&ticket)
+        .await
+        .unwrap()
+        .expect("the shell is recorded");
+    assert_eq!((whole.paths, whole.unrecorded), (1, 0));
+    let page = changes.records(&holder, None, LIMIT).await.unwrap();
+    assert_eq!(
+        page.records
+            .iter()
+            .map(|record| (record.seq, record.client.clone(), record.state))
+            .collect::<Vec<_>>(),
+        [
+            (
+                named.seq,
+                json!({"call":CHANGE_PATHS_CALL}),
+                RecordState::Applied
+            ),
+            (
+                whole.seq,
+                json!({"call":CHANGE_WORKSPACE_CALL}),
+                RecordState::Applied
+            ),
+        ]
+    );
+
+    let revert = changes
+        .prepare_revert(&holder, &[named.seq, whole.seq])
+        .await
+        .unwrap();
+    let ChangeOperationPreview::Revert(preview) = &revert.preview else {
+        panic!("revert preview: {:?}", revert.preview)
+    };
+    assert_eq!(
+        preview
+            .planned
+            .iter()
+            .map(|planned| planned.path.as_str().to_owned())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            format!("{CHANGE_DIRECTORY}/{CHANGE_FILE}"),
+            format!("{CHANGE_DIRECTORY}/{CHANGE_CREATED}"),
+        ])
+    );
+    let reverted = changes.execute(&revert).await.unwrap();
+    assert!(
+        matches!(
+            reverted.state,
+            OperationState::Completed {
+                result: ChangeOperationResult::Revert(_),
+                ..
+            }
+        ),
+        "{reverted:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(directory.join(CHANGE_FILE)).unwrap(),
+        CHANGE_BEFORE
+    );
+    assert!(!directory.join(CHANGE_CREATED).exists());
+    assert_eq!(
+        fs::read_to_string(root.join(CHANGE_CANARY)).unwrap(),
+        CHANGE_AFTER
+    );
+    assert_eq!(changes.status(&holder).await.unwrap().pending.len(), 1);
+
+    let unrevert = changes.prepare_unrevert(&holder).await.unwrap();
+    let unreverted = changes.execute(&unrevert).await.unwrap();
+    assert!(
+        matches!(unreverted.state, OperationState::Completed { .. }),
+        "{unreverted:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(directory.join(CHANGE_FILE)).unwrap(),
+        CHANGE_AFTER
+    );
+    assert_eq!(
+        fs::read_to_string(directory.join(CHANGE_CREATED)).unwrap(),
+        CHANGE_AFTER
+    );
+    assert!(changes.status(&holder).await.unwrap().pending.is_empty());
+
+    client.reconnect(&CancellationToken::new()).await.unwrap();
+    let revert = changes.prepare_revert(&holder, &[named.seq]).await.unwrap();
+    changes.execute(&revert).await.unwrap();
+    assert!(
+        changes
+            .acknowledge(&holder)
+            .await
+            .unwrap()
+            .pending
+            .is_empty()
+    );
+    assert_eq!(
+        changes
+            .records(&holder, None, LIMIT)
+            .await
+            .unwrap()
+            .records
+            .iter()
+            .map(|record| record.seq)
+            .collect::<Vec<_>>(),
+        [whole.seq]
+    );
+
+    let cleanup = changes.prepare_cleanup(0).await.unwrap();
+    assert!(matches!(
+        cleanup.preview,
+        ChangeOperationPreview::Cleanup(_)
+    ));
+    let cleaned = changes.execute(&cleanup).await.unwrap();
+    assert!(
+        matches!(
+            cleaned.state,
+            OperationState::Completed {
+                result: ChangeOperationResult::Cleanup(_),
+                ..
+            }
+        ),
+        "{cleaned:?}"
+    );
+    let page = changes.records(&holder, None, LIMIT).await.unwrap();
+    assert!(page.records.is_empty());
+    assert!(page.evicted_through.is_some());
+    assert!(client.pending_remote_operations().is_empty());
+    eprintln!(
+        "PASS change records at a nested cursor: named and whole-directory records, records page, revert, unrevert, reconnect, acknowledge, cleanup"
+    );
+}
+
+async fn record_workload(client: &RemoteWorkcellClient, root: &Path) {
     if env::var("WORKCELL_TEST_CAPTURE_WORKLOAD").as_deref() != Ok("1") {
         return;
     }
@@ -3453,35 +3674,23 @@ async fn capture_workload(client: &RemoteWorkcellClient, root: &Path) {
         .resolve_directory_cursor(client.session_binding(), client.root_cursor(), &scope)
         .await
         .unwrap();
-    for checkpoint in CAPTURE_WORKLOAD_CHECKPOINTS {
+    let changes = change_service(client, &resolved.cursor);
+    for round in CAPTURE_WORKLOAD_ROUNDS {
         let started = Instant::now();
-        let result = WorkspaceSnapshotReadService::capture(
-            client,
-            client.session_binding(),
-            &resolved.cursor,
-            &SnapshotCaptureRequest {
-                checkpoint_id: CheckpointId::new(checkpoint).unwrap(),
-                label: None,
-                limits: SnapshotCaptureLimits {
-                    max_files: u64::from(CAPTURE_WORKLOAD_FILES),
-                    ..CAPTURE_LIMITS
+        let ticket = changes
+            .begin(&RecordRequest {
+                limits: RecordLimits {
+                    max_files: CAPTURE_WORKLOAD_FILES,
+                    ..CHANGE_LIMITS
                 },
-            },
-        )
-        .await
-        .unwrap();
-        assert!(!result.reused_checkpoint);
-        assert_eq!(result.snapshot.scope, scope);
-        assert_eq!(result.snapshot.file_count, CAPTURE_WORKLOAD_FILES);
-        assert_eq!(
-            result.snapshot.total_bytes,
-            u64::from(CAPTURE_WORKLOAD_FILES) * CAPTURE_WORKLOAD_FILE_BYTES as u64
-        );
+                ..change_request(RecordScope::Workspace, round)
+            })
+            .await
+            .unwrap();
+        assert_eq!(changes.finish(&ticket).await.unwrap(), None);
         assert!(client.pending_remote_operations().is_empty());
         eprintln!(
-            "PASS capture workload {checkpoint}: {} files, {} bytes, {:.3}s",
-            result.snapshot.file_count,
-            result.snapshot.total_bytes,
+            "PASS record workload {round}: {CAPTURE_WORKLOAD_FILES} files, {:.3}s",
             started.elapsed().as_secs_f64()
         );
     }
@@ -3890,114 +4099,8 @@ fn authenticated_local() {
         eprintln!(
             "PASS recursive list/search, ranged authenticated bytes, watch open/poll/close, SCM discover/status/log/read-side/stage/diff/unstage"
         );
-        capture_workload(&client, &root).await;
-        let capture_request = SnapshotCaptureRequest {
-            checkpoint_id: CheckpointId::new("integration-checkpoint").unwrap(),
-            label: None,
-            limits: CAPTURE_LIMITS,
-        };
-        let snapshot = WorkspaceSnapshotReadService::capture(
-            &client,
-            binding,
-            &resolved_root.cursor,
-            &capture_request,
-        )
-        .await
-        .unwrap();
-        let inspected = WorkspaceSnapshotReadService::inspect(
-            &client,
-            binding,
-            cursor,
-            &SnapshotInspectRequest {
-                snapshot_id: snapshot.snapshot.snapshot_id.clone(),
-                page_size: LIMIT,
-                continuation: None,
-            },
-        )
-        .await
-        .unwrap();
-        assert!(!inspected.files.is_empty());
-        tool(
-            &client,
-            cursor,
-            "file_write",
-            json!({"filePath":"written.txt","content":"changed\n"}),
-        )
-        .await;
-        let changed = WorkspaceSnapshotReadService::capture(
-            &client,
-            binding,
-            &resolved_root.cursor,
-            &SnapshotCaptureRequest {
-                checkpoint_id: CheckpointId::new("integration-changed").unwrap(),
-                label: None,
-                limits: CAPTURE_LIMITS,
-            },
-        )
-        .await
-        .unwrap();
-        let restore = client
-            .prepare_restore(
-                binding,
-                cursor,
-                &snapshot.snapshot.snapshot_id,
-                &changed.snapshot.snapshot_id,
-            )
-            .await
-            .unwrap();
-        let SnapshotOperationPreview::Restore(preview) = &restore.preview else {
-            panic!("restore preview")
-        };
-        let restored =
-            WorkspaceSnapshotMutationService::execute(&client, binding, cursor, &restore)
-                .await
-                .unwrap();
-        assert!(
-            matches!(restored.state, OperationState::Completed { .. }),
-            "{restored:?}"
-        );
-        assert_eq!(
-            fs::read_to_string(root.join("written.txt")).unwrap(),
-            "after\n"
-        );
-        let unrevert = client
-            .prepare_unrevert(binding, cursor, &preview.restore_id)
-            .await
-            .unwrap();
-        let reverted =
-            WorkspaceSnapshotMutationService::execute(&client, binding, cursor, &unrevert)
-                .await
-                .unwrap();
-        assert!(
-            matches!(reverted.state, OperationState::Completed { .. }),
-            "{reverted:?}"
-        );
-        assert_eq!(
-            fs::read_to_string(root.join("written.txt")).unwrap(),
-            "changed\n"
-        );
-        client.reconnect(&CancellationToken::new()).await.unwrap();
-        let recovered = WorkspaceSnapshotReadService::capture(
-            &client,
-            client.session_binding(),
-            client.root_cursor(),
-            &capture_request,
-        )
-        .await
-        .unwrap();
-        assert!(recovered.reused_checkpoint);
-        assert_eq!(recovered.snapshot, snapshot.snapshot);
-        assert!(client.pending_remote_operations().is_empty());
-        tool(
-            &client,
-            cursor,
-            "file_read",
-            json!({"filePath":"written.txt"}),
-        )
-        .await;
-        eprintln!(
-            "PASS snapshot capture/inspect/restore/unrevert and checkpoint recovery after reconnect"
-        );
+        record_workload(&client, &root).await;
+        Box::pin(change_records(&client, &root)).await;
         fs::create_dir(root.join("stale-dir")).unwrap();
         let stale = client
             .resolve_directory_cursor(binding, cursor, &WorkspacePath::new("stale-dir").unwrap())

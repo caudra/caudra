@@ -5,7 +5,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use caudra_providers::{
     CaudraId, ContentBlock, HistoryItem, HistoryItemKind, HistoryProjectionError, Message, Role,
-    expand_message, project_messages,
+    UserOrigin, expand_message, project_messages,
 };
 use caudra_storage::sessions::next_epoch;
 use tracing::warn;
@@ -188,13 +188,14 @@ impl History {
     /// starts a chain the request reads instead of the turns behind it, and
     /// without this the transcript has no way back to them.
     pub fn replace_superseding(&mut self, messages: Vec<Message>, supersedes: Option<CaudraId>) {
+        let mut items = expand_messages(&messages);
         if let Some(end) =
             supersedes.and_then(|id| self.snapshot.messages.iter().position(|item| item.id == id))
         {
-            self.archived
-                .extend_from_slice(&self.snapshot.messages[..=end]);
+            let (replaced, originals) = self.snapshot.messages.split_at(end + 1);
+            stand_for_originals(&mut items, &replaced[end], originals);
+            self.archived.extend_from_slice(replaced);
         }
-        let mut items = expand_messages(&messages);
         if let Some(root) = items.first_mut() {
             root.supersedes = supersedes;
         }
@@ -303,6 +304,59 @@ pub fn stored_todos<'i, 'o>(
         }
     }
     None
+}
+
+/// Places a compaction's new chain in time. The kept turns come back as copies
+/// behind the summary, and each is matched to the original it replaces from
+/// the end, past thinking the compaction stripped and past results the repair
+/// step added. What precedes the copies stands for the `superseded` item. Once
+/// a copy cannot be matched, nothing ahead of it can be told apart from a copy,
+/// so each of those points at itself.
+fn stand_for_originals(
+    items: &mut [HistoryItem],
+    superseded: &HistoryItem,
+    mut originals: &[HistoryItem],
+) {
+    let mut unplaced = items.len();
+    while let (Some((original, earlier)), Some(index)) =
+        (originals.split_last(), unplaced.checked_sub(1))
+    {
+        let item = &mut items[index];
+        if original.kind == item.kind {
+            item.stands_for = Some(original.happened_at().unwrap_or(item.id));
+            unplaced = index;
+            originals = earlier;
+        } else if matches!(original.kind, HistoryItemKind::Reasoning { .. }) {
+            originals = earlier;
+        } else if added_by_repair(&item.kind) {
+            unplaced = index;
+        } else {
+            break;
+        }
+    }
+    let lead = superseded.happened_at().filter(|_| {
+        originals
+            .iter()
+            .all(|original| matches!(original.kind, HistoryItemKind::Reasoning { .. }))
+    });
+    for item in &mut items[..unplaced] {
+        item.stands_for = Some(lead.unwrap_or(item.id));
+    }
+}
+
+/// A result the repair step closed a dangling call with, or the empty turn it
+/// inserted to carry one.
+fn added_by_repair(kind: &HistoryItemKind) -> bool {
+    match kind {
+        HistoryItemKind::ToolResult { .. } => true,
+        HistoryItemKind::User {
+            text,
+            images,
+            origin: UserOrigin::Synthetic,
+            ..
+        } => text.is_empty() && images.is_empty(),
+        _ => false,
+    }
 }
 
 fn expand_messages(messages: &[Message]) -> Vec<HistoryItem> {
@@ -448,6 +502,7 @@ fn append_unavailable_results(
         id: CaudraId::generate(),
         parent_id: None,
         supersedes: None,
+        stands_for: None,
         group_id,
         kind: HistoryItemKind::ToolResult {
             call_id: call_id.clone(),
@@ -737,6 +792,9 @@ mod tests {
     const FIRST: &str = "first";
     const SECOND: &str = "second";
     const GO: &str = "go";
+    const ANCHOR: &str = "anchor";
+    /// The messages a compaction in these tests summarizes.
+    const COMPACTED_HEAD: usize = 2;
     const FAILURE: &str = "inference engine is unavailable";
     const EMPTY_RULE: &str = "empty_response";
     const SPENT: &str = "a reply typed into a stall does not refill the budget";
@@ -799,6 +857,96 @@ mod tests {
             .collect();
         assert_eq!(texts, [FIRST, "summary", GO]);
         assert_eq!(history.active_items().len(), 1);
+    }
+
+    /// How a compaction's kept turns come back behind its summary.
+    enum Replay {
+        Verbatim,
+        ThinkingStripped,
+        ResultSynthesized,
+        Edited,
+        SyntheticText,
+        SyntheticImage,
+        Twice,
+    }
+
+    /// Where an item of the new chain happened, against the chain it replaced.
+    #[derive(Debug, PartialEq)]
+    enum Placed {
+        At(usize),
+        Itself,
+        Unknown,
+        Elsewhere,
+    }
+
+    fn compact(history: &mut History, kept: Vec<Message>) {
+        let seam = history.item_at_message_boundary(COMPACTED_HEAD);
+        let mut messages = vec![Message::user(ANCHOR.into()), assistant_text(COMPACTED)];
+        messages.extend(kept);
+        history.replace_superseding(messages, seam);
+    }
+
+    #[test_case(Replay::Verbatim => vec![Placed::At(1), Placed::At(1), Placed::At(2), Placed::At(3), Placed::At(4), Placed::At(5)] ; "copies_stand_for_their_originals")]
+    #[test_case(Replay::ThinkingStripped => vec![Placed::At(1), Placed::At(1), Placed::At(2), Placed::At(4), Placed::At(5)] ; "stripped_thinking_is_passed_over")]
+    #[test_case(Replay::ResultSynthesized => vec![Placed::At(1), Placed::At(1), Placed::At(2), Placed::At(3), Placed::At(4), Placed::At(5), Placed::Itself, Placed::Itself] ; "a_synthesized_result_stands_for_itself")]
+    #[test_case(Replay::Edited => vec![Placed::Unknown, Placed::Unknown, Placed::Unknown, Placed::At(3), Placed::At(4), Placed::At(5)] ; "an_unmatched_copy_leaves_everything_ahead_unknown")]
+    #[test_case(Replay::SyntheticText => vec![Placed::Unknown, Placed::Unknown, Placed::Unknown, Placed::At(3), Placed::At(4), Placed::At(5)] ; "a_synthetic_turn_with_text_is_no_repair")]
+    #[test_case(Replay::SyntheticImage => vec![Placed::Unknown, Placed::Unknown, Placed::Unknown, Placed::At(3), Placed::At(4), Placed::At(5)] ; "a_synthetic_turn_with_an_image_is_no_repair")]
+    #[test_case(Replay::Twice => vec![Placed::At(1), Placed::At(1), Placed::At(2), Placed::At(3), Placed::At(4), Placed::At(5)] ; "a_second_compaction_reaches_the_first_originals")]
+    fn compaction_copies_happen_when_their_originals_did(replay: Replay) -> Vec<Placed> {
+        let reply = Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::thinking(FIRST.into(), Some(SECOND.into())),
+                ContentBlock::Text { text: GO.into() },
+                ContentBlock::tool_use(PLAN_CALL, PLAN_CALL, serde_json::json!({})),
+            ],
+            ..Default::default()
+        };
+        let mut history = History::new(vec![
+            Message::user(FIRST.into()),
+            assistant_text(DRAFT),
+            Message::user(SECOND.into()),
+            reply.clone(),
+        ]);
+        let before: Vec<CaudraId> = history.active_items().iter().map(|item| item.id).collect();
+        let stripped = Message {
+            content: reply.content[1..].to_vec(),
+            ..reply.clone()
+        };
+        let kept = match replay {
+            Replay::Verbatim | Replay::Twice => vec![Message::user(SECOND.into()), reply],
+            Replay::ThinkingStripped => vec![Message::user(SECOND.into()), stripped],
+            Replay::ResultSynthesized => {
+                repair_tool_pairs(Cow::Owned(vec![Message::user(SECOND.into()), reply]))
+                    .into_owned()
+            }
+            Replay::Edited => vec![Message::user(SHIP.into()), reply],
+            Replay::SyntheticText => vec![Message::synthetic(SHIP.into()), reply],
+            Replay::SyntheticImage => vec![
+                Message {
+                    content: vec![png_block()],
+                    ..Message::synthetic(String::new())
+                },
+                reply,
+            ],
+        };
+        compact(&mut history, kept.clone());
+        if matches!(replay, Replay::Twice) {
+            compact(&mut history, kept);
+        }
+        history
+            .active_items()
+            .iter()
+            .map(|item| match item.happened_at() {
+                None => Placed::Unknown,
+                Some(id) if id == item.id => Placed::Itself,
+                Some(id) => before
+                    .iter()
+                    .position(|original| *original == id)
+                    .map_or(Placed::Elsewhere, Placed::At),
+            })
+            .collect()
     }
 
     #[test]
@@ -1283,14 +1431,18 @@ mod tests {
         assert_eq!(history.len(), expected_len);
     }
 
-    #[test]
-    fn sanitize_restored_drops_image_when_all_results_orphaned() {
-        let image_block = ContentBlock::Image {
+    fn png_block() -> ContentBlock {
+        ContentBlock::Image {
             source: caudra_providers::ImageSource::new(
                 caudra_providers::ImageMediaType::Png,
                 std::sync::Arc::from("aGVsbG8="),
             ),
-        };
+        }
+    }
+
+    #[test]
+    fn sanitize_restored_drops_image_when_all_results_orphaned() {
+        let image_block = png_block();
         let mut orphaned = make_tool_result_msg(&["orphan"]);
         orphaned.content.push(image_block.clone());
         let history = restore_messages(vec![Message::user("go".into()), orphaned]);
@@ -1312,12 +1464,7 @@ mod tests {
     #[test]
     fn sanitize_restored_keeps_image_when_any_result_survives() {
         let mut msg = make_tool_result_msg(&["t1", "orphan"]);
-        msg.content.push(ContentBlock::Image {
-            source: caudra_providers::ImageSource::new(
-                caudra_providers::ImageMediaType::Png,
-                std::sync::Arc::from("aGVsbG8="),
-            ),
-        });
+        msg.content.push(png_block());
         msg.tool_result_image_owners.push("t1".into());
         let history = restore_messages(vec![
             Message::user("go".into()),

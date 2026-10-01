@@ -16,7 +16,7 @@ use arc_swap::ArcSwap;
 use bitflags::bitflags;
 use caudra_storage::tool_ledger::ToolOutcome;
 use caudra_storage::tool_outputs::ToolOutputRef;
-use caudra_workspace::{TransportErrorKind, WorkspaceError};
+use caudra_workspace::{RecordScope, TransportErrorKind, WorkspaceError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -591,6 +591,12 @@ pub trait ToolInvocation: Send + Sync {
             .map(Path::to_path_buf)
             .into_iter()
             .collect()
+    }
+    /// What a file revert must be able to undo of this call in the session
+    /// directory at `root`, or `None` when it changes nothing there. Asked
+    /// after `preflight`, and only of a call whose effect is not read-only.
+    fn record_scope(&self, ctx: &ToolContext, root: &Path) -> Option<RecordScope> {
+        RecordScope::of_files(&self.mutation_targets(ctx), root)
     }
     fn local_document_target(&self) -> Option<&caudra_workspace::LocalDocumentRef> {
         None

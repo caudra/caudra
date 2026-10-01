@@ -8,6 +8,7 @@ pub(crate) mod background_delivery;
 mod btw;
 mod delegation;
 mod extract;
+pub(crate) mod file_revert;
 #[cfg(debug_assertions)]
 mod grab;
 mod image_paste;
@@ -40,9 +41,7 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use caudra_workbench::text_field::{self, FieldKind, TextCommand};
-use caudra_workbench::{
-    DocumentKey, Layout as WorkbenchLayout, MutationGate, Workbench, WorkbenchAction,
-};
+use caudra_workbench::{DocumentKey, Layout as WorkbenchLayout, Workbench, WorkbenchAction};
 
 use crate::agent::ModelSlot;
 use crate::agent::SharedMode;
@@ -130,9 +129,7 @@ use caudra_agent::herdr::PaneMetadata;
 use caudra_agent::mentions;
 use caudra_agent::permissions::{PermissionManager, PermissionPolicyError};
 use caudra_agent::prompt::profile::PromptProfileCatalog;
-use caudra_agent::snapshots::{SnapshotError, SnapshotLimits, SnapshotStore, workspace_key};
 use caudra_agent::types::{BACKGROUND_EVENT_RUN_ID, WorkflowProvenance};
-use caudra_agent::workspace_baseline::{BaselineOutcome, WorkspaceBaseline};
 use caudra_agent::{
     AgentEvent, AgentInput, AgentMode, CommitRef, Envelope, GoalVerdict, ImageSource,
     McpConfigErrors, McpPromptInfo, McpSnapshotReader, Mention, PromptAdmission, QueueItemId,
@@ -154,18 +151,16 @@ use caudra_providers::{
 };
 use caudra_storage::StateDir;
 use caudra_storage::background::JobKind;
-use caudra_storage::id::{CaudraId, SessionRef};
+use caudra_storage::id::SessionRef;
 use caudra_storage::input_history::InputHistory;
 use caudra_storage::model::persist_model;
 use caudra_storage::tool_ledger::{ToolCall, ToolLedger, ToolStats};
 use caudra_storage::usage_ledger::{LedgerPurpose, LifetimeUsage, TurnUsage, UsageLedger};
 use caudra_storage::view::ViewMode;
-use caudra_storage::workspace_binding::StoredWorkspaceBinding;
-use caudra_workspace::SnapshotState;
+use caudra_workspace::WorkspaceChangeService;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
 use flume::{Receiver, TryRecvError};
-use futures_lite::future;
-use smol::{Task, Timer};
+use smol::Task;
 
 use crate::storage_writer::StorageWriter;
 use ratatui::layout::Position;
@@ -178,12 +173,8 @@ use mouse::Autoscroll;
 use mouse::EDGE_SCROLL_LINES;
 pub(crate) use permission_editor::ConversationPermissions;
 pub(crate) use queue::{MODE_DECISION_ERR, MessageQueue, SubmitOutcome};
-#[cfg(test)]
-pub(crate) use session::LEGACY_RESTORE_CLEARED;
 use session::{MergedHistory, Sent};
-pub(crate) use session::{
-    REVERT_BUSY_MSG, reachable_subagent_ids, recover_pending_workspace_restore, session_has_content,
-};
+pub(crate) use session::{REVERT_BUSY_MSG, reachable_subagent_ids, session_has_content};
 use session_state::SessionState;
 
 const CANCEL_MSG: &str = "Cancelled.";
@@ -207,13 +198,7 @@ const WORKFLOW_AUTH_REQUIRED: &str =
 const WORKFLOW_REQUESTER_PREFIX: &str = "workflow";
 const COPY_FAILED: &str = "Copy failed: ";
 const HISTORY_UNREADABLE: &str = "Failed to read session history: ";
-const NO_FILE_REVERT_MSG: &str = "No file revert for this workspace";
-const REMOTE_SNAPSHOT_READY: &str = "Remote workspace snapshot is available";
-const REMOTE_SNAPSHOT_BUSY: &str = "Workspace snapshot capture is busy; final snapshot skipped";
-const REMOTE_SNAPSHOT_PLACEHOLDER_DIR: &str = "remote-snapshot-metadata";
-const REMOTE_SNAPSHOT_PLACEHOLDER_KEY: &str = "remote";
-const NO_FILE_CHANGES_MSG: &str =
-    "Nothing has written to this workspace, so there are no file changes to revert";
+const UNRECORDED_MSG: &str = "A call ran without file revert";
 const FAST_UNSUPPORTED_MSG: &str = "Fast mode needs a model that sells a fast tier (API only)";
 const THINKING_UNSUPPORTED_MSG: &str = "Thinking requires a model that supports it";
 const FAST_ON_MSG: &str = "Fast mode: on";
@@ -363,13 +348,6 @@ enum CommitReload {
 pub enum KeyFocus {
     Composer,
     Transcript,
-}
-
-struct PendingSnapshot {
-    session_id: CaudraId,
-    binding: Option<StoredWorkspaceBinding>,
-    head: CaudraId,
-    task: Task<BaselineOutcome>,
 }
 
 pub struct App {
@@ -528,16 +506,18 @@ pub struct App {
     pub(crate) remote_project_context:
         Option<Arc<caudra_agent::remote_project_context::RemoteProjectContext>>,
     pub(crate) local_documents: Option<Arc<caudra_storage::local_documents::LocalDocumentStore>>,
-    pub(crate) snapshot_store: Arc<SnapshotStore>,
-    /// Shared with this session's agents, which is what lets the first mutating
-    /// tool call capture the revert point the UI later restores from.
-    pub(crate) workspace_baseline: Arc<WorkspaceBaseline>,
-    pending_snapshot: Option<PendingSnapshot>,
-    /// Mirrors the baseline's refusal, so the poller can tell a new verdict
-    /// from the one it already reported.
-    pub(crate) snapshots_unavailable: Option<String>,
-    /// Set by the event loop after construction, like `live_sessions`: every
-    /// store this session opens later has to agree with the one it started with.
+    /// Set by the event loop after construction, like `live_sessions`.
+    pub(crate) change_factory: Option<crate::ChangeServiceFactory>,
+    /// The local store's handle for this session's directory. A remote
+    /// session binds one per use instead.
+    pub(crate) local_changes: Option<Arc<dyn WorkspaceChangeService>>,
+    /// Shared with this session's agents, which read it when a run starts.
+    pub(crate) change_recorder: file_revert::RecorderSlot,
+    /// The session's records as last read, or why there are none to revert.
+    pub(crate) record_index: Option<Result<file_revert::RecordIndex, String>>,
+    pub(crate) record_index_refresh: Option<Task<Result<file_revert::RecordIndex, String>>>,
+    revert_confirmation: Option<file_revert::RevertConfirmation>,
+    /// Set by the event loop after construction, like `live_sessions`.
     pub(crate) snapshots_config: SnapshotsConfig,
     pub(crate) usage_slot: Arc<ArcSwapOption<UsageFetchState>>,
     pub(crate) storage_slot: Arc<ArcSwapOption<StorageFetchState>>,
@@ -571,7 +551,6 @@ pub struct App {
     hints: Watch<HintSnapshot>,
     pub(crate) restore_event_tx: Option<caudra_agent::EventSender>,
     pub(super) restoring: Arc<AtomicBool>,
-    remote_restore_confirmation: Option<session::RemoteRestoreConfirmation>,
     subagent_answers: HashMap<String, flume::Sender<String>>,
     subagent_steers: HashMap<String, SteeringQueue>,
     pending_subagent_steers: HashMap<String, VecDeque<PendingSteer>>,
@@ -605,8 +584,6 @@ impl App {
         model: &Model,
         session: AppSession,
         storage: StateDir,
-        snapshot_store: Arc<SnapshotStore>,
-        workspace_baseline: Arc<WorkspaceBaseline>,
         available_models: Arc<ArcSwapOption<Vec<String>>>,
         mcp_reader: McpSnapshotReader,
         mcp_config_errors: McpConfigErrors,
@@ -779,10 +756,12 @@ impl App {
             workspace_session: workspace_session.clone(),
             remote_project_context: None,
             local_documents: None,
-            snapshot_store,
-            workspace_baseline,
-            pending_snapshot: None,
-            snapshots_unavailable: None,
+            change_factory: None,
+            local_changes: None,
+            change_recorder: file_revert::RecorderSlot::default(),
+            record_index: None,
+            record_index_refresh: None,
+            revert_confirmation: None,
             snapshots_config: SnapshotsConfig::default(),
             usage_slot: Arc::new(ArcSwapOption::empty()),
             storage_slot: Arc::new(ArcSwapOption::empty()),
@@ -812,7 +791,6 @@ impl App {
             hint_reader,
             restore_event_tx: None,
             restoring: Arc::new(AtomicBool::new(false)),
-            remote_restore_confirmation: None,
             subagent_answers: HashMap::new(),
             subagent_steers: HashMap::new(),
             pending_subagent_steers: HashMap::new(),
@@ -831,10 +809,7 @@ impl App {
         app.sync_composer_cwd();
         app.workbench.set_markdown_painter(paint_markdown);
         if let Some(workspace) = workspace_session
-            && let Err(error) = app.workbench.bind_workspace_with_gate(
-                workspace,
-                remote_workbench_gate(Arc::clone(&app.workspace_baseline)),
-            )
+            && let Err(error) = app.workbench.bind_workspace(workspace)
         {
             tracing::warn!(%error, "remote workbench backend initialization failed");
         }
@@ -982,224 +957,6 @@ impl App {
             Err(TryRecvError::Empty) => {}
         }
         Dirty::NO
-    }
-
-    pub(crate) fn snapshot_store_for(
-        storage: &StateDir,
-        session_id: caudra_storage::id::CaudraId,
-        cwd: &std::path::Path,
-        limits: SnapshotLimits,
-    ) -> Result<Arc<SnapshotStore>, SnapshotError> {
-        Ok(Arc::new(
-            SnapshotStore::new_managed(storage.clone(), session_id, &workspace_key(cwd)?)
-                .with_limits(limits),
-        ))
-    }
-
-    /// A remote session's snapshots live on the Workcell host. This store only
-    /// fills the slot, under a directory no local store uses, and writes
-    /// nothing unless something captures into it.
-    pub(crate) fn remote_snapshot_placeholder(
-        storage: &StateDir,
-        session_id: CaudraId,
-    ) -> Arc<SnapshotStore> {
-        Arc::new(SnapshotStore::new(
-            &storage.path().join(REMOTE_SNAPSHOT_PLACEHOLDER_DIR),
-            session_id,
-            REMOTE_SNAPSHOT_PLACEHOLDER_KEY,
-        ))
-    }
-
-    /// The store and the baseline move together: an agent mid-session must never
-    /// capture one workspace's revert point into another workspace's store.
-    fn rebind_workspace_baseline(&mut self, store: Arc<SnapshotStore>, cwd: PathBuf) {
-        self.pending_snapshot = None;
-        self.workspace_baseline.rebind(Arc::clone(&store), cwd);
-        self.snapshot_store = store;
-    }
-
-    pub(super) fn discard_workspace_unrevert(&self) -> Result<(), SnapshotError> {
-        self.snapshot_store.discard_unrevert()
-    }
-
-    pub(super) fn history_head(&self) -> Option<CaudraId> {
-        self.shared_history
-            .as_ref()
-            .and_then(|history| history.load().messages.last().map(|item| item.id))
-            .or_else(|| crate::session_history_head(&self.state.session))
-    }
-
-    pub(super) fn snapshot_history_head(&mut self) -> Result<(), String> {
-        let _ = self.poll_snapshot_capture();
-        let Some(head) = self.history_head().filter(|_| self.has_revert_point()) else {
-            return Ok(());
-        };
-        if self.workspace_baseline.is_remote() {
-            if let Some(pending) = &self.pending_snapshot {
-                return if pending.head == head {
-                    Ok(())
-                } else {
-                    Err(REMOTE_SNAPSHOT_BUSY.into())
-                };
-            }
-            if let Some(capture) = self
-                .workspace_baseline
-                .reserve_remote_capture(head)
-                .map_err(|error| error.to_string())?
-            {
-                let preview = self
-                    .remote_restore_confirmation
-                    .take()
-                    .and_then(|confirmation| {
-                        self.workspace_session
-                            .clone()
-                            .map(|workspace| (workspace, confirmation.prepared))
-                    });
-                self.pending_snapshot = Some(PendingSnapshot {
-                    session_id: self.state.session.id,
-                    binding: self.state.session.workspace_binding().cloned(),
-                    head,
-                    task: smol::spawn(async move {
-                        if let Some((workspace, prepared)) = preview
-                            && let Some(service) =
-                                &workspace.workspace().services().snapshot_mutation
-                            && let Err(error) = service
-                                .release(workspace.binding(), workspace.cursor(), &prepared)
-                                .await
-                        {
-                            tracing::warn!(%error, "failed to release superseded remote restore preview");
-                        }
-                        capture.await
-                    }),
-                });
-            }
-            return Ok(());
-        }
-        self.snapshot_store
-            .snapshot(std::path::Path::new(&self.state.session.cwd), head)
-            .map(drop)
-            .map_err(|error| error.to_string())
-    }
-
-    fn discard_stale_snapshot_capture(&mut self) {
-        if self.pending_snapshot.as_ref().is_some_and(|pending| {
-            pending.session_id != self.state.session.id
-                || pending.binding.as_ref() != self.state.session.workspace_binding()
-        }) {
-            self.pending_snapshot = None;
-        }
-    }
-
-    fn poll_snapshot_capture(&mut self) -> Dirty {
-        self.discard_stale_snapshot_capture();
-        let Some(pending) = self.pending_snapshot.as_mut() else {
-            return Dirty::NO;
-        };
-        let Some(outcome) = smol::block_on(future::poll_once(&mut pending.task)) else {
-            return Dirty::NO;
-        };
-        let head = pending.head;
-        self.pending_snapshot = None;
-        if self.history_head() != Some(head) {
-            return Dirty::NO;
-        }
-        match outcome {
-            BaselineOutcome::Ready => self.status_bar.flash(REMOTE_SNAPSHOT_READY.into()),
-            BaselineOutcome::Unavailable(_) => return Dirty::NO,
-            BaselineOutcome::Failed(error) => {
-                tracing::warn!(%error, "final workspace snapshot failed");
-                self.status_bar
-                    .flash(format!("Final workspace snapshot failed: {error}"));
-            }
-        }
-        Dirty::YES
-    }
-
-    /// Whether a run has captured a baseline for this workspace yet. Until one
-    /// exists there is nothing for a later capture to bracket.
-    pub(super) fn has_revert_point(&self) -> bool {
-        if !self.workspace_baseline.is_enabled() {
-            return false;
-        }
-        if self.workspace_baseline.is_remote() {
-            self.workspace_baseline
-                .remote_capture(self.history_head())
-                .is_ok_and(|capture| capture.is_some())
-                || self
-                    .workspace_baseline
-                    .remote_capture(None)
-                    .is_ok_and(|capture| capture.is_some())
-        } else {
-            self.snapshot_store.has_session_start()
-        }
-    }
-
-    /// Why a file revert cannot run, in the user's terms: either this workspace
-    /// is one Caudra will not snapshot, or nothing has written to it yet.
-    pub(super) fn file_revert_blocker(&self) -> Option<String> {
-        if self.has_revert_point() {
-            return None;
-        }
-        Some(match self.workspace_baseline.unavailable_reason() {
-            Some(reason) => format!("{NO_FILE_REVERT_MSG}: {reason}"),
-            None => NO_FILE_CHANGES_MSG.to_owned(),
-        })
-    }
-
-    pub(super) fn snapshot_history_head_within(
-        &mut self,
-        budget: Duration,
-    ) -> Result<bool, String> {
-        if !self.workspace_baseline.is_enabled() {
-            return Ok(true);
-        }
-        if self.workspace_baseline.is_remote() {
-            let deadline = Instant::now() + budget;
-            self.discard_stale_snapshot_capture();
-            let Some(head) = self.history_head().filter(|_| self.has_revert_point()) else {
-                self.pending_snapshot = None;
-                return Ok(true);
-            };
-            if self
-                .pending_snapshot
-                .as_ref()
-                .is_some_and(|pending| pending.head != head)
-            {
-                self.pending_snapshot = None;
-                return Ok(false);
-            }
-            if budget.is_zero() {
-                self.pending_snapshot = None;
-            } else if self.pending_snapshot.is_none() {
-                self.snapshot_history_head()?;
-            }
-            let Some(pending) = self.pending_snapshot.take() else {
-                return Ok(self
-                    .workspace_baseline
-                    .remote_capture(Some(head))
-                    .is_ok_and(|capture| {
-                        capture.is_some_and(|capture| capture.state == SnapshotState::Complete)
-                    }));
-            };
-            return match smol::block_on(future::or(
-                async move { Some(pending.task.await) },
-                async move {
-                    Timer::at(deadline).await;
-                    None
-                },
-            )) {
-                Some(BaselineOutcome::Ready) => Ok(true),
-                Some(BaselineOutcome::Unavailable(_)) | None => Ok(false),
-                Some(BaselineOutcome::Failed(error)) => Err(error.to_string()),
-            };
-        }
-        self.snapshot_store
-            .capture_head_within(
-                std::path::Path::new(&self.state.session.cwd),
-                self.history_head(),
-                budget,
-            )
-            .map_err(|error| error.to_string())
     }
 
     pub(crate) fn main_chat(&mut self) -> &mut Chat {
@@ -4334,6 +4091,15 @@ impl App {
             }
             return vec![];
         }
+        // Session state too, and a background shell reports its own gap long
+        // after the run that started it retired.
+        if let AgentEvent::Unrecorded { gap, notice } = envelope.event {
+            if notice {
+                self.flash(format!("{UNRECORDED_MSG}: {}", gap.reason));
+            }
+            self.state.session_mut().meta.push_unrecorded(gap);
+            return vec![];
+        }
         if let AgentEvent::TaskAdmitted(card) = &envelope.event {
             if !session_owned && envelope.run_id != self.run_id {
                 return Vec::new();
@@ -4497,9 +4263,7 @@ impl App {
                     } else {
                         Status::Idle
                     };
-                if let Err(error) = self.snapshot_history_head() {
-                    self.flash(format!("Failed to snapshot cancelled run: {error}"));
-                }
+                self.refresh_record_index();
                 if cancelled_error {
                     self.queue.resume();
                 }
@@ -4519,7 +4283,7 @@ impl App {
             return vec![];
         }
 
-        let snapshot_top_level = envelope.subagent.is_none()
+        let run_ended = envelope.subagent.is_none()
             && matches!(
                 &envelope.event,
                 AgentEvent::Done { .. } | AgentEvent::Error { .. }
@@ -5007,8 +4771,8 @@ impl App {
                 ChatEventResult::Continue => {}
             }
         }
-        if snapshot_top_level && let Err(error) = self.snapshot_history_head() {
-            self.flash(format!("Failed to snapshot completed run: {error}"));
+        if run_ended {
+            self.refresh_record_index();
         }
         vec![]
     }
@@ -5552,10 +5316,9 @@ impl App {
     pub(crate) fn install_working_directory(
         &mut self,
         cwd: &std::path::Path,
-        snapshot_store: Arc<SnapshotStore>,
         permissions: PermissionsConfig,
     ) {
-        self.release_remote_restore_confirmation();
+        self.release_revert_confirmation();
         self.file_picker.close();
         self.mention_popup.close();
         self.commit_popup.close();
@@ -5569,7 +5332,8 @@ impl App {
         self.state
             .session_mut()
             .set_cwd(cwd.to_string_lossy().into_owned());
-        self.rebind_workspace_baseline(snapshot_store, cwd.to_path_buf());
+        self.bind_change_recorder();
+        self.refresh_record_index();
         self.status_bar.refresh_cwd(&cwd.to_string_lossy());
         self.sync_composer_cwd();
         self.sync_transcript_cwd();
@@ -5598,7 +5362,7 @@ impl App {
                     })
             })
             .map_err(|error| error.to_string())?;
-        self.release_remote_restore_confirmation();
+        self.release_revert_confirmation();
         self.file_picker.close();
         self.mention_popup.close();
         self.commit_popup.close();
@@ -5612,26 +5376,16 @@ impl App {
                     &change.context,
                 ))
             });
-        self.pending_snapshot = None;
-        self.workspace_baseline.rebind_workspace_session(
-            self.storage.clone(),
-            self.state.session.id,
-            change.workspace.clone(),
-            change.binding,
-        );
-        self.workspace_baseline
-            .set_current_head(self.history_head());
         self.workspace_session = Some(change.workspace);
+        self.bind_change_recorder();
+        self.refresh_record_index();
         self.invalidate_permission_authority();
         if let Some(workspace) = self.workspace_session.clone()
             && let Err(error) = self
                 .parked_workbench
                 .as_mut()
                 .unwrap_or(&mut self.workbench)
-                .bind_workspace_with_gate(
-                    workspace,
-                    remote_workbench_gate(Arc::clone(&self.workspace_baseline)),
-                )
+                .bind_workspace(workspace)
         {
             tracing::warn!(%error, "remote workbench backend rebind failed");
         }
@@ -5831,13 +5585,6 @@ impl App {
             || self.chats.iter().any(|chat| chat.retry().is_some())
             || self.restoring.load(Ordering::Relaxed)
             || self.stream_modal.is_streaming()
-            || self
-                .state
-                .session
-                .meta
-                .pending_revert
-                .as_ref()
-                .is_some_and(|pending| pending.restore_operation.is_some())
     }
 
     /// True while `recoverable_queue` holds user text captured at an agent
@@ -5849,7 +5596,7 @@ impl App {
     pub(crate) fn prepare_shutdown(&mut self) {
         self.pending_pattern_suggestions = None;
         self.pattern_suggestion_loader = None;
-        self.release_remote_restore_confirmation();
+        self.release_revert_confirmation();
         if self.recoverable_queue.is_empty() {
             self.recoverable_queue = self.queue.pending_prompts();
             self.recoverable_queue_together =
@@ -5857,18 +5604,6 @@ impl App {
         }
         self.queue.clear();
         self.shell.cancel_all();
-    }
-
-    pub(super) fn release_remote_restore_confirmation(&mut self) {
-        let Some(confirmation) = self.remote_restore_confirmation.take() else {
-            return;
-        };
-        if let Err(error) = smol::block_on(
-            self.workspace_baseline
-                .release_remote_prepared(&confirmation.prepared),
-        ) {
-            tracing::warn!(%error, "failed to release remote restore preview");
-        }
     }
 
     pub(crate) fn disconnect_agent_queue(&mut self) {
@@ -5921,8 +5656,7 @@ impl App {
             | self.status_bar.clear_expired_hint()
             | self.mcp_picker.refresh()
             | self.tick_permission_config_trust()
-            | self.poll_snapshot_refusal()
-            | self.poll_snapshot_capture()
+            | self.poll_record_index()
             | self.poll_pattern_suggestions()
             | self.poll_permission_editor()
             | self.poll_sandbox()
@@ -5995,29 +5729,6 @@ impl App {
         let cwd = PathBuf::from(&self.state.session.cwd);
         caudra_storage::workbench::persist(&self.storage, &cwd, &layout);
         self.workbench_layout = Some(layout);
-    }
-
-    /// A refusal is decided inside a tool call, so the UI learns it by polling.
-    /// Reported once per verdict: it is a standing property of the workspace,
-    /// not an event, and repeating it every turn would be noise.
-    fn poll_snapshot_refusal(&mut self) -> Dirty {
-        if self.workspace_baseline.is_remote() && self.workspace_baseline.is_capturing() {
-            self.status_bar
-                .flash("Capturing remote workspace snapshot".into());
-            return Dirty::YES;
-        }
-        let reason = self.workspace_baseline.refusal();
-        if reason.as_deref().map(String::as_str) == self.snapshots_unavailable.as_deref() {
-            return Dirty::NO;
-        }
-        self.snapshots_unavailable = reason.as_deref().cloned();
-        let Some(reason) = reason else {
-            return Dirty::NO;
-        };
-        self.status_bar
-            .flash(format!("{NO_FILE_REVERT_MSG}: {reason}"));
-        self.checkpoint();
-        Dirty::YES
     }
 
     fn tick_permission_config_trust(&mut self) -> Dirty {
@@ -6555,19 +6266,6 @@ fn decision_status_message(
         lines.push(format!("  {name}: {mode}"));
     }
     lines.join("\n")
-}
-
-fn remote_workbench_gate(baseline: Arc<WorkspaceBaseline>) -> MutationGate {
-    MutationGate::new(move || {
-        let baseline = Arc::clone(&baseline);
-        Box::pin(async move {
-            baseline
-                .ensure_current()
-                .await
-                .into_result()
-                .map_err(|error| error.to_string())
-        })
-    })
 }
 
 /// The key `/usage` groups a session's spend under: always the full spec, so a

@@ -15,7 +15,7 @@ pub use caudra_storage::permission_state::{
 };
 pub use caudra_storage::sessions::PermissionMode;
 pub use command_pattern::{PatternFault, PatternGrade, grade_command_pattern};
-pub use sed_script::sed_only_prints;
+pub use sed_script::{sed_only_prints, sed_written_files};
 #[cfg(test)]
 use structured::CONFINED_READ_AUTHORITY;
 use structured::NORMALIZED_COMMAND_ATTRIBUTE;

@@ -1,7 +1,6 @@
 use super::*;
 use crate::agent::shared_queue::{self, QueueReceiver};
 use crate::app::sandbox::attached_sandbox_instance;
-use crate::app::session::REVERT_SNAPSHOT_PENDING_MSG;
 use crate::app::tasks::{MAIN_TASK_ID, TaskStatus};
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT};
 use crate::components::command::{BUILTIN_COMMANDS, CommandPalette, ParsedCommand};
@@ -32,7 +31,6 @@ use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{SelectableZone, SelectionState, SelectionZone};
 use crate::test_pattern_discovery_report;
 use arc_swap::ArcSwap;
-use async_trait::async_trait;
 use caudra_agent::command::CustomCommand;
 use caudra_agent::context::{
     ContextInventory, ContextModel, ContextReadiness, ContextReserve, ContextUsage, ContextWindow,
@@ -45,10 +43,8 @@ use caudra_agent::permissions::pattern_recognition::{
 use caudra_agent::permissions::{
     PermissionManager, PermissionRequest, PermissionResourceSelector, PermissionRuleRecord,
 };
-use caudra_agent::snapshots::{RestoreFailureKind, RestoreStatus, SnapshotKey};
 use caudra_agent::tools::{SHELL_TOOL_NAME, TODOWRITE_TOOL_NAME, ToolEffect};
 use caudra_agent::types::{TodoItem, TodoPriority, TodoStatus};
-use caudra_agent::workspace_baseline::BaselineOutcome;
 use caudra_agent::{
     CallStage, DoneReason, GoalResult, GoalStatus, GoalVerdict, HistorySnapshot, ImageMediaType,
     McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader,
@@ -76,10 +72,9 @@ use caudra_storage::permission_patterns::{
 };
 use caudra_storage::prompt_stash::{PromptStash, StashEntry};
 use caudra_storage::sessions::{
-    PendingConversationRevert, PendingRestoreKind, PendingRestoreOperation, PendingRestorePhase,
     PermissionMode, SessionLocation, SessionMeta, StoredActiveGoal, StoredGoalVerdict, StoredImage,
     StoredMode, StoredPasteRange, StoredPromptAdmission, StoredQueuedDraft, StoredQueuedPrompt,
-    StoredSubagent, StoredSubagentOutcome, StoredTokenUsage,
+    StoredSubagent, StoredSubagentOutcome, StoredTokenUsage, UnrecordedCall,
 };
 use caudra_storage::thinking::StoredThinking;
 use caudra_storage::tool_outputs::{ToolOutputError, ToolOutputStore};
@@ -88,16 +83,9 @@ use caudra_storage::view::ViewMode;
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
 use caudra_workbench::keys as workbench_keys;
 use caudra_workspace::{
-    CancellationResult, CheckpointId, CollectionRevision, CwdHandle, OperationHandle, OperationId,
-    OperationPhase, OperationStatus, PreparedSnapshotOperation, ProjectAsset, ProjectAssetContent,
-    ProjectAssetManifest, ReleaseResult, ResourceId, ResourceRevision, ResourceScope, RestoreId,
-    SessionWorkspaceBinding, SnapshotCaptureRequest, SnapshotCaptureResult, SnapshotChangeCounts,
-    SnapshotId, SnapshotInspectPage, SnapshotInspectRequest, SnapshotOperationPreview,
-    SnapshotOperationResult, SnapshotRestorePreview, SnapshotRestoreState, SnapshotRestoreStatus,
-    SnapshotSkipped, SnapshotState, SnapshotSummary, WorkspaceAssetService, WorkspaceCapabilities,
-    WorkspaceCapability, WorkspaceCursor, WorkspaceError, WorkspaceHandle, WorkspacePath,
-    WorkspaceServices, WorkspaceSession, WorkspaceSnapshotMutationService,
-    WorkspaceSnapshotReadService,
+    CollectionRevision, OperationId, ProjectAsset, ProjectAssetContent, ProjectAssetManifest,
+    SessionWorkspaceBinding, WorkspaceAssetService, WorkspaceCapabilities, WorkspaceCursor,
+    WorkspaceError, WorkspaceHandle, WorkspaceServices, WorkspaceSession,
 };
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
@@ -128,14 +116,6 @@ const DECISIONS_TEST_MODEL: &str = "test-decision-model";
 const DECISIONS_TEST_ERROR: &str = "transport";
 const DECISIONS_NOT_CHECKED: &str = "Cached reachability: unknown (not checked)";
 const DECISIONS_OFF: &str = "Decision engine: off";
-const SNAPSHOT_TEST_TIMEOUT: Duration = Duration::from_secs(10);
-const SNAPSHOT_TEST_BUDGET: Duration = Duration::from_millis(10);
-const SNAPSHOT_TEST_TIMEOUT_MSG: &str = "remote snapshot task did not finish";
-const SNAPSHOT_TEST_ID: &str = "snapshot";
-const SNAPSHOT_TEST_REVISION: &str = "snapshot-revision";
-const SNAPSHOT_TEST_RESTORE: &str = "snapshot-restore";
-const SNAPSHOT_TEST_REBOUND_ROOT: &str = "rebound-root";
-const SNAPSHOT_TEST_REBOUND_CURSOR: &str = "rebound-cursor";
 const PERMISSION_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 const PATTERN_TEST_ANALYSIS: &str = "test-analysis/v1";
 const PATTERN_TEST_SOURCE: &str = "history-test";
@@ -287,12 +267,6 @@ const MEASURED_CONTEXT: u32 = 100_000;
 /// The rewind fixture holds a few dozen bytes of chat, far below this, so it
 /// doubles as the window the gauge is allowed to land in.
 const SMALL_HISTORY: u32 = 1_000;
-const SNAPSHOT_FILE: &str = "tracked.txt";
-const ROOT_CONTENT: &str = "root";
-const FIRST_CONTENT: &str = "after first";
-const CURRENT_CONTENT: &str = "current";
-const CONFLICT_CONTENT: &str = "conflict";
-const CONTINUED_CONTENT: &str = "continued after revert";
 const GOAL_CONDITION: &str = "all focused tests pass";
 const GOAL_CHIP_PREFIX: &str = "[goal \u{b7}";
 const CONTEXT_COMMAND: &str = "/context";
@@ -365,19 +339,10 @@ fn build_app_with_lua(
         .join(session.id.to_string());
     std::fs::create_dir_all(&workspace).unwrap();
     session.set_cwd(workspace.to_string_lossy().into_owned());
-    let snapshot_store =
-        App::snapshot_store_for(&dir, session.id, &workspace, SnapshotLimits::default()).unwrap();
-    let workspace_baseline = WorkspaceBaseline::new(
-        Arc::clone(&snapshot_store),
-        workspace.clone(),
-        SnapshotsConfig::default(),
-    );
     App::new(
         &model,
         session,
         dir,
-        snapshot_store,
-        workspace_baseline,
         Arc::new(ArcSwapOption::empty()),
         McpSnapshotReader::empty(),
         McpConfigErrors::new(PathBuf::new()),
@@ -463,15 +428,6 @@ fn app_with_hints() -> (App, HintWriterHandle) {
     app.hints = Watch::seeded(reader.load_full());
     app.hint_reader = reader;
     (app, writer)
-}
-
-/// Stands in for the first write-capable tool call of a run. These tests drive
-/// the app without an agent, so nothing else reaches the dispatch gate that
-/// arms the revert point in production.
-fn arm_revert_point(app: &App) {
-    const ARMED_MSG: &str = "the first write must arm a revert point";
-    let outcome = smol::block_on(app.workspace_baseline.ensure(app.history_head()));
-    assert!(matches!(outcome, BaselineOutcome::Ready), "{ARMED_MSG}");
 }
 
 fn tempdir_app() -> (TempDir, StateDir, Arc<StorageWriter>, App) {
@@ -694,22 +650,6 @@ fn typing_and_submit() {
         Some(&DisplayRole::User),
     );
     assert_eq!(app.main_chat().last_message_text(), "hi");
-}
-
-/// A submit is a conversation, not a write. Paying for a working-tree walk
-/// before the model has even been asked is the cost this removed.
-#[test]
-fn submit_captures_nothing_until_a_tool_asks_to_write() {
-    const NO_STORE_MSG: &str = "a submit must not capture a workspace baseline";
-    let mut app = test_app();
-
-    let actions = type_and_submit(&mut app, "hi");
-
-    assert!(matches!(
-        actions.as_slice(),
-        [Action::SendMessage(input)] if input.message == "hi"
-    ));
-    assert!(!app.snapshot_store.has_session_start(), "{NO_STORE_MSG}");
 }
 
 #[test]
@@ -968,7 +908,7 @@ mod background_runtime {
                 None,
                 Arc::new(PromptProfileCatalog::default()),
                 Some(app.storage.clone()),
-                Arc::clone(&app.workspace_baseline),
+                Arc::clone(&app.change_recorder),
                 None,
                 None,
                 None,
@@ -10724,6 +10664,44 @@ fn repair_accounting_persists_once_without_changing_context(subagent: bool, stal
     assert_eq!(rows[0].cost, GOAL_COST);
 }
 
+const GAP_CALL: &str = "unrecorded-call";
+const GAP_REASON: &str = "a workspace quota is exhausted";
+const GAP_UNSAVED: &str = "a call that ran unrecorded must stay on the session it changed";
+
+/// A gap outlives the run that hit it: a file revert of that session later
+/// leaves the call's changes in place, and has to be able to say so.
+#[test_case(true ; "the_first_gap_is_told")]
+#[test_case(false ; "a_later_gap_is_only_kept")]
+fn an_unrecorded_call_is_kept_with_its_session(notice: bool) {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    crate::push_history_message(
+        app.state.session_mut(),
+        Message::user(FIRST_TURN_PROMPT.into()),
+    );
+    let gap = UnrecordedCall {
+        at: CaudraId::generate(),
+        call_id: GAP_CALL.into(),
+        reason: GAP_REASON.into(),
+    };
+    let told = format!("{UNRECORDED_MSG}: {GAP_REASON}");
+
+    let actions = app.update(agent_msg(AgentEvent::Unrecorded {
+        gap: gap.clone(),
+        notice,
+    }));
+
+    assert!(actions.is_empty());
+    assert_eq!(app.status_bar.flash_text(), notice.then_some(told.as_str()));
+    app.checkpoint();
+    let id = app.state.session.id;
+    drain_writer(app, writer);
+    assert_eq!(
+        AppSession::load(id, &dir).unwrap().meta.unrecorded,
+        [gap],
+        "{GAP_UNSAVED}"
+    );
+}
+
 /// The title request never enters the conversation, so its spend is recorded
 /// while the context size it would otherwise report is ignored.
 #[test]
@@ -11045,7 +11023,6 @@ fn ctrl_r_refreshes_usage_while_modal_open() {
 #[test]
 fn cd_command_behavior() {
     let mut app = test_app();
-    let old_store = Arc::clone(&app.snapshot_store);
     let original_cwd = app.state.session.cwd.clone();
     let actions = app.execute_command(
         ParsedCommand {
@@ -11059,7 +11036,6 @@ fn cd_command_behavior() {
     };
     assert_eq!(resolved, &std::fs::canonicalize("/tmp").unwrap());
     assert_eq!(app.state.session.cwd, original_cwd);
-    assert!(Arc::ptr_eq(&old_store, &app.snapshot_store));
 
     app.execute_command(
         ParsedCommand {
@@ -11218,7 +11194,6 @@ fn remote_cd_persistence_failure_preserves_live_state() {
     app.state.session = Arc::new(AppSession::new_with_workspace("test", ".", binding.clone()));
     app.workspace_session = Some(workspace.clone());
     let old_session = Arc::clone(&app.state.session);
-    let old_baseline = Arc::clone(&app.workspace_baseline);
     let old_context = smol::block_on(
         caudra_agent::remote_project_context::load_remote_project_context(
             &workspace,
@@ -11260,7 +11235,6 @@ fn remote_cd_persistence_failure_preserves_live_state() {
         .unwrap_err();
     assert_eq!(error, SAVE_FAILED);
     assert!(Arc::ptr_eq(&app.state.session, &old_session));
-    assert!(Arc::ptr_eq(&app.workspace_baseline, &old_baseline));
     assert!(Arc::ptr_eq(
         app.remote_project_context.as_ref().unwrap(),
         &old_context
@@ -11425,7 +11399,7 @@ fn context_command_is_local_and_does_not_mutate_the_chat(
 }
 
 /// Opening must ask for a measurement, not take one: the walk that sizes the
-/// snapshot stores is far too slow to run on the command's own frame.
+/// change record stores is far too slow to run on the command's own frame.
 #[test_case(STORAGE_COMMAND, Some(false), None ; "summary")]
 #[test_case(STORAGE_ALL_COMMAND, Some(true), None ; "case_insensitive_all")]
 #[test_case(STORAGE_INVALID_COMMAND, None, Some(STORAGE_USAGE) ; "invalid_args")]
@@ -12044,1105 +12018,6 @@ impl caudra_providers::provider::Provider for PendingProvider {
     }
 }
 
-struct BlockedSnapshots {
-    started: flume::Sender<()>,
-    resume: flume::Receiver<()>,
-}
-
-#[async_trait]
-impl WorkspaceSnapshotReadService for BlockedSnapshots {
-    async fn capture(
-        &self,
-        _binding: &SessionWorkspaceBinding,
-        _cursor: &WorkspaceCursor,
-        request: &SnapshotCaptureRequest,
-    ) -> Result<SnapshotCaptureResult, WorkspaceError> {
-        self.started.send_async(()).await.unwrap();
-        self.resume.recv_async().await.unwrap();
-        Ok(SnapshotCaptureResult {
-            snapshot: SnapshotSummary {
-                snapshot_id: SnapshotId::new(format!(
-                    "{SNAPSHOT_TEST_ID}-{}",
-                    request.checkpoint_id.as_str()
-                ))
-                .unwrap(),
-                checkpoint_id: Some(request.checkpoint_id.clone()),
-                label: None,
-                state: SnapshotState::Complete,
-                manifest_revision: ResourceRevision::new(SNAPSHOT_TEST_REVISION).unwrap(),
-                scope: WorkspacePath::new(".").unwrap(),
-                file_count: 0,
-                total_bytes: 0,
-                skipped: SnapshotSkipped::default(),
-                created_at_unix_ms: 1,
-            },
-            reused_checkpoint: false,
-        })
-    }
-
-    async fn inspect(
-        &self,
-        _binding: &SessionWorkspaceBinding,
-        _cursor: &WorkspaceCursor,
-        _request: &SnapshotInspectRequest,
-    ) -> Result<SnapshotInspectPage, WorkspaceError> {
-        Err(WorkspaceError::UnsupportedCapability {
-            capability: WorkspaceCapability::SnapshotInspect,
-        })
-    }
-
-    async fn restore_status(
-        &self,
-        _binding: &SessionWorkspaceBinding,
-        _cursor: &WorkspaceCursor,
-        _restore_id: &RestoreId,
-    ) -> Result<SnapshotRestoreStatus, WorkspaceError> {
-        Err(WorkspaceError::UnsupportedCapability {
-            capability: WorkspaceCapability::SnapshotStatus,
-        })
-    }
-}
-
-struct SnapshotRestoreProbe(flume::Sender<WorkspaceCapability>);
-
-impl SnapshotRestoreProbe {
-    fn unsupported<T>(&self, capability: WorkspaceCapability) -> Result<T, WorkspaceError> {
-        self.0.send(capability).unwrap();
-        Err(WorkspaceError::UnsupportedCapability { capability })
-    }
-}
-
-#[async_trait]
-impl WorkspaceSnapshotMutationService for SnapshotRestoreProbe {
-    fn max_cleanup_checkpoints(&self) -> usize {
-        0
-    }
-
-    async fn prepare_restore(
-        &self,
-        _binding: &SessionWorkspaceBinding,
-        _cursor: &WorkspaceCursor,
-        target: &SnapshotId,
-        source: &SnapshotId,
-    ) -> Result<PreparedSnapshotOperation, WorkspaceError> {
-        self.0
-            .send(WorkspaceCapability::SnapshotPrepareRestore)
-            .unwrap();
-        Ok(PreparedSnapshotOperation {
-            operation: OperationHandle {
-                preparation_id: OperationId::new(SNAPSHOT_TEST_RESTORE).unwrap(),
-                invocation_id: None,
-                execution_id: None,
-                expires_at_unix_ms: None,
-            },
-            preview: SnapshotOperationPreview::Restore(SnapshotRestorePreview {
-                restore_id: RestoreId::new(SNAPSHOT_TEST_RESTORE).unwrap(),
-                target_snapshot_id: target.clone(),
-                source_snapshot_id: source.clone(),
-                counts: SnapshotChangeCounts {
-                    replace: u32::from(target != source),
-                    ..SnapshotChangeCounts::default()
-                },
-                changes: Vec::new(),
-                created_directories: Vec::new(),
-            }),
-        })
-    }
-
-    async fn prepare_unrevert(
-        &self,
-        _binding: &SessionWorkspaceBinding,
-        _cursor: &WorkspaceCursor,
-        _restore_id: &RestoreId,
-    ) -> Result<PreparedSnapshotOperation, WorkspaceError> {
-        self.unsupported(WorkspaceCapability::SnapshotPrepareUnrevert)
-    }
-
-    async fn prepare_cleanup(
-        &self,
-        _binding: &SessionWorkspaceBinding,
-        _cursor: &WorkspaceCursor,
-        _checkpoint_ids: &[CheckpointId],
-    ) -> Result<PreparedSnapshotOperation, WorkspaceError> {
-        self.unsupported(WorkspaceCapability::SnapshotPrepareCleanup)
-    }
-
-    async fn execute(
-        &self,
-        _binding: &SessionWorkspaceBinding,
-        _cursor: &WorkspaceCursor,
-        _prepared: &PreparedSnapshotOperation,
-    ) -> Result<OperationStatus<SnapshotOperationResult>, WorkspaceError> {
-        self.unsupported(WorkspaceCapability::SnapshotExecute)
-    }
-
-    async fn operation_status(
-        &self,
-        _binding: &SessionWorkspaceBinding,
-        _cursor: &WorkspaceCursor,
-        _operation: &OperationHandle,
-    ) -> Result<OperationStatus<SnapshotOperationResult>, WorkspaceError> {
-        self.unsupported(WorkspaceCapability::SnapshotOperationStatus)
-    }
-
-    async fn cancel(
-        &self,
-        _binding: &SessionWorkspaceBinding,
-        _cursor: &WorkspaceCursor,
-        _operation: &OperationHandle,
-    ) -> Result<CancellationResult, WorkspaceError> {
-        self.unsupported(WorkspaceCapability::SnapshotCancel)
-    }
-
-    async fn acknowledge(
-        &self,
-        _binding: &SessionWorkspaceBinding,
-        _cursor: &WorkspaceCursor,
-        _restore_id: &RestoreId,
-    ) -> Result<SnapshotRestoreStatus, WorkspaceError> {
-        self.unsupported(WorkspaceCapability::SnapshotAcknowledge)
-    }
-
-    async fn release(
-        &self,
-        _binding: &SessionWorkspaceBinding,
-        _cursor: &WorkspaceCursor,
-        _prepared: &PreparedSnapshotOperation,
-    ) -> Result<ReleaseResult, WorkspaceError> {
-        self.0.send(WorkspaceCapability::SnapshotRelease).unwrap();
-        Ok(ReleaseResult {
-            state: OperationPhase::Cancelled,
-            released: true,
-        })
-    }
-}
-
-fn install_snapshot_restore_probe(app: &mut App) -> flume::Receiver<WorkspaceCapability> {
-    let (requests_tx, requests) = flume::unbounded();
-    let workspace = app.workspace_session.as_ref().unwrap();
-    let handle = WorkspaceHandle::new(
-        workspace.workspace().authority().clone(),
-        WorkspaceCapabilities::new([
-            WorkspaceCapability::SnapshotCapture,
-            WorkspaceCapability::SnapshotPrepareRestore,
-            WorkspaceCapability::SnapshotPrepareUnrevert,
-            WorkspaceCapability::SnapshotRelease,
-        ]),
-        WorkspaceServices {
-            snapshot_read: workspace.workspace().services().snapshot_read.clone(),
-            snapshot_mutation: Some(Arc::new(SnapshotRestoreProbe(requests_tx))),
-            ..WorkspaceServices::default()
-        },
-    )
-    .unwrap();
-    let workspace = WorkspaceSession::new(
-        handle,
-        workspace.binding().clone(),
-        workspace.cursor().clone(),
-    )
-    .unwrap();
-    app.workspace_baseline.rebind_workspace_session(
-        app.storage.clone(),
-        app.state.session.id,
-        workspace.clone(),
-        app.state.session.workspace_binding().unwrap().clone(),
-    );
-    app.workspace_session = Some(workspace);
-    requests
-}
-
-fn remote_snapshot_app(
-    enabled: bool,
-    existing: bool,
-) -> (TempDir, App, flume::Receiver<()>, flume::Sender<()>) {
-    let (temp, _, _, mut app) = tempdir_app();
-    let target = remote_workspace_session();
-    let (started_tx, started) = flume::bounded(1);
-    let (resume, resume_rx) = flume::bounded(1);
-    let service = Arc::new(BlockedSnapshots {
-        started: started_tx,
-        resume: resume_rx,
-    });
-    let handle = WorkspaceHandle::new(
-        target.workspace().authority().clone(),
-        WorkspaceCapabilities::new([WorkspaceCapability::SnapshotCapture]),
-        WorkspaceServices {
-            snapshot_read: Some(service),
-            ..WorkspaceServices::default()
-        },
-    )
-    .unwrap();
-    let workspace =
-        WorkspaceSession::new(handle, target.binding().clone(), target.cursor().clone()).unwrap();
-    let binding = StoredWorkspaceBinding::new_with_cursor(
-        workspace.binding().clone(),
-        workspace.cursor().clone(),
-        None,
-    )
-    .unwrap();
-    app.state.session = Arc::new(AppSession::new_with_workspace("test", ".", binding.clone()));
-    app.state
-        .session_mut()
-        .replace_messages(crate::history_items(&[Message::user(FIRST_CONTENT.into())]));
-    if existing {
-        let baseline = WorkspaceBaseline::new_workspace_session(
-            app.storage.clone(),
-            app.state.session.id,
-            workspace.clone(),
-            binding.clone(),
-            SnapshotsConfig::default(),
-        );
-        resume.send(()).unwrap();
-        smol::block_on(baseline.ensure(None)).into_result().unwrap();
-        started.recv_timeout(SNAPSHOT_TEST_TIMEOUT).unwrap();
-    }
-    app.snapshots_config.enabled = enabled;
-    app.workspace_baseline = WorkspaceBaseline::new_workspace_session(
-        app.storage.clone(),
-        app.state.session.id,
-        workspace.clone(),
-        binding,
-        app.snapshots_config,
-    );
-    app.workspace_session = Some(workspace);
-    (temp, app, started, resume)
-}
-
-fn wait_for_snapshot_task(app: &App) {
-    smol::block_on(future::or(
-        async {
-            while !app.pending_snapshot.as_ref().unwrap().task.is_finished() {
-                future::yield_now().await;
-            }
-        },
-        async {
-            Timer::after(SNAPSHOT_TEST_TIMEOUT).await;
-            panic!("{SNAPSHOT_TEST_TIMEOUT_MSG}");
-        },
-    ));
-}
-
-fn wait_for_snapshot_gate(baseline: &WorkspaceBaseline) {
-    smol::block_on(future::or(
-        async {
-            baseline.ensure(None).await.into_result().unwrap();
-        },
-        async {
-            Timer::after(SNAPSHOT_TEST_TIMEOUT).await;
-            panic!("{SNAPSHOT_TEST_TIMEOUT_MSG}");
-        },
-    ));
-}
-
-#[test_case(RestoreMode::Files, false; "files")]
-#[test_case(RestoreMode::Both, false; "files_and_conversation")]
-#[test_case(RestoreMode::Files, true; "files_with_cached_preview")]
-#[test_case(RestoreMode::Both, true; "both_with_cached_preview")]
-fn remote_final_snapshot_defers_file_rewind_until_source_is_captured(
-    mode: RestoreMode,
-    cached: bool,
-) {
-    let (_temp, mut app, started, resume) = remote_snapshot_app(true, true);
-    let requests = install_snapshot_restore_probe(&mut app);
-    let head = app.history_head().unwrap();
-    let root = app
-        .workspace_baseline
-        .remote_capture(None)
-        .unwrap()
-        .unwrap();
-    if cached {
-        assert!(app.revert_to(head, mode).is_empty());
-        assert!(app.remote_restore_confirmation.is_some());
-        assert_eq!(
-            requests.try_recv().unwrap(),
-            WorkspaceCapability::SnapshotPrepareRestore
-        );
-    }
-    app.snapshot_history_head().unwrap();
-    started.recv_timeout(SNAPSHOT_TEST_TIMEOUT).unwrap();
-    if cached {
-        assert_eq!(
-            requests.try_recv().unwrap(),
-            WorkspaceCapability::SnapshotRelease
-        );
-    }
-    assert!(app.remote_restore_confirmation.is_none());
-    assert!(app.revert_to(head, mode).is_empty());
-    assert_eq!(
-        app.status_bar.flash_text(),
-        Some(REVERT_SNAPSHOT_PENDING_MSG)
-    );
-    assert!(requests.is_empty());
-    assert!(app.remote_restore_confirmation.is_none());
-    assert!(app.state.session.meta.pending_revert.is_none());
-    assert_eq!(app.history_head(), Some(head));
-    resume.send(()).unwrap();
-    wait_for_snapshot_task(&app);
-    assert!(app.revert_to(head, mode).is_empty());
-    assert_eq!(
-        requests.try_recv().unwrap(),
-        WorkspaceCapability::SnapshotPrepareRestore
-    );
-    assert!(requests.is_empty());
-    assert!(app.pending_snapshot.is_none());
-    let captured = app
-        .workspace_baseline
-        .remote_capture(Some(head))
-        .unwrap()
-        .unwrap();
-    let confirmation = app.remote_restore_confirmation.as_ref().unwrap();
-    let SnapshotOperationPreview::Restore(preview) = &confirmation.prepared.preview else {
-        unreachable!()
-    };
-    assert_eq!(preview.source_snapshot_id, captured.snapshot_id);
-    assert_eq!(preview.target_snapshot_id, root.snapshot_id);
-    assert_ne!(preview.source_snapshot_id, preview.target_snapshot_id);
-    assert_eq!(preview.counts.replace, 1);
-    assert_eq!(app.history_head(), Some(head));
-}
-
-#[test_case(false; "conversation_only")]
-#[test_case(true; "files")]
-fn remote_final_snapshot_only_blocks_unrevert_that_changes_files(files: bool) {
-    let (_temp, mut app, started, resume) = remote_snapshot_app(true, true);
-    let requests = install_snapshot_restore_probe(&mut app);
-    let head = app.history_head().unwrap();
-    app.snapshot_history_head().unwrap();
-    started.recv_timeout(SNAPSHOT_TEST_TIMEOUT).unwrap();
-    assert!(matches!(
-        app.revert_to(head, RestoreMode::Conversation).as_slice(),
-        [Action::LoadSession(_)]
-    ));
-    assert_eq!(app.history_head(), None);
-    if files {
-        let root = app
-            .workspace_baseline
-            .remote_capture(None)
-            .unwrap()
-            .unwrap();
-        let status = SnapshotRestoreStatus {
-            restore_id: RestoreId::new(SNAPSHOT_TEST_RESTORE).unwrap(),
-            state: SnapshotRestoreState::Completed,
-            source_snapshot_id: root.snapshot_id.clone(),
-            target_snapshot_id: root.snapshot_id,
-            applied_files: 0,
-            total_files: 0,
-            acknowledgement_required: true,
-            reconciliation_required: false,
-            unrevert_of: None,
-        };
-        app.state
-            .session_mut()
-            .meta
-            .pending_revert
-            .as_mut()
-            .unwrap()
-            .file_status = Some(serde_json::to_value(status).unwrap());
-        let pending = app.state.session.meta.pending_revert.clone();
-        assert!(app.unrevert().is_empty());
-        assert_eq!(
-            app.status_bar.flash_text(),
-            Some(REVERT_SNAPSHOT_PENDING_MSG)
-        );
-        assert_eq!(app.state.session.meta.pending_revert, pending);
-        assert_eq!(app.history_head(), None);
-    } else {
-        assert!(matches!(
-            app.unrevert().as_slice(),
-            [Action::LoadSession(_)]
-        ));
-        assert_eq!(app.history_head(), Some(head));
-        assert!(app.state.session.meta.pending_revert.is_none());
-    }
-    assert!(requests.is_empty());
-    assert!(app.remote_restore_confirmation.is_none());
-    resume.send(()).unwrap();
-    wait_for_snapshot_task(&app);
-    if files {
-        assert!(app.unrevert().is_empty());
-        assert_eq!(
-            requests.try_recv().unwrap(),
-            WorkspaceCapability::SnapshotPrepareUnrevert
-        );
-    } else {
-        let _ = app.tick();
-    }
-    assert!(app.pending_snapshot.is_none());
-    assert!(requests.is_empty());
-}
-
-#[test_case(false; "current_head")]
-#[test_case(true; "head_advanced")]
-fn remote_final_snapshot_returns_before_capture_and_announces_only_current_head(advance: bool) {
-    let (_temp, mut app, started, resume) = remote_snapshot_app(true, true);
-    let head = app.history_head();
-    app.snapshot_history_head().unwrap();
-    started.recv_timeout(SNAPSHOT_TEST_TIMEOUT).unwrap();
-    assert!(app.pending_snapshot.is_some());
-    assert!(app.workspace_baseline.is_capturing());
-    assert!(
-        app.workspace_baseline
-            .remote_capture(head)
-            .unwrap()
-            .is_none()
-    );
-    assert_ne!(app.status_bar.flash_text(), Some(REMOTE_SNAPSHOT_READY));
-    app.snapshot_history_head().unwrap();
-    assert!(started.is_empty());
-    if advance {
-        app.state
-            .session_mut()
-            .replace_messages(crate::history_items(&[Message::user(
-                CURRENT_CONTENT.into(),
-            )]));
-    }
-    resume.send(()).unwrap();
-    wait_for_snapshot_task(&app);
-    let _ = app.tick();
-    assert!(app.pending_snapshot.is_none());
-    assert_eq!(
-        app.status_bar.flash_text() == Some(REMOTE_SNAPSHOT_READY),
-        !advance
-    );
-    assert!(
-        app.workspace_baseline
-            .remote_capture(head)
-            .unwrap()
-            .is_some()
-    );
-    assert_eq!(app.poll_snapshot_capture(), Dirty::NO);
-}
-
-#[test_case(false; "rebind")]
-#[test_case(true; "drop_app")]
-fn remote_final_snapshot_is_cancelled_with_its_owner(drop_app: bool) {
-    let (_temp, mut app, started, _resume) = remote_snapshot_app(true, true);
-    let baseline = Arc::clone(&app.workspace_baseline);
-    app.snapshot_history_head().unwrap();
-    started.recv_timeout(SNAPSHOT_TEST_TIMEOUT).unwrap();
-    if drop_app {
-        drop(app);
-        wait_for_snapshot_gate(&baseline);
-    } else {
-        let workspace = app.workspace_session.clone().unwrap();
-        app.state.session = Arc::new(AppSession::new_with_workspace(
-            "test",
-            ".",
-            app.state.session.workspace_binding().unwrap().clone(),
-        ));
-        baseline.rebind_workspace_session(
-            app.storage.clone(),
-            app.state.session.id,
-            workspace,
-            app.state.session.workspace_binding().unwrap().clone(),
-        );
-        wait_for_snapshot_task(&app);
-        let _ = app.tick();
-        assert!(app.pending_snapshot.is_none());
-        assert_ne!(app.status_bar.flash_text(), Some(REMOTE_SNAPSHOT_READY));
-    }
-    assert!(!baseline.is_capturing());
-}
-
-#[test_case(Duration::ZERO, false; "expired_before_schedule")]
-#[test_case(Duration::ZERO, true; "expired_while_running")]
-#[test_case(SNAPSHOT_TEST_BUDGET, false; "bounded_new_capture")]
-#[test_case(SNAPSHOT_TEST_BUDGET, true; "bounded_running_capture")]
-fn remote_final_snapshot_shutdown_honors_budget(budget: Duration, running: bool) {
-    let (_temp, mut app, started, _resume) = remote_snapshot_app(true, true);
-    let head = app.history_head();
-    if running {
-        app.snapshot_history_head().unwrap();
-        started.recv_timeout(SNAPSHOT_TEST_TIMEOUT).unwrap();
-    }
-    let start = Instant::now();
-    assert!(!app.snapshot_history_head_within(budget).unwrap());
-    assert!(start.elapsed() < SNAPSHOT_TEST_TIMEOUT);
-    assert!(app.pending_snapshot.is_none());
-    wait_for_snapshot_gate(&app.workspace_baseline);
-    assert!(!app.workspace_baseline.is_capturing());
-    assert!(
-        app.workspace_baseline
-            .remote_capture(head)
-            .unwrap()
-            .is_none()
-    );
-    if budget.is_zero() && !running {
-        assert!(started.is_empty());
-    }
-}
-
-#[test_case(false; "running")]
-#[test_case(true; "completed")]
-fn remote_final_snapshot_cannot_announce_for_another_binding(completed: bool) {
-    let (_temp, mut app, started, resume) = remote_snapshot_app(true, true);
-    app.snapshot_history_head().unwrap();
-    started.recv_timeout(SNAPSHOT_TEST_TIMEOUT).unwrap();
-    if completed {
-        resume.send(()).unwrap();
-        wait_for_snapshot_task(&app);
-    }
-    let workspace = app.workspace_session.as_ref().unwrap();
-    let cursor = WorkspaceCursor::new(
-        workspace.binding(),
-        ResourceScope::root(ResourceId::new(SNAPSHOT_TEST_REBOUND_ROOT).unwrap()),
-        2,
-        CwdHandle::new(SNAPSHOT_TEST_REBOUND_CURSOR).unwrap(),
-    );
-    let binding =
-        StoredWorkspaceBinding::new_with_cursor(workspace.binding().clone(), cursor, None).unwrap();
-    app.state
-        .session_mut()
-        .replace_workspace_cursor(binding)
-        .unwrap();
-    let _ = app.tick();
-    assert!(app.pending_snapshot.is_none());
-    assert_ne!(app.status_bar.flash_text(), Some(REMOTE_SNAPSHOT_READY));
-    wait_for_snapshot_gate(&app.workspace_baseline);
-    assert!(!app.workspace_baseline.is_capturing());
-}
-
-#[test_case(false; "success")]
-#[test_case(true; "new_head_is_busy")]
-fn remote_final_snapshot_shutdown_observes_the_scheduled_head(advance: bool) {
-    let (_temp, mut app, started, resume) = remote_snapshot_app(true, true);
-    let head = app.history_head();
-    app.snapshot_history_head().unwrap();
-    started.recv_timeout(SNAPSHOT_TEST_TIMEOUT).unwrap();
-    if advance {
-        app.state
-            .session_mut()
-            .replace_messages(crate::history_items(&[Message::user(
-                CURRENT_CONTENT.into(),
-            )]));
-        assert_eq!(
-            app.snapshot_history_head(),
-            Err(REMOTE_SNAPSHOT_BUSY.to_owned())
-        );
-        assert!(
-            !app.snapshot_history_head_within(SNAPSHOT_TEST_TIMEOUT)
-                .unwrap()
-        );
-        wait_for_snapshot_gate(&app.workspace_baseline);
-        assert!(
-            app.workspace_baseline
-                .remote_capture(head)
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            app.workspace_baseline
-                .remote_capture(app.history_head())
-                .unwrap()
-                .is_none()
-        );
-    } else {
-        resume.send(()).unwrap();
-        assert!(
-            app.snapshot_history_head_within(SNAPSHOT_TEST_TIMEOUT)
-                .unwrap()
-        );
-        assert!(
-            app.workspace_baseline
-                .remote_capture(head)
-                .unwrap()
-                .is_some()
-        );
-    }
-    assert!(app.pending_snapshot.is_none());
-    assert!(started.is_empty());
-}
-
-#[test_case(false, false; "disabled_fresh")]
-#[test_case(false, true; "disabled_existing")]
-#[test_case(true, false; "no_revert_point")]
-fn remote_final_snapshot_requires_enabled_revert_point(enabled: bool, existing: bool) {
-    let (_temp, mut app, started, _resume) = remote_snapshot_app(enabled, existing);
-    app.snapshot_history_head().unwrap();
-    assert!(app.pending_snapshot.is_none());
-    assert!(started.is_empty());
-    assert!(app.snapshot_history_head_within(Duration::ZERO).unwrap());
-    assert!(
-        app.snapshot_history_head_within(SNAPSHOT_TEST_BUDGET)
-            .unwrap()
-    );
-}
-
-fn snapshot_revert_app() -> (TempDir, App, PathBuf, CaudraId, CaudraId, CaudraId) {
-    let (temp, _, _, mut app) = tempdir_app();
-    let workspace = PathBuf::from(&app.state.session.cwd);
-    let path = workspace.join(SNAPSHOT_FILE);
-    std::fs::write(&path, ROOT_CONTENT).unwrap();
-    app.snapshot_store
-        .snapshot_session_start(&workspace)
-        .unwrap();
-
-    let items = crate::history_items(&[
-        Message::user("first prompt".into()),
-        assistant_message("first response"),
-        Message::user("second prompt".into()),
-        assistant_message("second response"),
-    ]);
-    let first_user = items[0].id;
-    let first_head = items[1].id;
-    let second_user = items[2].id;
-    let current_head = items[3].id;
-    app.state.session_mut().replace_messages(items);
-
-    std::fs::write(&path, FIRST_CONTENT).unwrap();
-    app.snapshot_store.snapshot(&workspace, first_head).unwrap();
-    std::fs::write(&path, CURRENT_CONTENT).unwrap();
-    app.snapshot_store
-        .snapshot(&workspace, current_head)
-        .unwrap();
-
-    (temp, app, path, first_user, second_user, first_head)
-}
-
-fn persist_both_restore_intent(app: &mut App, target_head: Option<CaudraId>) -> CaudraId {
-    let source_head = crate::session_history_head(&app.state.session);
-    let operation_id = CaudraId::generate();
-    app.state.session_mut().set_conversation_state(
-        source_head,
-        Some(PendingConversationRevert {
-            original_head: source_head,
-            target_head,
-            original_workspace_head: Some(source_head.into()),
-            workspace_head: Some(source_head.into()),
-            file_status: None,
-            restore_operation: Some(PendingRestoreOperation {
-                id: operation_id,
-                kind: PendingRestoreKind::Revert,
-                phase: PendingRestorePhase::Intent,
-                target_workspace_head: target_head.into(),
-                conversation_target: Some(target_head.into()),
-                overwrite: false,
-            }),
-        }),
-    );
-    app.storage_writer
-        .save_sync(Arc::clone(&app.state.session))
-        .unwrap();
-    operation_id
-}
-
-/// A run that never writes must leave the disk as it found it: no store, no
-/// snapshots, and nothing for a later exit to close.
-#[test]
-fn a_run_that_writes_nothing_leaves_no_revert_point() {
-    const UNTOUCHED_MSG: &str = "a read-only run must capture no workspace state";
-    let (_temp, _, _, mut app) = tempdir_app();
-    std::fs::write(
-        PathBuf::from(&app.state.session.cwd).join(SNAPSHOT_FILE),
-        FIRST_CONTENT,
-    )
-    .unwrap();
-
-    let actions = app.start_from_queue(&QueuedMessage {
-        text: "next prompt".into(),
-        images: Vec::new(),
-        mentions: Vec::new(),
-        commits: Vec::new(),
-        paste_ranges: Vec::new(),
-    });
-    app.update(done_event());
-
-    assert!(matches!(actions.as_slice(), [Action::SendMessage(_)]));
-    assert!(!app.snapshot_store.has_session_start(), "{UNTOUCHED_MSG}");
-}
-
-#[test_case(false; "fresh_session")]
-#[test_case(true; "resumed_session")]
-fn disabled_snapshots_skip_baseline_run_and_final_captures(existing: bool) {
-    let (_temp, _, _, mut app) = tempdir_app();
-    let workspace = PathBuf::from(&app.state.session.cwd);
-    let path = workspace.join(SNAPSHOT_FILE);
-    std::fs::write(&path, FIRST_CONTENT).unwrap();
-    if existing {
-        app.snapshot_store
-            .snapshot_session_start(&workspace)
-            .unwrap();
-    }
-    app.snapshots_config.enabled = false;
-    app.workspace_baseline = WorkspaceBaseline::new(
-        Arc::clone(&app.snapshot_store),
-        workspace,
-        app.snapshots_config,
-    );
-    let blocker = format!(
-        "{NO_FILE_REVERT_MSG}: {}",
-        app.workspace_baseline.unavailable_reason().unwrap()
-    );
-    app.state
-        .session_mut()
-        .replace_messages(crate::history_items(&[
-            Message::user(FIRST_CONTENT.into()),
-            assistant_message(CURRENT_CONTENT),
-        ]));
-    let head = app.history_head().unwrap();
-    smol::block_on(app.workspace_baseline.ensure(Some(head)))
-        .into_result()
-        .unwrap();
-    std::fs::write(&path, CURRENT_CONTENT).unwrap();
-    app.update(done_event());
-    app.snapshot_history_head().unwrap();
-    assert!(app.snapshot_history_head_within(Duration::ZERO).unwrap());
-
-    assert!(!app.has_revert_point());
-    assert_eq!(app.file_revert_blocker(), Some(blocker.clone()));
-    assert!(app.revert_to(head, RestoreMode::Files).is_empty());
-    assert_eq!(app.status_bar.flash_text(), Some(blocker.as_str()));
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), CURRENT_CONTENT);
-    assert!(!app.snapshot_store.has_checkpoint(head));
-    assert_eq!(app.snapshot_store.has_session_start(), existing);
-    if existing {
-        assert_eq!(
-            app.snapshot_store
-                .snapshot_entries(SnapshotKey::SessionStart)
-                .unwrap()
-                .len(),
-            1
-        );
-    }
-}
-
-#[test]
-fn run_snapshots_are_complete_and_associated_with_atomic_heads() {
-    let (_temp, _, _, mut app) = tempdir_app();
-    let workspace = PathBuf::from(&app.state.session.cwd);
-    let path = workspace.join(SNAPSHOT_FILE);
-    std::fs::write(&path, FIRST_CONTENT).unwrap();
-    let initial = crate::history_items(&[
-        Message::user("first prompt".into()),
-        assistant_message("first response"),
-    ]);
-    let initial_head = initial.last().unwrap().id;
-    app.state.session_mut().replace_messages(initial.clone());
-
-    let actions = app.start_from_queue(&QueuedMessage {
-        text: "next prompt".into(),
-        images: Vec::new(),
-        mentions: Vec::new(),
-        commits: Vec::new(),
-        paste_ranges: Vec::new(),
-    });
-    arm_revert_point(&app);
-
-    assert!(matches!(actions.as_slice(), [Action::SendMessage(_)]));
-    assert!(app.snapshot_store.has_session_start());
-    assert!(app.snapshot_store.has_checkpoint(initial_head));
-    assert_eq!(
-        app.snapshot_store
-            .snapshot_id(SnapshotKey::Checkpoint(initial_head))
-            .unwrap(),
-        app.snapshot_store
-            .snapshot_id(SnapshotKey::SessionStart)
-            .unwrap()
-    );
-
-    let completed = crate::history_items(&[
-        Message::user("first prompt".into()),
-        assistant_message("first response"),
-        Message::user("next prompt".into()),
-        assistant_message("next response"),
-    ]);
-    let completed_head = completed.last().unwrap().id;
-    app.shared_history = Some(Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(
-        completed,
-    ))));
-    std::fs::write(path, CURRENT_CONTENT).unwrap();
-
-    app.update(done_event());
-
-    assert!(app.snapshot_store.has_checkpoint(completed_head));
-    assert_ne!(
-        app.snapshot_store
-            .snapshot_id(SnapshotKey::Checkpoint(completed_head))
-            .unwrap(),
-        app.snapshot_store
-            .snapshot_id(SnapshotKey::Checkpoint(initial_head))
-            .unwrap()
-    );
-}
-
-#[test]
-fn cancelled_top_level_snapshots_atomic_head_but_subagent_completion_does_not() {
-    let (_temp, _, _, mut app) = tempdir_app();
-    let workspace = PathBuf::from(&app.state.session.cwd);
-    std::fs::write(workspace.join(SNAPSHOT_FILE), CURRENT_CONTENT).unwrap();
-    let cancelled = crate::history_items(&[
-        Message::user("cancel me".into()),
-        assistant_message("partial response"),
-    ]);
-    let cancelled_head = cancelled.last().unwrap().id;
-    // Armed before the run's own turn lands, the way a write mid-run is: the
-    // head it anchors on is the one the run started from.
-    arm_revert_point(&app);
-    app.shared_history = Some(Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(
-        cancelled,
-    ))));
-    app.run_id = 2;
-    app.cancelling_run = Some(1);
-    app.status = Status::Streaming;
-
-    app.update(subagent_msg_with_run_id(
-        AgentEvent::Done {
-            usage: TokenUsage::default(),
-            num_turns: 1,
-            reason: DoneReason::EndTurn,
-        },
-        TASK_ID,
-        Some(RESEARCH_NAME),
-        2,
-    ));
-    assert!(!app.snapshot_store.has_checkpoint(cancelled_head));
-
-    app.update(agent_msg_with_run_id(
-        AgentEvent::Done {
-            usage: TokenUsage::default(),
-            num_turns: 1,
-            reason: DoneReason::Cancelled,
-        },
-        1,
-    ));
-
-    assert!(app.snapshot_store.has_checkpoint(cancelled_head));
-    assert_eq!(app.cancelling_run, None);
-    assert_eq!(app.status, Status::Idle);
-}
-
-#[test]
-fn cancellation_stays_non_quiescent_until_the_matching_top_level_terminal_event() {
-    let (_temp, _, _, mut app) = tempdir_app();
-    let workspace = PathBuf::from(&app.state.session.cwd);
-    let path = workspace.join(SNAPSHOT_FILE);
-    std::fs::write(&path, FIRST_CONTENT).unwrap();
-    let history = crate::history_items(&[
-        Message::user("cancel me".into()),
-        assistant_message("partial response"),
-    ]);
-    let head = history.last().unwrap().id;
-    app.shared_history = Some(Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(
-        history,
-    ))));
-    let (shared_queue, receiver) = shared_queue::queue();
-    app.queue.set_shared(shared_queue);
-    app.status = Status::Streaming;
-    app.run_id = 7;
-    receiver.set_active_run(app.run_id);
-    arm_revert_point(&app);
-
-    let actions = app.handle_cancel();
-
-    assert!(matches!(
-        actions.as_slice(),
-        [Action::CancelAgent { run_id: 7 }]
-    ));
-    assert_eq!(app.cancelling_run, Some(7));
-    assert_eq!(app.status, Status::Streaming);
-    assert!(matches!(
-        app.submit_prompt(queued_msg("new work")),
-        SubmitOutcome::Queued
-    ));
-    app.update(agent_msg_with_run_id(done(), 6));
-    assert_eq!(app.cancelling_run, Some(7));
-    assert_eq!(app.status, Status::Streaming);
-
-    app.update(agent_msg_with_run_id(
-        AgentEvent::Error {
-            message: "cancelled".into(),
-        },
-        7,
-    ));
-
-    assert_eq!(app.cancelling_run, None);
-    assert_eq!(app.status, Status::Streaming);
-    assert_eq!(app.queue.text_messages(), ["new work"]);
-    let captured = app
-        .snapshot_store
-        .snapshot_id(SnapshotKey::Checkpoint(head))
-        .unwrap();
-    std::fs::write(path, CURRENT_CONTENT).unwrap();
-    app.update(agent_msg_with_run_id(done(), 7));
-    assert_eq!(
-        app.snapshot_store
-            .snapshot_id(SnapshotKey::Checkpoint(head))
-            .unwrap(),
-        captured
-    );
-}
-
-#[test]
-fn both_restore_moves_files_then_conversation() {
-    let (_temp, mut app, path, _, second_user, first_head) = snapshot_revert_app();
-
-    let actions = app.revert_to(second_user, RestoreMode::Both);
-
-    assert!(matches!(actions.as_slice(), [Action::LoadSession(_)]));
-    assert_eq!(std::fs::read_to_string(path).unwrap(), FIRST_CONTENT);
-    assert_eq!(
-        crate::session_history_head(&app.state.session),
-        Some(first_head)
-    );
-    assert_eq!(app.input_box.buffer.value(), "second prompt");
-    let status: RestoreStatus = serde_json::from_value(
-        app.state
-            .session
-            .meta
-            .pending_revert
-            .as_ref()
-            .unwrap()
-            .file_status
-            .clone()
-            .unwrap(),
-    )
-    .unwrap();
-    assert!(status.is_restored());
-}
-
-#[test]
-fn both_restore_conflict_preserves_conversation_head() {
-    let (_temp, mut app, path, _, second_user, _) = snapshot_revert_app();
-    let original_head = crate::session_history_head(&app.state.session);
-    std::fs::write(&path, CONFLICT_CONTENT).unwrap();
-
-    let actions = app.revert_to(second_user, RestoreMode::Both);
-
-    assert!(actions.is_empty());
-    assert_eq!(
-        crate::session_history_head(&app.state.session),
-        original_head
-    );
-    assert_eq!(std::fs::read_to_string(path).unwrap(), CONFLICT_CONTENT);
-    let status: RestoreStatus = serde_json::from_value(
-        app.state
-            .session
-            .meta
-            .pending_revert
-            .as_ref()
-            .unwrap()
-            .file_status
-            .clone()
-            .unwrap(),
-    )
-    .unwrap();
-    assert!(matches!(
-        status,
-        RestoreStatus::Failed {
-            kind: RestoreFailureKind::Conflicts,
-            ..
-        }
-    ));
-}
-
-#[test]
-fn both_restore_to_first_user_restores_session_root() {
-    let (_temp, mut app, path, first_user, _, _) = snapshot_revert_app();
-
-    let actions = app.revert_to(first_user, RestoreMode::Both);
-
-    assert!(matches!(actions.as_slice(), [Action::LoadSession(_)]));
-    assert_eq!(crate::session_history_head(&app.state.session), None);
-    assert_eq!(std::fs::read_to_string(path).unwrap(), ROOT_CONTENT);
-    assert_eq!(app.input_box.buffer.value(), "first prompt");
-}
-
-#[test]
-fn recovery_completes_intent_saved_before_the_restore_journal_exists() {
-    let (_temp, mut app, path, _, _, first_head) = snapshot_revert_app();
-    persist_both_restore_intent(&mut app, Some(first_head));
-    assert_eq!(app.snapshot_store.journal_operation_id().unwrap(), None);
-    let session_id = app.state.session.id;
-    let mut restarted = AppSession::load(session_id, &app.storage).unwrap();
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), CURRENT_CONTENT);
-    assert!(
-        restarted
-            .meta
-            .pending_revert
-            .as_ref()
-            .is_some_and(|pending| pending.restore_operation.is_some())
-    );
-
-    recover_pending_workspace_restore(&mut restarted, &app.snapshot_store, &app.storage_writer)
-        .unwrap();
-
-    assert_eq!(std::fs::read_to_string(path).unwrap(), FIRST_CONTENT);
-    assert_eq!(crate::session_history_head(&restarted), Some(first_head));
-    assert!(
-        restarted
-            .meta
-            .pending_revert
-            .as_ref()
-            .is_some_and(|pending| pending.restore_operation.is_none())
-    );
-    assert_eq!(app.snapshot_store.journal_operation_id().unwrap(), None);
-}
-
-#[test]
-fn recovery_moves_conversation_after_a_completed_file_journal() {
-    let (_temp, mut app, path, _, _, first_head) = snapshot_revert_app();
-    let source_head = crate::session_history_head(&app.state.session).unwrap();
-    let operation_id = persist_both_restore_intent(&mut app, Some(first_head));
-    let cwd = PathBuf::from(&app.state.session.cwd);
-
-    app.snapshot_store
-        .restore_transaction_with_policy(
-            &cwd,
-            &[source_head],
-            &[first_head],
-            caudra_agent::snapshots::ConflictPolicy::Abort,
-            operation_id,
-        )
-        .unwrap();
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), FIRST_CONTENT);
-    let session_id = app.state.session.id;
-    let mut restarted = AppSession::load(session_id, &app.storage).unwrap();
-    assert_eq!(crate::session_history_head(&restarted), Some(source_head));
-
-    recover_pending_workspace_restore(&mut restarted, &app.snapshot_store, &app.storage_writer)
-        .unwrap();
-
-    assert_eq!(std::fs::read_to_string(path).unwrap(), FIRST_CONTENT);
-    assert_eq!(crate::session_history_head(&restarted), Some(first_head));
-    assert_eq!(app.snapshot_store.journal_operation_id().unwrap(), None);
-}
-
-#[test]
-fn conversation_then_files_revert_uses_the_workspace_head_as_its_source() {
-    let (_temp, mut app, path, first_user, second_user, _) = snapshot_revert_app();
-
-    app.revert_to(second_user, RestoreMode::Conversation);
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), CURRENT_CONTENT);
-
-    let actions = app.revert_to(first_user, RestoreMode::Files);
-
-    assert!(actions.is_empty());
-    assert_eq!(std::fs::read_to_string(path).unwrap(), ROOT_CONTENT);
-    let pending = app.state.session.meta.pending_revert.as_ref().unwrap();
-    assert_eq!(pending.workspace_head.as_ref().unwrap().head, None);
-}
-
-#[test]
-fn files_then_conversation_revert_preserves_the_workspace_source_chain() {
-    let (_temp, mut app, path, first_user, second_user, _) = snapshot_revert_app();
-    let current_head = app.state.session.messages().last().unwrap().id;
-
-    app.revert_to(second_user, RestoreMode::Files);
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), FIRST_CONTENT);
-    app.revert_to(first_user, RestoreMode::Conversation);
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), FIRST_CONTENT);
-
-    let actions = app.revert_to(current_head, RestoreMode::Files);
-
-    assert!(actions.is_empty());
-    assert_eq!(std::fs::read_to_string(path).unwrap(), CURRENT_CONTENT);
-    let pending = app.state.session.meta.pending_revert.as_ref().unwrap();
-    assert_eq!(
-        pending.workspace_head.as_ref().unwrap().head,
-        Some(current_head)
-    );
-}
-
 #[test]
 fn user_revert_restores_display_text_and_images_as_draft() {
     let mut app = test_app();
@@ -13271,137 +12146,6 @@ fn fork_and_revert_through_parallel_result_include_the_whole_result_group() {
     );
 }
 
-#[test_case(true; "enabled")]
-#[test_case(false; "disabled")]
-fn unrevert_restores_worktree_before_original_conversation(enabled: bool) {
-    let (_temp, mut app, path, _, second_user, _) = snapshot_revert_app();
-    let original_head = crate::session_history_head(&app.state.session);
-    app.revert_to(second_user, RestoreMode::Both);
-
-    app.snapshots_config.enabled = enabled;
-    app.workspace_baseline = WorkspaceBaseline::new(
-        Arc::clone(&app.snapshot_store),
-        PathBuf::from(&app.state.session.cwd),
-        app.snapshots_config,
-    );
-    let actions = app.unrevert();
-
-    assert!(matches!(actions.as_slice(), [Action::LoadSession(_)]));
-    assert_eq!(std::fs::read_to_string(path).unwrap(), CURRENT_CONTENT);
-    assert_eq!(
-        crate::session_history_head(&app.state.session),
-        original_head
-    );
-    assert!(app.state.session.meta.pending_revert.is_none());
-}
-
-#[test]
-fn fresh_file_revert_replaces_the_unrevert_baseline_after_continued_work() {
-    let (_temp, mut app, path, first_user, second_user, first_head) = snapshot_revert_app();
-    app.revert_to(second_user, RestoreMode::Both);
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), FIRST_CONTENT);
-
-    let mut continued = crate::active_session_history(&app.state.session).unwrap();
-    let mut parent = Some(first_head);
-    for message in [
-        Message::user("continue on reverted branch".into()),
-        assistant_message("continued response"),
-    ] {
-        for item in expand_message(&message, parent) {
-            parent = Some(item.id);
-            continued.push(item);
-        }
-    }
-    app.shared_history = Some(Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(
-        continued,
-    ))));
-    std::fs::write(&path, CONTINUED_CONTENT).unwrap();
-    app.checkpoint();
-    assert!(app.state.session.meta.pending_revert.is_none());
-    app.snapshot_history_head().unwrap();
-
-    app.revert_to(first_user, RestoreMode::Files);
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), ROOT_CONTENT);
-    app.unrevert();
-
-    assert_eq!(std::fs::read_to_string(path).unwrap(), CONTINUED_CONTENT);
-    assert!(app.state.session.meta.pending_revert.is_none());
-}
-
-#[test]
-fn unrevert_recovery_keeps_conversation_reverted_until_files_are_restored() {
-    let (_temp, mut app, path, _, second_user, _) = snapshot_revert_app();
-    let original_head = crate::session_history_head(&app.state.session);
-    app.revert_to(second_user, RestoreMode::Both);
-    let reverted_head = crate::session_history_head(&app.state.session);
-    let mut pending = app.state.session.meta.pending_revert.clone().unwrap();
-    let operation_id = CaudraId::generate();
-    pending.restore_operation = Some(PendingRestoreOperation {
-        id: operation_id,
-        kind: PendingRestoreKind::Unrevert,
-        phase: PendingRestorePhase::Intent,
-        target_workspace_head: pending.original_workspace_head.clone().unwrap(),
-        conversation_target: Some(original_head.into()),
-        overwrite: false,
-    });
-    app.state
-        .session_mut()
-        .set_conversation_state(reverted_head, Some(pending));
-    app.storage_writer
-        .save_sync(Arc::clone(&app.state.session))
-        .unwrap();
-    let cwd = PathBuf::from(&app.state.session.cwd);
-
-    app.snapshot_store
-        .unrevert_transaction_with_policy(
-            &cwd,
-            caudra_agent::snapshots::ConflictPolicy::Abort,
-            operation_id,
-        )
-        .unwrap();
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), CURRENT_CONTENT);
-    let mut restarted = AppSession::load(app.state.session.id, &app.storage).unwrap();
-    assert_eq!(crate::session_history_head(&restarted), reverted_head);
-
-    recover_pending_workspace_restore(&mut restarted, &app.snapshot_store, &app.storage_writer)
-        .unwrap();
-
-    assert_eq!(std::fs::read_to_string(path).unwrap(), CURRENT_CONTENT);
-    assert_eq!(crate::session_history_head(&restarted), original_head);
-    assert!(restarted.meta.pending_revert.is_none());
-}
-
-#[test]
-fn unrevert_conflict_keeps_pending_state_and_can_retry() {
-    let (_temp, mut app, path, _, second_user, first_head) = snapshot_revert_app();
-    let original_head = crate::session_history_head(&app.state.session);
-    app.revert_to(second_user, RestoreMode::Both);
-    std::fs::write(&path, CONFLICT_CONTENT).unwrap();
-
-    let actions = app.unrevert();
-
-    assert!(actions.is_empty());
-    assert_eq!(
-        crate::session_history_head(&app.state.session),
-        Some(first_head)
-    );
-    let pending = app.state.session.meta.pending_revert.as_ref().unwrap();
-    let status: RestoreStatus =
-        serde_json::from_value(pending.file_status.clone().unwrap()).unwrap();
-    assert!(status.worktree_is_reverted());
-
-    std::fs::write(&path, FIRST_CONTENT).unwrap();
-    let actions = app.unrevert();
-
-    assert!(matches!(actions.as_slice(), [Action::LoadSession(_)]));
-    assert_eq!(std::fs::read_to_string(path).unwrap(), CURRENT_CONTENT);
-    assert_eq!(
-        crate::session_history_head(&app.state.session),
-        original_head
-    );
-    assert!(app.state.session.meta.pending_revert.is_none());
-}
-
 #[test]
 fn fork_targets_every_display_source_with_user_before_and_other_items_inclusive() {
     let (_temp, _, _, mut app) = tempdir_app();
@@ -13482,7 +12226,7 @@ fn fork_at_unfinished_tool_is_inclusive_and_does_not_continue_automatically() {
         result_id: None,
     };
     app.state.session_mut().replace_messages(items.clone());
-    app.message_actions.open(source, false);
+    app.message_actions.open(source, false, None);
     app.update(Msg::Key(key(KeyCode::Down)));
 
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
@@ -14636,44 +13380,8 @@ fn fork_discards_remote_plan_authority() {
 }
 
 #[test]
-fn fork_copies_ancestor_snapshots_into_child_store_without_restoring_files() {
-    let (_temp, _, _, mut app) = tempdir_app();
-    let workspace = PathBuf::from(&app.state.session.cwd);
-    let path = workspace.join(SNAPSHOT_FILE);
-    std::fs::write(&path, ROOT_CONTENT).unwrap();
-    app.snapshot_store
-        .snapshot_session_start(&workspace)
-        .unwrap();
-    let items =
-        crate::history_items(&[Message::user("prompt".into()), assistant_message("answer")]);
-    app.state.session_mut().replace_messages(items.clone());
-    std::fs::write(&path, FIRST_CONTENT).unwrap();
-    app.snapshot_store
-        .snapshot(&workspace, items[1].id)
-        .unwrap();
-    std::fs::write(&path, CURRENT_CONTENT).unwrap();
-
-    let forked = app
-        .fork_at(DisplaySource::AssistantText(items[1].id))
-        .unwrap();
-    let child = App::snapshot_store_for(
-        &app.storage,
-        forked.session.id,
-        std::path::Path::new(&forked.session.cwd),
-        SnapshotLimits::default(),
-    )
-    .unwrap();
-
-    assert!(child.has_session_start());
-    assert!(child.has_checkpoint(items[1].id));
-    assert_eq!(std::fs::read_to_string(path).unwrap(), CURRENT_CONTENT);
-}
-
-/// A bare not-found out of the store names a missing snapshot. The user needs
-/// to hear why there is no snapshot to miss.
-#[test]
-fn a_files_revert_without_a_baseline_says_why() {
-    const EXPLAINED_MSG: &str = "a revert with no baseline must name the reason";
+fn a_files_revert_without_change_records_says_why() {
+    const EXPLAINED_MSG: &str = "a revert with no change records must name the reason";
     let mut app = build_rewind_app();
     let target = app.state.session.messages()[0].id;
 
@@ -14682,15 +13390,16 @@ fn a_files_revert_without_a_baseline_says_why() {
     assert!(actions.is_empty(), "{EXPLAINED_MSG}");
     assert_eq!(
         app.status_bar.flash_text(),
-        Some(crate::app::NO_FILE_CHANGES_MSG),
+        Some(file_revert::NO_CHANGE_RECORDS),
         "{EXPLAINED_MSG}"
     );
 }
 
 /// The conversation half is still doable, so refusing the whole request would
-/// cost the user something Caudra can actually deliver.
+/// cost the user something Caudra can actually deliver. Rewinding resets the
+/// chrome, and the reason must outlive that.
 #[test]
-fn a_both_revert_without_a_baseline_still_rewinds_the_conversation() {
+fn a_both_revert_without_change_records_still_rewinds_the_conversation() {
     const DOWNGRADED_MSG: &str = "a both revert must fall back to the conversation half";
     let mut app = build_rewind_app();
     let target = app.state.session.messages()[0].id;
@@ -14699,6 +13408,11 @@ fn a_both_revert_without_a_baseline_still_rewinds_the_conversation() {
 
     assert!(
         matches!(actions.as_slice(), [Action::LoadSession(_)]),
+        "{DOWNGRADED_MSG}"
+    );
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(file_revert::NO_CHANGE_RECORDS),
         "{DOWNGRADED_MSG}"
     );
 }
@@ -14719,7 +13433,8 @@ fn revert_is_rejected_while_streaming() {
 
 #[test]
 fn revert_and_unrevert_are_rejected_while_cancellation_is_pending() {
-    let (_temp, mut reverting, path, _, second_user, _) = snapshot_revert_app();
+    let mut reverting = build_rewind_app();
+    let second_user = reverting.state.session.messages()[3].id;
     let original_head = crate::session_history_head(&reverting.state.session);
     reverting.status = Status::Streaming;
     reverting.run_id = 1;
@@ -14728,17 +13443,16 @@ fn revert_and_unrevert_are_rejected_while_cancellation_is_pending() {
 
     assert!(
         reverting
-            .revert_to(second_user, RestoreMode::Both)
+            .revert_to(second_user, RestoreMode::Conversation)
             .is_empty()
     );
     assert_eq!(
         crate::session_history_head(&reverting.state.session),
         original_head
     );
-    assert_eq!(std::fs::read_to_string(path).unwrap(), CURRENT_CONTENT);
 
-    let (_temp, mut unreverting, path, _, second_user, _) = snapshot_revert_app();
-    unreverting.revert_to(second_user, RestoreMode::Both);
+    let mut unreverting = build_rewind_app();
+    unreverting.revert_to(second_user, RestoreMode::Conversation);
     let reverted_head = crate::session_history_head(&unreverting.state.session);
     unreverting.status = Status::Streaming;
     unreverting.run_id = 1;
@@ -14750,7 +13464,6 @@ fn revert_and_unrevert_are_rejected_while_cancellation_is_pending() {
         crate::session_history_head(&unreverting.state.session),
         reverted_head
     );
-    assert_eq!(std::fs::read_to_string(path).unwrap(), FIRST_CONTENT);
 }
 
 #[test_case(Duration::ZERO,          true  ; "keeps_fresh_error")]
@@ -15750,14 +14463,7 @@ fn pattern_suggestion_context_switch_cancels_stale_work(_case: &str) {
 
     let temp = TempDir::new().unwrap();
     let project = std::fs::canonicalize(temp.path()).unwrap();
-    let store = App::snapshot_store_for(
-        &app.storage,
-        app.state.session.id,
-        &project,
-        SnapshotLimits::default(),
-    )
-    .unwrap();
-    app.install_working_directory(&project, store, PermissionsConfig::default());
+    app.install_working_directory(&project, PermissionsConfig::default());
     assert!(old_reply.is_disconnected());
     let (active, reply) = requested.try_recv().unwrap();
     assert_ne!(active, original);
@@ -15874,16 +14580,9 @@ fn changing_projects_closes_stale_permission_config_actions() {
     let temp = TempDir::new().unwrap();
     let project = temp.path().join("destination");
     std::fs::create_dir(&project).unwrap();
-    let snapshot_store = App::snapshot_store_for(
-        &app.storage,
-        app.state.session.id,
-        &project,
-        SnapshotLimits::default(),
-    )
-    .unwrap();
     assert!(app.permissions_picker.is_open());
 
-    app.install_working_directory(&project, snapshot_store, PermissionsConfig::default());
+    app.install_working_directory(&project, PermissionsConfig::default());
 
     assert!(!app.permissions_picker.is_open());
     assert!(!app.permission_config_trust_deferred);
@@ -18250,38 +16949,6 @@ fn thinking_restored_from_session_meta() {
     assert_eq!(state.thinking, ThinkingConfig::Budget(4096));
 }
 
-const VOLATILE_SNAPSHOTS: &str = "an ephemeral run must snapshot into the volatile root";
-const PERSISTENT_TRACE: &str = "an ephemeral run must leave no snapshot in the persistent root";
-
-#[test]
-fn ephemeral_snapshots_are_written_to_the_volatile_root() {
-    let tmp = TempDir::new().unwrap();
-    let persistent = tmp.path().join("persistent");
-    let volatile = tmp.path().join("volatile");
-    let cwd = tmp.path().join("workspace");
-    std::fs::create_dir_all(&persistent).unwrap();
-    std::fs::create_dir_all(&cwd).unwrap();
-    std::fs::write(cwd.join("tracked.txt"), "before").unwrap();
-    let storage = StateDir::split(volatile.clone(), persistent.clone());
-    let session_id = CaudraId::generate();
-
-    let store =
-        App::snapshot_store_for(&storage, session_id, &cwd, SnapshotLimits::default()).unwrap();
-    store.snapshot_session_start(&cwd).unwrap();
-
-    let snapshots = |root: &Path| root.join(caudra_agent::snapshots::SESSION_SNAPSHOTS_DIR);
-    assert!(
-        snapshots(&volatile).join(session_id.to_string()).is_dir(),
-        "{VOLATILE_SNAPSHOTS}"
-    );
-    for dir in [
-        caudra_agent::snapshots::SESSION_SNAPSHOTS_DIR,
-        caudra_agent::snapshots::WORKSPACE_SNAPSHOTS_DIR,
-    ] {
-        assert!(!persistent.join(dir).exists(), "{PERSISTENT_TRACE}");
-    }
-}
-
 fn set_opus_model(app: &mut App) {
     app.state.model = caudra_providers::Model::from_spec(OPUS_SPEC).unwrap();
 }
@@ -20562,14 +19229,7 @@ fn turn_end_keeps_only_the_subagents_that_finished() {
 }
 
 fn change_directory(app: &mut App, cwd: &Path) {
-    let store = App::snapshot_store_for(
-        &app.storage,
-        app.state.session.id,
-        cwd,
-        SnapshotLimits::default(),
-    )
-    .expect("a snapshot store for the project");
-    app.install_working_directory(cwd, store, PermissionsConfig::default());
+    app.install_working_directory(cwd, PermissionsConfig::default());
 }
 
 const CD_SHELL_ID: &str = "cd-shell";
@@ -20680,14 +19340,7 @@ fn clicking_a_popup_row_completes_the_mention_it_shows() {
 fn transcript_mention(app: &mut App) -> (TempDir, u16, u16) {
     let dir = TempDir::new().expect("a temporary directory");
     std::fs::write(dir.path().join(MENTIONED_FILE), "body\n").expect("a file");
-    let store = App::snapshot_store_for(
-        &app.storage,
-        app.state.session.id,
-        dir.path(),
-        SnapshotLimits::default(),
-    )
-    .expect("a snapshot store for the project");
-    app.install_working_directory(dir.path(), store, PermissionsConfig::default());
+    app.install_working_directory(dir.path(), PermissionsConfig::default());
     app.main_chat()
         .push_user_message(format!("look at @{MENTIONED_FILE} please"));
     let (row, column) = screen_hit(app, MENTIONED_FILE);

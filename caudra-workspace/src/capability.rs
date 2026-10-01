@@ -40,20 +40,8 @@ pub enum WorkspaceCapability {
     ScmMutationStatus,
     ScmMutationCancel,
     ScmMutationRelease,
-    SnapshotCapture,
-    SnapshotCaptureLabels,
-    SnapshotInspect,
-    SnapshotStatus,
-    SnapshotPrepareRestore,
-    SnapshotPrepareUnrevert,
-    SnapshotAcknowledge,
-    SnapshotPrepareCleanup,
-    SnapshotExecute,
-    SnapshotOperationStatus,
-    SnapshotCancel,
-    SnapshotRelease,
-    SnapshotAtomicAcrossFiles,
-    SnapshotDurablePerFileJournal,
+    /// Per-call change records and the reverts that undo exactly them.
+    ChangeRecords,
     ProjectAssetsDiscover,
     ProjectAssetsRead,
     ToolPrepare,
@@ -105,17 +93,6 @@ impl WorkspaceCapabilities {
             {
                 return Err(WorkspaceError::CapabilityMismatch { capability });
             }
-            if capability.requires_snapshot_preparation()
-                && ![
-                    WorkspaceCapability::SnapshotPrepareRestore,
-                    WorkspaceCapability::SnapshotPrepareUnrevert,
-                    WorkspaceCapability::SnapshotPrepareCleanup,
-                ]
-                .into_iter()
-                .any(|candidate| self.supports(candidate))
-            {
-                return Err(WorkspaceError::CapabilityMismatch { capability });
-            }
         }
         Ok(())
     }
@@ -131,11 +108,6 @@ impl WorkspaceCapability {
             | Self::WatchRecursive
             | Self::WatchExactRenamePairing => Some(Self::WatchOpen),
             Self::ExecStatus | Self::ExecCancel | Self::ExecTimeout => Some(Self::ExecExecute),
-            Self::SnapshotCaptureLabels => Some(Self::SnapshotCapture),
-            Self::SnapshotAtomicAcrossFiles | Self::SnapshotDurablePerFileJournal => {
-                Some(Self::SnapshotPrepareRestore)
-            }
-            Self::SnapshotOperationStatus | Self::SnapshotCancel => Some(Self::SnapshotExecute),
             Self::ProjectAssetsRead => Some(Self::ProjectAssetsDiscover),
             Self::ToolExecute | Self::ToolRelease => Some(Self::ToolPrepare),
             Self::ToolStatus | Self::ToolCancel => Some(Self::ToolExecute),
@@ -148,10 +120,6 @@ impl WorkspaceCapability {
             self,
             Self::ScmMutationStatus | Self::ScmMutationCancel | Self::ScmMutationRelease
         )
-    }
-
-    const fn requires_snapshot_preparation(self) -> bool {
-        matches!(self, Self::SnapshotExecute | Self::SnapshotRelease)
     }
 }
 
@@ -183,13 +151,12 @@ mod tests {
 
     #[test]
     fn field_capabilities_require_the_method_that_can_express_them() {
-        let capabilities =
-            WorkspaceCapabilities::from([WorkspaceCapability::SnapshotCaptureLabels]);
+        let capabilities = WorkspaceCapabilities::from([WorkspaceCapability::ExecTimeout]);
 
         assert_eq!(
             capabilities.validate(),
             Err(WorkspaceError::CapabilityMismatch {
-                capability: WorkspaceCapability::SnapshotCaptureLabels,
+                capability: WorkspaceCapability::ExecTimeout,
             })
         );
     }

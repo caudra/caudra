@@ -21,7 +21,6 @@ pub mod private_file;
 pub mod projects;
 pub mod prompt_stash;
 pub mod remote_operation_journal;
-pub mod remote_snapshots;
 pub mod retention;
 pub mod sandbox_auth;
 pub mod sessions;

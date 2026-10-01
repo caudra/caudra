@@ -501,8 +501,7 @@ impl App {
                     self.flash(MESSAGE_ACTIONS_UNAVAILABLE.into());
                     return Vec::new();
                 };
-                self.message_actions
-                    .open(source, self.state.session.meta.pending_revert.is_some());
+                self.open_message_actions(source);
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 self.admission_mouse_down = None;
@@ -655,10 +654,7 @@ impl App {
                     self.status_mouse_down = None;
                     self.link_mouse_down = None;
                     self.mention_mouse_down = None;
-                    self.message_actions.open(
-                        pressed.source(),
-                        self.state.session.meta.pending_revert.is_some(),
-                    );
+                    self.open_message_actions(pressed.source());
                     return Vec::new();
                 }
                 if let Some(SelectionState::Dragging { sel, .. }) = self.selection_state {

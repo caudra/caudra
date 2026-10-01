@@ -248,6 +248,21 @@ impl StoredWorkspaceBinding {
             && self.principal_id() == other.principal_id()
             && self.project_key() == other.project_key()
     }
+
+    /// Names the change store a remote session records in. Equal exactly
+    /// when [`Self::same_workspace_identity`] holds, so a remote cd, which
+    /// only moves the cursor, keeps the store.
+    pub fn change_store_key(&self) -> String {
+        opaque_hash(
+            "change-store",
+            &serde_json::to_vec(&(
+                self.binding.authority(),
+                self.principal_id(),
+                self.project_key(),
+            ))
+            .expect("workspace identity serialization cannot fail"),
+        )
+    }
 }
 
 impl fmt::Debug for StoredWorkspaceBinding {
@@ -345,6 +360,56 @@ mod tests {
     use test_case::test_case;
 
     const MISSING_CWD: &str = "/definitely/missing/workspace";
+    const REMOTE_SOURCE: &str = "https://remote.example";
+    const AUTHORITY: &str = "authority";
+    const PRINCIPAL: &str = "principal";
+    const PROJECT: &str = "project";
+    const CURSOR: &str = "remote-cwd";
+    const OTHER: &str = "other";
+
+    /// `cursor` names both the binding and its cwd, which a reconnect and a
+    /// remote cd move without leaving the workspace.
+    fn remote_binding(
+        authority: &str,
+        principal: &str,
+        project: &str,
+        cursor: &str,
+    ) -> StoredWorkspaceBinding {
+        let authority = AuthorityIdentity::new(
+            SourceTrustAnchor::new(REMOTE_SOURCE).unwrap(),
+            authority,
+            authority,
+            authority,
+            authority,
+        )
+        .unwrap();
+        let binding = SessionWorkspaceBinding::new(
+            SessionBindingId::new(cursor).unwrap(),
+            authority.clone(),
+            AuthenticatedPrincipalId::new(authority.clone(), principal).unwrap(),
+            ProjectIdentity::new(authority, ProjectKey::new(project).unwrap()),
+        )
+        .unwrap();
+        StoredWorkspaceBinding::new(binding, CwdHandle::new(cursor).unwrap(), None).unwrap()
+    }
+
+    #[test_case(AUTHORITY, PRINCIPAL, PROJECT, OTHER, true ; "another_cursor_keeps_the_store")]
+    #[test_case(OTHER, PRINCIPAL, PROJECT, CURSOR, false ; "another_authority_has_its_own_store")]
+    #[test_case(AUTHORITY, OTHER, PROJECT, CURSOR, false ; "another_principal_has_its_own_store")]
+    #[test_case(AUTHORITY, PRINCIPAL, OTHER, CURSOR, false ; "another_project_has_its_own_store")]
+    fn the_change_store_is_named_by_the_workspace_identity(
+        authority: &str,
+        principal: &str,
+        project: &str,
+        cursor: &str,
+        same: bool,
+    ) {
+        let base = remote_binding(AUTHORITY, PRINCIPAL, PROJECT, CURSOR);
+        let other = remote_binding(authority, principal, project, cursor);
+
+        assert_eq!(base.same_workspace_identity(&other), same);
+        assert_eq!(base.change_store_key() == other.change_store_key(), same);
+    }
 
     fn resume_binding(kind: &str) -> Option<StoredWorkspaceBinding> {
         if kind == "legacy" {

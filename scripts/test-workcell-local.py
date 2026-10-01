@@ -790,6 +790,20 @@ def main():
                     "--transfer-root",
                     str(temp / "transfers"),
                 ]
+                if not sandbox_only:
+                    change_root = args.index("--snapshot-root")
+                    change_args = args[change_root : change_root + 2]
+                    del args[change_root : change_root + 2]
+                    restart_server()
+                    with child(
+                        [*command, "unrecorded_server", "--", "--nocapture"],
+                        cwd=repo,
+                        env={**env, "WORKCELL_TEST_UNRECORDED": "1"},
+                    ) as tests:
+                        assert tests.wait(timeout=600) == 0, (
+                            "a host without change records was refused"
+                        )
+                    args[change_root:change_root] = change_args
                 restart_server()
                 if not sandbox_only:
                     metadata_root = temp / "metadata-root"
@@ -823,6 +837,8 @@ def main():
                             "--test-threads=1",
                             "--skip",
                             "unsupported_server",
+                            "--skip",
+                            "unrecorded_server",
                             "--skip",
                             "metadata_",
                         ],

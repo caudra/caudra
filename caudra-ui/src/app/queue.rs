@@ -1018,16 +1018,6 @@ impl App {
         {
             return Some(PLAN_TARGET_ERR);
         }
-        if self
-            .state
-            .session
-            .meta
-            .pending_revert
-            .as_ref()
-            .is_some_and(|pending| pending.restore_operation.is_some())
-        {
-            return Some(super::REVERT_BUSY_MSG);
-        }
         None
     }
 
@@ -1523,15 +1513,7 @@ impl App {
             self.flash(reason.into());
             return Vec::new();
         }
-        if self.cancelling_run.is_some()
-            || self
-                .state
-                .session
-                .meta
-                .pending_revert
-                .as_ref()
-                .is_some_and(|pending| pending.restore_operation.is_some())
-        {
+        if self.cancelling_run.is_some() {
             self.flash(super::REVERT_BUSY_MSG.into());
             return Vec::new();
         }

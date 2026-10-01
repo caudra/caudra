@@ -23,9 +23,26 @@ pub struct HistoryItem {
     /// The transcript crosses it; the request never does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supersedes: Option<CaudraId>,
+    /// The item a compaction copied this one from. A copy is new, but what it
+    /// says happened when its original did, and a file revert chosen at it
+    /// has to reach the changes made since then. A copy whose original could
+    /// not be matched points at itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stands_for: Option<CaudraId>,
     pub group_id: CaudraId,
     #[serde(flatten)]
     pub kind: HistoryItemKind,
+}
+
+impl HistoryItem {
+    /// When this item happened, which the changes made after it are measured
+    /// from, or `None` for a copy whose original is unknown.
+    pub fn happened_at(&self) -> Option<CaudraId> {
+        match self.stands_for {
+            Some(original) if original == self.id => None,
+            original => Some(original.unwrap_or(self.id)),
+        }
+    }
 }
 
 impl TitleSource for HistoryItem {
@@ -212,6 +229,7 @@ pub fn expand_message(message: &Message, parent_id: Option<CaudraId>) -> Vec<His
                 id,
                 parent_id,
                 supersedes: None,
+                stands_for: None,
                 group_id,
                 kind,
             };
@@ -1562,6 +1580,7 @@ mod tests {
             id: CaudraId::generate(),
             parent_id,
             supersedes: None,
+            stands_for: None,
             group_id,
             kind,
         }
@@ -2051,6 +2070,7 @@ mod tests {
             id: CaudraId::generate(),
             parent_id: None,
             supersedes: None,
+            stands_for: None,
             group_id: CaudraId::generate(),
             kind: HistoryItemKind::AssistantText {
                 text: EMPTY_RESPONSE_MARKER.into(),

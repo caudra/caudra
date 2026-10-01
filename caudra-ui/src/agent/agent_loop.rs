@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::{env, sync::Arc};
 
 use crate::app::background_delivery::DeliveryFence;
+use crate::app::file_revert::RecorderSlot;
 use arc_swap::ArcSwap;
 use caudra_agent::agent;
 use caudra_agent::background::BackgroundTasks;
@@ -26,10 +27,9 @@ use caudra_agent::types::TodoItem;
 use caudra_agent::workflow::{WorkflowHandle, WorkspaceRebind};
 use caudra_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams,
-    BackgroundReminderContext, BaselineGate, CancelMap, CancelToken, CancelTrigger, DoneReason,
-    Envelope, EventSender, GoalHandle, History, InstructionBaseline, Instructions, McpCommand,
-    Nudge, PromptRole, SessionMailbox, SharedHistory, SubagentHistoryStore, ToolOutputLines,
-    WorkspaceBaseline,
+    BackgroundReminderContext, CancelMap, CancelToken, CancelTrigger, DoneReason, Envelope,
+    EventSender, GoalHandle, History, InstructionBaseline, Instructions, McpCommand, Nudge,
+    PromptRole, SessionMailbox, SharedHistory, SubagentHistoryStore, ToolOutputLines,
 };
 use caudra_config::ModelPolicy;
 use caudra_lua::EventHandle;
@@ -93,9 +93,9 @@ pub(super) struct AgentLoop {
     /// Published on every run so workflow agents start under the mode the
     /// user last committed, however long ago their run was launched.
     mode: SharedMode,
-    /// Armed per run with the head the run starts from, and consulted by the
-    /// first tool call that could change a file.
-    baseline: Arc<WorkspaceBaseline>,
+    /// Read when each run starts, so a run records for the session and
+    /// workspace bound at that moment.
+    change_recorder: RecorderSlot,
     workspace_session: Option<WorkspaceSession>,
     remote_project_context: Option<Arc<caudra_agent::remote_project_context::RemoteProjectContext>>,
     /// The directory Caudra itself runs in. Set only in a sandbox session,
@@ -141,7 +141,7 @@ impl AgentLoop {
         delivery_fence: Arc<DeliveryFence>,
         mode: SharedMode,
         path_locks: Arc<PathLocks>,
-        baseline: Arc<WorkspaceBaseline>,
+        change_recorder: RecorderSlot,
         workspace_session: Option<WorkspaceSession>,
         remote_project_context: Option<
             Arc<caudra_agent::remote_project_context::RemoteProjectContext>,
@@ -208,7 +208,7 @@ impl AgentLoop {
             background,
             delivery_fence,
             mode,
-            baseline,
+            change_recorder,
             workspace_session,
             remote_project_context,
             host_cwd,
@@ -610,12 +610,7 @@ impl AgentLoop {
                 timeouts: self.timeouts,
                 file_tracker: Arc::clone(&self.file_tracker),
                 path_locks: Arc::clone(&self.path_locks),
-                // The head as it stands before this run's input is appended, so
-                // a capture the run triggers later still brackets the run.
-                baseline: Some(BaselineGate::new(
-                    Arc::clone(&self.baseline),
-                    self.history.item_head(),
-                )),
+                changes: self.change_recorder.load_full().as_deref().cloned(),
                 prompt_slots: Arc::new(prompt_slots),
                 prompt_profiles: Arc::clone(&self.prompt_profiles),
                 default_task_prompt_profile_name: Arc::clone(&active_prompt_profile_name),
