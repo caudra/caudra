@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use caudra_agent::peers::PeerSession;
 use caudra_storage::id::CaudraId;
 use caudra_storage::permission_state::mutation::{
     PermissionCommitReceipt, PermissionMutationError, PermissionOwner, PreparedPermissionMutation,
@@ -757,6 +758,11 @@ impl Writer {
             // latest committed cursor instead of falling back to a stale full write.
             database.save(session, self.cursors.get(&session.id))?
         };
+        if session.meta.peer_controls.is_some()
+            && let Some(peer) = PeerSession::lookup(session.id)
+        {
+            peer.checkpoint(session.messages());
+        }
         self.deleted_sessions.remove(&session.id);
         self.report_session_growth(session.id, saved.logical_bytes());
         self.cursors.insert(session.id, saved);

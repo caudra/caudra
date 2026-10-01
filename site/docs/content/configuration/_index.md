@@ -96,6 +96,7 @@ decision_engine = true
 | `remote_workcell` | `false` | Direct [remote Workcell](/docs/remote-workspaces/) connections: the `--workcell-*` flags and `caudra auth workcell`. |
 | `lua_plugins` | `false` | Every use of Lua: [plugins](/docs/plugins/), the [Lua API](/docs/lua-api/), global and project `init.lua`, and the `caudra-plugin-dev` skill. `--no-plugins` still turns Lua off for one run. |
 | `decision_engine` | `false` | The [decision engine](#decisions), [Auto mode](/docs/permissions/#auto-mode), `caudra decisions`, and workflow [`decide()` calls](/docs/workflows/#typed-decisions). |
+| `cross_session_messaging` | `false` | Local [cross-session messaging](/docs/sessions/#cross-session-messaging): the `list_sessions` and `send_message` tools, `/peers`, `/messages`, and live session inboxes. Both processes must opt in. |
 
 Each switch is independent, so turning one on never turns on another. A missing file, table, or key leaves a switch off, and an unknown key is an error. `caudra remote` and `/remote` work when either `sandboxes` or `remote_workcell` is on, and each session checks the switch for its own source.
 
@@ -219,7 +220,7 @@ The `bash`, `python_execution`, and `task` entries apply only when `ui.scroll_ca
 | `read` | 3 | `file_read`, `local_document_read` |
 | `write` | 7 | `file_write`, `file_edit`, `file_apply_patch`, `image_generate`, `local_document_apply_patch`, `local_document_write`, `memory` |
 | `web` | 3 | `webfetch`, `websearch` |
-| `other` | 3 | `batch`, `execution_environment`, `question`, `skill`, `todo_write`, `tool_output`, `view_image`, `workflow` |
+| `other` | 3 | `batch`, `execution_environment`, `list_sessions`, `question`, `send_message`, `skill`, `todo_write`, `tool_output`, `view_image`, `workflow` |
 
 ### `agent`
 
@@ -247,6 +248,12 @@ The `bash`, `python_execution`, and `task` entries apply only when `ui.scroll_ca
 | `defer_builtin_tools` | string | `auto` | - | When the on-demand built-in tools start outside the request array: `auto` defers them for a small model or one with no supply metadata and declares them upfront for a known non-small model, `always` defers for every model, `never` declares them upfront |
 | `image_model` | string | `sunburst` | - | GPT Image 2.5 model behind `image_generate`: `sunburst` is the most capable and the better editor, `flare` is faster at the same price |
 | `disabled_tools` | string[] | `[]` | - | Tools to withhold from the model: built-in names, `server.tool`, or `server.*` for a whole MCP server. A project list extends the global one |
+
+### `agent.messaging`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `inbound` | string | `auto` | Inbound cross-session messages: `auto` accepts only compatible trusted peers, `accept` allows wider delivery, `hold` requires approval, `refuse` rejects messages. Project settings may only tighten policy: accept < auto < hold < refuse. Needs `experimental.cross_session_messaging`; accepting messages can start billable turns |
 
 ### `agent.steering`
 

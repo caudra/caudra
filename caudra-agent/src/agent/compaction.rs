@@ -490,6 +490,7 @@ pub async fn compact_with_session(
         event_tx.send(AgentEvent::Injected {
             text: post.to_string(),
             task_event: None,
+            peer_event: None,
         })?;
     }
 

@@ -29,7 +29,7 @@ use clap::ValueEnum;
 use color_eyre::Result;
 use color_eyre::eyre::eyre;
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const NO_PROMPT: &str = "no prompt: pass --prompt \"<text>\" or pipe text on stdin";
@@ -335,10 +335,29 @@ pub fn run(
             | AgentEvent::ToolHeaderSnapshot { .. }
             | AgentEvent::LiveToolBuf { .. }
             | AgentEvent::Nudge { .. }
-            | AgentEvent::Injected { .. }
             | AgentEvent::ToolsLoaded { .. }
             | AgentEvent::Unrecorded { .. }
             | AgentEvent::PromptProgress { .. } => {}
+            AgentEvent::Injected {
+                text, peer_event, ..
+            } => {
+                if let Some(origin) = peer_event {
+                    if let Some(out) = &mut verbose_out {
+                        out.emit(&json!({
+                            "type": "system",
+                            "subtype": "peer_message",
+                            "session_id": session_id,
+                            "peer_event": origin,
+                            "text": text,
+                        }))?;
+                    } else {
+                        eprintln!(
+                            "Peer message {} received; included in model context",
+                            origin.message_id
+                        );
+                    }
+                }
+            }
             // One-shot print spawns no workflow runtime (`workflow: None`), so
             // nothing can launch a run here and the event has no consumer.
             AgentEvent::Workflow(_) => {}

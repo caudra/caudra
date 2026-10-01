@@ -352,6 +352,23 @@ pub enum StoredPromptAdmission {
     Interrupt,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoredInboundPolicy {
+    Accept,
+    Auto,
+    Hold,
+    Refuse,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StoredPeerControls {
+    pub inbound: Option<StoredInboundPolicy>,
+    pub delivered: usize,
+    pub sends: usize,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -407,8 +424,12 @@ pub struct SessionMeta {
     pub goal_result: Option<Box<StoredGoalResult>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal_continuation_limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub automatic_wakes_suppressed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<PermissionMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_controls: Option<StoredPeerControls>,
     /// Calls that ran without a change record, whose changes a file revert
     /// leaves in place. Oldest first, and only the newest
     /// [`MAX_UNRECORDED_CALLS`].
@@ -1581,10 +1602,11 @@ mod tests {
     use super::StoredThinking;
     use super::{
         ARCHIVE_DIR, ARCHIVE_KEEP, ARCHIVE_MAX_BYTES, DEFAULT_TITLE, LOG_FORMAT_VERSION,
-        MAX_TITLE_LEN, SESSION_VERSION, SESSIONS_DIR, StoredImage, StoredMode, StoredPasteRange,
-        StoredPromptAdmission, StoredQueuedDraft, StoredQueuedPrompt, StoredSubagent,
-        StoredSubagentOutcome, StoredSubagentTaskSpec, StoredTokenUsage, generate_title,
-        meta_record, next_epoch, persisted_session_ids, write_full_session,
+        MAX_TITLE_LEN, SESSION_VERSION, SESSIONS_DIR, StoredImage, StoredInboundPolicy, StoredMode,
+        StoredPasteRange, StoredPeerControls, StoredPromptAdmission, StoredQueuedDraft,
+        StoredQueuedPrompt, StoredSubagent, StoredSubagentOutcome, StoredSubagentTaskSpec,
+        StoredTokenUsage, generate_title, meta_record, next_epoch, persisted_session_ids,
+        write_full_session,
     };
     use super::{
         HistorySnapshot, MAX_UNRECORDED_CALLS, PendingConversationRevert, PermissionMode, Session,
@@ -1621,6 +1643,91 @@ mod tests {
     const FORK_TITLE: &str = "Renamed by hand (fork #1)";
     const MODE_UNCHOSEN: &str = "a new session must not pretend it picked a mode";
     const QUEUED_PROMPT: &str = "queued prompt";
+    const PEER_DELIVERED: usize = 7;
+    const PEER_SENDS: usize = 11;
+    const WAKE_SUPPRESSION_FIELD: &str = "automatic_wakes_suppressed";
+
+    #[test_case("{}", false; "legacy_default")]
+    #[test_case(r#"{"automatic_wakes_suppressed":false}"#, false; "explicit_false")]
+    #[test_case(r#"{"automatic_wakes_suppressed":true}"#, true; "suppressed")]
+    fn automatic_wake_suppression_round_trips_without_default_bloat(
+        source: &str,
+        suppressed: bool,
+    ) {
+        let meta: SessionMeta = serde_json::from_str(source).unwrap();
+        assert_eq!(meta.automatic_wakes_suppressed, suppressed);
+        let serialized = serde_json::to_value(&meta).unwrap();
+        assert_eq!(
+            serialized
+                .get(WAKE_SUPPRESSION_FIELD)
+                .and_then(Value::as_bool),
+            suppressed.then_some(true)
+        );
+        let restored: SessionMeta = serde_json::from_value(serialized).unwrap();
+        assert_eq!(restored.automatic_wakes_suppressed, suppressed);
+    }
+
+    #[test_case("{}"; "missing_peer_controls")]
+    #[test_case(r#"{"peer_controls":null}"#; "null_peer_controls")]
+    #[test_case(r#"{"mode":"build","fast":true}"#; "old_metadata")]
+    fn peer_controls_missing_from_old_metadata_are_omitted(source: &str) {
+        let meta: SessionMeta = serde_json::from_str(source).unwrap();
+        assert_eq!(meta.peer_controls, None);
+        assert!(
+            serde_json::to_value(meta)
+                .unwrap()
+                .get("peer_controls")
+                .is_none()
+        );
+    }
+
+    #[test_case("{}", None; "empty_controls")]
+    #[test_case(r#"{"inbound":null}"#, None; "no_override")]
+    #[test_case(r#"{"inbound":"hold"}"#, Some(StoredInboundPolicy::Hold); "override_only")]
+    fn peer_controls_missing_fields_use_defaults(
+        source: &str,
+        inbound: Option<StoredInboundPolicy>,
+    ) {
+        let controls: StoredPeerControls = serde_json::from_str(source).unwrap();
+        assert_eq!(
+            controls,
+            StoredPeerControls {
+                inbound,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test_case(None, None; "no_override")]
+    #[test_case(Some(StoredInboundPolicy::Accept), Some("accept"); "accept")]
+    #[test_case(Some(StoredInboundPolicy::Auto), Some("auto"); "auto")]
+    #[test_case(Some(StoredInboundPolicy::Hold), Some("hold"); "hold")]
+    #[test_case(Some(StoredInboundPolicy::Refuse), Some("refuse"); "refuse")]
+    fn peer_controls_survive_storage_and_session_clone(
+        inbound: Option<StoredInboundPolicy>,
+        serialized_inbound: Option<&str>,
+    ) {
+        let (_temp, dir) = state_dir();
+        let controls = StoredPeerControls {
+            inbound,
+            delivered: PEER_DELIVERED,
+            sends: PEER_SENDS,
+        };
+        let mut session = TestSession::new("model", "/project");
+        session.meta.peer_controls = Some(controls.clone());
+        let serialized = serde_json::to_value(&session.meta).unwrap();
+        assert_eq!(
+            serialized["peer_controls"]["inbound"].as_str(),
+            serialized_inbound
+        );
+        session.save(&dir).unwrap();
+
+        let mut restored = TestSession::load(session.id, &dir).unwrap();
+        assert_eq!(restored.meta.peer_controls, Some(controls.clone()));
+        let cloned = restored.clone();
+        restored.meta.peer_controls = None;
+        assert_eq!(cloned.meta.peer_controls, Some(controls));
+    }
 
     #[test_case(None; "legacy_default")]
     #[test_case(Some(StoredMode::Build); "build")]

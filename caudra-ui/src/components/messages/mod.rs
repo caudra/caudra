@@ -3894,7 +3894,10 @@ impl MessagesPanel {
     }
 
     fn has_foldable_body(msg: &DisplayMessage) -> bool {
-        matches!(msg.role, DisplayRole::Thinking | DisplayRole::Injected)
+        matches!(
+            msg.role,
+            DisplayRole::Thinking | DisplayRole::Injected | DisplayRole::PeerMessage(_)
+        )
     }
 
     fn streaming_thinking_collapsed(&self) -> bool {
@@ -5183,7 +5186,7 @@ impl MessagesPanel {
     /// a reflow about what a closed block looks like.
     fn folded_message(&self, msg: &DisplayMessage) -> BuiltMessage {
         match msg.role {
-            DisplayRole::Injected => BuiltMessage::bare(
+            DisplayRole::Injected | DisplayRole::PeerMessage(_) => BuiltMessage::bare(
                 injected_line(&msg.text),
                 format!("{INJECTED_SEARCH_PREFIX}{}", msg.text),
             ),
@@ -5686,7 +5689,7 @@ enum DisplayKey<'a> {
 fn display_key(message: &DisplayMessage) -> Option<DisplayKey<'_>> {
     match &message.role {
         DisplayRole::Tool(tool) => Some(DisplayKey::Tool(&tool.id)),
-        DisplayRole::TaskDelivery(_) => Some(DisplayKey::Delivery),
+        DisplayRole::TaskDelivery(_) | DisplayRole::PeerMessage(_) => Some(DisplayKey::Delivery),
         DisplayRole::User
         | DisplayRole::Assistant
         | DisplayRole::Thinking
@@ -5807,6 +5810,7 @@ fn same_display_item(left: &DisplayMessage, right: &DisplayMessage) -> bool {
     match (&left.role, &right.role) {
         (DisplayRole::Tool(left), DisplayRole::Tool(right)) => left.id == right.id,
         (DisplayRole::TaskDelivery(left), DisplayRole::TaskDelivery(right)) => left == right,
+        (DisplayRole::PeerMessage(left), DisplayRole::PeerMessage(right)) => left == right,
         (DisplayRole::User, DisplayRole::User)
         | (DisplayRole::Assistant, DisplayRole::Assistant)
         | (DisplayRole::Thinking, DisplayRole::Thinking)
@@ -5879,7 +5883,9 @@ fn segment_kind(role: &DisplayRole) -> SegmentKind {
         DisplayRole::Thinking => SegmentKind::Thinking,
         DisplayRole::Error => SegmentKind::Error,
         DisplayRole::Done => SegmentKind::Done,
-        DisplayRole::Notice | DisplayRole::Injected => SegmentKind::Assistant,
+        DisplayRole::Notice | DisplayRole::Injected | DisplayRole::PeerMessage(_) => {
+            SegmentKind::Assistant
+        }
         DisplayRole::TaskDelivery(_) => SegmentKind::TaskDelivery,
         DisplayRole::Tool(_) => SegmentKind::ToolBlock,
     }
@@ -5940,7 +5946,7 @@ fn build_message_lines(
         DisplayRole::Thinking => thinking_style(),
         DisplayRole::Error => error_style(),
         DisplayRole::Done => done_style(),
-        DisplayRole::Notice | DisplayRole::Injected => notice_style(),
+        DisplayRole::Notice | DisplayRole::Injected | DisplayRole::PeerMessage(_) => notice_style(),
         DisplayRole::Tool(_) | DisplayRole::TaskDelivery(_) => unreachable!(),
     };
     let prefix = if msg.plan_path.is_some() {

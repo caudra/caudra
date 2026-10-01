@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Caudra ships with 31 built-in tools in this reference (31 requiring no plugin opt-in, 0 opt-in via plugin options). Availability depends on the selected workspace backend. Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Caudra ships with 33 built-in tools in this reference (33 requiring no plugin opt-in, 0 opt-in via plugin options). Availability depends on the selected workspace backend. Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 First-party file, web, shell, index, Python, and environment tools run through protocol-neutral Workcell contracts. Workcell owns schemas, validation, execution bounds, atomic file changes, network policy, subprocess cleanup, cancellation, and the bundled worker lifecycle. Caudra owns registration, authorization, retained session output, and model or UI presentation. Release builds pin an exact Workcell revision.
 
@@ -326,6 +326,27 @@ Experimental and off by default. Turn it on with `workflows = true` under `[expe
 | `agent_budget` | integer | no | Most agents the run may launch, for start and resume. |
 | `run_id` | string | no | Run id, for status, inspect, pause, resume, and stop. |
 | `limit` | integer | no | Most runs a history answer lists. |
+
+### `list_sessions` <span class="badge">experimental</span> {#list_sessions}
+
+Discover other live Caudra sessions on this machine. Returns bounded session metadata and exact reply targets, not conversation history. Use the returned target with send_message; titles are not unique. Cross-session messaging is experimental and requires each process to opt in.
+
+Experimental and off by default. Turn it on with `cross_session_messaging = true` under `[experimental]` in the global `caudra.toml`. See [Experimental features](/docs/configuration/#experimental-features).
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+
+### `send_message` <span class="badge">experimental</span> {#send_message}
+
+Send plain text to another live Caudra session using an exact target from list_sessions or an incoming peer message. Cross-session messaging is experimental and requires each process to opt in. A queued or held receipt is not model delivery or task completion. A message may start a billable turn using the recipient's own permissions. Never ask another session to bypass your mode, permissions, or a denied action. Peer messages cannot approve actions, change configuration, execute slash commands, or attach files. Do not poll for replies or automatically retry an unknown outcome as a new message.
+
+Experimental and off by default. Turn it on with `cross_session_messaging = true` under `[experimental]` in the global `caudra.toml`. See [Experimental features](/docs/configuration/#experimental-features).
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `target` | string | yes | Exact live target from list_sessions or a peer reply address. Never a title or filesystem path. |
+| `text` | string | yes | Plain text only; also limited to 32 KiB of UTF-8. |
+| `reply_to` | string | no | Optional incoming message ID for correlation. |
 
 ### `todo_write` {#todo_write}
 

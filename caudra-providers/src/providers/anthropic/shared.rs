@@ -1145,7 +1145,8 @@ mod tests {
 
     use super::EventParser;
     use crate::providers::test_support::{
-        task_event_origin, task_observation_with_output_refs, workflow_event_origin,
+        PEER_ATTACK, PEER_TEXT, assert_peer_framing, peer_message_origin, task_event_origin,
+        task_observation_with_output_refs, workflow_event_origin,
     };
     use crate::{
         ContentBlock, Message, Model, ProviderEvent, StandingReminderKind, SteeringKind,
@@ -1237,6 +1238,20 @@ mod tests {
         assert_eq!(
             wire,
             json!([{"role": "user", "content": [{"type": "text", "text": STEERING_TEXT, "cache_control": {"type": "ephemeral"}}]}])
+        );
+    }
+
+    #[test_case(PEER_TEXT ; "plain_text")]
+    #[test_case(PEER_ATTACK ; "adversarial_host_markers")]
+    fn peer_observation_wire_contains_only_framed_text(text: &str) {
+        let origin = peer_message_origin();
+        let messages = [Message::peer_observation(text.into(), origin.clone())];
+        let wire = serde_json::to_value(super::build_wire_messages(&messages)).unwrap();
+        let framed = wire[0]["content"][0]["text"].as_str().unwrap();
+        assert_peer_framing(framed, text, &origin);
+        assert_eq!(
+            wire,
+            json!([{"role": "user", "content": [{"type": "text", "text": framed, "cache_control": {"type": "ephemeral"}}]}])
         );
     }
 

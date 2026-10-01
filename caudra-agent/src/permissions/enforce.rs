@@ -277,7 +277,7 @@ impl PermissionManager {
                 "current permission default denies this request".into(),
             ));
         }
-        let automatic = mode == PermissionMode::Yolo
+        let automatic = (mode == PermissionMode::Yolo && !context.plan_scoped)
             || (!context.forced
                 && !coverage.must_prompt
                 && (covered
@@ -305,7 +305,7 @@ impl PermissionManager {
             coverage,
             automatic,
             auto_eligible,
-            source: if mode == PermissionMode::Yolo {
+            source: if mode == PermissionMode::Yolo && !context.plan_scoped {
                 DECISION_SOURCE_YOLO
             } else if auto_eligible {
                 DECISION_SOURCE_AUTO
@@ -2287,15 +2287,16 @@ mod tests {
 
     /// The point of plan containment: one approval while planning is enough to
     /// keep exploring, so the model can run the scripts the plan needs.
-    #[test]
-    fn a_conversation_grant_covers_later_plan_scoped_commands() {
+    #[test_case(PermissionMode::Ask; "ask")]
+    #[test_case(PermissionMode::Yolo; "yolo")]
+    fn a_conversation_grant_covers_later_plan_scoped_commands(mode: PermissionMode) {
         smol::block_on(async {
             let temp = tempfile::tempdir().unwrap();
             let project = temp.path().join("project");
             std::fs::create_dir(&project).unwrap();
             let manager =
                 persistent_manager(StateDir::from_path(temp.path().join("state")), &project);
-
+            manager.set_seed_mode(mode);
             assert!(
                 enforce_plan_command_without_prompt(&manager, &project, "cargo check > /tmp/out")
                     .await
@@ -2322,8 +2323,9 @@ mod tests {
 
     /// Containment cuts the other way too: authority the plan never asked for
     /// does not apply to it, however durable that authority is.
-    #[test]
-    fn a_project_grant_does_not_cover_a_plan_scoped_command() {
+    #[test_case(PermissionMode::Ask; "ask")]
+    #[test_case(PermissionMode::Yolo; "yolo")]
+    fn a_project_grant_does_not_cover_a_plan_scoped_command(mode: PermissionMode) {
         smol::block_on(async {
             let temp = tempfile::tempdir().unwrap();
             let project = temp.path().join("project");
@@ -2341,6 +2343,7 @@ mod tests {
             .await
             .unwrap();
 
+            manager.set_seed_mode(mode);
             assert!(
                 enforce_opaque_command_without_prompt(&manager, &project, command)
                     .await

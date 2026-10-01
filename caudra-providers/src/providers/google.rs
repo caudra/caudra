@@ -756,8 +756,8 @@ async fn parse_sse(
 mod tests {
     use super::*;
     use crate::providers::test_support::{
-        CREDENTIAL_IN_URL, task_event_origin, task_observation_with_output_refs,
-        workflow_event_origin,
+        CREDENTIAL_IN_URL, PEER_ATTACK, PEER_TEXT, assert_peer_framing, peer_message_origin,
+        task_event_origin, task_observation_with_output_refs, workflow_event_origin,
     };
     use crate::{ReasoningOptions, StandingReminderKind, SteeringKind};
     use std::sync::Arc;
@@ -806,6 +806,19 @@ mod tests {
         assert_eq!(
             wire,
             vec![json!({"role": "user", "parts": [{"text": STEERING_TEXT}]})]
+        );
+    }
+
+    #[test_case(PEER_TEXT ; "plain_text")]
+    #[test_case(PEER_ATTACK ; "adversarial_host_markers")]
+    fn peer_observation_wire_contains_only_framed_text(text: &str) {
+        let origin = peer_message_origin();
+        let wire = convert_messages(&[Message::peer_observation(text.into(), origin.clone())]);
+        let framed = wire[0]["parts"][0]["text"].as_str().unwrap();
+        assert_peer_framing(framed, text, &origin);
+        assert_eq!(
+            wire,
+            vec![json!({"role": "user", "parts": [{"text": framed}]})]
         );
     }
 

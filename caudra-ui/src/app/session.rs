@@ -17,7 +17,9 @@ use crate::input_document::InputDraft;
 use crate::repaint::{Dirty, Watch};
 use caudra_agent::HistorySnapshot;
 use caudra_agent::agent::estimate_message_tokens;
+use caudra_agent::peers::PeerSession;
 use caudra_agent::{GoalHandle, GoalStatus};
+use caudra_config::Feature;
 use caudra_providers::{
     HistoryItem, HistoryItemKind, HistoryProjectionError, ImageSource, Model, TokenUsage,
     active_history_items, merge_history_items, project_messages, validate_history_items,
@@ -398,6 +400,11 @@ impl App {
     /// and an empty `Vec` does not allocate.
     fn build_meta(&self) -> SessionMeta {
         let state = &self.state;
+        let peer = self
+            .features
+            .enabled(Feature::CrossSessionMessaging)
+            .then(|| PeerSession::lookup(state.session.id))
+            .flatten();
         let draft = self.input_box.draft();
         let queued_prompts = if self.recoverable_queue.is_empty() {
             self.queue.pending_prompts()
@@ -527,7 +534,12 @@ impl App {
                 Some(GoalStatus::Active(_)) | None => None,
             },
             goal_continuation_limit: Some(state.goal.continuation_limit()),
+            automatic_wakes_suppressed: self.automatic_wakes_suppressed
+                || peer.as_ref().is_some_and(PeerSession::wakes_suppressed),
             permission_mode: self.permissions.persisted_mode(),
+            peer_controls: peer
+                .map(|peer| peer.controls())
+                .or_else(|| state.session.meta.peer_controls.clone()),
             unrecorded: state.session.meta.unrecorded.clone(),
             record_coverage: state.session.meta.record_coverage.clone(),
         };
@@ -902,6 +914,7 @@ impl App {
     /// history, so no respawn follows and the restored queue must be
     /// flushed here.
     pub(crate) fn restore_resumed_session(&mut self) {
+        self.automatic_wakes_suppressed |= self.state.session.meta.automatic_wakes_suppressed;
         if !self.conversation_permissions.is_published() {
             self.permissions.load_structured_conversation_rules(
                 self.state.session.meta.structured_permission_rules.clone(),
@@ -986,6 +999,7 @@ impl App {
         // whichever session is current.
         self.fire_session_autocmd("SessionReset", serde_json::json!({}));
         self.state.session = Arc::new(replacement);
+        self.automatic_wakes_suppressed = self.state.session.meta.automatic_wakes_suppressed;
         // After the swap: a remote plan document is filed under the session id
         // that will own it, and the retiring session must not be handed one.
         if self.state.mode == Mode::Plan {
@@ -1496,6 +1510,8 @@ impl App {
                 deferred
             }
         };
+        let automatic_wakes_suppressed = session.meta.automatic_wakes_suppressed
+            || (session.id == self.state.session.id && self.automatic_wakes_suppressed);
         self.retire_current_session()
             .map_err(|error| format!("Failed to retire current session: {error}"))?;
         self.suspend_permission_editor();
@@ -1514,6 +1530,7 @@ impl App {
             self.status_bar.flash(w);
         }
         self.reset_ui_chrome();
+        self.automatic_wakes_suppressed = automatic_wakes_suppressed;
         self.restore_display();
 
         self.request_pattern_suggestions();

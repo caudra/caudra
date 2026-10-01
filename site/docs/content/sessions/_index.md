@@ -29,6 +29,56 @@ A session is recorded once it holds something worth keeping, such as a prompt, a
 typed draft, or a queued message. Starting Caudra and quitting leaves no session
 behind, so the picker and `caudra --continue` skip it.
 
+## Cross-session messaging
+
+The experimental messaging MVP lets live main sessions on the same Unix host exchange text, including sessions in separate terminals or TUI tabs. It supports the TUI and an active one-shot `--print` run. Subagents, the SDK, ACP, remote Workcell sessions, and managed sandbox sessions are outside this scope.
+
+Messaging is off by default. Enable it in the **global** `caudra.toml` and restart each participating Caudra process:
+
+```toml
+[experimental]
+cross_session_messaging = true
+
+[agent.messaging]
+inbound = "auto"
+```
+
+A project cannot enable the experiment. An inbound setting or saved session cannot enable it either. With the switch off, Caudra creates no messaging endpoint and exposes no messaging tools or peer-triggered wakes. Previously recorded messages remain readable.
+
+### Find peers and review messages
+
+Use `/peers` to inspect live peers. `/messages` lets you review held messages, approve or reject them, and choose the session's inbound policy. See [inbound policy and trust](/docs/permissions/#cross-session-messages) before allowing automatic delivery.
+
+| Command | Action |
+|---|---|
+| `/messages` | Show held messages and their IDs |
+| `/messages approve <id>` | Approve a message from the current review |
+| `/messages reject <id>` | Reject a message from the current review |
+| `/messages inbound auto\|accept\|hold\|refuse` | Set the session policy within project restrictions |
+
+Review again if the session's mode, workspace, or policy changes. An old review cannot approve a message under new controls.
+
+You can also ask the agent to find a session and send it a message. It uses `list_sessions` for discovery and `send_message` for delivery. Discovery shows session labels and availability, without transcript previews. Messages use an opaque target from discovery or an incoming reply address. A title is not a unique address.
+
+Accepted messages enter at a safe run boundary. They can also wake an eligible idle TUI session and start a billable model turn. They do not interrupt a running tool or bypass cancellation, permission review, or delivery limits. The recipient still applies its own tool permissions.
+
+### Delivery receipts and lifetime
+
+| Status | Meaning |
+|---|---|
+| `queued` | Accepted into the live inbox, not yet delivered to the model |
+| `held` | Accepted into the live inbox, waiting for approval or an automatic-delivery limit to clear |
+| `refused`, `unavailable`, `rate_limited` | Not admitted |
+| `unknown` | Delivery may have been accepted before the connection failed |
+
+A receipt does not promise a reply or completed work. Do not treat `unknown` as a definite failure and send the same request again under a new identity.
+
+Queued and held messages live only in bounded memory. Closing or replacing the receiving session, exiting, or crashing can discard them. There is no offline inbox or crash-durable delivery guarantee. Messages already recorded in conversation history follow normal session retention. Reloading or rewinding history never sends them again.
+
+Each body is limited to 32 KiB of UTF-8. The inbox admits at most 50 messages across pending, held, and claimed states, with a 1 MiB session ceiling and an 8 MiB process ceiling. A full inbox rejects new messages rather than evicting older ones.
+
+Each session can automatically deliver 16 messages and send 16 messages between local user interactions. This shared budget covers all peers and both busy delivery and idle wakes. Exhaustion holds further incoming messages and rejects further sends. Local user input resets the budget. Peer replies, elapsed time, and reloading the session do not.
+
 ## Background tasks
 
 In the TUI and [stream-JSON SDK](/docs/headless/#background-tasks), tasks and shell commands can return an admission receipt while work continues. Admission does not mean success. The session delivers reports and terminal results to the agent that owns the work.

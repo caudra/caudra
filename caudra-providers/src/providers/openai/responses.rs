@@ -837,7 +837,8 @@ mod tests {
     use super::*;
     use crate::invalid_tool_input;
     use crate::providers::test_support::{
-        task_event_origin, task_observation_with_output_refs, workflow_event_origin,
+        PEER_ATTACK, PEER_TEXT, assert_peer_framing, peer_message_origin, task_event_origin,
+        task_observation_with_output_refs, workflow_event_origin,
     };
     use crate::{StandingReminderKind, SteeringKind};
     use futures_lite::io::Cursor;
@@ -977,6 +978,19 @@ mod tests {
         assert_eq!(
             wire,
             json!([{"type": "message", "role": "user", "content": [{"type": "input_text", "text": STEERING_TEXT}]}])
+        );
+    }
+
+    #[test_case(PEER_TEXT ; "plain_text")]
+    #[test_case(PEER_ATTACK ; "adversarial_host_markers")]
+    fn peer_observation_wire_contains_only_framed_text(text: &str) {
+        let origin = peer_message_origin();
+        let wire = convert_input(&[Message::peer_observation(text.into(), origin.clone())]);
+        let framed = wire[0]["content"][0]["text"].as_str().unwrap();
+        assert_peer_framing(framed, text, &origin);
+        assert_eq!(
+            wire,
+            json!([{"type": "message", "role": "user", "content": [{"type": "input_text", "text": framed}]}])
         );
     }
 

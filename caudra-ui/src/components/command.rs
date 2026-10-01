@@ -231,6 +231,20 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         features: &[],
     },
     BuiltinCommand {
+        name: "/peers",
+        description: "List live local messaging peers (experimental)",
+        max_args: 0,
+        scope: ChatScope::MainOnly,
+        features: &[Feature::CrossSessionMessaging],
+    },
+    BuiltinCommand {
+        name: "/messages",
+        description: "Inspect held messages; approve/reject ID or set inbound POLICY",
+        max_args: usize::MAX,
+        scope: ChatScope::MainOnly,
+        features: &[Feature::CrossSessionMessaging],
+    },
+    BuiltinCommand {
         name: "/workflows",
         description: "Browse, trust, and launch workflows",
         max_args: 0,
@@ -1241,6 +1255,8 @@ mod tests {
     }
 
     #[test_case("/workflow", Feature::Workflows; "workflow")]
+    #[test_case("/peers", Feature::CrossSessionMessaging; "peers")]
+    #[test_case("/messages", Feature::CrossSessionMessaging; "messages")]
     #[test_case("/deep-research", Feature::Workflows; "workflow_shortcut")]
     #[test_case("/sandbox", Feature::Sandboxes; "sandbox")]
     #[test_case("/decisions", Feature::DecisionEngine; "decisions")]

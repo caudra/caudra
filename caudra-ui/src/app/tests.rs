@@ -74,8 +74,9 @@ use caudra_storage::permission_patterns::{
 use caudra_storage::prompt_stash::{PromptStash, StashEntry};
 use caudra_storage::sessions::{
     PermissionMode, SessionLocation, SessionMeta, StoredActiveGoal, StoredGoalVerdict, StoredImage,
-    StoredMode, StoredPasteRange, StoredPromptAdmission, StoredQueuedDraft, StoredQueuedPrompt,
-    StoredSubagent, StoredSubagentOutcome, StoredTokenUsage, UnrecordedCall,
+    StoredInboundPolicy, StoredMode, StoredPasteRange, StoredPeerControls, StoredPromptAdmission,
+    StoredQueuedDraft, StoredQueuedPrompt, StoredSubagent, StoredSubagentOutcome, StoredTokenUsage,
+    UnrecordedCall,
 };
 use caudra_storage::thinking::StoredThinking;
 use caudra_storage::tool_outputs::{ToolOutputError, ToolOutputStore};
@@ -104,6 +105,9 @@ use tempfile::TempDir;
 use test_case::test_case;
 
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const PEER_DELIVERED: usize = 11;
+const PEER_SENT: usize = 9;
+const PEER_CONTROL_PROMPT: &str = "Keep the peer controls across a reload.";
 const REJECTED_DRAFT_PREFIX: &str = "  review ";
 const REJECTED_DRAFT_PASTE: &str = "pasted context\nsecond line";
 const REJECTED_DRAFT_IMAGE: &str = "iVBORw0KGgo=";
@@ -673,6 +677,28 @@ fn mailbox_wake_starts_without_an_empty_user_bubble() {
     assert!(app.main_chat().segment_search_texts().is_empty());
 }
 
+#[test_case(false; "peer_admission_wake")]
+#[test_case(true; "suppressed_peer_wake")]
+fn empty_mailbox_wake_leaves_peer_claim_to_admission(suppressed: bool) {
+    let mut app = test_app();
+    app.automatic_wakes_suppressed = suppressed;
+    let run_id = app.run_id;
+    let actions = app.start_mailbox_run(Vec::new());
+    if suppressed {
+        assert!(actions.is_empty());
+        assert_eq!(app.run_id, run_id);
+    } else {
+        assert!(matches!(actions.as_slice(), [Action::SendMessage(input)]
+            if input.message.is_empty()
+                && input.preamble.is_empty()
+                && input.images.is_empty()
+                && !input.resume));
+        assert_eq!(app.run_id, run_id + 1);
+    }
+    assert!(app.main_chat().segment_search_texts().is_empty());
+    assert_eq!(app.automatic_wakes_suppressed, suppressed);
+}
+
 #[test_case(false; "report_after_final_answer")]
 #[test_case(true; "stop_suppresses_report")]
 fn normal_done_keeps_background_continuation_eligible(stopped: bool) {
@@ -1177,6 +1203,7 @@ mod background_runtime {
                         AgentEvent::Injected {
                             text,
                             task_event: None,
+                            peer_event: None,
                         } if text.contains(caudra_agent::prompt::ENVIRONMENT_MARKER) => {
                             assert!(summary_seen);
                             assert!(reminder.is_none(), "{SNAPSHOT_STAYS_LAST}");
@@ -1185,6 +1212,7 @@ mod background_runtime {
                         AgentEvent::Injected {
                             text,
                             task_event: None,
+                            peer_event: None,
                         } => {
                             assert!(summary_seen);
                             assert!(!done);
@@ -4683,6 +4711,8 @@ fn main_only_commands_still_run_from_the_main_composer() {
 
 #[test_case("/workflow", Feature::Workflows; "workflow")]
 #[test_case("/workflows", Feature::Workflows; "workflows")]
+#[test_case("/peers", Feature::CrossSessionMessaging; "peers")]
+#[test_case("/messages", Feature::CrossSessionMessaging; "messages")]
 #[test_case("/deep-research", Feature::Workflows; "workflow_shortcut")]
 #[test_case("/sandbox", Feature::Sandboxes; "sandbox")]
 #[test_case("/decisions", Feature::DecisionEngine; "decisions")]
@@ -8056,6 +8086,7 @@ fn clicking_task_delivery_opens_chat_named_by_typed_origin(restored: bool) {
             AgentEvent::Injected {
                 text: DELIVERY_TEXT.into(),
                 task_event: Some(origin),
+                peer_event: None,
             },
             None,
         );
@@ -9705,6 +9736,178 @@ fn drain_writer(app: App, writer: Arc<StorageWriter>) {
         .ok()
         .expect("app must hold the only other writer reference")
         .shutdown(WRITER_DRAIN_TIMEOUT);
+}
+
+fn stored_peer_controls() -> StoredPeerControls {
+    StoredPeerControls {
+        inbound: Some(StoredInboundPolicy::Hold),
+        delivered: PEER_DELIVERED,
+        sends: PEER_SENT,
+    }
+}
+
+#[test_case(false; "experiment_disabled")]
+#[test_case(true; "experiment_enabled")]
+fn peer_controls_survive_checkpoint_and_reload(enabled: bool) {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    app.features = if enabled {
+        FeatureFlags::NONE.with(Feature::CrossSessionMessaging)
+    } else {
+        FeatureFlags::NONE
+    };
+    app.state.session_mut().meta.peer_controls = Some(stored_peer_controls());
+    crate::push_history_message(
+        app.state.session_mut(),
+        Message::user(PEER_CONTROL_PROMPT.into()),
+    );
+    app.checkpoint_now();
+    let id = app.state.session.id;
+    let features = app.features;
+    drain_writer(app, writer);
+    let loaded = AppSession::load(id, &dir).unwrap();
+    assert_eq!(loaded.meta.peer_controls, Some(stored_peer_controls()));
+
+    let mut restored = test_app();
+    restored.features = features;
+    restored
+        .apply_loaded_session(loaded, &test_model())
+        .unwrap();
+    restored.checkpoint_now();
+    assert_eq!(
+        restored.state.session.meta.peer_controls,
+        Some(stored_peer_controls())
+    );
+}
+
+#[test]
+fn peer_controls_alone_do_not_persist_a_blank_session() {
+    let mut app = test_app();
+    app.state.session_mut().meta.peer_controls = Some(stored_peer_controls());
+    app.checkpoint_now();
+    assert_eq!(
+        app.state.session.meta.peer_controls,
+        Some(stored_peer_controls())
+    );
+    assert!(!app.has_content());
+    assert!(!app.state.session.is_persisted());
+}
+
+#[test_case(false; "new_session")]
+#[test_case(true; "fork")]
+fn peer_controls_are_not_inherited_by_new_session_ids(fork: bool) {
+    let mut app = test_app();
+    app.suppress_background_wakes();
+    app.state.session_mut().meta.peer_controls = Some(stored_peer_controls());
+    crate::push_history_message(
+        app.state.session_mut(),
+        Message::user(PEER_CONTROL_PROMPT.into()),
+    );
+    app.checkpoint_now();
+    let old_id = app.state.session.id;
+    if fork {
+        let source = app.state.session.messages()[0].id;
+        let child = app.fork_at(DisplaySource::User(source)).unwrap();
+        assert_ne!(child.session.id, old_id);
+        assert_eq!(child.session.meta.peer_controls, None);
+        assert!(!child.session.meta.automatic_wakes_suppressed);
+    } else {
+        assert!(!app.reset_session().is_empty());
+        app.checkpoint_now();
+        assert_ne!(app.state.session.id, old_id);
+        assert_eq!(app.state.session.meta.peer_controls, None);
+        assert!(!app.automatic_wakes_suppressed);
+        assert!(!app.state.session.meta.automatic_wakes_suppressed);
+    }
+}
+
+#[test]
+fn peer_controls_survive_conversation_rewind() {
+    let mut app = test_app();
+    app.state.session_mut().meta.peer_controls = Some(stored_peer_controls());
+    let _history = attach_live_history(
+        &mut app,
+        vec![
+            Message::user(PEER_CONTROL_PROMPT.into()),
+            Message::user(PEER_CONTROL_PROMPT.into()),
+        ],
+    );
+    app.checkpoint_now();
+    assert!(
+        !app.rewind_to(RewindEntry {
+            turn_index: 1,
+            prompt_preview: PEER_CONTROL_PROMPT.into(),
+        })
+        .is_empty()
+    );
+    app.checkpoint_now();
+    assert_eq!(
+        app.state.session.meta.peer_controls,
+        Some(stored_peer_controls())
+    );
+    assert!(app.automatic_wakes_suppressed);
+    assert!(app.state.session.meta.automatic_wakes_suppressed);
+}
+
+#[test_case(DoneReason::Cancelled, true, true; "cancelled_process_resume")]
+#[test_case(DoneReason::MaxTurns, true, true; "exhausted_process_resume")]
+#[test_case(DoneReason::Cancelled, false, true; "cancelled_loaded_session")]
+#[test_case(DoneReason::MaxTurns, false, true; "exhausted_loaded_session")]
+#[test_case(DoneReason::Cancelled, true, false; "disabled_process_resume")]
+#[test_case(DoneReason::MaxTurns, false, false; "disabled_loaded_session")]
+fn automatic_wake_suppression_survives_reload(reason: DoneReason, startup: bool, messaging: bool) {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    crate::push_history_message(
+        app.state.session_mut(),
+        Message::user(PEER_CONTROL_PROMPT.into()),
+    );
+    app.status = Status::Streaming;
+    app.update(agent_msg_with_run_id(
+        AgentEvent::Done {
+            usage: TokenUsage::default(),
+            num_turns: 1,
+            reason,
+        },
+        app.run_id,
+    ));
+    assert!(app.automatic_wakes_suppressed);
+    app.checkpoint_now();
+    let id = app.state.session.id;
+    drain_writer(app, writer);
+    let loaded = AppSession::load(id, &dir).unwrap();
+    assert!(loaded.meta.automatic_wakes_suppressed);
+
+    let mut restored = test_app();
+    restored.features = if messaging {
+        FeatureFlags::NONE.with(Feature::CrossSessionMessaging)
+    } else {
+        FeatureFlags::NONE
+    };
+    if startup {
+        restored.state = SessionState::from_session(
+            loaded,
+            &test_model(),
+            &restored.storage,
+            &restored.model_policy,
+        );
+        restored.restore_resumed_session();
+    } else {
+        restored
+            .apply_loaded_session(loaded, &test_model())
+            .unwrap();
+    }
+    assert!(restored.automatic_wakes_suppressed);
+    assert!(restored.start_mailbox_run(Vec::new()).is_empty());
+    restored.checkpoint_now();
+    assert!(restored.state.session.meta.automatic_wakes_suppressed);
+
+    restored.shared_history = Some(Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(
+        crate::active_session_history(&restored.state.session).unwrap(),
+    ))));
+    let actions = restored.execute_command(cmd("/continue"), 0);
+    assert!(matches!(actions.as_slice(), [Action::SendMessage(input)] if input.resume));
+    assert!(!restored.automatic_wakes_suppressed);
+    restored.checkpoint_now();
+    assert!(!restored.state.session.meta.automatic_wakes_suppressed);
 }
 
 #[test]

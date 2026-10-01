@@ -69,6 +69,10 @@ version = 1
 # Type: bool.
 # decision_engine = false
 
+# Turn on cross-session messages.
+# Type: bool.
+# cross_session_messaging = false
+
 [ui]
 
 # Show splash animation on startup.
@@ -220,8 +224,9 @@ version = 1
 # Type: usize, at least 1.
 # web = 3
 
-# Rows for `batch`, `execution_environment`, `question`, `skill`, `todo_write`,
-# `tool_output`, `view_image`, `workflow`.
+# Rows for `batch`, `execution_environment`, `list_sessions`, `question`,
+# `send_message`, `skill`, `todo_write`, `tool_output`, `view_image`,
+# `workflow`.
 # Type: usize, at least 1.
 # other = 3
 
@@ -340,6 +345,16 @@ version = 1
 # `server.*` for a whole MCP server. A project list extends the global one.
 # Type: string[].
 # disabled_tools = []
+
+[agent.messaging]
+
+# Inbound cross-session messages: `auto` accepts only compatible trusted peers,
+# `accept` allows wider delivery, `hold` requires approval, `refuse` rejects
+# messages. Project settings may only tighten policy: accept < auto < hold <
+# refuse. Needs `experimental.cross_session_messaging`; accepting messages can
+# start billable turns.
+# Type: string.
+# inbound = "auto"
 
 [agent.steering]
 # Automatic steering repairs unusable model output and can add bounded guidance

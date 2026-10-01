@@ -4,9 +4,9 @@ use crate::experimental::{Feature, FeatureFlags};
 use crate::files::{self, CONFIG_FILES};
 use crate::steering::{SteeringConfig, SteeringRule, SteeringRulesConfig};
 use crate::{
-    AgentConfig, ConfigValue, DEFAULT_BUILTINS, MIN_TOOL_OUTPUT_LINES, NATIVE_PLUGIN_OPTIONS,
-    ProviderConfig, RetentionConfig, SnapshotsConfig, StorageConfig, TOP_LEVEL_FIELDS,
-    TelemetryConfig, ToolOutputLines, UiConfig, WorktreesConfig,
+    AgentConfig, ConfigValue, DEFAULT_BUILTINS, MIN_TOOL_OUTPUT_LINES, MessagingConfig,
+    NATIVE_PLUGIN_OPTIONS, ProviderConfig, RetentionConfig, SnapshotsConfig, StorageConfig,
+    TOP_LEVEL_FIELDS, TelemetryConfig, ToolOutputLines, UiConfig, WorktreesConfig,
 };
 
 use super::{Document, Entry, Header, Table, code_list, global_location, preamble};
@@ -81,6 +81,10 @@ fn tables() -> Vec<Table> {
         )
         .about(TOOL_OUTPUT_LINES_ABOUT),
         Table::of(Header::Fixed("agent".into()), AgentConfig::FIELDS),
+        Table::of(
+            Header::Fixed("agent.messaging".into()),
+            MessagingConfig::FIELDS,
+        ),
         Table::of(
             Header::Fixed("agent.steering".into()),
             SteeringConfig::FIELDS,
@@ -197,6 +201,7 @@ mod tests {
     use crate::example::Render;
     use crate::experimental::FeatureFlags;
     use crate::{Config, RawConfig};
+    use toml::Value;
 
     const MODEL: &str = "provider/model";
 
@@ -259,5 +264,29 @@ mod tests {
             &defaults.decisions,
         );
         assert_eq!(format!("{stated:?}"), format!("{built_in:?}"));
+    }
+
+    #[test]
+    fn messaging_reference_lists_opt_in_and_inbound_defaults() {
+        let live = document().render(Render::Live { defaults: true });
+        let example: Value = toml::from_str(&live).unwrap();
+        assert_eq!(
+            example["experimental"]["cross_session_messaging"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            example["agent"]["messaging"]["inbound"].as_str(),
+            Some("auto")
+        );
+        assert!(
+            example["agent"]["messaging"]
+                .get("project_inbound")
+                .is_none()
+        );
+        assert!(
+            !document()
+                .render(Render::Reference)
+                .contains("project_inbound")
+        );
     }
 }

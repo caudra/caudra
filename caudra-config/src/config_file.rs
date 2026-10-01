@@ -147,10 +147,11 @@ mod tests {
     use super::{
         CONFIG_FILE, ConfigFileError, load_global_config, load_project_config, project_config_path,
     };
+    use crate::InboundPolicy;
     use crate::experimental::{Feature, FeatureFlags};
     use test_case::test_case;
 
-    const EVERY_FLAG: &str = "[experimental]\nworkflows = true\nsandboxes = true\nremote_workcell = true\nlua_plugins = true\ndecision_engine = true\n";
+    const EVERY_FLAG: &str = "[experimental]\nworkflows = true\nsandboxes = true\nremote_workcell = true\nlua_plugins = true\ndecision_engine = true\ncross_session_messaging = true\n";
 
     fn write(contents: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -178,6 +179,9 @@ mod tests {
     #[test_case("version = 1\n[experimental]\n", FeatureFlags::NONE; "empty_table")]
     #[test_case("[experimental]\nworkflows = false\n", FeatureFlags::NONE; "explicit_false")]
     #[test_case("[experimental]\nlua_plugins = true\n", FeatureFlags::NONE.with(Feature::LuaPlugins); "one_flag")]
+    #[test_case("[experimental]\ncross_session_messaging = false\n", FeatureFlags::NONE; "messaging_false")]
+    #[test_case("[experimental]\ncross_session_messaging = true\n", FeatureFlags::NONE.with(Feature::CrossSessionMessaging); "messaging_only")]
+    #[test_case("[experimental]\nworkflows = true\ncross_session_messaging = false\n", FeatureFlags::NONE.with(Feature::Workflows); "messaging_independent_of_workflows")]
     fn global_flags_resolve(contents: &str, expected: FeatureFlags) {
         let (_dir, path) = write(contents);
         assert_eq!(load_global_config(&path).unwrap().features, expected);
@@ -203,6 +207,24 @@ mod tests {
         assert_eq!(loaded.settings.ui.scrollbar, Some(false));
     }
 
+    #[test_case(""; "missing_flag")]
+    #[test_case("[experimental]\ncross_session_messaging = false\n"; "disabled_flag")]
+    fn inbound_accept_does_not_enable_messaging(flags: &str) {
+        let (_dir, path) = write(&format!("{flags}[agent.messaging]\ninbound = 'accept'\n"));
+        let loaded = load_global_config(&path).unwrap();
+        assert_eq!(loaded.features, FeatureFlags::NONE);
+        assert_eq!(
+            loaded
+                .settings
+                .into_config(false)
+                .unwrap()
+                .agent
+                .messaging
+                .inbound,
+            InboundPolicy::Accept,
+        );
+    }
+
     #[test_case("[experimental]\nworkflow = true\n", "unknown field `workflow`"; "unknown_flag")]
     #[test_case("[experimental]\nworkflows = 1\n", "line 2"; "non_bool_flag")]
     #[test_case("experimental = true\n", "line 1"; "flag_table_not_a_table")]
@@ -219,6 +241,8 @@ mod tests {
 
     #[test_case("[experimental]\n"; "empty_table")]
     #[test_case(EVERY_FLAG; "enabled_flags")]
+    #[test_case("[experimental]\ncross_session_messaging = true\n"; "messaging_enabled")]
+    #[test_case("[experimental]\ncross_session_messaging = false\n"; "messaging_disabled")]
     fn project_files_cannot_hold_experiments(contents: &str) {
         let dir = tempfile::tempdir().unwrap();
         let path = project_config_path(dir.path());

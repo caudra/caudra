@@ -58,6 +58,7 @@ use crate::background::{BackgroundTasks, BackgroundTransition};
 use crate::cancel::{CancelMap, CancelToken, CancelTrigger};
 use crate::commits;
 use crate::mentions;
+use crate::peers::{PeerDescriptor, PeerHost};
 use crate::permissions::editor::{PermissionEditError, PermissionPublication};
 use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedSlots;
@@ -1324,6 +1325,22 @@ fn advertised_tool_names(
 }
 
 pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveStartError> {
+    let peer_host = if params.workspace_session.is_some() || params.host_cwd.is_some() {
+        None
+    } else {
+        match PeerHost::start(params.config.features) {
+            Ok(host) => host,
+            Err(error) => {
+                warn!(%error, "cross-session messaging unavailable");
+                None
+            }
+        }
+    };
+    if peer_host.is_none() {
+        params
+            .excluded_tools
+            .extend_from_slice(crate::tools::native::peers::TOOL_NAMES);
+    }
     let state_dir =
         StateDir::resolve().map_err(|error| InteractiveStartError(error.to_string()))?;
     let decisions = initialize_decisions(
@@ -1461,6 +1478,28 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
                 session_id,
                 &params.snapshots,
             );
+            let peer_session = peer_host.as_ref().and_then(|host| {
+                match host.register_with_controls(
+                    PeerDescriptor {
+                        session_id,
+                        name: "Print session".into(),
+                        cwd: params.initial_wd.clone(),
+                        mode: mode.clone(),
+                        permission_mode: permissions.mode(),
+                        inbound: params.config.messaging.inbound.clone(),
+                        blocked: false,
+                        busy: true,
+                    },
+                    params.config.messaging.project_inbound.clone(),
+                    None,
+                ) {
+                    Ok(session) => Some(session),
+                    Err(error) => {
+                        warn!(%error, "cross-session messaging registration unavailable");
+                        None
+                    }
+                }
+            });
             let mut agent = Agent::new(
                 AgentParams {
                     provider: Arc::clone(&provider),
@@ -1514,6 +1553,7 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
             .with_loaded_instructions(instructions.loaded)
             .with_goal(params.goal)
             .with_background_wait()
+            .with_peer_exit()
             .with_mcp(mcp);
 
             let mentions = if params.remote_environment.is_some() {
@@ -1552,6 +1592,9 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
                 })
                 .await;
             drop(agent);
+            if let Some(peer) = peer_session {
+                peer.close();
+            }
 
             if let Err(e) = result {
                 error!(error = %e, "agent error");
@@ -1943,6 +1986,9 @@ impl PreparedInteractive {
 pub async fn prepare_interactive(
     mut params: InteractiveParams,
 ) -> Result<PreparedInteractive, InteractiveStartError> {
+    params
+        .excluded_tools
+        .extend_from_slice(crate::tools::native::peers::TOOL_NAMES);
     if params.remote_environment.is_some() != params.workspace_session.is_some() {
         return Err(InteractiveStartError(
             "remote workspace and environment must be supplied together".into(),
@@ -5616,6 +5662,7 @@ complete(#{ report: first.output });
                 AgentEvent::Injected {
                     text,
                     task_event: Some(origin),
+                    ..
                 } => return (text, origin),
                 AgentEvent::Done { .. } if envelope.subagent.is_none() => {
                     panic!("{TASK_INJECTION_MISSING}")

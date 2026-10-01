@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use caudra_providers::{
-    AgentError, Billing, ContentBlock, Message, Role, StopReason, TaskEventOrigin, TokenUsage,
-    estimate_tokens_cached, token_label,
+    AgentError, Billing, ContentBlock, Message, PeerMessageOrigin, Role, StopReason,
+    TaskEventOrigin, TokenUsage, estimate_tokens_cached, token_label,
 };
 use caudra_storage::background::{JobKind, JobOwner, ShellJobMetadata};
 use caudra_storage::id::CaudraId;
@@ -2104,6 +2104,8 @@ pub enum AgentEvent {
         text: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         task_event: Option<TaskEventOrigin>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        peer_event: Option<PeerMessageOrigin>,
     },
     /// Deferred tools moved into the request array. Reported because the user
     /// is paying for it: the tools array changes, so the provider's prompt

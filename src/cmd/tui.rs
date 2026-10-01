@@ -17,6 +17,7 @@ use flume::{RecvTimeoutError as PatternRecvError, Sender as ChannelSender};
 use caudra_agent::command::{self, CustomCommand};
 use caudra_agent::decisions::Decisions;
 use caudra_agent::herdr::HerdrEnv;
+use caudra_agent::peers::PeerHost;
 use caudra_agent::permissions::pattern_recognition::{PatternCandidate, RecognitionExclusion};
 use caudra_agent::prompt::profile::{PromptProfileCatalog, SystemPromptProfile};
 use caudra_agent::tools::{ToolAudience, ToolFilter, ToolRegistry};
@@ -1517,6 +1518,17 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
     let mut sweeper = RetentionSweeper::spawn(storage.clone(), stack.config.storage);
     let mut committed_relocation: Option<String> = None;
     let sandboxes = cli.startup.features.enabled(Feature::Sandboxes);
+    let peer_host = if workcell_runtime.is_remote() {
+        None
+    } else {
+        match PeerHost::start(cli.startup.features) {
+            Ok(host) => host.map(Arc::new),
+            Err(error) => {
+                warnings.push(format!("Cross-session messaging unavailable: {error}"));
+                None
+            }
+        }
+    };
 
     loop {
         let runtime_cwd = if workcell_runtime.is_remote() {
@@ -1669,6 +1681,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                 default_prompt_profile: stack.default_prompt_profile.clone(),
                 prompt_profile_override: cli.system_prompt_profile.clone(),
                 herdr_reporter: herdr_reporter.as_ref().map(HerdrReporter::handle),
+                peer_host: peer_host.clone(),
                 worktrees: worktrees.clone(),
                 workspace_session: workcell_runtime.workspace_session().cloned(),
                 remote_project_context: workcell_runtime.remote_project_context().cloned(),

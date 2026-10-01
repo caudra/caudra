@@ -13,6 +13,7 @@ pub mod batch;
 pub mod image_generate;
 mod local_document;
 pub mod memory;
+pub mod peers;
 pub mod question;
 pub(crate) mod report_to_parent;
 pub mod skill;
@@ -143,6 +144,20 @@ fn entries(
             workflow::DESCRIPTION,
         ));
     }
+    if features.enabled(Feature::CrossSessionMessaging) {
+        entries.extend([
+            entry(
+                peers::ListSessions,
+                ToolEffect::ReadOnly,
+                peers::LIST_DESCRIPTION,
+            ),
+            entry(
+                peers::SendMessage,
+                ToolEffect::Mutating,
+                peers::SEND_DESCRIPTION,
+            ),
+        ]);
+    }
     entries
 }
 
@@ -184,6 +199,7 @@ pub fn static_description(tool: &dyn Tool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_case::test_case;
 
     const DUPLICATE_NAME: &str = "two native tools share a name";
     const NAME_DRIFT: &str = "CAUDRA_NATIVE_TOOL_NAMES must list exactly what `entries` registers; \
@@ -246,5 +262,18 @@ mod tests {
         assert!(registers_workflow(
             FeatureFlags::NONE.with(Feature::Workflows)
         ));
+    }
+
+    #[test_case(FeatureFlags::NONE, false; "disabled")]
+    #[test_case(FeatureFlags::NONE.with(Feature::Workflows), false; "independent_of_workflows")]
+    #[test_case(FeatureFlags::NONE.with(Feature::CrossSessionMessaging), true; "enabled")]
+    fn messaging_registers_only_when_its_experiment_is_on(features: FeatureFlags, enabled: bool) {
+        let entries = entries(skill::SkillTool::default(), features);
+        for name in peers::TOOL_NAMES {
+            assert_eq!(
+                entries.iter().any(|(tool, ..)| tool.name() == *name),
+                enabled
+            );
+        }
     }
 }

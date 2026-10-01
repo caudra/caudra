@@ -273,11 +273,13 @@ pub const ACTIVE_DEFAULT_LUA_PLUGINS: &[&str] = &[];
 pub const CAUDRA_NATIVE_TOOL_NAMES: &[&str] = &[
     "batch",
     "image_generate",
+    "list_sessions",
     "local_document_apply_patch",
     "local_document_read",
     "local_document_write",
     "memory",
     "question",
+    "send_message",
     "skill",
     "task",
     "task_control",
@@ -658,7 +660,7 @@ pub struct RawConfig {
 
 impl RawConfig {
     /// Applies a project layer: global-only settings are refused and the
-    /// decision engine may only be tightened.
+    /// decision engine and inbound messaging policy may only be tightened.
     pub fn merge(&mut self, mut overlay: RawConfig) {
         self.project_permission_mode_override = self
             .project_permission_mode_override
@@ -666,6 +668,21 @@ impl RawConfig {
             .or(overlay.always_yolo.map(|_| "always_yolo"))
             .or(overlay.always_auto.map(|_| "always_auto"));
         self.decisions.restrict(mem::take(&mut overlay.decisions));
+        let messaging = &mut overlay.agent.messaging;
+        messaging.project_inbound = messaging
+            .project_inbound
+            .take()
+            .max(messaging.inbound.clone());
+        if let Some(inbound) = messaging.inbound.take() {
+            self.agent.messaging.inbound = Some(
+                self.agent
+                    .messaging
+                    .inbound
+                    .take()
+                    .unwrap_or_default()
+                    .max(inbound),
+            );
+        }
         self.merge_shared(overlay);
     }
 
@@ -1229,6 +1246,7 @@ impl<'de> Deserialize<'de> for CompactionBuffer {
 #[serde(default, deny_unknown_fields)]
 pub struct AgentFileConfig {
     pub steering: Option<SteeringConfig>,
+    pub messaging: MessagingFileConfig,
     pub system_prompt_profile: Option<String>,
     pub max_output_bytes: Option<usize>,
     pub max_output_lines: Option<usize>,
@@ -1258,6 +1276,23 @@ impl AgentFileConfig {
     fn merge(&mut self, overlay: AgentFileConfig) {
         if let Some(steering) = overlay.steering {
             self.steering.get_or_insert_default().merge(steering);
+        }
+        if overlay.messaging.inbound.is_some() {
+            self.messaging.inbound = overlay.messaging.inbound;
+        }
+        self.messaging.project_inbound = self
+            .messaging
+            .project_inbound
+            .take()
+            .max(overlay.messaging.project_inbound);
+        if let Some(floor) = &self.messaging.project_inbound {
+            self.messaging.inbound = Some(
+                self.messaging
+                    .inbound
+                    .take()
+                    .unwrap_or_default()
+                    .max(floor.clone()),
+            );
         }
         merge_option!(
             self,
@@ -1291,6 +1326,14 @@ impl AgentFileConfig {
             self.disabled_tools.get_or_insert_default().extend(overlay);
         }
     }
+}
+
+#[derive(Deserialize, Default, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct MessagingFileConfig {
+    pub inbound: Option<InboundPolicy>,
+    #[serde(skip)]
+    pub project_inbound: Option<InboundPolicy>,
 }
 
 #[derive(Deserialize, Default, Debug)]
@@ -2125,7 +2168,9 @@ impl ToolOutputLines {
             &[
                 "batch",
                 "execution_environment",
+                "list_sessions",
                 "question",
+                "send_message",
                 "skill",
                 "todo_write",
                 "tool_output",
@@ -2200,12 +2245,45 @@ impl Default for ToolOutputLines {
     }
 }
 
+/// Ordered from least to most restrictive so project layers can only tighten it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InboundPolicy {
+    Accept,
+    #[default]
+    Auto,
+    Hold,
+    Refuse,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ConfigSection, Serialize, Deserialize)]
+#[config(section = "agent.messaging")]
+#[serde(default, deny_unknown_fields)]
+pub struct MessagingConfig {
+    #[config(
+        default = InboundPolicy::Auto,
+        ty = "string",
+        default_doc = "auto",
+        desc = "Inbound cross-session messages: `auto` accepts only compatible trusted peers, `accept` allows wider delivery, `hold` requires approval, `refuse` rejects messages. Project settings may only tighten policy: accept < auto < hold < refuse. Needs `experimental.cross_session_messaging`; accepting messages can start billable turns"
+    )]
+    pub inbound: InboundPolicy,
+
+    /// The strictest explicit project policy. No project policy leaves session
+    /// controls free to choose `Accept`, even when the global default is `Auto`.
+    #[config(skip, default = "None")]
+    #[serde(skip)]
+    pub project_inbound: Option<InboundPolicy>,
+}
+
 #[derive(Debug, Clone, ConfigSection, Serialize)]
 #[config(section = "agent")]
 pub struct AgentConfig {
     // Sharing immutable policy keeps tool contexts from cloning the full model map.
     #[config(skip, default = "Arc::default()")]
     pub steering: Arc<SteeringConfig>,
+
+    #[config(skip, default = "MessagingConfig::default()")]
+    pub messaging: MessagingConfig,
 
     #[config(
         ty = "String",
@@ -2375,6 +2453,10 @@ impl AgentConfig {
         Self {
             no_rtk,
             steering: Arc::new(file.steering.unwrap_or_default()),
+            messaging: MessagingConfig {
+                inbound: file.messaging.inbound.unwrap_or_default(),
+                project_inbound: file.messaging.project_inbound,
+            },
             system_prompt_profile: file
                 .system_prompt_profile
                 .filter(|profile| profile != "builtin"),
@@ -3681,6 +3763,139 @@ mod tests {
         PluginFileConfig {
             enabled: Some(enabled),
             opts: JsonMap::new(),
+        }
+    }
+
+    #[test_case("", InboundPolicy::Auto; "missing_agent")]
+    #[test_case("[agent]", InboundPolicy::Auto; "missing_messaging")]
+    #[test_case("[agent.messaging]", InboundPolicy::Auto; "missing_inbound")]
+    #[test_case("[agent.messaging]\ninbound = 'accept'", InboundPolicy::Accept; "accept")]
+    #[test_case("[agent.messaging]\ninbound = 'auto'", InboundPolicy::Auto; "auto")]
+    #[test_case("[agent.messaging]\ninbound = 'hold'", InboundPolicy::Hold; "hold")]
+    #[test_case("[agent.messaging]\ninbound = 'refuse'", InboundPolicy::Refuse; "refuse")]
+    fn messaging_config_resolves_and_serializes(source: &str, expected: InboundPolicy) {
+        let raw: RawConfig = toml::from_str(source).unwrap();
+        let config = raw.into_config(false).unwrap();
+        assert_eq!(config.agent.messaging.inbound, expected);
+        assert_eq!(config.agent.messaging.project_inbound, None);
+        assert_eq!(config.agent.features, FeatureFlags::NONE);
+        let serialized = serde_json::to_value(&config.agent).unwrap();
+        let messaging: MessagingConfig =
+            serde_json::from_value(serialized["messaging"].clone()).unwrap();
+        assert_eq!(messaging, config.agent.messaging);
+    }
+
+    #[test_case("inbound = 'unknown'"; "unknown_policy")]
+    #[test_case("inbound = true"; "boolean_policy")]
+    #[test_case("inbound = 1"; "numeric_policy")]
+    #[test_case("inboud = 'hold'"; "unknown_field")]
+    fn invalid_messaging_config_is_rejected(source: &str) {
+        assert!(toml::from_str::<RawConfig>(&format!("[agent.messaging]\n{source}")).is_err());
+    }
+
+    fn messaging_layer(inbound: Option<&str>) -> RawConfig {
+        let field = inbound.map_or_else(String::new, |value| format!("inbound = '{value}'"));
+        toml::from_str(&format!("[agent.messaging]\n{field}")).unwrap()
+    }
+
+    #[test_case("accept"; "accept")]
+    #[test_case("auto"; "auto")]
+    #[test_case("hold"; "hold")]
+    #[test_case("refuse"; "refuse")]
+    fn internal_project_messaging_policy_cannot_be_deserialized(policy: &str) {
+        let source = format!("project_inbound = '{policy}'");
+        assert!(toml::from_str::<MessagingConfig>(&source).is_err());
+        assert!(toml::from_str::<RawConfig>(&format!("[agent.messaging]\n{source}")).is_err());
+    }
+
+    #[test_case(Some("accept"), Some("accept"), InboundPolicy::Accept; "accept_accept")]
+    #[test_case(Some("accept"), Some("auto"), InboundPolicy::Auto; "accept_auto")]
+    #[test_case(Some("accept"), Some("hold"), InboundPolicy::Hold; "accept_hold")]
+    #[test_case(Some("accept"), Some("refuse"), InboundPolicy::Refuse; "accept_refuse")]
+    #[test_case(Some("auto"), Some("accept"), InboundPolicy::Auto; "auto_accept")]
+    #[test_case(Some("auto"), Some("auto"), InboundPolicy::Auto; "auto_auto")]
+    #[test_case(Some("auto"), Some("hold"), InboundPolicy::Hold; "auto_hold")]
+    #[test_case(Some("auto"), Some("refuse"), InboundPolicy::Refuse; "auto_refuse")]
+    #[test_case(Some("hold"), Some("accept"), InboundPolicy::Hold; "hold_accept")]
+    #[test_case(Some("hold"), Some("auto"), InboundPolicy::Hold; "hold_auto")]
+    #[test_case(Some("hold"), Some("hold"), InboundPolicy::Hold; "hold_hold")]
+    #[test_case(Some("hold"), Some("refuse"), InboundPolicy::Refuse; "hold_refuse")]
+    #[test_case(Some("refuse"), Some("accept"), InboundPolicy::Refuse; "refuse_accept")]
+    #[test_case(Some("refuse"), Some("auto"), InboundPolicy::Refuse; "refuse_auto")]
+    #[test_case(Some("refuse"), Some("hold"), InboundPolicy::Refuse; "refuse_hold")]
+    #[test_case(Some("refuse"), Some("refuse"), InboundPolicy::Refuse; "refuse_refuse")]
+    #[test_case(None, Some("accept"), InboundPolicy::Auto; "implicit_auto_accept")]
+    #[test_case(None, Some("auto"), InboundPolicy::Auto; "implicit_auto_auto")]
+    #[test_case(None, Some("hold"), InboundPolicy::Hold; "implicit_auto_hold")]
+    #[test_case(None, Some("refuse"), InboundPolicy::Refuse; "implicit_auto_refuse")]
+    #[test_case(Some("accept"), None, InboundPolicy::Accept; "missing_preserves_accept")]
+    #[test_case(Some("auto"), None, InboundPolicy::Auto; "missing_preserves_auto")]
+    #[test_case(Some("hold"), None, InboundPolicy::Hold; "missing_preserves_hold")]
+    #[test_case(Some("refuse"), None, InboundPolicy::Refuse; "missing_preserves_refuse")]
+    #[test_case(None, None, InboundPolicy::Auto; "both_missing")]
+    fn project_messaging_can_only_tighten(
+        global: Option<&str>,
+        project: Option<&str>,
+        expected: InboundPolicy,
+    ) {
+        let mut raw = messaging_layer(global);
+        let project = messaging_layer(project);
+        let expected_floor = project.agent.messaging.inbound.clone();
+        raw.merge(project);
+        raw.merge(RawConfig::default());
+        let messaging = raw.into_config(false).unwrap().agent.messaging;
+        assert_eq!(messaging.inbound, expected);
+        assert_eq!(messaging.project_inbound, expected_floor);
+    }
+
+    #[test_case(Some("refuse"), Some("accept"), InboundPolicy::Accept; "relax_refuse_to_accept")]
+    #[test_case(Some("hold"), Some("auto"), InboundPolicy::Auto; "relax_hold_to_auto")]
+    #[test_case(Some("accept"), Some("hold"), InboundPolicy::Hold; "tighten_accept_to_hold")]
+    #[test_case(None, Some("accept"), InboundPolicy::Accept; "replace_implicit_auto")]
+    #[test_case(Some("accept"), None, InboundPolicy::Accept; "missing_preserves_accept")]
+    #[test_case(Some("hold"), None, InboundPolicy::Hold; "missing_preserves_hold")]
+    fn global_messaging_overlay_replaces_explicit_policy(
+        base: Option<&str>,
+        overlay: Option<&str>,
+        expected: InboundPolicy,
+    ) {
+        let mut raw = messaging_layer(base);
+        raw.merge_global(messaging_layer(overlay));
+        raw.merge_global(RawConfig::default());
+        let messaging = raw.into_config(false).unwrap().agent.messaging;
+        assert_eq!(messaging.inbound, expected);
+        assert_eq!(messaging.project_inbound, None);
+    }
+
+    #[test_case("hold", InboundPolicy::Hold; "hold")]
+    #[test_case("refuse", InboundPolicy::Refuse; "refuse")]
+    fn later_project_layers_cannot_relax_messaging(restriction: &str, expected: InboundPolicy) {
+        let mut raw = messaging_layer(Some("accept"));
+        raw.merge(messaging_layer(Some(restriction)));
+        raw.merge(messaging_layer(Some("auto")));
+        raw.merge(messaging_layer(Some("accept")));
+        let messaging = raw.into_config(false).unwrap().agent.messaging;
+        assert_eq!(messaging.inbound, expected);
+        assert_eq!(messaging.project_inbound, Some(expected));
+    }
+
+    #[test_case("hold", InboundPolicy::Hold; "hold")]
+    #[test_case("refuse", InboundPolicy::Refuse; "refuse")]
+    fn project_messaging_floor_survives_global_overlays(project: &str, floor: InboundPolicy) {
+        for global in ["accept", "auto", "hold", "refuse"] {
+            let mut raw = messaging_layer(Some(global));
+            let global_policy = raw.agent.messaging.inbound.clone().unwrap();
+            raw.merge(messaging_layer(Some(project)));
+            raw.merge_global(messaging_layer(Some(global)));
+            let messaging = raw.into_config(false).unwrap().agent.messaging;
+            assert_eq!(messaging.inbound, global_policy.max(floor.clone()));
+            assert_eq!(messaging.project_inbound, Some(floor.clone()));
+            assert!(
+                serde_json::to_value(messaging)
+                    .unwrap()
+                    .get("project_inbound")
+                    .is_none()
+            );
         }
     }
 
@@ -5991,6 +6206,8 @@ mod tests {
     }
 
     #[test_case("shell" ; "builtin")]
+    #[test_case("list_sessions" ; "peer_discovery")]
+    #[test_case("send_message" ; "peer_send")]
     #[test_case("github.create_issue" ; "mcp_tool")]
     #[test_case("github.*" ; "mcp_server")]
     fn agent_disabled_tools_accepts(tool: &str) {

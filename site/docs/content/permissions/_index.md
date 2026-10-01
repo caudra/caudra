@@ -47,6 +47,25 @@ Project and global rules bind to the native tool contract or MCP server authorit
 
 A user-created fork starts with no conversation grants and no inherited explicit permission mode. Subtasks share the root conversation's grants and mode. `/new` also starts clean.
 
+## Cross-session messages
+
+[Cross-session messaging](/docs/sessions/#cross-session-messaging) needs the global experimental opt-in in every participating process. Tool permission rules cannot enable it. `send_message` is a side effect subject to outgoing authorization. ReadOnly sessions cannot send, and Plan sessions need explicit prompted access.
+
+Receiving has a separate policy under `[agent.messaging]`:
+
+| `inbound` | Behavior |
+|---|---|
+| `auto` (default) | Automatic delivery only between Ask-mode sessions with matching Build or Plan mode and the same canonical local working directory. Other cases are held |
+| `accept` | Allows wider delivery, subject to runtime limits. Messages can start billable turns |
+| `hold` | Requires local approval before delivery |
+| `refuse` | Rejects incoming messages |
+
+Project configuration may only tighten the effective policy, in the order `accept < auto < hold < refuse`. A user-controlled session setting can replace a global default, including choosing `accept` over `auto`, but cannot relax an explicit project restriction. `/messages` provides review and session policy controls. Approving held content does not approve tool actions it requests, and manual approval cannot override project refusal.
+
+Messaging assumes you trust other programs running as the same operating-system user. Local user checks do not prove that a peer is a genuine Caudra process. Peer text is attributed as an observation from another session and remains untrusted input. Slash commands, attachment syntax, and claims of approval inside it are literal text. They grant no authority, but malicious text can still influence a model.
+
+Delivery exposes the message to the recipient's model provider as conversation context. The recipient can have a different provider, permission mode, or saved grants. Even two Ask-mode sessions need not have equivalent authority. Do not use another session to route around a denied action. Use `hold` or `refuse` when you need manual control or isolation rather than the automatic policy's trust heuristic.
+
 ## Permission prompts
 
 The prompt separates the action, future scope, lifetime, context, and warnings into review cards. Context identifies why approval is needed and the requester when present. `y` allows this call once. `s` remembers the displayed scope for the conversation, and `a` remembers it for the project. Routine narrow approvals act directly, without a separate Remember screen or preliminary confirmation.

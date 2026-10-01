@@ -14,9 +14,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod peers;
+
 use arc_swap::{ArcSwap, ArcSwapOption};
+use caudra_agent::peers::PeerHost;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
+use peers::PeerRegistration;
 
 use crate::sandbox::{
     LiveOperation, NETWORK_RECOVERY, NetworkGate, SandboxAttachment, SandboxConnector,
@@ -165,6 +169,7 @@ pub(crate) struct ShutdownReport {
 }
 
 pub struct EventLoopParams {
+    pub peer_host: Option<Arc<PeerHost>>,
     pub model: Model,
     pub needs_login: bool,
     pub commands: Vec<CustomCommand>,
@@ -396,6 +401,7 @@ fn parse_session_id(id: &str) -> Result<CaudraId, String> {
 }
 
 struct SessionRuntime {
+    peer: Option<PeerRegistration>,
     app: App,
     lease: Arc<SessionLease>,
     handles: AgentHandles,
@@ -822,6 +828,7 @@ fn prepare_session_for_runtime(
 
 /// Everything needed to bring up a new session runtime after startup.
 struct SpawnCtx {
+    peer_host: Option<Arc<PeerHost>>,
     storage: StateDir,
     background_enabled: bool,
     config: AgentConfig,
@@ -1123,6 +1130,7 @@ impl SpawnCtx {
         );
         let (shell_tx, shell_rx) = flume::unbounded::<ShellEvent>();
         Ok(SessionRuntime {
+            peer: None,
             app,
             lease,
             handles,
@@ -1394,6 +1402,7 @@ impl<'t> EventLoop<'t> {
         params: EventLoopParams,
     ) -> Result<Self> {
         let EventLoopParams {
+            peer_host,
             mut model,
             needs_login,
             commands,
@@ -1491,6 +1500,11 @@ impl<'t> EventLoop<'t> {
         let notifier =
             terminal::TerminalNotifier::new(ui_config.notifications, herdr_reporter.is_some());
         let mut ctx = SpawnCtx {
+            peer_host: peer_host.filter(|_| {
+                config.features.enabled(Feature::CrossSessionMessaging)
+                    && workspace_session.is_none()
+                    && sandbox_name.is_none()
+            }),
             storage,
             background_enabled: !exit_on_done,
             config,
@@ -1570,6 +1584,9 @@ impl<'t> EventLoop<'t> {
         }
         for w in startup_warnings {
             app.flash(w);
+        }
+        for runtime in &mut runtimes {
+            runtime.install_peer(&ctx);
         }
 
         Ok(Self {
@@ -2328,7 +2345,9 @@ impl<'t> EventLoop<'t> {
         // autocmds. Anything a handler does comes back as a `UiAction` on the
         // next wake, which repaints then.
         self.emit_focus_change();
+        dirty |= self.sync_peers();
         dirty |= self.start_mailbox_runs();
+        dirty |= self.start_peer_runs();
         for runtime in &self.sessions {
             let ready = runtime.app.status == Status::Idle
                 && !runtime.app.awaiting_input()
@@ -2490,7 +2509,7 @@ impl<'t> EventLoop<'t> {
         let mut background = Vec::new();
         let handle = &self.ctx.lua_event_handle;
         for (i, rt) in self.sessions.iter_mut().enumerate() {
-            let status = SessionStatus::of(&rt.app);
+            let status = rt.display_status();
             if status == rt.last_status {
                 continue;
             }
@@ -2577,7 +2596,7 @@ impl<'t> EventLoop<'t> {
                 id: rt.id(),
                 title: rt.app.state.session.title.clone(),
                 updated_at: rt.app.state.session.updated_at,
-                activity: Some(SessionStatus::of(&rt.app).activity()),
+                activity: Some(rt.display_status().activity()),
                 focused: i == self.focused,
                 checkout: None,
             })
@@ -3004,14 +3023,16 @@ impl<'t> EventLoop<'t> {
     /// removable, so `sessions` stays non-empty.
     fn remove_runtime(&mut self, idx: usize) -> SessionRuntime {
         debug_assert_ne!(idx, self.focused);
-        let rt = self.sessions.remove(idx);
+        let mut rt = self.sessions.remove(idx);
+        rt.close_peer();
         if idx < self.focused {
             self.focused -= 1;
         }
         rt
     }
 
-    fn push_runtime(&mut self, rt: SessionRuntime) -> usize {
+    fn push_runtime(&mut self, mut rt: SessionRuntime) -> usize {
+        rt.install_peer(&self.ctx);
         self.sessions.push(rt);
         self.sessions.len() - 1
     }
@@ -3050,7 +3071,14 @@ impl<'t> EventLoop<'t> {
         if focused.quiescent() && !focused.app.has_content() && self.ctx.workspace_session.is_none()
         {
             let model = focused.app.state.model.clone();
-            let loaded = focused.app.apply_loaded_session(session, &model)?;
+            focused.close_peer();
+            let loaded = match focused.app.apply_loaded_session(session, &model) {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    focused.install_peer(&self.ctx);
+                    return Err(error);
+                }
+            };
             focused.app.state.system_prompt_profile_name = profile_name;
             focused.app.state.system_prompt_profile = profile;
             focused.app.state.system_prompt_profile_override =
@@ -3222,6 +3250,7 @@ impl<'t> EventLoop<'t> {
             }
             self.handle_action(idx, action);
         }
+        let _ = self.sync_peers();
     }
 
     fn request_new_session(&mut self, idx: usize) -> bool {
@@ -3267,8 +3296,10 @@ impl<'t> EventLoop<'t> {
             );
             return true;
         }
+        self.sessions[idx].close_peer();
         let actions = self.sessions[idx].app.reset_session();
         if actions.is_empty() {
+            self.sessions[idx].install_peer(&self.ctx);
             return false;
         }
         self.dispatch(idx, actions);
@@ -3330,6 +3361,10 @@ impl<'t> EventLoop<'t> {
             }
         }
         self.sessions[idx].restore_transitions = transitions;
+        for runtime in &mut self.sessions {
+            runtime.close_peer();
+            runtime.install_peer(&self.ctx);
+        }
         Ok(())
     }
 
@@ -3476,7 +3511,13 @@ impl<'t> EventLoop<'t> {
                 }
             }
         }
+        for runtime in &mut self.sessions {
+            runtime.close_peer();
+        }
         if let Err(error) = std::env::set_current_dir(&cwd) {
+            for runtime in &mut self.sessions {
+                runtime.install_peer(&self.ctx);
+            }
             self.sessions[idx].app.flash(format!("cd: {error}"));
             return false;
         }
@@ -3657,6 +3698,7 @@ impl<'t> EventLoop<'t> {
 
     fn respawn_agent(&mut self, idx: usize, history: Vec<HistoryItem>) {
         let rt = &mut self.sessions[idx];
+        rt.close_peer();
         rt.reset_run_notifications();
         let lua_handle = rt.app.lua_event_handle.clone();
         let permissions = Arc::clone(&rt.app.permissions);
@@ -3670,10 +3712,13 @@ impl<'t> EventLoop<'t> {
             lua_handle,
             Some(Arc::clone(&rt.lease)),
         );
+        rt.install_peer(&self.ctx);
     }
 
     fn handle_action(&mut self, idx: usize, action: Action) {
         match action {
+            Action::ListPeers => self.list_peers(idx),
+            Action::PeerMessages(args) => self.peer_messages(idx, &args),
             Action::SendMessage(input) => {
                 let rt = &mut self.sessions[idx];
                 rt.reset_run_notifications();
@@ -4231,6 +4276,7 @@ impl<'t> EventLoop<'t> {
         // store is still open, and their agents are gone before the loops
         // are asked to quiesce.
         for rt in &mut self.sessions {
+            rt.close_peer();
             rt.app.prepare_shutdown();
             rt.handles.shutdown_workflow();
             let _ = rt.handles.cmd_tx.try_send(AgentCommand::CancelAll);

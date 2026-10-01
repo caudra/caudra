@@ -477,6 +477,7 @@ impl AgentLoop {
         initial_batch: bool,
     ) -> Result<(), AgentError> {
         let automatic = inputs.iter().all(is_automatic_input);
+        let peer_wake = is_peer_wake(&inputs);
         let Some(input) = inputs.last_mut() else {
             return Ok(());
         };
@@ -637,6 +638,7 @@ impl AgentLoop {
                 deferred: self.deferred.clone(),
             },
         )
+        .with_peer_checkpoint()
         .with_loaded_instructions(self.instructions.loaded().clone())
         .with_user_response_rx(Arc::clone(&self.answer_rx))
         .with_interrupt_source(Arc::clone(&self.queue) as Arc<dyn caudra_agent::InterruptSource>)
@@ -645,7 +647,12 @@ impl AgentLoop {
         .with_goal(self.goal.clone())
         .with_mcp(self.mcp.clone());
 
-        let result = if inputs.len() == 1 {
+        let result = if peer_wake {
+            let Some(input) = inputs.pop() else {
+                return Ok(());
+            };
+            agent.run_peer_wake(input).await
+        } else if inputs.len() == 1 {
             let Some(input) = inputs.pop() else {
                 return Ok(());
             };
@@ -962,6 +969,13 @@ fn is_automatic_input(input: &AgentInput) -> bool {
         && !input.resume
 }
 
+fn is_peer_wake(inputs: &[AgentInput]) -> bool {
+    !inputs.is_empty()
+        && inputs
+            .iter()
+            .all(|input| is_automatic_input(input) && input.preamble.is_empty())
+}
+
 fn model_purpose(mode: &AgentMode) -> ModelPurpose {
     match mode {
         AgentMode::Plan(_) | AgentMode::RemotePlan(_) => ModelPurpose::Plan,
@@ -1018,6 +1032,7 @@ fn spawn_oauth_for_needs_auth(handle: &McpHandle) {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::slice::from_ref;
 
     use caudra_agent::McpPromptRef;
     use test_case::test_case;
@@ -1029,23 +1044,27 @@ mod tests {
     const AUTOMATIC_REPORT: &str = "background result";
     const MCP_PROMPT: &str = "test/prompt";
 
-    #[test_case("", false, false, true; "automatic_report")]
-    #[test_case(USER_MESSAGE, false, false, false; "explicit_message")]
-    #[test_case("", true, false, false; "explicit_resume")]
-    #[test_case("", false, true, false; "explicit_mcp_prompt")]
+    #[test_case("", false, false, None, true, true; "peer_wake")]
+    #[test_case("", false, false, Some(Message::observation(AUTOMATIC_REPORT.into())), true, false; "automatic_report")]
+    #[test_case("", false, false, Some(Message::synthetic(AUTOMATIC_REPORT.into())), true, false; "goal_checkin")]
+    #[test_case(USER_MESSAGE, false, false, None, false, false; "explicit_message")]
+    #[test_case("", true, false, None, false, false; "explicit_resume")]
+    #[test_case("", false, true, None, false, false; "explicit_mcp_prompt")]
     fn only_automatic_input_uses_committed_route(
         message: &str,
         resume: bool,
         prompt: bool,
+        preamble: Option<Message>,
         automatic: bool,
+        peer_wake: bool,
     ) {
-        let input = AgentInput {
+        let input = || AgentInput {
             message: message.into(),
             mode: AgentMode::Build,
             images: Vec::new(),
             mentions: Vec::new(),
             commits: Vec::new(),
-            preamble: vec![Message::observation(AUTOMATIC_REPORT.into())],
+            preamble: preamble.clone().into_iter().collect(),
             thinking: Default::default(),
             fast: false,
             prompt: prompt.then(|| {
@@ -1056,7 +1075,17 @@ mod tests {
             }),
             resume,
         };
-        assert_eq!(is_automatic_input(&input), automatic);
+        assert_eq!(is_automatic_input(&input()), automatic);
+        assert_eq!(is_peer_wake(from_ref(&input())), peer_wake);
+        assert_eq!(is_peer_wake(&[input(), input()]), peer_wake);
+        let mut local_input = input();
+        local_input.message = USER_MESSAGE.into();
+        assert!(!is_peer_wake(&[input(), local_input]));
+    }
+
+    #[test]
+    fn empty_input_batch_is_not_a_peer_wake() {
+        assert!(!is_peer_wake(&[]));
     }
 
     #[test_case(AgentMode::Build, ModelPurpose::Chat ; "build_uses_chat")]

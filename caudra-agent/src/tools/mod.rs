@@ -295,10 +295,18 @@ pub fn capability_exclusions(model: &Model) -> &'static [&'static str] {
 /// A tool whose experiment is off leaves every catalog, even one an allowlist
 /// asks for by name: only the global caudra.toml can turn it on.
 pub fn feature_exclusions(features: FeatureFlags) -> &'static [&'static str] {
-    if features.enabled(Feature::Workflows) {
-        &[]
-    } else {
-        &[WORKFLOW_TOOL_NAME]
+    match (
+        features.enabled(Feature::Workflows),
+        features.enabled(Feature::CrossSessionMessaging),
+    ) {
+        (true, true) => &[],
+        (false, true) => &[WORKFLOW_TOOL_NAME],
+        (true, false) => native::peers::TOOL_NAMES,
+        (false, false) => &[
+            WORKFLOW_TOOL_NAME,
+            native::peers::LIST_NAME,
+            native::peers::SEND_NAME,
+        ],
     }
 }
 

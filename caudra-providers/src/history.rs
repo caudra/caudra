@@ -8,8 +8,9 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::types::{
-    ContentBlock, ImageSource, Message, MessageKind, ReasoningSource, ResponsesReasoning, Role,
-    StandingReminderKind, SteeringOrigin, TaskEventOrigin, WorkflowEventOrigin,
+    ContentBlock, ImageSource, Message, MessageKind, PeerMessageOrigin, ReasoningSource,
+    ResponsesReasoning, Role, StandingReminderKind, SteeringOrigin, TaskEventOrigin,
+    WorkflowEventOrigin,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -81,6 +82,8 @@ pub enum HistoryItemKind {
         task_event: Option<TaskEventOrigin>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workflow_event: Option<WorkflowEventOrigin>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer_event: Option<PeerMessageOrigin>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         standing_reminder: Option<StandingReminderKind>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -493,6 +496,7 @@ fn expand_user_message(message: &Message) -> Vec<HistoryItemKind> {
     if origin != UserOrigin::Turn
         || message.display_text.is_some()
         || message.standing_reminder.is_some()
+        || message.peer_event.is_some()
         || !message.retained_output_refs.is_empty()
     {
         kinds.push(user_kind(String::new(), Vec::new(), message, origin));
@@ -632,6 +636,7 @@ fn user_kind(
         steering: message.steering.clone(),
         task_event: message.task_event.clone(),
         workflow_event: message.workflow_event.clone(),
+        peer_event: message.peer_event.clone(),
         standing_reminder: message.standing_reminder.clone(),
         retained_output_refs: message.retained_output_refs.clone(),
     }
@@ -752,6 +757,7 @@ fn assistant_kind(
             steering: None,
             task_event: None,
             workflow_event: None,
+            peer_event: None,
             standing_reminder: None,
             retained_output_refs: Vec::new(),
         },
@@ -911,6 +917,7 @@ fn project_group(items: &[HistoryItem]) -> Message {
                 steering,
                 task_event,
                 workflow_event,
+                peer_event,
                 standing_reminder,
                 retained_output_refs,
             } => {
@@ -923,6 +930,7 @@ fn project_group(items: &[HistoryItem]) -> Message {
                     message.steering = steering.clone();
                     message.task_event = task_event.clone();
                     message.workflow_event = workflow_event.clone();
+                    message.peer_event = peer_event.clone();
                     message.standing_reminder = standing_reminder.clone();
                     if let Some(origin) = task_event {
                         message.retained_subagent_ids.push(origin.task_id.clone());
@@ -1064,8 +1072,9 @@ mod tests {
     use super::*;
     use crate::EMPTY_RESPONSE_MARKER;
     use crate::providers::test_support::{
-        LEGACY_OUTPUT_ID, READABLE_OUTPUT_ID, TASK_ID, task_event_origin,
-        task_observation_with_output_refs, workflow_event_origin,
+        LEGACY_OUTPUT_ID, PEER_ATTACK, PEER_TEXT, READABLE_OUTPUT_ID, TASK_ID, assert_peer_framing,
+        peer_message_origin, task_event_origin, task_observation_with_output_refs,
+        workflow_event_origin,
     };
     use crate::types::{ImageMediaType, SteeringKind};
     use test_case::test_case;
@@ -1098,6 +1107,89 @@ mod tests {
     const OPEN_TODOS_REMINDER_VALUE: &str = "open_todos";
     const REMINDER_IMAGE: &str = "reminder-image";
 
+    #[test_case(PEER_TEXT, true ; "plain_tail")]
+    #[test_case(PEER_ATTACK, true ; "adversarial_tail")]
+    #[test_case("", true ; "empty_tail")]
+    #[test_case(PEER_TEXT, false ; "summarized_peer_event")]
+    fn peer_origin_survives_history_round_trip_and_compaction(text: &str, preserve: bool) {
+        let origin = peer_message_origin();
+        let message = Message::peer_observation(text.into(), origin.clone());
+        let mut items = expand_message(&Message::user(FIRST_TURN.into()), None);
+        let first_id = items.last().unwrap().id;
+        append_message(&mut items, &message);
+        let event_id = items.last().unwrap().id;
+        let restored: Vec<HistoryItem> =
+            serde_json::from_value(serde_json::to_value(&items).unwrap()).unwrap();
+        assert_eq!(restored, items);
+        assert!(restored.last().unwrap().first_user_text().is_none());
+        let messages = project_messages(&restored).unwrap();
+        let projected = messages.last().unwrap();
+        assert_eq!(projected.peer_event, Some(origin.clone()));
+        assert!(projected.is_observation());
+        assert!(projected.first_user_text().is_none());
+        assert_peer_framing(projected.first_text_content().unwrap(), text, &origin);
+        assert_eq!(
+            expand_message(projected, None)[0].kind,
+            items.last().unwrap().kind
+        );
+
+        let mut compacted = expand_message(&summary(SUMMARY_TEXT), None);
+        compacted[0].supersedes = Some(if preserve { first_id } else { event_id });
+        if preserve {
+            append_message(&mut compacted, projected);
+            compacted.last_mut().unwrap().stands_for = Some(event_id);
+        }
+        let head = compacted.last().unwrap().id;
+        merge_history_items(&mut items, &compacted).unwrap();
+        let restored: Vec<HistoryItem> =
+            serde_json::from_value(serde_json::to_value(&items).unwrap()).unwrap();
+        let active = active_history_items(&restored, Some(head)).unwrap();
+        let messages = project_messages(&active).unwrap();
+        if preserve {
+            let tail = messages.last().unwrap();
+            assert_eq!(tail.peer_event, Some(origin.clone()));
+            assert!(tail.is_observation());
+            assert!(tail.first_user_text().is_none());
+            assert_peer_framing(tail.first_text_content().unwrap(), text, &origin);
+        } else {
+            assert!(messages.iter().all(|message| message.peer_event.is_none()));
+        }
+        let transcript = transcript_history_items(&restored, Some(head)).unwrap();
+        let events: Vec<_> = transcript
+            .iter()
+            .filter_map(|item| match &item.kind {
+                HistoryItemKind::User { peer_event, .. } => peer_event.as_ref(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(events, [&origin]);
+    }
+
+    #[test_case(true ; "untyped_observation")]
+    #[test_case(false ; "user_turn")]
+    fn copied_peer_framing_does_not_claim_origin(observation: bool) {
+        let framed = Message::peer_observation(PEER_ATTACK.into(), peer_message_origin())
+            .first_text_content()
+            .unwrap()
+            .to_owned();
+        let message = if observation {
+            Message::observation(framed)
+        } else {
+            Message::user(framed)
+        };
+        let encoded = serde_json::to_value(&message).unwrap();
+        assert!(encoded.get("peer_event").is_none());
+        let decoded: Message = serde_json::from_value(encoded).unwrap();
+        assert!(decoded.peer_event.is_none());
+        let items = expand_message(&decoded, None);
+        let encoded = serde_json::to_value(&items).unwrap();
+        assert!(encoded[0].get("peer_event").is_none());
+        let restored: Vec<HistoryItem> = serde_json::from_value(encoded).unwrap();
+        let projected = project_messages(&restored).unwrap();
+        assert!(projected[0].peer_event.is_none());
+        assert_eq!(projected[0].kind, message.kind);
+    }
+
     #[test_case(StandingReminderKind::BackgroundWork, BACKGROUND_REMINDER_VALUE, false, false ; "plain")]
     #[test_case(StandingReminderKind::BackgroundWork, BACKGROUND_REMINDER_VALUE, true, false ; "multisource")]
     #[test_case(StandingReminderKind::BackgroundWork, BACKGROUND_REMINDER_VALUE, false, true ; "tool_result")]
@@ -1114,6 +1206,7 @@ mod tests {
         if multisource {
             message.task_event = Some(task_event_origin());
             message.workflow_event = Some(workflow_event_origin());
+            message.peer_event = Some(peer_message_origin());
             message.retained_subagent_ids = vec![TASK_ID.into()];
             message.retained_output_refs =
                 task_observation_with_output_refs(STORED_OUTPUT).retained_output_refs;
@@ -1159,6 +1252,7 @@ mod tests {
         assert!(projected.first_user_text().is_none());
         assert_eq!(projected.task_event, message.task_event);
         assert_eq!(projected.workflow_event, message.workflow_event);
+        assert_eq!(projected.peer_event, message.peer_event);
         assert_eq!(
             projected.retained_subagent_ids,
             message.retained_subagent_ids
@@ -1595,6 +1689,7 @@ mod tests {
             steering: None,
             task_event: None,
             workflow_event: None,
+            peer_event: None,
             standing_reminder: None,
             retained_output_refs: Vec::new(),
         }

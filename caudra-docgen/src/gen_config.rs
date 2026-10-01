@@ -8,8 +8,9 @@ use caudra_config::steering::{SteeringRule, SteeringRulesConfig};
 use caudra_config::{
     AgentConfig, ConfigField, ConfigValue, DEFAULT_MAX_LOG_FILES, DEFAULT_MAX_OUTPUT_LINES,
     DEFAULT_MOUSE_SCROLL_LINES, DecisionsConfig, Feature, FeatureFlags, MIN_TOOL_OUTPUT_LINES,
-    NATIVE_PLUGIN_OPTIONS, ProviderConfig, RetentionConfig, SnapshotsConfig, SteeringConfig,
-    StorageConfig, TOP_LEVEL_FIELDS, TelemetryConfig, ToolOutputLines, UiConfig, WorktreesConfig,
+    MessagingConfig, NATIVE_PLUGIN_OPTIONS, ProviderConfig, RetentionConfig, SnapshotsConfig,
+    SteeringConfig, StorageConfig, TOP_LEVEL_FIELDS, TelemetryConfig, ToolOutputLines, UiConfig,
+    WorktreesConfig,
 };
 
 use crate::gen_providers::join_and;
@@ -128,7 +129,10 @@ fn experiment_scope(feature: Feature) -> &'static str {
         }
         Feature::DecisionEngine => {
             "The [decision engine](#decisions), [Auto mode](/docs/permissions/#auto-mode), \
-             `caudra decisions`, and workflow [`decide()` calls](/docs/workflows/#typed-decisions)."
+              `caudra decisions`, and workflow [`decide()` calls](/docs/workflows/#typed-decisions)."
+        }
+        Feature::CrossSessionMessaging => {
+            "Local [cross-session messaging](/docs/sessions/#cross-session-messaging): the `list_sessions` and `send_message` tools, `/peers`, `/messages`, and live session inboxes. Both processes must opt in."
         }
     }
 }
@@ -807,6 +811,7 @@ For every setting in one file, with its type, default, and description, run [`ca
     write_update_check_section(&mut out);
     write_tool_output_section(&mut out);
     write_section(&mut out, "agent", AgentConfig::FIELDS);
+    write_section(&mut out, "agent.messaging", MessagingConfig::FIELDS);
     write_steering_section(&mut out);
     write_section(&mut out, "provider", ProviderConfig::FIELDS);
     write_section(&mut out, "storage", StorageConfig::FIELDS);

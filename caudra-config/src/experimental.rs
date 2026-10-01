@@ -5,12 +5,13 @@ use serde::de::{self, Deserialize, Deserializer, MapAccess, Visitor};
 use thiserror::Error;
 
 /// Indexed by [`Feature`] discriminant, so the enum and its config keys stay one list.
-const FEATURE_KEYS: [&str; 5] = [
+const FEATURE_KEYS: [&str; 6] = [
     "workflows",
     "sandboxes",
     "remote_workcell",
     "lua_plugins",
     "decision_engine",
+    "cross_session_messaging",
 ];
 
 /// A first-party capability that stays off until the user opts in through the
@@ -22,15 +23,17 @@ pub enum Feature {
     RemoteWorkcell,
     LuaPlugins,
     DecisionEngine,
+    CrossSessionMessaging,
 }
 
 impl Feature {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Workflows,
         Self::Sandboxes,
         Self::RemoteWorkcell,
         Self::LuaPlugins,
         Self::DecisionEngine,
+        Self::CrossSessionMessaging,
     ];
 
     pub fn key(self) -> &'static str {
@@ -49,6 +52,7 @@ impl Feature {
             Self::RemoteWorkcell => "direct remote Workcell connections",
             Self::LuaPlugins => "Lua plugins and init.lua",
             Self::DecisionEngine => "the decision engine and Auto mode",
+            Self::CrossSessionMessaging => "cross-session messages",
         }
     }
 
@@ -186,6 +190,7 @@ mod tests {
 
     #[test_case(Feature::Workflows, "experimental.workflows"; "workflows")]
     #[test_case(Feature::DecisionEngine, "experimental.decision_engine"; "decision_engine")]
+    #[test_case(Feature::CrossSessionMessaging, "experimental.cross_session_messaging"; "cross_session_messaging")]
     fn disabled_error_names_the_key(feature: Feature, key: &str) {
         let message = FeatureDisabled(feature).to_string();
         assert!(message.contains(&format!("`{key} = true`")), "{message}");

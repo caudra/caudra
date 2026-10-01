@@ -52,6 +52,7 @@ use crate::decisions::{
 };
 use crate::mcp::{McpRequestSnapshot, McpSession};
 use crate::nudge::Nudge;
+use crate::peers::PeerSession;
 use crate::permissions::PermissionManager;
 use crate::template::Vars;
 use crate::tools::native::skill::{self, SkillInventoryEntry};
@@ -66,7 +67,7 @@ use crate::{
     QueueConsumedItem, SessionMailbox, SubagentHistoryStore, TurnCompleteEvent,
 };
 use caudra_config::decisions::FeatureMode;
-use caudra_config::{ModelPolicy, ToolOutputLines};
+use caudra_config::{Feature, ModelPolicy, ToolOutputLines};
 use caudra_decision::{Answer, Question, QuestionSet, QuestionType};
 use caudra_storage::background::JobOwner;
 use caudra_storage::decision_log::{DecisionEffect, DecisionLabel};
@@ -404,6 +405,9 @@ pub struct Agent<'h> {
     turn_id: u64,
     root_tool_use_id: Option<String>,
     mailbox: Option<SessionMailbox>,
+    peers: Option<PeerSession>,
+    close_peers_on_done: bool,
+    checkpoint_peer_delivery: bool,
     context_publisher: Option<ContextPublisher>,
     timeouts: caudra_providers::Timeouts,
     file_tracker: Arc<FileReadTracker>,
@@ -434,7 +438,37 @@ pub struct Agent<'h> {
 }
 
 impl<'h> Agent<'h> {
-    pub fn new(params: AgentParams, mut run: AgentRunParams<'h>) -> Self {
+    pub fn new(mut params: AgentParams, mut run: AgentRunParams<'h>) -> Self {
+        let peers = if params
+            .config
+            .features
+            .enabled(Feature::CrossSessionMessaging)
+            && params.audience == ToolAudience::MAIN
+            && params.root_tool_use_id.is_none()
+            && params.workspace_session.is_none()
+            && params.host_cwd.is_none()
+        {
+            params
+                .session_id
+                .as_ref()
+                .and_then(|id| PeerSession::lookup(id.id()))
+        } else {
+            None
+        };
+        if peers.is_none() {
+            let names = crate::tools::native::peers::TOOL_NAMES;
+            params.tool_filter = params.tool_filter.excluding(names);
+            if let Some(tools) = run.tools.as_array_mut() {
+                tools.retain(|tool| {
+                    !tool
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| names.contains(&name))
+                });
+            }
+            run.deferred
+                .retain(|tool| !names.contains(&tool.name.as_ref()));
+        }
         let jobs = params
             .jobs
             .clone()
@@ -526,6 +560,9 @@ impl<'h> Agent<'h> {
             turn_id: 0,
             root_tool_use_id: params.root_tool_use_id,
             mailbox: params.mailbox,
+            peers,
+            close_peers_on_done: false,
+            checkpoint_peer_delivery: false,
             context_publisher: params.context_publisher,
             file_tracker: params.file_tracker,
             path_locks: params.path_locks,
@@ -654,10 +691,24 @@ impl<'h> Agent<'h> {
         self
     }
 
+    pub fn with_peer_exit(mut self) -> Self {
+        self.close_peers_on_done = true;
+        self
+    }
+
+    pub fn with_peer_checkpoint(mut self) -> Self {
+        self.checkpoint_peer_delivery = true;
+        self
+    }
+
     /// Cancellation is an ending, not a failure: it comes back as
     /// `Ok(DoneReason::Cancelled)` so callers only report real errors.
     pub async fn run(&mut self, input: AgentInput) -> Result<DoneReason, AgentError> {
-        self.run_inputs(vec![input], false).await
+        self.run_inputs(vec![input], false, false).await
+    }
+
+    pub async fn run_peer_wake(&mut self, input: AgentInput) -> Result<DoneReason, AgentError> {
+        self.run_inputs(vec![input], false, true).await
     }
 
     pub async fn run_batch(
@@ -668,7 +719,7 @@ impl<'h> Agent<'h> {
         let mut inputs = Vec::with_capacity(rest.len() + 1);
         inputs.push(first);
         inputs.extend(rest);
-        self.run_inputs(inputs, true).await
+        self.run_inputs(inputs, true, false).await
     }
 
     pub async fn run_initial_batch(
@@ -679,7 +730,7 @@ impl<'h> Agent<'h> {
         let mut inputs = Vec::with_capacity(rest.len() + 1);
         inputs.push(first);
         inputs.extend(rest);
-        self.run_inputs(inputs, false).await
+        self.run_inputs(inputs, false, false).await
     }
 
     /// One span per turn. Everything the turn awaits inherits `session_id`,
@@ -689,6 +740,7 @@ impl<'h> Agent<'h> {
         &mut self,
         inputs: Vec<AgentInput>,
         queued: bool,
+        peer_wake: bool,
     ) -> Result<DoneReason, AgentError> {
         self.turn_id += 1;
         let span = info_span!(
@@ -697,13 +749,16 @@ impl<'h> Agent<'h> {
             turn_id = self.turn_id,
             model = %self.model.id,
         );
-        self.run_turn(inputs, queued).instrument(span).await
+        self.run_turn(inputs, queued, peer_wake)
+            .instrument(span)
+            .await
     }
 
     async fn run_turn(
         &mut self,
         inputs: Vec<AgentInput>,
         queued: bool,
+        peer_wake: bool,
     ) -> Result<DoneReason, AgentError> {
         self.goal_blocks = 0;
         self.goal_prescreen_skips = 0;
@@ -748,7 +803,9 @@ impl<'h> Agent<'h> {
             if let Some(session) = &self.session_id {
                 caudra_otel::set_session_id(session.as_str());
             }
-            caudra_otel::emit::user_prompt(&message);
+            if !peer_wake {
+                caudra_otel::emit::user_prompt(&message);
+            }
         }
 
         if self.should_generate_title(&message) {
@@ -758,7 +815,7 @@ impl<'h> Agent<'h> {
         // Every frontend enters here, so busy time is measured here; a turn
         // that failed was still busy.
         let busy_since = Instant::now();
-        let mut result = self.run_loop().await;
+        let mut result = self.run_loop(peer_wake).await;
         if let Some(suggestion) = skill_suggestion {
             suggestion.label(self.history).await;
         }
@@ -786,6 +843,7 @@ impl<'h> Agent<'h> {
                     let _ = self.event_tx.send(AgentEvent::Injected {
                         text: CANCEL_MARKER.into(),
                         task_event: None,
+                        peer_event: None,
                     });
                 }
                 self.publish_prepared_context();
@@ -809,12 +867,15 @@ impl<'h> Agent<'h> {
                     let _ = self.event_tx.send(AgentEvent::Injected {
                         text,
                         task_event: None,
+                        peer_event: None,
                     });
                 }
                 self.publish_prepared_context();
                 if let Some(background) = &self.background {
                     background.suppress_wakes();
                 }
+                self.suppress_peer_wakes();
+                self.close_peer_session();
                 return Err(e);
             }
         };
@@ -823,6 +884,12 @@ impl<'h> Agent<'h> {
         {
             background.suppress_wakes();
         }
+        if matches!(reason, DoneReason::MaxTurns | DoneReason::Cancelled)
+            || steering::lock(&self.steering).turn_limit_reached(self.config.max_turns)
+        {
+            self.suppress_peer_wakes();
+        }
+        self.close_peer_session();
         self.emit_done(reason)?;
 
         Ok(reason)
@@ -927,6 +994,22 @@ impl<'h> Agent<'h> {
         ));
         standing.extend(mode_switch_notice(self.history.as_slice(), &latest.mode));
         self.mode = latest.mode.clone();
+        if let Some(peers) = &self.peers {
+            let human_input = inputs.iter().any(|input| {
+                !input.message.trim().is_empty() || !input.images.is_empty() || input.resume
+            });
+            let mut descriptor = peers.descriptor();
+            descriptor.mode = self.mode.clone();
+            descriptor.permission_mode = self.permissions.mode();
+            descriptor.busy = true;
+            if human_input {
+                peers.reset_budget();
+                descriptor.blocked = false;
+            }
+            if let Err(error) = peers.update(descriptor) {
+                warn!(%error, "peer session update failed");
+            }
+        }
         self.opts = RequestOptions {
             thinking: latest.thinking.clone(),
             fast: latest.fast,
@@ -1034,7 +1117,61 @@ impl<'h> Agent<'h> {
         push_injected(self.history, &self.event_tx, message);
     }
 
-    async fn run_loop(&mut self) -> Result<DoneReason, AgentError> {
+    fn inject_peer_messages(&mut self) -> bool {
+        self.claim_peer_messages(false)
+    }
+
+    fn claim_peer_messages(&mut self, finishing: bool) -> bool {
+        if self.cancel.is_cancelled()
+            || steering::lock(&self.steering).turn_limit_reached(self.config.max_turns)
+            || self
+                .interrupt_source
+                .as_ref()
+                .is_some_and(|source| source.has_pending_input())
+        {
+            if finishing {
+                self.close_peer_session();
+            }
+            return false;
+        }
+        let Some(peers) = &self.peers else {
+            return false;
+        };
+        let claim = if finishing && self.close_peers_on_done {
+            peers.claim_or_close()
+        } else {
+            peers.claim()
+        };
+        let Some(claim) = claim else {
+            return false;
+        };
+        for message in claim.messages() {
+            self.push_injected(message.clone());
+        }
+        if self.checkpoint_peer_delivery {
+            claim.stage();
+        } else {
+            claim.commit();
+        }
+        self.publish_prepared_context();
+        true
+    }
+
+    fn suppress_peer_wakes(&self) {
+        if let Some(peers) = &self.peers {
+            peers.suppress_wakes();
+        }
+    }
+
+    fn close_peer_session(&self) {
+        if self.close_peers_on_done
+            && let Some(peers) = &self.peers
+        {
+            peers.close();
+        }
+    }
+
+    async fn run_loop(&mut self, peer_wake: bool) -> Result<DoneReason, AgentError> {
         let mut initial = true;
         loop {
             if self.cancel.is_cancelled() {
@@ -1048,7 +1185,13 @@ impl<'h> Agent<'h> {
                 }
                 return Ok(DoneReason::MaxTurns);
             }
+            if initial && peer_wake && !self.inject_peer_messages() {
+                return Ok(DoneReason::EndTurn);
+            }
             self.inject_owned_results().await?;
+            if !initial || !peer_wake {
+                self.inject_peer_messages();
+            }
             if initial {
                 self.inject_advisory();
                 initial = false;
@@ -1067,6 +1210,9 @@ impl<'h> Agent<'h> {
                         && !self.terminal_report_ready()
                         && self.wait_for_owned_results().await?
                     {
+                        continue;
+                    }
+                    if reason == DoneReason::EndTurn && self.claim_peer_messages(true) {
                         continue;
                     }
                     return Ok(reason);
@@ -2893,6 +3039,7 @@ pub(super) fn push_injected(history: &mut History, event_tx: &EventSender, messa
         let _ = event_tx.send(AgentEvent::Injected {
             text: text.clone(),
             task_event: message.task_event.clone(),
+            peer_event: message.peer_event.clone(),
         });
     }
     history.push(message);
@@ -2906,6 +3053,7 @@ fn last_announced<'a>(history: &'a [Message], markers: &[&str]) -> Option<&'a st
         .filter(|message| {
             message.is_observation()
                 && message.task_event.is_none()
+                && message.peer_event.is_none()
                 && message.workflow_event.is_none()
                 && message.standing_reminder.is_none()
         })
@@ -3155,6 +3303,7 @@ fn add_opaque_blob_tokens(total: &mut u32, blob: &str) {
 #[cfg(test)]
 mod tests {
     include!("owned_jobs_tests.rs");
+    include!("peer_tests.rs");
 
     use std::collections::{HashMap, VecDeque};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3202,6 +3351,31 @@ mod tests {
     const DECISION_SKILL: &str = "test-helper";
     const DECISION_SKILL_TASK: &str = "effect-suggestion-regression";
     const EFFECT_TEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn peer_wake_without_a_claim_does_not_request_the_model() {
+        smol::block_on(async {
+            let provider = MockProvider::new(Vec::new());
+            let requests = Arc::clone(&provider.captured_messages);
+            let mut history = History::default();
+            let (mut agent, events) = make_agent(provider, &mut history);
+            let input = AgentInput {
+                message: String::new(),
+                ..default_input()
+            };
+            assert_eq!(
+                agent.run_peer_wake(input).await.unwrap(),
+                DoneReason::EndTurn
+            );
+            assert!(requests.lock().unwrap().is_empty());
+            assert!(
+                events.try_iter().any(|envelope| matches!(
+                    envelope.event,
+                    AgentEvent::Done { num_turns: 0, .. }
+                ))
+            );
+        });
+    }
 
     struct FeatureEngine {
         probability: f64,
@@ -5855,7 +6029,10 @@ mod tests {
                 })
                 .unwrap();
             let wire = serde_json::to_value(&event).unwrap();
-            let AgentEvent::Injected { text, task_event } = event else {
+            let AgentEvent::Injected {
+                text, task_event, ..
+            } = event
+            else {
                 unreachable!()
             };
             assert_eq!(text, TEXT);
@@ -6280,7 +6457,9 @@ mod tests {
             let injected: Vec<String> = drain_events(&event_rx)
                 .into_iter()
                 .filter_map(|envelope| match envelope.event {
-                    AgentEvent::Injected { text, task_event } => {
+                    AgentEvent::Injected {
+                        text, task_event, ..
+                    } => {
                         assert!(task_event.is_none());
                         Some(text)
                     }

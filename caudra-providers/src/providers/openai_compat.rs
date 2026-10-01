@@ -823,7 +823,8 @@ mod tests {
     use super::*;
     use crate::invalid_tool_input;
     use crate::providers::test_support::{
-        task_event_origin, task_observation_with_output_refs, workflow_event_origin,
+        PEER_ATTACK, PEER_TEXT, assert_peer_framing, peer_message_origin, task_event_origin,
+        task_observation_with_output_refs, workflow_event_origin,
     };
     use crate::{StandingReminderKind, SteeringKind};
     use futures_lite::io::Cursor;
@@ -1013,6 +1014,25 @@ mod tests {
             vec![
                 json!({"role": "system", "content": ""}),
                 json!({"role": "user", "content": STEERING_TEXT})
+            ]
+        );
+    }
+
+    #[test_case(PEER_TEXT ; "plain_text")]
+    #[test_case(PEER_ATTACK ; "adversarial_host_markers")]
+    fn peer_observation_wire_contains_only_framed_text(text: &str) {
+        let origin = peer_message_origin();
+        let wire = convert_messages(
+            &[Message::peer_observation(text.into(), origin.clone())],
+            "",
+        );
+        let framed = wire[1]["content"].as_str().unwrap();
+        assert_peer_framing(framed, text, &origin);
+        assert_eq!(
+            wire,
+            vec![
+                json!({"role": "system", "content": ""}),
+                json!({"role": "user", "content": framed})
             ]
         );
     }

@@ -123,6 +123,7 @@ impl BackgroundReminderContext<'_> {
             let _ = event_tx.send(AgentEvent::Injected {
                 text,
                 task_event: None,
+                peer_event: None,
             });
         }
     }

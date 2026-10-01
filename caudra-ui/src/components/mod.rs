@@ -86,7 +86,7 @@ use caudra_agent::{
     ToolOutput,
 };
 use caudra_providers::model_registry::Binding;
-use caudra_providers::{CaudraId, HistoryItem, ModelPurpose, TaskEventOrigin};
+use caudra_providers::{CaudraId, HistoryItem, ModelPurpose, PeerMessageOrigin, TaskEventOrigin};
 use caudra_storage::sessions::SessionRelocation;
 use caudra_workbench::text_field::FieldStyles;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
@@ -858,6 +858,8 @@ pub enum Action {
         tool_use_id: String,
     },
     RequestNewSession,
+    ListPeers,
+    PeerMessages(String),
     NewSession(Arc<caudra_storage::sessions::SessionLease>),
     LoadSession(Box<LoadedSession>),
     ForkSession(Box<ForkedSession>),
@@ -1156,6 +1158,23 @@ pub struct DisplayMessage {
 }
 
 impl DisplayMessage {
+    pub(crate) fn peer(text: &str, origin: PeerMessageOrigin) -> Self {
+        let safe_body = text
+            .lines()
+            .map(|line| {
+                line.chars()
+                    .flat_map(char::escape_debug)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = format!(
+            "Peer: {:?}\nMessage: {:?}\nSender session: {:?}\nReply target: {:?}\n\n{safe_body}",
+            origin.sender_name, origin.message_id, origin.sender_session_id, origin.reply_target,
+        );
+        Self::new(DisplayRole::PeerMessage(Box::new(origin)), text)
+    }
+
     pub(crate) fn injected(text: String, task_event: Option<TaskEventOrigin>) -> Self {
         let role = task_event.map_or(DisplayRole::Injected, |origin| {
             DisplayRole::TaskDelivery(Box::new(origin))
@@ -1280,6 +1299,7 @@ pub enum DisplayRole {
     /// something a model or a person said.
     Notice,
     TaskDelivery(Box<TaskEventOrigin>),
+    PeerMessage(Box<PeerMessageOrigin>),
     /// A message the harness wrote into the conversation. Unlike a notice it
     /// has a body worth reading, so it collapses to its heading and opens on a
     /// click.
