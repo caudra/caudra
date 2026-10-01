@@ -43,7 +43,7 @@ use workcell_host_contract::{
 };
 
 #[cfg(unix)]
-use crate::binary::DIRECTORY_FLAGS;
+use crate::binary::{DIRECTORY_FLAGS, metadata_flags};
 use crate::{
     FileGrepInput, FileResource, FileResourceAccess, FileToolGroup, FilesystemError,
     SnapshotTreeStamp,
@@ -67,11 +67,6 @@ const LIST_INVENTORY_TTL: Duration = Duration::from_secs(30);
 const LIST_CAPACITY_MESSAGE: &str =
     "Workspace listing inventory capacity is exhausted; retry after expiry";
 const PROJECT_ASSET_HASH_BUFFER_BYTES: usize = 64 * 1_024;
-#[cfg(unix)]
-const WORKSPACE_METADATA_FLAGS: OFlags =
-    OFlags::PATH.union(OFlags::NOFOLLOW).union(OFlags::CLOEXEC);
-#[cfg(unix)]
-const LIST_SEARCH_FLAGS: OFlags = WORKSPACE_METADATA_FLAGS.union(OFlags::DIRECTORY);
 #[cfg(target_os = "linux")]
 const LIST_RESOLVE_FLAGS: ResolveFlags = ResolveFlags::BENEATH
     .union(ResolveFlags::NO_SYMLINKS)
@@ -2149,7 +2144,10 @@ impl FileToolGroup {
         check_cancelled(token)?;
         let anchor = open_listing_root(self.core.root())
             .map_err(|error| FilesystemError::io("Cannot open workspace root", error.into()))?;
-        let cwd = open_listing_child(&anchor, &binding.relative_path, LIST_SEARCH_FLAGS)
+        let cwd = metadata_flags()
+            .and_then(|flags| {
+                open_listing_child(&anchor, &binding.relative_path, flags | OFlags::DIRECTORY)
+            })
             .map_err(|_| WorkspaceError::StaleCwd)?;
         let metadata = cwd.metadata().map_err(|_| WorkspaceError::StaleCwd)?;
         if directory_revision_from_metadata(&binding.path, &metadata)? != binding.revision {
@@ -2309,7 +2307,9 @@ impl FileToolGroup {
         if path.to_str().is_none() {
             return Ok(None);
         }
-        let node = open_listing_child(scope, scope_relative(root, path)?, WORKSPACE_METADATA_FLAGS)
+        let relative = scope_relative(root, path)?;
+        let node = metadata_flags()
+            .and_then(|flags| open_listing_child(scope, relative, flags))
             .map_err(|error| {
                 FilesystemError::io("Cannot open workspace entry metadata", error.into())
             })?;
@@ -2618,7 +2618,8 @@ async fn expire_listing(workspace: Weak<WorkspaceState>, id: Uuid, deadline: Ins
 #[cfg(unix)]
 fn open_listing_root(root: &Path) -> Result<File, Errno> {
     let relative = root.strip_prefix("/").map_err(|_| Errno::INVAL)?;
-    let anchor = File::from(open("/", LIST_SEARCH_FLAGS, Mode::empty())?);
+    let flags = metadata_flags()? | OFlags::DIRECTORY;
+    let anchor = File::from(open("/", flags, Mode::empty())?);
     open_listing_child(
         &anchor,
         if relative.as_os_str().is_empty() {
@@ -2626,7 +2627,7 @@ fn open_listing_root(root: &Path) -> Result<File, Errno> {
         } else {
             relative
         },
-        LIST_SEARCH_FLAGS,
+        flags,
     )
 }
 
@@ -3959,7 +3960,7 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn special_files_are_skipped_without_opening_or_blocking() {
         use rustix::fs::{CWD, FileType, Mode, mknodat};

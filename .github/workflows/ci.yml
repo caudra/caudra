@@ -27,3 +27,16 @@ jobs:
           path: target/code-worker
           key: monty-worker-${{ runner.os }}-${{ steps.worker.outputs.version }}
       - run: make ci
+
+  macos-files:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked -p workcell-mcp-files --all-targets --all-features
+      - run: cargo check --locked -p workcell --no-default-features --features files-index,snapshots
+      - run: cargo test --locked -p workcell-mcp-files --lib staged_files_keep_exact_permission_bits
+      - run: cargo test --locked -p workcell-mcp-files --lib metadata_descriptors_refuse_unsupported_platforms

@@ -600,17 +600,23 @@ pub(super) fn identity(metadata: &Metadata) -> (u64, u64) {
 }
 
 pub(super) fn regular_file(parent: &File, name: &str) -> Result<File, BinaryError> {
-    #[cfg(target_os = "linux")]
-    let descriptor = open_child(
-        parent,
-        name,
-        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-    )
-    .map_err(|_| BinaryError::Inaccessible)?;
-    #[cfg(not(target_os = "linux"))]
-    return Err(BinaryError::Inaccessible);
-    #[cfg(target_os = "linux")]
+    let descriptor = open_metadata(parent, name).map_err(|_| BinaryError::Inaccessible)?;
     reopen_regular(&descriptor)
+}
+
+pub(super) fn metadata_flags() -> Result<OFlags, Errno> {
+    #[cfg(target_os = "linux")]
+    {
+        Ok(OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(Errno::NOSYS)
+    }
+}
+
+pub(super) fn open_metadata(parent: &File, name: &str) -> Result<File, Errno> {
+    open_child(parent, name, metadata_flags()?)
 }
 
 /// Reopens the regular inode an `O_PATH` descriptor names, never its replaceable directory entry.
@@ -815,7 +821,11 @@ mod tests {
     use super::{
         BinaryError, BinaryPublicationContent, PreparedBinaryPublication, digest_revision,
     };
+    #[cfg(not(target_os = "linux"))]
+    use super::{open_metadata, regular_file};
     use crate::{FileToolGroup, FilesystemLimits};
+    #[cfg(not(target_os = "linux"))]
+    use rustix::io::Errno;
     use sha2::{Digest, Sha256};
     use std::{fs, io::Write, os::unix::fs::symlink};
     use tempfile::{TempDir, tempfile};
@@ -872,6 +882,30 @@ mod tests {
         let mut file = tempfile().unwrap();
         file.write_all(bytes).unwrap();
         file
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn metadata_descriptors_refuse_unsupported_platforms() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("file"), PAYLOAD).unwrap();
+        symlink("file", root.path().join("link")).unwrap();
+        let parent = fs::File::open(root.path()).unwrap();
+
+        for name in ["file", "link", "missing"] {
+            assert_eq!(open_metadata(&parent, name).unwrap_err(), Errno::NOSYS);
+            assert!(matches!(
+                regular_file(&parent, name),
+                Err(BinaryError::Inaccessible)
+            ));
+        }
+        assert_eq!(fs::read(root.path().join("file")).unwrap(), PAYLOAD);
+        assert!(
+            fs::symlink_metadata(root.path().join("link"))
+                .unwrap()
+                .is_symlink()
+        );
+        assert!(!root.path().join("missing").exists());
     }
 
     #[tokio::test]

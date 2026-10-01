@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, fs::File, io::Read, sync::Arc};
 
-use rustix::fs::{AtFlags, Dir, OFlags, statat};
+use rustix::fs::{AtFlags, Dir, statat};
 use rustix::io::Errno;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -15,7 +15,7 @@ use crate::{
     BinaryError, FileToolGroup, FilesystemLimits, RootResourceKind,
     binary::{
         DIRECTORY_FLAGS, cancelled, digest_revision, identity, mutation_guard, open_child,
-        open_root, regular_file, reject_repository, stamp,
+        open_metadata, open_root, regular_file, reject_repository, stamp,
     },
     gitignore::{IgnoreBudget, IgnoreScope, IgnoreScratch, compile_scope},
     glob::{GlobMatcher, MatchOutcome, MatchScratch},
@@ -501,11 +501,7 @@ impl Scan {
 }
 
 fn node_metadata(parent: &File, name: &str) -> Result<NodeMetadata, BinaryError> {
-    #[cfg(target_os = "linux")]
-    let flags = OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    #[cfg(not(target_os = "linux"))]
-    let flags = DIRECTORY_FLAGS;
-    let file = match open_child(parent, name, flags) {
+    let file = match open_metadata(parent, name) {
         Ok(file) => file,
         Err(Errno::XDEV) => {
             let revision = digest_revision(Sha256::digest(name))?;

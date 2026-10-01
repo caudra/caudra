@@ -1,12 +1,12 @@
 use std::{
-    fs::{File, Permissions},
+    fs::File,
     mem::size_of,
-    os::unix::fs::{MetadataExt, PermissionsExt},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
-use rustix::fs::{AtFlags, Mode, mkdirat, statat, unlinkat};
+use rustix::fs::{AtFlags, Mode, fchmod, mkdirat, statat, unlinkat};
 #[cfg(target_os = "linux")]
 use rustix::fs::{RenameFlags, renameat_with};
 use rustix::io::Errno;
@@ -388,10 +388,7 @@ impl<'a> StagedDirectory<'a> {
             published: false,
         };
         let initialized = (|| {
-            staged
-                .directory
-                .set_permissions(Permissions::from_mode(DIRECTORY_MODE.as_raw_mode()))
-                .map_err(|_| BinaryError::Inaccessible)?;
+            fchmod(&staged.directory, DIRECTORY_MODE).map_err(|_| BinaryError::Inaccessible)?;
             staged
                 .directory
                 .sync_all()

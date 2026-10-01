@@ -13,7 +13,11 @@
 #[cfg(unix)]
 use std::{
     ffi::{OsStr, OsString},
-    os::unix::ffi::{OsStrExt, OsStringExt},
+    fs::Permissions,
+    os::unix::{
+        ffi::{OsStrExt, OsStringExt},
+        fs::PermissionsExt,
+    },
     sync::Arc,
 };
 use std::{
@@ -24,8 +28,8 @@ use std::{
 #[cfg(unix)]
 use rustix::{
     fs::{
-        AtFlags, Dir, Mode, OFlags, fchmod, linkat, mkdirat, openat, readlinkat, renameat,
-        symlinkat, unlinkat,
+        AtFlags, Dir, Mode, OFlags, linkat, mkdirat, openat, readlinkat, renameat, symlinkat,
+        unlinkat,
     },
     io::Errno,
 };
@@ -40,8 +44,8 @@ use crate::{WorkspaceSnapshotAccess, WorkspaceSnapshotScope};
 #[cfg(unix)]
 use crate::{
     binary::{
-        DIRECTORY_FLAGS, PublicationTemporary, open_child, open_root, reject_repository,
-        reopen_regular,
+        DIRECTORY_FLAGS, PublicationTemporary, open_child, open_metadata, open_root,
+        reject_repository, reopen_regular,
     },
     gitignore::{IgnoreBudget, IgnoreScope, IgnoreScratch, admit_scope},
     operations::FilesystemCore,
@@ -49,17 +53,15 @@ use crate::{
 };
 
 #[cfg(unix)]
-const NODE_FLAGS: OFlags = OFlags::PATH.union(OFlags::NOFOLLOW).union(OFlags::CLOEXEC);
-#[cfg(unix)]
 const STAGED_FLAGS: OFlags = OFlags::WRONLY
     .union(OFlags::CREATE)
     .union(OFlags::EXCL)
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
 #[cfg(unix)]
-const STAGED_MODE: u32 = 0o600;
+const STAGED_MODE: Mode = Mode::RUSR.union(Mode::WUSR);
 #[cfg(unix)]
-const DIRECTORY_MODE: u32 = 0o777;
+const DIRECTORY_MODE: Mode = Mode::RWXU.union(Mode::RWXG).union(Mode::RWXO);
 #[cfg(unix)]
 const PERMISSION_BITS: u32 = 0o777;
 #[cfg(unix)]
@@ -346,7 +348,7 @@ impl WorkspaceSnapshotAccess {
     #[cfg(unix)]
     pub fn create_tree_directory(&self, path: &WorkspacePath) -> Result<(), SnapshotTreeError> {
         let (parent, name) = tree_parent(&self.core, path)?.ok_or(SnapshotTreeError::Blocked)?;
-        match mkdirat(&parent, name, Mode::from_raw_mode(DIRECTORY_MODE)) {
+        match mkdirat(&parent, name, DIRECTORY_MODE) {
             Ok(()) => parent.sync_all().map_err(SnapshotTreeError::Unsettled),
             Err(Errno::EXIST) => open_child(&parent, name, DIRECTORY_FLAGS)
                 .map(drop)
@@ -536,7 +538,7 @@ impl WalkState {
         if WorkspacePath::new(relative.as_str()).is_err() {
             return Ok(Some(skipped(relative, SnapshotSkipReason::Unrepresentable)));
         }
-        let node = match open_child(&frame.directory, text, NODE_FLAGS) {
+        let node = match open_metadata(&frame.directory, text) {
             Ok(node) => node,
             Err(Errno::NOENT) => return Ok(None),
             Err(errno) => {
@@ -652,7 +654,7 @@ impl WalkState {
         prefix: &str,
         parent: Option<Arc<IgnoreScope>>,
     ) -> Result<Option<Arc<IgnoreScope>>, SnapshotTreeError> {
-        let Ok(node) = open_child(directory, GITIGNORE, NODE_FLAGS) else {
+        let Ok(node) = open_metadata(directory, GITIGNORE) else {
             return Ok(parent);
         };
         let Ok(file) = reopen_regular(&node) else {
@@ -754,7 +756,7 @@ fn tree_parent<'p>(
 
 #[cfg(unix)]
 fn observe_child(parent: &File, name: &str) -> Result<SnapshotTreeObserved, SnapshotTreeError> {
-    let node = match open_child(parent, name, NODE_FLAGS) {
+    let node = match open_metadata(parent, name) {
         Ok(node) => node,
         Err(Errno::NOENT) => return Ok(SnapshotTreeObserved::Absent),
         Err(Errno::XDEV) => return Ok(SnapshotTreeObserved::Other),
@@ -790,7 +792,7 @@ fn verify_expected(
     name: &str,
     expected: &SnapshotTreeExpected,
 ) -> Result<(), SnapshotTreeError> {
-    let current = match open_child(parent, name, NODE_FLAGS) {
+    let current = match open_metadata(parent, name) {
         Ok(node) => Some(SnapshotTreeStamp::of(&node.metadata()?)),
         Err(Errno::NOENT) => None,
         Err(_) => return Err(SnapshotTreeError::Changed),
@@ -813,12 +815,10 @@ fn stage_file(
     source: &mut dyn Read,
     mode: u32,
 ) -> Result<(), SnapshotTreeError> {
-    let mut file = File::from(
-        openat(parent, name, STAGED_FLAGS, Mode::from_raw_mode(STAGED_MODE))
-            .map_err(io::Error::from)?,
-    );
+    let mut file =
+        File::from(openat(parent, name, STAGED_FLAGS, STAGED_MODE).map_err(io::Error::from)?);
     io::copy(source, &mut file)?;
-    fchmod(&file, Mode::from_raw_mode(mode & PERMISSION_BITS)).map_err(io::Error::from)?;
+    file.set_permissions(Permissions::from_mode(mode & PERMISSION_BITS))?;
     file.sync_all()?;
     Ok(())
 }
@@ -861,7 +861,7 @@ mod tests {
     use std::{
         fs,
         io::{self, Read},
-        os::unix::fs::symlink,
+        os::unix::fs::{PermissionsExt, symlink},
         path::Path,
     };
 
@@ -871,7 +871,7 @@ mod tests {
 
     use super::{
         SnapshotTreeContent, SnapshotTreeError, SnapshotTreeExpected, SnapshotTreeLimit,
-        SnapshotTreeLimits, SnapshotTreeObserved, SnapshotTreeStamp,
+        SnapshotTreeLimits, SnapshotTreeObserved, SnapshotTreeStamp, stage_file,
     };
     use crate::{FileToolGroup, WorkspaceSnapshotAccess};
 
@@ -881,6 +881,16 @@ mod tests {
         max_path_bytes: usize::MAX,
     };
     const FILE_MODE: u32 = 0o644;
+    const STAGED_MODE_CASES: &[(u32, u32)] = &[
+        (0, 0),
+        (0o600, 0o600),
+        (0o644, 0o644),
+        (0o755, 0o755),
+        (0o6754, 0o754),
+        (u32::MAX, 0o777),
+    ];
+    const PERMISSION_MASK: u32 = 0o7777;
+    const STAGED_CONTENT: &[u8] = b"restored";
 
     struct FailingSource;
 
@@ -929,6 +939,20 @@ mod tests {
 
     fn entries(directory: &Path) -> usize {
         fs::read_dir(directory).unwrap().count()
+    }
+
+    #[test]
+    fn staged_files_keep_exact_permission_bits() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = fs::File::open(root.path()).unwrap();
+        for &(mode, expected) in STAGED_MODE_CASES {
+            let name = format!("mode-{mode:o}");
+            let mut source = STAGED_CONTENT;
+            stage_file(&parent, &name, &mut source, mode).unwrap();
+            let metadata = fs::metadata(root.path().join(name)).unwrap();
+            assert_eq!(metadata.permissions().mode() & PERMISSION_MASK, expected);
+            assert_eq!(metadata.len(), STAGED_CONTENT.len() as u64);
+        }
     }
 
     #[tokio::test]
