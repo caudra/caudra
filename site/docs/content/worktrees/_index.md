@@ -32,13 +32,17 @@ A worktree may have notes and plans of its own from an older Caudra release. The
 | `Ctrl+D` | Remove the selected worktree |
 | `Ctrl+R` | Refresh the list |
 
-`/worktree new` opens the create form directly, and `/worktree new <branch>` fills in the branch. `/worktree remove` opens the removal of the checkout the session works in. The main checkout cannot be removed.
+`/worktree new` starts creating a worktree as `Ctrl+N` does, and `/worktree new <branch>` names the branch up front. `/worktree remove` opens the removal of the checkout the session works in. The main checkout cannot be removed.
 
 Opening a checkout outside Herdr moves every open tab into it, as [`/cd`](/docs/commands/) does. Inside Herdr, Caudra asks Herdr to open the checkout in its workspace. Herdr focuses the workspace when it is already open.
 
 ## Creating a worktree
 
-The create form has these fields:
+Caudra first asks for the branch name. Leave it empty to have one generated. `/worktree new <branch>` skips this question.
+
+Press `Enter` to open the form with **Create worktree** selected. A second `Enter` creates it. To change a field, select it and press `Enter`. Finishing an edit returns to **Create worktree**.
+
+The form has these fields:
 
 | Field | Meaning |
 |-------|---------|
@@ -53,6 +57,8 @@ Uncommitted changes carry over through `git stash`. The stash is taken in the cu
 Outside Herdr, git creates the worktree under `worktrees.directory` as `<directory>/<repository>/<branch>`, with the branch turned into one path component. A branch named for you starts with `caudra/`. The process then follows the session into the worktree and reloads the project config there. See [`[worktrees]`](/docs/configuration/#worktrees) for the settings.
 
 Inside Herdr, Herdr creates the worktree and a workspace grouped with the repository's own. Herdr names the branch when you leave it empty. The session continues in the root pane of the new workspace, and its tab closes in the current pane. A fresh session opens there when that tab was the last one.
+
+The new pane runs the same Caudra executable. If an upgrade replaced it while Caudra was running, the pane runs the replacement at that path. If neither file remains, the pane runs `caudra` from `PATH`.
 
 ## Removing a worktree
 

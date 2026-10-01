@@ -28,6 +28,8 @@ const WORKTREE_TIMEOUT: Duration = Duration::from_secs(600);
 /// Opening a workspace or a pane, or typing into one.
 const LAYOUT_TIMEOUT: Duration = Duration::from_secs(15);
 const SPLIT_DIRECTION: &str = "right";
+/// Linux appends this when a running executable has been replaced or removed.
+const REPLACED_EXE_SUFFIX: &str = " (deleted)";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentState {
@@ -314,13 +316,24 @@ impl HerdrCli {
     }
 }
 
-/// What to type into a shell to resume `session` with this very Caudra, so a
-/// pane never runs another installed version.
+/// Resumes `session` with this executable, its replacement at the same path,
+/// or the installed `caudra` when neither file remains.
 pub fn resume_command_line(session: &str) -> String {
-    let program = env::current_exe()
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| RESUME_COMMAND.to_owned());
+    let program = resume_program(env::current_exe().ok());
     shell_words::join([program.as_str(), SESSION_FLAG, session])
+}
+
+fn resume_program(exe: Option<PathBuf>) -> String {
+    exe.and_then(|path| {
+        if path.is_file() {
+            return Some(path.to_string_lossy().into_owned());
+        }
+        let replacement = path.to_str()?.strip_suffix(REPLACED_EXE_SUFFIX)?;
+        Path::new(replacement)
+            .is_file()
+            .then(|| replacement.to_owned())
+    })
+    .unwrap_or_else(|| RESUME_COMMAND.to_owned())
 }
 
 fn missing_field(field: &'static str) -> HerdrError {
@@ -489,6 +502,7 @@ mod tests {
     const WORKSPACE: &str = "w2";
     const ROOT_PANE: &str = "w2:p2";
     const SPLIT_PANE: &str = "w2:p3";
+    const RESUME_BINARY: &str = "caudra build";
 
     fn strings(args: Vec<OsString>) -> Vec<String> {
         args.into_iter()
@@ -691,6 +705,52 @@ mod tests {
                 SESSION
             ]
         );
+    }
+
+    #[test_case(false, true ; "current_executable")]
+    #[test_case(true, true ; "replaced_executable")]
+    #[test_case(false, false ; "missing_executable")]
+    #[test_case(true, false ; "deleted_without_replacement")]
+    fn a_resume_uses_a_remaining_executable_or_path(replaced: bool, installed: bool) {
+        let temp = TempDir::new().unwrap();
+        let installed_path = temp.path().join(RESUME_BINARY);
+        if installed {
+            fs::write(&installed_path, []).unwrap();
+        }
+        let mut running_path = installed_path.as_os_str().to_owned();
+        if replaced {
+            running_path.push(REPLACED_EXE_SUFFIX);
+        }
+
+        let program = resume_program(Some(running_path.into()));
+
+        let expected = if installed {
+            installed_path.to_string_lossy().into_owned()
+        } else {
+            RESUME_COMMAND.to_owned()
+        };
+        assert_eq!(program, expected);
+    }
+
+    #[test_case(false ; "only_literal_name_exists")]
+    #[test_case(true ; "both_names_exist")]
+    fn an_existing_executable_keeps_a_literal_deleted_suffix(unsuffixed_exists: bool) {
+        let temp = TempDir::new().unwrap();
+        let path = temp
+            .path()
+            .join(format!("{RESUME_BINARY}{REPLACED_EXE_SUFFIX}"));
+        fs::write(&path, []).unwrap();
+        if unsuffixed_exists {
+            fs::write(temp.path().join(RESUME_BINARY), []).unwrap();
+        }
+
+        assert_eq!(resume_program(Some(path.clone())), path.to_string_lossy());
+    }
+
+    #[test_case(None ; "current_exe_unavailable")]
+    #[test_case(Some(PathBuf::new()) ; "empty_path")]
+    fn an_unavailable_executable_uses_path(exe: Option<PathBuf>) {
+        assert_eq!(resume_program(exe), RESUME_COMMAND);
     }
 
     #[cfg(unix)]

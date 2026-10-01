@@ -186,12 +186,17 @@ impl WorktreePicker {
         let Some(flow) = &mut self.flow else {
             return;
         };
+        let named = branch.is_some();
         flow.stage = Stage::Create(Draft {
             branch: branch.unwrap_or_default(),
             base: HEAD.into(),
             carry: false,
         });
-        self.render_create(None);
+        if named {
+            self.render_create(None);
+        } else {
+            self.edit(Field::Branch);
+        }
     }
 
     pub fn show_removal(&mut self, root: PathBuf, dirty: bool) {
@@ -490,10 +495,7 @@ impl WorktreePicker {
             Field::Base => draft.base = value,
         }
         flow.stage = Stage::Create(draft);
-        self.render_create(Some(match field {
-            Field::Branch => |kind| matches!(kind, EntryKind::Field(Field::Branch)),
-            Field::Base => |kind| matches!(kind, EntryKind::Field(Field::Base)),
-        }));
+        self.render_create(None);
     }
 
     fn toggle_carry(&mut self) {
@@ -678,8 +680,8 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        ALREADY_HERE, HEAD, MAIN_NOT_REMOVABLE, USAGE, WorktreeAction, WorktreeOverview,
-        WorktreePicker, WorktreeView,
+        ALREADY_HERE, EntryKind, Field, HEAD, MAIN_NOT_REMOVABLE, Stage, USAGE, WorktreeAction,
+        WorktreeOverview, WorktreePicker, WorktreeView,
     };
     use crate::components::keybindings::key;
 
@@ -688,6 +690,9 @@ mod tests {
     const CWD: &str = "/work/app/src";
     const BRANCH: &str = "feature/login";
     const BASE: &str = "v1.2";
+    const EMPTY_BRANCH: &str = "";
+    const WHITESPACE_BRANCH: &str = "   ";
+    const EXPECTED_CREATE: &str = "expected a create request";
 
     fn checkout(root: &str, branch: &str, linked: bool) -> CheckoutSessions {
         CheckoutSessions {
@@ -780,28 +785,117 @@ mod tests {
         assert_eq!(picker.picker.error_text(), Some(ALREADY_HERE));
     }
 
+    #[test_case(WorktreeView::List, BRANCH, Some(BRANCH) ; "shortcut_typed")]
+    #[test_case(WorktreeView::List, EMPTY_BRANCH, None ; "shortcut_empty")]
+    #[test_case(WorktreeView::List, WHITESPACE_BRANCH, None ; "shortcut_whitespace")]
+    #[test_case(WorktreeView::Create(None), BRANCH, Some(BRANCH) ; "command_typed")]
+    #[test_case(WorktreeView::Create(None), EMPTY_BRANCH, None ; "command_empty")]
+    #[test_case(WorktreeView::Create(None), WHITESPACE_BRANCH, None ; "command_whitespace")]
+    fn unnamed_creation_asks_for_a_branch_before_confirming(
+        view: WorktreeView,
+        typed: &str,
+        branch: Option<&str>,
+    ) {
+        let overview = overview(false);
+        let mut picker = WorktreePicker::new();
+        picker.open(overview.clone(), view.clone());
+        if view == WorktreeView::List {
+            assert!(matches!(
+                picker.handle_key(key::NEW_SESSION.to_key_event()),
+                WorktreeAction::Consumed
+            ));
+        }
+
+        assert!(matches!(
+            picker.flow.as_ref().map(|flow| &flow.stage),
+            Some(Stage::Edit(_, Field::Branch, _))
+        ));
+        type_text(&mut picker, typed);
+        assert!(matches!(
+            picker.handle_key(press(KeyCode::Enter)),
+            WorktreeAction::Consumed
+        ));
+        assert!(picker.is_open());
+        assert!(matches!(
+            picker.flow.as_ref().map(|flow| &flow.stage),
+            Some(Stage::Create(_))
+        ));
+        assert!(matches!(
+            picker.picker.selected_item().map(|entry| &entry.kind),
+            Some(EntryKind::Create)
+        ));
+
+        let action = picker.handle_key(press(KeyCode::Enter));
+
+        let WorktreeAction::Run(Request::Create(request)) = action else {
+            panic!("{EXPECTED_CREATE}, got {action:?}");
+        };
+        assert_eq!(
+            request,
+            CreateRequest {
+                session: overview.session,
+                cwd: CWD.into(),
+                source: MAIN.into(),
+                main_root: MAIN.into(),
+                branch: branch.map(str::to_owned),
+                base: HEAD.into(),
+                carry: false,
+            }
+        );
+        assert!(!picker.is_open());
+    }
+
+    #[test]
+    fn a_supplied_branch_skips_the_question() {
+        let mut picker = WorktreePicker::new();
+        picker.open(overview(false), WorktreeView::Create(Some(BRANCH.into())));
+
+        assert!(matches!(
+            picker.flow.as_ref().map(|flow| &flow.stage),
+            Some(Stage::Create(_))
+        ));
+        let action = picker.handle_key(press(KeyCode::Enter));
+
+        let WorktreeAction::Run(Request::Create(request)) = action else {
+            panic!("{EXPECTED_CREATE}, got {action:?}");
+        };
+        assert_eq!(request.branch.as_deref(), Some(BRANCH));
+        assert!(!picker.is_open());
+    }
+
+    #[test_case(key::ESC.to_key_event() ; "escape")]
+    #[test_case(key::QUIT.to_key_event() ; "quit")]
+    fn cancelling_the_branch_question_closes_without_creating(cancel: KeyEvent) {
+        let mut picker = WorktreePicker::new();
+        picker.open(overview(false), WorktreeView::Create(None));
+        type_text(&mut picker, BRANCH);
+
+        assert!(matches!(picker.handle_key(cancel), WorktreeAction::Closed));
+        assert!(!picker.is_open());
+        assert!(matches!(
+            picker.handle_key(press(KeyCode::Enter)),
+            WorktreeAction::Consumed
+        ));
+    }
+
     #[test]
     fn a_new_worktree_is_named_and_based_as_typed() {
         let (mut picker, overview) = opened(false);
         picker.handle_key(key::NEW_SESSION.to_key_event());
 
-        picker.handle_key(press(KeyCode::Up));
-        picker.handle_key(press(KeyCode::Up));
-        picker.handle_key(press(KeyCode::Enter));
         type_text(&mut picker, BRANCH);
         picker.handle_key(press(KeyCode::Enter));
-        picker.handle_key(press(KeyCode::Down));
+        picker.handle_key(press(KeyCode::Up));
         picker.handle_key(press(KeyCode::Enter));
         for _ in HEAD.chars() {
             picker.handle_key(press(KeyCode::Backspace));
         }
         type_text(&mut picker, BASE);
         picker.handle_key(press(KeyCode::Enter));
-        picker.handle_key(press(KeyCode::Down));
         let action = picker.handle_key(press(KeyCode::Enter));
 
         let WorktreeAction::Run(Request::Create(request)) = action else {
-            panic!("expected a create request, got {action:?}");
+            panic!("{EXPECTED_CREATE}, got {action:?}");
         };
         assert_eq!(
             request,
@@ -822,16 +916,21 @@ mod tests {
     fn uncommitted_changes_carry_only_when_there_are_some(dirty: bool, carried: bool) {
         let (mut picker, _) = opened(dirty);
         picker.show_create(None);
+        picker.handle_key(press(KeyCode::Enter));
         if dirty {
             picker.handle_key(press(KeyCode::Up));
             picker.handle_key(key::RELOCATION_USAGE.to_key_event());
+            assert!(matches!(
+                picker.picker.selected_item().map(|entry| &entry.kind),
+                Some(EntryKind::Carry)
+            ));
             picker.handle_key(press(KeyCode::Down));
         }
 
         let action = picker.handle_key(press(KeyCode::Enter));
 
         let WorktreeAction::Run(Request::Create(request)) = action else {
-            panic!("expected a create request, got {action:?}");
+            panic!("{EXPECTED_CREATE}, got {action:?}");
         };
         assert_eq!(request.carry, carried);
         assert_eq!(request.branch, None);
