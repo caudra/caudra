@@ -119,7 +119,7 @@ jobs:
       - run: just build
 
   macos:
-    name: Check + Build (macOS)
+    name: Check + Test + Build (macOS)
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: macos-14
@@ -131,6 +131,9 @@ jobs:
           tool: just
       - run: just code-worker
       - run: just check
+      - run: cargo test --locked -p caudra-agent directory_ancestry_respects_sticky_permissions
+        env:
+          WORKCELL_BUNDLED_MONTY_WORKER: ${{ github.workspace }}/target/code-worker/bin/monty
       - run: just build
 
   windows:

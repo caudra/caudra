@@ -26,6 +26,7 @@ use super::{
 const DIRECTORY_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
 const PERMISSION_MASK: u32 = 0o7777;
+const STICKY_BIT: u32 = 0o1000;
 const MAX_SOCKET_PATH: usize = 103;
 const MAX_MANIFEST_BYTES: u64 = 1024;
 const MAX_HOSTS: usize = 32;
@@ -108,7 +109,7 @@ fn checked_directory(path: &Path) -> Result<File, String> {
                 current = unsafe { File::from_raw_fd(fd) };
                 let metadata = current.metadata().map_err(|error| error.to_string())?;
                 let writable = metadata.mode() & 0o022 != 0;
-                let root_sticky = metadata.uid() == 0 && metadata.mode() & libc::S_ISVTX != 0;
+                let root_sticky = metadata.uid() == 0 && metadata.mode() & STICKY_BIT != 0;
                 if (metadata.uid() != 0 && metadata.uid() != uid()) || (writable && !root_sticky) {
                     return Err(UNSAFE_ENTRY.into());
                 }
@@ -628,7 +629,8 @@ mod tests {
 
     use super::{
         DIRECTORY_MODE, Endpoint, FILE_MODE, MAX_DIRECTORY_ENTRIES, MAX_FRAME_BYTES, PARTIAL,
-        Request, Response, UNSAFE_ENTRY, check_peer_uid, discover, read_frame, write_frame,
+        PERMISSION_MASK, Request, Response, UNSAFE_ENTRY, check_peer_uid, discover,
+        make_private_directory, read_frame, uid, write_frame,
     };
     use crate::AgentMode;
     use crate::peers::{
@@ -659,6 +661,33 @@ mod tests {
             drop(first);
             assert!(read_frame::<Request>(&mut second).await.is_err());
         });
+    }
+
+    #[test_case(DIRECTORY_MODE, true; "private")]
+    #[test_case(0o1700, true; "private_sticky")]
+    #[test_case(0o777, false; "shared_without_sticky")]
+    #[test_case(0o2777, false; "shared_setgid_is_not_sticky")]
+    #[test_case(0o1777, uid() == 0; "shared_sticky_requires_root")]
+    fn directory_ancestry_respects_sticky_permissions(mode: u32, allowed: bool) {
+        let parent = directory();
+        fs::set_permissions(parent.path(), Permissions::from_mode(mode)).unwrap();
+        let child = parent.path().join("private");
+
+        let result = make_private_directory(&child);
+        if allowed {
+            assert_eq!(result.unwrap(), child);
+            assert_eq!(
+                fs::metadata(&child).unwrap().permissions().mode() & PERMISSION_MASK,
+                DIRECTORY_MODE
+            );
+        } else {
+            assert_eq!(result.unwrap_err(), UNSAFE_ENTRY);
+            assert!(!child.exists());
+        }
+        assert_eq!(
+            fs::metadata(parent.path()).unwrap().permissions().mode() & PERMISSION_MASK,
+            mode
+        );
     }
 
     #[test]
