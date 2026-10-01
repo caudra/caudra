@@ -45,6 +45,7 @@ pub struct CommitSummary {
     pub id: String,
     pub subject: String,
     pub author: String,
+    pub committed_unix_seconds: i64,
 }
 
 impl CommitSummary {
@@ -96,6 +97,7 @@ pub fn log(root: &Path, limit: usize) -> Result<Vec<CommitSummary>, CommitError>
             id: info.id.to_string(),
             subject: subject_of(&commit)?,
             author: signature.name.to_str_lossy().trim().to_owned(),
+            committed_unix_seconds: commit.time().map(|time| time.seconds).unwrap_or_default(),
         });
     }
     Ok(log)
@@ -219,10 +221,14 @@ pub fn abbreviate(id: &str) -> String {
 mod tests {
     use super::*;
     use gix::ObjectId;
+    use gix::actor::SignatureRef;
     use gix::bstr::BString;
 
     const AUTHOR: &str = "Ada Lovelace";
     const EMAIL: &str = "ada@example.com";
+    const AUTHOR_TIME: &str = "1700000000 +0000";
+    const COMMITTER_TIME: &str = "1700003600 +0530";
+    const COMMITTED_UNIX_SECONDS: i64 = 1_700_003_600;
     const SUBJECT: &str = "Fix login crash on empty session";
     const BODY: &str = "Sessions restored from disk could carry an empty\ntoken list.";
     const EXPECT_FILES: &str = "the commit lists the paths it touched";
@@ -270,12 +276,16 @@ mod tests {
         tree: ObjectId,
         parents: Vec<ObjectId>,
     ) -> ObjectId {
-        let who = gix::actor::SignatureRef {
+        let author = SignatureRef {
             name: AUTHOR.into(),
             email: EMAIL.into(),
-            time: "1700000000 +0000",
+            time: AUTHOR_TIME,
         };
-        repo.commit_as(who, who, "HEAD", message, tree, parents)
+        let committer = SignatureRef {
+            time: COMMITTER_TIME,
+            ..author
+        };
+        repo.commit_as(committer, author, "HEAD", message, tree, parents)
             .expect("a commit")
             .detach()
     }
@@ -323,6 +333,7 @@ mod tests {
         );
         assert_eq!(log[0].subject, SUBJECT);
         assert_eq!(log[0].author, AUTHOR);
+        assert_eq!(log[0].committed_unix_seconds, COMMITTED_UNIX_SECONDS);
     }
 
     #[test]
@@ -332,6 +343,7 @@ mod tests {
         let detail = show(&fixture.root, &short(tip)).expect("a commit");
         assert_eq!(detail.subject, SUBJECT);
         assert_eq!(detail.body, BODY);
+        assert_eq!(detail.committed_unix_seconds, COMMITTED_UNIX_SECONDS);
     }
 
     #[test]

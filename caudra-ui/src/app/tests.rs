@@ -32,6 +32,7 @@ use crate::selection::{SelectableZone, SelectionState, SelectionZone};
 use crate::test_pattern_discovery_report;
 use arc_swap::ArcSwap;
 use caudra_agent::command::CustomCommand;
+use caudra_agent::commits::repo::CommitSummary;
 use caudra_agent::context::{
     ContextInventory, ContextModel, ContextReadiness, ContextReserve, ContextUsage, ContextWindow,
 };
@@ -173,8 +174,12 @@ const MENTION_UNRESOLVED: &str = "a completed path must resolve to a mention";
 const MENTION_DROPPED_A_PASTE: &str =
     "completing a mention must splice a range, not replace the buffer";
 const COMMIT_ID: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
+const COMMIT_SHORT_ID: &str = "a1b2c3d";
 const COMMIT_SUBJECT: &str = "Fix login crash";
 const COMMIT_AUTHOR: &str = "Ada Lovelace";
+const COMMIT_UNIX_SECONDS: i64 = 1_700_003_600;
+const COMMIT_COMPLETION_PREFIX: &str = "landed in ";
+const COMMIT_COMPLETION_SUFFIX: &str = " yesterday";
 const COMMIT_POPUP_CLOSED: &str = "typing # over a loaded log must open the popup";
 const COMMIT_POPUP_LINGERED: &str = "choosing a commit must close the popup";
 const COMMIT_UNRESOLVED: &str = "a completed hash must resolve to a commit";
@@ -19436,10 +19441,11 @@ fn clicking_the_composer_closes_the_mention_popup() {
 /// A one-commit log window. No repository is created: the index is the whole
 /// source of truth, which is the property the `#` scanner rests on.
 fn commit_index() -> CommitIndex {
-    CommitIndex::loaded(vec![caudra_agent::commits::repo::CommitSummary {
+    CommitIndex::loaded(vec![CommitSummary {
         id: COMMIT_ID.to_owned(),
         subject: COMMIT_SUBJECT.to_owned(),
         author: COMMIT_AUTHOR.to_owned(),
+        committed_unix_seconds: COMMIT_UNIX_SECONDS,
     }])
 }
 
@@ -19456,20 +19462,38 @@ fn commit_popup_at(app: &mut App, query: &str) {
     app.commit_popup.settle();
 }
 
-#[test]
-fn typing_a_hash_sigil_opens_the_commit_popup_and_completing_splices_in_place() {
+#[test_case("#a1b2", KeyCode::Enter; "hash_enter")]
+#[test_case("#a1b2", KeyCode::Tab; "hash_tab")]
+#[test_case("#login", KeyCode::Enter; "title_enter")]
+#[test_case("#login", KeyCode::Tab; "title_tab")]
+fn typing_a_hash_sigil_opens_the_commit_popup_and_completing_splices_in_place(
+    query: &str,
+    completion: KeyCode,
+) {
     let mut app = test_app();
+    app.update(Msg::Paste(COMMIT_COMPLETION_SUFFIX.to_owned()));
+    app.update(Msg::Key(KeyEvent::new(
+        KeyCode::Home,
+        KeyModifiers::CONTROL,
+    )));
 
-    commit_popup_at(&mut app, "landed in #a1b2");
+    commit_popup_at(&mut app, &format!("{COMMIT_COMPLETION_PREFIX}{query}"));
+    assert_eq!(
+        app.input_box.buffer.display_text(),
+        format!("{COMMIT_COMPLETION_PREFIX}{query}{COMMIT_COMPLETION_SUFFIX}")
+    );
     assert!(app.commit_popup.is_open(), "{COMMIT_POPUP_CLOSED}");
 
-    app.update(Msg::Key(key(KeyCode::Enter)));
+    app.update(Msg::Key(key(completion)));
 
-    assert_eq!(app.input_box.buffer.display_text(), "landed in #a1b2c3d");
+    assert_eq!(
+        app.input_box.buffer.display_text(),
+        format!("{COMMIT_COMPLETION_PREFIX}#{COMMIT_SHORT_ID}{COMMIT_COMPLETION_SUFFIX}")
+    );
     assert!(!app.commit_popup.is_open(), "{COMMIT_POPUP_LINGERED}");
     let commits = app.input_box.commits();
     assert_eq!(commits.len(), 1, "{COMMIT_UNRESOLVED}");
-    assert_eq!(commits[0].1.id, "a1b2c3d");
+    assert_eq!(commits[0].1.id, COMMIT_SHORT_ID);
 }
 
 /// Clicking away moves the caret out of the query, and the popup has no

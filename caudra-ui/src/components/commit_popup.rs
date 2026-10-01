@@ -17,6 +17,8 @@ use std::sync::Arc;
 use caudra_agent::commits::repo::{self, CommitSummary};
 use caudra_grab::grab_scope;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
+use jiff::Timestamp;
+use jiff::tz::TimeZone;
 use nucleo::{Config, Utf32String};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
@@ -35,6 +37,8 @@ const SCOPE: &str = "commit_popup";
 /// would be pushed off a narrow composer.
 const SUBJECT_WIDTH: usize = 60;
 const GAP: &str = "  ";
+const DATE_FORMAT: &str = "%Y-%m-%d %H:%M";
+const UNKNOWN_DATE: &str = "unknown date";
 /// Shown while the log is being read, so a `#` answers at once in a project
 /// whose history is a round trip away.
 const LOADING: &str = "reading the log";
@@ -115,11 +119,28 @@ impl CommitIndex {
     }
 }
 
+struct CommitRow {
+    hash: String,
+    text: String,
+}
+
+impl CommitRow {
+    fn new(commit: &CommitSummary, zone: &TimeZone) -> Self {
+        let hash = commit.short().to_owned();
+        let date = datetime(commit.committed_unix_seconds, zone);
+        let subject = truncate(&commit.subject, SUBJECT_WIDTH);
+        Self {
+            text: format!("{hash}{GAP}{date}{GAP}{subject}{GAP}{}", commit.author),
+            hash,
+        }
+    }
+}
+
 struct Session {
     completion: Completion,
     /// The row text each match came from, so choosing one recovers its hash
     /// without re-parsing the rendered row.
-    hashes: HashMap<String, String>,
+    rows: HashMap<String, CommitRow>,
     /// The window the rows were seeded from, compared by pointer. A refresh
     /// replaces the window wholesale, so this is how an open popup notices one
     /// landing behind it instead of listing a stale log.
@@ -192,10 +213,6 @@ impl CommitPopup {
         self.step(-delta.signum() as isize);
     }
 
-    /// Re-reads the composer after an edit. Opens when the cursor is inside a
-    /// `#query` and the query could still become a hash, re-queries while it
-    /// grows, and closes as soon as it is not.
-    ///
     /// A pending index opens the popup anyway, on a spinner: the reader asked a
     /// question and the answer is on its way.
     pub fn sync(&mut self, text: &str, cursor: usize, index: &CommitIndex) {
@@ -203,9 +220,7 @@ impl CommitPopup {
             self.close();
             return;
         };
-        // A heading, a list marker or an issue number all start `#` too. Only a
-        // run that could still grow into a hash is worth a popup.
-        if index.is_absent() || !query.chars().all(|c| c.is_ascii_hexdigit()) {
+        if index.is_absent() {
             self.close();
             return;
         }
@@ -228,13 +243,14 @@ impl CommitPopup {
     fn start(&mut self, query: String, index: &CommitIndex) {
         let completion = Completion::new(Config::DEFAULT, query.clone());
         let injector = completion.injector();
-        let mut hashes = HashMap::new();
+        let mut rows = HashMap::new();
+        let zone = TimeZone::system();
         for commit in index.commits() {
             let row = haystack(commit);
             injector.push((), |_, columns| {
                 columns[0] = Utf32String::from(row.as_str());
             });
-            hashes.insert(row, commit.short().to_owned());
+            rows.insert(row, CommitRow::new(commit, &zone));
         }
         let sourced = match index {
             CommitIndex::Loaded(commits) => Some(Arc::clone(commits)),
@@ -242,7 +258,7 @@ impl CommitPopup {
         };
         let mut session = Session {
             completion,
-            hashes,
+            rows,
             sourced,
         };
         session.completion.set_query(query);
@@ -308,8 +324,8 @@ impl CommitPopup {
         let Some(hash) = session
             .completion
             .selected()
-            .and_then(|row| session.hashes.get(row))
-            .cloned()
+            .and_then(|query| session.rows.get(query))
+            .map(|row| row.hash.clone())
         else {
             return CommitAction::Passthrough;
         };
@@ -326,17 +342,25 @@ impl CommitPopup {
         }
         let session = self.session.as_mut()?;
         let theme = theme::current();
+        let rows = &session.rows;
         session.completion.view(
             frame,
             input_area,
             SCOPE,
-            |row| UnicodeWidthStr::width(row) as u16 + PAD * 2,
-            move |row, selected| {
+            |query| {
+                rows.get(query).map_or(0, |row| {
+                    UnicodeWidthStr::width(row.text.as_str()) as u16 + PAD * 2
+                })
+            },
+            move |query, selected| {
+                let Some(row) = rows.get(query) else {
+                    return Line::default();
+                };
                 let base = match selected {
                     true => theme.item_selected,
                     false => theme.item,
                 };
-                let (hash, rest) = row.split_once(' ').unwrap_or((row, ""));
+                let (hash, rest) = row.text.split_once(' ').unwrap_or((&row.text, ""));
                 Line::from(vec![
                     Span::styled(format!(" {hash}"), base.patch(theme.mention)),
                     Span::styled(format!(" {rest} "), base),
@@ -370,12 +394,24 @@ fn loading_view(frame: &mut Frame, input_area: Rect) -> Option<Rect> {
     Some(area)
 }
 
-/// What the matcher searches and the row displays: the abbreviated hash, the
-/// subject, and the author. One string for both, so what a reader matched on is
-/// exactly what they can see.
 fn haystack(commit: &CommitSummary) -> String {
-    let subject = truncate(&commit.subject, SUBJECT_WIDTH);
-    format!("{} {subject}{GAP}{}", commit.short(), commit.author)
+    format!(
+        "{} {}{GAP}{}",
+        commit.short(),
+        commit.subject,
+        commit.author
+    )
+}
+
+fn datetime(seconds: i64, zone: &TimeZone) -> String {
+    Timestamp::from_second(seconds)
+        .map(|stamp| {
+            stamp
+                .to_zoned(zone.clone())
+                .strftime(DATE_FORMAT)
+                .to_string()
+        })
+        .unwrap_or_else(|_| UNKNOWN_DATE.to_owned())
 }
 
 fn truncate(text: &str, width: usize) -> String {
@@ -387,14 +423,39 @@ fn truncate(text: &str, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crossterm::event::{MouseButton, MouseEventKind};
+    use super::{
+        CommitAction, CommitIndex, CommitPopup, CommitRow, SUBJECT_WIDTH, UNKNOWN_DATE, datetime,
+        haystack,
+    };
+    use caudra_agent::commits::repo::CommitSummary;
+    use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use jiff::tz::{Offset, TimeZone};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
     use test_case::test_case;
+
+    use crate::components::key;
+    use crate::repaint::Cadence;
 
     const FIRST: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
     const SECOND: &str = "0f1e2d3c4b5a69788796a5b4c3d2e1f098765432";
     const SUBJECT: &str = "Fix login crash";
     const AUTHOR: &str = "Ada Lovelace";
+    const OTHER_AUTHOR: &str = "Grace Hopper";
+    const COMMITTED: i64 = 1_700_000_000;
+    const UTC_DATETIME: &str = "2023-11-14 22:13";
+    const OFFSET_SECONDS: i32 = 19_800;
+    const OFFSET_DATETIME: &str = "2023-11-15 03:43";
+    const FIRST_MENTION: &str = "#a1b2c3d";
+    const SECOND_MENTION: &str = "#0f1e2d3";
+    const TITLE_QUERY: &str = "#login";
+    const HIDDEN_WORD: &str = "needle";
+    const WIDE: u16 = 120;
+    const NARROW: u16 = 32;
+    const NO_FRAME: &str = "the commit popup must render in a test terminal";
+    const INVALID_OFFSET: &str = "the fixed test timezone must be valid";
+    const MISSING_ROW: &str = "the popup did not retain its display row";
     const AREA: Rect = Rect {
         x: 0,
         y: 4,
@@ -403,7 +464,7 @@ mod tests {
     };
     const NO_SESSION: &str = "the popup dropped the session it was given";
     const NOT_INSERTED: &str = "the click did not take the row it landed on";
-    const EXPECT_CLOSED: &str = "the popup stayed open over text that cannot be a hash";
+    const EXPECT_CLOSED: &str = "the popup stayed open without a matching commit query";
     const THIRD: &str = "c3d4e5f60718293a4b5c6d7e8f90123456789abc";
     const EXPECT_LOADING: &str = "a `#` typed before the log arrives must still answer";
     const LOADING_CAPTURES: &str = "a popup with no rows must not capture keys or clicks";
@@ -417,14 +478,14 @@ mod tests {
             id: id.to_owned(),
             subject: subject.to_owned(),
             author: AUTHOR.to_owned(),
+            committed_unix_seconds: COMMITTED,
         }
     }
 
     fn index() -> CommitIndex {
-        CommitIndex::loaded(vec![
-            summary(FIRST, SUBJECT),
-            summary(SECOND, "Earlier work"),
-        ])
+        let mut earlier = summary(SECOND, "Earlier work");
+        earlier.author = OTHER_AUTHOR.to_owned();
+        CommitIndex::loaded(vec![summary(FIRST, SUBJECT), earlier])
     }
 
     fn opened() -> CommitPopup {
@@ -455,18 +516,21 @@ mod tests {
         let popup = opened();
         assert!(popup.is_open());
         assert_eq!(
-            popup.session.as_ref().expect(NO_SESSION).hashes.len(),
+            popup.session.as_ref().expect(NO_SESSION).rows.len(),
             2,
             "both commits are listed"
         );
     }
 
     #[test_case("# heading", 2 ; "a_heading")]
-    #[test_case("#zzz", 4 ; "not_hexadecimal")]
-    fn text_that_cannot_become_a_hash_does_not_open_the_popup(text: &str, cursor: usize) {
+    #[test_case("#login more", 11 ; "past_whitespace")]
+    #[test_case("word#login", 10 ; "mid_word")]
+    fn text_outside_a_query_does_not_open_the_popup(text: &str, cursor: usize) {
         let mut popup = CommitPopup::new();
         popup.sync(text, cursor, &index());
+        popup.settle();
         assert!(!popup.is_open(), "{EXPECT_CLOSED}: {text}");
+        assert!(!popup.is_active(), "{EXPECT_CLOSED}: {text}");
     }
 
     /// Without a repository there is nothing to complete and nothing to wait
@@ -480,24 +544,30 @@ mod tests {
 
     /// A project whose history is a round trip away still answers the `#` on the
     /// frame it was typed on, which is what the spinner is for.
-    #[test]
-    fn a_pending_index_opens_the_popup_on_a_spinner() {
+    #[test_case("#a1b2" ; "hash")]
+    #[test_case(TITLE_QUERY ; "title")]
+    fn a_pending_index_opens_the_popup_on_a_spinner(query: &str) {
         let mut popup = CommitPopup::new();
-        popup.sync("#a1b2", 5, &CommitIndex::Pending);
+        popup.sync(query, query.chars().count(), &CommitIndex::Pending);
         assert!(popup.is_loading(), "{EXPECT_LOADING}");
         assert!(!popup.is_open(), "{LOADING_CAPTURES}");
     }
 
     /// A window landing behind an open popup replaces its rows. Without this the
     /// spinner would never become a list.
-    #[test]
-    fn a_window_arriving_behind_a_loading_popup_becomes_its_rows() {
+    #[test_case("#a1b2" ; "hash")]
+    #[test_case(TITLE_QUERY ; "title")]
+    fn a_window_arriving_behind_a_loading_popup_becomes_its_rows(query: &str) {
         let mut popup = CommitPopup::new();
-        popup.sync("#a1b2", 5, &CommitIndex::Pending);
-        popup.sync("#a1b2", 5, &index());
+        popup.sync(query, query.chars().count(), &CommitIndex::Pending);
+        popup.sync(query, query.chars().count(), &index());
         popup.settle();
         assert!(popup.is_open(), "{EXPECT_LISTED}");
         assert!(!popup.is_loading(), "{LOADING_LINGERED}");
+        assert_eq!(
+            inserted(popup.handle_key(key(KeyCode::Enter))).as_deref(),
+            Some(FIRST_MENTION)
+        );
     }
 
     /// A refresh replaces the window, and an open popup has to notice: listing
@@ -515,7 +585,7 @@ mod tests {
         popup.sync("#", 1, &refreshed);
         popup.settle();
         assert_eq!(
-            popup.session.as_ref().expect(NO_SESSION).hashes.len(),
+            popup.session.as_ref().expect(NO_SESSION).rows.len(),
             3,
             "{STALE_WINDOW}"
         );
@@ -586,6 +656,8 @@ mod tests {
     #[test]
     fn a_press_and_release_on_one_row_takes_that_commit() {
         let mut popup = opened();
+        popup.sync(TITLE_QUERY, TITLE_QUERY.chars().count(), &index());
+        popup.settle();
         popup
             .session
             .as_mut()
@@ -594,16 +666,28 @@ mod tests {
             .set_area(AREA);
         popup.handle_mouse(event(MouseEventKind::Down(MouseButton::Left), 0));
         let action = popup.handle_mouse(event(MouseEventKind::Up(MouseButton::Left), 0));
-        assert!(inserted(action).is_some(), "{NOT_INSERTED}");
+        assert_eq!(
+            inserted(action).as_deref(),
+            Some(FIRST_MENTION),
+            "{NOT_INSERTED}"
+        );
     }
 
-    #[test]
-    fn the_query_narrows_the_list_to_the_hash_it_names() {
+    #[test_case("#0f1e", Some(SECOND_MENTION) ; "hash")]
+    #[test_case(TITLE_QUERY, Some(FIRST_MENTION) ; "title_word")]
+    #[test_case("#fixlogin", Some(FIRST_MENTION) ; "fuzzy_title")]
+    #[test_case("#Hopper", Some(SECOND_MENTION) ; "author")]
+    #[test_case("#zzz", None ; "unmatched")]
+    #[test_case("#2023", None ; "dates_are_not_searchable")]
+    fn the_query_selects_the_matching_commit(query: &str, expected: Option<&str>) {
+        let index = index();
         let mut popup = CommitPopup::new();
-        popup.sync("#0f1e", 5, &index());
+        popup.sync("#", 1, &index);
         popup.settle();
-        let action = popup.handle_key(crate::components::key(KeyCode::Enter));
-        assert_eq!(inserted(action).as_deref(), Some("#0f1e2d3"));
+        popup.sync(query, query.chars().count(), &index);
+        popup.settle();
+        let action = popup.handle_key(key(KeyCode::Enter));
+        assert_eq!(inserted(action).as_deref(), expected);
     }
 
     #[test]
@@ -614,11 +698,80 @@ mod tests {
         assert!(row.ends_with(AUTHOR));
     }
 
-    #[test]
-    fn a_long_subject_is_cut_rather_than_pushing_the_author_off() {
-        let row = haystack(&summary(FIRST, &"x".repeat(SUBJECT_WIDTH * 2)));
+    #[test_case(HIDDEN_WORD)]
+    fn a_truncated_title_remains_fully_searchable(word: &str) {
+        let subject = format!("{} {word}", "x".repeat(SUBJECT_WIDTH));
+        let commit = summary(FIRST, &subject);
+        let query = format!("#{word}");
+        let search = haystack(&commit);
+        let mut popup = CommitPopup::new();
+        popup.sync(
+            &query,
+            query.chars().count(),
+            &CommitIndex::loaded(vec![commit]),
+        );
+        popup.settle();
+        let row = &popup
+            .session
+            .as_ref()
+            .expect(NO_SESSION)
+            .rows
+            .get(&search)
+            .expect(MISSING_ROW)
+            .text;
         assert!(row.contains('\u{2026}'));
         assert!(row.ends_with(AUTHOR));
+        assert!(!row.contains(word));
+        assert_eq!(
+            inserted(popup.handle_key(key(KeyCode::Tab))).as_deref(),
+            Some(FIRST_MENTION)
+        );
+    }
+
+    #[test_case(COMMITTED, 0, UTC_DATETIME ; "utc")]
+    #[test_case(COMMITTED, OFFSET_SECONDS, OFFSET_DATETIME ; "offset_crosses_midnight")]
+    #[test_case(i64::MAX, 0, UNKNOWN_DATE ; "unrepresentable")]
+    fn timestamps_use_the_requested_timezone(seconds: i64, offset: i32, expected: &str) {
+        let zone = TimeZone::fixed(Offset::from_seconds(offset).expect(INVALID_OFFSET));
+        assert_eq!(datetime(seconds, &zone), expected);
+    }
+
+    #[test_case(WIDE ; "wide")]
+    #[test_case(NARROW ; "narrow")]
+    fn rendered_rows_place_the_datetime_between_hash_and_title(width: u16) {
+        let mut popup = CommitPopup::new();
+        let commit = summary(FIRST, SUBJECT);
+        let date = datetime(COMMITTED, &TimeZone::system());
+        let expected = format!(" {}  {date}  {SUBJECT}  {AUTHOR} ", commit.short());
+        popup.sync("#", 1, &CommitIndex::loaded(vec![commit]));
+        popup.settle();
+        let mut terminal = Terminal::new(TestBackend::new(width, AREA.bottom())).expect(NO_FRAME);
+        let mut drawn = None;
+        terminal
+            .draw(|frame| drawn = popup.view(frame, Rect { width, ..AREA }))
+            .expect(NO_FRAME);
+        let area = drawn.expect(NO_FRAME);
+        assert_eq!(area.width as usize, expected.len().min(width as usize));
+        let buffer = terminal.backend().buffer();
+        let actual: String = (area.x..area.right())
+            .map(|x| buffer[(x, area.y)].symbol())
+            .collect();
+        assert_eq!(
+            actual,
+            expected.chars().take(width as usize).collect::<String>()
+        );
+    }
+
+    #[test_case(i64::MAX)]
+    fn invalid_timestamps_keep_the_commit_row(seconds: i64) {
+        let mut commit = summary(FIRST, SUBJECT);
+        commit.committed_unix_seconds = seconds;
+        let row = CommitRow::new(&commit, &TimeZone::UTC);
+        assert_eq!(row.hash, commit.short());
+        assert_eq!(
+            row.text,
+            format!("{}  {UNKNOWN_DATE}  {SUBJECT}  {AUTHOR}", commit.short())
+        );
     }
 
     #[test_case("a1b2c3d", true ; "an_abbreviation_of_a_listed_commit")]

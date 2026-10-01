@@ -11,6 +11,7 @@ use crate::components::tool_display::{
 };
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{Selection, SelectionZone};
+use caudra_agent::commits::repo::CommitSummary;
 use caudra_agent::tools::{
     BATCH_TOOL_NAME, FILE_APPLY_PATCH_TOOL_NAME, FILE_EDIT_TOOL_NAME, FILE_GLOB_TOOL_NAME,
     FILE_GREP_TOOL_NAME, FILE_INDEX_TOOL_NAME, FILE_READ_TOOL_NAME, FILE_WRITE_TOOL_NAME,
@@ -799,6 +800,7 @@ const COMMIT_ID: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
 const COMMIT_HASH: &str = "#a1b2c3d";
 const COMMIT_PROSE: &str = "landed in #a1b2c3d yesterday";
 const COMMIT_SUBJECT: &str = "Fix login crash";
+const COMMIT_UNIX_SECONDS: i64 = 1_700_003_600;
 const COMMIT_MISSED: &str = "the pointer sat on a commit the panel did not resolve";
 const COMMIT_CLAIMED: &str = "a message the reader did not write answered with a commit";
 const COMMIT_MARKED_GLYPHS: &str = "a hovered commit repainted the message around it";
@@ -3925,13 +3927,12 @@ fn mention_hover(role: DisplayRole, text: &str) -> (MessagesPanel, Rect, u16, u1
 /// hover answers from memory rather than opening the repository.
 fn commit_hover(role: DisplayRole) -> (MessagesPanel, Rect, u16, u16) {
     let (mut panel, area, row, column) = pointer_at(role, COMMIT_PROSE, COMMIT_HASH);
-    panel.set_commit_index(CommitIndex::loaded(vec![
-        caudra_agent::commits::repo::CommitSummary {
-            id: COMMIT_ID.to_owned(),
-            subject: COMMIT_SUBJECT.to_owned(),
-            author: "Ada Lovelace".to_owned(),
-        },
-    ]));
+    panel.set_commit_index(CommitIndex::loaded(vec![CommitSummary {
+        id: COMMIT_ID.to_owned(),
+        subject: COMMIT_SUBJECT.to_owned(),
+        author: "Ada Lovelace".to_owned(),
+        committed_unix_seconds: COMMIT_UNIX_SECONDS,
+    }]));
     (panel, area, row, column)
 }
 

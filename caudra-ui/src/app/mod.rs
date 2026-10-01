@@ -1161,6 +1161,7 @@ impl App {
                         id: commit.id.clone(),
                         subject: commit.summary.clone(),
                         author: commit.author.clone(),
+                        committed_unix_seconds: commit.committed,
                     })
                     .collect()
             }
