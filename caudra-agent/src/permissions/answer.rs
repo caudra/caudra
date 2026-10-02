@@ -171,6 +171,7 @@ impl PermissionManager {
         request: &PermissionRequest,
         answer: &PermissionAnswer,
         approved_project: Option<&Path>,
+        plan_scoped: bool,
     ) -> Result<(), PermissionPolicyError> {
         let selects_template = match answer {
             PermissionAnswer::AllowOption { option_id, .. } => {
@@ -211,10 +212,15 @@ impl PermissionManager {
                 lifetime,
             } => (option_id.as_str(), lifetime.clone()),
             PermissionAnswer::AllowComposed { rows } => {
+                if plan_scoped {
+                    request
+                        .contain_rows_to_the_plan(rows)
+                        .map_err(|error| PermissionPolicyError(error.to_string()))?;
+                }
                 let rules = request
                     .composed_rules(rows)
                     .map_err(|error| PermissionPolicyError(error.to_string()))?;
-                return self.store_reusable_rules(request, rules, approved_project);
+                return self.store_reusable_rules(request, rules, approved_project, plan_scoped);
             }
             PermissionAnswer::DenyAlwaysLocal => ("deny_exact", PermissionLifetime::Project),
             PermissionAnswer::DenyAlwaysGlobal => ("deny_exact", PermissionLifetime::Global),
@@ -247,24 +253,38 @@ impl PermissionManager {
                 "authority {option_id:?} does not cover the pending request"
             )));
         }
-        self.store_reusable_rules(request, vec![rule], approved_project)
+        self.store_reusable_rules(request, vec![rule], approved_project, plan_scoped)
     }
 
     /// Files each rule under its lifetime's owner: conversation rules with the
-    /// conversation, project and global rules in persistent storage.
+    /// conversation, project and global rules in persistent storage. A project
+    /// rule filed while planning gets a conversation copy, because remembered
+    /// rules never reach a plan-scoped call and the plan is still running.
     pub(super) fn store_reusable_rules(
         &self,
         request: &PermissionRequest,
         rules: Vec<StructuredPermissionRule>,
         approved_project: Option<&Path>,
+        plan_scoped: bool,
     ) -> Result<(), PermissionPolicyError> {
         for rule in &rules {
             validate_compiled_templates(rule)?;
         }
-        let (conversation, persistent): (Vec<_>, Vec<_>) = rules
+        let (mut conversation, persistent): (Vec<_>, Vec<_>) = rules
             .into_iter()
             .filter(|rule| rule.lifetime != PermissionLifetime::Once)
             .partition(|rule| rule.lifetime == PermissionLifetime::Conversation);
+        if plan_scoped {
+            conversation.extend(
+                persistent
+                    .iter()
+                    .filter(|rule| rule.lifetime == PermissionLifetime::Project)
+                    .map(|rule| StructuredPermissionRule {
+                        lifetime: PermissionLifetime::Conversation,
+                        ..rule.clone()
+                    }),
+            );
+        }
         if conversation.is_empty() && persistent.is_empty() {
             return Ok(());
         }
@@ -576,7 +596,7 @@ mod tests {
         };
         assert!(
             manager
-                .store_reusable_rules(&request, vec![first, invalid], Some(temp.path()))
+                .store_reusable_rules(&request, vec![first, invalid], Some(temp.path()), false)
                 .is_err()
         );
         assert!(manager.structured_rule_inventory().unwrap().is_empty());

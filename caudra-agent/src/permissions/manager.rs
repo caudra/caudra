@@ -1961,7 +1961,8 @@ mod pattern_runtime_tests {
                 .commit_structured_decision(
                     &offered,
                     &PermissionAnswer::AllowComposed { rows },
-                    None
+                    None,
+                    false,
                 )
                 .is_err()
         );
@@ -2010,7 +2011,7 @@ mod pattern_runtime_tests {
         let manager = default_mgr();
         manager.set_pattern_candidates(vec![candidate()]);
         manager
-            .commit_structured_decision(&offered, &answer, None)
+            .commit_structured_decision(&offered, &answer, None, false)
             .unwrap();
         assert_eq!(
             manager.structured_rule_inventory().unwrap()[0]
@@ -2066,12 +2067,13 @@ mod pattern_runtime_tests {
                     &offered,
                     vec![valid.clone(), invalid.clone()],
                     Some(temp.path()),
+                    false,
                 )
                 .is_err()
         );
         assert!(manager.structured_rule_inventory().unwrap().is_empty());
         manager
-            .store_reusable_rules(&offered, vec![valid.clone()], Some(temp.path()))
+            .store_reusable_rules(&offered, vec![valid.clone()], Some(temp.path()), false)
             .unwrap();
         let approved = manager.structured_rule_inventory().unwrap();
         assert_eq!(approved.len(), 1);

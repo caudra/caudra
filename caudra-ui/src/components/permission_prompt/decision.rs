@@ -3,7 +3,7 @@ use std::path::Path;
 use caudra_agent::permissions::{
     COMMAND_EXACT_PREFIX, ComposedRow, PermissionAnswer, PermissionCaution, PermissionExecutorKind,
     PermissionLifetime, PermissionRequest, PermissionResourceAccess, PermissionResourceKind,
-    PermissionRowGrant, PermissionRuleOption, PermissionSubject, ShellOpacity,
+    PermissionRowGrant, PermissionRuleOption, PermissionSubject, PromptReason, ShellOpacity,
     StructuredPermissionEffect, grade_command_pattern,
 };
 
@@ -113,6 +113,27 @@ pub(super) fn grant_option<'a>(
         PermissionRowGrant::Written(_) => format!("{COMMAND_EXACT_PREFIX}{row}"),
     };
     row_ladder(request, row).find(|option| option.id == id)
+}
+
+/// The lifetimes a row's grant can be kept for: its rung's, except that a
+/// written pattern broad enough to need confirming lasts this conversation
+/// at most while planning, as every broad rung does.
+pub(super) fn row_lifetimes(
+    request: &PermissionRequest,
+    row: usize,
+    grant: &PermissionRowGrant,
+) -> Vec<PermissionLifetime> {
+    let Some(option) = grant_option(request, row, grant) else {
+        return Vec::new();
+    };
+    let contained = request.presentation.reason == PromptReason::Plan
+        && request.broad_written_grant(row, grant);
+    option
+        .allowed_lifetimes
+        .iter()
+        .filter(|lifetime| !contained || **lifetime <= PermissionLifetime::Conversation)
+        .cloned()
+        .collect()
 }
 
 /// The rung a row starts on: the one the request marks as its default, or
@@ -454,9 +475,7 @@ impl PermissionPrompt {
             let Some(grant) = grant else {
                 continue;
             };
-            if !grant_option(request, row, grant)
-                .is_some_and(|option| option.allowed_lifetimes.contains(lifetime))
-            {
+            if !row_lifetimes(request, row, grant).contains(lifetime) {
                 return false;
             }
             remembered = true;

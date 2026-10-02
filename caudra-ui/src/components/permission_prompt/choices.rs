@@ -1,7 +1,7 @@
 use caudra_agent::permissions::review::command_template_phrase;
 use caudra_agent::permissions::{
     PermissionAnswer, PermissionLifetime, PermissionRequest, PermissionResourceAccess,
-    PermissionResourceKind, PermissionRowGrant,
+    PermissionResourceKind, PermissionResourceSelector, PermissionRowGrant, PermissionRuleOption,
 };
 
 use super::decision::grant_option;
@@ -57,6 +57,33 @@ pub(super) fn grant_label(
         PermissionRowGrant::Pattern { definition, .. } => command_template_phrase(definition),
         PermissionRowGrant::Written(pattern) => pattern.clone(),
     })
+}
+
+/// Whether an option names commands by a pattern or a template, which reads
+/// as shell, rather than in words such as `this exact command`.
+fn names_commands(option: &PermissionRuleOption) -> bool {
+    option.rule.resources.iter().any(|resource| {
+        matches!(
+            resource.selector,
+            PermissionResourceSelector::CommandPattern { .. }
+                | PermissionResourceSelector::CommandTemplate { .. }
+        )
+    })
+}
+
+/// [`names_commands`] for a row's grant. A pattern written for the row always
+/// does.
+pub(super) fn grant_names_commands(
+    request: &PermissionRequest,
+    row: usize,
+    grant: &PermissionRowGrant,
+) -> bool {
+    match grant {
+        PermissionRowGrant::Offered(_) => {
+            grant_option(request, row, grant).is_some_and(names_commands)
+        }
+        PermissionRowGrant::Written(_) | PermissionRowGrant::Pattern { .. } => true,
+    }
 }
 
 /// How a file grant says what it lets the agent do, so the sentence reads
@@ -152,6 +179,21 @@ impl PermissionPrompt {
             Some(verb) => format!("{verb} ‹{label}›"),
             None => format!("‹{label}›"),
         }
+    }
+
+    /// Whether the scope in [`Self::scope_phrase`]'s marks names commands. A
+    /// phrase counting several commands has no marks, and a scope for the
+    /// whole request is named in words.
+    pub(super) fn scope_names_commands(&self) -> bool {
+        let Some(request) = self.current() else {
+            return false;
+        };
+        self.per_row()
+            && self.row_grants().iter().enumerate().any(|(row, grant)| {
+                grant
+                    .as_ref()
+                    .is_some_and(|grant| grant_names_commands(request, row, grant))
+            })
     }
 
     /// Acts on a choice the same way whether it came from its number, its

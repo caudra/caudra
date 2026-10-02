@@ -17,6 +17,7 @@ async-trait = { workspace = true }
 event-listener = { workspace = true }
 futures-lite = { workspace = true }
 flume = { workspace = true }
+globset = { workspace = true }
 isahc = { workspace = true }
 jiff = { workspace = true }
 serde = { workspace = true }

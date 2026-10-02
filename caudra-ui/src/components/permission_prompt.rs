@@ -33,7 +33,7 @@ pub(crate) use inspector::{pattern_summary, slot_name};
 pub(crate) use notes::{origin_word, tilde};
 #[cfg(test)]
 pub(crate) use scope::MISSING_SCOPE;
-pub(crate) use scope::{rule_phrase, rule_summary, tool_words};
+pub(crate) use scope::{rule_names_commands, rule_phrase, rule_summary, tool_words};
 use step_through::StepThrough;
 pub(crate) use step_through::lifetime_phrase;
 #[cfg(test)]

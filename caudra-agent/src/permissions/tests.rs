@@ -846,6 +846,7 @@ pub(super) fn remember_command(manager: &PermissionManager, command: &str) {
                 lifetime: PermissionLifetime::Conversation,
             },
             None,
+            false,
         )
         .unwrap();
     manager.notify_policy_changed("grant");

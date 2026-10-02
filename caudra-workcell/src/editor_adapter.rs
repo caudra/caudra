@@ -606,10 +606,9 @@ pub(super) fn shell_plan_access(shell: &PreparedShell) -> PlanModeAccess {
         shell.bash_command_contexts().ok().is_some_and(|contexts| {
             let facts = pattern_analysis::shell_facts(program, &contexts);
             facts.opacity.is_none()
-                && facts
-                    .commands
-                    .iter()
-                    .all(|command| read_only_shell::scope_is_read_only(&command.scope))
+                && facts.commands.iter().all(|command| {
+                    read_only_shell::scope_is_read_only(&command.scope, &command.globs)
+                })
         })
     });
     if read_only {
@@ -1492,7 +1491,8 @@ mod tests {
     #[test_case("git diff 'HEAD~1'", false, true; "quoted_revision")]
     #[test_case("find . -name *.rs", true, false; "unquoted_glob")]
     #[test_case("find . -name '*.rs'", false, true; "quoted_glob")]
-    #[test_case("rg a.*b src", true, false; "unquoted_regex")]
+    #[test_case("rg a.*b src", false, false; "unquoted_regex_reads_as_a_glob_in_the_pattern")]
+    #[test_case("ls src/*", false, true; "safe_glob")]
     #[test_case("rg 'a.*b' src", false, true; "quoted_regex")]
     #[test_case("git push origin main", false, false; "write")]
     #[test_case("git clean -n", false, false; "unsupported_dry_run")]
@@ -1525,7 +1525,7 @@ mod tests {
         assert!(!facts.commands.is_empty());
         assert_eq!(
             facts.commands.iter().all(|command| {
-                read_only_shell::shell_read_only_verdict(&command.scope).is_ok()
+                read_only_shell::shell_read_only_verdict(&command.scope, &command.globs).is_ok()
             }),
             scopes_read_only
         );
@@ -1557,11 +1557,12 @@ mod tests {
                 .iter()
                 .map(|command| {
                     assert_eq!(
-                        read_only_shell::shell_read_only_verdict(&command.scope),
+                        read_only_shell::shell_read_only_verdict(&command.scope, &command.globs),
                         Ok(())
                     );
                     read_only_shell::confined_read(
                         &command.scope,
+                        &command.globs,
                         &command.context.unwrap().incoming,
                         &fixture.project(),
                     )

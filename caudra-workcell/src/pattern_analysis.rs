@@ -2,6 +2,10 @@ use std::{collections::BTreeMap, path::Path};
 
 use caudra_agent::permissions::{
     ScriptLanguage, ShellOpacity, canonical_json_sha256,
+    executables::{
+        INDIRECT_EXECUTABLES, PARSED_SHELLS, PAYLOAD_EXECUTABLES, PRIVILEGED_EXECUTABLES,
+        SOURCE_DOT, WRAPPERS, versioned_interpreter,
+    },
     pattern_recognition::{
         CommandObservation, InvocationOutcome, OBSERVATION_SCHEMA_VERSION, ObservationProvenance,
         ObservationSource, ObservationVerification, ShellEffectStatus,
@@ -20,6 +24,7 @@ use workcell::shell::{
 };
 
 use crate::read_only_shell::{decimal, name_lookup};
+use crate::shell_glob::safe_glob;
 
 pub use caudra_agent::permissions::COMMAND_OBSERVATION_ATTRIBUTE;
 pub use workcell::shell::bash::{
@@ -32,13 +37,7 @@ const ANALYSIS_VERSION: &str = "caudra-shell-patterns/v1";
 const PREPARED_SOURCE: &str = "prepared-shell";
 const IMPORTED_SOURCE: &str = "imported-shell";
 const NULL_DEVICE: &str = "/dev/null";
-const SOURCE_DOT: &str = ".";
 const END_OF_OPTIONS: &str = "--";
-const PRIVILEGED_EXECUTABLES: &[&str] = &["sudo", "doas", "su"];
-const INDIRECT_EXECUTABLES: &[&str] = &["eval", "source", SOURCE_DOT];
-/// Shells whose `-c` code is Bash, so Workcell's parser reads it faithfully.
-const PARSED_SHELLS: &[&str] = &["bash", "sh"];
-const WRAPPERS: &[&str] = &["command", "builtin", "env", "xargs", "time", "coproc"];
 const SHELL_CODE_FLAG: char = 'c';
 const SHELL_VALUE_OPTIONS: &[&str] = &["--rcfile", "--init-file"];
 const SHELL_VALUE_FLAGS: [char; 2] = ['o', 'O'];
@@ -84,65 +83,6 @@ const SCREENABLE_REGIONS: &[(&str, ShellOpacity)] = &[
     ("command_substitution", ShellOpacity::Dynamic),
     ("process_substitution", ShellOpacity::Dynamic),
     ("arithmetic_expansion", ShellOpacity::Dynamic),
-];
-const PAYLOAD_EXECUTABLES: &[&str] = &[
-    "cd",
-    "exec",
-    "ash",
-    "dash",
-    "zsh",
-    "ksh",
-    "csh",
-    "tcsh",
-    "fish",
-    "cmd",
-    "powershell",
-    "pwsh",
-    "awk",
-    "gawk",
-    "mawk",
-    "nawk",
-    "sed",
-    "jq",
-    "yq",
-    "ssh",
-    "sshpass",
-    "rsh",
-    "mosh",
-    "expect",
-    "tclsh",
-    "wish",
-    "osascript",
-    "deno",
-    "bun",
-    "npx",
-    "ts-node",
-    "tsx",
-    "parallel",
-    "bc",
-    "dc",
-    "sqlite3",
-    "psql",
-    "mysql",
-    "r",
-    "rscript",
-];
-const VERSIONED_INTERPRETERS: &[&str] = &[
-    "python",
-    "pypy",
-    "ipython",
-    "jython",
-    "micropython",
-    "node",
-    "nodejs",
-    "perl",
-    "raku",
-    "ruby",
-    "irb",
-    "lua",
-    "luajit",
-    "php",
-    "julia",
 ];
 const SCRIPT_EXTENSIONS: &[&str] = &[
     "sh", "bash", "zsh", "ksh", "fish", "py", "pyw", "js", "mjs", "cjs", "ts", "pl", "rb", "lua",
@@ -447,6 +387,9 @@ pub(crate) struct CommandFacts<'a> {
     pub command: &'a BashCommand,
     pub context: Option<&'a BashCommandContext>,
     pub scope: ShellCommandScope,
+    /// Each argument's pattern when it is a safe glob, aligned with
+    /// `scope.arguments`.
+    pub globs: Vec<Option<&'a str>>,
 }
 
 pub(crate) struct ShellFacts<'a> {
@@ -505,9 +448,10 @@ pub(crate) fn shell_facts<'a>(
         };
         let context = contexts_by_node.get(&id.0).copied();
         let workdir = workdir_opacity(context);
+        let globs = safe_globs(program, command);
         unaccounted |= cause.is_some()
             || workdir.is_some()
-            || unfixed_values(command)
+            || unreviewable_values(command, &globs)
             || command
                 .redirects
                 .iter()
@@ -515,12 +459,13 @@ pub(crate) fn shell_facts<'a>(
         opaque_cause = opaque_cause
             .max(cause)
             .max(workdir)
-            .max(effect_opacity(program, command));
+            .max(effect_opacity(program, command, &globs));
         commands.push(CommandFacts {
             span: &program.nodes()[id.0].span,
             command,
             context,
             scope,
+            globs,
         });
     }
     commands.sort_by_key(|command| command.span.start);
@@ -646,11 +591,15 @@ fn workdir_opacity(context: Option<&BashCommandContext>) -> Option<ShellOpacity>
 }
 
 /// Words, assignments, and heredoc or here-string text whose values the text
-/// does not fix, and redirects to anything but a descriptor or the null device.
-/// A heredoc or here-string is a redirect too: no rule's argv sees the text it
-/// feeds, which a program like `psql` runs.
-fn effect_opacity(program: &BashProgram, command: &BashCommand) -> Option<ShellOpacity> {
-    let dynamic = unfixed_values(command).then_some(ShellOpacity::Dynamic);
+/// does not fix, safe globs aside, and redirects to anything but a descriptor
+/// or the null device. A heredoc or here-string is a redirect too: no rule's
+/// argv sees the text it feeds, which a program like `psql` runs.
+fn effect_opacity(
+    program: &BashProgram,
+    command: &BashCommand,
+    globs: &[Option<&str>],
+) -> Option<ShellOpacity> {
+    let dynamic = unreviewable_values(command, globs).then_some(ShellOpacity::Dynamic);
     let redirect = (!command.payloads.is_empty()
         || command
             .redirects
@@ -661,15 +610,36 @@ fn effect_opacity(program: &BashProgram, command: &BashCommand) -> Option<ShellO
 }
 
 /// Whether a word, an assignment, or the text of a heredoc or here-string can
-/// take a value the source does not spell out. An unquoted heredoc can still
-/// run code without a substitution, as `${prompt@P}` does.
-fn unfixed_values(command: &BashCommand) -> bool {
-    command.static_argv().is_none()
+/// take a value the source does not spell out for review. A safe glob can be
+/// reviewed: a rule reads the pattern the shell matches, and confinement
+/// checks what it matches. An unquoted heredoc can still run code without a
+/// substitution, as `${prompt@P}` does.
+fn unreviewable_values(command: &BashCommand, globs: &[Option<&str>]) -> bool {
+    !command.complete
+        || command.words.iter().enumerate().any(|(index, word)| {
+            word.literal.is_none()
+                && (index == 0 || globs.get(index - 1).copied().flatten().is_none())
+        })
         || !command.assignments.is_empty()
         || command
             .payloads
             .iter()
             .any(|payload| payload.literal.is_none())
+}
+
+/// Each argument's text when the shell globs it and `safe_glob` holds, aligned
+/// with the scope's arguments.
+fn safe_globs<'a>(program: &'a BashProgram, command: &BashCommand) -> Vec<Option<&'a str>> {
+    command
+        .words
+        .iter()
+        .skip(1)
+        .map(|word| {
+            program
+                .text(&word.span)
+                .filter(|text| word.literal.is_none() && safe_glob(text))
+        })
+        .collect()
 }
 
 /// What running `words` hands to code the line does not show, `depth` shells
@@ -841,19 +811,6 @@ fn executable_name<'a>(words: &[Option<&'a str>]) -> Option<&'a str> {
         .rsplit('/')
         .next()
         .filter(|name| !name.is_empty())
-}
-
-/// The interpreter a name runs, reading `python3` and `python3.12` as `python`.
-pub(crate) fn versioned_interpreter(name: &str) -> Option<&'static str> {
-    VERSIONED_INTERPRETERS.iter().copied().find(|interpreter| {
-        name.strip_prefix(interpreter).is_some_and(|version| {
-            version.is_empty()
-                || version.starts_with(|character: char| character.is_ascii_digit())
-                    && version
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || byte == b'.')
-        })
-    })
 }
 
 fn command_scope(program: &BashProgram, command: &BashCommand) -> Option<ShellCommandScope> {
@@ -1340,6 +1297,7 @@ mod tests {
     #[test_case("cargo check -p core 2>&1", PatternOmissionReason::ShellRedirects, false; "descriptor_redirect")]
     #[test_case("MODE=debug cargo check -p core", PatternOmissionReason::ShellAssignments, true; "assignment")]
     #[test_case("cargo check -p *", PatternOmissionReason::NonStaticArguments, true; "expansion")]
+    #[test_case("ls -la src/*", PatternOmissionReason::NonStaticArguments, false; "a_reviewable_glob_is_still_not_learned")]
     #[test_case("bash -c 'cargo check'", PatternOmissionReason::OpaqueWrapper, true; "opaque_wrapper")]
     #[test_case("''", PatternOmissionReason::UnrepresentableScope, true; "missing_scope")]
     fn omissions_identify_single_command_rejections(
@@ -1615,6 +1573,10 @@ mod tests {
     #[test_case("type -t rg", None; "a_type_lookup")]
     #[test_case("git status > status.txt", Some(ShellOpacity::Redirect); "a_file_redirect")]
     #[test_case("cat $HOME/notes", Some(ShellOpacity::Dynamic); "an_expansion")]
+    #[test_case("ls src/*", None; "a_safe_glob")]
+    #[test_case("ls *.rs", Some(ShellOpacity::Dynamic); "a_glob_led_by_a_wildcard")]
+    #[test_case("ls ~/x*", Some(ShellOpacity::Dynamic); "a_glob_under_the_home_directory")]
+    #[test_case("ls {a,b}/*", Some(ShellOpacity::Dynamic); "a_glob_under_a_brace")]
     #[test_case("MODE=debug cargo check", Some(ShellOpacity::Dynamic); "an_assignment")]
     #[test_case("cd - && ls", Some(ShellOpacity::Dynamic); "a_computed_directory")]
     #[test_case("git status > status.txt; MODE=debug cargo check", Some(ShellOpacity::Dynamic); "dynamic_outranks_redirect")]
@@ -1696,6 +1658,18 @@ mod tests {
         let facts = shell_facts(&program, &contexts);
         assert!(facts.opacity.is_some());
         assert_eq!(facts.opaque, opaque);
+    }
+
+    #[test]
+    fn globs_align_with_the_scope_arguments() {
+        let program = parse_bash("ls -la src/* notes.md").expect(ANALYSIS_EXPECTED);
+        let contexts =
+            program.command_contexts_with_assumptions(Path::new(HISTORICAL_ROOT), assumptions());
+
+        assert_eq!(
+            shell_facts(&program, &contexts).commands[0].globs,
+            [None, Some("src/*"), None]
+        );
     }
 
     #[test_case(Path::new(HISTORICAL_ROOT), BashContextAssumptions::default(); "undeclared_assumptions")]

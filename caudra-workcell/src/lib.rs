@@ -6,6 +6,7 @@ mod native_redirect;
 mod pattern_analysis;
 mod read_only_shell;
 mod remote;
+mod shell_glob;
 mod shell_record_scope;
 mod transfer;
 mod transfer_authorization;
@@ -2053,7 +2054,7 @@ fn remote_shell_plan_access(call: &RemotePreparedToolCall) -> PlanModeAccess {
                 && facts
                     .commands
                     .iter()
-                    .all(|command| read_only_shell::scope_is_read_only(&command.scope))
+                    .all(|command| read_only_shell::scope_is_read_only(&command.scope, &[]))
         });
     if read_only {
         PlanModeAccess::ReadOnly
@@ -3829,7 +3830,12 @@ fn shell_prepared(
             );
             if opacity.is_none()
                 && command.context.is_some_and(|context| {
-                    read_only_shell::confined_read(&command.scope, &context.incoming, project)
+                    read_only_shell::confined_read(
+                        &command.scope,
+                        &command.globs,
+                        &context.incoming,
+                        project,
+                    )
                 })
             {
                 attributes.insert(CONFINED_READ_ATTRIBUTE.into(), CONFINED_READ_VALUE.into());
@@ -6310,6 +6316,7 @@ mod tests {
     #[test_case("sed -n '1,140p' Cargo.toml" => true ; "a sed script that only prints")]
     #[test_case("cd src && rg -n needle ." => true ; "a move into the project before reading")]
     #[test_case("git log --oneline -3 2>/dev/null | head -20" => true ; "a read that discards its stderr")]
+    #[test_case("git status --short; git log -1 --format='%h %ci'" => true ; "a formatted log after a status")]
     #[test_case("python3 --version" => true ; "a version probe")]
     #[test_case("command -v rg" => true ; "a name lookup")]
     #[test_case("type -t rg" => true ; "a lookup of what a name is")]
@@ -6400,6 +6407,7 @@ mod tests {
     #[test_case("grep --dereference-r needle ." => false ; "grep_abbreviated_follow")]
     #[test_case("wc --files0-from=paths" => false ; "wc_indirect_file_operands")]
     #[test_case("du --files0-f=paths" => false ; "du_abbreviated_indirect_operands")]
+    #[test_case("echo src/*" => false ; "echo_prints_the_names_a_glob_matches")]
     fn shell_preflight_marks_only_a_confined_read(command: &str) -> bool {
         let root = TempDir::new().expect("tempdir");
         confined_read_preflight_marks(root.path(), command)
@@ -6438,6 +6446,37 @@ mod tests {
             confined_read_preflight_marks(root.path(), "cat alias"),
             expected
         );
+    }
+
+    /// Bash passes what a glob matches, or the pattern itself when nothing
+    /// does, so a row is confined only when each of those stays inside. `*`
+    /// skips the `.env` beside `Cargo.toml`, so it cannot count against the
+    /// listing.
+    #[test_case("ls caudra-highlight/* | head -30" => vec![true, true] ; "a_listing_piped_to_a_slice")]
+    #[test_case("cat caudra-highlight/Cargo.toml && ls caudra-highlight/* | head -30 && wc -l caudra-highlight/src/*" => vec![true, true, true, true] ; "the_reported_line")]
+    #[test_case("cat caudra-highlight/.e*" => vec![false] ; "a_dotfile_named_explicitly")]
+    #[test_case("cat escape/*" => vec![false] ; "a_match_linking_out")]
+    #[test_case("cat linked/*" => vec![false] ; "a_glob_through_a_linked_directory")]
+    #[test_case("ls missing/*" => vec![true] ; "no_match_passes_the_pattern_inside")]
+    #[test_case("ls /nonexistent-caudra-root/*" => vec![false] ; "no_match_passes_the_pattern_outside")]
+    #[test_case("ls missing/../../*" => vec![false] ; "no_match_passes_a_pattern_climbing_out")]
+    fn shell_preflight_expands_a_safe_glob(command: &str) -> Vec<bool> {
+        let root = TempDir::new().expect("tempdir");
+        let outside = TempDir::new().expect("outside");
+        let crate_directory = root.path().join("caudra-highlight");
+        std::fs::create_dir_all(crate_directory.join("src")).expect("crate directory");
+        for file in ["Cargo.toml", ".env", "src/lib.rs"] {
+            std::fs::write(crate_directory.join(file), "fixture").expect("crate file");
+        }
+        let escape = root.path().join("escape");
+        std::fs::create_dir(&escape).expect("escape directory");
+        std::fs::write(escape.join("notes.md"), "notes").expect("notes");
+        std::fs::write(outside.path().join("id_rsa"), "key").expect("secret");
+        std::os::unix::fs::symlink(outside.path().join("id_rsa"), escape.join("secret"))
+            .expect("file link");
+        std::os::unix::fs::symlink(outside.path(), root.path().join("linked")).expect("dir link");
+
+        confined_read_preflight_rows(root.path(), command)
     }
 
     #[test_case("execution_environment")]

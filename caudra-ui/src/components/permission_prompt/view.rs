@@ -2,7 +2,7 @@ use std::iter::repeat_n;
 
 use caudra_agent::permissions::{
     PermissionCaution, PermissionLifetime, PermissionRequest, PermissionResourceAccess,
-    PermissionResourceKind, PermissionRowGrant, grade_command_pattern,
+    PermissionResourceKind, PermissionRowGrant, PromptReason, grade_command_pattern,
 };
 use caudra_config::ToolKey;
 use caudra_grab::grab_scope;
@@ -11,17 +11,17 @@ use crossterm::event::KeyCode;
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::choices::{Choice, ONCE_ONLY, grant_label};
-use super::customize::{Effect, Field, ScopeItem, scope_item_label};
-use super::decision::{grant_option, main_ladder, row_positions};
+use super::choices::{Choice, ONCE_ONLY, grant_label, grant_names_commands};
+use super::customize::{Effect, Field, ScopeItem, scope_item_label, scope_item_names_commands};
+use super::decision::{covered, grant_option, main_ladder, row_positions};
 use super::details::{review_lines, review_text};
 use super::notes::{
-    Note, RowStatus, Tone, action_lines, coverage_phrase, row_coverage, row_status,
+    Note, RowStatus, Tone, action_lines, coverage_phrase, is_shell, row_coverage, row_status,
 };
 use super::scope::{option_model, pattern_model};
 use super::step_through::{
@@ -29,12 +29,16 @@ use super::step_through::{
     rung_lifetimes,
 };
 use super::{Panel, PermissionPrompt, PromptHit, PromptState, PromptTarget};
+use crate::components::command_text::{
+    code_spans_in, command_lines, command_spans, ellipsize_spans, marked_spans, overlay, pad_spans,
+    scope_spans,
+};
 use crate::components::permission_scope::model::ScopeModel;
 use crate::components::permission_scope::pattern::PatternPanel;
 use crate::components::permission_scope::view::ScopeView;
 use crate::components::tab_bar::{Tab, tab_spans};
 use crate::components::{
-    Hint, field_styles, hanging_lines, hint_hits, hint_line_hovered, hover_style,
+    Hint, field_styles, hanging_lines, hanging_spans, hint_hits, hint_line_hovered, hover_style,
 };
 use crate::theme::{self, Theme};
 
@@ -75,6 +79,8 @@ const OVERFLOW_HINT: &str = "? shows all";
 const REMEMBER_FOR: &str = "Remember for ";
 const EFFECT_LABEL: &str = "Effect";
 const REMEMBER_LABEL: &str = "Remember";
+pub(super) const BROAD_WHILE_PLANNING: &str =
+    "While planning, broad scopes last for this conversation.";
 const SCOPE_LABEL: &str = "Scope";
 const ASKS_EVERY_TIME: &str = "asks every time";
 const ALREADY_ALLOWED: &str = "already allowed";
@@ -241,6 +247,15 @@ fn hang(text: &str, style: Style, width: u16) -> Vec<Line<'static>> {
     lines
 }
 
+/// [`hang`] for a line already in colour.
+fn hang_spans(spans: Vec<Span<'static>>, width: u16) -> Vec<Line<'static>> {
+    let mut lines = hanging_spans(Span::raw(HANG), spans, width);
+    if let Some(first) = lines.first_mut() {
+        first.spans.remove(0);
+    }
+    lines
+}
+
 /// `text` wrapped under a fixed indent.
 fn indented(indent: usize, text: &str, style: Style, width: u16) -> Vec<Line<'static>> {
     hanging_lines(
@@ -287,13 +302,54 @@ fn pad(mut text: String, width: usize) -> String {
     text
 }
 
+/// `style` for a row already allowed: dimmed, so its colours do not outshine
+/// the rows that need an answer.
+fn settled(style: Style, status: RowStatus) -> Style {
+    match status {
+        RowStatus::Allowed => style.add_modifier(Modifier::DIM),
+        RowStatus::New | RowStatus::Asks => style,
+    }
+}
+
+/// A row's command in one column: coloured, cut, and padded to `width`, under
+/// `style`'s modifiers.
+fn command_cell(command: &str, width: usize, style: Style) -> Vec<Span<'static>> {
+    overlay(
+        pad_spans(ellipsize_spans(command_spans(command), width), width),
+        style,
+    )
+}
+
+/// The request's own text, a command coloured as shell.
+fn request_lines(request: &PermissionRequest) -> Vec<Vec<Span<'static>>> {
+    let lines = action_lines(request);
+    if is_shell(request) {
+        return command_lines(&lines);
+    }
+    lines
+        .into_iter()
+        .map(|line| vec![Span::raw(line)])
+        .collect()
+}
+
+/// One row's command, every line of it coloured as shell.
+fn row_lines(request: &PermissionRequest, row: usize) -> Vec<Vec<Span<'static>>> {
+    command_lines(
+        &request
+            .resources
+            .get(row)
+            .map(|resource| review_lines(&resource.value))
+            .unwrap_or_default(),
+    )
+}
+
 /// A numbered answer: `❯ 1. Yes`, its later rows hanging under the text,
 /// with any badges at the right edge when they fit there.
 fn numbered(
     index: usize,
     style: Style,
     highlighted: bool,
-    label: &str,
+    mut label: Vec<Span<'static>>,
     badges: &[String],
     width: u16,
     t: &Theme,
@@ -302,25 +358,19 @@ fn numbered(
     let prefix = format!("{pointer}{}. ", index + 1);
     let badge = badges.join(BADGE_SEPARATOR);
     let room = usize::from(width).saturating_sub(prefix.width());
-    if !badge.is_empty() && label.width() + COLUMN_GAP.width() + badge.width() <= room {
-        let gap = room - label.width() - badge.width();
-        return vec![Line::from(vec![
-            Span::styled(prefix, style),
-            Span::styled(label.to_owned(), style),
-            Span::raw(" ".repeat(gap)),
-            Span::styled(badge, t.tool_dim),
-        ])];
+    let label_width: usize = label.iter().map(Span::width).sum();
+    if !badge.is_empty() && label_width + COLUMN_GAP.width() + badge.width() <= room {
+        let gap = room - label_width - badge.width();
+        let mut spans = vec![Span::styled(prefix, style)];
+        spans.extend(label);
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.push(Span::styled(badge, t.tool_dim));
+        return vec![Line::from(spans)];
     }
-    let text = if badge.is_empty() {
-        label.to_owned()
-    } else {
-        format!("{label}{COLUMN_GAP}{badge}")
-    };
-    hanging_lines(
-        Span::styled(prefix, style),
-        Span::styled(text, style),
-        width,
-    )
+    if !badge.is_empty() {
+        label.push(Span::styled(format!("{COLUMN_GAP}{badge}"), style));
+    }
+    hanging_spans(Span::styled(prefix, style), label, width)
 }
 
 fn choice_style(highlighted: bool, hovered: bool, t: &Theme) -> Style {
@@ -650,12 +700,12 @@ impl PermissionPrompt {
         if self.pending_count() > 1 {
             parts.push(format!("1 of {}", self.pending_count()));
         }
-        if self.batch() {
-            parts.push(format!(
-                "{} of {} new",
-                self.new_rows().len(),
-                self.listed_rows().len()
-            ));
+        if let Some(request) = self.current()
+            && self.batch()
+        {
+            let listed = self.listed_rows();
+            let new = listed.iter().filter(|row| !covered(request, **row)).count();
+            parts.push(format!("{new} of {} new", listed.len()));
         }
         parts.join(TITLE_SEPARATOR)
     }
@@ -698,10 +748,10 @@ impl PermissionPrompt {
     }
 
     /// The request's own text, capped at `cap` rows with the rest counted.
-    fn action_block(&self, body: &mut Body, lines: &[String], cap: usize, t: &Theme) {
+    fn action_block(&self, body: &mut Body, lines: Vec<Vec<Span<'static>>>, cap: usize, t: &Theme) {
         let rows: Vec<Line<'static>> = lines
-            .iter()
-            .flat_map(|line| hang(line, Style::default(), body.width))
+            .into_iter()
+            .flat_map(|spans| hang_spans(spans, body.width))
             .collect();
         body.action_rows = rows.len();
         if rows.len() <= cap {
@@ -746,7 +796,7 @@ impl PermissionPrompt {
             return;
         };
         body.blank();
-        self.action_block(body, &action_lines(request), cap, t);
+        self.action_block(body, request_lines(request), cap, t);
         self.context_lines(body, t);
         if self.batch() {
             body.blank();
@@ -754,19 +804,18 @@ impl PermissionPrompt {
         }
         self.notes_block(body, t);
         body.blank();
+        let names_commands = self.scope_names_commands();
         for (index, choice) in self.choices().into_iter().enumerate() {
             let highlighted = choice == self.highlight;
             let target = PromptTarget::Choice(choice);
             let style = choice_style(highlighted, self.hover.as_ref() == Some(&target), t);
-            let lines = numbered(
-                index,
-                style,
-                highlighted,
+            let label = marked_spans(
                 &self.choice_sentence(choice),
-                &[],
-                body.width,
-                t,
+                style,
+                t.accent,
+                names_commands,
             );
+            let lines = numbered(index, style, highlighted, label, &[], body.width, t);
             body.control(target, lines, highlighted);
             if choice == Choice::Deny && self.state == PromptState::Guidance {
                 self.field_line(body, GUIDANCE_PLACEHOLDER, NUMBER_INDENT, t);
@@ -805,41 +854,48 @@ impl PermissionPrompt {
             let focused = new && self.focus_row == Some(row);
             let target = PromptTarget::Row(row);
             let hovered = self.hover.as_ref() == Some(&target);
-            let scope = match status {
-                RowStatus::New if new => format!(
-                    "‹{}›",
-                    self.row_grant(row).map_or_else(
-                        || ONCE_ONLY.into(),
-                        |grant| grant_label(request, row, &grant)
-                    )
+            let (scope, names_commands) = match status {
+                RowStatus::New if new => match self.row_grant(row) {
+                    Some(grant) => (
+                        format!("‹{}›", grant_label(request, row, &grant)),
+                        grant_names_commands(request, row, &grant),
+                    ),
+                    None => (format!("‹{ONCE_ONLY}›"), false),
+                },
+                RowStatus::New => (String::new(), false),
+                RowStatus::Asks | RowStatus::Allowed => (
+                    row_coverage(request, row)
+                        .map(coverage_phrase)
+                        .unwrap_or_default(),
+                    false,
                 ),
-                RowStatus::New => String::new(),
-                RowStatus::Asks | RowStatus::Allowed => row_coverage(request, row)
-                    .map(coverage_phrase)
-                    .unwrap_or_default(),
             };
             let (status_style, text_style) = match status {
                 RowStatus::New => (t.accent, Style::default()),
                 RowStatus::Asks => (t.tool_warning, Style::default()),
                 RowStatus::Allowed => (t.tool_dim, t.tool_dim),
             };
-            let command_style = if focused { t.active } else { text_style };
-            let line = Line::from(vec![
+            let command_style = settled(if focused { t.active } else { text_style }, status);
+            let mut spans = vec![
                 Span::styled(if focused { ROW_FOCUS } else { NO_POINTER }, t.accent),
                 Span::styled(pad(status.word().into(), STATUS_WIDTH), status_style),
-                Span::styled(
-                    pad(
-                        ellipsize(&row_command(request, row), command_width),
-                        command_width,
-                    ),
-                    hover_style(command_style, hovered),
-                ),
-                Span::raw(COLUMN_GAP),
-                Span::styled(
-                    ellipsize(&scope, scope_width),
+            ];
+            spans.extend(command_cell(
+                &row_command(request, row),
+                command_width,
+                hover_style(command_style, hovered),
+            ));
+            spans.push(Span::raw(COLUMN_GAP));
+            spans.extend(ellipsize_spans(
+                marked_spans(
+                    &scope,
                     hover_style(text_style, hovered),
+                    t.accent,
+                    names_commands,
                 ),
-            ]);
+                scope_width,
+            ));
+            let line = Line::from(spans);
             if new {
                 body.control(target, vec![line], focused);
             } else {
@@ -966,12 +1022,7 @@ impl PermissionPrompt {
         cap: usize,
         t: &Theme,
     ) {
-        let command = request
-            .resources
-            .get(row)
-            .map(|resource| review_lines(&resource.value))
-            .unwrap_or_default();
-        self.action_block(body, &command, cap, t);
+        self.action_block(body, row_lines(request, row), cap, t);
         self.notes_block(body, t);
         body.blank();
         for (index, item) in step.items(request, row).iter().enumerate() {
@@ -979,7 +1030,12 @@ impl PermissionPrompt {
             let highlighted = index == step.highlight;
             let target = PromptTarget::Item(index);
             let style = choice_style(highlighted, self.hover.as_ref() == Some(&target), t);
-            let lines = numbered(index, style, highlighted, &label, &badges, body.width, t);
+            let names_commands = matches!(
+                item,
+                PageItem::Grant(Some(grant)) if grant_names_commands(request, row, grant)
+            );
+            let label = scope_spans(&label, style, t.accent, names_commands);
+            let lines = numbered(index, style, highlighted, label, &badges, body.width, t);
             body.control(target, lines, highlighted);
             if *item == PageItem::OwnPattern && self.state == PromptState::PatternEditing {
                 self.pattern_field(body, row, NUMBER_INDENT, t);
@@ -1028,7 +1084,13 @@ impl PermissionPrompt {
             .saturating_sub(command_width + scope_width + 2 * COLUMN_GAP.width())
             .max(MIN_COLUMN);
         for row in self.listed_rows() {
-            let (scope, how_long, style) = match row_status(request, row) {
+            let status = row_status(request, row);
+            let coverage = || {
+                row_coverage(request, row)
+                    .map(coverage_phrase)
+                    .unwrap_or_default()
+            };
+            let (scope, how_long, style, names_commands) = match status {
                 RowStatus::New => match step.grant(request, row) {
                     Some(grant) => (
                         grant_label(request, row, &grant),
@@ -1038,36 +1100,29 @@ impl PermissionPrompt {
                             .unwrap_or_default()
                             .to_owned(),
                         Style::default(),
+                        grant_names_commands(request, row, &grant),
                     ),
-                    None => (ONCE_ONLY.into(), String::new(), Style::default()),
+                    None => (ONCE_ONLY.into(), String::new(), Style::default(), false),
                 },
-                RowStatus::Asks => (
-                    ASKS_EVERY_TIME.into(),
-                    row_coverage(request, row)
-                        .map(coverage_phrase)
-                        .unwrap_or_default(),
-                    t.tool_warning,
-                ),
-                RowStatus::Allowed => (
-                    ALREADY_ALLOWED.into(),
-                    row_coverage(request, row)
-                        .map(coverage_phrase)
-                        .unwrap_or_default(),
-                    t.tool_dim,
-                ),
+                RowStatus::Asks => (ASKS_EVERY_TIME.into(), coverage(), t.tool_warning, false),
+                RowStatus::Allowed => (ALREADY_ALLOWED.into(), coverage(), t.tool_dim, false),
             };
-            body.push([Line::styled(
-                format!(
-                    "{}{COLUMN_GAP}{}{COLUMN_GAP}{}",
-                    pad(
-                        ellipsize(&row_command(request, row), command_width),
-                        command_width
-                    ),
-                    pad(ellipsize(&scope, scope_width), scope_width),
-                    ellipsize(&how_long, rest),
+            let mut spans = command_cell(
+                &row_command(request, row),
+                command_width,
+                settled(style, status),
+            );
+            spans.push(Span::styled(COLUMN_GAP, style));
+            spans.extend(pad_spans(
+                ellipsize_spans(
+                    scope_spans(&scope, style, t.accent, names_commands),
+                    scope_width,
                 ),
-                style,
-            )]);
+                scope_width,
+            ));
+            spans.push(Span::styled(COLUMN_GAP, style));
+            spans.push(Span::styled(ellipsize(&how_long, rest), style));
+            body.push([Line::from(spans)]);
         }
         body.blank();
         for (index, choice) in REVIEW_CHOICES.iter().enumerate() {
@@ -1078,7 +1133,7 @@ impl PermissionPrompt {
                 index,
                 style,
                 highlighted,
-                self.review_sentence(*choice),
+                vec![Span::styled(self.review_sentence(*choice), style)],
                 &[],
                 body.width,
                 t,
@@ -1096,7 +1151,7 @@ impl PermissionPrompt {
             return;
         };
         body.blank();
-        self.action_block(body, &action_lines(request), cap, t);
+        self.action_block(body, request_lines(request), cap, t);
         self.context_lines(body, t);
         self.notes_block(body, t);
         body.blank();
@@ -1141,6 +1196,17 @@ impl PermissionPrompt {
         }
         body.spans(lifetimes, FIELD_LABEL_WIDTH);
         let indent = usize::from(FIELD_LABEL_WIDTH);
+        if request.presentation.reason == PromptReason::Plan
+            && customize.effect == Effect::Allow
+            && customize.broad(request)
+        {
+            body.push(indented(
+                indent,
+                BROAD_WHILE_PLANNING,
+                t.tool_dim,
+                body.width,
+            ));
+        }
         for (index, item) in self.customize_items().iter().enumerate() {
             let (text, badges, selectable) =
                 scope_item_label(request, customize, item, self.batch());
@@ -1158,14 +1224,17 @@ impl PermissionPrompt {
                 Span::raw(" ".repeat(indent))
             };
             let pointer = if highlighted { POINTER } else { NO_POINTER };
-            let text = if badges.is_empty() {
-                text
-            } else {
-                format!("{text}{COLUMN_GAP}{}", badges.join(BADGE_SEPARATOR))
-            };
-            let mut lines = hanging_lines(
+            let names_commands = selectable && scope_item_names_commands(request, customize, item);
+            let mut spans = scope_spans(&text, style, t.accent, names_commands);
+            if !badges.is_empty() {
+                spans.push(Span::styled(
+                    format!("{COLUMN_GAP}{}", badges.join(BADGE_SEPARATOR)),
+                    style,
+                ));
+            }
+            let mut lines = hanging_spans(
                 Span::styled(format!("{}{pointer}", " ".repeat(indent)), style),
-                Span::styled(text, style),
+                spans,
                 body.width,
             );
             if let Some(first) = lines.first_mut() {
@@ -1217,13 +1286,8 @@ impl PermissionPrompt {
         let (Some(request), Some(inspector)) = (self.current(), &self.inspector) else {
             return;
         };
-        let command = request
-            .resources
-            .get(inspector.row())
-            .map(|resource| review_lines(&resource.value))
-            .unwrap_or_default();
         body.blank();
-        self.action_block(body, &command, cap, t);
+        self.action_block(body, row_lines(request, inspector.row()), cap, t);
         if let Some(panel) = self.inspector_panel() {
             body.blank();
             let height = panel.height(body.width, t);
@@ -1235,8 +1299,20 @@ impl PermissionPrompt {
         for section in self.details() {
             body.blank();
             body.push([Line::styled(section.heading, t.panel_title)]);
-            for line in section.lines {
-                body.push(indented(HANG.width(), &line, Style::default(), body.width));
+            let lines = match section.command {
+                true => command_lines(&section.lines),
+                false => section
+                    .lines
+                    .iter()
+                    .enumerate()
+                    .map(|(index, line)| match section.patterns.contains(&index) {
+                        true => marked_spans(line, Style::default(), t.accent, true),
+                        false => code_spans_in(line, Style::default()),
+                    })
+                    .collect(),
+            };
+            for spans in lines {
+                body.push(hanging_spans(Span::raw(HANG), spans, body.width));
             }
         }
     }
@@ -1396,7 +1472,7 @@ pub(super) mod tests {
         PermissionAuthorityProfile, PermissionExecutorKind, PermissionLifetime, PermissionRequest,
         PermissionResource, PermissionResourceAccess, PermissionResourceKind, PermissionRisk,
         PermissionSubject, PromptReason, ResourceCoverage, RuleOrigin, ScriptLanguage,
-        ShellOpacity,
+        ShellOpacity, StructuredPermissionEffect,
     };
     use caudra_agent::tools::{PermissionIntent, PermissionScopes};
     use caudra_config::ToolKey;
@@ -1404,15 +1480,21 @@ pub(super) mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
+    use ratatui::style::Color;
     use serde_json::{Value, json};
     use tempfile::Builder;
     use test_case::test_case;
 
+    use super::super::customize::BROAD;
     use super::super::decision::tests::{
         PROJECT, command_resource, commands_request, native_shell_request, shell_request,
     };
     use super::super::{Panel, PermissionPrompt};
     use crate::components::buffer_text;
+    use crate::components::command_text::tests::{
+        COLOUR_THEME, NOT_COLOURED, NOT_TOLD_APART, PYTHON_SYNTAX, SHELL_SYNTAX, assert_drawn_in,
+        coloured, drawn_colours, syntax_colour,
+    };
     use crate::theme::{self, Theme};
 
     pub(crate) const ROOMY_WIDTH: u16 = 140;
@@ -1427,7 +1509,10 @@ pub(super) mod tests {
         "head",
     ];
     const ASK_RULE: &str = "git push *";
+    const DYNAMIC_ROWS: [&str; 2] = ["ls \"$TARGET\"", "wc -l \"$TARGET\""];
     const HEREDOC: &str = "python3 - <<'EOF'\nimport json, pathlib\nfor path in pathlib.Path(\"logs\").glob(\"*.json\"):\n    print(json.loads(path.read_text())[\"event\"])\nEOF";
+    const HEREDOC_BODY: &str = "import json, pathlib";
+    const PYTHON_KEYWORD: &str = "import";
     const PAGE: &str = "https://docs.rs/ratatui/latest/ratatui/widgets/struct.Paragraph.html";
     pub(crate) const OUTSIDE_FILE: &str = "/etc/caudra/caudra.toml";
     const READ_CONTRACT: &str = "file.read.v1";
@@ -1443,6 +1528,7 @@ pub(super) mod tests {
     const HASH_TAG_DIGITS: usize = 8;
     const ADVISORY_PROBABILITY: f64 = 0.875;
     const DELETE_CAUTION: &str = "May delete files (88%)";
+    const BARE_RUNG: &str = "cargo *";
     pub(crate) const INTERNAL_TERMS: [&str; 12] = [
         "SHA-256",
         "sha256",
@@ -1620,16 +1706,19 @@ pub(super) mod tests {
         request
     }
 
-    /// A request the way plan mode sends it: every rung lasts this
-    /// conversation at most.
+    /// A request the way plan mode sends it: no allow lasts for all
+    /// projects, and a broad one lasts this conversation at most.
     pub(crate) fn planning(mut request: PermissionRequest) -> PermissionRequest {
         request.presentation.reason = PromptReason::Plan;
         for option in &mut request.options {
-            option.allowed_lifetimes.retain(|lifetime| {
-                matches!(
-                    lifetime,
-                    PermissionLifetime::Once | PermissionLifetime::Conversation
-                )
+            if option.rule.effect != StructuredPermissionEffect::Allow {
+                continue;
+            }
+            let broad = option.confirmation.is_some();
+            option.allowed_lifetimes.retain(|lifetime| match lifetime {
+                PermissionLifetime::Once | PermissionLifetime::Conversation => true,
+                PermissionLifetime::Project => !broad,
+                PermissionLifetime::Global => false,
             });
         }
         request
@@ -1690,6 +1779,9 @@ pub(super) mod tests {
         let mut details = shell_prompt(SINGLE_COMMAND);
         details.toggle_details();
         surfaces.push(("details", details));
+        let mut batch_details = prompt_for(batch_request());
+        batch_details.toggle_details();
+        surfaces.push(("batch-details", batch_details));
         let mut page = prompt_for(batch_request());
         page.open_step_through();
         surfaces.push(("page", page));
@@ -1783,7 +1875,7 @@ pub(super) mod tests {
     #[test]
     fn common_prompts_fit_80x24_without_scrolling() {
         for (name, mut prompt) in surfaces() {
-            if matches!(name, "details" | "advanced") {
+            if matches!(name, "details" | "batch-details" | "advanced") {
                 continue;
             }
             let rows = buffer_rows(&themed_buffer(
@@ -1842,15 +1934,16 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn plan_mode_drops_the_project_choice_and_says_why() {
+    fn plan_mode_keeps_the_project_choice_and_says_why() {
         let mut prompt = prompt_for(planning(native_shell_request(SINGLE_COMMAND)));
         let text = screen(&mut prompt, FIT_WIDTH, FIT_HEIGHT);
-        assert!(
-            text.contains("3. No, and tell the agent what to do instead"),
-            "{text}"
-        );
-        assert!(!text.contains("in this project"), "{text}");
-        assert!(text.contains(super::super::notes::PLAN_NOTE), "{text}");
+        for line in [
+            "in this project",
+            "4. No, and tell the agent what to do instead",
+            super::super::notes::PLAN_NOTE,
+        ] {
+            assert!(text.contains(line), "{line}\n{text}");
+        }
     }
 
     #[test]
@@ -1895,6 +1988,23 @@ pub(super) mod tests {
         assert_eq!(rows.len(), 2, "{text}");
         assert!(rows.iter().all(|row| row.contains("read-only")), "{text}");
         assert!(text.contains("3 of 6 new"), "{text}");
+    }
+
+    #[test]
+    fn opaque_batches_count_every_uncovered_row_as_new() {
+        let mut line = command_resource(&DYNAMIC_ROWS.join(" && "));
+        line.protected = true;
+        line.requires_prompt = true;
+        line.attributes
+            .insert(OPACITY_ATTRIBUTE.into(), ShellOpacity::Dynamic.to_string());
+        let mut resources: Vec<_> = DYNAMIC_ROWS
+            .iter()
+            .map(|command| command_resource(command))
+            .collect();
+        resources.push(line);
+        let mut prompt = prompt_for(shell_request(&DYNAMIC_ROWS.join(" && "), resources));
+        let text = screen(&mut prompt, FIT_WIDTH, FIT_HEIGHT);
+        assert!(text.contains("2 of 2 new"), "{text}");
     }
 
     #[test]
@@ -1974,6 +2084,120 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn colours_leave_every_surface_word_for_word() {
+        let draw = || {
+            surfaces()
+                .into_iter()
+                .map(|(name, mut prompt)| (name, screen(&mut prompt, FIT_WIDTH, ROOMY_HEIGHT)))
+                .collect::<Vec<_>>()
+        };
+        let plain = draw();
+        coloured();
+        assert_eq!(draw(), plain);
+    }
+
+    #[test]
+    fn a_heredoc_body_is_drawn_in_the_language_it_feeds() {
+        coloured();
+        let python = syntax_colour(PYTHON_SYNTAX, HEREDOC_BODY, PYTHON_KEYWORD);
+        assert_ne!(
+            python,
+            syntax_colour(SHELL_SYNTAX, HEREDOC_BODY, PYTHON_KEYWORD),
+            "{NOT_TOLD_APART}"
+        );
+        let mut prompt = prompt_for(heredoc_request());
+        let buffer = themed_buffer(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT, &theme::current());
+        assert_drawn_in(&buffer, PYTHON_KEYWORD, 0, python);
+    }
+
+    /// The named surface drawn roomy, colours on.
+    fn coloured_surface(name: &str) -> Buffer {
+        coloured();
+        let (_, mut prompt) = surfaces()
+            .into_iter()
+            .find(|(surface, _)| *surface == name)
+            .unwrap();
+        themed_buffer(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT, &theme::current())
+    }
+
+    /// The colour shell gives `command`'s program.
+    fn program_colour(command: &str) -> Option<Color> {
+        coloured();
+        let program = command.split_whitespace().next().unwrap_or_default();
+        let colour = syntax_colour(SHELL_SYNTAX, command, program);
+        assert!(colour.is_some(), "{NOT_COLOURED}");
+        colour
+    }
+
+    /// What `before` a command tells which part of a surface shows it.
+    #[test_case("single", "", SINGLE_COMMAND; "request")]
+    #[test_case("single", "‹", "cargo test *"; "remembered_scope")]
+    #[test_case("batch", "", "rm -rf target/tmp"; "batch_rows")]
+    #[test_case("batch", "‹", "cargo fmt *"; "row_scope")]
+    #[test_case("customize", "", "cargo test -p caudra-agent *"; "customize_scope")]
+    #[test_case("details", "‹", "cargo test *"; "details_scope")]
+    #[test_case("details", "`", "cargo test"; "details_sentence")]
+    #[test_case("batch-details", "‹", "cargo fmt *"; "details_row_scope")]
+    #[test_case("batch-details", "`", "rg -n TODO src"; "details_allowed")]
+    #[test_case("batch-details", "`", "git push origin HEAD"; "details_asks")]
+    #[test_case("page", "", "cargo fmt -p caudra-agent"; "page_command")]
+    #[test_case("page", "3. ", "cargo fmt *"; "page_scope")]
+    #[test_case("review", "", "rm -rf target/tmp"; "review_command")]
+    #[test_case("review", "", "cargo clippy *"; "review_scope")]
+    fn commands_are_drawn_in_shell_colours(surface: &str, before: &str, command: &str) {
+        assert_drawn_in(
+            &coloured_surface(surface),
+            &format!("{before}{command}"),
+            before.chars().count(),
+            program_colour(command),
+        );
+    }
+
+    /// What will run comes first in Details. The tool's input, further down,
+    /// lists the same command as raw words.
+    #[test]
+    fn details_draw_what_will_run_in_shell_colours() {
+        let places = drawn_colours(&coloured_surface("details"), SINGLE_COMMAND);
+        assert_eq!(
+            places.first().and_then(|colours| colours.first()).copied(),
+            program_colour(SINGLE_COMMAND)
+        );
+    }
+
+    /// A scope named in words is drawn in one colour wherever it shows.
+    #[test_case("caution", "‹this exact command›"; "choice")]
+    #[test_case("batch", "‹this exact command›"; "row_scope")]
+    #[test_case("batch-details", "‹this exact command›"; "details_row_scope")]
+    #[test_case("fetch", "‹this page and below›"; "page_scope")]
+    fn scopes_in_words_stay_words(surface: &str, scope: &str) {
+        let places = drawn_colours(&coloured_surface(surface), scope);
+        assert!(!places.is_empty(), "{scope}\n{surface}");
+        for colours in places {
+            assert!(
+                colours.iter().all(|colour| *colour == colours[0]),
+                "{scope}: {colours:?}"
+            );
+        }
+    }
+
+    /// Colours change nothing in a prompt that runs no command.
+    #[test_case(false; "prompt")]
+    #[test_case(true; "details")]
+    fn only_commands_take_shell_colours(details: bool) {
+        theme::set(theme::load_by_name(COLOUR_THEME).unwrap());
+        let draw = || {
+            let mut prompt = prompt_for(fetch_request());
+            if details {
+                prompt.toggle_details();
+            }
+            themed_buffer(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT, &theme::current())
+        };
+        let plain = draw();
+        coloured();
+        assert_eq!(draw(), plain);
+    }
+
+    #[test]
     fn details_drop_hashes_and_name_the_tool() {
         let mut prompt = shell_prompt(SINGLE_COMMAND);
         prompt.toggle_details();
@@ -1997,5 +2221,22 @@ pub(super) mod tests {
         }
         assert!(text.contains("(this project)"), "{text}");
         assert_plain(&rows, "details");
+    }
+
+    /// The bare executable is the one rung of a command's ladder that needs
+    /// confirming, so a page marks it the way Customize does.
+    #[test_case("customize"; "customize")]
+    #[test_case("page"; "page")]
+    fn the_bare_rung_is_marked_broad(surface: &str) {
+        let (_, mut prompt) = surfaces()
+            .into_iter()
+            .find(|(name, _)| *name == surface)
+            .unwrap();
+        let text = screen(&mut prompt, FIT_WIDTH, FIT_HEIGHT);
+        let rung = text
+            .lines()
+            .find(|line| line.contains(BARE_RUNG))
+            .unwrap_or_else(|| panic!("{BARE_RUNG} is not listed\n{text}"));
+        assert!(rung.contains(BROAD), "{rung}");
     }
 }

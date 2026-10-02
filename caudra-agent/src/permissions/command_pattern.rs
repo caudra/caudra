@@ -1,5 +1,6 @@
 use thiserror::Error;
 
+use super::executables::runs_given_code;
 use super::structured::{BROAD_SHELL_PHRASE, PermissionCaution};
 
 pub(super) const MAX_PATTERN_TOKENS: usize = 8;
@@ -176,6 +177,73 @@ pub(crate) fn reusable_prefix(command: &str) -> Option<String> {
 
     let pattern = format!("{}{WILDCARD_SUFFIX}", literals.join(" "));
     matches(&pattern, command).then_some(pattern)
+}
+
+/// Every prefix of a command a rung can widen to, longest first, so a scope
+/// grows one unit at a time out to the bare executable.
+///
+/// A unit is the executable, a `--flag=value`, a flag with its value, a lone
+/// flag, or an operand, so no rung splits a flag from its value. The word
+/// after a flag is its value when it is no flag itself and holds no `/` or
+/// `.`, which keeps `--edition 2024` together and `--check f.rs` apart.
+/// Decoding stops where `reusable_prefix` stops, and the bare executable is
+/// offered only when the words after it cannot be code it runs.
+pub(crate) fn ancestor_prefixes(command: &str) -> Vec<String> {
+    let Some(tokens) = tokenize(command) else {
+        return Vec::new();
+    };
+    let decoded: Vec<String> = tokens
+        .iter()
+        .map_while(|token| decode_static_token(token))
+        .collect();
+    let literals: Vec<&str> = decoded
+        .iter()
+        .map(String::as_str)
+        .take_while(|token| is_pattern_literal(token))
+        .collect();
+    let Some(executable) = literals.first() else {
+        return Vec::new();
+    };
+    if !sed_prefix_is_offerable(&decoded) {
+        return Vec::new();
+    }
+    let bare = !runs_given_code(executable.rsplit('/').next().unwrap_or(executable));
+    let mut ends = unit_ends(&literals);
+    if literals.len() == tokens.len() {
+        ends.pop();
+    }
+    ends.into_iter()
+        .rev()
+        .map(|end| &literals[..end])
+        .filter(|prefix| {
+            (bare || prefix.len() > 1)
+                && prefix.len() < MAX_PATTERN_TOKENS
+                && !overlaps_builtin_ask(prefix)
+        })
+        .map(|prefix| format!("{}{WILDCARD_SUFFIX}", prefix.join(" ")))
+        .filter(|pattern| matches(pattern, command))
+        .collect()
+}
+
+/// How many words each successive unit of a command ends after.
+fn unit_ends(words: &[&str]) -> Vec<usize> {
+    let mut ends = vec![1];
+    let mut end = 1;
+    while let Some(word) = words.get(end) {
+        end += 1;
+        if word.starts_with('-')
+            && !word.contains('=')
+            && words.get(end).is_some_and(|value| is_flag_value(value))
+        {
+            end += 1;
+        }
+        ends.push(end);
+    }
+    ends
+}
+
+fn is_flag_value(word: &str) -> bool {
+    !word.starts_with('-') && !word.contains(['/', '.'])
 }
 
 /// A curated entry is a deliberate decision, so it may keep a bare executable or
@@ -424,11 +492,24 @@ mod tests {
 
     use super::{
         BROAD_SHELL_PHRASE, BUILTIN_ALLOW_PATTERNS, BUILTIN_ASK_PATTERNS, PatternFault,
-        PatternGrade, PermissionCaution, builtin_allowed, grade_command_pattern, matches,
-        reusable_prefix, specificity, tokenize,
+        PatternGrade, PermissionCaution, ancestor_prefixes, builtin_allowed, grade_command_pattern,
+        matches, reusable_prefix, specificity, tokenize,
     };
 
     const SED_SLICE: &str = "sed -n 1,140p src/main.rs";
+
+    #[test_case("rustfmt --edition 2024 --check f.rs", &["rustfmt --edition 2024 --check *", "rustfmt --edition 2024 *", "rustfmt *"] ; "a_flag_keeps_its_value")]
+    #[test_case("git log -1 --format='%h %ci'", &["git log -1 *", "git log *"] ; "a_word_no_pattern_holds_ends_the_ladder")]
+    #[test_case("docker -H tcp://h run x", &["docker -H tcp://h run *", "docker -H tcp://h *", "docker -H *", "docker *"] ; "a_path_is_no_flag_value")]
+    #[test_case("python3 x.py", &[] ; "an_interpreter_has_no_bare_rung")]
+    #[test_case("python3 -m pytest tests/", &["python3 -m pytest *"] ; "an_interpreter_keeps_its_module")]
+    #[test_case(SED_SLICE, &["sed -n *"] ; "a_sed_script_that_only_prints")]
+    #[test_case("sed -i s/a/b/ f.rs", &[] ; "a_sed_script_that_writes")]
+    #[test_case("git push origin main", &[] ; "an_ask_family_is_never_widened")]
+    #[test_case("ls", &[] ; "a_lone_executable_has_no_ancestor")]
+    fn ancestors_widen_one_unit_at_a_time(command: &str, expected: &[&str]) {
+        assert_eq!(ancestor_prefixes(command), expected);
+    }
 
     #[test_case("sed -n *", SED_SLICE, None ; "flag_prefix_is_plain")]
     #[test_case("sed *", SED_SLICE, Some(PermissionCaution::Danger) ; "bare_executable_is_grave")]

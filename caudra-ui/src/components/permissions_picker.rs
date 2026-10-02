@@ -28,13 +28,14 @@ use std::sync::Arc;
 use unicode_width::UnicodeWidthStr;
 
 use crate::PatternDiscoveryOutcome;
+use crate::components::command_text::{code_spans_in, pattern_spans};
 use crate::components::keybindings::Bind;
 use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::components::modal::{CHROME_LINES, FooterHits, FooterLine, Modal};
 use crate::components::permission_prompt::{
-    lifetime_phrase, origin_word, pattern_summary, rule_phrase, rule_summary, slot_name, tilde,
-    tool_words,
+    lifetime_phrase, origin_word, pattern_summary, rule_names_commands, rule_phrase, rule_summary,
+    slot_name, tilde, tool_words,
 };
 use crate::components::permission_scope::editor::{EditorEvent, EditorLaunch, ScopeEditor};
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
@@ -291,6 +292,29 @@ impl PickerItem for PermissionEntry {
             (_, StructuredPermissionEffect::Deny) => theme.tool_error,
         };
         Some((effect_word(&effect).len(), style))
+    }
+
+    /// A stored rule that names one command draws it as shell after its
+    /// effect word.
+    fn label_colours(&self) -> Option<Vec<Span<'static>>> {
+        let PickerEntry::Stored(record) = &self.source else {
+            return None;
+        };
+        if !rule_names_commands(&record.rule, record.review.as_ref()) {
+            return None;
+        }
+        let (lead, style) = self.lead()?;
+        let phrase = EFFECT_WIDTH + EFFECT_GAP.len();
+        let mut spans = vec![
+            Span::styled(self.label.get(..lead)?.to_owned(), style),
+            Span::raw(self.label.get(lead..phrase)?.to_owned()),
+        ];
+        spans.extend(pattern_spans(
+            self.label.get(phrase..)?,
+            Style::default(),
+            theme::current().accent,
+        ));
+        Some(spans)
     }
 
     fn section(&self) -> Option<&str> {
@@ -1759,6 +1783,12 @@ fn summary_lines(entry: &PermissionEntry, current: Option<&Path>) -> Vec<Line<'s
     let title =
         |text: String| Line::styled(display_text(&text, MAX_DISPLAY_CHARS), theme.panel_title);
     let plain = |text: &str| Line::from(display_text(text, MAX_DISPLAY_CHARS));
+    let sentence = |text: &str| {
+        Line::from(code_spans_in(
+            &display_text(text, MAX_DISPLAY_CHARS),
+            Style::default(),
+        ))
+    };
     let muted =
         |text: String| Line::styled(display_text(&text, MAX_DISPLAY_CHARS), theme.item_desc);
     match &entry.source {
@@ -1773,7 +1803,7 @@ fn summary_lines(entry: &PermissionEntry, current: Option<&Path>) -> Vec<Line<'s
                 rule_summary(&record.rule, review, current)
                     .lines
                     .iter()
-                    .map(|line| plain(line)),
+                    .map(|line| sentence(line)),
             );
             if let Some(input) = review.and_then(|review| review.input.as_ref())
                 && let Some(fixed) = fixed_input(&record.rule.arguments, input)
@@ -1812,13 +1842,20 @@ fn summary_lines(entry: &PermissionEntry, current: Option<&Path>) -> Vec<Line<'s
         PickerEntry::Discovered(candidate) => {
             let mut lines = vec![
                 title(seen_phrase(&candidate.evidence)),
-                plain(&suggestion_template(&candidate.definition, None)),
+                Line::from(pattern_spans(
+                    &display_text(
+                        &suggestion_template(&candidate.definition, None),
+                        MAX_DISPLAY_CHARS,
+                    ),
+                    Style::default(),
+                    theme.accent,
+                )),
             ];
             lines.extend(
                 pattern_summary(&candidate.definition)
                     .lines
                     .iter()
-                    .map(|line| plain(line)),
+                    .map(|line| sentence(line)),
             );
             lines.push(Line::default());
             lines.push(muted(
@@ -2104,6 +2141,9 @@ mod tests {
     use test_case::test_case;
     use unicode_width::UnicodeWidthStr;
 
+    use crate::components::command_text::tests::{
+        NOT_COLOURED, SHELL_SYNTAX, assert_drawn_in, coloured, syntax_colour,
+    };
     use crate::components::permission_prompt::{
         MISSING_SCOPE, THEMES, WIDTHS, assert_plain, buffer_rows,
     };
@@ -2115,7 +2155,7 @@ mod tests {
         DISCOVERY_LOADING, DISCOVERY_WARNING, DiscoveryState, FIXED_INPUT, INACTIVE,
         INACTIVE_ALLOW, MAX_DISPLAY_CHARS, MAX_FIELD_CHARS, MAX_SUGGESTION_DETAIL_CHARS,
         NATIVE_SOURCE, NOT_TRUSTED, OMITTED, PROJECT_CONFIG, PermissionEntry, PermissionsMode,
-        PermissionsPicker, PermissionsPickerAction, PickerAction, ProjectConfigAction,
+        PermissionsPicker, PermissionsPickerAction, PickerAction, PickerEntry, ProjectConfigAction,
         REVIEW_SECTION, REVOKE_CAUTION, SCROLLBAR_WIDTH, SUGGESTED_GUIDANCE, SUGGESTED_SECTION,
         TRUST_HINT, TRUST_MESSAGE, UNTRUSTED_CONFIG, display_text, entry, project_config_entry,
         suggestion_entry, summary_lines,
@@ -2125,6 +2165,7 @@ mod tests {
     const FILE: &str = "/project/src/main.rs";
     const PATTERN: &str = "**/*.{rs,toml}";
     const COMMAND: &str = "git status --short";
+    const COMMAND_PROGRAM: &str = "git";
     const COMMAND_PATTERN: &str = "git status *";
     const SECRET: &str = "top-secret";
     const REDACTED: &str = "[redacted]";
@@ -2149,6 +2190,7 @@ mod tests {
     const HISTORICAL_ASSUMPTIONS: &str = "Analysis assumes standard Bash startup";
     const HISTORICAL_PROJECT: &str = "current stored cwd approximates its historical project";
     const NARROW_WIDTH: u16 = 40;
+    const WIDE_WIDTH: u16 = 140;
     const SHORT_HEIGHT: u16 = 12;
     const LONG_WORD_REPEATS: usize = 24;
     const NAV_LABELS: [&str; 3] = ["short-rule", "long-rule", "last-rule"];
@@ -3444,6 +3486,31 @@ mod tests {
         discover.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::CONTROL));
         capture("evidence", &mut discover);
         surfaces
+    }
+
+    #[test]
+    fn colours_leave_every_manager_surface_word_for_word() {
+        let plain = manager_surfaces(WIDE_WIDTH);
+        coloured();
+        assert_eq!(manager_surfaces(WIDE_WIDTH), plain);
+    }
+
+    /// The rule's row is left unselected, since a selected row is drawn in
+    /// the selection's colours.
+    #[test]
+    fn stored_commands_are_drawn_in_shell_colours() {
+        coloured();
+        let shell = syntax_colour(SHELL_SYNTAX, COMMAND, COMMAND_PROGRAM);
+        assert!(shell.is_some(), "{NOT_COLOURED}");
+        let mut picker = sentence_picker();
+        let entries = picker.visible_entries();
+        let stored = entries
+            .iter()
+            .position(|entry| matches!(entry.source, PickerEntry::Stored(_)))
+            .unwrap();
+        picker.picker.select((stored + 1) % entries.len());
+        let buffer = export_buffer(&mut picker, WIDE_WIDTH, MANAGER_TEST_HEIGHT);
+        assert_drawn_in(&buffer, COMMAND, 0, shell);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use super::PermissionPrompt;
 use super::details::{mask_secrets, redact_url_query, review_lines, review_text};
 use super::scope::requested_action;
 
-pub(super) const PLAN_NOTE: &str = "While planning, approvals last for this conversation.";
+pub(super) const PLAN_NOTE: &str = "Plan mode asks before anything it can't prove read-only.";
 const PROTECTED_NOTE: &str = "Touches protected files such as keys and settings";
 const OUTSIDE_REPOSITORY: &str = "Outside this repository";
 const OUTSIDE_HOME: &str = "Outside your home directory";
@@ -163,14 +163,18 @@ fn outside_project(request: &PermissionRequest, path: &str) -> bool {
         .is_none_or(|project| !Path::new(path).starts_with(project))
 }
 
+/// Whether the request runs commands, whose text is drawn as shell.
+pub(super) fn is_shell(request: &PermissionRequest) -> bool {
+    request
+        .resources
+        .iter()
+        .any(|resource| resource.kind == PermissionResourceKind::Command)
+}
+
 /// The literal request a prompt asks about: the command line with its own
 /// line breaks, the URL, the paths, or the tool and its arguments.
 pub(super) fn action_lines(request: &PermissionRequest) -> Vec<String> {
-    let shell = request
-        .resources
-        .iter()
-        .any(|resource| resource.kind == PermissionResourceKind::Command);
-    if shell {
+    if is_shell(request) {
         return review_lines(&requested_action(request));
     }
     let paths: Vec<String> = request

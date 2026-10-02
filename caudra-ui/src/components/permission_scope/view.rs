@@ -8,7 +8,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent,
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget, Wrap};
 use unicode_width::UnicodeWidthStr;
 
@@ -18,6 +18,7 @@ use super::model::{
     selector_mode, selector_value,
 };
 use super::pattern::{EVIDENCE_LABEL, INDEPENDENT_VALUES, SAME_VALUE};
+use crate::components::command_text::scope_spans;
 use crate::theme::Theme;
 
 pub(crate) const ALLOWED_COMBINATIONS: &str = "Allowed combinations";
@@ -358,28 +359,30 @@ impl ScopeView {
                         theme.item
                     };
                     buffer.set_style(row, style);
-                    let cells = [
-                        format!(
-                            "{} {}/{}",
-                            index + 1,
-                            resource_kind(&resource.kind),
-                            access_name(resource.access.as_ref())
-                        ),
-                        selector_mode(&resource.selector).into(),
-                        model.target_text(index),
-                        format!("{} conditions", resource.attributes.len() + 2),
-                    ];
+                    let kind = format!(
+                        "{} {}/{}",
+                        index + 1,
+                        resource_kind(&resource.kind),
+                        access_name(resource.access.as_ref())
+                    );
+                    let mode = selector_mode(&resource.selector);
+                    let target = target_spans(model, index, style, theme);
                     if wide {
+                        let cells = [
+                            Line::from(kind),
+                            Line::from(mode),
+                            Line::from(target),
+                            Line::from(format!("{} conditions", resource.attributes.len() + 2)),
+                        ];
                         for (column, value) in target_columns(row).into_iter().zip(cells) {
                             Paragraph::new(value).style(style).render(column, buffer);
                         }
                     } else {
-                        Paragraph::new(vec![
-                            Line::from(cells[0].clone()),
-                            Line::from(format!("{} · {}", cells[1], cells[2])),
-                        ])
-                        .style(style)
-                        .render(row, buffer);
+                        let mut second = vec![Span::raw(format!("{mode} · "))];
+                        second.extend(target);
+                        Paragraph::new(vec![Line::from(kind), Line::from(second)])
+                            .style(style)
+                            .render(row, buffer);
                     }
                     self.hits.push(ScopeHit {
                         area: row,
@@ -422,7 +425,7 @@ impl ScopeView {
                 .saturating_sub(footer_height),
             ..area
         };
-        let rows = properties.unwrap_or_else(|| self.properties(model));
+        let rows = properties.unwrap_or_else(|| self.properties(model, theme));
         let paragraph = Paragraph::new(rows)
             .style(theme.item)
             .wrap(Wrap { trim: false });
@@ -578,7 +581,7 @@ impl ScopeView {
         *y = (*y).saturating_add(1).min(area.bottom());
     }
 
-    fn properties(&self, model: &ScopeModel) -> Vec<Line<'static>> {
+    fn properties(&self, model: &ScopeModel, theme: &Theme) -> Vec<Line<'static>> {
         match self.disclosure {
             Some(Disclosure::Identity) => identity_rows(model, self.target),
             Some(Disclosure::Evidence) => evidence_rows(model),
@@ -605,11 +608,12 @@ impl ScopeView {
                             self.target + 1,
                             resource_kind(&resource.kind)
                         )));
-                        rows.push(Line::from(format!(
-                            "{}  {}",
-                            selector_mode(&resource.selector),
-                            model.target_text(self.target)
-                        )));
+                        let mut target = vec![Span::raw(format!(
+                            "{}  ",
+                            selector_mode(&resource.selector)
+                        ))];
+                        target.extend(target_spans(model, self.target, Style::default(), theme));
+                        rows.push(Line::from(target));
                         rows.push(Line::from(format!(
                             "Access {}  ·  Protection {}",
                             access_name(resource.access.as_ref()),
@@ -643,6 +647,21 @@ impl ScopeView {
             }
         }
     }
+}
+
+/// A target's value in `style`, a command pattern drawn as shell.
+fn target_spans(
+    model: &ScopeModel,
+    index: usize,
+    style: Style,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    scope_spans(
+        &model.target_text(index),
+        style,
+        theme.accent,
+        model.target_is_command(index),
+    )
 }
 
 fn warning_paragraph(model: &ScopeModel) -> Paragraph<'static> {

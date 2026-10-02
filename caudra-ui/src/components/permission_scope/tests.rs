@@ -34,6 +34,9 @@ use super::model::{
 };
 use super::view::{ALLOWED_COMBINATIONS, Disclosure, ScopeControl, ScopeView};
 use crate::components::buffer_text;
+use crate::components::command_text::tests::{
+    COLOUR_THEME, NOT_COLOURED, SHELL_SYNTAX, assert_drawn_in, coloured, syntax_colour,
+};
 use crate::components::permission_prompt::{assert_plain, buffer_rows};
 use crate::theme;
 
@@ -53,6 +56,9 @@ const PAGE_UP: &str = "[PgUp]";
 const PAGE_DOWN: &str = "[PgDn]";
 const ALL_OF_TARGET: &str = "Target 1 · Command · all of:";
 const ANY_OF_TARGETS: &str = "Targets (1) · any of:";
+const COMMAND_PATTERN: &str = "cargo test *";
+const COMMAND_PROGRAM: &str = "cargo";
+const WIDE_WIDTH: u16 = 140;
 
 fn mixed_risk_record() -> PermissionRuleRecord {
     let mut record = record(true);
@@ -370,6 +376,20 @@ fn authority_is_typed_not_reconstructed_from_review(template_rule: bool) {
     let mut view = ScopeView::default();
     view.disclosure = Some(Disclosure::Evidence);
     assert!(buffer_text(&render(&model, &mut view, 80, "ayu_dark")).contains(DISPLAY_ONLY));
+}
+
+#[test]
+fn command_pattern_targets_are_drawn_in_shell_colours() {
+    coloured();
+    let shell = syntax_colour(SHELL_SYNTAX, COMMAND_PATTERN, COMMAND_PROGRAM);
+    assert!(shell.is_some(), "{NOT_COLOURED}");
+    let mut record = record(false);
+    record.rule.resources[0].selector = PermissionResourceSelector::CommandPattern {
+        pattern: COMMAND_PATTERN.into(),
+    };
+    let model = ScopeModel::record(Arc::new(record));
+    let buffer = render(&model, &mut ScopeView::default(), WIDE_WIDTH, COLOUR_THEME);
+    assert_drawn_in(&buffer, COMMAND_PATTERN, 0, shell);
 }
 
 #[test_case(40; "narrow")]

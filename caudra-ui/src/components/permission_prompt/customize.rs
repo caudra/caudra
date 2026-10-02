@@ -4,8 +4,8 @@ use caudra_agent::permissions::{
     StructuredPermissionEffect, grade_command_pattern,
 };
 
-use super::choices::grant_label;
-use super::decision::{default_grant, grant_option, row_ladder, step};
+use super::choices::{grant_label, grant_names_commands};
+use super::decision::{default_grant, grant_option, row_ladder, row_lifetimes, step};
 use super::details::review_text;
 use super::scope::option_summary;
 use super::{Panel, PermissionDecision, PermissionPrompt, PromptState, front_request};
@@ -16,7 +16,7 @@ const EXACT_CALL: &str = "allow_exact";
 pub(super) const OWN_PATTERN_ITEM: &str = "your own pattern…";
 const EXACT_SCRIPT: &str = "this exact script";
 const SUGGESTED: &str = "suggested";
-const BROAD: &str = "⚠ broad";
+pub(super) const BROAD: &str = "⚠ broad";
 const INCOMPLETE: &str = "can't show everything";
 
 /// Whether Customize allows or refuses.
@@ -181,15 +181,28 @@ fn selectable(request: &PermissionRequest, row: Option<usize>, item: &ScopeItem)
 }
 
 impl Customize {
+    /// Whether the chosen scope is broad enough to need confirming.
+    pub(super) fn broad(&self, request: &PermissionRequest) -> bool {
+        item_option(request, self.row, &self.chosen)
+            .is_some_and(|option| option.confirmation.is_some())
+            || matches!(
+                (&self.chosen, self.row),
+                (ScopeItem::Row(grant), Some(row)) if request.broad_written_grant(row, grant)
+            )
+    }
+
     /// The lifetimes the chosen effect and scope allow, `Once` first.
     fn lifetimes(&self, request: &PermissionRequest, project: bool) -> Vec<PermissionLifetime> {
         let durable = match self.effect {
             Effect::Deny => option(request, DENY_EXACT)
                 .map(|option| option.allowed_lifetimes.clone())
                 .unwrap_or_default(),
-            Effect::Allow => item_option(request, self.row, &self.chosen)
-                .map(|option| option.allowed_lifetimes.clone())
-                .unwrap_or_default(),
+            Effect::Allow => match (&self.chosen, self.row) {
+                (ScopeItem::Row(grant), Some(row)) => row_lifetimes(request, row, grant),
+                _ => item_option(request, self.row, &self.chosen)
+                    .map(|option| option.allowed_lifetimes.clone())
+                    .unwrap_or_default(),
+            },
         };
         let mut lifetimes = vec![PermissionLifetime::Once];
         lifetimes.extend(
@@ -292,23 +305,45 @@ pub(super) fn scope_item_label(
             .map(|option| review_text(&option.label))
             .unwrap_or_default(),
     };
-    let mut badges = Vec::new();
-    if let Some(option) = item_option(request, customize.row, item) {
-        if option.id.starts_with(COMMAND_TEMPLATE_PREFIX) {
-            badges.push(SUGGESTED.into());
-        }
-        if let Some(seen) = option.seen {
-            badges.push(format!("seen {seen}×"));
-        }
-        if option.confirmation.is_some() {
-            badges.push(BROAD.into());
-        }
-    }
+    let mut badges = item_option(request, customize.row, item)
+        .map(option_badges)
+        .unwrap_or_default();
     let selectable = selectable(request, customize.row, item);
     if !selectable {
         badges.push(INCOMPLETE.into());
     }
     (label, badges, selectable)
+}
+
+/// What a listed scope is marked with: where it came from, and whether it
+/// is broad enough to be confirmed before it is stored.
+pub(super) fn option_badges(option: &PermissionRuleOption) -> Vec<String> {
+    let mut badges = Vec::new();
+    if option.id.starts_with(COMMAND_TEMPLATE_PREFIX) {
+        badges.push(SUGGESTED.into());
+    }
+    if let Some(seen) = option.seen {
+        badges.push(format!("seen {seen}×"));
+    }
+    if option.confirmation.is_some() {
+        badges.push(BROAD.into());
+    }
+    badges
+}
+
+/// Whether a listed scope names commands, which reads as shell. Only a row's
+/// rung can, as a scope for the whole request is named in words.
+pub(super) fn scope_item_names_commands(
+    request: &PermissionRequest,
+    customize: &Customize,
+    item: &ScopeItem,
+) -> bool {
+    match item {
+        ScopeItem::Row(grant) => customize
+            .row
+            .is_some_and(|row| grant_names_commands(request, row, grant)),
+        ScopeItem::OwnPattern | ScopeItem::Whole(_) => false,
+    }
 }
 
 impl PermissionPrompt {
@@ -328,14 +363,19 @@ impl PermissionPrompt {
         }
     }
 
-    /// Opens Customize in place of the choices: for the one command's own
-    /// ladder, or, from Review or on a line no row can remember, for the
-    /// whole script.
+    /// Opens Customize in place of the choices: for the focused command's own
+    /// ladder, or the only new one's, or, from Review or on a line no row can
+    /// remember, for the whole script.
     pub(super) fn open_customize(&mut self, from_review: bool) {
-        let listed = self.listed_rows();
-        let row = match listed.as_slice() {
-            [row] if !from_review && self.per_row() && self.is_new_row(*row) => Some(*row),
-            _ => None,
+        let row = if from_review {
+            None
+        } else {
+            self.focus_row
+                .filter(|row| self.is_new_row(*row))
+                .or_else(|| match self.new_rows().as_slice() {
+                    [row] => Some(*row),
+                    _ => None,
+                })
         };
         let chosen = match row {
             Some(row) => self.row_grant(row).map(ScopeItem::Row),

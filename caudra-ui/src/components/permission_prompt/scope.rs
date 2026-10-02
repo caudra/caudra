@@ -328,6 +328,24 @@ pub(crate) fn rule_summary(
     summary
 }
 
+/// Whether a rule's row phrase is one command, which reads as shell: a single
+/// command resource whose value and starting folder could both be shown.
+pub(crate) fn rule_names_commands(
+    rule: &StructuredPermissionRule,
+    review: Option<&PermissionReview>,
+) -> bool {
+    let [resource] = rule.resources.as_slice() else {
+        return false;
+    };
+    let shown = shown(review, 0);
+    resource.kind == PermissionResourceKind::Command
+        && matches!(
+            reach(resource, shown),
+            Reach::Exact(_) | Reach::Pattern(_) | Reach::Template(_) | Reach::Prefix(_)
+        )
+        && !matches!(start(resource, shown), Start::Hidden)
+}
+
 /// A rule's scope the way a list row names it. A command started outside
 /// `binding`, the project the rule belongs to, names its folder.
 pub(crate) fn rule_phrase(

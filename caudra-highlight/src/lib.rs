@@ -9,7 +9,14 @@ use syntect::highlighting::{
 use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 use syntect::util::LinesWithEndings;
 
+use heredoc::Embedding;
+
+mod heredoc;
+
 const TOKEN_ALIASES: &[(&str, &str)] = &[("jsx", "js")];
+/// Every shell grammar's scope starts with this, and only shell lines can
+/// hand a heredoc body to another language.
+const SHELL_SCOPE: &str = "source.shell";
 pub const TAB_SPACES: &str = "  ";
 
 type Rgb = (u8, u8, u8);
@@ -104,16 +111,73 @@ pub fn syntax_for_token(lang: &str) -> &'static SyntaxReference {
 
 pub struct Highlighter {
     theme: Arc<Theme>,
-    parse_state: ParseState,
-    highlight_state: HighlightState,
+    state: HighlighterState,
+}
+
+/// Everything a highlighter carries from one line to the next.
+#[derive(Clone)]
+pub struct HighlighterState {
+    parse: ParseState,
+    highlight: HighlightState,
+    /// `None` outside the shell grammars, the only ones that hand lines to
+    /// another language.
+    embedding: Option<Embedding>,
+}
+
+impl HighlighterState {
+    /// One line through its grammar. Inside a heredoc body written in another
+    /// language the colours come from that language, but the shell grammar
+    /// still reads the line, so it is where it should be when the body ends.
+    fn raw_highlight_line<'a>(
+        &mut self,
+        syn_hl: &SynHighlighter,
+        text: &'a str,
+    ) -> Result<Vec<(SynStyle, &'a str)>, syntect::Error> {
+        let set = syntax_set();
+        let ops = self.parse.parse_line(text, set)?;
+        let ranges = HighlightIterator::new(&mut self.highlight, &ops, text, syn_hl);
+        let Some(embedding) = &mut self.embedding else {
+            return Ok(ranges.collect());
+        };
+        if let Embedding::Heredoc(heredoc) = embedding
+            && !heredoc.closed_by(text)
+        {
+            let Some((parse, highlight)) = &mut heredoc.body else {
+                return Ok(ranges.collect());
+            };
+            ranges.for_each(drop);
+            let ops = parse.parse_line(text, set)?;
+            return Ok(HighlightIterator::new(highlight, &ops, text, syn_hl).collect());
+        }
+        let ranges = ranges.collect();
+        *embedding = Embedding::after(text, syn_hl);
+        Ok(ranges)
+    }
+
+    fn segments(&mut self, syn_hl: &SynHighlighter, text: &str) -> Vec<StyledSegment> {
+        match self.raw_highlight_line(syn_hl, text) {
+            Ok(ranges) => ranges
+                .into_iter()
+                .map(|(style, text)| StyledSegment::from_syntect(style, normalize_text(text)))
+                .collect(),
+            Err(_) => vec![StyledSegment::fallback(normalize_text(text))],
+        }
+    }
 }
 
 impl Highlighter {
     fn new(syntax: &SyntaxReference, theme: Arc<Theme>) -> Self {
         let syn_hl = SynHighlighter::new(&theme);
         Self {
-            highlight_state: HighlightState::new(&syn_hl, ScopeStack::new()),
-            parse_state: ParseState::new(syntax),
+            state: HighlighterState {
+                parse: ParseState::new(syntax),
+                highlight: HighlightState::new(&syn_hl, ScopeStack::new()),
+                embedding: syntax
+                    .scope
+                    .build_string()
+                    .starts_with(SHELL_SCOPE)
+                    .then_some(Embedding::Shell),
+            },
             theme,
         }
     }
@@ -121,16 +185,8 @@ impl Highlighter {
     /// Resumes mid-file from a state captured earlier. Syntect's parse state is
     /// a running fold over the lines before it, so this is the only way to
     /// highlight line N without walking 0..N again.
-    pub fn from_state(
-        theme: Arc<Theme>,
-        highlight_state: HighlightState,
-        parse_state: ParseState,
-    ) -> Self {
-        Self {
-            theme,
-            highlight_state,
-            parse_state,
-        }
+    pub fn from_state(theme: Arc<Theme>, state: HighlighterState) -> Self {
+        Self { theme, state }
     }
 
     pub fn for_path(path: &str) -> Self {
@@ -145,24 +201,9 @@ impl Highlighter {
         Self::new(syntax_for_token(lang), theme())
     }
 
-    fn raw_highlight_line<'a>(
-        &mut self,
-        text: &'a str,
-    ) -> Result<Vec<(SynStyle, &'a str)>, syntect::Error> {
-        let ops = self.parse_state.parse_line(text, syntax_set())?;
-        let syn_hl = SynHighlighter::new(&self.theme);
-        let iter = HighlightIterator::new(&mut self.highlight_state, &ops, text, &syn_hl);
-        Ok(iter.collect())
-    }
-
     pub fn highlight_line(&mut self, text: &str) -> Vec<StyledSegment> {
-        match self.raw_highlight_line(text) {
-            Ok(ranges) => ranges
-                .into_iter()
-                .map(|(style, text)| StyledSegment::from_syntect(style, normalize_text(text)))
-                .collect(),
-            Err(_) => vec![StyledSegment::fallback(normalize_text(text))],
-        }
+        let syn_hl = SynHighlighter::new(&self.theme);
+        self.state.segments(&syn_hl, text)
     }
 
     /// Highlights a run of lines in one pass.
@@ -177,7 +218,6 @@ impl Highlighter {
         lines: impl IntoIterator<Item = &'a str>,
     ) -> Vec<Vec<StyledSegment>> {
         let syn_hl = SynHighlighter::new(&self.theme);
-        let set = syntax_set();
         let mut buffer = String::new();
         let mut out = Vec::new();
         for line in lines {
@@ -186,32 +226,24 @@ impl Highlighter {
             if !buffer.ends_with('\n') {
                 buffer.push('\n');
             }
-            out.push(match self.parse_state.parse_line(&buffer, set) {
-                Ok(ops) => {
-                    HighlightIterator::new(&mut self.highlight_state, &ops, &buffer, &syn_hl)
-                        .map(|(style, text)| {
-                            StyledSegment::from_syntect(style, normalize_text(text))
-                        })
-                        .collect()
-                }
-                Err(_) => vec![StyledSegment::fallback(normalize_text(&buffer))],
-            });
+            out.push(self.state.segments(&syn_hl, &buffer));
         }
         out
     }
 
     pub fn advance(&mut self, text: &str) {
-        let _ = self.raw_highlight_line(text);
+        let syn_hl = SynHighlighter::new(&self.theme);
+        let _ = self.state.raw_highlight_line(&syn_hl, text);
     }
 
-    pub fn state(self) -> (HighlightState, ParseState) {
-        (self.highlight_state, self.parse_state)
+    pub fn state(self) -> HighlighterState {
+        self.state
     }
 
     /// [`Self::state`] without giving up the highlighter, for a caller laying
     /// down checkpoints as it walks a file it is still walking.
-    pub fn snapshot(&self) -> (HighlightState, ParseState) {
-        (self.highlight_state.clone(), self.parse_state.clone())
+    pub fn snapshot(&self) -> HighlighterState {
+        self.state.clone()
     }
 }
 
@@ -286,20 +318,15 @@ pub fn highlight_ansi(lang: &str, code: &str, bg: (u8, u8, u8)) -> String {
 }
 
 pub struct CodeHighlighter {
-    checkpoint_parse: ParseState,
-    checkpoint_highlight: HighlightState,
+    checkpoint: HighlighterState,
     completed_lines: usize,
     cached_segments: Vec<Vec<StyledSegment>>,
 }
 
 impl CodeHighlighter {
     pub fn new(lang: &str) -> Self {
-        let syntax = syntax_for_token(lang);
-        let t = theme();
-        let highlighter = SynHighlighter::new(&t);
         Self {
-            checkpoint_parse: ParseState::new(syntax),
-            checkpoint_highlight: HighlightState::new(&highlighter, ScopeStack::new()),
+            checkpoint: Highlighter::for_token(lang).state(),
             completed_lines: 0,
             cached_segments: Vec::new(),
         }
@@ -329,31 +356,21 @@ impl CodeHighlighter {
         };
 
         if new_completed > self.completed_lines {
-            let mut hl = Highlighter::from_state(
-                theme(),
-                self.checkpoint_highlight.clone(),
-                self.checkpoint_parse.clone(),
-            );
+            let mut hl = Highlighter::from_state(theme(), self.checkpoint.clone());
 
             for raw in &raw_lines[self.completed_lines..new_completed] {
                 self.set_or_push(self.completed_lines, hl.highlight_line(raw));
                 self.completed_lines += 1;
             }
 
-            let (hs, ps) = hl.state();
-            self.checkpoint_parse = ps;
-            self.checkpoint_highlight = hs;
+            self.checkpoint = hl.state();
         }
 
         let line_count = new_completed + usize::from(new_completed < total);
         self.cached_segments.truncate(line_count);
 
         if new_completed < total {
-            let mut hl = Highlighter::from_state(
-                theme(),
-                self.checkpoint_highlight.clone(),
-                self.checkpoint_parse.clone(),
-            );
+            let mut hl = Highlighter::from_state(theme(), self.checkpoint.clone());
             self.set_or_push(new_completed, hl.highlight_line(raw_lines[new_completed]));
         }
 
@@ -363,8 +380,25 @@ impl CodeHighlighter {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use super::*;
+    use syntect::highlighting::{Color, ScopeSelectors, StyleModifier, ThemeItem};
     use test_case::test_case;
+
+    const PYTHON_BODY: &str = "import os\nprint(os.getcwd())\n";
+    const KEYWORD: Color = Color {
+        r: 200,
+        g: 0,
+        b: 0,
+        a: 255,
+    };
+    const STRING: Color = Color {
+        r: 0,
+        g: 200,
+        b: 0,
+        a: 255,
+    };
 
     fn segments_text(segs: &[StyledSegment]) -> String {
         segs.iter().map(|s| s.text.as_str()).collect()
@@ -509,9 +543,8 @@ mod tests {
         warmup();
         let mut hl = Highlighter::for_token("rust");
         hl.advance("fn main() {\n");
-        let (hs, ps) = hl.state();
 
-        let mut from_state = Highlighter::from_state(theme(), hs, ps);
+        let mut from_state = Highlighter::from_state(theme(), hl.state());
         let seg_from_state = from_state.highlight_line("    let x = 1;\n");
 
         let mut fresh = Highlighter::for_token("rust");
@@ -527,5 +560,91 @@ mod tests {
         let aliased = syntax_for_token(alias);
         let canonical_syntax = syntax_set().find_syntax_by_token(canonical).unwrap();
         assert_eq!(aliased.name, canonical_syntax.name);
+    }
+
+    /// The default theme colours every scope alike, which would make any two
+    /// grammars agree.
+    fn scoped_theme() -> Arc<Theme> {
+        let item = |selector: &str, color| ThemeItem {
+            scope: ScopeSelectors::from_str(selector).expect("selector"),
+            style: StyleModifier {
+                foreground: Some(color),
+                background: None,
+                font_style: None,
+            },
+        };
+        Arc::new(Theme {
+            scopes: vec![item("keyword", KEYWORD), item("string", STRING)],
+            ..Theme::default()
+        })
+    }
+
+    fn coloured(token: &str, embedding: bool, code: &str) -> Vec<Vec<StyledSegment>> {
+        warmup();
+        let mut highlighter = Highlighter::new(syntax_for_token(token), scoped_theme());
+        if !embedding {
+            highlighter.state.embedding = None;
+        }
+        highlighter.highlight_lines(code.lines())
+    }
+
+    #[test]
+    fn a_heredoc_body_is_coloured_in_the_language_it_feeds() {
+        let code = format!("python3 - <<'PY'\n{PYTHON_BODY}PY\necho done\n");
+        let shell = coloured("bash", true, &code);
+
+        assert_eq!(shell[1..3], coloured("python", true, PYTHON_BODY)[..]);
+        assert_ne!(shell[1..3], coloured("bash", false, &code)[1..3]);
+    }
+
+    #[test]
+    fn the_delimiter_line_returns_to_shell() {
+        let code = format!("python3 - <<'PY'\n{PYTHON_BODY}PY\necho done\n");
+
+        assert_eq!(
+            coloured("bash", true, &code)[3..],
+            coloured("bash", false, &code)[3..]
+        );
+    }
+
+    /// The body leaves the shell grammar inside a substitution, so the lines
+    /// after it keep the colours only a grammar that read the body gives.
+    #[test]
+    fn the_shell_reads_the_body_it_does_not_colour() {
+        let code = "python3 - <<PY\nx = \"$(date\nPY\n)\"\necho done\n";
+
+        assert_eq!(
+            coloured("bash", true, code)[2..],
+            coloured("bash", false, code)[2..]
+        );
+    }
+
+    #[test]
+    fn a_tab_stripped_delimiter_ends_the_body() {
+        let code = "python3 - <<-PY\n\timport os\n\tPY\necho done\n";
+        let shell = coloured("bash", true, code);
+
+        assert_eq!(shell[1], coloured("python", true, "\timport os\n")[0]);
+        assert_eq!(shell[2..], coloured("bash", false, code)[2..]);
+    }
+
+    #[test_case("cat <<EOF\nimport os\nEOF\n"; "a_command_with_no_language")]
+    #[test_case("cat <<EOF\npython3 - <<PY\nimport os\nPY\nEOF\n"; "a_heredoc_written_inside_one")]
+    #[test_case("python3 - <<<'import os'\nimport os\n"; "a_here_string")]
+    fn a_body_with_no_language_stays_shell(code: &str) {
+        assert_eq!(coloured("bash", true, code), coloured("bash", false, code));
+    }
+
+    #[test]
+    fn a_resumed_state_keeps_the_heredoc_it_was_in() {
+        warmup();
+        let mut first = Highlighter::new(syntax_for_token("bash"), scoped_theme());
+        first.highlight_line("python3 - <<'PY'\n");
+        let mut resumed = Highlighter::from_state(scoped_theme(), first.snapshot());
+
+        assert_eq!(
+            resumed.highlight_line("import os\n"),
+            coloured("python", true, "import os\n")[0]
+        );
     }
 }

@@ -18,9 +18,7 @@
 //! text that had not changed. Repainting the same window costs nothing, and
 //! scrolling costs the rows that came into view.
 
-use caudra_highlight::{Highlighter, StyledSegment, syntax_for_path};
-use syntect::highlighting::HighlightState;
-use syntect::parsing::ParseState;
+use caudra_highlight::{Highlighter, HighlighterState, StyledSegment, syntax_for_path};
 
 const CHECKPOINT_STRIDE: usize = 100;
 /// How far above a target a walk may start when nothing nearer is within
@@ -39,8 +37,7 @@ const MAX_CACHED_ROWS: usize = 1000;
 #[derive(Clone)]
 struct Checkpoint {
     line: usize,
-    highlight: HighlightState,
-    parse: ParseState,
+    state: HighlighterState,
 }
 
 /// Colours already worked out, covering `[first, first + rows.len())`, with the
@@ -52,8 +49,7 @@ struct Checkpoint {
 struct Band {
     first: usize,
     rows: Vec<Vec<StyledSegment>>,
-    highlight: HighlightState,
-    parse: ParseState,
+    state: HighlighterState,
     exact: bool,
 }
 
@@ -138,8 +134,7 @@ impl ViewportHighlighter {
 
     fn extend(&mut self, lines: &[String], last: usize) {
         let band = self.band.take().expect("an extendable band");
-        let mut highlighter =
-            Highlighter::from_state(caudra_highlight::theme(), band.highlight, band.parse);
+        let mut highlighter = Highlighter::from_state(caudra_highlight::theme(), band.state);
         let end = band.first + band.rows.len();
         let mut rows = band.rows;
         rows.append(&mut self.walk(lines, &mut highlighter, end, last, band.exact));
@@ -153,11 +148,9 @@ impl ViewportHighlighter {
         // and a file shorter than the lookback is always walked from the top.
         let exact = resume.is_some() || floor == 0;
         let mut highlighter = match resume {
-            Some(checkpoint) => Highlighter::from_state(
-                caudra_highlight::theme(),
-                checkpoint.highlight.clone(),
-                checkpoint.parse.clone(),
-            ),
+            Some(checkpoint) => {
+                Highlighter::from_state(caudra_highlight::theme(), checkpoint.state.clone())
+            }
             None => Highlighter::for_syntax(syntax_for_path(&self.path)),
         };
         // The band starts where the walk starts rather than at the viewport, so
@@ -210,12 +203,10 @@ impl ViewportHighlighter {
         let excess = excess.min(last.saturating_sub(first));
         rows.drain(..excess);
         first += excess;
-        let (highlight, parse) = highlighter.state();
         self.band = Some(Band {
             first,
             rows,
-            highlight,
-            parse,
+            state: highlighter.state(),
             exact,
         });
     }
@@ -234,11 +225,9 @@ impl ViewportHighlighter {
         if self.checkpoints.iter().any(|c| c.line == line) {
             return;
         }
-        let (highlight, parse) = highlighter.snapshot();
         self.checkpoints.push(Checkpoint {
             line,
-            highlight,
-            parse,
+            state: highlighter.snapshot(),
         });
         self.checkpoints.sort_by_key(|c| c.line);
     }

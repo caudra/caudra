@@ -6,6 +6,7 @@ use caudra_storage::StateDir;
 mod command_arity;
 #[allow(dead_code)]
 pub(crate) mod command_pattern;
+pub mod executables;
 pub mod pattern_matching;
 pub mod pattern_recognition;
 mod sed_script;

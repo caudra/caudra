@@ -1,10 +1,13 @@
 use caudra_agent::permissions::{
-    COMMAND_TEMPLATE_PREFIX, ComposedRow, PermissionAnswer, PermissionLifetime, PermissionRequest,
-    PermissionRowGrant, grade_command_pattern,
+    ComposedRow, PermissionAnswer, PermissionLifetime, PermissionRequest, PermissionRowGrant,
+    grade_command_pattern,
 };
 
 use super::choices::{NO, ONCE_ONLY, grant_label};
-use super::decision::{default_grant, grant_option, offers, per_row, row_positions, step};
+use super::customize::option_badges;
+use super::decision::{
+    default_grant, grant_option, offers, per_row, row_lifetimes, row_positions, step,
+};
 use super::notes::{RowStatus, row_status};
 use super::{Panel, PermissionDecision, PermissionPrompt, PromptState, RowChoice, front_request};
 
@@ -12,7 +15,6 @@ const REMEMBER_AS_LISTED: &str = "Yes, and remember as listed";
 const RUN_THEM_ONCE: &str = "Yes, run them once";
 const MORE_OPTIONS: &str = "More options for the whole script…";
 pub(super) const OWN_PATTERN: &str = "Your own pattern…";
-const SUGGESTED: &str = "suggested";
 const EXACT_PAGE_LABEL: &str = "This exact command";
 const ONCE_PAGE_LABEL: &str = "This time only";
 
@@ -58,9 +60,7 @@ pub(super) fn rung_lifetimes(
     grant: &PermissionRowGrant,
     project: bool,
 ) -> Vec<PermissionLifetime> {
-    let Some(option) = grant_option(request, row, grant) else {
-        return Vec::new();
-    };
+    let allowed = row_lifetimes(request, row, grant);
     [
         PermissionLifetime::Conversation,
         PermissionLifetime::Project,
@@ -68,8 +68,7 @@ pub(super) fn rung_lifetimes(
     ]
     .into_iter()
     .filter(|lifetime| {
-        option.allowed_lifetimes.contains(lifetime)
-            && (project || *lifetime != PermissionLifetime::Project)
+        allowed.contains(lifetime) && (project || *lifetime != PermissionLifetime::Project)
     })
     .collect()
 }
@@ -176,15 +175,9 @@ pub(super) fn item_label(
         PageItem::Grant(None) => return (ONCE_PAGE_LABEL.into(), Vec::new()),
         PageItem::Grant(Some(grant)) => grant,
     };
-    let mut badges = Vec::new();
-    if let Some(option) = grant_option(request, row, grant) {
-        if option.id.starts_with(COMMAND_TEMPLATE_PREFIX) {
-            badges.push(SUGGESTED.into());
-        }
-        if let Some(seen) = option.seen {
-            badges.push(format!("seen {seen}×"));
-        }
-    }
+    let badges = grant_option(request, row, grant)
+        .map(option_badges)
+        .unwrap_or_default();
     let label = grant_label(request, row, grant);
     let label = match label.strip_prefix("this exact command") {
         Some(rest) => format!("{EXACT_PAGE_LABEL}{rest}"),

@@ -20,6 +20,7 @@ use super::{
     trusted_command_observation,
 };
 use crate::permissions::{
+    command_pattern::{ancestor_prefixes, grade_command_pattern, reusable_prefix},
     manager::PatternCandidates,
     pattern_matching::CompiledPattern,
     pattern_recognition::{
@@ -32,6 +33,7 @@ use caudra_storage::permission_patterns::{
 };
 use caudra_storage::permission_state::validate_command_templates;
 use serde_json::{Value, json};
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -58,6 +60,7 @@ pub const COMMAND_EXACT_PREFIX: &str = "command_exact_";
 
 pub const COMMAND_PATTERN_PREFIX: &str = "command_pattern_";
 pub const COMMAND_TEMPLATE_PREFIX: &str = "command_template_";
+const COMMAND_PREFIX_PREFIX: &str = "command_prefix_";
 
 pub(super) const EXACT_COMMAND_CHIP: &str = "this command";
 
@@ -79,7 +82,7 @@ const EXACT_COMMAND_LABEL: &str = "this exact command";
 const EXACT_COMMANDS_LABEL: &str = "these exact commands";
 const COMMAND_PATTERNS_LABEL: &str = "these command patterns";
 const ANY_COMMAND_LABEL: &str = "any shell command";
-const PROJECT_COMMANDS_LABEL: &str = "any command in this project";
+const PROJECT_COMMANDS_LABEL: &str = "any command in this folder";
 pub(super) const WORKDIRS_COMMANDS_LABEL: &str = "any command in these folders";
 const REMOTE_RESOURCES_LABEL: &str = "these remote resources";
 const EXACT_PAGE_LABEL: &str = "this exact page";
@@ -203,22 +206,25 @@ impl PermissionRequest {
                 self.options.insert(position, option);
             }
         }
+        prune_incomparable_prefixes(&mut self.options);
         settle_row_defaults(&mut self.options);
     }
 }
 
+fn option_row(option: &PermissionRuleOption) -> Option<usize> {
+    option.group.as_ref().and_then(|group| group.resource)
+}
+
 /// Where a template joins its command's ladder so the ladder keeps widening:
-/// after the rungs that fix more literal words, and before a prefix that fixes
-/// as many.
+/// after the rungs that fix more literal words, and before a pattern that
+/// fixes as many.
 fn rung_position(
     options: &[PermissionRuleOption],
     row: usize,
     template: &PermissionRuleOption,
 ) -> usize {
     let head = literal_head(template);
-    let in_row = |option: &PermissionRuleOption| {
-        option.group.as_ref().and_then(|group| group.resource) == Some(row)
-    };
+    let in_row = |option: &PermissionRuleOption| option_row(option) == Some(row);
     options
         .iter()
         .position(|option| {
@@ -226,29 +232,63 @@ fn rung_position(
                 && !option.id.starts_with(COMMAND_EXACT_PREFIX)
                 && (literal_head(option) < head
                     || literal_head(option) == head
-                        && option.id.starts_with(COMMAND_PATTERN_PREFIX))
+                        && !option.id.starts_with(COMMAND_TEMPLATE_PREFIX))
         })
         .or_else(|| options.iter().rposition(in_row).map(|last| last + 1))
         .unwrap_or(options.len())
 }
 
-/// How many literal words a command rung fixes before it matches anything, so
-/// the fewer it fixes the wider it reaches.
+/// A prefix fixing words a template on its row leaves open reaches commands
+/// the template does not and misses some it does, so neither widens the
+/// other. Only the prefixes of every such template's fixed words stay, which
+/// keeps each step along a row wider than the last.
+fn prune_incomparable_prefixes(options: &mut Vec<PermissionRuleOption>) {
+    let incomparable: Vec<bool> = options
+        .iter()
+        .map(|option| {
+            let Some(words) =
+                fixed_words(option).filter(|_| option.id.starts_with(COMMAND_PREFIX_PREFIX))
+            else {
+                return false;
+            };
+            options
+                .iter()
+                .filter(|template| {
+                    template.id.starts_with(COMMAND_TEMPLATE_PREFIX)
+                        && option_row(template) == option_row(option)
+                })
+                .filter_map(fixed_words)
+                .any(|fixed| !fixed.starts_with(&words))
+        })
+        .collect();
+    let mut incomparable = incomparable.into_iter();
+    options.retain(|_| !incomparable.next().unwrap_or_default());
+}
+
 fn literal_head(option: &PermissionRuleOption) -> Option<usize> {
+    fixed_words(option).map(|words| words.len())
+}
+
+/// The literal words a command rung fixes before it matches anything, so the
+/// fewer it fixes the wider it reaches.
+fn fixed_words(option: &PermissionRuleOption) -> Option<Vec<&str>> {
     match &option.rule.resources.first()?.selector {
         PermissionResourceSelector::CommandPattern { pattern } => Some(
             pattern
                 .strip_suffix(" *")
                 .unwrap_or(pattern)
                 .split_whitespace()
-                .count(),
+                .collect(),
         ),
         PermissionResourceSelector::CommandTemplate { definition } => Some(
             definition
                 .argv
                 .iter()
-                .take_while(|token| matches!(token, PatternToken::Exact { .. }))
-                .count(),
+                .map_while(|token| match token {
+                    PatternToken::Exact { value, .. } => Some(value.as_str()),
+                    PatternToken::Slot { .. } => None,
+                })
+                .collect(),
         ),
         _ => None,
     }
@@ -618,9 +658,7 @@ pub(super) fn rule_options(
                 .into_iter()
                 .zip(resources)
                 .map(|(mut constraint, resource)| {
-                    if let Some(pattern) =
-                        crate::permissions::command_pattern::reusable_prefix(&resource.value)
-                    {
+                    if let Some(pattern) = reusable_prefix(&resource.value) {
                         if !patterns.contains(&pattern) {
                             patterns.push(pattern.clone());
                         }
@@ -811,10 +849,12 @@ fn url_place(url: &str) -> &str {
 /// One ladder per command, so a request that batches several can be remembered
 /// at a different breadth for each.
 ///
-/// The rungs are deliberately narrow: the command itself, and its reusable
-/// prefix when it has one. Anything wider is a claim about the whole request
-/// and stays in the blanket options. Rungs leave the arguments unconstrained
-/// because a composition cannot pin them for one resource and not another.
+/// A ladder climbs from the command itself through its ancestor prefixes, the
+/// reusable prefix among them as the default, out to the bare executable,
+/// which is graded broad as a typed one is. Anything wider is a claim about
+/// the whole request and stays in the blanket options. Rungs leave the
+/// arguments unconstrained because a composition cannot pin them for one
+/// resource and not another.
 pub(super) fn add_command_options(
     options: &mut Vec<PermissionRuleOption>,
     resources: &[PermissionResource],
@@ -876,20 +916,38 @@ pub(super) fn add_command_options(
             format!("Allow `{command}` in {workdir} with different timeout or display controls."),
             constraint.selector.clone(),
         ));
-        if let Some(pattern) = crate::permissions::command_pattern::reusable_prefix(&resource.value)
-        {
-            options.push(rung(
-                format!("{COMMAND_PATTERN_PREFIX}{index}"),
-                format!("{}{suffix}", safe_summary(&pattern)),
-                &pattern,
-                format!(
-                    "Allow commands matching `{}` in {workdir}.",
-                    safe_summary(&pattern)
-                ),
-                PermissionResourceSelector::CommandPattern {
-                    pattern: pattern.clone(),
-                },
-            ));
+        let default = reusable_prefix(&resource.value);
+        let mut patterns: Vec<String> = ancestor_prefixes(&resource.value)
+            .into_iter()
+            .filter(|pattern| Some(pattern) != default.as_ref())
+            .chain(default.clone())
+            .collect();
+        patterns.sort_by_key(|pattern| Reverse(pattern.split_whitespace().count()));
+        for pattern in patterns {
+            let id = if Some(&pattern) == default.as_ref() {
+                format!("{COMMAND_PATTERN_PREFIX}{index}")
+            } else {
+                let literals = pattern.split_whitespace().count() - 1;
+                format!("{COMMAND_PREFIX_PREFIX}{index}_{literals}")
+            };
+            let confirmation = grade_command_pattern(&pattern, &resource.value)
+                .ok()
+                .and_then(|grade| grade.confirmation);
+            options.push(PermissionRuleOption {
+                confirmation: confirmation.map(String::from),
+                ..rung(
+                    id,
+                    format!("{}{suffix}", safe_summary(&pattern)),
+                    &pattern,
+                    format!(
+                        "Allow commands matching `{}` in {workdir}.",
+                        safe_summary(&pattern)
+                    ),
+                    PermissionResourceSelector::CommandPattern {
+                        pattern: pattern.clone(),
+                    },
+                )
+            });
         }
     }
 }
@@ -1411,6 +1469,7 @@ mod learned_scope_tests {
     const PACKAGE: &str = "core";
     const OTHER_PACKAGE: &str = "other";
     const UNOBSERVED_PACKAGE: &str = "new";
+    const OTHER_OPERATION: &str = "build";
     const LEARNED_SOURCE: &str = "Native observations: 2 observations across 2 sessions";
     const IMPORTED_SOURCE: &str = "Imported history (unverified): 2 observations across 2 sessions";
     const REQUESTED_OUTCOMES: &str = "2 requested (execution outcome not recorded)";
@@ -1627,8 +1686,14 @@ mod learned_scope_tests {
     fn right_arrow_always_widens() {
         let mut request = prepared(observation(PACKAGE));
         request.add_pattern_candidates(&learned_candidates().into(), &[None]);
-        let fixtures = [PACKAGE, OTHER_PACKAGE, UNOBSERVED_PACKAGE]
-            .map(|package| prepared(observation(package)));
+        let mut other_operation = observation(PACKAGE);
+        other_operation.argv[1] = OTHER_OPERATION.into();
+        let fixtures: Vec<_> = [PACKAGE, OTHER_PACKAGE, UNOBSERVED_PACKAGE]
+            .map(observation)
+            .into_iter()
+            .chain([other_operation])
+            .map(prepared)
+            .collect();
         let reach = |rule: &StructuredPermissionRule| {
             fixtures
                 .iter()
@@ -1651,9 +1716,10 @@ mod learned_scope_tests {
         assert_eq!(
             ladder,
             [
-                [true, false, false],
-                [true, true, false],
-                [true, true, true]
+                [true, false, false, false],
+                [true, true, false, false],
+                [true, true, true, false],
+                [true, true, true, true]
             ]
         );
     }
@@ -2557,9 +2623,9 @@ mod tests {
 
     /// A rung's label is the scope of a sentence, `allow ‹label› for this
     /// conversation`, naming the workdir only when it is not the project.
-    #[test_case("/project", &["this exact command", "cargo test *"]; "project_root")]
-    #[test_case("/project/crates/core", &["this exact command in crates/core/", "cargo test * in crates/core/"]; "inside_the_project")]
-    #[test_case("/elsewhere", &["this exact command in /elsewhere/", "cargo test * in /elsewhere/"]; "outside_the_project")]
+    #[test_case("/project", &["this exact command", "cargo test *", "cargo *"]; "project_root")]
+    #[test_case("/project/crates/core", &["this exact command in crates/core/", "cargo test * in crates/core/", "cargo * in crates/core/"]; "inside_the_project")]
+    #[test_case("/elsewhere", &["this exact command in /elsewhere/", "cargo test * in /elsewhere/", "cargo * in /elsewhere/"]; "outside_the_project")]
     fn command_rungs_read_as_scopes(workdir: &str, labels: &[&str]) {
         let request = explicit_request(
             PermissionAuthorityProfile::Shell,
@@ -2696,7 +2762,10 @@ mod tests {
         );
         assert_eq!(
             chips(1),
-            [("command_exact_1".to_owned(), EXACT_COMMAND_CHIP.to_owned())]
+            [
+                ("command_exact_1".to_owned(), EXACT_COMMAND_CHIP.to_owned()),
+                ("command_prefix_1_1".to_owned(), "printf *".to_owned()),
+            ]
         );
         for index in 0..resources.len() {
             for option in rungs(index) {
@@ -2717,6 +2786,55 @@ mod tests {
                 ));
             }
         }
+    }
+
+    /// Each rung reads as the scope it grants, whether it is where the row
+    /// starts, and whether it needs confirming. A broad rung is confirmed as
+    /// broad shell access and never claims the filesystem reach of a folder.
+    #[test_case("rustfmt --edition 2024 --check f.rs", &[
+        ("command_exact_0", EXACT_COMMAND_CHIP, true, false),
+        ("command_prefix_0_4", "rustfmt --edition 2024 --check *", false, false),
+        ("command_prefix_0_3", "rustfmt --edition 2024 *", false, false),
+        ("command_prefix_0_1", "rustfmt *", false, true),
+    ]; "a_command_without_a_prefix_starts_exact")]
+    #[test_case("cargo test -p core", &[
+        ("command_exact_0", EXACT_COMMAND_CHIP, false, false),
+        ("command_pattern_0", "cargo test *", true, false),
+        ("command_prefix_0_1", "cargo *", false, true),
+    ]; "the_reusable_prefix_is_one_of_the_ancestors")]
+    #[test_case("python3 x.py", &[
+        ("command_exact_0", EXACT_COMMAND_CHIP, true, false),
+    ]; "an_interpreter_never_reaches_its_bare_rung")]
+    fn a_row_climbs_its_ancestors_to_a_broad_bare_rung(
+        command: &str,
+        expected: &[(&str, &str, bool, bool)],
+    ) {
+        let request = explicit_request(
+            PermissionAuthorityProfile::Shell,
+            vec![command_resource(command, "/project")],
+            json!({ "command": command }),
+        );
+
+        let ladder: Vec<_> = request
+            .options
+            .iter()
+            .filter(|option| option.group.as_ref().and_then(|group| group.resource) == Some(0))
+            .map(|option| {
+                (
+                    option.id.as_str(),
+                    option.group.as_ref().unwrap().value.as_str(),
+                    option.is_default,
+                    option.confirmation.is_some(),
+                )
+            })
+            .collect();
+        assert_eq!(ladder, expected);
+        let cautions: Vec<_> = request
+            .options
+            .iter()
+            .filter_map(|option| option.caution.map(|caution| (&option.id, caution)))
+            .collect();
+        assert!(cautions.is_empty(), "{cautions:?}");
     }
 
     /// A file two levels inside the project can be widened all the way out, so

@@ -10,6 +10,18 @@ group = "Reference"
 Caudra renders model replies as markdown: headings, emphasis, lists, tables,
 code blocks with syntax highlighting, maths, and mermaid flowcharts.
 
+## Shell code
+
+A shell code block colours the body of a heredoc in the language of the
+program that reads it, up to the delimiter line. The lines after
+`python3 - <<'PY'` read as Python. Python, JavaScript, Ruby, Perl, PHP, Lua,
+SQL clients, and shells are recognised, with versioned names such as
+`python3.12` and paths such as `/usr/bin/node`. A here-string (`<<<`) and a
+heredoc fed to any other program, such as `cat`, keep the shell colours.
+
+Tool cards, permission prompts, `/permissions`, and the workbench editor
+colour shell commands the same way. Colours never change the text.
+
 ## Maths
 
 Models write maths as LaTeX. Caudra recognises four delimiters:

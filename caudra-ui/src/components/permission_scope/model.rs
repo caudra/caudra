@@ -137,6 +137,22 @@ impl ScopeModel {
         )
     }
 
+    /// Whether [`Self::target_text`] shows a command pattern, which reads as
+    /// shell. A live request's pattern is masked.
+    pub(crate) fn target_is_command(&self, index: usize) -> bool {
+        !matches!(self.source, ScopeSource::Live { .. })
+            && self
+                .rule()
+                .and_then(|rule| rule.resources.get(index))
+                .is_some_and(|resource| {
+                    resource.kind == PermissionResourceKind::Command
+                        && matches!(
+                            resource.selector,
+                            PermissionResourceSelector::CommandPattern { .. }
+                        )
+                })
+    }
+
     pub(crate) fn warnings(&self) -> Vec<&'static str> {
         let mut warnings = Vec::new();
         if let Some(rule) = self.rule() {

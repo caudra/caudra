@@ -56,6 +56,7 @@ mod peer_tests {
     const PEER_SECOND_TURN: &str = "Preserve the review tail.";
     const PEER_ONE_TURN: u32 = 1;
     const PEER_QUEUED: &str = "queued";
+    const PEER_HELD: &str = "held";
     const PEER_REFUSED: &str = "refused";
     const PEER_MISSING: &str = "the isolated host must discover its live recipient";
     const PEER_PENDING: &str = "an unconsumed peer message must remain claimable";
@@ -207,7 +208,6 @@ mod peer_tests {
 
     #[test_case(PermissionMode::Ask; "standing_allow")]
     #[test_case(PermissionMode::Auto; "auto_with_standing_allow")]
-    #[test_case(PermissionMode::Yolo; "yolo_with_standing_allow")]
     fn peer_plan_dispatch_requires_review_despite_broader_authority(mode: PermissionMode) {
         smol::block_on(async {
             let fixture = PeerFixture::new().await;
@@ -245,12 +245,9 @@ mod peer_tests {
                     .options
                     .iter()
                     .filter(|option| option.rule.effect == StructuredPermissionEffect::Allow)
-                    .all(
-                        |option| option.allowed_lifetimes.iter().all(|lifetime| matches!(
-                            lifetime,
-                            PermissionLifetime::Once | PermissionLifetime::Conversation
-                        ))
-                    )
+                    .all(|option| !option
+                        .allowed_lifetimes
+                        .contains(&PermissionLifetime::Global))
             );
             assert!(!fixture.receiver.has_pending());
             assert!(fixture.receiver.held().is_empty());
@@ -266,6 +263,52 @@ mod peer_tests {
             assert!(done.is_error);
             assert!(fixture.receiver.claim().is_none());
             assert!(fixture.receiver.held().is_empty());
+        });
+    }
+
+    /// YOLO answers for the plan too, so the send goes out unreviewed. A
+    /// standing deny still refuses it, and the receiver's own policy still
+    /// holds a message from a YOLO session.
+    #[test_case(Effect::Allow, Some(PEER_HELD); "sends_without_review")]
+    #[test_case(Effect::Deny, None; "preserves_deny")]
+    fn peer_plan_dispatch_under_yolo_skips_review(effect: Effect, status: Option<&str>) {
+        smol::block_on(async {
+            let fixture = PeerFixture::new().await;
+            let mut history = History::default();
+            let (mut agent, events) =
+                fixture.outbound_agent(&mut history, PermissionMode::Yolo, effect);
+            assert_eq!(
+                agent
+                    .run(AgentInput {
+                        mode: AgentMode::Plan(fixture.directory.path().join(PEER_PLAN)),
+                        ..peer_input()
+                    })
+                    .await
+                    .unwrap(),
+                DoneReason::EndTurn
+            );
+            let events: Vec<_> = events.try_iter().map(|event| event.event).collect();
+            assert!(
+                events
+                    .iter()
+                    .all(|event| !matches!(event, AgentEvent::PermissionRequest(_)))
+            );
+            let done = events
+                .iter()
+                .find_map(|event| match event {
+                    AgentEvent::ToolDone(done) if done.tool.as_ref() == SEND_NAME => Some(done),
+                    _ => None,
+                })
+                .expect(PEER_TOOL_RESULT);
+            let sent = match &done.output {
+                ToolOutput::Peers(PeerOutput::Sent { receipt, .. }) => {
+                    Some(receipt.status.as_str())
+                }
+                _ => None,
+            };
+            assert_eq!(sent, status);
+            assert_eq!(done.is_error, status.is_none());
+            assert!(fixture.receiver.claim().is_none());
         });
     }
 

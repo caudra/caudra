@@ -4125,7 +4125,7 @@ mod tests {
         };
         publication.fail.store(fail_conversation, Ordering::Relaxed);
         let committed = manager
-            .commit_structured_decision(&request, &answer, Some(project))
+            .commit_structured_decision(&request, &answer, Some(project), false)
             .is_ok();
         let mut lifetimes: Vec<_> = manager
             .structured_rule_inventory()

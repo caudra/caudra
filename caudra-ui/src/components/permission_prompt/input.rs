@@ -783,8 +783,8 @@ impl PermissionPrompt {
 #[cfg(test)]
 mod tests {
     use caudra_agent::permissions::{
-        COMMAND_EXACT_PREFIX, PermissionAnswer, PermissionLifetime, PermissionRequest,
-        PermissionResourceAccess, PermissionRowGrant,
+        COMMAND_EXACT_PREFIX, CONFINED_READ_AUTHORITY, PermissionAnswer, PermissionLifetime,
+        PermissionRequest, PermissionResourceAccess, PermissionRowGrant, RuleOrigin,
     };
     use crossterm::event::{
         KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -793,19 +793,20 @@ mod tests {
     use test_case::test_case;
 
     use super::super::choices::Choice;
-    use super::super::decision::default_grant;
     use super::super::decision::tests::{commands_request, native_shell_request};
+    use super::super::decision::{default_grant, grant_option};
     use super::super::step_through::PageItem;
     use super::super::view::tests::{
         BATCH, OUTSIDE_FILE, ROOMY_HEIGHT, ROOMY_WIDTH, SINGLE_COMMAND, advised, batch_request,
-        fetch_request, file_request, heredoc_request, key, planning, prompt_for, prose, render,
-        shell_prompt,
+        cover, fetch_request, file_request, heredoc_request, key, planning, prompt_for, prose,
+        render, shell_prompt,
     };
     use super::super::view::{PRESS_AGAIN, REARM_MESSAGE};
     use super::super::{
         Panel, PermissionPrompt, PromptMouse, PromptState, PromptTarget, RowChoice,
     };
     use super::ScopeItem;
+    use crate::components::command_text::tests::coloured;
 
     const FIRST: &str = "first";
     const NEXT: &str = "next";
@@ -817,6 +818,15 @@ mod tests {
     const SECRET: &str = "private-test-value";
     const SENSITIVE_COMMAND: &str = "env API_TOKEN=private-test-value rm -rf /project";
     const WRONG_PHRASE: &str = "not the phrase";
+    const BROAD_PHRASE: &str = "ALLOW BROAD SHELL ACCESS";
+    const GIT_LOG: &str = "git log -1";
+    const RUSTFMT_CHECK: &str = "rustfmt --edition 2024 --check f.rs";
+    const RUSTFMT_LADDER: [&str; 4] = [
+        "this command",
+        "rustfmt --edition 2024 --check *",
+        "rustfmt --edition 2024 *",
+        "rustfmt *",
+    ];
     const UNMATCHED_PATTERN: &str = "git *";
     const MATCHING_PATTERN: &str = "cargo test -p *";
     const SHORTCUT_LETTERS: &str = "yn?e";
@@ -907,18 +917,82 @@ mod tests {
         }
     }
 
-    #[test_case(planning(native_shell_request(SINGLE_COMMAND)), &['a'], '3'; "plan_mode")]
-    #[test_case(heredoc_request(), &['s', 'a'], '2'; "inline_script")]
-    fn absent_choices_ignore_their_letters(request: PermissionRequest, absent: &[char], no: char) {
-        let mut prompt = prompt_for(request);
+    #[test]
+    fn absent_choices_ignore_their_letters() {
+        let mut prompt = prompt_for(heredoc_request());
         draw(&mut prompt);
-        for letter in absent {
-            assert!(prompt.handle_key(key(KeyCode::Char(*letter))).is_none());
+        for letter in ['s', 'a'] {
+            assert!(prompt.handle_key(key(KeyCode::Char(letter))).is_none());
             assert_eq!(prompt.state, PromptState::Normal);
             assert!(prompt.pending.is_none());
         }
-        assert!(prompt.handle_key(key(KeyCode::Char(no))).is_none());
+        assert!(prompt.handle_key(key(KeyCode::Char('2'))).is_none());
         assert_eq!(prompt.state, PromptState::Guidance);
+    }
+
+    #[test]
+    fn plan_mode_keeps_a_narrow_scope_for_the_project() {
+        let mut prompt = prompt_for(planning(native_shell_request(SINGLE_COMMAND)));
+        draw(&mut prompt);
+        let answer = prompt.handle_key(key(KeyCode::Char('a'))).unwrap().answer;
+        let PermissionAnswer::AllowComposed { rows } = answer else {
+            panic!("expected a composed answer: {answer:?}");
+        };
+        assert_eq!(
+            rows[0].as_ref().unwrap().lifetime,
+            PermissionLifetime::Project
+        );
+    }
+
+    #[test]
+    fn plan_mode_customize_keeps_only_narrow_scopes_for_the_project() {
+        let mut prompt = prompt_for(planning(native_shell_request(GIT_LOG)));
+        draw(&mut prompt);
+        prompt.open_customize(false);
+        let items = prompt.customize_items();
+        let narrow = default_grant(prompt.current().unwrap(), 0).map(ScopeItem::Row);
+        let narrow = items.iter().position(|item| Some(item) == narrow.as_ref());
+        let broad = items
+            .iter()
+            .position(|item| matches!(item, ScopeItem::Whole(_)));
+        let mut keeps_for_the_project = |index: Option<usize>| {
+            prompt.highlight_scope(index.unwrap());
+            prompt
+                .customize_lifetimes()
+                .contains(&PermissionLifetime::Project)
+        };
+        assert!(keeps_for_the_project(narrow));
+        assert!(!keeps_for_the_project(broad));
+    }
+
+    /// `→` walks a row out through every ancestor of its command to the bare
+    /// executable, and `←` walks it back.
+    #[test]
+    fn arrows_walk_a_row_through_its_ancestors() {
+        let mut prompt = prompt_for(native_shell_request(RUSTFMT_CHECK));
+        draw(&mut prompt);
+        let start = prompt.row_grants()[0].clone();
+        let mut walked = vec![start.clone()];
+        for _ in 1..RUSTFMT_LADDER.len() {
+            assert!(prompt.handle_key(key(KeyCode::Right)).is_none());
+            draw(&mut prompt);
+            walked.push(prompt.row_grants()[0].clone());
+        }
+        let request = prompt.current().unwrap();
+        let scopes: Vec<_> = walked
+            .iter()
+            .map(|grant| {
+                grant_option(request, 0, grant.as_ref().unwrap())
+                    .and_then(|option| option.group.as_ref())
+                    .map(|group| group.value.as_str())
+            })
+            .collect();
+        assert_eq!(scopes, RUSTFMT_LADDER.map(Some));
+        for _ in 1..RUSTFMT_LADDER.len() {
+            prompt.handle_key(key(KeyCode::Left));
+            draw(&mut prompt);
+        }
+        assert_eq!(prompt.row_grants()[0], start);
     }
 
     #[test_case(native_shell_request(SINGLE_COMMAND), KeyCode::Left, KeyCode::Right; "command_row_narrows")]
@@ -1009,7 +1083,7 @@ mod tests {
     }
 
     #[test_case(false, &[PermissionLifetime::Conversation, PermissionLifetime::Project]; "build_mode")]
-    #[test_case(true, &[PermissionLifetime::Conversation]; "plan_mode")]
+    #[test_case(true, &[PermissionLifetime::Conversation]; "plan_mode_holds_a_broad_rung_to_the_conversation")]
     fn remember_for_offers_only_the_rungs_lifetimes(plan: bool, offered: &[PermissionLifetime]) {
         let mut request = commands_request(&PAIR);
         let exact = format!("{COMMAND_EXACT_PREFIX}0");
@@ -1024,6 +1098,7 @@ mod tests {
                     PermissionLifetime::Conversation,
                     PermissionLifetime::Project,
                 ];
+                option.confirmation = Some(BROAD_PHRASE.into());
             } else if option.id == exact {
                 option.allowed_lifetimes =
                     vec![PermissionLifetime::Once, PermissionLifetime::Conversation];
@@ -1089,6 +1164,25 @@ mod tests {
                 Some(PermissionLifetime::Conversation)
             ]
         );
+    }
+
+    #[test_case(None; "focused_row")]
+    #[test_case(Some(0); "covered_row_clicked")]
+    fn customize_opens_on_the_only_new_rows_ladder(clicked: Option<usize>) {
+        let mut request = commands_request(&PAIR);
+        cover(
+            &mut request,
+            0,
+            RuleOrigin::Builtin,
+            CONFINED_READ_AUTHORITY,
+            false,
+        );
+        let mut prompt = prompt_for(request);
+        if let Some(row) = clicked {
+            prompt.activate(PromptTarget::Row(row));
+        }
+        prompt.open_customize(false);
+        assert_eq!(prompt.customize.as_ref().unwrap().row, Some(1));
     }
 
     #[test_case(false; "from_main_view")]
@@ -1494,8 +1588,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn credentials_never_reach_the_screen() {
+    #[test_case(false; "plain")]
+    #[test_case(true; "coloured")]
+    fn credentials_never_reach_the_screen(colours: bool) {
+        if colours {
+            coloured();
+        }
         let mut prompt = shell_prompt(SENSITIVE_COMMAND);
         assert!(!draw(&mut prompt).contains(SECRET));
         prompt.toggle_details();

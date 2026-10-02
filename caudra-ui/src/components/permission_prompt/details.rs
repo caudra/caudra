@@ -5,10 +5,10 @@ use caudra_agent::permissions::{PermissionRequest, PermissionRowGrant, Permissio
 use serde_json::{Map, Value};
 
 use super::PermissionPrompt;
-use super::choices::grant_label;
+use super::choices::{grant_label, grant_names_commands};
 use super::decision::grant_option;
 use super::inspector::pattern_summary;
-use super::notes::{action_lines, coverage_phrase, reason_sentence, row_coverage, tilde};
+use super::notes::{action_lines, coverage_phrase, is_shell, reason_sentence, row_coverage, tilde};
 use super::scope::{SHELL_REACH, option_summary, tool_text};
 use crate::components::escape_terminal_controls;
 
@@ -342,6 +342,12 @@ pub(super) fn review_lines(value: &str) -> Vec<String> {
 pub(super) struct Section {
     pub heading: String,
     pub lines: Vec<String>,
+    /// Whether the lines are one command, drawn as shell. Other lines are
+    /// words, any backtick-quoted command in them drawn as shell.
+    pub command: bool,
+    /// The lines holding a scope in `‹…›` marks that names commands, drawn
+    /// the way the choices draw it.
+    pub patterns: Vec<usize>,
 }
 
 impl Section {
@@ -349,6 +355,8 @@ impl Section {
         Self {
             heading: heading.into(),
             lines,
+            command: false,
+            patterns: Vec::new(),
         }
     }
 }
@@ -455,14 +463,17 @@ impl PermissionPrompt {
             return Vec::new();
         };
         let mut sections = vec![
-            Section::new(
-                if self.shell() {
-                    "What will run"
-                } else {
-                    "What it asks"
-                },
-                action_lines(request),
-            ),
+            Section {
+                command: is_shell(request),
+                ..Section::new(
+                    if self.shell() {
+                        "What will run"
+                    } else {
+                        "What it asks"
+                    },
+                    action_lines(request),
+                )
+            },
             Section::new("Where", places(request)),
         ];
         let mut why = vec![reason_sentence(&request.presentation.reason)];
@@ -476,10 +487,10 @@ impl PermissionPrompt {
                 let command = review_text(&request.resources[row].value);
                 Some(match coverage.asks {
                     true => format!(
-                        "{command}: {ASKS_EVERY_TIME} ({})",
+                        "`{command}`: {ASKS_EVERY_TIME} ({})",
                         coverage_phrase(coverage)
                     ),
-                    false => format!("{command}: {}", coverage_phrase(coverage)),
+                    false => format!("`{command}`: {}", coverage_phrase(coverage)),
                 })
             })
             .collect();
@@ -519,11 +530,15 @@ impl PermissionPrompt {
             many => format!("What choices {} allow", many.join(" and ")),
         };
         let mut lines = Vec::new();
+        let mut patterns = Vec::new();
         if self.per_row() {
             for (row, grant) in self.row_grants().iter().enumerate() {
                 let Some(grant) = grant else {
                     continue;
                 };
+                if grant_names_commands(request, row, grant) {
+                    patterns.push(lines.len());
+                }
                 lines.push(format!("‹{}›", grant_label(request, row, grant)));
                 match grant {
                     PermissionRowGrant::Pattern { definition, .. } => {
@@ -543,7 +558,10 @@ impl PermissionPrompt {
             lines.push(format!("‹{}›", review_text(&option.label)));
             lines.extend(option_summary(request, option).lines);
         }
-        Some(Section::new(heading, lines))
+        Some(Section {
+            patterns,
+            ..Section::new(heading, lines)
+        })
     }
 }
 

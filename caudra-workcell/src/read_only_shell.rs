@@ -10,14 +10,14 @@
 use std::path::{Component, Path, PathBuf};
 
 use caudra_agent::permissions::{
-    PermissionResourceAccess, PermissionResourceKind, filesystem_permission_resource,
-    physical_boundary_check, sed_only_prints,
+    PermissionResourceAccess, PermissionResourceKind, executables::versioned_interpreter,
+    filesystem_permission_resource, physical_boundary_check, sed_only_prints,
 };
 #[cfg(test)]
 use workcell::shell::ShellCommandAnalysis;
 use workcell::shell::{ShellCommandScope, ShellWord, bash::BashCwdSet};
 
-use crate::pattern_analysis::versioned_interpreter;
+use crate::shell_glob::expand_glob;
 
 const VERSION_FLAG: &str = "--version";
 const VERSION_ONLY: &[&str] = &[VERSION_FLAG];
@@ -118,6 +118,12 @@ const GIT_READ_FLAGS: &[&str] = &[
     "--full-name",
     "--full-tree",
     "--long",
+    "--pretty",
+    "--abbrev-commit",
+    "--no-abbrev-commit",
+    "--follow",
+    "--shortstat",
+    "--no-patch",
     "-p",
     "-s",
     "-u",
@@ -127,6 +133,26 @@ const GIT_READ_FLAGS: &[&str] = &[
     "-t",
     "-v",
 ];
+/// Flags read only in their attached form, so the value can never be taken for
+/// the next operand or the next operand for the value.
+const GIT_READ_VALUE_FLAGS: &[&str] = &[
+    "--format=",
+    "--pretty=",
+    "--date=",
+    "--abbrev=",
+    "--since=",
+    "--until=",
+    "--after=",
+    "--before=",
+    "--author=",
+    "--committer=",
+    "--grep=",
+    "--skip=",
+];
+const GIT_FORMAT_FLAGS: &[&str] = &["--format=", "--pretty="];
+/// `%G?`, `%GS`, and the rest of the signature placeholders verify a signature,
+/// which runs gpg.
+const GIT_SIGNATURE_PLACEHOLDER: &str = "%G";
 const GIT_LIST_FLAGS: &[&str] = &["--list", "-l", "--no-color", "--color=never"];
 const GIT_BRANCH_FLAGS: &[&str] = &["--all", "-a", "--remotes", "-r", "--verbose", "-v", "-vv"];
 const RG: &str = "rg";
@@ -234,6 +260,12 @@ const READ_ONLY_COMMANDS: &[&str] = &[
     "basename", "cat", "cd", "df", "dirname", "echo", "head", "ls", "ps", "pwd", "readlink",
     "realpath", "stat", "tail", "uname", "which",
 ];
+/// Readers that take every operand as a path to read, so a safe glob among
+/// them only names more of the same. `echo` and the name tools print or
+/// resolve what they are given instead.
+const GLOB_READERS: &[&str] = &[
+    "cat", "du", "file", "head", "ls", SORT, "stat", "tail", "tree", "wc",
+];
 /// `du` and `wc` write nothing, so the allow-list is about what they read:
 /// `--files0-from` takes its operands from a file nobody reviewed, and the
 /// dereference flags walk out of the project through a symlink. Both are absent
@@ -296,7 +328,12 @@ const TREE_READ_FLAGS: &[&str] = &[
 /// be trusted.
 #[cfg(test)]
 fn is_read_only(analysis: &ShellCommandAnalysis, opaque: bool) -> bool {
-    !opaque && !analysis.scopes.is_empty() && analysis.scopes.iter().all(scope_is_read_only)
+    !opaque
+        && !analysis.scopes.is_empty()
+        && analysis
+            .scopes
+            .iter()
+            .all(|scope| scope_is_read_only(scope, &[]))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -311,13 +348,20 @@ pub(crate) enum NotReadOnly {
     UnsupportedInvocation,
 }
 
-pub(crate) fn scope_is_read_only(scope: &ShellCommandScope) -> bool {
-    shell_read_only_verdict(scope).is_ok()
+pub(crate) fn scope_is_read_only(scope: &ShellCommandScope, globs: &[Option<&str>]) -> bool {
+    shell_read_only_verdict(scope, globs).is_ok()
 }
 
 /// Classifies only the decoded command scope, not line effects or confinement.
 /// A failure means read-only is unproven, not that the command writes.
-pub(crate) fn shell_read_only_verdict(scope: &ShellCommandScope) -> Result<(), NotReadOnly> {
+///
+/// `globs` holds each argument's pattern when it is a safe glob. One reads as
+/// its own text where its matches can only be paths to read, which never
+/// start with a dash, and confinement expands it.
+pub(crate) fn shell_read_only_verdict(
+    scope: &ShellCommandScope,
+    globs: &[Option<&str>],
+) -> Result<(), NotReadOnly> {
     if scope.source != scope.normalized {
         return Err(NotReadOnly::SourceMismatch);
     }
@@ -325,7 +369,9 @@ pub(crate) fn shell_read_only_verdict(scope: &ShellCommandScope) -> Result<(), N
     // observers, and a word that does not mean its own text could be any of the
     // denied ones. Plan mode gates on this answer alone, so it cannot defer the
     // question to the confinement check the way the permission path does.
-    let arguments = literal_arguments(scope).ok_or(NotReadOnly::UndecodableWord)?;
+    let arguments = reviewed_arguments(scope, globs)
+        .filter(|arguments| globs_name_read_paths(&scope.executable, arguments, globs))
+        .ok_or(NotReadOnly::UndecodableWord)?;
     let read_only = match scope.executable.as_str() {
         executable if version_probe(executable, &arguments) => true,
         GIT => git_is_read_only(&arguments),
@@ -355,6 +401,21 @@ pub(crate) fn shell_read_only_verdict(scope: &ShellCommandScope) -> Result<(), N
         Ok(())
     } else {
         Err(NotReadOnly::UnsupportedInvocation)
+    }
+}
+
+/// Whether every safe glob stands where its matches can only be paths to
+/// read: among the operands of a `GLOB_READERS` command, after the pattern of
+/// `grep` or `rg`, or as a pathspec after `--` for `git`.
+fn globs_name_read_paths(executable: &str, arguments: &[&str], globs: &[Option<&str>]) -> bool {
+    let Some(first) = globs.iter().position(Option::is_some) else {
+        return true;
+    };
+    let mut before = arguments.iter().take(first);
+    match executable {
+        GREP | RG => before.any(|argument| !argument.starts_with('-')),
+        GIT => before.any(|argument| *argument == END_OF_FLAGS),
+        executable => GLOB_READERS.contains(&executable),
     }
 }
 
@@ -440,6 +501,7 @@ fn git_read_arguments(arguments: &[&str]) -> bool {
             }
         } else if argument.starts_with('-')
             && !GIT_READ_FLAGS.contains(&argument)
+            && !git_read_value_flag(argument)
             && !argument.strip_prefix('-').is_some_and(decimal)
             && !argument.strip_prefix("--max-count=").is_some_and(decimal)
         {
@@ -447,6 +509,14 @@ fn git_read_arguments(arguments: &[&str]) -> bool {
         }
     }
     true
+}
+
+fn git_read_value_flag(argument: &str) -> bool {
+    GIT_READ_VALUE_FLAGS.iter().any(|flag| {
+        argument.strip_prefix(flag).is_some_and(|value| {
+            !GIT_FORMAT_FLAGS.contains(flag) || !value.contains(GIT_SIGNATURE_PLACEHOLDER)
+        })
+    })
 }
 
 pub(crate) fn decimal(value: &str) -> bool {
@@ -488,6 +558,7 @@ fn no_attached_pattern_file(arguments: &[&str]) -> bool {
 
 pub(crate) fn confined_read(
     scope: &ShellCommandScope,
+    globs: &[Option<&str>],
     incoming: &BashCwdSet,
     project: &Path,
 ) -> bool {
@@ -495,14 +566,14 @@ pub(crate) fn confined_read(
         return false;
     };
     !directories.is_empty()
-        && scope_is_read_only(scope)
+        && scope_is_read_only(scope, globs)
         && directories.iter().all(|directory| {
             directory.starts_with(project)
                 && resolves_inside("", directory, project)
                 && if scope.executable == CD {
                     cd_target(scope, directory, project).is_some()
                 } else {
-                    scope_stays_in_project(scope, directory, project)
+                    scope_stays_in_project(scope, globs, directory, project)
                 }
         })
 }
@@ -510,7 +581,7 @@ pub(crate) fn confined_read(
 /// Where a `cd` leaves the shell, or `None` when the command does not say, or
 /// says somewhere outside the project.
 fn cd_target(scope: &ShellCommandScope, current: &Path, project: &Path) -> Option<PathBuf> {
-    if !scope_is_read_only(scope) {
+    if !scope_is_read_only(scope, &[]) {
         return None;
     }
     // No operand is `$HOME`, and two is the substitution form `cd old new`.
@@ -526,11 +597,35 @@ fn cd_target(scope: &ShellCommandScope, current: &Path, project: &Path) -> Optio
     resolves_inside(target, current, project).then_some(moved)
 }
 
-fn scope_stays_in_project(scope: &ShellCommandScope, workdir: &Path, project: &Path) -> bool {
-    literal_arguments(scope).is_some_and(|arguments| {
-        arguments
-            .iter()
-            .all(|argument| argument_stays_in_project(argument, workdir, project))
+fn scope_stays_in_project(
+    scope: &ShellCommandScope,
+    globs: &[Option<&str>],
+    workdir: &Path,
+    project: &Path,
+) -> bool {
+    reviewed_arguments(scope, globs).is_some_and(|arguments| {
+        arguments.iter().enumerate().all(|(index, argument)| {
+            if glob_at(globs, index).is_some() {
+                glob_stays_in_project(argument, workdir, project)
+            } else {
+                argument_stays_in_project(argument, workdir, project)
+            }
+        })
+    })
+}
+
+/// Bash passes what a glob matches, or the pattern itself when nothing does,
+/// so each of those has to stay inside. An expansion past its bounds is not
+/// confined.
+fn glob_stays_in_project(pattern: &str, workdir: &Path, project: &Path) -> bool {
+    expand_glob(pattern, workdir).is_some_and(|matches| {
+        if matches.is_empty() {
+            resolves_inside(pattern, workdir, project)
+        } else {
+            matches
+                .iter()
+                .all(|path| resolves_inside(path, workdir, project))
+        }
     })
 }
 
@@ -548,15 +643,28 @@ fn argument_stays_in_project(argument: &str, workdir: &Path, project: &Path) -> 
 /// An expansion, a glob, or a brace stands for text that is not in the command,
 /// so a rule reading that text is answering about something else.
 pub(crate) fn literal_arguments(scope: &ShellCommandScope) -> Option<Vec<&str>> {
+    reviewed_arguments(scope, &[])
+}
+
+/// `literal_arguments`, with each safe glob standing as its own pattern.
+fn reviewed_arguments<'a>(
+    scope: &'a ShellCommandScope,
+    globs: &[Option<&'a str>],
+) -> Option<Vec<&'a str>> {
     scope
         .arguments
         .as_ref()?
         .iter()
-        .map(|word| match word {
+        .enumerate()
+        .map(|(index, word)| match word {
             ShellWord::Literal(text) => Some(text.as_str()),
-            ShellWord::Undecodable => None,
+            ShellWord::Undecodable => glob_at(globs, index),
         })
         .collect()
+}
+
+fn glob_at<'a>(globs: &[Option<&'a str>], index: usize) -> Option<&'a str> {
+    globs.get(index).copied().flatten()
 }
 
 /// Text cannot see through a symlink, and a project can contain one pointing
@@ -567,7 +675,7 @@ pub(crate) fn literal_arguments(scope: &ShellCommandScope) -> Option<Vec<&str>> 
 /// above have already excluded every form that escapes, so a flag or a pattern
 /// joins the workdir and canonicalizes to its own lexical form, which is inside.
 /// Only a link can leave, and only resolving finds it.
-fn resolves_inside(operand: &str, workdir: &Path, project: &Path) -> bool {
+fn resolves_inside(operand: impl AsRef<Path>, workdir: &Path, project: &Path) -> bool {
     let path = workdir.join(operand);
     physical_boundary_check(project, &path) == Some(true)
         && !filesystem_permission_resource(
@@ -669,21 +777,42 @@ mod tests {
     #[test_case("find . -delete", Err(NotReadOnly::UnsupportedInvocation); "denied_delete")]
     #[test_case("rg --follow needle", Err(NotReadOnly::UnsupportedInvocation); "denied_nonwriting_flag")]
     #[test_case("git status --short", Ok(()); "read_only_git")]
+    #[test_case("git log -1 --format='%h %ci'", Ok(()); "git_log_format")]
+    #[test_case("git log --date=short --since=2.weeks", Ok(()); "git_log_date_window")]
+    #[test_case("git log --pretty --abbrev-commit --follow -- notes.md", Ok(()); "git_log_pretty_follow")]
+    #[test_case("git log --pretty='format:%G?'", Err(NotReadOnly::UnsupportedInvocation); "git_signature_placeholder_runs_gpg")]
+    #[test_case("git log --format=%GS", Err(NotReadOnly::UnsupportedInvocation); "git_signer_placeholder_runs_gpg")]
+    #[test_case("git log --show-signature", Err(NotReadOnly::UnsupportedInvocation); "git_show_signature_runs_gpg")]
+    #[test_case("git log --format '%h'", Err(NotReadOnly::UnsupportedInvocation); "git_detached_format_value")]
+    #[test_case("git diff --ext-diff", Err(NotReadOnly::UnsupportedInvocation); "git_external_diff")]
     #[test_case("cat notes.md > out.txt", Ok(()); "redirect_is_not_a_scope_fact")]
     #[test_case("cat .env", Ok(()); "protected_path_is_not_a_scope_fact")]
     #[test_case("cat /etc/shadow", Ok(()); "confinement_is_not_a_scope_fact")]
+    #[test_case("ls -la src/*", Ok(()); "a_glob_listing")]
+    #[test_case("echo src/*", Err(NotReadOnly::UndecodableWord); "echo_prints_the_names_a_glob_matches")]
+    #[test_case("rg needle src/*", Ok(()); "a_glob_after_the_search_pattern")]
+    #[test_case("grep -n needle src/*", Ok(()); "a_glob_after_the_grep_pattern")]
+    #[test_case("rg -n src/* notes.md", Err(NotReadOnly::UndecodableWord); "a_glob_that_could_be_the_search_pattern")]
+    #[test_case("git log -- src/*", Ok(()); "a_glob_pathspec")]
+    #[test_case("git log src/*", Err(NotReadOnly::UndecodableWord); "a_glob_that_could_be_a_revision")]
+    #[test_case("find src/* -name x", Err(NotReadOnly::UndecodableWord); "a_glob_for_a_reader_with_an_expression")]
     fn parsed_scope_verdicts(command: &str, expected: Result<(), NotReadOnly>) {
-        let scope = parsed_scope(command);
-        assert_eq!(shell_read_only_verdict(&scope), expected);
-        assert_eq!(scope_is_read_only(&scope), expected.is_ok());
+        assert_eq!(parsed_verdict(command), expected);
     }
 
-    fn parsed_scope(command: &str) -> ShellCommandScope {
+    fn parsed_verdict(command: &str) -> Result<(), NotReadOnly> {
         let program = parse_bash(command).unwrap();
         let contexts = program.command_contexts(Path::new(PROJECT));
-        let mut facts = shell_facts(&program, &contexts);
-        assert_eq!(facts.commands.len(), 1);
-        facts.commands.remove(0).scope
+        let facts = shell_facts(&program, &contexts);
+        let [command] = facts.commands.as_slice() else {
+            panic!("expected one command, got {}", facts.commands.len());
+        };
+        let verdict = shell_read_only_verdict(&command.scope, &command.globs);
+        assert_eq!(
+            scope_is_read_only(&command.scope, &command.globs),
+            verdict.is_ok()
+        );
+        verdict
     }
 
     #[test_case("python --version", Ok(()); "python")]
@@ -723,7 +852,7 @@ mod tests {
     #[test_case("cargo --version --verbose", Err(NotReadOnly::UnknownCommand); "an_extra_flag")]
     #[test_case("git --version --build-options", Err(NotReadOnly::UnsupportedInvocation); "an_extra_flag_to_a_known_reader")]
     fn version_probes_are_read_only(command: &str, expected: Result<(), NotReadOnly>) {
-        assert_eq!(shell_read_only_verdict(&parsed_scope(command)), expected);
+        assert_eq!(parsed_verdict(command), expected);
     }
 
     #[test_case("command -v rg", Ok(()); "command_lookup")]
@@ -741,14 +870,14 @@ mod tests {
     #[test_case("command -v $TOOL", Err(NotReadOnly::UndecodableWord); "a_name_that_is_not_literal")]
     #[test_case("/usr/bin/command -v rg", Err(NotReadOnly::SourceMismatch); "a_qualified_lookup")]
     fn name_lookups_are_read_only(command: &str, expected: Result<(), NotReadOnly>) {
-        assert_eq!(shell_read_only_verdict(&parsed_scope(command)), expected);
+        assert_eq!(parsed_verdict(command), expected);
     }
 
     #[test_case(None; "unenumerated_arguments")]
     #[test_case(Some(vec![ShellWord::Undecodable]); "undecodable_argument")]
     fn unavailable_words_have_a_decoding_reason(arguments: Option<Vec<ShellWord>>) {
         assert_eq!(
-            shell_read_only_verdict(&scope("pwd", arguments)),
+            shell_read_only_verdict(&scope("pwd", arguments), &[]),
             Err(NotReadOnly::UndecodableWord)
         );
     }
@@ -789,7 +918,7 @@ mod tests {
                     .find(|context| {
                         program.nodes()[context.command.0].span.start == scope.start_byte
                     })
-                    .is_some_and(|context| confined_read(scope, &context.incoming, project))
+                    .is_some_and(|context| confined_read(scope, &[], &context.incoming, project))
             })
             .collect()
     }

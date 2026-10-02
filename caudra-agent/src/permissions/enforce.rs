@@ -391,7 +391,7 @@ impl PermissionManager {
         {
             return Err(PermissionPolicyError(CURRENT_DEFAULT_DENIES_REQUEST.into()));
         }
-        let automatic = (mode == PermissionMode::Yolo && !context.plan_scoped)
+        let automatic = mode == PermissionMode::Yolo
             || (!context.forced
                 && !coverage.must_prompt
                 && (covered
@@ -410,7 +410,7 @@ impl PermissionManager {
             coverage,
             automatic,
             auto,
-            source: if mode == PermissionMode::Yolo && !context.plan_scoped {
+            source: if mode == PermissionMode::Yolo {
                 DECISION_SOURCE_YOLO
             } else if matches!(
                 auto,
@@ -1054,23 +1054,25 @@ impl PermissionManager {
     }
 }
 
-/// Withdraws the lifetimes that would outlive the plan being built.
+/// Withdraws the lifetimes a plan may not hand out: all projects for every
+/// allow, and this project for a broad one.
 ///
 /// `commit_structured_decision` validates an answer against the lifetimes the
-/// request carried, so withdrawing them here is what refuses a project or
-/// global answer from any client, not just from a prompt that hid the keys.
-/// Denials keep theirs: a plan may not widen authority, but narrowing it is
-/// always the user's to make.
+/// request carried, so withdrawing them here is what refuses such an answer
+/// from any client, not just from a prompt that hid the keys. A narrow grant
+/// kept for the project also files a conversation copy, because remembered
+/// rules never reach a plan-scoped call. Denials keep theirs: a plan may not
+/// widen authority, but narrowing it is always the user's to make.
 pub(super) fn contain_authority_to_the_plan(request: &mut PermissionRequest) {
     for option in &mut request.options {
         if option.rule.effect != StructuredPermissionEffect::Allow {
             continue;
         }
-        option.allowed_lifetimes.retain(|lifetime| {
-            matches!(
-                lifetime,
-                PermissionLifetime::Once | PermissionLifetime::Conversation
-            )
+        let broad = option.confirmation.is_some();
+        option.allowed_lifetimes.retain(|lifetime| match lifetime {
+            PermissionLifetime::Once | PermissionLifetime::Conversation => true,
+            PermissionLifetime::Project => !broad,
+            PermissionLifetime::Global => false,
         });
     }
 }
@@ -1123,7 +1125,7 @@ pub(super) mod tests {
     use super::{
         ACTIVE_PLAN_INTENT_MISMATCH, AutoEligibility, CURRENT_DEFAULT_DENIES_REQUEST,
         CURRENT_POLICY_DENIES_REQUEST, EvaluationContext, PendingDecision, PendingPermission,
-        PendingRegistration, remove_pending,
+        PendingRegistration, contain_authority_to_the_plan, remove_pending,
     };
     use crate::permissions::tests::{
         CONTROLLED_REQUEST, FIRST_COMMAND, SECOND_COMMAND, controlled_enforcement, remember_command,
@@ -1187,6 +1189,9 @@ pub(super) mod tests {
     use std::sync::Arc;
 
     const REPLACEMENT_COMMAND: &str = "cargo clean";
+    const RUSTFMT_COMMAND: &str = "rustfmt --edition 2024 --check src/lib.rs";
+    const BROAD_RUSTFMT_PATTERN: &str = "rustfmt *";
+    const NARROW_RUSTFMT_PATTERN: &str = "rustfmt --edition *";
     const AUTO_BUILTIN_ASK: &str = "git push origin main";
     const BUILTIN_PUSH_ASK: &str = "git push *";
     const PLAN_DOCUMENT: &str = "active-plan.md";
@@ -1637,7 +1642,7 @@ pub(super) mod tests {
 
     #[test_case(true, false; "persistent_reviewed_project")]
     #[test_case(false, false; "nonpersistent_canonical_project")]
-    #[test_case(true, true; "persistent_plan_withdraws_project")]
+    #[test_case(true, true; "persistent_plan_keeps_a_narrow_project_grant")]
     #[test_case(false, true; "nonpersistent_plan")]
     fn enforcement_presentation_names_only_available_reviewed_project_grants(
         persistent: bool,
@@ -1685,7 +1690,7 @@ pub(super) mod tests {
             let AgentEvent::PermissionRequest(request) = received.try_recv().unwrap().event else {
                 panic!("expected permission request");
             };
-            let expected_project = (persistent && !plan_scoped).then_some(reviewed_project);
+            let expected_project = persistent.then_some(reviewed_project);
             assert_eq!(request.presentation.project, expected_project);
             assert_eq!(
                 manager
@@ -1695,15 +1700,12 @@ pub(super) mod tests {
                     .project,
                 expected_project
             );
-            assert_eq!(
-                request.options.iter().any(|option| {
-                    option.rule.effect == StructuredPermissionEffect::Allow
-                        && option
-                            .allowed_lifetimes
-                            .contains(&PermissionLifetime::Project)
-                }),
-                !plan_scoped
-            );
+            assert!(request.options.iter().any(|option| {
+                option.rule.effect == StructuredPermissionEffect::Allow
+                    && option
+                        .allowed_lifetimes
+                        .contains(&PermissionLifetime::Project)
+            }));
             let answer = if expected_project.is_some() {
                 PermissionAnswer::AllowAlwaysLocal
             } else {
@@ -1712,9 +1714,14 @@ pub(super) mod tests {
             assert!(manager.answer(CONTROLLED_REQUEST, answer));
             assert!(enforcement.await.is_ok());
             if expected_project.is_some() {
-                let inventory = manager.structured_rule_inventory().unwrap();
-                assert_eq!(inventory.len(), 1);
-                assert_eq!(inventory[0].project, expected_project);
+                let stored: Vec<_> = manager
+                    .structured_rule_inventory()
+                    .unwrap()
+                    .into_iter()
+                    .filter(|record| record.rule.lifetime == PermissionLifetime::Project)
+                    .map(|record| record.project)
+                    .collect();
+                assert_eq!(stored, [expected_project]);
             }
         });
     }
@@ -2830,16 +2837,14 @@ pub(super) mod tests {
 
     /// The point of plan containment: one approval while planning is enough to
     /// keep exploring, so the model can run the scripts the plan needs.
-    #[test_case(PermissionMode::Ask; "ask")]
-    #[test_case(PermissionMode::Yolo; "yolo")]
-    fn a_conversation_grant_covers_later_plan_scoped_commands(mode: PermissionMode) {
+    #[test]
+    fn a_conversation_grant_covers_later_plan_scoped_commands() {
         smol::block_on(async {
             let temp = tempfile::tempdir().unwrap();
             let project = temp.path().join("project");
             std::fs::create_dir(&project).unwrap();
             let manager =
                 persistent_manager(StateDir::from_path(temp.path().join("state")), &project);
-            manager.set_seed_mode(mode);
             assert!(
                 enforce_plan_command_without_prompt(&manager, &project, "cargo check > /tmp/out")
                     .await
@@ -2866,9 +2871,8 @@ pub(super) mod tests {
 
     /// Containment cuts the other way too: authority the plan never asked for
     /// does not apply to it, however durable that authority is.
-    #[test_case(PermissionMode::Ask; "ask")]
-    #[test_case(PermissionMode::Yolo; "yolo")]
-    fn a_project_grant_does_not_cover_a_plan_scoped_command(mode: PermissionMode) {
+    #[test]
+    fn a_project_grant_does_not_cover_a_plan_scoped_command() {
         smol::block_on(async {
             let temp = tempfile::tempdir().unwrap();
             let project = temp.path().join("project");
@@ -2886,7 +2890,6 @@ pub(super) mod tests {
             .await
             .unwrap();
 
-            manager.set_seed_mode(mode);
             assert!(
                 enforce_opaque_command_without_prompt(&manager, &project, command)
                     .await
@@ -2900,11 +2903,72 @@ pub(super) mod tests {
         });
     }
 
-    #[test_case(PermissionLifetime::Project ; "project")]
-    #[test_case(PermissionLifetime::Global ; "global")]
-    fn a_plan_scoped_prompt_refuses_a_lifetime_that_outlives_the_plan(
-        lifetime: PermissionLifetime,
-    ) {
+    #[test]
+    fn yolo_runs_plan_scoped_commands_without_storing_rules() {
+        smol::block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let project = temp.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let manager =
+                persistent_manager(StateDir::from_path(temp.path().join("state")), &project);
+            manager.set_seed_mode(PermissionMode::Yolo);
+
+            assert!(
+                enforce_plan_command_without_prompt(&manager, &project, "python3 - <<'PY'")
+                    .await
+                    .is_ok()
+            );
+            assert!(manager.structured_rule_inventory().unwrap().is_empty());
+        });
+    }
+
+    /// A narrow grant kept for the project while planning also files a
+    /// conversation copy, which is what lets the rest of this plan use it.
+    #[test]
+    fn a_narrow_project_grant_while_planning_covers_the_rest_of_the_plan() {
+        smol::block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let project = temp.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let manager =
+                persistent_manager(StateDir::from_path(temp.path().join("state")), &project);
+            let command = "cargo check";
+
+            let (accepted, granted, _) = answer_plan_command(
+                Arc::clone(&manager),
+                &project,
+                command,
+                PermissionAnswer::AllowAlwaysLocal,
+            )
+            .await;
+            assert!(accepted);
+            assert!(granted.is_ok());
+
+            let lifetimes: Vec<_> = manager
+                .structured_rule_inventory()
+                .unwrap()
+                .into_iter()
+                .map(|record| record.rule.lifetime)
+                .collect();
+            assert_eq!(
+                lifetimes,
+                [
+                    PermissionLifetime::Conversation,
+                    PermissionLifetime::Project
+                ]
+            );
+            assert!(
+                enforce_plan_command_without_prompt(&manager, &project, command)
+                    .await
+                    .is_ok()
+            );
+        });
+    }
+
+    #[test_case(workdir_grant(PermissionLifetime::Project) ; "a broad rung for the project")]
+    #[test_case(workdir_grant(PermissionLifetime::Global) ; "a broad rung for all projects")]
+    #[test_case(PermissionAnswer::AllowAlwaysGlobal ; "a narrow rung for all projects")]
+    fn a_plan_scoped_prompt_refuses_what_a_plan_may_not_keep(answer: PermissionAnswer) {
         smol::block_on(async {
             let temp = tempfile::tempdir().unwrap();
             let project = temp.path().join("project");
@@ -2912,15 +2976,11 @@ pub(super) mod tests {
             let manager =
                 persistent_manager(StateDir::from_path(temp.path().join("state")), &project);
 
-            let (accepted, _, request) = answer_plan_command(
-                Arc::clone(&manager),
-                &project,
-                "cargo check",
-                workdir_grant(lifetime),
-            )
-            .await;
+            let (accepted, _, request) =
+                answer_plan_command(Arc::clone(&manager), &project, "cargo check", answer).await;
 
             assert!(!accepted);
+            assert!(manager.structured_rule_inventory().unwrap().is_empty());
             let offered = request
                 .options
                 .iter()
@@ -2931,6 +2991,41 @@ pub(super) mod tests {
                 vec![PermissionLifetime::Conversation]
             );
         });
+    }
+
+    /// A written pattern rides the exact rung, which a plan may keep for the
+    /// project, so a pattern broad enough to need confirming is held to the
+    /// conversation on its own.
+    #[test_case(BROAD_RUSTFMT_PATTERN, PermissionLifetime::Project, true, false ; "a broad pattern for the project while planning")]
+    #[test_case(BROAD_RUSTFMT_PATTERN, PermissionLifetime::Conversation, true, true ; "a broad pattern for the conversation while planning")]
+    #[test_case(BROAD_RUSTFMT_PATTERN, PermissionLifetime::Project, false, true ; "a broad pattern for the project outside a plan")]
+    #[test_case(NARROW_RUSTFMT_PATTERN, PermissionLifetime::Project, true, true ; "a narrow pattern for the project while planning")]
+    fn a_plan_holds_a_broad_written_pattern_to_the_conversation(
+        pattern: &str,
+        lifetime: PermissionLifetime,
+        plan_scoped: bool,
+        accepted: bool,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let manager =
+            persistent_manager(StateDir::from_path(temp.path().join("state")), temp.path());
+        let mut request = shell_request(&[RUSTFMT_COMMAND], workcell_shell_subject());
+        if plan_scoped {
+            contain_authority_to_the_plan(&mut request);
+        }
+        let answer = PermissionAnswer::AllowComposed {
+            rows: vec![Some(ComposedRow {
+                grant: PermissionRowGrant::Written(pattern.into()),
+                lifetime,
+            })],
+        };
+
+        assert_eq!(
+            manager
+                .commit_structured_decision(&request, &answer, Some(temp.path()), plan_scoped)
+                .is_ok(),
+            accepted
+        );
     }
 
     /// Containment narrows. A deny is narrowing, so the plan still obeys it

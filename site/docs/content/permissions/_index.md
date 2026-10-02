@@ -49,7 +49,7 @@ A user-created fork starts with no conversation grants and no inherited explicit
 
 ## Cross-session messages
 
-[Cross-session messaging](/docs/sessions/#cross-session-messaging) needs the global experimental opt-in in every participating process. Tool permission rules cannot enable it. `send_message` is a side effect subject to outgoing authorization. ReadOnly sessions cannot send, and Plan sessions need explicit prompted access.
+[Cross-session messaging](/docs/sessions/#cross-session-messaging) needs the global experimental opt-in in every participating process. Tool permission rules cannot enable it. `send_message` is a side effect subject to outgoing authorization. ReadOnly sessions cannot send. Plan sessions ask before sending unless [YOLO mode](#yolo-mode) is on.
 
 Receiving has a separate policy under `[agent.messaging]`:
 
@@ -70,7 +70,7 @@ Delivery exposes the message to the recipient's model provider as conversation c
 
 ## Permission prompts
 
-A prompt asks one question, such as `Allow shell command?` or `Allow fetching a web page?`, and offers numbered answers. Above them it shows the request as the tool receives it. Likely secret values and URL query values are masked, and terminal controls are escaped. The folder a command starts in appears when it is not the project root, and a path outside the project is marked `⚠ Outside this project`. The right edge of the title names the subagent that asks, the place in the queue, such as `1 of 3`, and how many commands of a batch need an answer.
+A prompt asks one question, such as `Allow shell command?` or `Allow fetching a web page?`, and offers numbered answers. Above them it shows the request as the tool receives it. Likely secret values and URL query values are masked, and terminal controls are escaped. Commands are coloured as shell code, with the body of a heredoc in the language of the program that reads it, as described under [Markdown](/docs/markdown/#shell-code). The folder a command starts in appears when it is not the project root, and a path outside the project is marked `⚠ Outside this project`. The right edge of the title names the subagent that asks, the place in the queue, such as `1 of 3`, and how many commands of a batch need an answer.
 
 ```text
 ╭ Allow shell command? ────────────────────────────────────────────────────────╮
@@ -86,16 +86,16 @@ A prompt asks one question, such as `Allow shell command?` or `Allow fetching a 
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
-The phrase between `‹` and `›` is the scope a remembered answer covers. A command offers `this exact command`, any suggested templates such as `cargo check -p <pattern1>`, and token prefixes such as `cargo test *`. It starts on a suggested template, else on the prefix, else on the exact command. A web page starts on `this page and below`, and a file read on `this file`. `Left` and `Right` narrow or widen the scope before you answer, and the answers change with it. Blanket grants such as `any shell command` are offered only in [Customize](#customize).
+The phrase between `‹` and `›` is the scope a remembered answer covers. A command offers `this exact command`, any suggested templates such as `cargo check -p <pattern1>`, and its token prefixes from the longest to the shortest, such as `cargo test -p caudra-agent *`, `cargo test *`, and `cargo *`. It starts on a suggested template, else on the [derived prefix](#shell-parsing), else on the exact command. A web page starts on `this page and below`, and a file read on `this file`. `Left` and `Right` narrow or widen the scope before you answer, and the answers change with it. Blanket grants such as `any shell command` are offered only in [Customize](#customize).
 
-Warnings appear above the answers as `⚠` lines. They name a protected path, a line Caudra cannot check command by command, the reach of the selected scope, or a [decision engine](#decision-engine-advice) caution such as `⚠ May delete files (88%)`. A muted line explains an unusual reason for asking, such as `While planning, approvals last for this conversation.` or a line starting with `Auto asked:`. Details gives the usual reason.
+Warnings appear above the answers as `⚠` lines. They name a protected path, a line Caudra cannot check command by command, the reach of the selected scope, or a [decision engine](#decision-engine-advice) caution such as `⚠ May delete files (88%)`. A muted line explains an unusual reason for asking, such as `Plan mode asks before anything it can't prove read-only.` or a line starting with `Auto asked:`. Details gives the usual reason.
 
 The answers depend on what can be remembered:
 
 | Request | Answers |
 |---|---|
 | Most requests | `Yes`, `Yes, and allow ‹scope› for this conversation`, `Yes, and always allow ‹scope› in this project`, `No, and tell the agent what to do instead` |
-| Plan mode, or no project to bind a rule to | The same without the project answer, renumbered |
+| A broad scope while planning, or no project to bind a rule to | The same without the project answer, renumbered |
 | A line Caudra cannot check command by command, such as an inline script | `Yes, run it once`, `No, and tell the agent what to do instead` |
 
 The `No` answer opens a one-line field for guidance. `Enter` sends the guidance to the agent, and an empty field denies without it. `Esc` leaves the field without answering.
@@ -139,9 +139,11 @@ When policy changes, each pending request rechecks its own current policy and re
 │  Effect     [Allow]  Deny                                                    │
 │  Remember    Once  [This conversation]  This project   All projects          │
 │  Scope        this exact command                                             │
+│               cargo test -p caudra-agent *                                   │
 │             ❯ cargo test *                                                   │
+│               cargo *  ⚠ broad                                               │
 │               your own pattern…                                              │
-│               any command in this project  ⚠ broad                           │
+│               any command in this folder  ⚠ broad                            │
 │               any shell command  ⚠ broad                                     │
 │                                                                              │
 │  Tab next field  ↑↓ choose  Enter apply  v advanced  Esc back                │
@@ -152,9 +154,11 @@ When policy changes, each pending request rechecks its own current policy and re
 |---|---|
 | Effect | Allow, or Deny to refuse the request once, for this project, or for all projects |
 | Remember | Once, This conversation, This project, or All projects, limited to the lifetimes the chosen scope allows |
-| Scope | The ladder from the main view, then `your own pattern…` and the blanket grants marked `⚠ broad`. A suggested template is marked `suggested` |
+| Scope | The ladder from the main view, then `your own pattern…` and the blanket grants. A suggested template is marked `suggested`, and a scope that needs [confirmation](#confirming-broad-grants) is marked `⚠ broad` |
 
 Opened from the step-through's Review, Customize lists scopes for the whole line: these commands exactly and the blanket grants. Under Deny it offers `this exact script`.
+
+While planning, Remember offers This project only for a scope that is not broad, and never All projects. A broad scope adds the line `While planning, broad scopes last for this conversation.` See [Plan mode](#plan-mode).
 
 | Key | Customize action |
 |---|---|
@@ -173,7 +177,7 @@ Some scopes reach far enough that Caudra asks again before it stores them. Choos
 
 | Phrase | Scope |
 |---|---|
-| `ALLOW BROAD SHELL ACCESS` | Any shell command, any command in a folder, or a pattern of your own with one literal word |
+| `ALLOW BROAD SHELL ACCESS` | Any shell command, any command in a folder, a whole program such as `cargo *`, or a pattern of your own with one literal word |
 | `ALLOW OUTSIDE HOME` | A folder that takes in your home directory |
 | `ALLOW DIRECTORY CHANGES` | Changes anywhere below a folder |
 | `ALLOW FILE CHANGES` | Changes to the files of this request |
@@ -233,7 +237,7 @@ A shell line can run several commands. When it does, the prompt gives each comma
 
 More than three allowed rows fold into one line, such as `+ 5 already allowed`, and Details lists them.
 
-`▸` marks the focused row. `Tab` and `Shift-Tab` move between the new rows, `Left` and `Right` walk the focused row's ladder, and `<` and `>` move every new row one step. A row at the end of its ladder stays put. Each ladder runs narrowest first: `this time only`, `this exact command`, suggested templates, then token prefixes from the longest to the shortest. A row starts on its suggested template, else on its prefix, else on the exact command.
+`▸` marks the focused row. `Tab` and `Shift-Tab` move between the new rows, `Left` and `Right` walk the focused row's ladder, and `<` and `>` move every new row one step. A row at the end of its ladder stays put. Each ladder runs narrowest first: `this time only`, `this exact command`, suggested templates, then token prefixes from the longest to the shortest. The shortest prefix names the program alone, such as `cargo *`, and needs [confirmation](#confirming-broad-grants). A row starts on its suggested template, else on its derived prefix, else on the exact command.
 
 Answers 2 and 3 count the rows they remember, as in `these 3 commands`, or name the scope when only one row is remembered. With every row on `this time only`, they are left out. Answer 2 remembers each row for this conversation, and answer 3 in this project. The [step-through](#step-through) gives each command its own lifetime.
 
@@ -259,7 +263,8 @@ A line Caudra cannot check command by command, such as one running an inline scr
 │    1. This time only                                                         │
 │    2. This exact command                                                     │
 │  ❯ 3. cargo fmt *                                                            │
-│    4. Your own pattern…                                                      │
+│    4. cargo *                                                        ⚠ broad │
+│    5. Your own pattern…                                                      │
 │                                                                              │
 │  Remember for ‹this conversation›                                            │
 │                                                                              │
@@ -267,7 +272,7 @@ A line Caudra cannot check command by command, such as one running an inline scr
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
-A page lists the command's whole ladder as numbered answers, with badges such as `suggested`. `Your own pattern…` opens a field for [a pattern of your own](#writing-your-own-pattern). `Remember for` sets how long this command is remembered: this conversation, this project, or all projects. It offers only the lifetimes the chosen scope allows and is hidden while `This time only` is chosen. In plan mode it offers only this conversation.
+A page lists the command's whole ladder as numbered answers, with badges such as `suggested` and `⚠ broad`. `Your own pattern…` opens a field for [a pattern of your own](#writing-your-own-pattern). `Remember for` sets how long this command is remembered: this conversation, this project, or all projects. It offers only the lifetimes the chosen scope allows and is hidden while `This time only` is chosen. In plan mode it offers this conversation, and this project for a scope that is not broad.
 
 | Key | Page action |
 |---|---|
@@ -383,9 +388,13 @@ Selecting Plan while Build work runs does not change that work. A conflicting su
 
 The main agent's [`plan` tool](/docs/tools/#plan) can read or replace only the committed active plan target. Exact-target writes can receive scoped plan approval, but explicit denies, configured asks, and a default Deny still apply. Reads use normal permission checks. A profile can disable the tool, and tasks do not receive the parent's plan-write capability.
 
-While plan mode is active, Caudra withholds the authority that would outlive the plan. Remembered project and global rules do not apply, allows from `permissions.toml` do not apply, and the prompt offers only the once and conversation lifetimes. Deny and ask rules still apply, because they only restrict access.
+While plan mode is active, Caudra withholds the authority that would outlive the plan. Remembered project and global rules do not apply, and allows from `permissions.toml` do not apply. Deny and ask rules still apply, because they only restrict access.
 
 A conversation grant made while planning does apply for the rest of the plan. Approving broad shell authority for the conversation lets the agent keep exploring with scripts and searches instead of asking about each command. The grant stays with the conversation after you leave plan mode. `Yes` covers only the current call.
+
+A narrow scope, such as this exact command or `git log *`, can also be kept for this project. Caudra stores the project rule together with a copy for this conversation, so the grant covers the rest of the plan as well as later Build work, and `/permissions` lists both. A plan in another conversation still asks, because project rules never apply while planning. A broad scope, such as `cargo *` or `any shell command`, lasts this conversation at most, and no grant made while planning lasts for all projects.
+
+With [YOLO mode](#yolo-mode) on, plan mode skips these prompts too. YOLO approves each call once and stores no rule. Plan mode still refuses what it always refuses, such as file writes outside the plan.
 
 Reading this project's plans and memory notes never asks, in plan mode or any other mode. The file and code tools may read the `plans/` and `memories/` directories under `…/state/caudra/projects/<project-id>/` (see [Directory layout](/docs/configuration/#directory-layout)). The allowance covers reads only, and another project's documents still ask. A symlink inside those directories cannot carry a read outside them. Tools in a remote workspace run on another machine, so they get no such allowance.
 
@@ -393,9 +402,11 @@ Reading this project's plans and memory notes never asks, in plan mode or any ot
 
 A read-only agent is a subagent that may not change anything: research tasks, `task` calls in plan mode, and every agent a workflow starts in `read-only` capability mode. Only audited host tools with safe call effects are eligible. Ordinary MCP and plugin tools are excluded. When an audited `shell` is available, Caudra judges each command line rather than the tool as a whole.
 
-A line is admitted when the classifier rules every command in it read-only and every path it touches resolves inside the project. `git diff`, `git log`, `rg`, and `wc -l` pass. Anything that writes, anything the parser could not read, and anything reaching outside the project is refused with a message naming the call and the reason, and the agent can retry with a narrower line. The same classifier answers here and in plan mode, so a command plan mode would refuse is refused here too.
+A line is admitted when the classifier rules every command in it read-only and every path it touches resolves inside the project. `git diff`, `git log`, `rg`, and `wc -l` pass. Git options that only shape what is printed pass in their `=` form, such as `--format='%h %ci'`, `--date=short`, and `--since=2.weeks`. A format holding `%G` does not, because signature placeholders run gpg. Anything that writes, anything the parser could not read, and anything reaching outside the project is refused with a message naming the call and the reason, and the agent can retry with a narrower line. The same classifier answers here and in plan mode, so a command plan mode would refuse is refused here too.
 
 The confinement check resolves symlinks before it answers, so a link checked into the repository cannot carry a read out of the project. It says nothing about what an admitted command reads inside the project: a read-only agent can still read any file you have.
+
+A glob that [shell parsing](#shell-parsing) can check, such as `src/*`, is expanded the way Bash does by default before the check: `*` never crosses `/` and skips names that start with a dot. Every match must resolve inside the project. A glob counts only where its matches are paths to read: an operand of `ls`, `cat`, `head`, `tail`, `wc`, `du`, `file`, `stat`, `tree`, or `sort`, an operand after the pattern of `grep` or `rg`, or a path after `--` in a Git read, so `echo src/*` is not admitted. Expansion stops after 4096 directory entries or 1024 matches, and a glob past either limit is refused. A remote workspace refuses globs, because Caudra cannot list its files.
 
 A read-only agent's file tools can also read this project's plans and memory notes without asking, as described under [Plan mode](#plan-mode). A shell line reading them is refused, because they sit outside the project.
 
@@ -403,7 +414,7 @@ Profiles cannot relax this restriction. Safe lazy tools remain discoverable thro
 
 ## Stored rules
 
-Use `/permissions` to manage stored conversation, project, and global rules and inspect policy. Builtin, configured, and trusted-plugin policy appears alongside stored rules. Each row reads as a sentence: the effect, the scope, how long it lasts, and who added it.
+Use `/permissions` to manage stored conversation, project, and global rules and inspect policy. Builtin, configured, and trusted-plugin policy appears alongside stored rules. Each row reads as a sentence: the effect, the scope, how long it lasts, and who added it. Commands and command patterns in the list and the detail pane are coloured as shell code.
 
 ```text
 Allow  cargo test *              this project       you
@@ -662,13 +673,15 @@ A shell prompt can offer a token prefix derived from the reviewed command. A cur
 
 A derived prefix never reaches past a flag, so `docker -H tcp://host run nginx` offers no prefix. A prefix taken from outside the table must name more than the executable and must leave at least one operand behind, which is why `git status` offers no prefix. Caudra also avoids deriving prefixes that overlap a default ask family, because storing `git checkout main *` would silence the `git checkout *` ask.
 
+A command's ladder also offers its other token prefixes, from the longest to the shortest, though a row never starts on one. Unlike the derived prefix, they can include flags. A flag keeps its value when the value is not a flag and holds no `/` or `.`, so `rustfmt --edition 2024 --check f.rs` offers `rustfmt --edition 2024 --check *`, `rustfmt --edition 2024 *`, and `rustfmt *`, and starts on the exact command. The shortest prefix names the program alone and is broad. It needs [confirmation](#confirming-broad-grants) and lasts this conversation at most while planning. It is never offered for shells, interpreters, wrappers, or privileged and indirect commands such as `bash`, `python3`, `env`, `sudo`, and `eval`, because any use of those can run any code. Prefixes that overlap a default ask family are left out, so `git log -1` offers `git log -1 *` and `git log *` but not `git *`.
+
 Some lines cannot be checked command by command. Caudra then reviews the whole line as one protected request, names the cause in a `⚠` line, and offers only `Yes, run it once` and `No`:
 
 | Cause | Examples | Warning | Auto |
 |---|---|---|---|
 | Loops and conditions | `for`, `while`, `if`, `case`, functions | `Uses loops or conditions that rules can't check` | Screened |
 | File redirects | `> out.txt`, or data in a heredoc such as `cat <<'EOF'` | `Redirects input or output in ways rules can't check` | Screened |
-| Words built at run time | `$(…)`, `<(…)`, `$((…))`, `$HOME`, assignments, `cd` to a computed path | `Builds part of the command only when it runs` | Screened |
+| Words built at run time | `$(…)`, `<(…)`, `$((…))`, `$HOME`, assignments, `cd` to a computed path, globs such as `*.rs` or `~/x*` | `Builds part of the command only when it runs` | Screened |
 | Wrappers | `env`, `time`, `xargs`, `command`, `builtin`, `coproc`, `bash script.sh` | `Runs a command through another program` | Screened |
 | Inline scripts | A heredoc or here-string fed to an interpreter, `python3 -c`, `node -e`, `bash -c` | `Runs inline Python that Caudra can't check`, naming the language | Screened |
 | Indirect code | `eval`, `source`, `.` | `Runs code through eval or source` | Always asks |
@@ -676,6 +689,8 @@ Some lines cannot be checked command by command. Caudra then reviews the whole l
 | Unreadable | Syntax errors, an executable that is not literal, other unsupported syntax | `Caudra couldn't read this command line` | Always asks |
 
 The most severe cause names the line, so `eval` in a loop always asks. A redirect to `/dev/null` or between descriptors, such as `2>&1`, keeps a line checkable. Caudra looks inside loops, conditions, and substitutions for the commands they run. It also parses literal shell code given to `bash -c` or fed to a shell on standard input, up to two shells deep. Code that is not literal, or nested deeper, is unreadable. [Auto mode](#auto-mode) describes screening.
+
+A glob stays checkable when it starts with a letter, digit, `.`, `_`, `/`, `+`, `@`, `:`, `,`, or `=`, and holds nothing but those characters, `-`, the wildcards `*` and `?`, and bracket classes such as `[0-9]`. `ls src/*` then gets a row and a ladder like any other command, a rule for `ls *` covers it, and deny and ask rules see it too. Any other glob is built at run time. A leading wildcard could expand to a name that reads as a flag, so write `./*.rs` rather than `*.rs`.
 
 Interpreted payloads and sensitivity guards also prevent argument-pattern suggestions. Successful parsing alone does not establish reusable authority.
 
@@ -788,5 +803,7 @@ Use [`caudra decisions`](/docs/cli/#caudra-decisions) to inspect configuration a
 `/yolo` and `--yolo` skip prompts after deny rules and hard restrictions have run. The status bar shows `[yolo]` while enabled, or `[!]` when the terminal is too narrow to spell it. The warning is the last chip its row gives up, so a narrow terminal drops the reasoning level before it. Clicking it turns YOLO off and brings prompts back, from a task footer as well as the main one.
 
 An explicit `/yolo` choice is stored with the root conversation. A user-created fork and `/new` start without that explicit state. `--yolo` selects YOLO at startup.
+
+YOLO approves each call once and stores no rule, so turning it off brings back the prompts your rules do not cover. In plan mode it also skips the prompts for commands plan mode cannot prove read-only and for `send_message`. Plan mode still refuses what it always refuses, such as file writes outside the plan.
 
 Decision-engine screening never interrupts YOLO, including in plan mode. Engine advice is not shown in YOLO. Deterministic denies and hard capability restrictions still apply.

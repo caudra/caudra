@@ -225,7 +225,7 @@ fn named_writes(
 
 /// The operands a command writes, or `None` when it could write anything else.
 fn written_operands(scope: &ShellCommandScope) -> Option<Vec<String>> {
-    if scope_is_read_only(scope) {
+    if scope_is_read_only(scope, &[]) {
         return Some(Vec::new());
     }
     if scope.source != scope.normalized {

@@ -120,7 +120,7 @@ impl PermissionManager {
             .context_revision
             .read()
             .unwrap_or_else(|error| error.into_inner());
-        let (request, project, sender) = {
+        let (request, project, plan_scoped, sender) = {
             let mut pending = self.pending();
             let Some(candidate) = pending
                 .get_mut(&self.id)
@@ -139,10 +139,16 @@ impl PermissionManager {
             (
                 candidate.request.clone(),
                 candidate.project.clone(),
+                candidate
+                    .evaluation
+                    .as_ref()
+                    .is_some_and(|evaluation| evaluation.plan_scoped),
                 candidate.sender.clone(),
             )
         };
-        if let Err(error) = self.commit_structured_decision(&request, &answer, project.as_deref()) {
+        if let Err(error) =
+            self.commit_structured_decision(&request, &answer, project.as_deref(), plan_scoped)
+        {
             self.release_failed_answer(request_id, &sender);
             warn!(%error, request_id, "permission decision was not committed");
             return false;
@@ -963,6 +969,7 @@ mod tests {
                     &request,
                     &PermissionAnswer::AllowAlwaysLocal,
                     Some(temp.path()),
+                    false,
                 )
                 .unwrap();
             if effect == Effect::Deny {
@@ -1225,7 +1232,8 @@ mod tests {
                         option_id: "not-offered".into(),
                         lifetime: PermissionLifetime::Conversation,
                     },
-                    None
+                    None,
+                    false,
                 )
                 .is_err()
         );

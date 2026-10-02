@@ -1,6 +1,7 @@
 pub(crate) mod code_view;
 pub mod command;
 pub(crate) mod command_modal;
+pub(crate) mod command_text;
 pub(crate) mod commit_popup;
 pub(crate) mod completion;
 pub(crate) mod context_modal;
@@ -440,8 +441,27 @@ pub(crate) fn hanging_lines(
     text: Span<'static>,
     width: u16,
 ) -> Vec<Line<'static>> {
+    hanging_spans(prefix, vec![text], width)
+}
+
+/// [`hanging_lines`] for text in more than one style, such as a coloured
+/// command. Each row keeps the styles of the characters it took.
+pub(crate) fn hanging_spans(
+    prefix: Span<'static>,
+    spans: Vec<Span<'static>>,
+    width: u16,
+) -> Vec<Line<'static>> {
     let indent = UnicodeWidthStr::width(prefix.content.as_ref()) as u16;
-    let chars: Vec<char> = text.content.chars().collect();
+    let styled: Vec<(char, Style)> = spans
+        .iter()
+        .flat_map(|span| {
+            span.content
+                .chars()
+                .map(|character| (character, span.style))
+        })
+        .collect();
+    let chars: Vec<char> = styled.iter().map(|(character, _)| *character).collect();
+    let first_style = spans.first().map(|span| span.style).unwrap_or_default();
     let mut starts = vec![0];
     starts.extend(
         wrap_breaks(&chars, width.saturating_sub(indent).max(1))
@@ -453,21 +473,30 @@ pub(crate) fn hanging_lines(
         .iter()
         .enumerate()
         .map(|(row, &start)| {
-            let end = starts.get(row + 1).copied().unwrap_or(chars.len());
+            let mut end = starts.get(row + 1).copied().unwrap_or(chars.len());
             // Trailing spaces are what the wrap broke on; keeping them could
             // push a row past the width it was measured for.
-            let content: String = chars[start..end].iter().collect();
-            let content = match end == chars.len() {
-                true => content,
-                false => content.trim_end().to_owned(),
-            };
-            Line::from(vec![
-                match row {
-                    0 => prefix.clone(),
-                    _ => hang.clone(),
-                },
-                Span::styled(content, text.style),
-            ])
+            if end != chars.len() {
+                while end > start && chars[end - 1].is_whitespace() {
+                    end -= 1;
+                }
+            }
+            let mut line = vec![match row {
+                0 => prefix.clone(),
+                _ => hang.clone(),
+            }];
+            for run in styled[start..end].chunk_by(|left, right| left.1 == right.1) {
+                line.push(Span::styled(
+                    run.iter()
+                        .map(|(character, _)| character)
+                        .collect::<String>(),
+                    run[0].1,
+                ));
+            }
+            if line.len() == 1 {
+                line.push(Span::styled(String::new(), first_style));
+            }
+            Line::from(line)
         })
         .collect()
 }

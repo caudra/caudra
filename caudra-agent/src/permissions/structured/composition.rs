@@ -75,6 +75,35 @@ impl PermissionRequest {
         }
         Ok(rules)
     }
+    /// Whether a row's written pattern is broad enough to need confirming.
+    pub fn broad_written_grant(&self, index: usize, grant: &PermissionRowGrant) -> bool {
+        let PermissionRowGrant::Written(pattern) = grant else {
+            return false;
+        };
+        self.resources.get(index).is_some_and(|resource| {
+            grade_command_pattern(pattern, &resource.value)
+                .is_ok_and(|grade| grade.confirmation.is_some())
+        })
+    }
+    /// Plan mode keeps every broad rung to this conversation, and a written
+    /// pattern rides the exact rung, so its own breadth is checked here.
+    pub(crate) fn contain_rows_to_the_plan(
+        &self,
+        rows: &[Option<ComposedRow>],
+    ) -> Result<(), ComposedAnswerError> {
+        let outlives = rows.iter().enumerate().find(|(index, row)| {
+            row.as_ref().is_some_and(|row| {
+                row.lifetime > PermissionLifetime::Conversation
+                    && self.broad_written_grant(*index, &row.grant)
+            })
+        });
+        match outlives {
+            Some((index, _)) => Err(ComposedAnswerError::LifetimeWithdrawn(format!(
+                "{COMMAND_EXACT_PREFIX}{index}"
+            ))),
+            None => Ok(()),
+        }
+    }
     /// The option one row's grant rides on, and the constraints it names.
     ///
     /// Lifetime is deliberately not checked here: how far a grant reaches is a
@@ -371,14 +400,18 @@ mod tests {
         );
     }
 
-    /// Plan mode withdraws the durable lifetimes from every rung, so each row
-    /// is held to the plan on its own: one row kept for the project refuses
-    /// the whole answer even when its sibling stays in the conversation.
-    #[test_case(PermissionLifetime::Conversation, true; "conversation_rows_pass")]
-    #[test_case(PermissionLifetime::Project, false; "a_project_row_is_refused")]
-    #[test_case(PermissionLifetime::Global, false; "an_all_projects_row_is_refused")]
-    fn plan_mode_withdraws_durable_lifetimes_row_by_row(
-        second: PermissionLifetime,
+    /// While planning, each row is held on its own to what a plan may keep: a
+    /// narrow rung for the project, a broad one for the conversation, and none
+    /// for all projects. One row past that refuses the whole answer even when
+    /// its sibling stays in the conversation.
+    #[test_case("command_exact_1", PermissionLifetime::Conversation, true; "conversation_rows_pass")]
+    #[test_case("command_exact_1", PermissionLifetime::Project, true; "a_narrow_project_row_passes")]
+    #[test_case("command_exact_1", PermissionLifetime::Global, false; "an_all_projects_row_is_refused")]
+    #[test_case("command_prefix_1_1", PermissionLifetime::Conversation, true; "a_broad_conversation_row_passes")]
+    #[test_case("command_prefix_1_1", PermissionLifetime::Project, false; "a_broad_project_row_is_refused")]
+    fn plan_mode_contains_each_row_on_its_own(
+        second: &str,
+        lifetime: PermissionLifetime,
         accepted: bool,
     ) {
         let mut request = two_command_request();
@@ -388,7 +421,7 @@ mod tests {
             request
                 .composed_rules(&[
                     row("command_exact_0", PermissionLifetime::Conversation),
-                    row("command_exact_1", second),
+                    row(second, lifetime),
                 ])
                 .is_ok(),
             accepted
