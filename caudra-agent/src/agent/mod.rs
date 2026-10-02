@@ -44,6 +44,7 @@ pub use instructions::{
     load_instruction_text, load_instructions, load_remote_instructions,
 };
 pub use provider_projection::{ProjectedHistory, project_for_inspection, project_request};
+pub(crate) use run::resolve_purpose_model_for_inspection;
 pub use run::{
     Agent, AgentParams, AgentRunParams, ModelRoute, estimate_message_tokens,
     resolve_compaction_model, resolve_model_for_purpose, resolve_purpose_model,

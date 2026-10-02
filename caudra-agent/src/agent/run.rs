@@ -167,6 +167,26 @@ pub fn resolve_purpose_model(
         default_model,
         chat_model,
         model_policy,
+        Model::resolve_binding,
+    )
+}
+
+pub(crate) fn resolve_purpose_model_for_inspection(
+    purpose: ModelPurpose,
+    binding_override: Option<&Binding>,
+    default_model: &Model,
+    chat_model: &Model,
+    model_policy: &ModelPolicy,
+) -> Result<Model, ModelError> {
+    let binding = model_registry::binding(purpose);
+    resolve_captured_purpose_model(
+        purpose,
+        binding_override,
+        binding.as_ref(),
+        default_model,
+        chat_model,
+        model_policy,
+        Model::resolve_binding_if_available,
     )
 }
 
@@ -177,11 +197,17 @@ fn resolve_captured_purpose_model(
     default_model: &Model,
     chat_model: &Model,
     model_policy: &ModelPolicy,
+    resolve: impl FnOnce(
+        ModelPurpose,
+        Option<&Binding>,
+        &Model,
+        &ModelPolicy,
+    ) -> Result<Model, ModelError>,
 ) -> Result<Model, ModelError> {
     let binding = binding_override.or(purpose_binding);
     match binding {
-        Some(binding) => Model::resolve_binding(purpose, Some(binding), chat_model, model_policy),
-        None => Model::resolve_binding(purpose, None, default_model, model_policy),
+        Some(binding) => resolve(purpose, Some(binding), chat_model, model_policy),
+        None => resolve(purpose, None, default_model, model_policy),
     }
 }
 
@@ -1454,6 +1480,8 @@ impl<'h> Agent<'h> {
                 filter: &self.tool_filter,
                 config: &self.config,
                 model: &self.model,
+                mode: &self.mode,
+                audience: self.audience,
                 deferral: BuiltinDeferral::resolve(&self.config, &self.model),
                 deferred: self.deferral.definitions(),
             }),
@@ -1461,6 +1489,8 @@ impl<'h> Agent<'h> {
         );
         publisher.publish(ContextSnapshot::capture(ContextCapture {
             readiness,
+            mode: &self.mode,
+            audience: self.audience,
             model: &self.model,
             auto_compact: self.auto_compact,
             compaction_buffer: self.config.compaction_buffer,
@@ -4861,6 +4891,7 @@ mod tests {
             &plan,
             &chat,
             &ModelPolicy::default(),
+            Model::resolve_binding,
         )
         .unwrap();
 
@@ -6148,24 +6179,20 @@ mod tests {
         );
     }
 
-    #[test_case(false; "embedded_plan_uses_only_file_tools")]
-    #[test_case(true; "remote_plan_uses_only_local_document_tools")]
+    #[test_case(false; "embedded_plan_prefers_active_plan")]
+    #[test_case(true; "remote_plan_prefers_active_plan")]
     fn plan_notice_names_only_the_active_workspace_plan_tools(remote: bool) {
         let mode = if remote {
             AgentMode::RemotePlan(PlanRef::new("plan-test").expect("valid plan reference"))
         } else {
             plan_mode()
         };
-        let notice = mode_switch_notice(&[], &mode).expect(EXPECTED_PLAN_NOTICE);
+        let notice =
+            mode_switch_notice_with_tools(&[], &mode, |_| true).expect(EXPECTED_PLAN_NOTICE);
         let text = notice.user_text().expect(EXPECTED_PLAN_NOTICE);
-        for tool in ["local_document_write", "local_document_apply_patch"] {
-            assert_eq!(text.contains(tool), remote, "{tool}: {text}");
-        }
+        assert!(text.contains("`plan`"));
         for tool in ["`file_write`", "`file_edit`", "`file_apply_patch`"] {
-            assert_eq!(text.contains(tool), !remote, "{tool}: {text}");
-        }
-        if !remote {
-            assert!(!text.contains("local_"));
+            assert!(!text.contains(tool), "{tool}: {text}");
         }
         assert!(!text.contains("{plan_write_tools}"));
     }

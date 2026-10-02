@@ -486,7 +486,7 @@ mod tests {
     };
     use crate::permissions::{PermissionResourceAccess, PermissionResourceKind};
     use crate::tools::native::batch::BatchTool;
-    use crate::tools::native::local_document::tests::{tempdir, workspace_for_principal};
+    use crate::tools::native::tests::{tempdir, workspace_for_principal};
     use crate::tools::registry::{
         PermissionIntent, Tool, ToolEffect, ToolExecResult, ToolFailure, ToolSource,
     };

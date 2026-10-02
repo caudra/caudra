@@ -124,10 +124,8 @@ impl WorkflowSession {
             None => env::current_dir().unwrap_or_else(|_| spawn.permissions.project_cwd()),
         };
         let slot = spawn.effective_model_slot.load();
-        let tool_filter = ToolFilter::from_config(spawn.config, &slot.model, &[])
-            .for_remote_workspace(spawn.workspace_session.is_some());
-        let tool_ceiling = ToolFilter::ceiling_from_config(spawn.config, &[])
-            .for_remote_workspace(spawn.workspace_session.is_some());
+        let tool_filter = ToolFilter::from_config(spawn.config, &slot.model, &[]);
+        let tool_ceiling = ToolFilter::ceiling_from_config(spawn.config, &[]);
         let profile = match spawn
             .prompt_profiles
             .resolve(Some(&spawn.task_prompt_profile_name))

@@ -7,17 +7,19 @@ group = "Reference"
 
 # Tools
 
-Caudra ships with 34 built-in tools in this reference (34 requiring no plugin opt-in, 0 opt-in via plugin options). Availability depends on the selected workspace backend. Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Caudra ships with 31 built-in tools in this reference (31 requiring no plugin opt-in, 0 opt-in via plugin options). Availability depends on the selected workspace backend. Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 First-party file, web, shell, index, Python, and environment tools run through protocol-neutral Workcell contracts. Workcell owns schemas, validation, execution bounds, atomic file changes, network policy, subprocess cleanup, cancellation, and the bundled worker lifecycle. Caudra owns registration, authorization, retained session output, and model or UI presentation. Release builds pin an exact Workcell revision.
 
-Remote Workcell selection replaces the first-party execution backend. Startup requires the complete compatible catalog and workspace capabilities, even when a tool is disabled for the model. A missing or incompatible remote tool never falls back to local execution. The Local Documents section below describes remote-only tools for client-owned documents, including memory notes, by opaque reference. They remain available alongside the active-plan tool and are absent from embedded sessions. This development feature requires a matching Workcell build beyond the current release pin. See [Remote Workspaces](/docs/remote-workspaces/).
+Remote Workcell selection replaces the first-party execution backend. Startup requires the complete compatible catalog and workspace capabilities, even when a tool is disabled for the model. A missing or incompatible remote tool never falls back to local execution. This development feature requires a matching Workcell build beyond the current release pin. See [Remote Workspaces](/docs/remote-workspaces/).
 
 The single `plan` tool reads or replaces the active main-agent plan in local and remote workspaces. Use `{"action":"read"}` to read it or `{"action":"write","content":"Complete plan document"}` to replace it. It accepts no path, reference, or session selector and has no patch, approval, or mode-switch action. It is available only during the committed main-agent Plan invocation, subject to the selected profile and [permissions](/docs/permissions/#plan-mode). Selecting Plan in the composer does not change the authority of running work. A task does not inherit the parent's plan-write capability.
 
 Successful plan writes retain the committed target, revision, and content for the plan card. Implement and Clear-and-Implement capture validated content and its revision before consuming the plan or clearing the session. They include the content in the model-visible Build request, so implementation does not require file tools to retrieve the plan. A capture failure leaves the plan available and does not start implementation.
 
 Secure plan storage currently requires a Unix client. Windows and other non-Unix clients return `UnsupportedPlatform` for secure plan storage operations. This applies to local plans and client-owned plans for remote workspaces, regardless of the Workcell server's platform.
+
+The `memory` tool lists, reads, writes, and deletes named notes in local and remote workspaces. Writes replace the complete note. Remote notes stay on the client and cannot be edited through remote file tools. Workbench saves retain revision-conflict checks.
 
 ## Disabling tools
 
@@ -32,7 +34,7 @@ disabled_tools = ["shell", "file_write", "github.*"]
 
 `tool_output` stays available whatever the lists say. The agent calls it on its own to page through a truncated result.
 
-Run [`caudra tools`](/docs/cli/) to see the resulting set, including which rule turned each tool off, or `/tools` inside a session to see it for the open transcript. To keep a tool available but gate every call, use a `deny` or `prompt` default in [Permissions](/docs/permissions/) instead.
+Run [`caudra tools`](/docs/cli/) to see the resulting set, including which rule turned each tool off, or `/tools` inside a session for a [mode-aware inventory](/docs/context/#inspect-the-active-window). To keep a tool available but gate every call, use a `deny` or `prompt` default in [Permissions](/docs/permissions/) instead.
 
 [System prompt profiles](/docs/system-prompts/#choose-tool-availability) can make eligible tools eager, lazy, or disabled for one actor. Pass `--system-prompt-profile NAME` to `caudra tools` or `caudra prompt --tools` to inspect that profile. A profile cannot re-enable tools excluded by config, CLI flags, experimental feature gates, mode, or runtime requirements.
 
@@ -202,38 +204,6 @@ Return one symbol's source together with its immediate callers and callees.
 |-----------|------|----------|-------------|
 | `symbol` | string | yes | A symbol name, optionally qualified as `path::name` to disambiguate. |
 | `path` | string | no | Root-relative subdirectory to scope the map to. Absent means the whole configured root, and an empty string is the same as absent. |
-
-## Local Documents
-
-### `local_document_read` {#local_document_read}
-
-Read a client-owned plan or memory document by opaque reference. Available only for remote workspace sessions; it never accepts or reveals a host path.
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `kind` | string | yes | Document kind associated with the reference. |
-| `reference` | string | yes | Opaque reference supplied by Caudra or a previous tool result. |
-
-### `local_document_write` {#local_document_write}
-
-Replace a client-owned plan or memory document by opaque reference. Available only for remote workspace sessions; it never accepts an arbitrary path.
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `kind` | string | yes | Document kind associated with the reference. |
-| `reference` | string | yes | Opaque reference supplied by Caudra or a previous tool result. |
-| `content` | string | yes | Complete replacement content for the document. |
-
-### `local_document_apply_patch` {#local_document_apply_patch}
-
-Apply exact text replacements to a client-owned plan or memory document by opaque reference. Requires the revision returned by the latest read and rejects stale edits.
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `kind` | string | yes | Document kind associated with the reference. |
-| `reference` | string | yes | Opaque reference supplied by Caudra or a previous tool result. |
-| `revision` | string | yes | Revision returned by the latest read. |
-| `edits` | array | yes | Exact text replacements applied in order. |
 
 ## Execution & Control
 

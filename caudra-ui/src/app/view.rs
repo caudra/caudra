@@ -562,7 +562,8 @@ impl App {
         }
         if self.tools_modal.is_open() {
             let ctx = ToolsModalContext {
-                snapshot: self.context_snapshot.get(),
+                snapshot: self.tools_snapshot.get(),
+                basis: &self.tools_basis,
                 session: self.state.session.tool_usage(),
                 recorded: self.tool_stats.as_ref(),
             };

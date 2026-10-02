@@ -11,7 +11,6 @@
 
 pub mod batch;
 pub mod image_generate;
-mod local_document;
 pub mod memory;
 pub mod peers;
 pub mod plan;
@@ -94,21 +93,6 @@ fn entries(
             image_generate::ImageGenerate,
             ToolEffect::Mutating,
             image_generate::DESCRIPTION,
-        ),
-        entry(
-            local_document::LocalDocumentRead,
-            ToolEffect::ReadOnly,
-            local_document::READ_DESCRIPTION,
-        ),
-        entry(
-            local_document::LocalDocumentWrite,
-            ToolEffect::Mutating,
-            local_document::WRITE_DESCRIPTION,
-        ),
-        entry(
-            local_document::LocalDocumentApplyPatch,
-            ToolEffect::Mutating,
-            local_document::PATCH_DESCRIPTION,
         ),
         entry(
             memory::MemoryTool,
@@ -204,12 +188,168 @@ pub fn static_description(tool: &dyn Tool) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    #[cfg(unix)]
+    use std::fs::Permissions;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+
+    use caudra_config::{Feature, FeatureFlags, ProfileToolDefault, ProfileToolPolicy};
+    use caudra_workspace::{
+        AuthenticatedPrincipalId, AuthorityIdentity, CwdHandle, ProjectIdentity, ProjectKey,
+        ResourceId, ResourceScope, SessionBindingId, SessionWorkspaceBinding, SourceTrustAnchor,
+        WorkspaceCapabilities, WorkspaceCursor, WorkspaceHandle, WorkspaceServices,
+        WorkspaceSession,
+    };
+    use serde_json::json;
+    use tempfile::{Builder, TempDir};
     use test_case::test_case;
+
+    use super::{entries, peers, register, register_remote, skill, static_description};
+    use crate::AgentMode;
+    use crate::agent::tool_dispatch::{Emit, run};
+    use crate::template::Vars;
+    use crate::tools::registry::{Tool, ToolEffect, ToolSource};
+    use crate::tools::test_support::stub_ctx;
+    use crate::tools::{BATCH_TOOL_NAME, DescriptionContext, ToolAudience, ToolFilter};
+    use crate::types::{BatchToolStatus, ToolOutput};
 
     const DUPLICATE_NAME: &str = "two native tools share a name";
     const NAME_DRIFT: &str = "CAUDRA_NATIVE_TOOL_NAMES must list exactly what `entries` registers; \
          it drives tool classification, prompt filters, and permission defaults";
+    const REMOVED_TOOLS: &[&str] = &[
+        "local_document_read",
+        "local_document_write",
+        "local_document_apply_patch",
+    ];
+    const UNKNOWN_TOOL: &str = "unknown tool";
+    const PROJECT: &str = "project-a";
+    #[cfg(unix)]
+    const DIRECTORY_MODE: u32 = 0o700;
+
+    pub(super) fn tempdir() -> TempDir {
+        let mut builder = Builder::new();
+        #[cfg(unix)]
+        builder.permissions(Permissions::from_mode(DIRECTORY_MODE));
+        builder
+            .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
+            .unwrap()
+    }
+
+    pub(super) fn workspace_for_principal(subject: &str) -> WorkspaceSession {
+        let authority = AuthorityIdentity::new(
+            SourceTrustAnchor::new("test-source").expect("trust anchor"),
+            "authority",
+            "workspace",
+            "generation",
+            "namespace",
+        )
+        .expect("authority");
+        let principal =
+            AuthenticatedPrincipalId::new(authority.clone(), subject).expect("principal");
+        let project = ProjectIdentity::new(
+            authority.clone(),
+            ProjectKey::new(PROJECT).expect("project key"),
+        );
+        let binding = SessionWorkspaceBinding::new(
+            SessionBindingId::new("binding").expect("binding id"),
+            authority.clone(),
+            principal,
+            project,
+        )
+        .expect("binding");
+        let cursor = WorkspaceCursor::new(
+            &binding,
+            ResourceScope::root(ResourceId::new("root").expect("resource id")),
+            1,
+            CwdHandle::new("cwd").expect("cwd handle"),
+        );
+        let handle = WorkspaceHandle::new(
+            authority,
+            WorkspaceCapabilities::new([]),
+            WorkspaceServices::default(),
+        )
+        .expect("workspace handle");
+        WorkspaceSession::new(handle, binding, cursor).expect("workspace session")
+    }
+
+    #[test_case(false; "local")]
+    #[test_case(true; "remote")]
+    fn removed_document_tools_are_absent_and_refused(remote: bool) {
+        smol::block_on(async {
+            let mut ctx = stub_ctx(&AgentMode::Build);
+            if remote {
+                ctx.workspace_session = Some(workspace_for_principal("principal"));
+                register_remote(&ctx.registry, &[], FeatureFlags::all()).unwrap();
+            } else {
+                register(&ctx.registry, FeatureFlags::all()).unwrap();
+            }
+            for default in [
+                ProfileToolDefault::Eager,
+                ProfileToolDefault::Lazy,
+                ProfileToolDefault::Disabled,
+            ] {
+                let definitions = ctx.registry.definitions_split_with_policy(
+                    &Vars::new(),
+                    &DescriptionContext {
+                        filter: &ToolFilter::All,
+                        audience: ToolAudience::MAIN,
+                        workflows_available: true,
+                    },
+                    false,
+                    &[],
+                    &ProfileToolPolicy {
+                        default,
+                        ..ProfileToolPolicy::default()
+                    },
+                    &ctx.mode,
+                );
+                for name in REMOVED_TOOLS {
+                    assert!(!ctx.registry.has(name));
+                    assert!(!definitions.available_filter().matches(name));
+                }
+            }
+            for name in REMOVED_TOOLS {
+                let done = run(
+                    &ctx.registry,
+                    None,
+                    (*name).into(),
+                    name,
+                    &json!({}),
+                    &ctx,
+                    Emit::Silent,
+                )
+                .await;
+                assert!(done.is_error);
+                assert_eq!(done.output.as_text(), format!("{UNKNOWN_TOOL}: {name}"));
+            }
+            let calls: Vec<_> = REMOVED_TOOLS
+                .iter()
+                .map(|name| json!({"tool": name, "parameters": {}}))
+                .collect();
+            let done = run(
+                &ctx.registry,
+                None,
+                BATCH_TOOL_NAME.into(),
+                BATCH_TOOL_NAME,
+                &json!({"tool_calls": calls}),
+                &ctx,
+                Emit::Silent,
+            )
+            .await;
+            let ToolOutput::Batch { entries, .. } = done.output else {
+                panic!("expected batch output");
+            };
+            assert_eq!(entries.len(), REMOVED_TOOLS.len());
+            for (entry, name) in entries.iter().zip(REMOVED_TOOLS) {
+                assert_eq!(entry.status, BatchToolStatus::Error);
+                assert_eq!(
+                    entry.output.as_ref().unwrap().as_text(),
+                    format!("{UNKNOWN_TOOL}: {name}")
+                );
+            }
+        });
+    }
 
     fn every_entry() -> Vec<(Arc<dyn Tool>, ToolSource, ToolEffect)> {
         entries(skill::SkillTool::default(), FeatureFlags::all())

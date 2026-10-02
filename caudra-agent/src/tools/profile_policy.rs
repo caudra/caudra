@@ -21,6 +21,7 @@ pub const REQUIRED_INFRASTRUCTURE: &str = "required host infrastructure";
 pub const PROFILE_LOADING: &str = "selected profile loading policy";
 pub const LEGACY_LOADING: &str = "legacy loading policy";
 pub const PLAN_TOOL_NAME: &str = "plan";
+pub const PLAN_MODE_REQUIRED: &str = "requires active main-agent Plan mode";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolExposureDecision {
@@ -52,11 +53,14 @@ pub fn registered_decision(
     legacy_lazy: bool,
 ) -> ToolExposureDecision {
     let source = source_kind(&entry.source);
+    if source == ProfileToolSource::Native
+        && entry.name() == PLAN_TOOL_NAME
+        && (!mode.is_planning() || ctx.audience != ToolAudience::MAIN)
+    {
+        return disabled(PLAN_MODE_REQUIRED);
+    }
     if !entry.tool.audience().contains(ctx.audience)
         || (ctx.policy().is_read_only() && !entry.is_visible_in_read_only())
-        || (source == ProfileToolSource::Native
-            && entry.name() == PLAN_TOOL_NAME
-            && (!mode.is_planning() || ctx.audience != ToolAudience::MAIN))
     {
         return disabled(MODE_DISABLED);
     }

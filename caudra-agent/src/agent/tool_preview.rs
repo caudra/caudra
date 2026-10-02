@@ -40,9 +40,6 @@ const PREVIEW_KEYS: &[(&str, &[&str])] = &[
     ("shell", &["command"]),
     ("memory", &["command", "path"]),
     ("plan", &["action"]),
-    ("local_document_read", &["kind", "reference"]),
-    ("local_document_write", &["kind", "reference"]),
-    ("local_document_apply_patch", &["kind", "reference"]),
     ("websearch", &["query"]),
     ("webfetch", &["url"]),
     ("task", &["description"]),
@@ -573,7 +570,6 @@ mod tests {
     #[test_case("plan", r#"{"action": "read"}"#, Some("read") ; "plan_read")]
     #[test_case("plan", r##"{"action": "write", "content": "# Plan""##, Some("write") ; "plan_write")]
     #[test_case("plan", r##"{"content": "# Plan", "action": "write"}"##, Some("write") ; "plan_content_before_action")]
-    #[test_case("local_document_write", r#"{"kind": "plan", "reference": "abc""#, Some("plan abc") ; "a_document_is_named_by_kind_and_reference")]
     #[test_case("report_to_parent", r#"{"title": "Writer lock identified""#, Some("Writer lock identified") ; "report_title_streams")]
     #[test_case("report_to_parent", r#"{"message": "Detailed finding", "title": "Writer lock identified""#, Some("Writer lock identified") ; "report_title_wins_over_message")]
     #[test_case("report_to_parent", r#"{"message": "Detailed finding""#, None ; "report_payload_is_not_a_streaming_title")]

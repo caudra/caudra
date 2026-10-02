@@ -23,7 +23,6 @@ const TASK_AUTO_GUIDANCE: &str = "Task calls default to foreground execution (ba
 const TASK_ASYNC_GUIDANCE: &str = "Task calls launch background work and return an admission receipt. Omit background or set it to true. Reports and final results arrive automatically, including after you end your turn.";
 const ASYNC_RESULT_GUIDANCE: &str = "An admission receipt is not completion or success. Continue independent work without duplicating pending work or concurrently editing the same files. Do not poll, sleep, or repeat a launch. If only pending work remains, state what is pending and return control without claiming completion. Later results arrive at a safe boundary; evaluate them against current user instructions and verify claims before continuing.";
 const LOCAL_PLAN_WRITE_TOOLS: &[&str] = &["file_write", "file_edit", "file_apply_patch"];
-const REMOTE_PLAN_WRITE_TOOLS: &[&str] = &["local_document_write", "local_document_apply_patch"];
 const PLAN_TOOL_GUIDANCE: &str =
     "Use `plan` with action `read` or `write` for the active plan; it needs no path or reference.";
 const PLAN_UNAVAILABLE_GUIDANCE: &str = "No permitted plan-writing tool is available. Present the plan in your response and explain that it cannot be saved with the current profile.";
@@ -40,13 +39,10 @@ pub fn plan_mode_prompt(mode: &AgentMode, available: impl Fn(&str) -> bool) -> O
     };
     let plan_write_tools = if available(PLAN_TOOL_NAME) {
         PLAN_TOOL_GUIDANCE.to_owned()
+    } else if mode.plan_ref().is_some() {
+        PLAN_UNAVAILABLE_GUIDANCE.to_owned()
     } else {
-        let tools = if mode.plan_ref().is_some() {
-            REMOTE_PLAN_WRITE_TOOLS
-        } else {
-            LOCAL_PLAN_WRITE_TOOLS
-        };
-        let tools: Vec<_> = tools
+        let tools: Vec<_> = LOCAL_PLAN_WRITE_TOOLS
             .iter()
             .filter(|name| available(name))
             .map(|name| format!("`{name}`"))
@@ -895,10 +891,8 @@ mod tests {
     const ACTIVE_PLAN: &str = "active-plan";
 
     #[test_case(false, &["plan", "file_write"], &["plan"]; "local_plan_preferred")]
-    #[test_case(true, &["plan", "local_document_write"], &["plan"]; "remote_plan_preferred")]
+    #[test_case(true, &["plan", "file_write"], &["plan"]; "remote_plan_preferred")]
     #[test_case(false, &["file_edit", "shell"], &["file_edit", "shell"]; "local_fallback")]
-    #[test_case(true, &["local_document_apply_patch"], &["local_document_apply_patch"]; "remote_fallback")]
-    #[test_case(false, &["local_document_write"], &[]; "remote_writer_cannot_write_local_plan")]
     #[test_case(true, &["file_write"], &[]; "file_writer_cannot_write_remote_plan")]
     #[test_case(false, &["shell"], &["shell"]; "shell_is_not_a_plan_writer")]
     #[test_case(false, &[], &[]; "local_no_tools")]
@@ -919,7 +913,6 @@ mod tests {
         for name in [PLAN_TOOL_NAME, SHELL_TOOL_NAME]
             .iter()
             .chain(LOCAL_PLAN_WRITE_TOOLS)
-            .chain(REMOTE_PLAN_WRITE_TOOLS)
         {
             assert_eq!(
                 rendered.contains(&format!("`{name}`")),

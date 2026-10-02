@@ -452,9 +452,11 @@ mod tests {
     use std::sync::Arc;
 
     use arc_swap::ArcSwap;
+    use caudra_agent::tools::native::plan::{self, PlanTarget, PlanWriteResult};
     use caudra_agent::{AgentEvent, PromptAdmission, ToolDoneEvent};
     use caudra_providers::{ImageMediaType, ImageSource, Message};
     use caudra_storage::id::CaudraId;
+    use caudra_storage::local_documents::DocumentRevision;
     use caudra_storage::sessions::StoredMode;
     use caudra_workspace::{
         AuthenticatedPrincipalId, AuthorityIdentity, CwdHandle, ProjectIdentity, ProjectKey,
@@ -480,7 +482,7 @@ mod tests {
     const OTHER_REMOTE_PLAN: &str = "plan-other";
     const PLAN_WRITE_ID: &str = "plan-write";
     const PLAN_WRITTEN: &str = "wrote plan";
-    const PLAN_REVISION: &str = "revision";
+    const PLAN_REVISION: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const RUN_ID: u64 = 1;
     const PROMPT: &str = "Review the implementation in Plan";
     const NEXT_PROMPT: &str = "Keep this queued work";
@@ -524,13 +526,20 @@ mod tests {
     fn plan_write_done(plan: &PlanState) -> AgentEvent {
         let mut event = ToolDoneEvent::error(PLAN_WRITE_ID.into(), PLAN_WRITTEN);
         event.is_error = false;
-        event.written_path = plan.path().map(|path| path.to_string_lossy().into_owned());
-        event.annotation = plan.reference().map(|reference| {
-            format!(
-                "local_document:plan:{};revision:{PLAN_REVISION}",
-                reference.as_str()
+        event.tool = plan::NAME.into();
+        let target = match plan.reference() {
+            Some(reference) => PlanTarget::Remote(reference.clone()),
+            None => PlanTarget::Local(plan.path().unwrap().to_path_buf()),
+        };
+        event.annotation = Some(
+            PlanWriteResult::new(
+                target,
+                DocumentRevision::new(PLAN_REVISION).unwrap(),
+                PLAN_WRITTEN.into(),
             )
-        });
+            .annotation()
+            .unwrap(),
+        );
         AgentEvent::ToolDone(Box::new(event))
     }
 
@@ -666,7 +675,7 @@ mod tests {
         assert_eq!(app.execution_agent_mode(), mode);
         assert_eq!(
             app.main_chat().last_message_is_plan(),
-            execution == Mode::Plan && !remote
+            execution == Mode::Plan
         );
         assert!(!app.plan_form_active());
         if execution == Mode::Plan {

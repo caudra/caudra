@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::io::Error;
 use std::path::PathBuf;
 use std::process;
 use std::str::FromStr;
@@ -871,7 +872,7 @@ impl ProvidersConfig {
     /// in a purpose or pricing surfaces immediately instead of silently dropping
     /// every provider and starting caudra with an empty registry.
     pub fn load() -> Self {
-        let path = providers_file_path();
+        let path = providers_file_path(paths::config_dir_path());
         if !path.exists() {
             return Self::default();
         }
@@ -895,7 +896,7 @@ impl ProvidersConfig {
     }
 
     pub fn save(&self) -> Result<(), std::io::Error> {
-        let path = providers_file_path();
+        let path = providers_file_path(paths::config_dir());
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -919,8 +920,8 @@ impl ProvidersConfig {
     }
 }
 
-fn providers_file_path() -> PathBuf {
-    paths::config_dir()
+fn providers_file_path(directory: Result<PathBuf, Error>) -> PathBuf {
+    directory
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(PROVIDERS_FILE)
 }

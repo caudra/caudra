@@ -16,7 +16,7 @@ use crate::model::{Model, ModelFamily, ModelInfo};
 use crate::providers::Timeouts;
 use crate::providers::anthropic::Anthropic;
 use crate::providers::anthropic::bedrock;
-use crate::providers::aperture::Aperture;
+use crate::providers::aperture::{self, Aperture};
 use crate::providers::catalog::{
     OPENCODE_FAMILY_SLUGS, available_if_warm, catalog_providers, catalog_providers_if_available,
 };
@@ -25,14 +25,14 @@ use crate::providers::deepseek::DeepSeek;
 use crate::providers::dynamic;
 use crate::providers::google::Google;
 use crate::providers::local::{LLAMACPP, LocalEndpoint, OLLAMA};
-use crate::providers::mistral::Mistral;
+use crate::providers::mistral::{self, Mistral};
 use crate::providers::openai::{OpenAi, SETUP_MODEL_SPEC};
 use crate::providers::opencode::Opencode;
 use crate::providers::openrouter::OpenRouter;
 use crate::providers::synthetic::Synthetic;
 use crate::providers::tensorx::TensorX;
-use crate::providers::xai::Xai;
-use crate::providers::zai::Zai;
+use crate::providers::xai::{self, Xai};
+use crate::providers::zai::{self, Zai};
 use crate::{
     AgentError, CacheKey, Message, ProviderEvent, ProviderUsage, ReasoningTransport,
     RequestOptions, StreamResponse,
@@ -411,6 +411,22 @@ pub fn adjust_model(model: &mut Model, timeouts: Timeouts) -> Result<(), AgentEr
     Ok(())
 }
 
+pub fn adjust_model_for_inspection(model: &mut Model) {
+    if let Ok(kind) = ProviderKind::from_str(&model.provider) {
+        adjust_model_metadata(kind, model);
+    }
+}
+
+pub(crate) fn adjust_model_metadata(kind: ProviderKind, model: &mut Model) {
+    match kind {
+        ProviderKind::Aperture => aperture::adjust_model_for_inspection(model),
+        ProviderKind::Mistral => mistral::adjust_model(model),
+        ProviderKind::Zai => zai::adjust_model(model),
+        ProviderKind::Xai => xai::catalog::adjust_model(model),
+        _ => {}
+    }
+}
+
 pub fn from_model_fallback(model: &mut Model, timeouts: Timeouts) -> Box<dyn Provider> {
     match from_model(model, timeouts) {
         Ok(provider) => provider,
@@ -700,6 +716,7 @@ pub async fn fetch_all_models(
 mod tests {
     use std::future::pending;
 
+    use caudra_config::providers::ModelPurpose;
     use caudra_storage::StateClass;
     use caudra_storage::state::{self, SCOPE_GLOBAL, StateKey};
     use tempfile::TempDir;
@@ -707,6 +724,7 @@ mod tests {
 
     use super::*;
     use crate::model::ModelPricing;
+    use crate::model_registry::Binding;
 
     const LISTED_ONCE: &str =
         "a model both declared and discovered must reach the picker once, not twice";
@@ -716,6 +734,34 @@ mod tests {
         name: "thinking.selected",
         class: StateClass::Persistent,
     };
+
+    #[test_case("aperture/mistral/mistral-medium-latest", true, true ; "routed_vision")]
+    #[test_case("aperture/mistral/ministral-14b-latest", false, false ; "routed_no_vision_or_thinking")]
+    #[test_case("aperture/mistral/unknown-model", false, true ; "unknown_model_has_no_assumed_vision")]
+    #[test_case("aperture/unknown/mistral-medium-latest", false, false ; "unknown_route_has_no_assumed_capabilities")]
+    #[test_case("aperture/openai/gpt-6.1-sol", false, false ; "excluded_native_route")]
+    #[test_case("mistral/ministral-14b-latest", false, false ; "direct_mistral")]
+    #[test_case("zai/glm-5.2", false, true ; "direct_zai")]
+    fn inspection_adjusts_bound_plan_metadata(spec: &str, vision: bool, thinking: bool) {
+        let anchor = Model::from_spec(TEST_MODEL).unwrap();
+        let binding = Binding::Exact(spec.into());
+        let mut model = Model::resolve_binding_if_available(
+            ModelPurpose::Plan,
+            Some(&binding),
+            &anchor,
+            &ModelPolicy::default(),
+        )
+        .unwrap();
+
+        if model.provider.as_ref() == "aperture" {
+            assert!(!model.supports_vision());
+        }
+        adjust_model_for_inspection(&mut model);
+
+        assert_eq!(model.spec(), spec);
+        assert_eq!(model.supports_vision(), vision);
+        assert_eq!(model.supports_thinking(), thinking);
+    }
 
     #[test_case("openai/gpt-6.1-sol", Some("medium") ; "setup_model_gets_medium")]
     #[test_case("openai/gpt-5.5", None ; "previous_setup_model_is_unchanged")]

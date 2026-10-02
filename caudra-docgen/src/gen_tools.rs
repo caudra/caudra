@@ -41,14 +41,6 @@ const SECTIONS: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "Local Documents",
-        &[
-            "local_document_read",
-            "local_document_write",
-            "local_document_apply_patch",
-        ],
-    ),
-    (
         "Execution & Control",
         &[
             "batch",
@@ -106,7 +98,8 @@ fn write_disabling_section(out: &mut String) {
          {companions} {verb} available whatever the lists say. The agent calls {pronoun} on its \
          own to page through a truncated result.\n\n\
          Run [`caudra tools`](/docs/cli/) to see the resulting set, including which rule turned \
-         each tool off, or `/tools` inside a session to see it for the open transcript. To keep \
+         each tool off, or `/tools` inside a session for a \
+         [mode-aware inventory](/docs/context/#inspect-the-active-window). To keep \
          a tool available but gate every call, use a `deny` or `prompt` default in \
          [Permissions](/docs/permissions/) instead.\n\n\
          [System prompt profiles](/docs/system-prompts/#choose-tool-availability) can make \
@@ -527,12 +520,13 @@ pub fn generate() -> String {
     .unwrap();
     writeln!(
         out,
-        "\nRemote Workcell selection replaces the first-party execution backend. Startup requires the complete compatible catalog and workspace capabilities, even when a tool is disabled for the model. A missing or incompatible remote tool never falls back to local execution. The Local Documents section below describes remote-only tools for client-owned documents, including memory notes, by opaque reference. They remain available alongside the active-plan tool and are absent from embedded sessions. This development feature requires a matching Workcell build beyond the current release pin. See [Remote Workspaces](/docs/remote-workspaces/)."
+        "\nRemote Workcell selection replaces the first-party execution backend. Startup requires the complete compatible catalog and workspace capabilities, even when a tool is disabled for the model. A missing or incompatible remote tool never falls back to local execution. This development feature requires a matching Workcell build beyond the current release pin. See [Remote Workspaces](/docs/remote-workspaces/)."
     )
     .unwrap();
     writeln!(out, "\nThe single `plan` tool reads or replaces the active main-agent plan in local and remote workspaces. Use `{{\"action\":\"read\"}}` to read it or `{{\"action\":\"write\",\"content\":\"Complete plan document\"}}` to replace it. It accepts no path, reference, or session selector and has no patch, approval, or mode-switch action. It is available only during the committed main-agent Plan invocation, subject to the selected profile and [permissions](/docs/permissions/#plan-mode). Selecting Plan in the composer does not change the authority of running work. A task does not inherit the parent's plan-write capability.").unwrap();
     writeln!(out, "\nSuccessful plan writes retain the committed target, revision, and content for the plan card. Implement and Clear-and-Implement capture validated content and its revision before consuming the plan or clearing the session. They include the content in the model-visible Build request, so implementation does not require file tools to retrieve the plan. A capture failure leaves the plan available and does not start implementation.").unwrap();
     writeln!(out, "\nSecure plan storage currently requires a Unix client. Windows and other non-Unix clients return `UnsupportedPlatform` for secure plan storage operations. This applies to local plans and client-owned plans for remote workspaces, regardless of the Workcell server's platform.").unwrap();
+    writeln!(out, "\nThe `memory` tool lists, reads, writes, and deletes named notes in local and remote workspaces. Writes replace the complete note. Remote notes stay on the client and cannot be edited through remote file tools. Workbench saves retain revision-conflict checks.").unwrap();
     write_disabling_section(&mut out);
     write_on_demand_section(&mut out);
 
@@ -634,7 +628,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_reference_preserves_active_target_and_memory_documents() {
+    fn plan_reference_preserves_active_target_and_named_memory() {
         const PLAN_HEADING: &str = "### `plan`";
         const PLAN_ANCHOR: &str = " {#plan}";
         const EXPECTED: &[&str] = &[
@@ -643,10 +637,8 @@ mod tests {
             "model-visible Build request",
             "A capture failure leaves the plan available",
             "Windows and other non-Unix clients return `UnsupportedPlatform`",
-            "including memory notes",
-            "### `local_document_read`",
-            "### `local_document_write`",
-            "### `local_document_apply_patch`",
+            "The `memory` tool lists, reads, writes, and deletes named notes",
+            "Workbench saves retain revision-conflict checks",
             "A known-name direct call to an eligible lazy tool is valid",
         ];
         let page = generate();
@@ -660,6 +652,8 @@ mod tests {
                 "missing plan or document contract: {expected}"
             );
         }
+        assert!(!page.contains("local_document_"));
+        assert!(!page.contains("## Local Documents"));
     }
 
     #[test_case("2026-07-05", "YYYY-MM-DD"; "simple date")]

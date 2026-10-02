@@ -423,6 +423,10 @@ pub fn cache_dir() -> Result<PathBuf, std::io::Error> {
     active_path(|paths| &paths.cache)
 }
 
+pub fn cache_dir_path() -> Result<PathBuf, std::io::Error> {
+    Ok(resolve().map_err(err)?.cache.clone())
+}
+
 /// The root every project's scratch directory sits under. Namespaced like every
 /// other directory, so a debug build never shares scratch with a release.
 ///

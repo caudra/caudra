@@ -949,7 +949,6 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
     };
     let base_filter = ToolFilter::from_config(&ctx.config, &model, &[])
         .intersect(&ctx.tool_ceiling)
-        .for_remote_workspace(ctx.workspace_session.is_some())
         .for_mode(&mode);
     let profile_tool_policy = Arc::new(
         profile
@@ -2006,6 +2005,8 @@ mod tests {
     fn context_snapshot(model: &Model) -> ContextSnapshot {
         ContextSnapshot {
             readiness: ContextReadiness::PreparedNextRequest,
+            mode: AgentMode::Build,
+            audience: ToolAudience::GENERAL_SUB,
             model: model.into(),
             window: ContextWindow::new(model, false, None),
             usage: ContextUsage::default(),

@@ -126,7 +126,6 @@ MCP selectors use canonical `server.tool` names, not provider wire aliases. Plug
 | `execution` | `shell`, `python_execution`, `execution_environment` |
 | `delegation` | `task`, `task_control`, `workflow` |
 | `support` | `batch`, `question`, `todo_write`, `plan` |
-| `documents` | `local_document_read`, `local_document_write`, `local_document_apply_patch` |
 | `images` | `view_image`, `image_generate` |
 | `messaging` | `list_sessions`, `send_message` |
 
@@ -242,7 +241,7 @@ caudra --system-prompt-profile researcher tools
 caudra --system-prompt-profile scheduler prompt --plan --tools
 ```
 
-`caudra tools` reports the initial eager, lazy, and disabled set. `caudra tools --schemas` and `caudra prompt --tools` show the initial request schemas, including one combined pending catalog when needed. They do not restore a session's previously loaded schemas. Use `/tools` for that session's current state.
+`caudra tools` reports the initial eager, lazy, and disabled set. `caudra tools --schemas` and `caudra prompt --tools` show the initial request schemas, including one combined pending catalog when needed. They do not restore a session's previously loaded schemas. Inside a session, `/tools` provides a [mode-aware inventory](/docs/context/#inspect-the-active-window).
 
 Inside the TUI, run `/system-prompt` to read the prompt the current session is sending. The modal shows the text the agent bound, so it matches what the provider received rather than a fresh assembly of it. Press `r` to swap between rendered markdown and the source, `y` to copy, and `p` to open the profile picker.
 

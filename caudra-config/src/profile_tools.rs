@@ -43,14 +43,6 @@ pub const TOOL_POLICY_GROUPS: &[(ToolPolicyGroup, &[&str])] = &[
         ToolPolicyGroup::Support,
         &["batch", "question", "todo_write", "plan"],
     ),
-    (
-        ToolPolicyGroup::Documents,
-        &[
-            "local_document_read",
-            "local_document_write",
-            "local_document_apply_patch",
-        ],
-    ),
     (ToolPolicyGroup::Images, &["view_image", "image_generate"]),
     (
         ToolPolicyGroup::Messaging,
@@ -68,7 +60,6 @@ pub enum ToolPolicyGroup {
     Execution,
     Delegation,
     Support,
-    Documents,
     Images,
     Messaging,
 }
@@ -227,6 +218,7 @@ mod tests {
     #[test_case(r#"{"default":"lazy","groups":{"support":"eager"}}"#, true; "states")]
     #[test_case(r#"{"extra":true}"#, false; "unknown_field")]
     #[test_case(r#"{"groups":{"unknown":"eager"}}"#, false; "unknown_group")]
+    #[test_case(r#"{"groups":{"documents":"eager"}}"#, false; "removed_document_group")]
     #[test_case(r#"{"groups":{"web":"inherit"}}"#, false; "entry_inherit")]
     #[test_case(r#"{"overrides":{"web*":"lazy"}}"#, false; "glob")]
     #[test_case(r#"{"overrides":{"a..b":"lazy"}}"#, false; "malformed_mcp")]
@@ -260,5 +252,17 @@ mod tests {
                 assert!(seen.insert(name));
             }
         }
+    }
+
+    #[test_case("local_document_read")]
+    #[test_case("local_document_write")]
+    #[test_case("local_document_apply_patch")]
+    fn removed_tools_have_no_builtin_binding(name: &str) {
+        let policy: ProfileToolPolicy = serde_json::from_value(serde_json::json!({
+            "overrides": {name: "eager"}
+        }))
+        .unwrap();
+        assert!(!crate::is_builtin_tool(name));
+        assert!(policy.validate_bindings([]).is_err());
     }
 }

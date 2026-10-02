@@ -279,9 +279,6 @@ pub const CAUDRA_NATIVE_TOOL_NAMES: &[&str] = &[
     "batch",
     "image_generate",
     "list_sessions",
-    "local_document_apply_patch",
-    "local_document_read",
-    "local_document_write",
     "memory",
     "plan",
     "question",
@@ -2156,7 +2153,7 @@ impl ToolOutputLines {
             ],
         ),
         ("grep", &["file_grep", "file_glob"]),
-        ("read", &["file_read", "local_document_read"]),
+        ("read", &["file_read"]),
         (
             "write",
             &[
@@ -2164,8 +2161,6 @@ impl ToolOutputLines {
                 "file_edit",
                 "file_apply_patch",
                 "image_generate",
-                "local_document_apply_patch",
-                "local_document_write",
                 "memory",
                 "plan",
             ],
@@ -2238,8 +2233,8 @@ impl ToolOutputLines {
             "index" | "file_index" | "code_map" | "code_context" | "code_refs" | "code_impact"
             | "code_expand" => self.index,
             "file_grep" | "file_glob" | "grep" | "glob" => self.grep,
-            "file_read" | "local_document_read" | "read" => self.read,
-            "local_document_apply_patch" | "local_document_write" | "memory" | "plan" => self.write,
+            "file_read" | "read" => self.read,
+            "memory" | "plan" => self.write,
             name if FILE_WRITE_TOOLS.contains(&name) => self.write,
             "webfetch" | "websearch" => self.web,
             _ => self.other,
@@ -6226,6 +6221,9 @@ mod tests {
 
     #[test_case("file_wrte" ; "typo")]
     #[test_case("bash" ; "legacy_plugin_id_is_not_a_tool")]
+    #[test_case("local_document_read" ; "removed_document_read")]
+    #[test_case("local_document_write" ; "removed_document_write")]
+    #[test_case("local_document_apply_patch" ; "removed_document_patch")]
     #[test_case("*" ; "bare_wildcard")]
     fn agent_disabled_tools_rejects_unknown_name(tool: &str) {
         let raw: RawConfig =

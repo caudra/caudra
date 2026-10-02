@@ -473,8 +473,7 @@ mod tests {
     use caudra_agent::tools::native::memory::{BrowseEntry, browse_store};
     use caudra_agent::tools::native::plan::{self, PlanTarget, PlanWriteResult};
     use caudra_agent::tools::{
-        BATCH_TOOL_NAME, FILE_WRITE_TOOL_NAME, LOCAL_DOCUMENT_WRITE_TOOL_NAME, MEMORY_TOOL_NAME,
-        ToolEffect,
+        BATCH_TOOL_NAME, FILE_WRITE_TOOL_NAME, MEMORY_TOOL_NAME, ToolEffect,
     };
     use caudra_agent::{
         AgentEvent, AgentMode, BatchProgressEvent, BatchToolEntry, BatchToolStatus, TextOutput,
@@ -668,16 +667,6 @@ mod tests {
     fn wrote(path: &Path) -> Msg {
         let written = vec![path.to_string_lossy().into_owned()];
         done(FILE_WRITE_TOOL_NAME, None, written)
-    }
-
-    /// What `local_document_write` reports once it has written `document`.
-    fn wrote_document(document: &LocalDocumentRef, revision: &DocumentRevision) -> Msg {
-        let (kind, id) = match document {
-            LocalDocumentRef::Plan(plan) => ("plan", plan.as_str()),
-            LocalDocumentRef::Memory(note) => ("memory", note.as_str()),
-        };
-        let annotation = format!("local_document:{kind}:{id};revision:{}", revision.as_str());
-        done(LOCAL_DOCUMENT_WRITE_TOOL_NAME, Some(annotation), Vec::new())
     }
 
     /// A session in a remote workspace, whose plan and notes live in a store
@@ -1135,7 +1124,19 @@ mod tests {
         remote.app.run_id = 1;
 
         let revision = remote.write(&plan, REWRITTEN_PLAN);
-        remote.app.update(wrote_document(&plan, &revision));
+        let LocalDocumentRef::Plan(reference) = &plan else {
+            unreachable!()
+        };
+        let written = PlanWriteResult::new(
+            PlanTarget::Remote(reference.clone()),
+            revision,
+            REWRITTEN_PLAN.into(),
+        );
+        remote.app.update(done(
+            plan::NAME,
+            Some(written.annotation().unwrap()),
+            Vec::new(),
+        ));
 
         let app = &mut remote.app;
         assert_eq!(

@@ -302,23 +302,7 @@ impl Provider for Xai {
 
     fn adjust_model(&self, model: &mut Model) {
         model.billing = Billing::from_oauth(self.is_oauth());
-        let Some(cached) = catalog::cached_model(&model.id) else {
-            return;
-        };
-        model.context_window = cached.context_window;
-        model.max_output_tokens = Some(cached.max_tokens);
-        if cached.pricing.input > 0.0 || cached.pricing.output > 0.0 {
-            model.pricing.input = cached.pricing.input;
-            model.pricing.output = cached.pricing.output;
-            model.pricing.cache_write = cached.pricing.cache_write;
-            model.pricing.cache_read = cached.pricing.cache_read;
-        }
-        model.supports_vision_override = Some(cached.vision);
-        model.thinking_override = Some(if cached.reasoning {
-            crate::model::ThinkingSupport::Yes
-        } else {
-            crate::model::ThinkingSupport::No
-        });
+        catalog::adjust_model(model);
     }
 }
 

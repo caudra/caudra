@@ -7,14 +7,14 @@ use arc_swap::ArcSwap;
 use caudra_agent::agent;
 use caudra_agent::background::BackgroundTasks;
 use caudra_agent::context::{
-    BuiltinToolsInput, ContextCapture, ContextInventory, ContextPublisher, ContextReadiness,
-    ContextSnapshot,
+    BuiltinToolsInput, ContextCapture, ContextInventory, ContextMcpInventory, ContextPublisher,
+    ContextReadiness, ContextSnapshot,
 };
 use caudra_agent::mcp::config::McpServerStatus;
 use caudra_agent::mcp::{McpHandle, McpRequestSnapshot, McpSession};
 use caudra_agent::permissions::PermissionManager;
 use caudra_agent::prompt::profile::{
-    BUILTIN_PROFILE_NAME, PromptProfileCatalog, SystemPromptProfile,
+    BUILTIN_PROFILE_NAME, PromptProfileCatalog, SystemPromptProfile, TaskProfileBindings,
 };
 use caudra_agent::template;
 use caudra_agent::template::Vars;
@@ -34,7 +34,7 @@ use caudra_agent::{
 use caudra_config::{ModelPolicy, ProfileToolPolicy};
 use caudra_lua::EventHandle;
 use caudra_providers::{
-    AgentError, CacheKey, HistoryItem, Message, Model, ModelPurpose, RequestOptions,
+    AgentError, CacheKey, HistoryItem, Message, Model, ModelPurpose, RequestOptions, ThinkingConfig,
 };
 use caudra_storage::id::SessionRef;
 use caudra_storage::local_documents::LocalDocumentStore;
@@ -47,6 +47,131 @@ use super::cancel_map::RunCancelMap;
 use super::shared_queue::{QueueItem, QueueReceiver};
 use super::workflow::SharedMode;
 use super::{BtwPrompt, ModelSlot, SharedBtwPrompt};
+
+pub(crate) struct ToolsPreviewSource {
+    pub(crate) registry: Arc<ToolRegistry>,
+    config: AgentConfig,
+    profile_name: Arc<str>,
+    profile: Arc<ProfileToolPolicy>,
+    profiles: Arc<PromptProfileCatalog>,
+    model_policy: Arc<ModelPolicy>,
+    workflows_available: bool,
+    background_available: bool,
+    pub(crate) mcp: Option<McpSession>,
+}
+
+impl ToolsPreviewSource {
+    pub(crate) fn profile_name(&self) -> &str {
+        &self.profile_name
+    }
+
+    fn definitions(
+        &self,
+        model: &Model,
+        vars: &Vars,
+        mode: &AgentMode,
+        bindings: &TaskProfileBindings,
+    ) -> ToolDefinitions {
+        let filter = ToolFilter::from_config(&self.config, model, &[]).for_mode(mode);
+        let vars = vars.clone().set(
+            "{task_system_prompt_profiles}",
+            bindings.task_tool_summary("Caudra's built-in task prompt"),
+        );
+        let mut definitions = self.registry.definitions_split_with_policy(
+            &vars,
+            &DescriptionContext {
+                filter: &filter,
+                audience: ToolAudience::MAIN,
+                workflows_available: self.workflows_available,
+            },
+            model.supports_tool_examples(),
+            &deferral::deferred_names(
+                &self.config.allowed_tools,
+                BuiltinDeferral::resolve(&self.config, model),
+            ),
+            &self.profile,
+            mode,
+        );
+        configure_tools(
+            &mut definitions.declared,
+            &mut definitions.deferred,
+            &self.config,
+            self.background_available,
+            self.background_available,
+        );
+        definitions
+    }
+
+    pub(crate) fn snapshot(
+        &self,
+        model: &Model,
+        chat_model: &Model,
+        thinking: &ThinkingConfig,
+        mode: &AgentMode,
+        cwd: &str,
+        history: &[Message],
+    ) -> ContextSnapshot {
+        let bindings = self.profiles.bind_for_tasks_for_inspection(
+            model,
+            chat_model,
+            thinking,
+            &self.model_policy,
+        );
+        let definitions = self.definitions(
+            model,
+            &template::env_vars().set("{cwd}", cwd),
+            mode,
+            &bindings,
+        );
+        let mcp = self.mcp.clone().map(|mcp| {
+            mcp.with_profile_policy(
+                Arc::clone(&self.profile),
+                ToolFilter::All.for_mcp_mode(mode),
+            )
+            .request_snapshot()
+        });
+        let full_tools = request_tools_from(
+            &self.registry,
+            history,
+            definitions.declared.clone(),
+            definitions.deferred.clone(),
+            mcp.as_ref(),
+        );
+        let inventory = ContextInventory {
+            builtins: BuiltinToolsInput {
+                registry: &self.registry,
+                filter: &ToolFilter::from_config(&self.config, model, &[]).for_mode(mode),
+                config: &self.config,
+                model,
+                mode,
+                audience: ToolAudience::MAIN,
+                deferral: BuiltinDeferral::resolve(&self.config, model),
+                deferred: &definitions.deferred,
+            }
+            .inventory(&self.profile),
+            mcp: mcp
+                .as_ref()
+                .map(|mcp| ContextMcpInventory::from_statuses(mcp.tool_inventory()))
+                .unwrap_or_default(),
+            ..ContextInventory::default()
+        };
+        ContextSnapshot::capture(ContextCapture {
+            readiness: ContextReadiness::PreparedNextRequest,
+            mode,
+            audience: ToolAudience::MAIN,
+            model,
+            auto_compact: false,
+            compaction_buffer: None,
+            system: "",
+            base_tools: &DeferralSession::new(definitions.deferred, std::iter::empty())
+                .accounting_definitions(&definitions.declared),
+            full_tools: &full_tools,
+            projected_messages: &[],
+            measured: None,
+            inventory,
+        })
+    }
+}
 
 pub(super) struct AgentLoop {
     model_slot: Arc<ArcSwap<ModelSlot>>,
@@ -628,8 +753,7 @@ impl AgentLoop {
                 subagent_history: self.subagent_history.clone(),
                 registry: Arc::clone(caudra_agent::tools::ToolRegistry::global_arc()),
                 audience: ToolAudience::MAIN,
-                tool_ceiling: ToolFilter::ceiling_from_config(&self.config, &[])
-                    .for_remote_workspace(self.workspace_session.is_some()),
+                tool_ceiling: ToolFilter::ceiling_from_config(&self.config, &[]),
                 profile_tool_policy: Arc::new(self.profile_tool_policy()),
                 tool_filter,
                 model_policy: Arc::clone(&self.model_policy),
@@ -711,9 +835,6 @@ impl AgentLoop {
         chat_model: &Model,
         thinking: &caudra_providers::ThinkingConfig,
     ) -> ToolDefinitions {
-        let examples = model.supports_tool_examples();
-        let filter = ToolFilter::from_config(&self.config, model, &[])
-            .for_remote_workspace(self.workspace_session.is_some());
         let bindings = self.prompt_profiles.bind_for_tasks(
             model,
             chat_model,
@@ -721,34 +842,26 @@ impl AgentLoop {
             &self.model_policy,
             self.timeouts,
         );
-        let vars = self.vars.clone().set(
-            "{task_system_prompt_profiles}",
-            bindings.task_tool_summary("Caudra's built-in task prompt"),
-        );
-        let ctx = DescriptionContext {
-            filter: &filter,
-            audience: ToolAudience::MAIN,
-            workflows_available: self.workflow.is_some(),
-        };
-        let mut definitions = ToolRegistry::global().definitions_split_with_policy(
-            &vars,
-            &ctx,
-            examples,
-            &deferral::deferred_names(
-                &self.config.allowed_tools,
-                BuiltinDeferral::resolve(&self.config, model),
+        self.tools_preview_source()
+            .definitions(model, &self.vars, &self.mode.load(), &bindings)
+    }
+
+    pub(super) fn tools_preview_source(&self) -> ToolsPreviewSource {
+        ToolsPreviewSource {
+            registry: Arc::clone(ToolRegistry::global_arc()),
+            config: self.config.clone(),
+            profile_name: Arc::from(
+                self.system_prompt_profile
+                    .as_deref()
+                    .map_or(BUILTIN_PROFILE_NAME, SystemPromptProfile::name),
             ),
-            &self.profile_tool_policy(),
-            &self.mode.load(),
-        );
-        configure_tools(
-            &mut definitions.declared,
-            &mut definitions.deferred,
-            &self.config,
-            self.background.is_some(),
-            self.background.is_some(),
-        );
-        definitions
+            profile: Arc::new(self.profile_tool_policy()),
+            profiles: Arc::clone(&self.prompt_profiles),
+            model_policy: Arc::clone(&self.model_policy),
+            workflows_available: self.workflow.is_some(),
+            background_available: self.background.is_some(),
+            mcp: self.mcp.clone(),
+        }
     }
 
     fn profile_tool_policy(&self) -> ProfileToolPolicy {
@@ -855,27 +968,17 @@ impl AgentLoop {
 
     fn request_tools_from(
         &self,
-        mut tools: Value,
+        tools: Value,
         deferred: Vec<DeferredTool>,
         mcp: Option<&McpRequestSnapshot>,
     ) -> Value {
-        let mut sections: Vec<String> = DeferralSession::new(
+        request_tools_from(
+            ToolRegistry::global(),
+            self.history.as_slice(),
+            tools,
             deferred,
-            deferral::loaded_tool_names(self.history.as_slice()),
+            mcp,
         )
-        .request_snapshot()
-        .extend_declared(&mut tools)
-        .into_iter()
-        .collect();
-        if let Some(mcp) = mcp {
-            sections.extend(mcp.extend_declared(&mut tools));
-        }
-        deferral::push_unbound_catalog(
-            &mut tools,
-            &sections,
-            ToolRegistry::global().has(deferral::TOOL_SEARCH_TOOL_NAME),
-        );
-        tools
     }
 
     fn build_system(
@@ -960,6 +1063,8 @@ impl AgentLoop {
                 filter: &self.effective_tool_filter(),
                 config: &self.config,
                 model: &slot.model,
+                mode: &self.mode.load(),
+                audience: ToolAudience::MAIN,
                 deferral: BuiltinDeferral::resolve(&self.config, &slot.model),
                 deferred: &self.deferred,
             }),
@@ -968,6 +1073,8 @@ impl AgentLoop {
         self.context_publisher
             .publish(ContextSnapshot::capture(ContextCapture {
                 readiness: ContextReadiness::PreparedNextRequest,
+                mode: &self.mode.load(),
+                audience: ToolAudience::MAIN,
                 model: &slot.model,
                 auto_compact: agent::auto_compact_enabled(),
                 compaction_buffer: self.config.compaction_buffer,
@@ -1001,6 +1108,30 @@ impl AgentLoop {
             message: error.user_message(),
         });
     }
+}
+
+fn request_tools_from(
+    registry: &ToolRegistry,
+    history: &[Message],
+    mut tools: Value,
+    deferred: Vec<DeferredTool>,
+    mcp: Option<&McpRequestSnapshot>,
+) -> Value {
+    let mut sections: Vec<String> =
+        DeferralSession::new(deferred, deferral::loaded_tool_names(history))
+            .request_snapshot()
+            .extend_declared(&mut tools)
+            .into_iter()
+            .collect();
+    if let Some(mcp) = mcp {
+        sections.extend(mcp.extend_declared(&mut tools));
+    }
+    deferral::push_unbound_catalog(
+        &mut tools,
+        &sections,
+        registry.has(deferral::TOOL_SEARCH_TOOL_NAME),
+    );
+    tools
 }
 
 fn is_automatic_input(input: &AgentInput) -> bool {
@@ -1073,11 +1204,23 @@ fn spawn_oauth_for_needs_auth(handle: &McpHandle) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::path::PathBuf;
     use std::slice::from_ref;
 
     use caudra_agent::McpPromptRef;
+    use caudra_agent::context::{ContextBuiltinState, ContextMcpStatus};
+    use caudra_agent::mcp::stub_session;
+    use caudra_agent::tools::native::plan;
+    use caudra_agent::tools::profile_policy::{
+        MODE_DISABLED, PLAN_MODE_REQUIRED, PROFILE_DISABLED, PROFILE_LOADING,
+    };
+    use caudra_agent::tools::report::{REASON_CONFIG, REASON_PROFILE_LOADED};
+    use caudra_agent::tools::{ToolEffect, ToolSource};
+    use caudra_config::ProfileToolExposure;
+    use caudra_providers::{ContentBlock, Role};
+    use caudra_workspace::PlanRef;
+    use serde_json::json;
     use test_case::test_case;
 
     use super::*;
@@ -1086,6 +1229,208 @@ mod tests {
     const USER_MESSAGE: &str = "explicit submission";
     const AUTOMATIC_REPORT: &str = "background result";
     const MCP_PROMPT: &str = "test/prompt";
+    const PREVIEW_CWD: &str = "/preview-project";
+    const PREVIEW_MODEL: &str = "anthropic/claude-sonnet-4-6";
+    const PREVIEW_OWNER: &str = "caudra";
+    const PREVIEW_CONTRACT: &str = "preview-test";
+    const LOAD_PLAN_CALL: &str = "load-plan";
+    const PREVIEW_MCP_TOOL: &str = "preview.lookup";
+    const PREVIEW_MCP_DESCRIPTION: &str = "Look up preview data";
+    const PREVIEW_PLAN_REF: &str = "plan-preview";
+
+    pub(crate) fn tools_preview_source(
+        config: AgentConfig,
+        policy: ProfileToolPolicy,
+    ) -> ToolsPreviewSource {
+        let registry = Arc::new(ToolRegistry::new());
+        registry
+            .register_audited(
+                Arc::new(plan::PlanTool),
+                ToolSource::Native {
+                    owner: PREVIEW_OWNER.into(),
+                    contract: PREVIEW_CONTRACT.into(),
+                    trusted: true,
+                },
+                ToolEffect::Mutating,
+            )
+            .unwrap();
+        ToolsPreviewSource {
+            registry,
+            config,
+            profile_name: BUILTIN_PROFILE_NAME.into(),
+            profile: Arc::new(policy),
+            profiles: Arc::new(PromptProfileCatalog::default()),
+            model_policy: Arc::new(ModelPolicy::default()),
+            workflows_available: false,
+            background_available: false,
+            mcp: None,
+        }
+    }
+
+    #[test_case(ProfileToolExposure::Eager, false, ContextBuiltinState::Declared; "eager")]
+    #[test_case(ProfileToolExposure::Lazy, false, ContextBuiltinState::Deferred; "lazy")]
+    #[test_case(ProfileToolExposure::Lazy, true, ContextBuiltinState::Declared; "loaded_lazy")]
+    #[test_case(ProfileToolExposure::Disabled, true, ContextBuiltinState::Disabled; "disabled_loaded")]
+    fn tools_preview_uses_execution_policy_and_accounting(
+        exposure: ProfileToolExposure,
+        loaded: bool,
+        expected: ContextBuiltinState,
+    ) {
+        let mut policy = ProfileToolPolicy::default();
+        policy.overrides.insert(plan::NAME.into(), exposure);
+        let source = tools_preview_source(AgentConfig::default(), policy);
+        let model = Model::from_spec(PREVIEW_MODEL).unwrap();
+        let history = if loaded {
+            vec![Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use(
+                    LOAD_PLAN_CALL,
+                    plan::NAME,
+                    json!({"action":"read"}),
+                )],
+                ..Message::default()
+            }]
+        } else {
+            Vec::new()
+        };
+        for mode in [
+            AgentMode::Plan(PLAN_PATH.into()),
+            AgentMode::RemotePlan(PlanRef::new(PREVIEW_PLAN_REF).unwrap()),
+        ] {
+            let snapshot = source.snapshot(
+                &model,
+                &model,
+                &ThinkingConfig::Off,
+                &mode,
+                PREVIEW_CWD,
+                &history,
+            );
+            assert_eq!(snapshot.mode, mode);
+            assert_eq!(snapshot.audience, ToolAudience::MAIN);
+            assert_eq!(snapshot.inventory.builtins.tools.len(), 1);
+            let plan = &snapshot.inventory.builtins.tools[0];
+            assert_eq!(plan.state, expected);
+            assert_eq!(
+                snapshot.inventory.builtins.request_tokens(),
+                snapshot.usage.system_tools
+            );
+            assert_eq!(snapshot.usage.messages, 0);
+            assert_eq!(snapshot.measured, None);
+            if exposure == ProfileToolExposure::Disabled {
+                assert_eq!(plan.reason, Some(PROFILE_DISABLED));
+                assert_eq!(plan.tokens, 0);
+            } else {
+                assert!(plan.tokens > 0);
+            }
+        }
+    }
+
+    #[test_case(AgentMode::Build, false, PLAN_MODE_REQUIRED; "build")]
+    #[test_case(AgentMode::ReadOnly, false, PLAN_MODE_REQUIRED; "missing_target")]
+    #[test_case(AgentMode::Plan(PLAN_PATH.into()), true, REASON_CONFIG; "globally_disabled")]
+    fn tools_preview_cannot_enable_ineligible_plan(mode: AgentMode, disabled: bool, reason: &str) {
+        let config = AgentConfig {
+            disabled_tools: disabled
+                .then(|| plan::NAME.to_owned())
+                .into_iter()
+                .collect(),
+            ..AgentConfig::default()
+        };
+        let policy = serde_json::from_value(json!({"overrides":{"plan":"eager"}})).unwrap();
+        let source = tools_preview_source(config, policy);
+        let model = Model::from_spec(PREVIEW_MODEL).unwrap();
+        let snapshot = source.snapshot(
+            &model,
+            &model,
+            &ThinkingConfig::Off,
+            &mode,
+            PREVIEW_CWD,
+            &[],
+        );
+        assert_eq!(
+            snapshot.inventory.builtins.tools[0].state,
+            ContextBuiltinState::Disabled
+        );
+        assert_eq!(snapshot.inventory.builtins.tools[0].reason, Some(reason));
+        assert_eq!(snapshot.inventory.builtins.tools[0].tokens, 0);
+        assert_eq!(
+            snapshot
+                .inventory
+                .builtins
+                .count(ContextBuiltinState::Declared),
+            0
+        );
+        assert_eq!(
+            snapshot
+                .inventory
+                .builtins
+                .count(ContextBuiltinState::Deferred),
+            0
+        );
+    }
+
+    #[test_case(AgentMode::Build, ProfileToolExposure::Eager, false, ContextMcpStatus::LoadedOrEager, PROFILE_LOADING; "eager_does_not_load_source")]
+    #[test_case(AgentMode::Build, ProfileToolExposure::Lazy, false, ContextMcpStatus::AvailableOnDemand, PROFILE_LOADING; "lazy_catalog")]
+    #[test_case(AgentMode::Build, ProfileToolExposure::Lazy, true, ContextMcpStatus::LoadedOrEager, REASON_PROFILE_LOADED; "loaded_lazy")]
+    #[test_case(AgentMode::Build, ProfileToolExposure::Disabled, true, ContextMcpStatus::Disabled, PROFILE_DISABLED; "profile_excludes_loaded")]
+    #[test_case(AgentMode::ReadOnly, ProfileToolExposure::Eager, true, ContextMcpStatus::Disabled, MODE_DISABLED; "read_only_excludes_eager")]
+    #[test_case(AgentMode::Plan(PLAN_PATH.into()), ProfileToolExposure::Lazy, true, ContextMcpStatus::Disabled, MODE_DISABLED; "local_plan_excludes_loaded")]
+    #[test_case(AgentMode::RemotePlan(PlanRef::new(PREVIEW_PLAN_REF).unwrap()), ProfileToolExposure::Eager, false, ContextMcpStatus::Disabled, MODE_DISABLED; "remote_plan_excludes_eager")]
+    fn tools_preview_narrows_mcp_without_changing_source_loads(
+        mode: AgentMode,
+        exposure: ProfileToolExposure,
+        loaded: bool,
+        expected: ContextMcpStatus,
+        reason: &'static str,
+    ) {
+        let session = stub_session(&[(PREVIEW_MCP_TOOL, PREVIEW_MCP_DESCRIPTION)]);
+        if loaded {
+            assert!(session.mark_loaded(PREVIEW_MCP_TOOL));
+        }
+        let before = session.request_snapshot();
+        assert_eq!(before.tool_inventory()[0].deferred, !loaded);
+        let mut policy = ProfileToolPolicy::default();
+        policy
+            .overrides
+            .insert(plan::NAME.into(), ProfileToolExposure::Disabled);
+        policy.overrides.insert(PREVIEW_MCP_TOOL.into(), exposure);
+        let mut source = tools_preview_source(AgentConfig::default(), policy);
+        source.mcp = Some(session);
+        let model = Model::from_spec(PREVIEW_MODEL).unwrap();
+        let snapshot = source.snapshot(
+            &model,
+            &model,
+            &ThinkingConfig::Off,
+            &mode,
+            PREVIEW_CWD,
+            &[],
+        );
+        assert_eq!(snapshot.inventory.mcp.tools.len(), 1);
+        let tool = &snapshot.inventory.mcp.tools[0];
+        assert_eq!(tool.qualified_name, PREVIEW_MCP_TOOL);
+        assert_eq!(tool.status, expected);
+        assert_eq!(tool.reason, Some(reason));
+        assert_eq!(
+            tool.request_tokens > 0,
+            expected == ContextMcpStatus::LoadedOrEager
+        );
+        assert_eq!(snapshot.usage.mcp_tools, tool.request_tokens);
+        assert_eq!(
+            snapshot.inventory.builtins.catalog_tokens > 0,
+            expected == ContextMcpStatus::AvailableOnDemand
+        );
+        assert_eq!(
+            snapshot.usage.system_tools,
+            snapshot.inventory.builtins.request_tokens()
+        );
+        let after = source.mcp.as_ref().unwrap().request_snapshot();
+        assert_eq!(after.tool_inventory(), before.tool_inventory());
+        let mut before_tools = json!([]);
+        let mut after_tools = json!([]);
+        before.extend_tools(&mut before_tools);
+        after.extend_tools(&mut after_tools);
+        assert_eq!(after_tools, before_tools);
+    }
 
     #[test_case("", false, false, None, true, true; "peer_wake")]
     #[test_case("", false, false, Some(Message::observation(AUTOMATIC_REPORT.into())), true, false; "automatic_report")]

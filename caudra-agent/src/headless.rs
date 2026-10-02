@@ -1185,7 +1185,6 @@ struct TaskDescriptionContext<'a> {
     thinking: &'a crate::ThinkingConfig,
     model_policy: &'a ModelPolicy,
     timeouts: Timeouts,
-    remote_workspace: bool,
     remote_project_context: Option<&'a Arc<crate::remote_project_context::RemoteProjectContext>>,
     host_cwd: Option<&'a Path>,
 }
@@ -1197,7 +1196,6 @@ fn setup(
     workflows_available: bool,
     task: TaskDescriptionContext<'_>,
     remote_environment: Option<&RemoteEnvironment>,
-    remote_workspace: bool,
 ) -> AgentSetup {
     let vars = if let Some(environment) = remote_environment {
         template::env_vars()
@@ -1227,7 +1225,7 @@ fn setup(
         instructions,
         tools: definitions.declared,
         deferred: definitions.deferred,
-        tool_filter: tool_filter.for_remote_workspace(remote_workspace),
+        tool_filter,
     }
 }
 
@@ -1276,8 +1274,7 @@ fn tool_definitions(
     workflows_available: bool,
     task: TaskDescriptionContext<'_>,
 ) -> ToolDefinitions {
-    let filter = ToolFilter::from_config(config, model, excluded_tools)
-        .for_remote_workspace(task.remote_workspace);
+    let filter = ToolFilter::from_config(config, model, excluded_tools);
     let bindings = task.prompt_profiles.bind_for_tasks(
         model,
         task.chat_model,
@@ -1352,8 +1349,7 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
                 .map(|entry| entry.name()),
         )
         .map_err(InteractiveStartError)?;
-    let tool_ceiling = ToolFilter::ceiling_from_config(&params.config, &params.excluded_tools)
-        .for_remote_workspace(params.workspace_session.is_some());
+    let tool_ceiling = ToolFilter::ceiling_from_config(&params.config, &params.excluded_tools);
     let peer_host = if params.workspace_session.is_some() || params.host_cwd.is_some() {
         None
     } else {
@@ -1402,12 +1398,10 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
             thinking: &params.thinking,
             model_policy: &params.model_policy,
             timeouts: params.timeouts,
-            remote_workspace: params.workspace_session.is_some(),
             remote_project_context: params.remote_project_context.as_ref(),
             host_cwd: params.host_cwd.as_deref(),
         },
         params.remote_environment.as_ref(),
-        params.workspace_session.is_some(),
     );
 
     crate::tools::execution::configure_tools(
@@ -2185,12 +2179,10 @@ async fn spawn_prepared_session(
             thinking: &params.thinking,
             model_policy: &params.model_policy,
             timeouts: params.timeouts,
-            remote_workspace: params.workspace_session.is_some(),
             remote_project_context: params.remote_project_context.as_ref(),
             host_cwd: params.host_cwd.as_deref(),
         },
         params.remote_environment.as_ref(),
-        params.workspace_session.is_some(),
     );
 
     crate::tools::execution::configure_tools(
@@ -2339,8 +2331,7 @@ async fn spawn_prepared_session(
         registry: Arc::clone(ToolRegistry::global_arc()),
         audience: ToolAudience::MAIN,
         tool_filter: tool_filter.clone(),
-        tool_ceiling: ToolFilter::ceiling_from_config(&params.config, &params.excluded_tools)
-            .for_remote_workspace(params.workspace_session.is_some()),
+        tool_ceiling: ToolFilter::ceiling_from_config(&params.config, &params.excluded_tools),
         profile_tool_policy: Arc::new(
             params
                 .system_prompt_profile
@@ -2975,7 +2966,6 @@ async fn spawn_prepared_session(
                         thinking: &input.thinking,
                         model_policy: &params.model_policy,
                         timeouts: params.timeouts,
-                        remote_workspace: params.workspace_session.is_some(),
                         remote_project_context: params.remote_project_context.as_ref(),
                         host_cwd: params.host_cwd.as_deref(),
                     },
@@ -3357,6 +3347,7 @@ mod tests {
         StreamResponse, TaskEventOrigin,
     };
     use caudra_storage::background::TaskRecord;
+    use caudra_storage::local_documents::DocumentRevision;
     use caudra_storage::permission_state::PermissionRuleRecord;
     use caudra_storage::permission_state::mutation::{
         PermissionMutation, PermissionRecordIdentity, prepare_mutation,
@@ -3364,6 +3355,7 @@ mod tests {
     use caudra_storage::sessions::{RecordCoverage, generate_title};
     use caudra_storage::workflow::WorkflowRunStatus;
     use caudra_workflow::{RunStatus, WorkflowError, WorkflowEvent};
+    use caudra_workspace::PlanRef;
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -3375,6 +3367,7 @@ mod tests {
         PermissionAnswer, PermissionError, PermissionLifetime, PermissionRequest, RevokedRuleScope,
     };
     use crate::remote_project_context::tests::AssetService;
+    use crate::tools::native::plan::{self, PlanTarget, PlanWriteResult};
     use crate::tools::registry::BoxFuture;
     use crate::tools::test_support::stub_ctx_with;
     use crate::tools::{PermissionScopes, TODOWRITE_TOOL_NAME};
@@ -4440,22 +4433,25 @@ mod tests {
     fn only_the_stored_remote_plan_marks_the_session_written() {
         let tmp = TempDir::new().unwrap();
         let mut store = store_in(&tmp);
-        let expected =
-            caudra_workspace::PlanRef::new(format!("plan-{}", "a".repeat(32))).expect("plan ref");
-        let other =
-            caudra_workspace::PlanRef::new(format!("plan-{}", "b".repeat(32))).expect("plan ref");
+        let expected = PlanRef::new(format!("plan-{}", "a".repeat(32))).expect("plan ref");
+        let other = PlanRef::new(format!("plan-{}", "b".repeat(32))).expect("plan ref");
         store.session.meta.plan_target = Some(StoredPlanTarget::PlanRef {
             reference: expected.clone(),
         });
 
-        let record = |store: &mut SessionStore, reference: &caudra_workspace::PlanRef| {
+        let record = |store: &mut SessionStore, reference: &PlanRef| {
             let mut done = crate::ToolDoneEvent::error("write".into(), "written");
+            done.tool = plan::NAME.into();
             done.is_error = false;
-            done.annotation = Some(format!(
-                "local_document:plan:{};revision:{}",
-                reference.as_str(),
-                "c".repeat(64)
-            ));
+            done.annotation = Some(
+                PlanWriteResult::new(
+                    PlanTarget::Remote(reference.clone()),
+                    DocumentRevision::new("c".repeat(64)).unwrap(),
+                    PLANNING_PROMPT.into(),
+                )
+                .annotation()
+                .unwrap(),
+            );
             store
                 .record_event(&Envelope {
                     event: AgentEvent::ToolDone(Box::new(done)),

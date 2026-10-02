@@ -52,12 +52,6 @@ pub struct LocalDocument {
     pub revision: DocumentRevision,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PatchEdit {
-    pub old: String,
-    pub new: String,
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum LocalDocumentError {
     #[error("local document belongs to a different project")]
@@ -76,8 +70,6 @@ pub enum LocalDocumentError {
     Symlink,
     #[error("local document changed since revision {expected}")]
     StaleRevision { expected: String },
-    #[error("patch text was not found exactly once")]
-    PatchConflict,
     #[error("local document storage failed: {0}")]
     Storage(#[from] StorageError),
     #[error("local document I/O failed: {0}")]
@@ -227,31 +219,6 @@ impl LocalDocumentStore {
         }
         write_secure(&path, content)?;
         Ok(revision(content))
-    }
-
-    pub fn apply_patch(
-        &self,
-        project: &ProjectKey,
-        session_id: Option<&str>,
-        reference: &LocalDocumentRef,
-        expected_revision: &DocumentRevision,
-        edits: &[PatchEdit],
-    ) -> Result<DocumentRevision, LocalDocumentError> {
-        self.rewrite(
-            project,
-            session_id,
-            reference,
-            expected_revision,
-            |mut content| {
-                for edit in edits {
-                    if edit.old.is_empty() || content.match_indices(&edit.old).count() != 1 {
-                        return Err(LocalDocumentError::PatchConflict);
-                    }
-                    content = content.replacen(&edit.old, &edit.new, 1);
-                }
-                Ok(content)
-            },
-        )
     }
 
     /// Writes `content` over the whole document, provided nothing else wrote
@@ -683,7 +650,7 @@ fn memory_files(root: &Path) -> Result<Vec<(String, PathBuf)>, LocalDocumentErro
 mod tests {
     use super::{
         LocalDocumentError, LocalDocumentRef, LocalDocumentStore, LocalProjectAliases,
-        MEMORIES_DIR, PatchEdit, ProjectKey, StateDir, fs,
+        MEMORIES_DIR, ProjectKey, StateDir, fs,
     };
     use crate::plans::MAX_PLAN_BYTES;
     use crate::plans::tests::tempdir;
@@ -703,6 +670,8 @@ mod tests {
     const SESSION: &str = "session-a";
     const OTHER_SESSION: &str = "session-b";
     const NOTE: &str = "note.md";
+    #[cfg(unix)]
+    const NESTED_NOTE: &str = "nested/note.md";
     const CANARY: &str = "local legacy secret";
     const REMOTE_CONTENT: &str = "remote note";
     const REPLACED: &str = "a reader's edit";
@@ -1033,8 +1002,32 @@ mod tests {
         (root, store, project)
     }
 
+    #[cfg(unix)]
+    #[test_case(NOTE; "flat_note")]
+    #[test_case(NESTED_NOTE; "nested_note")]
+    fn memory_creation_keeps_shared_ancestors_safe_for_plans(name: &str) {
+        let (_root, store, project) = store();
+        let memory = store.write_memory(&project, name, REMOTE_CONTENT).unwrap();
+        let plan = LocalDocumentRef::Plan(store.create_plan(&project, SESSION).unwrap());
+        store
+            .write(&project, Some(SESSION), &plan, REPLACED)
+            .unwrap();
+
+        assert_eq!(
+            store.read(&project, Some(SESSION), &plan).unwrap().content,
+            REPLACED
+        );
+        assert_eq!(
+            store
+                .read(&project, None, &LocalDocumentRef::Memory(memory))
+                .unwrap()
+                .content,
+            REMOTE_CONTENT
+        );
+    }
+
     #[test]
-    fn plan_round_trip_patch_and_owner_checks() {
+    fn plan_round_trip_replace_and_owner_checks() {
         let (_root, store, project) = store();
         let reference = store.create_plan(&project, SESSION).expect("create plan");
         let document = LocalDocumentRef::Plan(reference.clone());
@@ -1045,20 +1038,17 @@ mod tests {
             .read(&project, Some(SESSION), &document)
             .expect("read plan");
         let revision = store
-            .apply_patch(
+            .replace(
                 &project,
                 Some(SESSION),
                 &document,
                 &first.revision,
-                &[PatchEdit {
-                    old: "two".into(),
-                    new: "three".into(),
-                }],
+                "one\nthree\n",
             )
-            .expect("patch plan");
+            .expect("replace plan");
         let updated = store
             .read(&project, Some(SESSION), &document)
-            .expect("read patched plan");
+            .expect("read replaced plan");
 
         assert_eq!(updated.content, "one\nthree\n");
         assert_eq!(updated.revision, revision);
@@ -1074,7 +1064,7 @@ mod tests {
     }
 
     #[test]
-    fn patch_rejects_a_stale_revision() {
+    fn replace_rejects_a_stale_revision() {
         let (_root, store, project) = store();
         let reference =
             LocalDocumentRef::Plan(store.create_plan(&project, SESSION).expect("create plan"));
@@ -1087,16 +1077,7 @@ mod tests {
             .expect("write plan");
 
         assert!(matches!(
-            store.apply_patch(
-                &project,
-                Some(SESSION),
-                &reference,
-                &stale,
-                &[PatchEdit {
-                    old: "new".into(),
-                    new: "newer".into(),
-                }]
-            ),
+            store.replace(&project, Some(SESSION), &reference, &stale, "newer"),
             Err(LocalDocumentError::StaleRevision { .. })
         ));
     }

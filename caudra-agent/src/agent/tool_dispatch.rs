@@ -938,16 +938,12 @@ async fn run_inner(
                 && matches!(entry.source, ToolSource::Native { trusted: true, .. })
                 && ctx.mode.is_planning()
                 && ctx.audience == ToolAudience::MAIN;
-            let remote_plan_target = ctx.mode.plan_ref().is_some_and(|expected| {
-                active_plan_write
-                    || invocation.local_document_target()
-                        == Some(&caudra_workspace::LocalDocumentRef::Plan(expected.clone()))
-            });
+            let remote_plan_target = ctx.mode.plan_ref().is_some() && active_plan_write;
             if ctx.mode.plan_ref().is_some()
                 && !call_effect.is_safe_in_read_only()
                 && !remote_plan_target
             {
-                warn!(tool = %name, "blocked non-plan local document write in remote plan mode");
+                warn!(tool = %name, "blocked non-plan write in remote plan mode");
                 invocation.abandon(ctx).await;
                 return done_error(ToolFailure::Denied, PLAN_WRITE_RESTRICTED.into());
             }

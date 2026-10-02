@@ -9,7 +9,7 @@ use tracing::warn;
 
 use crate::manifest::{ManifestRegistry, ProviderManifest};
 use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing, ThinkingSupport, lookup_entry};
-use crate::provider::{BoxFuture, Provider, ProviderKind, WireRequest};
+use crate::provider::{BoxFuture, Provider, ProviderKind, WireRequest, adjust_model_metadata};
 use crate::providers::anthropic::shared::declares_input_budget;
 use crate::{AgentError, CacheKey, Message, ProviderEvent, RequestOptions, StreamResponse};
 
@@ -460,6 +460,23 @@ fn apply_adjustments(model: &mut Model, overrides: &Overrides) {
     model.supports_vision_override = ov.supports_vision.or(model.supports_vision_override);
 }
 
+pub(crate) fn adjust_model_for_inspection(model: &mut Model) {
+    adjust_metadata_with_overrides(model, &load_overrides());
+}
+
+fn adjust_metadata_with_overrides(model: &mut Model, overrides: &Overrides) {
+    if let Some((provider_id, model_id)) = model.id.split_once('/') {
+        let ov = merged_override(overrides, provider_id, model_id);
+        if let Some(kind) = routed_kind(provider_id, &ov) {
+            let model_id = model_id.to_owned();
+            let full_id = std::mem::replace(&mut model.id, model_id);
+            adjust_model_metadata(kind, model);
+            model.id = full_id;
+        }
+    }
+    apply_adjustments(model, overrides);
+}
+
 impl Provider for Aperture {
     fn stream_message<'a>(
         &'a self,
@@ -564,6 +581,49 @@ mod tests {
     use crate::model::ModelFamily;
     use serde_json::json;
     use test_case::test_case;
+
+    const INSPECTION_PROVIDER: &str = "inspection-mistral";
+    const INSPECTION_MODEL: &str = "mistral-medium-latest";
+
+    #[test_case(None, None, None, true ; "remapped_static_vision")]
+    #[test_case(Some(false), None, None, false ; "existing_metadata_wins_over_static")]
+    #[test_case(None, Some(false), None, false ; "provider_override_disables_static_vision")]
+    #[test_case(Some(false), Some(true), None, true ; "provider_override_wins_over_existing_metadata")]
+    #[test_case(None, Some(true), Some(false), false ; "model_override_disables_provider_vision")]
+    #[test_case(None, Some(false), Some(true), true ; "model_override_enables_provider_vision")]
+    fn inspection_vision_override_precedence(
+        existing: Option<bool>,
+        provider: Option<bool>,
+        specific: Option<bool>,
+        expected: bool,
+    ) {
+        let overrides = HashMap::from([(
+            INSPECTION_PROVIDER.into(),
+            ProviderOverride {
+                default: OverrideFields {
+                    base: Some("mistral".into()),
+                    supports_vision: provider,
+                    ..Default::default()
+                },
+                models: HashMap::from([(
+                    INSPECTION_MODEL.into(),
+                    OverrideFields {
+                        supports_vision: specific,
+                        ..Default::default()
+                    },
+                )]),
+            },
+        )]);
+        let spec = format!("aperture/{INSPECTION_PROVIDER}/{INSPECTION_MODEL}");
+        let mut model = Model::from_spec(&spec).unwrap();
+        model.supports_vision_override = existing;
+
+        adjust_metadata_with_overrides(&mut model, &overrides);
+
+        assert_eq!(model.spec(), spec);
+        assert_eq!(model.supports_vision(), expected);
+        assert!(model.supports_thinking());
+    }
 
     #[test_case("zai", Some(ProviderKind::Zai) ; "known_zai")]
     #[test_case("synthetic", Some(ProviderKind::Synthetic) ; "known_synthetic")]

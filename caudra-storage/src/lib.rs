@@ -52,7 +52,7 @@ use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -69,6 +69,8 @@ use paths::state_dir;
 const RENAME_ATTEMPTS: usize = 20;
 const XDG_RUNTIME_DIR_ENV: &str = "XDG_RUNTIME_DIR";
 const EPHEMERAL_DIR_PREFIX: &str = "caudra";
+#[cfg(unix)]
+const STATE_DIRECTORY_MODE: u32 = 0o700;
 const SESSION_ARTIFACT_LOCK_FILE: &str = "caudra.sqlite.artifacts.lock";
 /// How long a bounded artifact-lock wait sleeps between attempts. `flock`
 /// grants no queue and no fairness, so a waiter polls rather than blocks.
@@ -209,7 +211,11 @@ impl StateDir {
 
     pub fn ensure_subdir(&self, name: impl AsRef<Path>) -> Result<PathBuf, StorageError> {
         let dir = self.root.join(name);
-        fs::create_dir_all(&dir)?;
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        builder.mode(STATE_DIRECTORY_MODE);
+        builder.create(&dir)?;
         Ok(dir)
     }
 }

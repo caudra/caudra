@@ -15,6 +15,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use bitflags::bitflags;
 use caudra_config::{ProfileToolExposure, ProfileToolPolicy, ProfileToolSource};
+use caudra_storage::local_documents::LocalDocumentError;
 use caudra_storage::tool_ledger::ToolOutcome;
 use caudra_storage::tool_outputs::ToolOutputRef;
 use caudra_workspace::{RecordScope, TransportErrorKind, WorkspaceError};
@@ -311,6 +312,21 @@ impl From<&str> for ToolError {
     }
 }
 
+/// References the store cannot place are refused as not owned, not as missing.
+impl From<LocalDocumentError> for ToolError {
+    fn from(error: LocalDocumentError) -> Self {
+        let failure = match &error {
+            LocalDocumentError::InvalidReference
+            | LocalDocumentError::InvalidMemoryName
+            | LocalDocumentError::TooLarge => ToolFailure::InvalidInput,
+            LocalDocumentError::Symlink => ToolFailure::Denied,
+            LocalDocumentError::Io(error) => ToolFailure::from(error),
+            _ => ToolFailure::Other,
+        };
+        Self::new(failure, error.to_string())
+    }
+}
+
 impl From<ToolFailure> for ToolOutcome {
     fn from(failure: ToolFailure) -> Self {
         match failure {
@@ -602,9 +618,6 @@ pub trait ToolInvocation: Send + Sync {
     /// after `preflight`, and only of a call whose effect is not read-only.
     fn record_scope(&self, ctx: &ToolContext, root: &Path) -> Option<RecordScope> {
         RecordScope::of_files(&self.mutation_targets(ctx), root)
-    }
-    fn local_document_target(&self) -> Option<&caudra_workspace::LocalDocumentRef> {
-        None
     }
     /// Files this call reads whole, named before it runs. Dispatch takes a
     /// shared guard on each, so a concurrent write cannot land between the read

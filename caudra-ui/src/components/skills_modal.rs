@@ -305,6 +305,7 @@ mod tests {
         ContextSkillInventory, ContextUsage, ContextWindow,
     };
     use caudra_agent::tools::native::skill::SkillScope;
+    use caudra_agent::{AgentMode, tools::ToolAudience};
 
     use super::{
         ContextSnapshot, NO_SKILLS, NOT_MEASURED, ON_DEMAND, SkillDirCandidate, SkillDirState,
@@ -351,6 +352,8 @@ mod tests {
     fn snapshot() -> ContextSnapshot {
         ContextSnapshot {
             readiness: ContextReadiness::CapturedCurrentRequest,
+            mode: AgentMode::Build,
+            audience: ToolAudience::MAIN,
             model: ContextModel {
                 spec: "test/model".to_owned(),
                 provider_display_name: "Test".to_owned(),

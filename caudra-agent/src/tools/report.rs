@@ -1,12 +1,13 @@
-use caudra_config::{AgentConfig, ProfileToolExposure, ProfileToolPolicy, ProfileToolSource};
+use caudra_config::{AgentConfig, ProfileToolExposure, ProfileToolPolicy};
 use caudra_providers::Model;
 
+use crate::AgentMode;
 use crate::tools::profile_policy::{
-    PROFILE_DISABLED, PROFILE_LOADING, REQUIRED_INFRASTRUCTURE, source_kind,
+    CEILING_DISABLED, LEGACY_LOADING, PROFILE_DISABLED, registered_decision, source_kind,
 };
 use crate::tools::{
-    BuiltinDeferral, RegisteredTool, ToolFilter, VIEW_IMAGE_TOOL_NAME, capability_exclusions,
-    credential_exclusions, deferral,
+    BuiltinDeferral, DescriptionContext, RegisteredTool, ToolFilter, VIEW_IMAGE_TOOL_NAME,
+    capability_exclusions, credential_exclusions, deferral,
 };
 
 pub const REASON_DISALLOWED_FLAG: &str = "--disallowed-tools";
@@ -60,37 +61,38 @@ pub fn profile_report(
     entry: &RegisteredTool,
     profile: &ProfileToolPolicy,
     legacy: ToolReport,
+    ctx: &DescriptionContext,
+    mode: &AgentMode,
 ) -> ToolReport {
-    let source = source_kind(&entry.source);
-    if source == ProfileToolSource::Native && entry.name() == crate::tools::TOOL_OUTPUT_TOOL_NAME {
+    let decision = registered_decision(entry, ctx, profile, mode, legacy.state == ToolState::Lazy);
+    if !decision.available() {
         return ToolReport {
-            state: ToolState::On,
-            reason: Some(REQUIRED_INFRASTRUCTURE),
-        };
-    }
-    if legacy.state == ToolState::Off {
-        return ToolReport {
-            reason: legacy.reason.or_else(|| {
-                (profile.exposure(entry.name(), source) == Some(ProfileToolExposure::Disabled))
-                    .then_some(PROFILE_DISABLED)
-            }),
-            ..legacy
-        };
-    }
-    match profile.exposure(entry.name(), source) {
-        Some(exposure) => ToolReport {
-            state: match exposure {
-                ProfileToolExposure::Eager => ToolState::On,
-                ProfileToolExposure::Lazy => ToolState::Lazy,
-                ProfileToolExposure::Disabled => ToolState::Off,
-            },
-            reason: Some(if exposure == ProfileToolExposure::Disabled {
-                PROFILE_DISABLED
+            state: ToolState::Off,
+            reason: Some(if decision.reason == CEILING_DISABLED {
+                legacy.reason.unwrap_or_else(|| {
+                    if profile.exposure(entry.name(), source_kind(&entry.source))
+                        == Some(ProfileToolExposure::Disabled)
+                    {
+                        PROFILE_DISABLED
+                    } else {
+                        CEILING_DISABLED
+                    }
+                })
             } else {
-                PROFILE_LOADING
+                decision.reason
             }),
+        };
+    }
+    if decision.reason == LEGACY_LOADING {
+        return legacy;
+    }
+    ToolReport {
+        state: match decision.exposure {
+            ProfileToolExposure::Eager => ToolState::On,
+            ProfileToolExposure::Lazy => ToolState::Lazy,
+            ProfileToolExposure::Disabled => ToolState::Off,
         },
-        None => legacy,
+        reason: Some(decision.reason),
     }
 }
 
@@ -176,23 +178,28 @@ fn eager_reason(name: &str, deferral: BuiltinDeferral) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use caudra_config::{INTERNAL_COMPANION_TOOL_NAMES, ProfileToolPolicy};
+    use caudra_config::{INTERNAL_COMPANION_TOOL_NAMES, ProfileToolDefault, ProfileToolPolicy};
     use std::sync::Arc;
     use test_case::test_case;
 
     use super::{
         AgentConfig, BuiltinDeferral, Model, REASON_CONFIG, REASON_DEFERRED,
         REASON_DISALLOWED_FLAG, REASON_EAGER_CLASS, REASON_EAGER_CONFIG, REASON_NOT_ALLOWED,
-        REASON_OTHER_EDITOR, REQUIRED_INFRASTRUCTURE, ToolReport, ToolState, builtin_report,
-        profile_report,
+        REASON_OTHER_EDITOR, ToolReport, ToolState, builtin_report, profile_report,
+    };
+    use crate::AgentMode;
+    use crate::tools::profile_policy::{
+        MODE_DISABLED, PLAN_MODE_REQUIRED, PLAN_TOOL_NAME, PROFILE_LOADING, REQUIRED_INFRASTRUCTURE,
     };
     use crate::tools::{
-        FILE_APPLY_PATCH_TOOL_NAME, FILE_READ_TOOL_NAME, RegisteredTool, SHELL_TOOL_NAME,
-        ToolAudience, ToolEffect, ToolFilter, test_support::NamedMock,
+        DescriptionContext, FILE_APPLY_PATCH_TOOL_NAME, FILE_READ_TOOL_NAME, RegisteredTool,
+        SHELL_TOOL_NAME, ToolAudience, ToolEffect, ToolFilter, ToolSource, test_support::NamedMock,
     };
 
     const MODEL_SPEC: &str = "anthropic/claude-opus-4-8";
     const DEFERRED_TOOL: &str = "code_map";
+    const PLAN_PATH: &str = "plan.md";
+    const CUSTOM_SOURCE: &str = "custom_plan";
 
     fn config(disabled: &[&str], allowed: &[&str]) -> AgentConfig {
         AgentConfig {
@@ -282,10 +289,71 @@ mod tests {
                 &entry,
                 &ProfileToolPolicy::default(),
                 lazy_report(name, &[], &config(&[name], &[])),
+                &DescriptionContext {
+                    filter: &ToolFilter::All,
+                    audience: ToolAudience::MAIN,
+                    workflows_available: false,
+                },
+                &crate::AgentMode::Build,
             );
             assert_eq!(report.state, ToolState::On);
             assert_eq!(report.reason, Some(REQUIRED_INFRASTRUCTURE));
         }
+    }
+
+    #[test_case(true, AgentMode::Build, ToolAudience::MAIN, ToolState::Off, PLAN_MODE_REQUIRED; "native_build")]
+    #[test_case(true, AgentMode::ReadOnly, ToolAudience::MAIN, ToolState::Off, PLAN_MODE_REQUIRED; "native_read_only")]
+    #[test_case(true, AgentMode::Plan(PLAN_PATH.into()), ToolAudience::GENERAL_SUB, ToolState::Off, PLAN_MODE_REQUIRED; "native_task")]
+    #[test_case(true, AgentMode::Plan(PLAN_PATH.into()), ToolAudience::MAIN, ToolState::On, PROFILE_LOADING; "native_main_plan")]
+    #[test_case(false, AgentMode::Build, ToolAudience::MAIN, ToolState::On, PROFILE_LOADING; "custom_build")]
+    #[test_case(false, AgentMode::ReadOnly, ToolAudience::MAIN, ToolState::Off, MODE_DISABLED; "custom_read_only")]
+    #[test_case(false, AgentMode::Plan(PLAN_PATH.into()), ToolAudience::GENERAL_SUB, ToolState::On, PROFILE_LOADING; "custom_task")]
+    fn plan_mode_reason_belongs_to_the_native_source(
+        native: bool,
+        mode: AgentMode,
+        audience: ToolAudience,
+        state: ToolState,
+        reason: &'static str,
+    ) {
+        let entry = RegisteredTool {
+            tool: Arc::new(NamedMock::new(PLAN_TOOL_NAME, ToolAudience::all())),
+            source: if native {
+                NamedMock::source()
+            } else {
+                ToolSource::Lua {
+                    plugin: CUSTOM_SOURCE.into(),
+                    contract: CUSTOM_SOURCE.into(),
+                    bundled: false,
+                }
+            },
+            effect: ToolEffect::ReadOnly,
+        };
+        let policy = ProfileToolPolicy {
+            default: ProfileToolDefault::Eager,
+            ..ProfileToolPolicy::default()
+        };
+        let filter = ToolFilter::All.for_mode(&mode);
+        let report = profile_report(
+            &entry,
+            &policy,
+            ToolReport {
+                state: ToolState::On,
+                reason: None,
+            },
+            &DescriptionContext {
+                filter: &filter,
+                audience,
+                workflows_available: false,
+            },
+            &mode,
+        );
+        assert_eq!(
+            report,
+            ToolReport {
+                state,
+                reason: Some(reason),
+            }
+        );
     }
 
     #[test]

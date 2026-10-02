@@ -45,6 +45,7 @@ use caudra_workbench::{DocumentKey, Layout as WorkbenchLayout, Workbench, Workbe
 
 use crate::agent::ModelSlot;
 use crate::agent::SharedMode;
+use crate::agent::ToolsPreviewSource;
 use crate::app::tasks::TaskOutcome;
 use crate::app::workbench::StoredDocument;
 use crate::chat::Chat;
@@ -127,15 +128,17 @@ use caudra_agent::commits::repo;
 use caudra_agent::context::{ContextKey, ContextSnapshot, ContextStore};
 use caudra_agent::decisions::DecisionStatus;
 use caudra_agent::herdr::PaneMetadata;
+use caudra_agent::mcp::McpSnapshot;
 use caudra_agent::mentions;
 use caudra_agent::permissions::{PermissionManager, PermissionPolicyError};
 use caudra_agent::prompt::profile::PromptProfileCatalog;
+use caudra_agent::tools::ToolAudience;
 use caudra_agent::tools::native::plan;
 use caudra_agent::types::{BACKGROUND_EVENT_RUN_ID, WorkflowProvenance};
 use caudra_agent::{
-    AgentEvent, AgentInput, AgentMode, CommitRef, Envelope, GoalVerdict, ImageSource,
-    McpConfigErrors, McpPromptInfo, McpSnapshotReader, Mention, PromptAdmission, QueueItemId,
-    SharedHistory, SteeringQueue, SubagentInfo, ToolOutput, project_for_inspection,
+    AgentEvent, AgentInput, AgentMode, CommitRef, Envelope, GoalVerdict, HistorySnapshot,
+    ImageSource, McpConfigErrors, McpPromptInfo, McpSnapshotReader, Mention, PromptAdmission,
+    QueueItemId, SharedHistory, SteeringQueue, SubagentInfo, ToolOutput, project_for_inspection,
 };
 use caudra_config::decisions::{DecisionsConfig, FeatureMode};
 use caudra_config::{
@@ -146,7 +149,8 @@ use caudra_docs::DocsLibrary;
 use caudra_lua::{
     BuiltinAction, EventHandle, HintReader, HintSnapshot, KeymapReader, LuaCommandReader, WinView,
 };
-use caudra_providers::provider::seed_setup_thinking;
+use caudra_providers::model_registry::{self, Binding};
+use caudra_providers::provider::{adjust_model_for_inspection, seed_setup_thinking};
 use caudra_providers::{
     Billing, CacheKey, ContentBlock, Message, Model, ModelPurpose, RequestOptions,
     ResolvedThinking, ThinkingConfig, TokenUsage, add_cost, project_messages,
@@ -306,6 +310,14 @@ fn normalize_preview(text: &str) -> Option<String> {
     notification_preview(std::iter::once(text))
 }
 
+fn tools_mode_name(mode: &AgentMode) -> &'static str {
+    match mode {
+        AgentMode::Build => "Build",
+        AgentMode::ReadOnly => "Read-only",
+        AgentMode::Plan(_) | AgentMode::RemotePlan(_) => "Plan",
+    }
+}
+
 pub(crate) fn turn_response(message: &Message) -> Option<String> {
     if message.has_tool_calls() {
         return None;
@@ -356,6 +368,27 @@ pub enum KeyFocus {
     Transcript,
 }
 
+#[derive(PartialEq, Eq)]
+struct ToolsPreviewKey {
+    mode: AgentMode,
+    chat_model: String,
+    model: String,
+    bindings: [Option<Binding>; ModelPurpose::ALL.len()],
+    window: u32,
+    thinking: ThinkingConfig,
+    cwd: String,
+    registry_revision: u64,
+}
+
+#[derive(Default)]
+struct ToolsPreviewCache {
+    key: Option<ToolsPreviewKey>,
+    source: Watch<ToolsPreviewSource>,
+    history: Watch<HistorySnapshot>,
+    mcp: Watch<McpSnapshot>,
+    snapshot: Option<Arc<ContextSnapshot>>,
+}
+
 pub struct App {
     pub(super) chats: Vec<Chat>,
     pub(super) active_chat: usize,
@@ -391,6 +424,10 @@ pub struct App {
     pub(super) system_prompt_modal: SystemPromptModal,
     pub(super) projection_modal: ProjectionModal,
     context_snapshot: Watch<ContextSnapshot>,
+    tools_snapshot: Watch<ContextSnapshot>,
+    tools_basis: String,
+    tools_preview_cache: ToolsPreviewCache,
+    pub(crate) tools_preview_source: Option<Arc<ToolsPreviewSource>>,
     /// Read from the ledger when the modal asks for it, not on every frame:
     /// the table outlives sessions and only grows.
     pub(super) lifetime_usage: Option<LifetimeUsage>,
@@ -666,6 +703,10 @@ impl App {
             system_prompt_modal: SystemPromptModal::default(),
             projection_modal: ProjectionModal::default(),
             context_snapshot: Watch::default(),
+            tools_snapshot: Watch::default(),
+            tools_basis: String::new(),
+            tools_preview_cache: ToolsPreviewCache::default(),
+            tools_preview_source: None,
             lifetime_usage: None,
             tool_stats: None,
             goal_modal: GoalModal::default(),
@@ -996,6 +1037,9 @@ impl App {
     /// still describes the model in force.
     pub(super) fn main_context_snapshot(&self) -> Option<Arc<ContextSnapshot>> {
         let snapshot = self.context_store.as_ref()?.latest(&ContextKey::Main)?;
+        if snapshot.mode != self.execution_agent_mode() || snapshot.audience != ToolAudience::MAIN {
+            return None;
+        }
         if let Some(model_slot) = self.status_main_model() {
             return (snapshot.model.spec == model_slot.model.spec()
                 && snapshot.window.tokens == model_slot.model.context_window)
@@ -3536,8 +3580,8 @@ impl App {
     }
 
     fn execute_tools(&mut self) {
-        self.context_snapshot = Watch::seeded(self.active_context_snapshot());
         self.tools_modal.open();
+        let _ = self.poll_tools_snapshot();
         self.load_tool_stats();
     }
 
@@ -4445,13 +4489,9 @@ impl App {
                     plan_write = Some((e.id.clone(), plan));
                 }
             } else if active_plan
-                && (self.state.plan.path().is_some_and(|pp| {
+                && self.state.plan.path().is_some_and(|pp| {
                     e.wrote_to(pp) || e.wrote_to(&Path::new(&self.state.session.cwd).join(pp))
-                }) || self
-                    .state
-                    .plan
-                    .document_ref()
-                    .is_some_and(|reference| e.wrote_document(&reference)))
+                })
             {
                 self.transition_plan(PlanTrigger::WriteDone);
             }
@@ -5782,6 +5822,7 @@ impl App {
             | self.usage_modal.poll(&self.usage_slot)
             | self.storage_modal.poll(&self.storage_slot)
             | self.poll_context_snapshot()
+            | self.poll_tools_snapshot()
             | self.logs_modal.poll()
             | self.hints.poll(self.hint_reader.load_full())
             | self.tick_file_picker()
@@ -5799,14 +5840,111 @@ impl App {
     }
 
     fn poll_context_snapshot(&mut self) -> Dirty {
-        if !self.context_modal.is_open()
-            && !self.tools_modal.is_open()
-            && !self.skills_modal.is_open()
-        {
+        if !self.context_modal.is_open() && !self.skills_modal.is_open() {
             return Dirty::NO;
         }
         let snapshot = self.active_context_snapshot();
         self.context_snapshot.poll(snapshot)
+    }
+
+    fn poll_tools_snapshot(&mut self) -> Dirty {
+        if !self.tools_modal.is_open() {
+            return Dirty::NO;
+        }
+        let (snapshot, basis) = if self.active_subagent_id().is_some() {
+            self.tools_preview_cache.key = None;
+            let snapshot = self.active_context_snapshot();
+            let basis = snapshot.as_ref().map_or_else(
+                || "Task · awaiting tools snapshot".to_owned(),
+                |snapshot| format!("Task · {}", tools_mode_name(&snapshot.mode)),
+            );
+            (snapshot, basis)
+        } else if self.status == Status::Streaming
+            || self.queue.is_processing()
+            || self.chats[0].retry().is_some()
+            || self.cancelling_run.is_some()
+        {
+            self.tools_preview_cache.key = None;
+            let mode = self.execution_agent_mode();
+            let mut basis = format!("Executing {}", tools_mode_name(&mode));
+            if self.agent_mode() != mode {
+                let selected = if self.state.mode == Mode::Plan {
+                    "Plan"
+                } else {
+                    "Build"
+                };
+                basis.push_str(&format!(" · Selected {selected} pending"));
+            }
+            (self.main_context_snapshot(), basis)
+        } else {
+            let selected = if self.state.mode == Mode::Plan {
+                "Plan"
+            } else {
+                "Build"
+            };
+            (
+                self.selected_tools_snapshot(),
+                format!("Selected {selected} · next user message"),
+            )
+        };
+        let changed = self.tools_basis != basis;
+        self.tools_basis = basis;
+        self.tools_snapshot.poll(snapshot) | Dirty::from(changed)
+    }
+
+    fn selected_tools_snapshot(&mut self) -> Option<Arc<ContextSnapshot>> {
+        let source = Arc::clone(self.tools_preview_source.as_ref()?);
+        if source.profile_name() != self.state.system_prompt_profile_name {
+            return None;
+        }
+        let mode = self.agent_mode();
+        let mut model = if self.state.mode == Mode::Plan {
+            Model::resolve_if_available(ModelPurpose::Plan, &self.state.model, &self.model_policy)
+                .ok()?
+        } else {
+            self.state.model.clone()
+        };
+        adjust_model_for_inspection(&mut model);
+        let key = ToolsPreviewKey {
+            mode,
+            chat_model: self.state.model.spec(),
+            model: model.spec(),
+            bindings: ModelPurpose::ALL.map(model_registry::binding),
+            window: model.context_window,
+            thinking: self.state.thinking.clone(),
+            cwd: self.state.session.cwd.clone(),
+            registry_revision: source.registry.authority_snapshot().revision(),
+        };
+        let cache = &mut self.tools_preview_cache;
+        let changed = cache.source.poll(Some(Arc::clone(&source)))
+            | cache.history.poll(
+                self.shared_history
+                    .as_ref()
+                    .map(|history| history.load_full()),
+            )
+            | cache
+                .mcp
+                .poll(source.mcp.as_ref().map(|mcp| mcp.reader().load_full()));
+        if cache.key.as_ref() != Some(&key) || changed == Dirty::YES {
+            cache.key = None;
+            cache.snapshot = None;
+            let messages = cache
+                .history
+                .get()
+                .map(|history| project_messages(&history.messages))
+                .transpose()
+                .ok()?;
+            cache.snapshot = Some(Arc::new(source.snapshot(
+                &model,
+                &self.state.model,
+                &key.thinking,
+                &key.mode,
+                &key.cwd,
+                messages.as_deref().unwrap_or_default(),
+            )));
+            cache.key = Some(key);
+        }
+        cache.snapshot.clone()
     }
 
     fn tick_workbench(&mut self) -> Dirty {

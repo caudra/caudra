@@ -1152,8 +1152,8 @@ mod tests {
     /// restated after it with a row for the chat to draw.
     #[test_case(false, false, &["plan"]; "restated_local_plan")]
     #[test_case(true, false, &["plan"]; "retained_local_plan")]
-    #[test_case(false, true, &["local_document_write"]; "restated_remote_fallback")]
-    #[test_case(true, true, &["local_document_write"]; "retained_remote_fallback")]
+    #[test_case(false, true, &["plan"]; "restated_remote_plan")]
+    #[test_case(true, true, &["plan"]; "retained_remote_plan")]
     #[test_case(false, true, &[]; "restated_no_writer")]
     #[test_case(true, true, &[]; "retained_no_writer")]
     fn compaction_keeps_every_standing_reminder_in_force(

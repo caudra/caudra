@@ -598,8 +598,7 @@ impl MemoryOrigin {
         }
     }
 
-    /// The lines that name a remote note, which is how the model reaches it
-    /// with `local_document_read` and replaces it with `local_document_write`.
+    /// The document locator used by the memory editor.
     fn locator_lines(&self) -> Vec<String> {
         match self {
             Self::File { .. } => Vec::new(),
@@ -1967,24 +1966,9 @@ impl ToolDoneEvent {
     }
 
     pub fn wrote_document(&self, reference: &LocalDocumentRef) -> bool {
-        if self.is_error {
-            return false;
-        }
-        if &*self.tool == plan::NAME {
-            return self.plan_write_result().is_some_and(|result| {
-                matches!((result.target(), reference),
-                    (PlanTarget::Remote(written), LocalDocumentRef::Plan(expected)) if written == expected)
-            });
-        }
-        let (kind, id) = match reference {
-            LocalDocumentRef::Plan(reference) => ("plan", reference.as_str()),
-            LocalDocumentRef::Memory(reference) => ("memory", reference.as_str()),
-        };
-        self.annotation.as_deref().is_some_and(|annotation| {
-            annotation
-                .strip_prefix("local_document:")
-                .and_then(|value| value.split_once(";revision:"))
-                .is_some_and(|(written, _)| written == format!("{kind}:{id}"))
+        self.plan_write_result().is_some_and(|result| {
+            matches!((result.target(), reference),
+                (PlanTarget::Remote(written), LocalDocumentRef::Plan(expected)) if written == expected)
         })
     }
 

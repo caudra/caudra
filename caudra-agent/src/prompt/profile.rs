@@ -6,12 +6,14 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use caudra_config::{ModelPolicy, ProfileToolPolicy};
 use caudra_providers::model_registry::Binding;
-use caudra_providers::{Model, ModelPurpose, ThinkingConfig, Timeouts, provider};
+use caudra_providers::{
+    AgentError, Model, ModelError, ModelPurpose, ThinkingConfig, Timeouts, provider,
+};
 use caudra_storage::thinking::{StoredThinking, ThinkingParseError};
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::agent::resolve_purpose_model;
+use crate::agent::{resolve_purpose_model, resolve_purpose_model_for_inspection};
 
 pub const BUILTIN_PROFILE_NAME: &str = "builtin";
 
@@ -229,22 +231,65 @@ impl PromptProfileCatalog {
         model_policy: &ModelPolicy,
         timeouts: Timeouts,
     ) -> TaskProfileBindings {
+        self.bind_tasks_with(|profile| {
+            validate_task_profile(
+                profile,
+                parent_thinking,
+                |binding| {
+                    resolve_purpose_model(
+                        ModelPurpose::Subagent,
+                        binding,
+                        parent_model,
+                        chat_model,
+                        model_policy,
+                    )
+                },
+                |model| provider::adjust_model(model, timeouts),
+            )
+            .inspect_err(|reason| warn_task_profile_once(profile.name(), parent_model, reason))
+        })
+    }
+
+    pub fn bind_for_tasks_for_inspection(
+        &self,
+        parent_model: &Model,
+        chat_model: &Model,
+        parent_thinking: &ThinkingConfig,
+        model_policy: &ModelPolicy,
+    ) -> TaskProfileBindings {
+        self.bind_tasks_with(|profile| {
+            validate_task_profile(
+                profile,
+                parent_thinking,
+                |binding| {
+                    resolve_purpose_model_for_inspection(
+                        ModelPurpose::Subagent,
+                        binding,
+                        parent_model,
+                        chat_model,
+                        model_policy,
+                    )
+                },
+                |model| {
+                    provider::adjust_model_for_inspection(model);
+                    Ok(())
+                },
+            )
+        })
+    }
+
+    fn bind_tasks_with(
+        &self,
+        validate: impl Fn(&SystemPromptProfile) -> Result<(), String>,
+    ) -> TaskProfileBindings {
         let mut available = BTreeMap::new();
         let mut disabled = BTreeMap::new();
         for (name, profile) in &self.profiles {
-            match validate_task_profile(
-                profile,
-                parent_model,
-                chat_model,
-                parent_thinking,
-                model_policy,
-                timeouts,
-            ) {
+            match validate(profile) {
                 Ok(()) => {
                     available.insert(Arc::clone(name), Arc::clone(profile));
                 }
                 Err(reason) => {
-                    warn_task_profile_once(name, parent_model, &reason);
                     disabled.insert(Arc::clone(name), Arc::from(reason));
                 }
             }
@@ -319,28 +364,19 @@ fn task_tool_summary<'a>(
 
 fn validate_task_profile(
     profile: &SystemPromptProfile,
-    parent_model: &Model,
-    chat_model: &Model,
     parent_thinking: &ThinkingConfig,
-    model_policy: &ModelPolicy,
-    timeouts: Timeouts,
+    resolve_model: impl FnOnce(Option<&Binding>) -> Result<Model, ModelError>,
+    adjust_model: impl FnOnce(&mut Model) -> Result<(), AgentError>,
 ) -> Result<(), String> {
     if profile.subagent_model().is_none() && profile.subagent_thinking().is_none() {
         return Ok(());
     }
     let binding = profile.subagent_model();
-    let mut model = resolve_purpose_model(
-        ModelPurpose::Subagent,
-        binding,
-        parent_model,
-        chat_model,
-        model_policy,
-    )
-    .map_err(|error| match binding {
+    let mut model = resolve_model(binding).map_err(|error| match binding {
         Some(binding) => format!("subagent model {binding:?} is unavailable: {error}"),
         None => format!("global subagent model is unavailable: {error}"),
     })?;
-    provider::adjust_model(&mut model, timeouts)
+    adjust_model(&mut model)
         .map_err(|error| format!("cannot inspect subagent model {:?}: {error}", model.spec()))?;
     let thinking = profile
         .subagent_thinking()
@@ -601,8 +637,12 @@ fn validate_custom_template(
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+    use std::process::Command;
+
     use caudra_config::ModelPolicy;
-    use caudra_providers::{Model, ThinkingConfig};
+    use caudra_providers::{Model, ThinkingConfig, catalog_providers_if_available, model_registry};
+    use caudra_storage::StateDir;
     use caudra_storage::thinking::StoredThinking;
     use tempfile::TempDir;
     use test_case::test_case;
@@ -612,6 +652,34 @@ mod tests {
     /// The reminder contract is appended once, after the profile, so a profile
     /// cannot leave a subagent unable to read its own announcements.
     const EXPECTED_REMINDER_CONTRACTS: usize = 1;
+    const INSPECTION_PROFILE: &str = "inspect";
+    const INSPECTION_PARENT: &str = "mistral/ministral-14b-latest";
+    const INSPECTION_CHAT: &str = "anthropic/claude-sonnet-4-6";
+    const INSPECTION_ROUTED: &str = "aperture/mistral/mistral-medium-latest";
+    const INSPECTION_UNKNOWN: &str = "caudra-inspection-unknown/model";
+    const INCOMPATIBLE_THINKING: &str = "subagent thinking Adaptive is incompatible with model \"mistral/ministral-14b-latest\": model does not support thinking";
+    const INSPECTION_OFFLINE_ENV: &str = "CAUDRA_TEST_PROFILE_INSPECTION_OFFLINE";
+    const INSPECTION_OFFLINE_TEST: &str =
+        "prompt::profile::tests::inspection_task_bindings_need_no_auth_or_catalog";
+
+    fn inspection_catalog(model: Option<&str>, thinking: Option<&str>) -> PromptProfileCatalog {
+        let name: Arc<str> = Arc::from(INSPECTION_PROFILE);
+        let profile = SystemPromptProfile {
+            name: Arc::clone(&name),
+            description: None,
+            layout: PromptProfileLayout::Overlay,
+            subagent_model: model.map(|model| parse_subagent_model(model.to_owned()).unwrap()),
+            subagent_thinking: thinking
+                .map(|thinking| StoredThinking::parse_setting(thinking).unwrap()),
+            tools: ProfileToolPolicy::default(),
+            body: Arc::from(""),
+            path: Arc::from(Path::new(INSPECTION_PROFILE)),
+        };
+        PromptProfileCatalog {
+            profiles: BTreeMap::from([(name, Arc::new(profile))]),
+            invalid: BTreeMap::new(),
+        }
+    }
 
     fn discover(dir: &Path) -> PromptProfileCatalog {
         PromptProfileCatalog::discover_with(Some(dir))
@@ -747,6 +815,113 @@ mod tests {
         let summary = bindings.task_tool_summary("Built in");
         assert!(summary.contains("`plain`"));
         assert!(!summary.contains("`blocked`"));
+    }
+
+    #[test_case(Some("chat"), None, None; "selected_chat_not_parent")]
+    #[test_case(Some(INSPECTION_CHAT), None, None; "exact_model_not_parent")]
+    #[test_case(Some(INSPECTION_ROUTED), None, None; "routed_metadata_adjusted")]
+    #[test_case(None, Some("adaptive"), Some(INCOMPATIBLE_THINKING); "unbound_uses_effective_parent")]
+    #[test_case(Some(INSPECTION_PARENT), None, Some(INCOMPATIBLE_THINKING); "exact_model_inherits_thinking")]
+    #[test_case(Some(INSPECTION_PARENT), Some("off"), None; "profile_thinking_overrides_parent")]
+    #[test_case(None, None, None; "no_overrides_skip_validation")]
+    fn inspection_task_bindings_validate_selected_model_and_thinking(
+        model: Option<&str>,
+        thinking: Option<&str>,
+        expected_error: Option<&str>,
+    ) {
+        let catalog = inspection_catalog(model, thinking);
+        let parent = Model::from_spec(INSPECTION_PARENT).unwrap();
+        let chat = Model::from_spec(INSPECTION_CHAT).unwrap();
+        let bindings = catalog.bind_for_tasks_for_inspection(
+            &parent,
+            &chat,
+            &ThinkingConfig::Adaptive,
+            &ModelPolicy::default(),
+        );
+
+        assert_eq!(
+            bindings.disabled().next(),
+            expected_error.map(|reason| (INSPECTION_PROFILE, reason))
+        );
+        assert_eq!(
+            bindings.resolve(INSPECTION_PROFILE).is_ok(),
+            expected_error.is_none()
+        );
+        assert!(catalog.resolve(Some(INSPECTION_PROFILE)).unwrap().is_some());
+    }
+
+    #[test]
+    fn inspection_task_bindings_need_no_auth_or_catalog() {
+        if env::var_os(INSPECTION_OFFLINE_ENV).is_none() {
+            let home = TempDir::new().unwrap();
+            let status = Command::new(env::current_exe().unwrap())
+                .args(["--exact", INSPECTION_OFFLINE_TEST, "--nocapture"])
+                .env_clear()
+                .env(INSPECTION_OFFLINE_ENV, INSPECTION_OFFLINE_TEST)
+                .env("HOME", home.path())
+                .env("XDG_CONFIG_HOME", home.path())
+                .env("XDG_DATA_HOME", home.path())
+                .env("XDG_STATE_HOME", home.path())
+                .env("XDG_CACHE_HOME", home.path())
+                .current_dir(home.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let parent = Model::from_spec(INSPECTION_PARENT).unwrap();
+        let chat = Model::from_spec(INSPECTION_CHAT).unwrap();
+        let policy = ModelPolicy::default();
+        assert!(catalog_providers_if_available().is_none());
+        for model in [INSPECTION_CHAT, INSPECTION_ROUTED] {
+            let bindings = inspection_catalog(Some(model), None).bind_for_tasks_for_inspection(
+                &parent,
+                &chat,
+                &ThinkingConfig::Adaptive,
+                &policy,
+            );
+            assert!(bindings.resolve(INSPECTION_PROFILE).unwrap().is_some());
+        }
+
+        let bindings = inspection_catalog(Some(INSPECTION_UNKNOWN), None)
+            .bind_for_tasks_for_inspection(&parent, &chat, &ThinkingConfig::Off, &policy);
+        assert!(matches!(
+            bindings.resolve(INSPECTION_PROFILE),
+            Err(PromptProfileSelectionError::Unavailable { .. })
+        ));
+
+        let dir = TempDir::new().unwrap();
+        let state = StateDir::from_path(dir.path().to_path_buf());
+        model_registry::set_binding_and_persist(
+            ModelPurpose::Subagent,
+            Binding::Same(ModelPurpose::Chat),
+            &state,
+        )
+        .unwrap();
+        let bindings = inspection_catalog(None, Some("adaptive")).bind_for_tasks_for_inspection(
+            &parent,
+            &chat,
+            &ThinkingConfig::Off,
+            &policy,
+        );
+        assert!(bindings.resolve(INSPECTION_PROFILE).unwrap().is_some());
+
+        let bindings = inspection_catalog(Some(INSPECTION_PARENT), None)
+            .bind_for_tasks_for_inspection(&parent, &chat, &ThinkingConfig::Adaptive, &policy);
+        assert_eq!(
+            bindings.disabled().next(),
+            Some((INSPECTION_PROFILE, INCOMPATIBLE_THINKING))
+        );
+
+        let blocked = ModelPolicy::new(&[], &[INSPECTION_CHAT.into()]).unwrap();
+        let bindings = inspection_catalog(Some(INSPECTION_CHAT), None)
+            .bind_for_tasks_for_inspection(&parent, &chat, &ThinkingConfig::Off, &blocked);
+        assert!(matches!(
+            bindings.resolve(INSPECTION_PROFILE),
+            Err(PromptProfileSelectionError::Unavailable { .. })
+        ));
+        assert!(catalog_providers_if_available().is_none());
     }
 
     #[test]

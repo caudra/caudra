@@ -9,14 +9,15 @@ use caudra_providers::{
 };
 use serde_json::Value;
 
+use crate::AgentMode;
 use crate::agent::{compaction_reserve, estimate_message_tokens};
 use crate::mcp::{McpRequestSnapshot, McpToolStatus};
 use crate::prompt::profile::{BUILTIN_PROFILE_NAME, PromptProfileCatalog, TaskProfileBindings};
 use crate::tools::TOOL_SEARCH_TOOL_NAME;
 use crate::tools::native::{memory, skill};
 use crate::tools::{
-    BuiltinDeferral, DeferredTool, MEMORY_TOOL_NAME, SKILL_TOOL_NAME, TASK_TOOL_NAME, ToolFilter,
-    ToolRegistry, ToolState, builtin_report,
+    BuiltinDeferral, DeferredTool, DescriptionContext, MEMORY_TOOL_NAME, SKILL_TOOL_NAME,
+    TASK_TOOL_NAME, ToolAudience, ToolFilter, ToolRegistry, ToolState, builtin_report,
 };
 
 const MEMORY_READ_COMMAND: &str = "read";
@@ -407,12 +408,14 @@ pub struct BuiltinToolsInput<'a> {
     pub filter: &'a ToolFilter,
     pub config: &'a AgentConfig,
     pub model: &'a Model,
+    pub mode: &'a AgentMode,
+    pub audience: ToolAudience,
     pub deferral: BuiltinDeferral,
     pub deferred: &'a [DeferredTool],
 }
 
 impl BuiltinToolsInput<'_> {
-    fn inventory(&self, profile: &ProfileToolPolicy) -> ContextBuiltinInventory {
+    pub fn inventory(&self, profile: &ProfileToolPolicy) -> ContextBuiltinInventory {
         let deferred_tokens: HashMap<&str, u32> = self
             .deferred
             .iter()
@@ -432,7 +435,17 @@ impl BuiltinToolsInput<'_> {
                     self.model,
                     self.deferral,
                 );
-                let report = crate::tools::report::profile_report(entry, profile, report);
+                let report = crate::tools::report::profile_report(
+                    entry,
+                    profile,
+                    report,
+                    &DescriptionContext {
+                        filter: self.filter,
+                        audience: self.audience,
+                        workflows_available: true,
+                    },
+                    self.mode,
+                );
                 let (state, reason) = match report.state {
                     ToolState::On => (ContextBuiltinState::Declared, report.reason),
                     ToolState::Lazy if deferred_tokens.contains_key(name) => {
@@ -552,6 +565,8 @@ impl ContextInventory {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextSnapshot {
     pub readiness: ContextReadiness,
+    pub mode: AgentMode,
+    pub audience: ToolAudience,
     pub model: ContextModel,
     pub window: ContextWindow,
     pub usage: ContextUsage,
@@ -573,6 +588,8 @@ impl ContextSnapshot {
 
 pub struct ContextCapture<'a> {
     pub readiness: ContextReadiness,
+    pub mode: &'a AgentMode,
+    pub audience: ToolAudience,
     pub model: &'a Model,
     pub auto_compact: bool,
     pub compaction_buffer: Option<CompactionBuffer>,
@@ -607,6 +624,8 @@ impl ContextSnapshot {
         inventory.apply_accounting(&accounting);
         Self {
             readiness: capture.readiness,
+            mode: capture.mode.clone(),
+            audience: capture.audience,
             model: ContextModel::from(capture.model),
             window: ContextWindow::new(
                 capture.model,
@@ -662,6 +681,7 @@ struct BuiltinDefinition {
     name: String,
     tokens: u32,
     billed_to: Option<&'static str>,
+    catalog: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -791,12 +811,15 @@ fn account_tools(base_tools: &Value, full_tools: &Value) -> ToolAccounting {
                 name: contribution.name.clone(),
                 tokens: contribution.tokens,
                 billed_to: Some(billed_to),
+                catalog: false,
             });
         }
         match contribution.category {
             ToolCategory::System => {
                 add_tokens(&mut accounting.system, contribution.tokens);
                 accounting.builtin_definitions.push(BuiltinDefinition {
+                    catalog: contribution.name == TOOL_SEARCH_TOOL_NAME
+                        && !own_names.contains(contribution.name.as_str()),
                     name: contribution.name,
                     tokens: contribution.tokens,
                     billed_to: None,
@@ -964,11 +987,8 @@ impl ContextBuiltinInventory {
                 name,
                 tokens,
                 billed_to,
+                catalog,
             } = definition;
-            if name == TOOL_SEARCH_TOOL_NAME {
-                add_tokens(&mut self.catalog_tokens, *tokens);
-                continue;
-            }
             match self.tools.iter_mut().find(|tool| tool.name == *name) {
                 Some(tool) => {
                     let reason = tool.reason;
@@ -987,6 +1007,7 @@ impl ContextBuiltinInventory {
                     tool.tokens = *tokens;
                     tool.billed_to = *billed_to;
                 }
+                None if *catalog => add_tokens(&mut self.catalog_tokens, *tokens),
                 None => self.tools.push(ContextBuiltinTool {
                     name: name.clone(),
                     source: String::new(),
@@ -1103,6 +1124,8 @@ mod tests {
     const CROWDED_EXCESS: u32 = 30;
     const TASK_CONTROL_NAME: &str = "task_control";
     const CONFIG_DISABLED_REASON: &str = "disabled in configuration";
+    const CUSTOM_SEARCH_SOURCE: &str = "plugin:custom-search";
+    const SEARCH_DESCRIPTION: &str = "Search available information";
 
     fn model(context_window: u32, window_excludes_output: bool) -> Model {
         let mut model = Model::from_spec(MODEL_SPEC).unwrap();
@@ -1289,6 +1312,7 @@ mod tests {
                 name: TASK_CONTROL_NAME.into(),
                 tokens: CROWDED_EXCESS,
                 billed_to: None,
+                catalog: false,
             }]
         } else {
             Vec::new()
@@ -1309,6 +1333,55 @@ mod tests {
                 CROWDED_ROW_TOKENS
             }
         );
+    }
+
+    #[test_case(Some(ContextBuiltinState::Declared), true; "registered_eager")]
+    #[test_case(Some(ContextBuiltinState::Deferred), true; "registered_lazy")]
+    #[test_case(None, true; "local_binding")]
+    #[test_case(None, false; "native_catalog")]
+    fn tool_search_tokens_keep_binding_identity(initial: Option<ContextBuiltinState>, bound: bool) {
+        let full = json!([definition(TOOL_SEARCH_TOOL_NAME, SEARCH_DESCRIPTION)]);
+        let sources = if bound { full.clone() } else { json!([]) };
+        let accounting = account_tools(&sources, &full);
+        let mut inventory = ContextBuiltinInventory {
+            tools: initial
+                .into_iter()
+                .map(|state| ContextBuiltinTool {
+                    name: TOOL_SEARCH_TOOL_NAME.into(),
+                    source: CUSTOM_SEARCH_SOURCE.into(),
+                    state,
+                    reason: None,
+                    tokens: 0,
+                    billed_to: None,
+                })
+                .collect(),
+            ..ContextBuiltinInventory::default()
+        };
+        inventory.apply_request_tokens(
+            &accounting.builtin_definitions,
+            accounting.system_unattributed,
+        );
+        assert_eq!(inventory.request_tokens(), accounting.system);
+        if bound {
+            assert_eq!(inventory.catalog_tokens, 0);
+            assert_eq!(inventory.tools.len(), 1);
+            let tool = &inventory.tools[0];
+            assert_eq!(tool.name, TOOL_SEARCH_TOOL_NAME);
+            assert_eq!(tool.state, ContextBuiltinState::Declared);
+            assert_eq!(tool.tokens, value_tokens(&full[0]));
+            assert_eq!(
+                tool.source,
+                if initial.is_some() {
+                    CUSTOM_SEARCH_SOURCE
+                } else {
+                    ""
+                },
+            );
+        } else {
+            assert!(inventory.tools.is_empty());
+            assert!(inventory.catalog_tokens > 0);
+            assert_eq!(inventory.catalog_tokens, value_tokens(&full[0]));
+        }
     }
 
     #[test]
@@ -1353,6 +1426,8 @@ mod tests {
         let messages = messages();
         let snapshot = ContextSnapshot::capture(ContextCapture {
             readiness: ContextReadiness::CapturedCurrentRequest,
+            mode: &AgentMode::Build,
+            audience: ToolAudience::MAIN,
             model: &model,
             auto_compact: true,
             compaction_buffer: None,
@@ -2072,6 +2147,8 @@ mod tests {
         let empty_tools = json!([]);
         let snapshot = ContextSnapshot::capture(ContextCapture {
             readiness: ContextReadiness::PreparedNextRequest,
+            mode: &AgentMode::Build,
+            audience: ToolAudience::MAIN,
             model: &model,
             auto_compact: false,
             compaction_buffer: None,
@@ -2146,6 +2223,8 @@ mod tests {
     fn stored_snapshot(spec: &str, readiness: ContextReadiness) -> ContextSnapshot {
         ContextSnapshot {
             readiness,
+            mode: AgentMode::Build,
+            audience: ToolAudience::MAIN,
             model: ContextModel {
                 spec: spec.to_owned(),
                 provider_display_name: "Test".into(),

@@ -135,14 +135,6 @@ impl ToolFilter {
         }
     }
 
-    pub fn for_remote_workspace(self, remote: bool) -> Self {
-        if remote {
-            self
-        } else {
-            self.excluding(LOCAL_DOCUMENT_TOOL_NAMES)
-        }
-    }
-
     pub fn is_read_only(&self) -> bool {
         matches!(self, Self::ReadOnly(_))
     }
@@ -358,14 +350,6 @@ pub const FILE_WRITE_TOOL_NAME: &str = "file_write";
 pub const IMAGE_GENERATE_TOOL_NAME: &str = "image_generate";
 /// The only backend `image_generate` can reach today.
 const OPENAI_PROVIDER_SLUG: &str = "openai";
-pub const LOCAL_DOCUMENT_APPLY_PATCH_TOOL_NAME: &str = "local_document_apply_patch";
-pub const LOCAL_DOCUMENT_READ_TOOL_NAME: &str = "local_document_read";
-pub const LOCAL_DOCUMENT_WRITE_TOOL_NAME: &str = "local_document_write";
-pub const LOCAL_DOCUMENT_TOOL_NAMES: &[&str] = &[
-    LOCAL_DOCUMENT_APPLY_PATCH_TOOL_NAME,
-    LOCAL_DOCUMENT_READ_TOOL_NAME,
-    LOCAL_DOCUMENT_WRITE_TOOL_NAME,
-];
 pub const MEMORY_TOOL_NAME: &str = "memory";
 pub const QUESTION_TOOL_NAME: &str = "question";
 pub const SHELL_TOOL_NAME: &str = "shell";
@@ -1601,17 +1585,6 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for name in &names {
             assert!(seen.insert(name), "duplicate builtin tool name: {name}");
-        }
-    }
-
-    #[test]
-    fn local_document_tools_are_exposed_only_for_remote_workspaces() {
-        let embedded = ToolFilter::All.for_remote_workspace(false);
-        let remote = ToolFilter::All.for_remote_workspace(true);
-
-        for name in LOCAL_DOCUMENT_TOOL_NAMES {
-            assert!(!embedded.matches(name));
-            assert!(remote.matches(name));
         }
     }
 }

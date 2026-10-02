@@ -1,5 +1,6 @@
 use super::*;
 use crate::agent::shared_queue::{self, QueueReceiver};
+use crate::agent::tools_preview_source;
 use crate::app::sandbox::attached_sandbox_instance;
 use crate::app::tasks::{MAIN_TASK_ID, TaskStatus};
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT};
@@ -34,7 +35,8 @@ use arc_swap::ArcSwap;
 use caudra_agent::command::CustomCommand;
 use caudra_agent::commits::repo::CommitSummary;
 use caudra_agent::context::{
-    ContextInventory, ContextModel, ContextReadiness, ContextReserve, ContextUsage, ContextWindow,
+    ContextBuiltinState, ContextInventory, ContextModel, ContextReadiness, ContextReserve,
+    ContextUsage, ContextWindow,
 };
 use caudra_agent::decisions::Decisions;
 use caudra_agent::mcp::config::{McpConfigSource, McpReviewSummary};
@@ -45,7 +47,10 @@ use caudra_agent::permissions::{
     PermissionManager, PermissionRequest, PermissionResourceSelector, PermissionRuleRecord,
 };
 use caudra_agent::tools::native::plan::{self, PlanTarget, PlanWriteResult};
-use caudra_agent::tools::{SHELL_TOOL_NAME, TODOWRITE_TOOL_NAME, ToolEffect};
+use caudra_agent::tools::profile_policy::PLAN_MODE_REQUIRED;
+use caudra_agent::tools::{
+    SHELL_TOOL_NAME, TODOWRITE_TOOL_NAME, ToolEffect, ToolRegistry, VIEW_IMAGE_TOOL_NAME, native,
+};
 use caudra_agent::types::{AskedQuestion, QuestionOption, TodoItem, TodoPriority, TodoStatus};
 use caudra_agent::{
     BatchProgressEvent, BatchToolEntry, BatchToolStatus, CallStage, DoneReason, GoalResult,
@@ -110,6 +115,15 @@ use tempfile::{Builder, TempDir};
 use test_case::test_case;
 
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const SELECTED_BUILD_TOOLS: &str = "Selected Build · next user message";
+const SELECTED_PLAN_TOOLS: &str = "Selected Plan · next user message";
+const EXECUTING_BUILD_TOOLS: &str = "Executing Build · Selected Plan pending";
+const EXECUTING_PLAN_TOOLS: &str = "Executing Plan · Selected Build pending";
+const PREVIEW_PLAN_FILE: &str = "preview-only-plan.md";
+const PREVIEW_PERMISSION_ID: &str = "preview-permission";
+const PREVIEW_PERMISSION_COMMAND: &str = "pwd";
+const PREVIEW_QUEUED_TEXT: &str = "leave this queued request unchanged";
+const PREVIEW_VISION_MODEL: &str = "aperture/mistral/mistral-medium-latest";
 #[cfg(unix)]
 const PRIVATE_TEST_DIRECTORY_MODE: u32 = 0o700;
 const HANDOFF_PLAN_FILE: &str = "test-plan.md";
@@ -660,6 +674,8 @@ fn turn_complete_from(
 fn context_snapshot(spec: &str, window: u32) -> ContextSnapshot {
     ContextSnapshot {
         readiness: ContextReadiness::PreparedNextRequest,
+        mode: AgentMode::Build,
+        audience: ToolAudience::MAIN,
         model: ContextModel {
             spec: spec.to_owned(),
             provider_display_name: TEST_PROVIDER.to_owned(),
@@ -675,7 +691,317 @@ fn context_snapshot(spec: &str, window: u32) -> ContextSnapshot {
 }
 
 fn current_context_snapshot(app: &App) -> ContextSnapshot {
-    context_snapshot(&app.state.model.spec(), app.state.model.context_window)
+    let mut snapshot = context_snapshot(&app.state.model.spec(), app.state.model.context_window);
+    snapshot.mode = app.execution_agent_mode();
+    snapshot
+}
+
+fn tools_preview_app() -> App {
+    let mut app = test_app();
+    app.state.mode = Mode::Build;
+    app.state.applied_mode = Mode::Build;
+    let policy = serde_json::from_value(serde_json::json!({"overrides":{"plan":"eager"}})).unwrap();
+    app.tools_preview_source = Some(Arc::new(tools_preview_source(Default::default(), policy)));
+    app.state.plan = PlanState::Drafting(Path::new(&app.state.session.cwd).join(PREVIEW_PLAN_FILE));
+    app.execution_mode = Some(Arc::new(ArcSwap::from_pointee(AgentMode::Build)));
+    app.shared_history = Some(Arc::new(ArcSwap::from_pointee(HistorySnapshot::default())));
+    app
+}
+
+#[test_case(false; "local")]
+#[test_case(true; "remote")]
+fn tools_preview_same_model_toggles_are_isolated_and_cached(remote: bool) {
+    let mut app = tools_preview_app();
+    if remote {
+        app.state.plan = PlanState::RemoteDrafting(PlanRef::new(COMMITTED_PLAN_REF).unwrap());
+    }
+    let plan_before = app.state.plan.clone();
+    let mode_before = app.execution_mode.as_ref().unwrap().load_full();
+    let applied_before = (app.state.applied_mode, app.state.applied_model.clone());
+    let history_before = app.shared_history.as_ref().unwrap().load_full();
+    let store = ContextStore::new();
+    let mut committed = current_context_snapshot(&app);
+    committed.measured = Some(CHAT_CONTEXT_WINDOW);
+    store.publisher(ContextKey::Main).publish(committed.clone());
+    app.context_store = Some(store.clone());
+    assert!(app.queue_and_notify(queued_msg(PREVIEW_QUEUED_TEXT)));
+    let queued = app.queue.pending_prompts();
+    for (mode, basis, state) in [
+        (
+            Mode::Build,
+            SELECTED_BUILD_TOOLS,
+            ContextBuiltinState::Disabled,
+        ),
+        (
+            Mode::Plan,
+            SELECTED_PLAN_TOOLS,
+            ContextBuiltinState::Declared,
+        ),
+        (
+            Mode::Build,
+            SELECTED_BUILD_TOOLS,
+            ContextBuiltinState::Disabled,
+        ),
+        (
+            Mode::Plan,
+            SELECTED_PLAN_TOOLS,
+            ContextBuiltinState::Declared,
+        ),
+    ] {
+        app.state.mode = mode;
+        app.execute_tools();
+        assert_eq!(app.tools_basis, basis);
+        let snapshot = app.tools_snapshot.held().unwrap();
+        assert_eq!(snapshot.inventory.builtins.tools[0].state, state);
+        assert_eq!(
+            snapshot.inventory.builtins.request_tokens(),
+            snapshot.usage.system_tools
+        );
+        assert_eq!(snapshot.measured, None);
+        assert_eq!(app.poll_tools_snapshot(), Dirty::NO);
+        assert!(Arc::ptr_eq(&snapshot, &app.tools_snapshot.held().unwrap()));
+        app.tools_modal.close();
+        app.execute_tools();
+        assert!(Arc::ptr_eq(&snapshot, &app.tools_snapshot.held().unwrap()));
+        assert_eq!(
+            store.latest(&ContextKey::Main).unwrap().as_ref(),
+            &committed
+        );
+        assert!(Arc::ptr_eq(
+            &mode_before,
+            &app.execution_mode.as_ref().unwrap().load_full()
+        ));
+        assert!(Arc::ptr_eq(
+            &history_before,
+            &app.shared_history.as_ref().unwrap().load_full()
+        ));
+        assert_eq!(
+            (app.state.applied_mode, app.state.applied_model.clone()),
+            applied_before
+        );
+        assert_eq!(app.state.plan, plan_before);
+        assert_eq!(app.queue.pending_prompts(), queued);
+        assert_eq!(app.continuation_input().mode, AgentMode::Build);
+    }
+    if let Some(path) = app.state.plan.path() {
+        assert!(!path.exists());
+    }
+}
+
+#[test_case(Mode::Build, Mode::Plan, false, EXECUTING_BUILD_TOOLS; "running_build")]
+#[test_case(Mode::Plan, Mode::Build, false, EXECUTING_PLAN_TOOLS; "running_plan")]
+#[test_case(Mode::Build, Mode::Plan, true, EXECUTING_BUILD_TOOLS; "permission_build")]
+#[test_case(Mode::Plan, Mode::Build, true, EXECUTING_PLAN_TOOLS; "permission_plan")]
+fn tools_preview_active_turn_uses_committed_mode(
+    executing: Mode,
+    selected: Mode,
+    permission: bool,
+    basis: &str,
+) {
+    let mut app = tools_preview_app();
+    app.state.mode = executing;
+    app.execution_mode
+        .as_ref()
+        .unwrap()
+        .store(Arc::new(app.agent_mode()));
+    app.state.applied_mode = executing;
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let snapshot = app.tools_preview_source.as_ref().unwrap().snapshot(
+        &app.state.model,
+        &app.state.model,
+        &app.state.thinking,
+        &app.execution_agent_mode(),
+        &app.state.session.cwd,
+        &[],
+    );
+    let store = ContextStore::new();
+    store.publisher(ContextKey::Main).publish(snapshot);
+    app.context_store = Some(store.clone());
+    let committed = store.latest(&ContextKey::Main).unwrap();
+    app.state.mode = selected;
+    if permission {
+        app.update(agent_msg(permission_event(
+            PREVIEW_PERMISSION_ID,
+            PREVIEW_PERMISSION_COMMAND,
+        )));
+        assert!(app.permission_prompt.is_open());
+    }
+    app.execute_tools();
+    assert_eq!(app.tools_basis, basis);
+    assert!(Arc::ptr_eq(&app.tools_snapshot.held().unwrap(), &committed));
+    assert!(app.tools_preview_cache.snapshot.is_none());
+    app.state.mode = executing;
+    assert_eq!(app.poll_tools_snapshot(), Dirty::YES);
+    assert!(!app.tools_basis.contains("pending"));
+    assert!(Arc::ptr_eq(&app.tools_snapshot.held().unwrap(), &committed));
+    app.state.mode = selected;
+    assert_eq!(app.poll_tools_snapshot(), Dirty::YES);
+    assert_eq!(app.tools_basis, basis);
+}
+
+#[test]
+fn tools_preview_missing_target_stays_readonly_without_allocating() {
+    let mut app = tools_preview_app();
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::None;
+    app.execute_tools();
+    let snapshot = app.tools_snapshot.get().unwrap();
+    assert_eq!(app.tools_basis, SELECTED_PLAN_TOOLS);
+    assert_eq!(snapshot.mode, AgentMode::ReadOnly);
+    assert_eq!(
+        snapshot.inventory.builtins.tools[0].state,
+        ContextBuiltinState::Disabled
+    );
+    assert_eq!(
+        snapshot.inventory.builtins.tools[0].reason,
+        Some(PLAN_MODE_REQUIRED)
+    );
+    assert_eq!(app.state.plan, PlanState::None);
+    assert_eq!(app.execution_agent_mode(), AgentMode::Build);
+}
+
+#[test]
+fn tools_preview_refreshes_selection_model_history_and_policy_source() {
+    let mut app = tools_preview_app();
+    app.execute_tools();
+    app.state.mode = Mode::Plan;
+    assert_eq!(app.poll_tools_snapshot(), Dirty::YES);
+    assert_eq!(app.tools_basis, SELECTED_PLAN_TOOLS);
+    app.state.model = Model::from_spec("openai/gpt-6-astra").unwrap();
+    assert_eq!(app.poll_tools_snapshot(), Dirty::YES);
+    assert_eq!(
+        app.tools_snapshot.get().unwrap().model.spec,
+        app.state.model.spec()
+    );
+    app.shared_history
+        .as_ref()
+        .unwrap()
+        .store(Arc::new(HistorySnapshot::default()));
+    assert_eq!(app.poll_tools_snapshot(), Dirty::YES);
+    let policy =
+        serde_json::from_value(serde_json::json!({"overrides":{"plan":"disabled"}})).unwrap();
+    app.tools_preview_source = Some(Arc::new(tools_preview_source(Default::default(), policy)));
+    assert_eq!(app.poll_tools_snapshot(), Dirty::YES);
+    assert_eq!(
+        app.tools_snapshot.get().unwrap().inventory.builtins.tools[0].state,
+        ContextBuiltinState::Disabled
+    );
+    assert_eq!(app.poll_tools_snapshot(), Dirty::NO);
+}
+
+#[test]
+fn tools_preview_bound_plan_model_uses_provider_capabilities() {
+    let mut app = tools_preview_app();
+    app.state.mode = Mode::Plan;
+    let selected = app.state.model.spec();
+    let applied = app.state.applied_model.clone();
+    let execution = app.execution_mode.as_ref().unwrap().load_full();
+    let source = Arc::get_mut(app.tools_preview_source.as_mut().unwrap()).unwrap();
+    source.registry = Arc::new(ToolRegistry::new());
+    native::register(&source.registry, FeatureFlags::default()).unwrap();
+    let previous = model_registry::binding(ModelPurpose::Plan);
+    model_registry::set_binding_and_persist(
+        ModelPurpose::Plan,
+        Binding::Exact(PREVIEW_VISION_MODEL.into()),
+        &app.storage,
+    )
+    .unwrap();
+    app.execute_tools();
+    restore_plan_binding(previous, &app.storage);
+
+    let snapshot = app.tools_snapshot.get().unwrap();
+    assert_eq!(snapshot.model.spec, PREVIEW_VISION_MODEL);
+    let image = snapshot
+        .inventory
+        .builtins
+        .tools
+        .iter()
+        .find(|tool| tool.name == VIEW_IMAGE_TOOL_NAME)
+        .unwrap();
+    assert_ne!(image.state, ContextBuiltinState::Disabled);
+    assert!(image.tokens > 0);
+    assert_eq!(app.state.model.spec(), selected);
+    assert_eq!(app.state.applied_model, applied);
+    assert!(Arc::ptr_eq(
+        &execution,
+        &app.execution_mode.as_ref().unwrap().load_full()
+    ));
+    assert!(!app.state.plan.path().unwrap().exists());
+}
+
+#[test_case(ModelPurpose::Subagent; "task_model")]
+#[test_case(ModelPurpose::Best; "task_model_indirection")]
+fn tools_preview_refreshes_changed_purpose_bindings(purpose: ModelPurpose) {
+    let mut app = tools_preview_app();
+    let previous = model_registry::binding(purpose);
+    model_registry::clear_binding_and_persist(purpose, &app.storage).unwrap();
+    app.execute_tools();
+    let before = app.tools_snapshot.held().unwrap();
+    let binding = Binding::Exact(PREVIEW_VISION_MODEL.into());
+    model_registry::set_binding_and_persist(purpose, binding, &app.storage).unwrap();
+    let rebound = app.poll_tools_snapshot();
+    let after_bind = app.tools_snapshot.held().unwrap();
+    app.tools_modal.close();
+    model_registry::clear_binding_and_persist(purpose, &app.storage).unwrap();
+    app.execute_tools();
+    let after_unbind = app.tools_snapshot.held().unwrap();
+    let unchanged = app.poll_tools_snapshot();
+    if let Some(previous) = previous {
+        model_registry::set_binding_and_persist(purpose, previous, &app.storage).unwrap();
+    }
+
+    assert_eq!(rebound, Dirty::YES);
+    assert!(!Arc::ptr_eq(&before, &after_bind));
+    assert!(!Arc::ptr_eq(&after_bind, &after_unbind));
+    assert_eq!(before.model, after_bind.model);
+    assert_eq!(before.mode, after_bind.mode);
+    assert_eq!(app.execution_agent_mode(), AgentMode::Build);
+    assert_eq!(unchanged, Dirty::NO);
+}
+
+#[test]
+fn tools_preview_rejects_same_model_stale_admission_snapshot() {
+    let mut app = tools_preview_app();
+    let store = ContextStore::new();
+    store
+        .publisher(ContextKey::Main)
+        .publish(current_context_snapshot(&app));
+    app.context_store = Some(store.clone());
+    app.status = Status::Streaming;
+    app.state.mode = Mode::Plan;
+    app.execution_mode
+        .as_ref()
+        .unwrap()
+        .store(Arc::new(app.agent_mode()));
+    app.execute_tools();
+    assert!(app.tools_snapshot.get().is_none());
+    assert!(app.main_context_snapshot().is_none());
+    store
+        .publisher(ContextKey::Main)
+        .publish(current_context_snapshot(&app));
+    assert_eq!(app.poll_tools_snapshot(), Dirty::YES);
+    assert_eq!(app.tools_snapshot.get().unwrap().mode, app.agent_mode());
+}
+
+#[test]
+fn tools_preview_task_uses_own_mode_and_audience() {
+    let mut app = priced_subagent_app();
+    let store = ContextStore::new();
+    let mut snapshot = context_snapshot(TASK_CONTEXT_SPEC, CHAT_CONTEXT_WINDOW);
+    snapshot.mode = AgentMode::ReadOnly;
+    snapshot.audience = ToolAudience::GENERAL_SUB;
+    store
+        .publisher(ContextKey::task(TASK_ID))
+        .publish(snapshot.clone());
+    app.context_store = Some(store);
+    app.execute_tools();
+    for mode in [Mode::Plan, Mode::Build] {
+        app.state.mode = mode;
+        assert_eq!(app.poll_tools_snapshot(), Dirty::NO);
+        assert_eq!(app.tools_snapshot.get(), Some(&snapshot));
+        assert_eq!(app.tools_basis, "Task · Read-only");
+    }
 }
 
 fn tool_results_submitted() -> AgentEvent {
@@ -2469,20 +2795,25 @@ fn tool_done_completes_only_the_matching_remote_plan() {
     let mut app = test_app();
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::RemoteDrafting(expected.clone());
+    app.state.applied_mode = Mode::Plan;
     app.status = Status::Streaming;
     app.run_id = 1;
 
     let event = |reference: &caudra_workspace::PlanRef| {
         agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
-            id: "plan-write".into(),
-            tool: "local_document_write".into(),
+            id: reference.as_str().into(),
+            tool: plan::NAME.into(),
             output: ToolOutput::Plain("wrote plan".into()),
             is_error: false,
-            annotation: Some(format!(
-                "local_document:plan:{};revision:{}",
-                reference.as_str(),
-                "c".repeat(64)
-            )),
+            annotation: Some(
+                PlanWriteResult::new(
+                    PlanTarget::Remote(reference.clone()),
+                    DocumentRevision::new("c".repeat(64)).unwrap(),
+                    HANDOFF_PLAN_CONTENT.into(),
+                )
+                .annotation()
+                .unwrap(),
+            ),
             written_path: None,
             written_paths: Vec::new(),
             remote_written_paths: false,
@@ -3822,9 +4153,9 @@ fn active_context_snapshot_accepts_the_running_plan_model() {
     })));
     app.status = Status::Streaming;
     let store = ContextStore::new();
-    store
-        .publisher(ContextKey::Main)
-        .publish(context_snapshot(PLAN_CONTEXT_SPEC, CHAT_CONTEXT_WINDOW));
+    let mut snapshot = context_snapshot(PLAN_CONTEXT_SPEC, CHAT_CONTEXT_WINDOW);
+    snapshot.mode = app.execution_agent_mode();
+    store.publisher(ContextKey::Main).publish(snapshot);
     app.context_store = Some(store);
 
     let snapshot = app.active_context_snapshot().unwrap();
@@ -3866,9 +4197,9 @@ fn idle_plan_status_uses_the_last_validated_effective_snapshot() {
     app.state.mode = Mode::Plan;
     app.state.applied_mode = Mode::Plan;
     let store = ContextStore::new();
-    store
-        .publisher(ContextKey::Main)
-        .publish(context_snapshot(PLAN_CONTEXT_SPEC, CHAT_CONTEXT_WINDOW));
+    let mut snapshot = context_snapshot(PLAN_CONTEXT_SPEC, CHAT_CONTEXT_WINDOW);
+    snapshot.mode = app.execution_agent_mode();
+    store.publisher(ContextKey::Main).publish(snapshot);
     app.context_store = Some(store);
 
     let snapshot = app.active_context_snapshot();

@@ -46,6 +46,9 @@ use crate::app::background_delivery::DeliveryFence;
 use crate::app::file_revert::RecorderSlot;
 
 use self::agent_loop::AgentLoop;
+pub(crate) use self::agent_loop::ToolsPreviewSource;
+#[cfg(test)]
+pub(crate) use self::agent_loop::tests::tools_preview_source;
 use self::command_router::spawn_command_router;
 pub(crate) use self::shared_queue::{QueueSender, QueuedMessage};
 pub(crate) use self::workflow::SharedMode;
@@ -112,6 +115,7 @@ pub(crate) struct AgentHandles {
     pub(crate) history: SharedHistory,
     pub(crate) btw_prompt: SharedBtwPrompt,
     pub(crate) context_store: ContextStore,
+    tools_preview_source: Arc<ToolsPreviewSource>,
     /// Resolved for the active lane without replacing the selected Chat slot.
     pub(crate) effective_model_slot: Arc<ArcSwap<ModelSlot>>,
     pub(crate) execution_mode: SharedMode,
@@ -269,6 +273,7 @@ impl AgentHandles {
         app.forget_merged_history();
         app.btw_prompt = Some(Arc::clone(&self.btw_prompt));
         app.context_store = Some(self.context_store.clone());
+        app.tools_preview_source = Some(Arc::clone(&self.tools_preview_source));
         if app
             .execution_mode
             .as_ref()
@@ -692,6 +697,7 @@ fn spawn_agent_internal(
         local_documents.clone(),
     );
 
+    let tools_preview_source = Arc::new(agent_loop.tools_preview_source());
     let task = smol::spawn(async move {
         let _session_lease = session_lease;
         agent_loop.run().await;
@@ -705,6 +711,7 @@ fn spawn_agent_internal(
         history: shared_history,
         btw_prompt,
         context_store,
+        tools_preview_source,
         effective_model_slot,
         execution_mode,
         mcp_handle,

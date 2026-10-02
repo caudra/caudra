@@ -204,7 +204,7 @@ impl ToolsModal {
         // is what the pan bar exists to avoid.
         let wrapped = self.scope == ToolsScope::Inventory;
         let lines = match self.scope {
-            ToolsScope::Inventory => build_lines(ctx.snapshot, &theme),
+            ToolsScope::Inventory => build_lines(ctx.snapshot, ctx.basis, &theme),
             ToolsScope::Session => stats_lines(Some(&ToolStats::from_session(ctx.session)), &theme),
             ToolsScope::Project | ToolsScope::Global => stats_lines(ctx.recorded, &theme),
         };
@@ -270,6 +270,7 @@ impl ToolsModal {
 /// so.
 pub struct ToolsModalContext<'a> {
     pub snapshot: Option<&'a ContextSnapshot>,
+    pub basis: &'a str,
     pub session: &'a [caudra_storage::sessions::StoredToolUsage],
     pub recorded: Option<&'a ToolStats>,
 }
@@ -310,14 +311,21 @@ impl Overlay for ToolsModal {
     }
 }
 
-fn build_lines(snapshot: Option<&ContextSnapshot>, theme: &Theme) -> Vec<Line<'static>> {
+fn build_lines(
+    snapshot: Option<&ContextSnapshot>,
+    basis: &str,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let basis = Line::from(Span::styled(basis.to_owned(), theme.status_dim));
     let Some(snapshot) = snapshot else {
         return vec![
+            basis,
             Line::from(Span::styled(NO_SNAPSHOT, theme.status_dim)),
             Line::from(Span::styled(NO_SNAPSHOT_HINT, theme.tool_dim)),
         ];
     };
-    let mut lines = summary_lines(snapshot, theme);
+    let mut lines = vec![basis];
+    lines.extend(summary_lines(snapshot, theme));
     lines.extend(builtin_lines(snapshot, theme));
     lines.extend(mcp_lines(snapshot, theme));
     lines
@@ -670,6 +678,7 @@ mod tests {
         ContextModel, ContextReadiness, ContextReserve, ContextUsage, ContextWindow,
     };
     use caudra_agent::tools::profile_policy::PROFILE_LOADING;
+    use caudra_agent::{AgentMode, tools::ToolAudience};
 
     use caudra_storage::sessions::StoredToolUsage;
     use caudra_storage::tool_ledger::Latency;
@@ -714,6 +723,8 @@ mod tests {
     fn snapshot(mcp: Vec<ContextMcpTool>) -> ContextSnapshot {
         ContextSnapshot {
             readiness: ContextReadiness::CapturedCurrentRequest,
+            mode: AgentMode::Build,
+            audience: ToolAudience::MAIN,
             model: ContextModel {
                 spec: MODEL_SPEC.to_owned(),
                 provider_display_name: "Test".to_owned(),
@@ -757,7 +768,7 @@ mod tests {
     }
 
     fn rendered(snapshot: Option<&ContextSnapshot>) -> String {
-        join(build_lines(snapshot, &theme::current()))
+        join(build_lines(snapshot, "Executing Build", &theme::current()))
     }
 
     /// A deferred tool costs nothing yet, so its number has to read as a

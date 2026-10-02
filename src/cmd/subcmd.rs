@@ -1353,8 +1353,7 @@ pub fn tools(cli: &Cli, enabled_only: bool, json: bool, names: bool, schemas: bo
             .cloned()
             .unwrap_or_default(),
     );
-    let filter = ToolFilter::from_config(&config.agent, &model, &[])
-        .for_remote_workspace(runtime.is_remote());
+    let filter = ToolFilter::from_config(&config.agent, &model, &[]);
     let ctx = DescriptionContext {
         filter: &filter,
         audience: ToolAudience::MAIN,
@@ -1621,9 +1620,7 @@ pub fn prompt(
         PromptVariant::Research => (ToolAudience::RESEARCH_SUB, AgentMode::ReadOnly),
         PromptVariant::General => (ToolAudience::GENERAL_SUB, AgentMode::Build),
     };
-    let filter = ToolFilter::from_config(&config.agent, &model, &[])
-        .for_remote_workspace(runtime.is_remote())
-        .for_mode(&mode);
+    let filter = ToolFilter::from_config(&config.agent, &model, &[]).for_mode(&mode);
     let vars = inspection_vars(vars, &prompt_profiles, &config, &model);
     let ctx = DescriptionContext {
         filter: &filter,
@@ -1744,6 +1741,7 @@ mod auth_tests {
     use super::*;
     use caudra_agent::permissions::PermissionManager;
     use caudra_agent::tools::cli_tool_ctx;
+    use caudra_agent::tools::profile_policy::{PLAN_MODE_REQUIRED, PLAN_TOOL_NAME};
     use caudra_config::{Effect, ExecutionMode, FeatureFlags, PermissionRule, RawConfig};
     use caudra_workcell::WorkcellHost;
     use tempfile::TempDir;
@@ -2020,6 +2018,46 @@ Title     default       provider/title\n"
                     .contains(&format!("\n- {INSPECTION_TASK}:"))
             );
         }
+    }
+
+    #[test_case("eager"; "eager")]
+    #[test_case("lazy"; "lazy")]
+    fn tools_listing_explains_plan_mode_requirement(exposure: &str) {
+        let registry = ToolRegistry::new();
+        caudra_agent::tools::native::register(&registry, FeatureFlags::default()).unwrap();
+        let config = RawConfig::default().into_config(false).unwrap();
+        let model = Model::from_spec(BEST_SPEC).unwrap();
+        let filter = ToolFilter::from_config(&config.agent, &model, &[]);
+        let policy: ProfileToolPolicy = serde_json::from_value(serde_json::json!({
+            "default": "disabled", "overrides": {PLAN_TOOL_NAME: exposure}
+        }))
+        .unwrap();
+        let definitions = inspection_definitions(
+            &registry,
+            &Vars::new(),
+            &DescriptionContext {
+                filter: &filter,
+                audience: ToolAudience::MAIN,
+                workflows_available: false,
+            },
+            &config.agent,
+            &model,
+            &policy,
+            &AgentMode::Build,
+        )
+        .unwrap();
+        let rows = builtin_rows(
+            &registry,
+            &filter,
+            &config,
+            &[],
+            &model,
+            &definitions,
+            &policy,
+        );
+        let plan = rows.iter().find(|row| row.name == PLAN_TOOL_NAME).unwrap();
+        assert_eq!(plan.state, ToolState::Off);
+        assert_eq!(plan.note, Some(PLAN_MODE_REQUIRED));
     }
 
     #[test_case(AgentMode::Build, ToolAudience::MAIN, false; "build")]

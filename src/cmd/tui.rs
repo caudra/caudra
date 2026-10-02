@@ -1599,9 +1599,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
             let runtime = Arc::clone(&workcell_runtime);
             let config = stack.config.agent.clone();
             Arc::new(move |project, mode, model, workspace, profile, session| {
-                let tool_filter = ToolFilter::from_config(&config, &model, &[])
-                    .for_remote_workspace(workspace.is_some())
-                    .for_mode(&mode);
+                let tool_filter = ToolFilter::from_config(&config, &model, &[]).for_mode(&mode);
                 let registry = ToolRegistry::global();
                 let description = DescriptionContext {
                     filter: &tool_filter,

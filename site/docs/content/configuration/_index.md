@@ -217,8 +217,8 @@ The `bash`, `python_execution`, and `task` entries apply only when `ui.scroll_ca
 | `task` | 12 | `task`, `task_control` |
 | `index` | 3 | `file_index`, `code_map`, `code_context`, `code_refs`, `code_impact`, `code_expand` |
 | `grep` | 3 | `file_grep`, `file_glob` |
-| `read` | 3 | `file_read`, `local_document_read` |
-| `write` | 7 | `file_write`, `file_edit`, `file_apply_patch`, `image_generate`, `local_document_apply_patch`, `local_document_write`, `memory`, `plan` |
+| `read` | 3 | `file_read` |
+| `write` | 7 | `file_write`, `file_edit`, `file_apply_patch`, `image_generate`, `memory`, `plan` |
 | `web` | 3 | `webfetch`, `websearch` |
 | `other` | 3 | `batch`, `execution_environment`, `list_sessions`, `question`, `send_message`, `skill`, `todo_write`, `tool_output`, `view_image`, `workflow` |
 

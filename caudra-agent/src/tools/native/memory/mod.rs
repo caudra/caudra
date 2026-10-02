@@ -22,7 +22,6 @@ use caudra_workspace::{LocalDocumentRef, MemoryRef, RecordScope};
 use serde_json::Value;
 
 use crate::permissions::{PermissionResource, PermissionResourceKind, PermissionRisk};
-use crate::tools::native::local_document::scoped_store;
 use crate::tools::registry::{
     ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionIntent, PermissionScopes, Tool,
     ToolEffect, ToolError, ToolExecResult, ToolFailure, ToolInvocation,
@@ -39,7 +38,7 @@ pub const DESCRIPTION: &str = "Persistent, project-scoped scratchpad for learnin
 - Save important context before compaction or to build up project knowledge.
 - Keep entries concise and current. Delete outdated information.
 - Concision comes from dropping facts, never from dropping spaces or running words together. A note that cannot be read costs more than the tokens it saved.
-- Embedded `list` and `read` report the notes dir for `file_edit`. Remote sessions return opaque memory references for `local_document_read`, `local_document_write`, or `local_document_apply_patch`; no client host path is exposed.";
+- Use `list` and `read` to find notes, then `write` or `delete` with the note's relative path. The same named operations work in local and remote sessions; remote notes expose no client host path.";
 
 pub const TOOL_USAGE: &str =
     "- Proactively save non-obvious project gotchas and architecture decisions to **memory**.";
@@ -766,6 +765,19 @@ impl ToolInvocation for MemoryCall {
     }
 }
 
+fn scoped_store(ctx: &ToolContext) -> Result<&LocalDocumentStore, ToolError> {
+    let workspace = ctx
+        .workspace_session
+        .as_ref()
+        .ok_or("remote memory requires a remote workspace session")?;
+    let store = ctx
+        .local_documents
+        .as_ref()
+        .ok_or("local document store is unavailable")?;
+    store.validate_binding(workspace.binding())?;
+    Ok(store)
+}
+
 impl MemoryCall {
     fn remote_permission_intent(&self) -> PermissionIntent {
         let detail = self
@@ -952,18 +964,145 @@ fn reference_id(reference: &LocalDocumentRef) -> &str {
 #[cfg(test)]
 mod tests {
     use std::slice;
+    use std::sync::Arc;
 
     use super::*;
     use crate::AgentMode;
+    use crate::agent::tool_dispatch::{self, Emit};
+    use crate::tools::native::tests::{tempdir, workspace_for_principal};
     use crate::tools::test_support::stub_ctx;
+    use crate::tools::{MEMORY_TOOL_NAME, PLAN_WRITE_RESTRICTED};
     use crate::types::MEMORY_DIRECTORY_LABEL;
+    use caudra_config::FeatureFlags;
     use caudra_providers::token_label;
+    use caudra_storage::StateDir;
+    use caudra_storage::id::SessionRef;
     use caudra_storage::local_documents::DocumentRevision;
     use caudra_workspace::MemoryRef;
     use serde_json::json;
+    use tempfile::TempDir;
     use test_case::test_case;
 
     const REGISTERED_EFFECT: ToolEffect = ToolEffect::Mutating;
+    const NOTE_PATH: &str = "note.md";
+    const NOTE_CONTENT: &str = "retained memory";
+    const NOTE_TAG: &str = "architecture";
+    const WRONG_OWNER: &str = "local document does not belong to this project or session";
+
+    fn remote_context() -> (TempDir, ToolContext) {
+        let root = tempdir();
+        let workspace = workspace_for_principal("principal");
+        let store = Arc::new(LocalDocumentStore::remote(
+            StateDir::from_path(root.path().join("state")),
+            workspace.binding(),
+        ));
+        let mut ctx = stub_ctx(&AgentMode::Build);
+        ctx.workspace_session = Some(workspace);
+        ctx.local_documents = Some(store);
+        crate::tools::native::register_remote(&ctx.registry, &[], FeatureFlags::all()).unwrap();
+        (root, ctx)
+    }
+
+    #[test_case("list")]
+    #[test_case("read")]
+    #[test_case("write")]
+    #[test_case("delete")]
+    fn remote_commands_reject_a_store_from_another_principal(command: &str) {
+        smol::block_on(async {
+            let (_root, mut ctx) = remote_context();
+            let store = Arc::clone(ctx.local_documents.as_ref().unwrap());
+            store
+                .write_memory(store.project_key(), NOTE_PATH, NOTE_CONTENT)
+                .unwrap();
+            ctx.workspace_session = Some(workspace_for_principal("other"));
+            let done = tool_dispatch::run(
+                &ctx.registry,
+                None,
+                command.into(),
+                MEMORY_TOOL_NAME,
+                &json!({"command": command, "path": NOTE_PATH, "content": "overwrite"}),
+                &ctx,
+                Emit::Silent,
+            )
+            .await;
+            assert!(done.is_error);
+            assert_eq!(done.output.as_text(), WRONG_OWNER);
+            assert_eq!(
+                store.list_memories(store.project_key()).unwrap()[0].content,
+                NOTE_CONTENT
+            );
+        });
+    }
+
+    #[test]
+    fn remote_named_crud_preserves_tags_and_exposes_no_host_path() {
+        smol::block_on(async {
+            let (root, ctx) = remote_context();
+            let store = ctx.local_documents.as_ref().unwrap();
+            for input in [
+                json!({"command": "write", "path": NOTE_PATH, "content": NOTE_CONTENT, "tags": [NOTE_TAG]}),
+                json!({"command": "list"}),
+                json!({"command": "read", "path": NOTE_PATH}),
+                json!({"command": "read", "tags": [NOTE_TAG]}),
+                json!({"command": "delete", "path": NOTE_PATH}),
+            ] {
+                let done = tool_dispatch::run(
+                    &ctx.registry,
+                    None,
+                    input["command"].as_str().unwrap().into(),
+                    MEMORY_TOOL_NAME,
+                    &input,
+                    &ctx,
+                    Emit::Silent,
+                )
+                .await;
+                assert!(!done.is_error, "{}", done.output.as_text());
+                assert!(done.written_paths().next().is_none());
+                for text in [done.output.as_text(), done.composed_model_output()] {
+                    assert!(!text.contains(root.path().to_str().unwrap()));
+                    if input["command"] == "read" {
+                        assert!(text.contains(NOTE_CONTENT));
+                        assert!(text.contains(NOTE_TAG));
+                    }
+                }
+            }
+            assert!(store.list_memories(store.project_key()).unwrap().is_empty());
+        });
+    }
+
+    #[test_case("write")]
+    #[test_case("delete")]
+    fn remote_memory_mutation_is_not_an_active_plan_write(command: &str) {
+        smol::block_on(async {
+            let (_root, mut ctx) = remote_context();
+            let store = ctx.local_documents.as_ref().unwrap();
+            store
+                .write_memory(store.project_key(), NOTE_PATH, NOTE_CONTENT)
+                .unwrap();
+            let session = SessionRef::generate();
+            let plan = store
+                .create_plan(store.project_key(), session.as_str())
+                .unwrap();
+            ctx.mode = AgentMode::RemotePlan(plan);
+            ctx.session_id = Some(session);
+            let done = tool_dispatch::run(
+                &ctx.registry,
+                None,
+                command.into(),
+                MEMORY_TOOL_NAME,
+                &json!({"command": command, "path": NOTE_PATH, "content": "overwrite"}),
+                &ctx,
+                Emit::Silent,
+            )
+            .await;
+            assert!(done.is_error);
+            assert_eq!(done.output.as_text(), PLAN_WRITE_RESTRICTED);
+            assert_eq!(
+                store.list_memories(store.project_key()).unwrap()[0].content,
+                NOTE_CONTENT
+            );
+        });
+    }
 
     fn call(input: Value) -> Box<dyn ToolInvocation> {
         MemoryTool.parse(&input).expect("valid input")

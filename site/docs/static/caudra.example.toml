@@ -211,12 +211,12 @@ version = 1
 # Type: usize, at least 1.
 # grep = 3
 
-# Rows for `file_read`, `local_document_read`.
+# Rows for `file_read`.
 # Type: usize, at least 1.
 # read = 3
 
 # Rows for `file_write`, `file_edit`, `file_apply_patch`, `image_generate`,
-# `local_document_apply_patch`, `local_document_write`, `memory`, `plan`.
+# `memory`, `plan`.
 # Type: usize, at least 1.
 # write = 7
 

@@ -1,15 +1,17 @@
 use std::fs;
+use std::io::Error;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use caudra_storage::auth::now_millis;
+use caudra_storage::paths;
 use isahc::ReadResponseExt;
 use isahc::config::{Configurable, RedirectPolicy, VersionNegotiation};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::AgentError;
-use crate::model::{ModelInfo, ModelPricing};
+use crate::model::{Model, ModelInfo, ModelPricing, ThinkingSupport};
 use crate::{ReasoningOption, ReasoningOptions};
 
 use super::auth;
@@ -44,6 +46,25 @@ pub(crate) struct CachedModel {
     pub max_tokens: u32,
     #[serde(default)]
     pub reasoning_efforts: Vec<String>,
+}
+
+impl CachedModel {
+    fn adjust_model(&self, model: &mut Model) {
+        model.context_window = self.context_window;
+        model.max_output_tokens = Some(self.max_tokens);
+        if self.pricing.input > 0.0 || self.pricing.output > 0.0 {
+            model.pricing.input = self.pricing.input;
+            model.pricing.output = self.pricing.output;
+            model.pricing.cache_write = self.pricing.cache_write;
+            model.pricing.cache_read = self.pricing.cache_read;
+        }
+        model.supports_vision_override = Some(self.vision);
+        model.thinking_override = Some(if self.reasoning {
+            ThinkingSupport::Yes
+        } else {
+            ThinkingSupport::No
+        });
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,6 +125,12 @@ pub(crate) fn cached_model(model_id: &str) -> Option<CachedModel> {
         .find(|model| model.id.eq_ignore_ascii_case(model_id))
 }
 
+pub(crate) fn adjust_model(model: &mut Model) {
+    if let Some(cached) = cached_model(&model.id) {
+        cached.adjust_model(model);
+    }
+}
+
 pub(crate) fn list_models(access: &str, force: bool) -> Result<Vec<ModelInfo>, AgentError> {
     Ok(select_models(Some(access), force)?
         .into_iter()
@@ -116,7 +143,7 @@ pub(crate) fn refresh(access: &str) -> Result<Vec<ModelInfo>, AgentError> {
 }
 
 pub(crate) fn invalidate() {
-    if let Some(path) = cache_path() {
+    if let Some(path) = cache_path(paths::cache_dir()) {
         let _ = fs::remove_file(path);
     }
 }
@@ -512,13 +539,13 @@ fn positive_u32(value: &serde_json::Value, maximum: u32) -> Option<u32> {
     (n > 0 && n <= maximum).then_some(n)
 }
 
-fn cache_path() -> Option<PathBuf> {
-    let dir = caudra_storage::paths::cache_dir().ok()?;
+fn cache_path(directory: Result<PathBuf, Error>) -> Option<PathBuf> {
+    let dir = directory.ok()?;
     Some(dir.join(CACHE_SUBDIR).join(CACHE_FILE))
 }
 
 fn load_cache(now: u64) -> Option<CacheRecord> {
-    let path = cache_path()?;
+    let path = cache_path(paths::cache_dir_path())?;
     let bytes = fs::read(path).ok()?;
     let record: CacheRecord = serde_json::from_slice(&bytes).ok()?;
     if record.schema_version != CACHE_SCHEMA || record.models.is_empty() {
@@ -533,7 +560,7 @@ fn load_cache(now: u64) -> Option<CacheRecord> {
 }
 
 fn save_cache(models: &[CachedModel], now: u64) {
-    let Some(path) = cache_path() else {
+    let Some(path) = cache_path(paths::cache_dir()) else {
         return;
     };
     if let Some(parent) = path.parent()
@@ -558,6 +585,7 @@ fn save_cache(models: &[CachedModel], now: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_case::test_case;
 
     const VALID_PAYLOAD: &str = r#"{
         "object": "list",
@@ -587,6 +615,89 @@ mod tests {
             }
         ]
     }"#;
+
+    #[test_case(true, true ; "cached_capabilities_enable_tools")]
+    #[test_case(false, false ; "cached_capabilities_disable_tools")]
+    fn cached_model_adjusts_inspection_metadata(vision: bool, reasoning: bool) {
+        let mut cached = normalize_catalog_payload(VALID_PAYLOAD).unwrap().remove(0);
+        cached.vision = vision;
+        cached.reasoning = reasoning;
+        let mut model = Model::from_spec(&format!("xai/{}", cached.id)).unwrap();
+        model.supports_vision_override = Some(!vision);
+        model.thinking_override = Some(if reasoning {
+            ThinkingSupport::No
+        } else {
+            ThinkingSupport::Yes
+        });
+
+        cached.adjust_model(&mut model);
+
+        assert_eq!(model.supports_vision(), vision);
+        assert_eq!(model.supports_thinking(), reasoning);
+        assert_eq!(model.context_window, cached.context_window);
+        assert_eq!(model.max_output_tokens, Some(cached.max_tokens));
+    }
+
+    #[cfg(target_os = "linux")]
+    mod read_only {
+        use std::env;
+        use std::process::Command;
+
+        use caudra_config::providers::ProvidersConfig;
+        use caudra_storage::auth::now_millis;
+        use caudra_storage::paths;
+        use tempfile::TempDir;
+
+        use super::super::{cached_model, normalize_catalog_payload, save_cache};
+        use super::VALID_PAYLOAD;
+        use crate::model::Model;
+        use crate::provider::adjust_model_for_inspection;
+
+        const CHILD_ENV: &str = "CAUDRA_TEST_READ_ONLY_INSPECTION";
+        const TEST_NAME: &str =
+            "providers::xai::catalog::tests::read_only::inspection_does_not_create_directories";
+
+        #[test]
+        fn inspection_does_not_create_directories() {
+            if env::var_os(CHILD_ENV).is_none() {
+                let root = TempDir::new().unwrap();
+                let output = Command::new(env::current_exe().unwrap())
+                    .args(["--exact", TEST_NAME, "--nocapture"])
+                    .env(CHILD_ENV, root.path())
+                    .env("HOME", root.path())
+                    .env("XDG_CONFIG_HOME", root.path().join("config"))
+                    .env("XDG_CACHE_HOME", root.path().join("cache"))
+                    .env_remove("CAUDRA_NAMESPACE")
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{output:?}");
+                assert!(root.path().join("cache").is_dir());
+                return;
+            }
+
+            let config_path = paths::config_dir_path().unwrap();
+            let cache_path = paths::cache_dir_path().unwrap();
+            assert!(!config_path.exists());
+            assert!(!cache_path.exists());
+            let config = ProvidersConfig::load();
+            assert!(config.providers.is_empty());
+            for spec in ["aperture/mistral/mistral-medium-latest", "xai/grok-4.6"] {
+                let mut model = Model::from_spec(spec).unwrap();
+                adjust_model_for_inspection(&mut model);
+                assert!(model.supports_vision());
+            }
+            assert!(!config_path.exists());
+            assert!(!cache_path.exists());
+
+            config.save().unwrap();
+            assert!(config_path.is_dir());
+            assert!(ProvidersConfig::load().providers.is_empty());
+            let models = normalize_catalog_payload(VALID_PAYLOAD).unwrap();
+            save_cache(&models, now_millis());
+            assert!(cache_path.is_dir());
+            assert!(cached_model(&models[0].id).is_some());
+        }
+    }
 
     #[test]
     fn normalize_keeps_oauth_models_and_drops_api_key_only() {

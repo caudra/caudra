@@ -393,7 +393,7 @@ impl Provider for Zai {
     }
 }
 
-fn adjust_model(model: &mut Model) {
+pub(crate) fn adjust_model(model: &mut Model) {
     if model.id.starts_with("glm-5.2") {
         model.thinking_override = Some(ThinkingSupport::Yes);
     }

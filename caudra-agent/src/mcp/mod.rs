@@ -1777,8 +1777,8 @@ fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSw
 
 /// Session for dispatch-level tests outside this module, built through the
 /// real `publish` path so it can't drift from production index construction.
-#[cfg(test)]
-pub(crate) fn stub_session(tools: &[(&str, &str)]) -> McpSession {
+#[cfg(any(test, feature = "test-support"))]
+pub fn stub_session(tools: &[(&str, &str)]) -> McpSession {
     let entry = ServerEntry {
         name: "stub".into(),
         config: None,
@@ -1842,10 +1842,10 @@ pub(crate) fn tool_names(tools: &Value) -> Vec<&str> {
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 struct StubTransport(Arc<str>);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl McpTransport for StubTransport {
     fn send_request<'a>(
         &'a self,
@@ -1974,6 +1974,7 @@ fn intern(name: String) -> Arc<str> {
 mod tests {
     use super::*;
     use crate::AgentMode;
+    use crate::tools::ToolAudience;
     use crate::tools::deferral::{
         TOOL_SEARCH_TOOL_NAME,
         tests::{PENDING_CHOICE, SearchDecisions},
@@ -2264,6 +2265,8 @@ mod tests {
         let model = Model::from_spec(TEST_MODEL_SPEC).unwrap();
         let captured = ContextSnapshot::capture(ContextCapture {
             readiness: ContextReadiness::CapturedCurrentRequest,
+            mode: &AgentMode::Build,
+            audience: ToolAudience::MAIN,
             model: &model,
             auto_compact: false,
             compaction_buffer: None,

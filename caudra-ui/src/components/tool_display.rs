@@ -39,10 +39,9 @@ use caudra_agent::{
     SubagentProgress, TaskCard, ToolInput, ToolOutput, format_live_duration,
     format_settled_duration,
     tools::{
-        FILE_READ_TOOL_NAME, FILE_WRITE_TOOL_NAME, IMAGE_GENERATE_TOOL_NAME,
-        LOCAL_DOCUMENT_WRITE_TOOL_NAME, MEMORY_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME,
-        SHELL_TOOL_NAME, TASK_TOOL_NAME, TOOL_OUTPUT_TOOL_NAME, humanize_duration,
-        timeout_annotation,
+        FILE_READ_TOOL_NAME, FILE_WRITE_TOOL_NAME, IMAGE_GENERATE_TOOL_NAME, MEMORY_TOOL_NAME,
+        PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME, TOOL_OUTPUT_TOOL_NAME,
+        humanize_duration, timeout_annotation,
     },
 };
 use caudra_workcell::{CURRENT_WORKDIR, effective_timeout, requested_workdir};
@@ -306,11 +305,6 @@ const COMPACT_ARG_LIMIT: usize = 3;
 const COMPACT_ARG_MAX_CHARS: usize = 40;
 const ELLIPSIS: char = '…';
 const EDIT_KEYS: &[&str] = &["file_path", "old_string", "new_string"];
-/// A local document is addressed by kind and opaque reference, which together
-/// are its header.
-const DOCUMENT_KEYS: &[&str] = &["kind", "reference"];
-/// The same, plus the document itself, which the card's body carries.
-const DOCUMENT_WRITE_KEYS: &[&str] = &["kind", "reference", "content"];
 const READ_RESULT_KEYS: &[&str] = &["offset", "limit"];
 /// Extensions whose file is worth more rendered than quoted.
 const MARKDOWN_EXTENSIONS: &[&str] = &["md", "markdown", "mdx"];
@@ -345,21 +339,12 @@ const LIVE_SCRIPT_TOOLS: &[(&str, bool)] = &[
     (PYTHON_EXECUTION_TOOL_NAME, true),
     (IMAGE_GENERATE_TOOL_NAME, false),
 ];
-/// The tools whose streaming body is a document however it is named. Both
-/// stores settle to rendered markdown, and one of them is named by an opaque
-/// reference with no extension to read, so the tool is what says so rather
-/// than the header.
-///
 /// A delegation is the one member whose live body is not what its settled card
 /// draws: the prompt arrives while the subagent works, and the answer replaces
 /// it on `ToolDone`. The two are different documents rather than one drawn
 /// twice, so the swap is the card reporting progress, not the flicker the rule
 /// against a mismatched live draw exists to prevent. Leave it.
-const LIVE_MARKDOWN_TOOLS: &[&str] = &[
-    MEMORY_TOOL_NAME,
-    LOCAL_DOCUMENT_WRITE_TOOL_NAME,
-    TASK_TOOL_NAME,
-];
+const LIVE_MARKDOWN_TOOLS: &[&str] = &[MEMORY_TOOL_NAME, TASK_TOOL_NAME];
 pub(super) const WRITING_PROMPT: &str = "Writing prompt";
 pub(super) const WRITING_COMMAND: &str = "Writing command";
 pub(super) const WRITING_SCRIPT: &str = "Writing script";
@@ -548,9 +533,6 @@ const COMPACT_TOOLS: &[(&str, CompactTool)] = &[
     tool_row("sessions", '▤', SESSIONS, &[]),
     tool_row(LIST_SESSIONS_TOOL_NAME, '⇄', PEERS, &[]),
     tool_row(SEND_MESSAGE_TOOL_NAME, '⇄', PEERS, &["text"]),
-    tool_row("local_document_read", '→', READ, DOCUMENT_KEYS),
-    tool_row("local_document_write", '←', WRITE, DOCUMENT_WRITE_KEYS),
-    tool_row("local_document_apply_patch", '±', PATCH, DOCUMENT_KEYS),
     tool_row("view_image", '→', VIEW, &["path"]),
     tool_row("image_generate", '←', DRAW, &["out", "prompt"]),
 ];
@@ -7090,7 +7072,6 @@ mod tests {
 
     #[test_case(TASK_TOOL_NAME ; "a_delegation")]
     #[test_case(MEMORY_TOOL_NAME ; "a_note")]
-    #[test_case(LOCAL_DOCUMENT_WRITE_TOOL_NAME ; "a_local_document")]
     fn a_document_body_is_drawn_as_one_before_it_settles(tool: &str) {
         assert!(
             draws_live_markdown(tool, HEADERLESS_EXTENSION),

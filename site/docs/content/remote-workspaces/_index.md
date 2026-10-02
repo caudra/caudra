@@ -176,7 +176,7 @@ The main agent uses the same [`plan` tool](/docs/tools/#plan) locally and remote
 
 Secure plan storage currently requires a Unix client. On Windows and other non-Unix clients, these storage operations return `UnsupportedPlatform`. A Unix Workcell server does not remove this client-side limitation.
 
-Remote sessions also expose `local_document_read`, `local_document_write`, and `local_document_apply_patch` for client-owned documents, including memory notes. They accept opaque document references, not arbitrary local filenames. Patches require the revision from the latest read and reject stale edits. A remote `file_write` cannot be used to edit a client plan. Profile restrictions and normal permission checks still apply.
+Use the `memory` tool to list, read, write, and delete named notes, just as in a local workspace. Writes replace the complete note. Plans use `plan` read/write. Workbench saves check document revisions and reject stale edits. Remote file tools cannot edit client plans or notes. Profile restrictions and normal permission checks still apply.
 
 Remote file contents and tool output can still enter model context and retained client output. Keeping the repository remote does not mean its content stays exclusively on the server.
 

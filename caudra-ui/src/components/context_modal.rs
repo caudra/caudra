@@ -1016,6 +1016,7 @@ mod tests {
         ContextProfileInventory, ContextSkill, ContextSkillInventory, ContextUsage, ContextWindow,
     };
     use caudra_agent::tools::profile_policy::PROFILE_DISABLED;
+    use caudra_agent::{AgentMode, tools::ToolAudience};
     use crossterm::event::{MouseButton, MouseEventKind};
     use ratatui::backend::TestBackend;
     use ratatui::style::Modifier;
@@ -1038,6 +1039,8 @@ mod tests {
     fn snapshot() -> ContextSnapshot {
         ContextSnapshot {
             readiness: ContextReadiness::PreparedNextRequest,
+            mode: AgentMode::Build,
+            audience: ToolAudience::MAIN,
             model: ContextModel {
                 spec: MODEL_SPEC.to_owned(),
                 provider_display_name: "Test Provider".to_owned(),

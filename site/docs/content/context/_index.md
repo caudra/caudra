@@ -15,7 +15,13 @@ Everything the model knows about your project passes through one context window,
 
 The summary shows the active model and window size, estimated tokens grouped by source, the compaction reserve, and the space available before automatic compaction. Once a call has been billed it also shows the size the provider measured, which is the figure the status bar draws and the one automatic compaction decides on. `/context all` adds item-level built-in tool, MCP tool, profile, memory, and skill inventories. Opening either view does not add its report to the transcript.
 
-`/tools` answers a narrower question: which tools the model can reach right now. It lists every built-in and MCP tool with its state, its token cost, and the rule behind that state. Tools turned off by configuration appear there and nowhere else, because they cost no context. Press `g` to leave the inventory for what those tools have actually done, counted per session, per project, and across every run. See [Token Economy](/docs/token-economy/#what-the-tools-cost).
+`/tools` lists every built-in and MCP tool with its state, token cost, and the rule behind that state. Tools turned off by configuration appear there and nowhere else, because they cost no context.
+
+While Main is idle, the inventory previews the selected Plan or Build mode for the next user message. During an active turn, including a permission wait, it shows the committed execution mode and labels a different composer selection as pending. A task view uses that task's own snapshot. Queued messages and automatic continuations retain their captured or committed mode, so the idle preview does not change their tools or permissions. Opening `/tools` does not create a plan, load a tool, or change execution mode.
+
+The `plan` tool needs an active main-agent Plan target. Otherwise its row explains `requires active main-agent Plan mode`. In an eligible Plan view it can still be disabled by the selected profile or global restrictions. Preview token estimates belong to the labelled tool inventory and do not replace the `/context` request snapshot.
+
+Press `g` to leave the inventory for what those tools have actually done, counted per session, per project, and across every run. See [Token Economy](/docs/token-economy/#what-the-tools-cost).
 
 The per-source breakdown is an estimate. Caudra counts text and images locally with one tokenizer, which is exact only for the GPT-4o and GPT-5 families, so the total a provider bills for the same request can differ. The measured line and the status bar carry the provider's own count instead, extended by a local estimate of whatever arrived after it.
 

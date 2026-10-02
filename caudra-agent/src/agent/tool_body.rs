@@ -81,7 +81,6 @@ const BODY_ARGS: &[(&str, &[&str], Body)] = &[
     ("python_execution", &["code"], Body::Drawn),
     ("memory", &["content"], Body::Drawn),
     ("plan", &["content"], Body::Drawn),
-    ("local_document_write", &["content"], Body::Drawn),
     ("task", &["prompt"], Body::Drawn),
     ("image_generate", &["prompt"], Body::Drawn),
 ];
@@ -447,7 +446,6 @@ mod tests {
     #[test_case("python_execution", Some((CODE_KEYS, Body::Drawn)) ; "a_script_is_drawn")]
     #[test_case(MEMORY, Some((CONTENT_KEYS, Body::Drawn)) ; "a_note_is_drawn")]
     #[test_case("plan", Some((CONTENT_KEYS, Body::Drawn)) ; "a_plan_is_drawn")]
-    #[test_case("local_document_write", Some((CONTENT_KEYS, Body::Drawn)) ; "a_local_document_is_drawn")]
     #[test_case(TASK, Some((PROMPT_KEYS, Body::Drawn)) ; "a_delegation_draws_its_prompt")]
     #[test_case(IMAGE, Some((PROMPT_KEYS, Body::Drawn)) ; "a_generation_draws_its_prompt")]
     #[test_case("file_read", None ; "a_tool_with_no_body")]
