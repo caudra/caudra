@@ -325,9 +325,15 @@ fn analyze_with_program(
         .filter_map(|(_, command)| command.words.first().map(|word| (word.span.start, command)))
         .collect();
     let root = tree.root_node();
+    // No scope names the code or data a heredoc or here-string feeds a command.
     let mut analysis = ShellCommandAnalysis {
         scopes: Vec::new(),
-        opaque: root.has_error() || !cfg!(unix) || !program.is_complete(),
+        opaque: root.has_error()
+            || !cfg!(unix)
+            || !program.is_complete()
+            || program
+                .commands()
+                .any(|(_, command)| !command.payloads.is_empty()),
     };
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {

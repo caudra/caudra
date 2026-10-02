@@ -13,6 +13,7 @@ pub const MAX_CWD_PATH_BYTES: usize = 4096;
 pub const MAX_CONTEXT_BYTES: usize = 1024 * 1024;
 const CONTEXT_DIAGNOSTICS_PER_NODE: usize = 3;
 const INITIAL_CONTEXT_DIAGNOSTICS: usize = 3;
+const TYPE_FLAGS: &str = "afptP";
 const BASH_BUILTINS: &[&str] = &[
     ".",
     ":",
@@ -407,6 +408,7 @@ impl ContextBuilder {
             return match *executable {
                 ":" | "true" | "false" | "echo" => Outcomes::unchanged(incoming),
                 "pwd" if argv.len() == 1 => Outcomes::unchanged(incoming),
+                "command" | "type" if looks_up_names(&argv) => Outcomes::unchanged(incoming),
                 _ => self.unknown_effect(id),
             };
         }
@@ -417,6 +419,30 @@ impl ContextBuilder {
         self.issue(id, BashContextIssue::UnknownStateEffect);
         Outcomes::unchanged(BashCwdSet::Unknown)
     }
+}
+
+/// `command -v|-V` and `type` only report what each name resolves to.
+fn looks_up_names(argv: &[&str]) -> bool {
+    let names = match argv {
+        ["command", "-v" | "-V", names @ ..] => names,
+        ["type", arguments @ ..] => {
+            let options = arguments
+                .iter()
+                .take_while(|argument| argument.starts_with('-'))
+                .count();
+            if !arguments[..options].iter().all(|option| {
+                option.len() > 1 && option[1..].chars().all(|flag| TYPE_FLAGS.contains(flag))
+            }) {
+                return false;
+            }
+            &arguments[options..]
+        }
+        _ => return false,
+    };
+    !names.is_empty()
+        && names
+            .iter()
+            .all(|name| !name.is_empty() && !name.starts_with('-'))
 }
 
 #[cfg(test)]
@@ -548,6 +574,58 @@ mod tests {
         let result = contexts("cd left && cat note | cat next");
         assert_eq!(result.commands[1].incoming, paths(&["left"]));
         assert_eq!(result.commands[2].incoming, paths(&["left"]));
+    }
+
+    #[test]
+    fn a_cd_after_a_pipeline_moves_the_commands_after_the_list() {
+        for (source, expected) in [
+            ("a | b | c && cd left; cat note", paths(&["", "left"])),
+            ("a | b | c && cd left && cat note", paths(&["left"])),
+            (
+                "cat <<EOF | cat && cd left\nx\nEOF\ncat note",
+                paths(&["", "left"]),
+            ),
+        ] {
+            let result = contexts(source);
+            assert!(result.complete, "{source:?}: {:?}", result.diagnostics);
+            assert_eq!(
+                result.commands.last().unwrap().incoming,
+                expected,
+                "{source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn name_lookups_keep_the_working_directory() {
+        for source in [
+            "command -v cargo; cat note",
+            "command -V cargo rustc; cat note",
+            "type cargo; cat note",
+            "type -at cargo; cat note",
+            "type -P cargo just; cat note",
+        ] {
+            let result = contexts(source);
+            assert!(result.complete, "{source:?}: {:?}", result.diagnostics);
+            assert_eq!(result.commands.last().unwrap().incoming, paths(&[""]));
+        }
+        for source in [
+            "command cargo; cat note",
+            "command -p cargo; cat note",
+            "command -v; cat note",
+            "command -v -p cargo; cat note",
+            "type -x cargo; cat note",
+            "type cargo -t; cat note",
+            "type; cat note",
+        ] {
+            let result = contexts(source);
+            assert!(!result.complete, "{source:?}");
+            assert_eq!(
+                result.commands.last().unwrap().incoming,
+                BashCwdSet::Unknown,
+                "{source:?}"
+            );
+        }
     }
 
     #[test]

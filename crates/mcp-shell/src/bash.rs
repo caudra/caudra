@@ -6,7 +6,7 @@ use std::{
 };
 
 use serde::Serialize;
-use tree_sitter::{Node, ParseOptions, ParseState, Parser, Tree};
+use tree_sitter::{Node, ParseOptions, ParseState, Parser, Point, Range, Tree};
 
 mod contexts;
 mod lower;
@@ -17,12 +17,15 @@ pub use contexts::{
     MAX_CWD_STATES,
 };
 
-pub const BASH_ANALYSIS_VERSION: u16 = 1;
+pub const BASH_ANALYSIS_VERSION: u16 = 2;
 pub const BASH_GRAMMAR_VERSION: &str = "tree-sitter-bash-0.25.1";
 pub const MAX_BASH_SOURCE_BYTES: usize = 64 * 1024;
 pub const MAX_BASH_CST_NODES: usize = 4096;
 pub const MAX_BASH_DEPTH: usize = 64;
 pub const MAX_BASH_PARSE_MILLIS: u64 = 250;
+pub const MAX_BASH_REGION_COMMANDS: usize = 256;
+pub const MAX_BASH_REGION_ARGV_WORDS: usize = 128;
+pub const MAX_BASH_REGION_ARGV_BYTES: usize = 8 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct BashLimits {
@@ -189,11 +192,39 @@ pub struct BashRedirect {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BashPayloadKind {
+    /// Bash expands nothing in the body when any part of the delimiter word is quoted.
+    Heredoc {
+        quoted: bool,
+    },
+    HereString,
+}
+
+/// Data a heredoc or here-string feeds to a descriptor of its command.
+///
+/// `span` is the redirection on the command line and `body` the payload source. A heredoc body
+/// and its delimiter line follow the command line, so they lie outside the command's span.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct BashPayload {
+    pub span: BashSpan,
+    pub operator: BashSpan,
+    pub descriptor: Option<BashSpan>,
+    pub body: BashSpan,
+    pub kind: BashPayloadKind,
+    /// The exact bytes the descriptor reads, present only when no expansion can change them: a
+    /// heredoc body after `<<-` tab stripping, or a here-string word after quote removal followed
+    /// by the newline Bash appends.
+    pub literal: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "index", rename_all = "snake_case")]
 pub enum BashCommandPart {
     Word(usize),
     Assignment(usize),
     Redirect(usize),
+    Payload(usize),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -202,6 +233,7 @@ pub struct BashCommand {
     pub words: Vec<BashWord>,
     pub assignments: Vec<BashAssignment>,
     pub redirects: Vec<BashRedirect>,
+    pub payloads: Vec<BashPayload>,
     pub parts: Vec<BashCommandPart>,
 }
 
@@ -282,6 +314,28 @@ pub struct BashCoverage {
     pub role: BashCoverageKind,
 }
 
+/// A command found inside an `UnsupportedSyntax` region, which stays unlowered.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct BashRegionCommand {
+    pub region: BashNodeId,
+    pub span: BashSpan,
+    /// The decoded command name, or `None` when it is not literal.
+    pub executable: Option<String>,
+    /// Every word including the executable, present only when all of them are literal.
+    pub argv: Option<Vec<String>>,
+}
+
+/// Commands inside every `UnsupportedSyntax` region, nested regions included, in source order.
+///
+/// `complete` is false when a bound was reached or a region holds commands the grammar does not
+/// expose, such as backticks in an unquoted heredoc. A consumer must then assume a region can
+/// run anything.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct BashRegionInventory {
+    pub commands: Vec<BashRegionCommand>,
+    pub complete: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct BashProgram {
     analysis_version: u16,
@@ -291,6 +345,7 @@ pub struct BashProgram {
     nodes: Vec<BashNode>,
     coverage: Vec<BashCoverage>,
     diagnostics: Vec<BashDiagnostic>,
+    regions: BashRegionInventory,
 }
 
 impl BashProgram {
@@ -314,6 +369,9 @@ impl BashProgram {
     }
     pub fn diagnostics(&self) -> &[BashDiagnostic] {
         &self.diagnostics
+    }
+    pub const fn region_inventory(&self) -> &BashRegionInventory {
+        &self.regions
     }
     pub fn is_complete(&self) -> bool {
         self.diagnostics.is_empty()
@@ -358,6 +416,7 @@ impl BashProgram {
                     .map(|diagnostic| lower::retained_diagnostic_bytes(&diagnostic.kind))
                     .fold(0, usize::saturating_add),
             )
+            .saturating_add(lower::retained_inventory_bytes(&self.regions))
     }
 }
 
@@ -378,8 +437,47 @@ pub(crate) fn parse_tree(source: &str, limits: &BashLimits) -> Result<Tree, Bash
     parse_tree_with_clock(source, limits, || started.elapsed())
 }
 
+/// Parses only `source[start..end]`, with node offsets that still index `source`.
+pub(crate) fn parse_tree_range(
+    source: &str,
+    start: usize,
+    end: usize,
+) -> Result<Tree, BashParseError> {
+    let started = Instant::now();
+    let range = Range {
+        start_byte: start,
+        end_byte: end,
+        start_point: point_at(source, start),
+        end_point: point_at(source, end),
+    };
+    parse_tree_within(source, Some(range), &BashLimits::default(), || {
+        started.elapsed()
+    })
+}
+
+fn point_at(source: &str, offset: usize) -> Point {
+    let before = &source.as_bytes()[..offset];
+    let line_start = before
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |newline| newline + 1);
+    Point::new(
+        before.iter().filter(|byte| **byte == b'\n').count(),
+        offset - line_start,
+    )
+}
+
 fn parse_tree_with_clock(
     source: &str,
+    limits: &BashLimits,
+    elapsed: impl FnMut() -> Duration,
+) -> Result<Tree, BashParseError> {
+    parse_tree_within(source, None, limits, elapsed)
+}
+
+fn parse_tree_within(
+    source: &str,
+    range: Option<Range>,
     limits: &BashLimits,
     mut elapsed: impl FnMut() -> Duration,
 ) -> Result<Tree, BashParseError> {
@@ -401,6 +499,11 @@ fn parse_tree_with_clock(
     parser
         .set_language(&tree_sitter_bash::LANGUAGE.into())
         .map_err(|_| BashParseError::ParserUnavailable)?;
+    if let Some(range) = range {
+        parser
+            .set_included_ranges(&[range])
+            .map_err(|_| BashParseError::ParserUnavailable)?;
+    }
     let mut progress = |_: &ParseState| {
         if elapsed() >= Duration::from_millis(limits.parse_millis) {
             ControlFlow::Break(())
@@ -458,8 +561,9 @@ mod tests {
 
     use super::{
         BASH_ANALYSIS_VERSION, BASH_GRAMMAR_VERSION, BashCommand, BashCoverageKind,
-        BashDiagnosticKind, BashLimits, BashNodeKind, BashOperatorKind, BashParseError,
-        BashProgram, BashQuoting, BashRedirectKind, MAX_BASH_SOURCE_BYTES, parse_bash,
+        BashDiagnosticKind, BashLimits, BashNodeId, BashNodeKind, BashOperatorKind, BashParseError,
+        BashPayloadKind, BashProgram, BashQuoting, BashRedirectKind, MAX_BASH_REGION_ARGV_BYTES,
+        MAX_BASH_REGION_ARGV_WORDS, MAX_BASH_REGION_COMMANDS, MAX_BASH_SOURCE_BYTES, parse_bash,
         parse_bash_with_limits, parse_tree_with_clock,
     };
     use crate::{ShellInput, ShellPermissionPolicy, ShellToolGroup, ShellWord};
@@ -494,8 +598,19 @@ mod tests {
         "python3 - <<'PY' || cat tail\nprint('one')\nPY\n",
         "python3 - <<'PY' | cat tail\nprint('one')\nPY\n",
         "cat <<EOF\n$(touch never)\nEOF\n",
+        "cat <<EOF\n`touch never`\nEOF\n",
         "cat <<A <<B\none\nA\ntwo\nB\n",
+        "cat - <<EOF\nx\nEOF\n",
+        "cat -<<EOF\nx\nEOF\n",
+        "cat <<-EOF\n\tx\n\tEOF\n",
+        "cat <<E\"O\"F\n$x\nEOF\n",
+        "cat <<EOF\nEOF\n",
+        "FOO=1 python3 - <<EOF >log 2>&1\nx\nEOF\n",
+        "python3 <<PY | cat tail && echo done\nx\nPY\n",
+        "while read -r line; do echo \"$line\"; done <<EOF\nx\nEOF\n",
         "cat <<<payload",
+        "cat <<< \"a b\" extra >out",
+        "a | b | c && cd /tmp; rm x",
         "if cat a; then cat b; fi",
         "for x in a b; do cat x; done",
         "f() { cd elsewhere; }; f",
@@ -546,6 +661,32 @@ mod tests {
 
     fn first_command(program: &BashProgram) -> &BashCommand {
         program.commands().next().expect("represented command").1
+    }
+
+    /// The grouping Bash gives a lowered program, written with explicit parentheses.
+    fn grouping(program: &BashProgram, id: BashNodeId) -> String {
+        let join = |ids: &[BashNodeId], separator: &str| {
+            ids.iter()
+                .map(|id| grouping(program, *id))
+                .collect::<Vec<_>>()
+                .join(separator)
+        };
+        match &program.nodes()[id.0].structure {
+            BashNodeKind::Sequence { items, .. } => join(items, "; "),
+            BashNodeKind::AndOr {
+                left,
+                operator,
+                right,
+            } => format!(
+                "({} {} {})",
+                grouping(program, *left),
+                program.text(&operator.span).unwrap(),
+                grouping(program, *right)
+            ),
+            BashNodeKind::Pipeline { commands, .. } => format!("({})", join(commands, " | ")),
+            BashNodeKind::Command { command } => command.static_argv().unwrap().join(" "),
+            other => panic!("unexpected structure {other:?}"),
+        }
     }
 
     #[test]
@@ -688,51 +829,342 @@ mod tests {
     }
 
     #[test]
-    fn the_real_pre_heredoc_argument_gap_refuses_an_incomplete_python_argv() {
-        let program = parse_bash(HEREDOC).unwrap();
-        assert!(!program.is_complete());
-        assert!(program.commands().next().is_none());
-        assert!(
-            program
-                .diagnostics()
-                .iter()
-                .any(|diagnostic| diagnostic.kind == BashDiagnosticKind::SourceGap)
-        );
-        assert!(
-            program
-                .coverage()
-                .iter()
-                .any(|covered| covered.role == BashCoverageKind::Payload
-                    && program.text(&covered.span) == Some("print('one')\n"))
-        );
-        assert_coverage(&program);
-    }
-
-    #[test]
-    fn heredoc_owned_control_tails_and_payloads_cannot_disappear() {
-        for source in [
-            "python3 <<'PY' && cat tail\nprint('one')\nPY\n",
-            "python3 <<'PY' || cat tail\nprint('one')\nPY\n",
-            "python3 <<'PY' | cat tail\nprint('one')\nPY\n",
-            "python3 <<'PY' >out arg\nprint('one')\nPY\n",
+    fn heredoc_commands_lower_completely() {
+        const QUOTED: BashPayloadKind = BashPayloadKind::Heredoc { quoted: true };
+        const UNQUOTED: BashPayloadKind = BashPayloadKind::Heredoc { quoted: false };
+        for (source, argv, kind, body, literal) in [
+            (
+                HEREDOC,
+                &["python3", "-"][..],
+                QUOTED,
+                "print('one')\n",
+                Some("print('one')\n"),
+            ),
+            (
+                "cat - <<EOF\nx\nEOF\n",
+                &["cat", "-"],
+                UNQUOTED,
+                "x\n",
+                Some("x\n"),
+            ),
+            (
+                "cat -<<EOF\nx\nEOF\n",
+                &["cat", "-"],
+                UNQUOTED,
+                "x\n",
+                Some("x\n"),
+            ),
+            (
+                "cat <<-EOF\n\tone\n\t\ttwo\n\tEOF\n",
+                &["cat"],
+                UNQUOTED,
+                "\tone\n\t\ttwo\n",
+                Some("one\ntwo\n"),
+            ),
+            (
+                "cat <<EOF\n$HOME\nEOF\n",
+                &["cat"],
+                UNQUOTED,
+                "$HOME\n",
+                None,
+            ),
+            (
+                "cat <<EOF\na\\\nb\nEOF\n",
+                &["cat"],
+                UNQUOTED,
+                "a\\\nb\n",
+                None,
+            ),
+            (
+                "cat <<'EOF'\n$HOME `id`\nEOF\n",
+                &["cat"],
+                QUOTED,
+                "$HOME `id`\n",
+                Some("$HOME `id`\n"),
+            ),
+            (
+                "cat <<E\"O\"F\n$HOME\nEOF\n",
+                &["cat"],
+                QUOTED,
+                "$HOME\n",
+                Some("$HOME\n"),
+            ),
+            ("cat <<EOF\nEOF\n", &["cat"], UNQUOTED, "", Some("")),
+            (
+                "FOO=1 python3 - <<EOF >log 2>&1\nx\nEOF\n",
+                &["python3", "-"],
+                UNQUOTED,
+                "x\n",
+                Some("x\n"),
+            ),
+            (
+                "cat 3<<EOF\nx\nEOF\n",
+                &["cat"],
+                UNQUOTED,
+                "x\n",
+                Some("x\n"),
+            ),
+            (
+                "cat <<< \"a b\" extra",
+                &["cat", "extra"],
+                BashPayloadKind::HereString,
+                "\"a b\"",
+                Some("a b\n"),
+            ),
+            (
+                "cat <<< $HOME",
+                &["cat"],
+                BashPayloadKind::HereString,
+                "$HOME",
+                None,
+            ),
         ] {
             let program = parse_bash(source).unwrap();
-            assert!(!program.is_complete(), "{source:?}");
+            assert!(
+                program.is_complete(),
+                "{source:?}: {:?}",
+                program.diagnostics()
+            );
+            let command = first_command(&program);
+            assert_eq!(command.static_argv().unwrap(), argv, "{source:?}");
+            let [payload] = &command.payloads[..] else {
+                panic!("{source:?} has one payload");
+            };
+            assert_eq!(payload.kind, kind, "{source:?}");
+            assert_eq!(program.text(&payload.body), Some(body), "{source:?}");
+            assert_eq!(payload.literal.as_deref(), literal, "{source:?}");
             assert!(
                 program
                     .coverage()
                     .iter()
-                    .any(|covered| covered.role == BashCoverageKind::Payload)
+                    .any(|covered| covered.span == payload.body
+                        && covered.role == BashCoverageKind::Payload)
+                    || body.is_empty(),
+                "{source:?}"
             );
-            assert!(program.coverage().iter().any(|covered| covered.role
-                == BashCoverageKind::Unknown
-                && program.text(&covered.span).unwrap().contains("tail")
-                || covered.role == BashCoverageKind::Unknown
-                    && program.text(&covered.span).unwrap().contains("arg")));
             assert_coverage(&program);
         }
+        let assigned = parse_bash("FOO=1 python3 - <<EOF >log 2>&1\nx\nEOF\n").unwrap();
+        let command = first_command(&assigned);
+        assert_eq!(command.assignments.len(), 1);
+        assert_eq!(command.redirects.len(), 2);
+        let descriptor = parse_bash("cat 3<<EOF\nx\nEOF\n").unwrap();
+        let payload = &first_command(&descriptor).payloads[0];
+        assert_eq!(
+            descriptor.text(payload.descriptor.as_ref().unwrap()),
+            Some("3")
+        );
+        assert_eq!(descriptor.text(&payload.span), Some("3<<EOF"));
         let other = parse_bash(&HEREDOC.replace("one", "two")).unwrap();
         assert_ne!(parse_bash(HEREDOC).unwrap(), other);
+    }
+
+    #[test]
+    fn heredoc_tails_stay_visible() {
+        for (source, expected) in [
+            (
+                "python3 <<'PY' && cat tail\nprint('one')\nPY\n",
+                "(python3 && cat tail)",
+            ),
+            (
+                "python3 <<'PY' || cat tail\nprint('one')\nPY\n",
+                "(python3 || cat tail)",
+            ),
+            (
+                "python3 <<'PY' | cat tail\nprint('one')\nPY\n",
+                "(python3 | cat tail)",
+            ),
+            ("python3 <<'PY' >out arg\nprint('one')\nPY\n", "python3 arg"),
+            ("cat <<EOF >out && rm x\nx\nEOF\n", "(cat && rm x)"),
+            (
+                "cat <<'EOF' | sudo tee /etc/x\nx\nEOF\n",
+                "(cat | sudo tee /etc/x)",
+            ),
+            (
+                "python3 <<PY | cat tail && echo done\nx\nPY\n",
+                "((python3 | cat tail) && echo done)",
+            ),
+            ("python3 <<PY && a || b\nx\nPY\n", "((python3 && a) || b)"),
+            ("a && python3 - <<PY | b\nx\nPY\n", "(a && (python3 - | b))"),
+            ("a | b && c - <<PY\nx\nPY\n", "((a | b) && c -)"),
+        ] {
+            let program = parse_bash(source).unwrap();
+            assert!(
+                program.is_complete(),
+                "{source:?}: {:?}",
+                program.diagnostics()
+            );
+            assert_eq!(grouping(&program, program.root()), expected, "{source:?}");
+            let fed: Vec<_> = program
+                .commands()
+                .filter(|(_, command)| !command.payloads.is_empty())
+                .collect();
+            let [(id, command)] = fed[..] else {
+                panic!("{source:?} feeds one command");
+            };
+            assert!(
+                program.nodes()[id.0].span.end < command.payloads[0].body.start,
+                "{source:?}"
+            );
+            assert_coverage(&program);
+        }
+    }
+
+    #[test]
+    fn pipelines_bind_tighter_than_and_or_lists() {
+        for (source, expected) in [
+            (
+                "a | b | c && cd /tmp; rm x",
+                "((a | b | c) && cd /tmp); rm x",
+            ),
+            ("a | b || c && d", "(((a | b) || c) && d)"),
+            ("a && b | c && d", "((a && (b | c)) && d)"),
+            ("a | b && c | d", "((a | b) && (c | d))"),
+            ("a || b && c | d; e", "((a || b) && (c | d)); e"),
+        ] {
+            let program = parse_bash(source).unwrap();
+            assert!(
+                program.is_complete(),
+                "{source:?}: {:?}",
+                program.diagnostics()
+            );
+            assert_eq!(grouping(&program, program.root()), expected, "{source:?}");
+            assert_coverage(&program);
+        }
+    }
+
+    #[test]
+    fn redirects_after_a_list_belong_to_its_last_command() {
+        for (source, expected, redirected) in [
+            ("a && b >x c", "(a && b c)", "b c"),
+            (
+                "cd x && cargo test 2>&1",
+                "(cd x && cargo test)",
+                "cargo test",
+            ),
+            ("a | b 2>/dev/null", "(a | b)", "b"),
+            ("a || b | c >out && d", "((a || (b | c)) && d)", "c"),
+            ("a && b >x || c", "((a && b) || c)", "b"),
+        ] {
+            let program = parse_bash(source).unwrap();
+            assert!(
+                program.is_complete(),
+                "{source:?}: {:?}",
+                program.diagnostics()
+            );
+            assert_eq!(grouping(&program, program.root()), expected, "{source:?}");
+            let with_redirects: Vec<_> = program
+                .commands()
+                .filter(|(_, command)| !command.redirects.is_empty())
+                .map(|(_, command)| command.static_argv().unwrap().join(" "))
+                .collect();
+            assert_eq!(with_redirects, [redirected], "{source:?}");
+            assert_coverage(&program);
+        }
+    }
+
+    #[test]
+    fn unsupported_regions_list_their_commands() {
+        let listed = |program: &BashProgram| {
+            program
+                .region_inventory()
+                .commands
+                .iter()
+                .map(|command| {
+                    (
+                        command.executable.clone(),
+                        command.argv.as_ref().map(|argv| argv.join(" ")),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let named = |executable: &str, argv: Option<&str>| {
+            (Some(executable.to_owned()), argv.map(str::to_owned))
+        };
+        for (source, expected) in [
+            (
+                "for x in a b; do sudo cat $x; done",
+                vec![named("sudo", None)],
+            ),
+            (
+                "echo $(sudo id) `whoami`",
+                vec![
+                    named("echo", None),
+                    named("sudo", Some("sudo id")),
+                    named("whoami", Some("whoami")),
+                ],
+            ),
+            ("f() { \"$runner\" x; }", vec![(None, None)]),
+            (
+                "if true; then env >/dev/null sudo id; fi",
+                vec![
+                    named("true", Some("true")),
+                    named("env", Some("env sudo id")),
+                ],
+            ),
+            (
+                "if true; then a && env >/dev/null sudo id; fi",
+                vec![
+                    named("true", Some("true")),
+                    named("a", Some("a")),
+                    named("env", Some("env sudo id")),
+                ],
+            ),
+            (
+                "if true; then python3 - <<PY\nprint()\nPY\nfi",
+                vec![named("true", Some("true")), named("python3", None)],
+            ),
+            (
+                "while read -r line; do echo \"$line\"; done <<EOF\nx\nEOF\n",
+                vec![named("read", Some("read -r line")), named("echo", None)],
+            ),
+            (
+                "cat <<EOF\n$(sudo id)\nEOF\n",
+                vec![named("cat", Some("cat")), named("sudo", Some("sudo id"))],
+            ),
+        ] {
+            let program = parse_bash(source).unwrap();
+            assert!(!program.is_complete(), "{source:?}");
+            assert!(program.region_inventory().complete, "{source:?}");
+            assert_eq!(listed(&program), expected, "{source:?}");
+            assert!(
+                program
+                    .region_inventory()
+                    .commands
+                    .iter()
+                    .all(|command| matches!(
+                        program.nodes()[command.region.0].structure,
+                        BashNodeKind::Unknown { .. }
+                    )),
+                "{source:?}"
+            );
+        }
+        for source in [
+            "cat <<EOF\n`sudo id`\nEOF\n".to_owned(),
+            "if true; then cat <<EOF\n`sudo id`\nEOF\nfi".to_owned(),
+            format!(
+                "for x in a; do {}done",
+                "c; ".repeat(MAX_BASH_REGION_COMMANDS + 1)
+            ),
+            format!(
+                "for x in a; do echo{}; done",
+                " w".repeat(MAX_BASH_REGION_ARGV_WORDS)
+            ),
+            format!(
+                "for x in a; do echo {}; done",
+                "w".repeat(MAX_BASH_REGION_ARGV_BYTES)
+            ),
+        ] {
+            let program = parse_bash(&source).unwrap();
+            assert!(!program.region_inventory().complete, "{source:?}");
+            assert!(
+                program.region_inventory().commands.len() <= MAX_BASH_REGION_COMMANDS,
+                "{source:?}"
+            );
+        }
+        let lowered = parse_bash("cat a && cat b").unwrap();
+        assert!(lowered.region_inventory().commands.is_empty());
+        assert!(lowered.region_inventory().complete);
     }
 
     #[test]
@@ -748,7 +1180,9 @@ mod tests {
             "cat $((x=1))",
             "[[ -f note ]]",
             "[ -f note ]",
-            "cat <<<payload",
+            "cat <<EOF\n$(cat secret)\nEOF\n",
+            "cat <<EOF\n`cat secret`\nEOF\n",
+            "cat <<< \"$(cat secret)\"",
             "A=(a b)",
         ] {
             let program = parse_bash(source).unwrap();
@@ -889,7 +1323,10 @@ mod tests {
             }
             if source == HEREDOC {
                 assert!(prepared.analysis().opaque);
-                assert!(prepared.analysis().scopes[0].arguments.is_none());
+                assert_eq!(
+                    prepared.analysis().scopes[0].arguments,
+                    Some(vec![ShellWord::Literal("-".into())])
+                );
             }
             if source.starts_with("cd ") {
                 assert!(!prepared.analysis().opaque);
