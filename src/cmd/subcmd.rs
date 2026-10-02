@@ -1669,18 +1669,7 @@ pub fn prompt(
         &definitions.declared,
         &definitions.deferred,
     );
-    let filter = if policy.is_legacy() {
-        filter
-    } else {
-        ToolFilter::Only(
-            reg.iter()
-                .iter()
-                .filter(|entry| inspection_tool_state(&definitions, entry.name()).reaches_model())
-                .map(|entry| entry.name().to_owned())
-                .collect(),
-        )
-        .for_mode(&mode)
-    };
+    let filter = definitions.available_filter().for_mode(&mode);
     let output = match variant {
         PromptVariant::System => {
             let system = build_system_prompt(

@@ -10,7 +10,10 @@ use strum::{Display, EnumIter, EnumString, IntoEnumIterator};
 use crate::{
     AgentMode,
     template::Vars,
-    tools::{SHELL_TOOL_NAME, profile_policy::PLAN_TOOL_NAME},
+    tools::{
+        BATCH_TOOL_NAME, FILE_APPLY_PATCH_TOOL_NAME, FILE_EDIT_TOOL_NAME, FILE_GREP_TOOL_NAME,
+        FILE_INDEX_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME, profile_policy::PLAN_TOOL_NAME,
+    },
 };
 
 pub mod profile;
@@ -290,16 +293,7 @@ const NATIVE_HINTS: &[(&str, Slot, &str)] = &[
         "- Use **code_impact** to inspect change reach and existing tests.",
     ),
     ("code_map", Slot::ToolUsage, CODE_MAP_TOOL_USAGE),
-    (
-        crate::tools::FILE_INDEX_TOOL_NAME,
-        Slot::ToolUsage,
-        INDEX_TOOL_USAGE,
-    ),
-    (
-        crate::tools::FILE_INDEX_TOOL_NAME,
-        Slot::EfficientTools,
-        crate::tools::FILE_INDEX_TOOL_NAME,
-    ),
+    (FILE_INDEX_TOOL_NAME, Slot::ToolUsage, INDEX_TOOL_USAGE),
     (
         crate::tools::TODOWRITE_TOOL_NAME,
         Slot::ToolUsage,
@@ -322,13 +316,16 @@ pub const DEFAULT_TONE: &str = r#"- Be concise. Your output is displayed on a CL
 - Output text to communicate with the user; all text you output outside of tool use is displayed to the user. Only use tools to complete tasks. NEVER use shell commands to communicate thoughts, explanations, diagrams, or instructions to the user. Output all communication directly in your response text instead.
 - NEVER create files unless absolutely necessary. ALWAYS prefer editing existing files."#;
 
+/// Each is listed only when the tool filter offers it.
 const NATIVE_EFFICIENT_TOOLS: &[&str] = &[
-    "batch",
-    "file_grep",
-    "file_edit",
-    "file_apply_patch",
-    "task",
+    BATCH_TOOL_NAME,
+    FILE_GREP_TOOL_NAME,
+    FILE_EDIT_TOOL_NAME,
+    FILE_APPLY_PATCH_TOOL_NAME,
+    TASK_TOOL_NAME,
+    FILE_INDEX_TOOL_NAME,
 ];
+pub(crate) const EFFICIENT_TOOLS_LABEL: &str = "Most efficient tools:";
 const SYSTEM_COMPONENTS: &[&str] = &[
     "default",
     "identity",
@@ -484,6 +481,12 @@ impl ResolvedSlots {
     ) -> Cow<'a, Self> {
         let hints: Vec<_> = NATIVE_HINTS
             .iter()
+            .copied()
+            .chain(
+                NATIVE_EFFICIENT_TOOLS
+                    .iter()
+                    .map(|&tool| (tool, Slot::EfficientTools, tool)),
+            )
             .filter(|(tool, ..)| filter.matches(tool))
             .collect();
         if hints.is_empty() && !filter.matches(crate::tools::MEMORY_TOOL_NAME) {
@@ -572,15 +575,16 @@ fn render_slot(slots: &ResolvedSlots, prompt: PromptId, slot: Slot) -> String {
 }
 
 fn render_efficient_tools(slots: &ResolvedSlots, prompt: PromptId) -> String {
-    let extras = slots.get(prompt, Slot::EfficientTools);
-    let names = NATIVE_EFFICIENT_TOOLS
+    let entries = slots.get(prompt, Slot::EfficientTools);
+    if entries.is_empty() {
+        return String::new();
+    }
+    let names = entries
         .iter()
-        .copied()
-        .filter(|name| prompt == PromptId::System || *name != "task")
-        .chain(extras.iter().map(|e| e.content.as_str()))
+        .map(|entry| format!("`{}`", entry.content))
         .collect::<Vec<_>>()
         .join(", ");
-    format!("Most efficient tools: {names}.")
+    format!("{EFFICIENT_TOOLS_LABEL} {names}.")
 }
 
 pub(crate) fn is_system_component(name: &str) -> bool {
@@ -877,14 +881,16 @@ pub fn assemble(id: PromptId, slots: &ResolvedSlots, instructions: &str) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::ToolFilter;
     use caudra_workspace::PlanRef;
     use test_case::test_case;
 
-    const NATIVE_EFFICIENT_LINE: &str =
-        "Most efficient tools: batch, file_grep, file_edit, file_apply_patch, task";
-    /// Subagent prompts drop `task`, which only the main agent may call.
-    const SUBAGENT_EFFICIENT_LINE: &str =
-        "Most efficient tools: batch, file_grep, file_edit, file_apply_patch";
+    const EDIT_MODEL_EFFICIENT_TOOLS: &str =
+        "`batch`, `file_grep`, `file_edit`, `task`, `file_index`";
+    const PATCH_MODEL_EFFICIENT_TOOLS: &str =
+        "`batch`, `file_grep`, `file_apply_patch`, `task`, `file_index`";
+    const GREP_ONLY_EFFICIENT_TOOLS: &str = "`file_grep`";
+    const PLUGIN_EFFICIENT_TOOL: &str = "plugin_tool";
     const EXECUTION_TEST_THRESHOLD: u64 = 937;
     const CUSTOM_EXECUTION_INSTRUCTION: &str =
         "User-authored background and foreground instructions remain intact.";
@@ -1046,14 +1052,14 @@ mod tests {
     }
 
     #[test]
-    fn empty_slots_emit_template_and_native_efficient_line() {
+    fn empty_slots_emit_template_without_efficient_line() {
         let out = assemble(PromptId::System, &ResolvedSlots::default(), "");
         assert!(out.starts_with("You are Caudra"));
         assert!(
             !out.contains("{{"),
             "unfilled marker left in output:\n{out}"
         );
-        assert!(out.contains(&format!("{NATIVE_EFFICIENT_LINE}.")));
+        assert!(!out.contains(EFFICIENT_TOOLS_LABEL), "{out}");
     }
 
     /// One test to pin the whole System layout: every slot shows up, in order,
@@ -1096,38 +1102,51 @@ mod tests {
         );
     }
 
+    /// Plugin entries are free text that may name tools the filter never sees,
+    /// so they are kept, ahead of the native tools the filter offers.
     #[test]
-    fn efficient_tools_extras_join_native_list() {
-        let s = slots(
+    fn plugin_efficient_tools_are_kept_ahead_of_offered_native_ones() {
+        let plugin = slots(
             PromptId::System,
-            &[
-                (Slot::EfficientTools, "file_index"),
-                (Slot::EfficientTools, "foo"),
-            ],
+            &[(Slot::EfficientTools, PLUGIN_EFFICIENT_TOOL)],
         );
-        let out = assemble(PromptId::System, &s, "");
-        assert!(out.contains(&format!("{NATIVE_EFFICIENT_LINE}, file_index, foo.")));
+        let filter = ToolFilter::Only(vec![BATCH_TOOL_NAME.into()]);
+        let out = assemble(PromptId::System, &plugin.with_native_hints(&filter), "");
+        assert!(
+            out.contains(&format!(
+                "{EFFICIENT_TOOLS_LABEL} `{PLUGIN_EFFICIENT_TOOL}`, `{BATCH_TOOL_NAME}`."
+            )),
+            "{out}"
+        );
     }
 
-    #[test_case(crate::tools::ToolFilter::All, true ; "enabled")]
-    #[test_case(crate::tools::ToolFilter::AllExcept(vec!["file_index".into()]), false ; "disabled")]
-    fn native_index_hints_follow_effective_filter(
-        filter: crate::tools::ToolFilter,
-        expected: bool,
-    ) {
+    #[test_case(ToolFilter::AllExcept(vec![FILE_APPLY_PATCH_TOOL_NAME.into()]), Some(EDIT_MODEL_EFFICIENT_TOOLS) ; "edit_model")]
+    #[test_case(ToolFilter::AllExcept(vec![FILE_EDIT_TOOL_NAME.into()]), Some(PATCH_MODEL_EFFICIENT_TOOLS) ; "patch_model")]
+    #[test_case(ToolFilter::Only(vec![FILE_GREP_TOOL_NAME.into()]), Some(GREP_ONLY_EFFICIENT_TOOLS) ; "partial")]
+    #[test_case(ToolFilter::Only(vec![SHELL_TOOL_NAME.into()]), None ; "none_offered")]
+    fn efficient_tools_name_only_offered_tools(filter: ToolFilter, expected: Option<&str>) {
+        let slots = ResolvedSlots::default();
+        let out = assemble(PromptId::System, &slots.with_native_hints(&filter), "");
+        match expected {
+            Some(names) => assert!(
+                out.contains(&format!("{EFFICIENT_TOOLS_LABEL} {names}.")),
+                "{out}"
+            ),
+            None => assert!(!out.contains(EFFICIENT_TOOLS_LABEL), "{out}"),
+        }
+    }
+
+    #[test_case(ToolFilter::All, true ; "enabled")]
+    #[test_case(ToolFilter::AllExcept(vec![FILE_INDEX_TOOL_NAME.into()]), false ; "disabled")]
+    fn native_index_hints_follow_effective_filter(filter: ToolFilter, expected: bool) {
         let slots = ResolvedSlots::default();
         let filtered = slots.with_native_hints(&filter);
         let output = assemble(PromptId::System, &filtered, "");
         assert_eq!(output.contains(INDEX_TOOL_USAGE), expected);
-        assert_eq!(output.contains("task, file_index."), expected);
-    }
-
-    #[test_case(PromptId::Research ; "research")]
-    #[test_case(PromptId::General ; "general")]
-    fn task_prompts_do_not_recommend_the_main_only_task_tool(prompt: PromptId) {
-        let out = assemble(prompt, &ResolvedSlots::default(), "");
-        assert!(out.contains(&format!("{SUBAGENT_EFFICIENT_LINE}.")));
-        assert!(!out.contains(NATIVE_EFFICIENT_LINE));
+        assert_eq!(
+            output.contains(&format!("`{FILE_INDEX_TOOL_NAME}`.")),
+            expected
+        );
     }
 
     #[test]
@@ -1171,7 +1190,7 @@ mod tests {
         );
         let out = assemble(PromptId::Research, &s, "");
         assert!(!out.contains("DROPPED"));
-        assert!(out.contains(&format!("{SUBAGENT_EFFICIENT_LINE}, EXTRA.")));
+        assert!(out.contains(&format!("{EFFICIENT_TOOLS_LABEL} `EXTRA`.")));
     }
 
     #[test_case(PromptId::System, Slot::ToolUsage, true ; "system_tool_usage")]

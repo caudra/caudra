@@ -1631,10 +1631,12 @@ mod tests {
         ContextUsage, ContextWindow,
     };
     use crate::permissions::{PermissionManager, PermissionMode, PermissionRequest};
+    use crate::prompt::EFFICIENT_TOOLS_LABEL;
     use crate::tools::BATCH_TOOL_NAME;
     use crate::tools::DEADLINE_EXCEEDED;
     use crate::tools::registry::Tool;
     use crate::tools::test_support::NamedMock;
+    use crate::tools::{FILE_GREP_TOOL_NAME, TASK_TOOL_NAME};
     use crate::tools::{ToolEffect, audited_local_tool};
     use crate::{CancelToken, ToolDoneEvent, TurnCompleteEvent};
     use caudra_config::{PermissionsConfig, ToolKey};
@@ -2364,6 +2366,37 @@ mod tests {
                 .unwrap();
 
             assert_eq!(subagent.params.tool_filter.matches(tool), callable);
+            subagent.close();
+        });
+    }
+
+    /// The prompt is filtered by the child's audience like its tools are, so it
+    /// never recommends `task`, which only the main agent may call.
+    #[test]
+    fn a_task_is_only_recommended_tools_it_can_call() {
+        smol::block_on(async {
+            let ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            ctx.registry
+                .register_many([
+                    (
+                        Arc::new(NamedMock::new(FILE_GREP_TOOL_NAME, ToolAudience::all()))
+                            as Arc<dyn Tool>,
+                        NamedMock::source(),
+                    ),
+                    (
+                        Arc::new(NamedMock::new(TASK_TOOL_NAME, ToolAudience::MAIN))
+                            as Arc<dyn Tool>,
+                        NamedMock::source(),
+                    ),
+                ])
+                .unwrap();
+
+            let mut subagent = open_task(&ctx, task_options(Some(SubagentTaskMode::Build)))
+                .await
+                .unwrap();
+
+            let line = format!("{EFFICIENT_TOOLS_LABEL} `{FILE_GREP_TOOL_NAME}`.");
+            assert!(subagent.system.contains(&line), "{}", subagent.system);
             subagent.close();
         });
     }
