@@ -233,7 +233,7 @@ impl PermissionAuthorityLease for WorkcellAuthorityLease<'_> {
             .to_str()
             .ok_or_else(|| unavailable(NO_TEMPLATE))?;
         let input = json!({"command": source.command, "workdir": workdir});
-        let prepared = self.prepare(authority, &input)?;
+        let (_, prepared) = self.prepare(authority, &input)?;
         let PreparedExecution::Shell(_, shell) = prepared.execution else {
             return Err(unavailable(NO_TEMPLATE));
         };
@@ -283,25 +283,24 @@ impl PermissionAuthorityLease for WorkcellAuthorityLease<'_> {
                 plan_path: None,
             });
         }
-        let mut prepared = self.prepare(authority, input)?;
+        let (parsed, mut prepared) = self.prepare(authority, input)?;
         let runtime = &self.runtime.1;
         if runtime.mode.is_planning() {
-            if let PreparedExecution::Shell(_, shell) = &prepared.execution {
-                match shell_plan_access(shell) {
-                    PlanModeAccess::ReadOnly => {}
-                    PlanModeAccess::Prompted => prepared.intent.scopes.plan_scoped = true,
-                    PlanModeAccess::Refused | PlanModeAccess::Standard => {
+            match local_plan_access(&parsed, Some(&prepared.execution)) {
+                PlanModeAccess::ReadOnly => {}
+                PlanModeAccess::Prompted => prepared.intent.scopes.plan_scoped = true,
+                PlanModeAccess::Refused => return Err(unavailable(PLAN_RESTRICTED)),
+                PlanModeAccess::Standard => {
+                    if !authority.source.effect().is_safe_in_read_only()
+                        && (prepared.mutation_targets.is_empty()
+                            || prepared
+                                .mutation_targets
+                                .iter()
+                                .any(|target| Some(target.as_path()) != runtime.mode.plan_path()))
+                    {
                         return Err(unavailable(PLAN_RESTRICTED));
                     }
                 }
-            } else if !authority.source.effect().is_safe_in_read_only()
-                && (prepared.mutation_targets.is_empty()
-                    || prepared
-                        .mutation_targets
-                        .iter()
-                        .any(|target| Some(target.as_path()) != runtime.mode.plan_path()))
-            {
-                return Err(unavailable(PLAN_RESTRICTED));
             }
             if matches!(runtime.mode, AgentMode::RemotePlan(_))
                 && !authority.source.effect().is_safe_in_read_only()
@@ -347,11 +346,13 @@ impl WorkcellAuthorityLease<'_> {
         Ok(())
     }
 
+    /// The example parsed against the validated contract, and what preflight
+    /// made of it.
     fn prepare(
         &self,
         authority: &EditableAuthorityDescriptor,
         raw_input: &Value,
-    ) -> Result<PreparedInvocation, PermissionEditError> {
+    ) -> Result<(Input, PreparedInvocation), PermissionEditError> {
         self.validate_authority(authority)?;
         if serde_json::to_vec(raw_input).map_or(true, |input| input.len() > MAX_EXAMPLE_BYTES) {
             return Err(unavailable("Example exceeds the analysis bound"));
@@ -370,8 +371,9 @@ impl WorkcellAuthorityLease<'_> {
         let raw_input = raw_input.clone();
         let (sender, receiver) = flume::bounded(1);
         let handle = host.runtime.handle().clone();
+        let example = input.clone();
         let task = handle.spawn(async move {
-            let result = prepare_example(host, project, input, raw_input).await;
+            let result = prepare_example(host, project, example, raw_input).await;
             let _ = sender.send(result);
         });
         let result = receiver.recv_timeout(ANALYSIS_TIMEOUT);
@@ -385,7 +387,7 @@ impl WorkcellAuthorityLease<'_> {
                 crate::MISSING_READ_TARGET
             )));
         }
-        Ok(prepared)
+        Ok((input, prepared))
     }
 }
 
@@ -601,7 +603,24 @@ fn resource(
     }
 }
 
-pub(super) fn shell_plan_access(shell: &PreparedShell) -> PlanModeAccess {
+/// How a local call may proceed while planning, for the dispatch gate and the
+/// editor's analysis alike. A shell line is judged from the form preflight
+/// parsed it into, so a line that was never parsed is unreviewed and refused.
+/// Inspecting the execution environment runs fixed probes that can have
+/// effects, so planning runs it only under an authority the plan asked for.
+pub(super) fn local_plan_access(
+    input: &Input,
+    execution: Option<&PreparedExecution>,
+) -> PlanModeAccess {
+    match (input, execution) {
+        (Input::Shell(_), Some(PreparedExecution::Shell(_, shell))) => shell_plan_access(shell),
+        (Input::Shell(_), _) => PlanModeAccess::Refused,
+        (Input::Environment, _) => PlanModeAccess::Prompted,
+        _ => PlanModeAccess::Standard,
+    }
+}
+
+fn shell_plan_access(shell: &PreparedShell) -> PlanModeAccess {
     let read_only = shell.bash_program().ok().is_some_and(|program| {
         shell.bash_command_contexts().ok().is_some_and(|contexts| {
             let facts = pattern_analysis::shell_facts(program, &contexts);
@@ -910,6 +929,7 @@ mod tests {
     use crate::{WorkcellHost, pattern_analysis::shell_facts, read_only_shell};
 
     const SHELL: &str = "shell";
+    const ENVIRONMENT: &str = "execution_environment";
     const COMMAND: &str = "touch editor-sentinel";
     const PATTERN: &str = "touch *";
     const SENTINEL: &str = "editor-sentinel";
@@ -1728,6 +1748,31 @@ mod tests {
             );
         }
         assert!(!target.exists());
+    }
+
+    /// The editor previews an environment inspection the way dispatch runs
+    /// it: while planning it asks for the plan rather than being refused as a
+    /// write the plan file does not cover.
+    #[test_case(false; "building")]
+    #[test_case(true; "planning")]
+    fn environment_examples_ask_for_the_plan(planning: bool) {
+        let fixture = Fixture::new();
+        let plan = fixture.project().join(PLAN_DOCUMENT);
+        if planning {
+            let mut runtime = fixture.runtime();
+            runtime.mode = AgentMode::Plan(plan.clone());
+            fixture.context.replace(runtime).unwrap();
+        }
+        let lease = fixture.provider.acquire(&fixture.project()).unwrap();
+        let authority = lease
+            .catalog()
+            .authorities
+            .iter()
+            .find(|entry| entry.key == ENVIRONMENT)
+            .unwrap();
+        let analysis = lease.analyze_example(authority, &json!({})).unwrap();
+        assert_eq!(analysis.intent.scopes.plan_scoped, planning);
+        assert_eq!(analysis.plan_path, planning.then_some(plan));
     }
 
     #[test_case(None, false; "allow_matches")]

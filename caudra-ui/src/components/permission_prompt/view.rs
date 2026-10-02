@@ -1396,7 +1396,10 @@ impl PermissionPrompt {
                     hints.push(KeyHint::key("Tab", "next", KeyCode::Tab));
                 }
                 if self.scope_movable() {
-                    hints.push(KeyHint::inert("←→", "scope"));
+                    hints.extend([
+                        KeyHint::inert("←", "broader"),
+                        KeyHint::inert("→", "narrower"),
+                    ]);
                 }
                 if several {
                     hints.push(KeyHint::inert("<>", "all"));
@@ -1513,7 +1516,8 @@ pub(super) mod tests {
     const HEREDOC: &str = "python3 - <<'EOF'\nimport json, pathlib\nfor path in pathlib.Path(\"logs\").glob(\"*.json\"):\n    print(json.loads(path.read_text())[\"event\"])\nEOF";
     const HEREDOC_BODY: &str = "import json, pathlib";
     const PYTHON_KEYWORD: &str = "import";
-    const PAGE: &str = "https://docs.rs/ratatui/latest/ratatui/widgets/struct.Paragraph.html";
+    pub(crate) const PAGE: &str =
+        "https://docs.rs/ratatui/latest/ratatui/widgets/struct.Paragraph.html";
     pub(crate) const OUTSIDE_FILE: &str = "/etc/caudra/caudra.toml";
     const READ_CONTRACT: &str = "file.read.v1";
     const WORKCELL_OWNER: &str = "workcell";

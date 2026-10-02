@@ -1680,10 +1680,10 @@ mod learned_scope_tests {
         assert_eq!(defaults(&request), [prefix]);
     }
 
-    /// `→` walks a row's ladder from narrow to wide, so every rung reaches the
+    /// A row's ladder is listed narrowest first, so every rung reaches the
     /// commands the rung before it reached, and more.
     #[test]
-    fn right_arrow_always_widens() {
+    fn every_rung_reaches_past_the_rung_before_it() {
         let mut request = prepared(observation(PACKAGE));
         request.add_pattern_candidates(&learned_candidates().into(), &[None]);
         let mut other_operation = observation(PACKAGE);

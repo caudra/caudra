@@ -2867,23 +2867,15 @@ impl ToolInvocation for WorkcellInvocation {
         self.prepared_targets(|prepared| &prepared.read_targets)
     }
 
-    /// A shell line is judged from its parsed form, which only exists once
-    /// `preflight` has run. Reaching here without it means the parse never
-    /// happened, so the line is unreviewed and refused.
     fn plan_mode_access(&self) -> PlanModeAccess {
-        if !matches!(self.input, Input::Shell(_)) {
-            return PlanModeAccess::Standard;
-        }
-        match self
+        let prepared = self
             .prepared
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .as_ref()
-            .map(|prepared| &prepared.execution)
-        {
-            Some(PreparedExecution::Shell(_, shell)) => editor_adapter::shell_plan_access(shell),
-            _ => PlanModeAccess::Refused,
-        }
+            .unwrap_or_else(|error| error.into_inner());
+        editor_adapter::local_plan_access(
+            &self.input,
+            prepared.as_ref().map(|prepared| &prepared.execution),
+        )
     }
 
     /// A shell line counts as read-only only when preflight proved every one of
@@ -4938,12 +4930,16 @@ mod tests {
         PermissionCapabilityFamily, PermissionError, PermissionExecutorKind, PermissionLifetime,
         PermissionManager, PermissionMode, PermissionRequest, PermissionResourceAccess,
         PermissionResourceKind, PermissionResourceSelector, PermissionRowGrant, PermissionSubject,
-        ScriptLanguage, permission_rule_covers_request, permission_rule_covers_resource,
+        PromptReason, ScriptLanguage, permission_rule_covers_request,
+        permission_rule_covers_resource,
         review::{COMMAND_TEMPLATE_EXECUTION_NOTICE, review_for_rule},
     };
     use caudra_agent::template::Vars;
     use caudra_agent::tools::execution::configure_tools;
-    use caudra_agent::tools::{Deadline, FileReadTracker, STALE_READ_MSG, interpreter_ctx};
+    use caudra_agent::tools::{
+        Deadline, FileReadTracker, PLAN_WRITE_RESTRICTED, READ_ONLY_TOOL_RESTRICTED,
+        STALE_READ_MSG, interpreter_ctx,
+    };
     use caudra_agent::{
         AgentMode, ContentBlock, Envelope, EventSender, History, Mention, Message, StoredSession,
         TaskCard, ToolFilter,
@@ -5023,6 +5019,9 @@ mod tests {
     /// The descriptor pretty-prints to about 170 lines on a populated host; a
     /// rendering that ever approached that would have stopped being one.
     const ENVIRONMENT_MAX_MODEL_LINES: usize = 40;
+    const ENVIRONMENT_TOOL: &str = "execution_environment";
+    const STATE_DIRECTORY: &str = "state";
+    const PLAN_FILE: &str = "plan.md";
     const REMOTE_ENVIRONMENT_MODEL_TEXT: &str = "authoritative remote environment text";
     /// Output that names every failure class, so a result is proven to be
     /// placed by Workcell's flags rather than by what the command printed.
@@ -6479,17 +6478,15 @@ mod tests {
         confined_read_preflight_rows(root.path(), command)
     }
 
-    #[test_case("execution_environment")]
+    /// The probes can have effects, so the call keeps its effect and its exact
+    /// authority, names no file it writes, and asks while planning.
+    #[test_case(ENVIRONMENT_TOOL)]
     fn environment_preflight_keeps_explicit_authority(tool: &str) {
         let root = TempDir::new().expect("tempdir");
         let (_host, registry) = host_and_registry(root.path());
         let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
-        let invocation = registry
-            .get(tool)
-            .expect("registered tool")
-            .tool
-            .parse(&json!({}))
-            .expect("valid input");
+        let entry = registry.get(tool).expect("registered tool");
+        let invocation = entry.tool.parse(&json!({})).expect("valid input");
         let intent = smol::block_on(invocation.preflight(&ctx))
             .expect("preflight")
             .expect("permission intent");
@@ -6505,10 +6502,9 @@ mod tests {
                 .attributes
                 .contains_key(CONFINED_READ_ATTRIBUTE)
         );
-        assert!(!matches!(
-            invocation.plan_mode_access(),
-            PlanModeAccess::ReadOnly
-        ));
+        assert_eq!(entry.effect_for(invocation.as_ref()), ToolEffect::Mutating);
+        assert!(invocation.mutation_targets(&ctx).is_empty());
+        assert_eq!(invocation.plan_mode_access(), PlanModeAccess::Prompted);
     }
 
     /// Plan mode gates on `is_read_only` alone, with no confinement check, so
@@ -9058,6 +9054,149 @@ mod tests {
 
         assert!(done.is_error);
         assert!(!target.exists());
+    }
+
+    /// How a dispatched environment inspection settled: what it returned,
+    /// what it asked, and how many rules it left behind.
+    struct EnvironmentDispatch {
+        done: caudra_agent::ToolDoneEvent,
+        prompts: Vec<PermissionRequest>,
+        stored_rules: usize,
+    }
+
+    impl EnvironmentDispatch {
+        fn inspected(&self) -> bool {
+            matches!(self.done.output, ToolOutput::Environment { .. })
+        }
+    }
+
+    /// Dispatches an environment inspection, answering any prompt with
+    /// `answer`. Without one there is nobody to ask.
+    fn dispatch_environment(
+        mode: AgentMode,
+        permission_mode: PermissionMode,
+        deny: bool,
+        answer: Option<PermissionAnswer>,
+    ) -> EnvironmentDispatch {
+        let root = TempDir::new().expect("tempdir");
+        let (_host, registry) = host_and_registry(root.path());
+        let permissions = Arc::new(PermissionManager::new_persistent_in(
+            PermissionsConfig {
+                default: DefaultEffect::Prompt,
+                rules: deny
+                    .then(|| PermissionRule {
+                        tool: ToolKey::native(ENVIRONMENT_TOOL),
+                        scope: Some(ENVIRONMENT_TOOL.into()),
+                        effect: Effect::Deny,
+                    })
+                    .into_iter()
+                    .collect(),
+                ..PermissionsConfig::default()
+            },
+            root.path().to_path_buf(),
+            Arc::default(),
+            StateDir::from_path(root.path().join(STATE_DIRECTORY)),
+        ));
+        permissions.set_seed_mode(permission_mode);
+        let (tx, events) = flume::unbounded::<Envelope>();
+        let (_responses, responses) = flume::unbounded();
+        let ctx = interpreter_ctx(
+            &mode,
+            &EventSender::new(tx, 0),
+            CancelToken::none(),
+            Arc::clone(&permissions),
+            Arc::new(FileReadTracker::new()),
+            answer
+                .is_some()
+                .then(|| Arc::new(AsyncMutex::new(responses))),
+            Arc::clone(&registry),
+        );
+        let mut prompts = Vec::new();
+        let done = smol::block_on(future::or(
+            tool_dispatch::run(
+                &registry,
+                None,
+                ENVIRONMENT_TOOL.into(),
+                ENVIRONMENT_TOOL,
+                &json!({}),
+                &ctx,
+                Emit::Silent,
+            ),
+            async {
+                loop {
+                    let event = events.recv_async().await.expect("agent events");
+                    if let AgentEvent::PermissionRequest(request) = event.event {
+                        if let Some(answer) = &answer {
+                            assert!(permissions.answer(&request.id, answer.clone()));
+                        }
+                        prompts.push(*request);
+                    }
+                }
+            },
+        ));
+        EnvironmentDispatch {
+            done,
+            prompts,
+            stored_rules: permissions
+                .structured_rule_inventory()
+                .expect("rule inventory")
+                .len(),
+        }
+    }
+
+    fn planning() -> AgentMode {
+        AgentMode::Plan(PathBuf::from(PLAN_FILE))
+    }
+
+    /// The probes can have effects, so an inspection asks first. While
+    /// planning it asks for the plan rather than being refused as a write the
+    /// plan file does not cover. Returns whether it inspected.
+    #[test_case(planning(), PermissionAnswer::AllowOnce => true; "planning_allowed_once")]
+    #[test_case(planning(), PermissionAnswer::Deny => false; "planning_refused")]
+    #[test_case(AgentMode::Build, PermissionAnswer::AllowOnce => true; "building_allowed_once")]
+    fn an_environment_inspection_asks_first(mode: AgentMode, answer: PermissionAnswer) -> bool {
+        let planning = mode.is_planning();
+        let dispatch = dispatch_environment(mode, PermissionMode::Ask, false, Some(answer));
+        let text = dispatch.done.output.as_text();
+        let asked_for_the_plan: Vec<_> = dispatch
+            .prompts
+            .iter()
+            .map(|request| request.presentation.reason == PromptReason::Plan)
+            .collect();
+
+        assert_eq!(asked_for_the_plan, [planning], "{text}");
+        assert_ne!(dispatch.done.is_error, dispatch.inspected(), "{text}");
+        assert!(!text.contains(PLAN_WRITE_RESTRICTED), "{text}");
+        assert_eq!(dispatch.stored_rules, 0);
+        dispatch.inspected()
+    }
+
+    /// YOLO answers for the plan and keeps nothing. A deny still outranks it,
+    /// nobody to ask means no, and a strict read-only agent never inspects.
+    /// Returns whether it inspected.
+    #[test_case(planning(), PermissionMode::Yolo, false => true; "planning_under_yolo")]
+    #[test_case(planning(), PermissionMode::Yolo, true => false; "deny_outranks_yolo")]
+    #[test_case(planning(), PermissionMode::Ask, false => false; "nobody_to_ask")]
+    #[test_case(AgentMode::ReadOnly, PermissionMode::Yolo, false => false; "read_only_refuses")]
+    fn an_environment_inspection_settles_without_asking(
+        mode: AgentMode,
+        permission_mode: PermissionMode,
+        deny: bool,
+    ) -> bool {
+        let read_only = mode.is_read_only();
+        let dispatch = dispatch_environment(mode, permission_mode, deny, None);
+        let text = dispatch.done.output.as_text();
+
+        assert!(dispatch.prompts.is_empty(), "{text}");
+        assert_ne!(dispatch.done.is_error, dispatch.inspected(), "{text}");
+        assert!(!text.contains(PLAN_WRITE_RESTRICTED), "{text}");
+        assert_eq!(
+            text.starts_with(READ_ONLY_TOOL_RESTRICTED),
+            read_only,
+            "{text}"
+        );
+        assert_eq!(dispatch.stored_rules, 0);
+        dispatch.inspected()
     }
 
     fn glob_output(count: usize, total: usize, scan_complete: bool) -> FileGlobOutput {

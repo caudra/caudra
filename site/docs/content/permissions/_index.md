@@ -82,11 +82,11 @@ A prompt asks one question, such as `Allow shell command?` or `Allow fetching a 
 │    3. Yes, and always allow ‹cargo test *› in this project                   │
 │    4. No, and tell the agent what to do instead                              │
 │                                                                              │
-│  ←→ scope  e customize  ? details  Esc no                                    │
+│  ← broader  → narrower  e customize  ? details  Esc no                       │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
-The phrase between `‹` and `›` is the scope a remembered answer covers. A command offers `this exact command`, any suggested templates such as `cargo check -p <pattern1>`, and its token prefixes from the longest to the shortest, such as `cargo test -p caudra-agent *`, `cargo test *`, and `cargo *`. It starts on a suggested template, else on the [derived prefix](#shell-parsing), else on the exact command. A web page starts on `this page and below`, and a file read on `this file`. `Left` and `Right` narrow or widen the scope before you answer, and the answers change with it. Blanket grants such as `any shell command` are offered only in [Customize](#customize).
+The phrase between `‹` and `›` is the scope a remembered answer covers. A command offers `this exact command`, any suggested templates such as `cargo check -p <pattern1>`, and its token prefixes from the longest to the shortest, such as `cargo test -p caudra-agent *`, `cargo test *`, and `cargo *`. It starts on a suggested template, else on the [derived prefix](#shell-parsing), else on the exact command. A web page starts on `this page and below`, and a file read on `this file`. `Left` broadens the scope and `Right` narrows it before you answer, and the answers change with it. Blanket grants such as `any shell command` are offered only in [Customize](#customize).
 
 Warnings appear above the answers as `⚠` lines. They name a protected path, a line Caudra cannot check command by command, the reach of the selected scope, or a [decision engine](#decision-engine-advice) caution such as `⚠ May delete files (88%)`. A muted line explains an unusual reason for asking, such as `Plan mode asks before anything it can't prove read-only.` or a line starting with `Auto asked:`. Details gives the usual reason.
 
@@ -106,9 +106,9 @@ The `No` answer opens a one-line field for guidance. `Enter` sends the guidance 
 | `y` / `s` / `a` / `n` | Yes, allow for this conversation, allow in this project, or No with guidance. A letter does nothing when its answer is not offered |
 | `Up` / `Down`, `k` / `j` | Move the highlight |
 | `Enter` | Choose the highlighted answer |
-| `Left` / `Right` | Narrow or widen the scope of the focused command |
+| `Left` / `Right` | Broaden or narrow the scope of the focused command |
 | `Tab` / `Shift-Tab` | Focus the next or previous new command of a [batch](#per-command-scopes) |
-| `<` / `>` | Narrow or widen every new command of a batch |
+| `<` / `>` | Broaden or narrow every new command of a batch |
 | `e` | Open [Customize](#customize), or the [step-through](#step-through) when several commands need an answer |
 | `?` | Open or close [Details](#details) |
 | `PageUp` / `PageDown` | Scroll a prompt that does not fit |
@@ -119,9 +119,9 @@ Answers and footer keys also take mouse clicks. A click counts when the press an
 
 For eligible reads, the scope starts on `this file` or `these files`. This remembers the resource rather than the full input, so reading the same file with another `offset` or `limit` does not need a new grant. Exact-path search grants still constrain the search expression. The exact-call authority continues to require the complete original input. Protected paths, remote requests, plan restrictions, and unavailable persistence can limit the offered scopes and lifetimes.
 
-A filesystem scope is a ladder. Its narrowest rung covers the directories the request touched, and each step up covers the directory above, as far as the filesystem root. `Left` and `Right` walk it, so widening changes the reach the answers name rather than adding answers to scroll through. A rung reaching outside the repository adds `⚠ Outside this repository`. A rung that takes in your home directory adds a red `⚠ Outside your home directory` and needs [confirmation](#confirming-broad-grants).
+A filesystem scope is a ladder. Its narrowest rung covers the directories the request touched, and each step up covers the directory above, as far as the filesystem root. `Left` steps up to the directory above and `Right` steps back down, so widening changes the reach the answers name rather than adding answers to scroll through. A rung reaching outside the repository adds `⚠ Outside this repository`. A rung that takes in your home directory adds a red `⚠ Outside your home directory` and needs [confirmation](#confirming-broad-grants).
 
-A URL scope is a ladder too, walked one path segment at a time, so a page can be scoped to the section it sits in. A request for `https://example.com/path/to/sub/page` starts on `this page and below`, which covers `https://example.com/path/to/sub/page/**`. It widens through `pages under example.com/path/to/sub/` and `pages under example.com/path/` to `any page on example.com`. The scheme is shown only when it is not `https`. A path deeper than eight segments offers its eight deepest prefixes and the origin. A URL with no path offers the origin alone. `any public web page` reaches other origins, is offered only in Customize, and needs [confirmation](#confirming-broad-grants).
+A URL scope is a ladder too, walked one path segment at a time, so a page can be scoped to the section it sits in. A request for `https://example.com/path/to/sub/page` starts on `this page and below`, which covers `https://example.com/path/to/sub/page/**`. `Left` widens it through `pages under example.com/path/to/sub/` and `pages under example.com/path/` to `any page on example.com`, and `Right` walks back toward the page. The scheme is shown only when it is not `https`. A path deeper than eight segments offers its eight deepest prefixes and the origin. A URL with no path offers the origin alone. `any public web page` reaches other origins, is offered only in Customize, and needs [confirmation](#confirming-broad-grants).
 
 Multiple requests are queued by request ID. A subtask request cannot replace a prompt from the main agent or another subtask. `Yes` resolves only the selected request.
 
@@ -225,7 +225,7 @@ A shell line can run several commands. When it does, the prompt gives each comma
 │    3. Yes, and always allow these 3 commands in this project                 │
 │    4. No, and tell the agent what to do instead                              │
 │                                                                              │
-│  Tab next  ←→ scope  <> all  e one by one  ? details  Esc no                 │
+│  Tab next  ← broader  → narrower  <> all  e one by one  ? details  Esc no    │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -237,7 +237,7 @@ A shell line can run several commands. When it does, the prompt gives each comma
 
 More than three allowed rows fold into one line, such as `+ 5 already allowed`, and Details lists them.
 
-`▸` marks the focused row. `Tab` and `Shift-Tab` move between the new rows, `Left` and `Right` walk the focused row's ladder, and `<` and `>` move every new row one step. A row at the end of its ladder stays put. Each ladder runs narrowest first: `this time only`, `this exact command`, suggested templates, then token prefixes from the longest to the shortest. The shortest prefix names the program alone, such as `cargo *`, and needs [confirmation](#confirming-broad-grants). A row starts on its suggested template, else on its derived prefix, else on the exact command.
+`▸` marks the focused row. `Tab` and `Shift-Tab` move between the new rows. `Left` moves the focused row one step broader and `Right` one step narrower, and `<` and `>` do the same for every new row. A row at the end of its ladder stays put. Each ladder runs narrowest first: `this time only`, `this exact command`, suggested templates, then token prefixes from the longest to the shortest. The shortest prefix names the program alone, such as `cargo *`, and needs [confirmation](#confirming-broad-grants). A row starts on its suggested template, else on its derived prefix, else on the exact command.
 
 Answers 2 and 3 count the rows they remember, as in `these 3 commands`, or name the scope when only one row is remembered. With every row on `this time only`, they are left out. Answer 2 remembers each row for this conversation, and answer 3 in this project. The [step-through](#step-through) gives each command its own lifetime.
 
@@ -717,7 +717,7 @@ The initial working directory is context, not confinement. An approved shell com
 
 The builtin read-only classifier is conservative about mutation flags, executable paths, expansions, and named file operands. For example, `git branch -D`, tag creation, and reflog expiration do not receive read-only authority. A path-qualified executable such as `./cat` does not inherit the builtin reader allowance, and an explicitly named protected operand such as `.env` requires review. These checks do not guarantee containment of recursive reads, program configuration, or repository code. Build and test commands are not read-only exemptions.
 
-`execution_environment` still requires explicit approval under normal prompting policy. Its fixed probes can invoke sudo policy hooks or refresh credentials. A remembered exact grant can avoid repeated prompts without treating the tool as a pure read.
+`execution_environment` still requires explicit approval under normal prompting policy. Its fixed probes can invoke sudo policy hooks or refresh credentials. A remembered exact grant can avoid repeated prompts without treating the tool as a pure read. Plan mode asks before running it as well, and [Plan mode](#plan-mode) describes which grants apply there.
 
 ## Plugin rules
 
@@ -804,6 +804,6 @@ Use [`caudra decisions`](/docs/cli/#caudra-decisions) to inspect configuration a
 
 An explicit `/yolo` choice is stored with the root conversation. A user-created fork and `/new` start without that explicit state. `--yolo` selects YOLO at startup.
 
-YOLO approves each call once and stores no rule, so turning it off brings back the prompts your rules do not cover. In plan mode it also skips the prompts for commands plan mode cannot prove read-only and for `send_message`. Plan mode still refuses what it always refuses, such as file writes outside the plan.
+YOLO approves each call once and stores no rule, so turning it off brings back the prompts your rules do not cover. In plan mode it also skips the prompts for commands plan mode cannot prove read-only, for `send_message`, and for `execution_environment`. Plan mode still refuses what it always refuses, such as file writes outside the plan.
 
 Decision-engine screening never interrupts YOLO, including in plan mode. Engine advice is not shown in YOLO. Deterministic denies and hard capability restrictions still apply.

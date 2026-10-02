@@ -283,7 +283,7 @@ impl PermissionPrompt {
                 None
             }
             KeyCode::Left | KeyCode::Right => {
-                self.widen_focused(key.code == KeyCode::Right);
+                self.widen_focused(key.code == KeyCode::Left);
                 None
             }
             KeyCode::Tab | KeyCode::BackTab => {
@@ -291,7 +291,7 @@ impl PermissionPrompt {
                 None
             }
             KeyCode::Char(bracket @ ('<' | '>')) => {
-                self.widen_all(bracket == '>');
+                self.widen_all(bracket == '<');
                 None
             }
             KeyCode::Char('e') => {
@@ -555,7 +555,7 @@ impl PermissionPrompt {
         }
     }
 
-    fn widen_focused(&mut self, forward: bool) {
+    fn widen_focused(&mut self, broader: bool) {
         if self.opacity().is_some() {
             return;
         }
@@ -563,22 +563,22 @@ impl PermissionPrompt {
             let Some(row) = self.focus_row else {
                 return;
             };
-            self.widen_row(row, forward)
+            self.widen_row(row, broader)
         } else {
-            self.widen_authority(forward)
+            self.widen_authority(broader)
         };
         if changed {
             self.scope_changed();
         }
     }
 
-    fn widen_all(&mut self, forward: bool) {
+    fn widen_all(&mut self, broader: bool) {
         if !self.per_row() || self.opacity().is_some() {
             return;
         }
         let mut changed = false;
         for row in self.new_rows() {
-            changed |= self.widen_row(row, forward);
+            changed |= self.widen_row(row, broader);
         }
         if changed {
             self.scope_changed();
@@ -794,12 +794,12 @@ mod tests {
 
     use super::super::choices::Choice;
     use super::super::decision::tests::{commands_request, native_shell_request};
-    use super::super::decision::{default_grant, grant_option};
+    use super::super::decision::{default_grant, grant_option, row_positions};
     use super::super::step_through::PageItem;
     use super::super::view::tests::{
-        BATCH, OUTSIDE_FILE, ROOMY_HEIGHT, ROOMY_WIDTH, SINGLE_COMMAND, advised, batch_request,
-        cover, fetch_request, file_request, heredoc_request, key, planning, prompt_for, prose,
-        render, shell_prompt,
+        BATCH, OUTSIDE_FILE, PAGE, ROOMY_HEIGHT, ROOMY_WIDTH, SINGLE_COMMAND, advised,
+        batch_request, cover, fetch_request, file_request, heredoc_request, key, planning,
+        prompt_for, prose, render, shell_prompt,
     };
     use super::super::view::{PRESS_AGAIN, REARM_MESSAGE};
     use super::super::{
@@ -827,6 +827,7 @@ mod tests {
         "rustfmt --edition 2024 *",
         "rustfmt *",
     ];
+    const SUBTREE_SUFFIX: &str = "/**";
     const UNMATCHED_PATTERN: &str = "git *";
     const MATCHING_PATTERN: &str = "cargo test -p *";
     const SHORTCUT_LETTERS: &str = "yn?e";
@@ -965,8 +966,8 @@ mod tests {
         assert!(!keeps_for_the_project(broad));
     }
 
-    /// `→` walks a row out through every ancestor of its command to the bare
-    /// executable, and `←` walks it back.
+    /// `←` walks a row out through every ancestor of its command to the bare
+    /// executable, and `→` walks it back.
     #[test]
     fn arrows_walk_a_row_through_its_ancestors() {
         let mut prompt = prompt_for(native_shell_request(RUSTFMT_CHECK));
@@ -974,7 +975,7 @@ mod tests {
         let start = prompt.row_grants()[0].clone();
         let mut walked = vec![start.clone()];
         for _ in 1..RUSTFMT_LADDER.len() {
-            assert!(prompt.handle_key(key(KeyCode::Right)).is_none());
+            assert!(prompt.handle_key(key(KeyCode::Left)).is_none());
             draw(&mut prompt);
             walked.push(prompt.row_grants()[0].clone());
         }
@@ -988,15 +989,61 @@ mod tests {
             })
             .collect();
         assert_eq!(scopes, RUSTFMT_LADDER.map(Some));
-        for _ in 1..RUSTFMT_LADDER.len() {
-            prompt.handle_key(key(KeyCode::Left));
+        assert!(prompt.handle_key(key(KeyCode::Left)).is_none());
+        assert_eq!(prompt.row_grants()[0], *walked.last().unwrap());
+        for _ in 0..RUSTFMT_LADDER.len() {
             draw(&mut prompt);
+            prompt.handle_key(key(KeyCode::Right));
         }
         assert_eq!(prompt.row_grants()[0], start);
     }
 
-    #[test_case(native_shell_request(SINGLE_COMMAND), KeyCode::Left, KeyCode::Right; "command_row_narrows")]
-    #[test_case(fetch_request(), KeyCode::Right, KeyCode::Left; "web_page_widens")]
+    /// The folder or URL prefix the chosen scope covers, or `target` itself on
+    /// the rung that names it exactly.
+    fn scope_root(prompt: &PermissionPrompt, target: &str) -> String {
+        let group = prompt.chosen_authority().unwrap().group.as_ref().unwrap();
+        group
+            .value
+            .strip_suffix(SUBTREE_SUFFIX)
+            .unwrap_or(target)
+            .to_owned()
+    }
+
+    /// `←` moves a subtree's scope to its parent until the ladder ends, and
+    /// `→` walks it back to the target the request named. A key pressed at
+    /// either end leaves the scope where it is.
+    #[test_case(fetch_request(), PAGE; "web_page")]
+    #[test_case(file_request(OUTSIDE_FILE, PermissionResourceAccess::Read), OUTSIDE_FILE; "file")]
+    fn left_moves_a_subtree_toward_its_parent(request: PermissionRequest, target: &str) {
+        let mut prompt = prompt_for(request);
+        let mut walk = |code| {
+            let mut roots = vec![scope_root(&prompt, target)];
+            loop {
+                draw(&mut prompt);
+                assert!(prompt.handle_key(key(code)).is_none());
+                let root = scope_root(&prompt, target);
+                if root == *roots.last().unwrap() {
+                    return roots;
+                }
+                roots.push(root);
+            }
+        };
+        assert_eq!(walk(KeyCode::Right), [target]);
+        let parents = walk(KeyCode::Left);
+        assert!(parents.len() > 2, "{parents:?}");
+        for pair in parents.windows(2) {
+            assert!(
+                pair[0].starts_with(&pair[1]) && pair[0] != pair[1],
+                "{parents:?}"
+            );
+        }
+        let back: Vec<_> = parents.iter().rev().cloned().collect();
+        assert_eq!(walk(KeyCode::Right), back);
+    }
+
+    #[test_case(native_shell_request(SINGLE_COMMAND), KeyCode::Right, KeyCode::Left; "command_row_narrows")]
+    #[test_case(fetch_request(), KeyCode::Left, KeyCode::Right; "web_page_widens")]
+    #[test_case(file_request(OUTSIDE_FILE, PermissionResourceAccess::Read), KeyCode::Left, KeyCode::Right; "file_widens")]
     fn arrows_change_scope_without_answering(
         request: PermissionRequest,
         there: KeyCode,
@@ -1015,24 +1062,50 @@ mod tests {
         assert_eq!(prompt.choice_answer(Choice::Conversation), answer);
     }
 
+    /// Where each row stands on its ladder, from 0 on its narrowest position,
+    /// and how many positions the ladder has.
+    fn rungs(prompt: &PermissionPrompt) -> Vec<(usize, usize)> {
+        let request = prompt.current().unwrap();
+        (0..BATCH.len())
+            .map(|row| {
+                let grant = prompt.row_grant(row);
+                let positions = row_positions(request, row, &grant, prompt.batch());
+                let index = positions.iter().position(|position| *position == grant);
+                (index.unwrap(), positions.len())
+            })
+            .collect()
+    }
+
+    /// `>` moves every new row one step narrower and `<` one step broader.
+    /// Rows a rule already covers stay put, and so does a row at the end of
+    /// its ladder.
     #[test]
     fn angle_brackets_move_every_new_row() {
         let mut prompt = prompt_for(batch_request());
         draw(&mut prompt);
         let defaults = prompt.row_grants();
         let new_rows = prompt.new_rows();
-        assert!(prompt.handle_key(key(KeyCode::Char('<'))).is_none());
-        let narrowed = prompt.row_grants();
-        for row in 0..BATCH.len() {
-            assert_eq!(
-                narrowed[row] != defaults[row],
-                new_rows.contains(&row),
-                "row {row}"
-            );
+        let start = rungs(&prompt);
+        assert!(prompt.handle_key(key(KeyCode::Char('>'))).is_none());
+        for (row, (index, _)) in rungs(&prompt).into_iter().enumerate() {
+            let step = usize::from(new_rows.contains(&row));
+            assert_eq!(index + step, start[row].0, "row {row}");
         }
         draw(&mut prompt);
-        assert!(prompt.handle_key(key(KeyCode::Char('>'))).is_none());
+        assert!(prompt.handle_key(key(KeyCode::Char('<'))).is_none());
         assert_eq!(prompt.row_grants(), defaults);
+        for _ in 0..REPEAT_COUNT {
+            draw(&mut prompt);
+            prompt.handle_key(key(KeyCode::Char('<')));
+        }
+        for (row, (index, len)) in rungs(&prompt).into_iter().enumerate() {
+            let top = if new_rows.contains(&row) {
+                len - 1
+            } else {
+                start[row].0
+            };
+            assert_eq!(index, top, "row {row}");
+        }
     }
 
     #[test]
@@ -1516,7 +1589,7 @@ mod tests {
         let request = commands_request(&PAIR);
         let mut prompt = prompt_for(request.clone());
         draw(&mut prompt);
-        assert!(prompt.handle_key(key(KeyCode::Left)).is_none());
+        assert!(prompt.handle_key(key(KeyCode::Right)).is_none());
         let chosen = prompt.row_grant(0);
         assert_ne!(chosen, default_grant(&request, 0));
 
@@ -1529,7 +1602,7 @@ mod tests {
             prompt.row_grant(1),
             Some(PermissionRowGrant::Offered(exact))
         );
-        assert_eq!(prompt.input_freshness.blocked_key, Some(KeyCode::Left));
+        assert_eq!(prompt.input_freshness.blocked_key, Some(KeyCode::Right));
 
         let Some(PermissionRowGrant::Offered(id)) = chosen else {
             panic!("row 0 was not moved to an offered rung: {chosen:?}");
