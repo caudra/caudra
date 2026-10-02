@@ -1,4 +1,4 @@
-# opencode dark -- palette sourced from opencode's default TUI theme
+# caudra-dark -- palette sourced from opencode's default TUI theme
 # (packages/tui/src/theme/assets/opencode.json, "dark" branch).
 # Each palette entry is commented with the opencode def or theme key it maps to.
 #

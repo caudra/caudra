@@ -12,7 +12,7 @@ use syntect::highlighting::{
 };
 
 /// Applied on first run and whenever no theme has been picked or configured.
-pub const DEFAULT_THEME: &str = "opencode";
+pub const DEFAULT_THEME: &str = "caudra-dark";
 const MESSAGE_BACKGROUND_TINT: f32 = 0.08;
 const ELEMENT_BACKGROUND_TINT: f32 = 0.1;
 const PANEL_BACKGROUND_TINT: f32 = 0.04;
@@ -185,12 +185,12 @@ pub static THEME_PAIRS: &[ThemePair] = &[
         light: "catppuccin_latte",
     },
     ThemePair {
-        dark: "gruvbox",
-        light: "gruvbox_light",
+        dark: "caudra-dark",
+        light: "caudra-light",
     },
     ThemePair {
-        dark: "opencode",
-        light: "opencode_light",
+        dark: "gruvbox",
+        light: "gruvbox_light",
     },
     ThemePair {
         dark: "rose_pine",
@@ -239,6 +239,14 @@ pub static BUNDLED_THEMES: &[ThemeEntry] = &[
     ThemeEntry {
         name: "catppuccin_mocha",
         toml: include_str!("themes/catppuccin_mocha.toml"),
+    },
+    ThemeEntry {
+        name: "caudra-dark",
+        toml: include_str!("themes/caudra-dark.toml"),
+    },
+    ThemeEntry {
+        name: "caudra-light",
+        toml: include_str!("themes/caudra-light.toml"),
     },
     ThemeEntry {
         name: "dark_daltonized",
@@ -303,14 +311,6 @@ pub static BUNDLED_THEMES: &[ThemeEntry] = &[
     ThemeEntry {
         name: "onedark",
         toml: include_str!("themes/onedark.toml"),
-    },
-    ThemeEntry {
-        name: "opencode",
-        toml: include_str!("themes/opencode.toml"),
-    },
-    ThemeEntry {
-        name: "opencode_light",
-        toml: include_str!("themes/opencode_light.toml"),
     },
     ThemeEntry {
         name: "rose_pine",
@@ -722,10 +722,11 @@ fn contrast_floor(role: &str) -> f32 {
 ///
 /// The accent is the first choice, but it is chosen to stand against the theme
 /// background and nothing else, so on a selected row it lands on the selection
-/// bar instead. Every bundled theme misses the text floor that way, and the two
-/// opencode themes tint with the very colour the bar is painted in. Where the
-/// accent cannot be read, the row keeps its own already-clamped foreground and
-/// the match is carried by weight and an underline, which no palette can erase.
+/// bar instead. Every bundled theme misses the text floor that way, and
+/// `caudra-dark` and `caudra-light` tint with the very colour the bar is
+/// painted in. Where the accent cannot be read, the row keeps its own
+/// already-clamped foreground and the match is carried by weight and an
+/// underline, which no palette can erase.
 fn derive_match_style(base: Style, accent: Style, background: Color) -> Style {
     let tint = match (accent.fg, base.bg.unwrap_or(background)) {
         (Some(Color::Rgb(fr, fg, fb)), Color::Rgb(br, bg, bb))
@@ -1270,10 +1271,10 @@ mod tests {
     /// Reads `[palette]` rather than the constructed `Theme`, because
     /// `ensure_contrast` lifts any role that misses its floor. Asserting the
     /// built styles would pin this test to our contrast floor instead of to
-    /// opencode's values: `opencode_light` publishes `accent` at 2.75:1 on
+    /// opencode's values: its light theme publishes `accent` at 2.75:1 on
     /// white, so every role drawn from it renders slightly darker than the def.
     #[test_case(
-        "opencode",
+        "caudra-dark",
         &[
             ("background", 0x0a, 0x0a, 0x0a),
             ("foreground", 0xee, 0xee, 0xee),
@@ -1289,7 +1290,7 @@ mod tests {
     )]
     // opencode swaps the two hues between branches: primary is blue here.
     #[test_case(
-        "opencode_light",
+        "caudra-light",
         &[
             ("background", 0xff, 0xff, 0xff),
             ("foreground", 0x1a, 0x1a, 0x1a),
@@ -1303,7 +1304,7 @@ mod tests {
         ];
         "light"
     )]
-    fn opencode_palette_matches_upstream_defs(name: &str, expected: &[(&str, u8, u8, u8)]) {
+    fn caudra_palette_matches_opencode_defs(name: &str, expected: &[(&str, u8, u8, u8)]) {
         let palette = bundled_palette(name);
         for (key, r, g, b) in expected {
             assert_eq!(
@@ -1316,9 +1317,9 @@ mod tests {
 
     /// Background roles never pass through `ensure_contrast`, so these stay on
     /// the constructed theme where they also cover the wiring.
-    #[test_case("opencode", 0x0a, 0x0a, 0x0a, 0x14, 0x14, 0x14; "dark")]
-    #[test_case("opencode_light", 0xff, 0xff, 0xff, 0xfa, 0xfa, 0xfa; "light")]
-    fn opencode_panel_lands_on_background_panel(
+    #[test_case("caudra-dark", 0x0a, 0x0a, 0x0a, 0x14, 0x14, 0x14; "dark")]
+    #[test_case("caudra-light", 0xff, 0xff, 0xff, 0xfa, 0xfa, 0xfa; "light")]
+    fn caudra_panel_lands_on_background_panel(
         name: &str,
         br: u8,
         bg: u8,
@@ -1335,8 +1336,8 @@ mod tests {
     }
 
     #[test]
-    fn opencode_diff_backgrounds_match_upstream_defs() {
-        let t = bundled("opencode");
+    fn caudra_diff_backgrounds_match_opencode_defs() {
+        let t = bundled("caudra-dark");
         assert_eq!(t.diff_old.bg, Some(Color::Rgb(0x37, 0x22, 0x2c)));
         assert_eq!(t.diff_new.bg, Some(Color::Rgb(0x20, 0x30, 0x3b)));
     }
@@ -1374,8 +1375,8 @@ mod tests {
         assert_eq!(pair.dark, DEFAULT_THEME);
     }
 
-    #[test_case("opencode", "opencode", "opencode_light"; "dark_half_finds_pair")]
-    #[test_case("opencode_light", "opencode", "opencode_light"; "light_half_finds_pair")]
+    #[test_case("caudra-dark", "caudra-dark", "caudra-light"; "dark_half_finds_pair")]
+    #[test_case("caudra-light", "caudra-dark", "caudra-light"; "light_half_finds_pair")]
     #[test_case("gruvbox_light", "gruvbox", "gruvbox_light"; "light_only_name")]
     fn pair_for_resolves_either_half(name: &str, dark: &str, light: &str) {
         let pair = pair_for(name).unwrap_or_else(|| panic!("'{name}' must resolve to a pair"));
@@ -1390,9 +1391,9 @@ mod tests {
         assert!(pair_for(name).is_none());
     }
 
-    #[test_case("opencode", Color::Rgb(0xfa, 0xb2, 0x83), Color::Rgb(0x9d, 0x7c, 0xd8), Color::Rgb(0x5c, 0x9c, 0xf5); "dark")]
-    #[test_case("opencode_light", Color::Rgb(0x3b, 0x7d, 0xd8), Color::Rgb(0xd6, 0x8c, 0x27), Color::Rgb(0x7b, 0x5b, 0xb6); "light")]
-    fn opencode_mode_colors_come_from_palette(name: &str, build: Color, plan: Color, bash: Color) {
+    #[test_case("caudra-dark", Color::Rgb(0xfa, 0xb2, 0x83), Color::Rgb(0x9d, 0x7c, 0xd8), Color::Rgb(0x5c, 0x9c, 0xf5); "dark")]
+    #[test_case("caudra-light", Color::Rgb(0x3b, 0x7d, 0xd8), Color::Rgb(0xd6, 0x8c, 0x27), Color::Rgb(0x7b, 0x5b, 0xb6); "light")]
+    fn caudra_mode_colors_come_from_palette(name: &str, build: Color, plan: Color, bash: Color) {
         let t = bundled(name);
         assert_eq!(t.mode_build, build);
         assert_eq!(t.mode_plan, plan);
@@ -1611,7 +1612,7 @@ mod tests {
     /// Matched characters are painted over the row they sit in, so the selected
     /// variant is measured against the selection bar and not the background.
     /// Every bundled theme fails that when the accent is used unconditionally,
-    /// and the opencode pair tints with the bar's own colour.
+    /// and the caudra pair tints with the bar's own colour.
     #[test]
     fn bundled_themes_match_highlight_is_readable() {
         for entry in BUNDLED_THEMES {
@@ -1656,10 +1657,10 @@ mod tests {
         }
     }
 
-    /// Both opencode themes name one colour for `accent` and for the selection
+    /// Both caudra themes name one colour for `accent` and for the selection
     /// bar, so the tint is exactly the bar it lands on and has to be given up.
-    #[test_case("opencode"; "dark")]
-    #[test_case("opencode_light"; "light")]
+    #[test_case("caudra-dark"; "dark")]
+    #[test_case("caudra-light"; "light")]
     fn colliding_accent_falls_back_to_modifiers(name: &str) {
         let t = bundled(name);
         assert_eq!(t.item_match_selected.fg, t.item_selected.fg);

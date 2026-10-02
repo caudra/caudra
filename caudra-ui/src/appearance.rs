@@ -365,8 +365,8 @@ mod tests {
     use crate::repaint::expect;
     use crate::theme::{self, ThemePair};
 
-    const DARK_THEME: &str = "opencode";
-    const LIGHT_THEME: &str = "opencode_light";
+    const DARK_THEME: &str = "caudra-dark";
+    const LIGHT_THEME: &str = "caudra-light";
     const MANUAL_THEME: &str = "dracula";
     const INVALID_THEME: &str = "\0invalid_theme";
     const OTHER_PAIR: ThemePair = ThemePair {
@@ -539,7 +539,7 @@ mod tests {
 
     #[test_case(b"\x1b]11;rgb:0000/0000/0000\x07", Some((0x00, 0x00, 0x00)); "16_bit_black")]
     #[test_case(b"\x1b]11;rgb:ffff/ffff/ffff\x07", Some((0xff, 0xff, 0xff)); "16_bit_white")]
-    #[test_case(b"\x1b]11;rgb:0a0a/0a0a/0a0a\x07", Some((0x0a, 0x0a, 0x0a)); "16_bit_opencode_dark")]
+    #[test_case(b"\x1b]11;rgb:0a0a/0a0a/0a0a\x07", Some((0x0a, 0x0a, 0x0a)); "16_bit_caudra_dark")]
     #[test_case(b"\x1b]11;rgb:ff/ff/ff\x1b\\", Some((0xff, 0xff, 0xff)); "8_bit_st_terminated")]
     #[test_case(b"\x1b]11;rgb:1a/1a/1a\x07", Some((0x1a, 0x1a, 0x1a)); "8_bit_dark")]
     #[test_case(b"\x1b]11;rgb:f/f/f\x07", Some((0xff, 0xff, 0xff)); "4_bit_white")]
@@ -731,8 +731,8 @@ mod tests {
         assert_eq!(auto.applied, background);
     }
 
-    #[test_case(0x0a, 0x0a, 0x0a, Appearance::Dark; "opencode_dark_background")]
-    #[test_case(0xff, 0xff, 0xff, Appearance::Light; "opencode_light_background")]
+    #[test_case(0x0a, 0x0a, 0x0a, Appearance::Dark; "caudra_dark_background")]
+    #[test_case(0xff, 0xff, 0xff, Appearance::Light; "caudra_light_background")]
     #[test_case(0x28, 0x2a, 0x36, Appearance::Dark; "dracula_background")]
     #[test_case(0xf8, 0xf9, 0xfa, Appearance::Light; "ayu_light_background")]
     #[test_case(0x7f, 0x7f, 0x7f, Appearance::Dark; "one_step_below_mid_gray")]

@@ -146,8 +146,8 @@ mod tests {
     use crossterm::event::KeyCode;
     use test_case::test_case;
 
-    const DARK_THEME: &str = "opencode";
-    const LIGHT_THEME: &str = "opencode_light";
+    const DARK_THEME: &str = "caudra-dark";
+    const LIGHT_THEME: &str = "caudra-light";
 
     #[test_case(key(KeyCode::Esc); "escape")]
     #[test_case(kb::QUIT.to_key_event(); "ctrl_c")]
