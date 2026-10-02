@@ -48,8 +48,8 @@ use caudra_agent::patch;
 use caudra_agent::permissions::pattern_recognition::ObservationProvenance;
 use caudra_agent::permissions::{
     COMMAND_OBSERVATION_BINDING_ATTRIBUTE, CONFINED_READ_ATTRIBUTE, CONFINED_READ_VALUE,
-    PermissionAuthorityProfile, PermissionResource, PermissionResourceAccess,
-    PermissionResourceKind, PermissionRisk, RemotePermissionIdentity,
+    OPACITY_ATTRIBUTE, PermissionAuthorityProfile, PermissionResource, PermissionResourceAccess,
+    PermissionResourceKind, PermissionRisk, RemotePermissionIdentity, ShellOpacity,
     filesystem_permission_resource, prepared_command_binding, shell_permission_scope,
 };
 use caudra_agent::tools::{
@@ -1031,7 +1031,7 @@ enum PreparedExecution {
     FilePatch(FileToolGroup, PreparedFilePatch),
     Websearch(PreparedWebsearch),
     Webfetch(PreparedWebfetch),
-    Shell(ShellToolGroup, PreparedShell),
+    Shell(ShellToolGroup, Box<PreparedShell>),
     CodeGraph(Arc<CodeGraphToolGroup>),
     Environment(Arc<ExecutionEnvironment>),
     None,
@@ -2048,7 +2048,7 @@ fn remote_shell_plan_access(call: &RemotePreparedToolCall) -> PlanModeAccess {
         .is_some_and(|program| {
             let contexts = remote_shell_contexts(&program, cwd);
             let facts = pattern_analysis::shell_facts(&program, &contexts);
-            !facts.opaque()
+            facts.opacity.is_none()
                 && !facts.commands.is_empty()
                 && facts
                     .commands
@@ -3171,7 +3171,7 @@ impl WorkcellInvocation {
                     .host
                     .run(ctx, move |token| async move {
                         group
-                            .execute_prepared(prepared, token, Some(progress))
+                            .execute_prepared(*prepared, token, Some(progress))
                             .await
                     })
                     .await
@@ -3771,7 +3771,7 @@ fn shell_prepared(
 ) -> Result<PreparedInvocation, ToolError> {
     let raw_input = raw_input
         .filter(|input| input.get("command").and_then(Value::as_str) == Some(shell.command()));
-    let mut opaque = true;
+    let mut opacity = Some(ShellOpacity::Unparsed);
     let mut resources = Vec::new();
     let mut scopes = Vec::new();
     if let Ok(program) = shell.bash_program() {
@@ -3789,8 +3789,8 @@ fn shell_prepared(
             .bash_command_contexts()
             .unwrap_or_else(|_| program.command_contexts(shell.workdir()));
         let facts = pattern_analysis::shell_facts(program, &contexts);
-        opaque = facts.opaque();
-        if !opaque
+        opacity = facts.opacity;
+        if !facts.opaque
             && redirect != ShellNativeRedirect::Off
             && let Some(natives) = native_redirect::detect(&facts.commands)
         {
@@ -3827,27 +3827,28 @@ fn shell_prepared(
                 NORMALIZED_COMMAND_ATTRIBUTE.into(),
                 command.scope.normalized.clone(),
             );
-            if !opaque {
-                if command.context.is_some_and(|context| {
+            if opacity.is_none()
+                && command.context.is_some_and(|context| {
                     read_only_shell::confined_read(&command.scope, &context.incoming, project)
-                }) {
-                    attributes.insert(CONFINED_READ_ATTRIBUTE.into(), CONFINED_READ_VALUE.into());
-                }
-                if let Some(raw_input) = raw_input
-                    && let Some(mut observation) = pattern_analysis::command_observation(
-                        program,
-                        command,
-                        shell.workdir(),
-                        project,
-                        ObservationProvenance::Native,
-                    )
-                {
-                    let binding = prepared_command_binding(&command.scope.source, raw_input);
-                    observation.source.input_hash = binding.clone();
-                    if let Ok(observation) = serde_json::to_string(&observation) {
-                        attributes.insert(COMMAND_OBSERVATION_ATTRIBUTE.into(), observation);
-                        attributes.insert(COMMAND_OBSERVATION_BINDING_ATTRIBUTE.into(), binding);
-                    }
+                })
+            {
+                attributes.insert(CONFINED_READ_ATTRIBUTE.into(), CONFINED_READ_VALUE.into());
+            }
+            if !facts.opaque
+                && let Some(raw_input) = raw_input
+                && let Some(mut observation) = pattern_analysis::command_observation(
+                    program,
+                    command,
+                    shell.workdir(),
+                    project,
+                    ObservationProvenance::Native,
+                )
+            {
+                let binding = prepared_command_binding(&command.scope.source, raw_input);
+                observation.source.input_hash = binding.clone();
+                if let Ok(observation) = serde_json::to_string(&observation) {
+                    attributes.insert(COMMAND_OBSERVATION_ATTRIBUTE.into(), observation);
+                    attributes.insert(COMMAND_OBSERVATION_BINDING_ATTRIBUTE.into(), binding);
                 }
             }
             scopes.push(shell_permission_scope(
@@ -3864,7 +3865,7 @@ fn shell_prepared(
             });
         }
     }
-    if opaque {
+    if let Some(opacity) = opacity {
         scopes.push(shell_permission_scope(shell.command(), shell.workdir()));
         resources.push(PermissionResource {
             kind: PermissionResourceKind::Command,
@@ -3872,10 +3873,13 @@ fn shell_prepared(
             access: Some(PermissionResourceAccess::Execute),
             protected: true,
             requires_prompt: true,
-            attributes: BTreeMap::from([(
-                "workdir".into(),
-                shell.workdir().to_string_lossy().into_owned(),
-            )]),
+            attributes: BTreeMap::from([
+                (
+                    "workdir".into(),
+                    shell.workdir().to_string_lossy().into_owned(),
+                ),
+                (OPACITY_ATTRIBUTE.into(), opacity.to_string()),
+            ]),
         });
     }
     Ok(PreparedInvocation {
@@ -3890,14 +3894,14 @@ fn shell_prepared(
                 plan_scoped: false,
             },
             resources,
-            if opaque {
+            if opacity.is_some() {
                 PermissionRisk::Critical
             } else {
                 PermissionRisk::High
             },
         )
         .with_authority(PermissionAuthorityProfile::Shell),
-        execution: PreparedExecution::Shell(group, shell),
+        execution: PreparedExecution::Shell(group, Box::new(shell)),
         // A command's writes are not knowable from its text, so shell neither
         // takes guards nor invalidates the tracker.
         mutation_targets: Vec::new(),
@@ -4924,11 +4928,11 @@ mod tests {
     use caudra_agent::cancel::CancelToken;
     use caudra_agent::permissions::pattern_recognition::{CommandObservation, ShellEffectStatus};
     use caudra_agent::permissions::{
-        COMMAND_EXACT_PREFIX, COMMAND_TEMPLATE_PREFIX, PermissionAnswer,
+        AutoNote, COMMAND_EXACT_PREFIX, COMMAND_TEMPLATE_PREFIX, ComposedRow, PermissionAnswer,
         PermissionCapabilityFamily, PermissionError, PermissionExecutorKind, PermissionLifetime,
-        PermissionManager, PermissionRequest, PermissionResourceAccess, PermissionResourceKind,
-        PermissionResourceSelector, PermissionRowGrant, PermissionSubject,
-        permission_rule_covers_request, permission_rule_covers_resource,
+        PermissionManager, PermissionMode, PermissionRequest, PermissionResourceAccess,
+        PermissionResourceKind, PermissionResourceSelector, PermissionRowGrant, PermissionSubject,
+        ScriptLanguage, permission_rule_covers_request, permission_rule_covers_resource,
         review::{COMMAND_TEMPLATE_EXECUTION_NOTICE, review_for_rule},
     };
     use caudra_agent::template::Vars;
@@ -5000,6 +5004,10 @@ mod tests {
     const BROWSE_CONTENT_SENTINEL: &str = "content_not_authorized_by_a_names_only_grant";
     const PATTERN_PACKAGES: [&str; 3] = ["alpha", "beta", "gamma"];
     const PATTERN_COMMAND: &str = "cargo check -p alpha --tests";
+    const INTERPRETER_SIBLING: &str = "cargo check -p core && python3 -c 'print(1)'";
+    const INLINE_PYTHON: ShellOpacity = ShellOpacity::InlineScript {
+        language: ScriptLanguage::Python,
+    };
     const PATTERN_TIMEOUT_SECS: u64 = 1;
     const DEADLINE_COMMAND: &str = "cargo test";
     const DEADLINE_CODE: &str = "21 * 2";
@@ -6235,6 +6243,63 @@ mod tests {
         );
     }
 
+    /// Only the resource standing for the whole line says why the line could
+    /// not be reviewed; the commands inside it, and a line that could be, say
+    /// nothing.
+    #[test_case("git status --short", None; "a_reviewable_line")]
+    #[test_case("git status > status.txt", Some(ShellOpacity::Redirect); "a_redirect")]
+    #[test_case("sudo ls", Some(ShellOpacity::Privilege); "privilege")]
+    #[test_case("bash -c 'cargo test'", Some(ShellOpacity::InlineScript { language: ScriptLanguage::Shell }); "shell_code")]
+    #[test_case("python3 -c 'print(1)'", Some(INLINE_PYTHON); "interpreter_code")]
+    #[test_case("echo $(date)", Some(ShellOpacity::Dynamic); "a_substitution")]
+    #[test_case("cat <<'EOF'\nnotes\nEOF\n", Some(ShellOpacity::Redirect); "a_heredoc")]
+    fn only_the_whole_line_resource_names_its_opacity(
+        command: &str,
+        expected: Option<ShellOpacity>,
+    ) {
+        let root = TempDir::new().expect("tempdir");
+        let intent = shell_preflight_intent(root.path(), command);
+        let named: Vec<_> = intent
+            .resources
+            .iter()
+            .filter_map(|resource| {
+                ShellOpacity::of(resource).map(|opacity| {
+                    (
+                        resource.value.as_str(),
+                        resource.protected && resource.requires_prompt,
+                        opacity,
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(
+            named,
+            Vec::from_iter(expected.map(|opacity| (command, true, opacity)))
+        );
+    }
+
+    /// Interpreter code makes the line ask as a whole, yet the command beside
+    /// it is still exactly what runs, so pattern learning keeps observing it.
+    #[test]
+    fn interpreter_code_leaves_sibling_commands_observed() {
+        let root = TempDir::new().expect("tempdir");
+        let intent = shell_preflight_intent(root.path(), INTERPRETER_SIBLING);
+        let whole_line = intent.resources.last().expect("whole line resource");
+        assert_eq!(whole_line.value, INTERPRETER_SIBLING);
+        assert_eq!(ShellOpacity::of(whole_line), Some(INLINE_PYTHON));
+        let observed: Vec<_> = intent
+            .resources
+            .iter()
+            .filter_map(|resource| resource.attributes.get(COMMAND_OBSERVATION_ATTRIBUTE))
+            .map(|json| {
+                CommandObservation::from_json(json)
+                    .expect("observation")
+                    .argv
+            })
+            .collect();
+        assert_eq!(observed, [["cargo", "check", "-p", "core"]]);
+    }
+
     /// The classifier's answer has to reach the permission layer or it only ever
     /// gated plan mode. This attribute is what the builtin allow rule keys on,
     /// so marking a line is the whole difference between running and asking.
@@ -6245,6 +6310,9 @@ mod tests {
     #[test_case("sed -n '1,140p' Cargo.toml" => true ; "a sed script that only prints")]
     #[test_case("cd src && rg -n needle ." => true ; "a move into the project before reading")]
     #[test_case("git log --oneline -3 2>/dev/null | head -20" => true ; "a read that discards its stderr")]
+    #[test_case("python3 --version" => true ; "a version probe")]
+    #[test_case("command -v rg" => true ; "a name lookup")]
+    #[test_case("type -t rg" => true ; "a lookup of what a name is")]
     #[test_case("cd /tmp && cat x" => false ; "a move out of it")]
     #[test_case("sed -i 's/a/b/' Cargo.toml" => false ; "a sed script that writes in place")]
     #[test_case("cat /etc/shadow" => false ; "a read that leaves the project")]
@@ -7172,7 +7240,7 @@ mod tests {
                         template.group.as_ref().and_then(|group| group.resource),
                         Some(cargo_index)
                     );
-                    assert!(!template.is_default);
+                    assert!(template.is_default);
                     assert!(
                         template.rule.resources[0]
                             .attributes
@@ -7180,18 +7248,18 @@ mod tests {
                             .all(|name| name == "workdir")
                     );
                     let mut rows = vec![None; offered.resources.len()];
-                    rows[cargo_index] = Some(PermissionRowGrant::Offered(template.id.clone()));
+                    rows[cargo_index] = Some(ComposedRow {
+                        grant: PermissionRowGrant::Offered(template.id.clone()),
+                        lifetime: PermissionLifetime::Project,
+                    });
                     assert_eq!(
                         offered
-                            .composed_rules(&rows, &PermissionLifetime::Project)
+                            .composed_rules(&rows)
                             .expect("composed template")
                             .len(),
                         1
                     );
-                    PermissionAnswer::AllowComposed {
-                        rows,
-                        lifetime: PermissionLifetime::Project,
-                    }
+                    PermissionAnswer::AllowComposed { rows }
                 } else {
                     assert!(template.is_none());
                     PermissionAnswer::AllowOnce
@@ -7387,6 +7455,51 @@ mod tests {
         *offered
     }
 
+    /// What the shell reads off a line decides whether Auto may ever screen
+    /// it: privilege, indirection, and a line it cannot parse always ask, while
+    /// a line it merely could not review waits for an engine.
+    #[test_case("sudo ls", AutoNote::AlwaysAsks(ShellOpacity::Privilege); "sudo")]
+    #[test_case("doas ls", AutoNote::AlwaysAsks(ShellOpacity::Privilege); "doas")]
+    #[test_case("su -c ls", AutoNote::AlwaysAsks(ShellOpacity::Privilege); "su")]
+    #[test_case("eval x", AutoNote::AlwaysAsks(ShellOpacity::Indirect); "eval")]
+    #[test_case("source env.sh", AutoNote::AlwaysAsks(ShellOpacity::Indirect); "source")]
+    #[test_case(". ./env.sh", AutoNote::AlwaysAsks(ShellOpacity::Indirect); "dot")]
+    #[test_case("bash -c 'sudo ls'", AutoNote::AlwaysAsks(ShellOpacity::Privilege); "privilege_in_shell_code")]
+    #[test_case("env sudo ls", AutoNote::AlwaysAsks(ShellOpacity::Privilege); "privilege_behind_env")]
+    #[test_case("xargs -n 1 sudo rm", AutoNote::AlwaysAsks(ShellOpacity::Privilege); "privilege_behind_xargs")]
+    #[test_case("for f in a; do sudo ls; done", AutoNote::AlwaysAsks(ShellOpacity::Privilege); "privilege_in_a_loop")]
+    #[test_case("echo $(sudo ls)", AutoNote::AlwaysAsks(ShellOpacity::Privilege); "privilege_in_a_substitution")]
+    #[test_case("python3 - <<'PY'\nprint(1)\nPY\n", AutoNote::EngineNeeded; "a_heredoc_script_waits_for_an_engine")]
+    #[test_case("for f in a b; do wc -l $f; done", AutoNote::EngineNeeded; "a_loop_waits_for_an_engine")]
+    #[test_case("cargo check &&", AutoNote::AlwaysAsks(ShellOpacity::Unparsed); "a_syntax_error")]
+    #[test_case("$EDITOR notes.md", AutoNote::AlwaysAsks(ShellOpacity::Unparsed); "a_dynamic_executable")]
+    #[test_case("git status > status.txt", AutoNote::EngineNeeded; "a_screenable_line_waits_for_an_engine")]
+    fn auto_always_asks_for_privilege_indirect_and_unparsed(command: &str, note: AutoNote) {
+        smol::block_on(async {
+            let root = TempDir::new().expect("project");
+            let (_host, registry) = host_and_registry(root.path());
+            let manager = PermissionManager::new_nonpersistent(
+                PermissionsConfig {
+                    decision_engine: true,
+                    ..PermissionsConfig::default()
+                },
+                root.path().to_path_buf(),
+                Arc::default(),
+            );
+            manager.set_session_mode(Some(PermissionMode::Auto));
+            let request = prepared_shell_request(
+                root.path(),
+                &registry,
+                json!({"command": command}),
+                command,
+            )
+            .await;
+            let offered =
+                prompted_shell_request(&manager, &request, |_| PermissionAnswer::AllowOnce).await;
+            assert_eq!(offered.presentation.auto, Some(note));
+        });
+    }
+
     #[test]
     fn generic_shell_templates_require_consent_and_respect_explicit_regex_domains() {
         smol::block_on(async {
@@ -7426,8 +7539,8 @@ mod tests {
                     .find(|option| option.id.starts_with(COMMAND_TEMPLATE_PREFIX));
                 assert_eq!(template.is_some(), index + 1 == PATTERN_PACKAGES.len());
                 if let Some(template) = template {
-                    assert!(!template.is_default);
-                    assert!(template.label.contains(COMMAND_TEMPLATE_EXECUTION_NOTICE));
+                    assert!(template.is_default);
+                    assert!(!template.label.contains(COMMAND_TEMPLATE_EXECUTION_NOTICE));
                     assert!(
                         template
                             .description
@@ -7499,21 +7612,23 @@ mod tests {
                 edited.slots[0].domain = ArgumentDomain::Regex {
                     pattern: GENERIC_NAME_REGEX.into(),
                 };
-                let tuple_rows = [Some(PermissionRowGrant::Pattern {
-                    option_id: template.id.clone(),
-                    definition: edited.clone(),
-                })];
+                let row = |definition| {
+                    vec![Some(ComposedRow {
+                        grant: PermissionRowGrant::Pattern {
+                            option_id: template.id.clone(),
+                            definition,
+                        },
+                        lifetime: PermissionLifetime::Conversation,
+                    })]
+                };
                 let tuple_rules = offered
-                    .composed_rules(&tuple_rows, &PermissionLifetime::Conversation)
+                    .composed_rules(&row(edited.clone()))
                     .expect("tuple-bound regex");
                 assert!(!permission_rule_covers_request(&tuple_rules[0], &unseen));
                 edited.combinations = SlotCombinations::Independent;
-                let rows = vec![Some(PermissionRowGrant::Pattern {
-                    option_id: template.id.clone(),
-                    definition: edited,
-                })];
+                let rows = row(edited);
                 let rules = offered
-                    .composed_rules(&rows, &PermissionLifetime::Conversation)
+                    .composed_rules(&rows)
                     .expect("explicit regex domain");
                 assert!(permission_rule_covers_request(&rules[0], &unseen));
                 let review = review_for_rule(offered, &rules[0]);
@@ -7523,10 +7638,7 @@ mod tests {
                     .expect("edited template review");
                 assert!(label.contains(COMMAND_TEMPLATE_EXECUTION_NOTICE));
                 assert!(label.contains(GENERIC_NAME_REGEX));
-                PermissionAnswer::AllowComposed {
-                    rows,
-                    lifetime: PermissionLifetime::Conversation,
-                }
+                PermissionAnswer::AllowComposed { rows }
             })
             .await;
             let saved = manager.structured_rule_inventory().expect("explicit grant");

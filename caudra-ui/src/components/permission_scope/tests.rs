@@ -29,11 +29,12 @@ use test_case::test_case;
 use unicode_width::UnicodeWidthStr;
 
 use super::model::{
-    ANY_RESOURCES, OPAQUE, PROTECTED_RISK, SOURCE_RISK, ScopeModel, UNCONSTRAINED_INPUT,
+    ANY_RESOURCES, FIXED_VALUE, PROTECTED_RISK, SOURCE_RISK, ScopeModel, UNCONSTRAINED_INPUT,
     UNKNOWN_ROLE_RISK, rule_kind,
 };
-use super::view::{Disclosure, ScopeControl, ScopeView};
+use super::view::{ALLOWED_COMBINATIONS, Disclosure, ScopeControl, ScopeView};
 use crate::components::buffer_text;
+use crate::components::permission_prompt::{assert_plain, buffer_rows};
 use crate::theme;
 
 const WORKDIR: &str = "/work/repository";
@@ -50,6 +51,8 @@ const SHORT_SCOPE_HEIGHT: u16 = 10;
 const EXECUTE_TARGET: &str = "1 Command/execute";
 const PAGE_UP: &str = "[PgUp]";
 const PAGE_DOWN: &str = "[PgDn]";
+const ALL_OF_TARGET: &str = "Target 1 · Command · all of:";
+const ANY_OF_TARGETS: &str = "Targets (1) · any of:";
 
 fn mixed_risk_record() -> PermissionRuleRecord {
     let mut record = record(true);
@@ -132,7 +135,7 @@ fn all_of_selection_does_not_break_repeated_slot_equality(width: u16) {
         assert_eq!(linked.len(), 2);
         view.activate(ScopeControl::Disclosure(Disclosure::Conditions));
         let conditions = render(&model, &mut view, width, name);
-        assert!(buffer_text(&conditions).contains("ALL OF · target 1"));
+        assert!(buffer_text(&conditions).contains(ALL_OF_TARGET));
         assert_eq!(view.slot, Some(SlotId(1)));
         for area in linked {
             for x in area.x..area.right() {
@@ -362,11 +365,39 @@ fn authority_is_typed_not_reconstructed_from_review(template_rule: bool) {
     let text = buffer_text(&render(&model, &mut ScopeView::default(), 80, "ayu_dark"));
     assert!(!text.contains(DISPLAY_ONLY));
     if !template_rule {
-        assert!(text.contains(OPAQUE));
+        assert!(text.contains(FIXED_VALUE));
     }
     let mut view = ScopeView::default();
     view.disclosure = Some(Disclosure::Evidence);
     assert!(buffer_text(&render(&model, &mut view, 80, "ayu_dark")).contains(DISPLAY_ONLY));
+}
+
+#[test_case(40; "narrow")]
+#[test_case(80; "normal")]
+#[test_case(140; "wide")]
+fn scope_views_never_show_internal_terms(width: u16) {
+    for (fixture, record) in [
+        ("fixed", record(false)),
+        ("template", record(true)),
+        ("risks", mixed_risk_record()),
+        ("remote", remote_record()),
+    ] {
+        let model = ScopeModel::record(Arc::new(record));
+        for name in ["ayu_dark", "ayu_light"] {
+            for disclosure in [
+                None,
+                Some(Disclosure::Conditions),
+                Some(Disclosure::Combinations),
+                Some(Disclosure::Identity),
+                Some(Disclosure::Evidence),
+            ] {
+                let mut view = ScopeView::default();
+                view.disclosure = disclosure;
+                let buffer = render(&model, &mut view, width, name);
+                assert_plain(&buffer_rows(&buffer), fixture);
+            }
+        }
+    }
 }
 
 #[test_case(false; "same_target_click")]
@@ -405,8 +436,8 @@ fn keyboard_inspects_first_typed_slot(code: KeyCode) {
     assert_eq!(view.slot, Some(SlotId(1)));
     view.disclosure = Some(Disclosure::Combinations);
     let text = buffer_text(&render(&model, &mut view, 80, "ayu_dark"));
-    assert!(text.contains("ANY OF"));
-    assert!(text.contains("ALL OF"));
+    assert!(text.contains(ANY_OF_TARGETS));
+    assert!(text.contains(ALLOWED_COMBINATIONS));
     assert!(text.contains("src/main.rs"));
 }
 

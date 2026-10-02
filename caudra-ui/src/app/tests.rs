@@ -45,6 +45,7 @@ use caudra_agent::permissions::pattern_recognition::{
 };
 use caudra_agent::permissions::{
     PermissionManager, PermissionRequest, PermissionResourceSelector, PermissionRuleRecord,
+    RuleOrigin,
 };
 use caudra_agent::tools::native::plan::{self, PlanTarget, PlanWriteResult};
 use caudra_agent::tools::profile_policy::PLAN_MODE_REQUIRED;
@@ -168,8 +169,10 @@ const PROJECT_PERMISSION_TEST_SCOPE: &str = "cargo check -p caudra-ui";
 const REPORTED_PERMISSION_FIRST: &str = "physical-first";
 const REPORTED_PERMISSION_SECOND: &str = "physical-second";
 const REPORTED_PERMISSION_COMMAND: &str = "cargo check";
-const PERMISSION_TITLE: &str = "Permission required";
-const PERMISSION_ALLOW_HINT: &str = "[y Once]";
+const PERMISSION_TITLE: &str = "Allow shell command?";
+const PERMISSION_ALLOW_HINT: &str = "1. Yes";
+const PERMISSION_GUIDANCE_KEY: char = 'n';
+const PERMISSION_GUIDANCE_PROMPT: &str = "› ";
 const PERMISSION_EDITOR_DRAFT: &str = "unsaved editor text";
 const REPEAT_FIELD_TEXT: &str = "repeat field";
 const REPEAT_WORDS: &str = "alpha beta";
@@ -12046,7 +12049,7 @@ fn remote_cd_persistence_failure_preserves_live_state() {
         .permissions
         .active_policy()
         .into_iter()
-        .map(|entry| (entry.source, entry.rule))
+        .map(|entry| (entry.origin, entry.rule))
         .collect();
     let temp = TempDir::new().unwrap();
     let blocked = temp.path().join("not-a-directory");
@@ -12087,7 +12090,7 @@ fn remote_cd_persistence_failure_preserves_live_state() {
         app.permissions
             .active_policy()
             .into_iter()
-            .map(|entry| (entry.source, entry.rule))
+            .map(|entry| (entry.origin, entry.rule))
             .collect::<Vec<_>>(),
         old_policy
     );
@@ -15532,7 +15535,7 @@ fn trusting_project_permission_config_refreshes_picker() {
     assert!(app.permissions_picker.is_open());
     assert!(!app.permissions_picker.discovery_mode());
     assert!(app.permissions.active_policy().iter().any(|policy| {
-        policy.source == "configuration"
+        policy.origin == RuleOrigin::Config
             && policy.rule.tool == ToolKey::native("bash")
             && policy.rule.effect == Effect::Allow
             && policy.rule.scope.as_deref() == Some(PROJECT_PERMISSION_TEST_SCOPE)
@@ -15551,7 +15554,7 @@ fn trusting_project_permission_config_refreshes_picker() {
         .unwrap();
     let screen = buffer_text(terminal.backend().buffer());
     assert!(!screen.contains("no authority has been granted"));
-    assert!(screen.contains("shell allow patterns are active"));
+    assert!(screen.contains("Shell allow patterns are active"));
     assert!(screen.contains("Trust or revoke"));
     assert!(!screen.contains("needs review"));
 
@@ -15562,7 +15565,7 @@ fn trusting_project_permission_config_refreshes_picker() {
         })
         .unwrap();
     let screen = buffer_text(terminal.backend().buffer());
-    for visible in ["bash", "[policy] allow", "configuration", "read-only"] {
+    for visible in ["Allow  bash:", "configuration", "read-only"] {
         assert!(screen.contains(visible), "{visible}: {screen}");
     }
     for word in PROJECT_PERMISSION_TEST_SCOPE.split_whitespace() {
@@ -18712,9 +18715,11 @@ fn permission_guidance_owns_paste_instead_of_the_hidden_editor(workbench: bool) 
         vec![REPORTED_PERMISSION_COMMAND.into()],
         None,
     );
-    app.update(Msg::Key(key(KeyCode::Char('g'))));
+    app.update(Msg::Key(key(KeyCode::Char(PERMISSION_GUIDANCE_KEY))));
     app.update(Msg::Paste(REPORTED_PERMISSION_COMMAND.into()));
-    assert!(rendered(&mut app).contains(&format!("Guidance: {REPORTED_PERMISSION_COMMAND}")));
+    assert!(rendered(&mut app).contains(&format!(
+        "{PERMISSION_GUIDANCE_PROMPT}{REPORTED_PERMISSION_COMMAND}"
+    )));
     assert_eq!(
         app.input_box.expanded_text(),
         format!("{PERMISSION_EDITOR_DRAFT} ")
@@ -21513,7 +21518,10 @@ fn a_permission_prompt_is_visible_and_answerable_over_the_workbench() {
         None,
     );
 
-    assert!(rendered(&mut app).contains("bash"), "{OVERLAY_HIDDEN}");
+    assert!(
+        rendered(&mut app).contains(PERMISSION_TITLE),
+        "{OVERLAY_HIDDEN}"
+    );
 
     app.update(Msg::Key(kb::QUIT.to_key_event()));
 

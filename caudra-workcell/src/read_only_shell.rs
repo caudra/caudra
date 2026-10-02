@@ -17,6 +17,47 @@ use caudra_agent::permissions::{
 use workcell::shell::ShellCommandAnalysis;
 use workcell::shell::{ShellCommandScope, ShellWord, bash::BashCwdSet};
 
+use crate::pattern_analysis::versioned_interpreter;
+
+const VERSION_FLAG: &str = "--version";
+const VERSION_ONLY: &[&str] = &[VERSION_FLAG];
+/// Executables whose version flags only print, keyed by the name
+/// `versioned_interpreter` resolves to. A probe is one of these flags and
+/// nothing else. `python -v` starts a verbose REPL and `ruby -v` reads a
+/// program from stdin, so neither flag is listed.
+const VERSION_PROBES: &[(&str, &[&str])] = &[
+    ("python", &[VERSION_FLAG, "-V"]),
+    ("node", &[VERSION_FLAG, "-v"]),
+    ("npm", &[VERSION_FLAG, "-v"]),
+    ("pnpm", &[VERSION_FLAG, "-v"]),
+    ("yarn", &[VERSION_FLAG, "-v"]),
+    ("deno", VERSION_ONLY),
+    ("bun", VERSION_ONLY),
+    ("cargo", &[VERSION_FLAG, "-V"]),
+    ("rustc", &[VERSION_FLAG, "-V"]),
+    ("rustup", &[VERSION_FLAG, "-V"]),
+    ("go", &["version"]),
+    ("java", &["-version", VERSION_FLAG]),
+    ("ruby", VERSION_ONLY),
+    ("perl", &[VERSION_FLAG, "-v"]),
+    ("gcc", VERSION_ONLY),
+    ("clang", VERSION_ONLY),
+    ("make", VERSION_ONLY),
+    ("cmake", VERSION_ONLY),
+    (GIT, VERSION_ONLY),
+    ("just", VERSION_ONLY),
+    (RG, VERSION_ONLY),
+    ("jq", VERSION_ONLY),
+    ("uv", VERSION_ONLY),
+    ("pip", VERSION_ONLY),
+    ("pip3", VERSION_ONLY),
+    ("nix", VERSION_ONLY),
+    ("docker", VERSION_ONLY),
+];
+const LOOKUP_COMMAND: &str = "command";
+const LOOKUP_TYPE: &str = "type";
+const LOOKUP_FLAGS: &[&str] = &["-v", "-V"];
+const TYPE_FLAGS: &str = "afptP";
 const GIT: &str = "git";
 const GIT_READ_SUBCOMMANDS: &[&str] = &[
     "blame",
@@ -286,6 +327,7 @@ pub(crate) fn shell_read_only_verdict(scope: &ShellCommandScope) -> Result<(), N
     // question to the confinement check the way the permission path does.
     let arguments = literal_arguments(scope).ok_or(NotReadOnly::UndecodableWord)?;
     let read_only = match scope.executable.as_str() {
+        executable if version_probe(executable, &arguments) => true,
         GIT => git_is_read_only(&arguments),
         RG => !denies(&arguments, RG_DENIED_FLAGS) && no_attached_pattern_file(&arguments),
         GREP => {
@@ -305,6 +347,7 @@ pub(crate) fn shell_read_only_verdict(scope: &ShellCommandScope) -> Result<(), N
         "printf" => arguments
             .first()
             .is_some_and(|format| !format.starts_with('-') || *format == "--"),
+        executable @ (LOOKUP_COMMAND | LOOKUP_TYPE) => name_lookup(executable, &arguments),
         executable if READ_ONLY_COMMANDS.contains(&executable) => true,
         _ => return Err(NotReadOnly::UnknownCommand),
     };
@@ -313,6 +356,43 @@ pub(crate) fn shell_read_only_verdict(scope: &ShellCommandScope) -> Result<(), N
     } else {
         Err(NotReadOnly::UnsupportedInvocation)
     }
+}
+
+fn version_probe(executable: &str, arguments: &[&str]) -> bool {
+    let name = versioned_interpreter(executable).unwrap_or(executable);
+    let [flag] = arguments else {
+        return false;
+    };
+    VERSION_PROBES
+        .iter()
+        .any(|(probed, flags)| *probed == name && flags.contains(flag))
+}
+
+/// `command -v|-V NAME…` and `type [-afptP] NAME…` only report what each name
+/// resolves to.
+pub(crate) fn name_lookup(executable: &str, arguments: &[&str]) -> bool {
+    let names = match executable {
+        LOOKUP_COMMAND => match arguments {
+            [flag, names @ ..] if LOOKUP_FLAGS.contains(flag) => names,
+            _ => return false,
+        },
+        LOOKUP_TYPE => {
+            let flags = arguments
+                .iter()
+                .take_while(|argument| {
+                    argument.strip_prefix('-').is_some_and(|flags| {
+                        !flags.is_empty() && flags.chars().all(|flag| TYPE_FLAGS.contains(flag))
+                    })
+                })
+                .count();
+            &arguments[flags..]
+        }
+        _ => return false,
+    };
+    !names.is_empty()
+        && names
+            .iter()
+            .all(|name| !name.is_empty() && !name.starts_with('-'))
 }
 
 fn git_is_read_only(mut arguments: &[&str]) -> bool {
@@ -577,7 +657,7 @@ mod tests {
     #[test_case("diff a b", Err(NotReadOnly::UnknownCommand); "unknown_reader")]
     #[test_case("touch notes.md", Err(NotReadOnly::UnknownCommand); "unknown_writer")]
     #[test_case("env git status", Err(NotReadOnly::UnknownCommand); "environment_wrapper")]
-    #[test_case("command git status", Err(NotReadOnly::UnknownCommand); "command_wrapper")]
+    #[test_case("command git status", Err(NotReadOnly::UnsupportedInvocation); "command_wrapper")]
     #[test_case("bash -c 'git status'", Err(NotReadOnly::UnknownCommand); "shell_wrapper")]
     #[test_case("git push origin main", Err(NotReadOnly::UnsupportedInvocation); "writing_subcommand")]
     #[test_case("git clean -n", Err(NotReadOnly::UnsupportedInvocation); "unsupported_dry_run")]
@@ -593,13 +673,75 @@ mod tests {
     #[test_case("cat .env", Ok(()); "protected_path_is_not_a_scope_fact")]
     #[test_case("cat /etc/shadow", Ok(()); "confinement_is_not_a_scope_fact")]
     fn parsed_scope_verdicts(command: &str, expected: Result<(), NotReadOnly>) {
+        let scope = parsed_scope(command);
+        assert_eq!(shell_read_only_verdict(&scope), expected);
+        assert_eq!(scope_is_read_only(&scope), expected.is_ok());
+    }
+
+    fn parsed_scope(command: &str) -> ShellCommandScope {
         let program = parse_bash(command).unwrap();
         let contexts = program.command_contexts(Path::new(PROJECT));
-        let facts = shell_facts(&program, &contexts);
+        let mut facts = shell_facts(&program, &contexts);
         assert_eq!(facts.commands.len(), 1);
-        let scope = &facts.commands[0].scope;
-        assert_eq!(shell_read_only_verdict(scope), expected);
-        assert_eq!(scope_is_read_only(scope), expected.is_ok());
+        facts.commands.remove(0).scope
+    }
+
+    #[test_case("python --version", Ok(()); "python")]
+    #[test_case("python3 -V", Ok(()); "python3")]
+    #[test_case("python3.12 --version", Ok(()); "versioned_python")]
+    #[test_case("node -v", Ok(()); "node")]
+    #[test_case("npm --version", Ok(()); "npm")]
+    #[test_case("pnpm -v", Ok(()); "pnpm")]
+    #[test_case("yarn -v", Ok(()); "yarn")]
+    #[test_case("deno --version", Ok(()); "deno")]
+    #[test_case("bun --version", Ok(()); "bun")]
+    #[test_case("cargo -V", Ok(()); "cargo")]
+    #[test_case("rustc --version", Ok(()); "rustc")]
+    #[test_case("rustup -V", Ok(()); "rustup")]
+    #[test_case("go version", Ok(()); "go")]
+    #[test_case("java -version", Ok(()); "java")]
+    #[test_case("ruby --version", Ok(()); "ruby")]
+    #[test_case("perl -v", Ok(()); "perl")]
+    #[test_case("gcc --version", Ok(()); "gcc")]
+    #[test_case("clang --version", Ok(()); "clang")]
+    #[test_case("make --version", Ok(()); "make")]
+    #[test_case("cmake --version", Ok(()); "cmake")]
+    #[test_case("git --version", Ok(()); "git")]
+    #[test_case("just --version", Ok(()); "just")]
+    #[test_case("rg --version", Ok(()); "ripgrep")]
+    #[test_case("jq --version", Ok(()); "jq")]
+    #[test_case("uv --version", Ok(()); "uv")]
+    #[test_case("pip --version", Ok(()); "pip")]
+    #[test_case("pip3 --version", Ok(()); "pip3")]
+    #[test_case("nix --version", Ok(()); "nix")]
+    #[test_case("docker --version", Ok(()); "docker")]
+    #[test_case("python3 -v", Err(NotReadOnly::UnknownCommand); "python_verbose_repl")]
+    #[test_case("ruby -v", Err(NotReadOnly::UnknownCommand); "ruby_reading_stdin")]
+    #[test_case("go --version", Err(NotReadOnly::UnknownCommand); "another_tools_flag")]
+    #[test_case("./python3 --version", Err(NotReadOnly::SourceMismatch); "qualified_interpreter")]
+    #[test_case("python3 --version script.py", Err(NotReadOnly::UnknownCommand); "an_extra_operand")]
+    #[test_case("cargo --version --verbose", Err(NotReadOnly::UnknownCommand); "an_extra_flag")]
+    #[test_case("git --version --build-options", Err(NotReadOnly::UnsupportedInvocation); "an_extra_flag_to_a_known_reader")]
+    fn version_probes_are_read_only(command: &str, expected: Result<(), NotReadOnly>) {
+        assert_eq!(shell_read_only_verdict(&parsed_scope(command)), expected);
+    }
+
+    #[test_case("command -v rg", Ok(()); "command_lookup")]
+    #[test_case("command -V rg cargo", Ok(()); "described_lookup_of_several_names")]
+    #[test_case("type rg", Ok(()); "type_lookup")]
+    #[test_case("type -t rg", Ok(()); "type_kind")]
+    #[test_case("type -a -P rg", Ok(()); "type_separate_flags")]
+    #[test_case("type -ap rg", Ok(()); "type_clustered_flags")]
+    #[test_case("command rg --version", Err(NotReadOnly::UnsupportedInvocation); "command_running_a_command")]
+    #[test_case("command -p rg", Err(NotReadOnly::UnsupportedInvocation); "command_with_the_default_path")]
+    #[test_case("command -v", Err(NotReadOnly::UnsupportedInvocation); "a_lookup_without_a_name")]
+    #[test_case("command -v -p", Err(NotReadOnly::UnsupportedInvocation); "a_flag_where_a_name_belongs")]
+    #[test_case("type -x rg", Err(NotReadOnly::UnsupportedInvocation); "an_unknown_type_flag")]
+    #[test_case("type", Err(NotReadOnly::UnsupportedInvocation); "type_without_a_name")]
+    #[test_case("command -v $TOOL", Err(NotReadOnly::UndecodableWord); "a_name_that_is_not_literal")]
+    #[test_case("/usr/bin/command -v rg", Err(NotReadOnly::SourceMismatch); "a_qualified_lookup")]
+    fn name_lookups_are_read_only(command: &str, expected: Result<(), NotReadOnly>) {
+        assert_eq!(shell_read_only_verdict(&parsed_scope(command)), expected);
     }
 
     #[test_case(None; "unenumerated_arguments")]

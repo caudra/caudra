@@ -2525,12 +2525,12 @@ mod tests {
         PERMISSION_RULES_STATE_KEY, SHELL_WORKDIR, shell_request, workcell_shell_subject,
     };
     use crate::permissions::{
-        PermissionArgumentConstraint, PermissionCapabilityFamily, PermissionLifetime,
-        PermissionManager, PermissionPolicyError, PermissionProjectFilter,
-        PermissionResourceAccess, PermissionResourceKind, PermissionResourceSelector,
-        PermissionRuleRecord, PermissionSubject, RemotePermissionIdentity,
-        StructuredPermissionEffect, VerifiedLocalSourceLocator, argument_constraint_matches,
-        canonical_json_sha256, hex_encode,
+        COMMAND_EXACT_PREFIX, ComposedRow, PermissionAnswer, PermissionArgumentConstraint,
+        PermissionCapabilityFamily, PermissionLifetime, PermissionManager, PermissionPolicyError,
+        PermissionProjectFilter, PermissionResourceAccess, PermissionResourceKind,
+        PermissionResourceSelector, PermissionRowGrant, PermissionRuleRecord, PermissionSubject,
+        RemotePermissionIdentity, StructuredPermissionEffect, VerifiedLocalSourceLocator,
+        argument_constraint_matches, canonical_json_sha256, hex_encode,
     };
     use crate::tools::DescriptionContext;
     use crate::tools::native::plan::{self, PlanTarget, PlanTool};
@@ -2556,6 +2556,12 @@ mod tests {
     const PROJECT: &str = "/project";
     const COMMAND: &str = "git show alpha";
     const COMMAND_PATTERN: &str = "git show *";
+    const OTHER_COMMAND: &str = "git log --oneline";
+    const CONVERSATION_AND_PROJECT: [PermissionLifetime; 2] = [
+        PermissionLifetime::Conversation,
+        PermissionLifetime::Project,
+    ];
+    const RELATIVE_PROJECT: &str = "relative/project";
     const LABEL: &str = "Edited label";
     const OTHER_LABEL: &str = "Concurrent label";
     const FAILURE: &str = "injected durable write failure";
@@ -4094,6 +4100,92 @@ mod tests {
                 .records,
             preview.prepared.targets()[0].records
         );
+    }
+
+    /// Saves one command for the project and another for this conversation,
+    /// and reports whether the answer committed and which lifetimes it left.
+    fn save_mixed_lifetimes(
+        manager: &PermissionManager,
+        publication: &DatabasePublication,
+        project: &Path,
+        fail_conversation: bool,
+    ) -> (bool, Vec<PermissionLifetime>) {
+        let request = shell_request(&[COMMAND, OTHER_COMMAND], workcell_shell_subject());
+        let row = |index: usize, lifetime| {
+            Some(ComposedRow {
+                grant: PermissionRowGrant::Offered(format!("{COMMAND_EXACT_PREFIX}{index}")),
+                lifetime,
+            })
+        };
+        let answer = PermissionAnswer::AllowComposed {
+            rows: vec![
+                row(0, PermissionLifetime::Project),
+                row(1, PermissionLifetime::Conversation),
+            ],
+        };
+        publication.fail.store(fail_conversation, Ordering::Relaxed);
+        let committed = manager
+            .commit_structured_decision(&request, &answer, Some(project))
+            .is_ok();
+        let mut lifetimes: Vec<_> = manager
+            .structured_rule_inventory()
+            .unwrap()
+            .into_iter()
+            .map(|record| record.rule.lifetime)
+            .collect();
+        lifetimes.sort();
+        (committed, lifetimes)
+    }
+
+    /// One database commits both owners in one transaction, so a failure
+    /// saves neither.
+    #[test_case(false; "commits")]
+    #[test_case(true; "a_failure_saves_neither")]
+    fn mixed_lifetimes_commit_in_one_transaction(fail: bool) {
+        let (_temp, manager, _provider, publication) = manager_with_storage(false);
+        let (committed, lifetimes) =
+            save_mixed_lifetimes(&manager, &publication, &manager.project_cwd(), fail);
+        assert_eq!(committed, !fail);
+        assert_eq!(
+            lifetimes,
+            if fail {
+                &[][..]
+            } else {
+                &CONVERSATION_AND_PROJECT[..]
+            }
+        );
+    }
+
+    #[test]
+    fn mixed_lifetimes_save_project_rules_first() {
+        let (_temp, manager, _provider, publication) = manager_with_storage(true);
+        assert_eq!(
+            save_mixed_lifetimes(&manager, &publication, &manager.project_cwd(), false),
+            (true, CONVERSATION_AND_PROJECT.to_vec())
+        );
+    }
+
+    #[test]
+    fn failed_conversation_save_revokes_new_project_rules() {
+        let (_temp, manager, _provider, publication) = manager_with_storage(true);
+        assert_eq!(
+            save_mixed_lifetimes(&manager, &publication, &manager.project_cwd(), true),
+            (false, Vec::new())
+        );
+    }
+
+    /// Storage refuses a project rule whose project is not absolute, so the
+    /// project save fails where a conversation-first order would already
+    /// have committed the conversation row.
+    #[test]
+    fn failed_project_save_leaves_conversation_untouched() {
+        let (_temp, manager, _provider, publication) = manager_with_storage(true);
+        let conversation = publication.snapshot().unwrap();
+        assert_eq!(
+            save_mixed_lifetimes(&manager, &publication, Path::new(RELATIVE_PROJECT), false),
+            (false, Vec::new())
+        );
+        assert_eq!(publication.snapshot().unwrap(), conversation);
     }
 
     #[test_case(StructuredPermissionEffect::Deny, false; "deny_persistent_to_conversation")]

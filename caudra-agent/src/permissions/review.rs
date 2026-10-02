@@ -37,6 +37,7 @@ const UNKNOWN_INPUT: &str = "[omitted: unrecognized tool input]";
 const UNKNOWN_FIELD: &str = "[omitted: unrecognized field]";
 const BULK_CONTENT: &str = "[omitted: content payload]";
 const MISSING_SCOPE: &str = "[scope unavailable: no verified preimage]";
+const SCOPE_SEPARATOR: &str = ": ";
 const INCOMPLETE: &str = "; some scope descriptions unavailable or omitted";
 const MISSING_INPUT: &str = "; input scope unavailable: no verified input";
 const INCOMPLETE_COMMAND: &str =
@@ -479,76 +480,89 @@ fn selector_label(
     {
         return filesystem_browse_recursion(selector).map(str::to_owned);
     }
-    let (scope, value) = match selector {
+    let value = match selector {
         PermissionResourceSelector::CommandTemplate { definition } => {
             return Some(command_template_label(definition));
         }
         PermissionResourceSelector::Any => return Some("Any resource".into()),
-        PermissionResourceSelector::Exact { value } => ("Exact", value.clone()),
-        PermissionResourceSelector::Subtree { root } => ("Subtree", root.clone()),
-        PermissionResourceSelector::Prefix { value } => ("Prefix", value.clone()),
-        PermissionResourceSelector::CommandPattern { pattern } => {
-            ("Command pattern", pattern.clone())
+        PermissionResourceSelector::Exact { value }
+        | PermissionResourceSelector::Prefix { value } => value.clone(),
+        PermissionResourceSelector::Subtree { root } => root.clone(),
+        PermissionResourceSelector::CommandPattern { pattern } => pattern.clone(),
+        PermissionResourceSelector::RemoteResource { scope, .. }
+        | PermissionResourceSelector::RemoteSubtree { scope, .. } => {
+            serde_json::to_string(scope).ok()?
         }
-        PermissionResourceSelector::RemoteResource { scope, .. } => {
-            ("Remote exact scope", serde_json::to_string(scope).ok()?)
-        }
-        PermissionResourceSelector::RemoteSubtree { scope, .. } => {
-            ("Remote subtree", serde_json::to_string(scope).ok()?)
-        }
-        PermissionResourceSelector::Digest { digest } => {
-            let value = candidates
-                .iter()
-                .filter_map(|candidate| match kind {
-                    PermissionResourceKind::File | PermissionResourceKind::Directory => {
-                        absolute_preimage(candidate).map(|_| candidate.clone())
-                    }
-                    PermissionResourceKind::Url => strict_http_url(candidate).map(|url| url.key),
-                    _ => Some(candidate.clone()),
-                })
-                .find(|value| canonical_json_sha256(&json!(value)) == *digest)?;
-            ("Exact", value)
-        }
-        PermissionResourceSelector::FilesystemSubtreeDigest { digest } => {
-            let root = candidates
-                .iter()
-                .filter_map(|candidate| absolute_preimage(candidate))
-                .find_map(|path| {
-                    path.ancestors()
-                        .take(MAX_CANDIDATE_PREIMAGE_DEPTH)
-                        .filter_map(|root| root.to_str())
-                        .find(|root| {
-                            canonical_json_sha256(&json!([FILESYSTEM_SUBTREE_DOMAIN, root]))
-                                == *digest
-                        })
-                        .map(str::to_owned)
-                })?;
-            ("Filesystem subtree", root)
-        }
-        PermissionResourceSelector::UrlSubtreeDigest { digest } => {
-            let root = candidates
-                .iter()
-                .filter_map(|value| strict_http_url(value))
-                .filter(|url| url_within_depth(&url.url, MAX_CANDIDATE_PREIMAGE_DEPTH))
-                .filter_map(|url| url_subtree_roots(&url))
-                .flatten()
-                .find(|root| url_subtree_digest(root) == *digest)?;
-            ("URL subtree", root)
-        }
-        PermissionResourceSelector::UrlOriginDigest { digest } => {
-            let origin = candidates
-                .iter()
-                .filter_map(|value| strict_http_url(value))
-                .map(|url| url.url.origin().ascii_serialization())
-                .find(|origin| {
-                    canonical_json_sha256(&json!([URL_ORIGIN_DOMAIN, origin])) == *digest
-                })?;
-            ("URL origin", origin)
-        }
+        PermissionResourceSelector::Digest { digest } => candidates
+            .iter()
+            .filter_map(|candidate| match kind {
+                PermissionResourceKind::File | PermissionResourceKind::Directory => {
+                    absolute_preimage(candidate).map(|_| candidate.clone())
+                }
+                PermissionResourceKind::Url => strict_http_url(candidate).map(|url| url.key),
+                _ => Some(candidate.clone()),
+            })
+            .find(|value| canonical_json_sha256(&json!(value)) == *digest)?,
+        PermissionResourceSelector::FilesystemSubtreeDigest { digest } => candidates
+            .iter()
+            .filter_map(|candidate| absolute_preimage(candidate))
+            .find_map(|path| {
+                path.ancestors()
+                    .take(MAX_CANDIDATE_PREIMAGE_DEPTH)
+                    .filter_map(|root| root.to_str())
+                    .find(|root| {
+                        canonical_json_sha256(&json!([FILESYSTEM_SUBTREE_DOMAIN, root])) == *digest
+                    })
+                    .map(str::to_owned)
+            })?,
+        PermissionResourceSelector::UrlSubtreeDigest { digest } => candidates
+            .iter()
+            .filter_map(|value| strict_http_url(value))
+            .filter(|url| url_within_depth(&url.url, MAX_CANDIDATE_PREIMAGE_DEPTH))
+            .filter_map(|url| url_subtree_roots(&url))
+            .flatten()
+            .find(|root| url_subtree_digest(root) == *digest)?,
+        PermissionResourceSelector::UrlOriginDigest { digest } => candidates
+            .iter()
+            .filter_map(|value| strict_http_url(value))
+            .map(|url| url.url.origin().ascii_serialization())
+            .find(|origin| canonical_json_sha256(&json!([URL_ORIGIN_DOMAIN, origin])) == *digest)?,
     };
     let value = display_text(&value)?;
-    let label = format!("{scope}: {value}");
+    let label = format!("{}{SCOPE_SEPARATOR}{value}", labelled_scope(selector)?);
     (label.len() <= REVIEW_MAX_STRING_BYTES).then_some(label)
+}
+
+/// The kind a review label names a selector's value by.
+fn labelled_scope(selector: &PermissionResourceSelector) -> Option<&'static str> {
+    Some(match selector {
+        PermissionResourceSelector::Exact { .. } | PermissionResourceSelector::Digest { .. } => {
+            "Exact"
+        }
+        PermissionResourceSelector::Subtree { .. } => "Subtree",
+        PermissionResourceSelector::Prefix { .. } => "Prefix",
+        PermissionResourceSelector::CommandPattern { .. } => "Command pattern",
+        PermissionResourceSelector::RemoteResource { .. } => "Remote exact scope",
+        PermissionResourceSelector::RemoteSubtree { .. } => "Remote subtree",
+        PermissionResourceSelector::FilesystemSubtreeDigest { .. } => "Filesystem subtree",
+        PermissionResourceSelector::UrlSubtreeDigest { .. } => "URL subtree",
+        PermissionResourceSelector::UrlOriginDigest { .. } => "URL origin",
+        PermissionResourceSelector::Any | PermissionResourceSelector::CommandTemplate { .. } => {
+            return None;
+        }
+    })
+}
+
+/// The value a review label recovered for `selector`, without the kind the
+/// label names it by. `None` when the review holds no value for it, which is
+/// also how a redacted or missing value reads.
+pub fn recovered_value<'a>(
+    selector: &PermissionResourceSelector,
+    label: &'a str,
+) -> Option<&'a str> {
+    label
+        .strip_prefix(labelled_scope(selector)?)?
+        .strip_prefix(SCOPE_SEPARATOR)
 }
 
 fn possible_workdirs_label(
@@ -638,6 +652,33 @@ pub fn command_template_label(definition: &PatternDefinition) -> String {
     }
     label.push_str(&combinations);
     label
+}
+
+/// A template as a scope reads in a sentence: its literal words, quoted only
+/// where the shell would need it, with each slot named in angle brackets, as
+/// in `cargo test -p <crate>`.
+pub fn command_template_phrase(definition: &PatternDefinition) -> String {
+    definition
+        .argv
+        .iter()
+        .map(|token| match token {
+            PatternToken::Exact { value, .. } => {
+                display_text(value).map(|value| shell_words::quote(&value).into_owned())
+            }
+            PatternToken::Slot { id, .. } => definition
+                .slots
+                .iter()
+                .find(|slot| slot.id == *id)
+                .and_then(|slot| display_text(&slot.label))
+                .map(|name| {
+                    let name = name.trim_start_matches('<').trim_end_matches('>');
+                    format!("<{name}>")
+                }),
+        })
+        .collect::<Option<Vec<_>>>()
+        .map(|words| words.join(" "))
+        .filter(|phrase| phrase.len() <= REVIEW_MAX_STRING_BYTES)
+        .unwrap_or_else(|| OMITTED.into())
 }
 
 fn absolute_preimage(value: &str) -> Option<&Path> {
@@ -1094,10 +1135,13 @@ mod tests {
         PermissionResourceKind, PermissionResourceSelector, PermissionReviewSource,
         PermissionSubject, REDACTED, REVIEW_MAX_INPUT_DEPTH, REVIEW_MAX_INPUT_NODES,
         REVIEW_MAX_RESOURCES, REVIEW_MAX_STRING_BYTES, StructuredPermissionRule, UNKNOWN_FIELD,
-        UNKNOWN_INPUT, display_text, redact_text, review_for_rule, review_from_candidates,
-        selector_label, url_subtree_digest, visit_review_candidate_preimages,
+        UNKNOWN_INPUT, display_text, recovered_value, redact_text, review_for_rule,
+        review_from_candidates, selector_label, url_subtree_digest,
+        visit_review_candidate_preimages,
     };
-    use crate::permissions::{PermissionRowGrant, canonical_json_sha256, selected_input_digest};
+    use crate::permissions::{
+        ComposedRow, PermissionRowGrant, canonical_json_sha256, selected_input_digest,
+    };
 
     const ROOT: &str = "/project";
     const PATH: &str = "/project/src/main.rs";
@@ -1107,6 +1151,7 @@ mod tests {
     const UNCHOSEN: &str = "cargo test";
     const URL: &str = "https://example.test/api/item?token=top-secret&page=2";
     const URL_ROOT: &str = "https://example.test/api";
+    const URL_ORIGIN: &str = "https://example.test";
     const PATTERN: &str = "**/*.{rs,toml}";
 
     #[test_case(PATH; "raw_and_filesystem_domains_once")]
@@ -1313,7 +1358,10 @@ mod tests {
             PermissionRowGrant::Offered("command_exact_0".into())
         };
         let rules = request
-            .composed_rules(&[Some(grant), None], &PermissionLifetime::Conversation)
+            .composed_rules(&ComposedRow::uniform(
+                vec![Some(grant), None],
+                &PermissionLifetime::Conversation,
+            ))
             .unwrap();
         assert_eq!(rules.len(), 1);
         let review = review_for_rule(&request, &rules[0]);
@@ -1378,6 +1426,23 @@ mod tests {
         assert_eq!(review.resources[0].value, None);
         assert!(review.authority.contains(INCOMPLETE));
         assert!(review.authority.contains(MISSING_INPUT));
+    }
+
+    #[test_case(PermissionResourceSelector::Digest { digest: canonical_json_sha256(&json!(PATH)) }, PermissionResourceKind::File, PATH, PATH; "pinned_path")]
+    #[test_case(PermissionResourceSelector::CommandPattern { pattern: CHOSEN.into() }, PermissionResourceKind::Command, CHOSEN, CHOSEN; "command_pattern")]
+    #[test_case(PermissionResourceSelector::FilesystemSubtreeDigest { digest: filesystem_subtree_digest(ROOT).unwrap() }, PermissionResourceKind::Directory, PATH, ROOT; "filesystem_subtree")]
+    #[test_case(PermissionResourceSelector::UrlSubtreeDigest { digest: url_subtree_digest(URL_ROOT) }, PermissionResourceKind::Url, URL, URL_ROOT; "url_subtree")]
+    #[test_case(PermissionResourceSelector::UrlOriginDigest { digest: url_origin_digest(URL).unwrap() }, PermissionResourceKind::Url, URL, URL_ORIGIN; "url_origin")]
+    fn recovered_values_drop_only_the_kind_the_label_names(
+        selector: PermissionResourceSelector,
+        kind: PermissionResourceKind,
+        candidate: &str,
+        expected: &str,
+    ) {
+        let label = selector_label(&selector, &kind, &[candidate.into()]).unwrap();
+        assert_eq!(recovered_value(&selector, &label), Some(expected));
+        assert_eq!(recovered_value(&selector, MISSING_SCOPE), None);
+        assert_eq!(recovered_value(&selector, REDACTED), None);
     }
 
     #[test_case("filesystem"; "filesystem_ancestor_hash")]
@@ -1776,13 +1841,13 @@ mod tests {
             &[command, UNCHOSEN],
         );
         let rules = request
-            .composed_rules(
-                &[
+            .composed_rules(&ComposedRow::uniform(
+                vec![
                     Some(PermissionRowGrant::Offered("command_exact_0".into())),
                     None,
                 ],
                 &PermissionLifetime::Conversation,
-            )
+            ))
             .unwrap();
         let original = serde_json::to_vec(&rules).unwrap();
         let review = review_for_rule(&request, &rules[0]);

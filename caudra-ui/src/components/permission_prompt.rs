@@ -1,125 +1,72 @@
 use std::collections::{HashSet, VecDeque};
 
 use caudra_agent::permissions::{
-    COMPOSABLE_SHELL_OPTIONS, DEFAULT_DENY_GUIDANCE, PermissionAnswer, PermissionCaution,
-    PermissionLifetime, PermissionRequest, PermissionRowGrant, PermissionRuleOption,
-    ResourceCoverage, StructuredPermissionEffect, grade_command_pattern,
+    PermissionAnswer, PermissionLifetime, PermissionRequest, PermissionRowGrant,
 };
-use caudra_workbench::text_field::{FieldKind, TextField, TextKey};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::Style;
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
-use serde_json::{Map, Value};
+use caudra_config::ToolKey;
+use caudra_workbench::text_field::{FieldKind, TextField};
+use crossterm::event::KeyEvent;
+use ratatui::layout::Rect;
 
 use crate::components::permission_scope::view::{ScopeControl, ScopeView};
-use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
-use crate::components::{
-    ModalScroll, Overlay, escape_terminal_controls, hover_style, is_ctrl, visual_rows,
-};
-use crate::theme;
+use crate::components::scrollbar::Scrollbar;
+use crate::components::{ModalScroll, Overlay};
 
+mod choices;
+mod customize;
 mod decision;
 mod details;
 mod input;
 mod inspector;
+mod notes;
 mod scope;
+mod step_through;
 mod view;
 
-use decision::{Confirmation, command_ladders};
+use choices::Choice;
+use customize::{Customize, Effect};
+use decision::Pending;
 pub(crate) use details::{likely_secret_key, sensitive_text};
-use input::{InputFreshness, hint_key};
-use inspector::{EditedPattern, InspectorControl, PatternInspector};
+use input::InputFreshness;
+use inspector::{InspectorControl, PatternInspector};
+pub(crate) use inspector::{pattern_summary, slot_name};
+pub(crate) use notes::{origin_word, tilde};
+#[cfg(test)]
+pub(crate) use scope::MISSING_SCOPE;
+pub(crate) use scope::{rule_phrase, rule_summary, tool_words};
+use step_through::StepThrough;
+pub(crate) use step_through::lifetime_phrase;
+#[cfg(test)]
+pub(crate) use view::tests::{THEMES, WIDTHS, assert_plain, buffer_rows};
 
-const KEY_ALLOW_ONCE: &str = "y";
-const KEY_ALLOW_SESSION: &str = "s";
-const KEY_ALLOW_LOCAL: &str = "a";
-const KEY_ALLOW_GLOBAL: &str = "A";
-const KEY_GUIDE_DENY: &str = "g";
-const KEY_DENY_LOCAL: &str = "d";
-const KEY_DENY_GLOBAL: &str = "D";
-const HINT_ENTER: &str = "Enter";
-const HINT_ESC: &str = "Esc";
-const HINT_CONFIRM: &str = "Enter/y";
-const CHIP_ONCE: &str = "Once; not remembered";
-const CHIP_COVERED: &str = "already allowed";
-const COVERAGE_SEPARATOR: &str = " · ";
-const MIN_REVIEW_WIDTH: u16 = 32;
-const MIN_REVIEW_HEIGHT: u16 = 10;
-const KEY_DETAILS: &str = "v";
-const KEY_COVERED: &str = "c";
-
-#[derive(Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Panel {
     #[default]
     Main,
-    Scopes,
+    StepThrough,
+    Customize,
     Details,
 }
 
-type HintPairs = Vec<(&'static str, &'static str)>;
-
-enum FooterRow {
-    Hints(HintPairs),
-    Guidance,
-    ConfirmationInput,
-    InspectorStatus,
-    Rearm,
-}
-
-struct PromptBody {
-    lines: Vec<Line<'static>>,
-    entries: Vec<(PromptTarget, u16)>,
-}
-
-#[derive(Clone, Default, PartialEq, Eq, Debug)]
-struct RowChoice {
-    rung: usize,
-    written: Option<String>,
-    pattern: Option<EditedPattern>,
-}
-
-impl RowChoice {
-    fn ladder_len(&self, offered: usize) -> usize {
-        1 + offered + usize::from(self.written.is_some())
-    }
-
-    fn grant(&self, offered: &[&PermissionRuleOption]) -> Option<PermissionRowGrant> {
-        match self.rung.checked_sub(1)? {
-            rung if rung < offered.len() => Some(
-                self.pattern
-                    .as_ref()
-                    .filter(|edited| edited.option_id == offered[rung].id)
-                    .map_or_else(
-                        || PermissionRowGrant::Offered(offered[rung].id.clone()),
-                        |edited| PermissionRowGrant::Pattern {
-                            option_id: edited.option_id.clone(),
-                            definition: edited.definition.clone(),
-                        },
-                    ),
-            ),
-            _ => self.written.clone().map(PermissionRowGrant::Written),
-        }
-    }
-}
-
-struct AuthorityRow {
-    chosen: String,
-    rungs: Vec<String>,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum PromptState {
+/// What typing goes to: nothing, the guidance under No, or a pattern being
+/// written for a command.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PromptState {
     #[default]
     Normal,
-    ConfirmAllowAlwaysLocal,
-    ConfirmAllowAlwaysGlobal,
-    ConfirmAllowSession,
-    ConfirmDenyAlwaysLocal,
-    ConfirmDenyAlwaysGlobal,
-    DenyEditing,
+    Guidance,
     PatternEditing,
+}
+
+/// What a command row remembers: the rung the request marks as its default
+/// until the user moves it, then the rung they chose, `None` being this time
+/// only. A chosen rung is kept by its option id, so a late update that
+/// reorders the ladder cannot change what the row means.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum RowChoice {
+    #[default]
+    Default,
+    Chosen(Option<PermissionRowGrant>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,43 +80,26 @@ struct QueuedPermission {
     requester: Option<String>,
 }
 
-pub struct PermissionPrompt {
-    requests: VecDeque<QueuedPermission>,
-    request_ids: HashSet<String>,
-    state: PromptState,
-    /// The guidance, prefix, phrase or pattern field being typed.
-    field: TextField,
-    /// What the field last copied or cut, until the host puts it on the
-    /// clipboard.
-    copied: Option<String>,
-    scroll: ModalScroll,
-    scrollbar: Scrollbar,
-    selected_option: String,
-    scopes: Vec<RowChoice>,
-    pending_reveal: Option<PromptTarget>,
-    row_hits: Vec<PromptHit>,
-    mouse_down: Option<PromptTarget>,
-    hover: Option<PromptTarget>,
-    area: Rect,
-    panel: Panel,
-    lifetime: PermissionLifetime,
-    confirmation: Option<Confirmation>,
-    inspector: Option<PatternInspector>,
-    expanded_covered: bool,
-    focus: Option<PromptTarget>,
-    awaiting_review: bool,
-    input_freshness: InputFreshness,
-    scope_view: ScopeView,
-    scope_authority: usize,
+/// The request in front, borrowed from the queue alone so the rest of the
+/// prompt stays free to change while it is read.
+fn front_request(requests: &VecDeque<QueuedPermission>) -> Option<&PermissionRequest> {
+    requests.front().map(|queued| queued.request.as_ref())
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+/// Everything a press or a click can land on. A list item is a rung on a
+/// step-through page, a choice on Review, or a scope in Customize.
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum PromptTarget {
-    Scope,
-    Authority(String),
+    Choice(Choice),
+    Row(usize),
+    Item(usize),
+    Tab(usize),
+    Review,
+    Effect(Effect),
+    Remember(PermissionLifetime),
     Hint(KeyEvent),
     Inspector(InspectorControl),
-    VisualScope(usize, ScopeControl),
+    VisualScope(ScopeControl),
 }
 
 struct PromptHit {
@@ -181,6 +111,42 @@ pub(crate) enum PromptMouse {
     Passthrough,
     Consumed,
     Decided(PermissionDecision),
+}
+
+pub struct PermissionPrompt {
+    requests: VecDeque<QueuedPermission>,
+    request_ids: HashSet<String>,
+    state: PromptState,
+    panel: Panel,
+    /// Where `?` returns to from Details.
+    before_details: Panel,
+    /// The guidance, pattern, or phrase being typed.
+    field: TextField,
+    /// What the field last copied or cut, until the host puts it on the
+    /// clipboard.
+    copied: Option<String>,
+    scroll: ModalScroll,
+    scrollbar: Scrollbar,
+    rows: Vec<RowChoice>,
+    /// The rung chosen on a request without command rows, `None` while it is
+    /// the request's default.
+    authority: Option<String>,
+    focus_row: Option<usize>,
+    highlight: Choice,
+    pending: Option<Pending>,
+    step: Option<StepThrough>,
+    customize: Option<Customize>,
+    inspector: Option<PatternInspector>,
+    scope_view: ScopeView,
+    hits: Vec<PromptHit>,
+    mouse_down: Option<PromptTarget>,
+    hover: Option<PromptTarget>,
+    focus: Option<PromptTarget>,
+    /// Keeps the highlighted line in sight on the next draw.
+    reveal: bool,
+    area: Rect,
+    awaiting_review: bool,
+    input_freshness: InputFreshness,
 }
 
 impl Overlay for PermissionPrompt {
@@ -205,27 +171,29 @@ impl PermissionPrompt {
             requests: VecDeque::new(),
             request_ids: HashSet::new(),
             state: PromptState::Normal,
+            panel: Panel::Main,
+            before_details: Panel::Main,
             field: TextField::new(FieldKind::Line),
             copied: None,
             scroll: ModalScroll::new_top(),
             scrollbar: Scrollbar::default(),
-            selected_option: "allow_exact".into(),
-            scopes: Vec::new(),
-            pending_reveal: None,
-            row_hits: Vec::new(),
+            rows: Vec::new(),
+            authority: None,
+            focus_row: None,
+            highlight: Choice::Once,
+            pending: None,
+            step: None,
+            customize: None,
+            inspector: None,
+            scope_view: ScopeView::default(),
+            hits: Vec::new(),
             mouse_down: None,
             hover: None,
-            area: Rect::default(),
-            panel: Panel::Main,
-            lifetime: PermissionLifetime::Once,
-            confirmation: None,
-            inspector: None,
-            expanded_covered: false,
             focus: None,
+            reveal: false,
+            area: Rect::default(),
             awaiting_review: false,
             input_freshness: InputFreshness::default(),
-            scope_view: ScopeView::default(),
-            scope_authority: 0,
         }
     }
 
@@ -242,6 +210,10 @@ impl PermissionPrompt {
         true
     }
 
+    /// Takes a newer version of a queued request. The prompt in front keeps
+    /// what the user chose, its panel, and anything typed; a change to what
+    /// an answer would grant, or a new note, re-arms the input barrier so a
+    /// press made before the redraw cannot land on it.
     pub fn update(&mut self, request: Box<PermissionRequest>) -> bool {
         let Some(index) = self
             .requests
@@ -250,10 +222,18 @@ impl PermissionPrompt {
         else {
             return false;
         };
-        self.requests[index].request = request;
-        if index == 0 {
-            self.reset_view();
+        if index > 0 {
+            self.requests[index].request = request;
+            return true;
         }
+        let before = self.answer_fingerprint();
+        self.requests[0].request = request;
+        self.reconcile();
+        self.recheck_inspector();
+        if self.answer_fingerprint() != before {
+            self.input_freshness.barrier();
+        }
+        self.invalidate_controls();
         true
     }
 
@@ -261,7 +241,7 @@ impl PermissionPrompt {
     pub(crate) fn open(
         &mut self,
         id: String,
-        tool: caudra_config::ToolKey,
+        tool: ToolKey,
         scopes: Vec<String>,
         subagent_id: Option<String>,
     ) {
@@ -270,7 +250,7 @@ impl PermissionPrompt {
                 id,
                 tool,
                 scopes,
-                Value::Null,
+                serde_json::Value::Null,
                 std::path::Path::new("/project"),
                 true,
             )),
@@ -278,7 +258,7 @@ impl PermissionPrompt {
         );
     }
 
-    pub(crate) fn tool(&self) -> Option<&caudra_config::ToolKey> {
+    pub(crate) fn tool(&self) -> Option<&ToolKey> {
         self.current().map(|request| &request.tool)
     }
 
@@ -292,20 +272,22 @@ impl PermissionPrompt {
 
     #[cfg(test)]
     pub(crate) fn requester(&self) -> Option<&str> {
+        self.requester_name()
+    }
+
+    fn requester_name(&self) -> Option<&str> {
         self.requests
             .front()
             .and_then(|queued| queued.requester.as_deref())
     }
 
     pub fn resolve(&mut self, request_id: &str) -> bool {
-        let Some(request) = self.requests.front() else {
-            return false;
-        };
-        if request.request.id != request_id {
+        if self.request_id() != Some(request_id) {
             return false;
         }
-        let request = self.requests.pop_front().expect("front request exists");
-        self.request_ids.remove(&request.request.id);
+        if let Some(request) = self.requests.pop_front() {
+            self.request_ids.remove(&request.request.id);
+        }
         self.reset_view();
         true
     }
@@ -327,73 +309,127 @@ impl PermissionPrompt {
     }
 
     fn current(&self) -> Option<&PermissionRequest> {
-        self.requests.front().map(|queued| queued.request.as_ref())
+        front_request(&self.requests)
+    }
+
+    fn decision(&self, answer: PermissionAnswer) -> Option<PermissionDecision> {
+        Some(PermissionDecision {
+            request_id: self.request_id()?.to_owned(),
+            answer,
+        })
     }
 
     fn reset_view(&mut self) {
-        self.scope_view = ScopeView::default();
         self.input_freshness.barrier();
         self.state = PromptState::Normal;
         self.panel = Panel::Main;
-        self.lifetime = PermissionLifetime::Once;
-        self.confirmation = None;
+        self.before_details = Panel::Main;
+        self.rows = self.current().map_or_else(Vec::new, |request| {
+            vec![RowChoice::Default; request.resources.len()]
+        });
+        self.authority = None;
+        self.highlight = Choice::Once;
+        self.pending = None;
+        self.step = None;
+        self.customize = None;
         self.inspector = None;
-        self.expanded_covered = false;
-        self.focus = None;
-        self.awaiting_review = true;
+        self.scope_view = ScopeView::default();
         self.field.clear();
         self.scroll.reset();
-        self.pending_reveal = None;
-        self.row_hits.clear();
-        self.mouse_down = None;
-        self.hover = None;
-        self.reset_selection();
+        self.focus_row = self.first_new_row();
+        self.focus = None;
+        self.invalidate_controls();
     }
 
-    fn reset_selection(&mut self) {
-        let Some(request) = self.current() else {
-            self.scopes.clear();
-            self.selected_option = "allow_exact".into();
+    /// Forgets where everything was drawn, so nothing can be pressed until
+    /// the prompt is drawn again.
+    fn invalidate_controls(&mut self) {
+        self.awaiting_review = true;
+        self.hits.clear();
+        self.mouse_down = None;
+        self.hover = None;
+        self.scrollbar = Scrollbar::default();
+    }
+
+    /// Fits what the user chose to a newer version of the request: a chosen
+    /// rung the update withdrew falls back to the row's default, and a
+    /// confirmation for a scope that changed is dropped.
+    fn reconcile(&mut self) {
+        let project = self.project_available();
+        let Some(request) = front_request(&self.requests) else {
             return;
         };
-        let covered = |row: usize| {
-            request
-                .presentation
-                .resources
-                .get(row)
-                .is_some_and(|shown| shown.covered())
-        };
-        let ladders = command_ladders(request);
-        let scopes = (0..ladders.len())
-            .map(|row| RowChoice {
-                rung: usize::from(!covered(row)),
-                written: None,
-                pattern: None,
+        let count = request.resources.len();
+        let rows: Vec<_> = (0..count)
+            .map(|row| match self.rows.get(row) {
+                Some(RowChoice::Chosen(Some(grant))) if !decision::offers(request, row, grant) => {
+                    RowChoice::Default
+                }
+                Some(choice) => choice.clone(),
+                None => RowChoice::Default,
             })
             .collect();
-        let default_authority = || {
-            request
-                .options
+        let authority = self.authority.take().filter(|id| {
+            decision::main_ladder(request)
                 .iter()
-                .find(|option| {
-                    option.is_default && option.rule.effect == StructuredPermissionEffect::Allow
-                })
-                .map_or_else(|| "allow_exact".into(), |option| option.id.clone())
-        };
-        let selected = ladders
-            .iter()
-            .enumerate()
-            .find(|(row, _)| !covered(*row))
-            .or_else(|| ladders.iter().enumerate().next())
-            .map_or_else(default_authority, |(_, ladder)| {
-                ladder[0]
-                    .group
+                .any(|option| option.id == *id)
+        });
+        let step = self
+            .step
+            .take()
+            .map(|step| step.reconciled(request, project));
+        let pending_answer = self.pending.as_ref().map(|pending| pending.answer.clone());
+        self.rows = rows;
+        self.authority = authority;
+        self.step = step;
+        if self
+            .focus_row
+            .is_none_or(|row| row >= count || !self.is_new_row(row))
+        {
+            self.focus_row = self.first_new_row();
+        }
+        if let Some(customize) = self.customize.take() {
+            self.customize = Some(customize.clamped(self));
+        }
+        if pending_answer.is_some() && self.pending_answer_now() != pending_answer {
+            self.pending = None;
+            self.field.clear();
+        }
+        if !self.choices().contains(&self.highlight) {
+            self.highlight = Choice::Once;
+        }
+    }
+
+    /// What a press would now grant and every note it would be made under,
+    /// so an update that changes either can be told apart from one that does
+    /// not.
+    fn answer_fingerprint(&self) -> (Vec<Option<PermissionAnswer>>, Vec<String>) {
+        let answers = [Choice::Conversation, Choice::Project]
+            .into_iter()
+            .map(|choice| self.choice_answer(choice))
+            .chain([
+                self.step
                     .as_ref()
-                    .map_or_else(|| ladder[0].id.clone(), |group| group.key.clone())
-            });
-        self.scopes = scopes;
-        self.selected_option = selected;
-        self.select_default_path();
+                    .zip(self.current())
+                    .map(|(step, request)| step.answer(request)),
+                self.customize
+                    .as_ref()
+                    .and_then(|customize| customize.answer(self)),
+            ])
+            .collect();
+        let notes = self.notes().into_iter().map(|note| note.text).collect();
+        (answers, notes)
+    }
+
+    /// The answer the action that opened the pending confirmation would give
+    /// now.
+    fn pending_answer_now(&self) -> Option<PermissionAnswer> {
+        let pending = self.pending.as_ref()?;
+        match self.panel {
+            Panel::StepThrough => Some(self.step.as_ref()?.answer(self.current()?)),
+            Panel::Customize => self.customize.as_ref()?.answer(self),
+            _ => self.choice_answer(pending.choice?),
+        }
     }
 }
 

@@ -185,7 +185,15 @@ pub fn prepare_mutation(
     expected: Vec<PermissionSnapshot>,
     mutation: PermissionMutation,
 ) -> Result<PreparedPermissionMutation, PermissionMutationError> {
-    if expected.is_empty() || expected.len() > MAX_MUTATION_OWNERS {
+    prepare_mutations(expected, vec![mutation])
+}
+
+/// Several operations that commit together or not at all, applied in order.
+pub fn prepare_mutations(
+    expected: Vec<PermissionSnapshot>,
+    mutations: Vec<PermissionMutation>,
+) -> Result<PreparedPermissionMutation, PermissionMutationError> {
+    if mutations.is_empty() || expected.is_empty() || expected.len() > MAX_MUTATION_OWNERS {
         return Err(PermissionMutationError::InvalidOperation);
     }
     let store = &expected[0].store_id;
@@ -200,44 +208,10 @@ pub fn prepare_mutation(
         }
     }
     let mut targets = expected.clone();
-    let used = match mutation {
-        PermissionMutation::Create {
-            destination,
-            records,
-        } => {
-            if records.is_empty()
-                || records
-                    .iter()
-                    .any(|record| !record.is_active() || record.replaces.is_some())
-            {
-                return Err(PermissionMutationError::InvalidOperation);
-            }
-            target(&mut targets, &destination)?.records.extend(records);
-            vec![destination]
-        }
-        PermissionMutation::Replace {
-            source,
-            destination,
-            mut replacement,
-        } => {
-            if !replacement.is_active()
-                || replacement.id == source.record_id
-                || replacement.replaces.is_some()
-            {
-                return Err(PermissionMutationError::InvalidOperation);
-            }
-            retire(&mut targets, &source)?;
-            replacement.replaces = Some(source.clone());
-            target(&mut targets, &destination)?
-                .records
-                .push(*replacement);
-            vec![source.owner, destination]
-        }
-        PermissionMutation::Revoke { source } => {
-            retire(&mut targets, &source)?;
-            vec![source.owner]
-        }
-    };
+    let mut used = HashSet::new();
+    for mutation in mutations {
+        apply(&mut targets, &mut used, mutation)?;
+    }
     targets.retain(|snapshot| used.contains(&snapshot.revision.owner));
     for snapshot in &mut targets {
         snapshot.revision.row_present = true;
@@ -250,6 +224,51 @@ pub fn prepare_mutation(
     };
     bounded_json(&prepared)?;
     Ok(prepared)
+}
+
+fn apply(
+    targets: &mut [PermissionSnapshot],
+    used: &mut HashSet<PermissionOwner>,
+    mutation: PermissionMutation,
+) -> Result<(), PermissionMutationError> {
+    match mutation {
+        PermissionMutation::Create {
+            destination,
+            records,
+        } => {
+            if records.is_empty()
+                || records
+                    .iter()
+                    .any(|record| !record.is_active() || record.replaces.is_some())
+            {
+                return Err(PermissionMutationError::InvalidOperation);
+            }
+            target(targets, &destination)?.records.extend(records);
+            used.insert(destination);
+        }
+        PermissionMutation::Replace {
+            source,
+            destination,
+            mut replacement,
+        } => {
+            if !replacement.is_active()
+                || replacement.id == source.record_id
+                || replacement.replaces.is_some()
+            {
+                return Err(PermissionMutationError::InvalidOperation);
+            }
+            retire(targets, &source)?;
+            replacement.replaces = Some(source.clone());
+            target(targets, &destination)?.records.push(*replacement);
+            used.insert(source.owner);
+            used.insert(destination);
+        }
+        PermissionMutation::Revoke { source } => {
+            retire(targets, &source)?;
+            used.insert(source.owner);
+        }
+    }
+    Ok(())
 }
 
 fn target<'a>(
@@ -583,7 +602,7 @@ mod tests {
     use super::{
         INVALID_RECEIPT_ID, PERMISSION_RECEIPT_LIMIT, PermissionMutation, PermissionMutationError,
         PermissionOwner, PermissionRecordIdentity, PreparedPermissionMutation,
-        permission_databases_shared, prepare_mutation,
+        permission_databases_shared, prepare_mutation, prepare_mutations,
     };
     use crate::id::CaudraId;
     use crate::permission_state::{
@@ -1186,6 +1205,112 @@ mod tests {
                 .is_none()
         );
         assert_accounting(&database, &session);
+    }
+
+    /// One answer can file rules under both owners. They land in one
+    /// transaction, so a failure on the second write takes back the first.
+    #[test_case(false; "both_owners_commit")]
+    #[test_case(true; "a_late_failure_leaves_neither")]
+    fn create_spans_both_owners_in_one_transaction(fail: bool) {
+        let (_temp, _dir, database, session) = database();
+        let conversation = PermissionOwner::Conversation(session.id);
+        let expected = database
+            .permission_snapshots(&[PermissionOwner::Persistent, conversation.clone()])
+            .unwrap();
+        let project_rule = record(
+            PermissionLifetime::Project,
+            StructuredPermissionEffect::Allow,
+        );
+        let conversation_rule = record(
+            PermissionLifetime::Conversation,
+            StructuredPermissionEffect::Allow,
+        );
+        let prepared = prepare_mutations(
+            expected.clone(),
+            vec![
+                PermissionMutation::Create {
+                    destination: PermissionOwner::Persistent,
+                    records: Box::new([project_rule.clone()]),
+                },
+                PermissionMutation::Create {
+                    destination: conversation.clone(),
+                    records: Box::new([conversation_rule.clone()]),
+                },
+            ],
+        )
+        .unwrap();
+        if fail {
+            database.connection().execute_batch(&format!("CREATE TRIGGER injected_failure BEFORE UPDATE OF metadata ON sessions BEGIN SELECT RAISE(ABORT, '{FAILURE}'); END;")).unwrap();
+            assert!(
+                database
+                    .commit_permission_mutation(&prepared)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(FAILURE)
+            );
+            for snapshot in expected {
+                assert_eq!(
+                    database
+                        .permission_snapshot(snapshot.revision.owner.clone())
+                        .unwrap(),
+                    snapshot
+                );
+            }
+        } else {
+            database.commit_permission_mutation(&prepared).unwrap();
+            assert_eq!(
+                database
+                    .permission_snapshot(PermissionOwner::Persistent)
+                    .unwrap()
+                    .records,
+                [project_rule]
+            );
+            assert_eq!(
+                database.permission_snapshot(conversation).unwrap().records,
+                [conversation_rule]
+            );
+        }
+        assert_accounting(&database, &session);
+    }
+
+    #[test]
+    fn revoke_takes_several_records() {
+        let (_temp, _dir, database, _session) = database();
+        let rules = [PermissionLifetime::Project, PermissionLifetime::Global]
+            .map(|lifetime| record(lifetime, StructuredPermissionEffect::Allow));
+        for rule in &rules {
+            create(&database, PermissionOwner::Persistent, rule.clone());
+        }
+        let before = database.permission_generation().unwrap();
+        let prepared = prepare_mutations(
+            vec![
+                database
+                    .permission_snapshot(PermissionOwner::Persistent)
+                    .unwrap(),
+            ],
+            rules
+                .iter()
+                .map(|rule| PermissionMutation::Revoke {
+                    source: PermissionRecordIdentity {
+                        owner: PermissionOwner::Persistent,
+                        record_id: rule.id.clone(),
+                    },
+                })
+                .collect(),
+        )
+        .unwrap();
+        database.commit_permission_mutation(&prepared).unwrap();
+        let after = database
+            .permission_snapshot(PermissionOwner::Persistent)
+            .unwrap();
+        assert!(after.records.iter().all(|record| !record.is_active()));
+        assert_ne!(database.permission_generation().unwrap(), before);
+        assert!(
+            database
+                .permission_receipt(prepared.operation_id())
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test_case(false; "new_rule")]

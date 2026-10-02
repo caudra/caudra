@@ -1,21 +1,25 @@
 use caudra_agent::permissions::{
-    ActivePolicyRule, PermissionArgumentConstraint, PermissionLifetime, PermissionResourceKind,
-    PermissionResourceSelector, PermissionReviewSource, PermissionRuleRecord, PermissionSubject,
-    StructuredPermissionEffect, VerifiedLocalSourceLocator,
-    pattern_recognition::{MAX_RECOGNIZER_SUGGESTIONS, PatternCandidate, RecognizerLimits},
+    ActivePolicyRule, PermissionArgumentConstraint, PermissionResourceKind, PermissionRuleRecord,
+    PermissionSubject, RuleOrigin, StructuredPermissionEffect, VerifiedLocalSourceLocator,
+    pattern_recognition::{
+        CandidateEvidence, MAX_RECOGNIZER_SUGGESTIONS, ObservationProvenance, PatternCandidate,
+        RecognizerLimits,
+    },
 };
 use caudra_config::{
     Effect, PermissionReviewCandidate, PermissionReviewKind, PermissionRule, PermissionSource,
+    ToolKey,
 };
 use caudra_grab::grab_scope;
 use caudra_storage::permission_patterns::{
     ArgumentDomain, ObservedTuple, OptionLikePolicy, PatternDefinition, PatternToken,
-    SlotCombinations, SlotId,
+    SlotCombinations,
 };
 use caudra_workbench::keys::{LIST_FIRST, LIST_LAST};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 use serde_json::Value;
@@ -28,11 +32,11 @@ use crate::components::keybindings::Bind;
 use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::components::modal::{CHROME_LINES, FooterHits, FooterLine, Modal};
-use crate::components::permission_scope::editor::{EditorEvent, EditorLaunch, ScopeEditor};
-use crate::components::permission_scope::{
-    model::{ScopeActivity, ScopeModel, rule_kind},
-    view::ScopeView,
+use crate::components::permission_prompt::{
+    lifetime_phrase, origin_word, pattern_summary, rule_phrase, rule_summary, slot_name, tilde,
+    tool_words,
 };
+use crate::components::permission_scope::editor::{EditorEvent, EditorLaunch, ScopeEditor};
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::components::{Hint, HintBar, ModalScroll, Overlay, escape_terminal_controls, hint_line};
 use crate::theme;
@@ -65,8 +69,12 @@ const MAX_INPUT_DEPTH: usize = 4;
 const UNAVAILABLE: &str = "unavailable";
 const OMITTED: &str = "[omitted: display limit]";
 const SUGGESTED_SECTION: &str = "Suggested · not active";
+const PROJECT_CONFIG_SECTION: &str = "Project configuration";
+const STORED_SECTION: &str = "Stored permissions";
+const POLICY_SECTION: &str = "Active policy · read-only";
+const REVIEW_SECTION: &str = "Needs review · inactive";
 const SUGGESTED_TITLE: &str = " Proposal evidence · not active ";
-const SUGGESTED_GUIDANCE: &str = "Create permission opens a draft for current-identity validation. Evidence alone grants nothing.";
+const SUGGESTED_GUIDANCE: &str = "Not active: a proposal allows nothing. Create permission (Ctrl-E) opens a draft you review before saving.";
 const SUGGESTED_DISMISSAL_HELP: &str =
     "Dismiss: this definition in this project. Snooze: hide it in this project for 24 hours.";
 const MAX_SUGGESTION_EXAMPLES: usize = 3;
@@ -76,7 +84,9 @@ const INSPECTOR_HEIGHT_PERCENT: u16 = 80;
 const SCROLLBAR_WIDTH: u16 = 1;
 const MANAGER_SIZE_PERCENT: u16 = 95;
 const SIDE_BY_SIDE_WIDTH: u16 = 110;
-const LIST_WIDTH: u16 = 56;
+/// Rows are sentences with a place and an origin, so the list takes the
+/// larger share and the short summary beside it the rest.
+const LIST_PERCENT: u16 = 55;
 const PANE_GAP: u16 = 1;
 const MIN_CHROME_HEIGHT: u16 = 16;
 const DISCOVERY_WARNING: &str = "Imported history is unverified. Standard Bash startup and tool identity are assumed; current stored cwd approximates historical context. Execution success is not proven.";
@@ -85,10 +95,56 @@ const DISCOVERY_IDLE: &str = "Scan local saved history for suggested command pat
 const DISCOVERY_LOADING: &str = "Reading and analyzing a bounded history sample in the background. Cancel stops this request; active permissions are unchanged.";
 const DISCOVERY_CANCELLED: &str =
     "Scan cancelled. No late result from this request will be installed. Refresh to scan again.";
-const READ_ONLY_POLICY: &str = "Read-only: no verified local source locator or supported editing API. No saved override is created.";
-const INACTIVE_ALLOW: &str = "This legacy allow is inactive. Re-approve the next exact request or remove the old config entry.";
+const READ_ONLY_POLICY: &str =
+    "It can't be changed here. Change it where it was set, such as your config or the plugin.";
+const EDIT_AT_SOURCE: &str = "Ctrl-E opens the file it comes from.";
+const INACTIVE_ALLOW: &str = "Caudra no longer applies it. Approve the next matching request again, or remove the entry from the config.";
 const CONFIRM_REVOKE_MESSAGE: &str =
-    "Revoke this permission? Press Enter/y to confirm or Esc to cancel.";
+    "Revoke this permission? Press Enter or y to confirm, or Esc to cancel.";
+const REVOKE_CAUTION: &str = "Calls already running are not stopped. Revoking a Deny or Ask rule can let more run without asking.";
+const TRUST_MESSAGE: &str = "Trust this project's permissions.toml? Its shell allow rules start to apply, and any edit to the file withdraws trust. Press Enter or y to confirm, or Esc to cancel.";
+const REVOKE_TRUST_MESSAGE: &str = "Stop trusting this project's permissions.toml? Its shell allow rules stop applying. Press Enter or y to confirm, or Esc to cancel.";
+const PROJECT_CONFIG: &str = "Project permissions.toml";
+const TRUSTED_CONFIG: &str = "Shell allow patterns are active · trust can be revoked";
+const UNTRUSTED_CONFIG: &str =
+    "Shell allow patterns are inactive · nothing is granted until you trust them";
+const TRUST_REVIEW: &str = "Enter reviews the trust change before you confirm it.";
+const TRUST_HINT: &str = "Trust or revoke";
+const TRUSTED: &str = "trusted";
+const NOT_TRUSTED: &str = "not trusted";
+const ALLOW: &str = "Allow";
+const ASK: &str = "Ask";
+const DENY: &str = "Deny";
+/// The widest effect word, so every row's scope starts in one column.
+const EFFECT_WIDTH: usize = 5;
+/// The widest place a row names, `this conversation`, so origins line up.
+const PLACE_WIDTH: usize = 17;
+const EFFECT_GAP: &str = "  ";
+const ALWAYS: &str = "always";
+const INACTIVE: &str = "inactive";
+const REVOKED: &str = "revoked";
+const OTHER_PROJECT: &str = "other project";
+const YOU: &str = "you";
+const CONFIG: &str = "config";
+const ANY_TOOL: &str = "any tool";
+const ANYTHING: &str = "anything";
+const TOOL_PREFIX: &str = "Tool: ";
+const FIXED_INPUT: &str = "Fixed input: ";
+const FIELD_PATH: &str = "pointer";
+const FIELD_VALUE: &str = "value";
+const NOT_SET: &str = "not set";
+const NAMED: &str = "Named: ";
+const ADDED_BY_YOU: &str = " · added by you";
+const REVOKED_NOTE: &str = "Revoked; it no longer applies";
+const FROM_CONFIG: &str = "Set in your permissions configuration.";
+const BUILT_IN_RULE: &str = "Built into Caudra.";
+const FROM_PLUGIN: &str = "Added by a plugin you trust.";
+const NATIVE_PLACE: &str = "conversation";
+const NATIVE_PLACES: &str = "conversations";
+const IMPORTED_PLACE: &str = "session";
+const IMPORTED_PLACES: &str = "sessions";
+const NATIVE_SOURCE: &str = "Seen in your Caudra conversations.";
+const IMPORTED_SOURCE: &str = "Seen in imported history, which Caudra can't verify.";
 
 pub(crate) enum PermissionsPickerAction {
     Consumed,
@@ -182,7 +238,7 @@ enum PickerEntry {
     Stored(Arc<PermissionRuleRecord>),
     Discovered(Arc<PatternCandidate>),
     Policy {
-        source: &'static str,
+        origin: RuleOrigin,
         rule: PermissionRule,
         locator: Option<VerifiedLocalSourceLocator>,
     },
@@ -190,44 +246,64 @@ enum PickerEntry {
     ProjectConfig,
 }
 
+/// One row: a sentence of effect and scope, with where it applies and who
+/// added it on the right.
 #[derive(Clone, PartialEq)]
 struct PermissionEntry {
     source: PickerEntry,
     id: Option<String>,
-    tool: String,
-    detail: String,
-    description: Option<String>,
+    label: String,
+    status: Option<String>,
+    /// What the proposal inspector shows; proposals only.
+    evidence: Option<String>,
     read_only_policy: bool,
     project_config_action: Option<ProjectConfigAction>,
     suggestion: Option<SuggestedPatternTarget>,
 }
 
 impl PermissionEntry {
-    fn scope(&self) -> Option<ScopeModel> {
+    fn effect(&self) -> Option<StructuredPermissionEffect> {
         match &self.source {
-            PickerEntry::Stored(record) => Some(ScopeModel::record(record.clone())),
-            PickerEntry::Discovered(candidate) => Some(ScopeModel::candidate(candidate.clone())),
-            _ => None,
+            PickerEntry::Stored(record) => Some(record.rule.effect.clone()),
+            PickerEntry::Policy { rule, .. } => Some(configured_effect(&rule.effect)),
+            PickerEntry::Review(_) => Some(StructuredPermissionEffect::Allow),
+            PickerEntry::Discovered(_) | PickerEntry::ProjectConfig => None,
         }
     }
 }
 
 impl PickerItem for PermissionEntry {
     fn label(&self) -> &str {
-        &self.tool
+        &self.label
+    }
+
+    fn detail(&self) -> Option<&str> {
+        self.status.as_deref()
+    }
+
+    fn lead(&self) -> Option<(usize, Style)> {
+        let effect = self.effect()?;
+        let theme = theme::current();
+        let style = match (&self.source, &effect) {
+            (PickerEntry::Review(_), _) => theme.tool_dim,
+            (_, StructuredPermissionEffect::Allow) => theme.tool_success,
+            (_, StructuredPermissionEffect::Ask) => theme.tool_warning,
+            (_, StructuredPermissionEffect::Deny) => theme.tool_error,
+        };
+        Some((effect_word(&effect).len(), style))
     }
 
     fn section(&self) -> Option<&str> {
         Some(if self.suggestion.is_some() {
             SUGGESTED_SECTION
         } else if self.project_config_action.is_some() {
-            "Project configuration"
+            PROJECT_CONFIG_SECTION
         } else if self.id.is_some() {
-            "Stored permissions"
+            STORED_SECTION
         } else if self.read_only_policy {
-            "Active policy · read-only"
+            POLICY_SECTION
         } else {
-            "Needs review · inactive"
+            REVIEW_SECTION
         })
     }
 }
@@ -249,7 +325,6 @@ pub(crate) struct PermissionsPicker {
     toolbar_hits: FooterHits,
     tabs_hits: FooterHits,
     footer: HintBar,
-    scope_view: ScopeView,
     editor: Option<ScopeEditor>,
     current_project: Option<PathBuf>,
     project_filter: ProjectFilter,
@@ -349,7 +424,6 @@ impl PermissionsPicker {
             toolbar_hits: FooterHits::default(),
             tabs_hits: FooterHits::default(),
             footer: HintBar::default(),
-            scope_view: ScopeView::default(),
             editor: None,
             current_project: None,
             project_filter: ProjectFilter::All,
@@ -371,7 +445,11 @@ impl PermissionsPicker {
                     .then(|| project_config_entry(ProjectConfigAction::RevokeTrust))
             })
             .into_iter()
-            .chain(rules.into_iter().map(entry))
+            .chain(
+                rules
+                    .into_iter()
+                    .map(|record| entry(Arc::new(record), self.current_project.as_deref())),
+            )
             .chain(review_candidates.iter().map(review_entry))
             .chain(effective_policy.iter().map(policy_entry))
             .collect();
@@ -656,20 +734,11 @@ impl PermissionsPicker {
                 && self.mode == PermissionsMode::Discover
                 && !self.discovery_view
             {
-                self.scope_view.handle_key(key);
+                self.inspect_suggestion();
             } else if key::QUIT.matches(key) {
                 return PermissionsPickerAction::Close;
             } else {
-                if self
-                    .picker
-                    .selected_item()
-                    .and_then(PermissionEntry::scope)
-                    .is_some()
-                {
-                    self.scope_view.handle_key(key);
-                } else {
-                    self.detail.scroll.handle_key(key);
-                }
+                self.detail.scroll.handle_key(key);
             }
             return PermissionsPickerAction::Consumed;
         }
@@ -716,24 +785,6 @@ impl PermissionsPicker {
             return self.handle_key(key);
         }
         if self.has_pending_confirmation() {
-            return PermissionsPickerAction::Consumed;
-        }
-        if self.notice.is_none()
-            && !self.discovery_view
-            && self
-                .detail
-                .popup
-                .contains(Position::new(event.column, event.row))
-            && self
-                .picker
-                .selected_item()
-                .and_then(PermissionEntry::scope)
-                .is_some()
-            && self.scope_view.handle_mouse(event)
-        {
-            if event.kind == MouseEventKind::Down(MouseButton::Left) {
-                self.detail_focused = true;
-            }
             return PermissionsPickerAction::Consumed;
         }
         if self.detail.handle_mouse(event) {
@@ -783,7 +834,6 @@ impl PermissionsPicker {
         }
         let position = Position::new(event.column, event.row);
         if self.detail.popup.contains(position) {
-            self.scope_view.handle_mouse(event);
             if event.kind == MouseEventKind::Down(MouseButton::Left) {
                 self.detail_focused = true;
             }
@@ -828,7 +878,6 @@ impl PermissionsPicker {
             return;
         }
         if self.detail_focused {
-            self.scope_view.scroll(delta);
             self.detail.scroll.scroll(delta);
         } else {
             let selected = self.picker.selected_index();
@@ -845,7 +894,6 @@ impl PermissionsPicker {
         if self.suggestion_inspector.is_some() || self.has_pending_confirmation() {
             self.scroll(delta);
         } else if self.detail.popup.contains(position) {
-            self.scope_view.scroll(delta);
             self.detail.scroll.scroll(delta);
         } else if self.picker.contains(position) {
             let selected = self.picker.selected_index();
@@ -865,12 +913,12 @@ impl PermissionsPicker {
     pub(crate) fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
         grab_scope!("permissions_picker", area);
         if let Some(inspector) = &mut self.suggestion_inspector {
-            let description = self
+            let evidence = self
                 .picker
                 .selected_item()
-                .and_then(|entry| entry.description.as_deref())
+                .and_then(|entry| entry.evidence.as_deref())
                 .unwrap_or(UNAVAILABLE);
-            return inspector.view(frame, area, description);
+            return inspector.view(frame, area, evidence);
         }
         if !self.has_pending_confirmation() {
             let selected = self.picker.selected_item();
@@ -1041,7 +1089,7 @@ impl PermissionsPicker {
             }
         } else {
             let [list, _, detail] = Layout::horizontal([
-                Constraint::Length(LIST_WIDTH),
+                Constraint::Percentage(LIST_PERCENT),
                 Constraint::Length(PANE_GAP),
                 Constraint::Min(0),
             ])
@@ -1074,25 +1122,6 @@ impl PermissionsPicker {
         if area.is_empty() {
             return;
         }
-        if self.notice.is_none()
-            && !self.discovery_view
-            && let Some(mut model) = self.picker.selected_item().and_then(PermissionEntry::scope)
-        {
-            if let Some(current) = &self.current_project
-                && let Some(PickerEntry::Stored(record)) =
-                    self.picker.selected_item().map(|entry| &entry.source)
-                && record
-                    .project
-                    .as_ref()
-                    .is_some_and(|project| project != current)
-                && record.revoked_at.is_none()
-            {
-                model.activity = ScopeActivity::OtherProject;
-            }
-            self.scope_view
-                .render(&model, area, frame.buffer_mut(), &theme::current());
-            return;
-        }
         let theme = theme::current();
         let block = Block::bordered()
             .title(if self.mode == PermissionsMode::Discover {
@@ -1112,32 +1141,16 @@ impl PermissionsPicker {
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let lines = if let Some(notice) = &self.notice {
-            vec![Line::styled(notice.clone(), theme.panel_title)]
+            notice
+                .lines()
+                .map(|line| Line::styled(line.to_owned(), theme.panel_title))
+                .collect()
         } else if self.mode == PermissionsMode::Discover
             && (self.discovery_view || self.picker.selected_item().is_none())
         {
             self.discovery_lines()
         } else if let Some(entry) = self.picker.selected_item() {
-            let mut lines = if entry.suggestion.is_some() {
-                Vec::new()
-            } else {
-                vec![Line::styled(entry.detail.clone(), theme.item_desc)]
-            };
-            lines.extend(
-                entry
-                    .description
-                    .as_deref()
-                    .unwrap_or(if entry.read_only_policy {
-                        READ_ONLY_POLICY
-                    } else if entry.project_config_action.is_some() {
-                        "Enter reviews the trust change before confirmation."
-                    } else {
-                        INACTIVE_ALLOW
-                    })
-                    .lines()
-                    .map(|line| Line::from(line.to_owned())),
-            );
-            lines
+            summary_lines(entry, self.current_project.as_deref())
         } else {
             vec![Line::from(EMPTY)]
         };
@@ -1262,7 +1275,6 @@ impl PermissionsPicker {
     fn selection_changed(&mut self, previous: Option<usize>) {
         if previous != self.picker.selected_index() {
             self.toolbar_hits.clear();
-            self.scope_view = ScopeView::default();
             self.detail.scroll.reset();
             self.discovery_view = false;
             self.notice = None;
@@ -1302,33 +1314,24 @@ impl PermissionsPicker {
 
     fn confirm_project_config_action(&mut self, action: ProjectConfigAction) {
         self.pending_project_config_action = Some(action);
-        let message = match action {
-            ProjectConfigAction::Trust => {
-                "Trust the exact project shell allow configuration? Edits invalidate trust. Press Enter/y to confirm or Esc to cancel."
+        self.notice = Some(
+            match action {
+                ProjectConfigAction::Trust => TRUST_MESSAGE,
+                ProjectConfigAction::RevokeTrust => REVOKE_TRUST_MESSAGE,
             }
-            ProjectConfigAction::RevokeTrust => {
-                "Revoke trust in this project permission config? Its shell allows will become inactive. Press Enter/y to confirm or Esc to cancel."
-            }
-        };
-        self.notice = Some(message.into());
+            .into(),
+        );
         self.detail.scroll.reset();
     }
 
     fn confirm_revoke(&mut self, id: String) {
         self.pending_revoke = Some(id);
-        self.notice = Some(format!(
-            "{CONFIRM_REVOKE_MESSAGE}\nOpaque constraints remain unknown; removing Deny/Ask can increase authority. Already-running calls cannot be undone."
-        ));
+        self.notice = Some(format!("{CONFIRM_REVOKE_MESSAGE}\n{REVOKE_CAUTION}"));
         self.detail.scroll.reset();
     }
 
-    fn show_read_only(&mut self, read_only_policy: bool) {
-        let message = if read_only_policy {
-            READ_ONLY_POLICY
-        } else {
-            INACTIVE_ALLOW
-        };
-        self.notice = Some(message.into());
+    fn show_read_only(&mut self) {
+        self.notice = Some(READ_ONLY_POLICY.into());
         self.detail.scroll.reset();
     }
 
@@ -1343,7 +1346,14 @@ impl PermissionsPicker {
     pub(crate) fn set_current_project(&mut self, project: Option<PathBuf>) {
         if self.current_project != project {
             self.current_project = project;
-            self.scope_view = ScopeView::default();
+            for permission in &mut self.entries {
+                if let PickerEntry::Stored(record) = &permission.source {
+                    *permission = entry(Arc::clone(record), self.current_project.as_deref());
+                }
+            }
+            if self.mode == PermissionsMode::Rules && self.picker.is_open() {
+                self.picker.replace_items(self.visible_entries());
+            }
             self.toolbar_hits.clear();
             if let Some(editor) = &mut self.editor {
                 editor.suspend();
@@ -1362,7 +1372,6 @@ impl PermissionsPicker {
             ProjectFilter::History => ProjectFilter::All,
         };
         self.picker.replace_items(self.visible_entries());
-        self.scope_view = ScopeView::default();
         self.tabs_hits.clear();
         self.toolbar_hits.clear();
     }
@@ -1386,7 +1395,7 @@ impl PermissionsPicker {
                 ..
             }) if !duplicate => PermissionsPickerAction::EditSource(locator),
             Some(_) => {
-                self.show_read_only(true);
+                self.show_read_only();
                 self.detail_focused = true;
                 PermissionsPickerAction::Consumed
             }
@@ -1407,7 +1416,7 @@ impl PermissionsPicker {
                 draft: None,
             })
         } else {
-            self.show_read_only(true);
+            self.show_read_only();
             PermissionsPickerAction::Consumed
         }
     }
@@ -1437,18 +1446,18 @@ impl Overlay for PermissionsPicker {
 }
 
 fn project_config_entry(action: ProjectConfigAction) -> PermissionEntry {
-    let trusted = action == ProjectConfigAction::RevokeTrust;
     PermissionEntry {
         source: PickerEntry::ProjectConfig,
         id: None,
-        tool: "Project permissions.toml".into(),
-        detail: if trusted {
-            "shell allow patterns are active · trust can be revoked"
-        } else {
-            "shell allow patterns are inactive · no authority has been granted"
-        }
-        .into(),
-        description: None,
+        label: PROJECT_CONFIG.into(),
+        status: Some(
+            match action {
+                ProjectConfigAction::Trust => NOT_TRUSTED,
+                ProjectConfigAction::RevokeTrust => TRUSTED,
+            }
+            .into(),
+        ),
+        evidence: None,
         read_only_policy: false,
         project_config_action: Some(action),
         suggestion: None,
@@ -1465,18 +1474,20 @@ fn suggestion_entry(
         return None;
     }
     let definition_id = definition.fingerprint().ok()?;
-    let detail = format!(
-        "[{}] {} observations · {} sessions · not active",
-        candidate.evidence.review_origin(),
-        candidate.evidence.support.observations,
-        candidate.evidence.support.independent_sessions,
-    );
     let template = suggestion_template(definition, None);
-    let mut lines = vec![format!("Command template: {template}"), detail.clone()];
+    let mut lines = vec![
+        format!("Command template: {template}"),
+        format!(
+            "[{}] {} observations · {} sessions · not active",
+            candidate.evidence.review_origin(),
+            candidate.evidence.support.observations,
+            candidate.evidence.support.independent_sessions,
+        ),
+    ];
     for slot in definition.slots.iter().take(MAX_DISPLAY_ITEMS) {
         lines.push(format!(
             "{}: {}",
-            suggestion_slot(definition, slot.id),
+            slot_name(definition, slot.id),
             suggestion_domain(&slot.domain)
         ));
         lines.push(
@@ -1545,9 +1556,9 @@ fn suggestion_entry(
     Some(PermissionEntry {
         source: PickerEntry::Discovered(Arc::new(candidate.clone())),
         id: None,
-        tool: template,
-        detail,
-        description: Some(bounded_text(&lines.join("\n"), MAX_SUGGESTION_DETAIL_CHARS)),
+        label: format!("{}: {template}", seen_phrase(&candidate.evidence)),
+        status: None,
+        evidence: Some(bounded_text(&lines.join("\n"), MAX_SUGGESTION_DETAIL_CHARS)),
         read_only_policy: false,
         project_config_action: None,
         suggestion: Some(SuggestedPatternTarget {
@@ -1558,13 +1569,19 @@ fn suggestion_entry(
     })
 }
 
-fn suggestion_slot(definition: &PatternDefinition, id: SlotId) -> String {
-    let index = definition
-        .slots
-        .iter()
-        .position(|slot| slot.id == id)
-        .unwrap_or_default();
-    format!("<arg{}>", index + 1)
+/// How often a proposal was seen: `Seen 12× in 4 conversations`.
+fn seen_phrase(evidence: &CandidateEvidence) -> String {
+    let sessions = evidence.support.independent_sessions;
+    let place = match (&evidence.provenance, sessions == 1) {
+        (ObservationProvenance::Native, true) => NATIVE_PLACE,
+        (ObservationProvenance::Native, false) => NATIVE_PLACES,
+        (_, true) => IMPORTED_PLACE,
+        (_, false) => IMPORTED_PLACES,
+    };
+    format!(
+        "Seen {}× in {sessions} {place}",
+        evidence.support.observations
+    )
 }
 
 fn suggestion_literal(value: &str) -> String {
@@ -1581,7 +1598,7 @@ fn suggestion_template(definition: &PatternDefinition, values: Option<&ObservedT
             PatternToken::Slot { id, .. } => values
                 .and_then(|values| values.get(id))
                 .map(|value| suggestion_literal(value))
-                .unwrap_or_else(|| suggestion_slot(definition, *id)),
+                .unwrap_or_else(|| slot_name(definition, *id)),
         })
         .collect();
     if definition.argv.len() > MAX_DISPLAY_ITEMS {
@@ -1621,135 +1638,254 @@ fn suggestion_domain(domain: &ArgumentDomain) -> String {
     }
 }
 
-fn entry(record: PermissionRuleRecord) -> PermissionEntry {
-    let fallback_tool = match &record.rule.subject {
-        PermissionSubject::Native { contract, .. } => contract.clone(),
-        PermissionSubject::Lua { plugin, tool, .. } => format!("{plugin}:{tool}"),
-        PermissionSubject::Mcp { server, tool, .. } => format!("{server}.{tool}"),
-        PermissionSubject::RemoteWorkcell { tool, .. } => format!("remote.{tool}"),
-        PermissionSubject::RemoteNative { owner, .. } => format!("remote.{owner}"),
-        PermissionSubject::UnknownLegacy { identity } => identity.clone(),
-    };
-    let review = record.review.as_ref();
-    let tool = display_text(
-        record
-            .label
-            .as_ref()
-            .unwrap_or_else(|| review.map_or(&fallback_tool, |review| &review.tool)),
-        MAX_FIELD_CHARS,
-    );
-    let mut description = vec![tool.clone()];
-    if let Some(review) = review {
-        description.push(format!(
-            "Authority: {}",
-            display_text(&review.authority, MAX_FIELD_CHARS)
-        ));
-        description.push(format!(
-            "Review: {}",
-            match review.source {
-                PermissionReviewSource::Approved => "approved",
-                PermissionReviewSource::Recovered => "recovered",
-                PermissionReviewSource::Unavailable => UNAVAILABLE,
-            }
-        ));
-    } else {
-        description.push(format!("Review: {UNAVAILABLE}"));
-    }
-    let mut scopes = Vec::new();
-    for (index, constraint) in record
-        .rule
-        .resources
-        .iter()
-        .take(MAX_DISPLAY_ITEMS)
-        .enumerate()
-    {
-        let resource = review.and_then(|review| {
-            review
-                .resources
-                .iter()
-                .find(|resource| resource.index == index)
-        });
-        let value = resource
-            .and_then(|resource| resource.value.as_deref())
-            .unwrap_or(UNAVAILABLE);
-        scopes.push(display_text(value, MAX_FIELD_CHARS));
-        let kind = match &constraint.kind {
-            PermissionResourceKind::File => "File",
-            PermissionResourceKind::Directory => "Directory",
-            PermissionResourceKind::Url => "URL",
-            PermissionResourceKind::Command => "Command",
-            PermissionResourceKind::Query => "Query",
-            PermissionResourceKind::RemoteFile { .. } => "Remote file",
-            PermissionResourceKind::RemoteDirectory { .. } => "Remote directory",
-            PermissionResourceKind::RemoteResource { resource_kind, .. } => resource_kind,
-            PermissionResourceKind::Custom { name } => name,
-        };
-        description.push(format!(
-            "Scope {} ({}): {} · access {} · protected {}",
-            index + 1,
-            display_text(kind, MAX_FIELD_CHARS),
-            display_text(value, MAX_FIELD_CHARS),
-            constraint
-                .access
-                .as_ref()
-                .map_or_else(|| "any".into(), |access| format!("{access:?}")),
-            constraint
-                .protected
-                .map_or_else(|| "any".into(), |protected| protected.to_string())
-        ));
-        for key in constraint.attributes.keys().take(MAX_DISPLAY_ITEMS) {
-            let value = resource
-                .and_then(|resource| resource.attributes.get(key))
-                .map(String::as_str)
-                .unwrap_or(UNAVAILABLE);
-            description.push(format!(
-                "{}: {}",
-                display_text(key, MAX_FIELD_CHARS),
-                display_text(value, MAX_FIELD_CHARS)
-            ));
-        }
-        if constraint.attributes.len() > MAX_DISPLAY_ITEMS {
-            description.push(OMITTED.into());
-        }
-    }
-    if record.rule.resources.len() > MAX_DISPLAY_ITEMS {
-        description.push(OMITTED.into());
-    }
-    let input = review
-        .and_then(|review| review.input.as_ref())
-        .map(|input| input_description(input, 0))
-        .unwrap_or_else(|| {
-            if matches!(
-                record.rule.arguments,
-                PermissionArgumentConstraint::Unconstrained
-            ) {
-                "unconstrained".into()
-            } else {
-                UNAVAILABLE.into()
-            }
-        });
-    description.push(format!("Input: {input}"));
-    let detail = format!(
-        "[{}] {} · {}",
-        authority_badge(&record),
-        effect_name(&record.rule.effect),
-        lifetime_name(&record.rule.lifetime),
-    );
-    description.insert(1, detail.clone());
-    let label = if scopes.is_empty() {
-        input
-    } else {
-        scopes.join(" · ")
-    };
+fn entry(record: Arc<PermissionRuleRecord>, current: Option<&Path>) -> PermissionEntry {
     PermissionEntry {
         id: Some(record.id.clone()),
-        source: PickerEntry::Stored(Arc::new(record)),
-        tool: display_text(&format!("{tool} · {label}"), MAX_DISPLAY_CHARS),
-        detail,
-        description: Some(bounded_text(&description.join("\n"), MAX_DISPLAY_CHARS)),
+        label: row_label(&record.rule.effect, &record_phrase(&record, current)),
+        status: Some(record_status(&record, current)),
+        source: PickerEntry::Stored(record),
+        evidence: None,
         read_only_policy: false,
         project_config_action: None,
         suggestion: None,
+    }
+}
+
+/// The tool a stored rule names, as its review recorded it.
+fn record_tool(record: &PermissionRuleRecord) -> String {
+    if let Some(review) = &record.review {
+        return review.tool.clone();
+    }
+    match &record.rule.subject {
+        PermissionSubject::Native { contract, .. } => contract.clone(),
+        PermissionSubject::Lua { tool, .. }
+        | PermissionSubject::Mcp { tool, .. }
+        | PermissionSubject::RemoteWorkcell { tool, .. } => tool.clone(),
+        PermissionSubject::RemoteNative { owner, .. } => owner.clone(),
+        PermissionSubject::UnknownLegacy { identity } => identity.clone(),
+    }
+}
+
+/// A stored rule's scope as a row names it. Commands, pages, searches, and
+/// paths say what they reach on their own; anything else names its tool. A
+/// command names its folder only when it starts outside the rule's project,
+/// or outside the current one for a rule bound to none.
+fn record_phrase(record: &PermissionRuleRecord, current: Option<&Path>) -> String {
+    let phrase = rule_phrase(
+        &record.rule,
+        record.review.as_ref(),
+        record.project.as_deref().or(current),
+    );
+    let self_describing = !record.rule.resources.is_empty()
+        && record.rule.resources.iter().all(|resource| {
+            matches!(
+                resource.kind,
+                PermissionResourceKind::Command
+                    | PermissionResourceKind::Url
+                    | PermissionResourceKind::Query
+                    | PermissionResourceKind::File
+                    | PermissionResourceKind::Directory
+            )
+        });
+    match self_describing {
+        true => phrase,
+        false => format!("{}: {phrase}", record_tool(record)),
+    }
+}
+
+fn other_project(record: &PermissionRuleRecord, current: Option<&Path>) -> bool {
+    current.is_some_and(|current| {
+        record
+            .project
+            .as_deref()
+            .is_some_and(|project| project != current)
+    })
+}
+
+/// Where a stored rule applies, as its row says it.
+fn record_status(record: &PermissionRuleRecord, current: Option<&Path>) -> String {
+    let place = if record.revoked_at.is_some() {
+        REVOKED
+    } else if other_project(record, current) {
+        OTHER_PROJECT
+    } else {
+        lifetime_phrase(&record.rule.lifetime)
+    };
+    row_status(place, YOU)
+}
+
+fn effect_word(effect: &StructuredPermissionEffect) -> &'static str {
+    match effect {
+        StructuredPermissionEffect::Allow => ALLOW,
+        StructuredPermissionEffect::Ask => ASK,
+        StructuredPermissionEffect::Deny => DENY,
+    }
+}
+
+fn configured_effect(effect: &Effect) -> StructuredPermissionEffect {
+    match effect {
+        Effect::Allow => StructuredPermissionEffect::Allow,
+        Effect::Ask => StructuredPermissionEffect::Ask,
+        Effect::Deny => StructuredPermissionEffect::Deny,
+    }
+}
+
+/// `Allow  cargo test *`: the effect padded so every scope starts in one
+/// column.
+fn row_label(effect: &StructuredPermissionEffect, phrase: &str) -> String {
+    display_text(
+        &format!("{:<EFFECT_WIDTH$}{EFFECT_GAP}{phrase}", effect_word(effect)),
+        MAX_DISPLAY_CHARS,
+    )
+}
+
+fn row_status(place: &str, origin: &str) -> String {
+    format!("{place:<PLACE_WIDTH$}{EFFECT_GAP}{origin}")
+}
+
+/// A configured rule's scope: `bash: git push *`, `any tool: anything`.
+fn config_rule_phrase(tool: &ToolKey, scope: Option<&str>) -> String {
+    let tool = match tool {
+        ToolKey::Wildcard => ANY_TOOL.into(),
+        tool => tool.to_string(),
+    };
+    format!("{tool}: {}", scope.map_or_else(|| ANYTHING.into(), tilde))
+}
+
+/// What the selected row allows, said plainly: the same sentences prompt
+/// Details uses, then where it applies and who added it.
+fn summary_lines(entry: &PermissionEntry, current: Option<&Path>) -> Vec<Line<'static>> {
+    let theme = theme::current();
+    let title =
+        |text: String| Line::styled(display_text(&text, MAX_DISPLAY_CHARS), theme.panel_title);
+    let plain = |text: &str| Line::from(display_text(text, MAX_DISPLAY_CHARS));
+    let muted =
+        |text: String| Line::styled(display_text(&text, MAX_DISPLAY_CHARS), theme.item_desc);
+    match &entry.source {
+        PickerEntry::Stored(record) => {
+            let review = record.review.as_ref();
+            let mut lines = vec![title(format!(
+                "{} {}",
+                effect_word(&record.rule.effect),
+                record_phrase(record, current)
+            ))];
+            lines.extend(
+                rule_summary(&record.rule, review, current)
+                    .lines
+                    .iter()
+                    .map(|line| plain(line)),
+            );
+            if let Some(input) = review.and_then(|review| review.input.as_ref())
+                && let Some(fixed) = fixed_input(&record.rule.arguments, input)
+            {
+                lines.push(plain(&format!("{FIXED_INPUT}{fixed}")));
+            }
+            lines.push(Line::default());
+            lines.push(muted(if record.revoked_at.is_some() {
+                format!("{REVOKED_NOTE}{ADDED_BY_YOU}")
+            } else if let Some(project) = record.project.as_deref()
+                && other_project(record, current)
+            {
+                format!(
+                    "Remembered for {}{ADDED_BY_YOU}. It doesn't apply in this project.",
+                    tilde(&project.to_string_lossy())
+                )
+            } else {
+                format!(
+                    "Remembered for {}{ADDED_BY_YOU}",
+                    lifetime_phrase(&record.rule.lifetime)
+                )
+            }));
+            if let Some(label) = &record.label {
+                lines.push(muted(format!("{NAMED}{label}")));
+            }
+            lines.push(muted(format!(
+                "{TOOL_PREFIX}{}",
+                tool_words(
+                    &record_tool(record),
+                    &record.rule.subject,
+                    &record.rule.executor
+                )
+            )));
+            lines
+        }
+        PickerEntry::Discovered(candidate) => {
+            let mut lines = vec![
+                title(seen_phrase(&candidate.evidence)),
+                plain(&suggestion_template(&candidate.definition, None)),
+            ];
+            lines.extend(
+                pattern_summary(&candidate.definition)
+                    .lines
+                    .iter()
+                    .map(|line| plain(line)),
+            );
+            lines.push(Line::default());
+            lines.push(muted(
+                match candidate.evidence.provenance {
+                    ObservationProvenance::Native => NATIVE_SOURCE,
+                    _ => IMPORTED_SOURCE,
+                }
+                .into(),
+            ));
+            lines.push(muted(SUGGESTED_GUIDANCE.into()));
+            lines
+        }
+        PickerEntry::Policy {
+            origin,
+            rule,
+            locator,
+        } => vec![
+            title(format!(
+                "{} {}",
+                effect_word(&configured_effect(&rule.effect)),
+                config_rule_phrase(&rule.tool, rule.scope.as_deref())
+            )),
+            plain(match origin {
+                RuleOrigin::Builtin => BUILT_IN_RULE,
+                RuleOrigin::Plugin => FROM_PLUGIN,
+                _ => FROM_CONFIG,
+            }),
+            Line::default(),
+            muted(
+                match locator {
+                    Some(_) => EDIT_AT_SOURCE,
+                    None => READ_ONLY_POLICY,
+                }
+                .into(),
+            ),
+        ],
+        PickerEntry::Review(candidate) => vec![
+            title(format!(
+                "{ALLOW} {}",
+                config_rule_phrase(
+                    candidate.tool.as_ref().unwrap_or(&ToolKey::Wildcard),
+                    candidate.scope.as_deref()
+                )
+            )),
+            plain(&format!(
+                "An old {} from {}.",
+                match candidate.kind {
+                    PermissionReviewKind::Rule => "allow rule",
+                    PermissionReviewKind::Default => "default allow",
+                },
+                match candidate.source {
+                    PermissionSource::Global => "your global config",
+                    PermissionSource::Project => "this project's config",
+                    PermissionSource::Conversation => "an earlier conversation",
+                }
+            )),
+            plain(INACTIVE_ALLOW),
+        ],
+        PickerEntry::ProjectConfig => vec![
+            title(PROJECT_CONFIG.into()),
+            plain(match entry.project_config_action {
+                Some(ProjectConfigAction::RevokeTrust) => TRUSTED_CONFIG,
+                _ => UNTRUSTED_CONFIG,
+            }),
+            Line::default(),
+            muted(TRUST_REVIEW.into()),
+        ],
     }
 }
 
@@ -1774,6 +1910,31 @@ fn display_text(text: &str, limit: usize) -> String {
         }
     }
     bounded_text(&safe, limit)
+}
+
+/// The inputs a rule holds fixed, as `name: value` pairs. A rule fixing only
+/// some fields was reviewed as one entry per field, naming it by its path.
+fn fixed_input(arguments: &PermissionArgumentConstraint, input: &Value) -> Option<String> {
+    let fields = match arguments {
+        PermissionArgumentConstraint::Unconstrained => return None,
+        PermissionArgumentConstraint::Exact { .. } => return Some(input_description(input, 0)),
+        PermissionArgumentConstraint::Selected { .. }
+        | PermissionArgumentConstraint::SelectedDigest { .. } => input.as_array()?,
+    };
+    let pairs: Vec<String> = fields
+        .iter()
+        .map(|field| {
+            let Some(path) = field.get(FIELD_PATH).and_then(Value::as_str) else {
+                return input_description(field, 1);
+            };
+            let name = display_text(path.strip_prefix('/').unwrap_or(path), MAX_FIELD_CHARS);
+            match field.get(FIELD_VALUE) {
+                Some(value) => format!("{name}: {}", input_description(value, 1)),
+                None => format!("{name}: {NOT_SET}"),
+            }
+        })
+        .collect();
+    Some(bounded_text(&pairs.join(", "), MAX_DISPLAY_CHARS))
 }
 
 fn input_description(value: &Value, depth: usize) -> String {
@@ -1813,147 +1974,47 @@ fn input_description(value: &Value, depth: usize) -> String {
 }
 
 fn review_entry(candidate: &PermissionReviewCandidate) -> PermissionEntry {
-    let source = match candidate.source {
-        PermissionSource::Global => "global config",
-        PermissionSource::Project => "project config",
-        PermissionSource::Conversation => "legacy conversation",
-    };
-    let kind = match candidate.kind {
-        PermissionReviewKind::Rule => "allow rule",
-        PermissionReviewKind::Default => "allow default",
-    };
-    let tool = candidate
-        .tool
-        .as_ref()
-        .map(ToString::to_string)
-        .unwrap_or_else(|| "*".into());
-    let scope = candidate.scope.as_deref().unwrap_or("<all>");
     PermissionEntry {
         source: PickerEntry::Review(candidate.clone()),
         id: None,
-        tool: display_text(&tool, MAX_FIELD_CHARS),
-        detail: format!(
-            "[needs review] inactive {kind} · {source} · scope {}",
-            display_text(scope, MAX_FIELD_CHARS)
+        label: row_label(
+            &StructuredPermissionEffect::Allow,
+            &config_rule_phrase(
+                candidate.tool.as_ref().unwrap_or(&ToolKey::Wildcard),
+                candidate.scope.as_deref(),
+            ),
         ),
-        description: None,
+        status: Some(row_status(
+            INACTIVE,
+            match candidate.source {
+                PermissionSource::Conversation => YOU,
+                PermissionSource::Global | PermissionSource::Project => CONFIG,
+            },
+        )),
+        evidence: None,
         read_only_policy: false,
         project_config_action: None,
         suggestion: None,
     }
 }
 
-fn policy_entry(entry: &ActivePolicyRule) -> PermissionEntry {
-    let scope = entry.rule.scope.as_deref().unwrap_or("<all>");
+fn policy_entry(policy: &ActivePolicyRule) -> PermissionEntry {
     PermissionEntry {
         source: PickerEntry::Policy {
-            source: entry.source,
-            rule: entry.rule.clone(),
-            locator: entry.verified_local_source_locator.clone(),
+            origin: policy.origin,
+            rule: policy.rule.clone(),
+            locator: policy.verified_local_source_locator.clone(),
         },
         id: None,
-        tool: display_text(&entry.rule.tool.to_string(), MAX_FIELD_CHARS),
-        detail: format!(
-            "[policy] {} · {} · scope {} · read-only",
-            match entry.rule.effect {
-                Effect::Allow => "allow",
-                Effect::Ask => "ask",
-                Effect::Deny => "deny",
-            },
-            display_text(entry.source, MAX_FIELD_CHARS),
-            display_text(scope, MAX_FIELD_CHARS),
+        label: row_label(
+            &configured_effect(&policy.rule.effect),
+            &config_rule_phrase(&policy.rule.tool, policy.rule.scope.as_deref()),
         ),
-        description: None,
+        status: Some(row_status(ALWAYS, origin_word(policy.origin))),
+        evidence: None,
         read_only_policy: true,
         project_config_action: None,
         suggestion: None,
-    }
-}
-
-fn authority_badge(record: &PermissionRuleRecord) -> String {
-    if record.rule.family.is_some()
-        || record.rule.resources.iter().any(|resource| {
-            matches!(
-                resource.selector,
-                PermissionResourceSelector::CommandTemplate { .. }
-                    | PermissionResourceSelector::RemoteResource { .. }
-                    | PermissionResourceSelector::RemoteSubtree { .. }
-                    | PermissionResourceSelector::Prefix { .. }
-                    | PermissionResourceSelector::Subtree { .. }
-            )
-        })
-    {
-        return rule_kind(&record.rule);
-    }
-    let argument = match record.rule.arguments {
-        PermissionArgumentConstraint::Exact { .. } => "exact",
-        PermissionArgumentConstraint::Selected { .. }
-        | PermissionArgumentConstraint::SelectedDigest { .. } => "selected",
-        PermissionArgumentConstraint::Unconstrained
-            if record.rule.resources.is_empty()
-                || record.rule.resources.iter().any(|resource| {
-                    matches!(resource.selector, PermissionResourceSelector::Any)
-                }) =>
-        {
-            "any"
-        }
-        PermissionArgumentConstraint::Unconstrained => "resource",
-    };
-    let selector = if record.rule.resources.iter().any(|resource| {
-        matches!(
-            resource.selector,
-            PermissionResourceSelector::UrlOriginDigest { .. }
-        )
-    }) {
-        "origin/**"
-    } else if record.rule.resources.iter().any(|resource| {
-        matches!(
-            resource.selector,
-            PermissionResourceSelector::CommandPattern { .. }
-        )
-    }) {
-        "command-pattern"
-    } else if record.rule.resources.iter().any(|resource| {
-        matches!(
-            resource.selector,
-            PermissionResourceSelector::UrlSubtreeDigest { .. }
-        )
-    }) {
-        "url/**"
-    } else if record.rule.resources.iter().any(|resource| {
-        matches!(
-            resource.selector,
-            PermissionResourceSelector::FilesystemSubtreeDigest { .. }
-        )
-    }) {
-        "directory/**"
-    } else if record
-        .rule
-        .resources
-        .iter()
-        .any(|resource| matches!(resource.selector, PermissionResourceSelector::Any))
-    {
-        "*"
-    } else {
-        "exact-resource"
-    };
-    format!("{argument}:{selector}")
-}
-
-fn effect_name(effect: &StructuredPermissionEffect) -> &'static str {
-    match effect {
-        StructuredPermissionEffect::Allow => "allow",
-        StructuredPermissionEffect::Deny => "deny",
-        StructuredPermissionEffect::Ask => "ask",
-    }
-}
-
-fn lifetime_name(lifetime: &PermissionLifetime) -> &'static str {
-    match lifetime {
-        PermissionLifetime::Once => "once",
-        PermissionLifetime::Conversation => "conversation",
-        PermissionLifetime::Project => "project",
-        PermissionLifetime::Global => "global",
     }
 }
 
@@ -1967,7 +2028,7 @@ fn footer() -> Vec<Hint> {
 
 fn trust_footer() -> Vec<Hint> {
     vec![
-        Hint::bind(key::ENTER, "Trust or revoke"),
+        Hint::bind(key::ENTER, TRUST_HINT),
         Hint::bind(key::TAB, "Details"),
         Hint::bind(key::ESC, "Close"),
     ]
@@ -2013,9 +2074,9 @@ mod tests {
     use std::sync::Arc;
 
     use caudra_agent::permissions::{
-        PermissionArgumentConstraint, PermissionLifetime, PermissionRequest,
+        ActivePolicyRule, PermissionArgumentConstraint, PermissionLifetime, PermissionRequest,
         PermissionResourceKind, PermissionResourceSelector, PermissionReviewSource,
-        PermissionRuleRecord, StructuredPermissionEffect,
+        PermissionRuleRecord, RuleOrigin, StructuredPermissionEffect,
         pattern_recognition::{
             CandidateEvidence, InvocationOutcome, ObservationProvenance, PatternCandidate,
             SupportCount, TupleSupport,
@@ -2024,7 +2085,8 @@ mod tests {
         selected_input_digest,
     };
     use caudra_config::{
-        PermissionReviewCandidate, PermissionReviewKind, PermissionSource, ToolKey,
+        Effect, PermissionReviewCandidate, PermissionReviewKind, PermissionRule, PermissionSource,
+        ToolKey,
     };
     use caudra_storage::permission_patterns::{
         ArgumentDomain, ArgumentRole, OptionLikePolicy, PATTERN_SCHEMA_VERSION, PatternContext,
@@ -2042,16 +2104,21 @@ mod tests {
     use test_case::test_case;
     use unicode_width::UnicodeWidthStr;
 
-    use crate::components::permission_scope::view::Disclosure;
+    use crate::components::permission_prompt::{
+        MISSING_SCOPE, THEMES, WIDTHS, assert_plain, buffer_rows,
+    };
     use crate::components::{buffer_text, list_picker::PickerItem};
     use crate::{PatternDiscoveryOutcome, test_pattern_discovery_report, theme};
 
     use super::{
-        DISCOVERY_CANCELLED, DISCOVERY_EMPTY, DISCOVERY_IDLE, DISCOVERY_LOADING, DISCOVERY_WARNING,
-        DiscoveryState, MAX_DISPLAY_CHARS, MAX_FIELD_CHARS, MAX_SUGGESTION_DETAIL_CHARS, OMITTED,
-        PermissionsMode, PermissionsPicker, PermissionsPickerAction, PickerAction,
-        ProjectConfigAction, SCROLLBAR_WIDTH, SUGGESTED_GUIDANCE, SUGGESTED_SECTION, UNAVAILABLE,
-        display_text, entry, project_config_entry, suggestion_entry,
+        CONFIRM_REVOKE_MESSAGE, DISCOVERY_CANCELLED, DISCOVERY_EMPTY, DISCOVERY_IDLE,
+        DISCOVERY_LOADING, DISCOVERY_WARNING, DiscoveryState, FIXED_INPUT, INACTIVE,
+        INACTIVE_ALLOW, MAX_DISPLAY_CHARS, MAX_FIELD_CHARS, MAX_SUGGESTION_DETAIL_CHARS,
+        NATIVE_SOURCE, NOT_TRUSTED, OMITTED, PROJECT_CONFIG, PermissionEntry, PermissionsMode,
+        PermissionsPicker, PermissionsPickerAction, PickerAction, ProjectConfigAction,
+        REVIEW_SECTION, REVOKE_CAUTION, SCROLLBAR_WIDTH, SUGGESTED_GUIDANCE, SUGGESTED_SECTION,
+        TRUST_HINT, TRUST_MESSAGE, UNTRUSTED_CONFIG, display_text, entry, project_config_entry,
+        suggestion_entry, summary_lines,
     };
 
     const ROOT: &str = "/project";
@@ -2062,7 +2129,12 @@ mod tests {
     const SECRET: &str = "top-secret";
     const REDACTED: &str = "[redacted]";
     const CONFIRM_REVOKE: &str = "Revoke this permission?";
-    const SUGGESTED_COMMAND: &str = "cargo test <arg1>";
+    const SUGGESTED_COMMAND: &str = "cargo test <pattern1>";
+    const SUGGESTED_ROW: &str = "Seen 4× in 2 conversations: cargo test <pattern1>";
+    const SUGGESTED_SLOT_SUMMARY: &str =
+        "<pattern1> (package): Values seen before, 2 allowed: alpha, beta";
+    const SUGGESTED_COMBINATIONS: &str = "Combinations: Only the 2 combinations seen before";
+    const SUGGESTED_EXAMPLE: &str = "cargo test alpha";
     const SUGGESTED_OBSERVATIONS: &str = "4 observations";
     const SUGGESTED_SESSIONS: &str = "2 sessions";
     const SUGGESTED_VALUES: [&str; 2] = ["alpha", "beta"];
@@ -2096,13 +2168,27 @@ mod tests {
     const EXPORT_LONG_COMMAND: &str = "opsctl release inspect --project warehouse --environment staging --format json --include dependencies --include rollout --include health --target 'deploy/東京/warehouse-green' --config '/project/deployments/production/release coordination/rollout and recovery settings.toml'";
     const EXPORT_UNICODE_PATH: &str =
         "/project/docs/設計/rollout notes/production/recovery checklist.md";
-    const EXPORT_ANCHORS: [&str; 2] = ["shell · Exact: git status", "shell · Exact: opsctl"];
-    const EXPORT_LONG_ANCHORS: [&str; 2] = [
-        "shell · Exact: opsctl task inspect --id task-000",
-        "shell · Exact: opsctl task inspect --id task-001",
-    ];
+    const EXPORT_ANCHORS: [&str; 2] = ["Allow  git", "Allow  ops"];
     const MODE_TEST_RULE_INDEX: usize = 17;
-    const PROPOSAL_ANCHORS: [&str; 2] = ["opsctl release inspect", "artifactctl artifact describe"];
+    const PROPOSAL_ANCHORS: [&str; 2] = ["opsctl", "artifact"];
+    const LEGACY_SCOPE: &str = "cargo *";
+    const LEGACY_ROW: &str = "Allow  bash: cargo *";
+    const LEGACY_ORIGIN: &str = "An old allow rule from this project's config.";
+    const POLICY_SCOPE: &str = "git push *";
+    const BUILTIN_SCOPE: &str = "git log *";
+    const COMMAND_PATTERN_SENTENCE: &str = "Runs `git status` with any arguments";
+    const SENTENCE_ROWS: [(&str, &str, &str); 4] = [
+        ("Deny   git status --short", "this conversation", "you"),
+        ("Ask    bash: git push *", "always", "config"),
+        ("Allow  bash: git log *", "always", "built-in"),
+        (LEGACY_ROW, "inactive", "config"),
+    ];
+    const RULE_SUMMARY: [&str; 4] = [
+        "Deny git status --short",
+        "Runs exactly `git status --short`, started in /project (this project).",
+        "Fixed input: command: git status --short",
+        "Remembered for this conversation · added by you",
+    ];
 
     fn suggestion() -> PatternCandidate {
         let slot = SlotId(1);
@@ -2238,37 +2324,6 @@ mod tests {
         picker.detail_focused = true;
         picker.detail.scroll.reset();
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        if picker
-            .picker
-            .selected_item()
-            .and_then(super::PermissionEntry::scope)
-            .is_some()
-            && !picker.discovery_view
-            && picker.notice.is_none()
-        {
-            let mut text = String::new();
-            for disclosure in [None, Some(Disclosure::Evidence)] {
-                picker.scope_view.disclosure = disclosure;
-                picker.scope_view.offset = 0;
-                let mut previous = None;
-                for _ in 0..MAX_DISPLAY_CHARS {
-                    terminal
-                        .draw(|frame| {
-                            picker.view(frame, frame.area());
-                        })
-                        .unwrap();
-                    if previous == Some(picker.scope_view.offset) {
-                        break;
-                    }
-                    previous = Some(picker.scope_view.offset);
-                    text.push_str(&buffer_text(terminal.backend().buffer()));
-                    picker.scope_view.scroll(1);
-                }
-            }
-            picker.scope_view = super::ScopeView::default();
-            picker.detail_focused = false;
-            return compact(&text);
-        }
         let mut rows = BTreeMap::new();
         loop {
             terminal
@@ -2351,7 +2406,7 @@ mod tests {
                 .map(|index| {
                     let command = format!("opsctl task inspect --id task-{index:03}");
                     export_rule(
-                        "shell",
+                        "bash",
                         json!({"command": command, "workdir": ROOT}),
                         &[&command],
                     )
@@ -2362,12 +2417,12 @@ mod tests {
         } else {
             vec![
                 export_rule(
-                    "shell",
+                    "bash",
                     json!({"command": COMMAND, "workdir": ROOT}),
                     &[COMMAND],
                 ),
                 export_rule(
-                    "shell",
+                    "bash",
                     json!({"command": EXPORT_LONG_COMMAND, "workdir": ROOT}),
                     &[EXPORT_LONG_COMMAND],
                 ),
@@ -2379,6 +2434,7 @@ mod tests {
             ]
         };
         let mut picker = PermissionsPicker::new();
+        picker.set_current_project(Some(ROOT.into()));
         picker.open(rules, &[], &[], false, false);
         if panel.starts_with("active-") {
             return picker;
@@ -2730,14 +2786,11 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, label)| {
-                let mut permission = entry(record());
+                let mut record = record();
+                record.label = (index == 1).then(|| LONG_DETAIL.repeat(LONG_DETAIL_REPEATS));
+                let mut permission = entry(Arc::new(record), None);
                 permission.id = Some((*label).into());
-                permission.tool = (*label).into();
-                permission.description = Some(if index == 1 {
-                    LONG_DETAIL.repeat(LONG_DETAIL_REPEATS)
-                } else {
-                    (*label).into()
-                });
+                permission.label = (*label).into();
                 permission
             })
             .collect();
@@ -2851,7 +2904,7 @@ mod tests {
             })
             .unwrap();
         picker.handle_key(KeyEvent::from(KeyCode::PageDown));
-        assert!(picker.scope_view.offset > 0);
+        assert!(picker.detail.scroll.offset() > 0);
         let selected = picker.picker.selected_index();
         picker.handle_paste(COMMAND);
         assert!(picker.picker.search_text().is_empty());
@@ -2978,8 +3031,8 @@ mod tests {
             picker
                 .picker
                 .selected_item()
+                .and_then(|entry| entry.evidence.as_deref())
                 .unwrap()
-                .detail
                 .contains(origin)
         );
         picker.handle_key(KeyEvent::from(KeyCode::Enter));
@@ -3031,9 +3084,7 @@ mod tests {
             picker
                 .picker
                 .selected_item()
-                .unwrap()
-                .description
-                .as_deref()
+                .and_then(|entry| entry.evidence.as_deref())
                 .unwrap(),
         );
         let text = read_suggestion(&mut picker, width, SHORT_HEIGHT);
@@ -3041,7 +3092,7 @@ mod tests {
             text.contains(&expected),
             "incomplete inspector text: {text}"
         );
-        assert!(text.contains(&format!("Commandtemplate:cargo{operation}<arg1>")));
+        assert!(text.contains(&format!("Commandtemplate:cargo{operation}<pattern1>")));
         assert_eq!(text.matches(&value).count(), 2);
         for hidden in [OMITTED, "path_binding", "ObservedTuples", &fingerprint] {
             assert!(!text.contains(&compact(hidden)), "unexpected {hidden}");
@@ -3120,44 +3171,49 @@ mod tests {
                 picker.view(frame, frame.area());
             })
             .unwrap();
-        let screen = compact(&buffer_text(terminal.backend().buffer()))
-            + read_suggestion(&mut picker, 150, 36).as_str();
-        for text in [
-            SUGGESTED_SECTION,
-            SUGGESTED_COMMAND,
-            SUGGESTED_OBSERVATIONS,
-            SUGGESTED_SESSIONS,
-            SUGGESTED_GUIDANCE,
-        ] {
-            assert!(screen.contains(&compact(text)), "missing {text}");
+        let list = compact(&buffer_text(terminal.backend().buffer()));
+        for text in [SUGGESTED_SECTION, SUGGESTED_ROW] {
+            assert!(list.contains(&compact(text)), "missing {text}: {list}");
         }
         assert!(matches!(
             picker.handle_key(KeyEvent::from(KeyCode::Enter)),
             PermissionsPickerAction::Consumed
         ));
-        terminal
-            .draw(|frame| {
-                picker.view(frame, frame.area());
-            })
-            .unwrap();
-        let screen = buffer_text(terminal.backend().buffer());
+        let summary = read_details(&mut picker, 150, 36);
         for text in [
-            "Observed values (2): alpha, beta",
-            "Combinations: 2 observed tuples only",
-            "cargo test alpha",
-            "Working directory:",
+            SUGGESTED_COMMAND,
+            SUGGESTED_SLOT_SUMMARY,
+            SUGGESTED_COMBINATIONS,
+            NATIVE_SOURCE,
             SUGGESTED_GUIDANCE,
         ] {
-            assert!(screen.contains(text), "missing {text}");
+            assert!(
+                summary.contains(&compact(text)),
+                "missing {text}: {summary}"
+            );
         }
-        assert!(!screen.contains("path_binding"));
-        assert!(!screen.contains(CONFIRM_REVOKE));
+        let evidence = read_suggestion(&mut picker, 150, 36);
+        for text in [
+            SUGGESTED_OBSERVATIONS,
+            SUGGESTED_SESSIONS,
+            SUGGESTED_EXAMPLE,
+            SUGGESTED_GUIDANCE,
+        ] {
+            assert!(
+                evidence.contains(&compact(text)),
+                "missing {text}: {evidence}"
+            );
+        }
+        for screen in [&summary, &evidence] {
+            assert!(!screen.contains("path_binding"));
+            assert!(!screen.contains(&compact(CONFIRM_REVOKE)));
+        }
         assert!(picker.pending_revoke.is_none());
         assert!(matches!(
             picker.handle_key(KeyEvent::from(KeyCode::Enter)),
             PermissionsPickerAction::Consumed
         ));
-        assert!(picker.detail_focused || picker.suggestion_inspector.is_some());
+        assert!(picker.suggestion_inspector.is_some());
         assert!(matches!(
             picker.handle_key(KeyEvent::from(KeyCode::Esc)),
             PermissionsPickerAction::Consumed
@@ -3200,9 +3256,9 @@ mod tests {
         )]
         .into();
         let rendered = suggestion_entry(Path::new(ROOT), SUGGESTION_REVISION, &candidate).unwrap();
-        assert_eq!(rendered.tool, SUGGESTED_COMMAND);
+        assert_eq!(rendered.label, SUGGESTED_ROW);
         assert_eq!(rendered.section(), Some(SUGGESTED_SECTION));
-        let description = rendered.description.as_ref().unwrap();
+        let description = rendered.evidence.as_ref().unwrap();
         assert!(description.contains("Source (untrusted label):"));
         assert!(description.contains("\\u{202e}"));
         assert!(description.contains("\\u{1b}"));
@@ -3296,8 +3352,114 @@ mod tests {
         reviewed_record("bash", json!({"command": COMMAND}), &[COMMAND])
     }
 
+    fn policy(origin: RuleOrigin, effect: Effect, scope: &str) -> ActivePolicyRule {
+        ActivePolicyRule {
+            origin,
+            rule: PermissionRule {
+                tool: ToolKey::native("bash"),
+                scope: Some(scope.into()),
+                effect,
+            },
+            verified_local_source_locator: None,
+        }
+    }
+
+    fn legacy_allow() -> PermissionReviewCandidate {
+        PermissionReviewCandidate {
+            source: PermissionSource::Project,
+            kind: PermissionReviewKind::Rule,
+            tool: Some(ToolKey::native("bash")),
+            scope: Some(LEGACY_SCOPE.into()),
+        }
+    }
+
+    fn sentence_picker() -> PermissionsPicker {
+        let mut picker = PermissionsPicker::new();
+        picker.set_current_project(Some(ROOT.into()));
+        picker.open(
+            vec![record()],
+            &[legacy_allow()],
+            &[
+                policy(RuleOrigin::Config, Effect::Ask, POLICY_SCOPE),
+                policy(RuleOrigin::Builtin, Effect::Allow, BUILTIN_SCOPE),
+            ],
+            false,
+            false,
+        );
+        picker
+    }
+
     #[test]
-    fn shows_structured_scope_and_requires_confirmed_revocation() {
+    fn rule_rows_read_as_sentences() {
+        let mut picker = sentence_picker();
+        let rows = buffer_rows(&export_buffer(&mut picker, 140, 32));
+        for (sentence, place, origin) in SENTENCE_ROWS {
+            assert!(
+                rows.iter().any(|row| row.contains(sentence)
+                    && row.contains(place)
+                    && row.contains(origin)),
+                "missing {sentence} · {place} · {origin}:\n{}",
+                rows.join("\n")
+            );
+        }
+        let summary = read_details(&mut picker, 140, 32);
+        for text in RULE_SUMMARY {
+            assert!(
+                summary.contains(&compact(text)),
+                "missing {text}: {summary}"
+            );
+        }
+    }
+
+    /// Every manager screen a person reads: each row with and without its
+    /// detail, the revoke and trust confirmations, and a proposal with its
+    /// evidence.
+    fn manager_surfaces(width: u16) -> Vec<(&'static str, Vec<String>)> {
+        let mut surfaces = Vec::new();
+        let mut capture = |surface, picker: &mut PermissionsPicker| {
+            surfaces.push((
+                surface,
+                buffer_rows(&export_buffer(picker, width, MANAGER_TEST_HEIGHT)),
+            ));
+        };
+        let mut picker = sentence_picker();
+        for index in 0..picker.visible_entries().len() {
+            picker.picker.select(index);
+            capture("list", &mut picker);
+            picker.detail_focused = true;
+            capture("detail", &mut picker);
+            picker.detail_focused = false;
+        }
+        picker.picker.select(0);
+        picker.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        capture("revoke", &mut picker);
+        let mut trust = PermissionsPicker::new();
+        trust.open(Vec::new(), &[], &[], true, false);
+        trust.handle_key(KeyEvent::from(KeyCode::Enter));
+        capture("trust", &mut trust);
+        let mut discover = suggested_picker();
+        capture("proposal", &mut discover);
+        discover.handle_key(KeyEvent::from(KeyCode::Enter));
+        capture("proposal detail", &mut discover);
+        discover.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::CONTROL));
+        capture("evidence", &mut discover);
+        surfaces
+    }
+
+    #[test]
+    fn manager_surfaces_never_show_internal_terms() {
+        for name in THEMES {
+            theme::set(theme::load_by_name(name).unwrap());
+            for width in WIDTHS {
+                for (surface, rows) in manager_surfaces(width) {
+                    assert_plain(&rows, &format!("{name} {width} {surface}"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn revocation_needs_a_plain_confirmation() {
         let record = record();
         let id = record.id.clone();
         let PermissionArgumentConstraint::Exact { digest } = &record.rule.arguments else {
@@ -3306,36 +3468,22 @@ mod tests {
         let digest = digest.clone();
         let mut picker = PermissionsPicker::new();
         picker.open(vec![record], &[], &[], false, false);
-        let backend = TestBackend::new(100, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| {
-                picker.view(frame, frame.area());
-            })
-            .unwrap();
-        let screen = compact(&buffer_text(terminal.backend().buffer()))
+        let screen = compact(&buffer_text(&export_buffer(&mut picker, 100, 24)))
             + read_details(&mut picker, 100, 24).as_str();
-        assert!(screen.contains("bash"));
-        assert!(screen.contains("[DENY]"));
-        assert!(screen.contains("[CONVERSATION]"));
         assert!(screen.contains(&compact(COMMAND)));
-        assert!(screen.contains("\"command\":"));
-        assert!(screen.contains(&digest[..10]));
+        assert!(!screen.contains(&digest[..10]));
         assert!(!screen.contains(&id[..10]));
 
-        let enter = KeyEvent::from(KeyCode::Enter);
         assert!(matches!(
             picker.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL)),
             PermissionsPickerAction::Consumed
         ));
-        terminal
-            .draw(|frame| {
-                picker.view(frame, frame.area());
-            })
-            .unwrap();
-        assert!(buffer_text(terminal.backend().buffer()).contains(CONFIRM_REVOKE));
+        let screen = read_details(&mut picker, 100, 24);
+        for text in [CONFIRM_REVOKE_MESSAGE, REVOKE_CAUTION] {
+            assert!(screen.contains(&compact(text)), "missing {text}: {screen}");
+        }
         assert!(matches!(
-            picker.handle_key(enter),
+            picker.handle_key(KeyEvent::from(KeyCode::Enter)),
             PermissionsPickerAction::Revoke(selected) if selected == id
         ));
     }
@@ -3343,65 +3491,37 @@ mod tests {
     #[test]
     fn shows_inactive_legacy_allows_for_review() {
         let mut picker = PermissionsPicker::new();
-        picker.open(
-            Vec::new(),
-            &[PermissionReviewCandidate {
-                source: PermissionSource::Project,
-                kind: PermissionReviewKind::Rule,
-                tool: Some(ToolKey::native("bash")),
-                scope: Some("cargo *".into()),
-            }],
-            &[],
-            false,
-            false,
-        );
-        let backend = TestBackend::new(100, 16);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| {
-                picker.view(frame, frame.area());
-            })
-            .unwrap();
-        let screen = compact(&buffer_text(terminal.backend().buffer()))
+        picker.open(Vec::new(), &[legacy_allow()], &[], false, false);
+        let screen = compact(&buffer_text(&export_buffer(&mut picker, 100, 16)))
             + read_details(&mut picker, 100, 16).as_str();
-        assert!(screen.contains(&compact("needs review")));
-        assert!(screen.contains(&compact("inactive allow rule")));
-        assert!(screen.contains(&compact("project config")));
+        for text in [
+            REVIEW_SECTION,
+            LEGACY_ROW,
+            INACTIVE,
+            LEGACY_ORIGIN,
+            INACTIVE_ALLOW,
+        ] {
+            assert!(screen.contains(&compact(text)), "missing {text}: {screen}");
+        }
     }
 
     #[test]
     fn project_config_trust_requires_confirmation_and_can_be_cancelled() {
         let mut picker = PermissionsPicker::new();
         picker.open(Vec::new(), &[], &[], true, false);
-        let backend = TestBackend::new(120, 18);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| {
-                picker.view(frame, frame.area());
-            })
-            .unwrap();
-        let screen = compact(&buffer_text(terminal.backend().buffer()))
+        let screen = compact(&buffer_text(&export_buffer(&mut picker, 120, 18)))
             + read_details(&mut picker, 120, 18).as_str();
-        assert!(screen.contains(&compact("Project permissions.toml")));
-        assert!(screen.contains(&compact("shell allow patterns are inactive")));
-        assert!(screen.contains(&compact("no authority has been granted")));
-        assert!(screen.contains(&compact("Trust or revoke")));
+        for text in [PROJECT_CONFIG, UNTRUSTED_CONFIG, NOT_TRUSTED, TRUST_HINT] {
+            assert!(screen.contains(&compact(text)), "missing {text}: {screen}");
+        }
 
         let enter = KeyEvent::from(KeyCode::Enter);
         assert!(matches!(
             picker.handle_key(enter),
             PermissionsPickerAction::Consumed
         ));
-        terminal
-            .draw(|frame| {
-                picker.view(frame, frame.area());
-            })
-            .unwrap();
         let screen = read_details(&mut picker, 120, 18);
-        assert!(screen.contains(&compact(
-            "Trust the exact project shell allow configuration"
-        )));
-        assert!(screen.contains(&compact("Edits invalidate trust")));
+        assert!(screen.contains(&compact(TRUST_MESSAGE)), "{screen}");
 
         assert!(matches!(
             picker.handle_key(KeyEvent::from(KeyCode::Esc)),
@@ -3456,18 +3576,11 @@ mod tests {
         ));
         let mut picker = PermissionsPicker::new();
         picker.open(vec![record], &[], &[], false, false);
-        let backend = TestBackend::new(70, 16);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| {
-                picker.view(frame, frame.area());
-            })
-            .unwrap();
-
-        let screen = compact(&buffer_text(terminal.backend().buffer()))
+        let screen = compact(&buffer_text(&export_buffer(&mut picker, 70, 16)))
             + read_details(&mut picker, 70, 16).as_str();
-        assert!(screen.contains(&compact(COMMAND_PATTERN)));
-        assert!(screen.contains("TOKENPREFIX"));
+        for text in [COMMAND_PATTERN, COMMAND_PATTERN_SENTENCE] {
+            assert!(screen.contains(&compact(text)), "missing {text}: {screen}");
+        }
     }
 
     #[test]
@@ -3499,10 +3612,18 @@ mod tests {
             })
             .unwrap();
         let screen = read_details(&mut picker, 120, 32);
+        assert!(screen.contains(&compact(FIXED_INPUT)), "{screen}");
         assert!(screen.contains(&compact(expected)), "{screen}");
         for key in input.as_object().unwrap().keys() {
-            assert!(screen.contains(&format!("\"{key}\":")), "{screen}");
+            assert!(screen.contains(&format!("{key}:")), "{screen}");
         }
+    }
+
+    fn summary_rows(entry: &PermissionEntry) -> Vec<String> {
+        summary_lines(entry, None)
+            .iter()
+            .map(ToString::to_string)
+            .collect()
     }
 
     #[test_case(false; "absent_review")]
@@ -3519,12 +3640,12 @@ mod tests {
             )
         });
         let id = record.id.clone();
-        let rendered = entry(record);
-        let description = rendered.description.unwrap();
-        assert!(description.contains(&format!("Review: {UNAVAILABLE}")));
-        assert!(description.contains(&format!("Input: {UNAVAILABLE}")));
-        assert!(description.contains(&format!("(Command): {UNAVAILABLE}")));
-        assert!(!description.contains(&id[..10]));
+        let rendered = entry(Arc::new(record), None);
+        let mut rows = summary_rows(&rendered);
+        rows.push(rendered.label.clone());
+        assert!(rows.iter().any(|row| row == MISSING_SCOPE), "{rows:?}");
+        assert!(!rows.iter().any(|row| row.contains(&id[..10])));
+        assert_plain(&rows, "missing review");
         assert_eq!(rendered.id.as_deref(), Some(id.as_str()));
     }
 
@@ -3533,11 +3654,11 @@ mod tests {
     fn builder_redaction_survives_picker_rendering(tool: &str, input: Value) {
         let resource = input.get("command").and_then(Value::as_str).unwrap_or(FILE);
         let record = reviewed_record(tool, input.clone(), &[resource]);
-        let rendered = entry(record);
-        let description = rendered.description.unwrap();
-        assert!(description.contains(REDACTED), "{description}");
-        assert!(!description.contains(SECRET));
-        assert!(!rendered.tool.contains(SECRET));
+        let rendered = entry(Arc::new(record), None);
+        let mut rows = summary_rows(&rendered);
+        rows.push(rendered.label.clone());
+        assert!(rows.iter().any(|row| row.contains(REDACTED)), "{rows:?}");
+        assert!(!rows.iter().any(|row| row.contains(SECRET)), "{rows:?}");
     }
 
     #[test_case(false; "selected_fields")]
@@ -3564,18 +3685,16 @@ mod tests {
         let record =
             PermissionRuleRecord::conversation_with_review(record.rule, Some(review)).unwrap();
         let id = record.id.clone();
-        let rendered = entry(record);
-        let description = rendered.description.unwrap();
-        assert!(description.contains(if broad {
-            "input unconstrained"
+        let rendered = entry(Arc::new(record), None);
+        let fixed: Vec<String> = summary_rows(&rendered)
+            .into_iter()
+            .filter(|row| row.starts_with(FIXED_INPUT))
+            .collect();
+        if broad {
+            assert!(fixed.is_empty(), "{fixed:?}");
         } else {
-            "selected input fields only"
-        }));
-        assert!(
-            rendered
-                .detail
-                .starts_with(if broad { "[resource:" } else { "[selected:" })
-        );
+            assert_eq!(fixed, [format!("{FIXED_INPUT}pattern: {PATTERN}")]);
+        }
         assert_eq!(rendered.id.as_deref(), Some(id.as_str()));
     }
 
@@ -3591,17 +3710,23 @@ mod tests {
         let mut record = record();
         let review = record.review.as_mut().unwrap();
         review.tool = text.clone();
-        review.authority = text.clone();
         review.input = Some(json!({text.clone(): text.clone()}));
-        review.resources[0].value = Some(text);
+        let shown = &mut review.resources[0];
+        shown.value = shown
+            .value
+            .as_ref()
+            .map(|value| value.replace(COMMAND, &text));
         record.rule.resources[0].kind = PermissionResourceKind::Custom {
             name: controls.into(),
         };
-        let rendered = entry(record);
-        let description = rendered.description.unwrap();
-        assert!(!description.contains(controls));
-        assert!(description.chars().count() <= MAX_DISPLAY_CHARS + OMITTED.len());
-        assert!(rendered.tool.chars().count() <= MAX_DISPLAY_CHARS + OMITTED.len());
+        let rendered = entry(Arc::new(record), None);
+        let mut rows = summary_rows(&rendered);
+        rows.push(rendered.label.clone());
+        assert!(rows.iter().any(|row| row.contains('界')), "{rows:?}");
+        for row in rows {
+            assert!(!row.chars().any(char::is_control), "{row:?}");
+            assert!(row.chars().count() <= MAX_DISPLAY_CHARS + OMITTED.len());
+        }
     }
 
     #[test_case(KeyCode::Enter; "enter_confirmation")]
@@ -3633,7 +3758,7 @@ mod tests {
     fn mouse_selection_restores_the_selected_entry() {
         let record = record();
         let selected_id = record.id.clone();
-        let selected = entry(record.clone());
+        let selected = entry(Arc::new(record.clone()), None);
         let mut picker = PermissionsPicker::new();
         picker.open(vec![record], &[], &[], true, false);
 
@@ -3730,34 +3855,6 @@ mod tests {
         assert!(picker.pending_revoke.is_none());
     }
 
-    #[test_case(false; "conditions")]
-    #[test_case(true; "identity")]
-    fn two_hundred_forty_rules_keep_whole_inventory_cells_when_scope_changes(identity: bool) {
-        let mut picker = export_picker("discovery-long-list");
-        picker.set_mode(PermissionsMode::Rules);
-        assert_eq!(picker.visible_entries().len(), EXPORT_LONG_GRANTS);
-        let before = export_buffer(&mut picker, 140, 32);
-        let anchors = export_list_anchors(&picker, &export_rows(&before), &EXPORT_LONG_ANCHORS);
-        picker.scope_view.disclosure = Some(if identity {
-            Disclosure::Identity
-        } else {
-            Disclosure::Conditions
-        });
-        picker.scope_view.scroll(4);
-        let after = export_buffer(&mut picker, 140, 32);
-        assert_eq!(
-            export_list_anchors(&picker, &export_rows(&after), &EXPORT_LONG_ANCHORS),
-            anchors
-        );
-        for y in before.area.y..before.area.bottom() {
-            for x in before.area.x..before.area.right() {
-                if picker.picker.contains(Position::new(x, y)) {
-                    assert_eq!(before[(x, y)], after[(x, y)]);
-                }
-            }
-        }
-    }
-
     #[test_case(40, false; "narrow_copy")]
     #[test_case(80, false; "normal_copy")]
     #[test_case(140, false; "wide_copy")]
@@ -3804,22 +3901,25 @@ mod tests {
     #[test_case(40; "narrow")]
     #[test_case(80; "normal")]
     #[test_case(140; "wide")]
-    fn wheel_scrolls_typed_scope_instead_of_legacy_detail(width: u16) {
+    fn wheel_scrolls_the_selected_summary(width: u16) {
         let mut record = record();
-        record.review.as_mut().unwrap().resources[0].value =
-            Some(COMMAND.repeat(EXPORT_LONG_GRANTS));
+        let shown = &mut record.review.as_mut().unwrap().resources[0];
+        shown.value = shown
+            .value
+            .as_ref()
+            .map(|value| value.replace(COMMAND, &COMMAND.repeat(EXPORT_LONG_GRANTS)));
         let mut picker = PermissionsPicker::new();
         picker.open(vec![record], &[], &[], false, false);
         picker.handle_key(KeyEvent::from(KeyCode::Enter));
-        picker.scope_view.disclosure = Some(Disclosure::Evidence);
         export_buffer(&mut picker, width, MANAGER_TEST_HEIGHT);
+        let selected = picker.picker.selected_index();
         picker.handle_mouse(MouseEvent {
             kind: MouseEventKind::ScrollDown,
             column: picker.detail.popup.x,
             row: picker.detail.popup.y,
             modifiers: KeyModifiers::NONE,
         });
-        assert_eq!(picker.scope_view.offset, 1);
-        assert_eq!(picker.detail.scroll.offset(), 0);
+        assert_eq!(picker.detail.scroll.offset(), 1);
+        assert_eq!(picker.picker.selected_index(), selected);
     }
 }

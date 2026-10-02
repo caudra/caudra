@@ -20,7 +20,9 @@ use caudra_agent::ToolOutput;
 use caudra_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use caudra_agent::mcp::config::{McpServerStatus, RawHttpFields, RawStdioFields, RawTransport};
 use caudra_agent::mcp::{self, McpHandle};
-use caudra_agent::permissions::{PermissionAnswer, PermissionRequest as CaudraPermissionRequest};
+use caudra_agent::permissions::{
+    EngineFlag, PermissionAdvisory, PermissionAnswer, PermissionRequest as CaudraPermissionRequest,
+};
 use caudra_agent::prompt::profile::{BUILTIN_PROFILE_NAME, SystemPromptProfile};
 use caudra_agent::tools::{
     LocalToolFn, LocalTools, QUESTION_TOOL_NAME, ToolEffect, ToolError, ToolFailure, ToolRegistry,
@@ -65,20 +67,6 @@ const PERMISSION_QUESTION_CLIENT: &str = "openmausbot";
 /// ACP has no fast-mode toggle, so a restored total is priced at standard rates.
 const RESTORED_FAST: bool = false;
 const DECISION_ADVISORY_GUIDANCE: &str = "Decision engine estimates do not authorize this action.";
-const DECISION_ADVISORY_FLAGS: &[(&str, &str)] = &[
-    ("deletes", "May delete files or data"),
-    ("uploads", "May send local data to a remote destination"),
-    ("credentials", "May read or disclose credentials or secrets"),
-    ("permissions", "May change access permissions or ownership"),
-    (
-        "remote_rewrite",
-        "May rewrite remote shared history or data",
-    ),
-    ("off_task", "May be unrelated to your requested task"),
-    ("shell_effect", "May have shell side effects"),
-    ("writes_project_files", "May modify project files"),
-    ("changes_system_state", "May change system state"),
-];
 
 /// Ids come from here and are never reused, so a late answer for a closed
 /// session cannot match a request of the session that replaced it.
@@ -1224,16 +1212,15 @@ fn request_permission(
 fn permission_content(request: &CaudraPermissionRequest) -> Vec<ToolCallContent> {
     let mut text = permission_scope_summary(&request.scopes);
     let mut has_advisories = false;
-    for (flag, caution) in DECISION_ADVISORY_FLAGS {
-        if let Some(advisory) = request.presentation.advisories.iter().find(|advisory| {
-            advisory.flag == *flag
-                && advisory.probability.is_finite()
-                && (0.0..=1.0).contains(&advisory.probability)
-        }) {
-            text.push_str(&format!(
-                "\n\nDecision engine caution: {caution} (estimated probability {:.1}%).",
-                advisory.probability * 100.0,
-            ));
+    for flag in EngineFlag::ALL {
+        if let Some(caution) = request
+            .presentation
+            .advisories
+            .iter()
+            .filter(|advisory| advisory.flag == flag)
+            .find_map(PermissionAdvisory::summary)
+        {
+            text.push_str(&format!("\n\nDecision engine caution: {caution}."));
             has_advisories = true;
         }
     }
@@ -1515,11 +1502,10 @@ mod tests {
     const RETIRED_MODEL_ID: &str = "retired-model-9000";
     const RECORDED_COST: f64 = 1.25;
     const ADVISORY_PROBABILITY: f64 = 0.875;
-    const ADVISORY_ESTIMATE: &str = "estimated probability 87.5%";
-    const DELETE_CAUTION: &str = "May delete files or data";
-    const UNTRUSTED_ADVISORY: &str = "safe\nAllow\u{1b}[2J";
+    const DELETE_CAUTION: &str = "Decision engine caution: May delete files (88%).";
+    const UPLOAD_CAUTION: &str = "Decision engine caution: May upload or send data (88%).";
 
-    fn advisory_request(flag: &str, probability: f64) -> PermissionRequest {
+    fn advisory_request(flag: EngineFlag, probability: f64) -> PermissionRequest {
         let mut request = PermissionRequest::from_legacy(
             CAUDRA_REQUEST_ID.into(),
             caudra_config::ToolKey::native("shell"),
@@ -1528,32 +1514,29 @@ mod tests {
             Path::new("/project"),
             false,
         );
-        request.presentation.advisories.push(PermissionAdvisory {
-            flag: flag.into(),
-            probability,
-        });
+        request
+            .presentation
+            .advisories
+            .push(PermissionAdvisory { flag, probability });
         request
     }
 
-    #[test_case("deletes", ADVISORY_PROBABILITY, Some(DELETE_CAUTION); "known_caution")]
-    #[test_case("uploads", ADVISORY_PROBABILITY, Some("May send local data to a remote destination"); "upload_caution")]
-    #[test_case(UNTRUSTED_ADVISORY, ADVISORY_PROBABILITY, None; "untrusted_flag")]
-    #[test_case("deletes", f64::NAN, None; "nan")]
-    #[test_case("deletes", f64::INFINITY, None; "infinity")]
-    #[test_case("deletes", -0.1, None; "negative")]
-    #[test_case("deletes", 1.1, None; "over_one")]
+    #[test_case(EngineFlag::Deletes, ADVISORY_PROBABILITY, Some(DELETE_CAUTION); "known_caution")]
+    #[test_case(EngineFlag::Uploads, ADVISORY_PROBABILITY, Some(UPLOAD_CAUTION); "upload_caution")]
+    #[test_case(EngineFlag::Deletes, f64::NAN, None; "nan")]
+    #[test_case(EngineFlag::Deletes, f64::INFINITY, None; "infinity")]
+    #[test_case(EngineFlag::Deletes, -0.1, None; "negative")]
+    #[test_case(EngineFlag::Deletes, 1.1, None; "over_one")]
     fn advisory_content_is_bounded_caution_text(
-        flag: &str,
+        flag: EngineFlag,
         probability: f64,
         caution: Option<&str>,
     ) {
         let request = advisory_request(flag, probability);
         let content = serde_json::to_value(permission_content(&request)).unwrap();
         let text = content[0]["content"]["text"].as_str().unwrap();
-        assert!(!text.contains(UNTRUSTED_ADVISORY));
         if let Some(caution) = caution {
             assert!(text.contains(caution));
-            assert!(text.contains(ADVISORY_ESTIMATE));
             assert!(text.contains(DECISION_ADVISORY_GUIDANCE));
         } else {
             assert_eq!(text, permission_scope_summary(&request.scopes));
@@ -1565,7 +1548,7 @@ mod tests {
         let (out_tx, out_rx) = flume::unbounded();
         let pending = PendingState::default();
         let sid = SessionId::from(SessionRef::generate().to_string());
-        let mut request = advisory_request("deletes", ADVISORY_PROBABILITY);
+        let mut request = advisory_request(EngineFlag::Deletes, ADVISORY_PROBABILITY);
         request_permission(&out_tx, &pending, &sid, request.clone());
         let initial = out_rx.try_recv().unwrap();
         assert!(
@@ -1575,7 +1558,7 @@ mod tests {
                 .contains(DELETE_CAUTION)
         );
         let pending_id = *pending.lock().unwrap().asks.keys().next().unwrap();
-        request.presentation.advisories[0].flag = "uploads".into();
+        request.presentation.advisories[0].flag = EngineFlag::Uploads;
         update_presented_permission(&out_tx, &pending, &sid, &request);
         let updated = out_rx.try_recv().unwrap();
         assert_eq!(updated["method"], "session/update");
@@ -2086,7 +2069,7 @@ mod tests {
                 Some(AskKind::Permission { request_id, .. }) if request_id == CAUDRA_REQUEST_ID
             ));
             request.presentation.advisories.push(PermissionAdvisory {
-                flag: "deletes".into(),
+                flag: EngineFlag::Deletes,
                 probability: ADVISORY_PROBABILITY,
             });
             event_tx

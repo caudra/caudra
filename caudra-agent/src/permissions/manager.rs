@@ -312,7 +312,7 @@ impl PermissionManager {
         let seed = PermissionMode::from(config.yolo);
         let decision_engine = config.decision_engine;
         let configured = configured_policy(config, None);
-        let builtin_rules = builtin_rules(&cwd);
+        let builtin_rules = builtin_rules(&cwd, policy.as_ref().map(|state| &state.state_dir));
 
         // Warn if wildcard deny is present — it blocks ALL tools including builtins.
         let has_wildcard_deny = configured
@@ -391,6 +391,10 @@ impl PermissionManager {
         self
     }
 
+    fn state_dir(&self) -> Option<&StateDir> {
+        self.policy.as_ref().map(|state| &state.state_dir)
+    }
+
     pub(super) fn project(&self) -> MutexGuard<'_, ProjectContext> {
         self.project.lock().unwrap_or_else(|error| {
             warn!("permission project mutex was poisoned, recovering");
@@ -423,7 +427,7 @@ impl PermissionManager {
             cwd: cwd.to_path_buf(),
             canonical_project: canonical_project.clone(),
             policy_context_error,
-            builtin_rules: builtin_rules(cwd),
+            builtin_rules: builtin_rules(cwd, self.state_dir()),
         };
         self.notify_policy_changed("");
     }
@@ -449,7 +453,7 @@ impl PermissionManager {
             cwd: cwd.to_path_buf(),
             canonical_project,
             policy_context_error,
-            builtin_rules: builtin_rules(cwd),
+            builtin_rules: builtin_rules(cwd, self.state_dir()),
         };
         self.notify_policy_changed("");
     }
@@ -1434,12 +1438,12 @@ mod pattern_runtime_tests {
     use super::PermissionManager;
     use crate::permissions::{
         COMMAND_OBSERVATION_ATTRIBUTE, COMMAND_OBSERVATION_BINDING_ATTRIBUTE,
-        COMMAND_TEMPLATE_PREFIX, ComposedAnswerError, PermissionAnswer, PermissionAuthorityProfile,
-        PermissionError, PermissionExecutorKind, PermissionLifetime, PermissionRequest,
-        PermissionResource, PermissionResourceSelector, PermissionRowGrant, PermissionRuleOption,
-        PermissionRuleRecord, PermissionSubject, ResourceCoverage, RuleOrigin,
-        StructuredPermissionDecision, StructuredPermissionEffect, StructuredPermissionRule,
-        evaluate_structured_permission_rules,
+        COMMAND_TEMPLATE_PREFIX, ComposedAnswerError, ComposedRow, PermissionAnswer,
+        PermissionAuthorityProfile, PermissionError, PermissionExecutorKind, PermissionLifetime,
+        PermissionRequest, PermissionResource, PermissionResourceSelector, PermissionRowGrant,
+        PermissionRuleOption, PermissionRuleRecord, PermissionSubject, ResourceCoverage,
+        RuleOrigin, StructuredPermissionDecision, StructuredPermissionEffect,
+        StructuredPermissionRule, evaluate_structured_permission_rules,
         pattern_recognition::{
             CommandObservation, PatternCandidate, PatternRecognizer, RecognizerLimits,
             ShellEffectStatus, fixtures,
@@ -1739,21 +1743,14 @@ mod pattern_runtime_tests {
                     .any(|option| option.id.starts_with(COMMAND_TEMPLATE_PREFIX)),
                 !broad,
             );
-            assert!(
-                offered
-                    .options
-                    .iter()
-                    .filter(|option| option.id.starts_with(COMMAND_TEMPLATE_PREFIX))
-                    .all(|option| !option.is_default)
-            );
             assert_eq!(
                 offered
                     .options
                     .iter()
-                    .find(|option| option.is_default)
-                    .unwrap()
-                    .id,
-                "allow_exact"
+                    .filter(|option| option.is_default)
+                    .map(is_learned_template)
+                    .collect::<Vec<_>>(),
+                [!broad]
             );
             assert!(manager.structured_rule_inventory().unwrap().is_empty());
             assert!(
@@ -1957,19 +1954,13 @@ mod pattern_runtime_tests {
             option_id: template_option_id(&offered),
             definition: Box::new(definition),
         }));
-        assert!(
-            offered
-                .composed_rules(&rows, &PermissionLifetime::Conversation)
-                .is_err()
-        );
+        let rows = ComposedRow::uniform(rows, &PermissionLifetime::Conversation);
+        assert!(offered.composed_rules(&rows).is_err());
         assert!(
             default_mgr()
                 .commit_structured_decision(
                     &offered,
-                    &PermissionAnswer::AllowComposed {
-                        rows,
-                        lifetime: PermissionLifetime::Conversation
-                    },
+                    &PermissionAnswer::AllowComposed { rows },
                     None
                 )
                 .is_err()
@@ -2004,11 +1995,13 @@ mod pattern_runtime_tests {
             _ => unreachable!(),
         };
         let answer = PermissionAnswer::AllowComposed {
-            rows: vec![Some(PermissionRowGrant::Pattern {
-                option_id: template_option_id(&offered),
-                definition: Box::new(definition.clone()),
+            rows: vec![Some(ComposedRow {
+                grant: PermissionRowGrant::Pattern {
+                    option_id: template_option_id(&offered),
+                    definition: Box::new(definition.clone()),
+                },
+                lifetime: PermissionLifetime::Conversation,
             })],
-            lifetime: PermissionLifetime::Conversation,
         };
         assert_eq!(
             PermissionAnswer::decode(&answer.encode()),
@@ -2134,6 +2127,7 @@ mod pattern_runtime_tests {
             &[Some(ResourceCoverage {
                 origin: RuleOrigin::Conversation,
                 authority: "already allowed".into(),
+                asks: false,
             })],
         );
         assert!(
@@ -2162,12 +2156,15 @@ mod pattern_runtime_tests {
         offered
             .options
             .retain(|option| !option.id.starts_with(COMMAND_TEMPLATE_PREFIX));
-        let rows = vec![Some(PermissionRowGrant::Pattern {
-            option_id: template_option_id(&offered_request()),
-            definition: Box::new(candidate().definition),
-        })];
+        let rows = ComposedRow::uniform(
+            vec![Some(PermissionRowGrant::Pattern {
+                option_id: template_option_id(&offered_request()),
+                definition: Box::new(candidate().definition),
+            })],
+            &PermissionLifetime::Conversation,
+        );
         assert_eq!(
-            offered.composed_rules(&rows, &PermissionLifetime::Conversation),
+            offered.composed_rules(&rows),
             Err(ComposedAnswerError::TemplateNotOffered)
         );
         let other_project = tempfile::tempdir().unwrap();
@@ -2203,21 +2200,15 @@ mod pattern_runtime_tests {
             .find(|option| option.id.starts_with(COMMAND_TEMPLATE_PREFIX))
             .unwrap();
         assert_eq!(template.group.as_ref().unwrap().resource, Some(1));
-        let grant = PermissionRowGrant::Pattern {
-            option_id: template.id.clone(),
-            definition: Box::new(candidate().definition),
+        let row = ComposedRow {
+            grant: PermissionRowGrant::Pattern {
+                option_id: template.id.clone(),
+                definition: Box::new(candidate().definition),
+            },
+            lifetime: PermissionLifetime::Conversation,
         };
-        assert!(
-            mixed
-                .composed_rules(
-                    &[Some(grant.clone()), None],
-                    &PermissionLifetime::Conversation
-                )
-                .is_err()
-        );
-        let rules = mixed
-            .composed_rules(&[None, Some(grant)], &PermissionLifetime::Conversation)
-            .unwrap();
+        assert!(mixed.composed_rules(&[Some(row.clone()), None]).is_err());
+        let rules = mixed.composed_rules(&[None, Some(row)]).unwrap();
         assert_eq!(rules.len(), 1);
         assert!(!permission_rule_covers_request(&rules[0], &mixed));
         assert!(permission_rule_covers_request(&rules[0], &observed));
@@ -2302,12 +2293,14 @@ mod pattern_runtime_tests {
                     offered.options.iter().any(is_learned_template),
                     index == PACKAGES.len() - 1
                 );
-                assert!(
+                assert_eq!(
                     offered
                         .options
                         .iter()
                         .filter(|option| option.is_default)
-                        .all(|option| option.id == "allow_exact")
+                        .map(is_learned_template)
+                        .collect::<Vec<_>>(),
+                    [index == PACKAGES.len() - 1]
                 );
                 assert!(manager.structured_rule_inventory().unwrap().is_empty());
             }
@@ -2696,14 +2689,28 @@ mod pattern_runtime_tests {
                     .iter()
                     .all(|option| !option.id.starts_with(COMMAND_TEMPLATE_PREFIX))
             );
+            let offered_rungs = |options: &[PermissionRuleOption]| {
+                options
+                    .iter()
+                    .filter(|option| !is_learned_template(option))
+                    .map(|option| PermissionRuleOption {
+                        is_default: false,
+                        ..option.clone()
+                    })
+                    .collect::<Vec<_>>()
+            };
             assert_eq!(
-                updated.options,
-                initial
+                offered_rungs(&updated.options),
+                offered_rungs(&initial.options)
+            );
+            assert_eq!(
+                updated
                     .options
                     .iter()
-                    .filter(|option| !option.id.starts_with(COMMAND_TEMPLATE_PREFIX))
-                    .cloned()
-                    .collect::<Vec<_>>()
+                    .filter(|option| option.is_default)
+                    .count(),
+                1,
+                "the withdrawn suggestion's row falls back to another rung"
             );
             assert!(manager.structured_rule_inventory().unwrap().is_empty());
             assert!(manager.answer(REQUEST_ID, PermissionAnswer::AllowOnce));
@@ -2799,11 +2806,13 @@ mod pattern_runtime_tests {
             assert!(!manager.answer(
                 REQUEST_ID,
                 PermissionAnswer::AllowComposed {
-                    rows: vec![Some(PermissionRowGrant::Pattern {
-                        option_id: stale_id,
-                        definition: Box::new(candidate().definition)
+                    rows: vec![Some(ComposedRow {
+                        grant: PermissionRowGrant::Pattern {
+                            option_id: stale_id,
+                            definition: Box::new(candidate().definition)
+                        },
+                        lifetime: PermissionLifetime::Conversation
                     })],
-                    lifetime: PermissionLifetime::Conversation
                 }
             ));
             let revision = manager.broker.revision.load(Ordering::Acquire);

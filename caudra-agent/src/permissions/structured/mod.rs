@@ -25,6 +25,7 @@ pub use caudra_storage::permission_state::{
 mod arguments;
 mod composition;
 mod matching;
+mod opacity;
 mod options;
 mod presentation;
 mod resources;
@@ -36,7 +37,6 @@ pub use arguments::{
     escape_json_pointer_segment, json_pointer, selected_input, selected_input_digest,
     selected_input_pointer,
 };
-pub(in crate::permissions) use matching::trusted_command_observation;
 #[cfg(test)]
 use matching::{SelectorWidth, resource_decision, selector_matches, selector_width};
 pub use matching::{
@@ -51,6 +51,8 @@ use matching::{
     resource_value_digest, strict_http_url, url_origin_digest, url_subtree_digest,
     url_subtree_roots,
 };
+pub(in crate::permissions) use matching::{trusted_command_observation, trusted_shell_request};
+pub use opacity::{OPACITY_ATTRIBUTE, ScriptLanguage, ShellOpacity, UnknownShellOpacity};
 pub(super) use options::BROAD_SHELL_PHRASE;
 use options::rule_options;
 pub use options::{
@@ -62,7 +64,7 @@ use options::{
     EXACT_COMMAND_CHIP, MAX_URL_LADDER_RUNGS, OUTSIDE_HOME_PHRASE, URL_ORIGIN_OPTION_ID,
     URL_SUBTREE_OPTION_ID,
 };
-pub use presentation::update_presentation_coverage;
+pub use presentation::{AutoNote, EngineFlag, PromptReason, update_presentation_coverage};
 use presentation::{listed_commands, presentation_for, safe_summary};
 pub use resources::filesystem_permission_resource;
 #[cfg(test)]
@@ -96,7 +98,8 @@ const FILE_READ_TOOLS: &[&str] = &["file_read", "file_index", "read", "view_imag
 const DIRECTORY_READ_TOOLS: &[&str] = &["list"];
 const FILE_SEARCH_TOOLS: &[&str] = &["file_glob", "file_grep", "glob", "grep"];
 const WORKDIR_ATTRIBUTE: &str = "workdir";
-pub(super) const CONFINED_READ_AUTHORITY: &str = "reads inside the project";
+/// How coverage names the builtin rule for confined read-only commands.
+pub const CONFINED_READ_AUTHORITY: &str = "reads inside the project";
 /// The executable-name-resolved form of a command, set by the shell tool.
 /// Restrictive policy is matched against it as well as the reviewed text, so a
 /// deny cannot be dodged by spelling the executable as a path.
@@ -187,6 +190,9 @@ pub struct PermissionRuleOption {
     pub group: Option<PermissionOptionGroup>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caution: Option<PermissionCaution>,
+    /// How many recorded runs a suggested pattern was learned from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seen: Option<usize>,
 }
 /// What one resource row contributes to a composed answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,6 +207,43 @@ pub enum PermissionRowGrant {
         definition: Box<PatternDefinition>,
     },
 }
+/// One remembered row of a composed answer: the rung it chose, and how long
+/// the rule filed for it lasts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComposedRow {
+    pub grant: PermissionRowGrant,
+    pub lifetime: PermissionLifetime,
+}
+impl ComposedRow {
+    /// Every chosen rung remembered for one lifetime, the way the main view's
+    /// choices remember them. `Once` remembers none of them.
+    pub fn uniform(
+        grants: Vec<Option<PermissionRowGrant>>,
+        lifetime: &PermissionLifetime,
+    ) -> Vec<Option<Self>> {
+        grants
+            .into_iter()
+            .map(|grant| {
+                grant
+                    .filter(|_| *lifetime != PermissionLifetime::Once)
+                    .map(|grant| Self {
+                        grant,
+                        lifetime: lifetime.clone(),
+                    })
+            })
+            .collect()
+    }
+
+    /// How long the longest-lived row lasts; `Once` when no row is remembered.
+    pub fn longest(rows: &[Option<Self>]) -> PermissionLifetime {
+        rows.iter()
+            .flatten()
+            .map(|row| row.lifetime.clone())
+            .max()
+            .unwrap_or(PermissionLifetime::Once)
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ComposedAnswerError {
     #[error("answer named {named} rows for {resources} resources")]
@@ -209,6 +252,8 @@ pub enum ComposedAnswerError {
     NotOffered(String),
     #[error("authority {0:?} does not allow the chosen lifetime")]
     LifetimeWithdrawn(String),
+    #[error("a remembered row needs a lifetime beyond this call")]
+    RememberedOnce,
     #[error("pattern for `{command}` is not usable: {fault}")]
     Pattern {
         command: String,
@@ -254,13 +299,17 @@ pub struct PolicyRule {
     pub origin: RuleOrigin,
     pub rule: StructuredPermissionRule,
 }
-/// The authority that already allows a resource, for a prompt that has to say
-/// why a command needs no answer.
+/// The authority that already settles a resource, for a prompt that has to say
+/// why a command needs no answer of its own.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceCoverage {
     pub origin: RuleOrigin,
     /// How the covering constraint names the resource, such as `rg *`.
     pub authority: String,
+    /// An ask rule outranks the allow that reaches the resource, so it is asked
+    /// about every time and `authority` names the ask.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub asks: bool,
 }
 /// What the rule set says about one resource, and which authority said it.
 ///
@@ -270,6 +319,8 @@ pub struct ResourceCoverage {
 pub struct ResourceStanding {
     pub decision: StructuredPermissionDecision,
     pub coverage: Option<ResourceCoverage>,
+    /// The ask rule that decided the resource, present only when it was asked.
+    pub asking: Option<ResourceCoverage>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PermissionResourcePresentation {
@@ -288,7 +339,7 @@ impl PermissionResourcePresentation {
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PermissionAdvisory {
-    pub flag: String,
+    pub flag: EngineFlag,
     pub probability: f64,
 }
 
@@ -297,12 +348,16 @@ pub struct PermissionPresentation {
     pub action: String,
     pub risk: PermissionRisk,
     pub risk_summary: String,
+    #[serde(default)]
+    pub reason: PromptReason,
     pub resources: Vec<PermissionResourcePresentation>,
     /// Display-only, host-approved canonical project for available durable project grants.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub advisories: Vec<PermissionAdvisory>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto: Option<AutoNote>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PermissionRequest {

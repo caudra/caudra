@@ -1,14 +1,21 @@
-use caudra_workbench::text_field::{TextCommand, decode};
-use crossterm::event::KeyEventKind;
-
-use super::details::sensitive_text;
-use super::{
-    FieldKind, HINT_ENTER, HINT_ESC, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
-    MouseEventKind, Overlay, Panel, PermissionAnswer, PermissionDecision, PermissionLifetime,
-    PermissionPrompt, Position, PromptMouse, PromptState, PromptTarget, ScrollbarMouse, TextKey,
-    command_ladders, grade_command_pattern, is_ctrl,
+use caudra_agent::permissions::PermissionAnswer;
+use caudra_workbench::text_field::{FieldKind, TextCommand, TextKey, decode};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use ratatui::layout::Position;
 
+use super::choices::Choice;
+use super::customize::ScopeItem;
+use super::step_through::{REVIEW_CHOICES, ReviewChoice};
+use super::{Panel, PermissionDecision, PermissionPrompt, PromptMouse, PromptState, PromptTarget};
+use crate::components::permission_scope::view::ScopeView;
+use crate::components::scrollbar::ScrollbarMouse;
+use crate::components::{Overlay, is_ctrl};
+
+/// Holds back a key that was already down when what it would answer last
+/// changed, until it is let go or another key is pressed, so a held or
+/// repeated key cannot answer something the user has not seen.
 #[derive(Default)]
 pub(super) struct InputFreshness {
     last_press: Option<KeyCode>,
@@ -40,75 +47,67 @@ impl InputFreshness {
     }
 }
 
-pub(super) fn hint_key(label: &str) -> Option<KeyEvent> {
-    let code = match label {
-        HINT_ESC => KeyCode::Esc,
-        "←" => KeyCode::Left,
-        "→" => KeyCode::Right,
-        "↑" => KeyCode::Up,
-        "↓" => KeyCode::Down,
-        "PgDn" => KeyCode::PageDown,
-        "PgUp" => KeyCode::PageUp,
-        "F2" => KeyCode::F(2),
-        _ => match label.split('/').next()? {
-            HINT_ENTER => KeyCode::Enter,
-            first => {
-                let mut chars = first.chars();
-                let single = chars.next().filter(|c| c.is_ascii_graphic())?;
-                chars.next().is_none().then_some(KeyCode::Char(single))?
-            }
-        },
-    };
-    Some(KeyEvent::new(code, KeyModifiers::NONE))
+fn backwards(key: &KeyEvent) -> bool {
+    key.code == KeyCode::BackTab || key.modifiers.contains(KeyModifiers::SHIFT)
+}
+
+fn digit(code: KeyCode) -> Option<usize> {
+    match code {
+        KeyCode::Char(digit @ '1'..='9') => Some(digit as usize - '1' as usize),
+        _ => None,
+    }
+}
+
+fn review_index(choice: ReviewChoice) -> usize {
+    REVIEW_CHOICES
+        .iter()
+        .position(|found| *found == choice)
+        .unwrap_or_default()
 }
 
 impl PermissionPrompt {
+    /// Whether the key being held back would answer, so the footer says how
+    /// to get it through.
     pub(super) fn decision_needs_rearm(&self) -> bool {
-        let Some(mut key) = self.input_freshness.blocked_key else {
+        let Some(key) = self.input_freshness.blocked_key else {
             return false;
         };
-        if key == KeyCode::Enter {
-            match &self.focus {
-                Some(PromptTarget::Hint(focused)) => key = focused.code,
-                Some(_) => return false,
-                None => {}
+        if self.inspector.is_some() && self.panel != Panel::Details {
+            return false;
+        }
+        if self.pending.is_some() {
+            return key == KeyCode::Enter;
+        }
+        match (self.state, self.panel) {
+            (PromptState::Guidance, _) => key == KeyCode::Enter,
+            (PromptState::PatternEditing, _) => false,
+            (_, Panel::Details) => key == KeyCode::Esc,
+            (_, Panel::Customize) => key == KeyCode::Enter,
+            (_, Panel::StepThrough) => {
+                self.step.as_ref().is_some_and(|step| step.page.is_none())
+                    && (key == KeyCode::Enter
+                        || key == KeyCode::Char('y')
+                        || digit(key) == Some(review_index(ReviewChoice::Remember)))
+            }
+            (_, Panel::Main) => {
+                matches!(key, KeyCode::Esc | KeyCode::Enter)
+                    || self
+                        .choice_for(key)
+                        .is_some_and(|choice| choice != Choice::Deny)
             }
         }
-        if self.panel == Panel::Details {
-            return self.confirmation.is_none()
-                && match key {
-                    KeyCode::Char('d') => self.project_available(),
-                    KeyCode::Char('D') => true,
-                    _ => false,
-                };
-        }
-        if let Some(inspector) = &self.inspector {
-            return !inspector.is_editing() && key == KeyCode::Char('y');
-        }
-        if let Some(confirmation) = &self.confirmation {
-            return confirmation.complete
-                && (key == KeyCode::Enter
-                    || key == KeyCode::Char('y') && confirmation.phrase.is_none());
-        }
-        match self.state {
-            PromptState::DenyEditing => key == KeyCode::Enter,
-            PromptState::PatternEditing => false,
-            _ => match (&self.panel, key) {
-                (Panel::Main, KeyCode::Esc | KeyCode::Char('y' | 'g' | 'n')) => true,
-                (Panel::Main, KeyCode::Char('s')) => {
-                    self.grants_lifetime(&PermissionLifetime::Conversation)
-                }
-                (Panel::Main, KeyCode::Char('a')) => {
-                    self.grants_lifetime(&PermissionLifetime::Project)
-                }
-                (Panel::Scopes, KeyCode::Char('A')) => {
-                    self.grants_lifetime(&PermissionLifetime::Global)
-                }
-                (Panel::Scopes, KeyCode::Char('d')) => self.project_available(),
-                (Panel::Scopes, KeyCode::Char('D')) => true,
-                _ => false,
+    }
+
+    /// The main view's choice a number or letter names, when it is on offer.
+    fn choice_for(&self, code: KeyCode) -> Option<Choice> {
+        let choice = match code {
+            KeyCode::Char(letter) => match digit(code) {
+                Some(index) => self.choices().get(index).copied(),
+                None => Choice::from_letter(letter),
             },
-        }
+            _ => None,
+        }?;
+        self.choices().contains(&choice).then_some(choice)
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<PermissionDecision> {
@@ -136,19 +135,9 @@ impl PermissionPrompt {
             return None;
         }
         let unseen_activation = self.awaiting_review
-            && self.panel != Panel::Details
-            && !matches!(
-                self.state,
-                PromptState::DenyEditing | PromptState::PatternEditing
-            )
-            && !self
-                .inspector
-                .as_ref()
-                .is_some_and(|inspector| inspector.is_editing())
-            && matches!(
-                key.code,
-                KeyCode::Char('y' | 's' | 'a' | 'A') | KeyCode::Enter
-            );
+            && !self.field_focused()
+            && (matches!(key.code, KeyCode::Enter | KeyCode::Char('y' | 's' | 'a'))
+                || digit(key.code).is_some());
         let decision = self.handle_press(key);
         if decision.is_some() || unseen_activation {
             self.input_freshness.barrier();
@@ -159,6 +148,7 @@ impl PermissionPrompt {
         decision
     }
 
+    /// A held key may move and scroll, and edit a field, but never answer.
     fn handle_repeat(&mut self, key: KeyEvent) {
         let edits = decode(key, FieldKind::Line).is_some_and(TextCommand::repeats);
         if let Some(inspector) = &self.inspector
@@ -197,34 +187,33 @@ impl PermissionPrompt {
                     | KeyCode::End
                     | KeyCode::Tab
                     | KeyCode::BackTab
-            )
+                    | KeyCode::Char('<' | '>' | 'j' | 'k')
+            ) && !self.field_focused()
         {
             self.handle_press(key);
         }
     }
 
-    /// Whether typing lands in the text field: guidance, a prefix or a phrase
-    /// being typed, or an inspector field being edited.
+    /// Whether typing lands in the text field.
     fn field_focused(&self) -> bool {
         match &self.inspector {
             Some(inspector) if self.panel != Panel::Details => inspector.is_editing(),
             _ => {
-                matches!(
-                    self.state,
-                    PromptState::DenyEditing | PromptState::PatternEditing
-                ) || self.phrase_focused()
+                self.panel != Panel::Details
+                    && (matches!(
+                        self.state,
+                        PromptState::Guidance | PromptState::PatternEditing
+                    ) || self.phrase_focused())
             }
         }
     }
 
-    /// Whether a confirmation is waiting on its phrase being typed.
+    /// Whether a grant waits on a phrase being typed.
     fn phrase_focused(&self) -> bool {
-        self.confirmation.as_ref().is_some_and(|confirmation| {
-            confirmation.phrase.is_some()
-                && confirmation.complete
-                && !self.awaiting_review
-                && self.panel != Panel::Details
-        })
+        self.pending
+            .as_ref()
+            .is_some_and(|pending| !pending.phrases.is_empty())
+            && !self.awaiting_review
     }
 
     /// Hands `key` to the text field, keeping whatever it copies or cuts for
@@ -245,403 +234,459 @@ impl PermissionPrompt {
     }
 
     fn handle_press(&mut self, key: KeyEvent) -> Option<PermissionDecision> {
-        let request_id = self.request_id()?.to_owned();
+        self.current()?;
         if is_ctrl(&key) && key.code == KeyCode::Char('c') {
-            // A focused field copies its selection; only with nothing to copy
-            // does the chord deny.
             if self.field_focused() && self.edit_field(key) {
                 return None;
             }
-            return Some(PermissionDecision {
-                request_id,
-                answer: PermissionAnswer::Deny,
-            });
+            return self.decision(PermissionAnswer::Deny);
         }
         if self.inspector.is_some() && self.panel != Panel::Details {
-            return self.handle_inspector_key(key);
+            self.handle_inspector_key(key);
+            return None;
         }
-        if matches!(
-            self.state,
-            PromptState::DenyEditing | PromptState::PatternEditing
-        ) {
-            if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
-                self.move_focus(
-                    key.code == KeyCode::BackTab || key.modifiers.contains(KeyModifiers::SHIFT),
-                );
+        if self.pending.is_some() && self.panel != Panel::Details {
+            return self.handle_pending_key(key);
+        }
+        match self.state {
+            PromptState::Guidance => return self.handle_guidance_key(key),
+            PromptState::PatternEditing => {
+                self.handle_pattern_key(key);
                 return None;
             }
-            if key.code == KeyCode::Enter
-                && let Some(PromptTarget::Hint(focused)) = self.focus
-                && focused.code != KeyCode::Enter
-            {
-                self.focus = None;
-                return self.handle_press(focused);
-            }
-        }
-        if self.state == PromptState::DenyEditing {
-            return match key.code {
-                KeyCode::Enter => {
-                    let text = self.field.text().trim().to_string();
-                    Some(PermissionDecision {
-                        request_id,
-                        answer: if text.is_empty() {
-                            PermissionAnswer::Deny
-                        } else {
-                            PermissionAnswer::DenyWithGuidance(text)
-                        },
-                    })
-                }
-                KeyCode::Esc => {
-                    self.leave_editor();
-                    None
-                }
-                _ => {
-                    self.edit_field(key);
-                    None
-                }
-            };
-        }
-        if self.state == PromptState::PatternEditing {
-            match key.code {
-                KeyCode::Enter => self.commit_written_pattern(),
-                KeyCode::Esc => self.leave_editor(),
-                _ => {
-                    self.edit_field(key);
-                }
-            }
-            return None;
-        }
-        if key.code == KeyCode::Esc {
-            if self.panel != Panel::Main {
-                self.panel = Panel::Main;
-            } else if self.confirmation.take().is_some() {
-                self.state = PromptState::Normal;
-                self.field.clear();
-            } else {
-                return Some(PermissionDecision {
-                    request_id,
-                    answer: PermissionAnswer::Deny,
-                });
-            }
-            self.scroll.reset();
-            self.invalidate_controls();
-            return None;
+            PromptState::Normal => {}
         }
         if key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
         {
-            if self.phrase_focused() {
-                // A phrase being typed keeps bare Home and End for its caret,
-                // so Ctrl takes the review to either end instead.
-                match key.code {
-                    KeyCode::Home | KeyCode::End => {
-                        self.scroll
-                            .handle_key(KeyEvent::new(key.code, KeyModifiers::NONE));
-                    }
-                    _ => {
-                        self.edit_field(key);
-                    }
-                }
-            }
             return None;
         }
-        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
-            self.move_focus(
-                key.code == KeyCode::BackTab || key.modifiers.contains(KeyModifiers::SHIFT),
-            );
-            return None;
+        match self.panel {
+            Panel::Main => self.handle_main_key(key),
+            Panel::StepThrough => self.handle_step_key(key),
+            Panel::Customize => self.handle_customize_key(key),
+            Panel::Details => self.handle_details_key(key),
         }
-        if key.code == KeyCode::Enter
-            && let Some(target) = self.focus.clone()
-            && target != PromptTarget::Hint(hint_key(HINT_ENTER)?)
-        {
-            return self.activate(target);
-        }
-        if key.code == KeyCode::F(2)
-            || (key.code == KeyCode::Char('v') && self.confirmation_phrase().is_none())
-        {
-            self.panel = if self.panel == Panel::Details {
-                Panel::Main
-            } else {
-                Panel::Details
-            };
-            self.scroll.reset();
-            self.invalidate_controls();
-            return None;
-        }
-        if self.panel == Panel::Details {
-            if self.confirmation.is_none() {
-                match key.code {
-                    KeyCode::Char('d') => {
-                        self.open_confirmation(PromptState::ConfirmDenyAlwaysLocal)
-                    }
-                    KeyCode::Char('D') => {
-                        self.open_confirmation(PromptState::ConfirmDenyAlwaysGlobal)
-                    }
-                    _ => {}
-                }
-            }
-            self.scroll.handle_key(key);
-            return None;
-        }
-        if let Some(confirmation) = &self.confirmation {
-            let scrolls = match key.code {
-                KeyCode::PageUp | KeyCode::PageDown | KeyCode::Up | KeyCode::Down => true,
-                KeyCode::Home | KeyCode::End => !self.phrase_focused(),
-                _ => false,
-            };
-            if scrolls {
-                self.scroll.handle_key(key);
-                return None;
-            }
-            if self.awaiting_review || !confirmation.complete {
-                return None;
-            }
-            if let Some(phrase) = &confirmation.phrase {
-                if key.code == KeyCode::Enter && self.field.text().trim() == phrase {
-                    return Some(PermissionDecision {
-                        request_id,
-                        answer: confirmation.answer.clone(),
-                    });
-                }
-                self.edit_field(key);
-                return None;
-            }
-            return matches!(key.code, KeyCode::Char('y') | KeyCode::Enter).then(|| {
-                PermissionDecision {
-                    request_id,
-                    answer: confirmation.answer.clone(),
-                }
-            });
-        }
-        if key.code == KeyCode::Char('r') || key.code == KeyCode::Char('?') {
-            self.open_scope_editor();
-            return None;
-        }
-        if key.code == KeyCode::Char('c') && self.covered_count() > 0 {
-            self.expanded_covered = !self.expanded_covered;
-            self.invalidate_controls();
-            return None;
-        }
-        if self.steer(key.code) {
-            return None;
-        }
-        if self.scroll.handle_key(key) {
-            return None;
-        }
-        if self.panel == Panel::Scopes {
-            match key.code {
-                KeyCode::Char('p') => {
-                    self.panel = Panel::Main;
-                    self.scroll.reset();
-                    self.invalidate_controls();
-                }
-                KeyCode::Char('e') => {
-                    self.open_pattern_editor();
-                }
-                KeyCode::Char('i') => self.open_inspector(),
-                KeyCode::Char('A') => return self.approve(PermissionLifetime::Global),
-                KeyCode::Char('d') => self.open_confirmation(PromptState::ConfirmDenyAlwaysLocal),
-                KeyCode::Char('D') => self.open_confirmation(PromptState::ConfirmDenyAlwaysGlobal),
-                _ => {}
-            }
-            return None;
-        }
+    }
+
+    fn handle_main_key(&mut self, key: KeyEvent) -> Option<PermissionDecision> {
         match key.code {
-            KeyCode::Char('y') if !self.awaiting_review => Some(PermissionDecision {
-                request_id,
-                answer: PermissionAnswer::AllowOnce,
-            }),
-            KeyCode::Char('s') => self.approve(PermissionLifetime::Conversation),
-            KeyCode::Char('a') => self.approve(PermissionLifetime::Project),
-            KeyCode::Char('g' | 'n') => {
-                self.state = PromptState::DenyEditing;
+            KeyCode::Esc => self.decision(PermissionAnswer::Deny),
+            KeyCode::Enter => self.choose(self.highlight),
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.move_highlight(false);
+                None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.move_highlight(true);
+                None
+            }
+            KeyCode::Left | KeyCode::Right => {
+                self.widen_focused(key.code == KeyCode::Right);
+                None
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.cycle_row(backwards(&key));
+                None
+            }
+            KeyCode::Char(bracket @ ('<' | '>')) => {
+                self.widen_all(bracket == '>');
+                None
+            }
+            KeyCode::Char('e') => {
+                self.open_editor();
+                None
+            }
+            KeyCode::Char('?') => {
+                self.toggle_details();
+                None
+            }
+            code @ KeyCode::Char(_) => self.choose(self.choice_for(code)?),
+            _ => {
+                self.scroll.handle_key(key);
+                None
+            }
+        }
+    }
+
+    fn handle_pending_key(&mut self, key: KeyEvent) -> Option<PermissionDecision> {
+        match key.code {
+            KeyCode::Esc => {
+                self.pending = None;
                 self.field.clear();
                 self.invalidate_controls();
                 None
             }
-            _ => None,
+            KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown => {
+                self.scroll.handle_key(key);
+                None
+            }
+            KeyCode::Enter => {
+                if self.awaiting_review {
+                    return None;
+                }
+                let typed = self.field.text().trim().to_owned();
+                let pending = self.pending.as_mut()?;
+                if let Some(phrase) = pending.phrases.first() {
+                    if typed != *phrase {
+                        return None;
+                    }
+                    pending.phrases.remove(0);
+                    self.field.clear();
+                    if self
+                        .pending
+                        .as_ref()
+                        .is_some_and(|pending| !pending.phrases.is_empty())
+                    {
+                        self.invalidate_controls();
+                        return None;
+                    }
+                }
+                let answer = self.pending.take()?.answer;
+                self.decision(answer)
+            }
+            _ => {
+                if self.phrase_focused() {
+                    self.edit_field(key);
+                }
+                None
+            }
         }
     }
 
-    fn leave_editor(&mut self) {
+    fn handle_guidance_key(&mut self, key: KeyEvent) -> Option<PermissionDecision> {
+        match key.code {
+            KeyCode::Enter => {
+                let guidance = self.field.text().trim().to_owned();
+                self.decision(if guidance.is_empty() {
+                    PermissionAnswer::Deny
+                } else {
+                    PermissionAnswer::DenyWithGuidance(guidance)
+                })
+            }
+            KeyCode::Esc => {
+                self.leave_field();
+                None
+            }
+            _ => {
+                self.edit_field(key);
+                None
+            }
+        }
+    }
+
+    fn handle_pattern_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter => {
+                match self.panel {
+                    Panel::StepThrough => self.commit_page_pattern(),
+                    Panel::Customize => self.commit_customize_pattern(),
+                    Panel::Main | Panel::Details => false,
+                };
+            }
+            KeyCode::Esc => self.leave_field(),
+            _ => {
+                self.edit_field(key);
+            }
+        }
+    }
+
+    fn leave_field(&mut self) {
         self.state = PromptState::Normal;
         self.field.clear();
         self.invalidate_controls();
     }
 
-    pub(super) fn invalidate_controls(&mut self) {
-        self.awaiting_review = true;
-        self.row_hits.clear();
-        self.mouse_down = None;
-        self.hover = None;
-        self.focus = None;
-        self.pending_reveal = None;
-        self.scrollbar = Default::default();
+    fn handle_step_key(&mut self, key: KeyEvent) -> Option<PermissionDecision> {
+        let review = self.step.as_ref()?.page.is_none();
+        match key.code {
+            KeyCode::Esc => {
+                self.discard_step_through();
+                None
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.turn_page(!backwards(&key));
+                None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.move_step_highlight(false);
+                None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.move_step_highlight(true);
+                None
+            }
+            KeyCode::Left | KeyCode::Right if !review => {
+                self.step_lifetime(key.code == KeyCode::Right);
+                None
+            }
+            KeyCode::Enter => {
+                let index = self.step.as_ref()?.highlight;
+                self.choose_step_item(index)
+            }
+            KeyCode::Char('y') if review => {
+                self.choose_step_item(review_index(ReviewChoice::Remember))
+            }
+            KeyCode::Char('n') if review => self.choose_step_item(review_index(ReviewChoice::Deny)),
+            KeyCode::Char('i') if !review => {
+                self.open_inspector();
+                None
+            }
+            KeyCode::Char('?') => {
+                self.toggle_details();
+                None
+            }
+            code => match digit(code) {
+                Some(index) => self.choose_step_item(index),
+                None => {
+                    self.scroll.handle_key(key);
+                    None
+                }
+            },
+        }
     }
 
-    pub(super) fn move_focus(&mut self, reverse: bool) {
-        let mut controls = Vec::new();
-        if self.panel != Panel::Details
-            && let Some(panel) = self.inspector_panel()
-        {
-            controls.extend(
-                panel
-                    .fields()
-                    .into_iter()
-                    .map(|field| PromptTarget::Inspector(field.control)),
-            );
+    fn move_step_highlight(&mut self, forward: bool) {
+        let (Some(request), Some(step)) = (self.current(), &self.step) else {
+            return;
+        };
+        let count = match step.page {
+            Some(row) => step.items(request, row).len(),
+            None => REVIEW_CHOICES.len(),
+        };
+        if let Some(step) = &mut self.step {
+            step.highlight = if forward {
+                (step.highlight + 1).min(count.saturating_sub(1))
+            } else {
+                step.highlight.saturating_sub(1)
+            };
         }
-        for hit in &self.row_hits {
-            if !controls.contains(&hit.target) {
-                controls.push(hit.target.clone());
+        self.reveal = true;
+    }
+
+    fn handle_customize_key(&mut self, key: KeyEvent) -> Option<PermissionDecision> {
+        match key.code {
+            KeyCode::Esc => {
+                self.close_customize();
+                None
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.cycle_customize_field(backwards(&key));
+                None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.move_scope(false);
+                None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.move_scope(true);
+                None
+            }
+            KeyCode::Left | KeyCode::Right => {
+                self.step_customize(key.code == KeyCode::Right);
+                None
+            }
+            KeyCode::Enter => self.apply_customize(),
+            KeyCode::Char('v') => {
+                self.toggle_advanced();
+                None
+            }
+            KeyCode::Char('i') => {
+                self.open_inspector();
+                None
+            }
+            KeyCode::Char('?') => {
+                self.toggle_details();
+                None
+            }
+            _ => {
+                self.scroll.handle_key(key);
+                None
             }
         }
-        if controls.is_empty() {
+    }
+
+    fn toggle_advanced(&mut self) {
+        if self.customize_model().is_none() {
+            return;
+        }
+        if let Some(customize) = self.customize.as_mut() {
+            customize.advanced = !customize.advanced;
+        }
+        self.scope_view = ScopeView::default();
+        self.reveal = true;
+        self.invalidate_controls();
+    }
+
+    fn handle_details_key(&mut self, key: KeyEvent) -> Option<PermissionDecision> {
+        match key.code {
+            KeyCode::Esc => self.decision(PermissionAnswer::Deny),
+            KeyCode::Char('?') => {
+                self.toggle_details();
+                None
+            }
+            _ => {
+                self.scroll.handle_key(key);
+                None
+            }
+        }
+    }
+
+    /// `?` opens Details over whatever is shown, and closes it again.
+    pub(super) fn toggle_details(&mut self) {
+        if self.panel == Panel::Details {
+            self.panel = self.before_details;
+        } else {
+            self.before_details = self.panel;
+            self.panel = Panel::Details;
+        }
+        self.scroll.reset();
+        self.invalidate_controls();
+    }
+
+    /// `e`: the step-through when several commands need an answer, else
+    /// Customize.
+    fn open_editor(&mut self) {
+        if self.batch() && self.per_row() && !self.new_rows().is_empty() {
+            self.open_step_through();
+        } else {
+            self.open_customize(false);
+        }
+    }
+
+    fn widen_focused(&mut self, forward: bool) {
+        if self.opacity().is_some() {
+            return;
+        }
+        let changed = if self.per_row() {
+            let Some(row) = self.focus_row else {
+                return;
+            };
+            self.widen_row(row, forward)
+        } else {
+            self.widen_authority(forward)
+        };
+        if changed {
+            self.scope_changed();
+        }
+    }
+
+    fn widen_all(&mut self, forward: bool) {
+        if !self.per_row() || self.opacity().is_some() {
+            return;
+        }
+        let mut changed = false;
+        for row in self.new_rows() {
+            changed |= self.widen_row(row, forward);
+        }
+        if changed {
+            self.scope_changed();
+        }
+    }
+
+    fn scope_changed(&mut self) {
+        if !self.choices().contains(&self.highlight) {
+            self.highlight = Choice::Once;
+        }
+        self.invalidate_controls();
+    }
+
+    fn cycle_row(&mut self, backwards: bool) {
+        let rows = self.new_rows();
+        if rows.is_empty() {
             return;
         }
         let index = self
-            .focus
-            .as_ref()
-            .and_then(|focus| controls.iter().position(|target| target == focus));
+            .focus_row
+            .and_then(|row| rows.iter().position(|found| *found == row));
         let next = match index {
-            Some(index) if reverse => (index + controls.len() - 1) % controls.len(),
-            Some(index) => (index + 1) % controls.len(),
-            None if reverse => controls.len() - 1,
+            Some(index) if backwards => (index + rows.len() - 1) % rows.len(),
+            Some(index) => (index + 1) % rows.len(),
             None => 0,
         };
-        self.focus = Some(controls[next].clone());
-        if matches!(self.focus, Some(PromptTarget::Inspector(_))) {
-            self.pending_reveal = self.focus.clone();
-        }
+        self.focus_row = Some(rows[next]);
+        self.invalidate_controls();
     }
 
+    /// Acts on what was clicked, or on a focused control's Enter.
     pub(super) fn activate(&mut self, target: PromptTarget) -> Option<PermissionDecision> {
         match target {
-            PromptTarget::VisualScope(authority, control) => {
-                if self.confirmation.is_some() {
+            PromptTarget::Choice(choice) => {
+                if let Some(pending) = &self.pending {
+                    let again = pending.choice == Some(choice) && pending.phrases.is_empty();
+                    return again
+                        .then(|| self.handle_pending_key(KeyEvent::from(KeyCode::Enter)))
+                        .flatten();
+                }
+                if self.state != PromptState::Normal {
                     return None;
                 }
-                if self.scope_authority != authority {
-                    self.scope_authority = authority;
-                    self.scope_view = Default::default();
-                }
-                self.scope_view.activate(control);
+                self.choose(choice)
+            }
+            PromptTarget::Row(row) => {
+                self.focus_row = Some(row);
                 self.invalidate_controls();
                 None
             }
+            PromptTarget::Item(index) => match self.panel {
+                Panel::StepThrough => {
+                    if let Some(step) = self.step.as_mut() {
+                        step.highlight = index;
+                    }
+                    self.choose_step_item(index)
+                }
+                Panel::Customize => {
+                    let own = self.customize_items().get(index) == Some(&ScopeItem::OwnPattern);
+                    self.highlight_scope(index);
+                    if own {
+                        return self.apply_customize();
+                    }
+                    None
+                }
+                Panel::Main | Panel::Details => None,
+            },
+            PromptTarget::Tab(row) => {
+                self.go_to_page(Some(row));
+                None
+            }
+            PromptTarget::Review => {
+                self.go_to_page(None);
+                None
+            }
+            PromptTarget::Effect(effect) => {
+                self.set_effect(effect);
+                None
+            }
+            PromptTarget::Remember(lifetime) => {
+                match self.panel {
+                    Panel::Customize => self.set_lifetime(lifetime),
+                    Panel::StepThrough => self.set_page_lifetime(lifetime),
+                    Panel::Main | Panel::Details => {}
+                }
+                None
+            }
+            PromptTarget::Hint(key) => self.handle_press(key),
             PromptTarget::Inspector(control) => {
                 self.activate_inspector(control);
                 None
             }
-            PromptTarget::Scope => {
-                if self.panel == Panel::Scopes {
-                    self.panel = Panel::Main;
-                    self.invalidate_controls();
-                } else {
-                    self.open_scope_editor();
-                }
+            PromptTarget::VisualScope(control) => {
+                self.scope_view.activate(control);
+                self.invalidate_controls();
                 None
             }
-            PromptTarget::Authority(id) => {
-                self.select_authority(id);
-                self.open_scope_editor();
-                None
-            }
-            PromptTarget::Hint(key) => {
-                self.focus = (self.panel == Panel::Scopes
-                    && matches!(
-                        key.code,
-                        KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
-                    ))
-                .then_some(PromptTarget::Scope);
-                self.handle_press(key)
-            }
         }
-    }
-
-    fn steer(&mut self, code: KeyCode) -> bool {
-        let Some(target) = self.focus.clone() else {
-            return false;
-        };
-        match target {
-            PromptTarget::Authority(id) if matches!(code, KeyCode::Left | KeyCode::Right) => {
-                self.select_authority(id);
-                self.widen(code == KeyCode::Right);
-            }
-            PromptTarget::Scope => match code {
-                KeyCode::Left | KeyCode::Right => self.widen(code == KeyCode::Right),
-                KeyCode::Up | KeyCode::Down => self.move_selection(code == KeyCode::Up),
-                _ => return false,
-            },
-            _ => return false,
-        }
-        true
-    }
-
-    pub(super) fn open_pattern_editor(&mut self) -> bool {
-        let Some(row) = self.command_row() else {
-            return false;
-        };
-        let Some(request) = self.current() else {
-            return false;
-        };
-        let seed = self.scopes[row]
-            .written
-            .clone()
-            .or_else(|| {
-                command_ladders(request)[row]
-                    .get(1)
-                    .and_then(|rung| rung.group.as_ref())
-                    .map(|group| group.value.clone())
-            })
-            .or_else(|| {
-                request
-                    .resources
-                    .get(row)
-                    .map(|resource| resource.value.clone())
-            })
-            .unwrap_or_default();
-        let seed = if request
-            .resources
-            .get(row)
-            .is_some_and(|resource| sensitive_text(&resource.value))
-            || sensitive_text(&seed)
-        {
-            String::new()
-        } else {
-            seed
-        };
-        self.field.set_text(&seed);
-        self.state = PromptState::PatternEditing;
-        self.invalidate_controls();
-        true
-    }
-
-    fn commit_written_pattern(&mut self) {
-        let Some(row) = self.command_row() else {
-            return;
-        };
-        let pattern = self.field.text().trim().to_owned();
-        let usable = self
-            .current()
-            .and_then(|request| request.resources.get(row))
-            .is_some_and(|resource| grade_command_pattern(&pattern, &resource.value).is_ok());
-        if !usable {
-            return;
-        }
-        let offered = self
-            .current()
-            .map_or(0, |request| command_ladders(request)[row].len());
-        self.scopes[row].written = Some(pattern);
-        self.scopes[row].rung = offered + 1;
-        self.leave_editor();
     }
 
     pub fn handle_paste(&mut self, text: &str) -> bool {
-        if let Some(inspector) = &self.inspector {
-            if !inspector.is_editing() || self.panel == Panel::Details {
+        if !self.is_open() {
+            return false;
+        }
+        if let Some(inspector) = &self.inspector
+            && self.panel != Panel::Details
+        {
+            if !inspector.is_editing() {
                 return false;
             }
             self.field.paste(text);
@@ -649,16 +694,7 @@ impl PermissionPrompt {
             self.refresh_inspector(None);
             return true;
         }
-        let editing = matches!(
-            self.state,
-            PromptState::DenyEditing | PromptState::PatternEditing
-        );
-        if (!editing
-            && (self.confirmation_phrase().is_none()
-                || self.panel == Panel::Details
-                || self.awaiting_review))
-            || !self.is_open()
-        {
+        if !self.field_focused() {
             return false;
         }
         self.field.paste(text);
@@ -669,16 +705,19 @@ impl PermissionPrompt {
     pub fn clear_hover(&mut self) {
         self.hover = None;
     }
+
     pub fn scroll(&mut self, delta: i32) {
         self.scroll.scroll(delta);
-        self.row_hits.clear();
+        self.hits.clear();
         self.mouse_down = None;
     }
+
     pub fn contains(&self, pos: Position) -> bool {
         self.area.contains(pos)
     }
-    pub(super) fn target_at(&self, pos: Position) -> Option<&PromptTarget> {
-        self.row_hits
+
+    fn target_at(&self, pos: Position) -> Option<&PromptTarget> {
+        self.hits
             .iter()
             .find(|hit| hit.area.contains(pos))
             .map(|hit| &hit.target)
@@ -692,8 +731,9 @@ impl PermissionPrompt {
             ScrollbarMouse::Ignored => {}
             ScrollbarMouse::Consumed => return PromptMouse::Consumed,
             ScrollbarMouse::ScrollTo(top) => {
-                self.scroll.scroll_to(top as u16);
-                self.row_hits.clear();
+                self.scroll
+                    .scroll_to(u16::try_from(top).unwrap_or(u16::MAX));
+                self.hits.clear();
                 self.mouse_down = None;
                 return PromptMouse::Consumed;
             }
@@ -715,13 +755,13 @@ impl PermissionPrompt {
                     return PromptMouse::Consumed;
                 }
                 self.focus = None;
-                let decision = self.activate(pressed);
-                if let Some(decision) = decision {
-                    self.input_freshness.barrier();
-                    self.invalidate_controls();
-                    PromptMouse::Decided(decision)
-                } else {
-                    PromptMouse::Consumed
+                match self.activate(pressed) {
+                    Some(decision) => {
+                        self.input_freshness.barrier();
+                        self.invalidate_controls();
+                        PromptMouse::Decided(decision)
+                    }
+                    None => PromptMouse::Consumed,
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) if self.mouse_down.is_some() => {
@@ -742,31 +782,49 @@ impl PermissionPrompt {
 
 #[cfg(test)]
 mod tests {
-    use std::{thread, time::Duration};
-
+    use caudra_agent::permissions::{
+        COMMAND_EXACT_PREFIX, PermissionAnswer, PermissionLifetime, PermissionRequest,
+        PermissionResourceAccess, PermissionRowGrant,
+    };
     use crossterm::event::{
         KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
-    use serde_json::json;
+    use ratatui::layout::Rect;
     use test_case::test_case;
 
-    use super::super::view::REARM_MESSAGE;
-    use super::super::view::tests::{ROOMY_HEIGHT, ROOMY_WIDTH, key, open_prompt, render, request};
-    use super::super::{
-        Panel, PermissionAnswer, PermissionLifetime, PermissionPrompt, PromptMouse, PromptState,
-        PromptTarget, Rect,
+    use super::super::choices::Choice;
+    use super::super::decision::default_grant;
+    use super::super::decision::tests::{commands_request, native_shell_request};
+    use super::super::step_through::PageItem;
+    use super::super::view::tests::{
+        BATCH, OUTSIDE_FILE, ROOMY_HEIGHT, ROOMY_WIDTH, SINGLE_COMMAND, advised, batch_request,
+        fetch_request, file_request, heredoc_request, key, planning, prompt_for, prose, render,
+        shell_prompt,
     };
-    use super::hint_key;
+    use super::super::view::{PRESS_AGAIN, REARM_MESSAGE};
+    use super::super::{
+        Panel, PermissionPrompt, PromptMouse, PromptState, PromptTarget, RowChoice,
+    };
+    use super::ScopeItem;
 
+    const FIRST: &str = "first";
+    const NEXT: &str = "next";
+    const PAIR: [&str; 2] = [
+        "cargo fmt -p caudra-agent",
+        "cargo clippy -p caudra-agent --tests",
+    ];
     const GUIDANCE: &str = "Use a native read tool instead";
     const SECRET: &str = "private-test-value";
     const SENSITIVE_COMMAND: &str = "env API_TOKEN=private-test-value rm -rf /project";
+    const WRONG_PHRASE: &str = "not the phrase";
+    const UNMATCHED_PATTERN: &str = "git *";
+    const MATCHING_PATTERN: &str = "cargo test -p *";
+    const SHORTCUT_LETTERS: &str = "yn?e";
     const REPEAT_COUNT: usize = 10;
-    const DELAYED_FIRST_REPEAT: Duration = Duration::from_millis(600);
 
     fn hit(prompt: &PermissionPrompt, target: &PromptTarget) -> Rect {
         prompt
-            .row_hits
+            .hits
             .iter()
             .find(|hit| hit.target == *target)
             .unwrap()
@@ -788,501 +846,702 @@ mod tests {
         prompt.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), area))
     }
 
+    fn with_kind(code: KeyCode, kind: KeyEventKind) -> KeyEvent {
+        let mut event = key(code);
+        event.kind = kind;
+        event
+    }
+
+    fn draw(prompt: &mut PermissionPrompt) -> String {
+        render(prompt, ROOMY_WIDTH, ROOMY_HEIGHT)
+    }
+
+    /// Two shell requests queued one after the other.
+    fn queued_pair() -> PermissionPrompt {
+        let mut prompt = PermissionPrompt::new();
+        for id in [FIRST, NEXT] {
+            let mut request = native_shell_request(SINGLE_COMMAND);
+            request.id = id.into();
+            prompt.enqueue(Box::new(request), None);
+        }
+        prompt
+    }
+
+    /// Customize applied on the broadest scope it lists, waiting on its
+    /// confirmation. The Enter that applied it is still down.
+    fn broad_pending(lifetime: PermissionLifetime) -> PermissionPrompt {
+        let mut prompt = shell_prompt(SINGLE_COMMAND);
+        prompt.open_customize(false);
+        let last = prompt.customize_items().len() - 1;
+        prompt.highlight_scope(last);
+        prompt.set_lifetime(lifetime);
+        draw(&mut prompt);
+        assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());
+        assert!(prompt.pending.is_some());
+        draw(&mut prompt);
+        prompt
+    }
+
+    fn decided(mouse: PromptMouse) -> Option<PermissionAnswer> {
+        match mouse {
+            PromptMouse::Decided(decision) => Some(decision.answer),
+            _ => None,
+        }
+    }
+
+    #[test_case('1', 'y', Choice::Once; "once")]
+    #[test_case('2', 's', Choice::Conversation; "conversation")]
+    #[test_case('3', 'a', Choice::Project; "project")]
+    fn number_and_letter_keys_choose_the_same_answer(number: char, letter: char, choice: Choice) {
+        let expected = shell_prompt(SINGLE_COMMAND).choice_answer(choice).unwrap();
+        for shortcut in [Some(number), Some(letter), None] {
+            let mut prompt = shell_prompt(SINGLE_COMMAND);
+            draw(&mut prompt);
+            let answer = match shortcut {
+                Some(shortcut) => prompt
+                    .handle_key(key(KeyCode::Char(shortcut)))
+                    .map(|decision| decision.answer),
+                None => decided(click(&mut prompt, PromptTarget::Choice(choice))),
+            };
+            assert_eq!(answer.as_ref(), Some(&expected), "{shortcut:?}");
+        }
+    }
+
+    #[test_case(planning(native_shell_request(SINGLE_COMMAND)), &['a'], '3'; "plan_mode")]
+    #[test_case(heredoc_request(), &['s', 'a'], '2'; "inline_script")]
+    fn absent_choices_ignore_their_letters(request: PermissionRequest, absent: &[char], no: char) {
+        let mut prompt = prompt_for(request);
+        draw(&mut prompt);
+        for letter in absent {
+            assert!(prompt.handle_key(key(KeyCode::Char(*letter))).is_none());
+            assert_eq!(prompt.state, PromptState::Normal);
+            assert!(prompt.pending.is_none());
+        }
+        assert!(prompt.handle_key(key(KeyCode::Char(no))).is_none());
+        assert_eq!(prompt.state, PromptState::Guidance);
+    }
+
+    #[test_case(native_shell_request(SINGLE_COMMAND), KeyCode::Left, KeyCode::Right; "command_row_narrows")]
+    #[test_case(fetch_request(), KeyCode::Right, KeyCode::Left; "web_page_widens")]
+    fn arrows_change_scope_without_answering(
+        request: PermissionRequest,
+        there: KeyCode,
+        back: KeyCode,
+    ) {
+        let mut prompt = prompt_for(request);
+        draw(&mut prompt);
+        let answer = prompt.choice_answer(Choice::Conversation);
+        let sentence = prompt.choice_sentence(Choice::Conversation);
+        assert!(prompt.handle_key(key(there)).is_none());
+        assert_ne!(prompt.choice_answer(Choice::Conversation), answer);
+        assert_ne!(prompt.choice_sentence(Choice::Conversation), sentence);
+        assert!(prompt.pending.is_none());
+        draw(&mut prompt);
+        assert!(prompt.handle_key(key(back)).is_none());
+        assert_eq!(prompt.choice_answer(Choice::Conversation), answer);
+    }
+
+    #[test]
+    fn angle_brackets_move_every_new_row() {
+        let mut prompt = prompt_for(batch_request());
+        draw(&mut prompt);
+        let defaults = prompt.row_grants();
+        let new_rows = prompt.new_rows();
+        assert!(prompt.handle_key(key(KeyCode::Char('<'))).is_none());
+        let narrowed = prompt.row_grants();
+        for row in 0..BATCH.len() {
+            assert_eq!(
+                narrowed[row] != defaults[row],
+                new_rows.contains(&row),
+                "row {row}"
+            );
+        }
+        draw(&mut prompt);
+        assert!(prompt.handle_key(key(KeyCode::Char('>'))).is_none());
+        assert_eq!(prompt.row_grants(), defaults);
+    }
+
+    #[test]
+    fn tab_cycles_only_new_rows() {
+        let mut prompt = prompt_for(batch_request());
+        draw(&mut prompt);
+        let new_rows = prompt.new_rows();
+        assert!(new_rows.len() > 1 && new_rows.len() < BATCH.len());
+        assert_eq!(prompt.focus_row, new_rows.first().copied());
+        let mut visited = Vec::new();
+        for _ in 0..new_rows.len() {
+            prompt.handle_key(key(KeyCode::Tab));
+            visited.extend(prompt.focus_row);
+        }
+        assert_eq!(visited, [&new_rows[1..], &new_rows[..1]].concat());
+        prompt.handle_key(key(KeyCode::BackTab));
+        assert_eq!(prompt.focus_row, new_rows.last().copied());
+    }
+
+    /// The key that chooses item `index` of a page.
+    fn number_key(index: usize) -> KeyEvent {
+        key(KeyCode::Char(
+            char::from_digit(index as u32 + 1, 10).unwrap(),
+        ))
+    }
+
+    fn drafted_lifetime(prompt: &PermissionPrompt, row: usize) -> PermissionLifetime {
+        prompt.step.as_ref().unwrap().lifetimes[row].clone()
+    }
+
+    #[test]
+    fn step_through_escape_discards_the_draft() {
+        let mut prompt = prompt_for(commands_request(&PAIR));
+        draw(&mut prompt);
+        let rows = prompt.row_grants();
+        assert!(prompt.handle_key(key(KeyCode::Char('e'))).is_none());
+        assert_eq!(prompt.panel, Panel::StepThrough);
+        draw(&mut prompt);
+        assert!(prompt.handle_key(number_key(0)).is_none());
+        assert_eq!(
+            prompt.step.as_ref().unwrap().rows[0],
+            RowChoice::Chosen(None)
+        );
+        assert!(prompt.handle_key(key(KeyCode::Esc)).is_none());
+        assert_eq!(prompt.panel, Panel::Main);
+        assert!(prompt.step.is_none());
+        assert_eq!(prompt.row_grants(), rows);
+    }
+
+    #[test_case(false, &[PermissionLifetime::Conversation, PermissionLifetime::Project]; "build_mode")]
+    #[test_case(true, &[PermissionLifetime::Conversation]; "plan_mode")]
+    fn remember_for_offers_only_the_rungs_lifetimes(plan: bool, offered: &[PermissionLifetime]) {
+        let mut request = commands_request(&PAIR);
+        let exact = format!("{COMMAND_EXACT_PREFIX}0");
+        let Some(PermissionRowGrant::Offered(default)) = default_grant(&request, 0) else {
+            panic!("row 0 has no offered default");
+        };
+        assert_ne!(default, exact);
+        for option in &mut request.options {
+            if option.id == default {
+                option.allowed_lifetimes = vec![
+                    PermissionLifetime::Once,
+                    PermissionLifetime::Conversation,
+                    PermissionLifetime::Project,
+                ];
+            } else if option.id == exact {
+                option.allowed_lifetimes =
+                    vec![PermissionLifetime::Once, PermissionLifetime::Conversation];
+            }
+        }
+        let mut prompt = prompt_for(if plan { planning(request) } else { request });
+        draw(&mut prompt);
+        prompt.handle_key(key(KeyCode::Char('e')));
+        assert_eq!(prompt.page_lifetimes(), offered);
+        for _ in 0..REPEAT_COUNT {
+            prompt.handle_key(key(KeyCode::Right));
+        }
+        assert_eq!(drafted_lifetime(&prompt, 0), *offered.last().unwrap());
+
+        let request = prompt.current().unwrap();
+        let exact_item = PageItem::Grant(Some(PermissionRowGrant::Offered(exact)));
+        let index = prompt
+            .step
+            .as_ref()
+            .unwrap()
+            .items(request, 0)
+            .iter()
+            .position(|item| *item == exact_item)
+            .unwrap();
+        draw(&mut prompt);
+        prompt.handle_key(number_key(index));
+        assert_eq!(
+            drafted_lifetime(&prompt, 0),
+            PermissionLifetime::Conversation
+        );
+
+        prompt.go_to_page(Some(0));
+        draw(&mut prompt);
+        prompt.handle_key(number_key(0));
+        prompt.go_to_page(Some(0));
+        assert!(prompt.page_lifetimes().is_empty());
+    }
+
+    #[test]
+    fn review_answer_carries_each_rows_lifetime() {
+        let mut prompt = prompt_for(commands_request(&PAIR));
+        draw(&mut prompt);
+        prompt.handle_key(key(KeyCode::Char('e')));
+        prompt.handle_key(key(KeyCode::Right));
+        for _ in PAIR {
+            draw(&mut prompt);
+            assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());
+        }
+        assert_eq!(prompt.step.as_ref().unwrap().page, None);
+        draw(&mut prompt);
+        let answer = prompt.handle_key(key(KeyCode::Char('y'))).unwrap().answer;
+        let PermissionAnswer::AllowComposed { rows } = answer else {
+            panic!("expected a composed answer: {answer:?}");
+        };
+        let lifetimes: Vec<_> = rows
+            .iter()
+            .map(|row| row.as_ref().map(|row| row.lifetime.clone()))
+            .collect();
+        assert_eq!(
+            lifetimes,
+            [
+                Some(PermissionLifetime::Project),
+                Some(PermissionLifetime::Conversation)
+            ]
+        );
+    }
+
+    #[test_case(false; "from_main_view")]
+    #[test_case(true; "from_review")]
+    fn customize_returns_without_answering(from_review: bool) {
+        let mut prompt = if from_review {
+            prompt_for(commands_request(&PAIR))
+        } else {
+            shell_prompt(SINGLE_COMMAND)
+        };
+        draw(&mut prompt);
+        prompt.handle_key(key(KeyCode::Char('e')));
+        if from_review {
+            prompt.go_to_page(None);
+            draw(&mut prompt);
+            prompt.handle_key(number_key(2));
+        }
+        let back = prompt.customize.as_ref().unwrap().back;
+        let (rows, answer) = (
+            prompt.row_grants(),
+            prompt.choice_answer(Choice::Conversation),
+        );
+        for code in [KeyCode::Down, KeyCode::Right] {
+            assert!(prompt.handle_key(key(code)).is_none());
+        }
+        assert!(prompt.handle_key(key(KeyCode::Esc)).is_none());
+        assert!(prompt.customize.is_none());
+        assert_eq!(prompt.panel, back);
+        assert_eq!(prompt.step.is_some(), from_review);
+        assert_eq!(prompt.row_grants(), rows);
+        assert_eq!(prompt.choice_answer(Choice::Conversation), answer);
+        assert_eq!(prompt.pending_count(), 1);
+    }
+
+    #[test]
+    fn broad_conversation_grant_needs_a_fresh_second_enter() {
+        let mut prompt = broad_pending(PermissionLifetime::Conversation);
+        let frozen = prompt.pending.as_ref().unwrap().answer.clone();
+        assert!(prompt.pending.as_ref().unwrap().phrases.is_empty());
+        assert!(prose(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT).contains(PRESS_AGAIN));
+        for _ in 0..REPEAT_COUNT {
+            assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());
+        }
+        assert!(draw(&mut prompt).contains(REARM_MESSAGE));
+        let modified = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+        assert!(prompt.handle_key(modified).is_none());
+        prompt.handle_key(with_kind(KeyCode::Enter, KeyEventKind::Release));
+        draw(&mut prompt);
+        assert_eq!(
+            prompt.handle_key(key(KeyCode::Enter)).unwrap().answer,
+            frozen
+        );
+    }
+
+    #[test]
+    fn broad_project_grant_needs_the_typed_phrase() {
+        let mut prompt = broad_pending(PermissionLifetime::Project);
+        let pending = prompt.pending.as_ref().unwrap();
+        let [phrase] = pending.phrases.as_slice() else {
+            panic!("expected one phrase: {:?}", pending.phrases);
+        };
+        let (phrase, frozen) = (phrase.clone(), pending.answer.clone());
+        prompt.handle_key(with_kind(KeyCode::Enter, KeyEventKind::Release));
+        draw(&mut prompt);
+        assert!(prompt.handle_paste(WRONG_PHRASE));
+        assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());
+        assert!(prompt.pending.is_some());
+        prompt.field.clear();
+        assert!(prompt.handle_paste(&phrase));
+        assert_eq!(
+            prompt.handle_key(key(KeyCode::Enter)).unwrap().answer,
+            frozen
+        );
+    }
+
+    #[test_case(PermissionLifetime::Conversation, KeyCode::Enter, true; "keypress_enter")]
+    #[test_case(PermissionLifetime::Conversation, KeyCode::Char('y'), false; "keypress_letter")]
+    #[test_case(PermissionLifetime::Project, KeyCode::Enter, true; "phrase_enter")]
+    #[test_case(PermissionLifetime::Project, KeyCode::Char('y'), false; "phrase_letter")]
+    fn a_held_key_is_named_only_when_it_would_confirm(
+        lifetime: PermissionLifetime,
+        held: KeyCode,
+        named: bool,
+    ) {
+        let mut prompt = broad_pending(lifetime);
+        let frozen = prompt.pending.as_ref().unwrap().answer.clone();
+        prompt.handle_key(with_kind(KeyCode::Enter, KeyEventKind::Release));
+        draw(&mut prompt);
+        assert!(
+            prompt
+                .handle_key(with_kind(held, KeyEventKind::Repeat))
+                .is_none()
+        );
+        assert_eq!(draw(&mut prompt).contains(REARM_MESSAGE), named);
+        assert!(prompt.handle_key(key(held)).is_none());
+        assert_eq!(prompt.pending.as_ref().unwrap().answer, frozen);
+    }
+
+    #[test_case(Some('4'), GUIDANCE; "number_with_text")]
+    #[test_case(Some('n'), GUIDANCE; "letter_with_text")]
+    #[test_case(None, GUIDANCE; "click_with_text")]
+    #[test_case(Some('n'), ""; "without_text")]
+    fn guidance_choice_denies_with_text(shortcut: Option<char>, guidance: &str) {
+        let mut prompt = shell_prompt(SINGLE_COMMAND);
+        draw(&mut prompt);
+        let opened = match shortcut {
+            Some(shortcut) => prompt
+                .handle_key(key(KeyCode::Char(shortcut)))
+                .map(|decision| decision.answer),
+            None => decided(click(&mut prompt, PromptTarget::Choice(Choice::Deny))),
+        };
+        assert!(opened.is_none());
+        assert_eq!(prompt.state, PromptState::Guidance);
+        assert!(prompt.handle_paste(guidance));
+        let expected = if guidance.is_empty() {
+            PermissionAnswer::Deny
+        } else {
+            PermissionAnswer::DenyWithGuidance(guidance.into())
+        };
+        assert_eq!(
+            prompt.handle_key(key(KeyCode::Enter)).unwrap().answer,
+            expected
+        );
+    }
+
+    #[test]
+    fn escape_leaves_guidance_without_denying() {
+        let mut prompt = shell_prompt(SINGLE_COMMAND);
+        draw(&mut prompt);
+        prompt.handle_key(key(KeyCode::Char('n')));
+        assert!(prompt.handle_paste(GUIDANCE));
+        assert!(prompt.handle_key(key(KeyCode::Esc)).is_none());
+        assert_eq!(prompt.state, PromptState::Normal);
+        assert!(prompt.field.is_empty());
+    }
+
+    #[test_case(Panel::Main; "main_view")]
+    #[test_case(Panel::Details; "details")]
+    fn escape_denies_without_guidance(panel: Panel) {
+        let mut prompt = shell_prompt(SINGLE_COMMAND);
+        if panel == Panel::Details {
+            prompt.toggle_details();
+        }
+        draw(&mut prompt);
+        assert_eq!(prompt.panel, panel);
+        assert_eq!(
+            prompt.handle_key(key(KeyCode::Esc)).unwrap().answer,
+            PermissionAnswer::Deny
+        );
+    }
+
+    #[test_case('1'; "once_number")]
     #[test_case('y'; "once")]
     #[test_case('s'; "conversation")]
     #[test_case('a'; "project")]
     fn queued_decisions_need_a_fresh_frame_and_a_fresh_press(shortcut: char) {
-        let mut prompt = open_prompt();
-        prompt.enqueue(request("next", json!({"command": "cargo test"})), None);
-        render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT);
-        let area = hit(&prompt, &PromptTarget::Hint(key(KeyCode::Char(shortcut))));
+        let mut prompt = queued_pair();
+        draw(&mut prompt);
+        let area = hit(&prompt, &PromptTarget::Choice(Choice::Once));
         prompt.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), area));
-        assert!(prompt.resolve("id"));
+        assert!(prompt.resolve(FIRST));
         assert!(prompt.handle_key(key(KeyCode::Char(shortcut))).is_none());
-        assert!(render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT).contains(REARM_MESSAGE));
-        assert!(!matches!(
-            prompt.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), area)),
-            PromptMouse::Decided(_)
-        ));
+        assert!(draw(&mut prompt).contains(REARM_MESSAGE));
+        assert!(
+            decided(prompt.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), area)))
+                .is_none()
+        );
         for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
-            let mut event = key(KeyCode::Char(shortcut));
-            event.kind = kind;
-            assert!(prompt.handle_key(event).is_none());
+            assert!(
+                prompt
+                    .handle_key(with_kind(KeyCode::Char(shortcut), kind))
+                    .is_none()
+            );
         }
         assert_eq!(
             prompt
                 .handle_key(key(KeyCode::Char(shortcut)))
                 .unwrap()
                 .request_id,
-            "next"
+            NEXT
         );
     }
 
     #[test_case('y'; "once")]
     #[test_case('s'; "conversation")]
     #[test_case('a'; "project")]
-    fn legacy_repeat_presses_require_an_explicit_rearming_gesture(shortcut: char) {
+    fn repeat_presses_need_an_explicit_rearming_gesture(shortcut: char) {
         let event = key(KeyCode::Char(shortcut));
-        let mut prompt = open_prompt();
-        prompt.enqueue(request("next", json!({"command": "cargo test"})), None);
-        render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT);
-        assert_eq!(prompt.handle_key(event).unwrap().request_id, "id");
-        assert!(prompt.resolve("id"));
-        assert!(render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT).contains(REARM_MESSAGE));
+        let mut prompt = queued_pair();
+        draw(&mut prompt);
+        assert_eq!(prompt.handle_key(event).unwrap().request_id, FIRST);
+        assert!(prompt.resolve(FIRST));
+        assert!(draw(&mut prompt).contains(REARM_MESSAGE));
         for _ in 0..REPEAT_COUNT {
             assert!(prompt.handle_key(event).is_none());
-            assert!(render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT).contains(REARM_MESSAGE));
-            assert_eq!(prompt.request_id(), Some("next"));
+            assert!(draw(&mut prompt).contains(REARM_MESSAGE));
+            assert_eq!(prompt.request_id(), Some(NEXT));
         }
-        assert!(prompt.handle_key(key(KeyCode::Tab)).is_none());
-        assert!(!render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT).contains(REARM_MESSAGE));
-        assert_eq!(prompt.handle_key(event).unwrap().request_id, "next");
-        assert!(prompt.confirmation.is_none());
-    }
-
-    #[test]
-    fn legacy_first_repeat_after_500ms_of_silence_cannot_approve_the_next_request() {
-        let mut prompt = open_prompt();
-        prompt.enqueue(request("next", json!({"command": "cargo test"})), None);
-        render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT);
-        let event = key(KeyCode::Char('y'));
-        assert!(prompt.handle_key(event).is_some());
-        assert!(prompt.resolve("id"));
-        render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT);
-        thread::sleep(DELAYED_FIRST_REPEAT);
-        assert!(prompt.handle_key(event).is_none());
-        assert_eq!(prompt.request_id(), Some("next"));
-        prompt.handle_key(key(KeyCode::Tab));
-        assert_eq!(prompt.handle_key(event).unwrap().request_id, "next");
+        assert!(prompt.handle_key(key(KeyCode::Down)).is_none());
+        assert!(!draw(&mut prompt).contains(REARM_MESSAGE));
+        assert_eq!(prompt.handle_key(event).unwrap().request_id, NEXT);
     }
 
     #[test_case("release"; "release")]
     #[test_case("different_key"; "different_key")]
     #[test_case("mouse"; "mouse_press")]
     fn unambiguous_activation_rearms_the_next_request(activation: &str) {
-        let mut prompt = open_prompt();
-        prompt.enqueue(request("next", json!({"command": "cargo test"})), None);
-        render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT);
+        let mut prompt = queued_pair();
+        draw(&mut prompt);
         assert!(prompt.handle_key(key(KeyCode::Char('y'))).is_some());
-        prompt.resolve("id");
-        render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT);
-        let decision = match activation {
+        prompt.resolve(FIRST);
+        draw(&mut prompt);
+        let decided = match activation {
             "release" => {
-                let mut release = key(KeyCode::Char('y'));
-                release.kind = KeyEventKind::Release;
-                assert!(prompt.handle_key(release).is_none());
-                prompt.handle_key(key(KeyCode::Char('y'))).unwrap()
+                prompt.handle_key(with_kind(KeyCode::Char('y'), KeyEventKind::Release));
+                prompt.handle_key(key(KeyCode::Char('y'))).is_some()
             }
-            "different_key" => prompt.handle_key(key(KeyCode::Char('s'))).unwrap(),
-            "mouse" => {
-                let PromptMouse::Decided(decision) =
-                    click(&mut prompt, PromptTarget::Hint(key(KeyCode::Char('y'))))
-                else {
-                    panic!("fresh mouse press did not decide");
-                };
-                decision
-            }
+            "different_key" => prompt.handle_key(key(KeyCode::Char('s'))).is_some(),
+            "mouse" => decided(click(&mut prompt, PromptTarget::Choice(Choice::Once))).is_some(),
             _ => unreachable!(),
         };
-        assert_eq!(decision.request_id, "next");
+        assert!(decided);
+        assert_eq!(prompt.request_id(), Some(NEXT));
     }
 
     #[test]
     fn navigation_repeats_and_unrelated_releases_do_not_rearm_an_approval() {
-        let mut prompt = open_prompt();
-        prompt.enqueue(request("next", json!({"command": "cargo test"})), None);
-        render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT);
+        let mut prompt = queued_pair();
+        draw(&mut prompt);
         assert!(prompt.handle_key(key(KeyCode::Char('y'))).is_some());
-        prompt.resolve("id");
-        render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT);
+        prompt.resolve(FIRST);
+        draw(&mut prompt);
         for _ in 0..REPEAT_COUNT {
-            let previous = prompt.focus.clone();
-            let mut repeat = key(KeyCode::Tab);
-            repeat.kind = KeyEventKind::Repeat;
-            prompt.handle_key(repeat);
-            assert_ne!(prompt.focus, previous);
-            repeat.kind = KeyEventKind::Release;
-            prompt.handle_key(repeat);
+            prompt.handle_key(with_kind(KeyCode::Down, KeyEventKind::Repeat));
+            prompt.handle_key(with_kind(KeyCode::Down, KeyEventKind::Release));
             assert!(prompt.handle_key(key(KeyCode::Char('y'))).is_none());
         }
-        prompt.handle_key(key(KeyCode::Tab));
+        prompt.handle_key(key(KeyCode::Up));
         assert!(prompt.handle_key(key(KeyCode::Char('y'))).is_some());
     }
 
     #[test]
     fn unseen_press_is_not_made_fresh_by_rendering() {
-        let mut prompt = open_prompt();
+        let mut prompt = shell_prompt(SINGLE_COMMAND);
         assert!(prompt.handle_key(key(KeyCode::Char('y'))).is_none());
-        render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT);
+        draw(&mut prompt);
         assert!(prompt.handle_key(key(KeyCode::Char('y'))).is_none());
-        prompt.handle_key(key(KeyCode::Tab));
+        prompt.handle_key(key(KeyCode::Down));
         assert!(prompt.handle_key(key(KeyCode::Char('y'))).is_some());
     }
 
-    #[test]
-    fn held_enter_cannot_accept_a_confirmation_opened_by_that_press() {
-        let mut prompt = open_prompt();
-        prompt
-            .requests
-            .front_mut()
-            .unwrap()
-            .request
-            .options
-            .iter_mut()
-            .find(|option| option.id == "allow_any_command")
-            .unwrap()
-            .confirmation = None;
-        prompt.select_authority("allow_any_command".into());
-        render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT);
-        prompt.focus = Some(PromptTarget::Hint(key(KeyCode::Char('s'))));
+    #[test_case("release"; "release")]
+    #[test_case("key"; "different_key")]
+    #[test_case("mouse"; "fresh_click")]
+    fn mouse_opened_confirmation_blocks_a_previously_held_enter(rearm: &str) {
+        let mut prompt = prompt_for(file_request(OUTSIDE_FILE, PermissionResourceAccess::Write));
         assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());
-        assert!(prompt.confirmation.is_some());
-        assert!(prompt.confirmation_phrase().is_none());
-        assert!(render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT).contains(REARM_MESSAGE));
-        assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());
-        let mut modified = key(KeyCode::Enter);
-        modified.modifiers = KeyModifiers::SHIFT;
-        assert!(prompt.handle_key(modified).is_none());
-        prompt.handle_key(key(KeyCode::Tab));
-        assert!(!render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT).contains(REARM_MESSAGE));
-        assert!(prompt.handle_key(key(KeyCode::Enter)).is_some());
-    }
-
-    #[test_case(false, KeyCode::Enter, true; "phraseless_enter")]
-    #[test_case(false, KeyCode::Char('y'), true; "phraseless_y")]
-    #[test_case(false, KeyCode::Char('s'), false; "phraseless_previous_stage_key")]
-    #[test_case(true, KeyCode::Enter, true; "phrase_enter")]
-    #[test_case(true, KeyCode::Char('y'), false; "phrase_text_key")]
-    #[test_case(true, KeyCode::Char('s'), false; "phrase_previous_stage_key")]
-    fn confirmation_rearm_hint_only_describes_current_decision_keys(
-        phrase: bool,
-        blocked: KeyCode,
-        shown: bool,
-    ) {
-        let mut prompt = open_prompt();
-        if !phrase {
-            prompt
-                .requests
-                .front_mut()
-                .unwrap()
-                .request
-                .options
-                .iter_mut()
-                .find(|option| option.id == "allow_any_command")
-                .unwrap()
-                .confirmation = None;
-        }
-        prompt.select_authority("allow_any_command".into());
-        render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT);
-        assert!(prompt.handle_key(key(KeyCode::Char('s'))).is_none());
-        let frozen = prompt.confirmation.as_ref().unwrap().answer.clone();
-        render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT);
-        let mut release = key(KeyCode::Char('s'));
-        release.kind = KeyEventKind::Release;
-        prompt.handle_key(release);
-        let mut repeat = key(blocked);
-        repeat.kind = KeyEventKind::Repeat;
-        assert!(prompt.handle_key(repeat).is_none());
-        assert_eq!(
-            render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT).contains(REARM_MESSAGE),
-            shown
+        draw(&mut prompt);
+        assert!(
+            decided(click(
+                &mut prompt,
+                PromptTarget::Choice(Choice::Conversation)
+            ))
+            .is_none()
         );
-        assert!(prompt.handle_key(key(blocked)).is_none());
-        assert_eq!(prompt.confirmation.as_ref().unwrap().answer, frozen);
-    }
-
-    #[test_case(false, "release"; "allow_after_release")]
-    #[test_case(false, "key"; "allow_after_different_key")]
-    #[test_case(false, "mouse"; "allow_after_fresh_click")]
-    #[test_case(true, "release"; "deny_after_release")]
-    #[test_case(true, "key"; "deny_after_different_key")]
-    #[test_case(true, "mouse"; "deny_after_fresh_click")]
-    fn mouse_opened_confirmation_blocks_a_previously_held_enter(deny: bool, rearm: &str) {
-        let mut prompt = open_prompt();
-        prompt
-            .requests
-            .front_mut()
-            .unwrap()
-            .request
-            .options
-            .iter_mut()
-            .find(|option| option.id == "allow_any_command")
-            .unwrap()
-            .confirmation = None;
-        prompt.select_authority("allow_any_command".into());
-        render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT);
-        if deny {
-            prompt.handle_key(key(KeyCode::F(2)));
-            render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT);
-        }
-        assert!(prompt.focus.is_none());
-        assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());
-        let open = PromptTarget::Hint(key(KeyCode::Char(if deny { 'D' } else { 's' })));
-        assert!(matches!(click(&mut prompt, open), PromptMouse::Consumed));
-        let frozen = prompt.confirmation.as_ref().unwrap().answer.clone();
-        assert!(prompt.confirmation_phrase().is_none());
-        render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT);
+        let frozen = prompt.pending.as_ref().unwrap().answer.clone();
+        assert!(prompt.pending.as_ref().unwrap().phrases.is_empty());
+        draw(&mut prompt);
         for _ in 0..REPEAT_COUNT {
             assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());
-            assert_eq!(prompt.confirmation.as_ref().unwrap().answer, frozen);
+            assert_eq!(prompt.pending.as_ref().unwrap().answer, frozen);
         }
-        let mut unrelated_release = key(KeyCode::Char('x'));
-        unrelated_release.kind = KeyEventKind::Release;
-        prompt.handle_key(unrelated_release);
+        prompt.handle_key(with_kind(KeyCode::Char('x'), KeyEventKind::Release));
         assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());
-        let answer = if rearm == "mouse" {
-            let PromptMouse::Decided(decision) =
-                click(&mut prompt, PromptTarget::Hint(key(KeyCode::Enter)))
-            else {
-                panic!("fresh confirmation click did not decide")
-            };
-            decision.answer
-        } else {
-            if rearm == "release" {
-                let mut release = key(KeyCode::Enter);
-                release.kind = KeyEventKind::Release;
-                prompt.handle_key(release);
-            } else {
-                prompt.handle_key(key(KeyCode::Tab));
-            }
-            render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT);
-            prompt.handle_key(key(KeyCode::Enter)).unwrap().answer
-        };
-        assert_eq!(answer, frozen);
-    }
-
-    #[test_case(40, 10; "narrow_short")]
-    #[test_case(80, 18; "normal")]
-    #[test_case(140, 24; "wide")]
-    fn mouse_approves_the_same_displayed_scope_as_keyboard(width: u16, height: u16) {
-        for (shortcut, lifetime) in [
-            ('y', PermissionLifetime::Once),
-            ('s', PermissionLifetime::Conversation),
-            ('a', PermissionLifetime::Project),
-        ] {
-            let mut prompt = open_prompt();
-            let expected = if lifetime == PermissionLifetime::Once {
-                PermissionAnswer::AllowOnce
-            } else {
-                prompt.allow_answer(lifetime)
-            };
-            render(&mut prompt, width, height);
-            prompt.focus = Some(PromptTarget::Hint(key(KeyCode::Esc)));
-            let PromptMouse::Decided(decision) = click(
+        let answer = match rearm {
+            "mouse" => decided(click(
                 &mut prompt,
-                PromptTarget::Hint(key(KeyCode::Char(shortcut))),
-            ) else {
-                panic!("visible approval did not decide");
-            };
-            assert_eq!(decision.answer, expected);
-        }
-    }
-
-    #[test]
-    fn tab_and_arrows_edit_scope_without_an_enter_approval_default() {
-        let mut prompt = open_prompt();
-        render(&mut prompt, 80, 18);
-        assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());
-        prompt.handle_key(key(KeyCode::Tab));
-        assert_eq!(prompt.focus, Some(PromptTarget::Scope));
-        assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());
-        assert!(prompt.panel == Panel::Scopes);
-        render(&mut prompt, 80, 18);
-        let previous = prompt.scopes.clone();
-        prompt.handle_key(key(KeyCode::Left));
-        assert_ne!(prompt.scopes, previous);
-        render(&mut prompt, 80, 18);
-        prompt.handle_key(key(KeyCode::Right));
-        assert_eq!(prompt.scopes, previous);
-        render(&mut prompt, 80, 18);
-        prompt.handle_key(key(KeyCode::Enter));
-        assert!(prompt.panel == Panel::Main);
-        render(&mut prompt, 80, 18);
-        prompt.handle_key(key(KeyCode::BackTab));
-        assert_eq!(prompt.focus, Some(PromptTarget::Hint(key(KeyCode::Esc))));
-        assert_eq!(
-            prompt.handle_key(key(KeyCode::Enter)).unwrap().answer,
-            PermissionAnswer::Deny
-        );
-    }
-
-    #[test]
-    fn scope_button_and_arrow_clicks_match_keyboard_without_approving() {
-        let mut mouse_prompt = open_prompt();
-        let mut keyboard = open_prompt();
-        render(&mut mouse_prompt, 80, 18);
-        render(&mut keyboard, 80, 18);
-        assert!(matches!(
-            click(&mut mouse_prompt, PromptTarget::Scope),
-            PromptMouse::Consumed
-        ));
-        keyboard.handle_key(key(KeyCode::Char('r')));
-        for label in ["→", "↓", "↑", "←"] {
-            render(&mut mouse_prompt, 80, 18);
-            render(&mut keyboard, 80, 18);
-            let event = hint_key(label).unwrap();
-            assert!(matches!(
-                click(&mut mouse_prompt, PromptTarget::Hint(event)),
-                PromptMouse::Consumed
-            ));
-            assert!(keyboard.handle_key(event).is_none());
-            assert_eq!(mouse_prompt.selected_option, keyboard.selected_option);
-            assert_eq!(mouse_prompt.scopes, keyboard.scopes);
-        }
-        assert!(mouse_prompt.confirmation.is_none());
-    }
-
-    #[test_case('g'; "displayed_guidance")]
-    #[test_case('n'; "guidance_alias")]
-    fn guidance_and_escape_are_not_persistent_denials(shortcut: char) {
-        let mut prompt = open_prompt();
-        prompt.handle_key(key(KeyCode::Char(shortcut)));
-        prompt.handle_paste(GUIDANCE);
-        assert!(prompt.handle_key(key(KeyCode::Esc)).is_none());
-        assert_eq!(prompt.state, PromptState::Normal);
-        assert!(prompt.field.is_empty());
-        prompt.handle_key(key(KeyCode::Char(shortcut)));
-        prompt.handle_paste(GUIDANCE);
-        assert_eq!(
-            prompt.handle_key(key(KeyCode::Enter)).unwrap().answer,
-            PermissionAnswer::DenyWithGuidance(GUIDANCE.into())
-        );
+                PromptTarget::Choice(Choice::Conversation),
+            )),
+            "release" | "key" => {
+                if rearm == "release" {
+                    prompt.handle_key(with_kind(KeyCode::Enter, KeyEventKind::Release));
+                } else {
+                    prompt.handle_key(key(KeyCode::Down));
+                }
+                draw(&mut prompt);
+                prompt
+                    .handle_key(key(KeyCode::Enter))
+                    .map(|decision| decision.answer)
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(answer, Some(frozen));
     }
 
     #[test_case("resize"; "resize")]
-    #[test_case("update"; "coverage_refresh")]
+    #[test_case("update"; "update")]
     #[test_case("scroll"; "scroll")]
     fn changing_geometry_or_request_cancels_mouse_down(change: &str) {
-        let mut prompt = open_prompt();
+        let mut prompt = shell_prompt(SINGLE_COMMAND);
         render(&mut prompt, 80, 18);
-        let area = hit(&prompt, &PromptTarget::Hint(key(KeyCode::Char('y'))));
+        let area = hit(&prompt, &PromptTarget::Choice(Choice::Once));
         prompt.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), area));
         match change {
             "resize" => {
                 render(&mut prompt, 140, 18);
             }
             "update" => {
-                prompt.update(request("id", json!({"command": "cargo test --tests"})));
+                prompt.update(Box::new(native_shell_request(SINGLE_COMMAND)));
             }
             "scroll" => prompt.scroll(1),
             _ => unreachable!(),
         }
         render(&mut prompt, 80, 18);
-        assert!(!matches!(
-            prompt.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), area)),
-            PromptMouse::Decided(_)
-        ));
+        assert!(
+            decided(prompt.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), area)))
+                .is_none()
+        );
+    }
+
+    fn mark_default(request: &mut PermissionRequest, row: usize, id: &str) {
+        for option in &mut request.options {
+            if option.group.as_ref().and_then(|group| group.resource) == Some(row) {
+                option.is_default = option.id == id;
+            }
+        }
     }
 
     #[test]
-    fn refresh_clears_frozen_confirmation_and_pending_pattern_editor() {
-        let mut prompt = open_prompt();
-        prompt.select_authority("allow_any_command".into());
-        render(&mut prompt, 80, 18);
-        prompt.handle_key(key(KeyCode::Char('s')));
-        assert!(prompt.confirmation.is_some());
-        assert!(prompt.update(request("id", json!({"command": "cargo test --tests"}))));
-        assert!(prompt.confirmation.is_none());
-        assert_eq!(prompt.state, PromptState::Normal);
-        assert!(prompt.handle_key(key(KeyCode::Char('a'))).is_none());
+    fn row_choices_survive_request_updates() {
+        let request = commands_request(&PAIR);
+        let mut prompt = prompt_for(request.clone());
+        draw(&mut prompt);
+        assert!(prompt.handle_key(key(KeyCode::Left)).is_none());
+        let chosen = prompt.row_grant(0);
+        assert_ne!(chosen, default_grant(&request, 0));
+
+        let exact = format!("{COMMAND_EXACT_PREFIX}1");
+        let mut suggested = request.clone();
+        mark_default(&mut suggested, 1, &exact);
+        assert!(prompt.update(Box::new(suggested.clone())));
+        assert_eq!(prompt.row_grant(0), chosen);
+        assert_eq!(
+            prompt.row_grant(1),
+            Some(PermissionRowGrant::Offered(exact))
+        );
+        assert_eq!(prompt.input_freshness.blocked_key, Some(KeyCode::Left));
+
+        let Some(PermissionRowGrant::Offered(id)) = chosen else {
+            panic!("row 0 was not moved to an offered rung: {chosen:?}");
+        };
+        let mut withdrawn = suggested;
+        withdrawn.options.retain(|option| option.id != id);
+        assert!(prompt.update(Box::new(withdrawn.clone())));
+        assert_eq!(prompt.row_grant(0), default_grant(&withdrawn, 0));
     }
 
-    #[test]
-    fn dangerous_custom_prefix_is_validated_and_requires_its_phrase() {
-        let mut prompt = open_prompt();
-        prompt.open_scope_editor();
-        prompt.handle_key(key(KeyCode::Char('e')));
-        prompt.field.clear();
-        prompt.handle_paste("git *");
-        prompt.handle_key(key(KeyCode::Enter));
-        assert_eq!(prompt.state, PromptState::PatternEditing);
-        prompt.field.clear();
-        prompt.handle_paste("cargo *");
-        prompt.handle_key(key(KeyCode::Enter));
-        assert_eq!(prompt.state, PromptState::Normal);
-        assert_eq!(prompt.scopes[0].written.as_deref(), Some("cargo *"));
-        prompt.handle_key(key(KeyCode::Char('p')));
-        render(&mut prompt, 80, 18);
-        prompt.handle_key(key(KeyCode::Char('s')));
-        let phrase = prompt.confirmation_phrase().unwrap().to_owned();
-        render(&mut prompt, 40, 10);
-        prompt.handle_paste(&phrase);
+    #[test_case(false; "unchanged")]
+    #[test_case(true; "late_caution")]
+    fn late_caution_rearms_the_input_barrier(caution: bool) {
+        let request = native_shell_request(SINGLE_COMMAND);
+        let mut prompt = prompt_for(request.clone());
+        draw(&mut prompt);
+        prompt.handle_key(key(KeyCode::Down));
+        let update = if caution { advised(request) } else { request };
+        assert!(prompt.update(Box::new(update)));
+        assert_eq!(prompt.input_freshness.blocked_key.is_some(), caution);
+        assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());
+        draw(&mut prompt);
+        assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());
+        prompt.handle_key(with_kind(KeyCode::Enter, KeyEventKind::Release));
         assert!(prompt.handle_key(key(KeyCode::Enter)).is_some());
     }
 
     #[test]
-    fn credential_bearing_command_is_not_seeded_into_the_prefix_editor() {
-        let mut prompt = open_prompt();
-        let request = &mut prompt.requests.front_mut().unwrap().request;
-        request.input = json!({"command": SENSITIVE_COMMAND});
-        request.resources[0].value = SENSITIVE_COMMAND.into();
-        prompt.open_scope_editor();
-        prompt.handle_key(key(KeyCode::Char('e')));
-        assert!(prompt.field.is_empty());
-        let screen = render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT);
-        assert!(!screen.contains(SECRET));
-        assert!(screen.contains("rm -rf /project"));
-        assert!(screen.contains("author a prefix explicitly"));
-    }
-
-    #[test]
-    fn repeat_navigation_and_editing_never_confirm_or_open_an_editor() {
-        let mut prompt = open_prompt();
-        render(&mut prompt, 80, 18);
-        let mut event = key(KeyCode::Char('g'));
-        event.kind = KeyEventKind::Repeat;
-        prompt.handle_key(event);
-        assert_eq!(prompt.state, PromptState::Normal);
-        event.kind = KeyEventKind::Release;
-        prompt.handle_key(event);
-        prompt.handle_key(key(KeyCode::Char('g')));
-        prompt.handle_paste("abc");
-        event.code = KeyCode::Backspace;
-        event.kind = KeyEventKind::Repeat;
-        prompt.handle_key(event);
-        assert_eq!(prompt.field.text(), "ab");
-        event.code = KeyCode::Enter;
-        assert!(prompt.handle_key(event).is_none());
-        assert_eq!(prompt.state, PromptState::DenyEditing);
-    }
-
-    #[test_case(false; "guidance")]
-    #[test_case(true; "prefix")]
-    fn enter_activates_the_focused_editor_back_control(prefix: bool) {
-        let mut prompt = open_prompt();
-        if prefix {
-            prompt.open_scope_editor();
-            prompt.handle_key(key(KeyCode::Char('e')));
-        } else {
-            prompt.handle_key(key(KeyCode::Char('g')));
-        }
-        render(&mut prompt, 80, 18);
-        prompt.handle_key(key(KeyCode::BackTab));
-        assert_eq!(prompt.focus, Some(PromptTarget::Hint(key(KeyCode::Esc))));
+    fn written_patterns_must_match_the_command() {
+        let mut prompt = shell_prompt(SINGLE_COMMAND);
+        prompt.open_customize(false);
+        let own = prompt
+            .customize_items()
+            .iter()
+            .position(|item| *item == ScopeItem::OwnPattern)
+            .unwrap();
+        prompt.highlight_scope(own);
+        draw(&mut prompt);
         assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());
-        assert_eq!(prompt.state, PromptState::Normal);
+        assert_eq!(prompt.state, PromptState::PatternEditing);
+        assert!(prompt.field.is_empty());
+        for (pattern, accepted) in [(UNMATCHED_PATTERN, false), (MATCHING_PATTERN, true)] {
+            prompt.field.clear();
+            assert!(prompt.handle_paste(pattern));
+            prompt.handle_key(key(KeyCode::Enter));
+            assert_eq!(prompt.state == PromptState::Normal, accepted, "{pattern}");
+        }
+        draw(&mut prompt);
+        let answer = prompt.handle_key(key(KeyCode::Enter)).unwrap().answer;
+        let PermissionAnswer::AllowComposed { rows } = answer else {
+            panic!("expected a composed answer: {answer:?}");
+        };
+        assert_eq!(
+            rows[0].as_ref().unwrap().grant,
+            PermissionRowGrant::Written(MATCHING_PATTERN.into())
+        );
     }
 
     #[test]
-    fn technical_details_cannot_type_into_a_hidden_confirmation() {
-        let mut prompt = open_prompt();
-        prompt.select_authority("allow_any_command".into());
-        render(&mut prompt, 80, 18);
-        prompt.handle_key(key(KeyCode::Char('s')));
-        render(&mut prompt, 80, 18);
-        prompt.handle_key(key(KeyCode::F(2)));
-        render(&mut prompt, 80, 18);
-        let mut event = key(KeyCode::Char('x'));
-        event.kind = KeyEventKind::Repeat;
-        prompt.handle_key(event);
-        assert!(!prompt.handle_paste("x"));
-        assert!(prompt.field.is_empty());
+    fn credentials_never_reach_the_screen() {
+        let mut prompt = shell_prompt(SENSITIVE_COMMAND);
+        assert!(!draw(&mut prompt).contains(SECRET));
+        prompt.toggle_details();
+        assert!(!draw(&mut prompt).contains(SECRET));
+        prompt.toggle_details();
+        prompt.open_customize(false);
+        assert!(!draw(&mut prompt).contains(SECRET));
+    }
+
+    #[test]
+    fn repeats_never_open_guidance_or_send_it() {
+        let mut prompt = shell_prompt(SINGLE_COMMAND);
+        draw(&mut prompt);
+        prompt.handle_key(with_kind(KeyCode::Char('n'), KeyEventKind::Repeat));
+        assert_eq!(prompt.state, PromptState::Normal);
+        prompt.handle_key(with_kind(KeyCode::Char('n'), KeyEventKind::Release));
+        prompt.handle_key(key(KeyCode::Char('n')));
+        assert!(prompt.handle_paste("abc"));
+        prompt.handle_key(with_kind(KeyCode::Backspace, KeyEventKind::Repeat));
+        assert_eq!(prompt.field.text(), "ab");
+        assert!(
+            prompt
+                .handle_key(with_kind(KeyCode::Enter, KeyEventKind::Repeat))
+                .is_none()
+        );
+        assert_eq!(prompt.state, PromptState::Guidance);
+    }
+
+    #[test]
+    fn a_pending_phrase_takes_letters_that_are_shortcuts_elsewhere() {
+        let mut prompt = broad_pending(PermissionLifetime::Project);
+        prompt.handle_key(with_kind(KeyCode::Enter, KeyEventKind::Release));
+        draw(&mut prompt);
+        for letter in SHORTCUT_LETTERS.chars() {
+            assert!(prompt.handle_key(key(KeyCode::Char(letter))).is_none());
+        }
+        assert_eq!(prompt.field.text(), SHORTCUT_LETTERS);
+        assert_eq!(prompt.panel, Panel::Customize);
+        assert!(prompt.pending.is_some());
     }
 
     #[test]
     fn ctrl_w_edits_the_guidance_instead_of_being_dropped() {
-        let mut prompt = open_prompt();
-        prompt.handle_key(key(KeyCode::Char('g')));
+        let mut prompt = shell_prompt(SINGLE_COMMAND);
+        draw(&mut prompt);
+        prompt.handle_key(key(KeyCode::Char('n')));
         prompt.handle_paste(GUIDANCE);
         let chord = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
         assert!(prompt.handle_key(chord).is_none());
@@ -1294,29 +1553,27 @@ mod tests {
                 .to_owned()
                 + " "
         );
-        assert_eq!(prompt.state, PromptState::DenyEditing);
+        assert_eq!(prompt.state, PromptState::Guidance);
     }
 
     #[test_case(true; "selection_copies")]
     #[test_case(false; "no_selection_denies")]
     fn ctrl_c_copies_a_selected_field_before_denying(selected: bool) {
-        let mut prompt = open_prompt();
-        prompt.handle_key(key(KeyCode::Char('g')));
+        let mut prompt = shell_prompt(SINGLE_COMMAND);
+        draw(&mut prompt);
+        prompt.handle_key(key(KeyCode::Char('n')));
         prompt.handle_paste(GUIDANCE);
         if selected {
             prompt.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
         }
         let decision = prompt.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
-        match selected {
-            true => {
-                assert!(decision.is_none());
-                assert_eq!(prompt.take_copied().as_deref(), Some(GUIDANCE));
-                assert_eq!(prompt.state, PromptState::DenyEditing);
-            }
-            false => {
-                assert_eq!(decision.unwrap().answer, PermissionAnswer::Deny);
-                assert!(prompt.take_copied().is_none());
-            }
+        if selected {
+            assert!(decision.is_none());
+            assert_eq!(prompt.take_copied().as_deref(), Some(GUIDANCE));
+            assert_eq!(prompt.state, PromptState::Guidance);
+        } else {
+            assert_eq!(decision.unwrap().answer, PermissionAnswer::Deny);
+            assert!(prompt.take_copied().is_none());
         }
     }
 }

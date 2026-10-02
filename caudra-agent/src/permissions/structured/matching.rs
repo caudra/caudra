@@ -9,8 +9,8 @@ use super::{
     remote_resource_identity, safe_summary,
 };
 use super::{
-    COMMAND_OBSERVATION_ATTRIBUTE, NORMALIZED_COMMAND_ATTRIBUTE, PermissionExecutorKind,
-    WORKDIR_ATTRIBUTE,
+    COMMAND_OBSERVATION_ATTRIBUTE, NORMALIZED_COMMAND_ATTRIBUTE, OPACITY_ATTRIBUTE,
+    PermissionExecutorKind, WORKDIR_ATTRIBUTE,
 };
 use super::{
     COMMAND_OBSERVATION_BINDING_ATTRIBUTE, POSSIBLE_WORKDIRS_ATTRIBUTE, prepared_command_binding,
@@ -173,14 +173,20 @@ pub(super) fn constraint_covers_resource(
     })
 }
 
+/// Whether the request comes from the first-party shell, the one executor whose
+/// facts about a command line the host produced itself.
+pub(in crate::permissions) fn trusted_shell_request(request: &PermissionRequest) -> bool {
+    matches!(&request.tool, ToolKey::Native(name) if name.as_ref() == "shell")
+        && request.executor == PermissionExecutorKind::Native
+        && matches!(&request.subject, PermissionSubject::Native { owner, contract }
+            if owner == WORKCELL_OWNER && contract == SHELL_EXECUTION_CONTRACT)
+}
+
 pub(in crate::permissions) fn trusted_command_observation(
     request: &PermissionRequest,
     resource: &PermissionResource,
 ) -> Option<CommandObservation> {
-    if !matches!(&request.tool, ToolKey::Native(name) if name.as_ref() == "shell")
-        || request.executor != PermissionExecutorKind::Native
-        || !matches!(&request.subject, PermissionSubject::Native { owner, contract }
-            if owner == WORKCELL_OWNER && contract == SHELL_EXECUTION_CONTRACT)
+    if !trusted_shell_request(request)
         || resource.kind != PermissionResourceKind::Command
         || resource.access != Some(PermissionResourceAccess::Execute)
         || resource.protected
@@ -269,6 +275,7 @@ pub(super) fn protected_coverage_allowed(
                         COMMAND_OBSERVATION_ATTRIBUTE
                             | COMMAND_OBSERVATION_BINDING_ATTRIBUTE
                             | NORMALIZED_COMMAND_ATTRIBUTE
+                            | OPACITY_ATTRIBUTE
                     )
                 })
                 .count()
@@ -396,11 +403,12 @@ pub(super) fn rule_reach<'a>(
         })
 }
 
-/// What the rule set says about one resource, and the allow that covers it.
+/// What the rule set says about one resource, the allow that covers it, and
+/// the ask that decided it.
 ///
 /// Ranking is what keeps a config that asks about `git *` from swallowing its
 /// own `git status` allow. Ties are broken entirely by the standing, so the
-/// answer does not depend on rule order. The credited allow is ranked the same
+/// answer does not depend on rule order. The credited rules are ranked the same
 /// way, so the authority a prompt names is the one that would decide.
 pub fn permission_rules_resource_standing(
     rules: &[PolicyRule],
@@ -408,11 +416,28 @@ pub fn permission_rules_resource_standing(
     resource: &PermissionResource,
 ) -> ResourceStanding {
     let decision = resource_decision(rules.iter().map(|policy| &policy.rule), request, resource);
-    // `min_by_key` over the reversed width keeps the first rule of equal reach,
-    // so a grant the user made outranks configured policy that says the same.
-    let coverage = rules
+    ResourceStanding {
+        decision,
+        coverage: credited_rule(rules, StructuredPermissionEffect::Allow, request, resource),
+        asking: (decision == StructuredPermissionDecision::Ask)
+            .then(|| credited_rule(rules, StructuredPermissionEffect::Ask, request, resource))
+            .flatten(),
+    }
+}
+
+/// The narrowest rule of one effect that reaches the resource. `min_by_key`
+/// over the reversed width keeps the first rule of equal reach, so a grant the
+/// user made outranks configured policy that says the same.
+fn credited_rule(
+    rules: &[PolicyRule],
+    effect: StructuredPermissionEffect,
+    request: &PermissionRequest,
+    resource: &PermissionResource,
+) -> Option<ResourceCoverage> {
+    let asks = effect == StructuredPermissionEffect::Ask;
+    rules
         .iter()
-        .filter(|policy| policy.rule.effect == StructuredPermissionEffect::Allow)
+        .filter(|policy| policy.rule.effect == effect)
         .filter_map(|policy| {
             rule_reach(&policy.rule, request, resource)
                 .map(|((_, width, _), constraint)| (policy, width, constraint))
@@ -424,8 +449,8 @@ pub fn permission_rules_resource_standing(
                 || blanket_authority(&resource.kind),
                 |constraint| constraint_authority(constraint, &resource.kind),
             ),
-        });
-    ResourceStanding { decision, coverage }
+            asks,
+        })
 }
 
 pub(super) fn resource_decision<'a>(
@@ -974,6 +999,7 @@ mod tests {
     use tempfile::TempDir;
     use test_case::test_case;
 
+    use crate::permissions::structured::options::WORKDIRS_COMMANDS_LABEL;
     use crate::permissions::structured::tests::{
         ALLOW, ASK, BROAD_ASK, BROAD_COMMAND, DENY, EXACT_RESOURCES_OPTION, EXPECT_STRICT_URL,
         EXPECT_SUBTREE_OPTION, EXPECT_URL_ROOTS, GREP_CONTRACT, MCP_SERVER, MINTED_TOOL,
@@ -1929,7 +1955,7 @@ mod tests {
             .find(|option| option.id == "allow_commands_in_workdir")
             .expect("workdir authority option");
 
-        assert_eq!(option.label, "Any command in these workdirs");
+        assert_eq!(option.label, WORKDIRS_COMMANDS_LABEL);
         assert_eq!(
             option.description,
             "Allow arbitrary commands starting in `/other`, `/project`."

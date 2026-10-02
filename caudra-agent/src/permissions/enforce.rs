@@ -1,20 +1,21 @@
 use super::decisions::{advisories, label_answer};
-use super::diagnostics::prompt_reason_message;
 use super::diagnostics::{answer_scope_kind, bounded_log_value};
+use super::diagnostics::{prompt_reason, prompt_reason_message};
 use super::manager::PERMISSION_POLL_INTERVAL;
 use super::policy::TRUSTED_UNSCOPED_TOOLS;
+use super::structured::trusted_shell_request;
 use super::{
-    DECISION_SOURCE_AUTO, DECISION_SOURCE_RULE, DECISION_SOURCE_USER_ABORT, DECISION_SOURCE_YOLO,
-    DEFAULT_DENY_GUIDANCE, NORMALIZED_COMMAND_ATTRIBUTE, PERMISSION_DENIED_PREFIX,
-    PERMISSION_LOG_TARGET, PROMPT_LOG_MAX_RESOURCES, PendingDecision, PendingPermission,
-    PendingRegistration, PermissionAnswer, PermissionExecutorKind, PermissionLifetime,
-    PermissionManager, PermissionMode, PermissionPolicyError, PermissionRequest,
-    PermissionResource, PermissionResourceAccess, PermissionResourceKind, PermissionSubject,
-    PolicyRule, ResourceCoverage, RuleOrigin, StructuredPermissionDecision,
-    StructuredPermissionEffect, answer_log_fields, command_pattern, normalize_scope_path,
-    permission_rule_intersects_request, permission_rules_resource_standing, prompt_forcing_reason,
-    remove_pending, subject_kind_and_contract, uncovered_resource_summary,
-    update_presentation_coverage,
+    AutoNote, DECISION_SOURCE_AUTO, DECISION_SOURCE_RULE, DECISION_SOURCE_USER_ABORT,
+    DECISION_SOURCE_YOLO, DEFAULT_DENY_GUIDANCE, NORMALIZED_COMMAND_ATTRIBUTE,
+    PERMISSION_DENIED_PREFIX, PERMISSION_LOG_TARGET, PROMPT_LOG_MAX_RESOURCES, PendingDecision,
+    PendingPermission, PendingRegistration, PermissionAnswer, PermissionExecutorKind,
+    PermissionLifetime, PermissionManager, PermissionMode, PermissionPolicyError,
+    PermissionPresentation, PermissionRequest, PermissionResource, PermissionResourceAccess,
+    PermissionResourceKind, PermissionSubject, PolicyRule, PromptReason, ResourceCoverage,
+    RuleOrigin, ShellOpacity, StructuredPermissionDecision, StructuredPermissionEffect,
+    answer_log_fields, command_pattern, normalize_scope_path, permission_rule_intersects_request,
+    permission_rules_resource_standing, prompt_forcing_reason, remove_pending,
+    subject_kind_and_contract, uncovered_resource_summary, update_presentation_coverage,
 };
 use crate::CancelToken;
 use crate::tools::native::plan::{self, PlanTarget};
@@ -147,6 +148,9 @@ impl PermissionError {
 pub(super) struct RequestCoverage {
     pub(super) covered: Vec<Option<ResourceCoverage>>,
     pub(super) must_prompt: bool,
+    /// The first ask that forced the prompt, for explaining it. `must_prompt`
+    /// alone decides, so a missing explanation can never weaken an ask.
+    pub(super) asking: Option<ResourceCoverage>,
     pub(super) resolved: bool,
 }
 
@@ -160,12 +164,38 @@ pub(super) struct EvaluationContext {
     pub(super) exact_plan_write: bool,
 }
 
+/// How Auto mode may settle a request the policy leaves to the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AutoEligibility {
+    /// Auto decides as it always has, consulting an engine only for caution.
+    Direct,
+    /// Only an enforcing engine that read the whole line may approve it.
+    NeedsEngine,
+    Never(AutoNote),
+}
+
 pub(super) struct CurrentPolicy {
     pub(super) coverage: RequestCoverage,
     pub(super) automatic: bool,
-    pub(super) auto_eligible: bool,
+    /// `None` outside Auto mode, or when the policy settles the request alone.
+    pub(super) auto: Option<AutoEligibility>,
     source: &'static str,
-    reason: &'static str,
+    reason: PromptReason,
+}
+
+impl CurrentPolicy {
+    /// Says why the request needs an answer. Screening is not repeated while a
+    /// prompt waits, so a request Auto may still settle keeps the note its
+    /// screening left.
+    fn explain(&self, presentation: &mut PermissionPresentation) {
+        presentation.risk_summary = prompt_reason_message(&self.reason).into();
+        presentation.reason = self.reason.clone();
+        match self.auto {
+            None => presentation.auto = None,
+            Some(AutoEligibility::Never(note)) => presentation.auto = Some(note),
+            Some(AutoEligibility::Direct | AutoEligibility::NeedsEngine) => {}
+        }
+    }
 }
 
 impl PendingRegistration<'_> {
@@ -181,7 +211,7 @@ impl PendingRegistration<'_> {
             &current.coverage.covered,
         );
         update_presentation_coverage(&mut updated.presentation, &current.coverage.covered);
-        updated.presentation.risk_summary = current.reason.into();
+        current.explain(&mut updated.presentation);
         let mut pending = self.manager.pending();
         if revision != self.manager.broker.revision.load(Ordering::Acquire) {
             return None;
@@ -220,17 +250,31 @@ impl PermissionManager {
             .map(|pattern| ResourceCoverage {
                 origin: RuleOrigin::Builtin,
                 authority: pattern.to_owned(),
+                asks: false,
             })
     }
 
-    pub(super) fn builtin_command_ask(resource: &PermissionResource) -> bool {
-        resource.kind == PermissionResourceKind::Command
-            && command_pattern::BUILTIN_ASK_PATTERNS.iter().any(|pattern| {
-                command_pattern::matches(pattern, &resource.value)
-                    || resource
-                        .attributes
-                        .get(NORMALIZED_COMMAND_ATTRIBUTE)
-                        .is_some_and(|normalized| command_pattern::matches(pattern, normalized))
+    /// The builtin ask family a command falls in, named by its pattern.
+    pub(super) fn builtin_command_ask(resource: &PermissionResource) -> Option<ResourceCoverage> {
+        (resource.kind == PermissionResourceKind::Command)
+            .then(|| {
+                command_pattern::BUILTIN_ASK_PATTERNS
+                    .iter()
+                    .find(|pattern| {
+                        command_pattern::matches(pattern, &resource.value)
+                            || resource
+                                .attributes
+                                .get(NORMALIZED_COMMAND_ATTRIBUTE)
+                                .is_some_and(|normalized| {
+                                    command_pattern::matches(pattern, normalized)
+                                })
+                    })
+            })
+            .flatten()
+            .map(|pattern| ResourceCoverage {
+                origin: RuleOrigin::Builtin,
+                authority: (*pattern).to_owned(),
+                asks: true,
             })
     }
 
@@ -241,6 +285,7 @@ impl PermissionManager {
         builtin_allows: bool,
     ) -> RequestCoverage {
         let mut must_prompt = false;
+        let mut asking = None;
         let mut resolved = true;
         let covered = request
             .resources
@@ -251,11 +296,16 @@ impl PermissionManager {
                 match standing.decision {
                     StructuredPermissionDecision::Allow => standing.coverage,
                     // An ask withholds authority without erasing it. The
-                    // resource stays covered so the prompt can say so and a
-                    // later grant can sweep it.
+                    // resource stays covered so a later grant can sweep it,
+                    // and the prompt names the ask that outranked the allow.
                     StructuredPermissionDecision::Ask => {
                         must_prompt = true;
-                        standing.coverage
+                        let named = standing.asking.clone();
+                        asking = asking.take().or(standing.asking);
+                        standing.coverage.map(|allowed| ResourceCoverage {
+                            asks: true,
+                            ..named.unwrap_or(allowed)
+                        })
                     }
                     StructuredPermissionDecision::Deny => {
                         resolved = false;
@@ -265,8 +315,13 @@ impl PermissionManager {
                         let covered = builtin_allows
                             .then(|| Self::builtin_command_allow(resource))
                             .flatten();
-                        if covered.is_none() && Self::builtin_command_ask(resource) {
+                        let builtin_ask = covered
+                            .is_none()
+                            .then(|| Self::builtin_command_ask(resource))
+                            .flatten();
+                        if builtin_ask.is_some() {
                             must_prompt = true;
+                            asking = asking.take().or(builtin_ask);
                         } else if covered.is_none() {
                             resolved = false;
                         }
@@ -278,6 +333,7 @@ impl PermissionManager {
         RequestCoverage {
             covered,
             must_prompt,
+            asking,
             resolved,
         }
     }
@@ -341,31 +397,25 @@ impl PermissionManager {
                 && (covered
                     || (!context.force_prompt
                         && (context.exact_plan_write || default == DefaultEffect::Allow))));
-        let auto_eligible = mode == PermissionMode::Auto
-            && !automatic
-            && default == DefaultEffect::Prompt
-            && !coverage.must_prompt
-            && !context.forced
-            && !context.force_prompt
-            && !context.plan_scoped
-            && !request
-                .resources
-                .iter()
-                .any(|resource| resource.protected || resource.requires_prompt);
+        let auto = (mode == PermissionMode::Auto && !automatic)
+            .then(|| auto_eligibility(request, context, &coverage, default));
         Ok(CurrentPolicy {
-            reason: prompt_reason_message(
+            reason: prompt_reason(
                 request,
                 &coverage.covered,
                 context.forced,
-                coverage.must_prompt,
+                coverage.asking.as_ref(),
                 context.plan_scoped,
             ),
             coverage,
             automatic,
-            auto_eligible,
+            auto,
             source: if mode == PermissionMode::Yolo && !context.plan_scoped {
                 DECISION_SOURCE_YOLO
-            } else if auto_eligible {
+            } else if matches!(
+                auto,
+                Some(AutoEligibility::Direct | AutoEligibility::NeedsEngine)
+            ) {
                 DECISION_SOURCE_AUTO
             } else {
                 DECISION_SOURCE_RULE
@@ -652,7 +702,7 @@ impl PermissionManager {
         }
         let mut receipts = Vec::new();
         let mut escalation = None;
-        if current.auto_eligible {
+        if let Some(AutoEligibility::Direct | AutoEligibility::NeedsEngine) = current.auto {
             let screened = self
                 .screen_auto_candidate(&request, &context, cancel)
                 .await
@@ -664,6 +714,7 @@ impl PermissionManager {
             if screened.approved {
                 return allowed(DECISION_SOURCE_AUTO);
             }
+            request.presentation.auto = screened.note;
             escalation = screened.escalation;
             if let Some((service, decision)) = screened.decision {
                 request.presentation.advisories = advisories(&decision);
@@ -673,7 +724,7 @@ impl PermissionManager {
             }
         }
         request.add_pattern_candidates(&self.pattern_candidates(), &current.coverage.covered);
-        request.presentation.risk_summary = current.reason.into();
+        current.explain(&mut request.presentation);
         if self.policy.is_some()
             && request.options.iter().any(|option| {
                 option.rule.effect == StructuredPermissionEffect::Allow
@@ -749,6 +800,10 @@ impl PermissionManager {
             .filter(|covered| covered.is_none())
             .count();
         let (subject_owner, subject_contract) = subject_kind_and_contract(&request.subject);
+        let opacity = request.resources.iter().filter_map(ShellOpacity::of).max();
+        // Captured now, because a refresh while the prompt waits may drop the
+        // note that marks this as an Auto prompt.
+        let auto_opacity = request.presentation.auto.and(opacity);
         info!(
             target: PERMISSION_LOG_TARGET,
             event = "permission_prompt",
@@ -764,6 +819,8 @@ impl PermissionManager {
             resource_count = request.resources.len(),
             uncovered_count,
             forcing_reason,
+            opacity = opacity.map(display),
+            auto_note = request.presentation.auto.map(AutoNote::name),
             uncovered = %uncovered,
             offered_options = %request
                 .options
@@ -923,6 +980,7 @@ impl PermissionManager {
             option_id = %option_id,
             lifetime,
             source = answer_source,
+            opacity = auto_opacity.map(display),
             waited_ms = waiting_since.elapsed().as_millis() as u64,
             "permission prompt answered"
         );
@@ -957,10 +1015,10 @@ impl PermissionManager {
                     PermissionAnswer::AllowSession
                     | PermissionAnswer::AllowAlwaysLocal
                     | PermissionAnswer::AllowAlwaysGlobal => true,
-                    PermissionAnswer::AllowOption { lifetime, .. }
-                    | PermissionAnswer::AllowComposed { lifetime, .. } => {
+                    PermissionAnswer::AllowOption { lifetime, .. } => {
                         *lifetime != PermissionLifetime::Once
                     }
+                    PermissionAnswer::AllowComposed { rows } => rows.iter().any(Option::is_some),
                     _ => false,
                 };
                 if remembered
@@ -971,7 +1029,7 @@ impl PermissionManager {
                         .enumerate()
                         .any(|(index, covered)| {
                             let selected = match answer {
-                                PermissionAnswer::AllowComposed { rows, .. } => {
+                                PermissionAnswer::AllowComposed { rows } => {
                                     rows.get(index).is_some_and(Option::is_some)
                                 }
                                 _ => true,
@@ -1017,11 +1075,55 @@ pub(super) fn contain_authority_to_the_plan(request: &mut PermissionRequest) {
     }
 }
 
+/// Whether Auto may settle a request the policy leaves to the user, or the
+/// first reason it may not, in the precedence of the prompt's own reason.
+///
+/// A protected or prepared resource normally means Auto never applies. The one
+/// exception is a whole command line the first-party shell could not review
+/// command by command, for a cause an engine reading the full text may screen.
+/// A cause that always asks restricts from any source, but only the trusted
+/// shell's facts can open the engine path.
+fn auto_eligibility(
+    request: &PermissionRequest,
+    context: &EvaluationContext,
+    coverage: &RequestCoverage,
+    default: DefaultEffect,
+) -> AutoEligibility {
+    let gated: Vec<_> = request
+        .resources
+        .iter()
+        .filter(|resource| resource.protected || resource.requires_prompt)
+        .map(ShellOpacity::of)
+        .collect();
+    let worst = gated.iter().flatten().max().copied();
+    let note = if context.plan_scoped {
+        AutoNote::Planning
+    } else if context.forced {
+        AutoNote::Forced
+    } else if let Some(cause) = worst.filter(|cause| !cause.screenable()) {
+        AutoNote::AlwaysAsks(cause)
+    } else if !gated.is_empty() && (gated.contains(&None) || !trusted_shell_request(request)) {
+        AutoNote::Protected
+    } else if coverage.must_prompt {
+        AutoNote::RuleAsks
+    } else if gated.is_empty() && context.force_prompt {
+        AutoNote::Forced
+    } else if default != DefaultEffect::Prompt {
+        AutoNote::ToolDefault
+    } else if gated.is_empty() {
+        return AutoEligibility::Direct;
+    } else {
+        return AutoEligibility::NeedsEngine;
+    };
+    AutoEligibility::Never(note)
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use super::{
-        ACTIVE_PLAN_INTENT_MISMATCH, CURRENT_DEFAULT_DENIES_REQUEST, CURRENT_POLICY_DENIES_REQUEST,
-        EvaluationContext, PendingDecision, PendingPermission, PendingRegistration, remove_pending,
+        ACTIVE_PLAN_INTENT_MISMATCH, AutoEligibility, CURRENT_DEFAULT_DENIES_REQUEST,
+        CURRENT_POLICY_DENIES_REQUEST, EvaluationContext, PendingDecision, PendingPermission,
+        PendingRegistration, remove_pending,
     };
     use crate::permissions::tests::{
         CONTROLLED_REQUEST, FIRST_COMMAND, SECOND_COMMAND, controlled_enforcement, remember_command,
@@ -1052,8 +1154,8 @@ pub(super) mod tests {
     use crate::permissions::tests::{
         ALLOWED_COMMANDS, BROAD_GIT_PATTERN, BUILTIN_ECHO_PATTERN, COMPLEX_COMMAND,
         CONFINED_COMMAND, COVERAGE_COMMAND, COVERAGE_PATTERN, ECHO_COMMAND, EMPTY_MCP_SCOPE,
-        GIT_CONFIG, GIT_HEAD, PERMISSION_RULES_STATE_KEY, PLAN_PATH, SHELL_WORKDIR,
-        THIS_COMMAND_AUTHORITY, WORKDIR_OPTION, allow_rule, allows_without_prompt,
+        GIT_CONFIG, GIT_HEAD, PERMISSION_RULES_STATE_KEY, PLAN_PATH, SHELL_PROMPT_MISSING,
+        SHELL_WORKDIR, THIS_COMMAND_AUTHORITY, WORKDIR_OPTION, allow_rule, allows_without_prompt,
         answer_enforcement, answer_plan_command, answer_tool_enforcement, conversation_grant,
         coverage_of, coverage_with, covered_flags, decisions, default_mgr, denied_by_rule,
         deny_rule, enforce_opaque_command_without_prompt, enforce_plan_command_without_prompt,
@@ -1061,20 +1163,21 @@ pub(super) mod tests {
         enforce_tool_without_prompt, enforce_without_prompt, legacy_request, log_coverage,
         log_request, log_resource, make_config, mark_confined, mgr_with, pending_scope_enforcement,
         pending_tool_enforcement, persistent_manager, project_read_request,
-        remote_permission_asset, shell_intent, shell_policy_rule, shell_request,
+        remote_permission_asset, shell_intent, shell_policy_rule, shell_prompt, shell_request,
         workcell_shell_subject, workdir_grant,
     };
     use crate::permissions::{
-        CONFINED_READ_ATTRIBUTE, CONFINED_READ_AUTHORITY, CONFINED_READ_VALUE,
-        PROMPT_REASON_ASK_RULE, PROMPT_REASON_FORCED, PROMPT_REASON_PROTECTED,
+        AutoNote, CONFINED_READ_ATTRIBUTE, CONFINED_READ_AUTHORITY, CONFINED_READ_VALUE,
+        ComposedRow, PROMPT_REASON_ASK_RULE, PROMPT_REASON_FORCED, PROMPT_REASON_PROTECTED,
         PROMPT_REASON_UNCOVERED, PermissionAnswer, PermissionAuthorityProfile,
         PermissionExecutorKind, PermissionLifetime, PermissionManager, PermissionMode,
-        PermissionPolicyError, PermissionRequest, PermissionResource, PermissionResourceAccess,
-        PermissionResourceKind, PermissionRisk, PermissionRowGrant, PermissionRuleRecord,
-        PermissionSubject, RemotePermissionIdentity, ResourceCoverage, RevokedRuleScope,
-        RuleOrigin, StructuredPermissionDecision, StructuredPermissionEffect,
-        builtin_structured_rules, canonical_json, canonical_json_sha256,
-        filesystem_permission_resource, is_shell_tool, normalize_scope_path, prompt_forcing_reason,
+        PermissionPolicyError, PermissionPresentation, PermissionRequest, PermissionResource,
+        PermissionResourceAccess, PermissionResourceKind, PermissionRisk, PermissionRowGrant,
+        PermissionRuleRecord, PermissionSubject, PromptReason, RemotePermissionIdentity,
+        ResourceCoverage, RevokedRuleScope, RuleOrigin, StructuredPermissionDecision,
+        StructuredPermissionEffect, builtin_structured_rules, canonical_json,
+        canonical_json_sha256, filesystem_permission_resource, is_shell_tool, normalize_scope_path,
+        prompt_forcing_reason,
     };
     use crate::{AgentEvent, AgentMode};
     use caudra_config::{DefaultEffect, Effect, PermissionRule, PermissionsConfig, ToolKey};
@@ -1085,6 +1188,7 @@ pub(super) mod tests {
 
     const REPLACEMENT_COMMAND: &str = "cargo clean";
     const AUTO_BUILTIN_ASK: &str = "git push origin main";
+    const BUILTIN_PUSH_ASK: &str = "git push *";
     const PLAN_DOCUMENT: &str = "active-plan.md";
     const PLAN_CONTENT: &str = "The complete plan";
     #[cfg(unix)]
@@ -1430,7 +1534,7 @@ pub(super) mod tests {
         };
         let current = manager.current_policy(&request, &context).unwrap();
         assert_eq!(current.automatic, automatic);
-        assert_eq!(current.auto_eligible, eligible);
+        assert_eq!(current.auto, eligible.then_some(AutoEligibility::Direct));
         manager.set_session_mode(Some(PermissionMode::Ask));
         assert_eq!(
             manager
@@ -1652,6 +1756,7 @@ pub(super) mod tests {
             Some(ResourceCoverage {
                 origin: RuleOrigin::Builtin,
                 authority: CONFINED_READ_AUTHORITY.into(),
+                asks: false,
             })
         );
     }
@@ -1794,6 +1899,7 @@ pub(super) mod tests {
             Some(ResourceCoverage {
                 origin: RuleOrigin::Config,
                 authority: COVERAGE_PATTERN.into(),
+                asks: false,
             })
         );
         assert_eq!(
@@ -1801,6 +1907,7 @@ pub(super) mod tests {
             Some(ResourceCoverage {
                 origin: RuleOrigin::Builtin,
                 authority: BUILTIN_ECHO_PATTERN.into(),
+                asks: false,
             })
         );
         assert_eq!(
@@ -1812,6 +1919,7 @@ pub(super) mod tests {
             Some(ResourceCoverage {
                 origin: RuleOrigin::Conversation,
                 authority: THIS_COMMAND_AUTHORITY.into(),
+                asks: false,
             })
         );
     }
@@ -1831,10 +1939,11 @@ pub(super) mod tests {
         assert_eq!(coverage_of(&manager, COVERAGE_COMMAND, &[]), None);
     }
 
-    /// An ask withholds authority without erasing it, so the covering allow is
-    /// still reported and a later grant can still sweep the prompt.
+    /// An ask withholds authority without erasing it, so the resource stays
+    /// covered for a later grant to sweep, and names the ask that outranked
+    /// the allow rather than claiming the allow.
     #[test]
-    fn an_ask_still_reports_the_allow_that_covers_the_resource() {
+    fn ask_coverage_is_reported_as_asks() {
         let manager = mgr_with(
             make_config(vec![
                 shell_policy_rule(BROAD_GIT_PATTERN, Effect::Allow),
@@ -1851,7 +1960,8 @@ pub(super) mod tests {
             coverage.covered[0],
             Some(ResourceCoverage {
                 origin: RuleOrigin::Config,
-                authority: BROAD_GIT_PATTERN.into(),
+                authority: COVERAGE_PATTERN.into(),
+                asks: true,
             })
         );
     }
@@ -2554,11 +2664,13 @@ pub(super) mod tests {
             assert!(manager.answer(
                 "first",
                 PermissionAnswer::AllowComposed {
-                    rows: vec![
-                        Some(PermissionRowGrant::Offered("command_exact_0".into())),
-                        Some(PermissionRowGrant::Offered("command_exact_1".into())),
-                    ],
-                    lifetime: PermissionLifetime::Conversation,
+                    rows: ComposedRow::uniform(
+                        vec![
+                            Some(PermissionRowGrant::Offered("command_exact_0".into())),
+                            Some(PermissionRowGrant::Offered("command_exact_1".into())),
+                        ],
+                        &PermissionLifetime::Conversation,
+                    ),
                 }
             ));
             assert!(matches!(
@@ -2567,6 +2679,41 @@ pub(super) mod tests {
             ));
             assert!(first.await.is_ok());
             assert!(second.await.is_ok());
+        });
+    }
+
+    /// Once an answer is saved, only the rows it remembered have to be covered:
+    /// a row left to this call runs without a rule of its own.
+    #[test]
+    fn post_save_check_reads_remembered_rows() {
+        smol::block_on(async {
+            let manager = Arc::new(default_mgr());
+            let (call, events) = pending_scope_enforcement(
+                Arc::clone(&manager),
+                "mixed",
+                "bash",
+                crate::tools::PermissionScopes {
+                    scopes: vec!["cargo build".into(), "npm test".into()],
+                    force_prompt: false,
+                    plan_scoped: false,
+                },
+                serde_json::json!({"command": "cargo build && npm test"}),
+            );
+            events.recv_async().await.unwrap();
+
+            assert!(manager.answer(
+                "mixed",
+                PermissionAnswer::AllowComposed {
+                    rows: vec![
+                        Some(ComposedRow {
+                            grant: PermissionRowGrant::Offered("command_exact_0".into()),
+                            lifetime: PermissionLifetime::Conversation,
+                        }),
+                        None,
+                    ],
+                }
+            ));
+            assert!(call.await.is_ok());
         });
     }
 
@@ -3115,6 +3262,58 @@ pub(super) mod tests {
         let reason = prompt_forcing_reason(&request, &[None, None], false, false);
 
         assert_eq!(reason, PROMPT_REASON_PROTECTED);
+    }
+
+    /// An ask is named by the rule that decided it, never by text a client
+    /// shows, so a covering allow cannot stand in for the ask that withheld it.
+    #[test_case(&[], AUTO_BUILTIN_ASK, PromptReason::AskRule { origin: RuleOrigin::Builtin, pattern: BUILTIN_PUSH_ASK.into() }; "a_builtin_ask_names_its_family")]
+    #[test_case(&[(BROAD_GIT_PATTERN, Effect::Allow), (COVERAGE_PATTERN, Effect::Ask)], COVERAGE_COMMAND, PromptReason::AskRule { origin: RuleOrigin::Config, pattern: COVERAGE_PATTERN.into() }; "a_configured_ask_names_its_rule_not_the_covering_allow")]
+    #[test_case(&[], FIRST_COMMAND, PromptReason::Uncovered; "an_uncovered_command")]
+    fn prompt_reason_is_typed(rules: &[(&str, Effect)], command: &str, expected: PromptReason) {
+        smol::block_on(async {
+            let rules = rules
+                .iter()
+                .map(|&(scope, effect)| shell_policy_rule(scope, effect))
+                .collect();
+            let manager = mgr_with(make_config(rules), PathBuf::from(SHELL_WORKDIR));
+            let prompt = shell_prompt(&manager, &shell_intent(&[command]), command)
+                .await
+                .expect(SHELL_PROMPT_MISSING);
+            assert_eq!(prompt.presentation.reason, expected);
+            assert_eq!(prompt.presentation.auto, None);
+            let wire = serde_json::to_value(&prompt.presentation).unwrap();
+            let restored: PermissionPresentation = serde_json::from_value(wire).unwrap();
+            assert_eq!(restored.reason, expected);
+        });
+    }
+
+    #[test_case(Some(Effect::Ask), false, false, false, AutoNote::RuleAsks; "an_ask_rule")]
+    #[test_case(None, true, false, false, AutoNote::Forced; "a_forced_prompt")]
+    #[test_case(None, false, true, false, AutoNote::Planning; "plan_mode")]
+    #[test_case(None, false, false, true, AutoNote::Protected; "a_protected_command")]
+    fn auto_names_why_it_did_not_decide(
+        rule: Option<Effect>,
+        forced: bool,
+        plan_scoped: bool,
+        protected: bool,
+        note: AutoNote,
+    ) {
+        smol::block_on(async {
+            let rules = rule
+                .map(|effect| shell_policy_rule(FIRST_COMMAND, effect))
+                .into_iter()
+                .collect();
+            let manager = mgr_with(make_config(rules), PathBuf::from(SHELL_WORKDIR));
+            manager.set_session_mode(Some(PermissionMode::Auto));
+            let mut intent = shell_intent(&[FIRST_COMMAND]);
+            intent.scopes.force_prompt = forced;
+            intent.scopes.plan_scoped = plan_scoped;
+            intent.resources[0].protected = protected;
+            let prompt = shell_prompt(&manager, &intent, FIRST_COMMAND)
+                .await
+                .expect(SHELL_PROMPT_MISSING);
+            assert_eq!(prompt.presentation.auto, Some(note));
+        });
     }
     #[test_case(false; "stale_partial_refresh_preserves_replacement")]
     #[test_case(true; "stale_settlement_preserves_replacement")]

@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use unicode_width::UnicodeWidthStr;
 
 use super::model::{
-    access_name, effect_name, lifetime_name, literal, resource_kind, selector_mode,
+    FIXED_VALUE, access_name, effect_name, lifetime_name, literal, resource_kind, selector_mode,
 };
 use crate::components::ModalScroll;
 use crate::components::permission_prompt::{likely_secret_key, sensitive_text};
@@ -35,9 +35,9 @@ use crate::theme::Theme;
 pub(super) const DETAIL_ROWS: u16 = 5;
 pub(super) const COMPACT_DETAIL_ROWS: u16 = 4;
 const ABSENT: &str = "Absent";
-const OPAQUE: &str = "Opaque identity · no verified preimage";
-const INDEPENDENT: &str = "INDEPENDENT · any combination of allowed slot values";
-const TUPLES_ONLY: &str = "ALLOWED TUPLES ONLY · no other combinations";
+const NEW_FIXED_VALUE: &str = "a new fixed value Caudra can't show";
+const INDEPENDENT: &str = "Any combination of the allowed values";
+const TUPLES_ONLY: &str = "Only the allowed combinations";
 const UNCHANGED_SECRET: &str = "[redacted · unchanged]";
 const BEFORE_SECRET: &str = "[redacted · prior value]";
 const AFTER_SECRET: &str = "[redacted · replacement value]";
@@ -49,12 +49,15 @@ const INPUT_VALUES: &str = "Arguments · Input";
 const SELECTED_VALUE: &str = "Argument ";
 const VERIFIED_INPUT: &str = "Host-verified input";
 const MISSING_POINTER: &str = "Missing pointer · not JSON null";
-const REDACTED_VALUE: &str = "Redacted value · SHA-256";
+const FIXED_INPUT: &str = "Arguments · Fixed input";
 
+/// A fact as the review compares it. Hidden and fixed facts compare by a
+/// value the reviewer never sees, so a change still reads as a change.
 #[derive(PartialEq, Eq)]
 enum FactValue {
     Visible(String),
     Hidden(String),
+    Fixed(String),
 }
 
 impl FactValue {
@@ -69,6 +72,12 @@ impl FactValue {
                 BEFORE_SECRET
             }
             .into(),
+            Self::Fixed(_) => if changed && after {
+                NEW_FIXED_VALUE
+            } else {
+                FIXED_VALUE
+            }
+            .into(),
         }
     }
 }
@@ -80,6 +89,18 @@ impl Facts {
     fn add(&mut self, label: impl Into<String>, value: impl Into<String>) {
         self.0
             .insert(label.into(), FactValue::Visible(value.into()));
+    }
+
+    fn fixed(&mut self, label: impl Into<String>, digest: &str) {
+        self.0.insert(label.into(), FactValue::Fixed(digest.into()));
+    }
+
+    fn fixed_input(&mut self, digest: &str, verified: bool) {
+        if verified {
+            self.add(FIXED_INPUT, VERIFIED_INPUT);
+        } else {
+            self.fixed(FIXED_INPUT, digest);
+        }
     }
 
     fn literal(&mut self, label: impl Into<String>, value: &str, hidden: bool) {
@@ -239,11 +260,11 @@ impl Facts {
             verified_selector(normalized, &EditField::Resource(index), &resource.selector),
         );
         self.add(
-            format!("{prefix} · Attributes"),
+            format!("{prefix} · Conditions"),
             if resource.attributes.is_empty() {
-                "No attribute predicates"
+                "No other conditions"
             } else {
-                "ALL OF these attribute predicates"
+                "All of these conditions"
             },
         );
         for (name, selector) in &resource.attributes {
@@ -286,21 +307,18 @@ impl Facts {
             PermissionResourceSelector::Digest { digest }
             | PermissionResourceSelector::FilesystemSubtreeDigest { digest }
             | PermissionResourceSelector::UrlSubtreeDigest { digest }
-            | PermissionResourceSelector::UrlOriginDigest { digest } => {
-                self.add(format!("{prefix} · SHA-256"), digest.clone());
-                self.add(
-                    format!("{prefix} · Preimage"),
-                    match verified {
-                        Some(
-                            SelectorValue::Exact(value)
-                            | SelectorValue::FilesystemSubtree(value)
-                            | SelectorValue::UrlSubtree(value)
-                            | SelectorValue::UrlOrigin(value),
-                        ) => format!("Host verified · {}", literal(value)),
-                        _ => OPAQUE.into(),
-                    },
-                );
-            }
+            | PermissionResourceSelector::UrlOriginDigest { digest } => match verified {
+                Some(
+                    SelectorValue::Exact(value)
+                    | SelectorValue::FilesystemSubtree(value)
+                    | SelectorValue::UrlSubtree(value)
+                    | SelectorValue::UrlOrigin(value),
+                ) => self.add(
+                    format!("{prefix} · Value"),
+                    format!("Host verified · {}", literal(value)),
+                ),
+                _ => self.fixed(format!("{prefix} · Value"), digest),
+            },
             PermissionResourceSelector::RemoteResource { identity, scope }
             | PermissionResourceSelector::RemoteSubtree { identity, scope } => {
                 self.remote(&format!("{prefix} · Selector binding"), identity);
@@ -405,7 +423,11 @@ impl Facts {
                     for (id, value) in tuple {
                         let hidden = pattern.argv.iter().any(|token| matches!(token, PatternToken::Slot { id: token_id, role: ArgumentRole::Sensitive | ArgumentRole::Payload } if token_id == id));
                         self.literal(
-                            format!("{prefix} · Allowed tuple {} · Slot #{}", index + 1, id.0),
+                            format!(
+                                "{prefix} · Allowed combination {} · Slot #{}",
+                                index + 1,
+                                id.0
+                            ),
                             value,
                             hidden,
                         );
@@ -419,9 +441,9 @@ impl Facts {
 
     fn json(&mut self, prefix: &str, value: &Value, hidden: bool) {
         if hidden || value.as_str().is_some_and(sensitive_text) {
-            self.add(
-                prefix,
-                format!("{REDACTED_VALUE} {}", canonical_json_sha256(value)),
+            self.0.insert(
+                prefix.into(),
+                FactValue::Hidden(canonical_json_sha256(value)),
             );
             return;
         }
@@ -457,14 +479,14 @@ impl Facts {
         let input = verified_input(normalized, arguments);
         let mode = match arguments {
             PermissionArgumentConstraint::Exact { digest } => {
-                self.add("Arguments · SHA-256", digest.clone());
+                self.fixed_input(digest, input.is_some());
                 if let Some(input) = input {
                     self.json(INPUT_VALUES, input, false);
                 }
                 "Exact input"
             }
             PermissionArgumentConstraint::SelectedDigest { pointers, digest } => {
-                self.add("Arguments · SHA-256", digest.clone());
+                self.fixed_input(digest, input.is_some());
                 for (index, pointer) in pointers.iter().enumerate() {
                     self.literal(format!("Arguments · Pointer {}", index + 1), pointer, false);
                     if let Some(input) = input {
@@ -475,39 +497,27 @@ impl Facts {
                         }
                     }
                 }
-                "ALL OF selected pointers"
+                "All of the selected arguments"
             }
             PermissionArgumentConstraint::Selected { arguments } => {
                 for argument in arguments {
-                    let prefix = format!("Argument {}", literal(&argument.pointer));
-                    self.add(format!("{prefix} · SHA-256"), argument.digest.clone());
                     self.json(
-                        &format!("{prefix} · Value"),
+                        &format!("Argument {} · Value", literal(&argument.pointer)),
                         &argument.value,
                         sensitive_pointer(&argument.pointer),
                     );
                 }
-                "ALL OF selected arguments"
+                "All of the listed arguments"
             }
             PermissionArgumentConstraint::Unconstrained => "UNCONSTRAINED input",
         };
         self.add("Arguments · Match", mode);
-        let digested = matches!(
-            arguments,
-            PermissionArgumentConstraint::Exact { .. }
-                | PermissionArgumentConstraint::SelectedDigest { .. }
-        );
-        if digested {
-            self.add(
-                "Arguments · Preimage",
-                if input.is_some() {
-                    VERIFIED_INPUT
-                } else {
-                    OPAQUE
-                },
-            );
-        }
-        digested && input.is_none()
+        input.is_none()
+            && matches!(
+                arguments,
+                PermissionArgumentConstraint::Exact { .. }
+                    | PermissionArgumentConstraint::SelectedDigest { .. }
+            )
     }
 
     fn rule(
@@ -523,7 +533,7 @@ impl Facts {
             if rule.resources.is_empty() {
                 "UNRESTRICTED resources"
             } else {
-                "ANY OF target predicates; all requested resources must be covered"
+                "Any of these targets; every requested resource must match one"
             },
         );
         for (index, resource) in rule.resources.iter().enumerate() {
@@ -608,7 +618,7 @@ impl ChangeReview {
         normalized: Option<&NormalizedPermissionDraft>,
     ) -> Self {
         let (mut before, mut after) = (Facts::default(), Facts::default());
-        let mut opaque_input = [false; 2];
+        let mut fixed_input = [false; 2];
         let title = match change {
             SemanticChange::Resource {
                 index,
@@ -627,7 +637,7 @@ impl ChangeReview {
                 before: left,
                 after: right,
             } => {
-                opaque_input = [
+                fixed_input = [
                     before.arguments(left, normalized),
                     after.arguments(right, normalized),
                 ];
@@ -724,8 +734,8 @@ impl ChangeReview {
                     label,
                     before: left.map_or_else(
                         || {
-                            if input_value && opaque_input[0] {
-                                OPAQUE
+                            if input_value && fixed_input[0] {
+                                FIXED_VALUE
                             } else {
                                 ABSENT
                             }
@@ -735,8 +745,8 @@ impl ChangeReview {
                     ),
                     after: right.map_or_else(
                         || {
-                            if input_value && opaque_input[1] {
-                                OPAQUE
+                            if input_value && fixed_input[1] {
+                                FIXED_VALUE
                             } else {
                                 ABSENT
                             }
@@ -896,7 +906,7 @@ impl ChangeView {
         let mut hits = Vec::new();
         clipped_line(
             &format!(
-                "Predicate {}/{} · {}",
+                "Detail {}/{} · {}",
                 self.predicate + 1,
                 review.predicates.len(),
                 if predicate.changed {
@@ -1065,10 +1075,11 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        ABSENT, AFTER_SECRET, BEFORE_SECRET, ChangeReview, INDEPENDENT, MISSING_POINTER, OPAQUE,
-        REDACTED_VALUE, TUPLES_ONLY, VERIFIED_INPUT,
+        ABSENT, AFTER_SECRET, BEFORE_SECRET, ChangeReview, FIXED_INPUT, INDEPENDENT,
+        MISSING_POINTER, NEW_FIXED_VALUE, TUPLES_ONLY, UNCHANGED_SECRET, VERIFIED_INPUT,
     };
-    use crate::components::permission_scope::model::literal;
+    use crate::components::permission_prompt::assert_plain;
+    use crate::components::permission_scope::model::{FIXED_VALUE, literal};
     use crate::components::permission_scope::tests::record;
 
     const DIGEST_BEFORE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1";
@@ -1130,7 +1141,7 @@ mod tests {
 
     #[test_case(false; "exact_json")]
     #[test_case(true; "selected_pointers_only")]
-    fn verified_argument_preimages_show_typed_values_and_keep_old_input_opaque(selected: bool) {
+    fn verified_arguments_show_typed_values_and_keep_the_old_input_fixed(selected: bool) {
         let pointers = if selected {
             vec![WORKDIR_POINTER, NESTED_POINTER]
         } else {
@@ -1147,7 +1158,7 @@ mod tests {
             .find(|predicate| predicate.after == literal(VERIFIED_PATH))
             .unwrap();
         assert!(path.label.contains(WORKDIR));
-        assert_eq!(path.before, OPAQUE);
+        assert_eq!(path.before, FIXED_VALUE);
         assert!(
             review
                 .predicates
@@ -1188,7 +1199,7 @@ mod tests {
     #[test_case("field"; "wrong_host_field")]
     #[test_case("constraint"; "stale_constraint")]
     #[test_case("input"; "mismatched_input_digest")]
-    fn argument_preimages_require_a_matching_verified_input(case: &str) {
+    fn argument_values_require_a_matching_verified_input(case: &str) {
         let mut normalized = input_preview(json!({"workdir": VERIFIED_PATH}), &[]);
         let change = input_change(&normalized);
         match case {
@@ -1206,7 +1217,8 @@ mod tests {
             review
                 .predicates
                 .iter()
-                .any(|predicate| predicate.after == OPAQUE)
+                .any(|predicate| predicate.label == FIXED_INPUT
+                    && predicate.after == NEW_FIXED_VALUE)
         );
         assert!(
             review
@@ -1220,7 +1232,7 @@ mod tests {
     #[test_case(ESCAPED_NULL_POINTER, "null"; "null_is_present")]
     #[test_case(ESCAPED_NUMBER_POINTER, "7"; "escaped_pointer_value")]
     #[test_case(ABSENT_POINTER, MISSING_POINTER; "missing_is_not_null")]
-    fn selected_argument_preimages_preserve_missing_null_and_pointer_boundaries(
+    fn selected_argument_values_preserve_missing_null_and_pointer_boundaries(
         pointer: &str,
         expected: &str,
     ) {
@@ -1235,7 +1247,7 @@ mod tests {
             .find(|predicate| predicate.label == format!("Argument {} · Value", literal(pointer)))
             .unwrap();
         assert_eq!(value.after, expected);
-        assert_eq!(value.before, OPAQUE);
+        assert_eq!(value.before, FIXED_VALUE);
         assert!(
             review
                 .predicates
@@ -1247,14 +1259,13 @@ mod tests {
     #[test_case("exact"; "exact_input")]
     #[test_case("selected"; "selected_input")]
     #[test_case("legacy"; "legacy_selected_values")]
-    fn argument_secrets_keep_distinct_opaque_identities_without_plaintext(mode: &str) {
+    fn argument_secrets_say_whether_they_changed_without_plaintext_or_hashes(mode: &str) {
         let input = |secret| json!({"auth": {"api_key": secret}, "command": format!("deploy --token {secret}")});
         let pointers = if mode == "exact" {
             Vec::new()
         } else {
             SECRET_POINTERS.to_vec()
         };
-        let mut identities = Vec::new();
         for secret in [SECRET_BEFORE, SECRET_AFTER] {
             let normalized = input_preview(input(secret), &pointers);
             let change = if mode == "legacy" {
@@ -1273,21 +1284,22 @@ mod tests {
                 .iter()
                 .find(|predicate| predicate.label.contains("api_key"))
                 .unwrap();
+            let unchanged = mode == "legacy" && secret == SECRET_BEFORE;
             assert_eq!(
                 value.after,
-                format!(
-                    "{REDACTED_VALUE} {}",
-                    canonical_json_sha256(&Value::String(secret.into()))
-                )
+                if unchanged {
+                    UNCHANGED_SECRET
+                } else {
+                    AFTER_SECRET
+                }
             );
-            identities.push(value.after.clone());
-            assert!(review.predicates.iter().all(|predicate| {
-                [SECRET_BEFORE, SECRET_AFTER].iter().all(|secret| {
-                    !predicate.before.contains(*secret) && !predicate.after.contains(*secret)
-                })
-            }));
+            for predicate in &review.predicates {
+                for text in [&predicate.before, &predicate.after] {
+                    assert!(!text.contains(SECRET_BEFORE) && !text.contains(SECRET_AFTER));
+                }
+                assert_plain(&[predicate.before.clone(), predicate.after.clone()], mode);
+            }
         }
-        assert_ne!(identities[0], identities[1]);
     }
 
     fn resource_change(
@@ -1303,17 +1315,17 @@ mod tests {
 
     #[test_case("access", "Access"; "access_wildcard")]
     #[test_case("protection", "Protection"; "protection_wildcard")]
-    #[test_case("attribute", "SHA-256"; "attribute_identity_same_digest_prefix")]
+    #[test_case("attribute", "Value"; "attribute_identity_same_digest_prefix")]
     #[test_case("attribute_mode", "Match"; "attribute_match_mode")]
     #[test_case("attribute_name", "Attribute"; "attribute_names_same_count")]
-    #[test_case("digest", "SHA-256"; "target_identity_same_digest_prefix")]
+    #[test_case("digest", "Value"; "target_identity_same_digest_prefix")]
     #[test_case("domain", "Domain"; "unrestricted_slot_domain")]
     #[test_case("values", "Allowed value"; "allowed_values_same_count")]
     #[test_case("glob", "Glob"; "changed_glob")]
     #[test_case("regex", "Regex"; "changed_regex")]
     #[test_case("options", "Option-like values"; "option_like_authority")]
     #[test_case("links", "Repeated-slot equality"; "repeated_slot_relationship")]
-    #[test_case("tuples", "Allowed tuple"; "tuple_values_same_count")]
+    #[test_case("tuples", "Allowed combination"; "tuple_values_same_count")]
     #[test_case("independent", "Combinations"; "tuple_independence")]
     #[test_case("context", "Context"; "execution_context")]
     fn resource_authority_differences_never_collapse(case: &str, label: &str) {
@@ -1442,15 +1454,15 @@ mod tests {
                 review
                     .predicates
                     .iter()
-                    .any(|predicate| predicate.label.contains("Allowed tuple")
+                    .any(|predicate| predicate.label.contains("Allowed combination")
                         && predicate.after == ABSENT)
             );
         }
     }
 
-    #[test_case(false; "target_preimage")]
-    #[test_case(true; "attribute_preimage")]
-    fn verified_preimages_bind_to_the_exact_predicate_not_review_labels(attribute: bool) {
+    #[test_case(false; "target_value")]
+    #[test_case(true; "attribute_value")]
+    fn verified_values_bind_to_the_exact_predicate_not_review_labels(attribute: bool) {
         let record = record(false);
         let mut before = record.rule.resources[0].clone();
         before.selector = PermissionResourceSelector::Digest {
@@ -1493,13 +1505,13 @@ mod tests {
             BTreeMap::from([(WORKDIR.into(), UNVERIFIED_PATH.into())]);
         let change = resource_change(before, after);
         let review = ChangeReview::new(&change, None, Some(&normalized));
-        let preimage = review
+        let value = review
             .predicates
             .iter()
-            .find(|predicate| predicate.label == format!("{prefix} · Preimage"))
+            .find(|predicate| predicate.label == format!("{prefix} · Value"))
             .unwrap();
-        assert_eq!(preimage.before, OPAQUE);
-        assert!(preimage.after.contains(VERIFIED_PATH));
+        assert_eq!(value.before, FIXED_VALUE);
+        assert!(value.after.contains(VERIFIED_PATH));
         assert!(
             review
                 .predicates
@@ -1542,14 +1554,14 @@ mod tests {
         }
         let review = ChangeReview::new(&resource_change(before, after), None, None);
         for index in 0..count {
-            let label = format!("Target 1 · Attribute \"attribute-{index}\" · SHA-256");
+            let label = format!("Target 1 · Attribute \"attribute-{index}\" · Value");
             let predicate = review
                 .predicates
                 .iter()
                 .find(|predicate| predicate.label == label)
                 .unwrap();
-            assert_eq!(predicate.before, DIGEST_BEFORE);
-            assert_eq!(predicate.after, DIGEST_AFTER);
+            assert_eq!(predicate.before, FIXED_VALUE);
+            assert_eq!(predicate.after, NEW_FIXED_VALUE);
             assert!(predicate.changed);
         }
     }

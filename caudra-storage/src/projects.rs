@@ -247,6 +247,13 @@ pub fn project_subdir(cwd: &Path) -> PathBuf {
     Path::new(PROJECTS_DIR).join(state_id(cwd))
 }
 
+/// The directories holding `cwd`'s plans and notes, where the plan file and
+/// the memory tool write them.
+pub fn project_document_dirs(state_dir: &StateDir, cwd: &Path) -> [PathBuf; 2] {
+    let project = state_dir.persistent_path().join(project_subdir(cwd));
+    [project.join(PLANS_DIR), project.join(MEMORIES_DIR)]
+}
+
 fn state_id(cwd: &Path) -> String {
     linked_checkout(cwd).map_or_else(
         || project_id(&project_root(cwd)),
@@ -712,6 +719,21 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::create_dir_all(root.join(GIT_MARKER)).unwrap();
         assert_eq!(project_subdir(&nested), project_subdir(&root));
+    }
+
+    #[test]
+    fn document_dirs_hold_the_plan_file_under_the_persistent_root() {
+        let temp = crate::plans::tests::tempdir();
+        let persistent = temp.path().join("persistent");
+        let state = StateDir::split(temp.path().join("volatile"), persistent.clone());
+        let cwd = temp.path().join("workspace");
+
+        let [plans, memories] = project_document_dirs(&state, &cwd);
+        let plan = crate::plans::new_plan_path(&state, &cwd).unwrap();
+
+        assert_eq!(plan.parent(), Some(plans.as_path()));
+        assert_eq!(memories.parent(), plans.parent());
+        assert!(memories.starts_with(&persistent));
     }
 
     #[test]

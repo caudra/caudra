@@ -1,4 +1,3 @@
-use caudra_agent::permissions::pattern_recognition::PatternCandidate;
 use caudra_storage::permission_patterns::{ArgumentRole, PatternDefinition, PatternToken};
 use caudra_storage::permission_state::{
     PermissionArgumentConstraint, PermissionCapabilityFamily, PermissionLifetime,
@@ -11,21 +10,19 @@ use std::sync::Arc;
 
 use crate::components::escape_terminal_controls;
 
-pub(crate) const OPAQUE: &str = "Opaque · preimage unavailable";
+pub(crate) const FIXED_VALUE: &str = "a fixed value Caudra can't show";
+pub(crate) const MASKED_VALUE: &str = "masked · see Evidence";
 pub(crate) const ANY_RESOURCES: &str = "UNRESTRICTED resources";
 pub(crate) const ALL_RESOURCES: &str = "Allow still requires coverage of every actual resource.";
 pub(crate) const UNCONSTRAINED_INPUT: &str = "UNCONSTRAINED input: may vary";
 pub(crate) const PROTECTED_RISK: &str = "Protected resources may match";
 pub(crate) const UNKNOWN_ROLE_RISK: &str = "UNKNOWN role: operations unproven";
 pub(crate) const SOURCE_RISK: &str = "Review source is unverified";
-const PROPOSAL_RISK: &str = "Proposal: not authority; verify ID";
 const POLICY_RISK: &str = "Less DENY/ASK may grant more";
-const DIGEST_LABEL_CHARS: usize = 12;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ScopeActivity {
     Stored,
-    OtherProject,
     Revoked,
     Proposed,
     Live,
@@ -35,7 +32,6 @@ impl ScopeActivity {
     pub(crate) fn label(&self) -> &'static str {
         match self {
             Self::Stored => "STORED · context unchecked",
-            Self::OtherProject => "OTHER PROJECT",
             Self::Revoked => "REVOKED",
             Self::Proposed => "PROPOSED · not active",
             Self::Live => "THIS REQUEST",
@@ -46,7 +42,6 @@ impl ScopeActivity {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ScopeSource {
     Record(Arc<PermissionRuleRecord>),
-    Candidate(Arc<PatternCandidate>),
     Live {
         rule: Box<StructuredPermissionRule>,
         review: PermissionReview,
@@ -77,18 +72,11 @@ impl ScopeModel {
         }
     }
 
-    pub(crate) fn candidate(candidate: Arc<PatternCandidate>) -> Self {
-        Self {
-            source: ScopeSource::Candidate(candidate),
-            activity: ScopeActivity::Proposed,
-        }
-    }
-
     pub(crate) fn rule(&self) -> Option<&StructuredPermissionRule> {
         match &self.source {
             ScopeSource::Record(record) => Some(&record.rule),
             ScopeSource::Live { rule, .. } => Some(rule),
-            ScopeSource::Candidate(_) | ScopeSource::Pattern { .. } => None,
+            ScopeSource::Pattern { .. } => None,
         }
     }
 
@@ -96,13 +84,12 @@ impl ScopeModel {
         match &self.source {
             ScopeSource::Record(record) => record.review.as_ref(),
             ScopeSource::Live { review, .. } => Some(review),
-            ScopeSource::Candidate(_) | ScopeSource::Pattern { .. } => None,
+            ScopeSource::Pattern { .. } => None,
         }
     }
 
     pub(crate) fn pattern(&self, target: usize) -> Option<&PatternDefinition> {
         match &self.source {
-            ScopeSource::Candidate(candidate) => Some(&candidate.definition),
             ScopeSource::Pattern { definition, .. } => Some(definition),
             _ => self.rule()?.resources.get(target).and_then(|resource| {
                 if let PermissionResourceSelector::CommandTemplate { definition } =
@@ -170,9 +157,7 @@ impl ScopeModel {
                 warnings.push(PROTECTED_RISK);
             }
         }
-        if matches!(self.source, ScopeSource::Candidate(_)) {
-            warnings.push(PROPOSAL_RISK);
-        } else if self
+        if self
             .review()
             .is_some_and(|review| review.source != PermissionReviewSource::Approved)
         {
@@ -247,35 +232,22 @@ pub(crate) fn selector_mode(selector: &PermissionResourceSelector) -> &'static s
 
 pub(crate) fn selector_value(selector: &PermissionResourceSelector, redact: bool) -> String {
     match selector {
-        PermissionResourceSelector::Digest { digest }
-        | PermissionResourceSelector::FilesystemSubtreeDigest { digest }
-        | PermissionResourceSelector::UrlSubtreeDigest { digest }
-        | PermissionResourceSelector::UrlOriginDigest { digest } => format!(
-            "{OPAQUE} #{}",
-            safe(&digest.chars().take(DIGEST_LABEL_CHARS).collect::<String>())
-        ),
+        PermissionResourceSelector::Digest { .. }
+        | PermissionResourceSelector::FilesystemSubtreeDigest { .. }
+        | PermissionResourceSelector::UrlSubtreeDigest { .. }
+        | PermissionResourceSelector::UrlOriginDigest { .. } => FIXED_VALUE.into(),
+        PermissionResourceSelector::Exact { .. }
+        | PermissionResourceSelector::Prefix { .. }
+        | PermissionResourceSelector::Subtree { .. }
+        | PermissionResourceSelector::CommandPattern { .. }
+            if redact =>
+        {
+            MASKED_VALUE.into()
+        }
         PermissionResourceSelector::Exact { value }
-        | PermissionResourceSelector::Prefix { value } => {
-            if redact {
-                "Opaque source · see redacted evidence".into()
-            } else {
-                literal(value)
-            }
-        }
-        PermissionResourceSelector::Subtree { root } => {
-            if redact {
-                "Opaque root · see redacted evidence".into()
-            } else {
-                literal(root)
-            }
-        }
-        PermissionResourceSelector::CommandPattern { pattern } => {
-            if redact {
-                "Opaque token prefix · see evidence".into()
-            } else {
-                safe(pattern)
-            }
-        }
+        | PermissionResourceSelector::Prefix { value } => literal(value),
+        PermissionResourceSelector::Subtree { root } => literal(root),
+        PermissionResourceSelector::CommandPattern { pattern } => safe(pattern),
         PermissionResourceSelector::CommandTemplate { definition } => safe(&definition.name),
         PermissionResourceSelector::RemoteResource { scope, .. }
         | PermissionResourceSelector::RemoteSubtree { scope, .. } => scope

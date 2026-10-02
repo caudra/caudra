@@ -1,39 +1,42 @@
 use std::collections::BTreeSet;
 
 use caudra_agent::permissions::{
-    ComposedAnswerError, PermissionRequest, PermissionResourceSelector,
+    ComposedAnswerError, ComposedRow, PermissionLifetime, PermissionRequest,
+    PermissionResourceSelector, PermissionRowGrant, PermissionRuleOption,
     pattern_matching::{CompiledPattern, PatternCompileError},
 };
 use caudra_storage::permission_patterns::{
     ArgumentDomain, ArgumentRole, ObservedTuple, OptionLikePolicy, PatternDefinition, PatternToken,
     PatternValidationError, SlotCombinations, SlotId,
 };
+use caudra_workbench::text_field::TextField;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::style::Style;
 
+use super::customize::ScopeItem;
+use super::decision::{grant_option, row_ladder};
 use super::details::review_text;
-use super::scope::{ApprovalImpact, SHELL_REACH, ScopeSummary, complete_text};
-use super::{
-    FooterRow, HINT_ENTER, HINT_ESC, KEY_ALLOW_ONCE, KeyCode, KeyEvent, KeyModifiers, Line, Panel,
-    PermissionAnswer, PermissionDecision, PermissionPrompt, PermissionRowGrant,
-    PermissionRuleOption, PromptTarget, Span, TextField, command_ladders,
+use super::scope::{SHELL_REACH, ScopeSummary, complete_text};
+use super::step_through::PageItem;
+use super::view::KeyHint;
+use super::{Panel, PermissionPrompt, PromptTarget, RowChoice};
+use crate::components::permission_scope::controls::{
+    DOMAIN_COUNT, domain_for_mode, domain_index, domain_name,
 };
-use crate::components::permission_scope::controls::{DOMAIN_COUNT, domain_for_mode, domain_index};
 pub(super) use crate::components::permission_scope::pattern::PatternControl as InspectorControl;
-use crate::components::permission_scope::pattern::PatternPanel;
+use crate::components::permission_scope::pattern::{
+    INDEPENDENT_VALUES, PatternPanel, option_values,
+};
 use crate::theme::Theme;
 
-const EXCLUSIONS: &str = "Excludes extra arguments, redirects, expansions and payloads. Other commands need their own coverage.";
-const MATCH_UNAVAILABLE: &str = "Current-row match unavailable. Change the scope or use Once.";
-const MATCHED: &str =
-    "Current row matches the policy preview; the whole call is rechecked on approval.";
-const MATCH_MISMATCH: &str = "Current row does not match this scope. Change the scope or use Once.";
-const SCOPE_UNAVAILABLE: &str = "Policy cannot use this edited scope for the current request.";
-const UNKNOWN_ROLE_CAUTION: &str = "Unknown-role slots: values can change program operation. Widen with care; not read-only or sandboxed.";
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct EditedPattern {
-    pub option_id: String,
-    pub definition: Box<PatternDefinition>,
-}
+const EXCLUSIONS: &str = "Extra arguments, redirects, expansions, and inline input are not included. Other commands need their own approval.";
+const MATCH_UNAVAILABLE: &str =
+    "Caudra can't tell whether this command matches. Change the pattern or run it once.";
+const MATCHED: &str = "This command matches. Caudra checks the whole line again when you approve.";
+const MATCH_MISMATCH: &str = "This command doesn't match. Change the pattern or run it once.";
+const SCOPE_UNAVAILABLE: &str = "Caudra can't use this edited pattern for this request.";
+const UNKNOWN_ROLE_CAUTION: &str = "Some values can change what the program does. Widen them with care; this is not read-only or sandboxed.";
+const INVALID_PREFIX: &str = "Invalid: ";
 
 #[derive(Clone, PartialEq, Eq)]
 enum EditField {
@@ -49,6 +52,7 @@ enum CurrentMatch {
     Unavailable,
 }
 
+/// A suggested template opened for editing, for one command of the request.
 pub(super) struct PatternInspector {
     row: usize,
     option_id: String,
@@ -72,15 +76,23 @@ fn pattern_preview(
         .options
         .iter()
         .find(|option| option.id == option_id)
-        .and_then(|option| option.allowed_lifetimes.first())
+        .and_then(|option| {
+            option
+                .allowed_lifetimes
+                .iter()
+                .find(|lifetime| **lifetime != PermissionLifetime::Once)
+        })
         .ok_or_else(|| ComposedAnswerError::NotOffered(option_id.into()))?;
     let mut rows = vec![None; request.resources.len()];
-    let grant = rows.get_mut(row).ok_or(ComposedAnswerError::Uncovered)?;
-    *grant = Some(PermissionRowGrant::Pattern {
-        option_id: option_id.into(),
-        definition: Box::new(definition.clone()),
+    let slot = rows.get_mut(row).ok_or(ComposedAnswerError::Uncovered)?;
+    *slot = Some(ComposedRow {
+        grant: PermissionRowGrant::Pattern {
+            option_id: option_id.into(),
+            definition: Box::new(definition.clone()),
+        },
+        lifetime: lifetime.clone(),
     });
-    request.composed_rules(&rows, lifetime).map(|_| ())
+    request.composed_rules(&rows).map(|_| ())
 }
 
 fn current_bindings(
@@ -152,21 +164,17 @@ pub(super) fn offered_pattern(option: &PermissionRuleOption) -> Option<&PatternD
     }
 }
 
-pub(super) fn pattern_impact(definition: &PatternDefinition) -> ApprovalImpact {
-    if definition.slots.iter().any(|slot| {
+/// Whether an edited template reaches past the values it was suggested with:
+/// a pattern, any argument, option-looking data, or slots combined freely.
+pub(super) fn pattern_widened(definition: &PatternDefinition) -> bool {
+    definition.slots.iter().any(|slot| {
         matches!(
             slot.domain,
             ArgumentDomain::Glob { .. }
                 | ArgumentDomain::Regex { .. }
                 | ArgumentDomain::AnyLiteralArgument
         ) || slot.option_like == OptionLikePolicy::AllowForProvenData
-    }) || (definition.slots.len() > 1
-        && definition.combinations == SlotCombinations::Independent)
-    {
-        ApprovalImpact::Review
-    } else {
-        ApprovalImpact::Routine
-    }
+    }) || (definition.slots.len() > 1 && definition.combinations == SlotCombinations::Independent)
 }
 
 pub(super) fn unknown_role_caution(definition: &PatternDefinition) -> Option<&'static str> {
@@ -185,7 +193,7 @@ pub(super) fn unknown_role_caution(definition: &PatternDefinition) -> Option<&'s
         .then_some(UNKNOWN_ROLE_CAUTION)
 }
 
-fn slot_name(definition: &PatternDefinition, id: SlotId) -> String {
+pub(crate) fn slot_name(definition: &PatternDefinition, id: SlotId) -> String {
     let index = definition
         .slots
         .iter()
@@ -196,35 +204,6 @@ fn slot_name(definition: &PatternDefinition, id: SlotId) -> String {
 
 fn literal(value: &str) -> String {
     shell_words::quote(&review_text(value)).into_owned()
-}
-
-fn template_words(definition: &PatternDefinition) -> Vec<(String, bool)> {
-    definition
-        .argv
-        .iter()
-        .map(|token| match token {
-            PatternToken::Exact { value, .. } => (literal(value), false),
-            PatternToken::Slot { id, .. } => (slot_name(definition, *id), true),
-        })
-        .collect()
-}
-
-fn template_text(definition: &PatternDefinition) -> String {
-    template_words(definition)
-        .into_iter()
-        .map(|(word, _)| word)
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn mode_name(domain: &ArgumentDomain) -> &'static str {
-    match domain {
-        ArgumentDomain::ObservedSet { .. } => "Observed values",
-        ArgumentDomain::Exact { .. } => "Exact literal",
-        ArgumentDomain::Glob { .. } => "Glob",
-        ArgumentDomain::Regex { .. } => "Regex",
-        ArgumentDomain::AnyLiteralArgument => "Any literal argument",
-    }
 }
 
 fn domain_text(domain: &ArgumentDomain) -> String {
@@ -240,14 +219,16 @@ fn domain_text(domain: &ArgumentDomain) -> String {
         ),
         ArgumentDomain::Exact { value } => literal(value),
         ArgumentDomain::Glob { pattern } | ArgumentDomain::Regex { pattern } => literal(pattern),
-        ArgumentDomain::AnyLiteralArgument => "One argument; option guard stays fixed".into(),
+        ArgumentDomain::AnyLiteralArgument => {
+            "Any one argument; values that look like options stay refused".into()
+        }
     }
 }
 
 fn combinations_text(definition: &PatternDefinition) -> String {
     match &definition.combinations {
         SlotCombinations::ObservedTuples { tuples } => {
-            format!("{} observed tuples only", tuples.len())
+            format!("Only the {} combinations seen before", tuples.len())
         }
         SlotCombinations::Independent => {
             let count =
@@ -260,8 +241,8 @@ fn combinations_text(definition: &PatternDefinition) -> String {
                         _ => None,
                     });
             count.map_or_else(
-                || "Independent; new combinations allowed".into(),
-                |count| format!("Independent; up to {count} combinations"),
+                || INDEPENDENT_VALUES.into(),
+                |count| format!("Any combination, up to {count}"),
             )
         }
     }
@@ -273,39 +254,37 @@ fn compile_error(definition: &PatternDefinition, error: PatternCompileError) -> 
             format!("{}: {reason}", slot_name(definition, slot))
         }
         PatternCompileError::InvalidTuple(slot) => format!(
-            "An observed tuple is outside {}'s domain or fixed option guard",
+            "A combination seen before doesn't fit {}",
             slot_name(definition, slot)
         ),
-        PatternCompileError::Definition(PatternValidationError::InvalidSlot(slot)) => format!(
-            "{} is not a valid variable position",
-            slot_name(definition, slot)
-        ),
-        PatternCompileError::Definition(PatternValidationError::InvalidDomain(slot)) => format!(
-            "{} has no valid allowed values",
-            slot_name(definition, slot)
-        ),
+        PatternCompileError::Definition(PatternValidationError::InvalidSlot(slot)) => {
+            format!("{} can't vary here", slot_name(definition, slot))
+        }
+        PatternCompileError::Definition(PatternValidationError::InvalidDomain(slot)) => {
+            format!("{} has no values it may take", slot_name(definition, slot))
+        }
         other => other.to_string(),
     };
     review_text(&message)
 }
 
-pub(super) fn pattern_summary(definition: &PatternDefinition) -> ScopeSummary {
+pub(crate) fn pattern_summary(definition: &PatternDefinition) -> ScopeSummary {
     let mut lines = vec![
-        format!("Pattern name: {}", review_text(&definition.name)),
+        format!("Name: {}", review_text(&definition.name)),
         format!(
-            "Starting directory: {}",
+            "Starting in {}.",
             review_text(&definition.context.effective_workdir)
         ),
     ];
     for slot in &definition.slots {
         lines.push(format!(
-            "{} ({}): {} — {}",
+            "{} ({}): {}, {}",
             slot_name(definition, slot.id),
             review_text(&slot.label),
-            mode_name(&slot.domain),
+            domain_name(&slot.domain),
             domain_text(&slot.domain)
         ));
-        lines.push(option_guard(&slot.option_like).into());
+        lines.push(option_values(&slot.option_like).into());
     }
     lines.push(format!("Combinations: {}", combinations_text(definition)));
     lines.push(EXCLUSIONS.into());
@@ -313,25 +292,19 @@ pub(super) fn pattern_summary(definition: &PatternDefinition) -> ScopeSummary {
     let validation = CompiledPattern::compile(definition);
     let complete = validation.is_ok() && lines.iter().all(|line| complete_text(line));
     if let Err(error) = validation {
-        lines.push(format!("Invalid: {}", compile_error(definition, error)));
+        lines.push(format!(
+            "{INVALID_PREFIX}{}",
+            compile_error(definition, error)
+        ));
     }
-    ScopeSummary {
-        label: format!("Pattern: {}", template_text(definition)),
-        lines,
-        complete,
-    }
-}
-
-fn option_guard(policy: &OptionLikePolicy) -> &'static str {
-    match policy {
-        OptionLikePolicy::Reject => "Option-looking values: rejected (fixed guard).",
-        OptionLikePolicy::AllowForProvenData => {
-            "Option-looking values: allowed only at proven data positions (fixed guard)."
-        }
-    }
+    ScopeSummary { lines, complete }
 }
 
 impl PatternInspector {
+    pub(super) fn row(&self) -> usize {
+        self.row
+    }
+
     fn usable(&self) -> bool {
         self.error.is_none() && self.current_match == CurrentMatch::Matched
     }
@@ -392,59 +365,109 @@ impl PatternInspector {
 }
 
 impl PermissionPrompt {
-    pub(super) fn suggested_pattern(&self) -> Option<&PermissionRuleOption> {
-        let row = self.command_row()?;
-        let ladders = command_ladders(self.current()?);
-        let offered = ladders.get(row)?;
-        self.scopes[row]
-            .rung
-            .checked_sub(1)
-            .and_then(|rung| offered.get(rung).copied())
+    /// The grant the page or Customize currently gives `row`.
+    fn drafted_grant(&self, row: usize) -> Option<PermissionRowGrant> {
+        let request = self.current()?;
+        match self.panel {
+            Panel::StepThrough => self.step.as_ref()?.grant(request, row),
+            Panel::Customize => match &self.customize.as_ref()?.chosen {
+                ScopeItem::Row(grant) => Some(grant.clone()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The template `i` opens: the highlighted rung when it is one, else the
+    /// first the command's ladder suggests.
+    fn inspected_rung(&self) -> Option<(usize, &PermissionRuleOption)> {
+        let request = self.current()?;
+        let (row, highlighted) = match self.panel {
+            Panel::StepThrough => {
+                let step = self.step.as_ref()?;
+                let row = step.page?;
+                let grant = match step.items(request, row).get(step.highlight) {
+                    Some(PageItem::Grant(Some(grant))) => Some(grant.clone()),
+                    _ => None,
+                };
+                (row, grant)
+            }
+            Panel::Customize => {
+                let customize = self.customize.as_ref()?;
+                let row = customize.row?;
+                let grant = match self.customize_items().get(customize.highlight) {
+                    Some(ScopeItem::Row(grant)) => Some(grant.clone()),
+                    _ => None,
+                };
+                (row, grant)
+            }
+            _ => return None,
+        };
+        highlighted
+            .and_then(|grant| grant_option(request, row, &grant))
             .filter(|option| offered_pattern(option).is_some())
-            .or_else(|| {
-                offered
-                    .iter()
-                    .copied()
-                    .find(|option| offered_pattern(option).is_some())
-            })
+            .or_else(|| row_ladder(request, row).find(|option| offered_pattern(option).is_some()))
+            .map(|option| (row, option))
     }
 
     pub(super) fn open_inspector(&mut self) {
-        let Some(row) = self.command_row() else {
+        let Some((row, option)) = self.inspected_rung() else {
             return;
         };
-        let Some(option) = self.suggested_pattern() else {
+        let Some(proposal) = offered_pattern(option).cloned() else {
             return;
         };
-        let Some(proposal) = offered_pattern(option) else {
+        let option_id = option.id.clone();
+        let Some(request) = self.current() else {
             return;
         };
-        let draft = self.scopes[row]
-            .pattern
-            .as_ref()
-            .filter(|edited| edited.option_id == option.id)
-            .map_or_else(
-                || Box::new(proposal.clone()),
-                |edited| edited.definition.clone(),
-            );
+        let bindings = current_bindings(request, row, &option_id, &proposal);
+        let draft = match self.drafted_grant(row) {
+            Some(PermissionRowGrant::Pattern {
+                option_id: edited,
+                definition,
+            }) if edited == option_id => definition,
+            _ => Box::new(proposal.clone()),
+        };
         self.inspector = Some(PatternInspector {
             row,
-            option_id: option.id.clone(),
-            proposal: Box::new(proposal.clone()),
+            option_id,
+            proposal: Box::new(proposal),
             draft,
             slot: 0,
             editing: None,
             show_values: false,
             error: None,
             current_match: CurrentMatch::Unavailable,
-            current_bindings: self
-                .current()
-                .and_then(|request| current_bindings(request, row, &option.id, proposal)),
+            current_bindings: bindings,
         });
-        self.panel = Panel::Scopes;
         self.field.clear();
         self.scroll.reset();
         self.refresh_inspector(None);
+    }
+
+    /// Checks the open inspector again against a newer version of the
+    /// request, keeping the draft and the focus.
+    pub(super) fn recheck_inspector(&mut self) {
+        let Some(inspector) = &self.inspector else {
+            return;
+        };
+        let bindings = self.current().and_then(|request| {
+            current_bindings(
+                request,
+                inspector.row,
+                &inspector.option_id,
+                &inspector.proposal,
+            )
+        });
+        let focus = match &self.focus {
+            Some(PromptTarget::Inspector(control)) => Some(control.clone()),
+            _ => None,
+        };
+        if let Some(inspector) = &mut self.inspector {
+            inspector.current_bindings = bindings;
+        }
+        self.refresh_inspector(focus);
     }
 
     pub(super) fn refresh_inspector(&mut self, focus: Option<InspectorControl>) {
@@ -478,7 +501,7 @@ impl PermissionPrompt {
         }
         self.invalidate_controls();
         self.focus = focus.map(PromptTarget::Inspector);
-        self.pending_reveal = self.focus.clone();
+        self.reveal = self.focus.is_some();
     }
 
     fn set_domain(&mut self, mode: usize) {
@@ -606,53 +629,79 @@ impl PermissionPrompt {
         self.refresh_inspector(Some(control));
     }
 
-    pub(super) fn handle_inspector_key(&mut self, key: KeyEvent) -> Option<PermissionDecision> {
-        if self.inspector.as_ref()?.is_editing() {
-            let control = match self.inspector.as_ref()?.editing.as_ref()? {
+    fn move_inspector_focus(&mut self, reverse: bool) {
+        let Some(panel) = self.inspector_panel() else {
+            return;
+        };
+        let controls: Vec<PromptTarget> = panel
+            .fields()
+            .into_iter()
+            .map(|field| PromptTarget::Inspector(field.control))
+            .collect();
+        if controls.is_empty() {
+            return;
+        }
+        let index = self
+            .focus
+            .as_ref()
+            .and_then(|focus| controls.iter().position(|target| target == focus));
+        let next = match index {
+            Some(index) if reverse => (index + controls.len() - 1) % controls.len(),
+            Some(index) => (index + 1) % controls.len(),
+            None if reverse => controls.len() - 1,
+            None => 0,
+        };
+        self.focus = Some(controls[next].clone());
+        self.reveal = true;
+    }
+
+    pub(super) fn handle_inspector_key(&mut self, key: KeyEvent) {
+        let Some(inspector) = self.inspector.as_ref() else {
+            return;
+        };
+        let backwards = key.code == KeyCode::BackTab || key.modifiers.contains(KeyModifiers::SHIFT);
+        if let Some(editing) = &inspector.editing {
+            let control = match editing {
                 EditField::Name => InspectorControl::Name,
                 EditField::SlotName => InspectorControl::SlotName,
                 EditField::Constraint => InspectorControl::Constraint,
             };
             match key.code {
                 KeyCode::Esc => {
-                    self.inspector.as_mut()?.editing = None;
+                    if let Some(inspector) = self.inspector.as_mut() {
+                        inspector.editing = None;
+                    }
                     self.field.clear();
                 }
-                KeyCode::Enter | KeyCode::Tab | KeyCode::BackTab => {
-                    self.apply_inspector_edit();
-                }
+                KeyCode::Enter | KeyCode::Tab | KeyCode::BackTab => self.apply_inspector_edit(),
                 _ => {
                     self.edit_field(key);
                 }
             }
             self.refresh_inspector(Some(control));
             if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
-                self.move_focus(
-                    key.code == KeyCode::BackTab || key.modifiers.contains(KeyModifiers::SHIFT),
-                );
+                self.move_inspector_focus(backwards);
             }
-            return None;
+            return;
         }
         if key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
         {
-            return None;
+            return;
         }
         match key.code {
             KeyCode::Esc => {
                 self.inspector = None;
                 self.field.clear();
-                self.panel = Panel::Scopes;
+                self.focus = None;
                 self.scroll.reset();
                 self.invalidate_controls();
             }
-            KeyCode::Tab | KeyCode::BackTab => self.move_focus(
-                key.code == KeyCode::BackTab || key.modifiers.contains(KeyModifiers::SHIFT),
-            ),
+            KeyCode::Tab | KeyCode::BackTab => self.move_inspector_focus(backwards),
             KeyCode::Enter => {
                 if let Some(target) = self.focus.clone() {
-                    return self.activate(target);
+                    self.activate(target);
                 }
             }
             KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
@@ -668,40 +717,27 @@ impl PermissionPrompt {
                         self.activate_inspector(InspectorControl::Combinations)
                     }
                     _ if matches!(key.code, KeyCode::Up | KeyCode::Down) => {
-                        self.move_focus(!forward)
+                        self.move_inspector_focus(!forward)
                     }
                     _ => {}
                 }
             }
-            KeyCode::Char('1'..='5') => {
-                if let KeyCode::Char(mode) = key.code {
-                    self.set_domain(mode as usize - '1' as usize);
-                }
-            }
+            KeyCode::Char(mode @ '1'..='5') => self.set_domain(mode as usize - '1' as usize),
             KeyCode::Char('N') => self.activate_inspector(InspectorControl::Name),
             KeyCode::Char('n') => self.activate_inspector(InspectorControl::SlotName),
             KeyCode::Char('e') => self.activate_inspector(InspectorControl::Constraint),
             KeyCode::Char('o') => self.activate_inspector(InspectorControl::Observations),
             KeyCode::Char('c') => self.activate_inspector(InspectorControl::Combinations),
-            KeyCode::F(2) => {
-                self.panel = Panel::Details;
-                self.scroll.reset();
-                self.invalidate_controls();
-            }
+            KeyCode::Char('?') => self.toggle_details(),
             KeyCode::Char('p') if !self.awaiting_review => self.use_inspected_pattern(),
-            KeyCode::Char('y') if !self.awaiting_review => {
-                return Some(PermissionDecision {
-                    request_id: self.request_id()?.into(),
-                    answer: PermissionAnswer::AllowOnce,
-                });
-            }
             _ => {
                 self.scroll.handle_key(key);
             }
         }
-        None
     }
 
+    /// Puts the edited template where the inspector was opened from: the
+    /// page's row, or Customize's scope.
     fn use_inspected_pattern(&mut self) {
         let Some(inspector) = &self.inspector else {
             return;
@@ -717,26 +753,34 @@ impl PermissionPrompt {
             self.refresh_inspector(None);
             return;
         }
-        let ladders = command_ladders(request);
-        let Some(rung) = ladders.get(inspector.row).and_then(|offered| {
-            offered
-                .iter()
-                .position(|option| option.id == inspector.option_id)
-        }) else {
-            return;
-        };
         let Some(inspector) = self.inspector.take() else {
             return;
         };
-        let choice = &mut self.scopes[inspector.row];
-        choice.pattern = Some(EditedPattern {
+        let grant = PermissionRowGrant::Pattern {
             option_id: inspector.option_id,
             definition,
-        });
-        choice.rung = rung + 1;
-        self.panel = Panel::Main;
+        };
+        match self.panel {
+            Panel::StepThrough => {
+                if let Some(step) = self.step.as_mut()
+                    && let Some(row) = step.rows.get_mut(inspector.row)
+                {
+                    *row = RowChoice::Chosen(Some(grant));
+                }
+                self.highlight_current_item();
+            }
+            Panel::Customize => {
+                if let Some(customize) = self.customize.as_mut() {
+                    customize.chosen = ScopeItem::Row(grant);
+                }
+                self.highlight_chosen_scope();
+            }
+            _ => {}
+        }
+        self.field.clear();
+        self.focus = None;
         self.scroll.reset();
-        self.scope_changed();
+        self.invalidate_controls();
     }
 
     fn apply_inspector_edit(&mut self) {
@@ -752,54 +796,48 @@ impl PermissionPrompt {
         }
     }
 
-    pub(super) fn inspector_footer(&self) -> Vec<FooterRow> {
+    pub(super) fn inspector_hints(&self) -> Vec<KeyHint> {
         let Some(inspector) = &self.inspector else {
             return Vec::new();
         };
         if inspector.is_editing() {
             return vec![
-                FooterRow::InspectorStatus,
-                FooterRow::ConfirmationInput,
-                FooterRow::Hints(vec![(HINT_ENTER, "Apply edit"), (HINT_ESC, "Cancel edit")]),
+                KeyHint::key("Enter", "apply", KeyCode::Enter),
+                KeyHint::key("Esc", "cancel", KeyCode::Esc),
             ];
         }
-        let mut actions = Vec::new();
-        if inspector.usable() {
-            actions.push(("p", "Use scope"));
-        }
-        actions.extend([
-            (KEY_ALLOW_ONCE, "Once"),
-            ("F2", "Details"),
-            (HINT_ESC, "Back"),
-        ]);
-        let mut rows = vec![FooterRow::InspectorStatus];
+        let mut hints = Vec::new();
         if !inspector.draft.slots.is_empty() {
-            rows.push(FooterRow::Hints(vec![
-                ("1", "Values"),
-                ("2", "Exact"),
-                ("3", "Glob"),
-                ("4", "Regex"),
-                ("5", "Any"),
-            ]));
+            hints.push(KeyHint::inert("1–5", "kind of value"));
         }
-        rows.push(FooterRow::Hints(actions));
-        rows
+        if inspector.usable() {
+            hints.push(KeyHint::key("p", "use", KeyCode::Char('p')));
+        }
+        hints.extend([
+            KeyHint::key("?", "details", KeyCode::Char('?')),
+            KeyHint::key("Esc", "back", KeyCode::Esc),
+        ]);
+        hints
     }
 
-    pub(super) fn inspector_status_line(&self, t: &Theme) -> Line<'static> {
-        let Some(inspector) = &self.inspector else {
-            return Line::default();
-        };
-        match &inspector.error {
-            Some(error) => Line::from(Span::styled(format!("Invalid: {error}"), t.error)),
+    /// Whether the edited template matches the command, or why not.
+    pub(super) fn inspector_status(&self, t: &Theme) -> Option<(String, Style)> {
+        let inspector = self.inspector.as_ref()?;
+        Some(match &inspector.error {
+            Some(error) => (format!("{INVALID_PREFIX}{error}"), t.error),
             None if inspector.current_match == CurrentMatch::KnownMismatch => {
-                Line::from(Span::styled(MATCH_MISMATCH, t.error))
+                (MATCH_MISMATCH.into(), t.error)
             }
             None if inspector.current_match == CurrentMatch::Unavailable => {
-                Line::styled(MATCH_UNAVAILABLE, t.tool_warning)
+                (MATCH_UNAVAILABLE.into(), t.tool_warning)
             }
-            None => Line::from(Span::styled(MATCHED, t.tool_dim)),
-        }
+            None => (MATCHED.into(), t.tool_dim),
+        })
+    }
+
+    /// Whether `i` has a template to open where the user is.
+    pub(super) fn inspectable(&self) -> bool {
+        self.inspected_rung().is_some()
     }
 
     pub(super) fn inspector_panel(&self) -> Option<PatternPanel> {
@@ -831,8 +869,8 @@ pub(super) mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use caudra_agent::permissions::{
-        COMMAND_OBSERVATION_ATTRIBUTE, COMMAND_OBSERVATION_BINDING_ATTRIBUTE, PermissionLifetime,
-        PermissionRequest, PermissionRowGrant,
+        COMMAND_OBSERVATION_ATTRIBUTE, COMMAND_OBSERVATION_BINDING_ATTRIBUTE, ComposedRow,
+        PermissionAnswer, PermissionLifetime, PermissionRequest, PermissionRowGrant,
         pattern_recognition::{
             CommandObservation, InvocationOutcome, OBSERVATION_SCHEMA_VERSION,
             ObservationProvenance, ObservationSource, ObservationVerification, ShellEffectStatus,
@@ -848,29 +886,32 @@ pub(super) mod tests {
     use test_case::test_case;
 
     use super::super::decision::tests::native_shell_request;
-    use super::super::details::{MAX_REVIEW_CHARS, TRUNCATED};
-    use super::super::scope::ReviewDocument;
-    use super::super::view::tests::{key, render};
+    use super::super::view::tests::{key, prose, render};
     use super::super::{Panel, PromptMouse};
     use super::{
         ArgumentDomain, CompiledPattern, CurrentMatch, InspectorControl, MATCH_MISMATCH,
-        MATCH_UNAVAILABLE, OptionLikePolicy, PatternDefinition, PatternToken, PermissionAnswer,
-        PermissionPrompt, PermissionResourceSelector, PromptTarget, SlotCombinations, SlotId,
-        UNKNOWN_ROLE_CAUTION, offered_pattern, template_text, unknown_role_caution,
+        MATCH_UNAVAILABLE, OptionLikePolicy, PatternDefinition, PatternToken, PermissionPrompt,
+        PermissionResourceSelector, PromptTarget, ScopeItem, SlotCombinations, SlotId,
+        UNKNOWN_ROLE_CAUTION, offered_pattern, pattern_summary, unknown_role_caution,
     };
     use super::{KeyCode, KeyModifiers};
+    use crate::components::permission_scope::pattern::{
+        EVIDENCE_LABEL, INDEPENDENT_VALUES, REFUSED_OPTIONS,
+    };
     use crate::theme;
 
     const OPTION_ID: &str = "command_template_0";
     const EVIDENCE: &str = "Native observations: 12 observations across 3 sessions. Outcomes: 12 requested (execution outcome not recorded).";
     const IMPORTED_EVIDENCE: &str = "Imported history (unverified): 12 observations across 3 sessions. Outcomes: 12 unknown outcomes. Historical execution context and tool identity are unverified. Analysis assumes standard Bash startup.";
-    const EVIDENCE_LABEL: &str = "Proposal evidence: ";
     const UI_VALUE: &str = "caudra-ui";
     const AGENT_VALUE: &str = "caudra-agent";
     const SLOT: SlotId = SlotId(9);
     const SECOND_SLOT: SlotId = SlotId(17);
     const TEMPLATE_PHRASE: &str = "REVIEW TEMPLATE";
-    const EXPECTED_TEMPLATE: &str = "cargo check -p <pattern1> --tests";
+    const TEMPLATE_HEAD: &str = "cargo check -p";
+    const RENAMED_SLOT: &str = "<pattern1> (crate)";
+    const LATER_NAME: &str = "later name";
+    const NOT_PERSISTED: &str = "not persisted";
     const EXPECTED_TUPLE: &str = "\"caudra-agent\" │ \"arm\"";
     const INVALID_EXPRESSION: &str = "[";
     const EDITED_NAME: &str = "Reviewed checks";
@@ -992,9 +1033,41 @@ pub(super) mod tests {
     }
 
     fn inspect(prompt: &mut PermissionPrompt) {
-        prompt.handle_key(key(KeyCode::Char('r')));
+        render(prompt, WIDE, TALL);
+        prompt.handle_key(key(KeyCode::Char('e')));
+        assert_eq!(prompt.panel, Panel::Customize);
+        render(prompt, WIDE, TALL);
         prompt.handle_key(key(KeyCode::Char('i')));
         assert!(prompt.inspector.is_some());
+        render(prompt, WIDE, TALL);
+    }
+
+    fn chosen_pattern(prompt: &PermissionPrompt) -> Option<Box<PatternDefinition>> {
+        match &prompt.customize.as_ref()?.chosen {
+            ScopeItem::Row(PermissionRowGrant::Pattern { definition, .. }) => {
+                Some(definition.clone())
+            }
+            _ => None,
+        }
+    }
+
+    fn customize_answer(prompt: &PermissionPrompt) -> PermissionAnswer {
+        prompt.customize.as_ref().unwrap().answer(prompt).unwrap()
+    }
+
+    /// Lets go of Enter, so the next Enter is a fresh press.
+    fn release_enter(prompt: &mut PermissionPrompt) {
+        let mut release = key(KeyCode::Enter);
+        release.kind = KeyEventKind::Release;
+        prompt.handle_key(release);
+        render(prompt, WIDE, TALL);
+    }
+
+    fn back_to_main(prompt: &mut PermissionPrompt) {
+        prompt.handle_key(key(KeyCode::Esc));
+        assert!(prompt.inspector.is_none());
+        prompt.handle_key(key(KeyCode::Esc));
+        assert_eq!(prompt.panel, Panel::Main);
         render(prompt, WIDE, TALL);
     }
 
@@ -1010,20 +1083,12 @@ pub(super) mod tests {
         render(prompt, WIDE, TALL);
         assert!(prompt.handle_key(key(KeyCode::Char('p'))).is_none());
         assert!(prompt.inspector.is_none());
-        let Some(PermissionRowGrant::Pattern { definition, .. }) = prompt
-            .row_grants(prompt.current().unwrap())
-            .into_iter()
-            .next()
-            .unwrap()
-        else {
-            panic!("edited pattern was not selected");
-        };
-        definition
+        chosen_pattern(prompt).expect("edited pattern was not chosen")
     }
 
     fn click(prompt: &mut PermissionPrompt, target: PromptTarget) {
         let area = prompt
-            .row_hits
+            .hits
             .iter()
             .find(|hit| hit.target == target)
             .unwrap()
@@ -1084,19 +1149,26 @@ pub(super) mod tests {
         }
     }
 
-    #[test]
-    fn suggestions_never_replace_the_exact_default_or_once_answer() {
-        let mut prompt = suggested_prompt();
+    #[test_case(false; "suggestion_not_marked")]
+    #[test_case(true; "suggestion_marked")]
+    fn rows_start_on_the_rung_the_request_marks(marked: bool) {
+        let mut request = offered_request("pattern", definition());
+        if marked {
+            for option in &mut request.options {
+                option.is_default = option.id == OPTION_ID;
+            }
+        }
+        let mut prompt = PermissionPrompt::new();
+        prompt.enqueue(request, None);
         assert_eq!(
-            prompt.row_grants(prompt.current().unwrap()),
-            vec![Some(PermissionRowGrant::Offered("command_exact_0".into()))]
+            prompt.row_grant(0) == Some(PermissionRowGrant::Offered(OPTION_ID.into())),
+            marked
         );
         render(&mut prompt, 80, 18);
         assert_eq!(
             prompt.handle_key(key(KeyCode::Char('y'))).unwrap().answer,
             PermissionAnswer::AllowOnce
         );
-        assert!(prompt.scopes[0].pattern.is_none());
     }
 
     #[test_case('1', ""; "observed_set")]
@@ -1128,20 +1200,28 @@ pub(super) mod tests {
             _ => panic!("wrong argument domain"),
         }
         render(&mut prompt, WIDE, TALL);
-        let answer = prompt.allow_answer(PermissionLifetime::Conversation);
-        let decision = prompt.handle_key(key(KeyCode::Char('s')));
+        let answer = customize_answer(&prompt);
+        let decision = prompt.handle_key(key(KeyCode::Enter));
         if matches!(mode, '3' | '4' | '5') {
             assert!(decision.is_none());
-            assert!(prompt.confirmation_phrase().is_none());
-            let frozen = prompt.confirmation.as_ref().unwrap();
-            assert!(frozen.complete, "{}", frozen.review.text());
-            let summary = frozen.review.text();
-            assert!(summary.contains(EXPECTED_TEMPLATE));
-            assert!(summary.contains("/project"));
-            assert!(!summary.contains("opaque-fixture-binding"));
-            assert!(!summary.contains(OPTION_ID));
-            assert!(!summary.contains(&definition.fingerprint().unwrap()));
+            let pending = prompt.pending.as_ref().unwrap();
+            assert!(pending.phrases.is_empty());
+            assert_eq!(pending.answer, answer);
+            assert!(
+                pending.warning.contains(TEMPLATE_HEAD),
+                "{}",
+                pending.warning
+            );
+            for hidden in [
+                "opaque-fixture-binding",
+                OPTION_ID,
+                &definition.fingerprint().unwrap(),
+            ] {
+                assert!(!pending.warning.contains(hidden), "{}", pending.warning);
+            }
             render(&mut prompt, WIDE, TALL);
+            assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());
+            release_enter(&mut prompt);
             assert_eq!(
                 prompt.handle_key(key(KeyCode::Enter)).unwrap().answer,
                 answer
@@ -1202,7 +1282,7 @@ pub(super) mod tests {
         let panel = prompt.inspector_panel().unwrap();
         assert_eq!(panel.caution.as_deref(), Some(UNKNOWN_ROLE_CAUTION));
         prompt.scroll.scroll_to(0);
-        assert!(render(&mut prompt, WIDE, TALL).contains(UNKNOWN_ROLE_CAUTION));
+        assert!(prose(&mut prompt, WIDE, TALL).contains(UNKNOWN_ROLE_CAUTION));
         let selected = take_scope(&mut prompt);
         assert_eq!(selected.argv, original.argv);
         assert!(matches!(
@@ -1210,16 +1290,16 @@ pub(super) mod tests {
             SlotCombinations::ObservedTuples { .. }
         ));
         render(&mut prompt, WIDE, TALL);
-        let decision = prompt.handle_key(key(KeyCode::Char('s')));
+        let decision = prompt.handle_key(key(KeyCode::Enter));
         if matches!(mode, '3' | '4' | '5') {
             assert!(decision.is_none());
-            let frozen = prompt.confirmation.as_ref().unwrap();
-            assert!(frozen.complete, "{}", frozen.review.text());
+            let warning = prompt.pending.as_ref().unwrap().warning.clone();
             assert_eq!(
-                frozen.review.text().matches(UNKNOWN_ROLE_CAUTION).count(),
-                1
+                warning.matches(UNKNOWN_ROLE_CAUTION).count(),
+                1,
+                "{warning}"
             );
-            assert!(render(&mut prompt, WIDE, TALL).contains(UNKNOWN_ROLE_CAUTION));
+            assert!(prose(&mut prompt, WIDE, TALL).contains(UNKNOWN_ROLE_CAUTION));
         } else {
             assert!(decision.is_some());
         }
@@ -1227,16 +1307,25 @@ pub(super) mod tests {
 
     #[test_case(false; "offered_pattern")]
     #[test_case(true; "edited_pattern")]
-    fn unknown_role_caution_is_in_the_bounded_frozen_review(edited: bool) {
+    fn unknown_role_caution_is_in_the_confirmation(edited: bool) {
         let definition = unknown_joint_definition();
-        let request = offered_request("unknown", definition.clone());
+        let mut request = offered_request("unknown", definition.clone());
+        for option in &mut request.options {
+            if option.id == OPTION_ID {
+                option.confirmation = Some(TEMPLATE_PHRASE.into());
+            }
+        }
+        let mut prompt = PermissionPrompt::new();
+        prompt.enqueue(request, None);
         let answer = if edited {
             PermissionAnswer::AllowComposed {
-                rows: vec![Some(PermissionRowGrant::Pattern {
-                    option_id: OPTION_ID.into(),
-                    definition: Box::new(definition),
+                rows: vec![Some(ComposedRow {
+                    grant: PermissionRowGrant::Pattern {
+                        option_id: OPTION_ID.into(),
+                        definition: Box::new(definition),
+                    },
+                    lifetime: PermissionLifetime::Conversation,
                 })],
-                lifetime: PermissionLifetime::Conversation,
             }
         } else {
             PermissionAnswer::AllowOption {
@@ -1244,17 +1333,9 @@ pub(super) mod tests {
                 lifetime: PermissionLifetime::Conversation,
             }
         };
-        let mut review = ReviewDocument::new(&request, &answer);
-        assert!(review.bound());
-        assert_eq!(review.text().matches(UNKNOWN_ROLE_CAUTION).count(), 1);
-        review.action = "x".repeat(MAX_REVIEW_CHARS);
-        assert!(!review.bound());
-        assert!(
-            review
-                .warnings
-                .iter()
-                .any(|warning| warning.contains(TRUNCATED))
-        );
+        let pending = prompt.pending_for(&answer, None).unwrap();
+        assert!(pending.phrases.is_empty());
+        assert_eq!(pending.warning.matches(UNKNOWN_ROLE_CAUTION).count(), 1);
     }
 
     #[test]
@@ -1268,7 +1349,12 @@ pub(super) mod tests {
         assert_eq!(definition.name, "Build checks");
         assert_eq!(definition.slots[0].label, "crate");
         assert_eq!(definition.fingerprint().unwrap(), fingerprint);
-        assert_eq!(template_text(&definition), EXPECTED_TEMPLATE);
+        assert!(
+            pattern_summary(&definition)
+                .lines
+                .iter()
+                .any(|line| line.starts_with(RENAMED_SLOT))
+        );
         assert_eq!(
             offered_pattern(&prompt.current().unwrap().options[0])
                 .unwrap()
@@ -1292,17 +1378,18 @@ pub(super) mod tests {
         assert!(screen.contains("Invalid:"));
         assert!(
             !prompt
-                .row_hits
+                .hits
                 .iter()
                 .any(|hit| hit.target == PromptTarget::Hint(key(KeyCode::Char('p'))))
         );
         assert!(prompt.handle_key(key(KeyCode::Char('p'))).is_none());
         assert!(prompt.inspector.is_some());
+        assert!(chosen_pattern(&prompt).is_none());
+        back_to_main(&mut prompt);
         assert_eq!(
             prompt.handle_key(key(KeyCode::Char('y'))).unwrap().answer,
             PermissionAnswer::AllowOnce
         );
-        assert!(prompt.scopes[0].pattern.is_none());
     }
 
     #[test_case('2', "caudra-ui", "caudra-ui", "caudra-ui-more"; "exact_whole_argument")]
@@ -1385,7 +1472,7 @@ pub(super) mod tests {
         prompt.activate_inspector(InspectorControl::ObservedValue(0));
         prompt.handle_key(key(KeyCode::Char('c')));
         let screen = render(&mut prompt, WIDE, TALL);
-        assert!(screen.contains("INDEPENDENT"));
+        assert!(screen.contains(INDEPENDENT_VALUES));
         assert_eq!(
             prompt.inspector.as_ref().unwrap().draft.combinations,
             SlotCombinations::Independent
@@ -1404,11 +1491,12 @@ pub(super) mod tests {
         let edited = take_scope(&mut prompt);
         assert_eq!(edited.combinations, SlotCombinations::Independent);
         render(&mut prompt, WIDE, TALL);
-        assert!(prompt.handle_key(key(KeyCode::Char('s'))).is_none());
-        assert!(prompt.confirmation.as_ref().unwrap().complete);
-        assert!(prompt.confirmation_phrase().is_none());
-        let answer = prompt.allow_answer(PermissionLifetime::Conversation);
-        render(&mut prompt, WIDE, TALL);
+        let answer = customize_answer(&prompt);
+        assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());
+        let pending = prompt.pending.as_ref().unwrap();
+        assert!(pending.phrases.is_empty());
+        assert_eq!(pending.answer, answer);
+        release_enter(&mut prompt);
         assert_eq!(
             prompt.handle_key(key(KeyCode::Enter)).unwrap().answer,
             answer
@@ -1437,7 +1525,7 @@ pub(super) mod tests {
         render(&mut prompt, WIDE, TALL);
         assert!(prompt.handle_key(key(KeyCode::Char('p'))).is_none());
         assert!(prompt.inspector.is_some());
-        assert!(prompt.scopes[0].pattern.is_none());
+        assert!(chosen_pattern(&prompt).is_none());
     }
 
     #[test_case(false; "observation_no_longer_available")]
@@ -1456,7 +1544,7 @@ pub(super) mod tests {
         }
         assert!(prompt.handle_key(key(KeyCode::Char('p'))).is_none());
         assert!(!prompt.inspector.as_ref().unwrap().usable());
-        assert!(prompt.scopes[0].pattern.is_none());
+        assert!(chosen_pattern(&prompt).is_none());
     }
 
     #[test_case(false; "joint_values")]
@@ -1526,6 +1614,7 @@ pub(super) mod tests {
         assert!(inspector.error.is_some());
         assert!(prompt.handle_key(key(KeyCode::Char('p'))).is_none());
         assert!(prompt.inspector.is_some());
+        back_to_main(&mut prompt);
         assert_eq!(
             prompt.handle_key(key(KeyCode::Char('y'))).unwrap().answer,
             PermissionAnswer::AllowOnce
@@ -1576,10 +1665,10 @@ pub(super) mod tests {
         let inspector = prompt.inspector.as_ref().unwrap();
         assert!(inspector.error.is_none());
         assert_eq!(inspector.current_match, CurrentMatch::KnownMismatch);
-        assert!(render(&mut prompt, WIDE, TALL).contains(MATCH_MISMATCH));
+        assert!(prose(&mut prompt, WIDE, TALL).contains(MATCH_MISMATCH));
         assert!(
             !prompt
-                .row_hits
+                .hits
                 .iter()
                 .any(|hit| hit.target == PromptTarget::Hint(key(KeyCode::Char('p'))))
         );
@@ -1587,18 +1676,21 @@ pub(super) mod tests {
         assert!(prompt.inspector.is_some());
         edit(&mut prompt, 'e', UI_VALUE);
         take_scope(&mut prompt);
-        let stored = &mut prompt.scopes[0].pattern.as_mut().unwrap().definition;
-        stored.slots[0].domain = ArgumentDomain::Exact {
-            value: AGENT_VALUE.into(),
-        };
-        stored.combinations = SlotCombinations::ObservedTuples {
-            tuples: BTreeSet::from([BTreeMap::from([(SLOT, AGENT_VALUE.into())])]),
-        };
-        render(&mut prompt, WIDE, TALL);
-        assert!(prompt.handle_key(key(KeyCode::Char('s'))).is_none());
-        assert!(!prompt.confirmation.as_ref().unwrap().complete);
+        if let Some(ScopeItem::Row(PermissionRowGrant::Pattern { definition, .. })) = prompt
+            .customize
+            .as_mut()
+            .map(|customize| &mut customize.chosen)
+        {
+            definition.slots[0].domain = ArgumentDomain::Exact {
+                value: AGENT_VALUE.into(),
+            };
+            definition.combinations = SlotCombinations::ObservedTuples {
+                tuples: BTreeSet::from([BTreeMap::from([(SLOT, AGENT_VALUE.into())])]),
+            };
+        }
         render(&mut prompt, WIDE, TALL);
         assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());
+        assert!(prompt.pending.is_none());
     }
 
     #[test]
@@ -1609,19 +1701,19 @@ pub(super) mod tests {
             .options
             .retain(|option| offered_pattern(option).is_none());
         request.input = json!({"pattern": definition()});
-        prompt.open_scope_editor();
+        prompt.open_customize(false);
         prompt.open_inspector();
         assert!(prompt.inspector.is_none());
     }
 
     #[test_case(false; "refresh")]
     #[test_case(true; "queue_advance")]
-    fn new_request_discards_the_draft_and_stale_click(advance: bool) {
+    fn a_newer_request_drops_the_stale_click_and_only_the_next_one_drops_the_draft(advance: bool) {
         let mut prompt = suggested_prompt();
         inspect(&mut prompt);
-        edit(&mut prompt, 'n', "not persisted");
+        edit(&mut prompt, 'n', NOT_PERSISTED);
         let area = prompt
-            .row_hits
+            .hits
             .iter()
             .find(|hit| hit.target == PromptTarget::Hint(key(KeyCode::Char('p'))))
             .unwrap()
@@ -1636,30 +1728,39 @@ pub(super) mod tests {
         if advance {
             prompt.enqueue(offered_request("next", definition()), None);
             prompt.resolve("pattern");
+            assert!(prompt.inspector.is_none());
         } else {
             prompt.update(offered_request("pattern", definition()));
+            assert_eq!(
+                prompt.inspector.as_ref().unwrap().draft.slots[0].label,
+                NOT_PERSISTED
+            );
         }
-        assert!(prompt.inspector.is_none());
-        assert!(prompt.scopes[0].pattern.is_none());
+        assert!(chosen_pattern(&prompt).is_none());
         assert!(prompt.handle_key(key(KeyCode::Char('s'))).is_none());
         render(&mut prompt, WIDE, TALL);
         assert!(!matches!(
             prompt.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left))),
             PromptMouse::Decided(_)
         ));
+        assert!(chosen_pattern(&prompt).is_none());
     }
 
     #[test]
     fn closing_an_inspector_does_not_select_its_edited_scope() {
         let mut prompt = suggested_prompt();
-        let before = prompt.row_grants(prompt.current().unwrap());
+        let rows = prompt.row_grants();
         inspect(&mut prompt);
+        let chosen = prompt.customize.as_ref().unwrap().chosen.clone();
         edit(&mut prompt, 'N', "Discard me");
         prompt.handle_key(key(KeyCode::Char('5')));
         prompt.handle_key(key(KeyCode::Esc));
         assert!(prompt.inspector.is_none());
-        assert!(prompt.panel == Panel::Scopes);
-        assert_eq!(prompt.row_grants(prompt.current().unwrap()), before);
+        assert_eq!(prompt.panel, Panel::Customize);
+        assert_eq!(prompt.customize.as_ref().unwrap().chosen, chosen);
+        prompt.handle_key(key(KeyCode::Esc));
+        assert_eq!(prompt.panel, Panel::Main);
+        assert_eq!(prompt.row_grants(), rows);
     }
 
     #[test_case(40, 10; "narrow_short")]
@@ -1680,7 +1781,7 @@ pub(super) mod tests {
             assert_eq!(prompt.focus, Some(PromptTarget::Inspector(target.clone())));
             assert!(
                 prompt
-                    .row_hits
+                    .hits
                     .iter()
                     .any(|hit| hit.target == PromptTarget::Inspector(target.clone()))
             );
@@ -1744,23 +1845,27 @@ pub(super) mod tests {
             assert_eq!(prompt.inspector.as_ref().unwrap().draft.name, EDITED_NAME);
             assert!(!prompt.inspector.as_ref().unwrap().is_editing());
 
-            action(&mut prompt, KeyCode::F(2));
-            assert!(prompt.panel == Panel::Details);
+            action(&mut prompt, KeyCode::Char('?'));
+            assert_eq!(prompt.panel, Panel::Details);
             assert!(!prompt.handle_paste(DISCARDED_NAME));
-            action(&mut prompt, KeyCode::Esc);
-            assert!(prompt.panel != Panel::Details);
+            action(&mut prompt, KeyCode::Char('?'));
+            assert_eq!(prompt.panel, Panel::Customize);
             assert_eq!(prompt.inspector.as_ref().unwrap().draft.name, EDITED_NAME);
-            assert!(prompt.scopes[0].pattern.is_none());
+            assert!(chosen_pattern(&prompt).is_none());
             action(&mut prompt, KeyCode::Char('p'));
             assert!(prompt.inspector.is_none());
-            assert!(prompt.confirmation.is_none());
-            answers.push(prompt.allow_answer(PermissionLifetime::Conversation));
+            assert!(prompt.pending.is_none());
+            answers.push(customize_answer(&prompt));
         }
         assert_eq!(answers[0], answers[1]);
     }
 
-    #[test]
-    fn edited_patterns_retain_offered_lifetimes_and_required_phrases() {
+    #[test_case(PermissionLifetime::Conversation, &[]; "conversation_needs_a_second_enter")]
+    #[test_case(PermissionLifetime::Project, &[TEMPLATE_PHRASE]; "project_needs_the_phrase")]
+    fn edited_patterns_keep_the_offered_lifetimes_and_confirmation(
+        lifetime: PermissionLifetime,
+        phrases: &[&str],
+    ) {
         let mut prompt = suggested_prompt();
         let source = prompt
             .requests
@@ -1771,18 +1876,34 @@ pub(super) mod tests {
             .iter_mut()
             .find(|option| option.id == OPTION_ID)
             .unwrap();
-        source.allowed_lifetimes = vec![PermissionLifetime::Conversation];
+        source
+            .allowed_lifetimes
+            .retain(|allowed| *allowed != PermissionLifetime::Global);
         source.confirmation = Some(TEMPLATE_PHRASE.into());
         inspect(&mut prompt);
         take_scope(&mut prompt);
-        assert!(!prompt.grants_lifetime(&PermissionLifetime::Project));
+        assert!(
+            !prompt
+                .customize_lifetimes()
+                .contains(&PermissionLifetime::Global)
+        );
+        prompt.set_lifetime(lifetime);
         render(&mut prompt, WIDE, TALL);
-        prompt.handle_key(key(KeyCode::Char('s')));
-        assert_eq!(prompt.confirmation_phrase(), Some(TEMPLATE_PHRASE));
-        let frozen = prompt.confirmation.as_ref().unwrap().answer.clone();
-        prompt.scopes[0].pattern.as_mut().unwrap().definition.name = "later name".into();
-        render(&mut prompt, WIDE, TALL);
-        prompt.handle_paste(TEMPLATE_PHRASE);
+        assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());
+        let pending = prompt.pending.as_ref().unwrap();
+        assert_eq!(pending.phrases, phrases);
+        let frozen = pending.answer.clone();
+        if let Some(ScopeItem::Row(PermissionRowGrant::Pattern { definition, .. })) = prompt
+            .customize
+            .as_mut()
+            .map(|customize| &mut customize.chosen)
+        {
+            definition.name = LATER_NAME.into();
+        }
+        release_enter(&mut prompt);
+        for phrase in phrases {
+            assert!(prompt.handle_paste(phrase));
+        }
         assert_eq!(
             prompt.handle_key(key(KeyCode::Enter)).unwrap().answer,
             frozen
@@ -1816,7 +1937,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn display_names_and_option_guards_are_human_without_raw_context_ids() {
+    fn display_names_and_option_conditions_are_human_without_raw_context_ids() {
         let mut prompt = suggested_prompt();
         inspect(&mut prompt);
         let body = prompt
@@ -1827,7 +1948,7 @@ pub(super) mod tests {
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(body.contains("Option-looking values: rejected (fixed guard)."));
+        assert!(body.contains(REFUSED_OPTIONS));
         for hidden in [
             OPTION_ID,
             "opaque-fixture-binding",

@@ -13,8 +13,21 @@ use super::view::{ScopeControl, ScopeView, tuple_rows};
 use crate::theme::Theme;
 
 pub(crate) const PATTERN_CHIP_ROWS: u16 = 3;
+pub(crate) const EVIDENCE_LABEL: &str = "Seen before (for reference): ";
+pub(crate) const INDEPENDENT_VALUES: &str = "Any combination, including new ones";
+pub(crate) const REFUSED_OPTIONS: &str = "Values that look like options are refused.";
+const DATA_OPTIONS: &str = "Values that look like options are allowed only where data is expected.";
+pub(crate) const SAME_VALUE: &str = "A ◆ value that appears twice must be the same in both places.";
 const FIELD_LABEL_WIDTH: u16 = 20;
 const FIELD_HEADER_ROWS: u16 = 1;
+
+/// How a slot treats values that start with a dash.
+pub(crate) fn option_values(policy: &OptionLikePolicy) -> &'static str {
+    match policy {
+        OptionLikePolicy::Reject => REFUSED_OPTIONS,
+        OptionLikePolicy::AllowForProvenData => DATA_OPTIONS,
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PatternControl {
@@ -55,9 +68,9 @@ impl PatternPanel {
             fields.extend([
                 PatternField {
                     control: PatternControl::Slot,
-                    label: "Slot (Up/Down)",
+                    label: "Slot (↑↓)",
                     value: format!(
-                        "{} / {} · ◆{}",
+                        "{} of {} · ◆{}",
                         self.slot + 1,
                         self.definition.slots.len(),
                         slot.id.0
@@ -70,23 +83,22 @@ impl PatternPanel {
                 },
                 PatternField {
                     control: PatternControl::Mode,
-                    label: "Match (Left/Right)",
+                    label: "Match (←→)",
                     value: domain_name(&slot.domain).into(),
                 },
                 PatternField {
                     control: PatternControl::Constraint,
-                    label: "Constraint (e)",
+                    label: "Value (e)",
                     value: match &slot.domain {
-                        ArgumentDomain::ObservedSet { values } => format!(
-                            "{} allowed values · inspect supplied values below",
-                            values.len()
-                        ),
+                        ArgumentDomain::ObservedSet { values } => {
+                            format!("{} allowed · o lists the values seen", values.len())
+                        }
                         ArgumentDomain::Exact { value } => literal(value),
                         ArgumentDomain::Glob { pattern } | ArgumentDomain::Regex { pattern } => {
                             literal(pattern)
                         }
                         ArgumentDomain::AnyLiteralArgument => {
-                            "One literal argument, not command syntax".into()
+                            "Any one argument, taken literally".into()
                         }
                     },
                 },
@@ -96,20 +108,17 @@ impl PatternPanel {
             control: PatternControl::Combinations,
             label: "Combinations (c)",
             value: match &self.definition.combinations {
-                SlotCombinations::ObservedTuples { tuples } => format!(
-                    "LISTED · {} allowed tuples · ANY OF rows / ALL OF cells",
-                    tuples.len()
-                ),
-                SlotCombinations::Independent => {
-                    "INDEPENDENT · new cross-products permitted".into()
+                SlotCombinations::ObservedTuples { tuples } => {
+                    format!("Only the {} combinations seen before", tuples.len())
                 }
+                SlotCombinations::Independent => INDEPENDENT_VALUES.into(),
             },
         });
         fields.push(PatternField {
             control: PatternControl::Observations,
-            label: "Supplied values (o)",
+            label: "Values seen (o)",
             value: format!(
-                "[{}] {} values · evidence is not editable authority",
+                "[{}] {} values",
                 if self.show_values { "-" } else { "+" },
                 self.supplied.len()
             ),
@@ -139,26 +148,22 @@ impl PatternPanel {
     pub(crate) fn details(&self, theme: &Theme) -> Vec<Line<'static>> {
         let mut details = Vec::new();
         if let Some(slot) = self.definition.slots.get(self.slot) {
-            details.push(Line::styled(match slot.option_like { OptionLikePolicy::Reject => "Option-looking values: rejected (fixed guard).", OptionLikePolicy::AllowForProvenData => "Option-looking values: allowed only at proven data positions (fixed guard)." }, theme.item_desc));
             details.push(Line::styled(
-                "Repeated ◆IDs require equal arguments; roles and eligibility are host-derived.",
+                option_values(&slot.option_like),
                 theme.item_desc,
             ));
+            details.push(Line::styled(SAME_VALUE, theme.item_desc));
         }
         if self.show_values {
             details.extend(tuple_rows(&self.definition));
-            details.push(Line::styled(
-                "Supplied proposal values are not a historical support count.",
-                theme.item_desc,
-            ));
             details.push(Line::from(format!(
-                "Proposal evidence: {}",
+                "{EVIDENCE_LABEL}{}",
                 safe(&self.evidence)
             )));
             details.extend(
                 self.supplied
                     .iter()
-                    .map(|value| Line::from(format!("Supplied: {}", literal(value)))),
+                    .map(|value| Line::from(format!("Seen: {}", literal(value)))),
             );
         }
         details
@@ -223,7 +228,7 @@ impl PatternPanel {
         );
         y += chips.height;
         if y < area.bottom() {
-            Paragraph::new("Argument / property     Match and allowed constraint")
+            Paragraph::new("Field               Setting")
                 .style(theme.panel_title)
                 .render(
                     Rect {
@@ -301,6 +306,7 @@ mod tests {
     use super::{PatternControl, PatternPanel};
     use crate::components::buffer_text;
     use crate::components::permission_scope::tests::template;
+    use crate::components::permission_scope::view::ALLOWED_COMBINATIONS;
     use crate::theme;
 
     const WIDTH: u16 = 80;
@@ -388,8 +394,7 @@ mod tests {
             .join("\n");
         assert_eq!(text.contains(TUPLE_PATH), disclosed);
         assert_eq!(text.contains(EVIDENCE), disclosed);
-        assert_eq!(text.contains("ANY OF"), disclosed);
-        assert_eq!(text.contains("ALL OF"), disclosed);
+        assert_eq!(text.contains(ALLOWED_COMBINATIONS), disclosed);
         assert_eq!(panel.definition, original);
     }
 }

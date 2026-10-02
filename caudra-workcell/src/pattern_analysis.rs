@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, path::Path};
 
 use caudra_agent::permissions::{
-    canonical_json_sha256,
+    ScriptLanguage, ShellOpacity, canonical_json_sha256,
     pattern_recognition::{
         CommandObservation, InvocationOutcome, OBSERVATION_SCHEMA_VERSION, ObservationProvenance,
         ObservationSource, ObservationVerification, ShellEffectStatus,
@@ -14,12 +14,12 @@ use workcell::shell::{
     ShellCommandScope, ShellWord,
     bash::{
         BashCommand, BashCommandContext, BashCommandContexts, BashCoverageKind, BashCwdSet,
-        BashDiagnosticKind, BashParseError, BashProgram, BashRedirect, BashRedirectKind,
-        parse_bash,
+        BashDiagnosticKind, BashNodeKind, BashParseError, BashProgram, BashRedirect,
+        BashRedirectKind, BashRegionCommand, parse_bash,
     },
 };
 
-use crate::read_only_shell::decimal;
+use crate::read_only_shell::{decimal, name_lookup};
 
 pub use caudra_agent::permissions::COMMAND_OBSERVATION_ATTRIBUTE;
 pub use workcell::shell::bash::{
@@ -32,9 +32,58 @@ const ANALYSIS_VERSION: &str = "caudra-shell-patterns/v1";
 const PREPARED_SOURCE: &str = "prepared-shell";
 const IMPORTED_SOURCE: &str = "imported-shell";
 const NULL_DEVICE: &str = "/dev/null";
-const OPAQUE_WRAPPERS: &[&str] = &[
-    "command", "builtin", "env", "sudo", "doas", "su", "xargs", "eval", "source", ".", "bash",
-    "sh", "time", "coproc",
+const SOURCE_DOT: &str = ".";
+const END_OF_OPTIONS: &str = "--";
+const PRIVILEGED_EXECUTABLES: &[&str] = &["sudo", "doas", "su"];
+const INDIRECT_EXECUTABLES: &[&str] = &["eval", "source", SOURCE_DOT];
+/// Shells whose `-c` code is Bash, so Workcell's parser reads it faithfully.
+const PARSED_SHELLS: &[&str] = &["bash", "sh"];
+const WRAPPERS: &[&str] = &["command", "builtin", "env", "xargs", "time", "coproc"];
+const SHELL_CODE_FLAG: char = 'c';
+const SHELL_VALUE_OPTIONS: &[&str] = &["--rcfile", "--init-file"];
+const SHELL_VALUE_FLAGS: [char; 2] = ['o', 'O'];
+const SHELL_OPTION_PREFIXES: [char; 2] = ['-', '+'];
+const STDIN_OPERAND: &str = "-";
+const MAX_SHELL_NESTING: usize = 2;
+const INLINE_SHELL: ShellOpacity = ShellOpacity::InlineScript {
+    language: ScriptLanguage::Shell,
+};
+/// Interpreters that take code inline, the language of that code, and the
+/// one-letter flags that carry it, keyed by the name `versioned_interpreter`
+/// resolves to. Bash and sh are absent: their code is parsed, not named.
+const SCRIPT_LANGUAGES: &[(&str, ScriptLanguage, &str)] = &[
+    ("ash", ScriptLanguage::Shell, "c"),
+    ("dash", ScriptLanguage::Shell, "c"),
+    ("ksh", ScriptLanguage::Shell, "c"),
+    ("zsh", ScriptLanguage::Shell, "c"),
+    ("python", ScriptLanguage::Python, "c"),
+    ("pypy", ScriptLanguage::Python, "c"),
+    ("ipython", ScriptLanguage::Python, "c"),
+    ("jython", ScriptLanguage::Python, "c"),
+    ("micropython", ScriptLanguage::Python, "c"),
+    ("node", ScriptLanguage::JavaScript, "ep"),
+    ("nodejs", ScriptLanguage::JavaScript, "ep"),
+    ("bun", ScriptLanguage::JavaScript, "ep"),
+    ("ruby", ScriptLanguage::Ruby, "e"),
+    ("perl", ScriptLanguage::Perl, "eE"),
+    ("php", ScriptLanguage::Php, "r"),
+    ("lua", ScriptLanguage::Lua, "e"),
+    ("luajit", ScriptLanguage::Lua, "e"),
+];
+const INLINE_CODE_OPTIONS: &[&str] = &["--eval", "--print"];
+/// Constructs the parser leaves unlowered that an engine may screen, because
+/// Workcell lists every command inside them, and the cause each stands for.
+/// Any other construct leaves the line unparsed.
+const SCREENABLE_REGIONS: &[(&str, ShellOpacity)] = &[
+    ("for_statement", ShellOpacity::ControlFlow),
+    ("c_style_for_statement", ShellOpacity::ControlFlow),
+    ("while_statement", ShellOpacity::ControlFlow),
+    ("if_statement", ShellOpacity::ControlFlow),
+    ("case_statement", ShellOpacity::ControlFlow),
+    ("function_definition", ShellOpacity::ControlFlow),
+    ("command_substitution", ShellOpacity::Dynamic),
+    ("process_substitution", ShellOpacity::Dynamic),
+    ("arithmetic_expansion", ShellOpacity::Dynamic),
 ];
 const PAYLOAD_EXECUTABLES: &[&str] = &[
     "cd",
@@ -302,7 +351,7 @@ pub fn analyze_pattern_calls(
         omission_counts: BTreeMap::new(),
         omissions: Vec::new(),
         omissions_truncated: 0,
-        obligations: source_obligations(&program, &contexts, facts.opaque()),
+        obligations: source_obligations(&program, &contexts, facts.opaque),
     };
     let mut observations = Vec::new();
     for span in spans {
@@ -319,13 +368,13 @@ pub fn analyze_pattern_calls(
                 )
             });
         match result {
-            Ok(observation) if !facts.opaque() => observations.push(observation),
+            Ok(observation) if !facts.opaque => observations.push(observation),
             Ok(_) => diagnostics.omit(span, PatternOmissionReason::ExactSourceRequired),
             Err(reason) => diagnostics.omit(span, reason),
         }
     }
     diagnostics.observed_command_count = observations.len();
-    let requires_exact_source = facts.opaque();
+    let requires_exact_source = facts.opaque;
     Ok(PatternCallAnalysis {
         observations,
         contexts,
@@ -402,19 +451,20 @@ pub(crate) struct CommandFacts<'a> {
 
 pub(crate) struct ShellFacts<'a> {
     pub commands: Vec<CommandFacts<'a>>,
+    /// Why approving the line's commands one by one does not cover it, the
+    /// most severe cause found, or `None` when it does.
+    pub opacity: Option<ShellOpacity>,
+    /// Whether `commands` falls short of what the line runs, so it cannot be
+    /// learned or templated command by command. Code handed inline to an
+    /// interpreter does not count here: the interpreter is still a command a
+    /// rule can name, as it is when the same code sits in a file.
+    pub opaque: bool,
     /// Part of the line is beyond the analysis: syntax it does not model, a
-    /// command it cannot scope or place, a wrapper, or a word, assignment or
-    /// redirect it cannot read.
+    /// command it cannot scope or place, a wrapper, or a word, assignment,
+    /// redirect, heredoc or here-string it cannot read. Unlike `opaque`, a
+    /// redirect to a file it can name, or fixed text a heredoc or here-string
+    /// feeds, leaves the line accounted for.
     pub unaccounted: bool,
-    /// A redirect opens a file, which no command scope shows.
-    pub redirects_to_files: bool,
-}
-
-impl ShellFacts<'_> {
-    /// Whether the reviewed commands describe less than the line does.
-    pub fn opaque(&self) -> bool {
-        self.unaccounted || self.redirects_to_files
-    }
 }
 
 /// What a redirect reaches beyond the descriptors the command already holds.
@@ -438,27 +488,34 @@ pub(crate) fn shell_facts<'a>(
         .map(|context| (context.command.0, context))
         .collect();
     let mut commands = Vec::new();
+    let regions = region_opacity(program);
+    let mut opaque_cause = line_opacity(program, contexts, regions);
+    let mut inline_code = None;
     let mut unaccounted = !program.is_complete() || !contexts.complete;
-    let mut redirects_to_files = false;
     for (id, command) in program.commands() {
+        let words = literal_words(command);
+        let cause = command_opacity(&words, 0).max(fed_shell(command, &words));
+        inline_code = inline_code
+            .max(inline_script(&words))
+            .max(fed_script(command, &words));
         let Some(scope) = command_scope(program, command) else {
+            opaque_cause = opaque_cause.max(cause.or(Some(ShellOpacity::Unparsed)));
             unaccounted = true;
             continue;
         };
         let context = contexts_by_node.get(&id.0).copied();
-        unaccounted |= context.is_none_or(|context| {
-            !context.complete
-                || !matches!(&context.incoming, BashCwdSet::Known(paths) if !paths.is_empty())
-        }) || command.static_argv().is_none()
-            || !command.assignments.is_empty()
-            || OPAQUE_WRAPPERS.contains(&scope.executable.as_str());
-        for redirect in &command.redirects {
-            match redirect_effect(program, redirect) {
-                RedirectEffect::Inert => {}
-                RedirectEffect::Reads(_) | RedirectEffect::Writes(_) => redirects_to_files = true,
-                RedirectEffect::Unknown => unaccounted = true,
-            }
-        }
+        let workdir = workdir_opacity(context);
+        unaccounted |= cause.is_some()
+            || workdir.is_some()
+            || unfixed_values(command)
+            || command
+                .redirects
+                .iter()
+                .any(|redirect| redirect_effect(program, redirect) == RedirectEffect::Unknown);
+        opaque_cause = opaque_cause
+            .max(cause)
+            .max(workdir)
+            .max(effect_opacity(program, command));
         commands.push(CommandFacts {
             span: &program.nodes()[id.0].span,
             command,
@@ -467,12 +524,336 @@ pub(crate) fn shell_facts<'a>(
         });
     }
     commands.sort_by_key(|command| command.span.start);
+    let represented = program.commands().count();
+    if represented == 0 && regions.is_none() || represented != contexts_by_node.len() {
+        opaque_cause = Some(ShellOpacity::Unparsed);
+    }
     unaccounted |= commands.is_empty() || commands.len() != contexts_by_node.len();
     ShellFacts {
         commands,
+        opacity: opaque_cause.max(inline_code),
+        opaque: opaque_cause.is_some(),
         unaccounted,
-        redirects_to_files,
     }
+}
+
+/// Causes that belong to the line rather than to one command: a parse that did
+/// not finish, unless only regions an engine can screen stopped it, and
+/// whatever the cwd analysis could not follow. A state change it could not
+/// model leaves the cwd computed, except a name lookup's, which changes
+/// nothing. A screenable region's own cause already accounts for the cwd it
+/// leaves behind.
+fn line_opacity(
+    program: &BashProgram,
+    contexts: &BashCommandContexts,
+    regions: Option<ShellOpacity>,
+) -> Option<ShellOpacity> {
+    if !program.is_complete() && regions.is_none() {
+        return Some(ShellOpacity::Unparsed);
+    }
+    contexts
+        .diagnostics
+        .iter()
+        .map(|diagnostic| {
+            let structure = program
+                .nodes()
+                .get(diagnostic.node.0)
+                .map(|node| &node.structure);
+            match (&diagnostic.issue, structure) {
+                (BashContextIssue::IncompleteProgram, _)
+                | (BashContextIssue::UnknownStateEffect, Some(BashNodeKind::Unknown { .. }))
+                    if regions.is_some() =>
+                {
+                    None
+                }
+                (BashContextIssue::UnknownStateEffect, Some(BashNodeKind::Command { command }))
+                    if looks_up_names(&literal_words(command)) =>
+                {
+                    None
+                }
+                (
+                    BashContextIssue::UnknownStateEffect,
+                    Some(BashNodeKind::Command { .. } | BashNodeKind::Assignments { .. }),
+                ) => Some(ShellOpacity::Dynamic),
+                _ => Some(ShellOpacity::Unparsed),
+            }
+        })
+        .max()
+        .flatten()
+        .max(regions)
+}
+
+/// The cause the regions the parser left unlowered stand for, when each is a
+/// construct an engine can screen and Workcell listed every command inside:
+/// the construct's own cause, or what a command inside runs when that is worse.
+/// `None` when nothing was left unlowered, or anything else left the line
+/// incomplete.
+fn region_opacity(program: &BashProgram) -> Option<ShellOpacity> {
+    let inventory = program.region_inventory();
+    if !inventory.complete {
+        return None;
+    }
+    let constructs = program
+        .diagnostics()
+        .iter()
+        .map(|diagnostic| match &diagnostic.kind {
+            BashDiagnosticKind::UnsupportedSyntax(kind) => SCREENABLE_REGIONS
+                .iter()
+                .find(|(construct, _)| construct == kind)
+                .map(|&(_, cause)| cause),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    constructs
+        .into_iter()
+        .map(Some)
+        .chain(inventory.commands.iter().map(region_command_opacity))
+        .max()
+        .flatten()
+}
+
+/// What a command inside an unlowered region runs. Its words are listed only
+/// when all are literal; otherwise one unknown word stands for the rest, which
+/// a wrapper or a shell reads as an unknown command.
+fn region_command_opacity(command: &BashRegionCommand) -> Option<ShellOpacity> {
+    let Some(executable) = command.executable.as_deref() else {
+        return Some(ShellOpacity::Unparsed);
+    };
+    match &command.argv {
+        Some(argv) => {
+            let words: Vec<_> = argv.iter().map(|word| Some(word.as_str())).collect();
+            command_opacity(&words, 0).max(inline_script(&words))
+        }
+        None => command_opacity(&[Some(executable), None], 0).max(Some(ShellOpacity::Dynamic)),
+    }
+}
+
+/// A command runs where the analysis says, somewhere a state change before it
+/// made unknowable, or, with no context at all, somewhere nobody looked.
+fn workdir_opacity(context: Option<&BashCommandContext>) -> Option<ShellOpacity> {
+    match context {
+        Some(BashCommandContext {
+            complete: true,
+            incoming: BashCwdSet::Known(paths),
+            ..
+        }) if !paths.is_empty() => None,
+        Some(BashCommandContext {
+            incoming: BashCwdSet::Unknown,
+            ..
+        }) => Some(ShellOpacity::Dynamic),
+        _ => Some(ShellOpacity::Unparsed),
+    }
+}
+
+/// Words, assignments, and heredoc or here-string text whose values the text
+/// does not fix, and redirects to anything but a descriptor or the null device.
+/// A heredoc or here-string is a redirect too: no rule's argv sees the text it
+/// feeds, which a program like `psql` runs.
+fn effect_opacity(program: &BashProgram, command: &BashCommand) -> Option<ShellOpacity> {
+    let dynamic = unfixed_values(command).then_some(ShellOpacity::Dynamic);
+    let redirect = (!command.payloads.is_empty()
+        || command
+            .redirects
+            .iter()
+            .any(|redirect| redirect_effect(program, redirect) != RedirectEffect::Inert))
+    .then_some(ShellOpacity::Redirect);
+    dynamic.max(redirect)
+}
+
+/// Whether a word, an assignment, or the text of a heredoc or here-string can
+/// take a value the source does not spell out. An unquoted heredoc can still
+/// run code without a substitution, as `${prompt@P}` does.
+fn unfixed_values(command: &BashCommand) -> bool {
+    command.static_argv().is_none()
+        || !command.assignments.is_empty()
+        || command
+            .payloads
+            .iter()
+            .any(|payload| payload.literal.is_none())
+}
+
+/// What running `words` hands to code the line does not show, `depth` shells
+/// deep. An executable that is not literal could be anything.
+fn command_opacity(words: &[Option<&str>], depth: usize) -> Option<ShellOpacity> {
+    let Some(executable) = executable_name(words) else {
+        return Some(ShellOpacity::Unparsed);
+    };
+    if PRIVILEGED_EXECUTABLES.contains(&executable) {
+        Some(ShellOpacity::Privilege)
+    } else if INDIRECT_EXECUTABLES.contains(&executable) {
+        Some(ShellOpacity::Indirect)
+    } else if PARSED_SHELLS.contains(&executable) {
+        Some(shell_opacity(words, depth))
+    } else if WRAPPERS.contains(&executable) && !looks_up_names(words) {
+        (1..words.len())
+            .map(|start| wrapped_opacity(&words[start..], depth))
+            .max()
+            .flatten()
+            .max(Some(ShellOpacity::Wrapper))
+    } else {
+        None
+    }
+}
+
+/// Any word a wrapper passes on may be the command it runs, so each is read as
+/// one, and a word that is not literal could be any command. `.` is skipped:
+/// handed to a wrapper it is far more often a directory than a script. Later
+/// wrappers are skipped too, because this scan already reads their words.
+fn wrapped_opacity(words: &[Option<&str>], depth: usize) -> Option<ShellOpacity> {
+    if words.first().is_some_and(Option::is_none) {
+        return Some(ShellOpacity::Unparsed);
+    }
+    executable_name(words)
+        .filter(|name| *name != SOURCE_DOT && !WRAPPERS.contains(name))
+        .and_then(|_| command_opacity(words, depth).max(inline_script(words)))
+}
+
+/// Bash or sh. Code given with `-c` is parsed for the causes that always ask;
+/// without `-c` the shell runs a script file, or whatever arrives on stdin.
+fn shell_opacity(words: &[Option<&str>], depth: usize) -> ShellOpacity {
+    let mut takes_code = false;
+    let mut arguments = words.iter().skip(1).copied();
+    let operand = loop {
+        let Some(word) = arguments.next() else {
+            break None;
+        };
+        let Some(option) = word.filter(|word| word.starts_with(SHELL_OPTION_PREFIXES)) else {
+            break Some(word);
+        };
+        if option == END_OF_OPTIONS || option == STDIN_OPERAND {
+            break arguments.next();
+        }
+        if let Some(cluster) = option
+            .strip_prefix(SHELL_OPTION_PREFIXES)
+            .filter(|cluster| !cluster.starts_with(SHELL_OPTION_PREFIXES))
+        {
+            takes_code |= option.starts_with('-') && cluster.contains(SHELL_CODE_FLAG);
+            if cluster.ends_with(SHELL_VALUE_FLAGS) {
+                arguments.next();
+            }
+        } else if SHELL_VALUE_OPTIONS.contains(&option) {
+            arguments.next();
+        }
+    };
+    match operand {
+        Some(Some(code)) if takes_code => script_opacity(code, depth),
+        Some(None) => ShellOpacity::Unparsed,
+        None if takes_code => ShellOpacity::Unparsed,
+        _ => ShellOpacity::Wrapper,
+    }
+}
+
+/// Literal shell code, parsed only for the causes that always ask, since every
+/// other cause ranks below the script itself. Code that does not parse
+/// completely, or sits more than `MAX_SHELL_NESTING` shells deep, is unparsed.
+fn script_opacity(code: &str, depth: usize) -> ShellOpacity {
+    let depth = depth + 1;
+    if depth > MAX_SHELL_NESTING {
+        return ShellOpacity::Unparsed;
+    }
+    let Some(program) = parse_bash(code).ok().filter(BashProgram::is_complete) else {
+        return ShellOpacity::Unparsed;
+    };
+    program
+        .commands()
+        .filter_map(|(_, command)| command_opacity(&literal_words(command), depth))
+        .filter(|cause| !cause.screenable())
+        .max()
+        .unwrap_or(INLINE_SHELL)
+}
+
+/// Bash or sh reading its script from a heredoc or here-string, parsed like
+/// `-c` code. Text with expansions in it could be any script.
+fn fed_shell(command: &BashCommand, words: &[Option<&str>]) -> Option<ShellOpacity> {
+    executable_name(words).filter(|name| PARSED_SHELLS.contains(name))?;
+    command
+        .payloads
+        .iter()
+        .map(|payload| {
+            payload
+                .literal
+                .as_deref()
+                .map_or(ShellOpacity::Unparsed, |code| script_opacity(code, 0))
+        })
+        .max()
+}
+
+/// An interpreter handed a heredoc or here-string, which it reads as its
+/// program unless a file operand names another.
+fn fed_script(command: &BashCommand, words: &[Option<&str>]) -> Option<ShellOpacity> {
+    if command.payloads.is_empty() {
+        return None;
+    }
+    script_language(words).map(|(language, _)| ShellOpacity::InlineScript { language })
+}
+
+/// The language an interpreter runs and the one-letter flags that carry its
+/// code inline.
+fn script_language(words: &[Option<&str>]) -> Option<(ScriptLanguage, &'static str)> {
+    let name = executable_name(words)?;
+    let name = versioned_interpreter(name).unwrap_or(name);
+    SCRIPT_LANGUAGES
+        .iter()
+        .find(|(interpreter, ..)| *interpreter == name)
+        .map(|&(_, language, flags)| (language, flags))
+}
+
+/// Code an interpreter is handed in its arguments: a code flag among the
+/// options before its first operand.
+fn inline_script(words: &[Option<&str>]) -> Option<ShellOpacity> {
+    let (language, flags) = script_language(words)?;
+    words
+        .iter()
+        .skip(1)
+        .copied()
+        .map_while(|word| word.filter(|word| word.starts_with('-') && *word != END_OF_OPTIONS))
+        .any(|option| {
+            INLINE_CODE_OPTIONS.contains(&option.split_once('=').map_or(option, |(flag, _)| flag))
+                || option.strip_prefix('-').is_some_and(|cluster| {
+                    !cluster.starts_with('-') && cluster.ends_with(|flag| flags.contains(flag))
+                })
+        })
+        .then_some(ShellOpacity::InlineScript { language })
+}
+
+fn looks_up_names(words: &[Option<&str>]) -> bool {
+    let Some((_, arguments)) = words.split_first() else {
+        return false;
+    };
+    let arguments: Option<Vec<&str>> = arguments.iter().copied().collect();
+    executable_name(words)
+        .zip(arguments)
+        .is_some_and(|(executable, arguments)| name_lookup(executable, &arguments))
+}
+
+fn literal_words(command: &BashCommand) -> Vec<Option<&str>> {
+    command
+        .words
+        .iter()
+        .map(|word| word.literal.as_deref())
+        .collect()
+}
+
+/// The name a literal executable runs by, `.` included.
+fn executable_name<'a>(words: &[Option<&'a str>]) -> Option<&'a str> {
+    let executable = words.first().copied().flatten()?;
+    executable
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+}
+
+/// The interpreter a name runs, reading `python3` and `python3.12` as `python`.
+pub(crate) fn versioned_interpreter(name: &str) -> Option<&'static str> {
+    VERSIONED_INTERPRETERS.iter().copied().find(|interpreter| {
+        name.strip_prefix(interpreter).is_some_and(|version| {
+            version.is_empty()
+                || version.starts_with(|character: char| character.is_ascii_digit())
+                    && version
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || byte == b'.')
+        })
+    })
 }
 
 fn command_scope(program: &BashProgram, command: &BashCommand) -> Option<ShellCommandScope> {
@@ -594,7 +975,7 @@ fn checked_command_observation(
     if !facts.command.assignments.is_empty() {
         return Err(PatternOmissionReason::ShellAssignments);
     }
-    if !facts.command.redirects.is_empty() {
+    if !facts.command.redirects.is_empty() || !facts.command.payloads.is_empty() {
         return Err(PatternOmissionReason::ShellRedirects);
     }
     let argv = facts
@@ -688,19 +1069,19 @@ fn check_executable(argv: &[&str], scope: &ShellCommandScope) -> Result<(), Patt
     if scope.source != scope.normalized {
         return Err(PatternOmissionReason::ExecutableIdentity);
     }
-    if OPAQUE_WRAPPERS.contains(&name) {
+    if [
+        PRIVILEGED_EXECUTABLES,
+        INDIRECT_EXECUTABLES,
+        PARSED_SHELLS,
+        WRAPPERS,
+    ]
+    .iter()
+    .any(|names| names.contains(&name))
+    {
         return Err(PatternOmissionReason::OpaqueWrapper);
     }
     if PAYLOAD_EXECUTABLES.contains(&name)
-        || VERSIONED_INTERPRETERS.iter().any(|interpreter| {
-            name.strip_prefix(*interpreter).is_some_and(|version| {
-                version.is_empty()
-                    || version.starts_with(|character: char| character.is_ascii_digit())
-                        && version
-                            .bytes()
-                            .all(|byte| byte.is_ascii_digit() || byte == b'.')
-            })
-        })
+        || versioned_interpreter(name).is_some()
         || Path::new(name)
             .extension()
             .and_then(|extension| extension.to_str())
@@ -796,18 +1177,22 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        BashContextAssumptions, BashContextIssue, BashOperatorKind, BashSpan,
+        BashContextAssumptions, BashContextIssue, BashOperatorKind, BashSpan, INLINE_SHELL,
         MAX_PATTERN_DIAGNOSTIC_DETAILS, PatternCommandOmission, PatternObligationKind,
-        PatternOmissionReason, PatternSourceObligations, analyze_pattern_calls, argument_roles,
-        command_observation, parse_bash, shell_facts,
+        PatternOmissionReason, PatternSourceObligations, ScriptLanguage, ShellOpacity,
+        analyze_pattern_calls, argument_roles, command_observation, parse_bash, shell_facts,
     };
 
+    const INLINE_PYTHON: ShellOpacity = ShellOpacity::InlineScript {
+        language: ScriptLanguage::Python,
+    };
     const HISTORICAL_ROOT: &str = "/nonexistent/historical-project";
     const ANALYSIS_EXPECTED: &str = "analysis";
     const SERIALIZATION_EXPECTED: &str = "serialized diagnostics";
     const COMMAND_SPAN_EXPECTED: &str = "fixture command span";
     const STATIC_COMMAND: &str = "cargo check -p core";
     const PAYLOAD_COMMAND: &str = "python3 -c 'print(1)'";
+    const INTERPRETER_SIBLING: &str = "cargo check && python3 -c 'print(1)'";
     const DIAGNOSTIC_OVERFLOW: usize = 3;
 
     fn assumptions() -> BashContextAssumptions {
@@ -918,7 +1303,7 @@ mod tests {
         let native_count = facts
             .commands
             .iter()
-            .filter(|_| !facts.opaque())
+            .filter(|_| !facts.opaque)
             .filter_map(|command| {
                 command_observation(&program, command, root, root, ObservationProvenance::Native)
             })
@@ -1111,28 +1496,44 @@ mod tests {
         assert!(!serialized.contains(HISTORICAL_ROOT));
     }
 
-    #[test_case("python3 - <<'PY'\nprint(1)\nPY\n", PatternObligationKind::SourceGap, true; "heredoc_source_gap")]
-    #[test_case("python3 <<'PY'\nprint(1)\nPY\n", PatternObligationKind::UnsupportedSyntax, true; "heredoc_unsupported")]
-    #[test_case("cargo check -p $(echo core)", PatternObligationKind::UnsupportedSyntax, false; "substitution")]
-    fn incomplete_ir_counts_are_not_whole_source_coverage(
-        source: &str,
-        kind: PatternObligationKind,
-        payload: bool,
-    ) {
+    #[test]
+    fn incomplete_ir_counts_are_not_whole_source_coverage() {
         let root = Path::new(HISTORICAL_ROOT);
         let result =
-            analyze_pattern_calls(source, root, root, assumptions()).expect(ANALYSIS_EXPECTED);
+            analyze_pattern_calls("cargo check -p $(echo core)", root, root, assumptions())
+                .expect(ANALYSIS_EXPECTED);
         assert!(result.requires_exact_source);
         assert!(result.observations.is_empty());
         assert_eq!(result.diagnostics.represented_command_count, 0);
         assert!(result.diagnostics.omissions.is_empty());
         let obligations = result.diagnostics.obligations;
         assert!(!obligations.source_coverage_complete);
-        assert!(obligation_count(&obligations, kind) > 0);
+        assert!(obligation_count(&obligations, PatternObligationKind::UnsupportedSyntax) > 0);
         assert!(obligation_count(&obligations, PatternObligationKind::UnknownSource) > 0);
         assert_eq!(
-            obligation_count(&obligations, PatternObligationKind::Payload) > 0,
-            payload
+            obligation_count(&obligations, PatternObligationKind::Payload),
+            0
+        );
+    }
+
+    /// A heredoc lowers to a command with its text attached, so the source is
+    /// covered, yet no rule's argv sees that text, so it is never learned.
+    #[test_case("python3 - <<'PY'\nprint(1)\nPY\n"; "interpreter_code")]
+    #[test_case("python3 <<'PY'\nprint(1)\nPY\n"; "interpreter_code_without_an_operand")]
+    #[test_case("cat <<'EOF'\nnotes\nEOF\n"; "data")]
+    fn heredoc_commands_are_covered_but_never_learned(source: &str) {
+        let root = Path::new(HISTORICAL_ROOT);
+        let result =
+            analyze_pattern_calls(source, root, root, assumptions()).expect(ANALYSIS_EXPECTED);
+        assert!(result.requires_exact_source);
+        assert!(result.observations.is_empty());
+        assert_eq!(result.diagnostics.represented_command_count, 1);
+        let obligations = result.diagnostics.obligations;
+        assert!(obligations.source_coverage_complete);
+        assert!(obligation_count(&obligations, PatternObligationKind::Payload) > 0);
+        assert_eq!(
+            obligation_count(&obligations, PatternObligationKind::UnknownSource),
+            0
         );
     }
 
@@ -1140,7 +1541,7 @@ mod tests {
     #[test_case("rg -n authentication_alpha fixture_alpha", "rg -n authentication_bravo fixture_bravo"; "sensitive_arguments")]
     #[test_case("/private/alpha/cargo check", "/private/bravo/cargo check"; "executable_paths")]
     #[test_case("cargo check >alpha", "cargo check >bravo"; "redirect_targets")]
-    #[test_case("python3 - <<'ALPHA'\nprint('alpha')\nALPHA\n", "python3 - <<'BRAVO'\nprint('bravo')\nBRAVO\n"; "unsupported_source_and_payload")]
+    #[test_case("python3 - <<'ALPHA'\nprint('alpha')\nALPHA\n", "python3 - <<'BRAVO'\nprint('bravo')\nBRAVO\n"; "heredoc_payload")]
     fn diagnostic_serialization_contains_no_source_literals(first: &str, second: &str) {
         let first_root = Path::new("/private/alpha");
         let second_root = Path::new("/private/bravo");
@@ -1207,5 +1608,107 @@ mod tests {
         roles: Vec<ArgumentRole>,
     ) {
         assert_eq!(argument_roles(argv), roles);
+    }
+
+    #[test_case(STATIC_COMMAND, None; "a_reviewable_command")]
+    #[test_case("command -v rg", None; "a_command_lookup")]
+    #[test_case("type -t rg", None; "a_type_lookup")]
+    #[test_case("git status > status.txt", Some(ShellOpacity::Redirect); "a_file_redirect")]
+    #[test_case("cat $HOME/notes", Some(ShellOpacity::Dynamic); "an_expansion")]
+    #[test_case("MODE=debug cargo check", Some(ShellOpacity::Dynamic); "an_assignment")]
+    #[test_case("cd - && ls", Some(ShellOpacity::Dynamic); "a_computed_directory")]
+    #[test_case("git status > status.txt; MODE=debug cargo check", Some(ShellOpacity::Dynamic); "dynamic_outranks_redirect")]
+    #[test_case("env cargo test", Some(ShellOpacity::Wrapper); "an_environment_wrapper")]
+    #[test_case("command git status", Some(ShellOpacity::Wrapper); "a_command_wrapper")]
+    #[test_case("bash scripts/build.sh", Some(ShellOpacity::Wrapper); "a_shell_running_a_file")]
+    #[test_case("xargs rm < files.txt", Some(ShellOpacity::Wrapper); "wrapper_outranks_redirect")]
+    #[test_case(PAYLOAD_COMMAND, Some(INLINE_PYTHON); "interpreter_code")]
+    #[test_case("node -e '1'", Some(ShellOpacity::InlineScript { language: ScriptLanguage::JavaScript }); "javascript_code")]
+    #[test_case(INTERPRETER_SIBLING, Some(INLINE_PYTHON); "interpreter_code_beside_a_command")]
+    #[test_case("python3 -c 'x' > out", Some(INLINE_PYTHON); "inline_script_outranks_redirect")]
+    #[test_case("perl -ne 'print' notes.txt > out.txt", Some(ShellOpacity::InlineScript { language: ScriptLanguage::Perl }); "clustered_interpreter_code")]
+    #[test_case("env python3 -c 'print(1)'", Some(INLINE_PYTHON); "wrapped_interpreter_code")]
+    #[test_case("bash -c 'cargo test'", Some(INLINE_SHELL); "shell_code")]
+    #[test_case("bash -o pipefail -c 'cargo test | tee log'", Some(INLINE_SHELL); "shell_code_after_an_option_value")]
+    #[test_case("bash -c \"bash -c 'ls'\"", Some(INLINE_SHELL); "shell_code_two_shells_deep")]
+    #[test_case("eval cargo test", Some(ShellOpacity::Indirect); "eval")]
+    #[test_case("source env.sh", Some(ShellOpacity::Indirect); "source")]
+    #[test_case(". ./env.sh", Some(ShellOpacity::Indirect); "dot")]
+    #[test_case("command eval ls", Some(ShellOpacity::Indirect); "wrapped_eval")]
+    #[test_case("bash -c 'cargo test'; eval ls", Some(ShellOpacity::Indirect); "indirect_outranks_inline_script")]
+    #[test_case("sudo apt install jq", Some(ShellOpacity::Privilege); "sudo")]
+    #[test_case("doas reboot", Some(ShellOpacity::Privilege); "doas")]
+    #[test_case("su -c ls", Some(ShellOpacity::Privilege); "su")]
+    #[test_case("env sudo ls", Some(ShellOpacity::Privilege); "wrapped_sudo")]
+    #[test_case("xargs -n 1 sudo rm", Some(ShellOpacity::Privilege); "sudo_past_an_option_value")]
+    #[test_case("bash -c 'sudo ls'", Some(ShellOpacity::Privilege); "sudo_in_shell_code")]
+    #[test_case("bash -c \"bash -c 'sudo ls'\"", Some(ShellOpacity::Privilege); "sudo_two_shells_deep")]
+    #[test_case("eval ls; sudo ls", Some(ShellOpacity::Privilege); "privilege_outranks_indirect")]
+    #[test_case("cargo check &&", Some(ShellOpacity::Unparsed); "a_syntax_error")]
+    #[test_case("$EDITOR notes.md", Some(ShellOpacity::Unparsed); "a_dynamic_executable")]
+    #[test_case("env $TOOL --version", Some(ShellOpacity::Unparsed); "a_dynamic_wrapped_word")]
+    #[test_case("cargo build && cargo test 2>&1", None; "a_list_redirect_to_a_descriptor")]
+    #[test_case("cat <<'EOF'\nnotes\nEOF\n", Some(ShellOpacity::Redirect); "heredoc_data")]
+    #[test_case("psql app <<< 'drop table users'", Some(ShellOpacity::Redirect); "here_string_data")]
+    #[test_case("cat <<EOF\n$HOME\nEOF\n", Some(ShellOpacity::Dynamic); "heredoc_data_with_expansions")]
+    #[test_case("cat > notes.md <<'EOF'\nnotes\nEOF\n", Some(ShellOpacity::Redirect); "heredoc_data_written_to_a_file")]
+    #[test_case("python3 - <<'PY'\nprint(1)\nPY\n", Some(INLINE_PYTHON); "heredoc_interpreter_code")]
+    #[test_case("python3 <<< 'print(1)'", Some(INLINE_PYTHON); "here_string_interpreter_code")]
+    #[test_case("bash <<'SH'\ncargo test\nSH\n", Some(INLINE_SHELL); "heredoc_shell_code")]
+    #[test_case("if test -f Cargo.toml; then cargo check; fi", Some(ShellOpacity::ControlFlow); "a_conditional")]
+    #[test_case("for f in a b; do wc -l $f; done", Some(ShellOpacity::Dynamic); "a_loop_over_an_expansion")]
+    #[test_case("echo $(date)", Some(ShellOpacity::Dynamic); "a_substitution")]
+    #[test_case("cat <<EOF\n$(date)\nEOF\n", Some(ShellOpacity::Dynamic); "a_substitution_in_a_heredoc")]
+    #[test_case("for f in a; do eval ls; done", Some(ShellOpacity::Indirect); "eval_in_a_loop")]
+    #[test_case("for f in a b; do sudo rm $f; done", Some(ShellOpacity::Privilege); "sudo_in_a_loop")]
+    #[test_case("echo $(sudo cat /etc/shadow)", Some(ShellOpacity::Privilege); "sudo_in_a_substitution")]
+    #[test_case("bash <<'SH'\nsudo ls\nSH\n", Some(ShellOpacity::Privilege); "sudo_in_heredoc_shell_code")]
+    #[test_case("if true; then $EDITOR notes.md; fi", Some(ShellOpacity::Unparsed); "a_dynamic_executable_in_a_conditional")]
+    #[test_case("[[ -f notes.md ]] && cat notes.md", Some(ShellOpacity::Unparsed); "a_construct_outside_the_screenable_ones")]
+    #[test_case("cat <<EOF\n`id`\nEOF\n", Some(ShellOpacity::Unparsed); "backticks_in_a_heredoc")]
+    #[test_case("bash <<SH\n$SCRIPT\nSH\n", Some(ShellOpacity::Unparsed); "heredoc_shell_code_that_is_not_literal")]
+    #[test_case("bash -c \"$SCRIPT\"", Some(ShellOpacity::Unparsed); "shell_code_that_is_not_literal")]
+    #[test_case("bash -c 'if true; then ls; fi'", Some(ShellOpacity::Unparsed); "shell_code_that_does_not_lower")]
+    #[test_case("bash -c \"bash -c 'bash -c ls'\"", Some(ShellOpacity::Unparsed); "shell_code_three_shells_deep")]
+    #[test_case("sudo ls; $EDITOR notes.md", Some(ShellOpacity::Unparsed); "unparsed_outranks_privilege")]
+    fn opacity_takes_the_most_severe_cause(source: &str, expected: Option<ShellOpacity>) {
+        let program = parse_bash(source).expect(ANALYSIS_EXPECTED);
+        let contexts =
+            program.command_contexts_with_assumptions(Path::new(HISTORICAL_ROOT), assumptions());
+        assert_eq!(shell_facts(&program, &contexts).opacity, expected);
+    }
+
+    /// Every line here asks as a whole. Pattern learning still reads it command
+    /// by command when interpreter code is all that hides, and not when anything
+    /// else does, even a cause that the code outranks.
+    #[test_case(PAYLOAD_COMMAND, false; "interpreter_code")]
+    #[test_case("node -e '1'", false; "javascript_code")]
+    #[test_case(INTERPRETER_SIBLING, false; "interpreter_code_beside_a_command")]
+    #[test_case("python3 -c 'x' > out", true; "a_redirect_under_interpreter_code")]
+    #[test_case("env python3 -c 'print(1)'", true; "wrapped_interpreter_code")]
+    #[test_case("bash -c 'cargo test'", true; "shell_code")]
+    #[test_case("python3 - <<'PY'\nprint(1)\nPY\n", true; "heredoc_interpreter_code")]
+    #[test_case("bash <<'SH'\ncargo test\nSH\n", true; "heredoc_shell_code")]
+    fn only_interpreter_code_leaves_the_commands_learnable(source: &str, opaque: bool) {
+        let program = parse_bash(source).expect(ANALYSIS_EXPECTED);
+        let contexts =
+            program.command_contexts_with_assumptions(Path::new(HISTORICAL_ROOT), assumptions());
+        let facts = shell_facts(&program, &contexts);
+        assert!(facts.opacity.is_some());
+        assert_eq!(facts.opaque, opaque);
+    }
+
+    #[test_case(Path::new(HISTORICAL_ROOT), BashContextAssumptions::default(); "undeclared_assumptions")]
+    #[test_case(Path::new("relative"), assumptions(); "relative_initial_cwd")]
+    fn an_incomplete_command_context_is_unparsed(
+        initial_cwd: &Path,
+        declared: BashContextAssumptions,
+    ) {
+        let program = parse_bash(STATIC_COMMAND).expect(ANALYSIS_EXPECTED);
+        let contexts = program.command_contexts_with_assumptions(initial_cwd, declared);
+        assert_eq!(
+            shell_facts(&program, &contexts).opacity,
+            Some(ShellOpacity::Unparsed)
+        );
     }
 }

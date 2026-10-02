@@ -253,7 +253,8 @@ pub enum PermissionArgumentConstraint {
     Unconstrained,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Ordered by how long a rule lasts, shortest first.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionLifetime {
     Once,

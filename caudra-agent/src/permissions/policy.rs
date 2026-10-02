@@ -12,6 +12,7 @@ use caudra_config::{
     PermissionsConfig, ToolKey,
 };
 use caudra_storage::StateDir;
+use caudra_storage::paths::incremental_canonicalize;
 use caudra_storage::permission_config_trust::{
     is_project_trusted as is_permission_config_trusted, is_remote_asset_trusted,
     revoke_project_trust as revoke_project_permission_config, revoke_remote_asset_trust,
@@ -20,6 +21,7 @@ use caudra_storage::permission_config_trust::{
 use caudra_storage::permission_state::PermissionState;
 use caudra_storage::permission_state::mutation::PermissionOwner;
 use caudra_storage::permission_state::validate_command_templates;
+use caudra_storage::projects::project_document_dirs;
 use caudra_storage::sessions::SESSIONS_DB_FILE;
 use caudra_workspace::ProjectAssetTrustKey;
 use sha2::Digest;
@@ -114,7 +116,13 @@ pub(super) fn validate_compiled_templates(
 /// directory the model was handed lives on the host running the tools and the
 /// local one names nothing any of them can reach. The rule follows the advertised
 /// path in both modes, and covers no more than the root holding it.
-pub(super) fn builtin_rules(cwd: &Path) -> Vec<PermissionRule> {
+///
+/// The project's own plans and notes are readable the same way, never writable
+/// through these rules: the plan file and the memory tool keep them under the
+/// state directory, and asking before reading back what this project wrote
+/// protects nothing. Only while tools run on this machine, because a remote
+/// host's path of the same spelling is not Caudra's.
+pub(super) fn builtin_rules(cwd: &Path, state_dir: Option<&StateDir>) -> Vec<PermissionRule> {
     let allow = |tool: &str, scope: &str| PermissionRule {
         tool: ToolKey::native(tool),
         scope: Some(scope.into()),
@@ -131,6 +139,15 @@ pub(super) fn builtin_rules(cwd: &Path) -> Vec<PermissionRule> {
     for root in &roots {
         rules.extend(FILE_WRITE_TOOLS.iter().map(|tool| allow(tool, root)));
         rules.extend(PROJECT_READ_TOOLS.iter().map(|tool| allow(tool, root)));
+    }
+    let document_roots = state_dir
+        .filter(|_| crate::scratch::tools_run_locally())
+        .into_iter()
+        .flat_map(|state_dir| project_document_dirs(state_dir, cwd))
+        .filter_map(|dir| incremental_canonicalize(&dir))
+        .map(|dir| format!("{}/**", dir.display()));
+    for root in document_roots {
+        rules.extend(PROJECT_READ_TOOLS.iter().map(|tool| allow(tool, &root)));
     }
     rules.extend(TRUSTED_UNSCOPED_TOOLS.iter().map(|tool| allow(tool, "*")));
     rules
@@ -282,14 +299,7 @@ impl PluginRuleStore {
             .flat_map(|(plugin, rules)| {
                 let source = sources.get(plugin).cloned();
                 rules.iter().cloned().map(move |rule| ActivePolicyRule {
-                    source: if source
-                        .as_ref()
-                        .is_some_and(VerifiedLocalSourceLocator::is_plugin_entrypoint)
-                    {
-                        "plugin entrypoint"
-                    } else {
-                        "trusted plugin"
-                    },
+                    origin: RuleOrigin::Plugin,
                     rule,
                     verified_local_source_locator: source.clone(),
                 })
@@ -351,7 +361,8 @@ pub(super) struct SharedPermissionState {
 /// revoked, so the picker shows them read-only.
 #[derive(Clone)]
 pub struct ActivePolicyRule {
-    pub source: &'static str,
+    /// `Config`, `Builtin`, or `Plugin`; never a user's own lifetime.
+    pub origin: RuleOrigin,
     pub rule: PermissionRule,
     pub verified_local_source_locator: Option<VerifiedLocalSourceLocator>,
 }
@@ -1168,7 +1179,7 @@ impl PermissionManager {
             .active_config_rules()
             .into_iter()
             .map(|rule| ActivePolicyRule {
-                source: "configuration",
+                origin: RuleOrigin::Config,
                 verified_local_source_locator: sources
                     .iter()
                     .filter(|(loaded, _)| {
@@ -1188,7 +1199,7 @@ impl PermissionManager {
             })
             .collect();
         entries.extend(builtin_rules.iter().cloned().map(|rule| ActivePolicyRule {
-            source: "builtin",
+            origin: RuleOrigin::Builtin,
             rule,
             verified_local_source_locator: None,
         }));
@@ -1450,6 +1461,7 @@ mod tests {
     };
     use caudra_config::{DefaultEffect, Effect, PermissionRule, PermissionsConfig, ToolKey};
     use caudra_storage::StateDir;
+    use caudra_storage::projects::project_document_dirs;
     use std::collections::HashMap;
     use std::path::{MAIN_SEPARATOR_STR, Path, PathBuf};
     use std::sync::Arc;
@@ -1458,6 +1470,12 @@ mod tests {
     const LOCAL_SOURCE_DIR: &str = "loaded";
     const LOCAL_SOURCE_BYTES: &[u8] = b"[shell]\ndeny = ['git push *']\n";
     const REPLACEMENT_SOURCE_BYTES: &[u8] = b"[shell]\nallow = ['*']\n";
+    const PROJECT_DOCUMENT: &str = "notes.md";
+    const DOCUMENT_ESCAPE_LINK: &str = "escape";
+    const READ_TOOL: &str = "read";
+    const WRITE_TOOL: &str = "write";
+    const REMOTE_SCRATCH_ROOT: &str = "/var/folders/xy/caudra";
+    const REMOTE_SCRATCH_PROJECT: &str = "/var/folders/xy/caudra/happy-cute-tick";
 
     fn local_source() -> (TempDir, VerifiedLocalSourceLocator) {
         let directory = TempDir::new().unwrap();
@@ -2317,7 +2335,7 @@ mod tests {
     }
 
     fn allow_scopes(cwd: &Path) -> Vec<String> {
-        super::builtin_rules(cwd)
+        super::builtin_rules(cwd, None)
             .into_iter()
             .filter(|rule| rule.effect == Effect::Allow)
             .filter_map(|rule| rule.scope)
@@ -2331,8 +2349,6 @@ mod tests {
     /// namespace Caudra made, never everything beside it.
     #[test]
     fn builtin_rules_follow_the_remote_scratch_root_when_tools_run_remotely() {
-        const REMOTE_ROOT: &str = "/var/folders/xy/caudra";
-        const REMOTE_PROJECT: &str = "/var/folders/xy/caudra/happy-cute-tick";
         const REMOTE_TEMP: &str = "/var/folders/xy";
         const REMOTE_IS_COVERED: &str = "the advertised remote directory must be pre-allowed";
         const LOCAL_IS_NOT: &str = "a local scratch root no remote tool can reach must not be";
@@ -2340,13 +2356,15 @@ mod tests {
 
         let project = tempfile::tempdir().unwrap();
         let local = caudra_storage::paths::scratch_root().unwrap();
-        let _scratch_mode =
-            crate::scratch::ScratchGuard::remote(Some((REMOTE_ROOT, REMOTE_PROJECT)));
+        let _scratch_mode = crate::scratch::ScratchGuard::remote(Some((
+            REMOTE_SCRATCH_ROOT,
+            REMOTE_SCRATCH_PROJECT,
+        )));
 
         let scopes = allow_scopes(project.path());
 
         assert!(
-            scopes.contains(&format!("{REMOTE_ROOT}/**")),
+            scopes.contains(&format!("{REMOTE_SCRATCH_ROOT}/**")),
             "{REMOTE_IS_COVERED}"
         );
         assert!(
@@ -2380,6 +2398,83 @@ mod tests {
             "{}/**",
             caudra_storage::paths::canonicalize_clean(project.path()).display()
         )));
+    }
+
+    #[cfg(unix)]
+    struct ProjectDocuments {
+        _temp: TempDir,
+        manager: Arc<PermissionManager>,
+        plans: PathBuf,
+        memories: PathBuf,
+        other_project_plans: PathBuf,
+    }
+
+    /// Built after the scratch mode is set, as a session's manager is: the rule
+    /// is decided when the manager is.
+    #[cfg(unix)]
+    fn project_documents() -> ProjectDocuments {
+        let temp = TempDir::new().unwrap();
+        let [project, other_project, outside] =
+            ["project", "other", "outside"].map(|name| temp.path().join(name));
+        for dir in [&project, &other_project, &outside] {
+            fs::create_dir(dir).unwrap();
+        }
+        let state_dir = StateDir::from_path(temp.path().join("state"));
+        let [plans, memories] = project_document_dirs(&state_dir, &project);
+        let [other_project_plans, _] = project_document_dirs(&state_dir, &other_project);
+        for dir in [&plans, &memories, &other_project_plans] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        symlink(&outside, memories.join(DOCUMENT_ESCAPE_LINK)).unwrap();
+        ProjectDocuments {
+            manager: persistent_manager(state_dir, &project),
+            _temp: temp,
+            plans,
+            memories,
+            other_project_plans,
+        }
+    }
+
+    #[cfg(unix)]
+    fn allowed_without_prompt(documents: &ProjectDocuments, tool: &str, path: &Path) -> bool {
+        let manager = &documents.manager;
+        allows_without_prompt(
+            manager,
+            &legacy_request(manager, ToolKey::native(tool), &[&path.to_string_lossy()]),
+        )
+    }
+
+    #[cfg(unix)]
+    #[test_case(READ_TOOL, |documents: &ProjectDocuments| documents.plans.join(PROJECT_DOCUMENT) => true ; "a_plan_reads")]
+    #[test_case(READ_TOOL, |documents: &ProjectDocuments| documents.memories.join(PROJECT_DOCUMENT) => true ; "a_note_reads")]
+    #[test_case(WRITE_TOOL, |documents: &ProjectDocuments| documents.plans.join(PROJECT_DOCUMENT) => false ; "a_plan_write_asks")]
+    #[test_case(READ_TOOL, |documents: &ProjectDocuments| documents.other_project_plans.join(PROJECT_DOCUMENT) => false ; "another_projects_plan_asks")]
+    #[test_case(READ_TOOL, |documents: &ProjectDocuments| documents.memories.join(DOCUMENT_ESCAPE_LINK).join(PROJECT_DOCUMENT) => false ; "a_link_out_of_the_notes_asks")]
+    fn project_plans_and_memories_are_readable_without_a_prompt(
+        tool: &str,
+        target: fn(&ProjectDocuments) -> PathBuf,
+    ) -> bool {
+        let _scratch_mode = crate::scratch::ScratchGuard::local();
+        let documents = project_documents();
+        allowed_without_prompt(&documents, tool, &target(&documents))
+    }
+
+    /// A remote host's tools never read this machine's state directory, and a
+    /// path of the same spelling there is not Caudra's to hand out.
+    #[cfg(unix)]
+    #[test]
+    fn project_plans_ask_when_tools_run_remotely() {
+        let _scratch_mode = crate::scratch::ScratchGuard::remote(Some((
+            REMOTE_SCRATCH_ROOT,
+            REMOTE_SCRATCH_PROJECT,
+        )));
+        let documents = project_documents();
+
+        assert!(!allowed_without_prompt(
+            &documents,
+            READ_TOOL,
+            &documents.plans.join(PROJECT_DOCUMENT)
+        ));
     }
 
     #[test]

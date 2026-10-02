@@ -18,13 +18,15 @@ use std::path::{Path, PathBuf};
 use caudra_storage::StateDir;
 
 use crate::permissions::{
-    CONFINED_READ_ATTRIBUTE, CONFINED_READ_VALUE, PermissionAnswer, PermissionAuthorityProfile,
-    PermissionError, PermissionExecutorKind, PermissionLifetime, PermissionManager,
-    PermissionRequest, PermissionResource, PermissionResourceAccess, PermissionResourceKind,
-    PermissionRisk, PermissionSubject, PolicyRule, RequestCoverage, ResourceCoverage, RuleOrigin,
-    StructuredPermissionDecision, StructuredPermissionRule, filesystem_permission_resource,
-    permission_rule_intersects_request, permission_rules_resource_standing,
+    CONFINED_READ_ATTRIBUTE, CONFINED_READ_VALUE, ComposedRow, OPACITY_ATTRIBUTE, PermissionAnswer,
+    PermissionAuthorityProfile, PermissionError, PermissionExecutorKind, PermissionLifetime,
+    PermissionManager, PermissionRequest, PermissionResource, PermissionResourceAccess,
+    PermissionResourceKind, PermissionRisk, PermissionRowGrant, PermissionSubject, PolicyRule,
+    RequestCoverage, ResourceCoverage, RuleOrigin, ShellOpacity, StructuredPermissionDecision,
+    StructuredPermissionRule, filesystem_permission_resource, permission_rule_intersects_request,
+    permission_rules_resource_standing,
 };
+use futures_lite::future;
 pub(super) const PERMISSION_RULES_STATE_KEY: &str = "permission.rules";
 
 pub(super) const SHELL_WORKDIR: &str = "/tmp";
@@ -545,6 +547,22 @@ pub(super) async fn enforce_tool_without_prompt(
 
 pub(super) const COMPOSED_REQUEST_ID: &str = "composed-request";
 
+/// A composed answer whose rows last as listed; what each row grants does not
+/// matter to the questions asked of it.
+pub(super) fn composed_answer(lifetimes: &[Option<PermissionLifetime>]) -> PermissionAnswer {
+    PermissionAnswer::AllowComposed {
+        rows: lifetimes
+            .iter()
+            .map(|lifetime| {
+                lifetime.clone().map(|lifetime| ComposedRow {
+                    grant: PermissionRowGrant::Written(String::new()),
+                    lifetime,
+                })
+            })
+            .collect(),
+    }
+}
+
 pub(super) const COMPOSED_PROMPT_MISSING: &str = "batched commands did not raise a prompt";
 
 pub(super) fn opaque_intent(
@@ -688,6 +706,7 @@ pub(super) fn log_coverage() -> Option<ResourceCoverage> {
     Some(ResourceCoverage {
         origin: RuleOrigin::Project,
         authority: "this command".into(),
+        asks: false,
     })
 }
 
@@ -734,6 +753,80 @@ pub(super) async fn controlled_enforcement(
             None,
         )
         .await
+}
+
+pub(super) const SHELL_PROMPT_MISSING: &str = "the shell call ran without a prompt";
+
+const PROMPT_NOT_FIRST: &str = "a prompted shell call raises its prompt before any other event";
+
+/// A line the first-party shell could not review command by command, the way
+/// it presents one: the command it did read, then the whole line, protected
+/// and naming why.
+pub(super) fn opaque_line_intent(
+    line: &str,
+    opacity: ShellOpacity,
+) -> crate::tools::PermissionIntent {
+    let mut intent = shell_intent(&[FIRST_COMMAND]);
+    intent.scopes.scopes.push(line.into());
+    intent.resources.push(PermissionResource {
+        kind: PermissionResourceKind::Command,
+        value: line.into(),
+        access: Some(PermissionResourceAccess::Execute),
+        protected: true,
+        requires_prompt: true,
+        attributes: BTreeMap::from([
+            ("workdir".into(), SHELL_WORKDIR.into()),
+            (OPACITY_ATTRIBUTE.into(), opacity.to_string()),
+        ]),
+    });
+    intent
+}
+
+/// Runs a first-party shell call that can be answered. A prompt it raises is
+/// denied and returned; `None` means the call ran without one.
+pub(super) async fn shell_prompt(
+    manager: &PermissionManager,
+    intent: &crate::tools::PermissionIntent,
+    command: &str,
+) -> Option<Box<PermissionRequest>> {
+    let (event_tx, events) = flume::unbounded();
+    let event_tx = EventSender::new(event_tx, 0);
+    let (_legacy_tx, legacy_rx) = flume::unbounded();
+    let legacy_rx = async_lock::Mutex::new(legacy_rx);
+    let input = serde_json::json!({"command": command, "workdir": SHELL_WORKDIR});
+    let tool = ToolKey::native("shell");
+    let cancel = CancelToken::none();
+    let mut enforcement = Box::pin(manager.enforce_with_intent(
+        &tool,
+        intent,
+        &input,
+        &event_tx,
+        Some(&legacy_rx),
+        CONTROLLED_REQUEST,
+        &cancel,
+        None,
+        Some((workcell_shell_subject(), PermissionExecutorKind::Native)),
+        true,
+    ));
+    let prompt = future::race(
+        async {
+            enforcement.as_mut().await.unwrap();
+            None
+        },
+        async {
+            let AgentEvent::PermissionRequest(request) = events.recv_async().await.unwrap().event
+            else {
+                panic!("{PROMPT_NOT_FIRST}");
+            };
+            Some(request)
+        },
+    )
+    .await;
+    if prompt.is_some() {
+        assert!(manager.answer(CONTROLLED_REQUEST, PermissionAnswer::Deny));
+        assert!(enforcement.await.is_err());
+    }
+    prompt
 }
 
 pub(super) fn remember_command(manager: &PermissionManager, command: &str) {

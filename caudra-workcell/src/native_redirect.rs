@@ -133,11 +133,12 @@ enum Role {
 /// is a whole-file read, and `cat notes.txt > copy.txt` is a copy no read tool
 /// performs. The parse is what distinguishes them, because the grammar hangs
 /// `> copy.txt` off a node above the command and the scope reads the same
-/// either way.
+/// either way. A heredoc or here-string is a redirection too: `grep x <<< 'a b'`
+/// searches text no file holds.
 pub(crate) fn detect(commands: &[CommandFacts<'_>]) -> Option<Vec<Native>> {
     let mut natives: Vec<Native> = Vec::new();
     for facts in commands {
-        if !facts.command.redirects.is_empty() {
+        if !facts.command.redirects.is_empty() || !facts.command.payloads.is_empty() {
             return None;
         }
         match role(&facts.scope) {
@@ -333,6 +334,7 @@ mod tests {
     #[test_case("cd src && cargo build && cargo test"; "and_chain")]
     #[test_case("cd src && rg -i needle | sort"; "remaining_pipeline")]
     #[test_case("cd src && printf '%s' \"$VALUE\""; "remaining_expansion")]
+    #[test_case("cd src && cargo test > output.txt"; "redirected_last_command")]
     fn leading_cd_redirects_to_workdir(command: &str) {
         let program = parse_bash(command).expect("program");
         assert!(leading_workdir(&program), "{program:?}");
@@ -345,7 +347,6 @@ mod tests {
     #[test_case("cd src; cargo test"; "semicolon")]
     #[test_case("cd src\ncargo test"; "newline")]
     #[test_case("cd src && cargo test; pwd"; "trailing_sequence")]
-    #[test_case("cd src && cargo test > output.txt"; "redirected_list")]
     #[test_case("cd src || cargo test"; "fallback")]
     #[test_case("cd src && cargo test || pwd"; "trailing_fallback")]
     #[test_case("(cd src && cargo test)"; "subshell")]

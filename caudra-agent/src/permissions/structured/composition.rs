@@ -1,8 +1,9 @@
 use super::{
-    COMMAND_EXACT_PREFIX, ComposedAnswerError, PermissionArgumentConstraint, PermissionLifetime,
-    PermissionRequest, PermissionResourceConstraint, PermissionResourceSelector,
-    PermissionRowGrant, PermissionRuleOption, StructuredPermissionEffect, StructuredPermissionRule,
-    grade_command_pattern, permission_rule_covers_resource, resource_constraint, safe_summary,
+    COMMAND_EXACT_PREFIX, ComposedAnswerError, ComposedRow, PermissionArgumentConstraint,
+    PermissionLifetime, PermissionRequest, PermissionResourceConstraint,
+    PermissionResourceSelector, PermissionRowGrant, PermissionRuleOption,
+    StructuredPermissionEffect, StructuredPermissionRule, grade_command_pattern,
+    permission_rule_covers_resource, resource_constraint, safe_summary,
 };
 use super::{COMMAND_TEMPLATE_PREFIX, PatternDefinition};
 use crate::permissions::pattern_matching::CompiledPattern;
@@ -21,23 +22,18 @@ impl PermissionRequest {
         rule.lifetime = lifetime;
         Some(rule)
     }
-    /// The one rule a per-row answer stands for, or `None` when no row asked to
-    /// be remembered.
+    /// One rule per remembered row, each for its row's own lifetime.
     ///
-    /// Composing is sound because a rule's resource constraints are a set: each
-    /// granted row contributes the constraint it chose, and the rule covers a
-    /// resource when any constraint does. Rows left ungranted contribute
-    /// nothing, which is what makes them this call only — the call itself
-    /// proceeds on the answer, not on the rule.
+    /// Rows left `None` contribute nothing, which is what makes them this call
+    /// only — the call itself proceeds on the answer, not on the rules.
     ///
     /// A written pattern is authority the request never offered, so it is
     /// admitted only against the command on its own row and only for a lifetime
     /// that row's offered rung still allows. That second gate is what keeps
-    /// plan mode contained without knowing anything about plans.
+    /// plan mode contained row by row without knowing anything about plans.
     pub fn composed_rules(
         &self,
-        rows: &[Option<PermissionRowGrant>],
-        lifetime: &PermissionLifetime,
+        rows: &[Option<ComposedRow>],
     ) -> Result<Vec<StructuredPermissionRule>, ComposedAnswerError> {
         if rows.len() != self.resources.len() {
             return Err(ComposedAnswerError::RowCount {
@@ -47,14 +43,17 @@ impl PermissionRequest {
         }
         let subsumed = self.subsumed_rows(rows);
         let mut rules = Vec::new();
-        for (index, grant) in rows.iter().enumerate() {
-            let Some(grant) = grant else {
+        for (index, row) in rows.iter().enumerate() {
+            let Some(row) = row else {
                 continue;
             };
+            if row.lifetime == PermissionLifetime::Once {
+                return Err(ComposedAnswerError::RememberedOnce);
+            }
             // Validated before pruning: a grant the request never offered is an
             // error whether or not it would have been kept.
-            let (option, resources) = self.row_reach(index, grant)?;
-            if !option.allowed_lifetimes.contains(lifetime) {
+            let (option, resources) = self.row_reach(index, &row.grant)?;
+            if !option.allowed_lifetimes.contains(&row.lifetime) {
                 return Err(ComposedAnswerError::LifetimeWithdrawn(option.id.clone()));
             }
             if subsumed[index].is_some() {
@@ -65,7 +64,7 @@ impl PermissionRequest {
                 executor: self.executor.clone(),
                 resources,
                 arguments: PermissionArgumentConstraint::Unconstrained,
-                lifetime: lifetime.clone(),
+                lifetime: row.lifetime.clone(),
                 effect: StructuredPermissionEffect::Allow,
                 family: option.rule.family,
             };
@@ -79,8 +78,7 @@ impl PermissionRequest {
     /// The option one row's grant rides on, and the constraints it names.
     ///
     /// Lifetime is deliberately not checked here: how far a grant reaches is a
-    /// question about resources, and subsumption has to answer it before any
-    /// lifetime has been chosen.
+    /// question about resources alone.
     pub(super) fn row_reach(
         &self,
         index: usize,
@@ -166,32 +164,36 @@ impl PermissionRequest {
     }
     /// For each row, the row whose grant already covers it.
     ///
-    /// A grant that reaches no further than another row's contributes nothing:
-    /// the prompt should not claim it does, and storage should not keep it. Row
-    /// `i` is subsumed by `j` when `j` reaches resource `i` and either `i` does
-    /// not reach resource `j` — a redundant narrower row, wherever it sits — or
-    /// `j` comes first, which is what settles two rows that reach each other so
-    /// that exactly one of them survives.
-    pub fn subsumed_rows(&self, rows: &[Option<PermissionRowGrant>]) -> Vec<Option<usize>> {
-        let reach: Vec<Option<StructuredPermissionRule>> = rows
+    /// A grant that reaches no further than another row's, for no longer,
+    /// contributes nothing: the prompt should not claim it does, and storage
+    /// should not keep it. Row `j` dominates row `i` when `j` reaches resource
+    /// `i` and lasts at least as long. Row `i` is subsumed by `j` when `j`
+    /// dominates it and either `i` does not dominate `j` — a redundant narrower
+    /// or shorter row, wherever it sits — or `j` comes first, which is what
+    /// settles two rows that dominate each other so that exactly one survives.
+    pub fn subsumed_rows(&self, rows: &[Option<ComposedRow>]) -> Vec<Option<usize>> {
+        let reach: Vec<Option<(StructuredPermissionRule, &PermissionLifetime)>> = rows
             .iter()
             .enumerate()
-            .map(|(index, grant)| self.row_rule(index, grant.as_ref()?))
-            .collect();
-        let covers = |row: usize, resource: usize| {
-            reach.get(row).and_then(Option::as_ref).is_some_and(|rule| {
-                self.resources
-                    .get(resource)
-                    .is_some_and(|resource| permission_rule_covers_resource(rule, self, resource))
+            .map(|(index, row)| {
+                let row = row.as_ref()?;
+                Some((self.row_rule(index, &row.grant)?, &row.lifetime))
             })
+            .collect();
+        let dominates = |row: usize, other: usize| {
+            let (Some(Some((rule, lifetime))), Some(Some((_, other_lifetime))), Some(resource)) =
+                (reach.get(row), reach.get(other), self.resources.get(other))
+            else {
+                return false;
+            };
+            lifetime >= other_lifetime && permission_rule_covers_resource(rule, self, resource)
         };
         (0..rows.len())
             .map(|index| {
-                reach.get(index)?.as_ref()?;
                 (0..rows.len()).find(|&other| {
                     other != index
-                        && covers(other, index)
-                        && (!covers(index, other) || other < index)
+                        && dominates(other, index)
+                        && (!dominates(index, other) || other < index)
                 })
             })
             .collect()
@@ -215,15 +217,24 @@ fn preserves_template_structure(original: &PatternDefinition, edited: &PatternDe
 mod tests {
     use test_case::test_case;
 
+    use crate::permissions::enforce::contain_authority_to_the_plan;
     use crate::permissions::structured::tests::{
         BROAD_ASK, BUILTIN_ALLOW_AUTHORITY, NARROW_ALLOW, command_resource, composed, covered_at,
-        offered, twin_command_request, two_command_request,
+        offered, remembered, twin_command_request, two_command_request,
     };
     use crate::permissions::structured::{
-        ComposedAnswerError, EXACT_COMMAND_CHIP, PatternFault, PermissionArgumentConstraint,
-        PermissionLifetime, PermissionResourceSelector, PermissionRowGrant, RuleOrigin,
-        permission_rule_covers_resource, resource_constraint,
+        ComposedAnswerError, ComposedRow, EXACT_COMMAND_CHIP, PatternFault,
+        PermissionArgumentConstraint, PermissionLifetime, PermissionResourceSelector,
+        PermissionRowGrant, RuleOrigin, permission_rule_covers_resource, resource_constraint,
     };
+
+    fn row(id: &str, lifetime: PermissionLifetime) -> Option<ComposedRow> {
+        Some(ComposedRow {
+            grant: PermissionRowGrant::Offered(id.into()),
+            lifetime,
+        })
+    }
+
     /// Two rows reaching the same pattern reach each other, so exactly one has
     /// to survive or the answer files the same rule twice.
     #[test]
@@ -231,7 +242,10 @@ mod tests {
         let request = twin_command_request();
 
         assert_eq!(
-            request.subsumed_rows(&[offered("command_pattern_0"), offered("command_pattern_1")]),
+            request.subsumed_rows(&remembered(vec![
+                offered("command_pattern_0"),
+                offered("command_pattern_1")
+            ])),
             vec![None, Some(0)]
         );
     }
@@ -243,12 +257,54 @@ mod tests {
         let request = twin_command_request();
 
         assert_eq!(
-            request.subsumed_rows(&[offered("command_exact_0"), offered("command_pattern_1")]),
+            request.subsumed_rows(&remembered(vec![
+                offered("command_exact_0"),
+                offered("command_pattern_1")
+            ])),
             vec![Some(1), None]
         );
         assert_eq!(
-            request.subsumed_rows(&[offered("command_pattern_0"), offered("command_exact_1")]),
+            request.subsumed_rows(&remembered(vec![
+                offered("command_pattern_0"),
+                offered("command_exact_1")
+            ])),
             vec![None, Some(0)]
+        );
+    }
+
+    /// A row is pruned only by one that covers it for at least as long, so a
+    /// conversation-wide pattern never swallows a command kept for the project.
+    #[test_case(PermissionLifetime::Conversation, PermissionLifetime::Project, vec![None, None]; "a_shorter_cover_keeps_the_row")]
+    #[test_case(PermissionLifetime::Project, PermissionLifetime::Conversation, vec![None, Some(0)]; "a_longer_cover_prunes_it")]
+    #[test_case(PermissionLifetime::Global, PermissionLifetime::Project, vec![None, Some(0)]; "all_projects_outlasts_one")]
+    fn a_row_is_pruned_only_by_a_row_that_lasts_as_long(
+        cover: PermissionLifetime,
+        covered: PermissionLifetime,
+        expected: Vec<Option<usize>>,
+    ) {
+        let request = twin_command_request();
+
+        assert_eq!(
+            request.subsumed_rows(&[
+                row("command_pattern_0", cover),
+                row("command_exact_1", covered)
+            ]),
+            expected
+        );
+    }
+
+    /// Two rows reaching each other settle on the one that lasts longer, not on
+    /// the one that comes first.
+    #[test]
+    fn rows_that_reach_each_other_keep_the_longer_lived() {
+        let request = twin_command_request();
+
+        assert_eq!(
+            request.subsumed_rows(&[
+                row("command_pattern_0", PermissionLifetime::Conversation),
+                row("command_pattern_1", PermissionLifetime::Project)
+            ]),
+            vec![Some(1), None]
         );
     }
 
@@ -259,7 +315,10 @@ mod tests {
         let request = twin_command_request();
 
         assert_eq!(
-            request.subsumed_rows(&[offered("command_exact_0"), offered("command_exact_1")]),
+            request.subsumed_rows(&remembered(vec![
+                offered("command_exact_0"),
+                offered("command_exact_1")
+            ])),
             vec![None, None]
         );
     }
@@ -271,8 +330,68 @@ mod tests {
         let request = twin_command_request();
 
         assert_eq!(
-            request.subsumed_rows(&[None, offered("command_pattern_1")]),
+            request.subsumed_rows(&remembered(vec![None, offered("command_pattern_1")])),
             vec![None, None]
+        );
+    }
+
+    /// Each row's rule lasts as long as that row asked, so one answer can keep
+    /// one command for the project and another for this conversation only.
+    #[test]
+    fn each_row_files_for_its_own_lifetime() {
+        let request = two_command_request();
+
+        let lifetimes: Vec<_> = request
+            .composed_rules(&[
+                row("command_exact_0", PermissionLifetime::Project),
+                row("command_exact_1", PermissionLifetime::Conversation),
+            ])
+            .unwrap()
+            .into_iter()
+            .map(|rule| rule.lifetime)
+            .collect();
+
+        assert_eq!(
+            lifetimes,
+            [
+                PermissionLifetime::Project,
+                PermissionLifetime::Conversation
+            ]
+        );
+    }
+
+    /// "This time only" is a row left empty; a row that names it is malformed.
+    #[test]
+    fn a_row_lifetime_of_once_is_rejected() {
+        let request = two_command_request();
+
+        assert_eq!(
+            request.composed_rules(&[row("command_exact_0", PermissionLifetime::Once), None]),
+            Err(ComposedAnswerError::RememberedOnce)
+        );
+    }
+
+    /// Plan mode withdraws the durable lifetimes from every rung, so each row
+    /// is held to the plan on its own: one row kept for the project refuses
+    /// the whole answer even when its sibling stays in the conversation.
+    #[test_case(PermissionLifetime::Conversation, true; "conversation_rows_pass")]
+    #[test_case(PermissionLifetime::Project, false; "a_project_row_is_refused")]
+    #[test_case(PermissionLifetime::Global, false; "an_all_projects_row_is_refused")]
+    fn plan_mode_withdraws_durable_lifetimes_row_by_row(
+        second: PermissionLifetime,
+        accepted: bool,
+    ) {
+        let mut request = two_command_request();
+        contain_authority_to_the_plan(&mut request);
+
+        assert_eq!(
+            request
+                .composed_rules(&[
+                    row("command_exact_0", PermissionLifetime::Conversation),
+                    row("command_exact_1", second),
+                ])
+                .is_ok(),
+            accepted
         );
     }
 
@@ -332,11 +451,10 @@ mod tests {
     fn a_row_covered_less_durably_than_the_grant_still_files() {
         let mut request = two_command_request();
         covered_at(&mut request, 0, RuleOrigin::Conversation, NARROW_ALLOW);
-        let rows = vec![offered("command_exact_0"), None];
 
         assert_eq!(
             request
-                .composed_rules(&rows, &PermissionLifetime::Project)
+                .composed_rules(&[row("command_exact_0", PermissionLifetime::Project), None])
                 .map(|rules| rules.len()),
             Ok(1)
         );
@@ -353,11 +471,10 @@ mod tests {
             RuleOrigin::Builtin,
             BUILTIN_ALLOW_AUTHORITY,
         );
-        let rows = vec![offered("command_exact_0"), None];
 
         assert_eq!(
             request
-                .composed_rules(&rows, &PermissionLifetime::Global)
+                .composed_rules(&[row("command_exact_0", PermissionLifetime::Global), None])
                 .map(|rules| rules.len()),
             Ok(1)
         );
@@ -369,23 +486,15 @@ mod tests {
     fn widening_a_covered_row_still_files() {
         let mut request = two_command_request();
         covered_at(&mut request, 0, RuleOrigin::Project, EXACT_COMMAND_CHIP);
-        let rows = vec![offered("command_pattern_0"), None];
+        let rows = [row("command_pattern_0", PermissionLifetime::Project), None];
 
         assert_eq!(
-            request
-                .composed_rules(&rows, &PermissionLifetime::Project)
-                .map(|rules| rules.len()),
+            request.composed_rules(&rows).map(|rules| rules.len()),
             Ok(1)
         );
 
         covered_at(&mut request, 0, RuleOrigin::Project, NARROW_ALLOW);
-        assert_eq!(
-            request
-                .composed_rules(&rows, &PermissionLifetime::Project)
-                .unwrap()
-                .len(),
-            1
-        );
+        assert_eq!(request.composed_rules(&rows).unwrap().len(), 1);
     }
 
     /// A pattern typed for one row still reaches the other, so it subsumes the
@@ -395,10 +504,10 @@ mod tests {
         let request = twin_command_request();
 
         assert_eq!(
-            request.subsumed_rows(&[
+            request.subsumed_rows(&remembered(vec![
                 Some(PermissionRowGrant::Written(BROAD_ASK.into())),
                 offered("command_exact_1"),
-            ]),
+            ])),
             vec![None, Some(0)]
         );
     }
@@ -539,18 +648,23 @@ mod tests {
                 )
             });
         }
-        let rows = vec![
-            None,
-            Some(PermissionRowGrant::Written("cargo test *".into())),
-        ];
+        let written = |lifetime| {
+            [
+                None,
+                Some(ComposedRow {
+                    grant: PermissionRowGrant::Written("cargo test *".into()),
+                    lifetime,
+                }),
+            ]
+        };
 
         assert!(
             request
-                .composed_rules(&rows, &PermissionLifetime::Conversation)
+                .composed_rules(&written(PermissionLifetime::Conversation))
                 .is_ok()
         );
         assert_eq!(
-            request.composed_rules(&rows, &PermissionLifetime::Project),
+            request.composed_rules(&written(PermissionLifetime::Project)),
             Err(ComposedAnswerError::LifetimeWithdrawn(
                 "command_exact_1".into()
             ))
@@ -561,7 +675,12 @@ mod tests {
     fn presentation_coverage_does_not_prune_selected_authority(lifetime: PermissionLifetime) {
         let mut request = two_command_request();
         covered_at(&mut request, 0, RuleOrigin::Project, NARROW_ALLOW);
-        let rows = vec![offered("command_exact_0"), None];
-        assert_eq!(request.composed_rules(&rows, &lifetime).unwrap().len(), 1);
+        assert_eq!(
+            request
+                .composed_rules(&[row("command_exact_0", lifetime), None])
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

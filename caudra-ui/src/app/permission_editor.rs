@@ -1481,6 +1481,7 @@ pub(super) mod tests {
     use crate::app::sandbox::WORKBENCH_BUSY;
     use crate::app::tests::{pattern_suggestion_candidate, remote_workspace_session, test_app};
     use crate::components::buffer_text;
+    use crate::components::permission_prompt::{assert_plain, buffer_rows};
     use crate::components::permission_scope::editor::{
         EditorEvent, EditorLaunch, EditorTestExample, ScopeEditor,
     };
@@ -1531,6 +1532,8 @@ pub(super) mod tests {
     const PREVIEW_ACTION: &str = "[Preview ^P]";
     const SAVE_ACTION: &str = "[Save ^S]";
     const CONFIRM_ACTION: &str = "Confirm all";
+    const SCOPE_SECTION: &str = "[Scope]";
+    const EDITOR_SECTIONS: [&str; 3] = ["[Rule]", "[Targets]", SCOPE_SECTION];
 
     struct SourceRemoteFiles {
         files: Mutex<BTreeMap<String, (String, ResourceRevision)>>,
@@ -2171,8 +2174,8 @@ pub(super) mod tests {
             "Registered target",
             "[Targets]",
             "Add target",
-            "ALL OF access",
-            "ALL OF protection",
+            "Access",
+            "Protection",
             "[Arguments]",
             "Whole-rule input",
             "[Targets]",
@@ -2470,6 +2473,44 @@ pub(super) mod tests {
         );
     }
 
+    fn picker_rows(app: &mut App) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(EDITOR_WIDTH, EDITOR_HEIGHT)).unwrap();
+        terminal
+            .draw(|frame| {
+                app.permissions_picker.view(frame, frame.area());
+            })
+            .unwrap();
+        buffer_rows(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn scope_view_appears_only_in_edit() {
+        let mut app = durable_app();
+        begin(&mut app, EditorLaunch::New);
+        preview(&mut app, draft(PermissionLifetime::Conversation));
+        save(&mut app);
+        let has_editor = |rows: &[String]| {
+            EDITOR_SECTIONS
+                .iter()
+                .all(|section| rows.iter().any(|row| row.contains(section)))
+        };
+        let inventory = picker_rows(&mut app);
+        assert!(!has_editor(&inventory), "{}", inventory.join("\n"));
+        assert_plain(&inventory, "inventory");
+        let PermissionsPickerAction::Editor(event) = app
+            .permissions_picker
+            .handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL))
+        else {
+            panic!("expected an edit launch");
+        };
+        app.handle_permission_editor(event);
+        app.finish_permission_jobs();
+        let edit = picker_rows(&mut app);
+        assert!(has_editor(&edit), "{}", edit.join("\n"));
+        assert!(click_editor_label(&mut app, SCOPE_SECTION).is_none());
+        assert_plain(&picker_rows(&mut app), "edit scope");
+    }
+
     #[test_case((); "discovery_is_evidence_only")]
     fn discovery_requires_current_explicit_authority_and_never_runs_the_sample(_: ()) {
         let mut app = durable_app();
@@ -2561,7 +2602,7 @@ pub(super) mod tests {
             .into_iter()
             .map(|entry| {
                 (
-                    entry.source,
+                    entry.origin,
                     entry.rule,
                     entry.verified_local_source_locator,
                 )
@@ -2627,7 +2668,7 @@ pub(super) mod tests {
                 .active_policy()
                 .into_iter()
                 .map(|entry| (
-                    entry.source,
+                    entry.origin,
                     entry.rule,
                     entry.verified_local_source_locator
                 ))

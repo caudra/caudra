@@ -1511,7 +1511,7 @@ async fn isolated_python_permissions(client: &RemoteWorkcellClient, root: &Path,
         permissions
             .active_policy()
             .into_iter()
-            .map(|entry| (entry.source, entry.rule))
+            .map(|entry| (entry.origin, entry.rule))
             .collect::<Vec<_>>()
     };
     let policy_before = policy();

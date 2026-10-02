@@ -20,15 +20,13 @@ use caudra_workbench::text_field::{FieldKind, FieldStyles, TextField, TextKey, i
 
 use super::form::render_form;
 use super::keybindings::{Bind, key};
+use super::tab_bar::{Tab, tab_spans};
 use super::{Hint, Overlay, VisualRows, field_styles, hanging_lines, visual_rows};
 use crate::repaint::Cadence;
 use crate::theme;
 
 const TITLE: &str = " Question ";
 const CUSTOM_OPTION: &str = "Type your own answer";
-const REVIEW_TAB: &str = " Review ";
-const TAB_SEPARATOR: &str = "│";
-const ANSWERED_MARK: &str = " ✓ ";
 const MULTI_HINT: &str = "  (multiple answers)";
 const SINGLE_HINT: &str = "  (single answer)";
 const NO_ANSWER: &str = "(no answer)";
@@ -705,34 +703,23 @@ impl QuestionForm {
     /// testing both read this, so a tab can never sit somewhere other than
     /// where a click looks for it. Separators select nothing.
     fn tab_spans(&self) -> Vec<(Span<'static>, Option<FormTarget>)> {
-        let t = theme::current();
-        let mut spans = Vec::with_capacity(self.questions.len() * 2 + 1);
-        for (index, question) in self.questions.iter().enumerate() {
-            let label = tab_label(index, question);
-            let answered = !self.answers[index].is_empty();
-            let target = FormTarget::Tab(index);
-            let span = match (index == self.tab && self.mode != Mode::Confirming, answered) {
-                (true, _) => Span::styled(format!(" {label} "), t.active),
-                (false, true) => Span::styled(format!(" {label}{ANSWERED_MARK}"), t.todo_completed),
-                (false, false) => Span::styled(format!(" {label} "), t.tool_dim),
-            };
-            spans.push((self.hovered(span, target), Some(target)));
-            spans.push((Span::styled(TAB_SEPARATOR, t.tool_dim), None));
-        }
-        let review = match self.mode {
-            Mode::Confirming => Span::styled(REVIEW_TAB, t.active),
-            _ => Span::styled(REVIEW_TAB, t.tool_dim),
-        };
-        spans.push((
-            self.hovered(review, FormTarget::Review),
-            Some(FormTarget::Review),
-        ));
-        spans
-    }
-
-    fn hovered(&self, span: Span<'static>, target: FormTarget) -> Span<'static> {
-        let style = super::hover_style(span.style, self.hover == Some(target));
-        Span::styled(span.content, style)
+        let tabs: Vec<_> = self
+            .questions
+            .iter()
+            .enumerate()
+            .map(|(index, question)| Tab {
+                label: tab_label(index, question),
+                done: !self.answers[index].is_empty(),
+                target: FormTarget::Tab(index),
+            })
+            .collect();
+        tab_spans(
+            &tabs,
+            (self.mode != Mode::Confirming).then_some(self.tab),
+            FormTarget::Review,
+            self.hover.as_ref(),
+            u16::MAX,
+        )
     }
 
     fn tab_bar(&self) -> Line<'static> {

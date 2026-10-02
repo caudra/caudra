@@ -10,13 +10,14 @@ use caudra_config::ToolKey;
 use serde_json::Value;
 
 use crate::permissions::structured::{
-    ComposedAnswerError, MCP_CONTRACT, PermissionArgumentConstraint, PermissionAuthorityProfile,
-    PermissionCaution, PermissionExecutorKind, PermissionIntent, PermissionLifetime,
-    PermissionRequest, PermissionResource, PermissionResourceAccess, PermissionResourceConstraint,
-    PermissionResourceKind, PermissionResourceSelector, PermissionRisk, PermissionRowGrant,
-    PermissionRuleOption, PermissionSubject, RemotePermissionIdentity, ResourceCoverage,
-    RuleOrigin, StructuredPermissionDecision, StructuredPermissionEffect, StructuredPermissionRule,
-    URL_SUBTREE_OPTION_ID, WORKCELL_OWNER, filesystem_resource_flags, resource_decision,
+    ComposedAnswerError, ComposedRow, MCP_CONTRACT, PermissionArgumentConstraint,
+    PermissionAuthorityProfile, PermissionCaution, PermissionExecutorKind, PermissionIntent,
+    PermissionLifetime, PermissionRequest, PermissionResource, PermissionResourceAccess,
+    PermissionResourceConstraint, PermissionResourceKind, PermissionResourceSelector,
+    PermissionRisk, PermissionRowGrant, PermissionRuleOption, PermissionSubject,
+    RemotePermissionIdentity, ResourceCoverage, RuleOrigin, StructuredPermissionDecision,
+    StructuredPermissionEffect, StructuredPermissionRule, URL_SUBTREE_OPTION_ID, WORKCELL_OWNER,
+    filesystem_resource_flags, resource_decision,
 };
 pub(super) fn request(resources: Vec<PermissionResource>) -> PermissionRequest {
     PermissionRequest::from_legacy(
@@ -355,7 +356,12 @@ pub(super) fn composed(
     request: &PermissionRequest,
     rows: Vec<Option<PermissionRowGrant>>,
 ) -> Result<Vec<StructuredPermissionRule>, ComposedAnswerError> {
-    request.composed_rules(&rows, &PermissionLifetime::Conversation)
+    request.composed_rules(&remembered(rows))
+}
+
+/// Every granted row remembered for this conversation.
+pub(super) fn remembered(rows: Vec<Option<PermissionRowGrant>>) -> Vec<Option<ComposedRow>> {
+    ComposedRow::uniform(rows, &PermissionLifetime::Conversation)
 }
 
 pub(super) const SHARED_PATTERN_COMMANDS: [&str; 2] =
@@ -389,6 +395,7 @@ pub(super) fn covered_at(
     request.presentation.resources[index].coverage = Some(ResourceCoverage {
         origin,
         authority: authority.into(),
+        asks: false,
     });
 }
 
@@ -495,16 +502,18 @@ pub(super) fn read_subtree_rule(option: &str) -> StructuredPermissionRule {
     .expect("a first-party read must offer a subtree grant")
 }
 
-/// Every rung of the subtree ladder, in the order it was offered.
+/// The subtree rungs of the filesystem ladder in the order they were offered,
+/// without the exact paths it starts on.
 pub(super) fn subtree_ladder(request: &PermissionRequest) -> Vec<&PermissionRuleOption> {
     request
         .options
         .iter()
         .filter(|option| {
-            option
-                .group
-                .as_ref()
-                .is_some_and(|group| group.key == SUBTREE_OPTION)
+            option.id.starts_with(SUBTREE_OPTION)
+                && option
+                    .group
+                    .as_ref()
+                    .is_some_and(|group| group.key == SUBTREE_OPTION)
         })
         .collect()
 }

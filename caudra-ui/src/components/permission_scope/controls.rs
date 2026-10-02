@@ -147,11 +147,11 @@ pub(crate) fn domain_index(domain: &ArgumentDomain) -> usize {
 
 pub(crate) fn domain_name(domain: &ArgumentDomain) -> &'static str {
     match domain {
-        ArgumentDomain::ObservedSet { .. } => "Allowed values",
-        ArgumentDomain::Exact { .. } => "Exact literal",
-        ArgumentDomain::Glob { .. } => "One-argument glob",
-        ArgumentDomain::Regex { .. } => "One-argument regex",
-        ArgumentDomain::AnyLiteralArgument => "Any one literal",
+        ArgumentDomain::ObservedSet { .. } => "Values seen before",
+        ArgumentDomain::Exact { .. } => "Exact value",
+        ArgumentDomain::Glob { .. } => "Wildcard",
+        ArgumentDomain::Regex { .. } => "Regular expression",
+        ArgumentDomain::AnyLiteralArgument => "Any argument",
     }
 }
 

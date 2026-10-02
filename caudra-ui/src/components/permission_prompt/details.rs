@@ -1,4 +1,16 @@
-use super::{Line, Map, PermissionRequest, PromptBody, Value, escape_terminal_controls};
+use std::collections::BTreeSet;
+use std::path::Path;
+
+use caudra_agent::permissions::{PermissionRequest, PermissionRowGrant, PermissionSubject};
+use serde_json::{Map, Value};
+
+use super::PermissionPrompt;
+use super::choices::grant_label;
+use super::decision::grant_option;
+use super::inspector::pattern_summary;
+use super::notes::{action_lines, coverage_phrase, reason_sentence, row_coverage, tilde};
+use super::scope::{SHELL_REACH, option_summary, tool_text};
+use crate::components::escape_terminal_controls;
 
 pub(super) const MAX_REVIEW_CHARS: usize = 32_768;
 const MAX_REVIEW_NODES: usize = 1024;
@@ -6,7 +18,22 @@ const MAX_REVIEW_DEPTH: usize = 16;
 pub(super) const TRUNCATED: &str = "[truncated: review limit reached]";
 pub(super) const INCOMPLETE_REDACTION: &str = "[incomplete command preview: credential boundary or expansion is ambiguous; hidden text may execute actions]";
 const REDACTED: &str = "<redacted>";
-const MISSING_BEFORE: &str = "Supplied changes only. Before-state and applied diff are unavailable; no files were read for this preview.";
+const MISSING_BEFORE: &str = "Shows the change as sent; the file's current contents aren't shown.";
+const EDIT_KEYS: [&str; 8] = [
+    "content",
+    "patch",
+    "patchText",
+    "old_string",
+    "new_string",
+    "oldText",
+    "newText",
+    "edits",
+];
+const THIS_PROJECT: &str = " (this project)";
+const REMOTE_PLACE: &str = "A remote workspace";
+const ASKS_EVERY_TIME: &str = "asks every time";
+const WORKDIR_ATTRIBUTE: &str = "workdir";
+const WRITTEN_SCOPE: &str = "Commands that match this pattern, started in the same folder.";
 
 pub(super) fn mask_secrets(value: &Value) -> Value {
     let mut nodes = MAX_REVIEW_NODES;
@@ -295,75 +322,102 @@ pub(super) fn review_text(value: &str) -> String {
     escape_terminal_controls(&redacted)
 }
 
-pub(super) fn details_body(request: &PermissionRequest) -> PromptBody {
-    let mut lines = vec![Line::from(
-        "Details: supplied request data (secrets redacted)",
-    )];
-    let mut remaining = MAX_REVIEW_CHARS;
-    for resource in request.resources.iter().take(MAX_REVIEW_NODES) {
-        if remaining == 0 {
-            lines.push(Line::from(TRUNCATED));
-            break;
-        }
-        lines.push(Line::from(format!(
-            "Resource: {}",
-            review_text(&bounded_text(&resource.value, &mut remaining))
-        )));
-        if let Some(workdir) = resource.attributes.get("workdir") {
-            lines.push(Line::from(format!(
-                "Working directory: {}",
-                review_text(&bounded_text(workdir, &mut remaining))
-            )));
-        }
+/// Every line of `value` as a reader may see it: credentials redacted,
+/// controls escaped, and its own line breaks kept.
+pub(super) fn review_lines(value: &str) -> Vec<String> {
+    let mut chars = MAX_REVIEW_CHARS;
+    let mut redacted = redact_text(&bounded_text(value, &mut chars));
+    if value.contains(INCOMPLETE_REDACTION) && !redacted.contains(INCOMPLETE_REDACTION) {
+        redacted.push_str(INCOMPLETE_REDACTION);
     }
-    if request.resources.len() > MAX_REVIEW_NODES {
-        lines.push(Line::from(TRUNCATED));
-    }
-    if request.input.as_object().is_some_and(|input| {
-        [
-            "content",
-            "patch",
-            "patchText",
-            "old_string",
-            "new_string",
-            "oldText",
-            "newText",
-            "edits",
-        ]
-        .iter()
-        .any(|key| input.contains_key(*key))
-    }) {
-        lines.push(Line::from(MISSING_BEFORE));
-    }
-    let input = mask_secrets(&request.input);
-    lines.push(Line::from("Supplied input"));
-    detail_fields("input", &input, &mut lines, &mut remaining);
-    lines.push(Line::from("Technical authority and request data:"));
-    let technical = mask_secrets(&serde_json::json!({
-        "subject": request.subject,
-        "executor": request.executor,
-        "input_digest": request.input_digest,
-        "resources": request.resources,
-        "options": request.options,
-    }));
-    detail_fields("request", &technical, &mut lines, &mut remaining);
-    if remaining == 0 {
-        lines.push(Line::from(TRUNCATED));
-    }
-    PromptBody {
-        lines,
-        entries: Vec::new(),
+    let lines: Vec<String> = redacted.lines().map(escape_terminal_controls).collect();
+    if lines.is_empty() {
+        vec![String::new()]
+    } else {
+        lines
     }
 }
 
-fn detail_fields(path: &str, value: &Value, lines: &mut Vec<Line<'static>>, remaining: &mut usize) {
+/// One heading of Details and the plain lines under it.
+pub(super) struct Section {
+    pub heading: String,
+    pub lines: Vec<String>,
+}
+
+impl Section {
+    fn new(heading: impl Into<String>, lines: Vec<String>) -> Self {
+        Self {
+            heading: heading.into(),
+            lines,
+        }
+    }
+}
+
+fn places(request: &PermissionRequest) -> Vec<String> {
+    if matches!(
+        request.subject,
+        PermissionSubject::RemoteWorkcell { .. } | PermissionSubject::RemoteNative { .. }
+    ) {
+        return vec![REMOTE_PLACE.into()];
+    }
+    let project = request.presentation.project.as_deref();
+    let place = |path: &str| {
+        let mut text = tilde(path);
+        if project.is_some_and(|project| Path::new(path) == project) {
+            text.push_str(THIS_PROJECT);
+        }
+        text
+    };
+    let workdirs: BTreeSet<&str> = request
+        .resources
+        .iter()
+        .filter_map(|resource| resource.attributes.get(WORKDIR_ATTRIBUTE))
+        .map(String::as_str)
+        .collect();
+    let mut places: Vec<String> = workdirs.into_iter().map(place).collect();
+    if places.is_empty()
+        && let Some(project) = project.and_then(Path::to_str)
+    {
+        places.push(place(project));
+    }
+    places
+}
+
+fn input_lines(request: &PermissionRequest) -> Vec<String> {
+    let mut lines = Vec::new();
+    if request
+        .input
+        .as_object()
+        .is_some_and(|input| EDIT_KEYS.iter().any(|key| input.contains_key(*key)))
+    {
+        lines.push(MISSING_BEFORE.into());
+    }
+    let mut remaining = MAX_REVIEW_CHARS;
+    detail_fields(
+        "",
+        &mask_secrets(&request.input),
+        &mut lines,
+        &mut remaining,
+    );
+    if remaining == 0 {
+        lines.push(TRUNCATED.into());
+    }
+    lines
+}
+
+fn detail_fields(path: &str, value: &Value, lines: &mut Vec<String>, remaining: &mut usize) {
     if *remaining == 0 {
         return;
     }
     match value {
         Value::Object(fields) if !fields.is_empty() => {
             for (key, value) in fields {
-                detail_fields(&format!("{path}.{key}"), value, lines, remaining);
+                let child = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                detail_fields(&child, value, lines, remaining);
                 if *remaining == 0 {
                     break;
                 }
@@ -384,15 +438,112 @@ fn detail_fields(path: &str, value: &Value, lines: &mut Vec<Line<'static>>, rema
                 Value::Null => "(not supplied)".into(),
                 _ => value.to_string(),
             };
-            lines.push(Line::from(escape_terminal_controls(&bounded_text(
-                path, remaining,
-            ))));
+            lines.push(escape_terminal_controls(&bounded_text(path, remaining)));
             lines.extend(
                 bounded_text(&text, remaining)
                     .lines()
-                    .map(|line| Line::from(format!("  {}", escape_terminal_controls(line)))),
+                    .map(|line| format!("  {}", escape_terminal_controls(line))),
             );
         }
+    }
+}
+
+impl PermissionPrompt {
+    /// Everything Caudra knows about the request, as plain sections.
+    pub(super) fn details(&self) -> Vec<Section> {
+        let Some(request) = self.current() else {
+            return Vec::new();
+        };
+        let mut sections = vec![
+            Section::new(
+                if self.shell() {
+                    "What will run"
+                } else {
+                    "What it asks"
+                },
+                action_lines(request),
+            ),
+            Section::new("Where", places(request)),
+        ];
+        let mut why = vec![reason_sentence(&request.presentation.reason)];
+        if let Some(auto) = request.presentation.auto {
+            why.push(auto.phrase().into());
+        }
+        sections.push(Section::new("Why Caudra is asking", why));
+        let allowed: Vec<String> = (0..request.resources.len())
+            .filter_map(|row| {
+                let coverage = row_coverage(request, row)?;
+                let command = review_text(&request.resources[row].value);
+                Some(match coverage.asks {
+                    true => format!(
+                        "{command}: {ASKS_EVERY_TIME} ({})",
+                        coverage_phrase(coverage)
+                    ),
+                    false => format!("{command}: {}", coverage_phrase(coverage)),
+                })
+            })
+            .collect();
+        if !allowed.is_empty() {
+            sections.push(Section::new("Already allowed", allowed));
+        }
+        if let Some(section) = self.remembering_section() {
+            sections.push(section);
+        }
+        let cautions: Vec<String> = request
+            .presentation
+            .advisories
+            .iter()
+            .filter_map(|advisory| advisory.summary())
+            .collect();
+        if !cautions.is_empty() {
+            sections.push(Section::new("Decision engine", cautions));
+        }
+        sections.push(Section::new("Tool", vec![tool_text(request)]));
+        sections.push(Section::new("Input", input_lines(request)));
+        sections
+    }
+
+    /// What choices 2 and 3 would remember, rung by rung.
+    fn remembering_section(&self) -> Option<Section> {
+        let request = self.current()?;
+        let numbers: Vec<String> = self
+            .choices()
+            .iter()
+            .enumerate()
+            .filter(|(_, choice)| choice.lifetime().is_some())
+            .map(|(index, _)| (index + 1).to_string())
+            .collect();
+        let heading = match numbers.as_slice() {
+            [] => return None,
+            [one] => format!("What choice {one} allows"),
+            many => format!("What choices {} allow", many.join(" and ")),
+        };
+        let mut lines = Vec::new();
+        if self.per_row() {
+            for (row, grant) in self.row_grants().iter().enumerate() {
+                let Some(grant) = grant else {
+                    continue;
+                };
+                lines.push(format!("‹{}›", grant_label(request, row, grant)));
+                match grant {
+                    PermissionRowGrant::Pattern { definition, .. } => {
+                        lines.extend(pattern_summary(definition).lines)
+                    }
+                    PermissionRowGrant::Written(_) => {
+                        lines.extend([WRITTEN_SCOPE.to_owned(), SHELL_REACH.to_owned()])
+                    }
+                    PermissionRowGrant::Offered(_) => {
+                        if let Some(option) = grant_option(request, row, grant) {
+                            lines.extend(option_summary(request, option).lines);
+                        }
+                    }
+                }
+            }
+        } else if let Some(option) = self.chosen_authority() {
+            lines.push(format!("‹{}›", review_text(&option.label)));
+            lines.extend(option_summary(request, option).lines);
+        }
+        Some(Section::new(heading, lines))
     }
 }
 

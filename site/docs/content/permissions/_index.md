@@ -11,7 +11,7 @@ Caudra reviews a tool's action before it sends the call to the tool. Reusable de
 
 Permissions control consent. They do not sandbox shell commands or external MCP processes.
 
-In a [remote workspace](/docs/remote-workspaces/#project-context-and-trust), local file grants do not cover remote resources. Remote project permission denies apply immediately, while allows require review of the exact fetched asset. A remote call that can change the workspace, such as a shell command or a file write, can be allowed only as `This exact call`. Caudra approval cannot override the Workcell server's immutable policy.
+In a [remote workspace](/docs/remote-workspaces/#project-context-and-trust), local file grants do not cover remote resources. Remote project permission denies apply immediately, while allows require review of the exact fetched asset. A remote call that can change the workspace, such as a shell command or a file write, can be remembered only as `this call`. Caudra approval cannot override the Workcell server's immutable policy.
 
 ## Resolution order
 
@@ -70,71 +70,243 @@ Delivery exposes the message to the recipient's model provider as conversation c
 
 ## Permission prompts
 
-The prompt separates the action, future scope, lifetime, context, and warnings into review cards. Context identifies why approval is needed and the requester when present. `y` allows this call once. `s` remembers the displayed scope for the conversation, and `a` remembers it for the project. Routine narrow approvals act directly, without a separate Remember screen or preliminary confirmation.
+A prompt asks one question, such as `Allow shell command?` or `Allow fetching a web page?`, and offers numbered answers. Above them it shows the request as the tool receives it. Likely secret values and URL query values are masked, and terminal controls are escaped. The folder a command starts in appears when it is not the project root, and a path outside the project is marked `⚠ Outside this project`. The right edge of the title names the subagent that asks, the place in the queue, such as `1 of 3`, and how many commands of a batch need an answer.
 
-Local exact-shell calls with fully matched input and prepared context use a compact review. It shows the command, working directory, lifetime, and any warnings, with `Exact call only` and `Same reviewed preparation` describing the retained scope.
+```text
+╭ Allow shell command? ────────────────────────────────────────────────────────╮
+│                                                                              │
+│  cargo test -p caudra-agent permissions::structured                          │
+│                                                                              │
+│  ❯ 1. Yes                                                                    │
+│    2. Yes, and allow ‹cargo test *› for this conversation                    │
+│    3. Yes, and always allow ‹cargo test *› in this project                   │
+│    4. No, and tell the agent what to do instead                              │
+│                                                                              │
+│  ←→ scope  e customize  ? details  Esc no                                    │
+╰──────────────────────────────────────────────────────────────────────────────╯
+```
 
-Already covered resources are collapsed behind a count. Expand them with `c` to see the covering scope and authority, such as `already allowed · project · rg *`.
+The phrase between `‹` and `›` is the scope a remembered answer covers. A command offers `this exact command`, any suggested templates such as `cargo check -p <pattern1>`, and token prefixes such as `cargo test *`. It starts on a suggested template, else on the prefix, else on the exact command. A web page starts on `this page and below`, and a file read on `this file`. `Left` and `Right` narrow or widen the scope before you answer, and the answers change with it. Blanket grants such as `any shell command` are offered only in [Customize](#customize).
 
-Shell reviews use the supplied command text when available. Likely secret values and URL query values are masked, and terminal controls are escaped.
+Warnings appear above the answers as `⚠` lines. They name a protected path, a line Caudra cannot check command by command, the reach of the selected scope, or a [decision engine](#decision-engine-advice) caution such as `⚠ May delete files (88%)`. A muted line explains an unusual reason for asking, such as `While planning, approvals last for this conversation.` or a line starting with `Auto asked:`. Details gives the usual reason.
+
+The answers depend on what can be remembered:
+
+| Request | Answers |
+|---|---|
+| Most requests | `Yes`, `Yes, and allow ‹scope› for this conversation`, `Yes, and always allow ‹scope› in this project`, `No, and tell the agent what to do instead` |
+| Plan mode, or no project to bind a rule to | The same without the project answer, renumbered |
+| A line Caudra cannot check command by command, such as an inline script | `Yes, run it once`, `No, and tell the agent what to do instead` |
+
+The `No` answer opens a one-line field for guidance. `Enter` sends the guidance to the agent, and an empty field denies without it. `Esc` leaves the field without answering.
 
 | Key | Action |
 |---|---|
-| `y` | On the main prompt, allow this exact call once |
-| `s` | Allow the displayed future scope for the conversation |
-| `a` | Allow the displayed future scope for the project, when available |
-| `r` / `?` | Open the optional scope editor without approving |
-| `v` / `F2` | Open or close Details |
-| `c` | Expand or collapse already covered resources |
-| `Tab` / `Shift-Tab` | Move focus between controls |
-| `Enter` | Activate the focused control |
-| `Up` / `Down` | With a scope control focused, select an authority or command row |
-| `Left` / `Right` | With a scope control focused, narrow or widen that row |
-| `p` | In the scope editor, use the scope and return to the main prompt without approving |
-| `i` | In the scope editor, inspect an available argument pattern |
-| `e` | In the scope editor, write a command prefix pattern |
-| `A` | In the scope editor, review a global approval when available |
-| `g` / `n` | Add guidance and deny once |
-| `d` / `D` | In the scope editor or Details, review a project / global exact-call deny |
-| `PageUp` / `PageDown` | Scroll the body when it does not fit |
-| `Esc` | Return from a panel or editor. From the main prompt, deny once |
-| `Ctrl-C` | Deny once |
+| `1` to `4` | Choose that answer |
+| `y` / `s` / `a` / `n` | Yes, allow for this conversation, allow in this project, or No with guidance. A letter does nothing when its answer is not offered |
+| `Up` / `Down`, `k` / `j` | Move the highlight |
+| `Enter` | Choose the highlighted answer |
+| `Left` / `Right` | Narrow or widen the scope of the focused command |
+| `Tab` / `Shift-Tab` | Focus the next or previous new command of a [batch](#per-command-scopes) |
+| `<` / `>` | Narrow or widen every new command of a batch |
+| `e` | Open [Customize](#customize), or the [step-through](#step-through) when several commands need an answer |
+| `?` | Open or close [Details](#details) |
+| `PageUp` / `PageDown` | Scroll a prompt that does not fit |
+| `Esc` | Deny from the answers or Details. Elsewhere, go back without answering |
+| `Ctrl-C` | Deny |
 
-Controls also support mouse input. Opening the scope editor or inspecting a suggestion grants nothing. On the main prompt, `y` allows this exact call once, regardless of the selected future scope.
+Answers and footer keys also take mouse clicks. A click counts when the press and the release land on the same answer. An answer needs a key press made after the prompt was drawn, so a held or repeated key cannot answer a prompt you have not seen. Terminals that report key releases rearm on release. On older terminals, a key that would carry over into the next decision makes the footer read `Press Tab, then press the key again.`
 
-Higher-impact reusable scopes and global decisions require an extra confirmation. It shows a frozen human-readable summary of the authority, lifetime, project binding, and any required phrases. It does not require interpreting a JSON rule. In this confirmation, `Enter` or `y` confirms the displayed decision, including reusable authority, when no phrase is required. Unrestricted URL, search, shell, and MCP authorities require a typed phrase followed by `Enter`. Incomplete or truncated authority summaries disable approval until they can be reviewed.
+For eligible reads, the scope starts on `this file` or `these files`. This remembers the resource rather than the full input, so reading the same file with another `offset` or `limit` does not need a new grant. Exact-path search grants still constrain the search expression. The exact-call authority continues to require the complete original input. Protected paths, remote requests, plan restrictions, and unavailable persistence can limit the offered scopes and lifetimes.
 
-Advanced reviews keep distinct resource alternatives separate. All guards within an alternative apply, and unrestricted guards are labelled. Remote reviews show the trust anchor, server, workspace and generation, resource namespace, principal, remote project, scope and target keys, and authority digest. Binding IDs are percent-escaped. Display paths are labelled as display information rather than authority.
+A filesystem scope is a ladder. Its narrowest rung covers the directories the request touched, and each step up covers the directory above, as far as the filesystem root. `Left` and `Right` walk it, so widening changes the reach the answers name rather than adding answers to scroll through. A rung reaching outside the repository adds `⚠ Outside this repository`. A rung that takes in your home directory adds a red `⚠ Outside your home directory` and needs [confirmation](#confirming-broad-grants).
 
-For eligible reads, the prompt starts on `This exact path` or `These exact paths`. This remembers the resource rather than the full input, so reading the same file with another `offset` or `limit` does not need a new grant. Exact-path search grants still constrain the search expression. The exact-call authority continues to require the complete original input. Protected paths, remote requests, plan restrictions, and unavailable persistence can limit the offered scopes and lifetimes.
+A URL scope is a ladder too, walked one path segment at a time, so a page can be scoped to the section it sits in. A request for `https://example.com/path/to/sub/page` starts on `this page and below`, which covers `https://example.com/path/to/sub/page/**`. It widens through `pages under example.com/path/to/sub/` and `pages under example.com/path/` to `any page on example.com`. The scheme is shown only when it is not `https`. A path deeper than eight segments offers its eight deepest prefixes and the origin. A URL with no path offers the origin alone. `any public web page` reaches other origins, is offered only in Customize, and needs [confirmation](#confirming-broad-grants).
 
-Details presents supplied input and technical authority as scrollable, bounded named fields, with secret redaction and escaped terminal controls. Supplied edits and patches are shown as supplied, with a warning when no before-state is available. Opening Details does not run a tool or read files to construct a diff. Truncation is labelled.
-
-A filesystem authority arrives as a ladder. Its narrowest rung covers the directories the request touched, and each step up covers the directory above, as far as the filesystem root. The rungs share one row, and `Left` and `Right` walk it, so widening changes the reach the row names rather than adding choices to scroll through. A rung reaching outside the repository is marked `outside repo`. A rung that takes in your home directory is marked `outside home` and needs the `ALLOW OUTSIDE HOME` phrase. Moving to another authority and back returns the ladder to its narrowest rung.
-
-A URL authority is a ladder too. `Left` and `Right` walk it the same way, one path segment at a time, so a page can be scoped to the section it sits in. A request for `https://example.com/path/to/sub/page` starts at `https://example.com/path/to/sub/page/**` and widens through `https://example.com/path/to/**` and `https://example.com/path/**` to `https://example.com/**`, where the row reads `Any page on this origin`. A path deeper than eight segments offers its eight deepest prefixes and the origin. A URL with no path offers the origin alone. Reaching other origins is a separate authority that needs the `ALLOW ANY URL` phrase.
-
-Multiple requests are queued by request ID. A subtask request cannot replace a prompt from the main agent or another subtask. Allow once resolves only the selected request. Terminals reporting key releases rearm on release. Older terminals may show `Tab, then retry` when the same key would cross into another decision.
+Multiple requests are queued by request ID. A subtask request cannot replace a prompt from the main agent or another subtask. `Yes` resolves only the selected request.
 
 When policy changes, each pending request rechecks its own current policy and refreshes partial coverage. Separate grants for A and B can cumulatively settle a request needing both. Automatic settlement requires complete coverage under the current deny, ask, lifetime, and workspace restrictions. Policy is checked again before execution, so stale displayed coverage cannot authorize a call. Conversation, project, and global lifetimes limit which waiting requests can share approval.
 
+### Customize
+
+`e` opens Customize in place of the answers, with every scope and lifetime the request offers. On a batch, `e` opens the [step-through](#step-through) instead, and Customize opens from its Review page. `Esc` returns to where Customize was opened without answering.
+
+```text
+╭ Allow shell command? · Customize ────────────────────────────────────────────╮
+│                                                                              │
+│  cargo test -p caudra-agent permissions::structured                          │
+│                                                                              │
+│  Effect     [Allow]  Deny                                                    │
+│  Remember    Once  [This conversation]  This project   All projects          │
+│  Scope        this exact command                                             │
+│             ❯ cargo test *                                                   │
+│               your own pattern…                                              │
+│               any command in this project  ⚠ broad                           │
+│               any shell command  ⚠ broad                                     │
+│                                                                              │
+│  Tab next field  ↑↓ choose  Enter apply  v advanced  Esc back                │
+╰──────────────────────────────────────────────────────────────────────────────╯
+```
+
+| Field | Choices |
+|---|---|
+| Effect | Allow, or Deny to refuse the request once, for this project, or for all projects |
+| Remember | Once, This conversation, This project, or All projects, limited to the lifetimes the chosen scope allows |
+| Scope | The ladder from the main view, then `your own pattern…` and the blanket grants marked `⚠ broad`. A suggested template is marked `suggested` |
+
+Opened from the step-through's Review, Customize lists scopes for the whole line: these commands exactly and the blanket grants. Under Deny it offers `this exact script`.
+
+| Key | Customize action |
+|---|---|
+| `Tab` / `Shift-Tab` | Focus the next or previous field |
+| `Up` / `Down` | Choose a scope |
+| `Left` / `Right` | Switch the effect while Effect is focused, otherwise change how long |
+| `Enter` | Apply, or open the field for [your own pattern](#writing-your-own-pattern) |
+| `i` | Open the [argument pattern inspector](#argument-pattern-inspector) on a template |
+| `v` | Show or hide the full rule the chosen scope would store |
+| `?` | Open [Details](#details) |
+| `Esc` | Go back without answering |
+
+### Confirming broad grants
+
+Some scopes reach far enough that Caudra asks again before it stores them. Choosing one adds a red line naming what the agent could then do, such as `⚠ The agent could run any shell command without asking.` For this conversation, press `Enter` again to confirm. A project or global rule needs its phrase typed exactly:
+
+| Phrase | Scope |
+|---|---|
+| `ALLOW BROAD SHELL ACCESS` | Any shell command, any command in a folder, or a pattern of your own with one literal word |
+| `ALLOW OUTSIDE HOME` | A folder that takes in your home directory |
+| `ALLOW DIRECTORY CHANGES` | Changes anywhere below a folder |
+| `ALLOW FILE CHANGES` | Changes to the files of this request |
+| `ALLOW ANY URL` | Any public web page |
+| `ALLOW ANY SEARCH` | Any search query |
+
+A whole MCP tool can be allowed for this conversation only, so it needs the second `Enter`. Scopes that reach protected files, writes outside the project, and widened [argument patterns](#argument-pattern-inspector) also need the second `Enter`. When several remembered commands need confirmation, the strongest one applies, and phrases are asked in command order. `Esc` goes back without answering.
+
+### Details
+
+`?` opens Details over the prompt, and `?` again closes it. `Esc` in Details denies the request. Details lists plain sections, each shown only when it has something to say:
+
+| Section | Content |
+|---|---|
+| What will run | The full command, or what the tool asks for |
+| Where | The folder or workspace it applies to |
+| Why Caudra is asking | The reason, and the `Auto asked:` line when Auto left it to you |
+| Already allowed | Each covered command and the rule that covers it |
+| What choices 2 and 3 allow | What each remembering answer would store, scope by scope |
+| Decision engine | Every [caution](#decision-engine-advice) with its likelihood |
+| Tool | The tool and where it comes from, such as `shell (built-in)` |
+| Input | The input as the tool receives it, with likely secrets masked |
+
+A value that Caudra stores only as a fingerprint reads `a fixed value Caudra can't show`.
+
 ## Per-command scopes
 
-A shell call can contain several commands. The scope editor gives each reviewed command its own row. A row starts on `this command`, which remembers that exact command in its reviewed workdir. Wider choices can include a suggested argument pattern or a token prefix such as `git status *`. Narrowing past the start reaches `this call only`, which remembers nothing for that command. Already covered rows start there and remain collapsed until expanded with `c`.
+A shell line can run several commands. When it does, the prompt gives each command its own row, in the order the line runs them, and the title counts the new ones:
 
-The main prompt counts unresolved rows, such as `Needs approval: 2 of 5 commands`. Every command needs authorization before the whole call is submitted. Shell effects are not transactional and are not rolled back if a later command fails.
+```text
+╭ Allow shell commands? ─────────────────────────────────────────── 3 of 6 new ╮
+│                                                                              │
+│  cargo fmt -p caudra-agent && cargo clippy -p caudra-agent --tests && rm     │
+│    -rf target/tmp && git push origin HEAD && rg -n TODO src && head          │
+│                                                                              │
+│  ▸ new      cargo fmt -p caudra-agent           ‹cargo fmt *›                │
+│    new      cargo clippy -p caudra-agent --te…  ‹cargo clippy *›             │
+│    new      rm -rf target/tmp                   ‹this exact command›         │
+│    asks     git push origin HEAD                git push * · config          │
+│    allowed  rg -n TODO src                      read-only                    │
+│    allowed  head                                read-only                    │
+│                                                                              │
+│  ❯ 1. Yes                                                                    │
+│    2. Yes, and allow these 3 commands for this conversation                  │
+│    3. Yes, and always allow these 3 commands in this project                 │
+│    4. No, and tell the agent what to do instead                              │
+│                                                                              │
+│  Tab next  ←→ scope  <> all  e one by one  ? details  Esc no                 │
+╰──────────────────────────────────────────────────────────────────────────────╯
+```
 
-With the scope control focused, `Left` and `Right` walk the selected row. Both ends clamp rather than wrap. Unsupported shell expressions remain subject to [exact-call review](#shell-parsing).
+| Status | Meaning |
+|---|---|
+| `new` | Needs an answer. The row shows the scope a remembering answer stores for it |
+| `asks` | An ask rule covers it, so it asks every time and cannot be remembered. The row names the rule and its source |
+| `allowed` | Already covered. The row names what covers it, such as `read-only`, `built-in`, `rg * · project`, or `this conversation` |
 
-The scope you pick controls what Caudra remembers, never which commands are submitted. `this call only` means run now without remembering, not skip the command. Shell operators still determine execution order and conditional execution. Confirming reusable scopes stores separate rules, so `/permissions` lists commands separately and revoking one leaves the others in place. The lifetimes offered are the ones every granted row allows.
+More than three allowed rows fold into one line, such as `+ 5 already allowed`, and Details lists them.
 
-When one selected row covers another, the prompt identifies the covering row and scope without adding a duplicate rule. Narrowing the covering row restores the other row's choice. Displayed coverage from existing policy does not discard an explicitly selected grant. It is presentation information, not authorization.
+`▸` marks the focused row. `Tab` and `Shift-Tab` move between the new rows, `Left` and `Right` walk the focused row's ladder, and `<` and `>` move every new row one step. A row at the end of its ladder stays put. Each ladder runs narrowest first: `this time only`, `this exact command`, suggested templates, then token prefixes from the longest to the shortest. A row starts on its suggested template, else on its prefix, else on the exact command.
 
-Composed grants are validated together and stored atomically. A failed write leaves no partial grant set. Conversation grants are also added together after validation.
+Answers 2 and 3 count the rows they remember, as in `these 3 commands`, or name the scope when only one row is remembered. With every row on `this time only`, they are left out. Answer 2 remembers each row for this conversation, and answer 3 in this project. The [step-through](#step-through) gives each command its own lifetime.
+
+The scope you pick controls what Caudra remembers, never which commands run. `this time only` runs the command now without remembering it. Shell operators still decide execution order and conditional execution, and the effects of earlier commands stay when a later one fails. Each remembered row becomes its own rule, so `/permissions` lists the commands separately and revoking one leaves the others in place.
+
+A chosen scope can cover another row. Caudra then stores only the covering rule, as long as it lasts at least as long as the other row. Rules you already have never replace a scope you chose. They change what the rows show and leave authorization to the policy check.
+
+Remembered rows are validated together and stored in one transaction, so a failed write leaves no partial set. An [ephemeral session](/docs/sessions/#ephemeral-sessions) keeps its conversation in a separate database. Its project and global rules are stored first, and a failed conversation write withdraws them before the prompt reopens.
+
+A line Caudra cannot check command by command, such as one running an inline script, keeps its rows and offers only `Yes, run it once` and `No`. [Shell parsing](#shell-parsing) lists what makes a line uncheckable.
+
+### Step-through
+
+`e` on a batch opens the step-through at the focused row. It has a page for each new command and a final Review page. The tabs at the top name each command by its executable and subcommand, and a visited page gets `✓`.
+
+```text
+╭ Allow shell commands? ─────────────────────────────────────────── 3 of 6 new ╮
+│                                                                              │
+│   cargo fmt │ cargo clippy │ rm │ Review                                     │
+│                                                                              │
+│  cargo fmt -p caudra-agent                                                   │
+│                                                                              │
+│    1. This time only                                                         │
+│    2. This exact command                                                     │
+│  ❯ 3. cargo fmt *                                                            │
+│    4. Your own pattern…                                                      │
+│                                                                              │
+│  Remember for ‹this conversation›                                            │
+│                                                                              │
+│  ↑↓ scope  ←→ how long  Enter choose  Tab next  Esc back                     │
+╰──────────────────────────────────────────────────────────────────────────────╯
+```
+
+A page lists the command's whole ladder as numbered answers, with badges such as `suggested`. `Your own pattern…` opens a field for [a pattern of your own](#writing-your-own-pattern). `Remember for` sets how long this command is remembered: this conversation, this project, or all projects. It offers only the lifetimes the chosen scope allows and is hidden while `This time only` is chosen. In plan mode it offers only this conversation.
+
+| Key | Page action |
+|---|---|
+| `Up` / `Down` | Move the highlight |
+| `Enter` or a number | Choose that scope and go to the next page |
+| `Left` / `Right` | Change how long this command is remembered |
+| `Tab` / `Shift-Tab` | Go to the next or previous page without choosing |
+| `i` | Open the [argument pattern inspector](#argument-pattern-inspector) on a template |
+| `Esc` | Discard the draft and return to the main view |
+
+Review lists every command with its scope and lifetime. Asking and allowed commands say so.
+
+```text
+╭ Allow shell commands? ─────────────────────────────────────────── 3 of 6 new ╮
+│                                                                              │
+│   cargo fmt │ cargo clippy │ rm │ Review                                     │
+│                                                                              │
+│  cargo fmt -p caudra-agent       cargo fmt *             this project        │
+│  cargo clippy -p caudra-agent …  cargo clippy *          this conversation   │
+│  rm -rf target/tmp               this time only                              │
+│  git push origin HEAD            asks every time         git push * · config │
+│  rg -n TODO src                  already allowed         read-only           │
+│  head                            already allowed         read-only           │
+│                                                                              │
+│  ❯ 1. Yes, and remember as listed                                            │
+│    2. No, and tell the agent what to do instead                              │
+│    3. More options for the whole script…                                     │
+│                                                                              │
+│  ↑↓ choose  Enter confirm  Shift-Tab back  Esc main view                     │
+╰──────────────────────────────────────────────────────────────────────────────╯
+```
+
+`Yes, and remember as listed` (`y`) stores each command for its own lifetime, and reads `Yes, run them once` when nothing would be remembered. `No` (`n`) asks for guidance as in the main view. `More options for the whole script…` opens [Customize](#customize) with scopes for the whole line. `Shift-Tab` returns to the last page, and `Esc` to the main view.
+
+Only Review applies the draft. A policy change while the step-through is open keeps your choices, unless it withdraws a scope you chose. That row then falls back to its default, and the next answer needs a fresh key press.
 
 ### Argument pattern inspector
 
-When a row has a suggested pattern, press `i` in the scope editor. The inspector shows fixed command words, variable argument positions, working directory, evidence, and a current-call match preview. Patterns match parsed static arguments. They never interpolate captured values into command text.
+A suggested template such as `cargo check -p <pattern1>` can be inspected and edited before it is stored. Press `i` on it in Customize or on a step-through page. The inspector shows fixed command words, variable argument positions, working directory, evidence, and whether the current command matches. Patterns match parsed static arguments. They never interpolate captured values into command text.
 
 Use `Tab` to focus controls, then arrows to select a slot or mode. The mode shortcuts are:
 
@@ -144,11 +316,11 @@ Use `Tab` to focus controls, then arrows to select a slot or mode. The mode shor
 | `2` | Exact | One exact literal value |
 | `3` | Glob | One entire argument matched by a glob |
 | `4` | Regex | One entire argument matched by a regular expression |
-| `5` | Any | Any one literal argument, subject to the fixed option guard |
+| `5` | Any | Any one literal argument. Values that look like options stay refused |
 
 `e` edits a constraint, `o` shows observed values, and `c` switches between observed tuples and independent combinations when available. `N` edits the pattern name and `n` edits a slot label. Names are display labels and do not change matching or rule identity. The executable, fixed arguments, argument count, and slot positions stay fixed.
 
-For example, `cargo check -p <pattern1>` can restrict its variable argument to the observed values `caudra-agent` and `caudra-ui`. It does not cover another executable, another subcommand, or extra arguments. Option-looking values remain rejected unless the host has proved the position is data. Choosing Any does not remove that guard.
+For example, `cargo check -p <pattern1>` can restrict its variable argument to the observed values `caudra-agent` and `caudra-ui`. It does not cover another executable, another subcommand, or extra arguments. Option-looking values remain rejected unless the host has proved the position is data. Choosing Any keeps that check.
 
 Slots with an unknown role can include arguments after fixed flags. That position does not prove the argument is data or establish the flag's arity. These values can select program operations, so the inspector and approval review caution against widening them.
 
@@ -158,16 +330,16 @@ Glob matching is case-sensitive over UTF-8 bytes. `?` matches one byte, `*` excl
 
 Regex uses Rust's finite-automata regular-expression engine, with whole-argument matching. Regular constructs such as alternation, groups, and repetition work. PCRE look-around and backreferences do not. Expressions, nesting, compiled size, input, and retained evidence are bounded. Invalid or oversized expressions show a compile error and cannot be used.
 
-`p` uses a valid scope and returns to the main prompt without granting it. A known current-call mismatch must be fixed or approved once instead. Policy rechecks the complete call on approval. Glob, Regex, Any, and independent multi-slot combinations require extra review. A remembered pattern is explicit execution authority, even for an unfamiliar CLI. It never makes that command read-only or sandboxed.
+`p` takes a valid pattern back to the page or to Customize without answering, and `Esc` leaves the inspector without it. A pattern that does not match the current command must be fixed or the command run once instead. Policy rechecks the complete call on approval. Glob, Regex, Any, and independent multi-slot combinations need a [second `Enter`](#confirming-broad-grants) before they are stored. A remembered pattern is explicit execution authority, even for an unfamiliar CLI. It never makes that command read-only or sandboxed.
 
 ### Writing your own pattern
 
-For a token prefix instead of an argument pattern, press `e` on a command row in the scope editor. A prefix must end in `*`, hold at least one literal token before it, use at most eight tokens, and match the command on that row. Caudra refuses anything else and names the reason. This editor validates text without running it.
+To remember a token prefix of your own, choose `your own pattern…` in Customize or `Your own pattern…` on a step-through page. A prefix must end in `*`, hold at least one literal token before it, use at most eight tokens, and match the command. The line under the field says whether it matches or names the reason it is refused. `Enter` accepts a matching pattern and `Esc` leaves the field. Caudra validates the text without running it.
 
 Two patterns are accepted with a caution:
 
-- A pattern with one literal covers a whole program, such as `python *`. It is marked `[any invocation]` and needs the `ALLOW BROAD SHELL ACCESS` phrase. Typing a pattern Caudra offers on that row, such as `ls *`, is graded like the offered rung rather than as a broad grant.
-- A pattern overlapping a builtin always-ask family, such as `git push *`, is marked `[always-ask family]`. It is allowed because those are often the commands worth shortcutting, but read it before confirming.
+- A pattern with one literal covers a whole program, such as `python *`. It reads `⚠ Any use of this program.` and needs the same [confirmation](#confirming-broad-grants) as `any shell command`. Typing a pattern Caudra offers for that command, such as `ls *`, is graded like the offered scope rather than as a broad grant.
+- A pattern overlapping a builtin always-ask family, such as `git push *`, reads `⚠ Overlaps commands Caudra always asks about.` It is allowed because those are often the commands worth shortcutting, so read it before confirming.
 
 Grading is structural. It checks the shape of the pattern and that it matches the command, and it cannot know what a program does with its arguments. `sed -n *` grades clean, yet GNU `sed` can run shell commands through the `e` escape. Write patterns for programs whose arguments you understand.
 
@@ -197,7 +369,7 @@ The overview reports `Not scanned`, `Loading`, `Ready`, `Partial`, `Unavailable`
 
 Imported proposals need at least two observations from two independent parent sessions. Repeated commands in one session are insufficient. An empty list can also reflect unsupported or sensitive commands, sample limits, or dismissed and snoozed definitions.
 
-In Discover, select a proposal to read its command shape, constraints, evidence, and examples. `Enter` focuses its details without granting it. The separate evidence inspector wraps text and supports `Up` / `Down`, `PageUp` / `PageDown`, and mouse-wheel scrolling.
+Each proposal reads like `Seen 12× in 4 conversations: cargo test -p <pattern1>`. Proposals from imported history count sessions instead of conversations. Select one to read its command shape, constraints, evidence, and examples. `Enter` focuses its details without granting it. The separate evidence inspector wraps text and supports `Up` / `Down`, `PageUp` / `PageDown`, and mouse-wheel scrolling.
 
 Create permission opens an editable draft. Select the currently registered local shell target and supply concrete command text and an absolute workdir for fresh host analysis. Historical tool identity and context do not authorize the new rule. Configure its input constraints and lifetime, then review and Save as described under [Stored rules](#stored-rules). A matching live prompt is not required. Opening the draft or analyzing its source grants nothing.
 
@@ -213,7 +385,9 @@ The main agent's [`plan` tool](/docs/tools/#plan) can read or replace only the c
 
 While plan mode is active, Caudra withholds the authority that would outlive the plan. Remembered project and global rules do not apply, allows from `permissions.toml` do not apply, and the prompt offers only the once and conversation lifetimes. Deny and ask rules still apply, because they only restrict access.
 
-A conversation grant made while planning does apply for the rest of the plan. Approving broad shell authority for the conversation lets the agent keep exploring with scripts and searches instead of asking about each command. The grant stays with the conversation after you leave plan mode. Allow once covers only the current call.
+A conversation grant made while planning does apply for the rest of the plan. Approving broad shell authority for the conversation lets the agent keep exploring with scripts and searches instead of asking about each command. The grant stays with the conversation after you leave plan mode. `Yes` covers only the current call.
+
+Reading this project's plans and memory notes never asks, in plan mode or any other mode. The file and code tools may read the `plans/` and `memories/` directories under `…/state/caudra/projects/<project-id>/` (see [Directory layout](/docs/configuration/#directory-layout)). The allowance covers reads only, and another project's documents still ask. A symlink inside those directories cannot carry a read outside them. Tools in a remote workspace run on another machine, so they get no such allowance.
 
 ## Read-only agents
 
@@ -223,11 +397,24 @@ A line is admitted when the classifier rules every command in it read-only and e
 
 The confinement check resolves symlinks before it answers, so a link checked into the repository cannot carry a read out of the project. It says nothing about what an admitted command reads inside the project: a read-only agent can still read any file you have.
 
+A read-only agent's file tools can also read this project's plans and memory notes without asking, as described under [Plan mode](#plan-mode). A shell line reading them is refused, because they sit outside the project.
+
 Profiles cannot relax this restriction. Safe lazy tools remain discoverable through `tool_search`, but loading a schema cannot grant write access or the main agent's active plan capability.
 
 ## Stored rules
 
-Use `/permissions` to manage stored conversation, project, and global rules and inspect policy. On a rule, `Enter` focuses its scope details without editing or revoking it. Details show named inputs, typed targets, context, and authority constraints. Missing values are marked unavailable or opaque. Builtin, configured, and trusted-plugin policy appears alongside stored rules. Project-config trust rows open a separate confirmation.
+Use `/permissions` to manage stored conversation, project, and global rules and inspect policy. Builtin, configured, and trusted-plugin policy appears alongside stored rules. Each row reads as a sentence: the effect, the scope, how long it lasts, and who added it.
+
+```text
+Allow  cargo test *              this project       you
+Deny   git status --short        this conversation  you
+Ask    bash: git push *          always             config
+Allow  bash: git log *           always             built-in
+```
+
+A stored rule lasts for `this conversation`, `this project`, or `all projects`, and policy reads `always`. `other project`, `inactive`, and `revoked` mark rules that do not apply here. The origin is `you`, `config`, `plugin`, or `built-in`.
+
+The detail pane summarizes the selected rule in plain words: what it allows or refuses, where, for how long, and who added it. `Enter` focuses the pane without editing or revoking anything. The full scope, with named inputs, typed targets, context, and authority constraints, appears in Edit. Project-config trust rows open a separate confirmation.
 
 | Key | Manager action |
 |---|---|
@@ -250,7 +437,7 @@ In Rule, choose a registered target, effect, lifetime, and project binding. Capa
 
 Authoring uses the current host catalog, not tool names or arbitrary identity text. The implemented provider supports audited local Workcell registrations, subject to the current tool filter, agent mode, and host availability. Remote, MCP, and plugin tool authority authoring is unavailable. Existing active rules remain inspectable and revocable. Label-only edits preserve their authority. Revoked records are inspection-only.
 
-Targets offers only the selected registration's resource kinds, access types, guards, and match modes:
+Targets offers only the selected registration's resource kinds, access types, conditions, and match modes:
 
 | Resource | Offered match modes |
 |---|---|
@@ -260,11 +447,11 @@ Targets offers only the selected registration's resource kinds, access types, gu
 | Search query | Exact query, Any |
 | Isolated Python or environment-inspection custom resource | Exact value, Any |
 
-Shell targets can have an exact, subtree, or Any workdir guard. Directory targets offer an exact recursion guard. Glob and Regex are command-slot modes, not general resource match modes. Target alternatives are `ANY OF`, while access, protection, and attribute guards within one alternative are `ALL OF`. Removing the last target leaves an invalid blank. Unrestricted resources and wildcard guards require explicit choices.
+Shell targets can have an exact, subtree, or Any workdir condition. Directory targets offer an exact recursion condition. Glob and Regex are command-slot modes, not general resource match modes. A rule matches when any of its targets does, and a target matches when all of its access, protection, and attribute conditions hold. Removing the last target leaves an invalid blank. Unrestricted resources and wildcard conditions require explicit choices.
 
 Arguments constrains the whole tool input independently of targets. Choose exact JSON input, selected JSON pointers, or explicitly unconstrained input. Missing input is distinct from JSON `null`. Changing a target does not remove an existing input constraint. Supply replacement input or explicitly choose Keep old input pin when retaining that constraint is intended.
 
-Stored hashes and sanitized review labels do not recover editable values. Opaque constraints remain preserved until you choose a replacement mode and enter a value. Label-only changes can keep them unchanged. New rules, copies, and authority expansions require reviewable values. A display label cannot substitute for a missing target or input.
+A value Caudra stores only as a fingerprint reads `a fixed value Caudra can't show`, and sanitized review labels do not recover it. Such a constraint stays in force until you choose a replacement mode and enter a value. Label-only changes can keep it unchanged. New rules, copies, and authority expansions require reviewable values. A display label cannot substitute for a missing target or input.
 
 Choose Preview (`Ctrl-P`), inspect the before/after Changes and resulting Scope, and confirm the listed authority changes when required. Save (`Ctrl-S`) is a separate action and waits for durable acknowledgment. Background validation never saves. Draft or context changes invalidate the reviewed preview and require fresh review. Saving a grant or relaxing a restriction can release pending requests after policy rechecks.
 
@@ -272,7 +459,7 @@ Choose Preview (`Ctrl-P`), inspect the before/after Changes and resulting Scope,
 
 To create a template without a live request or historical proposal:
 
-1. Choose New and select the registered local shell target. In Targets, add a Command target and configure its access and protection guards.
+1. Choose New and select the registered local shell target. In Targets, add a Command target and configure its access and protection conditions.
 2. Open Template. Enter a concrete Source for analysis, an absolute Analysis workdir, and a template name. Choose Create template.
 3. The host derives the argument list, roles, and execution context through nonexecuting analysis. The initial template has only fixed literal arguments and no slots.
 4. Select an eligible data or unknown-role argument and use Add/unlink slot to make it variable. Configure the remaining Rule and Arguments fields, then Preview, review, and Save.
@@ -463,7 +650,7 @@ Caudra binds approval to one immutable MCP transport, server configuration diges
 
 Generic field names such as `path` or `command` do not create reusable resource authority. External servers control their schemas, so Caudra treats these values as display information unless the host has a trusted typed profile.
 
-The TUI can select broad whole-tool MCP authority for the current conversation. It requires the `ALLOW MCP TOOL` confirmation phrase and cannot be stored for a project or globally. ACP and SDK clients remain exact-only.
+In [Customize](#customize), the TUI can allow a whole MCP tool with any arguments for the current conversation. It needs a [second `Enter`](#confirming-broad-grants) and cannot be stored for a project or globally. ACP and SDK clients remain exact-only.
 
 ## Shell parsing
 
@@ -475,9 +662,37 @@ A shell prompt can offer a token prefix derived from the reviewed command. A cur
 
 A derived prefix never reaches past a flag, so `docker -H tcp://host run nginx` offers no prefix. A prefix taken from outside the table must name more than the executable and must leave at least one operand behind, which is why `git status` offers no prefix. Caudra also avoids deriving prefixes that overlap a default ask family, because storing `git checkout main *` would silence the `git checkout *` ask.
 
-Dynamic arguments, command or process substitution, unsupported control flow, wrappers such as `eval` and `sudo`, ordinary file redirects, heredocs, and parse failures require protected whole-call review. Interpreted payloads and sensitivity guards also prevent argument-pattern suggestions. Successful parsing alone does not establish reusable authority.
+Some lines cannot be checked command by command. Caudra then reviews the whole line as one protected request, names the cause in a `⚠` line, and offers only `Yes, run it once` and `No`:
 
-Configured allows, scope allows, and command patterns never cover a protected command. The two unrestricted shell authorities do, because they already authorize any command the user can write, including `tee` and an interpreter reading a script from standard input. Selecting one requires the `ALLOW BROAD SHELL ACCESS` phrase. Deny rules still apply. Builtin command-family asks do not reach protected commands, so a broad grant also silences those asks for them.
+| Cause | Examples | Warning | Auto |
+|---|---|---|---|
+| Loops and conditions | `for`, `while`, `if`, `case`, functions | `Uses loops or conditions that rules can't check` | Screened |
+| File redirects | `> out.txt`, or data in a heredoc such as `cat <<'EOF'` | `Redirects input or output in ways rules can't check` | Screened |
+| Words built at run time | `$(…)`, `<(…)`, `$((…))`, `$HOME`, assignments, `cd` to a computed path | `Builds part of the command only when it runs` | Screened |
+| Wrappers | `env`, `time`, `xargs`, `command`, `builtin`, `coproc`, `bash script.sh` | `Runs a command through another program` | Screened |
+| Inline scripts | A heredoc or here-string fed to an interpreter, `python3 -c`, `node -e`, `bash -c` | `Runs inline Python that Caudra can't check`, naming the language | Screened |
+| Indirect code | `eval`, `source`, `.` | `Runs code through eval or source` | Always asks |
+| Privilege | `sudo`, `su`, `doas` | `Runs with elevated privileges` | Always asks |
+| Unreadable | Syntax errors, an executable that is not literal, other unsupported syntax | `Caudra couldn't read this command line` | Always asks |
+
+The most severe cause names the line, so `eval` in a loop always asks. A redirect to `/dev/null` or between descriptors, such as `2>&1`, keeps a line checkable. Caudra looks inside loops, conditions, and substitutions for the commands they run. It also parses literal shell code given to `bash -c` or fed to a shell on standard input, up to two shells deep. Code that is not literal, or nested deeper, is unreadable. [Auto mode](#auto-mode) describes screening.
+
+Interpreted payloads and sensitivity guards also prevent argument-pattern suggestions. Successful parsing alone does not establish reusable authority.
+
+Configured allows, scope allows, and command patterns never cover a protected command. The two unrestricted shell authorities do, because they already authorize any command the user can write, including `tee` and an interpreter reading a script from standard input. Selecting one needs [confirmation](#confirming-broad-grants). Deny rules still apply. Builtin command-family asks do not reach protected commands, so a broad grant also silences those asks for them.
+
+Routine probes count as read-only, so they do not ask. A name lookup qualifies when every name is literal, as in `command -v rg`, `type -t cargo`, or `which jq`. A version check qualifies when its only argument is one of these:
+
+| Executables | Version argument |
+|---|---|
+| `python` | `--version`, `-V` |
+| `node`, `npm`, `pnpm`, `yarn`, `perl` | `--version`, `-v` |
+| `cargo`, `rustc`, `rustup` | `--version`, `-V` |
+| `java` | `-version`, `--version` |
+| `go` | `version` |
+| `deno`, `bun`, `ruby`, `gcc`, `clang`, `make`, `cmake`, `git`, `just`, `rg`, `jq`, `uv`, `pip`, `pip3`, `nix`, `docker` | `--version` |
+
+Versioned names such as `python3.12` count as their interpreter. `python -v` starts a verbose interpreter and `ruby -v` reads a program from standard input, so neither is listed. A path-qualified executable such as `/usr/bin/python3 --version` still asks.
 
 Caudra executes the reviewed command text unchanged. Workcell may reduce completed shell output before the model receives it. The TUI shows raw output while the command runs, then switches to a labelled filtered view that the user can toggle back to raw.
 
@@ -504,6 +719,26 @@ Auto mode is experimental and belongs to the decision engine. Turn it on with `d
 `/auto` toggles between Ask and Auto. `--auto` selects Auto at startup. The status bar shows `[auto]`, or `[a]` in a narrow terminal. Clicking the chip returns to Ask. `--auto` and `--yolo` are mutually exclusive.
 
 Auto skips prompts only when no rule covers the call and the tool's default is Prompt. Configured asks, builtin asks, protected paths, and forced prompts still require approval. In plan mode, shell calls that deterministic checks cannot prove read-only still prompt. Deny rules and default Deny remain effective.
+
+A shell line that cannot be [checked command by command](#shell-parsing), such as an inline script, needs more. Auto runs it only when a decision engine with `auto_screening = "enforce"` has read the whole line and flagged nothing, and policy did not change meanwhile. Indirect code, privilege, and unreadable lines always ask.
+
+When Auto leaves a call to you, a muted line in the prompt says why:
+
+| Line | Reason |
+|---|---|
+| `Auto asked: scripts need a decision engine to screen them` | The line needs screening and `auto_screening` is `off` |
+| `Auto asked: the decision engine only advises, so it can't approve scripts` | The line needs screening and `auto_screening` is `shadow` |
+| `Auto asked: the decision engine flagged this` | Enforced screening flagged the call |
+| `Auto asked: the decision engine couldn't check this` | The engine failed or timed out |
+| `Auto asked: this project turned off decision engine screening` | Project configuration disabled globally required screening |
+| `Auto asked: sudo, su, and doas always need your approval` | The line runs with elevated privileges |
+| `Auto asked: eval and source always need your approval` | The line runs indirect code |
+| `Auto asked: Caudra couldn't read this command line` | The line could not be parsed |
+| `Auto asked: protected files and commands always need your approval` | The call touches a protected path or command |
+| `Auto asked: a rule says to ask first` | A configured or builtin ask rule matched |
+| `Auto asked: plan mode needs your approval` | Plan mode withholds Auto |
+| `Auto asked: this tool always asks for approval` | The tool or call forces a prompt |
+| `Auto asked: Auto only decides for tools that prompt by default` | The tool's default is not Prompt |
 
 An explicit mode choice is saved with the root conversation. A command-line mode overrides the restored choice. Global `always_auto = true` supplies the default when neither exists. Global YOLO settings take precedence if both defaults are enabled. Projects cannot set `always_auto` or `always_yolo`.
 
@@ -534,9 +769,9 @@ permission_advice = "shadow"
 auto_screening = "shadow"
 ```
 
-Every feature defaults to `off`. `permission_advice = "shadow"` evaluates predictions without changing a prompt. Retaining them requires `log = true`. `"advise"` can add warnings to an already visible prompt without delaying the user's answer. `auto_screening = "shadow"` leaves Auto's deterministic baseline unchanged. `"enforce"` can turn an eligible Auto call into a prompt.
+Every feature defaults to `off`. `permission_advice = "shadow"` evaluates predictions without changing a prompt. Retaining them requires `log = true`. `"advise"` can add warnings to an already visible prompt without delaying the user's answer. `auto_screening = "shadow"` leaves Auto's deterministic baseline unchanged. `"enforce"` can turn an eligible Auto call into a prompt, and only `"enforce"` lets Auto run a line that cannot be checked command by command.
 
-Warnings identify possible deletion, uploads, credential access, permission changes, remote-history rewrites, or work outside the task. They are uncertain predictions, not proof that a call is safe or unsafe. A model's read-only prediction never grants permission.
+Each warning is a `⚠` line above the answers, with the predicted likelihood, such as `⚠ May delete files (88%)`. The warnings are `May delete files`, `May upload or send data`, `May read or use credentials`, `May change file permissions`, `May rewrite remote history`, `Looks unrelated to the task`, and `May change project files`. ACP permission requests carry the same phrases. They are uncertain predictions, not proof that a call is safe or unsafe. A model's read-only prediction never grants permission.
 
 `shell_effect = "advise"` can warn about possible project writes during Plan review when `thresholds.shell_writes` is explicitly configured. This is caution only. Deterministic checks still decide read-only access. Shadow labels use the deterministic classifier, not observed filesystem changes.
 

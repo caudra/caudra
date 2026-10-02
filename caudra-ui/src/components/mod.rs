@@ -58,6 +58,7 @@ pub(crate) mod storage_modal;
 pub(crate) mod stream_modal;
 pub(crate) mod streaming_content;
 pub(crate) mod system_prompt_modal;
+pub(crate) mod tab_bar;
 pub(crate) mod task_card;
 pub(crate) mod task_picker;
 pub(crate) mod text_editor;

@@ -1,338 +1,217 @@
-use std::path::Path;
+use std::iter::repeat_n;
 
-use caudra_agent::permissions::PermissionAdvisory;
+use caudra_agent::permissions::{
+    PermissionCaution, PermissionLifetime, PermissionRequest, PermissionResourceAccess,
+    PermissionResourceKind, PermissionRowGrant, grade_command_pattern,
+};
+use caudra_config::ToolKey;
 use caudra_grab::grab_scope;
-use caudra_workbench::text_field::FieldStyles;
+use caudra_workbench::text_field::{FieldKind, FieldStyles, TextField};
+use crossterm::event::KeyCode;
+use ratatui::Frame;
 use ratatui::buffer::Buffer;
-use ratatui::style::Modifier;
-use ratatui::widgets::Widget;
-use unicode_width::UnicodeWidthStr;
+use ratatui::layout::Rect;
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::details::{details_body, review_text, sensitive_text};
-use super::scope::{
-    INCOMPLETE_REVIEW, NO_POLICY_REASON, ReviewDocument, ReviewField, WHOLE_CALL, policy_reason,
+use super::choices::{Choice, ONCE_ONLY, grant_label};
+use super::customize::{Effect, Field, ScopeItem, scope_item_label};
+use super::decision::{grant_option, main_ladder, row_positions};
+use super::details::{review_lines, review_text};
+use super::notes::{
+    Note, RowStatus, Tone, action_lines, coverage_phrase, row_coverage, row_status,
 };
-use super::{
-    Block, BorderType, Borders, CHIP_COVERED, COVERAGE_SEPARATOR, Constraint,
-    DEFAULT_DENY_GUIDANCE, FieldKind, FooterRow, Frame, HINT_CONFIRM, HINT_ENTER, HINT_ESC,
-    KEY_ALLOW_GLOBAL, KEY_ALLOW_LOCAL, KEY_ALLOW_ONCE, KEY_ALLOW_SESSION, KEY_COVERED,
-    KEY_DENY_GLOBAL, KEY_DENY_LOCAL, KEY_DETAILS, KEY_GUIDE_DENY, Layout, Line, MIN_REVIEW_HEIGHT,
-    MIN_REVIEW_WIDTH, Panel, Paragraph, PermissionCaution, PermissionLifetime, PermissionPrompt,
-    PromptBody, PromptHit, PromptState, PromptTarget, Rect, ResourceCoverage, Span, Style,
-    TextField, Wrap, command_ladders, grade_command_pattern, hint_key, hover_style, theme,
-    visual_rows,
+use super::scope::{option_model, pattern_model};
+use super::step_through::{
+    PageItem, REVIEW_CHOICES, ReviewChoice, StepThrough, item_label, lifetime_phrase,
+    rung_lifetimes,
 };
-use crate::components::field_styles;
+use super::{Panel, PermissionPrompt, PromptHit, PromptState, PromptTarget};
+use crate::components::permission_scope::model::ScopeModel;
 use crate::components::permission_scope::pattern::PatternPanel;
-use crate::components::permission_scope::{
-    model::ScopeModel,
-    view::{Disclosure, ScopeView},
+use crate::components::permission_scope::view::ScopeView;
+use crate::components::tab_bar::{Tab, tab_spans};
+use crate::components::{
+    Hint, field_styles, hanging_lines, hint_hits, hint_line_hovered, hover_style,
 };
-use crate::theme::Theme;
+use crate::theme::{self, Theme};
 
-const CONTROL_GAP: &str = "  ";
-const RESIZE_MESSAGE: &str = "Resize to review permission. Esc denies.";
-const BORDER_ROWS: u16 = 2;
-const FOOTER_SEPARATOR_ROWS: u16 = 1;
 const MAX_CONTENT_WIDTH: u16 = 112;
-const FIELD_COLUMNS_WIDTH: u16 = 52;
-const LABEL_WIDTH: u16 = 18;
-const CARD_INSET: u16 = 2;
-const CARD_GAP: u16 = 1;
-const CANONICAL_SCOPE_DETAILS: &str = "Canonical scope details";
-const ADVISORY_TITLE: &str = "Decision engine · caution";
-const ADVISORY_GUIDANCE: &str = "Estimates only; review the action and scope.";
-const UNKNOWN_ADVISORY: &str = "Unrecognized caution flag";
-const UNAVAILABLE_PROBABILITY: &str = "estimated probability unavailable";
-pub(super) const REARM_MESSAGE: &str = "Tab, then retry the blocked key.";
+const MIN_WIDTH: u16 = 32;
+const MIN_HEIGHT: u16 = 8;
+const BORDER_ROWS: u16 = 2;
+/// The blank row above the footer, and the footer.
+const FOOTER_ROWS: u16 = 2;
+const MARGIN: u16 = 2;
+const SCROLLBAR_COLUMNS: u16 = 1;
+const MIN_ACTION_ROWS: usize = 3;
+const MAX_NOTES: usize = 3;
+const MAX_ALLOWED_ROWS: usize = 3;
+const MAX_STATUS_ROWS: usize = 3;
+const STATUS_WIDTH: usize = 9;
+const MIN_COLUMN: usize = 6;
+const FIELD_LABEL_WIDTH: u16 = 11;
+const NUMBER_INDENT: usize = 5;
+const POINTER: &str = "❯ ";
+const NO_POINTER: &str = "  ";
+const ROW_FOCUS: &str = "▸ ";
+const FIELD_PROMPT: &str = "› ";
+const HANG: &str = "  ";
+const WARNING_MARK: &str = "⚠ ";
+const ELLIPSIS: char = '…';
+const COLUMN_GAP: &str = "  ";
+const BADGE_SEPARATOR: &str = " · ";
+const TITLE_SEPARATOR: &str = " · ";
+const RESIZE_MESSAGE: &str = "Make the terminal larger to answer. Esc says no.";
+pub(super) const REARM_MESSAGE: &str = "Press Tab, then press the key again.";
+pub(super) const GUIDANCE_PLACEHOLDER: &str = "what to do instead (optional)";
+const PATTERN_PLACEHOLDER: &str = "a pattern ending in ` *`, such as cargo test *";
+pub(super) const PRESS_AGAIN: &str = "Press Enter again to allow, or Esc to go back.";
+const DETAILS_TITLE: &str = "Details";
+const CUSTOMIZE_TITLE: &str = "Customize";
+const OVERFLOW_HINT: &str = "? shows all";
+const REMEMBER_FOR: &str = "Remember for ";
+const EFFECT_LABEL: &str = "Effect";
+const REMEMBER_LABEL: &str = "Remember";
+const SCOPE_LABEL: &str = "Scope";
+const ASKS_EVERY_TIME: &str = "asks every time";
+const ALREADY_ALLOWED: &str = "already allowed";
+const PATTERN_MATCHES: &str = "Matches this command.";
+const PATTERN_BROAD: &str = "⚠ Any use of this program. You'll confirm it before it's saved.";
+const PATTERN_ASKING: &str = "⚠ Overlaps commands Caudra always asks about.";
 
-pub(super) fn coverage_chip(coverage: &ResourceCoverage) -> String {
-    format!(
-        "{CHIP_COVERED}{COVERAGE_SEPARATOR}{}{COVERAGE_SEPARATOR}{}",
-        coverage.origin.label(),
-        review_text(&coverage.authority)
-    )
+/// A key and what it does, for the footer. A key that is only a direction,
+/// like `←→`, cannot be clicked.
+pub(super) struct KeyHint {
+    label: &'static str,
+    description: &'static str,
+    code: Option<KeyCode>,
 }
 
-fn advisory_line(advisory: &PermissionAdvisory, t: &Theme) -> Line<'static> {
-    let caution = match advisory.flag.as_str() {
-        "deletes" => "May delete files or data",
-        "uploads" => "May send local data to a remote destination",
-        "credentials" => "May read or disclose credentials or secrets",
-        "permissions" => "May change access permissions or ownership",
-        "remote_rewrite" => "May rewrite remote shared history or data",
-        "off_task" => "May be unrelated to your requested task",
-        "shell_effect" => "May have shell side effects",
-        "writes_project_files" => "May write project files",
-        _ => UNKNOWN_ADVISORY,
-    };
-    let probability =
-        if advisory.probability.is_finite() && (0.0..=1.0).contains(&advisory.probability) {
-            format!("estimated probability {:.1}%", advisory.probability * 100.0)
-        } else {
-            UNAVAILABLE_PROBABILITY.into()
-        };
-    Line::styled(format!("{caution} · {probability}"), t.tool_warning)
+impl KeyHint {
+    pub(super) fn key(label: &'static str, description: &'static str, code: KeyCode) -> Self {
+        Self {
+            label,
+            description,
+            code: Some(code),
+        }
+    }
+
+    pub(super) fn char(label: &'static str, description: &'static str) -> Self {
+        let code = label.chars().next().map(KeyCode::Char);
+        Self {
+            label,
+            description,
+            code,
+        }
+    }
+
+    pub(super) fn inert(label: &'static str, description: &'static str) -> Self {
+        Self {
+            label,
+            description,
+            code: None,
+        }
+    }
+
+    fn hint(&self, compact: bool) -> Hint {
+        let description = if compact { "" } else { self.description };
+        match self.code {
+            Some(code) => Hint::key(self.label, code, description),
+            None => Hint::inert(self.label, description),
+        }
+    }
 }
 
-enum CardContent {
-    Text(PromptBody),
-    Fields(Vec<ReviewField>),
-    Scope(usize, ScopeModel, Box<ScopeView>, Vec<ReviewField>),
+/// A widget drawn into the body at its own place: the rule a scope stores,
+/// or the template being edited.
+enum Insert {
+    Scope(Box<ScopeModel>),
     Pattern(PatternPanel),
 }
 
-enum CardTone {
-    Action,
-    Scope,
-    Context,
-    Warning,
-}
-
-struct ReviewCard {
-    title: String,
-    content: CardContent,
-    tone: CardTone,
-    target: Option<PromptTarget>,
-}
-
-impl ReviewCard {
-    fn text(title: impl Into<String>, lines: Vec<Line<'static>>, tone: CardTone) -> Self {
-        Self {
-            title: title.into(),
-            content: CardContent::Text(PromptBody {
-                lines,
-                entries: Vec::new(),
-            }),
-            tone,
-            target: None,
-        }
-    }
-
-    fn fields(title: impl Into<String>, fields: Vec<ReviewField>, tone: CardTone) -> Self {
-        Self {
-            title: title.into(),
-            content: CardContent::Fields(fields),
-            tone,
-            target: None,
-        }
-    }
-
-    fn height(&self, width: u16) -> u16 {
-        let width = width.saturating_sub(CARD_INSET * 2).max(1);
-        let height = match &self.content {
-            CardContent::Pattern(panel) => panel.height(width, &theme::current()),
-            CardContent::Scope(_, model, _, fields) => fields_height(fields, width)
-                .saturating_add(ScopeView::summary_height(model, width))
-                .saturating_add(1),
-            CardContent::Text(body) => visual_rows(&body.lines, width).total,
-            CardContent::Fields(fields) => fields_height(fields, width),
-        };
-        height.max(1).saturating_add(BORDER_ROWS)
-    }
-
-    fn render(
-        &mut self,
-        area: Rect,
-        buffer: &mut Buffer,
-        t: &Theme,
-        focused: Option<&PromptTarget>,
-    ) -> Vec<PromptHit> {
-        let (base, border) = match self.tone {
-            CardTone::Action => (t.code_block, t.accent),
-            CardTone::Scope => (t.tool_bg.fg(t.foreground), t.panel_border),
-            CardTone::Context => (Style::new().fg(t.foreground), t.panel_border),
-            CardTone::Warning => (Style::new().fg(t.foreground), t.tool_warning),
-        };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(border)
-            .style(base)
-            .title_top(Line::styled(
-                format!(" {} ", self.title),
-                hover_style(
-                    border.add_modifier(Modifier::BOLD),
-                    self.target
-                        .as_ref()
-                        .is_some_and(|target| Some(target) == focused),
-                ),
-            ));
-        let mut inner = block.inner(area);
-        inner.x += 1;
-        inner.width = inner.width.saturating_sub(2);
-        block.render(area, buffer);
-        let mut hits = Vec::new();
-        if let Some(target) = &self.target {
-            hits.push(PromptHit {
-                area: Rect { height: 1, ..area },
-                target: target.clone(),
-            });
-        }
-        match &mut self.content {
-            CardContent::Pattern(panel) => {
-                let control = if let Some(PromptTarget::Inspector(control)) = focused {
-                    Some(control)
-                } else {
-                    None
-                };
-                hits.extend(panel.render(inner, buffer, t, control).into_iter().map(
-                    |(area, control)| PromptHit {
-                        area,
-                        target: PromptTarget::Inspector(control),
-                    },
-                ));
-            }
-            CardContent::Scope(authority, model, state, fields) => {
-                let [summary, label, details] = Layout::vertical([
-                    Constraint::Length(ScopeView::summary_height(model, inner.width)),
-                    Constraint::Length(1),
-                    Constraint::Min(0),
-                ])
-                .areas(inner);
-                let properties = matches!(
-                    state.disclosure,
-                    Some(Disclosure::Identity | Disclosure::Evidence)
-                )
-                .then(|| {
-                    fields
-                        .iter()
-                        .flat_map(|field| {
-                            [
-                                Line::styled(field.label.clone(), t.item_desc),
-                                Line::from(field.value.clone()),
-                            ]
-                        })
-                        .collect()
-                });
-                state.render_with_properties(model, summary, buffer, t, properties);
-                if self.target.is_some() {
-                    for hit in &state.hits {
-                        let target = PromptTarget::VisualScope(*authority, hit.control.clone());
-                        if focused == Some(&target) {
-                            buffer.set_style(hit.area, hover_style(Style::default(), true));
-                        }
-                        hits.push(PromptHit {
-                            area: hit.area,
-                            target,
-                        });
-                    }
-                }
-                Paragraph::new(CANONICAL_SCOPE_DETAILS)
-                    .style(t.panel_title)
-                    .render(label, buffer);
-                render_fields(fields, details, buffer, t);
-            }
-            CardContent::Text(body) => {
-                let rows = visual_rows(&body.lines, inner.width);
-                Paragraph::new(body.lines.clone())
-                    .wrap(Wrap { trim: false })
-                    .render(inner, buffer);
-                for (target, line) in &body.entries {
-                    hits.push(PromptHit {
-                        area: Rect {
-                            y: inner.y + rows.row_of(*line),
-                            height: rows.height_of(*line),
-                            ..inner
-                        },
-                        target: target.clone(),
-                    });
-                }
-            }
-            CardContent::Fields(fields) => render_fields(fields, inner, buffer, t),
-        }
-        hits
-    }
-}
-
-fn fields_height(fields: &[ReviewField], width: u16) -> u16 {
-    fields
-        .iter()
-        .map(|field| field_height(field, width))
-        .fold(0u16, u16::saturating_add)
-}
-
-fn render_fields(fields: &[ReviewField], inner: Rect, buffer: &mut Buffer, theme: &Theme) {
-    let mut y = inner.y;
-    for field in fields {
-        let height = field_height(field, inner.width);
-        let row = Rect { y, height, ..inner };
-        if field.label.is_empty() {
-            Paragraph::new(field.value.as_str())
-                .wrap(Wrap { trim: false })
-                .render(row, buffer);
-        } else if inner.width < FIELD_COLUMNS_WIDTH {
-            Paragraph::new(field.label.as_str())
-                .style(theme.tool_dim)
-                .wrap(Wrap { trim: false })
-                .render(Rect { height: 1, ..row }, buffer);
-            Paragraph::new(field.value.as_str())
-                .wrap(Wrap { trim: false })
-                .render(
-                    Rect {
-                        y: y + 1,
-                        height: height.saturating_sub(1),
-                        ..row
-                    },
-                    buffer,
-                );
-        } else {
-            let [label, value] =
-                Layout::horizontal([Constraint::Length(LABEL_WIDTH), Constraint::Min(1)])
-                    .areas(row);
-            Paragraph::new(field.label.as_str())
-                .style(theme.tool_dim)
-                .wrap(Wrap { trim: false })
-                .render(label, buffer);
-            Paragraph::new(field.value.as_str())
-                .wrap(Wrap { trim: false })
-                .render(value, buffer);
-        }
-        y += height;
-    }
-}
-
-fn field_height(field: &ReviewField, width: u16) -> u16 {
-    let measure = |text: &str, width| {
-        Paragraph::new(text)
-            .wrap(Wrap { trim: false })
-            .line_count(width) as u16
-    };
-    if field.label.is_empty() {
-        measure(&field.value, width).max(1)
-    } else if width < FIELD_COLUMNS_WIDTH {
-        1 + measure(&field.value, width).max(1)
-    } else {
-        measure(&field.label, LABEL_WIDTH)
-            .max(measure(&field.value, width.saturating_sub(LABEL_WIDTH)))
-            .max(1)
-    }
-}
-
-struct ReviewLayout {
-    cards: Vec<(Rect, ReviewCard)>,
+/// Every row the body draws and what each part does when pressed. One
+/// function builds it for drawing and for measuring, so the two agree.
+struct Body {
     width: u16,
-    height: u16,
+    lines: Vec<Line<'static>>,
+    hits: Vec<PromptHit>,
+    inserts: Vec<(Rect, Insert)>,
+    /// The rows to keep in sight: the highlighted choice, or a field.
+    reveal: Option<(u16, u16)>,
+    /// How many rows the request's text takes before it is capped.
+    action_rows: usize,
 }
 
-impl ReviewLayout {
+impl Body {
     fn new(width: u16) -> Self {
         Self {
-            cards: Vec::new(),
             width,
-            height: 0,
+            lines: Vec::new(),
+            hits: Vec::new(),
+            inserts: Vec::new(),
+            reveal: None,
+            action_rows: 0,
         }
     }
 
-    fn push(&mut self, card: ReviewCard) {
-        let height = card.height(self.width);
-        self.cards
-            .push((Rect::new(0, self.height, self.width, height), card));
-        self.height = self.height.saturating_add(height + CARD_GAP);
+    fn row(&self) -> u16 {
+        u16::try_from(self.lines.len()).unwrap_or(u16::MAX)
     }
 
-    fn total(&self) -> u16 {
-        self.height.saturating_sub(CARD_GAP)
+    fn blank(&mut self) {
+        self.lines.push(Line::default());
+    }
+
+    fn push(&mut self, lines: impl IntoIterator<Item = Line<'static>>) {
+        self.lines.extend(lines);
+    }
+
+    /// Lines that together are one control.
+    fn control(&mut self, target: PromptTarget, lines: Vec<Line<'static>>, revealed: bool) {
+        let top = self.row();
+        let height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+        self.lines.extend(lines);
+        self.hits.push(PromptHit {
+            area: Rect::new(0, top, self.width, height),
+            target,
+        });
+        if revealed {
+            self.reveal = Some((top, height));
+        }
+    }
+
+    /// Controls side by side, continuing on rows `indent` columns in when
+    /// they do not fit.
+    fn spans(&mut self, parts: Vec<(Span<'static>, Option<PromptTarget>)>, indent: u16) {
+        let mut line = Vec::new();
+        let mut x: u16 = 0;
+        for (span, target) in parts {
+            let width = u16::try_from(span.width()).unwrap_or(u16::MAX);
+            if x > indent && x.saturating_add(width) > self.width {
+                self.lines.push(Line::from(std::mem::take(&mut line)));
+                line.push(Span::raw(" ".repeat(usize::from(indent))));
+                x = indent;
+            }
+            if let Some(target) = target {
+                self.hits.push(PromptHit {
+                    area: Rect::new(x, self.row(), width.min(self.width.saturating_sub(x)), 1),
+                    target,
+                });
+            }
+            x = x.saturating_add(width);
+            line.push(span);
+        }
+        self.lines.push(Line::from(line));
+    }
+
+    fn insert(&mut self, height: u16, insert: Insert) {
+        let top = self.row();
+        self.lines.extend((0..height).map(|_| Line::default()));
+        self.inserts
+            .push((Rect::new(0, top, self.width, height), insert));
     }
 }
 
@@ -345,13 +224,182 @@ fn content_area(area: Rect) -> Rect {
     }
 }
 
+fn body_width(inner: u16) -> u16 {
+    inner.saturating_sub(MARGIN + SCROLLBAR_COLUMNS).max(1)
+}
+
+/// `text` wrapped to `width`, its later rows hanging two columns in.
+fn hang(text: &str, style: Style, width: u16) -> Vec<Line<'static>> {
+    let mut lines = hanging_lines(
+        Span::styled(HANG, style),
+        Span::styled(text.to_owned(), style),
+        width,
+    );
+    if let Some(first) = lines.first_mut() {
+        first.spans.remove(0);
+    }
+    lines
+}
+
+/// `text` wrapped under a fixed indent.
+fn indented(indent: usize, text: &str, style: Style, width: u16) -> Vec<Line<'static>> {
+    hanging_lines(
+        Span::styled(" ".repeat(indent), style),
+        Span::styled(text.to_owned(), style),
+        width,
+    )
+}
+
+fn note_lines(note: &Note, width: u16, t: &Theme) -> Vec<Line<'static>> {
+    match note.tone {
+        Tone::Warning => hang(
+            &format!("{WARNING_MARK}{}", note.text),
+            t.tool_warning,
+            width,
+        ),
+        Tone::Danger => hang(&format!("{WARNING_MARK}{}", note.text), t.error, width),
+        Tone::Muted => hang(&note.text, t.tool_dim, width),
+    }
+}
+
+/// `text` cut to `width` columns, ending in `…` when anything was cut.
+fn ellipsize(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.to_owned();
+    }
+    let mut shown = String::new();
+    let mut used = 0;
+    for character in text.chars() {
+        let columns = character.width().unwrap_or_default();
+        if used + columns + 1 > width {
+            break;
+        }
+        shown.push(character);
+        used += columns;
+    }
+    shown.push(ELLIPSIS);
+    shown
+}
+
+fn pad(mut text: String, width: usize) -> String {
+    let columns = text.width();
+    text.extend(repeat_n(' ', width.saturating_sub(columns)));
+    text
+}
+
+/// A numbered answer: `❯ 1. Yes`, its later rows hanging under the text,
+/// with any badges at the right edge when they fit there.
+fn numbered(
+    index: usize,
+    style: Style,
+    highlighted: bool,
+    label: &str,
+    badges: &[String],
+    width: u16,
+    t: &Theme,
+) -> Vec<Line<'static>> {
+    let pointer = if highlighted { POINTER } else { NO_POINTER };
+    let prefix = format!("{pointer}{}. ", index + 1);
+    let badge = badges.join(BADGE_SEPARATOR);
+    let room = usize::from(width).saturating_sub(prefix.width());
+    if !badge.is_empty() && label.width() + COLUMN_GAP.width() + badge.width() <= room {
+        let gap = room - label.width() - badge.width();
+        return vec![Line::from(vec![
+            Span::styled(prefix, style),
+            Span::styled(label.to_owned(), style),
+            Span::raw(" ".repeat(gap)),
+            Span::styled(badge, t.tool_dim),
+        ])];
+    }
+    let text = if badge.is_empty() {
+        label.to_owned()
+    } else {
+        format!("{label}{COLUMN_GAP}{badge}")
+    };
+    hanging_lines(
+        Span::styled(prefix, style),
+        Span::styled(text, style),
+        width,
+    )
+}
+
+fn choice_style(highlighted: bool, hovered: bool, t: &Theme) -> Style {
+    hover_style(
+        if highlighted {
+            t.active
+        } else {
+            Style::default()
+        },
+        hovered,
+    )
+}
+
+/// The executable and its subcommand, which name a command's page.
+fn tab_label(command: &str) -> String {
+    let mut words = command.split_whitespace();
+    let Some(program) = words.next() else {
+        return String::new();
+    };
+    match words.next() {
+        Some(word)
+            if word.starts_with(|character: char| character.is_ascii_lowercase())
+                && word
+                    .chars()
+                    .all(|character| character.is_ascii_lowercase() || character == '-') =>
+        {
+            format!("{program} {word}")
+        }
+        _ => program.to_owned(),
+    }
+}
+
+fn row_command(request: &PermissionRequest, row: usize) -> String {
+    request
+        .resources
+        .get(row)
+        .map(|resource| review_text(&resource.value).replace('\n', " "))
+        .unwrap_or_default()
+}
+
+fn remember_name(lifetime: &PermissionLifetime) -> &'static str {
+    match lifetime {
+        PermissionLifetime::Once => "Once",
+        PermissionLifetime::Conversation => "This conversation",
+        PermissionLifetime::Project => "This project",
+        PermissionLifetime::Global => "All projects",
+    }
+}
+
+/// What a typed pattern would do, said under the field.
+fn pattern_feedback(pattern: &str, command: &str, t: &Theme) -> (String, Style) {
+    if pattern.trim().is_empty() {
+        return (PATTERN_PLACEHOLDER.into(), t.tool_dim);
+    }
+    match grade_command_pattern(pattern.trim(), command) {
+        Err(fault) => {
+            let text = fault.to_string();
+            let mut characters = text.chars();
+            let text = characters
+                .next()
+                .map(|first| first.to_uppercase().chain(characters).collect())
+                .unwrap_or(text);
+            (format!("{text}."), t.error)
+        }
+        Ok(grade) => match grade.caution {
+            Some(PermissionCaution::Danger) => (PATTERN_BROAD.into(), t.error),
+            Some(PermissionCaution::Warn) => (PATTERN_ASKING.into(), t.tool_warning),
+            None => (PATTERN_MATCHES.into(), t.tool_dim),
+        },
+    }
+}
+
 impl PermissionPrompt {
     pub fn view(&mut self, frame: &mut Frame, area: Rect) {
         grab_scope!("permission_prompt", area);
         self.view_with_theme(frame, area, &theme::current());
     }
 
-    fn view_with_theme(&mut self, frame: &mut Frame, area: Rect, t: &Theme) {
+    pub(super) fn view_with_theme(&mut self, frame: &mut Frame, area: Rect, t: &Theme) {
         let area = content_area(area);
         if self.area != area {
             let focus = self.focus.clone();
@@ -359,20 +407,7 @@ impl PermissionPrompt {
             self.focus = focus;
         }
         self.area = area;
-        let pressed_area = self.mouse_down.as_ref().and_then(|target| {
-            self.row_hits
-                .iter()
-                .find(|hit| hit.target == *target)
-                .map(|hit| hit.area)
-        });
-        let footer_height = self
-            .footer_rows(area.width.saturating_sub(BORDER_ROWS))
-            .len() as u16
-            + FOOTER_SEPARATOR_ROWS;
-        if area.width < MIN_REVIEW_WIDTH
-            || area.height < MIN_REVIEW_HEIGHT
-            || area.height <= BORDER_ROWS + footer_height
-        {
+        if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
             self.invalidate_controls();
             frame.render_widget(
                 Paragraph::new(RESIZE_MESSAGE)
@@ -383,72 +418,111 @@ impl PermissionPrompt {
             return;
         }
         if self.current().is_none() {
-            self.row_hits.clear();
+            self.hits.clear();
             return;
         }
-        let title = if self.panel == Panel::Details {
-            "Permission details"
-        } else if self.confirmation.is_some() {
-            "Confirm permission"
-        } else if self.inspector.is_some() {
-            "Pattern editor"
-        } else if self.panel == Panel::Scopes {
-            "Choose future scope"
-        } else {
-            "Permission required"
-        };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(t.panel_border)
-            .title_top(Line::from(format!(
-                " {title} · {} pending ",
-                self.pending_count()
-            )))
-            .title_style(t.panel_title);
+        let pressed_area = self.mouse_down.as_ref().and_then(|target| {
+            self.hits
+                .iter()
+                .find(|hit| hit.target == *target)
+                .map(|hit| hit.area)
+        });
+        let block = self.block(t);
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        let [body_area, footer_area] =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(footer_height)]).areas(inner);
-        let mut layout = self.review_layout(body_area.width.saturating_sub(1).max(1), t);
-        self.scroll
-            .update_dimensions(layout.total(), body_area.height);
-        let mut buffer = Buffer::empty(Rect::new(0, 0, layout.width, layout.total()));
-        let mut hits = Vec::new();
-        for (rect, card) in &mut layout.cards {
-            hits.extend(card.render(
-                *rect,
-                &mut buffer,
-                t,
-                self.hover.as_ref().or(self.focus.as_ref()),
-            ));
-            if self.confirmation.is_none()
-                && let CardContent::Scope(authority, _, state, _) = &card.content
-                && *authority == self.scope_authority
-            {
-                self.scope_view = state.as_ref().clone();
+        let pinned = self.pinned_status(body_width(inner.width), t);
+        let pinned_rows = u16::try_from(pinned.len()).unwrap_or(u16::MAX);
+        let body_area = Rect {
+            x: inner.x + MARGIN,
+            width: body_width(inner.width),
+            height: inner.height.saturating_sub(FOOTER_ROWS + pinned_rows),
+            ..inner
+        };
+        let footer_area = Rect {
+            y: inner.bottom().saturating_sub(1),
+            height: 1,
+            ..inner
+        };
+        frame.render_widget(
+            Paragraph::new(pinned),
+            Rect {
+                y: footer_area.y.saturating_sub(pinned_rows),
+                height: pinned_rows,
+                ..body_area
+            },
+        );
+        let Body {
+            lines,
+            hits: body_hits,
+            inserts,
+            reveal,
+            ..
+        } = self.fitted_body(body_area.width, body_area.height, t);
+        let total = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+        self.scroll.update_dimensions(total, body_area.height);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, body_area.width, total));
+        for (y, line) in lines.iter().enumerate() {
+            buffer.set_line(0, y as u16, line, body_area.width);
+        }
+        let mut hits = body_hits;
+        for (rect, insert) in inserts {
+            match insert {
+                Insert::Scope(model) => {
+                    self.scope_view.render(&model, rect, &mut buffer, t);
+                    hits.extend(self.scope_view.hits.iter().map(|hit| PromptHit {
+                        area: hit.area,
+                        target: PromptTarget::VisualScope(hit.control.clone()),
+                    }));
+                }
+                Insert::Pattern(panel) => {
+                    let focused = match self.hover.as_ref().or(self.focus.as_ref()) {
+                        Some(PromptTarget::Inspector(control)) => Some(control.clone()),
+                        _ => None,
+                    };
+                    hits.extend(
+                        panel
+                            .render(rect, &mut buffer, t, focused.as_ref())
+                            .into_iter()
+                            .map(|(area, control)| PromptHit {
+                                area,
+                                target: PromptTarget::Inspector(control),
+                            }),
+                    );
+                }
             }
         }
-        if let Some(target) = self.pending_reveal.take()
-            && let Some(hit) = hits.iter().find(|hit| hit.target == target)
-        {
-            self.scroll.reveal(hit.area.y, 1);
+        if std::mem::take(&mut self.reveal) {
+            let focused = self
+                .focus
+                .as_ref()
+                .and_then(|focus| hits.iter().find(|hit| hit.target == *focus))
+                .map(|hit| (hit.area.y, hit.area.height));
+            if let Some((top, height)) = focused.or(reveal) {
+                self.scroll.reveal(top, height);
+            }
         }
         let offset = self.scroll.offset();
-        for y in 0..body_area.height.min(layout.total().saturating_sub(offset)) {
-            for x in 0..layout.width {
+        for y in 0..body_area.height.min(total.saturating_sub(offset)) {
+            for x in 0..body_area.width {
                 frame.buffer_mut()[(body_area.x + x, body_area.y + y)] =
                     buffer[(x, offset + y)].clone();
             }
         }
-        self.scrollbar
-            .draw(frame, body_area, layout.total(), offset);
-        self.row_hits.clear();
-        let viewport = Rect::new(0, offset, layout.width, body_area.height);
+        self.scrollbar.draw(
+            frame,
+            Rect {
+                width: body_area.width + SCROLLBAR_COLUMNS,
+                ..body_area
+            },
+            total,
+            offset,
+        );
+        self.hits.clear();
+        let viewport = Rect::new(0, offset, body_area.width, body_area.height);
         for hit in hits {
             let clipped = hit.area.intersection(viewport);
             if !clipped.is_empty() {
-                self.row_hits.push(PromptHit {
+                self.hits.push(PromptHit {
                     area: Rect {
                         x: body_area.x + clipped.x,
                         y: body_area.y + clipped.y - offset,
@@ -458,74 +532,10 @@ impl PermissionPrompt {
                 });
             }
         }
-        frame.render_widget(
-            Paragraph::new("─".repeat(usize::from(footer_area.width))).style(t.panel_border),
-            Rect {
-                height: FOOTER_SEPARATOR_ROWS,
-                ..footer_area
-            },
-        );
-        for (index, row) in self.footer_rows(footer_area.width).into_iter().enumerate() {
-            let area = Rect {
-                y: footer_area.y + FOOTER_SEPARATOR_ROWS + index as u16,
-                height: 1,
-                ..footer_area
-            };
-            let line = match row {
-                FooterRow::Hints(pairs) => {
-                    let mut x = area.x;
-                    let mut spans = Vec::new();
-                    if pairs.first().is_some_and(|(key, _)| *key == KEY_ALLOW_ONCE)
-                        && self.confirmation.is_none()
-                    {
-                        spans.push(Span::styled("Allow: ", t.tool_dim));
-                        x += "Allow: ".width() as u16;
-                    }
-                    for (index, (label, description)) in pairs.into_iter().enumerate() {
-                        if index > 0 {
-                            spans.push(Span::raw(CONTROL_GAP));
-                            x += CONTROL_GAP.width() as u16;
-                        }
-                        let target = if label == "r" {
-                            Some(PromptTarget::Scope)
-                        } else {
-                            hint_key(label).map(PromptTarget::Hint)
-                        };
-                        let on = target.as_ref().is_some_and(|target| {
-                            self.hover.as_ref().or(self.focus.as_ref()) == Some(target)
-                        });
-                        spans.extend([
-                            Span::styled("[", hover_style(t.tool_dim, on)),
-                            Span::styled(label, hover_style(t.keybind_key, on)),
-                            Span::styled(
-                                format!(" {description}"),
-                                hover_style(t.keybind_desc, on),
-                            ),
-                            Span::styled("]", hover_style(t.tool_dim, on)),
-                        ]);
-                        let width = button_width(label, description);
-                        if x + width <= area.right()
-                            && let Some(target) = target
-                        {
-                            self.row_hits.push(PromptHit {
-                                area: Rect { x, width, ..area },
-                                target,
-                            });
-                        }
-                        x += width;
-                    }
-                    Line::from(spans)
-                }
-                FooterRow::Guidance => self.guidance_line(area.width, t),
-                FooterRow::ConfirmationInput => self.input_line(area.width, t),
-                FooterRow::InspectorStatus => self.inspector_status_line(t),
-                FooterRow::Rearm => Line::styled(REARM_MESSAGE, t.status_notice),
-            };
-            frame.render_widget(Paragraph::new(line), area);
-        }
+        self.draw_footer(frame, footer_area, t);
         self.awaiting_review = false;
         if let Some(pressed_area) = pressed_area
-            && !self.row_hits.iter().any(|hit| {
+            && !self.hits.iter().any(|hit| {
                 Some(&hit.target) == self.mouse_down.as_ref() && hit.area == pressed_area
             })
         {
@@ -534,7 +544,7 @@ impl PermissionPrompt {
         if self
             .focus
             .as_ref()
-            .is_some_and(|target| !self.row_hits.iter().any(|hit| hit.target == *target))
+            .is_some_and(|target| !self.hits.iter().any(|hit| hit.target == *target))
         {
             self.focus = None;
         }
@@ -545,516 +555,314 @@ impl PermissionPrompt {
             return 0;
         }
         let inner = width.min(MAX_CONTENT_WIDTH).saturating_sub(BORDER_ROWS);
-        self.review_layout(inner.saturating_sub(1).max(1), &theme::current())
-            .total()
-            .saturating_add(self.footer_rows(inner).len() as u16)
-            .saturating_add(BORDER_ROWS + FOOTER_SEPARATOR_ROWS)
-            .max(MIN_REVIEW_HEIGHT)
+        let t = theme::current();
+        let pinned =
+            u16::try_from(self.pinned_status(body_width(inner), &t).len()).unwrap_or(u16::MAX);
+        self.body(body_width(inner), usize::MAX, &t)
+            .row()
+            .saturating_add(BORDER_ROWS + FOOTER_ROWS + pinned)
+            .max(MIN_HEIGHT)
     }
 
-    fn review_layout(&self, width: u16, t: &Theme) -> ReviewLayout {
-        let mut layout = ReviewLayout::new(width);
-        let Some(request) = self.current() else {
-            return layout;
-        };
+    /// Whether the template being edited fits this command, kept above the
+    /// footer so it stays in sight however far the panel scrolls.
+    fn pinned_status(&self, width: u16, t: &Theme) -> Vec<Line<'static>> {
         if self.panel == Panel::Details {
-            layout.push(ReviewCard {
-                title: "Technical review · secrets redacted".into(),
-                content: CardContent::Text(details_body(request)),
-                tone: CardTone::Context,
-                target: None,
-            });
-            return layout;
+            return Vec::new();
         }
-        if let Some(panel) = self.inspector_panel() {
-            layout.push(ReviewCard {
-                title: "Pattern · edit without approving".into(),
-                content: CardContent::Pattern(panel),
-                tone: CardTone::Scope,
-                target: None,
-            });
-            return layout;
-        }
-        if self.state == PromptState::PatternEditing {
-            let mut lines = vec![self.input_line(width.saturating_sub(CARD_INSET * 2), t)];
-            if let Some(row) = self.command_row() {
-                lines.push(Line::styled(self.pattern_feedback(row), t.tool_warning));
-            }
-            layout.push(ReviewCard::text(
-                "Custom command prefix",
-                lines,
-                CardTone::Scope,
-            ));
-        }
-        let mut current;
-        let document = if let Some(confirmation) = &self.confirmation {
-            &confirmation.review
-        } else {
-            current = ReviewDocument::new(request, &self.allow_answer(self.lifetime.clone()));
-            current
-                .context
-                .push(ReviewField::new("Needs approval", policy_reason(request)));
-            if self.project_available()
-                && !current.context.iter().any(|field| field.label == "Project")
-                && let Some(project) = request
-                    .presentation
-                    .project
-                    .as_deref()
-                    .and_then(Path::to_str)
-            {
-                current.context.push(ReviewField::new("Project", project));
-            }
-            if let Some(requester) = self
-                .requests
-                .front()
-                .and_then(|queued| queued.requester.as_deref())
-            {
-                current
-                    .context
-                    .insert(1, ReviewField::new("Requester", requester));
-            }
-            current.bound();
-            &current
-        };
-        let command_style = t.code_block.fg(t.foreground).add_modifier(Modifier::BOLD);
-        layout.push(ReviewCard::text(
-            if document.shell && document.exact_call_workdir.is_none() {
-                format!("Run command · {}", review_text(&request.tool.to_string()))
-            } else if document.shell {
-                "Run command".into()
-            } else {
-                "Requested action".into()
-            },
-            document
-                .action
-                .lines()
-                .map(|line| Line::styled(line.to_owned(), command_style))
-                .collect(),
-            CardTone::Action,
-        ));
-        if !request.presentation.advisories.is_empty() {
-            let mut lines: Vec<_> = request
-                .presentation
-                .advisories
-                .iter()
-                .map(|advisory| advisory_line(advisory, t))
-                .collect();
-            lines.push(Line::styled(ADVISORY_GUIDANCE, t.tool_warning));
-            layout.push(ReviewCard::text(ADVISORY_TITLE, lines, CardTone::Warning));
-        }
-        let lifetime = if self.confirmation.is_some() {
-            match document.lifetime {
-                PermissionLifetime::Once => "This call only; nothing remembered.",
-                PermissionLifetime::Conversation => "This conversation only.",
-                PermissionLifetime::Project => "This project, across conversations.",
-                PermissionLifetime::Global => "All projects, across conversations.",
-            }
-        } else if self.panel == Panel::Scopes {
-            "Choosing a scope does not approve execution."
-        } else {
-            "Choose Once, Conversation or Project below."
-        };
-        let mut lifetime_lines = vec![Line::styled(lifetime, t.status_notice)];
-        if let Some(requester) = self
-            .requests
-            .front()
-            .and_then(|queued| queued.requester.as_deref())
-        {
-            lifetime_lines.push(Line::styled(
-                format!("Requester: {}", review_text(requester)),
-                t.tool_dim,
-            ));
-        }
-        if document.exact_call_workdir.is_some() {
-            lifetime_lines.extend(
-                document
-                    .context
-                    .iter()
-                    .filter(|field| {
-                        field.label == "Project"
-                            || (field.label == "Needs approval" && field.value != NO_POLICY_REASON)
-                    })
-                    .map(|field| {
-                        Line::styled(format!("{}: {}", field.label, field.value), t.tool_dim)
-                    }),
-            );
-        }
-        if self.confirmation.is_none() && !self.grants_lifetime(&PermissionLifetime::Project) {
-            lifetime_lines.push(Line::styled(
-                if self.project_available() {
-                    "Project persistence is not offered for this scope."
-                } else {
-                    "Project persistence unavailable: no local project binding."
-                },
-                t.tool_dim,
-            ));
-        }
-        layout.push(ReviewCard::text(
-            "Lifetime",
-            lifetime_lines,
-            CardTone::Context,
-        ));
-        let compact_exact = document.exact_call_workdir.is_some()
-            && self.panel != Panel::Scopes
-            && (document.lifetime == PermissionLifetime::Once || self.confirmation.is_some());
-        if let Some(workdir) = document
-            .exact_call_workdir
-            .as_ref()
-            .filter(|_| compact_exact)
-        {
-            let mut card = ReviewCard::fields(
-                "Future scope",
-                vec![
-                    ReviewField::new("Scope", "Exact call only"),
-                    ReviewField::new("Run from", workdir),
-                    ReviewField::new("Context", "Same reviewed preparation"),
-                ],
-                CardTone::Scope,
-            );
-            if self.confirmation.is_none() {
-                card.target = Some(PromptTarget::Scope);
-            }
-            layout.push(card);
-        }
-        if self
-            .confirmation
-            .as_ref()
-            .is_some_and(|confirmation| !confirmation.complete)
-        {
-            layout.push(ReviewCard::text(
-                "Approval disabled",
-                vec![Line::styled(INCOMPLETE_REVIEW, t.tool_warning)],
-                CardTone::Warning,
-            ));
-        } else if !document.warnings.is_empty() {
-            layout.push(ReviewCard::text(
-                "Review carefully",
-                document
-                    .warnings
-                    .iter()
-                    .map(|warning| Line::styled(warning.clone(), t.tool_warning))
-                    .collect(),
-                CardTone::Warning,
-            ));
-        } else if self.confirmation.is_none() && !self.selected_summary().complete {
-            layout.push(ReviewCard::text(
-                "Future scope unavailable",
-                vec![Line::styled(
-                    "Use Once or inspect Details before choosing a reusable scope.",
-                    t.tool_warning,
-                )],
-                CardTone::Warning,
-            ));
-        }
-        if !compact_exact {
-            let ladders = command_ladders(request);
-            let subsumed = request.subsumed_rows(&self.row_grants(request));
-            for (index, authority) in document.authorities.iter().enumerate() {
-                if self.panel == Panel::Scopes
-                    && self.command_row().is_some()
-                    && authority.row != self.command_row()
-                {
-                    continue;
-                }
-                let covered = authority
-                    .row
-                    .and_then(|row| request.presentation.resources.get(row))
-                    .and_then(|shown| shown.coverage.as_ref());
-                if covered.is_some() && !self.expanded_covered && self.confirmation.is_none() {
-                    continue;
-                }
-                let mut fields = vec![ReviewField::new("Scope", &authority.title)];
-                fields.extend(
-                    authority
-                        .fields
-                        .iter()
-                        .map(|field| ReviewField::new(&field.label, &field.value)),
-                );
-                if let Some(coverage) = covered {
-                    fields.push(ReviewField::new("Already allowed", coverage_chip(coverage)));
-                }
-                if self.confirmation.is_none()
-                    && let Some(other) = authority
-                        .row
-                        .and_then(|row| subsumed.get(row))
-                        .copied()
-                        .flatten()
-                {
-                    fields.push(ReviewField::new(
-                        "Also covered",
-                        format!("Row {}: {}", other + 1, self.row_summary(other).label),
-                    ));
-                }
-                let content = if let Some(scope) = &authority.scope {
-                    CardContent::Scope(
-                        index,
-                        scope.clone(),
-                        Box::new(if self.scope_authority == index {
-                            self.scope_view.clone()
-                        } else {
-                            ScopeView::default()
-                        }),
-                        fields,
-                    )
-                } else {
-                    CardContent::Fields(fields)
-                };
-                let mut card = ReviewCard {
-                    title: if let Some(row) =
-                        authority.row.filter(|_| document.authorities.len() > 1)
-                    {
-                        format!("Command {} · future scope", row + 1)
-                    } else {
-                        "Future scope".into()
-                    },
-                    content,
-                    tone: CardTone::Scope,
-                    target: None,
-                };
-                if self.confirmation.is_none() {
-                    card.target = authority
-                        .row
-                        .filter(|_| document.authorities.len() > 1)
-                        .and_then(|row| ladders.get(row))
-                        .and_then(|ladder| ladder.first())
-                        .map(|option| PromptTarget::Authority(self.row_key(option)))
-                        .or(Some(PromptTarget::Scope));
-                }
-                layout.push(card);
-            }
-            if request.resources.len() > 1 && document.shell {
-                let mut lines = Vec::new();
-                if self.confirmation.is_none() {
-                    lines.push(Line::styled(
-                        format!(
-                            "Needs approval: {} of {} commands",
-                            request.resources.len().saturating_sub(self.covered_count()),
-                            request.resources.len()
-                        ),
-                        t.panel_title,
-                    ));
-                }
-                lines.push(Line::styled(WHOLE_CALL, t.tool_dim));
-                lines.push(Line::styled(
-                    "Rows not remembered still run with this call.",
-                    t.tool_dim,
-                ));
-                layout.push(ReviewCard::text("Whole call", lines, CardTone::Context));
-            }
-            layout.push(ReviewCard::fields(
-                "Context",
-                document
-                    .context
-                    .iter()
-                    .filter(|field| field.label != "Requester")
-                    .map(|field| ReviewField::new(&field.label, &field.value))
-                    .collect(),
-                CardTone::Context,
-            ));
-        }
-        if let Some(phrase) = self.confirmation_phrase() {
-            layout.push(ReviewCard::text(
-                "Type to confirm",
-                vec![Line::styled(
-                    review_text(phrase),
-                    t.status_notice.add_modifier(Modifier::BOLD),
-                )],
-                CardTone::Warning,
-            ));
-        }
-        layout
+        self.inspector_status(t)
+            .map(|(status, style)| {
+                hang(&status, style, width)
+                    .into_iter()
+                    .take(MAX_STATUS_ROWS)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
-    fn pattern_feedback(&self, row: usize) -> String {
-        let pattern = self.field.text();
-        let Some(command) = self
-            .current()
-            .and_then(|request| request.resources.get(row))
-        else {
+    fn block(&self, t: &Theme) -> Block<'static> {
+        let mut block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(t.panel_border)
+            .title_top(Line::styled(format!(" {} ", self.title()), t.panel_title));
+        let place = self.place();
+        if !place.is_empty() {
+            block = block.title_top(Line::styled(format!(" {place} "), t.tool_dim).right_aligned());
+        }
+        block
+    }
+
+    /// The question the prompt asks, chosen by what the tool touches.
+    pub(super) fn question(&self) -> String {
+        let Some(request) = self.current() else {
             return String::new();
         };
-        if pattern.is_empty() && sensitive_text(&command.value) {
-            return "Credential-bearing command: author a prefix explicitly; no command text was seeded.".into();
-        }
-        match grade_command_pattern(pattern.trim(), &command.value) {
-            Err(fault) => fault.to_string(),
-            Ok(grade) => match grade.caution {
-                Some(PermissionCaution::Danger) => {
-                    "Every invocation of this program; extra confirmation required.".into()
-                }
-                Some(PermissionCaution::Warn) => {
-                    "Overlaps an always-ask family; extra confirmation required.".into()
-                }
-                None => "Matches this command; review the future prefix before approval.".into(),
-            },
-        }
-    }
-
-    fn footer_rows(&self, width: u16) -> Vec<FooterRow> {
-        let mut rows = if self.panel == Panel::Details {
-            let mut rows = vec![FooterRow::Hints(vec![("PgUp", "Up"), ("PgDn", "Down")])];
-            if self.confirmation.is_none() {
-                let mut denies = Vec::new();
-                if self.project_available() {
-                    denies.push((KEY_DENY_LOCAL, "Deny project"));
-                }
-                denies.push((KEY_DENY_GLOBAL, "Deny global"));
-                rows.push(FooterRow::Hints(denies));
-            }
-            rows.push(FooterRow::Hints(vec![(HINT_ESC, "Back")]));
-            rows
-        } else if self.inspector.is_some() {
-            self.inspector_footer()
-        } else if let Some(confirmation) = &self.confirmation {
-            let mut rows = Vec::new();
-            if confirmation.complete {
-                if confirmation.phrase.is_some() {
-                    rows.push(FooterRow::ConfirmationInput);
-                }
-                rows.push(FooterRow::Hints(vec![(
-                    if confirmation.phrase.is_some() {
-                        HINT_ENTER
-                    } else {
-                        HINT_CONFIRM
-                    },
-                    "Confirm",
-                )]));
-            }
-            rows.push(FooterRow::Hints(vec![
-                ("F2", "Details"),
-                (HINT_ESC, "Back"),
-            ]));
-            rows
-        } else {
-            match self.state {
-                PromptState::DenyEditing => vec![
-                    FooterRow::Guidance,
-                    FooterRow::Hints(vec![(HINT_ENTER, "Deny with guidance"), (HINT_ESC, "Back")]),
-                ],
-                PromptState::PatternEditing => vec![FooterRow::Hints(vec![
-                    (HINT_ENTER, "Use prefix"),
-                    (HINT_ESC, "Back"),
-                ])],
-                _ if self.panel == Panel::Scopes => {
-                    let mut advanced = Vec::new();
-                    if self.suggested_pattern().is_some() {
-                        advanced.push(("i", "Pattern"));
-                    }
-                    if self.command_row().is_some() {
-                        advanced.push(("e", "Prefix"));
-                    }
-                    if self.grants_lifetime(&PermissionLifetime::Global) {
-                        advanced.push((KEY_ALLOW_GLOBAL, "Global"));
-                    }
-                    let mut navigation = vec![("r", "Scope")];
-                    if self.row_keys().len() > 1 {
-                        navigation.extend([("↑", "Prev"), ("↓", "Next")]);
-                    }
-                    if self.can_widen() {
-                        navigation.extend([("←", "Less"), ("→", "More")]);
-                    }
-                    let mut rows = vec![FooterRow::Hints(navigation)];
-                    if !advanced.is_empty() {
-                        rows.push(FooterRow::Hints(advanced));
-                    }
-                    rows.push(FooterRow::Hints(vec![
-                        ("p", "Use scope"),
-                        (KEY_DETAILS, "Details"),
-                        (HINT_ESC, "Back"),
-                    ]));
-                    rows
-                }
-                _ => {
-                    let mut grants = vec![(KEY_ALLOW_ONCE, "Once")];
-                    if self.grants_lifetime(&PermissionLifetime::Conversation) {
-                        grants.push((KEY_ALLOW_SESSION, "Conversation"));
-                    }
-                    if self.grants_lifetime(&PermissionLifetime::Project) {
-                        grants.push((KEY_ALLOW_LOCAL, "Project"));
-                    }
-                    let mut rows = vec![
-                        FooterRow::Hints(grants),
-                        FooterRow::Hints(vec![
-                            ("r", "Scope"),
-                            (KEY_DETAILS, "Details"),
-                            (KEY_GUIDE_DENY, "Guidance"),
-                            (HINT_ESC, "Deny"),
-                        ]),
-                    ];
-                    if self.covered_count() > 0 {
-                        rows.push(FooterRow::Hints(vec![(KEY_COVERED, "Covered")]));
-                    }
-                    rows
-                }
-            }
-        };
-        if self.decision_needs_rearm() {
-            rows.push(FooterRow::Rearm);
-        }
-        let mut wrapped = Vec::new();
-        for row in rows {
-            if let FooterRow::Hints(pairs) = row {
-                let mut line = Vec::new();
-                let mut used = 0;
-                for pair in pairs {
-                    let leading = if pair.0 == KEY_ALLOW_ONCE && self.confirmation.is_none() {
-                        "Allow: ".width() as u16
-                    } else {
-                        0
-                    };
-                    let next = button_width(pair.0, pair.1)
-                        + if line.is_empty() {
-                            leading
-                        } else {
-                            CONTROL_GAP.width() as u16
-                        };
-                    if !line.is_empty() && used + next > width {
-                        wrapped.push(FooterRow::Hints(line));
-                        line = Vec::new();
-                        used = 0;
-                    }
-                    used += button_width(pair.0, pair.1)
-                        + if line.is_empty() {
-                            leading
-                        } else {
-                            CONTROL_GAP.width() as u16
-                        };
-                    line.push(pair);
-                }
-                if !line.is_empty() {
-                    wrapped.push(FooterRow::Hints(line));
-                }
+        if self.shell() {
+            return if self.batch() {
+                "Allow shell commands?"
             } else {
-                wrapped.push(row);
+                "Allow shell command?"
+            }
+            .into();
+        }
+        if let ToolKey::McpTool { server, tool } = &request.tool {
+            return format!(
+                "Allow MCP tool {}?",
+                review_text(&format!("{server}/{tool}"))
+            );
+        }
+        let Some(resource) = request.resources.first() else {
+            return format!("Allow {}?", review_text(&request.tool.to_string()));
+        };
+        match (&resource.kind, &resource.access) {
+            (PermissionResourceKind::Url, _) => "Allow fetching a web page?".into(),
+            (PermissionResourceKind::Query, _) => "Allow a web search?".into(),
+            (_, Some(PermissionResourceAccess::Write)) => "Allow editing a file?".into(),
+            (_, Some(PermissionResourceAccess::List)) => "Allow listing a folder?".into(),
+            (_, Some(PermissionResourceAccess::Search)) => "Allow searching files?".into(),
+            (
+                PermissionResourceKind::File
+                | PermissionResourceKind::Directory
+                | PermissionResourceKind::RemoteFile { .. }
+                | PermissionResourceKind::RemoteDirectory { .. },
+                _,
+            ) => "Allow reading a file?".into(),
+            _ => format!("Allow {}?", review_text(&request.tool.to_string())),
+        }
+    }
+
+    fn title(&self) -> String {
+        match self.panel {
+            Panel::Details => DETAILS_TITLE.into(),
+            Panel::Customize => format!("{}{TITLE_SEPARATOR}{CUSTOMIZE_TITLE}", self.question()),
+            _ => self.question(),
+        }
+    }
+
+    /// Who asks, where this prompt stands in the queue, and how many of a
+    /// batch's commands need an answer.
+    fn place(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(requester) = self.requester_name() {
+            parts.push(review_text(requester));
+        }
+        if self.pending_count() > 1 {
+            parts.push(format!("1 of {}", self.pending_count()));
+        }
+        if self.batch() {
+            parts.push(format!(
+                "{} of {} new",
+                self.new_rows().len(),
+                self.listed_rows().len()
+            ));
+        }
+        parts.join(TITLE_SEPARATOR)
+    }
+
+    /// The body, its request text capped so the choices fit `viewport` rows
+    /// when they can.
+    fn fitted_body(&self, width: u16, viewport: u16, t: &Theme) -> Body {
+        let body = self.body(width, usize::MAX, t);
+        let overflow = usize::from(body.row()).saturating_sub(usize::from(viewport));
+        if overflow == 0 {
+            return body;
+        }
+        let cap = body
+            .action_rows
+            .saturating_sub(overflow)
+            .max(MIN_ACTION_ROWS);
+        if cap >= body.action_rows {
+            return body;
+        }
+        self.body(width, cap, t)
+    }
+
+    fn body(&self, width: u16, cap: usize, t: &Theme) -> Body {
+        let mut body = Body::new(width);
+        if self.current().is_none() {
+            return body;
+        }
+        if self.panel == Panel::Details {
+            self.details_body(&mut body, t);
+        } else if self.inspector.is_some() {
+            self.inspector_body(&mut body, cap, t);
+        } else {
+            match self.panel {
+                Panel::StepThrough => self.step_body(&mut body, cap, t),
+                Panel::Customize => self.customize_body(&mut body, cap, t),
+                Panel::Main | Panel::Details => self.main_body(&mut body, cap, t),
             }
         }
-        wrapped
+        body
     }
 
-    fn guidance_line(&self, width: u16, t: &Theme) -> Line<'static> {
-        self.editor_line("Guidance: ", DEFAULT_DENY_GUIDANCE, width, t)
+    /// The request's own text, capped at `cap` rows with the rest counted.
+    fn action_block(&self, body: &mut Body, lines: &[String], cap: usize, t: &Theme) {
+        let rows: Vec<Line<'static>> = lines
+            .iter()
+            .flat_map(|line| hang(line, Style::default(), body.width))
+            .collect();
+        body.action_rows = rows.len();
+        if rows.len() <= cap {
+            body.push(rows);
+            return;
+        }
+        let shown = cap.saturating_sub(1).max(1);
+        let hidden = rows.len() - shown;
+        body.push(rows.into_iter().take(shown));
+        let lines = if hidden == 1 { "line" } else { "lines" };
+        body.push([Line::styled(
+            format!("{ELLIPSIS} {hidden} more {lines}{TITLE_SEPARATOR}{OVERFLOW_HINT}"),
+            t.tool_dim,
+        )]);
     }
 
-    fn input_line(&self, width: u16, t: &Theme) -> Line<'static> {
-        self.editor_line("> ", "", width, t)
+    fn context_lines(&self, body: &mut Body, t: &Theme) {
+        for note in self.context() {
+            body.push(note_lines(&note, body.width, t));
+        }
     }
 
-    /// The field after `prefix` in `width` columns, panned to keep its caret
-    /// in sight. Text review would redact or escape is shown as review shows
-    /// it, with the caret after it.
-    fn editor_line(
-        &self,
-        prefix: &'static str,
-        placeholder: &str,
-        width: u16,
-        t: &Theme,
-    ) -> Line<'static> {
+    /// Every caution, then the reasons while there is room for them.
+    fn notes_block(&self, body: &mut Body, t: &Theme) {
+        let notes = self.notes();
+        if notes.is_empty() {
+            return;
+        }
+        body.blank();
+        let mut shown = 0;
+        for note in &notes {
+            if note.tone == Tone::Muted && shown >= MAX_NOTES {
+                continue;
+            }
+            body.push(note_lines(note, body.width, t));
+            shown += 1;
+        }
+    }
+
+    fn main_body(&self, body: &mut Body, cap: usize, t: &Theme) {
+        let Some(request) = self.current() else {
+            return;
+        };
+        body.blank();
+        self.action_block(body, &action_lines(request), cap, t);
+        self.context_lines(body, t);
+        if self.batch() {
+            body.blank();
+            self.command_rows(body, t);
+        }
+        self.notes_block(body, t);
+        body.blank();
+        for (index, choice) in self.choices().into_iter().enumerate() {
+            let highlighted = choice == self.highlight;
+            let target = PromptTarget::Choice(choice);
+            let style = choice_style(highlighted, self.hover.as_ref() == Some(&target), t);
+            let lines = numbered(
+                index,
+                style,
+                highlighted,
+                &self.choice_sentence(choice),
+                &[],
+                body.width,
+                t,
+            );
+            body.control(target, lines, highlighted);
+            if choice == Choice::Deny && self.state == PromptState::Guidance {
+                self.field_line(body, GUIDANCE_PLACEHOLDER, NUMBER_INDENT, t);
+            }
+        }
+        self.pending_lines(body, t);
+    }
+
+    /// One row per command: whether it needs an answer, the command, and the
+    /// scope it gets or what already settles it.
+    fn command_rows(&self, body: &mut Body, t: &Theme) {
+        let Some(request) = self.current() else {
+            return;
+        };
+        let rows = self.listed_rows();
+        let allowed = rows
+            .iter()
+            .filter(|row| row_status(request, **row) == RowStatus::Allowed)
+            .count();
+        let collapse = allowed > MAX_ALLOWED_ROWS;
+        let rest = usize::from(body.width)
+            .saturating_sub(ROW_FOCUS.width() + STATUS_WIDTH + COLUMN_GAP.width());
+        let longest = rows
+            .iter()
+            .map(|row| row_command(request, *row).width())
+            .max()
+            .unwrap_or_default();
+        let command_width = longest.min(rest * 11 / 20).max(MIN_COLUMN);
+        let scope_width = rest.saturating_sub(command_width).max(MIN_COLUMN);
+        for row in rows {
+            let status = row_status(request, row);
+            if collapse && status == RowStatus::Allowed {
+                continue;
+            }
+            let new = self.is_new_row(row);
+            let focused = new && self.focus_row == Some(row);
+            let target = PromptTarget::Row(row);
+            let hovered = self.hover.as_ref() == Some(&target);
+            let scope = match status {
+                RowStatus::New if new => format!(
+                    "‹{}›",
+                    self.row_grant(row).map_or_else(
+                        || ONCE_ONLY.into(),
+                        |grant| grant_label(request, row, &grant)
+                    )
+                ),
+                RowStatus::New => String::new(),
+                RowStatus::Asks | RowStatus::Allowed => row_coverage(request, row)
+                    .map(coverage_phrase)
+                    .unwrap_or_default(),
+            };
+            let (status_style, text_style) = match status {
+                RowStatus::New => (t.accent, Style::default()),
+                RowStatus::Asks => (t.tool_warning, Style::default()),
+                RowStatus::Allowed => (t.tool_dim, t.tool_dim),
+            };
+            let command_style = if focused { t.active } else { text_style };
+            let line = Line::from(vec![
+                Span::styled(if focused { ROW_FOCUS } else { NO_POINTER }, t.accent),
+                Span::styled(pad(status.word().into(), STATUS_WIDTH), status_style),
+                Span::styled(
+                    pad(
+                        ellipsize(&row_command(request, row), command_width),
+                        command_width,
+                    ),
+                    hover_style(command_style, hovered),
+                ),
+                Span::raw(COLUMN_GAP),
+                Span::styled(
+                    ellipsize(&scope, scope_width),
+                    hover_style(text_style, hovered),
+                ),
+            ]);
+            if new {
+                body.control(target, vec![line], focused);
+            } else {
+                body.push([line]);
+            }
+        }
+        if collapse {
+            body.push([Line::styled(
+                format!("{NO_POINTER}+ {allowed} {ALREADY_ALLOWED}"),
+                t.tool_dim,
+            )]);
+        }
+    }
+
+    /// The field being typed into, under the choice or item that opened it.
+    fn field_line(&self, body: &mut Body, placeholder: &str, indent: usize, t: &Theme) {
+        let prefix = format!("{}{FIELD_PROMPT}", " ".repeat(indent));
+        let width = usize::from(body.width).saturating_sub(prefix.width());
         let styles = FieldStyles {
             caret: t.cursor,
             placeholder: t.input_placeholder,
             ..field_styles(Style::new().fg(t.foreground))
         };
-        let width = usize::from(width).saturating_sub(prefix.width());
         let text = self.field.text();
         let display = review_text(&text);
         let mut line = if display == text {
@@ -1063,223 +871,592 @@ impl PermissionPrompt {
             TextField::with_text(FieldKind::Line, &display).paint(width, &styles, true, placeholder)
         };
         line.spans.insert(0, Span::styled(prefix, t.tool_dim));
-        line
+        let top = body.row();
+        body.push([line]);
+        body.reveal = Some((top, 1));
     }
-}
 
-fn button_width(key: &str, description: &str) -> u16 {
-    (key.width() + description.width() + "[ ]".width()) as u16
+    /// What a typed pattern would do, under its field.
+    fn pattern_field(&self, body: &mut Body, row: usize, indent: usize, t: &Theme) {
+        self.field_line(body, PATTERN_PLACEHOLDER, indent, t);
+        let Some(command) = self
+            .current()
+            .and_then(|request| request.resources.get(row))
+        else {
+            return;
+        };
+        let (text, style) = pattern_feedback(&self.field.text(), &command.value, t);
+        body.push(indented(
+            indent + FIELD_PROMPT.width(),
+            &text,
+            style,
+            body.width,
+        ));
+    }
+
+    /// The red line a grant waits under, and how to give it.
+    fn pending_lines(&self, body: &mut Body, t: &Theme) {
+        let Some(pending) = &self.pending else {
+            return;
+        };
+        body.blank();
+        let top = body.row();
+        body.push(hang(
+            &format!("{WARNING_MARK}{}", pending.warning),
+            t.error,
+            body.width,
+        ));
+        match pending.phrases.first() {
+            None => body.push(indented(HANG.width(), PRESS_AGAIN, t.tool_dim, body.width)),
+            Some(phrase) => {
+                body.push(indented(
+                    HANG.width(),
+                    &format!("Type ‹{phrase}› to allow, or press Esc to go back."),
+                    t.tool_dim,
+                    body.width,
+                ));
+                self.field_line(body, "", HANG.width(), t);
+            }
+        }
+        body.reveal = Some((top, body.row() - top));
+    }
+
+    fn step_body(&self, body: &mut Body, cap: usize, t: &Theme) {
+        let (Some(request), Some(step)) = (self.current(), &self.step) else {
+            return;
+        };
+        body.blank();
+        let pages = self.new_rows();
+        let tabs: Vec<Tab<PromptTarget>> = pages
+            .iter()
+            .map(|row| Tab {
+                label: tab_label(&row_command(request, *row)),
+                done: step.visited.get(*row).copied().unwrap_or_default(),
+                target: PromptTarget::Tab(*row),
+            })
+            .collect();
+        let active = step
+            .page
+            .and_then(|row| pages.iter().position(|page| *page == row));
+        body.spans(
+            tab_spans(
+                &tabs,
+                active,
+                PromptTarget::Review,
+                self.hover.as_ref(),
+                body.width,
+            ),
+            0,
+        );
+        body.blank();
+        match step.page {
+            Some(row) => self.page_body(body, request, step, row, cap, t),
+            None => self.review_body(body, request, step, t),
+        }
+    }
+
+    /// One command's page: the command, its ladder, a pattern of one's own,
+    /// and how long to remember it.
+    fn page_body(
+        &self,
+        body: &mut Body,
+        request: &PermissionRequest,
+        step: &StepThrough,
+        row: usize,
+        cap: usize,
+        t: &Theme,
+    ) {
+        let command = request
+            .resources
+            .get(row)
+            .map(|resource| review_lines(&resource.value))
+            .unwrap_or_default();
+        self.action_block(body, &command, cap, t);
+        self.notes_block(body, t);
+        body.blank();
+        for (index, item) in step.items(request, row).iter().enumerate() {
+            let (label, badges) = item_label(request, row, item);
+            let highlighted = index == step.highlight;
+            let target = PromptTarget::Item(index);
+            let style = choice_style(highlighted, self.hover.as_ref() == Some(&target), t);
+            let lines = numbered(index, style, highlighted, &label, &badges, body.width, t);
+            body.control(target, lines, highlighted);
+            if *item == PageItem::OwnPattern && self.state == PromptState::PatternEditing {
+                self.pattern_field(body, row, NUMBER_INDENT, t);
+            }
+        }
+        let Some(grant) = step.grant(request, row) else {
+            return;
+        };
+        let lifetime = step
+            .lifetimes
+            .get(row)
+            .cloned()
+            .unwrap_or(PermissionLifetime::Conversation);
+        let allowed = rung_lifetimes(request, row, &grant, self.project_available());
+        let next = allowed
+            .iter()
+            .position(|found| *found == lifetime)
+            .and_then(|index| allowed.get((index + 1) % allowed.len()))
+            .filter(|next| **next != lifetime)
+            .cloned();
+        body.blank();
+        body.spans(
+            vec![
+                (Span::styled(REMEMBER_FOR, t.tool_dim), None),
+                (
+                    Span::styled(format!("‹{}›", lifetime_phrase(&lifetime)), t.active),
+                    next.map(PromptTarget::Remember),
+                ),
+            ],
+            0,
+        );
+    }
+
+    /// Every row, the scope it gets, and how long, then the answers.
+    fn review_body(
+        &self,
+        body: &mut Body,
+        request: &PermissionRequest,
+        step: &StepThrough,
+        t: &Theme,
+    ) {
+        let width = usize::from(body.width);
+        let command_width = (width * 2 / 5).max(MIN_COLUMN);
+        let scope_width = (width * 3 / 10).max(MIN_COLUMN);
+        let rest = width
+            .saturating_sub(command_width + scope_width + 2 * COLUMN_GAP.width())
+            .max(MIN_COLUMN);
+        for row in self.listed_rows() {
+            let (scope, how_long, style) = match row_status(request, row) {
+                RowStatus::New => match step.grant(request, row) {
+                    Some(grant) => (
+                        grant_label(request, row, &grant),
+                        step.lifetimes
+                            .get(row)
+                            .map(lifetime_phrase)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        Style::default(),
+                    ),
+                    None => (ONCE_ONLY.into(), String::new(), Style::default()),
+                },
+                RowStatus::Asks => (
+                    ASKS_EVERY_TIME.into(),
+                    row_coverage(request, row)
+                        .map(coverage_phrase)
+                        .unwrap_or_default(),
+                    t.tool_warning,
+                ),
+                RowStatus::Allowed => (
+                    ALREADY_ALLOWED.into(),
+                    row_coverage(request, row)
+                        .map(coverage_phrase)
+                        .unwrap_or_default(),
+                    t.tool_dim,
+                ),
+            };
+            body.push([Line::styled(
+                format!(
+                    "{}{COLUMN_GAP}{}{COLUMN_GAP}{}",
+                    pad(
+                        ellipsize(&row_command(request, row), command_width),
+                        command_width
+                    ),
+                    pad(ellipsize(&scope, scope_width), scope_width),
+                    ellipsize(&how_long, rest),
+                ),
+                style,
+            )]);
+        }
+        body.blank();
+        for (index, choice) in REVIEW_CHOICES.iter().enumerate() {
+            let highlighted = index == step.highlight;
+            let target = PromptTarget::Item(index);
+            let style = choice_style(highlighted, self.hover.as_ref() == Some(&target), t);
+            let lines = numbered(
+                index,
+                style,
+                highlighted,
+                self.review_sentence(*choice),
+                &[],
+                body.width,
+                t,
+            );
+            body.control(target, lines, highlighted);
+            if *choice == ReviewChoice::Deny && self.state == PromptState::Guidance {
+                self.field_line(body, GUIDANCE_PLACEHOLDER, NUMBER_INDENT, t);
+            }
+        }
+        self.pending_lines(body, t);
+    }
+
+    fn customize_body(&self, body: &mut Body, cap: usize, t: &Theme) {
+        let (Some(request), Some(customize)) = (self.current(), &self.customize) else {
+            return;
+        };
+        body.blank();
+        self.action_block(body, &action_lines(request), cap, t);
+        self.context_lines(body, t);
+        self.notes_block(body, t);
+        body.blank();
+        let label = |text: &str, field: Field| {
+            let style = if customize.field == field {
+                t.active
+            } else {
+                t.tool_dim
+            };
+            Span::styled(pad(text.into(), usize::from(FIELD_LABEL_WIDTH)), style)
+        };
+        let option = |text: &str, selected: bool, target: PromptTarget| {
+            let hovered = self.hover.as_ref() == Some(&target);
+            let (text, style) = if selected {
+                (format!("[{text}]"), t.active)
+            } else {
+                (format!(" {text} "), Style::default())
+            };
+            (
+                Span::styled(text, hover_style(style, hovered)),
+                Some(target),
+            )
+        };
+        let mut effects = vec![(label(EFFECT_LABEL, Field::Effect), None)];
+        for (effect, name) in [(Effect::Allow, "Allow"), (Effect::Deny, "Deny")] {
+            effects.push(option(
+                name,
+                customize.effect == effect,
+                PromptTarget::Effect(effect),
+            ));
+            effects.push((Span::raw(" "), None));
+        }
+        body.spans(effects, FIELD_LABEL_WIDTH);
+        let mut lifetimes = vec![(label(REMEMBER_LABEL, Field::Remember), None)];
+        for lifetime in self.customize_lifetimes() {
+            lifetimes.push(option(
+                remember_name(&lifetime),
+                customize.lifetime == lifetime,
+                PromptTarget::Remember(lifetime.clone()),
+            ));
+            lifetimes.push((Span::raw(" "), None));
+        }
+        body.spans(lifetimes, FIELD_LABEL_WIDTH);
+        let indent = usize::from(FIELD_LABEL_WIDTH);
+        for (index, item) in self.customize_items().iter().enumerate() {
+            let (text, badges, selectable) =
+                scope_item_label(request, customize, item, self.batch());
+            let highlighted = index == customize.highlight;
+            let target = PromptTarget::Item(index);
+            let hovered = self.hover.as_ref() == Some(&target);
+            let style = if !selectable {
+                t.tool_dim
+            } else {
+                choice_style(highlighted, hovered, t)
+            };
+            let lead = if index == 0 {
+                label(SCOPE_LABEL, Field::Scope)
+            } else {
+                Span::raw(" ".repeat(indent))
+            };
+            let pointer = if highlighted { POINTER } else { NO_POINTER };
+            let text = if badges.is_empty() {
+                text
+            } else {
+                format!("{text}{COLUMN_GAP}{}", badges.join(BADGE_SEPARATOR))
+            };
+            let mut lines = hanging_lines(
+                Span::styled(format!("{}{pointer}", " ".repeat(indent)), style),
+                Span::styled(text, style),
+                body.width,
+            );
+            if let Some(first) = lines.first_mut() {
+                first.spans[0] = Span::styled(pointer, style);
+                first.spans.insert(0, lead);
+            }
+            body.control(target, lines, highlighted);
+            if *item == ScopeItem::OwnPattern
+                && self.state == PromptState::PatternEditing
+                && let Some(row) = customize.row
+            {
+                self.pattern_field(body, row, indent + POINTER.width(), t);
+            }
+        }
+        if customize.advanced
+            && let Some(model) = self.customize_model()
+        {
+            body.blank();
+            let height = ScopeView::summary_height(&model, body.width);
+            body.insert(height, Insert::Scope(Box::new(model)));
+        }
+        self.pending_lines(body, t);
+    }
+
+    /// The rule Customize's chosen scope would store, for Advanced.
+    pub(super) fn customize_model(&self) -> Option<ScopeModel> {
+        let request = self.current()?;
+        let customize = self.customize.as_ref()?;
+        let lifetime = customize.lifetime.clone();
+        match &customize.chosen {
+            ScopeItem::Row(PermissionRowGrant::Pattern { definition, .. }) => {
+                Some(pattern_model(definition.clone(), lifetime))
+            }
+            ScopeItem::Row(grant @ PermissionRowGrant::Offered(_)) => Some(option_model(
+                request,
+                grant_option(request, customize.row?, grant)?,
+                lifetime,
+            )),
+            ScopeItem::Whole(id) => Some(option_model(
+                request,
+                request.options.iter().find(|option| option.id == *id)?,
+                lifetime,
+            )),
+            ScopeItem::Row(PermissionRowGrant::Written(_)) | ScopeItem::OwnPattern => None,
+        }
+    }
+
+    fn inspector_body(&self, body: &mut Body, cap: usize, t: &Theme) {
+        let (Some(request), Some(inspector)) = (self.current(), &self.inspector) else {
+            return;
+        };
+        let command = request
+            .resources
+            .get(inspector.row())
+            .map(|resource| review_lines(&resource.value))
+            .unwrap_or_default();
+        body.blank();
+        self.action_block(body, &command, cap, t);
+        if let Some(panel) = self.inspector_panel() {
+            body.blank();
+            let height = panel.height(body.width, t);
+            body.insert(height, Insert::Pattern(panel));
+        }
+    }
+
+    fn details_body(&self, body: &mut Body, t: &Theme) {
+        for section in self.details() {
+            body.blank();
+            body.push([Line::styled(section.heading, t.panel_title)]);
+            for line in section.lines {
+                body.push(indented(HANG.width(), &line, Style::default(), body.width));
+            }
+        }
+    }
+
+    /// Whether `←` `→` can move the main view's scope.
+    fn scope_movable(&self) -> bool {
+        let Some(request) = self.current() else {
+            return false;
+        };
+        if self.opacity().is_some() {
+            return false;
+        }
+        if self.per_row() {
+            return self.focus_row.is_some_and(|row| {
+                row_positions(request, row, &self.row_grant(row), self.batch()).len() > 1
+            });
+        }
+        main_ladder(request).len() > 1
+    }
+
+    /// The keys that do something right now, in the order they matter.
+    fn footer_hints(&self) -> Vec<KeyHint> {
+        let enter = |description| KeyHint::key("Enter", description, KeyCode::Enter);
+        let esc = |description| KeyHint::key("Esc", description, KeyCode::Esc);
+        if self.inspector.is_some() && self.panel != Panel::Details {
+            return self.inspector_hints();
+        }
+        if self.pending.is_some() {
+            return vec![enter("allow"), esc("back")];
+        }
+        match self.state {
+            PromptState::Guidance => return vec![enter("send"), esc("cancel")],
+            PromptState::PatternEditing => return vec![enter("use"), esc("back")],
+            PromptState::Normal => {}
+        }
+        match self.panel {
+            Panel::Details => vec![
+                KeyHint::inert("↑↓", "scroll"),
+                KeyHint::char("?", "back"),
+                esc("no"),
+            ],
+            Panel::Customize => {
+                let mut hints = vec![
+                    KeyHint::key("Tab", "next field", KeyCode::Tab),
+                    KeyHint::inert("↑↓", "choose"),
+                    enter("apply"),
+                ];
+                if self.customize_model().is_some() {
+                    hints.push(KeyHint::char("v", "advanced"));
+                }
+                if self.inspectable() {
+                    hints.push(KeyHint::char("i", "edit template"));
+                }
+                hints.push(esc("back"));
+                hints
+            }
+            Panel::StepThrough if self.step.as_ref().is_some_and(|step| step.page.is_none()) => {
+                vec![
+                    KeyHint::inert("↑↓", "choose"),
+                    enter("confirm"),
+                    KeyHint::key("Shift-Tab", "back", KeyCode::BackTab),
+                    esc("main view"),
+                ]
+            }
+            Panel::StepThrough => {
+                let mut hints = vec![KeyHint::inert("↑↓", "scope")];
+                if self.page_lifetimes().len() > 1 {
+                    hints.push(KeyHint::inert("←→", "how long"));
+                }
+                hints.extend([enter("choose"), KeyHint::key("Tab", "next", KeyCode::Tab)]);
+                if self.inspectable() {
+                    hints.push(KeyHint::char("i", "edit template"));
+                }
+                hints.push(esc("back"));
+                hints
+            }
+            Panel::Main => {
+                let several = self.batch() && self.per_row() && self.new_rows().len() > 1;
+                let mut hints = Vec::new();
+                if several {
+                    hints.push(KeyHint::key("Tab", "next", KeyCode::Tab));
+                }
+                if self.scope_movable() {
+                    hints.push(KeyHint::inert("←→", "scope"));
+                }
+                if several {
+                    hints.push(KeyHint::inert("<>", "all"));
+                }
+                hints.push(KeyHint::char(
+                    "e",
+                    if self.batch() && self.per_row() && !self.new_rows().is_empty() {
+                        "one by one"
+                    } else if self.choices().len() > 2 {
+                        "customize"
+                    } else {
+                        "more options"
+                    },
+                ));
+                hints.extend([KeyHint::char("?", "details"), esc("no")]);
+                hints
+            }
+        }
+    }
+
+    /// Every key's description when they all fit, else only the last one's.
+    fn draw_footer(&mut self, frame: &mut Frame, area: Rect, t: &Theme) {
+        if self.decision_needs_rearm() {
+            frame.render_widget(
+                Paragraph::new(Line::styled(
+                    format!("{}{REARM_MESSAGE}", " ".repeat(usize::from(MARGIN))),
+                    t.status_notice,
+                )),
+                area,
+            );
+            return;
+        }
+        let hints = self.footer_hints();
+        let full: Vec<Hint> = hints.iter().map(|hint| hint.hint(false)).collect();
+        let hints = if hint_hits(&full, area).len() == full.len() {
+            full
+        } else {
+            hints
+                .iter()
+                .enumerate()
+                .map(|(index, hint)| hint.hint(index + 1 < hints.len()))
+                .collect()
+        };
+        let hits = hint_hits(&hints, area);
+        let shown = &hints[..hits.len()];
+        let hovered = self.hover.as_ref().or(self.focus.as_ref());
+        let hovered = shown.iter().position(|hint| {
+            hint.press()
+                .is_some_and(|key| hovered == Some(&PromptTarget::Hint(key)))
+        });
+        frame.render_widget(Paragraph::new(hint_line_hovered(shown, hovered)), area);
+        for (area, hint) in hits.into_iter().zip(shown) {
+            if let Some(key) = hint.press() {
+                self.hits.push(PromptHit {
+                    area,
+                    target: PromptTarget::Hint(key),
+                });
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 pub(super) mod tests {
     use std::collections::BTreeMap;
-    use std::fs::OpenOptions;
-    #[cfg(unix)]
-    use std::fs::{self, Permissions};
+    use std::fs::{self, OpenOptions, Permissions};
     use std::io::Write;
-    #[cfg(unix)]
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use std::path::Path;
 
     use caudra_agent::permissions::{
-        PermissionAnswer, PermissionArgumentConstraint, PermissionAuthorityProfile,
-        PermissionExecutorKind, PermissionLifetime, PermissionRequest, PermissionResource,
-        PermissionResourceAccess, PermissionResourceKind, PermissionResourceSelector,
-        PermissionRisk, PermissionSubject, RemotePermissionIdentity, ResourceCoverage, RuleOrigin,
+        AutoNote, CONFINED_READ_AUTHORITY, EngineFlag, OPACITY_ATTRIBUTE, PermissionAdvisory,
+        PermissionAuthorityProfile, PermissionExecutorKind, PermissionLifetime, PermissionRequest,
+        PermissionResource, PermissionResourceAccess, PermissionResourceKind, PermissionRisk,
+        PermissionSubject, PromptReason, ResourceCoverage, RuleOrigin, ScriptLanguage,
+        ShellOpacity,
     };
     use caudra_agent::tools::{PermissionIntent, PermissionScopes};
     use caudra_config::ToolKey;
-    use caudra_workspace::{
-        AuthenticatedPrincipalId, AuthorityIdentity, ProjectIdentity, ProjectKey, SourceTrustAnchor,
-    };
-    use crossterm::event::{
-        KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-    };
-    use ratatui::{
-        Terminal,
-        backend::TestBackend,
-        buffer::Buffer,
-        layout::{Position, Rect},
-        style::{Color, Modifier, Style},
-        text::Line,
-        widgets::{Block, BorderType, Paragraph, Widget, Wrap},
-    };
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
     use serde_json::{Value, json};
     use tempfile::Builder;
     use test_case::test_case;
-    use unicode_width::UnicodeWidthStr;
 
-    use super::super::decision::tests::native_shell_request;
-    use super::super::details::{INCOMPLETE_REDACTION, review_text};
-    use super::super::inspector::InspectorControl;
-    use super::super::inspector::tests::suggested_prompt;
-    use super::super::{Panel, PromptMouse, PromptTarget};
-    use super::{
-        ADVISORY_GUIDANCE, ADVISORY_TITLE, CANONICAL_SCOPE_DETAILS, CardContent, CardTone,
-        PermissionAdvisory, PermissionPrompt, ReviewField, UNAVAILABLE_PROBABILITY,
-        UNKNOWN_ADVISORY, advisory_line,
+    use super::super::decision::tests::{
+        PROJECT, command_resource, commands_request, native_shell_request, shell_request,
     };
+    use super::super::{Panel, PermissionPrompt};
     use crate::components::buffer_text;
-    use crate::components::permission_scope::view::{Disclosure, ScopeControl, ScopeView};
     use crate::theme::{self, Theme};
 
     pub(crate) const ROOMY_WIDTH: u16 = 140;
     pub(crate) const ROOMY_HEIGHT: u16 = 40;
-    const FULL_REVIEW_HEIGHT: u16 = 128;
-    #[cfg(unix)]
+    pub(crate) const SINGLE_COMMAND: &str = "cargo test -p caudra-agent permissions::structured";
+    pub(crate) const BATCH: [&str; 6] = [
+        "cargo fmt -p caudra-agent",
+        "cargo clippy -p caudra-agent --tests",
+        "rm -rf target/tmp",
+        "git push origin HEAD",
+        "rg -n TODO src",
+        "head",
+    ];
+    const ASK_RULE: &str = "git push *";
+    const HEREDOC: &str = "python3 - <<'EOF'\nimport json, pathlib\nfor path in pathlib.Path(\"logs\").glob(\"*.json\"):\n    print(json.loads(path.read_text())[\"event\"])\nEOF";
+    const PAGE: &str = "https://docs.rs/ratatui/latest/ratatui/widgets/struct.Paragraph.html";
+    pub(crate) const OUTSIDE_FILE: &str = "/etc/caudra/caudra.toml";
+    const READ_CONTRACT: &str = "file.read.v1";
+    const WORKCELL_OWNER: &str = "workcell";
     const PRIVATE_ARTIFACT_MODE: u32 = 0o600;
-    const COMMAND: &str = "ls ~/.cache";
-    const EXACT_WORKDIR: &str = "/project";
-    const EXACT_PROJECT: &str = "/host/project-binding";
-    const COMPACT_SCOPE: &str = "Exact call only";
-    const COMPACT_CONTEXT: &str = "Same reviewed preparation";
-    const COVERING: &str = "git status *";
-    const PROTECTED: &str = "Includes protected resources. Review the scope before allowing.";
-    const BROAD_PHRASE: &str = "ALLOW BROAD SHELL ACCESS";
-    const PROTECTED_PHRASE: &str = "ALLOW PROTECTED ACCESS";
-    const HIDDEN_SECRET: &str = "never-display-this";
-    const REMOTE_IDS: [&str; 7] = [
-        "anchor",
-        "server",
-        "workspace",
-        "generation",
-        "namespace",
-        "principal",
-        "project",
-    ];
-    const REMOTE_DISPLAY_PATH: &str = "/display-only/file";
-    const REMOTE_ESCAPED_TARGET_KEY: &str = "/root/folder%2Ffile";
-    const REMOTE_SPLIT_TARGET_KEY: &str = "/root/folder/file";
-    const LIVE_SCOPE_HEIGHT: u16 = 24;
-    const ALTERNATIVE_DIRECTORY: &str = "/work/alternative";
-    const ATTRIBUTE_NAME: &str = "zone";
-    const ATTRIBUTE_VALUE: &str = "reviewed-zone";
-    const FIRST_COMMAND: &str = "git status";
-    const TARGETS_LABEL: &str = "Targets · ANY OF (2)";
-    const SECOND_CONDITIONS: &str = "ALL OF · target 2";
-    const UNRESTRICTED_ATTRIBUTE: &str = "zoneAnyUNRESTRICTED";
-    const MAX_PROPERTY_PAGES: usize = 32;
-    const ADVISORY_FLAG: &str = "deletes";
+    const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+    pub(crate) const THEMES: [&str; 2] = ["ayu_dark", "ayu_light"];
+    pub(crate) const WIDTHS: [u16; 3] = [40, 80, 140];
+    const FIT_WIDTH: u16 = 80;
+    const FIT_HEIGHT: u16 = 24;
+    const FRAME: &str = "│╭╮╰╯─";
+    const MIN_HEX_RUN: usize = 32;
+    const HASH_TAG_DIGITS: usize = 8;
     const ADVISORY_PROBABILITY: f64 = 0.875;
-    const ADVISORY_ESTIMATE: &str = "estimated probability 87.5%";
-    const DELETE_CAUTION: &str = "May delete files or data";
-    const SCOPE_FIELDS: &[(&str, &str)] = &[
-        ("Scope", COMPACT_SCOPE),
-        ("Run from", EXACT_WORKDIR),
-        ("Context", COMPACT_CONTEXT),
+    const DELETE_CAUTION: &str = "May delete files (88%)";
+    pub(crate) const INTERNAL_TERMS: [&str; 12] = [
+        "SHA-256",
+        "sha256",
+        "preimage",
+        "digest",
+        "ANY OF",
+        "ALL OF",
+        "guard",
+        "Canonical",
+        "Opaque",
+        "opaque",
+        "rule family",
+        "option id",
     ];
-
-    fn prepared_protected_request(command: &str) -> PermissionRequest {
-        let native = native_shell_request(command);
-        let mut resources = native.resources;
-        resources.push(PermissionResource {
-            kind: PermissionResourceKind::Command,
-            value: command.into(),
-            access: Some(PermissionResourceAccess::Execute),
-            protected: true,
-            requires_prompt: true,
-            attributes: BTreeMap::from([("workdir".into(), EXACT_WORKDIR.into())]),
-        });
-        let intent = PermissionIntent::new(
-            PermissionScopes::single(command.into()),
-            resources,
-            PermissionRisk::Critical,
-        )
-        .with_authority(PermissionAuthorityProfile::Shell);
-        let mut request = PermissionRequest::from_intent_with_identity(
-            native.id,
-            native.tool,
-            &intent,
-            json!({"command": command}),
-            Path::new(EXACT_WORKDIR),
-            native.subject,
-            native.executor,
-        );
-        request.presentation.project = Some(EXACT_PROJECT.into());
-        request
-    }
-
-    fn protected_prompt(command: &str) -> PermissionPrompt {
-        exact_prompt(prepared_protected_request(command))
-    }
-
-    fn remote_request(ids: [&str; 7], parts: &[&str], subtree: bool) -> PermissionRequest {
-        let authority = AuthorityIdentity::new(
-            SourceTrustAnchor::new(ids[0]).unwrap(),
-            ids[1],
-            ids[2],
-            ids[3],
-            ids[4],
-        )
-        .unwrap();
-        let identity = RemotePermissionIdentity {
-            principal: AuthenticatedPrincipalId::new(authority.clone(), ids[5]).unwrap(),
-            project: ProjectIdentity::new(authority.clone(), ProjectKey::new(ids[6]).unwrap()),
-            authority,
-        };
-        let intent = PermissionIntent::new(
-            PermissionScopes::single("remote read".into()),
-            vec![PermissionResource {
-                kind: PermissionResourceKind::RemoteFile {
-                    identity: identity.clone(),
-                },
-                value: parts.join("\u{1f}"),
-                access: Some(PermissionResourceAccess::Read),
-                protected: false,
-                requires_prompt: false,
-                attributes: BTreeMap::from([("display_path".into(), REMOTE_DISPLAY_PATH.into())]),
-            }],
-            PermissionRisk::Low,
-        )
-        .with_authority(PermissionAuthorityProfile::RemoteResource);
-        let mut request = PermissionRequest::from_intent_with_identity(
-            "remote".into(),
-            ToolKey::native("file_read"),
-            &intent,
-            json!({"filePath": REMOTE_DISPLAY_PATH}),
-            Path::new("/not-the-remote-project"),
-            PermissionSubject::RemoteNative {
-                identity: identity.clone(),
-                owner: "workcell".into(),
-                contract: "file.read.v1".into(),
-            },
-            PermissionExecutorKind::RemoteWorkcell,
-        );
-        request.presentation.action = "Run native tool file_read".into();
-        if subtree {
-            let resource = &mut request
-                .options
-                .iter_mut()
-                .find(|option| option.id == "allow_exact")
-                .unwrap()
-                .rule
-                .resources[0];
-            resource.kind = PermissionResourceKind::RemoteDirectory {
-                identity: identity.clone(),
-            };
-            resource.selector = PermissionResourceSelector::RemoteSubtree {
-                identity,
-                scope: vec![parts[0].into()],
-            };
-        }
-        request
-    }
-
-    fn exact_prompt(request: PermissionRequest) -> PermissionPrompt {
-        let mut prompt = PermissionPrompt::new();
-        prompt.enqueue(Box::new(request), None);
-        prompt.select_authority("allow_exact".into());
-        prompt
-    }
-
-    fn confirm_request(request: PermissionRequest) -> PermissionPrompt {
-        let mut prompt = exact_prompt(request);
-        render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT);
-        assert!(prompt.handle_key(key(KeyCode::Char('s'))).is_none());
-        assert!(prompt.confirmation.is_some());
-        prompt
-    }
 
     pub(crate) fn request(id: &str, input: Value) -> Box<PermissionRequest> {
         let mut request = PermissionRequest::from_legacy(
@@ -1287,29 +1464,22 @@ pub(super) mod tests {
             ToolKey::native("bash"),
             vec!["cargo test".into()],
             input,
-            Path::new("/project"),
+            Path::new(PROJECT),
             false,
         );
-        request.presentation.project = Some("/project".into());
+        request.presentation.project = Some(PROJECT.into());
         Box::new(request)
     }
-    pub(crate) fn open_prompt() -> PermissionPrompt {
-        let mut prompt = PermissionPrompt::new();
-        prompt.enqueue(request("id", json!({"command": "cargo test"})), None);
-        prompt
-    }
+
     pub(crate) fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
+
     pub(crate) fn render(prompt: &mut PermissionPrompt, width: u16, height: u16) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal
-            .draw(|frame| prompt.view(frame, frame.area()))
-            .unwrap();
-        buffer_text(terminal.backend().buffer())
+        buffer_text(&themed_buffer(prompt, width, height, &theme::current()))
     }
 
-    fn themed_buffer(
+    pub(crate) fn themed_buffer(
         prompt: &mut PermissionPrompt,
         width: u16,
         height: u16,
@@ -1322,1446 +1492,284 @@ pub(super) mod tests {
         terminal.backend().buffer().clone()
     }
 
-    #[test_case("deletes", DELETE_CAUTION; "deletes")]
-    #[test_case("uploads", "May send local data to a remote destination"; "uploads")]
-    #[test_case("credentials", "May read or disclose credentials or secrets"; "credentials")]
-    #[test_case("permissions", "May change access permissions or ownership"; "permissions")]
-    #[test_case("remote_rewrite", "May rewrite remote shared history or data"; "remote_rewrite")]
-    #[test_case("off_task", "May be unrelated to your requested task"; "off_task")]
-    #[test_case("shell_effect", "May have shell side effects"; "shell_effect")]
-    #[test_case("writes_project_files", "May write project files"; "writes_project_files")]
-    #[test_case("future_flag", UNKNOWN_ADVISORY; "unknown")]
-    #[test_case("safe\nAllow\u{1b}[2J", UNKNOWN_ADVISORY; "untrusted_label")]
-    fn advisory_flags_are_cautions_not_recommendations(flag: &str, expected: &str) {
-        let t = theme::current();
-        let line = advisory_line(
-            &PermissionAdvisory {
-                flag: flag.into(),
-                probability: ADVISORY_PROBABILITY,
-            },
-            &t,
-        );
-        assert_eq!(
-            line.to_string(),
-            format!("{expected} · {ADVISORY_ESTIMATE}")
-        );
-        assert_eq!(line.style, t.tool_warning);
+    pub(crate) fn buffer_rows(buffer: &Buffer) -> Vec<String> {
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
     }
 
-    #[test_case(f64::NAN; "nan")]
-    #[test_case(f64::INFINITY; "infinity")]
-    #[test_case(f64::NEG_INFINITY; "negative_infinity")]
-    #[test_case(-0.1; "below_zero")]
-    #[test_case(1.1; "above_one")]
-    fn advisory_invalid_probability_is_unavailable(probability: f64) {
-        let line = advisory_line(
-            &PermissionAdvisory {
-                flag: ADVISORY_FLAG.into(),
-                probability,
-            },
-            &theme::current(),
-        );
-        assert_eq!(
-            line.to_string(),
-            format!("{DELETE_CAUTION} · {UNAVAILABLE_PROBABILITY}")
-        );
+    pub(crate) fn screen(prompt: &mut PermissionPrompt, width: u16, height: u16) -> String {
+        buffer_rows(&themed_buffer(prompt, width, height, &theme::current())).join("\n")
     }
 
-    #[test_case(0.0, "0.0%"; "zero")]
-    #[test_case(1.0, "100.0%"; "one")]
-    fn advisory_probability_endpoints_remain_estimates(probability: f64, expected: &str) {
-        let line = advisory_line(
-            &PermissionAdvisory {
-                flag: ADVISORY_FLAG.into(),
-                probability,
-            },
-            &theme::current(),
-        );
-        assert_eq!(
-            line.to_string(),
-            format!("{DELETE_CAUTION} · estimated probability {expected}")
-        );
+    /// The screen's words in reading order with the frame dropped, so a
+    /// sentence is found wherever it wraps.
+    pub(crate) fn prose(prompt: &mut PermissionPrompt, width: u16, height: u16) -> String {
+        screen(prompt, width, height)
+            .split(|character: char| character.is_whitespace() || FRAME.contains(character))
+            .filter(|word| !word.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
-    #[test_case(false; "review")]
-    #[test_case(true; "confirmation")]
-    fn advisories_render_an_attributed_warning_without_controls(confirm: bool) {
-        let mut request = if confirm {
-            prepared_protected_request(FIRST_COMMAND)
-        } else {
-            native_shell_request(FIRST_COMMAND)
-        };
-        let expected_answer = if confirm {
-            confirm_request(request.clone())
-                .confirmation
-                .unwrap()
-                .answer
-        } else {
-            exact_prompt(request.clone()).allow_answer(PermissionLifetime::Conversation)
-        };
-        request.presentation.advisories = vec![PermissionAdvisory {
-            flag: ADVISORY_FLAG.into(),
-            probability: ADVISORY_PROBABILITY,
-        }];
-        let mut prompt = if confirm {
-            confirm_request(request)
-        } else {
-            exact_prompt(request)
-        };
-        assert_eq!(
-            prompt.allow_answer(PermissionLifetime::Conversation),
-            expected_answer
-        );
-        if let Some(confirmation) = &prompt.confirmation {
-            assert_eq!(confirmation.answer, expected_answer);
-        }
-        let text = render(&mut prompt, ROOMY_WIDTH, FULL_REVIEW_HEIGHT);
-        for expected in [
-            ADVISORY_TITLE,
-            ADVISORY_GUIDANCE,
-            DELETE_CAUTION,
-            ADVISORY_ESTIMATE,
-        ] {
-            assert!(text.contains(expected), "{text}");
-        }
-        let layout = prompt.review_layout(ROOMY_WIDTH, &theme::current());
-        let (_, card) = layout
-            .cards
-            .iter()
-            .find(|(_, card)| card.title == ADVISORY_TITLE)
-            .unwrap();
-        assert!(matches!(card.tone, CardTone::Warning));
-        assert!(card.target.is_none());
-        let CardContent::Text(body) = &card.content else {
-            panic!("{ADVISORY_TITLE}");
-        };
-        assert!(body.entries.is_empty());
-        assert!(
-            body.lines
-                .iter()
-                .all(|line| line.style == theme::current().tool_warning)
-        );
-    }
-
-    #[test_case(false; "legacy_missing_field")]
-    #[test_case(true; "explicit_empty_field")]
-    fn empty_advisories_restore_the_original_review(explicit: bool) {
-        let request = native_shell_request(FIRST_COMMAND);
-        let mut wire = serde_json::to_value(&request).unwrap();
-        wire["presentation"]
-            .as_object_mut()
-            .unwrap()
-            .remove("advisories");
-        if explicit {
-            wire["presentation"]["advisories"] = json!([]);
-        }
-        let restored: PermissionRequest = serde_json::from_value(wire).unwrap();
-        assert!(restored.presentation.advisories.is_empty());
-        assert_eq!(restored, request);
+    pub(crate) fn prompt_for(request: PermissionRequest) -> PermissionPrompt {
         let mut prompt = PermissionPrompt::new();
-        assert!(prompt.enqueue(Box::new(request.clone()), None));
-        let before = render(&mut prompt, ROOMY_WIDTH, FULL_REVIEW_HEIGHT);
-        let height = prompt.height(ROOMY_WIDTH);
-        let answer = prompt.allow_answer(PermissionLifetime::Conversation);
-        let mut advised = request;
-        advised.presentation.advisories.push(PermissionAdvisory {
-            flag: ADVISORY_FLAG.into(),
+        prompt.enqueue(Box::new(request), None);
+        prompt
+    }
+
+    pub(crate) fn shell_prompt(command: &str) -> PermissionPrompt {
+        prompt_for(native_shell_request(command))
+    }
+
+    pub(crate) fn cover(
+        request: &mut PermissionRequest,
+        row: usize,
+        origin: RuleOrigin,
+        authority: &str,
+        asks: bool,
+    ) {
+        request.presentation.resources[row].coverage = Some(ResourceCoverage {
+            origin,
+            authority: authority.into(),
+            asks,
+        });
+    }
+
+    /// The §2 script: three new commands, one an ask rule covers, and two
+    /// read-only ones.
+    pub(crate) fn batch_request() -> PermissionRequest {
+        let mut request = commands_request(&BATCH);
+        cover(&mut request, 3, RuleOrigin::Config, ASK_RULE, true);
+        for row in [4, 5] {
+            cover(
+                &mut request,
+                row,
+                RuleOrigin::Builtin,
+                CONFINED_READ_AUTHORITY,
+                false,
+            );
+        }
+        request
+    }
+
+    pub(crate) fn heredoc_request() -> PermissionRequest {
+        let mut line = command_resource(HEREDOC);
+        line.protected = true;
+        line.requires_prompt = true;
+        line.attributes.insert(
+            OPACITY_ATTRIBUTE.into(),
+            ShellOpacity::InlineScript {
+                language: ScriptLanguage::Python,
+            }
+            .to_string(),
+        );
+        let mut request = shell_request(HEREDOC, vec![command_resource("python3 -"), line]);
+        request.presentation.auto = Some(AutoNote::EngineNeeded);
+        request
+    }
+
+    pub(crate) fn fetch_request() -> PermissionRequest {
+        let mut request = PermissionRequest::from_legacy(
+            "fetch".into(),
+            ToolKey::native("webfetch"),
+            vec![PAGE.into()],
+            json!({"url": PAGE}),
+            Path::new(PROJECT),
+            false,
+        );
+        request.presentation.project = Some(PROJECT.into());
+        request
+    }
+
+    pub(crate) fn file_request(path: &str, access: PermissionResourceAccess) -> PermissionRequest {
+        let intent = PermissionIntent::new(
+            PermissionScopes::single(path.into()),
+            vec![PermissionResource {
+                kind: PermissionResourceKind::File,
+                value: path.into(),
+                access: Some(access),
+                protected: false,
+                requires_prompt: false,
+                attributes: BTreeMap::new(),
+            }],
+            PermissionRisk::Medium,
+        )
+        .with_authority(PermissionAuthorityProfile::Filesystem {
+            input_pointers: Vec::new(),
+        });
+        let mut request = PermissionRequest::from_intent_with_identity(
+            "file".into(),
+            ToolKey::native("file_read"),
+            &intent,
+            json!({"filePath": path}),
+            Path::new(PROJECT),
+            PermissionSubject::Native {
+                owner: WORKCELL_OWNER.into(),
+                contract: READ_CONTRACT.into(),
+            },
+            PermissionExecutorKind::Native,
+        );
+        request.presentation.project = Some(PROJECT.into());
+        request
+    }
+
+    /// A request the way plan mode sends it: every rung lasts this
+    /// conversation at most.
+    pub(crate) fn planning(mut request: PermissionRequest) -> PermissionRequest {
+        request.presentation.reason = PromptReason::Plan;
+        for option in &mut request.options {
+            option.allowed_lifetimes.retain(|lifetime| {
+                matches!(
+                    lifetime,
+                    PermissionLifetime::Once | PermissionLifetime::Conversation
+                )
+            });
+        }
+        request
+    }
+
+    pub(crate) fn advised(mut request: PermissionRequest) -> PermissionRequest {
+        request.presentation.advisories.push(PermissionAdvisory {
+            flag: EngineFlag::Deletes,
             probability: ADVISORY_PROBABILITY,
         });
-        assert!(prompt.update(Box::new(advised)));
-        assert_eq!(
-            prompt.allow_answer(PermissionLifetime::Conversation),
-            answer
-        );
-        assert!(render(&mut prompt, ROOMY_WIDTH, FULL_REVIEW_HEIGHT).contains(ADVISORY_TITLE));
-        assert!(prompt.height(ROOMY_WIDTH) > height);
-        assert!(prompt.update(Box::new(restored)));
-        assert_eq!(
-            prompt.allow_answer(PermissionLifetime::Conversation),
-            answer
-        );
-        assert_eq!(render(&mut prompt, ROOMY_WIDTH, FULL_REVIEW_HEIGHT), before);
-        assert_eq!(prompt.height(ROOMY_WIDTH), height);
+        request
     }
 
-    fn typed_alternatives_prompt() -> PermissionPrompt {
-        let mut request = native_shell_request(FIRST_COMMAND);
-        request.resources[0]
-            .attributes
-            .insert(ATTRIBUTE_NAME.into(), ATTRIBUTE_VALUE.into());
-        let option = request
-            .options
-            .iter_mut()
-            .find(|option| option.id == "allow_exact")
-            .unwrap();
-        option.rule.arguments = PermissionArgumentConstraint::Unconstrained;
-        let first = &mut option.rule.resources[0];
-        first.selector = PermissionResourceSelector::Any;
-        first.protected = Some(false);
-        first.attributes.retain(|name, _| name == "workdir");
-        first.attributes.insert(
-            ATTRIBUTE_NAME.into(),
-            PermissionResourceSelector::Exact {
-                value: ATTRIBUTE_VALUE.into(),
-            },
-        );
-        let mut second = first.clone();
-        second.protected = Some(true);
-        second.attributes.insert(
-            "workdir".into(),
-            PermissionResourceSelector::Exact {
-                value: ALTERNATIVE_DIRECTORY.into(),
-            },
-        );
-        second
-            .attributes
-            .insert(ATTRIBUTE_NAME.into(), PermissionResourceSelector::Any);
-        option.rule.resources.push(second);
-        exact_prompt(request)
-    }
-
-    fn typed_pattern_prompt() -> PermissionPrompt {
-        let mut prompt = suggested_prompt();
-        let id = prompt
-            .current()
-            .unwrap()
-            .options
-            .iter()
-            .find(|option| {
-                option.rule.resources.iter().any(|resource| {
-                    matches!(
-                        resource.selector,
-                        PermissionResourceSelector::CommandTemplate { .. }
-                    )
-                })
-            })
-            .unwrap()
-            .id
-            .clone();
-        prompt.select_authority(id);
-        prompt
-    }
-
-    fn scope_card(prompt: &PermissionPrompt, t: &Theme) -> Rect {
-        prompt
-            .review_layout(prompt.area.width.saturating_sub(3), t)
-            .cards
-            .into_iter()
-            .find(|(_, card)| matches!(card.content, CardContent::Scope(..)))
-            .unwrap()
-            .0
-    }
-
-    fn reveal_scope(prompt: &mut PermissionPrompt, width: u16, t: &Theme) -> Buffer {
-        themed_buffer(prompt, width, LIVE_SCOPE_HEIGHT, t);
-        prompt.scroll.scroll_to(scope_card(prompt, t).y);
-        themed_buffer(prompt, width, LIVE_SCOPE_HEIGHT, t)
-    }
-
-    fn click_scope_control(
-        prompt: &mut PermissionPrompt,
-        width: u16,
-        t: &Theme,
-        control: ScopeControl,
-    ) -> Buffer {
-        themed_buffer(prompt, width, LIVE_SCOPE_HEIGHT, t);
-        let y = prompt
-            .scope_view
-            .hits
-            .iter()
-            .find(|hit| hit.control == control)
-            .unwrap()
-            .area
-            .y;
-        if matches!(control, ScopeControl::Scroll(_)) {
-            let properties = prompt
-                .scope_view
-                .hits
-                .iter()
-                .find(|hit| hit.control == ScopeControl::Disclosure(Disclosure::Conditions))
-                .unwrap()
-                .area
-                .y;
-            prompt.scroll.scroll_to(properties);
-            prompt.scroll.reveal(y, 1);
-        } else {
-            prompt.scroll.scroll_to(y.saturating_sub(1));
+    /// Every state a reviewer should see, by name.
+    pub(crate) fn surfaces() -> Vec<(&'static str, PermissionPrompt)> {
+        let mut surfaces = vec![
+            ("single", shell_prompt(SINGLE_COMMAND)),
+            ("batch", prompt_for(batch_request())),
+            ("heredoc", prompt_for(heredoc_request())),
+            ("fetch", prompt_for(fetch_request())),
+            (
+                "outside-file",
+                prompt_for(file_request(OUTSIDE_FILE, PermissionResourceAccess::Read)),
+            ),
+            (
+                "plan",
+                prompt_for(planning(native_shell_request(SINGLE_COMMAND))),
+            ),
+            (
+                "caution",
+                prompt_for(advised(native_shell_request(
+                    "rm -rf target/debug/incremental",
+                ))),
+            ),
+        ];
+        let mut guidance = shell_prompt(SINGLE_COMMAND);
+        guidance.open_guidance();
+        guidance
+            .field
+            .set_text("use cargo clean -p caudra-agent instead");
+        surfaces.push(("guidance", guidance));
+        let mut customize = shell_prompt(SINGLE_COMMAND);
+        customize.open_customize(false);
+        surfaces.push(("customize", customize));
+        let mut advanced = shell_prompt(SINGLE_COMMAND);
+        advanced.open_customize(false);
+        if let Some(customize) = advanced.customize.as_mut() {
+            customize.advanced = true;
         }
-        themed_buffer(prompt, width, LIVE_SCOPE_HEIGHT, t);
-        let target = PromptTarget::VisualScope(0, control);
-        let area = prompt
-            .row_hits
-            .iter()
-            .find(|hit| hit.target == target)
-            .unwrap()
-            .area;
-        for kind in [
-            MouseEventKind::Down(MouseButton::Left),
-            MouseEventKind::Up(MouseButton::Left),
-        ] {
-            assert!(matches!(
-                prompt.handle_mouse(MouseEvent {
-                    kind,
-                    column: area.x,
-                    row: area.y,
-                    modifiers: KeyModifiers::NONE
-                }),
-                PromptMouse::Consumed
-            ));
-        }
-        themed_buffer(prompt, width, LIVE_SCOPE_HEIGHT, t)
+        surfaces.push(("advanced", advanced));
+        let mut broad = shell_prompt(SINGLE_COMMAND);
+        broad.open_customize(false);
+        let last = broad.customize_items().len() - 1;
+        broad.highlight_scope(last);
+        broad.awaiting_review = false;
+        broad.apply_customize();
+        surfaces.push(("confirm", broad));
+        let mut details = shell_prompt(SINGLE_COMMAND);
+        details.toggle_details();
+        surfaces.push(("details", details));
+        let mut page = prompt_for(batch_request());
+        page.open_step_through();
+        surfaces.push(("page", page));
+        let mut review = prompt_for(batch_request());
+        review.open_step_through();
+        review.go_to_page(None);
+        surfaces.push(("review", review));
+        surfaces
     }
 
-    fn compact_cells(buffer: &Buffer) -> String {
-        buffer_rows(buffer)
-            .chars()
-            .filter(|character| !character.is_whitespace() && *character != '│')
-            .collect()
-    }
-
-    fn displayed_scope_fields(prompt: &PermissionPrompt) -> Vec<ReviewField> {
-        prompt
-            .review_layout(
-                prompt.area.width.saturating_sub(3).max(1),
-                &theme::current(),
-            )
-            .cards
-            .into_iter()
-            .flat_map(|(_, card)| match (card.tone, card.content) {
-                (
-                    CardTone::Scope,
-                    CardContent::Fields(fields) | CardContent::Scope(_, _, _, fields),
-                ) => fields,
-                _ => Vec::new(),
-            })
-            .collect()
-    }
-
-    fn assert_scrollable_body(
-        prompt: &mut PermissionPrompt,
-        width: u16,
-        height: u16,
-        t: &Theme,
-    ) -> Buffer {
-        themed_buffer(prompt, width, FULL_REVIEW_HEIGHT, t);
-        prompt.handle_key(key(KeyCode::Home));
-        let full = themed_buffer(prompt, width, FULL_REVIEW_HEIGHT, t);
-        let first = themed_buffer(prompt, width, height, t);
-        assert_eq!(prompt.scroll.offset(), 0);
-        let footer_rows = prompt.footer_rows(prompt.area.width - 2).len() as u16;
-        let footer_top = height - 2 - footer_rows;
-        let body_height = footer_top - 1;
-        let required_height = prompt.height(width);
-        assert!(required_height > height);
-        assert!(required_height <= FULL_REVIEW_HEIGHT);
-        let max_offset = required_height - height;
-        let left = prompt.area.x + 1;
-        let right = prompt.area.right() - 2;
-        let mut page = first.clone();
-        for offset in 0..=max_offset {
-            if offset > 0 {
-                prompt.scroll(-1);
-                page = themed_buffer(prompt, width, height, t);
-            }
-            assert_eq!(prompt.scroll.offset(), offset);
-            for row in 0..body_height {
-                for x in left..right {
-                    assert_eq!(
-                        page[(x, row + 1)],
-                        full[(x, row + offset + 1)],
-                        "offset {offset}, cell ({x}, {row})"
-                    );
-                }
-            }
-            for row in footer_top..height {
-                for x in prompt.area.x..prompt.area.right() {
-                    assert_eq!(page[(x, row)], first[(x, row)], "footer at offset {offset}");
-                }
-            }
-        }
-        assert_ne!(page, first);
-        prompt.handle_key(key(KeyCode::Home));
-        assert_eq!(themed_buffer(prompt, width, height, t), first);
-        prompt.handle_key(key(KeyCode::End));
-        assert_eq!(themed_buffer(prompt, width, height, t), page);
-        assert!(prompt.row_hits.iter().all(|hit| {
-            prompt.area.contains(Position::new(hit.area.x, hit.area.y))
-                && hit.area.bottom() <= prompt.area.bottom()
-        }));
-        full
-    }
-
-    fn golden_button(
-        buffer: &mut Buffer,
-        x: u16,
-        y: u16,
-        key: &str,
-        description: &str,
-        t: &Theme,
-    ) -> u16 {
-        buffer.set_string(x, y, "[", t.tool_dim);
-        buffer.set_string(x + 1, y, key, t.keybind_key);
-        let x = x + 1 + key.width() as u16;
-        buffer.set_string(x, y, format!(" {description}"), t.keybind_desc);
-        let x = x + 1 + description.width() as u16;
-        buffer.set_string(x, y, "]", t.tool_dim);
-        x + 1
-    }
-
-    fn golden_card(
-        buffer: &mut Buffer,
-        area: Rect,
-        title: &str,
-        base: Style,
-        border: Style,
-        lines: Vec<Line<'static>>,
-    ) -> u16 {
-        let content_width = area.width - 4;
-        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-        let height = paragraph.line_count(content_width) as u16 + 2;
-        let area = Rect { height, ..area };
-        let block = Block::bordered()
-            .border_type(BorderType::Rounded)
-            .border_style(border)
-            .style(base)
-            .title_top(Line::styled(
-                format!(" {title} "),
-                border.add_modifier(Modifier::BOLD),
-            ));
-        let inner = Rect::new(area.x + 2, area.y + 1, content_width, height - 2);
-        block.render(area, buffer);
-        paragraph.render(inner, buffer);
-        height
-    }
-
-    fn golden_fields(
-        buffer: &mut Buffer,
-        area: Rect,
-        title: &str,
-        fields: &[(&str, &str)],
-        base: Style,
-        t: &Theme,
-    ) -> u16 {
-        let width = area.width - 4;
-        let measure = |text: &str, width| {
-            Paragraph::new(text)
-                .wrap(Wrap { trim: false })
-                .line_count(width) as u16
-        };
-        let sizes = fields
-            .iter()
-            .map(|(name, value)| {
-                if width < 52 {
-                    1 + measure(value, width)
-                } else {
-                    measure(name, 18).max(measure(value, width - 18))
-                }
-            })
-            .collect::<Vec<_>>();
-        let height = sizes.iter().sum::<u16>() + 2;
-        Block::bordered()
-            .border_type(BorderType::Rounded)
-            .border_style(t.panel_border)
-            .style(base)
-            .title_top(Line::styled(
-                format!(" {title} "),
-                t.panel_border.add_modifier(Modifier::BOLD),
-            ))
-            .render(Rect { height, ..area }, buffer);
-        let mut y = area.y + 1;
-        for ((name, value), height) in fields.iter().zip(sizes) {
-            let (label, value_area) = if width < 52 {
-                (
-                    Rect::new(area.x + 2, y, width, 1),
-                    Rect::new(area.x + 2, y + 1, width, height - 1),
-                )
+    fn hex_run(text: &str) -> bool {
+        let mut run = 0;
+        text.chars().any(|character| {
+            run = if character.is_ascii_hexdigit() {
+                run + 1
             } else {
-                (
-                    Rect::new(area.x + 2, y, 18, height),
-                    Rect::new(area.x + 20, y, width - 18, height),
-                )
+                0
             };
-            Paragraph::new(*name)
-                .style(t.tool_dim)
-                .wrap(Wrap { trim: false })
-                .render(label, buffer);
-            Paragraph::new(*value)
-                .wrap(Wrap { trim: false })
-                .render(value_area, buffer);
-            y += height;
-        }
-        height
+            run >= MIN_HEX_RUN
+        })
     }
 
-    fn golden_review(
-        width: u16,
-        height: u16,
-        t: &Theme,
-        command: &str,
-        confirming: bool,
-    ) -> Buffer {
-        let panel_width = width.min(112);
-        let left = (width - panel_width) / 2;
-        let body_width = panel_width - 3;
-        let mut document = Buffer::empty(Rect::new(0, 0, body_width, 128));
-        let base = Style::new().fg(t.foreground);
-        let mut y = golden_card(
-            &mut document,
-            Rect::new(0, 0, body_width, 0),
-            "Run command",
-            t.code_block,
-            t.accent,
-            vec![Line::styled(
-                command.to_owned(),
-                t.code_block.fg(t.foreground).add_modifier(Modifier::BOLD),
-            )],
-        ) + 1;
-        let lifetime = if confirming {
-            "This conversation only."
-        } else {
-            "Choose Once, Conversation or Project below."
-        };
-        let mut lifetime_lines = vec![Line::styled(lifetime, t.status_notice)];
-        if !confirming {
-            lifetime_lines.push(Line::styled(
-                format!("Project: {EXACT_PROJECT}"),
-                t.tool_dim,
-            ));
-        }
-        y += golden_card(
-            &mut document,
-            Rect::new(0, y, body_width, 0),
-            "Lifetime",
-            base,
-            t.panel_border,
-            lifetime_lines,
-        ) + 1;
-        y += golden_fields(
-            &mut document,
-            Rect::new(0, y, body_width, 0),
-            "Future scope",
-            SCOPE_FIELDS,
-            t.tool_bg.fg(t.foreground),
-            t,
-        ) + 1;
-        y += golden_card(
-            &mut document,
-            Rect::new(0, y, body_width, 0),
-            "Review carefully",
-            base,
-            t.tool_warning,
-            vec![Line::styled(PROTECTED, t.tool_warning)],
-        );
-        let mut footer: Vec<Vec<(&str, &str)>> = Vec::new();
-        let groups = if confirming {
-            vec![
-                vec![("Enter/y", "Confirm")],
-                vec![("F2", "Details"), ("Esc", "Back")],
-            ]
-        } else {
-            vec![
-                vec![("y", "Once"), ("s", "Conversation"), ("a", "Project")],
-                vec![
-                    ("r", "Scope"),
-                    ("v", "Details"),
-                    ("g", "Guidance"),
-                    ("Esc", "Deny"),
-                ],
-            ]
-        };
-        for group in groups {
-            let mut row = Vec::new();
-            let mut used = if group[0].0 == "y" { 7 } else { 0 };
-            for (key, description) in group {
-                let size = (key.width() + description.width() + 3) as u16;
-                let gap = if row.is_empty() { 0 } else { 2 };
-                if used + gap + size > panel_width - 2 {
-                    footer.push(row);
-                    row = Vec::new();
-                    used = 0;
-                }
-                used += size + if row.is_empty() { 0 } else { 2 };
-                row.push((key, description));
-            }
-            footer.push(row);
-        }
-        let body_height = height - 3 - footer.len() as u16;
-        let mut expected = Buffer::empty(Rect::new(0, 0, width, height));
-        let title = if confirming {
-            "Confirm permission"
-        } else {
-            "Permission required"
-        };
-        Block::bordered()
-            .border_type(BorderType::Rounded)
-            .border_style(t.panel_border)
-            .title_style(t.panel_title)
-            .title_top(Line::from(format!(" {title} · 1 pending ")))
-            .render(Rect::new(left, 0, panel_width, height), &mut expected);
-        for row in 0..body_height.min(y) {
-            for x in 0..body_width {
-                expected[(left + 1 + x, row + 1)] = document[(x, row)].clone();
-            }
-        }
-        if y > body_height {
-            let thumb = ((body_height * body_height + y / 2) / y).max(1);
-            for row in 1..=thumb {
-                expected.set_string(
-                    left + panel_width - 2,
-                    row,
-                    "▐",
-                    Style::new().fg(Color::Reset).bg(Color::Reset),
-                );
-            }
-        }
-        expected.set_string(
-            left + 1,
-            body_height + 1,
-            "─".repeat(usize::from(panel_width - 2)),
-            t.panel_border,
-        );
-        for (index, row) in footer.iter().enumerate() {
-            let mut x = left + 1;
-            let y = body_height + 2 + index as u16;
-            if row[0].0 == "y" {
-                expected.set_string(x, y, "Allow: ", t.tool_dim);
-                x += 7;
-            }
-            for (key, description) in row {
-                x = golden_button(&mut expected, x, y, key, description, t) + 2;
-            }
-        }
-        expected
+    fn hash_tag(text: &str) -> bool {
+        text.match_indices('#').any(|(index, _)| {
+            text[index + 1..]
+                .chars()
+                .take(HASH_TAG_DIGITS)
+                .filter(char::is_ascii_hexdigit)
+                .count()
+                == HASH_TAG_DIGITS
+        })
     }
 
-    #[test_case(40, 10; "narrow_short")]
-    #[test_case(40, 48; "narrow_tall")]
-    #[test_case(80, 10; "normal_short")]
-    #[test_case(80, 24; "normal_exact_call")]
-    #[test_case(80, 32; "normal_tall")]
-    #[test_case(140, 10; "wide_short")]
-    #[test_case(140, 32; "wide_tall")]
-    fn protected_review_matches_every_cell_and_style(width: u16, height: u16) {
-        for name in ["ayu_dark", "ayu_light"] {
-            for confirming in [false, true] {
-                let t = theme::load_by_name(name).unwrap();
-                let mut prompt = protected_prompt(COMMAND);
-                if confirming {
-                    themed_buffer(&mut prompt, width, height, &t);
-                    assert!(prompt.handle_key(key(KeyCode::Char('s'))).is_none());
-                    assert!(prompt.confirmation.as_ref().unwrap().complete);
-                }
-                let actual = themed_buffer(&mut prompt, width, height, &t);
-                let expected = golden_review(width, height, &t, COMMAND, confirming);
-                assert_eq!(
-                    actual,
-                    expected,
-                    "{name}, confirming={confirming}\n{}",
-                    buffer_text(&actual)
-                );
+    pub(crate) fn assert_plain(rows: &[String], surface: &str) {
+        for row in rows {
+            for term in INTERNAL_TERMS {
+                assert!(!row.contains(term), "{surface}: {term} in {row:?}");
             }
-        }
-    }
-
-    #[test_case(40; "narrow")]
-    #[test_case(80; "normal")]
-    #[test_case(140; "wide")]
-    fn unicode_command_uses_real_cells_and_preserves_metadata(width: u16) {
-        const UNICODE: &str = "printf '%s' '界é'";
-        const PREFIX: &str = "printf '%s' '";
-        const HEIGHT: u16 = 32;
-        for name in ["ayu_dark", "ayu_light"] {
-            let t = theme::load_by_name(name).unwrap();
-            let mut prompt = protected_prompt(UNICODE);
-            let mut terminal = Terminal::new(TestBackend::new(width, HEIGHT)).unwrap();
-            let frame = terminal
-                .draw(|frame| prompt.view_with_theme(frame, frame.area(), &t))
-                .unwrap();
-            let expected = golden_review(width, HEIGHT, &t, UNICODE, false);
-            assert_eq!(frame.buffer, &expected);
-            let x = (width - width.min(112)) / 2 + 3 + PREFIX.width() as u16;
-            let backend = terminal.backend().buffer();
-            for (column, symbol) in [(x, "界"), (x + 2, "é"), (x + 3, "'")] {
-                assert_eq!(backend[(column, 2)].symbol(), symbol);
-                assert_eq!(backend[(column, 2)].style(), expected[(column, 2)].style());
-            }
-        }
-    }
-
-    #[test_case(40; "narrow")]
-    #[test_case(80; "normal")]
-    #[test_case(140; "wide")]
-    fn exact_protected_summary_deduplicates_values_but_keeps_obligations(width: u16) {
-        let mut prompt = protected_prompt(COMMAND);
-        render(&mut prompt, width, 64);
-        prompt.handle_key(key(KeyCode::Char('s')));
-        let screen = render(&mut prompt, width, 64);
-        assert_eq!(screen.matches(COMMAND).count(), 1, "{screen}");
-        assert_eq!(screen.matches("/project").count(), 1, "{screen}");
-        for obligation in [
-            COMPACT_SCOPE,
-            COMPACT_CONTEXT,
-            "Run from",
-            "protected",
-            "Lifetime",
-            "Context",
-        ] {
-            assert!(screen.contains(obligation), "{obligation}: {screen}");
-        }
-        let frozen = prompt.confirmation.as_ref().unwrap();
-        assert!(frozen.complete);
-        for obligation in [
-            "Arguments",
-            "Directories",
-            "1 · Protection",
-            "2 · Protection",
-        ] {
-            assert!(frozen.review.text().contains(obligation));
-        }
-    }
-
-    #[test_case(false; "main")]
-    #[test_case(true; "confirmation")]
-    fn prepared_cache_call_is_comfortable_at_normal_terminal_size(confirming: bool) {
-        const WIDTH: u16 = 80;
-        const HEIGHT: u16 = 24;
-        for name in ["ayu_dark", "ayu_light"] {
-            let t = theme::load_by_name(name).unwrap();
-            let mut prompt = protected_prompt(COMMAND);
-            let answer = prompt.allow_answer(PermissionLifetime::Conversation);
-            themed_buffer(&mut prompt, WIDTH, HEIGHT, &t);
-            if confirming {
-                assert!(prompt.handle_key(key(KeyCode::Char('s'))).is_none());
-                let frozen = prompt.confirmation.as_ref().unwrap();
-                assert_eq!(frozen.answer, answer);
-                assert!(frozen.complete);
-            }
-            let screen = buffer_rows(&themed_buffer(&mut prompt, WIDTH, HEIGHT, &t));
-            assert!(prompt.height(WIDTH) <= HEIGHT, "{screen}");
-            for text in [
-                COMMAND,
-                EXACT_WORKDIR,
-                COMPACT_SCOPE,
-                COMPACT_CONTEXT,
-                "Lifetime",
-                PROTECTED,
-                if confirming {
-                    "[Enter/y Confirm]"
-                } else {
-                    "[s Conversation]"
-                },
-                if confirming {
-                    "This conversation only."
-                } else {
-                    "Choose Once, Conversation or Project below."
-                },
-            ] {
-                assert!(screen.contains(text), "{text}:\n{screen}");
-            }
-            assert_eq!(screen.matches(COMMAND).count(), 1);
-            assert_eq!(
-                screen
-                    .split_whitespace()
-                    .filter(|word| *word == EXACT_WORKDIR)
-                    .count(),
-                1
-            );
-            assert_eq!(screen.matches(PROTECTED).count(), 1);
-            for hidden in ["normalized", "Unrestricted", "Alternatives", "1 ·", "2 ·"] {
-                assert!(!screen.contains(hidden), "{hidden}:\n{screen}");
-            }
-            let details = super::details_body(prompt.current().unwrap())
-                .lines
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("\n");
-            for technical in [
-                "normalized_command",
-                "possible_workdirs",
-                "resources[1].protected",
-                "input.command",
-            ] {
-                assert!(details.contains(technical), "{technical}");
-            }
-        }
-    }
-
-    #[test_case(KeyCode::Enter; "enter_is_fresh")]
-    #[test_case(KeyCode::Char('y'); "y_is_fresh")]
-    fn conversation_confirmation_does_not_ask_to_rearm_its_opening_shortcut(confirm: KeyCode) {
-        let mut prompt = protected_prompt(COMMAND);
-        render(&mut prompt, 80, 24);
-        assert!(prompt.handle_key(key(KeyCode::Char('s'))).is_none());
-        let frozen = prompt.confirmation.as_ref().unwrap().answer.clone();
-        assert!(!render(&mut prompt, 80, 24).contains(super::REARM_MESSAGE));
-        assert!(prompt.handle_key(key(KeyCode::Char('s'))).is_none());
-        assert!(!render(&mut prompt, 80, 24).contains(super::REARM_MESSAGE));
-        assert_eq!(prompt.handle_key(key(confirm)).unwrap().answer, frozen);
-    }
-
-    #[test_case(false; "canonical_digest")]
-    #[test_case(true; "equivalent_literals")]
-    fn exact_call_compaction_is_proven_from_rules_not_labels(literal: bool) {
-        const RENAMED: &str = "different-option-id";
-        let mut request = prepared_protected_request(COMMAND);
-        let option = request
-            .options
-            .iter_mut()
-            .find(|option| option.id == "allow_exact")
-            .unwrap();
-        option.id = RENAMED.into();
-        option.label = "Untrusted display label".into();
-        if literal {
-            for (constraint, resource) in option.rule.resources.iter_mut().zip(&request.resources) {
-                constraint.selector = PermissionResourceSelector::Exact {
-                    value: resource.value.clone(),
-                };
-                for (name, selector) in &mut constraint.attributes {
-                    *selector = PermissionResourceSelector::Exact {
-                        value: resource.attributes[name].clone(),
-                    };
-                }
-            }
-        }
-        let answer = PermissionAnswer::AllowOption {
-            option_id: RENAMED.into(),
-            lifetime: PermissionLifetime::Conversation,
-        };
-        let review = super::ReviewDocument::new(&request, &answer);
-        assert_eq!(review.exact_call_workdir.as_deref(), Some(EXACT_WORKDIR));
-    }
-
-    #[test_case("arguments"; "resource_based_grant")]
-    #[test_case("selected"; "selected_input_grant")]
-    #[test_case("input"; "changed_raw_input")]
-    #[test_case("digest"; "mismatched_input_digest")]
-    #[test_case("selector"; "any_resource")]
-    #[test_case("prefix"; "non_exact_selector")]
-    #[test_case("guard"; "any_guard")]
-    #[test_case("missing"; "unbound_preparation")]
-    #[test_case("protection"; "unbound_protection")]
-    #[test_case("access"; "unbound_access")]
-    #[test_case("alternative"; "broader_alternative")]
-    #[test_case("workdir"; "different_starting_directories")]
-    #[test_case("executor"; "non_native_executor")]
-    fn exact_call_compaction_rejects_unproven_bounds(change: &str) {
-        let mut request = prepared_protected_request(COMMAND);
-        let rule = &mut request
-            .options
-            .iter_mut()
-            .find(|option| option.id == "allow_exact")
-            .unwrap()
-            .rule;
-        match change {
-            "arguments" => rule.arguments = PermissionArgumentConstraint::Unconstrained,
-            "selected" => {
-                rule.arguments = PermissionArgumentConstraint::Selected {
-                    arguments: Vec::new(),
-                }
-            }
-            "input" => request.input["timeoutSec"] = json!(1),
-            "digest" => {
-                rule.arguments = PermissionArgumentConstraint::Exact {
-                    digest: "different".into(),
-                }
-            }
-            "selector" => rule.resources[0].selector = PermissionResourceSelector::Any,
-            "prefix" => {
-                rule.resources[0].selector = PermissionResourceSelector::Prefix {
-                    value: COMMAND.into(),
-                }
-            }
-            "guard" => {
-                rule.resources[0]
-                    .attributes
-                    .insert("workdir".into(), PermissionResourceSelector::Any);
-            }
-            "missing" => {
-                rule.resources[0].attributes.remove("possible_workdirs");
-            }
-            "protection" => rule.resources[0].protected = None,
-            "access" => rule.resources[0].access = None,
-            "alternative" => {
-                let mut extra = rule.resources[0].clone();
-                extra.attributes.clear();
-                rule.resources.push(extra);
-            }
-            "workdir" => {
-                const OTHER: &str = "/elsewhere";
-                request.resources[1]
-                    .attributes
-                    .insert("workdir".into(), OTHER.into());
-                rule.resources[1].attributes.insert(
-                    "workdir".into(),
-                    PermissionResourceSelector::Exact {
-                        value: OTHER.into(),
-                    },
-                );
-            }
-            "executor" => request.executor = PermissionExecutorKind::UnknownLegacy,
-            _ => unreachable!(),
-        }
-        let mut prompt = exact_prompt(request);
-        let review = super::ReviewDocument::new(
-            prompt.current().unwrap(),
-            &prompt.allow_answer(PermissionLifetime::Conversation),
-        );
-        assert!(review.exact_call_workdir.is_none());
-        assert!(!render(&mut prompt, 80, FULL_REVIEW_HEIGHT).contains(COMPACT_CONTEXT));
-    }
-
-    #[test_case(40, false; "narrow_broad")]
-    #[test_case(80, false; "normal_broad")]
-    #[test_case(140, false; "wide_broad")]
-    #[test_case(40, true; "narrow_protected_phrase")]
-    #[test_case(80, true; "normal_protected_phrase")]
-    #[test_case(140, true; "wide_protected_phrase")]
-    fn phrase_review_remains_frozen_and_requires_exact_input(width: u16, protected: bool) {
-        for name in ["ayu_dark", "ayu_light"] {
-            let mut prompt = if protected {
-                protected_prompt(COMMAND)
-            } else {
-                open_prompt()
-            };
-            if protected {
-                prompt
-                    .requests
-                    .front_mut()
-                    .unwrap()
-                    .request
-                    .options
-                    .iter_mut()
-                    .find(|option| option.id == "allow_exact")
-                    .unwrap()
-                    .confirmation = Some(PROTECTED_PHRASE.into());
-            } else {
-                prompt.select_authority("allow_any_command".into());
-            }
-            let t = theme::load_by_name(name).unwrap();
-            themed_buffer(&mut prompt, width, 64, &t);
-            prompt.handle_key(key(KeyCode::Char('s')));
-            let frozen = prompt.confirmation.as_ref().unwrap().answer.clone();
-            let before = themed_buffer(&mut prompt, width, FULL_REVIEW_HEIGHT, &t);
-            prompt.selected_option = "allow_exact_resources".into();
-            assert_eq!(
-                themed_buffer(&mut prompt, width, FULL_REVIEW_HEIGHT, &t),
-                before
-            );
-            let phrase = if protected {
-                PROTECTED_PHRASE
-            } else {
-                BROAD_PHRASE
-            };
-            let screen = buffer_text(&before);
-            assert!(screen.contains(phrase), "{screen}");
-            assert!(screen.contains("Review carefully"));
-            assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());
-            prompt.handle_paste(phrase);
-            prompt.handle_key(KeyEvent::new_with_kind(
-                KeyCode::Enter,
-                KeyModifiers::NONE,
-                KeyEventKind::Release,
-            ));
-            assert_eq!(
-                prompt.handle_key(key(KeyCode::Enter)).unwrap().answer,
-                frozen
-            );
-        }
-    }
-
-    #[test_case(40, 10; "narrow_short")]
-    #[test_case(80, 18; "normal")]
-    #[test_case(140, 18; "wide")]
-    fn inspector_scroll_geometry_keeps_footer_fixed(width: u16, height: u16) {
-        for name in ["ayu_dark", "ayu_light"] {
-            let mut prompt = suggested_prompt();
-            prompt.handle_key(key(KeyCode::Char('r')));
-            prompt.handle_key(key(KeyCode::Char('i')));
-            let t = theme::load_by_name(name).unwrap();
-            let full = assert_scrollable_body(&mut prompt, width, height, &t);
-            assert!(buffer_text(&full).contains("Current row matches"));
+            assert!(!hex_run(row), "{surface}: hex run in {row:?}");
+            assert!(!hash_tag(row), "{surface}: hash tag in {row:?}");
         }
     }
 
     #[test]
-    fn fitting_inspector_stays_at_the_top_when_scrolled_down() {
-        let mut prompt = suggested_prompt();
-        prompt.handle_key(key(KeyCode::Char('r')));
-        prompt.handle_key(key(KeyCode::Char('i')));
-        let t = theme::load_by_name("ayu_dark").unwrap();
-        let before = themed_buffer(&mut prompt, 140, 28, &t);
-        assert!(prompt.height(140) <= 28);
-        assert!(buffer_text(&before).contains("Current row matches"));
-        prompt.scroll(-8);
-        assert_eq!(themed_buffer(&mut prompt, 140, 28, &t), before);
-        assert_eq!(prompt.scroll.offset(), 0);
-    }
-
-    fn buffer_rows(buffer: &Buffer) -> String {
-        let mut text = String::new();
-        for y in buffer.area.y..buffer.area.bottom() {
-            let mut x = buffer.area.x;
-            while x < buffer.area.right() {
-                let symbol = buffer[(x, y)].symbol();
-                text.push_str(symbol);
-                x += (symbol.width() as u16).max(1);
+    #[ignore = "prints every surface for a visual review"]
+    fn dump_permission_prompt_surfaces() {
+        for (width, height) in [(80, 24), (40, 24)] {
+            for (name, mut prompt) in surfaces() {
+                println!("== {name} {width}x{height}");
+                println!("{}", screen(&mut prompt, width, height));
             }
-            text.push('\n');
         }
-        text
-    }
-
-    #[test_case(40; "narrow")]
-    #[test_case(80; "normal")]
-    #[test_case(140; "wide")]
-    fn live_future_scope_renders_shared_targets_and_selected_conditions(width: u16) {
-        for name in ["ayu_dark", "ayu_light"] {
-            let t = theme::load_by_name(name).unwrap();
-            let mut prompt = typed_alternatives_prompt();
-            let answer = prompt.allow_answer(PermissionLifetime::Conversation);
-            let first = reveal_scope(&mut prompt, width, &t);
-            assert!(buffer_text(&first).contains(TARGETS_LABEL));
-            assert!(
-                prompt
-                    .scope_view
-                    .hits
-                    .iter()
-                    .any(|hit| hit.control == ScopeControl::Disclosure(Disclosure::Conditions))
-            );
-            let height = prompt.height(width);
-            click_scope_control(&mut prompt, width, &t, ScopeControl::Target(1));
-            let conditions = click_scope_control(
-                &mut prompt,
-                width,
-                &t,
-                ScopeControl::Disclosure(Disclosure::Conditions),
-            );
-            assert_eq!(prompt.scope_view.target, 1);
-            assert!(buffer_text(&conditions).contains(SECOND_CONDITIONS));
-            assert!(compact_cells(&conditions).contains("Protectionprotectedonly"));
-            let target =
-                PromptTarget::VisualScope(0, ScopeControl::Disclosure(Disclosure::Conditions));
-            let area = prompt
-                .row_hits
-                .iter()
-                .find(|hit| hit.target == target)
-                .unwrap()
-                .area;
-            prompt.focus = Some(target);
-            let mut focused = conditions.clone();
-            focused.set_style(area, Style::default().add_modifier(Modifier::REVERSED));
-            assert_eq!(
-                themed_buffer(&mut prompt, width, LIVE_SCOPE_HEIGHT, &t),
-                focused
-            );
-            assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());
-            assert_eq!(prompt.scope_view.disclosure, None);
-            let mut properties = compact_cells(&conditions);
-            for _ in 0..MAX_PROPERTY_PAGES {
-                let down = prompt
-                    .scope_view
-                    .hits
-                    .iter()
-                    .find_map(|hit| match hit.control {
-                        ScopeControl::Scroll(delta) if delta > 0 => Some(hit.control.clone()),
-                        _ => None,
-                    })
-                    .unwrap();
-                properties.push_str(&compact_cells(&click_scope_control(
-                    &mut prompt,
-                    width,
-                    &t,
-                    down,
-                )));
-            }
-            assert!(properties.contains(UNRESTRICTED_ATTRIBUTE));
-            let clamped = prompt.scope_view.offset;
-            let up = prompt
-                .scope_view
-                .hits
-                .iter()
-                .find_map(|hit| match hit.control {
-                    ScopeControl::Scroll(delta) if delta < 0 => Some(hit.control.clone()),
-                    _ => None,
-                })
-                .unwrap();
-            click_scope_control(&mut prompt, width, &t, up);
-            assert!(prompt.scope_view.offset < clamped);
-            assert_eq!(prompt.height(width), height);
-            assert_eq!(
-                prompt.allow_answer(PermissionLifetime::Conversation),
-                answer
-            );
-            assert!(prompt.confirmation.is_none());
-        }
-    }
-
-    #[test_case(40, false; "narrow_alternatives")]
-    #[test_case(80, false; "normal_alternatives")]
-    #[test_case(140, false; "wide_alternatives")]
-    #[test_case(40, true; "narrow_remote")]
-    #[test_case(80, true; "normal_remote")]
-    #[test_case(140, true; "wide_remote")]
-    fn canonical_scope_details_keep_every_cell_reachable(width: u16, remote: bool) {
-        for name in ["ayu_dark", "ayu_light"] {
-            let t = theme::load_by_name(name).unwrap();
-            let mut prompt = if remote {
-                exact_prompt(remote_request(REMOTE_IDS, &["root", "folder/file"], true))
-            } else {
-                typed_alternatives_prompt()
-            };
-            let height = prompt.height(width) + 2;
-            let full = themed_buffer(&mut prompt, width, height, &t);
-            let (card, content) = prompt
-                .review_layout(prompt.area.width - 3, &t)
-                .cards
-                .into_iter()
-                .find(|(_, card)| matches!(card.content, CardContent::Scope(..)))
-                .unwrap();
-            let CardContent::Scope(_, model, _, fields) = content.content else {
-                unreachable!()
-            };
-            if remote {
-                for (label, value) in [
-                    "Trust anchor",
-                    "Server",
-                    "Workspace",
-                    "Generation",
-                    "Namespace",
-                    "Principal",
-                    "Remote project",
-                ]
-                .into_iter()
-                .zip(REMOTE_IDS)
-                {
-                    assert!(
-                        fields
-                            .iter()
-                            .any(|field| field.label == label && field.value == value)
-                    );
-                }
-                assert!(
-                    fields.iter().any(|field| field.label == "Target key"
-                        && field.value == REMOTE_ESCAPED_TARGET_KEY)
-                );
-            } else {
-                for label in [
-                    "1 · Protection",
-                    "2 · Protection",
-                    "1 · Starting directory",
-                    "2 · Starting directory",
-                    "1 · zone",
-                    "2 · zone",
-                ] {
-                    assert!(fields.iter().any(|field| field.label == label));
-                }
-                assert!(
-                    fields
-                        .iter()
-                        .any(|field| field.value.contains(ALTERNATIVE_DIRECTORY))
-                );
-            }
-            let summary_height = ScopeView::summary_height(&model, card.width - 4);
-            let start = card.y + summary_height + 2;
-            let x = prompt.area.x + card.x + 3;
-            let y = prompt.area.y + start + 1;
-            let mut expected = Buffer::empty(Rect::new(0, 0, card.width, card.height));
-            let pairs: Vec<_> = fields
-                .iter()
-                .map(|field| (field.label.as_str(), field.value.as_str()))
-                .collect();
-            let rows = golden_fields(
-                &mut expected,
-                Rect::new(0, 0, card.width, 0),
-                CANONICAL_SCOPE_DETAILS,
-                &pairs,
-                t.tool_bg.fg(t.foreground),
-                &t,
-            ) - 2;
-            assert!(buffer_rows(&full).contains(CANONICAL_SCOPE_DETAILS));
-            for row in 0..rows {
-                for column in 0..card.width - 4 {
-                    assert_eq!(full[(x + column, y + row)], expected[(column + 2, row + 1)]);
-                }
-            }
-            themed_buffer(&mut prompt, width, LIVE_SCOPE_HEIGHT, &t);
-            for row in 0..rows {
-                prompt.scroll.scroll_to(start + row);
-                let page = themed_buffer(&mut prompt, width, LIVE_SCOPE_HEIGHT, &t);
-                let visible_y = prompt.area.y + 1 + start + row - prompt.scroll.offset();
-                for column in 0..card.width - 4 {
-                    assert_eq!(page[(x + column, visible_y)], full[(x + column, y + row)]);
-                }
-            }
-            assert!(prompt.confirmation.is_none());
-        }
-    }
-
-    #[test_case(40; "narrow")]
-    #[test_case(80; "normal")]
-    #[test_case(140; "wide")]
-    fn live_slot_and_all_of_controls_inspect_without_changing_authority(width: u16) {
-        for name in ["ayu_dark", "ayu_light"] {
-            let t = theme::load_by_name(name).unwrap();
-            let mut prompt = typed_pattern_prompt();
-            reveal_scope(&mut prompt, width, &t);
-            let answer = prompt.allow_answer(PermissionLifetime::Conversation);
-            let id = prompt
-                .scope_view
-                .hits
-                .iter()
-                .find_map(|hit| match hit.control {
-                    ScopeControl::Slot(id) => Some(id),
-                    _ => None,
-                })
-                .unwrap();
-            let slot = click_scope_control(&mut prompt, width, &t, ScopeControl::Slot(id));
-            assert!(compact_cells(&slot).contains("SameID=equalvalues"));
-            let conditions = click_scope_control(
-                &mut prompt,
-                width,
-                &t,
-                ScopeControl::Disclosure(Disclosure::Conditions),
-            );
-            assert!(buffer_text(&conditions).contains("ALL OF · target 1"));
-            click_scope_control(&mut prompt, width, &t, ScopeControl::Slot(id));
-            assert_eq!(prompt.scope_view.slot, Some(id));
-            assert_eq!(prompt.scope_view.disclosure, None);
-            assert_eq!(
-                prompt.allow_answer(PermissionLifetime::Conversation),
-                answer
-            );
-            assert!(prompt.confirmation.is_none());
-        }
-    }
-
-    #[test_case(40; "narrow")]
-    #[test_case(80; "normal")]
-    #[test_case(140; "wide")]
-    fn frozen_scope_controls_and_held_enter_cannot_change_or_confirm(width: u16) {
-        for name in ["ayu_dark", "ayu_light"] {
-            let t = theme::load_by_name(name).unwrap();
-            let mut prompt = exact_prompt(remote_request(REMOTE_IDS, &["root", "file"], true));
-            themed_buffer(&mut prompt, width, LIVE_SCOPE_HEIGHT, &t);
-            prompt.focus = Some(PromptTarget::Hint(key(KeyCode::Char('s'))));
-            assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());
-            let frozen = prompt.confirmation.as_ref().unwrap().answer.clone();
-            let scope = reveal_scope(&mut prompt, width, &t);
-            assert!(buffer_text(&scope).contains("[ALL OF]"));
-            assert!(
-                prompt
-                    .row_hits
-                    .iter()
-                    .all(|hit| !matches!(hit.target, PromptTarget::VisualScope(..)))
-            );
-            let state = prompt.scope_view.clone();
-            for control in [
-                ScopeControl::Scroll(4),
-                ScopeControl::Target(1),
-                ScopeControl::Disclosure(Disclosure::Identity),
-            ] {
-                assert!(
-                    prompt
-                        .activate(PromptTarget::VisualScope(0, control))
-                        .is_none()
-                );
-            }
-            assert_eq!(prompt.scope_view.offset, state.offset);
-            assert_eq!(prompt.scope_view.target, state.target);
-            assert_eq!(prompt.scope_view.disclosure, state.disclosure);
-            assert!(
-                prompt
-                    .handle_key(KeyEvent::new_with_kind(
-                        KeyCode::Enter,
-                        KeyModifiers::NONE,
-                        KeyEventKind::Repeat
-                    ))
-                    .is_none()
-            );
-            assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());
-            assert_eq!(prompt.confirmation.as_ref().unwrap().answer, frozen);
-            assert!(
-                prompt
-                    .handle_key(KeyEvent::new_with_kind(
-                        KeyCode::Enter,
-                        KeyModifiers::NONE,
-                        KeyEventKind::Release
-                    ))
-                    .is_none()
-            );
-            themed_buffer(&mut prompt, width, LIVE_SCOPE_HEIGHT, &t);
-            assert_eq!(
-                prompt.handle_key(key(KeyCode::Enter)).unwrap().answer,
-                frozen
-            );
-        }
-    }
-
-    #[test_case(40; "narrow")]
-    #[test_case(80; "normal")]
-    #[test_case(140; "wide")]
-    fn exact_once_scope_chooser_exposes_the_typed_rule(width: u16) {
-        let t = theme::load_by_name("ayu_dark").unwrap();
-        let mut prompt = protected_prompt(COMMAND);
-        assert_eq!(prompt.lifetime, PermissionLifetime::Once);
-        themed_buffer(&mut prompt, width, LIVE_SCOPE_HEIGHT, &t);
-        assert!(prompt.handle_key(key(KeyCode::Char('r'))).is_none());
-        assert!(prompt.panel == Panel::Scopes);
-        let scope = reveal_scope(&mut prompt, width, &t);
-        assert!(buffer_text(&scope).contains(TARGETS_LABEL));
-        assert!(
-            prompt
-                .scope_view
-                .hits
-                .iter()
-                .any(|hit| hit.control == ScopeControl::Disclosure(Disclosure::Conditions))
-        );
-        assert!(prompt.confirmation.is_none());
-        assert_ne!(prompt.lifetime, PermissionLifetime::Once);
-        assert!(prompt.handle_key(key(KeyCode::Char('p'))).is_none());
-        assert!(prompt.panel == Panel::Main);
-        assert!(buffer_text(&reveal_scope(&mut prompt, width, &t)).contains(TARGETS_LABEL));
-        assert!(prompt.confirmation.is_none());
     }
 
     #[test]
     #[ignore = "writes private visual review buffers under /tmp"]
-    fn export_permission_review_buffers() {
+    fn export_permission_prompt_buffers() {
         let directory = Builder::new()
-            .prefix("caudra-permission-review-")
+            .prefix("caudra-permission-prompt-")
             .tempdir_in("/tmp")
             .unwrap();
-        #[cfg(unix)]
-        fs::set_permissions(directory.path(), Permissions::from_mode(0o700)).unwrap();
-        for name in ["ayu_dark", "ayu_light"] {
+        fs::set_permissions(
+            directory.path(),
+            Permissions::from_mode(PRIVATE_DIRECTORY_MODE),
+        )
+        .unwrap();
+        for name in THEMES {
             let t = theme::load_by_name(name).unwrap();
-            for (width, height) in [(40, 24), (40, 48), (80, 24), (80, 32), (140, 32)] {
-                for panel in [
-                    "main",
-                    "confirm",
-                    "broad",
-                    "remote-main",
-                    "remote-confirm",
-                    "pattern-read",
-                    "pattern-edit",
-                    "pattern-tuples",
-                    "typed-alternatives",
-                    "typed-alternatives-selected",
-                    "typed-canonical-details",
-                    "typed-remote-scope",
-                    "typed-remote-identities",
-                    "typed-pattern-scope",
-                    "typed-pattern-slot",
-                    "typed-once-scope-chooser",
-                ] {
-                    let mut prompt = match panel {
-                        "typed-alternatives"
-                        | "typed-alternatives-selected"
-                        | "typed-canonical-details" => typed_alternatives_prompt(),
-                        "typed-remote-scope" | "typed-remote-identities" => {
-                            exact_prompt(remote_request(REMOTE_IDS, &["root", "folder/file"], true))
-                        }
-                        "typed-pattern-scope" | "typed-pattern-slot" => typed_pattern_prompt(),
-                        "broad" => open_prompt(),
-                        "pattern-read" | "pattern-edit" | "pattern-tuples" => suggested_prompt(),
-                        "remote-main" | "remote-confirm" => exact_prompt(remote_request(
-                            REMOTE_IDS,
-                            &["root", "folder/file"],
-                            panel == "remote-confirm",
-                        )),
-                        _ => protected_prompt(COMMAND),
-                    };
-                    if panel == "broad" {
-                        prompt.select_authority("allow_any_command".into());
-                    }
-                    if panel.starts_with("pattern-") {
-                        prompt.open_scope_editor();
-                        prompt.open_inspector();
-                        match panel {
-                            "pattern-edit" => prompt.activate_inspector(InspectorControl::Name),
-                            "pattern-tuples" => {
-                                prompt.activate_inspector(InspectorControl::Observations)
-                            }
-                            _ => {}
-                        }
-                    }
-                    themed_buffer(&mut prompt, width, height, &t);
-                    if matches!(panel, "confirm" | "broad" | "remote-confirm") {
-                        assert!(prompt.handle_key(key(KeyCode::Char('s'))).is_none());
-                        assert!(prompt.confirmation.is_some());
-                    }
+            for (width, height) in [(40, 24), (80, 24), (80, 16), (140, 32)] {
+                for (surface, mut prompt) in surfaces() {
                     let buffer = themed_buffer(&mut prompt, width, height, &t);
-                    let buffer = if panel.starts_with("typed-") {
-                        if panel == "typed-once-scope-chooser" {
-                            prompt.open_scope_editor();
-                        }
-                        reveal_scope(&mut prompt, width, &t);
-                        match panel {
-                            "typed-alternatives-selected" => {
-                                click_scope_control(
-                                    &mut prompt,
-                                    width,
-                                    &t,
-                                    ScopeControl::Target(1),
-                                );
-                            }
-                            "typed-remote-identities" => {
-                                click_scope_control(
-                                    &mut prompt,
-                                    width,
-                                    &t,
-                                    ScopeControl::Disclosure(Disclosure::Identity),
-                                );
-                            }
-                            "typed-pattern-slot" => {
-                                let slot = prompt
-                                    .scope_view
-                                    .hits
-                                    .iter()
-                                    .find_map(|hit| match hit.control {
-                                        ScopeControl::Slot(id) => Some(id),
-                                        _ => None,
-                                    })
-                                    .unwrap();
-                                click_scope_control(
-                                    &mut prompt,
-                                    width,
-                                    &t,
-                                    ScopeControl::Slot(slot),
-                                );
-                            }
-                            "typed-canonical-details" => {
-                                let card = scope_card(&prompt, &t);
-                                let rule = prompt
-                                    .review_layout(prompt.area.width - 3, &t)
-                                    .cards
-                                    .into_iter()
-                                    .find_map(|(_, card)| match card.content {
-                                        CardContent::Scope(_, model, _, _) => Some(model),
-                                        _ => None,
-                                    })
-                                    .unwrap();
-                                prompt.scroll.scroll_to(
-                                    card.y + 1 + ScopeView::summary_height(&rule, card.width - 4),
-                                );
-                            }
-                            _ => {}
-                        }
-                        themed_buffer(&mut prompt, width, height, &t)
-                    } else {
-                        buffer
-                    };
-                    let stem = format!("{panel}-{name}-{width}x{height}");
+                    let stem = format!("{surface}-{name}-{width}x{height}");
                     for (extension, contents) in [
-                        ("txt", buffer_rows(&buffer)),
+                        ("txt", buffer_rows(&buffer).join("\n")),
                         ("cells", format!("{buffer:#?}")),
                     ] {
-                        let mut options = OpenOptions::new();
-                        options.write(true).create_new(true);
-                        #[cfg(unix)]
-                        options.mode(PRIVATE_ARTIFACT_MODE);
-                        let mut file = options
+                        let mut file = OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .mode(PRIVATE_ARTIFACT_MODE)
                             .open(directory.path().join(format!("{stem}.{extension}")))
                             .unwrap();
                         file.write_all(contents.as_bytes()).unwrap();
@@ -2769,714 +1777,225 @@ pub(super) mod tests {
                 }
             }
         }
-        println!("Permission review buffers: {}", directory.keep().display());
+        println!("Permission prompt buffers: {}", directory.keep().display());
     }
 
     #[test]
-    fn incomplete_confirmation_does_not_unlock_at_the_end() {
-        let mut prompt = open_prompt();
-        let request = &mut prompt.requests.front_mut().unwrap().request;
-        request.resources[0].attributes.insert(
-            "workdir".into(),
-            "/long/".repeat(super::super::details::MAX_REVIEW_CHARS),
-        );
-        prompt.select_authority("allow_commands_in_workdir".into());
-        render(&mut prompt, 80, 18);
-        prompt.handle_key(key(KeyCode::Char('s')));
-        assert!(!prompt.confirmation.as_ref().unwrap().complete);
-        render(&mut prompt, 40, 10);
-        prompt.handle_key(key(KeyCode::End));
-        render(&mut prompt, 40, 10);
-        assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());
-        assert!(
-            !prompt
-                .row_hits
-                .iter()
-                .any(|hit| hit.target == PromptTarget::Hint(key(KeyCode::Enter)))
-        );
-    }
-
-    #[test_case("pem"; "inert_pem")]
-    #[test_case("query"; "inert_query")]
-    #[test_case("fragment"; "inert_fragment")]
-    fn inert_redacted_values_do_not_disable_an_exact_approval(kind: &str) {
-        let command = match kind {
-            "pem" => format!(
-                "echo \"-----BEGIN PRIVATE KEY-----{HIDDEN_SECRET}-----END PRIVATE KEY-----\""
-            ),
-            "query" => format!("echo \"https://example.invalid/path?q={HIDDEN_SECRET}\""),
-            _ => format!("echo \"https://example.invalid/path#{HIDDEN_SECRET}\""),
-        };
-        let shown = review_text(&command);
-        assert!(!shown.contains(INCOMPLETE_REDACTION));
-        assert!(!shown.contains(HIDDEN_SECRET));
-        let mut prompt = PermissionPrompt::new();
-        prompt.enqueue(Box::new(native_shell_request(&command)), None);
-        prompt.select_authority("allow_exact".into());
-        render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT);
-        assert!(prompt.handle_key(key(KeyCode::Char('s'))).is_some());
-    }
-
-    #[test_case("pem", "$(touch /tmp/marker)"; "pem_substitution")]
-    #[test_case("pem", "`touch /tmp/marker`"; "pem_backticks")]
-    #[test_case("pem", "$(\ntouch /tmp/marker\n)"; "pem_multiline")]
-    #[test_case("pem", "<(touch /tmp/marker)"; "pem_process_substitution")]
-    #[test_case("pem", ">\\\n(touch /tmp/marker)"; "pem_process_line_continuation")]
-    #[test_case("query", "$(touch /tmp/marker)"; "query_substitution")]
-    #[test_case("query", "`touch /tmp/marker`"; "query_backticks")]
-    #[test_case("query", "$\\\n(touch /tmp/marker)"; "query_line_continuation")]
-    #[test_case("query", "<(touch /tmp/marker)"; "query_process_substitution")]
-    #[test_case("fragment", "$(\ntouch /tmp/marker\n)"; "fragment_multiline")]
-    #[test_case("fragment", "`touch /tmp/marker`"; "fragment_backticks")]
-    #[test_case("unquoted", "$(printf never-display-this)"; "split_unquoted_expansion")]
-    #[test_case("unquoted", "`printf never-display-this`"; "split_unquoted_backticks")]
-    #[test_case("userinfo", "$(touch /tmp/marker)"; "userinfo_substitution")]
-    fn executable_text_hidden_by_redaction_disables_confirmation(kind: &str, expansion: &str) {
-        let hidden = format!("{HIDDEN_SECRET}{expansion}");
-        let command = match kind {
-            "pem" => {
-                format!("echo \"-----BEGIN PRIVATE KEY-----{hidden}-----END PRIVATE KEY-----\"")
+    fn common_prompts_fit_80x24_without_scrolling() {
+        for (name, mut prompt) in surfaces() {
+            if matches!(name, "details" | "advanced") {
+                continue;
             }
-            "query" => format!("echo \"https://example.invalid/path?q={hidden}\""),
-            "fragment" => format!("echo \"https://example.invalid/path#{hidden}\""),
-            "userinfo" => format!("echo \"https://user:{hidden}@example.invalid/path\""),
-            _ => format!("echo https://example.invalid/path?q={hidden}"),
-        };
-        let shown = review_text(&command);
-        assert!(shown.contains(INCOMPLETE_REDACTION), "{shown}");
-        assert!(!shown.contains(HIDDEN_SECRET), "{shown}");
-        assert!(review_text(&shown).contains(INCOMPLETE_REDACTION));
-        let mut prompt = confirm_request(native_shell_request(&command));
-        let frozen = prompt.confirmation.as_ref().unwrap();
-        assert!(!frozen.complete);
-        assert!(frozen.review.text().contains(INCOMPLETE_REDACTION));
-        assert!(!frozen.review.text().contains(HIDDEN_SECRET));
-        for width in [40, 80, 140] {
-            let screen = render(&mut prompt, width, 10);
-            assert!(!screen.contains(HIDDEN_SECRET));
-            assert!(!prompt.row_hits.iter().any(|hit| matches!(&hit.target, PromptTarget::Hint(event) if event.code == KeyCode::Enter)));
-            prompt.handle_key(key(KeyCode::Tab));
-            assert!(prompt.handle_key(key(KeyCode::Char('y'))).is_none());
-            assert!(prompt.confirmation.is_some());
-        }
-    }
-
-    #[test_case(40; "narrow")]
-    #[test_case(80; "normal")]
-    #[test_case(140; "wide")]
-    fn every_remote_binding_component_distinguishes_the_rendered_approval(width: u16) {
-        let parts = ["root", "file"];
-        for name in ["ayu_light", "ayu_dark"] {
-            let t = theme::load_by_name(name).unwrap();
-            let mut original = confirm_request(remote_request(REMOTE_IDS, &parts, true));
-            assert!(original.confirmation.as_ref().unwrap().complete);
-            let before = themed_buffer(&mut original, width, 80, &t);
-            assert!(
-                original
-                    .row_hits
-                    .iter()
-                    .all(|hit| !matches!(hit.target, PromptTarget::VisualScope(_, _)))
-            );
-            let rendered = displayed_scope_fields(&original);
-            for authority in &original.confirmation.as_ref().unwrap().review.authorities {
-                assert!(
-                    authority
-                        .fields
-                        .iter()
-                        .all(|field| rendered.contains(field))
-                );
-            }
-            let authority_row = buffer_rows(&before)
-                .lines()
-                .position(|line| line.contains("Authority SHA-256"))
-                .unwrap() as u16;
-            themed_buffer(&mut original, width, 18, &t);
-            original.scroll.scroll_to(authority_row - 1);
-            let compact_before = themed_buffer(&mut original, width, 18, &t);
-            for index in 0..REMOTE_IDS.len() {
-                let mut ids = REMOTE_IDS;
-                ids[index] = "different";
-                let mut changed = confirm_request(remote_request(ids, &parts, true));
-                assert!(changed.confirmation.as_ref().unwrap().complete);
-                assert_ne!(
-                    themed_buffer(&mut changed, width, 80, &t),
-                    before,
-                    "identity field {index}"
-                );
-                themed_buffer(&mut changed, width, 18, &t);
-                changed.scroll.scroll_to(authority_row - 1);
-                assert_ne!(
-                    themed_buffer(&mut changed, width, 18, &t),
-                    compact_before,
-                    "compact identity field {index}"
-                );
-            }
-            let text = original.confirmation.as_ref().unwrap().review.text();
-            for label in [
-                "Trust anchor",
-                "Server",
-                "Workspace",
-                "Generation",
-                "Namespace",
-                "Principal",
-                "Remote project",
-                "Target key",
-                "Display path only",
-            ] {
-                assert!(text.contains(label), "{label}: {text}");
-            }
-        }
-    }
-
-    #[test_case(false; "exact")]
-    #[test_case(true; "subtree")]
-    fn remote_scope_and_target_keys_are_not_inferred_from_display_paths(subtree: bool) {
-        let prepare = |request| {
-            if subtree {
-                confirm_request(request)
-            } else {
-                exact_prompt(request)
-            }
-        };
-        let mut first = prepare(remote_request(
-            REMOTE_IDS,
-            &["root", "folder/file"],
-            subtree,
-        ));
-        let mut second = prepare(remote_request(
-            REMOTE_IDS,
-            &["root", "folder", "file"],
-            subtree,
-        ));
-        assert_ne!(render(&mut first, 80, 80), render(&mut second, 80, 80));
-        for (prompt, target) in [
-            (&mut first, REMOTE_ESCAPED_TARGET_KEY),
-            (&mut second, REMOTE_SPLIT_TARGET_KEY),
-        ] {
-            let visible = (0..prompt.height(80)).any(|_| {
-                if render(prompt, 80, 18).contains(target) {
-                    return true;
-                }
-                prompt.scroll(-1);
-                false
-            });
-            assert!(visible, "target key missing from compact review: {target}");
-        }
-        let original_fields = displayed_scope_fields(&first);
-        let other_fields = displayed_scope_fields(&second);
-        assert!(
-            original_fields.iter().any(
-                |field| field.label == "Target key" && field.value == REMOTE_ESCAPED_TARGET_KEY
-            )
-        );
-        assert!(
-            other_fields
-                .iter()
-                .any(|field| field.label == "Target key" && field.value == REMOTE_SPLIT_TARGET_KEY)
-        );
-        let scope = if subtree {
-            "Scope key and descendants: /root"
-        } else {
-            "Exact scope key: /root/folder%2Ffile"
-        };
-        assert!(
-            original_fields
-                .iter()
-                .any(|field| field.label == "Read" && field.value == scope)
-        );
-        let mut display_change = remote_request(REMOTE_IDS, &["root", "folder/file"], subtree);
-        display_change.resources[0]
-            .attributes
-            .insert("display_path".into(), "/unrelated-display-path".into());
-        let mut changed = prepare(display_change);
-        render(&mut changed, 80, 18);
-        let changed_fields = displayed_scope_fields(&changed);
-        for label in ["Read", "Target key", "Authority SHA-256"] {
-            assert!(
-                original_fields.iter().find(|field| field.label == label)
-                    == changed_fields.iter().find(|field| field.label == label)
-            );
-        }
-        for prompt in [&mut first, &mut second, &mut changed] {
-            if subtree {
-                assert!(prompt.confirmation.as_ref().unwrap().complete);
-            } else {
-                let expected = prompt.allow_answer(PermissionLifetime::Conversation);
-                assert_eq!(
-                    prompt.handle_key(key(KeyCode::Char('s'))).unwrap().answer,
-                    expected
-                );
-                assert!(prompt.confirmation.is_none());
-            }
-        }
-    }
-
-    #[test_case(false; "selector_binding_mismatch")]
-    #[test_case(true; "principal_binding_mismatch")]
-    fn unverified_remote_bindings_disable_confirmation(principal_mismatch: bool) {
-        let mut request = remote_request(REMOTE_IDS, &["root", "file"], false);
-        let other = AuthorityIdentity::new(
-            SourceTrustAnchor::new("other").unwrap(),
-            "server",
-            "workspace",
-            "generation",
-            "namespace",
-        )
-        .unwrap();
-        if principal_mismatch {
-            let PermissionSubject::RemoteNative { identity, .. } = &mut request.subject else {
-                unreachable!()
-            };
-            identity.principal = AuthenticatedPrincipalId::new(other, "principal").unwrap();
-        } else {
-            let resource = &mut request
-                .options
-                .iter_mut()
-                .find(|option| option.id == "allow_exact")
-                .unwrap()
-                .rule
-                .resources[0];
-            let PermissionResourceSelector::RemoteResource { identity, .. } =
-                &mut resource.selector
-            else {
-                unreachable!()
-            };
-            identity.authority = other;
-        }
-        let mut prompt = confirm_request(request);
-        assert!(!prompt.confirmation.as_ref().unwrap().complete);
-        render(&mut prompt, 80, 18);
-        prompt.handle_key(key(KeyCode::Tab));
-        assert!(prompt.handle_key(key(KeyCode::Char('y'))).is_none());
-    }
-
-    #[test_case("pem"; "future_pem_guard")]
-    #[test_case("fragment"; "future_fragment_guard")]
-    fn hidden_future_command_guards_cannot_borrow_a_lossy_projection(kind: &str) {
-        let hidden = format!("$(printf '{HIDDEN_SECRET}')");
-        let command = if kind == "pem" {
-            format!("echo \"-----BEGIN PRIVATE KEY-----{hidden}-----END PRIVATE KEY-----\"")
-        } else {
-            format!("echo \"https://example.invalid/path#{hidden}\"")
-        };
-        let mut request = native_shell_request(COMMAND);
-        let option = request
-            .options
-            .iter_mut()
-            .find(|option| option.id == "allow_exact")
-            .unwrap();
-        option.rule.arguments = PermissionArgumentConstraint::Unconstrained;
-        option.rule.resources[0].selector = PermissionResourceSelector::Any;
-        option.rule.resources[0].attributes.insert(
-            "normalized_command".into(),
-            PermissionResourceSelector::Exact { value: command },
-        );
-        let prompt = confirm_request(request);
-        let frozen = prompt.confirmation.as_ref().unwrap();
-        assert!(!frozen.complete);
-        assert!(frozen.review.text().contains(INCOMPLETE_REDACTION));
-        assert!(!frozen.review.text().contains(HIDDEN_SECRET));
-    }
-
-    #[test_case("presence"; "guard_presence")]
-    #[test_case("any"; "explicit_any_guard")]
-    #[test_case("value"; "guard_value")]
-    #[test_case("protected"; "protected_guard")]
-    fn predicate_alternatives_never_merge_distinct_guards(change: &str) {
-        const FIRST_COMMAND: &str = "git status";
-        const OTHER_COMMAND: &str = "cargo test";
-        let mut request = native_shell_request(FIRST_COMMAND);
-        let option = request
-            .options
-            .iter_mut()
-            .find(|option| option.id == "allow_exact")
-            .unwrap();
-        option.rule.arguments = PermissionArgumentConstraint::Unconstrained;
-        let first = &mut option.rule.resources[0];
-        first.selector = PermissionResourceSelector::Any;
-        first.protected = Some(false);
-        first.attributes.retain(|name, _| name == "workdir");
-        first.attributes.insert(
-            "normalized_command".into(),
-            PermissionResourceSelector::Exact {
-                value: FIRST_COMMAND.into(),
-            },
-        );
-        let mut second = first.clone();
-        match change {
-            "presence" => {
-                second.attributes.remove("normalized_command");
-            }
-            "value" => {
-                second.attributes.insert(
-                    "normalized_command".into(),
-                    PermissionResourceSelector::Exact {
-                        value: OTHER_COMMAND.into(),
-                    },
-                );
-            }
-            "any" => {
-                second
-                    .attributes
-                    .insert("normalized_command".into(), PermissionResourceSelector::Any);
-            }
-            _ => second.protected = Some(true),
-        }
-        option.rule.resources.push(second);
-        let mut prompt = confirm_request(request);
-        let frozen = prompt.confirmation.as_ref().unwrap();
-        assert!(frozen.complete);
-        let fields = &frozen.review.authorities[0].fields;
-        for label in [
-            "1 · Execute",
-            "2 · Execute",
-            "1 · Protection",
-            "2 · Protection",
-            "1 · Preparation",
-            "2 · Preparation",
-        ] {
-            assert!(
-                fields.iter().any(|field| field.label == label),
-                "{label}: {}",
-                frozen.review.text()
-            );
-        }
-        let expected = match change {
-            "presence" => "Unrestricted".into(),
-            "value" => format!("Exact: {OTHER_COMMAND}"),
-            "any" => "Any value; attribute must be present".into(),
-            _ => "Exact: git status".into(),
-        };
-        assert!(
-            fields
-                .iter()
-                .any(|field| field.label == "2 · Preparation" && field.value == expected)
-        );
-        if change == "protected" {
-            assert!(fields.iter().any(|field| field.label == "2 · Protection" && field.value == "Protected only"));
-        }
-        let screen = render(&mut prompt, 80, 64);
-        assert!(screen.contains("Alternatives"));
-        assert_eq!(screen.matches("/project").count(), 1);
-    }
-
-    #[test_case("invalid"; "malformed_metadata")]
-    #[test_case("missing"; "unavailable_preimage")]
-    #[test_case("truncated"; "truncated_metadata")]
-    fn unavailable_metadata_never_exposes_an_approval_hit(failure: &str) {
-        let mut prompt = protected_prompt(COMMAND);
-        let request = &mut prompt.requests.front_mut().unwrap().request;
-        let value = match failure {
-            "invalid" => "not prepared directory metadata".into(),
-            "missing" => json!({"kind": "known", "symbolic_paths": ["/another/root"]}).to_string(),
-            _ => "/long/".repeat(super::super::details::MAX_REVIEW_CHARS),
-        };
-        request.resources[0]
-            .attributes
-            .insert("possible_workdirs".into(), value.clone());
-        if failure == "invalid" {
-            let option = request
-                .options
-                .iter_mut()
-                .find(|option| option.id == "allow_exact")
-                .unwrap();
-            option.rule.resources[0].attributes.insert(
-                "possible_workdirs".into(),
-                PermissionResourceSelector::Exact { value },
-            );
-        }
-        render(&mut prompt, 80, 18);
-        prompt.handle_key(key(KeyCode::Char('s')));
-        assert!(!prompt.confirmation.as_ref().unwrap().complete);
-        for code in [KeyCode::Home, KeyCode::End] {
-            prompt.handle_key(key(code));
-            render(&mut prompt, 40, 10);
-            assert!(prompt.row_hits.iter().all(|hit| !matches!(&hit.target, PromptTarget::Hint(event) if event.code == KeyCode::Enter)));
-            assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());
-        }
-    }
-
-    #[test_case(40; "narrow")]
-    #[test_case(80; "normal")]
-    #[test_case(140; "wide")]
-    fn composed_commands_keep_their_own_directories(width: u16) {
-        const FIRST_COMMAND: &str = "git status";
-        const SECOND_COMMAND: &str = "cargo test";
-        const FIRST_DIRECTORY: &str = "/work/first";
-        const SECOND_DIRECTORY: &str = "/work/second";
-        let mut request = PermissionRequest::from_legacy(
-            "compound".into(),
-            ToolKey::native("bash"),
-            vec![FIRST_COMMAND.into(), SECOND_COMMAND.into()],
-            json!({"command": "git status && cargo test"}),
-            Path::new("/project"),
-            false,
-        );
-        for (index, directory) in [FIRST_DIRECTORY, SECOND_DIRECTORY].into_iter().enumerate() {
-            request.resources[index]
-                .attributes
-                .insert("workdir".into(), directory.into());
-            request.resources[index].protected = true;
-            for option in &mut request.options {
-                if option.group.as_ref().and_then(|group| group.resource) == Some(index) {
-                    option.rule.resources[0].attributes.insert(
-                        "workdir".into(),
-                        PermissionResourceSelector::Exact {
-                            value: directory.into(),
-                        },
-                    );
-                }
-            }
-        }
-        let mut prompt = PermissionPrompt::new();
-        prompt.enqueue(Box::new(request), None);
-        render(&mut prompt, width, 64);
-        prompt.handle_key(key(KeyCode::Char('s')));
-        let confirmation = prompt.confirmation.as_ref().unwrap();
-        assert!(confirmation.complete);
-        for (index, directory) in [FIRST_DIRECTORY, SECOND_DIRECTORY].into_iter().enumerate() {
-            let authority = &confirmation.review.authorities[index];
-            assert_eq!(authority.row, Some(index));
-            assert!(authority.fields.iter().any(
-                |field| field.label == "Starting directory" && field.value.ends_with(directory)
+            let rows = buffer_rows(&themed_buffer(
+                &mut prompt,
+                FIT_WIDTH,
+                FIT_HEIGHT,
+                &theme::current(),
             ));
             assert!(
-                !authority
-                    .fields
-                    .iter()
-                    .any(|field| field.value.ends_with(if index == 0 {
-                        SECOND_DIRECTORY
-                    } else {
-                        FIRST_DIRECTORY
-                    }))
+                prompt.height(FIT_WIDTH) <= FIT_HEIGHT,
+                "{name} needs {} rows:\n{}",
+                prompt.height(FIT_WIDTH),
+                rows.join("\n")
             );
-        }
-        let screen = buffer_text(&assert_scrollable_body(
-            &mut prompt,
-            width,
-            LIVE_SCOPE_HEIGHT,
-            &theme::current(),
-        ));
-        for text in [
-            FIRST_DIRECTORY,
-            SECOND_DIRECTORY,
-            "Command 1",
-            "Command 2",
-            "Whole call",
-        ] {
-            assert!(screen.contains(text), "{text}: {screen}");
+            assert_eq!(prompt.scroll.offset(), 0, "{name}");
         }
     }
 
-    #[test_case(40; "narrow")]
-    #[test_case(80; "normal")]
-    #[test_case(140; "wide")]
-    fn long_paths_wrap_without_losing_cells_or_moving_actions(width: u16) {
-        const PATH_END: &str = "unique-final-file.rs";
-        let path = format!("/project/{}/{PATH_END}", "long-directory-".repeat(12));
-        let mut request = PermissionRequest::from_legacy(
-            "path".into(),
-            ToolKey::native("file_read"),
-            vec![path.clone()],
-            json!({"filePath": &path}),
-            Path::new("/project"),
-            false,
-        );
-        request.presentation.project = Some("/project".into());
-        let mut prompt = PermissionPrompt::new();
-        prompt.enqueue(Box::new(request), None);
-        for name in ["ayu_dark", "ayu_light"] {
+    #[test]
+    fn prompt_surfaces_never_show_internal_terms() {
+        for name in THEMES {
             let t = theme::load_by_name(name).unwrap();
-            let full = assert_scrollable_body(&mut prompt, width, 10, &t);
-            let text = buffer_text(&full)
-                .chars()
-                .filter(|character| !character.is_whitespace() && *character != '│')
-                .collect::<String>();
-            assert!(text.contains(&path));
-        }
-    }
-
-    #[test_case(40, 10; "narrow")]
-    #[test_case(80, 18; "normal")]
-    #[test_case(140, 24; "wide")]
-    fn footer_gaps_are_real_unstyled_nonclickable_cells(width: u16, height: u16) {
-        let mut prompt = open_prompt();
-        let theme = theme::load_by_name("ayu_dark").unwrap();
-        let buffer = themed_buffer(&mut prompt, width, height, &theme);
-        let hints = prompt
-            .row_hits
-            .iter()
-            .filter(|hit| matches!(hit.target, PromptTarget::Hint(_)))
-            .collect::<Vec<_>>();
-        for (index, hit) in hints.iter().enumerate() {
-            assert_eq!(buffer[(hit.area.x, hit.area.y)].symbol(), "[");
-            assert_eq!(buffer[(hit.area.right() - 1, hit.area.y)].symbol(), "]");
-            for other in &hints[index + 1..] {
-                assert!(hit.area.intersection(other.area).is_empty());
-            }
-            if let Some(next) = hints
-                .get(index + 1)
-                .filter(|next| next.area.y == hit.area.y)
-            {
-                assert_eq!(next.area.x - hit.area.right(), 2);
-                for x in hit.area.right()..next.area.x {
-                    assert_eq!(buffer[(x, hit.area.y)].symbol(), " ");
-                    assert_eq!(
-                        buffer[(x, hit.area.y)].style(),
-                        Style::default()
-                            .fg(Color::Reset)
-                            .bg(Color::Reset)
-                            .underline_color(Color::Reset)
-                    );
-                    assert!(prompt.target_at(Position::new(x, hit.area.y)).is_none());
+            for width in WIDTHS {
+                for (surface, mut prompt) in surfaces() {
+                    let height = prompt.height(width);
+                    let rows = buffer_rows(&themed_buffer(&mut prompt, width, height, &t));
+                    assert_plain(&rows, surface);
                 }
             }
         }
     }
 
-    #[test]
-    fn hover_changes_only_the_hovered_button_cells() {
-        let mut prompt = open_prompt();
-        let theme = theme::load_by_name("ayu_light").unwrap();
-        let before = themed_buffer(&mut prompt, 80, 18, &theme);
-        let target = PromptTarget::Hint(key(KeyCode::Char('y')));
-        let area = prompt
-            .row_hits
-            .iter()
-            .find(|hit| hit.target == target)
-            .unwrap()
-            .area;
-        prompt.hover = Some(target);
-        let after = themed_buffer(&mut prompt, 80, 18, &theme);
-        let mut expected = before;
-        expected.set_style(area, Style::new().add_modifier(Modifier::REVERSED));
-        assert_eq!(after, expected);
+    #[test_case(native_shell_request(SINGLE_COMMAND), "Allow shell command?"; "single_command")]
+    #[test_case(commands_request(&["cargo fmt", "cargo clippy"]), "Allow shell commands?"; "batch")]
+    #[test_case(fetch_request(), "Allow fetching a web page?"; "web_fetch")]
+    #[test_case(file_request(OUTSIDE_FILE, PermissionResourceAccess::Read), "Allow reading a file?"; "file_read")]
+    #[test_case(file_request(OUTSIDE_FILE, PermissionResourceAccess::Write), "Allow editing a file?"; "file_write")]
+    fn the_title_asks_about_the_tool(request: PermissionRequest, question: &str) {
+        let mut prompt = prompt_for(request);
+        assert_eq!(prompt.question(), question);
+        assert!(render(&mut prompt, FIT_WIDTH, FIT_HEIGHT).contains(question));
     }
 
     #[test]
-    fn guidance_cursor_tracks_unicode_edits_without_splitting_utf8() {
-        let mut prompt = open_prompt();
-        prompt.handle_key(key(KeyCode::Char('g')));
-        prompt.handle_paste("界 test");
-        prompt.handle_key(key(KeyCode::Home));
-        prompt.handle_key(key(KeyCode::Right));
-        let theme = theme::current();
-        let line = prompt.guidance_line(ROOMY_WIDTH, &theme);
-        assert_eq!(line.to_string(), "Guidance: 界 test");
-        let cursor = line
-            .spans
-            .iter()
-            .find(|span| span.style.bg == theme.cursor.bg)
-            .unwrap();
-        assert_eq!(cursor.content, " ");
-        assert_eq!(line.spans[1].content, "界");
-    }
-
-    #[test]
-    fn technical_authority_is_available_only_in_details() {
-        let mut prompt = open_prompt();
-        let digest = prompt.current().unwrap().input_digest.clone();
-        let main = render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT);
-        assert!(!main.contains(&digest));
-        assert!(!main.contains("allow_exact"));
-        prompt.select_authority("allow_any_command".into());
-        render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT);
-        prompt.handle_key(key(KeyCode::Char('s')));
-        let confirmation = render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT);
-        assert!(!confirmation.contains(&digest));
-        let frozen = prompt.confirmation.as_ref().unwrap().answer.clone();
-        prompt.handle_key(key(KeyCode::F(2)));
-        assert!(prompt.panel == Panel::Details);
-        let details = super::details_body(prompt.current().unwrap())
-            .lines
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(details.contains(&digest));
-        assert!(details.contains("allow_any_command"));
-        assert!(details.contains("subject"));
-        assert!(prompt.handle_key(key(KeyCode::Char('y'))).is_none());
-        prompt.handle_key(key(KeyCode::Esc));
-        assert_eq!(prompt.confirmation.as_ref().unwrap().answer, frozen);
-    }
-
-    #[test]
-    fn covered_toggle_only_exists_for_covered_rows_and_never_changes_the_call() {
-        let mut prompt = open_prompt();
-        render(&mut prompt, 80, 18);
-        assert!(
-            !prompt
-                .row_hits
-                .iter()
-                .any(|hit| hit.target == PromptTarget::Hint(key(KeyCode::Char('c'))))
-        );
-        prompt.handle_key(key(KeyCode::Char('c')));
-        assert!(!prompt.expanded_covered);
-        let mut request = PermissionRequest::from_legacy(
-            "compound".into(),
-            ToolKey::native("bash"),
-            vec!["git status".into(), "cargo test".into()],
-            json!({"command": "git status && cargo test"}),
-            Path::new("/project"),
-            false,
-        );
-        request.presentation.resources[0].coverage = Some(ResourceCoverage {
-            origin: RuleOrigin::Project,
-            authority: COVERING.into(),
-        });
-        request.presentation.project = Some("/project".into());
-        let input = request.input.clone();
-        let mut prompt = PermissionPrompt::new();
-        prompt.enqueue(Box::new(request), None);
-        let grants = prompt.row_grants(prompt.current().unwrap());
-        assert!(grants[0].is_none());
-        let collapsed = render(&mut prompt, ROOMY_WIDTH, FULL_REVIEW_HEIGHT);
-        assert!(collapsed.contains("Needs approval: 1 of 2 commands"));
-        assert!(collapsed.contains(super::WHOLE_CALL));
-        assert!(!collapsed.contains(COVERING));
-        prompt.handle_key(key(KeyCode::Char('c')));
-        let expanded = render(&mut prompt, ROOMY_WIDTH, FULL_REVIEW_HEIGHT);
-        assert!(expanded.contains(COVERING));
-        assert_eq!(prompt.row_grants(prompt.current().unwrap()), grants);
-        assert_eq!(prompt.current().unwrap().input, input);
-        assert_eq!(
-            prompt.handle_key(key(KeyCode::Char('s'))).unwrap().answer,
-            PermissionAnswer::AllowComposed {
-                rows: grants,
-                lifetime: PermissionLifetime::Conversation
-            }
-        );
-    }
-
-    #[test]
-    fn scope_chooser_never_stacks_all_authorities() {
-        let mut prompt = open_prompt();
-        prompt.open_scope_editor();
-        let layout = prompt.review_layout(77, &theme::current());
-        assert_eq!(
-            layout
-                .cards
-                .iter()
-                .filter(|(_, card)| card.title == "Future scope")
-                .count(),
-            1
-        );
-        assert!(layout.cards.len() <= 5);
-    }
-
-    #[test_case(20, 5; "tiny")]
-    #[test_case(40, 7; "short")]
-    fn unusable_layouts_have_no_approval_targets(width: u16, height: u16) {
-        let mut prompt = open_prompt();
-        render(&mut prompt, width, height);
-        assert!(prompt.row_hits.is_empty());
-        for shortcut in ['y', 's', 'a'] {
-            assert!(prompt.handle_key(key(KeyCode::Char(shortcut))).is_none());
+    fn single_command_reads_as_numbered_sentences() {
+        let mut prompt = shell_prompt(SINGLE_COMMAND);
+        let text = screen(&mut prompt, FIT_WIDTH, FIT_HEIGHT);
+        for line in [
+            "❯ 1. Yes",
+            "2. Yes, and allow ‹cargo test *› for this conversation",
+            "3. Yes, and always allow ‹cargo test *› in this project",
+            "4. No, and tell the agent what to do instead",
+        ] {
+            assert!(text.contains(line), "{line}\n{text}");
         }
-        assert_eq!(
-            prompt.handle_key(key(KeyCode::Esc)).unwrap().answer,
-            PermissionAnswer::Deny
+    }
+
+    #[test]
+    fn plan_mode_drops_the_project_choice_and_says_why() {
+        let mut prompt = prompt_for(planning(native_shell_request(SINGLE_COMMAND)));
+        let text = screen(&mut prompt, FIT_WIDTH, FIT_HEIGHT);
+        assert!(
+            text.contains("3. No, and tell the agent what to do instead"),
+            "{text}"
         );
+        assert!(!text.contains("in this project"), "{text}");
+        assert!(text.contains(super::super::notes::PLAN_NOTE), "{text}");
+    }
+
+    #[test]
+    fn opaque_lines_offer_only_once_or_no() {
+        let mut prompt = prompt_for(heredoc_request());
+        let text = screen(&mut prompt, FIT_WIDTH, FIT_HEIGHT);
+        for line in [
+            "Runs inline Python that Caudra can't check",
+            AutoNote::EngineNeeded.phrase(),
+            "❯ 1. Yes, run it once",
+            "2. No, and tell the agent what to do instead",
+            "e more options",
+        ] {
+            assert!(text.contains(line), "{line}\n{text}");
+        }
+        assert!(!text.contains("3."), "{text}");
+    }
+
+    #[test]
+    fn engine_cautions_render_as_warning_notes() {
+        let mut prompt = prompt_for(advised(native_shell_request(SINGLE_COMMAND)));
+        assert!(render(&mut prompt, FIT_WIDTH, FIT_HEIGHT).contains(DELETE_CAUTION));
+        prompt.toggle_details();
+        assert!(render(&mut prompt, FIT_WIDTH, ROOMY_HEIGHT).contains(DELETE_CAUTION));
+    }
+
+    #[test_case(None; "manual")]
+    #[test_case(Some(AutoNote::EngineFlagged); "auto")]
+    fn auto_note_renders_only_in_auto(auto: Option<AutoNote>) {
+        let mut request = native_shell_request(SINGLE_COMMAND);
+        request.presentation.auto = auto;
+        let mut prompt = prompt_for(request);
+        let text = render(&mut prompt, FIT_WIDTH, FIT_HEIGHT);
+        assert_eq!(text.contains("Auto asked"), auto.is_some(), "{text}");
+    }
+
+    #[test]
+    fn allowed_rows_name_their_origin() {
+        let mut prompt = prompt_for(batch_request());
+        let text = screen(&mut prompt, FIT_WIDTH, FIT_HEIGHT);
+        let rows: Vec<&str> = text.lines().filter(|row| row.contains("allowed")).collect();
+        assert_eq!(rows.len(), 2, "{text}");
+        assert!(rows.iter().all(|row| row.contains("read-only")), "{text}");
+        assert!(text.contains("3 of 6 new"), "{text}");
+    }
+
+    #[test]
+    fn ask_covered_rows_say_asks() {
+        let mut prompt = prompt_for(batch_request());
+        let text = screen(&mut prompt, FIT_WIDTH, FIT_HEIGHT);
+        let row = text
+            .lines()
+            .find(|row| row.contains("git push origin HEAD") && row.contains("asks"))
+            .unwrap_or_else(|| panic!("{text}"));
+        assert!(row.contains("git push * · config"), "{row}");
+        assert!(!prompt.new_rows().contains(&3));
+    }
+
+    #[test]
+    fn many_allowed_rows_collapse_into_a_count() {
+        let commands = ["cargo test", "rg a", "rg b", "rg c", "rg d"];
+        let mut request = commands_request(&commands);
+        for row in 1..commands.len() {
+            cover(
+                &mut request,
+                row,
+                RuleOrigin::Builtin,
+                CONFINED_READ_AUTHORITY,
+                false,
+            );
+        }
+        let mut prompt = prompt_for(request);
+        let text = screen(&mut prompt, FIT_WIDTH, FIT_HEIGHT);
+        assert!(text.contains("+ 4 already allowed"), "{text}");
+        assert_eq!(
+            text.lines().filter(|row| row.contains("allowed")).count(),
+            1,
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn step_through_review_lists_every_row() {
+        let mut prompt = prompt_for(batch_request());
+        prompt.open_step_through();
+        prompt.go_to_page(None);
+        let text = screen(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT);
+        for command in BATCH {
+            assert!(text.contains(command), "{command}\n{text}");
+        }
+        for phrase in [
+            "asks every time",
+            "already allowed",
+            "Yes, and remember as listed",
+            "More options for the whole script…",
+        ] {
+            assert!(text.contains(phrase), "{phrase}\n{text}");
+        }
+    }
+
+    #[test]
+    fn long_scripts_cap_the_action_block() {
+        let script: Vec<String> = (0..40).map(|line| format!("echo line {line}")).collect();
+        let mut prompt = shell_prompt(&script.join("\n"));
+        let text = screen(&mut prompt, FIT_WIDTH, FIT_HEIGHT);
+        assert!(text.contains("more lines · ? shows all"), "{text}");
+        assert!(
+            text.contains("4. No, and tell the agent what to do instead"),
+            "{text}"
+        );
+    }
+
+    #[test_case(20, 6; "too_narrow_and_short")]
+    #[test_case(31, 24; "too_narrow")]
+    #[test_case(80, 7; "too_short")]
+    fn unusable_layouts_have_no_targets(width: u16, height: u16) {
+        let mut prompt = shell_prompt(SINGLE_COMMAND);
+        render(&mut prompt, width, height);
+        assert!(prompt.hits.is_empty());
+        assert!(prompt.handle_key(key(KeyCode::Char('y'))).is_none());
+    }
+
+    #[test]
+    fn details_drop_hashes_and_name_the_tool() {
+        let mut prompt = shell_prompt(SINGLE_COMMAND);
+        prompt.toggle_details();
+        assert_eq!(prompt.panel, Panel::Details);
+        let height = prompt.height(ROOMY_WIDTH);
+        let rows = buffer_rows(&themed_buffer(
+            &mut prompt,
+            ROOMY_WIDTH,
+            height,
+            &theme::current(),
+        ));
+        let text = rows.join("\n");
+        for heading in [
+            "What will run",
+            "Where",
+            "Why Caudra is asking",
+            "Tool",
+            "Input",
+        ] {
+            assert!(text.contains(heading), "{heading}\n{text}");
+        }
+        assert!(text.contains("(this project)"), "{text}");
+        assert_plain(&rows, "details");
     }
 }

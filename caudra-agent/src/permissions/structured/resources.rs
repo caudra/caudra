@@ -1,12 +1,12 @@
 use super::COMMAND_OBSERVATION_BINDING_ATTRIBUTE;
 use super::{
     COMMAND_OBSERVATION_ATTRIBUTE, DIRECTORY_READ_TOOLS, FILE_READ_TOOLS, FILE_SEARCH_TOOLS,
-    MCP_CONTRACT, NATIVE_OWNER, NORMALIZED_COMMAND_ATTRIBUTE, PermissionAuthorityProfile,
-    PermissionExecutorKind, PermissionResource, PermissionResourceAccess,
-    PermissionResourceConstraint, PermissionResourceKind, PermissionResourceSelector,
-    PermissionRisk, PermissionSubject, RemotePermissionIdentity, WORKDIR_ATTRIBUTE,
-    canonical_json_sha256, normalized_filesystem_path, remote_scope, resource_value_digest,
-    strict_http_url,
+    MCP_CONTRACT, NATIVE_OWNER, NORMALIZED_COMMAND_ATTRIBUTE, OPACITY_ATTRIBUTE,
+    PermissionAuthorityProfile, PermissionExecutorKind, PermissionResource,
+    PermissionResourceAccess, PermissionResourceConstraint, PermissionResourceKind,
+    PermissionResourceSelector, PermissionRisk, PermissionSubject, RemotePermissionIdentity,
+    WORKDIR_ATTRIBUTE, canonical_json_sha256, normalized_filesystem_path, remote_scope,
+    resource_value_digest, strict_http_url,
 };
 use caudra_config::{FILE_WRITE_TOOLS, ToolKey};
 use caudra_storage::permission_state::REVIEW_MAX_STRING_BYTES;
@@ -455,6 +455,7 @@ pub(super) fn resource_constraint(resource: &PermissionResource) -> PermissionRe
                     NORMALIZED_COMMAND_ATTRIBUTE
                         | COMMAND_OBSERVATION_ATTRIBUTE
                         | COMMAND_OBSERVATION_BINDING_ATTRIBUTE
+                        | OPACITY_ATTRIBUTE
                 )
             })
             .map(|(name, value)| {

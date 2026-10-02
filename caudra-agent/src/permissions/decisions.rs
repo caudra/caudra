@@ -1,7 +1,7 @@
-use super::enforce::{CurrentPolicy, EvaluationContext};
+use super::enforce::{AutoEligibility, CurrentPolicy, EvaluationContext};
 use super::{
-    PendingRegistration, PermissionAdvisory, PermissionAnswer, PermissionManager,
-    PermissionPolicyError, PermissionRequest, PermissionResourceKind,
+    AutoNote, EngineFlag, PendingRegistration, PermissionAdvisory, PermissionAnswer,
+    PermissionManager, PermissionPolicyError, PermissionRequest, PermissionResourceKind,
 };
 use crate::decisions::{
     DecisionContext, DecisionFeature, DecisionReceipt, Decisions, PermissionAction,
@@ -19,16 +19,6 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tracing::warn;
 
-const SHELL_WRITES: &str = "writes_project_files";
-const FLAGS: [&str; 7] = [
-    "deletes",
-    "uploads",
-    "credentials",
-    "permissions",
-    "remote_rewrite",
-    "off_task",
-    SHELL_WRITES,
-];
 const SCREEN_CANCELLED: &str = "permission screening cancelled";
 const LABEL_SOURCE: &str = "user";
 const EFFECT_UPDATE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -40,6 +30,8 @@ pub(super) type PermissionReceipt = (Decisions, DecisionReceipt);
 pub(super) struct AutoScreening {
     pub(super) policy: CurrentPolicy,
     pub(super) approved: bool,
+    /// Why screening left a still-eligible request to the user.
+    pub(super) note: Option<AutoNote>,
     pub(super) decision: Option<(Decisions, PermissionDecision)>,
     pub(super) escalation: Option<EscalationReceipt>,
 }
@@ -103,18 +95,18 @@ pub(super) fn advisories(decision: &PermissionDecision) -> Vec<PermissionAdvisor
     else {
         return Vec::new();
     };
-    FLAGS
-        .iter()
+    EngineFlag::ALL
+        .into_iter()
         .filter_map(|flag| {
             flags
                 .iter()
                 .find(|candidate| {
-                    candidate.flag == *flag
+                    candidate.flag == flag.name()
                         && candidate.probability.is_finite()
                         && (0.0..=1.0).contains(&candidate.probability)
                 })
                 .map(|candidate| PermissionAdvisory {
-                    flag: (*flag).into(),
+                    flag,
                     probability: candidate.probability,
                 })
         })
@@ -152,25 +144,31 @@ impl PermissionManager {
         let changed = self.broker.changed.listen();
         let revision = self.broker.revision.load(Ordering::Acquire);
         let policy = self.current_policy(request, evaluation)?;
-        if policy.automatic || !policy.auto_eligible {
+        let Some(eligibility @ (AutoEligibility::Direct | AutoEligibility::NeedsEngine)) =
+            policy.auto
+        else {
             return Ok(AutoScreening {
                 policy,
                 approved: false,
+                note: None,
                 decision: None,
                 escalation: None,
             });
-        }
+        };
         let decisions = self.decisions();
         let restricted = decisions
             .as_ref()
             .is_some_and(|service| service.config().auto_screening_restricted);
         let service = decisions.filter(|service| service.enabled(&DecisionFeature::AutoScreening));
+        let enforcing = service.as_ref().is_some_and(|service| {
+            service.config().features.auto_screening == FeatureMode::Enforce
+        });
+        let advisory = service.is_some();
         let mut decision = None;
-        let mut approved = !restricted;
         if let Some(service) = service.filter(|_| !restricted) {
             let input = state(request);
             let context = context(self, request);
-            let result = cancel
+            decision = cancel
                 .race(future::race(
                     async {
                         changed.await;
@@ -179,17 +177,33 @@ impl PermissionManager {
                     service.permission(PermissionPurpose::AutoScreening, &input, &context),
                 ))
                 .await
-                .map_err(|_| PermissionPolicyError(SCREEN_CANCELLED.into()))?;
-            if service.config().features.auto_screening == FeatureMode::Enforce {
-                approved = result.as_ref().is_some_and(|result| {
-                    result.evaluation.result.is_ok() && result.action.is_none()
-                });
-            }
-            decision = result.map(|result| (service, result));
+                .map_err(|_| PermissionPolicyError(SCREEN_CANCELLED.into()))?
+                .map(|result| (service, result));
         }
+        let screened = if restricted {
+            Err(AutoNote::Restricted)
+        } else if enforcing {
+            match decision.as_ref().map(|(_, decision)| decision) {
+                Some(decision) if decision.evaluation.result.is_err() => {
+                    Err(AutoNote::EngineUnavailable)
+                }
+                Some(decision) if decision.action.is_some() => Err(AutoNote::EngineFlagged),
+                Some(_) => Ok(()),
+                None => Err(AutoNote::EngineUnavailable),
+            }
+        } else if eligibility == AutoEligibility::Direct {
+            Ok(())
+        } else if advisory {
+            Err(AutoNote::EngineAdvisory)
+        } else {
+            Err(AutoNote::EngineNeeded)
+        };
         let policy = self.current_policy(request, evaluation)?;
         let unchanged = self.broker.revision.load(Ordering::Acquire) == revision;
-        approved &= !cancel.is_cancelled() && policy.auto_eligible && unchanged;
+        let approved = screened.is_ok()
+            && !cancel.is_cancelled()
+            && policy.auto == Some(eligibility)
+            && unchanged;
         if !unchanged {
             decision = None;
         }
@@ -206,6 +220,7 @@ impl PermissionManager {
         Ok(AutoScreening {
             policy,
             approved,
+            note: screened.err(),
             decision,
             escalation,
         })
@@ -370,7 +385,7 @@ pub(super) fn label_answer(
 
 #[cfg(test)]
 mod tests {
-    use super::{FLAGS, SHELL_WRITES, advisories, label_answer, state};
+    use super::{advisories, label_answer, state};
     use crate::decisions::{
         DecisionContext, DecisionOutcome, DecisionReceipt, Decisions, PermissionAction,
         PermissionDecision, PermissionFlag, PermissionPurpose,
@@ -378,10 +393,13 @@ mod tests {
     use crate::permissions::enforce::EvaluationContext;
     use crate::permissions::tests::{
         CONTROLLED_REQUEST, FIRST_COMMAND, SHELL_WORKDIR, controlled_enforcement, default_mgr,
-        enforce_shell_without_prompt, make_config, mgr_with, shell_policy_rule, shell_request,
-        workcell_shell_subject,
+        enforce_shell_without_prompt, make_config, mgr_with, opaque_line_intent, shell_policy_rule,
+        shell_prompt, shell_request, workcell_shell_subject,
     };
-    use crate::permissions::{PendingRegistration, PermissionAnswer, PermissionMode};
+    use crate::permissions::{
+        AutoNote, EngineFlag, PendingRegistration, PermissionAnswer, PermissionMode,
+        ScriptLanguage, ShellOpacity,
+    };
     use crate::tools::PermissionScopes;
     use crate::{AgentEvent, CancelToken, EventSender};
     use async_trait::async_trait;
@@ -409,6 +427,11 @@ mod tests {
     const UPDATE_MISSING: &str = "expected advisory update";
     const PREMATURE_ADMISSION: &str = "advisory must not settle the prompt";
     const OVERSIZED_STATE_BYTES: usize = 16_384;
+    const SCREENABLE_LINE: &str = "cargo build > build.log";
+    const SCRIPT_STEPS: usize = 24;
+    const INLINE_PYTHON: ShellOpacity = ShellOpacity::InlineScript {
+        language: ScriptLanguage::Python,
+    };
 
     #[derive(Clone)]
     enum Behavior {
@@ -418,10 +441,12 @@ mod tests {
         Pending,
     }
 
+    /// Reports the state of every call it starts, so a case can read exactly
+    /// what the engine was given.
     struct FakeEngine {
         behavior: Behavior,
         calls: Arc<AtomicUsize>,
-        started: flume::Sender<()>,
+        started: flume::Sender<Value>,
         release: Option<flume::Receiver<()>>,
     }
 
@@ -433,7 +458,7 @@ mod tests {
             _deadline: Instant,
         ) -> Result<DecisionResponse, DecisionError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            let _ = self.started.try_send(());
+            let _ = self.started.try_send(request.state.clone());
             if let Some(release) = &self.release {
                 let _ = release.recv_async().await;
             }
@@ -463,7 +488,7 @@ mod tests {
     struct Service {
         decisions: Decisions,
         calls: Arc<AtomicUsize>,
-        started: flume::Receiver<()>,
+        started: flume::Receiver<Value>,
         release: flume::Sender<()>,
         _state: TempDir,
     }
@@ -535,6 +560,103 @@ mod tests {
             );
             let calls = service.calls.load(Ordering::Relaxed);
             assert!(calls == 1 || (may_time_out_before_dispatch && calls == 0));
+        });
+    }
+
+    /// A line the shell could not review runs in Auto only on an enforcing
+    /// engine's clear answer; anything less asks, and says what was missing.
+    #[test_case(Some(Behavior::Probability(0.0)), FeatureMode::Enforce, false, None; "enforcing_engine_clears_the_line")]
+    #[test_case(Some(Behavior::Probability(1.0)), FeatureMode::Enforce, false, Some(AutoNote::EngineFlagged); "flagged")]
+    #[test_case(Some(Behavior::Probability(0.0)), FeatureMode::Shadow, false, Some(AutoNote::EngineAdvisory); "advice_mode")]
+    #[test_case(None, FeatureMode::Off, false, Some(AutoNote::EngineNeeded); "no_engine")]
+    #[test_case(Some(Behavior::Probability(0.0)), FeatureMode::Enforce, true, Some(AutoNote::Restricted); "restricted")]
+    #[test_case(Some(Behavior::Error), FeatureMode::Enforce, false, Some(AutoNote::EngineUnavailable); "engine_error")]
+    fn auto_sends_screenable_lines_to_an_enforcing_engine(
+        engine: Option<Behavior>,
+        screening: FeatureMode,
+        restricted: bool,
+        note: Option<AutoNote>,
+    ) {
+        smol::block_on(async {
+            let service = engine.map(|behavior| {
+                let mut config = DecisionsConfig {
+                    base_url: Some(BASE_URL.parse().unwrap()),
+                    timeout_ms: TIMEOUT_MS,
+                    auto_screening_restricted: restricted,
+                    ..Default::default()
+                };
+                config.features.auto_screening = screening;
+                configured_service(behavior, config, false)
+            });
+            let manager = default_mgr();
+            manager.set_session_mode(Some(PermissionMode::Auto));
+            manager.set_decisions(service.as_ref().map(|service| service.decisions.clone()));
+            let intent = opaque_line_intent(SCREENABLE_LINE, ShellOpacity::Redirect);
+            let prompt = shell_prompt(&manager, &intent, SCREENABLE_LINE).await;
+            assert_eq!(
+                prompt.map(|request| request.presentation.auto),
+                note.map(Some)
+            );
+            if let Some(service) = service {
+                assert_eq!(
+                    service.calls.load(Ordering::Relaxed),
+                    usize::from(!restricted)
+                );
+            }
+        });
+    }
+
+    #[test_case("sudo cargo build", ShellOpacity::Privilege; "privilege")]
+    #[test_case("eval cargo build", ShellOpacity::Indirect; "indirect")]
+    #[test_case("cargo build &&", ShellOpacity::Unparsed; "unparsed")]
+    fn always_asking_lines_never_reach_the_engine(line: &str, cause: ShellOpacity) {
+        smol::block_on(async {
+            let service = service(
+                Behavior::Probability(0.0),
+                FeatureMode::Enforce,
+                FeatureMode::Off,
+                false,
+            );
+            let manager = default_mgr();
+            manager.set_session_mode(Some(PermissionMode::Auto));
+            manager.set_decisions(Some(service.decisions));
+            let prompt = shell_prompt(&manager, &opaque_line_intent(line, cause), line)
+                .await
+                .expect(PROMPT_MISSING);
+            assert_eq!(prompt.presentation.auto, Some(AutoNote::AlwaysAsks(cause)));
+            assert_eq!(service.calls.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    /// The engine judges the script itself, so it has to read all of it, not
+    /// the shortened form a prompt displays.
+    #[test]
+    fn a_long_script_reaches_the_engine_untruncated() {
+        smol::block_on(async {
+            let steps: Vec<_> = (0..SCRIPT_STEPS)
+                .map(|step| format!("print('step {step}')"))
+                .collect();
+            let script = format!("python3 - <<'PY'\n{}\nPY", steps.join("\n"));
+            let service = service(
+                Behavior::Probability(0.0),
+                FeatureMode::Enforce,
+                FeatureMode::Off,
+                false,
+            );
+            let manager = default_mgr();
+            manager.set_session_mode(Some(PermissionMode::Auto));
+            manager.set_decisions(Some(service.decisions));
+            let intent = opaque_line_intent(&script, INLINE_PYTHON);
+            assert!(shell_prompt(&manager, &intent, &script).await.is_none());
+            let state = service.started.try_recv().unwrap();
+            assert_eq!(state["input"]["command"], script);
+            assert!(
+                state["resources"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|resource| resource["value"] == script)
+            );
         });
     }
 
@@ -773,7 +895,10 @@ mod tests {
             };
             assert_eq!(
                 updated.presentation.advisories.len(),
-                FLAGS.iter().filter(|flag| **flag != SHELL_WRITES).count()
+                EngineFlag::ALL
+                    .iter()
+                    .filter(|flag| **flag != EngineFlag::WritesProjectFiles)
+                    .count()
             );
             assert_eq!(
                 manager.pending_request(CONTROLLED_REQUEST).unwrap(),
@@ -830,11 +955,11 @@ mod tests {
                     probability: 1.0,
                 },
                 PermissionFlag {
-                    flag: FLAGS[0].into(),
+                    flag: EngineFlag::Deletes.name().into(),
                     probability: f64::NAN,
                 },
                 PermissionFlag {
-                    flag: FLAGS[1].into(),
+                    flag: EngineFlag::Uploads.name().into(),
                     probability: 1.0,
                 },
             ])),
@@ -846,7 +971,7 @@ mod tests {
         };
         let warnings = advisories(&decision);
         assert_eq!(warnings.len(), 1);
-        assert_eq!(warnings[0].flag, FLAGS[1]);
+        assert_eq!(warnings[0].flag, EngineFlag::Uploads);
     }
 
     #[test]
@@ -1039,7 +1164,7 @@ mod tests {
                     loop {
                         if let AgentEvent::PermissionRequestUpdated(request) =
                             events.recv_async().await.unwrap().event
-                            && request.presentation.advisories.len() == FLAGS.len()
+                            && request.presentation.advisories.len() == EngineFlag::ALL.len()
                         {
                             break request;
                         }
@@ -1052,7 +1177,7 @@ mod tests {
                     .presentation
                     .advisories
                     .iter()
-                    .any(|advisory| advisory.flag == SHELL_WRITES)
+                    .any(|advisory| advisory.flag == EngineFlag::WritesProjectFiles)
             );
             updated.presentation.advisories.clear();
             assert_eq!(updated, original);

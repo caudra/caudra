@@ -130,7 +130,7 @@ features! {
     permission_advice: [Advise],
         "Add warnings to an existing permission prompt without delaying the answer.";
     auto_screening: [Enforce],
-        "Escalate an eligible Auto call to a prompt on a flag or engine failure. No answer channel means denial.";
+        "Escalate an eligible Auto call to a prompt on a flag or engine failure. Only `enforce` lets Auto run scripts and other lines that cannot be checked command by command. No answer channel means denial.";
     shell_effect: [Advise],
         "Warn about possible project writes during Plan review only when `shell_writes` is configured. Never establish read-only authority.";
     content_screening: [Advise],

@@ -202,8 +202,8 @@ mod tests {
         pending_scope_enforcement, pending_tool_enforcement, persistent_manager, remember_command,
     };
     use crate::permissions::{
-        PermissionAnswer, PermissionLifetime, PermissionManager, PermissionMode, PermissionRequest,
-        PermissionRowGrant, PermissionRuleRecord,
+        ComposedRow, PermissionAnswer, PermissionLifetime, PermissionManager, PermissionMode,
+        PermissionRequest, PermissionRowGrant, PermissionRuleRecord,
     };
     use crate::{AgentEvent, EventSender};
     use caudra_config::{Effect, PermissionRule, PermissionsConfig, ToolKey};
@@ -438,8 +438,10 @@ mod tests {
             assert!(manager.answer(
                 "first",
                 PermissionAnswer::AllowComposed {
-                    rows: vec![Some(PermissionRowGrant::Offered("command_exact_0".into()))],
-                    lifetime: PermissionLifetime::Conversation,
+                    rows: vec![Some(ComposedRow {
+                        grant: PermissionRowGrant::Offered("command_exact_0".into()),
+                        lifetime: PermissionLifetime::Conversation,
+                    })],
                 }
             ));
             assert!(matches!(

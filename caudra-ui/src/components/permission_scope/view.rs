@@ -14,11 +14,14 @@ use unicode_width::UnicodeWidthStr;
 
 use super::controls::domain_name;
 use super::model::{
-    ALL_RESOURCES, ScopeModel, ScopeSource, access_name, literal, resource_kind, safe,
+    ALL_RESOURCES, FIXED_VALUE, ScopeModel, ScopeSource, access_name, literal, resource_kind, safe,
     selector_mode, selector_value,
 };
+use super::pattern::{EVIDENCE_LABEL, INDEPENDENT_VALUES, SAME_VALUE};
 use crate::theme::Theme;
 
+pub(crate) const ALLOWED_COMBINATIONS: &str = "Allowed combinations";
+const MISSING_VALUE: &str = "(missing)";
 const TABLE_WIDE: u16 = 68;
 const TARGET_ROWS: usize = 3;
 const CHIP_ROWS: u16 = 3;
@@ -30,8 +33,8 @@ const PAGER_BUTTON_WIDTH: u16 = 6;
 const PAGER_GAP: u16 = 1;
 const PAGER_WIDTH: u16 = (PAGER_BUTTON_WIDTH + PAGER_GAP) * 2;
 const DISCLOSURES: [(Disclosure, &str); 4] = [
-    (Disclosure::Conditions, "[ALL OF]"),
-    (Disclosure::Combinations, "[Tuples]"),
+    (Disclosure::Conditions, "[All of]"),
+    (Disclosure::Combinations, "[Combinations]"),
     (Disclosure::Identity, "[ID]"),
     (Disclosure::Evidence, "[Evidence]"),
 ];
@@ -303,7 +306,7 @@ impl ScopeView {
                 buffer,
                 area,
                 &mut y,
-                Line::styled(format!("Targets · ANY OF ({count})"), theme.panel_title),
+                Line::styled(format!("Targets ({count}) · any of:"), theme.panel_title),
             );
             if count > 0 {
                 self.target = self.target.min(count - 1);
@@ -328,7 +331,7 @@ impl ScopeView {
                 });
                 for (column, title) in columns
                     .iter()
-                    .zip(["Resource/access", "Match mode", "Target", "ALL OF"])
+                    .zip(["Resource/access", "Match mode", "Target", "All of"])
                     .filter(|_| !short && wide)
                 {
                     Paragraph::new(title)
@@ -364,7 +367,7 @@ impl ScopeView {
                         ),
                         selector_mode(&resource.selector).into(),
                         model.target_text(index),
-                        format!("{} guards", resource.attributes.len() + 2),
+                        format!("{} conditions", resource.attributes.len() + 2),
                     ];
                     if wide {
                         for (column, value) in target_columns(row).into_iter().zip(cells) {
@@ -598,7 +601,7 @@ impl ScopeView {
                 if let Some(rule) = model.rule() {
                     if let Some(resource) = rule.resources.get(self.target) {
                         rows.push(Line::from(format!(
-                            "ALL OF · target {} · {}",
+                            "Target {} · {} · all of:",
                             self.target + 1,
                             resource_kind(&resource.kind)
                         )));
@@ -613,7 +616,7 @@ impl ScopeView {
                             match resource.protected {
                                 Some(true) => "protected only",
                                 Some(false) => "unprotected only",
-                                None => "ANY",
+                                None => "any",
                             }
                         )));
                         for (name, selector) in &resource.attributes {
@@ -621,7 +624,7 @@ impl ScopeView {
                                 "{}  {}  {}",
                                 safe(name),
                                 selector_mode(selector),
-                                selector_detail(
+                                selector_value(
                                     selector,
                                     matches!(model.source, ScopeSource::Live { .. })
                                 )
@@ -658,7 +661,7 @@ fn target_columns(area: Rect) -> [Rect; 4] {
         Constraint::Length(21),
         Constraint::Length(15),
         Constraint::Min(1),
-        Constraint::Length(10),
+        Constraint::Length(13),
     ])
     .areas::<4>(area);
     for column in &mut columns[..3] {
@@ -749,13 +752,12 @@ fn slot_rows(pattern: &PatternDefinition, id: SlotId) -> Vec<Line<'static>> {
 
 pub(super) fn tuple_rows(pattern: &PatternDefinition) -> Vec<Line<'static>> {
     match &pattern.combinations {
-        SlotCombinations::Independent => vec![
-            Line::from("INDEPENDENT · new cross-products allowed"),
-            Line::from("Repeated occurrences of the same slot still require equality."),
-        ],
+        SlotCombinations::Independent => {
+            vec![Line::from(INDEPENDENT_VALUES), Line::from(SAME_VALUE)]
+        }
         SlotCombinations::ObservedTuples { tuples } => {
             let mut rows = vec![Line::from(format!(
-                "LISTED TUPLES · ANY OF {} rows; ALL OF each row",
+                "{ALLOWED_COMBINATIONS} ({}), one per row:",
                 tuples.len()
             ))];
             rows.push(Line::from(
@@ -774,41 +776,25 @@ pub(super) fn tuple_rows(pattern: &PatternDefinition) -> Vec<Line<'static>> {
                         .map(|slot| {
                             tuple
                                 .get(&slot.id)
-                                .map_or_else(|| "MISSING".into(), |value| literal(value))
+                                .map_or_else(|| MISSING_VALUE.into(), |value| literal(value))
                         })
                         .collect::<Vec<_>>()
                         .join(" │ "),
                 ));
             }
-            rows.push(Line::from(
-                "Allowed combinations are separate from observed evidence.",
-            ));
             rows
         }
     }
 }
 
-fn selector_detail(selector: &PermissionResourceSelector, redact: bool) -> String {
-    match selector {
-        PermissionResourceSelector::Digest { digest }
-        | PermissionResourceSelector::FilesystemSubtreeDigest { digest }
-        | PermissionResourceSelector::UrlSubtreeDigest { digest }
-        | PermissionResourceSelector::UrlOriginDigest { digest } => {
-            format!("opaque SHA-256 {}", safe(digest))
-        }
-        _ => selector_value(selector, redact),
-    }
-}
-
 fn argument_rows(arguments: &PermissionArgumentConstraint) -> Vec<Line<'static>> {
     match arguments {
-        PermissionArgumentConstraint::Exact { digest } => vec![Line::from(format!(
-            "Whole rule · EXACT input · opaque SHA-256 {}",
-            safe(digest)
+        PermissionArgumentConstraint::Exact { .. } => vec![Line::from(format!(
+            "Whole rule · input must equal {FIXED_VALUE}"
         ))],
-        PermissionArgumentConstraint::SelectedDigest { pointers, digest } => vec![
+        PermissionArgumentConstraint::SelectedDigest { pointers, .. } => vec![
             Line::from(format!(
-                "Whole rule · SELECTED {}",
+                "Whole rule · selected {}",
                 pointers
                     .iter()
                     .map(|pointer| literal(pointer))
@@ -816,17 +802,15 @@ fn argument_rows(arguments: &PermissionArgumentConstraint) -> Vec<Line<'static>>
                     .join(" + ")
             )),
             Line::from(format!(
-                "Opaque SHA-256 {} · other arguments may vary",
-                safe(digest)
+                "Must equal {FIXED_VALUE} · other arguments may vary"
             )),
         ],
         PermissionArgumentConstraint::Selected { arguments } => arguments
             .iter()
             .map(|argument| {
                 Line::from(format!(
-                    "Whole rule · {} = opaque SHA-256 {}",
-                    literal(&argument.pointer),
-                    safe(&argument.digest)
+                    "Whole rule · {} must equal {FIXED_VALUE}",
+                    literal(&argument.pointer)
                 ))
             })
             .collect(),
@@ -852,7 +836,7 @@ fn identity_rows(model: &ScopeModel, target: usize) -> Vec<Line<'static>> {
                 index + 1,
                 resource.kind
             )));
-            rows.push(Line::from(selector_detail(
+            rows.push(Line::from(selector_value(
                 &resource.selector,
                 matches!(model.source, ScopeSource::Live { .. }),
             )));
@@ -867,7 +851,7 @@ fn identity_rows(model: &ScopeModel, target: usize) -> Vec<Line<'static>> {
                     "{} · {} · {}",
                     safe(key),
                     selector_mode(selector),
-                    selector_detail(selector, matches!(model.source, ScopeSource::Live { .. }))
+                    selector_value(selector, matches!(model.source, ScopeSource::Live { .. }))
                 )));
             }
         }
@@ -920,28 +904,8 @@ fn identity_rows(model: &ScopeModel, target: usize) -> Vec<Line<'static>> {
 }
 
 fn evidence_rows(model: &ScopeModel) -> Vec<Line<'static>> {
-    let mut rows = vec![Line::from("DISPLAY EVIDENCE · not verified preimages")];
-    if let ScopeSource::Candidate(candidate) = &model.source {
-        rows.push(Line::from(safe(&candidate.evidence.review_summary())));
-        for tuple in &candidate.evidence.tuples {
-            rows.push(Line::from(format!(
-                "{} observations · {}",
-                tuple.support.observations,
-                tuple
-                    .values
-                    .iter()
-                    .map(|(slot, value)| format!("◆{}={}", slot.0, literal(value)))
-                    .collect::<Vec<_>>()
-                    .join(" │ ")
-            )));
-        }
-        for source in &candidate.evidence.sources {
-            rows.push(Line::from(format!(
-                "Untrusted source label: {}",
-                literal(source)
-            )));
-        }
-    } else if let Some(review) = model.review() {
+    let mut rows = vec![Line::from(EVIDENCE_LABEL.trim_end())];
+    if let Some(review) = model.review() {
         rows.push(Line::from(format!(
             "Review {:?} · {} · {}",
             review.source,
@@ -971,9 +935,7 @@ fn evidence_rows(model: &ScopeModel) -> Vec<Line<'static>> {
             rows.extend(input.lines().map(|line| Line::from(safe(line))));
         }
     } else {
-        rows.push(Line::from(
-            "No historical evidence or review preimages available.",
-        ));
+        rows.push(Line::from("Nothing was recorded when this rule was made."));
     }
     rows
 }

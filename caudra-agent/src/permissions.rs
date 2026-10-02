@@ -16,25 +16,24 @@ pub use caudra_storage::permission_state::{
 pub use caudra_storage::sessions::PermissionMode;
 pub use command_pattern::{PatternFault, PatternGrade, grade_command_pattern};
 pub use sed_script::{sed_only_prints, sed_written_files};
-#[cfg(test)]
-use structured::CONFINED_READ_AUTHORITY;
 use structured::NORMALIZED_COMMAND_ATTRIBUTE;
 pub(crate) use structured::hex_encode;
 pub use structured::review;
 pub use structured::{
-    COMMAND_EXACT_PREFIX, COMMAND_GROUP_PREFIX, COMMAND_OBSERVATION_ATTRIBUTE,
+    AutoNote, COMMAND_EXACT_PREFIX, COMMAND_GROUP_PREFIX, COMMAND_OBSERVATION_ATTRIBUTE,
     COMMAND_OBSERVATION_BINDING_ATTRIBUTE, COMMAND_PATTERN_PREFIX, COMMAND_TEMPLATE_PREFIX,
-    COMPOSABLE_SHELL_OPTIONS, ComposedAnswerError, PermissionAdvisory,
-    PermissionArgumentConstraint, PermissionAuthorityProfile, PermissionCapabilityFamily,
-    PermissionCaution, PermissionExecutorKind, PermissionLifetime, PermissionOptionGroup,
-    PermissionPresentation, PermissionRequest, PermissionResource, PermissionResourceAccess,
-    PermissionResourceConstraint, PermissionResourceKind, PermissionResourcePresentation,
-    PermissionResourceSelector, PermissionRisk, PermissionRowGrant, PermissionRuleOption,
-    PermissionRuleRecord, PermissionSubject, PolicyRule, RemotePermissionIdentity,
-    ResourceCoverage, ResourceStanding, RuleOrigin, SelectedInputError, SelectedPermissionArgument,
-    StructuredPermissionDecision, StructuredPermissionEffect, StructuredPermissionRule,
-    argument_constraint_matches, canonical_json, canonical_json_sha256,
-    escape_json_pointer_segment, evaluate_structured_permission_rules,
+    COMPOSABLE_SHELL_OPTIONS, CONFINED_READ_AUTHORITY, ComposedAnswerError, ComposedRow,
+    EngineFlag, OPACITY_ATTRIBUTE, PermissionAdvisory, PermissionArgumentConstraint,
+    PermissionAuthorityProfile, PermissionCapabilityFamily, PermissionCaution,
+    PermissionExecutorKind, PermissionLifetime, PermissionOptionGroup, PermissionPresentation,
+    PermissionRequest, PermissionResource, PermissionResourceAccess, PermissionResourceConstraint,
+    PermissionResourceKind, PermissionResourcePresentation, PermissionResourceSelector,
+    PermissionRisk, PermissionRowGrant, PermissionRuleOption, PermissionRuleRecord,
+    PermissionSubject, PolicyRule, PromptReason, RemotePermissionIdentity, ResourceCoverage,
+    ResourceStanding, RuleOrigin, ScriptLanguage, SelectedInputError, SelectedPermissionArgument,
+    ShellOpacity, StructuredPermissionDecision, StructuredPermissionEffect,
+    StructuredPermissionRule, UnknownShellOpacity, argument_constraint_matches, canonical_json,
+    canonical_json_sha256, escape_json_pointer_segment, evaluate_structured_permission_rules,
     filesystem_permission_resource, json_pointer, permission_rule_covers_request,
     permission_rule_covers_resource, permission_rule_intersects_request,
     permission_rules_cover_request, permission_rules_resource_standing, prepared_command_binding,

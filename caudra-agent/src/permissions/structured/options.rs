@@ -16,7 +16,7 @@ use super::{
 };
 use super::{
     PermissionRequest, ResourceCoverage,
-    review::{COMMAND_TEMPLATE_EXECUTION_NOTICE, command_template_label},
+    review::{COMMAND_TEMPLATE_EXECUTION_NOTICE, command_template_phrase},
     trusted_command_observation,
 };
 use crate::permissions::{
@@ -27,7 +27,9 @@ use crate::permissions::{
     },
 };
 use caudra_config::ToolKey;
-use caudra_storage::permission_patterns::{MAX_PATTERN_JSON_BYTES, PatternDefinition};
+use caudra_storage::permission_patterns::{
+    MAX_PATTERN_JSON_BYTES, PatternDefinition, PatternToken,
+};
 use caudra_storage::permission_state::validate_command_templates;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -38,6 +40,8 @@ pub(super) const SUBTREE_OPTION_ID: &str = "allow_filesystem_subtree";
 pub(super) const URL_SUBTREE_OPTION_ID: &str = "allow_url_subtree";
 
 pub(super) const URL_ORIGIN_OPTION_ID: &str = "allow_url_origin";
+
+pub(super) const EXACT_CALL_OPTION: &str = "allow_exact";
 
 /// How many path prefixes a URL ladder offers below its origin. The rungs share
 /// one row, so this bounds the request a deep path serializes to rather than
@@ -69,8 +73,31 @@ const MAX_COMMAND_TEMPLATE_OPTIONS: usize = 16;
 const MAX_COMMAND_TEMPLATE_OPTION_BYTES: usize = 4 * MAX_PATTERN_JSON_BYTES;
 const BROWSE_OPTION_ID: &str = "allow_filesystem_browse";
 const BROWSE_SUBTREE_OPTION_ID: &str = "allow_filesystem_browse_subtree";
-const LIST_NAMES_LABEL: &str = "List names in this directory";
-const BROWSE_NAMES_LABEL: &str = "Browse names below this directory";
+const BROWSE_NAMES_LABEL: &str = "this folder and below";
+const EXACT_CALL_LABEL: &str = "this call";
+const EXACT_COMMAND_LABEL: &str = "this exact command";
+const EXACT_COMMANDS_LABEL: &str = "these exact commands";
+const COMMAND_PATTERNS_LABEL: &str = "these command patterns";
+const ANY_COMMAND_LABEL: &str = "any shell command";
+const PROJECT_COMMANDS_LABEL: &str = "any command in this project";
+pub(super) const WORKDIRS_COMMANDS_LABEL: &str = "any command in these folders";
+const REMOTE_RESOURCES_LABEL: &str = "these remote resources";
+const EXACT_PAGE_LABEL: &str = "this exact page";
+const PAGE_SUBTREE_LABEL: &str = "this page and below";
+const ANY_PAGE_LABEL: &str = "any public web page";
+const EXACT_QUERY_LABEL: &str = "this exact search";
+const ANY_QUERY_LABEL: &str = "any search";
+const ANY_ARGUMENTS_LABEL: &str = "any arguments";
+const EXACT_SEARCH_LABEL: &str = "this search";
+const EXACT_FILE_LABEL: &str = "this file";
+const EXACT_FOLDER_LABEL: &str = "this folder";
+const EXACT_FILES_LABEL: &str = "these files";
+const EXACT_PATHS_LABEL: &str = "these paths";
+const SUBTREES_LABEL: &str = "these folders";
+const PROJECT_LABEL: &str = "this project";
+const FILESYSTEM_ROOT_LABEL: &str = "anything under /";
+const HOME_PREFIX: &str = "~/";
+const HTTPS_SCHEME: &str = "https://";
 const IMPORTED_PATTERN_CONTEXT: &str = "Historical execution context and tool identity are unverified. Analysis assumes standard Bash startup, no aliases, functions, traps or command-not-found hook, default shell options and standard builtins, standard directory variables, empty CDPATH, disabled lastpipe, and logical PWD matching the initial cwd. The session's current stored cwd approximates its historical project; paths are interpreted lexically without filesystem resolution. These assumptions do not verify the historical environment.";
 
 impl CandidateEvidence {
@@ -128,7 +155,7 @@ impl PermissionRequest {
             .retain(|option| !option.id.starts_with(COMMAND_TEMPLATE_PREFIX));
         let mut count = 0;
         let mut option_bytes = 0;
-        for (index, resource) in self.resources.iter().enumerate() {
+        'rows: for (index, resource) in self.resources.iter().enumerate() {
             if coverage.get(index).is_some_and(Option::is_some) || resource.requires_prompt {
                 continue;
             }
@@ -144,19 +171,21 @@ impl PermissionRequest {
                 continue;
             };
             let mut seen = BTreeSet::new();
-            let definitions = candidates
-                .proposals
-                .iter()
-                .map(|candidate| (&candidate.definition, candidate.evidence.review_summary()));
-            for (definition, description) in definitions {
+            for candidate in &candidates.proposals {
+                let definition = &candidate.definition;
                 if candidates.is_dismissed(definition) {
                     continue;
                 }
-                let Some(option) =
-                    command_template_option(index, &exact, &observation, definition, &description)
-                else {
+                let Some(mut option) = command_template_option(
+                    index,
+                    &exact,
+                    &observation,
+                    definition,
+                    &candidate.evidence.review_summary(),
+                ) else {
                     continue;
                 };
+                option.seen = Some(candidate.evidence.support.observations);
                 if !seen.insert(option.id.clone()) {
                     continue;
                 }
@@ -166,12 +195,93 @@ impl PermissionRequest {
                 if count == MAX_COMMAND_TEMPLATE_OPTIONS
                     || option_bytes + encoded.len() > MAX_COMMAND_TEMPLATE_OPTION_BYTES
                 {
-                    return;
+                    break 'rows;
                 }
                 option_bytes += encoded.len();
                 count += 1;
-                self.options.push(option);
+                let position = rung_position(&self.options, index, &option);
+                self.options.insert(position, option);
             }
+        }
+        settle_row_defaults(&mut self.options);
+    }
+}
+
+/// Where a template joins its command's ladder so the ladder keeps widening:
+/// after the rungs that fix more literal words, and before a prefix that fixes
+/// as many.
+fn rung_position(
+    options: &[PermissionRuleOption],
+    row: usize,
+    template: &PermissionRuleOption,
+) -> usize {
+    let head = literal_head(template);
+    let in_row = |option: &PermissionRuleOption| {
+        option.group.as_ref().and_then(|group| group.resource) == Some(row)
+    };
+    options
+        .iter()
+        .position(|option| {
+            in_row(option)
+                && !option.id.starts_with(COMMAND_EXACT_PREFIX)
+                && (literal_head(option) < head
+                    || literal_head(option) == head
+                        && option.id.starts_with(COMMAND_PATTERN_PREFIX))
+        })
+        .or_else(|| options.iter().rposition(in_row).map(|last| last + 1))
+        .unwrap_or(options.len())
+}
+
+/// How many literal words a command rung fixes before it matches anything, so
+/// the fewer it fixes the wider it reaches.
+fn literal_head(option: &PermissionRuleOption) -> Option<usize> {
+    match &option.rule.resources.first()?.selector {
+        PermissionResourceSelector::CommandPattern { pattern } => Some(
+            pattern
+                .strip_suffix(" *")
+                .unwrap_or(pattern)
+                .split_whitespace()
+                .count(),
+        ),
+        PermissionResourceSelector::CommandTemplate { definition } => Some(
+            definition
+                .argv
+                .iter()
+                .take_while(|token| matches!(token, PatternToken::Exact { .. }))
+                .count(),
+        ),
+        _ => None,
+    }
+}
+
+/// Each command's ladder starts on its suggested template, else its reusable
+/// prefix, else the command itself.
+fn settle_row_defaults(options: &mut [PermissionRuleOption]) {
+    let rank = |option: &PermissionRuleOption| {
+        let row = option.group.as_ref()?.resource?;
+        let rank = [
+            COMMAND_TEMPLATE_PREFIX,
+            COMMAND_PATTERN_PREFIX,
+            COMMAND_EXACT_PREFIX,
+        ]
+        .iter()
+        .position(|prefix| option.id.starts_with(prefix))?;
+        Some((row, rank))
+    };
+    let mut defaults: BTreeMap<usize, (usize, usize)> = BTreeMap::new();
+    for (position, option) in options.iter().enumerate() {
+        if let Some((row, rank)) = rank(option) {
+            let best = defaults.entry(row).or_insert((rank, position));
+            if rank < best.0 {
+                *best = (rank, position);
+            }
+        }
+    }
+    for (position, option) in options.iter_mut().enumerate() {
+        if let Some((row, _)) = rank(option) {
+            option.is_default = defaults
+                .get(&row)
+                .is_some_and(|&(_, chosen)| chosen == position);
         }
     }
 }
@@ -200,12 +310,15 @@ fn command_template_option(
         "{COMMAND_TEMPLATE_PREFIX}{}",
         canonical_json_sha256(&json!([index, compiled.fingerprint(), exact.rule]))
     );
-    option.label = command_template_label(definition);
+    let workdir = exact
+        .label
+        .strip_prefix(EXACT_COMMAND_LABEL)
+        .unwrap_or_default();
+    option.label = format!("{}{workdir}", command_template_phrase(definition));
     option.description = format!(
         "{}. {COMMAND_TEMPLATE_EXECUTION_NOTICE}. Bound executable, workdir and argument structure; other shell resources require separate authority.",
         source_description.trim_end_matches('.'),
     );
-    option.is_default = false;
     if let Some(group) = &mut option.group {
         group.value = definition.name.clone();
     }
@@ -255,6 +368,7 @@ pub(super) fn rule_options(
         confirmation: confirmation.map(String::from),
         group: None,
         caution: None,
+        seen: None,
     };
     let reusable = vec![
         PermissionLifetime::Conversation,
@@ -263,10 +377,15 @@ pub(super) fn rule_options(
     ];
     let mut exact_lifetimes = vec![PermissionLifetime::Once];
     exact_lifetimes.extend(reusable.iter().cloned());
+    let exact_call_label = match (authority, resources.len()) {
+        (PermissionAuthorityProfile::Shell, 1) => EXACT_COMMAND_LABEL,
+        (PermissionAuthorityProfile::Shell, _) => EXACT_COMMANDS_LABEL,
+        _ => EXACT_CALL_LABEL,
+    };
     let mut options = vec![
         option(
-            "allow_exact",
-            "This exact call",
+            EXACT_CALL_OPTION,
+            exact_call_label,
             "Allow only these exact arguments and resources.",
             StructuredPermissionEffect::Allow,
             resource_constraints.clone(),
@@ -278,7 +397,7 @@ pub(super) fn rule_options(
         ),
         option(
             "deny_exact",
-            "Deny this exact call",
+            exact_call_label,
             "Deny only these exact arguments and resources.",
             StructuredPermissionEffect::Deny,
             resource_constraints.clone(),
@@ -300,7 +419,7 @@ pub(super) fn rule_options(
     {
         options.push(option(
             "allow_remote_resources",
-            "These remote resources",
+            REMOTE_RESOURCES_LABEL,
             "Allow these authority-issued resources with different display controls.",
             StructuredPermissionEffect::Allow,
             resources
@@ -332,7 +451,7 @@ pub(super) fn rule_options(
         };
         options.push(option(
             "allow_exact_url",
-            "This exact URL",
+            EXACT_PAGE_LABEL,
             "Allow this normalized URL with different fetch format or timeout controls.",
             StructuredPermissionEffect::Allow,
             vec![exact_url],
@@ -350,7 +469,8 @@ pub(super) fn rule_options(
             reusable: &reusable,
         };
         // Deepest first, dropping the origin's own root: the rung below reaches
-        // exactly that far and says so in the origin's own terms.
+        // exactly that far and says so in the origin's own terms. The deepest
+        // rung is where the ladder starts.
         let roots = url_subtree_roots(&strict).unwrap_or_default();
         let pages = roots.len().saturating_sub(1).min(MAX_URL_LADDER_RUNGS);
         for (step, root) in roots[..pages].iter().enumerate() {
@@ -359,28 +479,33 @@ pub(super) fn rule_options(
                     0 => URL_SUBTREE_OPTION_ID.into(),
                     step => format!("{URL_SUBTREE_OPTION_ID}_{step}"),
                 },
-                "This page and subpages",
+                match step {
+                    0 => PAGE_SUBTREE_LABEL.into(),
+                    _ => format!("pages under {}/", url_place(root)),
+                },
                 format!("Allow requested URLs at or below {root}/**."),
                 format!("{root}/**"),
                 PermissionResourceSelector::UrlSubtreeDigest {
                     digest: url_subtree_digest(root),
                 },
+                step == 0,
             ));
         }
 
         let origin = strict.url.origin().ascii_serialization();
         options.push(ladder.rung(
             URL_ORIGIN_OPTION_ID.into(),
-            "Any page on this origin",
+            format!("any page on {}", url_place(&origin)),
             format!("Allow any requested URL on {origin}/**."),
             format!("{origin}/**"),
             PermissionResourceSelector::UrlOriginDigest {
                 digest: url_origin_digest(&resource.value).expect("strict URL has an origin"),
             },
+            pages == 0,
         ));
         options.push(option(
             "allow_any_url",
-            "Any public HTTP(S) URL",
+            ANY_PAGE_LABEL,
             "Allow any public HTTP(S) URL accepted by this exact tool contract.",
             StructuredPermissionEffect::Allow,
             vec![PermissionResourceConstraint {
@@ -404,19 +529,19 @@ pub(super) fn rule_options(
     {
         options.push(option(
             "allow_exact_query",
-            "This exact search query",
+            EXACT_QUERY_LABEL,
             "Allow this query with different result limits or paging controls.",
             StructuredPermissionEffect::Allow,
             exact_resource_constraints(resources),
             PermissionArgumentConstraint::Unconstrained,
             reusable.clone(),
             true,
-            false,
+            true,
             None,
         ));
         options.push(option(
             "allow_any_query",
-            "Any search query",
+            ANY_QUERY_LABEL,
             "Allow any future query through this exact tool contract.",
             StructuredPermissionEffect::Allow,
             vec![PermissionResourceConstraint {
@@ -441,18 +566,40 @@ pub(super) fn rule_options(
             .all(|resource| resource.kind == PermissionResourceKind::Command)
     {
         let workdir_label = workdir_label(resources.first());
-        add_command_options(&mut options, resources, subject, executor, &reusable);
+        let project = normalized_filesystem_path(&cwd.to_string_lossy());
+        let project = project.as_deref();
+        let workdirs = resources
+            .iter()
+            .filter_map(|resource| resource.attributes.get(WORKDIR_ATTRIBUTE))
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let shared_suffix = if workdirs.len() == 1 {
+            workdir_suffix(workdirs.first().copied(), project)
+        } else {
+            String::new()
+        };
+        add_command_options(
+            &mut options,
+            resources,
+            subject,
+            executor,
+            &reusable,
+            project,
+        );
         // Protected commands were reviewed as whole command lines because analysis
         // dropped operands, so only the blanket options below describe them
         // truthfully.
         if resources.iter().all(|resource| !resource.protected) {
             options.push(option(
                 EXACT_COMMANDS_OPTION,
-                if resources.len() == 1 {
-                    "This command in this workdir"
-                } else {
-                    "These commands in this workdir"
-                },
+                &format!(
+                    "{}{shared_suffix}",
+                    if resources.len() == 1 {
+                        EXACT_COMMAND_LABEL
+                    } else {
+                        EXACT_COMMANDS_LABEL
+                    }
+                ),
                 &format!(
                     "Allow {} in {workdir_label} with different timeout or display controls.",
                     listed_commands(resources.iter().map(|resource| resource.value.as_str()))
@@ -487,12 +634,9 @@ pub(super) fn rule_options(
                 .collect();
             if !patterns.is_empty() {
                 let label = if patterns.len() == 1 && exact_fallbacks.is_empty() {
-                    format!(
-                        "Any `{}` command in this workdir",
-                        patterns[0].strip_suffix(" *").unwrap_or(&patterns[0])
-                    )
+                    format!("{}{shared_suffix}", safe_summary(&patterns[0]))
                 } else {
-                    "These command patterns in this workdir".into()
+                    format!("{COMMAND_PATTERNS_LABEL}{shared_suffix}")
                 };
                 let summaries = patterns
                     .iter()
@@ -526,18 +670,13 @@ pub(super) fn rule_options(
         // must match for it to cover a resource, so pinning only the first
         // workdir would leave `cd /elsewhere && …` uncoverable and the answer
         // uncommittable.
-        let workdirs = resources
-            .iter()
-            .filter_map(|resource| resource.attributes.get(WORKDIR_ATTRIBUTE))
-            .map(String::as_str)
-            .collect::<BTreeSet<_>>();
         if !workdirs.is_empty() {
             options.push(option(
                 "allow_commands_in_workdir",
-                if workdirs.len() == 1 {
-                    "Any command in this workdir"
-                } else {
-                    "Any command in these workdirs"
+                &match (workdirs.len(), shared_suffix.is_empty()) {
+                    (1, true) => PROJECT_COMMANDS_LABEL.to_owned(),
+                    (1, false) => format!("any command{shared_suffix}"),
+                    _ => WORKDIRS_COMMANDS_LABEL.to_owned(),
                 },
                 &format!(
                     "Allow arbitrary commands starting in {}.",
@@ -568,7 +707,7 @@ pub(super) fn rule_options(
         }
         options.push(option(
             "allow_any_command",
-            "Any shell command",
+            ANY_COMMAND_LABEL,
             "Allow arbitrary shell commands from any working directory.",
             StructuredPermissionEffect::Allow,
             vec![PermissionResourceConstraint {
@@ -599,7 +738,7 @@ pub(super) fn rule_options(
     if tool.is_mcp() {
         options.push(option(
             "allow_whole_mcp_tool_conversation",
-            "Allow whole MCP tool for conversation (broad)",
+            ANY_ARGUMENTS_LABEL,
             "Broad: allow this MCP tool with any arguments for the conversation.",
             StructuredPermissionEffect::Allow,
             resource_constraints,
@@ -609,6 +748,16 @@ pub(super) fn rule_options(
             false,
             Some("ALLOW MCP TOOL"),
         ));
+    }
+    settle_row_defaults(&mut options);
+    let laddered = options
+        .iter()
+        .any(|option| option.is_default && option.id != EXACT_CALL_OPTION);
+    if let Some(exact) = options
+        .iter_mut()
+        .find(|option| option.id == EXACT_CALL_OPTION)
+    {
+        exact.is_default = !laddered;
     }
     options
 }
@@ -624,6 +773,41 @@ pub(super) fn workdir_label(resource: Option<&PermissionResource>) -> String {
         )
 }
 
+/// ` in caudra-agent/` for a command that starts somewhere other than the
+/// project root, and nothing for one that starts there.
+fn workdir_suffix(workdir: Option<&str>, project: Option<&Path>) -> String {
+    workdir
+        .and_then(normalized_filesystem_path)
+        .and_then(|workdir| {
+            folder_place(&workdir, project, caudra_storage::paths::home().as_deref())
+        })
+        .map(|place| format!(" in {place}"))
+        .unwrap_or_default()
+}
+
+/// How a folder reads in a scope: relative inside the project, `~`-abbreviated
+/// under home, absolute elsewhere, always ending in a slash. The project itself
+/// has no place of its own, so the caller says what it means there.
+fn folder_place(folder: &Path, project: Option<&Path>, home: Option<&Path>) -> Option<String> {
+    if project == Some(folder) {
+        return None;
+    }
+    let place =
+        if let Some(relative) = project.and_then(|project| folder.strip_prefix(project).ok()) {
+            relative.to_string_lossy().into_owned()
+        } else if let Some(relative) = home.and_then(|home| folder.strip_prefix(home).ok()) {
+            format!("{HOME_PREFIX}{}", relative.to_string_lossy())
+        } else {
+            folder.to_string_lossy().into_owned()
+        };
+    Some(format!("{}/", safe_summary(place.trim_end_matches('/'))))
+}
+
+/// A URL as a scope names it: the scheme only when it is not https.
+fn url_place(url: &str) -> &str {
+    url.strip_prefix(HTTPS_SCHEME).unwrap_or(url)
+}
+
 /// One ladder per command, so a request that batches several can be remembered
 /// at a different breadth for each.
 ///
@@ -637,6 +821,7 @@ pub(super) fn add_command_options(
     subject: &PermissionSubject,
     executor: &PermissionExecutorKind,
     reusable: &[PermissionLifetime],
+    project: Option<&Path>,
 ) {
     for (index, resource) in resources.iter().enumerate() {
         if resource.protected {
@@ -644,13 +829,21 @@ pub(super) fn add_command_options(
         }
         let constraint = resource_constraint(resource);
         let workdir = workdir_label(Some(resource));
+        let suffix = workdir_suffix(
+            resource
+                .attributes
+                .get(WORKDIR_ATTRIBUTE)
+                .map(String::as_str),
+            project,
+        );
         let command = safe_summary(&resource.value);
         let rung = |id: String,
+                    label: String,
                     value: &str,
                     description: String,
                     selector: PermissionResourceSelector| PermissionRuleOption {
             id,
-            label: command.clone(),
+            label,
             description,
             rule: StructuredPermissionRule {
                 subject: subject.clone(),
@@ -674,9 +867,11 @@ pub(super) fn add_command_options(
                 resource: Some(index),
             }),
             caution: None,
+            seen: None,
         };
         options.push(rung(
             format!("{COMMAND_EXACT_PREFIX}{index}"),
+            format!("{EXACT_COMMAND_LABEL}{suffix}"),
             EXACT_COMMAND_CHIP,
             format!("Allow `{command}` in {workdir} with different timeout or display controls."),
             constraint.selector.clone(),
@@ -685,6 +880,7 @@ pub(super) fn add_command_options(
         {
             options.push(rung(
                 format!("{COMMAND_PATTERN_PREFIX}{index}"),
+                format!("{}{suffix}", safe_summary(&pattern)),
                 &pattern,
                 format!(
                     "Allow commands matching `{}` in {workdir}.",
@@ -745,13 +941,24 @@ pub(super) fn add_filesystem_options(
     } else {
         PermissionArgumentConstraint::Unconstrained
     };
+    let exact_label = if search {
+        EXACT_SEARCH_LABEL
+    } else {
+        match resources {
+            [resource] if resource.kind == PermissionResourceKind::File => EXACT_FILE_LABEL,
+            [_] => EXACT_FOLDER_LABEL,
+            _ if resources
+                .iter()
+                .all(|resource| resource.kind == PermissionResourceKind::File) =>
+            {
+                EXACT_FILES_LABEL
+            }
+            _ => EXACT_PATHS_LABEL,
+        }
+    };
     options.push(PermissionRuleOption {
         id: "allow_exact_resources".into(),
-        label: if resources.len() == 1 {
-            "This exact path".into()
-        } else {
-            "These exact paths".into()
-        },
+        label: exact_label.into(),
         description: if write {
             "Allow future changes to only the exact reviewed path set.".into()
         } else if search {
@@ -770,10 +977,15 @@ pub(super) fn add_filesystem_options(
         },
         allowed_lifetimes: reusable.to_vec(),
         broad: true,
-        is_default: false,
+        is_default: true,
         confirmation: write.then(|| "ALLOW FILE CHANGES".into()),
-        group: None,
+        group: Some(PermissionOptionGroup {
+            key: SUBTREE_OPTION_ID.into(),
+            value: exact_label.into(),
+            resource: None,
+        }),
         caution: None,
+        seen: None,
     });
 
     // A protected path never earns a subtree grant, because every rung of the
@@ -912,6 +1124,11 @@ fn add_browse_options(
         {
             continue;
         }
+        let label = if recursive {
+            BROWSE_NAMES_LABEL
+        } else {
+            EXACT_FOLDER_LABEL
+        };
         let mut constraint = resource_constraint(resource);
         if recursive && !resource.protected {
             constraint.selector = PermissionResourceSelector::FilesystemSubtreeDigest {
@@ -931,7 +1148,7 @@ fn add_browse_options(
         }
         options.push(PermissionRuleOption {
             id: if recursive { BROWSE_SUBTREE_OPTION_ID } else { BROWSE_OPTION_ID }.into(),
-            label: if recursive { BROWSE_NAMES_LABEL } else { LIST_NAMES_LABEL }.into(),
+            label: label.into(),
             description: if recursive {
                 "Allow recursive filename enumeration below this root, with any filename pattern; never file contents."
             } else {
@@ -948,10 +1165,15 @@ fn add_browse_options(
             },
             allowed_lifetimes: reusable.to_vec(),
             broad: true,
-            is_default: false,
+            is_default: !recursive || recursion == BROWSE_RECURSIVE,
             confirmation: None,
-            group: None,
+            group: Some(PermissionOptionGroup {
+                key: BROWSE_OPTION_ID.into(),
+                value: label.into(),
+                resource: None,
+            }),
             caution: None,
+            seen: None,
         });
     }
 }
@@ -970,14 +1192,15 @@ impl UrlLadder<'_> {
     pub(super) fn rung(
         &self,
         id: String,
-        label: &str,
+        label: String,
         description: String,
         pattern: String,
         selector: PermissionResourceSelector,
+        is_default: bool,
     ) -> PermissionRuleOption {
         PermissionRuleOption {
             id,
-            label: label.into(),
+            label,
             description,
             rule: StructuredPermissionRule {
                 subject: self.subject.clone(),
@@ -996,7 +1219,7 @@ impl UrlLadder<'_> {
             },
             allowed_lifetimes: self.reusable.to_vec(),
             broad: true,
-            is_default: false,
+            is_default,
             confirmation: None,
             group: Some(PermissionOptionGroup {
                 key: URL_SUBTREE_OPTION_ID.into(),
@@ -1004,6 +1227,7 @@ impl UrlLadder<'_> {
                 resource: None,
             }),
             caution: None,
+            seen: None,
         }
     }
 }
@@ -1050,7 +1274,10 @@ impl SubtreeLadder<'_> {
         }
         PermissionRuleOption {
             id,
-            label: "These directories and descendants".into(),
+            label: match roots {
+                [root] => self.place(root),
+                _ => SUBTREES_LABEL.into(),
+            },
             description,
             rule: StructuredPermissionRule {
                 subject: subject.clone(),
@@ -1071,6 +1298,7 @@ impl SubtreeLadder<'_> {
                 resource: None,
             }),
             caution,
+            seen: None,
         }
     }
 
@@ -1094,6 +1322,14 @@ impl SubtreeLadder<'_> {
                 .any(|root| root != repository && !root.starts_with(repository))
         });
         outside_repository.then_some(PermissionCaution::Warn)
+    }
+
+    fn place(&self, root: &Path) -> String {
+        if root.parent().is_none() {
+            return FILESYSTEM_ROOT_LABEL.into();
+        }
+        folder_place(root, self.project, self.home.as_deref())
+            .unwrap_or_else(|| PROJECT_LABEL.into())
     }
 
     pub(super) fn reason(&self, caution: Option<PermissionCaution>) -> Option<String> {
@@ -1146,14 +1382,15 @@ pub(super) fn enclosing_repository(start: Option<&Path>) -> Option<PathBuf> {
 #[cfg(test)]
 mod learned_scope_tests {
     use super::{
-        COMMAND_EXACT_PREFIX, COMMAND_TEMPLATE_PREFIX, IMPORTED_PATTERN_CONTEXT,
-        command_template_option,
+        COMMAND_EXACT_PREFIX, COMMAND_PATTERN_PREFIX, COMMAND_TEMPLATE_PREFIX,
+        IMPORTED_PATTERN_CONTEXT, command_template_option,
     };
     use crate::permissions::{
         COMMAND_OBSERVATION_ATTRIBUTE, COMMAND_OBSERVATION_BINDING_ATTRIBUTE, ComposedAnswerError,
-        PermissionExecutorKind, PermissionLifetime, PermissionRequest, PermissionResourceSelector,
-        PermissionRowGrant, PermissionRuleOption, ResourceCoverage, RuleOrigin,
-        StructuredPermissionDecision, evaluate_structured_permission_rules,
+        ComposedRow, PermissionExecutorKind, PermissionLifetime, PermissionRequest,
+        PermissionResourceSelector, PermissionRowGrant, PermissionRuleOption, ResourceCoverage,
+        RuleOrigin, StructuredPermissionDecision, StructuredPermissionRule,
+        evaluate_structured_permission_rules,
         pattern_recognition::{
             CommandObservation, InvocationOutcome, ObservationProvenance, PatternCandidate,
             PatternRecognizer, RecognizerLimits, fixtures,
@@ -1289,7 +1526,7 @@ mod learned_scope_tests {
                 recognizer.observe(fact.clone()).unwrap();
             }
         }
-        assert!(!template_option(&request).is_default);
+        assert!(template_option(&request).is_default);
         request.add_pattern_candidates(&Default::default(), &[None]);
         assert!(
             request
@@ -1297,22 +1534,23 @@ mod learned_scope_tests {
                 .iter()
                 .all(|option| !option.id.starts_with(COMMAND_TEMPLATE_PREFIX))
         );
+        assert_eq!(
+            request
+                .options
+                .iter()
+                .filter(|option| option.is_default)
+                .count(),
+            1
+        );
     }
 
     #[test_case(PermissionLifetime::Conversation; "conversation_proposal")]
     #[test_case(PermissionLifetime::Project; "project_proposal")]
     fn learned_scope_never_grants_itself(lifetime: PermissionLifetime) {
         let mut request = prepared(observation(PACKAGE));
-        let defaults = request
-            .options
-            .iter()
-            .filter(|option| option.is_default)
-            .map(|option| option.id.clone())
-            .collect::<Vec<_>>();
         let candidates = learned_candidates().into();
         request.add_pattern_candidates(&candidates, &[None]);
         let option = template_option(&request);
-        assert!(!option.is_default);
         assert!(option.description.starts_with(LEARNED_SOURCE));
         assert_eq!(option.group.as_ref().unwrap().resource, Some(0));
         assert_eq!(
@@ -1344,9 +1582,9 @@ mod learned_scope_tests {
                 .options
                 .iter()
                 .filter(|option| option.is_default)
-                .map(|option| option.id.clone())
+                .map(|option| option.id.as_str())
                 .collect::<Vec<_>>(),
-            defaults
+            [option.id.as_str()]
         );
         let id = option.id.clone();
         request.add_pattern_candidates(&candidates, &[None]);
@@ -1358,6 +1596,65 @@ mod learned_scope_tests {
                 .filter(|option| option.id.starts_with(COMMAND_TEMPLATE_PREFIX))
                 .count(),
             1
+        );
+    }
+
+    fn defaults(request: &PermissionRequest) -> Vec<String> {
+        request
+            .options
+            .iter()
+            .filter(|option| option.is_default)
+            .map(|option| option.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn shell_default_rung_prefers_template_then_prefix() {
+        let prefix = format!("{COMMAND_PATTERN_PREFIX}0");
+        let mut request = prepared(observation(PACKAGE));
+        assert_eq!(defaults(&request), [prefix.as_str()]);
+
+        request.add_pattern_candidates(&learned_candidates().into(), &[None]);
+        assert_eq!(defaults(&request), [template_option(&request).id.as_str()]);
+
+        request.add_pattern_candidates(&Default::default(), &[None]);
+        assert_eq!(defaults(&request), [prefix]);
+    }
+
+    /// `→` walks a row's ladder from narrow to wide, so every rung reaches the
+    /// commands the rung before it reached, and more.
+    #[test]
+    fn right_arrow_always_widens() {
+        let mut request = prepared(observation(PACKAGE));
+        request.add_pattern_candidates(&learned_candidates().into(), &[None]);
+        let fixtures = [PACKAGE, OTHER_PACKAGE, UNOBSERVED_PACKAGE]
+            .map(|package| prepared(observation(package)));
+        let reach = |rule: &StructuredPermissionRule| {
+            fixtures
+                .iter()
+                .map(|fixture| permission_rule_covers_request(rule, fixture))
+                .collect::<Vec<_>>()
+        };
+        let ladder: Vec<_> = request
+            .options
+            .iter()
+            .filter(|option| option.group.as_ref().and_then(|group| group.resource) == Some(0))
+            .map(|option| {
+                reach(
+                    &request
+                        .option_rule(&option.id, PermissionLifetime::Conversation)
+                        .unwrap(),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            ladder,
+            [
+                [true, false, false],
+                [true, true, false],
+                [true, true, true]
+            ]
         );
     }
 
@@ -1403,6 +1700,7 @@ mod learned_scope_tests {
         let coverage = (change == "covered").then(|| ResourceCoverage {
             origin: RuleOrigin::Conversation,
             authority: COVERED_REASON.into(),
+            asks: false,
         });
         request.add_pattern_candidates(&learned_candidates().into(), &[coverage]);
         assert!(
@@ -1422,24 +1720,23 @@ mod learned_scope_tests {
         let mut definition = template_definition(option);
         definition.slots[0].domain = domain;
         definition.combinations = SlotCombinations::Independent;
-        let rows = vec![Some(PermissionRowGrant::Pattern {
-            option_id: option.id.clone(),
-            definition: Box::new(definition.clone()),
-        })];
-        let reviewed = request
-            .composed_rules(&rows, &PermissionLifetime::Conversation)
-            .unwrap();
+        let row = |definition| {
+            [Some(ComposedRow {
+                grant: PermissionRowGrant::Pattern {
+                    option_id: option.id.clone(),
+                    definition: Box::new(definition),
+                },
+                lifetime: PermissionLifetime::Conversation,
+            })]
+        };
+        let reviewed = request.composed_rules(&row(definition.clone())).unwrap();
         assert!(permission_rule_covers_request(
             &reviewed[0],
             &prepared(observation(UNOBSERVED_PACKAGE))
         ));
         definition.context.path_binding = "/other".into();
-        let changed = vec![Some(PermissionRowGrant::Pattern {
-            option_id: option.id.clone(),
-            definition: Box::new(definition),
-        })];
         assert_eq!(
-            request.composed_rules(&changed, &PermissionLifetime::Conversation),
+            request.composed_rules(&row(definition)),
             Err(ComposedAnswerError::TemplateNotOffered)
         );
     }
@@ -1527,7 +1824,7 @@ mod learned_scope_tests {
 #[cfg(test)]
 mod browse_tests {
     use super::{
-        BROWSE_NAMES_LABEL, BROWSE_OPTION_ID, BROWSE_SUBTREE_OPTION_ID, LIST_NAMES_LABEL,
+        BROWSE_NAMES_LABEL, BROWSE_OPTION_ID, BROWSE_SUBTREE_OPTION_ID, EXACT_FOLDER_LABEL,
         rule_options,
     };
     use crate::permissions::structured::tests::{
@@ -1724,12 +2021,12 @@ mod browse_tests {
             assert_eq!(
                 option.label,
                 if direct {
-                    LIST_NAMES_LABEL
+                    EXACT_FOLDER_LABEL
                 } else {
                     BROWSE_NAMES_LABEL
                 }
             );
-            assert!(!option.is_default);
+            assert_eq!(option.is_default, direct || recursion == BROWSE_RECURSIVE);
             assert!(permission_rule_covers_request(&option.rule, &request));
             let stored = request
                 .option_rule(&option.id, PermissionLifetime::Conversation)
@@ -1793,6 +2090,7 @@ mod tests {
 
     use std::sync::Arc;
 
+    use super::{COMMAND_PATTERNS_LABEL, EXACT_COMMAND_LABEL, EXACT_COMMANDS_LABEL};
     use crate::tools::PermissionScopes;
     use serde_json::json;
 
@@ -1801,8 +2099,8 @@ mod tests {
     use crate::permissions::structured::tests::{
         EXPECT_SUBTREE_OPTION, PROJECT_ROOT_MARK, PROJECT_RUNG, PROTECTED_PATH, READ_CONTRACT,
         SOURCE_FILE, SUBTREE_OPTION, caution_of, command_resource, default_remote_identity,
-        explicit_request, ladder_values, read_subtree_rule, remote_request_resource,
-        subtree_ladder, url_ladder, webfetch_request, workcell_request,
+        explicit_request, ladder_values, protected_command_resource, read_subtree_rule,
+        remote_request_resource, subtree_ladder, url_ladder, webfetch_request, workcell_request,
     };
     use crate::permissions::structured::{
         EXACT_COMMAND_CHIP, GIT_METADATA_DIR, MAX_URL_LADDER_RUNGS, NATIVE_OWNER,
@@ -1810,8 +2108,8 @@ mod tests {
         PermissionCapabilityFamily, PermissionCaution, PermissionExecutorKind, PermissionIntent,
         PermissionLifetime, PermissionRequest, PermissionResource, PermissionResourceAccess,
         PermissionResourceKind, PermissionResourceSelector, PermissionRisk, PermissionSubject,
-        StructuredPermissionEffect, URL_ORIGIN_OPTION_ID, WORKCELL_OWNER, canonical_json,
-        exact_resource_constraints, permission_rule_covers_request,
+        StructuredPermissionEffect, URL_ORIGIN_OPTION_ID, URL_SUBTREE_OPTION_ID, WORKCELL_OWNER,
+        canonical_json, exact_resource_constraints, permission_rule_covers_request,
         permission_rule_covers_resource,
     };
     use caudra_config::ToolKey;
@@ -2055,7 +2353,7 @@ mod tests {
             .find(|option| option.id == "allow_command_patterns")
             .unwrap();
 
-        assert_eq!(option.label, "These command patterns in this workdir");
+        assert_eq!(option.label, COMMAND_PATTERNS_LABEL);
         assert_eq!(
             option.description,
             r#"Allow commands matching these patterns in /project: git diff *, git status *. Also allow `printf "%s\n" done` exactly as reviewed."#
@@ -2113,10 +2411,7 @@ mod tests {
             .find(|option| option.id == "allow_command_patterns")
             .unwrap();
 
-        assert_eq!(
-            option.label,
-            "Any `/usr/bin/git diff` command in this workdir"
-        );
+        assert_eq!(option.label, "/usr/bin/git diff *");
         assert!(
             !option.rule.resources[0]
                 .attributes
@@ -2149,7 +2444,7 @@ mod tests {
             .find(|option| option.id == "allow_command_patterns")
             .unwrap();
 
-        assert_eq!(option.label, "Any `git commit` command in this workdir");
+        assert_eq!(option.label, "git commit *");
 
         let next = explicit_request(
             PermissionAuthorityProfile::Shell,
@@ -2172,7 +2467,7 @@ mod tests {
             .find(|option| option.id == "allow_command_patterns")
             .unwrap();
 
-        assert_eq!(option.label, "Any `rg` command in this workdir");
+        assert_eq!(option.label, "rg *");
 
         let next = explicit_request(
             PermissionAuthorityProfile::Shell,
@@ -2233,7 +2528,7 @@ mod tests {
             .find(|option| option.id == "allow_exact_commands")
             .unwrap();
 
-        assert_eq!(option.label, "These commands in this workdir");
+        assert_eq!(option.label, EXACT_COMMANDS_LABEL);
         assert_eq!(
             option.description,
             "Allow `cargo test`, `git status --short` in /project with different timeout or display controls."
@@ -2253,10 +2548,110 @@ mod tests {
             .find(|option| option.id == "allow_exact_commands")
             .unwrap();
 
-        assert_eq!(option.label, "This command in this workdir");
+        assert_eq!(option.label, EXACT_COMMAND_LABEL);
         assert_eq!(
             option.description,
             "Allow `cargo test` in /project with different timeout or display controls."
+        );
+    }
+
+    /// A rung's label is the scope of a sentence, `allow ‹label› for this
+    /// conversation`, naming the workdir only when it is not the project.
+    #[test_case("/project", &["this exact command", "cargo test *"]; "project_root")]
+    #[test_case("/project/crates/core", &["this exact command in crates/core/", "cargo test * in crates/core/"]; "inside_the_project")]
+    #[test_case("/elsewhere", &["this exact command in /elsewhere/", "cargo test * in /elsewhere/"]; "outside_the_project")]
+    fn command_rungs_read_as_scopes(workdir: &str, labels: &[&str]) {
+        let request = explicit_request(
+            PermissionAuthorityProfile::Shell,
+            vec![command_resource("cargo test -p core", workdir)],
+            json!({"command": "cargo test -p core"}),
+        );
+
+        assert_eq!(
+            request
+                .options
+                .iter()
+                .filter(|option| option.group.as_ref().and_then(|group| group.resource) == Some(0))
+                .map(|option| option.label.as_str())
+                .collect::<Vec<_>>(),
+            labels
+        );
+    }
+
+    #[test]
+    fn web_fetch_defaults_to_this_page_and_below() {
+        let request =
+            webfetch_request("https://docs.rs/ratatui/latest/widgets/struct.Paragraph.html");
+
+        assert_eq!(
+            request
+                .options
+                .iter()
+                .filter(|option| option
+                    .group
+                    .as_ref()
+                    .is_some_and(|group| group.key == URL_SUBTREE_OPTION_ID))
+                .map(|option| (option.label.as_str(), option.is_default))
+                .collect::<Vec<_>>(),
+            [
+                ("this page and below", true),
+                ("pages under docs.rs/ratatui/latest/widgets/", false),
+                ("pages under docs.rs/ratatui/latest/", false),
+                ("pages under docs.rs/ratatui/", false),
+                ("any page on docs.rs", false),
+            ]
+        );
+    }
+
+    #[test]
+    fn file_rungs_read_as_scopes_from_the_file_outward() {
+        let request = workcell_request(
+            READ_CONTRACT,
+            PermissionResourceKind::File,
+            PermissionResourceAccess::Read,
+            "/project/src/lib.rs",
+        );
+
+        assert_eq!(
+            request
+                .options
+                .iter()
+                .filter(|option| option
+                    .group
+                    .as_ref()
+                    .is_some_and(|group| group.key == SUBTREE_OPTION))
+                .map(|option| (option.label.as_str(), option.is_default))
+                .collect::<Vec<_>>(),
+            [
+                ("this file", true),
+                ("src/", false),
+                ("this project", false),
+                ("anything under /", false),
+            ]
+        );
+    }
+
+    /// Choices 2 and 3 start on one rung per ladder, so the exact call is the
+    /// default only where the request offers no ladder at all.
+    #[test_case(command_resource("cargo test -p core", "/project"), "command_pattern_0"; "a_command_with_a_prefix")]
+    #[test_case(command_resource("cargo test", "/project"), "command_exact_0"; "a_command_without_a_prefix")]
+    #[test_case(protected_command_resource("cargo test -p core", "/project"), "allow_exact"; "a_protected_line")]
+    fn each_request_starts_on_one_default(resource: PermissionResource, default: &str) {
+        let command = resource.value.clone();
+        let request = explicit_request(
+            PermissionAuthorityProfile::Shell,
+            vec![resource],
+            json!({ "command": command }),
+        );
+
+        assert_eq!(
+            request
+                .options
+                .iter()
+                .filter(|option| option.is_default)
+                .map(|option| option.id.as_str())
+                .collect::<Vec<_>>(),
+            [default]
         );
     }
 

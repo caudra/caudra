@@ -1,6 +1,6 @@
 use super::{
-    PermissionAnswer, PermissionLifetime, PermissionRequest, PermissionSubject, ResourceCoverage,
-    lifetime_name,
+    PermissionAnswer, PermissionLifetime, PermissionRequest, PermissionSubject, PromptReason,
+    ResourceCoverage, lifetime_name,
 };
 use super::{PermissionArgumentConstraint, PermissionResourceKind, PermissionResourceSelector};
 use std::borrow::Cow;
@@ -14,6 +14,9 @@ pub(super) const PERMISSION_LOG_TARGET: &str = "caudra::permission";
 pub(super) const PROMPT_LOG_MAX_RESOURCES: usize = 8;
 
 pub(super) const PROMPT_LOG_MAX_VALUE_CHARS: usize = 200;
+
+/// The `lifetime` of a composed answer whose remembered rows differ.
+pub(super) const MIXED_LIFETIMES: &str = "mixed";
 
 /// Why the request could not be settled from stored authority. Ordered by
 /// precedence: the first that applies is reported.
@@ -158,16 +161,24 @@ pub(super) fn answer_log_fields(
             lifetime_name(lifetime),
         ),
         // The rungs themselves are not named: what matters for grouping is how
-        // much of the request an answer chose to remember.
-        PermissionAnswer::AllowComposed { rows, lifetime } => (
-            "allow_composed",
-            Cow::Owned(format!(
-                "{}/{} rows",
-                rows.iter().filter(|row| row.is_some()).count(),
-                rows.len()
-            )),
-            lifetime_name(lifetime),
-        ),
+        // much of the request an answer chose to remember, and for how long.
+        PermissionAnswer::AllowComposed { rows } => {
+            let mut lifetimes = rows.iter().flatten().map(|row| &row.lifetime);
+            let lifetime = match lifetimes.next() {
+                None => lifetime_name(&PermissionLifetime::Once),
+                Some(first) if lifetimes.all(|lifetime| lifetime == first) => lifetime_name(first),
+                Some(_) => MIXED_LIFETIMES,
+            };
+            (
+                "allow_composed",
+                Cow::Owned(format!(
+                    "{}/{} rows",
+                    rows.iter().filter(|row| row.is_some()).count(),
+                    rows.len()
+                )),
+                lifetime,
+            )
+        }
         PermissionAnswer::Deny => ("deny", none, ""),
         PermissionAnswer::DenyWithGuidance(_) => ("deny_guidance", none, ""),
         PermissionAnswer::DenyAlwaysLocal => ("deny_always_local", none, ""),
@@ -204,22 +215,42 @@ pub(super) fn prompt_forcing_reason(
     }
 }
 
-pub(super) fn prompt_reason_message(
+/// The prompt's reason as typed data. An ask rule is named by the authority
+/// that decided it, so the pattern comes from typed coverage and never from
+/// text a client rendered.
+pub(super) fn prompt_reason(
     request: &PermissionRequest,
     coverage: &[Option<ResourceCoverage>],
     forced: bool,
-    ask_rule: bool,
+    asking: Option<&ResourceCoverage>,
     plan_scoped: bool,
-) -> &'static str {
+) -> PromptReason {
     if plan_scoped {
-        return PROMPT_MESSAGE_PLAN;
+        return PromptReason::Plan;
     }
-    match prompt_forcing_reason(request, coverage, forced, ask_rule) {
-        PROMPT_REASON_FORCED => PROMPT_MESSAGE_FORCED,
-        PROMPT_REASON_PROTECTED => PROMPT_MESSAGE_PROTECTED,
-        PROMPT_REASON_REQUIRES_PROMPT => PROMPT_MESSAGE_REQUIRES_PROMPT,
-        PROMPT_REASON_ASK_RULE => PROMPT_MESSAGE_ASK,
-        _ => PROMPT_MESSAGE_UNCOVERED,
+    match (
+        prompt_forcing_reason(request, coverage, forced, asking.is_some()),
+        asking,
+    ) {
+        (PROMPT_REASON_FORCED, _) => PromptReason::Forced,
+        (PROMPT_REASON_PROTECTED, _) => PromptReason::Protected,
+        (PROMPT_REASON_REQUIRES_PROMPT, _) => PromptReason::RequiresReview,
+        (PROMPT_REASON_ASK_RULE, Some(asking)) => PromptReason::AskRule {
+            origin: asking.origin,
+            pattern: asking.authority.clone(),
+        },
+        _ => PromptReason::Uncovered,
+    }
+}
+
+pub(super) fn prompt_reason_message(reason: &PromptReason) -> &'static str {
+    match reason {
+        PromptReason::Plan => PROMPT_MESSAGE_PLAN,
+        PromptReason::Forced => PROMPT_MESSAGE_FORCED,
+        PromptReason::Protected => PROMPT_MESSAGE_PROTECTED,
+        PromptReason::RequiresReview => PROMPT_MESSAGE_REQUIRES_PROMPT,
+        PromptReason::AskRule { .. } => PROMPT_MESSAGE_ASK,
+        PromptReason::Uncovered => PROMPT_MESSAGE_UNCOVERED,
     }
 }
 
@@ -251,13 +282,13 @@ pub(super) fn uncovered_resource_summary(
 
 #[cfg(test)]
 mod tests {
-    use super::bounded_log_value;
+    use super::{MIXED_LIFETIMES, bounded_log_value};
     use crate::permissions::PermissionResourceKind;
     use std::borrow::Cow;
 
     use test_case::test_case;
 
-    use crate::permissions::tests::{log_coverage, log_request, log_resource};
+    use crate::permissions::tests::{composed_answer, log_coverage, log_request, log_resource};
     use crate::permissions::{
         PROMPT_LOG_MAX_RESOURCES, PROMPT_LOG_MAX_VALUE_CHARS, PermissionAnswer, PermissionLifetime,
         answer_log_fields, uncovered_resource_summary,
@@ -363,6 +394,24 @@ mod tests {
         assert_eq!(
             answer_log_fields(&answer),
             ("allow_option", Cow::Borrowed("allow_subtree"), "project")
+        );
+    }
+
+    #[test_case(&[None, None], "0/2 rows", "once"; "nothing_remembered")]
+    #[test_case(&[Some(PermissionLifetime::Project), None], "1/2 rows", "project"; "one_lifetime")]
+    #[test_case(&[Some(PermissionLifetime::Project), Some(PermissionLifetime::Conversation)], "2/2 rows", MIXED_LIFETIMES; "rows_that_differ")]
+    fn answer_log_fields_report_how_long_a_composed_answer_lasts(
+        lifetimes: &[Option<PermissionLifetime>],
+        expected_rows: &str,
+        expected_lifetime: &str,
+    ) {
+        assert_eq!(
+            answer_log_fields(&composed_answer(lifetimes)),
+            (
+                "allow_composed",
+                Cow::Borrowed(expected_rows),
+                expected_lifetime
+            )
         );
     }
 }

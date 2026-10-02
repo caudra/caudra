@@ -36,8 +36,8 @@ use super::controls::{
     DOMAIN_COUNT, TemplateStructureEdit, domain_for_mode, domain_index, propose_structure,
 };
 use super::model::{
-    ScopeActivity, ScopeModel, ScopeSource, access_name, effect_name, lifetime_name, literal,
-    resource_kind, safe,
+    FIXED_VALUE, ScopeActivity, ScopeModel, ScopeSource, access_name, effect_name, lifetime_name,
+    literal, resource_kind, safe,
 };
 use super::pattern::{PATTERN_CHIP_ROWS, PatternControl, PatternPanel};
 use super::view::ScopeView;
@@ -51,7 +51,7 @@ const FIELD_GAP: u16 = 1;
 const FORM_CHROME_ROWS: u16 = 6;
 const CHANGE_CHROME_ROWS: u16 = 3;
 const UNPROTECTED_ONLY: &str = "Unprotected only";
-const PROTECTION_LABEL: &str = "ALL OF protection";
+const PROTECTION_LABEL: &str = "Protection";
 const NEEDS_PREVIEW: &str = "Not validated · Preview before Save";
 const EMPTY_TARGETS: &str =
     "No target configured; not unrestricted. Add a target or explicitly choose unrestricted.";
@@ -1314,7 +1314,7 @@ impl ScopeEditor {
                     self.field.set_text(&text);
                     self.editing = Some(control);
                 } else {
-                    self.status = "Read-only in this mode. Preserved opaque values require an explicit replacement; host-derived facts require analysis.".into();
+                    self.status = "Read-only in this mode. A fixed value Caudra can't show needs an explicit replacement; values Caudra derives need analysis.".into();
                 }
             }
         }
@@ -1323,7 +1323,7 @@ impl ScopeEditor {
 
     fn cycle_selector(&mut self, control: Control) {
         let Some(capability) = self.capability() else {
-            self.status = "Select a registered target to see supported match modes. Opaque constraints remain unchanged.".into();
+            self.status = "Select a registered target to see supported match modes. Fixed values stay unchanged.".into();
             return;
         };
         let mut modes = match &control {
@@ -1640,7 +1640,7 @@ impl ScopeEditor {
                     "Selected target",
                     match &self.draft.resources {
                         ResourcesDraft::Constrained(resources) => {
-                            format!("{} / {} · ANY OF", self.target + 1, resources.len())
+                            format!("{} / {} · any of", self.target + 1, resources.len())
                         }
                         ResourcesDraft::Unrestricted => "Explicitly UNRESTRICTED".into(),
                         _ => EMPTY_TARGETS.into(),
@@ -1660,7 +1660,7 @@ impl ScopeEditor {
                                 || "Structure / unrestricted".into(),
                                 |text| literal(&text),
                             ),
-                            _ => "Opaque · choose a replacement mode, not a review label".into(),
+                            _ => format!("{FIXED_VALUE} · choose a mode to replace it"),
                         },
                     );
                     if self.capability().is_some_and(|capability| {
@@ -1680,7 +1680,7 @@ impl ScopeEditor {
                     }
                     add(
                         Control::Access,
-                        "ALL OF access",
+                        "Access",
                         match &resource.access {
                             GuardDraft::Unconfigured => "Not configured",
                             GuardDraft::Any => access_name(None),
@@ -1714,12 +1714,12 @@ impl ScopeEditor {
                                     |text| literal(&text),
                                 )
                             } else {
-                                "Opaque · preserved".into()
+                                format!("{FIXED_VALUE} · kept")
                             },
                         );
                         add(
                             Control::RemoveGuard(name.clone()),
-                            "Remove guard",
+                            "Remove condition",
                             safe(name),
                         );
                     }
@@ -1729,7 +1729,7 @@ impl ScopeEditor {
                             .keys()
                             .filter(|name| !resource.attributes.contains_key(*name))
                         {
-                            add(Control::AddGuard(name.clone()), "Add guard", safe(name));
+                            add(Control::AddGuard(name.clone()), "Add condition", safe(name));
                         }
                     }
                     add(
@@ -1762,7 +1762,7 @@ impl ScopeEditor {
                         ArgumentsDraft::Selected { .. } => "Selected JSON pointers",
                         ArgumentsDraft::Unconstrained => "UNCONSTRAINED",
                         ArgumentsDraft::PreserveCoupled => "Explicitly preserve old input pin",
-                        ArgumentsDraft::Preserve => "Preserve opaque constraint",
+                        ArgumentsDraft::Preserve => "Keep the fixed value",
                         ArgumentsDraft::Unconfigured => "Not configured",
                     }
                     .into(),
@@ -1886,10 +1886,9 @@ impl ScopeEditor {
                     add(
                         Control::StructureLiteral,
                         "Fixed replacement",
-                        self.structure_literal.as_deref().map_or_else(
-                            || "Unset · no review preimage is assumed".into(),
-                            literal,
-                        ),
+                        self.structure_literal
+                            .as_deref()
+                            .map_or_else(|| "Unset · no value is assumed".into(), literal),
                     );
                     add(
                         Control::RemoveSlot,
@@ -4043,7 +4042,7 @@ mod tests {
                 let navigation: String = (buffer.area.x..buffer.area.right())
                     .map(|x| buffer[(x, pane.y - 2)].symbol())
                     .collect();
-                assert!(navigation.contains(&format!("Predicate {}/{}", index + 1, count)));
+                assert!(navigation.contains(&format!("Detail {}/{}", index + 1, count)));
                 let label_y = pane.y - 1;
                 let label: String = (buffer.area.x..buffer.area.right())
                     .map(|x| buffer[(x, label_y)].symbol())

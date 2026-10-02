@@ -517,7 +517,7 @@ Redaction is best effort. Decision context can include commands, task text, tool
 | Feature | Default | Supported modes | Behavior beyond shadow |
 |---------|---------|-----------------|------------------------|
 | `permission_advice` | `off` | `off`, `shadow`, `advise` | Add warnings to an existing permission prompt without delaying the answer. |
-| `auto_screening` | `off` | `off`, `shadow`, `enforce` | Escalate an eligible Auto call to a prompt on a flag or engine failure. No answer channel means denial. |
+| `auto_screening` | `off` | `off`, `shadow`, `enforce` | Escalate an eligible Auto call to a prompt on a flag or engine failure. Only `enforce` lets Auto run scripts and other lines that cannot be checked command by command. No answer channel means denial. |
 | `shell_effect` | `off` | `off`, `shadow`, `advise` | Warn about possible project writes during Plan review only when `shell_writes` is configured. Never establish read-only authority. |
 | `content_screening` | `off` | `off`, `shadow`, `advise` | Add caution to flagged web/MCP output and tighten upload/credential Auto screening for the session. Content remains available. |
 | `shell_duration` | `off` | `off`, `shadow`, `advise`, `enforce` | Advise with local shell estimates. Enforce may fill an omitted timeout and select delivery at admission. Explicit timeouts stay unchanged. See [shell duration](#shell-duration). |

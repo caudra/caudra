@@ -883,8 +883,10 @@ version = 1
 # Type: string.
 # permission_advice = "off"
 
-# Escalate an eligible Auto call to a prompt on a flag or engine failure. No
-# answer channel means denial. Modes: off, shadow, enforce.
+# Escalate an eligible Auto call to a prompt on a flag or engine failure. Only
+# `enforce` lets Auto run scripts and other lines that cannot be checked
+# command by command. No answer channel means denial. Modes: off, shadow,
+# enforce.
 # Type: string.
 # auto_screening = "off"
 

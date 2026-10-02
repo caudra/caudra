@@ -18,11 +18,13 @@ use caudra_workbench::text_field::{FieldKind, TextField, TextKey};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const NO_MATCHES: &str = "No matches";
+const LABEL_INDENT: &str = "  ";
 const MIN_WIDTH_PERCENT: u16 = 65;
 const MAX_HEIGHT_PERCENT: u16 = 80;
 const SEARCH_ROW: u16 = 1;
@@ -48,6 +50,11 @@ pub trait PickerItem {
         None
     }
     fn badge(&self) -> Option<&str> {
+        None
+    }
+    /// How many leading characters of the label draw in their own style, as a
+    /// coloured status word does. Selected and disabled rows ignore it.
+    fn lead(&self) -> Option<(usize, Style)> {
         None
     }
     fn section(&self) -> Option<&str> {
@@ -1008,7 +1015,11 @@ fn detail_row(label: &str, detail: &str, trailing_gap: usize, width: u16) -> Det
     let room = usize::from(width)
         .saturating_sub(trailing_gap + usize::from(DETAIL_RIGHT_PAD) + LABEL_DETAIL_GAP);
     let floor = LABEL_MIN_COLS.min(room);
-    let label = truncate_label(label, room.saturating_sub(detail.width()).max(floor));
+    let label = truncate_label(
+        label,
+        room.saturating_sub(detail.width() + LABEL_DETAIL_GAP)
+            .max(floor),
+    );
     let detail = truncate_label(
         detail,
         room.saturating_sub(label.width() + LABEL_DETAIL_GAP),
@@ -1026,6 +1037,29 @@ fn badge_row(label: &str, detail: &str, trailing_gap: usize, width: u16) -> Deta
     );
     let pad = room.saturating_sub(label.width() + detail.width());
     DetailRow { label, detail, pad }
+}
+
+/// An indented, possibly truncated label as spans, its lead in the lead's
+/// style over the row's.
+fn label_spans(label: String, lead: Option<(usize, Style)>, style: Style) -> Vec<Span<'static>> {
+    let Some((chars, lead_style)) = lead else {
+        return vec![Span::styled(label, style)];
+    };
+    let boundary = |chars: usize| {
+        label
+            .char_indices()
+            .nth(chars)
+            .map_or(label.len(), |(index, _)| index)
+    };
+    let (start, end) = (
+        boundary(LABEL_INDENT.len()),
+        boundary(LABEL_INDENT.len() + chars),
+    );
+    vec![
+        Span::styled(label[..start].to_owned(), style),
+        Span::styled(label[start..end].to_owned(), style.patch(lead_style)),
+        Span::styled(label[end..].to_owned(), style),
+    ]
 }
 
 pub(super) fn truncate_label(label: &str, max_width: usize) -> String {
@@ -1136,7 +1170,8 @@ fn render_list<T: PickerItem>(
             };
             Span::styled(sym, sty)
         });
-        let label = format!("  {}", item.label());
+        let lead = item.lead().filter(|_| i != selected && !item.is_disabled());
+        let label = format!("{LABEL_INDENT}{}", item.label());
         let suffix = item.suffix();
         let detail: Option<&str> = if item.is_spinning() {
             Some(spinner_str(animation_elapsed_ms()))
@@ -1162,7 +1197,7 @@ fn render_list<T: PickerItem>(
                 if let Some(cb) = checkbox {
                     spans.push(cb);
                 }
-                spans.push(Span::styled(row.label, style));
+                spans.extend(label_spans(row.label, lead, style));
                 if let Some(s) = suffix {
                     spans.push(Span::styled(" ".repeat(suffix_gap), style));
                     spans.push(Span::styled(s.to_string(), theme::dim_style(style, 0.4)));
@@ -1177,7 +1212,7 @@ fn render_list<T: PickerItem>(
                 if let Some(cb) = checkbox {
                     spans.push(cb);
                 }
-                spans.push(Span::styled(label, style));
+                spans.extend(label_spans(label, lead, style));
                 if let Some(s) = suffix {
                     spans.push(Span::styled(" ".repeat(suffix_gap), style));
                     spans.push(Span::styled(s.to_string(), theme::dim_style(style, 0.4)));
@@ -1237,6 +1272,8 @@ mod tests {
     const DETAIL_GIVES_UP_ITS_TAIL: &str = "a detail too long for the row is cut";
     const LABEL_KEEPS_ITS_BLANK: &str = "a label and a detail never run together";
     const LABEL_KEEPS_ITS_FLOOR: &str = "a label keeps its floor whatever the detail costs";
+    const DETAIL_SURVIVES: &str = "a label cut above its floor leaves a fitting detail whole";
+    const LABEL_GIVES_UP_ITS_TAIL: &str = "a label too long for the row is cut";
 
     fn ready_state<T>(p: &ListPicker<T>) -> &State<T> {
         p.state.as_ref().expect("expected open state")
@@ -2049,6 +2086,20 @@ mod tests {
         assert!(row.detail.ends_with(ELLIPSIS), "{DETAIL_GIVES_UP_ITS_TAIL}");
         assert!(row.pad >= LABEL_DETAIL_GAP, "{LABEL_KEEPS_ITS_BLANK}");
         assert!(end_column(&row, 0) <= usize::from(ROW_WIDTH), "{ROW_FITS}");
+    }
+
+    /// A long label pays for the blank before the detail too: a rule's
+    /// `this conversation  you` once lost its last letter beside a long
+    /// command.
+    #[test]
+    fn a_cut_label_pays_for_the_blank_before_its_detail() {
+        let long = "  ".to_string() + "x".repeat(60).as_str();
+
+        let row = detail_row(&long, SHORT_DETAIL, 0, ROW_WIDTH);
+
+        assert_eq!(row.detail, SHORT_DETAIL, "{DETAIL_SURVIVES}");
+        assert!(row.label.ends_with(ELLIPSIS), "{LABEL_GIVES_UP_ITS_TAIL}");
+        assert!(row.pad >= LABEL_DETAIL_GAP, "{LABEL_KEEPS_ITS_BLANK}");
     }
 
     /// A label past the floor is cut, because the detail cannot pay for more
