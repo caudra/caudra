@@ -9,7 +9,9 @@ use std::time::Duration;
 
 use crate::{
     components::{
-        code_view::{RowTarget, WrappedRows, body_window, plain_body, truncation_line},
+        code_view::{
+            RowTarget, WrappedRows, body_window, highlighted_body, plain_body, truncation_line,
+        },
         escape_terminal_controls, format_compact,
         tool_display::task_details,
     },
@@ -23,24 +25,53 @@ const SEPARATOR: &str = " · ";
 const BACKGROUND_BADGE: &str = " [background]";
 const OPEN_CHAT: &str = " · open chat";
 pub(crate) const COMMAND_LABEL: &str = "Command";
+/// The most text [`literal_code`] colours. Colouring is a parse on the UI
+/// thread at about 4-5 µs a byte, so longer text is drawn plain rather than
+/// stalling the frame that first shows it.
+const MAX_HIGHLIGHTED_BYTES: usize = 8 * 1024;
 
 pub(crate) fn is_shell_delivery(origin: &TaskEventOrigin, text: &str) -> bool {
     text.starts_with(&format!("Shell {}:", origin.task_id))
 }
 
 pub(crate) fn literal_body(text: &str, width: u16) -> (Vec<Line<'static>>, LinkMap) {
-    let text = text
-        .lines()
-        .map(escape_terminal_controls)
-        .collect::<Vec<_>>()
-        .join("\n");
-    let (mut lines, _) = plain_body(&text, width.saturating_sub(INDENT.len() as u16).max(1));
-    for line in &mut lines {
-        line.style = theme::current().tool;
-        line.spans.insert(0, Span::raw(INDENT));
-    }
+    let (lines, _) = plain_body(&escaped(text), body_width(width));
+    let lines = indented(lines);
     let links = LinkMap::none_for(&lines);
     (lines, links)
+}
+
+/// [`literal_body`] coloured as `language`, or plain past
+/// [`MAX_HIGHLIGHTED_BYTES`].
+pub(crate) fn literal_code(text: &str, language: &str, width: u16) -> Vec<Line<'static>> {
+    let body = escaped(text);
+    let width = body_width(width);
+    let lines = if text.len() > MAX_HIGHLIGHTED_BYTES {
+        plain_body(&body, width).0
+    } else {
+        highlighted_body(&body, language, width)
+    };
+    indented(lines)
+}
+
+fn escaped(text: &str) -> String {
+    text.lines()
+        .map(escape_terminal_controls)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn body_width(width: u16) -> u16 {
+    width.saturating_sub(INDENT.len() as u16).max(1)
+}
+
+fn indented(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    let style = theme::current().tool;
+    for line in &mut lines {
+        line.style = style;
+        line.spans.insert(0, Span::raw(INDENT));
+    }
+    lines
 }
 
 pub(crate) fn details(task: &TaskCard, width: u16) -> (Vec<Line<'static>>, LinkMap) {
@@ -89,15 +120,10 @@ fn repeats_script(command: &str, script: Option<&str>) -> bool {
 }
 
 pub(crate) fn markdown_body(text: &str, width: u16) -> (Vec<Line<'static>>, LinkMap) {
-    let escaped = text
-        .lines()
-        .map(escape_terminal_controls)
-        .collect::<Vec<_>>()
-        .join("\n");
     let (mut painted, _) = text_to_wrapped(
-        &escaped,
+        &escaped(text),
         theme::current().assistant,
-        width.saturating_sub(INDENT.len() as u16).max(1),
+        body_width(width),
         caudra_markdown::render::TOOL_OUTPUT_MAX_LINE_BYTES,
     );
     for (line, links) in painted.lines.iter_mut().zip(&mut painted.links.rows) {
@@ -374,14 +400,19 @@ pub(crate) fn has_active(output: &ToolOutput) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{BACKGROUND_BADGE, COMMAND_LABEL, OPEN_CHAT, delivery, markdown_body, render};
+    use super::{
+        BACKGROUND_BADGE, COMMAND_LABEL, MAX_HIGHLIGHTED_BYTES, OPEN_CHAT, delivery, literal_body,
+        literal_code, markdown_body, render,
+    };
     use crate::chat::history_to_display;
     use crate::components::{DisplayRole, code_view::RowTarget};
+    use crate::theme;
     use caudra_agent::{History, TaskCard};
     use caudra_providers::{Message, TaskEventOrigin};
     use caudra_storage::background::{JobKind, ShellJobMetadata};
     use ratatui::{style::Modifier, text::Line};
     use serde_json::{Value, json};
+    use std::collections::HashSet;
     use std::slice;
     use test_case::test_case;
 
@@ -397,6 +428,14 @@ mod tests {
     const OTHER_SCRIPT: &str = "printf other";
     const RUNNING: &str = "running";
     const TIMEOUT_MS: u64 = 1_200_000;
+    const SHELL: &str = "bash";
+    const COLOUR_THEME: &str = "dracula";
+    const NARROW_WIDTH: u16 = 24;
+    const WIDE_WIDTH: u16 = 120;
+    const COLOURED_COMMAND: &str = "echo \"done\" | grep -c done > out.txt";
+    const SAME_TEXT: &str = "colouring changes neither the text nor where it breaks";
+    const COLOURED: &str = "a command within the budget is coloured";
+    const PLAIN: &str = "a command past the budget is drawn plain";
 
     fn text(lines: &[Line<'_>]) -> String {
         lines
@@ -656,6 +695,38 @@ mod tests {
             assert_eq!(shown.matches(identity).count(), 1, "{shown}");
         }
         assert!(links.is_aligned(&lines));
+    }
+
+    #[test_case("cargo test"; "one_line")]
+    #[test_case("cat <<'EOF' > notes.txt\nfirst \"line\"\nEOF"; "heredoc")]
+    #[test_case("printf '\u{1b}[31mred\u{7}'"; "terminal_controls")]
+    #[test_case(SHELL_COMMAND; "wrapped_long_line")]
+    fn literal_code_draws_the_rows_literal_body_draws(command: &str) {
+        let (plain, _) = literal_body(command, NARROW_WIDTH);
+        assert_eq!(
+            text(&literal_code(command, SHELL, NARROW_WIDTH)),
+            text(&plain),
+            "{SAME_TEXT}"
+        );
+    }
+
+    #[test_case(false; "within_budget")]
+    #[test_case(true; "past_budget")]
+    fn literal_code_colours_only_what_its_budget_covers(past_budget: bool) {
+        theme::set(theme::load_by_name(COLOUR_THEME).unwrap());
+        let command = match past_budget {
+            true => format!("{COLOURED_COMMAND}\n{}", "#".repeat(MAX_HIGHLIGHTED_BYTES)),
+            false => COLOURED_COMMAND.to_owned(),
+        };
+        let colours: HashSet<_> = literal_code(&command, SHELL, WIDE_WIDTH)
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter_map(|span| span.style.fg)
+            .collect();
+        match past_budget {
+            true => assert!(colours.is_empty(), "{PLAIN}"),
+            false => assert!(colours.len() > 1, "{COLOURED}"),
+        }
     }
 
     #[test_case(false; "without_script")]

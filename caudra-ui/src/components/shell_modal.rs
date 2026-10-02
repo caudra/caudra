@@ -6,6 +6,7 @@
 //! rebuilt only when those change. Output is shown as the command wrote it,
 //! with terminal controls escaped and no Markdown.
 
+use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -14,6 +15,7 @@ use std::time::Duration;
 use caudra_agent::background::{ShellLive, ShellOutputView, ShellSnapshot, ShellView};
 use caudra_agent::{ShellOutput, SnapshotLine, TaskCard, ToolOutput, format_settled_duration};
 use caudra_grab::grab_scope;
+use caudra_highlight::Highlighter;
 use caudra_storage::auth::now_millis;
 use caudra_storage::background::{JobKind, JobOwner};
 use caudra_storage::now_epoch;
@@ -24,12 +26,12 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::components::code_view::WrappedRows;
+use crate::components::code_view::{WrappedRows, highlight_spans};
 use crate::components::keybindings::{Bind, key};
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::components::modal::Modal;
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
-use crate::components::task_card::{self, fact, literal_body, status_style};
+use crate::components::task_card::{self, fact, literal_body, literal_code, status_style};
 use crate::components::{
     Hint, HintBar, ModalScroll, Overlay, escape_terminal_controls, format_elapsed,
 };
@@ -37,6 +39,11 @@ use crate::repaint::{Cadence, Dirty, Watch};
 use crate::theme;
 
 const TITLE: &str = " Shell ";
+const SHELL_LANGUAGE: &str = "bash";
+/// The most of a row's label that is coloured. A row draws one line cut to the
+/// modal's width, so only its head is parsed, and the rest keeps the row's
+/// style.
+const MAX_HIGHLIGHTED_LABEL_BYTES: usize = 256;
 const MAX_VISIBLE: u16 = 15;
 const WIDTH_PERCENT: u16 = 85;
 const MAX_HEIGHT_PERCENT: u16 = 80;
@@ -143,6 +150,10 @@ pub struct ShellItem {
     search: String,
     section: Option<&'static str>,
     source: ShellSource,
+    /// The label's colours and the theme generation they were painted for,
+    /// filled the first time the row is drawn so a row never shown is never
+    /// parsed.
+    coloured: RefCell<Option<(u64, Vec<Span<'static>>)>>,
 }
 
 impl ShellItem {
@@ -155,6 +166,7 @@ impl ShellItem {
             search: String::new(),
             section: None,
             source,
+            coloured: RefCell::default(),
         };
         let label = match item.command().lines().next() {
             Some(line) if !line.trim().is_empty() => escape_terminal_controls(line),
@@ -277,6 +289,25 @@ impl PickerItem for ShellItem {
         self.is_background().then_some(BACKGROUND_BADGE)
     }
 
+    /// None for a row named by its id, which stands in for a blank first line
+    /// and is not shell.
+    fn label_colours(&self) -> Option<Vec<Span<'static>>> {
+        if self.label == self.id {
+            return None;
+        }
+        let generation = theme::generation();
+        let mut coloured = self.coloured.borrow_mut();
+        if coloured
+            .as_ref()
+            .is_none_or(|(painted, _)| *painted != generation)
+        {
+            let head = &self.label[..self.label.floor_char_boundary(MAX_HIGHLIGHTED_LABEL_BYTES)];
+            let spans = highlight_spans(&mut Highlighter::for_token(SHELL_LANGUAGE), head);
+            *coloured = Some((generation, spans));
+        }
+        coloured.as_ref().map(|(_, spans)| spans.clone())
+    }
+
     fn section(&self) -> Option<&str> {
         self.section
     }
@@ -289,10 +320,31 @@ impl PickerItem for ShellItem {
 /// One execution's details, in place of the list until Escape.
 struct DetailsPage {
     id: String,
+    command: CommandRows,
     scroll: ModalScroll,
     scrollbar: Scrollbar,
     hints: HintBar,
     popup: Rect,
+}
+
+/// A command's coloured rows, kept for the width and theme they were painted
+/// for. The command never changes, but its page is drawn on every frame,
+/// including one for each change to the output below it.
+#[derive(Default)]
+struct CommandRows {
+    key: Option<(u16, u64)>,
+    lines: Vec<Line<'static>>,
+}
+
+impl CommandRows {
+    fn rows(&mut self, command: &str, width: u16) -> &[Line<'static>] {
+        let key = (width, theme::generation());
+        if self.key != Some(key) {
+            self.lines = literal_code(command, SHELL_LANGUAGE, width);
+            self.key = Some(key);
+        }
+        &self.lines
+    }
 }
 
 pub struct ShellModal {
@@ -491,7 +543,8 @@ impl ShellModal {
         };
         let width = Modal::inner_width(area.width, WIDTH_PERCENT).saturating_sub(H_PAD * 2);
         let header = header_lines(item, width);
-        let mut body = body_lines(item, live.get().map(Vec::as_slice), width);
+        let command = page.command.rows(item.command(), width);
+        let mut body = body_lines(item, command, live.get().map(Vec::as_slice), width);
         if body.len() > MAX_BODY_ROWS {
             body.drain(..body.len() - MAX_BODY_ROWS);
         }
@@ -564,6 +617,7 @@ impl ShellModal {
         };
         self.page = Some(DetailsPage {
             id,
+            command: CommandRows::default(),
             scroll,
             scrollbar: Scrollbar::default(),
             hints: HintBar::default(),
@@ -807,9 +861,14 @@ fn exit_fact(shell: &ShellOutput, state: &str) -> Option<Line<'static>> {
     (!parts.is_empty()).then(|| fact(EXIT_LABEL, &parts.join(SEPARATOR), status_style(state)))
 }
 
-fn body_lines(item: &ShellItem, live: Option<&[SnapshotLine]>, width: u16) -> Vec<Line<'static>> {
+fn body_lines(
+    item: &ShellItem,
+    command: &[Line<'static>],
+    live: Option<&[SnapshotLine]>,
+    width: u16,
+) -> Vec<Line<'static>> {
     let mut lines = vec![heading(COMMAND_HEADING)];
-    lines.extend(literal_body(item.command(), width).0);
+    lines.extend_from_slice(command);
     if matches!(&item.source, ShellSource::Foreground(view) if view.record.command_truncated) {
         lines.push(notice(COMMAND_CUT));
     }
@@ -919,7 +978,10 @@ mod tests {
     use super::*;
     use crate::components::key as key_event;
     use caudra_storage::shell_history::{ShellExecutionRecord, ShellExecutionState};
+    use ratatui::buffer::Buffer;
+    use ratatui::style::Color;
     use ratatui::{Terminal, backend::TestBackend};
+    use std::collections::HashSet;
     use test_case::test_case;
 
     const FIRST_ID: &str = "exec-first";
@@ -939,6 +1001,17 @@ mod tests {
     const RAW_OUTPUT: &str = "**bold** \u{1b}[31mred";
     const MARKDOWN_KEPT: &str = "**bold**";
     const CONTROL_ESCAPED: &str = "\\u{1b}[31mred";
+    /// Wider than the narrow modal's command column, narrower than the wide one's.
+    const COLOURED: &str = "echo \"done\" | grep -c done > out.txt";
+    const COLOURED_TAIL: &str = "out.txt";
+    const NARROW_WIDTH: u16 = 40;
+    const FIRST_THEME: &str = "dracula";
+    const SECOND_THEME: &str = "tokyonight";
+    const NOT_DRAWN: &str = "the text is drawn whole on one row";
+    const NOT_COLOURED: &str = "the command is drawn in more than one colour";
+    const THEME_IGNORED: &str = "a theme switch recolours the command";
+    const NOT_REWRAPPED: &str = "a narrower modal rewraps the command rather than clipping it";
+    const ID_COLOURED: &str = "a row named by its id is not shell and keeps the row's style";
 
     fn record(id: &str, state: ShellExecutionState, created_at_ms: u64) -> ShellExecutionRecord {
         ShellExecutionRecord {
@@ -971,6 +1044,12 @@ mod tests {
             record(id, ShellExecutionState::Running, created_at_ms),
             ShellOutputView::Live(ShellLive::default()),
         )
+    }
+
+    fn finished(command: &str) -> Arc<ShellView> {
+        let mut record = record(FINISHED_ID, ShellExecutionState::Succeeded, STARTED_MS);
+        record.command = command.into();
+        view(record, ShellOutputView::Missing)
     }
 
     fn job(state: &str) -> TaskCard {
@@ -1032,20 +1111,54 @@ mod tests {
         (0..).map_while(|index| modal.picker.item(index)).collect()
     }
 
-    fn paint(modal: &mut ShellModal) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
+    fn draw(modal: &mut ShellModal, width: u16) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, HEIGHT)).unwrap();
         terminal
             .draw(|frame| {
                 modal.view(frame, frame.area());
             })
             .unwrap();
-        terminal
-            .backend()
-            .buffer()
+        terminal.backend().buffer().clone()
+    }
+
+    fn paint(modal: &mut ShellModal) -> String {
+        draw(modal, WIDTH)
             .content
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    /// Where `text` first appears whole on one row.
+    fn locate(buffer: &Buffer, text: &str) -> Option<Position> {
+        let glyphs: Vec<String> = text.chars().map(String::from).collect();
+        let area = buffer.area;
+        (area.top()..area.bottom()).find_map(|y| {
+            let row: Vec<&str> = (area.left()..area.right())
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            row.windows(glyphs.len())
+                .position(|cells| cells == glyphs.as_slice())
+                .map(|x| Position::new(area.left() + x as u16, y))
+        })
+    }
+
+    /// The colours of the cells that spell `text` where it first appears.
+    fn colours_of(buffer: &Buffer, text: &str) -> Vec<Color> {
+        let at = locate(buffer, text).expect(NOT_DRAWN);
+        (at.x..at.x + text.chars().count() as u16)
+            .map(|x| buffer[(x, at.y)].fg)
+            .collect()
+    }
+
+    /// The colours `COLOURED` is drawn in once the theme is `name`.
+    fn colours_under(modal: &mut ShellModal, name: &str) -> Vec<Color> {
+        theme::set(theme::load_by_name(name).unwrap());
+        colours_of(&draw(modal, WIDTH), COLOURED)
+    }
+
+    fn distinct(colours: &[Color]) -> usize {
+        colours.iter().collect::<HashSet<_>>().len()
     }
 
     #[test]
@@ -1215,5 +1328,59 @@ mod tests {
         let _ = modal.handle_key(key_event(KeyCode::Esc));
         assert!(!modal.is_open());
         assert_eq!(modal.selected_id(), None);
+    }
+
+    /// The coloured row is the second, below the selection. Each paint is kept
+    /// for the theme it was made under, so a cache that ignored the theme would
+    /// draw the first palette again.
+    #[test]
+    fn a_theme_switch_recolours_the_command_in_its_row_and_on_its_page() {
+        let mut modal = opened(
+            vec![running(FIRST_ID, STARTED_MS), finished(COLOURED)],
+            Vec::new(),
+        );
+        let row = colours_under(&mut modal, FIRST_THEME);
+        assert!(distinct(&row) > 1, "{NOT_COLOURED}");
+        assert_ne!(
+            colours_under(&mut modal, SECOND_THEME),
+            row,
+            "{THEME_IGNORED}"
+        );
+
+        assert!(modal.show(FINISHED_ID).is_some());
+        let page = colours_under(&mut modal, FIRST_THEME);
+        assert!(distinct(&page) > 1, "{NOT_COLOURED}");
+        assert_ne!(
+            colours_under(&mut modal, SECOND_THEME),
+            page,
+            "{THEME_IGNORED}"
+        );
+    }
+
+    /// The page is painted wide first. Rows kept from then would run past the
+    /// narrower border and lose the command's tail.
+    #[test]
+    fn a_narrower_modal_rewraps_the_command() {
+        let mut modal = opened(vec![finished(COLOURED)], Vec::new());
+        let _ = modal.handle_key(key_event(KeyCode::Enter));
+        assert!(
+            locate(&draw(&mut modal, WIDTH), COLOURED).is_some(),
+            "{NOT_DRAWN}"
+        );
+        assert!(
+            locate(&draw(&mut modal, NARROW_WIDTH), COLOURED_TAIL).is_some(),
+            "{NOT_REWRAPPED}"
+        );
+    }
+
+    #[test_case(COLOURED, true; "command")]
+    #[test_case("\nls -la", false; "blank_first_line")]
+    fn only_a_command_line_colours_its_row(command: &str, coloured: bool) {
+        let modal = opened(vec![finished(command)], Vec::new());
+        assert_eq!(
+            rows(&modal)[0].label_colours().is_some(),
+            coloured,
+            "{ID_COLOURED}"
+        );
     }
 }

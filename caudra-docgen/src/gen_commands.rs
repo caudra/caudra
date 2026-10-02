@@ -155,9 +155,9 @@ Commands that reach the main session's turn or history have no task equivalent, 
 
 const SHELLS: &str = r#"## Shell commands
 
-`/shells` opens the shell modal. It lists the `shell` calls that the main agent, subagents, and workflow agents made in this session, in the foreground or the background. Running commands come first, oldest first, and finished ones follow, newest first. Background rows show the same `bg` indicator as tasks. Click the shell count above the input to open the modal on the oldest running command. Commands you run with `!` or `!!` are not listed.
+`/shells` opens the shell modal. It lists the `shell` calls that the main agent, subagents, and workflow agents made in this session, in the foreground or the background. Running commands come first, oldest first, and finished ones follow, newest first. Each row shows the first line of its command, highlighted as shell code. Background rows show the same `bg` indicator as tasks. Click the shell count above the input to open the modal on the oldest running command. Commands you run with `!` or `!!` are not listed.
 
-Press Enter or click a row to see its owner, working directory, timeout, elapsed time, exit status, and output. Output appears as the command wrote it, with terminal control sequences escaped and no Markdown rendering. Output of a running command updates in place. Ordinary letters filter the list. Escape leaves the details, and a second Escape closes the modal without stopping anything.
+Press Enter or click a row to see the whole command with its owner, working directory, timeout, elapsed time, exit status, and output. A command longer than 8 KiB is shown without highlighting. Output appears as the command wrote it, with terminal control sequences escaped and no Markdown rendering. Output of a running command updates in place. Ordinary letters filter the list. Escape leaves the details, and a second Escape closes the modal without stopping anything.
 
 `Ctrl+K` stops the selected running command, from the list or its details. Only that call is cancelled. The row shows `cancelling` until the command settles. Its owner receives an ordinary cancelled result, and the rest of its work continues. Background shell jobs also accept `/tasks cancel <task_id>`. Shell jobs cannot be promoted or resumed.
 

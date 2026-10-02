@@ -165,7 +165,10 @@ pub(super) fn truncation_line(truncated: usize) -> Line<'static> {
     ))
 }
 
-fn highlight_spans(hl: &mut caudra_highlight::Highlighter, text: &str) -> Vec<Span<'static>> {
+pub(super) fn highlight_spans(
+    hl: &mut caudra_highlight::Highlighter,
+    text: &str,
+) -> Vec<Span<'static>> {
     let with_nl = format!("{text}\n");
     highlight_line(hl, &with_nl)
         .into_iter()
@@ -1801,6 +1804,24 @@ pub(super) fn plain_body(text: &str, width: u16) -> (Vec<Line<'static>>, BodySou
             code,
         },
     )
+}
+
+/// [`plain_body`]'s rows coloured as `language`, broken at the same places.
+///
+/// One highlighter runs across every line, so a quote or a heredoc left open
+/// on one line goes on colouring the lines after it.
+pub(super) fn highlighted_body(text: &str, language: &str, width: u16) -> Vec<Line<'static>> {
+    let mut highlighter = caudra_highlight::Highlighter::for_token(language);
+    text.lines()
+        .flat_map(|line| {
+            wrapped_lines(wrap_styled(
+                highlight_spans(&mut highlighter, line),
+                0,
+                "",
+                width,
+            ))
+        })
+        .collect()
 }
 
 /// One piece of a styled row, on the display row the break put it on.

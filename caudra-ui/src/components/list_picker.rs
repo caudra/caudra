@@ -1,5 +1,6 @@
 use std::cmp::Reverse;
 use std::collections::HashMap;
+use std::iter;
 
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
@@ -55,6 +56,12 @@ pub trait PickerItem {
     /// How many leading characters of the label draw in their own style, as a
     /// coloured status word does. Selected and disabled rows ignore it.
     fn lead(&self) -> Option<(usize, Style)> {
+        None
+    }
+    /// The label's own colours, as spans over its text the way highlighted code
+    /// has them. They may stop short of the label, and the rest keeps the row's
+    /// style. Selected and disabled rows ignore them, as they ignore a lead.
+    fn label_colours(&self) -> Option<Vec<Span<'static>>> {
         None
     }
     fn section(&self) -> Option<&str> {
@@ -1062,6 +1069,43 @@ fn label_spans(label: String, lead: Option<(usize, Style)>, style: Style) -> Vec
     ]
 }
 
+/// An indented, possibly truncated label as spans, each colour drawn over the
+/// row's style across the characters that match its text. The rest of the
+/// label, from the first character no colour matches, such as a truncation's
+/// ellipsis, keeps the row's style, so the text drawn is the label as it was
+/// cut.
+fn painted_label(label: String, colours: &[Span<'static>], style: Style) -> Vec<Span<'static>> {
+    let indent = Span::raw(LABEL_INDENT);
+    let mut spans = Vec::with_capacity(colours.len() + 2);
+    let mut at = 0;
+    for colour in iter::once(&indent).chain(colours) {
+        let matched = shared_prefix(&label[at..], &colour.content);
+        if matched > 0 {
+            spans.push(Span::styled(
+                label[at..at + matched].to_owned(),
+                style.patch(colour.style),
+            ));
+            at += matched;
+        }
+        if matched < colour.content.len() {
+            break;
+        }
+    }
+    if at < label.len() {
+        spans.push(Span::styled(label[at..].to_owned(), style));
+    }
+    spans
+}
+
+/// The bytes `text` and `other` open with in common, in whole characters.
+fn shared_prefix(text: &str, other: &str) -> usize {
+    text.chars()
+        .zip(other.chars())
+        .take_while(|(mine, theirs)| mine == theirs)
+        .map(|(mine, _)| mine.len_utf8())
+        .sum()
+}
+
 pub(super) fn truncate_label(label: &str, max_width: usize) -> String {
     if label.width() <= max_width {
         return label.to_string();
@@ -1170,7 +1214,13 @@ fn render_list<T: PickerItem>(
             };
             Span::styled(sym, sty)
         });
-        let lead = item.lead().filter(|_| i != selected && !item.is_disabled());
+        let tinted = i != selected && !item.is_disabled();
+        let lead = item.lead().filter(|_| tinted);
+        let colours = tinted.then(|| item.label_colours()).flatten();
+        let paint_label = |label: String| match &colours {
+            Some(colours) => painted_label(label, colours, style),
+            None => label_spans(label, lead, style),
+        };
         let label = format!("{LABEL_INDENT}{}", item.label());
         let suffix = item.suffix();
         let detail: Option<&str> = if item.is_spinning() {
@@ -1197,7 +1247,7 @@ fn render_list<T: PickerItem>(
                 if let Some(cb) = checkbox {
                     spans.push(cb);
                 }
-                spans.extend(label_spans(row.label, lead, style));
+                spans.extend(paint_label(row.label));
                 if let Some(s) = suffix {
                     spans.push(Span::styled(" ".repeat(suffix_gap), style));
                     spans.push(Span::styled(s.to_string(), theme::dim_style(style, 0.4)));
@@ -1212,7 +1262,7 @@ fn render_list<T: PickerItem>(
                 if let Some(cb) = checkbox {
                     spans.push(cb);
                 }
-                spans.extend(label_spans(label, lead, style));
+                spans.extend(paint_label(label));
                 if let Some(s) = suffix {
                     spans.push(Span::styled(" ".repeat(suffix_gap), style));
                     spans.push(Span::styled(s.to_string(), theme::dim_style(style, 0.4)));
@@ -1243,6 +1293,8 @@ mod tests {
     use crate::components::keybindings::key as kb;
     use caudra_workbench::keys::Bind;
     use crossterm::event::{KeyCode, KeyModifiers};
+    use ratatui::buffer::Buffer;
+    use ratatui::style::Color;
     use test_case::test_case;
 
     const SECTION_A: &str = "A";
@@ -1274,6 +1326,15 @@ mod tests {
     const LABEL_KEEPS_ITS_FLOOR: &str = "a label keeps its floor whatever the detail costs";
     const DETAIL_SURVIVES: &str = "a label cut above its floor leaves a fitting detail whole";
     const LABEL_GIVES_UP_ITS_TAIL: &str = "a label too long for the row is cut";
+    const ROW_COLOUR: Color = Color::White;
+    const FIRST_COLOUR: Color = Color::Red;
+    const SECOND_COLOUR: Color = Color::Blue;
+    const COLOURED_LABEL: &str = "git status";
+    /// Cuts [`COLOURED_LABEL`] inside its second colour.
+    const CUT_LABEL_COLS: usize = 8;
+    const LABEL_COLOURED: &str = "a label's colours paint exactly the characters they match";
+    const OWN_COLOURS_PAINTED: &str = "a row drawn in its own colours paints its label's colours";
+    const MARKED_ROW_PLAIN: &str = "a selected or disabled row draws its label in the row's style";
 
     fn ready_state<T>(p: &ListPicker<T>) -> &State<T> {
         p.state.as_ref().expect("expected open state")
@@ -1292,7 +1353,7 @@ mod tests {
         }
     }
 
-    fn render<T: PickerItem>(picker: &mut ListPicker<T>) {
+    fn render<T: PickerItem>(picker: &mut ListPicker<T>) -> Buffer {
         let backend = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
@@ -1300,6 +1361,7 @@ mod tests {
                 picker.view(frame, frame.area());
             })
             .unwrap();
+        terminal.backend().buffer().clone()
     }
 
     struct Entry {
@@ -2113,5 +2175,86 @@ mod tests {
         assert_eq!(row.label.width(), LABEL_MIN_COLS, "{LABEL_KEEPS_ITS_FLOOR}");
         assert!(row.detail.ends_with(ELLIPSIS), "{DETAIL_GIVES_UP_ITS_TAIL}");
         assert!(end_column(&row, 0) <= usize::from(ROW_WIDTH), "{ROW_FITS}");
+    }
+
+    fn label_colours() -> Vec<Span<'static>> {
+        vec![
+            Span::styled("git", Style::new().fg(FIRST_COLOUR)),
+            Span::styled(" status", Style::new().fg(SECOND_COLOUR)),
+        ]
+    }
+
+    #[test_case(usize::MAX, 2, &[("  ", ROW_COLOUR), ("git", FIRST_COLOUR), (" status", SECOND_COLOUR)]; "whole_label")]
+    #[test_case(CUT_LABEL_COLS, 2, &[("  ", ROW_COLOUR), ("git", FIRST_COLOUR), (" s", SECOND_COLOUR), ("\u{2026}", ROW_COLOUR)]; "truncated_label")]
+    #[test_case(usize::MAX, 1, &[("  ", ROW_COLOUR), ("git", FIRST_COLOUR), (" status", ROW_COLOUR)]; "colours_stop_short")]
+    fn a_painted_label_colours_only_what_its_colours_match(
+        width: usize,
+        colours: usize,
+        expected: &[(&str, Color)],
+    ) {
+        let label = truncate_label(&format!("{LABEL_INDENT}{COLOURED_LABEL}"), width);
+        let painted = painted_label(
+            label,
+            &label_colours()[..colours],
+            Style::new().fg(ROW_COLOUR),
+        );
+        let drawn: Vec<_> = painted
+            .iter()
+            .map(|span| (span.content.as_ref(), span.style.fg))
+            .collect();
+        let expected: Vec<_> = expected
+            .iter()
+            .map(|&(text, colour)| (text, Some(colour)))
+            .collect();
+        assert_eq!(drawn, expected, "{LABEL_COLOURED}");
+    }
+
+    struct ColouredEntry {
+        disabled: bool,
+    }
+
+    impl PickerItem for ColouredEntry {
+        fn label(&self) -> &str {
+            COLOURED_LABEL
+        }
+        fn label_colours(&self) -> Option<Vec<Span<'static>>> {
+            Some(label_colours())
+        }
+        fn is_disabled(&self) -> bool {
+            self.disabled
+        }
+    }
+
+    /// The first row is selected and the last disabled, so only the middle one
+    /// is drawn in its own colours.
+    #[test]
+    fn only_a_row_drawn_in_its_own_colours_paints_its_label() {
+        let mut picker = ListPicker::new();
+        picker.open(
+            [false, false, true]
+                .map(|disabled| ColouredEntry { disabled })
+                .into(),
+            " Test ",
+        );
+        let buffer = render(&mut picker);
+        let rows = &ready_state(&picker).row_hits;
+        let colour = |row: usize, column: usize| {
+            let area = rows[row].area;
+            buffer[(area.x + column as u16, area.y)].fg
+        };
+        let label_start = LABEL_INDENT.len();
+
+        assert_eq!(
+            colour(1, label_start),
+            FIRST_COLOUR,
+            "{OWN_COLOURS_PAINTED}"
+        );
+        for row in [0, 2] {
+            assert_eq!(
+                colour(row, label_start),
+                colour(row, 0),
+                "{MARKED_ROW_PLAIN}"
+            );
+        }
     }
 }
