@@ -1,6 +1,6 @@
 //! Feeds monty's memory counters so `max_memory` holds in-process.
 //!
-//! monty v0.0.21 checks `LIVE_MEMORY - BASELINE_MEMORY` at VM checkpoints,
+//! monty v1.0.0 checks `LIVE_MEMORY - BASELINE_MEMORY` at VM checkpoints,
 //! but something must feed those counters. Upstream feeds them with
 //! `monty-alloc` in a throwaway worker process that dies on a breach. caudra
 //! runs the interpreter in-process, so this allocator does the accounting
@@ -22,19 +22,19 @@
 //! The accounting is approximate: tool results are allocated on other
 //! threads (never charged) yet often freed inside the scope (refunded), so
 //! a large result grants that much unearned headroom. Good enough as a
-//! guardrail against runaway agent code, not a security boundary. Once
-//! monty ships `set_memory_probe` (pydantic/monty#740) the counter becomes
-//! thread-local and the sharing and rebasing go away.
+//! guardrail against runaway agent code, not a security boundary. Monty
+//! v1.0.0 still has no thread-local memory probe override.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
-use std::sync::atomic::AtomicUsize;
+use std::sync::Mutex;
 use std::sync::atomic::Ordering::Relaxed;
 
 use monty_types::{BASELINE_MEMORY, LIVE_MEMORY};
 
 #[global_allocator]
 static ALLOC: CountingAllocator = CountingAllocator;
+static ACTIVE_SCOPES: Mutex<usize> = Mutex::new(0);
 
 thread_local! {
     static IN_SANDBOX: Cell<bool> = const { Cell::new(false) };
@@ -89,26 +89,29 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 }
 
-static ACTIVE_SCOPES: AtomicUsize = AtomicUsize::new(0);
-
 /// Marks the current thread as the interpreter's for the scope's lifetime.
 /// The first live scope rebases the counters so the run starts from zero;
 /// later ones join its budget rather than forgiving it their usage.
-pub(crate) struct SandboxScope;
+pub(crate) struct SandboxScope {
+    was_in_sandbox: bool,
+}
 
 impl SandboxScope {
     pub(crate) fn enter() -> Self {
-        if ACTIVE_SCOPES.fetch_add(1, Relaxed) == 0 {
+        let mut active = ACTIVE_SCOPES.lock().unwrap_or_else(|e| e.into_inner());
+        if *active == 0 {
             BASELINE_MEMORY.store(LIVE_MEMORY.load(Relaxed), Relaxed);
         }
-        IN_SANDBOX.set(true);
-        SandboxScope
+        *active += 1;
+        Self {
+            was_in_sandbox: IN_SANDBOX.replace(true),
+        }
     }
 }
 
 impl Drop for SandboxScope {
     fn drop(&mut self) {
-        IN_SANDBOX.set(false);
-        ACTIVE_SCOPES.fetch_sub(1, Relaxed);
+        IN_SANDBOX.set(self.was_in_sandbox);
+        *ACTIVE_SCOPES.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
     }
 }

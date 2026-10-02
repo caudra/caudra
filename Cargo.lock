@@ -197,6 +197,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ar_archive_writer"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73cd58deff2140a0a8eae87e417bd01db68a33e148aa93d1e8cd837e55e312b6"
+dependencies = [
+ "object 0.39.1",
+]
+
+[[package]]
 name = "arboard"
 version = "3.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -494,7 +503,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "miniz_oxide",
- "object",
+ "object 0.37.3",
  "rustc-demangle",
  "windows-link",
 ]
@@ -1003,9 +1012,8 @@ dependencies = [
 name = "caudra-interpreter"
 version = "0.1.0"
 dependencies = [
- "get-size2",
  "monty",
- "monty-types 0.0.21 (git+https://github.com/pydantic/monty.git?tag=v0.0.21)",
+ "monty-types 1.0.0 (git+https://github.com/pydantic/monty.git?tag=v1.0.0)",
  "serde_json",
  "test-case",
  "thiserror 2.0.18",
@@ -1418,6 +1426,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "char_str"
+version = "0.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9cba78a5abb515610e10af297615434b019755b5d7be14e559ff5340dff50c4"
+dependencies = [
+ "castaway",
+ "get-size2",
+ "itoa",
+ "ryu",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1613,6 +1633,19 @@ dependencies = [
  "rustversion",
  "ryu",
  "static_assertions",
+]
+
+[[package]]
+name = "compact_str"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "79fcda08c33bb58b97008b2cdada6622500e949e060f5913361763121abd2416"
+dependencies = [
+ "castaway",
+ "cfg-if",
+ "itoa",
+ "static_assertions",
+ "zmij",
 ]
 
 [[package]]
@@ -2152,6 +2185,12 @@ name = "downcast-rs"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
+
+[[package]]
+name = "drop_bomb"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9bda8e21c04aca2ae33ffc2fd8c23134f3cac46db123ba97bd9d3f3b8a4a85e1"
 
 [[package]]
 name = "dtoa"
@@ -2750,9 +2789,9 @@ dependencies = [
 
 [[package]]
 name = "get-size-derive2"
-version = "0.10.3"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c736d226c32e496b8377813b52269e11ad3a48d8373b68862d0364f04fd1229d"
+checksum = "7efe46d2adb529015748742f1a38594039ce357dbb21e6d178de342cfce468d4"
 dependencies = [
  "attribute-derive",
  "quote",
@@ -2761,11 +2800,11 @@ dependencies = [
 
 [[package]]
 name = "get-size2"
-version = "0.10.1"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "823645bc6404ae2915707777061a47d3a031a9ee0bff51b34ec973df3d8d2990"
+checksum = "d4d338de392104417fe6fdbe588c52383b9236956d8afe5654f0077176edc632"
 dependencies = [
- "compact_str",
+ "compact_str 0.10.0",
  "get-size-derive2",
  "hashbrown 0.17.1",
  "ordermap",
@@ -4539,9 +4578,9 @@ dependencies = [
 
 [[package]]
 name = "jiter"
-version = "0.16.0"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "820ddcacd75c9782308d3fa594f3885630ea3f49adba78a8a29abdfe4b81630c"
+checksum = "bc2f2b4e673d798b3dbad0af24bc23b92013e680a6b9ad300b4e5e52fafe0586"
 dependencies = [
  "ahash",
  "bitvec",
@@ -5054,6 +5093,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
+name = "minicbor"
+version = "2.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c12b4033ffaa92fbf9df03df38d19324f52bad130dd223f811734a8006dd2d69"
+
+[[package]]
+name = "minicbor-serde"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7abdec9761edcb452764c68564ae4b77ec62f6c1a361aa68f5de15fd788c679"
+dependencies = [
+ "minicbor",
+ "serde",
+]
+
+[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5128,12 +5183,13 @@ dependencies = [
 
 [[package]]
 name = "monty"
-version = "0.0.21"
-source = "git+https://github.com/pydantic/monty.git?tag=v0.0.21#70fe3f5781381eb33579e45046f8cb3845953373"
+version = "1.0.0"
+source = "git+https://github.com/pydantic/monty.git?tag=v1.0.0#85c5d1f6bef038405cfc40a4eed94806e303567e"
 dependencies = [
  "ahash",
  "chrono",
  "fancy-regex 0.17.0",
+ "getrandom 0.3.4",
  "hashbrown 0.16.1",
  "indexmap 2.14.0",
  "itertools 0.14.0",
@@ -5141,8 +5197,9 @@ dependencies = [
  "jiter",
  "libm",
  "memchr",
- "monty-macros 0.0.21 (git+https://github.com/pydantic/monty.git?tag=v0.0.21)",
- "monty-types 0.0.21 (git+https://github.com/pydantic/monty.git?tag=v0.0.21)",
+ "minicbor-serde",
+ "monty-macros 1.0.0 (git+https://github.com/pydantic/monty.git?tag=v1.0.0)",
+ "monty-types 1.0.0 (git+https://github.com/pydantic/monty.git?tag=v1.0.0)",
  "num-bigint",
  "num-integer",
  "num-traits",
@@ -5154,6 +5211,8 @@ dependencies = [
  "ruff_source_file",
  "ruff_text_size",
  "serde",
+ "serde_bytes",
+ "sha2 0.10.9",
  "smallvec",
  "speedate",
  "strum 0.27.2",
@@ -5164,21 +5223,21 @@ dependencies = [
 
 [[package]]
 name = "monty-fs"
-version = "0.0.21"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "343097acb29c9bb4e230a5a187a21c50d268f94911bc81db89dab4aa304d4c50"
+checksum = "9b832703ccfaedaae9930ec8984eb37db2998b0fd1ab97bd556551dd4479e5b4"
 dependencies = [
  "ahash",
  "cap-std",
- "monty-types 0.0.21 (registry+https://github.com/rust-lang/crates.io-index)",
+ "monty-types 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "rustix 1.1.4",
 ]
 
 [[package]]
 name = "monty-macros"
-version = "0.0.21"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "40ed428288161f63d2bec7929438563fe31390f08e014e58ce20be96d7ef82ee"
+checksum = "18acfe594cfe965254e684f128ec6e0a2e63774bf4ec8eb7eb5b13fd4a182a22"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5187,8 +5246,8 @@ dependencies = [
 
 [[package]]
 name = "monty-macros"
-version = "0.0.21"
-source = "git+https://github.com/pydantic/monty.git?tag=v0.0.21#70fe3f5781381eb33579e45046f8cb3845953373"
+version = "1.0.0"
+source = "git+https://github.com/pydantic/monty.git?tag=v1.0.0#85c5d1f6bef038405cfc40a4eed94806e303567e"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5197,14 +5256,14 @@ dependencies = [
 
 [[package]]
 name = "monty-pool"
-version = "0.0.21"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a483cbecc06bf69bdc7a94479e271d4ee7bce6d05e1eb60ef0e199e8ca110df"
+checksum = "0132326a4dc93d42ced6738e638d38a96cf977963316aaf1df5fafefa8d69136"
 dependencies = [
  "futures-util",
  "monty-fs",
  "monty-proto",
- "monty-types 0.0.21 (registry+https://github.com/rust-lang/crates.io-index)",
+ "monty-types 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "rustls",
  "tokio",
  "tokio-tungstenite",
@@ -5212,26 +5271,28 @@ dependencies = [
 
 [[package]]
 name = "monty-proto"
-version = "0.0.21"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8741cb0a667eebd8bf090affd2f5f92bcf1597b9216f7714e9ea6b2ef6ac556"
+checksum = "1ecd13d16939361f670687b545ff20d726f0bcdb4c35f1a5a04fa4cb3ed3e5ae"
 dependencies = [
- "monty-types 0.0.21 (registry+https://github.com/rust-lang/crates.io-index)",
+ "monty-types 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "num-bigint",
  "prost",
 ]
 
 [[package]]
 name = "monty-types"
-version = "0.0.21"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00b4b3318107fee36c5eee05c52f16f6565a63aa29d04f8608ebc221e3fe5dd8"
+checksum = "eb42ab8791581458d83352f53028cf84a9225ab22e9c6093e12fd06877ce7ac4"
 dependencies = [
  "chrono",
- "monty-macros 0.0.21 (registry+https://github.com/rust-lang/crates.io-index)",
+ "jiff",
+ "monty-macros 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "num-bigint",
  "num-traits",
  "serde",
+ "serde_bytes",
  "strum 0.27.2",
  "unicode-general-category",
  "web-time",
@@ -5239,14 +5300,16 @@ dependencies = [
 
 [[package]]
 name = "monty-types"
-version = "0.0.21"
-source = "git+https://github.com/pydantic/monty.git?tag=v0.0.21#70fe3f5781381eb33579e45046f8cb3845953373"
+version = "1.0.0"
+source = "git+https://github.com/pydantic/monty.git?tag=v1.0.0#85c5d1f6bef038405cfc40a4eed94806e303567e"
 dependencies = [
  "chrono",
- "monty-macros 0.0.21 (git+https://github.com/pydantic/monty.git?tag=v0.0.21)",
+ "jiff",
+ "monty-macros 1.0.0 (git+https://github.com/pydantic/monty.git?tag=v1.0.0)",
  "num-bigint",
  "num-traits",
  "serde",
+ "serde_bytes",
  "strum 0.27.2",
  "unicode-general-category",
  "web-time",
@@ -5567,6 +5630,15 @@ name = "object"
 version = "0.37.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff76201f031d8863c38aa7f905eca4f53abbfa15f609db4277d44cd8938f33fe"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
+name = "object"
+version = "0.39.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e5a6c098c7a3b6547378093f5cc30bc54fd361ce711e05293a5cc589562739b"
 dependencies = [
  "memchr",
 ]
@@ -6251,6 +6323,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "psm"
+version = "0.1.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4dcd034599e63b970727f70d79e02d62390a4a84f7c6b827c27c46d5ac3fa622"
+dependencies = [
+ "ar_archive_writer",
+ "cc",
+]
+
+[[package]]
 name = "pxfm"
 version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6554,7 +6636,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cbb175c433c8e28a809d1f5773a2ae96e68c0ce40db865cbab1020bf33ae479c"
 dependencies = [
  "bitflags 2.13.1",
- "compact_str",
+ "compact_str 0.9.1",
  "critical-section",
  "hashbrown 0.17.1",
  "itertools 0.14.0",
@@ -6875,14 +6957,15 @@ dependencies = [
 
 [[package]]
 name = "ruff_python_ast"
-version = "0.0.3"
+version = "0.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a10ab966362319801f5e85ce5c6aeac69f0cf50936a31e888f5d004e9279f337"
+checksum = "6aa1de604c478a790cfbcc9c1fef3060e619ed87dd776c6614862ed7e59dc461"
 dependencies = [
  "aho-corasick",
  "arrayvec",
  "bitflags 2.13.1",
- "compact_str",
+ "char_str",
+ "compact_str 0.10.0",
  "get-size2",
  "is-macro",
  "memchr",
@@ -6896,9 +6979,9 @@ dependencies = [
 
 [[package]]
 name = "ruff_python_codegen"
-version = "0.0.3"
+version = "0.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1902d82ae0745be9d3d12a1aee4429acff987c768710dc38a6521eab05990ca0"
+checksum = "61039f2c61869bdabf2e5448b561ab6546b787718926c78973ebfefe03f84298"
 dependencies = [
  "ruff_python_ast",
  "ruff_python_literal",
@@ -6909,9 +6992,9 @@ dependencies = [
 
 [[package]]
 name = "ruff_python_literal"
-version = "0.0.3"
+version = "0.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af3e1f868fa58adc12d1fa3ce1b29c6098aa4b101739d9589cbde9fec239af59"
+checksum = "3b6025882ae43876fda9867693e14d1d749acefb3db2763d81bfa32a8cd92682"
 dependencies = [
  "bitflags 2.13.1",
  "icu_properties",
@@ -6921,19 +7004,21 @@ dependencies = [
 
 [[package]]
 name = "ruff_python_parser"
-version = "0.0.3"
+version = "0.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e3b8436fb010636ea79ce545acc3e391296ef4e804f7cef336dd5f9c8a4aa3a"
+checksum = "b44b423a842d5d2f10807189a260ba677d4eacdc98c5d0459b66bef67fb78d97"
 dependencies = [
  "bitflags 2.13.1",
  "bstr",
- "compact_str",
+ "drop_bomb",
  "get-size2",
+ "hashbrown 0.17.1",
  "memchr",
  "ruff_python_ast",
  "ruff_python_trivia",
  "ruff_text_size",
  "rustc-hash",
+ "stacker",
  "static_assertions",
  "thin-vec",
  "unicode-ident",
@@ -6943,9 +7028,9 @@ dependencies = [
 
 [[package]]
 name = "ruff_python_stdlib"
-version = "0.0.3"
+version = "0.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c8860927bf42efdabb31ccb2ac9b8f98ee43897b45536f8023e217b158e49a4"
+checksum = "ea8c1e6e69f7570e1f24c7a26ef93f6fd1475e2d76aa9ca4a78093c1f80523cb"
 dependencies = [
  "bitflags 2.13.1",
  "unicode-ident",
@@ -6953,21 +7038,22 @@ dependencies = [
 
 [[package]]
 name = "ruff_python_trivia"
-version = "0.0.3"
+version = "0.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "969e4a14b2550818efea99b9e2361c714c72e4f1fb94799251d55aed20345189"
+checksum = "990dadfad3aa3fd63040d98056112e5a377af8ada0c9c7659e8907a4b3c7cb34"
 dependencies = [
  "itertools 0.15.0",
  "ruff_source_file",
  "ruff_text_size",
+ "rustc-hash",
  "unicode-ident",
 ]
 
 [[package]]
 name = "ruff_source_file"
-version = "0.0.3"
+version = "0.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c194e02d121e4a1744464ce3a982c4c196eb039bbf67532d18c8ce09f8da6381"
+checksum = "ed11e9366de40e79707c0e575afd8beffad58ec94c253577d516b8679cf98308"
 dependencies = [
  "memchr",
  "ruff_text_size",
@@ -6975,9 +7061,9 @@ dependencies = [
 
 [[package]]
 name = "ruff_text_size"
-version = "0.0.3"
+version = "0.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c91652ad39be604bc4d5299a5d19feccdd89e255609d89a031e7bb8e0d0aef9f"
+checksum = "5a4edc941f215495170a1bda0beeeb31db2fdcd67beecfe7f29d94b2663e1965"
 dependencies = [
  "get-size2",
 ]
@@ -7301,6 +7387,16 @@ checksum = "f3a1a3341211875ef120e117ea7fd5228530ae7e7036a779fdc9117be6b3282c"
 dependencies = [
  "ordered-float 2.10.1",
  "serde",
+]
+
+[[package]]
+name = "serde_bytes"
+version = "0.11.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5d440709e79d88e51ac01c4b72fc6cb7314017bb7da9eeff678aa94c10e3ea8"
+dependencies = [
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -7672,6 +7768,19 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "stacker"
+version = "0.1.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "707f49d46706bacf8a2b00d51dace3f9de527c13eec3778f570c411f89e69967"
+dependencies = [
+ "cc",
+ "cfg-if",
+ "libc",
+ "psm",
+ "windows-sys 0.60.2",
+]
 
 [[package]]
 name = "static_assertions"
@@ -9846,7 +9955,7 @@ dependencies = [
 [[package]]
 name = "workcell"
 version = "0.1.0"
-source = "git+https://github.com/tensorninja/workcell-mcp?rev=617188ec60716830213658d77f3e4874bff3b20c#617188ec60716830213658d77f3e4874bff3b20c"
+source = "git+https://github.com/tensorninja/workcell-mcp?rev=762bf300080e8a8e9de416fa095d7ee2d72698aa#762bf300080e8a8e9de416fa095d7ee2d72698aa"
 dependencies = [
  "workcell-environment",
  "workcell-host-contract",
@@ -9863,7 +9972,7 @@ dependencies = [
 [[package]]
 name = "workcell-code-graph"
 version = "0.1.0"
-source = "git+https://github.com/tensorninja/workcell-mcp?rev=617188ec60716830213658d77f3e4874bff3b20c#617188ec60716830213658d77f3e4874bff3b20c"
+source = "git+https://github.com/tensorninja/workcell-mcp?rev=762bf300080e8a8e9de416fa095d7ee2d72698aa#762bf300080e8a8e9de416fa095d7ee2d72698aa"
 dependencies = [
  "gix",
  "lru",
@@ -9875,7 +9984,7 @@ dependencies = [
 [[package]]
 name = "workcell-environment"
 version = "0.1.0"
-source = "git+https://github.com/tensorninja/workcell-mcp?rev=617188ec60716830213658d77f3e4874bff3b20c#617188ec60716830213658d77f3e4874bff3b20c"
+source = "git+https://github.com/tensorninja/workcell-mcp?rev=762bf300080e8a8e9de416fa095d7ee2d72698aa#762bf300080e8a8e9de416fa095d7ee2d72698aa"
 dependencies = [
  "rustix 0.38.44",
  "serde",
@@ -9889,7 +9998,7 @@ dependencies = [
 [[package]]
 name = "workcell-host-contract"
 version = "0.1.0"
-source = "git+https://github.com/tensorninja/workcell-mcp?rev=617188ec60716830213658d77f3e4874bff3b20c#617188ec60716830213658d77f3e4874bff3b20c"
+source = "git+https://github.com/tensorninja/workcell-mcp?rev=762bf300080e8a8e9de416fa095d7ee2d72698aa#762bf300080e8a8e9de416fa095d7ee2d72698aa"
 dependencies = [
  "serde",
  "serde_json",
@@ -9898,10 +10007,10 @@ dependencies = [
 [[package]]
 name = "workcell-mcp-code"
 version = "0.1.0"
-source = "git+https://github.com/tensorninja/workcell-mcp?rev=617188ec60716830213658d77f3e4874bff3b20c#617188ec60716830213658d77f3e4874bff3b20c"
+source = "git+https://github.com/tensorninja/workcell-mcp?rev=762bf300080e8a8e9de416fa095d7ee2d72698aa#762bf300080e8a8e9de416fa095d7ee2d72698aa"
 dependencies = [
  "monty-pool",
- "monty-types 0.0.21 (registry+https://github.com/rust-lang/crates.io-index)",
+ "monty-types 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "schemars 1.2.1",
  "serde",
  "serde_json",
@@ -9914,7 +10023,7 @@ dependencies = [
 [[package]]
 name = "workcell-mcp-code-graph"
 version = "0.1.0"
-source = "git+https://github.com/tensorninja/workcell-mcp?rev=617188ec60716830213658d77f3e4874bff3b20c#617188ec60716830213658d77f3e4874bff3b20c"
+source = "git+https://github.com/tensorninja/workcell-mcp?rev=762bf300080e8a8e9de416fa095d7ee2d72698aa#762bf300080e8a8e9de416fa095d7ee2d72698aa"
 dependencies = [
  "async-trait",
  "schemars 1.2.1",
@@ -9931,7 +10040,7 @@ dependencies = [
 [[package]]
 name = "workcell-mcp-files"
 version = "0.1.0"
-source = "git+https://github.com/tensorninja/workcell-mcp?rev=617188ec60716830213658d77f3e4874bff3b20c#617188ec60716830213658d77f3e4874bff3b20c"
+source = "git+https://github.com/tensorninja/workcell-mcp?rev=762bf300080e8a8e9de416fa095d7ee2d72698aa#762bf300080e8a8e9de416fa095d7ee2d72698aa"
 dependencies = [
  "dunce",
  "file-format",
@@ -9955,7 +10064,7 @@ dependencies = [
 [[package]]
 name = "workcell-mcp-shell"
 version = "0.1.0"
-source = "git+https://github.com/tensorninja/workcell-mcp?rev=617188ec60716830213658d77f3e4874bff3b20c#617188ec60716830213658d77f3e4874bff3b20c"
+source = "git+https://github.com/tensorninja/workcell-mcp?rev=762bf300080e8a8e9de416fa095d7ee2d72698aa#762bf300080e8a8e9de416fa095d7ee2d72698aa"
 dependencies = [
  "async-trait",
  "dunce",
@@ -9977,7 +10086,7 @@ dependencies = [
 [[package]]
 name = "workcell-mcp-web"
 version = "0.1.0"
-source = "git+https://github.com/tensorninja/workcell-mcp?rev=617188ec60716830213658d77f3e4874bff3b20c#617188ec60716830213658d77f3e4874bff3b20c"
+source = "git+https://github.com/tensorninja/workcell-mcp?rev=762bf300080e8a8e9de416fa095d7ee2d72698aa#762bf300080e8a8e9de416fa095d7ee2d72698aa"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -10006,7 +10115,7 @@ dependencies = [
 [[package]]
 name = "workcell-monty-worker"
 version = "0.1.0"
-source = "git+https://github.com/tensorninja/workcell-mcp?rev=617188ec60716830213658d77f3e4874bff3b20c#617188ec60716830213658d77f3e4874bff3b20c"
+source = "git+https://github.com/tensorninja/workcell-mcp?rev=762bf300080e8a8e9de416fa095d7ee2d72698aa#762bf300080e8a8e9de416fa095d7ee2d72698aa"
 dependencies = [
  "flate2",
  "libc",
@@ -10018,7 +10127,7 @@ dependencies = [
 [[package]]
 name = "workcell-net"
 version = "0.1.0"
-source = "git+https://github.com/tensorninja/workcell-mcp?rev=617188ec60716830213658d77f3e4874bff3b20c#617188ec60716830213658d77f3e4874bff3b20c"
+source = "git+https://github.com/tensorninja/workcell-mcp?rev=762bf300080e8a8e9de416fa095d7ee2d72698aa#762bf300080e8a8e9de416fa095d7ee2d72698aa"
 dependencies = [
  "async-trait",
  "bytes",
@@ -10036,7 +10145,7 @@ dependencies = [
 [[package]]
 name = "workcell-output-filter"
 version = "0.1.0"
-source = "git+https://github.com/tensorninja/workcell-mcp?rev=617188ec60716830213658d77f3e4874bff3b20c#617188ec60716830213658d77f3e4874bff3b20c"
+source = "git+https://github.com/tensorninja/workcell-mcp?rev=762bf300080e8a8e9de416fa095d7ee2d72698aa#762bf300080e8a8e9de416fa095d7ee2d72698aa"
 dependencies = [
  "regex",
  "serde",
@@ -10046,7 +10155,7 @@ dependencies = [
 [[package]]
 name = "workcell-snapshot-store"
 version = "0.1.0"
-source = "git+https://github.com/tensorninja/workcell-mcp?rev=617188ec60716830213658d77f3e4874bff3b20c#617188ec60716830213658d77f3e4874bff3b20c"
+source = "git+https://github.com/tensorninja/workcell-mcp?rev=762bf300080e8a8e9de416fa095d7ee2d72698aa#762bf300080e8a8e9de416fa095d7ee2d72698aa"
 dependencies = [
  "gix",
  "serde",
@@ -10057,7 +10166,7 @@ dependencies = [
 [[package]]
 name = "workcell-source-icons"
 version = "0.1.0"
-source = "git+https://github.com/tensorninja/workcell-mcp?rev=617188ec60716830213658d77f3e4874bff3b20c#617188ec60716830213658d77f3e4874bff3b20c"
+source = "git+https://github.com/tensorninja/workcell-mcp?rev=762bf300080e8a8e9de416fa095d7ee2d72698aa#762bf300080e8a8e9de416fa095d7ee2d72698aa"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -10077,7 +10186,7 @@ dependencies = [
 [[package]]
 name = "workcell-source-languages"
 version = "0.1.0"
-source = "git+https://github.com/tensorninja/workcell-mcp?rev=617188ec60716830213658d77f3e4874bff3b20c#617188ec60716830213658d77f3e4874bff3b20c"
+source = "git+https://github.com/tensorninja/workcell-mcp?rev=762bf300080e8a8e9de416fa095d7ee2d72698aa#762bf300080e8a8e9de416fa095d7ee2d72698aa"
 dependencies = [
  "tree-sitter",
  "tree-sitter-bash",
@@ -10121,7 +10230,7 @@ dependencies = [
 [[package]]
 name = "workcell-tool-contract"
 version = "0.1.0"
-source = "git+https://github.com/tensorninja/workcell-mcp?rev=617188ec60716830213658d77f3e4874bff3b20c#617188ec60716830213658d77f3e4874bff3b20c"
+source = "git+https://github.com/tensorninja/workcell-mcp?rev=762bf300080e8a8e9de416fa095d7ee2d72698aa#762bf300080e8a8e9de416fa095d7ee2d72698aa"
 dependencies = [
  "serde",
  "serde_json",
@@ -10131,7 +10240,7 @@ dependencies = [
 [[package]]
 name = "workcell-workspace-snapshot"
 version = "0.1.0"
-source = "git+https://github.com/tensorninja/workcell-mcp?rev=617188ec60716830213658d77f3e4874bff3b20c#617188ec60716830213658d77f3e4874bff3b20c"
+source = "git+https://github.com/tensorninja/workcell-mcp?rev=762bf300080e8a8e9de416fa095d7ee2d72698aa#762bf300080e8a8e9de416fa095d7ee2d72698aa"
 dependencies = [
  "rustix 0.38.44",
  "serde",

@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-VERSION = "0.0.21"
+VERSION = "1.0.0"
 EXPECTED_VERSION = f"monty-runtime {VERSION}"
 ROOT = Path(__file__).resolve().parent.parent
 PROFILE = {

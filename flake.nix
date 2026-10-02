@@ -91,10 +91,10 @@
       #   mismatch that prints the real hash. This is both the recovery
       #   path for updates and a hard stop if pinned content ever changes.
       gitDepHashes = {
-        "git+https://github.com/pydantic/monty.git?tag=v0.0.21#70fe3f5781381eb33579e45046f8cb3845953373" =
-          "sha256-P4PgqfYykkZrWGg5G3WQo070lORLEhmXQUQPx3+Yslo=";
-        "git+https://github.com/tensorninja/workcell-mcp?rev=617188ec60716830213658d77f3e4874bff3b20c#617188ec60716830213658d77f3e4874bff3b20c" =
-          "sha256-kfHl85vf0rkQWti303rfFUtrJ2sTJlcjasT0vE0H7E4=";
+        "git+https://github.com/pydantic/monty.git?tag=v1.0.0#85c5d1f6bef038405cfc40a4eed94806e303567e" =
+          "sha256-tuDFwYLIprdVyAH47rqYiI4xU3RCuNdkBjIyVM1JeWE=";
+        "git+https://github.com/tensorninja/workcell-mcp?rev=762bf300080e8a8e9de416fa095d7ee2d72698aa#762bf300080e8a8e9de416fa095d7ee2d72698aa" =
+          "sha256-VtUmxsgmLbemCYwveZRFmrkDhkhbakmwhpseqlSpFh4=";
       };
 
       missingGitDepHashes = builtins.filter (s: !(builtins.hasAttr s gitDepHashes)) gitDepSources;
@@ -121,13 +121,13 @@
           workspaceSrc = mkWorkspaceSrc craneLib;
           montySrc = pkgs.fetchgit {
             url = "https://github.com/pydantic/monty.git";
-            rev = "70fe3f5781381eb33579e45046f8cb3845953373";
-            hash = "sha256-P4PgqfYykkZrWGg5G3WQo070lORLEhmXQUQPx3+Yslo=";
+            rev = "85c5d1f6bef038405cfc40a4eed94806e303567e";
+            hash = "sha256-tuDFwYLIprdVyAH47rqYiI4xU3RCuNdkBjIyVM1JeWE=";
           };
           montyVendorDeps = craneLib.vendorCargoDeps { src = montySrc; };
           montyWorker = craneLib.buildPackage {
             pname = "caudra-monty-worker";
-            version = "0.0.21";
+            version = "1.0.0";
             src = montySrc;
             cargoVendorDir = montyVendorDeps;
             cargoExtraArgs = "--package monty-runtime --no-default-features";
@@ -144,7 +144,7 @@
               cp target/release/monty $debug/bin/monty
               cp target/release/monty $out/bin/monty
               $STRIP $out/bin/monty
-              $out/bin/monty --version | grep -q '0.0.21'
+              $out/bin/monty --version | grep -qx 'monty-runtime 1.0.0'
             '';
             dontStrip = true;
           };
