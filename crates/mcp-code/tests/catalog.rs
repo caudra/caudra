@@ -61,10 +61,8 @@ fn description_states_exactly_the_subset_the_crate_defines() {
     }
 }
 
-/// The absent-module sentence has to keep naming the three that were wrongly advertised, because a
-/// caller that saw the old description will otherwise assume they were merely omitted by accident.
 #[test]
-fn description_names_the_modules_that_were_wrongly_advertised() {
+fn description_distinguishes_new_modules_from_modules_still_absent() {
     let tools = catalog();
     let description = tools[0].description.as_deref().expect("tool description");
     let advertised = description
@@ -74,14 +72,21 @@ fn description_names_the_modules_that_were_wrongly_advertised() {
         .split_once('.')
         .expect("the enumeration is a sentence")
         .0;
-    for absent in ["base64", "binascii", "functools"] {
+    for available in ["base64", "binascii", "copy", "functools", "random", "time"] {
+        assert!(
+            advertised.split(", ").any(|name| name == available),
+            "{available} must be advertised"
+        );
+    }
+    for absent in ["statistics", "hashlib", "urllib"] {
         assert!(
             !advertised.contains(absent),
             "{absent} is advertised as available: {advertised}"
         );
         assert!(
             description.contains(&format!("no {absent}"))
-                || description.contains(&format!(" {absent},")),
+                || description.contains(&format!(" {absent},"))
+                || description.contains(&format!("or {absent}.")),
             "{absent} should be listed among the absent modules"
         );
     }

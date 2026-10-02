@@ -11,7 +11,10 @@ use std::{
 };
 
 use monty_pool::{Checkout, Pool, PoolError, ReplConfig, TurnEvent, on_print_sync};
-use monty_types::{PrintStream, ResourceLimits, TypeCheckingConfig, TypeCheckingFormat};
+use monty_types::{
+    DateTimeSource, OsPolicy, PrintStream, ProcessTime, RandomStart, ResourceLimits,
+    SandboxTimeZone, SleepMode, TypeCheckingConfig, TypeCheckingFormat,
+};
 #[cfg(feature = "mcp")]
 use rmcp::model::{CallToolResult, ContentBlock, Tool};
 #[cfg(feature = "mcp")]
@@ -214,13 +217,21 @@ impl CodeToolGroup {
 
     fn repl_config(type_check: bool, timeout_ms: u64) -> ReplConfig {
         let limits = ResourceLimits::default()
-            .max_duration(Duration::from_millis(timeout_ms))
+            .max_feed_duration(Duration::from_millis(timeout_ms))
+            .max_turn_duration(Duration::from_millis(timeout_ms))
             .max_memory(MAX_MEMORY_BYTES);
         ReplConfig {
             script_name: SCRIPT_NAME.to_owned(),
             limits: Some(limits),
             type_check,
             type_check_stubs: None,
+            os_policy: OsPolicy {
+                datetime: DateTimeSource::CallHost,
+                timezone: SandboxTimeZone::utc(),
+                sleep: SleepMode::CallHost,
+                process_time: ProcessTime::Zero,
+                random_start: RandomStart::CallHost,
+            },
             // Concise diagnostics stay readable in a tool result; the full form renders a source
             // snippet with carets for a terminal, and colour would be ANSI noise in JSON.
             type_check_config: TypeCheckingConfig {
@@ -502,6 +513,31 @@ mod tests {
 
     use super::*;
     use crate::types::DEFAULT_TIMEOUT_MS;
+
+    #[test]
+    fn every_feed_and_turn_is_bounded_without_ambient_os_capabilities() {
+        let config = CodeToolGroup::repl_config(true, DEFAULT_TIMEOUT_MS);
+        let limits = config.limits.expect("resource limits");
+        assert_eq!(
+            limits.max_feed_duration,
+            Some(Duration::from_millis(DEFAULT_TIMEOUT_MS))
+        );
+        assert_eq!(limits.max_turn_duration, limits.max_feed_duration);
+        assert_eq!(limits.max_memory, Some(MAX_MEMORY_BYTES));
+        assert_eq!(limits.max_recursion_depth, 1000);
+        assert_eq!(
+            config.os_policy,
+            OsPolicy {
+                datetime: DateTimeSource::CallHost,
+                timezone: SandboxTimeZone::utc(),
+                sleep: SleepMode::CallHost,
+                process_time: ProcessTime::Zero,
+                random_start: RandomStart::CallHost,
+            }
+        );
+        assert!(config.type_check);
+        assert!(config.type_check_stubs.is_none());
+    }
 
     /// A pool failure never becomes an MCP fault, and never leaks worker internals. The hard-kill
     /// paths cannot be provoked from Python on purpose — Monty preflights the allocations that would

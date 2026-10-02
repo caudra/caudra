@@ -1546,12 +1546,15 @@ value of its final expression along with anything it printed.
 - The worker has no filesystem access, no network access, no subprocesses, and an empty environment.
   `open`, `os.getenv`, and `os.environ` do not reach the host; attempts raise `PermissionError` or
   observe an empty environment. The result explains which tool to use instead.
+- Host clocks, entropy, and sleep are refused rather than using Monty 1.0's system defaults.
+  Seed `random` explicitly and supply dates as data; process-time reads return zero and the virtual
+  timezone is UTC. `eval` and `exec` run inside the same interpreter with the same limits and refusals.
 - Only Monty's built-in module subset is importable. There are no third-party packages and no
   `pip install`. Importing anything else raises `ModuleNotFoundError` and the result lists what is
   available.
 - Snippets are type-checked before execution by default, so a type error is reported without running
   any code. Use `--no-code-type-check` to execute unchecked. A few builtins — `map`, `filter`,
-  `getattr`, `setattr`, and `hasattr` — exist in the interpreter but are absent from its type stubs,
+  `getattr`, `setattr`, `hasattr`, and `format` — exist in the interpreter but are absent from its type stubs,
   so they run only when type checking is off. The rejection says so rather than calling them
   undefined.
 - Type annotations are never required to pass the check. Unannotated code is inferred permissively;
@@ -1560,17 +1563,19 @@ value of its final expression along with anything it printed.
   `types`, `typing_extensions`, `_collections_abc`, and `_typeshed` resolve during checking because
   the stubs need them, then raise `ModuleNotFoundError` at import.
 - The interpreter is Monty, not CPython. It implements a large but incomplete subset: notably no
-  `str.format()`, `match` statements, generators, or class inheritance, and operators do not dispatch
-  to user-defined dunders. Unpacking is complete except that a subscript or attribute cannot be an
-  unpacking target, so `x[i], x[j] = x[j], x[i]` is refused and has to go through a temporary
-  ([pydantic/monty#408](https://github.com/pydantic/monty/issues/408)). The tool description
+  `match` statements, generator functions, or class inheritance, and operators do not dispatch
+  to user-defined dunders. Monty 1.0 supports `str.format()`, percent formatting, subscript and
+  attribute unpacking targets, and generic aliases such as `list[int]` as values. The tool description
   enumerates the divergences that most often cost a caller a wasted turn, and it is generated from
   the same lists the runtime diagnostics quote, so the two cannot disagree.
 - The structured result reports the outcome, the final value as JSON with a `repr` fallback for values
   JSON cannot express, bounded stdout and stderr, and, when execution fails, the exception type,
   message, and traceback plus targeted guidance.
+- Shared wire values are costed before expanding into JSON or repr. An oversized expansion returns
+  null and an explicit rendering-budget notice rather than exhausting the server's memory.
 - Exhausting the timeout or the 256 MiB memory ceiling ends the call and returns a `limited` outcome.
-  A worker that aborts is replaced; it cannot take the server down with it.
+  The timeout covers the entire feed as well as each turn between suspensions. A worker that aborts
+  is replaced; it cannot take the server down with it.
 - At most two code calls execute concurrently within one process. Queued calls remain cancellable.
 
 ### `execution_environment`

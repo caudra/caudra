@@ -15,15 +15,22 @@ server down with it.
 Isolation is the absence of capability, not a kernel boundary. Every interpreter suspension that would
 reach outside the process is answered rather than forwarded:
 
-- Filesystem and other OS calls are refused, surfacing as `PermissionError`, and the result names the
-  filesystem or shell tool that the caller should use instead.
+- Filesystem calls are refused with `PermissionError`, and the result names the filesystem or shell
+  tool that the caller should use instead. Other OS calls are refused with `RuntimeError`.
 - Environment reads observe an explicitly empty environment, so no host variable is disclosed.
-- Absent callables such as `eval` resolve to `NameError` rather than being satisfied by the host.
+- Monty 1.0's system-clock, entropy, and sleep defaults are overridden with refused host calls.
+  Process-time reads return zero and the virtual timezone is UTC. Explicitly seeded random
+  computation and arithmetic on supplied dates need no host capability.
+- Absent callables such as `compile` resolve to `NameError` rather than being satisfied by the host.
+- `eval` and `exec` execute inside the same interpreter, under the same limits and OS refusals.
 - There is no network access, no subprocess creation, and no session state between calls.
 
 Bounds are compile-time constants and are never accepted as tool input: 64 KiB of source, a
 caller-selected timeout capped at 30 seconds, a 256 MiB memory ceiling enforced by the worker's global
 allocator, 256 KiB of captured output per stream, a suspension cap, and a concurrency limit of two.
+The timeout applies to the whole feed as well as each turn. A conservative 8 MiB expansion-cost
+budget is checked over the shared-node wire graph before rendering JSON or repr; values exceeding
+it return null with an explicit omission notice rather than expanding without bound in the server.
 
 The interpreter is Monty, not CPython, and implements an incomplete subset of the language. The tool
 description enumerates the divergences that most often waste a caller's turn, and the fixture-backed

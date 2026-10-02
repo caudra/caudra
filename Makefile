@@ -9,7 +9,7 @@ ROOT ?=
 PORT ?= 3001
 ARGS ?=
 # Must match the `monty-pool` pin in Cargo.toml; `code-worker` enforces it.
-MONTY_VERSION ?= 0.0.21
+MONTY_VERSION ?= 1.0.0
 CODE_WORKER_ROOT ?= target/code-worker
 CODE_WORKER_BUILD ?= target/code-worker-build
 CODE_WORKER ?= $(CODE_WORKER_ROOT)/bin/monty

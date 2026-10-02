@@ -67,8 +67,8 @@ lru = "0.18.1"
 # interpreter and type checker pull a large ruff/ty tree that only resolves correctly under Monty's
 # own lockfile, and making it a workspace member would unify `monty-proto/worker` across the
 # workspace, linking the interpreter into the server binary for every `--workspace` build.
-monty-pool = "=0.0.21"
-monty-types = "=0.0.21"
+monty-pool = "=1.0.0"
+monty-types = "=1.0.0"
 notify = { version = "8.2.0", default-features = false, features = ["macos_kqueue"] }
 gix = { version = "0.87.1", default-features = false, features = ["sha1", "max-performance-safe", "index"] }
 proptest = "1.11.0"

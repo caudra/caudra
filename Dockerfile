@@ -6,7 +6,7 @@
 # MONTY_VERSION must match the `monty-pool` pin in Cargo.toml: the worker protocol is version-coupled.
 FROM rust:1.98.0-bookworm AS worker
 
-ARG MONTY_VERSION=0.0.21
+ARG MONTY_VERSION=1.0.0
 
 RUN cargo install monty-runtime --version "=${MONTY_VERSION}" --locked --no-default-features \
       --root /out \

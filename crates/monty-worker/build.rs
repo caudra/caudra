@@ -12,7 +12,7 @@ use limits::MAX_WORKER_BYTES;
 use sha2::{Digest, Sha256};
 
 const WORKER_ENV: &str = "WORKCELL_BUNDLED_MONTY_WORKER";
-const WORKER_VERSION: &str = "0.0.21";
+const WORKER_VERSION: &str = "1.0.0";
 
 fn main() {
     println!("cargo:rerun-if-env-changed={WORKER_ENV}");

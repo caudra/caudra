@@ -235,6 +235,48 @@ async fn captures_print_output_in_order() {
 }
 
 #[tokio::test]
+async fn buffered_prints_remain_separate_bounded_utf8_streams() {
+    const CAPTURE_BYTES: usize = 256 * 1024;
+    const PRINTED_CHARACTERS: usize = CAPTURE_BYTES + 1;
+    let group = group_or_skip!(true);
+    let output = run(&group, &format!(
+        "import sys\nprint('é' * {PRINTED_CHARACTERS})\nprint('x' * {PRINTED_CHARACTERS}, file=sys.stderr)\n42"
+    )).await;
+    assert_eq!(output["outcome"], "completed", "{output}");
+    assert_eq!(output["result"], 42);
+    assert_eq!(
+        output["stdout"].as_str().expect("stdout").len(),
+        CAPTURE_BYTES
+    );
+    assert_eq!(
+        output["stderr"].as_str().expect("stderr").len(),
+        CAPTURE_BYTES
+    );
+    assert!(
+        output["stdout"]
+            .as_str()
+            .expect("stdout")
+            .chars()
+            .all(|c| c == 'é')
+    );
+    assert!(
+        output["stderr"]
+            .as_str()
+            .expect("stderr")
+            .chars()
+            .all(|c| c == 'x')
+    );
+    assert_eq!(output["stdoutTruncated"], true);
+    assert_eq!(output["stderrTruncated"], true);
+    assert_eq!(
+        output["stdoutUtf8Bytes"],
+        PRINTED_CHARACTERS * 'é'.len_utf8() + 1
+    );
+    assert_eq!(output["stderrUtf8Bytes"], PRINTED_CHARACTERS + 1);
+    group.shutdown().await;
+}
+
+#[tokio::test]
 async fn state_does_not_leak_between_calls() {
     let group = group_or_skip!();
     let first = run(&group, "carried_over = 5\ncarried_over").await;
@@ -309,12 +351,16 @@ async fn every_withheld_builtin_is_actually_absent() {
 async fn modules_named_as_absent_really_are() {
     let group = group_or_skip!();
     for module in [
-        "base64",
-        "binascii",
-        "functools",
-        "random",
+        "gc",
+        "io",
+        "string",
+        "struct",
+        "operator",
         "statistics",
+        "enum",
+        "contextlib",
         "hashlib",
+        "uuid",
         "urllib",
     ] {
         let output = run(&group, &format!("import {module}")).await;
@@ -364,13 +410,8 @@ async fn the_described_cpython_divergences_hold() {
     group.shutdown().await;
 }
 
-/// Unpacking is nearly complete, and describing it as unsupported would cost far more than the one
-/// gap does. The gap is that the parser accepts only a name, tuple, list, or starred name as a leaf,
-/// so the ordinary element swap is refused; upstream reports that as a bare `SyntaxError`, which
-/// reads as a mistake in the caller's own code. Both halves are pinned: the forms that work, and the
-/// rewrite the diagnostic promises.
 #[tokio::test]
-async fn unpacking_works_except_into_subscripts_and_attributes() {
+async fn unpacking_supports_names_subscripts_and_attributes() {
     let group = group_or_skip!(true);
 
     for (label, code, expected) in [
@@ -411,35 +452,32 @@ async fn unpacking_works_except_into_subscripts_and_attributes() {
         assert_eq!(output["result"], expected, "{label}");
     }
 
-    // Both leaf kinds the parser refuses. Nothing ran, so the outcome is a rejection, not a raise.
-    for (label, code) in [
-        ("subscript swap", "x = [1, 2]\nx[0], x[1] = x[1], x[0]\nx"),
+    for (label, code, expected) in [
+        (
+            "subscript swap",
+            "x = [1, 2]\nx[0], x[1] = x[1], x[0]\nx",
+            json!([2, 1]),
+        ),
         (
             "computed index",
             "x = [1, 2]\ni, j = 0, 1\nx[i], x[j] = x[j], x[i]\nx",
+            json!([2, 1]),
         ),
         (
             "dict subscript",
             "d = {'a': 1, 'b': 2}\nd['a'], d['b'] = d['b'], d['a']\nd",
+            json!({"a": 2, "b": 1}),
         ),
         (
             "attribute",
             "class P:\n    def __init__(self):\n        self.a = 1\n        self.b = 2\np = P()\np.a, p.b = p.b, p.a\n[p.a, p.b]",
+            json!([2, 1]),
         ),
     ] {
         let output = run(&group, code).await;
-        assert_eq!(output["outcome"], "rejected", "{label}: {output}");
-        assert_eq!(output["exception"]["type"], "SyntaxError", "{label}");
-        let diagnostic = output["diagnostic"].as_str().expect("guidance");
-        assert!(
-            diagnostic.contains("did not run") && diagnostic.contains("temporary"),
-            "{label} must be told the rewrite: {diagnostic}"
-        );
+        assert_eq!(output["outcome"], "completed", "{label}: {output}");
+        assert_eq!(output["result"], expected, "{label}: {output}");
     }
-
-    // The rewrite the diagnostic names has to be one the worker actually accepts.
-    let rewritten = run(&group, "x = [1, 2]\nt = x[0]\nx[0] = x[1]\nx[1] = t\nx").await;
-    assert_eq!(rewritten["result"], json!([2, 1]), "{rewritten}");
 
     group.shutdown().await;
 }
@@ -485,13 +523,15 @@ async fn annotations_are_never_required_and_only_add_constraints() {
     );
     assert!(diagnostic.contains("Widen or drop"), "{diagnostic}");
 
-    // An annotation is never evaluated, so the same expression is fine in a hint and fatal as a
-    // value. This is the distinction the description draws, and it holds in both directions.
     let hint = run(&group, "x: list[int] = [1]\nx").await;
     assert_eq!(hint["outcome"], "completed", "{hint}");
-    let value = run(&group, "y = list[int]\n1").await;
-    assert_eq!(value["outcome"], "exception", "{value}");
-    assert_eq!(value["exception"]["type"], "TypeError", "{value}");
+    let value = run(&group, "[str(list[int]), str(dict[str, int])]").await;
+    assert_eq!(value["outcome"], "completed", "{value}");
+    assert_eq!(
+        value["result"],
+        json!(["list[int]", "dict[str, int]"]),
+        "{value}"
+    );
 
     group.shutdown().await;
 }
@@ -523,28 +563,21 @@ async fn some_modules_pass_the_type_check_and_then_fail_at_import() {
     group.shutdown().await;
 }
 
-/// Both formatting habits the subset omits arrive as unrelated exception types, and the `%` one
-/// names neither formatting nor f-strings. Without guidance it reads as an arithmetic error.
 #[tokio::test]
-async fn both_formatting_habits_redirect_to_f_strings() {
-    let group = group_or_skip!();
-    for (label, code, exc) in [
-        ("str.format", "'{}'.format(1)", "AttributeError"),
-        ("percent", "'%s' % 'x'", "TypeError"),
-    ] {
-        let output = run(&group, code).await;
-        assert_eq!(output["outcome"], "exception", "{label}: {output}");
-        assert_eq!(output["exception"]["type"], exc, "{label}");
-        let diagnostic = output["diagnostic"].as_str().expect("guidance");
-        assert!(diagnostic.contains("f-strings"), "{label}: {diagnostic}");
+async fn formatting_works_and_bad_formats_are_ordinary_python_errors() {
+    for type_check in [false, true] {
+        let group = group_or_skip!(type_check);
+        let output = run(&group, "['{}'.format(1), '%s' % 'x', f'{15:04x}', 7 % 3]").await;
+        assert_eq!(output["outcome"], "completed", "{output}");
+        assert_eq!(output["result"], json!(["1", "x", "000f", 1]), "{output}");
+        for code in ["'{'.format()", "'{:invalid}'.format(1)"] {
+            let output = run(&group, code).await;
+            assert_eq!(output["outcome"], "exception", "{output}");
+            assert_eq!(output["exception"]["type"], "ValueError", "{output}");
+            assert!(output["diagnostic"].is_null(), "{output}");
+        }
+        group.shutdown().await;
     }
-
-    // Integer `%` is modulo and must not be mistaken for the formatting operator.
-    let modulo = run(&group, "7 % 3").await;
-    assert_eq!(modulo["result"], json!(1), "{modulo}");
-    assert!(modulo["diagnostic"].is_null(), "{modulo}");
-
-    group.shutdown().await;
 }
 
 /// The arity failure surfaces as a `RuntimeError` describing an internal error in Monty, which tells
@@ -573,7 +606,7 @@ async fn multi_argument_exception_constructors_are_explained() {
 #[tokio::test]
 async fn import_guidance_never_names_a_module_that_is_missing() {
     let group = group_or_skip!();
-    let output = run(&group, "import functools").await;
+    let output = run(&group, "import socket").await;
     let diagnostic = output["diagnostic"].as_str().expect("guidance");
     // Only the enumeration is under test. The trailing parenthetical echoes Monty's own message,
     // which necessarily repeats the module the caller asked for.
@@ -584,14 +617,15 @@ async fn import_guidance_never_names_a_module_that_is_missing() {
         .split_once('.')
         .expect("the enumeration is a sentence")
         .0;
-    for absent in ["base64", "binascii", "functools"] {
+    for absent in ["socket", "subprocess", "statistics"] {
         assert!(
             !offered.contains(absent),
             "guidance offered {absent}, which the worker cannot import: {offered}"
         );
     }
-    // The enumeration is still present rather than having been emptied out.
-    assert!(offered.contains("unicodedata"), "{offered}");
+    for available in SUBSET_MODULES {
+        assert!(offered.contains(available), "{available}: {offered}");
+    }
     group.shutdown().await;
 }
 
@@ -607,6 +641,8 @@ async fn unstubbed_builtins_run_but_are_rejected_by_type_checking() {
             absent.push(format!("{name} -> {}", output["exception"]));
         }
     }
+    let formatted = run(&permissive, "format(15, '04x')").await;
+    assert_eq!(formatted["result"], "000f", "{formatted}");
     permissive.shutdown().await;
     assert!(
         absent.is_empty(),
@@ -614,6 +650,17 @@ async fn unstubbed_builtins_run_but_are_rejected_by_type_checking() {
     );
 
     let checked = group_or_skip!(true);
+    for name in UNTYPED_BUILTINS {
+        let output = run(&checked, name).await;
+        assert_eq!(output["outcome"], "rejected", "{name}: {output}");
+        assert!(
+            output["diagnostic"]
+                .as_str()
+                .expect("guidance")
+                .contains("missing from its type stubs"),
+            "{name}: {output}"
+        );
+    }
     let output = run(&checked, "list(map(str, [1, 2]))").await;
     assert_eq!(output["outcome"], "rejected");
     let diagnostic = output["diagnostic"].as_str().expect("guidance");
@@ -693,6 +740,125 @@ async fn environment_reads_return_nothing_rather_than_leaking() {
 }
 
 #[tokio::test]
+async fn clocks_entropy_and_sleep_cannot_bypass_the_os_refusal() {
+    for type_check in [false, true] {
+        let group = group_or_skip!(type_check);
+        for code in [
+            "from datetime import date\ndate.today()",
+            "from datetime import datetime\ndatetime.now()",
+            "import time\ntime.time()",
+            "import time\ntime.monotonic()",
+            "import time\ntime.perf_counter()",
+            "import time\ntime.sleep(0)",
+            "import asyncio\nawait asyncio.sleep(0)",
+            "import os\nos.urandom(1)",
+            "import random\nrandom.random()",
+            "import random\nrandom.Random().random()",
+        ] {
+            let output = run(&group, code).await;
+            assert_eq!(output["outcome"], "exception", "{code}: {output}");
+            assert_eq!(
+                output["exception"]["type"], "RuntimeError",
+                "{code}: {output}"
+            );
+            assert!(
+                output["exception"]["message"]
+                    .as_str()
+                    .expect("message")
+                    .contains("not supported in this environment"),
+                "{code}: {output}"
+            );
+        }
+        let output = run(
+            &group,
+            "import time\n[time.process_time(), time.thread_time(), time.timezone, time.tzname]",
+        )
+        .await;
+        assert_eq!(
+            output["result"],
+            json!([0.0, 0.0, 0, ["UTC", "UTC"]]),
+            "{output}"
+        );
+        group.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn unmounted_reads_writes_and_process_modules_stay_unavailable() {
+    let directory = tempfile::tempdir().expect("test directory");
+    let path = directory.path().join("sentinel.txt");
+    std::fs::write(&path, "unchanged").expect("sentinel");
+    let path_literal = serde_json::to_string(&path.to_string_lossy()).expect("path literal");
+    for type_check in [false, true] {
+        let group = group_or_skip!(type_check);
+        for operation in ["read_text()", "write_text('changed')", "unlink()", "stat()"] {
+            let output = run(
+                &group,
+                &format!("from pathlib import Path\nPath({path_literal}).{operation}"),
+            )
+            .await;
+            assert_eq!(output["outcome"], "exception", "{operation}: {output}");
+            assert_eq!(
+                output["exception"]["type"], "PermissionError",
+                "{operation}: {output}"
+            );
+        }
+        let output = run(&group, &format!("open({path_literal}).read()")).await;
+        if type_check {
+            assert_eq!(output["outcome"], "rejected", "{output}");
+            assert!(
+                output["diagnostic"]
+                    .as_str()
+                    .expect("guidance")
+                    .contains("file tools")
+            );
+        } else {
+            assert_eq!(output["exception"]["type"], "PermissionError", "{output}");
+        }
+        for module in ["socket", "subprocess", "requests"] {
+            let output = run(&group, &format!("import {module}")).await;
+            assert_eq!(
+                output["outcome"],
+                if type_check { "rejected" } else { "exception" },
+                "{module}: {output}"
+            );
+        }
+        group.shutdown().await;
+    }
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("sentinel survives"),
+        "unchanged"
+    );
+}
+
+#[tokio::test]
+async fn shared_and_cyclic_wire_values_render_without_unbounded_expansion() {
+    let group = group_or_skip!();
+    let shared = run(&group, "a = [1, 2]\n[a, a]").await;
+    assert_eq!(shared["result"], json!([[1, 2], [1, 2]]), "{shared}");
+    assert!(shared["resultRepr"].is_null(), "{shared}");
+    let cyclic = run(&group, "a = []\na.append(a)\na").await;
+    assert_eq!(cyclic["result"], json!(["[...]"]), "{cyclic}");
+    assert_eq!(cyclic["resultRepr"], "[[...]]", "{cyclic}");
+    for leaf in ["1", "b'x'"] {
+        let large = run(
+            &group,
+            &format!("a = {leaf}\nfor _ in range(20):\n    a = [a, a]\na"),
+        )
+        .await;
+        assert_eq!(large["outcome"], "completed", "{large}");
+        assert!(large["result"].is_null());
+        assert!(
+            large["resultRepr"]
+                .as_str()
+                .expect("omission notice")
+                .contains("rendering budget")
+        );
+    }
+    group.shutdown().await;
+}
+
+#[tokio::test]
 async fn network_modules_are_absent() {
     let group = group_or_skip!();
     let output = run(&group, "import socket").await;
@@ -726,11 +892,11 @@ async fn unsupported_syntax_is_rejected_before_running() {
 #[tokio::test]
 async fn missing_builtins_are_explained() {
     let group = group_or_skip!();
-    let output = run(&group, "eval('1 + 1')").await;
+    let output = run(&group, "compile('1 + 1', 'snippet', 'eval')").await;
     assert_eq!(output["outcome"], "exception");
     assert_eq!(output["exception"]["type"], "NameError");
     let diagnostic = output["diagnostic"].as_str().expect("guidance");
-    assert!(diagnostic.contains("eval"));
+    assert!(diagnostic.contains("compile"));
     group.shutdown().await;
 }
 
@@ -924,7 +1090,7 @@ async fn withheld_capabilities_are_redirected_under_the_default_type_checking() 
             .contains("Third-party packages cannot be installed")
     );
 
-    let builtin = run(&group, "eval('1 + 1')").await;
+    let builtin = run(&group, "compile('1 + 1', 'snippet', 'eval')").await;
     assert_eq!(builtin["outcome"], "rejected");
     assert!(
         builtin["diagnostic"]
@@ -951,5 +1117,129 @@ json.dumps(rows)",
         output["result"],
         json!(r#"[{"n": 0, "sq": 0}, {"n": 1, "sq": 1}, {"n": 2, "sq": 4}, {"n": 3, "sq": 9}]"#)
     );
+    group.shutdown().await;
+}
+
+#[tokio::test]
+async fn v1_computation_works_without_adding_host_capabilities() {
+    for type_check in [false, true] {
+        let group = group_or_skip!(type_check);
+        for (code, expected) in [
+            (
+                "import base64, binascii\n[base64.b64encode(b'hello').decode(), binascii.hexlify(b'hi').decode()]",
+                json!(["aGVsbG8=", "6869"]),
+            ),
+            (
+                "import copy\na = [[1]]\nb = copy.deepcopy(a)\nb[0].append(2)\n[a, b]",
+                json!([[[1]], [[1, 2]]]),
+            ),
+            (
+                "import functools\nfunctools.reduce(lambda a, b: a + b, [1, 2, 3])",
+                json!(6),
+            ),
+            (
+                "import random\nrandom.seed(42)\n[random.randint(1, 10), random.Random(42).randint(1, 10)]",
+                json!([2, 2]),
+            ),
+            (
+                "scope = {'x': 2}\nexec('y = x + 3', scope)\n[eval('y * 2', scope), 'scope' in locals()]",
+                json!([10, true]),
+            ),
+            (
+                "import sys\n[sys.version_info.major, sys.version_info.minor, sys.maxsize > 0]",
+                json!([3, 14, true]),
+            ),
+            (
+                "from dataclasses import dataclass\n@dataclass\nclass A:\n    x: int\n    y: list[int]\nA(1, [2])",
+                json!({"x": 1, "y": [2]}),
+            ),
+            ("str(object)", json!("<class 'object'>")),
+        ] {
+            let output = run(&group, code).await;
+            assert_eq!(output["outcome"], "completed", "{code}: {output}");
+            assert_eq!(output["result"], expected, "{code}: {output}");
+        }
+        let output = run(&group, "object()").await;
+        assert_eq!(output["outcome"], "exception", "{output}");
+        assert_eq!(output["exception"]["type"], "TypeError", "{output}");
+        group.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn dynamic_code_inherits_os_refusals_and_execution_limits() {
+    let group = group_or_skip!(true);
+    for (code, exception) in [
+        ("eval(\"open('/etc/passwd').read()\")", "PermissionError"),
+        (
+            "exec(\"from pathlib import Path; Path('/etc/passwd').read_text()\")",
+            "PermissionError",
+        ),
+        ("exec('import socket')", "ModuleNotFoundError"),
+        ("exec('import subprocess')", "ModuleNotFoundError"),
+        ("exec('import time; time.time()')", "RuntimeError"),
+        ("exec('import random; random.random()')", "RuntimeError"),
+    ] {
+        let output = run(&group, code).await;
+        assert_eq!(output["outcome"], "exception", "{code}: {output}");
+        assert_eq!(output["exception"]["type"], exception, "{code}: {output}");
+    }
+    let output = run(&group, "scope = {}\nexec('import os; result = [os.getenv(\"PATH\"), len(os.environ)]', scope)\nscope['result']").await;
+    assert_eq!(output["result"], json!([null, 0]), "{output}");
+    let output = run_with(
+        &group,
+        json!({"code": "exec('while True: pass')", "timeoutSec": 1}),
+    )
+    .await;
+    assert_eq!(output["outcome"], "limited", "{output}");
+    assert_eq!(output["timedOut"], true, "{output}");
+    assert_eq!(run(&group, "6 * 7").await["result"], 42);
+    group.shutdown().await;
+}
+
+#[tokio::test]
+async fn resuming_os_calls_does_not_reset_the_feed_budget() {
+    let group = group_or_skip!();
+    let output = run_with(&group, json!({
+        "code": "import os\nwhile True:\n    for _ in range(1_000_000):\n        pass\n    os.getenv('PATH')",
+        "timeoutSec": 1,
+    })).await;
+    assert_eq!(output["outcome"], "limited", "{output}");
+    assert_eq!(output["timedOut"], true, "{output}");
+    assert_eq!(output["suspensionLimitExceeded"], false, "{output}");
+    group.shutdown().await;
+}
+
+#[tokio::test]
+async fn repeated_denied_os_calls_are_stopped_by_the_suspension_cap() {
+    let group = group_or_skip!();
+    let output = run(&group, "import os\nwhile True:\n    os.getenv('PATH')").await;
+    assert_eq!(output["outcome"], "limited", "{output}");
+    assert_eq!(output["suspensionLimitExceeded"], true, "{output}");
+    assert_eq!(output["timedOut"], false, "{output}");
+    assert_eq!(run(&group, "6 * 7").await["result"], 42);
+    group.shutdown().await;
+}
+
+#[tokio::test]
+async fn cancellation_discards_an_inflight_call_and_keeps_the_pool_usable() {
+    let group = group_or_skip!();
+    let cancellation = CancellationToken::new();
+    let running = group.execute(
+        CodeInput {
+            code: "while True: pass".to_owned(),
+            timeout_sec: Some(MAX_TIMEOUT_SECS),
+        },
+        cancellation.clone(),
+    );
+    tokio::pin!(running);
+    tokio::select! {
+        biased;
+        _ = &mut running => panic!("infinite snippet completed before cancellation"),
+        () = tokio::task::yield_now() => {}
+    }
+    cancellation.cancel();
+    assert!(running.await.expect("valid input").is_none());
+    assert_eq!(run(&group, "6 * 7").await["result"], 42);
     group.shutdown().await;
 }

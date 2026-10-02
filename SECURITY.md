@@ -386,10 +386,17 @@ run in a separate `monty` worker process, never in the server process. The worke
 filesystem access, no network access, no ability to spawn processes, and an explicitly empty
 environment, so `os.getenv` and `os.environ` observe nothing from the host and file access raises
 `PermissionError`. Each call is fed a fresh interpreter state, so nothing persists between calls.
+Workcell overrides Monty 1.0's system-clock, entropy, and sleep defaults: those operations suspend
+and are refused, process-time reads return zero, and the virtual timezone is UTC. No mounts or host
+functions are installed. Explicitly seeded random computation and arithmetic on supplied dates
+remain local to the interpreter.
 Snippets are bounded by a caller-supplied timeout capped at 30 seconds, a 256 MiB memory ceiling
 enforced by the worker's global allocator, bounded captured output, and a cap on interpreter
-suspensions. A worker that exhausts memory, overflows its stack, or otherwise aborts terminates only
-itself; the supervising server replaces it. This is process isolation for a language runtime, not an
+suspensions. The timeout bounds both an entire feed and each turn, so a suspension cannot reset the
+snippet's execution budget. Shared wire values are costed before expanding them into JSON or repr;
+an oversized expansion is omitted with an explicit notice. A worker that exhausts memory, overflows
+its stack, or otherwise aborts terminates only itself; the supervising server replaces it. This is
+process isolation for a language runtime, not an
 OS sandbox: the worker still runs with the identity and namespace of the deployment, so operator
 isolation remains mandatory.
 
@@ -523,7 +530,7 @@ appropriate. Protocol headers are routing and consistency checks, not authentica
 - Selected transfers check identity and content before publication or streaming, but cannot isolate
   the filesystem from external writers. Clients must verify downloaded length and digest before
   publishing locally, and replacement retains the revision-check/rename race described above.
-- Monty is pre-1.0 software on a `0.0.x` line with a version-coupled worker protocol. Workcell pins the
+- Monty 1.0 has a version-coupled worker protocol. Workcell pins the
   `monty-pool` dependency and the installed worker to the same release and they must be upgraded
   together; the build fails when the pins diverge and the pool reports any remaining skew as a fatal
   error on the first checkout. Treat interpreter escape as possible and do not rely on the code tool

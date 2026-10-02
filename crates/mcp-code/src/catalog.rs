@@ -26,12 +26,12 @@ Use this for computation: arithmetic and math, summary statistics computed direc
 Isolation:
 - No filesystem, no network, no environment variables, and no subprocesses. Use the file tools, webfetch, or shell when the task needs any of those.
 - Runs in a separate worker process under enforced time, memory, and recursion limits.
+- Host clocks, unseeded randomness, and sleep are refused. Seed random explicitly; supply dates and timestamps as data. Process-time reads return zero and the virtual timezone is UTC.
 
 This is a Python subset, not CPython. It rejects or fails on:
 - Class inheritance, metaclasses, super(), and decorators on methods, so @classmethod, @staticmethod, and @property are unavailable. Simple classes and @dataclass do work.
 - yield and generator functions, match statements, del, try*/except* groups, async with, async for, PEP 695 type aliases, wildcard imports, complex literals, and t-strings.
-- str.format(), %-formatting, str.translate(), and str.maketrans(). Use f-strings.
-- Subscripts and attributes as unpacking targets, so x[i], x[j] = x[j], x[i] and o.a, o.b = 1, 2 are refused. Swap through a temporary instead. Every other unpacking form works, including a, b = xs, a, *rest = xs, nested targets, for a, b in pairs, and *xs in calls and literals.
+- str.translate() and str.maketrans(). str.format(), %-formatting, and f-strings work.
 - Defining exception classes, since classes cannot inherit. Raise a built-in such as ValueError. Exception constructors take at most one string, so OSError(errno, message, path) fails, and raise X from Y parses but silently drops the cause.
 - These builtins, which are undefined and raise NameError: "#,
     withheld_builtins!(),
@@ -40,26 +40,29 @@ This is a Python subset, not CPython. It rejects or fails on:
 
 Only these standard library modules exist, each covering part of its CPython surface: "#,
     available_modules!(),
-    r#". There are no third-party packages, and no base64, binascii, functools, random, time, io, copy, string, struct, operator, statistics, enum, contextlib, hashlib, uuid, or urllib.
+    r#". There are no third-party packages, and no gc, io, string, struct, operator, statistics, enum, contextlib, hashlib, uuid, or urllib.
+
+Unpacking supports subscript and attribute targets, including x[i], x[j] = x[j], x[i]. eval(), exec(), and locals() work inside the same isolated interpreter; dynamic code gains no host access. Generic aliases such as list[int] work as values as well as annotations.
 
 Behaviour that differs from CPython even where the API exists:
 - "#,
     untyped_builtins!(),
-    r#" exist at runtime but are missing from the type stubs, so type checking rejects them before the snippet runs. Use a comprehension instead of map or filter. getattr and hasattr also cannot see methods, so hasattr returns False for attributes that do exist.
+    r#" exist at runtime but are missing from the type stubs, so type checking rejects them before the snippet runs. Use a comprehension instead of map or filter, and f-strings instead of format(). getattr and hasattr also cannot see methods, so hasattr returns False for attributes that do exist. object exists as a type but object() cannot create instances.
 - enumerate, zip, reversed, and generator expressions are eager and return lists, so an infinite iterator never terminates. iter() and the itertools functions stay lazy and single-use.
 - Operators do not dispatch to user-defined dunders, so +, -, <, len(), [], and () ignore __add__, __neg__, __lt__, __len__, __getitem__, and __call__ on your own classes. __init__, __repr__, __str__, __eq__, __hash__, __bool__, __iter__, and __contains__ do work; reach anything else by calling the method directly.
 - re is backed by fancy-regex: no bytes patterns, no VERBOSE flag, no re.subn, and re.sub takes a string replacement only, never a callable.
-- os exposes constants but no os.path, and sys exposes only version, platform, and the streams. Use pathlib for path manipulation.
+- os has no os.path. Use pathlib for path manipulation. sys includes version, version_info, platform, maxsize, and the streams, not the host environment.
 - dataclasses provides @dataclass with no arguments plus is_dataclass; field, asdict, astuple, fields, replace, and options such as frozen= are absent.
 - Only the utf-8, ascii, utf-16, and utf-32 codecs exist.
 
 Usage notes:
 - The code parameter is required and is bounded to 65536 UTF-8 bytes.
 - The value of the final expression is returned. Use print() for intermediate output.
+- Oversized expanded values are omitted with an explicit rendering-budget notice; shared references cannot expand without bound in the host.
 - timeoutSec is optional, in seconds from 1 to 30. Omit it unless the snippet is expected to outlast the 5 second default. A value outside that range is rejected rather than clamped.
 - Each call is independent. No variables, definitions, or imports persist between calls.
 - Snippets are type checked before running unless the operator disables it, so unsupported APIs and unavailable names usually fail before any output is produced.
-- Type annotations are never required. Unannotated code is inferred permissively, so xs = [] then xs.append(1) then xs.append('a') passes. An annotation only adds a constraint that is then enforced, so when a diagnostic names one, widen or remove it rather than annotating more. Annotations themselves are never evaluated, which is why x: list[int] is fine while the same expression in a value position raises TypeError.
+- Type annotations are never required. Unannotated code is inferred permissively, so xs = [] then xs.append(1) then xs.append('a') passes. An annotation only adds a constraint that is then enforced, so when a diagnostic names one, widen or remove it rather than annotating more. Annotations themselves are never evaluated.
 - Passing the type check does not guarantee the snippet runs: abc, types, typing_extensions, _collections_abc, and _typeshed resolve during checking and then raise ModuleNotFoundError at import.
 - Raised exceptions are completed results carrying the exception type and message, so the caller can correct the script and retry."#
 );

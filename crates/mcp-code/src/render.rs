@@ -5,12 +5,18 @@
 //! identity or precision. Emitting the repr unconditionally would double every payload for the
 //! common case of a number or a string.
 
-use monty_types::MontyObject;
+use monty_types::{
+    MontyObject, ObjectRef,
+    unstable::{MontyNode, NodeId, child, graph_parts, node},
+};
 use serde_json::{Map, Value};
 
 /// Independent of Monty's own value-depth cap: this bounds the JSON we build, not the frame we
 /// received, so a deeply nested value degrades to its repr instead of recursing.
 const MAX_RENDER_DEPTH: usize = 32;
+const MAX_RENDER_COST: usize = 8 * 1024 * 1024;
+const MAX_ESCAPE_EXPANSION: usize = 6;
+const OMITTED_VALUE: &str = "<value omitted: expanded representation exceeds the rendering budget>";
 
 /// A rendered value plus whether JSON lost anything a caller might need.
 pub(crate) struct Rendered {
@@ -29,51 +35,63 @@ impl Rendered {
 
 /// Renders a returned value, pairing JSON with a repr only when JSON is not faithful.
 pub(crate) fn render(object: &MontyObject) -> (Value, Option<String>) {
-    let rendered = render_inner(object, 0);
+    if !within_render_budget(object) {
+        return (Value::Null, Some(OMITTED_VALUE.to_owned()));
+    }
+    let rendered = render_inner(object.as_ref(), 0);
     let repr = rendered.lossy.then(|| object.to_string());
     (rendered.json, repr)
 }
 
-// One arm per `MontyObject` variant. The match is deliberately exhaustive rather than defaulted, so
-// a new Monty variant becomes a compile error here instead of silently rendering as `null`.
-fn render_inner(object: &MontyObject, depth: usize) -> Rendered {
+fn within_render_budget(object: &MontyObject) -> bool {
+    let (graph, root) = graph_parts(object);
+    let mut costs = Vec::<usize>::with_capacity(graph.len());
+    for node in graph.nodes() {
+        let mut cost = node.decoded_size().saturating_mul(MAX_ESCAPE_EXPANSION);
+        node.for_each_child(|id| cost = cost.saturating_add(costs[id.index()]));
+        costs.push(cost.min(MAX_RENDER_COST + 1));
+    }
+    costs[root.index()] <= MAX_RENDER_COST
+}
+
+fn render_inner(object: ObjectRef<'_>, depth: usize) -> Rendered {
     if depth >= MAX_RENDER_DEPTH {
         return Rendered::lossy(Value::Null);
     }
-    match object {
+    match node(object) {
         // Faithful in JSON: the type survives the round trip.
-        MontyObject::None => Rendered::exact(Value::Null),
-        MontyObject::Bool(value) => Rendered::exact(Value::Bool(*value)),
-        MontyObject::Int(value) => Rendered::exact(Value::Number((*value).into())),
-        MontyObject::String(value) => Rendered::exact(Value::String(value.clone())),
-        MontyObject::Float(value) => serde_json::Number::from_f64(*value).map_or_else(
+        MontyNode::None => Rendered::exact(Value::Null),
+        MontyNode::Bool(value) => Rendered::exact(Value::Bool(*value)),
+        MontyNode::Int(value) => Rendered::exact(Value::Number((*value).into())),
+        MontyNode::String(value) => Rendered::exact(Value::String(value.clone())),
+        MontyNode::Float(value) => serde_json::Number::from_f64(*value).map_or_else(
             // NaN and the infinities have no JSON literal; only the repr can carry them.
             || Rendered::lossy(Value::Null),
             |number| Rendered::exact(Value::Number(number)),
         ),
-        MontyObject::List(items) => render_sequence(items, depth, false),
+        MontyNode::List(items) => render_sequence(object, items, depth, false),
 
         // Representable, but the JSON form drops the Python type.
-        MontyObject::Tuple(items) | MontyObject::Set(items) | MontyObject::FrozenSet(items) => {
-            render_sequence(items, depth, true)
+        MontyNode::Tuple(items) | MontyNode::Set(items) | MontyNode::FrozenSet(items) => {
+            render_sequence(object, items, depth, true)
         }
         // A big integer exceeds JSON's safe numeric range, so it crosses as a decimal string.
-        MontyObject::BigInt(value) => Rendered::lossy(Value::String(value.to_string())),
-        MontyObject::Dict(pairs) => {
+        MontyNode::BigInt(value) => Rendered::lossy(Value::String(value.to_string())),
+        MontyNode::Dict(pairs) => {
             let mut map = Map::new();
             let mut lossy = false;
             let mut fallback = Vec::new();
             for (key, value) in pairs {
-                let rendered = render_inner(value, depth + 1);
+                let rendered = render_inner(child(object, *value), depth + 1);
                 lossy |= rendered.lossy;
-                match key {
-                    MontyObject::String(name) => {
+                match node(child(object, *key)) {
+                    MontyNode::String(name) => {
                         map.insert(name.clone(), rendered.json);
                     }
                     // Non-string keys have no JSON object equivalent, so the whole dict degrades to
                     // an entry list rather than silently stringifying keys into a lossy object.
-                    other => {
-                        fallback.push((other.to_string(), rendered.json));
+                    _ => {
+                        fallback.push((child(object, *key).to_string(), rendered.json));
                     }
                 }
             }
@@ -90,52 +108,62 @@ fn render_inner(object: &MontyObject, depth: usize) -> Rendered {
                 .collect();
             Rendered::lossy(Value::Array(entries))
         }
-        MontyObject::NamedTuple {
+        MontyNode::NamedTuple {
             field_names,
             values,
             ..
         } => {
             let mut map = Map::new();
             for (name, value) in field_names.iter().zip(values) {
-                map.insert(name.clone(), render_inner(value, depth + 1).json);
+                map.insert(
+                    name.clone(),
+                    render_inner(child(object, *value), depth + 1).json,
+                );
             }
             Rendered::lossy(Value::Object(map))
         }
-        MontyObject::Dataclass { attrs, .. } => {
+        MontyNode::ClassInstance { attrs, .. } => {
             let mut map = Map::new();
             for (key, value) in attrs {
-                let rendered = render_inner(value, depth + 1);
-                map.insert(key.to_string(), rendered.json);
+                let rendered = render_inner(child(object, *value), depth + 1);
+                map.insert(child(object, *key).to_string(), rendered.json);
             }
             Rendered::lossy(Value::Object(map))
         }
 
         // No JSON analogue at all: the repr is the only faithful form, and the string rendering is
         // provided so a caller that only reads `result` still sees something meaningful.
-        MontyObject::Bytes(_)
-        | MontyObject::Date(_)
-        | MontyObject::DateTime(_)
-        | MontyObject::TimeDelta(_)
-        | MontyObject::TimeZone(_)
-        | MontyObject::Path(_)
-        | MontyObject::Type(_)
-        | MontyObject::BuiltinFunction(_)
-        | MontyObject::FileHandle(_)
-        | MontyObject::Function { .. }
-        | MontyObject::Exception { .. }
-        | MontyObject::Repr(_)
-        | MontyObject::Cycle(_, _)
-        | MontyObject::Ellipsis
-        | MontyObject::NotImplemented => Rendered::lossy(Value::String(object.to_string())),
+        MontyNode::Bytes(_)
+        | MontyNode::Date(_)
+        | MontyNode::DateTime(_)
+        | MontyNode::Time(_)
+        | MontyNode::TimeDelta(_)
+        | MontyNode::TimeZone(_)
+        | MontyNode::Path(_)
+        | MontyNode::Type(_)
+        | MontyNode::ClassType(_)
+        | MontyNode::BuiltinFunction(_)
+        | MontyNode::FileHandle(_)
+        | MontyNode::Function { .. }
+        | MontyNode::Exception { .. }
+        | MontyNode::Repr(_)
+        | MontyNode::Cycle(_)
+        | MontyNode::Ellipsis
+        | MontyNode::NotImplemented => Rendered::lossy(Value::String(object.to_string())),
     }
 }
 
-fn render_sequence(items: &[MontyObject], depth: usize, type_lost: bool) -> Rendered {
+fn render_sequence(
+    object: ObjectRef<'_>,
+    items: &[NodeId],
+    depth: usize,
+    type_lost: bool,
+) -> Rendered {
     let mut lossy = type_lost;
     let values = items
         .iter()
         .map(|item| {
-            let rendered = render_inner(item, depth + 1);
+            let rendered = render_inner(child(object, *item), depth + 1);
             lossy |= rendered.lossy;
             rendered.json
         })
@@ -195,16 +223,18 @@ impl Capture {
 
 #[cfg(test)]
 mod tests {
+    use monty_types::unstable::{MontyGraph, object_from_graph};
+
     use super::*;
 
     #[test]
     fn plain_scalars_need_no_repr() {
         for object in [
-            MontyObject::None,
-            MontyObject::Bool(true),
-            MontyObject::Int(42),
-            MontyObject::Float(1.5),
-            MontyObject::String("hi".into()),
+            MontyObject::none(),
+            MontyObject::bool(true),
+            MontyObject::int(42),
+            MontyObject::float(1.5),
+            MontyObject::string("hi"),
         ] {
             let (_, repr) = render(&object);
             assert!(repr.is_none(), "{object:?} should render exactly");
@@ -213,12 +243,12 @@ mod tests {
 
     #[test]
     fn json_matches_python_values() {
-        assert_eq!(render(&MontyObject::Int(42)).0, serde_json::json!(42));
-        assert_eq!(render(&MontyObject::None).0, Value::Null);
+        assert_eq!(render(&MontyObject::int(42)).0, serde_json::json!(42));
+        assert_eq!(render(&MontyObject::none()).0, Value::Null);
         assert_eq!(
-            render(&MontyObject::List(vec![
-                MontyObject::Int(1),
-                MontyObject::String("a".into())
+            render(&MontyObject::list(vec![
+                MontyObject::int(1),
+                MontyObject::string("a")
             ]))
             .0,
             serde_json::json!([1, "a"])
@@ -229,19 +259,19 @@ mod tests {
     fn lossy_values_carry_a_repr() {
         // A tuple survives as an array but loses its type, so the repr disambiguates it from a list.
         // The exact repr text is Monty's to define; only its presence is our contract.
-        let (json, repr) = render(&MontyObject::Tuple(vec![MontyObject::Int(1)]));
+        let (json, repr) = render(&MontyObject::tuple(vec![MontyObject::int(1)]));
         assert_eq!(json, serde_json::json!([1]));
         assert!(repr.is_some_and(|text| text.starts_with('(')));
 
         // A non-finite float has no JSON literal at all.
-        let (json, repr) = render(&MontyObject::Float(f64::INFINITY));
+        let (json, repr) = render(&MontyObject::float(f64::INFINITY));
         assert_eq!(json, Value::Null);
         assert!(repr.is_some());
     }
 
     #[test]
     fn lossiness_propagates_out_of_containers() {
-        let (_, repr) = render(&MontyObject::List(vec![MontyObject::Bytes(vec![1])]));
+        let (_, repr) = render(&MontyObject::list(vec![MontyObject::bytes(vec![1])]));
         assert!(
             repr.is_some(),
             "a list holding a lossy element is itself lossy"
@@ -250,7 +280,7 @@ mod tests {
 
     #[test]
     fn string_keyed_dicts_become_objects() {
-        let dict = MontyObject::dict(vec![(MontyObject::String("k".into()), MontyObject::Int(1))]);
+        let dict = MontyObject::dict(vec![(MontyObject::string("k"), MontyObject::int(1))]);
         let (json, repr) = render(&dict);
         assert_eq!(json, serde_json::json!({"k": 1}));
         assert!(repr.is_none());
@@ -258,7 +288,7 @@ mod tests {
 
     #[test]
     fn non_string_keyed_dicts_degrade_to_entry_lists() {
-        let dict = MontyObject::dict(vec![(MontyObject::Int(1), MontyObject::Int(2))]);
+        let dict = MontyObject::dict(vec![(MontyObject::int(1), MontyObject::int(2))]);
         let (json, repr) = render(&dict);
         assert_eq!(json, serde_json::json!([["1", 2]]));
         assert!(repr.is_some());
@@ -266,12 +296,39 @@ mod tests {
 
     #[test]
     fn deep_nesting_degrades_instead_of_recursing() {
-        let mut object = MontyObject::Int(1);
+        let mut object = MontyObject::int(1);
         for _ in 0..(MAX_RENDER_DEPTH + 8) {
-            object = MontyObject::List(vec![object]);
+            object = MontyObject::list(vec![object]);
         }
         let (_, repr) = render(&object);
         assert!(repr.is_some());
+    }
+
+    #[test]
+    fn shared_graphs_are_bounded_before_json_or_repr_expansion() {
+        for leaf in [MontyNode::Int(1), MontyNode::Bytes(vec![1])] {
+            let mut graph = MontyGraph::new();
+            let mut root = graph.push(leaf);
+            for _ in 0..16 {
+                root = graph.push(MontyNode::List(vec![root, root]));
+            }
+            let value = object_from_graph(graph, root).expect("valid shared graph");
+            let (json, repr) = render(&value);
+            assert!(json.is_null());
+            assert_eq!(repr.as_deref(), Some(OMITTED_VALUE));
+        }
+    }
+
+    #[test]
+    fn small_shared_values_render_each_reference_without_losing_types() {
+        let mut graph = MontyGraph::new();
+        let item = graph.push(MontyNode::Int(1));
+        let tuple = graph.push(MontyNode::Tuple(vec![item, item]));
+        let root = graph.push(MontyNode::List(vec![tuple, tuple]));
+        let value = object_from_graph(graph, root).expect("valid shared graph");
+        let (json, repr) = render(&value);
+        assert_eq!(json, serde_json::json!([[1, 1], [1, 1]]));
+        assert_eq!(repr.as_deref(), Some("[(1, 1), (1, 1)]"));
     }
 
     #[test]

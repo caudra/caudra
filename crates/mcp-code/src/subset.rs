@@ -1,12 +1,5 @@
 //! Canonical statement of what the Monty subset provides.
 //!
-//! The tool description and the failure diagnostics both enumerate the subset. They were
-//! independent hand-written prose until `base64`, `binascii`, and `functools` — modules Monty has
-//! never implemented — survived in both, so an agent whose import failed received guidance naming
-//! the same three absent modules and retried into a loop. Nothing here is derived from CPython's
-//! library or from Monty's changelog; it is derived from the worker, and the live-worker tests in
-//! `tests/execution.rs` fail if any list drifts from what the interpreter actually does.
-//!
 //! The prose forms are macros rather than constants because the description splices them into a
 //! string literal at compile time and `concat!` accepts only literals.
 
@@ -15,14 +8,14 @@
 /// Verified name by name against a running worker by `every_advertised_module_imports`.
 macro_rules! available_modules {
     () => {
-        "asyncio, collections, dataclasses, datetime, itertools, json, math, os, pathlib, re, sys, typing, unicodedata"
+        "asyncio, base64, binascii, collections, copy, dataclasses, datetime, functools, itertools, json, math, os, pathlib, random, re, sys, time, typing, unicodedata"
     };
 }
 
 /// Builtins the interpreter does not define at all, so referencing one raises `NameError`.
 macro_rules! withheld_builtins {
     () => {
-        "eval, exec, compile, __import__, globals, locals, vars, dir, input, breakpoint, help, exit, super, callable, issubclass, delattr, staticmethod, classmethod, bytearray, complex, memoryview, object, format, ascii, aiter, and anext"
+        "compile, __import__, globals, vars, dir, input, breakpoint, help, exit, super, callable, issubclass, delattr, staticmethod, classmethod, bytearray, complex, memoryview, ascii, aiter, and anext"
     };
 }
 
@@ -34,7 +27,7 @@ macro_rules! withheld_builtins {
 /// under a configuration most callers never see.
 macro_rules! untyped_builtins {
     () => {
-        "map, filter, getattr, setattr, and hasattr"
+        "map, filter, getattr, setattr, hasattr, and format"
     };
 }
 
@@ -44,18 +37,24 @@ pub(crate) use {available_modules, untyped_builtins, withheld_builtins};
 ///
 /// Public because the contract belongs to this crate and a host restating it — or a test holding the
 /// description to the worker — must not retype the list, which is how the lists diverged before.
-pub const SUBSET_MODULES: [&str; 13] = [
+pub const SUBSET_MODULES: [&str; 19] = [
     "asyncio",
+    "base64",
+    "binascii",
     "collections",
+    "copy",
     "dataclasses",
     "datetime",
+    "functools",
     "itertools",
     "json",
     "math",
     "os",
     "pathlib",
+    "random",
     "re",
     "sys",
+    "time",
     "typing",
     "unicodedata",
 ];
@@ -65,13 +64,10 @@ pub const SUBSET_MODULES: [&str; 13] = [
 /// Type checking reports each as an unresolved reference, which reads as a typo unless the caller is
 /// told it is withheld on purpose, so `diagnose` uses this to pick its wording. Every entry is
 /// asserted to raise `NameError` on a live worker by `every_withheld_builtin_is_actually_absent`.
-pub const WITHHELD_BUILTINS: [&str; 26] = [
-    "eval",
-    "exec",
+pub const WITHHELD_BUILTINS: [&str; 21] = [
     "compile",
     "__import__",
     "globals",
-    "locals",
     "vars",
     "dir",
     "input",
@@ -87,8 +83,6 @@ pub const WITHHELD_BUILTINS: [&str; 26] = [
     "bytearray",
     "complex",
     "memoryview",
-    "object",
-    "format",
     "ascii",
     "aiter",
     "anext",
@@ -100,7 +94,8 @@ pub const WITHHELD_BUILTINS: [&str; 26] = [
 ///
 /// `open` belongs to this set behaviourally but is deliberately excluded: it is answered by the
 /// isolation refusal, which is a more useful thing to say than anything about type stubs.
-pub const UNTYPED_BUILTINS: [&str; 5] = ["map", "filter", "getattr", "setattr", "hasattr"];
+pub const UNTYPED_BUILTINS: [&str; 6] =
+    ["map", "filter", "getattr", "setattr", "hasattr", "format"];
 
 /// Renders a name list the way the prose does, so a diagnostic that has to build one at runtime
 /// reads the same as the ones spliced into the description.
@@ -143,11 +138,9 @@ mod tests {
         }
     }
 
-    /// The three modules that were advertised for as long as the description existed and have never
-    /// been resolvable. Guarding the regression by name is cheap and states the lesson.
     #[test]
     fn modules_monty_does_not_implement_are_never_advertised() {
-        for absent in ["base64", "binascii", "functools", "statistics", "random"] {
+        for absent in ["socket", "subprocess", "statistics", "hashlib", "urllib"] {
             assert!(
                 !SUBSET_MODULES.contains(&absent),
                 "{absent} is not resolvable by the worker and must not be advertised"

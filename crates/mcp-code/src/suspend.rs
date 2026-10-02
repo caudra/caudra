@@ -35,9 +35,6 @@ pub(crate) fn answer(event: &TurnEvent) -> Answer {
         // the message consistent with what Monty documents for an unmounted path. It is only valid
         // for an OS call.
         TurnEvent::OsCall { .. } => Answer::Resume(ResumeValue::NotHandled),
-        // Calling an unknown name suspends as a function call rather than a name lookup, so this is
-        // the arm that catches `eval(...)`, `open(...)`, and every other absent callable. `NotFound`
-        // raises `NameError`, matching what Monty documents for the unimplemented builtins.
         TurnEvent::FunctionCall { .. } => Answer::Resume(ResumeValue::NotFound),
         // No host functions are exposed, so an undefined name is exactly that.
         TurnEvent::NameLookup { .. } => Answer::NameError,
@@ -57,20 +54,24 @@ fn empty_environment(function_name: &str) -> MontyObject {
     if function_name == "os.environ" {
         MontyObject::dict(Vec::new())
     } else {
-        MontyObject::None
+        MontyObject::none()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use monty_types::SourceRange;
+
     use super::*;
 
     fn os_call(name: &str) -> TurnEvent {
         TurnEvent::OsCall {
             function_name: name.to_owned(),
-            args: Vec::new(),
-            kwargs: Vec::new(),
+            args: Default::default(),
             call_id: 1,
+            allow_eager_await: false,
+            system_sleep: None,
+            position: SourceRange::unknown(),
         }
     }
 
@@ -89,40 +90,37 @@ mod tests {
 
     #[test]
     fn environment_reads_yield_an_empty_environment() {
-        assert!(matches!(
-            answer(&os_call("os.getenv")),
-            Answer::Resume(ResumeValue::Return(MontyObject::None))
-        ));
-        let Answer::Resume(ResumeValue::Return(MontyObject::Dict(pairs))) =
-            answer(&os_call("os.environ"))
-        else {
-            panic!("os.environ must resolve to a mapping");
-        };
-        assert!(
-            pairs.is_empty(),
-            "no host environment value may cross the boundary"
-        );
+        for (name, expected) in [
+            ("os.getenv", MontyObject::none()),
+            ("os.environ", MontyObject::dict(Vec::new())),
+        ] {
+            let Answer::Resume(ResumeValue::Return(value)) = answer(&os_call(name)) else {
+                panic!("environment reads must resolve to an empty value");
+            };
+            assert_eq!(value, expected);
+        }
     }
 
     #[test]
     fn undefined_names_stay_undefined() {
         let event = TurnEvent::NameLookup {
             name: "requests".to_owned(),
+            object_id: None,
+            position: SourceRange::unknown(),
         };
         assert!(matches!(answer(&event), Answer::NameError));
     }
 
     #[test]
     fn calls_to_absent_names_raise_name_error() {
-        // Monty surfaces `eval(...)` and friends as a function call, not a name lookup, so this arm
-        // is what makes the unimplemented builtins report `NameError` as documented.
-        for name in ["eval", "exec", "compile", "fetch_from_host"] {
+        for name in ["compile", "__import__", "fetch_from_host"] {
             let event = TurnEvent::FunctionCall {
                 function_name: name.to_owned(),
-                args: Vec::new(),
-                kwargs: Vec::new(),
+                args: Default::default(),
                 call_id: 1,
-                method_call: false,
+                object_id: None,
+                allow_eager_await: false,
+                position: SourceRange::unknown(),
             };
             assert!(
                 matches!(answer(&event), Answer::Resume(ResumeValue::NotFound)),

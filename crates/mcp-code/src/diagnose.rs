@@ -33,17 +33,6 @@ pub(crate) fn diagnose(exception: &MontyException) -> Diagnosis {
                 )),
             }
         }
-        // The parser accepts only a name, tuple, list, or single starred name as an unpacking leaf,
-        // so the ordinary element-swap idiom is refused before anything runs. Upstream reports it as
-        // a plain `SyntaxError`, which reads as a mistake in the caller's own code; without the
-        // rewrite spelled out an agent retries the same line. Sandbox code can raise `SyntaxError`
-        // itself, so this matches the parser's wording rather than the type.
-        ExcType::SyntaxError if message.contains("invalid unpacking target") => Diagnosis {
-            outcome: Outcome::Rejected,
-            diagnostic: Some(format!(
-                "Unpacking cannot assign into a subscript or an attribute, and the snippet did not run. Assign through a temporary instead: replace `x[i], x[j] = x[j], x[i]` with `t = x[i]`, `x[i] = x[j]`, `x[j] = t`. Only plain names, tuples, lists, and one starred name are valid unpacking targets; every other form of unpacking works. ({message})"
-            )),
-        },
         ExcType::ModuleNotFoundError | ExcType::ImportError => Diagnosis {
             outcome: Outcome::Exception,
             diagnostic: Some(module_guidance(message)),
@@ -73,18 +62,6 @@ pub(crate) fn diagnose(exception: &MontyException) -> Diagnosis {
         ExcType::TimeoutError => Diagnosis {
             outcome: Outcome::Limited,
             diagnostic: Some(timeout_guidance(message)),
-        },
-        // The two CPython formatting habits the subset omits. `str.format` surfaces as a missing
-        // attribute; `%` surfaces as a missing operator, because `str` has no `__mod__`. They need
-        // the same redirection, and the operator message names neither formatting nor f-strings, so
-        // without this arm the most mechanical of the two failures is the one left unexplained.
-        ExcType::AttributeError if message.contains("format") => Diagnosis {
-            outcome: Outcome::Exception,
-            diagnostic: Some(formatting_guidance(message)),
-        },
-        ExcType::TypeError if message.contains("for %: 'str'") => Diagnosis {
-            outcome: Outcome::Exception,
-            diagnostic: Some(formatting_guidance(message)),
         },
         // Exception constructors take at most one string, and the arity failure arrives as an
         // internal error naming Monty rather than the call the caller wrote.
@@ -119,11 +96,6 @@ pub(crate) fn timeout_guidance(detail: &str) -> String {
     )
 }
 
-/// Shared wording for the two formatting mechanisms the subset omits.
-fn formatting_guidance(detail: &str) -> String {
-    format!("str.format() and %-formatting are not implemented. Use f-strings instead. ({detail})")
-}
-
 /// Guidance for an import the subset does not provide.
 ///
 /// The list must stay exactly the set the worker resolves. Naming a module Monty does not implement
@@ -154,7 +126,7 @@ fn untyped_name_guidance(name: &str) -> String {
         .filter(|candidate| *candidate != name)
         .collect();
     format!(
-        "`{name}` exists in the interpreter but is missing from its type stubs, so type checking rejects it before the snippet runs. The same is true of {}. Use a comprehension in place of map or filter, or ask the operator to disable type checking.",
+        "`{name}` exists in the interpreter but is missing from its type stubs, so type checking rejects it before the snippet runs. The same is true of {}. Use a comprehension in place of map or filter, f-strings in place of format(), or ask the operator to disable type checking.",
         oxford(&others)
     )
 }
@@ -235,7 +207,7 @@ mod tests {
         assert!(!file.contains("disable type checking"), "{file}");
 
         let builtin = diagnose_type_errors(
-            "snippet.py:1:1: error[unresolved-reference] Name `eval` used when not defined",
+            "snippet.py:1:1: error[unresolved-reference] Name `compile` used when not defined",
         );
         assert!(builtin.contains("not implemented"), "{builtin}");
         assert!(!builtin.contains("disable type checking"), "{builtin}");
@@ -298,7 +270,7 @@ mod tests {
             "guidance repeats the name it is already explaining: {text}"
         );
         assert!(
-            others.starts_with("filter, getattr, setattr, and hasattr"),
+            others.starts_with("filter, getattr, setattr, hasattr, and format"),
             "{text}"
         );
     }
@@ -327,28 +299,6 @@ mod tests {
         assert!(diagnosis.diagnostic.is_none());
     }
 
-    /// The parser refuses the target before anything runs, so this is a rejection rather than a
-    /// raise, and the guidance has to carry the rewrite: the caller cannot derive it from the
-    /// message, which names only the offending leaf kind.
-    #[test]
-    fn an_unsupported_unpacking_target_is_rejected_with_the_rewrite() {
-        for leaf in ["subscript", "attribute"] {
-            let diagnosis = diagnose(&exception(
-                ExcType::SyntaxError,
-                &format!("invalid unpacking target: {leaf}"),
-            ));
-            assert_eq!(diagnosis.outcome, Outcome::Rejected);
-            let text = diagnosis.diagnostic.expect("guidance");
-            assert!(text.contains("did not run"), "{text}");
-            assert!(text.contains("temporary"), "{text}");
-            // Saying only what fails would imply unpacking is broken generally, which it is not.
-            assert!(
-                text.contains("every other form of unpacking works"),
-                "{text}"
-            );
-        }
-    }
-
     /// Sandbox code can raise `SyntaxError` itself, so the type alone must not imply a rejection.
     #[test]
     fn a_plain_syntax_error_stays_an_exception() {
@@ -357,9 +307,8 @@ mod tests {
         assert!(diagnosis.diagnostic.is_none());
     }
 
-    /// The two formatting habits arrive as unrelated exception types and need one answer.
     #[test]
-    fn both_formatting_mechanisms_point_at_f_strings() {
+    fn formatting_errors_do_not_claim_formatting_is_unimplemented() {
         let attribute = diagnose(&exception(
             ExcType::AttributeError,
             "'str' object has no attribute 'format'",
@@ -370,17 +319,10 @@ mod tests {
         ));
         for diagnosis in [attribute, operator] {
             assert_eq!(diagnosis.outcome, Outcome::Exception);
-            assert!(
-                diagnosis
-                    .diagnostic
-                    .expect("guidance")
-                    .contains("f-strings")
-            );
+            assert!(diagnosis.diagnostic.is_none());
         }
     }
 
-    /// Integer `%` is modulo. Matching the operator alone would annotate ordinary arithmetic errors
-    /// with formatting advice, so the arm keys on the left operand being a string.
     #[test]
     fn modulo_type_errors_are_not_mistaken_for_formatting() {
         let diagnosis = diagnose(&exception(
