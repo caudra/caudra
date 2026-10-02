@@ -154,7 +154,7 @@ fn compile(document: &str) -> Result<Corpus, String> {
             match_output.push(CompiledMatchOutput {
                 pattern: compile_one(&entry.pattern)?,
                 message: entry.message.clone(),
-                unless: entry.unless.as_deref().map(&compile_one).transpose()?,
+                unless: entry.unless.as_deref().map(compile_one).transpose()?,
             });
         }
         let mut replace = Vec::with_capacity(document.replace.len());

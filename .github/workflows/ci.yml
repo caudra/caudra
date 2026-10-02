@@ -15,7 +15,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       # The code tool group runs snippets in a separate `monty` worker process, installed from the
@@ -34,7 +34,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --locked -p workcell-mcp-files --all-targets --all-features
       - run: cargo check --locked -p workcell --no-default-features --features files-index,snapshots

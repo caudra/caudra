@@ -22,7 +22,7 @@
 //! 4. **No `algebraic_*` float operation anywhere in this module.** Ripwire's fourth rule was to
 //!    compile the PageRank translation unit without `-ffast-math`. Rust has no such flag and no
 //!    per-function or per-crate equivalent, so for a long time this rule had no analogue. It does
-//!    now: Rust 1.98 — the version this workspace pins — stabilized `f64::algebraic_add` and its
+//!    now: Rust 1.98 stabilized `f64::algebraic_add` and its
 //!    siblings as safe const methods. They permit exactly the reassociation rule 1 exists to
 //!    prevent, and the standard library documents their results as differing across optimization
 //!    levels, `-C target-cpu`, compiler versions, and even between two call sites in one binary.

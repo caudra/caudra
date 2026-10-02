@@ -94,7 +94,7 @@ rather than exposing a tool that cannot run.
 
 ## Requirements
 
-- Rust 1.98 for source builds
+- Rust 1.99 for source builds
 - The `python_execution` tool group needs the pinned `monty` worker binary: `make code-worker`
 - Linux is the primary production target
 - Bash is required for the shell tool in the production container

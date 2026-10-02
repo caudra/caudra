@@ -4,7 +4,7 @@
 # leaving a binary that only serves `monty subprocess`.
 #
 # MONTY_VERSION must match the `monty-pool` pin in Cargo.toml: the worker protocol is version-coupled.
-FROM rust:1.98.0-bookworm AS worker
+FROM rust:1.99.0-bookworm AS worker
 
 ARG MONTY_VERSION=1.0.0
 
@@ -12,7 +12,7 @@ RUN cargo install monty-runtime --version "=${MONTY_VERSION}" --locked --no-defa
       --root /out \
     && strip /out/bin/monty
 
-FROM rust:1.98.0-bookworm AS builder
+FROM rust:1.99.0-bookworm AS builder
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends cmake \
