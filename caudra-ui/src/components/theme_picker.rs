@@ -19,14 +19,12 @@ pub enum ThemePickerAction {
 
 pub struct ThemePicker {
     picker: ListPicker<String>,
-    original_theme_name: Option<String>,
 }
 
 impl ThemePicker {
     pub fn new() -> Self {
         Self {
             picker: ListPicker::new().with_max_visible(MAX_VISIBLE),
-            original_theme_name: None,
         }
     }
 
@@ -37,7 +35,6 @@ impl ThemePicker {
             .iter()
             .position(|name| *name == current_name)
             .unwrap_or(0);
-        self.original_theme_name = Some(current_name);
         self.picker.open(entries, TITLE);
         self.picker.select(current_idx);
     }
@@ -48,7 +45,6 @@ impl ThemePicker {
 
     pub fn close(&mut self) {
         self.picker.close();
-        self.original_theme_name = None;
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> ThemePickerAction {
@@ -65,8 +61,6 @@ impl ThemePicker {
         self.picker.contains(pos)
     }
 
-    /// Leaving without choosing, which puts the theme back the way the preview
-    /// found it.
     pub fn cancel(&mut self) -> ThemePickerAction {
         self.map_picker_action(PickerAction::Close)
     }
@@ -84,13 +78,14 @@ impl ThemePicker {
                 ThemePickerAction::Consumed
             }
             PickerAction::Select(name) => {
+                if let Ok(selected) = theme::load_by_name(&name) {
+                    theme::set(selected);
+                }
                 theme::persist_theme(&name);
-                self.original_theme_name = None;
                 ThemePickerAction::Closed
             }
             PickerAction::Close => {
-                self.restore_original();
-                self.original_theme_name = None;
+                self.restore_committed();
                 ThemePickerAction::Closed
             }
             PickerAction::Toggle(..) | PickerAction::Key(_) => ThemePickerAction::Consumed,
@@ -122,10 +117,8 @@ impl ThemePicker {
         }
     }
 
-    fn restore_original(&self) {
-        if let Some(ref name) = self.original_theme_name
-            && let Ok(t) = theme::load_by_name(name)
-        {
+    fn restore_committed(&self) {
+        if let Ok(t) = theme::load_by_name(&theme::current_theme_name()) {
             theme::set(t);
         }
     }
@@ -153,13 +146,51 @@ mod tests {
     use crossterm::event::KeyCode;
     use test_case::test_case;
 
+    const DARK_THEME: &str = "opencode";
+    const LIGHT_THEME: &str = "opencode_light";
+
+    #[test_case(key(KeyCode::Esc); "escape")]
+    #[test_case(kb::QUIT.to_key_event(); "ctrl_c")]
+    fn cancel_after_appearance_change_restores_latest_palette(cancel_key: KeyEvent) {
+        theme::set_current_name(DARK_THEME);
+        theme::set(theme::load_by_name(DARK_THEME).unwrap());
+        let mut picker = ThemePicker::new();
+        picker.open();
+        picker.handle_key(key(KeyCode::Down));
+
+        theme::set_current_name(LIGHT_THEME);
+        theme::set(theme::load_by_name(LIGHT_THEME).unwrap());
+
+        assert!(matches!(
+            picker.handle_key(cancel_key),
+            ThemePickerAction::Closed
+        ));
+        assert!(!picker.is_open());
+        assert_eq!(theme::current_theme_name(), LIGHT_THEME);
+        let selected = theme::load_by_name(LIGHT_THEME).unwrap();
+        assert_eq!(theme::current().background, selected.background);
+        assert_eq!(theme::current().foreground, selected.foreground);
+    }
+
     #[test]
-    fn enter_closes() {
+    fn enter_after_appearance_change_applies_selection_and_closes() {
+        let selected_name = theme::current_theme_name();
         let mut p = ThemePicker::new();
         p.open();
+        let reported_name = if selected_name == LIGHT_THEME {
+            DARK_THEME
+        } else {
+            LIGHT_THEME
+        };
+        theme::set_current_name(reported_name);
+        theme::set(theme::load_by_name(reported_name).unwrap());
         let action = p.handle_key(key(KeyCode::Enter));
         assert!(matches!(action, ThemePickerAction::Closed));
         assert!(!p.is_open());
+        assert_eq!(theme::current_theme_name(), selected_name);
+        let selected = theme::load_by_name(&selected_name).unwrap();
+        assert_eq!(theme::current().background, selected.background);
+        assert_eq!(theme::current().foreground, selected.foreground);
     }
 
     #[test_case(key(KeyCode::Esc) ; "escape_restores_and_closes")]

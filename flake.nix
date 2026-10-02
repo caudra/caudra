@@ -56,6 +56,7 @@
           filter =
             path: type:
             (craneLib.filterCargoSources path type)
+            || (builtins.match ".*/vendor/crossterm/.*" path != null)
             || (builtins.match ".*/plugins/.*" path != null)
             || (builtins.match ".*/prompts/.*" path != null)
             || (builtins.match ".*/themes/.*" path != null)
@@ -92,8 +93,6 @@
       gitDepHashes = {
         "git+https://github.com/pydantic/monty.git?tag=v0.0.21#70fe3f5781381eb33579e45046f8cb3845953373" =
           "sha256-P4PgqfYykkZrWGg5G3WQo070lORLEhmXQUQPx3+Yslo=";
-        "git+https://github.com/crossterm-rs/crossterm?rev=3ca54292d2b1f1c58e200a06122ddaf5dd6b5c77#3ca54292d2b1f1c58e200a06122ddaf5dd6b5c77" =
-          "sha256-A5lgiEEi7mktf7m2GljdAxst7Fdl7Uqko29Xq6o90Ow=";
         "git+https://github.com/tensorninja/workcell-mcp?rev=c07f55436d81f9dc48755677cf4fb9c2a9093231#c07f55436d81f9dc48755677cf4fb9c2a9093231" =
           "sha256-Pfh1iOG/BiEuaRDkHlXUq9f1zkxGpNKacIuyIlaYR8c=";
       };

@@ -286,8 +286,11 @@ fn write_theme_section(out: &mut String) {
     writeln!(
         out,
         "Some themes ship as a light and dark pair: {pairs}. Choosing either \
-         half makes Caudra ask the terminal for its background color and show \
-         the half that matches. Themes outside these pairs stay as you left \
+         half makes Caudra ask the terminal whether it is in light or dark mode \
+         and show the half that matches. Caudra changes halves as soon as the \
+         terminal reports a new mode, for example when your desktop switches to \
+         dark mode. A terminal that cannot report its mode is asked for its \
+         background color instead. Themes outside these pairs stay as you left \
          them.\n"
     )
     .unwrap();
@@ -297,8 +300,21 @@ fn write_theme_section(out: &mut String) {
          regains focus or changes size, so reattaching a multiplexer to \
          another terminal updates the theme. Following the terminal only \
          changes the running session, and the theme you saved from `/theme` \
-         stays saved. Terminals that do not report a background color are \
-         asked a few times and then left alone.\n"
+         stays saved. A terminal that answers neither question is asked for its \
+         background color only a few times. After that, Caudra asks only \
+         whether it is in light or dark mode.\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "Mosh drops the request for mode reports before it reaches your \
+         terminal. Turn the reports on yourself when you connect, and off again \
+         when you leave:\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "```sh\nprintf '\\033[?2031h'; mosh user@host; printf '\\033[?2031l'\n```\n"
     )
     .unwrap();
 

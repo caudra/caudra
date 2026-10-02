@@ -182,9 +182,15 @@ You can add your own themes too. Drop a `<name>.toml` file into `themes/` inside
 
 Themes use 24-bit colors, but not every terminal can show them. Caudra checks the environment, terminfo, and the terminal itself, and when truecolor is missing it quietly falls back to the closest of the 256 classic terminal colors. If detection gets it wrong, set `CAUDRA_TRUECOLOR=1` to force truecolor or `CAUDRA_TRUECOLOR=0` to force the fallback.
 
-Some themes ship as a light and dark pair: `ayu_dark` and `ayu_light`, `catppuccin_mocha` and `catppuccin_latte`, `gruvbox` and `gruvbox_light`, `opencode` and `opencode_light`, `rose_pine` and `rose_pine_dawn`, `solarized_dark` and `solarized_light`. Choosing either half makes Caudra ask the terminal for its background color and show the half that matches. Themes outside these pairs stay as you left them.
+Some themes ship as a light and dark pair: `ayu_dark` and `ayu_light`, `catppuccin_mocha` and `catppuccin_latte`, `gruvbox` and `gruvbox_light`, `opencode` and `opencode_light`, `rose_pine` and `rose_pine_dawn`, `solarized_dark` and `solarized_light`. Choosing either half makes Caudra ask the terminal whether it is in light or dark mode and show the half that matches. Caudra changes halves as soon as the terminal reports a new mode, for example when your desktop switches to dark mode. A terminal that cannot report its mode is asked for its background color instead. Themes outside these pairs stay as you left them.
 
-Caudra asks again every ten minutes, and also when the terminal regains focus or changes size, so reattaching a multiplexer to another terminal updates the theme. Following the terminal only changes the running session, and the theme you saved from `/theme` stays saved. Terminals that do not report a background color are asked a few times and then left alone.
+Caudra asks again every ten minutes, and also when the terminal regains focus or changes size, so reattaching a multiplexer to another terminal updates the theme. Following the terminal only changes the running session, and the theme you saved from `/theme` stays saved. A terminal that answers neither question is asked for its background color only a few times. After that, Caudra asks only whether it is in light or dark mode.
+
+Mosh drops the request for mode reports before it reaches your terminal. Turn the reports on yourself when you connect, and off again when you leave:
+
+```sh
+printf '\033[?2031h'; mosh user@host; printf '\033[?2031l'
+```
 
 ### `ui.theme_light`
 

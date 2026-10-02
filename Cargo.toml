@@ -58,6 +58,7 @@ include_dir = { workspace = true }
 test-case = { workspace = true }
 
 [workspace]
+exclude = ["vendor/crossterm"]
 members = [
   "caudra-acp",
   "caudra-agent",
@@ -264,9 +265,12 @@ debug = false
 [profile.dev.build-override]
 debug = false
 
-# crossterm 0.29.0 has no VT input on Windows, so bracketed paste never decodes and a
-# multiline paste submits at the first newline (#336). Pinned to the head of
-# crossterm-rs/crossterm#1030, which lives in refs/pull/1030/head on the upstream repo.
-# Remove once the PR ships in a crossterm release.
+# vendor/crossterm is the head of crossterm-rs/crossterm#1030 (3ca5429), which adds VT input on
+# Windows so bracketed paste decodes and a multiline paste no longer submits at the first newline
+# (#336). On top sits our colour-scheme patch in src/event.rs and src/event/sys/parse.rs:
+# `Event::ColorSchemeChanged`, the mode 2031 and `CSI ?996n` commands, and parsing of
+# `CSI ?997;1n` / `CSI ?997;2n`. Unpatched crossterm treats those reports as unfinished and
+# swallows every key typed after one until a `u` or `c`. Once a crossterm release ships both,
+# delete vendor/crossterm, this patch, the workspace exclude, and the vendor filter in flake.nix.
 [patch.crates-io]
-crossterm = { git = "https://github.com/crossterm-rs/crossterm", rev = "3ca54292d2b1f1c58e200a06122ddaf5dd6b5c77" }
+crossterm = { path = "vendor/crossterm" }

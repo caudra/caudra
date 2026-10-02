@@ -1,5 +1,5 @@
 use shell_words::split;
-use std::io::{Write, stdout};
+use std::io::{self, Write, stdout};
 use std::num::NonZeroU16;
 use std::path::Path;
 use std::process::{Command as ProcessCommand, Stdio};
@@ -11,8 +11,9 @@ use crossterm::Command;
 use crossterm::ExecutableCommand;
 use crossterm::clipboard::CopyToClipboard;
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableColorSchemeReporting, DisableMouseCapture, EnableBracketedPaste,
+    EnableColorSchemeReporting, EnableMouseCapture, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags, RequestColorScheme,
 };
 #[cfg(not(windows))]
 use crossterm::event::{DisableFocusChange, EnableFocusChange};
@@ -392,6 +393,7 @@ fn teardown() {
 }
 
 fn pop_terminal_modes() {
+    set_appearance_reporting(false);
     write_mux_sequence(POP_WINDOW_TITLE_SEQUENCE);
     stdout().execute(crossterm::cursor::Show).ok();
     stdout().execute(PopKeyboardEnhancementFlags).ok();
@@ -408,7 +410,24 @@ fn resume(terminal: &mut ratatui::DefaultTerminal) {
     enable_focus_change();
     terminal::enable_raw_mode().ok();
     push_keyboard_enhancement();
+    set_appearance_reporting(true);
     let _ = terminal.clear();
+}
+
+pub(crate) fn set_appearance_reporting(enabled: bool) {
+    if let Err(error) = write_appearance_reporting(&mut stdout().lock(), enabled) {
+        tracing::warn!(%error, enabled, "failed to configure terminal appearance reporting");
+    } else {
+        tracing::debug!(enabled, "terminal appearance reporting configured");
+    }
+}
+
+fn write_appearance_reporting(output: &mut impl Write, enabled: bool) -> io::Result<()> {
+    if enabled {
+        crossterm::execute!(output, EnableColorSchemeReporting, RequestColorScheme)
+    } else {
+        crossterm::execute!(output, DisableColorSchemeReporting)
+    }
 }
 
 #[cfg(not(windows))]
@@ -491,6 +510,16 @@ mod tests {
     const WRONG_TERMUX: &str = "the environment was read as the wrong terminal";
     const TERMUX_PREFIX: &str = "/data/data/com.termux/files/usr";
     const EXPECTED_KEYBOARD_ENHANCEMENTS: &str = "\u{1b}[>3u";
+    const APPEARANCE_SUBSCRIBE: &[u8] = b"\x1b[?2031h\x1b[?996n";
+    const APPEARANCE_UNSUBSCRIBE: &[u8] = b"\x1b[?2031l";
+
+    #[test_case(true, APPEARANCE_SUBSCRIBE; "subscribe_then_query")]
+    #[test_case(false, APPEARANCE_UNSUBSCRIBE; "unsubscribe")]
+    fn appearance_reporting_sequences(enabled: bool, expected: &[u8]) {
+        let mut output = Vec::new();
+        write_appearance_reporting(&mut output, enabled).unwrap();
+        assert_eq!(output, expected);
+    }
 
     #[test_case(false, Some(TERMUX_PREFIX), true ; "the prefix alone identifies an older termux")]
     #[test_case(true, None, true ; "the version alone identifies one that exports it")]

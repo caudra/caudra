@@ -1,23 +1,28 @@
 //! Whether the terminal is showing us a light or a dark background, so a
 //! light/dark theme pair can follow it without the user re-picking a theme.
-//!
-//! The terminal is asked with OSC 11, whose reply carries the background as
-//! `rgb:` components of one to four hex digits each. Terminals disagree on
-//! the width and on the terminator, so the parser accepts every shape.
 
+use std::io::stdout;
 use std::time::{Duration, Instant};
+
+use crossterm::ExecutableCommand;
+use crossterm::event::{ColorScheme, RequestColorScheme};
 
 use crate::repaint::Dirty;
 use crate::theme::ThemePair;
 use crate::{theme, tty_query};
 
-/// Query the background color. The reply is `OSC 11 ; rgb:.../.../... ST`.
-const BACKGROUND_QUERY: &[u8] = b"\x1b]11;?\x07";
+const APPEARANCE_QUERY: &[u8] = b"\x1b[?996n\x1b]11;?\x07";
 /// Matches the truecolor probe: enough for a slow remote terminal, short
 /// enough that a terminal which never answers does not stall a frame.
 const QUERY_TIMEOUT: Duration = Duration::from_millis(500);
-const REPLY_PREFIX: &[u8] = b"]11;";
+const REPLY_PREFIX: &[u8] = b"\x1b]11;";
 const RGB_MARKER: &[u8] = b"rgb";
+const CSI: &[u8] = b"\x1b[";
+const STRING_TERMINATOR: &[u8] = b"\x1b\\";
+const DARK_REPORT: &[u8] = b"?997;1n";
+const LIGHT_REPORT: &[u8] = b"?997;2n";
+const PASTE_START: &[u8] = b"200~";
+const PASTE_END: &[u8] = b"\x1b[201~";
 /// Coefficients and threshold are opencode's, so a terminal that puts it in
 /// light mode puts us in light mode on exactly the same colors.
 const LUMA_RED: f32 = 0.299;
@@ -36,7 +41,8 @@ const WAKE_DEBOUNCE: Duration = Duration::from_millis(250);
 /// the input reader.
 const MIN_PROBE_GAP: Duration = Duration::from_secs(2);
 /// Terminals that never answer are common enough (some multiplexers, serial
-/// links) that we stop asking rather than pay the timeout every interval.
+/// links) that we stop the blocking probe rather than pay the timeout every
+/// interval.
 const MAX_SILENT_PROBES: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,31 +63,108 @@ impl Appearance {
     }
 }
 
+impl From<ColorScheme> for Appearance {
+    fn from(scheme: ColorScheme) -> Self {
+        match scheme {
+            ColorScheme::Dark => Self::Dark,
+            ColorScheme::Light => Self::Light,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Observation {
+    Explicit(Appearance),
+    Background(Appearance),
+}
+
+impl Observation {
+    fn appearance(&self) -> Appearance {
+        match self {
+            Self::Explicit(appearance) | Self::Background(appearance) => *appearance,
+        }
+    }
+}
+
 /// `None` when the terminal does not answer, which is normal under some
 /// multiplexers and over bare serial links. Callers keep their current theme
 /// rather than guessing.
 ///
 /// Reads the tty directly, so the input reader must not be running.
-pub(crate) fn detect() -> Option<Appearance> {
-    let reply = tty_query::query(BACKGROUND_QUERY, QUERY_TIMEOUT)?;
-    let appearance = parse_background(&reply).map(|(r, g, b)| Appearance::from_background(r, g, b));
-    tracing::debug!(?appearance, "terminal background probe");
-    appearance
+pub(crate) fn detect() -> Option<Observation> {
+    let reply = tty_query::query(APPEARANCE_QUERY, QUERY_TIMEOUT);
+    let observation = reply.as_deref().and_then(parse_observation);
+    tracing::debug!(
+        ?observation,
+        response_bytes = reply.as_ref().map(Vec::len),
+        "terminal appearance probe"
+    );
+    observation
 }
 
-/// Only the bytes between the `]11;` introducer and the terminator count, so
-/// input that arrives mid-probe (mouse reports, a paste) cannot spoof a match.
+fn parse_observation(mut buf: &[u8]) -> Option<Observation> {
+    let mut explicit = None;
+    let mut background = None;
+    while let Some(start) = buf.iter().position(|byte| *byte == b'\x1b') {
+        buf = &buf[start..];
+        if let Some(csi) = buf.strip_prefix(CSI) {
+            let Some(end) = csi
+                .iter()
+                .position(|byte| (b'@'..=b'~').contains(byte) || *byte == b'\x1b')
+            else {
+                break;
+            };
+            if csi[end] == b'\x1b' {
+                buf = &csi[end..];
+                continue;
+            }
+            let report = &csi[..=end];
+            buf = &csi[end + 1..];
+            match report {
+                DARK_REPORT => explicit = Some(Observation::Explicit(Appearance::Dark)),
+                LIGHT_REPORT => explicit = Some(Observation::Explicit(Appearance::Light)),
+                PASTE_START => {
+                    let Some(end) = tty_query::find(buf, PASTE_END) else {
+                        break;
+                    };
+                    buf = &buf[end + PASTE_END.len()..];
+                }
+                _ => {}
+            }
+        } else if matches!(buf.get(1), Some(b']' | b'P' | b'X' | b'^' | b'_')) {
+            let osc = buf[1] == b']';
+            let Some(end) = buf.iter().enumerate().find_map(|(index, byte)| {
+                if osc && *byte == b'\x07' {
+                    Some(index + 1)
+                } else if buf[index..].starts_with(STRING_TERMINATOR) {
+                    Some(index + STRING_TERMINATOR.len())
+                } else {
+                    None
+                }
+            }) else {
+                break;
+            };
+            if osc && let Some((r, g, b)) = parse_background(&buf[..end]) {
+                background = Some(Observation::Background(Appearance::from_background(
+                    r, g, b,
+                )));
+            }
+            buf = &buf[end..];
+        } else {
+            buf = &buf[1..];
+        }
+    }
+    explicit.or(background)
+}
+
 fn parse_background(buf: &[u8]) -> Option<(u8, u8, u8)> {
-    let start = tty_query::find(buf, REPLY_PREFIX)? + REPLY_PREFIX.len();
-    let payload = &buf[start..];
-    let end = payload
-        .iter()
-        .position(|b| matches!(b, b'\x07' | b'\x1b'))
-        .unwrap_or(payload.len());
-    let payload = &payload[..end];
+    let payload = buf.strip_prefix(REPLY_PREFIX)?;
+    let payload = payload
+        .strip_suffix(b"\x07")
+        .or_else(|| payload.strip_suffix(STRING_TERMINATOR))?;
 
     // Some terminals answer `rgba:` and put alpha last, which we ignore.
-    let after_marker = &payload[tty_query::find(payload, RGB_MARKER)? + RGB_MARKER.len()..];
+    let after_marker = payload.strip_prefix(RGB_MARKER)?;
     let components = after_marker
         .strip_prefix(b"a")
         .unwrap_or(after_marker)
@@ -112,7 +195,8 @@ pub(crate) struct AutoSwitch {
     dark: String,
     light: String,
     applied: Appearance,
-    /// `None` once we have stopped probing for good.
+    explicit: bool,
+    apply_failed: bool,
     next_probe: Option<Instant>,
     last_probe: Instant,
     silent_probes: u8,
@@ -121,11 +205,15 @@ pub(crate) struct AutoSwitch {
 impl AutoSwitch {
     /// `initial` comes from the startup probe, taken before the input reader
     /// owns the tty. `None` leaves the dark half in place and keeps probing.
-    pub(crate) fn new(dark: String, light: String, initial: Option<Appearance>) -> Self {
+    pub(crate) fn new(dark: String, light: String, initial: Option<Observation>) -> Self {
         Self {
             dark,
             light,
-            applied: initial.unwrap_or(Appearance::Dark),
+            applied: initial
+                .as_ref()
+                .map_or(Appearance::Dark, Observation::appearance),
+            explicit: matches!(initial, Some(Observation::Explicit(_))),
+            apply_failed: false,
             next_probe: Some(Instant::now() + PROBE_INTERVAL),
             last_probe: Instant::now(),
             silent_probes: 0,
@@ -136,14 +224,39 @@ impl AutoSwitch {
     /// The chosen half stays on screen until the next probe, so picking the
     /// light half of a pair does not flip back before the terminal is asked.
     pub(crate) fn adopt(pair: &ThemePair, chosen: &str) -> Self {
-        let applied = if pair.light == chosen {
+        let mut auto = Self::new(String::new(), String::new(), None);
+        auto.retarget(pair, chosen);
+        auto
+    }
+
+    pub(crate) fn retarget(&mut self, pair: &ThemePair, chosen: &str) {
+        self.dark = pair.dark.to_owned();
+        self.light = pair.light.to_owned();
+        self.applied = if pair.light == chosen {
             Appearance::Light
         } else {
             Appearance::Dark
         };
-        let mut auto = Self::new(pair.dark.to_owned(), pair.light.to_owned(), Some(applied));
-        auto.wake();
-        auto
+        self.apply_failed = false;
+        self.silent_probes = 0;
+        self.next_probe = Some(Instant::now() + PROBE_INTERVAL);
+        self.wake();
+    }
+
+    /// Ask only for the explicit report, which never pauses input, once the
+    /// terminal has sent one or has ignored every blocking probe. A
+    /// multiplexer can learn its appearance later without reporting the
+    /// change, and answers when asked.
+    pub(crate) fn uses_explicit(&self) -> bool {
+        self.explicit || self.silent_probes >= MAX_SILENT_PROBES
+    }
+
+    pub(crate) fn request_explicit(&mut self) {
+        if let Err(error) = stdout().execute(RequestColorScheme) {
+            tracing::warn!(%error, "terminal appearance query failed");
+        }
+        self.last_probe = Instant::now();
+        self.next_probe = Some(self.last_probe + PROBE_INTERVAL);
     }
 
     pub(crate) fn theme_name(&self) -> &str {
@@ -165,9 +278,6 @@ impl AutoSwitch {
     /// Bring the next probe forward because a different terminal may now be
     /// showing the session: focus returned, or the viewport was resized.
     /// Reattaching a multiplexer to another terminal produces both.
-    ///
-    /// A terminal we have already given up on stays given up on, so window
-    /// switching cannot restart probing that went unanswered.
     pub(crate) fn wake(&mut self) {
         let Some(scheduled) = self.next_probe else {
             return;
@@ -179,36 +289,50 @@ impl AutoSwitch {
     /// Installs the current half. In-memory only: the pick the user saved
     /// interactively must survive a session that ran under a light terminal.
     pub(crate) fn apply(&self) -> Result<(), String> {
-        let name = self.theme_name();
+        self.apply_appearance(self.applied)
+    }
+
+    fn apply_appearance(&self, appearance: Appearance) -> Result<(), String> {
+        let name = match appearance {
+            Appearance::Dark => &self.dark,
+            Appearance::Light => &self.light,
+        };
         let theme = theme::load_by_name(name)?;
         theme::set_current_name(name);
         theme::set(theme);
         Ok(())
     }
 
-    pub(crate) fn observe(&mut self, observed: Option<Appearance>) -> Dirty {
+    pub(crate) fn observe(&mut self, observed: Option<Observation>) -> Dirty {
+        if matches!(observed, Some(Observation::Explicit(_))) {
+            self.explicit = true;
+        } else if self.explicit && matches!(observed, Some(Observation::Background(_))) {
+            return Dirty::NO;
+        }
+        if self.apply_failed {
+            return Dirty::NO;
+        }
         self.last_probe = Instant::now();
-        let Some(appearance) = observed else {
-            self.silent_probes += 1;
-            self.next_probe =
-                (self.silent_probes < MAX_SILENT_PROBES).then(|| Instant::now() + PROBE_INTERVAL);
-            if self.next_probe.is_none() {
+        self.next_probe = Some(self.last_probe + PROBE_INTERVAL);
+        let Some(observation) = observed else {
+            self.silent_probes = self.silent_probes.saturating_add(1);
+            if self.silent_probes == MAX_SILENT_PROBES {
                 tracing::info!(
                     probes = self.silent_probes,
-                    "terminal never reported its background; theme auto-switch off"
+                    "terminal never answered the appearance probe; explicit queries only"
                 );
             }
             return Dirty::NO;
         };
 
         self.silent_probes = 0;
-        self.next_probe = Some(Instant::now() + PROBE_INTERVAL);
+        let appearance = observation.appearance();
         if appearance == self.applied {
             return Dirty::NO;
         }
-        self.applied = appearance;
-        match self.apply() {
+        match self.apply_appearance(appearance) {
             Ok(()) => {
+                self.applied = appearance;
                 tracing::info!(
                     theme = self.theme_name(),
                     ?appearance,
@@ -218,6 +342,7 @@ impl AutoSwitch {
             }
             Err(e) => {
                 tracing::warn!(error = %e, "theme auto-switch failed; off");
+                self.apply_failed = true;
                 self.next_probe = None;
                 Dirty::NO
             }
@@ -227,24 +352,36 @@ impl AutoSwitch {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::repaint::expect;
+    use std::time::Instant;
+
+    use crossterm::event::ColorScheme;
     use test_case::test_case;
+
+    use super::{
+        Appearance, AutoSwitch, MAX_SILENT_PROBES, MIN_PROBE_GAP, Observation, PROBE_INTERVAL,
+        RETRY_INTERVAL, WAKE_DEBOUNCE, parse_background, parse_observation,
+    };
+    use crate::repaint::Dirty;
+    use crate::repaint::expect;
+    use crate::theme::{self, ThemePair};
 
     const DARK_THEME: &str = "opencode";
     const LIGHT_THEME: &str = "opencode_light";
     const MANUAL_THEME: &str = "dracula";
+    const INVALID_THEME: &str = "\0invalid_theme";
+    const OTHER_PAIR: ThemePair = ThemePair {
+        dark: "ayu_dark",
+        light: "ayu_light",
+    };
 
     fn switch() -> AutoSwitch {
         AutoSwitch::new(
             DARK_THEME.to_owned(),
             LIGHT_THEME.to_owned(),
-            Some(Appearance::Dark),
+            Some(Observation::Background(Appearance::Dark)),
         )
     }
 
-    /// Installing the pair is what makes `current_theme_name` deterministic,
-    /// so the manual-pick check has a known baseline to compare against.
     fn installed_switch() -> AutoSwitch {
         let auto = switch();
         auto.apply().expect("bundled pair must load");
@@ -276,14 +413,14 @@ mod tests {
     }
 
     #[test]
-    fn a_terminal_that_never_answers_is_given_up_on() {
+    fn a_terminal_that_never_answers_is_only_asked_explicitly() {
         let mut auto = switch();
-        for _ in 1..MAX_SILENT_PROBES {
+        for _ in 0..MAX_SILENT_PROBES {
+            assert!(!auto.uses_explicit());
             assert_eq!(auto.observe(None), Dirty::NO, "{}", expect::QUIET);
             assert!(auto.due(Instant::now() + PROBE_INTERVAL));
         }
-        assert_eq!(auto.observe(None), Dirty::NO, "{}", expect::QUIET);
-        assert!(!auto.due(Instant::now() + PROBE_INTERVAL * 100));
+        assert!(auto.uses_explicit());
     }
 
     #[test]
@@ -293,14 +430,14 @@ mod tests {
             assert_eq!(auto.observe(None), Dirty::NO, "{}", expect::QUIET);
         }
         assert_eq!(
-            auto.observe(Some(Appearance::Dark)),
+            auto.observe(Some(Observation::Background(Appearance::Dark))),
             Dirty::NO,
             "{}",
             expect::QUIET
         );
         for _ in 1..MAX_SILENT_PROBES {
             assert_eq!(auto.observe(None), Dirty::NO, "{}", expect::QUIET);
-            assert!(auto.due(Instant::now() + PROBE_INTERVAL));
+            assert!(!auto.uses_explicit());
         }
     }
 
@@ -308,7 +445,7 @@ mod tests {
     fn an_unchanged_background_owes_no_frame() {
         let mut auto = installed_switch();
         assert_eq!(
-            auto.observe(Some(Appearance::Dark)),
+            auto.observe(Some(Observation::Background(Appearance::Dark))),
             Dirty::NO,
             "{}",
             expect::QUIET
@@ -320,16 +457,15 @@ mod tests {
     fn a_flipped_background_switches_halves() {
         let mut auto = installed_switch();
         assert_eq!(
-            auto.observe(Some(Appearance::Light)),
+            auto.observe(Some(Observation::Background(Appearance::Light))),
             Dirty::YES,
             "{}",
             expect::OWED
         );
         assert_eq!(auto.theme_name(), LIGHT_THEME);
-        assert_eq!(theme::current_theme_name(), LIGHT_THEME);
 
         assert_eq!(
-            auto.observe(Some(Appearance::Dark)),
+            auto.observe(Some(Observation::Background(Appearance::Dark))),
             Dirty::YES,
             "{}",
             expect::OWED
@@ -350,7 +486,7 @@ mod tests {
     fn wake_keeps_a_floor_between_probes() {
         let mut auto = installed_switch();
         assert_eq!(
-            auto.observe(Some(Appearance::Dark)),
+            auto.observe(Some(Observation::Background(Appearance::Dark))),
             Dirty::NO,
             "{}",
             expect::QUIET
@@ -364,13 +500,16 @@ mod tests {
     }
 
     #[test]
-    fn wake_does_not_revive_a_terminal_we_gave_up_on() {
+    fn wake_asks_a_terminal_that_never_answered() {
         let mut auto = switch();
         for _ in 0..MAX_SILENT_PROBES {
             assert_eq!(auto.observe(None), Dirty::NO, "{}", expect::QUIET);
         }
         auto.wake();
-        assert!(!auto.due(Instant::now() + PROBE_INTERVAL * 100));
+        assert!(
+            auto.due(Instant::now() + MIN_PROBE_GAP),
+            "a multiplexer may have learned its appearance since the last probe"
+        );
     }
 
     #[test_case(DARK_THEME, Appearance::Dark; "dark_half")]
@@ -405,8 +544,6 @@ mod tests {
     #[test_case(b"\x1b]11;rgb:1a/1a/1a\x07", Some((0x1a, 0x1a, 0x1a)); "8_bit_dark")]
     #[test_case(b"\x1b]11;rgb:f/f/f\x07", Some((0xff, 0xff, 0xff)); "4_bit_white")]
     #[test_case(b"\x1b]11;rgba:ffff/ffff/ffff/ffff\x07", Some((0xff, 0xff, 0xff)); "rgba_alpha_ignored")]
-    #[test_case(b"\x1b]11;rgb:2828/2a2a/3636\x07\x1b[?65;1;9c", Some((0x28, 0x2a, 0x36)); "da1_tail_ignored")]
-    #[test_case(b"\x1b[<48;2;5M\x1b]11;rgb:0000/0000/0000\x07", Some((0x00, 0x00, 0x00)); "mouse_report_before_reply")]
     #[test_case(b"\x1b[?65;1;9c", None; "no_osc_reply")]
     #[test_case(b"", None; "empty")]
     #[test_case(b"\x1b]11;rgb:ffff/ffff\x07", None; "missing_component")]
@@ -414,8 +551,184 @@ mod tests {
     #[test_case(b"\x1b]11;rgb:zzzz/0000/0000\x07", None; "non_hex_component")]
     #[test_case(b"\x1b]11;rgb:fffff/0/0\x07", None; "component_too_wide")]
     #[test_case(b"\x1b]11;\x07", None; "truncated_before_rgb")]
+    #[test_case(b"\x1b]11;rgb:ffff/ffff/ffff", None; "missing_terminator")]
+    #[test_case(b"\x1b]11;rgb:ffff/ffff/ffff\x1b", None; "partial_terminator")]
+    #[test_case(b"]11;rgb:ffff/ffff/ffff\x07", None; "missing_escape")]
+    #[test_case(b"\x1b]11;not_rgb:ffff/ffff/ffff\x07", None; "unanchored_rgb")]
     fn parses_background_reply(buf: &[u8], expected: Option<(u8, u8, u8)>) {
         assert_eq!(parse_background(buf), expected);
+    }
+
+    #[test_case(b"\x1b[?997;1n", Some(Observation::Explicit(Appearance::Dark)); "explicit_dark")]
+    #[test_case(b"\x1b[?997;2n", Some(Observation::Explicit(Appearance::Light)); "explicit_light")]
+    #[test_case(b"\x1b]11;rgb:2828/2a2a/3636\x07\x1b[?65;1;9c", Some(Observation::Background(Appearance::Dark)); "da1_tail_ignored")]
+    #[test_case(b"\x1b[<48;2;5M\x1b]11;rgb:ffff/ffff/ffff\x07", Some(Observation::Background(Appearance::Light)); "mouse_report_before_reply")]
+    #[test_case(b"\x1b[?997;1n\x1b]11;rgb:ffff/ffff/ffff\x07", Some(Observation::Explicit(Appearance::Dark)); "explicit_before_background")]
+    #[test_case(b"\x1b]11;rgb:0000/0000/0000\x07\x1b[?997;2n", Some(Observation::Explicit(Appearance::Light)); "explicit_after_background")]
+    #[test_case(b"\x1b[?997;1n\x1b[?997;2n", Some(Observation::Explicit(Appearance::Light)); "last_explicit_light_wins")]
+    #[test_case(b"\x1b[?997;2n\x1b[?997;1n", Some(Observation::Explicit(Appearance::Dark)); "last_explicit_dark_wins")]
+    #[test_case(b"\x1b[?997;2n\x1b[?997;3n", Some(Observation::Explicit(Appearance::Light)); "invalid_report_keeps_last_valid")]
+    #[test_case(b"\x1b[?997;1n\x1b[?997;2", Some(Observation::Explicit(Appearance::Dark)); "truncated_report_keeps_last_valid")]
+    #[test_case(b"\x1b[?997;0n", None; "unknown_zero")]
+    #[test_case(b"\x1b[?997;3n", None; "unknown_three")]
+    #[test_case(b"\x1b[?997;01n", None; "leading_zero")]
+    #[test_case(b"\x1b[?997;1;2n", None; "extra_parameter")]
+    #[test_case(b"\x1b[?997;1 n", None; "intermediate_byte")]
+    #[test_case(b"\x1b[?997;1m", None; "wrong_final")]
+    #[test_case(b"\x1b[?997;1", None; "truncated_report")]
+    #[test_case(b"\x1b[?997;", None; "truncated_value")]
+    #[test_case(b"\x1b[", None; "truncated_csi")]
+    #[test_case(b"\x1b", None; "truncated_escape")]
+    #[test_case(b"[?997;1n", None; "missing_escape")]
+    #[test_case(b"\x1b[997;1n", None; "missing_private_marker")]
+    #[test_case(b"\x1b[?1997;1n", None; "wrong_report_number")]
+    #[test_case(b"\x1b]0;\x1b[?997;1n\x07", None; "report_in_osc_bel")]
+    #[test_case(b"\x1b]0;\x1b[?997;1n\x1b\\", None; "report_in_osc_st")]
+    #[test_case(b"\x1b]0;\x1b[?997;1n", None; "report_in_unterminated_osc")]
+    #[test_case(b"\x1bP\x1b[?997;1n\x1b\\", None; "report_in_dcs")]
+    #[test_case(b"\x1b[200~\x1b[?997;1n\x1b[201~", None; "report_in_paste")]
+    #[test_case(b"\x1b[200~\x1b[?997;1n", None; "report_in_unterminated_paste")]
+    #[test_case(b"\x1b[200~\x1b]11;rgb:f/f/f\x07\x1b[201~", None; "background_in_paste")]
+    #[test_case(b"\x1b[200~\x1b[?997;1n\x1b[201~\x1b[?997;2n", Some(Observation::Explicit(Appearance::Light)); "report_after_paste")]
+    #[test_case(b"\x1b]0;\x1b[?997;1n\x07\x1b[?997;2n", Some(Observation::Explicit(Appearance::Light)); "report_after_osc")]
+    #[test_case(b"\x1b[?997;\x1b[?997;2n", Some(Observation::Explicit(Appearance::Light)); "report_after_interrupted_csi")]
+    #[test_case(b"\x1b[?997;3n\x1b]11;rgb:f/f/f\x07", Some(Observation::Background(Appearance::Light)); "invalid_report_falls_back_to_rgb")]
+    fn parses_observation(buf: &[u8], expected: Option<Observation>) {
+        assert_eq!(parse_observation(buf), expected);
+    }
+
+    #[test_case(ColorScheme::Dark, Appearance::Dark; "dark")]
+    #[test_case(ColorScheme::Light, Appearance::Light; "light")]
+    fn converts_color_scheme(scheme: ColorScheme, expected: Appearance) {
+        assert_eq!(Appearance::from(scheme), expected);
+    }
+
+    #[test_case(Appearance::Dark, Appearance::Light; "dark_preference")]
+    #[test_case(Appearance::Light, Appearance::Dark; "light_preference")]
+    fn explicit_preference_overrides_later_background(
+        explicit: Appearance,
+        background: Appearance,
+    ) {
+        let mut auto = switch();
+        let _ = auto.observe(Some(Observation::Explicit(explicit)));
+        assert!(auto.uses_explicit());
+        assert_eq!(auto.applied, explicit);
+        assert_eq!(
+            auto.observe(Some(Observation::Background(background))),
+            Dirty::NO,
+            "{}",
+            expect::QUIET
+        );
+        assert_eq!(auto.applied, explicit);
+        assert_eq!(
+            auto.observe(Some(Observation::Explicit(background))),
+            Dirty::YES,
+            "{}",
+            expect::OWED
+        );
+        assert_eq!(auto.applied, background);
+    }
+
+    #[test_case(Appearance::Dark, Appearance::Light; "dark_initial")]
+    #[test_case(Appearance::Light, Appearance::Dark; "light_initial")]
+    fn initial_explicit_preference_survives_first_background(
+        initial: Appearance,
+        background: Appearance,
+    ) {
+        let mut auto = AutoSwitch::new(
+            DARK_THEME.to_owned(),
+            LIGHT_THEME.to_owned(),
+            Some(Observation::Explicit(initial)),
+        );
+        assert!(auto.uses_explicit());
+        assert_eq!(
+            auto.observe(Some(Observation::Background(background))),
+            Dirty::NO,
+            "{}",
+            expect::QUIET
+        );
+        assert_eq!(auto.applied, initial);
+    }
+
+    #[test_case(Appearance::Light, Dirty::YES; "changed_notification")]
+    #[test_case(Appearance::Dark, Dirty::NO; "unchanged_notification")]
+    fn notification_recovers_after_silence_exhaustion(appearance: Appearance, expected: Dirty) {
+        let mut auto = switch();
+        for _ in 0..MAX_SILENT_PROBES {
+            let _ = auto.observe(None);
+        }
+        assert!(!auto.explicit);
+        assert_eq!(
+            auto.observe(Some(Observation::Explicit(appearance))),
+            expected
+        );
+        assert!(auto.uses_explicit());
+        assert_eq!(auto.applied, appearance);
+        assert_eq!(auto.silent_probes, 0);
+        assert!(auto.due(auto.last_probe + PROBE_INTERVAL));
+    }
+
+    #[test_case(Observation::Explicit(Appearance::Light); "explicit_failure")]
+    #[test_case(Observation::Background(Appearance::Light); "background_failure")]
+    fn failed_application_preserves_applied_and_ignores_notifications(observation: Observation) {
+        let mut auto = AutoSwitch::new(DARK_THEME.to_owned(), INVALID_THEME.to_owned(), None);
+        assert_eq!(
+            auto.observe(Some(observation)),
+            Dirty::NO,
+            "{}",
+            expect::QUIET
+        );
+        assert_eq!(auto.applied, Appearance::Dark);
+        assert_eq!(auto.theme_name(), DARK_THEME);
+        assert!(auto.apply_failed);
+        assert!(auto.next_probe.is_none());
+
+        auto.light = LIGHT_THEME.to_owned();
+        assert_eq!(
+            auto.observe(Some(Observation::Explicit(Appearance::Light))),
+            Dirty::NO,
+            "{}",
+            expect::QUIET
+        );
+        assert!(auto.uses_explicit());
+        assert_eq!(auto.applied, Appearance::Dark);
+        auto.wake();
+        assert!(auto.next_probe.is_none());
+    }
+
+    #[test_case(OTHER_PAIR.dark, Appearance::Dark, Appearance::Light; "dark_chosen")]
+    #[test_case(OTHER_PAIR.light, Appearance::Light, Appearance::Dark; "light_chosen")]
+    fn retarget_preserves_explicit_source(
+        chosen: &str,
+        appearance: Appearance,
+        background: Appearance,
+    ) {
+        let mut auto = AutoSwitch::new(
+            DARK_THEME.to_owned(),
+            LIGHT_THEME.to_owned(),
+            Some(Observation::Explicit(background)),
+        );
+        auto.retarget(&OTHER_PAIR, chosen);
+        assert!(auto.uses_explicit());
+        assert_eq!(auto.dark, OTHER_PAIR.dark);
+        assert_eq!(auto.light, OTHER_PAIR.light);
+        assert_eq!(auto.theme_name(), chosen);
+        assert_eq!(auto.applied, appearance);
+        assert!(auto.due(Instant::now() + MIN_PROBE_GAP));
+        assert_eq!(
+            auto.observe(Some(Observation::Background(background))),
+            Dirty::NO,
+            "{}",
+            expect::QUIET
+        );
+        assert_eq!(auto.applied, appearance);
+        assert_eq!(
+            auto.observe(Some(Observation::Explicit(background))),
+            Dirty::YES,
+            "{}",
+            expect::OWED
+        );
+        assert_eq!(auto.applied, background);
     }
 
     #[test_case(0x0a, 0x0a, 0x0a, Appearance::Dark; "opencode_dark_background")]

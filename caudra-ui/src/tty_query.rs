@@ -12,7 +12,16 @@
 /// The DA1 reply is `ESC [ ? ... c`.
 #[cfg(any(unix, test))]
 fn da1_answered(buf: &[u8]) -> bool {
-    find(buf, b"\x1b[?").is_some_and(|start| buf[start + 3..].contains(&b'c'))
+    buf.split(|byte| *byte == b'\x1b').skip(1).any(|sequence| {
+        let Some(payload) = sequence.strip_prefix(b"[?") else {
+            return false;
+        };
+        let parameters = payload
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit() || **byte == b';')
+            .count();
+        parameters > 0 && payload.get(parameters) == Some(&b'c')
+    })
 }
 
 pub(crate) fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
@@ -99,6 +108,9 @@ mod tests {
     #[test_case(b"\x1b[?65;1;9c", true; "da1_reply")]
     #[test_case(b"\x1bP1$r0;48:2:1:2:3m\x1b\\", false; "other_reply_only")]
     #[test_case(b"\x1b[?65;1;9", false; "partial_da1")]
+    #[test_case(b"\x1b[?997;1nc", false; "appearance_then_typed_c")]
+    #[test_case(b"\x1b[?997;2n\x1b[?65;1;9c", true; "appearance_then_da1")]
+    #[test_case(b"[?65;1;9c", false; "missing_escape")]
     #[test_case(b"", false; "empty")]
     fn da1(buf: &[u8], expected: bool) {
         assert_eq!(da1_answered(buf), expected);

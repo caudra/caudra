@@ -86,7 +86,7 @@ use crate::app::tasks::{TaskStatus, diff_task_states};
 use crate::app::{
     App, Msg, Notification, QueuedMessage, SubmitOutcome, session_has_content, turn_response,
 };
-use crate::appearance::{self, AutoSwitch};
+use crate::appearance::{self, AutoSwitch, Observation};
 use crate::color_compat;
 use crate::components::input::Submission;
 use crate::components::session_picker::{SessionActivity, SessionRow};
@@ -1622,6 +1622,9 @@ impl<'t> EventLoop<'t> {
             runtime.install_peer(&ctx);
         }
 
+        let input = InputReader::spawn();
+        terminal::set_appearance_reporting(true);
+
         Ok(Self {
             terminal,
             sessions: runtimes,
@@ -1632,7 +1635,7 @@ impl<'t> EventLoop<'t> {
             terminal_focused: false,
             notifier,
             ctx,
-            input: InputReader::spawn(),
+            input,
             auto_theme,
             warn_rx: bg.warn_rx,
             warn_tx: bg.warn_tx,
@@ -2274,15 +2277,20 @@ impl<'t> EventLoop<'t> {
         {
             return;
         }
-        self.auto_theme = theme::pair_for(&current).map(|pair| AutoSwitch::adopt(pair, &current));
+        match (self.auto_theme.as_mut(), theme::pair_for(&current)) {
+            (Some(auto), Some(pair)) => auto.retarget(pair, &current),
+            (None, Some(pair)) => self.auto_theme = Some(AutoSwitch::adopt(pair, &current)),
+            (_, None) => self.auto_theme = None,
+        }
     }
 
-    /// Re-ask the terminal for its background so a session left open across a
+    /// Re-ask the terminal for its appearance so a session left open across a
     /// light/dark switch follows it.
     ///
-    /// The probe reads the tty directly, so it parks the input reader first
-    /// and waits for a lull: bytes arriving mid-probe would be consumed
-    /// instead of delivered as keystrokes.
+    /// The explicit query is answered through the input reader. The background
+    /// probe reads the tty directly, so it parks the input reader first and
+    /// waits for a lull: bytes arriving mid-probe would be consumed instead of
+    /// delivered as keystrokes.
     fn poll_appearance(&mut self) -> Dirty {
         let Some(auto) = self.auto_theme.as_mut() else {
             return Dirty::NO;
@@ -2290,12 +2298,23 @@ impl<'t> EventLoop<'t> {
         if !auto.due(Instant::now()) {
             return Dirty::NO;
         }
+        if auto.uses_explicit() {
+            auto.request_explicit();
+            return Dirty::NO;
+        }
         if !self.input.receiver().is_empty() {
             auto.defer();
             return Dirty::NO;
         }
         let observed = {
-            let _pause = self.input.pause();
+            let _pause = match self.input.try_pause() {
+                Ok(pause) => pause,
+                Err(error) => {
+                    warn!(%error, "terminal appearance probe deferred");
+                    auto.defer();
+                    return Dirty::NO;
+                }
+            };
             appearance::detect()
         };
         auto.observe(observed)
@@ -3175,6 +3194,18 @@ impl<'t> EventLoop<'t> {
             self.terminal_focused = true;
         }
         match raw {
+            Event::ColorSchemeChanged(scheme) => {
+                self.sync_auto_theme();
+                tracing::debug!(
+                    ?scheme,
+                    auto_switch = self.auto_theme.is_some(),
+                    "terminal appearance report"
+                );
+                if let Some(auto) = self.auto_theme.as_mut() {
+                    let _ = auto.observe(Some(Observation::Explicit(scheme.into())));
+                }
+                (None, None)
+            }
             Event::Key(key) => (Some(Msg::Key(key)), None),
             Event::Paste(text) => (Some(Msg::Paste(text)), None),
             Event::Mouse(mouse) => self.translate_mouse(mouse),
@@ -4545,7 +4576,7 @@ mod tests {
     use caudra_providers::{ImageMediaType, ImageSource, TokenUsage};
     use caudra_storage::sessions::PendingConversationRevert;
     use caudra_workspace::WorkspacePath;
-    use crossterm::event::KeyCode;
+    use crossterm::event::{ColorScheme, KeyCode};
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -5242,6 +5273,14 @@ mod tests {
         assert_eq!(terminal_focus_event(&Event::FocusGained), Some(true));
         assert_eq!(terminal_focus_event(&Event::FocusLost), Some(false));
         assert_eq!(terminal_focus_event(&Event::Resize(80, 24)), None);
+    }
+
+    #[test_case(ColorScheme::Dark; "dark")]
+    #[test_case(ColorScheme::Light; "light")]
+    fn appearance_reports_do_not_prove_terminal_focus(scheme: ColorScheme) {
+        let event = Event::ColorSchemeChanged(scheme);
+        assert_eq!(terminal_focus_event(&event), None);
+        assert!(!terminal_input_proves_focus(&event));
     }
 
     #[cfg(not(windows))]
