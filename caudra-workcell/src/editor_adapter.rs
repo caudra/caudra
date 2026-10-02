@@ -14,12 +14,18 @@ use caudra_agent::permissions::{
     PermissionResourceAccess, PermissionResourceKind, PermissionRisk, PermissionSubject,
     pattern_recognition::ObservationProvenance,
 };
-use caudra_agent::tools::registry::{RegistryAuthoritySnapshot, TrustedToolSource};
+use caudra_agent::tools::native::{
+    self,
+    plan::{self, PlanAuthority, PlanTarget},
+};
+use caudra_agent::tools::registry::{RegistryAuthoritySnapshot, ToolEffect, TrustedToolSource};
 use caudra_agent::tools::{
     PermissionIntent, PermissionScopes, PlanModeAccess, ToolAudience, ToolFilter, ToolRegistry,
     expand_tilde,
 };
 use caudra_config::{ShellNativeRedirect, ToolKey};
+use caudra_storage::id::SessionRef;
+use caudra_storage::local_documents::LocalDocumentStore;
 use caudra_storage::permission_state::BROWSE_RECURSION_ATTRIBUTE;
 use caudra_workspace::WorkspaceSession;
 use serde_json::{Value, json};
@@ -48,6 +54,7 @@ const NO_HOST: &str = "The local Workcell host is unavailable";
 const NO_TEMPLATE: &str = "Fresh analysis requires one complete, static, reviewable shell command";
 const WORKDIR_ATTRIBUTE: &str = "workdir";
 const LOCAL_IN_REMOTE: &str = "The local Workcell host is not the active remote workspace";
+const OPERATION_ATTRIBUTE: &str = "operation";
 
 #[derive(Clone)]
 pub struct PermissionEditorRuntime {
@@ -56,6 +63,21 @@ pub struct PermissionEditorRuntime {
     pub tool_filter: ToolFilter,
     pub audience: ToolAudience,
     pub workspace: Option<WorkspaceSession>,
+    pub session_id: Option<SessionRef>,
+    pub local_documents: Option<Arc<LocalDocumentStore>>,
+}
+
+impl PermissionEditorRuntime {
+    fn plan_authority(&self) -> PlanAuthority<'_> {
+        PlanAuthority {
+            mode: &self.mode,
+            host_cwd: &self.project,
+            audience: self.audience,
+            workspace: self.workspace.as_ref(),
+            local_documents: self.local_documents.as_deref(),
+            session_id: self.session_id.as_ref(),
+        }
+    }
 }
 
 pub struct PermissionEditorContext {
@@ -137,9 +159,15 @@ impl PermissionAuthorityProvider for WorkcellAuthorityProvider {
                 let spec = local_contract(&source)
                     .and_then(|contract| specs.iter().find(|spec| spec.contract_id == contract));
                 let kind = spec.and_then(|spec| ToolKind::from_name(spec.name));
-                let mut authority = descriptor(entry.name(), source, kind);
+                let native_plan = native_plan_contract(entry.name(), &source);
+                let mut authority = if native_plan {
+                    plan_descriptor(entry.name(), source)
+                } else {
+                    descriptor(entry.name(), source, kind)
+                };
                 authority.unavailable = if !runtime.1.tool_filter.matches(entry.name())
                     || kind.is_some_and(|kind| !kind.audience().contains(runtime.1.audience))
+                    || (native_plan && runtime.1.audience != ToolAudience::MAIN)
                 {
                     Some(DISABLED.into())
                 } else if (runtime.1.mode.is_read_only() || runtime.1.tool_filter.is_read_only())
@@ -158,6 +186,13 @@ impl PermissionAuthorityProvider for WorkcellAuthorityProvider {
                     Some(LOCAL_IN_REMOTE.into())
                 } else if self.host.is_none() && local_contract(&authority.source).is_some() {
                     Some(NO_HOST.into())
+                } else if native_plan {
+                    runtime
+                        .1
+                        .plan_authority()
+                        .verified_target()
+                        .err()
+                        .map(|error| error.to_string())
                 } else if kind.is_none() {
                     Some(UNSUPPORTED.into())
                 } else if kind == Some(ToolKind::Code)
@@ -231,6 +266,23 @@ impl PermissionAuthorityLease for WorkcellAuthorityLease<'_> {
         authority: &EditableAuthorityDescriptor,
         input: &Value,
     ) -> Result<PermissionExampleAnalysis, PermissionEditError> {
+        if native_plan_contract(&authority.key, &authority.source) {
+            self.validate_authority(authority)?;
+            if serde_json::to_vec(input).map_or(true, |input| input.len() > MAX_EXAMPLE_BYTES) {
+                return Err(unavailable("Example exceeds the analysis bound"));
+            }
+            let intent = self
+                .runtime
+                .1
+                .plan_authority()
+                .analyze(input)
+                .map_err(|error| unavailable(error.to_string()))?;
+            return Ok(PermissionExampleAnalysis {
+                tool: ToolKey::native(&authority.key),
+                intent,
+                plan_path: None,
+            });
+        }
         let mut prepared = self.prepare(authority, input)?;
         let runtime = &self.runtime.1;
         if runtime.mode.is_planning() {
@@ -263,20 +315,44 @@ impl PermissionAuthorityLease for WorkcellAuthorityLease<'_> {
             plan_path: runtime.mode.plan_path().map(Path::to_path_buf),
         })
     }
+
+    fn active_plan_target(
+        &self,
+        authority: &EditableAuthorityDescriptor,
+    ) -> Result<Option<PlanTarget>, PermissionEditError> {
+        self.validate_authority(authority)?;
+        if !native_plan_contract(&authority.key, &authority.source) {
+            return Ok(None);
+        }
+        self.runtime
+            .1
+            .plan_authority()
+            .verified_target()
+            .map(Some)
+            .map_err(|error| unavailable(error.to_string()))
+    }
 }
 
 impl WorkcellAuthorityLease<'_> {
-    fn prepare(
+    fn validate_authority(
         &self,
         authority: &EditableAuthorityDescriptor,
-        raw_input: &Value,
-    ) -> Result<PreparedInvocation, PermissionEditError> {
+    ) -> Result<(), PermissionEditError> {
         if !self.catalog.authorities.contains(authority) {
             return Err(PermissionEditError::Conflict);
         }
         if let Some(reason) = &authority.unavailable {
             return Err(unavailable(reason));
         }
+        Ok(())
+    }
+
+    fn prepare(
+        &self,
+        authority: &EditableAuthorityDescriptor,
+        raw_input: &Value,
+    ) -> Result<PreparedInvocation, PermissionEditError> {
+        self.validate_authority(authority)?;
         if serde_json::to_vec(raw_input).map_or(true, |input| input.len() > MAX_EXAMPLE_BYTES) {
             return Err(unavailable("Example exceeds the analysis bound"));
         }
@@ -334,6 +410,50 @@ fn local_contract(source: &TrustedToolSource) -> Option<&str> {
             Some(contract)
         }
         _ => None,
+    }
+}
+
+fn native_plan_contract(key: &str, source: &TrustedToolSource) -> bool {
+    key == plan::NAME
+        && matches!(source.subject(), PermissionSubject::Native { owner, contract }
+        if source.builtin_allows() && source.effect() == ToolEffect::Mutating
+            && owner == native::OWNER && *contract == plan::permission_contract())
+}
+
+fn plan_descriptor(key: &str, source: TrustedToolSource) -> EditableAuthorityDescriptor {
+    EditableAuthorityDescriptor {
+        key: key.into(),
+        source,
+        resources: [
+            PermissionResourceKind::File,
+            PermissionResourceKind::Custom {
+                name: "local_document".into(),
+            },
+        ]
+        .into_iter()
+        .map(|kind| {
+            let mut capability = resource(
+                kind,
+                vec![SelectorMode::Exact, SelectorMode::Any],
+                vec![
+                    PermissionResourceAccess::Read,
+                    PermissionResourceAccess::Write,
+                ],
+            );
+            capability
+                .attributes
+                .insert(OPERATION_ATTRIBUTE.into(), vec![SelectorMode::Exact]);
+            capability
+        })
+        .collect(),
+        arguments: vec![
+            ArgumentMode::Exact,
+            ArgumentMode::Selected,
+            ArgumentMode::Unconstrained,
+        ],
+        families: Vec::new(),
+        unrestricted_resources: false,
+        unavailable: None,
     }
 }
 
@@ -737,6 +857,10 @@ pub(super) fn web_intent(kind: PermissionResourceKind, value: String) -> Permiss
 mod tests {
     use std::borrow::Cow;
     use std::collections::BTreeMap;
+    #[cfg(unix)]
+    use std::fs::Permissions;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -752,22 +876,37 @@ mod tests {
         PermissionResourceAccess, PermissionResourceKind, StructuredPermissionEffect,
         pattern_recognition::CommandObservation,
     };
+    use caudra_agent::tools::native::{
+        self,
+        plan::{self, PlanTarget},
+    };
     use caudra_agent::tools::{
-        DescriptionContext, ParseError, PlanModeAccess, Tool, ToolAudience, ToolFilter,
+        DescriptionContext, ParseError, PlanModeAccess, Tool, ToolAudience, ToolEffect, ToolFilter,
         ToolInvocation, ToolRegistry, ToolSource,
     };
-    use caudra_config::{Effect, PermissionRule, PermissionsConfig, ToolKey};
+    use caudra_config::{
+        DefaultEffect, Effect, FeatureFlags, PermissionRule, PermissionsConfig, ToolKey,
+    };
     use caudra_storage::StateDir;
+    use caudra_storage::id::SessionRef;
+    use caudra_storage::local_documents::LocalDocumentStore;
     use caudra_storage::permission_patterns::{ArgumentRole, PatternToken};
     use caudra_storage::permission_state::PermissionState;
+    use caudra_storage::plans::PlanFile;
+    use caudra_workspace::{
+        AuthenticatedPrincipalId, AuthorityIdentity, CwdHandle, LocalDocumentRef, ProjectIdentity,
+        ProjectKey, ResourceId, ResourceScope, SessionBindingId, SessionWorkspaceBinding,
+        SourceTrustAnchor, WorkspaceCursor, WorkspaceHandle, WorkspaceSession,
+    };
     use serde_json::{Value, json};
-    use tempfile::TempDir;
+    use tempfile::{Builder, TempDir};
     use test_case::test_case;
     use workcell::shell::{PreparedShell, ShellInput};
 
     use super::{
-        DISABLED, NO_TEMPLATE, PermissionEditorContext, PermissionEditorRuntime, READ_ONLY,
-        UNSUPPORTED, permission_authority_provider, shell_plan_access,
+        DISABLED, NO_TEMPLATE, OPERATION_ATTRIBUTE, PermissionEditorContext,
+        PermissionEditorRuntime, READ_ONLY, UNSUPPORTED, permission_authority_provider,
+        shell_plan_access,
     };
     use crate::{WorkcellHost, pattern_analysis::shell_facts, read_only_shell};
 
@@ -779,6 +918,21 @@ mod tests {
     const CUSTOM_TOOL: &str = "untrusted_shell";
     const TEMPLATE_NAME: &str = "User literal template";
     const STATE_DIRECTORY: &str = "state";
+    const PLAN_DOCUMENT: &str = "active-plan.md";
+    const PLAN_CONTENT: &str = "The approved plan";
+    const PLAN_EXAMPLE: &str = "A proposed replacement";
+    const PLAN_IDENTITY: &str = "plan-editor";
+    #[cfg(unix)]
+    const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+
+    enum InvalidPlanAuthority {
+        Mode,
+        Session,
+        Store,
+        Disabled,
+        ReadOnly,
+        Audience,
+    }
 
     struct Fixture {
         root: TempDir,
@@ -790,7 +944,10 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let root = TempDir::new().unwrap();
+            let mut builder = Builder::new();
+            #[cfg(unix)]
+            builder.permissions(Permissions::from_mode(PRIVATE_DIRECTORY_MODE));
+            let root = builder.tempdir().unwrap();
             let project = root.path().canonicalize().unwrap();
             let host = WorkcellHost::new(&project, None).unwrap();
             let registry = Arc::new(ToolRegistry::new());
@@ -802,6 +959,8 @@ mod tests {
                     tool_filter: ToolFilter::All,
                     audience: ToolAudience::MAIN,
                     workspace: None,
+                    session_id: None,
+                    local_documents: None,
                 })
                 .unwrap(),
             );
@@ -822,6 +981,66 @@ mod tests {
 
         fn runtime(&self) -> PermissionEditorRuntime {
             self.context.current.read().unwrap().1.clone()
+        }
+
+        fn plan(remote: bool) -> Self {
+            let fixture = Self::new();
+            native::register(&fixture.registry, FeatureFlags::default()).unwrap();
+            let mut runtime = fixture.runtime();
+            if remote {
+                let authority = AuthorityIdentity::new(
+                    SourceTrustAnchor::new(PLAN_IDENTITY).unwrap(),
+                    PLAN_IDENTITY,
+                    PLAN_IDENTITY,
+                    PLAN_IDENTITY,
+                    PLAN_IDENTITY,
+                )
+                .unwrap();
+                let binding = SessionWorkspaceBinding::new(
+                    SessionBindingId::new(PLAN_IDENTITY).unwrap(),
+                    authority.clone(),
+                    AuthenticatedPrincipalId::new(authority.clone(), PLAN_IDENTITY).unwrap(),
+                    ProjectIdentity::new(
+                        authority.clone(),
+                        ProjectKey::new(PLAN_IDENTITY).unwrap(),
+                    ),
+                )
+                .unwrap();
+                let cursor = WorkspaceCursor::new(
+                    &binding,
+                    ResourceScope::root(ResourceId::new(PLAN_IDENTITY).unwrap()),
+                    1,
+                    CwdHandle::new(PLAN_IDENTITY).unwrap(),
+                );
+                let workspace = WorkspaceSession::new(
+                    WorkspaceHandle::new(authority, Default::default(), Default::default())
+                        .unwrap(),
+                    binding,
+                    cursor,
+                )
+                .unwrap();
+                let store = Arc::new(LocalDocumentStore::remote(
+                    StateDir::from_path(fixture.project().join(STATE_DIRECTORY)),
+                    workspace.binding(),
+                ));
+                let session_id = SessionRef::generate();
+                let reference = store
+                    .create_plan(workspace.binding().project().key(), session_id.as_str())
+                    .unwrap();
+                runtime.mode = AgentMode::RemotePlan(reference);
+                runtime.workspace = Some(workspace);
+                runtime.local_documents = Some(store);
+                runtime.session_id = Some(session_id);
+            } else {
+                let path = fixture.project().join(PLAN_DOCUMENT);
+                PlanFile::new(path.clone())
+                    .unwrap()
+                    .write(PLAN_CONTENT)
+                    .unwrap();
+                runtime.mode = AgentMode::Plan(path);
+            }
+            fixture.context.replace(runtime).unwrap();
+            fixture
         }
 
         fn prepare_shell(&self, command: &str) -> PreparedShell {
@@ -850,6 +1069,228 @@ mod tests {
             manager.set_permission_authority_provider(self.provider.clone());
             manager
         }
+    }
+
+    #[test_case(StructuredPermissionEffect::Deny, true, DefaultEffect::Prompt; "exact_deny_blocks")]
+    #[test_case(StructuredPermissionEffect::Ask, true, DefaultEffect::Prompt; "exact_ask_prompts")]
+    #[test_case(StructuredPermissionEffect::Deny, false, DefaultEffect::Prompt; "unmatched_deny_preserves_scoped_approval")]
+    #[test_case(StructuredPermissionEffect::Deny, false, DefaultEffect::Deny; "default_deny_blocks_scoped_approval")]
+    fn native_plan_editor_uses_verified_policy(
+        effect: StructuredPermissionEffect,
+        write: bool,
+        default: DefaultEffect,
+    ) {
+        for remote in [false, true] {
+            let fixture = Fixture::plan(remote);
+            let manager = fixture.permissions();
+            manager.set_project_with_config(
+                &fixture.project(),
+                PermissionsConfig {
+                    default,
+                    ..Default::default()
+                },
+            );
+            let input = json!({"action": "write", "content": PLAN_EXAMPLE});
+            let (intent, target) = {
+                let lease = fixture.provider.acquire(&fixture.project()).unwrap();
+                let authority = lease
+                    .catalog()
+                    .authorities
+                    .iter()
+                    .find(|authority| authority.key == plan::NAME)
+                    .unwrap();
+                assert_eq!(authority.unavailable, None);
+                (
+                    lease.analyze_example(authority, &input).unwrap().intent,
+                    lease.active_plan_target(authority).unwrap().unwrap(),
+                )
+            };
+            let resource = &intent.resources[0];
+            let session = manager
+                .begin_permission_edit(
+                    PermissionEditOperation::Create,
+                    PermissionEditEvidence {
+                        input: Some(input.clone()),
+                        values: vec![resource.value.clone()],
+                    },
+                )
+                .unwrap();
+            let draft = PermissionRuleDraft {
+                identity: IdentityDraft::Registered {
+                    key: plan::NAME.into(),
+                    family: None,
+                },
+                effect: effect.clone(),
+                lifetime: PermissionLifetime::Project,
+                project: ProjectDraft::Current,
+                resources: ResourcesDraft::Constrained(vec![ResourceDraft {
+                    original_index: None,
+                    kind: resource.kind.clone(),
+                    selector: SelectorDraft::Replace(SelectorValue::Exact(resource.value.clone())),
+                    access: GuardDraft::Equals(if write {
+                        PermissionResourceAccess::Write
+                    } else {
+                        PermissionResourceAccess::Read
+                    }),
+                    protected: GuardDraft::Equals(false),
+                    attributes: BTreeMap::from([(
+                        OPERATION_ATTRIBUTE.into(),
+                        SelectorDraft::Replace(SelectorValue::Exact(
+                            if write { "write" } else { "read" }.into(),
+                        )),
+                    )]),
+                }]),
+                arguments: ArgumentsDraft::Unconstrained,
+                label: None,
+            };
+            let preview = manager.preview_permission_edit(&session, &draft).unwrap();
+            let result = manager
+                .preview_permission_example(&preview, plan::NAME, &input)
+                .unwrap();
+            assert_eq!(result.matches_rule, write);
+            if default == DefaultEffect::Deny
+                || (write && effect == StructuredPermissionEffect::Deny)
+            {
+                assert!(matches!(
+                    result.effective_policy,
+                    EffectivePolicyPreview::Denied(_)
+                ));
+            } else if write {
+                assert_eq!(result.effective_policy, EffectivePolicyPreview::Prompt);
+            } else {
+                assert_eq!(
+                    result.effective_policy,
+                    EffectivePolicyPreview::AllowedByPolicy
+                );
+            }
+            let confirmation = preview.confirm(preview.requirements()).unwrap();
+            manager
+                .commit_permission_edit(&preview, &confirmation, &draft)
+                .unwrap();
+            assert_eq!(manager.structured_rule_inventory().unwrap().len(), 1);
+            match target {
+                PlanTarget::Local(path) => {
+                    assert_eq!(PlanFile::new(path).unwrap().read().unwrap().0, PLAN_CONTENT)
+                }
+                PlanTarget::Remote(reference) => {
+                    let runtime = fixture.runtime();
+                    let store = runtime.local_documents.as_ref().unwrap();
+                    assert!(
+                        store
+                            .read(
+                                store.project_key(),
+                                runtime.session_id.as_ref().map(SessionRef::as_str),
+                                &LocalDocumentRef::Plan(reference)
+                            )
+                            .unwrap()
+                            .content
+                            .is_empty()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test_case(InvalidPlanAuthority::Mode; "outside_committed_plan")]
+    #[test_case(InvalidPlanAuthority::Session; "different_session")]
+    #[test_case(InvalidPlanAuthority::Store; "missing_document_store")]
+    #[test_case(InvalidPlanAuthority::Disabled; "profile_disabled_plan")]
+    #[test_case(InvalidPlanAuthority::ReadOnly; "strict_read_only_plan")]
+    #[test_case(InvalidPlanAuthority::Audience; "subagent_plan")]
+    fn native_plan_editor_rejects_invalid_authority(invalid: InvalidPlanAuthority) {
+        let fixture = Fixture::plan(true);
+        let mut runtime = fixture.runtime();
+        match invalid {
+            InvalidPlanAuthority::Mode => runtime.mode = AgentMode::Build,
+            InvalidPlanAuthority::Session => runtime.session_id = Some(SessionRef::generate()),
+            InvalidPlanAuthority::Store => runtime.local_documents = None,
+            InvalidPlanAuthority::Disabled => {
+                runtime.tool_filter = ToolFilter::AllExcept(vec![plan::NAME.into()])
+            }
+            InvalidPlanAuthority::ReadOnly => {
+                runtime.tool_filter = ToolFilter::ReadOnly(Box::new(ToolFilter::All))
+            }
+            InvalidPlanAuthority::Audience => runtime.audience = ToolAudience::GENERAL_SUB,
+        }
+        fixture.context.replace(runtime).unwrap();
+        let lease = fixture.provider.acquire(&fixture.project()).unwrap();
+        let authority = lease
+            .catalog()
+            .authorities
+            .iter()
+            .find(|authority| authority.key == plan::NAME)
+            .unwrap();
+        assert!(authority.unavailable.is_some());
+        assert!(
+            lease
+                .analyze_example(authority, &json!({"action": "read"}))
+                .is_err()
+        );
+        assert!(lease.active_plan_target(authority).is_err());
+    }
+
+    struct PlanImpostor;
+
+    impl Tool for PlanImpostor {
+        fn name(&self) -> &str {
+            plan::NAME
+        }
+        fn description(&self, _: &DescriptionContext) -> Cow<'_, str> {
+            panic!("{NEVER}")
+        }
+        fn schema(&self) -> Value {
+            panic!("{NEVER}")
+        }
+        fn parse(&self, _: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+            panic!("{NEVER}")
+        }
+    }
+
+    #[test_case(false, true, native::OWNER, ToolEffect::Mutating; "untrusted_plan_contract")]
+    #[test_case(true, false, native::OWNER, ToolEffect::Mutating; "wrong_plan_contract")]
+    #[test_case(true, true, CUSTOM_TOOL, ToolEffect::Mutating; "wrong_plan_owner")]
+    #[test_case(true, true, native::OWNER, ToolEffect::ReadOnly; "wrong_plan_effect")]
+    fn native_plan_editor_does_not_trust_the_name(
+        trusted: bool,
+        correct_contract: bool,
+        owner: &str,
+        effect: ToolEffect,
+    ) {
+        let fixture = Fixture::new();
+        fixture
+            .registry
+            .register_audited(
+                Arc::new(PlanImpostor),
+                ToolSource::Native {
+                    owner: owner.into(),
+                    contract: if correct_contract {
+                        plan::permission_contract()
+                    } else {
+                        CUSTOM_TOOL.into()
+                    }
+                    .into(),
+                    trusted,
+                },
+                effect,
+            )
+            .unwrap();
+        let lease = fixture.provider.acquire(&fixture.project()).unwrap();
+        let authority = lease
+            .catalog()
+            .authorities
+            .iter()
+            .find(|authority| authority.key == plan::NAME)
+            .unwrap();
+        assert_eq!(authority.unavailable.as_deref(), Some(UNSUPPORTED));
+        assert!(authority.resources.is_empty());
+        assert!(
+            lease
+                .analyze_example(
+                    authority,
+                    &json!({"action": "write", "content": PLAN_EXAMPLE})
+                )
+                .is_err()
+        );
     }
 
     struct NeverInvoked;

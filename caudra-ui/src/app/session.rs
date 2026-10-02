@@ -18,6 +18,7 @@ use crate::repaint::{Dirty, Watch};
 use caudra_agent::HistorySnapshot;
 use caudra_agent::agent::estimate_message_tokens;
 use caudra_agent::peers::PeerSession;
+use caudra_agent::permissions::PermissionManager;
 use caudra_agent::{GoalHandle, GoalStatus};
 use caudra_config::Feature;
 use caudra_providers::{
@@ -49,6 +50,13 @@ const SOFT_SAVE_DELAY: Duration = Duration::from_millis(1000);
 const PARALLEL_RESTORE_MIN_CHATS: usize = 4;
 const RENAME_USAGE: &str = "Usage: /rename <title>";
 pub(crate) const REVERT_BUSY_MSG: &str = "Wait for the session to become idle before reverting";
+
+struct PreparedSessionReset {
+    session: AppSession,
+    lease: Arc<SessionLease>,
+    permissions: Arc<PermissionManager>,
+    conversation_permissions: ConversationPermissions,
+}
 
 /// Saturates rather than wraps: a goal left open for longer than `u64`
 /// milliseconds is not a number worth panicking over.
@@ -950,13 +958,55 @@ impl App {
     }
 
     pub(crate) fn reset_session(&mut self) -> Vec<Action> {
+        let result = self
+            .prepare_session_reset()
+            .and_then(|prepared| self.commit_session_reset(prepared, self.state.mode));
+        match result {
+            Ok(actions) => actions,
+            Err(error) => {
+                self.flash(error);
+                Vec::new()
+            }
+        }
+    }
+
+    pub(crate) fn reset_session_for_plan(&mut self) -> Result<Vec<Action>, String> {
+        self.check_run_admission()?;
+        let mut prepared = self.prepare_session_reset()?;
+        if matches!(
+            prepared.conversation_permissions,
+            ConversationPermissions::Pending
+        ) {
+            match attach_session_permissions(
+                &self.storage,
+                &self.storage_writer,
+                &mut prepared.session,
+                &prepared.permissions,
+            ) {
+                Ok(snapshot) => {
+                    prepared.conversation_permissions = ConversationPermissions::Published(snapshot)
+                }
+                Err(error) => {
+                    self.discard_unstarted_session(prepared.session.id);
+                    return Err(error);
+                }
+            }
+        }
+        self.commit_session_reset(prepared, Mode::Build)
+    }
+
+    pub(crate) fn discard_unstarted_session(&self, id: CaudraId) {
+        if let Err(error) = self.storage_writer.delete_sync(id) {
+            tracing::warn!(%error, session_id = %id, "failed to discard unstarted session");
+        }
+    }
+
+    fn prepare_session_reset(&self) -> Result<PreparedSessionReset, String> {
         if self.permission_mutation_pending() {
-            self.flash(PERMISSION_WORKER_BUSY.into());
-            return Vec::new();
+            return Err(PERMISSION_WORKER_BUSY.into());
         }
         if self.cancelling_run.is_some() {
-            self.status_bar.flash(REVERT_BUSY_MSG.into());
-            return Vec::new();
+            return Err(REVERT_BUSY_MSG.into());
         }
         let replacement = self.state.session.workspace_binding().map_or_else(
             || AppSession::new(&self.state.session.model, &self.state.session.cwd),
@@ -968,24 +1018,30 @@ impl App {
                 )
             },
         );
-        let lease = match SessionLease::acquire(&self.storage, replacement.id) {
-            Ok(lease) => Arc::new(lease),
-            Err(error) => {
-                self.status_bar
-                    .flash(format!("Failed to reserve new session: {error}"));
-                return Vec::new();
-            }
-        };
-        let permissions = Arc::new(self.permissions.fork_session());
-        let conversation_permissions = self.conversation_permissions.deferred();
+        let lease = SessionLease::acquire(&self.storage, replacement.id)
+            .map_err(|error| format!("Failed to reserve new session: {error}"))?;
+        Ok(PreparedSessionReset {
+            session: replacement,
+            lease: Arc::new(lease),
+            permissions: Arc::new(self.permissions.fork_session()),
+            conversation_permissions: self.conversation_permissions.deferred(),
+        })
+    }
+
+    fn commit_session_reset(
+        &mut self,
+        prepared: PreparedSessionReset,
+        mode: Mode,
+    ) -> Result<Vec<Action>, String> {
         if let Err(error) = self.retire_current_session() {
-            self.status_bar
-                .flash(format!("Failed to retire current session: {error}"));
-            return Vec::new();
+            if prepared.conversation_permissions.is_published() {
+                self.discard_unstarted_session(prepared.session.id);
+            }
+            return Err(format!("Failed to retire current session: {error}"));
         }
         self.suspend_permission_editor();
-        self.permissions = permissions;
-        self.conversation_permissions = conversation_permissions;
+        self.permissions = prepared.permissions;
+        self.conversation_permissions = prepared.conversation_permissions;
         self.reset_ui_chrome();
         self.state.token_usage = TokenUsage::default();
         self.state.cost = None;
@@ -993,12 +1049,14 @@ impl App {
         self.state.goal = GoalHandle::default();
         self.goal_deferred = false;
         self.state.plan = PlanState::None;
+        self.state.mode = mode;
+        self.state.applied_mode = mode;
         self.permissions.set_session_mode(None);
         // Fire before the swap. A handler cleaning up after the session
         // that just ended needs its id, and the stamp always reads
         // whichever session is current.
         self.fire_session_autocmd("SessionReset", serde_json::json!({}));
-        self.state.session = Arc::new(replacement);
+        self.state.session = Arc::new(prepared.session);
         self.automatic_wakes_suppressed = self.state.session.meta.automatic_wakes_suppressed;
         // After the swap: a remote plan document is filed under the session id
         // that will own it, and the retiring session must not be handed one.
@@ -1012,7 +1070,7 @@ impl App {
             Some(&self.state.session.id.to_string()),
         );
         self.install_local_history();
-        vec![Action::NewSession(lease)]
+        Ok(vec![Action::NewSession(prepared.lease)])
     }
 
     pub(super) fn open_rewind_picker(&mut self) -> Vec<Action> {

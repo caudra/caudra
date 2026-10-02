@@ -847,8 +847,16 @@ impl SubscriptionProvider {
 
 use std::path::PathBuf;
 
+pub struct PlanHandoff {
+    pub(crate) input: AgentInput,
+    pub(crate) content: String,
+    pub(crate) source: String,
+    pub(crate) header: String,
+}
+
 pub enum Action {
     SendMessage(Box<AgentInput>),
+    ClearAndImplement(Box<PlanHandoff>),
     ManualExit,
     ShellCommand {
         id: String,

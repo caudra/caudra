@@ -79,6 +79,7 @@ pub struct Tab {
     notice: Option<ReadOnly>,
     diff_rows: Option<Vec<DiffRow>>,
     modified: Option<SystemTime>,
+    snapshot: Option<String>,
     source: Option<Source>,
     /// The file changed underneath an edited buffer. Neither copy can be thrown
     /// away without being asked, so the tab says so and waits.
@@ -125,6 +126,7 @@ impl Tab {
             notice: loaded.read_only,
             diff_rows: None,
             modified: loaded.modified,
+            snapshot: None,
             source: None,
             conflict: false,
             remote_reload: false,
@@ -180,6 +182,7 @@ impl Tab {
             notice: None,
             diff_rows: None,
             modified: None,
+            snapshot: None,
             source: None,
             conflict: false,
             remote_reload: false,
@@ -230,6 +233,7 @@ impl Tab {
             notice: None,
             diff_rows: Some(rows),
             modified: None,
+            snapshot: None,
             source: None,
             conflict: false,
             remote_reload: false,
@@ -545,9 +549,12 @@ impl Tab {
             return Err(SaveError::ReadOnly(path.to_path_buf()));
         }
         let contents = read::encode(self.buffer.lines(), self.line_ending, self.trailing_newline);
-        let saved = match &mut self.source {
-            Some(source) => read::save_local_source(source, path, &contents),
-            None => read::save(path, &contents, self.modified),
+        let saved = match (&self.snapshot, &mut self.source) {
+            (Some(snapshot), source) => {
+                read::save_snapshot(path, &contents, snapshot, source.as_mut())
+            }
+            (None, Some(source)) => read::save_local_source(source, path, &contents),
+            (None, None) => read::save(path, &contents, self.modified),
         };
         if matches!(
             &saved,
@@ -556,6 +563,7 @@ impl Tab {
             self.conflict = true;
         }
         self.modified = saved?;
+        self.snapshot = None;
         self.history.mark_saved();
         self.conflict = false;
         Ok(())
@@ -616,6 +624,22 @@ impl Tab {
         self.take(read::decode(text, None));
     }
 
+    pub fn replace_file(&mut self, text: &str) -> bool {
+        if self.is_dirty() {
+            self.conflict = true;
+            return false;
+        }
+        self.take(read::decode(text, self.modified));
+        self.snapshot = Some(text.to_owned());
+        self.refresh_find();
+        let cursor = self.buffer.cursor();
+        self.h_scroll = self.h_scroll.min(render::display_column(
+            self.buffer.line(cursor.line),
+            cursor.col,
+        ));
+        true
+    }
+
     /// The host kept what a save of this document handed it, so nothing in
     /// the tab is unsaved any more.
     pub fn mark_saved(&mut self) {
@@ -633,6 +657,7 @@ impl Tab {
         self.trailing_newline = loaded.trailing_newline;
         self.notice = loaded.read_only;
         self.modified = loaded.modified;
+        self.snapshot = None;
         self.buffer = Buffer::new(loaded.lines);
         self.changed();
         self.buffer.set_cursor(cursor, false);
@@ -1094,6 +1119,7 @@ mod tests {
     const WRONG_SOURCE: &str = "rendered copy did not preserve the complete current document";
     const NO_RENDERED: &str = "the Markdown tab has no rendered view";
     const DOCUMENT_STATUS: &str = "draft";
+    const SNAPSHOT_QUERY: &str = "Title";
 
     enum SourceEdit {
         Insert,
@@ -1379,6 +1405,73 @@ mod tests {
         assert_eq!(tab.contents(), REPLACEMENT, "{WRONG_SOURCE}");
     }
 
+    #[test_case(REPLACEMENT, Cursor::new(2, 3), 2, false ; "preserves_fitting_source")]
+    #[test_case(REPLACEMENT, Cursor::new(2, 3), 2, true ; "preserves_fitting_rendered")]
+    #[test_case(EMPTY_MARKDOWN, Cursor::new(0, 0), 0, false ; "clamps_shorter_source")]
+    #[test_case(EMPTY_MARKDOWN, Cursor::new(0, 0), 0, true ; "clamps_shorter_rendered")]
+    fn file_snapshot_refreshes_view_search_and_history(
+        text: &str,
+        cursor: Cursor,
+        scroll: usize,
+        rendered: bool,
+    ) {
+        let mut tab = markdown_tab(MARKDOWN);
+        let edit = tab.buffer.insert(ADDITION);
+        assert!(tab.record(edit));
+        assert!(tab.undo());
+        tab.buffer.set_cursor(Cursor::new(2, 3), false);
+        tab.set_scroll(2);
+        tab.h_scroll = PAINT_WIDTH as usize;
+        tab.find.open();
+        tab.find.query_mut().set_text(SNAPSHOT_QUERY);
+        tab.search_find();
+        assert!(tab.find.current().is_some());
+        if rendered {
+            select_rendered(&mut tab);
+        }
+        let modified = tab.modified;
+
+        assert!(tab.replace_file(text));
+
+        assert_eq!(tab.contents(), text);
+        assert_eq!(tab.buffer.cursor(), cursor);
+        assert_eq!(tab.scroll(), scroll);
+        assert_eq!(tab.scroll_row, 0);
+        assert!(tab.h_scroll <= cursor.col);
+        assert_eq!(tab.modified, modified);
+        assert_eq!(tab.snapshot.as_deref(), Some(text));
+        assert!(tab.find.current().is_none());
+        assert_eq!(tab.find.is_open(), !rendered);
+        if rendered {
+            assert_rendered_selection_invalidated(&mut tab);
+        }
+        assert!(!tab.is_dirty());
+        assert!(!tab.undo() && !tab.redo());
+    }
+
+    #[test_case(false ; "reload_clean_snapshot")]
+    #[test_case(true ; "discard_edited_snapshot")]
+    fn disk_reload_replaces_the_snapshot_save_baseline(dirty: bool) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(MARKDOWN_FILE);
+        fs::write(&path, MARKDOWN).unwrap();
+        let mut tab = Tab::open(&path, PAINT_THEME).unwrap();
+        assert!(tab.replace_file(REPLACEMENT));
+        if dirty {
+            let edit = tab.buffer.insert(ADDITION);
+            assert!(tab.record(edit));
+            tab.discard_and_reload().unwrap();
+        } else {
+            assert!(tab.reload_from_disk().unwrap());
+        }
+        assert_eq!(tab.contents(), MARKDOWN);
+        assert!(tab.snapshot.is_none());
+        let edit = tab.buffer.insert(ADDITION);
+        assert!(tab.record(edit));
+        tab.save().unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), tab.contents());
+    }
+
     #[cfg(unix)]
     mod local_source {
         use std::fs::{self, File};
@@ -1429,6 +1522,33 @@ mod tests {
             let change = tab.buffer.insert(EDIT);
             assert!(tab.record(change));
             tab.contents()
+        }
+
+        #[test_case(false, ORIGINAL, true ; "unchanged_verified_source")]
+        #[test_case(false, EXTERNAL, false ; "snapshot_cannot_reauthorize_source")]
+        #[test_case(true, ORIGINAL, false ; "same_bytes_replacement_keeps_identity_guard")]
+        fn snapshot_preserves_verified_source_authority(
+            replaced: bool,
+            text: &str,
+            can_save: bool,
+        ) {
+            let (_dir, path, mut tab) = fixture();
+            if replaced {
+                fs::remove_file(&path).unwrap();
+                fs::write(&path, ORIGINAL).unwrap();
+            }
+            assert!(tab.replace_file(text));
+            let contents = edit(&mut tab);
+            let saved = tab.save();
+            if can_save {
+                saved.unwrap();
+                assert_eq!(fs::read_to_string(&path).unwrap(), contents);
+                assert!(tab.reload_from_disk().unwrap());
+            } else {
+                assert!(matches!(saved, Err(SaveError::Stale(_))));
+                assert!(tab.conflict && tab.is_dirty());
+                assert_eq!(fs::read_to_string(&path).unwrap(), ORIGINAL);
+            }
         }
 
         #[test_case(false ; "ordinary_source")]

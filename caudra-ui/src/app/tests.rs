@@ -44,13 +44,14 @@ use caudra_agent::permissions::pattern_recognition::{
 use caudra_agent::permissions::{
     PermissionManager, PermissionRequest, PermissionResourceSelector, PermissionRuleRecord,
 };
+use caudra_agent::tools::native::plan::{self, PlanTarget, PlanWriteResult};
 use caudra_agent::tools::{SHELL_TOOL_NAME, TODOWRITE_TOOL_NAME, ToolEffect};
 use caudra_agent::types::{AskedQuestion, QuestionOption, TodoItem, TodoPriority, TodoStatus};
 use caudra_agent::{
-    CallStage, DoneReason, GoalResult, GoalStatus, GoalVerdict, HistorySnapshot, ImageMediaType,
-    McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader,
-    SubagentActivity, SubagentProgress, ToolAccounting, ToolDoneEvent, ToolOutput, ToolStartEvent,
-    TurnCompleteEvent,
+    BatchProgressEvent, BatchToolEntry, BatchToolStatus, CallStage, DoneReason, GoalResult,
+    GoalStatus, GoalVerdict, HistorySnapshot, ImageMediaType, McpConfigErrors, McpServerInfo,
+    McpServerStatus, McpSnapshot, McpSnapshotReader, SubagentActivity, SubagentProgress,
+    TextOutput, ToolAccounting, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
 };
 use caudra_config::decisions::DecisionFeatures;
 use caudra_config::sandbox::SandboxName;
@@ -67,10 +68,12 @@ use caudra_providers::{
     project_messages,
 };
 use caudra_storage::id::CaudraId;
+use caudra_storage::local_documents::DocumentRevision;
 use caudra_storage::permission_patterns::{
     ArgumentRole, PATTERN_SCHEMA_VERSION, PatternContext, PatternDefinition, PatternToken,
     SlotCombinations,
 };
+use caudra_storage::plans::PlanFile;
 use caudra_storage::prompt_stash::{PromptStash, StashEntry};
 use caudra_storage::sessions::{
     PermissionMode, SessionLocation, SessionMeta, StoredActiveGoal, StoredGoalVerdict, StoredImage,
@@ -85,9 +88,9 @@ use caudra_storage::view::ViewMode;
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
 use caudra_workbench::keys as workbench_keys;
 use caudra_workspace::{
-    CollectionRevision, OperationId, ProjectAsset, ProjectAssetContent, ProjectAssetManifest,
-    SessionWorkspaceBinding, WorkspaceAssetService, WorkspaceCapabilities, WorkspaceCursor,
-    WorkspaceError, WorkspaceHandle, WorkspaceServices, WorkspaceSession,
+    CollectionRevision, OperationId, PlanRef, ProjectAsset, ProjectAssetContent,
+    ProjectAssetManifest, SessionWorkspaceBinding, WorkspaceAssetService, WorkspaceCapabilities,
+    WorkspaceCursor, WorkspaceError, WorkspaceHandle, WorkspaceServices, WorkspaceSession,
 };
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
@@ -98,13 +101,25 @@ use ratatui::buffer::CellDiffOption;
 use ratatui::layout::{Position, Rect};
 use ratatui::text::Line;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::slice::from_ref;
 use std::time::Duration;
-use tempfile::TempDir;
+use tempfile::{Builder, TempDir};
 use test_case::test_case;
 
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(unix)]
+const PRIVATE_TEST_DIRECTORY_MODE: u32 = 0o700;
+const HANDOFF_PLAN_FILE: &str = "test-plan.md";
+const HANDOFF_PLAN_CONTENT: &str = "# Captured plan\n\nImplement without reading files.";
+const HANDOFF_PLAN_CHANGED: &str = "# A later plan revision";
+const COMMITTED_PLAN_PATH: &str = "/unreadable/committed-plan.md";
+const STALE_PLAN_PATH: &str = "/unreadable/stale-plan.md";
+const COMMITTED_PLAN_REF: &str = "plan-committed";
+const STALE_PLAN_REF: &str = "plan-stale";
+const COMMITTED_PLAN_CALL: &str = "committed-plan-write";
 const PEER_DELIVERED: usize = 11;
 const PEER_SENT: usize = 9;
 const PEER_CONTROL_PROMPT: &str = "Keep the peer controls across a reload.";
@@ -356,6 +371,14 @@ fn build_app_with_lua(
         .join("caudra-ui-test-workspaces")
         .join(session.id.to_string());
     std::fs::create_dir_all(&workspace).unwrap();
+    #[cfg(unix)]
+    for path in [workspace.parent().unwrap(), &workspace] {
+        fs::set_permissions(
+            path,
+            fs::Permissions::from_mode(PRIVATE_TEST_DIRECTORY_MODE),
+        )
+        .unwrap();
+    }
     session.set_cwd(workspace.to_string_lossy().into_owned());
     App::new(
         &model,
@@ -401,7 +424,16 @@ thread_local! {
     /// `retire_current_session` failed, taking `/new` and session loading down
     /// with it. Tests on one thread still share a dir, which is what a second
     /// app in the same test wants; tests that run at the same time never can.
-    static TEST_STATE_DIR: TempDir = TempDir::new().expect("test state dir");
+    static TEST_STATE_DIR: TempDir = private_tempdir();
+}
+
+pub(crate) fn private_tempdir() -> TempDir {
+    let mut builder = Builder::new();
+    #[cfg(unix)]
+    builder.permissions(fs::Permissions::from_mode(PRIVATE_TEST_DIRECTORY_MODE));
+    builder
+        .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
+        .unwrap()
 }
 
 fn test_state_dir() -> StateDir {
@@ -449,7 +481,7 @@ fn app_with_hints() -> (App, HintWriterHandle) {
 }
 
 fn tempdir_app() -> (TempDir, StateDir, Arc<StorageWriter>, App) {
-    let tmp = TempDir::new().unwrap();
+    let tmp = private_tempdir();
     let dir = StateDir::from_path(tmp.path().to_path_buf());
     let writer = Arc::new(test_writer(dir.clone()));
     let app = build_app(dir.clone(), Arc::clone(&writer));
@@ -16457,20 +16489,32 @@ fn flush_restored_queue_drops_recovery_snapshot() {
 
 // --- Plan form integration tests ---
 
-fn implement_msg(parallel: bool) -> String {
-    if parallel {
-        format!("{IMPLEMENT_MSG_PREFIX} at `test-plan.md`. {IMPLEMENT_PARALLEL_HINT}")
+fn implement_msg(app: &App, parallel: bool) -> String {
+    let path = Path::new(&app.state.session.cwd).join(HANDOFF_PLAN_FILE);
+    let (content, revision) = PlanFile::new(path.clone()).unwrap().read().unwrap();
+    let hint = if parallel {
+        format!(" {IMPLEMENT_PARALLEL_HINT}")
     } else {
-        format!("{IMPLEMENT_MSG_PREFIX} at `test-plan.md`.")
-    }
+        String::new()
+    };
+    format!(
+        "{IMPLEMENT_MSG_PREFIX} from `{}` (revision `{}`).{hint}\n\n{content}",
+        path.display(),
+        revision.as_str()
+    )
 }
 
-fn plan_app() -> App {
+pub(crate) fn plan_app() -> App {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
     app.state.mode = Mode::Plan;
-    app.state.plan = PlanState::Drafting(PathBuf::from("test-plan.md"));
+    app.state.applied_mode = Mode::Plan;
+    PlanFile::new(Path::new(&app.state.session.cwd).join(HANDOFF_PLAN_FILE))
+        .unwrap()
+        .write(HANDOFF_PLAN_CONTENT)
+        .unwrap();
+    app.state.plan = PlanState::Drafting(PathBuf::from(HANDOFF_PLAN_FILE));
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         id: "t1".into(),
         tool: "write".into(),
@@ -16574,6 +16618,15 @@ fn plan_form_menu_options(
         app.update(Msg::Key(key(KeyCode::Down)));
     }
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    if has_new_session {
+        assert!(app.plan_form.is_visible());
+        assert_eq!(app.state.mode, Mode::Plan);
+        assert!(app.state.plan.is_ready());
+        assert!(
+            matches!(&actions[..], [Action::ClearAndImplement(handoff)] if handoff.input.message == implement_msg(&app, false))
+        );
+        return;
+    }
     assert!(!app.plan_form.is_visible());
     assert_eq!(app.state.mode, expected_mode);
     assert_eq!(app.state.plan, PlanState::None);
@@ -16583,7 +16636,7 @@ fn plan_form_menu_options(
             .any(|a| matches!(a, Action::RequestNewSession)),
         has_new_session
     );
-    let expected_msg = implement_msg(PlanForm::new().parallel());
+    let expected_msg = implement_msg(&app, PlanForm::new().parallel());
     assert_eq!(
         actions
             .iter()
@@ -16599,12 +16652,335 @@ fn plan_form_implement_toggled_parallel() {
     app.update(Msg::Key(key(KeyCode::Down)));
     app.update(Msg::Key(key(KeyCode::Down)));
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
-    let expected_msg = implement_msg(!PlanForm::new().parallel());
+    let expected_msg = implement_msg(&app, !PlanForm::new().parallel());
     assert!(
         actions
             .iter()
             .any(|a| matches!(a, Action::SendMessage(i) if i.message == expected_msg))
     );
+}
+
+#[test_case(false ; "implement")]
+#[test_case(true ; "clear_and_implement")]
+fn plan_handoff_captures_content_and_revision_before_consumption(clear: bool) {
+    let mut app = plan_app();
+    let expected = implement_msg(&app, false);
+    let actions = app.implement_plan(clear);
+    PlanFile::new(Path::new(&app.state.session.cwd).join(HANDOFF_PLAN_FILE))
+        .unwrap()
+        .write(HANDOFF_PLAN_CHANGED)
+        .unwrap();
+    let actions = if clear {
+        let Action::ClearAndImplement(handoff) = actions.into_iter().next().unwrap() else {
+            panic!("expected captured plan handoff");
+        };
+        assert!(app.plan_form.is_visible());
+        assert!(app.state.plan.is_ready());
+        app.reset_session_for_plan().unwrap();
+        app.finish_plan_handoff(*handoff)
+    } else {
+        actions
+    };
+    let input = actions
+        .iter()
+        .find_map(|action| match action {
+            Action::SendMessage(input) => Some(input),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(input.message, expected);
+    assert_eq!(input.mode, AgentMode::Build);
+    assert_eq!(app.state.plan, PlanState::None);
+}
+
+#[test_case(true, false; "reservation")]
+#[test_case(false, false; "retirement")]
+#[test_case(false, true; "admission")]
+fn failed_clear_plan_transaction_preserves_source(reservation: bool, admission: bool) {
+    let mut app = plan_app();
+    app.status = Status::Idle;
+    let plan = app.state.plan.clone();
+    let session = app.state.session.id;
+    let run = app.run_id;
+    let messages = app.main_chat().message_count();
+    let actions = app.implement_plan(true);
+    assert!(matches!(&actions[..], [Action::ClearAndImplement(_)]));
+    assert_eq!(app.run_id, run);
+    assert_eq!(app.status, Status::Idle);
+    let tmp = private_tempdir();
+    let blocked = tmp.path().join("not-a-directory");
+    fs::write(&blocked, b"blocked").unwrap();
+    if reservation {
+        app.storage = StateDir::from_path(blocked);
+    } else {
+        app.storage_writer = Arc::new(test_writer(StateDir::from_path(blocked)));
+    }
+    if admission {
+        app.conversation_permissions = permission_editor::ConversationPermissions::Pending;
+    }
+    let error = app.reset_session_for_plan().err().unwrap();
+    if reservation {
+        assert!(error.starts_with("Failed to reserve new session:"));
+    } else if !admission {
+        assert!(error.starts_with("Failed to retire current session:"));
+    }
+    assert_eq!(app.state.session.id, session);
+    assert_eq!(app.state.plan, plan);
+    assert_eq!(app.state.mode, Mode::Plan);
+    assert_eq!(app.run_id, run);
+    assert_eq!(app.status, Status::Idle);
+    assert_eq!(app.main_chat().message_count(), messages);
+    assert!(app.plan_form.is_visible());
+}
+
+#[test_case(false, None ; "implement_missing")]
+#[test_case(true, None ; "clear_missing")]
+#[test_case(false, Some("") ; "implement_empty")]
+#[test_case(true, Some(" \n") ; "clear_blank")]
+fn failed_plan_capture_preserves_state(clear: bool, content: Option<&str>) {
+    let mut app = plan_app();
+    let path = Path::new(&app.state.session.cwd).join(HANDOFF_PLAN_FILE);
+    match content {
+        Some(content) => {
+            PlanFile::new(path).unwrap().write(content).unwrap();
+        }
+        None => fs::remove_file(path).unwrap(),
+    }
+    let plan = app.state.plan.clone();
+    let session = app.state.session.id;
+    let messages = app.main_chat().message_count();
+    let run = app.run_id;
+    let actions = app.implement_plan(clear);
+    assert!(actions.is_empty());
+    assert_eq!(app.state.plan, plan);
+    assert_eq!(app.state.session.id, session);
+    assert_eq!(app.state.mode, Mode::Plan);
+    assert_eq!(app.run_id, run);
+    assert_eq!(app.main_chat().message_count(), messages);
+    assert!(app.plan_form.is_visible());
+    assert!(
+        app.status_bar
+            .flash_text()
+            .unwrap()
+            .starts_with(IMPLEMENT_CAPTURE_FAILED)
+    );
+}
+
+#[test_case(false ; "implement")]
+#[test_case(true ; "clear_and_implement")]
+fn blocked_plan_submission_preserves_state(clear: bool) {
+    let mut app = plan_app();
+    app.cancelling_run = Some(app.run_id);
+    let plan = app.state.plan.clone();
+    assert!(app.implement_plan(clear).is_empty());
+    assert_eq!(app.state.plan, plan);
+    assert_eq!(app.state.mode, Mode::Plan);
+    assert!(app.plan_form.is_visible());
+    assert_eq!(app.status_bar.flash_text(), Some(REVERT_BUSY_MSG));
+}
+
+#[test]
+fn a_child_plan_write_cannot_complete_the_main_plan() {
+    let mut app = plan_app();
+    app.state.plan.mark_drafting();
+    app.plan_form.on_plan_drafting();
+    let messages = app.main_chat().message_count();
+    let mut done = ToolDoneEvent::error("child-plan".into(), HANDOFF_PLAN_CONTENT);
+    done.is_error = false;
+    done.written_path = Some(HANDOFF_PLAN_FILE.into());
+    app.update(subagent_msg(
+        AgentEvent::ToolDone(Box::new(done)),
+        "child",
+        None,
+    ));
+    assert!(!app.state.plan.is_ready());
+    assert!(!app.plan_form.is_visible());
+    assert_eq!(app.main_chat().message_count(), messages);
+    assert!(!app.chats[1].last_message_is_plan());
+}
+
+#[test_case(Mode::Build, Mode::Plan, false, false, false, true ; "selected_build_executing_plan")]
+#[test_case(Mode::Plan, Mode::Build, false, false, false, false ; "selected_plan_executing_build")]
+#[test_case(Mode::Plan, Mode::Plan, true, false, false, false ; "old_target")]
+#[test_case(Mode::Plan, Mode::Plan, false, true, false, false ; "child")]
+#[test_case(Mode::Plan, Mode::Plan, false, false, true, false ; "failed")]
+fn native_plan_completion_uses_committed_authority(
+    selected: Mode,
+    execution: Mode,
+    stale: bool,
+    child: bool,
+    error: bool,
+    expected: bool,
+) {
+    for remote in [false, true] {
+        let mut app = test_app();
+        app.state.mode = selected;
+        app.state.plan = if remote {
+            PlanState::RemoteDrafting(PlanRef::new(COMMITTED_PLAN_REF).unwrap())
+        } else {
+            PlanState::Drafting(COMMITTED_PLAN_PATH.into())
+        };
+        app.execution_mode = Some(Arc::new(ArcSwap::from_pointee(
+            app.agent_mode_for(execution),
+        )));
+        app.status = Status::Streaming;
+        app.run_id = 1;
+        let target = if remote {
+            PlanTarget::Remote(
+                PlanRef::new(if stale {
+                    STALE_PLAN_REF
+                } else {
+                    COMMITTED_PLAN_REF
+                })
+                .unwrap(),
+            )
+        } else {
+            PlanTarget::Local(
+                if stale {
+                    STALE_PLAN_PATH
+                } else {
+                    COMMITTED_PLAN_PATH
+                }
+                .into(),
+            )
+        };
+        let written = PlanWriteResult::new(
+            target,
+            DocumentRevision::new("a".repeat(64)).unwrap(),
+            HANDOFF_PLAN_CONTENT.into(),
+        );
+        let mut done = ToolDoneEvent::error(COMMITTED_PLAN_CALL.into(), HANDOFF_PLAN_CONTENT);
+        done.tool = plan::NAME.into();
+        done.is_error = error;
+        done.output = ToolOutput::Markdown(HANDOFF_PLAN_CONTENT.into());
+        done.annotation = Some(written.annotation().unwrap());
+        let event = AgentEvent::ToolDone(Box::new(done));
+        app.update(if child {
+            subagent_msg(event, "child", None)
+        } else {
+            agent_msg(event)
+        });
+        assert_eq!(app.state.plan.is_ready(), expected);
+        assert_eq!(app.plan_form.is_visible(), expected);
+        assert_eq!(app.main_chat().last_message_is_plan(), expected);
+        if expected {
+            assert_eq!(app.main_chat().last_message_text(), HANDOFF_PLAN_CONTENT);
+            let stored = &app.state.session.tool_outputs()[COMMITTED_PLAN_CALL];
+            let restored: ToolOutput =
+                serde_json::from_str(&serde_json::to_string(stored).unwrap()).unwrap();
+            assert_eq!(restored.plan_write_result(), Some(written.clone()));
+            let messages = app.main_chat().message_count();
+            let mut duplicate =
+                ToolDoneEvent::error(COMMITTED_PLAN_CALL.into(), HANDOFF_PLAN_CHANGED);
+            duplicate.tool = plan::NAME.into();
+            app.update(agent_msg(AgentEvent::ToolDone(Box::new(duplicate))));
+            assert_eq!(app.main_chat().message_count(), messages);
+            assert_eq!(
+                app.state.session.tool_outputs()[COMMITTED_PLAN_CALL].plan_write_result(),
+                Some(written)
+            );
+        }
+        if child {
+            assert!(!app.chats[1].last_message_is_plan());
+        }
+    }
+}
+
+#[test_case(Mode::Build, Mode::Plan, true ; "pending_build")]
+#[test_case(Mode::Plan, Mode::Build, false ; "pending_plan")]
+fn plan_handoff_uses_execution_not_selection(selected: Mode, execution: Mode, expected: bool) {
+    let mut app = plan_app();
+    app.state.mode = selected;
+    app.execution_mode = Some(Arc::new(ArcSwap::from_pointee(
+        app.agent_mode_for(execution),
+    )));
+    let plan = app.state.plan.clone();
+    let actions = app.implement_plan(false);
+    assert_eq!(!actions.is_empty(), expected);
+    if !expected {
+        assert_eq!(app.state.plan, plan);
+        assert!(app.plan_form.is_visible());
+    }
+}
+
+#[test_case(false, false, false, false, true; "local")]
+#[test_case(true, false, false, false, true; "remote")]
+#[test_case(true, true, false, false, false; "subagent")]
+#[test_case(false, false, true, false, false; "error")]
+#[test_case(false, false, false, true, false; "stale_target")]
+fn batch_plan_completion_checks_authority(
+    remote: bool,
+    child: bool,
+    error: bool,
+    stale: bool,
+    expected: bool,
+) {
+    let mut app = streaming_app();
+    app.state.mode = Mode::Plan;
+    app.state.applied_mode = Mode::Plan;
+    app.state.plan = if remote {
+        PlanState::RemoteDrafting(PlanRef::new(COMMITTED_PLAN_REF).unwrap())
+    } else {
+        PlanState::Drafting(COMMITTED_PLAN_PATH.into())
+    };
+    let target = if remote {
+        PlanTarget::Remote(PlanRef::new(COMMITTED_PLAN_REF).unwrap())
+    } else {
+        PlanTarget::Local(
+            if stale {
+                STALE_PLAN_PATH
+            } else {
+                COMMITTED_PLAN_PATH
+            }
+            .into(),
+        )
+    };
+    let written = PlanWriteResult::new(
+        target,
+        DocumentRevision::new("a".repeat(64)).unwrap(),
+        HANDOFF_PLAN_CONTENT.into(),
+    );
+    let event = || {
+        AgentEvent::BatchProgress(Box::new(BatchProgressEvent {
+            id: COMMITTED_PLAN_CALL.into(),
+            index: 0,
+            entry: BatchToolEntry {
+                tool: plan::NAME.into(),
+                effect: ToolEffect::Mutating,
+                summary: String::new(),
+                status: if error {
+                    BatchToolStatus::Error
+                } else {
+                    BatchToolStatus::Success
+                },
+                input: None,
+                raw_input: None,
+                output: Some(ToolOutput::Markdown(TextOutput {
+                    state: Some(written.annotation().unwrap().into()),
+                    ..HANDOFF_PLAN_CONTENT.into()
+                })),
+                annotation: None,
+                model_suffix: None,
+            },
+        }))
+    };
+    let wrap = |event| {
+        if child {
+            subagent_msg(event, "child", None)
+        } else {
+            agent_msg(event)
+        }
+    };
+    app.update(wrap(batch_roster(COMMITTED_PLAN_CALL, 1)));
+    app.update(wrap(event()));
+    assert_eq!(app.state.plan.is_ready(), expected);
+    assert_eq!(app.plan_form.is_visible(), expected);
+    assert!(!app.main_chat().last_message_is_plan());
+    app.state.plan.mark_drafting();
+    app.plan_form.on_plan_drafting();
+    app.update(wrap(event()));
+    assert!(!app.state.plan.is_ready());
+    assert!(!app.plan_form.is_visible());
 }
 
 fn rewrite_plan(app: &mut App) {

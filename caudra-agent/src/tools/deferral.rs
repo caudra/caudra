@@ -312,6 +312,29 @@ impl DeferralSession {
         &self.deferred
     }
 
+    pub fn loaded_names(&self) -> Vec<Arc<str>> {
+        self.lock_loaded().iter().cloned().collect()
+    }
+
+    pub fn accounting_definitions(&self, declared: &Value) -> Value {
+        let mut definitions = declared.as_array().cloned().unwrap_or_default();
+        definitions.extend(self.deferred.iter().map(|tool| tool.definition.clone()));
+        Value::Array(definitions)
+    }
+
+    pub fn filtered(&self, eligible: impl Fn(&str) -> bool) -> Self {
+        Self {
+            deferred: Arc::new(
+                self.deferred
+                    .iter()
+                    .filter(|tool| eligible(&tool.name))
+                    .cloned()
+                    .collect(),
+            ),
+            loaded: Arc::clone(&self.loaded),
+        }
+    }
+
     /// Snapshot for one request, taken while the loaded set is stable.
     pub fn request_snapshot(&self) -> DeferralSnapshot {
         DeferralSnapshot {
@@ -536,6 +559,18 @@ pub fn push_catalog(tools: &mut Value, sections: &[String]) {
         return;
     }
     array.push(catalog_definition(&sections.join("\n")));
+}
+
+pub fn push_unbound_catalog(tools: &mut Value, sections: &[String], bound: bool) {
+    if bound {
+        if !sections.is_empty() {
+            warn!(
+                "deferred tools have no discovery route: tool_search is owned by a registered or local binding"
+            );
+        }
+    } else {
+        push_catalog(tools, sections);
+    }
 }
 
 fn catalog_definition(listing: &str) -> Value {
@@ -1371,6 +1406,26 @@ pub(crate) mod tests {
         session().request_snapshot().extend_tools(&mut tools);
 
         assert_eq!(names(&tools), ["file_read", TOOL_SEARCH_TOOL_NAME]);
+    }
+
+    #[test_case(false; "unbound_loader")]
+    #[test_case(true; "hidden_shadowing_binding")]
+    fn hidden_binding_still_blocks_synthetic_discovery(bound: bool) {
+        let mut tools = json!([]);
+        let sections = session()
+            .request_snapshot()
+            .extend_declared(&mut tools)
+            .into_iter()
+            .collect::<Vec<_>>();
+        assert!(!sections.is_empty());
+        assert!(names(&tools).is_empty());
+        push_unbound_catalog(&mut tools, &sections, bound);
+        assert_eq!(
+            names(&tools)
+                .iter()
+                .any(|name| name == TOOL_SEARCH_TOOL_NAME),
+            !bound,
+        );
     }
 
     /// The whole point of the group: five code tools are one decision and one

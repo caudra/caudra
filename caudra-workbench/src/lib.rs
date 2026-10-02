@@ -916,6 +916,18 @@ impl Workbench {
         }
     }
 
+    pub fn replace_file(&mut self, path: &Path, text: &str) -> bool {
+        let Some(tab) = self
+            .editor
+            .tabs_mut()
+            .iter_mut()
+            .find(|tab| tab.path.local() == Some(path) && tab.is_file() && tab.is_editable())
+        else {
+            return false;
+        };
+        tab.replace_file(text)
+    }
+
     /// Whether the tab on `path` holds edits that are not on disk yet.
     pub fn has_unsaved(&self, path: &Path) -> bool {
         let identity = WorkbenchPath::Local(path.to_path_buf());
@@ -4730,6 +4742,7 @@ mod tests {
         RemoteControl, SCOPED_CONTENTS, SCOPED_FILE, SCOPED_ROOT, SHADOW_CONTENTS, SHADOW_FILE,
         scoped_widget_fixture,
     };
+    use crate::fs::read::SaveError;
     use crate::fs::tree::GitMark;
     use crate::menu::Item as MenuItem;
     use crate::scm::backend::DiffResult;
@@ -8138,6 +8151,201 @@ mod tests {
 
         assert_caught_up(workbench.editor.active().expect(NO_TAB), dirty);
         assert_eq!(workbench.has_unsaved(&plan), dirty, "{LOST_EDIT}");
+    }
+
+    #[test_case(false, LOCAL_SOURCE_CONTENT ; "newer_disk_crlf_snapshot")]
+    #[test_case(true, REWRITTEN_TEXT ; "removed_file_lf_snapshot")]
+    #[test_case(false, "" ; "empty_snapshot")]
+    fn replace_file_uses_committed_text_without_reading_disk(removed: bool, text: &str) {
+        let (dir, mut workbench) = project();
+        let (_state, plan) = outside_plan();
+        open_plan(&mut workbench, dir.path(), &plan);
+        workbench.sidebar = SidebarView::Search;
+        workbench.focus = Focus::Sidebar;
+        let tab = workbench.editor.active_mut().expect(NO_TAB);
+        tab.buffer.set_cursor(Cursor::new(1, 1), false);
+        tab.set_scroll(1);
+        let label = tab.label.clone();
+        let revision = tab.revision();
+        if removed {
+            fs::remove_file(&plan).unwrap();
+        } else {
+            rewrite(&plan, NEWER_DRAFT);
+        }
+
+        assert!(workbench.replace_file(&plan, text));
+
+        let tab = workbench.editor.active().expect(NO_TAB);
+        assert_eq!(tab.contents(), text);
+        assert_eq!(tab.label, label);
+        assert_eq!(tab.path.local(), Some(plan.as_path()));
+        assert!(tab.resource.is_none());
+        assert!(!tab.is_dirty() && !tab.conflict);
+        assert!(tab.revision() > revision);
+        assert!(tab.buffer.cursor().line < tab.buffer.line_count());
+        assert!(tab.scroll() < tab.buffer.line_count());
+        assert_eq!(workbench.sidebar, SidebarView::Search);
+        assert_eq!(workbench.focus, Focus::Sidebar);
+    }
+
+    #[test_case(())]
+    fn replace_file_preserves_dirty_edits_selection_history_and_baseline(_: ()) {
+        let (dir, mut workbench) = project();
+        let (_state, plan) = outside_plan();
+        open_plan(&mut workbench, dir.path(), &plan);
+        let tab = workbench.editor.active_mut().expect(NO_TAB);
+        let edit = tab.buffer.insert(DRAFT_TEXT);
+        assert!(tab.record(edit));
+        tab.buffer.select_all();
+        tab.set_scroll(1);
+        let before = (
+            tab.contents(),
+            tab.revision(),
+            tab.buffer.cursor(),
+            tab.buffer.selection(),
+            tab.scroll(),
+            tab.label.clone(),
+        );
+        rewrite(&plan, REWRITTEN_TEXT);
+
+        assert!(!workbench.replace_file(&plan, REWRITTEN_TEXT));
+
+        let tab = workbench.editor.active_mut().expect(NO_TAB);
+        assert_eq!(
+            (
+                tab.contents(),
+                tab.revision(),
+                tab.buffer.cursor(),
+                tab.buffer.selection(),
+                tab.scroll(),
+                tab.label.clone(),
+            ),
+            before
+        );
+        assert!(tab.is_dirty() && tab.conflict);
+        assert!(matches!(tab.save(), Err(SaveError::Stale(_))));
+        assert_eq!(fs::read_to_string(&plan).unwrap(), REWRITTEN_TEXT);
+        assert!(tab.undo());
+        assert_eq!(tab.contents(), INDEXED_TEXT);
+        assert!(tab.redo());
+        assert_eq!(tab.contents(), before.0);
+    }
+
+    #[test_case(())]
+    fn replace_file_ignores_unopened_documents_and_synthetic_tabs(_: ()) {
+        let (dir, mut workbench) = project();
+        let (_state, plan) = outside_plan();
+        assert!(!workbench.replace_file(&plan, REWRITTEN_TEXT));
+        assert!(workbench.editor.tabs().is_empty());
+        open_draft(&mut workbench, DRAFT_TEXT);
+        let path = workbench
+            .editor
+            .active()
+            .unwrap()
+            .path
+            .local()
+            .unwrap()
+            .to_owned();
+        assert!(!workbench.replace_file(&path, REWRITTEN_TEXT));
+        assert_eq!(draft(&workbench).unwrap().contents(), DRAFT_TEXT);
+        workbench.editor.push(Tab::synthetic(
+            &plan,
+            PLAN_TITLE.to_owned(),
+            Vec::new(),
+            workbench.theme_generation,
+        ));
+        assert!(!workbench.replace_file(&plan, REWRITTEN_TEXT));
+        assert!(workbench.editor.active().unwrap().diff_rows().is_some());
+        assert!(!workbench.replace_file(&dir.path().join(OPENED_FILE), REWRITTEN_TEXT));
+    }
+
+    #[test_case(())]
+    fn replace_file_leaves_remote_identity_and_pending_operations_untouched(_: ()) {
+        let (session, _control) = crate::fs::backend::tests::widget_fixture();
+        let mut workbench = Workbench::new(WorkbenchStyles::default());
+        workbench.toggle_workspace(session).unwrap();
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        let path = WorkspacePath::new(REMOTE_TEST_FILE).unwrap();
+        workbench.open_remote_at(path.clone(), None);
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        workbench.save_active();
+        workbench.request_remote_path(WorkbenchPath::Remote(path), super::OpenPurpose::Reload);
+        let pending = workbench.remote_pending.clone();
+        let saves = workbench.pending_save.clone();
+        let opens: BTreeMap<_, _> = workbench
+            .pending_open
+            .iter()
+            .map(|(id, open)| (*id, (open.path.clone(), open.purpose, open.invalidated)))
+            .collect();
+        assert!(!saves.is_empty() && !opens.is_empty());
+        let tab = workbench.editor.active().unwrap();
+        let resource = tab.resource.clone();
+        let contents = tab.contents();
+        let revision = tab.revision();
+
+        assert!(!workbench.replace_file(Path::new(REMOTE_TEST_FILE), REWRITTEN_TEXT));
+
+        let tab = workbench.editor.active().unwrap();
+        assert_eq!(tab.contents(), contents);
+        assert_eq!(tab.resource, resource);
+        assert_eq!(tab.revision(), revision);
+        assert!(!tab.conflict && !tab.is_dirty());
+        assert_eq!(workbench.remote_pending, pending);
+        assert_eq!(workbench.pending_save, saves);
+        assert_eq!(
+            workbench
+                .pending_open
+                .iter()
+                .map(|(id, open)| (*id, (open.path.clone(), open.purpose, open.invalidated)))
+                .collect::<BTreeMap<_, _>>(),
+            opens
+        );
+        assert!(workbench.remote_backend.is_some());
+    }
+
+    #[test_case(Some(REWRITTEN_TEXT), true ; "matching_committed_bytes_can_save")]
+    #[test_case(Some(INDEXED_TEXT), false ; "old_opened_bytes_are_not_authority")]
+    #[test_case(Some(NEWER_DRAFT), false ; "newer_disk_bytes_conflict")]
+    #[test_case(None, false ; "removed_file_conflicts")]
+    fn replace_file_saves_only_over_the_supplied_content(disk: Option<&str>, can_save: bool) {
+        let (dir, mut workbench) = project();
+        let (_state, plan) = outside_plan();
+        open_plan(&mut workbench, dir.path(), &plan);
+        let original_modified = fs::metadata(&plan).unwrap().modified().unwrap();
+        assert!(workbench.replace_file(&plan, REWRITTEN_TEXT));
+        match disk {
+            Some(text) => {
+                fs::write(&plan, text).unwrap();
+                fs::File::options()
+                    .write(true)
+                    .open(&plan)
+                    .unwrap()
+                    .set_modified(original_modified)
+                    .unwrap();
+            }
+            None => fs::remove_file(&plan).unwrap(),
+        }
+        let tab = workbench.editor.active_mut().unwrap();
+        let edit = tab.buffer.insert(DRAFT_TEXT);
+        assert!(tab.record(edit));
+        let contents = tab.contents();
+
+        let saved = tab.save();
+
+        if can_save {
+            saved.unwrap();
+            assert!(!tab.conflict && !tab.is_dirty());
+            assert_eq!(fs::read_to_string(&plan).unwrap(), contents);
+            let edit = tab.buffer.insert(DRAFT_TEXT);
+            assert!(tab.record(edit));
+            tab.save().unwrap();
+            assert_eq!(fs::read_to_string(&plan).unwrap(), tab.contents());
+        } else {
+            assert!(matches!(saved, Err(SaveError::Stale(_))));
+            assert!(tab.conflict && tab.is_dirty());
+            assert_eq!(tab.contents(), contents);
+            assert_eq!(fs::read_to_string(&plan).ok().as_deref(), disk);
+        }
     }
 
     #[test]

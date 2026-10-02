@@ -9,6 +9,8 @@ use std::fs;
 use std::io::Error as IoError;
 #[cfg(not(unix))]
 use std::io::Write;
+#[cfg(unix)]
+use std::path::absolute;
 use std::path::{Component, Path, PathBuf};
 #[cfg(unix)]
 use std::str;
@@ -240,6 +242,40 @@ pub(crate) fn save_local_source(
     {
         let _ = (source, contents);
         Err(SaveError::ReadOnly(path.to_path_buf()))
+    }
+}
+
+pub(crate) fn save_snapshot(
+    path: &Path,
+    contents: &str,
+    expected: &str,
+    source: Option<&mut Source>,
+) -> Result<Option<SystemTime>, SaveError> {
+    let stale = || SaveError::Stale(path.to_path_buf());
+    #[cfg(unix)]
+    {
+        let absolute = absolute(path).map_err(|_| stale())?;
+        let mut opened;
+        let source = match source {
+            Some(source) => source,
+            None => {
+                opened = Source::open(&absolute).map_err(|_| stale())?;
+                &mut opened
+            }
+        };
+        if source.bytes != expected.as_bytes() {
+            return Err(stale());
+        }
+        source.save(&absolute, contents)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = source;
+        let modified = modified(path).ok_or_else(stale)?;
+        if fs::read(path).map_err(|_| stale())? != expected.as_bytes() {
+            return Err(stale());
+        }
+        save(path, contents, Some(modified))
     }
 }
 

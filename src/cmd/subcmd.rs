@@ -5,25 +5,36 @@ use std::path::Path;
 use std::sync::Arc;
 
 use color_eyre::Result;
-use color_eyre::eyre::{Context, bail};
+use color_eyre::eyre::{Context, bail, eyre};
 
+use caudra_agent::AgentMode;
 use caudra_agent::mcp::{McpSession, config as mcp_config, oauth as mcp_oauth};
+use caudra_agent::prompt::profile::{PromptProfileCatalog, SystemPromptProfile};
+use caudra_agent::template::{self, Vars};
+use caudra_agent::tools::deferral::{deferred_names, push_unbound_catalog};
 use caudra_agent::tools::native::skill::{self, SkillDirCandidate, SkillInventoryEntry};
+use caudra_agent::tools::profile_policy::{
+    CEILING_DISABLED, LEGACY_LOADING, PROFILE_DISABLED, PROFILE_LOADING, registered_decision,
+};
+use caudra_agent::tools::registry::ToolDefinitions;
 use caudra_agent::tools::report::{CATALOG_SOURCE, REASON_CATALOG, REASON_CONFIG, REASON_DEFERRED};
 use caudra_agent::tools::{
-    BuiltinDeferral, DescriptionContext, SHELL_TOOL_NAME, TOOL_SEARCH_TOOL_NAME, ToolAudience,
-    ToolFilter, ToolRegistry, ToolState, builtin_report, is_tool_enabled,
+    BuiltinDeferral, DeferralSession, DescriptionContext, SHELL_TOOL_NAME, TOOL_SEARCH_TOOL_NAME,
+    ToolAudience, ToolFilter, ToolRegistry, ToolState, builtin_report, execution, is_tool_enabled,
 };
 use caudra_config::providers::{
     Protocol, ProviderDef, ProvidersConfig, all_builtins, builtin_provider, custom_provider_slug,
     resolve_api_key_env, resolve_base_url, resolve_default_model, resolve_display_name,
     resolve_login_url, slugify,
 };
-use caudra_config::{Config, DefaultEffect, ModelPolicy, PermissionsConfig, ToolKey};
+use caudra_config::{
+    AgentConfig, Config, DefaultEffect, ModelPolicy, PermissionsConfig, ProfileToolPolicy,
+    ProfileToolSource, ToolKey,
+};
 use caudra_providers::model_registry::{self, Binding};
 use caudra_providers::provider::{fetch_all_models, seed_setup_thinking};
 use caudra_providers::{
-    Model, ModelMarker, ModelPurpose, ProviderData, Timeouts, catalog_providers,
+    Model, ModelMarker, ModelPurpose, ProviderData, ThinkingConfig, Timeouts, catalog_providers,
 };
 use caudra_providers::{anthropic_auth, copilot_auth, dynamic, openai_auth, xai_auth};
 use caudra_storage::StateDir;
@@ -35,11 +46,15 @@ use caudra_storage::auth::{
 };
 use caudra_storage::model::persist_model_for_every_mode;
 use caudra_storage::sessions::StoredMode;
+use caudra_workspace::PlanRef;
+use serde_json::Value;
 
 use crate::cli::{AuthMethod, Cli, normalize_tool_name};
 use crate::setup::resolve_model;
 
-const PROMPT_PLAN_PATH: &str = "plan.md";
+const PROMPT_PLAN_PATH: &str = "<active plan document>";
+const PROMPT_PLAN_REFERENCE: &str = "active-plan-inspection";
+const REASON_INSPECTION_UNAVAILABLE: &str = "unavailable for this inspection runtime or mode";
 const AUTH_STATUS_EMPTY: &str = "       ";
 const AUTH_STATUS_ENV: &str = "\x1b[33m~ env  \x1b[0m";
 const AUTH_STATUS_KEY: &str = "\x1b[32m✓ key  \x1b[0m";
@@ -1019,8 +1034,15 @@ fn builtin_rows(
     config: &Config,
     cli_disallowed: &[String],
     model: &Model,
+    definitions: &ToolDefinitions,
+    policy: &ProfileToolPolicy,
 ) -> Vec<ToolRow> {
     let deferral = BuiltinDeferral::resolve(&config.agent, model);
+    let ctx = DescriptionContext {
+        filter,
+        audience: ToolAudience::MAIN,
+        workflows_available: false,
+    };
     let mut rows: Vec<ToolRow> = registry
         .iter()
         .iter()
@@ -1030,8 +1052,25 @@ fn builtin_rows(
                 SHELL_TOOL_NAME => vec![ToolKey::native(name), ToolKey::native(LEGACY_SHELL_KEY)],
                 _ => vec![ToolKey::native(name)],
             };
-            let report =
+            let mut report =
                 builtin_report(name, filter, cli_disallowed, &config.agent, model, deferral);
+            let decision = registered_decision(
+                entry,
+                &ctx,
+                policy,
+                &AgentMode::Build,
+                report.state == ToolState::Lazy,
+            );
+            if !matches!(decision.reason, CEILING_DISABLED | LEGACY_LOADING) {
+                report.reason = Some(decision.reason);
+            }
+            let state = inspection_tool_state(definitions, name);
+            if state != report.state {
+                if state == ToolState::Off && decision.available() {
+                    report.reason = Some(REASON_INSPECTION_UNAVAILABLE);
+                }
+                report.state = state;
+            }
             ToolRow {
                 name: name.to_owned(),
                 source: entry.source.as_log_field().into_owned(),
@@ -1049,6 +1088,13 @@ fn builtin_rows(
 /// array whenever something is deferred, so a lazy row anywhere means the
 /// model is offered the catalog too.
 fn catalog_row(builtin: &[ToolRow], mcp: &[ToolRow]) -> Option<ToolRow> {
+    if builtin
+        .iter()
+        .chain(mcp)
+        .any(|row| row.name == TOOL_SEARCH_TOOL_NAME && row.state.reaches_model())
+    {
+        return None;
+    }
     let lazy = builtin
         .iter()
         .chain(mcp)
@@ -1062,38 +1108,178 @@ fn catalog_row(builtin: &[ToolRow], mcp: &[ToolRow]) -> Option<ToolRow> {
     })
 }
 
-fn mcp_rows(mcp: Option<&McpSession>, permissions: &PermissionsConfig) -> Vec<ToolRow> {
+fn mcp_rows(mcp: Option<&McpSession>, config: &Config, policy: &ProfileToolPolicy) -> Vec<ToolRow> {
     let Some(mcp) = mcp else {
         return Vec::new();
     };
-    let mut rows: Vec<ToolRow> = mcp
-        .request_snapshot()
-        .tool_inventory()
-        .into_iter()
-        .map(|tool| {
-            let keys = [
-                ToolKey::parse(&tool.qualified_name),
-                ToolKey::parse(&format!("{}.*", tool.server)),
-            ]
+    let mut rows: Vec<ToolRow> =
+        mcp.request_snapshot()
+            .tool_inventory()
             .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-            let (state, note) = match (tool.disabled, tool.deferred) {
-                (true, _) => (ToolState::Off, Some(REASON_CONFIG)),
-                (false, true) => (ToolState::Lazy, Some(REASON_DEFERRED)),
-                _ => (ToolState::On, None),
-            };
-            ToolRow {
-                state,
-                note,
-                permission: permission_default(permissions, &keys),
-                source: format!("{SOURCE_MCP}:{}", tool.server),
-                name: tool.wire_name,
-            }
-        })
-        .collect();
+            .map(|tool| {
+                let keys = [
+                    ToolKey::parse(&tool.qualified_name),
+                    ToolKey::parse(&format!("{}.*", tool.server)),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+                let (state, mut note) = match (tool.disabled, tool.deferred) {
+                    (true, _) => (ToolState::Off, Some(REASON_INSPECTION_UNAVAILABLE)),
+                    (false, true) => (ToolState::Lazy, Some(REASON_DEFERRED)),
+                    _ => (ToolState::On, None),
+                };
+                if config.agent.disabled_tools.iter().any(|pattern| {
+                    caudra_config::tool_pattern_matches(pattern, &tool.qualified_name)
+                }) {
+                    note = Some(REASON_CONFIG);
+                } else if policy
+                    .exposure(&tool.qualified_name, ProfileToolSource::Mcp)
+                    .is_some()
+                {
+                    note = Some(if tool.disabled {
+                        PROFILE_DISABLED
+                    } else {
+                        PROFILE_LOADING
+                    });
+                }
+                ToolRow {
+                    state,
+                    note,
+                    permission: permission_default(&config.permissions, &keys),
+                    source: format!("{SOURCE_MCP}:{}", tool.server),
+                    name: tool.wire_name,
+                }
+            })
+            .collect();
     rows.sort_by(|a, b| a.name.cmp(&b.name));
     rows
+}
+
+fn inspection_definitions(
+    registry: &ToolRegistry,
+    vars: &Vars,
+    ctx: &DescriptionContext,
+    config: &AgentConfig,
+    model: &Model,
+    policy: &ProfileToolPolicy,
+    mode: &AgentMode,
+) -> Result<ToolDefinitions> {
+    policy
+        .validate_bindings(registry.iter().iter().map(|entry| entry.name()))
+        .map_err(|error| eyre!(error))
+        .context("resolve system prompt profile tools")?;
+    let deferred = deferred_names(
+        &config.allowed_tools,
+        BuiltinDeferral::resolve(config, model),
+    );
+    let mut definitions = registry.definitions_split_with_policy(
+        vars,
+        ctx,
+        model.supports_tool_examples(),
+        &deferred,
+        policy,
+        mode,
+    );
+    execution::configure_tools(
+        &mut definitions.declared,
+        &mut definitions.deferred,
+        config,
+        ctx.audience == ToolAudience::MAIN,
+        true,
+    );
+    Ok(definitions)
+}
+
+fn inspection_vars(
+    vars: Vars,
+    profiles: &PromptProfileCatalog,
+    config: &Config,
+    model: &Model,
+) -> Vars {
+    let thinking = config
+        .always_thinking
+        .clone()
+        .map(ThinkingConfig::from)
+        .unwrap_or_default();
+    let bindings = profiles.bind_for_tasks(
+        model,
+        model,
+        &thinking,
+        &config.provider.model_policy,
+        Timeouts::default(),
+    );
+    vars.set(
+        "{task_system_prompt_profiles}",
+        bindings.task_tool_summary("Caudra's built-in task prompt"),
+    )
+}
+
+fn inspection_tool_state(definitions: &ToolDefinitions, name: &str) -> ToolState {
+    if definitions
+        .declared
+        .as_array()
+        .is_some_and(|tools| tools.iter().any(|tool| tool["name"].as_str() == Some(name)))
+    {
+        ToolState::On
+    } else if definitions
+        .deferred
+        .iter()
+        .any(|tool| tool.name.as_ref() == name)
+    {
+        ToolState::Lazy
+    } else {
+        ToolState::Off
+    }
+}
+
+fn inspection_catalog(mut definitions: ToolDefinitions, mcp: Option<&McpSession>) -> Value {
+    let deferred = DeferralSession::new(definitions.deferred, std::iter::empty());
+    let mut sections = Vec::new();
+    sections.extend(
+        deferred
+            .request_snapshot()
+            .extend_declared(&mut definitions.declared),
+    );
+    if let Some(mcp) = mcp {
+        sections.extend(
+            mcp.request_snapshot()
+                .extend_declared(&mut definitions.declared),
+        );
+    }
+    push_unbound_catalog(
+        &mut definitions.declared,
+        &sections,
+        ToolRegistry::global().has(caudra_agent::tools::TOOL_SEARCH_TOOL_NAME),
+    );
+    definitions.declared
+}
+
+fn inspection_mcp(
+    cwd: &Path,
+    remote: bool,
+    config: &AgentConfig,
+    policy: Arc<ProfileToolPolicy>,
+    mode: &AgentMode,
+) -> Option<McpSession> {
+    let (handle, errors) = if remote {
+        smol::block_on(caudra_agent::mcp::start_global_connected(cwd))
+    } else {
+        smol::block_on(caudra_agent::mcp::start_connected(cwd))
+    };
+    if !errors.is_empty() {
+        eprintln!("warning: {errors}");
+    }
+    let ceiling = ToolFilter::All.for_mode(if mode.is_planning() {
+        &AgentMode::ReadOnly
+    } else {
+        mode
+    });
+    handle.map(|handle| {
+        McpSession::new(handle, &[])
+            .with_disabled_tools(&config.disabled_tools)
+            .with_profile_policy(policy, ceiling)
+    })
 }
 
 fn print_group(heading: &str, rows: &[ToolRow]) {
@@ -1152,37 +1338,55 @@ pub fn tools(cli: &Cli, enabled_only: bool, json: bool, names: bool, schemas: bo
         StoredMode::Build,
     )?;
     caudra_providers::provider::adjust_model(&mut model, Timeouts::default())?;
-    let filter = ToolFilter::from_config(&config.agent, &model, &[]);
-
-    let (mcp_handle, mcp_errors) = if runtime.is_remote() {
-        smol::block_on(caudra_agent::mcp::start_global_connected(&cwd))
-    } else {
-        smol::block_on(caudra_agent::mcp::start_connected(&cwd))
+    let profiles = PromptProfileCatalog::discover_user();
+    let profile = profiles
+        .resolve(
+            cli.system_prompt_profile
+                .as_deref()
+                .or(config.agent.system_prompt_profile.as_deref()),
+        )
+        .context("resolve system prompt profile")?;
+    let policy = Arc::new(
+        profile
+            .as_deref()
+            .map(SystemPromptProfile::tools)
+            .cloned()
+            .unwrap_or_default(),
+    );
+    let filter = ToolFilter::from_config(&config.agent, &model, &[])
+        .for_remote_workspace(runtime.is_remote());
+    let ctx = DescriptionContext {
+        filter: &filter,
+        audience: ToolAudience::MAIN,
+        workflows_available: false,
     };
-    if !mcp_errors.is_empty() {
-        eprintln!("warning: {mcp_errors}");
-    }
-    let mcp = mcp_handle.map(|handle| {
-        McpSession::new(handle, &[]).with_disabled_tools(&config.agent.disabled_tools)
-    });
+    let vars = if runtime.is_remote() {
+        template::env_vars()
+            .set("{cwd}", runtime.display().cwd.clone())
+            .set("{platform}", runtime.display().platform.clone())
+    } else {
+        template::env_vars()
+    };
+    let vars = inspection_vars(vars, &profiles, &config, &model);
+    let definitions = inspection_definitions(
+        reg,
+        &vars,
+        &ctx,
+        &config.agent,
+        &model,
+        &policy,
+        &AgentMode::Build,
+    )?;
+    let mcp = inspection_mcp(
+        &cwd,
+        runtime.is_remote(),
+        &config.agent,
+        Arc::clone(&policy),
+        &AgentMode::Build,
+    );
 
     if schemas {
-        let ctx = DescriptionContext {
-            filter: &filter,
-            audience: ToolAudience::MAIN,
-            workflows_available: false,
-        };
-        let vars = if runtime.is_remote() {
-            caudra_agent::template::env_vars()
-                .set("{cwd}", runtime.display().cwd.clone())
-                .set("{platform}", runtime.display().platform.clone())
-        } else {
-            caudra_agent::template::env_vars()
-        };
-        let mut defs = reg.definitions(&vars, &ctx, model.supports_tool_examples());
-        if let Some(mcp) = &mcp {
-            mcp.request_snapshot().extend_tools(&mut defs);
-        }
+        let defs = inspection_catalog(definitions, mcp.as_ref());
         println!("{}", serde_json::to_string_pretty(&defs)?);
         return Ok(());
     }
@@ -1192,8 +1396,16 @@ pub fn tools(cli: &Cli, enabled_only: bool, json: bool, names: bool, schemas: bo
         .iter()
         .map(|tool| normalize_tool_name(tool))
         .collect::<Result<Vec<_>>>()?;
-    let mut builtin = builtin_rows(reg, &filter, &config, &cli_disallowed, &model);
-    let mut mcp_tools = mcp_rows(mcp.as_ref(), &config.permissions);
+    let mut builtin = builtin_rows(
+        reg,
+        &filter,
+        &config,
+        &cli_disallowed,
+        &model,
+        &definitions,
+        &policy,
+    );
+    let mut mcp_tools = mcp_rows(mcp.as_ref(), &config, &policy);
     if let Some(catalog) = catalog_row(&builtin, &mcp_tools) {
         let at = builtin.partition_point(|row| row.name < catalog.name);
         builtin.insert(at, catalog);
@@ -1337,9 +1549,8 @@ pub fn prompt(
     use caudra_agent::agent::{build_system_prompt, environment_block, load_instruction_text};
     use caudra_agent::prompt::{
         PromptId, TASK_BUILD_CONTRACT, TASK_PLAN_CONTRACT, assemble_task_with_filter,
+        plan_mode_prompt,
     };
-    use caudra_agent::template;
-    use caudra_agent::tools::{DescriptionContext, ToolAudience, ToolFilter, ToolRegistry};
 
     if plan && !matches!(variant, PromptVariant::System) {
         bail!("--plan can only be used with the 'system' prompt variant");
@@ -1363,10 +1574,7 @@ pub fn prompt(
     };
     let reg = ToolRegistry::global_arc();
     let mut host = super::cli_plugin_host(cli, Arc::clone(reg))?;
-    let mut config = super::load_settings(&host, &cli.startup, &cwd, runtime.is_remote())?
-        .into_config(cli.no_rtk)
-        .context("invalid config")?;
-    config.agent.features = cli.startup.features;
+    let config = super::load_config(&host, cli, &cwd, runtime.is_remote())?;
     super::configure_native_tools(&config.agent);
     super::install_native_permission_rules(&host.plugin_rules(), &cwd);
     host.load_production_builtins(&config.plugins)
@@ -1379,7 +1587,7 @@ pub fn prompt(
         load_instruction_text(&cwd_str)
     };
     let slots = host.event_handle().collect_prompt_slots(&config.agent);
-    let prompt_profiles = caudra_agent::prompt::profile::PromptProfileCatalog::discover_user();
+    let prompt_profiles = PromptProfileCatalog::discover_user();
     let profile_name = cli
         .system_prompt_profile
         .as_deref()
@@ -1394,31 +1602,45 @@ pub fn prompt(
         StoredMode::Build,
     )?;
     caudra_providers::provider::adjust_model(&mut model, caudra_providers::Timeouts::default())?;
-    let filter = ToolFilter::from_config(&config.agent, &model, &[]);
-
+    let policy = Arc::new(
+        system_prompt_profile
+            .as_deref()
+            .map(SystemPromptProfile::tools)
+            .cloned()
+            .unwrap_or_default(),
+    );
+    let (audience, mode) = match variant {
+        PromptVariant::System if plan && runtime.is_remote() => (
+            ToolAudience::MAIN,
+            AgentMode::RemotePlan(PlanRef::new(PROMPT_PLAN_REFERENCE)?),
+        ),
+        PromptVariant::System if plan => {
+            (ToolAudience::MAIN, AgentMode::Plan(PROMPT_PLAN_PATH.into()))
+        }
+        PromptVariant::System => (ToolAudience::MAIN, AgentMode::Build),
+        PromptVariant::Research => (ToolAudience::RESEARCH_SUB, AgentMode::ReadOnly),
+        PromptVariant::General => (ToolAudience::GENERAL_SUB, AgentMode::Build),
+    };
+    let filter = ToolFilter::from_config(&config.agent, &model, &[])
+        .for_remote_workspace(runtime.is_remote())
+        .for_mode(&mode);
+    let vars = inspection_vars(vars, &prompt_profiles, &config, &model);
+    let ctx = DescriptionContext {
+        filter: &filter,
+        audience,
+        workflows_available: false,
+    };
+    let definitions =
+        inspection_definitions(reg, &vars, &ctx, &config.agent, &model, &policy, &mode)?;
     if tools {
-        let thinking = config
-            .always_thinking
-            .clone()
-            .map(caudra_providers::ThinkingConfig::from)
-            .unwrap_or_default();
-        let bindings = prompt_profiles.bind_for_tasks(
-            &model,
-            &model,
-            &thinking,
-            &config.provider.model_policy,
-            caudra_providers::Timeouts::default(),
+        let mcp = inspection_mcp(
+            &cwd,
+            runtime.is_remote(),
+            &config.agent,
+            Arc::clone(&policy),
+            &mode,
         );
-        let vars = vars.set(
-            "{task_system_prompt_profiles}",
-            bindings.task_tool_summary("Caudra's built-in task prompt"),
-        );
-        let ctx = DescriptionContext {
-            filter: &filter,
-            audience: ToolAudience::MAIN,
-            workflows_available: false,
-        };
-        let defs = reg.definitions(&vars, &ctx, model.supports_tool_examples());
+        let defs = inspection_catalog(definitions, mcp.as_ref());
         if names {
             for name in defs
                 .as_array()
@@ -1434,6 +1656,26 @@ pub fn prompt(
         return Ok(());
     }
 
+    let slots = execution::execution_slots(
+        &slots,
+        &config.agent,
+        audience == ToolAudience::MAIN,
+        true,
+        &definitions.declared,
+        &definitions.deferred,
+    );
+    let filter = if policy.is_legacy() {
+        filter
+    } else {
+        ToolFilter::Only(
+            reg.iter()
+                .iter()
+                .filter(|entry| inspection_tool_state(&definitions, entry.name()).reaches_model())
+                .map(|entry| entry.name().to_owned())
+                .collect(),
+        )
+        .for_mode(&mode)
+    };
     let output = match variant {
         PromptVariant::System => {
             let system = build_system_prompt(
@@ -1443,14 +1685,10 @@ pub fn prompt(
                 system_prompt_profile.as_deref(),
             );
             let system = format!("{system}\n\n{}", environment_block(&vars, &model));
-            // The system prompt no longer varies by mode; the plan reminder is
-            // announced in the conversation, so show it alongside.
-            if plan {
-                let plan_vars = template::Vars::new().set("{plan_path}", PROMPT_PLAN_PATH);
-                format!(
-                    "{system}\n\n{}",
-                    plan_vars.apply(caudra_agent::prompt::PLAN_PROMPT)
-                )
+            if let Some(reminder) = plan_mode_prompt(&mode, |name| {
+                inspection_tool_state(&definitions, name).reaches_model()
+            }) {
+                format!("{system}\n\n{reminder}")
             } else {
                 system
             }
@@ -1506,7 +1744,7 @@ mod auth_tests {
     use super::*;
     use caudra_agent::permissions::PermissionManager;
     use caudra_agent::tools::cli_tool_ctx;
-    use caudra_config::{Effect, PermissionRule};
+    use caudra_config::{Effect, ExecutionMode, FeatureFlags, PermissionRule, RawConfig};
     use caudra_workcell::WorkcellHost;
     use tempfile::TempDir;
     use test_case::test_case;
@@ -1581,6 +1819,10 @@ mod auth_tests {
     const UNCURATED_SPEC: &str = "ollama/llama3";
     const AGGREGATED_SPEC: &str = "openrouter/anthropic/claude-haiku-4-5";
     const UNAVAILABLE_RESOLUTION: &str = "error: unavailable";
+    const INSPECTION_TODO: &str = "todo_write";
+    const INSPECTION_TASK: &str = "task";
+    const INSPECTION_UNKNOWN: &str = "unregistered_inspection_tool";
+    const INSPECTION_BINDING_ERROR: &str = "no registered binding";
 
     #[test_case(FAST_SPEC, ModelMarker::Fast ; "fast_default")]
     #[test_case(SMALL_SPEC, ModelMarker::Small ; "small_non_default")]
@@ -1692,6 +1934,221 @@ Title     default       provider/title\n"
                 permission: None,
             })
             .collect()
+    }
+
+    #[test_case("eager", false, ToolState::On; "eager")]
+    #[test_case("lazy", false, ToolState::Lazy; "explicitly_lazy")]
+    #[test_case("disabled", false, ToolState::Off; "disabled")]
+    #[test_case("eager", true, ToolState::Off; "global_disable_wins")]
+    fn inspection_profiles_match_schema_catalog_and_report(
+        exposure: &str,
+        disabled: bool,
+        expected: ToolState,
+    ) {
+        let registry = ToolRegistry::new();
+        caudra_agent::tools::native::register(&registry, FeatureFlags::default()).unwrap();
+        let mut config = RawConfig::default().into_config(false).unwrap();
+        if disabled {
+            config.agent.disabled_tools.push(INSPECTION_TODO.into());
+        }
+        let model = Model::from_spec(BEST_SPEC).unwrap();
+        let filter = ToolFilter::from_config(&config.agent, &model, &[]);
+        let policy: ProfileToolPolicy = serde_json::from_value(serde_json::json!({
+            "default": "disabled", "overrides": {INSPECTION_TODO: exposure}
+        }))
+        .unwrap();
+        let definitions = inspection_definitions(
+            &registry,
+            &Vars::new(),
+            &DescriptionContext {
+                filter: &filter,
+                audience: ToolAudience::MAIN,
+                workflows_available: false,
+            },
+            &config.agent,
+            &model,
+            &policy,
+            &AgentMode::Build,
+        )
+        .unwrap();
+        let rows = builtin_rows(
+            &registry,
+            &filter,
+            &config,
+            &[],
+            &model,
+            &definitions,
+            &policy,
+        );
+        let row = rows.iter().find(|row| row.name == INSPECTION_TODO).unwrap();
+        assert_eq!(row.state, expected);
+        assert_eq!(
+            row.note,
+            Some(if disabled {
+                REASON_CONFIG
+            } else if expected == ToolState::Off {
+                PROFILE_DISABLED
+            } else {
+                PROFILE_LOADING
+            })
+        );
+        assert_eq!(
+            catalog_row(&rows, &[]).is_some(),
+            expected == ToolState::Lazy
+        );
+        let catalog = inspection_catalog(definitions, None);
+        let tools = catalog.as_array().unwrap();
+        assert_eq!(
+            tools.iter().any(|tool| tool["name"] == INSPECTION_TODO),
+            expected == ToolState::On
+        );
+        let search = tools
+            .iter()
+            .find(|tool| tool["name"] == TOOL_SEARCH_TOOL_NAME);
+        assert_eq!(search.is_some(), expected == ToolState::Lazy);
+        if let Some(search) = search {
+            assert!(
+                search["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains(INSPECTION_TODO)
+            );
+            assert!(
+                !search["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("\n- {INSPECTION_TASK}:"))
+            );
+        }
+    }
+
+    #[test_case(AgentMode::Build, ToolAudience::MAIN, false; "build")]
+    #[test_case(AgentMode::Plan(PROMPT_PLAN_PATH.into()), ToolAudience::MAIN, true; "active_plan")]
+    #[test_case(AgentMode::RemotePlan(PlanRef::new(PROMPT_PLAN_REFERENCE).unwrap()), ToolAudience::MAIN, true; "remote_plan")]
+    #[test_case(AgentMode::Plan(PROMPT_PLAN_PATH.into()), ToolAudience::RESEARCH_SUB, false; "task_cannot_use_parent_plan")]
+    fn inspection_plan_needs_an_active_target(
+        mode: AgentMode,
+        audience: ToolAudience,
+        available: bool,
+    ) {
+        let registry = ToolRegistry::new();
+        caudra_agent::tools::native::register(&registry, FeatureFlags::default()).unwrap();
+        let policy: ProfileToolPolicy = serde_json::from_value(serde_json::json!({
+            "default": "disabled", "overrides": {"plan": "lazy"}
+        }))
+        .unwrap();
+        let definitions = inspection_definitions(
+            &registry,
+            &Vars::new(),
+            &DescriptionContext {
+                filter: &ToolFilter::All,
+                audience,
+                workflows_available: false,
+            },
+            &AgentConfig::default(),
+            &Model::from_spec(BEST_SPEC).unwrap(),
+            &policy,
+            &mode,
+        )
+        .unwrap();
+        assert_eq!(
+            inspection_tool_state(&definitions, "plan"),
+            if available {
+                ToolState::Lazy
+            } else {
+                ToolState::Off
+            }
+        );
+        let reminder = caudra_agent::prompt::plan_mode_prompt(&mode, |name| {
+            inspection_tool_state(&definitions, name).reaches_model()
+        });
+        assert_eq!(reminder.is_some(), mode.is_planning());
+        if let Some(reminder) = reminder {
+            assert_eq!(reminder.contains("`plan`"), available);
+            assert_eq!(
+                reminder.contains(PROMPT_PLAN_REFERENCE),
+                mode.plan_ref().is_some()
+            );
+            assert!(!reminder.contains("{plan_"));
+            assert!(!reminder.contains("`shell`"));
+            assert!(!reminder.contains("`file_write`"));
+        }
+        assert_eq!(
+            inspection_catalog(definitions, None)
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == TOOL_SEARCH_TOOL_NAME),
+            available
+        );
+    }
+
+    #[test_case("eager"; "declared")]
+    #[test_case("lazy"; "deferred")]
+    fn inspection_shapes_execution_for_profile_tools(exposure: &str) {
+        let registry = ToolRegistry::new();
+        caudra_agent::tools::native::register(&registry, FeatureFlags::default()).unwrap();
+        let config = AgentConfig {
+            task_execution: ExecutionMode::Sync,
+            ..AgentConfig::default()
+        };
+        let policy: ProfileToolPolicy = serde_json::from_value(serde_json::json!({
+            "default": "disabled", "overrides": {INSPECTION_TASK: exposure}
+        }))
+        .unwrap();
+        let definitions = inspection_definitions(
+            &registry,
+            &Vars::new(),
+            &DescriptionContext {
+                filter: &ToolFilter::All,
+                audience: ToolAudience::MAIN,
+                workflows_available: false,
+            },
+            &config,
+            &Model::from_spec(BEST_SPEC).unwrap(),
+            &policy,
+            &AgentMode::Build,
+        )
+        .unwrap();
+        let task = definitions
+            .declared
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(definitions.deferred.iter().map(|tool| &tool.definition))
+            .find(|tool| tool["name"] == INSPECTION_TASK)
+            .unwrap();
+        assert!(
+            task["input_schema"]["properties"]
+                .get("background")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn inspection_rejects_unbound_profile_selectors() {
+        let policy: ProfileToolPolicy = serde_json::from_value(serde_json::json!({
+            "overrides": {INSPECTION_UNKNOWN: "eager"}
+        }))
+        .unwrap();
+        let error = inspection_definitions(
+            &ToolRegistry::new(),
+            &Vars::new(),
+            &DescriptionContext {
+                filter: &ToolFilter::All,
+                audience: ToolAudience::MAIN,
+                workflows_available: false,
+            },
+            &AgentConfig::default(),
+            &Model::from_spec(BEST_SPEC).unwrap(),
+            &policy,
+            &AgentMode::Build,
+        )
+        .err()
+        .unwrap();
+        let message = format!("{error:#}");
+        assert!(message.contains(INSPECTION_UNKNOWN));
+        assert!(message.contains(INSPECTION_BINDING_ERROR));
     }
 
     /// The catalog has no registry entry, so the row exists exactly when the

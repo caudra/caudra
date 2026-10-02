@@ -172,7 +172,11 @@ Only global client MCP configuration is loaded. Local stdio extensions require e
 
 Conversation records, retained tool output, credentials, approval records, and the remote-operation journal stay on the client. Plans and memory notes also stay local, scoped to the remote workspace identity. They are not remote repository paths. `Ctrl+O` and `/memory` open them in the [workbench](/docs/workbench/#plans-memory-notes-and-prompt-drafts), which saves them back to the same local store.
 
-Remote sessions expose `local_document_read`, `local_document_write`, and `local_document_apply_patch` for these documents. They accept opaque document references, not arbitrary local filenames. Patches require the revision from the latest read and reject stale edits. A remote `file_write` cannot be used to edit a client plan.
+The main agent uses the same [`plan` tool](/docs/tools/#plan) locally and remotely to read or replace its active plan. The host chooses the target from the committed Plan invocation. Tool arguments cannot select another document or session. Implement and Clear-and-Implement include validated plan content and its revision in the model-visible Build request, even when the selected profile has no file tools.
+
+Secure plan storage currently requires a Unix client. On Windows and other non-Unix clients, these storage operations return `UnsupportedPlatform`. A Unix Workcell server does not remove this client-side limitation.
+
+Remote sessions also expose `local_document_read`, `local_document_write`, and `local_document_apply_patch` for client-owned documents, including memory notes. They accept opaque document references, not arbitrary local filenames. Patches require the revision from the latest read and reject stale edits. A remote `file_write` cannot be used to edit a client plan. Profile restrictions and normal permission checks still apply.
 
 Remote file contents and tool output can still enter model context and retained client output. Keeping the repository remote does not mean its content stays exclusively on the server.
 

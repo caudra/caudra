@@ -55,6 +55,7 @@ use crate::nudge::Nudge;
 use crate::peers::PeerSession;
 use crate::permissions::PermissionManager;
 use crate::template::Vars;
+use crate::tools::ToolFilter;
 use crate::tools::native::skill::{self, SkillInventoryEntry};
 use crate::tools::{BATCH_TOOL_NAME, SKILL_TOOL_NAME};
 use crate::tools::{BuiltinDeferral, DeferralSession, DeferredTool};
@@ -67,7 +68,7 @@ use crate::{
     QueueConsumedItem, SessionMailbox, SubagentHistoryStore, TurnCompleteEvent,
 };
 use caudra_config::decisions::FeatureMode;
-use caudra_config::{Feature, ModelPolicy, ToolOutputLines};
+use caudra_config::{Feature, ModelPolicy, ProfileToolPolicy, ToolOutputLines};
 use caudra_decision::{Answer, Question, QuestionSet, QuestionType};
 use caudra_storage::background::JobOwner;
 use caudra_storage::decision_log::{DecisionEffect, DecisionLabel};
@@ -138,8 +139,6 @@ const RESUME_PROMPT: &str =
     "Continue the task from where you left off, and end your turn with a text response.";
 /// Reported in place of a spec when nothing is bound to the goal evaluator.
 const UNBOUND_EVALUATOR: &str = "default";
-const LOCAL_PLAN_WRITE_TOOLS: &str = "`file_write`, `file_edit`, or `file_apply_patch`";
-const REMOTE_PLAN_WRITE_TOOLS: &str = "`local_document_write` or `local_document_apply_patch`";
 const REQUEST_CONTEXT_TOO_LARGE: &str = "The decorated request exceeds the model context window after context maintenance. Reduce the retained context or use a model with a larger context window.";
 /// The open-todos reminder quotes the list one item per row, in the shape
 /// `todo_write` takes, so the model can answer with the list it read.
@@ -322,6 +321,8 @@ pub struct AgentParams {
     pub registry: Arc<crate::tools::ToolRegistry>,
     pub audience: ToolAudience,
     pub tool_filter: crate::tools::ToolFilter,
+    pub tool_ceiling: ToolFilter,
+    pub profile_tool_policy: Arc<ProfileToolPolicy>,
     pub model_policy: Arc<ModelPolicy>,
     /// The session's workflow runtime, reachable through the `workflow` tool.
     pub workflow: Option<WorkflowHandle>,
@@ -422,6 +423,8 @@ pub struct Agent<'h> {
     registry: Arc<crate::tools::ToolRegistry>,
     audience: ToolAudience,
     tool_filter: crate::tools::ToolFilter,
+    tool_ceiling: ToolFilter,
+    profile_tool_policy: Arc<ProfileToolPolicy>,
     local_tools: LocalTools,
     model_policy: Arc<ModelPolicy>,
     workflow: Option<WorkflowHandle>,
@@ -576,6 +579,8 @@ impl<'h> Agent<'h> {
             registry: params.registry,
             audience: params.audience,
             tool_filter: params.tool_filter,
+            tool_ceiling: params.tool_ceiling,
+            profile_tool_policy: params.profile_tool_policy,
             local_tools: LocalTools::default(),
             model_policy: params.model_policy,
             workflow: params.workflow,
@@ -593,7 +598,7 @@ impl<'h> Agent<'h> {
     }
 
     pub fn with_mcp(mut self, mcp: Option<McpSession>) -> Self {
-        self.mcp = mcp;
+        self.mcp = mcp.map(|mcp| mcp.with_actor_policy(Arc::clone(&self.profile_tool_policy)));
         self
     }
 
@@ -761,6 +766,22 @@ impl<'h> Agent<'h> {
         peer_wake: bool,
     ) -> Result<DoneReason, AgentError> {
         self.goal_blocks = 0;
+        if let Some(name) = self.active_prompt_profile_name.as_deref() {
+            self.prompt_profiles
+                .resolve(Some(name))
+                .map_err(|error| AgentError::Config {
+                    message: error.to_string(),
+                })?;
+        }
+        self.profile_tool_policy
+            .validate_bindings(
+                self.registry
+                    .iter()
+                    .iter()
+                    .map(|entry| entry.name())
+                    .chain(self.local_tools.keys().map(String::as_str)),
+            )
+            .map_err(|message| AgentError::Config { message })?;
         self.goal_prescreen_skips = 0;
         self.todos_reminded = false;
         self.response_text = None;
@@ -785,6 +806,7 @@ impl<'h> Agent<'h> {
         }
         self.rollback_len = self.history.len();
         let message = self.push_user_inputs(inputs, queued).await;
+        self.configure_profile_tools();
         let skill_suggestion = self.suggest_skill(&message).await;
 
         info!(
@@ -992,8 +1014,13 @@ impl<'h> Agent<'h> {
             crate::prompt::TASK_MODE_MARKER,
             self.mode_notice.as_deref(),
         ));
-        standing.extend(mode_switch_notice(self.history.as_slice(), &latest.mode));
         self.mode = latest.mode.clone();
+        let tool_context = self.tool_context();
+        standing.extend(mode_switch_notice_with_tools(
+            self.history.as_slice(),
+            &latest.mode,
+            |name| tool_context.tool_available(name),
+        ));
         if let Some(peers) = &self.peers {
             let human_input = inputs.iter().any(|input| {
                 !input.message.trim().is_empty() || !input.images.is_empty() || input.resume
@@ -1239,6 +1266,9 @@ impl<'h> Agent<'h> {
     /// because acknowledging the report that woke this run can outlast it.
     fn remind_open_todos(&mut self) -> bool {
         if self.todos_reminded
+            || !self
+                .tool_context()
+                .tool_available(crate::tools::TODOWRITE_TOOL_NAME)
             || !self.config.todo_reminder
             || !self.is_main_session()
             || self.session_work().running
@@ -1342,12 +1372,22 @@ impl<'h> Agent<'h> {
         }
     }
 
-    /// `self.tools` holds the declared base only; deferred built-ins and MCP
-    /// are recomputed here every turn so `tool_search` loads and
-    /// late-connecting servers take effect on the next request.
-    ///
-    /// Both extensions append, which keeps the base a prefix of the result
-    /// and gives token accounting a stable boundary to attribute against.
+    fn configure_profile_tools(&mut self) {
+        let ctx = self.tool_context();
+        let mut definitions = crate::tools::ToolDefinitions {
+            declared: self.tools.clone(),
+            deferred: self.deferral.definitions().to_vec(),
+        };
+        crate::tools::profile_policy::configure_definitions(&mut definitions, &ctx);
+        self.tools = definitions.declared;
+        self.deferral = DeferralSession::new(
+            definitions.deferred,
+            self.deferral.loaded_names().into_iter(),
+        );
+    }
+
+    /// Deferred tools and MCP are recomputed each turn so loads and late
+    /// server connections take effect on the next request.
     fn request_tools(&self) -> (Cow<'_, Value>, Option<McpRequestSnapshot>) {
         if self.mcp.is_none() && self.deferral.is_empty() {
             return (Cow::Borrowed(&self.tools), None);
@@ -1359,12 +1399,19 @@ impl<'h> Agent<'h> {
             .extend_declared(&mut tools)
             .into_iter()
             .collect();
-        let snapshot = self.mcp.as_ref().map(|mcp| {
+        let snapshot = self.tool_context().mcp.as_ref().map(|mcp| {
             let snapshot = mcp.request_snapshot();
             sections.extend(snapshot.extend_declared(&mut tools));
             snapshot
         });
-        crate::tools::deferral::push_catalog(&mut tools, &sections);
+        crate::tools::deferral::push_unbound_catalog(
+            &mut tools,
+            &sections,
+            self.registry.has(crate::tools::TOOL_SEARCH_TOOL_NAME)
+                || self
+                    .local_tools
+                    .contains_key(crate::tools::TOOL_SEARCH_TOOL_NAME),
+        );
         (Cow::Owned(tools), snapshot)
     }
 
@@ -1418,7 +1465,7 @@ impl<'h> Agent<'h> {
             auto_compact: self.auto_compact,
             compaction_buffer: self.config.compaction_buffer,
             system: &self.system,
-            base_tools: &self.tools,
+            base_tools: &self.deferral.accounting_definitions(&self.tools),
             full_tools,
             projected_messages,
             measured: self.context_size(),
@@ -2490,7 +2537,15 @@ impl<'h> Agent<'h> {
             user_response_rx: self.user_response_rx.clone(),
             loaded_instructions: self.loaded_instructions.clone(),
             cancel: self.cancel.clone(),
-            mcp: self.mcp.clone(),
+            mcp: self.mcp.clone().map(|mcp| {
+                mcp.narrowed(&if self.tool_filter.is_read_only()
+                    || self.audience == ToolAudience::RESEARCH_SUB
+                {
+                    ToolFilter::ReadOnly(Box::new(ToolFilter::All))
+                } else {
+                    ToolFilter::All.for_mcp_mode(&self.mode)
+                })
+            }),
             deferral: Some(self.deferral.clone()),
             deadline: Deadline::None,
             config: self.config.clone(),
@@ -2509,6 +2564,8 @@ impl<'h> Agent<'h> {
             registry: Arc::clone(&self.registry),
             audience: self.audience,
             tool_filter: self.tool_filter.clone(),
+            tool_ceiling: self.tool_ceiling.clone(),
+            profile_tool_policy: Arc::clone(&self.profile_tool_policy),
             local_tools: Arc::clone(&self.local_tools),
             tool_name_aliases: self.tool_name_aliases.clone(),
             steering_observations: None,
@@ -2538,7 +2595,7 @@ impl<'h> Agent<'h> {
         let estimated = estimate_context_usage(
             &self.model,
             &self.system,
-            &self.tools,
+            &self.deferral.accounting_definitions(&self.tools),
             tools.as_ref(),
             projected.as_ref(),
         )
@@ -3167,28 +3224,26 @@ fn last_announced_mode(history: &[Message]) -> AnnouncedMode {
 /// (see [`stranded_reminders`]). Otherwise the transcript would read as build:
 /// the rest of a plan turn would run without its rules, and a later switch to
 /// build would find nothing to announce.
+#[cfg(test)]
 fn mode_switch_notice(history: &[Message], next: &AgentMode) -> Option<Message> {
+    mode_switch_notice_with_tools(history, next, |name| {
+        name != crate::tools::profile_policy::PLAN_TOOL_NAME
+    })
+}
+
+fn mode_switch_notice_with_tools(
+    history: &[Message],
+    next: &AgentMode,
+    available: impl Fn(&str) -> bool,
+) -> Option<Message> {
     let announced = AnnouncedMode::of(next)?;
-    if announced == last_announced_mode(history) {
+    if announced == AnnouncedMode::Build && announced == last_announced_mode(history) {
         return None;
     }
-    let text = match next {
-        AgentMode::Plan(plan_path) => Vars::new()
-            .set("{plan_path}", plan_path.display().to_string())
-            .set("{plan_write_tools}", LOCAL_PLAN_WRITE_TOOLS)
-            .apply(crate::prompt::PLAN_PROMPT)
-            .into_owned(),
-        AgentMode::RemotePlan(reference) => Vars::new()
-            .set(
-                "{plan_path}",
-                format!("opaque plan reference {}", reference.as_str()),
-            )
-            .set("{plan_write_tools}", REMOTE_PLAN_WRITE_TOOLS)
-            .apply(crate::prompt::PLAN_PROMPT)
-            .into_owned(),
-        AgentMode::Build | AgentMode::ReadOnly => crate::prompt::BUILD_PROMPT.to_owned(),
-    };
-    Some(Message::observation(text))
+    let text = crate::prompt::plan_mode_prompt(next, available)
+        .unwrap_or_else(|| crate::prompt::BUILD_PROMPT.to_owned());
+    (last_announced(history, crate::prompt::MODE_MARKERS) != Some(text.as_str()))
+        .then(|| Message::observation(text))
 }
 
 /// Counts provider-visible message content and replay framing. The system
@@ -3957,6 +4012,8 @@ mod tests {
     /// regression that would otherwise hang instead of failing.
     const TITLE_EVENT_TIMEOUT: Duration = Duration::from_secs(5);
     const TEST_PLAN_PATH: &str = ".caudra/plans/123.md";
+    const NEXT_PLAN: &str = "next-plan";
+    const PREVIOUS_REMOTE_PLAN: &str = "previous-plan";
     const EXPECTED_PLAN_NOTICE: &str = "entering plan mode must be announced";
     const EXPECTED_BUILD_NOTICE: &str = "leaving plan mode must be announced";
     const PLAN_RESTATED: &str =
@@ -4993,6 +5050,8 @@ mod tests {
                 registry: Arc::new(crate::tools::ToolRegistry::new()),
                 audience: ToolAudience::MAIN,
                 tool_filter: crate::tools::ToolFilter::All,
+                tool_ceiling: ToolFilter::All,
+                profile_tool_policy: Arc::default(),
                 model_policy: Arc::new(ModelPolicy::default()),
                 workflow: None,
                 background: None,
@@ -6109,6 +6168,53 @@ mod tests {
             assert!(!text.contains("local_"));
         }
         assert!(!text.contains("{plan_write_tools}"));
+    }
+
+    #[test_case(true; "plan_available")]
+    #[test_case(false; "no_writer_available")]
+    fn plan_notice_obeys_profile_availability(plan: bool) {
+        let notice = mode_switch_notice_with_tools(&[], &plan_mode(), |name| {
+            plan && name == crate::tools::profile_policy::PLAN_TOOL_NAME
+        })
+        .unwrap();
+        let text = notice.user_text().unwrap();
+        assert_eq!(
+            text,
+            crate::prompt::plan_mode_prompt(&plan_mode(), |name| plan
+                && name == crate::tools::profile_policy::PLAN_TOOL_NAME)
+            .unwrap()
+        );
+        assert!(!text.contains("`shell`"));
+        assert!(!text.contains("`file_write`"));
+        assert!(
+            mode_switch_notice_with_tools(&[notice], &plan_mode(), |name| !plan
+                && name == crate::tools::profile_policy::PLAN_TOOL_NAME)
+            .is_some()
+        );
+    }
+
+    #[test_case(false; "local_target_changed")]
+    #[test_case(true; "remote_target_changed")]
+    fn plan_notice_reannounces_changed_target(remote: bool) {
+        let current = if remote {
+            AgentMode::RemotePlan(PlanRef::new(PREVIOUS_REMOTE_PLAN).unwrap())
+        } else {
+            plan_mode()
+        };
+        let next = if remote {
+            AgentMode::RemotePlan(PlanRef::new(NEXT_PLAN).unwrap())
+        } else {
+            AgentMode::Plan(NEXT_PLAN.into())
+        };
+        let available = |name: &str| name == crate::tools::profile_policy::PLAN_TOOL_NAME;
+        let first = mode_switch_notice_with_tools(&[], &current, available).unwrap();
+        let notice = mode_switch_notice_with_tools(&[first], &next, available).unwrap();
+        assert_eq!(
+            notice.user_text(),
+            crate::prompt::plan_mode_prompt(&next, available).as_deref()
+        );
+        assert!(notice.user_text().unwrap().contains(NEXT_PLAN));
+        assert!(mode_switch_notice_with_tools(&[notice], &next, available).is_none());
     }
 
     #[test]
@@ -9082,6 +9188,21 @@ mod tests {
             .count()
     }
 
+    fn install_todo_tool(agent: &Agent<'_>) {
+        agent
+            .registry
+            .register_audited(
+                Arc::new(TodoWrite),
+                ToolSource::Native {
+                    owner: crate::tools::native::OWNER.into(),
+                    contract: TODOWRITE_TOOL_NAME.into(),
+                    trusted: true,
+                },
+                ToolEffect::Isolated,
+            )
+            .unwrap();
+    }
+
     #[test]
     fn the_todo_reminder_quotes_the_whole_list_as_data() {
         let todos = mixed_todos();
@@ -9112,6 +9233,7 @@ mod tests {
             let provider = MockProvider::new(vec![answer(FIRST_ANSWER), answer(SECOND_ANSWER)]);
             let requests = Arc::clone(&provider.captured_messages);
             let (mut agent, events) = make_agent(provider, &mut history);
+            install_todo_tool(&agent);
 
             assert_eq!(
                 agent.run(default_input()).await.unwrap(),
@@ -9145,6 +9267,7 @@ mod tests {
     #[test_case(Some(closed_todos()), StopReason::EndTurn, |_| {} ; "a_closed_list")]
     #[test_case(Some(Vec::new()), StopReason::EndTurn, |_| {} ; "an_emptied_list")]
     #[test_case(Some(mixed_todos()), StopReason::EndTurn, |a| a.config.todo_reminder = false ; "disabled_in_config")]
+    #[test_case(Some(mixed_todos()), StopReason::EndTurn, |a| a.profile_tool_policy = Arc::new(serde_json::from_value(json!({"default":"disabled"})).unwrap()) ; "profile_disables_todo")]
     #[test_case(Some(mixed_todos()), StopReason::EndTurn, |a| a.root_tool_use_id = Some("call-1".into()) ; "subagent_run")]
     #[test_case(Some(mixed_todos()), StopReason::EndTurn, |a| a.audience = ToolAudience::GENERAL_SUB ; "not_the_main_audience")]
     #[test_case(Some(mixed_todos()), StopReason::EndTurn, |a| a.config.max_turns = Some(1) ; "turn_limit_reached")]
@@ -9175,6 +9298,7 @@ mod tests {
             }]);
             let requests = Arc::clone(&provider.captured_messages);
             let (mut agent, _events) = make_agent(provider, &mut history);
+            install_todo_tool(&agent);
             adjust(&mut agent);
 
             assert!(agent.run(default_input()).await.is_ok());
@@ -9233,6 +9357,7 @@ mod tests {
             for _ in 0..2 {
                 let provider = MockProvider::new(vec![answer(FIRST_ANSWER), answer(SECOND_ANSWER)]);
                 let (mut agent, _events) = make_agent(provider, &mut history);
+                install_todo_tool(&agent);
                 assert_eq!(
                     agent.run(default_input()).await.unwrap(),
                     DoneReason::EndTurn
@@ -9259,6 +9384,7 @@ mod tests {
             let provider = MockProvider::new(responses);
             let requests = Arc::clone(&provider.captured_messages);
             let (mut agent, events) = make_agent(provider, &mut history);
+            install_todo_tool(&agent);
             agent.goal.set(DECISION_GOAL).unwrap();
             agent.interrupt_source = Some(Arc::new(PendingInput(AtomicBool::new(next_waiting))));
 

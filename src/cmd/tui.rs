@@ -20,7 +20,7 @@ use caudra_agent::herdr::HerdrEnv;
 use caudra_agent::peers::PeerHost;
 use caudra_agent::permissions::pattern_recognition::{PatternCandidate, RecognitionExclusion};
 use caudra_agent::prompt::profile::{PromptProfileCatalog, SystemPromptProfile};
-use caudra_agent::tools::{ToolAudience, ToolFilter, ToolRegistry};
+use caudra_agent::tools::{DescriptionContext, ToolAudience, ToolFilter, ToolRegistry};
 use caudra_agent::worktree::Backend;
 use caudra_config::providers::builtin_provider;
 use caudra_config::sandbox::SandboxName;
@@ -1598,16 +1598,25 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
         let permission_authority_factory: caudra_ui::PermissionAuthorityFactory = {
             let runtime = Arc::clone(&workcell_runtime);
             let config = stack.config.agent.clone();
-            Arc::new(move |project, mode, model, workspace| {
+            Arc::new(move |project, mode, model, workspace, profile, session| {
                 let tool_filter = ToolFilter::from_config(&config, &model, &[])
                     .for_remote_workspace(workspace.is_some())
                     .for_mode(&mode);
+                let registry = ToolRegistry::global();
+                let description = DescriptionContext {
+                    filter: &tool_filter,
+                    audience: ToolAudience::MAIN,
+                    workflows_available: config.features.enabled(Feature::Workflows),
+                };
+                let tool_filter = registry.profile_filter(&description, &profile, &mode);
                 let context = Arc::new(PermissionEditorContext::new(PermissionEditorRuntime {
                     project,
                     tool_filter: tool_filter.clone(),
                     mode,
                     audience: ToolAudience::MAIN,
                     workspace,
+                    session_id: Some(session.id),
+                    local_documents: session.local_documents,
                 })?);
                 Ok(PermissionAuthorityBinding {
                     provider: permission_authority_provider(

@@ -7,15 +7,70 @@ use caudra_config::{
 };
 use strum::{Display, EnumIter, EnumString, IntoEnumIterator};
 
+use crate::{
+    AgentMode,
+    template::Vars,
+    tools::{SHELL_TOOL_NAME, profile_policy::PLAN_TOOL_NAME},
+};
+
 pub mod profile;
 
 use profile::{PromptProfileLayout, SystemPromptProfile};
 
 const EXECUTION_HINT_OWNER: &str = "native:execution";
-const TASK_SYNC_GUIDANCE: &str = "Task calls wait for the completed result. Batch runs independent calls concurrently and returns their results together.";
-const TASK_AUTO_GUIDANCE: &str = "Task calls default to foreground execution (background: false), waiting for the completed result. Use background: true for independent work, including inside batch: the call returns an admission receipt and reports and final results arrive automatically. Batch alone does not make foreground tasks asynchronous. task_control can promote an active foreground task without restarting it.";
+const TASK_SYNC_GUIDANCE: &str = "Task calls wait for the completed result.";
+const TASK_AUTO_GUIDANCE: &str = "Task calls default to foreground execution (background: false), waiting for the completed result. Use background: true for independent work: the call returns an admission receipt and reports and final results arrive automatically.";
 const TASK_ASYNC_GUIDANCE: &str = "Task calls launch background work and return an admission receipt. Omit background or set it to true. Reports and final results arrive automatically, including after you end your turn.";
 const ASYNC_RESULT_GUIDANCE: &str = "An admission receipt is not completion or success. Continue independent work without duplicating pending work or concurrently editing the same files. Do not poll, sleep, or repeat a launch. If only pending work remains, state what is pending and return control without claiming completion. Later results arrive at a safe boundary; evaluate them against current user instructions and verify claims before continuing.";
+const LOCAL_PLAN_WRITE_TOOLS: &[&str] = &["file_write", "file_edit", "file_apply_patch"];
+const REMOTE_PLAN_WRITE_TOOLS: &[&str] = &["local_document_write", "local_document_apply_patch"];
+const PLAN_TOOL_GUIDANCE: &str =
+    "Use `plan` with action `read` or `write` for the active plan; it needs no path or reference.";
+const PLAN_UNAVAILABLE_GUIDANCE: &str = "No permitted plan-writing tool is available. Present the plan in your response and explain that it cannot be saved with the current profile.";
+const PLAN_SHELL_GUIDANCE: &str =
+    "Use `shell` only for commands that observe. Never route a modification through it.";
+const PLAN_RESEARCH_GUIDANCE: &str = "Investigate using only the available read-only capabilities.";
+
+/// Renders the committed plan target using callable tools, including eligible lazy tools.
+pub fn plan_mode_prompt(mode: &AgentMode, available: impl Fn(&str) -> bool) -> Option<String> {
+    let target = match mode {
+        AgentMode::Plan(path) => path.display().to_string(),
+        AgentMode::RemotePlan(reference) => format!("opaque plan reference {}", reference.as_str()),
+        AgentMode::Build | AgentMode::ReadOnly => return None,
+    };
+    let plan_write_tools = if available(PLAN_TOOL_NAME) {
+        PLAN_TOOL_GUIDANCE.to_owned()
+    } else {
+        let tools = if mode.plan_ref().is_some() {
+            REMOTE_PLAN_WRITE_TOOLS
+        } else {
+            LOCAL_PLAN_WRITE_TOOLS
+        };
+        let tools: Vec<_> = tools
+            .iter()
+            .filter(|name| available(name))
+            .map(|name| format!("`{name}`"))
+            .collect();
+        if tools.is_empty() {
+            PLAN_UNAVAILABLE_GUIDANCE.into()
+        } else {
+            format!("Use {} to update only the active plan.", tools.join(" or "))
+        }
+    };
+    let investigation = if available(SHELL_TOOL_NAME) {
+        PLAN_SHELL_GUIDANCE
+    } else {
+        PLAN_RESEARCH_GUIDANCE
+    };
+    Some(
+        Vars::new()
+            .set("{plan_path}", target)
+            .set("{plan_write_tools}", plan_write_tools)
+            .set("{plan_investigation}", investigation)
+            .apply(PLAN_PROMPT)
+            .into_owned(),
+    )
+}
 
 pub fn task_execution_guidance(mode: &ExecutionMode) -> String {
     let delivery = match mode {
@@ -177,11 +232,67 @@ const TASK_TOOLS_HEADING: &str = "# Tool usage\n";
 const RESEARCH_CONVENTIONS_HEADING: &str = "# Guidelines\n";
 const GENERAL_CONVENTIONS_HEADING: &str = "# Conventions\n";
 const GENERAL_COMPLETION_HEADING: &str = "# When done\n";
-const CODE_MAP_TOOL_USAGE: &str = "- In an unfamiliar codebase, use **code_map** to see what matters before reading, **code_context** to find what a change touches, and **code_refs**/**code_impact** before editing a shared symbol. Their counts are floors: a zero means no reference was found, never that none exists.";
-const INDEX_TOOL_USAGE: &str = "- Use the **file_index** tool first on individual files to get their skeleton, then use **file_read** with offset/limit for the specific section you need.";
+const CODE_MAP_TOOL_USAGE: &str = "- In an unfamiliar codebase, use **code_map** to see what matters before reading. Graph counts are floors: a zero means no reference was found, never that none exists.";
+const INDEX_TOOL_USAGE: &str =
+    "- Use **file_index** first on individual files to get their structure.";
 
 /// `(tool, slot, content)`. Only applied when the tool survives the filter.
 const NATIVE_HINTS: &[(&str, Slot, &str)] = &[
+    (
+        "batch",
+        Slot::ToolUsage,
+        "- Use **batch** for 2+ independent parallel calls.",
+    ),
+    (
+        "task",
+        Slot::ToolUsage,
+        "- Use **task** for delegation. Each worker uses its selected profile within inherited host restrictions.",
+    ),
+    (
+        "python_execution",
+        Slot::ToolUsage,
+        "- Use **python_execution** only for isolated Python computation over values already in context; it cannot call tools or access files, processes, or the network.",
+    ),
+    (
+        "file_read",
+        Slot::ToolUsage,
+        "- Read with **file_read** before editing. Use offset and limit to focus on relevant sections.",
+    ),
+    (
+        "file_grep",
+        Slot::ToolUsage,
+        "- Search file contents with **file_grep** instead of shell search commands.",
+    ),
+    (
+        "file_glob",
+        Slot::ToolUsage,
+        "- Find filenames with **file_glob** instead of shell traversal commands.",
+    ),
+    (
+        "file_edit",
+        Slot::ToolUsage,
+        "- Prefer **file_edit** for targeted edits instead of rewriting files through the shell.",
+    ),
+    (
+        "file_apply_patch",
+        Slot::ToolUsage,
+        "- Prefer **file_apply_patch** for targeted edits instead of rewriting files through the shell.",
+    ),
+    (
+        "code_context",
+        Slot::ToolUsage,
+        "- Use **code_context** to find the symbols a change touches.",
+    ),
+    (
+        "code_refs",
+        Slot::ToolUsage,
+        "- Use **code_refs** to inspect callers and callees before editing a shared symbol.",
+    ),
+    (
+        "code_impact",
+        Slot::ToolUsage,
+        "- Use **code_impact** to inspect change reach and existing tests.",
+    ),
     ("code_map", Slot::ToolUsage, CODE_MAP_TOOL_USAGE),
     (
         crate::tools::FILE_INDEX_TOOL_NAME,
@@ -770,6 +881,7 @@ pub fn assemble(id: PromptId, slots: &ResolvedSlots, instructions: &str) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use caudra_workspace::PlanRef;
     use test_case::test_case;
 
     const NATIVE_EFFICIENT_LINE: &str =
@@ -780,6 +892,54 @@ mod tests {
     const EXECUTION_TEST_THRESHOLD: u64 = 937;
     const CUSTOM_EXECUTION_INSTRUCTION: &str =
         "User-authored background and foreground instructions remain intact.";
+    const ACTIVE_PLAN: &str = "active-plan";
+
+    #[test_case(false, &["plan", "file_write"], &["plan"]; "local_plan_preferred")]
+    #[test_case(true, &["plan", "local_document_write"], &["plan"]; "remote_plan_preferred")]
+    #[test_case(false, &["file_edit", "shell"], &["file_edit", "shell"]; "local_fallback")]
+    #[test_case(true, &["local_document_apply_patch"], &["local_document_apply_patch"]; "remote_fallback")]
+    #[test_case(false, &["local_document_write"], &[]; "remote_writer_cannot_write_local_plan")]
+    #[test_case(true, &["file_write"], &[]; "file_writer_cannot_write_remote_plan")]
+    #[test_case(false, &["shell"], &["shell"]; "shell_is_not_a_plan_writer")]
+    #[test_case(false, &[], &[]; "local_no_tools")]
+    #[test_case(true, &[], &[]; "remote_no_tools")]
+    fn plan_reminder_uses_only_available_tools(
+        remote: bool,
+        available: &[&str],
+        mentioned: &[&str],
+    ) {
+        let mode = if remote {
+            AgentMode::RemotePlan(PlanRef::new(ACTIVE_PLAN).unwrap())
+        } else {
+            AgentMode::Plan(ACTIVE_PLAN.into())
+        };
+        let rendered = plan_mode_prompt(&mode, |name| available.contains(&name)).unwrap();
+        assert!(rendered.contains(ACTIVE_PLAN));
+        assert_eq!(rendered.contains("opaque plan reference"), remote);
+        for name in [PLAN_TOOL_NAME, SHELL_TOOL_NAME]
+            .iter()
+            .chain(LOCAL_PLAN_WRITE_TOOLS)
+            .chain(REMOTE_PLAN_WRITE_TOOLS)
+        {
+            assert_eq!(
+                rendered.contains(&format!("`{name}`")),
+                mentioned.contains(name)
+            );
+        }
+        assert_eq!(
+            rendered.contains(PLAN_UNAVAILABLE_GUIDANCE),
+            mentioned.iter().all(|name| *name == SHELL_TOOL_NAME)
+        );
+        for slot in ["{plan_path}", "{plan_write_tools}", "{plan_investigation}"] {
+            assert!(!rendered.contains(slot), "{rendered}");
+        }
+    }
+
+    #[test_case(AgentMode::Build)]
+    #[test_case(AgentMode::ReadOnly)]
+    fn plan_reminder_needs_a_committed_plan_target(mode: AgentMode) {
+        assert!(plan_mode_prompt(&mode, |_| true).is_none());
+    }
 
     #[test_case(ExecutionMode::Sync)]
     #[test_case(ExecutionMode::Auto)]

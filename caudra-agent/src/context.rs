@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use caudra_config::{AgentConfig, CompactionBuffer};
+use caudra_config::{AgentConfig, CompactionBuffer, ProfileToolPolicy};
 use caudra_providers::{
     ContentBlock, Message, Model, Role, adapt_images_for_model, estimate_tokens_cached,
 };
@@ -278,6 +278,7 @@ pub struct ContextMcpTool {
     pub wire_name: String,
     pub server: String,
     pub status: ContextMcpStatus,
+    pub reason: Option<&'static str>,
     pub request_tokens: u32,
 }
 
@@ -295,6 +296,7 @@ impl ContextMcpInventory {
                 qualified_name: status.qualified_name,
                 wire_name: status.wire_name,
                 server: status.server,
+                reason: status.reason,
                 status: if status.disabled {
                     ContextMcpStatus::Disabled
                 } else if status.deferred {
@@ -410,7 +412,7 @@ pub struct BuiltinToolsInput<'a> {
 }
 
 impl BuiltinToolsInput<'_> {
-    fn inventory(&self) -> ContextBuiltinInventory {
+    fn inventory(&self, profile: &ProfileToolPolicy) -> ContextBuiltinInventory {
         let deferred_tokens: HashMap<&str, u32> = self
             .deferred
             .iter()
@@ -430,6 +432,7 @@ impl BuiltinToolsInput<'_> {
                     self.model,
                     self.deferral,
                 );
+                let report = crate::tools::report::profile_report(entry, profile, report);
                 let (state, reason) = match report.state {
                     ToolState::On => (ContextBuiltinState::Declared, report.reason),
                     ToolState::Lazy if deferred_tokens.contains_key(name) => {
@@ -530,7 +533,16 @@ impl ContextInventory {
                 ..ContextSkillInventory::default()
             },
             builtins: builtins
-                .map(BuiltinToolsInput::inventory)
+                .map(|builtins| {
+                    builtins.inventory(
+                        &profiles
+                            .resolve(active_profile)
+                            .ok()
+                            .flatten()
+                            .map(|profile| profile.tools().clone())
+                            .unwrap_or_default(),
+                    )
+                })
                 .unwrap_or_default(),
             mcp,
         }
@@ -574,10 +586,20 @@ pub struct ContextCapture<'a> {
 
 impl ContextSnapshot {
     pub fn capture(capture: ContextCapture<'_>) -> Self {
+        let mut source_definitions = capture.base_tools.as_array().cloned().unwrap_or_default();
+        source_definitions.extend(
+            capture
+                .inventory
+                .builtins
+                .tools
+                .iter()
+                .filter(|tool| !tool.source.starts_with("mcp:"))
+                .map(|tool| serde_json::json!({"name": tool.name})),
+        );
         let accounting = account_request(
             capture.model,
             capture.system,
-            capture.base_tools,
+            &Value::Array(source_definitions),
             capture.full_tools,
             capture.projected_messages,
         );
@@ -740,28 +762,17 @@ fn account_tools(base_tools: &Value, full_tools: &Value) -> ToolAccounting {
             ..ToolAccounting::default()
         };
     };
-    if full.get(..base.len()) != Some(base.as_slice()) {
-        return ToolAccounting {
-            system: full_tokens,
-            ..ToolAccounting::default()
-        };
-    }
-
+    let own_names: HashSet<_> = base.iter().filter_map(tool_name).collect();
     let mut contributions = full
         .iter()
-        .enumerate()
-        .map(|(index, definition)| {
+        .map(|definition| {
             let name = tool_name(definition).unwrap_or_default();
             let category = match name {
                 TASK_TOOL_NAME => ToolCategory::Profiles,
                 MEMORY_TOOL_NAME => ToolCategory::Memory,
                 SKILL_TOOL_NAME => ToolCategory::Skills,
-                _ if index < base.len() => ToolCategory::System,
-                // Past the base array a definition is either a deferred
-                // built-in the model loaded or the catalog standing in for the
-                // ones it did not, both of ours, or it came from a server.
+                _ if own_names.contains(name) => ToolCategory::System,
                 TOOL_SEARCH_TOOL_NAME => ToolCategory::System,
-                _ if caudra_config::is_deferred_builtin(name) => ToolCategory::System,
                 _ => ToolCategory::Mcp,
             };
             ToolContribution {
@@ -960,8 +971,19 @@ impl ContextBuiltinInventory {
             }
             match self.tools.iter_mut().find(|tool| tool.name == *name) {
                 Some(tool) => {
+                    let reason = tool.reason;
+                    let deferred = tool.state == ContextBuiltinState::Deferred;
                     tool.state = ContextBuiltinState::Declared;
-                    tool.reason = None;
+                    tool.reason = match reason {
+                        Some(crate::tools::profile_policy::PROFILE_LOADING) if deferred => {
+                            Some(crate::tools::report::REASON_PROFILE_LOADED)
+                        }
+                        Some(
+                            crate::tools::profile_policy::PROFILE_LOADING
+                            | crate::tools::profile_policy::REQUIRED_INFRASTRUCTURE,
+                        ) => reason,
+                        _ => None,
+                    };
                     tool.tokens = *tokens;
                     tool.billed_to = *billed_to;
                 }
@@ -1133,6 +1155,7 @@ mod tests {
             server: qualified_name.split_once('.').unwrap().0.to_owned(),
             disabled,
             deferred,
+            reason: None,
         }
     }
 
@@ -1470,6 +1493,20 @@ mod tests {
         assert!(loaded.request_tokens > 0);
         assert_eq!(deferred.request_tokens, 0);
         assert_eq!(disabled.request_tokens, 0);
+    }
+
+    #[test_case("file_read"; "native")]
+    #[test_case("plugin_lookup"; "plugin")]
+    #[test_case("local_lookup"; "local")]
+    fn lazy_own_definitions_keep_source_attribution(name: &str) {
+        let own_definition = definition(name, "Deferred lookup");
+        let sources = json!([own_definition]);
+        let full = json!([own_definition, definition(LOADED_MCP, "MCP lookup")]);
+        let accounted = account_tools(&sources, &full);
+        assert_eq!(accounted.builtin_definitions[0].name, name);
+        assert_eq!(accounted.mcp_definitions.len(), 1);
+        assert_eq!(accounted.mcp_definitions[0].0, LOADED_MCP);
+        assert_eq!(accounted.system + accounted.mcp, value_tokens(&full));
     }
 
     /// The reconciliation grows with the tool count, so a request carrying

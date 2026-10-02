@@ -24,7 +24,7 @@ mod owned_jobs_tests {
     use test_case::test_case;
 
     use super::{
-        Agent, History, MockProvider, default_input, empty_response, make_agent,
+        Agent, History, MockProvider, default_input, empty_response, install_todo_tool, make_agent,
         make_agent_with_output_store, mixed_todos, text_response, todo_reminders,
         tool_use_response,
     };
@@ -357,7 +357,9 @@ mod owned_jobs_tests {
             let requests = run_main(&mut history, &fixture.tasks, 3).await;
             assert_eq!(requests.len(), 3);
             assert!(
-                requests[1].iter().any(|message| message.task_event.is_some())
+                requests[1]
+                    .iter()
+                    .any(|message| message.task_event.is_some())
                     && !reminded(&requests[1]),
                 "{REPORT_BEFORE_REMINDER}"
             );
@@ -376,6 +378,7 @@ mod owned_jobs_tests {
         let provider = MockProvider::new((0..answers).map(|_| response(FINAL)).collect());
         let requests = Arc::clone(&provider.captured_messages);
         let (mut agent, _events) = make_agent(provider, history);
+        install_todo_tool(&agent);
         agent.background = Some(tasks.clone());
         assert_eq!(
             agent.run(default_input()).await.unwrap(),

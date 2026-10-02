@@ -416,7 +416,9 @@ caudra prompt --tools          # tool definitions as JSON
 caudra prompt --tools --names  # tool names only, one per line
 ```
 
-Debug helper for inspecting the prompt and tool surface the agent sees. The `research` and `general` variants include the selected system prompt profile and their final host mode contract. `--plan` is rejected on non-system variants. For the tool surface, prefer `caudra tools`: it applies `--allowed-tools` and `--disallowed-tools`, and it includes MCP.
+Debug helper for inspecting the prompt and tool surface the agent sees. The `research` and `general` variants include the selected system prompt profile and their final host mode contract. `--plan` previews an active main-agent plan target without creating a document or changing session mode. It is rejected on non-system variants.
+
+`--tools` applies the selected profile, model, audience, tool flags, and execution policy. It connects MCP servers and prints the initial request schemas, with one combined catalog for eligible lazy tools. `--names` lists declared schemas, including `tool_search` when needed, rather than expanding the pending catalog. Use `caudra tools --enabled-only --names` to include lazy tool names too.
 
 ### `caudra tools`
 
@@ -427,13 +429,16 @@ caudra tools --names                          # names, one per line
 caudra tools --json                           # full records
 caudra tools --schemas                        # definitions as the provider receives them
 caudra tools --disallowed-tools shell         # preview a change before you run it
+caudra --system-prompt-profile researcher tools --schemas
 ```
 
-Resolves config the way a real run does, so the output reflects `agent.disabled_tools`, the plugin table, `--allowed-tools`, `--disallowed-tools`, and the model you select with `-m`. Built-in tools come first, then MCP tools grouped by server. MCP servers connect on every run, so a slow or failed server shows its status instead of its tools.
+Resolves config the way a real run does, so the output reflects `agent.disabled_tools`, the plugin table, `--allowed-tools`, `--disallowed-tools`, the selected [system prompt profile](/docs/system-prompts/#choose-tool-availability), and the model you select with `-m`. Built-in tools come first, then MCP tools grouped by server. MCP servers connect on every run, so a slow or failed server shows its status instead of its tools.
 
 A tool that is off carries the rule that turned it off: `--disallowed-tools`, `disabled by config`, `not in --allowed-tools`, `model has no vision support`, `model uses the other editing tool`, or `no ChatGPT subscription`. A `deny` or `allow` default from [Permissions](/docs/permissions/) appears next to the tool it applies to. See [Disabling tools](/docs/tools/#disabling-tools).
 
-A tool marked `lazy` is available and starts outside the request array, so the model reaches it through `tool_search` rather than seeing it upfront. Built-in and MCP tools can both be lazy. Which built-ins are lazy depends on the model you select with `-m`: a small or supply-unknown model defers them, while a known non-small model lists them `on` with the note `declared upfront on a known non-small model`. See [Tools loaded on demand](/docs/tools/#tools-loaded-on-demand).
+A tool marked `lazy` is available and starts outside the request array. The model can discover it through `tool_search` or call it directly by its known name. Without profile loading overrides, a small or supply-unknown model defers eligible built-ins, while a known non-small model lists them `on` with the note `declared upfront on a known non-small model`. Explicit profile loading choices take precedence over those preferences. See [Tools loaded on demand](/docs/tools/#tools-loaded-on-demand).
+
+These commands inspect a fresh tool view rather than restoring an open session's loaded schemas. `caudra tools` uses Build mode, so the active-plan tool is unavailable. Use `caudra prompt --plan --tools` for a Plan preview and `/tools` for the live session inventory. Schemas and catalogs omit unavailable tools even when a profile requests them.
 
 ### `caudra skills`
 

@@ -4,7 +4,7 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
 
-use caudra_config::ModelPolicy;
+use caudra_config::{ModelPolicy, ProfileToolPolicy};
 use caudra_providers::model_registry::Binding;
 use caudra_providers::{Model, ModelPurpose, ThinkingConfig, Timeouts, provider};
 use caudra_storage::thinking::{StoredThinking, ThinkingParseError};
@@ -36,6 +36,7 @@ struct Frontmatter {
     layout: PromptProfileLayout,
     subagent_model: Option<String>,
     subagent_thinking: Option<FrontmatterThinking>,
+    tools: ProfileToolPolicy,
 }
 
 #[derive(Debug, Deserialize)]
@@ -61,11 +62,16 @@ pub struct SystemPromptProfile {
     layout: PromptProfileLayout,
     subagent_model: Option<Binding>,
     subagent_thinking: Option<StoredThinking>,
+    tools: ProfileToolPolicy,
     body: Arc<str>,
     path: Arc<Path>,
 }
 
 impl SystemPromptProfile {
+    pub fn tools(&self) -> &ProfileToolPolicy {
+        &self.tools
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -515,6 +521,7 @@ fn load_profile(path: &Path, name: Arc<str>) -> Result<SystemPromptProfile, Prom
         layout: frontmatter.layout,
         subagent_model,
         subagent_thinking,
+        tools: frontmatter.tools,
         body: Arc::from(body),
         path: Arc::from(path),
     })
@@ -614,6 +621,27 @@ mod tests {
         let profiles = dir.path().join(PROFILE_DIR);
         fs::create_dir(&profiles).unwrap();
         profiles
+    }
+
+    #[test_case("", true; "omitted")]
+    #[test_case("tools: {}", true; "empty")]
+    #[test_case("layout: custom\ntools:\n  default: lazy", true; "custom")]
+    #[test_case("tools:\n  default: inherit\n  groups:\n    messaging: lazy\n    support: eager", true; "groups")]
+    #[test_case("tools:\n  default: disabled\n  overrides:\n    github.*: lazy", true; "mcp_server")]
+    #[test_case("tools:\n  groups:\n    bogus: eager", false; "unknown_group")]
+    #[test_case("tools:\n  overrides:\n    file_read: lazy\n    file_read: eager", false; "duplicate_selector")]
+    #[test_case("tools:\n  groups:\n    web: lazy\n    web: eager", false; "duplicate_group")]
+    #[test_case("tools:\n  overrides:\n    tool_search: eager", false; "reserved_loader")]
+    #[test_case("tools:\n  overrides:\n    structured_output: disabled", false; "required_output")]
+    fn profile_tool_frontmatter_is_strict(metadata: &str, valid: bool) {
+        let dir = TempDir::new().unwrap();
+        let profiles = profile_dir(&dir);
+        fs::write(
+            profiles.join("policy.md"),
+            format!("---\n{metadata}\n---\nProfile body."),
+        )
+        .unwrap();
+        assert_eq!(discover(dir.path()).resolve(Some("policy")).is_ok(), valid);
     }
 
     #[test]

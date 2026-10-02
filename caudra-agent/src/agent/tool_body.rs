@@ -80,6 +80,7 @@ const BODY_ARGS: &[(&str, &[&str], Body)] = &[
     ("shell", &["command"], Body::Drawn),
     ("python_execution", &["code"], Body::Drawn),
     ("memory", &["content"], Body::Drawn),
+    ("plan", &["content"], Body::Drawn),
     ("local_document_write", &["content"], Body::Drawn),
     ("task", &["prompt"], Body::Drawn),
     ("image_generate", &["prompt"], Body::Drawn),
@@ -445,6 +446,7 @@ mod tests {
     #[test_case(SHELL, Some((COMMAND_KEYS, Body::Drawn)) ; "a_command_is_drawn")]
     #[test_case("python_execution", Some((CODE_KEYS, Body::Drawn)) ; "a_script_is_drawn")]
     #[test_case(MEMORY, Some((CONTENT_KEYS, Body::Drawn)) ; "a_note_is_drawn")]
+    #[test_case("plan", Some((CONTENT_KEYS, Body::Drawn)) ; "a_plan_is_drawn")]
     #[test_case("local_document_write", Some((CONTENT_KEYS, Body::Drawn)) ; "a_local_document_is_drawn")]
     #[test_case(TASK, Some((PROMPT_KEYS, Body::Drawn)) ; "a_delegation_draws_its_prompt")]
     #[test_case(IMAGE, Some((PROMPT_KEYS, Body::Drawn)) ; "a_generation_draws_its_prompt")]
@@ -489,6 +491,12 @@ mod tests {
             ],
         );
         assert_eq!(decoded, "A wide cinematic shot", "{EXPECT_IMAGE_PROMPT}");
+    }
+
+    #[test_case(r#"{"action":"read"}"#, "" ; "read_has_no_body")]
+    #[test_case(r##"{"action":"write","content":"# Plan\nDo it"}"##, "# Plan\nDo it" ; "write_draws_content")]
+    fn plan_action_body(json: &str, expected: &str) {
+        assert_eq!(published("plan", &[json]), expected);
     }
 
     #[test]

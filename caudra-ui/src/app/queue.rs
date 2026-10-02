@@ -1432,6 +1432,7 @@ impl App {
 
     /// Immediate path: kick off the agent and draw the bubble in the same
     /// frame, so the user sees their message land where it will stay.
+    #[cfg(test)]
     pub(super) fn start_from_queue(&mut self, msg: &QueuedMessage) -> Vec<Action> {
         let display = format_with_images(&msg.text, msg.images.len());
         let input = self.build_agent_input(msg);
@@ -1509,20 +1510,32 @@ impl App {
     /// `Action::SendMessage` must go through here so `run_id` bumps exactly
     /// once per run.
     pub(super) fn start_run(&mut self, input: AgentInput, display: String) -> Vec<Action> {
-        if let Some(reason) = self.sandbox_network_dispatch_blocker() {
-            self.flash(reason.into());
+        if let Err(error) = self.admit_run() {
+            self.flash(error);
             return Vec::new();
+        }
+        self.start_admitted_run(input, display)
+    }
+
+    pub(crate) fn check_run_admission(&self) -> Result<(), String> {
+        if let Some(reason) = self.sandbox_network_dispatch_blocker() {
+            return Err(reason.into());
         }
         if self.cancelling_run.is_some() {
-            self.flash(super::REVERT_BUSY_MSG.into());
-            return Vec::new();
+            return Err(super::REVERT_BUSY_MSG.into());
         }
+        Ok(())
+    }
+
+    pub(crate) fn admit_run(&mut self) -> Result<(), String> {
+        self.check_run_admission()?;
         // The turn is what earns this session its row, and a conversation
         // grant cannot be published before there is one.
-        if let Err(error) = self.publish_conversation_permissions() {
-            self.flash(format!("{PERMISSION_PUBLISH_ERR}: {error}"));
-            return Vec::new();
-        }
+        self.publish_conversation_permissions()
+            .map_err(|error| format!("{PERMISSION_PUBLISH_ERR}: {error}"))
+    }
+
+    pub(super) fn start_admitted_run(&mut self, input: AgentInput, display: String) -> Vec<Action> {
         self.run_id += 1;
         self.background_delivery.invalidate();
         if !input.message.is_empty() || !input.images.is_empty() || input.resume {

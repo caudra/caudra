@@ -9,6 +9,8 @@ use caudra_workspace::{LocalDocumentRef, MemoryRef, PlanRef, ProjectKey, Session
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::plans::PlanFile;
+use crate::private_file::PrivateFileError;
 use crate::projects::{DocumentProjectScope, LocalProjectAliases};
 use crate::{StateDir, StorageError, atomic_write_permissions};
 
@@ -80,6 +82,8 @@ pub enum LocalDocumentError {
     Storage(#[from] StorageError),
     #[error("local document I/O failed: {0}")]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    PrivateFile(#[from] PrivateFileError),
 }
 
 #[derive(Clone)]
@@ -137,13 +141,13 @@ impl LocalDocumentStore {
         session_id: &str,
     ) -> Result<PlanRef, LocalDocumentError> {
         self.validate_project(project)?;
-        let dir = self.plan_write_dir(session_id)?;
+        let dir = self.plan_write_dir(session_id);
         for _ in 0..10 {
             let reference = PlanRef::new(format!("{PLAN_REF_PREFIX}{}", random_id()))
                 .map_err(|_| LocalDocumentError::InvalidReference)?;
             let path = document_path(&dir, reference.as_str())?;
             if !path.exists() {
-                write_secure(&path, "")?;
+                PlanFile::new(path)?.write("")?;
                 return Ok(reference);
             }
         }
@@ -176,7 +180,7 @@ impl LocalDocumentStore {
         if !owned || !legacy_path.is_file() {
             return Err(LocalDocumentError::WrongOwner);
         }
-        let content = read_secure(legacy_path)?;
+        let content = PlanFile::new(legacy_path.to_path_buf())?.read()?.0;
         let reference = self.create_plan(project, session_id)?;
         self.write(
             project,
@@ -195,7 +199,11 @@ impl LocalDocumentStore {
     ) -> Result<LocalDocument, LocalDocumentError> {
         self.validate_project(project)?;
         let (path, name) = self.resolve(project, session_id, reference)?;
-        let content = read_secure(&path)?;
+        let content = if matches!(reference, LocalDocumentRef::Plan(_)) {
+            PlanFile::new(path)?.read()?.0
+        } else {
+            read_secure(&path)?
+        };
         Ok(LocalDocument {
             reference: reference.clone(),
             name,
@@ -214,6 +222,9 @@ impl LocalDocumentStore {
         self.validate_project(project)?;
         validate_size(content)?;
         let (path, _) = self.resolve(project, session_id, reference)?;
+        if matches!(reference, LocalDocumentRef::Plan(_)) {
+            return PlanFile::new(path)?.write(content);
+        }
         write_secure(&path, content)?;
         Ok(revision(content))
     }
@@ -269,6 +280,9 @@ impl LocalDocumentStore {
     ) -> Result<DocumentRevision, LocalDocumentError> {
         self.validate_project(project)?;
         let (path, _) = self.resolve(project, session_id, reference)?;
+        if matches!(reference, LocalDocumentRef::Plan(_)) {
+            return PlanFile::new(path)?.rewrite(expected_revision, edit);
+        }
         let current = read_secure(&path)?;
         if revision(&current) != *expected_revision {
             return Err(LocalDocumentError::StaleRevision {
@@ -433,14 +447,23 @@ impl LocalDocumentStore {
             .collect()
     }
 
-    fn plan_write_dir(&self, session_id: &str) -> Result<PathBuf, LocalDocumentError> {
-        let project = self.aliases.ensure_write_subdir(&self.state_dir)?;
-        secure_directory(
-            &project
-                .join(PLANS_DIR)
-                .join(PLAN_SESSIONS_DIR)
-                .join(session_directory(session_id)),
-        )
+    fn plan_write_dir(&self, session_id: &str) -> PathBuf {
+        let project = match &self.aliases {
+            DocumentProjectScope::Local(aliases) => aliases
+                .resolve_existing(&self.state_dir)
+                .unwrap_or_else(|| {
+                    self.state_dir
+                        .persistent_path()
+                        .join(aliases.keyed_subdir())
+                }),
+            DocumentProjectScope::Remote { subdir, .. } => {
+                self.state_dir.persistent_path().join(subdir)
+            }
+        };
+        project
+            .join(PLANS_DIR)
+            .join(PLAN_SESSIONS_DIR)
+            .join(session_directory(session_id))
     }
 
     fn memory_read_dirs(&self) -> Vec<PathBuf> {
@@ -486,7 +509,7 @@ fn session_directory(session_id: &str) -> String {
     format!("session-{}", hex_digest(digest.as_slice()))
 }
 
-fn revision(content: &str) -> DocumentRevision {
+pub(crate) fn revision(content: &str) -> DocumentRevision {
     DocumentRevision(hex_digest(Sha256::digest(content.as_bytes()).as_slice()))
 }
 
@@ -662,10 +685,17 @@ mod tests {
         LocalDocumentError, LocalDocumentRef, LocalDocumentStore, LocalProjectAliases,
         MEMORIES_DIR, PatchEdit, ProjectKey, StateDir, fs,
     };
+    use crate::plans::MAX_PLAN_BYTES;
+    use crate::plans::tests::tempdir;
     use caudra_workspace::{
         AuthenticatedPrincipalId, AuthorityIdentity, ProjectIdentity, SessionBindingId,
         SessionWorkspaceBinding, SourceTrustAnchor,
     };
+    #[cfg(unix)]
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt, symlink};
+    use std::path::{Path, PathBuf};
+    use std::sync::Barrier;
+    use std::thread;
     use test_case::test_case;
 
     const PROJECT: &str = "remote-project";
@@ -679,6 +709,161 @@ mod tests {
     const NEWER: &str = "written in between";
     const WRONG_TEXT: &str = "the document holds the wrong text after a replace";
     const STALE_REPLACED: &str = "a replace went over a revision it never read";
+    const LEGACY_PLAN: &str = "legacy.md";
+    #[cfg(unix)]
+    const LEGACY_MODE: u32 = 0o644;
+
+    fn legacy_plan_path(store: &LocalDocumentStore) -> PathBuf {
+        let root = store
+            .state_dir
+            .persistent_path()
+            .join(store.aliases.read_subdirs()[0])
+            .join(super::PLANS_DIR);
+        create_dir_all(&root);
+        root.join(LEGACY_PLAN)
+    }
+
+    fn write_legacy_plan(path: &Path, content: &str) {
+        fs::write(path, content).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(path, fs::Permissions::from_mode(LEGACY_MODE)).unwrap();
+    }
+
+    #[test]
+    fn legacy_adoption_is_bounded_before_allocating_a_destination() {
+        let (_root, store, project) = store();
+        let path = legacy_plan_path(&store);
+        write_legacy_plan(&path, &"x".repeat(MAX_PLAN_BYTES + 1));
+        assert!(matches!(
+            store.adopt_legacy_plan(&project, SESSION, &path),
+            Err(LocalDocumentError::PrivateFile(
+                super::PrivateFileError::TooLarge
+            ))
+        ));
+        assert!(!store.plan_write_dir(SESSION).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_adoption_reads_without_chmod_or_source_publication() {
+        let (_root, store, project) = store();
+        let path = legacy_plan_path(&store);
+        write_legacy_plan(&path, CANARY);
+        let before = fs::metadata(&path).unwrap();
+        let reference = store.adopt_legacy_plan(&project, SESSION, &path).unwrap();
+        let after = fs::metadata(&path).unwrap();
+        assert_eq!(after.permissions().mode(), before.permissions().mode());
+        assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), CANARY);
+        assert!(!path.with_extension("md.lock").exists());
+        assert_eq!(
+            store
+                .read(&project, Some(SESSION), &LocalDocumentRef::Plan(reference))
+                .unwrap()
+                .content,
+            CANARY
+        );
+    }
+
+    #[cfg(unix)]
+    #[test_case(false; "symlink")]
+    #[test_case(true; "hardlink")]
+    fn legacy_adoption_refuses_linked_source_without_mutation(hardlink: bool) {
+        let (root, store, project) = store();
+        let path = legacy_plan_path(&store);
+        let source = root.path().join(LEGACY_PLAN);
+        write_legacy_plan(&source, CANARY);
+        if hardlink {
+            fs::hard_link(&source, &path).unwrap();
+        } else {
+            symlink(&source, &path).unwrap();
+        }
+        let before = fs::metadata(&source).unwrap();
+        let expected = if hardlink {
+            super::PrivateFileError::NotRegular
+        } else {
+            super::PrivateFileError::UnsafePath
+        };
+        assert!(
+            matches!(store.adopt_legacy_plan(&project, SESSION, &path), Err(LocalDocumentError::PrivateFile(error)) if error == expected)
+        );
+        assert!(!store.plan_write_dir(SESSION).exists());
+        assert_eq!(
+            fs::metadata(&source).unwrap().permissions().mode(),
+            before.permissions().mode()
+        );
+        assert_eq!(fs::read_to_string(source).unwrap(), CANARY);
+    }
+
+    fn create_dir_all(path: &Path) {
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        builder.mode(super::OWNER_ONLY_DIR_MODE);
+        builder.create(path).unwrap();
+    }
+
+    #[test]
+    fn tool_publication_invalidates_an_inflight_workbench_save() {
+        let (_root, store, project) = store();
+        let reference = LocalDocumentRef::Plan(store.create_plan(&project, SESSION).unwrap());
+        let first = store.read(&project, Some(SESSION), &reference).unwrap();
+        let barrier = Barrier::new(2);
+        thread::scope(|scope| {
+            let save = scope.spawn(|| {
+                store.rewrite(&project, Some(SESSION), &reference, &first.revision, |_| {
+                    barrier.wait();
+                    barrier.wait();
+                    Ok(REPLACED.to_owned())
+                })
+            });
+            barrier.wait();
+            let committed = store.write(&project, Some(SESSION), &reference, NEWER);
+            barrier.wait();
+            committed.unwrap();
+            assert!(
+                matches!(
+                    save.join().unwrap(),
+                    Err(LocalDocumentError::StaleRevision { .. })
+                ),
+                "{STALE_REPLACED}"
+            );
+        });
+        assert_eq!(
+            store
+                .read(&project, Some(SESSION), &reference)
+                .unwrap()
+                .content,
+            NEWER
+        );
+    }
+
+    #[test]
+    fn competing_workbench_saves_publish_only_one_revision() {
+        let (_root, store, project) = store();
+        let reference = LocalDocumentRef::Plan(store.create_plan(&project, SESSION).unwrap());
+        let first = store.read(&project, Some(SESSION), &reference).unwrap();
+        let barrier = Barrier::new(2);
+        let results = thread::scope(|scope| {
+            let save = |content: &str| {
+                store.rewrite(&project, Some(SESSION), &reference, &first.revision, |_| {
+                    barrier.wait();
+                    Ok(content.to_owned())
+                })
+            };
+            let left = scope.spawn(move || save(REPLACED));
+            let right = scope.spawn(move || save(NEWER));
+            [left.join().unwrap(), right.join().unwrap()]
+        });
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert!(results.iter().any(|result| matches!(
+            result,
+            Err(LocalDocumentError::StaleRevision { .. })
+                | Err(LocalDocumentError::PrivateFile(
+                    super::PrivateFileError::Busy
+                ))
+        )));
+    }
 
     fn binding(fields: [&str; 7], session: &str) -> SessionWorkspaceBinding {
         let [
@@ -715,7 +900,7 @@ mod tests {
     #[test_case(5; "principal")]
     #[test_case(6; "project")]
     fn remote_documents_isolate_every_durable_identity_field(changed: usize) {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = tempdir();
         let state = StateDir::from_path(root.path().join("state"));
         let fields = [
             "origin",
@@ -729,10 +914,10 @@ mod tests {
         let owner = binding(fields, SESSION);
         let store = LocalDocumentStore::remote(state.clone(), &owner);
         let project = owner.project().key();
+        let plan = LocalDocumentRef::Plan(store.create_plan(project, SESSION).expect("plan"));
         let memory = store
             .write_memory(project, NOTE, REMOTE_CONTENT)
             .expect("write memory");
-        let plan = LocalDocumentRef::Plan(store.create_plan(project, SESSION).expect("plan"));
         let mut other_fields = fields;
         other_fields[changed] = "different";
         let other = binding(other_fields, SESSION);
@@ -791,11 +976,11 @@ mod tests {
             .state_dir
             .persistent_path()
             .join(LocalProjectAliases::new(root.path(), project.clone()).legacy_subdir());
-        fs::create_dir_all(legacy.join(MEMORIES_DIR)).expect("legacy dir");
+        create_dir_all(&legacy.join(MEMORIES_DIR));
         fs::write(legacy.join(MEMORIES_DIR).join(NOTE), CANARY).expect("canary");
-        fs::create_dir_all(legacy.join("plans")).expect("plans dir");
+        create_dir_all(&legacy.join("plans"));
         let legacy_plan = legacy.join("plans/legacy.md");
-        fs::write(&legacy_plan, CANARY).expect("plan canary");
+        write_legacy_plan(&legacy_plan, CANARY);
         let owner = binding(
             [
                 "origin",
@@ -838,7 +1023,7 @@ mod tests {
     }
 
     fn store() -> (tempfile::TempDir, LocalDocumentStore, ProjectKey) {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = tempdir();
         let project = ProjectKey::new(PROJECT).expect("project key");
         let store = LocalDocumentStore::local_with_legacy(
             StateDir::from_path(root.path().join("state")),

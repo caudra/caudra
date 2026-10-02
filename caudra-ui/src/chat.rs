@@ -22,9 +22,11 @@ use crate::markdown::truncate_output;
 use crate::selection::Selection;
 use caudra_agent::background::BackgroundTasks;
 use caudra_agent::permissions::PermissionRequest;
+use caudra_agent::tools::native::plan::{self, PlanTarget, PlanWriteResult};
 use caudra_agent::tools::native::question::asked_questions;
 use caudra_agent::tools::{
-    FILE_WRITE_TOOL_NAME, ToolEffect, ToolInvocation, ToolRegistry, WORKFLOW_TOOL_NAME,
+    BATCH_TOOL_NAME, FILE_WRITE_TOOL_NAME, ToolEffect, ToolInvocation, ToolRegistry,
+    WORKFLOW_TOOL_NAME,
 };
 use caudra_agent::types::{Answer, QuestionEvent, WorkflowRunCard};
 use caudra_agent::{
@@ -61,6 +63,7 @@ const TOOLS_LOADED_SUFFIX: &str = " - the tools array changed, so the prompt cac
 
 pub enum ChatEventResult {
     Continue,
+    PlanWritten(PlanWriteResult),
     Done,
     QueueItemConsumed {
         id: caudra_agent::QueueItemId,
@@ -246,10 +249,23 @@ impl Chat {
             AgentEvent::ToolStart(e) => self.messages_panel.tool_start(*e),
             AgentEvent::ToolOutput { id, content } => self.tool_output(&id, &content),
             AgentEvent::BatchProgress(e) => {
-                self.messages_panel.batch_progress(&e.id, e.index, e.entry)
+                let plan = e.entry.plan_write_result();
+                if self.messages_panel.batch_progress(&e.id, e.index, e.entry)
+                    && let Some(plan) = plan
+                {
+                    return ChatEventResult::PlanWritten(plan);
+                }
             }
-            AgentEvent::ToolDone(e) => {
-                let plan_write = plan_path.filter(|pp| e.wrote_to(pp));
+            AgentEvent::ToolDone(mut e) => {
+                let native_plan = &*e.tool == plan::NAME;
+                let plan_write = plan_path.filter(|pp| !native_plan && e.wrote_to(pp));
+                if native_plan
+                    && e.annotation
+                        .as_deref()
+                        .is_some_and(|annotation| annotation.starts_with(plan::WRITE_RESULT_PREFIX))
+                {
+                    e.annotation = e.output.annotation();
+                }
                 let is_full_write = &*e.tool == FILE_WRITE_TOOL_NAME;
                 let tool_id = e.id.clone();
                 self.messages_panel.tool_done(*e);
@@ -451,6 +467,11 @@ impl Chat {
 
     pub fn scroll(&mut self, delta: i32) {
         self.messages_panel.scroll(delta);
+    }
+
+    pub(crate) fn plan_written(&mut self, id: &str, plan: &PlanWriteResult) {
+        self.messages_panel.close_tool_card(id);
+        self.messages_panel.push(plan_message(plan));
     }
 
     /// Offers the wheel to an armed scroll card under the pointer first,
@@ -968,6 +989,14 @@ pub(crate) fn batch_child_id(tool_id: &str) -> Option<(&str, usize)> {
     Some((parent, index.parse().ok()?))
 }
 
+fn plan_message(plan: &PlanWriteResult) -> DisplayMessage {
+    let source = match plan.target() {
+        PlanTarget::Local(path) => path.display().to_string(),
+        PlanTarget::Remote(reference) => format!("plan reference {}", reference.as_str()),
+    };
+    DisplayMessage::plan(plan.content().to_owned(), source)
+}
+
 fn is_stall_prompt(steering: &Option<SteeringOrigin>) -> bool {
     steering.as_ref().is_some_and(|origin| {
         origin.kind == SteeringKind::Recovery && origin.rule == EMPTY_RESPONSE_RULE
@@ -1102,6 +1131,13 @@ pub fn history_to_display(
                     .cloned()
                     .map(|output| stamped_batch_effects(output, reg))
                     .map(|output| restored_answers(output, input));
+                let saved_plan = (static_name == plan::NAME && status == ToolStatus::Success)
+                    .then(|| {
+                        reconstructed
+                            .as_ref()
+                            .and_then(|output| output.plan_write_result())
+                    })
+                    .flatten();
                 let (text, truncated_lines, tool_output, mut annotation) = build_loaded_tool(
                     static_name,
                     &summary,
@@ -1123,10 +1159,12 @@ pub fn history_to_display(
                 let state = reconstructed
                     .as_ref()
                     .and_then(|output| output.state().cloned());
-                let rust_rendered = reconstructed
-                    .as_ref()
-                    .is_some_and(|output| output.structured_display_text().is_some());
-                if !rust_rendered {
+                let rust_rendered = reconstructed.as_ref().is_some_and(|output| {
+                    output.structured_display_text().is_some()
+                        || (static_name == BATCH_TOOL_NAME
+                            && matches!(output.as_ref(), ToolOutput::Batch { .. }))
+                });
+                if !rust_rendered && saved_plan.is_none() {
                     restore_items.push(caudra_lua::RestoreItem {
                         tool: Arc::from(static_name),
                         tool_use_id: call_id.clone(),
@@ -1173,10 +1211,13 @@ pub fn history_to_display(
                     render_snapshot: None,
                     render_header: None,
                     snapshot_theme_gen: 0,
-                    body_open: None,
+                    body_open: saved_plan.as_ref().map(|_| false),
                     thinking_duration: None,
                     tool_started: None,
                 });
+                if let Some(plan) = saved_plan {
+                    display.push(plan_message(&plan));
+                }
             }
             HistoryItemKind::AssistantText { .. }
             | HistoryItemKind::Reasoning { .. }
@@ -1385,15 +1426,17 @@ mod tests {
     use caudra_agent::tools::native::peers::{LIST_NAME, SEND_NAME};
     use caudra_agent::tools::{BATCH_TOOL_NAME, SHELL_TOOL_NAME, TOOL_OUTPUT_TOOL_NAME};
     use caudra_agent::{
-        AgentEvent, BatchToolEntry, BatchToolStatus, IndexLine, IndexLineSemantic, IndexOutput,
-        IndexSourceRange, PeerOutput, SharedBuf, TextOutput, ToolDoneEvent, ToolOutput,
-        ToolStartEvent, TurnCompleteEvent,
+        AgentEvent, BatchProgressEvent, BatchToolEntry, BatchToolStatus, IndexLine,
+        IndexLineSemantic, IndexOutput, IndexSourceRange, PeerOutput, SharedBuf, TextOutput,
+        ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
     };
     use caudra_config::{InboundPolicy, UiConfig};
     use caudra_providers::{
         Billing, ContentBlock, Message, PeerMessageOrigin, Role, StandingReminderKind,
         TaskEventOrigin, estimate_tokens_cached, project_messages, token_label,
     };
+    use caudra_storage::local_documents::DocumentRevision;
+    use caudra_workspace::PlanRef;
     use ratatui::{Terminal, backend::TestBackend};
     use test_case::test_case;
 
@@ -1472,6 +1515,9 @@ mod tests {
     }
 
     const MAIN_NAME: &str = "Main";
+    const COMMITTED_PLAN_CONTENT: &str = "# Committed plan\n\nUse this exact content.";
+    const COMMITTED_PLAN_PATH: &str = "/unreadable/committed-plan.md";
+    const COMMITTED_PLAN_REFERENCE: &str = "plan-committed";
     const SUBAGENT_NAME: &str = "research";
     const TASK_ID: &str = "toolu_01";
     const USER_TEXT: &str = "one more thing";
@@ -1729,6 +1775,140 @@ mod tests {
         assert!(chat.last_message_is_plan());
         assert!(chat.last_message_text().is_empty());
         assert!(!chat.messages_panel.card_closed("e1"), "{PLAN_DIFF_MSG}");
+    }
+
+    fn committed_plan(remote: bool) -> PlanWriteResult {
+        let target = if remote {
+            PlanTarget::Remote(PlanRef::new(COMMITTED_PLAN_REFERENCE).unwrap())
+        } else {
+            PlanTarget::Local(COMMITTED_PLAN_PATH.into())
+        };
+        PlanWriteResult::new(
+            target,
+            DocumentRevision::new("a".repeat(64)).unwrap(),
+            COMMITTED_PLAN_CONTENT.into(),
+        )
+    }
+
+    #[test_case(false ; "local")]
+    #[test_case(true ; "remote")]
+    fn native_plan_write_draws_one_committed_card_without_reading_storage(remote: bool) {
+        let mut chat = chat();
+        let result = committed_plan(remote);
+        chat.handle_event(tool_start("w1", plan::NAME), None);
+        let mut done = ToolDoneEvent::error("w1".into(), COMMITTED_PLAN_CONTENT);
+        done.tool = plan::NAME.into();
+        done.is_error = false;
+        done.output = ToolOutput::Markdown(COMMITTED_PLAN_CONTENT.into());
+        done.annotation = Some(result.annotation().unwrap());
+        chat.handle_event(
+            AgentEvent::ToolDone(Box::new(done)),
+            Some(Path::new(COMMITTED_PLAN_PATH)),
+        );
+        chat.plan_written("w1", &result);
+        assert_eq!(chat.message_count(), 2);
+        assert!(
+            chat.messages_panel.card_closed("w1"),
+            "{PLAN_DUPLICATION_MSG}"
+        );
+        assert!(chat.last_message_is_plan());
+        assert_eq!(chat.last_message_text(), COMMITTED_PLAN_CONTENT);
+        assert!(
+            !chat
+                .message_at(0)
+                .unwrap()
+                .annotation
+                .as_deref()
+                .unwrap()
+                .contains(plan::WRITE_RESULT_PREFIX)
+        );
+    }
+
+    #[test_case(false, false ; "local_success")]
+    #[test_case(true, false ; "remote_success")]
+    #[test_case(false, true ; "local_failure")]
+    #[test_case(true, true ; "remote_failure")]
+    fn persisted_plan_write_restores_one_captured_card(remote: bool, error: bool) {
+        let result = committed_plan(remote);
+        let output = ToolOutput::Markdown(TextOutput {
+            state: Some(result.annotation().unwrap().into()),
+            ..COMMITTED_PLAN_CONTENT.into()
+        });
+        let stored: ToolOutput =
+            serde_json::from_str(&serde_json::to_string(&output).unwrap()).unwrap();
+        let messages = tool_use_pair(
+            plan::NAME,
+            serde_json::json!({"action": "write", "content": COMMITTED_PLAN_CONTENT}),
+            "Active plan saved.",
+            error,
+        );
+        let outputs = HashMap::from([("t1".into(), Arc::new(stored))]);
+        let (display, restores) = display_messages(&messages, &outputs);
+        assert_eq!(display.len(), if error { 1 } else { 2 });
+        if !error {
+            assert_eq!(display[0].body_open, Some(false));
+            assert_eq!(display[1].text, COMMITTED_PLAN_CONTENT);
+            assert_eq!(display[1].plan_path, plan_message(&result).plan_path);
+            assert!(restores.is_empty());
+        }
+    }
+
+    #[test_case(false; "local")]
+    #[test_case(true; "remote")]
+    fn batch_plan_completion_and_replay_keep_one_native_body(remote: bool) {
+        let mut live = chat();
+        live.handle_event(batch_start("t1", 2), None);
+        let plan = committed_plan(remote);
+        let entry = BatchToolEntry {
+            tool: plan::NAME.into(),
+            effect: ToolEffect::Mutating,
+            summary: String::new(),
+            status: BatchToolStatus::Success,
+            input: None,
+            raw_input: None,
+            output: Some(ToolOutput::Markdown(TextOutput {
+                state: Some(plan.annotation().unwrap().into()),
+                ..COMMITTED_PLAN_CONTENT.into()
+            })),
+            annotation: None,
+            model_suffix: None,
+        };
+        for index in [1, 0] {
+            let event = || {
+                AgentEvent::BatchProgress(Box::new(BatchProgressEvent {
+                    id: "t1".into(),
+                    index,
+                    entry: entry.clone(),
+                }))
+            };
+            assert!(
+                matches!(live.handle_event(event(), None), ChatEventResult::PlanWritten(written) if written == plan)
+            );
+            assert!(matches!(
+                live.handle_event(event(), None),
+                ChatEventResult::Continue
+            ));
+        }
+        let output = ToolOutput::Batch {
+            entries: vec![entry.clone(), entry],
+            text: String::new(),
+        };
+        live.handle_event(tool_done("t1", BATCH_TOOL_NAME, output.clone()), None);
+        assert_eq!(live.message_count(), 1);
+        let restored: ToolOutput =
+            serde_json::from_str(&serde_json::to_string(&output).unwrap()).unwrap();
+        let messages = tool_use_pair(BATCH_TOOL_NAME, serde_json::json!({}), "saved", false);
+        let outputs = HashMap::from([("t1".into(), Arc::new(restored))]);
+        let (display, restores) = display_messages(&messages, &outputs);
+        assert_eq!(display.len(), 1);
+        assert!(restores.is_empty());
+        let ToolOutput::Batch { entries, .. } = display[0].tool_output.as_deref().unwrap() else {
+            panic!("expected batch output");
+        };
+        assert_eq!(entries.len(), 2);
+        for entry in entries {
+            assert_eq!(entry.plan_write_result(), Some(plan.clone()));
+        }
     }
 
     #[test]

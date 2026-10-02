@@ -57,6 +57,7 @@ impl From<io::Error> for PrivateFileError {
 pub struct PrivateFile {
     path: PathBuf,
     max_bytes: usize,
+    public_read: bool,
 }
 
 pub struct PrivateFileSnapshot {
@@ -77,11 +78,31 @@ impl PrivateFile {
         {
             return Err(PrivateFileError::UnsafePath);
         }
-        Ok(Self { path, max_bytes })
+        Ok(Self {
+            path,
+            max_bytes,
+            public_read: false,
+        })
+    }
+
+    pub(crate) fn document(path: PathBuf, max_bytes: usize) -> Result<Self, PrivateFileError> {
+        let mut file = Self::new(path, max_bytes)?;
+        file.public_read = true;
+        Ok(file)
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(crate) fn ensure_parent(&self) -> Result<(), PrivateFileError> {
+        #[cfg(unix)]
+        {
+            unix::Directory::open(&self.path, true, self.public_read)?;
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        Err(PrivateFileError::UnsupportedPlatform)
     }
 
     /// A stable, owner-only advisory lease, separate from the atomically replaced data.
@@ -90,7 +111,7 @@ impl PrivateFile {
     pub fn try_lease(&self, exclusive: bool) -> Result<File, PrivateFileError> {
         #[cfg(unix)]
         {
-            unix::Directory::open(&self.path, true)?
+            unix::Directory::open(&self.path, true, self.public_read)?
                 .ok_or(PrivateFileError::UnsafePath)?
                 .lease(exclusive)
         }
@@ -104,7 +125,7 @@ impl PrivateFile {
     pub fn load(&self) -> Result<PrivateFileSnapshot, PrivateFileError> {
         #[cfg(unix)]
         {
-            let data = match unix::Directory::open(&self.path, false)? {
+            let data = match unix::Directory::open(&self.path, false, self.public_read)? {
                 Some(directory) => directory.read(self.max_bytes)?,
                 None => None,
             };
@@ -127,8 +148,8 @@ impl PrivateFile {
         }
         #[cfg(unix)]
         {
-            let directory =
-                unix::Directory::open(&self.path, true)?.ok_or(PrivateFileError::UnsafePath)?;
+            let directory = unix::Directory::open(&self.path, true, self.public_read)?
+                .ok_or(PrivateFileError::UnsafePath)?;
             let _lock = directory.lock()?;
             let current = directory.read(self.max_bytes)?;
             if &FileRevision::of(current.as_deref()) != expected {
@@ -179,6 +200,7 @@ mod unix {
         file: File,
         path: PathBuf,
         name: OsString,
+        public_read: bool,
     }
 
     fn syscall(error: Errno) -> PrivateFileError {
@@ -188,9 +210,17 @@ mod unix {
         }
     }
 
-    fn validate_file(path: &Path, metadata: &Metadata) -> Result<(), PrivateFileError> {
+    fn validate_file(
+        path: &Path,
+        metadata: &Metadata,
+        public_read: bool,
+    ) -> Result<(), PrivateFileError> {
         if !metadata.is_file() || metadata.nlink() != 1 {
             return Err(PrivateFileError::NotRegular);
+        }
+        if public_read && metadata.uid() == geteuid().as_raw() && metadata.mode() & OTHER_WRITE == 0
+        {
+            return Ok(());
         }
         validate_file_owner(path, metadata.uid(), metadata.mode())
     }
@@ -224,7 +254,11 @@ mod unix {
     }
 
     impl Directory {
-        pub(super) fn open(path: &Path, create: bool) -> Result<Option<Self>, PrivateFileError> {
+        pub(super) fn open(
+            path: &Path,
+            create: bool,
+            public_read: bool,
+        ) -> Result<Option<Self>, PrivateFileError> {
             let parent = path.parent().ok_or(PrivateFileError::UnsafePath)?;
             let mut directory =
                 File::from(fs::open("/", DIRECTORY_FLAGS, Mode::empty()).map_err(syscall)?);
@@ -258,6 +292,7 @@ mod unix {
                 file: directory,
                 path: walked,
                 name: path.file_name().ok_or(PrivateFileError::UnsafePath)?.into(),
+                public_read,
             }))
         }
 
@@ -267,7 +302,11 @@ mod unix {
                 Err(Errno::NOENT) => return Ok(None),
                 Err(error) => return Err(syscall(error)),
             };
-            validate_file(&self.path.join(name), &file.metadata()?)?;
+            validate_file(
+                &self.path.join(name),
+                &file.metadata()?,
+                self.public_read && name == self.name,
+            )?;
             Ok(Some(file))
         }
 
@@ -339,9 +378,62 @@ mod unix {
     }
 }
 
+#[cfg(all(test, not(unix)))]
+mod unsupported_tests {
+    use super::{FileRevision, PrivateFile, PrivateFileError};
+    use std::fs;
+    use test_case::test_case;
+
+    const CONTENT: &[u8] = b"unchanged";
+    const FILE_NAME: &str = "document.md";
+    const LIMIT: usize = 128;
+
+    #[test_case(false, false; "private_missing")]
+    #[test_case(false, true; "private_existing")]
+    #[test_case(true, false; "document_missing")]
+    #[test_case(true, true; "document_existing")]
+    fn unsupported_storage_refuses_without_io(document: bool, existing: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(FILE_NAME);
+        if existing {
+            fs::write(&path, CONTENT).unwrap();
+        }
+        let file = if document {
+            PrivateFile::document(path.clone(), LIMIT)
+        } else {
+            PrivateFile::new(path.clone(), LIMIT)
+        }
+        .unwrap();
+        assert_eq!(
+            file.ensure_parent(),
+            Err(PrivateFileError::UnsupportedPlatform)
+        );
+        assert_eq!(
+            file.try_lease(true).err(),
+            Some(PrivateFileError::UnsupportedPlatform)
+        );
+        assert_eq!(
+            file.load().err(),
+            Some(PrivateFileError::UnsupportedPlatform)
+        );
+        assert_eq!(
+            file.compare_exchange(&FileRevision::Missing, Some(CONTENT)),
+            Err(PrivateFileError::UnsupportedPlatform)
+        );
+        assert_eq!(
+            fs::read_dir(root.path()).unwrap().count(),
+            usize::from(existing)
+        );
+        if existing {
+            assert_eq!(fs::read(path).unwrap(), CONTENT);
+        }
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::{FileRevision, MAX_PRIVATE_FILE_BYTES, PrivateFile, PrivateFileError, unix};
+    #[cfg(not(target_vendor = "apple"))]
     use rustix::fs::{CWD, Mode, mkfifoat};
     use rustix::process::geteuid;
     use std::fs::{self, File, Permissions};
@@ -535,6 +627,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_vendor = "apple"))]
     fn refuses_nonregular_files_without_blocking() {
         let temp = tempdir().unwrap();
         let file = PrivateFile::new(temp.path().join(FILE_NAME), LIMIT).unwrap();

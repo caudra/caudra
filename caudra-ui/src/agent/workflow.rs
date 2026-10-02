@@ -126,6 +126,24 @@ impl WorkflowSession {
         let slot = spawn.effective_model_slot.load();
         let tool_filter = ToolFilter::from_config(spawn.config, &slot.model, &[])
             .for_remote_workspace(spawn.workspace_session.is_some());
+        let tool_ceiling = ToolFilter::ceiling_from_config(spawn.config, &[])
+            .for_remote_workspace(spawn.workspace_session.is_some());
+        let profile = match spawn
+            .prompt_profiles
+            .resolve(Some(&spawn.task_prompt_profile_name))
+        {
+            Ok(profile) => profile,
+            Err(error) => {
+                warn!(%error, "workflow prompt profile unavailable");
+                return None;
+            }
+        };
+        let profile_tool_policy = Arc::new(
+            profile
+                .as_ref()
+                .map(|profile| profile.tools().clone())
+                .unwrap_or_default(),
+        );
         let session_ref = SessionRef::from(spawn.session_id);
         let base = AgentParams {
             provider: Arc::clone(&slot.provider),
@@ -159,6 +177,8 @@ impl WorkflowSession {
             subagent_history: spawn.subagent_history.clone(),
             registry: Arc::clone(ToolRegistry::global_arc()),
             audience: ToolAudience::MAIN,
+            tool_ceiling,
+            profile_tool_policy,
             tool_filter,
             model_policy: Arc::clone(spawn.model_policy),
             workflow: None,

@@ -14,14 +14,13 @@ You must NEVER generate or guess URLs unless they are for helping the user with 
 
 # Tool usage
 - Every tool result grows your context. Minimize use of verbose tool calls, prefer compact results.
-- **Use batch** for 2+ independent `file_read`, `file_grep`, or `file_glob` calls. Never call them one at a time sequentially.
-- **Use python_execution** only for isolated Python computation over values already in context; it cannot call tools or access files, processes, or the network.
+- Use only available tools, including eligible tools in the lazy catalog.
 {{tool_usage}}
 
 {{efficient_tools}}
 
 # Guidelines
-- Search broadly first with `file_glob` and `file_grep`, then drill into relevant files.
+- Search broadly with the available tools, then drill into relevant evidence.
 - Include specific file paths and line numbers when referencing code.
 - If you cannot find what was asked for, say so clearly.
 - Do not speculate beyond what the code shows.

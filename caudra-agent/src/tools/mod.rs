@@ -14,6 +14,7 @@ pub mod interpreter_bridge;
 pub mod json_repair;
 pub mod native;
 mod path_locks;
+pub mod profile_policy;
 pub mod registry;
 pub mod report;
 pub mod schema;
@@ -60,7 +61,7 @@ use crate::workflow::WorkflowHandle;
 use crate::{
     AgentConfig, AgentMode, EventSender, SharedBuf, SubagentHistoryStore, SubagentProgress,
 };
-use caudra_config::{Feature, FeatureFlags, ModelPolicy, ToolOutputLines};
+use caudra_config::{Feature, FeatureFlags, ModelPolicy, ProfileToolPolicy, ToolOutputLines};
 use caudra_providers::Model;
 use caudra_providers::RequestOptions;
 use caudra_providers::provider::Provider;
@@ -120,6 +121,14 @@ impl ToolFilter {
 
     pub fn for_mode(self, mode: &AgentMode) -> Self {
         if mode.is_read_only() {
+            Self::ReadOnly(Box::new(self))
+        } else {
+            self
+        }
+    }
+
+    pub fn for_mcp_mode(self, mode: &AgentMode) -> Self {
+        if mode.is_planning() || mode.is_read_only() {
             Self::ReadOnly(Box::new(self))
         } else {
             self
@@ -254,6 +263,10 @@ impl ToolFilter {
     }
 
     pub fn from_config(config: &AgentConfig, model: &Model, extra_exclude: &[&str]) -> Self {
+        Self::ceiling_from_config(config, extra_exclude).excluding(capability_exclusions(model))
+    }
+
+    pub fn ceiling_from_config(config: &AgentConfig, extra_exclude: &[&str]) -> Self {
         let base = if config.allowed_tools.is_empty() {
             Self::All
         } else {
@@ -268,10 +281,9 @@ impl ToolFilter {
         };
         let mut exclude: Vec<&str> = extra_exclude.to_vec();
         exclude.extend(feature_exclusions(config.features));
-        exclude.extend(capability_exclusions(model));
         exclude.extend(credential_exclusions());
         exclude.extend(config.disabled_tools.iter().map(|s| s.as_str()));
-        base.excluding(&exclude).with_internal_companions()
+        base.excluding(&exclude)
     }
 }
 
@@ -456,9 +468,19 @@ type LocalToolHandler = Arc<dyn Fn(Value, ToolContext) -> TypedLocalToolResult +
 pub struct LocalToolEntry {
     handler: LocalToolHandler,
     pub effect: ToolEffect,
+    required: bool,
 }
 
 impl LocalToolEntry {
+    pub fn required_output(mut self) -> Self {
+        self.required = true;
+        self
+    }
+
+    pub fn is_required(&self) -> bool {
+        self.required
+    }
+
     pub fn call(&self, input: Value, ctx: ToolContext) -> TypedLocalToolResult {
         (self.handler)(input, ctx)
     }
@@ -495,6 +517,7 @@ where
     LocalToolEntry {
         handler: Arc::new(f),
         effect,
+        required: false,
     }
 }
 
@@ -559,6 +582,8 @@ pub struct ToolContext {
     pub registry: Arc<ToolRegistry>,
     pub audience: ToolAudience,
     pub tool_filter: ToolFilter,
+    pub tool_ceiling: ToolFilter,
+    pub profile_tool_policy: Arc<ProfileToolPolicy>,
     pub local_tools: LocalTools,
     pub tool_name_aliases: Option<caudra_providers::ToolNameAliases>,
     pub json_repair: Arc<json_repair::RepairState>,
@@ -850,6 +875,8 @@ pub fn interpreter_ctx(
         registry,
         audience: ToolAudience::MAIN,
         tool_filter: ToolFilter::All,
+        tool_ceiling: ToolFilter::All,
+        profile_tool_policy: Arc::default(),
         local_tools: LocalTools::default(),
         tool_name_aliases: None,
         json_repair: Arc::new(json_repair::RepairState::default()),
@@ -1140,7 +1167,7 @@ mod tests {
     }
 
     #[test]
-    fn config_filters_always_keep_internal_output_companions() {
+    fn config_filter_does_not_grant_infrastructure_by_name() {
         let model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
         let config = AgentConfig {
             allowed_tools: vec![FILE_READ_TOOL_NAME.into()],
@@ -1154,7 +1181,7 @@ mod tests {
         let filter = ToolFilter::from_config(&config, &model, INTERNAL_COMPANION_TOOL_NAMES);
 
         assert!(filter.matches(FILE_READ_TOOL_NAME));
-        assert!(filter.matches(TOOL_OUTPUT_TOOL_NAME));
+        assert!(!filter.matches(TOOL_OUTPUT_TOOL_NAME));
         assert!(!filter.matches(SHELL_TOOL_NAME));
         assert!(is_tool_enabled(
             &config.disabled_tools,

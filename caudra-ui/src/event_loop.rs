@@ -33,6 +33,7 @@ use caudra_agent::permissions::PermissionManager;
 use caudra_agent::prompt::profile::{
     BUILTIN_PROFILE_NAME, PromptProfileCatalog, SystemPromptProfile,
 };
+use caudra_agent::tools::ToolRegistry;
 use caudra_agent::workflow::WorkflowTransition;
 use caudra_agent::worktree::git::Git;
 use caudra_agent::worktree::{Backend, Request as WorktreeRequest, counterpart, label};
@@ -92,7 +93,7 @@ use crate::components::session_picker::{SessionActivity, SessionRow};
 use crate::components::storage_modal::{StorageFetchState, StorageReport};
 use crate::components::usage_modal::UsageFetchState;
 use crate::components::worktree_picker::{WorktreeOverview, WorktreeView};
-use crate::components::{Action, ExitRequest, ForkDraft, ForkedSession, Status};
+use crate::components::{Action, ExitRequest, ForkDraft, ForkedSession, PlanHandoff, Status};
 use crate::herdr::{
     HerdrObservation, HerdrReporterHandle, HerdrResume, HerdrStatus, aggregate_observations,
 };
@@ -877,10 +878,38 @@ struct SpawnCtx {
 }
 
 impl SpawnCtx {
+    fn spawn_fresh_runtime(&self, current: &AppSession) -> Result<SessionRuntime, String> {
+        let session = current.workspace_binding().map_or_else(
+            || AppSession::new(&current.model, &current.cwd),
+            |binding| AppSession::new_with_workspace(&current.model, &current.cwd, binding.clone()),
+        );
+        let lease = SessionLease::acquire(&self.storage, session.id)
+            .map_err(|error| format!("Failed to reserve new session: {error}"))?;
+        self.spawn_runtime(SessionTab {
+            session,
+            lease: Arc::new(lease),
+            cursor: None,
+        })
+    }
+
+    fn spawn_plan_runtime(&self, source: &App) -> Result<SessionRuntime, String> {
+        source.check_run_admission()?;
+        if source.permission_mutation_pending() {
+            return Err(crate::app::permission_editor::PERMISSION_WORKER_BUSY.into());
+        }
+        let mut runtime = self.spawn_fresh_runtime(&source.state.session)?;
+        if let Err(error) = runtime.app.admit_run() {
+            runtime.app.discard_unstarted_session(runtime.id());
+            runtime.handles.cancel();
+            return Err(error);
+        }
+        Ok(runtime)
+    }
+
     fn resolve_prompt_profile(
         &self,
         session: &AppSession,
-    ) -> (String, Option<Arc<SystemPromptProfile>>, Option<String>) {
+    ) -> Result<(String, Option<Arc<SystemPromptProfile>>), String> {
         let requested_name = self
             .prompt_profile_override
             .as_deref()
@@ -890,21 +919,28 @@ impl SpawnCtx {
                     .as_deref()
                     .map(SystemPromptProfile::name)
             });
-        match self.prompt_profiles.resolve(requested_name) {
-            Ok(profile) => (
-                requested_name.unwrap_or(BUILTIN_PROFILE_NAME).to_owned(),
-                profile,
-                None,
-            ),
-            Err(error) => (
-                BUILTIN_PROFILE_NAME.to_owned(),
-                None,
-                Some(format!(
-                    "Could not use system prompt profile {:?}: {error}. Using built-in prompt.",
-                    requested_name.unwrap_or(BUILTIN_PROFILE_NAME)
-                )),
-            ),
+        let profile = self.resolve_bound_profile(requested_name)?;
+        Ok((
+            requested_name.unwrap_or(BUILTIN_PROFILE_NAME).to_owned(),
+            profile,
+        ))
+    }
+
+    fn resolve_bound_profile(
+        &self,
+        name: Option<&str>,
+    ) -> Result<Option<Arc<SystemPromptProfile>>, String> {
+        let profile = self
+            .prompt_profiles
+            .resolve(name)
+            .map_err(|error| error.to_string())?;
+        if let Some(profile) = &profile {
+            profile
+                .tools()
+                .validate_bindings(ToolRegistry::global().names().iter().map(AsRef::as_ref))
+                .map_err(|error| format!("System prompt profile {:?}: {error}", profile.name()))?;
         }
+        Ok(profile)
     }
 
     fn spawn_runtime(&self, tab: SessionTab) -> Result<SessionRuntime, String> {
@@ -992,8 +1028,8 @@ impl SpawnCtx {
         let todos = crate::session_todos(&session, &archived_history, &initial_history);
         let archived_history_ms = lap();
         let restore_session = !initial_history.is_empty() || session_has_content(&session);
-        let (system_prompt_profile_name, system_prompt_profile, profile_warning) =
-            self.resolve_prompt_profile(&session);
+        let (system_prompt_profile_name, system_prompt_profile) =
+            self.resolve_prompt_profile(&session)?;
         let permissions = Arc::new(self.permissions.fork_session());
         // Publishing writes the session out so a conversation grant has a row
         // to be fenced against. A session holding nothing has nothing to keep,
@@ -1104,9 +1140,6 @@ impl SpawnCtx {
         app.state.system_prompt_profile_name = system_prompt_profile_name;
         app.state.system_prompt_profile = system_prompt_profile;
         app.state.system_prompt_profile_override = self.prompt_profile_override.is_some();
-        if let Some(warning) = profile_warning {
-            app.state.warnings.push(warning);
-        }
         handles.apply_to_app(&mut app);
         if restore_session {
             app.restore_resumed_session();
@@ -3067,7 +3100,7 @@ impl<'t> EventLoop<'t> {
         if self.ctx.workspace_session.is_none() {
             validate_session_focus(&session, None)?;
         }
-        let (profile_name, profile, profile_warning) = self.ctx.resolve_prompt_profile(&session);
+        let (profile_name, profile) = self.ctx.resolve_prompt_profile(&session)?;
         let focused = &mut self.sessions[self.focused];
         if focused.quiescent() && !focused.app.has_content() && self.ctx.workspace_session.is_none()
         {
@@ -3084,9 +3117,6 @@ impl<'t> EventLoop<'t> {
             focused.app.state.system_prompt_profile = profile;
             focused.app.state.system_prompt_profile_override =
                 self.ctx.prompt_profile_override.is_some();
-            if let Some(warning) = profile_warning {
-                focused.app.flash(warning);
-            }
             let old_lease = std::mem::replace(&mut self.sessions[self.focused].lease, lease);
             self.dispatch(self.focused, vec![Action::LoadSession(Box::new(loaded))]);
             drop(old_lease);
@@ -3245,6 +3275,10 @@ impl<'t> EventLoop<'t> {
             if self.relocation.is_some() {
                 break;
             }
+            if let Action::ClearAndImplement(handoff) = action {
+                self.clear_and_implement(idx, *handoff);
+                continue;
+            }
             if matches!(&action, Action::RequestNewSession) {
                 if !self.request_new_session(idx) {
                     break;
@@ -3259,33 +3293,10 @@ impl<'t> EventLoop<'t> {
 
     fn request_new_session(&mut self, idx: usize) -> bool {
         if !self.sessions[idx].work_quiescent() {
-            let session = {
-                let current = &self.sessions[idx].app.state.session;
-                current.workspace_binding().map_or_else(
-                    || AppSession::new(&current.model, &current.cwd),
-                    |binding| {
-                        AppSession::new_with_workspace(
-                            &current.model,
-                            &current.cwd,
-                            binding.clone(),
-                        )
-                    },
-                )
-            };
-            let lease = match SessionLease::acquire(&self.ctx.storage, session.id) {
-                Ok(lease) => Arc::new(lease),
-                Err(error) => {
-                    self.sessions[idx]
-                        .app
-                        .flash(format!("Failed to reserve new session: {error}"));
-                    return false;
-                }
-            };
-            let runtime = match self.ctx.spawn_runtime(SessionTab {
-                session,
-                lease,
-                cursor: None,
-            }) {
+            let runtime = match self
+                .ctx
+                .spawn_fresh_runtime(&self.sessions[idx].app.state.session)
+            {
                 Ok(runtime) => runtime,
                 Err(error) => {
                     self.sessions[idx].app.flash(error);
@@ -3308,6 +3319,38 @@ impl<'t> EventLoop<'t> {
         }
         self.dispatch(idx, actions);
         true
+    }
+
+    fn clear_and_implement(&mut self, idx: usize, handoff: PlanHandoff) {
+        let target = if self.sessions[idx].work_quiescent() {
+            let actions = match self.sessions[idx].app.reset_session_for_plan() {
+                Ok(actions) => actions,
+                Err(error) => {
+                    self.sessions[idx].app.flash(error);
+                    return;
+                }
+            };
+            self.dispatch(idx, actions);
+            idx
+        } else {
+            let runtime = match self.ctx.spawn_plan_runtime(&self.sessions[idx].app) {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    self.sessions[idx].app.flash(error);
+                    return;
+                }
+            };
+            self.sessions[idx].app.consume_plan();
+            let child = self.push_runtime(runtime);
+            self.focused = child;
+            caudra_otel::emit::session_started(
+                caudra_otel::emit::START_FRESH,
+                Some(&self.sessions[child].id().to_string()),
+            );
+            child
+        };
+        let actions = self.sessions[target].app.finish_plan_handoff(handoff);
+        self.dispatch(target, actions);
     }
 
     fn workspace_group_quiescent(&self, idx: usize) -> bool {
@@ -3765,7 +3808,9 @@ impl<'t> EventLoop<'t> {
                     .cmd_tx
                     .try_send(AgentCommand::CancelSubagent { tool_use_id });
             }
-            Action::RequestNewSession => unreachable!("handled by dispatch"),
+            Action::RequestNewSession | Action::ClearAndImplement(_) => {
+                unreachable!("handled by dispatch")
+            }
             Action::FocusSession(id) => {
                 if let Err(error) = self.focus_session(id) {
                     self.sessions[idx].app.flash(error);
@@ -4164,7 +4209,7 @@ impl<'t> EventLoop<'t> {
             );
             return;
         }
-        let profile = match self.ctx.prompt_profiles.resolve(Some(name)) {
+        let profile = match self.ctx.resolve_bound_profile(Some(name)) {
             Ok(profile) => profile,
             Err(error) => {
                 self.sessions[idx].app.flash(error.to_string());
@@ -4179,6 +4224,7 @@ impl<'t> EventLoop<'t> {
             .unwrap_or_default();
         self.sessions[idx].app.state.system_prompt_profile_name = name.to_owned();
         self.sessions[idx].app.state.system_prompt_profile = profile;
+        self.sessions[idx].app.invalidate_permission_authority();
         self.sessions[idx].app.checkpoint_now();
         self.sessions[idx]
             .app
@@ -4483,20 +4529,200 @@ fn background_flash(title: &str, previous: SessionStatus, status: SessionStatus)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::tests::test_app;
+    use crate::app::tests::{plan_app, private_tempdir, test_app};
+    use crate::app::{Mode, PlanState};
     use crate::components::docs_modal::fixture as docs_fixture;
     use crate::components::{key, test_model};
     use crate::sandbox::transfer::{TransferCommand, TransferLink, TransferScope};
     use caudra_agent::background::BackgroundTasks;
-    use caudra_agent::{DoneReason, McpSnapshotReader};
+    use caudra_agent::{AgentMode, DoneReason, McpSnapshotReader};
     use caudra_config::sandbox::Revision;
     use caudra_config::{FeatureFlags, PermissionsConfig};
+    use caudra_providers::provider::BoxFuture;
+    use caudra_providers::{
+        AgentError, CacheKey, ModelInfo, ProviderEvent, RequestOptions, StreamResponse,
+    };
     use caudra_providers::{ImageMediaType, ImageSource, TokenUsage};
     use caudra_storage::sessions::PendingConversationRevert;
     use caudra_workspace::WorkspacePath;
     use crossterm::event::KeyCode;
     use tempfile::TempDir;
     use test_case::test_case;
+
+    const MISSING_PLAN_PROFILE: &str = "missing-plan-handoff-profile";
+    const PLAN_TRANSACTION_BLOCKED: &str = "plan handoff did not fail at its admission boundary";
+
+    struct PlanProvider;
+
+    impl Provider for PlanProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _model: &'a Model,
+            _messages: &'a [Message],
+            _system: &'a str,
+            _tools: &'a serde_json::Value,
+            _event_tx: &'a flume::Sender<ProviderEvent>,
+            _opts: RequestOptions,
+            _cache_key: Option<&'a CacheKey>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async { Err(AgentError::Channel) })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    fn plan_spawn_context(source: &mut App) -> SpawnCtx {
+        let path = Path::new(&source.state.session.cwd).join(source.state.plan.path().unwrap());
+        source.state.plan = PlanState::Ready(path);
+        source.state.session_mut().cwd = std::env::current_dir().unwrap().to_str().unwrap().into();
+        SpawnCtx {
+            peer_host: None,
+            storage: source.storage.clone(),
+            background_enabled: false,
+            config: AgentConfig {
+                features: FeatureFlags::NONE,
+                ..Default::default()
+            },
+            ui_config: UiConfig::default(),
+            snapshots: SnapshotsConfig::default(),
+            change_factory: None,
+            allow_workspace_recovery: false,
+            input_history_size: RELOCATION_INPUT_HISTORY,
+            max_log_files: caudra_storage::log::DEFAULT_MAX_FILES,
+            docs: docs_fixture::library,
+            permissions: Arc::clone(&source.permissions),
+            pattern_suggestion_loader: None,
+            permission_authority_factory: None,
+            sandbox_connector: None,
+            transfer_connector: None,
+            sandbox_readiness: None,
+            sandbox_name: None,
+            network_gate: Arc::default(),
+            timeouts: Timeouts::default(),
+            custom_commands: Arc::from([]),
+            no_commands: true,
+            lua_command_reader: LuaCommandReader::empty(),
+            keymap_reader: KeymapReader::empty(),
+            hint_reader: HintReader::empty(),
+            lua_event_handle: EventHandle::disconnected_for_test(),
+            mcp_handle: None,
+            mcp_config_errors: McpConfigErrors::new(PathBuf::new()),
+            model_slot: Arc::new(ArcSwap::from_pointee(ModelSlot {
+                model: test_model(),
+                provider: Arc::new(PlanProvider),
+            })),
+            available_models: Arc::new(ArcSwapOption::empty()),
+            storage_writer: Arc::new(StorageWriter::new(
+                source.storage.clone(),
+                flume::unbounded().0,
+            )),
+            model_policy: Arc::default(),
+            prompt_profiles: Arc::default(),
+            default_prompt_profile: None,
+            prompt_profile_override: None,
+            live_sessions: Arc::default(),
+            workspace_session: None,
+            host_cwd: None,
+            local_documents: None,
+        }
+    }
+
+    fn captured_plan_action(source: &mut App) -> PlanHandoff {
+        source.update(Msg::Key(key(KeyCode::Down)));
+        let action = source.update(Msg::Key(key(KeyCode::Enter))).pop().unwrap();
+        let Action::ClearAndImplement(handoff) = action else {
+            panic!("expected captured plan handoff");
+        };
+        *handoff
+    }
+
+    #[test_case(true, false; "reservation")]
+    #[test_case(false, false; "spawn_profile_resolution")]
+    #[test_case(false, true; "new_session_run_admission")]
+    fn failed_plan_runtime_admission_preserves_source(reservation: bool, admission: bool) {
+        let mut source = plan_app();
+        let mut ctx = plan_spawn_context(&mut source);
+        let plan = source.state.plan.clone();
+        let id = source.state.session.id;
+        let run = source.run_id;
+        let _handoff = captured_plan_action(&mut source);
+        let temp = private_tempdir();
+        let blocked = temp.path().join("not-a-directory");
+        fs::write(&blocked, b"blocked").unwrap();
+        if reservation {
+            ctx.storage = StateDir::from_path(blocked);
+        } else if admission {
+            ctx.storage_writer = Arc::new(StorageWriter::new(
+                StateDir::from_path(blocked),
+                flume::unbounded().0,
+            ));
+        } else {
+            ctx.prompt_profile_override = Some(MISSING_PLAN_PROFILE.into());
+        }
+        let error = ctx
+            .spawn_plan_runtime(&source)
+            .err()
+            .expect(PLAN_TRANSACTION_BLOCKED);
+        if reservation {
+            assert!(error.starts_with("Failed to reserve new session:"));
+        } else if !admission {
+            assert!(error.contains(MISSING_PLAN_PROFILE));
+        }
+        assert_eq!(source.state.session.id, id);
+        assert_eq!(source.state.plan, plan);
+        assert_eq!(source.state.mode, Mode::Plan);
+        assert_eq!(source.run_id, run);
+        assert_eq!(source.status, Status::Streaming);
+        assert!(source.plan_form.is_visible());
+    }
+
+    #[test_case(false; "idle_same_app")]
+    #[test_case(true; "working_new_runtime")]
+    fn admitted_plan_handoff_starts_only_the_destination(working: bool) {
+        let mut source = plan_app();
+        let ctx = plan_spawn_context(&mut source);
+        source.status = if working {
+            Status::Streaming
+        } else {
+            Status::Idle
+        };
+        let source_id = source.state.session.id;
+        let source_run = source.run_id;
+        let handoff = captured_plan_action(&mut source);
+        let expected = handoff.input.message.clone();
+        let mut runtime = if working {
+            Some(ctx.spawn_plan_runtime(&source).unwrap())
+        } else {
+            None
+        };
+        let target = if let Some(runtime) = &mut runtime {
+            assert_eq!(source.run_id, source_run);
+            assert_eq!(runtime.app.status, Status::Idle);
+            source.consume_plan();
+            &mut runtime.app
+        } else {
+            let actions = source.reset_session_for_plan().unwrap();
+            assert!(matches!(&actions[..], [Action::NewSession(_)]));
+            assert_eq!(source.status, Status::Idle);
+            assert_eq!(source.run_id, source_run);
+            &mut source
+        };
+        let run = target.run_id;
+        let actions = target.finish_plan_handoff(handoff);
+        assert_ne!(target.state.session.id, source_id);
+        assert_eq!(target.run_id, run + 1);
+        assert_eq!(target.status, Status::Streaming);
+        assert_eq!(target.state.mode, Mode::Build);
+        assert!(
+            matches!(&actions[..], [Action::SendMessage(input)] if input.message == expected && input.mode == AgentMode::Build)
+        );
+        assert!(!target.plan_form.is_visible());
+        if let Some(runtime) = runtime {
+            runtime.handles.cancel();
+        }
+    }
 
     #[test]
     fn settled_transfer_reservations_release_before_queued_compare() {

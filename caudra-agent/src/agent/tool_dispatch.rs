@@ -25,8 +25,8 @@ use crate::tools::registry::{
 };
 use crate::tools::{
     DOOM_LOOP_GUIDANCE, LocalToolEntry, LockKey, PLAN_WRITE_RESTRICTED, READ_ONLY_CALL_GUIDANCE,
-    READ_ONLY_TOOL_RESTRICTED, TOOL_SEARCH_TOOL_NAME, ToolContext, ToolEffect, ToolError,
-    ToolExecResult, ToolFailure, ToolSource,
+    READ_ONLY_TOOL_RESTRICTED, TOOL_SEARCH_TOOL_NAME, ToolAudience, ToolContext, ToolEffect,
+    ToolError, ToolExecResult, ToolFailure, ToolFilter, ToolSource,
 };
 use crate::{
     AgentError, AgentEvent, AgentMode, LuaToolProvenance, ToolAccounting, ToolDoneEvent,
@@ -447,6 +447,23 @@ pub async fn run(
     ctx: &ToolContext,
     mut emit: Emit<'_>,
 ) -> ToolDoneEvent {
+    let filtered_mcp = mcp.cloned().map(|mcp| {
+        let ceiling = if ctx.policy().is_read_only() || ctx.mode.is_planning() {
+            ToolFilter::ReadOnly(Box::new(ToolFilter::All))
+        } else {
+            ToolFilter::All
+        };
+        mcp.with_actor_policy(Arc::clone(&ctx.profile_tool_policy))
+            .narrowed(&ceiling)
+    });
+    let mcp = filtered_mcp.as_ref();
+    let mut policy_ctx = ctx.clone();
+    policy_ctx.mcp = filtered_mcp.clone();
+    policy_ctx.deferral = ctx.deferral.as_ref().map(|deferral| {
+        deferral
+            .filtered(|name| crate::tools::profile_policy::tool_available(registry, mcp, ctx, name))
+    });
+    let ctx = &policy_ctx;
     let mut observed_ctx;
     let ctx = if ctx
         .steering_observations
@@ -468,8 +485,9 @@ pub async fn run(
     let entry = registry.get(canonical);
     let local = ctx.local_tools.get(canonical);
     let mcp_name = crate::mcp::internal_tool_name(canonical);
+    let available = available_for_dispatch(registry, mcp, canonical, ctx);
     let eligible = ctx.config.tool_json_repair
-        && ctx.tool_filter.matches(canonical)
+        && available
         && (entry
             .as_ref()
             .is_some_and(|entry| entry.tool.audience().contains(ctx.audience))
@@ -489,7 +507,8 @@ pub async fn run(
     } else {
         None
     };
-    let refusal = if canonical == crate::tools::BATCH_TOOL_NAME
+    let refusal = if available
+        && canonical == crate::tools::BATCH_TOOL_NAME
         && local.is_none()
         && invalid.is_some()
         && let Some(runs) = &ctx.speculative
@@ -506,6 +525,21 @@ pub async fn run(
         None
     };
     let dispatched = match refusal {
+        _ if !available => {
+            let message = if ctx.policy().is_read_only()
+                && (local.is_some_and(|entry| !entry.effect.is_safe_in_read_only())
+                    || entry
+                        .as_ref()
+                        .is_some_and(|entry| !entry.is_visible_in_read_only()))
+            {
+                format!("{READ_ONLY_TOOL_RESTRICTED}: {canonical}")
+            } else {
+                format!("tool {canonical} {TOOL_DISABLED_SUFFIX}")
+            };
+            let mut done = ToolDoneEvent::error(id, message).with_failure(ToolFailure::Denied);
+            done.tool = Arc::from(canonical);
+            done.into()
+        }
         Some(message) => ToolDoneEvent::error(id, message)
             .with_failure(ToolFailure::InvalidInput)
             .into(),
@@ -619,6 +653,9 @@ pub(crate) fn repair_schema(
     name: &str,
     ctx: &ToolContext,
 ) -> Option<Value> {
+    if !available_for_dispatch(registry, mcp, name, ctx) {
+        return None;
+    }
     if ctx.local_tools.contains_key(name) {
         return ctx.json_repair.schema(name);
     }
@@ -724,7 +761,10 @@ async fn run_inner(
 
     // Before the read-only gate: a tool the config turned off should say so
     // even when the mode would have refused it for another reason.
-    if entry.is_none() && local.is_none() && mcp.is_some_and(|mcp| mcp.is_disabled(mcp_lookup)) {
+    if entry.is_none()
+        && local.is_none()
+        && mcp.is_some_and(|mcp| mcp.has_tool(mcp_lookup) && mcp.is_disabled(mcp_lookup))
+    {
         return done_error(
             ToolFailure::Denied,
             format!("tool {mcp_lookup} {TOOL_DISABLED_SUFFIX}"),
@@ -738,8 +778,8 @@ async fn run_inner(
             (Some(local), _) => local.effect.is_safe_in_read_only(),
             (None, Some(_)) => true,
             (None, None) => {
-                !(name == TOOL_SEARCH_TOOL_NAME && searchable(mcp, ctx))
-                    && !mcp.is_some_and(|mcp| mcp.has_tool(mcp_lookup))
+                name == TOOL_SEARCH_TOOL_NAME && searchable(mcp, ctx)
+                    || !mcp.is_some_and(|mcp| mcp.has_tool(mcp_lookup))
             }
         };
         if !allowed {
@@ -751,13 +791,16 @@ async fn run_inner(
         }
     }
 
-    if (local.is_some() || entry.is_some()) && !ctx.tool_filter.matches(name) {
+    if !available_for_dispatch(registry, mcp, name, ctx) {
         return done_error(
             ToolFailure::Denied,
             format!("tool {name} {TOOL_DISABLED_SUFFIX}"),
         );
     }
     if let Some(local) = local {
+        if let Some(deferral) = &ctx.deferral {
+            announce_loads(ctx, deferral.mark_loaded(name));
+        }
         return run_local_tool(local, id, name, input, ctx, emit)
             .await
             .into();
@@ -891,9 +934,14 @@ async fn run_inner(
             }
 
             let mutation_targets = invocation.mutation_targets(ctx);
+            let active_plan_write = invocation.writes_active_plan()
+                && matches!(entry.source, ToolSource::Native { trusted: true, .. })
+                && ctx.mode.is_planning()
+                && ctx.audience == ToolAudience::MAIN;
             let remote_plan_target = ctx.mode.plan_ref().is_some_and(|expected| {
-                invocation.local_document_target()
-                    == Some(&caudra_workspace::LocalDocumentRef::Plan(expected.clone()))
+                active_plan_write
+                    || invocation.local_document_target()
+                        == Some(&caudra_workspace::LocalDocumentRef::Plan(expected.clone()))
             });
             if ctx.mode.plan_ref().is_some()
                 && !call_effect.is_safe_in_read_only()
@@ -922,10 +970,11 @@ async fn run_inner(
             }
 
             for target in &mutation_targets {
-                let is_plan_target = ctx
-                    .mode
-                    .plan_path()
-                    .is_some_and(|plan_path| target == plan_path);
+                let is_plan_target = active_plan_write
+                    || ctx
+                        .mode
+                        .plan_path()
+                        .is_some_and(|plan_path| target == plan_path);
                 if !is_plan_target {
                     if planning {
                         warn!(
@@ -943,7 +992,7 @@ async fn run_inner(
                 }
             }
 
-            if !remote_plan_target
+            if (!remote_plan_target || active_plan_write)
                 && let Err(refusal) = enforce_permission(
                     invocation.as_ref(),
                     prepared_intent.as_ref(),
@@ -1423,8 +1472,33 @@ fn announce_loads(ctx: &ToolContext, loaded: Vec<Arc<str>>) {
 /// Whether anything is deferred at all. The search tool is declared only when
 /// it has something to find, so being asked for it otherwise is an unknown
 /// tool rather than an empty answer.
+fn available_for_dispatch(
+    registry: &ToolRegistry,
+    mcp: Option<&McpSession>,
+    name: &str,
+    ctx: &ToolContext,
+) -> bool {
+    if !ctx.local_tools.contains_key(name) && !registry.has(name) {
+        if name == TOOL_SEARCH_TOOL_NAME {
+            return true;
+        }
+        if !mcp.is_some_and(|mcp| mcp.has_tool(&crate::mcp::internal_tool_name(name))) {
+            return true;
+        }
+    }
+    crate::tools::profile_policy::tool_available(registry, mcp, ctx, name)
+}
+
 fn searchable(mcp: Option<&McpSession>, ctx: &ToolContext) -> bool {
-    mcp.is_some() || ctx.deferral.as_ref().is_some_and(|d| !d.is_empty())
+    mcp.is_some_and(|mcp| {
+        mcp.request_snapshot()
+            .tool_inventory()
+            .iter()
+            .any(|tool| tool.deferred)
+    }) || ctx
+        .deferral
+        .as_ref()
+        .is_some_and(|d| !d.request_snapshot().pending_names().is_empty())
 }
 
 /// One search over both catalogs: the model is offered one tool, so it must
@@ -1652,6 +1726,15 @@ async fn enforce_permission(
         }
     };
     if let Some(intent) = intent {
+        if inv.writes_active_plan()
+            && matches!(entry.source, ToolSource::Native { trusted: true, .. })
+        {
+            return ctx
+                .permissions
+                .enforce_active_plan(intent, input, ctx, id, identity)
+                .await
+                .map_err(|error| permission_refusal(ctx, &error));
+        }
         ctx.permissions
             .enforce_with_intent(
                 &tool_key,
@@ -2110,7 +2193,7 @@ mod tests {
     use crate::tools::BATCH_TOOL_NAME;
     use crate::tools::native::batch::BatchTool;
     use crate::tools::registry::{PermissionIntent, ToolSource};
-    use crate::tools::test_support::{GUARDED_TOOL_NAME, GuardedMock};
+    use crate::tools::test_support::{GUARDED_TOOL_NAME, GuardedMock, NamedMock};
     use crate::{AgentMode, Envelope, EventSender, ShellOutput, StoredSession, TaskCard};
 
     const OBSERVED_TOOL: &str = "observed";
@@ -2119,6 +2202,7 @@ mod tests {
     const PATH_CWD: &str = "/home/ubuntu/workspace/caudra";
     const READ_TOOL: &str = "file_read";
     const PATCH_TOOL: &str = "file_apply_patch";
+    const FETCH_ISSUE: &str = "fetch_issue";
     const REPEAT_GUIDANCE: &str = "Inspect the previous result before choosing another tool.";
     const MODEL_REPEAT_GUIDANCE: &str = "Use a different query for this model.";
     const REPEAT_TWO_PREFIX: &str =
@@ -4538,12 +4622,19 @@ mod tests {
 
         smol::block_on(async {
             let mut ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            ctx.registry
+                .register_audited(
+                    Arc::new(NamedMock::new(FETCH_ISSUE, ToolAudience::all())),
+                    NamedMock::source(),
+                    ToolEffect::ReadOnly,
+                )
+                .unwrap();
             ctx.deferral = Some(DeferralSession::new(
                 vec![DeferredTool::new(
-                    "fetch_issue",
+                    FETCH_ISSUE,
                     None,
                     serde_json::json!({
-                        "name": "fetch_issue", "description": "Fetch an issue", "input_schema": {"type": "object"}
+                        "name": FETCH_ISSUE, "description": "Fetch an issue", "input_schema": {"type": "object"}
                     }),
                 )],
                 std::iter::empty(),

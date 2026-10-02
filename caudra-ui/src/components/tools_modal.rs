@@ -438,7 +438,7 @@ fn mcp_lines(snapshot: &ContextSnapshot, theme: &Theme) -> Vec<Line<'static>> {
             ContextMcpStatus::AvailableOnDemand => (DEFERRED_GLYPH, "lazy", theme.tool_dim),
             ContextMcpStatus::Disabled => (DISABLED_GLYPH, "off", theme.error),
         };
-        lines.push(Line::from(vec![
+        let mut spans = vec![
             Span::styled(format!("{glyph} "), style),
             Span::styled(
                 escape_terminal_controls(&tool.qualified_name),
@@ -450,7 +450,14 @@ fn mcp_lines(snapshot: &ContextSnapshot, theme: &Theme) -> Vec<Line<'static>> {
                 format!(" \u{b7} {}", escape_terminal_controls(&tool.server)),
                 theme.status_dim,
             ),
-        ]));
+        ];
+        if let Some(reason) = tool.reason {
+            spans.push(Span::styled(
+                format!(" · {}", escape_terminal_controls(reason)),
+                theme.status_dim,
+            ));
+        }
+        lines.push(Line::from(spans));
     }
     lines
 }
@@ -662,10 +669,12 @@ mod tests {
         ContextBuiltinInventory, ContextInventory, ContextMcpInventory, ContextMcpTool,
         ContextModel, ContextReadiness, ContextReserve, ContextUsage, ContextWindow,
     };
+    use caudra_agent::tools::profile_policy::PROFILE_LOADING;
 
     use caudra_storage::sessions::StoredToolUsage;
     use caudra_storage::tool_ledger::Latency;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use test_case::test_case;
 
     use super::{
         CATALOG_SOURCE, COUNT_COL, ContextBuiltinState, ContextBuiltinTool, ContextMcpStatus,
@@ -770,18 +779,23 @@ mod tests {
         }
     }
 
-    #[test]
-    fn an_mcp_tool_reports_its_server_and_state() {
+    #[test_case(None; "legacy")]
+    #[test_case(Some(PROFILE_LOADING); "profile_reason")]
+    fn an_mcp_tool_reports_its_server_and_state(reason: Option<&'static str>) {
         let out = rendered(Some(&snapshot(vec![ContextMcpTool {
             qualified_name: "issues.fetch".to_owned(),
             wire_name: "mcp_issues_fetch".to_owned(),
             server: "issues".to_owned(),
             status: ContextMcpStatus::AvailableOnDemand,
             request_tokens: 0,
+            reason,
         }])));
         assert!(out.contains("issues.fetch  lazy · "), "{out}");
         assert!(out.contains("· issues"), "{out}");
         assert!(!out.contains(NO_MCP), "{out}");
+        if let Some(reason) = reason {
+            assert!(out.contains(reason), "{out}");
+        }
     }
 
     /// `tool_search` has no registry row to inherit, so the report derives it

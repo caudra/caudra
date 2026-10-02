@@ -5,12 +5,13 @@ use crate::components::Status;
 use crate::components::status_bar::ModeLabel;
 use crate::theme;
 use caudra_agent::mentions;
+use caudra_agent::tools::native::plan::{PlanTarget, PlanWriteResult};
 use caudra_agent::{AgentInput, AgentMode, CommitRef, Mention, commits};
 use caudra_providers::ModelPurpose;
 use caudra_providers::model_registry;
 use caudra_storage::StateDir;
-use caudra_storage::local_documents::LocalDocumentStore;
-use caudra_storage::plans;
+use caudra_storage::local_documents::{DocumentRevision, LocalDocumentStore};
+use caudra_storage::plans::{self, PlanFile};
 use caudra_workspace::{LocalDocumentRef, PlanRef, WorkspaceSession};
 use ratatui::style::{Color, Modifier, Style};
 
@@ -26,6 +27,9 @@ const TO_PLAN_LABEL: &str = "[BUILD\u{2192}PLAN]";
 const TO_PLAN_SHORT_LABEL: &str = "[B\u{2192}P]";
 const TO_BUILD_LABEL: &str = "[PLAN\u{2192}BUILD]";
 const TO_BUILD_SHORT_LABEL: &str = "[P\u{2192}B]";
+const PLAN_NOT_ACTIVE: &str = "The ready plan is not the executing plan";
+const PLAN_EMPTY: &str = "The plan has not been written yet";
+const PLAN_STORE_UNAVAILABLE: &str = "The plan document store is unavailable";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
@@ -55,6 +59,12 @@ pub(crate) enum PlanState {
     Ready(PathBuf),
     RemoteDrafting(PlanRef),
     RemoteReady(PlanRef),
+}
+
+pub(super) struct PlanSnapshot {
+    pub content: String,
+    pub source: String,
+    pub revision: DocumentRevision,
 }
 
 impl PlanState {
@@ -122,6 +132,70 @@ impl PlanState {
 }
 
 impl App {
+    pub(super) fn accepts_plan_write(&self, written: &PlanWriteResult) -> bool {
+        if self.execution_agent_mode() != self.agent_mode_for(Mode::Plan) {
+            return false;
+        }
+        match written.target() {
+            PlanTarget::Local(path) => self.state.plan.path().is_some_and(|target| {
+                target == path || Path::new(&self.state.session.cwd).join(target) == *path
+            }),
+            PlanTarget::Remote(reference) => self.state.plan.reference() == Some(reference),
+        }
+    }
+
+    pub(super) fn capture_plan(&self) -> Result<PlanSnapshot, String> {
+        if !self.state.plan.is_ready()
+            || self.execution_agent_mode() != self.agent_mode_for(Mode::Plan)
+        {
+            return Err(PLAN_NOT_ACTIVE.into());
+        }
+        let snapshot = match &self.state.plan {
+            PlanState::Ready(path) => {
+                let path = Path::new(&self.state.session.cwd).join(path);
+                let (content, revision) = PlanFile::new(path.clone())
+                    .and_then(|plan| plan.read())
+                    .map_err(|error| error.to_string())?;
+                PlanSnapshot {
+                    content,
+                    source: path.display().to_string(),
+                    revision,
+                }
+            }
+            PlanState::RemoteReady(reference) => {
+                let (workspace, store) = self
+                    .workspace_session
+                    .as_ref()
+                    .zip(self.local_documents.as_ref())
+                    .ok_or_else(|| PLAN_STORE_UNAVAILABLE.to_owned())?;
+                store
+                    .validate_binding(workspace.binding())
+                    .map_err(|error| error.to_string())?;
+                let document = store
+                    .read(
+                        workspace.binding().project().key(),
+                        Some(&self.state.session.id.to_string()),
+                        &LocalDocumentRef::Plan(reference.clone()),
+                    )
+                    .map_err(|error| error.to_string())?;
+                PlanSnapshot {
+                    content: document.content,
+                    source: format!(
+                        "plan reference {} from session {}",
+                        reference.as_str(),
+                        self.state.session.id
+                    ),
+                    revision: document.revision,
+                }
+            }
+            _ => return Err(PLAN_NOT_ACTIVE.into()),
+        };
+        if snapshot.content.trim().is_empty() {
+            return Err(PLAN_EMPTY.into());
+        }
+        Ok(snapshot)
+    }
+
     pub(crate) fn transition_plan(&mut self, trigger: PlanTrigger) {
         match trigger {
             PlanTrigger::WriteDone => {
@@ -590,6 +664,10 @@ mod tests {
         assert_eq!(app.plan_form.is_visible(), execution == Mode::Plan);
         assert_eq!(app.state.mode, selected);
         assert_eq!(app.execution_agent_mode(), mode);
+        assert_eq!(
+            app.main_chat().last_message_is_plan(),
+            execution == Mode::Plan && !remote
+        );
         assert!(!app.plan_form_active());
         if execution == Mode::Plan {
             app.toggle_mode();
@@ -626,6 +704,7 @@ mod tests {
 
         assert_eq!(app.state.plan, selected_plan);
         assert!(!app.plan_form.is_visible());
+        assert!(!app.main_chat().last_message_is_plan());
 
         app.transition_plan(PlanTrigger::WriteDone);
 

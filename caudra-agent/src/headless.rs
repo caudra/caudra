@@ -62,7 +62,7 @@ use crate::peers::{PeerDescriptor, PeerHost};
 use crate::permissions::editor::{PermissionEditError, PermissionPublication};
 use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedSlots;
-use crate::prompt::profile::{BUILTIN_PROFILE_NAME, PromptProfileCatalog};
+use crate::prompt::profile::{BUILTIN_PROFILE_NAME, PromptProfileCatalog, SystemPromptProfile};
 use crate::template;
 use crate::tools::{
     BuiltinDeferral, DeferralSession, DeferredTool, DescriptionContext, FileReadTracker,
@@ -1178,6 +1178,8 @@ struct AgentSetup {
 }
 
 struct TaskDescriptionContext<'a> {
+    profile: Option<&'a SystemPromptProfile>,
+    mode: &'a AgentMode,
     prompt_profiles: &'a PromptProfileCatalog,
     chat_model: &'a Model,
     thinking: &'a crate::ThinkingConfig,
@@ -1219,13 +1221,13 @@ fn setup(
         task,
     );
 
+    let tool_filter = definitions.available_filter();
     AgentSetup {
         vars,
         instructions,
         tools: definitions.declared,
         deferred: definitions.deferred,
-        tool_filter: ToolFilter::from_config(config, model, excluded_tools)
-            .for_remote_workspace(remote_workspace),
+        tool_filter: tool_filter.for_remote_workspace(remote_workspace),
     }
 }
 
@@ -1292,7 +1294,7 @@ fn tool_definitions(
         audience: ToolAudience::MAIN,
         workflows_available,
     };
-    registry.definitions_split(
+    registry.definitions_split_with_policy(
         &vars,
         &ctx,
         model.supports_tool_examples(),
@@ -1300,6 +1302,11 @@ fn tool_definitions(
             &config.allowed_tools,
             BuiltinDeferral::resolve(config, model),
         ),
+        &task
+            .profile
+            .map(|profile| profile.tools().clone())
+            .unwrap_or_default(),
+        task.mode,
     )
 }
 
@@ -1310,6 +1317,7 @@ fn advertised_tool_names(
     tools: &Value,
     deferred: &[DeferredTool],
     mcp: Option<&McpSession>,
+    local_search_binding: bool,
 ) -> Vec<String> {
     let mut probe = tools.clone();
     let mut sections: Vec<String> = DeferralSession::new(deferred.to_vec(), std::iter::empty())
@@ -1320,11 +1328,32 @@ fn advertised_tool_names(
     if let Some(mcp) = mcp {
         sections.extend(mcp.request_snapshot().extend_declared(&mut probe));
     }
-    crate::tools::deferral::push_catalog(&mut probe, &sections);
+    crate::tools::deferral::push_unbound_catalog(
+        &mut probe,
+        &sections,
+        local_search_binding || ToolRegistry::global().has(crate::tools::TOOL_SEARCH_TOOL_NAME),
+    );
     extract_tool_names(&probe)
 }
 
 pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveStartError> {
+    let profile_tool_policy = Arc::new(
+        params
+            .system_prompt_profile
+            .as_ref()
+            .map(|profile| profile.tools().clone())
+            .unwrap_or_default(),
+    );
+    profile_tool_policy
+        .validate_bindings(
+            ToolRegistry::global()
+                .iter()
+                .iter()
+                .map(|entry| entry.name()),
+        )
+        .map_err(InteractiveStartError)?;
+    let tool_ceiling = ToolFilter::ceiling_from_config(&params.config, &params.excluded_tools)
+        .for_remote_workspace(params.workspace_session.is_some());
     let peer_host = if params.workspace_session.is_some() || params.host_cwd.is_some() {
         None
     } else {
@@ -1366,6 +1395,8 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
         &params.excluded_tools,
         false,
         TaskDescriptionContext {
+            profile: params.system_prompt_profile.as_deref(),
+            mode: &mode,
             prompt_profiles: &params.prompt_profiles,
             chat_model: &params.model,
             thinking: &params.thinking,
@@ -1414,11 +1445,12 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
         },
     );
 
-    let mcp = params
-        .mcp_handle
-        .clone()
-        .map(|h| McpSession::new(h, &[]).with_disabled_tools(&params.config.disabled_tools));
-    let tool_names = advertised_tool_names(&tools, &deferred, mcp.as_ref());
+    let mcp = params.mcp_handle.clone().map(|h| {
+        McpSession::new(h, &[])
+            .with_disabled_tools(&params.config.disabled_tools)
+            .with_actor_policy(Arc::clone(&profile_tool_policy))
+    });
+    let tool_names = advertised_tool_names(&tools, &deferred, mcp.as_ref(), false);
 
     let (raw_tx, event_rx) = flume::unbounded::<Envelope>();
 
@@ -1533,6 +1565,8 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
                     registry: Arc::clone(ToolRegistry::global_arc()),
                     audience: ToolAudience::MAIN,
                     tool_filter,
+                    tool_ceiling,
+                    profile_tool_policy,
                     model_policy: Arc::clone(&params.model_policy),
                     workflow: None,
                     background: None,
@@ -1987,6 +2021,21 @@ pub async fn prepare_interactive(
     mut params: InteractiveParams,
 ) -> Result<PreparedInteractive, InteractiveStartError> {
     params
+        .prompt_profiles
+        .resolve(params.system_prompt_profile_name.as_deref())
+        .map_err(|error| InteractiveStartError(error.to_string()))?;
+    if let Some(profile) = &params.system_prompt_profile {
+        profile
+            .tools()
+            .validate_bindings(
+                ToolRegistry::global()
+                    .iter()
+                    .iter()
+                    .map(|entry| entry.name()),
+            )
+            .map_err(InteractiveStartError)?;
+    }
+    params
         .excluded_tools
         .extend_from_slice(crate::tools::native::peers::TOOL_NAMES);
     if params.remote_environment.is_some() != params.workspace_session.is_some() {
@@ -2129,6 +2178,8 @@ async fn spawn_prepared_session(
         &params.excluded_tools,
         workflows_available,
         TaskDescriptionContext {
+            profile: params.system_prompt_profile.as_deref(),
+            mode: &AgentMode::Build,
             prompt_profiles: &params.prompt_profiles,
             chat_model: &model,
             thinking: &params.thinking,
@@ -2153,9 +2204,24 @@ async fn spawn_prepared_session(
 
     let initial_messages = history.as_slice();
     let mcp = params.mcp_handle.clone().map(|h| {
-        McpSession::new(h, initial_messages).with_disabled_tools(&params.config.disabled_tools)
+        McpSession::new(h, initial_messages)
+            .with_disabled_tools(&params.config.disabled_tools)
+            .with_actor_policy(Arc::new(
+                params
+                    .system_prompt_profile
+                    .as_ref()
+                    .map(|profile| profile.tools().clone())
+                    .unwrap_or_default(),
+            ))
     });
-    let tool_names = advertised_tool_names(&tools, &deferred, mcp.as_ref());
+    let tool_names = advertised_tool_names(
+        &tools,
+        &deferred,
+        mcp.as_ref(),
+        params
+            .local_tools
+            .contains_key(crate::tools::TOOL_SEARCH_TOOL_NAME),
+    );
 
     let session_ref = params.session_id.clone();
     let session_id = session_ref.id();
@@ -2273,6 +2339,15 @@ async fn spawn_prepared_session(
         registry: Arc::clone(ToolRegistry::global_arc()),
         audience: ToolAudience::MAIN,
         tool_filter: tool_filter.clone(),
+        tool_ceiling: ToolFilter::ceiling_from_config(&params.config, &params.excluded_tools)
+            .for_remote_workspace(params.workspace_session.is_some()),
+        profile_tool_policy: Arc::new(
+            params
+                .system_prompt_profile
+                .as_ref()
+                .map(|profile| profile.tools().clone())
+                .unwrap_or_default(),
+        ),
         model_policy: Arc::clone(&params.model_policy),
         workflow: None,
         background: background.clone(),
@@ -2885,10 +2960,6 @@ async fn spawn_prepared_session(
                         continue;
                     }
                 };
-                let turn_tool_filter =
-                    ToolFilter::from_config(&params.config, &turn_model, &params.excluded_tools)
-                        .for_remote_workspace(params.workspace_session.is_some());
-
                 let mut definitions = tool_definitions(
                     &vars,
                     &turn_model,
@@ -2897,6 +2968,8 @@ async fn spawn_prepared_session(
                     ToolRegistry::global(),
                     workflows_available,
                     TaskDescriptionContext {
+                        profile: params.system_prompt_profile.as_deref(),
+                        mode: &input.mode,
                         prompt_profiles: &params.prompt_profiles,
                         chat_model: &model,
                         thinking: &input.thinking,
@@ -2915,6 +2988,7 @@ async fn spawn_prepared_session(
                     background.is_some(),
                     background.is_some(),
                 );
+                let turn_tool_filter = definitions.available_filter().for_mode(&input.mode);
                 let execution_slots = crate::tools::execution::execution_slots(
                     &params.prompt_slots,
                     &params.config,
@@ -3313,6 +3387,7 @@ mod tests {
     const PERMISSION_REQUEST_ID: &str = "headless-permission";
     const PERMISSION_COMMAND: &str = "headless-permission-command";
     const PERMISSION_TOOL: &str = "bash";
+    const DEFERRED_MCP_TOOL: &str = "srv.fetch_issue";
     const PERMISSION_OPTION: &str = "allow_exact";
     const LOST_PERMISSION_ACK: &str = "permission committed but acknowledgment lost";
     const PLANNING_PROMPT: &str = "plan the migration";
@@ -4654,7 +4729,7 @@ mod tests {
             false => Vec::new(),
         };
 
-        let names = advertised_tool_names(&base, &deferred, session.as_ref());
+        let names = advertised_tool_names(&base, &deferred, session.as_ref(), false);
 
         assert_eq!(
             names,
@@ -4671,7 +4746,14 @@ mod tests {
     #[test]
     fn advertised_names_omit_the_search_tool_when_nothing_is_deferred() {
         let base = serde_json::json!([{"name": "read"}]);
-        assert_eq!(advertised_tool_names(&base, &[], None), vec!["read"]);
+        assert_eq!(advertised_tool_names(&base, &[], None, false), vec!["read"]);
+    }
+
+    #[test]
+    fn advertised_names_respect_hidden_local_search_binding() {
+        let base = serde_json::json!([]);
+        let session = crate::mcp::stub_session(&[(DEFERRED_MCP_TOOL, DEFERRED_MCP_TOOL)]);
+        assert!(advertised_tool_names(&base, &[], Some(&session), true).is_empty());
     }
 
     const WORKFLOW_NAME: &str = "echo";

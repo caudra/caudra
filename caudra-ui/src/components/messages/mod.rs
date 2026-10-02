@@ -2000,25 +2000,25 @@ impl MessagesPanel {
         self.sync_child_clocks(&id);
     }
 
-    pub fn batch_progress(&mut self, tool_id: &str, index: usize, entry: BatchToolEntry) {
+    pub fn batch_progress(&mut self, tool_id: &str, index: usize, entry: BatchToolEntry) -> bool {
         let Some(msg) = self
             .messages
             .iter_mut()
             .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
         else {
-            return;
+            return false;
         };
         if !Self::is_running(msg) {
-            return;
+            return false;
         }
         let Some(ToolOutput::Batch { entries, .. }) = msg.tool_output.as_deref() else {
-            return;
+            return false;
         };
         if index >= entries.len()
             || entries[index].status.is_terminal()
             || entry.status < entries[index].status
         {
-            return;
+            return false;
         }
         let terminal = entry.status.is_terminal();
         let mut entries = entries.clone();
@@ -2035,6 +2035,7 @@ impl MessagesPanel {
             self.forget_child_output(tool_id, index);
         }
         self.mark_card_dirty(tool_id);
+        true
     }
 
     pub(crate) fn task_card_update(&mut self, mut card: TaskCard) -> bool {

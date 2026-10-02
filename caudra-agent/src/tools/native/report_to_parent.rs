@@ -91,7 +91,7 @@ pub(crate) fn tool(reporter: TaskReporter) -> (Value, LocalToolFn) {
                 .map_err(ToolError::from)
         })
     });
-    (definition, handler)
+    (definition, handler.required_output())
 }
 
 fn invalid(message: &'static str) -> ToolError {

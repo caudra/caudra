@@ -18,7 +18,7 @@ use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use async_lock::{Mutex as AsyncMutex, Semaphore};
-use caudra_config::{ModelPolicy, ToolOutputLines};
+use caudra_config::{ModelPolicy, ProfileToolPolicy, ToolOutputLines};
 use caudra_providers::model::{Model, ModelPurpose};
 use caudra_providers::provider::Provider;
 use caudra_providers::{RequestOptions, Timeouts, ToolNameAliases};
@@ -539,7 +539,7 @@ fn structured_output_tool(
         });
     Ok((
         definition,
-        Arc::new([(STRUCTURED_OUTPUT_TOOL.to_owned(), handler)].into()),
+        Arc::new([(STRUCTURED_OUTPUT_TOOL.to_owned(), handler.required_output())].into()),
     ))
 }
 
@@ -618,6 +618,8 @@ pub struct WorkflowHostContext {
     pub user_response_rx: Option<Arc<AsyncMutex<flume::Receiver<String>>>>,
     pub audience: ToolAudience,
     pub tool_filter: ToolFilter,
+    pub tool_ceiling: ToolFilter,
+    pub profile_tool_policy: Arc<ProfileToolPolicy>,
     pub tool_name_aliases: Option<ToolNameAliases>,
 }
 
@@ -670,6 +672,8 @@ impl WorkflowHostContext {
             user_response_rx: extras.user_response_rx,
             audience: params.audience,
             tool_filter: params.tool_filter.clone(),
+            tool_ceiling: params.tool_ceiling.clone(),
+            profile_tool_policy: Arc::clone(&params.profile_tool_policy),
             tool_name_aliases: None,
         }
     }
@@ -710,6 +714,8 @@ impl WorkflowHostContext {
             user_response_rx: ctx.user_response_rx.clone(),
             audience: ctx.audience,
             tool_filter: ctx.tool_filter.clone(),
+            tool_ceiling: ctx.tool_ceiling.clone(),
+            profile_tool_policy: Arc::clone(&ctx.profile_tool_policy),
             tool_name_aliases: ctx.tool_name_aliases.clone(),
         }
     }
@@ -784,6 +790,8 @@ impl WorkflowHostContext {
             registry: Arc::clone(&self.registry),
             audience: self.audience,
             tool_filter: self.tool_filter.clone(),
+            tool_ceiling: self.tool_ceiling.clone(),
+            profile_tool_policy: Arc::clone(&self.profile_tool_policy),
             local_tools: LocalTools::default(),
             tool_name_aliases: self.tool_name_aliases.clone(),
             live_sink: None,

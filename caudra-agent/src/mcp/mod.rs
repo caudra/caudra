@@ -30,8 +30,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use crate::tools::ToolFilter;
 use arc_swap::{ArcSwap, Guard};
 use caudra_config::mcp::DEFAULT_DEFER_TOOLS;
+use caudra_config::{ProfileToolExposure, ProfileToolPolicy, ProfileToolSource};
 use caudra_providers::{ContentBlock, Message};
 use caudra_storage::StateDir;
 use caudra_storage::mcp_trust::{is_project_trusted, revoke_project_trust, trust_project};
@@ -51,6 +53,10 @@ use self::transport::McpTransport;
 use crate::decisions::{DecisionContext, Decisions};
 use crate::permissions::{PermissionSubject, canonical_json_sha256};
 use crate::tools::deferral::{SearchOutcome, ToolSearchRanking, rank_tool_search};
+use crate::tools::profile_policy::{
+    CEILING_DISABLED, MODE_DISABLED, PROFILE_DISABLED, PROFILE_LOADING,
+};
+use crate::tools::report::{REASON_CONFIG, REASON_PROFILE_LOADED};
 use crate::tools::schema::sanitize_tool_input_schema;
 
 const SEPARATOR: &str = ".";
@@ -307,6 +313,7 @@ pub struct McpToolStatus {
     pub server: String,
     pub disabled: bool,
     pub deferred: bool,
+    pub reason: Option<&'static str>,
 }
 
 /// Read-only view of the latest published `McpSnapshot`. Handing this out instead of the
@@ -383,6 +390,9 @@ pub struct McpSession {
     /// than in `ToolFilter` because MCP definitions are appended after the
     /// registry filter has already run.
     disabled: Arc<[String]>,
+    profile: Arc<ProfileToolPolicy>,
+    ceiling: ToolFilter,
+    inherited_profiles: Vec<Arc<ProfileToolPolicy>>,
 }
 
 /// Immutable MCP state used to assemble and account for one model request.
@@ -390,6 +400,9 @@ pub struct McpRequestSnapshot {
     index: Arc<ToolIndex>,
     loaded: HashSet<Arc<str>>,
     disabled: Arc<[String]>,
+    profile: Arc<ProfileToolPolicy>,
+    ceiling: ToolFilter,
+    inherited_profiles: Vec<Arc<ProfileToolPolicy>>,
     defer_tools: usize,
 }
 
@@ -438,6 +451,9 @@ impl McpSession {
             handle,
             loaded: Arc::new(Mutex::new(loaded)),
             disabled: Arc::from([]),
+            profile: Arc::default(),
+            ceiling: ToolFilter::All,
+            inherited_profiles: Vec::new(),
         }
     }
 
@@ -453,7 +469,38 @@ impl McpSession {
     }
 
     pub fn is_disabled(&self, qualified_name: &str) -> bool {
-        is_disabled(&self.disabled, qualified_name)
+        policy_disabled(&self.disabled, &self.profile, &self.ceiling, qualified_name)
+            || self.inherited_profiles.iter().any(|profile| {
+                profile.exposure(qualified_name, ProfileToolSource::Mcp)
+                    == Some(ProfileToolExposure::Disabled)
+            })
+    }
+
+    pub fn with_profile_policy(
+        mut self,
+        profile: Arc<ProfileToolPolicy>,
+        ceiling: ToolFilter,
+    ) -> Self {
+        self.profile = profile;
+        self.ceiling = ceiling;
+        self
+    }
+
+    pub fn with_actor_policy(mut self, profile: Arc<ProfileToolPolicy>) -> Self {
+        self.profile = profile;
+        self
+    }
+
+    pub fn narrowed(mut self, ceiling: &ToolFilter) -> Self {
+        self.ceiling = self.ceiling.intersect(ceiling);
+        self
+    }
+
+    pub fn freeze_actor_ceiling(mut self) -> Self {
+        if !self.profile.is_legacy() {
+            self.inherited_profiles.push(Arc::clone(&self.profile));
+        }
+        self
     }
 
     /// Captures the published tool generation while the session's loaded set is stable.
@@ -467,6 +514,9 @@ impl McpSession {
             loaded,
             disabled: Arc::clone(&self.disabled),
             defer_tools: self.handle.defer_tools,
+            profile: Arc::clone(&self.profile),
+            ceiling: self.ceiling.clone(),
+            inherited_profiles: self.inherited_profiles.clone(),
         }
     }
 
@@ -476,6 +526,9 @@ impl McpSession {
             handle: self.handle.clone(),
             loaded: Arc::new(Mutex::new(HashSet::new())),
             disabled: Arc::clone(&self.disabled),
+            profile: Arc::clone(&self.profile),
+            ceiling: self.ceiling.clone(),
+            inherited_profiles: self.inherited_profiles.clone(),
         }
     }
 
@@ -542,7 +595,10 @@ impl McpSession {
         let mut matches: Vec<(bool, usize, &ToolDescriptor)> = index
             .descriptors
             .iter()
-            .filter(|d| !d.always_load && !self.is_disabled(&d.qualified_name))
+            .filter(|d| {
+                !self.is_disabled(&d.qualified_name)
+                    && profile_lazy(&self.profile, d, !d.always_load)
+            })
             .filter_map(|d| {
                 let name = d.wire_name().to_lowercase();
                 let haystack = build_haystack(&d.definition);
@@ -646,7 +702,7 @@ impl McpSession {
     /// catalog name gets its full definition on the next request. `true` when
     /// that call is what declared it, so the change can be reported once.
     pub fn mark_loaded(&self, qualified_name: &str) -> bool {
-        self.lock_loaded().insert(Arc::from(qualified_name))
+        !self.is_disabled(qualified_name) && self.lock_loaded().insert(Arc::from(qualified_name))
     }
 
     fn lock_loaded(&self) -> std::sync::MutexGuard<'_, HashSet<Arc<str>>> {
@@ -656,7 +712,11 @@ impl McpSession {
 
 impl McpRequestSnapshot {
     fn is_disabled(&self, qualified_name: &str) -> bool {
-        is_disabled(&self.disabled, qualified_name)
+        policy_disabled(&self.disabled, &self.profile, &self.ceiling, qualified_name)
+            || self.inherited_profiles.iter().any(|profile| {
+                profile.exposure(qualified_name, ProfileToolSource::Mcp)
+                    == Some(ProfileToolExposure::Disabled)
+            })
     }
 
     fn deferring(&self) -> bool {
@@ -678,6 +738,28 @@ impl McpRequestSnapshot {
             .iter()
             .map(|descriptor| {
                 let disabled = self.is_disabled(&descriptor.qualified_name);
+                let loaded = self.loaded.contains(&descriptor.qualified_name);
+                let reason = if disabled {
+                    Some(if is_disabled(&self.disabled, &descriptor.qualified_name) {
+                        REASON_CONFIG
+                    } else if self.ceiling.is_read_only() {
+                        MODE_DISABLED
+                    } else if !self.ceiling.matches(&descriptor.qualified_name) {
+                        CEILING_DISABLED
+                    } else {
+                        PROFILE_DISABLED
+                    })
+                } else {
+                    self.profile
+                        .exposure(&descriptor.qualified_name, ProfileToolSource::Mcp)
+                        .map(|exposure| {
+                            if exposure == ProfileToolExposure::Lazy && loaded {
+                                REASON_PROFILE_LOADED
+                            } else {
+                                PROFILE_LOADING
+                            }
+                        })
+                };
                 let (server, _) = descriptor
                     .qualified_name
                     .split_once(SEPARATOR)
@@ -686,11 +768,15 @@ impl McpRequestSnapshot {
                     server: server.to_owned(),
                     wire_name: descriptor.wire_name().to_owned(),
                     deferred: !disabled
-                        && defer
-                        && !descriptor.always_load
-                        && !self.loaded.contains(&descriptor.qualified_name),
+                        && profile_lazy(
+                            &self.profile,
+                            descriptor,
+                            defer && !descriptor.always_load,
+                        )
+                        && !loaded,
                     qualified_name: descriptor.qualified_name.to_string(),
                     disabled,
+                    reason,
                 }
             })
             .collect()
@@ -732,7 +818,8 @@ impl McpRequestSnapshot {
             if existing.contains(descriptor.wire_name()) {
                 continue;
             }
-            if !defer || descriptor.always_load || self.loaded.contains(&descriptor.qualified_name)
+            if !profile_lazy(&self.profile, descriptor, defer && !descriptor.always_load)
+                || self.loaded.contains(&descriptor.qualified_name)
             {
                 arr.push(descriptor.definition.clone());
             } else {
@@ -741,6 +828,29 @@ impl McpRequestSnapshot {
         }
         (!deferred.is_empty()).then(|| catalog_section(&deferred))
     }
+}
+
+fn profile_lazy(
+    profile: &ProfileToolPolicy,
+    descriptor: &ToolDescriptor,
+    legacy_lazy: bool,
+) -> bool {
+    match profile.exposure(&descriptor.qualified_name, ProfileToolSource::Mcp) {
+        Some(exposure) => exposure == ProfileToolExposure::Lazy,
+        None => legacy_lazy,
+    }
+}
+
+fn policy_disabled(
+    patterns: &[String],
+    profile: &ProfileToolPolicy,
+    ceiling: &ToolFilter,
+    name: &str,
+) -> bool {
+    is_disabled(patterns, name)
+        || ceiling.is_read_only()
+        || !ceiling.matches(name)
+        || profile.exposure(name, ProfileToolSource::Mcp) == Some(ProfileToolExposure::Disabled)
 }
 
 fn is_disabled(patterns: &[String], qualified_name: &str) -> bool {
@@ -1863,6 +1973,7 @@ fn intern(name: String) -> Arc<str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AgentMode;
     use crate::tools::deferral::{
         TOOL_SEARCH_TOOL_NAME,
         tests::{PENDING_CHOICE, SearchDecisions},
@@ -1872,6 +1983,7 @@ mod tests {
     use caudra_providers::{Model, Role};
     use caudra_storage::sessions::SessionDatabase;
     use caudra_storage::state::project_scope;
+    use caudra_workspace::PlanRef;
     use config::{RawHttpFields, RawServerConfig, RawStdioFields, RawTransport};
     use futures_lite::future;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1949,6 +2061,8 @@ mod tests {
     const WIRE_TOOL_NAME: &str = "srv__tool";
     const BUILTIN_DEFERRED: &str = "code_map";
     const BUILTIN_DESCRIPTION: &str = "Rank every symbol in a source tree.";
+    const PLAN_PATH: &str = "/tmp/active-plan.md";
+    const PLAN_REFERENCE: &str = "plan_0123456789abcdef0123456789abcdef";
 
     /// Counts shutdowns, signals on `call_entered` the moment a `tools/call` begins, and holds
     /// the call inside `call_gate` until tests release it. That way tests can meet an in-flight
@@ -2679,6 +2793,137 @@ mod tests {
                 .map(|index| tool_def("srv", &format!("tool_{index}"), SEARCH_QUERY, json!({})))
                 .collect(),
         )])
+    }
+
+    #[test_case("eager", false; "explicit_eager")]
+    #[test_case("lazy", true; "explicit_lazy")]
+    fn profile_exposure_overrides_mcp_threshold(exposure: &str, deferred: bool) {
+        let mut session = stub_session(&[(REPLACEMENT_TOOL_NAME, REPLACEMENT_DESCRIPTION)]);
+        session.handle.defer_tools = if deferred { usize::MAX } else { 0 };
+        let profile =
+            Arc::new(serde_json::from_value(json!({"overrides":{"srv.*":exposure}})).unwrap());
+        let session = session.with_actor_policy(profile);
+        let inventory = session.request_snapshot().tool_inventory();
+        assert_eq!(inventory[0].deferred, deferred);
+        assert!(!inventory[0].disabled);
+        assert_eq!(inventory[0].reason, Some(PROFILE_LOADING));
+        let mut tools = json!([]);
+        session.request_snapshot().extend_tools(&mut tools);
+        assert_eq!(
+            tool_names(&tools).contains(&TOOL_SEARCH_TOOL_NAME),
+            deferred
+        );
+    }
+
+    #[test_case(AgentMode::Build, false; "build")]
+    #[test_case(AgentMode::ReadOnly, true; "read_only")]
+    #[test_case(AgentMode::Plan(PLAN_PATH.into()), true; "local_plan")]
+    #[test_case(AgentMode::RemotePlan(PlanRef::new(PLAN_REFERENCE).unwrap()), true; "remote_plan")]
+    fn prepared_mcp_mode_matches_live_schemas_and_inventory(mode: AgentMode, disabled: bool) {
+        for exposure in ["eager", "lazy"] {
+            for loaded in [false, true] {
+                let profile =
+                    Arc::new(serde_json::from_value(json!({"default": exposure})).unwrap());
+                let session = stub_session(&[(REPLACEMENT_TOOL_NAME, REPLACEMENT_DESCRIPTION)]);
+                if loaded {
+                    session.mark_loaded(REPLACEMENT_TOOL_NAME);
+                }
+                let prepared = session
+                    .clone()
+                    .with_profile_policy(Arc::clone(&profile), ToolFilter::All.for_mcp_mode(&mode));
+                let live = session
+                    .with_actor_policy(Arc::clone(&profile))
+                    .narrowed(&ToolFilter::All.for_mcp_mode(&mode));
+                let mut prepared_tools = json!([]);
+                let mut live_tools = json!([]);
+                prepared
+                    .request_snapshot()
+                    .extend_tools(&mut prepared_tools);
+                live.request_snapshot().extend_tools(&mut live_tools);
+                assert_eq!(prepared_tools, live_tools);
+                assert_eq!(tool_names(&prepared_tools).is_empty(), disabled);
+                assert_eq!(
+                    tool_names(&prepared_tools).contains(&TOOL_SEARCH_TOOL_NAME),
+                    !disabled && exposure == "lazy" && !loaded,
+                );
+                for candidate in [&prepared, &live] {
+                    let inventory = candidate.request_snapshot().tool_inventory();
+                    assert_eq!(inventory[0].disabled, disabled);
+                    if disabled {
+                        assert_eq!(inventory[0].reason, Some(MODE_DISABLED));
+                        assert!(!candidate.mark_loaded(REPLACEMENT_TOOL_NAME));
+                        assert!(
+                            candidate
+                                .search_tools("replacement")
+                                .unwrap()
+                                .loaded
+                                .is_empty()
+                        );
+                    }
+                }
+                let resumed = prepared
+                    .with_profile_policy(profile, ToolFilter::All.for_mcp_mode(&AgentMode::Build));
+                let mut resumed_tools = json!([]);
+                resumed.request_snapshot().extend_tools(&mut resumed_tools);
+                assert!(!tool_names(&resumed_tools).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn profile_lazy_overrides_mcp_always_load() {
+        let (_, session) = setup(vec![always_load_entry("eager", FakeTransport::new())]);
+        let profile = Arc::new(serde_json::from_value(json!({"default":"lazy"})).unwrap());
+        let session = session.with_actor_policy(profile);
+        assert!(session.request_snapshot().tool_inventory()[0].deferred);
+        assert!(!session.search_tools("tool").unwrap().loaded.is_empty());
+        let inventory = session.request_snapshot().tool_inventory();
+        assert!(!inventory[0].deferred);
+        assert_eq!(inventory[0].reason, Some(REASON_PROFILE_LOADED));
+    }
+
+    #[test]
+    fn profile_policy_survives_late_mcp_publication_and_history_loads() {
+        let (mut inner, session) = decision_search_session();
+        session.mark_loaded(REPLACEMENT_TOOL_NAME);
+        let profile =
+            Arc::new(serde_json::from_value(json!({"overrides":{"srv.*":"disabled"}})).unwrap());
+        let session = session.with_actor_policy(profile);
+        inner.entries[0].tools = vec![tool_def(
+            "srv",
+            "replacement",
+            REPLACEMENT_DESCRIPTION,
+            json!({}),
+        )];
+        publish(&inner, &session.handle.index, &session.handle.snapshot);
+        let mut tools = json!([]);
+        session.request_snapshot().extend_tools(&mut tools);
+        assert!(tool_names(&tools).is_empty());
+        assert!(!session.mark_loaded(REPLACEMENT_TOOL_NAME));
+        assert!(
+            session
+                .search_tools("replacement")
+                .unwrap()
+                .loaded
+                .is_empty()
+        );
+        assert!(session.request_snapshot().tool_inventory()[0].disabled);
+        assert_eq!(
+            session.request_snapshot().tool_inventory()[0].reason,
+            Some(PROFILE_DISABLED)
+        );
+    }
+
+    #[test]
+    fn generic_mcp_ceiling_cannot_be_replaced_by_worker_profile() {
+        let profile = Arc::new(serde_json::from_value(json!({"default":"disabled"})).unwrap());
+        let session = stub_session(&[(REPLACEMENT_TOOL_NAME, REPLACEMENT_DESCRIPTION)])
+            .with_actor_policy(profile)
+            .freeze_actor_ceiling()
+            .fresh()
+            .with_actor_policy(Arc::default());
+        assert!(session.is_disabled(REPLACEMENT_TOOL_NAME));
+        assert!(session.request_snapshot().tool_inventory()[0].disabled);
     }
 
     #[test]

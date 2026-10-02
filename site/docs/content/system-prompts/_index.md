@@ -7,7 +7,7 @@ group = "Guides"
 
 # System Prompt Profiles
 
-System prompt profiles change main and task prompts without copying Caudra's built-in prompts. Overlay profiles preserve current tool guidance, environment details, instruction files, plugin hints, and mode text.
+System prompt profiles change main and task prompts without copying Caudra's built-in prompts. They can also choose which tools are available and which schemas load on demand. Overlay profiles preserve current tool guidance, environment details, instruction files, plugin hints, and mode text.
 
 Profiles are Markdown files in the user config directory:
 
@@ -79,6 +79,117 @@ Each component directive may appear once. `{{caudra.default}}` cannot be combine
 
 Profile files must be valid UTF-8 and no larger than 64 KiB. Unknown frontmatter fields and unknown directives make the profile invalid.
 
+## Choose tool availability
+
+Add a `tools` block to either layout. It covers native tools, local and remote Workcell tools, MCP tools, Lua/plugin tools, and local callbacks. Omitting it, or writing `tools: {}`, preserves the existing loading behavior.
+
+```yaml
+tools:
+  default: inherit
+  groups:
+    files: disabled
+  overrides:
+    file_read: eager
+    "github.*": lazy
+    "github.delete_issue": disabled
+```
+
+| Field | Values | Default |
+| --- | --- | --- |
+| `tools.default` | `inherit`, `eager`, `lazy`, `disabled` | `inherit` |
+| `tools.groups` | Group name mapped to `eager`, `lazy`, or `disabled` | Empty |
+| `tools.overrides` | Tool selector mapped to `eager`, `lazy`, or `disabled` | Empty |
+
+An `eager` tool starts with its full schema in the request. A `lazy` tool is callable and searchable, but initially contributes only a catalog summary. Calling a lazy tool directly by its known name is valid and loads its schema. A `disabled` tool is absent from schemas and search, and calls are refused before argument repair, permission prompts, or execution.
+
+Loaded schemas remain session-local. Restored history and MCP reconnects cannot re-enable disabled tools.
+
+Resolution goes from the most specific rule to the least specific:
+
+1. Exact tool override.
+2. MCP `server.*` override.
+3. Built-in group.
+4. Profile default.
+5. Existing loading preferences when the default is `inherit`.
+
+Explicit `eager` and `lazy` settings override model-class deferral, `agent.defer_builtin_tools`, MCP thresholds and `always_load`, and the eager hint from `--allowed-tools`. Loading remains separate from [synchronous and background execution](/docs/sessions/#background-tasks).
+
+MCP selectors use canonical `server.tool` names, not provider wire aliases. Plugin and custom tools use their exact registered names. Unknown groups, invalid states, malformed selectors, duplicate keys, and reserved infrastructure selectors are errors. Bare custom names must resolve in the runtime registry before the profile can run. Qualified MCP selectors may precede a server connection, but an unavailable tool grants no access. Arbitrary globs, custom groups, and profile inheritance are unsupported.
+
+### Tool groups
+
+| Group | Members |
+| --- | --- |
+| `web` | `websearch`, `webfetch` |
+| `files` | `file_read`, `file_write`, `file_edit`, `file_apply_patch`, `file_glob`, `file_grep`, `file_index` |
+| `code_graph` | `code_map`, `code_context`, `code_refs`, `code_impact`, `code_expand` |
+| `execution` | `shell`, `python_execution`, `execution_environment` |
+| `delegation` | `task`, `task_control`, `workflow` |
+| `support` | `batch`, `question`, `todo_write`, `plan` |
+| `documents` | `local_document_read`, `local_document_write`, `local_document_apply_patch` |
+| `images` | `view_image`, `image_generate` |
+| `messaging` | `list_sessions`, `send_message` |
+
+Select `memory` and `skill` individually. Messaging is optional and separate from support and delegation. It still requires its experimental opt-in, an eligible main-session runtime, peer inbound controls, and outgoing permissions.
+
+Groups are authoring shortcuts. They do not guarantee that every member exists in a runtime or cause members to load together. The existing code-graph loading bundle remains, limited to its eligible lazy members. A custom tool using a built-in name does not acquire that built-in's group or infrastructure privileges.
+
+### Restrictions and infrastructure
+
+A profile cannot restore tools removed by global or CLI restrictions, disabled experimental features, model compatibility, execution policy, audience, or mode. A task in plan mode stays read-only. Permissions still authorize each call, and explicit denies remain effective.
+
+The trusted `tool_output` pager stays available for truncated results. Host-required task-report and structured-output sinks also remain where their protocol needs them. `tool_search` appears only while an eligible lazy catalog has pending tools. These are infrastructure exceptions, identified by their trusted bindings. `todo_write`, `question`, `batch`, `plan`, `memory`, `skill`, `task`, and `workflow` require normal opt-in under `default: disabled`.
+
+Tool availability is not a sandbox. Permitted shell commands, trusted plugins, and delegated tasks can perform broader work. Profiles do not isolate prompt history or sandbox plugin code.
+
+### Web researcher
+
+Save this as `system-prompts/researcher.md`:
+
+```markdown
+---
+description: Research online sources and report evidence
+tools:
+  default: disabled
+  groups:
+    web: eager
+    support: lazy
+  overrides:
+    todo_write: eager
+---
+Research the question using online sources. Cite evidence and distinguish uncertainty.
+```
+
+Remove `support` and the override for a web-only profile with just the required infrastructure.
+
+### Main-agent scheduler
+
+Save this as `system-prompts/scheduler.md`:
+
+```markdown
+---
+description: Coordinate specialists and track the plan
+tools:
+  default: disabled
+  groups:
+    delegation: eager
+    support: eager
+  overrides:
+    workflow: lazy
+    plan: lazy
+---
+Delegate research and implementation to appropriate task profiles.
+Coordinate results, maintain the todo list, and use the active plan document in plan mode.
+```
+
+This actor cannot call file, web, or shell tools directly. It can delegate to a task using `profile: researcher`, another coding profile, or `profile: builtin`. Each task resolves its own selected profile against the inherited CLI, config, mode, and security restrictions. The parent's profile-local mask is not inherited as a global restriction. Tool compatibility is recalculated for the worker's model. Omitting `profile` still selects the parent's profile, so an omitted profile keeps the scheduler's tool choices.
+
+This independence applies to Caudra's audited task delegation path, including workflow-created tasks and nested `task` calls. Ordinary Lua tool calls retain the current actor's policy. Generic/custom subagent APIs can only narrow their caller's effective access.
+
+The single [`plan` tool](/docs/tools/#plan) reads or replaces the main agent's active plan document through the same interface for local and remote workspaces. It has no model-supplied path, reference, or session selector. It is available only for the committed main-agent Plan invocation. Selecting Plan in the composer does not change the authority of running work. Saving cannot approve a plan or switch modes. Secure plan storage currently requires a Unix client, including for remote workspaces.
+
+Implement and Clear-and-Implement capture validated plan content and its revision before consuming the plan or clearing the session. The content is included in the model-visible Build request, so a scheduler does not need file access to receive it. If capture fails, the plan remains available and implementation does not start.
+
 ## Configure subagents
 
 A profile can select a model and thinking setting for subagents:
@@ -102,7 +213,7 @@ Caudra validates each profile against the effective subagent model. An explicit 
 
 The `task` tool accepts `profile` and `mode`. A new task inherits the parent profile when `profile` is omitted. Set `profile` to `builtin` to use Caudra's built-in task prompt.
 
-`mode` defaults to the caller's own mode and can never exceed it, so a task launched from build mode can build, and one launched from plan mode stays read-only. `plan` has a host-enforced read-only tool set with no `shell` and no file writes, so a task that must run a command needs `build`. A `build` request from a plan-mode caller runs as `plan` instead. Every result reports the mode the task ran as.
+`mode` defaults to the caller's own mode and can never exceed it, so a task launched from build mode can build, and one launched from plan mode stays read-only. `plan` has a host-enforced read-only tool set with no file writes. Eligible shell calls must pass the host's confined read-only checks. A task that needs mutating commands requires `build`. A `build` request from a plan-mode caller runs as `plan` instead. Every result reports the mode the task ran as. See [Read-only agents](/docs/permissions/#read-only-agents).
 
 Task profiles support overlay and custom layouts. For a custom task prompt, directives resolve to the matching research or general task component. `{{caudra.default}}` expands to the complete built-in task prompt. Caudra appends the system-reminder contract after the rendered profile, so custom layouts cannot remove it.
 
@@ -127,7 +238,11 @@ Override the default for one invocation:
 caudra --system-prompt-profile review
 caudra --system-prompt-profile review --print "Review this change"
 caudra --system-prompt-profile review prompt system
+caudra --system-prompt-profile researcher tools
+caudra --system-prompt-profile scheduler prompt --plan --tools
 ```
+
+`caudra tools` reports the initial eager, lazy, and disabled set. `caudra tools --schemas` and `caudra prompt --tools` show the initial request schemas, including one combined pending catalog when needed. They do not restore a session's previously loaded schemas. Use `/tools` for that session's current state.
 
 Inside the TUI, run `/system-prompt` to read the prompt the current session is sending. The modal shows the text the agent bound, so it matches what the provider received rather than a fresh assembly of it. Press `r` to swap between rendered markdown and the source, `y` to copy, and `p` to open the profile picker.
 
@@ -136,6 +251,8 @@ Drag the pointer to select a passage, and releasing the mouse button copies it w
 Line numbers count source lines in both views. A rendered row is numbered by the line it draws from, so a heading row and the code inside a fence point at the text you would find at that line in the profile file. A line too long for the modal is folded across several rows and numbered once, at its head.
 
 Switching a profile from that picker stores the selected name with the session. Profile content stays in the config directory, so edits apply when the session is resumed or Caudra is reloaded.
+
+A selected profile that is missing or invalid is rejected across the TUI, print/headless, SDK, and ACP. Caudra does not fall back to unrestricted built-in behavior. Select `builtin` explicitly to reset it.
 
 An explicit CLI profile takes precedence over the stored session profile and the configured default. It applies only to that invocation, so the picker cannot switch profiles until the next invocation.
 

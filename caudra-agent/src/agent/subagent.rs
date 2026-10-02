@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use async_lock::Mutex as AsyncMutex;
+use caudra_config::ProfileToolPolicy;
 use caudra_config::decisions::FeatureMode;
 use caudra_decision::{Answer, DecisionResponse, Question, QuestionSet, QuestionType};
 use serde_json::{Value as JsonValue, json};
@@ -696,6 +697,8 @@ impl Subagent {
 
 /// Everything both openers must decide before a [`Subagent`] can exist.
 struct Resolved {
+    tool_ceiling: ToolFilter,
+    profile_tool_policy: Arc<ProfileToolPolicy>,
     model: Model,
     provider: Arc<dyn provider::Provider>,
     system: String,
@@ -945,21 +948,44 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
         ),
     };
     let base_filter = ToolFilter::from_config(&ctx.config, &model, &[])
-        .intersect(&ctx.tool_filter)
+        .intersect(&ctx.tool_ceiling)
+        .for_remote_workspace(ctx.workspace_session.is_some())
         .for_mode(&mode);
+    let profile_tool_policy = Arc::new(
+        profile
+            .as_ref()
+            .map(|profile| profile.tools().clone())
+            .unwrap_or_default(),
+    );
+    profile_tool_policy.validate_bindings(
+        ctx.registry
+            .iter()
+            .iter()
+            .map(|entry| entry.name())
+            .chain(opts.local_tools.keys().map(String::as_str)),
+    )?;
+    let prompt_filter = ctx.registry.profile_filter(
+        &DescriptionContext {
+            filter: &base_filter,
+            audience,
+            workflows_available: false,
+        },
+        &profile_tool_policy,
+        &mode,
+    );
     let guidance = crate::prompt::execution_guidance(
         &ctx.config,
         false,
         ctx.job_scope().is_some(),
         false,
-        base_filter.matches(crate::tools::SHELL_TOOL_NAME)
+        prompt_filter.matches(crate::tools::SHELL_TOOL_NAME)
             && ctx.registry.get(crate::tools::SHELL_TOOL_NAME).is_some(),
     );
     let prompt_slots = ctx.prompt_slots.with_execution_guidance(&guidance);
     let mut assembled = crate::prompt::assemble_task_with_filter(
         prompt_id,
         &prompt_slots,
-        &base_filter,
+        &prompt_filter,
         &instructions,
         profile.as_deref(),
     );
@@ -970,7 +996,7 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
         assembled.push_str("\n\n");
         assembled.push_str(crate::tools::native::report_to_parent::CONTRACT);
     }
-    let mut definitions = ctx.registry.definitions_split(
+    let mut definitions = ctx.registry.definitions_split_with_policy(
         &vars,
         &DescriptionContext {
             filter: &base_filter,
@@ -982,6 +1008,8 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
             &ctx.config.allowed_tools,
             BuiltinDeferral::resolve(&ctx.config, &model),
         ),
+        &profile_tool_policy,
+        &mode,
     );
     crate::tools::execution::configure_tools(
         &mut definitions.declared,
@@ -990,11 +1018,13 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
         false,
         ctx.job_scope().is_some(),
     );
-    definitions
-        .declared
-        .as_array_mut()
-        .expect("definitions return an array")
-        .extend(opts.local_definitions);
+    crate::tools::profile_policy::append_local_definitions(
+        &mut definitions,
+        opts.local_definitions,
+        &opts.local_tools,
+        &base_filter,
+        &profile_tool_policy,
+    );
     let profile_name: Arc<str> = Arc::from(spec.profile_name.as_str());
     // The child's own model, which a profile's `subagent_model` can move away
     // from the parent's.
@@ -1004,6 +1034,8 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
         ctx,
         ids,
         Resolved {
+            tool_ceiling: ctx.tool_ceiling.clone().for_mode(&mode),
+            profile_tool_policy,
             model,
             provider,
             system: vars.apply(&assembled).into_owned(),
@@ -1053,13 +1085,29 @@ pub async fn open_generic(ctx: &ToolContext, opts: GenericOptions) -> Result<Sub
     let model_binding = opts.model_spec.map(Binding::Exact);
     let (model, provider) = resolve_provider(ctx, model_binding.as_ref()).await?;
     announce_model(ctx, &model);
+    let tool_ceiling = ToolFilter::Only(
+        ctx.registry
+            .iter()
+            .iter()
+            .map(|entry| entry.name().to_owned())
+            .chain(ctx.local_tools.keys().cloned())
+            .filter(|name| ctx.tool_available(name))
+            .collect(),
+    );
+    let mut inherited = ctx.clone();
+    inherited.mcp = inherited.mcp.map(|mcp| {
+        mcp.with_actor_policy(Arc::clone(&ctx.profile_tool_policy))
+            .freeze_actor_ceiling()
+    });
     build(
-        ctx,
+        &inherited,
         ids,
         Resolved {
             model,
             provider,
             system: opts.system,
+            tool_ceiling,
+            profile_tool_policy: Arc::clone(&ctx.profile_tool_policy),
             tools: opts.tools,
             deferred: Vec::new(),
             mode: AgentMode::Build,
@@ -1408,8 +1456,13 @@ fn build(
     )
     .including(resolved.deferred.iter().map(|tool| tool.name.to_string()))
     .intersect(&ToolFilter::from_config(&ctx.config, &resolved.model, &[]))
-    .intersect(&ctx.tool_filter)
-    .including(local_tools.keys().cloned())
+    .intersect(&resolved.tool_ceiling)
+    .including(
+        local_tools
+            .iter()
+            .filter(|(_, entry)| entry.is_required())
+            .map(|(name, _)| name.clone()),
+    )
     .for_mode(&resolved.mode);
 
     let (sub_tx, sub_rx) = flume::unbounded::<Envelope>();
@@ -1490,6 +1543,8 @@ fn build(
             registry: Arc::clone(&ctx.registry),
             audience: resolved.audience,
             tool_filter,
+            tool_ceiling: resolved.tool_ceiling,
+            profile_tool_policy: Arc::clone(&resolved.profile_tool_policy),
             model_policy: Arc::clone(&ctx.model_policy),
             workflow: None,
             background: None,
@@ -1517,7 +1572,10 @@ fn build(
             .mcp
             .as_ref()
             .filter(|_| resolved.mcp_enabled)
-            .map(McpSession::fresh),
+            .map(|mcp| {
+                mcp.fresh()
+                    .with_actor_policy(Arc::clone(&resolved.profile_tool_policy))
+            }),
         history,
         history_lease: Some(resolved.history_lease),
         sub_event_tx,
@@ -1578,6 +1636,7 @@ mod tests {
     use crate::tools::DEADLINE_EXCEEDED;
     use crate::tools::registry::Tool;
     use crate::tools::test_support::NamedMock;
+    use crate::tools::{ToolEffect, audited_local_tool};
     use crate::{CancelToken, ToolDoneEvent, TurnCompleteEvent};
     use caudra_config::{PermissionsConfig, ToolKey};
     use caudra_providers::{Billing, ContentBlock, Message, Role};
@@ -1594,6 +1653,8 @@ mod tests {
     const EFFECT_TEST_TIMEOUT: Duration = Duration::from_secs(10);
     const DUPLICATE_CALL_ERROR: &str = "duplicates call ID";
     const SUBAGENT_ROOT: &str = "/work/project";
+    const LOCAL_READER: &str = "local_reader";
+    const LOCAL_RESULT: &str = "local result";
 
     struct RevisionChangingProvider {
         permissions: Arc<PermissionManager>,
@@ -1978,6 +2039,70 @@ mod tests {
             mcp: Some(false),
             local_tools: LocalTools::default(),
         }
+    }
+
+    #[test_case(false, false, true; "independent_worker")]
+    #[test_case(true, false, false; "hard_ceiling")]
+    #[test_case(false, true, false; "generic_cannot_widen")]
+    fn profile_delegation_separates_actor_mask_from_ceiling(
+        blocked: bool,
+        generic: bool,
+        allowed: bool,
+    ) {
+        smol::block_on(async {
+            let mut ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            ctx.registry
+                .register_audited(
+                    Arc::new(NamedMock::new(DEFERRED_TOOL, ToolAudience::all())),
+                    NamedMock::source(),
+                    crate::tools::ToolEffect::ReadOnly,
+                )
+                .unwrap();
+            ctx.profile_tool_policy =
+                Arc::new(serde_json::from_value(json!({"default":"disabled"})).unwrap());
+            ctx.tool_filter = ToolFilter::Only(Vec::new());
+            if blocked {
+                ctx.tool_ceiling = ToolFilter::Only(Vec::new());
+            }
+            let mut child = if generic {
+                let mut options = generic_options();
+                options.tools = json!([{"name":DEFERRED_TOOL,"input_schema":{"type":"object"}}]);
+                open_generic(&ctx, options).await.unwrap()
+            } else {
+                open_task(&ctx, task_options(None)).await.unwrap()
+            };
+            assert_eq!(child.params.tool_filter.matches(DEFERRED_TOOL), allowed);
+            child.close();
+        });
+    }
+
+    #[test_case(false; "local_binding_available")]
+    #[test_case(true; "local_binding_ceiling")]
+    fn task_local_bindings_use_the_worker_ceiling(blocked: bool) {
+        smol::block_on(async {
+            let mut ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            ctx.profile_tool_policy =
+                Arc::new(serde_json::from_value(json!({"default":"disabled"})).unwrap());
+            ctx.tool_filter = ToolFilter::Only(Vec::new());
+            if blocked {
+                ctx.tool_ceiling = ToolFilter::Only(Vec::new());
+            }
+            let mut options = task_options(None);
+            options.local_definitions =
+                vec![json!({"name":LOCAL_READER,"input_schema":{"type":"object"}})];
+            options.local_tools = Arc::new(
+                [(
+                    LOCAL_READER.into(),
+                    audited_local_tool(ToolEffect::ReadOnly, |_, _| {
+                        Box::pin(async { Ok(LOCAL_RESULT.into()) })
+                    }),
+                )]
+                .into(),
+            );
+            let mut child = open_task(&ctx, options).await.unwrap();
+            assert_eq!(child.params.tool_filter.matches(LOCAL_READER), !blocked);
+            child.close();
+        });
     }
 
     #[test_case(false, false; "cancelled_without_database")]

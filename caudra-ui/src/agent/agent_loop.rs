@@ -31,7 +31,7 @@ use caudra_agent::{
     EventSender, GoalHandle, History, InstructionBaseline, Instructions, McpCommand, Nudge,
     PromptRole, SessionMailbox, SharedHistory, SubagentHistoryStore, ToolOutputLines,
 };
-use caudra_config::ModelPolicy;
+use caudra_config::{ModelPolicy, ProfileToolPolicy};
 use caudra_lua::EventHandle;
 use caudra_providers::{
     AgentError, CacheKey, HistoryItem, Message, Model, ModelPurpose, RequestOptions,
@@ -155,7 +155,17 @@ impl AgentLoop {
             .map(|history| history.as_slice())
             .unwrap_or_default();
         let mcp = mcp_handle.map(|h| {
-            McpSession::new(h, initial_messages).with_disabled_tools(&config.disabled_tools)
+            McpSession::new(h, initial_messages)
+                .with_disabled_tools(&config.disabled_tools)
+                .with_profile_policy(
+                    Arc::new(
+                        system_prompt_profile
+                            .as_ref()
+                            .map(|profile| profile.tools().clone())
+                            .unwrap_or_default(),
+                    ),
+                    ToolFilter::All.for_mcp_mode(&mode.load()),
+                )
         });
         let (history, history_restore_error) = match restored_history {
             Ok(history) => (
@@ -393,8 +403,7 @@ impl AgentLoop {
             &slot.model,
             &caudra_providers::ThinkingConfig::default(),
         );
-        let tool_filter = ToolFilter::from_config(&self.config, &slot.model, &[])
-            .for_remote_workspace(self.workspace_session.is_some());
+        let tool_filter = self.effective_tool_filter();
         self.context_system = self.build_system(
             &caudra_agent::prompt::ResolvedSlots::default(),
             &tool_filter,
@@ -533,9 +542,9 @@ impl AgentLoop {
                 self.instructions.drift(current, self.history.epoch())
             }
         };
+        self.mode.store(Arc::new(input.mode.clone()));
         self.rebuild_tools(&effective_slot.model, &selected_slot.model, &input.thinking);
         self.effective_model_slot.store(Arc::clone(&effective_slot));
-        self.mode.store(Arc::new(input.mode.clone()));
 
         if let Some(ref prompt_ref) = input.prompt {
             let Some(ref mcp) = self.mcp else {
@@ -573,8 +582,7 @@ impl AgentLoop {
             .lua_handle
             .collect_prompt_slots_async(&self.config)
             .await;
-        let tool_filter = ToolFilter::from_config(&self.config, &effective_slot.model, &[])
-            .for_remote_workspace(self.workspace_session.is_some());
+        let tool_filter = self.effective_tool_filter();
         let system = self.build_system(&prompt_slots, &tool_filter);
         self.context_system.clone_from(&system);
         self.context_options = opts.clone();
@@ -620,6 +628,9 @@ impl AgentLoop {
                 subagent_history: self.subagent_history.clone(),
                 registry: Arc::clone(caudra_agent::tools::ToolRegistry::global_arc()),
                 audience: ToolAudience::MAIN,
+                tool_ceiling: ToolFilter::ceiling_from_config(&self.config, &[])
+                    .for_remote_workspace(self.workspace_session.is_some()),
+                profile_tool_policy: Arc::new(self.profile_tool_policy()),
                 tool_filter,
                 model_policy: Arc::clone(&self.model_policy),
                 workflow: self.workflow.clone(),
@@ -683,6 +694,12 @@ impl AgentLoop {
         chat_model: &Model,
         thinking: &caudra_providers::ThinkingConfig,
     ) {
+        self.mcp = self.mcp.take().map(|mcp| {
+            mcp.with_profile_policy(
+                Arc::new(self.profile_tool_policy()),
+                ToolFilter::All.for_mcp_mode(&self.mode.load()),
+            )
+        });
         let definitions = self.build_tools(model, chat_model, thinking);
         self.tools = definitions.declared;
         self.deferred = definitions.deferred;
@@ -713,7 +730,7 @@ impl AgentLoop {
             audience: ToolAudience::MAIN,
             workflows_available: self.workflow.is_some(),
         };
-        let mut definitions = ToolRegistry::global().definitions_split(
+        let mut definitions = ToolRegistry::global().definitions_split_with_policy(
             &vars,
             &ctx,
             examples,
@@ -721,6 +738,8 @@ impl AgentLoop {
                 &self.config.allowed_tools,
                 BuiltinDeferral::resolve(&self.config, model),
             ),
+            &self.profile_tool_policy(),
+            &self.mode.load(),
         );
         configure_tools(
             &mut definitions.declared,
@@ -730,6 +749,26 @@ impl AgentLoop {
             self.background.is_some(),
         );
         definitions
+    }
+
+    fn profile_tool_policy(&self) -> ProfileToolPolicy {
+        self.system_prompt_profile
+            .as_ref()
+            .map(|profile| profile.tools().clone())
+            .unwrap_or_default()
+    }
+
+    fn effective_tool_filter(&self) -> ToolFilter {
+        ToolFilter::Only(
+            self.tools
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+                .chain(self.deferred.iter().map(|tool| tool.name.to_string()))
+                .collect(),
+        )
+        .for_mode(&self.mode.load())
     }
 
     async fn read_instructions(&mut self) -> Result<Instructions, AgentError> {
@@ -831,7 +870,11 @@ impl AgentLoop {
         if let Some(mcp) = mcp {
             sections.extend(mcp.extend_declared(&mut tools));
         }
-        deferral::push_catalog(&mut tools, &sections);
+        deferral::push_unbound_catalog(
+            &mut tools,
+            &sections,
+            ToolRegistry::global().has(deferral::TOOL_SEARCH_TOOL_NAME),
+        );
         tools
     }
 
@@ -914,8 +957,7 @@ impl AgentLoop {
             ),
             Some(&BuiltinToolsInput {
                 registry: ToolRegistry::global(),
-                filter: &ToolFilter::from_config(&self.config, &slot.model, &[])
-                    .for_remote_workspace(self.workspace_session.is_some()),
+                filter: &self.effective_tool_filter(),
                 config: &self.config,
                 model: &slot.model,
                 deferral: BuiltinDeferral::resolve(&self.config, &slot.model),
@@ -930,7 +972,8 @@ impl AgentLoop {
                 auto_compact: agent::auto_compact_enabled(),
                 compaction_buffer: self.config.compaction_buffer,
                 system: &self.context_system,
-                base_tools: &self.tools,
+                base_tools: &DeferralSession::new(self.deferred.clone(), std::iter::empty())
+                    .accounting_definitions(&self.tools),
                 full_tools: &tools,
                 projected_messages: messages.as_ref(),
                 // Published between runs, when nothing the provider billed

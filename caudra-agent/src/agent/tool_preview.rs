@@ -39,6 +39,7 @@ const PREVIEW_KEYS: &[(&str, &[&str])] = &[
     ("file_grep", &["pattern"]),
     ("shell", &["command"]),
     ("memory", &["command", "path"]),
+    ("plan", &["action"]),
     ("local_document_read", &["kind", "reference"]),
     ("local_document_write", &["kind", "reference"]),
     ("local_document_apply_patch", &["kind", "reference"]),
@@ -569,6 +570,9 @@ mod tests {
     #[test_case(MEMORY, r#"{"command": "write", "path": "a.md""#, Some("write a.md") ; "both_headline_arguments")]
     #[test_case(MEMORY, r#"{"path": "a.md", "command": "write""#, Some("write a.md") ; "joined_in_table_order_not_arrival_order")]
     #[test_case(MEMORY, r#"{"command": "list""#, Some("list") ; "one_of_two_arguments")]
+    #[test_case("plan", r#"{"action": "read"}"#, Some("read") ; "plan_read")]
+    #[test_case("plan", r##"{"action": "write", "content": "# Plan""##, Some("write") ; "plan_write")]
+    #[test_case("plan", r##"{"content": "# Plan", "action": "write"}"##, Some("write") ; "plan_content_before_action")]
     #[test_case("local_document_write", r#"{"kind": "plan", "reference": "abc""#, Some("plan abc") ; "a_document_is_named_by_kind_and_reference")]
     #[test_case("report_to_parent", r#"{"title": "Writer lock identified""#, Some("Writer lock identified") ; "report_title_streams")]
     #[test_case("report_to_parent", r#"{"message": "Detailed finding", "title": "Writer lock identified""#, Some("Writer lock identified") ; "report_title_wins_over_message")]

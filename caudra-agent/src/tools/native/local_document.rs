@@ -398,7 +398,11 @@ fn reference_label(reference: &LocalDocumentRef) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
+    #[cfg(unix)]
+    use std::fs::Permissions;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
 
     use caudra_config::FeatureFlags;
@@ -412,6 +416,7 @@ mod tests {
         WorkspaceSession,
     };
     use serde_json::json;
+    use tempfile::{Builder, TempDir};
     use test_case::test_case;
 
     use super::*;
@@ -427,12 +432,23 @@ mod tests {
     const RENDERED: &str = "the reader sees the document, the model sees the receipt";
     const HOST_PATH_NAMED: &str = "a remote note has no host path to report";
     const REMOTE_WRITE_FAILED: &str = "a remote note is written to the client's store";
+    #[cfg(unix)]
+    const DIRECTORY_MODE: u32 = 0o700;
+
+    pub(in crate::tools::native) fn tempdir() -> TempDir {
+        let mut builder = Builder::new();
+        #[cfg(unix)]
+        builder.permissions(Permissions::from_mode(DIRECTORY_MODE));
+        builder
+            .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
+            .unwrap()
+    }
 
     fn workspace() -> WorkspaceSession {
         workspace_for_principal("principal")
     }
 
-    fn workspace_for_principal(subject: &str) -> WorkspaceSession {
+    pub(in crate::tools::native) fn workspace_for_principal(subject: &str) -> WorkspaceSession {
         let authority = AuthorityIdentity::new(
             SourceTrustAnchor::new("test-source").expect("trust anchor"),
             "authority",
@@ -480,7 +496,7 @@ mod tests {
     }
 
     fn remote() -> Remote {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = tempdir();
         let workspace = workspace();
         let session_id = SessionRef::generate();
         let store = Arc::new(LocalDocumentStore::remote(
@@ -656,7 +672,7 @@ mod tests {
     #[test_case("memory"; "memory_list")]
     fn tools_reject_a_store_from_another_principal(tool: &str) {
         smol::block_on(async {
-            let root = tempfile::tempdir().expect("tempdir");
+            let root = tempdir();
             let owner = workspace();
             let store = Arc::new(LocalDocumentStore::remote(
                 StateDir::from_path(root.path().join("state")),
@@ -722,7 +738,7 @@ mod tests {
     #[test]
     fn a_memory_ref_cannot_be_written_as_the_remote_plan() {
         smol::block_on(async {
-            let root = tempfile::tempdir().expect("tempdir");
+            let root = tempdir();
             let workspace = workspace();
             let store = Arc::new(LocalDocumentStore::remote(
                 StateDir::from_path(root.path().join("state")),

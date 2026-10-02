@@ -216,7 +216,7 @@ version = 1
 # read = 3
 
 # Rows for `file_write`, `file_edit`, `file_apply_patch`, `image_generate`,
-# `local_document_apply_patch`, `local_document_write`, `memory`.
+# `local_document_apply_patch`, `local_document_write`, `memory`, `plan`.
 # Type: usize, at least 1.
 # write = 7
 

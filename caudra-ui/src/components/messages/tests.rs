@@ -9226,7 +9226,11 @@ fn batch_progress_never_moves_a_row_backwards(
         ..start(TOOL_ID, BATCH_TOOL)
     });
 
-    panel.batch_progress(TOOL_ID, 0, child_in(reported));
+    assert_eq!(
+        panel.batch_progress(TOOL_ID, 0, child_in(reported)),
+        !current.is_terminal() && reported >= current,
+        "{STAGED_ROW_MSG}"
+    );
 
     assert_eq!(roster(&panel)[0].status, expected, "{STAGED_ROW_MSG}");
 }

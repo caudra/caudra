@@ -7,11 +7,17 @@ group = "Reference"
 
 # Tools
 
-Caudra ships with 33 built-in tools in this reference (33 requiring no plugin opt-in, 0 opt-in via plugin options). Availability depends on the selected workspace backend. Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Caudra ships with 34 built-in tools in this reference (34 requiring no plugin opt-in, 0 opt-in via plugin options). Availability depends on the selected workspace backend. Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 First-party file, web, shell, index, Python, and environment tools run through protocol-neutral Workcell contracts. Workcell owns schemas, validation, execution bounds, atomic file changes, network policy, subprocess cleanup, cancellation, and the bundled worker lifecycle. Caudra owns registration, authorization, retained session output, and model or UI presentation. Release builds pin an exact Workcell revision.
 
-Remote Workcell selection replaces the first-party execution backend. Startup requires the complete compatible catalog and workspace capabilities, even when a tool is disabled for the model. A missing or incompatible remote tool never falls back to local execution. The Local Documents section below describes remote-only tools for client-owned plans and memory by opaque reference. They are absent from embedded sessions. This development feature requires a matching Workcell build beyond the current release pin. See [Remote Workspaces](/docs/remote-workspaces/).
+Remote Workcell selection replaces the first-party execution backend. Startup requires the complete compatible catalog and workspace capabilities, even when a tool is disabled for the model. A missing or incompatible remote tool never falls back to local execution. The Local Documents section below describes remote-only tools for client-owned documents, including memory notes, by opaque reference. They remain available alongside the active-plan tool and are absent from embedded sessions. This development feature requires a matching Workcell build beyond the current release pin. See [Remote Workspaces](/docs/remote-workspaces/).
+
+The single `plan` tool reads or replaces the active main-agent plan in local and remote workspaces. Use `{"action":"read"}` to read it or `{"action":"write","content":"Complete plan document"}` to replace it. It accepts no path, reference, or session selector and has no patch, approval, or mode-switch action. It is available only during the committed main-agent Plan invocation, subject to the selected profile and [permissions](/docs/permissions/#plan-mode). Selecting Plan in the composer does not change the authority of running work. A task does not inherit the parent's plan-write capability.
+
+Successful plan writes retain the committed target, revision, and content for the plan card. Implement and Clear-and-Implement capture validated content and its revision before consuming the plan or clearing the session. They include the content in the model-visible Build request, so implementation does not require file tools to retrieve the plan. A capture failure leaves the plan available and does not start implementation.
+
+Secure plan storage currently requires a Unix client. Windows and other non-Unix clients return `UnsupportedPlatform` for secure plan storage operations. This applies to local plans and client-owned plans for remote workspaces, regardless of the Workcell server's platform.
 
 ## Disabling tools
 
@@ -28,23 +34,25 @@ disabled_tools = ["shell", "file_write", "github.*"]
 
 Run [`caudra tools`](/docs/cli/) to see the resulting set, including which rule turned each tool off, or `/tools` inside a session to see it for the open transcript. To keep a tool available but gate every call, use a `deny` or `prompt` default in [Permissions](/docs/permissions/) instead.
 
+[System prompt profiles](/docs/system-prompts/#choose-tool-availability) can make eligible tools eager, lazy, or disabled for one actor. Pass `--system-prompt-profile NAME` to `caudra tools` or `caudra prompt --tools` to inspect that profile. A profile cannot re-enable tools excluded by config, CLI flags, experimental feature gates, mode, or runtime requirements.
+
 ## Tools loaded on demand
 
-9 built-in tools can start outside the request array. The model sees a `tool_search` entry instead, and one call with a query loads the matching tools for the rest of the session. Sessions that never need them never pay for their descriptions.
+The default loading policy lets 10 built-in tools start outside the request array. The model sees a `tool_search` entry instead, and one call with a query loads the matching tools for the rest of the session. Sessions that never need them never pay for their descriptions. An explicit profile policy can make other native, local or remote Workcell, Lua/plugin, local callback, or MCP tools lazy too. A known-name direct call to an eligible lazy tool is valid and loads its schema. `tool_search` disappears when no eligible pending tools remain.
 
-`code_map`, `code_context`, `code_refs`, `code_impact`, and `code_expand` load together as the code graph group, because a question about an unfamiliar codebase usually takes several of them in a row.
+`code_map`, `code_context`, `code_refs`, `code_impact`, and `code_expand` load together as the code graph bundle, limited to eligible lazy members. Profile policy groups do not create additional loading bundles.
 
-`execution_environment`, `image_generate`, `python_execution`, and `workflow` load on their own.
+`execution_environment`, `image_generate`, `python_execution`, `plan`, and `workflow` load on their own.
 
 Loading changes the tool array, so the provider's prompt cache prefix resets and the next request re-reads the history as fresh input. Caudra posts a notice naming what loaded when it happens.
 
 ### Which models defer
 
-That cache reset is why deferral depends on model supply. Caudra defers for every model recorded as small, whether marked **Small** or **Fast**, and for a model with no supply facts. A known non-small model takes all 9 upfront because it would spend a large prefix loading a tool it was likely to need.
+That cache reset is why deferral depends on model supply. Caudra defers for every model recorded as small, whether marked **Small** or **Fast**, and for a model with no supply facts. A known non-small model takes the eligible tools upfront because it would spend a large prefix loading a tool it was likely to need.
 
 Declare `fast` and `best` under `purposes` in `providers.toml` to describe model supply ([Providers](/docs/providers/#supply-metadata)), or set `agent.defer_builtin_tools` to `always` or `never` to decide for every model ([Configuration](/docs/configuration/#agent)).
 
-Listing a tool in `--allowed-tools` asks for it upfront and skips the search. [`caudra tools`](/docs/cli/) marks a deferred tool `lazy` and says `deferred behind tool_search`.
+Listing a tool in `--allowed-tools` asks for it upfront and skips the search unless the selected profile explicitly makes it lazy. [`caudra tools`](/docs/cli/) marks a deferred tool `lazy` and reports whether the choice came from the selected profile or the default loading policy.
 
 ## File Operations
 
@@ -355,6 +363,15 @@ Create or update a structured todo list to track tasks.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `todos` | array | yes | The updated todo list |
+
+### `plan` <span class="badge">on demand</span> {#plan}
+
+Read or replace the active plan document. Use action='read' to inspect it or action='write' with the complete content to save it. Only the main agent in plan mode may use this tool. The target is supplied by the host; paths and references are not accepted. Saving does not approve the plan or switch modes.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `action` | string | yes |  |
+| `content` | string | no | Complete plan text, required for write. |
 
 ### `memory` {#memory}
 

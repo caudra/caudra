@@ -221,7 +221,7 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
     };
     let filter = base
         .intersect(&ToolFilter::from_config(&agent.config, model, &[]))
-        .with_internal_companions();
+        .intersect(&agent.tool_filter);
 
     let vars = caudra_agent::template::env_vars();
     let ctx_desc = DescriptionContext {
@@ -231,7 +231,18 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
     };
     // Base definitions only: the session injects MCP definitions per
     // request, so baking them into a tools array would freeze the catalog.
-    let defs = ToolRegistry::global().definitions(&vars, &ctx_desc, model.supports_tool_examples());
+    let definitions = ToolRegistry::global().definitions_split_with_policy(
+        &vars,
+        &ctx_desc,
+        model.supports_tool_examples(),
+        &[],
+        &agent.profile_tool_policy,
+        &agent.mode,
+    );
+    let mut defs = definitions.declared;
+    if let Some(defs) = defs.as_array_mut() {
+        defs.extend(definitions.deferred.into_iter().map(|tool| tool.definition));
+    }
 
     Ok((Some(json_to_lua(&lua, &defs)?), None))
 }
@@ -470,16 +481,9 @@ async fn open_lua_task(
             .map_err(lua_err)?
             .as_deref(),
     )?;
-    // Plan-mode tasks are read-only, so the one tool they may install is the
-    // structured-output sink: anything else would be an effect in disguise. An
-    // omitted mode is inherited from the caller, exactly as `open_task` does.
-    let plan_mode =
-        mode.unwrap_or_else(|| subagent::inherited_mode(&agent_ctx.mode)) == SubagentTaskMode::Plan;
-    let (local_definitions, local_tools) = build_local_tools(
-        lua,
-        local_tools_tbl,
-        plan_mode.then_some(STRUCTURED_OUTPUT_TOOL),
-    )?;
+    let task_mode = mode.unwrap_or_else(|| subagent::inherited_mode(&agent_ctx.mode));
+    let (local_definitions, local_tools) =
+        build_local_tools(lua, local_tools_tbl, Some(task_mode))?;
     subagent::open_task(
         agent_ctx,
         subagent::TaskOptions {
@@ -592,13 +596,10 @@ fn parse_thinking(value: Option<LuaValue>) -> Result<Option<ThinkingConfig>, Str
     }
 }
 
-/// Turns the Lua `local_tools` table into tool definitions plus their
-/// handlers. `only` restricts which name may be installed, which is how a
-/// read-only task keeps its single output sink and nothing else.
 fn build_local_tools(
     lua: &Lua,
     table: Option<Table>,
-    only: Option<&str>,
+    task_mode: Option<SubagentTaskMode>,
 ) -> Result<(Vec<JsonValue>, LocalTools), String> {
     let Some(table) = table else {
         return Ok((Vec::new(), LocalTools::default()));
@@ -621,7 +622,8 @@ fn build_local_tools(
                 .map_err(lua_err)?
                 .as_deref(),
         )?;
-        if only.is_some_and(|allowed| name != allowed || effect != ToolEffect::ReadOnly) {
+        let is_output = name == STRUCTURED_OUTPUT_TOOL && effect == ToolEffect::ReadOnly;
+        if task_mode == Some(SubagentTaskMode::Plan) && !is_output {
             return Err(format!(
                 "local tool {name:?} is not an allowed plan-mode task output tool"
             ));
@@ -632,13 +634,16 @@ fn build_local_tools(
             "input_schema": sanitize_tool_input_schema(input_schema),
         }));
         let weak = lua.weak();
-        handlers.insert(
-            name,
-            audited_local_tool(effect, move |input, _ctx| {
-                let result = call_local_tool(&weak, &handler, &input);
-                Box::pin(async move { result })
-            }),
-        );
+        let handler = audited_local_tool(effect, move |input, _ctx| {
+            let result = call_local_tool(&weak, &handler, &input);
+            Box::pin(async move { result })
+        });
+        let handler = if task_mode.is_some() && is_output {
+            handler.required_output()
+        } else {
+            handler
+        };
+        handlers.insert(name, handler);
     }
     Ok((definitions, Arc::new(handlers)))
 }
@@ -861,9 +866,165 @@ fn call_local_tool(
 
 #[cfg(test)]
 mod tests {
+    use caudra_agent::AgentMode;
+    use caudra_agent::tools::ToolDefinitions;
+    use caudra_agent::tools::profile_policy::append_local_definitions;
+    use caudra_agent::tools::test_support::stub_ctx;
+    use caudra_config::{ProfileToolDefault, ProfileToolPolicy};
+    use mlua::{Function, Lua, Table};
     use serde_json::json;
+    use test_case::{test_case, test_matrix};
 
-    use super::*;
+    use super::{
+        Emit, JsonValue, STRUCTURED_OUTPUT_TOOL, SubagentTaskMode, ToolEffect, ToolFilter,
+        build_local_tools, call_local_tool, tool_dispatch,
+    };
+
+    const OTHER_LOCAL_TOOL: &str = "other_output";
+    const OUTPUT_SAVED: &str = "saved";
+    const OUTPUT_CALL_ID: &str = "output-call";
+    const PLAN_OUTPUT_REFUSED: &str =
+        "local tool \"structured_output\" is not an allowed plan-mode task output tool";
+    const PLAN_OTHER_REFUSED: &str =
+        "local tool \"other_output\" is not an allowed plan-mode task output tool";
+    const OUTPUT_SPEC: &str = r#"
+        return {
+            description = "Return the required output",
+            input_schema = { type = "object" },
+            handler = function() return output_saved end,
+        }
+    "#;
+
+    fn local_tool_table(lua: &Lua, name: &str, effect: Option<&str>) -> Table {
+        lua.globals().set("output_saved", OUTPUT_SAVED).unwrap();
+        let spec: Table = lua.load(OUTPUT_SPEC).eval().unwrap();
+        spec.set("effect", effect).unwrap();
+        let table = lua.create_table().unwrap();
+        table.set(name, spec).unwrap();
+        table
+    }
+
+    #[test_case(None, Some("read_only"), ToolEffect::ReadOnly, Some(false); "generic_read_only")]
+    #[test_case(None, Some("mutating"), ToolEffect::Mutating, Some(false); "generic_mutating")]
+    #[test_case(None, Some("isolated"), ToolEffect::Isolated, Some(false); "generic_isolated")]
+    #[test_case(None, Some("orchestrator"), ToolEffect::Orchestrator, Some(false); "generic_orchestrator")]
+    #[test_case(None, None, ToolEffect::Unknown, Some(false); "generic_unknown")]
+    #[test_case(Some(SubagentTaskMode::Build), Some("read_only"), ToolEffect::ReadOnly, Some(true); "build_read_only")]
+    #[test_case(Some(SubagentTaskMode::Build), Some("mutating"), ToolEffect::Mutating, Some(false); "build_mutating")]
+    #[test_case(Some(SubagentTaskMode::Build), Some("isolated"), ToolEffect::Isolated, Some(false); "build_isolated")]
+    #[test_case(Some(SubagentTaskMode::Build), Some("orchestrator"), ToolEffect::Orchestrator, Some(false); "build_orchestrator")]
+    #[test_case(Some(SubagentTaskMode::Build), None, ToolEffect::Unknown, Some(false); "build_unknown")]
+    #[test_case(Some(SubagentTaskMode::Plan), Some("read_only"), ToolEffect::ReadOnly, Some(true); "plan_read_only")]
+    #[test_case(Some(SubagentTaskMode::Plan), Some("mutating"), ToolEffect::Mutating, None; "plan_mutating_refused")]
+    #[test_case(Some(SubagentTaskMode::Plan), Some("isolated"), ToolEffect::Isolated, None; "plan_isolated_refused")]
+    #[test_case(Some(SubagentTaskMode::Plan), Some("orchestrator"), ToolEffect::Orchestrator, None; "plan_orchestrator_refused")]
+    #[test_case(Some(SubagentTaskMode::Plan), None, ToolEffect::Unknown, None; "plan_unknown_refused")]
+    fn only_audited_task_output_is_required(
+        task_mode: Option<SubagentTaskMode>,
+        effect: Option<&str>,
+        expected_effect: ToolEffect,
+        required: Option<bool>,
+    ) {
+        let lua = Lua::new();
+        let table = local_tool_table(&lua, STRUCTURED_OUTPUT_TOOL, effect);
+        let result = build_local_tools(&lua, Some(table), task_mode);
+        match required {
+            Some(required) => {
+                let (definitions, tools) = result.unwrap();
+                assert_eq!(definitions.len(), 1);
+                assert_eq!(definitions[0]["name"], STRUCTURED_OUTPUT_TOOL);
+                assert_eq!(tools[STRUCTURED_OUTPUT_TOOL].is_required(), required);
+                assert_eq!(tools[STRUCTURED_OUTPUT_TOOL].effect, expected_effect);
+            }
+            None => assert_eq!(result.err().as_deref(), Some(PLAN_OUTPUT_REFUSED)),
+        }
+    }
+
+    #[test_matrix(
+        [None, Some(SubagentTaskMode::Build), Some(SubagentTaskMode::Plan)],
+        [Some("read_only"), Some("mutating"), None]
+    )]
+    fn other_local_tools_are_never_required(
+        task_mode: Option<SubagentTaskMode>,
+        effect: Option<&str>,
+    ) {
+        let lua = Lua::new();
+        let table = local_tool_table(&lua, OTHER_LOCAL_TOOL, effect);
+        let result = build_local_tools(&lua, Some(table), task_mode);
+        if task_mode == Some(SubagentTaskMode::Plan) {
+            assert_eq!(result.err().as_deref(), Some(PLAN_OTHER_REFUSED));
+        } else {
+            let (definitions, tools) = result.unwrap();
+            assert_eq!(definitions[0]["name"], OTHER_LOCAL_TOOL);
+            assert!(!tools[OTHER_LOCAL_TOOL].is_required());
+        }
+    }
+
+    #[test_matrix(
+        [None, Some(SubagentTaskMode::Build), Some(SubagentTaskMode::Plan)],
+        [(true, false), (false, true), (true, true)]
+    )]
+    fn required_output_survives_policy_in_definitions_and_dispatch(
+        task_mode: Option<SubagentTaskMode>,
+        restrictions: (bool, bool),
+    ) {
+        let lua = Lua::new();
+        let table = local_tool_table(&lua, STRUCTURED_OUTPUT_TOOL, Some("read_only"));
+        let (local_definitions, local_tools) =
+            build_local_tools(&lua, Some(table), task_mode).unwrap();
+        let mode = if task_mode == Some(SubagentTaskMode::Plan) {
+            AgentMode::ReadOnly
+        } else {
+            AgentMode::Build
+        };
+        let (disabled, excluded) = restrictions;
+        let mut ctx = stub_ctx(&mode);
+        ctx.local_tools = local_tools;
+        ctx.tool_filter = if excluded {
+            ToolFilter::Only(Vec::new())
+        } else {
+            ToolFilter::All
+        }
+        .for_mode(&mode);
+        ctx.profile_tool_policy = ProfileToolPolicy {
+            default: if disabled {
+                ProfileToolDefault::Disabled
+            } else {
+                ProfileToolDefault::Inherit
+            },
+            ..ProfileToolPolicy::default()
+        }
+        .into();
+        let mut definitions = ToolDefinitions {
+            declared: json!([]),
+            deferred: Vec::new(),
+        };
+        append_local_definitions(
+            &mut definitions,
+            local_definitions,
+            &ctx.local_tools,
+            &ctx.tool_filter,
+            &ctx.profile_tool_policy,
+        );
+        assert_eq!(
+            definitions.declared.as_array().unwrap().len(),
+            usize::from(task_mode.is_some())
+        );
+        assert!(definitions.deferred.is_empty());
+        let done = smol::block_on(tool_dispatch::run(
+            &ctx.registry,
+            None,
+            OUTPUT_CALL_ID.into(),
+            STRUCTURED_OUTPUT_TOOL,
+            &json!({}),
+            &ctx,
+            Emit::Silent,
+        ));
+        assert_eq!(done.is_error, task_mode.is_none());
+        if task_mode.is_some() {
+            assert_eq!(done.output.as_text(), OUTPUT_SAVED);
+        }
+    }
 
     fn call(src: &str, input: JsonValue) -> Result<String, String> {
         let lua = Lua::new();

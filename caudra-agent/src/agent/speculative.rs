@@ -491,7 +491,7 @@ impl SpeculativeRuns {
         if ctx.resolve_tool_name_alias(super::streaming::canonical_tool_name(&top.name))
             != crate::tools::BATCH_TOOL_NAME
             || ctx.local_tools.contains_key(crate::tools::BATCH_TOOL_NAME)
-            || !ctx.tool_filter.matches(crate::tools::BATCH_TOOL_NAME)
+            || !ctx.tool_available(crate::tools::BATCH_TOOL_NAME)
             || !ctx
                 .registry
                 .get(crate::tools::BATCH_TOOL_NAME)

@@ -209,17 +209,21 @@ Use [`caudra permissions discover`](/docs/cli/#discovering-patterns-from-history
 
 Selecting Plan while Build work runs does not change that work. A conflicting submission offers a choice to keep editing, queue in Plan, or stop the work first. See [Selecting Plan while work runs](/docs/queue/#selecting-plan-while-work-runs).
 
+The main agent's [`plan` tool](/docs/tools/#plan) can read or replace only the committed active plan target. Exact-target writes can receive scoped plan approval, but explicit denies, configured asks, and a default Deny still apply. Reads use normal permission checks. A profile can disable the tool, and tasks do not receive the parent's plan-write capability.
+
 While plan mode is active, Caudra withholds the authority that would outlive the plan. Remembered project and global rules do not apply, allows from `permissions.toml` do not apply, and the prompt offers only the once and conversation lifetimes. Deny and ask rules still apply, because they only restrict access.
 
 A conversation grant made while planning does apply for the rest of the plan. Approving broad shell authority for the conversation lets the agent keep exploring with scripts and searches instead of asking about each command. The grant stays with the conversation after you leave plan mode. Allow once covers only the current call.
 
 ## Read-only agents
 
-A read-only agent is a subagent that may not change anything: research tasks, `task` calls in plan mode, and every agent a workflow starts in `read-only` capability mode. It sees `shell`, and Caudra judges each command line it runs rather than the tool as a whole.
+A read-only agent is a subagent that may not change anything: research tasks, `task` calls in plan mode, and every agent a workflow starts in `read-only` capability mode. Only audited host tools with safe call effects are eligible. Ordinary MCP and plugin tools are excluded. When an audited `shell` is available, Caudra judges each command line rather than the tool as a whole.
 
 A line is admitted when the classifier rules every command in it read-only and every path it touches resolves inside the project. `git diff`, `git log`, `rg`, and `wc -l` pass. Anything that writes, anything the parser could not read, and anything reaching outside the project is refused with a message naming the call and the reason, and the agent can retry with a narrower line. The same classifier answers here and in plan mode, so a command plan mode would refuse is refused here too.
 
 The confinement check resolves symlinks before it answers, so a link checked into the repository cannot carry a read out of the project. It says nothing about what an admitted command reads inside the project: a read-only agent can still read any file you have.
+
+Profiles cannot relax this restriction. Safe lazy tools remain discoverable through `tool_search`, but loading a schema cannot grant write access or the main agent's active plan capability.
 
 ## Stored rules
 

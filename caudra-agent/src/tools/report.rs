@@ -1,8 +1,11 @@
-use caudra_config::AgentConfig;
+use caudra_config::{AgentConfig, ProfileToolExposure, ProfileToolPolicy, ProfileToolSource};
 use caudra_providers::Model;
 
+use crate::tools::profile_policy::{
+    PROFILE_DISABLED, PROFILE_LOADING, REQUIRED_INFRASTRUCTURE, source_kind,
+};
 use crate::tools::{
-    BuiltinDeferral, ToolFilter, VIEW_IMAGE_TOOL_NAME, capability_exclusions,
+    BuiltinDeferral, RegisteredTool, ToolFilter, VIEW_IMAGE_TOOL_NAME, capability_exclusions,
     credential_exclusions, deferral,
 };
 
@@ -21,6 +24,7 @@ pub const REASON_EAGER_CONFIG: &str = "lazy loading disabled by config";
 /// than looking it up.
 pub const REASON_CATALOG: &str = "loads the lazy tools on request";
 pub const CATALOG_SOURCE: &str = "native:caudra";
+pub const REASON_PROFILE_LOADED: &str = "profile lazy tool loaded in this session";
 
 /// What a tool is doing in this run. `Lazy` is enabled and absent from the
 /// request array at once, which neither `On` nor `Off` can express.
@@ -50,6 +54,44 @@ impl ToolState {
 pub struct ToolReport {
     pub state: ToolState,
     pub reason: Option<&'static str>,
+}
+
+pub fn profile_report(
+    entry: &RegisteredTool,
+    profile: &ProfileToolPolicy,
+    legacy: ToolReport,
+) -> ToolReport {
+    let source = source_kind(&entry.source);
+    if source == ProfileToolSource::Native && entry.name() == crate::tools::TOOL_OUTPUT_TOOL_NAME {
+        return ToolReport {
+            state: ToolState::On,
+            reason: Some(REQUIRED_INFRASTRUCTURE),
+        };
+    }
+    if legacy.state == ToolState::Off {
+        return ToolReport {
+            reason: legacy.reason.or_else(|| {
+                (profile.exposure(entry.name(), source) == Some(ProfileToolExposure::Disabled))
+                    .then_some(PROFILE_DISABLED)
+            }),
+            ..legacy
+        };
+    }
+    match profile.exposure(entry.name(), source) {
+        Some(exposure) => ToolReport {
+            state: match exposure {
+                ProfileToolExposure::Eager => ToolState::On,
+                ProfileToolExposure::Lazy => ToolState::Lazy,
+                ProfileToolExposure::Disabled => ToolState::Off,
+            },
+            reason: Some(if exposure == ProfileToolExposure::Disabled {
+                PROFILE_DISABLED
+            } else {
+                PROFILE_LOADING
+            }),
+        },
+        None => legacy,
+    }
 }
 
 /// Why a built-in would not reach the model, in the order a user would ask:
@@ -134,16 +176,19 @@ fn eager_reason(name: &str, deferral: BuiltinDeferral) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use caudra_config::INTERNAL_COMPANION_TOOL_NAMES;
+    use caudra_config::{INTERNAL_COMPANION_TOOL_NAMES, ProfileToolPolicy};
+    use std::sync::Arc;
     use test_case::test_case;
 
     use super::{
-        AgentConfig, BuiltinDeferral, Model, REASON_COMPANION, REASON_CONFIG, REASON_DEFERRED,
+        AgentConfig, BuiltinDeferral, Model, REASON_CONFIG, REASON_DEFERRED,
         REASON_DISALLOWED_FLAG, REASON_EAGER_CLASS, REASON_EAGER_CONFIG, REASON_NOT_ALLOWED,
-        REASON_OTHER_EDITOR, ToolReport, ToolState, builtin_report,
+        REASON_OTHER_EDITOR, REQUIRED_INFRASTRUCTURE, ToolReport, ToolState, builtin_report,
+        profile_report,
     };
     use crate::tools::{
-        FILE_APPLY_PATCH_TOOL_NAME, FILE_READ_TOOL_NAME, SHELL_TOOL_NAME, ToolFilter,
+        FILE_APPLY_PATCH_TOOL_NAME, FILE_READ_TOOL_NAME, RegisteredTool, SHELL_TOOL_NAME,
+        ToolAudience, ToolEffect, ToolFilter, test_support::NamedMock,
     };
 
     const MODEL_SPEC: &str = "anthropic/claude-opus-4-8";
@@ -228,9 +273,18 @@ mod tests {
     #[test]
     fn a_companion_asked_to_turn_off_stays_on_with_a_reason() {
         for name in INTERNAL_COMPANION_TOOL_NAMES {
-            let report = lazy_report(name, &[], &config(&[name], &[]));
+            let entry = RegisteredTool {
+                tool: Arc::new(NamedMock::new(name, ToolAudience::all())),
+                source: NamedMock::source(),
+                effect: ToolEffect::ReadOnly,
+            };
+            let report = profile_report(
+                &entry,
+                &ProfileToolPolicy::default(),
+                lazy_report(name, &[], &config(&[name], &[])),
+            );
             assert_eq!(report.state, ToolState::On);
-            assert_eq!(report.reason, Some(REASON_COMPANION));
+            assert_eq!(report.reason, Some(REQUIRED_INFRASTRUCTURE));
         }
     }
 

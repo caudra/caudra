@@ -776,6 +776,12 @@ fn mcp_lines(snapshot: &ContextSnapshot, theme: &Theme) -> Vec<Line<'static>> {
             ),
             theme.status_dim,
         )));
+        if let Some(reason) = tool.reason {
+            lines.push(Line::from(Span::styled(
+                format!("  {}", escape_terminal_controls(reason)),
+                theme.status_dim,
+            )));
+        }
     }
     lines
 }
@@ -1009,6 +1015,7 @@ mod tests {
         ContextMcpTool, ContextMemoryFile, ContextMemoryInventory, ContextModel, ContextProfile,
         ContextProfileInventory, ContextSkill, ContextSkillInventory, ContextUsage, ContextWindow,
     };
+    use caudra_agent::tools::profile_policy::PROFILE_DISABLED;
     use crossterm::event::{MouseButton, MouseEventKind};
     use ratatui::backend::TestBackend;
     use ratatui::style::Modifier;
@@ -1120,6 +1127,7 @@ mod tests {
                             server: "issues".to_owned(),
                             status: ContextMcpStatus::LoadedOrEager,
                             request_tokens: 40,
+                            reason: None,
                         },
                         ContextMcpTool {
                             qualified_name: "search.query".to_owned(),
@@ -1127,6 +1135,7 @@ mod tests {
                             server: "search".to_owned(),
                             status: ContextMcpStatus::AvailableOnDemand,
                             request_tokens: 0,
+                            reason: None,
                         },
                         ContextMcpTool {
                             qualified_name: "admin.delete".to_owned(),
@@ -1134,6 +1143,7 @@ mod tests {
                             server: "admin".to_owned(),
                             status: ContextMcpStatus::Disabled,
                             request_tokens: 0,
+                            reason: None,
                         },
                     ],
                     unattributed_tokens: 0,
@@ -1153,6 +1163,16 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test_case(None; "legacy")]
+    #[test_case(Some(PROFILE_DISABLED); "profile_reason")]
+    fn mcp_inventory_displays_policy_reason(reason: Option<&'static str>) {
+        let mut snapshot = snapshot();
+        snapshot.inventory.mcp.tools[0].status = ContextMcpStatus::Disabled;
+        snapshot.inventory.mcp.tools[0].reason = reason;
+        let rendered = text(&mcp_lines(&snapshot, &theme::current()));
+        assert_eq!(rendered.contains(PROFILE_DISABLED), reason.is_some());
     }
 
     fn mouse(kind: MouseEventKind, area: Rect) -> MouseEvent {

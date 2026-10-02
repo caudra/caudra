@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, atomic::Ordering};
 
-use caudra_config::{FILE_WRITE_TOOLS, ToolKey};
+use caudra_config::ToolKey;
 use caudra_storage::StateClass;
 use caudra_storage::id::CaudraId;
 use caudra_storage::now_epoch;
@@ -26,9 +26,12 @@ use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::tools::native::plan::PlanTarget;
 use crate::tools::registry::{PermissionIntent, TrustedToolSource};
 
-use super::enforce::{EvaluationContext, contain_authority_to_the_plan};
+use super::enforce::{
+    EvaluationContext, active_plan_write, contain_authority_to_the_plan, exact_local_plan_write,
+};
 use super::pattern_matching::CompiledPattern;
 use super::policy::{
     SHELL_EXECUTION_CONTRACT, WORKCELL_TOOL_OWNER, builtin_structured_rules,
@@ -40,7 +43,7 @@ use super::{
     PermissionResourceKind, PermissionResourceSelector, PermissionRuleRecord, PermissionSubject,
     PolicyRule, RuleOrigin, StructuredPermissionDecision, StructuredPermissionEffect,
     StructuredPermissionRule, argument_constraint_matches, canonical_json_sha256,
-    evaluate_structured_permission_rules, normalize_scope_path, review, selected_input_digest,
+    evaluate_structured_permission_rules, review, selected_input_digest,
 };
 
 const MAX_EDIT_BYTES: usize = 256 * 1024;
@@ -172,6 +175,13 @@ pub trait PermissionAuthorityLease {
         Err(PermissionEditError::Unavailable(
             EXAMPLE_ANALYSIS_REQUIRED.into(),
         ))
+    }
+
+    fn active_plan_target(
+        &self,
+        _authority: &EditableAuthorityDescriptor,
+    ) -> Result<Option<PlanTarget>, PermissionEditError> {
+        Ok(None)
     }
 }
 
@@ -1271,13 +1281,18 @@ impl PermissionManager {
                 "Host analysis returned no resources",
             ));
         }
-        let exact_plan_write = analysis.plan_path.as_ref().is_some_and(|plan_path| {
-            matches!(&analysis.tool, ToolKey::Native(name) if FILE_WRITE_TOOLS.contains(&name.as_ref()))
-                && request.resources.iter().all(|resource| {
-                    resource.access == Some(PermissionResourceAccess::Write)
-                        && normalize_scope_path(&resource.value) == normalize_scope_path(&plan_path.display().to_string())
-                })
-        });
+        let verified_plan_write = lease
+            .active_plan_target(authority)?
+            .map(|target| active_plan_write(&analysis.intent, input, &target))
+            .transpose()
+            .map_err(|error| invalid(EditField::Resources, error))?
+            .unwrap_or(false);
+        let exact_plan_write = verified_plan_write
+            || exact_local_plan_write(
+                &analysis.tool,
+                &request.resources,
+                analysis.plan_path.as_deref(),
+            );
         let evaluation = EvaluationContext {
             revision: *context,
             plan_scoped: scopes.plan_scoped,
@@ -2502,20 +2517,26 @@ mod tests {
 
     use crate::CancelToken;
     use crate::permissions::broker::PendingPermission;
-    use crate::permissions::enforce::{CURRENT_POLICY_DENIES_REQUEST, EvaluationContext};
+    use crate::permissions::enforce::tests::active_plan_fixture;
+    use crate::permissions::enforce::{
+        CURRENT_DEFAULT_DENIES_REQUEST, CURRENT_POLICY_DENIES_REQUEST, EvaluationContext,
+    };
     use crate::permissions::tests::{
         PERMISSION_RULES_STATE_KEY, SHELL_WORKDIR, shell_request, workcell_shell_subject,
     };
     use crate::permissions::{
         PermissionArgumentConstraint, PermissionCapabilityFamily, PermissionLifetime,
-        PermissionManager, PermissionProjectFilter, PermissionResourceAccess,
-        PermissionResourceKind, PermissionResourceSelector, PermissionRuleRecord,
-        PermissionSubject, RemotePermissionIdentity, StructuredPermissionEffect,
-        VerifiedLocalSourceLocator, argument_constraint_matches, canonical_json_sha256, hex_encode,
+        PermissionManager, PermissionPolicyError, PermissionProjectFilter,
+        PermissionResourceAccess, PermissionResourceKind, PermissionResourceSelector,
+        PermissionRuleRecord, PermissionSubject, RemotePermissionIdentity,
+        StructuredPermissionEffect, VerifiedLocalSourceLocator, argument_constraint_matches,
+        canonical_json_sha256, hex_encode,
     };
     use crate::tools::DescriptionContext;
+    use crate::tools::native::plan::{self, PlanTarget, PlanTool};
     use crate::tools::registry::{
-        ParseError, RegisteredTool, Tool, ToolEffect, ToolInvocation, ToolSource, TrustedToolSource,
+        ParseError, PermissionIntent, RegisteredTool, Tool, ToolEffect, ToolInvocation, ToolSource,
+        TrustedToolSource,
     };
 
     use super::{
@@ -2524,9 +2545,9 @@ mod tests {
         EffectivePolicyPreview, GuardDraft, IdentityDraft, MAX_EDIT_BYTES,
         NormalizedPermissionDraft, PermissionAuthorityLease, PermissionAuthorityProvider,
         PermissionEditError, PermissionEditEvidence, PermissionEditOperation,
-        PermissionPublication, PermissionRuleDraft, ProjectDraft, ResourceCapability,
-        ResourceDraft, ResourcesDraft, SelectorDraft, SelectorMode, SelectorValue,
-        TemplateAnalysis, TemplateSource, UNREVIEWABLE, classify_authority_change,
+        PermissionExampleAnalysis, PermissionPublication, PermissionRuleDraft, ProjectDraft,
+        ResourceCapability, ResourceDraft, ResourcesDraft, SelectorDraft, SelectorMode,
+        SelectorValue, TemplateAnalysis, TemplateSource, UNREVIEWABLE, classify_authority_change,
         commit_persistent_permission_mutation, confirmation_requirements,
         normalize_permission_draft, validate_persistent_receipt, verified_selector_value,
     };
@@ -2573,6 +2594,7 @@ mod tests {
     struct Host {
         catalog: AuthorityCatalog,
         analysis: Option<TemplateAnalysis>,
+        plan_example: Option<(PermissionIntent, Option<PlanTarget>)>,
     }
 
     struct TestProvider {
@@ -2612,6 +2634,28 @@ mod tests {
                 .analysis
                 .clone()
                 .ok_or_else(|| PermissionEditError::Unavailable(ANALYSIS_REQUIRED.into()))
+        }
+
+        fn analyze_example(
+            &self,
+            authority: &EditableAuthorityDescriptor,
+            _input: &Value,
+        ) -> Result<PermissionExampleAnalysis, PermissionEditError> {
+            assert_eq!(authority.key, plan::NAME);
+            let (intent, _) = self.host.plan_example.as_ref().unwrap();
+            Ok(PermissionExampleAnalysis {
+                tool: ToolKey::native(plan::NAME),
+                intent: intent.clone(),
+                plan_path: None,
+            })
+        }
+
+        fn active_plan_target(
+            &self,
+            authority: &EditableAuthorityDescriptor,
+        ) -> Result<Option<PlanTarget>, PermissionEditError> {
+            assert_eq!(authority.key, plan::NAME);
+            Ok(self.host.plan_example.as_ref().unwrap().1.clone())
         }
     }
 
@@ -2683,6 +2727,7 @@ mod tests {
                     }],
                 },
                 analysis: None,
+                plan_example: None,
             }),
             analyses: AtomicUsize::new(0),
         })
@@ -4493,6 +4538,97 @@ mod tests {
             std::fs::write(&path, OTHER_LABEL).unwrap();
         }
         assert_eq!(locator.verify_current().is_ok(), !changed);
+    }
+
+    #[test_case(DefaultEffect::Prompt, None, true, false; "verified_plan_is_allowed")]
+    #[test_case(DefaultEffect::Prompt, None, false, false; "name_without_verified_target_does_not_approve")]
+    #[test_case(DefaultEffect::Prompt, Some(Effect::Deny), true, false; "deny_blocks_verified_plan")]
+    #[test_case(DefaultEffect::Prompt, Some(Effect::Ask), true, false; "ask_prompts_verified_plan")]
+    #[test_case(DefaultEffect::Deny, None, true, false; "default_deny_blocks_verified_plan")]
+    #[test_case(DefaultEffect::Allow, None, true, true; "malformed_intent_is_not_shown_allowed")]
+    fn active_plan_example_preview_preserves_policy(
+        default: DefaultEffect,
+        effect: Option<Effect>,
+        verified: bool,
+        malformed: bool,
+    ) {
+        smol::block_on(async {
+            for remote in [false, true] {
+                let (_temp, manager, provider, _publication) = manager();
+                let (_root, ctx, mut intent, input) = active_plan_fixture(remote).await;
+                manager.set_project_with_config(
+                    ctx.host_cwd.as_ref().unwrap(),
+                    PermissionsConfig {
+                        default,
+                        rules: effect
+                            .into_iter()
+                            .map(|effect| PermissionRule {
+                                tool: ToolKey::native(plan::NAME),
+                                scope: Some(intent.resources[0].value.clone()),
+                                effect,
+                            })
+                            .collect(),
+                        ..Default::default()
+                    },
+                );
+                if malformed {
+                    intent.resources[0].access = Some(PermissionResourceAccess::Read);
+                }
+                let registered = RegisteredTool {
+                    tool: Arc::new(PlanTool),
+                    source: ToolSource::Native {
+                        owner: "caudra".into(),
+                        contract: "plan/v1".into(),
+                        trusted: true,
+                    },
+                    effect: ToolEffect::Mutating,
+                };
+                {
+                    let mut host = provider.host.write().unwrap();
+                    host.catalog.authorities.push(EditableAuthorityDescriptor {
+                        key: plan::NAME.into(),
+                        source: TrustedToolSource::from_registered(&registered, None).unwrap(),
+                        resources: Vec::new(),
+                        arguments: vec![ArgumentMode::Exact],
+                        families: Vec::new(),
+                        unrestricted_resources: false,
+                        unavailable: None,
+                    });
+                    host.plan_example = Some((
+                        intent,
+                        verified.then(|| plan::verified_target(&ctx).unwrap()),
+                    ));
+                }
+                let session = manager
+                    .begin_permission_edit(
+                        PermissionEditOperation::Create,
+                        PermissionEditEvidence::default(),
+                    )
+                    .unwrap();
+                let preview = manager.preview_permission_edit(&session, &draft()).unwrap();
+                let result = manager.preview_permission_example(&preview, plan::NAME, &input);
+                if malformed {
+                    assert!(matches!(result, Err(PermissionEditError::Invalid(_))));
+                    continue;
+                }
+                let result = result.unwrap();
+                assert!(!result.matches_rule);
+                let expected = if effect == Some(Effect::Deny) {
+                    EffectivePolicyPreview::Denied(
+                        PermissionPolicyError(CURRENT_POLICY_DENIES_REQUEST.into()).to_string(),
+                    )
+                } else if default == DefaultEffect::Deny {
+                    EffectivePolicyPreview::Denied(
+                        PermissionPolicyError(CURRENT_DEFAULT_DENIES_REQUEST.into()).to_string(),
+                    )
+                } else if effect == Some(Effect::Ask) || !verified {
+                    EffectivePolicyPreview::Prompt
+                } else {
+                    EffectivePolicyPreview::AllowedByPolicy
+                };
+                assert_eq!(result.effective_policy, expected);
+            }
+        });
     }
 
     #[test_case(false, false, None; "allow_matches_and_allows")]

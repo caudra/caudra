@@ -685,17 +685,20 @@ mod tests {
     };
     use caudra_storage::id::CaudraId;
     use caudra_storage::tool_outputs::ToolOutputRef;
+    use caudra_workspace::PlanRef;
     use serde_json::Value;
     use test_case::test_case;
 
     use super::*;
-    use crate::AgentConfig;
+    use crate::{AgentConfig, AgentMode};
 
     const KEPT_THINKING: &str = "weighing the kept turn";
     const KEPT_SIGNATURE: &str = "signed-over-the-old-prefix";
     const KEPT_REPLY: &str = "reply two";
     /// The anchor, the summary and the kept user turn come first.
     const KEPT_REPLY_INDEX: usize = 3;
+    const ACTIVE_PLAN: &str = "current-plan";
+    const PREVIOUS_PLAN: &str = "previous-plan";
 
     struct MockProvider {
         responses: Mutex<Vec<Result<StreamResponse, AgentError>>>,
@@ -1147,24 +1150,39 @@ mod tests {
     /// The last block of a kind is in force until another replaces it, so the
     /// compacted transcript states each exactly once: kept in the tail, or
     /// restated after it with a row for the chat to draw.
-    #[test_case(false ; "summarized_blocks_are_restated")]
-    #[test_case(true ; "blocks_the_tail_keeps_stay_put")]
-    fn compaction_keeps_every_standing_reminder_in_force(tail_keeps_them: bool) {
+    #[test_case(false, false, &["plan"]; "restated_local_plan")]
+    #[test_case(true, false, &["plan"]; "retained_local_plan")]
+    #[test_case(false, true, &["local_document_write"]; "restated_remote_fallback")]
+    #[test_case(true, true, &["local_document_write"]; "retained_remote_fallback")]
+    #[test_case(false, true, &[]; "restated_no_writer")]
+    #[test_case(true, true, &[]; "retained_no_writer")]
+    fn compaction_keeps_every_standing_reminder_in_force(
+        tail_keeps_them: bool,
+        remote: bool,
+        available: &[&str],
+    ) {
         smol::block_on(async {
-            const REMINDERS: &[&str] = &[
-                crate::prompt::ENVIRONMENT_PROMPT,
-                crate::prompt::PLAN_PROMPT,
-            ];
-            let reminders = || {
-                REMINDERS
-                    .iter()
-                    .map(|text| Message::observation((*text).into()))
+            let mode = if remote {
+                AgentMode::RemotePlan(PlanRef::new(ACTIVE_PLAN).unwrap())
+            } else {
+                AgentMode::Plan(ACTIVE_PLAN.into())
             };
-            let mut messages = vec![Message::user("first".into())];
-            messages.extend(reminders());
+            let reminders = [
+                crate::prompt::ENVIRONMENT_PROMPT.to_owned(),
+                crate::prompt::plan_mode_prompt(&mode, |name| available.contains(&name)).unwrap(),
+            ];
+            let observations = || reminders.iter().cloned().map(Message::observation);
+            let previous =
+                crate::prompt::plan_mode_prompt(&AgentMode::Plan(PREVIOUS_PLAN.into()), |_| true)
+                    .unwrap();
+            let mut messages = vec![
+                Message::user("first".into()),
+                Message::observation(previous),
+            ];
+            messages.extend(observations());
             messages.extend([assistant_text("reply one"), Message::user("second".into())]);
             if tail_keeps_them {
-                messages.extend(reminders());
+                messages.extend(observations());
             }
             messages.push(assistant_text("reply two"));
             let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
@@ -1189,7 +1207,8 @@ mod tests {
                     _ => None,
                 })
                 .collect();
-            let restated: &[&str] = if tail_keeps_them { &[] } else { REMINDERS };
+            let expected: Vec<_> = reminders.iter().map(String::as_str).collect();
+            let restated: &[&str] = if tail_keeps_them { &[] } else { &expected };
             assert_eq!(injected, restated);
             let standing: Vec<_> = history
                 .as_slice()
@@ -1197,7 +1216,11 @@ mod tests {
                 .filter(|message| message.is_observation())
                 .filter_map(Message::user_text)
                 .collect();
-            assert_eq!(standing, REMINDERS);
+            assert_eq!(standing, expected);
+            let plan = standing.last().unwrap();
+            assert!(!plan.contains("`shell`"));
+            assert!(!plan.contains(PREVIOUS_PLAN));
+            assert!(!plan.contains("{plan_"));
         });
     }
 

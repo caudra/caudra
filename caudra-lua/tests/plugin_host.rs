@@ -25,6 +25,8 @@ use serde_json::{Value, json};
 
 const BUILTIN_COMMANDS: &[&str] = &["/sessions", "/rename", "/tasks"];
 const NARGS_ERR: &str = r#"'nargs' must be 0, 1, "?", "*", or "+""#;
+const TASK_LOCAL_TOOLS_RESERVED: &str =
+    "task-local tools are reserved for Caudra's bundled task tool";
 const USAGE_TOOL_NAME: &str = "usage_child";
 const USAGE_VALUE: &str = "12.3k↑ 456↓ $0.123";
 const USAGE_OUTPUT: &str = "usage_done";
@@ -5647,6 +5649,139 @@ fn session_task_id_reopens_completed_history() {
 
 const MODE_MISMATCH_ERR: &str = "uses `build` mode, not requested `plan` mode";
 
+mod task_output_policy {
+    use std::sync::Arc;
+
+    use caudra_agent::AgentMode;
+    use caudra_agent::agent::subagent::STRUCTURED_OUTPUT_TOOL;
+    use caudra_agent::tools::{ToolFilter, test_support::stub_ctx};
+    use caudra_config::PluginsConfig;
+    use caudra_lua::PluginHost;
+    use caudra_providers::provider::{BoxFuture, Provider};
+    use caudra_providers::{
+        AgentError, CacheKey, ContentBlock, Message, Model, ModelInfo, ProviderEvent,
+        RequestOptions, Role, StopReason, StreamResponse,
+    };
+    use serde_json::{Value, json};
+    use test_case::test_case;
+
+    use super::{exec_result_with_ctx, fresh_registry};
+
+    const TASK_TOOL: &str = "task";
+    const OUTPUT_CALL_ID: &str = "task-output";
+    const OUTPUT_ACK: &str = "Output recorded.";
+    const OUTPUT_ANSWER: &str = "required sink dispatched";
+    const TASK_DESCRIPTION: &str = "Required output regression";
+
+    struct OutputProvider;
+
+    impl Provider for OutputProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _model: &'a Model,
+            messages: &'a [Message],
+            _system: &'a str,
+            tools: &'a Value,
+            _event_tx: &'a flume::Sender<ProviderEvent>,
+            _opts: RequestOptions,
+            _cache_key: Option<&'a CacheKey>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                assert!(
+                    tools
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|definition| definition["name"] == STRUCTURED_OUTPUT_TOOL),
+                    "required output definition missing: {tools}"
+                );
+                let result = messages
+                    .iter()
+                    .flat_map(|message| &message.content)
+                    .find_map(|block| match block {
+                        ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            is_error,
+                            ..
+                        } if tool_use_id == OUTPUT_CALL_ID => Some((content, is_error)),
+                        _ => None,
+                    });
+                let (message, stop_reason) = if let Some((content, is_error)) = result {
+                    assert!(!is_error, "required output dispatch failed: {content}");
+                    assert_eq!(content, OUTPUT_ACK);
+                    (
+                        Message::synthetic(OUTPUT_ANSWER.into()),
+                        StopReason::EndTurn,
+                    )
+                } else {
+                    (
+                        Message {
+                            role: Role::Assistant,
+                            content: vec![ContentBlock::tool_use(
+                                OUTPUT_CALL_ID,
+                                STRUCTURED_OUTPUT_TOOL,
+                                json!({"answer": OUTPUT_ANSWER}),
+                            )],
+                            ..Message::default()
+                        },
+                        StopReason::ToolUse,
+                    )
+                };
+                Ok(StreamResponse {
+                    message,
+                    stop_reason: Some(stop_reason),
+                    ..StreamResponse::default()
+                })
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[test_case(AgentMode::Build, Some("build"); "explicit_build")]
+    #[test_case(AgentMode::Build, Some("plan"); "explicit_plan")]
+    #[test_case(AgentMode::Build, None; "inherited_build")]
+    #[test_case(AgentMode::ReadOnly, None; "inherited_plan")]
+    fn bundled_task_output_survives_child_ceiling(parent_mode: AgentMode, mode: Option<&str>) {
+        let reg = fresh_registry();
+        let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+        host.load_builtins(&PluginsConfig {
+            enabled: true,
+            names: vec![TASK_TOOL.into()],
+            opts: Default::default(),
+        })
+        .unwrap();
+        let mut ctx = stub_ctx(&parent_mode);
+        ctx.registry = Arc::clone(&reg);
+        ctx.provider = Arc::new(OutputProvider);
+        ctx.chat_provider = Arc::clone(&ctx.provider);
+        ctx.tool_ceiling = ToolFilter::Only(Vec::new());
+        let mut input = json!({
+            "description": TASK_DESCRIPTION,
+            "prompt": TASK_DESCRIPTION,
+            "output_schema": {
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "required": ["answer"],
+                "additionalProperties": false,
+            },
+        });
+        if let Some(mode) = mode {
+            input["mode"] = json!(mode);
+        }
+        let result = exec_result_with_ctx(&reg, TASK_TOOL, input, &ctx);
+        let output = result.output.unwrap();
+        let model_output = result.model_output.unwrap_or_else(|| output.as_text());
+        assert_eq!(
+            serde_json::from_str::<Value>(&model_output).unwrap(),
+            json!({"answer": OUTPUT_ANSWER})
+        );
+    }
+}
+
 /// An omitted mode is the caller's own, so a task opened from build mode can
 /// build. The stored spec is what a continuation is then held to.
 #[test]
@@ -5767,6 +5902,8 @@ fn plan_parent_cannot_launch_generic_build_session() {
 #[test_case::test_case("{ local_tools = { foo = { handler = function() return '' end } } }", "local_tools.foo: 'description' is required" ; "local_tool_missing_description")]
 #[test_case::test_case("{ local_tools = { foo = { description = 'd' } } }", "local_tools.foo: 'handler' is required" ; "local_tool_missing_handler")]
 #[test_case::test_case("{ audience = 'research_sub', local_tools = { foo = { description = 'd', input_schema = { type = 'object' }, effect = 'read_only', handler = function() return '' end } } }", "generic research sessions cannot install caller-defined local tools" ; "research_local_tool")]
+#[test_case::test_case("{ task = true, mode = 'build', local_tools = { structured_output = { description = 'd', input_schema = { type = 'object' }, effect = 'read_only', handler = function() return '' end } } }", TASK_LOCAL_TOOLS_RESERVED ; "untrusted_build_output")]
+#[test_case::test_case("{ task = true, mode = 'plan', local_tools = { structured_output = { description = 'd', input_schema = { type = 'object' }, effect = 'read_only', handler = function() return '' end } } }", TASK_LOCAL_TOOLS_RESERVED ; "untrusted_plan_output")]
 fn session_opts_validation_rejects(opts: &str, expected: &str) {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();

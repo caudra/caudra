@@ -52,12 +52,14 @@ use caudra_agent::permissions::pattern_recognition::{
 use caudra_agent::tools::ToolFilter;
 use caudra_agent::types::TodoItem;
 use caudra_agent::worktree::Request as WorktreeRequest;
+use caudra_config::ProfileToolPolicy;
 use caudra_providers::{
     HistoryItem, HistoryProjectionError, Message, Model, active_history_items, expand_message,
     resolve_history_head, transcript_history_items,
 };
 use caudra_storage::StateDir;
-use caudra_storage::id::CaudraId;
+use caudra_storage::id::{CaudraId, SessionRef};
+use caudra_storage::local_documents::LocalDocumentStore;
 use caudra_storage::sessions::{
     HistoryReadLimits, HistoryReadReport, SessionLease, SessionRelocation,
 };
@@ -85,12 +87,20 @@ pub struct PermissionAuthorityBinding {
     pub registry_revision: u64,
 }
 
+#[derive(Clone)]
+pub struct PermissionAuthoritySession {
+    pub id: SessionRef,
+    pub local_documents: Option<Arc<LocalDocumentStore>>,
+}
+
 pub type PermissionAuthorityFactory = Arc<
     dyn Fn(
             PathBuf,
             AgentMode,
             Model,
             Option<WorkspaceSession>,
+            ProfileToolPolicy,
+            PermissionAuthoritySession,
         ) -> Result<PermissionAuthorityBinding, PermissionEditError>
         + Send
         + Sync,

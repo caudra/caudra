@@ -61,6 +61,7 @@ pub mod example;
 pub mod experimental;
 pub mod files;
 pub mod mcp;
+pub mod profile_tools;
 pub mod providers;
 pub mod sandbox;
 pub mod steering;
@@ -68,6 +69,10 @@ pub mod workcell;
 
 pub use decisions::{DecisionsConfig, FeatureMode};
 pub use experimental::{Feature, FeatureDisabled, FeatureFlags};
+pub use profile_tools::{
+    ProfileToolDefault, ProfileToolExposure, ProfileToolPolicy, ProfileToolSource,
+    TOOL_POLICY_GROUPS, ToolPolicyGroup,
+};
 pub use steering::SteeringConfig;
 
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 50 * 1024;
@@ -278,6 +283,7 @@ pub const CAUDRA_NATIVE_TOOL_NAMES: &[&str] = &[
     "local_document_read",
     "local_document_write",
     "memory",
+    "plan",
     "question",
     "send_message",
     "skill",
@@ -345,6 +351,7 @@ pub const DEFERRED_BUILTIN_TOOLS: &[DeferredBuiltin] = &[
     DeferredBuiltin::alone("execution_environment"),
     DeferredBuiltin::alone("image_generate"),
     DeferredBuiltin::alone("python_execution"),
+    DeferredBuiltin::alone("plan"),
     DeferredBuiltin::alone("workflow"),
 ];
 
@@ -2160,6 +2167,7 @@ impl ToolOutputLines {
                 "local_document_apply_patch",
                 "local_document_write",
                 "memory",
+                "plan",
             ],
         ),
         ("web", &["webfetch", "websearch"]),
@@ -2231,7 +2239,7 @@ impl ToolOutputLines {
             | "code_expand" => self.index,
             "file_grep" | "file_glob" | "grep" | "glob" => self.grep,
             "file_read" | "local_document_read" | "read" => self.read,
-            "local_document_apply_patch" | "local_document_write" | "memory" => self.write,
+            "local_document_apply_patch" | "local_document_write" | "memory" | "plan" => self.write,
             name if FILE_WRITE_TOOLS.contains(&name) => self.write,
             "webfetch" | "websearch" => self.web,
             _ => self.other,

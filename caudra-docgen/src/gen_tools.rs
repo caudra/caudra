@@ -1,8 +1,9 @@
+use caudra_agent::AgentMode;
 use caudra_agent::template::Vars;
 use caudra_agent::tools::{
     DescriptionContext, ToolAudience, ToolFilter, ToolRegistry, ToolSource, feature_exclusions,
 };
-use caudra_config::{Feature, FeatureFlags, PluginsConfig};
+use caudra_config::{Feature, FeatureFlags, PluginsConfig, ProfileToolPolicy};
 use regex::Regex;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -12,6 +13,7 @@ use std::sync::Arc;
 use caudra_lua::{OptionType, PluginHost};
 
 const DATE_PLACEHOLDER: &str = "YYYY-MM-DD";
+const PLAN_PLACEHOLDER: &str = "<active plan document>";
 
 const SECTIONS: &[(&str, &[&str])] = &[
     (
@@ -65,6 +67,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "list_sessions",
             "send_message",
             "todo_write",
+            "plan",
             "memory",
             "skill",
         ],
@@ -105,7 +108,12 @@ fn write_disabling_section(out: &mut String) {
          Run [`caudra tools`](/docs/cli/) to see the resulting set, including which rule turned \
          each tool off, or `/tools` inside a session to see it for the open transcript. To keep \
          a tool available but gate every call, use a `deny` or `prompt` default in \
-         [Permissions](/docs/permissions/) instead."
+         [Permissions](/docs/permissions/) instead.\n\n\
+         [System prompt profiles](/docs/system-prompts/#choose-tool-availability) can make \
+         eligible tools eager, lazy, or disabled for one actor. Pass \
+         `--system-prompt-profile NAME` to `caudra tools` or `caudra prompt --tools` to inspect \
+         that profile. A profile cannot re-enable tools excluded by config, CLI flags, \
+         experimental feature gates, mode, or runtime requirements."
     )
     .unwrap();
 }
@@ -139,16 +147,20 @@ fn write_on_demand_section(out: &mut String) {
     writeln!(
         out,
         "\n## Tools loaded on demand\n\n\
-         {total} built-in tools can start outside the request array. The model sees a \
+         The default loading policy lets {total} built-in tools start outside the request array. The model sees a \
          `tool_search` entry instead, and one call with a query loads the matching tools for the \
-         rest of the session. Sessions that never need them never pay for their descriptions."
+         rest of the session. Sessions that never need them never pay for their descriptions. \
+         An explicit profile policy can make other native, local or remote Workcell, Lua/plugin, \
+         local callback, or MCP tools lazy too. \
+         A known-name direct call to an eligible lazy tool is valid and loads its schema. \
+         `tool_search` disappears when no eligible pending tools remain."
     )
     .unwrap();
     for (group, members) in &groups {
         writeln!(
             out,
-            "\n{} load together as the {group} group, because a question about an unfamiliar \
-             codebase usually takes several of them in a row.",
+            "\n{} load together as the {group} bundle, limited to eligible lazy members. \
+              Profile policy groups do not create additional loading bundles.",
             code_list(members)
         )
         .unwrap();
@@ -164,15 +176,16 @@ fn write_on_demand_section(out: &mut String) {
          ### Which models defer\n\n\
          That cache reset is why deferral depends on model supply. Caudra defers for every model \
          recorded as small, whether marked **Small** or **Fast**, and for a model with no supply \
-         facts. A known non-small model takes all {total} upfront because it would spend a large \
+         facts. A known non-small model takes the eligible tools upfront because it would spend a large \
          prefix loading a tool it was likely to need.\n\n\
          Declare `fast` and `best` under `purposes` in `providers.toml` to describe model supply \
          ([Providers](/docs/providers/#supply-metadata)), or set `agent.defer_builtin_tools` to \
          `always` or `never` to decide for every model \
          ([Configuration](/docs/configuration/#agent)).\n\n\
-         Listing a tool in `--allowed-tools` asks for it upfront and skips the search. \
-         [`caudra tools`](/docs/cli/) marks a deferred tool `lazy` and says \
-         `deferred behind tool_search`."
+         Listing a tool in `--allowed-tools` asks for it upfront and skips the search unless \
+         the selected profile explicitly makes it lazy. \
+         [`caudra tools`](/docs/cli/) marks a deferred tool `lazy` and reports whether the \
+         choice came from the selected profile or the default loading policy."
     )
     .unwrap();
 }
@@ -457,7 +470,7 @@ pub fn generate() -> String {
         .set("{date}", "YYYY-MM-DD");
 
     let (registry, opt_in) = load_registry_with_builtins();
-    let defs = registry.definitions(
+    let defs = registry.definitions_split_with_policy(
         &vars,
         &DescriptionContext {
             filter: &ToolFilter::All,
@@ -465,8 +478,12 @@ pub fn generate() -> String {
             workflows_available: false,
         },
         false,
+        &[],
+        &ProfileToolPolicy::default(),
+        &AgentMode::Plan(PLAN_PLACEHOLDER.into()),
     );
     let def_map: HashMap<String, &Value> = defs
+        .declared
         .as_array()
         .expect("definitions should be an array")
         .iter()
@@ -510,9 +527,12 @@ pub fn generate() -> String {
     .unwrap();
     writeln!(
         out,
-        "\nRemote Workcell selection replaces the first-party execution backend. Startup requires the complete compatible catalog and workspace capabilities, even when a tool is disabled for the model. A missing or incompatible remote tool never falls back to local execution. The Local Documents section below describes remote-only tools for client-owned plans and memory by opaque reference. They are absent from embedded sessions. This development feature requires a matching Workcell build beyond the current release pin. See [Remote Workspaces](/docs/remote-workspaces/)."
+        "\nRemote Workcell selection replaces the first-party execution backend. Startup requires the complete compatible catalog and workspace capabilities, even when a tool is disabled for the model. A missing or incompatible remote tool never falls back to local execution. The Local Documents section below describes remote-only tools for client-owned documents, including memory notes, by opaque reference. They remain available alongside the active-plan tool and are absent from embedded sessions. This development feature requires a matching Workcell build beyond the current release pin. See [Remote Workspaces](/docs/remote-workspaces/)."
     )
     .unwrap();
+    writeln!(out, "\nThe single `plan` tool reads or replaces the active main-agent plan in local and remote workspaces. Use `{{\"action\":\"read\"}}` to read it or `{{\"action\":\"write\",\"content\":\"Complete plan document\"}}` to replace it. It accepts no path, reference, or session selector and has no patch, approval, or mode-switch action. It is available only during the committed main-agent Plan invocation, subject to the selected profile and [permissions](/docs/permissions/#plan-mode). Selecting Plan in the composer does not change the authority of running work. A task does not inherit the parent's plan-write capability.").unwrap();
+    writeln!(out, "\nSuccessful plan writes retain the committed target, revision, and content for the plan card. Implement and Clear-and-Implement capture validated content and its revision before consuming the plan or clearing the session. They include the content in the model-visible Build request, so implementation does not require file tools to retrieve the plan. A capture failure leaves the plan available and does not start implementation.").unwrap();
+    writeln!(out, "\nSecure plan storage currently requires a Unix client. Windows and other non-Unix clients return `UnsupportedPlatform` for secure plan storage operations. This applies to local plans and client-owned plans for remote workspaces, regardless of the Workcell server's platform.").unwrap();
     write_disabling_section(&mut out);
     write_on_demand_section(&mut out);
 
@@ -610,6 +630,35 @@ mod tests {
             .unwrap();
         for expected in EXPECTED {
             assert!(task.contains(expected), "missing task guidance: {expected}");
+        }
+    }
+
+    #[test]
+    fn plan_reference_preserves_active_target_and_memory_documents() {
+        const PLAN_HEADING: &str = "### `plan`";
+        const PLAN_ANCHOR: &str = " {#plan}";
+        const EXPECTED: &[&str] = &[
+            "no path, reference, or session selector",
+            "committed main-agent Plan invocation",
+            "model-visible Build request",
+            "A capture failure leaves the plan available",
+            "Windows and other non-Unix clients return `UnsupportedPlatform`",
+            "including memory notes",
+            "### `local_document_read`",
+            "### `local_document_write`",
+            "### `local_document_apply_patch`",
+            "A known-name direct call to an eligible lazy tool is valid",
+        ];
+        let page = generate();
+        assert!(
+            page.lines()
+                .any(|line| line.starts_with(PLAN_HEADING) && line.ends_with(PLAN_ANCHOR))
+        );
+        for expected in EXPECTED {
+            assert!(
+                page.contains(expected),
+                "missing plan or document contract: {expected}"
+            );
         }
     }
 

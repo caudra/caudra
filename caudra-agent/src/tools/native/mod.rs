@@ -14,6 +14,7 @@ pub mod image_generate;
 mod local_document;
 pub mod memory;
 pub mod peers;
+pub mod plan;
 pub mod question;
 pub(crate) mod report_to_parent;
 pub mod skill;
@@ -114,6 +115,7 @@ fn entries(
             ToolEffect::Mutating,
             memory::DESCRIPTION,
         ),
+        entry(plan::PlanTool, ToolEffect::Mutating, plan::DESCRIPTION),
         entry(
             question::QuestionTool,
             ToolEffect::Isolated,
@@ -171,18 +173,22 @@ fn entry(
     description: &str,
 ) -> (Arc<dyn Tool>, ToolSource, ToolEffect) {
     let tool: Arc<dyn Tool> = Arc::new(tool);
-    let contract = canonical_json_sha256(&json!({
-        "tool": tool.name(),
-        "effect": effect.as_str(),
-        "description": description,
-        "schema": tool.schema(),
-    }));
+    let contract = permission_contract(tool.as_ref(), effect, description);
     let source = ToolSource::Native {
         owner: OWNER.into(),
         contract: contract.into(),
         trusted: true,
     };
     (tool, source, effect)
+}
+
+fn permission_contract(tool: &dyn Tool, effect: ToolEffect, description: &str) -> String {
+    canonical_json_sha256(&json!({
+        "tool": tool.name(),
+        "effect": effect.as_str(),
+        "description": description,
+        "schema": tool.schema(),
+    }))
 }
 
 /// Neutral context for callers that need a description outside a live turn.

@@ -20,7 +20,7 @@ use caudra_agent::tools::ToolFilter;
 use caudra_config::PermissionReviewCandidate;
 use caudra_providers::Model;
 use caudra_storage::StateDir;
-use caudra_storage::id::CaudraId;
+use caudra_storage::id::{CaudraId, SessionRef};
 use caudra_storage::permission_patterns::PatternDefinition;
 use caudra_storage::permission_state::mutation::{
     PermissionCommitReceipt, PermissionMutationError, PermissionOwner, PermissionSnapshot,
@@ -38,14 +38,14 @@ use crate::components::permission_scope::model::ScopeModel;
 use crate::components::permissions_picker::PermissionsPicker;
 use crate::repaint::Dirty;
 use crate::storage_writer::{PermissionMutationWriter, StorageWriter};
-use crate::{AppSession, PermissionAuthorityBinding};
+use crate::{AppSession, PermissionAuthorityBinding, PermissionAuthoritySession};
 
 use super::App;
 use super::workbench_styles;
 
 const PERMISSION_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const PERMISSION_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
-pub(super) const PERMISSION_WORKER_BUSY: &str =
+pub(crate) const PERMISSION_WORKER_BUSY: &str =
     "A permission operation is still awaiting acknowledgment";
 const PERMISSION_WORKER_GONE: &str = "Permission worker disconnected; inspect again before saving";
 const PERMISSION_STALE: &str =
@@ -305,6 +305,7 @@ struct PermissionAuthorityContext {
     mode: AgentMode,
     model: String,
     workspace: Option<WorkspaceSession>,
+    session: PermissionAuthoritySession,
     binding: PermissionAuthorityBinding,
 }
 
@@ -315,11 +316,13 @@ impl PermissionAuthorityContext {
         mode: &AgentMode,
         model: &Model,
         workspace: &Option<WorkspaceSession>,
+        session: &PermissionAuthoritySession,
     ) -> bool {
         self.project.as_path() == project
             && self.mode == *mode
             && self.model == model.spec()
             && same_workspace(&self.workspace, workspace)
+            && same_authority_session(&self.session, session)
     }
 
     fn matches(&self, other: &Self) -> bool {
@@ -330,7 +333,20 @@ impl PermissionAuthorityContext {
             && self.binding.registry_revision == other.binding.registry_revision
             && same_tool_filter(&self.binding.tool_filter, &other.binding.tool_filter)
             && same_workspace(&self.workspace, &other.workspace)
+            && same_authority_session(&self.session, &other.session)
     }
+}
+
+fn same_authority_session(
+    left: &PermissionAuthoritySession,
+    right: &PermissionAuthoritySession,
+) -> bool {
+    left.id == right.id
+        && match (&left.local_documents, &right.local_documents) {
+            (None, None) => true,
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
 }
 
 fn same_workspace(left: &Option<WorkspaceSession>, right: &Option<WorkspaceSession>) -> bool {
@@ -421,13 +437,28 @@ impl App {
         let model = self.permission_authority_model();
         let model_spec = model.spec();
         let workspace = self.workspace_session.clone();
+        let session = self.permission_authority_session();
+        let profile = self
+            .state
+            .system_prompt_profile
+            .as_ref()
+            .map(|profile| profile.tools().clone())
+            .unwrap_or_default();
         let context = match smol::block_on(smol::unblock(move || {
-            let binding = factory(project.clone(), mode.clone(), model, workspace.clone())?;
+            let binding = factory(
+                project.clone(),
+                mode.clone(),
+                model,
+                workspace.clone(),
+                profile,
+                session.clone(),
+            )?;
             Ok::<_, PermissionEditError>(PermissionAuthorityContext {
                 project,
                 mode,
                 model: model_spec,
                 workspace,
+                session,
                 binding,
             })
         })) {
@@ -454,6 +485,13 @@ impl App {
         Ok(())
     }
 
+    fn permission_authority_session(&self) -> PermissionAuthoritySession {
+        PermissionAuthoritySession {
+            id: SessionRef::from(self.state.session.id),
+            local_documents: self.local_documents.clone(),
+        }
+    }
+
     fn permission_authority_model(&self) -> Model {
         self.effective_model_slot
             .as_ref()
@@ -472,6 +510,7 @@ impl App {
                     &self.execution_agent_mode(),
                     &self.permission_authority_model(),
                     &self.workspace_session,
+                    &self.permission_authority_session(),
                 )
             })
         {
@@ -594,15 +633,30 @@ impl App {
         let mode = self.execution_agent_mode();
         let model = self.permission_authority_model();
         let workspace = self.workspace_session.clone();
+        let session = self.permission_authority_session();
+        let profile = self
+            .state
+            .system_prompt_profile
+            .as_ref()
+            .map(|profile| profile.tools().clone())
+            .unwrap_or_default();
         self.permission_job(revision, mutation, move |manager| {
             if let Some(factory) = factory {
                 let model_spec = model.spec();
-                let binding = factory(project.clone(), mode.clone(), model, workspace.clone())?;
+                let binding = factory(
+                    project.clone(),
+                    mode.clone(),
+                    model,
+                    workspace.clone(),
+                    profile,
+                    session.clone(),
+                )?;
                 let authority = PermissionAuthorityContext {
                     project,
                     mode,
                     model: model_spec,
                     workspace,
+                    session,
                     binding,
                 };
                 if previous
@@ -1066,7 +1120,7 @@ impl App {
         self.permission_ui.pending.is_some()
     }
 
-    pub(super) fn permission_mutation_pending(&self) -> bool {
+    pub(crate) fn permission_mutation_pending(&self) -> bool {
         self.permission_ui
             .pending
             .as_ref()
@@ -1169,6 +1223,7 @@ impl App {
                         &self.execution_agent_mode(),
                         &self.permission_authority_model(),
                         &self.workspace_session,
+                        &self.permission_authority_session(),
                     )
             }
             _ => pending.guard.context == context,
@@ -1371,7 +1426,9 @@ pub(super) mod tests {
     use std::thread;
     use std::time::Instant;
 
+    use arc_swap::ArcSwap;
     use async_trait::async_trait;
+    use caudra_agent::AgentMode;
     use caudra_agent::permissions::editor::{
         ArgumentMode, ArgumentsDraft, AuthorityCatalog, EditableAuthorityDescriptor, IdentityDraft,
         PermissionAuthorityLease, PermissionAuthorityProvider, PermissionEditError,
@@ -1388,7 +1445,8 @@ pub(super) mod tests {
     };
     use caudra_agent::tools::{DescriptionContext, ToolFilter};
     use caudra_config::{Effect, PermissionRule, PermissionsConfig, ToolKey};
-    use caudra_storage::id::CaudraId;
+    use caudra_storage::id::{CaudraId, SessionRef};
+    use caudra_storage::local_documents::LocalDocumentStore;
     use caudra_storage::permission_patterns::{ArgumentRole, PatternToken, SlotCombinations};
     use caudra_storage::permission_state::mutation::{
         PermissionCommitReceipt, PermissionOwner, PermissionSnapshot, PreparedPermissionMutation,
@@ -1419,6 +1477,7 @@ pub(super) mod tests {
     use unicode_width::UnicodeWidthStr;
 
     use crate::app::Msg;
+    use crate::app::mode::Mode;
     use crate::app::sandbox::WORKBENCH_BUSY;
     use crate::app::tests::{pattern_suggestion_candidate, remote_workspace_session, test_app};
     use crate::components::buffer_text;
@@ -2643,6 +2702,7 @@ pub(super) mod tests {
     #[test_case("read_only", true; "strict_read_only_filter_changed")]
     #[test_case("disconnected", true; "connection_became_unavailable")]
     #[test_case("reconnect", true; "explicit_reconnect_invalidates_before_network_work")]
+    #[test_case("plan_store", true; "plan_store_replacement_invalidates_preview")]
     fn authority_context_changes_invalidate_backend_seals_and_preserve_drafts(
         change: &str,
         invalidated: bool,
@@ -2659,7 +2719,7 @@ pub(super) mod tests {
             let available = Arc::clone(&available);
             let read_only = Arc::clone(&read_only);
             let registry_revision = Arc::clone(&registry_revision);
-            Arc::new(move |_, _, _, _| {
+            Arc::new(move |_, _, _, _, _, _| {
                 let tool_filter = if filter_changed.load(Ordering::Acquire) {
                     ToolFilter::AllExcept(vec![TOOL.into()])
                 } else {
@@ -2766,6 +2826,12 @@ pub(super) mod tests {
             "read_only" => read_only.store(true, Ordering::Release),
             "disconnected" => available.store(false, Ordering::Release),
             "reconnect" => app.invalidate_permission_authority(),
+            "plan_store" => {
+                app.local_documents = Some(Arc::new(LocalDocumentStore::remote(
+                    app.storage.clone(),
+                    workspace.binding(),
+                )));
+            }
             "unchanged" => {}
             _ => panic!("{NEVER_EXECUTE}"),
         }
@@ -2797,6 +2863,58 @@ pub(super) mod tests {
             app.permissions.conversation_permission_snapshot().unwrap(),
             policy_before
         );
+    }
+
+    #[test_case(false; "selected_plan_does_not_replace_committed_build")]
+    #[test_case(true; "selected_build_does_not_replace_committed_plan")]
+    fn authority_factory_receives_committed_mode_and_exact_session(planning: bool) {
+        let mut app = durable_app();
+        let (workspace, _, _) = source_remote_workspace();
+        let store = Arc::new(LocalDocumentStore::remote(
+            app.storage.clone(),
+            workspace.binding(),
+        ));
+        let session_id = SessionRef::from(app.state.session.id);
+        let reference = store
+            .create_plan(workspace.binding().project().key(), session_id.as_str())
+            .unwrap();
+        let committed = if planning {
+            AgentMode::RemotePlan(reference)
+        } else {
+            AgentMode::Build
+        };
+        app.state.mode = if planning { Mode::Build } else { Mode::Plan };
+        app.workspace_session = Some(workspace.clone());
+        app.local_documents = Some(store.clone());
+        app.execution_mode = Some(Arc::new(ArcSwap::from_pointee(committed.clone())));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        app.permission_authority_factory = Some({
+            let observed = observed.clone();
+            Arc::new(move |_, mode, _, current_workspace, _, session| {
+                assert_eq!(
+                    current_workspace.as_ref().unwrap().binding(),
+                    workspace.binding()
+                );
+                assert_eq!(session.id, session_id);
+                assert!(Arc::ptr_eq(
+                    session.local_documents.as_ref().unwrap(),
+                    &store
+                ));
+                observed.lock().unwrap().push(mode);
+                Ok(PermissionAuthorityBinding {
+                    provider: authority(),
+                    tool_filter: ToolFilter::All,
+                    available: true,
+                    registry_revision: REGISTRY_REVISION,
+                })
+            })
+        });
+        app.sync_permission_authority().unwrap();
+        app.open_permissions_picker().unwrap();
+        app.finish_permission_jobs();
+        begin(&mut app, EditorLaunch::New);
+        let observed = observed.lock().unwrap();
+        assert_eq!(*observed, vec![committed.clone(), committed]);
     }
 
     #[test_case(json!({"command": "git show alpha", "workdir": "/different", "optional": null}); "json_workdir_and_null_are_forwarded_unchanged")]
@@ -2844,7 +2962,7 @@ pub(super) mod tests {
         let ui_thread = thread::current().id();
         app.permission_authority_factory = Some({
             let changed = Arc::clone(&changed);
-            Arc::new(move |_, _, _, _| {
+            Arc::new(move |_, _, _, _, _, _| {
                 assert_ne!(thread::current().id(), ui_thread);
                 let changed = changed.load(Ordering::Acquire);
                 Ok(PermissionAuthorityBinding {

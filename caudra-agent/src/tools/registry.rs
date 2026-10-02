@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use bitflags::bitflags;
+use caudra_config::{ProfileToolExposure, ProfileToolPolicy, ProfileToolSource};
 use caudra_storage::tool_ledger::ToolOutcome;
 use caudra_storage::tool_outputs::ToolOutputRef;
 use caudra_workspace::{RecordScope, TransportErrorKind, WorkspaceError};
@@ -25,10 +26,10 @@ use crate::permissions::{
     PermissionSubject, RemotePermissionIdentity,
 };
 use crate::template::Vars;
-use crate::{BufferSnapshot, ToolInput, ToolOutput, ToolOutputLimits};
+use crate::{AgentMode, BufferSnapshot, ToolInput, ToolOutput, ToolOutputLimits};
 
 use super::deferral::DeferredTool;
-use super::{DescriptionContext, LockKey, ToolContext};
+use super::{DescriptionContext, LockKey, ToolContext, ToolFilter};
 
 const CANCELLED_CODE: &str = "cancelled";
 const TIMED_OUT_CODE: &str = "timed_out";
@@ -560,6 +561,10 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// Permission and mutation metadata belongs here because only the parsed call
 /// knows which authorities and files it will touch.
 pub trait ToolInvocation: Send + Sync {
+    fn writes_active_plan(&self) -> bool {
+        false
+    }
+
     fn start_header(&self) -> HeaderFuture;
     fn shell_timeout(&self) -> Option<Duration> {
         None
@@ -1118,17 +1123,37 @@ impl ToolRegistry {
         supports_examples: bool,
         deferred: &[&str],
     ) -> ToolDefinitions {
+        self.definitions_split_with_policy(
+            vars,
+            ctx,
+            supports_examples,
+            deferred,
+            &ProfileToolPolicy::default(),
+            &AgentMode::Build,
+        )
+    }
+
+    pub fn definitions_split_with_policy(
+        &self,
+        vars: &Vars,
+        ctx: &DescriptionContext,
+        supports_examples: bool,
+        deferred: &[&str],
+        profile: &ProfileToolPolicy,
+        mode: &AgentMode,
+    ) -> ToolDefinitions {
         let snapshot = self.tools.load();
         let mut out = Vec::with_capacity(snapshot.len());
         let mut held = Vec::new();
         for entry in snapshot.iter() {
-            if !entry.tool.audience().contains(ctx.audience) {
-                continue;
-            }
-            if ctx.policy().is_read_only() && !entry.is_visible_in_read_only() {
-                continue;
-            }
-            if !ctx.filter.matches(entry.name()) {
+            let decision = super::profile_policy::registered_decision(
+                entry,
+                ctx,
+                profile,
+                mode,
+                deferred.contains(&entry.name()),
+            );
+            if !decision.available() {
                 continue;
             }
             let description = vars.apply(&entry.tool.description(ctx)).into_owned();
@@ -1146,14 +1171,44 @@ impl ToolRegistry {
                     def["description"] = Value::String(merged);
                 }
             }
-            match deferred.contains(&entry.name()) {
-                true => held.push(DeferredTool::new(entry.name(), group_of(entry.name()), def)),
+            match decision.exposure == ProfileToolExposure::Lazy {
+                true => held.push(DeferredTool::new(
+                    entry.name(),
+                    (super::profile_policy::source_kind(&entry.source)
+                        == ProfileToolSource::Native)
+                        .then(|| group_of(entry.name()))
+                        .flatten(),
+                    def,
+                )),
                 false => out.push(def),
             }
         }
         ToolDefinitions {
             declared: Value::Array(out),
             deferred: held,
+        }
+    }
+
+    pub fn profile_filter(
+        &self,
+        ctx: &DescriptionContext,
+        profile: &ProfileToolPolicy,
+        mode: &AgentMode,
+    ) -> ToolFilter {
+        let filter = ToolFilter::Only(
+            self.iter()
+                .iter()
+                .filter(|entry| {
+                    super::profile_policy::registered_decision(entry, ctx, profile, mode, false)
+                        .available()
+                })
+                .map(|entry| entry.name().to_owned())
+                .collect(),
+        );
+        if ctx.policy().is_read_only() {
+            filter.for_mode(&AgentMode::ReadOnly)
+        } else {
+            filter
         }
     }
 
@@ -1166,6 +1221,20 @@ impl ToolRegistry {
 pub struct ToolDefinitions {
     pub declared: Value,
     pub deferred: Vec<DeferredTool>,
+}
+
+impl ToolDefinitions {
+    pub fn available_filter(&self) -> ToolFilter {
+        ToolFilter::Only(
+            self.declared
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|definition| definition["name"].as_str().map(str::to_owned))
+                .chain(self.deferred.iter().map(|tool| tool.name.to_string()))
+                .collect(),
+        )
+    }
 }
 
 /// Grouping is policy, so it is read from the same list that names the
@@ -1215,6 +1284,7 @@ fn format_examples_as_text(examples: &Value) -> Option<String> {
 mod tests {
     use super::*;
     use crate::template::Vars;
+    use crate::tools::test_support::NamedMock;
     use std::sync::Barrier;
     use std::thread;
     use test_case::test_case;
@@ -1708,7 +1778,7 @@ mod tests {
 
         let reg = ToolRegistry::new();
         for name in [FILE_READ_TOOL_NAME, TOOL_OUTPUT_TOOL_NAME, SHELL_TOOL_NAME] {
-            reg.register(mock(name), lua_source("p")).unwrap();
+            reg.register(mock(name), NamedMock::source()).unwrap();
         }
         let config = crate::AgentConfig {
             allowed_tools: vec![FILE_READ_TOOL_NAME.into()],

@@ -287,6 +287,7 @@ impl BatchCall {
             .iter()
             .map(|child| child.pending_entry(ctx))
             .collect();
+        let mut model_outputs = vec![None; entries.len()];
         let entries = Arc::new(Mutex::new(entries));
         // Reserve the complete child roster before any child executes, so
         // concurrent completion cannot choose the collector's bounded prefix.
@@ -351,6 +352,7 @@ impl BatchCall {
                         observations.finish(done.is_error);
                     }
                     publish(&entries, index, &ctx, |entry| settle_entry(entry, &done));
+                    (index, done.model_output)
                 });
                 continue;
             }
@@ -404,20 +406,22 @@ impl BatchCall {
                 })
                 .await;
                 publish(&entries, index, &ctx, |entry| settle_entry(entry, &done));
+                (index, done.model_output)
             });
         }
         // A panicked child leaves its entry mid-flight, so anything still
         // non-terminal after the join is settled here: none is left dangling,
         // on screen or in the answer.
-        for panic in set.join_all().await.into_iter() {
-            if let Err(message) = panic {
-                tracing::error!(%message, "batch child panicked");
+        for result in set.join_all().await {
+            match result {
+                Ok((index, output)) => model_outputs[index] = output,
+                Err(message) => tracing::error!(%message, "batch child panicked"),
             }
         }
         let mut entries = take(&entries);
         sweep(&mut entries, ctx);
         let cancelled = ctx.cancel.is_cancelled();
-        let text = render_llm(&entries);
+        let text = render_llm(&entries, &model_outputs);
         ToolExecResult {
             is_error: cancelled,
             failure: cancelled.then_some(ToolFailure::Cancelled),
@@ -583,18 +587,26 @@ fn lock(entries: &Mutex<Vec<BatchToolEntry>>) -> std::sync::MutexGuard<'_, Vec<B
 
 /// The model's view: one `## tool` section per child in input order, then a
 /// tally. `batch_policy.rs` pins this byte for byte.
-fn render_llm(entries: &[BatchToolEntry]) -> String {
+fn render_llm(entries: &[BatchToolEntry], model_outputs: &[Option<String>]) -> String {
     let mut out = String::new();
     let mut failed = 0;
-    for entry in entries {
+    for (index, entry) in entries.iter().enumerate() {
         out.push_str(SECTION_PREFIX);
         out.push_str(&entry.tool);
         out.push('\n');
-        let text = entry
-            .output
-            .as_ref()
-            .map(ToolOutput::as_text)
-            .unwrap_or_default();
+        let text = model_outputs
+            .get(index)
+            .and_then(Option::as_deref)
+            .map(Cow::Borrowed)
+            .unwrap_or_else(|| {
+                Cow::Owned(
+                    entry
+                        .output
+                        .as_ref()
+                        .map(ToolOutput::as_text)
+                        .unwrap_or_default(),
+                )
+            });
         if entry.status == BatchToolStatus::Success {
             out.push_str(&text);
         } else {
@@ -629,11 +641,13 @@ mod tests {
     use crate::AgentMode;
     use crate::agent::speculative::{REVISED_INPUT, SpeculativeRuns};
     use crate::agent::tool_dispatch::{ResponseObservations, ToolOutcome};
+    use crate::permissions::PermissionManager;
     use crate::tools::registry::{
         BoxFuture, PermissionIntent, ToolError, ToolRegistry, ToolSource,
     };
     use crate::tools::test_support::{stub_ctx, stub_ctx_with};
     use crate::tools::{LockKey, STALE_READ_MSG};
+    use caudra_storage::sessions::PermissionMode;
     use futures_lite::future;
     use serde_json::json;
     use std::collections::HashMap;
@@ -652,6 +666,96 @@ mod tests {
     const BATCH_ID: &str = "batch-1";
     const RAN_TWICE: &str = "an adopted child must not be run a second time";
     const NEVER_STARTED: &str = "the stream must have started the child before the batch runs";
+    const MODEL_RECEIPT: &str = "Saved without echoing the displayed document.";
+
+    struct ReceiptTool(bool);
+
+    impl Tool for ReceiptTool {
+        fn name(&self) -> &str {
+            READ
+        }
+
+        fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
+            Cow::Borrowed(READ)
+        }
+
+        fn schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        fn parse(&self, _input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+            Ok(Box::new(Self(self.0)))
+        }
+    }
+
+    impl ToolInvocation for ReceiptTool {
+        fn start_header(&self) -> HeaderFuture {
+            HeaderFuture::Ready(HeaderResult::plain(READ.into()))
+        }
+
+        fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
+            Box::pin(async move {
+                let mut result = ToolExecResult::from(Ok(ToolOutput::Markdown(BODY.into())))
+                    .with_model_output(Some(MODEL_RECEIPT.into()))
+                    .with_model_suffix(Some(MODEL_SUFFIX.into()));
+                result.is_error = self.0;
+                result
+            })
+        }
+    }
+
+    #[test_case(false, false; "direct_success")]
+    #[test_case(false, true; "direct_failure")]
+    #[test_case(true, false; "adopted_success")]
+    #[test_case(true, true; "adopted_failure")]
+    fn batches_keep_model_receipts_separate_from_persisted_display(
+        speculative: bool,
+        is_error: bool,
+    ) {
+        smol::block_on(async {
+            let mut ctx = observed_batch_ctx();
+            ctx.tool_use_id = Some(BATCH_ID.into());
+            ctx.permissions = Arc::new(PermissionManager::new_nonpersistent(
+                Default::default(),
+                ctx.permissions.project_cwd(),
+                Arc::default(),
+            ));
+            ctx.permissions.set_session_mode(Some(PermissionMode::Yolo));
+            ctx.registry
+                .register_audited(
+                    Arc::new(ReceiptTool(is_error)),
+                    ToolSource::Native {
+                        owner: super::super::OWNER.into(),
+                        contract: READ.into(),
+                        trusted: true,
+                    },
+                    ToolEffect::ReadOnly,
+                )
+                .unwrap();
+            if speculative {
+                let runs = Arc::new(SpeculativeRuns::new(&ctx, None));
+                runs.register(BATCH_ID, crate::tools::BATCH_TOOL_NAME);
+                runs.start(BATCH_ID, 0, &child(PATTERN).to_string());
+                runs.settled().await;
+                ctx.speculative = Some(runs);
+            }
+            let result = parsed(calls(json!([child(PATTERN)])))
+                .unwrap()
+                .execute(&ctx)
+                .await;
+            let output = result.output.unwrap();
+            let restored: ToolOutput =
+                serde_json::from_value(serde_json::to_value(output).unwrap()).unwrap();
+            let ToolOutput::Batch { entries, text } = restored else {
+                panic!("expected batch output");
+            };
+            assert_eq!(entries[0].output.as_ref().unwrap().as_display_text(), BODY);
+            assert_eq!(entries[0].status == BatchToolStatus::Error, is_error);
+            assert!(text.contains(MODEL_RECEIPT), "{text}");
+            assert!(!text.contains(BODY), "{text}");
+            assert_eq!(text.matches(MODEL_SUFFIX).count(), 1, "{text}");
+        });
+    }
 
     fn observed_batch_ctx() -> ToolContext {
         let ctx = stub_ctx(&AgentMode::Build);
@@ -1089,10 +1193,13 @@ mod tests {
 
     #[test]
     fn a_clean_run_reports_every_section_in_input_order_then_a_tally() {
-        let text = render_llm(&[
-            entry(READ, BatchToolStatus::Success, BODY),
-            entry(GREP, BatchToolStatus::Success, "3 matches"),
-        ]);
+        let text = render_llm(
+            &[
+                entry(READ, BatchToolStatus::Success, BODY),
+                entry(GREP, BatchToolStatus::Success, "3 matches"),
+            ],
+            &[],
+        );
         assert_eq!(
             text,
             format!(
@@ -1103,10 +1210,13 @@ mod tests {
 
     #[test]
     fn a_failed_child_is_marked_and_counted_without_stopping_the_others() {
-        let text = render_llm(&[
-            entry(READ, BatchToolStatus::Error, FAILURE),
-            entry(GREP, BatchToolStatus::Success, "3 matches"),
-        ]);
+        let text = render_llm(
+            &[
+                entry(READ, BatchToolStatus::Error, FAILURE),
+                entry(GREP, BatchToolStatus::Success, "3 matches"),
+            ],
+            &[],
+        );
         assert_eq!(
             text,
             format!(
@@ -1394,7 +1504,7 @@ mod tests {
             serde_json::from_value(serde_json::to_value(&row).unwrap()).unwrap();
         assert!(matches!(restored.output, Some(ToolOutput::Tasks(_))));
         assert_eq!(restored.model_suffix, row.model_suffix);
-        let model = render_llm(&[restored]);
+        let model = render_llm(&[restored], &[]);
         assert!(model.contains("<task_metadata>"));
         assert!(model.contains("Reports and the final outcome will arrive automatically"));
         assert!(!model.contains("internal-invocation"));
@@ -1422,7 +1532,7 @@ mod tests {
             "{EXPECT_MODEL_ONLY}"
         );
         assert!(
-            render_llm(&[row]).contains(MODEL_SUFFIX),
+            render_llm(&[row], &[]).contains(MODEL_SUFFIX),
             "{EXPECT_MODEL_ONLY}"
         );
     }

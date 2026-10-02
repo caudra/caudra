@@ -17,8 +17,11 @@ use super::{
     update_presentation_coverage,
 };
 use crate::CancelToken;
+use crate::tools::native::plan::{self, PlanTarget};
+use crate::tools::{PermissionIntent, PermissionScopes, ToolContext};
 use crate::{AgentEvent, EventSender};
 use caudra_config::{DefaultEffect, FILE_WRITE_TOOLS, ToolKey};
+use serde_json::Value;
 use std::borrow::Cow;
 use std::path::Path;
 use std::sync::atomic::Ordering;
@@ -28,6 +31,63 @@ use tracing::{info, warn};
 
 pub(super) const CURRENT_POLICY_DENIES_REQUEST: &str =
     "current permission policy denies this request";
+pub(super) const CURRENT_DEFAULT_DENIES_REQUEST: &str =
+    "current permission default denies this request";
+const ACTIVE_PLAN_INTENT_MISMATCH: &str =
+    "plan permission intent does not match the active target and requested action";
+
+pub(super) fn active_plan_write(
+    intent: &PermissionIntent,
+    input: &Value,
+    target: &PlanTarget,
+) -> Result<bool, &'static str> {
+    let (operation, access) = match input.get("action").and_then(Value::as_str) {
+        Some("read") => ("read", PermissionResourceAccess::Read),
+        Some("write") => ("write", PermissionResourceAccess::Write),
+        _ => return Err(ACTIVE_PLAN_INTENT_MISMATCH),
+    };
+    let [resource] = intent.resources.as_slice() else {
+        return Err(ACTIVE_PLAN_INTENT_MISMATCH);
+    };
+    let (kind, value, scope_target) = match target {
+        PlanTarget::Local(path) => {
+            let path = path.to_str().ok_or(ACTIVE_PLAN_INTENT_MISMATCH)?;
+            (PermissionResourceKind::File, Cow::Borrowed(path), path)
+        }
+        PlanTarget::Remote(reference) => (
+            PermissionResourceKind::Custom {
+                name: "local_document".into(),
+            },
+            Cow::Owned(format!("plan:{}", reference.as_str())),
+            reference.as_str(),
+        ),
+    };
+    if resource.kind != kind
+        || resource.value != value
+        || resource.access.as_ref() != Some(&access)
+        || resource.attributes.get("operation").map(String::as_str) != Some(operation)
+        || intent.scopes.scopes != [format!("plan:{operation}:{scope_target}")]
+    {
+        return Err(ACTIVE_PLAN_INTENT_MISMATCH);
+    }
+    Ok(access == PermissionResourceAccess::Write)
+}
+
+pub(super) fn exact_local_plan_write(
+    tool: &ToolKey,
+    resources: &[PermissionResource],
+    plan_path: Option<&Path>,
+) -> bool {
+    plan_path.is_some_and(|plan_path| {
+        matches!(tool, ToolKey::Native(name) if FILE_WRITE_TOOLS.contains(&name.as_ref()))
+            && !resources.is_empty()
+            && resources.iter().all(|resource| {
+                resource.access == Some(PermissionResourceAccess::Write)
+                    && normalize_scope_path(&resource.value)
+                        == normalize_scope_path(&plan_path.display().to_string())
+            })
+    })
+}
 
 /// An intent that names no resource is normally a tool that under-declared what
 /// it touches, and denying it is what keeps a broad tool-level rule from
@@ -273,9 +333,7 @@ impl PermissionManager {
             && !context.force_prompt
             && default == DefaultEffect::Deny
         {
-            return Err(PermissionPolicyError(
-                "current permission default denies this request".into(),
-            ));
+            return Err(PermissionPolicyError(CURRENT_DEFAULT_DENIES_REQUEST.into()));
         }
         let automatic = (mode == PermissionMode::Yolo && !context.plan_scoped)
             || (!context.forced
@@ -368,6 +426,7 @@ impl PermissionManager {
             identity,
             include_builtin_allows,
             None,
+            false,
         )
         .await
     }
@@ -398,16 +457,56 @@ impl PermissionManager {
             identity,
             include_builtin_allows,
             Some(intent),
+            false,
+        )
+        .await
+    }
+
+    pub async fn enforce_active_plan(
+        &self,
+        intent: &PermissionIntent,
+        input: &Value,
+        ctx: &ToolContext,
+        request_id: &str,
+        identity: Option<(PermissionSubject, PermissionExecutorKind)>,
+    ) -> Result<(), PermissionError> {
+        let target = plan::verified_target(ctx).map_err(|error| {
+            PermissionError::with_guidance(
+                plan::NAME,
+                &intent.scopes.scopes.join("; "),
+                error.to_string(),
+            )
+        })?;
+        let verified_plan_write = active_plan_write(intent, input, &target).map_err(|error| {
+            PermissionError::with_guidance(
+                plan::NAME,
+                &intent.scopes.scopes.join("; "),
+                error.into(),
+            )
+        })?;
+        self.enforce_inner(
+            &ToolKey::native(plan::NAME),
+            &intent.scopes,
+            input,
+            &ctx.event_tx,
+            ctx.user_response_rx.as_deref(),
+            request_id,
+            &ctx.cancel,
+            None,
+            identity,
+            true,
+            Some(intent),
+            verified_plan_write,
         )
         .await
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) async fn enforce_inner(
+    async fn enforce_inner(
         &self,
         tool: &ToolKey,
-        scopes: &crate::tools::PermissionScopes,
-        input: &serde_json::Value,
+        scopes: &PermissionScopes,
+        input: &Value,
         event_tx: &EventSender,
         user_response_rx: Option<&async_lock::Mutex<flume::Receiver<String>>>,
         request_id: &str,
@@ -415,7 +514,8 @@ impl PermissionManager {
         plan_path: Option<&Path>,
         identity: Option<(PermissionSubject, PermissionExecutorKind)>,
         include_builtin_allows: bool,
-        intent: Option<&crate::tools::PermissionIntent>,
+        intent: Option<&PermissionIntent>,
+        verified_plan_write: bool,
     ) -> Result<(), PermissionError> {
         // A plan-scoped call is unreviewable in the same way a forced prompt
         // is, so it is built and presented the same way. The difference is what
@@ -511,15 +611,8 @@ impl PermissionManager {
             }
         };
         let initial_request = make_request(tool.clone(), scopes.scopes.clone(), unreviewed);
-        let exact_plan_write = plan_path.is_some_and(|plan_path| {
-            matches!(tool, ToolKey::Native(name) if FILE_WRITE_TOOLS.contains(&name.as_ref()))
-                && !initial_request.resources.is_empty()
-                && initial_request.resources.iter().all(|resource| {
-                    resource.access == Some(PermissionResourceAccess::Write)
-                        && normalize_scope_path(&resource.value)
-                            == normalize_scope_path(&plan_path.display().to_string())
-                })
-        });
+        let exact_plan_write = verified_plan_write
+            || exact_local_plan_write(tool, &initial_request.resources, plan_path);
         let force_prompt = unreviewed
             || (!exact_plan_write
                 && initial_request
@@ -925,8 +1018,9 @@ pub(super) fn contain_authority_to_the_plan(request: &mut PermissionRequest) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::{
+        ACTIVE_PLAN_INTENT_MISMATCH, CURRENT_DEFAULT_DENIES_REQUEST, CURRENT_POLICY_DENIES_REQUEST,
         EvaluationContext, PendingDecision, PendingPermission, PendingRegistration, remove_pending,
     };
     use crate::permissions::tests::{
@@ -937,12 +1031,24 @@ mod tests {
 
     use std::collections::BTreeMap;
 
-    use crate::tools::PermissionIntent;
+    use crate::tools::native::plan::{self, PlanTool};
+    use crate::tools::registry::Tool;
+    use crate::tools::test_support::stub_ctx;
+    use crate::tools::{PermissionIntent, ToolAudience, ToolContext};
+    use caudra_storage::id::SessionRef;
+    use caudra_storage::local_documents::LocalDocumentStore;
+    use caudra_storage::plans::PlanFile;
     use caudra_storage::sessions::SessionDatabase;
+    use serde_json::{Value, json};
+    use std::env;
+    #[cfg(unix)]
+    use std::fs::Permissions;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::{Builder, TempDir};
 
     use test_case::test_case;
 
-    use crate::AgentEvent;
     use crate::permissions::tests::{
         ALLOWED_COMMANDS, BROAD_GIT_PATTERN, BUILTIN_ECHO_PATTERN, COMPLEX_COMMAND,
         CONFINED_COMMAND, COVERAGE_COMMAND, COVERAGE_PATTERN, ECHO_COMMAND, EMPTY_MCP_SCOPE,
@@ -963,13 +1069,14 @@ mod tests {
         PROMPT_REASON_ASK_RULE, PROMPT_REASON_FORCED, PROMPT_REASON_PROTECTED,
         PROMPT_REASON_UNCOVERED, PermissionAnswer, PermissionAuthorityProfile,
         PermissionExecutorKind, PermissionLifetime, PermissionManager, PermissionMode,
-        PermissionRequest, PermissionResource, PermissionResourceAccess, PermissionResourceKind,
-        PermissionRisk, PermissionRowGrant, PermissionRuleRecord, PermissionSubject,
-        RemotePermissionIdentity, ResourceCoverage, RevokedRuleScope, RuleOrigin,
-        StructuredPermissionDecision, StructuredPermissionEffect, builtin_structured_rules,
-        canonical_json, canonical_json_sha256, filesystem_permission_resource, is_shell_tool,
-        normalize_scope_path, prompt_forcing_reason,
+        PermissionPolicyError, PermissionRequest, PermissionResource, PermissionResourceAccess,
+        PermissionResourceKind, PermissionRisk, PermissionRowGrant, PermissionRuleRecord,
+        PermissionSubject, RemotePermissionIdentity, ResourceCoverage, RevokedRuleScope,
+        RuleOrigin, StructuredPermissionDecision, StructuredPermissionEffect,
+        builtin_structured_rules, canonical_json, canonical_json_sha256,
+        filesystem_permission_resource, is_shell_tool, normalize_scope_path, prompt_forcing_reason,
     };
+    use crate::{AgentEvent, AgentMode};
     use caudra_config::{DefaultEffect, Effect, PermissionRule, PermissionsConfig, ToolKey};
     use caudra_storage::StateDir;
     use caudra_storage::permission_state::PermissionState;
@@ -978,6 +1085,295 @@ mod tests {
 
     const REPLACEMENT_COMMAND: &str = "cargo clean";
     const AUTO_BUILTIN_ASK: &str = "git push origin main";
+    const PLAN_DOCUMENT: &str = "active-plan.md";
+    const PLAN_CONTENT: &str = "The complete plan";
+    #[cfg(unix)]
+    const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+
+    enum PlanIntentMismatch {
+        Target,
+        Access,
+        Operation,
+        Scope,
+        Kind,
+        ExtraResource,
+        MissingResource,
+        Action,
+        MissingAction,
+    }
+
+    pub(in crate::permissions) async fn active_plan_fixture(
+        remote: bool,
+    ) -> (TempDir, ToolContext, PermissionIntent, Value) {
+        let mut builder = Builder::new();
+        #[cfg(unix)]
+        builder.permissions(Permissions::from_mode(PRIVATE_DIRECTORY_MODE));
+        let root = builder
+            .tempdir_in(env::temp_dir().canonicalize().unwrap())
+            .unwrap();
+        let mut ctx = if remote {
+            let (workspace, _) =
+                crate::stored_session::tests::remote_workspace(CONTROLLED_REQUEST, PLAN_CONTENT);
+            let session = SessionRef::generate();
+            let store = Arc::new(LocalDocumentStore::remote(
+                StateDir::from_path(root.path().join("state")),
+                workspace.binding(),
+            ));
+            let reference = store
+                .create_plan(workspace.binding().project().key(), session.as_str())
+                .unwrap();
+            let mut ctx = stub_ctx(&AgentMode::RemotePlan(reference));
+            ctx.workspace_session = Some(workspace);
+            ctx.local_documents = Some(store);
+            ctx.session_id = Some(session);
+            ctx
+        } else {
+            let path = root.path().join(PLAN_DOCUMENT);
+            PlanFile::new(path.clone())
+                .unwrap()
+                .write(PLAN_CONTENT)
+                .unwrap();
+            stub_ctx(&AgentMode::Plan(path))
+        };
+        ctx.host_cwd = Some(root.path().to_path_buf());
+        let input = json!({"action": "write", "content": PLAN_CONTENT});
+        let intent = PlanTool
+            .parse(&input)
+            .unwrap()
+            .preflight(&ctx)
+            .await
+            .unwrap()
+            .unwrap();
+        (root, ctx, intent, input)
+    }
+
+    #[test_case(DefaultEffect::Prompt, None; "default_prompt_approves_exact_plan")]
+    #[test_case(DefaultEffect::Allow, None; "default_allow_approves_exact_plan")]
+    #[test_case(DefaultEffect::Deny, None; "default_deny_blocks_exact_plan")]
+    #[test_case(DefaultEffect::Prompt, Some(Effect::Deny); "explicit_deny_blocks_exact_plan")]
+    #[test_case(DefaultEffect::Allow, Some(Effect::Deny); "deny_beats_default_allow")]
+    #[test_case(DefaultEffect::Prompt, Some(Effect::Ask); "explicit_ask_prompts_exact_plan")]
+    #[test_case(DefaultEffect::Allow, Some(Effect::Ask); "ask_beats_default_allow")]
+    fn active_plan_approval_preserves_policy(default: DefaultEffect, effect: Option<Effect>) {
+        smol::block_on(async {
+            for remote in [false, true] {
+                let (_root, mut ctx, intent, input) = active_plan_fixture(remote).await;
+                let manager = mgr_with(
+                    PermissionsConfig {
+                        default,
+                        rules: effect
+                            .into_iter()
+                            .map(|effect| PermissionRule {
+                                tool: ToolKey::native(plan::NAME),
+                                scope: Some(intent.resources[0].value.clone()),
+                                effect,
+                            })
+                            .collect(),
+                        ..Default::default()
+                    },
+                    ctx.host_cwd.clone().unwrap(),
+                );
+                let (events, receiver) = flume::unbounded();
+                ctx.event_tx = EventSender::new(events, 0);
+                let (_sender, responses) = flume::unbounded();
+                ctx.user_response_rx = Some(Arc::new(async_lock::Mutex::new(responses)));
+                let mut enforcement = Box::pin(manager.enforce_active_plan(
+                    &intent,
+                    &input,
+                    &ctx,
+                    CONTROLLED_REQUEST,
+                    None,
+                ));
+                if effect == Some(Effect::Ask) {
+                    assert!(
+                        futures_lite::future::poll_once(&mut enforcement)
+                            .await
+                            .is_none()
+                    );
+                    assert!(matches!(
+                        receiver.try_recv().unwrap().event,
+                        AgentEvent::PermissionRequest(_)
+                    ));
+                    assert!(manager.answer(CONTROLLED_REQUEST, PermissionAnswer::Deny));
+                    assert!(enforcement.await.is_err());
+                } else if effect == Some(Effect::Deny) || default == DefaultEffect::Deny {
+                    let error = enforcement.await.unwrap_err();
+                    let expected = PermissionPolicyError(if effect == Some(Effect::Deny) {
+                        CURRENT_POLICY_DENIES_REQUEST.into()
+                    } else {
+                        CURRENT_DEFAULT_DENIES_REQUEST.into()
+                    })
+                    .to_string();
+                    assert_eq!(error.guidance, Some(expected));
+                    assert!(receiver.is_empty());
+                } else {
+                    assert!(enforcement.await.is_ok());
+                    assert!(receiver.is_empty());
+                }
+            }
+        });
+    }
+
+    #[test_case(PlanIntentMismatch::Target; "other_target")]
+    #[test_case(PlanIntentMismatch::Access; "missing_write_access")]
+    #[test_case(PlanIntentMismatch::Operation; "wrong_operation")]
+    #[test_case(PlanIntentMismatch::Scope; "wrong_scope")]
+    #[test_case(PlanIntentMismatch::Kind; "wrong_resource_kind")]
+    #[test_case(PlanIntentMismatch::ExtraResource; "extra_resource")]
+    #[test_case(PlanIntentMismatch::MissingResource; "missing_resource")]
+    #[test_case(PlanIntentMismatch::Action; "read_input_with_write_intent")]
+    #[test_case(PlanIntentMismatch::MissingAction; "missing_input_action")]
+    fn active_plan_rejects_mismatched_intent(field: PlanIntentMismatch) {
+        smol::block_on(async {
+            for remote in [false, true] {
+                let (_root, ctx, mut intent, mut input) = active_plan_fixture(remote).await;
+                match field {
+                    PlanIntentMismatch::Target => intent.resources[0].value.push_str(".other"),
+                    PlanIntentMismatch::Access => intent.resources[0].access = None,
+                    PlanIntentMismatch::Operation => {
+                        intent.resources[0]
+                            .attributes
+                            .insert("operation".into(), "read".into());
+                    }
+                    PlanIntentMismatch::Scope => intent.scopes.scopes.clear(),
+                    PlanIntentMismatch::Kind => {
+                        intent.resources[0].kind = PermissionResourceKind::Directory
+                    }
+                    PlanIntentMismatch::ExtraResource => {
+                        intent.resources.push(intent.resources[0].clone())
+                    }
+                    PlanIntentMismatch::MissingResource => intent.resources.clear(),
+                    PlanIntentMismatch::Action => input["action"] = json!("read"),
+                    PlanIntentMismatch::MissingAction => input = json!({}),
+                }
+                let manager = mgr_with(
+                    PermissionsConfig {
+                        default: DefaultEffect::Allow,
+                        ..Default::default()
+                    },
+                    ctx.host_cwd.clone().unwrap(),
+                );
+                let error = manager
+                    .enforce_active_plan(&intent, &input, &ctx, CONTROLLED_REQUEST, None)
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.guidance.as_deref(), Some(ACTIVE_PLAN_INTENT_MISMATCH));
+            }
+        });
+    }
+
+    #[test_case(true; "forced_prompt")]
+    #[test_case(false; "plan_containment")]
+    fn active_plan_approval_preserves_prompt_flags(forced: bool) {
+        smol::block_on(async {
+            for remote in [false, true] {
+                let (_root, ctx, mut intent, input) = active_plan_fixture(remote).await;
+                intent.scopes.force_prompt = forced;
+                intent.scopes.plan_scoped = !forced;
+                assert!(
+                    default_mgr()
+                        .enforce_active_plan(&intent, &input, &ctx, CONTROLLED_REQUEST, None)
+                        .await
+                        .is_err()
+                );
+            }
+        });
+    }
+
+    #[test_case(false; "build_mode")]
+    #[test_case(true; "subagent_audience")]
+    fn active_plan_revalidates_execution_authority(subagent: bool) {
+        smol::block_on(async {
+            for remote in [false, true] {
+                let (_root, mut ctx, intent, input) = active_plan_fixture(remote).await;
+                if subagent {
+                    ctx.audience = ToolAudience::GENERAL_SUB;
+                } else {
+                    ctx.mode = AgentMode::Build;
+                }
+                assert!(
+                    default_mgr()
+                        .enforce_active_plan(&intent, &input, &ctx, CONTROLLED_REQUEST, None)
+                        .await
+                        .is_err()
+                );
+            }
+        });
+    }
+
+    #[test_case(false; "ordinary_intent_does_not_gain_approval")]
+    #[test_case(true; "legacy_scopes_do_not_gain_approval")]
+    fn active_plan_name_does_not_grant_authority(legacy: bool) {
+        smol::block_on(async {
+            for remote in [false, true] {
+                let (_root, ctx, intent, input) = active_plan_fixture(remote).await;
+                let manager = default_mgr();
+                let tool = ToolKey::native(plan::NAME);
+                let result = if legacy {
+                    manager
+                        .enforce(
+                            &tool,
+                            &intent.scopes,
+                            &input,
+                            &ctx.event_tx,
+                            None,
+                            CONTROLLED_REQUEST,
+                            &ctx.cancel,
+                            ctx.mode.plan_path(),
+                        )
+                        .await
+                } else {
+                    manager
+                        .enforce_with_intent(
+                            &tool,
+                            &intent,
+                            &input,
+                            &ctx.event_tx,
+                            None,
+                            CONTROLLED_REQUEST,
+                            &ctx.cancel,
+                            ctx.mode.plan_path(),
+                            None,
+                            true,
+                        )
+                        .await
+                };
+                assert!(result.is_err());
+            }
+        });
+    }
+
+    #[test_case(DefaultEffect::Prompt, false; "read_has_no_write_approval")]
+    #[test_case(DefaultEffect::Allow, true; "read_uses_ordinary_policy")]
+    fn active_plan_read_uses_normal_policy(default: DefaultEffect, allowed: bool) {
+        smol::block_on(async {
+            for remote in [false, true] {
+                let (_root, ctx, _, _) = active_plan_fixture(remote).await;
+                let input = json!({"action": "read"});
+                let intent = PlanTool
+                    .parse(&input)
+                    .unwrap()
+                    .preflight(&ctx)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let manager = mgr_with(
+                    PermissionsConfig {
+                        default,
+                        ..Default::default()
+                    },
+                    ctx.host_cwd.clone().unwrap(),
+                );
+                assert_eq!(
+                    manager
+                        .enforce_active_plan(&intent, &input, &ctx, CONTROLLED_REQUEST, None)
+                        .await
+                        .is_ok(),
+                    allowed
+                );
+            }
+        });
+    }
 
     #[test_case(FIRST_COMMAND, None, false, true; "unmatched_default_ask_runs")]
     #[test_case(FIRST_COMMAND, Some(Effect::Ask), false, false; "configured_ask_prompts")]

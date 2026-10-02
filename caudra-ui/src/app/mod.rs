@@ -112,8 +112,8 @@ use crate::components::workflow_catalog_picker::WorkflowCatalogPicker;
 use crate::components::workflow_inspector::WorkflowInspector;
 use crate::components::worktree_picker::{WorktreePicker, WorktreeView};
 use crate::components::{
-    Action, DisplayMessage, DisplayRole, DisplaySource, ExitRequest, Overlay, RetryInfo, Status,
-    escape_terminal_controls, is_ctrl,
+    Action, DisplayMessage, DisplayRole, DisplaySource, ExitRequest, Overlay, PlanHandoff,
+    RetryInfo, Status, escape_terminal_controls, is_ctrl,
 };
 use crate::image;
 use crate::input_document::InputDraft;
@@ -130,11 +130,12 @@ use caudra_agent::herdr::PaneMetadata;
 use caudra_agent::mentions;
 use caudra_agent::permissions::{PermissionManager, PermissionPolicyError};
 use caudra_agent::prompt::profile::PromptProfileCatalog;
+use caudra_agent::tools::native::plan;
 use caudra_agent::types::{BACKGROUND_EVENT_RUN_ID, WorkflowProvenance};
 use caudra_agent::{
     AgentEvent, AgentInput, AgentMode, CommitRef, Envelope, GoalVerdict, ImageSource,
     McpConfigErrors, McpPromptInfo, McpSnapshotReader, Mention, PromptAdmission, QueueItemId,
-    SharedHistory, SteeringQueue, SubagentInfo, project_for_inspection,
+    SharedHistory, SteeringQueue, SubagentInfo, ToolOutput, project_for_inspection,
 };
 use caudra_config::decisions::{DecisionsConfig, FeatureMode};
 use caudra_config::{
@@ -161,6 +162,7 @@ use caudra_storage::view::ViewMode;
 use caudra_workspace::WorkspaceChangeService;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
 use flume::{Receiver, TryRecvError};
+use serde_json::Value;
 use smol::Task;
 
 use crate::storage_writer::StorageWriter;
@@ -218,6 +220,7 @@ const REVIEW_READY_MSG: &str = "Review notes added to the prompt";
 const REVIEW_UNAVAILABLE_MSG: &str = "Nothing to review here yet";
 const SHELL_PASTE_EXPANDED_MSG: &str = "Expanded pasted text; press Enter again to run it";
 const IMPLEMENT_MSG_PREFIX: &str = "Implement the plan";
+const IMPLEMENT_CAPTURE_FAILED: &str = "Cannot implement plan";
 const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign each subagent a separate module and restrict its tests to that module to avoid interference.";
 const PERMISSION_BLOCKER: &str = "Permission requested";
 const AUTH_BLOCKER: &str = "Authentication required";
@@ -4406,21 +4409,49 @@ impl App {
             }
         }
 
-        if let AgentEvent::ToolDone(ref e) = envelope.event {
+        let active_plan = subagent_id.is_none()
+            && envelope.task.is_none()
+            && self.execution_agent_mode() == self.agent_mode_for(Mode::Plan);
+        let mut plan_write = None;
+        if let AgentEvent::ToolDone(ref mut e) = envelope.event {
+            let native_plan = &*e.tool == plan::NAME;
+            if native_plan && self.state.session.tool_outputs().contains_key(&e.id) {
+                return vec![];
+            }
+            let committed_plan = e.plan_write_result();
+            if committed_plan.is_some()
+                && let Some(annotation) = &e.annotation
+                && let ToolOutput::Markdown(text) = &mut e.output
+                && text.state.is_none()
+            {
+                text.state = Some(Value::String(annotation.clone()));
+            }
             self.record_tool_call(e);
-            self.reload_written(e);
+            if !native_plan {
+                self.reload_written(e);
+            }
             // Whatever the call opened and never claimed was a prediction the
             // call disagreed with: bad arguments, or a child `batch` refused.
             if subagent_id.is_none() {
                 self.discard_pending_delegations_under(&e.id);
             }
-            if self.execution_agent_mode() == self.agent_mode_for(Mode::Plan)
-                && (self.state.plan.path().is_some_and(|pp| e.wrote_to(pp))
-                    || self
-                        .state
-                        .plan
-                        .document_ref()
-                        .is_some_and(|reference| e.wrote_document(&reference)))
+            if native_plan {
+                if active_plan
+                    && let Some(plan) = committed_plan
+                    && self.accepts_plan_write(&plan)
+                {
+                    self.reload_committed_plan(&plan);
+                    self.transition_plan(PlanTrigger::WriteDone);
+                    plan_write = Some((e.id.clone(), plan));
+                }
+            } else if active_plan
+                && (self.state.plan.path().is_some_and(|pp| {
+                    e.wrote_to(pp) || e.wrote_to(&Path::new(&self.state.session.cwd).join(pp))
+                }) || self
+                    .state
+                    .plan
+                    .document_ref()
+                    .is_some_and(|reference| e.wrote_document(&reference)))
             {
                 self.transition_plan(PlanTrigger::WriteDone);
             }
@@ -4665,14 +4696,24 @@ impl App {
             event => event,
         };
 
-        let plan_path = if self.state.mode == Mode::Plan {
+        let plan_path = if active_plan {
             self.state.plan.path()
         } else {
             None
         };
         let result = self.chats[chat_idx].handle_event(event, plan_path);
+        if let Some((id, plan)) = plan_write {
+            self.chats[chat_idx].plan_written(&id, &plan);
+        }
 
         let result = match result {
+            ChatEventResult::PlanWritten(plan) => {
+                if active_plan && self.accepts_plan_write(&plan) {
+                    self.reload_committed_plan(&plan);
+                    self.transition_plan(PlanTrigger::WriteDone);
+                }
+                return vec![];
+            }
             ChatEventResult::QueueBatchConsumed { items } => {
                 if chat_idx == 0 {
                     self.on_queue_batch_consumed(&items);
@@ -4833,6 +4874,7 @@ impl App {
                     }
                 }
                 ChatEventResult::AuthRequired
+                | ChatEventResult::PlanWritten(_)
                 | ChatEventResult::AuthRestored
                 | ChatEventResult::Question(_)
                 | ChatEventResult::PermissionRequest(_)
@@ -6222,63 +6264,65 @@ impl App {
         if self.plan_unsaved() {
             return vec![];
         }
+        let snapshot = match self.capture_plan() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.flash(format!("{IMPLEMENT_CAPTURE_FAILED}: {error}"));
+                return vec![];
+            }
+        };
         let parallel = self.plan_form.parallel();
-        self.plan_form.reset();
-        let plan_snapshot = match std::mem::take(&mut self.state.plan) {
-            PlanState::Ready(p) => Some((
-                std::fs::read_to_string(&p).unwrap_or_default(),
-                p.display().to_string(),
-            )),
-            PlanState::RemoteReady(reference) => self
-                .workspace_session
-                .as_ref()
-                .zip(self.local_documents.as_ref())
-                .and_then(|(workspace, store)| {
-                    store
-                        .read(
-                            workspace.binding().project().key(),
-                            Some(&self.state.session.id.to_string()),
-                            &caudra_workspace::LocalDocumentRef::Plan(reference.clone()),
-                        )
-                        .ok()
-                })
-                .map(|document| {
-                    (
-                        document.content,
-                        format!("plan reference {}", reference.as_str()),
-                    )
-                }),
-            _ => None,
-        };
-
-        self.state.mode = Mode::Build;
-
-        let mut actions = if clear_context {
-            vec![Action::RequestNewSession]
-        } else {
-            vec![]
-        };
-
-        let text = if let Some((content, path_str)) = plan_snapshot {
-            let text = if parallel {
-                format!("{IMPLEMENT_MSG_PREFIX} at `{path_str}`. {IMPLEMENT_PARALLEL_HINT}")
+        let header = format!(
+            "{IMPLEMENT_MSG_PREFIX} from `{}` (revision `{}`).{}",
+            snapshot.source,
+            snapshot.revision.as_str(),
+            if parallel {
+                format!(" {IMPLEMENT_PARALLEL_HINT}")
             } else {
-                format!("{IMPLEMENT_MSG_PREFIX} at `{path_str}`.")
-            };
-            self.main_chat()
-                .push(DisplayMessage::plan(content, path_str));
-            text
-        } else {
-            format!("{}.", IMPLEMENT_MSG_PREFIX)
-        };
+                String::new()
+            }
+        );
         let msg = QueuedMessage {
-            text,
-            images: vec![],
+            text: format!("{header}\n\n{}", snapshot.content),
+            images: Vec::new(),
             mentions: Vec::new(),
             commits: Vec::new(),
             paste_ranges: Vec::new(),
         };
-        actions.extend(self.start_from_queue(&msg));
+        let mut input = self.build_agent_input(&msg);
+        input.mode = AgentMode::Build;
+        let handoff = PlanHandoff {
+            input,
+            content: snapshot.content,
+            source: snapshot.source,
+            header,
+        };
+        if clear_context {
+            if let Err(error) = self.check_run_admission() {
+                self.flash(error);
+                return vec![];
+            }
+            return vec![Action::ClearAndImplement(Box::new(handoff))];
+        }
+        if let Err(error) = self.admit_run() {
+            self.flash(error);
+            return vec![];
+        }
+        self.finish_plan_handoff(handoff)
+    }
+
+    pub(crate) fn consume_plan(&mut self) {
+        self.plan_form.reset();
+        self.state.plan = PlanState::None;
+        self.state.mode = Mode::Build;
+    }
+
+    pub(crate) fn finish_plan_handoff(&mut self, handoff: PlanHandoff) -> Vec<Action> {
+        let actions = self.start_admitted_run(handoff.input, String::new());
+        self.consume_plan();
+        self.main_chat()
+            .push(DisplayMessage::plan(handoff.content, handoff.source));
+        self.main_chat().show_user_message(handoff.header);
         actions
     }
 }

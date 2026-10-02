@@ -27,6 +27,7 @@ use strum::Display;
 use crate::agent::{GoalResult, GoalVerdict};
 use crate::peers::{PeerSummary, SendReceipt};
 use crate::permissions::PermissionRequest;
+use crate::tools::native::plan::{self, PlanTarget, PlanWriteResult};
 use crate::tools::{TOOL_OUTPUT_TOOL_NAME, ToolEffect, ToolFailure};
 
 pub const NO_FILES_FOUND: &str = "No files found";
@@ -295,6 +296,15 @@ pub struct BatchProgressEvent {
     pub id: String,
     pub index: usize,
     pub entry: BatchToolEntry,
+}
+
+impl BatchToolEntry {
+    pub fn plan_write_result(&self) -> Option<PlanWriteResult> {
+        if self.status != BatchToolStatus::Success || self.tool != plan::NAME {
+            return None;
+        }
+        self.output.as_ref()?.plan_write_result()
+    }
 }
 
 /// Declared in the order a child moves through, which is what lets a reader
@@ -1402,6 +1412,16 @@ fn written_size(byte_count: usize, lines: &[String]) -> String {
 }
 
 impl ToolOutput {
+    pub fn plan_write_result(&self) -> Option<PlanWriteResult> {
+        let Self::Markdown(text) = self else {
+            return None;
+        };
+        text.state
+            .as_ref()?
+            .as_str()
+            .and_then(plan::parse_write_result)
+    }
+
     /// Short header suffix summarizing the output, e.g. `12 lines`.
     /// The UI uses it on tool completion, and `caudra.agent.call_tool` falls
     /// back to it when the tool's reply has no annotation of its own.
@@ -1935,6 +1955,11 @@ impl ToolDoneEvent {
     }
 
     pub fn wrote_to(&self, plan_path: &Path) -> bool {
+        if &*self.tool == plan::NAME {
+            return self.plan_write_result().is_some_and(
+                |result| matches!(result.target(), PlanTarget::Local(path) if path == plan_path),
+            );
+        }
         !self.remote_written_paths
             && self
                 .written_paths()
@@ -1945,6 +1970,12 @@ impl ToolDoneEvent {
         if self.is_error {
             return false;
         }
+        if &*self.tool == plan::NAME {
+            return self.plan_write_result().is_some_and(|result| {
+                matches!((result.target(), reference),
+                    (PlanTarget::Remote(written), LocalDocumentRef::Plan(expected)) if written == expected)
+            });
+        }
         let (kind, id) = match reference {
             LocalDocumentRef::Plan(reference) => ("plan", reference.as_str()),
             LocalDocumentRef::Memory(reference) => ("memory", reference.as_str()),
@@ -1954,6 +1985,17 @@ impl ToolDoneEvent {
                 .strip_prefix("local_document:")
                 .and_then(|value| value.split_once(";revision:"))
                 .is_some_and(|(written, _)| written == format!("{kind}:{id}"))
+        })
+    }
+
+    pub fn plan_write_result(&self) -> Option<PlanWriteResult> {
+        if self.is_error || &*self.tool != plan::NAME {
+            return None;
+        }
+        self.output.plan_write_result().or_else(|| {
+            self.annotation
+                .as_deref()
+                .and_then(plan::parse_write_result)
         })
     }
 }
@@ -3027,9 +3069,15 @@ mod tests {
     use caudra_providers::estimate_tokens;
     use caudra_storage::StateDir;
     use caudra_storage::id::SessionRef;
+    use caudra_storage::local_documents::DocumentRevision;
     use caudra_storage::tool_outputs::ToolOutputStore;
+    use caudra_workspace::PlanRef;
     use tempfile::TempDir;
     use test_case::test_case;
+
+    const PLAN_WRITE_PATH: &str = "/plans/committed.md";
+    const PLAN_WRITE_REFERENCE: &str = "plan-committed";
+    const PLAN_WRITE_CONTENT: &str = "# Committed plan";
 
     fn shell_output() -> ShellOutput {
         ShellOutput {
@@ -4026,6 +4074,77 @@ mod tests {
             ..ok_event
         };
         assert!(!err_event.wrote_to(Path::new("/plans/slug.md")));
+    }
+
+    #[test_case(false, false ; "local_success")]
+    #[test_case(true, false ; "remote_success")]
+    #[test_case(false, true ; "local_failure")]
+    #[test_case(true, true ; "remote_failure")]
+    fn encoded_plan_target_drives_write_helpers(remote: bool, error: bool) {
+        let reference = PlanRef::new(PLAN_WRITE_REFERENCE).unwrap();
+        let target = if remote {
+            PlanTarget::Remote(reference.clone())
+        } else {
+            PlanTarget::Local(PLAN_WRITE_PATH.into())
+        };
+        let result = PlanWriteResult::new(
+            target,
+            DocumentRevision::new("a".repeat(64)).unwrap(),
+            PLAN_WRITE_CONTENT.into(),
+        );
+        let mut event = ToolDoneEvent::error("plan-write".into(), PLAN_WRITE_CONTENT);
+        event.tool = plan::NAME.into();
+        event.is_error = error;
+        event.annotation = Some(result.annotation().unwrap());
+        assert_eq!(
+            event.wrote_to(Path::new(PLAN_WRITE_PATH)),
+            !remote && !error
+        );
+        assert_eq!(
+            event.wrote_document(&LocalDocumentRef::Plan(reference)),
+            remote && !error
+        );
+        assert_eq!(event.plan_write_result().is_some(), !error);
+        event.output = ToolOutput::Markdown(TextOutput {
+            state: event.annotation.take().map(Value::String),
+            ..PLAN_WRITE_CONTENT.into()
+        });
+        assert_eq!(event.plan_write_result().is_some(), !error);
+        event.tool = "custom".into();
+        assert!(event.plan_write_result().is_none());
+    }
+
+    #[test_case(BatchToolStatus::Running, plan::NAME, true, false; "nonterminal")]
+    #[test_case(BatchToolStatus::Error, plan::NAME, true, false; "failed")]
+    #[test_case(BatchToolStatus::Success, "custom", true, false; "other_tool")]
+    #[test_case(BatchToolStatus::Success, plan::NAME, false, false; "annotation_only")]
+    #[test_case(BatchToolStatus::Success, plan::NAME, true, true; "committed")]
+    fn batch_plan_result_requires_successful_native_state(
+        status: BatchToolStatus,
+        tool: &str,
+        state: bool,
+        expected: bool,
+    ) {
+        let result = PlanWriteResult::new(
+            PlanTarget::Local(PLAN_WRITE_PATH.into()),
+            DocumentRevision::new("a".repeat(64)).unwrap(),
+            PLAN_WRITE_CONTENT.into(),
+        );
+        let entry = BatchToolEntry {
+            tool: tool.into(),
+            effect: ToolEffect::Mutating,
+            summary: String::new(),
+            status,
+            input: None,
+            raw_input: None,
+            output: Some(ToolOutput::Markdown(TextOutput {
+                state: state.then(|| result.annotation().unwrap().into()),
+                ..PLAN_WRITE_CONTENT.into()
+            })),
+            annotation: Some(result.annotation().unwrap()),
+            model_suffix: None,
+        };
+        assert_eq!(entry.plan_write_result(), expected.then_some(result));
     }
 
     #[test]
