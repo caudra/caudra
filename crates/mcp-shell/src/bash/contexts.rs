@@ -14,6 +14,7 @@ pub const MAX_CONTEXT_BYTES: usize = 1024 * 1024;
 const CONTEXT_DIAGNOSTICS_PER_NODE: usize = 3;
 const INITIAL_CONTEXT_DIAGNOSTICS: usize = 3;
 const TYPE_FLAGS: &str = "afptP";
+const EXPANSION: char = '$';
 const BASH_BUILTINS: &[&str] = &[
     ".",
     ":",
@@ -341,7 +342,7 @@ impl ContextBuilder {
                     complete: matches!(incoming, BashCwdSet::Known(_)),
                     incoming: incoming.clone(),
                 });
-                self.command(id, command, incoming)
+                self.command(program, id, command, incoming)
             }
             BashNodeKind::Assignments { .. } | BashNodeKind::Unknown { .. } => {
                 self.issue(id, BashContextIssue::UnknownStateEffect);
@@ -350,10 +351,13 @@ impl ContextBuilder {
         }
     }
 
-    fn command(&mut self, id: BashNodeId, command: &BashCommand, incoming: BashCwdSet) -> Outcomes {
-        let Some(argv) = command.static_argv() else {
-            return self.unknown_effect(id);
-        };
+    fn command(
+        &mut self,
+        program: &BashProgram,
+        id: BashNodeId,
+        command: &BashCommand,
+        incoming: BashCwdSet,
+    ) -> Outcomes {
         if !command.assignments.is_empty()
             || command.redirects.iter().any(|redirect| {
                 redirect
@@ -364,6 +368,13 @@ impl ContextBuilder {
         {
             return self.unknown_effect(id);
         }
+        let Some(argv) = command.static_argv() else {
+            return if external_with_inert_expansions(program, command) {
+                Outcomes::unchanged(incoming)
+            } else {
+                self.unknown_effect(id)
+            };
+        };
         let Some(executable) = argv.first() else {
             return self.unknown_effect(id);
         };
@@ -421,6 +432,25 @@ impl ContextBuilder {
     }
 }
 
+/// A program the shell starts cannot change the shell's own state, so what its
+/// words expand to matters only when expanding them can. Globs, braces, and
+/// tildes assign nothing. A parameter expansion such as `${CDPATH:=/elsewhere}`
+/// does, so any word with one keeps the effect unknown.
+fn external_with_inert_expansions(program: &BashProgram, command: &BashCommand) -> bool {
+    command.complete
+        && command
+            .words
+            .first()
+            .and_then(|word| word.literal.as_deref())
+            .is_some_and(|executable| !BASH_BUILTINS.contains(&executable))
+        && command.words.iter().all(|word| {
+            word.literal.is_some()
+                || program
+                    .text(&word.span)
+                    .is_some_and(|text| !text.contains(EXPANSION))
+        })
+}
+
 /// `command -v|-V` and `type` only report what each name resolves to.
 fn looks_up_names(argv: &[&str]) -> bool {
     let names = match argv {
@@ -450,8 +480,8 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        BashCommandContexts, BashContextAssumptions, BashContextIssue, BashCwdSet,
-        MAX_CWD_PATH_BYTES, MAX_CWD_STATES,
+        BashCommandContexts, BashContextAssumptions, BashContextDiagnostic, BashContextIssue,
+        BashCwdSet, MAX_CWD_PATH_BYTES, MAX_CWD_STATES,
     };
     use crate::bash::parse_bash;
 
@@ -629,6 +659,37 @@ mod tests {
     }
 
     #[test]
+    fn an_external_command_keeps_the_cwd_whatever_its_globs_match() {
+        for source in [
+            "ls src/* && cat note",
+            "wc -l src/*.rs; cat note",
+            "ls ~/x* {a,b}/*; cat note",
+        ] {
+            let result = contexts(source);
+            assert!(result.complete, "{source:?}: {:?}", result.diagnostics);
+            assert_eq!(
+                result.commands.last().unwrap().incoming,
+                paths(&[""]),
+                "{source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_command_in_a_program_that_did_not_lower_stays_an_unknown_effect() {
+        let result = contexts("for x in a; do :; done; ls src/*");
+        let diagnostic = BashContextDiagnostic {
+            node: result.commands.last().unwrap().command,
+            issue: BashContextIssue::UnknownStateEffect,
+        };
+        assert!(
+            result.diagnostics.contains(&diagnostic),
+            "{:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
     fn no_startup_or_environment_assumption_is_inferred_from_source() {
         let program = parse_bash("cd left && cat note").unwrap();
         let default = program.command_contexts(Path::new(INITIAL));
@@ -708,6 +769,10 @@ mod tests {
             "trap 'cd left' DEBUG; cat note",
             "if cd left; then cat a; fi; cat note",
             "f() { cd left; }; f; cat note",
+            "ls ${CDPATH:=/outside}; cd left; cat note",
+            "cd left/*; cat note",
+            "ls src/* > $out; cat note",
+            "MODE=fast ls src/*; cat note",
         ] {
             let result = contexts(source);
             assert!(!result.complete, "{source:?}");
