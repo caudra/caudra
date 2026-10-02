@@ -81,7 +81,7 @@ pub async fn authenticate(
     let resource_meta =
         discovery::discover_resource_metadata(server_url, www_auth.as_ref(), server_addresses)
             .await
-            .map_err(&wrap)?;
+            .map_err(wrap)?;
 
     let auth_server_url = resource_meta
         .authorization_servers
@@ -92,7 +92,7 @@ pub async fn authenticate(
     let auth_server =
         discovery::discover_auth_server(&auth_server_url, server_url, server_addresses)
             .await
-            .map_err(&wrap)?;
+            .map_err(wrap)?;
 
     if !auth_server.code_challenge_methods_supported.is_empty()
         && !auth_server
@@ -110,7 +110,7 @@ pub async fn authenticate(
         server_addresses,
         HTTP_TIMEOUT,
     )
-    .map_err(&wrap)?;
+    .map_err(wrap)?;
 
     let callback = CallbackServer::bind(
         static_client.as_ref().and_then(|c| c.callback_port),
@@ -141,17 +141,17 @@ pub async fn authenticate(
         }
     } else if let Some(endpoint) = &auth_server.registration_endpoint {
         let client = build_http_client(endpoint, server_url, server_addresses, HTTP_TIMEOUT)
-            .map_err(&wrap)?;
+            .map_err(wrap)?;
         registration::register_client(&client, endpoint, &redirect_uri)
             .await
-            .map_err(&wrap)?
+            .map_err(wrap)?
     } else {
         return Err(wrap(OAuthError::Other(
             "no stored client and server has no registration endpoint".into(),
         )));
     };
 
-    let pkce = pkce::generate().map_err(&wrap)?;
+    let pkce = pkce::generate().map_err(wrap)?;
 
     let mut state_buf = [0u8; 16];
     getrandom::fill(&mut state_buf)
@@ -172,7 +172,7 @@ pub async fn authenticate(
         scope.as_deref(),
         server_url,
     )
-    .map_err(&wrap)?;
+    .map_err(wrap)?;
 
     info!(server = server_name, endpoint = %auth_server.authorization_endpoint, "starting OAuth authorization");
     let result = match interaction {
@@ -221,7 +221,7 @@ pub async fn authenticate(
         server_addresses,
         HTTP_TIMEOUT,
     )
-    .map_err(&wrap)?;
+    .map_err(wrap)?;
     let tokens = token::exchange_code(
         &token_client,
         &auth_server.token_endpoint,
@@ -233,7 +233,7 @@ pub async fn authenticate(
         server_url,
     )
     .await
-    .map_err(&wrap)?;
+    .map_err(wrap)?;
 
     let data = McpAuthData {
         server_url: server_url.to_string(),

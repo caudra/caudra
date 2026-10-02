@@ -58,7 +58,7 @@ jobs:
               set -eu
               apk add --no-cache gcc g++ musl-dev make perl linux-headers curl git ca-certificates pkgconf python3-dev
               git config --global --add safe.directory /workspace
-              curl --proto "=https" --tlsv1.2 --retry 5 --retry-delay 2 --retry-all-errors -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.98.0 --profile minimal --target ${{ matrix.target }}
+              curl --proto "=https" --tlsv1.2 --retry 5 --retry-delay 2 --retry-all-errors -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.99.0 --profile minimal --target ${{ matrix.target }}
               . "$HOME/.cargo/env"
               python3 scripts/build-code-worker.py --target ${{ matrix.target }}
               export WORKCELL_BUNDLED_MONTY_WORKER="$PWD/target/code-worker/bin/monty"
@@ -115,7 +115,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        run: rustup toolchain install 1.98.0 --profile minimal --target ${{ matrix.target }}
+        run: rustup toolchain install 1.99.0 --profile minimal --target ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:

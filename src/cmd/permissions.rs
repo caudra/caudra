@@ -48,7 +48,9 @@ pub fn run(action: PermissionAction, database: Option<PathBuf>) -> Result<()> {
     }
     let state_dir = selected_database(database.as_deref())?;
     match action {
-        PermissionAction::Audit { .. } => bail!(AUDIT_DATABASE_UNSUPPORTED),
+        PermissionAction::Audit { .. } => {
+            bail!(AUDIT_DATABASE_UNSUPPORTED);
+        }
         PermissionAction::Discover {
             project,
             limit,

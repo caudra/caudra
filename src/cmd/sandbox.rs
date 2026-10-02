@@ -356,7 +356,7 @@ fn read_json_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
         .take(local_admin::MAX_ADMIN_PREVIEW_BYTES as u64 + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() > local_admin::MAX_ADMIN_PREVIEW_BYTES {
-        bail!("sandbox input exceeds the review bound")
+        bail!("sandbox input exceeds the review bound");
     }
     serde_json::from_slice(&bytes)
         .map_err(|_| color_eyre::eyre::eyre!("invalid strict sandbox request JSON"))

@@ -19,7 +19,7 @@ SPEC.loader.exec_module(WORKER)
 
 TARGET = "x86_64-unknown-linux-gnu"
 WINDOWS_TARGET = "x86_64-pc-windows-msvc"
-TOOLCHAIN = f"rustc 1.98.0\ncommit-hash: original\nhost: {TARGET}\n"
+TOOLCHAIN = f"rustc 1.99.0\ncommit-hash: original\nhost: {TARGET}\n"
 UNSTRIPPED = b"worker executable with diagnostic symbols"
 STRIPPED = b"worker executable"
 OLD_WORKER = b"previous same-version worker"

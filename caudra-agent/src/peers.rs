@@ -1442,7 +1442,7 @@ impl SessionInner {
             || self
                 .host
                 .bytes
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                     current
                         .checked_add(bytes)
                         .filter(|next| *next <= MAX_PROCESS_BYTES)

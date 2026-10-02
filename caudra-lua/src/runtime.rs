@@ -1886,15 +1886,15 @@ impl LuaRuntime {
             permissions,
             Arc::clone(&opts),
         )
-        .map_err(&map_err)?;
+        .map_err(map_err)?;
 
         if let Some(cs) = config_store {
             let setup_fn = crate::api::util::setup::create_setup_fn(&self.lua, Arc::clone(cs))
-                .map_err(&map_err)?;
-            caudra.set("setup", setup_fn).map_err(&map_err)?;
+                .map_err(map_err)?;
+            caudra.set("setup", setup_fn).map_err(map_err)?;
         }
 
-        let env = self.build_env(caudra, require_root).map_err(&map_err)?;
+        let env = self.build_env(caudra, require_root).map_err(map_err)?;
 
         self.drop_plugin_keys(&name);
 

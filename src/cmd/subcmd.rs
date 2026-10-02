@@ -167,7 +167,9 @@ fn login_route(slug: &str, method: Option<AuthMethod>) -> Result<LoginRoute> {
         ("openai", None | Some(AuthMethod::Oauth)) => Ok(LoginRoute::OpenAiOauth),
         ("xai", None) => Ok(LoginRoute::XaiOauth),
         ("copilot", None) => Ok(LoginRoute::Copilot),
-        (_, Some(_)) => bail!("--method is supported only for Anthropic and OpenAI"),
+        (_, Some(_)) => {
+            bail!("--method is supported only for Anthropic and OpenAI");
+        }
         _ => Ok(LoginRoute::ApiKey),
     }
 }
@@ -198,7 +200,9 @@ fn prompt_auth_method(display_name: &str) -> Result<AuthMethod> {
     match input.trim() {
         "1" => Ok(AuthMethod::Oauth),
         "2" => Ok(AuthMethod::ApiKey),
-        _ => bail!("invalid selection"),
+        _ => {
+            bail!("invalid selection");
+        }
     }
 }
 
@@ -971,7 +975,9 @@ pub fn mcp_auth(server: &str, storage: &StateDir, global_only: bool) -> Result<(
         let (url, oauth) = match mcp_config::parse_server(server.to_owned(), raw.clone())?.transport
         {
             mcp_config::Transport::Http { url, oauth, .. } => (url, oauth),
-            _ => color_eyre::eyre::bail!("server '{server}' is not an HTTP transport"),
+            _ => {
+                bail!("server '{server}' is not an HTTP transport");
+            }
         };
         let resolved_addresses = mcp_config::resolve_url_addresses(&url)
             .map_err(|error| color_eyre::eyre::eyre!("cannot resolve MCP URL: {error}"))?;
@@ -1458,7 +1464,9 @@ pub fn skills(cli: &Cli, name: Option<&str>, names: bool, json: bool, dirs: bool
     if let Some(name) = name {
         match skill::load(reg, name) {
             Ok(body) => println!("{body}"),
-            Err(message) => bail!(message),
+            Err(message) => {
+                bail!(message);
+            }
         }
         return Ok(());
     }

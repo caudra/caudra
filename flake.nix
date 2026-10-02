@@ -41,7 +41,7 @@
       mkCraneLib =
         pkgs:
         let
-          rustToolchain = pkgs.rust-bin.stable."1.98.0".default.override {
+          rustToolchain = pkgs.rust-bin.stable."1.99.0".default.override {
             extensions = [
               "rust-src"
               "rust-analyzer"
@@ -93,8 +93,8 @@
       gitDepHashes = {
         "git+https://github.com/pydantic/monty.git?tag=v1.0.0#85c5d1f6bef038405cfc40a4eed94806e303567e" =
           "sha256-tuDFwYLIprdVyAH47rqYiI4xU3RCuNdkBjIyVM1JeWE=";
-        "git+https://github.com/tensorninja/workcell-mcp?rev=762bf300080e8a8e9de416fa095d7ee2d72698aa#762bf300080e8a8e9de416fa095d7ee2d72698aa" =
-          "sha256-VtUmxsgmLbemCYwveZRFmrkDhkhbakmwhpseqlSpFh4=";
+        "git+https://github.com/tensorninja/workcell-mcp?rev=5a5a5a7531b3ea10503572841994bf122946d003#5a5a5a7531b3ea10503572841994bf122946d003" =
+          "sha256-WZVbYqmNK8SUIuOQJ3icsZnCuEi0L2EK0L8iCkZ1QmM=";
       };
 
       missingGitDepHashes = builtins.filter (s: !(builtins.hasAttr s gitDepHashes)) gitDepSources;
