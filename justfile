@@ -1,6 +1,5 @@
 monty_worker_name := if os_family() == "windows" { "monty.exe" } else { "monty" }
 monty_worker := justfile_directory() + "/target/code-worker/bin/" + monty_worker_name
-monty_version := "0.0.21"
 workcell_root := justfile_directory() + "/../workcell-mcp/crates"
 cargo_cmd := justfile_directory() + "/scripts/dev-cargo.sh"
 export WORKCELL_LOCAL := workcell_root + "/workcell"
@@ -11,8 +10,7 @@ default:
 
 # Build the pinned worker that Workcell embeds at compile time.
 code-worker:
-    if [ ! -x "{{ monty_worker }}" ] || ! "{{ monty_worker }}" --version 2>&1 | grep -qx "monty-runtime {{ monty_version }}"; then cargo install monty-runtime --version "={{ monty_version }}" --locked --no-default-features --force --root target/code-worker --target-dir target/code-worker-build; fi
-    "{{ monty_worker }}" --version
+    python3 scripts/build-code-worker.py
 
 # Install Caudra with the pinned worker embedded.
 install: code-worker

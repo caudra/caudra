@@ -30,6 +30,8 @@ jobs:
               - "src/**"
               - "caudra-*/**"
               - "plugins/**"
+              - "scripts/build-code-worker.py"
+              - "scripts/test-build-code-worker.py"
               - "site/docs/content/**"
               - "THIRD_PARTY_LICENSES/**"
               - "justfile"
@@ -86,6 +88,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: just,cargo-nextest
+      - run: python3 scripts/test-build-code-worker.py
       - run: sudo apt-get -o Acquire::Retries=5 install -y ripgrep
       - run: just code-worker
       - run: just test

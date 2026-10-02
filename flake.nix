@@ -93,8 +93,8 @@
       gitDepHashes = {
         "git+https://github.com/pydantic/monty.git?tag=v0.0.21#70fe3f5781381eb33579e45046f8cb3845953373" =
           "sha256-P4PgqfYykkZrWGg5G3WQo070lORLEhmXQUQPx3+Yslo=";
-        "git+https://github.com/tensorninja/workcell-mcp?rev=c07f55436d81f9dc48755677cf4fb9c2a9093231#c07f55436d81f9dc48755677cf4fb9c2a9093231" =
-          "sha256-Pfh1iOG/BiEuaRDkHlXUq9f1zkxGpNKacIuyIlaYR8c=";
+        "git+https://github.com/tensorninja/workcell-mcp?rev=617188ec60716830213658d77f3e4874bff3b20c#617188ec60716830213658d77f3e4874bff3b20c" =
+          "sha256-kfHl85vf0rkQWti303rfFUtrJ2sTJlcjasT0vE0H7E4=";
       };
 
       missingGitDepHashes = builtins.filter (s: !(builtins.hasAttr s gitDepHashes)) gitDepSources;
@@ -131,12 +131,22 @@
             src = montySrc;
             cargoVendorDir = montyVendorDeps;
             cargoExtraArgs = "--package monty-runtime --no-default-features";
+            CARGO_PROFILE_RELEASE_LTO = "thin";
+            CARGO_PROFILE_RELEASE_CODEGEN_UNITS = "1";
+            CARGO_PROFILE_RELEASE_STRIP = "none";
+            outputs = [
+              "out"
+              "debug"
+            ];
             doCheck = false;
             installPhaseCommand = ''
-              mkdir -p $out/bin
+              mkdir -p $out/bin $debug/bin
+              cp target/release/monty $debug/bin/monty
               cp target/release/monty $out/bin/monty
+              $STRIP $out/bin/monty
               $out/bin/monty --version | grep -q '0.0.21'
             '';
+            dontStrip = true;
           };
 
           # TODO: Upstream monty includes a relative README path that doesn't
@@ -175,6 +185,7 @@
             inherit cargoVendorDir;
             WORKCELL_BASH_EXECUTABLE = "${pkgs.bash}/bin/bash";
             WORKCELL_BUNDLED_MONTY_WORKER = "${montyWorker}/bin/monty";
+            CARGO_PROFILE_RELEASE_STRIP = "none";
           };
 
           cargoArtifacts = craneLib.buildDepsOnly (
@@ -195,14 +206,31 @@
               src = workspaceSrc;
               cargoArtifacts = cargoArtifacts;
               cargoExtraArgs = "--package ${packageName}";
+              outputs = [
+                "out"
+                "debug"
+              ];
+              installPhaseCommand = ''
+                mkdir -p $out/bin $debug/bin
+                cp target/release/caudra $debug/bin/caudra
+                ln -s ${montyWorker.debug}/bin/monty $debug/bin/monty
+                cp target/release/caudra $out/bin/caudra
+                $STRIP $out/bin/caudra
+              '';
+              dontStrip = true;
               doCheck = false;
               doInstallCheck = true;
-              installCheckPhaseCommand = ''
+              installCheckPhase = ''
+                runHook preInstallCheck
                 smoke_output="$(OPENAI_API_KEY=release-smoke \
                   XDG_CACHE_HOME="$TMPDIR/cache" \
-                  $out/bin/caudra --model openai/gpt-5.1 prompt --tools --names 2>&1)"
-                printf '%s\n' "$smoke_output" | grep -qx python_execution
-                ! printf '%s\n' "$smoke_output" | grep -q 'Workcell python_execution is unavailable'
+                  $out/bin/caudra --model openai/gpt-5.1 tools --enabled-only --names 2>&1)" || exit 1
+                if ! printf '%s\n' "$smoke_output" | grep -qx python_execution ||
+                  printf '%s\n' "$smoke_output" | grep -q 'Workcell python_execution is unavailable'; then
+                  printf '%s\n' "$smoke_output" >&2
+                  exit 1
+                fi
+                runHook postInstallCheck
               '';
             }
           );

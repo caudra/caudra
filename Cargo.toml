@@ -119,7 +119,7 @@ caudra-workbench = { path = "caudra-workbench" }
 caudra-workcell = { path = "caudra-workcell" }
 caudra-workspace = { path = "caudra-workspace" }
 caudra-workflow = { path = "caudra-workflow" }
-workcell = { git = "https://github.com/tensorninja/workcell-mcp", rev = "c07f55436d81f9dc48755677cf4fb9c2a9093231", default-features = false, features = ["files-index", "web", "shell", "code-bundled", "code-graph-git", "environment", "host-contract", "snapshots"] }
+workcell = { git = "https://github.com/tensorninja/workcell-mcp", rev = "617188ec60716830213658d77f3e4874bff3b20c", default-features = false, features = ["files-index", "web", "shell", "code-bundled", "code-graph-git", "environment", "host-contract", "snapshots"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 rusqlite = { version = "0.40", default-features = false, features = ["backup", "bundled", "cache", "limits"] }
@@ -250,8 +250,14 @@ wait-timeout = "0.2"
 inventory = "0.3"
 rhai = { version = "1.26", default-features = false, features = ["std", "serde", "internals", "no_time", "no_module"] }
 
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
+
 [profile.bench]
 debug = true
+strip = "none"
 
 # Dev rebuilds are linker bound, and debug info is most of what the linker
 # chews through. Our crates keep theirs so a debugger still works, the 600

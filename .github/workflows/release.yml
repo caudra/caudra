@@ -55,26 +55,35 @@ jobs:
             -e CARGO_TERM_COLOR=always \
             -e CARGO_INCREMENTAL=0 \
             alpine:3.21 sh -c '
+              set -eu
               apk add --no-cache gcc g++ musl-dev make perl linux-headers curl git ca-certificates pkgconf python3-dev
               git config --global --add safe.directory /workspace
-               curl --proto "=https" --tlsv1.2 --retry 5 --retry-delay 2 --retry-all-errors -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.98.0 --profile minimal --target ${{ matrix.target }}
-               source "$HOME/.cargo/env"
-               cargo install monty-runtime --version "=0.0.21" --locked --no-default-features \
-                 --root target/code-worker --target-dir target/code-worker-build --target ${{ matrix.target }}
-               worker="$PWD/target/code-worker/bin/monty"
-               strip "$worker"
-               "$worker" --version | grep -q '0.0.21'
-               WORKCELL_BUNDLED_MONTY_WORKER="$worker" cargo build --release --target ${{ matrix.target }}
-               WORKCELL_BUNDLED_MONTY_WORKER="$worker" cargo test --release --target ${{ matrix.target }} \
-                 --package caudra-workcell production_host_executes_code_with_the_embedded_worker
-                smoke_output="$(OPENAI_API_KEY=release-smoke \
-                  XDG_CACHE_HOME="$PWD/target/release-smoke-cache" \
-                  target/${{ matrix.target }}/release/caudra --model openai/gpt-5.1 \
-                  prompt --tools --names 2>&1)"
-               printf '%s\n' "$smoke_output" | grep -qx python_execution
-               ! printf '%s\n' "$smoke_output" | grep -q 'Workcell python_execution is unavailable'
-             '
+              curl --proto "=https" --tlsv1.2 --retry 5 --retry-delay 2 --retry-all-errors -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.98.0 --profile minimal --target ${{ matrix.target }}
+              . "$HOME/.cargo/env"
+              python3 scripts/build-code-worker.py --target ${{ matrix.target }}
+              export WORKCELL_BUNDLED_MONTY_WORKER="$PWD/target/code-worker/bin/monty"
+              export CARGO_PROFILE_RELEASE_STRIP=none
+              cargo build --locked --release --target ${{ matrix.target }}
+              mkdir -p target/release-symbols
+              cp target/${{ matrix.target }}/release/caudra target/release-symbols/caudra
+              cp target/code-worker/symbols/bin/monty target/release-symbols/monty
+              strip target/${{ matrix.target }}/release/caudra
+              cargo test --locked --release --target ${{ matrix.target }} \
+                --package caudra-workcell production_host_executes_code_with_the_embedded_worker
+              smoke_output="$(OPENAI_API_KEY=release-smoke \
+                XDG_CACHE_HOME="$PWD/target/release-smoke-cache" \
+                target/${{ matrix.target }}/release/caudra --model openai/gpt-5.1 \
+                tools --enabled-only --names 2>&1)"
+              printf "%s\n" "$smoke_output" | grep -qx python_execution
+              ! printf "%s\n" "$smoke_output" | grep -q "Workcell python_execution is unavailable"
+              '
           sudo chown -R $(id -u):$(id -g) target/
+
+      - name: Package diagnostic binaries
+        run: |
+          archive="${BINARY_NAME}-${GITHUB_REF_NAME}-${{ matrix.target }}-symbols.tar.gz"
+          tar czf "$archive" LICENSE NOTICE.md THIRD_PARTY_LICENSES/Monty.txt -C target/release-symbols .
+          echo "SYMBOL_ARCHIVE=$archive" >> "$GITHUB_ENV"
 
       - name: Package
         run: |
@@ -85,7 +94,7 @@ jobs:
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
       - name: Upload artifact
-        run: .github/scripts/retry.sh gh release upload "$GITHUB_REF_NAME" "$ARCHIVE" --clobber
+        run: .github/scripts/retry.sh gh release upload "$GITHUB_REF_NAME" "$ARCHIVE" "$SYMBOL_ARCHIVE" --clobber
 
   build-other:
     name: Build (${{ matrix.target }})
@@ -115,28 +124,42 @@ jobs:
       - name: Build
         shell: bash
         run: |
-          cargo install monty-runtime --version "=0.0.21" --locked --no-default-features \
-            --root target/code-worker --target-dir target/code-worker-build --target ${{ matrix.target }}
+          python3 scripts/build-code-worker.py --target ${{ matrix.target }}
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             worker="$PWD/target/code-worker/bin/monty.exe"
           else
             worker="$PWD/target/code-worker/bin/monty"
-            strip -x "$worker"
           fi
-          "$worker" --version | grep -q '0.0.21'
-          WORKCELL_BUNDLED_MONTY_WORKER="$worker" cargo build --release --target ${{ matrix.target }}
-          WORKCELL_BUNDLED_MONTY_WORKER="$worker" cargo test --release --target ${{ matrix.target }} \
-            --package caudra-workcell production_host_executes_code_with_the_embedded_worker
+          export WORKCELL_BUNDLED_MONTY_WORKER="$worker"
+          export CARGO_PROFILE_RELEASE_STRIP=none
+          cargo build --locked --release --target ${{ matrix.target }}
+          mkdir -p target/release-symbols
+          cp "$PWD/target/code-worker/symbols/bin/"* target/release-symbols/
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             binary="target/${{ matrix.target }}/release/caudra.exe"
+            cp "$binary" target/release-symbols/
+            if [[ -f "target/${{ matrix.target }}/release/caudra.pdb" ]]; then
+              cp "target/${{ matrix.target }}/release/caudra.pdb" target/release-symbols/
+            fi
           else
             binary="target/${{ matrix.target }}/release/caudra"
+            cp "$binary" target/release-symbols/
+            strip "$binary"
           fi
+          cargo test --locked --release --target ${{ matrix.target }} \
+            --package caudra-workcell production_host_executes_code_with_the_embedded_worker
           smoke_output="$(OPENAI_API_KEY=release-smoke \
             XDG_CACHE_HOME="$PWD/target/release-smoke-cache" \
-            "$binary" --model openai/gpt-5.1 prompt --tools --names 2>&1)"
+            "$binary" --model openai/gpt-5.1 tools --enabled-only --names 2>&1)"
           printf '%s\n' "$smoke_output" | grep -qx python_execution
           ! printf '%s\n' "$smoke_output" | grep -q 'Workcell python_execution is unavailable'
+
+      - name: Package diagnostic binaries
+        shell: bash
+        run: |
+          archive="${BINARY_NAME}-${GITHUB_REF_NAME}-${{ matrix.target }}-symbols.tar.gz"
+          tar czf "$archive" LICENSE NOTICE.md THIRD_PARTY_LICENSES/Monty.txt -C target/release-symbols .
+          echo "SYMBOL_ARCHIVE=$archive" >> "$GITHUB_ENV"
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
@@ -159,7 +182,7 @@ jobs:
 
       - name: Upload artifact
         shell: bash
-        run: .github/scripts/retry.sh gh release upload "$GITHUB_REF_NAME" "$ARCHIVE" --clobber
+        run: .github/scripts/retry.sh gh release upload "$GITHUB_REF_NAME" "$ARCHIVE" "$SYMBOL_ARCHIVE" --clobber
 
   publish:
     name: Publish Release
