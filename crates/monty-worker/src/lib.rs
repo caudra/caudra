@@ -1,8 +1,10 @@
 #![forbid(unsafe_code)]
 
+mod limits;
+
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write as _};
+use std::io::{self, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -11,6 +13,8 @@ use std::thread;
 #[cfg(windows)]
 use std::time::Duration;
 
+use flate2::{Decompress, FlushDecompress, Status};
+use limits::MAX_WORKER_BYTES;
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
@@ -19,6 +23,7 @@ const LOCK_MODE: u32 = 0o600;
 const WORKER_MODE: u32 = 0o700;
 const EXTRACTION_LOCK: &str = ".extract.lock";
 const USE_LOCK: &str = ".use.lock";
+const IO_BUFFER_BYTES: usize = 64 * 1024;
 #[cfg(windows)]
 const RENAME_ATTEMPTS: usize = 20;
 
@@ -28,6 +33,8 @@ pub enum WorkerError {
     BundleUnavailable,
     #[error("the bundled Monty worker failed its build-time digest check")]
     BundledDigest,
+    #[error("the bundled Monty worker payload is malformed or exceeds its decoded length limit")]
+    BundledPayload,
     #[error("the cached Monty worker target is not a regular file or directory")]
     UnsafeCacheTarget,
     #[error("prepare the cached Monty worker: {0}")]
@@ -48,7 +55,8 @@ impl WorkerLease {
 
 #[derive(Clone, Copy)]
 struct WorkerArtifact<'a> {
-    bytes: &'a [u8],
+    compressed: &'a [u8],
+    decoded_len: usize,
     digest: &'a str,
     target: &'a str,
     version: &'a str,
@@ -68,7 +76,10 @@ pub fn extract(cache_root: &Path) -> Result<WorkerLease, WorkerError> {
 #[cfg(workcell_bundled_monty_worker)]
 fn bundled() -> Result<WorkerArtifact<'static>, WorkerError> {
     Ok(WorkerArtifact {
-        bytes: include_bytes!(concat!(env!("OUT_DIR"), "/bundled-monty-worker")),
+        compressed: include_bytes!(concat!(env!("OUT_DIR"), "/bundled-monty-worker.zlib")),
+        decoded_len: env!("WORKCELL_MONTY_WORKER_DECODED_LEN")
+            .parse()
+            .map_err(|_| WorkerError::BundledPayload)?,
         digest: env!("WORKCELL_MONTY_WORKER_SHA256"),
         target: env!("WORKCELL_MONTY_WORKER_TARGET"),
         version: env!("WORKCELL_MONTY_WORKER_VERSION"),
@@ -81,15 +92,6 @@ fn bundled() -> Result<WorkerArtifact<'static>, WorkerError> {
     Err(WorkerError::BundleUnavailable)
 }
 
-/// Never hashes `artifact.bytes` up front. The declared digest is what names the
-/// cache directory and what every cached file is checked against, so a bundle
-/// whose bytes and digest disagree still fails: the cached path either already
-/// holds bytes matching the digest, or gets written and re-read here and comes
-/// back `Corrupt`. Hashing the bundle on the hot path bought no guarantee the
-/// write-then-verify below does not already give, and cost a full pass over the
-/// embedded worker on every startup, including the common path where those bytes
-/// are never used. The build-time invariant is a test
-/// (`bundled_worker_matches_its_declared_digest`), not a per-launch cost.
 fn extract_at(cache_root: &Path, artifact: WorkerArtifact<'_>) -> Result<WorkerLease, WorkerError> {
     let worker_root = private_subdir(cache_root, "workers")?;
     let monty_root = private_subdir(&worker_root, "monty")?;
@@ -101,18 +103,8 @@ fn extract_at(cache_root: &Path, artifact: WorkerArtifact<'_>) -> Result<WorkerL
 
     match cached_worker_state(&path, artifact.digest)? {
         CachedWorker::Valid => set_worker_permissions(&path)?,
-        CachedWorker::Missing => {
-            atomic_write_permissions(&path, artifact.bytes, WORKER_MODE)?;
-            if cached_worker_state(&path, artifact.digest)? != CachedWorker::Valid {
-                return Err(WorkerError::BundledDigest);
-            }
-        }
-        CachedWorker::Corrupt => {
-            fs::remove_file(&path)?;
-            atomic_write_permissions(&path, artifact.bytes, WORKER_MODE)?;
-            if cached_worker_state(&path, artifact.digest)? != CachedWorker::Valid {
-                return Err(WorkerError::BundledDigest);
-            }
+        CachedWorker::Missing | CachedWorker::Corrupt => {
+            atomic_extract(&path, artifact)?;
         }
     }
 
@@ -228,16 +220,56 @@ fn cached_worker_state(path: &Path, expected_digest: &str) -> Result<CachedWorke
     }
 }
 
-fn atomic_write_permissions(path: &Path, data: &[u8], mode: u32) -> Result<(), io::Error> {
+fn decode_worker(artifact: WorkerArtifact<'_>, output: &mut impl Write) -> Result<(), WorkerError> {
+    if artifact.decoded_len == 0 || artifact.decoded_len > MAX_WORKER_BYTES {
+        return Err(WorkerError::BundledPayload);
+    }
+    let mut decoder = Decompress::new(true);
+    let mut digest = Sha256::new();
+    let mut buffer = [0; IO_BUFFER_BYTES];
+    loop {
+        let consumed = decoder.total_in() as usize;
+        let produced = decoder.total_out() as usize;
+        let capacity = buffer.len().min(artifact.decoded_len - produced + 1);
+        let status = decoder
+            .decompress(
+                &artifact.compressed[consumed..],
+                &mut buffer[..capacity],
+                FlushDecompress::None,
+            )
+            .map_err(|_| WorkerError::BundledPayload)?;
+        if decoder.total_out() > artifact.decoded_len as u64 {
+            return Err(WorkerError::BundledPayload);
+        }
+        let written = decoder.total_out() as usize - produced;
+        output.write_all(&buffer[..written])?;
+        digest.update(&buffer[..written]);
+        if status == Status::StreamEnd {
+            if decoder.total_in() != artifact.compressed.len() as u64
+                || decoder.total_out() != artifact.decoded_len as u64
+            {
+                return Err(WorkerError::BundledPayload);
+            }
+            break;
+        }
+        if decoder.total_in() == consumed as u64 && written == 0 {
+            return Err(WorkerError::BundledPayload);
+        }
+    }
+    if encode_digest(digest.finalize().as_slice()) != artifact.digest {
+        return Err(WorkerError::BundledDigest);
+    }
+    Ok(())
+}
+
+fn atomic_extract(path: &Path, artifact: WorkerArtifact<'_>) -> Result<(), WorkerError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let mut temporary = NamedTempFile::new_in(parent)?;
-    temporary.write_all(data)?;
+    decode_worker(artifact, &mut temporary)?;
     #[cfg(unix)]
     temporary
         .as_file()
-        .set_permissions(fs::Permissions::from_mode(mode))?;
-    #[cfg(not(unix))]
-    let _ = mode;
+        .set_permissions(fs::Permissions::from_mode(WORKER_MODE))?;
     temporary.as_file().sync_all()?;
     let (file, temporary_path) = temporary.into_parts();
     drop(file);
@@ -273,7 +305,7 @@ fn retry_rename(source: &Path, destination: &Path) -> Result<(), io::Error> {
 fn sha256_file(path: &Path) -> Result<String, io::Error> {
     let mut file = File::open(path)?;
     let mut digest = Sha256::new();
-    let mut buffer = [0; 64 * 1024];
+    let mut buffer = [0; IO_BUFFER_BYTES];
     loop {
         let read = file.read(&mut buffer)?;
         if read == 0 {
@@ -350,9 +382,25 @@ fn sync_directory(path: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::fs;
+    use std::io::{self, Write};
+    #[cfg(unix)]
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::sync::Barrier;
+    use std::thread;
 
-    use super::*;
+    use flate2::{Compression, write::ZlibEncoder};
+    use sha2::{Digest, Sha256};
+    use test_case::test_case;
+
+    #[cfg(workcell_bundled_monty_worker)]
+    use super::bundled;
+    #[cfg(unix)]
+    use super::{DIRECTORY_MODE, LOCK_MODE, USE_LOCK, WORKER_MODE};
+    use super::{
+        EXTRACTION_LOCK, IO_BUFFER_BYTES, MAX_WORKER_BYTES, WorkerArtifact, WorkerError,
+        atomic_extract, decode_worker, encode_digest, extract_at, prepare_cache_root,
+    };
 
     const FIRST_WORKER: &[u8] = b"first worker";
     const FIRST_WORKER_DIGEST: &str =
@@ -360,10 +408,23 @@ mod tests {
     const SECOND_WORKER: &[u8] = b"second worker";
     const SECOND_WORKER_DIGEST: &str =
         "cb712affff723bba2023f25a118505d51e5ce337c7259758c1a3125bdfd03adc";
+    const CORRUPT_WORKER: &[u8] = b"corrupt";
+    const EXTRACTION_THREADS: usize = 8;
 
-    fn artifact<'a>(bytes: &'a [u8], digest: &'a str) -> WorkerArtifact<'a> {
+    fn compress(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(bytes).expect("compress fixture");
+        encoder.finish().expect("finish compressed fixture")
+    }
+
+    fn artifact<'a>(
+        compressed: &'a [u8],
+        decoded_len: usize,
+        digest: &'a str,
+    ) -> WorkerArtifact<'a> {
         WorkerArtifact {
-            bytes,
+            compressed,
+            decoded_len,
             digest,
             target: "test-target",
             version: "test-version",
@@ -371,34 +432,178 @@ mod tests {
         }
     }
 
-    /// The build-time invariant `extract_at` no longer pays for at runtime.
     #[cfg(workcell_bundled_monty_worker)]
     #[test]
     fn bundled_worker_matches_its_declared_digest() {
         let artifact = bundled().expect("bundled artifact");
-        let digest = encode_digest(Sha256::digest(artifact.bytes).as_slice());
-        assert_eq!(digest, artifact.digest);
+        decode_worker(artifact, &mut io::sink()).expect("valid bundled worker");
     }
 
-    /// Removing the up-front bundle hash must not let bytes that disagree with
-    /// their declared digest reach a lease.
-    #[test]
-    fn a_bundle_disagreeing_with_its_digest_is_refused() {
+    #[test_case(None; "missing cache")]
+    #[test_case(Some(CORRUPT_WORKER); "corrupt cache")]
+    fn a_bundle_disagreeing_with_its_digest_is_never_published(existing: Option<&[u8]>) {
         let cache = tempfile::tempdir().expect("tempdir");
+        let compressed = compress(SECOND_WORKER);
+        let artifact = artifact(&compressed, SECOND_WORKER.len(), FIRST_WORKER_DIGEST);
+        let target_root = cache
+            .path()
+            .join("workers/monty/test-version/test-target")
+            .join(artifact.digest);
+        fs::create_dir_all(&target_root).expect("target root");
+        let path = target_root.join(artifact.file_name);
+        if let Some(bytes) = existing {
+            fs::write(&path, bytes).expect("existing cache");
+        }
 
-        let result = extract_at(cache.path(), artifact(SECOND_WORKER, FIRST_WORKER_DIGEST));
+        let result = extract_at(cache.path(), artifact);
 
         assert!(matches!(result, Err(WorkerError::BundledDigest)));
+        assert_eq!(fs::read(&path).ok().as_deref(), existing);
+        assert_eq!(
+            fs::read_dir(&target_root).expect("cache entries").count(),
+            usize::from(existing.is_some())
+        );
+    }
+
+    #[test]
+    fn a_valid_cache_never_decodes_the_bundle() {
+        let cache = tempfile::tempdir().expect("tempdir");
+        let compressed = compress(FIRST_WORKER);
+        let artifact = artifact(&compressed, FIRST_WORKER.len(), FIRST_WORKER_DIGEST);
+        let first = extract_at(cache.path(), artifact).expect("first extraction");
+        let reused = extract_at(
+            cache.path(),
+            WorkerArtifact {
+                compressed: CORRUPT_WORKER,
+                ..artifact
+            },
+        )
+        .expect("reuse without decompression");
+
+        assert_eq!(first.path(), reused.path());
+        assert_eq!(fs::read(reused.path()).expect("read worker"), FIRST_WORKER);
+    }
+
+    #[test_case(0; "empty length")]
+    #[test_case(FIRST_WORKER.len() - 1; "short length")]
+    #[test_case(FIRST_WORKER.len() + 1; "long length")]
+    #[test_case(MAX_WORKER_BYTES + 1; "hard limit")]
+    #[test_case(usize::MAX; "overflowing length")]
+    fn decoding_rejects_an_incorrect_or_unbounded_length(decoded_len: usize) {
+        let compressed = compress(FIRST_WORKER);
+        let artifact = artifact(&compressed, decoded_len, FIRST_WORKER_DIGEST);
+        let mut output = Vec::new();
+
+        assert!(matches!(
+            decode_worker(artifact, &mut output),
+            Err(WorkerError::BundledPayload)
+        ));
+        assert!(output.len() <= decoded_len.min(MAX_WORKER_BYTES));
+        if decoded_len > MAX_WORKER_BYTES {
+            assert!(output.is_empty());
+        }
+    }
+
+    #[test]
+    fn decoding_bounds_a_highly_compressible_payload_before_writing() {
+        let compressed = compress(&vec![0; IO_BUFFER_BYTES * 4]);
+        let artifact = artifact(&compressed, FIRST_WORKER.len(), FIRST_WORKER_DIGEST);
+        let mut output = Vec::new();
+
+        assert!(matches!(
+            decode_worker(artifact, &mut output),
+            Err(WorkerError::BundledPayload)
+        ));
+        assert!(output.is_empty());
+    }
+
+    #[test_case(IO_BUFFER_BYTES - 1; "less than a buffer")]
+    #[test_case(IO_BUFFER_BYTES; "one buffer")]
+    #[test_case(IO_BUFFER_BYTES + 1; "more than a buffer")]
+    #[test_case(IO_BUFFER_BYTES * 3; "multiple buffers")]
+    fn decoding_preserves_bytes_across_buffer_boundaries(decoded_len: usize) {
+        let bytes = (0..decoded_len)
+            .map(|index| index as u8)
+            .collect::<Vec<_>>();
+        let compressed = compress(&bytes);
+        let digest = encode_digest(Sha256::digest(&bytes).as_slice());
+        let artifact = artifact(&compressed, bytes.len(), &digest);
+        let mut output = Vec::new();
+
+        decode_worker(artifact, &mut output).expect("decode complete worker");
+
+        assert_eq!(output, bytes);
+    }
+
+    #[test]
+    fn decoding_rejects_every_truncated_prefix() {
+        let compressed = compress(FIRST_WORKER);
+        for end in 0..compressed.len() {
+            let artifact = artifact(&compressed[..end], FIRST_WORKER.len(), FIRST_WORKER_DIGEST);
+            assert!(
+                matches!(
+                    decode_worker(artifact, &mut io::sink()),
+                    Err(WorkerError::BundledPayload)
+                ),
+                "accepted truncated prefix of {end} bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn decoding_rejects_malformed_checksums_and_trailing_data() {
+        let compressed = compress(FIRST_WORKER);
+        let mut bad_checksum = compressed.clone();
+        *bad_checksum.last_mut().expect("checksum") ^= 1;
+        for payload in [
+            CORRUPT_WORKER.to_vec(),
+            bad_checksum,
+            [compressed.as_slice(), CORRUPT_WORKER].concat(),
+            [compressed.as_slice(), compressed.as_slice()].concat(),
+        ] {
+            let artifact = artifact(&payload, FIRST_WORKER.len(), FIRST_WORKER_DIGEST);
+            assert!(matches!(
+                decode_worker(artifact, &mut io::sink()),
+                Err(WorkerError::BundledPayload)
+            ));
+        }
+    }
+
+    #[test_case(None; "missing cache")]
+    #[test_case(Some(CORRUPT_WORKER); "corrupt cache")]
+    fn a_truncated_bundle_never_publishes_or_leaves_a_temporary_file(existing: Option<&[u8]>) {
+        let cache = tempfile::tempdir().expect("tempdir");
+        let path = cache.path().join("monty");
+        if let Some(bytes) = existing {
+            fs::write(&path, bytes).expect("existing cache");
+        }
+        let compressed = compress(FIRST_WORKER);
+        let artifact = artifact(
+            &compressed[..compressed.len() - 1],
+            FIRST_WORKER.len(),
+            FIRST_WORKER_DIGEST,
+        );
+
+        assert!(matches!(
+            atomic_extract(&path, artifact),
+            Err(WorkerError::BundledPayload)
+        ));
+        assert_eq!(fs::read(&path).ok().as_deref(), existing);
+        assert_eq!(
+            fs::read_dir(cache.path()).expect("cache entries").count(),
+            usize::from(existing.is_some())
+        );
     }
 
     #[test]
     fn extracts_and_repairs_a_content_addressed_worker() {
         let cache = tempfile::tempdir().expect("tempdir");
-        let artifact = artifact(FIRST_WORKER, FIRST_WORKER_DIGEST);
+        let compressed = compress(FIRST_WORKER);
+        let artifact = artifact(&compressed, FIRST_WORKER.len(), FIRST_WORKER_DIGEST);
         let first = extract_at(cache.path(), artifact).expect("first extraction");
         assert_eq!(fs::read(first.path()).expect("read worker"), FIRST_WORKER);
 
-        fs::write(first.path(), b"corrupt").expect("corrupt worker");
+        fs::write(first.path(), CORRUPT_WORKER).expect("corrupt worker");
         drop(first);
         let repaired = extract_at(cache.path(), artifact).expect("repair extraction");
         assert_eq!(
@@ -415,6 +620,49 @@ mod tests {
                 & 0o777,
             WORKER_MODE
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_and_reused_workers_keep_directories_and_locks_private() {
+        let cache = tempfile::tempdir().expect("tempdir");
+        let cache_root = prepare_cache_root(cache.path()).expect("cache root");
+        let compressed = compress(FIRST_WORKER);
+        let artifact = artifact(&compressed, FIRST_WORKER.len(), FIRST_WORKER_DIGEST);
+        let first = extract_at(&cache_root, artifact).expect("first extraction");
+        let digest_root = first.path().parent().expect("digest root");
+        let target_root = digest_root.parent().expect("target root");
+        let mut paths = vec![
+            (first.path().to_path_buf(), WORKER_MODE),
+            (digest_root.join(USE_LOCK), LOCK_MODE),
+            (target_root.join(EXTRACTION_LOCK), LOCK_MODE),
+        ];
+        paths.extend(
+            digest_root
+                .ancestors()
+                .take_while(|path| path.starts_with(&cache_root))
+                .map(|path| (path.to_path_buf(), DIRECTORY_MODE)),
+        );
+        for (path, mode) in &paths {
+            assert_eq!(
+                fs::metadata(path).expect("metadata").permissions().mode() & 0o777,
+                *mode
+            );
+            fs::set_permissions(path, fs::Permissions::from_mode(0o777))
+                .expect("broaden permissions");
+        }
+        drop(first);
+
+        let cache_root = prepare_cache_root(&cache_root).expect("repair cache permissions");
+        let reused = extract_at(&cache_root, artifact).expect("reuse extraction");
+
+        assert_eq!(fs::read(reused.path()).expect("read worker"), FIRST_WORKER);
+        for (path, mode) in &paths {
+            assert_eq!(
+                fs::metadata(path).expect("metadata").permissions().mode() & 0o777,
+                *mode
+            );
+        }
     }
 
     #[test]
@@ -440,8 +688,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn accepts_an_operator_selected_symlinked_cache_root() {
-        use std::os::unix::fs::symlink;
-
         let temporary = tempfile::tempdir().expect("tempdir");
         let destination = temporary.path().join("destination");
         fs::create_dir(&destination).expect("cache destination");
@@ -458,18 +704,24 @@ mod tests {
 
     #[test]
     fn concurrent_extraction_produces_one_intact_worker() {
-        let cache = Arc::new(tempfile::tempdir().expect("tempdir"));
-        let artifact = artifact(FIRST_WORKER, FIRST_WORKER_DIGEST);
-        let threads = (0..8)
-            .map(|_| {
-                let cache = Arc::clone(&cache);
-                std::thread::spawn(move || extract_at(cache.path(), artifact).expect("extraction"))
-            })
-            .collect::<Vec<_>>();
-        let leases = threads
-            .into_iter()
-            .map(|thread| thread.join().expect("extraction thread"))
-            .collect::<Vec<_>>();
+        let cache = tempfile::tempdir().expect("tempdir");
+        let compressed = compress(FIRST_WORKER);
+        let artifact = artifact(&compressed, FIRST_WORKER.len(), FIRST_WORKER_DIGEST);
+        let barrier = Barrier::new(EXTRACTION_THREADS);
+        let leases = thread::scope(|scope| {
+            let threads = (0..EXTRACTION_THREADS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        extract_at(cache.path(), artifact).expect("extraction")
+                    })
+                })
+                .collect::<Vec<_>>();
+            threads
+                .into_iter()
+                .map(|thread| thread.join().expect("extraction thread"))
+                .collect::<Vec<_>>()
+        });
 
         assert!(
             leases
@@ -485,18 +737,19 @@ mod tests {
     #[test]
     fn obsolete_digest_is_removed_only_after_its_lease_is_released() {
         let cache = tempfile::tempdir().expect("tempdir");
-        let old = extract_at(cache.path(), artifact(FIRST_WORKER, FIRST_WORKER_DIGEST))
-            .expect("old extraction");
+        let first = compress(FIRST_WORKER);
+        let second = compress(SECOND_WORKER);
+        let old_artifact = artifact(&first, FIRST_WORKER.len(), FIRST_WORKER_DIGEST);
+        let current_artifact = artifact(&second, SECOND_WORKER.len(), SECOND_WORKER_DIGEST);
+        let old = extract_at(cache.path(), old_artifact).expect("old extraction");
         let old_path = old.path().to_path_buf();
 
-        let current = extract_at(cache.path(), artifact(SECOND_WORKER, SECOND_WORKER_DIGEST))
-            .expect("current extraction");
+        let current = extract_at(cache.path(), current_artifact).expect("current extraction");
         assert!(old_path.exists());
         drop(old);
         drop(current);
 
-        let current = extract_at(cache.path(), artifact(SECOND_WORKER, SECOND_WORKER_DIGEST))
-            .expect("current extraction");
+        let current = extract_at(cache.path(), current_artifact).expect("current extraction");
         assert!(!old_path.exists());
         assert_eq!(
             fs::read(current.path()).expect("read current worker"),
@@ -507,10 +760,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn rejects_a_symlink_at_the_worker_target() {
-        use std::os::unix::fs::symlink;
-
         let cache = tempfile::tempdir().expect("tempdir");
-        let artifact = artifact(FIRST_WORKER, FIRST_WORKER_DIGEST);
+        let compressed = compress(FIRST_WORKER);
+        let artifact = artifact(&compressed, FIRST_WORKER.len(), FIRST_WORKER_DIGEST);
         let target_root = cache
             .path()
             .join("workers/monty/test-version/test-target")
@@ -529,10 +781,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn rejects_a_symlink_at_the_extraction_lock() {
-        use std::os::unix::fs::symlink;
-
         let cache = tempfile::tempdir().expect("tempdir");
-        let artifact = artifact(FIRST_WORKER, FIRST_WORKER_DIGEST);
+        let compressed = compress(FIRST_WORKER);
+        let artifact = artifact(&compressed, FIRST_WORKER.len(), FIRST_WORKER_DIGEST);
         let target_root = cache.path().join("workers/monty/test-version/test-target");
         fs::create_dir_all(&target_root).expect("target root");
         let destination = cache.path().join("destination");

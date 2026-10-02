@@ -5950,9 +5950,11 @@ dependencies = [
 name = "workcell-monty-worker"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "libc",
  "sha2",
  "tempfile",
+ "test-case",
  "thiserror",
 ]
 

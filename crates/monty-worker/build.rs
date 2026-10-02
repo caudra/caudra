@@ -1,8 +1,14 @@
+#[path = "src/limits.rs"]
+mod limits;
+
 use std::env;
-use std::fmt::Write;
-use std::fs;
+use std::fmt::Write as _;
+use std::fs::{self, File};
+use std::io::{Read, Write as _};
 use std::path::Path;
 
+use flate2::{Compression, write::ZlibEncoder};
+use limits::MAX_WORKER_BYTES;
 use sha2::{Digest, Sha256};
 
 const WORKER_ENV: &str = "WORKCELL_BUNDLED_MONTY_WORKER";
@@ -29,12 +35,28 @@ fn main() {
         "{WORKER_ENV} must identify a regular file, not a symlink: {}",
         worker.display()
     );
-    let bytes = fs::read(worker).unwrap_or_else(|error| {
+    let file = File::open(worker).unwrap_or_else(|error| {
         panic!(
-            "read the worker configured by {WORKER_ENV} at {}: {error}",
+            "open the worker configured by {WORKER_ENV} at {}: {error}",
             worker.display()
         )
     });
+    let metadata = file.metadata().expect("read opened Monty worker metadata");
+    assert!(
+        metadata.is_file(),
+        "{WORKER_ENV} must identify a regular file"
+    );
+    validate_worker_length(metadata.len());
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_WORKER_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .unwrap_or_else(|error| {
+            panic!(
+                "read the worker configured by {WORKER_ENV} at {}: {error}",
+                worker.display()
+            )
+        });
+    validate_worker_length(bytes.len() as u64);
     let target = env::var("TARGET").expect("Cargo sets TARGET for build scripts");
     validate_binary_format(&bytes, &target);
 
@@ -44,15 +66,17 @@ fn main() {
         "monty"
     };
     let output = Path::new(&env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"))
-        .join("bundled-monty-worker");
-    fs::write(&output, &bytes).unwrap_or_else(|error| {
-        panic!(
-            "stage bundled Monty worker at {}: {error}",
-            output.display()
-        )
-    });
+        .join("bundled-monty-worker.zlib");
+    let file = File::create(&output).expect("create compressed Monty worker");
+    let mut encoder = ZlibEncoder::new(file, Compression::best());
+    encoder.write_all(&bytes).expect("compress Monty worker");
+    encoder.finish().expect("finish compressed Monty worker");
 
     println!("cargo:rustc-cfg=workcell_bundled_monty_worker");
+    println!(
+        "cargo:rustc-env=WORKCELL_MONTY_WORKER_DECODED_LEN={}",
+        bytes.len()
+    );
     println!(
         "cargo:rustc-env=WORKCELL_MONTY_WORKER_SHA256={}",
         sha256_bytes(&bytes)
@@ -60,6 +84,13 @@ fn main() {
     println!("cargo:rustc-env=WORKCELL_MONTY_WORKER_TARGET={target}");
     println!("cargo:rustc-env=WORKCELL_MONTY_WORKER_FILE_NAME={file_name}");
     println!("cargo:rustc-env=WORKCELL_MONTY_WORKER_VERSION={WORKER_VERSION}");
+}
+
+fn validate_worker_length(length: u64) {
+    assert!(
+        length <= MAX_WORKER_BYTES as u64,
+        "{WORKER_ENV} exceeds the {MAX_WORKER_BYTES}-byte decoded worker limit"
+    );
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
