@@ -39,6 +39,10 @@ const MODEL_COL_MIN: usize = 16;
 const NUM_COL: usize = 7;
 const CACHE_READ_COL: usize = 10;
 const CACHE_WRITE_COL: usize = 11;
+const COST_COL: usize = 6;
+const LIFETIME_COST_COL: usize = 8;
+const TURNS_COL: usize = 6;
+const TOKEN_INTEGER_PADDING: &str = "   ";
 /// Wide enough for `100%`, and for the dash that says a provider reported no
 /// prompt tokens to score.
 const RATE_COL: usize = 4;
@@ -393,6 +397,18 @@ fn breakdown_table(
         .max()
         .unwrap_or(0)
         .max(MODEL_COL_MIN);
+    let cells: Vec<_> = rows.iter().map(breakdown_cells).collect();
+    let widths = column_widths(
+        &cells,
+        [
+            NUM_COL,
+            NUM_COL,
+            CACHE_READ_COL,
+            CACHE_WRITE_COL,
+            NUM_COL,
+            COST_COL,
+        ],
+    );
 
     let mut lines = vec![
         Line::default(),
@@ -400,13 +416,13 @@ fn breakdown_table(
             format!("{PREFIX}{heading}"),
             theme.keybind_section,
         )),
-        Line::from(header_row(label_w, theme)),
+        Line::from(header_row(label_w, &widths, theme)),
     ];
-    lines.extend(rows.iter().map(|row| {
+    lines.extend(rows.iter().zip(&cells).map(|(row, cells)| {
         Line::from(model_row(
-            &row.label,
-            &row.usage,
-            row.spend,
+            row,
+            cells,
+            &widths,
             label_w,
             fg,
             theme.status_dim,
@@ -513,30 +529,47 @@ fn slice_rows(slices: &[UsageSlice], fg: Style, dim: Style) -> Vec<Line<'static>
         .max()
         .unwrap_or(0)
         .max(MODEL_COL_MIN);
-    let mut lines: Vec<Line> = slices[..shown]
+    let cells: Vec<_> = slices[..shown]
         .iter()
         .map(|slice| {
+            [
+                table_tokens(slice.tokens),
+                slice.turns.to_string(),
+                table_cost(
+                    Some(slice.priced()),
+                    slice.cost == 0.0 && slice.subscription_cost > 0.0,
+                ),
+            ]
+        })
+        .collect();
+    let [token_w, turns_w, cost_w] = column_widths(&cells, [NUM_COL, TURNS_COL, LIFETIME_COST_COL]);
+    let mut lines: Vec<Line> = slices[..shown]
+        .iter()
+        .zip(&cells)
+        .map(|(slice, [tokens, turns, cost])| {
             Line::from(vec![
                 Span::raw(PREFIX),
                 Span::styled(format!("{:<label_w$}", slice.label), fg),
                 Span::raw(" ".repeat(COL_GAP)),
-                Span::styled(format!("{:>NUM_COL$}", format_tokens_u64(slice.tokens)), fg),
+                Span::styled(format!("{tokens:>token_w$}"), fg),
                 Span::raw(" ".repeat(COL_GAP)),
                 Span::styled(
                     format!("{:>RATE_COL$}", format_hit_rate(slice.cache_hit_rate())),
                     fg,
                 ),
                 Span::raw(" ".repeat(COL_GAP)),
-                Span::styled(format!("{:>6}", slice.turns), dim),
+                Span::styled(format!("{turns:>turns_w$}"), dim),
                 Span::raw(" ".repeat(COL_GAP)),
                 // A slice can hold both payers, so the column shows what the
                 // work was worth and marks it when none of it was billed.
-                match (slice.cost, slice.subscription_cost) {
-                    (0.0, subscription) if subscription > 0.0 => {
-                        Span::styled(format!("{NOT_BILLED_MARK}{subscription:>7.3}"), dim)
-                    }
-                    _ => Span::styled(format!("{:>8.3}", slice.priced()), fg),
-                },
+                Span::styled(
+                    format!("{cost:>cost_w$}"),
+                    if slice.cost == 0.0 && slice.subscription_cost > 0.0 {
+                        dim
+                    } else {
+                        fg
+                    },
+                ),
             ])
         })
         .collect();
@@ -585,7 +618,55 @@ fn totals_row(
     spans
 }
 
-fn header_row(model_w: usize, theme: &crate::theme::Theme) -> Vec<Span<'static>> {
+fn table_tokens(tokens: u64) -> String {
+    let mut text = format_tokens_u64(tokens);
+    if text.ends_with(['k', 'm']) {
+        if !text.contains('.') {
+            text.insert_str(text.len() - 1, ".0");
+        }
+    } else {
+        text.push_str(TOKEN_INTEGER_PADDING);
+    }
+    text
+}
+
+fn table_cost(cost: Option<f64>, subscription: bool) -> String {
+    match cost {
+        Some(cost) => {
+            let mark = if subscription { NOT_BILLED_MARK } else { "" };
+            format!("{mark}{cost:.3}")
+        }
+        None => "—".to_owned(),
+    }
+}
+
+fn column_widths<const N: usize>(rows: &[[String; N]], minimums: [usize; N]) -> [usize; N] {
+    rows.iter().fold(minimums, |mut widths, row| {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+        widths
+    })
+}
+
+fn breakdown_cells(row: &BreakdownRow) -> [String; 6] {
+    let usage = &row.usage;
+    [
+        table_tokens(u64::from(usage.input)),
+        table_tokens(u64::from(usage.output)),
+        table_tokens(u64::from(usage.cache_read)),
+        table_tokens(u64::from(usage.cache_creation)),
+        table_tokens(u64::from(usage.total())),
+        table_cost(row.spend.usd, row.spend.billing.is_subscription()),
+    ]
+}
+
+fn header_row(
+    model_w: usize,
+    widths: &[usize; 6],
+    theme: &crate::theme::Theme,
+) -> Vec<Span<'static>> {
+    let [input_w, output_w, read_w, write_w, total_w, cost_w] = *widths;
     let h = |label: &str, width: usize| Span::styled(format!("{label:>width$}"), theme.status_dim);
     let gap = || Span::raw(" ".repeat(COL_GAP));
     vec![
@@ -595,60 +676,57 @@ fn header_row(model_w: usize, theme: &crate::theme::Theme) -> Vec<Span<'static>>
             theme.status_dim,
         ),
         gap(),
-        h("base in", NUM_COL),
+        h("base in", input_w),
         gap(),
-        h("out", NUM_COL),
+        h("out", output_w),
         gap(),
-        h("cache read", CACHE_READ_COL),
+        h("cache read", read_w),
         gap(),
-        h("cache write", CACHE_WRITE_COL),
+        h("cache write", write_w),
         gap(),
-        h("total", NUM_COL),
+        h("total", total_w),
         gap(),
         Span::styled(format!("{:>RATE_COL$}", "hit"), theme.status_dim),
         gap(),
-        Span::styled(format!("{:>6}", "cost"), theme.status_dim),
+        h("cost", cost_w),
     ]
 }
 
 fn model_row(
-    id: &str,
-    usage: &StoredTokenUsage,
-    spend: ModelSpend,
+    row: &BreakdownRow,
+    cells: &[String; 6],
+    widths: &[usize; 6],
     model_w: usize,
     fg: Style,
     dim: Style,
 ) -> Vec<Span<'static>> {
-    let num = |v: u32, width: usize| Span::styled(format!("{:>width$}", format_tokens(v)), fg);
+    let [input, output, read, write, total, cost] = cells;
+    let [input_w, output_w, read_w, write_w, total_w, cost_w] = *widths;
+    let num = |text: &str, width: usize| Span::styled(format!("{text:>width$}"), fg);
     let gap = || Span::raw(" ".repeat(COL_GAP));
     vec![
         Span::raw(PREFIX),
-        Span::styled(format!("{id:<model_w$}"), fg),
+        Span::styled(format!("{:<model_w$}", row.label), fg),
         gap(),
-        num(usage.input, NUM_COL),
+        num(input, input_w),
         gap(),
-        num(usage.output, NUM_COL),
+        num(output, output_w),
         gap(),
-        num(usage.cache_read, CACHE_READ_COL),
+        num(read, read_w),
         gap(),
-        num(usage.cache_creation, CACHE_WRITE_COL),
+        num(write, write_w),
         gap(),
-        num(usage.total(), NUM_COL),
+        num(total, total_w),
         gap(),
         Span::styled(
-            format!("{:>RATE_COL$}", format_hit_rate(usage.cache_hit_rate())),
+            format!("{:>RATE_COL$}", format_hit_rate(row.usage.cache_hit_rate())),
             fg,
         ),
         gap(),
-        match spend.usd {
-            // One column, two meanings: the tilde is the only room there is to
-            // say this row is priced rather than owed.
-            Some(c) if spend.billing.is_subscription() => {
-                Span::styled(format!("{}{c:>5.3}", NOT_BILLED_MARK), fg)
-            }
-            Some(c) => Span::styled(format!("{c:>6.3}"), fg),
-            None => Span::styled(format!("{:>6}", "—"), dim),
-        },
+        Span::styled(
+            format!("{cost:>cost_w$}"),
+            if row.spend.usd.is_some() { fg } else { dim },
+        ),
     ]
 }
 
@@ -782,9 +860,9 @@ mod tests {
         subscription_cost: None,
     };
     const BUCKET_HEADERS: &str = "base in      out  cache read  cache write    total   hit    cost";
-    const BUCKET_VALUES: &str = "    101       37         211           53      402   58%   0.123";
+    const BUCKET_VALUES: &str = " 101       37         211           53      402      58%   0.123";
     const FOLDED_BUCKET_VALUES: &str =
-        "    124       56         254           70      504   57%   0.246";
+        " 124       56         254           70      504      57%   0.246";
     const BASE_INPUT_PREFIX: &str = "  base in 101 ";
     const LIFETIME_MODEL: &str = "anthropic/claude-opus-5";
     const LIFETIME_PROJECT: &str = "/home/dev/caudra";
@@ -801,7 +879,7 @@ mod tests {
     const COLD_RATE: &str = "0%";
     /// Two models of 1M input and 1M cached reads each, summed: the fold scores
     /// 2M of 4M prompt tokens.
-    const FOLDED_TOKENS: &str = "4m";
+    const FOLDED_TOKENS: &str = "4.0m";
     const FOLDED_RATE: &str = "50%";
     const UNKNOWN_IS_NOT_ZERO: &str =
         "a provider that reported no prompt tokens has no rate, which is not a rate of zero";
@@ -820,6 +898,175 @@ mod tests {
     const BAR_UNWANTED: &str = "a table that fits must not wear a pan bar";
     const BAR_MISSING: &str = "a table running off the edge must show what reaches it";
     const TOUCH_MARGIN: &str = "only a finger may press the rows beside the bar";
+    const TOKEN_SPANS: [usize; 5] = [3, 5, 7, 9, 11];
+    const COST_SPAN: usize = 15;
+    const COST_DECIMAL_TAIL: usize = 4;
+    const TABLE_HEADER: usize = 2;
+    const TABLE_BODY: usize = 3;
+    const DECIMAL_ALIGNMENT: &str = "numeric columns must share a decimal position";
+    const TABLE_COST_CASES: [(Option<f64>, bool, &str); 6] = [
+        (Some(120.646), true, "~120.646"),
+        (Some(219.226), true, "~219.226"),
+        (Some(0.400), false, "0.400"),
+        (None, false, NO_COST_TEXT),
+        (Some(0.002), true, "~0.002"),
+        (Some(999.9996), false, "1000.000"),
+    ];
+
+    #[test_case(0, "0   " ; "zero")]
+    #[test_case(999, "999   " ; "raw_integer")]
+    #[test_case(3_000, "3.0k" ; "whole_thousands")]
+    #[test_case(7_700, "7.7k" ; "fractional_thousands")]
+    #[test_case(7_000_000, "7.0m" ; "whole_millions")]
+    #[test_case(246_100_000, "246.1m" ; "fractional_millions")]
+    #[test_case(999_949, "999.9k" ; "below_suffix_rounding")]
+    #[test_case(999_950, "1.0m" ; "suffix_rounding")]
+    #[test_case(u32::MAX as u64, "4295.0m" ; "maximum_session_counter")]
+    #[test_case(u64::MAX, "18446744073709.6m" ; "maximum_lifetime_counter")]
+    fn table_tokens_reserve_fraction_and_suffix(tokens: u64, expected: &str) {
+        assert_eq!(table_tokens(tokens), expected);
+    }
+
+    #[test_case(false ; "per_model")]
+    #[test_case(true ; "per_provider")]
+    fn breakdown_decimals_align_across_every_numeric_column(providers: bool) {
+        let theme = crate::theme::current();
+        let tokens = [3_000, 7_000_000, 4_700, 0, 15_500, u32::MAX];
+        let mut rows: Vec<_> = TABLE_COST_CASES
+            .iter()
+            .zip(tokens)
+            .enumerate()
+            .map(|(index, (&(cost, subscription, _), tokens))| BreakdownRow {
+                label: format!("provider-{index}/model"),
+                usage: StoredTokenUsage {
+                    input: tokens,
+                    output: tokens,
+                    cache_read: tokens,
+                    cache_creation: tokens,
+                    ..StoredTokenUsage::default()
+                },
+                spend: ModelSpend {
+                    usd: cost,
+                    billing: Billing::from_oauth(subscription),
+                },
+            })
+            .collect();
+        if providers {
+            rows = provider_rows(&rows, FOREIGN_PROVIDER);
+        }
+        let lines = breakdown_table(PROVIDER_HEADING, &rows, &theme);
+        let header = &lines[TABLE_HEADER];
+        for line in &lines[TABLE_BODY..] {
+            assert_eq!(line.width(), header.width(), "{DECIMAL_ALIGNMENT}");
+            for index in TOKEN_SPANS {
+                let text = line.spans[index].content.as_ref();
+                let decimal = text.find('.').unwrap_or_else(|| text.trim_end().len());
+                assert_eq!(text.len(), header.spans[index].width());
+                assert_eq!(
+                    decimal,
+                    text.len() - TOKEN_INTEGER_PADDING.len(),
+                    "{DECIMAL_ALIGNMENT}"
+                );
+            }
+            let label = line.spans[1].content.trim();
+            let case = TABLE_COST_CASES
+                .iter()
+                .enumerate()
+                .find(|(index, _)| label.starts_with(&format!("provider-{index}")))
+                .unwrap()
+                .1;
+            let cost = line.spans[COST_SPAN].content.as_ref();
+            assert_eq!(cost.trim(), case.2);
+            assert_eq!(
+                line.spans[COST_SPAN].width(),
+                header.spans[COST_SPAN].width()
+            );
+            if case.0.is_some() {
+                assert_eq!(
+                    cost.find('.'),
+                    Some(cost.len() - COST_DECIMAL_TAIL),
+                    "{DECIMAL_ALIGNMENT}"
+                );
+            } else {
+                assert_eq!(line.spans[COST_SPAN].style, theme.status_dim);
+            }
+        }
+    }
+
+    #[test_case(false ; "api_cost")]
+    #[test_case(true ; "subscription_cost")]
+    fn lifetime_columns_expand_for_wide_counts_and_costs(subscription: bool) {
+        let theme = crate::theme::current();
+        let fg = Style::new().fg(theme.foreground);
+        let slices: Vec<_> = [
+            (u64::MAX, u64::MAX, 120.646),
+            (7_000_000, 1, 0.002),
+            (0, 0, 999.9996),
+        ]
+        .into_iter()
+        .map(|(tokens, turns, cost)| UsageSlice {
+            label: LIFETIME_MODEL.to_owned(),
+            tokens,
+            turns,
+            cost: if subscription { 0.0 } else { cost },
+            subscription_cost: if subscription { cost } else { 0.0 },
+            ..UsageSlice::default()
+        })
+        .collect();
+        let lines = slice_rows(&slices, fg, theme.status_dim);
+        let expected_costs = if subscription {
+            [" ~120.646", "   ~0.002", "~1000.000"]
+        } else {
+            [" 120.646", "   0.002", "1000.000"]
+        };
+        let expected_tokens = [
+            "18446744073709.6m",
+            "             7.0m",
+            "             0   ",
+        ];
+        let expected_turns = [
+            "18446744073709551615",
+            "                   1",
+            "                   0",
+        ];
+        for (index, line) in lines.iter().enumerate() {
+            assert_eq!(line.width(), lines[0].width(), "{DECIMAL_ALIGNMENT}");
+            assert_eq!(line.spans[3].content, expected_tokens[index]);
+            assert_eq!(line.spans[7].content, expected_turns[index]);
+            assert_eq!(line.spans[9].content, expected_costs[index]);
+            assert_eq!(
+                line.spans[9].style,
+                if subscription { theme.status_dim } else { fg }
+            );
+        }
+    }
+
+    #[test_case(false ; "billed")]
+    #[test_case(true ; "mixed_payers")]
+    fn lifetime_widths_ignore_hidden_rows(mixed: bool) {
+        let mut slices = vec![slice(LIFETIME_MODEL, RECORDED_COST); SLICE_LIMIT];
+        if mixed {
+            slices[0].subscription_cost = SUBSCRIPTION_COST;
+        }
+        let fg = Style::default();
+        let visible = slice_rows(&slices, fg, fg);
+        slices.push(UsageSlice {
+            label: LONG_MODEL.to_owned(),
+            tokens: u64::MAX,
+            turns: u64::MAX,
+            cost: 1_000_000.0,
+            ..UsageSlice::default()
+        });
+        let capped = slice_rows(&slices, fg, fg);
+        assert_eq!(&capped[..SLICE_LIMIT], visible);
+        assert_eq!(
+            line_texts(&capped[SLICE_LIMIT..]),
+            [format!("{PREFIX}... and 1 more")]
+        );
+        if mixed {
+            assert_eq!(visible[0].spans[9].content.trim(), "4.690");
+        }
+    }
 
     /// Where the arrow was painted, read back from the frame so the tap aims at
     /// what the reader sees rather than at a second copy of the layout.
