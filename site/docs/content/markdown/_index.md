@@ -20,7 +20,9 @@ SQL clients, and shells are recognised, with versioned names such as
 heredoc fed to any other program, such as `cat`, keep the shell colours.
 
 Tool cards, permission prompts, `/permissions`, and the workbench editor
-colour shell commands the same way. Colours never change the text.
+colour shell commands the same way. A tool card colours the script it shows
+when open, the command on its header row, each shell row of a batch, and the
+`Command` row of a background job. Colours never change the text.
 
 ## Maths
 

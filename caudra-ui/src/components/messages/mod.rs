@@ -24,7 +24,7 @@ use super::{
         BatchLiveMap, BatchProgressMap, BatchStartedMap, BatchViewMap, CardPolicy, Disclosure,
         RowTarget, ScrollSpan, ScrollWindow,
     },
-    memory_card, review, task_card, workflow_card,
+    command_text, memory_card, review, task_card, workflow_card,
     workflow_card::CardHit,
 };
 use crate::animation::{live_elapsed, spinner_str};
@@ -32,6 +32,7 @@ use crate::chat::batch_child_id;
 use crate::components::commit_popup::CommitIndex;
 use crate::components::keybindings::key;
 use crate::components::prompt_progress::{self, PromptProgress, PromptRate};
+use crate::highlight;
 use crate::markdown::{
     DiagramSpan, LinkMap, TerminalLink, hr_line, plain_lines, text_to_painted, text_to_rows,
     truncate_output, truncate_output_tail,
@@ -5372,6 +5373,8 @@ impl MessagesPanel {
         };
 
         let exp = self.tool_expansion(tool_id, opens);
+        // Before the build: the syntax set may finish loading while it runs.
+        let ready = highlight::is_ready();
         let tl = self.build_anchored_tool_lines(tool_id, msg_idx, status, exp);
         let msg = &self.messages[msg_idx];
 
@@ -5385,6 +5388,7 @@ impl MessagesPanel {
         let seg = self.cache.get_mut(seg_idx).unwrap();
         seg.search_text = tl.search_text.clone();
         seg.update_with_reuse(tl, &self.hl_worker, compact);
+        seg.uncoloured = !ready;
         self.hold_card_height(tool_id, status, drawn);
 
         if let Some(blocks) = instructions {
@@ -5396,6 +5400,12 @@ impl MessagesPanel {
         if !self.cache.needs_rebuild(self.messages.len()) {
             return;
         }
+        // A full rebuild draws every card at once, so it colours only the
+        // commands already coloured, and no card is coloured before the
+        // syntax set loads. `reflowed_height` colours the rest as they near
+        // the screen.
+        let full = self.cache.msg_count() == 0;
+        let ready = highlight::is_ready();
         for i in self.cache.msg_count()..self.messages.len() {
             let msg = &self.messages[i];
 
@@ -5408,11 +5418,16 @@ impl MessagesPanel {
                     .tool_output
                     .as_deref()
                     .and_then(|o| o.owned_instructions());
-                let tl = self.build_anchored_tool_lines(&id, i, status, exp);
+                let (tl, uncoloured) = if full {
+                    command_text::deferring(|| self.build_anchored_tool_lines(&id, i, status, exp))
+                } else {
+                    (self.build_anchored_tool_lines(&id, i, status, exp), !ready)
+                };
                 let drawn = tl.lines.len();
                 let mut seg = Segment::with_tool(id.clone(), SegmentKind::ToolBlock, Some(i));
                 seg.search_text = tl.search_text.clone();
                 seg.apply_highlight(tl, &self.hl_worker, compact);
+                seg.uncoloured = uncoloured;
                 self.cache.push(seg);
                 self.hold_card_height(&id, status, drawn);
 
@@ -5558,13 +5573,23 @@ impl MessagesPanel {
         true
     }
 
-    /// Reflows `seg_idx` if it is stale, then reports the height it draws at.
+    /// Reflows `seg_idx` if it is stale, colours any command it drew plain,
+    /// then reports the height it draws at.
     fn reflowed_height(&mut self, seg_idx: usize, width: u16) -> u32 {
         // A tool segment and its instruction segment both map back to the
         // same parent, and one `rebuild_tool_segment` clears both flags.
         // Re-check so the parent is not rebuilt twice.
-        if self.cache.get(seg_idx).is_some_and(|s| s.stale) {
+        let Some(seg) = self.cache.get_mut(seg_idx) else {
+            return 0;
+        };
+        if seg.stale {
             self.reflow_segment(seg_idx, width);
+        } else if seg.uncoloured && highlight::is_ready() {
+            // Cleared up front for the reason `reflow_segment` gives.
+            seg.uncoloured = false;
+            if let Some(tool_id) = seg.tool_id.clone() {
+                self.rebuild_tool_lines(&tool_id);
+            }
         }
         self.cache
             .get(seg_idx)

@@ -1,9 +1,16 @@
-//! Commands drawn in shell colours wherever a permission is reviewed: the
-//! request, its rows, the scopes it offers, and the `/permissions` lists.
+//! Commands drawn in shell colours wherever a permission is reviewed (the
+//! request, its rows, the scopes it offers, and the `/permissions` lists) and
+//! on the transcript rows that name one: a shell card's header, a batch's
+//! shell rows, and a background job's `Command` row.
 //!
-//! Every caller hands over text already redacted and escaped for review, so
-//! colouring decides only how that text is drawn, never what it says. Until
-//! the syntax set has loaded the text is drawn plain.
+//! Every caller hands over text already redacted, escaped, or checked to hold
+//! no control character, so colouring decides only how that text is drawn,
+//! never what it says. Until the syntax set has loaded the text is drawn
+//! plain.
+//!
+//! A full rebuild of the transcript draws every card at once, so it colours
+//! only the commands already remembered. [`deferring`] reports the rest, and
+//! the transcript colours those cards as they come near the screen.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -44,26 +51,49 @@ thread_local! {
 struct Coloured {
     theme: u64,
     commands: HashMap<String, Vec<Vec<Span<'static>>>>,
+    /// Inside [`deferring`], whether a command has been drawn plain for now.
+    deferred: Option<bool>,
+}
+
+/// Runs `build` colouring only the commands already remembered, and reports
+/// whether any other was drawn plain, as every command is while the syntax
+/// set loads. Parsing every command a full rebuild draws would stall the
+/// frame on cards nobody is looking at.
+pub(crate) fn deferring<T>(build: impl FnOnce() -> T) -> (T, bool) {
+    let outer = COLOURED.with_borrow_mut(|coloured| coloured.deferred.replace(false));
+    let built = build();
+    let deferred = COLOURED.with_borrow_mut(|coloured| {
+        let deferred = coloured.deferred == Some(true);
+        coloured.deferred = outer.map(|noted| noted || deferred);
+        deferred
+    });
+    (built, deferred)
 }
 
 /// The lines of one command, coloured by one highlighter so a heredoc body
 /// is coloured in the language it feeds.
 pub(crate) fn command_lines(lines: &[String]) -> Vec<Vec<Span<'static>>> {
-    if !highlight::is_ready() {
-        return lines
-            .iter()
-            .map(|line| vec![Span::raw(line.clone())])
-            .collect();
-    }
+    let ready = highlight::is_ready();
     let generation = theme::generation();
     COLOURED.with_borrow_mut(|coloured| {
-        if coloured.theme != generation || coloured.commands.len() >= MAX_REMEMBERED {
+        if coloured.theme != generation {
             coloured.commands.clear();
             coloured.theme = generation;
         }
+        let command = lines.join(LINE_BREAK);
+        if let Some(remembered) = coloured.commands.get(&command) {
+            return remembered.clone();
+        }
+        if !ready || coloured.deferred.is_some() {
+            coloured.deferred = coloured.deferred.map(|_| true);
+            return lines.iter().map(|line| plain(line)).collect();
+        }
+        if coloured.commands.len() >= MAX_REMEMBERED {
+            coloured.commands.clear();
+        }
         coloured
             .commands
-            .entry(lines.join(LINE_BREAK))
+            .entry(command)
             .or_insert_with(|| colour(lines))
             .clone()
     })
@@ -81,10 +111,14 @@ fn colour(lines: &[String]) -> Vec<Vec<Span<'static>>> {
             }
             None => {
                 budget = 0;
-                vec![Span::raw(line.clone())]
+                plain(line)
             }
         })
         .collect()
+}
+
+fn plain(line: &str) -> Vec<Span<'static>> {
+    vec![Span::raw(line.to_owned())]
 }
 
 /// One line of shell.
@@ -246,13 +280,13 @@ pub(crate) mod tests {
     use caudra_highlight::Highlighter;
     use ratatui::buffer::Buffer;
     use ratatui::style::{Color, Modifier, Style};
-    use ratatui::text::Span;
+    use ratatui::text::{Line, Span};
     use test_case::test_case;
 
     use super::super::code_view::highlight_spans;
     use super::{
         COLOURED, MAX_COLOURED_BYTES, MAX_REMEMBERED, SHELL, code_spans_in, command_lines,
-        command_spans, ellipsize_spans, marked_spans, overlay, pad_spans, pattern_spans,
+        command_spans, deferring, ellipsize_spans, marked_spans, overlay, pad_spans, pattern_spans,
     };
     use crate::{highlight, theme};
 
@@ -271,6 +305,10 @@ pub(crate) mod tests {
     const SENTENCE: &str = "Runs `git status` with any arguments";
     const QUOTED: &str = "git status";
     const TEXT_KEPT: &str = "colouring must keep the text as it was";
+    const ROW_KEPT: &str = "colouring a command must leave the rest of its row as it was";
+    const DEFERRED: &str = "a deferring build draws only remembered commands in colour, and \
+        reports any other it drew plain";
+    const SCOPE_ENDED: &str = "a command drawn after the deferring build is coloured again";
     pub(crate) const NOT_TOLD_APART: &str = "the theme must colour the two differently";
 
     /// Colours on, in a theme whose syntax colours tell words apart.
@@ -311,15 +349,53 @@ pub(crate) mod tests {
 
     /// The colour `language` gives the first character of `word` in `line`.
     pub(crate) fn syntax_colour(language: &str, line: &str, word: &str) -> Option<Color> {
-        let at = line.find(word)?;
+        colour_of(
+            &highlight_spans(&mut Highlighter::for_token(language), line),
+            word,
+        )
+    }
+
+    /// The colour `spans` draw the first character of `word` in.
+    pub(crate) fn colour_of(spans: &[Span<'_>], word: &str) -> Option<Color> {
+        let at = text(spans).find(word)?;
         let mut end = 0;
-        highlight_spans(&mut Highlighter::for_token(language), line)
-            .into_iter()
+        spans
+            .iter()
             .find(|span| {
                 end += span.content.len();
                 end > at
             })
             .and_then(|span| span.style.fg)
+    }
+
+    /// Each character `line` draws, with the style it is drawn in.
+    pub(crate) fn styled_characters(line: &Line<'_>) -> Vec<(char, Style)> {
+        line.spans
+            .iter()
+            .flat_map(|span| {
+                span.content
+                    .chars()
+                    .map(move |character| (character, span.style))
+            })
+            .collect()
+    }
+
+    /// `coloured` reads as `plain` does, with `command` in shell colours over
+    /// the style `plain` drew it in and the rest of the row as it was.
+    pub(crate) fn assert_command_coloured(plain: &Line<'_>, coloured: &Line<'_>, command: &str) {
+        let plain = styled_characters(plain);
+        let coloured = styled_characters(coloured);
+        let read = |row: &[(char, Style)]| row.iter().map(|(character, _)| character).collect();
+        let text: String = read(&plain);
+        assert_eq!(read(&coloured), text, "{TEXT_KEPT}");
+        let at = text.find(command).expect(NOT_SHOWN);
+        let start = text[..at].chars().count();
+        let end = start + command.chars().count();
+        let shell = styled_characters(&Line::from(overlay(command_spans(command), plain[start].1)));
+        assert_ne!(shell, plain[start..end], "{NOT_TOLD_APART}");
+        assert_eq!(coloured[start..end], shell, "{command}");
+        assert_eq!(coloured[..start], plain[..start], "{ROW_KEPT}");
+        assert_eq!(coloured[end..], plain[end..], "{ROW_KEPT}");
     }
 
     fn text(spans: &[Span<'_>]) -> String {
@@ -378,6 +454,21 @@ pub(crate) mod tests {
         let before = command_spans(QUOTED);
         theme::set(theme::load_by_name(OTHER_THEME).unwrap());
         assert_ne!(command_spans(QUOTED), before);
+    }
+
+    #[test_case(false; "not_yet_coloured")]
+    #[test_case(true; "remembered")]
+    fn a_deferring_build_colours_only_remembered_commands(remembered: bool) {
+        coloured();
+        let plain = vec![Span::raw(QUOTED)];
+        let shell = remembered.then(|| command_spans(QUOTED));
+        let (spans, deferred) = deferring(|| command_spans(QUOTED));
+        assert_eq!(
+            (spans, deferred),
+            (shell.unwrap_or_else(|| plain.clone()), !remembered),
+            "{DEFERRED}"
+        );
+        assert_ne!(command_spans(QUOTED), plain, "{SCOPE_ENDED}");
     }
 
     #[test_case("cargo test -p <crate> *", &["<crate>"]; "one_slot")]

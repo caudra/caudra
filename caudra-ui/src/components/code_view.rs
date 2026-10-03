@@ -3743,6 +3743,10 @@ fn merge_syntax_with_diff(
 mod tests {
     use super::*;
     use crate::animation::test_clock::FrozenClock;
+    use crate::components::command_text::deferring;
+    use crate::components::command_text::tests::{
+        assert_command_coloured, coloured, styled_characters,
+    };
     use crate::components::tool_display::{AWAITING_APPROVAL, WRITING_COMMAND};
     use crate::markdown::{EXPAND_AFFORDANCE, TRUNCATION_PREFIX};
     use crate::provenance::Provenance;
@@ -7320,6 +7324,56 @@ mod tests {
         assert!(
             row.contains(CHILD_ANNOTATION_TAIL),
             "{CHILD_WORKDIR_MSG}: {row:?}"
+        );
+    }
+
+    const CHILD_BODY_LINES: usize = 2;
+    const LONG_CHILD_COMMAND: &str =
+        "cargo nextest run -p caudra-ui --no-fail-fast --test-threads 4";
+    const CHILD_COLOURS_MSG: &str =
+        "a child's command keeps its text, and its shell colours on every row it wraps onto";
+
+    /// A shell child that ran `command`, folded to its summary row.
+    fn ran(command: &str) -> BatchToolEntry {
+        BatchToolEntry {
+            summary: command.into(),
+            raw_input: Some(serde_json::json!({ "command": command })),
+            ..batch_entry(SHELL_CHILD, CHILD_BODY_LINES)
+        }
+    }
+
+    /// The card as a full rebuild first draws it, and then once coloured.
+    fn plain_and_coloured(
+        entries: &[BatchToolEntry],
+        limits: &RenderLimits,
+    ) -> (BatchCard, BatchCard) {
+        let (plain, _) = deferring(|| render_batch(entries, false, limits));
+        (plain, render_batch(entries, false, limits))
+    }
+
+    #[test]
+    fn a_folded_shell_child_draws_its_command_in_shell_colours() {
+        coloured();
+        let (plain, card) =
+            plain_and_coloured(&[ran(CHILD_COMMAND)], &limits(BatchViews::default()));
+
+        assert_command_coloured(&plain.lines[0], &card.lines[0], CHILD_COMMAND);
+    }
+
+    #[test]
+    fn a_wrapped_shell_child_keeps_its_colours_past_the_break() {
+        coloured();
+        let narrow = limits(BatchViews::default())
+            .with_width(NARROW_BODY_WIDTH + batch_child_indent_width());
+        let (plain, card) = plain_and_coloured(&[ran(LONG_CHILD_COMMAND)], &narrow);
+        let rows = |card: &BatchCard| card.lines.iter().map(line_text).collect::<Vec<_>>();
+
+        assert!(card.lines.len() > 1, "{TITLE_HANGS}");
+        assert_eq!(rows(&card), rows(&plain), "{CHILD_COLOURS_MSG}");
+        assert_ne!(
+            styled_characters(&card.lines[1]),
+            styled_characters(&plain.lines[1]),
+            "{CHILD_COLOURS_MSG}"
         );
     }
 

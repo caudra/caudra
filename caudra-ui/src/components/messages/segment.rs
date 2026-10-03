@@ -148,6 +148,11 @@ pub(super) struct Segment {
     /// `reflow_segment`; partial splices (`apply_highlight_result`) leave it
     /// set so the segment still reflows later.
     pub(super) stale: bool,
+    /// Commands drawn plain, by a full rebuild or before the syntax set
+    /// loaded, which the reflow colours once the segment comes near the
+    /// screen. `set_lines` leaves it set: only a rebuild made while colours
+    /// are ready clears it.
+    pub(super) uncoloured: bool,
 }
 
 impl Segment {

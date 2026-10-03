@@ -1,6 +1,7 @@
 use super::{DisplayMessage, ToolProgress, ToolStatus, escape_terminal_controls, task_card};
 
 use super::code_view;
+use super::command_text::{command_spans, overlay};
 use super::status_bar::collapse_home;
 use crate::animation::{live_elapsed, spinner_frame, spinner_str};
 use crate::chat::batch_child_id;
@@ -320,6 +321,7 @@ const QUERY_KEYS: &[(&str, &str)] = &[
     ("code_impact", "symbol"),
     ("code_expand", "symbol"),
 ];
+const SHELL_COMMAND_KEY: &str = "command";
 /// The tools whose streaming body is a source the call carries entire rather
 /// than a file it names, and whether the header is a summary of that same
 /// source. All three draw the body as numbered lines whole, so it is rendered
@@ -971,6 +973,8 @@ fn same_key(left: &str, right: &str) -> bool {
 /// verbatim. Italic rather than a colour because the query is a literal, which
 /// is what italic already marks everywhere else, and because a new colour would
 /// have to mean something in every theme.
+///
+/// A shell header that is its command's first line is coloured as shell.
 pub(super) fn header_spans(
     tool: &str,
     header: &str,
@@ -979,6 +983,9 @@ pub(super) fn header_spans(
 ) -> Vec<Span<'static>> {
     if names_tool(SEND_MESSAGE_TOOL_NAME, tool) || names_tool(LIST_SESSIONS_TOOL_NAME, tool) {
         return vec![Span::styled(escape_terminal_controls(header), base)];
+    }
+    if is_shell_command(tool, header, raw_input) {
+        return overlay(command_spans(header), base);
     }
     let query = query_key(tool)
         .and_then(|key| raw_input?.get(key)?.as_str())
@@ -995,6 +1002,19 @@ pub(super) fn header_spans(
         spans.push(Span::styled(rest.to_owned(), base));
     }
     spans
+}
+
+/// Whether `header` is the first line of the command a shell call runs, word
+/// for word. Colouring would turn a tab into spaces, so a header holding a
+/// control character stays plain, and so does one the call's input does not
+/// bear out, such as a command the model is still drafting.
+fn is_shell_command(tool: &str, header: &str, raw_input: Option<&Value>) -> bool {
+    names_tool(SHELL_TOOL_NAME, tool)
+        && !header.is_empty()
+        && !header.chars().any(char::is_control)
+        && raw_input
+            .and_then(|input| input.get(SHELL_COMMAND_KEY)?.as_str())
+            .is_some_and(|command| command.lines().next() == Some(header))
 }
 
 /// The same for a tool named at runtime. A batch child knows only its tool's
@@ -3106,6 +3126,10 @@ mod tests {
 
     const TOL: ToolOutputLines = ToolOutputLines::DEFAULT;
     use crate::animation::test_clock::{FrozenClock, FrozenSpinner};
+    use crate::components::command_text::deferring;
+    use crate::components::command_text::tests::{
+        NOT_TOLD_APART, assert_command_coloured, coloured,
+    };
     use crate::components::{DisplayRole, ToolRole};
     use crate::markdown::{TRUNCATION_PREFIX, truncate_output};
     use crate::provenance::Provenance;
@@ -7653,6 +7677,68 @@ mod tests {
             vec![(true, "pub mod".to_owned()), (false, " in src".to_owned())],
             "{QUERY_MARK_MSG}"
         );
+    }
+
+    const SHELL_HEADER: &str = "cargo test -p caudra-ui";
+    const SHELL_SCRIPT: &str = "cargo test -p caudra-ui\necho done";
+    const TABBED_COMMAND: &str = "cargo\ttest";
+    const HEADER_BASE: Style = Style::new().fg(Color::Gray);
+    const SHELL_HEADER_MSG: &str =
+        "a shell header is coloured as shell exactly when it is its command's first line";
+    const SHELL_ROW_MSG: &str = "a closed shell row must keep reading as a shell row";
+
+    #[test_case(SHELL_TOOL_NAME, SHELL_HEADER, Some(serde_json::json!({ "command": SHELL_SCRIPT })), true ; "the_first_line_of_its_command")]
+    #[test_case("mcp_Shell", SHELL_HEADER, Some(serde_json::json!({ "command": SHELL_HEADER })), true ; "a_qualified_shell")]
+    #[test_case(SHELL_TOOL_NAME, SHELL_HEADER, None, false ; "a_session_that_kept_no_input")]
+    #[test_case(SHELL_TOOL_NAME, "cargo test", Some(serde_json::json!({ "command": SHELL_HEADER })), false ; "part_of_its_command")]
+    #[test_case(SHELL_TOOL_NAME, WRITING_COMMAND, Some(serde_json::json!({ "command": SHELL_HEADER })), false ; "a_command_still_being_written")]
+    #[test_case(SHELL_TOOL_NAME, TABBED_COMMAND, Some(serde_json::json!({ "command": TABBED_COMMAND })), false ; "a_control_character")]
+    #[test_case(READ_TOOL, SHELL_HEADER, Some(serde_json::json!({ "command": SHELL_HEADER })), false ; "another_tool")]
+    fn a_shell_header_is_coloured_only_as_its_command(
+        tool: &str,
+        header: &str,
+        raw_input: Option<serde_json::Value>,
+        shell: bool,
+    ) {
+        coloured();
+        let plain = vec![Span::styled(header.to_owned(), HEADER_BASE)];
+        let shell_spans = overlay(command_spans(header), HEADER_BASE);
+        assert_ne!(shell_spans, plain, "{NOT_TOLD_APART}");
+        assert_eq!(
+            header_spans(tool, header, HEADER_BASE, raw_input.as_ref()),
+            if shell { shell_spans } else { plain },
+            "{SHELL_HEADER_MSG}"
+        );
+    }
+
+    /// Everything around the command, from the sigil to the clock, is drawn
+    /// as it was before commands were coloured.
+    #[test_case(false ; "collapsed")]
+    #[test_case(true ; "compact")]
+    fn a_closed_shell_row_colours_only_its_command(compact: bool) {
+        coloured();
+        let mut msg = bash_msg(
+            SHELL_HEADER,
+            ToolStatus::Success,
+            None,
+            Some(settled_in(SUBDIR)),
+        );
+        msg.tool_raw_input = Some(Arc::new(serde_json::json!({
+            "command": SHELL_HEADER,
+            "workdir": SUBDIR,
+        })));
+        let rctx = match compact {
+            true => compact_rctx(UNBROKEN),
+            false => test_rctx(UNBROKEN),
+        };
+        let rctx = in_cwd(rctx, Some(PROJECT));
+        let build = || build_tool_lines(&msg, ToolStatus::Success, &rctx, None);
+
+        let (plain, _) = deferring(build);
+        let row = build();
+
+        assert!(lines_text(&row).contains(SUBDIR_SHOWN), "{SHELL_ROW_MSG}");
+        assert_command_coloured(&plain.lines[0], &row.lines[0], SHELL_HEADER);
     }
 
     const ARGS_MSG: &str = "the brackets carry what the header does not already show";

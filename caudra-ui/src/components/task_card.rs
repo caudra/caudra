@@ -12,6 +12,7 @@ use crate::{
         code_view::{
             RowTarget, WrappedRows, body_window, highlighted_body, plain_body, truncation_line,
         },
+        command_text::{command_lines, overlay},
         escape_terminal_controls, format_compact,
         tool_display::task_details,
     },
@@ -25,6 +26,9 @@ const SEPARATOR: &str = " · ";
 const BACKGROUND_BADGE: &str = " [background]";
 const OPEN_CHAT: &str = " · open chat";
 pub(crate) const COMMAND_LABEL: &str = "Command";
+const LINE_BREAK: char = '\n';
+/// How a line break inside a command reads on its one row.
+const ESCAPED_LINE_BREAK: &str = "\\n";
 /// The most text [`literal_code`] colours. Colouring is a parse on the UI
 /// thread at about 4-5 µs a byte, so longer text is drawn plain rather than
 /// stalling the frame that first shows it.
@@ -95,7 +99,7 @@ fn shell_facts(task: &TaskCard, script: Option<&str>) -> Vec<Line<'static>> {
         .map_or(task.label.as_str(), |shell| shell.command.as_str());
     let mut facts = Vec::new();
     if !repeats_script(command, script) {
-        facts.push(fact(COMMAND_LABEL, command, t.tool));
+        facts.push(command_fact(command));
     }
     if let Some(shell) = &task.shell {
         let owner = match task.owner {
@@ -291,13 +295,40 @@ pub(crate) fn render(
 }
 
 pub(crate) fn fact(label: &str, value: &str, style: Style) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(
-            format!("{INDENT}{label:<LABEL_WIDTH$}  "),
-            theme::current().tool_dim,
-        ),
-        Span::styled(escape_terminal_controls(value), style),
-    ])
+    labelled(
+        label,
+        vec![Span::styled(escape_terminal_controls(value), style)],
+    )
+}
+
+fn labelled(label: &str, value: Vec<Span<'static>>) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        format!("{INDENT}{label:<LABEL_WIDTH$}  "),
+        theme::current().tool_dim,
+    )];
+    spans.extend(value);
+    Line::from(spans)
+}
+
+/// A job's command on its one row, coloured as shell. Each line is escaped
+/// on its own and the breaks between them drawn as `\n`, so the row reads as
+/// the escaped command always has, and one highlighter colours them all so a
+/// heredoc body keeps its language.
+fn command_fact(command: &str) -> Line<'static> {
+    let style = theme::current().tool;
+    let lines: Vec<String> = command
+        .split(LINE_BREAK)
+        .map(escape_terminal_controls)
+        .collect();
+    let value = command_lines(&lines)
+        .into_iter()
+        .enumerate()
+        .flat_map(|(index, line)| {
+            let gap = (index > 0).then(|| Span::styled(ESCAPED_LINE_BREAK, style));
+            gap.into_iter().chain(line)
+        })
+        .collect();
+    labelled(COMMAND_LABEL, overlay(value, style))
 }
 
 pub(crate) fn status_style(state: &str) -> Style {
@@ -401,16 +432,23 @@ pub(crate) fn has_active(output: &ToolOutput) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        BACKGROUND_BADGE, COMMAND_LABEL, MAX_HIGHLIGHTED_BYTES, OPEN_CHAT, delivery, literal_body,
-        literal_code, markdown_body, render,
+        BACKGROUND_BADGE, COMMAND_LABEL, LINE_BREAK, MAX_HIGHLIGHTED_BYTES, OPEN_CHAT,
+        command_fact, delivery, fact, literal_body, literal_code, markdown_body, render,
     };
     use crate::chat::history_to_display;
-    use crate::components::{DisplayRole, code_view::RowTarget};
+    use crate::components::command_text::deferring;
+    use crate::components::command_text::tests::{
+        NOT_TOLD_APART, colour_of, coloured, syntax_colour,
+    };
+    use crate::components::{DisplayRole, code_view::RowTarget, escape_terminal_controls};
     use crate::theme;
     use caudra_agent::{History, TaskCard};
     use caudra_providers::{Message, TaskEventOrigin};
     use caudra_storage::background::{JobKind, ShellJobMetadata};
-    use ratatui::{style::Modifier, text::Line};
+    use ratatui::{
+        style::{Modifier, Style},
+        text::Line,
+    };
     use serde_json::{Value, json};
     use std::collections::HashSet;
     use std::slice;
@@ -433,6 +471,10 @@ mod tests {
     const NARROW_WIDTH: u16 = 24;
     const WIDE_WIDTH: u16 = 120;
     const COLOURED_COMMAND: &str = "echo \"done\" | grep -c done > out.txt";
+    const HEREDOC_COMMAND: &str = "cat <<'EOF' > notes.txt\nfirst \"line\"\nEOF";
+    const TWO_LINE_COMMAND: &str = "cd src # then build\nmake test";
+    const FIRST_PROGRAM: &str = "cd";
+    const SECOND_PROGRAM: &str = "make";
     const SAME_TEXT: &str = "colouring changes neither the text nor where it breaks";
     const COLOURED: &str = "a command within the budget is coloured";
     const PLAIN: &str = "a command past the budget is drawn plain";
@@ -698,7 +740,7 @@ mod tests {
     }
 
     #[test_case("cargo test"; "one_line")]
-    #[test_case("cat <<'EOF' > notes.txt\nfirst \"line\"\nEOF"; "heredoc")]
+    #[test_case(HEREDOC_COMMAND; "heredoc")]
     #[test_case("printf '\u{1b}[31mred\u{7}'"; "terminal_controls")]
     #[test_case(SHELL_COMMAND; "wrapped_long_line")]
     fn literal_code_draws_the_rows_literal_body_draws(command: &str) {
@@ -727,6 +769,59 @@ mod tests {
             true => assert!(colours.is_empty(), "{PLAIN}"),
             false => assert!(colours.len() > 1, "{COLOURED}"),
         }
+    }
+
+    #[test_case(SHELL_COMMAND; "one_line")]
+    #[test_case(HEREDOC_COMMAND; "heredoc")]
+    #[test_case("printf '\u{1b}[31mred\u{7}'\t&& echo\r\ndone\n"; "terminal_controls")]
+    fn the_command_row_reads_as_the_escaped_command(command: &str) {
+        coloured();
+        let row = command_fact(command);
+        assert_eq!(
+            row.to_string(),
+            fact(COMMAND_LABEL, command, Style::default()).to_string(),
+            "{SAME_TEXT}"
+        );
+        assert!(
+            row.spans
+                .iter()
+                .all(|span| !span.content.chars().any(char::is_control)),
+            "{SAME_TEXT}"
+        );
+    }
+
+    #[test_case(NARROW_WIDTH; "narrow")]
+    #[test_case(WIDE_WIDTH; "wide")]
+    fn colouring_the_command_row_keeps_where_it_breaks(width: u16) {
+        coloured();
+        let job = shell_job(true);
+        let ((plain, ..), _) = deferring(|| render(slice::from_ref(&job), None, usize::MAX, width));
+        let (lines, ..) = render(slice::from_ref(&job), None, usize::MAX, width);
+        assert_eq!(text(&lines), text(&plain), "{SAME_TEXT}");
+        assert_ne!(lines, plain, "{COLOURED}");
+    }
+
+    /// Coloured as the one row it is drawn on, the second line would read as
+    /// part of the first one's comment.
+    #[test]
+    fn each_line_of_the_command_row_is_coloured_from_its_start() {
+        coloured();
+        let (first, second) = TWO_LINE_COMMAND.split_once(LINE_BREAK).unwrap();
+        let as_command = syntax_colour(SHELL, second, SECOND_PROGRAM);
+        let as_comment = syntax_colour(
+            SHELL,
+            &escape_terminal_controls(TWO_LINE_COMMAND),
+            SECOND_PROGRAM,
+        );
+        assert_ne!(as_command, as_comment, "{NOT_TOLD_APART}");
+        let row = command_fact(TWO_LINE_COMMAND);
+        let value = &row.spans[1..];
+        assert_eq!(
+            colour_of(value, FIRST_PROGRAM),
+            syntax_colour(SHELL, first, FIRST_PROGRAM),
+            "{COLOURED}"
+        );
+        assert_eq!(colour_of(value, SECOND_PROGRAM), as_command, "{COLOURED}");
     }
 
     #[test_case(false; "without_script")]

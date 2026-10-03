@@ -3,6 +3,9 @@ use super::*;
 use crate::animation::test_clock::{FrozenClock, FrozenSpinner};
 use crate::chat::{DONE_TEXT, ERROR_TEXT};
 use crate::components::code_view::{BatchViews, RenderLimits, ScrollSpan, render_tool_content};
+use crate::components::command_text::tests::{
+    COLOUR_THEME, NOT_TOLD_APART, SHELL_SYNTAX, colour_of, coloured, syntax_colour,
+};
 use crate::components::prompt_progress::PROMPT_PROGRESS_LABEL;
 use crate::components::task_card::COMMAND_LABEL;
 use crate::components::tool_display::{
@@ -10494,6 +10497,124 @@ fn a_task_control_shell_job_names_its_command_once() {
     let row = shown.lines().find(|row| row.contains(JOB_COMMAND)).unwrap();
     assert!(row.contains(COMMAND_LABEL), "{shown}");
     assert_eq!(shown.matches(JOB_ID).count(), 1, "{shown}");
+}
+
+const RESUMED_SHELL_ROWS: usize = 40;
+const STARTUP_SHELL_ROWS: usize = 3;
+const RESUMED_WIDTH: u16 = 80;
+const RESIZED_WIDTH: u16 = 60;
+const RESUMED_HEIGHT: u16 = 8;
+const RESUMED_PROGRAM: &str = "cargo";
+const SHELL_ROWS_PROMPT: &str = "Run the tests";
+const NEAR_SCREEN_MSG: &str = "a card near the screen is coloured in the frame that draws it";
+const FAR_ROW_MSG: &str = "a card far from the screen stays plain until the reader nears it";
+const LOADING_MSG: &str = "a card drawn while the syntax set loads stays plain until it has";
+const SYNTAX_SET_LOADED_MSG: &str = "drawing compact shell rows must not load the syntax set";
+
+fn resumed_command(index: usize) -> String {
+    format!("{RESUMED_PROGRAM} test --test row_{index}")
+}
+
+fn shell_row_id(index: usize) -> String {
+    format!("{TOOL_ID}-{index}")
+}
+
+/// `count` shell calls, each running a command of its own, drawn as compact
+/// rows. A resumed session is loaded whole and not drawn yet; otherwise the
+/// calls arrive after a prompt already drawn.
+fn shell_rows(count: usize, resumed: bool) -> MessagesPanel {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_view(ViewMode::Compact);
+    if !resumed {
+        panel.load_messages(vec![text_row(DisplayRole::User, SHELL_ROWS_PROMPT)]);
+        render(&mut panel, RESUMED_WIDTH, RESUMED_HEIGHT);
+    }
+    for index in 0..count {
+        let id = shell_row_id(index);
+        let command = resumed_command(index);
+        panel.tool_start(ToolStartEvent {
+            summary: command.clone(),
+            raw_input: Some(serde_json::json!({ "command": command })),
+            ..start(&id, SHELL_TOOL_NAME)
+        });
+        panel.tool_done(done(&id));
+    }
+    if resumed {
+        let messages = mem::take(&mut panel.messages);
+        panel.load_messages(messages);
+    }
+    panel
+}
+
+fn shell_row(panel: &MessagesPanel, index: usize) -> Option<&Segment> {
+    panel
+        .cache
+        .get(panel.cache.find_by_tool_id(&shell_row_id(index))?)
+}
+
+/// The colour shell row `index` draws its command's program in.
+fn program_colour(panel: &MessagesPanel, index: usize) -> Option<Color> {
+    colour_of(
+        &shell_row(panel, index)?.lines().first()?.spans,
+        RESUMED_PROGRAM,
+    )
+}
+
+fn uncoloured(panel: &MessagesPanel, index: usize) -> bool {
+    shell_row(panel, index).is_some_and(|row| row.uncoloured)
+}
+
+/// The first frame of a long resumed transcript parses only what the reader
+/// can reach. The rest is coloured as they scroll near it, whether the card
+/// is only coloured or reflowed to a new width as well.
+#[test_case(RESUMED_WIDTH; "same_width")]
+#[test_case(RESIZED_WIDTH; "resized")]
+fn a_full_rebuild_colours_the_cards_near_the_screen(scrolled_width: u16) {
+    coloured();
+    let shell = syntax_colour(SHELL_SYNTAX, &resumed_command(0), RESUMED_PROGRAM);
+    let plain = theme::current().tool.fg;
+    assert_ne!(shell, plain, "{NOT_TOLD_APART}");
+    let mut panel = shell_rows(RESUMED_SHELL_ROWS, true);
+
+    render(&mut panel, RESUMED_WIDTH, RESUMED_HEIGHT);
+    let last = RESUMED_SHELL_ROWS - 1;
+    assert_eq!(program_colour(&panel, last), shell, "{NEAR_SCREEN_MSG}");
+    assert!(!uncoloured(&panel, last), "{NEAR_SCREEN_MSG}");
+    assert_eq!(program_colour(&panel, 0), plain, "{FAR_ROW_MSG}");
+    assert!(uncoloured(&panel, 0), "{FAR_ROW_MSG}");
+
+    panel.scroll_to_top();
+    render(&mut panel, scrolled_width, RESUMED_HEIGHT);
+    assert_eq!(program_colour(&panel, 0), shell, "{NEAR_SCREEN_MSG}");
+    assert!(!uncoloured(&panel, 0), "{NEAR_SCREEN_MSG}");
+}
+
+/// Startup draws the transcript while the syntax set is still loading on
+/// another thread, whether resumed whole or arriving a call at a time.
+/// Compact rows send the highlight worker nothing, so nothing here loads it
+/// before `warmup` does.
+#[test_case(true; "resumed")]
+#[test_case(false; "appended")]
+fn cards_drawn_before_colours_load_are_coloured_once_they_have(resumed: bool) {
+    theme::set(theme::load_by_name(COLOUR_THEME).unwrap());
+    let plain = theme::current().tool.fg;
+    let mut panel = shell_rows(STARTUP_SHELL_ROWS, resumed);
+
+    render(&mut panel, RESUMED_WIDTH, RESUMED_HEIGHT);
+    assert!(!highlight::is_ready(), "{SYNTAX_SET_LOADED_MSG}");
+    for index in 0..STARTUP_SHELL_ROWS {
+        assert_eq!(program_colour(&panel, index), plain, "{LOADING_MSG}");
+        assert!(uncoloured(&panel, index), "{LOADING_MSG}");
+    }
+
+    highlight::warmup();
+    let shell = syntax_colour(SHELL_SYNTAX, &resumed_command(0), RESUMED_PROGRAM);
+    assert_ne!(shell, plain, "{NOT_TOLD_APART}");
+    render(&mut panel, RESUMED_WIDTH, RESUMED_HEIGHT);
+    for index in 0..STARTUP_SHELL_ROWS {
+        assert_eq!(program_colour(&panel, index), shell, "{NEAR_SCREEN_MSG}");
+        assert!(!uncoloured(&panel, index), "{NEAR_SCREEN_MSG}");
+    }
 }
 
 #[test_case(false; "code_input")]
