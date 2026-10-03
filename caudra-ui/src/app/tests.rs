@@ -21432,6 +21432,7 @@ fn a_sideways_wheel_over_prose_pans_nothing() {
 /// terminal and leaves the cost column off the modal.
 const LONG_SPEND_MODEL: &str = "a-model-with-a-deliberately-long-identifier";
 const LONG_SPEND_TEXT: &str = "0.750";
+const PANS_TO_SPEND_END: usize = 16;
 const CLIPPED_COST: &str = "the cost column must start off the edge of a narrow modal";
 const WHEEL_DROPPED: &str = "a sideways wheel over a clipped modal must pan it";
 
@@ -21460,7 +21461,7 @@ fn a_sideways_wheel_pans_the_modal_it_is_over() {
         "{CLIPPED_COST}"
     );
 
-    for _ in 0..8 {
+    for _ in 0..PANS_TO_SPEND_END {
         app.update(mouse_event(MouseEventKind::ScrollRight, 5, 5));
     }
 
@@ -21477,7 +21478,7 @@ fn the_pan_chord_reaches_an_open_modal() {
     let mut app = app_with_wide_spend();
     let _ = rendered(&mut app);
 
-    for _ in 0..8 {
+    for _ in 0..PANS_TO_SPEND_END {
         app.update(Msg::Key(kb::PAN_RIGHT.to_key_event()));
     }
 

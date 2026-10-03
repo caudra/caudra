@@ -37,6 +37,8 @@ pub(crate) const SCOPE_KEY: Bind = key::SCOPE;
 const PREFIX: &str = "  ";
 const MODEL_COL_MIN: usize = 16;
 const NUM_COL: usize = 7;
+const CACHE_READ_COL: usize = 10;
+const CACHE_WRITE_COL: usize = 11;
 /// Wide enough for `100%`, and for the dash that says a provider reported no
 /// prompt tokens to score.
 const RATE_COL: usize = 4;
@@ -440,7 +442,7 @@ fn build_lifetime_lines(
             Span::raw(PREFIX),
             Span::styled(
                 format!(
-                    "in {:<7} out {:<7} cache {:<7} total {:<7} hit {:<4} turns {:<7}",
+                    "base in {:<7} out {:<7} cache {:<7} total {:<7} hit {:<4} turns {:<7}",
                     format_tokens_u64(lifetime.input),
                     format_tokens_u64(lifetime.output),
                     format_tokens_u64(lifetime.cache_read + lifetime.cache_creation),
@@ -566,7 +568,7 @@ fn totals_row(
         Span::raw(PREFIX),
         Span::styled(
             format!(
-                "in {:<7} out {:<7} cache read {:<7} cache write {:<7} total {:<7} hit {:<4}",
+                "base in {:<7} out {:<7} cache read {:<7} cache write {:<7} total {:<7} hit {:<4}",
                 format_tokens(total.input),
                 format_tokens(total.output),
                 format_tokens(total.cache_read),
@@ -584,7 +586,7 @@ fn totals_row(
 }
 
 fn header_row(model_w: usize, theme: &crate::theme::Theme) -> Vec<Span<'static>> {
-    let h = |label: &str| Span::styled(format!("{label:>NUM_COL$}"), theme.status_dim);
+    let h = |label: &str, width: usize| Span::styled(format!("{label:>width$}"), theme.status_dim);
     let gap = || Span::raw(" ".repeat(COL_GAP));
     vec![
         Span::raw(PREFIX),
@@ -593,13 +595,15 @@ fn header_row(model_w: usize, theme: &crate::theme::Theme) -> Vec<Span<'static>>
             theme.status_dim,
         ),
         gap(),
-        h("in"),
+        h("base in", NUM_COL),
         gap(),
-        h("out"),
+        h("out", NUM_COL),
         gap(),
-        h("cache"),
+        h("cache read", CACHE_READ_COL),
         gap(),
-        h("total"),
+        h("cache write", CACHE_WRITE_COL),
+        gap(),
+        h("total", NUM_COL),
         gap(),
         Span::styled(format!("{:>RATE_COL$}", "hit"), theme.status_dim),
         gap(),
@@ -615,19 +619,21 @@ fn model_row(
     fg: Style,
     dim: Style,
 ) -> Vec<Span<'static>> {
-    let num = |v: u32| Span::styled(format!("{:>NUM_COL$}", format_tokens(v)), fg);
+    let num = |v: u32, width: usize| Span::styled(format!("{:>width$}", format_tokens(v)), fg);
     let gap = || Span::raw(" ".repeat(COL_GAP));
     vec![
         Span::raw(PREFIX),
         Span::styled(format!("{id:<model_w$}"), fg),
         gap(),
-        num(usage.input),
+        num(usage.input, NUM_COL),
         gap(),
-        num(usage.output),
+        num(usage.output, NUM_COL),
         gap(),
-        num(usage.cache_read),
+        num(usage.cache_read, CACHE_READ_COL),
         gap(),
-        num(usage.total()),
+        num(usage.cache_creation, CACHE_WRITE_COL),
+        gap(),
+        num(usage.total(), NUM_COL),
         gap(),
         Span::styled(
             format!("{:>RATE_COL$}", format_hit_rate(usage.cache_hit_rate())),
@@ -767,6 +773,19 @@ mod tests {
     const ONE_MILLION_TEXT: &str = "1m";
     const UNKNOWN_MODEL: &str = "a-model-no-table-has-ever-heard-of";
     const NO_COST_TEXT: &str = "—";
+    const ALL_BUCKETS: StoredTokenUsage = StoredTokenUsage {
+        input: 101,
+        output: 37,
+        cache_read: 211,
+        cache_creation: 53,
+        cost: Some(RECORDED_COST),
+        subscription_cost: None,
+    };
+    const BUCKET_HEADERS: &str = "base in      out  cache read  cache write    total   hit    cost";
+    const BUCKET_VALUES: &str = "    101       37         211           53      402   58%   0.123";
+    const FOLDED_BUCKET_VALUES: &str =
+        "    124       56         254           70      504   57%   0.246";
+    const BASE_INPUT_PREFIX: &str = "  base in 101 ";
     const LIFETIME_MODEL: &str = "anthropic/claude-opus-5";
     const LIFETIME_PROJECT: &str = "/home/dev/caudra";
     const SCOPE_SURVIVES_CLOSE: &str =
@@ -787,14 +806,10 @@ mod tests {
     const UNKNOWN_IS_NOT_ZERO: &str =
         "a provider that reported no prompt tokens has no rate, which is not a rate of zero";
     /// Wide enough that the table below fits inside the modal with room to spare.
-    const WIDE_TERMINAL: u16 = 160;
+    const WIDE_TERMINAL: u16 = 180;
     /// A small screen: the modal fills its floor and the table still runs past it.
     const NARROW_TERMINAL: u16 = 80;
-    /// 43 columns of model id, which puts the 95-column row it builds well past
-    /// a narrow modal's 70. No provider slug, so nothing is trimmed off it.
     const LONG_MODEL: &str = "a-model-with-a-deliberately-long-identifier";
-    /// More presses than `PAN_STEP` needs to cross those 25 columns; panning
-    /// clamps, so overshooting is the point.
     const PANS_TO_THE_END: usize = 8;
     /// A tap covers half a viewport, so a couple reach the end of any table this
     /// modal draws and the rest are absorbed by the clamp.
@@ -1129,6 +1144,72 @@ mod tests {
         line_texts(&build_lines(&ctx, None, &crate::theme::current()))
     }
 
+    #[test_case(false; "single_provider")]
+    #[test_case(true; "multiple_providers")]
+    fn session_breakdowns_show_all_token_buckets(include_foreign: bool) {
+        let model = test_model();
+        let mut by_model = HashMap::from([
+            (format!("{}/{}", model.provider, model.id), ALL_BUCKETS),
+            (
+                format!("{}/second", model.provider),
+                StoredTokenUsage {
+                    input: 23,
+                    output: 19,
+                    cache_read: 43,
+                    cache_creation: 17,
+                    ..ALL_BUCKETS
+                },
+            ),
+        ]);
+        if include_foreign {
+            by_model.insert(format!("{FOREIGN_PROVIDER}/other"), ALL_BUCKETS);
+        }
+
+        let rows = modal_rows(&TokenUsage::default(), None, &by_model, &model);
+        let header = format!("{PREFIX}{:<MODEL_COL_MIN$}  {BUCKET_HEADERS}", "model");
+        let own_model = format!("{PREFIX}{:<MODEL_COL_MIN$}  {BUCKET_VALUES}", model.id);
+        assert!(rows.contains(&own_model), "{rows:?}");
+        assert_eq!(
+            rows.iter().filter(|row| **row == header).count(),
+            if include_foreign { 2 } else { 1 },
+        );
+        assert_eq!(
+            rows.iter().any(|row| row.contains(PROVIDER_HEADING)),
+            include_foreign,
+        );
+        if include_foreign {
+            let own_provider = format!(
+                "{PREFIX}{:<MODEL_COL_MIN$}  {FOLDED_BUCKET_VALUES}",
+                model.provider,
+            );
+            let foreign_provider =
+                format!("{PREFIX}{FOREIGN_PROVIDER:<MODEL_COL_MIN$}  {BUCKET_VALUES}");
+            assert!(rows.contains(&own_provider), "{rows:?}");
+            assert!(rows.contains(&foreign_provider), "{rows:?}");
+        }
+    }
+
+    #[test_case(UsageScope::Session; "session")]
+    #[test_case(UsageScope::Lifetime; "lifetime")]
+    fn totals_name_base_input(scope: UsageScope) {
+        let theme = crate::theme::current();
+        let total = TokenUsage::from(ALL_BUCKETS);
+        let rows = match scope {
+            UsageScope::Session => line_texts(&[Line::from(totals_row(&total, None, &theme))]),
+            UsageScope::Lifetime => lifetime_texts(Some(&LifetimeUsage {
+                input: u64::from(total.input),
+                output: u64::from(total.output),
+                cache_read: u64::from(total.cache_read),
+                cache_creation: u64::from(total.cache_creation),
+                ..lifetime()
+            })),
+        };
+        assert!(
+            rows.iter().any(|row| row.starts_with(BASE_INPUT_PREFIX)),
+            "{rows:?}"
+        );
+    }
+
     /// A recorded cost is what the turn was billed, and re-pricing its tokens
     /// restates the bill every time a provider moves its rates (DeepSeek moves
     /// them twice a day). A model the tables cannot resolve shows nothing,
@@ -1379,14 +1460,35 @@ mod tests {
     /// A breakdown whose model id is long enough that the cost column cannot fit
     /// beside it on a small screen.
     fn wide_breakdown() -> HashMap<String, StoredTokenUsage> {
-        HashMap::from([(
-            LONG_MODEL.to_string(),
-            StoredTokenUsage {
-                input: ONE_MILLION,
-                cost: Some(RECORDED_COST),
-                ..StoredTokenUsage::default()
-            },
-        )])
+        HashMap::from([(LONG_MODEL.to_string(), ALL_BUCKETS)])
+    }
+
+    #[test_case(NARROW_TERMINAL, 0, 0; "narrow_clipped")]
+    #[test_case(NARROW_TERMINAL, i32::MAX, 41; "narrow_panned")]
+    #[test_case(WIDE_TERMINAL, 0, 0; "wide_unpanned")]
+    fn token_columns_stay_aligned_when_panned(width: u16, pan: i32, expected_pan: u16) {
+        let mut modal = UsageModal::new();
+        modal.toggle();
+        let breakdown = wide_breakdown();
+        render_at(&mut modal, width, &breakdown);
+        modal.pan(pan);
+        let rendered = render_at(&mut modal, width, &breakdown);
+        assert_eq!(modal.scroll.pan(), expected_pan);
+
+        let header = format!(
+            "{PREFIX}{:<label_w$}  {BUCKET_HEADERS}",
+            "model",
+            label_w = LONG_MODEL.len()
+        );
+        let row = format!("{PREFIX}{LONG_MODEL}  {BUCKET_VALUES}");
+        for expected in [header, row] {
+            let visible: String = expected
+                .chars()
+                .skip(usize::from(expected_pan))
+                .take(usize::from(modal.popup.width - 2))
+                .collect();
+            assert!(rendered.contains(&visible), "{visible:?}: {rendered}");
+        }
     }
 
     /// The table is as wide as its longest model id, which owes nothing to the
@@ -1513,6 +1615,7 @@ mod tests {
                 row: modal.popup.bottom() - 1 - rows_up,
                 modifiers: KeyModifiers::NONE,
             });
+            render_at(&mut modal, NARROW_TERMINAL, &breakdown);
         }
 
         assert!(
@@ -1527,12 +1630,12 @@ mod tests {
         let mut modal = UsageModal::new();
         modal.toggle();
         let breakdown = wide_breakdown();
-        render_at(&mut modal, NARROW_TERMINAL, &breakdown);
+        let clipped = render_at(&mut modal, NARROW_TERMINAL, &breakdown);
         // The bar runs along the bottom border row, inside the corners, and the
         // last cell of a track is the end of the document by definition.
         assert!(modal.handle_mouse(&MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
-            column: modal.popup.right() - 2,
+            column: arrow_column(&clipped, SCROLLBAR_STEP_FORWARD) - 2,
             row: modal.popup.bottom() - 1,
             modifiers: KeyModifiers::NONE,
         }));

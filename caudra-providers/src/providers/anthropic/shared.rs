@@ -92,24 +92,20 @@ const EPHEMERAL: CacheControl = CacheControl {
 
 #[derive(Deserialize)]
 struct Usage {
-    #[serde(default)]
-    input_tokens: u32,
-    #[serde(default)]
-    output_tokens: u32,
-    #[serde(default)]
-    cache_creation_input_tokens: u32,
-    #[serde(default)]
-    cache_read_input_tokens: u32,
+    input_tokens: Option<u32>,
+    output_tokens: Option<u32>,
+    cache_creation_input_tokens: Option<u32>,
+    cache_read_input_tokens: Option<u32>,
 }
 
-impl From<Usage> for TokenUsage {
-    fn from(u: Usage) -> Self {
-        Self {
-            input: u.input_tokens,
-            output: u.output_tokens,
-            cache_creation: u.cache_creation_input_tokens,
-            cache_read: u.cache_read_input_tokens,
-        }
+impl Usage {
+    fn apply(self, usage: &mut TokenUsage) {
+        usage.input = self.input_tokens.unwrap_or(usage.input);
+        usage.output = self.output_tokens.unwrap_or(usage.output);
+        usage.cache_creation = self
+            .cache_creation_input_tokens
+            .unwrap_or(usage.cache_creation);
+        usage.cache_read = self.cache_read_input_tokens.unwrap_or(usage.cache_read);
     }
 }
 
@@ -638,7 +634,7 @@ impl EventParser {
                     .await?;
                 if let Ok(ev) = serde_json::from_str::<MessageStartEvent>(data) {
                     if let Some(u) = ev.message.usage {
-                        self.usage = TokenUsage::from(u);
+                        u.apply(&mut self.usage);
                     }
                     warn_dropped_thinking(&ev.message.input_transformations.unwrap_or_default());
                 }
@@ -755,7 +751,7 @@ impl EventParser {
             "message_delta" => {
                 if let Ok(ev) = serde_json::from_str::<MessageDeltaEvent>(data) {
                     if let Some(u) = ev.usage {
-                        self.usage.output = u.output_tokens;
+                        u.apply(&mut self.usage);
                     }
                     if let Some(d) = ev.delta {
                         self.stop_reason = d
@@ -1144,6 +1140,7 @@ mod tests {
     use test_case::test_case;
 
     use super::EventParser;
+    use crate::model::ModelPricing;
     use crate::providers::test_support::{
         PEER_ATTACK, PEER_TEXT, assert_peer_framing, peer_message_origin, task_event_origin,
         task_observation_with_output_refs, workflow_event_origin,
@@ -1164,6 +1161,91 @@ mod tests {
         cache_creation: 0,
         cache_read: 30,
     };
+    const CACHED_USAGE: TokenUsage = TokenUsage {
+        input: 10,
+        output: 2,
+        cache_creation: 20,
+        cache_read: 70,
+    };
+    const REVISED_USAGE: TokenUsage = TokenUsage {
+        input: 20,
+        output: 10,
+        cache_creation: 30,
+        cache_read: 150,
+    };
+    const REVISED_PROMPT_TOKENS: u32 = 200;
+    const REVISED_TOTAL_TOKENS: u32 = 210;
+    const REVISED_HIT_RATE: f64 = 0.75;
+    const REVISED_COST: f64 = 0.000205;
+
+    fn stream_usage(start: Value, deltas: &[Value], oauth: bool) -> TokenUsage {
+        smol::block_on(async {
+            let (tx, _rx) = flume::unbounded();
+            let mut parser = if oauth {
+                EventParser::new_oauth(HashMap::new())
+            } else {
+                EventParser::new()
+            };
+            let _ = parser
+                .process("message_start", &json!({"message": start}).to_string(), &tx)
+                .await
+                .unwrap();
+            for delta in deltas {
+                let _ = parser
+                    .process("message_delta", &delta.to_string(), &tx)
+                    .await
+                    .unwrap();
+            }
+            let _ = parser.process("message_stop", "{}", &tx).await.unwrap();
+            parser.finish().usage
+        })
+    }
+
+    #[test_case(json!({}), &[], TokenUsage::default() ; "missing_start_usage")]
+    #[test_case(json!({"usage": null}), &[], TokenUsage::default() ; "null_start_usage")]
+    #[test_case(json!({"usage": {"input_tokens": CACHED_USAGE.input}}), &[], TokenUsage { input: CACHED_USAGE.input, ..TokenUsage::default() } ; "partial_start_usage")]
+    #[test_case(json!({"usage": CACHED_USAGE}), &[], CACHED_USAGE ; "complete_start_usage")]
+    #[test_case(json!({"usage": CACHED_USAGE}), &[json!({"usage": {"output_tokens": REVISED_USAGE.output}})], TokenUsage { output: REVISED_USAGE.output, ..CACHED_USAGE } ; "output_only_delta")]
+    #[test_case(json!({"usage": CACHED_USAGE}), &[json!({"usage": {"input_tokens": REVISED_USAGE.input}})], TokenUsage { input: REVISED_USAGE.input, ..CACHED_USAGE } ; "input_only_delta")]
+    #[test_case(json!({"usage": CACHED_USAGE}), &[json!({"usage": {"cache_creation_input_tokens": REVISED_USAGE.cache_creation, "cache_read_input_tokens": REVISED_USAGE.cache_read}})], TokenUsage { cache_creation: REVISED_USAGE.cache_creation, cache_read: REVISED_USAGE.cache_read, ..CACHED_USAGE } ; "cache_only_delta")]
+    #[test_case(json!({"usage": CACHED_USAGE}), &[json!({"usage": TokenUsage::default()})], TokenUsage::default() ; "explicit_zero_replaces_all_counters")]
+    #[test_case(json!({"usage": CACHED_USAGE}), &[json!({})], CACHED_USAGE ; "missing_delta_usage")]
+    #[test_case(json!({"usage": CACHED_USAGE}), &[json!({"usage": {}})], CACHED_USAGE ; "empty_delta_usage")]
+    #[test_case(json!({"usage": CACHED_USAGE}), &[json!({"usage": null})], CACHED_USAGE ; "null_delta_usage")]
+    #[test_case(json!({"usage": CACHED_USAGE}), &[json!({"usage": {"input_tokens": null, "output_tokens": null, "cache_creation_input_tokens": null, "cache_read_input_tokens": null}})], CACHED_USAGE ; "null_counters_preserve_usage")]
+    #[test_case(json!({"usage": CACHED_USAGE}), &[json!({"usage": REVISED_USAGE}), json!({"usage": REVISED_USAGE}), json!({"usage": {"output_tokens": REVISED_USAGE.output}})], REVISED_USAGE ; "successive_cumulative_updates_replace_not_add")]
+    #[test_case(json!({}), &[json!({"usage": REVISED_USAGE})], REVISED_USAGE ; "usage_first_reported_in_delta")]
+    fn stream_usage_preserves_cumulative_counters(
+        start: Value,
+        deltas: &[Value],
+        expected: TokenUsage,
+    ) {
+        for oauth in [false, true] {
+            assert_eq!(stream_usage(start.clone(), deltas, oauth), expected);
+        }
+    }
+
+    #[test_case(false ; "api_key")]
+    #[test_case(true ; "oauth")]
+    fn revised_stream_usage_drives_totals_hit_rate_and_cost(oauth: bool) {
+        let usage = stream_usage(
+            json!({"usage": CACHED_USAGE}),
+            &[json!({"usage": REVISED_USAGE})],
+            oauth,
+        );
+        let pricing = ModelPricing {
+            input: 1.0,
+            output: 2.0,
+            cache_write: 3.0,
+            cache_read: 0.5,
+            ..Default::default()
+        };
+        assert_eq!(usage, REVISED_USAGE);
+        assert_eq!(usage.total_input(), REVISED_PROMPT_TOKENS);
+        assert_eq!(usage.context_tokens(), REVISED_TOTAL_TOKENS);
+        assert_eq!(usage.cache_hit_rate(), Some(REVISED_HIT_RATE));
+        assert!((usage.cost(&pricing, false) - REVISED_COST).abs() < f64::EPSILON);
+    }
 
     #[test_case("tool_use", true, true ; "completed_response")]
     #[test_case("max_tokens", true, false ; "token_truncated_after_block_stop")]
