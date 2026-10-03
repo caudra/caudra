@@ -4398,6 +4398,8 @@ fn a_snapshot_is_passive_without_a_lua_runtime(done: bool) {
 #[test]
 fn handle_click_returns_toggled_for_truncated_tool_without_snapshot() {
     let mut panel = panel_with_long_tool(SHELL_TOOL_NAME, 200);
+    panel.set_view(ViewMode::Auto);
+    render(&mut panel, 80, 24);
     let area = Rect::new(0, 0, 80, 24);
     assert!(panel.handle_click(area.y, area));
 }
@@ -5846,6 +5848,7 @@ const READER_LOST_THE_CARD: &str = "a card auto closes under a paused reader mus
 #[test]
 fn a_card_auto_closing_under_a_paused_reader_leaves_them_on_it() {
     let mut panel = panel_with_tools(&[(AUTO_CLOSED_ID, SHELL_TOOL_NAME)]);
+    panel.set_view(ViewMode::Auto);
     panel.tool_done(long_done(AUTO_CLOSED_ID, AUTO_BODY_LINES));
     render(&mut panel, READER_WIDTH, AUTO_VIEWPORT);
     panel.set_scroll_top(AUTO_PAUSE_ROWS);
@@ -6848,6 +6851,7 @@ fn a_wrapped_row_takes_air_from_the_rows_around_it(view: ViewMode) {
 #[test]
 fn the_card_auto_opens_separates_from_the_list_above_it() {
     let mut panel = panel_with_tools(&[("t1", CODE_MAP_TOOL_NAME)]);
+    panel.set_view(ViewMode::Auto);
     panel.tool_done(done("t1"));
     panel.tool_start(start("t2", CODE_MAP_TOOL_NAME));
     panel.tool_done(long_done("t2", HELD_BODY_LINES));
@@ -7729,6 +7733,7 @@ fn reasoning_answers_to_the_gate_alone(view: ViewMode, show_thinking: bool, open
 #[test]
 fn auto_leaves_older_reasoning_open() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_view(ViewMode::Auto);
     panel.push(DisplayMessage::new(DisplayRole::Thinking, "first".into()));
     rebuild(&mut panel);
     let open = panel.segment_heights()[0];
@@ -7789,9 +7794,9 @@ fn batch_row(panel: &MessagesPanel, target: RowTarget) -> u16 {
         .iter()
         .find(|s| s.tool_id.as_deref() == Some("t1"))
         .unwrap();
-    let width = segment.chrome(80).content_width(80);
-    let start = segment.chrome(80).content_start();
-    (0..segment.content_height(80))
+    let width = panel.viewport_width;
+    let start = segment.chrome(width).content_start();
+    (0..segment.content_height(width))
         .map(|row| start + row)
         .find(|row| segment.row_target_at(*row, width) == Some(target))
         .expect("the control was drawn")
@@ -7916,9 +7921,12 @@ fn compact_folds_every_batch_child() {
     );
 }
 
-#[test]
-fn clicking_a_batch_child_opens_only_that_child() {
+#[test_case(ViewMode::Auto; "auto")]
+#[test_case(ViewMode::Expanded; "expanded")]
+fn clicking_a_batch_child_opens_only_that_child(view: ViewMode) {
     let mut panel = panel_with_batch();
+    panel.set_view(view);
+    render(&mut panel, 80, 24);
     let area = Rect::new(0, 0, 80, 24);
 
     assert!(panel.handle_click(batch_child_row(&panel, 0), area));
@@ -7975,9 +7983,7 @@ fn hovering_a_batch_child_marks_that_row() {
         .iter()
         .find(|s| s.tool_id.as_deref() == Some("t1"))
         .unwrap();
-    let line = segment
-        .source_line_at(row, segment.chrome(80).content_width(80))
-        .unwrap();
+    let line = segment.source_line_at(row, panel.viewport_width).unwrap();
     assert_eq!(
         panel.hover,
         Some(HoverTarget::Tool {
@@ -8403,9 +8409,11 @@ fn an_unarmed_window_leaves_the_wheel_to_the_transcript() {
 
 /// A press on the header is the card's own control and must not arm anything,
 /// or the gesture that closes a card would also claim the wheel.
-#[test]
-fn a_press_on_the_header_arms_nothing() {
+#[test_case(ViewMode::Auto; "auto")]
+#[test_case(ViewMode::Expanded; "expanded")]
+fn a_press_on_the_header_arms_nothing(view: ViewMode) {
     let mut panel = panel_with_running_shell();
+    panel.set_view(view);
     panel.set_batch_child_output("t1", 0, &shell_stream());
     let terminal = render(&mut panel, 80, 24);
     let (column, _) = card_bar_rows(&terminal)[0];
@@ -8834,9 +8842,12 @@ fn a_later_report_is_not_overwritten_by_the_cached_one() {
 /// Opening a child is a choice about the body, like the raw/filtered switch,
 /// so the reset a mode change performs on every disclosure must leave it
 /// alone.
-#[test]
-fn changing_mode_keeps_a_batch_child_open() {
+#[test_case(ViewMode::Auto; "auto")]
+#[test_case(ViewMode::Expanded; "expanded")]
+fn changing_mode_keeps_a_batch_child_open(view: ViewMode) {
     let mut panel = panel_with_batch();
+    panel.set_view(view);
+    render(&mut panel, 80, 24);
     let area = Rect::new(0, 0, 80, 24);
     assert!(panel.handle_click(batch_child_row(&panel, 0), area));
     render(&mut panel, 80, 24);
@@ -8856,6 +8867,7 @@ const HELD_BODY_LINES: usize = 5;
 
 fn auto_panel_with_body(lines: usize) -> MessagesPanel {
     let mut panel = panel_with_tools(&[("t1", CODE_MAP_TOOL_NAME)]);
+    panel.set_view(ViewMode::Auto);
     panel.tool_done(long_done("t1", lines));
     rebuild(&mut panel);
     panel
@@ -9732,6 +9744,7 @@ fn a_shell_card_closes_like_any_other_read(view: ViewMode) {
 #[test_case(FILE_EDIT_TOOL_NAME ; "edit")]
 fn a_write_ignores_every_view_but_compact(tool: &'static str) {
     let mut panel = panel_with_tools(&[("t1", tool)]);
+    panel.set_view(ViewMode::Auto);
     panel.tool_done(long_done("t1", HELD_BODY_LINES));
     panel.push(DisplayMessage::new(DisplayRole::Assistant, "done".into()));
     render(&mut panel, 80, 24);
@@ -11083,12 +11096,12 @@ fn scroll_footer_row(panel: &MessagesPanel, tool_id: &str) -> u16 {
         .iter()
         .find(|s| s.tool_id.as_deref() == Some(tool_id))
         .unwrap();
-    let chrome = segment.chrome(80);
-    let width = chrome.content_width(80);
+    let width = panel.viewport_width;
+    let chrome = segment.chrome(width);
     let footer = segment
         .scroll_footer_line
         .expect("the window drew a footer");
-    (0..segment.content_height(80))
+    (0..segment.content_height(width))
         .map(|row| chrome.content_start() + row)
         .find(|row| segment.source_line_at(*row, width) == Some(footer))
         .expect("the footer was drawn")
@@ -11101,13 +11114,15 @@ fn scroll_footer_row(panel: &MessagesPanel, tool_id: &str) -> u16 {
 ///
 /// The command is left running, because a settled one has no tail to pause
 /// against and its footer says so by reporting only the counts.
-#[test]
-fn clicking_a_paused_windows_footer_follows_the_tail_again() {
+#[test_case(ViewMode::Auto; "auto")]
+#[test_case(ViewMode::Expanded; "expanded")]
+fn clicking_a_paused_windows_footer_follows_the_tail_again(view: ViewMode) {
     const FOLLOW_CLICK_MSG: &str =
         "the footer that reports a paused window is what takes it back to the tail";
     const PAUSED_BODY_LINES: usize = 40;
 
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_view(view);
     panel.tool_start(start(TOOL_ID, SHELL_TOOL_NAME));
     panel.tool_output(TOOL_ID, &numbered_body(PAUSED_BODY_LINES));
     rebuild(&mut panel);
@@ -11330,6 +11345,7 @@ enum Reset {
 #[test_case(Reset::Cancel ; "cancel_in_progress")]
 fn a_reset_drops_every_owed_redraw(reset: Reset) {
     let mut panel = panel_with_tools(&[(TOOL_ID, SHELL_TOOL_NAME)]);
+    panel.set_view(ViewMode::Auto);
     render(&mut panel, 80, 24);
     panel.tool_output(TOOL_ID, &numbered_body(BACKGROUND_EVENTS));
     assert!(panel.dirty_cards.contains(TOOL_ID), "{OWED_MSG}");
@@ -11418,6 +11434,7 @@ const STEADY_LINES: usize = 5;
 #[test]
 fn flushing_a_dirty_card_leaves_the_pointer_where_the_reader_put_it() {
     let mut panel = panel_with_tools(&[(TOOL_ID, SHELL_TOOL_NAME)]);
+    panel.set_view(ViewMode::Auto);
     let area = Rect::new(0, 0, 80, DRAWN_HEIGHT);
     panel.tool_output(TOOL_ID, &numbered_body(STEADY_LINES));
     render(&mut panel, area.width, area.height);

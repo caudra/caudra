@@ -157,7 +157,7 @@ To keep using `init.lua`, set `lua_plugins = true` under `[experimental]`. Its `
 | `notifications` | string | `auto` | - | - | Terminal notification method: auto, osc9, bell, or off. Auto is off in a Herdr pane, where Herdr shows its own notification when Caudra is blocked or finished |
 | `math` | string | `unicode` | - | - | How LaTeX maths renders: unicode (approximate with Unicode) or raw (show the LaTeX source) |
 | `mermaid` | string | `unicode` | - | - | How mermaid flowcharts render: unicode (draw them with box-drawing characters) or off (leave the fence as code) |
-| `flash_duration_ms` | u64 | `1500` | - | - | Duration of flash messages (ms) |
+| `flash_duration_ms` | u64 | `10000` | - | - | Duration of ordinary status-bar messages (ms). Confirmation prompts use a fixed 3-second window |
 | `which_key_delay_ms` | u64 | `250` | - | - | How long Ctrl+X waits before listing the chords it can still reach (ms). 0 shows the list at once |
 | `typewriter_ms_per_char` | u64 | `4` | - | - | Typewriter effect speed (ms/char) |
 | `mouse_scroll_lines` | u32 | `3` | - | 1 | Lines per mouse wheel scroll |

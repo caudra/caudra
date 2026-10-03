@@ -75,6 +75,7 @@ use caudra_providers::{
     THINKING_USAGE, TaskEventOrigin, TokenUsage, UserOrigin, expand_message, merge_history_items,
     project_messages,
 };
+use caudra_storage::StateClass;
 use caudra_storage::id::CaudraId;
 use caudra_storage::local_documents::LocalDocumentStore;
 use caudra_storage::permission_patterns::{
@@ -89,6 +90,7 @@ use caudra_storage::sessions::{
     StoredQueuedDraft, StoredQueuedPrompt, StoredSubagent, StoredSubagentOutcome, StoredTokenUsage,
     UnrecordedCall,
 };
+use caudra_storage::state::{self as stored_state, SCOPE_GLOBAL, StateKey};
 use caudra_storage::thinking::StoredThinking;
 use caudra_storage::tool_outputs::{ToolOutputError, ToolOutputStore};
 use caudra_storage::usage_ledger::{LedgerPurpose, TurnUsage, UsageLedger};
@@ -118,6 +120,14 @@ use tempfile::{Builder, TempDir};
 use test_case::test_case;
 
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const LONG_FLASH_DURATION: Duration = Duration::from_secs(60);
+const CONFIRMATION_TIMINGS: [(Duration, bool); 4] = [
+    (Duration::from_millis(1500), true),
+    (Duration::from_secs(2), true),
+    (Duration::from_secs(3), false),
+    (Duration::from_secs(4), false),
+];
+const CONFIRMATION_USER_TEXT: &str = "confirmation target";
 const SELECTED_BUILD_TOOLS: &str = "Selected Build · next user message";
 const SELECTED_PLAN_TOOLS: &str = "Selected Plan · next user message";
 const EXECUTING_BUILD_TOOLS: &str = "Executing Build · Selected Plan pending";
@@ -276,9 +286,14 @@ pub(crate) const RESEARCH_NAME: &str = "research";
 const SUB_TOOL_ID: &str = "sub_t1";
 const TOOL_OUTPUT_LINE: &str = "hello from the subagent";
 const LATE_MODEL_SPEC: &str = "zai/glm-5";
-const VIEW_DEFAULT_MSG: &str = "an app with no stored mode follows the newest card";
+const VIEW_DEFAULT_MSG: &str = "an app with no recognized stored mode opens every card";
 const VIEW_PERSIST_MSG: &str = "a chosen mode must survive the app that chose it";
 const VIEW_CYCLE_MSG: &str = "the shortcut must reach every mode and come back";
+const VIEW_STATE_KEY: StateKey = StateKey {
+    name: "ui.view",
+    class: StateClass::Persistent,
+};
+const UNKNOWN_VIEW_MODE: &str = "unknown-view";
 const HINT_PLUGIN: &str = "statusline";
 const HINT_TEXT: &str = "2/4 staged";
 const HINT_STYLE: &str = "fg";
@@ -2566,6 +2581,37 @@ fn expired_ctrl_d_press_rearms_exit() {
     assert_eq!(app.exit_request, ExitRequest::None);
     assert!(app.last_exit.is_some());
     assert_eq!(app.status_bar.flash_text(), Some(FLASH_EXIT));
+}
+
+#[test_case(Duration::ZERO ; "no_ordinary_flash")]
+#[test_case(LONG_FLASH_DURATION ; "long_ordinary_flash")]
+fn ctrl_d_confirmation_uses_fixed_window(flash_duration: Duration) {
+    for (elapsed, confirmed) in CONFIRMATION_TIMINGS {
+        let mut app = test_app();
+        app.status_bar.flash_duration = flash_duration;
+
+        assert!(app.update(Msg::Key(kb::EXIT.to_key_event())).is_empty());
+        assert_eq!(app.status_bar.clear_expired_hint(), Dirty::NO);
+        assert_eq!(app.status_bar.flash_text(), Some(FLASH_EXIT));
+
+        let pressed_at = Instant::now().checked_sub(elapsed).unwrap();
+        app.last_exit = Some(pressed_at);
+        let actions = app.update(Msg::Key(kb::EXIT.to_key_event()));
+
+        if confirmed {
+            assert_eq!(app.exit_request, ExitRequest::Success);
+            assert!(matches!(actions.as_slice(), [Action::ManualExit]));
+            assert!(app.last_exit.is_none());
+        } else {
+            assert_eq!(app.exit_request, ExitRequest::None);
+            assert!(actions.is_empty());
+            assert!(
+                app.last_exit
+                    .is_some_and(|rearmed_at| rearmed_at > pressed_at)
+            );
+            assert_eq!(app.status_bar.flash_text(), Some(FLASH_EXIT));
+        }
+    }
 }
 
 #[test]
@@ -7118,6 +7164,62 @@ fn double_esc_idle_no_user_turns_flashes_error() {
     assert!(!app.rewind_picker.is_open());
 }
 
+#[test_case(Status::Idle, Duration::ZERO ; "rewind_without_ordinary_flash")]
+#[test_case(Status::Idle, LONG_FLASH_DURATION ; "rewind_with_long_ordinary_flash")]
+#[test_case(Status::Streaming, Duration::ZERO ; "cancel_without_ordinary_flash")]
+#[test_case(Status::Streaming, LONG_FLASH_DURATION ; "cancel_with_long_ordinary_flash")]
+fn main_esc_confirmation_uses_fixed_window(status: Status, flash_duration: Duration) {
+    for (elapsed, confirmed) in CONFIRMATION_TIMINGS {
+        let mut app = test_app();
+        app.status = status.clone();
+        app.run_id = 1;
+        let _receiver = attach_processing_queue(&mut app);
+        app.status_bar.flash_duration = flash_duration;
+        crate::push_history_message(
+            app.state.session_mut(),
+            Message::user(CONFIRMATION_USER_TEXT.into()),
+        );
+        let prompt = if status == Status::Streaming {
+            FLASH_CANCEL
+        } else {
+            FLASH_REWIND
+        };
+
+        assert!(app.update(Msg::Key(key(KeyCode::Esc))).is_empty());
+        assert_eq!(app.status_bar.clear_expired_hint(), Dirty::NO);
+        assert_eq!(app.status_bar.flash_text(), Some(prompt));
+
+        let pressed_at = Instant::now().checked_sub(elapsed).unwrap();
+        app.last_esc = Some(pressed_at);
+        let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+
+        assert_eq!(
+            app.rewind_picker.is_open(),
+            confirmed && status == Status::Idle
+        );
+        if confirmed && status == Status::Streaming {
+            assert!(matches!(
+                actions.as_slice(),
+                [Action::CancelAgent { run_id: 1 }]
+            ));
+            assert_eq!(app.cancelling_run, Some(1));
+        } else {
+            assert!(actions.is_empty());
+            assert_eq!(app.cancelling_run, None);
+        }
+        if confirmed {
+            assert!(app.last_esc.is_none());
+        } else {
+            assert!(
+                app.last_esc
+                    .is_some_and(|rearmed_at| rearmed_at > pressed_at)
+            );
+            assert_eq!(app.status, status);
+            assert_eq!(app.status_bar.flash_text(), Some(prompt));
+        }
+    }
+}
+
 #[test]
 fn ctrl_c_while_streaming_cancels_instead_of_quitting() {
     let mut app = test_app();
@@ -10086,10 +10188,24 @@ fn context_command_is_discoverable_with_an_argument() {
     assert!(command.takes_args());
 }
 
+#[test_case(None ; "missing")]
+#[test_case(Some(UNKNOWN_VIEW_MODE) ; "unknown")]
+fn an_unrecognized_view_defaults_to_expanded(stored: Option<&str>) {
+    let tmp = private_tempdir();
+    let dir = StateDir::from_path(tmp.path().to_path_buf());
+    if let Some(mode) = stored {
+        stored_state::set(&dir, SCOPE_GLOBAL, VIEW_STATE_KEY, &mode).unwrap();
+    }
+
+    let app = build_app(dir.clone(), Arc::new(test_writer(dir)));
+
+    assert_eq!(app.view, ViewMode::Expanded, "{VIEW_DEFAULT_MSG}");
+}
+
 #[test]
 fn the_view_shortcut_cycles_every_mode() {
-    let mut app = test_app();
-    assert_eq!(app.view, ViewMode::Auto, "{VIEW_DEFAULT_MSG}");
+    let (_tmp, _dir, _writer, mut app) = tempdir_app();
+    assert_eq!(app.view, ViewMode::Expanded, "{VIEW_DEFAULT_MSG}");
 
     let mut seen = Vec::new();
     for _ in 0..3 {
@@ -10099,14 +10215,17 @@ fn the_view_shortcut_cycles_every_mode() {
 
     assert_eq!(
         seen,
-        vec![ViewMode::Compact, ViewMode::Expanded, ViewMode::Auto],
+        vec![ViewMode::Auto, ViewMode::Compact, ViewMode::Expanded],
         "{VIEW_CYCLE_MSG}"
     );
 }
 
 #[test]
 fn the_view_command_cycles_like_the_keybinding() {
-    let mut app = test_app();
+    let (_tmp, _dir, _writer, mut app) = tempdir_app();
+
+    app.execute_command(cmd("/view"), 0);
+    assert_eq!(app.view, ViewMode::Auto);
 
     app.execute_command(cmd("/view"), 0);
     assert_eq!(app.view, ViewMode::Compact);
@@ -10130,25 +10249,29 @@ fn view_command_does_not_shadow_compact() {
 
 #[test]
 fn view_toggle_is_reachable_from_lua() {
-    let mut app = test_app();
+    let (_tmp, _dir, _writer, mut app) = tempdir_app();
     app.run_builtin(BuiltinAction::ViewToggle);
-    assert_eq!(app.view, ViewMode::Compact);
+    assert_eq!(app.view, ViewMode::Auto);
 }
 
 /// The mode is a reading preference, not a per-session one, so it is picked
 /// once and then stays picked. Its own state dir, because the shared one
 /// would carry the choice into every other app built on this thread.
-#[test]
-fn a_view_mode_outlives_the_app_that_chose_it() {
+#[test_case(1, ViewMode::Auto ; "auto")]
+#[test_case(2, ViewMode::Compact ; "compact")]
+#[test_case(3, ViewMode::Expanded ; "expanded")]
+fn a_view_mode_outlives_the_app_that_chose_it(toggles: usize, expected: ViewMode) {
     let tmp = TempDir::new().expect("state dir");
     let dir = StateDir::from_path(tmp.path().to_path_buf());
 
     let mut app = build_app(dir.clone(), Arc::new(test_writer(dir.clone())));
-    assert_eq!(app.view, ViewMode::Auto, "{VIEW_DEFAULT_MSG}");
-    app.run_builtin(BuiltinAction::ViewToggle);
+    assert_eq!(app.view, ViewMode::Expanded, "{VIEW_DEFAULT_MSG}");
+    for _ in 0..toggles {
+        app.run_builtin(BuiltinAction::ViewToggle);
+    }
 
     let restarted = build_app(dir.clone(), Arc::new(test_writer(dir)));
-    assert_eq!(restarted.view, ViewMode::Compact, "{VIEW_PERSIST_MSG}");
+    assert_eq!(restarted.view, expected, "{VIEW_PERSIST_MSG}");
 }
 
 #[test]
@@ -17823,10 +17946,9 @@ fn streaming_cancel_wins_over_esc_override() {
     app.status = Status::Streaming;
     app.run_id = 1;
     let _receiver = attach_processing_queue(&mut app);
-    app.status_bar.flash_duration = Duration::from_secs(3600);
-    app.last_esc = Some(Instant::now());
     let probe = install_override(&mut app, KeyCode::Esc, KeyModifiers::NONE);
 
+    app.last_esc = Some(Instant::now());
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
 
     assert!(
@@ -19895,6 +20017,46 @@ fn single_or_stale_esc_in_subagent_flashes() {
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
     assert!(actions.is_empty());
     assert!(!app.chats[1].is_finished());
+}
+
+#[test_case(false, Duration::ZERO ; "read_only_without_ordinary_flash")]
+#[test_case(false, LONG_FLASH_DURATION ; "read_only_with_long_ordinary_flash")]
+#[test_case(true, Duration::ZERO ; "composer_without_ordinary_flash")]
+#[test_case(true, LONG_FLASH_DURATION ; "composer_with_long_ordinary_flash")]
+fn task_esc_confirmation_uses_fixed_window(steerable: bool, flash_duration: Duration) {
+    for (elapsed, confirmed) in CONFIRMATION_TIMINGS {
+        let mut app = if steerable {
+            focused_task_composer().0
+        } else {
+            app_with_active_subagent()
+        };
+        assert_eq!(app.active_subagent_can_steer(), steerable);
+        app.status_bar.flash_duration = flash_duration;
+
+        assert!(app.update(Msg::Key(key(KeyCode::Esc))).is_empty());
+        assert_eq!(app.status_bar.clear_expired_hint(), Dirty::NO);
+        assert_eq!(app.status_bar.flash_text(), Some(FLASH_CANCEL));
+
+        let pressed_at = Instant::now().checked_sub(elapsed).unwrap();
+        app.last_esc = Some(pressed_at);
+        let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+
+        assert_eq!(app.chats[1].is_finished(), confirmed);
+        if confirmed {
+            assert!(matches!(
+                actions.as_slice(),
+                [Action::CancelSubagent { tool_use_id }] if tool_use_id == TASK_ID
+            ));
+            assert!(app.last_esc.is_none());
+        } else {
+            assert!(actions.is_empty());
+            assert!(
+                app.last_esc
+                    .is_some_and(|rearmed_at| rearmed_at > pressed_at)
+            );
+            assert_eq!(app.status_bar.flash_text(), Some(FLASH_CANCEL));
+        }
+    }
 }
 
 #[test]

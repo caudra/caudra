@@ -107,9 +107,10 @@ version = 1
 # Type: string.
 # mermaid = "unicode"
 
-# Duration of flash messages (ms).
+# Duration of ordinary status-bar messages (ms). Confirmation prompts use a
+# fixed 3-second window.
 # Type: u64.
-# flash_duration_ms = 1500
+# flash_duration_ms = 10000
 
 # How long Ctrl+X waits before listing the chords it can still reach (ms). 0
 # shows the list at once.

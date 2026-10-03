@@ -19,11 +19,11 @@ const EXPANDED: &str = "expanded";
 pub enum ViewMode {
     /// The card being written is open and the ones scrolled past are closed,
     /// unless closing one would hide something that changed the workspace.
-    #[default]
     Auto,
     /// Every card that can close is closed.
     Compact,
     /// Every card is open.
+    #[default]
     Expanded,
 }
 
@@ -78,34 +78,27 @@ mod tests {
     use tempfile::TempDir;
     use test_case::test_case;
 
-    use super::*;
+    use super::{VIEW, ViewMode, persist, read};
+    use crate::StateDir;
+    use crate::state::{self, SCOPE_GLOBAL};
 
     const UNSET: &str = "an unwritten mode must leave the caller's default alone";
     const ROUND_TRIP: &str = "a stored mode must read back as written";
-    const UNKNOWN: &str = "a mode this build cannot read is not a mode";
-    const DEFAULT: &str = "a reader who never chose gets the mode that follows the writing";
-    const CYCLE: &str = "every mode must be reachable by pressing the key three times";
+    const UNKNOWN: &str = "a missing or unrecognized mode is not a saved choice";
+    const UNKNOWN_MODE: &str = "roomy";
+    const DEFAULT: &str = "a reader with no recognized saved choice gets expanded mode";
+    const CYCLE: &str = "the cycle must remain expanded, auto, compact, then expanded";
 
     #[test]
-    fn an_unchosen_mode_follows_the_latest_card() {
-        assert_eq!(ViewMode::default(), ViewMode::Auto, "{DEFAULT}");
+    fn an_unchosen_mode_is_expanded() {
+        assert_eq!(ViewMode::default(), ViewMode::Expanded, "{DEFAULT}");
     }
 
-    #[test]
-    fn the_cycle_visits_every_mode_and_returns() {
-        let mut mode = ViewMode::default();
-        let mut seen = Vec::new();
-        for _ in 0..3 {
-            seen.push(mode);
-            mode = mode.next();
-        }
-        seen.sort_by_key(|mode| mode.as_str());
-        assert_eq!(
-            seen,
-            vec![ViewMode::Auto, ViewMode::Compact, ViewMode::Expanded],
-            "{CYCLE}"
-        );
-        assert_eq!(mode, ViewMode::default(), "{CYCLE}");
+    #[test_case(ViewMode::Expanded, ViewMode::Auto ; "expanded_to_auto")]
+    #[test_case(ViewMode::Auto, ViewMode::Compact ; "auto_to_compact")]
+    #[test_case(ViewMode::Compact, ViewMode::Expanded ; "compact_to_expanded")]
+    fn the_cycle_preserves_each_edge(mode: ViewMode, expected: ViewMode) {
+        assert_eq!(mode.next(), expected, "{CYCLE}");
     }
 
     #[test_case(ViewMode::Auto ; "auto")]
@@ -118,14 +111,23 @@ mod tests {
         assert_eq!(read(&dir), None, "{UNSET}");
         persist(&dir, mode);
         assert_eq!(read(&dir), Some(mode), "{ROUND_TRIP}");
+        assert_eq!(read(&dir).unwrap_or_default(), mode, "{ROUND_TRIP}");
     }
 
-    #[test]
-    fn a_mode_this_build_cannot_read_is_ignored() {
+    #[test_case(None ; "missing")]
+    #[test_case(Some(UNKNOWN_MODE) ; "unrecognized")]
+    fn a_missing_or_unrecognized_mode_falls_back_to_expanded(stored: Option<&str>) {
         let tmp = TempDir::new().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
 
-        state::set(&dir, SCOPE_GLOBAL, VIEW, &"roomy").unwrap();
+        if let Some(stored) = stored {
+            state::set(&dir, SCOPE_GLOBAL, VIEW, &stored).unwrap();
+        }
         assert_eq!(read(&dir), None, "{UNKNOWN}");
+        assert_eq!(
+            read(&dir).unwrap_or_default(),
+            ViewMode::Expanded,
+            "{DEFAULT}"
+        );
     }
 }

@@ -809,7 +809,7 @@ impl PermissionTier {
 }
 
 pub struct StatusBar {
-    flash: Option<(String, Instant)>,
+    flash: Option<(String, Instant, Duration)>,
     started_at: Instant,
     cwd_branch: String,
     pub flash_duration: Duration,
@@ -904,12 +904,16 @@ impl StatusBar {
     }
 
     pub fn flash(&mut self, msg: String) {
-        self.flash = Some((msg, Instant::now()));
+        self.flash_for(msg, self.flash_duration);
+    }
+
+    pub fn flash_for(&mut self, msg: String, duration: Duration) {
+        self.flash = Some((msg, Instant::now(), duration));
     }
 
     #[cfg(test)]
     pub fn flash_text(&self) -> Option<&str> {
-        self.flash.as_ref().map(|(s, _)| s.as_str())
+        self.flash.as_ref().map(|(s, ..)| s.as_str())
     }
 
     pub fn refresh_cwd(&mut self, cwd: &str) {
@@ -945,10 +949,14 @@ impl StatusBar {
     }
 
     pub fn clear_expired_hint(&mut self) -> Dirty {
+        self.clear_expired_hint_at(Instant::now())
+    }
+
+    fn clear_expired_hint_at(&mut self, now: Instant) -> Dirty {
         if self
             .flash
             .as_ref()
-            .is_none_or(|(_, t)| t.elapsed() < self.flash_duration)
+            .is_none_or(|(_, started_at, duration)| now.duration_since(*started_at) < *duration)
         {
             return Dirty::NO;
         }
@@ -1136,7 +1144,7 @@ impl StatusBar {
     }
 
     fn flash_span(&self) -> Option<Span<'static>> {
-        self.flash.as_ref().map(|(message, _)| {
+        self.flash.as_ref().map(|(message, ..)| {
             Span::styled(format!("{GAP}{message}"), theme::current().status_notice)
         })
     }
@@ -2001,6 +2009,7 @@ fn spawn_branch_watcher(cwd: &str) -> Option<flume::Receiver<()>> {
 
 #[cfg(test)]
 mod tests {
+    use caudra_config::DEFAULT_FLASH_DURATION_MS;
     use ratatui::buffer::Cell;
     use ratatui::style::Modifier;
     use std::fs;
@@ -2013,6 +2022,15 @@ mod tests {
 
     const FLASH_TTL: Duration = Duration::from_secs(3600);
     const FLASH_MSG: &str = "Copied";
+    const DEFAULT_FLASH_TTL: Duration = Duration::from_millis(DEFAULT_FLASH_DURATION_MS);
+    const SHORT_FLASH_TTL: Duration = Duration::from_secs(3);
+    const BEFORE_SHORT_FLASH: Duration = Duration::from_secs(2);
+    const AFTER_SHORT_FLASH: Duration = Duration::from_secs(4);
+    const BEFORE_DEFAULT_FLASH: Duration = Duration::from_secs(9);
+    const AFTER_DEFAULT_FLASH: Duration = Duration::from_secs(11);
+    const REPLACEMENT_FLASH_MSG: &str = "Saved";
+    const FLASH_EXPIRY_MSG: &str = "a flash must expire at its own lifetime";
+    const FLASH_REPLACEMENT_MSG: &str = "a replacement flash must own its text and lifetime";
     const STALE_BRANCH: &str = "/nowhere:gone";
     const BAR_WIDTH: u16 = 120;
     const MODE_LABEL: &str = "[BUILD]";
@@ -4351,6 +4369,73 @@ mod tests {
         let first = bar.clear_expired_hint();
         assert_eq!(bar.clear_expired_hint(), Dirty::NO, "{QUIET}");
         first
+    }
+
+    #[test_case(None, BEFORE_DEFAULT_FLASH, false; "default_before_expiry")]
+    #[test_case(None, DEFAULT_FLASH_TTL, true; "default_at_expiry")]
+    #[test_case(None, AFTER_DEFAULT_FLASH, true; "default_after_expiry")]
+    #[test_case(Some(SHORT_FLASH_TTL), BEFORE_SHORT_FLASH, false; "explicit_before_expiry")]
+    #[test_case(Some(SHORT_FLASH_TTL), SHORT_FLASH_TTL, true; "explicit_at_expiry")]
+    #[test_case(Some(SHORT_FLASH_TTL), AFTER_SHORT_FLASH, true; "explicit_after_expiry")]
+    #[test_case(Some(Duration::ZERO), Duration::ZERO, true; "zero_expires_immediately")]
+    #[test_case(Some(Duration::MAX), AFTER_DEFAULT_FLASH, false; "maximum_lifetime_does_not_overflow")]
+    fn flash_expiry_uses_its_captured_lifetime(
+        explicit_duration: Option<Duration>,
+        elapsed: Duration,
+        expired: bool,
+    ) {
+        let mut bar = StatusBar::new(DEFAULT_FLASH_TTL, ".", true);
+        match explicit_duration {
+            Some(duration) => bar.flash_for(FLASH_MSG.into(), duration),
+            None => bar.flash(FLASH_MSG.into()),
+        }
+        let now = bar.flash.as_ref().unwrap().1 + elapsed;
+        bar.flash_duration = Duration::ZERO;
+
+        assert_eq!(
+            bar.clear_expired_hint_at(now),
+            Dirty::from(expired),
+            "{FLASH_EXPIRY_MSG}"
+        );
+        assert_eq!(bar.flash_text(), (!expired).then_some(FLASH_MSG));
+        assert_eq!(bar.clear_expired_hint_at(now), Dirty::NO, "{QUIET}");
+    }
+
+    #[test_case(false; "ordinary_replaces_explicit")]
+    #[test_case(true; "explicit_replaces_ordinary")]
+    fn replacing_a_flash_replaces_its_lifetime(explicit_replacement: bool) {
+        let mut bar = StatusBar::new(DEFAULT_FLASH_TTL, ".", true);
+        let lifetime = if explicit_replacement {
+            bar.flash(FLASH_MSG.into());
+            bar.flash_for(REPLACEMENT_FLASH_MSG.into(), SHORT_FLASH_TTL);
+            SHORT_FLASH_TTL
+        } else {
+            bar.flash_for(FLASH_MSG.into(), SHORT_FLASH_TTL);
+            bar.flash(REPLACEMENT_FLASH_MSG.into());
+            DEFAULT_FLASH_TTL
+        };
+        let started_at = bar.flash.as_ref().unwrap().1;
+        assert_eq!(
+            bar.flash_text(),
+            Some(REPLACEMENT_FLASH_MSG),
+            "{FLASH_REPLACEMENT_MSG}"
+        );
+        assert_eq!(
+            bar.clear_expired_hint_at(started_at + BEFORE_SHORT_FLASH),
+            Dirty::NO,
+            "{FLASH_REPLACEMENT_MSG}"
+        );
+        assert_eq!(
+            bar.clear_expired_hint_at(started_at + SHORT_FLASH_TTL),
+            Dirty::from(explicit_replacement),
+            "{FLASH_REPLACEMENT_MSG}"
+        );
+        assert_eq!(
+            bar.clear_expired_hint_at(started_at + lifetime),
+            Dirty::from(!explicit_replacement),
+            "{FLASH_REPLACEMENT_MSG}"
+        );
+        assert!(bar.flash_text().is_none(), "{FLASH_REPLACEMENT_MSG}");
     }
 
     /// The watcher fires for any write near `.git/HEAD`, most of which leave

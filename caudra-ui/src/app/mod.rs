@@ -1,5 +1,5 @@
 //! Elm-style `update(Msg) -> Vec<Action>`; side effects are dispatched by the caller.
-//! Double-esc cancels/rewinds and double Ctrl+D exits within `flash_duration`.
+//! Double-esc cancels/rewinds and double Ctrl+D exits within `CONFIRMATION_DURATION`.
 //! `run_id` invalidates in-flight agent events. It bumps in exactly three
 //! places, one per transition: `start_run`, `handle_cancel`, and
 //! `AgentHandles::respawn`. Everything else only reads it.
@@ -194,6 +194,7 @@ pub(crate) const RESTORE_RUN_ID: u64 = u64::MAX;
 const FLASH_CANCEL: &str = "Press esc again to stop...";
 const FLASH_REWIND: &str = "Press esc again to rewind...";
 const FLASH_EXIT: &str = "Press Ctrl+D again to exit...";
+const CONFIRMATION_DURATION: Duration = Duration::from_secs(3);
 const FLASH_NO_CHORD: &str = "is not a chord";
 const RETRY_COUNTDOWN_UNAVAILABLE: &str =
     "Retry countdown unavailable: delay exceeds the platform clock range";
@@ -1896,12 +1897,13 @@ impl App {
             }
             return Some(
                 if let Some(pressed_at) = self.last_exit.take()
-                    && pressed_at.elapsed() < self.status_bar.flash_duration
+                    && pressed_at.elapsed() < CONFIRMATION_DURATION
                 {
                     self.quit()
                 } else {
                     self.last_exit = Some(Instant::now());
-                    self.status_bar.flash(FLASH_EXIT.into());
+                    self.status_bar
+                        .flash_for(FLASH_EXIT.into(), CONFIRMATION_DURATION);
                     vec![]
                 },
             );
@@ -3182,12 +3184,13 @@ impl App {
                 KeyCode::Tab if !self.is_bash_input() => self.toggle_mode(),
                 KeyCode::Esc if !self.chats[self.active_chat].is_finished() => {
                     if let Some(t) = self.last_esc.take()
-                        && t.elapsed() < self.status_bar.flash_duration
+                        && t.elapsed() < CONFIRMATION_DURATION
                     {
                         self.handle_subagent_cancel()
                     } else {
                         self.last_esc = Some(Instant::now());
-                        self.status_bar.flash(FLASH_CANCEL.into());
+                        self.status_bar
+                            .flash_for(FLASH_CANCEL.into(), CONFIRMATION_DURATION);
                         vec![]
                     }
                 }
@@ -3373,12 +3376,13 @@ impl App {
             InputAction::Passthrough(key) => match key.code {
                 KeyCode::Esc => {
                     if let Some(t) = self.last_esc.take()
-                        && t.elapsed() < self.status_bar.flash_duration
+                        && t.elapsed() < CONFIRMATION_DURATION
                     {
                         self.handle_subagent_cancel()
                     } else {
                         self.last_esc = Some(Instant::now());
-                        self.status_bar.flash(FLASH_CANCEL.into());
+                        self.status_bar
+                            .flash_for(FLASH_CANCEL.into(), CONFIRMATION_DURATION);
                         vec![]
                     }
                 }
@@ -3798,7 +3802,7 @@ impl App {
                     KeyCode::Tab if !self.is_bash_input() => self.toggle_mode(),
                     KeyCode::Esc => {
                         if let Some(t) = self.last_esc.take()
-                            && t.elapsed() < self.status_bar.flash_duration
+                            && t.elapsed() < CONFIRMATION_DURATION
                         {
                             if streaming || self.has_session_work() {
                                 self.handle_cancel()
@@ -3807,13 +3811,14 @@ impl App {
                             }
                         } else {
                             self.last_esc = Some(Instant::now());
-                            self.status_bar.flash(
+                            self.status_bar.flash_for(
                                 if streaming || self.has_session_work() {
                                     FLASH_CANCEL
                                 } else {
                                     FLASH_REWIND
                                 }
                                 .into(),
+                                CONFIRMATION_DURATION,
                             );
                             vec![]
                         }

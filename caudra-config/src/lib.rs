@@ -77,7 +77,7 @@ pub use steering::SteeringConfig;
 
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 50 * 1024;
 pub const DEFAULT_MAX_OUTPUT_LINES: usize = 2000;
-pub const DEFAULT_FLASH_DURATION_MS: u64 = 1500;
+pub const DEFAULT_FLASH_DURATION_MS: u64 = 10_000;
 pub const DEFAULT_TYPEWRITER_MS_PER_CHAR: u64 = 4;
 pub const DEFAULT_WHICH_KEY_DELAY_MS: u64 = 250;
 pub const DEFAULT_MOUSE_SCROLL_LINES: u32 = 3;
@@ -1968,7 +1968,10 @@ pub struct UiConfig {
     )]
     pub mermaid: MermaidStyle,
 
-    #[config(default = DEFAULT_FLASH_DURATION_MS, desc = "Duration of flash messages (ms)")]
+    #[config(
+        default = DEFAULT_FLASH_DURATION_MS,
+        desc = "Duration of ordinary status-bar messages (ms). Confirmation prompts use a fixed 3-second window"
+    )]
     pub flash_duration_ms: u64,
 
     #[config(
@@ -3743,6 +3746,9 @@ mod tests {
     use tempfile::TempDir;
     use test_case::test_case;
 
+    const EXPECTED_DEFAULT_FLASH_DURATION: Duration = Duration::from_secs(10);
+    const CUSTOM_FLASH_DURATION_MS: u64 = 1500;
+    const ZERO_FLASH_DURATION_MS: u64 = 0;
     const NO_DEFAULT_DELETION: &str = "retention must delete nothing until a user opts in";
     const BACKGROUND_REMINDER_FIELD: &str = "background_reminder_turns";
     const CUSTOM_BACKGROUND_REMINDER_TURNS: u32 = 13;
@@ -4132,6 +4138,37 @@ mod tests {
         assert_eq!(
             config.storage.max_eager_load_bytes,
             DEFAULT_MAX_EAGER_LOAD_MB * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn ui_default_flash_duration_is_ten_seconds() {
+        let ui = UiConfig::default();
+        assert_eq!(ui.flash_duration_ms, DEFAULT_FLASH_DURATION_MS);
+        assert_eq!(ui.flash_duration(), EXPECTED_DEFAULT_FLASH_DURATION);
+    }
+
+    #[test_case(""; "empty_config")]
+    #[test_case("[ui]"; "empty_ui_table")]
+    fn missing_flash_duration_resolves_to_ten_seconds(source: &str) {
+        let raw: RawConfig = toml::from_str(source).unwrap();
+        let config = raw.into_config(false).unwrap();
+        assert_eq!(config.ui.flash_duration_ms, DEFAULT_FLASH_DURATION_MS);
+        assert_eq!(config.ui.flash_duration(), EXPECTED_DEFAULT_FLASH_DURATION);
+    }
+
+    #[test_case(CUSTOM_FLASH_DURATION_MS; "custom_duration")]
+    #[test_case(ZERO_FLASH_DURATION_MS; "zero_duration")]
+    fn explicit_flash_duration_is_preserved(milliseconds: u64) {
+        let mut raw: RawConfig =
+            toml::from_str(&format!("[ui]\nflash_duration_ms = {milliseconds}\n")).unwrap();
+        raw.merge(RawConfig::default());
+        let config = raw.into_config(false).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.ui.flash_duration_ms, milliseconds);
+        assert_eq!(
+            config.ui.flash_duration(),
+            Duration::from_millis(milliseconds)
         );
     }
 
