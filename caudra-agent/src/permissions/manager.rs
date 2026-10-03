@@ -622,6 +622,12 @@ impl PermissionManager {
         !self.is_yolo() && self.broker.revision.load(Ordering::Acquire) == revision
     }
 
+    /// Answering a call's own prompt bumps the revision too, and that alone
+    /// leaves the passive decisions made for the call current.
+    pub(crate) fn passive_decision_is_current_for(&self, revision: u64, call_id: &str) -> bool {
+        !self.is_yolo() && self.broker.bumped_only_by(revision, call_id)
+    }
+
     pub fn set_session_mode(&self, stored: Option<PermissionMode>) {
         self.update_mode(|state| state.stored = stored);
     }
@@ -1290,6 +1296,9 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     const META_KEY: &str = "request_id";
+    const OWN_CALL: &str = "own-call";
+    const SIBLING_CALL: &str = "sibling-call";
+    const UNATTRIBUTED: &str = "";
 
     #[test]
     fn decision_context_uses_the_canonical_project() {
@@ -1395,6 +1404,30 @@ mod tests {
         let revision = manager.passive_decision_revision().unwrap();
         manager.set_decisions(None);
         assert!(!manager.passive_decision_is_current(revision));
+    }
+
+    #[test_case(&[], OWN_CALL, true; "unchanged")]
+    #[test_case(&[OWN_CALL], OWN_CALL, true; "own_answer")]
+    #[test_case(&[OWN_CALL, OWN_CALL], OWN_CALL, true; "own_remembered_answer")]
+    #[test_case(&[SIBLING_CALL], OWN_CALL, false; "sibling_answer")]
+    #[test_case(&[SIBLING_CALL, OWN_CALL], OWN_CALL, false; "sibling_then_own_answer")]
+    #[test_case(&[OWN_CALL, SIBLING_CALL], OWN_CALL, false; "own_then_sibling_answer")]
+    #[test_case(&[OWN_CALL, UNATTRIBUTED], OWN_CALL, false; "own_answer_then_policy_change")]
+    #[test_case(&[UNATTRIBUTED], UNATTRIBUTED, false; "unattributed_call")]
+    fn passive_decision_for_a_call_survives_only_its_own_answer(
+        sources: &[&str],
+        call: &str,
+        current: bool,
+    ) {
+        let manager = default_mgr();
+        let revision = manager.passive_decision_revision().unwrap();
+        for source in sources {
+            manager.notify_policy_changed(source);
+        }
+        assert_eq!(
+            manager.passive_decision_is_current_for(revision, call),
+            current
+        );
     }
 
     #[test]

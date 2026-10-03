@@ -15,7 +15,17 @@ pub(super) struct PermissionBroker {
     // Claim/register under this lock; evaluate policy, commit storage, and send only after release.
     pub(super) pending: Mutex<HashMap<u64, HashMap<String, PendingPermission>>>,
     pub(super) revision: AtomicU64,
+    // Every bump happens under this lock, so it never disagrees with `revision`.
+    latest_bumps: Mutex<LatestBumps>,
     pub(super) changed: Event,
+}
+
+/// The request whose answer made the latest uninterrupted run of revision
+/// bumps, and the revision that run started from.
+#[derive(Default)]
+struct LatestBumps {
+    request_id: String,
+    since: u64,
 }
 
 impl PermissionBroker {
@@ -25,7 +35,18 @@ impl PermissionBroker {
                 .pending
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            self.revision.fetch_add(1, Ordering::Release);
+            let mut latest = self
+                .latest_bumps
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let previous = self.revision.fetch_add(1, Ordering::Release);
+            if latest.request_id != source_request_id {
+                *latest = LatestBumps {
+                    request_id: source_request_id.to_owned(),
+                    since: previous,
+                };
+            }
+            drop(latest);
             pending
                 .values()
                 .flat_map(|requests| requests.values())
@@ -36,6 +57,19 @@ impl PermissionBroker {
             let _ = sender.try_send(source_request_id.to_owned());
         }
         self.changed.notify(usize::MAX);
+    }
+
+    /// Whether every bump since `revision`, if any, came from answering
+    /// `request_id`.
+    pub(super) fn bumped_only_by(&self, revision: u64, request_id: &str) -> bool {
+        let latest = self
+            .latest_bumps
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.revision.load(Ordering::Acquire) == revision
+            || (!request_id.is_empty()
+                && latest.request_id == request_id
+                && latest.since <= revision)
     }
 }
 
@@ -216,6 +250,10 @@ mod tests {
     use caudra_storage::StateDir;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
+
+    const ANSWERED_CALL: &str = "answered-call";
+    const SIBLING_CALL: &str = "sibling-call";
+
     #[test]
     fn duplicate_request_id_does_not_replace_the_pending_request() {
         smol::block_on(async {
@@ -292,6 +330,28 @@ mod tests {
                     source_request_id
                 } if request_id == "second" && source_request_id == "first"
             ));
+        });
+    }
+
+    #[test_case(PermissionAnswer::AllowOnce; "once")]
+    #[test_case(PermissionAnswer::AllowSession; "remembered")]
+    fn answer_keeps_only_its_own_calls_passive_decisions(answer: PermissionAnswer) {
+        smol::block_on(async {
+            let manager = Arc::new(default_mgr());
+            let revision = manager.passive_decision_revision().unwrap();
+            let (call, events) = pending_tool_enforcement(
+                Arc::clone(&manager),
+                ANSWERED_CALL,
+                "bash",
+                FIRST_COMMAND.into(),
+                serde_json::json!({"command": FIRST_COMMAND}),
+            );
+            events.recv_async().await.unwrap();
+            assert!(manager.answer(ANSWERED_CALL, answer));
+            assert!(call.await.is_ok());
+            assert!(!manager.passive_decision_is_current(revision));
+            assert!(manager.passive_decision_is_current_for(revision, ANSWERED_CALL));
+            assert!(!manager.passive_decision_is_current_for(revision, SIBLING_CALL));
         });
     }
 
