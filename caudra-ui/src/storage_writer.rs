@@ -40,7 +40,7 @@ use crate::AppSession;
 const SAVE_FAILED_PREFIX: &str = "Session save failed";
 const SAVE_RECOVERED: &str = "Session save recovered";
 const WORKSPACE_TABS_SAVE_FAILED_PREFIX: &str = "Workspace tabs save failed";
-const STORAGE_WARNING_BYTES: u64 = 1024 * 1024 * 1024;
+const STORAGE_WARNING_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 /// A `-wal` sitting at the retention limit is the designed steady state, so an
 /// alarm set there would fire on every burst. Only a WAL that has outgrown what
 /// a reset is allowed to keep says checkpoints are not getting through.
