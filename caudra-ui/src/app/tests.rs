@@ -1,6 +1,7 @@
 use super::*;
 use crate::agent::shared_queue::{self, QueueReceiver};
 use crate::agent::tools_preview_source;
+use crate::app::permission_editor::tests::workbench_workspace;
 use crate::app::sandbox::attached_sandbox_instance;
 use crate::app::tasks::{MAIN_TASK_ID, TaskStatus};
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT};
@@ -26,7 +27,8 @@ use crate::components::storage_modal::{
 use crate::components::stream_modal::{StreamDone, StreamEvent, StreamFooter, StreamUsage};
 use crate::components::usage_modal::SCOPE_KEY;
 use crate::components::{
-    DisplaySource, ExitRequest, SubscriptionProvider, ToolProgress, buffer_text, key, test_model,
+    DisplaySource, ExitRequest, ForkedSession, SubscriptionProvider, ToolProgress, buffer_text,
+    key, test_model,
 };
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{SelectableZone, SelectionState, SelectionZone};
@@ -48,7 +50,7 @@ use caudra_agent::permissions::{
     RuleOrigin,
 };
 use caudra_agent::tools::native::plan::{self, PlanTarget, PlanWriteResult};
-use caudra_agent::tools::profile_policy::PLAN_MODE_REQUIRED;
+use caudra_agent::tools::profile_policy::PLAN_REQUIRED;
 use caudra_agent::tools::{
     SHELL_TOOL_NAME, TODOWRITE_TOOL_NAME, ToolEffect, ToolRegistry, VIEW_IMAGE_TOOL_NAME, native,
 };
@@ -74,7 +76,7 @@ use caudra_providers::{
     project_messages,
 };
 use caudra_storage::id::CaudraId;
-use caudra_storage::local_documents::DocumentRevision;
+use caudra_storage::local_documents::LocalDocumentStore;
 use caudra_storage::permission_patterns::{
     ArgumentRole, PATTERN_SCHEMA_VERSION, PatternContext, PatternDefinition, PatternToken,
     SlotCombinations,
@@ -94,7 +96,7 @@ use caudra_storage::view::ViewMode;
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
 use caudra_workbench::keys as workbench_keys;
 use caudra_workspace::{
-    CollectionRevision, OperationId, PlanRef, ProjectAsset, ProjectAssetContent,
+    CollectionRevision, LocalDocumentRef, OperationId, PlanRef, ProjectAsset, ProjectAssetContent,
     ProjectAssetManifest, SessionWorkspaceBinding, WorkspaceAssetService, WorkspaceCapabilities,
     WorkspaceCursor, WorkspaceError, WorkspaceHandle, WorkspaceServices, WorkspaceSession,
 };
@@ -130,6 +132,7 @@ const PRIVATE_TEST_DIRECTORY_MODE: u32 = 0o700;
 const HANDOFF_PLAN_FILE: &str = "test-plan.md";
 const HANDOFF_PLAN_CONTENT: &str = "# Captured plan\n\nImplement without reading files.";
 const HANDOFF_PLAN_CHANGED: &str = "# A later plan revision";
+const IMPLEMENT_REVISION: &str = "revision";
 const COMMITTED_PLAN_PATH: &str = "/unreadable/committed-plan.md";
 const STALE_PLAN_PATH: &str = "/unreadable/stale-plan.md";
 const COMMITTED_PLAN_REF: &str = "plan-committed";
@@ -729,33 +732,21 @@ fn tools_preview_same_model_toggles_are_isolated_and_cached(remote: bool) {
     app.context_store = Some(store.clone());
     assert!(app.queue_and_notify(queued_msg(PREVIEW_QUEUED_TEXT)));
     let queued = app.queue.pending_prompts();
-    for (mode, basis, state) in [
-        (
-            Mode::Build,
-            SELECTED_BUILD_TOOLS,
-            ContextBuiltinState::Disabled,
-        ),
-        (
-            Mode::Plan,
-            SELECTED_PLAN_TOOLS,
-            ContextBuiltinState::Declared,
-        ),
-        (
-            Mode::Build,
-            SELECTED_BUILD_TOOLS,
-            ContextBuiltinState::Disabled,
-        ),
-        (
-            Mode::Plan,
-            SELECTED_PLAN_TOOLS,
-            ContextBuiltinState::Declared,
-        ),
+    for (mode, basis) in [
+        (Mode::Build, SELECTED_BUILD_TOOLS),
+        (Mode::Plan, SELECTED_PLAN_TOOLS),
+        (Mode::Build, SELECTED_BUILD_TOOLS),
+        (Mode::Plan, SELECTED_PLAN_TOOLS),
     ] {
         app.state.mode = mode;
         app.execute_tools();
         assert_eq!(app.tools_basis, basis);
         let snapshot = app.tools_snapshot.held().unwrap();
-        assert_eq!(snapshot.inventory.builtins.tools[0].state, state);
+        assert_eq!(snapshot.mode, app.agent_mode());
+        assert_eq!(
+            snapshot.inventory.builtins.tools[0].state,
+            ContextBuiltinState::Declared
+        );
         assert_eq!(
             snapshot.inventory.builtins.request_tokens(),
             snapshot.usage.system_tools
@@ -815,6 +806,7 @@ fn tools_preview_active_turn_uses_committed_mode(
         &app.state.model,
         &app.state.thinking,
         &app.execution_agent_mode(),
+        true,
         &app.state.session.cwd,
         &[],
     );
@@ -858,10 +850,41 @@ fn tools_preview_missing_target_stays_readonly_without_allocating() {
     );
     assert_eq!(
         snapshot.inventory.builtins.tools[0].reason,
-        Some(PLAN_MODE_REQUIRED)
+        Some(PLAN_REQUIRED)
     );
     assert_eq!(app.state.plan, PlanState::None);
     assert_eq!(app.execution_agent_mode(), AgentMode::Build);
+}
+
+/// The idle preview is the next message's run: the selected mode with the
+/// session's plan binding, whatever mode created it.
+#[test_case(true, ContextBuiltinState::Declared, None; "bound")]
+#[test_case(false, ContextBuiltinState::Disabled, Some(PLAN_REQUIRED); "unbound")]
+fn tools_preview_idle_build_follows_the_session_plan(
+    bound: bool,
+    state: ContextBuiltinState,
+    reason: Option<&str>,
+) {
+    let mut app = tools_preview_app();
+    if !bound {
+        app.state.plan = PlanState::None;
+    }
+    app.execute_tools();
+    assert_eq!(app.tools_basis, SELECTED_BUILD_TOOLS);
+    let snapshot = app.tools_snapshot.held().unwrap();
+    assert_eq!(snapshot.mode, AgentMode::Build);
+    assert_eq!(snapshot.inventory.builtins.tools[0].state, state);
+    assert_eq!(snapshot.inventory.builtins.tools[0].reason, reason);
+    app.state.plan = if bound {
+        PlanState::None
+    } else {
+        PlanState::RemoteDrafting(PlanRef::new(COMMITTED_PLAN_REF).unwrap())
+    };
+    assert_eq!(app.poll_tools_snapshot(), Dirty::YES);
+    assert_ne!(
+        app.tools_snapshot.held().unwrap().inventory.builtins.tools[0].state,
+        state
+    );
 }
 
 #[test]
@@ -2811,7 +2834,6 @@ fn tool_done_completes_only_the_matching_remote_plan() {
             annotation: Some(
                 PlanWriteResult::new(
                     PlanTarget::Remote(reference.clone()),
-                    DocumentRevision::new("c".repeat(64)).unwrap(),
                     HANDOFF_PLAN_CONTENT.into(),
                 )
                 .annotation()
@@ -5040,6 +5062,23 @@ pub(crate) fn focused_task_composer() -> (App, caudra_agent::SteeringQueue) {
     (app, steer_tx)
 }
 
+/// A steer becomes the task's latest input, so it has to name the session
+/// plan the task inherited or the task loses it mid-run.
+#[test]
+fn a_task_steer_keeps_the_session_plan() {
+    const STEER: &str = "check the plan's second step";
+
+    let (mut app, steer_queue) = focused_task_composer();
+    app.state.plan = PlanState::Drafting(PathBuf::from(HANDOFF_PLAN_FILE));
+    app.subagent_input_box.set_input(STEER.into());
+
+    assert!(app.update(Msg::Key(key(KeyCode::Enter))).is_empty());
+
+    let id = steer_queue.entries()[0].id;
+    let steer = steer_queue.remove(id).unwrap();
+    assert_eq!(steer.plan, app.state.plan.target());
+}
+
 #[test]
 fn slash_opens_the_palette_in_a_task_composer() {
     let (mut app, _steer_tx) = focused_task_composer();
@@ -6560,7 +6599,7 @@ fn main_chat_sources(app: &mut App) -> Vec<Option<DisplaySource>> {
         .collect()
 }
 
-fn sent_input(actions: &[Action]) -> &AgentInput {
+pub(crate) fn sent_input(actions: &[Action]) -> &AgentInput {
     let [Action::SendMessage(input)] = actions else {
         panic!("{SENT_MSG}");
     };
@@ -14154,8 +14193,11 @@ fn fork_title_uses_next_number_for_base_title() {
 #[test]
 fn fork_copies_execution_settings_but_resets_conversation_state() {
     let (_temp, _, _, mut app) = tempdir_app();
-    let plan = PathBuf::from(&app.state.session.cwd).join("plan.md");
-    std::fs::write(&plan, "plan").unwrap();
+    let plan = PathBuf::from(&app.state.session.cwd).join(HANDOFF_PLAN_FILE);
+    PlanFile::new(plan.clone())
+        .unwrap()
+        .write(HANDOFF_PLAN_CONTENT)
+        .unwrap();
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Ready(plan.clone());
     app.state.thinking = ThinkingConfig::Adaptive;
@@ -14185,7 +14227,12 @@ fn fork_copies_execution_settings_but_resets_conversation_state() {
     assert_eq!(child.model, app.state.session.model);
     assert_eq!(child.cwd, app.state.session.cwd);
     assert_eq!(child.meta.mode, Some(StoredMode::Plan));
-    assert_eq!(child.meta.plan_path.as_deref(), plan.to_str());
+    let copy = PathBuf::from(child.meta.plan_path.as_deref().unwrap());
+    assert_ne!(copy, plan);
+    assert_eq!(
+        PlanFile::new(copy).unwrap().read().unwrap(),
+        HANDOFF_PLAN_CONTENT
+    );
     assert!(child.meta.plan_written);
     assert_eq!(child.meta.thinking, Some(StoredThinking::Adaptive));
     assert!(child.meta.fast);
@@ -14202,24 +14249,113 @@ fn fork_copies_execution_settings_but_resets_conversation_state() {
     assert!(child.meta.pending_revert.is_none());
 }
 
-#[test]
-fn fork_discards_remote_plan_authority() {
-    let (_temp, _, _, mut app) = tempdir_app();
-    let reference = caudra_workspace::PlanRef::new(format!("plan-{}", "a".repeat(32))).unwrap();
-    app.state.plan = PlanState::RemoteReady(reference.clone());
-    app.permissions
-        .load_structured_conversation_rules(vec![conversation_permission_record()]);
-    app.permissions.set_session_mode(Some(PermissionMode::Yolo));
+/// The text of the plan `target` names, read as `owner`, the session whose
+/// document it is.
+fn plan_text(app: &App, owner: &str, target: &PlanTarget) -> String {
+    match target {
+        PlanTarget::Local(path) => PlanFile::new(Path::new(&app.state.session.cwd).join(path))
+            .unwrap()
+            .read()
+            .unwrap(),
+        PlanTarget::Remote(reference) => {
+            let store = app.local_documents.as_ref().unwrap();
+            let document = LocalDocumentRef::Plan(reference.clone());
+            store
+                .read(store.project_key(), Some(owner), &document)
+                .unwrap()
+                .content
+        }
+    }
+}
+
+fn write_plan_text(app: &App, owner: &str, target: &PlanTarget, text: &str) {
+    match target {
+        PlanTarget::Local(path) => {
+            PlanFile::new(Path::new(&app.state.session.cwd).join(path))
+                .unwrap()
+                .write(text)
+                .unwrap();
+        }
+        PlanTarget::Remote(reference) => {
+            let store = app.local_documents.as_ref().unwrap();
+            let document = LocalDocumentRef::Plan(reference.clone());
+            store
+                .write(store.project_key(), Some(owner), &document, text)
+                .unwrap();
+        }
+    }
+}
+
+fn fork_after_first_prompt(app: &mut App) -> ForkedSession {
     let items = crate::history_items(&[Message::user("prompt".into())]);
     let source = DisplaySource::User(items[0].id);
     app.state.session_mut().replace_messages(items);
-    let child = app.fork_at(source).unwrap().session;
-    assert!(child.meta.plan_target.is_none());
-    assert!(child.meta.plan_path.is_none());
-    assert!(!child.meta.plan_written);
-    assert!(child.meta.structured_permission_rules.is_empty());
-    assert_eq!(child.meta.permission_mode, None);
-    assert_eq!(app.state.plan, PlanState::RemoteReady(reference));
+    app.fork_at(source).unwrap()
+}
+
+/// A fork revises a plan of its own, drafting or ready as its parent's is, so
+/// neither session's writes reach the other's.
+#[test_case(false, false ; "local_drafting")]
+#[test_case(false, true ; "local_ready")]
+#[test_case(true, false ; "remote_drafting")]
+#[test_case(true, true ; "remote_ready")]
+fn fork_copies_the_plan_into_a_document_of_its_own(remote: bool, ready: bool) {
+    let mut app = if remote {
+        remote_plan_app()
+    } else {
+        plan_app()
+    };
+    if !ready {
+        app.state.plan.mark_drafting();
+    }
+    let parent = app.state.plan.target().unwrap();
+
+    let forked = fork_after_first_prompt(&mut app);
+
+    let child = &forked.session;
+    assert!(forked.warning.is_none());
+    assert_eq!(child.meta.plan_written, ready);
+    assert_eq!(child.meta.plan_path.is_some(), !remote);
+    let copy = PlanTarget::from(child.meta.plan_target.as_ref().unwrap());
+    let owner = child.id.to_string();
+    assert_eq!(plan_text(&app, &owner, &copy), HANDOFF_PLAN_CONTENT);
+    write_plan_text(&app, &owner, &copy, HANDOFF_PLAN_CHANGED);
+    assert_eq!(
+        plan_text(&app, &app.state.session.id.to_string(), &parent),
+        HANDOFF_PLAN_CONTENT
+    );
+}
+
+/// A plan that cannot be copied does not stop the fork: it goes ahead without
+/// one, and says so.
+#[test_case(false ; "local_unreadable")]
+#[test_case(true ; "remote_store_unavailable")]
+fn a_fork_whose_plan_cannot_be_copied_has_none(remote: bool) {
+    let mut app = if remote {
+        remote_plan_app()
+    } else {
+        plan_app()
+    };
+    if remote {
+        app.local_documents = None;
+    } else {
+        let path = Path::new(&app.state.session.cwd).join(HANDOFF_PLAN_FILE);
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+    }
+
+    let forked = fork_after_first_prompt(&mut app);
+
+    let meta = &forked.session.meta;
+    assert!(meta.plan_target.is_none());
+    assert!(meta.plan_path.is_none());
+    assert!(!meta.plan_written);
+    assert!(
+        forked
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.starts_with(PLAN_COPY_FAILED))
+    );
 }
 
 #[test]
@@ -16823,19 +16959,46 @@ fn flush_restored_queue_drops_recovery_snapshot() {
 
 // --- Plan form integration tests ---
 
-fn implement_msg(app: &App, parallel: bool) -> String {
-    let path = Path::new(&app.state.session.cwd).join(HANDOFF_PLAN_FILE);
-    let (content, revision) = PlanFile::new(path.clone()).unwrap().read().unwrap();
+fn implement_msg(app: &App, remote: bool, parallel: bool) -> String {
+    let header = if remote {
+        format!("{IMPLEMENT_VERB} {}.", plan::SESSION_PLAN_LABEL)
+    } else {
+        let path = Path::new(&app.state.session.cwd).join(HANDOFF_PLAN_FILE);
+        format!("{IMPLEMENT_MSG_PREFIX} from `{}`.", path.display())
+    };
     let hint = if parallel {
         format!(" {IMPLEMENT_PARALLEL_HINT}")
     } else {
         String::new()
     };
-    format!(
-        "{IMPLEMENT_MSG_PREFIX} from `{}` (revision `{}`).{hint}\n\n{content}",
-        path.display(),
-        revision.as_str()
-    )
+    format!("{header}{hint}\n\n{HANDOFF_PLAN_CONTENT}")
+}
+
+/// A workspace-bound app whose plan lives in the document store and is ready.
+fn remote_plan_app() -> App {
+    let mut app = test_app();
+    let workspace = workbench_workspace();
+    let store = Arc::new(LocalDocumentStore::remote(
+        app.storage.clone(),
+        workspace.binding(),
+    ));
+    let session = app.state.session.id.to_string();
+    let reference = store.create_plan(store.project_key(), &session).unwrap();
+    store
+        .write(
+            store.project_key(),
+            Some(&session),
+            &LocalDocumentRef::Plan(reference.clone()),
+            HANDOFF_PLAN_CONTENT,
+        )
+        .unwrap();
+    app.workspace_session = Some(workspace);
+    app.local_documents = Some(store);
+    app.state.mode = Mode::Plan;
+    app.state.applied_mode = Mode::Plan;
+    app.state.plan = PlanState::RemoteDrafting(reference);
+    app.transition_plan(PlanTrigger::WriteDone);
+    app
 }
 
 pub(crate) fn plan_app() -> App {
@@ -16957,20 +17120,23 @@ fn plan_form_menu_options(
         assert_eq!(app.state.mode, Mode::Plan);
         assert!(app.state.plan.is_ready());
         assert!(
-            matches!(&actions[..], [Action::ClearAndImplement(handoff)] if handoff.input.message == implement_msg(&app, false))
+            matches!(&actions[..], [Action::ClearAndImplement(handoff)] if handoff.input.message == implement_msg(&app, false, false))
         );
         return;
     }
     assert!(!app.plan_form.is_visible());
     assert_eq!(app.state.mode, expected_mode);
-    assert_eq!(app.state.plan, PlanState::None);
+    assert_eq!(
+        app.state.plan,
+        PlanState::Drafting(PathBuf::from(HANDOFF_PLAN_FILE))
+    );
     assert_eq!(
         actions
             .iter()
             .any(|a| matches!(a, Action::RequestNewSession)),
         has_new_session
     );
-    let expected_msg = implement_msg(&app, PlanForm::new().parallel());
+    let expected_msg = implement_msg(&app, false, PlanForm::new().parallel());
     assert_eq!(
         actions
             .iter()
@@ -16986,7 +17152,7 @@ fn plan_form_implement_toggled_parallel() {
     app.update(Msg::Key(key(KeyCode::Down)));
     app.update(Msg::Key(key(KeyCode::Down)));
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
-    let expected_msg = implement_msg(&app, !PlanForm::new().parallel());
+    let expected_msg = implement_msg(&app, false, !PlanForm::new().parallel());
     assert!(
         actions
             .iter()
@@ -16994,13 +17160,40 @@ fn plan_form_implement_toggled_parallel() {
     );
 }
 
+#[test_case(false, false ; "local")]
+#[test_case(false, true ; "local_parallel")]
+#[test_case(true, false ; "remote")]
+#[test_case(true, true ; "remote_parallel")]
+fn implement_message_names_the_plan_and_never_a_revision(remote: bool, parallel: bool) {
+    let mut app = if remote {
+        remote_plan_app()
+    } else {
+        plan_app()
+    };
+    if parallel {
+        app.update(Msg::Key(key(KeyCode::Char(' '))));
+    }
+    let expected = implement_msg(&app, remote, parallel);
+    let actions = app.implement_plan(false);
+    let message = actions
+        .iter()
+        .find_map(|action| match action {
+            Action::SendMessage(input) => Some(&input.message),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(*message, expected);
+    assert!(!message.contains(IMPLEMENT_REVISION));
+}
+
 #[test_case(false ; "implement")]
 #[test_case(true ; "clear_and_implement")]
-fn plan_handoff_captures_content_and_revision_before_consumption(clear: bool) {
+fn plan_handoff_captures_content_before_consumption(clear: bool) {
     let mut app = plan_app();
-    let expected = implement_msg(&app, false);
+    let expected = implement_msg(&app, false, false);
     let actions = app.implement_plan(clear);
-    PlanFile::new(Path::new(&app.state.session.cwd).join(HANDOFF_PLAN_FILE))
+    let path = Path::new(&app.state.session.cwd).join(HANDOFF_PLAN_FILE);
+    PlanFile::new(path.clone())
         .unwrap()
         .write(HANDOFF_PLAN_CHANGED)
         .unwrap();
@@ -17011,6 +17204,7 @@ fn plan_handoff_captures_content_and_revision_before_consumption(clear: bool) {
         assert!(app.plan_form.is_visible());
         assert!(app.state.plan.is_ready());
         app.reset_session_for_plan().unwrap();
+        app.adopt_plan(&handoff);
         app.finish_plan_handoff(*handoff)
     } else {
         actions
@@ -17024,7 +17218,43 @@ fn plan_handoff_captures_content_and_revision_before_consumption(clear: bool) {
         .unwrap();
     assert_eq!(input.message, expected);
     assert_eq!(input.mode, AgentMode::Build);
-    assert_eq!(app.state.plan, PlanState::None);
+    let plan = PlanState::Drafting(if clear {
+        path
+    } else {
+        PathBuf::from(HANDOFF_PLAN_FILE)
+    });
+    assert_eq!(input.plan, plan.target());
+    assert_eq!(app.state.plan, plan);
+}
+
+/// Implement leaves the session bound to its plan, drafting again, so a
+/// return to Plan revises the same document rather than starting another.
+#[test_case(false; "local")]
+#[test_case(true; "remote")]
+fn implement_keeps_the_session_plan_for_a_return_to_plan(remote: bool) {
+    let mut app = if remote {
+        remote_plan_app()
+    } else {
+        plan_app()
+    };
+    let planning = app.agent_mode();
+    let bound = app.state.plan.target();
+
+    let actions = app.implement_plan(false);
+
+    assert_eq!(sent_input(&actions).plan, bound);
+    assert_eq!(app.state.mode, Mode::Build);
+    assert_eq!(app.state.plan.target(), bound);
+    assert!(!app.state.plan.is_ready());
+    app.checkpoint();
+    assert!(app.state.session.meta.plan_target.is_some());
+    assert!(!app.state.session.meta.plan_written);
+
+    app.toggle_mode();
+
+    assert_eq!(app.state.mode, Mode::Plan);
+    assert_eq!(app.agent_mode(), planning);
+    assert_eq!(app.state.plan.target(), bound);
 }
 
 #[test_case(true, false; "reservation")]
@@ -17178,11 +17408,7 @@ fn native_plan_completion_uses_committed_authority(
                 .into(),
             )
         };
-        let written = PlanWriteResult::new(
-            target,
-            DocumentRevision::new("a".repeat(64)).unwrap(),
-            HANDOFF_PLAN_CONTENT.into(),
-        );
+        let written = PlanWriteResult::new(target, HANDOFF_PLAN_CONTENT.into());
         let mut done = ToolDoneEvent::error(COMMITTED_PLAN_CALL.into(), HANDOFF_PLAN_CONTENT);
         done.tool = plan::NAME.into();
         done.is_error = error;
@@ -17269,11 +17495,7 @@ fn batch_plan_completion_checks_authority(
             .into(),
         )
     };
-    let written = PlanWriteResult::new(
-        target,
-        DocumentRevision::new("a".repeat(64)).unwrap(),
-        HANDOFF_PLAN_CONTENT.into(),
-    );
+    let written = PlanWriteResult::new(target, HANDOFF_PLAN_CONTENT.into());
     let event = || {
         AgentEvent::BatchProgress(Box::new(BatchProgressEvent {
             id: COMMITTED_PLAN_CALL.into(),

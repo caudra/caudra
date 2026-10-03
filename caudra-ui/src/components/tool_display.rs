@@ -34,6 +34,7 @@ use crate::markdown::{LinkMap, expand_notice, should_truncate, text_to_painted};
 use caudra_agent::tools::native::peers::{
     LIST_NAME as LIST_SESSIONS_TOOL_NAME, SEND_NAME as SEND_MESSAGE_TOOL_NAME,
 };
+use caudra_agent::tools::native::plan;
 use caudra_agent::{
     ActivityChild, BatchToolStatus, BufferSnapshot, CallStage, IndexOutput, InstructionBlock,
     NO_FILES_FOUND, PeerOutput, ShellOutput, SnapshotSpan, SpanStyle, SubagentActivity,
@@ -346,7 +347,7 @@ const LIVE_SCRIPT_TOOLS: &[(&str, bool)] = &[
 /// it on `ToolDone`. The two are different documents rather than one drawn
 /// twice, so the swap is the card reporting progress, not the flicker the rule
 /// against a mismatched live draw exists to prevent. Leave it.
-const LIVE_MARKDOWN_TOOLS: &[&str] = &[MEMORY_TOOL_NAME, TASK_TOOL_NAME];
+const LIVE_MARKDOWN_TOOLS: &[&str] = &[MEMORY_TOOL_NAME, plan::NAME, TASK_TOOL_NAME];
 pub(super) const WRITING_PROMPT: &str = "Writing prompt";
 pub(super) const WRITING_COMMAND: &str = "Writing command";
 pub(super) const WRITING_SCRIPT: &str = "Writing script";
@@ -7096,6 +7097,7 @@ mod tests {
 
     #[test_case(TASK_TOOL_NAME ; "a_delegation")]
     #[test_case(MEMORY_TOOL_NAME ; "a_note")]
+    #[test_case(plan::NAME ; "a_plan")]
     fn a_document_body_is_drawn_as_one_before_it_settles(tool: &str) {
         assert!(
             draws_live_markdown(tool, HEADERLESS_EXTENSION),

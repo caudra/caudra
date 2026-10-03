@@ -1268,6 +1268,7 @@ mod tests {
                 input: Box::new(AgentInput {
                     message: text,
                     mode: app.execution_agent_mode(),
+                    plan: None,
                     images: Vec::new(),
                     mentions: Vec::new(),
                     commits: Vec::new(),

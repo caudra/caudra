@@ -5,6 +5,7 @@ use caudra_agent::permissions::{
     CONFINED_READ_AUTHORITY, PermissionCaution, PermissionRequest, PermissionResourceKind,
     PermissionSubject, PromptReason, ResourceCoverage, RuleOrigin,
 };
+use caudra_agent::tools::native::plan;
 
 use super::PermissionPrompt;
 use super::details::{mask_secrets, redact_url_query, review_lines, review_text};
@@ -172,11 +173,13 @@ pub(super) fn is_shell(request: &PermissionRequest) -> bool {
 }
 
 /// The literal request a prompt asks about: the command line with its own
-/// line breaks, the URL, the paths, or the tool and its arguments.
+/// line breaks, the URL, the paths, or the tool and its arguments. A remote
+/// plan's reference means nothing to a person, so it is named by what it is.
 pub(super) fn action_lines(request: &PermissionRequest) -> Vec<String> {
     if is_shell(request) {
         return review_lines(&requested_action(request));
     }
+    let session_plan = plan::is_plan_subject(&request.subject);
     let paths: Vec<String> = request
         .resources
         .iter()
@@ -186,6 +189,9 @@ pub(super) fn action_lines(request: &PermissionRequest) -> Vec<String> {
             }
             PermissionResourceKind::Url => Some(review_text(&redact_url_query(&resource.value))),
             PermissionResourceKind::Query => Some(review_text(&resource.value)),
+            PermissionResourceKind::Custom { .. } if session_plan => {
+                Some(plan::SESSION_PLAN_LABEL.into())
+            }
             _ => None,
         })
         .collect();

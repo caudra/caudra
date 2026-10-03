@@ -257,6 +257,7 @@ mod tests {
         Role, ThinkingSupport,
     };
     use caudra_storage::thinking::StoredThinking;
+    use caudra_workspace::PlanRef;
     use std::collections::HashMap;
     use test_case::test_case;
 
@@ -282,6 +283,9 @@ mod tests {
     const STORED_LEVEL_LOST: &str = "a level the session stored outranks the remembered one";
     const LEVEL_KEPT: &str = "a model that cannot reason must not be sent a level";
     const FIXTURE_REASONS: &str = "the fixture must be a model that cannot reason";
+    const BOUND_PLAN_FILE: &str = "bound-plan.md";
+    const BOUND_PLAN_TEXT: &str = "# Bound plan";
+    const BOUND_PLAN_REF: &str = "plan-bound";
 
     fn resumed(session: AppSession, model: &Model) -> SessionState {
         let tmp = tempfile::tempdir().unwrap();
@@ -445,6 +449,44 @@ mod tests {
 
         assert_eq!(state.model.spec(), fallback.spec());
         assert_eq!(state.session.model, fallback.spec());
+    }
+
+    /// A session keeps its plan through Implement, so one saved in Build
+    /// comes back bound to the same plan, drafting or ready as stored.
+    #[test_case(false, false; "local_drafting")]
+    #[test_case(false, true; "local_ready")]
+    #[test_case(true, false; "remote_drafting")]
+    #[test_case(true, true; "remote_ready")]
+    fn a_build_session_restores_its_plan(remote: bool, written: bool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(tmp.path().to_path_buf());
+        let path = tmp.path().join(BOUND_PLAN_FILE);
+        std::fs::write(&path, BOUND_PLAN_TEXT).unwrap();
+        let reference = PlanRef::new(BOUND_PLAN_REF).unwrap();
+        let mut session = make_plan_session(Some(StoredMode::Build), None);
+        session.meta.plan_target = Some(if remote {
+            StoredPlanTarget::PlanRef {
+                reference: reference.clone(),
+            }
+        } else {
+            StoredPlanTarget::LocalPath {
+                path: path.to_string_lossy().into_owned(),
+            }
+        });
+        session.meta.plan_written = written;
+        let expected = match (remote, written) {
+            (false, false) => PlanState::Drafting(path),
+            (false, true) => PlanState::Ready(path),
+            (true, false) => PlanState::RemoteDrafting(reference),
+            (true, true) => PlanState::RemoteReady(reference),
+        };
+
+        let state =
+            SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
+
+        assert_eq!(state.mode, Mode::Build);
+        assert_eq!(state.plan, expected);
+        assert!(state.warnings.is_empty());
     }
 
     #[test]

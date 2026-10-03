@@ -133,7 +133,7 @@ use caudra_agent::mentions;
 use caudra_agent::permissions::{PermissionManager, PermissionPolicyError};
 use caudra_agent::prompt::profile::PromptProfileCatalog;
 use caudra_agent::tools::ToolAudience;
-use caudra_agent::tools::native::plan;
+use caudra_agent::tools::native::plan::{self, PlanTarget};
 use caudra_agent::types::{BACKGROUND_EVENT_RUN_ID, WorkflowProvenance};
 use caudra_agent::{
     AgentEvent, AgentInput, AgentMode, CommitRef, Envelope, GoalVerdict, HistorySnapshot,
@@ -174,6 +174,7 @@ use ratatui::layout::Position;
 
 pub(crate) use crate::agent::QueuedMessage;
 pub use crate::components::RestoreMode;
+use mode::PLAN_COPY_FAILED;
 pub(crate) use mode::{Mode, PlanState, PlanTrigger};
 use mouse::Autoscroll;
 #[cfg(test)]
@@ -223,6 +224,7 @@ const STEER_NOT_CONSUMED_MSG: &str = "Task finished before it consumed the messa
 const REVIEW_READY_MSG: &str = "Review notes added to the prompt";
 const REVIEW_UNAVAILABLE_MSG: &str = "Nothing to review here yet";
 const SHELL_PASTE_EXPANDED_MSG: &str = "Expanded pasted text; press Enter again to run it";
+const IMPLEMENT_VERB: &str = "Implement";
 const IMPLEMENT_MSG_PREFIX: &str = "Implement the plan";
 const IMPLEMENT_CAPTURE_FAILED: &str = "Cannot implement plan";
 const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign each subagent a separate module and restrict its tests to that module to avoid interference.";
@@ -371,6 +373,7 @@ pub enum KeyFocus {
 #[derive(PartialEq, Eq)]
 struct ToolsPreviewKey {
     mode: AgentMode,
+    session_plan: bool,
     chat_model: String,
     model: String,
     bindings: [Option<Binding>; ModelPurpose::ALL.len()],
@@ -3460,6 +3463,7 @@ impl App {
         let input = AgentInput {
             message: text.clone(),
             mode: AgentMode::Build,
+            plan: self.state.plan.target(),
             images,
             mentions,
             commits,
@@ -4453,9 +4457,9 @@ impl App {
             }
         }
 
-        let active_plan = subagent_id.is_none()
-            && envelope.task.is_none()
-            && self.execution_agent_mode() == self.agent_mode_for(Mode::Plan);
+        let main_agent = subagent_id.is_none() && envelope.task.is_none();
+        let active_plan =
+            main_agent && self.execution_agent_mode() == self.agent_mode_for(Mode::Plan);
         let mut plan_write = None;
         if let AgentEvent::ToolDone(ref mut e) = envelope.event {
             let native_plan = &*e.tool == plan::NAME;
@@ -4480,12 +4484,10 @@ impl App {
                 self.discard_pending_delegations_under(&e.id);
             }
             if native_plan {
-                if active_plan
+                if main_agent
                     && let Some(plan) = committed_plan
-                    && self.accepts_plan_write(&plan)
+                    && self.take_plan_write(&plan)
                 {
-                    self.reload_committed_plan(&plan);
-                    self.transition_plan(PlanTrigger::WriteDone);
                     plan_write = Some((e.id.clone(), plan));
                 }
             } else if active_plan
@@ -4748,9 +4750,8 @@ impl App {
 
         let result = match result {
             ChatEventResult::PlanWritten(plan) => {
-                if active_plan && self.accepts_plan_write(&plan) {
-                    self.reload_committed_plan(&plan);
-                    self.transition_plan(PlanTrigger::WriteDone);
+                if main_agent {
+                    self.take_plan_write(&plan);
                 }
                 return vec![];
             }
@@ -5906,6 +5907,7 @@ impl App {
         };
         adjust_model_for_inspection(&mut model);
         let key = ToolsPreviewKey {
+            session_plan: mode.has_session_plan(self.state.plan.target().as_ref()),
             mode,
             chat_model: self.state.model.spec(),
             model: model.spec(),
@@ -5939,6 +5941,7 @@ impl App {
                 &self.state.model,
                 &key.thinking,
                 &key.mode,
+                key.session_plan,
                 &key.cwd,
                 messages.as_deref().unwrap_or_default(),
             )));
@@ -6409,17 +6412,13 @@ impl App {
                 return vec![];
             }
         };
-        let parallel = self.plan_form.parallel();
-        let header = format!(
-            "{IMPLEMENT_MSG_PREFIX} from `{}` (revision `{}`).{}",
-            snapshot.source,
-            snapshot.revision.as_str(),
-            if parallel {
-                format!(" {IMPLEMENT_PARALLEL_HINT}")
-            } else {
-                String::new()
-            }
-        );
+        let mut header = match &snapshot.target {
+            PlanTarget::Local(path) => format!("{IMPLEMENT_MSG_PREFIX} from `{}`.", path.display()),
+            PlanTarget::Remote(_) => format!("{IMPLEMENT_VERB} {}.", plan::SESSION_PLAN_LABEL),
+        };
+        if self.plan_form.parallel() {
+            header = format!("{header} {IMPLEMENT_PARALLEL_HINT}");
+        }
         let msg = QueuedMessage {
             text: format!("{header}\n\n{}", snapshot.content),
             images: Vec::new(),
@@ -6434,6 +6433,7 @@ impl App {
             content: snapshot.content,
             source: snapshot.source,
             header,
+            target: snapshot.target,
         };
         if clear_context {
             if let Err(error) = self.check_run_admission() {
@@ -6449,15 +6449,45 @@ impl App {
         self.finish_plan_handoff(handoff)
     }
 
+    /// For the session a Clear-and-Implement leaves behind: its plan goes
+    /// with the work, so it keeps none.
     pub(crate) fn consume_plan(&mut self) {
-        self.plan_form.reset();
         self.state.plan = PlanState::None;
+        self.leave_plan();
+    }
+
+    /// Back to Build with the plan drafting again: the session keeps it, and
+    /// a return to Plan revises the same document.
+    fn leave_plan(&mut self) {
+        self.plan_form.reset();
+        self.state.plan.mark_drafting();
         self.state.mode = Mode::Build;
     }
 
-    pub(crate) fn finish_plan_handoff(&mut self, handoff: PlanHandoff) -> Vec<Action> {
+    /// The session a Clear-and-Implement starts takes the plan over. A remote
+    /// one is copied, and a failed copy still lets the run start: its message
+    /// holds the plan.
+    pub(crate) fn adopt_plan(&mut self, handoff: &PlanHandoff) {
+        self.state.plan = match &handoff.target {
+            PlanTarget::Local(path) => PlanState::Drafting(path.clone()),
+            PlanTarget::Remote(_) => {
+                match self.create_remote_plan(self.state.session.id, &handoff.content) {
+                    Ok(reference) => PlanState::RemoteDrafting(reference),
+                    Err(error) => {
+                        self.flash(format!("{PLAN_COPY_FAILED}: {error}"));
+                        PlanState::None
+                    }
+                }
+            }
+        };
+    }
+
+    /// A Clear-and-Implement builds the handoff before the session is
+    /// replaced, so the input takes its plan from the session that runs it.
+    pub(crate) fn finish_plan_handoff(&mut self, mut handoff: PlanHandoff) -> Vec<Action> {
+        handoff.input.plan = self.state.plan.target();
         let actions = self.start_admitted_run(handoff.input, String::new());
-        self.consume_plan();
+        self.leave_plan();
         self.main_chat()
             .push(DisplayMessage::plan(handoff.content, handoff.source));
         self.main_chat().show_user_message(handoff.header);

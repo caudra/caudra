@@ -171,7 +171,7 @@ impl QueueItem {
 
     fn into_extracted_command(self, id: QueueItemId) -> ExtractedCommand {
         match self {
-            Self::Message { input, run_id, .. } => ExtractedCommand::Interrupt(*input, run_id, id),
+            Self::Message { input, run_id, .. } => ExtractedCommand::Interrupt(input, run_id, id),
             Self::Compact { run_id } => ExtractedCommand::Compact(run_id),
         }
     }
@@ -1209,6 +1209,7 @@ mod tests {
             input: Box::new(AgentInput {
                 message: String::new(),
                 mode,
+                plan: None,
                 images: Vec::new(),
                 mentions: Vec::new(),
                 commits: Vec::new(),

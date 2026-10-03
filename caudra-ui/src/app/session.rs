@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -38,6 +39,7 @@ use caudra_storage::worktrees::{self, CheckoutSessions};
 use crate::AppSession;
 
 use super::file_revert::{self, FileRevert, SETTLE_FAILED};
+use super::mode::PLAN_COPY_FAILED;
 use super::permission_editor::{
     ConversationPermissions, PERMISSION_WORKER_BUSY, attach_session_permissions,
 };
@@ -970,6 +972,8 @@ impl App {
         }
     }
 
+    /// The plan goes with the work, so the session left behind is saved
+    /// without it, and keeps it only if it is not left behind after all.
     pub(crate) fn reset_session_for_plan(&mut self) -> Result<Vec<Action>, String> {
         self.check_run_admission()?;
         let mut prepared = self.prepare_session_reset()?;
@@ -992,7 +996,9 @@ impl App {
                 }
             }
         }
+        let plan = mem::take(&mut self.state.plan);
         self.commit_session_reset(prepared, Mode::Build)
+            .inspect_err(|_| self.state.plan = plan)
     }
 
     pub(crate) fn discard_unstarted_session(&self, id: CaudraId) {
@@ -1277,27 +1283,12 @@ impl App {
                 Some(self.state.system_prompt_profile_name.clone())
             },
             mode: Some(self.state.mode.into()),
-            plan_path: self
-                .state
-                .plan
-                .path()
-                .map(|path| path.to_string_lossy().into_owned()),
-            plan_target: plan_target(&self.state.plan),
-            plan_written: self.state.plan.is_ready(),
             thinking: Some(self.state.thinking.clone().into()),
             fast: self.state.fast,
             unrecorded: self.state.session.meta.unrecorded.clone(),
             record_coverage: self.state.session.meta.record_coverage.clone(),
             ..SessionMeta::default()
         };
-        if matches!(
-            child.meta.plan_target,
-            Some(StoredPlanTarget::PlanRef { .. })
-        ) {
-            child.meta.plan_target = None;
-            child.meta.plan_path = None;
-            child.meta.plan_written = false;
-        }
         child.replace_messages(ancestor.clone());
         child.set_title(self.next_fork_title()?);
 
@@ -1456,6 +1447,17 @@ impl App {
                 })?;
         }
 
+        let (plan, warning) = match self.copy_plan(child.id) {
+            Ok(plan) => (plan, None),
+            Err(error) => (
+                PlanState::None,
+                Some(format!("{PLAN_COPY_FAILED}: {error}")),
+            ),
+        };
+        child.meta.plan_path = plan.path().map(|path| path.to_string_lossy().into_owned());
+        child.meta.plan_target = plan_target(&plan);
+        child.meta.plan_written = plan.is_ready();
+
         self.hold_records_for(child.id);
 
         Ok(ForkedSession {
@@ -1464,6 +1466,7 @@ impl App {
             draft: target
                 .draft
                 .map(|(text, images)| ForkDraft { text, images }),
+            warning,
         })
     }
 

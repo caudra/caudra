@@ -12,7 +12,8 @@ use crate::{
     template::Vars,
     tools::{
         BATCH_TOOL_NAME, FILE_APPLY_PATCH_TOOL_NAME, FILE_EDIT_TOOL_NAME, FILE_GREP_TOOL_NAME,
-        FILE_INDEX_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME, profile_policy::PLAN_TOOL_NAME,
+        FILE_INDEX_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME, native::plan::SESSION_PLAN_LABEL,
+        profile_policy::PLAN_TOOL_NAME,
     },
 };
 
@@ -26,8 +27,7 @@ const TASK_AUTO_GUIDANCE: &str = "Task calls default to foreground execution (ba
 const TASK_ASYNC_GUIDANCE: &str = "Task calls launch background work and return an admission receipt. Omit background or set it to true. Reports and final results arrive automatically, including after you end your turn.";
 const ASYNC_RESULT_GUIDANCE: &str = "An admission receipt is not completion or success. Continue independent work without duplicating pending work or concurrently editing the same files. Do not poll, sleep, or repeat a launch. If only pending work remains, state what is pending and return control without claiming completion. Later results arrive at a safe boundary; evaluate them against current user instructions and verify claims before continuing.";
 const LOCAL_PLAN_WRITE_TOOLS: &[&str] = &["file_write", "file_edit", "file_apply_patch"];
-const PLAN_TOOL_GUIDANCE: &str =
-    "Use `plan` with action `read` or `write` for the active plan; it needs no path or reference.";
+const PLAN_TOOL_GUIDANCE: &str = "Use `plan` with action `read` or `write` for the active plan; it needs no path or reference. It may already hold this session's earlier plan, so read it before revising.";
 const PLAN_UNAVAILABLE_GUIDANCE: &str = "No permitted plan-writing tool is available. Present the plan in your response and explain that it cannot be saved with the current profile.";
 const PLAN_SHELL_GUIDANCE: &str =
     "Use `shell` only for commands that observe. Never route a modification through it.";
@@ -37,7 +37,7 @@ const PLAN_RESEARCH_GUIDANCE: &str = "Investigate using only the available read-
 pub fn plan_mode_prompt(mode: &AgentMode, available: impl Fn(&str) -> bool) -> Option<String> {
     let target = match mode {
         AgentMode::Plan(path) => path.display().to_string(),
-        AgentMode::RemotePlan(reference) => format!("opaque plan reference {}", reference.as_str()),
+        AgentMode::RemotePlan(_) => SESSION_PLAN_LABEL.to_owned(),
         AgentMode::Build | AgentMode::ReadOnly => return None,
     };
     let plan_write_tools = if available(PLAN_TOOL_NAME) {
@@ -914,8 +914,8 @@ mod tests {
             AgentMode::Plan(ACTIVE_PLAN.into())
         };
         let rendered = plan_mode_prompt(&mode, |name| available.contains(&name)).unwrap();
-        assert!(rendered.contains(ACTIVE_PLAN));
-        assert_eq!(rendered.contains("opaque plan reference"), remote);
+        assert_eq!(rendered.contains(ACTIVE_PLAN), !remote);
+        assert_eq!(rendered.contains(SESSION_PLAN_LABEL), remote);
         for name in [PLAN_TOOL_NAME, SHELL_TOOL_NAME]
             .iter()
             .chain(LOCAL_PLAN_WRITE_TOOLS)
@@ -928,6 +928,10 @@ mod tests {
         assert_eq!(
             rendered.contains(PLAN_UNAVAILABLE_GUIDANCE),
             mentioned.iter().all(|name| *name == SHELL_TOOL_NAME)
+        );
+        assert_eq!(
+            rendered.contains(PLAN_TOOL_GUIDANCE),
+            mentioned.contains(&PLAN_TOOL_NAME)
         );
         for slot in ["{plan_path}", "{plan_write_tools}", "{plan_investigation}"] {
             assert!(!rendered.contains(slot), "{rendered}");

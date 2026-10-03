@@ -30,6 +30,7 @@ use crate::template::Vars;
 use crate::{AgentMode, BufferSnapshot, ToolInput, ToolOutput, ToolOutputLimits};
 
 use super::deferral::DeferredTool;
+use super::native::plan::PlanAccess;
 use super::{DescriptionContext, LockKey, ToolContext, ToolFilter};
 
 const CANCELLED_CODE: &str = "cancelled";
@@ -577,8 +578,8 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// Permission and mutation metadata belongs here because only the parsed call
 /// knows which authorities and files it will touch.
 pub trait ToolInvocation: Send + Sync {
-    fn writes_active_plan(&self) -> bool {
-        false
+    fn active_plan_access(&self) -> Option<PlanAccess> {
+        None
     }
 
     fn start_header(&self) -> HeaderFuture;
@@ -1142,7 +1143,7 @@ impl ToolRegistry {
             supports_examples,
             deferred,
             &ProfileToolPolicy::default(),
-            &AgentMode::Build,
+            false,
         )
     }
 
@@ -1153,7 +1154,7 @@ impl ToolRegistry {
         supports_examples: bool,
         deferred: &[&str],
         profile: &ProfileToolPolicy,
-        mode: &AgentMode,
+        session_plan: bool,
     ) -> ToolDefinitions {
         let snapshot = self.tools.load();
         let mut out = Vec::with_capacity(snapshot.len());
@@ -1163,7 +1164,7 @@ impl ToolRegistry {
                 entry,
                 ctx,
                 profile,
-                mode,
+                session_plan,
                 deferred.contains(&entry.name()),
             );
             if !decision.available() {
@@ -1206,14 +1207,20 @@ impl ToolRegistry {
         &self,
         ctx: &DescriptionContext,
         profile: &ProfileToolPolicy,
-        mode: &AgentMode,
+        session_plan: bool,
     ) -> ToolFilter {
         let filter = ToolFilter::Only(
             self.iter()
                 .iter()
                 .filter(|entry| {
-                    super::profile_policy::registered_decision(entry, ctx, profile, mode, false)
-                        .available()
+                    super::profile_policy::registered_decision(
+                        entry,
+                        ctx,
+                        profile,
+                        session_plan,
+                        false,
+                    )
+                    .available()
                 })
                 .map(|entry| entry.name().to_owned())
                 .collect(),

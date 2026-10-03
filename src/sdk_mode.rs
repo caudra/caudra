@@ -1096,6 +1096,7 @@ pub fn run(params: SdkParams) -> Result<()> {
                     let input = AgentInput {
                         message: prompt,
                         mode,
+                        plan: None,
                         images,
                         mentions,
                         commits,

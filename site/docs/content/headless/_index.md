@@ -93,7 +93,7 @@ Auto mode needs `experimental.decision_engine`. Without it, `--permission-mode a
 Two caveats:
 
 - One-shot `--print` always starts a **new** session in **build** mode, unlike the TUI, which opens in plan mode. Plan mode and session resume need the SDK path (or the TUI).
-- In embedded mode, the plan file for SDK `--permission-mode plan` is `./plan.md` under cwd rather than the state-dir `projects/<project-id>/plans/<slug>.md` files the TUI uses. Remote plans remain client-owned documents addressed by opaque reference.
+- In embedded mode, the plan file for SDK `--permission-mode plan` is `./plan.md` under cwd rather than the state-dir `projects/<project-id>/plans/<slug>.md` files the TUI uses. Remote plans remain client-owned documents addressed by opaque reference. A `--fork-session` fork starts without a plan.
 
 With a Workcell selector, SDK stream sessions handle text-only `/remote` recovery commands and standalone `cd` messages before model dispatch. Recovery responses have system subtype `remote` or `remote_error`. Directory changes return `cwd` or `cwd_error`. See [Remote Workspaces](/docs/remote-workspaces/#recovery-commands) for exact commands, acknowledgement requirements, and the no-retry policy. For recovery without a model session, use [`caudra remote`](/docs/cli/#caudra-remote).
 

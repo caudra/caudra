@@ -347,24 +347,18 @@ impl App {
             .reload_paths(written.iter().map(PathBuf::as_path));
     }
 
+    /// The `plan` tool's writes skip `reload_written`, so this is what brings
+    /// an open plan tab up to date. A remote tab reads the store back, because
+    /// its next save is checked against the revision kept there.
     pub(super) fn reload_committed_plan(&mut self, plan: &PlanWriteResult) {
-        let reference = match plan.target() {
+        match plan.target() {
             PlanTarget::Local(path) => {
                 self.bound_workbench_mut()
                     .replace_file(path, plan.content());
-                return;
             }
-            PlanTarget::Remote(reference) => reference,
-        };
-        let key = stored_key(&LocalDocumentRef::Plan(reference.clone()));
-        if self.stored_documents.get(&key).is_some_and(|document| {
-            document.session == self.state.session.id.to_string()
-                && &document.revision != plan.revision()
-        }) && self
-            .bound_workbench_mut()
-            .replace_document(&key, plan.content())
-        {
-            self.record_revision(&key, plan.revision().clone());
+            PlanTarget::Remote(reference) => {
+                self.refresh_stored(&stored_key(&LocalDocumentRef::Plan(reference.clone())));
+            }
         }
     }
 
@@ -480,7 +474,7 @@ mod tests {
         ToolAccounting, ToolDoneEvent, ToolOutput, ToolStartEvent,
     };
     use caudra_storage::StateDir;
-    use caudra_storage::local_documents::{DocumentRevision, LocalDocumentStore};
+    use caudra_storage::local_documents::LocalDocumentStore;
     use caudra_storage::plans::PlanFile;
     use caudra_workbench::{Layout as WorkbenchLayout, Workbench, keys as workbench_keys};
     use caudra_workspace::{LocalDocumentRef, MemoryRef};
@@ -492,9 +486,11 @@ mod tests {
         DRAFT_OTHER_COMPOSER, FLASH_NO_PLAN, LOCAL_SOURCE_OPEN, PLAN_NOT_WRITTEN, PLAN_UNSAVED,
         SHORT_REFERENCE, STORED_CHANGED, stored_key,
     };
+    use crate::app::mode::PLAN_COPY_FAILED;
     use crate::app::permission_editor::tests::workbench_workspace;
     use crate::app::tests::{
-        agent_msg, focused_task_composer, press_chord, private_tempdir, rendered, test_app,
+        agent_msg, focused_task_composer, press_chord, private_tempdir, rendered, sent_input,
+        test_app,
     };
     use crate::app::{App, KeyFocus, Mode, Msg, PlanState, PlanTrigger};
     use crate::components::keybindings::{Bind, key, leader};
@@ -546,6 +542,9 @@ mod tests {
     const OVERWRITTEN: &str = "a save undid a change the reader had not seen";
     const EDITS_LOST: &str = "the tab lost edits that were never saved";
     const STALE_NOTE: &str = "the open note missed the memory tool's rewrite";
+    const PLAN_NOT_ADOPTED: &str = "the new session did not take the plan over as its own";
+    const BLOCKED_STATE: &str = "not-a-directory";
+    const REMOTE_SESSION: &str = "a session in a remote workspace";
     const SEND: Bind = Bind::from_workbench(workbench_keys::SEND_TO_COMPOSER);
     const REVERT: Bind = Bind::from_workbench(workbench_keys::REVERT);
 
@@ -690,7 +689,7 @@ mod tests {
         }
 
         /// Writes `document` the way another writer would, behind its tab.
-        fn write(&self, document: &LocalDocumentRef, text: &str) -> DocumentRevision {
+        fn write(&self, document: &LocalDocumentRef, text: &str) {
             self.store
                 .write(
                     self.store.project_key(),
@@ -698,7 +697,7 @@ mod tests {
                     document,
                     text,
                 )
-                .expect(STORED)
+                .expect(STORED);
         }
 
         fn note(&self, text: &str) -> MemoryRef {
@@ -1112,6 +1111,9 @@ mod tests {
         );
     }
 
+    /// The write result names the plan and nothing more, so the tab takes the
+    /// store's copy, and a later save is held to what the store holds: a clean
+    /// tab saves over the rewrite it took, and an unsaved one is refused.
     #[test_case(false ; "a clean tab takes the rewrite")]
     #[test_case(true ; "an unsaved tab keeps its edits")]
     fn an_agent_rewrite_reaches_the_open_remote_plan(unsaved: bool) {
@@ -1123,15 +1125,12 @@ mod tests {
         remote.app.status = Status::Streaming;
         remote.app.run_id = 1;
 
-        let revision = remote.write(&plan, REWRITTEN_PLAN);
+        remote.write(&plan, REWRITTEN_PLAN);
         let LocalDocumentRef::Plan(reference) = &plan else {
             unreachable!()
         };
-        let written = PlanWriteResult::new(
-            PlanTarget::Remote(reference.clone()),
-            revision,
-            REWRITTEN_PLAN.into(),
-        );
+        let written =
+            PlanWriteResult::new(PlanTarget::Remote(reference.clone()), REWRITTEN_PLAN.into());
         remote.app.update(done(
             plan::NAME,
             Some(written.annotation().unwrap()),
@@ -1149,45 +1148,23 @@ mod tests {
             unsaved,
             "{EDITS_LOST}"
         );
-    }
 
-    #[test_case(false ; "clean")]
-    #[test_case(true ; "unsaved")]
-    fn native_plan_refresh_uses_committed_content_without_store_read(unsaved: bool) {
-        let (mut remote, document) = remote_plan(PLAN_TEXT);
-        open_plan(&mut remote.app);
         if unsaved {
-            type_edit(&mut remote.app);
-        }
-        let LocalDocumentRef::Plan(reference) = &document else {
-            unreachable!()
-        };
-        let revision = remote.write(&document, REWRITTEN_PLAN);
-        let result = PlanWriteResult::new(
-            PlanTarget::Remote(reference.clone()),
-            revision.clone(),
-            REWRITTEN_PLAN.into(),
-        );
-        remote.app.local_documents = None;
-        remote.app.status = Status::Streaming;
-        remote.app.run_id = 1;
-        remote.app.update(done(
-            plan::NAME,
-            Some(result.annotation().unwrap()),
-            Vec::new(),
-        ));
-        assert_eq!(rendered(&mut remote.app).contains(REWRITTEN_PLAN), !unsaved);
-        assert_eq!(
-            remote
-                .app
-                .workbench
-                .has_unsaved_document(&stored_key(&document)),
-            unsaved
-        );
-        if !unsaved {
+            save(app);
             assert_eq!(
-                remote.app.stored_documents[&stored_key(&document)].revision,
-                revision
+                app.status_bar.flash_text(),
+                Some(STORED_CHANGED),
+                "{WRONG_FLASH}"
+            );
+            assert_eq!(remote.text(&plan), REWRITTEN_PLAN, "{OVERWRITTEN}");
+        } else {
+            app.update(Msg::Key(press(KeyCode::Home)));
+            type_edit(app);
+            save(app);
+            assert_eq!(
+                remote.text(&plan),
+                format!("{EDIT}{REWRITTEN_PLAN}"),
+                "{NOT_STORED}"
             );
         }
     }
@@ -1204,11 +1181,7 @@ mod tests {
         if unsaved {
             type_edit(&mut app);
         }
-        let written = PlanWriteResult::new(
-            PlanTarget::Local(path.clone()),
-            DocumentRevision::new("a".repeat(64)).unwrap(),
-            REWRITTEN_PLAN.into(),
-        );
+        let written = PlanWriteResult::new(PlanTarget::Local(path.clone()), REWRITTEN_PLAN.into());
         fs::remove_file(&path).unwrap();
         app.status = Status::Streaming;
         app.run_id = 1;
@@ -1225,18 +1198,63 @@ mod tests {
         assert!(!path.exists());
     }
 
+    /// Implements the open plan in place, then delivers the Build run's write
+    /// of it. The tab takes the write, while the plan stays in drafting, no
+    /// form opens, and no plan card takes the place of the call's own card.
+    fn assert_a_build_write_only_refreshes(app: &mut App, target: PlanTarget) {
+        assert!(!app.implement_plan(false).is_empty());
+        app.state.applied_mode = Mode::Build;
+        let plan = app.state.plan.clone();
+        let written = PlanWriteResult::new(target, REWRITTEN_PLAN.into());
+
+        app.update(done(
+            plan::NAME,
+            Some(written.annotation().unwrap()),
+            Vec::new(),
+        ));
+
+        assert!(rendered(app).contains(REWRITTEN_PLAN), "{STALE_PLAN}");
+        assert_eq!(app.state.plan, plan);
+        assert!(!app.state.plan.is_ready());
+        assert!(!app.plan_form.is_visible());
+        assert!(!app.main_chat().last_message_is_plan());
+    }
+
+    #[test]
+    fn a_build_write_only_refreshes_the_open_local_plan() {
+        let Planned {
+            plan,
+            mut app,
+            _dirs,
+        } = planned(Draft::Written);
+        open_plan(&mut app);
+        assert_a_build_write_only_refreshes(&mut app, PlanTarget::Local(plan));
+    }
+
+    #[test]
+    fn a_build_write_only_refreshes_the_open_remote_plan() {
+        let (mut remote, plan) = remote_plan(PLAN_TEXT);
+        open_plan(&mut remote.app);
+        remote.write(&plan, REWRITTEN_PLAN);
+        let LocalDocumentRef::Plan(reference) = plan else {
+            unreachable!()
+        };
+        assert_a_build_write_only_refreshes(&mut remote.app, PlanTarget::Remote(reference));
+    }
+
     #[test_case(false; "clean")]
     #[test_case(true; "unsaved")]
     fn batch_plan_refresh_follows_completion_order_not_roster_order(unsaved: bool) {
-        let (mut remote, document) = remote_plan(PLAN_TEXT);
-        open_plan(&mut remote.app);
+        let Planned {
+            plan: path,
+            mut app,
+            _dirs,
+        } = planned(Draft::Written);
+        open_plan(&mut app);
         if unsaved {
-            type_edit(&mut remote.app);
+            type_edit(&mut app);
         }
-        let LocalDocumentRef::Plan(reference) = &document else {
-            unreachable!()
-        };
-        let entry = |content: &str, digit: char| BatchToolEntry {
+        let entry = |content: &str| BatchToolEntry {
             tool: plan::NAME.into(),
             effect: ToolEffect::Mutating,
             summary: String::new(),
@@ -1245,22 +1263,18 @@ mod tests {
             raw_input: None,
             output: Some(ToolOutput::Markdown(TextOutput {
                 state: Some(
-                    PlanWriteResult::new(
-                        PlanTarget::Remote(reference.clone()),
-                        DocumentRevision::new(digit.to_string().repeat(64)).unwrap(),
-                        content.into(),
-                    )
-                    .annotation()
-                    .unwrap()
-                    .into(),
+                    PlanWriteResult::new(PlanTarget::Local(path.clone()), content.into())
+                        .annotation()
+                        .unwrap()
+                        .into(),
                 ),
                 ..content.into()
             })),
             annotation: None,
             model_suffix: None,
         };
-        let earlier = entry(EARLIER_PLAN, 'a');
-        let later = entry(REWRITTEN_PLAN, 'b');
+        let earlier = entry(EARLIER_PLAN);
+        let later = entry(REWRITTEN_PLAN);
         let output = ToolOutput::Batch {
             entries: vec![later.clone(), earlier.clone()],
             text: String::new(),
@@ -1272,55 +1286,38 @@ mod tests {
                 child.output = None;
             }
         }
-        remote.app.local_documents = None;
-        remote.app.status = Status::Streaming;
-        remote.app.run_id = 1;
-        remote
-            .app
-            .update(agent_msg(AgentEvent::ToolStart(Box::new(ToolStartEvent {
-                id: BATCH_PLAN_ID.into(),
-                tool: BATCH_TOOL_NAME.into(),
-                effect: ToolEffect::Orchestrator,
-                summary: String::new(),
-                annotation: None,
-                input: None,
-                raw_input: None,
-                output: Some(roster),
-                render_header: None,
-            }))));
+        fs::remove_file(&path).unwrap();
+        app.status = Status::Streaming;
+        app.run_id = 1;
+        app.update(agent_msg(AgentEvent::ToolStart(Box::new(ToolStartEvent {
+            id: BATCH_PLAN_ID.into(),
+            tool: BATCH_TOOL_NAME.into(),
+            effect: ToolEffect::Orchestrator,
+            summary: String::new(),
+            annotation: None,
+            input: None,
+            raw_input: None,
+            output: Some(roster),
+            render_header: None,
+        }))));
         for (index, entry) in [(1, earlier.clone()), (0, later.clone()), (1, earlier)] {
-            remote
-                .app
-                .update(agent_msg(AgentEvent::BatchProgress(Box::new(
-                    BatchProgressEvent {
-                        id: BATCH_PLAN_ID.into(),
-                        index,
-                        entry,
-                    },
-                ))));
+            app.update(agent_msg(AgentEvent::BatchProgress(Box::new(
+                BatchProgressEvent {
+                    id: BATCH_PLAN_ID.into(),
+                    index,
+                    entry,
+                },
+            ))));
         }
         let mut completed = ToolDoneEvent::error(BATCH_PLAN_ID.into(), "");
         completed.tool = BATCH_TOOL_NAME.into();
         completed.is_error = false;
         completed.output = output;
-        remote
-            .app
-            .update(agent_msg(AgentEvent::ToolDone(Box::new(completed))));
-        assert_eq!(rendered(&mut remote.app).contains(REWRITTEN_PLAN), !unsaved);
-        assert_eq!(
-            remote
-                .app
-                .workbench
-                .has_unsaved_document(&stored_key(&document)),
-            unsaved
-        );
-        if !unsaved {
-            assert_eq!(
-                &remote.app.stored_documents[&stored_key(&document)].revision,
-                later.plan_write_result().unwrap().revision()
-            );
-        }
-        let saved = &remote.app.state.session.tool_outputs()[BATCH_PLAN_ID];
+        app.update(agent_msg(AgentEvent::ToolDone(Box::new(completed))));
+        assert_eq!(rendered(&mut app).contains(REWRITTEN_PLAN), !unsaved);
+        assert_eq!(app.workbench.has_unsaved(&path), unsaved);
+        assert!(!path.exists());
+        let saved = &app.state.session.tool_outputs()[BATCH_PLAN_ID];
         let restored: ToolOutput =
             serde_json::from_str(&serde_json::to_string(saved).unwrap()).unwrap();
         let ToolOutput::Batch { entries, .. } = restored else {
@@ -1360,7 +1357,8 @@ mod tests {
     fn remote_plan_handoff_carries_content_across_sessions(clear: bool) {
         let (mut remote, plan) = remote_plan(PLAN_TEXT);
         let owner = remote.session();
-        let revision = remote.write(&plan, REWRITTEN_PLAN);
+        let bound = remote.app.state.plan.clone();
+        remote.write(&plan, REWRITTEN_PLAN);
         let actions = remote.app.implement_plan(clear);
         assert_eq!(
             matches!(actions.first(), Some(Action::ClearAndImplement(_))),
@@ -1371,26 +1369,20 @@ mod tests {
                 panic!("expected captured plan handoff");
             };
             assert!(remote.app.plan_form.is_visible());
-            assert!(handoff.input.message.contains(&owner));
             remote.app.reset_session_for_plan().unwrap();
+            remote.app.adopt_plan(&handoff);
             remote.app.finish_plan_handoff(*handoff)
         } else {
             actions
         };
-        let input = actions
-            .into_iter()
-            .find_map(|action| match action {
-                Action::SendMessage(input) => Some(input),
-                _ => None,
-            })
-            .unwrap();
+        let input = sent_input(&actions);
         assert_eq!(input.mode, AgentMode::Build);
         assert!(input.message.ends_with(REWRITTEN_PLAN));
-        assert!(input.message.contains(revision.as_str()));
+        assert!(input.message.contains(plan::SESSION_PLAN_LABEL));
         if let LocalDocumentRef::Plan(reference) = &plan {
-            assert!(input.message.contains(reference.as_str()));
+            assert!(!input.message.contains(reference.as_str()));
         }
-        assert_eq!(remote.app.state.plan, PlanState::None);
+        assert!(!input.message.contains(&owner));
         if clear {
             assert_ne!(remote.session(), owner);
             assert!(
@@ -1399,8 +1391,60 @@ mod tests {
                     .read(remote.store.project_key(), Some(&remote.session()), &plan,)
                     .is_err()
             );
-            assert!(input.message.ends_with(REWRITTEN_PLAN));
+            let PlanState::RemoteDrafting(copy) = &remote.app.state.plan else {
+                panic!("{PLAN_NOT_ADOPTED}");
+            };
+            let copy = LocalDocumentRef::Plan(copy.clone());
+            assert_ne!(copy, plan, "{PLAN_NOT_ADOPTED}");
+            assert_eq!(remote.text(&copy), REWRITTEN_PLAN, "{PLAN_NOT_ADOPTED}");
+        } else {
+            let mut kept = bound;
+            kept.mark_drafting();
+            assert_eq!(remote.app.state.plan, kept);
         }
+        assert_eq!(input.plan, remote.app.state.plan.target());
+    }
+
+    /// Without a copy the new session has no plan, but the work still starts:
+    /// its message holds the plan.
+    #[test_case(false ; "store_unavailable")]
+    #[test_case(true ; "copy_refused")]
+    fn a_failed_remote_plan_copy_still_starts_the_implementation(refused: bool) {
+        let (mut remote, _) = remote_plan(PLAN_TEXT);
+        let Some(Action::ClearAndImplement(handoff)) =
+            remote.app.implement_plan(true).into_iter().next()
+        else {
+            panic!("expected captured plan handoff");
+        };
+        remote.app.reset_session_for_plan().unwrap();
+        let temp = private_tempdir();
+        let blocked = temp.path().join(BLOCKED_STATE);
+        fs::write(&blocked, PLAN_TEXT).expect(WRITTEN);
+        remote.app.local_documents = refused.then(|| {
+            let workspace = remote.app.workspace_session.as_ref().expect(REMOTE_SESSION);
+            Arc::new(LocalDocumentStore::remote(
+                StateDir::from_path(blocked),
+                workspace.binding(),
+            ))
+        });
+
+        remote.app.adopt_plan(&handoff);
+        let actions = remote.app.finish_plan_handoff(*handoff);
+
+        let input = sent_input(&actions);
+        assert!(input.message.ends_with(PLAN_TEXT));
+        assert_eq!(input.plan, None);
+        assert_eq!(remote.app.state.plan, PlanState::None);
+        assert_eq!(remote.app.state.mode, Mode::Build);
+        assert_eq!(remote.app.status, Status::Streaming);
+        assert!(
+            remote
+                .app
+                .status_bar
+                .flash_text()
+                .is_some_and(|text| text.starts_with(PLAN_COPY_FAILED)),
+            "{WRONG_FLASH}"
+        );
     }
 
     #[test_case(false ; "implement")]

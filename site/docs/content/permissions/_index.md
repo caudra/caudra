@@ -386,7 +386,9 @@ Use [`caudra permissions discover`](/docs/cli/#discovering-patterns-from-history
 
 Selecting Plan while Build work runs does not change that work. A conflicting submission offers a choice to keep editing, queue in Plan, or stop the work first. See [Selecting Plan while work runs](/docs/queue/#selecting-plan-while-work-runs).
 
-The main agent's [`plan` tool](/docs/tools/#plan) can read or replace only the committed active plan target. Exact-target writes can receive scoped plan approval, but explicit denies, configured asks, and a default Deny still apply. Reads use normal permission checks. A profile can disable the tool, and tasks do not receive the parent's plan-write capability.
+The [`plan` tool](/docs/tools/#plan) works only on the session's own plan. The main agent can replace it in Plan and Build, and tasks can only read it. Exact-target writes can receive scoped plan approval in either mode, but explicit denies, configured asks, and a default Deny still apply. Reading the plan needs no approval in any mode, local or remote, and a default Deny does not block it. An explicit deny rule still refuses the read, and an explicit ask rule or a forced prompt still asks. A profile can disable the tool.
+
+A plan prompt asks `Allow reading the plan?` or `Allow changing the plan?`. It shows the path of a local plan and names a remote plan `this session's plan`.
 
 While plan mode is active, Caudra withholds the authority that would outlive the plan. Remembered project and global rules do not apply, and allows from `permissions.toml` do not apply. Deny and ask rules still apply, because they only restrict access.
 
@@ -398,6 +400,8 @@ With [YOLO mode](#yolo-mode) on, plan mode skips these prompts too. YOLO approve
 
 Reading this project's plans and memory notes never asks, in plan mode or any other mode. The file and code tools may read the `plans/` and `memories/` directories under `…/state/caudra/projects/<project-id>/` (see [Directory layout](/docs/configuration/#directory-layout)). The allowance covers reads only, and another project's documents still ask. A symlink inside those directories cannot carry a read outside them. Tools in a remote workspace run on another machine, so they get no such allowance.
 
+Listing and reading notes with the `memory` tool needs no approval either, local or remote. Writing or deleting a note goes through the normal checks.
+
 ## Read-only agents
 
 A read-only agent is a subagent that may not change anything: research tasks, `task` calls in plan mode, and every agent a workflow starts in `read-only` capability mode. Only audited host tools with safe call effects are eligible. Ordinary MCP and plugin tools are excluded. When an audited `shell` is available, Caudra judges each command line rather than the tool as a whole.
@@ -408,9 +412,9 @@ The confinement check resolves symlinks before it answers, so a link checked int
 
 A glob that [shell parsing](#shell-parsing) can check, such as `src/*`, is expanded the way Bash does by default before the check: `*` never crosses `/` and skips names that start with a dot. Every match must resolve inside the project. A glob counts only where its matches are paths to read: an operand of `ls`, `cat`, `head`, `tail`, `wc`, `du`, `file`, `stat`, `tree`, or `sort`, an operand after the pattern of `grep` or `rg`, or a path after `--` in a Git read, so `echo src/*` is not admitted. Expansion stops after 4096 directory entries or 1024 matches, and a glob past either limit is refused. A remote workspace refuses globs, because Caudra cannot list its files.
 
-A read-only agent's file tools can also read this project's plans and memory notes without asking, as described under [Plan mode](#plan-mode). A shell line reading them is refused, because they sit outside the project.
+A read-only agent's file tools can also read this project's plans and memory notes without asking, as described under [Plan mode](#plan-mode). A shell line reading them is refused, because they sit outside the project. A task can read the session plan with the `plan` tool but cannot replace it. An agent a workflow starts while the session is in Plan can read it too. One started in Build gets no plan.
 
-Profiles cannot relax this restriction. Safe lazy tools remain discoverable through `tool_search`, but loading a schema cannot grant write access or the main agent's active plan capability.
+Profiles cannot relax this restriction. Safe lazy tools remain discoverable through `tool_search`, but loading a schema cannot grant write access or the main agent's right to replace the plan.
 
 ## Stored rules
 

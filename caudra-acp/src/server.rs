@@ -24,6 +24,7 @@ use caudra_agent::permissions::{
     EngineFlag, PermissionAdvisory, PermissionAnswer, PermissionRequest as CaudraPermissionRequest,
 };
 use caudra_agent::prompt::profile::{BUILTIN_PROFILE_NAME, SystemPromptProfile};
+use caudra_agent::tools::native::plan::PlanTarget;
 use caudra_agent::tools::{
     LocalToolFn, LocalTools, QUESTION_TOOL_NAME, ToolEffect, ToolError, ToolFailure, ToolRegistry,
     typed_local_tool,
@@ -47,6 +48,7 @@ use caudra_storage::sessions::{
     PermissionMode, SessionError, SessionLease, StoredMode, StoredPlanTarget, StoredTokenUsage,
 };
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
+use caudra_workspace::LocalDocumentRef;
 use color_eyre::eyre::Context;
 use flume::{Receiver, Sender, WeakSender};
 use serde::Serialize;
@@ -95,6 +97,8 @@ struct SessionState {
     handle: InteractiveHandle,
     mcp: Option<McpHandle>,
     current_mode: AgentMode,
+    /// Outlives mode switches, so each return to Plan revises the same plan.
+    plan: Option<PlanTarget>,
     current_model: String,
     pending: PendingState,
     /// Resolves the relative paths an `@` mention names in a prompt.
@@ -103,11 +107,31 @@ struct SessionState {
     runtime: AcpRuntime,
 }
 
+impl SessionState {
+    fn switch_mode(&mut self, mode_id: &str) -> Result<(), AcpError> {
+        let mode = methods::mode_id_to_agent_mode_for_session(
+            mode_id,
+            &self.cwd,
+            self.runtime.workspace_session.as_ref(),
+            self.runtime.local_documents.as_deref(),
+            self.handle.session_id.as_str(),
+            self.plan.as_ref(),
+        )
+        .ok_or_else(|| AcpError::new(-32602, format!("unknown mode: {mode_id}")))?;
+        if let Some(plan) = mode.plan_target() {
+            self.plan = Some(plan);
+        }
+        self.current_mode = mode;
+        Ok(())
+    }
+}
+
 struct SessionInitialState {
     cwd: PathBuf,
     remote: bool,
     cost: Option<f64>,
     mode: AgentMode,
+    plan: Option<PlanTarget>,
     runtime: AcpRuntime,
 }
 
@@ -364,6 +388,7 @@ async fn new_session(
             remote,
             cost: None,
             mode: AgentMode::Build,
+            plan: None,
             runtime,
         },
     );
@@ -458,70 +483,13 @@ async fn load_session(
         &recorded_model,
         RESTORED_FAST,
     );
-    let restored_mode = match (
-        restored.mode,
+    let plan = restored_plan(
         restored.plan_target.as_ref(),
         restored.plan_path.as_deref(),
-    ) {
-        (Some(StoredMode::Plan), Some(StoredPlanTarget::PlanRef { reference }), _) => runtime
-            .workspace_session
-            .as_ref()
-            .zip(runtime.local_documents.as_ref())
-            .and_then(|(workspace, store)| {
-                store
-                    .read(
-                        workspace.binding().project().key(),
-                        Some(session_ref.as_str()),
-                        &caudra_workspace::LocalDocumentRef::Plan(reference.clone()),
-                    )
-                    .ok()
-                    .map(|_| AgentMode::RemotePlan(reference.clone()))
-            })
-            .unwrap_or(AgentMode::Build),
-        (Some(StoredMode::Plan), Some(StoredPlanTarget::LocalPath { path }), _)
-            if runtime.workspace_session.is_some() =>
-        {
-            runtime
-                .workspace_session
-                .as_ref()
-                .zip(runtime.local_documents.as_ref())
-                .and_then(|(workspace, store)| {
-                    store
-                        .adopt_legacy_plan(
-                            workspace.binding().project().key(),
-                            session_ref.as_str(),
-                            Path::new(path),
-                        )
-                        .ok()
-                })
-                .map(AgentMode::RemotePlan)
-                .unwrap_or(AgentMode::Build)
-        }
-        (Some(StoredMode::Plan), Some(StoredPlanTarget::LocalPath { path }), _)
-            if Path::new(path).is_file() =>
-        {
-            AgentMode::Plan(path.into())
-        }
-        (Some(StoredMode::Plan), None, Some(path)) if Path::new(path).is_file() => {
-            if let Some((workspace, store)) = runtime
-                .workspace_session
-                .as_ref()
-                .zip(runtime.local_documents.as_ref())
-            {
-                store
-                    .adopt_legacy_plan(
-                        workspace.binding().project().key(),
-                        session_ref.as_str(),
-                        Path::new(path),
-                    )
-                    .map(AgentMode::RemotePlan)
-                    .unwrap_or(AgentMode::Build)
-            } else {
-                AgentMode::Plan(path.into())
-            }
-        }
-        _ => AgentMode::Build,
-    };
+        &runtime,
+        &session_ref,
+    );
+    let restored_mode = restored_mode(restored.mode, plan.as_ref());
     let restored_mode_id = if restored_mode.is_planning() {
         methods::MODE_PLAN
     } else {
@@ -541,10 +509,57 @@ async fn load_session(
             remote,
             cost: restored_cost.billed,
             mode: restored_mode,
+            plan,
             runtime,
         },
     );
     Ok(AgentResponse::LoadSessionResponse(resp))
+}
+
+/// The stored plan if this session can still use it, whatever mode it was
+/// saved in: a remote plan it can read, a local plan file that exists, or a
+/// legacy local plan adopted into the remote workspace's document store.
+fn restored_plan(
+    target: Option<&StoredPlanTarget>,
+    legacy_path: Option<&str>,
+    runtime: &AcpRuntime,
+    session: &SessionRef,
+) -> Option<PlanTarget> {
+    let path = match target {
+        Some(StoredPlanTarget::PlanRef { reference }) => {
+            let workspace = runtime.workspace_session.as_ref()?;
+            return runtime
+                .local_documents
+                .as_ref()?
+                .read(
+                    workspace.binding().project().key(),
+                    Some(session.as_str()),
+                    &LocalDocumentRef::Plan(reference.clone()),
+                )
+                .ok()
+                .map(|_| PlanTarget::Remote(reference.clone()));
+        }
+        Some(StoredPlanTarget::LocalPath { path }) => Path::new(path),
+        None => Path::new(legacy_path?),
+    };
+    match &runtime.workspace_session {
+        Some(workspace) => runtime
+            .local_documents
+            .as_ref()?
+            .adopt_legacy_plan(workspace.binding().project().key(), session.as_str(), path)
+            .ok()
+            .map(PlanTarget::Remote),
+        None => path
+            .is_file()
+            .then(|| PlanTarget::Local(path.to_path_buf())),
+    }
+}
+
+fn restored_mode(stored: Option<StoredMode>, plan: Option<&PlanTarget>) -> AgentMode {
+    match (stored, plan) {
+        (Some(StoredMode::Plan), Some(plan)) => AgentMode::planning(plan.clone()),
+        _ => AgentMode::Build,
+    }
 }
 
 struct SessionStart {
@@ -934,6 +949,7 @@ fn install_session(
         handle,
         mcp,
         current_mode: initial.mode,
+        plan: initial.plan,
         current_model,
         pending,
         cwd: initial.cwd,
@@ -1027,6 +1043,7 @@ fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), Ac
     let input = AgentInput {
         message,
         mode: session.current_mode.clone(),
+        plan: session.plan.clone(),
         images,
         mentions,
         commits: Vec::new(),
@@ -1054,14 +1071,7 @@ fn handle_set_mode(
     let req: SetSessionModeRequest = parse_params(raw)?;
     let mode_str = req.mode_id.0.to_string();
     let session = srv.session.as_mut().ok_or_else(no_session)?;
-    session.current_mode = methods::mode_id_to_agent_mode_for_session(
-        &mode_str,
-        &session.cwd,
-        session.runtime.workspace_session.as_ref(),
-        session.runtime.local_documents.as_deref(),
-        session.handle.session_id.as_str(),
-    )
-    .ok_or_else(|| AcpError::new(-32602, format!("unknown mode: {mode_str}")))?;
+    session.switch_mode(&mode_str)?;
 
     let sid = SessionId::from(session.handle.session_id.to_string());
     session_update(
@@ -1484,6 +1494,7 @@ mod tests {
     use caudra_providers::{ContentBlock as MsgBlock, Role, TokenUsage};
     use caudra_storage::StateDir;
     use caudra_storage::sessions::Session;
+    use caudra_workspace::PlanRef;
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -1504,6 +1515,76 @@ mod tests {
     const ADVISORY_PROBABILITY: f64 = 0.875;
     const DELETE_CAUTION: &str = "Decision engine caution: May delete files (88%).";
     const UPLOAD_CAUTION: &str = "Decision engine caution: May upload or send data (88%).";
+    const PLAN_FILE: &str = "plan.md";
+    const PLAN_CONTENT: &str = "# Plan\nShip it.";
+    const REMOTE_PLAN_REF: &str = "plan-test";
+
+    fn stored_local_plan(path: &Path) -> StoredPlanTarget {
+        StoredPlanTarget::LocalPath {
+            path: path.to_string_lossy().into_owned(),
+        }
+    }
+
+    #[test]
+    fn plan_mode_reuses_the_session_plan_across_switches() {
+        let (mut server, _, _) = server_with_asks(permission_manager(), HashMap::new());
+        let session = server.session.as_mut().unwrap();
+        let plan = PlanTarget::Local(PathBuf::from(PLAN_FILE));
+        session.plan = Some(plan.clone());
+        for (mode_id, expected) in [
+            (methods::MODE_PLAN, AgentMode::planning(plan.clone())),
+            (methods::MODE_BUILD, AgentMode::Build),
+            (methods::MODE_PLAN, AgentMode::planning(plan.clone())),
+        ] {
+            session.switch_mode(mode_id).unwrap();
+            assert_eq!(session.current_mode, expected);
+            assert_eq!(session.plan.as_ref(), Some(&plan));
+        }
+    }
+
+    #[test_case(Some(StoredMode::Plan), true; "plan_session")]
+    #[test_case(Some(StoredMode::Build), false; "build_session")]
+    #[test_case(None, false; "unrecorded_mode")]
+    fn a_restored_local_plan_is_bound_in_any_mode(stored: Option<StoredMode>, planning: bool) {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join(PLAN_FILE);
+        std::fs::write(&path, PLAN_CONTENT).unwrap();
+        let session_ref = SessionRef::from(CaudraId::generate());
+        let plan = restored_plan(
+            Some(&stored_local_plan(&path)),
+            None,
+            &AcpRuntime::default(),
+            &session_ref,
+        );
+        assert_eq!(plan, Some(PlanTarget::Local(path.clone())));
+        let (mut server, _, _) = server_with_asks(permission_manager(), HashMap::new());
+        let session = server.session.as_mut().unwrap();
+        session.current_mode = restored_mode(stored, plan.as_ref());
+        session.plan = plan;
+        assert_eq!(session.current_mode.is_planning(), planning);
+        session.switch_mode(methods::MODE_PLAN).unwrap();
+        assert_eq!(session.current_mode, AgentMode::Plan(path));
+    }
+
+    #[test_case(true; "missing_local_file")]
+    #[test_case(false; "remote_plan_without_a_workspace")]
+    fn an_unusable_stored_plan_is_not_bound(local: bool) {
+        let temp = TempDir::new().unwrap();
+        let target = if local {
+            stored_local_plan(&temp.path().join(PLAN_FILE))
+        } else {
+            StoredPlanTarget::PlanRef {
+                reference: PlanRef::new(REMOTE_PLAN_REF).unwrap(),
+            }
+        };
+        let session_ref = SessionRef::from(CaudraId::generate());
+        let plan = restored_plan(Some(&target), None, &AcpRuntime::default(), &session_ref);
+        assert_eq!(plan, None);
+        assert_eq!(
+            restored_mode(Some(StoredMode::Plan), None),
+            AgentMode::Build
+        );
+    }
 
     fn advisory_request(flag: EngineFlag, probability: f64) -> PermissionRequest {
         let mut request = PermissionRequest::from_legacy(
@@ -1753,6 +1834,7 @@ mod tests {
                 handle,
                 mcp: None,
                 current_mode: AgentMode::Build,
+                plan: None,
                 current_model: String::new(),
                 pending: Arc::new(Mutex::new(Pending { prompt: None, asks })),
                 cwd: PathBuf::new(),

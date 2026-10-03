@@ -57,6 +57,7 @@ use crate::context::ContextPublisher;
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
 use crate::template::Vars;
+use crate::tools::native::plan::PlanTarget;
 use crate::workflow::WorkflowHandle;
 use crate::{
     AgentConfig, AgentMode, EventSender, SharedBuf, SubagentHistoryStore, SubagentProgress,
@@ -517,6 +518,9 @@ pub struct ToolContext {
     pub chat_model: Arc<Model>,
     pub event_tx: EventSender,
     pub mode: AgentMode,
+    /// The session's plan, which outlives planning. Read it through
+    /// [`ToolContext::session_plan`], where a planning mode's target wins.
+    pub plan: Option<PlanTarget>,
     /// The session this run belongs to. A subagent inherits its parent's,
     /// so a tool can always tell which conversation it is serving. `None`
     /// when there is no session at all, like the `caudra index` one-shot.
@@ -607,6 +611,17 @@ impl ToolContext {
         self.jobs
             .clone()
             .or_else(|| self.background.as_ref().map(|tasks| tasks.main_scope()))
+    }
+
+    /// The plan this context's tools act on and its children inherit: the
+    /// mode's own target while planning, the session binding otherwise.
+    pub fn session_plan(&self) -> Option<PlanTarget> {
+        self.mode.plan_target().or_else(|| self.plan.clone())
+    }
+
+    /// Whether [`Self::session_plan`] has one, without cloning it.
+    pub fn has_session_plan(&self) -> bool {
+        self.mode.has_session_plan(self.plan.as_ref())
     }
 
     pub fn mark_tool_result_repairable(&self) {
@@ -825,6 +840,7 @@ pub fn interpreter_ctx(
         chat_model: Arc::clone(&MODEL),
         event_tx: event_tx.clone(),
         mode: mode.clone(),
+        plan: None,
         session_id: None,
         workspace_session: None,
         remote_project_context: None,

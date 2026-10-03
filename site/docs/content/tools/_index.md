@@ -13,9 +13,11 @@ First-party file, web, shell, index, Python, and environment tools run through p
 
 Remote Workcell selection replaces the first-party execution backend. Startup requires the complete compatible catalog and workspace capabilities, even when a tool is disabled for the model. A missing or incompatible remote tool never falls back to local execution. This development feature requires a matching Workcell build beyond the current release pin. See [Remote Workspaces](/docs/remote-workspaces/).
 
-The single `plan` tool reads or replaces the active main-agent plan in local and remote workspaces. Use `{"action":"read"}` to read it or `{"action":"write","content":"Complete plan document"}` to replace it. It accepts no path, reference, or session selector and has no patch, approval, or mode-switch action. It is available only during the committed main-agent Plan invocation, subject to the selected profile and [permissions](/docs/permissions/#plan-mode). Selecting Plan in the composer does not change the authority of running work. A task does not inherit the parent's plan-write capability.
+The single `plan` tool reads or replaces this session's plan in local and remote workspaces. Use `{"action":"read"}` to read it or `{"action":"write","content":"Complete plan document"}` to replace it. It accepts no path, reference, or session selector and has no patch, approval, or mode-switch action. A session gets its plan the first time it enters Plan. The plan survives Implement and every mode switch, and returning to Plan revises the same document. The main agent can read and replace it in Plan and Build, subject to the selected profile and [permissions](/docs/permissions/#plan-mode). Tasks and other subagents, in the foreground or background, can only read it. An agent a workflow starts while the session is in Plan can read it too. One started in Build gets no plan. Without a session plan, `/tools` and `caudra tools` list `plan` as off with the reason `requires a session plan`.
 
-Successful plan writes retain the committed target, revision, and content for the plan card. Implement and Clear-and-Implement capture validated content and its revision before consuming the plan or clearing the session. They include the content in the model-visible Build request, so implementation does not require file tools to retrieve the plan. A capture failure leaves the plan available and does not start implementation.
+Implement and Clear-and-Implement capture the validated content before they switch to Build or clear the session. The model-visible Build request opens with "Implement the plan from `<path>`." for a local plan or "Implement this session's plan." for a remote one, followed by the content, so implementation does not need a tool call to read the plan. A capture failure leaves the plan available and does not start implementation.
+
+Clear-and-Implement moves the plan to the new session, and the old session keeps none. A local plan keeps its path. A remote plan is copied into a document the new session owns. If that copy fails, implementation still starts from the captured content and Caudra shows a warning.
 
 Secure plan storage currently requires a Unix client. Windows and other non-Unix clients return `UnsupportedPlatform` for secure plan storage operations. This applies to local plans and client-owned plans for remote workspaces, regardless of the Workcell server's platform.
 
@@ -336,7 +338,7 @@ Create or update a structured todo list to track tasks.
 
 ### `plan` <span class="badge">on demand</span> {#plan}
 
-Read or replace the active plan document. Use action='read' to inspect it or action='write' with the complete content to save it. Only the main agent in plan mode may use this tool. The target is supplied by the host; paths and references are not accepted. Saving does not approve the plan or switch modes.
+Read or replace this session's plan. Use action='read' to inspect it or action='write' with the complete content to save it. Any agent may read the plan; only the main agent may replace it. The target is supplied by the host; paths and references are not accepted. Saving does not approve the plan or switch modes.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

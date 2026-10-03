@@ -5,13 +5,11 @@ use caudra_config::{
 use serde_json::Value;
 use std::mem;
 
-use crate::AgentMode;
 use crate::mcp::McpSession;
 
 use super::{
     DescriptionContext, LocalToolEntry, LocalTools, RegisteredTool, TOOL_OUTPUT_TOOL_NAME,
-    ToolAudience, ToolContext, ToolDefinitions, ToolFilter, ToolRegistry, ToolSource,
-    deferral::DeferredTool,
+    ToolContext, ToolDefinitions, ToolFilter, ToolRegistry, ToolSource, deferral::DeferredTool,
 };
 
 pub const PROFILE_DISABLED: &str = "disabled by the selected profile";
@@ -21,7 +19,7 @@ pub const REQUIRED_INFRASTRUCTURE: &str = "required host infrastructure";
 pub const PROFILE_LOADING: &str = "selected profile loading policy";
 pub const LEGACY_LOADING: &str = "legacy loading policy";
 pub const PLAN_TOOL_NAME: &str = "plan";
-pub const PLAN_MODE_REQUIRED: &str = "requires active main-agent Plan mode";
+pub const PLAN_REQUIRED: &str = "requires a session plan";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolExposureDecision {
@@ -45,19 +43,18 @@ pub fn source_kind(source: &ToolSource) -> ProfileToolSource {
     }
 }
 
+/// `session_plan` says whether the actor has a session plan: its planning
+/// target, its binding, or the one a task inherited.
 pub fn registered_decision(
     entry: &RegisteredTool,
     ctx: &DescriptionContext,
     profile: &ProfileToolPolicy,
-    mode: &AgentMode,
+    session_plan: bool,
     legacy_lazy: bool,
 ) -> ToolExposureDecision {
     let source = source_kind(&entry.source);
-    if source == ProfileToolSource::Native
-        && entry.name() == PLAN_TOOL_NAME
-        && (!mode.is_planning() || ctx.audience != ToolAudience::MAIN)
-    {
-        return disabled(PLAN_MODE_REQUIRED);
+    if source == ProfileToolSource::Native && entry.name() == PLAN_TOOL_NAME && !session_plan {
+        return disabled(PLAN_REQUIRED);
     }
     if !entry.tool.audience().contains(ctx.audience)
         || (ctx.policy().is_read_only() && !entry.is_visible_in_read_only())
@@ -170,6 +167,7 @@ pub fn configure_definitions(definitions: &mut ToolDefinitions, ctx: &ToolContex
         .cloned()
         .unwrap_or_default();
     let deferred = mem::take(&mut definitions.deferred);
+    let session_plan = ctx.has_session_plan();
     let mut eager = Vec::new();
     for (definition, was_lazy, group) in declared
         .into_iter()
@@ -197,7 +195,7 @@ pub fn configure_definitions(definitions: &mut ToolDefinitions, ctx: &ToolContex
                     workflows_available: ctx.workflow.is_some(),
                 },
                 &ctx.profile_tool_policy,
-                &ctx.mode,
+                session_plan,
                 was_lazy,
             )
         } else {
@@ -266,7 +264,7 @@ pub fn tool_available(
                 workflows_available: ctx.workflow.is_some(),
             },
             &ctx.profile_tool_policy,
-            &ctx.mode,
+            ctx.has_session_plan(),
             false,
         )
         .available();
@@ -286,6 +284,7 @@ pub fn tool_available(
 
 #[cfg(test)]
 mod tests {
+    use crate::tools::native::plan::PlanTarget;
     use crate::tools::{
         DeferralSession, DescriptionContext, TOOL_SEARCH_TOOL_NAME, ToolAudience, ToolDefinitions,
         ToolEffect, ToolFilter, ToolRegistry, ToolSource, audited_local_tool,
@@ -374,7 +373,7 @@ mod tests {
             false,
             if lazy { &[] } else { &[READ] },
             &policy,
-            &AgentMode::Build,
+            false,
         );
         assert_eq!(
             split.deferred.iter().any(|tool| tool.name.as_ref() == READ),
@@ -382,26 +381,53 @@ mod tests {
         );
     }
 
-    #[test_case(AgentMode::Build, ToolAudience::MAIN, false; "build")]
-    #[test_case(AgentMode::ReadOnly, ToolAudience::MAIN, false; "readonly")]
-    #[test_case(AgentMode::Plan(PLAN_PATH.into()), ToolAudience::MAIN, true; "main_plan")]
-    #[test_case(AgentMode::Plan(PLAN_PATH.into()), ToolAudience::GENERAL_SUB, false; "child_plan")]
-    fn plan_exposure_requires_executing_main_target(
+    /// `bound` is the session binding a main agent carries or a task inherits.
+    #[test_case(true, AgentMode::Plan(PLAN_PATH.into()), false, ToolAudience::MAIN, true; "main_plan")]
+    #[test_case(true, AgentMode::Build, true, ToolAudience::MAIN, true; "main_build_with_binding")]
+    #[test_case(true, AgentMode::Build, false, ToolAudience::MAIN, false; "main_build_without_binding")]
+    #[test_case(true, AgentMode::ReadOnly, true, ToolAudience::RESEARCH_SUB, true; "task_with_inherited_plan")]
+    #[test_case(true, AgentMode::ReadOnly, false, ToolAudience::RESEARCH_SUB, false; "task_without_plan")]
+    #[test_case(false, AgentMode::Build, false, ToolAudience::MAIN, true; "custom_plan_needs_no_session_plan")]
+    fn plan_exposure_follows_the_session_plan(
+        native: bool,
         mode: AgentMode,
+        bound: bool,
         audience: ToolAudience,
         available: bool,
     ) {
         let mut ctx = stub_ctx(&mode);
         ctx.audience = audience;
+        ctx.plan = bound.then(|| PlanTarget::Local(PLAN_PATH.into()));
+        let source = if native {
+            NamedMock::source()
+        } else {
+            ToolSource::Lua {
+                plugin: CUSTOM.into(),
+                contract: CUSTOM.into(),
+                bundled: false,
+            }
+        };
         ctx.registry
             .register_audited(
                 Arc::new(NamedMock::new(super::PLAN_TOOL_NAME, ToolAudience::all())),
-                NamedMock::source(),
+                source,
                 ToolEffect::ReadOnly,
             )
             .unwrap();
         ctx.profile_tool_policy = profile(json!({"default":"eager"}));
+        let mut definitions = ToolDefinitions {
+            declared: json!([{"name":super::PLAN_TOOL_NAME,"input_schema":{"type":"object"}}]),
+            deferred: Vec::new(),
+        };
+        super::configure_definitions(&mut definitions, &ctx);
+
         assert_eq!(ctx.tool_available(super::PLAN_TOOL_NAME), available);
+        assert_eq!(
+            definitions
+                .available_filter()
+                .matches(super::PLAN_TOOL_NAME),
+            available
+        );
     }
 
     #[test_case("workflow", false; "feature_off")]
@@ -564,7 +590,7 @@ mod tests {
                 false,
                 &[],
                 &ctx.profile_tool_policy,
-                &ctx.mode,
+                ctx.has_session_plan(),
             );
             assert!(!split.available_filter().matches(WRITE));
             ctx.deferral = Some(DeferralSession::new(

@@ -19,7 +19,7 @@ The summary shows the active model and window size, estimated tokens grouped by 
 
 While Main is idle, the inventory previews the selected Plan or Build mode for the next user message. During an active turn, including a permission wait, it shows the committed execution mode and labels a different composer selection as pending. A task view uses that task's own snapshot. Queued messages and automatic continuations retain their captured or committed mode, so the idle preview does not change their tools or permissions. Opening `/tools` does not create a plan, load a tool, or change execution mode.
 
-The `plan` tool needs an active main-agent Plan target. Otherwise its row explains `requires active main-agent Plan mode`. In an eligible Plan view it can still be disabled by the selected profile or global restrictions. Preview token estimates belong to the labelled tool inventory and do not replace the `/context` request snapshot.
+The `plan` tool needs a session plan, which a session gets the first time it enters Plan. Without one, its row explains `requires a session plan`. With one, the selected profile or global restrictions can still disable it. Preview token estimates belong to the labelled tool inventory and do not replace the `/context` request snapshot.
 
 Press `g` to leave the inventory for what those tools have actually done, counted per session, per project, and across every run. See [Token Economy](/docs/token-economy/#what-the-tools-cost).
 

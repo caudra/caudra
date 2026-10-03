@@ -50,6 +50,7 @@ use caudra_agent::permissions::pattern_recognition::{
     PatternCandidate, RecognitionStats, RecognizerLimits,
 };
 use caudra_agent::tools::ToolFilter;
+use caudra_agent::tools::native::plan::PlanTarget;
 use caudra_agent::types::TodoItem;
 use caudra_agent::worktree::Request as WorktreeRequest;
 use caudra_config::ProfileToolPolicy;
@@ -91,6 +92,7 @@ pub struct PermissionAuthorityBinding {
 pub struct PermissionAuthoritySession {
     pub id: SessionRef,
     pub local_documents: Option<Arc<LocalDocumentStore>>,
+    pub plan: Option<PlanTarget>,
 }
 
 pub type PermissionAuthorityFactory = Arc<

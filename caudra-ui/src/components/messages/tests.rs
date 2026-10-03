@@ -15,6 +15,7 @@ use crate::components::tool_display::{
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{Selection, SelectionZone};
 use caudra_agent::commits::repo::CommitSummary;
+use caudra_agent::tools::native::plan;
 use caudra_agent::tools::{
     BATCH_TOOL_NAME, FILE_APPLY_PATCH_TOOL_NAME, FILE_EDIT_TOOL_NAME, FILE_GLOB_TOOL_NAME,
     FILE_GREP_TOOL_NAME, FILE_INDEX_TOOL_NAME, FILE_READ_TOOL_NAME, FILE_WRITE_TOOL_NAME,
@@ -2595,6 +2596,24 @@ fn a_streamed_note_draws_the_document_under_a_conjugated_header() {
     let shown = buffer_text(&render(&mut panel, 80, 24));
     assert!(shown.contains(CONJUGATED), "{shown}");
     assert!(shown.contains("Title"), "{shown}");
+    assert!(!shown.contains(HEADING.trim_end()), "{shown}");
+}
+
+/// A plan's header is its action, with no path to read an extension from, so
+/// the tool alone is what draws the arriving body as the document it becomes.
+#[test]
+fn a_streamed_plan_draws_the_document_under_its_action() {
+    const HEADER: &str = "write";
+    const TITLE: &str = "Title";
+    const HEADING: &str = "# Title\n";
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_pending(TOOL_ID.into(), plan::NAME);
+    panel.tool_input_preview(TOOL_ID, Some(HEADER.into()), None);
+    panel.tool_input_body(TOOL_ID, Some(HEADING.into()));
+
+    let shown = buffer_text(&render(&mut panel, 80, 24));
+    assert!(shown.contains(HEADER), "{shown}");
+    assert!(shown.contains(TITLE), "{shown}");
     assert!(!shown.contains(HEADING.trim_end()), "{shown}");
 }
 

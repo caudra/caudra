@@ -1060,13 +1060,8 @@ fn builtin_rows(
             };
             let mut report =
                 builtin_report(name, filter, cli_disallowed, &config.agent, model, deferral);
-            let decision = registered_decision(
-                entry,
-                &ctx,
-                policy,
-                &AgentMode::Build,
-                report.state == ToolState::Lazy,
-            );
+            let decision =
+                registered_decision(entry, &ctx, policy, false, report.state == ToolState::Lazy);
             if !matches!(decision.reason, CEILING_DISABLED | LEGACY_LOADING) {
                 report.reason = Some(decision.reason);
             }
@@ -1169,7 +1164,7 @@ fn inspection_definitions(
     config: &AgentConfig,
     model: &Model,
     policy: &ProfileToolPolicy,
-    mode: &AgentMode,
+    session_plan: bool,
 ) -> Result<ToolDefinitions> {
     policy
         .validate_bindings(registry.iter().iter().map(|entry| entry.name()))
@@ -1185,7 +1180,7 @@ fn inspection_definitions(
         model.supports_tool_examples(),
         &deferred,
         policy,
-        mode,
+        session_plan,
     );
     execution::configure_tools(
         &mut definitions.declared,
@@ -1373,15 +1368,8 @@ pub fn tools(cli: &Cli, enabled_only: bool, json: bool, names: bool, schemas: bo
         template::env_vars()
     };
     let vars = inspection_vars(vars, &profiles, &config, &model);
-    let definitions = inspection_definitions(
-        reg,
-        &vars,
-        &ctx,
-        &config.agent,
-        &model,
-        &policy,
-        &AgentMode::Build,
-    )?;
+    let definitions =
+        inspection_definitions(reg, &vars, &ctx, &config.agent, &model, &policy, false)?;
     let mcp = inspection_mcp(
         &cwd,
         runtime.is_remote(),
@@ -1635,8 +1623,15 @@ pub fn prompt(
         audience,
         workflows_available: false,
     };
-    let definitions =
-        inspection_definitions(reg, &vars, &ctx, &config.agent, &model, &policy, &mode)?;
+    let definitions = inspection_definitions(
+        reg,
+        &vars,
+        &ctx,
+        &config.agent,
+        &model,
+        &policy,
+        mode.has_session_plan(None),
+    )?;
     if tools {
         let mcp = inspection_mcp(
             &cwd,
@@ -1738,7 +1733,8 @@ mod auth_tests {
     use super::*;
     use caudra_agent::permissions::PermissionManager;
     use caudra_agent::tools::cli_tool_ctx;
-    use caudra_agent::tools::profile_policy::{PLAN_MODE_REQUIRED, PLAN_TOOL_NAME};
+    use caudra_agent::tools::native::plan::SESSION_PLAN_LABEL;
+    use caudra_agent::tools::profile_policy::{PLAN_REQUIRED, PLAN_TOOL_NAME};
     use caudra_config::{Effect, ExecutionMode, FeatureFlags, PermissionRule, RawConfig};
     use caudra_workcell::WorkcellHost;
     use tempfile::TempDir;
@@ -1963,7 +1959,7 @@ Title     default       provider/title\n"
             &config.agent,
             &model,
             &policy,
-            &AgentMode::Build,
+            false,
         )
         .unwrap();
         let rows = builtin_rows(
@@ -2019,7 +2015,7 @@ Title     default       provider/title\n"
 
     #[test_case("eager"; "eager")]
     #[test_case("lazy"; "lazy")]
-    fn tools_listing_explains_plan_mode_requirement(exposure: &str) {
+    fn tools_listing_explains_the_session_plan_requirement(exposure: &str) {
         let registry = ToolRegistry::new();
         caudra_agent::tools::native::register(&registry, FeatureFlags::default()).unwrap();
         let config = RawConfig::default().into_config(false).unwrap();
@@ -2040,7 +2036,7 @@ Title     default       provider/title\n"
             &config.agent,
             &model,
             &policy,
-            &AgentMode::Build,
+            false,
         )
         .unwrap();
         let rows = builtin_rows(
@@ -2054,13 +2050,13 @@ Title     default       provider/title\n"
         );
         let plan = rows.iter().find(|row| row.name == PLAN_TOOL_NAME).unwrap();
         assert_eq!(plan.state, ToolState::Off);
-        assert_eq!(plan.note, Some(PLAN_MODE_REQUIRED));
+        assert_eq!(plan.note, Some(PLAN_REQUIRED));
     }
 
     #[test_case(AgentMode::Build, ToolAudience::MAIN, false; "build")]
     #[test_case(AgentMode::Plan(PROMPT_PLAN_PATH.into()), ToolAudience::MAIN, true; "active_plan")]
     #[test_case(AgentMode::RemotePlan(PlanRef::new(PROMPT_PLAN_REFERENCE).unwrap()), ToolAudience::MAIN, true; "remote_plan")]
-    #[test_case(AgentMode::Plan(PROMPT_PLAN_PATH.into()), ToolAudience::RESEARCH_SUB, false; "task_cannot_use_parent_plan")]
+    #[test_case(AgentMode::ReadOnly, ToolAudience::RESEARCH_SUB, false; "task_without_session_plan")]
     fn inspection_plan_needs_an_active_target(
         mode: AgentMode,
         audience: ToolAudience,
@@ -2083,7 +2079,7 @@ Title     default       provider/title\n"
             &AgentConfig::default(),
             &Model::from_spec(BEST_SPEC).unwrap(),
             &policy,
-            &mode,
+            mode.has_session_plan(None),
         )
         .unwrap();
         assert_eq!(
@@ -2101,9 +2097,14 @@ Title     default       provider/title\n"
         if let Some(reminder) = reminder {
             assert_eq!(reminder.contains("`plan`"), available);
             assert_eq!(
-                reminder.contains(PROMPT_PLAN_REFERENCE),
+                reminder.contains(PROMPT_PLAN_PATH),
+                mode.plan_ref().is_none()
+            );
+            assert_eq!(
+                reminder.contains(SESSION_PLAN_LABEL),
                 mode.plan_ref().is_some()
             );
+            assert!(!reminder.contains(PROMPT_PLAN_REFERENCE));
             assert!(!reminder.contains("{plan_"));
             assert!(!reminder.contains("`shell`"));
             assert!(!reminder.contains("`file_write`"));
@@ -2142,7 +2143,7 @@ Title     default       provider/title\n"
             &config,
             &Model::from_spec(BEST_SPEC).unwrap(),
             &policy,
-            &AgentMode::Build,
+            false,
         )
         .unwrap();
         let task = definitions
@@ -2177,7 +2178,7 @@ Title     default       provider/title\n"
             &AgentConfig::default(),
             &Model::from_spec(BEST_SPEC).unwrap(),
             &policy,
-            &AgentMode::Build,
+            false,
         )
         .err()
         .unwrap();

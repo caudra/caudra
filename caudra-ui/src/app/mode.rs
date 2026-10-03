@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::agent::QueuedMessage;
+use crate::chat::plan_source;
 use crate::components::Status;
 use crate::components::status_bar::ModeLabel;
 use crate::theme;
@@ -10,7 +11,8 @@ use caudra_agent::{AgentInput, AgentMode, CommitRef, Mention, commits};
 use caudra_providers::ModelPurpose;
 use caudra_providers::model_registry;
 use caudra_storage::StateDir;
-use caudra_storage::local_documents::{DocumentRevision, LocalDocumentStore};
+use caudra_storage::id::CaudraId;
+use caudra_storage::local_documents::LocalDocumentStore;
 use caudra_storage::plans::{self, PlanFile};
 use caudra_workspace::{LocalDocumentRef, PlanRef, WorkspaceSession};
 use ratatui::style::{Color, Modifier, Style};
@@ -30,6 +32,7 @@ const TO_BUILD_SHORT_LABEL: &str = "[P\u{2192}B]";
 const PLAN_NOT_ACTIVE: &str = "The ready plan is not the executing plan";
 const PLAN_EMPTY: &str = "The plan has not been written yet";
 const PLAN_STORE_UNAVAILABLE: &str = "The plan document store is unavailable";
+pub(super) const PLAN_COPY_FAILED: &str = "Could not copy the plan to the new session";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
@@ -64,7 +67,7 @@ pub(crate) enum PlanState {
 pub(super) struct PlanSnapshot {
     pub content: String,
     pub source: String,
-    pub revision: DocumentRevision,
+    pub target: PlanTarget,
 }
 
 impl PlanState {
@@ -102,6 +105,17 @@ impl PlanState {
         matches!(self, Self::Ready(_) | Self::RemoteReady(_))
     }
 
+    /// The session's plan binding, drafting or ready.
+    pub(crate) fn target(&self) -> Option<PlanTarget> {
+        match self {
+            Self::None => None,
+            Self::Drafting(path) | Self::Ready(path) => Some(PlanTarget::Local(path.clone())),
+            Self::RemoteDrafting(reference) | Self::RemoteReady(reference) => {
+                Some(PlanTarget::Remote(reference.clone()))
+            }
+        }
+    }
+
     pub(crate) fn allocate_path(&mut self, storage: &StateDir, cwd: &Path) {
         if matches!(self, Self::None) {
             *self = Self::Drafting(
@@ -132,16 +146,31 @@ impl PlanState {
 }
 
 impl App {
-    pub(super) fn accepts_plan_write(&self, written: &PlanWriteResult) -> bool {
-        if self.execution_agent_mode() != self.agent_mode_for(Mode::Plan) {
-            return false;
-        }
-        match written.target() {
-            PlanTarget::Local(path) => self.state.plan.path().is_some_and(|target| {
-                target == path || Path::new(&self.state.session.cwd).join(target) == *path
+    /// Whether `target` is the plan this session is bound to. A local binding
+    /// may be relative to the session's directory.
+    fn is_session_plan(&self, target: &PlanTarget) -> bool {
+        match target {
+            PlanTarget::Local(path) => self.state.plan.path().is_some_and(|bound| {
+                bound == path || Path::new(&self.state.session.cwd).join(bound) == *path
             }),
             PlanTarget::Remote(reference) => self.state.plan.reference() == Some(reference),
         }
+    }
+
+    /// Takes in the main agent's write of the session plan, bringing an open
+    /// tab up to date. A write made while planning also readies the plan, and
+    /// the return says so, so the caller can show the plan card. A Build write
+    /// leaves readiness alone, and its tool card settles as the document.
+    pub(super) fn take_plan_write(&mut self, written: &PlanWriteResult) -> bool {
+        if !self.is_session_plan(written.target()) {
+            return false;
+        }
+        self.reload_committed_plan(written);
+        let planning = self.execution_agent_mode() == self.agent_mode_for(Mode::Plan);
+        if planning {
+            self.transition_plan(PlanTrigger::WriteDone);
+        }
+        planning
     }
 
     pub(super) fn capture_plan(&self) -> Result<PlanSnapshot, String> {
@@ -150,50 +179,101 @@ impl App {
         {
             return Err(PLAN_NOT_ACTIVE.into());
         }
-        let snapshot = match &self.state.plan {
-            PlanState::Ready(path) => {
-                let path = Path::new(&self.state.session.cwd).join(path);
-                let (content, revision) = PlanFile::new(path.clone())
-                    .and_then(|plan| plan.read())
-                    .map_err(|error| error.to_string())?;
-                PlanSnapshot {
-                    content,
-                    source: path.display().to_string(),
-                    revision,
-                }
+        let target = self
+            .plan_location()
+            .ok_or_else(|| PLAN_NOT_ACTIVE.to_owned())?;
+        let content = self.read_plan(&target)?;
+        if content.trim().is_empty() {
+            return Err(PLAN_EMPTY.into());
+        }
+        Ok(PlanSnapshot {
+            content,
+            source: plan_source(&target),
+            target,
+        })
+    }
+
+    /// The session's plan, a local path resolved against the session's
+    /// directory.
+    fn plan_location(&self) -> Option<PlanTarget> {
+        self.state.plan.target().map(|target| match target {
+            PlanTarget::Local(path) => {
+                PlanTarget::Local(Path::new(&self.state.session.cwd).join(path))
             }
-            PlanState::RemoteReady(reference) => {
-                let (workspace, store) = self
-                    .workspace_session
-                    .as_ref()
-                    .zip(self.local_documents.as_ref())
-                    .ok_or_else(|| PLAN_STORE_UNAVAILABLE.to_owned())?;
+            remote @ PlanTarget::Remote(_) => remote,
+        })
+    }
+
+    fn plan_store(&self) -> Result<(&WorkspaceSession, &LocalDocumentStore), String> {
+        self.workspace_session
+            .as_ref()
+            .zip(self.local_documents.as_deref())
+            .ok_or_else(|| PLAN_STORE_UNAVAILABLE.to_owned())
+    }
+
+    fn read_plan(&self, target: &PlanTarget) -> Result<String, String> {
+        match target {
+            PlanTarget::Local(path) => PlanFile::new(path.clone())
+                .and_then(|plan| plan.read())
+                .map_err(|error| error.to_string()),
+            PlanTarget::Remote(reference) => {
+                let (workspace, store) = self.plan_store()?;
                 store
                     .validate_binding(workspace.binding())
                     .map_err(|error| error.to_string())?;
-                let document = store
+                store
                     .read(
                         workspace.binding().project().key(),
                         Some(&self.state.session.id.to_string()),
                         &LocalDocumentRef::Plan(reference.clone()),
                     )
-                    .map_err(|error| error.to_string())?;
-                PlanSnapshot {
-                    content: document.content,
-                    source: format!(
-                        "plan reference {} from session {}",
-                        reference.as_str(),
-                        self.state.session.id
-                    ),
-                    revision: document.revision,
-                }
+                    .map(|document| document.content)
+                    .map_err(|error| error.to_string())
             }
-            _ => return Err(PLAN_NOT_ACTIVE.into()),
-        };
-        if snapshot.content.trim().is_empty() {
-            return Err(PLAN_EMPTY.into());
         }
-        Ok(snapshot)
+    }
+
+    /// A remote plan document belongs to one session, so a session taking
+    /// over another's plan gets a document of its own holding `content`.
+    pub(super) fn create_remote_plan(
+        &self,
+        owner: CaudraId,
+        content: &str,
+    ) -> Result<PlanRef, String> {
+        let (workspace, store) = self.plan_store()?;
+        store
+            .create_plan_with_content(
+                workspace.binding().project().key(),
+                &owner.to_string(),
+                content,
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    /// The session's plan copied into a new document for `owner`, drafting or
+    /// ready as this one is, so a fork revises a plan of its own.
+    pub(super) fn copy_plan(&self, owner: CaudraId) -> Result<PlanState, String> {
+        let Some(target) = self.plan_location() else {
+            return Ok(PlanState::None);
+        };
+        let content = self.read_plan(&target)?;
+        let mut copy = match target {
+            PlanTarget::Local(_) => PlanState::Drafting(
+                plans::create_plan_file(
+                    &self.storage,
+                    Path::new(&self.state.session.cwd),
+                    &content,
+                )
+                .map_err(|error| error.to_string())?,
+            ),
+            PlanTarget::Remote(_) => {
+                PlanState::RemoteDrafting(self.create_remote_plan(owner, &content)?)
+            }
+        };
+        if self.state.plan.is_ready() {
+            copy.mark_ready();
+        }
+        Ok(copy)
     }
 
     pub(crate) fn transition_plan(&mut self, trigger: PlanTrigger) {
@@ -372,6 +452,7 @@ impl App {
         AgentInput {
             message: msg.text.clone(),
             mode: self.agent_mode(),
+            plan: self.state.plan.target(),
             images: msg.images.clone(),
             mentions: msg.mentions.clone(),
             commits: msg.commits.clone(),
@@ -387,6 +468,7 @@ impl App {
         AgentInput {
             message: String::new(),
             mode: self.execution_agent_mode(),
+            plan: self.state.plan.target(),
             images: Vec::new(),
             mentions: Vec::new(),
             commits: Vec::new(),
@@ -456,7 +538,6 @@ mod tests {
     use caudra_agent::{AgentEvent, PromptAdmission, ToolDoneEvent};
     use caudra_providers::{ImageMediaType, ImageSource, Message};
     use caudra_storage::id::CaudraId;
-    use caudra_storage::local_documents::DocumentRevision;
     use caudra_storage::sessions::StoredMode;
     use caudra_workspace::{
         AuthenticatedPrincipalId, AuthorityIdentity, CwdHandle, ProjectIdentity, ProjectKey,
@@ -482,7 +563,6 @@ mod tests {
     const OTHER_REMOTE_PLAN: &str = "plan-other";
     const PLAN_WRITE_ID: &str = "plan-write";
     const PLAN_WRITTEN: &str = "wrote plan";
-    const PLAN_REVISION: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const RUN_ID: u64 = 1;
     const PROMPT: &str = "Review the implementation in Plan";
     const NEXT_PROMPT: &str = "Keep this queued work";
@@ -492,6 +572,7 @@ mod tests {
     const RICH_PASTE: &str = "first pasted line\nsecond pasted line\nthird pasted line";
     const IMAGE_DATA: &str = "dGVzdA==";
     const EXPECTED_SEND: &str = "expected one automatic continuation";
+    const EXPECTED_COMPOSED_SEND: &str = "expected the composed prompt to start a run";
     const EXPECTED_QUEUED_INPUT: &str = "expected the submitted Plan input in the queue";
 
     fn app_in_mode(mode: Mode) -> App {
@@ -532,13 +613,9 @@ mod tests {
             None => PlanTarget::Local(plan.path().unwrap().to_path_buf()),
         };
         event.annotation = Some(
-            PlanWriteResult::new(
-                target,
-                DocumentRevision::new(PLAN_REVISION).unwrap(),
-                PLAN_WRITTEN.into(),
-            )
-            .annotation()
-            .unwrap(),
+            PlanWriteResult::new(target, PLAN_WRITTEN.into())
+                .annotation()
+                .unwrap(),
         );
         AgentEvent::ToolDone(Box::new(event))
     }
@@ -836,6 +913,33 @@ mod tests {
                 .is_some_and(|text| text.contains(if goal { GOAL } else { MAILBOX_RESULT }))
         }));
         assert!(!app.mode_submission.is_open());
+    }
+
+    /// Composed and automatic runs alike name the session's plan, so a Build
+    /// run can still read and revise the plan the session drew up.
+    #[test_case(false; "local")]
+    #[test_case(true; "remote")]
+    fn build_runs_carry_the_session_plan(remote: bool) {
+        let mut app = app_in_mode(Mode::Build);
+        app.state.plan = drafting_plan(remote);
+        app.status = Status::Idle;
+        let bound = app.state.plan.target();
+        assert!(bound.is_some());
+
+        let actions = app.submit_or_queue(queued_message(PROMPT));
+        let [Action::SendMessage(composed)] = actions.as_slice() else {
+            panic!("{EXPECTED_COMPOSED_SEND}");
+        };
+        assert_eq!(composed.mode, AgentMode::Build);
+        assert_eq!(composed.plan, bound);
+
+        app.status = Status::Idle;
+        let actions = app.start_mailbox_run(vec![Message::synthetic(MAILBOX_RESULT.into())]);
+        let [Action::SendMessage(automatic)] = actions.as_slice() else {
+            panic!("{EXPECTED_SEND}");
+        };
+        assert_eq!(automatic.mode, AgentMode::Build);
+        assert_eq!(automatic.plan, bound);
     }
 
     #[test_case(Mode::Build, Mode::Plan, Status::Streaming, true; "active_build_to_plan")]

@@ -39,6 +39,7 @@ use crate::decisions::{DecisionContext, DecisionFeature, DecisionReceipt, Decisi
 use crate::prompt::PromptId;
 use crate::prompt::profile::SystemPromptProfile;
 use crate::tools::native::batch::{self, MAX_BATCH_SIZE};
+use crate::tools::native::plan::PlanTarget;
 use crate::tools::{
     BuiltinDeferral, Deadline, DeferredTool, DescriptionContext, FileReadTracker, LocalTools,
     ToolAudience, ToolContext, ToolFilter, ToolLive, deferral,
@@ -370,6 +371,8 @@ pub struct Subagent {
     tools: JsonValue,
     deferred: Vec<DeferredTool>,
     mode: AgentMode,
+    /// The parent's session plan, which this child may read but never write.
+    plan: Option<PlanTarget>,
     environment: Option<String>,
     mode_notice: Option<String>,
     thinking: ThinkingConfig,
@@ -643,6 +646,7 @@ impl Subagent {
                 resume,
                 message: message.unwrap_or_default(),
                 mode: self.mode.clone(),
+                plan: self.plan.clone(),
                 images: Vec::new(),
                 mentions: Vec::new(),
                 commits: Vec::new(),
@@ -970,7 +974,7 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
             workflows_available: false,
         },
         &profile_tool_policy,
-        &mode,
+        ctx.has_session_plan(),
     );
     let guidance = crate::prompt::execution_guidance(
         &ctx.config,
@@ -1008,7 +1012,7 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
             BuiltinDeferral::resolve(&ctx.config, &model),
         ),
         &profile_tool_policy,
-        &mode,
+        ctx.has_session_plan(),
     );
     crate::tools::execution::configure_tools(
         &mut definitions.declared,
@@ -1563,6 +1567,7 @@ fn build(
         tools: resolved.tools,
         deferred: resolved.deferred,
         mode: resolved.mode,
+        plan: ctx.session_plan(),
         environment: resolved.environment,
         mode_notice: resolved.mode_notice,
         thinking: resolved.thinking,
@@ -1624,8 +1629,10 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::agent::LoadedInstructions;
     use crate::agent::change_recording::ChangeRecorder;
     use crate::agent::change_recording::fixture::{FakeChanges, holder};
+    use crate::agent::task_runner::{HostExtras, ModelResolver, WorkflowHostContext};
     use crate::context::{
         ContextInventory, ContextKey, ContextReadiness, ContextSnapshot, ContextStore,
         ContextUsage, ContextWindow,
@@ -1634,6 +1641,7 @@ mod tests {
     use crate::prompt::EFFICIENT_TOOLS_LABEL;
     use crate::tools::BATCH_TOOL_NAME;
     use crate::tools::DEADLINE_EXCEEDED;
+    use crate::tools::native::plan::{NAME as PLAN_TOOL, PlanTool, WRITE_DENIED};
     use crate::tools::registry::Tool;
     use crate::tools::test_support::NamedMock;
     use crate::tools::{FILE_GREP_TOOL_NAME, TASK_TOOL_NAME};
@@ -1982,6 +1990,8 @@ mod tests {
     const REMOTE_CWD: &str = "remote/project";
     const REMOTE_PLATFORM: &str = "remote-os";
     const PLAN_PATH: &str = "plan.md";
+    const BOUND_PLAN: &str = "bound.md";
+    const PLAN_CONTENT: &str = "# Plan";
     const ENVIRONMENT_MISSING: &str = "a task must be told its environment";
     /// A real entry of `DEFERRED_BUILTIN_TOOLS`, so the split under test happens.
     const DEFERRED_TOOL: &str = "python_execution";
@@ -2413,6 +2423,115 @@ mod tests {
 
             assert_eq!(subagent.task_mode(), expected);
             subagent.close();
+        });
+    }
+
+    /// A child reads the plan its parent works on: the draft while the parent
+    /// plans, the session plan once it builds. A continued task inherits it
+    /// again, and the child's own context refuses a write before any
+    /// permission or storage work.
+    #[test_case(AgentMode::Plan(PLAN_PATH.into()), false; "plan_parent_task")]
+    #[test_case(AgentMode::Build, false; "build_parent_task")]
+    #[test_case(AgentMode::Build, true; "build_parent_generic")]
+    fn a_child_inherits_the_parents_session_plan(parent: AgentMode, generic: bool) {
+        smol::block_on(async {
+            let mut ctx = crate::tools::test_support::stub_ctx(&parent);
+            ctx.plan = Some(PlanTarget::Local(BOUND_PLAN.into()));
+            let expected = ctx.session_plan();
+            let mut child = if generic {
+                open_generic(&ctx, generic_options()).await.unwrap()
+            } else {
+                open_task(&ctx, task_options(None)).await.unwrap()
+            };
+            assert_eq!(child.plan, expected);
+
+            let child_ctx = ToolContext {
+                mode: child.mode.clone(),
+                plan: child.plan.clone(),
+                audience: child.params.audience,
+                ..ctx.clone()
+            };
+            let write = PlanTool
+                .parse(&json!({"action": "write", "content": PLAN_CONTENT}))
+                .unwrap();
+            let refusal = write.preflight(&child_ctx).await.unwrap_err();
+            assert_eq!(refusal.message, WRITE_DENIED);
+            child.close();
+
+            if !generic {
+                let mut options = task_options(None);
+                options.task_id = TaskIdentity::Continue(child.id().to_owned());
+                let mut continued = open_task(&ctx, options).await.unwrap();
+                assert_eq!(continued.plan, expected);
+                continued.close();
+            }
+        });
+    }
+
+    /// A task is offered `plan` exactly when it inherits a session plan, so
+    /// its own `/tools` view follows the parent's plan rather than its mode.
+    #[test_case(AgentMode::Plan(PLAN_PATH.into()), false, true; "plan_parent")]
+    #[test_case(AgentMode::Build, true, true; "bound_build_parent")]
+    #[test_case(AgentMode::Build, false, false; "unbound_build_parent")]
+    fn a_task_is_offered_the_plan_it_inherits(parent: AgentMode, bound: bool, offered: bool) {
+        smol::block_on(async {
+            let mut ctx = crate::tools::test_support::stub_ctx(&parent);
+            ctx.plan = bound.then(|| PlanTarget::Local(BOUND_PLAN.into()));
+            ctx.registry
+                .register_audited(
+                    Arc::new(PlanTool),
+                    NamedMock::source(),
+                    ToolEffect::Mutating,
+                )
+                .unwrap();
+            let mut child = open_task(&ctx, task_options(None)).await.unwrap();
+            let declared = child
+                .tools
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == PLAN_TOOL);
+            let deferred = child
+                .deferred
+                .iter()
+                .any(|tool| tool.name.as_ref() == PLAN_TOOL);
+            assert_eq!(declared || deferred, offered);
+            child.close();
+        });
+    }
+
+    /// A workflow host is built from session parameters, which carry no plan,
+    /// so what it launches inherits none even when its parent has one.
+    #[test]
+    fn a_workflow_agent_inherits_no_session_plan() {
+        smol::block_on(async {
+            let mut ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            ctx.plan = Some(PlanTarget::Local(BOUND_PLAN.into()));
+            let mut session = open_task(&ctx, task_options(None)).await.unwrap();
+            let model: ModelResolver = Arc::new({
+                let provider = Arc::clone(&ctx.provider);
+                let model = Arc::clone(&ctx.model);
+                move || (Arc::clone(&provider), Arc::clone(&model))
+            });
+            let host = WorkflowHostContext::from_agent_params(
+                &session.params,
+                HostExtras {
+                    mcp: None,
+                    loaded_instructions: LoadedInstructions::default(),
+                    user_response_rx: None,
+                },
+                model,
+                Arc::new(|| AgentMode::Build),
+                Arc::new(CancelMap::new()),
+            );
+            session.close();
+            let (event_tx, _event_rx) = flume::unbounded();
+            let launched = host
+                .tool_context(CancelToken::none(), EventSender::new(event_tx, 0), TOOL_ID)
+                .await
+                .unwrap();
+
+            assert_eq!(launched.session_plan(), None);
         });
     }
 

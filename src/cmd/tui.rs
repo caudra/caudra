@@ -1606,11 +1606,16 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                     audience: ToolAudience::MAIN,
                     workflows_available: config.features.enabled(Feature::Workflows),
                 };
-                let tool_filter = registry.profile_filter(&description, &profile, &mode);
+                let tool_filter = registry.profile_filter(
+                    &description,
+                    &profile,
+                    mode.has_session_plan(session.plan.as_ref()),
+                );
                 let context = Arc::new(PermissionEditorContext::new(PermissionEditorRuntime {
                     project,
                     tool_filter: tool_filter.clone(),
                     mode,
+                    plan: session.plan,
                     audience: ToolAudience::MAIN,
                     workspace,
                     session_id: Some(session.id),

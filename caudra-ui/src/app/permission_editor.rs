@@ -342,6 +342,7 @@ fn same_authority_session(
     right: &PermissionAuthoritySession,
 ) -> bool {
     left.id == right.id
+        && left.plan == right.plan
         && match (&left.local_documents, &right.local_documents) {
             (None, None) => true,
             (Some(left), Some(right)) => Arc::ptr_eq(left, right),
@@ -489,6 +490,7 @@ impl App {
         PermissionAuthoritySession {
             id: SessionRef::from(self.state.session.id),
             local_documents: self.local_documents.clone(),
+            plan: self.state.plan.target(),
         }
     }
 
@@ -1440,6 +1442,7 @@ pub(super) mod tests {
         PermissionResourceSelector, PluginRuleStore, StructuredPermissionEffect,
         VerifiedLocalSourceLocator,
     };
+    use caudra_agent::tools::native::plan::PlanTarget;
     use caudra_agent::tools::registry::{
         ParseError, RegisteredTool, Tool, ToolEffect, ToolInvocation, ToolSource, TrustedToolSource,
     };
@@ -1477,7 +1480,7 @@ pub(super) mod tests {
     use unicode_width::UnicodeWidthStr;
 
     use crate::app::Msg;
-    use crate::app::mode::Mode;
+    use crate::app::mode::{Mode, PlanState};
     use crate::app::sandbox::WORKBENCH_BUSY;
     use crate::app::tests::{pattern_suggestion_candidate, remote_workspace_session, test_app};
     use crate::components::buffer_text;
@@ -2919,6 +2922,8 @@ pub(super) mod tests {
         let reference = store
             .create_plan(workspace.binding().project().key(), session_id.as_str())
             .unwrap();
+        let bound = Some(PlanTarget::Remote(reference.clone()));
+        app.state.plan = PlanState::RemoteDrafting(reference.clone());
         let committed = if planning {
             AgentMode::RemotePlan(reference)
         } else {
@@ -2941,6 +2946,7 @@ pub(super) mod tests {
                     session.local_documents.as_ref().unwrap(),
                     &store
                 ));
+                assert_eq!(session.plan, bound);
                 observed.lock().unwrap().push(mode);
                 Ok(PermissionAuthorityBinding {
                     provider: authority(),

@@ -26,11 +26,11 @@ use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::tools::native::plan::PlanTarget;
+use crate::tools::native::plan::{PlanAccess, PlanTarget};
 use crate::tools::registry::{PermissionIntent, TrustedToolSource};
 
 use super::enforce::{
-    EvaluationContext, active_plan_write, contain_authority_to_the_plan, exact_local_plan_write,
+    EvaluationContext, active_plan_access, contain_authority_to_the_plan, exact_local_plan_write,
 };
 use super::pattern_matching::CompiledPattern;
 use super::policy::{
@@ -1281,37 +1281,38 @@ impl PermissionManager {
                 "Host analysis returned no resources",
             ));
         }
-        let verified_plan_write = lease
+        let exact_plan = lease
             .active_plan_target(authority)?
-            .map(|target| active_plan_write(&analysis.intent, input, &target))
+            .map(|target| active_plan_access(&analysis.intent, input, &target))
             .transpose()
             .map_err(|error| invalid(EditField::Resources, error))?
-            .unwrap_or(false);
-        let exact_plan_write = verified_plan_write
-            || exact_local_plan_write(
-                &analysis.tool,
-                &request.resources,
-                analysis.plan_path.as_deref(),
-            );
+            .or_else(|| {
+                exact_local_plan_write(
+                    &analysis.tool,
+                    &request.resources,
+                    analysis.plan_path.as_deref(),
+                )
+                .then_some(PlanAccess::Write)
+            });
         let evaluation = EvaluationContext {
             revision: *context,
             plan_scoped: scopes.plan_scoped,
             builtin_allows: authority.source.builtin_allows(),
             force_prompt: scopes.force_prompt
                 || scopes.plan_scoped
-                || (!exact_plan_write
+                || (exact_plan.is_none()
                     && request
                         .resources
                         .iter()
                         .any(|resource| resource.requires_prompt)),
             forced: scopes.force_prompt,
-            exact_plan_write,
+            exact_plan,
         };
         if scopes.plan_scoped {
             contain_authority_to_the_plan(&mut request);
         }
         let mut result = self.evaluate_permission_edit_example(preview, &request, &evaluation)?;
-        if !exact_plan_write
+        if exact_plan.is_none()
             && let Some(reason) = request
                 .resources
                 .iter()
@@ -2517,7 +2518,7 @@ mod tests {
 
     use crate::CancelToken;
     use crate::permissions::broker::PendingPermission;
-    use crate::permissions::enforce::tests::active_plan_fixture;
+    use crate::permissions::enforce::tests::{active_plan_fixture, active_plan_read};
     use crate::permissions::enforce::{
         CURRENT_DEFAULT_DENIES_REQUEST, CURRENT_POLICY_DENIES_REQUEST, EvaluationContext,
     };
@@ -2533,7 +2534,7 @@ mod tests {
         argument_constraint_matches, canonical_json_sha256, hex_encode,
     };
     use crate::tools::DescriptionContext;
-    use crate::tools::native::plan::{self, PlanTarget, PlanTool};
+    use crate::tools::native::plan::{self, PlanAccess, PlanTarget, PlanTool};
     use crate::tools::registry::{
         ParseError, PermissionIntent, RegisteredTool, Tool, ToolEffect, ToolInvocation, ToolSource,
         TrustedToolSource,
@@ -4205,7 +4206,7 @@ mod tests {
             builtin_allows: false,
             force_prompt: false,
             forced: false,
-            exact_plan_write: false,
+            exact_plan: None,
         };
         assert!(
             manager
@@ -4632,22 +4633,32 @@ mod tests {
         assert_eq!(locator.verify_current().is_ok(), !changed);
     }
 
-    #[test_case(DefaultEffect::Prompt, None, true, false; "verified_plan_is_allowed")]
-    #[test_case(DefaultEffect::Prompt, None, false, false; "name_without_verified_target_does_not_approve")]
-    #[test_case(DefaultEffect::Prompt, Some(Effect::Deny), true, false; "deny_blocks_verified_plan")]
-    #[test_case(DefaultEffect::Prompt, Some(Effect::Ask), true, false; "ask_prompts_verified_plan")]
-    #[test_case(DefaultEffect::Deny, None, true, false; "default_deny_blocks_verified_plan")]
-    #[test_case(DefaultEffect::Allow, None, true, true; "malformed_intent_is_not_shown_allowed")]
+    #[test_case(DefaultEffect::Prompt, None, true, false, PlanAccess::Write; "verified_plan_is_allowed")]
+    #[test_case(DefaultEffect::Prompt, None, false, false, PlanAccess::Write; "name_without_verified_target_does_not_approve")]
+    #[test_case(DefaultEffect::Prompt, Some(Effect::Deny), true, false, PlanAccess::Write; "deny_blocks_verified_plan")]
+    #[test_case(DefaultEffect::Prompt, Some(Effect::Ask), true, false, PlanAccess::Write; "ask_prompts_verified_plan")]
+    #[test_case(DefaultEffect::Deny, None, true, false, PlanAccess::Write; "default_deny_blocks_verified_plan")]
+    #[test_case(DefaultEffect::Allow, None, true, true, PlanAccess::Write; "malformed_intent_is_not_shown_allowed")]
+    #[test_case(DefaultEffect::Prompt, None, true, false, PlanAccess::Read; "verified_read_is_allowed")]
+    #[test_case(DefaultEffect::Deny, None, true, false, PlanAccess::Read; "default_deny_allows_verified_read")]
+    #[test_case(DefaultEffect::Prompt, None, false, false, PlanAccess::Read; "read_without_verified_target_prompts")]
+    #[test_case(DefaultEffect::Allow, Some(Effect::Deny), true, false, PlanAccess::Read; "deny_blocks_verified_read")]
+    #[test_case(DefaultEffect::Deny, Some(Effect::Ask), true, false, PlanAccess::Read; "ask_prompts_verified_read")]
+    #[test_case(DefaultEffect::Allow, None, true, true, PlanAccess::Read; "malformed_read_is_not_shown_allowed")]
     fn active_plan_example_preview_preserves_policy(
         default: DefaultEffect,
         effect: Option<Effect>,
         verified: bool,
         malformed: bool,
+        access: PlanAccess,
     ) {
         smol::block_on(async {
             for remote in [false, true] {
                 let (_temp, manager, provider, _publication) = manager();
-                let (_root, ctx, mut intent, input) = active_plan_fixture(remote).await;
+                let (_root, ctx, mut intent, mut input) = active_plan_fixture(remote).await;
+                if access == PlanAccess::Read {
+                    (intent, input) = active_plan_read(&ctx).await;
+                }
                 manager.set_project_with_config(
                     ctx.host_cwd.as_ref().unwrap(),
                     PermissionsConfig {
@@ -4664,7 +4675,10 @@ mod tests {
                     },
                 );
                 if malformed {
-                    intent.resources[0].access = Some(PermissionResourceAccess::Read);
+                    intent.resources[0].access = Some(match access {
+                        PlanAccess::Read => PermissionResourceAccess::Write,
+                        PlanAccess::Write => PermissionResourceAccess::Read,
+                    });
                 }
                 let registered = RegisteredTool {
                     tool: Arc::new(PlanTool),
@@ -4705,18 +4719,20 @@ mod tests {
                 }
                 let result = result.unwrap();
                 assert!(!result.matches_rule);
-                let expected = if effect == Some(Effect::Deny) {
-                    EffectivePolicyPreview::Denied(
+                let verified_read = verified && access == PlanAccess::Read;
+                let expected = match effect {
+                    Some(Effect::Deny) => EffectivePolicyPreview::Denied(
                         PermissionPolicyError(CURRENT_POLICY_DENIES_REQUEST.into()).to_string(),
-                    )
-                } else if default == DefaultEffect::Deny {
-                    EffectivePolicyPreview::Denied(
-                        PermissionPolicyError(CURRENT_DEFAULT_DENIES_REQUEST.into()).to_string(),
-                    )
-                } else if effect == Some(Effect::Ask) || !verified {
-                    EffectivePolicyPreview::Prompt
-                } else {
-                    EffectivePolicyPreview::AllowedByPolicy
+                    ),
+                    Some(Effect::Ask) => EffectivePolicyPreview::Prompt,
+                    _ if default == DefaultEffect::Deny && !verified_read => {
+                        EffectivePolicyPreview::Denied(
+                            PermissionPolicyError(CURRENT_DEFAULT_DENIES_REQUEST.into())
+                                .to_string(),
+                        )
+                    }
+                    _ if !verified => EffectivePolicyPreview::Prompt,
+                    _ => EffectivePolicyPreview::AllowedByPolicy,
                 };
                 assert_eq!(result.effective_policy, expected);
             }
@@ -4772,7 +4788,7 @@ mod tests {
                     builtin_allows: false,
                     force_prompt: forced,
                     forced,
-                    exact_plan_write: false,
+                    exact_plan: None,
                 }),
                 project: None,
                 context_revision: revision,

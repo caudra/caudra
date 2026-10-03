@@ -237,7 +237,7 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
         model.supports_tool_examples(),
         &[],
         &agent.profile_tool_policy,
-        &agent.mode,
+        agent.has_session_plan(),
     );
     let mut defs = definitions.declared;
     if let Some(defs) = defs.as_array_mut() {

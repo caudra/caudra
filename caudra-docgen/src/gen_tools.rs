@@ -1,5 +1,5 @@
-use caudra_agent::AgentMode;
 use caudra_agent::template::Vars;
+use caudra_agent::tools::profile_policy::PLAN_REQUIRED;
 use caudra_agent::tools::{
     DescriptionContext, ToolAudience, ToolFilter, ToolRegistry, ToolSource, feature_exclusions,
 };
@@ -13,7 +13,8 @@ use std::sync::Arc;
 use caudra_lua::{OptionType, PluginHost};
 
 const DATE_PLACEHOLDER: &str = "YYYY-MM-DD";
-const PLAN_PLACEHOLDER: &str = "<active plan document>";
+/// The reference documents `plan`, which is only offered with a session plan.
+const WITH_SESSION_PLAN: bool = true;
 
 const SECTIONS: &[(&str, &[&str])] = &[
     (
@@ -473,7 +474,7 @@ pub fn generate() -> String {
         false,
         &[],
         &ProfileToolPolicy::default(),
-        &AgentMode::Plan(PLAN_PLACEHOLDER.into()),
+        WITH_SESSION_PLAN,
     );
     let def_map: HashMap<String, &Value> = defs
         .declared
@@ -523,8 +524,9 @@ pub fn generate() -> String {
         "\nRemote Workcell selection replaces the first-party execution backend. Startup requires the complete compatible catalog and workspace capabilities, even when a tool is disabled for the model. A missing or incompatible remote tool never falls back to local execution. This development feature requires a matching Workcell build beyond the current release pin. See [Remote Workspaces](/docs/remote-workspaces/)."
     )
     .unwrap();
-    writeln!(out, "\nThe single `plan` tool reads or replaces the active main-agent plan in local and remote workspaces. Use `{{\"action\":\"read\"}}` to read it or `{{\"action\":\"write\",\"content\":\"Complete plan document\"}}` to replace it. It accepts no path, reference, or session selector and has no patch, approval, or mode-switch action. It is available only during the committed main-agent Plan invocation, subject to the selected profile and [permissions](/docs/permissions/#plan-mode). Selecting Plan in the composer does not change the authority of running work. A task does not inherit the parent's plan-write capability.").unwrap();
-    writeln!(out, "\nSuccessful plan writes retain the committed target, revision, and content for the plan card. Implement and Clear-and-Implement capture validated content and its revision before consuming the plan or clearing the session. They include the content in the model-visible Build request, so implementation does not require file tools to retrieve the plan. A capture failure leaves the plan available and does not start implementation.").unwrap();
+    writeln!(out, "\nThe single `plan` tool reads or replaces this session's plan in local and remote workspaces. Use `{{\"action\":\"read\"}}` to read it or `{{\"action\":\"write\",\"content\":\"Complete plan document\"}}` to replace it. It accepts no path, reference, or session selector and has no patch, approval, or mode-switch action. A session gets its plan the first time it enters Plan. The plan survives Implement and every mode switch, and returning to Plan revises the same document. The main agent can read and replace it in Plan and Build, subject to the selected profile and [permissions](/docs/permissions/#plan-mode). Tasks and other subagents, in the foreground or background, can only read it. An agent a workflow starts while the session is in Plan can read it too. One started in Build gets no plan. Without a session plan, `/tools` and `caudra tools` list `plan` as off with the reason `{PLAN_REQUIRED}`.").unwrap();
+    writeln!(out, "\nImplement and Clear-and-Implement capture the validated content before they switch to Build or clear the session. The model-visible Build request opens with \"Implement the plan from `<path>`.\" for a local plan or \"Implement this session's plan.\" for a remote one, followed by the content, so implementation does not need a tool call to read the plan. A capture failure leaves the plan available and does not start implementation.").unwrap();
+    writeln!(out, "\nClear-and-Implement moves the plan to the new session, and the old session keeps none. A local plan keeps its path. A remote plan is copied into a document the new session owns. If that copy fails, implementation still starts from the captured content and Caudra shows a warning.").unwrap();
     writeln!(out, "\nSecure plan storage currently requires a Unix client. Windows and other non-Unix clients return `UnsupportedPlatform` for secure plan storage operations. This applies to local plans and client-owned plans for remote workspaces, regardless of the Workcell server's platform.").unwrap();
     writeln!(out, "\nThe `memory` tool lists, reads, writes, and deletes named notes in local and remote workspaces. Writes replace the complete note. Remote notes stay on the client and cannot be edited through remote file tools. Workbench saves retain revision-conflict checks.").unwrap();
     write_disabling_section(&mut out);
@@ -577,8 +579,8 @@ static DATE_RE: std::sync::LazyLock<Regex> =
 #[cfg(test)]
 mod tests {
     use super::{
-        DATE_PLACEHOLDER, DATE_RE, SECTIONS, extract_default, extract_params, generate,
-        load_registry_with_builtins, redact_path,
+        DATE_PLACEHOLDER, DATE_RE, PLAN_REQUIRED, SECTIONS, extract_default, extract_params,
+        generate, load_registry_with_builtins, redact_path,
     };
     use serde_json::{Value, json};
     use std::collections::HashSet;
@@ -628,14 +630,19 @@ mod tests {
     }
 
     #[test]
-    fn plan_reference_preserves_active_target_and_named_memory() {
+    fn plan_reference_preserves_session_plan_and_named_memory() {
         const PLAN_HEADING: &str = "### `plan`";
         const PLAN_ANCHOR: &str = " {#plan}";
         const EXPECTED: &[&str] = &[
             "no path, reference, or session selector",
-            "committed main-agent Plan invocation",
+            "returning to Plan revises the same document",
+            "The main agent can read and replace it in Plan and Build",
+            "Tasks and other subagents, in the foreground or background, can only read it.",
+            PLAN_REQUIRED,
             "model-visible Build request",
+            "\"Implement this session's plan.\"",
             "A capture failure leaves the plan available",
+            "Clear-and-Implement moves the plan to the new session",
             "Windows and other non-Unix clients return `UnsupportedPlatform`",
             "The `memory` tool lists, reads, writes, and deletes named notes",
             "Workbench saves retain revision-conflict checks",

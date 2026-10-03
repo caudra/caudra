@@ -408,7 +408,7 @@ pub struct BuiltinToolsInput<'a> {
     pub filter: &'a ToolFilter,
     pub config: &'a AgentConfig,
     pub model: &'a Model,
-    pub mode: &'a AgentMode,
+    pub session_plan: bool,
     pub audience: ToolAudience,
     pub deferral: BuiltinDeferral,
     pub deferred: &'a [DeferredTool],
@@ -444,7 +444,7 @@ impl BuiltinToolsInput<'_> {
                         audience: self.audience,
                         workflows_available: true,
                     },
-                    self.mode,
+                    self.session_plan,
                 );
                 let (state, reason) = match report.state {
                     ToolState::On => (ContextBuiltinState::Declared, report.reason),

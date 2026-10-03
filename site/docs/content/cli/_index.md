@@ -438,7 +438,7 @@ A tool that is off carries the rule that turned it off: `--disallowed-tools`, `d
 
 A tool marked `lazy` is available and starts outside the request array. The model can discover it through `tool_search` or call it directly by its known name. Without profile loading overrides, a small or supply-unknown model defers eligible built-ins, while a known non-small model lists them `on` with the note `declared upfront on a known non-small model`. Explicit profile loading choices take precedence over those preferences. See [Tools loaded on demand](/docs/tools/#tools-loaded-on-demand).
 
-These commands inspect a fresh tool view rather than restoring an open session's loaded schemas. `caudra tools` uses Build mode, so `plan` is off with the reason `requires active main-agent Plan mode`. Use `caudra prompt --plan --tools` for a Plan preview. Inside a session, `/tools` provides a [mode-aware inventory](/docs/context/#inspect-the-active-window): selected mode while idle, committed mode during an active turn, and the task's own snapshot in a task view. Schemas and catalogs omit unavailable tools even when a profile requests them.
+These commands inspect a fresh tool view rather than restoring an open session's loaded schemas. `caudra tools` uses Build mode with no session, so `plan` is off with the reason `requires a session plan`. Use `caudra prompt --plan --tools` for a Plan preview. Inside a session, `/tools` provides a [mode-aware inventory](/docs/context/#inspect-the-active-window): selected mode while idle, committed mode during an active turn, and the task's own snapshot in a task view. Schemas and catalogs omit unavailable tools even when a profile requests them.
 
 ### `caudra skills`
 

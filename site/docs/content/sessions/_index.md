@@ -245,7 +245,7 @@ The menu offers:
 | Completed tool | Includes the call and result | Empty |
 | Incomplete tool call | Includes the call; history repair supplies an unavailable result | Empty |
 
-The child receives a new session ID and a title such as `Original title (fork #1)`. It copies the selected ancestor path, reachable tool outputs and subagent histories, and model and execution settings. It also holds the parent's [file change records](#file-revert), so the child can revert files too, and it copies no file data. Usage totals, goals, queues, pending revert state, conversation permission rules, and explicit YOLO state start clean.
+The child receives a new session ID and a title such as `Original title (fork #1)`. It copies the selected ancestor path, reachable tool outputs and subagent histories, and model and execution settings. It also holds the parent's [file change records](#file-revert), so the child can revert files too, and it copies no file data. It gets its own copy of the parent's [plan](/docs/tools/#plan), ready to implement if the parent's was. If that copy fails, the child starts without a plan and Caudra shows a warning. Usage totals, goals, queues, pending revert state, conversation permission rules, and explicit YOLO state start clean.
 
 Subtasks are different from user-created forks. They share the root conversation's permission rules. Resuming that root restores its rules, while `/new` starts a clean root.
 

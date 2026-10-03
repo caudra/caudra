@@ -561,9 +561,9 @@ impl InterruptSource for SteeringQueueReceiver {
             .collect::<Vec<_>>();
         match inputs.len() {
             0 => None,
-            1 => inputs
-                .pop()
-                .map(|queued| ExtractedCommand::Interrupt(queued.input, queued.run_id, queued.id)),
+            1 => inputs.pop().map(|queued| {
+                ExtractedCommand::Interrupt(Box::new(queued.input), queued.run_id, queued.id)
+            }),
             _ => Some(ExtractedCommand::InterruptBatch(inputs)),
         }
     }

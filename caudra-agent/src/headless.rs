@@ -64,6 +64,7 @@ use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedSlots;
 use crate::prompt::profile::{BUILTIN_PROFILE_NAME, PromptProfileCatalog, SystemPromptProfile};
 use crate::template;
+use crate::tools::native::plan::PlanTarget;
 use crate::tools::{
     BuiltinDeferral, DeferralSession, DeferredTool, DescriptionContext, FileReadTracker,
     LocalTools, PathLocks, ToolAudience, ToolDefinitions, ToolFilter, ToolRegistry, deferral,
@@ -369,22 +370,25 @@ impl SessionStore {
     }
 
     fn set_mode(&mut self, mode: &AgentMode) {
-        match mode {
-            AgentMode::Build => self.session.meta.mode = Some(StoredMode::Build),
-            AgentMode::Plan(path) => {
+        self.session.meta.mode = match mode {
+            AgentMode::Build => Some(StoredMode::Build),
+            AgentMode::Plan(_) | AgentMode::RemotePlan(_) => Some(StoredMode::Plan),
+            AgentMode::ReadOnly => return,
+        };
+    }
+
+    fn bind_plan(&mut self, plan: PlanTarget) {
+        let meta = &mut self.session.meta;
+        match plan {
+            PlanTarget::Local(path) => {
                 let path = path.to_string_lossy().into_owned();
-                self.session.meta.mode = Some(StoredMode::Plan);
-                self.session.meta.plan_path = Some(path.clone());
-                self.session.meta.plan_target = Some(StoredPlanTarget::LocalPath { path });
+                meta.plan_path = Some(path.clone());
+                meta.plan_target = Some(StoredPlanTarget::LocalPath { path });
             }
-            AgentMode::RemotePlan(reference) => {
-                self.session.meta.mode = Some(StoredMode::Plan);
-                self.session.meta.plan_path = None;
-                self.session.meta.plan_target = Some(StoredPlanTarget::PlanRef {
-                    reference: reference.clone(),
-                });
+            PlanTarget::Remote(reference) => {
+                meta.plan_path = None;
+                meta.plan_target = Some(StoredPlanTarget::PlanRef { reference });
             }
-            AgentMode::ReadOnly => {}
         }
     }
 
@@ -1179,7 +1183,7 @@ struct AgentSetup {
 
 struct TaskDescriptionContext<'a> {
     profile: Option<&'a SystemPromptProfile>,
-    mode: &'a AgentMode,
+    session_plan: bool,
     prompt_profiles: &'a PromptProfileCatalog,
     chat_model: &'a Model,
     thinking: &'a crate::ThinkingConfig,
@@ -1303,7 +1307,7 @@ fn tool_definitions(
             .profile
             .map(|profile| profile.tools().clone())
             .unwrap_or_default(),
-        task.mode,
+        task.session_plan,
     )
 }
 
@@ -1392,7 +1396,7 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
         false,
         TaskDescriptionContext {
             profile: params.system_prompt_profile.as_deref(),
-            mode: &mode,
+            session_plan: false,
             prompt_profiles: &params.prompt_profiles,
             chat_model: &params.model,
             thinking: &params.thinking,
@@ -1609,6 +1613,7 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
                 .run(AgentInput {
                     message: params.prompt,
                     mode,
+                    plan: None,
                     images: params.images,
                     mentions,
                     commits,
@@ -2173,7 +2178,7 @@ async fn spawn_prepared_session(
         workflows_available,
         TaskDescriptionContext {
             profile: params.system_prompt_profile.as_deref(),
-            mode: &AgentMode::Build,
+            session_plan: false,
             prompt_profiles: &params.prompt_profiles,
             chat_model: &model,
             thinking: &params.thinking,
@@ -2502,7 +2507,7 @@ async fn spawn_prepared_session(
                     break;
                 }
                 enum NextInput {
-                    Prompt(Result<AgentInput, flume::RecvError>),
+                    Prompt(Box<Result<AgentInput, flume::RecvError>>),
                     Workspace(Box<Result<WorkspaceChangeRequest, flume::RecvError>>),
                     Stop,
                     Background,
@@ -2516,7 +2521,7 @@ async fn spawn_prepared_session(
                         NextInput::Stop
                     },
                     futures_lite::future::or(
-                        async { NextInput::Prompt(input_rx.recv_async().await) },
+                        async { NextInput::Prompt(Box::new(input_rx.recv_async().await)) },
                         futures_lite::future::or(
                             async {
                                 NextInput::Workspace(Box::new(
@@ -2550,13 +2555,15 @@ async fn spawn_prepared_session(
                 let _turn = mode_route.turn.lock().await;
                 let automatic = matches!(next, NextInput::Background | NextInput::Workflow);
                 let mut input = match next {
-                    NextInput::Prompt(Ok(input)) => {
+                    NextInput::Prompt(received) => {
+                        let Ok(input) = *received else {
+                            break;
+                        };
                         if let Some(background) = &background {
                             background.rearm();
                         }
                         input
                     }
-                    NextInput::Prompt(Err(_)) => break,
                     NextInput::Stop => {
                         mode_route.control_epoch.fetch_add(1, Ordering::AcqRel);
                         stop_session_work(background.as_ref(), workflow.as_ref()).await;
@@ -2576,6 +2583,7 @@ async fn spawn_prepared_session(
                         AgentInput {
                             message: String::new(),
                             mode: mode.clone(),
+                            plan: None,
                             thinking: thinking.clone(),
                             fast: *fast,
                             images: Vec::new(),
@@ -2704,6 +2712,16 @@ async fn spawn_prepared_session(
                 if let Some(mode) = mode_route.mode.load_full() {
                     input.mode = (*mode).clone();
                 }
+                if input.plan.is_none()
+                    && let Some(store) = &*store.lock().await
+                {
+                    input.plan = store
+                        .session
+                        .meta
+                        .plan_target
+                        .as_ref()
+                        .map(PlanTarget::from);
+                }
                 if !automatic {
                     continuation = Some((input.mode.clone(), input.thinking.clone(), input.fast));
                 }
@@ -2775,6 +2793,7 @@ async fn spawn_prepared_session(
                     });
                 }
                 let input_mode = input.mode.clone();
+                let session_plan = input.session_plan();
                 let (trigger, cancel) = CancelToken::new();
                 *mode_route
                     .active
@@ -2960,7 +2979,7 @@ async fn spawn_prepared_session(
                     workflows_available,
                     TaskDescriptionContext {
                         profile: params.system_prompt_profile.as_deref(),
-                        mode: &input.mode,
+                        session_plan: input.has_session_plan(),
                         prompt_profiles: &params.prompt_profiles,
                         chat_model: &model,
                         thinking: &input.thinking,
@@ -3071,6 +3090,9 @@ async fn spawn_prepared_session(
                 let mut persisted = false;
                 if let Some(store) = &mut *store.lock().await {
                     store.set_mode(&input_mode);
+                    if let Some(plan) = session_plan {
+                        store.bind_plan(plan);
+                    }
                     if matches!(result, Ok(DoneReason::Cancelled)) {
                         store.kill_unfinished_subagents();
                     }
@@ -3342,12 +3364,16 @@ fn extract_tool_names(tools: &Value) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::fs::Permissions;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
     use caudra_providers::{
         AgentError, ProviderEvent, RequestOptions, StandingReminderKind, StopReason,
         StreamResponse, TaskEventOrigin,
     };
     use caudra_storage::background::TaskRecord;
-    use caudra_storage::local_documents::DocumentRevision;
     use caudra_storage::permission_state::PermissionRuleRecord;
     use caudra_storage::permission_state::mutation::{
         PermissionMutation, PermissionRecordIdentity, prepare_mutation,
@@ -3371,6 +3397,8 @@ mod tests {
     use crate::tools::registry::BoxFuture;
     use crate::tools::test_support::stub_ctx_with;
     use crate::tools::{PermissionScopes, TODOWRITE_TOOL_NAME};
+    #[cfg(unix)]
+    use crate::types::ToolDoneEvent;
     use crate::types::{TodoPriority, TodoStatus};
     use crate::workflow::store::WorkflowStore;
 
@@ -4446,7 +4474,6 @@ mod tests {
             done.annotation = Some(
                 PlanWriteResult::new(
                     PlanTarget::Remote(reference.clone()),
-                    DocumentRevision::new("c".repeat(64)).unwrap(),
                     PLANNING_PROMPT.into(),
                 )
                 .annotation()
@@ -4867,6 +4894,7 @@ complete(#{ report: first.output });
         provider: Arc<ScriptedProvider>,
         started: flume::Receiver<()>,
         features: FeatureFlags,
+        local_documents: Option<Arc<LocalDocumentStore>>,
     }
 
     impl WorkflowSession {
@@ -4894,6 +4922,7 @@ complete(#{ report: first.output });
                 }),
                 started,
                 features: FeatureFlags::all(),
+                local_documents: None,
                 _temp: temp,
             }
         }
@@ -4993,7 +5022,7 @@ complete(#{ report: first.output });
                 workspace_session: workspace,
                 remote_project_context: context,
                 host_cwd: None,
-                local_documents: None,
+                local_documents: self.local_documents.clone(),
             };
             spawn_prepared_session(
                 PreparedInteractive {
@@ -5465,6 +5494,101 @@ complete(#{ report: first.output });
         });
     }
 
+    #[cfg(unix)]
+    #[test_case(true; "after_a_plan_run")]
+    #[test_case(false; "without_a_plan")]
+    fn build_runs_receive_the_plan_the_session_stored(planned: bool) {
+        const WORKSPACE: &str = "stored-plan";
+        const PLAN_CONTENT: &str = "# Stored plan";
+        const PLAN_CALL: &str = "plan-read";
+        const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+        smol::block_on(async {
+            crate::tools::native::register(ToolRegistry::global(), FeatureFlags::all()).unwrap();
+            let mut session = WorkflowSession::new(false);
+            std::fs::set_permissions(
+                session.state_dir.persistent_path(),
+                Permissions::from_mode(PRIVATE_DIRECTORY_MODE),
+            )
+            .unwrap();
+            let (workspace, _) = crate::stored_session::tests::remote_workspace(WORKSPACE, "");
+            let store = Arc::new(LocalDocumentStore::remote(
+                session.state_dir.clone(),
+                workspace.binding(),
+            ));
+            let reference = store
+                .create_plan_with_content(
+                    store.project_key(),
+                    &session_id().to_string(),
+                    PLAN_CONTENT,
+                )
+                .unwrap();
+            session.local_documents = Some(store);
+            let handle = session.spawn_in(false, Some(workspace)).await;
+            if planned {
+                handle
+                    .set_mode(
+                        AgentMode::RemotePlan(reference.clone()),
+                        PermissionMode::Yolo,
+                    )
+                    .await
+                    .unwrap();
+                handle.input_tx.send(prompt(PROMPT)).unwrap();
+                wait_for_turn(&handle.event_rx).await;
+                handle
+                    .set_mode(AgentMode::Build, PermissionMode::Yolo)
+                    .await
+                    .unwrap();
+            }
+            let (responses, rx) = flume::unbounded();
+            *session.provider.responses.lock().unwrap() = Some(rx);
+            for (content, stop_reason) in [
+                (
+                    ContentBlock::tool_use(
+                        PLAN_CALL,
+                        plan::NAME,
+                        serde_json::json!({"action": "read"}),
+                    ),
+                    StopReason::ToolUse,
+                ),
+                (
+                    ContentBlock::Text {
+                        text: ANSWER.into(),
+                    },
+                    StopReason::EndTurn,
+                ),
+            ] {
+                responses
+                    .send(StreamResponse {
+                        message: Message {
+                            role: Role::Assistant,
+                            content: vec![content],
+                            ..Default::default()
+                        },
+                        stop_reason: Some(stop_reason),
+                        ..Default::default()
+                    })
+                    .unwrap();
+            }
+            handle.input_tx.send(prompt(SECOND_PROMPT)).unwrap();
+            let done = tool_done(&handle.event_rx, PLAN_CALL).await;
+            assert_eq!(done.is_error, !planned, "{:?}", done.output);
+            if planned {
+                assert!(
+                    done.output.as_text().contains(PLAN_CONTENT),
+                    "{:?}",
+                    done.output
+                );
+            }
+            wait_for_turn(&handle.event_rx).await;
+            shutdown_interactive(handle).await;
+            let stored = open_stored_session(session_id(), &session.state_dir).unwrap();
+            assert_eq!(
+                stored.meta.plan_target,
+                planned.then_some(StoredPlanTarget::PlanRef { reference })
+            );
+        });
+    }
+
     #[test_case(true; "interrupt_then_explicit_resume")]
     #[test_case(false; "plan_mode_then_explicit_start")]
     fn explicit_workflow_controls_rearm_without_model_requests_rearming(resume: bool) {
@@ -5751,6 +5875,18 @@ complete(#{ report: first.output });
         }
     }
 
+    #[cfg(unix)]
+    async fn tool_done(events: &Receiver<Envelope>, call: &str) -> ToolDoneEvent {
+        loop {
+            let envelope = events.recv_async().await.expect(EVENTS_CLOSED);
+            match envelope.event {
+                AgentEvent::ToolDone(done) if done.id == call => return *done,
+                AgentEvent::Error { message } => panic!("turn failed: {message}"),
+                _ => {}
+            }
+        }
+    }
+
     async fn wait_for_turn(events: &Receiver<Envelope>) {
         loop {
             let envelope = events.recv_async().await.expect(EVENTS_CLOSED);
@@ -5766,6 +5902,7 @@ complete(#{ report: first.output });
         AgentInput {
             message: message.into(),
             mode: AgentMode::Build,
+            plan: None,
             images: Vec::new(),
             mentions: Vec::new(),
             commits: Vec::new(),

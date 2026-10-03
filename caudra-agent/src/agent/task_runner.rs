@@ -46,6 +46,7 @@ use crate::subagent_history::{
     SubagentHistoryLease, SubagentHistoryStore, SubagentTaskMode, SubagentTaskSpecCandidate,
 };
 use crate::template::Vars;
+use crate::tools::native::plan::PlanTarget;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::{
     Deadline, FileReadTracker, LocalToolFn, LocalTools, PathLocks, ToolAudience, ToolContext,
@@ -611,6 +612,9 @@ pub struct WorkflowHostContext {
     pub loaded_instructions: LoadedInstructions,
     /// Read when each task starts; its answer caps that task.
     pub mode: ModeResolver,
+    /// The session binding launched agents inherit, captured with the rest.
+    /// A workflow host holds none.
+    pub plan: Option<PlanTarget>,
     /// The workflow runtime's own registrations, never the agent loop's.
     pub subagent_cancels: Arc<CancelMap<String>>,
     pub context_publisher: Option<ContextPublisher>,
@@ -667,6 +671,7 @@ impl WorkflowHostContext {
             task_environment: params.task_environment.clone(),
             loaded_instructions: extras.loaded_instructions,
             mode,
+            plan: None,
             subagent_cancels,
             context_publisher: params.context_publisher.clone(),
             user_response_rx: extras.user_response_rx,
@@ -709,6 +714,7 @@ impl WorkflowHostContext {
             task_environment: ctx.task_environment.clone(),
             loaded_instructions: ctx.loaded_instructions.clone(),
             mode,
+            plan: ctx.session_plan(),
             subagent_cancels,
             context_publisher: ctx.context_publisher.clone(),
             user_response_rx: ctx.user_response_rx.clone(),
@@ -757,6 +763,7 @@ impl WorkflowHostContext {
             chat_model,
             event_tx: events,
             mode,
+            plan: self.plan.clone(),
             session_id: self.session_id.clone(),
             workspace_session: self.workspace_session.clone(),
             remote_project_context: self.remote_project_context.clone(),
@@ -969,6 +976,7 @@ mod tests {
     const COMPACTION_INPUT_TOKENS: u32 = 190_000;
     const CURRENT_CHAT_ID: &str = "current-chat";
     const PLAN_PATH: &str = ".caudra/plans/current.md";
+    const BOUND_PLAN: &str = ".caudra/plans/bound.md";
     const CURSOR_PROBE: &str = "resume_cursor_probe";
     const CURSOR_WORKFLOW: &str = r#"let meta = #{ name: "echo", description: "cursor test" }; let result = agent("probe the cursor"); complete(result.output);"#;
     const FIRST_TURN: TokenUsage = TokenUsage {
@@ -1576,6 +1584,35 @@ mod tests {
             assert_eq!(ctx.model.id, CURRENT_CHAT_ID);
             assert_eq!(ctx.chat_model.id, CURRENT_CHAT_ID);
             assert!(Arc::ptr_eq(&ctx.provider, &ctx.chat_provider));
+        });
+    }
+
+    /// What a caller launches reads the plan the caller works on, captured
+    /// when the host is built: the draft while planning, the binding after.
+    #[test_case(AgentMode::Plan(PLAN_PATH.into()); "planning_caller")]
+    #[test_case(AgentMode::Build; "building_caller")]
+    fn a_launched_agent_inherits_the_callers_session_plan(caller: AgentMode) {
+        smol::block_on(async {
+            let mut base = stub_ctx_with(&caller, None, Some(CALL_ID));
+            base.plan = Some(PlanTarget::Local(BOUND_PLAN.into()));
+            let model: ModelResolver = Arc::new({
+                let provider = Arc::clone(&base.provider);
+                let model = Arc::clone(&base.model);
+                move || (Arc::clone(&provider), Arc::clone(&model))
+            });
+            let host = WorkflowHostContext::from_tool_context(
+                &base,
+                model,
+                Arc::new(|| AgentMode::Build),
+                Arc::new(CancelMap::new()),
+            );
+            let (event_tx, _event_rx) = flume::unbounded();
+            let launched = host
+                .tool_context(CancelToken::none(), EventSender::new(event_tx, 0), CALL_ID)
+                .await
+                .unwrap();
+
+            assert_eq!(launched.session_plan(), base.session_plan());
         });
     }
 

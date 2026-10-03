@@ -58,7 +58,7 @@ use caudra_storage::remote_operation_journal::RemoteOperationJournal;
 use caudra_storage::sessions::change_stores::{registered_change_stores, store_summaries};
 use caudra_storage::sessions::{
     SessionDatabase, SessionError, SessionLease, SessionLocation, SessionRelocation, StoredImage,
-    TitleSource, normalize_title,
+    StoredMode, TitleSource, normalize_title,
 };
 use caudra_storage::state::WorkspaceTabs;
 use caudra_storage::workflow::WorkflowRunStatus;
@@ -878,11 +878,16 @@ struct SpawnCtx {
 }
 
 impl SpawnCtx {
-    fn spawn_fresh_runtime(&self, current: &AppSession) -> Result<SessionRuntime, String> {
-        let session = current.workspace_binding().map_or_else(
+    fn spawn_fresh_runtime(
+        &self,
+        current: &AppSession,
+        mode: Option<StoredMode>,
+    ) -> Result<SessionRuntime, String> {
+        let mut session = current.workspace_binding().map_or_else(
             || AppSession::new(&current.model, &current.cwd),
             |binding| AppSession::new_with_workspace(&current.model, &current.cwd, binding.clone()),
         );
+        session.meta.mode = mode;
         let lease = SessionLease::acquire(&self.storage, session.id)
             .map_err(|error| format!("Failed to reserve new session: {error}"))?;
         self.spawn_runtime(SessionTab {
@@ -892,12 +897,15 @@ impl SpawnCtx {
         })
     }
 
+    /// The session that implements a plan starts in Build, so it never makes
+    /// a plan of its own before it takes the handed-over one.
     fn spawn_plan_runtime(&self, source: &App) -> Result<SessionRuntime, String> {
         source.check_run_admission()?;
         if source.permission_mutation_pending() {
             return Err(crate::app::permission_editor::PERMISSION_WORKER_BUSY.into());
         }
-        let mut runtime = self.spawn_fresh_runtime(&source.state.session)?;
+        let mut runtime =
+            self.spawn_fresh_runtime(&source.state.session, Some(StoredMode::Build))?;
         if let Err(error) = runtime.app.admit_run() {
             runtime.app.discard_unstarted_session(runtime.id());
             runtime.handles.cancel();
@@ -3326,7 +3334,7 @@ impl<'t> EventLoop<'t> {
         if !self.sessions[idx].work_quiescent() {
             let runtime = match self
                 .ctx
-                .spawn_fresh_runtime(&self.sessions[idx].app.state.session)
+                .spawn_fresh_runtime(&self.sessions[idx].app.state.session, None)
             {
                 Ok(runtime) => runtime,
                 Err(error) => {
@@ -3380,7 +3388,9 @@ impl<'t> EventLoop<'t> {
             );
             child
         };
-        let actions = self.sessions[target].app.finish_plan_handoff(handoff);
+        let app = &mut self.sessions[target].app;
+        app.adopt_plan(&handoff);
+        let actions = app.finish_plan_handoff(handoff);
         self.dispatch(target, actions);
     }
 
@@ -3894,6 +3904,7 @@ impl<'t> EventLoop<'t> {
                     mut session,
                     lease,
                     draft,
+                    warning,
                 } = *forked;
                 if let Some(draft) = draft {
                     install_fork_draft(&mut session, draft);
@@ -3911,6 +3922,9 @@ impl<'t> EventLoop<'t> {
                 };
                 let child = self.push_runtime(runtime);
                 let id = self.sessions[child].id();
+                if let Some(warning) = warning {
+                    self.sessions[child].app.flash(warning);
+                }
                 self.sessions[child].app.checkpoint_now();
                 self.focused = child;
                 caudra_otel::emit::session_started(
@@ -4566,6 +4580,7 @@ mod tests {
     use crate::components::{key, test_model};
     use crate::sandbox::transfer::{TransferCommand, TransferLink, TransferScope};
     use caudra_agent::background::BackgroundTasks;
+    use caudra_agent::tools::native::plan::PlanTarget;
     use caudra_agent::{AgentMode, DoneReason, McpSnapshotReader};
     use caudra_config::sandbox::Revision;
     use caudra_config::{FeatureFlags, PermissionsConfig};
@@ -4582,6 +4597,7 @@ mod tests {
 
     const MISSING_PLAN_PROFILE: &str = "missing-plan-handoff-profile";
     const PLAN_TRANSACTION_BLOCKED: &str = "plan handoff did not fail at its admission boundary";
+    const PLANNED_PROMPT: &str = "Plan the change.";
 
     struct PlanProvider;
 
@@ -4709,6 +4725,8 @@ mod tests {
         assert!(source.plan_form.is_visible());
     }
 
+    /// The plan goes with the work: the destination is bound to it, drafting,
+    /// and the source keeps none, in memory or on disk.
     #[test_case(false; "idle_same_app")]
     #[test_case(true; "working_new_runtime")]
     fn admitted_plan_handoff_starts_only_the_destination(working: bool) {
@@ -4719,8 +4737,15 @@ mod tests {
         } else {
             Status::Idle
         };
+        source
+            .state
+            .session_mut()
+            .replace_messages(crate::history_items(&[Message::user(
+                PLANNED_PROMPT.into(),
+            )]));
         let source_id = source.state.session.id;
         let source_run = source.run_id;
+        let bound = source.state.plan.path().unwrap().to_path_buf();
         let handoff = captured_plan_action(&mut source);
         let expected = handoff.input.message.clone();
         let mut runtime = if working {
@@ -4731,23 +4756,30 @@ mod tests {
         let target = if let Some(runtime) = &mut runtime {
             assert_eq!(source.run_id, source_run);
             assert_eq!(runtime.app.status, Status::Idle);
+            assert_eq!(runtime.app.state.plan, PlanState::None);
             source.consume_plan();
+            assert_eq!(source.state.plan, PlanState::None);
             &mut runtime.app
         } else {
             let actions = source.reset_session_for_plan().unwrap();
             assert!(matches!(&actions[..], [Action::NewSession(_)]));
             assert_eq!(source.status, Status::Idle);
             assert_eq!(source.run_id, source_run);
+            let retired = AppSession::load(source_id, &source.storage).unwrap();
+            assert_eq!(retired.meta.plan_target, None);
             &mut source
         };
         let run = target.run_id;
+        target.adopt_plan(&handoff);
         let actions = target.finish_plan_handoff(handoff);
         assert_ne!(target.state.session.id, source_id);
         assert_eq!(target.run_id, run + 1);
         assert_eq!(target.status, Status::Streaming);
         assert_eq!(target.state.mode, Mode::Build);
+        assert_eq!(target.state.plan, PlanState::Drafting(bound.clone()));
+        let plan = Some(PlanTarget::Local(bound));
         assert!(
-            matches!(&actions[..], [Action::SendMessage(input)] if input.message == expected && input.mode == AgentMode::Build)
+            matches!(&actions[..], [Action::SendMessage(input)] if input.message == expected && input.mode == AgentMode::Build && input.plan == plan)
         );
         assert!(!target.plan_form.is_visible());
         if let Some(runtime) = runtime {

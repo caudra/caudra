@@ -1,7 +1,6 @@
 use caudra_config::{AgentConfig, ProfileToolExposure, ProfileToolPolicy};
 use caudra_providers::Model;
 
-use crate::AgentMode;
 use crate::tools::profile_policy::{
     CEILING_DISABLED, LEGACY_LOADING, PROFILE_DISABLED, registered_decision, source_kind,
 };
@@ -62,9 +61,15 @@ pub fn profile_report(
     profile: &ProfileToolPolicy,
     legacy: ToolReport,
     ctx: &DescriptionContext,
-    mode: &AgentMode,
+    session_plan: bool,
 ) -> ToolReport {
-    let decision = registered_decision(entry, ctx, profile, mode, legacy.state == ToolState::Lazy);
+    let decision = registered_decision(
+        entry,
+        ctx,
+        profile,
+        session_plan,
+        legacy.state == ToolState::Lazy,
+    );
     if !decision.available() {
         return ToolReport {
             state: ToolState::Off,
@@ -189,7 +194,7 @@ mod tests {
     };
     use crate::AgentMode;
     use crate::tools::profile_policy::{
-        MODE_DISABLED, PLAN_MODE_REQUIRED, PLAN_TOOL_NAME, PROFILE_LOADING, REQUIRED_INFRASTRUCTURE,
+        MODE_DISABLED, PLAN_REQUIRED, PLAN_TOOL_NAME, PROFILE_LOADING, REQUIRED_INFRASTRUCTURE,
     };
     use crate::tools::{
         DescriptionContext, FILE_APPLY_PATCH_TOOL_NAME, FILE_READ_TOOL_NAME, RegisteredTool,
@@ -294,23 +299,26 @@ mod tests {
                     audience: ToolAudience::MAIN,
                     workflows_available: false,
                 },
-                &crate::AgentMode::Build,
+                false,
             );
             assert_eq!(report.state, ToolState::On);
             assert_eq!(report.reason, Some(REQUIRED_INFRASTRUCTURE));
         }
     }
 
-    #[test_case(true, AgentMode::Build, ToolAudience::MAIN, ToolState::Off, PLAN_MODE_REQUIRED; "native_build")]
-    #[test_case(true, AgentMode::ReadOnly, ToolAudience::MAIN, ToolState::Off, PLAN_MODE_REQUIRED; "native_read_only")]
-    #[test_case(true, AgentMode::Plan(PLAN_PATH.into()), ToolAudience::GENERAL_SUB, ToolState::Off, PLAN_MODE_REQUIRED; "native_task")]
-    #[test_case(true, AgentMode::Plan(PLAN_PATH.into()), ToolAudience::MAIN, ToolState::On, PROFILE_LOADING; "native_main_plan")]
-    #[test_case(false, AgentMode::Build, ToolAudience::MAIN, ToolState::On, PROFILE_LOADING; "custom_build")]
-    #[test_case(false, AgentMode::ReadOnly, ToolAudience::MAIN, ToolState::Off, MODE_DISABLED; "custom_read_only")]
-    #[test_case(false, AgentMode::Plan(PLAN_PATH.into()), ToolAudience::GENERAL_SUB, ToolState::On, PROFILE_LOADING; "custom_task")]
-    fn plan_mode_reason_belongs_to_the_native_source(
+    /// `bound` is the session binding a main agent carries or a task inherits.
+    #[test_case(true, AgentMode::Plan(PLAN_PATH.into()), false, ToolAudience::MAIN, ToolState::On, PROFILE_LOADING; "native_main_plan")]
+    #[test_case(true, AgentMode::Build, true, ToolAudience::MAIN, ToolState::On, PROFILE_LOADING; "native_main_build_with_binding")]
+    #[test_case(true, AgentMode::Build, false, ToolAudience::MAIN, ToolState::Off, PLAN_REQUIRED; "native_main_build_without_binding")]
+    #[test_case(true, AgentMode::ReadOnly, true, ToolAudience::RESEARCH_SUB, ToolState::On, PROFILE_LOADING; "native_task_with_inherited_plan")]
+    #[test_case(true, AgentMode::Build, false, ToolAudience::GENERAL_SUB, ToolState::Off, PLAN_REQUIRED; "native_task_without_plan")]
+    #[test_case(false, AgentMode::Build, false, ToolAudience::MAIN, ToolState::On, PROFILE_LOADING; "custom_build")]
+    #[test_case(false, AgentMode::ReadOnly, false, ToolAudience::MAIN, ToolState::Off, MODE_DISABLED; "custom_read_only")]
+    #[test_case(false, AgentMode::Build, false, ToolAudience::GENERAL_SUB, ToolState::On, PROFILE_LOADING; "custom_task")]
+    fn plan_reason_belongs_to_the_native_source(
         native: bool,
         mode: AgentMode,
+        bound: bool,
         audience: ToolAudience,
         state: ToolState,
         reason: &'static str,
@@ -345,7 +353,7 @@ mod tests {
                 audience,
                 workflows_available: false,
             },
-            &mode,
+            mode.is_planning() || bound,
         );
         assert_eq!(
             report,

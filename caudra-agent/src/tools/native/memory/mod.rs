@@ -21,7 +21,9 @@ use caudra_storage::local_documents::{LocalDocument, LocalDocumentStore};
 use caudra_workspace::{LocalDocumentRef, MemoryRef, RecordScope};
 use serde_json::Value;
 
-use crate::permissions::{PermissionResource, PermissionResourceKind, PermissionRisk};
+use crate::permissions::{
+    PermissionResource, PermissionResourceAccess, PermissionResourceKind, PermissionRisk,
+};
 use crate::tools::registry::{
     ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionIntent, PermissionScopes, Tool,
     ToolEffect, ToolError, ToolExecResult, ToolFailure, ToolInvocation,
@@ -56,6 +58,10 @@ const POLICY_TOOLS: &[&str] = &[
 /// Key the rules are stored under, so a reload replaces them rather than
 /// stacking duplicates.
 pub const RULE_OWNER: &str = "native:memory";
+
+/// The opaque resource a remote session's notes are named by, since a remote
+/// note has no host path a filesystem rule could cover.
+pub const LOCAL_MEMORY_RESOURCE: &str = "local_memory";
 
 pub fn permission_rules(cwd: &Path) -> Vec<caudra_config::PermissionRule> {
     paths::state_dir(cwd)
@@ -115,6 +121,12 @@ static SCHEMA: ParamSchema = ParamSchema::Object {
     description: "",
     reject_unknown: false,
 };
+static PERMISSION_CONTRACT: LazyLock<String> =
+    LazyLock::new(|| super::permission_contract(&MemoryTool, ToolEffect::Mutating, DESCRIPTION));
+
+pub fn permission_contract() -> &'static str {
+    &PERMISSION_CONTRACT
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Command {
@@ -141,6 +153,13 @@ impl Command {
             Self::Read => "read",
             Self::Write => "write",
             Self::Delete => "delete",
+        }
+    }
+
+    fn access(self) -> PermissionResourceAccess {
+        match self {
+            Self::List | Self::Read => PermissionResourceAccess::Read,
+            Self::Write | Self::Delete => PermissionResourceAccess::Write,
         }
     }
 }
@@ -790,10 +809,10 @@ impl MemoryCall {
             PermissionScopes::single(scope.clone()),
             vec![PermissionResource {
                 kind: PermissionResourceKind::Custom {
-                    name: "local_memory".to_owned(),
+                    name: LOCAL_MEMORY_RESOURCE.to_owned(),
                 },
                 value: scope,
-                access: None,
+                access: Some(self.command.access()),
                 protected: false,
                 requires_prompt: false,
                 attributes: BTreeMap::new(),
@@ -969,11 +988,17 @@ mod tests {
     use super::*;
     use crate::AgentMode;
     use crate::agent::tool_dispatch::{self, Emit};
+    use crate::permissions::{
+        PERMISSION_DENIED_PREFIX, PermissionExecutorKind, PermissionManager, PermissionSubject,
+    };
+    use crate::tools::native::OWNER;
     use crate::tools::native::tests::{tempdir, workspace_for_principal};
     use crate::tools::test_support::stub_ctx;
     use crate::tools::{MEMORY_TOOL_NAME, PLAN_WRITE_RESTRICTED};
     use crate::types::MEMORY_DIRECTORY_LABEL;
-    use caudra_config::FeatureFlags;
+    use caudra_config::{
+        DefaultEffect, Effect, FeatureFlags, PermissionRule, PermissionsConfig, ToolKey,
+    };
     use caudra_providers::token_label;
     use caudra_storage::StateDir;
     use caudra_storage::id::SessionRef;
@@ -1097,6 +1122,72 @@ mod tests {
             .await;
             assert!(done.is_error);
             assert_eq!(done.output.as_text(), PLAN_WRITE_RESTRICTED);
+            assert_eq!(
+                store.list_memories(store.project_key()).unwrap()[0].content,
+                NOTE_CONTENT
+            );
+        });
+    }
+
+    /// Browsing remote notes needs no answer whatever the default, as browsing
+    /// local ones already doesn't. Changing a note still waits for one, and a
+    /// rule that names the tool still governs every command.
+    #[test_case(DefaultEffect::Prompt, None; "default_prompt")]
+    #[test_case(DefaultEffect::Deny, None; "default_deny")]
+    #[test_case(DefaultEffect::Allow, Some(Effect::Deny); "explicit_deny")]
+    #[test_case(DefaultEffect::Allow, Some(Effect::Ask); "explicit_ask")]
+    fn remote_memory_reads_ask_only_when_a_rule_does(
+        default: DefaultEffect,
+        effect: Option<Effect>,
+    ) {
+        smol::block_on(async {
+            let (root, mut ctx) = remote_context();
+            ctx.permissions = Arc::new(PermissionManager::new_nonpersistent(
+                PermissionsConfig {
+                    default,
+                    rules: effect
+                        .into_iter()
+                        .map(|effect| PermissionRule {
+                            tool: ToolKey::native(MEMORY_TOOL_NAME),
+                            scope: None,
+                            effect,
+                        })
+                        .collect(),
+                    ..Default::default()
+                },
+                root.path().to_path_buf(),
+                Arc::default(),
+            ));
+            let store = ctx.local_documents.as_ref().unwrap();
+            store
+                .write_memory(store.project_key(), NOTE_PATH, NOTE_CONTENT)
+                .unwrap();
+            for (command, browses) in [
+                ("list", true),
+                ("read", true),
+                ("write", false),
+                ("delete", false),
+            ] {
+                let done = tool_dispatch::run(
+                    &ctx.registry,
+                    None,
+                    command.into(),
+                    MEMORY_TOOL_NAME,
+                    &json!({"command": command, "path": NOTE_PATH, "content": "overwrite"}),
+                    &ctx,
+                    Emit::Silent,
+                )
+                .await;
+                if browses && effect.is_none() {
+                    assert!(!done.is_error, "{command}: {}", done.output.as_text());
+                } else {
+                    assert!(
+                        done.output.as_text().starts_with(PERMISSION_DENIED_PREFIX),
+                        "{command}: {}",
+                        done.output.as_text()
+                    );
+                }
+            }
             assert_eq!(
                 store.list_memories(store.project_key()).unwrap()[0].content,
                 NOTE_CONTENT
@@ -1782,11 +1873,17 @@ mod tests {
         assert_eq!(output.notices(), [expected.to_owned()]);
     }
 
-    #[test]
-    fn remote_memory_permission_intent_uses_an_opaque_resource() {
+    #[test_case("list", PermissionResourceAccess::Read; "list_reads")]
+    #[test_case("read", PermissionResourceAccess::Read; "read_reads")]
+    #[test_case("write", PermissionResourceAccess::Write; "write_writes")]
+    #[test_case("delete", PermissionResourceAccess::Write; "delete_writes")]
+    fn remote_memory_permission_intent_uses_an_opaque_resource(
+        command: &str,
+        access: PermissionResourceAccess,
+    ) {
         let call = call_in(
-            json!({"command": "write", "path": "architecture.md", "content": "note"}),
-            Path::new("/secret/client/state"),
+            json!({"command": command, "path": REMOTE_NAME, "content": REMOTE_BODY}),
+            Path::new(CLIENT_STATE),
         );
 
         let intent = call.remote_permission_intent();
@@ -1795,13 +1892,32 @@ mod tests {
         assert_eq!(
             intent.resources[0].kind,
             PermissionResourceKind::Custom {
-                name: "local_memory".to_owned()
+                name: LOCAL_MEMORY_RESOURCE.to_owned()
             }
         );
         assert_eq!(
             intent.resources[0].value,
-            "local-memory:write:architecture.md"
+            format!("local-memory:{command}:{REMOTE_NAME}")
         );
-        assert!(!intent.resources[0].value.contains("/secret/client/state"));
+        assert_eq!(intent.resources[0].access, Some(access));
+        assert!(!intent.resources[0].value.contains(CLIENT_STATE));
+    }
+
+    #[test]
+    fn permission_contract_is_the_registered_native_identity() {
+        let (_root, ctx) = remote_context();
+        let registered = ctx.registry.get(MEMORY_TOOL_NAME).unwrap();
+        assert_eq!(
+            registered
+                .source
+                .permission_identity(MEMORY_TOOL_NAME, None),
+            Some((
+                PermissionSubject::Native {
+                    owner: OWNER.into(),
+                    contract: permission_contract().into(),
+                },
+                PermissionExecutorKind::Native,
+            ))
+        );
     }
 }

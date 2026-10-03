@@ -56,6 +56,7 @@ use crate::peers::PeerSession;
 use crate::permissions::PermissionManager;
 use crate::template::Vars;
 use crate::tools::ToolFilter;
+use crate::tools::native::plan::PlanTarget;
 use crate::tools::native::skill::{self, SkillInventoryEntry};
 use crate::tools::{BATCH_TOOL_NAME, SKILL_TOOL_NAME};
 use crate::tools::{BuiltinDeferral, DeferralSession, DeferredTool};
@@ -388,6 +389,7 @@ pub struct Agent<'h> {
     tools: Value,
     deferral: DeferralSession,
     mode: AgentMode,
+    plan: Option<PlanTarget>,
     user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
     interrupt_source: Option<Arc<dyn InterruptSource>>,
     cancel: CancelToken,
@@ -556,6 +558,7 @@ impl<'h> Agent<'h> {
             tools: run.tools,
             deferral,
             mode: AgentMode::default(),
+            plan: None,
             user_response_rx: None,
             interrupt_source: None,
             cancel: CancelToken::none(),
@@ -1041,6 +1044,7 @@ impl<'h> Agent<'h> {
             self.mode_notice.as_deref(),
         ));
         self.mode = latest.mode.clone();
+        self.plan = latest.plan.clone();
         let tool_context = self.tool_context();
         standing.extend(mode_switch_notice_with_tools(
             self.history.as_slice(),
@@ -1480,7 +1484,7 @@ impl<'h> Agent<'h> {
                 filter: &self.tool_filter,
                 config: &self.config,
                 model: &self.model,
-                mode: &self.mode,
+                session_plan: self.mode.has_session_plan(self.plan.as_ref()),
                 audience: self.audience,
                 deferral: BuiltinDeferral::resolve(&self.config, &self.model),
                 deferred: self.deferral.definitions(),
@@ -2553,6 +2557,7 @@ impl<'h> Agent<'h> {
             chat_model: Arc::clone(&self.chat_model),
             event_tx: self.event_tx.clone(),
             mode: self.mode.clone(),
+            plan: self.plan.clone(),
             session_id: self.session_id.clone(),
             workspace_session: self.workspace_session.clone(),
             remote_project_context: self.remote_project_context.clone(),
@@ -2776,7 +2781,7 @@ impl<'h> Agent<'h> {
                     text: input.message.clone(),
                     image_count: input.images.len(),
                 })?;
-                self.push_user_inputs(vec![input], true).await;
+                self.push_user_inputs(vec![*input], true).await;
                 let _ = run_id;
             }
             ExtractedCommand::InterruptBatch(inputs) => {
@@ -3391,6 +3396,7 @@ mod tests {
     include!("peer_tests.rs");
 
     use std::collections::{HashMap, VecDeque};
+    use std::slice;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -3425,7 +3431,7 @@ mod tests {
     use crate::remote_project_context::{RemoteAssetIdentity, RemoteSkill};
     use crate::tools::native::todo_write::TodoWrite;
     use crate::tools::registry::ToolSource;
-    use crate::tools::{TODOWRITE_TOOL_NAME, ToolEffect, local_tool};
+    use crate::tools::{TODOWRITE_TOOL_NAME, ToolEffect, audited_local_tool, local_tool};
     use crate::types::{TodoPriority, TodoStatus};
     use crate::{Envelope, QueueItemId};
 
@@ -4042,6 +4048,7 @@ mod tests {
     /// regression that would otherwise hang instead of failing.
     const TITLE_EVENT_TIMEOUT: Duration = Duration::from_secs(5);
     const TEST_PLAN_PATH: &str = ".caudra/plans/123.md";
+    const BOUND_PLAN: &str = ".caudra/plans/bound.md";
     const NEXT_PLAN: &str = "next-plan";
     const PREVIOUS_REMOTE_PLAN: &str = "previous-plan";
     const EXPECTED_PLAN_NOTICE: &str = "entering plan mode must be announced";
@@ -5115,6 +5122,7 @@ mod tests {
         AgentInput {
             message: "hello".into(),
             mode: AgentMode::Build,
+            plan: None,
             images: Vec::new(),
             mentions: Vec::new(),
             commits: Vec::new(),
@@ -6222,26 +6230,26 @@ mod tests {
 
     #[test_case(false; "local_target_changed")]
     #[test_case(true; "remote_target_changed")]
-    fn plan_notice_reannounces_changed_target(remote: bool) {
-        let current = if remote {
-            AgentMode::RemotePlan(PlanRef::new(PREVIOUS_REMOTE_PLAN).unwrap())
+    fn plan_notice_reannounces_only_a_changed_local_path(remote: bool) {
+        let (current, next) = if remote {
+            (
+                AgentMode::RemotePlan(PlanRef::new(PREVIOUS_REMOTE_PLAN).unwrap()),
+                AgentMode::RemotePlan(PlanRef::new(NEXT_PLAN).unwrap()),
+            )
         } else {
-            plan_mode()
-        };
-        let next = if remote {
-            AgentMode::RemotePlan(PlanRef::new(NEXT_PLAN).unwrap())
-        } else {
-            AgentMode::Plan(NEXT_PLAN.into())
+            (plan_mode(), AgentMode::Plan(NEXT_PLAN.into()))
         };
         let available = |name: &str| name == crate::tools::profile_policy::PLAN_TOOL_NAME;
         let first = mode_switch_notice_with_tools(&[], &current, available).unwrap();
-        let notice = mode_switch_notice_with_tools(&[first], &next, available).unwrap();
+        let notice = mode_switch_notice_with_tools(slice::from_ref(&first), &next, available);
+        assert_eq!(notice.is_some(), !remote);
+        let announced = notice.unwrap_or(first);
         assert_eq!(
-            notice.user_text(),
+            announced.user_text(),
             crate::prompt::plan_mode_prompt(&next, available).as_deref()
         );
-        assert!(notice.user_text().unwrap().contains(NEXT_PLAN));
-        assert!(mode_switch_notice_with_tools(&[notice], &next, available).is_none());
+        assert_eq!(announced.user_text().unwrap().contains(NEXT_PLAN), !remote);
+        assert!(mode_switch_notice_with_tools(&[announced], &next, available).is_none());
     }
 
     #[test]
@@ -6828,7 +6836,7 @@ mod tests {
             let mut input = default_input();
             input.preamble = vec![Message::observation("preamble".into())];
             let source = MockInterruptSource::new(vec![ExtractedCommand::Interrupt(
-                input,
+                Box::new(input),
                 0,
                 QueueItemId::new(),
             )]);
@@ -7540,7 +7548,7 @@ mod tests {
         smol::block_on(async {
             let source = if queued.is_some() {
                 Some(MockInterruptSource::new(vec![ExtractedCommand::Interrupt(
-                    default_input(),
+                    Box::new(default_input()),
                     0,
                     QueueItemId::new(),
                 )]))
@@ -8774,7 +8782,7 @@ mod tests {
                 &mut history,
             );
             let source = MockInterruptSource::new(vec![ExtractedCommand::Interrupt(
-                default_input(),
+                Box::new(default_input()),
                 0,
                 QueueItemId::new(),
             )]);
@@ -9162,6 +9170,42 @@ mod tests {
             )),
             None => assert!(context.tool_output_store.is_none()),
         }
+    }
+
+    /// The session binding rides on each input to the tools the turn calls,
+    /// and a planning input's own target wins over it.
+    #[test_case(AgentMode::Build, BOUND_PLAN; "build_uses_the_binding")]
+    #[test_case(plan_mode(), TEST_PLAN_PATH; "planning_target_wins")]
+    fn the_input_binding_reaches_tools(mode: AgentMode, expected: &str) {
+        smol::block_on(async {
+            let seen = Arc::new(Mutex::new(None));
+            let observed = Arc::clone(&seen);
+            let responses = vec![
+                tool_use_response(TEST_TOOL, json!({})),
+                text_response(StopReason::EndTurn),
+            ];
+            let mut history = History::default();
+            let (mut agent, _events) = make_agent(MockProvider::new(responses), &mut history);
+            agent.tools = json!([{"name": TEST_TOOL, "input_schema": {"type": "object"}}]);
+            agent.local_tools = Arc::new(HashMap::from([(
+                TEST_TOOL.into(),
+                audited_local_tool(ToolEffect::ReadOnly, move |_, ctx| {
+                    *observed.lock().unwrap() = ctx.session_plan();
+                    Box::pin(async { Ok(TEST_TOOL_RESULT.into()) })
+                }),
+            )]));
+            let input = AgentInput {
+                mode,
+                plan: Some(PlanTarget::Local(BOUND_PLAN.into())),
+                ..default_input()
+            };
+
+            assert_eq!(agent.run(input).await.unwrap(), DoneReason::EndTurn);
+            assert_eq!(
+                *seen.lock().unwrap(),
+                Some(PlanTarget::Local(expected.into()))
+            );
+        });
     }
 
     const FIRST_ANSWER: &str = "The first part is done.";

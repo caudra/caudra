@@ -18,10 +18,8 @@ impl PlanFile {
         Ok(Self(PrivateFile::document(path, MAX_PLAN_BYTES)?))
     }
 
-    pub fn read(&self) -> Result<(String, DocumentRevision), LocalDocumentError> {
-        let content = snapshot_content(self.0.load()?)?;
-        let revision = revision(&content);
-        Ok((content, revision))
+    pub fn read(&self) -> Result<String, LocalDocumentError> {
+        snapshot_content(self.0.load()?)
     }
 
     pub fn write(&self, content: &str) -> Result<DocumentRevision, LocalDocumentError> {
@@ -99,9 +97,24 @@ pub fn new_plan_path(dir: &StateDir, cwd: &Path) -> Result<PathBuf, StorageError
     Err(StorageError::SlugCollision)
 }
 
+/// A new plan in the project's plans directory that starts out holding
+/// `content`, for a session that takes another session's plan as its own.
+pub fn create_plan_file(
+    dir: &StateDir,
+    cwd: &Path,
+    content: &str,
+) -> Result<PathBuf, LocalDocumentError> {
+    validate_content(content)?;
+    let path = new_plan_path(dir, cwd)?;
+    PlanFile::new(path.clone())?.write(content)?;
+    Ok(path)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::{MAX_PLAN_BYTES, PLANS_DIR, PlanFile, new_plan_path, project_subdir};
+    use super::{
+        MAX_PLAN_BYTES, PLANS_DIR, PlanFile, create_plan_file, new_plan_path, project_subdir,
+    };
     use crate::StateDir;
     use crate::local_documents::LocalDocumentError;
     use crate::private_file::PrivateFileError;
@@ -145,20 +158,20 @@ pub(crate) mod tests {
         };
         let path = directory.join(FILE_NAME);
         let file = PlanFile::new(path.clone()).unwrap();
-        assert!(file.read().unwrap().0.is_empty());
+        assert!(file.read().unwrap().is_empty());
         assert!(!path.exists());
         assert_eq!(directory.exists(), !missing_parent);
         let first = file.write(CONTENT).unwrap();
-        let (content, revision) = file.read().unwrap();
-        assert_eq!(content, CONTENT);
-        assert_eq!(revision, first);
+        assert_eq!(file.read().unwrap(), CONTENT);
         let second = file.replace(&first, UPDATED).unwrap();
         assert_ne!(first, second);
         assert!(matches!(
             file.replace(&first, CONTENT),
             Err(LocalDocumentError::StaleRevision { .. })
         ));
-        assert_eq!(file.read().unwrap(), (UPDATED.to_owned(), second));
+        assert_eq!(file.read().unwrap(), UPDATED);
+        file.replace(&second, CONTENT).unwrap();
+        assert_eq!(file.read().unwrap(), CONTENT);
     }
 
     #[test_case(false; "write")]
@@ -249,6 +262,39 @@ pub(crate) mod tests {
 
         assert!(path.starts_with(tmp.path().join(project_subdir(&cwd)).join(PLANS_DIR)));
         assert_eq!(path.extension().and_then(|e| e.to_str()), Some("md"));
+    }
+
+    #[test]
+    fn a_created_plan_file_holds_its_content_privately_in_the_plans_dir() {
+        let tmp = tempdir();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let cwd = tmp.path().join("workspace");
+
+        let path = create_plan_file(&dir, &cwd, CONTENT).unwrap();
+
+        let plans = tmp.path().join(project_subdir(&cwd)).join(PLANS_DIR);
+        assert_eq!(path.parent(), Some(plans.as_path()));
+        assert_eq!(
+            PlanFile::new(path.clone()).unwrap().read().unwrap(),
+            CONTENT
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & MODE_MASK,
+            PRIVATE_MODE
+        );
+    }
+
+    #[test]
+    fn an_oversize_plan_file_is_refused_before_allocating() {
+        let tmp = tempdir();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let cwd = tmp.path().join("workspace");
+
+        let created = create_plan_file(&dir, &cwd, &"x".repeat(MAX_PLAN_BYTES + 1));
+
+        assert!(matches!(created, Err(LocalDocumentError::TooLarge)));
+        assert!(!tmp.path().join(project_subdir(&cwd)).exists());
     }
 
     #[test]

@@ -6,6 +6,7 @@ use agent_client_protocol_schema::v1::{
     NewSessionResponse, PromptCapabilities, SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigSelectOption, SessionMode, SessionModeId, SessionModeState,
 };
+use caudra_agent::tools::native::plan::PlanTarget;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -71,15 +72,18 @@ pub fn mode_id_to_agent_mode(mode_id: &str, cwd: &Path) -> Option<caudra_agent::
     }
 }
 
+/// Plan reuses the session's plan and allocates one only when it has none.
 pub fn mode_id_to_agent_mode_for_session(
     mode_id: &str,
     cwd: &Path,
     workspace: Option<&caudra_workspace::WorkspaceSession>,
     documents: Option<&caudra_storage::local_documents::LocalDocumentStore>,
     session_id: &str,
+    plan: Option<&PlanTarget>,
 ) -> Option<caudra_agent::AgentMode> {
-    match (mode_id, workspace, documents) {
-        (MODE_PLAN, Some(workspace), Some(documents)) => documents
+    match (mode_id, plan, workspace, documents) {
+        (MODE_PLAN, Some(plan), _, _) => Some(caudra_agent::AgentMode::planning(plan.clone())),
+        (MODE_PLAN, None, Some(workspace), Some(documents)) => documents
             .create_plan(workspace.binding().project().key(), session_id)
             .ok()
             .map(caudra_agent::AgentMode::RemotePlan),

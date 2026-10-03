@@ -14,10 +14,7 @@ use caudra_agent::permissions::{
     PermissionResourceAccess, PermissionResourceKind, PermissionRisk, PermissionSubject,
     pattern_recognition::ObservationProvenance,
 };
-use caudra_agent::tools::native::{
-    self,
-    plan::{self, PlanAuthority, PlanTarget},
-};
+use caudra_agent::tools::native::plan::{self, PlanAuthority, PlanTarget};
 use caudra_agent::tools::registry::{RegistryAuthoritySnapshot, ToolEffect, TrustedToolSource};
 use caudra_agent::tools::{
     PermissionIntent, PermissionScopes, PlanModeAccess, ToolAudience, ToolFilter, ToolRegistry,
@@ -60,6 +57,8 @@ const OPERATION_ATTRIBUTE: &str = "operation";
 pub struct PermissionEditorRuntime {
     pub project: PathBuf,
     pub mode: AgentMode,
+    /// The session's plan binding, which a planning mode's own target overrides.
+    pub plan: Option<PlanTarget>,
     pub tool_filter: ToolFilter,
     pub audience: ToolAudience,
     pub workspace: Option<WorkspaceSession>,
@@ -71,6 +70,7 @@ impl PermissionEditorRuntime {
     fn plan_authority(&self) -> PlanAuthority<'_> {
         PlanAuthority {
             mode: &self.mode,
+            plan: self.plan.as_ref(),
             host_cwd: &self.project,
             audience: self.audience,
             workspace: self.workspace.as_ref(),
@@ -417,9 +417,9 @@ fn local_contract(source: &TrustedToolSource) -> Option<&str> {
 
 fn native_plan_contract(key: &str, source: &TrustedToolSource) -> bool {
     key == plan::NAME
-        && matches!(source.subject(), PermissionSubject::Native { owner, contract }
-        if source.builtin_allows() && source.effect() == ToolEffect::Mutating
-            && owner == native::OWNER && *contract == plan::permission_contract())
+        && source.builtin_allows()
+        && source.effect() == ToolEffect::Mutating
+        && plan::is_plan_subject(source.subject())
 }
 
 fn plan_descriptor(key: &str, source: TrustedToolSource) -> EditableAuthorityDescriptor {
@@ -975,6 +975,7 @@ mod tests {
                 PermissionEditorContext::new(PermissionEditorRuntime {
                     project,
                     mode: AgentMode::Build,
+                    plan: None,
                     tool_filter: ToolFilter::All,
                     audience: ToolAudience::MAIN,
                     workspace: None,
@@ -1189,7 +1190,7 @@ mod tests {
             assert_eq!(manager.structured_rule_inventory().unwrap().len(), 1);
             match target {
                 PlanTarget::Local(path) => {
-                    assert_eq!(PlanFile::new(path).unwrap().read().unwrap().0, PLAN_CONTENT)
+                    assert_eq!(PlanFile::new(path).unwrap().read().unwrap(), PLAN_CONTENT)
                 }
                 PlanTarget::Remote(reference) => {
                     let runtime = fixture.runtime();
@@ -1248,6 +1249,37 @@ mod tests {
         assert!(lease.active_plan_target(authority).is_err());
     }
 
+    #[test_case(false; "local")]
+    #[test_case(true; "remote")]
+    fn native_plan_editor_accepts_a_build_binding(remote: bool) {
+        let fixture = Fixture::plan(remote);
+        let mut runtime = fixture.runtime();
+        runtime.plan = runtime.mode.plan_target();
+        runtime.mode = AgentMode::Build;
+        let bound = runtime.plan.clone();
+        fixture.context.replace(runtime).unwrap();
+        let lease = fixture.provider.acquire(&fixture.project()).unwrap();
+        let authority = lease
+            .catalog()
+            .authorities
+            .iter()
+            .find(|authority| authority.key == plan::NAME)
+            .unwrap();
+        assert_eq!(authority.unavailable, None);
+        let intent = lease
+            .analyze_example(
+                authority,
+                &json!({"action": "write", "content": PLAN_EXAMPLE}),
+            )
+            .unwrap()
+            .intent;
+        assert_eq!(
+            intent.resources[0].access,
+            Some(PermissionResourceAccess::Write)
+        );
+        assert_eq!(lease.active_plan_target(authority).unwrap(), bound);
+    }
+
     struct PlanImpostor;
 
     impl Tool for PlanImpostor {
@@ -1285,7 +1317,7 @@ mod tests {
                     contract: if correct_contract {
                         plan::permission_contract()
                     } else {
-                        CUSTOM_TOOL.into()
+                        CUSTOM_TOOL
                     }
                     .into(),
                     trusted,

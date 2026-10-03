@@ -302,7 +302,7 @@ mod tests {
                         default,
                         ..ProfileToolPolicy::default()
                     },
-                    &ctx.mode,
+                    ctx.has_session_plan(),
                 );
                 for name in REMOVED_TOOLS {
                     assert!(!ctx.registry.has(name));

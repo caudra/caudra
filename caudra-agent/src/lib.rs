@@ -73,6 +73,8 @@ pub use subagent_history::{
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use tools::native::plan::PlanTarget;
+
 pub use caudra_providers::AgentError;
 pub use caudra_providers::{ContentBlock, Message};
 pub use caudra_providers::{EMPTY_RESPONSE_MARKER, ImageMediaType, ImageSource, ThinkingConfig};
@@ -123,8 +125,31 @@ impl AgentMode {
         }
     }
 
+    /// The plan a planning mode names, which wins over the session binding
+    /// while planning. `None` outside planning.
+    pub fn plan_target(&self) -> Option<PlanTarget> {
+        match self {
+            Self::Plan(path) => Some(PlanTarget::Local(path.clone())),
+            Self::RemotePlan(reference) => Some(PlanTarget::Remote(reference.clone())),
+            Self::Build | Self::ReadOnly => None,
+        }
+    }
+
+    pub fn planning(target: PlanTarget) -> Self {
+        match target {
+            PlanTarget::Local(path) => Self::Plan(path),
+            PlanTarget::Remote(reference) => Self::RemotePlan(reference),
+        }
+    }
+
     pub fn is_planning(&self) -> bool {
         matches!(self, Self::Plan(_) | Self::RemotePlan(_))
+    }
+
+    /// Whether an actor in this mode has a session plan: its planning target
+    /// or `binding`.
+    pub fn has_session_plan(&self, binding: Option<&PlanTarget>) -> bool {
+        self.is_planning() || binding.is_some()
     }
 
     pub fn is_read_only(&self) -> bool {
@@ -133,7 +158,7 @@ impl AgentMode {
 }
 
 pub enum ExtractedCommand {
-    Interrupt(AgentInput, u64, QueueItemId),
+    Interrupt(Box<AgentInput>, u64, QueueItemId),
     InterruptBatch(Vec<QueuedInterrupt>),
     Compact(u64),
 }
@@ -161,6 +186,9 @@ pub struct McpPromptRef {
 pub struct AgentInput {
     pub message: String,
     pub mode: AgentMode,
+    /// The session's plan, which outlives planning. A planning `mode` names
+    /// its own target, and that one wins while planning.
+    pub plan: Option<PlanTarget>,
     pub images: Vec<ImageSource>,
     /// Files the caller asked to have inlined, declared rather than parsed out
     /// of `message`: `@` is too common in prose for a scan to be safe here, and
@@ -178,4 +206,16 @@ pub struct AgentInput {
     /// Resume with no turn of the caller's own: the run starts from history as
     /// it stands, and the agent decides what the request tail still needs.
     pub resume: bool,
+}
+
+impl AgentInput {
+    /// Whether the run this input starts has a session plan to work on.
+    pub fn has_session_plan(&self) -> bool {
+        self.mode.has_session_plan(self.plan.as_ref())
+    }
+
+    /// The plan the run works on: the planning target, else the binding.
+    pub fn session_plan(&self) -> Option<PlanTarget> {
+        self.mode.plan_target().or_else(|| self.plan.clone())
+    }
 }

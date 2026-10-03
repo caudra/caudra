@@ -989,12 +989,16 @@ pub(crate) fn batch_child_id(tool_id: &str) -> Option<(&str, usize)> {
     Some((parent, index.parse().ok()?))
 }
 
-fn plan_message(plan: &PlanWriteResult) -> DisplayMessage {
-    let source = match plan.target() {
+/// What a plan card names its plan by, whether written or handed off.
+pub(crate) fn plan_source(target: &PlanTarget) -> String {
+    match target {
         PlanTarget::Local(path) => path.display().to_string(),
-        PlanTarget::Remote(reference) => format!("plan reference {}", reference.as_str()),
-    };
-    DisplayMessage::plan(plan.content().to_owned(), source)
+        PlanTarget::Remote(_) => plan::SESSION_PLAN_LABEL.to_owned(),
+    }
+}
+
+fn plan_message(plan: &PlanWriteResult) -> DisplayMessage {
+    DisplayMessage::plan(plan.content().to_owned(), plan_source(plan.target()))
 }
 
 fn is_stall_prompt(steering: &Option<SteeringOrigin>) -> bool {
@@ -1435,7 +1439,6 @@ mod tests {
         Billing, ContentBlock, Message, PeerMessageOrigin, Role, StandingReminderKind,
         TaskEventOrigin, estimate_tokens_cached, project_messages, token_label,
     };
-    use caudra_storage::local_documents::DocumentRevision;
     use caudra_workspace::PlanRef;
     use ratatui::{Terminal, backend::TestBackend};
     use test_case::test_case;
@@ -1783,11 +1786,7 @@ mod tests {
         } else {
             PlanTarget::Local(COMMITTED_PLAN_PATH.into())
         };
-        PlanWriteResult::new(
-            target,
-            DocumentRevision::new("a".repeat(64)).unwrap(),
-            COMMITTED_PLAN_CONTENT.into(),
-        )
+        PlanWriteResult::new(target, COMMITTED_PLAN_CONTENT.into())
     }
 
     #[test_case(false ; "local")]
@@ -1813,6 +1812,14 @@ mod tests {
         );
         assert!(chat.last_message_is_plan());
         assert_eq!(chat.last_message_text(), COMMITTED_PLAN_CONTENT);
+        assert_eq!(
+            chat.message_at(1).unwrap().plan_path.as_deref(),
+            Some(if remote {
+                plan::SESSION_PLAN_LABEL
+            } else {
+                COMMITTED_PLAN_PATH
+            })
+        );
         assert!(
             !chat
                 .message_at(0)

@@ -7,6 +7,8 @@ use super::{
     SUBTREE_SCOPE_SUFFIX, StructuredPermissionEffect, StructuredPermissionRule, command_pattern,
     hex_encode, normalize_configured_selector, permission_rules_cover_request,
 };
+use crate::tools::native;
+use crate::tools::native::memory::{self, LOCAL_MEMORY_RESOURCE};
 use caudra_config::{
     DefaultEffect, Effect, FILE_WRITE_TOOLS, PermissionReviewCandidate, PermissionRule,
     PermissionsConfig, ToolKey,
@@ -161,16 +163,30 @@ pub(super) fn builtin_rules(cwd: &Path, state_dir: Option<&StateDir>) -> Vec<Per
 /// The rule turns entirely on `CONFINED_READ_ATTRIBUTE`, which the shell tool
 /// sets only after judging both halves. An opaque line never carries it, and
 /// `protected: Some(false)` refuses to cover one regardless.
+///
+/// Browsing a remote session's notes is the same read of the project's own
+/// notes that a local session's memory rules already allow; only the memory
+/// tool's own identity reaches the opaque resource those notes are named by.
 pub(super) fn builtin_structured_rules() -> Vec<PolicyRule> {
-    vec![PolicyRule {
+    let allow = |subject: PermissionSubject, resource: PermissionResourceConstraint| PolicyRule {
         origin: RuleOrigin::Builtin,
         rule: StructuredPermissionRule {
-            subject: PermissionSubject::Native {
+            subject,
+            executor: PermissionExecutorKind::Native,
+            resources: vec![resource],
+            arguments: PermissionArgumentConstraint::Unconstrained,
+            lifetime: PermissionLifetime::Conversation,
+            effect: StructuredPermissionEffect::Allow,
+            family: None,
+        },
+    };
+    vec![
+        allow(
+            PermissionSubject::Native {
                 owner: WORKCELL_TOOL_OWNER.into(),
                 contract: SHELL_EXECUTION_CONTRACT.into(),
             },
-            executor: PermissionExecutorKind::Native,
-            resources: vec![PermissionResourceConstraint {
+            PermissionResourceConstraint {
                 kind: PermissionResourceKind::Command,
                 selector: PermissionResourceSelector::Any,
                 access: Some(PermissionResourceAccess::Execute),
@@ -181,13 +197,24 @@ pub(super) fn builtin_structured_rules() -> Vec<PolicyRule> {
                         value: CONFINED_READ_VALUE.into(),
                     },
                 )]),
-            }],
-            arguments: PermissionArgumentConstraint::Unconstrained,
-            lifetime: PermissionLifetime::Conversation,
-            effect: StructuredPermissionEffect::Allow,
-            family: None,
-        },
-    }]
+            },
+        ),
+        allow(
+            PermissionSubject::Native {
+                owner: native::OWNER.into(),
+                contract: memory::permission_contract().into(),
+            },
+            PermissionResourceConstraint {
+                kind: PermissionResourceKind::Custom {
+                    name: LOCAL_MEMORY_RESOURCE.into(),
+                },
+                selector: PermissionResourceSelector::Any,
+                access: Some(PermissionResourceAccess::Read),
+                protected: Some(false),
+                attributes: BTreeMap::new(),
+            },
+        ),
+    ]
 }
 
 /// Permission rules declared by Lua plugins via

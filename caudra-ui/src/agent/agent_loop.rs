@@ -19,6 +19,7 @@ use caudra_agent::prompt::profile::{
 use caudra_agent::template;
 use caudra_agent::template::Vars;
 use caudra_agent::tools::execution::{configure_tools, execution_slots};
+use caudra_agent::tools::native::plan::PlanTarget;
 use caudra_agent::tools::{
     BuiltinDeferral, DeferralSession, DeferredTool, DescriptionContext, FileReadTracker, PathLocks,
     ToolAudience, ToolDefinitions, ToolFilter, ToolRegistry, deferral,
@@ -70,6 +71,7 @@ impl ToolsPreviewSource {
         model: &Model,
         vars: &Vars,
         mode: &AgentMode,
+        session_plan: bool,
         bindings: &TaskProfileBindings,
     ) -> ToolDefinitions {
         let filter = ToolFilter::from_config(&self.config, model, &[]).for_mode(mode);
@@ -90,7 +92,7 @@ impl ToolsPreviewSource {
                 BuiltinDeferral::resolve(&self.config, model),
             ),
             &self.profile,
-            mode,
+            session_plan,
         );
         configure_tools(
             &mut definitions.declared,
@@ -102,12 +104,14 @@ impl ToolsPreviewSource {
         definitions
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn snapshot(
         &self,
         model: &Model,
         chat_model: &Model,
         thinking: &ThinkingConfig,
         mode: &AgentMode,
+        session_plan: bool,
         cwd: &str,
         history: &[Message],
     ) -> ContextSnapshot {
@@ -121,6 +125,7 @@ impl ToolsPreviewSource {
             model,
             &template::env_vars().set("{cwd}", cwd),
             mode,
+            session_plan,
             &bindings,
         );
         let mcp = self.mcp.clone().map(|mcp| {
@@ -143,7 +148,7 @@ impl ToolsPreviewSource {
                 filter: &ToolFilter::from_config(&self.config, model, &[]).for_mode(mode),
                 config: &self.config,
                 model,
-                mode,
+                session_plan,
                 audience: ToolAudience::MAIN,
                 deferral: BuiltinDeferral::resolve(&self.config, model),
                 deferred: &definitions.deferred,
@@ -218,6 +223,9 @@ pub(super) struct AgentLoop {
     /// Published on every run so workflow agents start under the mode the
     /// user last committed, however long ago their run was launched.
     mode: SharedMode,
+    /// The session plan binding the latest run carried, which keeps `plan`
+    /// in the tools prepared between runs.
+    plan: Option<PlanTarget>,
     /// Read when each run starts, so a run records for the session and
     /// workspace bound at that moment.
     change_recorder: RecorderSlot,
@@ -343,6 +351,7 @@ impl AgentLoop {
             background,
             delivery_fence,
             mode,
+            plan: None,
             change_recorder,
             workspace_session,
             remote_project_context,
@@ -668,6 +677,7 @@ impl AgentLoop {
             }
         };
         self.mode.store(Arc::new(input.mode.clone()));
+        self.plan = input.plan.clone();
         self.rebuild_tools(&effective_slot.model, &selected_slot.model, &input.thinking);
         self.effective_model_slot.store(Arc::clone(&effective_slot));
 
@@ -842,8 +852,17 @@ impl AgentLoop {
             &self.model_policy,
             self.timeouts,
         );
-        self.tools_preview_source()
-            .definitions(model, &self.vars, &self.mode.load(), &bindings)
+        self.tools_preview_source().definitions(
+            model,
+            &self.vars,
+            &self.mode.load(),
+            self.has_session_plan(),
+            &bindings,
+        )
+    }
+
+    fn has_session_plan(&self) -> bool {
+        self.mode.load().has_session_plan(self.plan.as_ref())
     }
 
     pub(super) fn tools_preview_source(&self) -> ToolsPreviewSource {
@@ -1063,7 +1082,7 @@ impl AgentLoop {
                 filter: &self.effective_tool_filter(),
                 config: &self.config,
                 model: &slot.model,
-                mode: &self.mode.load(),
+                session_plan: self.has_session_plan(),
                 audience: ToolAudience::MAIN,
                 deferral: BuiltinDeferral::resolve(&self.config, &slot.model),
                 deferred: &self.deferred,
@@ -1213,7 +1232,7 @@ pub(super) mod tests {
     use caudra_agent::mcp::stub_session;
     use caudra_agent::tools::native::plan;
     use caudra_agent::tools::profile_policy::{
-        MODE_DISABLED, PLAN_MODE_REQUIRED, PROFILE_DISABLED, PROFILE_LOADING,
+        MODE_DISABLED, PLAN_REQUIRED, PROFILE_DISABLED, PROFILE_LOADING,
     };
     use caudra_agent::tools::report::{REASON_CONFIG, REASON_PROFILE_LOADED};
     use caudra_agent::tools::{ToolEffect, ToolSource};
@@ -1296,12 +1315,14 @@ pub(super) mod tests {
         for mode in [
             AgentMode::Plan(PLAN_PATH.into()),
             AgentMode::RemotePlan(PlanRef::new(PREVIEW_PLAN_REF).unwrap()),
+            AgentMode::Build,
         ] {
             let snapshot = source.snapshot(
                 &model,
                 &model,
                 &ThinkingConfig::Off,
                 &mode,
+                true,
                 PREVIEW_CWD,
                 &history,
             );
@@ -1325,8 +1346,8 @@ pub(super) mod tests {
         }
     }
 
-    #[test_case(AgentMode::Build, false, PLAN_MODE_REQUIRED; "build")]
-    #[test_case(AgentMode::ReadOnly, false, PLAN_MODE_REQUIRED; "missing_target")]
+    #[test_case(AgentMode::Build, false, PLAN_REQUIRED; "unbound_build")]
+    #[test_case(AgentMode::ReadOnly, false, PLAN_REQUIRED; "missing_target")]
     #[test_case(AgentMode::Plan(PLAN_PATH.into()), true, REASON_CONFIG; "globally_disabled")]
     fn tools_preview_cannot_enable_ineligible_plan(mode: AgentMode, disabled: bool, reason: &str) {
         let config = AgentConfig {
@@ -1344,6 +1365,7 @@ pub(super) mod tests {
             &model,
             &ThinkingConfig::Off,
             &mode,
+            mode.has_session_plan(None),
             PREVIEW_CWD,
             &[],
         );
@@ -1402,6 +1424,7 @@ pub(super) mod tests {
             &model,
             &ThinkingConfig::Off,
             &mode,
+            mode.has_session_plan(None),
             PREVIEW_CWD,
             &[],
         );
@@ -1449,6 +1472,7 @@ pub(super) mod tests {
         let input = || AgentInput {
             message: message.into(),
             mode: AgentMode::Build,
+            plan: None,
             images: Vec::new(),
             mentions: Vec::new(),
             commits: Vec::new(),

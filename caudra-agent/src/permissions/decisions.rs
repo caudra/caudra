@@ -1315,7 +1315,7 @@ mod tests {
                 builtin_allows: true,
                 force_prompt: false,
                 forced: false,
-                exact_plan_write: false,
+                exact_plan: None,
             };
             let screened = manager
                 .screen_auto_candidate(&request, &context, &CancelToken::none())

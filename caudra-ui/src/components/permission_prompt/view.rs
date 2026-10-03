@@ -4,6 +4,7 @@ use caudra_agent::permissions::{
     PermissionCaution, PermissionLifetime, PermissionRequest, PermissionResourceAccess,
     PermissionResourceKind, PermissionRowGrant, PromptReason, grade_command_pattern,
 };
+use caudra_agent::tools::native::plan;
 use caudra_config::ToolKey;
 use caudra_grab::grab_scope;
 use caudra_workbench::text_field::{FieldKind, FieldStyles, TextField};
@@ -75,6 +76,8 @@ const PATTERN_PLACEHOLDER: &str = "a pattern ending in ` *`, such as cargo test 
 pub(super) const PRESS_AGAIN: &str = "Press Enter again to allow, or Esc to go back.";
 const DETAILS_TITLE: &str = "Details";
 const CUSTOMIZE_TITLE: &str = "Customize";
+const PLAN_READ_QUESTION: &str = "Allow reading the plan?";
+const PLAN_WRITE_QUESTION: &str = "Allow changing the plan?";
 const OVERFLOW_HINT: &str = "? shows all";
 const REMEMBER_FOR: &str = "Remember for ";
 const EFFECT_LABEL: &str = "Effect";
@@ -665,6 +668,13 @@ impl PermissionPrompt {
         let Some(resource) = request.resources.first() else {
             return format!("Allow {}?", review_text(&request.tool.to_string()));
         };
+        if plan::is_plan_subject(&request.subject) {
+            return match resource.access {
+                Some(PermissionResourceAccess::Write) => PLAN_WRITE_QUESTION,
+                _ => PLAN_READ_QUESTION,
+            }
+            .into();
+        }
         match (&resource.kind, &resource.access) {
             (PermissionResourceKind::Url, _) => "Allow fetching a web page?".into(),
             (PermissionResourceKind::Query, _) => "Allow a web search?".into(),
@@ -1477,6 +1487,8 @@ pub(super) mod tests {
         PermissionSubject, PromptReason, ResourceCoverage, RuleOrigin, ScriptLanguage,
         ShellOpacity, StructuredPermissionEffect,
     };
+    use caudra_agent::tools::native;
+    use caudra_agent::tools::native::plan::{self, PlanAccess};
     use caudra_agent::tools::{PermissionIntent, PermissionScopes};
     use caudra_config::ToolKey;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1493,6 +1505,7 @@ pub(super) mod tests {
         PROJECT, command_resource, commands_request, native_shell_request, shell_request,
     };
     use super::super::{Panel, PermissionPrompt};
+    use super::{PLAN_READ_QUESTION, PLAN_WRITE_QUESTION};
     use crate::components::buffer_text;
     use crate::components::command_text::tests::{
         COLOUR_THEME, NOT_COLOURED, NOT_TOLD_APART, PYTHON_SYNTAX, SHELL_SYNTAX, assert_drawn_in,
@@ -1521,6 +1534,13 @@ pub(super) mod tests {
     pub(crate) const OUTSIDE_FILE: &str = "/etc/caudra/caudra.toml";
     const READ_CONTRACT: &str = "file.read.v1";
     const WORKCELL_OWNER: &str = "workcell";
+    const LOCAL_PLAN: &str = "/project/plan.md";
+    const REMOTE_PLAN: &str = "plan-0123456789abcdef0123456789abcdef";
+    const PLAN_DOCUMENT_RESOURCE: &str = "local_document";
+    const PLAN_SCOPE_PREFIX: &str = "plan:";
+    const OPERATION_ATTRIBUTE: &str = "operation";
+    const PLAN_PLUGIN: &str = "planner";
+    const GENERIC_READ_QUESTION: &str = "Allow reading a file?";
     const PRIVATE_ARTIFACT_MODE: u32 = 0o600;
     const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
     pub(crate) const THEMES: [&str; 2] = ["ayu_dark", "ayu_light"];
@@ -1710,6 +1730,61 @@ pub(super) mod tests {
         request
     }
 
+    /// A `plan` call the way the native tool asks about it: a local plan by
+    /// its path, a remote one by its document reference.
+    fn plan_request(remote: bool, access: PlanAccess) -> PermissionRequest {
+        let operation = access.operation();
+        let (kind, value, locator) = if remote {
+            (
+                PermissionResourceKind::Custom {
+                    name: PLAN_DOCUMENT_RESOURCE.into(),
+                },
+                format!("{PLAN_SCOPE_PREFIX}{REMOTE_PLAN}"),
+                REMOTE_PLAN,
+            )
+        } else {
+            (PermissionResourceKind::File, LOCAL_PLAN.into(), LOCAL_PLAN)
+        };
+        let intent = PermissionIntent::new(
+            PermissionScopes::single(format!("{PLAN_SCOPE_PREFIX}{operation}:{locator}")),
+            vec![PermissionResource {
+                kind,
+                value,
+                access: Some(access.resource_access()),
+                protected: false,
+                requires_prompt: false,
+                attributes: BTreeMap::from([(OPERATION_ATTRIBUTE.into(), operation.into())]),
+            }],
+            PermissionRisk::Low,
+        );
+        let mut request = PermissionRequest::from_intent_with_identity(
+            plan::NAME.into(),
+            ToolKey::native(plan::NAME),
+            &intent,
+            json!({"action": operation}),
+            Path::new(PROJECT),
+            PermissionSubject::Native {
+                owner: native::OWNER.into(),
+                contract: plan::permission_contract().into(),
+            },
+            PermissionExecutorKind::Native,
+        );
+        request.presentation.project = Some(PROJECT.into());
+        request
+    }
+
+    /// A plugin's tool that happens to be called `plan`.
+    fn plugin_plan_request() -> PermissionRequest {
+        let mut request = plan_request(false, PlanAccess::Read);
+        request.subject = PermissionSubject::Lua {
+            plugin: PLAN_PLUGIN.into(),
+            tool: plan::NAME.into(),
+            contract: plan::permission_contract().into(),
+        };
+        request.executor = PermissionExecutorKind::Lua;
+        request
+    }
+
     /// A request the way plan mode sends it: no allow lasts for all
     /// projects, and a broad one lasts this conversation at most.
     pub(crate) fn planning(mut request: PermissionRequest) -> PermissionRequest {
@@ -1750,6 +1825,14 @@ pub(super) mod tests {
             (
                 "plan",
                 prompt_for(planning(native_shell_request(SINGLE_COMMAND))),
+            ),
+            (
+                "remote-plan-read",
+                prompt_for(plan_request(true, PlanAccess::Read)),
+            ),
+            (
+                "remote-plan-write",
+                prompt_for(plan_request(true, PlanAccess::Write)),
             ),
             (
                 "caution",
@@ -1915,12 +1998,34 @@ pub(super) mod tests {
     #[test_case(native_shell_request(SINGLE_COMMAND), "Allow shell command?"; "single_command")]
     #[test_case(commands_request(&["cargo fmt", "cargo clippy"]), "Allow shell commands?"; "batch")]
     #[test_case(fetch_request(), "Allow fetching a web page?"; "web_fetch")]
-    #[test_case(file_request(OUTSIDE_FILE, PermissionResourceAccess::Read), "Allow reading a file?"; "file_read")]
+    #[test_case(file_request(OUTSIDE_FILE, PermissionResourceAccess::Read), GENERIC_READ_QUESTION; "file_read")]
     #[test_case(file_request(OUTSIDE_FILE, PermissionResourceAccess::Write), "Allow editing a file?"; "file_write")]
+    #[test_case(plan_request(false, PlanAccess::Read), PLAN_READ_QUESTION; "local_plan_read")]
+    #[test_case(plan_request(false, PlanAccess::Write), PLAN_WRITE_QUESTION; "local_plan_write")]
+    #[test_case(plan_request(true, PlanAccess::Read), PLAN_READ_QUESTION; "remote_plan_read")]
+    #[test_case(plan_request(true, PlanAccess::Write), PLAN_WRITE_QUESTION; "remote_plan_write")]
+    #[test_case(plugin_plan_request(), GENERIC_READ_QUESTION; "a_plugin_named_plan")]
     fn the_title_asks_about_the_tool(request: PermissionRequest, question: &str) {
         let mut prompt = prompt_for(request);
         assert_eq!(prompt.question(), question);
         assert!(render(&mut prompt, FIT_WIDTH, FIT_HEIGHT).contains(question));
+    }
+
+    /// A local plan is named by its path. A remote plan's reference means
+    /// nothing to a reader, so it is named as the session's plan instead.
+    #[test_case(false, PlanAccess::Read, LOCAL_PLAN; "local_read")]
+    #[test_case(false, PlanAccess::Write, LOCAL_PLAN; "local_write")]
+    #[test_case(true, PlanAccess::Read, plan::SESSION_PLAN_LABEL; "remote_read")]
+    #[test_case(true, PlanAccess::Write, plan::SESSION_PLAN_LABEL; "remote_write")]
+    fn a_plan_prompt_names_the_plan_not_its_reference(
+        remote: bool,
+        access: PlanAccess,
+        target: &str,
+    ) {
+        let mut prompt = prompt_for(plan_request(remote, access));
+        let text = prose(&mut prompt, FIT_WIDTH, FIT_HEIGHT);
+        assert!(text.contains(target), "{text}");
+        assert!(!text.contains(REMOTE_PLAN), "{text}");
     }
 
     #[test]

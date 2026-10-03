@@ -84,6 +84,7 @@ use std::time::{Duration, Instant};
 
 use caudra_agent::AgentInput;
 use caudra_agent::peers::{PeerDecision, PeerReviewToken};
+use caudra_agent::tools::native::plan::PlanTarget;
 use caudra_agent::tools::{SHELL_TOOL_NAME, ToolEffect};
 use caudra_agent::worktree::Request as WorktreeRequest;
 use caudra_agent::{
@@ -882,6 +883,7 @@ pub struct PlanHandoff {
     pub(crate) content: String,
     pub(crate) source: String,
     pub(crate) header: String,
+    pub(crate) target: PlanTarget,
 }
 
 pub enum Action {
@@ -977,6 +979,7 @@ pub struct ForkedSession {
     pub session: crate::AppSession,
     pub lease: Arc<caudra_storage::sessions::SessionLease>,
     pub draft: Option<ForkDraft>,
+    pub warning: Option<String>,
 }
 
 pub struct ForkDraft {

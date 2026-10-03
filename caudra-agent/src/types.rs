@@ -3053,7 +3053,6 @@ mod tests {
     use caudra_providers::estimate_tokens;
     use caudra_storage::StateDir;
     use caudra_storage::id::SessionRef;
-    use caudra_storage::local_documents::DocumentRevision;
     use caudra_storage::tool_outputs::ToolOutputStore;
     use caudra_workspace::PlanRef;
     use tempfile::TempDir;
@@ -4071,11 +4070,7 @@ mod tests {
         } else {
             PlanTarget::Local(PLAN_WRITE_PATH.into())
         };
-        let result = PlanWriteResult::new(
-            target,
-            DocumentRevision::new("a".repeat(64)).unwrap(),
-            PLAN_WRITE_CONTENT.into(),
-        );
+        let result = PlanWriteResult::new(target, PLAN_WRITE_CONTENT.into());
         let mut event = ToolDoneEvent::error("plan-write".into(), PLAN_WRITE_CONTENT);
         event.tool = plan::NAME.into();
         event.is_error = error;
@@ -4111,7 +4106,6 @@ mod tests {
     ) {
         let result = PlanWriteResult::new(
             PlanTarget::Local(PLAN_WRITE_PATH.into()),
-            DocumentRevision::new("a".repeat(64)).unwrap(),
             PLAN_WRITE_CONTENT.into(),
         );
         let entry = BatchToolEntry {

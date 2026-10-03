@@ -132,6 +132,17 @@ impl LocalDocumentStore {
         project: &ProjectKey,
         session_id: &str,
     ) -> Result<PlanRef, LocalDocumentError> {
+        self.create_plan_with_content(project, session_id, "")
+    }
+
+    /// A new plan owned by `session_id` that starts out holding `content`,
+    /// for a session that takes another session's plan as its own.
+    pub fn create_plan_with_content(
+        &self,
+        project: &ProjectKey,
+        session_id: &str,
+        content: &str,
+    ) -> Result<PlanRef, LocalDocumentError> {
         self.validate_project(project)?;
         let dir = self.plan_write_dir(session_id);
         for _ in 0..10 {
@@ -139,7 +150,7 @@ impl LocalDocumentStore {
                 .map_err(|_| LocalDocumentError::InvalidReference)?;
             let path = document_path(&dir, reference.as_str())?;
             if !path.exists() {
-                PlanFile::new(path)?.write("")?;
+                PlanFile::new(path)?.write(content)?;
                 return Ok(reference);
             }
         }
@@ -172,15 +183,8 @@ impl LocalDocumentStore {
         if !owned || !legacy_path.is_file() {
             return Err(LocalDocumentError::WrongOwner);
         }
-        let content = PlanFile::new(legacy_path.to_path_buf())?.read()?.0;
-        let reference = self.create_plan(project, session_id)?;
-        self.write(
-            project,
-            Some(session_id),
-            &LocalDocumentRef::Plan(reference.clone()),
-            &content,
-        )?;
-        Ok(reference)
+        let content = PlanFile::new(legacy_path.to_path_buf())?.read()?;
+        self.create_plan_with_content(project, session_id, &content)
     }
 
     pub fn read(
@@ -192,7 +196,7 @@ impl LocalDocumentStore {
         self.validate_project(project)?;
         let (path, name) = self.resolve(project, session_id, reference)?;
         let content = if matches!(reference, LocalDocumentRef::Plan(_)) {
-            PlanFile::new(path)?.read()?.0
+            PlanFile::new(path)?.read()?
         } else {
             read_secure(&path)?
         };
@@ -681,6 +685,8 @@ mod tests {
     const LEGACY_PLAN: &str = "legacy.md";
     #[cfg(unix)]
     const LEGACY_MODE: u32 = 0o644;
+    #[cfg(unix)]
+    const MODE_MASK: u32 = 0o777;
 
     fn legacy_plan_path(store: &LocalDocumentStore) -> PathBuf {
         let root = store
@@ -1061,6 +1067,52 @@ mod tests {
             store.read(&other, Some(SESSION), &document),
             Err(LocalDocumentError::WrongProject)
         ));
+    }
+
+    #[test]
+    fn a_plan_created_with_content_is_private_to_its_session() {
+        let (_root, store, project) = store();
+        let document = LocalDocumentRef::Plan(
+            store
+                .create_plan_with_content(&project, SESSION, REMOTE_CONTENT)
+                .unwrap(),
+        );
+
+        assert_eq!(
+            store
+                .read(&project, Some(SESSION), &document)
+                .unwrap()
+                .content,
+            REMOTE_CONTENT
+        );
+        assert!(matches!(
+            store.read(&project, Some(OTHER_SESSION), &document),
+            Err(LocalDocumentError::WrongOwner)
+        ));
+        #[cfg(unix)]
+        {
+            let (path, _) = store.resolve(&project, Some(SESSION), &document).unwrap();
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & MODE_MASK,
+                super::OWNER_ONLY_FILE_MODE
+            );
+        }
+    }
+
+    #[test_case(PROJECT, MAX_PLAN_BYTES + 1, LocalDocumentError::TooLarge; "oversize")]
+    #[test_case(OTHER_PROJECT, REMOTE_CONTENT.len(), LocalDocumentError::WrongProject; "foreign_project")]
+    fn a_refused_plan_with_content_allocates_nothing(
+        project: &str,
+        size: usize,
+        expected: LocalDocumentError,
+    ) {
+        let (_root, store, _) = store();
+        let project = ProjectKey::new(project).unwrap();
+
+        let created = store.create_plan_with_content(&project, SESSION, &"x".repeat(size));
+
+        assert_eq!(created.unwrap_err().to_string(), expected.to_string());
+        assert!(!store.plan_write_dir(SESSION).exists());
     }
 
     #[test]

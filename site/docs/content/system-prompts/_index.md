@@ -178,16 +178,16 @@ tools:
     plan: lazy
 ---
 Delegate research and implementation to appropriate task profiles.
-Coordinate results, maintain the todo list, and use the active plan document in plan mode.
+Coordinate results, maintain the todo list, and keep the session plan current.
 ```
 
 This actor cannot call file, web, or shell tools directly. It can delegate to a task using `profile: researcher`, another coding profile, or `profile: builtin`. Each task resolves its own selected profile against the inherited CLI, config, mode, and security restrictions. The parent's profile-local mask is not inherited as a global restriction. Tool compatibility is recalculated for the worker's model. Omitting `profile` still selects the parent's profile, so an omitted profile keeps the scheduler's tool choices.
 
 This independence applies to Caudra's audited task delegation path, including workflow-created tasks and nested `task` calls. Ordinary Lua tool calls retain the current actor's policy. Generic/custom subagent APIs can only narrow their caller's effective access.
 
-The single [`plan` tool](/docs/tools/#plan) reads or replaces the main agent's active plan document through the same interface for local and remote workspaces. It has no model-supplied path, reference, or session selector. It is available only for the committed main-agent Plan invocation. Selecting Plan in the composer does not change the authority of running work. Saving cannot approve a plan or switch modes. Secure plan storage currently requires a Unix client, including for remote workspaces.
+The single [`plan` tool](/docs/tools/#plan) reads or replaces this session's plan through the same interface for local and remote workspaces. It has no model-supplied path, reference, or session selector. It is available once the session has a plan, which it gets the first time it enters Plan. The main agent can then read and replace the plan in Plan and Build. Saving cannot approve a plan or switch modes. Secure plan storage currently requires a Unix client, including for remote workspaces.
 
-Implement and Clear-and-Implement capture validated plan content and its revision before consuming the plan or clearing the session. The content is included in the model-visible Build request, so a scheduler does not need file access to receive it. If capture fails, the plan remains available and implementation does not start.
+Implement and Clear-and-Implement capture validated plan content before they switch to Build or clear the session. The content is included in the model-visible Build request, so a scheduler does not need file access to receive it. If capture fails, the plan remains available and implementation does not start.
 
 ## Configure subagents
 
@@ -212,7 +212,7 @@ Caudra validates each profile against the effective subagent model. An explicit 
 
 The `task` tool accepts `profile` and `mode`. A new task inherits the parent profile when `profile` is omitted. Set `profile` to `builtin` to use Caudra's built-in task prompt.
 
-`mode` defaults to the caller's own mode and can never exceed it, so a task launched from build mode can build, and one launched from plan mode stays read-only. `plan` has a host-enforced read-only tool set with no file writes. Eligible shell calls must pass the host's confined read-only checks. A task that needs mutating commands requires `build`. A `build` request from a plan-mode caller runs as `plan` instead. Every result reports the mode the task ran as. See [Read-only agents](/docs/permissions/#read-only-agents).
+`mode` defaults to the caller's own mode and can never exceed it, so a task launched from build mode can build, and one launched from plan mode stays read-only. `plan` has a host-enforced read-only tool set with no file writes. Eligible shell calls must pass the host's confined read-only checks. A task that needs mutating commands requires `build`. A `build` request from a plan-mode caller runs as `plan` instead. Every result reports the mode the task ran as. A task in either mode can read the session plan but cannot replace it. See [Read-only agents](/docs/permissions/#read-only-agents).
 
 Task profiles support overlay and custom layouts. For a custom task prompt, directives resolve to the matching research or general task component. `{{caudra.default}}` expands to the complete built-in task prompt. Caudra appends the system-reminder contract after the rendered profile, so custom layouts cannot remove it.
 

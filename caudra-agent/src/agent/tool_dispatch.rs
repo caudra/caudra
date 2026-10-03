@@ -19,14 +19,15 @@ use crate::permissions::{
 };
 use crate::task_set::TaskSet;
 use crate::tools::json_repair::RepairError;
+use crate::tools::native::plan::{self, PlanAccess, PlanTarget};
 use crate::tools::native::report_to_parent;
 use crate::tools::registry::{
     PlanModeAccess, RegisteredTool, ToolInvocation, ToolRegistry, TrustedToolSource,
 };
 use crate::tools::{
     DOOM_LOOP_GUIDANCE, LocalToolEntry, LockKey, PLAN_WRITE_RESTRICTED, READ_ONLY_CALL_GUIDANCE,
-    READ_ONLY_TOOL_RESTRICTED, TOOL_SEARCH_TOOL_NAME, ToolAudience, ToolContext, ToolEffect,
-    ToolError, ToolExecResult, ToolFailure, ToolFilter, ToolSource,
+    READ_ONLY_TOOL_RESTRICTED, TOOL_SEARCH_TOOL_NAME, ToolContext, ToolEffect, ToolError,
+    ToolExecResult, ToolFailure, ToolFilter, ToolSource,
 };
 use crate::{
     AgentError, AgentEvent, AgentMode, LuaToolProvenance, ToolAccounting, ToolDoneEvent,
@@ -69,7 +70,7 @@ impl Emit<'_> {
 const DOOM_LOOP_THRESHOLD: usize = 3;
 const MCP_BLOCKED_IN_PLAN: &str = "MCP tools are not available in plan mode";
 const UNKNOWN_TOOL_PREFIX: &str = "unknown tool";
-const TOOL_DISABLED_SUFFIX: &str = "is disabled for the current agent";
+pub(crate) const TOOL_DISABLED_SUFFIX: &str = "is disabled for the current agent";
 const INVALID_INPUT_MESSAGE: &str = "arguments were not valid JSON, so the tool did not run. Call it again with complete \
      arguments; if the input is large, split it across several calls. Raw text received:";
 const MAX_INVALID_INPUT_CHARS: usize = 2_000;
@@ -934,11 +935,11 @@ async fn run_inner(
             }
 
             let mutation_targets = invocation.mutation_targets(ctx);
-            let active_plan_write = invocation.writes_active_plan()
-                && matches!(entry.source, ToolSource::Native { trusted: true, .. })
-                && ctx.mode.is_planning()
-                && ctx.audience == ToolAudience::MAIN;
-            let remote_plan_target = ctx.mode.plan_ref().is_some() && active_plan_write;
+            let plan_write = (invocation.active_plan_access() == Some(PlanAccess::Write)
+                && matches!(entry.source, ToolSource::Native { trusted: true, .. }))
+            .then(|| plan::write_target(ctx))
+            .and_then(Result::ok);
+            let remote_plan_target = ctx.mode.plan_ref().is_some() && plan_write.is_some();
             if ctx.mode.plan_ref().is_some()
                 && !call_effect.is_safe_in_read_only()
                 && !remote_plan_target
@@ -965,8 +966,14 @@ async fn run_inner(
                 return done_error(ToolFailure::Denied, PLAN_WRITE_RESTRICTED.into());
             }
 
+            // Only the target the plan authority verified is exempt, whatever
+            // else the same call names.
+            let verified_plan = match &plan_write {
+                Some(PlanTarget::Local(path)) => Some(path),
+                _ => None,
+            };
             for target in &mutation_targets {
-                let is_plan_target = active_plan_write
+                let is_plan_target = verified_plan == Some(target)
                     || ctx
                         .mode
                         .plan_path()
@@ -988,7 +995,7 @@ async fn run_inner(
                 }
             }
 
-            if (!remote_plan_target || active_plan_write)
+            if (!remote_plan_target || plan_write.is_some())
                 && let Err(refusal) = enforce_permission(
                     invocation.as_ref(),
                     prepared_intent.as_ref(),
@@ -1722,7 +1729,7 @@ async fn enforce_permission(
         }
     };
     if let Some(intent) = intent {
-        if inv.writes_active_plan()
+        if inv.active_plan_access().is_some()
             && matches!(entry.source, ToolSource::Native { trusted: true, .. })
         {
             return ctx
@@ -2186,10 +2193,10 @@ mod tests {
         PERMISSION_DENIED_PREFIX, PermissionManager, PermissionResource, PermissionResourceAccess,
         PermissionResourceKind, PermissionRisk,
     };
-    use crate::tools::BATCH_TOOL_NAME;
     use crate::tools::native::batch::BatchTool;
     use crate::tools::registry::{PermissionIntent, ToolSource};
     use crate::tools::test_support::{GUARDED_TOOL_NAME, GuardedMock, NamedMock};
+    use crate::tools::{BATCH_TOOL_NAME, ToolAudience};
     use crate::{AgentMode, Envelope, EventSender, ShellOutput, StoredSession, TaskCard};
 
     const OBSERVED_TOOL: &str = "observed";

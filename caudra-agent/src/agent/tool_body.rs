@@ -63,9 +63,9 @@ enum Body {
 /// empty until the last stretch of the stream, and empty for good on every
 /// edit whose replacement is shorter than the floor `size_label` applies.
 ///
-/// A note and a local document belong here for the reason a whole file does:
-/// each is a document the call carries entire, legible half-written, and drawn
-/// by its settled card as the document it is. A tool whose body is only one of
+/// A note and a plan belong here for the reason a whole file does: each is a
+/// document the call carries entire, legible half-written, and drawn by its
+/// settled card as the document it is. A tool whose body is only one of
 /// several commands still earns a row, because the reader that finds no such
 /// argument decodes nothing and costs nothing.
 ///
