@@ -13,7 +13,7 @@ use std::time::Instant;
 use async_lock::Mutex as AsyncMutex;
 use caudra_config::ProfileToolPolicy;
 use caudra_config::decisions::FeatureMode;
-use caudra_decision::{Answer, DecisionResponse, Question, QuestionSet, QuestionType};
+use caudra_decision::{Answer, DecisionResponse};
 use serde_json::{Value as JsonValue, json};
 use tracing::info;
 
@@ -35,7 +35,10 @@ use super::steering::{SharedSteering, Steering};
 use super::{ModelRoute, resolve_model_for_purpose};
 use crate::background::JobScope;
 use crate::cancel::{CancelMap, CancelSlot};
-use crate::decisions::{DecisionFeature, DecisionReceipt, Decisions};
+use crate::decisions::questions as decision_questions;
+use crate::decisions::{
+    DecisionFeature, DecisionReceipt, DecisionState, Decisions, redacted_excerpt,
+};
 use crate::prompt::PromptId;
 use crate::prompt::profile::SystemPromptProfile;
 use crate::tools::native::batch::{self, MAX_BATCH_SIZE};
@@ -67,6 +70,11 @@ const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
 /// prose and will never resolve one, so it stops being accumulated and a
 /// long reasoning stream cannot be buffered a second time for nothing.
 const THOUGHT_TITLE_SCAN_LIMIT: usize = 200;
+pub(crate) const DIFFICULTY_QUESTION: &str = "difficulty";
+const ROUTINE_LEVEL: usize = 1;
+const OPEN_ENDED_LEVEL: usize = 3;
+const SUBAGENT_PROMPT_EXCERPT_BYTES: usize = 900;
+const ROUTING_INPUT_SCOPE: &str = "task_label_and_prompt_excerpt";
 
 /// Forwards subagent events to the parent, stamped with the subagent identity.
 /// Usage takes two paths: live on the tool header while the run goes on (last
@@ -772,6 +780,9 @@ pub struct TaskOptions {
     /// user configured that and the caller only asked for a job. Not persisted
     /// with the task, so a continuation resolves the model the ordinary way.
     pub model_job: Option<ModelPurpose>,
+    /// The prompt the task will be sent, read only by subagent routing, which
+    /// sees a redacted excerpt of it.
+    pub routing_prompt: Option<String>,
     /// Tool definitions the subagent sees on top of the registry's, paired
     /// with `local_tools` by name.
     pub local_definitions: Vec<JsonValue>,
@@ -885,7 +896,13 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
         continuation,
         profile.as_deref(),
         opts.model_job,
-        &opts.name,
+        RoutingTask {
+            label: &opts.name,
+            prompt: opts.routing_prompt.as_deref(),
+            mode: spec.mode,
+            profile: (*spec.profile_name != *ctx.default_task_prompt_profile_name)
+                .then_some(spec.profile_name.as_str()),
+        },
     )
     .await;
     let asked = opts
@@ -1289,18 +1306,27 @@ struct SubagentRoute {
     receipt: Option<DecisionReceipt>,
 }
 
+/// What the router reads about a task. `profile` is set only when the caller
+/// chose one, since the default profile says nothing about the work.
+pub(crate) struct RoutingTask<'a> {
+    pub(crate) label: &'a str,
+    pub(crate) prompt: Option<&'a str>,
+    pub(crate) mode: SubagentTaskMode,
+    pub(crate) profile: Option<&'a str>,
+}
+
 async fn route_subagent(
     ctx: &ToolContext,
     continuation: bool,
     profile: Option<&SystemPromptProfile>,
     requested: Option<ModelPurpose>,
-    task_label: &str,
+    task: RoutingTask<'_>,
 ) -> Option<SubagentRoute> {
     let revision = ctx.permissions.passive_decision_revision()?;
     if continuation
         || requested.is_some()
         || profile.is_some_and(|profile| profile.subagent_model().is_some())
-        || task_label.trim().is_empty()
+        || task.label.trim().is_empty()
     {
         return None;
     }
@@ -1309,16 +1335,16 @@ async fn route_subagent(
     if !decisions.enabled(&feature) {
         return None;
     }
-    let questions = subagent_questions()?;
-    let state = json!({"task_label": task_label});
+    let questions = decision_questions::SUBAGENT.as_ref()?;
+    let state = routing_state(&task);
     let context = ctx
         .permissions
-        .decision_context(json!({"input_scope": "task_label_only"}));
+        .decision_context(json!({"input_scope": ROUTING_INPUT_SCOPE}));
     let outcome = ctx
         .cancel
         .race(
             ctx.permissions
-                .run_passive_decision(decisions.evaluate(feature, &state, &questions, &context)),
+                .run_passive_decision(decisions.evaluate(feature, &state, questions, &context)),
         )
         .await
         .ok()
@@ -1341,48 +1367,34 @@ async fn route_subagent(
     })
 }
 
-fn subagent_questions() -> Option<QuestionSet> {
-    QuestionSet::new("subagent.v1", [
-        ("difficulty", Question {
-            kind: QuestionType::Score,
-            instructions: json!("Rate the difficulty of the task. A task label is incomplete evidence; use low confidence when uncertain."),
-            criteria: Some(json!(["Simple, mechanical work", "Difficult work requiring deep reasoning"])),
-        }),
-        ("mechanical", Question {
-            kind: QuestionType::Noul,
-            instructions: json!("The task is mechanical and has a straightforward procedure."),
-            criteria: None,
-        }),
-        ("deep_reasoning", Question {
-            kind: QuestionType::Noul,
-            instructions: json!("The task requires deep reasoning."),
-            criteria: None,
-        }),
-    ].into_iter().map(|(id, question)| (id.into(), question)).collect()).ok()
+/// The label, a redacted excerpt of the prompt, the mode and any chosen
+/// profile; the label alone when the rest does not fit the state cap.
+pub(crate) fn routing_state(task: &RoutingTask) -> JsonValue {
+    let mut described = json!({"label": task.label});
+    if let Some(prompt) = task.prompt {
+        described["prompt"] = json!(redacted_excerpt(prompt, SUBAGENT_PROMPT_EXCERPT_BYTES));
+    }
+    described["mode"] = json!(task.mode);
+    if let Some(profile) = task.profile {
+        described["profile"] = json!(profile);
+    }
+    let state = json!({"task": described});
+    if DecisionState::new(&state).is_ok() {
+        state
+    } else {
+        json!({"task": {"label": task.label}})
+    }
 }
 
-fn subagent_job(response: &DecisionResponse, threshold: f64) -> Option<ModelPurpose> {
-    let Answer::Score(difficulty) = response.answers.get("difficulty")? else {
+/// Routine work or less runs on the Fast model and open-ended work on the
+/// Best one; anything between keeps the Subagent model.
+pub(crate) fn subagent_job(response: &DecisionResponse, threshold: f64) -> Option<ModelPurpose> {
+    let Answer::Score(difficulty) = response.answers.get(DIFFICULTY_QUESTION)? else {
         return None;
     };
-    let Answer::Noul(mechanical) = response.answers.get("mechanical")? else {
-        return None;
-    };
-    let Answer::Noul(deep) = response.answers.get("deep_reasoning")? else {
-        return None;
-    };
-    if difficulty.confidence < threshold {
-        return None;
-    }
-    if difficulty.score <= 1.0 - threshold
-        && mechanical.noul >= threshold
-        && deep.noul <= 1.0 - threshold
-    {
+    if difficulty.at_most(ROUTINE_LEVEL) >= threshold {
         Some(ModelPurpose::Fast)
-    } else if difficulty.score >= threshold
-        && deep.noul >= threshold
-        && mechanical.noul <= 1.0 - threshold
-    {
+    } else if difficulty.at_least(OPEN_ENDED_LEVEL) >= threshold {
         Some(ModelPurpose::Best)
     } else {
         None
@@ -1654,6 +1666,11 @@ mod tests {
     const ROUTING_TASK: &str = "Rename a variable";
     const ROUTING_BASELINE: &str = "anthropic/claude-sonnet-4-6";
     const ROUTING_FAST: &str = "anthropic/claude-haiku-4-5";
+    const ROUTING_PROFILE: &str = "security";
+    const ROUTING_SECRET: &str = "do-not-send-this-value";
+    const FAST_LEVELS: [f64; 4] = [0.6, 0.35, 0.05, 0.0];
+    const LONG_LABEL_WORDS: usize = 140;
+    const LONG_PROMPT_WORDS: usize = 400;
     const EFFECT_TEST_TIMEOUT: Duration = Duration::from_secs(10);
     const DUPLICATE_CALL_ERROR: &str = "duplicates call ID";
     const SUBAGENT_ROOT: &str = "/work/project";
@@ -1693,10 +1710,7 @@ mod tests {
     }
 
     struct RoutingEngine {
-        difficulty: f64,
-        mechanical: f64,
-        deep: f64,
-        confidence: f64,
+        levels: [f64; 4],
         fail: bool,
         calls: Arc<AtomicUsize>,
     }
@@ -1712,18 +1726,63 @@ mod tests {
             if self.fail {
                 return Err(DecisionError::Timeout);
             }
-            let levels = request.questions["difficulty"].criteria.as_ref().unwrap();
+            let score: f64 = self
+                .levels
+                .iter()
+                .enumerate()
+                .map(|(level, probability)| level as f64 * probability)
+                .sum();
             Ok(serde_json::from_value(json!({
                 "model": request.model,
                 "answers": {
-                    "difficulty": {"type": "score", "score": self.difficulty, "confidence": self.confidence,
-                        "legend": {"0": levels[0], "1": levels[1]},
-                        "probabilities": {"0": 1.0 - self.difficulty, "1": self.difficulty}},
-                    "mechanical": {"type": "noul", "noul": self.mechanical},
-                    "deep_reasoning": {"type": "noul", "noul": self.deep}
+                    DIFFICULTY_QUESTION: {"type": "score", "score": score, "confidence": 1.0,
+                        "legend": {"0": "", "1": "", "2": "", "3": ""},
+                        "probabilities": {"0": self.levels[0], "1": self.levels[1],
+                            "2": self.levels[2], "3": self.levels[3]}},
                 }, "usage": {"input_tokens": 0, "output_tokens": 0}
-            })).unwrap())
+            }))
+            .unwrap())
         }
+    }
+
+    fn routing_task(label: &str) -> RoutingTask<'_> {
+        RoutingTask {
+            label,
+            prompt: None,
+            mode: SubagentTaskMode::Build,
+            profile: None,
+        }
+    }
+
+    #[test]
+    fn routing_state_redacts_prompt_excerpt() {
+        let prompt = format!(
+            "Deploy with TOKEN={ROUTING_SECRET} and {}",
+            "check the logs ".repeat(LONG_PROMPT_WORDS)
+        );
+        let state = routing_state(&RoutingTask {
+            prompt: Some(&prompt),
+            profile: Some(ROUTING_PROFILE),
+            ..routing_task(ROUTING_TASK)
+        });
+        let described = &state["task"];
+        assert_eq!(described["label"], ROUTING_TASK);
+        assert_eq!(described["mode"], json!(SubagentTaskMode::Build));
+        assert_eq!(described["profile"], ROUTING_PROFILE);
+        let excerpt = described["prompt"].as_str().unwrap();
+        assert!(!excerpt.contains(ROUTING_SECRET));
+        assert!(excerpt.len() <= SUBAGENT_PROMPT_EXCERPT_BYTES);
+    }
+
+    #[test]
+    fn routing_state_falls_back_to_label() {
+        let label = "word ".repeat(LONG_LABEL_WORDS);
+        let prompt = "step ".repeat(LONG_PROMPT_WORDS);
+        let state = routing_state(&RoutingTask {
+            prompt: Some(&prompt),
+            ..routing_task(&label)
+        });
+        assert_eq!(state, json!({"task": {"label": label}}));
     }
 
     fn routing_decisions(
@@ -1759,20 +1818,15 @@ mod tests {
         )
     }
 
-    #[test_case(FeatureMode::Enforce, 0.0, 1.0, 0.0, 1.0, false, Some(ModelPurpose::Fast); "fast")]
-    #[test_case(FeatureMode::Enforce, 1.0, 0.0, 1.0, 1.0, false, Some(ModelPurpose::Best); "best")]
-    #[test_case(FeatureMode::Shadow, 0.0, 1.0, 0.0, 1.0, false, None; "shadow")]
-    #[test_case(FeatureMode::Enforce, 0.0, 1.0, 0.0, 0.2, false, None; "low_confidence")]
-    #[test_case(FeatureMode::Enforce, 0.0, 0.5, 0.0, 1.0, false, None; "uncertain_yes_no")]
-    #[test_case(FeatureMode::Enforce, 0.0, 1.0, 1.0, 1.0, false, None; "conflicting_signals")]
-    #[test_case(FeatureMode::Enforce, 0.5, 1.0, 0.0, 1.0, false, None; "uncertain_difficulty")]
-    #[test_case(FeatureMode::Enforce, 0.0, 1.0, 0.0, 1.0, true, None; "engine_error")]
-    fn decision_subagent_route(
+    #[test_case(FeatureMode::Enforce, FAST_LEVELS, false, Some(ModelPurpose::Fast); "routine_or_less_is_fast")]
+    #[test_case(FeatureMode::Enforce, [0.0, 0.0, 0.05, 0.95], false, Some(ModelPurpose::Best); "open_ended_is_best")]
+    #[test_case(FeatureMode::Enforce, [0.0, 0.1, 0.85, 0.05], false, None; "judgment_keeps_the_default")]
+    #[test_case(FeatureMode::Enforce, [0.5, 0.0, 0.0, 0.5], false, None; "split_keeps_the_default")]
+    #[test_case(FeatureMode::Shadow, FAST_LEVELS, false, None; "shadow")]
+    #[test_case(FeatureMode::Enforce, FAST_LEVELS, true, None; "engine_error")]
+    fn subagent_job_routes_on_difficulty_bounds(
         mode: FeatureMode,
-        difficulty: f64,
-        mechanical: f64,
-        deep: f64,
-        confidence: f64,
+        levels: [f64; 4],
         fail: bool,
         expected: Option<ModelPurpose>,
     ) {
@@ -1785,16 +1839,13 @@ mod tests {
                 &directory,
                 mode,
                 RoutingEngine {
-                    difficulty,
-                    mechanical,
-                    deep,
-                    confidence,
+                    levels,
                     fail,
                     calls: Arc::clone(&calls),
                 },
             )));
             assert_eq!(
-                route_subagent(&ctx, false, None, None, ROUTING_TASK)
+                route_subagent(&ctx, false, None, None, routing_task(ROUTING_TASK))
                     .await
                     .map(|route| route.purpose),
                 expected
@@ -1826,10 +1877,7 @@ mod tests {
                 &directory,
                 mode,
                 RoutingEngine {
-                    difficulty: 0.0,
-                    mechanical: 1.0,
-                    deep: 0.0,
-                    confidence: 1.0,
+                    levels: FAST_LEVELS,
                     fail: false,
                     calls: Arc::clone(&calls),
                 },
@@ -1841,7 +1889,7 @@ mod tests {
                     continuation,
                     profile.as_deref(),
                     explicit.then_some(ModelPurpose::Fast),
-                    ROUTING_TASK
+                    routing_task(ROUTING_TASK)
                 )
                 .await
                 .map(|route| route.purpose),
@@ -1888,10 +1936,7 @@ mod tests {
                 &directory,
                 mode,
                 RoutingEngine {
-                    difficulty: 0.0,
-                    mechanical: 1.0,
-                    deep: 0.0,
-                    confidence: 1.0,
+                    levels: FAST_LEVELS,
                     fail,
                     calls: Arc::new(AtomicUsize::new(0)),
                 },
@@ -1944,7 +1989,7 @@ mod tests {
             log.attach_label(
                 1,
                 &DecisionLabel {
-                    expected: json!({"mechanical": true}),
+                    expected: json!({DIFFICULTY_QUESTION: 0}),
                     source: ROUTING_TASK.into(),
                     timestamp: now_epoch(),
                     meta: JsonValue::Null,
@@ -2029,6 +2074,7 @@ mod tests {
             profile: Some(crate::prompt::profile::BUILTIN_PROFILE_NAME.into()),
             mode,
             model_job: None,
+            routing_prompt: None,
             local_definitions: Vec::new(),
             local_tools: LocalTools::default(),
         }
@@ -2230,6 +2276,7 @@ mod tests {
                     profile: Some(crate::prompt::profile::BUILTIN_PROFILE_NAME.into()),
                     mode: Some(mode),
                     model_job: None,
+                    routing_prompt: None,
                     local_definitions: Vec::new(),
                     local_tools: LocalTools::default(),
                 },
@@ -2612,6 +2659,7 @@ mod tests {
                     profile: Some(crate::prompt::profile::BUILTIN_PROFILE_NAME.into()),
                     mode: Some(SubagentTaskMode::Plan),
                     model_job: None,
+                    routing_prompt: None,
                     local_definitions: Vec::new(),
                     local_tools: LocalTools::default(),
                 },

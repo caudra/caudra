@@ -1,0 +1,60 @@
+{
+  "baseline": {"right": 7, "wrong": 0, "undecided": 2, "p50_ms": 279, "p95_ms": 281},
+  "cases": [
+    {
+      "label": "Locate retry constants",
+      "prompt": "Find where the HTTP retry backoff constants are defined in caudra-decision and report their values with file:line references. Read-only.",
+      "mode": "plan",
+      "route": "fast"
+    },
+    {
+      "label": "List public storage types",
+      "prompt": "List every public struct and enum in caudra-storage/src/sessions.rs with a one-line summary each. Do not edit files.",
+      "mode": "plan",
+      "route": "fast"
+    },
+    {
+      "label": "Fix typo in error message",
+      "prompt": "In caudra-config/src/decisions.rs change the error message 'must be a finite probabilty' to 'must be a finite probability', then run cargo check -p caudra-config.",
+      "mode": "build",
+      "route": "fast"
+    },
+    {
+      "label": "Bump serde patch version",
+      "prompt": "Bump serde from 1.0.210 to 1.0.215 in the workspace Cargo.toml, update Cargo.lock, and confirm cargo check still passes.",
+      "mode": "build",
+      "route": "fast"
+    },
+    {
+      "label": "Investigate memory growth",
+      "prompt": "Memory grows by about 200 MB an hour in long TUI sessions with many tool calls. Profile allocations, find what keeps them alive across turns, and propose a fix that keeps session restore working.",
+      "mode": "build",
+      "route": "best"
+    },
+    {
+      "label": "Plan shared workspace permissions",
+      "prompt": "Propose a permission model for shared team workspaces: per-user grants, inheritance from project rules, revocation semantics, and an upgrade path for existing stored rules. Weigh two designs and recommend one.",
+      "mode": "plan",
+      "route": "best"
+    },
+    {
+      "label": "Review sandbox escape risks",
+      "prompt": "Review the shell sandbox for ways a command could escape the project directory: symlinks, /proc, mount namespaces and environment leakage. Rank the risks and suggest mitigations.",
+      "mode": "plan",
+      "profile": "security",
+      "route": "best"
+    },
+    {
+      "label": "Add CSV export to usage report",
+      "prompt": "Add a --csv option to `caudra usage` that writes the same rows as the table. Wire it through the CLI parser and the report renderer, and add tests.",
+      "mode": "build",
+      "route": null
+    },
+    {
+      "label": "Fix narrow layout snapshot test",
+      "prompt": "The UI snapshot test permission_prompt::wide_layout fails on narrow terminals after the last theme change. Find why the layout differs and fix it.",
+      "mode": "build",
+      "route": null
+    }
+  ]
+}

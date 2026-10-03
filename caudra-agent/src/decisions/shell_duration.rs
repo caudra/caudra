@@ -1,41 +1,62 @@
 use caudra_config::decisions::FeatureMode;
-use caudra_decision::{Answer, DecisionResponse, Question, QuestionSet, QuestionType};
+use caudra_decision::{Answer, DecisionResponse};
 use caudra_storage::{
     decision_log::DecisionLabel,
     now_epoch,
+    sessions::SessionError,
     shell_durations::{
-        CommandDigest, DurationOutcome, DurationSource, ShellDurationKey, ShellDurations,
+        CommandDigest, DurationOutcome, DurationSource, FamilyRuns, ShellDurationKey,
+        ShellDurations,
     },
 };
 use serde_json::{Value, json};
-use std::{
-    collections::{BTreeMap, VecDeque},
-    sync::Arc,
-    thread,
-    time::Instant,
-};
+use std::{collections::VecDeque, sync::Arc, thread, time::Instant};
 
-use super::{DecisionFeature, DecisionReceipt, Decisions};
+use super::{DecisionFeature, DecisionReceipt, Decisions, push_fitting, questions};
 use crate::{
     ToolDoneEvent, ToolOutput,
     permissions::{canonical_json_sha256, command_pattern},
     tools::{ToolContext, ToolExecResult},
 };
 
-const QUESTION_SET: &str = "shell_duration.v2";
-const INSTANT: &str = "instant";
-const SHORT: &str = "short";
-const LONG: &str = "long";
-const ENDLESS: &str = "endless";
+pub(super) const DURATION_QUESTION: &str = "duration";
 pub(super) const ENDLESS_QUESTION: &str = "endless";
-pub(super) const HEAVY_QUESTION: &str = "heavy";
+/// Score agreement in stats means landing on the nearest level.
+pub(super) const LEVEL_TOLERANCE: f64 = 0.5;
+const COMMAND_FIELD: &str = "command";
+const WORKDIR_FIELD: &str = "workdir";
 const TIMEOUT_FIELD: &str = "timeoutSec";
+const EARLIER_RUNS: &str = "earlier_runs";
+const MAX_EARLIER_RUNS: usize = 4;
 const HISTORY_CACHE_ENTRIES: usize = 256;
 const MILLIS_PER_SECOND: u64 = 1_000;
+const AT_ONCE: usize = 0;
+const SECONDS: usize = 1;
+const MINUTES: usize = 2;
+const UNTIL_STOPPED: usize = 3;
+/// Measured label boundaries, fixed so a label never depends on configuration:
+/// a run completing within `INSTANT_MS` exits at once, and one lasting
+/// `MINUTES_MS` or longer runs for minutes.
 const INSTANT_MS: u64 = MILLIS_PER_SECOND;
-const SHORT_P50_MS: u64 = 10 * MILLIS_PER_SECOND;
-const LONG_P50_MS: u64 = 5 * 60 * MILLIS_PER_SECOND;
-const LONG_P90_MS: u64 = 10 * 60 * MILLIS_PER_SECOND;
+const MINUTES_MS: u64 = 120 * MILLIS_PER_SECOND;
+const SECONDS_P50_MS: u64 = 10 * MILLIS_PER_SECOND;
+const MINUTES_P50_MS: u64 = 5 * 60 * MILLIS_PER_SECOND;
+const MINUTES_P90_MS: u64 = 10 * 60 * MILLIS_PER_SECOND;
+const ENGINE_PRIOR: &str = "engine prior";
+/// The estimate each measurable level stands for, by level.
+const LEVELS: [Estimate; 3] = [
+    Estimate::prior(INSTANT_MS, INSTANT_MS, false),
+    Estimate::prior(SECONDS_P50_MS, MINUTES_MS, false),
+    Estimate::prior(MINUTES_P50_MS, MINUTES_P90_MS, true),
+];
+/// How each measurable level reads in `earlier_runs`, by level, in the words
+/// of the level descriptions.
+const TOOK: [&str; 3] = [
+    "exited at once, with no noticeable wait",
+    "took a few seconds before it exited",
+    "exited after minutes",
+];
+const STOPPED: &str = "did not finish before it was stopped";
 const ENDLESS_WARNING: &str =
     "Duration estimate: this command may run until stopped; its execution deadline still applies.";
 
@@ -46,6 +67,18 @@ struct Estimate {
     samples: u64,
     source: &'static str,
     extend_timeout: bool,
+}
+
+impl Estimate {
+    const fn prior(p50_ms: u64, p90_ms: u64, extend_timeout: bool) -> Self {
+        Self {
+            p50_ms,
+            p90_ms,
+            samples: 0,
+            source: ENGINE_PRIOR,
+            extend_timeout,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -89,7 +122,6 @@ pub(crate) struct ShellDurationPlan {
     estimate: Option<Estimate>,
     endless: bool,
     receipt: Option<DecisionReceipt>,
-    threshold_ms: u64,
     requested_timeout: Option<u64>,
     injected_timeout: Option<u64>,
 }
@@ -110,10 +142,10 @@ impl Decisions {
         {
             return None;
         }
-        let command = input.get("command")?.as_str()?;
+        let command = input.get(COMMAND_FIELD)?.as_str()?;
         let root = ctx.permissions.project_cwd();
-        let workdir = input.get("workdir").and_then(Value::as_str).unwrap_or(".");
-        let key = history_key(&root.display().to_string(), workdir, command);
+        let workdir = input.get(WORKDIR_FIELD).and_then(Value::as_str);
+        let key = history_key(&root.display().to_string(), workdir.unwrap_or("."), command);
         let (cached, revision) = {
             let cache = self
                 .0
@@ -129,10 +161,6 @@ impl Decisions {
             estimate: cached,
             endless: false,
             receipt: None,
-            threshold_ms: ctx
-                .config
-                .shell_async_threshold_secs
-                .saturating_mul(MILLIS_PER_SECOND),
             requested_timeout: input.get(TIMEOUT_FIELD).and_then(Value::as_u64),
             injected_timeout: None,
         };
@@ -141,10 +169,18 @@ impl Decisions {
         }
         let history_key = plan.key.clone();
         let dir = self.0.state_dir.clone();
-        let history =
-            smol::unblock(move || ShellDurations::open(&dir)?.estimate(&history_key)).await;
-        match history {
-            Ok(Some(estimate)) => {
+        let history = smol::unblock(move || {
+            let durations = ShellDurations::open(&dir)?;
+            let estimate = durations.estimate(&history_key)?;
+            let related = match estimate {
+                Some(_) => Vec::new(),
+                None => durations.related(&history_key, MAX_EARLIER_RUNS)?,
+            };
+            Ok::<_, SessionError>((estimate, related))
+        })
+        .await;
+        let earlier_runs = match history {
+            Ok((Some(estimate), _)) => {
                 let estimate = Estimate {
                     p50_ms: estimate.p50_ms,
                     p90_ms: estimate.p90_ms,
@@ -163,28 +199,29 @@ impl Decisions {
                 plan.estimate = Some(estimate);
                 return Some(plan);
             }
-            Err(error) => tracing::warn!(%error, "shell duration history unavailable"),
-            Ok(None) => {}
-        }
-        if let Some(questions) = duration_questions(plan.threshold_ms) {
+            Ok((None, related)) => related,
+            Err(error) => {
+                tracing::warn!(%error, "shell duration history unavailable");
+                Vec::new()
+            }
+        };
+        if let Some(questions) = questions::SHELL_DURATION.as_ref() {
             let context = ctx.permissions.decision_context(Value::Null);
+            let state = duration_state(command, workdir, earlier_runs.iter().map(earlier_run));
             if let Some(outcome) = self
-                .evaluate(
-                    DecisionFeature::ShellDuration,
-                    &json!({"command": command, "workdir": workdir}),
-                    &questions,
-                    &context,
-                )
+                .evaluate(DecisionFeature::ShellDuration, &state, questions, &context)
                 .await
             {
                 plan.receipt = outcome.receipt;
                 if let Ok(response) = outcome.result {
-                    (plan.estimate, plan.endless) = prior(
+                    let thresholds = &self.config().thresholds;
+                    let level = prior(
                         &response,
-                        self.config().thresholds.shell_heavy,
-                        self.config().thresholds.shell_endless,
-                        plan.threshold_ms,
+                        thresholds.shell_duration,
+                        thresholds.shell_endless,
                     );
+                    plan.endless = level == Some(UNTIL_STOPPED);
+                    plan.estimate = level.and_then(|level| LEVELS.get(level)).cloned();
                 }
             }
         }
@@ -203,105 +240,55 @@ pub(crate) fn history_key(workspace: &str, workdir: &str, command: &str) -> Shel
     }
 }
 
-/// The duration buckets follow `duration_label`, so a measured label always
-/// names an option the engine was offered.
-fn duration_questions(threshold_ms: u64) -> Option<QuestionSet> {
-    let instant_secs = INSTANT_MS / MILLIS_PER_SECOND;
-    let threshold_secs = threshold_ms.div_ceil(MILLIS_PER_SECOND);
-    let mut criteria = BTreeMap::from([
-        (
-            INSTANT,
-            format!("Finishes on its own within {instant_secs} second."),
-        ),
-        (
-            ENDLESS,
-            "Keeps running until stopped, such as a server, watcher, or interactive session."
-                .to_owned(),
-        ),
-    ]);
-    if threshold_ms > INSTANT_MS {
-        criteria.insert(
-            SHORT,
-            format!(
-                "Finishes on its own after more than {instant_secs} second and in under {threshold_secs} seconds."
-            ),
-        );
-        criteria.insert(
-            LONG,
-            format!("Finishes on its own, but only after {threshold_secs} seconds or more."),
-        );
-    } else {
-        criteria.insert(
-            LONG,
-            format!("Finishes on its own, but only after more than {instant_secs} second."),
-        );
+/// `workdir` appears only when the call names one, and `earlier_runs` keeps
+/// as many entries as the state cap allows.
+pub(super) fn duration_state(
+    command: &str,
+    workdir: Option<&str>,
+    earlier_runs: impl IntoIterator<Item = Value>,
+) -> Value {
+    let mut state = json!({COMMAND_FIELD: command});
+    if let Some(workdir) = workdir {
+        state[WORKDIR_FIELD] = json!(workdir);
     }
-    let noul = |instructions: &str| Question {
-        kind: QuestionType::Noul,
-        instructions: json!(instructions),
-        criteria: None,
-    };
-    QuestionSet::new(
-        QUESTION_SET,
-        BTreeMap::from([
-            (
-                ENDLESS_QUESTION.into(),
-                noul("Does this command normally keep running until stopped?"),
-            ),
-            (
-                HEAVY_QUESTION.into(),
-                noul(
-                    "Is this command likely to require substantial computation or lengthy network transfers?",
-                ),
-            ),
-            (
-                "duration".into(),
-                Question {
-                    kind: QuestionType::Choice,
-                    instructions: json!("Estimate this command's execution duration."),
-                    criteria: Some(json!(criteria)),
-                },
-            ),
-        ]),
-    )
-    .ok()
+    push_fitting(&mut state, EARLIER_RUNS, earlier_runs);
+    state
 }
 
-fn prior(
-    response: &DecisionResponse,
-    heavy: f64,
-    endless: f64,
-    threshold_ms: u64,
-) -> (Option<Estimate>, bool) {
-    if matches!(response.answers.get(ENDLESS_QUESTION), Some(Answer::Noul(answer)) if answer.noul >= endless)
-    {
-        return (None, true);
-    }
-    let choice = match response.answers.get("duration") {
-        Some(Answer::Choice(answer)) if answer.confidence >= heavy => Some(answer.choice.as_str()),
+/// A family that ever completed reads as the level of its median run; one
+/// that never did reads as stopped.
+fn earlier_run(runs: &FamilyRuns) -> Value {
+    let (took, count) = match runs.p50_ms {
+        Some(p50_ms) => (TOOK[completed_level(p50_ms)], runs.completed),
+        None => (STOPPED, runs.stopped),
+    };
+    json!({COMMAND_FIELD: runs.family, "took": took, "runs": count})
+}
+
+/// The level the answers settle on. Until stopped wins when either signal
+/// reaches `endless`; otherwise the first cumulative bound reaching
+/// `duration` decides, so a split between minutes and until stopped is still
+/// at least minutes.
+pub(super) fn prior(response: &DecisionResponse, duration: f64, endless: f64) -> Option<usize> {
+    let score = match response.answers.get(DURATION_QUESTION) {
+        Some(Answer::Score(score)) => Some(score),
         _ => None,
     };
-    if choice == Some(ENDLESS) {
-        return (None, true);
+    let endless_noul = matches!(
+        response.answers.get(ENDLESS_QUESTION),
+        Some(Answer::Noul(answer)) if answer.noul >= endless
+    );
+    if endless_noul || score.is_some_and(|score| score.at_least(UNTIL_STOPPED) >= endless) {
+        return Some(UNTIL_STOPPED);
     }
-    let is_heavy = matches!(response.answers.get(HEAVY_QUESTION), Some(Answer::Noul(answer)) if answer.noul >= heavy);
-    let (p50_ms, p90_ms, extend_timeout) = match choice {
-        Some(LONG) => (LONG_P50_MS, LONG_P90_MS, true),
-        Some(INSTANT) => (INSTANT_MS, INSTANT_MS, false),
-        Some(SHORT) => (SHORT_P50_MS.min(threshold_ms), threshold_ms, false),
-        _ if is_heavy => (LONG_P50_MS, LONG_P90_MS, true),
-        _ => return (None, false),
-    };
-    (
-        Some(Estimate {
-            p50_ms,
-            p90_ms,
-            samples: 0,
-            source: "engine prior",
-            extend_timeout,
-        }),
-        false,
-    )
+    let score = score?;
+    [
+        (MINUTES, score.at_least(MINUTES)),
+        (AT_ONCE, score.at_most(AT_ONCE)),
+        (SECONDS, score.at_most(SECONDS)),
+    ]
+    .into_iter()
+    .find_map(|(level, mass)| (mass >= duration).then_some(level))
 }
 
 impl ShellDurationPlan {
@@ -429,7 +416,7 @@ impl ShellDurationPlan {
     async fn record(self, outcome: DurationOutcome, elapsed_ms: u64) {
         let dir = self.decisions.0.state_dir.clone();
         let key = self.key.clone();
-        let label = duration_label(&outcome, elapsed_ms, self.threshold_ms);
+        let label = duration_label(&outcome, elapsed_ms);
         let censored = outcome != DurationOutcome::Ok;
         if let Err(error) = smol::unblock(move || {
             ShellDurations::open(&dir)?.record(&self.key, outcome, elapsed_ms)
@@ -451,7 +438,7 @@ impl ShellDurationPlan {
                 .attach_label(
                     &receipt,
                     &DecisionLabel {
-                        expected: json!({"duration": duration}),
+                        expected: json!({DURATION_QUESTION: duration}),
                         source: "measured".into(),
                         timestamp: now_epoch(),
                         meta: json!({"elapsed_ms": elapsed_ms, "censored": censored}),
@@ -512,30 +499,37 @@ impl Drop for ShellDurationRun {
     }
 }
 
-fn duration_label(
-    outcome: &DurationOutcome,
-    elapsed_ms: u64,
-    threshold_ms: u64,
-) -> Option<&'static str> {
+/// A stopped run only shows how long it lasted, so it labels a level once it
+/// outlasted the seconds level. Until stopped is never measured.
+fn duration_label(outcome: &DurationOutcome, elapsed_ms: u64) -> Option<usize> {
     match outcome {
-        DurationOutcome::Ok if elapsed_ms <= INSTANT_MS => Some(INSTANT),
-        DurationOutcome::Ok if elapsed_ms < threshold_ms => Some(SHORT),
-        DurationOutcome::Ok => Some(LONG),
-        _ if elapsed_ms >= threshold_ms => Some(LONG),
+        DurationOutcome::Ok => Some(completed_level(elapsed_ms)),
+        _ if elapsed_ms >= MINUTES_MS => Some(MINUTES),
         _ => None,
+    }
+}
+
+fn completed_level(elapsed_ms: u64) -> usize {
+    if elapsed_ms <= INSTANT_MS {
+        AT_ONCE
+    } else if elapsed_ms < MINUTES_MS {
+        SECONDS
+    } else {
+        MINUTES
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ENDLESS, Estimate, HISTORY_CACHE_ENTRIES, INSTANT, INSTANT_MS, LONG, LONG_P90_MS, SHORT,
-        ShellDurationCache, ShellDurationPlan, duration_label, duration_questions, history_key,
-        prior,
+        AT_ONCE, DURATION_QUESTION, EARLIER_RUNS, ENDLESS_QUESTION, Estimate,
+        HISTORY_CACHE_ENTRIES, INSTANT_MS, MAX_EARLIER_RUNS, MINUTES, MINUTES_MS, SECONDS, STOPPED,
+        ShellDurationCache, ShellDurationPlan, TOOK, UNTIL_STOPPED, WORKDIR_FIELD, duration_label,
+        duration_state, earlier_run, history_key, prior,
     };
     use crate::{
         AgentMode,
-        decisions::Decisions,
+        decisions::{DecisionState, Decisions},
         permissions::PermissionManager,
         tools::{ToolExecResult, test_support::stub_ctx_with_permissions},
     };
@@ -547,15 +541,18 @@ mod tests {
     use caudra_decision::{DecisionEngine, DecisionError, DecisionRequest, DecisionResponse};
     use caudra_storage::{
         StateDir,
-        shell_durations::{DurationOutcome, ShellDurations},
+        shell_durations::{DurationOutcome, FamilyRuns, ShellDurations},
     };
     use serde_json::{Value, json};
-    use std::{collections::BTreeSet, sync::Arc, time::Instant};
+    use std::{iter, sync::Arc, time::Instant};
     use test_case::test_case;
 
     const COMMAND: &str = "cargo test -p private-package";
+    const FAMILY: &str = "cargo test *";
     const WORKSPACE: &str = "/project";
-    const THRESHOLD_MS: u64 = 120_000;
+    const WORKDIR: &str = "crates/core";
+    const THRESHOLD: f64 = 0.9;
+    const LONG_FAMILY_BYTES: usize = 400;
     const DEFAULT_SECS: u64 = 120;
     const CAP_SECS: u64 = 21_600;
     const EXECUTION_ERROR: &str = "execution unavailable";
@@ -595,10 +592,37 @@ mod tests {
             }),
             endless: false,
             receipt: None,
-            threshold_ms: THRESHOLD_MS,
             requested_timeout: None,
             injected_timeout: None,
         }
+    }
+
+    fn response(probabilities: [f64; 4], endless: f64) -> DecisionResponse {
+        let score: f64 = probabilities
+            .iter()
+            .enumerate()
+            .map(|(level, probability)| level as f64 * probability)
+            .sum();
+        serde_json::from_value(json!({
+            "model": MODEL,
+            "answers": {
+                DURATION_QUESTION: {
+                    "type": "score",
+                    "score": score,
+                    "legend": {"0": "", "1": "", "2": "", "3": ""},
+                    "probabilities": {
+                        "0": probabilities[0],
+                        "1": probabilities[1],
+                        "2": probabilities[2],
+                        "3": probabilities[3],
+                    },
+                    "confidence": THRESHOLD,
+                },
+                ENDLESS_QUESTION: {"type": "noul", "noul": endless},
+            },
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        }))
+        .unwrap()
     }
 
     #[test_case(FeatureMode::Enforce, 1_000, Some(DEFAULT_SECS))]
@@ -634,68 +658,80 @@ mod tests {
         assert!(plan.inject_timeout(&input, &schema).is_none());
     }
 
-    #[test_case(DurationOutcome::Ok, 1_000, Some("instant"))]
-    #[test_case(DurationOutcome::Ok, 2_000, Some("short"))]
-    #[test_case(DurationOutcome::Ok, THRESHOLD_MS, Some("long"))]
-    #[test_case(DurationOutcome::Timeout, 2_000, None)]
-    #[test_case(DurationOutcome::Cancelled, 2_000, None)]
-    #[test_case(DurationOutcome::Timeout, THRESHOLD_MS, Some("long"))]
-    #[test_case(DurationOutcome::Cancelled, THRESHOLD_MS, Some("long"))]
-    fn measured_labels_are_censored(
+    #[test_case(DurationOutcome::Ok, INSTANT_MS, Some(AT_ONCE); "completed_at_once")]
+    #[test_case(DurationOutcome::Ok, INSTANT_MS + 1, Some(SECONDS); "completed_past_an_instant")]
+    #[test_case(DurationOutcome::Ok, MINUTES_MS - 1, Some(SECONDS); "completed_within_seconds")]
+    #[test_case(DurationOutcome::Ok, MINUTES_MS, Some(MINUTES); "completed_in_minutes")]
+    #[test_case(DurationOutcome::Timeout, MINUTES_MS - 1, None; "timed_out_early")]
+    #[test_case(DurationOutcome::Cancelled, MINUTES_MS - 1, None; "cancelled_early")]
+    #[test_case(DurationOutcome::Timeout, MINUTES_MS, Some(MINUTES); "timed_out_after_minutes")]
+    #[test_case(DurationOutcome::Cancelled, MINUTES_MS, Some(MINUTES); "cancelled_after_minutes")]
+    fn duration_label_uses_fixed_boundaries(
         outcome: DurationOutcome,
         elapsed: u64,
-        expected: Option<&str>,
+        expected: Option<usize>,
     ) {
-        assert_eq!(duration_label(&outcome, elapsed, THRESHOLD_MS), expected);
+        assert_eq!(duration_label(&outcome, elapsed), expected);
     }
 
-    #[test_case(LONG, 0.99, 0.01, 0.01, Some(LONG_P90_MS), false)]
-    #[test_case(SHORT, 0.99, 0.01, 0.01, Some(THRESHOLD_MS), false)]
-    #[test_case(INSTANT, 0.01, 0.99, 0.01, Some(LONG_P90_MS), false)]
-    #[test_case(LONG, 0.01, 0.01, 0.01, None, false)]
-    #[test_case(LONG, 0.99, 0.99, 0.99, None, true)]
-    #[test_case(ENDLESS, 0.99, 0.99, 0.01, None, true)]
-    fn priors_require_confidence_and_never_extend_endless(
-        choice: &str,
-        confidence: f64,
-        heavy: f64,
+    #[test_case([0.0, 0.05, 0.5, 0.45], 0.1, Some(MINUTES); "minutes_and_until_stopped_split")]
+    #[test_case([0.95, 0.05, 0.0, 0.0], 0.0, Some(AT_ONCE); "at_once")]
+    #[test_case([0.4, 0.55, 0.05, 0.0], 0.0, Some(SECONDS); "seconds")]
+    #[test_case([0.1, 0.5, 0.4, 0.0], 0.0, None; "undecided_split")]
+    #[test_case([0.95, 0.05, 0.0, 0.0], 0.95, Some(UNTIL_STOPPED); "endless_by_noul")]
+    #[test_case([0.0, 0.0, 0.05, 0.95], 0.2, Some(UNTIL_STOPPED); "endless_by_level_mass")]
+    fn prior_acts_on_cumulative_bounds(
+        probabilities: [f64; 4],
         endless: f64,
-        expected: Option<u64>,
-        is_endless: bool,
+        expected: Option<usize>,
     ) {
-        let response: DecisionResponse = serde_json::from_value(json!({
-            "model": MODEL,
-            "answers": {
-                "duration": {"type":"choice","choice":choice,"confidence":confidence,"probabilities":{INSTANT:0.1,SHORT:0.1,LONG:0.7,ENDLESS:0.1}},
-                "heavy": {"type":"noul","noul":heavy},
-                "endless": {"type":"noul","noul":endless}
-            },
-            "usage":{"input_tokens":0,"output_tokens":0}
-        })).unwrap();
-        let (estimate, endless) = prior(&response, 0.9, 0.9, THRESHOLD_MS);
-        assert_eq!(estimate.map(|estimate| estimate.p90_ms), expected);
-        assert_eq!(endless, is_endless);
+        assert_eq!(
+            prior(&response(probabilities, endless), THRESHOLD, THRESHOLD),
+            expected
+        );
     }
 
-    #[test_case(THRESHOLD_MS, &[ENDLESS, INSTANT, LONG, SHORT]; "default_threshold")]
-    #[test_case(INSTANT_MS, &[ENDLESS, INSTANT, LONG]; "threshold_within_instant")]
-    fn duration_options_match_measured_labels(threshold_ms: u64, expected: &[&str]) {
-        let questions = duration_questions(threshold_ms).unwrap();
-        let options: BTreeSet<_> = questions.questions()["duration"]
-            .criteria
-            .as_ref()
-            .and_then(Value::as_object)
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
-        let measured: BTreeSet<_> = [INSTANT_MS, INSTANT_MS + 1, threshold_ms - 1, threshold_ms]
-            .into_iter()
-            .filter_map(|elapsed| duration_label(&DurationOutcome::Ok, elapsed, threshold_ms))
-            .chain([ENDLESS])
-            .collect();
-        assert_eq!(options, measured);
-        assert_eq!(options, expected.iter().copied().collect());
+    #[test_case(3, 0, Some(INSTANT_MS), TOOK[AT_ONCE], 3; "completed_at_once")]
+    #[test_case(2, 1, Some(MINUTES_MS), TOOK[MINUTES], 2; "completed_in_minutes")]
+    #[test_case(0, 4, None, STOPPED, 4; "never_completed")]
+    fn earlier_runs_read_as_the_median_level(
+        completed: u64,
+        stopped: u64,
+        p50_ms: Option<u64>,
+        took: &str,
+        runs: u64,
+    ) {
+        let family = FamilyRuns {
+            family: FAMILY.into(),
+            completed,
+            stopped,
+            p50_ms,
+        };
+        assert_eq!(
+            earlier_run(&family),
+            json!({"command": FAMILY, "took": took, "runs": runs})
+        );
+    }
+
+    #[test]
+    fn earlier_runs_fit_the_state_cap() {
+        let bare = duration_state(COMMAND, None, []);
+        assert_eq!(bare, json!({"command": COMMAND}));
+        let runs = FamilyRuns {
+            family: format!("{} *", "x".repeat(LONG_FAMILY_BYTES)),
+            completed: 1,
+            stopped: 0,
+            p50_ms: Some(MINUTES_MS),
+        };
+        let state = duration_state(
+            COMMAND,
+            Some(WORKDIR),
+            iter::repeat_n(earlier_run(&runs), MAX_EARLIER_RUNS),
+        );
+        assert!(DecisionState::new(&state).is_ok());
+        assert_eq!(state[WORKDIR_FIELD], WORKDIR);
+        let kept = state[EARLIER_RUNS].as_array().unwrap().len();
+        assert!((1..MAX_EARLIER_RUNS).contains(&kept));
     }
 
     #[test_case(FeatureMode::Off, false, false)]
@@ -742,19 +778,13 @@ mod tests {
             let first = decisions.shell_duration(&input, &ctx).await.unwrap();
             assert!(first.estimate.is_none());
             for _ in 0..3 {
-                first
-                    .clone()
-                    .record(DurationOutcome::Ok, THRESHOLD_MS)
-                    .await;
+                first.clone().record(DurationOutcome::Ok, MINUTES_MS).await;
             }
             let exact = decisions.shell_duration(&input, &ctx).await.unwrap();
             assert_eq!(exact.estimate.as_ref().unwrap().source, "exact history");
             assert_eq!(exact.estimate.as_ref().unwrap().samples, 3);
             for _ in 0..2 {
-                first
-                    .clone()
-                    .record(DurationOutcome::Ok, THRESHOLD_MS)
-                    .await;
+                first.clone().record(DurationOutcome::Ok, MINUTES_MS).await;
             }
             let family = decisions
                 .shell_duration(&json!({"command":"cargo test --workspace"}), &ctx)
@@ -774,7 +804,7 @@ mod tests {
         smol::block_on(async {
             let temp = tempfile::tempdir().unwrap();
             let dir = StateDir::from_path(temp.path().join("state"));
-            let plan = plan(&dir, FeatureMode::Enforce, THRESHOLD_MS);
+            let plan = plan(&dir, FeatureMode::Enforce, MINUTES_MS);
             let key = plan.key.clone();
             for _ in 0..3 {
                 plan.clone()
@@ -827,7 +857,7 @@ mod tests {
     fn history_cache_is_bounded_and_rejects_stale_reads() {
         let temp = tempfile::tempdir().unwrap();
         let dir = StateDir::from_path(temp.path().join("state"));
-        let estimate = plan(&dir, FeatureMode::Enforce, THRESHOLD_MS)
+        let estimate = plan(&dir, FeatureMode::Enforce, MINUTES_MS)
             .estimate
             .unwrap();
         let mut cache = ShellDurationCache::default();

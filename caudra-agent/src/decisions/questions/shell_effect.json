@@ -1,0 +1,36 @@
+{
+  "writes_project_files": {
+    "type": "noul",
+    "instructions": {
+      "question": "Does running `command` create, change or delete files inside the project?",
+      "focus": "Build output, caches, lockfiles and the .git directory count. Reading, searching and printing do not, nor do files written outside the project, such as a global install."
+    },
+    "criteria": {
+      "true": {
+        "what": "Edits sources or leaves new or changed files in the project tree",
+        "examples": ["sed -i 's/old/new/' src/main.rs", "cargo build", "npm install", "git commit -m fix"]
+      },
+      "false": {
+        "what": "Only reads, searches or prints, or writes only outside the project",
+        "examples": ["git status", "rg TODO src", "cat Cargo.toml", "cargo install cargo-nextest"]
+      }
+    }
+  },
+  "changes_system_state": {
+    "type": "noul",
+    "instructions": {
+      "question": "Does running `command` change anything outside the project?",
+      "focus": "Package installs, services or processes, files outside the project, network or account settings."
+    },
+    "criteria": {
+      "true": {
+        "what": "Installs, starts, stops or reconfigures something on the machine",
+        "examples": ["sudo apt install jq", "systemctl restart nginx", "npm install -g pnpm", "kill -9 4242"]
+      },
+      "false": {
+        "what": "Stays inside the project or only reads the system",
+        "examples": ["cargo test", "ls /etc", "git status"]
+      }
+    }
+  }
+}

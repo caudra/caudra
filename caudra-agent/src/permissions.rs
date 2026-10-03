@@ -60,6 +60,8 @@ use broker::{
     PendingDecision, PendingPermission, PendingRegistration, PermissionBroker, remove_pending,
 };
 mod decisions;
+#[cfg(test)]
+pub(crate) use decisions::decision_state;
 mod enforce;
 pub use enforce::PermissionError;
 #[cfg(test)]

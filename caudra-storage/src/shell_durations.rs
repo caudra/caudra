@@ -97,6 +97,18 @@ pub struct DurationEstimate {
     pub counts: DurationCounts,
 }
 
+/// One command family's merged history in a workspace, too sparse for an
+/// estimate but still evidence of how its commands behave.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FamilyRuns {
+    pub family: String,
+    pub completed: u64,
+    /// Runs that timed out or were cancelled before they finished.
+    pub stopped: u64,
+    /// Conservative upper edge of the completed runs' median.
+    pub p50_ms: Option<u64>,
+}
+
 /// A synchronous handle for use on a storage actor/blocking thread. History persists
 /// across sessions, including ephemeral ones, and retains at most `MAX_HISTORY_KEYS`
 /// exact keys globally. Family estimates aggregate only those retained keys.
@@ -126,6 +138,14 @@ impl ShellDurations {
         key: &ShellDurationKey,
     ) -> Result<Option<DurationEstimate>, SessionError> {
         self.database.shell_duration_estimate(key)
+    }
+
+    pub fn related(
+        &self,
+        key: &ShellDurationKey,
+        limit: usize,
+    ) -> Result<Vec<FamilyRuns>, SessionError> {
+        self.database.related_shell_durations(key, limit)
     }
 }
 
@@ -201,15 +221,51 @@ impl SessionDatabase {
         let mut rows = statement.query(params![key.workspace, key.family])?;
         let mut family = History::default();
         while let Some(row) = rows.next()? {
-            let history = history_from_row(row)?;
-            family.counts.ok += history.counts.ok;
-            family.counts.timeout += history.counts.timeout;
-            family.counts.cancelled += history.counts.cancelled;
-            family.latency.merge(&history.latency);
+            family.absorb(&history_from_row(row)?);
         }
         Ok((family.counts.ok >= FAMILY_MIN_SAMPLES)
             .then(|| family.estimate(DurationSource::Family))
             .flatten())
+    }
+
+    /// The key's own family, then the families that share its program, most
+    /// recently run first. A family with no program word, such as a digest
+    /// fallback, holds nothing a reader could use and yields no runs.
+    pub fn related_shell_durations(
+        &self,
+        key: &ShellDurationKey,
+        limit: usize,
+    ) -> Result<Vec<FamilyRuns>, SessionError> {
+        validate_key(key)?;
+        let Some((program, _)) = key.family.split_once(' ') else {
+            return Ok(Vec::new());
+        };
+        let mut statement = self.connection().prepare(
+            "SELECT ok, timeout, cancelled, latency, family FROM shell_durations
+             WHERE workspace = ?1 AND substr(family, 1, length(?3)) = ?3
+             ORDER BY family = ?2 DESC, updated_at DESC, family",
+        )?;
+        let mut rows =
+            statement.query(params![key.workspace, key.family, format!("{program} ")])?;
+        let mut families: Vec<(String, History)> = Vec::new();
+        while let Some(row) = rows.next()? {
+            let family: String = row.get(4)?;
+            let history = history_from_row(row)?;
+            match families.iter().position(|(known, _)| *known == family) {
+                Some(index) => families[index].1.absorb(&history),
+                None if families.len() < limit => families.push((family, history)),
+                None => {}
+            }
+        }
+        Ok(families
+            .into_iter()
+            .map(|(family, history)| FamilyRuns {
+                family,
+                completed: history.counts.ok,
+                stopped: history.counts.timeout + history.counts.cancelled,
+                p50_ms: history.latency.percentile(P50),
+            })
+            .collect())
     }
 }
 
@@ -220,6 +276,13 @@ struct History {
 }
 
 impl History {
+    fn absorb(&mut self, other: &History) {
+        self.counts.ok += other.counts.ok;
+        self.counts.timeout += other.counts.timeout;
+        self.counts.cancelled += other.counts.cancelled;
+        self.latency.merge(&other.latency);
+    }
+
     fn estimate(self, source: DurationSource) -> Option<DurationEstimate> {
         Some(DurationEstimate {
             p50_ms: self.latency.percentile(P50)?,
@@ -292,8 +355,16 @@ mod tests {
     const COMMAND: &str = "cargo test -p secret-package-name";
     const OTHER_COMMAND: &str = "cargo test --workspace";
     const OTHER_FAMILY: &str = "cargo check";
+    const OLDER_FAMILY: &str = "cargo build";
+    const UNRELATED_FAMILY: &str = "npm test";
+    const STOPPED_FAMILY: &str = "cargo doc";
+    const UNDERSCORE_FAMILY: &str = "a_b run";
+    const UNDERSCORE_SIBLING: &str = "a_b check";
+    const DIGEST_FAMILY: &str = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
     const COMPLETED_MS: u64 = 100;
     const CENSORED_MS: u64 = 1_000_000;
+    const RECENT: i64 = 1_000;
+    const LIMIT: usize = 4;
 
     fn dir() -> (TempDir, StateDir) {
         let temp = TempDir::new().unwrap();
@@ -302,11 +373,24 @@ mod tests {
     }
 
     fn key(command: &str) -> ShellDurationKey {
+        family_key(FAMILY, command)
+    }
+
+    fn family_key(family: &str, command: &str) -> ShellDurationKey {
         ShellDurationKey {
             workspace: WORKSPACE.into(),
-            family: FAMILY.into(),
+            family: family.into(),
             digest: CommandDigest::of_normalized(command),
         }
+    }
+
+    fn related_families(history: &ShellDurations, family: &str, limit: usize) -> Vec<String> {
+        history
+            .related(&family_key(family, COMMAND), limit)
+            .unwrap()
+            .into_iter()
+            .map(|runs| runs.family)
+            .collect()
     }
 
     fn complete(history: &ShellDurations, key: &ShellDurationKey, samples: usize) {
@@ -569,5 +653,87 @@ mod tests {
         let after = exact_on(connection, &key).unwrap().unwrap();
         assert_eq!(after.counts, before.counts);
         assert_eq!(after.latency, before.latency);
+    }
+
+    #[test_case(LIMIT, &[FAMILY, OTHER_FAMILY, OLDER_FAMILY]; "own_family_then_newest_sibling")]
+    #[test_case(2, &[FAMILY, OTHER_FAMILY]; "limited")]
+    #[test_case(0, &[]; "zero_limit")]
+    fn related_lists_own_family_then_siblings(limit: usize, expected: &[&str]) {
+        let (_temp, dir) = dir();
+        let history = ShellDurations::open(&dir).unwrap();
+        for (age, family) in [
+            (3, OLDER_FAMILY),
+            (2, FAMILY),
+            (1, OTHER_FAMILY),
+            (0, UNRELATED_FAMILY),
+        ] {
+            complete(&history, &family_key(family, COMMAND), 1);
+            history
+                .database
+                .connection()
+                .execute(
+                    "UPDATE shell_durations SET updated_at = ?1 WHERE family = ?2",
+                    params![RECENT - age, family],
+                )
+                .unwrap();
+        }
+        let mut elsewhere = family_key(OTHER_FAMILY, OTHER_COMMAND);
+        elsewhere.workspace = OTHER_WORKSPACE.into();
+        complete(&history, &elsewhere, 1);
+        assert_eq!(related_families(&history, FAMILY, limit), expected);
+    }
+
+    #[test]
+    fn related_merges_sketches_per_family() {
+        let (_temp, dir) = dir();
+        let history = ShellDurations::open(&dir).unwrap();
+        complete(&history, &family_key(OTHER_FAMILY, COMMAND), 2);
+        let other = family_key(OTHER_FAMILY, OTHER_COMMAND);
+        complete(&history, &other, 1);
+        history
+            .record(&other, DurationOutcome::Timeout, CENSORED_MS)
+            .unwrap();
+        history
+            .record(
+                &family_key(STOPPED_FAMILY, COMMAND),
+                DurationOutcome::Cancelled,
+                CENSORED_MS,
+            )
+            .unwrap();
+        let mut runs = history.related(&key(COMMAND), LIMIT).unwrap();
+        runs.sort_by(|left, right| left.family.cmp(&right.family));
+        let summary: Vec<_> = runs
+            .iter()
+            .map(|runs| (runs.family.as_str(), runs.completed, runs.stopped))
+            .collect();
+        assert_eq!(summary, [(OTHER_FAMILY, 3, 1), (STOPPED_FAMILY, 0, 1)]);
+        assert!(
+            runs[0]
+                .p50_ms
+                .is_some_and(|p50_ms| (COMPLETED_MS..CENSORED_MS).contains(&p50_ms))
+        );
+        assert_eq!(runs[1].p50_ms, None);
+    }
+
+    #[test]
+    fn related_skips_unreadable_families() {
+        let (_temp, dir) = dir();
+        let history = ShellDurations::open(&dir).unwrap();
+        complete(&history, &family_key(DIGEST_FAMILY, COMMAND), 3);
+        assert!(related_families(&history, DIGEST_FAMILY, LIMIT).is_empty());
+    }
+
+    #[test_case("axb check"; "underscore_is_literal")]
+    #[test_case("A_B check"; "case_sensitive")]
+    #[test_case("a_bc check"; "whole_program_word")]
+    fn related_matches_the_program_exactly(other: &str) {
+        let (_temp, dir) = dir();
+        let history = ShellDurations::open(&dir).unwrap();
+        complete(&history, &family_key(UNDERSCORE_SIBLING, COMMAND), 1);
+        complete(&history, &family_key(other, COMMAND), 1);
+        assert_eq!(
+            related_families(&history, UNDERSCORE_FAMILY, LIMIT),
+            [UNDERSCORE_SIBLING]
+        );
     }
 }

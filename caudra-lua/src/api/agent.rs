@@ -492,6 +492,7 @@ async fn open_lua_task(
             profile: opts.get("profile").map_err(lua_err)?,
             mode,
             model_job: None,
+            routing_prompt: None,
             local_definitions,
             local_tools,
         },

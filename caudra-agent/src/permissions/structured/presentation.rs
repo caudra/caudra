@@ -22,18 +22,16 @@ pub enum EngineFlag {
     Credentials,
     Permissions,
     RemoteRewrite,
-    OffTask,
     WritesProjectFiles,
 }
 
 impl EngineFlag {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 6] = [
         Self::Deletes,
         Self::Uploads,
         Self::Credentials,
         Self::Permissions,
         Self::RemoteRewrite,
-        Self::OffTask,
         Self::WritesProjectFiles,
     ];
 
@@ -45,7 +43,6 @@ impl EngineFlag {
             Self::Credentials => "credentials",
             Self::Permissions => "permissions",
             Self::RemoteRewrite => "remote_rewrite",
-            Self::OffTask => "off_task",
             Self::WritesProjectFiles => "writes_project_files",
         }
     }
@@ -57,7 +54,6 @@ impl EngineFlag {
             Self::Credentials => "May read or use credentials",
             Self::Permissions => "May change file permissions",
             Self::RemoteRewrite => "May rewrite remote history",
-            Self::OffTask => "Looks unrelated to the task",
             Self::WritesProjectFiles => "May change project files",
         }
     }

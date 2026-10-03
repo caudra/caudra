@@ -1,0 +1,61 @@
+{
+  "baseline": {"right": 8, "wrong": 0, "undecided": 0, "p50_ms": 235, "p95_ms": 288},
+  "cases": [
+    {
+      "goal": "All tests in caudra-storage pass",
+      "assistant_tail": "Ran `cargo nextest run -p caudra-storage`: 1,099 tests passed, 0 failed. The fix for the retention query is in place.",
+      "tool_outcomes": [{"name": "shell", "ok": true}, {"name": "file_edit", "ok": true}],
+      "open_todos": [],
+      "met": true
+    },
+    {
+      "goal": "The README documents the new --json flag",
+      "assistant_tail": "Added a \"JSON output\" section to README.md that describes --json and shows an example of its output.",
+      "tool_outcomes": [{"name": "file_edit", "ok": true}, {"name": "file_read", "ok": true}],
+      "open_todos": [],
+      "met": true
+    },
+    {
+      "goal": "Your final message reports how many Rust source files the repository has",
+      "assistant_tail": "The repository has 412 Rust source files, counted with `fd -e rs | wc -l`.",
+      "tool_outcomes": [{"name": "shell", "ok": true}],
+      "open_todos": [],
+      "met": true
+    },
+    {
+      "goal": "All tests pass",
+      "assistant_tail": "I fixed the off-by-one in the tokenizer. Next I'll run the full test suite to confirm the fix.",
+      "tool_outcomes": [{"name": "file_edit", "ok": true}],
+      "open_todos": ["Run the full test suite"],
+      "met": false
+    },
+    {
+      "goal": "The CI pipeline is green",
+      "assistant_tail": "I fixed the lint errors. Two tests in parser::tests still fail with a timeout.",
+      "tool_outcomes": [{"name": "shell", "ok": false}, {"name": "file_edit", "ok": true}],
+      "open_todos": ["Fix the parser::tests timeouts"],
+      "met": false
+    },
+    {
+      "goal": "Every HTTP handler uses the new request API",
+      "assistant_tail": "Migrated 3 of 7 handlers (auth, users, billing). Still to do: orders, search, admin and reports.",
+      "tool_outcomes": [{"name": "file_edit", "ok": true}, {"name": "file_edit", "ok": true}],
+      "open_todos": ["Migrate the orders handler", "Migrate the search handler", "Migrate the admin handler"],
+      "met": false
+    },
+    {
+      "goal": "The release is deployed to staging",
+      "assistant_tail": "Which credentials should I use for the staging database? I can't find them in the repository or the deploy notes.",
+      "tool_outcomes": [{"name": "shell", "ok": true}],
+      "open_todos": ["Deploy the release to staging"],
+      "met": false
+    },
+    {
+      "goal": "The benchmark shows at least a 20% speedup",
+      "assistant_tail": "The benchmark now runs 8% faster (median 41.0 ms against 44.6 ms). Further gains would need a different allocator.",
+      "tool_outcomes": [{"name": "shell", "ok": true}],
+      "open_todos": [],
+      "met": false
+    }
+  ]
+}

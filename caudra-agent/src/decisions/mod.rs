@@ -1,5 +1,8 @@
 mod content;
+#[cfg(test)]
+mod eval;
 mod permission;
+pub(crate) mod questions;
 pub(crate) mod shell_duration;
 mod shell_effect;
 mod state;
@@ -35,7 +38,7 @@ use shell_duration::ShellDurationCache;
 
 pub use permission::{PermissionAction, PermissionDecision, PermissionFlag, PermissionPurpose};
 pub use state::{DecisionState, DecisionStateError};
-pub(crate) use state::{redact_decision_text, redacted_excerpt};
+pub(crate) use state::{push_fitting, redact_decision_text, redacted_excerpt};
 
 const CACHE_ENTRIES: usize = 128;
 const STATE_REJECTED: &str = "state exceeds the bounded redacted context";
@@ -158,7 +161,7 @@ pub fn stats_thresholds(config: &DecisionThresholds, feature: &str) -> StatsThre
             shell_duration::ENDLESS_QUESTION.into(),
             config.shell_endless,
         );
-        overrides.insert(shell_duration::HEAVY_QUESTION.into(), config.shell_heavy);
+        thresholds.score_tolerance = shell_duration::LEVEL_TOLERANCE;
     } else if feature == DecisionFeature::ShellEffect.name()
         && let Some(threshold) = config.shell_writes
     {

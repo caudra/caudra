@@ -51,7 +51,9 @@ use matching::{
     resource_value_digest, strict_http_url, url_origin_digest, url_subtree_digest,
     url_subtree_roots,
 };
-pub(in crate::permissions) use matching::{trusted_command_observation, trusted_shell_request};
+pub(in crate::permissions) use matching::{
+    kind_noun, trusted_command_observation, trusted_shell_request,
+};
 pub use opacity::{OPACITY_ATTRIBUTE, ScriptLanguage, ShellOpacity, UnknownShellOpacity};
 pub(super) use options::BROAD_SHELL_PHRASE;
 use options::rule_options;
@@ -97,7 +99,7 @@ const MCP_CONTRACT: &str = "mcp.tools.call/v1";
 const FILE_READ_TOOLS: &[&str] = &["file_read", "file_index", "read", "view_image"];
 const DIRECTORY_READ_TOOLS: &[&str] = &["list"];
 const FILE_SEARCH_TOOLS: &[&str] = &["file_glob", "file_grep", "glob", "grep"];
-const WORKDIR_ATTRIBUTE: &str = "workdir";
+pub(in crate::permissions) const WORKDIR_ATTRIBUTE: &str = "workdir";
 /// How coverage names the builtin rule for confined read-only commands.
 pub const CONFINED_READ_AUTHORITY: &str = "reads inside the project";
 /// The executable-name-resolved form of a command, set by the shell tool.

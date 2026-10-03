@@ -1,0 +1,67 @@
+{
+  "baseline": {"right": 7, "wrong": 0, "undecided": 0, "p50_ms": 211, "p95_ms": 226},
+  "cases": [
+    {
+      "query": "viewing an image file",
+      "candidates": [
+        {"name": "file_read", "description": "Read a file from the local filesystem."},
+        {"name": "view_image", "description": "View an image file (png, jpeg, gif, webp) so you can actually see it."},
+        {"name": "file_glob", "description": "Fast file pattern matching: find files by glob pattern."}
+      ],
+      "expect": "view_image"
+    },
+    {
+      "query": "who calls this function",
+      "candidates": [
+        {"name": "code_map", "description": "Rank every symbol in a source tree by importance and return the top ones. Start here when you do not know a codebase."},
+        {"name": "code_refs", "description": "List the symbols that reference a given symbol, or the symbols it references."},
+        {"name": "code_context", "description": "Return the symbols worth reading before making a specific change."}
+      ],
+      "expect": "code_refs"
+    },
+    {
+      "query": "run a quick python calculation",
+      "candidates": [
+        {"name": "execution_environment", "description": "Inspect the execution host's current environment: installed commands and versions, privilege access, Git status and package managers."},
+        {"name": "python_execution", "description": "Execute a short Python script in an isolated interpreter and return its value and printed output."}
+      ],
+      "expect": "python_execution"
+    },
+    {
+      "query": "what breaks if I change this function and which tests cover it",
+      "candidates": [
+        {"name": "code_refs", "description": "List the symbols that reference a given symbol, or the symbols it references."},
+        {"name": "code_impact", "description": "Show what a change to a symbol could reach, and which tests already cover it."},
+        {"name": "code_map", "description": "Rank every symbol in a source tree by importance and return the top ones. Start here when you do not know a codebase."}
+      ],
+      "expect": "code_impact"
+    },
+    {
+      "query": "check which version of node is installed",
+      "candidates": [
+        {"name": "python_execution", "description": "Execute a short Python script in an isolated interpreter and return its value and printed output."},
+        {"name": "execution_environment", "description": "Inspect the execution host's current environment: installed commands and versions, privilege access, Git status and package managers."},
+        {"name": "view_image", "description": "View an image file (png, jpeg, gif, webp) so you can actually see it."}
+      ],
+      "expect": "execution_environment"
+    },
+    {
+      "query": "send an email to the team",
+      "candidates": [
+        {"name": "webfetch", "description": "Fetch content from a URL and return model-facing text."},
+        {"name": "websearch", "description": "Search the web and return titles, URLs and snippets."},
+        {"name": "view_image", "description": "View an image file (png, jpeg, gif, webp) so you can actually see it."}
+      ],
+      "expect": "none"
+    },
+    {
+      "query": "rank the most important symbols in an unfamiliar repository",
+      "candidates": [
+        {"name": "code_context", "description": "Return the symbols worth reading before making a specific change."},
+        {"name": "code_map", "description": "Rank every symbol in a source tree by importance and return the top ones. Start here when you do not know a codebase."},
+        {"name": "code_expand", "description": "Return one symbol's source together with its immediate callers and callees."}
+      ],
+      "expect": "code_map"
+    }
+  ]
+}

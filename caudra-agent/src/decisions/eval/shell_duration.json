@@ -1,0 +1,53 @@
+{
+  "baseline": {"right": 24, "wrong": 0, "undecided": 8, "p50_ms": 333, "p95_ms": 387},
+  "cases": [
+    {"command": "echo \"$HOME\"", "expect": "instant"},
+    {"command": "git branch --show-current", "expect": "instant"},
+    {"command": "ls -la docs", "expect": "instant"},
+    {"command": "cat package.json", "expect": "instant"},
+    {"command": "git rev-parse --abbrev-ref HEAD", "expect": "instant"},
+    {"command": "touch .env.local", "expect": "instant"},
+    {"command": "node -e 'console.log(1 + 1)'", "expect": "instant"},
+    {"command": "pytest tests/unit/test_tokenizer.py -q", "expect": "seconds"},
+    {"command": "black src/", "expect": "seconds"},
+    {"command": "sleep 45", "expect": "seconds"},
+    {"command": "npx prettier --check src/index.ts", "expect": "seconds"},
+    {"command": "go test ./internal/config", "expect": "seconds"},
+    {"command": "git clone --depth 1 https://github.com/serde-rs/json /tmp/serde-json", "expect": "seconds"},
+    {"command": "sudo apt-get update", "expect": "seconds"},
+    {"command": "cargo test --workspace", "expect": "minutes"},
+    {"command": "cargo clippy --all --tests -- -D warnings", "expect": "minutes"},
+    {"command": "docker build -t api:dev .", "expect": "minutes"},
+    {"command": "./gradlew assembleRelease", "expect": "minutes"},
+    {"command": "yarn install --frozen-lockfile && yarn build", "expect": "minutes"},
+    {"command": "poetry install", "expect": "minutes"},
+    {"command": "cmake --build build -j8", "expect": "minutes"},
+    {"command": "sbt test", "expect": "minutes"},
+    {"command": "npm run dev", "expect": "endless"},
+    {"command": "uvicorn app.main:app --reload", "expect": "endless"},
+    {"command": "journalctl -f -u nginx", "expect": "endless"},
+    {"command": "python3 -m http.server 8000", "expect": "endless"},
+    {"command": "cargo watch -x test", "expect": "endless"},
+    {"command": "kubectl logs -f deploy/api", "expect": "endless"},
+    {
+      "command": "cargo test -p caudra-storage shell_durations",
+      "earlier_runs": [{"command": "cargo test *", "took": "exited after minutes", "runs": 4}],
+      "expect": "minutes"
+    },
+    {
+      "command": "./scripts/check.sh --fast",
+      "earlier_runs": [{"command": "./scripts/check.sh *", "took": "took a few seconds before it exited", "runs": 6}],
+      "expect": "seconds"
+    },
+    {
+      "command": "./bin/migrate --dry-run",
+      "earlier_runs": [{"command": "./bin/migrate *", "took": "exited at once, with no noticeable wait", "runs": 5}],
+      "expect": "instant"
+    },
+    {
+      "command": "just e2e",
+      "earlier_runs": [{"command": "just e2e *", "took": "exited after minutes", "runs": 3}],
+      "expect": "minutes"
+    }
+  ]
+}

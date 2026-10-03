@@ -1,19 +1,16 @@
 use caudra_config::decisions::FeatureMode;
-use caudra_decision::{Answer, QuestionSet};
+use caudra_decision::Answer;
 use caudra_storage::{decision_log::DecisionLabel, now_epoch};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::{
     DecisionContext, DecisionFeature, Decisions, PermissionAction, PermissionDecision,
-    PermissionFlag,
+    PermissionFlag, questions,
 };
 
-const QUESTION_SET: &str = "shell_effect.v1";
 pub(super) const WRITES: &str = "writes_project_files";
-const QUESTIONS: &str = r#"{
-    "writes_project_files": {"type":"noul","instructions":"Does executing this shell command modify files in the project tree?"},
-    "changes_system_state": {"type":"noul","instructions":"Does executing this shell command change system state beyond the project tree?"}
-}"#;
+#[cfg(test)]
+pub(super) const CHANGES_SYSTEM: &str = "changes_system_state";
 const LABEL_SOURCE: &str = "deterministic";
 
 impl Decisions {
@@ -30,13 +27,11 @@ impl Decisions {
         {
             return None;
         }
-        let questions =
-            QuestionSet::new(QUESTION_SET, serde_json::from_str(QUESTIONS).ok()?).ok()?;
         let evaluation = self
             .evaluate(
                 DecisionFeature::ShellEffect,
-                &json!({"command": command}),
-                &questions,
+                &effect_state(command),
+                questions::SHELL_EFFECT.as_ref()?,
                 context,
             )
             .await?;
@@ -71,4 +66,8 @@ impl Decisions {
         };
         Some(PermissionDecision { action, evaluation })
     }
+}
+
+pub(super) fn effect_state(command: &str) -> Value {
+    json!({"command": command})
 }

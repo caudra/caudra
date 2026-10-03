@@ -494,7 +494,7 @@ Connection settings and thresholds are global-only. Projects may set individual 
 | `api_key_env` | string | `TYPESAFE_API_KEY` | Environment variable containing the optional credential, never the credential itself. Project environment values are excluded. |
 | `allow_remote` | boolean | `false` | Explicit global consent to send decision context to a non-loopback endpoint. |
 | `allow_http` | boolean | `false` | Global-only opt-in for non-loopback HTTP. Also requires `allow_remote = true`. Use only with transport protection you control, such as a trusted encrypted tunnel. |
-| `timeout_ms` | integer | `400` | Positive decision-request deadline in milliseconds, separate from shell execution timeouts. |
+| `timeout_ms` | integer | `800` | Positive decision-request deadline in milliseconds, separate from shell execution timeouts. |
 | `log` | boolean | `false` | Retain bounded decision records in the separate local `decisions.db`. |
 | `log_retention_days` | integer | `90` | Positive retention period for decision records. |
 | `features` | table | `{}` | Per-feature modes below. |
@@ -510,7 +510,7 @@ allow_remote = true
 
 `TYPESAFE_BASE_URL` replaces the whole configured base URL, path prefix included, and passes the same URL and transport opt-in checks. It applies only when `base_url` is set, so the variable alone never activates the engine. Project `.env` files cannot set it.
 
-Caudra retries HTTP 408, 429, and 5xx responses at most twice. Each retry waits for the delay the server requests in `retry-after-ms` or `Retry-After`, or else for an exponential backoff that starts near half a second. No retry waits past `timeout_ms`, so under the default 400 ms deadline most retries need a short server-requested delay. Connection failures, 401, 422, and other client errors fail at once.
+Caudra retries HTTP 408, 429, and 5xx responses at most twice. Each retry waits for the delay the server requests in `retry-after-ms` or `Retry-After`, or else for an exponential backoff that starts near half a second. No retry waits past `timeout_ms`, so under the default 800 ms deadline most retries need a short server-requested delay. Connection failures, 401, 422, and other client errors fail at once.
 
 Requests ignore ambient proxies and do not follow redirects. `localhost` is a DNS name, not numeric loopback for this policy. Private and CGNAT addresses receive no automatic HTTP exemption. These settings do not change Workcell transport policy.
 
@@ -530,7 +530,7 @@ Redaction is best effort. Decision context can include commands, task text, tool
 | `tool_search` | `off` | `off`, `shadow`, `enforce` | Rerank the existing lexical tool shortlist. This neither loads arbitrary names nor grants execution permission. |
 | `skill_suggestions` | `off` | `off`, `shadow`, `advise` | Suggest a shortlisted skill. The agent still chooses whether to load it. |
 | `goal_prescreen` | `off` | `off`, `shadow`, `enforce` | Skip an unlikely-to-pass goal evaluation within the continuation budget and continue work. Only the normal evaluator can certify completion. |
-| `subagent_routing` | `off` | `off`, `shadow`, `enforce` | Choose a model job for a new unpinned subagent from its task label, not its full prompt. Explicit jobs, profile pins, and continuations keep their routing. |
+| `subagent_routing` | `off` | `off`, `shadow`, `enforce` | Choose a model job for a new unpinned subagent from its task label, mode, profile, and a redacted prompt excerpt. Explicit jobs, profile pins, and continuations keep their routing. |
 
 #### `decisions.thresholds`
 
@@ -543,8 +543,8 @@ Flag thresholds trigger at or above the configured value. Goal prescreening uses
 | `content_injection` | float | `0.9` | Probability that sampled content attempts instruction injection. |
 | `content_addressed_to_agent` | float | `0.9` | Probability that sampled content addresses the agent. |
 | `shell_endless` | float | `0.9` | Probability that a shell command runs until stopped. |
-| `shell_heavy` | float | `0.9` | Probability for a heavy-command prior and confidence required for a duration choice. |
-| `routing_confidence` | float | `0.9` | Confidence required for tool search, skill suggestions, and subagent routing. Tool-search choice probability must also meet it. Yes/no answers carry no confidence, so subagent routing requires each yes/no probability to be at least this value or at most 1 minus it. |
+| `shell_duration` | float | `0.9` | Probability mass a duration bound needs before an engine estimate is used. |
+| `routing_confidence` | float | `0.9` | Confidence required for tool search and skill suggestions. Tool-search choice probability must also meet it. Subagent routing picks the Fast model when this much difficulty probability is at or below routine work, and the Best model when this much is on open-ended work. |
 | `goal_skip_below` | float | `0.05` | Skip an evaluator at or below this completion probability, within the continuation budget. |
 | `shell_writes` | float | unset | Optional project-write warning threshold. Omission leaves the warning disabled. No built-in enforcement threshold. |
 
@@ -552,7 +552,9 @@ Flag thresholds trigger at or above the configured value. Goal prescreening uses
 
 `shell_duration` applies only to eligible local native shell calls, not remote workspaces or managed sandboxes. Measured exact-command history takes priority over command-family history, and both take priority over a model estimate. Timeouts, cancellations, and failures are recorded separately from completed latency samples. History is separate from the opt-in decision log, so `log = false` does not disable duration observations.
 
-A model estimate picks a bucket. `instant` finishes within 1 second, `short` finishes under `agent.shell_async_threshold_secs`, `long` finishes at or beyond that threshold, and `endless` runs until stopped. Measured runs are labeled with the same buckets.
+A model estimate scores a command on four levels: exits at once, runs for seconds, runs for minutes, or runs until stopped. It counts as running until stopped when the `endless` answer or the probability of that level reaches `shell_endless`. Otherwise the first of these bounds whose probability reaches `shell_duration` decides: at least minutes, at once, then at most seconds. With no bound reached, the call runs without an estimate.
+
+Measured runs are labeled by fixed boundaries. A run within 1 second exited at once, a run under 120 seconds took seconds, and a longer run took minutes. These boundaries stay the same whatever `agent.shell_async_threshold_secs` is. When neither the command nor its family has enough history, the request lists up to four related families as `earlier_runs`, drawn from runs in the same project and working directory. The command's own family comes first, then families with the same program, each with how long its runs took.
 
 In `advise`, estimates and warnings leave execution unchanged. In `enforce`, an omitted `timeoutSec` may receive a default based on 1.5 times estimated p90, bounded by the tool schema's default and maximum. An explicit timeout is never changed. An endless prediction gives caution only and does not remove the execution deadline.
 

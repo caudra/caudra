@@ -1,0 +1,40 @@
+{
+  "goal_met": {
+    "type": "noul",
+    "instructions": {
+      "question": "Does `assistant_tail` show that the condition in `goal` is fully met?",
+      "focus": "Judge only `assistant_tail`, `tool_outcomes` and `open_todos`. A plan, a promise, partial progress, a failing check or an open todo item means it is not met."
+    },
+    "criteria": {
+      "true": {
+        "what": "Reports the condition as done and nothing shown contradicts it"
+      },
+      "false": {
+        "what": "Work remains, failed, is only planned, or the user is asked to decide"
+      }
+    }
+  },
+  "asks_user": {
+    "type": "noul",
+    "instructions": {
+      "question": "Does `assistant_tail` end with a question the user must answer before the work can go on?",
+      "focus": "Rhetorical questions and offers of optional further help do not count."
+    },
+    "criteria": {
+      "true": {
+        "what": "Ends with a question or request that only the user can answer",
+        "examples": [
+          "Which database should the migration target, Postgres or SQLite?",
+          "Do you want the new flag enabled by default?"
+        ]
+      },
+      "false": {
+        "what": "Reports, plans or offers optional help without needing an answer",
+        "examples": [
+          "Done. Let me know if you want anything else.",
+          "The tests pass; next I will update the docs."
+        ]
+      }
+    }
+  }
+}

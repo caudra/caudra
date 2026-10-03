@@ -11,7 +11,7 @@ pub const BASE_URL_ENV: &str = "TYPESAFE_BASE_URL";
 pub const SYSTEM_ONE_PATH: &str = "/v1/systemone";
 const DEFAULT_MODEL: &str = "jev-latest";
 const DEFAULT_API_KEY_ENV: &str = "TYPESAFE_API_KEY";
-const DEFAULT_TIMEOUT_MS: u64 = 400;
+const DEFAULT_TIMEOUT_MS: u64 = 800;
 const DEFAULT_LOG_RETENTION_DAYS: u32 = 90;
 const DEFAULT_FLAG_THRESHOLD: f64 = 0.85;
 const DEFAULT_CONFIDENCE_THRESHOLD: f64 = 0.9;
@@ -144,7 +144,7 @@ features! {
     goal_prescreen: [Enforce],
         "Skip an unlikely-to-pass goal evaluation within the continuation budget and continue work. Only the normal evaluator can certify completion.";
     subagent_routing: [Enforce],
-        "Choose a model job for a new unpinned subagent from its task label, not its full prompt. Explicit jobs, profile pins, and continuations keep their routing.";
+        "Choose a model job for a new unpinned subagent from its task label, mode, profile, and a redacted prompt excerpt. Explicit jobs, profile pins, and continuations keep their routing.";
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -155,7 +155,7 @@ pub struct DecisionThresholds {
     pub content_injection: f64,
     pub content_addressed_to_agent: f64,
     pub shell_endless: f64,
-    pub shell_heavy: f64,
+    pub shell_duration: f64,
     pub routing_confidence: f64,
     pub goal_skip_below: f64,
     pub shell_writes: Option<f64>,
@@ -169,7 +169,7 @@ impl Default for DecisionThresholds {
             content_injection: DEFAULT_CONFIDENCE_THRESHOLD,
             content_addressed_to_agent: DEFAULT_CONFIDENCE_THRESHOLD,
             shell_endless: DEFAULT_CONFIDENCE_THRESHOLD,
-            shell_heavy: DEFAULT_CONFIDENCE_THRESHOLD,
+            shell_duration: DEFAULT_CONFIDENCE_THRESHOLD,
             routing_confidence: DEFAULT_CONFIDENCE_THRESHOLD,
             goal_skip_below: DEFAULT_GOAL_SKIP_BELOW,
             shell_writes: None,
@@ -225,13 +225,13 @@ impl DecisionThresholds {
             description: "Probability that a shell command runs until stopped.",
         },
         ConfigField {
-            name: "shell_heavy",
+            name: "shell_duration",
             ty: "float",
             default: ConfigValue::F64(DEFAULT_CONFIDENCE_THRESHOLD),
             min: None,
             max: None,
             env: None,
-            description: "Probability for a heavy-command prior and confidence required for a duration choice.",
+            description: "Probability mass a duration bound needs before an engine estimate is used.",
         },
         ConfigField {
             name: "routing_confidence",
@@ -240,7 +240,7 @@ impl DecisionThresholds {
             min: None,
             max: None,
             env: None,
-            description: "Confidence required for tool search, skill suggestions, and subagent routing. Tool-search choice probability must also meet it. Yes/no answers carry no confidence, so subagent routing requires each yes/no probability to be at least this value or at most 1 minus it.",
+            description: "Confidence required for tool search and skill suggestions. Tool-search choice probability must also meet it. Subagent routing picks the Fast model when this much difficulty probability is at or below routine work, and the Best model when this much is on open-ended work.",
         },
         ConfigField {
             name: "goal_skip_below",
@@ -272,7 +272,7 @@ impl DecisionThresholds {
                 Some(self.content_addressed_to_agent),
             ),
             ("thresholds.shell_endless", Some(self.shell_endless)),
-            ("thresholds.shell_heavy", Some(self.shell_heavy)),
+            ("thresholds.shell_duration", Some(self.shell_duration)),
             (
                 "thresholds.routing_confidence",
                 Some(self.routing_confidence),

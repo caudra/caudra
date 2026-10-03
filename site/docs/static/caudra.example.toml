@@ -864,7 +864,7 @@ version = 1
 # Positive decision-request deadline in milliseconds, separate from shell
 # execution timeouts.
 # Type: integer.
-# timeout_ms = 400
+# timeout_ms = 800
 
 # Retain bounded decision records in the separate local `decisions.db`.
 # Type: boolean.
@@ -925,9 +925,9 @@ version = 1
 # Type: string.
 # goal_prescreen = "off"
 
-# Choose a model job for a new unpinned subagent from its task label, not its
-# full prompt. Explicit jobs, profile pins, and continuations keep their
-# routing. Modes: off, shadow, enforce.
+# Choose a model job for a new unpinned subagent from its task label, mode,
+# profile, and a redacted prompt excerpt. Explicit jobs, profile pins, and
+# continuations keep their routing. Modes: off, shadow, enforce.
 # Type: string.
 # subagent_routing = "off"
 
@@ -955,15 +955,14 @@ version = 1
 # Type: float.
 # shell_endless = 0.9
 
-# Probability for a heavy-command prior and confidence required for a duration
-# choice.
+# Probability mass a duration bound needs before an engine estimate is used.
 # Type: float.
-# shell_heavy = 0.9
+# shell_duration = 0.9
 
-# Confidence required for tool search, skill suggestions, and subagent routing.
-# Tool-search choice probability must also meet it. Yes/no answers carry no
-# confidence, so subagent routing requires each yes/no probability to be at
-# least this value or at most 1 minus it.
+# Confidence required for tool search and skill suggestions. Tool-search choice
+# probability must also meet it. Subagent routing picks the Fast model when
+# this much difficulty probability is at or below routine work, and the Best
+# model when this much is on open-ended work.
 # Type: float.
 # routing_confidence = 0.9
 

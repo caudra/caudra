@@ -112,6 +112,29 @@ pub(crate) fn redact_decision_text(value: &str) -> String {
         .into_owned()
 }
 
+/// Appends `items` to the array at `key` while the state still fits
+/// [`DecisionState::new`], so optional evidence is trimmed instead of the
+/// whole state being refused. The key is only created for an item that fits.
+pub(crate) fn push_fitting(state: &mut Value, key: &str, items: impl IntoIterator<Item = Value>) {
+    for item in items {
+        let mut candidate = state.clone();
+        let Some(object) = candidate.as_object_mut() else {
+            return;
+        };
+        let Value::Array(array) = object
+            .entry(key)
+            .or_insert_with(|| Value::Array(Vec::new()))
+        else {
+            return;
+        };
+        array.push(item);
+        if DecisionState::new(&candidate).is_err() {
+            return;
+        }
+        *state = candidate;
+    }
+}
+
 /// The start of `text`, redacted and at most `limit` bytes. The raw text is
 /// cut on whitespace first so redaction sees whole words, and only a bounded
 /// prefix of a long prompt is ever scanned.
@@ -131,12 +154,37 @@ pub(crate) fn redacted_excerpt(text: &str, limit: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::iter;
+
     use serde_json::json;
     use test_case::test_case;
 
-    use super::{DecisionState, DecisionStateError, MAX_STATE_BYTES, REDACTED, redacted_excerpt};
+    use super::{
+        DecisionState, DecisionStateError, MAX_STATE_BYTES, REDACTED, push_fitting,
+        redacted_excerpt,
+    };
 
     const SECRET: &str = "do-not-send-this-value";
+    const EVIDENCE: &str = "evidence";
+    const COMMAND: &str = "cargo build";
+
+    #[test_case(100, true; "trimmed_to_the_cap")]
+    #[test_case(MAX_STATE_BYTES, false; "first_item_too_large")]
+    fn evidence_fills_the_state_up_to_its_cap(item_bytes: usize, kept: bool) {
+        let item = json!("x".repeat(item_bytes));
+        let mut state = json!({"command": COMMAND});
+        push_fitting(
+            &mut state,
+            EVIDENCE,
+            iter::repeat_n(item.clone(), MAX_STATE_BYTES),
+        );
+        assert!(DecisionState::new(&state).is_ok());
+        assert_eq!(state.get(EVIDENCE).is_some(), kept);
+        if kept {
+            state[EVIDENCE].as_array_mut().unwrap().push(item);
+            assert!(DecisionState::new(&state).is_err());
+        }
+    }
 
     #[test_case("fix the build", 64, "fix the build"; "fits")]
     #[test_case("fix the build now", 11, "fix the"; "cut_on_whitespace")]

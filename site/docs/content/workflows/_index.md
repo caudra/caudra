@@ -220,7 +220,7 @@ While the engine switch is off, a new `decide()` call raises a catchable error b
 
 Decision calls count against the host-call limit, not the agent budget. Their answers are data for the script. They do not grant permissions or change an agent's execution mode.
 
-Explicit `decide()` state is separate from passive subagent routing. The passive router currently sees a task label, not the full prompt. An explicit `model_job` or profile model pin takes precedence over passive routing.
+Explicit `decide()` state is separate from passive subagent routing. The passive router sees the task label, mode, and profile, plus a redacted excerpt of the prompt rather than the full prompt. An explicit `model_job` or profile model pin takes precedence over passive routing.
 
 ### Spending the budget
 

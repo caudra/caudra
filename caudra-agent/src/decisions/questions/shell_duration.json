@@ -1,0 +1,44 @@
+{
+  "duration": {
+    "type": "score",
+    "instructions": {
+      "question": "How long will `command` run before it exits on its own?",
+      "focus": "Judge the slowest step; a chain of steps runs as long as its slowest one. Use `earlier_runs` when present."
+    },
+    "criteria": [
+      {
+        "what": "Exits at once, with no noticeable wait: prints, reads or checks something small, or changes a little local state",
+        "examples": ["pwd", "git status", "ls src", "mkdir -p build && touch build/.keep", "python3 -c 'print(42)'"]
+      },
+      {
+        "what": "Takes a few seconds before it exits: a search across many files, a formatter run, a single test file or one network request",
+        "examples": ["rg TODO src", "git log --oneline -20", "cargo fmt --all", "curl -s https://example.org/api/items", "pytest tests/test_one.py"]
+      },
+      {
+        "what": "Project-scale work that exits after minutes: a full build, a test suite, a lint of the whole project, an install or a large download",
+        "examples": ["cargo build --release", "npm ci", "mvn package", "pip install -r requirements.txt", "docker compose build"]
+      },
+      {
+        "what": "Keeps running until someone stops it: a server, watcher, follow mode or interactive program",
+        "examples": ["npm start", "flask run", "tail -F /var/log/syslog", "jupyter lab", "top"]
+      }
+    ]
+  },
+  "endless": {
+    "type": "noul",
+    "instructions": {
+      "question": "Does `command` keep running until someone stops it?",
+      "focus": "A long build, test run or download still stops on its own."
+    },
+    "criteria": {
+      "true": {
+        "what": "A server, watcher, follow mode, REPL or interactive program",
+        "examples": ["npm start", "tail -F app.log"]
+      },
+      "false": {
+        "what": "Exits by itself when its work is done, however long that takes",
+        "examples": ["cargo build --release", "git status"]
+      }
+    }
+  }
+}

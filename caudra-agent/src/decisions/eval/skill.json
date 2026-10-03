@@ -1,0 +1,62 @@
+{
+  "baseline": {"right": 6, "wrong": 0, "undecided": 1, "p50_ms": 169, "p95_ms": 210},
+  "cases": [
+    {
+      "request": "How do I configure permission rules for shell commands in caudra.toml?",
+      "skills": [
+        {"name": "caudra-docs", "description": "Caudra's own user documentation for this build: caudra.toml configuration, permissions, tools, commands, keybindings, providers, sessions, MCP, skills, plugins, workflows. Load it before answering questions about using or configuring Caudra."},
+        {"name": "herdr", "description": "Control Herdr, the terminal multiplexer this session runs in: inspect and drive its workspaces, tabs, panes, commands, and the agents running in them. Use only when the user asks for Herdr."},
+        {"name": "pdf-reports", "description": "Create, fill and merge PDF documents: invoices, reports, forms. Use when the user asks to produce or edit a PDF file."}
+      ],
+      "expect": "caudra-docs"
+    },
+    {
+      "request": "Brainstorm five names for a CLI tool that syncs dotfiles, and check whether the npm package names are free.",
+      "skills": [
+        {"name": "brand-name-research", "description": "Research and compare brand, product, company, CLI, library, and domain names. Use when brainstorming names, checking domain or package availability, investigating naming clashes, grading candidates, or building a Pareto shortlist."},
+        {"name": "caudra-docs", "description": "Caudra's own user documentation for this build: caudra.toml configuration, permissions, tools, commands, keybindings, providers, sessions, MCP, skills, plugins, workflows. Load it before answering questions about using or configuring Caudra."}
+      ],
+      "expect": "brand-name-research"
+    },
+    {
+      "request": "Generate a PDF invoice for the March consulting hours.",
+      "skills": [
+        {"name": "pdf-reports", "description": "Create, fill and merge PDF documents: invoices, reports, forms. Use when the user asks to produce or edit a PDF file."},
+        {"name": "brand-name-research", "description": "Research and compare brand, product, company, CLI, library, and domain names. Use when brainstorming names, checking domain or package availability, investigating naming clashes, grading candidates, or building a Pareto shortlist."}
+      ],
+      "expect": "pdf-reports"
+    },
+    {
+      "request": "Rename the commands module to actions across the workspace and update its doc comments.",
+      "skills": [
+        {"name": "caudra-docs", "description": "Caudra's own user documentation for this build: caudra.toml configuration, permissions, tools, commands, keybindings, providers, sessions, MCP, skills, plugins, workflows. Load it before answering questions about using or configuring Caudra."},
+        {"name": "herdr", "description": "Control Herdr, the terminal multiplexer this session runs in: inspect and drive its workspaces, tabs, panes, commands, and the agents running in them. Use only when the user asks for Herdr."}
+      ],
+      "expect": "none"
+    },
+    {
+      "request": "Split the panes layout code in src/layout.rs into smaller functions.",
+      "skills": [
+        {"name": "herdr", "description": "Control Herdr, the terminal multiplexer this session runs in: inspect and drive its workspaces, tabs, panes, commands, and the agents running in them. Use only when the user asks for Herdr."},
+        {"name": "pdf-reports", "description": "Create, fill and merge PDF documents: invoices, reports, forms. Use when the user asks to produce or edit a PDF file."}
+      ],
+      "expect": "none"
+    },
+    {
+      "request": "Open a new terminal tab in the multiplexer and start the test watcher there.",
+      "skills": [
+        {"name": "herdr", "description": "Control Herdr, the terminal multiplexer this session runs in: inspect and drive its workspaces, tabs, panes, commands, and the agents running in them. Use only when the user asks for Herdr."},
+        {"name": "caudra-docs", "description": "Caudra's own user documentation for this build: caudra.toml configuration, permissions, tools, commands, keybindings, providers, sessions, MCP, skills, plugins, workflows. Load it before answering questions about using or configuring Caudra."}
+      ],
+      "expect": "herdr"
+    },
+    {
+      "request": "Check whether quillstack is already taken as a company or domain name.",
+      "skills": [
+        {"name": "brand-name-research", "description": "Research and compare brand, product, company, CLI, library, and domain names. Use when brainstorming names, checking domain or package availability, investigating naming clashes, grading candidates, or building a Pareto shortlist."},
+        {"name": "pdf-reports", "description": "Create, fill and merge PDF documents: invoices, reports, forms. Use when the user asks to produce or edit a PDF file."}
+      ],
+      "expect": "brand-name-research"
+    }
+  ]
+}

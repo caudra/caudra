@@ -8,20 +8,17 @@ use caudra_config::decisions::FeatureMode;
 use caudra_decision::{Answer, DecisionError, DecisionResponse, QuestionSet, QuestionType};
 use serde_json::Value;
 
-use super::{DecisionContext, DecisionFeature, DecisionOutcome, Decisions};
+use super::{DecisionContext, DecisionFeature, DecisionOutcome, Decisions, questions};
 
-const QUESTION_SET_ID: &str = "permission.v1";
-const QUESTIONS: &str = include_str!("questions/permission.json");
 const QUESTION_FILE: &str = "decisions/permission.json";
 const MAX_QUESTION_FILE_BYTES: u64 = 64 * 1024;
 const TAINT_THRESHOLD_FACTOR: f64 = 0.75;
-pub(super) const FLAGS: [&str; 6] = [
+pub(super) const FLAGS: [&str; 5] = [
     "deletes",
     "uploads",
     "credentials",
     "permissions",
     "remote_rewrite",
-    "off_task",
 ];
 
 #[derive(Clone, Debug)]
@@ -49,11 +46,9 @@ pub struct PermissionDecision {
 
 impl Decisions {
     pub fn permission_questions() -> Result<QuestionSet, DecisionError> {
-        QuestionSet::new(
-            QUESTION_SET_ID,
-            serde_json::from_str(QUESTIONS)
-                .map_err(|_| DecisionError::Rejected("invalid embedded permission questions"))?,
-        )
+        questions::PERMISSION.clone().ok_or(DecisionError::Rejected(
+            "invalid embedded permission questions",
+        ))
     }
 
     pub async fn permission(
@@ -167,7 +162,7 @@ pub(super) fn load_questions(global_dir: Option<&Path>) -> Result<QuestionSet, D
         ));
     }
     let questions = QuestionSet::new(
-        QUESTION_SET_ID,
+        defaults.id(),
         serde_json::from_slice(&bytes)
             .map_err(|_| DecisionError::Rejected("permission question override is invalid JSON"))?,
     )?;

@@ -785,7 +785,7 @@ HTTPS is required except for numeric loopback HTTP. A user-global `allow_http = 
 ```toml
 [decisions]
 base_url = "http://127.0.0.1:8000"
-timeout_ms = 400
+timeout_ms = 800
 log = false
 
 [decisions.features]
@@ -795,7 +795,7 @@ auto_screening = "shadow"
 
 Every feature defaults to `off`. `permission_advice = "shadow"` evaluates predictions without changing a prompt. Retaining them requires `log = true`. `"advise"` can add warnings to an already visible prompt without delaying the user's answer. `auto_screening = "shadow"` leaves Auto's deterministic baseline unchanged. `"enforce"` can turn an eligible Auto call into a prompt, and only `"enforce"` lets Auto run a line that cannot be checked command by command.
 
-Each warning is a `⚠` line above the answers, with the predicted likelihood, such as `⚠ May delete files (88%)`. The warnings are `May delete files`, `May upload or send data`, `May read or use credentials`, `May change file permissions`, `May rewrite remote history`, `Looks unrelated to the task`, and `May change project files`. ACP permission requests carry the same phrases. They are uncertain predictions, not proof that a call is safe or unsafe. A model's read-only prediction never grants permission.
+Each warning is a `⚠` line above the answers, with the predicted likelihood, such as `⚠ May delete files (88%)`. The warnings are `May delete files`, `May upload or send data`, `May read or use credentials`, `May change file permissions`, `May rewrite remote history`, and `May change project files`. ACP permission requests carry the same phrases. They are uncertain predictions, not proof that a call is safe or unsafe. A model's read-only prediction never grants permission.
 
 `shell_effect = "advise"` can warn about possible project writes during Plan review when `thresholds.shell_writes` is explicitly configured. This is caution only. Deterministic checks still decide read-only access. Shadow labels use the deterministic classifier, not observed filesystem changes.
 

@@ -201,6 +201,26 @@ pub struct ScoreAnswer {
     pub confidence: f64,
 }
 
+impl ScoreAnswer {
+    /// The probability that the answer lies at `level` or above.
+    pub fn at_least(&self, level: usize) -> f64 {
+        self.mass(|index| index >= level)
+    }
+
+    /// The probability that the answer lies at `level` or below.
+    pub fn at_most(&self, level: usize) -> f64 {
+        self.mass(|index| index <= level)
+    }
+
+    fn mass(&self, includes: impl Fn(usize) -> bool) -> f64 {
+        self.probabilities
+            .iter()
+            .filter(|(key, _)| key.parse().is_ok_and(&includes))
+            .map(|(_, probability)| probability)
+            .sum()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Answer {
@@ -360,8 +380,8 @@ pub(crate) mod tests {
     use test_case::test_case;
 
     use super::{
-        Answer, DecisionRequest, DecisionResponse, MAX_CHOICE_OPTIONS, MAX_QUESTIONS,
-        MAX_SCORE_LEVELS, MAX_STATE_CHARS, Question, QuestionType,
+        Answer, DecisionRequest, DecisionResponse, FLOAT_TOLERANCE, MAX_CHOICE_OPTIONS,
+        MAX_QUESTIONS, MAX_SCORE_LEVELS, MAX_STATE_CHARS, Question, QuestionType, ScoreAnswer,
     };
     use crate::DecisionError;
 
@@ -527,6 +547,24 @@ pub(crate) mod tests {
             answer.validate(&question),
             Err(DecisionError::Invalid(_))
         ));
+    }
+
+    #[test_case(json!({"0":0.1,"1":0.2,"2":0.3,"3":0.4}), 2, 0.7, 0.6; "split")]
+    #[test_case(json!({"0":0.0,"1":1.0,"2":0.0,"3":0.0}), 1, 1.0, 1.0; "single_peak")]
+    #[test_case(json!({"0":0.25,"1":0.25,"2":0.25,"3":0.25}), 0, 1.0, 0.25; "lowest_level")]
+    #[test_case(json!({"0":0.25,"1":0.25,"2":0.25,"3":0.25}), 3, 0.25, 1.0; "highest_level")]
+    fn score_bounds_sum_probabilities(
+        probabilities: Value,
+        level: usize,
+        at_least: f64,
+        at_most: f64,
+    ) {
+        let answer: ScoreAnswer = serde_json::from_value(json!({
+            "score": 0.0, "legend": {}, "probabilities": probabilities, "confidence": 1.0
+        }))
+        .unwrap();
+        assert!((answer.at_least(level) - at_least).abs() < FLOAT_TOLERANCE);
+        assert!((answer.at_most(level) - at_most).abs() < FLOAT_TOLERANCE);
     }
 
     #[test_case(QuestionType::Choice, MAX_CHOICE_OPTIONS; "choice_limit")]

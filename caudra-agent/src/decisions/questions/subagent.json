@@ -1,0 +1,27 @@
+{
+  "difficulty": {
+    "type": "score",
+    "instructions": {
+      "question": "How much reasoning does the delegated coding task in `task` need?",
+      "focus": "Judge the work the task asks for, not how long its description is. A task that spells out exactly what to look up or change needs little reasoning, however many files it touches."
+    },
+    "criteria": [
+      {
+        "what": "A lookup or mechanical step",
+        "examples": ["find where config is parsed", "list the callers of a function", "rename a variable in one file"]
+      },
+      {
+        "what": "Routine work that follows a known pattern",
+        "examples": ["add a test like the existing ones", "replace a deprecated call across one module"]
+      },
+      {
+        "what": "Multi-step work that needs judgment",
+        "examples": ["a small feature across two modules", "track down why a setting is ignored"]
+      },
+      {
+        "what": "Open-ended work that needs deep reasoning or expertise",
+        "examples": ["an intermittent deadlock", "a storage schema design", "a security audit of the auth flow"]
+      }
+    ]
+  }
+}

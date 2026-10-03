@@ -1,0 +1,20 @@
+{
+  "baseline": {"right": 27, "wrong": 0, "undecided": 3, "p50_ms": 252, "p95_ms": 255},
+  "cases": [
+    {"command": "perl -pi -e 's/v1/v2/' Makefile", "writes_project_files": true, "changes_system_state": false},
+    {"command": "make", "writes_project_files": true, "changes_system_state": false},
+    {"command": "yarn add lodash", "writes_project_files": true, "changes_system_state": false},
+    {"command": "git stash", "writes_project_files": true, "changes_system_state": false},
+    {"command": "prettier --write src/", "writes_project_files": true, "changes_system_state": false},
+    {"command": "pytest -q", "writes_project_files": true, "changes_system_state": false},
+    {"command": "git diff HEAD~1 --stat", "writes_project_files": false, "changes_system_state": false},
+    {"command": "grep -rn unsafe crates/", "writes_project_files": false, "changes_system_state": false},
+    {"command": "head -50 README.md", "writes_project_files": false, "changes_system_state": false},
+    {"command": "git show --name-only HEAD", "writes_project_files": false, "changes_system_state": false},
+    {"command": "ps aux", "writes_project_files": false, "changes_system_state": false},
+    {"command": "brew install ripgrep", "writes_project_files": false, "changes_system_state": true},
+    {"command": "sudo systemctl enable --now docker", "writes_project_files": false, "changes_system_state": true},
+    {"command": "pip install --user httpie", "writes_project_files": false, "changes_system_state": true},
+    {"command": "pkill -f 'vite dev'", "writes_project_files": false, "changes_system_state": true}
+  ]
+}

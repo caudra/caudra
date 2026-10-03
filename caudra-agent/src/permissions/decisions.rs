@@ -1,7 +1,9 @@
 use super::enforce::{AutoEligibility, CurrentPolicy, EvaluationContext};
+use super::structured::{WORKDIR_ATTRIBUTE, kind_noun};
 use super::{
     AutoNote, EngineFlag, PendingRegistration, PermissionAdvisory, PermissionAnswer,
-    PermissionManager, PermissionPolicyError, PermissionRequest, PermissionResourceKind,
+    PermissionManager, PermissionPolicyError, PermissionRequest, PermissionResource,
+    PermissionResourceKind,
 };
 use crate::decisions::{
     DecisionContext, DecisionFeature, DecisionReceipt, Decisions, PermissionAction,
@@ -66,19 +68,38 @@ fn record_effect(
 }
 
 fn state(request: &PermissionRequest) -> Value {
-    let resources: Vec<_> = request
-        .resources
+    decision_state(
+        &request.tool.to_string(),
+        &request.input,
+        &request.resources,
+    )
+}
+
+/// Command resources repeat `input.command` segment by segment, so only the
+/// other resources reach the engine, each with its kind as a plain noun.
+pub(crate) fn decision_state(tool: &str, input: &Value, resources: &[PermissionResource]) -> Value {
+    let mut state = json!({"tool": tool, "input": input});
+    if let Some(workdir) = resources
         .iter()
+        .find_map(|resource| resource.attributes.get(WORKDIR_ATTRIBUTE))
+    {
+        state["workdir"] = json!(workdir);
+    }
+    let resources: Vec<_> = resources
+        .iter()
+        .filter(|resource| resource.kind != PermissionResourceKind::Command)
         .map(|resource| {
-            json!({
-                "kind": resource.kind,
-                "value": resource.value,
-                "access": resource.access,
-                "workdir": resource.attributes.get("workdir"),
-            })
+            let mut entry = json!({"kind": kind_noun(&resource.kind), "value": resource.value});
+            if let Some(access) = &resource.access {
+                entry["access"] = json!(access);
+            }
+            entry
         })
         .collect();
-    json!({"tool": request.tool.to_string(), "input": request.input, "resources": resources})
+    if !resources.is_empty() {
+        state["resources"] = json!(resources);
+    }
+    state
 }
 
 fn context(manager: &PermissionManager, request: &PermissionRequest) -> DecisionContext {
@@ -394,7 +415,8 @@ mod tests {
     };
     use crate::permissions::{
         AutoNote, EngineFlag, PendingRegistration, PermissionAnswer, PermissionMode,
-        ScriptLanguage, ShellOpacity,
+        PermissionResourceAccess, PermissionResourceKind, ScriptLanguage, ShellOpacity,
+        filesystem_permission_resource,
     };
     use crate::tools::PermissionScopes;
     use crate::{AgentEvent, CancelToken, EventSender};
@@ -409,7 +431,7 @@ mod tests {
     use caudra_storage::id::CaudraId;
     use futures_lite::future;
     use serde_json::{Value, json};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
@@ -417,6 +439,9 @@ mod tests {
     use test_case::test_case;
 
     const BASE_URL: &str = "http://127.0.0.1:1";
+    const WRITTEN_FILE: &str = "build.log";
+    const FILE_NOUN: &str = "file";
+    const WRITE_ACCESS: &str = "write";
     const TIMEOUT_MS: u64 = 5_000;
     const SHORT_TIMEOUT_MS: u64 = 1;
     const UNKNOWN_FLAG: &str = "untrusted text";
@@ -647,13 +672,6 @@ mod tests {
             assert!(shell_prompt(&manager, &intent, &script).await.is_none());
             let state = service.started.try_recv().unwrap();
             assert_eq!(state["input"]["command"], script);
-            assert!(
-                state["resources"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|resource| resource["value"] == script)
-            );
         });
     }
 
@@ -996,13 +1014,24 @@ mod tests {
     }
 
     #[test]
-    fn permission_state_carries_resources_and_workdir_without_authority() {
-        let request = shell_request(&[FIRST_COMMAND], workcell_shell_subject());
-        let state = state(&request);
-        assert_eq!(state["resources"][0]["value"], FIRST_COMMAND);
-        assert_eq!(state["resources"][0]["workdir"], SHELL_WORKDIR);
-        assert!(state.get("options").is_none());
-        assert!(state.get("presentation").is_none());
+    fn state_drops_command_resources_and_flattens_kind() {
+        let mut request = shell_request(&[FIRST_COMMAND], workcell_shell_subject());
+        let written = filesystem_permission_resource(
+            PermissionResourceKind::File,
+            Path::new(WRITTEN_FILE),
+            PermissionResourceAccess::Write,
+            Path::new(SHELL_WORKDIR),
+        );
+        request.resources.push(written.clone());
+        assert_eq!(
+            state(&request),
+            json!({
+                "tool": request.tool.to_string(),
+                "input": request.input,
+                "workdir": SHELL_WORKDIR,
+                "resources": [{"kind": FILE_NOUN, "value": written.value, "access": WRITE_ACCESS}],
+            })
+        );
     }
 
     #[test]

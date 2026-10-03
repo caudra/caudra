@@ -512,7 +512,7 @@ pub(super) fn blanket_authority(kind: &PermissionResourceKind) -> String {
     format!("any {}", kind_noun(kind))
 }
 
-pub(super) fn kind_noun(kind: &PermissionResourceKind) -> String {
+pub(in crate::permissions) fn kind_noun(kind: &PermissionResourceKind) -> String {
     match kind {
         PermissionResourceKind::Custom { name } => safe_summary(name),
         PermissionResourceKind::RemoteFile { .. } => "remote file".into(),

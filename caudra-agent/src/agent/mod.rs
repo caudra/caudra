@@ -49,4 +49,9 @@ pub use run::{
     Agent, AgentParams, AgentRunParams, ModelRoute, estimate_message_tokens,
     resolve_compaction_model, resolve_model_for_purpose, resolve_purpose_model,
 };
+#[cfg(test)]
+pub(crate) use run::{
+    GOAL_MET_QUESTION, goal_prescreen_state, should_skip_goal, skill_questions, skill_shortlist,
+    skill_state, suggested_skill,
+};
 pub use steering::EMPTY_RULE as EMPTY_RESPONSE_RULE;

@@ -552,7 +552,8 @@ fn write_decisions_section(out: &mut String) {
          prompting for eligible Auto calls.\n\n",
     );
     write_table(out, DecisionsConfig::FIELDS);
-    out.push_str(
+    write!(
+        out,
         "\nCaudra sends each request to `base_url` with `/v1/systemone` appended. A path prefix \
          stays in place, so a server mounted under `/typesafe` uses \
          `base_url = \"http://127.0.0.1:8080/typesafe\"` and receives requests at \
@@ -569,7 +570,7 @@ fn write_decisions_section(out: &mut String) {
          Caudra retries HTTP 408, 429, and 5xx responses at most twice. Each retry waits for the \
          delay the server requests in `retry-after-ms` or `Retry-After`, or else for an exponential \
          backoff that starts near half a second. No retry waits past `timeout_ms`, so under the \
-         default 400 ms deadline most retries need a short server-requested delay. Connection \
+         default {timeout_ms} ms deadline most retries need a short server-requested delay. Connection \
          failures, 401, 422, and other client errors fail at once.\n\n\
          Requests ignore ambient proxies and do not follow redirects. `localhost` is a DNS name, \
          not numeric loopback for this policy. Private and CGNAT addresses receive no automatic HTTP exemption. \
@@ -584,7 +585,9 @@ fn write_decisions_section(out: &mut String) {
          Unsupported modes are configuration errors. Passive features are suppressed in YOLO.\n\n\
          | Feature | Default | Supported modes | Behavior beyond shadow |\n\
          |---------|---------|-----------------|------------------------|\n",
-    );
+        timeout_ms = DecisionsConfig::default().timeout_ms,
+    )
+    .unwrap();
     for feature in DecisionFeatures::ALL {
         let modes: Vec<String> = feature
             .modes
@@ -620,9 +623,19 @@ fn write_decisions_section(out: &mut String) {
          history, and both take priority over a model estimate. Timeouts, cancellations, and failures \
          are recorded separately from completed latency samples. History is separate from the \
          opt-in decision log, so `log = false` does not disable duration observations.\n\n\
-         A model estimate picks a bucket. `instant` finishes within 1 second, `short` finishes \
-         under `agent.shell_async_threshold_secs`, `long` finishes at or beyond that threshold, \
-         and `endless` runs until stopped. Measured runs are labeled with the same buckets.\n\n\
+         A model estimate scores a command on four levels: exits at once, runs for seconds, \
+         runs for minutes, or runs until stopped. It counts as running until stopped when the \
+         `endless` answer or the probability of that level reaches `shell_endless`. Otherwise \
+         the first of these bounds whose probability reaches `shell_duration` decides: at least \
+         minutes, at once, then at most seconds. With no bound reached, the call runs without an \
+         estimate.\n\n\
+         Measured runs are labeled by fixed boundaries. A run within 1 second exited at once, a \
+         run under 120 seconds took seconds, and a longer run took minutes. These boundaries \
+         stay the same whatever `agent.shell_async_threshold_secs` is. When neither the command \
+         nor its family has enough history, the request lists up to four related families as \
+         `earlier_runs`, drawn from runs in the same project and working directory. The \
+         command's own family comes first, then families with the same program, each with how \
+         long its runs took.\n\n\
          In `advise`, estimates and warnings leave execution unchanged. In `enforce`, an omitted \
          `timeoutSec` may receive a default based on 1.5 times estimated p90, bounded by the \
          tool schema's default and maximum. An explicit timeout is never changed. An endless \

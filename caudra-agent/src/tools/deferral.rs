@@ -1000,7 +1000,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn shortlist_is_bounded_and_uses_opaque_ids() {
+    fn shortlist_is_bounded_and_keeps_rank_order() {
         let fixture = SearchDecisions::new(FeatureMode::Enforce, "candidate_98", 1.0, 1.0);
         let session = DeferralSession::new(
             (0..MAX_SEARCH_CANDIDATES + 3)
@@ -1023,9 +1023,11 @@ pub(crate) mod tests {
             .unwrap()
             .as_object()
             .unwrap();
-        assert_eq!(options.len(), MAX_SEARCH_CANDIDATES + 1);
-        assert!(options.contains_key(SEARCH_NONE));
-        assert!(!options.contains_key("candidate_99"));
+        let expected: Vec<String> = (0..MAX_SEARCH_CANDIDATES)
+            .map(|index| format!("candidate_{index}"))
+            .chain([SEARCH_NONE.into()])
+            .collect();
+        assert_eq!(options.keys().cloned().collect::<Vec<_>>(), expected);
     }
 
     #[test_case(FIRST_CANDIDATE, true; "redacted_name")]

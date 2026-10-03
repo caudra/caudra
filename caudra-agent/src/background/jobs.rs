@@ -1366,6 +1366,7 @@ mod tests {
                         profile: None,
                         mode: None,
                         model_job: None,
+                        routing_prompt: None,
                         local_definitions: Vec::new(),
                         local_tools: LocalTools::default(),
                     },
