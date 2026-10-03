@@ -194,3 +194,17 @@ workcell-mcp-code = { workspace = true, features = ["mcp"] }
 
 [lints]
 workspace = true
+
+# Shipped builds trade compile time for a smaller binary. `release-fast` keeps the optimization
+# level but skips LTO and compiles in parallel and incrementally, for local iteration only. `off`
+# rather than `false`, which still runs ThinLTO across a crate's codegen units.
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
+
+[profile.release-fast]
+inherits = "release"
+lto = "off"
+codegen-units = 16
+incremental = true

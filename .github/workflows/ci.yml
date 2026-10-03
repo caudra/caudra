@@ -19,13 +19,14 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       # The code tool group runs snippets in a separate `monty` worker process, installed from the
-      # pinned release rather than built here. Cached on the pin so it is rebuilt only when it moves.
+      # pinned release rather than built here. Cached on the pin, the build helper, and the toolchain
+      # so it is rebuilt only when one moves; the helper still checks a restored worker's stamp.
       - id: worker
         run: echo "version=$(awk '/^name = "monty-pool"$/ { getline; gsub(/[",]/, "", $3); print $3 }' Cargo.lock)" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@v6
         with:
           path: target/code-worker
-          key: monty-worker-${{ runner.os }}-${{ steps.worker.outputs.version }}
+          key: monty-worker-${{ runner.os }}-${{ steps.worker.outputs.version }}-${{ hashFiles('scripts/build-code-worker.py', 'rust-toolchain.toml') }}
       - run: make ci
 
   macos-files:

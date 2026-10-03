@@ -3,6 +3,7 @@ SHELL := /bin/bash
 
 CARGO ?= cargo
 DOCKER ?= docker
+PYTHON ?= python3
 IMAGE ?= workcell-mcp
 TAG ?= local
 ROOT ?=
@@ -15,7 +16,7 @@ CODE_WORKER_BUILD ?= target/code-worker-build
 CODE_WORKER ?= $(CODE_WORKER_ROOT)/bin/monty
 BUNDLED_CODE_WORKER_ENV := WORKCELL_BUNDLED_MONTY_WORKER
 
-.PHONY: help code-worker fmt fmt-check check check-native clippy test test-optional-features build release ci install run run-web clean docker-build docker-smoke docker-run
+.PHONY: help code-worker fmt fmt-check check check-native clippy test test-optional-features build release release-fast ci install run run-web clean docker-build docker-smoke docker-run
 
 # Cargo wants one comma-separated `--features` value; Make can only build that from a word list.
 comma := ,
@@ -39,6 +40,7 @@ help:
 		'  make test          Run all workspace tests with the lockfile' \
 		'  make build         Build the debug workspace with the lockfile' \
 		'  make release       Build the optimized binary with the lockfile' \
+		'  make release-fast  Build an optimized binary without LTO for local iteration' \
 		'  make ci            Run the complete local CI verification' \
 		'  make install       Install workcell-mcp from this checkout' \
 		'  make run ROOT=...  Run all tool groups over stdio' \
@@ -57,6 +59,13 @@ help:
 #
 # `--no-default-features` drops Monty's standalone CLI, leaving a binary that only serves
 # `monty subprocess` and cannot run a REPL, a file, or `-c`.
+#
+# `scripts/build-code-worker.py` fixes the worker's profile and install command instead of taking
+# Cargo's defaults, so every checkout builds the same worker and a shared CODE_WORKER_BUILD reuses
+# compiled artifacts. It publishes a stripped `bin/monty`, keeps the unstripped build at
+# `symbols/bin/monty` for diagnostics, and rebuilds when the helper, toolchain, target, or RUSTFLAGS
+# no longer match its stamp. Any other CODE_WORKER belongs to the caller: it is version-checked,
+# never built or stripped.
 code-worker:
 	@lock_version=$$(awk '/^name = "monty-pool"$$/ { getline; gsub(/[",]/, "", $$3); print $$3 }' Cargo.lock); \
 	if [[ "$$lock_version" != "$(MONTY_VERSION)" ]]; then \
@@ -64,21 +73,21 @@ code-worker:
 			'the worker protocol is version-coupled, so update both together'; \
 		exit 2; \
 	fi
-	@if [[ ! -x "$(CODE_WORKER)" ]] \
-		|| ! "$(CODE_WORKER)" --version 2>&1 | grep -qx 'monty-runtime $(MONTY_VERSION)'; then \
-		$(CARGO) install monty-runtime --version "=$(MONTY_VERSION)" --locked --no-default-features \
-			--force --root "$(CODE_WORKER_ROOT)" --target-dir "$(CODE_WORKER_BUILD)"; \
-	else \
-		printf '%s\n' 'reusing pinned worker at $(CODE_WORKER)'; \
+	@if [[ "$(CODE_WORKER)" == "$(CODE_WORKER_ROOT)/bin/monty" ]]; then \
+		$(PYTHON) scripts/build-code-worker.py --version "$(MONTY_VERSION)" \
+			--root "$(CODE_WORKER_ROOT)" --target-dir "$(CODE_WORKER_BUILD)"; \
+	elif ! "$(CODE_WORKER)" --version 2>&1 | grep -qxF 'monty-runtime $(MONTY_VERSION)'; then \
+		printf '%s\n' 'CODE_WORKER=$(CODE_WORKER) must be an executable reporting monty-runtime $(MONTY_VERSION)'; \
+		exit 2; \
 	fi
 	@# The server finds the worker beside its own executable, which is the same rule the container
 	@# relies on. Placing a copy in each Cargo profile directory makes `cargo run` and a direct
 	@# `./target/<profile>/workcell-mcp` work with no configuration, exactly like the image.
-	@for profile in debug release; do \
+	@for profile in debug release release-fast; do \
 		mkdir -p "target/$$profile"; \
 		install -m 0755 "$(CODE_WORKER)" "target/$$profile/monty"; \
 	done
-	@printf '%s\n' 'installed $(CODE_WORKER) and copied it beside the debug and release binaries'
+	@printf '%s\n' 'copied $(CODE_WORKER) beside the debug, release, and release-fast binaries'
 
 fmt:
 	$(CARGO) fmt --all
@@ -147,6 +156,7 @@ clippy:
 # Build-time bundling is separate from the runtime override, so tests exercise both embedded and
 # explicit-path worker sources without leaking operator configuration into CLI tests.
 test: code-worker test-optional-features
+	$(PYTHON) scripts/test-build-code-worker.py
 	$(BUNDLED_CODE_WORKER_ENV)="$(abspath $(CODE_WORKER))" $(CARGO) test --workspace --locked
 
 # Optional features are dark to `--workspace` until something in the workspace turns them on, and a
@@ -165,6 +175,10 @@ build:
 release: code-worker
 	$(BUNDLED_CODE_WORKER_ENV)="$(abspath $(CODE_WORKER))" \
 		$(CARGO) build --release --locked --package workcell-mcp
+
+release-fast: code-worker
+	$(BUNDLED_CODE_WORKER_ENV)="$(abspath $(CODE_WORKER))" \
+		$(CARGO) build --profile release-fast --locked --package workcell-mcp
 
 ci: code-worker fmt-check check check-native clippy test release
 

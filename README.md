@@ -95,6 +95,7 @@ rather than exposing a tool that cannot run.
 ## Requirements
 
 - Rust 1.99 for source builds
+- Python 3.11 or later for the worker build helper that `make code-worker` and `make test` run
 - The `python_execution` tool group needs the pinned `monty` worker binary: `make code-worker`
 - Linux is the primary production target
 - Bash is required for the shell tool in the production container
@@ -299,6 +300,14 @@ Build the image:
 
 ```bash
 docker build -t workcell-mcp:local .
+```
+
+The image ships stripped executables. The `diagnostics` stage exports the unstripped server and
+worker from the builder and worker stages the image copies, so with the image's build cache warm
+their symbols match the shipped binaries:
+
+```bash
+docker build --target diagnostics --output target/diagnostics .
 ```
 
 Generate a bearer token and run a hardened container:
@@ -1102,8 +1111,8 @@ Run `make check-native` to verify every facade feature builds with no MCP adapte
 cache root, or discovery. Discovery checks beside the host executable, then the configured bundle,
 then `PATH`. Explicit paths are authoritative and never fall back. Set
 `WORKCELL_BUNDLED_MONTY_WORKER` while compiling `code-bundled` to embed a target-matching worker;
-`make release` and `make install` do this automatically. The standalone cache defaults to the platform
-cache directory and can be overridden with `--code-worker-cache` or
+`make release`, `make release-fast`, and `make install` do this automatically. The standalone
+cache defaults to the platform cache directory and can be overridden with `--code-worker-cache` or
 `WORKCELL_MCP_CODE_WORKER_CACHE`. Configure one explicitly when the platform cache directory cannot be
 determined, and keep it owned by the Workcell process identity rather than sharing it across users.
 
@@ -1117,6 +1126,16 @@ Plain `make` runs the complete local CI pipeline. Run `make help` for focused fo
 testing, installation, local execution, and container targets. `make docker-run
 ROOT=/absolute/workspace` starts the hardened HTTP topology documented above and requires
 `WORKCELL_MCP_HTTP_TOKEN` in the invoking environment.
+
+Release builds trade compile time for size: thin LTO over one codegen unit, with symbols stripped.
+Set `CARGO_PROFILE_RELEASE_STRIP=none` to keep them. `make release-fast` builds
+`target/release-fast/workcell-mcp` at the same optimization level without LTO and with parallel,
+incremental codegen. It is for local iteration rather than distribution: the binary is larger and
+less optimized across crates, and the incremental cache under `target/release-fast` costs extra disk
+space. `make code-worker` publishes a
+stripped `target/code-worker/bin/monty`, keeps the unstripped build at
+`target/code-worker/symbols/bin/monty`, and rebuilds both when the helper, toolchain, target, or
+`RUSTFLAGS` change.
 
 The conformance fixtures under `fixtures/mcp-conformance` are committed compatibility contracts for
 tool schemas and bounded behavior. Update fixtures deliberately when a public tool contract changes.
