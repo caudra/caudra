@@ -262,9 +262,8 @@ async fn run_btw(
         async move {
             while let Ok(event) = event_rx.recv_async().await {
                 let forwarded = match event {
-                    ProviderEvent::TextDelta { text } | ProviderEvent::ThinkingDelta { text } => {
-                        StreamEvent::TextDelta(text)
-                    }
+                    ProviderEvent::TextDelta { text } => StreamEvent::TextDelta(text),
+                    ProviderEvent::ThinkingDelta { text } => StreamEvent::ThinkingDelta(text),
                     ProviderEvent::PromptProgress {
                         processed,
                         total,
@@ -332,8 +331,8 @@ mod tests {
     use arc_swap::ArcSwap;
     use caudra_agent::UNAVAILABLE_RESULT;
     use caudra_providers::provider::{BoxFuture, Provider};
-    use caudra_providers::{Model, RequestOptions, StreamResponse};
-    use serde_json::json;
+    use caudra_providers::{Model, ModelInfo, RequestOptions, StreamResponse};
+    use serde_json::{Value, json};
     use test_case::test_case;
 
     use super::*;
@@ -352,6 +351,9 @@ mod tests {
     const ORPHANED_CALL: &str = "orphaned";
     const UNANSWERED_CALL: &str = "unanswered";
     const OPEN_CALLS: [&str; 2] = ["open-first", "open-second"];
+    const THINKING_DELTAS: [&str; 2] = ["considering ", "deployment"];
+    const TEXT_DELTAS: [&str; 2] = ["it ships ", "in the binary"];
+    const EXPECTED_DONE: &str = "expected stream completion after all deltas";
 
     /// Hands over the route and messages of every request it answers.
     struct RecordingProvider(flume::Sender<(String, Vec<Message>)>);
@@ -415,6 +417,66 @@ mod tests {
         fn list_models(
             &self,
         ) -> BoxFuture<'_, Result<Vec<caudra_providers::ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
+    }
+
+    struct ReasoningProvider {
+        interleaved: bool,
+    }
+
+    impl Provider for ReasoningProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            event_tx: &'a Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a CacheKey>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                let mut events = [
+                    ProviderEvent::ThinkingDelta {
+                        text: THINKING_DELTAS[0].into(),
+                    },
+                    ProviderEvent::ThinkingDelta {
+                        text: THINKING_DELTAS[1].into(),
+                    },
+                    ProviderEvent::TextDelta {
+                        text: TEXT_DELTAS[0].into(),
+                    },
+                    ProviderEvent::TextDelta {
+                        text: TEXT_DELTAS[1].into(),
+                    },
+                ];
+                if self.interleaved {
+                    events.swap(1, 2);
+                }
+                for event in events {
+                    event_tx.send(event)?;
+                }
+                let mut message = assistant_text(ANSWER);
+                message.content.insert(
+                    0,
+                    ContentBlock::Thinking {
+                        thinking: THINKING_DELTAS.concat(),
+                        signature: None,
+                        duration_ms: None,
+                        interrupted: false,
+                        responses: None,
+                    },
+                );
+                Ok(StreamResponse {
+                    message,
+                    stop_reason: Some(StopReason::EndTurn),
+                    ..Default::default()
+                })
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
             Box::pin(async { unimplemented!() })
         }
     }
@@ -571,6 +633,71 @@ mod tests {
                         && progress.total == PREFILL_TOTAL
                         && progress.cache == PREFILL_CACHE
             ));
+        });
+    }
+
+    #[test_case(false; "split_reasoning_before_text")]
+    #[test_case(true; "interleaved_reasoning_and_text")]
+    fn reasoning_streams_separately_and_stays_out_of_follow_up_history(interleaved: bool) {
+        smol::block_on(async {
+            let prompt = Arc::new(prompt_with(
+                Arc::new(ReasoningProvider { interleaved }),
+                FIRST_MODEL,
+            ));
+            let mut thread = BtwThread::new(prompt, vec![Message::user(BASE.into())]);
+            thread.ask(Q.into());
+            let (event_tx, event_rx) = flume::unbounded();
+            run_btw(
+                Arc::clone(&thread.prompt),
+                thread.request_messages(),
+                event_tx,
+                None,
+                CancelToken::none(),
+            )
+            .await;
+
+            let expected = if interleaved {
+                [
+                    (true, THINKING_DELTAS[0]),
+                    (false, TEXT_DELTAS[0]),
+                    (true, THINKING_DELTAS[1]),
+                    (false, TEXT_DELTAS[1]),
+                ]
+            } else {
+                [
+                    (true, THINKING_DELTAS[0]),
+                    (true, THINKING_DELTAS[1]),
+                    (false, TEXT_DELTAS[0]),
+                    (false, TEXT_DELTAS[1]),
+                ]
+            };
+            for (thinking, text) in expected {
+                assert!(matches!(
+                    (event_rx.try_recv().unwrap(), thinking),
+                    (StreamEvent::ThinkingDelta(delta), true)
+                        | (StreamEvent::TextDelta(delta), false) if delta == text
+                ));
+            }
+            let StreamEvent::Done(done) = event_rx.try_recv().unwrap() else {
+                panic!("{EXPECTED_DONE}");
+            };
+            assert_eq!(done.answer.as_deref(), Some(ANSWER));
+            assert!(event_rx.try_recv().is_err());
+
+            thread.settle(done.answer);
+            assert!(thread.pending().is_none());
+            assert_eq!(thread.exchanges, vec![(Q.to_owned(), ANSWER.to_owned())]);
+            thread.ask(FOLLOW_UP.into());
+            let expected = vec![
+                Message::user(BASE.into()),
+                btw_question(Q),
+                assistant_text(ANSWER),
+                Message::user(FOLLOW_UP.into()),
+            ];
+            assert_eq!(
+                serde_json::to_value(thread.request_messages()).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
         });
     }
 

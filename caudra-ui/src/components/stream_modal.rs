@@ -44,7 +44,6 @@ const QUEUED_PREFIX: &str = "queued: ";
 /// A stopped answer says so in its own body, where the truncation is, rather
 /// than only in the header.
 const STOPPED_NOTE: &str = "\n\n_Stopped._";
-const ERROR_PREFIX: &str = "";
 const TOKENS_IN: &str = " in";
 const TOKENS_CACHED: &str = " cached";
 const TOKENS_OUT: &str = " out";
@@ -115,6 +114,7 @@ pub enum StreamEvent {
     /// guarantee that a bar appears.
     Progress(PromptProgress),
     TextDelta(String),
+    ThinkingDelta(String),
     Done(StreamDone),
     Error(String),
 }
@@ -169,10 +169,22 @@ enum ExchangeOutcome {
     Stopped,
 }
 
+#[derive(PartialEq, Eq)]
+enum SectionKind {
+    Text,
+    Thinking,
+    Error,
+}
+
+struct StreamSection {
+    kind: SectionKind,
+    body: StreamingContent,
+}
+
 /// One question and the answer streaming under it.
 struct Exchange {
     header: String,
-    body: StreamingContent,
+    sections: Vec<StreamSection>,
     started_at: Instant,
     /// How long the answer took, once it is in. `None` while it is still
     /// coming, which is also what says the live clock belongs to this one.
@@ -182,21 +194,38 @@ struct Exchange {
 }
 
 impl Exchange {
-    fn new(header: String, ms_per_char: u64) -> Self {
-        let theme = theme::current();
+    fn new(header: String) -> Self {
         Self {
             header,
-            body: StreamingContent::new_noninteractive(
-                "",
-                theme.assistant,
-                theme.assistant,
-                ms_per_char,
-            ),
+            sections: Vec::new(),
             started_at: Instant::now(),
             settled: None,
             usage: None,
             outcome: ExchangeOutcome::Live,
         }
+    }
+
+    fn push(&mut self, kind: SectionKind, text: &str, ms_per_char: u64) {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(section) = self.sections.last_mut().filter(|s| s.kind == kind) {
+            section.body.push(text);
+            return;
+        }
+        let theme = theme::current();
+        let style = match kind {
+            SectionKind::Text => theme.assistant,
+            SectionKind::Thinking => theme.thinking,
+            SectionKind::Error => theme.error,
+        };
+        let mut body = StreamingContent::new_noninteractive("", style, style, ms_per_char);
+        body.push(text);
+        self.sections.push(StreamSection { kind, body });
+    }
+
+    fn text(&self) -> String {
+        self.sections.iter().map(|s| s.body.buffer()).collect()
     }
 
     fn settle(&mut self, outcome: ExchangeOutcome) {
@@ -309,7 +338,7 @@ impl StreamModal {
         rx: flume::Receiver<StreamEvent>,
         cancel: CancelTrigger,
     ) {
-        self.exchanges.push(Exchange::new(header, self.ms_per_char));
+        self.exchanges.push(Exchange::new(header));
         self.rx = Some(rx);
         self.cancel = Some(cancel);
         self.progress = None;
@@ -352,7 +381,10 @@ impl StreamModal {
             Cadence::any([
                 Cadence::when(self.is_streaming(), Cadence::SPINNER),
                 Cadence::when(
-                    self.exchanges.iter().any(|e| e.body.is_animating()),
+                    self.exchanges
+                        .iter()
+                        .flat_map(|e| &e.sections)
+                        .any(|s| s.body.is_animating()),
                     Cadence::SMOOTH,
                 ),
             ]),
@@ -369,8 +401,10 @@ impl StreamModal {
 
     /// Everything the live answer streamed so far, whether or not the reveal
     /// has drawn it.
-    pub fn text(&self) -> &str {
-        self.exchanges.last().map_or("", |e| e.body.buffer())
+    pub fn text(&self) -> String {
+        self.exchanges
+            .last()
+            .map_or_else(String::new, Exchange::text)
     }
 
     pub fn poll(&mut self) -> Dirty {
@@ -394,7 +428,11 @@ impl StreamModal {
                     // Text means the prefill is over, whatever the last count
                     // said; a bar left part-full outlives what it measured.
                     self.progress = None;
-                    live.body.push(&text);
+                    live.push(SectionKind::Text, &text, self.ms_per_char);
+                }
+                StreamEvent::ThinkingDelta(text) => {
+                    self.progress = None;
+                    live.push(SectionKind::Thinking, &text, self.ms_per_char);
                 }
                 StreamEvent::Done(done) => {
                     live.usage = Some(done.usage.usage);
@@ -404,10 +442,8 @@ impl StreamModal {
                     break;
                 }
                 StreamEvent::Error(msg) => {
-                    let theme = theme::current();
-                    live.body.clear();
-                    live.body.set_style(ERROR_PREFIX, theme.error, theme.error);
-                    live.body.push(&msg);
+                    live.sections.clear();
+                    live.push(SectionKind::Error, &msg, self.ms_per_char);
                     live.settle(ExchangeOutcome::Failed);
                     finished = true;
                     break;
@@ -435,7 +471,7 @@ impl StreamModal {
     /// it was cut. Dropping the trigger cancels the request.
     fn stop(&mut self) {
         if let Some(live) = self.exchanges.last_mut() {
-            live.body.push(STOPPED_NOTE);
+            live.push(SectionKind::Text, STOPPED_NOTE, self.ms_per_char);
             live.settle(ExchangeOutcome::Stopped);
         }
         self.finish_stream();
@@ -459,7 +495,7 @@ impl StreamModal {
             return StreamAction::Ignored;
         };
         match self.controls()[index].command {
-            StreamCommand::Copy => StreamAction::Copy(self.text().to_owned()),
+            StreamCommand::Copy => StreamAction::Copy(self.text()),
             StreamCommand::Send => self
                 .take_question()
                 .map_or(StreamAction::Consumed, StreamAction::Submit),
@@ -473,7 +509,7 @@ impl StreamModal {
     pub fn handle_key(&mut self, key_event: KeyEvent) -> StreamAction {
         let chord = key_event.modifiers.contains(KeyModifiers::CONTROL);
         if chord && key_event.code == KeyCode::Char('y') {
-            return StreamAction::Copy(self.text().to_owned());
+            return StreamAction::Copy(self.text());
         }
         if self.footer == StreamFooter::FollowUp {
             return self.handle_follow_up_key(key_event);
@@ -487,7 +523,7 @@ impl StreamModal {
         match key_event.code {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char(' ') => self.close(),
             KeyCode::Char('y') if self.footer == StreamFooter::Copy => {
-                return StreamAction::Copy(self.text().to_owned());
+                return StreamAction::Copy(self.text());
             }
             _ => {
                 self.scroll.handle_key(key_event);
@@ -613,7 +649,20 @@ impl StreamModal {
                 Span::styled(exchange.suffix(), theme.tool_dim),
             ]));
             lines.push(Line::default());
-            lines.extend_from_slice(exchange.body.render_lines(padded_width));
+            for (section_index, section) in exchange.sections.iter_mut().enumerate() {
+                if section_index > 0 {
+                    lines.push(Line::default());
+                }
+                for line in section.body.render_lines(padded_width) {
+                    let mut line = line.clone();
+                    if section.kind == SectionKind::Thinking {
+                        for span in &mut line.spans {
+                            span.style = span.style.patch(theme.thinking);
+                        }
+                    }
+                    lines.push(line);
+                }
+            }
         }
 
         let chrome = self.chrome_rows();
@@ -741,7 +790,7 @@ impl StreamModal {
 
     #[cfg(test)]
     pub fn body_eq(&self, expected: &str) -> bool {
-        self.exchanges.last().is_some_and(|e| e.body == expected)
+        self.exchanges.last().is_some_and(|e| e.text() == expected)
     }
 
     #[cfg(test)]
@@ -784,7 +833,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEventKind};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use ratatui::style::Modifier;
+    use ratatui::style::{Modifier, Style};
     use test_case::test_case;
 
     const COPY: usize = 0;
@@ -803,6 +852,12 @@ mod tests {
     const HEADER: &str = "Q: why?";
     const FOLLOW_UP: &str = "Q: and then?";
     const ANSWER: &str = "because";
+    const THINKING: &str = "weighing options";
+    const RECONSIDERING: &str = "checking assumptions";
+    const ERROR: &str = "the request failed";
+    const CONTENT_MISSING: &str = "the streamed section must be visible";
+    const STYLE_MISMATCH: &str = "the section must retain its own style";
+    const REVEAL_MS_PER_CHAR: u64 = 20;
 
     fn open_modal(
         m: &mut StreamModal,
@@ -852,6 +907,34 @@ mod tests {
                 m.view(frame, frame.area());
             })
             .unwrap();
+    }
+
+    fn delta(thinking: bool, text: &str) -> StreamEvent {
+        if thinking {
+            StreamEvent::ThinkingDelta(text.into())
+        } else {
+            StreamEvent::TextDelta(text.into())
+        }
+    }
+
+    fn assert_text_style(terminal: &Terminal<TestBackend>, text: &str, style: Style) -> Position {
+        let buffer = terminal.backend().buffer();
+        let position = buffer
+            .area
+            .positions()
+            .find(|position| {
+                text.chars().enumerate().all(|(offset, ch)| {
+                    let x = position.x + offset as u16;
+                    x < buffer.area.right() && buffer[(x, position.y)].symbol() == ch.to_string()
+                })
+            })
+            .expect(CONTENT_MISSING);
+        for offset in 0..text.chars().count() as u16 {
+            let cell = &buffer[(position.x + offset, position.y)];
+            assert_eq!(Some(cell.fg), style.fg, "{STYLE_MISMATCH}");
+            assert_eq!(cell.modifier, style.add_modifier, "{STYLE_MISMATCH}");
+        }
+        position
     }
 
     fn mouse(kind: MouseEventKind, at: Rect) -> MouseEvent {
@@ -919,6 +1002,228 @@ mod tests {
         let _ = m.poll();
         assert!(m.body_eq("hello world"));
         assert_eq!(m.text(), "hello world");
+    }
+
+    #[test_case(false, false ; "answer_live")]
+    #[test_case(false, true ; "answer_settled")]
+    #[test_case(true, false ; "thinking_live")]
+    #[test_case(true, true ; "thinking_settled")]
+    fn generated_sections_use_their_role_style(thinking: bool, settled: bool) {
+        let mut m = StreamModal::new(0);
+        let (tx, _cancel) = open_modal(&mut m, HEADER, StreamFooter::Close);
+        tx.send(delta(thinking, ANSWER)).unwrap();
+        if settled {
+            tx.send(done()).unwrap();
+        }
+        let _ = m.poll();
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
+        draw(&mut m, &mut terminal);
+        let theme = theme::current();
+        assert_text_style(
+            &terminal,
+            ANSWER,
+            if thinking {
+                theme.thinking
+            } else {
+                theme.assistant
+            },
+        );
+    }
+
+    #[test_case(false ; "live")]
+    #[test_case(true ; "settled")]
+    fn interleaved_sections_keep_their_order_and_style(settled: bool) {
+        let mut m = StreamModal::new(0);
+        let (tx, _cancel) = open_modal(&mut m, HEADER, StreamFooter::Close);
+        for event in [
+            StreamEvent::ThinkingDelta(THINKING.into()),
+            StreamEvent::TextDelta(ANSWER.into()),
+            StreamEvent::ThinkingDelta(RECONSIDERING.into()),
+        ] {
+            tx.send(event).unwrap();
+        }
+        if settled {
+            tx.send(done()).unwrap();
+        }
+        let _ = m.poll();
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
+        draw(&mut m, &mut terminal);
+        let theme = theme::current();
+        let thinking = assert_text_style(&terminal, THINKING, theme.thinking);
+        let answer = assert_text_style(&terminal, ANSWER, theme.assistant);
+        let reconsidering = assert_text_style(&terminal, RECONSIDERING, theme.thinking);
+        assert!(answer.y > thinking.y + 1);
+        assert!(reconsidering.y > answer.y + 1);
+        assert_eq!(m.text(), format!("{THINKING}{ANSWER}{RECONSIDERING}"));
+    }
+
+    #[test_case(false ; "answer")]
+    #[test_case(true ; "thinking")]
+    fn same_kind_chunks_share_markdown_without_empty_sections(thinking: bool) {
+        const OPEN: &str = "**because";
+        const CLOSE: &str = "**";
+        let mut m = StreamModal::new(0);
+        let (tx, _cancel) = open_modal(&mut m, HEADER, StreamFooter::Close);
+        tx.send(delta(!thinking, "")).unwrap();
+        tx.send(delta(thinking, OPEN)).unwrap();
+        tx.send(delta(!thinking, "")).unwrap();
+        tx.send(delta(thinking, CLOSE)).unwrap();
+        let _ = m.poll();
+        assert_eq!(m.exchanges[0].sections.len(), 1);
+        assert_eq!(m.text(), format!("{OPEN}{CLOSE}"));
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
+        draw(&mut m, &mut terminal);
+        let theme = theme::current();
+        let style = if thinking {
+            theme.bold.patch(theme.thinking)
+        } else {
+            theme.assistant.patch(theme.bold)
+        };
+        assert_text_style(&terminal, ANSWER, style);
+    }
+
+    #[test_case("# because", true ; "heading")]
+    #[test_case("**because**", true ; "bold")]
+    #[test_case("_because_", false ; "italic")]
+    #[test_case("```rust\nbecause\n```", false ; "highlighted_code")]
+    fn thinking_markdown_keeps_the_thinking_style(source: &str, bold: bool) {
+        let mut m = StreamModal::new(0);
+        let (tx, _cancel) = open_modal(&mut m, HEADER, StreamFooter::Close);
+        tx.send(StreamEvent::ThinkingDelta(source.into())).unwrap();
+        tx.send(StreamEvent::TextDelta(RECONSIDERING.into()))
+            .unwrap();
+        let _ = m.poll();
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
+        let theme = theme::current();
+        let style = if bold {
+            theme.thinking.add_modifier(Modifier::BOLD)
+        } else {
+            theme.thinking
+        };
+        for settled in [false, true] {
+            if settled {
+                tx.send(done()).unwrap();
+                let _ = m.poll();
+            }
+            draw(&mut m, &mut terminal);
+            assert_text_style(&terminal, ANSWER, style);
+            assert_text_style(&terminal, RECONSIDERING, theme.assistant);
+        }
+    }
+
+    #[test_case("```\nweighing options" ; "open_code_fence")]
+    #[test_case("**weighing options" ; "open_emphasis")]
+    fn reasoning_markdown_cannot_consume_the_answer(thinking: &str) {
+        let mut m = StreamModal::new(0);
+        let (tx, _cancel) = open_modal(&mut m, HEADER, StreamFooter::Close);
+        tx.send(StreamEvent::ThinkingDelta(thinking.into()))
+            .unwrap();
+        tx.send(StreamEvent::TextDelta(ANSWER.into())).unwrap();
+        let _ = m.poll();
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
+        draw(&mut m, &mut terminal);
+        assert_text_style(&terminal, ANSWER, theme::current().assistant);
+    }
+
+    #[test_case(false ; "live")]
+    #[test_case(true ; "settled")]
+    fn copying_includes_unrevealed_sections_in_arrival_order(settled: bool) {
+        let mut m = StreamModal::new(REVEAL_MS_PER_CHAR);
+        let (tx, _cancel) = open_modal(&mut m, HEADER, StreamFooter::FollowUp);
+        tx.send(StreamEvent::ThinkingDelta(THINKING.into()))
+            .unwrap();
+        tx.send(StreamEvent::TextDelta(ANSWER.into())).unwrap();
+        tx.send(StreamEvent::ThinkingDelta(RECONSIDERING.into()))
+            .unwrap();
+        if settled {
+            tx.send(done()).unwrap();
+        }
+        let _ = m.poll();
+        assert!(
+            m.exchanges[0]
+                .sections
+                .iter()
+                .all(|s| s.body.visible().is_empty())
+        );
+        let expected = format!("{THINKING}{ANSWER}{RECONSIDERING}");
+        assert!(matches!(
+            m.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)),
+            StreamAction::Copy(text) if text == expected
+        ));
+    }
+
+    #[test_case(false ; "reasoning_only")]
+    #[test_case(true ; "earlier_reasoning_section")]
+    fn reasoning_reveal_keeps_repainting_after_done(with_answer: bool) {
+        let _clock = FrozenClock::at(Duration::ZERO);
+        let mut m = StreamModal::new(REVEAL_MS_PER_CHAR);
+        let (tx, _cancel) = open_modal(&mut m, HEADER, StreamFooter::Close);
+        tx.send(StreamEvent::ThinkingDelta(THINKING.into()))
+            .unwrap();
+        let _ = m.poll();
+        assert_eq!(m.cadence(), Cadence::SMOOTH);
+        if with_answer {
+            m.ms_per_char = 0;
+            tx.send(StreamEvent::TextDelta(ANSWER.into())).unwrap();
+        }
+        tx.send(done()).unwrap();
+        let _ = m.poll();
+        assert_eq!(m.cadence(), Cadence::SMOOTH);
+        m.exchanges[0].sections[0].body.set_buffer(THINKING);
+        assert_eq!(m.cadence(), Cadence::IDLE);
+    }
+
+    #[test_case(false ; "error")]
+    #[test_case(true ; "stop")]
+    fn follow_up_failure_preserves_earlier_sections_and_styles(stopped: bool) {
+        let mut m = StreamModal::new(0);
+        let (tx, _cancel) = open_modal(&mut m, HEADER, StreamFooter::FollowUp);
+        tx.send(StreamEvent::ThinkingDelta(THINKING.into()))
+            .unwrap();
+        tx.send(StreamEvent::TextDelta(ANSWER.into())).unwrap();
+        tx.send(done()).unwrap();
+        let _ = m.poll();
+        let (tx, cancel) = follow_up(&mut m, FOLLOW_UP);
+        assert!(m.exchanges[1].sections.is_empty());
+        tx.send(StreamEvent::TextDelta(RECONSIDERING.into()))
+            .unwrap();
+        tx.send(StreamEvent::ThinkingDelta(RECONSIDERING.into()))
+            .unwrap();
+        let _ = m.poll();
+        if stopped {
+            m.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        } else {
+            tx.send(StreamEvent::Error(ERROR.into())).unwrap();
+            let _ = m.poll();
+            assert_eq!(m.text(), ERROR);
+            assert_eq!(m.exchanges[1].sections.len(), 1);
+        }
+        assert!(cancel.is_cancelled());
+        assert!(!m.is_streaming());
+        assert_eq!(m.exchanges[0].text(), format!("{THINKING}{ANSWER}"));
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT * 2)).unwrap();
+        draw(&mut m, &mut terminal);
+        let theme = theme::current();
+        assert_text_style(&terminal, THINKING, theme.thinking);
+        assert_text_style(&terminal, ANSWER, theme.assistant);
+        if stopped {
+            assert_eq!(
+                m.text(),
+                format!("{RECONSIDERING}{RECONSIDERING}{STOPPED_NOTE}")
+            );
+            assert!(matches!(
+                m.exchanges[1].sections.last().unwrap().kind,
+                SectionKind::Text
+            ));
+            assert_text_style(
+                &terminal,
+                STOPPED_NOTE.trim().trim_matches('_'),
+                theme.assistant.patch(theme.italic),
+            );
+        } else {
+            assert!(!terminal.backend().to_string().contains(RECONSIDERING));
+            assert_text_style(&terminal, ERROR, theme.error);
+        }
     }
 
     #[test]
@@ -1202,7 +1507,7 @@ mod tests {
 
         assert!(m.body_eq("oops"));
         assert!(
-            m.exchanges[0].body == ANSWER,
+            m.exchanges[0].text() == ANSWER,
             "an error in the follow-up leaves the first answer alone"
         );
     }
@@ -1334,8 +1639,9 @@ mod tests {
 
     /// Only some providers report prefill, so the bar is drawn from what
     /// arrives and retired the moment the answer starts instead.
-    #[test]
-    fn prefill_progress_fills_the_bar_until_the_first_token() {
+    #[test_case(false ; "answer")]
+    #[test_case(true ; "thinking")]
+    fn prefill_progress_fills_the_bar_until_the_first_token(thinking: bool) {
         let mut m = StreamModal::new(0);
         let (tx, _cancel) = open_modal(&mut m, HEADER, StreamFooter::Close);
         tx.send(StreamEvent::Progress(PromptProgress {
@@ -1353,7 +1659,7 @@ mod tests {
             "{STATUS_MISSING}: {prefilling}"
         );
 
-        tx.send(StreamEvent::TextDelta(ANSWER.into())).unwrap();
+        tx.send(delta(thinking, ANSWER)).unwrap();
         let _ = m.poll();
         draw(&mut m, &mut terminal);
         let answering = terminal.backend().to_string();
@@ -1398,7 +1704,7 @@ mod tests {
         assert!(!m.is_streaming());
         assert_eq!(m.headers(), [HEADER, FOLLOW_UP], "the thread survives");
         assert!(
-            m.exchanges[0].body == ANSWER,
+            m.exchanges[0].text() == ANSWER,
             "the answered exchange keeps its answer"
         );
         assert!(m.text().contains(STOPPED_NOTE.trim()));
