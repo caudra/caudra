@@ -225,7 +225,11 @@ impl Exchange {
     }
 
     fn text(&self) -> String {
-        self.sections.iter().map(|s| s.body.buffer()).collect()
+        self.sections
+            .iter()
+            .filter(|s| s.kind != SectionKind::Thinking)
+            .map(|s| s.body.buffer())
+            .collect()
     }
 
     fn settle(&mut self, outcome: ExchangeOutcome) {
@@ -1054,7 +1058,7 @@ mod tests {
         let reconsidering = assert_text_style(&terminal, RECONSIDERING, theme.thinking);
         assert!(answer.y > thinking.y + 1);
         assert!(reconsidering.y > answer.y + 1);
-        assert_eq!(m.text(), format!("{THINKING}{ANSWER}{RECONSIDERING}"));
+        assert_eq!(m.text(), ANSWER);
     }
 
     #[test_case(false ; "answer")]
@@ -1070,7 +1074,10 @@ mod tests {
         tx.send(delta(thinking, CLOSE)).unwrap();
         let _ = m.poll();
         assert_eq!(m.exchanges[0].sections.len(), 1);
-        assert_eq!(m.text(), format!("{OPEN}{CLOSE}"));
+        assert_eq!(
+            m.exchanges[0].sections[0].body.buffer(),
+            format!("{OPEN}{CLOSE}")
+        );
         let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
         draw(&mut m, &mut terminal);
         let theme = theme::current();
@@ -1125,16 +1132,27 @@ mod tests {
         assert_text_style(&terminal, ANSWER, theme::current().assistant);
     }
 
-    #[test_case(false ; "live")]
-    #[test_case(true ; "settled")]
-    fn copying_includes_unrevealed_sections_in_arrival_order(settled: bool) {
+    #[test_case(false, false ; "thinking_only_live")]
+    #[test_case(true, false ; "thinking_only_settled")]
+    #[test_case(false, true ; "answer_live")]
+    #[test_case(true, true ; "answer_settled")]
+    fn copying_excludes_reasoning_and_preserves_unrevealed_answer_text(
+        settled: bool,
+        with_answer: bool,
+    ) {
+        const ANSWER_PARTS: [&str; 2] = ["**be", "cause**"];
         let mut m = StreamModal::new(REVEAL_MS_PER_CHAR);
         let (tx, _cancel) = open_modal(&mut m, HEADER, StreamFooter::FollowUp);
         tx.send(StreamEvent::ThinkingDelta(THINKING.into()))
             .unwrap();
-        tx.send(StreamEvent::TextDelta(ANSWER.into())).unwrap();
-        tx.send(StreamEvent::ThinkingDelta(RECONSIDERING.into()))
-            .unwrap();
+        if with_answer {
+            tx.send(StreamEvent::TextDelta(ANSWER_PARTS[0].into()))
+                .unwrap();
+            tx.send(StreamEvent::ThinkingDelta(RECONSIDERING.into()))
+                .unwrap();
+            tx.send(StreamEvent::TextDelta(ANSWER_PARTS[1].into()))
+                .unwrap();
+        }
         if settled {
             tx.send(done()).unwrap();
         }
@@ -1145,11 +1163,42 @@ mod tests {
                 .iter()
                 .all(|s| s.body.visible().is_empty())
         );
-        let expected = format!("{THINKING}{ANSWER}{RECONSIDERING}");
+        let expected = if with_answer {
+            format!("**{ANSWER}**")
+        } else {
+            String::new()
+        };
         assert!(matches!(
             m.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)),
             StreamAction::Copy(text) if text == expected
         ));
+    }
+
+    #[test_case(StreamFooter::FollowUp, FOLLOW_UP_COPY ; "btw")]
+    #[test_case(StreamFooter::Copy, COPY ; "copy_footer")]
+    fn all_copy_controls_exclude_reasoning(footer: StreamFooter, copy_index: usize) {
+        let mut m = StreamModal::new(0);
+        let (tx, _cancel) = open_modal(&mut m, HEADER, footer);
+        tx.send(StreamEvent::ThinkingDelta(THINKING.into()))
+            .unwrap();
+        tx.send(StreamEvent::TextDelta(ANSWER.into())).unwrap();
+        tx.send(done()).unwrap();
+        let _ = m.poll();
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
+        draw(&mut m, &mut terminal);
+        let copy_hit = m.footer_hit(copy_index);
+        assert!(matches!(click(&mut m, copy_hit), StreamAction::Copy(text) if text == ANSWER));
+        assert!(matches!(
+            m.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)),
+            StreamAction::Copy(text) if text == ANSWER
+        ));
+        if footer == StreamFooter::Copy {
+            assert!(matches!(
+                m.handle_key(key_ev(KeyCode::Char('y'))),
+                StreamAction::Copy(text) if text == ANSWER
+            ));
+        }
+        assert_text_style(&terminal, THINKING, theme::current().thinking);
     }
 
     #[test_case(false ; "reasoning_only")]
@@ -1200,17 +1249,14 @@ mod tests {
         }
         assert!(cancel.is_cancelled());
         assert!(!m.is_streaming());
-        assert_eq!(m.exchanges[0].text(), format!("{THINKING}{ANSWER}"));
+        assert_eq!(m.exchanges[0].text(), ANSWER);
         let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT * 2)).unwrap();
         draw(&mut m, &mut terminal);
         let theme = theme::current();
         assert_text_style(&terminal, THINKING, theme.thinking);
         assert_text_style(&terminal, ANSWER, theme.assistant);
         if stopped {
-            assert_eq!(
-                m.text(),
-                format!("{RECONSIDERING}{RECONSIDERING}{STOPPED_NOTE}")
-            );
+            assert_eq!(m.text(), format!("{RECONSIDERING}{STOPPED_NOTE}"));
             assert!(matches!(
                 m.exchanges[1].sections.last().unwrap().kind,
                 SectionKind::Text
