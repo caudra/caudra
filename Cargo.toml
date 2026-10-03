@@ -119,7 +119,7 @@ caudra-workbench = { path = "caudra-workbench" }
 caudra-workcell = { path = "caudra-workcell" }
 caudra-workspace = { path = "caudra-workspace" }
 caudra-workflow = { path = "caudra-workflow" }
-workcell = { git = "https://github.com/tensorninja/workcell-mcp", rev = "5a5a5a7531b3ea10503572841994bf122946d003", default-features = false, features = ["files-index", "web", "shell", "code-bundled", "code-graph-git", "environment", "host-contract", "snapshots"] }
+workcell = { git = "https://github.com/tensorninja/workcell-mcp", rev = "0a215f7575b72b71e0dff2635e3a42e8ac2a1457", default-features = false, features = ["files-index", "web", "shell", "code-bundled", "code-graph-git", "environment", "host-contract", "snapshots"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 rusqlite = { version = "0.40", default-features = false, features = ["backup", "bundled", "cache", "limits"] }
