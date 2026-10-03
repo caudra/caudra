@@ -1616,6 +1616,7 @@ mod tests {
                     raw_input: None,
                     output: None,
                     annotation: None,
+                    refused: false,
                 })
                 .collect(),
             text: String::new(),
@@ -1879,6 +1880,7 @@ mod tests {
             })),
             annotation: None,
             model_suffix: None,
+            refused: false,
         };
         for index in [1, 0] {
             let event = || {
@@ -2299,6 +2301,7 @@ mod tests {
                     output: Some(output),
                     annotation: None,
                     model_suffix: None,
+                    refused: false,
                 }],
                 text: RETRIEVED_TEXT.into(),
             };

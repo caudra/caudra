@@ -5,6 +5,7 @@ use caudra_agent::permissions::{
         CandidateEvidence, MAX_RECOGNIZER_SUGGESTIONS, ObservationProvenance, PatternCandidate,
         RecognizerLimits,
     },
+    review::{command_template_values, slot_label},
 };
 use caudra_config::{
     Effect, PermissionReviewCandidate, PermissionReviewKind, PermissionRule, PermissionSource,
@@ -23,24 +24,28 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 use serde_json::Value;
+use std::cmp::Reverse;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use unicode_width::UnicodeWidthStr;
 
-use crate::PatternDiscoveryOutcome;
 use crate::components::command_text::{code_spans_in, pattern_spans};
 use crate::components::keybindings::Bind;
 use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::components::modal::{CHROME_LINES, FooterHits, FooterLine, Modal};
 use crate::components::permission_prompt::{
-    lifetime_phrase, origin_word, pattern_summary, rule_names_commands, rule_phrase, rule_summary,
-    slot_name, tilde, tool_words,
+    lifetime_phrase, origin_word, pattern_widened, rule_names_commands, rule_phrase, rule_summary,
+    tilde, tool_words,
 };
 use crate::components::permission_scope::editor::{EditorEvent, EditorLaunch, ScopeEditor};
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
-use crate::components::{Hint, HintBar, ModalScroll, Overlay, escape_terminal_controls, hint_line};
+use crate::components::{
+    Hint, HintBar, ModalScroll, Overlay, counted, escape_terminal_controls, format_elapsed,
+    format_iec_bytes,
+};
 use crate::theme;
+use crate::{PatternDiscoveryOutcome, PatternDiscoveryReport};
 
 const TITLE: &str = " Permissions ";
 /// The picker's own chords, spelled the way its toolbar already spells them.
@@ -60,28 +65,39 @@ const REFRESH_DISCOVERY: Bind = Bind {
     label: "^R",
 };
 const EMPTY: &str = "No grants or policies. Use Discover to scan saved history.";
-const EMPTY_DISCOVERY: &str = "No visible proposals. See the scan overview.";
+const EMPTY_DISCOVERY: &str = "No suggestions. See the scan overview.";
 const RULES_TITLE: &str = " Rules · grants & policies ";
-const DISCOVER_TITLE: &str = " Discover · not active ";
+const DISCOVER_TITLE: &str = " Discover ";
+const RULE_PANE_TITLE: &str = " Selected permission ";
+const SUGGESTION_PANE_TITLE: &str = " Suggestion ";
+const OVERVIEW_PANE_TITLE: &str = " Scan overview ";
 const MAX_DISPLAY_CHARS: usize = 2048;
 const MAX_FIELD_CHARS: usize = 256;
 const MAX_DISPLAY_ITEMS: usize = 16;
 const MAX_INPUT_DEPTH: usize = 4;
-const UNAVAILABLE: &str = "unavailable";
 const OMITTED: &str = "[omitted: display limit]";
-const SUGGESTED_SECTION: &str = "Suggested · not active";
+const SUGGESTED_SECTION: &str = "Suggested";
 const PROJECT_CONFIG_SECTION: &str = "Project configuration";
 const STORED_SECTION: &str = "Stored permissions";
 const POLICY_SECTION: &str = "Active policy · read-only";
 const REVIEW_SECTION: &str = "Needs review · inactive";
-const SUGGESTED_TITLE: &str = " Proposal evidence · not active ";
-const SUGGESTED_GUIDANCE: &str = "Not active: a proposal allows nothing. Create permission (Ctrl-E) opens a draft you review before saving.";
-const SUGGESTED_DISMISSAL_HELP: &str =
-    "Dismiss: this definition in this project. Snooze: hide it in this project for 24 hours.";
-const MAX_SUGGESTION_EXAMPLES: usize = 3;
-const MAX_SUGGESTION_DETAIL_CHARS: usize = 8192;
-const INSPECTOR_WIDTH_PERCENT: u16 = 80;
-const INSPECTOR_HEIGHT_PERCENT: u16 = 80;
+/// The one place the manager says a suggestion grants nothing yet.
+const NOT_ACTIVE: &str = "Not active. Ctrl-E drafts a permission you review before saving.";
+const COVERS: &str = "Covers these commands";
+const COVERS_SUCH_AS: &str = "Covers commands such as";
+const MAX_COVERED_COMMANDS: usize = 6;
+const STILL_ASKS: &str = "Still asks for";
+const OTHER_VALUES: &str = "other values";
+const OPTION_VALUES: &str = "values that start with -";
+const OTHER_COMBINATIONS: &str = "other combinations of these values";
+const ALWAYS_ASKS: [&str; 3] = [
+    "extra arguments, redirects and expansions",
+    "the same commands run from another folder",
+    "any other command on the same line",
+];
+const LIST_INDENT: &str = "  ";
+const COUNT_GAP: &str = "  ";
+const UNVERIFIED_SOURCE: &str = "Caudra cannot verify this history.";
 const SCROLLBAR_WIDTH: u16 = 1;
 const MANAGER_SIZE_PERCENT: u16 = 95;
 const SIDE_BY_SIDE_WIDTH: u16 = 110;
@@ -90,12 +106,21 @@ const SIDE_BY_SIDE_WIDTH: u16 = 110;
 const LIST_PERCENT: u16 = 55;
 const PANE_GAP: u16 = 1;
 const MIN_CHROME_HEIGHT: u16 = 16;
-const DISCOVERY_WARNING: &str = "Imported history is unverified. Standard Bash startup and tool identity are assumed; current stored cwd approximates historical context. Execution success is not proven.";
-const DISCOVERY_EMPTY: &str = "No visible proposals. Unsupported or sensitive commands are excluded; dismissed and snoozed definitions stay hidden. A bounded sample can miss otherwise eligible patterns.";
-const DISCOVERY_IDLE: &str = "Scan local saved history for suggested command patterns. Nothing is installed or approved by a scan.";
-const DISCOVERY_LOADING: &str = "Reading and analyzing a bounded history sample in the background. Cancel stops this request; active permissions are unchanged.";
-const DISCOVERY_CANCELLED: &str =
-    "Scan cancelled. No late result from this request will be installed. Refresh to scan again.";
+const DISCOVERY_UNVERIFIED: &str = "Saved history shows what was asked for, not whether it worked. Imported history is unverified.";
+const DISCOVERY_EMPTY: &str = "No suggestions. Unsupported and sensitive commands are left out, dismissed and snoozed ones stay hidden, and a scan reads only part of your history.";
+const DISCOVERY_IDLE: &str =
+    "Ctrl-R scans saved history for commands you run often. A scan changes no permissions.";
+const DISCOVERY_LOADING: &str = "Reading saved history in the background. Ctrl-X cancels, and your permissions stay as they are.";
+const DISCOVERY_CANCELLED: &str = "Scan cancelled. Nothing it found is shown. Ctrl-R scans again.";
+const DISCOVERY_CLOSING: &str = "Suggestions allow nothing until you create a permission from one.";
+const SCAN_COMPLETE: &str = "Scan complete.";
+const SCAN_PARTIAL: &str = "Partial scan.";
+const STOPPED_EARLY: &str = "Stopped early: ";
+const MILLIS_PER_SECOND: u64 = 1_000;
+const ROW: &str = "row";
+const TOOL_CALL: &str = "tool call";
+const SUGGESTION: &str = "suggestion";
+const SESSION: &str = "session";
 const READ_ONLY_POLICY: &str =
     "It can't be changed here. Change it where it was set, such as your config or the plugin.";
 const EDIT_AT_SOURCE: &str = "Ctrl-E opens the file it comes from.";
@@ -140,12 +165,7 @@ const REVOKED_NOTE: &str = "Revoked; it no longer applies";
 const FROM_CONFIG: &str = "Set in your permissions configuration.";
 const BUILT_IN_RULE: &str = "Built into Caudra.";
 const FROM_PLUGIN: &str = "Added by a plugin you trust.";
-const NATIVE_PLACE: &str = "conversation";
-const NATIVE_PLACES: &str = "conversations";
-const IMPORTED_PLACE: &str = "session";
-const IMPORTED_PLACES: &str = "sessions";
-const NATIVE_SOURCE: &str = "Seen in your Caudra conversations.";
-const IMPORTED_SOURCE: &str = "Seen in imported history, which Caudra can't verify.";
+const CONVERSATION: &str = "conversation";
 
 pub(crate) enum PermissionsPickerAction {
     Consumed,
@@ -255,8 +275,6 @@ struct PermissionEntry {
     id: Option<String>,
     label: String,
     status: Option<String>,
-    /// What the proposal inspector shows; proposals only.
-    evidence: Option<String>,
     read_only_policy: bool,
     project_config_action: Option<ProjectConfigAction>,
     suggestion: Option<SuggestedPatternTarget>,
@@ -295,10 +313,18 @@ impl PickerItem for PermissionEntry {
     }
 
     /// A stored rule that names one command draws it as shell after its
-    /// effect word.
+    /// effect word, and a suggestion's template is shell throughout.
     fn label_colours(&self) -> Option<Vec<Span<'static>>> {
-        let PickerEntry::Stored(record) = &self.source else {
-            return None;
+        let record = match &self.source {
+            PickerEntry::Stored(record) => record,
+            PickerEntry::Discovered(_) => {
+                return Some(pattern_spans(
+                    &self.label,
+                    Style::default(),
+                    theme::current().accent,
+                ));
+            }
+            _ => return None,
         };
         if !rule_names_commands(&record.rule, record.review.as_ref()) {
             return None;
@@ -337,13 +363,12 @@ pub(crate) struct PermissionsPicker {
     entries: Vec<PermissionEntry>,
     pending_revoke: Option<String>,
     pending_project_config_action: Option<ProjectConfigAction>,
-    suggestion_inspector: Option<SuggestionInspector>,
     discovery: DiscoveryState,
     mode: PermissionsMode,
     other_selection: usize,
     discovery_view: bool,
     detail_focused: bool,
-    detail: SuggestionInspector,
+    detail: DetailScroll,
     notice: Option<String>,
     popup: Rect,
     toolbar_hits: FooterHits,
@@ -354,13 +379,14 @@ pub(crate) struct PermissionsPicker {
     project_filter: ProjectFilter,
 }
 
-struct SuggestionInspector {
+/// The right-hand pane's scroll position, its bar, and where it was drawn.
+struct DetailScroll {
     scroll: ModalScroll,
     scrollbar: Scrollbar,
     popup: Rect,
 }
 
-impl SuggestionInspector {
+impl DetailScroll {
     fn new() -> Self {
         Self {
             scroll: ModalScroll::new_top(),
@@ -388,47 +414,11 @@ impl SuggestionInspector {
         }
         false
     }
-
-    fn view(&mut self, frame: &mut Frame, area: Rect, description: &str) -> Rect {
-        grab_scope!("permissions_picker_inspector", area);
-        let mut lines = vec![Line::from(SUGGESTED_GUIDANCE), Line::default()];
-        lines.extend(description.lines().map(Line::from));
-        lines.extend([
-            Line::default(),
-            Line::from(SUGGESTED_DISMISSAL_HELP),
-            suggestion_inspector_footer(),
-        ]);
-        let paragraph = Paragraph::new(lines)
-            .style(theme::current().item)
-            .wrap(Wrap { trim: false });
-        let width = Modal::inner_width(area.width, INSPECTOR_WIDTH_PERCENT)
-            .saturating_sub(SCROLLBAR_WIDTH)
-            .max(1);
-        let total = u16::try_from(paragraph.line_count(width))
-            .unwrap_or(u16::MAX)
-            .min(u16::MAX.saturating_sub(CHROME_LINES));
-        let (popup, inner) = Modal {
-            title: SUGGESTED_TITLE,
-            width_percent: INSPECTOR_WIDTH_PERCENT,
-            max_height_percent: INSPECTOR_HEIGHT_PERCENT,
-        }
-        .render(frame, area, total);
-        let body = Rect {
-            width: inner.width.saturating_sub(SCROLLBAR_WIDTH),
-            ..inner
-        };
-        self.scroll.update_dimensions(total, body.height);
-        let offset = self.scroll.offset();
-        frame.render_widget(paragraph.scroll((offset, 0)), body);
-        self.scrollbar.draw(frame, inner, total, offset);
-        self.popup = popup;
-        popup
-    }
 }
 
 impl PermissionsPicker {
     pub(crate) fn new() -> Self {
-        let mut picker = ListPicker::new().with_width_percent(100);
+        let mut picker = ListPicker::new().with_width_percent(100).docked();
         picker.set_empty_text(EMPTY);
         picker.set_footer_builder(footer);
         Self {
@@ -436,13 +426,12 @@ impl PermissionsPicker {
             entries: Vec::new(),
             pending_revoke: None,
             pending_project_config_action: None,
-            suggestion_inspector: None,
             discovery: DiscoveryState::Idle,
             mode: PermissionsMode::Rules,
             other_selection: 0,
             discovery_view: false,
             detail_focused: false,
-            detail: SuggestionInspector::new(),
+            detail: DetailScroll::new(),
             notice: None,
             popup: Rect::default(),
             toolbar_hits: FooterHits::default(),
@@ -479,9 +468,8 @@ impl PermissionsPicker {
             .collect();
         self.pending_revoke = None;
         self.pending_project_config_action = None;
-        self.suggestion_inspector = None;
         self.notice = None;
-        self.detail = SuggestionInspector::new();
+        self.detail = DetailScroll::new();
         self.detail_focused = false;
         self.mode = PermissionsMode::Rules;
         self.other_selection = 0;
@@ -568,7 +556,6 @@ impl PermissionsPicker {
         self.discovery_view = false;
         self.detail_focused = false;
         self.detail.scroll.reset();
-        self.suggestion_inspector = None;
         self.notice = None;
         self.tabs_hits.clear();
         self.toolbar_hits.clear();
@@ -619,13 +606,6 @@ impl PermissionsPicker {
                 }
             })
         });
-        if self.suggestion_inspector.is_some() {
-            if restored {
-                self.inspect_suggestion();
-            } else {
-                self.suggestion_inspector = None;
-            }
-        }
         if !restored {
             self.picker.select(0);
             self.detail.scroll.reset();
@@ -659,14 +639,6 @@ impl PermissionsPicker {
                 KeyCode::Char('s') => return PermissionsPickerAction::SnoozeSuggestion(target),
                 _ => {}
             }
-        }
-        if let Some(inspector) = &mut self.suggestion_inspector {
-            if key.code == KeyCode::Esc || key::QUIT.matches(key) {
-                self.suggestion_inspector = None;
-            } else {
-                inspector.scroll.handle_key(key);
-            }
-            return PermissionsPickerAction::Consumed;
         }
         if let Some(action) = self.pending_project_config_action {
             return match key.code {
@@ -711,10 +683,6 @@ impl PermissionsPicker {
                     self.cycle_project_filter();
                     return PermissionsPickerAction::Consumed;
                 }
-                KeyCode::Char('i') => {
-                    self.inspect_suggestion();
-                    return PermissionsPickerAction::Consumed;
-                }
                 KeyCode::Char('k') => {
                     if let Some(id) = self
                         .picker
@@ -754,11 +722,6 @@ impl PermissionsPicker {
         if self.detail_focused {
             if key.code == KeyCode::Esc {
                 self.detail_focused = false;
-            } else if key.code == KeyCode::Enter
-                && self.mode == PermissionsMode::Discover
-                && !self.discovery_view
-            {
-                self.inspect_suggestion();
             } else if key::QUIT.matches(key) {
                 return PermissionsPickerAction::Close;
             } else {
@@ -798,10 +761,6 @@ impl PermissionsPicker {
                 PermissionsPickerAction::Consumed,
                 PermissionsPickerAction::Editor,
             );
-        }
-        if let Some(inspector) = &mut self.suggestion_inspector {
-            inspector.handle_mouse(event);
-            return PermissionsPickerAction::Consumed;
         }
         // Ahead of the confirmation gate: the hint is a key press, and the
         // key path already knows what Esc means while a confirmation is up.
@@ -877,10 +836,7 @@ impl PermissionsPicker {
             editor.handle_paste(text);
             return true;
         }
-        if self.suggestion_inspector.is_some() || self.detail_focused {
-            return true;
-        }
-        if self.has_pending_confirmation() {
+        if self.detail_focused || self.has_pending_confirmation() {
             return true;
         }
         let selected = self.picker.selected_index();
@@ -892,10 +848,6 @@ impl PermissionsPicker {
     pub(crate) fn scroll(&mut self, delta: i32) {
         if let Some(editor) = &mut self.editor {
             editor.scroll(delta);
-            return;
-        }
-        if let Some(inspector) = &mut self.suggestion_inspector {
-            inspector.scroll.scroll(delta);
             return;
         }
         if self.has_pending_confirmation() {
@@ -915,7 +867,7 @@ impl PermissionsPicker {
             editor.scroll_at(position, delta);
             return;
         }
-        if self.suggestion_inspector.is_some() || self.has_pending_confirmation() {
+        if self.has_pending_confirmation() {
             self.scroll(delta);
         } else if self.detail.popup.contains(position) {
             self.detail.scroll.scroll(delta);
@@ -927,23 +879,11 @@ impl PermissionsPicker {
     }
 
     pub(crate) fn contains(&self, position: Position) -> bool {
-        if let Some(inspector) = &self.suggestion_inspector {
-            inspector.popup.contains(position)
-        } else {
-            self.popup.contains(position)
-        }
+        self.popup.contains(position)
     }
 
     pub(crate) fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
         grab_scope!("permissions_picker", area);
-        if let Some(inspector) = &mut self.suggestion_inspector {
-            let evidence = self
-                .picker
-                .selected_item()
-                .and_then(|entry| entry.evidence.as_deref())
-                .unwrap_or(UNAVAILABLE);
-            return inspector.view(frame, area, evidence);
-        }
         if !self.has_pending_confirmation() {
             let selected = self.picker.selected_item();
             let suggested = selected.is_some_and(|entry| entry.suggestion.is_some());
@@ -1053,30 +993,21 @@ impl PermissionsPicker {
             tabs,
         );
         self.tabs_hits.set(navigation.hits(tabs, 0, 1));
-        let proposals = self
-            .entries
-            .iter()
-            .filter(|entry| entry.suggestion.is_some())
-            .count();
         let mut status_line = vec![Span::styled(
             if self.mode == PermissionsMode::Discover {
                 format!(
-                    "Not active · {} · {proposals} proposals",
-                    self.discovery.label()
+                    "{} · {}",
+                    self.discovery.label(),
+                    counted(self.suggestion_count(), SUGGESTION)
                 )
             } else {
                 format!("Grants & policies · Discovery: {}", self.discovery.label())
             },
             theme.panel_title,
         )];
-        if let DiscoveryState::Complete(outcome) = &self.discovery
-            && let PatternDiscoveryOutcome::Ready(report) = outcome.as_ref()
-        {
+        if let Some(report) = self.report() {
             status_line.push(Span::styled(
-                format!(
-                    " · {} sessions · {} observations",
-                    report.sample.sessions, report.recognition.retained_observations
-                ),
+                format!(" · {} scanned", counted(report.sample.sessions, SESSION)),
                 theme.item_desc,
             ));
         }
@@ -1150,12 +1081,12 @@ impl PermissionsPicker {
         let block = Block::bordered()
             .title(if self.mode == PermissionsMode::Discover {
                 if self.discovery_view || self.picker.selected_item().is_none() {
-                    " Scan overview "
+                    OVERVIEW_PANE_TITLE
                 } else {
-                    " Proposal · not active "
+                    SUGGESTION_PANE_TITLE
                 }
             } else {
-                " Selected permission "
+                RULE_PANE_TITLE
             })
             .border_style(if self.detail_focused {
                 theme.panel_title
@@ -1193,97 +1124,63 @@ impl PermissionsPicker {
         self.detail.popup = area;
     }
 
+    fn suggestion_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| entry.suggestion.is_some())
+            .count()
+    }
+
+    fn report(&self) -> Option<&PatternDiscoveryReport> {
+        match &self.discovery {
+            DiscoveryState::Complete(outcome) => match outcome.as_ref() {
+                PatternDiscoveryOutcome::Ready(report) => Some(report),
+                PatternDiscoveryOutcome::Unavailable(_) => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The scan overview: what the last scan did, what makes a suggestion,
+    /// the limits and caveats in muted text, and that nothing is granted.
     fn discovery_lines(&self) -> Vec<Line<'static>> {
         let theme = theme::current();
-        let mut lines = vec![Line::styled(
-            format!("Discovery: {}", self.discovery.label()),
-            theme.panel_title,
-        )];
-        let min_sessions = match &self.discovery {
-            DiscoveryState::Complete(outcome) => match outcome.as_ref() {
-                PatternDiscoveryOutcome::Ready(report) => report.recognizer_limits.min_sessions,
-                _ => RecognizerLimits::default().min_sessions,
-            },
-            _ => RecognizerLimits::default().min_sessions,
-        };
-        let threshold = format!(
-            "Patterns need support from at least {min_sessions} independent sessions; repeated commands in one session are not enough."
-        );
-        let empty = !self.entries.iter().any(|entry| entry.suggestion.is_some());
-        let empty_sample = empty
-            && matches!(&self.discovery, DiscoveryState::Complete(outcome) if matches!(outcome.as_ref(), PatternDiscoveryOutcome::Ready(_)));
-        if empty_sample {
-            lines.push(Line::from(threshold.clone()));
-        }
-        match &self.discovery {
-            DiscoveryState::Idle => lines.push(Line::from(DISCOVERY_IDLE)),
-            DiscoveryState::Loading => lines.push(Line::from(DISCOVERY_LOADING)),
-            DiscoveryState::Cancelled => lines.push(Line::from(DISCOVERY_CANCELLED)),
+        let mut lines = match &self.discovery {
+            DiscoveryState::Idle => vec![Line::from(DISCOVERY_IDLE)],
+            DiscoveryState::Loading => vec![Line::from(DISCOVERY_LOADING)],
+            DiscoveryState::Cancelled => vec![Line::from(DISCOVERY_CANCELLED)],
             DiscoveryState::Complete(outcome) => match outcome.as_ref() {
                 PatternDiscoveryOutcome::Unavailable(reason) => {
-                    lines.push(Line::styled(*reason, theme.error))
+                    vec![Line::styled(*reason, theme.error)]
                 }
                 PatternDiscoveryOutcome::Ready(report) => {
-                    for (label, count, limit) in [
-                        (
-                            "Sessions sampled",
-                            report.sample.sessions,
-                            report.history_limits.max_sessions,
-                        ),
-                        (
-                            "History rows",
-                            report.sample.rows,
-                            report.history_limits.max_rows,
-                        ),
-                        (
-                            "History bytes",
-                            report.sample.bytes,
-                            report.history_limits.max_bytes,
-                        ),
-                        ("Tool calls", report.calls, report.max_calls),
-                        (
-                            "Analysis bytes",
-                            report.analysis_bytes,
-                            report.max_analysis_bytes,
-                        ),
-                        (
-                            "Observations retained",
-                            report.recognition.retained_observations,
-                            report.recognizer_limits.max_observations,
-                        ),
-                    ] {
-                        lines.push(Line::from(vec![
-                            Span::styled(format!("{label}: "), theme.item_desc),
-                            Span::raw(format!("{count} / {limit}")),
-                        ]));
-                    }
-                    lines.push(Line::from(format!(
-                        "Time budget: {} ms · row limit: {} bytes",
-                        report.max_elapsed_ms, report.history_limits.max_row_bytes
-                    )));
-                    lines.push(Line::from(format!(
-                        "{} / {} proposals found · {} visible",
-                        report.candidates.len(),
-                        report.recognizer_limits.max_suggestions,
-                        self.entries
-                            .iter()
-                            .filter(|entry| entry.suggestion.is_some())
-                            .count()
-                    )));
-                    for reason in &report.partial_reasons {
-                        lines.push(Line::styled(format!("Partial: {reason}"), theme.error));
-                    }
+                    scan_lines(report, self.suggestion_count())
                 }
             },
-        }
-        if !empty_sample {
-            lines.push(Line::from(threshold));
-        }
-        if empty {
+        };
+        let report = self.report();
+        let min_sessions = report.map_or(RecognizerLimits::default().min_sessions, |report| {
+            report.recognizer_limits.min_sessions
+        });
+        lines.extend([
+            Line::default(),
+            Line::from(format!(
+                "Saved history yields a suggestion when similar commands appear in at least {}. Commands you repeat in this conversation can also become suggestions.",
+                counted(min_sessions, SESSION)
+            )),
+        ]);
+        if self.suggestion_count() == 0 {
             lines.push(Line::from(DISCOVERY_EMPTY));
         }
-        lines.push(Line::styled(DISCOVERY_WARNING, theme.item_desc));
-        lines.push(Line::styled(SUGGESTED_GUIDANCE, theme.panel_title));
+        lines.push(Line::default());
+        if let Some(report) = report {
+            lines.push(Line::styled(scan_limits(report), theme.item_desc));
+        }
+        lines.extend([
+            Line::styled(DISCOVERY_UNVERIFIED, theme.item_desc),
+            Line::default(),
+            Line::styled(DISCOVERY_CLOSING, theme.panel_title),
+        ]);
         lines
     }
 
@@ -1323,16 +1220,6 @@ impl PermissionsPicker {
             PickerAction::Close => PermissionsPickerAction::Close,
             PickerAction::Key(key) => self.handle_key(key),
             PickerAction::Copy(text) => PermissionsPickerAction::Copy(text),
-        }
-    }
-
-    fn inspect_suggestion(&mut self) {
-        if self
-            .picker
-            .selected_item()
-            .is_some_and(|entry| entry.suggestion.is_some())
-        {
-            self.suggestion_inspector = Some(SuggestionInspector::new());
         }
     }
 
@@ -1462,7 +1349,6 @@ impl Overlay for PermissionsPicker {
     fn close(&mut self) {
         self.pending_revoke = None;
         self.pending_project_config_action = None;
-        self.suggestion_inspector = None;
         self.toolbar_hits = FooterHits::default();
         self.tabs_hits = FooterHits::default();
         self.picker.close();
@@ -1481,7 +1367,6 @@ fn project_config_entry(action: ProjectConfigAction) -> PermissionEntry {
             }
             .into(),
         ),
-        evidence: None,
         read_only_policy: false,
         project_config_action: Some(action),
         suggestion: None,
@@ -1498,91 +1383,15 @@ fn suggestion_entry(
         return None;
     }
     let definition_id = definition.fingerprint().ok()?;
-    let template = suggestion_template(definition, None);
-    let mut lines = vec![
-        format!("Command template: {template}"),
-        format!(
-            "[{}] {} observations · {} sessions · not active",
-            candidate.evidence.review_origin(),
-            candidate.evidence.support.observations,
-            candidate.evidence.support.independent_sessions,
-        ),
-    ];
-    for slot in definition.slots.iter().take(MAX_DISPLAY_ITEMS) {
-        lines.push(format!(
-            "{}: {}",
-            slot_name(definition, slot.id),
-            suggestion_domain(&slot.domain)
-        ));
-        lines.push(
-            match slot.option_like {
-                OptionLikePolicy::Reject => "  Leading '-' is rejected for this argument.",
-                OptionLikePolicy::AllowForProvenData => {
-                    "  Leading '-' allowed only for proven data arguments."
-                }
-            }
-            .into(),
-        );
-    }
-    if definition.slots.len() > MAX_DISPLAY_ITEMS {
-        lines.push(OMITTED.into());
-    }
-    lines.push(match &definition.combinations {
-        SlotCombinations::ObservedTuples { tuples } => {
-            format!("Combinations: {} observed tuples only", tuples.len())
-        }
-        SlotCombinations::Independent => {
-            "Combinations: independent; new combinations allowed".into()
-        }
-    });
-    for (label, value) in [
-        ("Working directory", &definition.context.effective_workdir),
-        ("Project", &definition.context.path_binding),
-        ("Tool identity", &definition.context.tool_identity),
-        (
-            "Executable identity",
-            &definition.context.executable_identity,
-        ),
-        ("Analysis version", &definition.context.analysis_version),
-    ] {
-        lines.push(format!("{label}: {}", suggestion_literal(value)));
-    }
-    lines.push(SUGGESTED_GUIDANCE.into());
-    lines.push(candidate.evidence.review_summary());
-    for example in candidate
-        .evidence
-        .tuples
-        .iter()
-        .take(MAX_SUGGESTION_EXAMPLES)
-    {
-        lines.push(format!(
-            "Observed example ({} observations): {}",
-            example.support.observations,
-            suggestion_template(definition, Some(&example.values))
-        ));
-    }
-    if candidate.evidence.tuples.len() > MAX_SUGGESTION_EXAMPLES {
-        lines.push(OMITTED.into());
-    }
-    lines.push(format!(
-        "Name (untrusted label): {}",
-        suggestion_literal(&definition.name)
-    ));
-    for source in candidate.evidence.sources.iter().take(MAX_DISPLAY_ITEMS) {
-        lines.push(format!(
-            "Source (untrusted label): {}",
-            suggestion_literal(source)
-        ));
-    }
-    if candidate.evidence.sources.len() > MAX_DISPLAY_ITEMS {
-        lines.push(OMITTED.into());
-    }
     Some(PermissionEntry {
         source: PickerEntry::Discovered(Arc::new(candidate.clone())),
         id: None,
-        label: format!("{}: {template}", seen_phrase(&candidate.evidence)),
-        status: None,
-        evidence: Some(bounded_text(&lines.join("\n"), MAX_SUGGESTION_DETAIL_CHARS)),
+        label: suggestion_template(definition, None),
+        status: Some(format!(
+            "{}× · {}",
+            candidate.evidence.support.observations,
+            places(&candidate.evidence)
+        )),
         read_only_policy: false,
         project_config_action: None,
         suggestion: Some(SuggestedPatternTarget {
@@ -1593,19 +1402,128 @@ fn suggestion_entry(
     })
 }
 
-/// How often a proposal was seen: `Seen 12× in 4 conversations`.
-fn seen_phrase(evidence: &CandidateEvidence) -> String {
-    let sessions = evidence.support.independent_sessions;
-    let place = match (&evidence.provenance, sessions == 1) {
-        (ObservationProvenance::Native, true) => NATIVE_PLACE,
-        (ObservationProvenance::Native, false) => NATIVE_PLACES,
-        (_, true) => IMPORTED_PLACE,
-        (_, false) => IMPORTED_PLACES,
-    };
-    format!(
-        "Seen {}× in {sessions} {place}",
-        evidence.support.observations
+/// Where a suggestion was seen: `2 conversations` of Caudra's own, or
+/// `2 sessions` of history it did not record.
+fn places(evidence: &CandidateEvidence) -> String {
+    counted(
+        evidence.support.independent_sessions,
+        if matches!(evidence.provenance, ObservationProvenance::Native) {
+            CONVERSATION
+        } else {
+            SESSION
+        },
     )
+}
+
+/// A suggestion as the pane reads it: the template and what its slots stand
+/// for, the commands it covers, what still asks, where it was seen, and that
+/// it grants nothing yet.
+fn suggestion_lines(candidate: &PatternCandidate) -> Vec<Line<'static>> {
+    let theme = theme::current();
+    let definition = &candidate.definition;
+    let evidence = &candidate.evidence;
+    let shell = |command: &str| pattern_spans(command, Style::default(), theme.accent);
+    let mut lines = vec![Line::from(shell(&suggestion_template(definition, None)))];
+    if let Some(values) = command_template_values(definition) {
+        lines.push(Line::from(display_text(&values, MAX_DISPLAY_CHARS)));
+    }
+    lines.push(Line::default());
+    lines.push(Line::styled(
+        if pattern_widened(definition) {
+            COVERS_SUCH_AS
+        } else {
+            COVERS
+        },
+        theme.panel_title,
+    ));
+    let mut tuples: Vec<_> = evidence.tuples.iter().collect();
+    tuples.sort_by_key(|tuple| Reverse(tuple.support.observations));
+    let covered: Vec<_> = tuples
+        .iter()
+        .take(MAX_COVERED_COMMANDS)
+        .map(|tuple| {
+            (
+                suggestion_template(definition, Some(&tuple.values)),
+                tuple.support.observations,
+            )
+        })
+        .collect();
+    let width = covered
+        .iter()
+        .map(|(command, _)| command.width())
+        .max()
+        .unwrap_or_default();
+    for (command, count) in &covered {
+        let mut spans = vec![Span::raw(LIST_INDENT)];
+        spans.extend(shell(command));
+        spans.push(Span::styled(
+            format!("{}{COUNT_GAP}{count}×", " ".repeat(width - command.width())),
+            theme.item_desc,
+        ));
+        lines.push(Line::from(spans));
+    }
+    if tuples.len() > MAX_COVERED_COMMANDS {
+        lines.push(Line::from(format!(
+            "{LIST_INDENT}and {} more",
+            tuples.len() - MAX_COVERED_COMMANDS
+        )));
+    }
+    lines.push(Line::default());
+    lines.push(Line::styled(STILL_ASKS, theme.panel_title));
+    lines.extend(
+        still_asks(definition)
+            .into_iter()
+            .map(|item| Line::from(format!("{LIST_INDENT}{item}"))),
+    );
+    lines.push(Line::default());
+    let mut seen = format!(
+        "Seen {}× in {}, run from {}.",
+        evidence.support.observations,
+        places(evidence),
+        tilde(&definition.context.effective_workdir)
+    );
+    if !matches!(evidence.provenance, ObservationProvenance::Native) {
+        seen.push(' ');
+        seen.push_str(UNVERIFIED_SOURCE);
+    }
+    lines.push(Line::styled(
+        display_text(&seen, MAX_DISPLAY_CHARS),
+        theme.item_desc,
+    ));
+    lines.push(Line::styled(NOT_ACTIVE, theme.tool_warning));
+    lines
+}
+
+/// What a template leaves to a prompt: values and combinations it was not
+/// shown, and whatever no template covers.
+fn still_asks(definition: &PatternDefinition) -> Vec<&'static str> {
+    let listed = |domain: &ArgumentDomain| {
+        matches!(
+            domain,
+            ArgumentDomain::ObservedSet { .. } | ArgumentDomain::Exact { .. }
+        )
+    };
+    let mut items = Vec::new();
+    if definition.slots.iter().any(|slot| listed(&slot.domain)) {
+        items.push(OTHER_VALUES);
+    }
+    if definition
+        .slots
+        .iter()
+        .any(|slot| !listed(&slot.domain) && slot.option_like == OptionLikePolicy::Reject)
+    {
+        items.push(OPTION_VALUES);
+    }
+    if definition.slots.len() > 1
+        && matches!(
+            definition.combinations,
+            SlotCombinations::ObservedTuples { .. }
+        )
+    {
+        items.push(OTHER_COMBINATIONS);
+    }
+    items.extend(ALWAYS_ASKS);
+    items
 }
 
 fn suggestion_literal(value: &str) -> String {
@@ -1622,7 +1540,7 @@ fn suggestion_template(definition: &PatternDefinition, values: Option<&ObservedT
             PatternToken::Slot { id, .. } => values
                 .and_then(|values| values.get(id))
                 .map(|value| suggestion_literal(value))
-                .unwrap_or_else(|| slot_name(definition, *id)),
+                .unwrap_or_else(|| slot_label(definition, *id)),
         })
         .collect();
     if definition.argv.len() > MAX_DISPLAY_ITEMS {
@@ -1631,35 +1549,60 @@ fn suggestion_template(definition: &PatternDefinition, values: Option<&ObservedT
     bounded_text(&words.join(" "), MAX_DISPLAY_CHARS)
 }
 
-fn suggestion_domain(domain: &ArgumentDomain) -> String {
-    match domain {
-        ArgumentDomain::ObservedSet { values } => {
-            let mut literals: Vec<_> = values
-                .iter()
-                .take(MAX_DISPLAY_ITEMS)
-                .map(|value| suggestion_literal(value))
-                .collect();
-            if values.len() > MAX_DISPLAY_ITEMS {
-                literals.push(OMITTED.into());
-            }
-            format!(
-                "Observed values ({}): {}",
-                values.len(),
-                literals.join(", ")
-            )
-        }
-        ArgumentDomain::Exact { value } => format!("Exact literal: {}", suggestion_literal(value)),
-        ArgumentDomain::Glob { pattern } => format!(
-            "Whole-argument glob (no shell expansion): {}",
-            suggestion_literal(pattern)
+/// What a finished scan read, looked at and found, in sentences.
+fn scan_lines(report: &PatternDiscoveryReport, shown: usize) -> Vec<Line<'static>> {
+    let theme = theme::current();
+    let mut lines = vec![
+        Line::styled(
+            if report.partial_reasons.is_empty() {
+                SCAN_COMPLETE
+            } else {
+                SCAN_PARTIAL
+            },
+            theme.panel_title,
         ),
-        ArgumentDomain::Regex { pattern } => {
-            format!("Whole-argument regex: {}", suggestion_literal(pattern))
-        }
-        ArgumentDomain::AnyLiteralArgument => {
-            "Any single literal argument; not a command fragment".into()
-        }
-    }
+        Line::from(format!(
+            "Read {} of up to {}: {} of history ({} of {}).",
+            report.sample.sessions,
+            counted(report.history_limits.max_sessions, SESSION),
+            counted(report.sample.rows, ROW),
+            iec_bytes(report.sample.bytes),
+            iec_bytes(report.history_limits.max_bytes),
+        )),
+        Line::from(format!(
+            "Looked at {} ({} of commands) and kept {} to compare.",
+            counted(report.calls, TOOL_CALL),
+            iec_bytes(report.analysis_bytes),
+            report.recognition.retained_observations,
+        )),
+        Line::from(format!(
+            "Found {}, {shown} shown.",
+            counted(report.candidates.len(), SUGGESTION)
+        )),
+    ];
+    lines.extend(
+        report
+            .partial_reasons
+            .iter()
+            .map(|reason| Line::styled(format!("{STOPPED_EARLY}{reason}"), theme.error)),
+    );
+    lines
+}
+
+fn scan_limits(report: &PatternDiscoveryReport) -> String {
+    format!(
+        "A scan reads at most {} of up to {} each and {} with {} of commands, keeps up to {} to compare, and stops after {}.",
+        counted(report.history_limits.max_rows, ROW),
+        iec_bytes(report.history_limits.max_row_bytes),
+        counted(report.max_calls, TOOL_CALL),
+        iec_bytes(report.max_analysis_bytes),
+        report.recognizer_limits.max_observations,
+        format_elapsed(report.max_elapsed_ms.div_ceil(MILLIS_PER_SECOND)),
+    )
+}
+
+fn iec_bytes(bytes: usize) -> String {
+    format_iec_bytes(u64::try_from(bytes).unwrap_or(u64::MAX))
 }
 
 fn entry(record: Arc<PermissionRuleRecord>, current: Option<&Path>) -> PermissionEntry {
@@ -1668,7 +1611,6 @@ fn entry(record: Arc<PermissionRuleRecord>, current: Option<&Path>) -> Permissio
         label: row_label(&record.rule.effect, &record_phrase(&record, current)),
         status: Some(record_status(&record, current)),
         source: PickerEntry::Stored(record),
-        evidence: None,
         read_only_policy: false,
         project_config_action: None,
         suggestion: None,
@@ -1839,35 +1781,7 @@ fn summary_lines(entry: &PermissionEntry, current: Option<&Path>) -> Vec<Line<'s
             )));
             lines
         }
-        PickerEntry::Discovered(candidate) => {
-            let mut lines = vec![
-                title(seen_phrase(&candidate.evidence)),
-                Line::from(pattern_spans(
-                    &display_text(
-                        &suggestion_template(&candidate.definition, None),
-                        MAX_DISPLAY_CHARS,
-                    ),
-                    Style::default(),
-                    theme.accent,
-                )),
-            ];
-            lines.extend(
-                pattern_summary(&candidate.definition)
-                    .lines
-                    .iter()
-                    .map(|line| sentence(line)),
-            );
-            lines.push(Line::default());
-            lines.push(muted(
-                match candidate.evidence.provenance {
-                    ObservationProvenance::Native => NATIVE_SOURCE,
-                    _ => IMPORTED_SOURCE,
-                }
-                .into(),
-            ));
-            lines.push(muted(SUGGESTED_GUIDANCE.into()));
-            lines
-        }
+        PickerEntry::Discovered(candidate) => suggestion_lines(candidate),
         PickerEntry::Policy {
             origin,
             rule,
@@ -2028,7 +1942,6 @@ fn review_entry(candidate: &PermissionReviewCandidate) -> PermissionEntry {
                 PermissionSource::Global | PermissionSource::Project => CONFIG,
             },
         )),
-        evidence: None,
         read_only_policy: false,
         project_config_action: None,
         suggestion: None,
@@ -2048,7 +1961,6 @@ fn policy_entry(policy: &ActivePolicyRule) -> PermissionEntry {
             &config_rule_phrase(&policy.rule.tool, policy.rule.scope.as_deref()),
         ),
         status: Some(row_status(ALWAYS, origin_word(policy.origin))),
-        evidence: None,
         read_only_policy: true,
         project_config_action: None,
         suggestion: None,
@@ -2075,7 +1987,7 @@ fn suggestion_footer() -> Vec<Hint> {
     vec![
         Hint::bind(key::ENTER, "View"),
         Hint::bind(DISMISS_SUGGESTION, "Dismiss"),
-        Hint::bind(SNOOZE_SUGGESTION, "Snooze"),
+        Hint::bind(SNOOZE_SUGGESTION, "Snooze 24h"),
     ]
 }
 
@@ -2085,17 +1997,6 @@ fn discovery_footer() -> Vec<Hint> {
         Hint::bind(key::TAB, "Details"),
         Hint::bind(key::ESC, "Back"),
     ]
-}
-
-/// Drawn inside the inspector's wrapped, scrolling paragraph, where no row
-/// is fixed enough to hold a hit rect, so it is text alone.
-fn suggestion_inspector_footer() -> Line<'static> {
-    hint_line(&[
-        Hint::inert("PgUp/PgDn", "Scroll"),
-        Hint::bind(DISMISS_SUGGESTION, "Dismiss"),
-        Hint::bind(SNOOZE_SUGGESTION, "Snooze 24h"),
-        Hint::bind(key::ESC, "Back"),
-    ])
 }
 
 #[cfg(test)]
@@ -2151,14 +2052,14 @@ mod tests {
     use crate::{PatternDiscoveryOutcome, test_pattern_discovery_report, theme};
 
     use super::{
-        CONFIRM_REVOKE_MESSAGE, DISCOVERY_CANCELLED, DISCOVERY_EMPTY, DISCOVERY_IDLE,
-        DISCOVERY_LOADING, DISCOVERY_WARNING, DiscoveryState, FIXED_INPUT, INACTIVE,
-        INACTIVE_ALLOW, MAX_DISPLAY_CHARS, MAX_FIELD_CHARS, MAX_SUGGESTION_DETAIL_CHARS,
-        NATIVE_SOURCE, NOT_TRUSTED, OMITTED, PROJECT_CONFIG, PermissionEntry, PermissionsMode,
+        ALWAYS_ASKS, CONFIRM_REVOKE_MESSAGE, COVERS, DISCOVERY_CANCELLED, DISCOVERY_CLOSING,
+        DISCOVERY_EMPTY, DISCOVERY_IDLE, DISCOVERY_LOADING, DISCOVERY_UNVERIFIED, DiscoveryState,
+        FIXED_INPUT, INACTIVE, INACTIVE_ALLOW, MAX_DISPLAY_CHARS, MAX_FIELD_CHARS, NOT_ACTIVE,
+        NOT_TRUSTED, OMITTED, OTHER_VALUES, PROJECT_CONFIG, PermissionEntry, PermissionsMode,
         PermissionsPicker, PermissionsPickerAction, PickerAction, PickerEntry, ProjectConfigAction,
-        REVIEW_SECTION, REVOKE_CAUTION, SCROLLBAR_WIDTH, SUGGESTED_GUIDANCE, SUGGESTED_SECTION,
-        TRUST_HINT, TRUST_MESSAGE, UNTRUSTED_CONFIG, display_text, entry, project_config_entry,
-        suggestion_entry, summary_lines,
+        REVIEW_SECTION, REVOKE_CAUTION, SCROLLBAR_WIDTH, STILL_ASKS, STORED_SECTION,
+        SUGGESTED_SECTION, TRUST_HINT, TRUST_MESSAGE, UNTRUSTED_CONFIG, display_text, entry,
+        project_config_entry, suggestion_entry, summary_lines,
     };
 
     const ROOT: &str = "/project";
@@ -2170,25 +2071,39 @@ mod tests {
     const SECRET: &str = "top-secret";
     const REDACTED: &str = "[redacted]";
     const CONFIRM_REVOKE: &str = "Revoke this permission?";
-    const SUGGESTED_COMMAND: &str = "cargo test <pattern1>";
-    const SUGGESTED_ROW: &str = "Seen 4× in 2 conversations: cargo test <pattern1>";
-    const SUGGESTED_SLOT_SUMMARY: &str =
-        "<pattern1> (package): Values seen before, 2 allowed: alpha, beta";
-    const SUGGESTED_COMBINATIONS: &str = "Combinations: Only the 2 combinations seen before";
-    const SUGGESTED_EXAMPLE: &str = "cargo test alpha";
-    const SUGGESTED_OBSERVATIONS: &str = "4 observations";
-    const SUGGESTED_SESSIONS: &str = "2 sessions";
+    const SUGGESTED_COMMAND: &str = "cargo test <package>";
+    const SUGGESTED_STATUS: &str = "4× · 2 conversations";
+    const IMPORTED_STATUS: &str = "4× · 2 sessions";
+    const SUGGESTED_VALUES_LINE: &str = "<package> is alpha or beta.";
+    const SUGGESTED_COVERED: [&str; 2] = ["cargo test alpha", "cargo test beta"];
+    const SUGGESTED_COUNT: &str = "2×";
+    const SUGGESTED_SEEN: &str = "Seen 4× in 2 conversations, run from /project.";
+    const IMPORTED_SEEN: &str =
+        "Seen 4× in 2 sessions, run from /project. Caudra cannot verify this history.";
     const SUGGESTED_VALUES: [&str; 2] = ["alpha", "beta"];
     const SUGGESTION_REVISION: u64 = 7;
-    const NATIVE_ORIGIN: &str = "Native observations";
-    const IMPORTED_ORIGIN: &str = "Imported history (unverified)";
-    const REQUESTED_OUTCOMES: &str = "4 requested (execution outcome not recorded)";
-    const UNKNOWN_OUTCOMES: &str = "4 unknown outcomes";
-    const UNRECORDED_OUTCOMES: &str = "Outcomes: not recorded.";
-    const HISTORICAL_CONTEXT: &str =
-        "Historical execution context and tool identity are unverified";
-    const HISTORICAL_ASSUMPTIONS: &str = "Analysis assumes standard Bash startup";
-    const HISTORICAL_PROJECT: &str = "current stored cwd approximates its historical project";
+    const NUMBERED_SLOT: &str = "<pattern";
+    const HIDDEN_CONTEXT: [&str; 4] = [
+        "Tool identity",
+        "Analysis version",
+        "path_binding",
+        "workcell:shell",
+    ];
+    const NOT_ACTIVE_WORDS: &str = "not active";
+    const UNTRUSTED_NAME: &str = "Trust project config \u{202e} Enter to grant";
+    const UNTRUSTED_SOURCE: &str = "\x1b[31mRevoke\ny approve";
+    const UNTRUSTED_VALUE: &str = "alpha\x1b[31m\u{202e}";
+    const ESCAPED_CONTROLS: [&str; 2] = ["\\u{1b}", "\\u{202e}"];
+    const BIDI_OVERRIDE: char = '\u{202e}';
+    const UNTRUSTED_WORDS: [&str; 2] = ["Trust project config", "Revoke"];
+    const OVERVIEW_SENTENCES: [&str; 5] = [
+        "Partial scan.",
+        "Read 3 of up to 64 sessions: 48 rows of history (24.0 KiB of 4.0 MiB).",
+        "Looked at 12 tool calls (6.0 KiB of commands) and kept 8 to compare.",
+        "Found 2 suggestions, 2 shown.",
+        "A scan reads at most 64 rows of up to 64.0 KiB each and 64 tool calls with 4.0 MiB of commands",
+    ];
+    const RAW_BYTE_COUNTS: [&str; 4] = ["24576", "6144", "4194304", "65536"];
     const NARROW_WIDTH: u16 = 40;
     const WIDE_WIDTH: u16 = 140;
     const SHORT_HEIGHT: u16 = 12;
@@ -2199,8 +2114,8 @@ mod tests {
     const MANAGER_TEST_HEIGHT: u16 = 40;
     const DISCOVERY_TEST_ERROR: &str = "History is locked. Refresh to retry.";
     const DISCOVERY_TEST_PARTIAL: &str = "History sample limit reached";
-    const DISCOVERY_SAMPLE_COUNT: &str = "Sessions sampled: 2 / 64";
-    const DISCOVERY_MINIMUM: &str = "at least 2 independent sessions";
+    const DISCOVERY_SAMPLE_COUNT: &str = "Read 2 of up to 64 sessions: 4 rows of history";
+    const DISCOVERY_MINIMUM: &str = "at least 2 sessions";
     const EXPORT_DIRECTORY_MODE: u32 = 0o700;
     const EXPORT_ARTIFACT_MODE: u32 = 0o600;
     const EXPORT_LONG_GRANTS: usize = 240;
@@ -2318,48 +2233,6 @@ mod tests {
         text.chars()
             .filter(|character| !character.is_whitespace())
             .collect()
-    }
-
-    fn read_suggestion(picker: &mut PermissionsPicker, width: u16, height: u16) -> String {
-        if picker.suggestion_inspector.is_none() {
-            picker.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::CONTROL));
-        }
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        let mut rows = BTreeMap::new();
-        loop {
-            terminal
-                .draw(|frame| {
-                    picker.view(frame, frame.area());
-                })
-                .unwrap();
-            let inspector = picker.suggestion_inspector.as_ref().unwrap();
-            let offset = inspector.scroll.offset();
-            let popup = inspector.popup;
-            for (index, y) in (popup.y + 1..popup.bottom() - 1).enumerate() {
-                let mut row = String::new();
-                let mut x = popup.x + 1;
-                let end = popup.right() - 1 - SCROLLBAR_WIDTH;
-                while x < end {
-                    let cell = &terminal.backend().buffer()[(x, y)];
-                    row.push_str(cell.symbol());
-                    x += cell.cell_width().max(1);
-                    assert!(x <= end, "grapheme extends past the inspector body");
-                }
-                rows.insert(usize::from(offset) + index, row);
-            }
-            picker.handle_key(KeyEvent::from(KeyCode::Down));
-            if picker
-                .suggestion_inspector
-                .as_ref()
-                .unwrap()
-                .scroll
-                .offset()
-                == offset
-            {
-                break;
-            }
-        }
-        compact(&rows.into_values().collect::<String>())
     }
 
     fn read_details(picker: &mut PermissionsPicker, width: u16, height: u16) -> String {
@@ -2992,17 +2865,15 @@ mod tests {
     ) {
         let mut picker = PermissionsPicker::new();
         picker.open(Vec::new(), &[], &[], false, false);
-        let label = state.label();
         picker.set_discovery(state);
         picker.show_discovery();
         let details = read_details(&mut picker, NARROW_WIDTH, SHORT_HEIGHT);
         for text in [
-            label,
             expected,
             DISCOVERY_MINIMUM,
-            DISCOVERY_WARNING,
             DISCOVERY_EMPTY,
-            SUGGESTED_GUIDANCE,
+            DISCOVERY_UNVERIFIED,
+            DISCOVERY_CLOSING,
         ] {
             assert!(
                 details.contains(&compact(text)),
@@ -3052,53 +2923,35 @@ mod tests {
             PermissionsPickerAction::CancelDiscovery
         ));
         assert!(!picker.has_pending_confirmation());
-        assert!(picker.suggestion_inspector.is_none());
     }
 
-    #[test_case(ObservationProvenance::Native, Some(InvocationOutcome::Requested), NATIVE_ORIGIN, REQUESTED_OUTCOMES; "native_requests")]
-    #[test_case(ObservationProvenance::Imported, Some(InvocationOutcome::Unknown), IMPORTED_ORIGIN, UNKNOWN_OUTCOMES; "imported_history")]
-    #[test_case(ObservationProvenance::Imported, None, IMPORTED_ORIGIN, UNRECORDED_OUTCOMES; "imported_history_without_outcome_records")]
-    fn suggestions_show_evidence_trust_and_execution_outcomes(
+    #[test_case(ObservationProvenance::Native, SUGGESTED_STATUS, SUGGESTED_SEEN; "native_history")]
+    #[test_case(ObservationProvenance::Imported, IMPORTED_STATUS, IMPORTED_SEEN; "imported_history")]
+    fn suggestions_say_where_they_were_seen(
         provenance: ObservationProvenance,
-        outcome: Option<InvocationOutcome>,
-        origin: &str,
-        outcomes: &str,
+        status: &str,
+        seen: &str,
     ) {
         let mut candidate = suggestion();
-        candidate.evidence.provenance = provenance.clone();
-        candidate.evidence.outcomes = outcome.into_iter().map(|outcome| (outcome, 4)).collect();
+        candidate.evidence.provenance = provenance;
         let mut picker = suggested_picker();
         picker.set_suggestions(Path::new(ROOT), SUGGESTION_REVISION, &[candidate]);
-        assert!(
+        assert_eq!(
             picker
                 .picker
                 .selected_item()
-                .and_then(|entry| entry.evidence.as_deref())
-                .unwrap()
-                .contains(origin)
+                .and_then(|entry| entry.status.as_deref()),
+            Some(status)
         );
         picker.handle_key(KeyEvent::from(KeyCode::Enter));
-        let text = read_suggestion(&mut picker, NARROW_WIDTH, SHORT_HEIGHT);
-        for expected in [origin, outcomes, SUGGESTED_OBSERVATIONS, SUGGESTED_SESSIONS] {
-            assert!(text.contains(&compact(expected)), "missing {expected}");
-        }
-        for historical in [
-            HISTORICAL_CONTEXT,
-            HISTORICAL_ASSUMPTIONS,
-            HISTORICAL_PROJECT,
-        ] {
-            assert_eq!(
-                text.contains(&compact(historical)),
-                provenance == ObservationProvenance::Imported,
-                "{historical}",
-            );
-        }
+        let text = read_details(&mut picker, NARROW_WIDTH, SHORT_HEIGHT);
+        assert!(text.contains(&compact(seen)), "missing {seen}: {text}");
     }
 
     #[test_case(24, "value-"; "narrow_ascii")]
     #[test_case(NARROW_WIDTH, "界é/"; "narrow_unicode")]
     #[test_case(25, "界e\u{301}/"; "narrow_combining_graphemes")]
-    fn suggested_inspection_wraps_complete_long_templates_and_values(width: u16, word: &str) {
+    fn suggestion_pane_wraps_complete_long_templates_and_values(width: u16, word: &str) {
         let mut candidate = suggestion();
         let operation = format!("check-{}end-operation", "part-".repeat(LONG_WORD_REPEATS));
         let value = format!("{}end-value", word.repeat(LONG_WORD_REPEATS));
@@ -3122,155 +2975,151 @@ mod tests {
         let mut picker = suggested_picker();
         picker.set_suggestions(Path::new(ROOT), SUGGESTION_REVISION, &[candidate]);
         picker.handle_key(KeyEvent::from(KeyCode::Enter));
-        let expected = compact(
-            picker
-                .picker
-                .selected_item()
-                .and_then(|entry| entry.evidence.as_deref())
-                .unwrap(),
-        );
-        let text = read_suggestion(&mut picker, width, SHORT_HEIGHT);
-        assert!(
-            text.contains(&expected),
-            "incomplete inspector text: {text}"
-        );
-        assert!(text.contains(&format!("Commandtemplate:cargo{operation}<pattern1>")));
-        assert_eq!(text.matches(&value).count(), 2);
-        for hidden in [OMITTED, "path_binding", "ObservedTuples", &fingerprint] {
+        let text = read_details(&mut picker, width, SHORT_HEIGHT);
+        let template = format!("cargo {operation} <package>");
+        for expected in [template.as_str(), value.as_str()] {
+            assert!(
+                text.contains(&compact(expected)),
+                "missing {expected}: {text}"
+            );
+        }
+        for hidden in [OMITTED, "ObservedTuples", &fingerprint] {
             assert!(!text.contains(&compact(hidden)), "unexpected {hidden}");
         }
-        assert!(
-            picker
-                .suggestion_inspector
-                .as_ref()
-                .unwrap()
-                .scroll
-                .offset()
-                > 0
-        );
+        assert!(picker.detail.scroll.offset() > 0);
         assert!(!picker.has_pending_confirmation());
     }
 
-    #[test_case(KeyEvent::from(KeyCode::Esc); "escape_returns_to_list")]
-    #[test_case(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL); "control_c_returns_to_list")]
-    fn suggested_inspection_pages_and_mouse_scroll_without_editing_or_approving(close: KeyEvent) {
+    #[test_case(false, KeyEvent::new(KeyCode::Char('i'), KeyModifiers::CONTROL); "control_i_in_the_list")]
+    #[test_case(true, KeyEvent::new(KeyCode::Char('i'), KeyModifiers::CONTROL); "control_i_in_the_pane")]
+    #[test_case(true, KeyEvent::from(KeyCode::Enter); "enter_in_the_pane")]
+    fn suggestion_keys_open_nothing_over_the_pane(pane: bool, key: KeyEvent) {
         let mut picker = suggested_picker();
-        picker.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::CONTROL));
-        let mut terminal = Terminal::new(TestBackend::new(NARROW_WIDTH, SHORT_HEIGHT)).unwrap();
-        terminal
-            .draw(|frame| {
-                picker.view(frame, frame.area());
-            })
-            .unwrap();
-        picker.handle_key(KeyEvent::from(KeyCode::PageDown));
-        let inspector = picker.suggestion_inspector.as_ref().unwrap();
-        let offset = inspector.scroll.offset();
-        let popup = inspector.popup;
-        assert!(offset > 0);
-        picker.handle_mouse(MouseEvent {
-            kind: MouseEventKind::ScrollUp,
-            column: popup.x + 1,
-            row: popup.y + 1,
-            modifiers: KeyModifiers::NONE,
-        });
-        assert_eq!(
-            picker
-                .suggestion_inspector
-                .as_ref()
-                .unwrap()
-                .scroll
-                .offset(),
-            offset - 1
-        );
-        assert!(picker.handle_paste(COMMAND));
-        for key in [KeyCode::Char('y'), KeyCode::Enter] {
-            assert!(matches!(
-                picker.handle_key(KeyEvent::from(key)),
-                PermissionsPickerAction::Consumed
-            ));
+        if pane {
+            picker.handle_key(KeyEvent::from(KeyCode::Enter));
         }
-        assert!(picker.suggestion_inspector.is_some());
-        assert!(!picker.has_pending_confirmation());
-        picker.handle_key(close);
-        picker.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::CONTROL));
+        let before = buffer_text(&export_buffer(&mut picker, WIDE_WIDTH, MANAGER_TEST_HEIGHT));
+        assert!(matches!(
+            picker.handle_key(key),
+            PermissionsPickerAction::Consumed
+        ));
         assert_eq!(
-            picker
-                .suggestion_inspector
-                .as_ref()
-                .unwrap()
-                .scroll
-                .offset(),
-            0
+            buffer_text(&export_buffer(&mut picker, WIDE_WIDTH, MANAGER_TEST_HEIGHT)),
+            before
         );
+        assert_eq!(picker.detail_focused, pane);
+        assert!(!picker.has_pending_confirmation());
     }
 
     #[test]
-    fn suggestions_are_separate_read_only_human_templates() {
+    fn suggestions_read_as_templates_with_what_they_cover() {
         let mut picker = suggested_picker();
-        let mut terminal = Terminal::new(TestBackend::new(150, 36)).unwrap();
-        terminal
-            .draw(|frame| {
-                picker.view(frame, frame.area());
+        let rows = buffer_rows(&export_buffer(&mut picker, WIDE_WIDTH, MANAGER_TEST_HEIGHT));
+        let screen = rows.join("\n");
+        assert!(screen.contains(SUGGESTED_SECTION), "{screen}");
+        assert!(
+            rows.iter()
+                .any(|row| row.contains(SUGGESTED_COMMAND) && row.contains(SUGGESTED_STATUS)),
+            "missing {SUGGESTED_COMMAND} · {SUGGESTED_STATUS}:\n{screen}"
+        );
+        let count_columns: Vec<_> = SUGGESTED_COVERED
+            .iter()
+            .map(|command| {
+                rows.iter()
+                    .find_map(|row| {
+                        row.find(command)?;
+                        row.rfind(SUGGESTED_COUNT).map(|at| row[..at].width())
+                    })
+                    .unwrap_or_else(|| panic!("missing {command}:\n{screen}"))
             })
-            .unwrap();
-        let list = compact(&buffer_text(terminal.backend().buffer()));
-        for text in [SUGGESTED_SECTION, SUGGESTED_ROW] {
-            assert!(list.contains(&compact(text)), "missing {text}: {list}");
-        }
+            .collect();
+        assert!(
+            count_columns.windows(2).all(|pair| pair[0] == pair[1]),
+            "{count_columns:?}"
+        );
         assert!(matches!(
             picker.handle_key(KeyEvent::from(KeyCode::Enter)),
             PermissionsPickerAction::Consumed
         ));
-        let summary = read_details(&mut picker, 150, 36);
+        let pane = read_details(&mut picker, WIDE_WIDTH, MANAGER_TEST_HEIGHT);
         for text in [
             SUGGESTED_COMMAND,
-            SUGGESTED_SLOT_SUMMARY,
-            SUGGESTED_COMBINATIONS,
-            NATIVE_SOURCE,
-            SUGGESTED_GUIDANCE,
-        ] {
-            assert!(
-                summary.contains(&compact(text)),
-                "missing {text}: {summary}"
-            );
+            SUGGESTED_VALUES_LINE,
+            COVERS,
+            STILL_ASKS,
+            OTHER_VALUES,
+            SUGGESTED_SEEN,
+            NOT_ACTIVE,
+        ]
+        .into_iter()
+        .chain(SUGGESTED_COVERED)
+        .chain(ALWAYS_ASKS)
+        {
+            assert!(pane.contains(&compact(text)), "missing {text}: {pane}");
         }
-        let evidence = read_suggestion(&mut picker, 150, 36);
-        for text in [
-            SUGGESTED_OBSERVATIONS,
-            SUGGESTED_SESSIONS,
-            SUGGESTED_EXAMPLE,
-            SUGGESTED_GUIDANCE,
-        ] {
+        for hidden in HIDDEN_CONTEXT
+            .into_iter()
+            .chain([NUMBERED_SLOT, CONFIRM_REVOKE])
+        {
             assert!(
-                evidence.contains(&compact(text)),
-                "missing {text}: {evidence}"
+                !pane.contains(&compact(hidden)),
+                "unexpected {hidden}: {pane}"
             );
-        }
-        for screen in [&summary, &evidence] {
-            assert!(!screen.contains("path_binding"));
-            assert!(!screen.contains(&compact(CONFIRM_REVOKE)));
         }
         assert!(picker.pending_revoke.is_none());
-        assert!(matches!(
-            picker.handle_key(KeyEvent::from(KeyCode::Enter)),
-            PermissionsPickerAction::Consumed
-        ));
-        assert!(picker.suggestion_inspector.is_some());
-        assert!(matches!(
-            picker.handle_key(KeyEvent::from(KeyCode::Esc)),
-            PermissionsPickerAction::Consumed
-        ));
-        assert!(picker.suggestion_inspector.is_none());
         assert!(picker.is_open());
+    }
+
+    #[test]
+    fn the_discover_screen_says_not_active_once() {
+        let mut picker = suggested_picker();
+        picker.handle_key(KeyEvent::from(KeyCode::Enter));
+        let screen = buffer_text(&export_buffer(&mut picker, WIDE_WIDTH, MANAGER_TEST_HEIGHT))
+            .to_lowercase();
+        assert_eq!(screen.matches(NOT_ACTIVE_WORDS).count(), 1, "{screen}");
+    }
+
+    #[test]
+    fn scan_overview_reads_as_sentences_with_readable_sizes() {
+        let mut picker = export_picker("discovery-overview");
+        picker.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        let overview = read_details(&mut picker, WIDE_WIDTH, MANAGER_TEST_HEIGHT);
+        for sentence in OVERVIEW_SENTENCES {
+            assert!(
+                overview.contains(&compact(sentence)),
+                "missing {sentence}: {overview}"
+            );
+        }
+        for raw in RAW_BYTE_COUNTS {
+            assert!(!overview.contains(raw), "raw byte count {raw}: {overview}");
+        }
+    }
+
+    #[test_case(PermissionsMode::Rules, STORED_SECTION; "rules")]
+    #[test_case(PermissionsMode::Discover, SUGGESTED_SECTION; "discover")]
+    fn lists_fill_their_column_from_the_top(mode: PermissionsMode, section: &str) {
+        let mut picker = suggested_picker();
+        picker.set_mode(mode);
+        let rows = buffer_rows(&export_buffer(&mut picker, WIDE_WIDTH, MANAGER_TEST_HEIGHT));
+        let pane = picker.detail.popup;
+        let column = picker.popup.x + 1;
+        for row in [pane.y, pane.bottom() - 1] {
+            assert!(
+                picker.picker.contains(Position::new(column, row)),
+                "the list stops short of row {row}"
+            );
+        }
+        let first = &rows[usize::from(pane.y) + 1];
+        assert!(first.contains(section), "{first:?}");
     }
 
     #[test_case('d', false; "dismiss_from_list")]
     #[test_case('s', false; "snooze_from_list")]
-    #[test_case('d', true; "dismiss_from_inspector")]
-    #[test_case('s', true; "snooze_from_inspector")]
-    fn suggestion_actions_are_explicit_and_bound_to_the_definition(key: char, inspect: bool) {
+    #[test_case('d', true; "dismiss_from_pane")]
+    #[test_case('s', true; "snooze_from_pane")]
+    fn suggestion_actions_are_explicit_and_bound_to_the_definition(key: char, pane: bool) {
         let mut picker = suggested_picker();
-        if inspect {
+        if pane {
             picker.handle_key(KeyEvent::from(KeyCode::Enter));
         }
         let action = picker.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::CONTROL));
@@ -3289,25 +3138,39 @@ mod tests {
     }
 
     #[test]
-    fn untrusted_suggestion_labels_are_escaped_bounded_and_never_actions() {
+    fn untrusted_suggestion_text_is_escaped_hidden_and_never_actions() {
         let mut candidate = suggestion();
-        candidate.definition.name = "Trust project config \u{202e} Enter to grant".into();
-        candidate.evidence.sources = [format!(
-            "\x1b[31mRevoke\ny approve {}",
-            "x".repeat(MAX_SUGGESTION_DETAIL_CHARS)
-        )]
-        .into();
+        let slot = candidate.definition.slots[0].id;
+        candidate.definition.name = UNTRUSTED_NAME.into();
+        candidate.evidence.sources = [UNTRUSTED_SOURCE.into()].into();
+        candidate.definition.slots[0].domain = ArgumentDomain::ObservedSet {
+            values: [UNTRUSTED_VALUE.into()].into(),
+        };
+        let tuple = BTreeMap::from([(slot, UNTRUSTED_VALUE.to_owned())]);
+        candidate.definition.combinations = SlotCombinations::ObservedTuples {
+            tuples: [tuple.clone()].into(),
+        };
+        candidate.evidence.tuples = vec![TupleSupport {
+            values: tuple,
+            support: candidate.evidence.support.clone(),
+        }];
         let rendered = suggestion_entry(Path::new(ROOT), SUGGESTION_REVISION, &candidate).unwrap();
-        assert_eq!(rendered.label, SUGGESTED_ROW);
+        assert_eq!(rendered.label, SUGGESTED_COMMAND);
         assert_eq!(rendered.section(), Some(SUGGESTED_SECTION));
-        let description = rendered.evidence.as_ref().unwrap();
-        assert!(description.contains("Source (untrusted label):"));
-        assert!(description.contains("\\u{202e}"));
-        assert!(description.contains("\\u{1b}"));
-        assert!(!description.contains('\x1b'));
-        assert!(!description.contains('\u{202e}'));
-        assert!(description.contains(OMITTED));
-        assert!(description.chars().count() <= MAX_SUGGESTION_DETAIL_CHARS + OMITTED.len());
+        let pane = summary_rows(&rendered).join("\n");
+        for escaped in ESCAPED_CONTROLS {
+            assert!(pane.contains(escaped), "missing {escaped}: {pane}");
+        }
+        assert!(
+            !pane
+                .chars()
+                .any(|character| character != '\n' && character.is_control()),
+            "{pane}"
+        );
+        assert!(!pane.contains(BIDI_OVERRIDE), "{pane}");
+        for hidden in UNTRUSTED_WORDS {
+            assert!(!pane.contains(hidden), "unexpected {hidden}: {pane}");
+        }
         let mut picker = suggested_picker();
         picker.set_suggestions(Path::new(ROOT), SUGGESTION_REVISION, &[candidate]);
         assert!(matches!(
@@ -3324,9 +3187,9 @@ mod tests {
         assert!(!picker.has_pending_confirmation());
     }
 
-    #[test_case(false; "proposal_removed")]
+    #[test_case(false; "suggestion_removed")]
     #[test_case(true; "context_changed")]
-    fn proposal_refresh_clears_stale_inspection_without_revoking_rules(context_changed: bool) {
+    fn suggestion_refresh_never_revokes_rules(context_changed: bool) {
         let mut picker = suggested_picker();
         let rule_id = picker.entries[0].id.clone();
         picker.handle_key(KeyEvent::from(KeyCode::Enter));
@@ -3336,7 +3199,6 @@ mod tests {
             Vec::new()
         };
         picker.set_suggestions(Path::new(ROOT), SUGGESTION_REVISION + 1, &candidates);
-        assert!(picker.suggestion_inspector.is_none());
         assert!(!picker.has_pending_confirmation());
         assert_eq!(picker.entries[0].id, rule_id);
         if !context_changed {
@@ -3454,8 +3316,8 @@ mod tests {
     }
 
     /// Every manager screen a person reads: each row with and without its
-    /// detail, the revoke and trust confirmations, and a proposal with its
-    /// evidence.
+    /// detail, the revoke and trust confirmations, a suggestion with its pane,
+    /// and the scan overview.
     fn manager_surfaces(width: u16) -> Vec<(&'static str, Vec<String>)> {
         let mut surfaces = Vec::new();
         let mut capture = |surface, picker: &mut PermissionsPicker| {
@@ -3480,11 +3342,12 @@ mod tests {
         trust.handle_key(KeyEvent::from(KeyCode::Enter));
         capture("trust", &mut trust);
         let mut discover = suggested_picker();
-        capture("proposal", &mut discover);
+        capture("suggestion", &mut discover);
         discover.handle_key(KeyEvent::from(KeyCode::Enter));
-        capture("proposal detail", &mut discover);
-        discover.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::CONTROL));
-        capture("evidence", &mut discover);
+        capture("suggestion pane", &mut discover);
+        let mut overview = export_picker("discovery-overview");
+        overview.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        capture("overview", &mut overview);
         surfaces
     }
 

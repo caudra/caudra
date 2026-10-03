@@ -1000,6 +1000,7 @@ mod tests {
                 raw_input: None,
                 output: Some(ToolOutput::Plain("child body".into())),
                 annotation: None,
+                refused: false,
             }],
             text: (0..400)
                 .map(|line| format!("{line}: <p align=\"center\">"))

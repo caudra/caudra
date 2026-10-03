@@ -1272,6 +1272,7 @@ mod tests {
             })),
             annotation: None,
             model_suffix: None,
+            refused: false,
         };
         let earlier = entry(EARLIER_PLAN);
         let later = entry(REWRITTEN_PLAN);

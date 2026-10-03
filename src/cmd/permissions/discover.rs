@@ -12,6 +12,7 @@ use caudra_agent::permissions::pattern_recognition::{
     MAX_RECOGNIZER_SUGGESTIONS, MAX_TIMESTAMP_MS, ObservationProvenance, ObserveOutcome,
     PatternCandidate, PatternRecognizer, RecognitionExclusion, RecognitionStats, RecognizerLimits,
 };
+use caudra_agent::permissions::review::slot_label;
 use caudra_agent::tools::native::batch::MAX_BATCH_SIZE;
 use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
@@ -47,10 +48,13 @@ const MAX_TIMESTAMP_BYTES: usize = 64;
 const MAX_CALL_ID_BYTES: usize = 256;
 const MAX_DISPLAY_BYTES: usize = 240;
 const NANOS_PER_MILLISECOND: i128 = 1_000_000;
+const TOOL_RESULT_RECORD: &str = "tool_result";
+const REFUSED_CALLS_FIELD: &str = "refused_calls";
 const INVALID_PROJECT: &str = "discovery requires a bounded absolute UTF-8 project path without parent components or control characters";
 const INVALID_SINCE: &str =
     "--since must be an RFC3339 timestamp between the Unix epoch and year 9999";
 pub(crate) const RECOGNIZER_CAPACITY: &str = "Recognizer capacity exclusions";
+const REFUSED_CALLS_SKIPPED: &str = "Calls refused before they ran, skipped";
 pub(crate) const RECOGNIZER_ORDER_BIAS: &str = "Recognizer admission is first-come and capacity-bounded; changing input order can change retained evidence and proposals.";
 const ASSUMPTIONS: &[&str] = &[
     "Imported proposals only: historical execution context is NOT verified; outcomes are unknown.",
@@ -136,7 +140,12 @@ pub enum DiscoveryExclusion {
     InvalidWorkdir,
     CommandSize,
     UnsupportedOrSensitiveAnalysis,
+    RefusedCall,
 }
+
+/// A call as its stored result names it: the session, the subagent stream,
+/// and the call ID.
+type CallKey = (CaudraId, Option<String>, String);
 
 #[derive(Debug, Default, Serialize)]
 pub struct DiscoveryStats {
@@ -345,6 +354,7 @@ fn discover_with_budget(
     };
     let stop_sampling = || should_stop(DiscoveryPhase::Sampling);
     let mut records = BTreeMap::<_, SeenRecord>::new();
+    let mut refusals = BTreeMap::new();
     let mut retained_count = 0;
     let mut retained_bytes = 0;
     if !stop_sampling() {
@@ -357,6 +367,9 @@ fn discover_with_budget(
                     &mut report.sample,
                     stop_sampling,
                     |record| {
+                        if let Some((call, positions)) = refused_calls(&record) {
+                            refusals.insert(call, positions);
+                        }
                         let fingerprint = canonical_json_sha256(record.payload);
                         let key = *record.history_id.as_bytes();
                         if let Some(previous) = records.get_mut(&key) {
@@ -389,6 +402,7 @@ fn discover_with_budget(
                                 &report.limits,
                                 &mut report.processing,
                                 &stop_sampling,
+                                &refusals,
                                 &mut |mut observation, call_index, command_index| {
                                     observation.source.source_identity =
                                         report.source_identity.clone();
@@ -536,6 +550,7 @@ fn analyze_record(
     limits: &DiscoveryLimits,
     stats: &mut DiscoveryStats,
     should_stop: &impl Fn() -> bool,
+    refusals: &BTreeMap<CallKey, Vec<usize>>,
     observe: &mut impl FnMut(CommandObservation, usize, usize) -> bool,
 ) {
     if record.payload.get("type").and_then(Value::as_str) != Some("tool_call") {
@@ -546,21 +561,17 @@ fn analyze_record(
         stats.exclude(DiscoveryExclusion::MalformedCall);
         return;
     };
-    if record
-        .payload
-        .get("call_id")
-        .and_then(Value::as_str)
-        .is_none_or(|id| {
-            id.is_empty() || id.len() > MAX_CALL_ID_BYTES || id.chars().any(char::is_control)
-        })
-    {
+    let Some(call_id) = stored_call_id(record.payload) else {
         stats.exclude(DiscoveryExclusion::MalformedCall);
         return;
-    }
+    };
     let Some(input) = record.payload.get("input").and_then(Value::as_object) else {
         stats.exclude(DiscoveryExclusion::MalformedCall);
         return;
     };
+    let refused = refusals
+        .get(&call_key(record, call_id))
+        .map_or(&[][..], Vec::as_slice);
     if native_name(name) == "batch" {
         let Some(calls) = input
             .get("tool_calls")
@@ -579,6 +590,10 @@ fn analyze_record(
                 return;
             }
             stats.calls += 1;
+            if refused.contains(&index) {
+                stats.exclude(DiscoveryExclusion::RefusedCall);
+                continue;
+            }
             let Some((name, input)) = batch_call(entry) else {
                 stats.exclude(DiscoveryExclusion::MalformedCall);
                 continue;
@@ -602,6 +617,10 @@ fn analyze_record(
             return;
         }
         stats.calls += 1;
+        if refused.contains(&0) {
+            stats.exclude(DiscoveryExclusion::RefusedCall);
+            return;
+        }
         analyze_call(
             name,
             input,
@@ -612,6 +631,40 @@ fn analyze_record(
             &mut |observation, command| observe(observation, 0, command),
         );
     }
+}
+
+fn stored_call_id(payload: &Value) -> Option<&str> {
+    payload.get("call_id").and_then(Value::as_str).filter(|id| {
+        !id.is_empty() && id.len() <= MAX_CALL_ID_BYTES && !id.chars().any(char::is_control)
+    })
+}
+
+fn call_key(record: &HistoryRecord<'_>, call_id: &str) -> CallKey {
+    (
+        record.session_id,
+        record.subagent_id.map(str::to_owned),
+        call_id.to_owned(),
+    )
+}
+
+/// The calls a stored result says were refused before they ran. Storage
+/// visits a stream newest first, so a call's result arrives before the call.
+fn refused_calls(record: &HistoryRecord<'_>) -> Option<(CallKey, Vec<usize>)> {
+    if record.payload.get("type").and_then(Value::as_str) != Some(TOOL_RESULT_RECORD) {
+        return None;
+    }
+    let call_id = stored_call_id(record.payload)?;
+    let positions: Vec<usize> = record
+        .payload
+        .get(REFUSED_CALLS_FIELD)?
+        .as_array()?
+        .iter()
+        .take(MAX_BATCH_SIZE)
+        .filter_map(Value::as_u64)
+        .filter_map(|position| usize::try_from(position).ok())
+        .filter(|position| *position < MAX_BATCH_SIZE)
+        .collect();
+    (!positions.is_empty()).then(|| (call_key(record, call_id), positions))
 }
 
 fn native_name(name: &str) -> &str {
@@ -815,6 +868,16 @@ fn render_human(report: &DiscoveryReport) -> String {
     );
     let _ = writeln!(
         output,
+        "{REFUSED_CALLS_SKIPPED}: {}. Results saved before refusals were recorded count as run.",
+        report
+            .processing
+            .exclusions
+            .get(&DiscoveryExclusion::RefusedCall)
+            .copied()
+            .unwrap_or_default()
+    );
+    let _ = writeln!(
+        output,
         "Per-parent row cap: {}; {} sessions cut short. Local parent rows (newest first): {:?}.",
         report.limits.max_rows_per_session,
         report.sample.session_row_cutoffs,
@@ -865,15 +928,7 @@ fn render_human(report: &DiscoveryReport) -> String {
                 PatternToken::Exact { value, .. } => {
                     serde_json::to_string(value).unwrap_or_default()
                 }
-                PatternToken::Slot { id, .. } => format!(
-                    "<pattern{}>",
-                    definition
-                        .slots
-                        .iter()
-                        .position(|slot| slot.id == *id)
-                        .unwrap_or_default()
-                        + 1
-                ),
+                PatternToken::Slot { id, .. } => slot_label(definition, *id),
             };
             if shape.len() + atom.len() > MAX_DISPLAY_BYTES {
                 shape.push_str(" [display clipped]");
@@ -893,12 +948,12 @@ fn render_human(report: &DiscoveryReport) -> String {
             SlotCombinations::Independent => "exact argv; no variable slots".into(),
         };
         let _ = writeln!(output, "   Constraint mode: {combinations}.");
-        for (index, slot) in definition.slots.iter().enumerate() {
+        for slot in &definition.slots {
             if let ArgumentDomain::ObservedSet { values } = &slot.domain {
                 let _ = writeln!(
                     output,
-                    "   <pattern{}>: observed set ({} literal values); option-like arguments rejected.",
-                    index + 1,
+                    "   {}: observed set ({} literal values); option-like arguments rejected.",
+                    slot_label(definition, slot.id),
                     values.len()
                 );
             }
@@ -968,9 +1023,9 @@ mod tests {
         AnalyzedObservation, DiscoveryExclusion, DiscoveryLimits, DiscoveryPhase, DiscoveryReport,
         HistoryEvidence, INVALID_PROJECT, INVALID_SINCE, MAX_COMMAND_BYTES, MAX_ELAPSED_MS,
         MAX_RECOGNIZER_SUGGESTIONS, MAX_ROWS_PER_SESSION, MAX_TIMESTAMP_MS, RECOGNIZER_CAPACITY,
-        RECOGNIZER_ORDER_BIAS, SAMPLING_BUDGET_DIVISOR, discover_for_project,
-        discover_for_project_cancellable, discover_with_budget, parse_since, render_human,
-        report_candidates, standard_bash_assumptions,
+        RECOGNIZER_ORDER_BIAS, REFUSED_CALLS_SKIPPED, SAMPLING_BUDGET_DIVISOR,
+        discover_for_project, discover_for_project_cancellable, discover_with_budget, parse_since,
+        render_human, report_candidates, standard_bash_assumptions,
     };
 
     const PROJECT: &str = "/nonexistent/historical-discovery-project";
@@ -984,8 +1039,11 @@ mod tests {
     const SECOND: &str = "cargo check -p beta --target right";
     const SECRET: &str = "do-not-print-this-private-input";
     const STREAM: &str = "private-subagent-label";
-    const PATTERN_ONE: &str = "<pattern1>";
-    const PATTERN_TWO: &str = "<pattern2>";
+    const PACKAGE_SLOT: &str = "<value>";
+    const TARGET_SLOT: &str = "<target>";
+    const REFUSED_COMMAND: &str = "cargo check -p gamma --target middle";
+    const REFUSAL: &str = "permission denied";
+    const RESULT_SERIAL_OFFSET: u16 = 50;
     const TUPLE_MODE: &str = "observed tuples only";
     const STATE_KEY: &str = "permission.rules";
     const SAMPLING_CHECKS: u32 = 32;
@@ -1022,6 +1080,24 @@ mod tests {
 
     fn shell(serial: u16, command: &str) -> Value {
         call(serial, "shell", json!({"command": command}))
+    }
+
+    fn result(serial: u16, refused: &[usize]) -> Value {
+        let id = id(serial + RESULT_SERIAL_OFFSET, TIME_MS);
+        let mut record = json!({ "id": id, "group_id": id, "type": "tool_result", "call_id": format!("call-{serial}"), "content": REFUSAL, "is_error": true });
+        if !refused.is_empty() {
+            record["refused_calls"] = json!(refused);
+        }
+        record
+    }
+
+    fn refused_calls_skipped(report: &DiscoveryReport) -> usize {
+        report
+            .processing
+            .exclusions
+            .get(&DiscoveryExclusion::RefusedCall)
+            .copied()
+            .unwrap_or_default()
     }
 
     fn fixture() -> (TempDir, StateDir, SessionDatabase) {
@@ -1479,8 +1555,8 @@ mod tests {
         assert!(exported.contains("beta"));
         assert!(!exported.contains(STREAM));
         let human = render_human(&report);
-        assert!(human.contains(PATTERN_ONE));
-        assert!(human.contains(PATTERN_TWO));
+        assert!(human.contains(PACKAGE_SLOT));
+        assert!(human.contains(TARGET_SLOT));
         assert!(human.contains(TUPLE_MODE));
         assert!(!human.contains(FIRST));
         assert_eq!(
@@ -1524,6 +1600,89 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test_case(&[0], 1, 0; "a_refused_call_is_skipped")]
+    #[test_case(&[], 0, 1; "a_result_saved_before_refusals_were_recorded_counts_its_call")]
+    fn refused_calls_teach_nothing(refused: &[usize], skipped: usize, candidates: usize) {
+        let (_temp, state, mut database) = fixture();
+        save(
+            &mut database,
+            1,
+            PROJECT,
+            vec![shell(11, FIRST), result(11, &[])],
+            vec![],
+        );
+        save(
+            &mut database,
+            2,
+            PROJECT,
+            vec![shell(12, SECOND), result(12, refused)],
+            vec![],
+        );
+        let report = discover_for_project(&state, Path::new(PROJECT), limits()).unwrap();
+        assert_eq!(refused_calls_skipped(&report), skipped);
+        assert_eq!(report.candidates.len(), candidates, "{report:?}");
+        assert!(render_human(&report).contains(&format!("{REFUSED_CALLS_SKIPPED}: {skipped}.")));
+        assert_eq!(
+            serde_json::to_value(&report).unwrap()["processing"]["exclusions"]["refused_call"]
+                .as_u64(),
+            (skipped > 0).then_some(1)
+        );
+    }
+
+    #[test_case(false; "main_history")]
+    #[test_case(true; "subagent_history")]
+    fn a_refused_batch_entry_is_skipped_while_its_siblings_count(subagent: bool) {
+        let (_temp, state, mut database) = fixture();
+        save(&mut database, 1, PROJECT, vec![shell(11, FIRST)], vec![]);
+        let batch = call(
+            12,
+            "batch",
+            json!({"tool_calls": [
+                {"tool": "shell", "command": REFUSED_COMMAND},
+                {"tool": "shell", "command": SECOND},
+            ]}),
+        );
+        let records = vec![batch, result(12, &[0])];
+        let (main, sub) = if subagent {
+            (vec![], records)
+        } else {
+            (records, vec![])
+        };
+        save(&mut database, 2, PROJECT, main, sub);
+        let report = discover_for_project(&state, Path::new(PROJECT), limits()).unwrap();
+        assert_eq!(refused_calls_skipped(&report), 1);
+        assert_eq!(report.candidates.len(), 1, "{report:?}");
+        assert_eq!(report.candidates[0].evidence.support.observations, 2);
+    }
+
+    #[test_case(true; "another_session")]
+    #[test_case(false; "another_stream_of_the_session")]
+    fn a_refusal_names_only_the_call_in_its_own_stream(other_session: bool) {
+        let (_temp, state, mut database) = fixture();
+        if other_session {
+            save(&mut database, 1, PROJECT, vec![shell(11, FIRST)], vec![]);
+            save(
+                &mut database,
+                2,
+                PROJECT,
+                vec![result(11, &[0]), shell(12, SECOND)],
+                vec![],
+            );
+        } else {
+            save(
+                &mut database,
+                1,
+                PROJECT,
+                vec![result(11, &[0])],
+                vec![shell(11, FIRST)],
+            );
+            save(&mut database, 2, PROJECT, vec![shell(12, SECOND)], vec![]);
+        }
+        let report = discover_for_project(&state, Path::new(PROJECT), limits()).unwrap();
+        assert_eq!(refused_calls_skipped(&report), 0);
+        assert_eq!(report.candidates.len(), 1, "{report:?}");
     }
 
     #[test_case(false; "copied_history_does_not_create_independent_support")]

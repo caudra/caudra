@@ -86,7 +86,9 @@ A prompt asks one question, such as `Allow shell command?` or `Allow fetching a 
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
-The phrase between `‹` and `›` is the scope a remembered answer covers. A command offers `this exact command`, any suggested templates such as `cargo check -p <pattern1>`, and its token prefixes from the longest to the shortest, such as `cargo test -p caudra-agent *`, `cargo test *`, and `cargo *`. It starts on a suggested template, else on the [derived prefix](#shell-parsing), else on the exact command. A web page starts on `this page and below`, and a file read on `this file`. `Left` broadens the scope and `Right` narrows it before you answer, and the answers change with it. Blanket grants such as `any shell command` are offered only in [Customize](#customize).
+The phrase between `‹` and `›` is the scope a remembered answer covers. A command offers `this exact command`, any suggested templates such as `cargo check -p <value>`, and its token prefixes from the longest to the shortest, such as `cargo test -p caudra-agent *`, `cargo test *`, and `cargo *`. It starts on a suggested template, else on the [derived prefix](#shell-parsing), else on the exact command. A web page starts on `this page and below`, and a file read on `this file`. `Left` broadens the scope and `Right` narrows it before you answer, and the answers change with it. Blanket grants such as `any shell command` are offered only in [Customize](#customize).
+
+A scope that is a template [learned from earlier commands](#suggested-patterns) adds a muted line under the answers that remember it, such as `Learned from 4 similar commands. <value> is caudra-agent or caudra-ui.` The count includes the command being asked about. In a batch the line describes the focused command, and it disappears when `Left` or `Right` moves the scope off the template.
 
 Warnings appear above the answers as `⚠` lines. They name a protected path, a line Caudra cannot check command by command, the reach of the selected scope, or a [decision engine](#decision-engine-advice) caution such as `⚠ May delete files (88%)`. A muted line explains an unusual reason for asking, such as `Plan mode asks before anything it can't prove read-only.` or a line starting with `Auto asked:`. Details gives the usual reason.
 
@@ -154,7 +156,7 @@ When policy changes, each pending request rechecks its own current policy and re
 |---|---|
 | Effect | Allow, or Deny to refuse the request once, for this project, or for all projects |
 | Remember | Once, This conversation, This project, or All projects, limited to the lifetimes the chosen scope allows |
-| Scope | The ladder from the main view, then `your own pattern…` and the blanket grants. A suggested template is marked `suggested`, and a scope that needs [confirmation](#confirming-broad-grants) is marked `⚠ broad` |
+| Scope | The ladder from the main view, then `your own pattern…` and the blanket grants. A suggested template is marked `suggested` with how often it was seen, and while highlighted it adds a line saying what each slot stands for. A scope that needs [confirmation](#confirming-broad-grants) is marked `⚠ broad` |
 
 Opened from the step-through's Review, Customize lists scopes for the whole line: these commands exactly and the blanket grants. Under Deny it offers `this exact script`.
 
@@ -311,7 +313,7 @@ Only Review applies the draft. A policy change while the step-through is open ke
 
 ### Argument pattern inspector
 
-A suggested template such as `cargo check -p <pattern1>` can be inspected and edited before it is stored. Press `i` on it in Customize or on a step-through page. The inspector shows fixed command words, variable argument positions, working directory, evidence, and whether the current command matches. Patterns match parsed static arguments. They never interpolate captured values into command text.
+A suggested template such as `cargo check -p <value>` can be inspected and edited before it is stored. Press `i` on it in Customize or on a step-through page. The inspector shows fixed command words, variable argument positions, working directory, evidence, and whether the current command matches. Patterns match parsed static arguments. They never interpolate captured values into command text.
 
 Use `Tab` to focus controls, then arrows to select a slot or mode. The mode shortcuts are:
 
@@ -325,7 +327,9 @@ Use `Tab` to focus controls, then arrows to select a slot or mode. The mode shor
 
 `e` edits a constraint, `o` shows observed values, and `c` switches between observed tuples and independent combinations when available. `N` edits the pattern name and `n` edits a slot label. Names are display labels and do not change matching or rule identity. The executable, fixed arguments, argument count, and slot positions stay fixed.
 
-For example, `cargo check -p <pattern1>` can restrict its variable argument to the observed values `caudra-agent` and `caudra-ui`. It does not cover another executable, another subcommand, or extra arguments. Option-looking values remain rejected unless the host has proved the position is data. Choosing Any keeps that check.
+A suggested slot is named after the long flag before it, such as `<package>` after `--package`. A slot whose observed values all contain `/` is `<path>`, and any other is `<value>`. Repeated names are numbered, as in `cp <path1> <path2>`. A name is only a hint. The main view, Customize, Discover, and the Rules pane add a line stating what each slot stands for, such as `<value> is caudra-agent or caudra-ui.` It names at most four values and counts the rest.
+
+For example, `cargo check -p <value>` can restrict its variable argument to the observed values `caudra-agent` and `caudra-ui`. It does not cover another executable, another subcommand, or extra arguments. Option-looking values remain rejected unless the host has proved the position is data. Choosing Any keeps that check.
 
 Slots with an unknown role can include arguments after fixed flags. That position does not prove the argument is data or establish the flag's arity. These values can select program operations, so the inspector and approval review caution against widening them.
 
@@ -352,29 +356,30 @@ Grading is structural. It checks the shape of the pattern and that it matches th
 
 Caudra learns permission suggestions from tool use. Suggestions are never automatic grants or the default future scope. Live recognition needs at least three eligible command observations and can propose a pattern within one session. A compound request can supply several observations. Counts do not establish successful execution.
 
+Only calls that are allowed keep teaching. A call refused or cancelled before it runs is withdrawn from live recognition, and a waiting prompt loses any template it supported. Saved conversations mark each call that permissions refused, including each refused command of a batch, and history discovery skips those calls. Conversations saved by earlier versions carry no marks, so their refused calls still count.
+
 Automatic suggestions come only from eligible live observations or imported session history. A command without enough evidence has no suggested argument template. You can also [create a template from explicit command text](#command-templates) without history. The executable, workdir, and argument structure stay bound, and every template requires explicit approval.
 
 Recognition compares individual commands with fixed argument structure and observed literal values. It can handle unfamiliar CLI names without a read-only executable allowlist. Payload and sensitivity guards still exclude interpreted code, unsafe expressions, and suspicious literals. It does not learn whole command sequences or generate scripts. Basic chains and pipelines are analyzed per command only where control flow and working-directory context can be established.
 
-The local TUI loads bounded historical proposals in the background at startup, for the current tab, and after `/cd`. Loading is cached per canonical project and cancellable, and stale results are discarded. Remote and ephemeral sessions do not run history discovery. Approval and Suggested inspectors label imported history as unverified, with unknown outcomes and historical execution context. Analysis assumes standard Bash startup and uses the session's current stored cwd as an approximation. Loading these proposals does not make them verified live evidence.
+The local TUI loads bounded historical proposals in the background at startup, for the current tab, and after `/cd`. Loading is cached per canonical project and cancellable, and stale results are discarded. Remote and ephemeral sessions do not run history discovery. Discover marks imported history as unverified, and the argument pattern inspector also names its unknown outcomes and historical execution context. Analysis assumes standard Bash startup and uses the session's current stored cwd as an approximation. Loading these proposals does not make them verified live evidence.
 
 Open `/permissions discover` for the Discover tab. The Rules tab contains stored rules and policy. Discover lists only proposals, which are not active permissions. Click either tab or press `Ctrl-G` to switch. Opening Discover does not force a new scan.
 
 | Key | Discovery action |
 |---|---|
-| `Enter` | Inspect the selected proposal in the detail pane |
-| `Ctrl-I` | Open the proposal evidence inspector |
+| `Enter` | Focus the selected proposal's pane |
 | `Ctrl-E` | Create permission from the selected proposal |
 | `Ctrl-G` | Switch between Rules and Discover |
 | `Ctrl-O` | Show the discovery overview and scan diagnostics |
 | `Ctrl-R` | Scan or refresh, bypassing an older cached result. An active scan is not restarted |
 | `Ctrl-X` | Cancel the current scan request |
 
-The overview reports `Not scanned`, `Loading`, `Ready`, `Partial`, `Unavailable`, or `Cancelled`. Completed scans show sample counts and limits. `Partial` lists cutoffs and exclusions, including per-parent row limits, omitted command scopes, and source obligations. `Unavailable` gives the reason discovery cannot run. Cancellation discards late results for that request and leaves active permissions unchanged. Press `Ctrl-R` to retry.
+The overview reports `Not scanned`, `Loading`, `Ready`, `Partial`, `Unavailable`, or `Cancelled`. Completed scans say in plain sentences how many sessions, rows, and tool calls were read, with sizes such as `24.0 KiB of 4.0 MiB`, and how many suggestions were found. `Partial` lists cutoffs and exclusions, including per-parent row limits, omitted command scopes, and source obligations. `Unavailable` gives the reason discovery cannot run. Cancellation discards late results for that request and leaves active permissions unchanged. Press `Ctrl-R` to retry.
 
 Imported proposals need at least two observations from two independent parent sessions. Repeated commands in one session are insufficient. An empty list can also reflect unsupported or sensitive commands, sample limits, or dismissed and snoozed definitions.
 
-Each proposal reads like `Seen 12× in 4 conversations: cargo test -p <pattern1>`. Proposals from imported history count sessions instead of conversations. Select one to read its command shape, constraints, evidence, and examples. `Enter` focuses its details without granting it. The separate evidence inspector wraps text and supports `Up` / `Down`, `PageUp` / `PageDown`, and mouse-wheel scrolling.
+Each proposal row leads with its template, such as `cargo test -p <value>`, and ends with how often it was seen and where, such as `4× · 2 conversations`. Proposals from imported history count sessions instead of conversations. The pane beside the list shows the template, what each slot stands for, the commands it covers with their counts, what still asks, and where it was seen. Its last line says the proposal is not active and that `Ctrl-E` drafts a permission to review. `Enter` focuses the pane without granting anything, and `PageUp` / `PageDown` and the mouse wheel scroll it.
 
 Create permission opens an editable draft. Select the currently registered local shell target and supply concrete command text and an absolute workdir for fresh host analysis. Historical tool identity and context do not authorize the new rule. Configure its input constraints and lifetime, then review and Save as described under [Stored rules](#stored-rules). A matching live prompt is not required. Opening the draft or analyzing its source grants nothing.
 

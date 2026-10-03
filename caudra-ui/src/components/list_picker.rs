@@ -7,7 +7,7 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 use crate::animation::{animation_elapsed_ms, spinner_str};
 use crate::components::keybindings::key;
-use crate::components::modal::Modal;
+use crate::components::modal::{CHROME_LINES, Modal};
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::components::{Hint, HintBar, Overlay, chevron_span, field_styles, input_text_style};
 use crate::repaint::Cadence;
@@ -28,6 +28,7 @@ const NO_MATCHES: &str = "No matches";
 const LABEL_INDENT: &str = "  ";
 const MIN_WIDTH_PERCENT: u16 = 65;
 const MAX_HEIGHT_PERCENT: u16 = 80;
+const DOCKED_HEIGHT_PERCENT: u16 = 100;
 const SEARCH_ROW: u16 = 1;
 const DETAIL_RIGHT_PAD: u16 = 1;
 /// The blank a row keeps between its label and its detail.
@@ -111,6 +112,7 @@ pub struct ListPicker<T> {
     info_text: Option<Text<'static>>,
     empty_text: &'static str,
     width_percent: u16,
+    docked: bool,
     relevance_order: bool,
 }
 
@@ -143,6 +145,7 @@ struct PickerRowHit {
 struct RenderOptions<'a> {
     max_visible: Option<u16>,
     width_percent: u16,
+    docked: bool,
     empty_text: &'a str,
 }
 
@@ -358,6 +361,7 @@ impl<T: PickerItem> ListPicker<T> {
             info_text: None,
             empty_text: NO_MATCHES,
             width_percent: MIN_WIDTH_PERCENT,
+            docked: false,
             relevance_order: false,
         }
     }
@@ -377,6 +381,14 @@ impl<T: PickerItem> ListPicker<T> {
 
     pub fn with_width_percent(mut self, width_percent: u16) -> Self {
         self.width_percent = width_percent.clamp(1, 100);
+        self
+    }
+
+    /// Fills the area it is drawn in, rows from the top and the search line
+    /// at the bottom, for a list that is a column of a larger view rather
+    /// than a popup sized to its rows.
+    pub fn docked(mut self) -> Self {
+        self.docked = true;
         self
     }
 
@@ -778,6 +790,7 @@ impl<T: PickerItem> ListPicker<T> {
                 RenderOptions {
                     max_visible: self.max_visible,
                     width_percent: self.width_percent,
+                    docked: self.docked,
                     empty_text: self.empty_text,
                 },
                 RenderContent {
@@ -818,15 +831,6 @@ fn render_ready<T: PickerItem>(
         info_text,
     } = content;
     let footer_rows = if footer.is_some() { 1u16 } else { 0 };
-    let content_rows = if s.filtered.is_empty() {
-        1
-    } else {
-        let rows = visual_rows_in_range(&s.filtered, &s.items, 0, s.filtered.len()) as u16;
-        match options.max_visible {
-            Some(max) => rows.min(max),
-            None => rows,
-        }
-    };
     let error_rows = error_text.is_some() as u16;
     let modal_inner_width = Modal::inner_width(area.width, options.width_percent);
     let requested_info_rows = info_text.map_or(0, |text| {
@@ -834,16 +838,32 @@ fn render_ready<T: PickerItem>(
             .wrap(ratatui::widgets::Wrap { trim: false })
             .line_count(modal_inner_width.max(1)) as u16
     });
+    let (max_height_percent, requested_rows) = if options.docked {
+        (
+            DOCKED_HEIGHT_PERCENT,
+            area.height.saturating_sub(CHROME_LINES),
+        )
+    } else {
+        let content_rows = if s.filtered.is_empty() {
+            1
+        } else {
+            let rows = visual_rows_in_range(&s.filtered, &s.items, 0, s.filtered.len()) as u16;
+            match options.max_visible {
+                Some(max) => rows.min(max),
+                None => rows,
+            }
+        };
+        (
+            MAX_HEIGHT_PERCENT,
+            content_rows + SEARCH_ROW + footer_rows + error_rows + requested_info_rows,
+        )
+    };
     let modal = Modal {
         title,
         width_percent: options.width_percent,
-        max_height_percent: MAX_HEIGHT_PERCENT,
+        max_height_percent,
     };
-    let (popup, inner) = modal.render(
-        frame,
-        area,
-        content_rows + SEARCH_ROW + footer_rows + error_rows + requested_info_rows,
-    );
+    let (popup, inner) = modal.render(frame, area, requested_rows);
     if s.popup_area != popup {
         s.invalidate_mouse_geometry();
     }
@@ -1696,6 +1716,26 @@ mod tests {
 
         assert!(matches!(action, PickerAction::Consumed));
         assert!(picker.is_open());
+    }
+
+    #[test_case(false; "centred_popup")]
+    #[test_case(true; "docked_column")]
+    fn docked_lists_fill_their_column_from_the_top(docked: bool) {
+        let mut picker = ListPicker::new();
+        if docked {
+            picker = picker.docked();
+        }
+        picker.open(entries(&["A", "B"]), " Test ");
+        let buffer = render(&mut picker);
+        let state = ready_state(&picker);
+        let first_row = state.row_hits[0].area.y;
+        if docked {
+            assert_eq!(state.popup_area.height, buffer.area.height);
+            assert_eq!(first_row, buffer.area.y + 1);
+        } else {
+            assert!(state.popup_area.height < buffer.area.height);
+            assert!(first_row > buffer.area.y + 1);
+        }
     }
 
     /// A highlighted row is painted over the bar's column, so the bar has to

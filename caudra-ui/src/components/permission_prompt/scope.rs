@@ -5,7 +5,7 @@ use caudra_agent::permissions::{
     PermissionLifetime, PermissionRequest, PermissionResourceAccess, PermissionResourceConstraint,
     PermissionResourceKind, PermissionResourceSelector, PermissionReview, PermissionReviewResource,
     PermissionRuleOption, PermissionSubject, StructuredPermissionRule,
-    review::{command_template_phrase, recovered_value, review_for_rule},
+    review::{command_template_phrase, command_template_values, recovered_value, review_for_rule},
 };
 use caudra_storage::permission_patterns::PatternDefinition;
 
@@ -275,6 +275,11 @@ pub(crate) fn rule_summary(
         }
         sentence.push('.');
         summary.lines.push(sentence);
+        if let PermissionResourceSelector::CommandTemplate { definition } = &resource.selector
+            && let Some(values) = command_template_values(definition)
+        {
+            summary.lines.push(values);
+        }
         if resource.protected == Some(true) {
             summary.lines.push(PROTECTED_SCOPE.into());
         }
@@ -504,5 +509,36 @@ pub(super) fn pattern_model(
             lifetime,
         },
         activity: ScopeActivity::Live,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use caudra_agent::permissions::review::review_for_rule;
+
+    use super::super::inspector::tests::learned_request;
+    use super::super::view::tests::{LEARNED_SEEN, TEMPLATE_VALUES};
+    use super::rule_summary;
+
+    const TEMPLATE_SENTENCE: &str = "Runs `cargo check -p <value> --tests`";
+
+    /// A stored template, as the Rules pane reads it, says what its slots
+    /// stand for right after what it runs.
+    #[test]
+    fn a_template_rule_says_what_its_slots_stand_for() {
+        let request = learned_request(LEARNED_SEEN, &[]);
+        let option = request
+            .options
+            .iter()
+            .find(|option| option.seen.is_some())
+            .unwrap();
+        let review = review_for_rule(&request, &option.rule);
+        let summary = rule_summary(&option.rule, Some(&review), None);
+        assert!(
+            summary.lines[0].starts_with(TEMPLATE_SENTENCE),
+            "{:?}",
+            summary.lines
+        );
+        assert_eq!(summary.lines[1], TEMPLATE_VALUES, "{:?}", summary.lines);
     }
 }

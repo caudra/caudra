@@ -3518,6 +3518,7 @@ mod tests {
                     raw_input: Some(raw),
                     output: Some(ToolOutput::Plain(REPORT_ACK.into())),
                     annotation: None,
+                    refused: false,
                 }],
                 text: String::new(),
             };
@@ -4724,6 +4725,7 @@ mod tests {
                     output: Some(output),
                     annotation: None,
                     model_suffix: None,
+                    refused: false,
                 }],
                 text: BODY.into(),
             }
@@ -6139,6 +6141,7 @@ mod tests {
             }),
             annotation: None,
             model_suffix: None,
+            refused: false,
         }
     }
 

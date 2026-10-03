@@ -130,6 +130,11 @@ pub enum HistoryItemKind {
         output_ref: Option<ToolOutputRef>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<ImageSource>,
+        /// Calls refused before they ran: `[0]` for a plain call, entry
+        /// positions for a batch. Results stored before refusals were recorded
+        /// carry none, so their absence proves nothing.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        refused_calls: Vec<usize>,
     },
 }
 
@@ -578,6 +583,11 @@ fn expand_user_message(message: &Message) -> Vec<HistoryItemKind> {
                     is_error: *is_error,
                     output_ref: output_ref.clone(),
                     images: Vec::new(),
+                    refused_calls: message
+                        .refused_tool_calls
+                        .get(tool_use_id)
+                        .cloned()
+                        .unwrap_or_default(),
                 });
                 last_tool_result = Some(kinds.len() - 1);
                 result_indexes.push((tool_use_id.clone(), kinds.len() - 1));
@@ -748,6 +758,7 @@ fn assistant_kind(
             is_error: *is_error,
             output_ref: output_ref.clone(),
             images: Vec::new(),
+            refused_calls: Vec::new(),
         },
         ContentBlock::Image { source } => HistoryItemKind::User {
             text: String::new(),
@@ -1032,6 +1043,7 @@ fn project_group(items: &[HistoryItem]) -> Message {
                 is_error,
                 output_ref,
                 images,
+                refused_calls,
             } => {
                 message.content.push(ContentBlock::ToolResult {
                     tool_use_id: call_id.clone(),
@@ -1044,6 +1056,11 @@ fn project_group(items: &[HistoryItem]) -> Message {
                 message
                     .tool_result_image_owners
                     .extend(std::iter::repeat_n(call_id.clone(), images.len()));
+                if !refused_calls.is_empty() {
+                    message
+                        .refused_tool_calls
+                        .insert(call_id.clone(), refused_calls.clone());
+                }
             }
         }
     }
@@ -1106,6 +1123,9 @@ mod tests {
     const BACKGROUND_REMINDER_VALUE: &str = "background_work";
     const OPEN_TODOS_REMINDER_VALUE: &str = "open_todos";
     const REMINDER_IMAGE: &str = "reminder-image";
+    const REFUSED_RESULT: &str = "permission denied";
+    const REFUSED_CALLS_KEY: &str = "refused_calls";
+    const REFUSED_TOOL_CALLS_KEY: &str = "refused_tool_calls";
 
     #[test_case(PEER_TEXT, true ; "plain_tail")]
     #[test_case(PEER_ATTACK, true ; "adversarial_tail")]
@@ -2421,6 +2441,7 @@ mod tests {
                 is_error: false,
                 output_ref: None,
                 images: vec![image("first")],
+                refused_calls: Vec::new(),
             },
             result_group,
             Some(second_call.id),
@@ -2432,6 +2453,7 @@ mod tests {
                 is_error: true,
                 output_ref: None,
                 images: vec![image("second")],
+                refused_calls: Vec::new(),
             },
             result_group,
             Some(first_result.id),
@@ -2480,6 +2502,67 @@ mod tests {
                 .get("tool_result_image_owners")
                 .is_none()
         );
+    }
+
+    #[test_case(&[]; "nothing_refused")]
+    #[test_case(&[0]; "plain_call_refused")]
+    #[test_case(&[1, 3]; "batch_entries_refused")]
+    fn refused_calls_round_trip_without_reaching_the_wire(refused: &[usize]) {
+        let call = item(
+            HistoryItemKind::ToolCall {
+                call_id: CALL_ONE.into(),
+                name: TOOL_NAME.into(),
+                input: json!({}),
+                thought_signature: None,
+                source: None,
+            },
+            CaudraId::generate(),
+            None,
+        );
+        let result = item(
+            HistoryItemKind::ToolResult {
+                call_id: CALL_ONE.into(),
+                content: REFUSED_RESULT.into(),
+                is_error: true,
+                output_ref: None,
+                images: Vec::new(),
+                refused_calls: refused.to_vec(),
+            },
+            CaudraId::generate(),
+            Some(call.id),
+        );
+        let stored = serde_json::to_value(&result.kind).unwrap();
+        assert_eq!(stored.get(REFUSED_CALLS_KEY).is_some(), !refused.is_empty());
+
+        let messages = project_messages(&[call, result]).unwrap();
+        assert_eq!(
+            messages[1]
+                .refused_tool_calls
+                .get(CALL_ONE)
+                .map(Vec::as_slice),
+            (!refused.is_empty()).then_some(refused)
+        );
+        let wire = serde_json::to_value(&messages[1]).unwrap();
+        assert!(wire.get(REFUSED_TOOL_CALLS_KEY).is_none());
+        assert!(!wire.to_string().contains(REFUSED_CALLS_KEY));
+        assert!(matches!(
+            &expand_message(&messages[1], None)[0].kind,
+            HistoryItemKind::ToolResult { refused_calls, .. } if refused_calls == refused
+        ));
+    }
+
+    #[test]
+    fn a_result_stored_before_refusals_were_recorded_loads_as_unrefused() {
+        let legacy = json!({
+            "type": "tool_result",
+            "call_id": CALL_ONE,
+            "content": REFUSED_RESULT,
+            "is_error": true,
+        });
+        assert!(matches!(
+            serde_json::from_value(legacy).unwrap(),
+            HistoryItemKind::ToolResult { refused_calls, .. } if refused_calls.is_empty()
+        ));
     }
 
     #[test]
@@ -2543,6 +2626,7 @@ mod tests {
                 is_error: false,
                 output_ref: None,
                 images: Vec::new(),
+                refused_calls: Vec::new(),
             },
             CaudraId::generate(),
             None,

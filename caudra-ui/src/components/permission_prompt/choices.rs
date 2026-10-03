@@ -1,18 +1,23 @@
-use caudra_agent::permissions::review::command_template_phrase;
+use caudra_agent::permissions::review::{command_template_phrase, command_template_values};
 use caudra_agent::permissions::{
     PermissionAnswer, PermissionLifetime, PermissionRequest, PermissionResourceAccess,
     PermissionResourceKind, PermissionResourceSelector, PermissionRowGrant, PermissionRuleOption,
 };
+use caudra_storage::permission_patterns::PatternDefinition;
 
 use super::decision::grant_option;
 use super::details::review_text;
+use super::inspector::offered_pattern;
 use super::{PermissionDecision, PermissionPrompt, PromptState};
+use crate::components::counted;
 
 const YES: &str = "Yes";
 const YES_ONCE: &str = "Yes, run it once";
 const YES_ALL_ONCE: &str = "Yes, run them once";
 pub(super) const NO: &str = "No, and tell the agent what to do instead";
 pub(super) const ONCE_ONLY: &str = "this time only";
+const LEARNED_FROM: &str = "Learned from";
+const SIMILAR_COMMAND: &str = "similar command";
 
 /// One numbered answer of the main view. The letters keep their meaning
 /// whatever number a choice ends up with.
@@ -57,6 +62,19 @@ pub(super) fn grant_label(
         PermissionRowGrant::Pattern { definition, .. } => command_template_phrase(definition),
         PermissionRowGrant::Written(pattern) => pattern.clone(),
     })
+}
+
+/// The template a row's grant names: an offered one, or one edited from it.
+pub(super) fn grant_template<'a>(
+    request: &'a PermissionRequest,
+    row: usize,
+    grant: &'a PermissionRowGrant,
+) -> Option<&'a PatternDefinition> {
+    match grant {
+        PermissionRowGrant::Offered(_) => offered_pattern(grant_option(request, row, grant)?),
+        PermissionRowGrant::Pattern { definition, .. } => Some(definition.as_ref()),
+        PermissionRowGrant::Written(_) => None,
+    }
 }
 
 /// Whether an option names commands by a pattern or a template, which reads
@@ -194,6 +212,28 @@ impl PermissionPrompt {
                     .as_ref()
                     .is_some_and(|grant| grant_names_commands(request, row, grant))
             })
+    }
+
+    /// The line under the choices that remember, when the focused command's
+    /// scope is a template learned from earlier commands: how many it was
+    /// learned from, and what its slots stand for.
+    pub(super) fn learned_line(&self) -> Option<String> {
+        let request = self.current()?;
+        let row = self
+            .focus_row
+            .filter(|_| self.per_row() && self.choices().len() > 2)?;
+        let grant = self.row_grant(row)?;
+        let PermissionRowGrant::Offered(_) = grant else {
+            return None;
+        };
+        let option = grant_option(request, row, &grant)?;
+        let learned = format!("{LEARNED_FROM} {}.", counted(option.seen?, SIMILAR_COMMAND));
+        Some(
+            match offered_pattern(option).and_then(command_template_values) {
+                Some(values) => format!("{learned} {values}"),
+                None => learned,
+            },
+        )
     }
 
     /// Acts on a choice the same way whether it came from its number, its

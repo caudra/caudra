@@ -368,6 +368,10 @@ pub struct Message {
     /// legacy persisted messages.
     #[serde(skip)]
     pub tool_result_image_owners: Vec<String>,
+    /// Host-only: per tool-result call ID, the calls refused before they ran,
+    /// as `HistoryItemKind::ToolResult::refused_calls` stores them.
+    #[serde(skip)]
+    pub refused_tool_calls: BTreeMap<String, Vec<usize>>,
     /// Session-owned artifacts retained by a compacted summary. Host-only:
     /// provider payloads must see retrieval IDs only when summary text cites them.
     #[serde(skip)]

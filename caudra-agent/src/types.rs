@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -285,6 +286,10 @@ pub struct BatchToolEntry {
     /// together drew a metadata block on the card.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_suffix: Option<String>,
+    /// Refused before it ran. Host-only: the history records it on the
+    /// batch's result, so a restored row never needs it.
+    #[serde(skip)]
+    pub refused: bool,
 }
 
 /// One child of a running batch changing state. Only the child that moved is
@@ -1933,6 +1938,26 @@ impl ToolDoneEvent {
         self.model_suffix.as_deref()
     }
 
+    /// Refused before it ran, by the reader, a rule, or the mode. A prompt
+    /// cancelled with its turn is not a refusal, as the call may have run.
+    pub fn refused(&self) -> bool {
+        self.accounting.outcome == Some(ToolOutcome::Denied)
+    }
+
+    /// The calls of this result refused before they ran: `[0]` for a plain
+    /// call, the refused children's positions for a batch.
+    fn refused_calls(&self) -> Vec<usize> {
+        match &self.output {
+            ToolOutput::Batch { entries, .. } => entries
+                .iter()
+                .enumerate()
+                .filter_map(|(index, entry)| entry.refused.then_some(index))
+                .collect(),
+            _ if self.refused() => vec![0],
+            _ => Vec::new(),
+        }
+    }
+
     pub fn with_failure(mut self, failure: ToolFailure) -> Self {
         self.is_error = true;
         self.accounting.outcome = Some(failure.into());
@@ -2003,7 +2028,12 @@ pub fn tool_results(results: Vec<ToolDoneEvent>) -> Message {
     let mut content = Vec::with_capacity(results.len());
     let mut images = Vec::new();
     let mut tool_result_image_owners = Vec::new();
+    let mut refused_tool_calls = BTreeMap::new();
     for mut r in results {
+        let refused = r.refused_calls();
+        if !refused.is_empty() {
+            refused_tool_calls.insert(r.id.clone(), refused);
+        }
         let mut result_content = r.model_output.take().unwrap_or_else(|| r.output.as_text());
         append_model_suffix(&mut result_content, r.model_suffix());
         if let ToolOutput::Image { source, .. } = &r.output {
@@ -2026,6 +2056,7 @@ pub fn tool_results(results: Vec<ToolDoneEvent>) -> Message {
         role: Role::User,
         content,
         tool_result_image_owners,
+        refused_tool_calls,
         ..Default::default()
     }
 }
@@ -3137,6 +3168,7 @@ mod tests {
                     output,
                     annotation: None,
                     model_suffix: None,
+                    refused: false,
                 })
                 .collect(),
             text: String::new(),
@@ -3983,6 +4015,65 @@ mod tests {
         );
     }
 
+    const PLAIN_CALL: &str = "plain-call";
+    const BATCH_CALL: &str = "batch-call";
+    const CHILD_RESULT: &str = "child result";
+
+    fn ended(id: &str, failure: Option<ToolFailure>) -> ToolDoneEvent {
+        let done = ToolDoneEvent::error(id.into(), CHILD_RESULT);
+        match failure {
+            Some(failure) => done.with_failure(failure),
+            None => ToolDoneEvent {
+                is_error: false,
+                ..done
+            },
+        }
+    }
+
+    #[test_case(Some(ToolFailure::Denied), Some(&[0]); "a_refused_call")]
+    #[test_case(Some(ToolFailure::Cancelled), None; "a_prompt_cancelled_with_its_turn")]
+    #[test_case(Some(ToolFailure::Other), None; "a_call_that_failed")]
+    #[test_case(None, None; "a_call_that_ran")]
+    fn tool_results_record_plain_calls_refused_before_they_ran(
+        failure: Option<ToolFailure>,
+        refused: Option<&[usize]>,
+    ) {
+        let message = tool_results(vec![ended(PLAIN_CALL, failure)]);
+        assert_eq!(
+            message
+                .refused_tool_calls
+                .get(PLAIN_CALL)
+                .map(Vec::as_slice),
+            refused
+        );
+    }
+
+    #[test]
+    fn tool_results_record_only_the_refused_children_of_a_batch() {
+        let children = [
+            None,
+            Some(ToolFailure::Denied),
+            Some(ToolFailure::Cancelled),
+            Some(ToolFailure::Denied),
+        ];
+        let ToolOutput::Batch { mut entries, text } =
+            batch(vec![(BatchToolStatus::Pending, None); children.len()])
+        else {
+            unreachable!()
+        };
+        for (entry, failure) in entries.iter_mut().zip(children) {
+            crate::tools::native::batch::settle_entry(entry, &ended(PLAIN_CALL, failure));
+        }
+        let message = tool_results(vec![ToolDoneEvent {
+            output: ToolOutput::Batch { entries, text },
+            ..ended(BATCH_CALL, None)
+        }]);
+        assert_eq!(
+            message.refused_tool_calls,
+            BTreeMap::from([(BATCH_CALL.to_owned(), vec![1, 3])])
+        );
+    }
+
     #[test_case(
         10,
         vec!["fn foo()".into(), "fn bar()".into()],
@@ -4121,6 +4212,7 @@ mod tests {
             })),
             annotation: Some(result.annotation().unwrap()),
             model_suffix: None,
+            refused: false,
         };
         assert_eq!(entry.plan_write_result(), expected.then_some(result));
     }

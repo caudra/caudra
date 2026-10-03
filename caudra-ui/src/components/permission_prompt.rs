@@ -28,8 +28,8 @@ use customize::{Customize, Effect};
 use decision::Pending;
 pub(crate) use details::{likely_secret_key, sensitive_text};
 use input::InputFreshness;
+pub(crate) use inspector::pattern_widened;
 use inspector::{InspectorControl, PatternInspector};
-pub(crate) use inspector::{pattern_summary, slot_name};
 pub(crate) use notes::{origin_word, tilde};
 #[cfg(test)]
 pub(crate) use scope::MISSING_SCOPE;

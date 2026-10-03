@@ -8,8 +8,8 @@ use super::{
     PermissionRequest,
     pattern_matching::CompiledPattern,
     pattern_recognition::{
-        MAX_RECOGNIZER_BYTES, MAX_RECOGNIZER_SUGGESTIONS, MAX_TIMESTAMP_MS, ObserveOutcome,
-        PatternCandidate, PatternRecognizer, RecognizerLimits,
+        CommandObservation, MAX_RECOGNIZER_BYTES, MAX_RECOGNIZER_SUGGESTIONS, MAX_TIMESTAMP_MS,
+        ObserveOutcome, PatternCandidate, PatternRecognizer, RecognizerLimits,
     },
     policy::validate_compiled_templates,
     structured::trusted_command_observation,
@@ -178,6 +178,41 @@ fn bounded_candidates(
         retained.push(candidate);
     }
     retained
+}
+
+fn relearn(patterns: &mut PatternDiscovery) -> bool {
+    let learned = bounded_candidates(
+        patterns
+            .recognizer
+            .as_ref()
+            .and_then(|recognizer| recognizer.suggestions().ok())
+            .unwrap_or_default(),
+    );
+    let changed = patterns.learned != learned;
+    patterns.learned = learned;
+    changed
+}
+
+#[must_use = "dropping it withdraws what the request taught"]
+pub(super) struct ObservedPatterns<'a> {
+    manager: &'a PermissionManager,
+    project: PathBuf,
+    observations: Vec<CommandObservation>,
+}
+
+impl ObservedPatterns<'_> {
+    pub(super) fn keep(mut self) {
+        self.observations.clear();
+    }
+}
+
+impl Drop for ObservedPatterns<'_> {
+    fn drop(&mut self) {
+        if !self.observations.is_empty() {
+            self.manager
+                .withdraw_pattern_observations(&self.project, &self.observations);
+        }
+    }
 }
 
 pub struct PermissionManager {
@@ -895,14 +930,25 @@ impl PermissionManager {
         Ok(())
     }
 
-    pub(super) fn observe_pattern_request(&self, request: &PermissionRequest) {
+    /// Teaches the recognizer the request's commands before it is decided, so
+    /// the prompt that completes a pattern already offers it. The lesson holds
+    /// only once the request is allowed: dropping what this returns withdraws it.
+    pub(super) fn observe_pattern_request(
+        &self,
+        request: &PermissionRequest,
+    ) -> ObservedPatterns<'_> {
         let revision = self
             .context_revision
             .read()
             .unwrap_or_else(|error| error.into_inner());
         let project = self.project_cwd();
+        let mut observed = ObservedPatterns {
+            manager: self,
+            project: project.clone(),
+            observations: Vec::new(),
+        };
         let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
-            return;
+            return observed;
         };
         let timestamp_ms = u64::try_from(now.as_millis())
             .unwrap_or(MAX_TIMESTAMP_MS)
@@ -924,7 +970,7 @@ impl PermissionManager {
             })
             .collect::<Vec<_>>();
         if observations.is_empty() {
-            return;
+            return observed;
         }
         let mut projects = self
             .patterns
@@ -943,27 +989,47 @@ impl PermissionManager {
             .ok();
         }
         let Some(recognizer) = &mut patterns.recognizer else {
-            return;
+            return observed;
         };
         let mut changed = false;
         for observation in observations {
-            changed |= matches!(
-                recognizer.observe(observation),
-                Ok(ObserveOutcome::Added) | Err(_)
-            );
-        }
-        let changed = if changed {
-            let learned = bounded_candidates(recognizer.suggestions().unwrap_or_default());
-            if patterns.learned == learned {
-                false
-            } else {
-                patterns.learned = learned;
-                true
+            match recognizer.observe(observation.clone()) {
+                Ok(ObserveOutcome::Added) => observed.observations.push(observation),
+                Ok(ObserveOutcome::Duplicate) => continue,
+                Err(_) => {}
             }
-        } else {
-            false
-        };
+            changed = true;
+        }
+        let changed = changed && relearn(patterns);
         drop(projects);
+        drop(revision);
+        if changed {
+            self.notify_policy_changed("");
+        }
+        observed
+    }
+
+    fn withdraw_pattern_observations(&self, project: &Path, observations: &[CommandObservation]) {
+        let revision = self
+            .context_revision
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        let changed = {
+            let mut projects = self
+                .patterns
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            projects.get_mut(project).is_some_and(|patterns| {
+                let withdrawn = patterns.recognizer.as_mut().is_some_and(|recognizer| {
+                    let mut withdrawn = false;
+                    for observation in observations {
+                        withdrawn |= recognizer.withdraw(observation);
+                    }
+                    withdrawn
+                });
+                withdrawn && relearn(patterns)
+            })
+        };
         drop(revision);
         if changed {
             self.notify_policy_changed("");
@@ -1522,6 +1588,7 @@ mod pattern_runtime_tests {
     const JUST_TEST: [&str; 2] = ["just", "test"];
     const WORKDIR: &str = "workdir";
     const POSSIBLE_WORKDIRS: &str = "possible_workdirs";
+    const LINE_SEPARATOR: &str = " && ";
 
     fn observation(id: &str, package: &str) -> CommandObservation {
         let mut observation =
@@ -1586,18 +1653,29 @@ mod pattern_runtime_tests {
 
     fn request_from_observation(
         id: &str,
-        mut fact: CommandObservation,
+        fact: CommandObservation,
         project: &Path,
     ) -> PermissionRequest {
-        let command = fact.argv.join(" ");
-        let input = json!({"command": command, "workdir": SHELL_WORKDIR});
-        let mut intent = shell_intent(&[&command]);
-        fact.context.path_binding = project.to_str().unwrap().into();
-        intent.resources[0].attributes.insert(
-            POSSIBLE_WORKDIRS.into(),
-            json!({"kind": "known", "symbolic_paths": [SHELL_WORKDIR]}).to_string(),
-        );
-        attach_observation(&mut intent.resources[0], &input, fact);
+        request_from_observations(id, vec![fact], project)
+    }
+
+    /// One line running each observed command in turn.
+    fn request_from_observations(
+        id: &str,
+        facts: Vec<CommandObservation>,
+        project: &Path,
+    ) -> PermissionRequest {
+        let commands: Vec<String> = facts.iter().map(|fact| fact.argv.join(" ")).collect();
+        let input = json!({"command": commands.join(LINE_SEPARATOR), "workdir": SHELL_WORKDIR});
+        let mut intent = shell_intent(&commands.iter().map(String::as_str).collect::<Vec<_>>());
+        for (resource, mut fact) in intent.resources.iter_mut().zip(facts) {
+            fact.context.path_binding = project.to_str().unwrap().into();
+            resource.attributes.insert(
+                POSSIBLE_WORKDIRS.into(),
+                json!({"kind": "known", "symbolic_paths": [SHELL_WORKDIR]}).to_string(),
+            );
+            attach_observation(resource, &input, fact);
+        }
         PermissionRequest::from_intent_with_identity(
             id.into(),
             ToolKey::native("shell"),
@@ -1657,6 +1735,16 @@ mod pattern_runtime_tests {
     ) -> Result<(), PermissionError> {
         let (_sender, receiver) = flume::unbounded();
         let responses = async_lock::Mutex::new(receiver);
+        enforce_answerable(manager, request, events, forced, Some(&responses)).await
+    }
+
+    async fn enforce_answerable(
+        manager: &PermissionManager,
+        request: &PermissionRequest,
+        events: &EventSender,
+        forced: bool,
+        responses: Option<&async_lock::Mutex<flume::Receiver<String>>>,
+    ) -> Result<(), PermissionError> {
         let intent = PermissionIntent::new(
             PermissionScopes {
                 scopes: request.scopes.clone(),
@@ -1673,7 +1761,7 @@ mod pattern_runtime_tests {
                 &intent,
                 &request.input,
                 events,
-                Some(&responses),
+                responses,
                 &request.id,
                 &CancelToken::none(),
                 None,
@@ -1746,6 +1834,148 @@ mod pattern_runtime_tests {
                 }
                 assert!(manager.structured_rule_inventory().unwrap().is_empty());
             }
+        });
+    }
+
+    enum Refusal {
+        Answered,
+        DenyRule,
+        DefaultDeny,
+        NoResponseChannel,
+        Abandoned,
+    }
+
+    #[test_case(Refusal::Answered; "answered_no")]
+    #[test_case(Refusal::DenyRule; "deny_rule")]
+    #[test_case(Refusal::DefaultDeny; "default_deny")]
+    #[test_case(Refusal::NoResponseChannel; "no_response_channel")]
+    #[test_case(Refusal::Abandoned; "dropped_while_waiting")]
+    fn refused_calls_teach_no_template(refusal: Refusal) {
+        smol::block_on(async {
+            let config = match refusal {
+                Refusal::DenyRule => make_config(vec![shell_policy_rule("*", Effect::Deny)]),
+                Refusal::DefaultDeny => PermissionsConfig {
+                    default: DefaultEffect::Deny,
+                    ..make_config(Vec::new())
+                },
+                _ => make_config(Vec::new()),
+            };
+            let manager = PermissionManager::new_nonpersistent(
+                config,
+                PathBuf::from(SHELL_WORKDIR),
+                Default::default(),
+            );
+            for package in PACKAGES {
+                let prepared = request(package, package);
+                let (events, _received) = flume::unbounded();
+                let events = EventSender::new(events, 0);
+                match refusal {
+                    Refusal::DenyRule | Refusal::DefaultDeny => {
+                        assert!(
+                            enforce_prepared(&manager, &prepared, &events, false)
+                                .await
+                                .is_err()
+                        );
+                    }
+                    Refusal::NoResponseChannel => {
+                        assert!(
+                            enforce_answerable(&manager, &prepared, &events, false, None)
+                                .await
+                                .is_err()
+                        );
+                    }
+                    Refusal::Answered | Refusal::Abandoned => {
+                        let mut enforcement =
+                            Box::pin(enforce_prepared(&manager, &prepared, &events, false));
+                        assert!(poll_once(&mut enforcement).await.is_none());
+                        if matches!(refusal, Refusal::Answered) {
+                            assert!(manager.answer(package, PermissionAnswer::Deny));
+                            assert!(enforcement.await.is_err());
+                        }
+                    }
+                }
+            }
+            assert!(manager.pattern_proposal_inventory().2.is_empty());
+            assert_eq!(manager.pending_count(), 0);
+        });
+    }
+
+    /// A refused line takes back everything it taught, so no command of it
+    /// is left to support a template.
+    #[test]
+    fn a_refused_line_withdraws_every_command_it_taught() {
+        smol::block_on(async {
+            let manager = default_mgr();
+            let facts = PACKAGES
+                .iter()
+                .chain([&NEW_PACKAGE])
+                .map(|package| observation(&format!("{REQUEST_ID}-{package}"), package))
+                .collect();
+            let line = request_from_observations(REQUEST_ID, facts, Path::new(SHELL_WORKDIR));
+            let (events, received) = flume::unbounded();
+            let events = EventSender::new(events, 0);
+            let mut enforcement = Box::pin(enforce_prepared(&manager, &line, &events, false));
+            assert!(poll_once(&mut enforcement).await.is_none());
+            let AgentEvent::PermissionRequest(offered) = received.try_recv().unwrap().event else {
+                panic!("expected permission request")
+            };
+            assert!(offered.options.iter().any(is_learned_template));
+            assert!(manager.answer(REQUEST_ID, PermissionAnswer::Deny));
+            assert!(enforcement.await.is_err());
+            assert!(manager.pattern_proposal_inventory().2.is_empty());
+        });
+    }
+
+    #[test]
+    fn a_refusal_withdraws_the_template_a_waiting_prompt_offers() {
+        smol::block_on(async {
+            let manager = default_mgr();
+            prompted(&manager, &request(PACKAGES[0], PACKAGES[0]), false, |_| {
+                PermissionAnswer::AllowOnce
+            })
+            .await;
+            let waiting = request(PACKAGES[1], PACKAGES[1]);
+            let (events, received) = flume::unbounded();
+            let events = EventSender::new(events, 0);
+            let mut sibling = Box::pin(enforce_prepared(&manager, &waiting, &events, false));
+            assert!(poll_once(&mut sibling).await.is_none());
+            let AgentEvent::PermissionRequest(initial) = received.try_recv().unwrap().event else {
+                panic!("expected permission request")
+            };
+            assert!(!initial.options.iter().any(is_learned_template));
+
+            let refused = request(PACKAGES[2], PACKAGES[2]);
+            let (refused_events, refused_received) = flume::unbounded();
+            let refused_events = EventSender::new(refused_events, 0);
+            let mut refusal =
+                Box::pin(enforce_prepared(&manager, &refused, &refused_events, false));
+            assert!(poll_once(&mut refusal).await.is_none());
+            let AgentEvent::PermissionRequest(completing) =
+                refused_received.try_recv().unwrap().event
+            else {
+                panic!("expected permission request")
+            };
+            assert!(completing.options.iter().any(is_learned_template));
+            assert!(poll_once(&mut sibling).await.is_none());
+            let AgentEvent::PermissionRequestUpdated(learned) = received.try_recv().unwrap().event
+            else {
+                panic!("expected permission update")
+            };
+            assert!(learned.options.iter().any(is_learned_template));
+
+            assert!(manager.answer(&refused.id, PermissionAnswer::Deny));
+            assert!(refusal.await.is_err());
+            assert!(manager.pattern_proposal_inventory().2.is_empty());
+            assert!(poll_once(&mut sibling).await.is_none());
+            let AgentEvent::PermissionRequestUpdated(forgotten) =
+                received.try_recv().unwrap().event
+            else {
+                panic!("expected permission update")
+            };
+            assert!(!forgotten.options.iter().any(is_learned_template));
+            assert!(manager.answer(&waiting.id, PermissionAnswer::AllowOnce));
+            sibling.await.unwrap();
+            assert!(manager.pattern_proposal_inventory().2.is_empty());
         });
     }
 
@@ -1838,11 +2068,13 @@ mod pattern_runtime_tests {
             learned.definition.slots[0].domain = ArgumentDomain::AnyLiteralArgument;
             learned.definition.combinations = SlotCombinations::Independent;
             manager.set_pattern_candidates(vec![learned]);
-            manager.observe_pattern_request(&request_for_project(
-                NEW_PACKAGE,
-                NEW_PACKAGE,
-                temp.path(),
-            ));
+            manager
+                .observe_pattern_request(&request_for_project(
+                    NEW_PACKAGE,
+                    NEW_PACKAGE,
+                    temp.path(),
+                ))
+                .keep();
             assert_eq!(manager.structured_rule_inventory().unwrap(), before);
             assert!(!allows_without_prompt(
                 &manager,
@@ -2551,11 +2783,13 @@ mod pattern_runtime_tests {
     fn snoozed_proposals_expire_at_the_injected_clock_boundary(argv: &[&str]) {
         let manager = default_mgr();
         for index in 0..super::RUNTIME_PATTERN_MIN_SUPPORT {
-            manager.observe_pattern_request(&bare_request(
-                &format!("{REQUEST_ID}-{index}"),
-                argv,
-                Path::new(SHELL_WORKDIR),
-            ));
+            manager
+                .observe_pattern_request(&bare_request(
+                    &format!("{REQUEST_ID}-{index}"),
+                    argv,
+                    Path::new(SHELL_WORKDIR),
+                ))
+                .keep();
         }
         let (project, revision, proposals) = manager.pattern_proposal_inventory();
         let id = proposals[0].definition.fingerprint().unwrap();

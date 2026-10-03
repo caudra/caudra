@@ -5006,6 +5006,7 @@ mod tests {
     const BROWSE_CONTENT_SENTINEL: &str = "content_not_authorized_by_a_names_only_grant";
     const PATTERN_PACKAGES: [&str; 3] = ["alpha", "beta", "gamma"];
     const PATTERN_COMMAND: &str = "cargo check -p alpha --tests";
+    const LEARNED_TEMPLATE: &str = "cargo check -p <value> --tests";
     const INTERPRETER_SIBLING: &str = "cargo check -p core && python3 -c 'print(1)'";
     const INLINE_PYTHON: ShellOpacity = ShellOpacity::InlineScript {
         language: ScriptLanguage::Python,
@@ -7264,8 +7265,7 @@ mod tests {
                                 .collect(),
                         }
                     );
-                    assert!(template.label.contains("cargo"));
-                    assert!(template.label.contains("<pattern1>"));
+                    assert!(template.label.starts_with(LEARNED_TEMPLATE));
                     assert!(
                         template
                             .description

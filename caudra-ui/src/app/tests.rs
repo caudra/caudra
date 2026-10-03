@@ -4573,6 +4573,7 @@ fn batch_roster(id: &str, children: usize) -> AgentEvent {
                 raw_input: None,
                 output: None,
                 annotation: None,
+                refused: false,
             })
             .collect(),
         text: String::new(),
@@ -17550,6 +17551,7 @@ fn batch_plan_completion_checks_authority(
                 })),
                 annotation: None,
                 model_suffix: None,
+                refused: false,
             },
         }))
     };

@@ -4,10 +4,11 @@ use caudra_agent::permissions::{
     ComposedAnswerError, ComposedRow, PermissionLifetime, PermissionRequest,
     PermissionResourceSelector, PermissionRowGrant, PermissionRuleOption,
     pattern_matching::{CompiledPattern, PatternCompileError},
+    review::slot_label,
 };
 use caudra_storage::permission_patterns::{
     ArgumentDomain, ArgumentRole, ObservedTuple, OptionLikePolicy, PatternDefinition, PatternToken,
-    PatternValidationError, SlotCombinations, SlotId,
+    PatternValidationError, SlotCombinations,
 };
 use caudra_workbench::text_field::TextField;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -166,7 +167,7 @@ pub(super) fn offered_pattern(option: &PermissionRuleOption) -> Option<&PatternD
 
 /// Whether an edited template reaches past the values it was suggested with:
 /// a pattern, any argument, option-looking data, or slots combined freely.
-pub(super) fn pattern_widened(definition: &PatternDefinition) -> bool {
+pub(crate) fn pattern_widened(definition: &PatternDefinition) -> bool {
     definition.slots.iter().any(|slot| {
         matches!(
             slot.domain,
@@ -191,15 +192,6 @@ pub(super) fn unknown_role_caution(definition: &PatternDefinition) -> Option<&'s
             )
         })
         .then_some(UNKNOWN_ROLE_CAUTION)
-}
-
-pub(crate) fn slot_name(definition: &PatternDefinition, id: SlotId) -> String {
-    let index = definition
-        .slots
-        .iter()
-        .position(|slot| slot.id == id)
-        .unwrap_or_default();
-    format!("<pattern{}>", index + 1)
 }
 
 fn literal(value: &str) -> String {
@@ -251,24 +243,24 @@ fn combinations_text(definition: &PatternDefinition) -> String {
 fn compile_error(definition: &PatternDefinition, error: PatternCompileError) -> String {
     let message = match error {
         PatternCompileError::Expression { slot, reason } => {
-            format!("{}: {reason}", slot_name(definition, slot))
+            format!("{}: {reason}", slot_label(definition, slot))
         }
         PatternCompileError::InvalidTuple(slot) => format!(
             "A combination seen before doesn't fit {}",
-            slot_name(definition, slot)
+            slot_label(definition, slot)
         ),
         PatternCompileError::Definition(PatternValidationError::InvalidSlot(slot)) => {
-            format!("{} can't vary here", slot_name(definition, slot))
+            format!("{} can't vary here", slot_label(definition, slot))
         }
         PatternCompileError::Definition(PatternValidationError::InvalidDomain(slot)) => {
-            format!("{} has no values it may take", slot_name(definition, slot))
+            format!("{} has no values it may take", slot_label(definition, slot))
         }
         other => other.to_string(),
     };
     review_text(&message)
 }
 
-pub(crate) fn pattern_summary(definition: &PatternDefinition) -> ScopeSummary {
+pub(super) fn pattern_summary(definition: &PatternDefinition) -> ScopeSummary {
     let mut lines = vec![
         format!("Name: {}", review_text(&definition.name)),
         format!(
@@ -278,9 +270,8 @@ pub(crate) fn pattern_summary(definition: &PatternDefinition) -> ScopeSummary {
     ];
     for slot in &definition.slots {
         lines.push(format!(
-            "{} ({}): {}, {}",
-            slot_name(definition, slot.id),
-            review_text(&slot.label),
+            "{}: {}, {}",
+            slot_label(definition, slot.id),
             domain_name(&slot.domain),
             domain_text(&slot.domain)
         ));
@@ -876,22 +867,23 @@ pub(super) mod tests {
             ObservationProvenance, ObservationSource, ObservationVerification, ShellEffectStatus,
         },
         prepared_command_binding,
+        review::command_template_phrase,
     };
     use caudra_storage::permission_patterns::{
-        ArgumentRole, PATTERN_SCHEMA_VERSION, PatternContext, PatternSlot,
+        ArgumentRole, PATTERN_SCHEMA_VERSION, PatternContext, PatternSlot, SlotId,
     };
     use caudra_storage::permission_state::validate_command_templates;
     use crossterm::event::{KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
     use serde_json::json;
     use test_case::test_case;
 
-    use super::super::decision::tests::native_shell_request;
+    use super::super::decision::tests::commands_request;
     use super::super::view::tests::{key, prose, render};
     use super::super::{Panel, PromptMouse};
     use super::{
         ArgumentDomain, CompiledPattern, CurrentMatch, InspectorControl, MATCH_MISMATCH,
         MATCH_UNAVAILABLE, OptionLikePolicy, PatternDefinition, PatternToken, PermissionPrompt,
-        PermissionResourceSelector, PromptTarget, ScopeItem, SlotCombinations, SlotId,
+        PermissionResourceSelector, PromptTarget, ScopeItem, SlotCombinations,
         UNKNOWN_ROLE_CAUTION, offered_pattern, pattern_summary, unknown_role_caution,
     };
     use super::{KeyCode, KeyModifiers};
@@ -909,7 +901,7 @@ pub(super) mod tests {
     const SECOND_SLOT: SlotId = SlotId(17);
     const TEMPLATE_PHRASE: &str = "REVIEW TEMPLATE";
     const TEMPLATE_HEAD: &str = "cargo check -p";
-    const RENAMED_SLOT: &str = "<pattern1> (crate)";
+    const RENAMED_SLOT: &str = "<crate>: ";
     const LATER_NAME: &str = "later name";
     const NOT_PERSISTED: &str = "not persisted";
     const EXPECTED_TUPLE: &str = "\"caudra-agent\" │ \"arm\"";
@@ -959,7 +951,7 @@ pub(super) mod tests {
             ],
             slots: vec![PatternSlot {
                 id: SLOT,
-                label: "<pattern1>".into(),
+                label: "<value>".into(),
                 domain: ArgumentDomain::ObservedSet {
                     values: BTreeSet::from([AGENT_VALUE.into(), UI_VALUE.into()]),
                 },
@@ -975,6 +967,16 @@ pub(super) mod tests {
     }
 
     fn offered_request(id: &str, definition: PatternDefinition) -> Box<PermissionRequest> {
+        offered_batch(id, definition, &[])
+    }
+
+    /// `definition` offered for the first command, the one it was observed
+    /// in, with `others` after it.
+    fn offered_batch(
+        id: &str,
+        definition: PatternDefinition,
+        others: &[&str],
+    ) -> Box<PermissionRequest> {
         let mut observation = preview(&definition, UI_VALUE);
         if let SlotCombinations::ObservedTuples { tuples } = &definition.combinations
             && let Some(bindings) = tuples
@@ -994,7 +996,7 @@ pub(super) mod tests {
             .map(|word| shell_words::quote(word).into_owned())
             .collect::<Vec<_>>()
             .join(" ");
-        let mut request = native_shell_request(&command);
+        let mut request = commands_request(&[&[command.as_str()], others].concat());
         request.id = id.into();
         let binding = prepared_command_binding(&request.resources[0].value, &request.input);
         observation.source.input_hash.clone_from(&binding);
@@ -1030,6 +1032,20 @@ pub(super) mod tests {
         let mut prompt = PermissionPrompt::new();
         prompt.enqueue(offered_request("pattern", definition()), None);
         prompt
+    }
+
+    /// A template the way a learned one arrives: the first command's default
+    /// rung, named by its phrase and seen `seen` times.
+    pub(crate) fn learned_request(seen: usize, others: &[&str]) -> PermissionRequest {
+        let mut request = offered_batch("learned", definition(), others);
+        for option in &mut request.options {
+            if option.id == OPTION_ID {
+                option.label = command_template_phrase(&definition());
+                option.is_default = true;
+                option.seen = Some(seen);
+            }
+        }
+        *request
     }
 
     fn inspect(prompt: &mut PermissionPrompt) {
@@ -1339,7 +1355,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn names_change_display_not_fingerprint_or_neutral_slot_tokens() {
+    fn names_change_display_not_fingerprint() {
         let mut prompt = suggested_prompt();
         let fingerprint = definition().fingerprint().unwrap();
         inspect(&mut prompt);

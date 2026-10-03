@@ -6214,6 +6214,7 @@ mod shell_receipt_tests {
                 output: Some(output),
                 annotation: None,
                 model_suffix: None,
+                refused: false,
             }],
             text: String::new(),
         }
@@ -6523,6 +6524,7 @@ mod retained_progress_tests {
                     output: None,
                     annotation: None,
                     model_suffix: None,
+                    refused: false,
                 }],
                 text: String::new(),
             }),

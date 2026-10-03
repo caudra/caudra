@@ -1,7 +1,7 @@
 use super::decisions::{advisories, label_answer};
 use super::diagnostics::{answer_scope_kind, bounded_log_value};
 use super::diagnostics::{prompt_reason, prompt_reason_message};
-use super::manager::PERMISSION_POLL_INTERVAL;
+use super::manager::{ObservedPatterns, PERMISSION_POLL_INTERVAL};
 use super::policy::TRUSTED_UNSCOPED_TOOLS;
 use super::structured::trusted_shell_request;
 use super::{
@@ -609,7 +609,8 @@ impl PermissionManager {
                 None => PermissionError::new(&tool_string, &scope_display()),
             }
         };
-        let allowed = |source: &'static str| {
+        let allowed = |observed: ObservedPatterns<'_>, source: &'static str| {
+            observed.keep();
             caudra_otel::emit::tool_decision(
                 &tool_string,
                 caudra_otel::emit::DECISION_ACCEPT,
@@ -693,7 +694,7 @@ impl PermissionManager {
             exact_plan,
         };
         let mut request = full_request;
-        self.observe_pattern_request(&request);
+        let observed = self.observe_pattern_request(&request);
         if scopes.plan_scoped {
             contain_authority_to_the_plan(&mut request);
         }
@@ -701,7 +702,7 @@ impl PermissionManager {
             .current_policy(&request, &context)
             .map_err(|error| deny(DECISION_SOURCE_RULE, Some(error.to_string())))?;
         if current.automatic {
-            return allowed(current.source);
+            return allowed(observed, current.source);
         }
         let mut receipts = Vec::new();
         let mut escalation = None;
@@ -712,10 +713,10 @@ impl PermissionManager {
                 .map_err(|error| deny(DECISION_SOURCE_RULE, Some(error.to_string())))?;
             current = screened.policy;
             if current.automatic {
-                return allowed(current.source);
+                return allowed(observed, current.source);
             }
             if screened.approved {
-                return allowed(DECISION_SOURCE_AUTO);
+                return allowed(observed, DECISION_SOURCE_AUTO);
             }
             request.presentation.auto = screened.note;
             escalation = screened.escalation;
@@ -1045,7 +1046,7 @@ impl PermissionManager {
             }
         }
         if allow {
-            allowed(source)
+            allowed(observed, source)
         } else {
             let guidance = match decision {
                 PendingDecision::Explicit(answer) => answer.guidance().map(String::from),

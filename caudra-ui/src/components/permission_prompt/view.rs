@@ -1,5 +1,6 @@
 use std::iter::repeat_n;
 
+use caudra_agent::permissions::review::command_template_values;
 use caudra_agent::permissions::{
     PermissionCaution, PermissionLifetime, PermissionRequest, PermissionResourceAccess,
     PermissionResourceKind, PermissionRowGrant, PromptReason, grade_command_pattern,
@@ -17,7 +18,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::choices::{Choice, ONCE_ONLY, grant_label, grant_names_commands};
+use super::choices::{Choice, ONCE_ONLY, grant_label, grant_names_commands, grant_template};
 use super::customize::{Effect, Field, ScopeItem, scope_item_label, scope_item_names_commands};
 use super::decision::{covered, grant_option, main_ladder, row_positions};
 use super::details::{review_lines, review_text};
@@ -816,6 +817,11 @@ impl PermissionPrompt {
         body.blank();
         let names_commands = self.scope_names_commands();
         for (index, choice) in self.choices().into_iter().enumerate() {
+            if choice == Choice::Deny
+                && let Some(learned) = self.learned_line()
+            {
+                body.push(indented(NUMBER_INDENT, &learned, t.tool_dim, body.width));
+            }
             let highlighted = choice == self.highlight;
             let target = PromptTarget::Choice(choice);
             let style = choice_style(highlighted, self.hover.as_ref() == Some(&target), t);
@@ -1251,6 +1257,20 @@ impl PermissionPrompt {
                 first.spans[0] = Span::styled(pointer, style);
                 first.spans.insert(0, lead);
             }
+            if highlighted
+                && let ScopeItem::Row(grant) = item
+                && let Some(values) = customize
+                    .row
+                    .and_then(|row| grant_template(request, row, grant))
+                    .and_then(command_template_values)
+            {
+                lines.extend(indented(
+                    indent + POINTER.width(),
+                    &values,
+                    t.tool_dim,
+                    body.width,
+                ));
+            }
             body.control(target, lines, highlighted);
             if *item == ScopeItem::OwnPattern
                 && self.state == PromptState::PatternEditing
@@ -1504,6 +1524,7 @@ pub(super) mod tests {
     use super::super::decision::tests::{
         PROJECT, command_resource, commands_request, native_shell_request, shell_request,
     };
+    use super::super::inspector::tests::learned_request;
     use super::super::{Panel, PermissionPrompt};
     use super::{PLAN_READ_QUESTION, PLAN_WRITE_QUESTION};
     use crate::components::buffer_text;
@@ -1553,6 +1574,13 @@ pub(super) mod tests {
     const ADVISORY_PROBABILITY: f64 = 0.875;
     const DELETE_CAUTION: &str = "May delete files (88%)";
     const BARE_RUNG: &str = "cargo *";
+    pub(crate) const LEARNED_SEEN: usize = 4;
+    const LEARNED_SCOPE: &str = "‹cargo check -p <value> --tests›";
+    pub(crate) const TEMPLATE_VALUES: &str = "<value> is caudra-agent or caudra-ui.";
+    const LEARNED_LINE: &str =
+        "Learned from 4 similar commands. <value> is caudra-agent or caudra-ui.";
+    const LEARNED_WORDS: &str = "Learned from";
+    const OTHER_COMMAND: &str = "ls src";
     pub(crate) const INTERNAL_TERMS: [&str; 12] = [
         "SHA-256",
         "sha256",
@@ -1840,6 +1868,7 @@ pub(super) mod tests {
                     "rm -rf target/debug/incremental",
                 ))),
             ),
+            ("learned", prompt_for(learned_request(LEARNED_SEEN, &[]))),
         ];
         let mut guidance = shell_prompt(SINGLE_COMMAND);
         guidance.open_guidance();
@@ -1850,6 +1879,9 @@ pub(super) mod tests {
         let mut customize = shell_prompt(SINGLE_COMMAND);
         customize.open_customize(false);
         surfaces.push(("customize", customize));
+        let mut learned_customize = prompt_for(learned_request(LEARNED_SEEN, &[]));
+        learned_customize.open_customize(false);
+        surfaces.push(("learned-customize", learned_customize));
         let mut advanced = shell_prompt(SINGLE_COMMAND);
         advanced.open_customize(false);
         if let Some(customize) = advanced.customize.as_mut() {
@@ -2347,5 +2379,65 @@ pub(super) mod tests {
             .find(|line| line.contains(BARE_RUNG))
             .unwrap_or_else(|| panic!("{BARE_RUNG} is not listed\n{text}"));
         assert!(rung.contains(BROAD), "{rung}");
+    }
+
+    fn never_remembered(mut request: PermissionRequest) -> PermissionRequest {
+        for option in &mut request.options {
+            option.allowed_lifetimes = vec![PermissionLifetime::Once];
+        }
+        request
+    }
+
+    #[test_case(learned_request(LEARNED_SEEN, &[]), true; "learned_template")]
+    #[test_case(native_shell_request(SINGLE_COMMAND), false; "prefix")]
+    #[test_case(never_remembered(learned_request(LEARNED_SEEN, &[])), false; "once_only")]
+    fn only_a_learned_scope_to_remember_says_it_was_learned(
+        request: PermissionRequest,
+        learned: bool,
+    ) {
+        let mut prompt = prompt_for(request);
+        let text = prose(&mut prompt, FIT_WIDTH, FIT_HEIGHT);
+        assert_eq!(text.contains(LEARNED_WORDS), learned, "{text}");
+    }
+
+    /// The learned line speaks for the scope the choices remember, so it
+    /// goes once `←` widens past the template and comes back with `→`.
+    #[test]
+    fn the_learned_line_follows_the_scope() {
+        let mut prompt = prompt_for(learned_request(LEARNED_SEEN, &[]));
+        let text = prose(&mut prompt, FIT_WIDTH, FIT_HEIGHT);
+        assert!(text.contains(LEARNED_SCOPE), "{text}");
+        assert!(text.contains(LEARNED_LINE), "{text}");
+        prompt.handle_key(key(KeyCode::Left));
+        let text = prose(&mut prompt, FIT_WIDTH, FIT_HEIGHT);
+        assert!(!text.contains(LEARNED_WORDS), "{text}");
+        prompt.handle_key(key(KeyCode::Right));
+        let text = prose(&mut prompt, FIT_WIDTH, FIT_HEIGHT);
+        assert!(text.contains(LEARNED_LINE), "{text}");
+    }
+
+    #[test]
+    fn the_learned_line_follows_the_focused_command() {
+        let mut prompt = prompt_for(learned_request(LEARNED_SEEN, &[OTHER_COMMAND]));
+        let text = prose(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT);
+        assert!(text.contains(LEARNED_LINE), "{text}");
+        prompt.handle_key(key(KeyCode::Tab));
+        let text = prose(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT);
+        assert!(!text.contains(LEARNED_WORDS), "{text}");
+        prompt.handle_key(key(KeyCode::BackTab));
+        let text = prose(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT);
+        assert!(text.contains(LEARNED_LINE), "{text}");
+    }
+
+    #[test]
+    fn customize_says_what_a_highlighted_template_stands_for() {
+        let mut prompt = prompt_for(learned_request(LEARNED_SEEN, &[]));
+        prompt.open_customize(false);
+        let text = prose(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT);
+        assert!(text.contains(TEMPLATE_VALUES), "{text}");
+        assert!(!text.contains(LEARNED_WORDS), "{text}");
+        prompt.handle_key(key(KeyCode::Down));
+        let text = prose(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT);
+        assert!(!text.contains(TEMPLATE_VALUES), "{text}");
     }
 }

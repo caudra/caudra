@@ -199,6 +199,33 @@ impl PatternRecognizer {
             .is_some_and(|stored| stored.observation == *observation)
     }
 
+    /// Forgets an accepted observation, as if it was never seen: a call that
+    /// was refused is no evidence that the command recurs. Its ID may be
+    /// observed again.
+    pub fn withdraw(&mut self, observation: &CommandObservation) -> bool {
+        let withdrawn = self.retains(observation) && self.remove(&ObservationKey::new(observation));
+        if withdrawn {
+            self.stats.received = self.stats.received.saturating_sub(1);
+            self.stats.accepted = self.stats.accepted.saturating_sub(1);
+        }
+        withdrawn
+    }
+
+    fn remove(&mut self, key: &ObservationKey) -> bool {
+        let Some(stored) = self.observations.remove(key) else {
+            return false;
+        };
+        self.stats.retained_bytes = self.stats.retained_bytes.saturating_sub(stored.bytes);
+        let shape = ShapeKey::new(&stored.observation);
+        if let Some(keys) = self.index.get_mut(&shape) {
+            keys.remove(key);
+            if keys.is_empty() {
+                self.index.remove(&shape);
+            }
+        }
+        true
+    }
+
     pub fn suggestions(&self) -> Result<Vec<PatternCandidate>, RecognitionError> {
         let mut candidates = Vec::new();
         for keys in self.index.values() {
@@ -268,15 +295,7 @@ impl PatternRecognizer {
             if previous.observation == observation {
                 return Ok(ObserveOutcome::Duplicate);
             }
-            let shape = ShapeKey::new(&previous.observation);
-            self.stats.retained_bytes = self.stats.retained_bytes.saturating_sub(previous.bytes);
-            self.observations.remove(&key);
-            if let Some(keys) = self.index.get_mut(&shape) {
-                keys.remove(&key);
-                if keys.is_empty() {
-                    self.index.remove(&shape);
-                }
-            }
+            self.remove(&key);
             self.quarantined.insert(key);
             return Err(RecognitionError::Collision);
         }
@@ -991,13 +1010,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_withdrawn_observation_is_no_longer_evidence() {
+        let mut learner = recognizer();
+        let candidates = vec![pair(&mut learner)];
+        let second = observation(&SECOND, "second");
+        let mut changed = second.clone();
+        changed.argv[2] = FIRST[2].into();
+        assert!(!learner.withdraw(&changed));
+        assert!(learner.withdraw(&second));
+        assert_caps(&learner);
+        assert!(learner.suggestions().unwrap().is_empty());
+        assert!(!learner.withdraw(&second));
+        assert!(matches!(learner.observe(second), Ok(ObserveOutcome::Added)));
+        assert_caps(&learner);
+        assert_eq!(learner.suggestions().unwrap(), candidates);
+    }
+
     #[test_case(true; "unknown_cli_observed_tuples")]
     fn unknown_cli_needs_no_dictionary(preserve_tuples: bool) {
         let mut learner = recognizer();
         let candidate = pair(&mut learner);
         assert_eq!(candidate.definition.slots.len(), 2);
-        assert_eq!(candidate.definition.slots[0].label, "<pattern1>");
-        assert_eq!(candidate.definition.slots[1].label, "<pattern2>");
+        assert_eq!(candidate.definition.slots[0].label, "<value1>");
+        assert_eq!(candidate.definition.slots[1].label, "<value2>");
         assert_eq!(candidate.definition.slots[0].id, SlotId(2));
         assert!(matches!(
             candidate.definition.argv[1],

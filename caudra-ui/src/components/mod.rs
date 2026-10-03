@@ -302,10 +302,6 @@ fn hint_gap_width() -> u16 {
     UnicodeWidthStr::width(HINT_GAP) as u16
 }
 
-pub(crate) fn hint_line(hints: &[Hint]) -> Line<'static> {
-    hint_line_hovered(hints, None)
-}
-
 /// The hint bar with one hint marked. A hovered hint reverses whole, key and
 /// description together, so the pointer marks the control rather than half of
 /// it. The gap before a hint separates two controls and belongs to neither, so
@@ -601,6 +597,14 @@ pub(crate) fn format_integer(value: u64) -> String {
 
 pub(crate) fn format_usize(value: usize) -> String {
     format_integer(u64::try_from(value).unwrap_or(u64::MAX))
+}
+
+/// `1 message`, `3 messages`.
+pub(crate) fn counted(count: usize, noun: &str) -> String {
+    match count {
+        1 => format!("{count} {noun}"),
+        _ => format!("{count} {noun}s"),
+    }
 }
 
 /// `41k`, `1.2M`: a count at the width a chip or a card row can spare.

@@ -510,6 +510,7 @@ fn append_unavailable_results(
             is_error: true,
             output_ref: None,
             images: Vec::new(),
+            refused_calls: Vec::new(),
         },
     }));
 }

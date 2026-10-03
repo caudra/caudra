@@ -7766,6 +7766,7 @@ fn batch_child(tool: &str, marker: &str) -> caudra_agent::BatchToolEntry {
             format!("{BATCH_CHILD_BODY}_{marker}").into(),
         )),
         annotation: None,
+        refused: false,
     }
 }
 
@@ -9000,6 +9001,7 @@ fn pending_child(tool: &str) -> caudra_agent::BatchToolEntry {
         raw_input: None,
         output: None,
         annotation: None,
+        refused: false,
     }
 }
 
@@ -9322,6 +9324,7 @@ fn eager_entry(status: BatchToolStatus) -> BatchToolEntry {
         raw_input: Some(serde_json::json!({ "command": EAGER_SUMMARY })),
         output: Some(ToolOutput::Plain(EAGER_BODY.into())),
         annotation: Some(EAGER_ANNOTATION.into()),
+        refused: false,
     }
 }
 

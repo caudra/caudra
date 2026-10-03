@@ -25,7 +25,7 @@ use crate::components::document_view::{
 };
 use crate::components::keybindings::key;
 use crate::components::modal::{CLOSE_HINT, ESC_LABEL, FooterHits, FooterLine, SEPARATOR};
-use crate::components::{Overlay, escape_terminal_controls, plain_char};
+use crate::components::{Overlay, counted, escape_terminal_controls, plain_char};
 use crate::theme::{self, Theme};
 
 #[cfg(test)]
@@ -383,14 +383,6 @@ fn footer(view: View, theme: &Theme) -> FooterLine {
         footer.describe(hint, theme.tool_dim);
     }
     footer
-}
-
-/// `1 message`, `3 messages`.
-fn counted(count: usize, noun: &str) -> String {
-    match count {
-        1 => format!("{count} {noun}"),
-        _ => format!("{count} {noun}s"),
-    }
 }
 
 #[cfg(test)]

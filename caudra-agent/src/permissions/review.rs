@@ -2,7 +2,7 @@ use super::{
     COMMAND_OBSERVATION_BINDING_ATTRIBUTE, POSSIBLE_WORKDIRS_ATTRIBUTE, resources::PreparedWorkdirs,
 };
 use caudra_storage::permission_patterns::{
-    ArgumentDomain, PatternDefinition, PatternToken, SlotCombinations,
+    ArgumentDomain, PatternDefinition, PatternToken, SlotCombinations, SlotId,
 };
 use caudra_storage::permission_state::{
     BROWSE_RECURSION_ATTRIBUTE, PermissionReview, PermissionReviewResource, PermissionReviewSource,
@@ -11,6 +11,7 @@ use caudra_storage::permission_state::{
     filesystem_browse_recursion,
 };
 use serde_json::{Map, Value, json};
+use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 use url::Url;
 
@@ -33,6 +34,16 @@ pub const COMMAND_TEMPLATE_EXECUTION_NOTICE: &str =
     "Execution grant; callee behavior is unknown, not certified read-only or path-confined";
 const REDACTED: &str = "[redacted]";
 const OMITTED: &str = "[omitted: review limit]";
+const FALLBACK_SLOT_NAME: &str = "value";
+const MAX_SLOT_NAME_BYTES: usize = 24;
+const SLOT_NAME_PUNCTUATION: &[char] = &['-', '_', '.'];
+const MAX_LISTED_VALUES: usize = 4;
+const MAX_VALUE_CHARS: usize = 40;
+const SHORTENED: char = '…';
+const ONE_OTHER: &str = "1 other";
+const OTHERS: &str = "others";
+const NOTHING: &str = "nothing";
+const SEEN_COMBINATIONS_ONLY: &str = "Only in combinations seen before.";
 const UNKNOWN_INPUT: &str = "[omitted: unrecognized tool input]";
 const UNKNOWN_FIELD: &str = "[omitted: unrecognized field]";
 const BULK_CONTENT: &str = "[omitted: content payload]";
@@ -601,15 +612,7 @@ pub fn command_template_label(definition: &PatternDefinition) -> String {
     for token in &definition.argv {
         let word = match token {
             PatternToken::Exact { value, .. } => literal(value),
-            PatternToken::Slot { id, .. } => {
-                let name = definition
-                    .slots
-                    .iter()
-                    .find(|slot| slot.id == *id)
-                    .and_then(|slot| display_text(&slot.label))
-                    .unwrap_or_else(|| OMITTED.into());
-                format!("<{name}>")
-            }
+            PatternToken::Slot { id, .. } => slot_label(definition, *id),
         };
         if label.len() + word.len() + 1 > REVIEW_MAX_STRING_BYTES {
             return OMITTED.into();
@@ -632,10 +635,7 @@ pub fn command_template_label(definition: &PatternDefinition) -> String {
             ArgumentDomain::Regex { pattern } => format!("regex {}", literal(pattern)),
             ArgumentDomain::AnyLiteralArgument => "any one literal argument".into(),
         };
-        let detail = format!(
-            "; {}: {domain}",
-            display_text(&slot.label).unwrap_or_else(|| OMITTED.into())
-        );
+        let detail = format!("; {}: {domain}", slot_label(definition, slot.id));
         if label.len() + detail.len() > REVIEW_MAX_STRING_BYTES {
             return OMITTED.into();
         }
@@ -665,20 +665,124 @@ pub fn command_template_phrase(definition: &PatternDefinition) -> String {
             PatternToken::Exact { value, .. } => {
                 display_text(value).map(|value| shell_words::quote(&value).into_owned())
             }
-            PatternToken::Slot { id, .. } => definition
-                .slots
-                .iter()
-                .find(|slot| slot.id == *id)
-                .and_then(|slot| display_text(&slot.label))
-                .map(|name| {
-                    let name = name.trim_start_matches('<').trim_end_matches('>');
-                    format!("<{name}>")
-                }),
+            PatternToken::Slot { id, .. } => Some(slot_label(definition, *id)),
         })
         .collect::<Option<Vec<_>>>()
         .map(|words| words.join(" "))
         .filter(|phrase| phrase.len() <= REVIEW_MAX_STRING_BYTES)
         .unwrap_or_else(|| OMITTED.into())
+}
+
+/// A slot the way a template names it, `<package>`: its label as one plain
+/// word, else its position, numbered when another slot reads the same.
+pub fn slot_label(definition: &PatternDefinition, id: SlotId) -> String {
+    let word = |position: usize, label: &str| {
+        let word = label
+            .trim_start_matches('<')
+            .trim_end_matches('>')
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join("-");
+        let plain = !word.is_empty()
+            && word.len() <= MAX_SLOT_NAME_BYTES
+            && word.chars().all(|character| {
+                character.is_ascii_alphanumeric() || SLOT_NAME_PUNCTUATION.contains(&character)
+            });
+        if plain {
+            word
+        } else {
+            format!("{FALLBACK_SLOT_NAME}{}", position + 1)
+        }
+    };
+    let words: Vec<_> = definition
+        .slots
+        .iter()
+        .enumerate()
+        .map(|(position, slot)| word(position, &slot.label))
+        .collect();
+    let Some(position) = definition.slots.iter().position(|slot| slot.id == id) else {
+        return format!("<{FALLBACK_SLOT_NAME}>");
+    };
+    let own = &words[position];
+    if words.iter().filter(|word| *word == own).count() > 1 {
+        format!("<{own}{}>", position + 1)
+    } else {
+        format!("<{own}>")
+    }
+}
+
+/// What a template's slots stand for, one sentence each, as in
+/// `<package> is caudra-agent or caudra-ui.` `None` for a template that fixes
+/// every word.
+pub fn command_template_values(definition: &PatternDefinition) -> Option<String> {
+    if definition.slots.is_empty() {
+        return None;
+    }
+    let mut sentences: Vec<_> = definition
+        .slots
+        .iter()
+        .map(|slot| {
+            let name = slot_label(definition, slot.id);
+            match &slot.domain {
+                ArgumentDomain::ObservedSet { values } => {
+                    format!("{name} is {}.", alternatives(values))
+                }
+                ArgumentDomain::Exact { value } => format!("{name} is {}.", value_word(value)),
+                ArgumentDomain::Glob { pattern } => {
+                    format!("{name} matches the wildcard {}.", value_word(pattern))
+                }
+                ArgumentDomain::Regex { pattern } => {
+                    format!("{name} matches the expression {}.", value_word(pattern))
+                }
+                ArgumentDomain::AnyLiteralArgument => format!("{name} is any one argument."),
+            }
+        })
+        .collect();
+    if definition.slots.len() > 1
+        && matches!(
+            definition.combinations,
+            SlotCombinations::ObservedTuples { .. }
+        )
+    {
+        sentences.push(SEEN_COMBINATIONS_ONLY.into());
+    }
+    Some(sentences.join(" "))
+}
+
+/// `a, b, c, d or 3 others`.
+fn alternatives(values: &BTreeSet<String>) -> String {
+    let mut words: Vec<_> = values
+        .iter()
+        .take(MAX_LISTED_VALUES)
+        .map(|value| value_word(value))
+        .collect();
+    match values.len().saturating_sub(MAX_LISTED_VALUES) {
+        0 => {}
+        1 => words.push(ONE_OTHER.into()),
+        others => words.push(format!("{others} {OTHERS}")),
+    }
+    match words.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+        None => NOTHING.into(),
+    }
+}
+
+/// One value as a sentence quotes it: redacted, escaped, shortened past a
+/// glance, and quoted where the shell would need it.
+fn value_word(value: &str) -> String {
+    let Some(text) = display_text(value) else {
+        return OMITTED.into();
+    };
+    let text = if text.chars().count() > MAX_VALUE_CHARS {
+        text.chars()
+            .take(MAX_VALUE_CHARS - 1)
+            .chain([SHORTENED])
+            .collect()
+    } else {
+        text
+    };
+    shell_words::quote(&text).into_owned()
 }
 
 fn absolute_preimage(value: &str) -> Option<&Path> {
@@ -1119,10 +1223,15 @@ fn review_words(value: &str) -> Vec<(usize, usize, bool)> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::iter;
     use std::path::Path;
 
     use caudra_config::ToolKey;
+    use caudra_storage::permission_patterns::{
+        ArgumentDomain, ArgumentRole, OptionLikePolicy, PATTERN_SCHEMA_VERSION, PatternContext,
+        PatternDefinition, PatternSlot, PatternToken, SlotCombinations, SlotId,
+    };
     use caudra_storage::permission_state::{PermissionLifetime, PermissionRuleRecord};
     use serde_json::{Value, json};
     use test_case::test_case;
@@ -1135,9 +1244,9 @@ mod tests {
         PermissionResourceKind, PermissionResourceSelector, PermissionReviewSource,
         PermissionSubject, REDACTED, REVIEW_MAX_INPUT_DEPTH, REVIEW_MAX_INPUT_NODES,
         REVIEW_MAX_RESOURCES, REVIEW_MAX_STRING_BYTES, StructuredPermissionRule, UNKNOWN_FIELD,
-        UNKNOWN_INPUT, display_text, recovered_value, redact_text, review_for_rule,
-        review_from_candidates, selector_label, url_subtree_digest,
-        visit_review_candidate_preimages,
+        UNKNOWN_INPUT, command_template_phrase, command_template_values, display_text,
+        recovered_value, redact_text, review_for_rule, review_from_candidates, selector_label,
+        slot_label, url_subtree_digest, visit_review_candidate_preimages,
     };
     use crate::permissions::{
         ComposedRow, PermissionRowGrant, canonical_json_sha256, selected_input_digest,
@@ -1153,6 +1262,11 @@ mod tests {
     const URL_ROOT: &str = "https://example.test/api";
     const URL_ORIGIN: &str = "https://example.test";
     const PATTERN: &str = "**/*.{rs,toml}";
+    const TEMPLATE_NAME: &str = "template";
+    const TEMPLATE_PROGRAM: &str = "cargo";
+    const CRATES: &[&str] = &["caudra-agent", "caudra-ui", "caudra-workcell"];
+    const LONG_LABEL: &str = "abcdefghijklmnopqrstuvwxyz";
+    const LONG_VALUE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     #[test_case(PATH; "raw_and_filesystem_domains_once")]
     fn candidate_digest_visit_is_domain_separated(value: &str) {
@@ -1869,5 +1983,110 @@ mod tests {
             &changed
         ));
         PermissionRuleRecord::conversation_with_review(rules[0].clone(), Some(review)).unwrap();
+    }
+
+    fn template(
+        labels: &[&str],
+        domain: &ArgumentDomain,
+        combinations: SlotCombinations,
+    ) -> PatternDefinition {
+        let slot_id = |position: usize| SlotId(u16::try_from(position + 1).unwrap());
+        PatternDefinition {
+            version: PATTERN_SCHEMA_VERSION,
+            name: TEMPLATE_NAME.into(),
+            context: PatternContext {
+                tool_identity: TEMPLATE_NAME.into(),
+                executable_identity: TEMPLATE_PROGRAM.into(),
+                effective_workdir: ROOT.into(),
+                path_binding: ROOT.into(),
+                analysis_version: TEMPLATE_NAME.into(),
+            },
+            argv: iter::once(PatternToken::Exact {
+                value: TEMPLATE_PROGRAM.into(),
+                role: ArgumentRole::Executable,
+            })
+            .chain((0..labels.len()).map(|position| PatternToken::Slot {
+                id: slot_id(position),
+                role: ArgumentRole::Unknown,
+            }))
+            .collect(),
+            slots: labels
+                .iter()
+                .enumerate()
+                .map(|(position, label)| PatternSlot {
+                    id: slot_id(position),
+                    label: (*label).into(),
+                    domain: domain.clone(),
+                    option_like: OptionLikePolicy::Reject,
+                })
+                .collect(),
+            combinations,
+        }
+    }
+
+    fn observed(values: &[&str]) -> ArgumentDomain {
+        ArgumentDomain::ObservedSet {
+            values: values.iter().map(|value| (*value).into()).collect(),
+        }
+    }
+
+    #[test_case(&["<package>"], &["<package>"]; "label_names_the_slot")]
+    #[test_case(&["<value1>", "<value2>"], &["<value1>", "<value2>"]; "numbered_labels_stay")]
+    #[test_case(&["crate name"], &["<crate-name>"]; "spaces_become_dashes")]
+    #[test_case(&["<pattern1> (crate)"], &["<value1>"]; "punctuation_falls_back_to_the_position")]
+    #[test_case(&[LONG_LABEL], &["<value1>"]; "long_label_falls_back_to_the_position")]
+    #[test_case(&["\u{1b}[31m"], &["<value1>"]; "control_characters_fall_back")]
+    #[test_case(&["<crate>", "<crate>"], &["<crate1>", "<crate2>"]; "duplicates_are_numbered")]
+    fn slots_read_as_one_plain_word(labels: &[&str], expected: &[&str]) {
+        let definition = template(labels, &observed(CRATES), SlotCombinations::Independent);
+        let names: Vec<_> = definition
+            .slots
+            .iter()
+            .map(|slot| slot_label(&definition, slot.id))
+            .collect();
+        assert_eq!(names, expected);
+        assert_eq!(
+            command_template_phrase(&definition),
+            format!("{TEMPLATE_PROGRAM} {}", expected.join(" "))
+        );
+    }
+
+    #[test_case(&observed(&[CRATES[0]]), "<value> is caudra-agent."; "one_value")]
+    #[test_case(&observed(&CRATES[..2]), "<value> is caudra-agent or caudra-ui."; "two_values")]
+    #[test_case(&observed(CRATES), "<value> is caudra-agent, caudra-ui or caudra-workcell."; "three_values")]
+    #[test_case(&observed(&["a", "b", "c", "d", "e"]), "<value> is a, b, c, d or 1 other."; "one_past_the_cap")]
+    #[test_case(&observed(&["a", "b", "c", "d", "e", "f"]), "<value> is a, b, c, d or 2 others."; "several_past_the_cap")]
+    #[test_case(&observed(&["two words", "\u{1b}[31m"]), "<value> is '\\u{1b}[31m' or 'two words'."; "values_are_escaped_and_quoted")]
+    #[test_case(&observed(&[LONG_VALUE]), "<value> is aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa…."; "long_values_are_shortened")]
+    #[test_case(&ArgumentDomain::Exact { value: CRATES[1].into() }, "<value> is caudra-ui."; "exact")]
+    #[test_case(&ArgumentDomain::Glob { pattern: "src/*.rs".into() }, "<value> matches the wildcard 'src/*.rs'."; "wildcard")]
+    #[test_case(&ArgumentDomain::Regex { pattern: "^caudra-.*$".into() }, "<value> matches the expression '^caudra-.*$'."; "expression")]
+    #[test_case(&ArgumentDomain::AnyLiteralArgument, "<value> is any one argument."; "any")]
+    fn a_template_says_what_its_slot_stands_for(domain: &ArgumentDomain, expected: &str) {
+        let definition = template(&["<value>"], domain, SlotCombinations::Independent);
+        assert_eq!(command_template_values(&definition).unwrap(), expected);
+    }
+
+    #[test_case(true, "<value1> is a or b. <value2> is a or b. Only in combinations seen before."; "observed_tuples")]
+    #[test_case(false, "<value1> is a or b. <value2> is a or b."; "independent")]
+    fn several_slots_say_whether_they_combine_freely(tuples: bool, expected: &str) {
+        let combinations = match tuples {
+            true => SlotCombinations::ObservedTuples {
+                tuples: BTreeSet::new(),
+            },
+            false => SlotCombinations::Independent,
+        };
+        let definition = template(
+            &["<value1>", "<value2>"],
+            &observed(&["a", "b"]),
+            combinations,
+        );
+        assert_eq!(command_template_values(&definition).unwrap(), expected);
+    }
+
+    #[test]
+    fn a_template_without_slots_has_no_values() {
+        let definition = template(&[], &observed(CRATES), SlotCombinations::Independent);
+        assert_eq!(command_template_values(&definition), None);
     }
 }

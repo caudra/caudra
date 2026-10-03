@@ -269,6 +269,7 @@ impl Child {
             raw_input: Some(self.params.clone()),
             output,
             annotation: None,
+            refused: false,
         }
     }
 }
@@ -488,6 +489,7 @@ pub(crate) fn started_entry(start: &ToolStartEvent) -> BatchToolEntry {
         raw_input: start.raw_input.clone(),
         output: None,
         annotation: None,
+        refused: false,
     }
 }
 
@@ -515,6 +517,7 @@ pub(crate) fn settle_entry(entry: &mut BatchToolEntry, done: &crate::ToolDoneEve
     entry.annotation = done.annotation.clone();
     entry.model_suffix = done.model_suffix.clone();
     entry.output = Some(done.output.clone());
+    entry.refused = done.refused();
 }
 
 /// Addresses one child's row on the batch that owns it, which is the only row
@@ -1063,6 +1066,7 @@ mod tests {
             raw_input: None,
             output: Some(ToolOutput::Plain(text.into())),
             annotation: None,
+            refused: false,
         }
     }
 

@@ -370,6 +370,7 @@ mod tests {
                 output: Some(ToolOutput::Peers(receipt("unknown"))),
                 raw_input: None,
                 model_suffix: None,
+                refused: false,
             }],
             text: RAW_JSON.into(),
         };

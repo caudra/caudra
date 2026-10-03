@@ -571,6 +571,7 @@ mod tests {
             is_error,
             output_ref: None,
             images: Vec::new(),
+            refused_calls: Vec::new(),
         })
     }
 

@@ -5119,6 +5119,7 @@ mod tests {
                 lua_provenance: None,
             })),
             annotation: None,
+            refused: false,
         }
     }
 
@@ -5291,6 +5292,7 @@ mod tests {
                 lua_provenance: None,
             })),
             annotation: None,
+            refused: false,
         }
     }
 

@@ -176,6 +176,7 @@ impl Peeked {
                 raw_input: None,
                 output: None,
                 annotation: None,
+                refused: false,
             }
         };
         if let Some(done) = &self.done {

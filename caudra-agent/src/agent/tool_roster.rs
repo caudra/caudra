@@ -199,6 +199,7 @@ impl Child {
             raw_input: None,
             output: None,
             annotation: None,
+            refused: false,
         })
     }
 }
