@@ -16,6 +16,10 @@ code-worker:
 install: code-worker
     cargo install --locked --path . --force
 
+# Install a release-fast build for local release testing: no LTO, parallel and incremental codegen.
+install-fast: code-worker
+    cargo install --locked --path . --force --profile release-fast
+
 build *ARGS:
     "{{ cargo_cmd }}" build {{ ARGS }}
 

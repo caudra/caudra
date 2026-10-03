@@ -254,6 +254,15 @@ strip = "symbols"
 lto = "thin"
 codegen-units = 1
 
+# `just install-fast`: local release testing trades binary size, cross-crate optimization, and
+# incremental-cache disk space for rebuild time. `off` rather than `false`, which still runs
+# ThinLTO across a crate's codegen units.
+[profile.release-fast]
+inherits = "release"
+lto = "off"
+codegen-units = 16
+incremental = true
+
 [profile.bench]
 debug = true
 strip = "none"
