@@ -428,7 +428,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "/decisions",
-        description: "Show decision engine configuration and cached status",
+        description: "Inspect decision engine status, features, activity, and recent decisions",
         max_args: 0,
         scope: ChatScope::Any,
         features: &[Feature::DecisionEngine],

@@ -6,6 +6,7 @@
 
 pub(crate) mod background_delivery;
 mod btw;
+mod decisions;
 mod delegation;
 mod extract;
 pub(crate) mod file_revert;
@@ -55,6 +56,7 @@ use crate::components::command::{CommandAction, CommandPalette, ParsedCommand, d
 use crate::components::command_modal::{CommandModal, CommandModalAction};
 use crate::components::commit_popup::{CommitAction, CommitIndex, CommitPopup};
 use crate::components::context_modal::ContextModal;
+use crate::components::decisions_modal::{DecisionsFetchState, DecisionsModal};
 use crate::components::docs_modal::{DocsAction, DocsModal};
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::goal_modal::GoalModal;
@@ -114,7 +116,7 @@ use crate::components::workflow_inspector::WorkflowInspector;
 use crate::components::worktree_picker::{WorktreePicker, WorktreeView};
 use crate::components::{
     Action, DisplayMessage, DisplayRole, DisplaySource, ExitRequest, Overlay, PlanHandoff,
-    RetryInfo, Status, escape_terminal_controls, is_ctrl,
+    RetryInfo, Status, is_ctrl,
 };
 use crate::image;
 use crate::input_document::InputDraft;
@@ -126,7 +128,6 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use caudra_agent::background::{BackgroundTasks, ShellSnapshot};
 use caudra_agent::commits::repo;
 use caudra_agent::context::{ContextKey, ContextSnapshot, ContextStore};
-use caudra_agent::decisions::DecisionStatus;
 use caudra_agent::herdr::PaneMetadata;
 use caudra_agent::mcp::McpSnapshot;
 use caudra_agent::mentions;
@@ -140,7 +141,6 @@ use caudra_agent::{
     ImageSource, McpConfigErrors, McpPromptInfo, McpSnapshotReader, Mention, PromptAdmission,
     QueueItemId, SharedHistory, SteeringQueue, SubagentInfo, ToolOutput, project_for_inspection,
 };
-use caudra_config::decisions::{DecisionsConfig, FeatureMode};
 use caudra_config::{
     Feature, FeatureDisabled, FeatureFlags, ModelPolicy, PermissionsConfig, SnapshotsConfig,
     UiConfig,
@@ -423,6 +423,7 @@ pub struct App {
     pub(super) logs_modal: LogsModal,
     pub(super) docs_modal: DocsModal,
     pub(super) tools_modal: ToolsModal,
+    pub(super) decisions_modal: DecisionsModal,
     pub(super) skills_modal: SkillsModal,
     pub(super) storage_modal: StorageModal,
     pub(super) system_prompt_modal: SystemPromptModal,
@@ -569,6 +570,7 @@ pub struct App {
     pub(crate) snapshots_config: SnapshotsConfig,
     pub(crate) usage_slot: Arc<ArcSwapOption<UsageFetchState>>,
     pub(crate) storage_slot: Arc<ArcSwapOption<StorageFetchState>>,
+    decisions_slot: Arc<ArcSwapOption<DecisionsFetchState>>,
     pub(crate) shared_history: Option<SharedHistory>,
     pub(crate) btw_prompt: Option<crate::agent::SharedBtwPrompt>,
     /// The `/btw` thread behind the stream modal, alive exactly as long as it
@@ -702,6 +704,7 @@ impl App {
             logs_modal: LogsModal::new(max_log_files),
             docs_modal: DocsModal::new(docs),
             tools_modal: ToolsModal::new(),
+            decisions_modal: DecisionsModal::new(),
             skills_modal: SkillsModal::new(),
             storage_modal: StorageModal::new(),
             system_prompt_modal: SystemPromptModal::default(),
@@ -818,6 +821,7 @@ impl App {
             snapshots_config: SnapshotsConfig::default(),
             usage_slot: Arc::new(ArcSwapOption::empty()),
             storage_slot: Arc::new(ArcSwapOption::empty()),
+            decisions_slot: Arc::new(ArcSwapOption::empty()),
             shared_history: None,
             btw_prompt: None,
             btw_thread: None,
@@ -1745,6 +1749,10 @@ impl App {
             self.tools_modal.scroll(delta);
             return None;
         }
+        if self.decisions_modal.is_open() {
+            self.decisions_modal.scroll_at(pos, delta);
+            return None;
+        }
         if self.skills_modal.is_open() {
             self.skills_modal.scroll(delta);
             return None;
@@ -2101,6 +2109,13 @@ impl App {
             if self.tools_modal.scope() != scope {
                 self.load_tool_stats();
             }
+            return Some(vec![]);
+        }
+
+        if self.decisions_modal.is_open() {
+            guard_repeat!(false);
+            let action = self.decisions_modal.handle_key(key);
+            self.handle_decisions_action(action);
             return Some(vec![]);
         }
 
@@ -3593,31 +3608,6 @@ impl App {
         self.load_tool_stats();
     }
 
-    fn execute_decisions(&mut self, args: &str) {
-        if !args.trim().is_empty() {
-            self.flash(DECISIONS_USAGE.into());
-            return;
-        }
-        let text = self.permissions.decisions().map_or_else(
-            || {
-                decision_status_message(
-                    &DecisionsConfig::default(),
-                    &DecisionStatus::default(),
-                    false,
-                )
-            },
-            |decisions| {
-                decision_status_message(
-                    decisions.config(),
-                    &decisions.status(),
-                    decisions.is_tainted(),
-                )
-            },
-        );
-        self.active_chat()
-            .push(DisplayMessage::new(DisplayRole::Notice, text));
-    }
-
     fn execute_skills(&mut self) {
         self.context_snapshot = Watch::seeded(self.active_context_snapshot());
         self.skills_modal.open();
@@ -4805,6 +4795,7 @@ impl App {
         if let ChatEventResult::PermissionRequest(request) = result {
             self.context_modal.close();
             self.tools_modal.close();
+            self.decisions_modal.close();
             self.skills_modal.close();
             self.storage_modal.close();
             self.system_prompt_modal.close();
@@ -5587,7 +5578,7 @@ impl App {
         }
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 43] {
+    fn overlays(&self) -> [&dyn Overlay; 44] {
         [
             &self.workbench,
             &self.logs_modal,
@@ -5596,6 +5587,7 @@ impl App {
             &self.usage_modal,
             &self.context_modal,
             &self.tools_modal,
+            &self.decisions_modal,
             &self.skills_modal,
             &self.storage_modal,
             &self.system_prompt_modal,
@@ -5635,7 +5627,7 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 43] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 44] {
         [
             &mut self.workbench,
             &mut self.logs_modal,
@@ -5644,6 +5636,7 @@ impl App {
             &mut self.usage_modal,
             &mut self.context_modal,
             &mut self.tools_modal,
+            &mut self.decisions_modal,
             &mut self.skills_modal,
             &mut self.storage_modal,
             &mut self.system_prompt_modal,
@@ -5827,6 +5820,7 @@ impl App {
             | self.model_picker.refresh()
             | self.usage_modal.poll(&self.usage_slot)
             | self.storage_modal.poll(&self.storage_slot)
+            | self.decisions_modal.poll(&self.decisions_slot)
             | self.poll_context_snapshot()
             | self.poll_tools_snapshot()
             | self.logs_modal.poll()
@@ -6498,70 +6492,6 @@ impl App {
         self.main_chat().show_user_message(handoff.header);
         actions
     }
-}
-
-fn decision_status_message(
-    config: &DecisionsConfig,
-    status: &DecisionStatus,
-    tainted: bool,
-) -> String {
-    let endpoint = config
-        .base_url
-        .as_ref()
-        .map(|url| url.origin().ascii_serialization());
-    let reachability = match status.reachable {
-        Some(true) => "reachable (last attempt)",
-        Some(false) => "offline (last attempt)",
-        None => "unknown (not checked)",
-    };
-    let mut lines = vec![
-        format!(
-            "Decision engine: {}",
-            if endpoint.is_some() {
-                "configured"
-            } else {
-                "off"
-            }
-        ),
-        format!(
-            "Endpoint origin: {}",
-            endpoint.as_deref().unwrap_or("not configured")
-        ),
-        format!("Model: {}", escape_terminal_controls(&config.model)),
-        format!(
-            "Logging: {}",
-            if config.log { "enabled" } else { "disabled" }
-        ),
-        format!(
-            "Log write failure: {}",
-            if status.log_failed { "yes" } else { "no" }
-        ),
-        format!("Cached reachability: {reachability}"),
-        format!("Last error: {}", status.last_error.unwrap_or("none")),
-        format!("Session tainted: {}", if tainted { "yes" } else { "no" }),
-        "Feature modes:".into(),
-    ];
-    let features = &config.features;
-    for (name, mode) in [
-        ("permission_advice", &features.permission_advice),
-        ("auto_screening", &features.auto_screening),
-        ("shell_effect", &features.shell_effect),
-        ("content_screening", &features.content_screening),
-        ("shell_duration", &features.shell_duration),
-        ("tool_search", &features.tool_search),
-        ("skill_suggestions", &features.skill_suggestions),
-        ("goal_prescreen", &features.goal_prescreen),
-        ("subagent_routing", &features.subagent_routing),
-    ] {
-        let mode = match mode {
-            FeatureMode::Off => "off",
-            FeatureMode::Shadow => "shadow",
-            FeatureMode::Advise => "advise",
-            FeatureMode::Enforce => "enforce",
-        };
-        lines.push(format!("  {name}: {mode}"));
-    }
-    lines.join("\n")
 }
 
 /// The key `/usage` groups a session's spend under: always the full spec, so a

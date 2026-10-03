@@ -10,14 +10,19 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_io::Timer;
-use caudra_config::decisions::{DecisionsConfig, DecisionsConfigError, FeatureMode};
+use caudra_config::decisions::{
+    DecisionFeature as FeatureSetting, DecisionFeatures, DecisionThresholds, DecisionsConfig,
+    DecisionsConfigError, FeatureMode,
+};
 use caudra_decision::{
     CachedDecisionEngine, DecisionEngine, DecisionError, DecisionRequest, DecisionResponse,
     HttpDecisionClient, QuestionSet,
 };
 use caudra_storage::decision_log::{
     DecisionEffect, DecisionLabel, DecisionLog, DecisionLogError, DecisionRecord, EndpointKind,
+    StatsThresholds,
 };
+use caudra_storage::id::CaudraId;
 use caudra_storage::sessions::SessionError;
 use caudra_storage::usage_ledger::{LedgerPurpose, TurnUsage, UsageLedger};
 use caudra_storage::{StateDir, now_epoch};
@@ -53,6 +58,22 @@ pub enum DecisionFeature {
 }
 
 impl DecisionFeature {
+    /// Configured features in `[decisions.features]` order, then workflow.
+    pub const ALL: [Self; 10] = [
+        Self::PermissionAdvice,
+        Self::AutoScreening,
+        Self::ShellEffect,
+        Self::ContentScreening,
+        Self::ShellDuration,
+        Self::ToolSearch,
+        Self::SkillSuggestions,
+        Self::GoalPrescreen,
+        Self::SubagentRouting,
+        Self::Workflow,
+    ];
+
+    /// The name the log records, which differs from the configuration key
+    /// for some features.
     pub fn name(&self) -> &'static str {
         match self {
             Self::Workflow => "workflow",
@@ -66,6 +87,100 @@ impl DecisionFeature {
             Self::GoalPrescreen => "goal",
             Self::SubagentRouting => "subagent_routing",
         }
+    }
+
+    /// The `[decisions.features]` key. Workflow has none: a script's
+    /// `decide()` call is the request, so it runs whenever an engine is set.
+    pub fn config_key(&self) -> Option<&'static str> {
+        match self {
+            Self::Workflow => None,
+            Self::PermissionAdvice => Some("permission_advice"),
+            Self::AutoScreening => Some("auto_screening"),
+            Self::ShellEffect => Some("shell_effect"),
+            Self::ContentScreening => Some("content_screening"),
+            Self::ShellDuration => Some("shell_duration"),
+            Self::ToolSearch => Some("tool_search"),
+            Self::SkillSuggestions => Some("skill_suggestions"),
+            Self::GoalPrescreen => Some("goal_prescreen"),
+            Self::SubagentRouting => Some("subagent_routing"),
+        }
+    }
+
+    /// The configuration entry: the modes the key accepts and what it does.
+    pub fn setting(&self) -> Option<&'static FeatureSetting> {
+        let key = self.config_key()?;
+        DecisionFeatures::ALL
+            .iter()
+            .find(|setting| setting.name == key)
+    }
+
+    pub fn mode<'a>(&self, features: &'a DecisionFeatures) -> &'a FeatureMode {
+        match self {
+            Self::Workflow => &FeatureMode::Enforce,
+            Self::PermissionAdvice => &features.permission_advice,
+            Self::AutoScreening => &features.auto_screening,
+            Self::ShellEffect => &features.shell_effect,
+            Self::ContentScreening => &features.content_screening,
+            Self::ShellDuration => &features.shell_duration,
+            Self::ToolSearch => &features.tool_search,
+            Self::SkillSuggestions => &features.skill_suggestions,
+            Self::GoalPrescreen => &features.goal_prescreen,
+            Self::SubagentRouting => &features.subagent_routing,
+        }
+    }
+}
+
+/// The thresholds the live feature applies, so agreement in `caudra decisions
+/// stats` and `/decisions` scores an answer the way the feature acted on it.
+/// `feature` is the logged name.
+pub fn stats_thresholds(config: &DecisionThresholds, feature: &str) -> StatsThresholds {
+    let mut thresholds = StatsThresholds::default();
+    let overrides = &mut thresholds.noul_by_question;
+    let permission = DecisionFeature::PermissionAdvice.name();
+    let auto = DecisionFeature::AutoScreening.name();
+    if feature == permission || feature == auto {
+        let threshold = if feature == auto {
+            config.auto_flag
+        } else {
+            config.permission_flag
+        };
+        for flag in permission::FLAGS {
+            overrides.insert(flag.into(), threshold);
+        }
+    } else if feature == DecisionFeature::ContentScreening.name() {
+        overrides.insert(content::INJECTION.into(), config.content_injection);
+        overrides.insert(
+            content::ADDRESSED_TO_AGENT.into(),
+            config.content_addressed_to_agent,
+        );
+    } else if feature == DecisionFeature::ShellDuration.name() {
+        overrides.insert(
+            shell_duration::ENDLESS_QUESTION.into(),
+            config.shell_endless,
+        );
+        overrides.insert(shell_duration::HEAVY_QUESTION.into(), config.shell_heavy);
+    } else if feature == DecisionFeature::ShellEffect.name()
+        && let Some(threshold) = config.shell_writes
+    {
+        overrides.insert(shell_effect::WRITES.into(), threshold);
+    }
+    thresholds
+}
+
+/// Local only for a numeric loopback host: a name can resolve anywhere.
+pub fn endpoint_kind(config: &DecisionsConfig) -> EndpointKind {
+    let loopback = config
+        .base_url
+        .as_ref()
+        .and_then(Url::host)
+        .is_some_and(|host| match host {
+            Host::Ipv4(address) => address.is_loopback(),
+            Host::Ipv6(address) => address.is_loopback(),
+            Host::Domain(_) => false,
+        });
+    match loopback {
+        true => EndpointKind::Local,
+        false => EndpointKind::Remote,
     }
 }
 
@@ -83,9 +198,12 @@ pub enum DecisionsError {
     ForeignReceipt,
 }
 
+/// What a call site knows about the decision it asks for. The session comes
+/// from the service, which each session runtime binds to its own id.
 #[derive(Clone, Default)]
 pub struct DecisionContext {
-    pub session: Option<String>,
+    /// Stored verbatim, so `/decisions` can find a project's rows by the same
+    /// canonical root it is asked about.
     pub project: Option<String>,
     pub meta: Value,
 }
@@ -115,6 +233,8 @@ pub struct Decisions(Arc<Inner>);
 struct Inner {
     config: DecisionsConfig,
     engine: Option<Arc<dyn DecisionEngine>>,
+    /// The session every row this service logs belongs to.
+    session: Option<CaudraId>,
     state_dir: StateDir,
     log: Arc<Mutex<Option<DecisionLog>>>,
     usage: Mutex<Option<UsageLedger>>,
@@ -144,7 +264,7 @@ impl Decisions {
         } else {
             Self::permission_questions()?
         };
-        Ok(Self::build(config, state_dir, engine, questions))
+        Ok(Self::build(config, state_dir, engine, None, questions))
     }
 
     pub fn with_engine<E: DecisionEngine + 'static>(
@@ -160,6 +280,7 @@ impl Decisions {
             config,
             state_dir,
             engine,
+            None,
             Self::permission_questions()?,
         ))
     }
@@ -168,11 +289,13 @@ impl Decisions {
         config: DecisionsConfig,
         state_dir: &StateDir,
         engine: Option<Arc<dyn DecisionEngine>>,
+        session: Option<CaudraId>,
         permission_questions: QuestionSet,
     ) -> Self {
         Self(Arc::new(Inner {
             config,
             engine,
+            session,
             state_dir: state_dir.clone(),
             log: Arc::new(Mutex::new(None)),
             usage: Mutex::new(None),
@@ -187,29 +310,24 @@ impl Decisions {
         &self.0.config
     }
 
-    pub fn fresh_session(&self) -> Self {
+    /// A service of its own for one session: health, taint and caches start
+    /// fresh, and every row it logs carries `session`.
+    pub fn for_session(&self, session: CaudraId) -> Self {
         Self::build(
             self.0.config.clone(),
             &self.0.state_dir,
             self.0.engine.clone(),
+            Some(session),
             self.0.permission_questions.clone(),
         )
     }
 
+    pub fn session(&self) -> Option<CaudraId> {
+        self.0.session
+    }
+
     pub fn mode(&self, feature: &DecisionFeature) -> &FeatureMode {
-        let features = &self.0.config.features;
-        match feature {
-            DecisionFeature::Workflow => &FeatureMode::Enforce,
-            DecisionFeature::PermissionAdvice => &features.permission_advice,
-            DecisionFeature::AutoScreening => &features.auto_screening,
-            DecisionFeature::ShellEffect => &features.shell_effect,
-            DecisionFeature::ContentScreening => &features.content_screening,
-            DecisionFeature::ShellDuration => &features.shell_duration,
-            DecisionFeature::ToolSearch => &features.tool_search,
-            DecisionFeature::SkillSuggestions => &features.skill_suggestions,
-            DecisionFeature::GoalPrescreen => &features.goal_prescreen,
-            DecisionFeature::SubagentRouting => &features.subagent_routing,
-        }
+        feature.mode(&self.0.config.features)
     }
 
     pub fn enabled(&self, feature: &DecisionFeature) -> bool {
@@ -387,37 +505,14 @@ impl Decisions {
             return None;
         }
         let log = &self.0.log;
-        let context = DecisionState::new(&json!({
-            "session": context.session, "project": context.project, "meta": context.meta,
-        }))
-        .ok();
-        let context = context.as_ref().map(DecisionState::value);
         let record = DecisionRecord {
             timestamp: now_epoch(),
-            session: context
-                .and_then(|value| value["session"].as_str())
-                .map(str::to_owned),
-            project: context
-                .and_then(|value| value["project"].as_str())
-                .map(str::to_owned),
+            session: self.0.session.map(|session| session.to_string()),
+            project: context.project.clone(),
             feature: feature.name().into(),
             question_set_id: questions.id().into(),
             question_set_version: questions.version().into(),
-            endpoint_kind: if self
-                .0
-                .config
-                .base_url
-                .as_ref()
-                .and_then(Url::host)
-                .is_some_and(|host| match host {
-                    Host::Ipv4(address) => address.is_loopback(),
-                    Host::Ipv6(address) => address.is_loopback(),
-                    Host::Domain(_) => false,
-                }) {
-                EndpointKind::Local
-            } else {
-                EndpointKind::Remote
-            },
+            endpoint_kind: endpoint_kind(&self.0.config),
             model: request.model.clone(),
             state: request.state.clone(),
             questions: serde_json::to_value(&request.questions).ok()?,
@@ -429,7 +524,8 @@ impl Decisions {
             latency_ms,
             mode: mode_name(self.mode(feature)).into(),
             effect: DecisionEffect::None,
-            meta: context.map_or(Value::Null, |value| value["meta"].clone()),
+            meta: DecisionState::new(&context.meta)
+                .map_or(Value::Null, |meta| meta.value().clone()),
         };
         let writer = log.clone();
         let state_dir = self.0.state_dir.clone();
@@ -609,15 +705,21 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
+    use std::collections::BTreeSet;
+
     use async_trait::async_trait;
-    use caudra_config::decisions::{DecisionsConfig, FeatureMode};
+    use caudra_config::decisions::{
+        DecisionFeatures, DecisionThresholds, DecisionsConfig, FeatureMode,
+    };
     use caudra_decision::{
         Answer, DecisionEngine, DecisionError, DecisionRequest, DecisionResponse, NoulAnswer,
         QuestionSet, Usage,
     };
     use caudra_storage::decision_log::{
-        DECISIONS_DB_FILE, DecisionEffect, DecisionLabel, DecisionLog,
+        DECISIONS_DB_FILE, DecisionEffect, DecisionFilter, DecisionLabel, DecisionLog,
+        StatsThresholds,
     };
+    use caudra_storage::id::CaudraId;
     use caudra_storage::{StateDir, now_epoch};
     use futures_lite::future;
     use serde_json::{Value, json};
@@ -625,10 +727,13 @@ mod tests {
 
     use super::{
         DecisionContext, DecisionFeature, Decisions, DecisionsError, PermissionAction,
-        PermissionPurpose, STATE_REJECTED,
+        PermissionPurpose, STATE_REJECTED, stats_thresholds,
     };
 
     const SECRET: &str = "never-store-this-credential";
+    /// A project root redaction would rewrite, since it embeds a URI with
+    /// credentials, so a verbatim column is distinguishable from a redacted one.
+    const SECRET_PATH: &str = "/work/ssh://user:password@host/project";
     const BASE_URL: &str = "http://127.0.0.1:1";
     const TEST_TIMEOUT_MS: u64 = 10;
     const TEST_NORMAL_TIMEOUT_MS: u64 = 5_000;
@@ -710,11 +815,83 @@ mod tests {
         )
         .unwrap();
         let same_session = service.clone();
-        let other_session = service.fresh_session();
+        let other_session = service.for_session(CaudraId::generate());
         service.mark_tainted();
         assert!(same_session.is_tainted());
         assert!(!other_session.is_tainted());
-        assert!(!service.fresh_session().is_tainted());
+        assert!(!service.for_session(CaudraId::generate()).is_tainted());
+    }
+
+    #[test]
+    fn a_bound_service_records_its_session_and_the_verbatim_project() {
+        smol::block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let state_dir = StateDir::from_path(root.path().into());
+            let session = CaudraId::generate();
+            let service = Decisions::with_engine(
+                config(true),
+                &state_dir,
+                FakeEngine {
+                    requests: Arc::new(Mutex::new(Vec::new())),
+                    behavior: Behavior::Answer(0.0),
+                },
+            )
+            .unwrap()
+            .for_session(session);
+            assert_eq!(service.session(), Some(session));
+            let context = DecisionContext {
+                project: Some(SECRET_PATH.into()),
+                meta: json!({"api_key": SECRET}),
+            };
+            service
+                .permission(
+                    PermissionPurpose::Advice,
+                    &json!({"command": "pwd"}),
+                    &context,
+                )
+                .await
+                .unwrap();
+            let log = DecisionLog::open_read_only(&state_dir).unwrap().unwrap();
+            let rows = log.recent(&DecisionFilter::default(), 1).unwrap();
+            let record = &rows[0].record;
+            assert_eq!(record.session, Some(session.to_string()));
+            assert_eq!(record.project.as_deref(), Some(SECRET_PATH));
+            assert!(!record.meta.to_string().contains(SECRET));
+        });
+    }
+
+    #[test]
+    fn every_config_feature_maps_to_one_decision_feature() {
+        let configured: BTreeSet<&str> = DecisionFeatures::ALL
+            .iter()
+            .map(|setting| setting.name)
+            .collect();
+        let mapped: Vec<&str> = DecisionFeature::ALL
+            .iter()
+            .filter_map(DecisionFeature::config_key)
+            .collect();
+        assert_eq!(mapped.len(), configured.len());
+        assert_eq!(mapped.into_iter().collect::<BTreeSet<_>>(), configured);
+        for feature in DecisionFeature::ALL {
+            assert_eq!(feature.setting().is_some(), feature.config_key().is_some());
+        }
+    }
+
+    #[test_case("permission", 0.8; "permission")]
+    #[test_case("auto", 0.9; "auto")]
+    fn configured_thresholds_do_not_reinterpret_approval_labels(feature: &str, expected: f64) {
+        let config = DecisionThresholds {
+            permission_flag: 0.8,
+            auto_flag: 0.9,
+            ..Default::default()
+        };
+        let thresholds = stats_thresholds(&config, feature);
+        assert_eq!(thresholds.noul_by_question["uploads"], expected);
+        assert!(!thresholds.noul_by_question.contains_key("user_approves"));
+        assert_eq!(
+            thresholds.default_noul,
+            StatsThresholds::default().default_noul
+        );
     }
 
     #[test_case(FeatureMode::Shadow, true, true, Some(0.8), false; "shadow_read_only")]

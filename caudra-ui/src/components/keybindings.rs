@@ -5,7 +5,7 @@ use std::fmt::Write;
 use strum::EnumIter;
 use unicode_width::UnicodeWidthStr;
 
-use crate::components::workflow_inspector;
+use crate::components::{decisions_modal, workflow_inspector};
 
 /// Spelled once because three tables quote it.
 const SHIFT_TAB_LABEL: &str = "Shift+Tab";
@@ -380,6 +380,7 @@ pub enum KeybindContext {
     PeerManager,
     WorkflowInspector,
     WorkflowCatalogPicker,
+    Decisions,
     SandboxManager,
     Workbench,
     WorkbenchExplorer,
@@ -418,6 +419,7 @@ impl KeybindContext {
             Self::PeerManager => "Peer Manager",
             Self::WorkflowInspector => "Workflow Inspector",
             Self::WorkflowCatalogPicker => "Workflow Catalog",
+            Self::Decisions => "Decisions",
             Self::SandboxManager => "Sandbox Manager",
             Self::Workbench => "Workbench",
             Self::WorkbenchExplorer => "Workbench Explorer",
@@ -434,6 +436,7 @@ impl KeybindContext {
         match self {
             Self::PeerManager => Some(Feature::CrossSessionMessaging),
             Self::WorkflowInspector | Self::WorkflowCatalogPicker => Some(Feature::Workflows),
+            Self::Decisions => Some(Feature::DecisionEngine),
             Self::SandboxManager | Self::WorkbenchTransfer => Some(Feature::Sandboxes),
             _ => None,
         }
@@ -454,7 +457,8 @@ impl KeybindContext {
             | Self::WorktreePicker
             | Self::PeerManager
             | Self::WorkflowInspector
-            | Self::WorkflowCatalogPicker => Some(Self::Picker),
+            | Self::WorkflowCatalogPicker
+            | Self::Decisions => Some(Self::Picker),
             Self::WorkbenchExplorer
             | Self::WorkbenchEditor
             | Self::WorkbenchSourceControl
@@ -1439,6 +1443,36 @@ pub const KEYBINDS: &[Keybind] = &[
         label: KeyLabel::Single("Enter"),
         description: "Launch a trusted workflow, or trust an untrusted one",
         context: KeybindContext::WorkflowCatalogPicker,
+    },
+    Keybind {
+        label: KeyLabel::Alt("Tab", SHIFT_TAB_LABEL),
+        description: "Next or previous section",
+        context: KeybindContext::Decisions,
+    },
+    Keybind {
+        label: KeyLabel::Single("1-4"),
+        description: "Jump to a section",
+        context: KeybindContext::Decisions,
+    },
+    Keybind {
+        label: KeyLabel::Alt("Left", "Right"),
+        description: "Focus the list or the detail",
+        context: KeybindContext::Decisions,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::SCOPE.label),
+        description: "Cycle the scope: this session, this project, every session",
+        context: KeybindContext::Decisions,
+    },
+    Keybind {
+        label: KeyLabel::Single(decisions_modal::COPY_LABEL),
+        description: "Copy the selected decision as JSON, or the visible section",
+        context: KeybindContext::Decisions,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::REFRESH.label),
+        description: "Read the decision log again",
+        context: KeybindContext::Decisions,
     },
     Keybind {
         label: KeyLabel::Single(leader::WORKBENCH.label),

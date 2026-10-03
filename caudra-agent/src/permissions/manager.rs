@@ -14,8 +14,9 @@ use super::{
     policy::validate_compiled_templates,
     structured::trusted_command_observation,
 };
-use crate::decisions::Decisions;
+use crate::decisions::{DecisionContext, Decisions};
 use caudra_config::{Effect, PermissionRule, PermissionsConfig, ToolKey};
+use caudra_storage::id::CaudraId;
 use caudra_storage::permission_patterns::PatternDefinition;
 use caudra_storage::permission_state::mutation::{
     PermissionGeneration, PermissionMutation, PermissionOwner, PermissionRecordIdentity,
@@ -26,6 +27,7 @@ use caudra_storage::sessions::{PermissionMode, SessionDatabase};
 use caudra_storage::state::{SCOPE_GLOBAL, StateKey, StateStore};
 use caudra_storage::{StateClass, StateDir, now_epoch};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -495,12 +497,25 @@ impl PermissionManager {
         }
     }
 
-    pub fn fork_session(&self) -> Self {
+    /// A fork whose decision service is the session's own, so its rows carry
+    /// `session` and its health and taint start fresh.
+    pub fn fork_session(&self, session: CaudraId) -> Self {
         let mut manager = self.fork();
         manager.decisions = Arc::new(RwLock::new(
-            manager.decisions().map(|service| service.fresh_session()),
+            manager
+                .decisions()
+                .map(|service| service.for_session(session)),
         ));
         manager
+    }
+
+    /// Every decision a call site asks for names the canonical project, which
+    /// is what `/decisions` filters a project's rows by.
+    pub fn decision_context(&self, meta: Value) -> DecisionContext {
+        DecisionContext {
+            project: Some(self.project_cwd().display().to_string()),
+            meta,
+        }
     }
 
     pub(super) fn structured_conversation_rules(
@@ -1202,9 +1217,27 @@ mod tests {
     };
     use caudra_config::{DefaultEffect, Effect, PermissionsConfig, ToolKey};
     use caudra_storage::StateDir;
+    use caudra_storage::id::CaudraId;
+    use serde_json::json;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
+
+    const META_KEY: &str = "request_id";
+
+    #[test]
+    fn decision_context_uses_the_canonical_project() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let manager = mgr_with(PermissionsConfig::default(), project.join("."));
+        let context = manager.decision_context(json!({META_KEY: 1}));
+        assert_eq!(
+            context.project,
+            Some(project.canonicalize().unwrap().display().to_string())
+        );
+        assert_eq!(context.meta[META_KEY], 1);
+    }
 
     #[test_case(PermissionMode::Ask, None; "ask_seed")]
     #[test_case(PermissionMode::Auto, None; "auto_seed")]
@@ -1243,7 +1276,10 @@ mod tests {
         assert!(!manager.toggle_auto());
         assert_eq!(manager.persisted_mode(), stored);
         assert_eq!(manager.fork().mode(), PermissionMode::Ask);
-        assert_eq!(manager.fork_session().mode(), PermissionMode::Ask);
+        assert_eq!(
+            manager.fork_session(CaudraId::generate()).mode(),
+            PermissionMode::Ask
+        );
     }
 
     #[test_case(PermissionMode::Ask; "from_ask")]

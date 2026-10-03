@@ -184,6 +184,12 @@ impl App {
             self.tools_modal.handle_mouse(event);
             return Vec::new();
         }
+        if self.decisions_modal.is_open() && !self.permission_prompt.is_open() {
+            self.clear_control_hovers();
+            let action = self.decisions_modal.handle_mouse(event);
+            self.handle_decisions_action(action);
+            return Vec::new();
+        }
         if self.skills_modal.is_open() && !self.permission_prompt.is_open() {
             self.clear_control_hovers();
             self.skills_modal.handle_mouse(event);
@@ -1173,6 +1179,11 @@ impl App {
                 self.open_sandbox("");
                 Vec::new()
             }
+            StatusBarHitTarget::Decisions => {
+                self.clear_control_hovers();
+                self.execute_decisions("");
+                Vec::new()
+            }
             // The label goes as soon as the transcript follows again, so the
             // hover it was drawn under has nothing left to sit on.
             StatusBarHitTarget::ResumeAutoScroll => {
@@ -1285,6 +1296,7 @@ impl App {
         dismiss!(self.docs_modal);
         dismiss!(self.context_modal);
         dismiss!(self.tools_modal);
+        dismiss!(self.decisions_modal);
         dismiss!(self.skills_modal);
         dismiss!(self.storage_modal);
         dismiss!(self.system_prompt_modal);

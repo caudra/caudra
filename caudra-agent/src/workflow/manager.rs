@@ -12,7 +12,7 @@ use arc_swap::ArcSwap;
 use caudra_config::{Feature, FeatureFlags};
 use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
-use caudra_storage::paths::config_dir;
+use caudra_storage::paths::{canonicalize_clean, config_dir};
 use caudra_storage::random_task_id;
 use caudra_storage::workflow::{
     MAX_HISTORY_RUNS, WorkflowCallKind, WorkflowCallRow, WorkflowCallState, WorkflowRunPatch,
@@ -129,6 +129,7 @@ impl WorkflowRuntime {
         let subagent_cancels = Arc::clone(&deps.subagent_cancels);
         let user_config_dir = deps.user_config_dir.or_else(|| config_dir().ok());
         Catalog::ensure_user_scope(user_config_dir.as_deref());
+        let project = canonicalize_clean(&deps.cwd).display().to_string();
         let manager = Manager {
             state_dir: deps.state_dir,
             session_id: deps.session_id,
@@ -138,6 +139,7 @@ impl WorkflowRuntime {
             env: RunEnv {
                 store,
                 decisions,
+                project,
                 features: deps.features,
                 runner: deps.runner,
                 events: deps.events,
@@ -923,6 +925,7 @@ mod tests {
     use caudra_config::decisions::DecisionsConfig;
     use caudra_decision::{DecisionEngine, DecisionError, DecisionRequest, DecisionResponse};
     use caudra_providers::{Message, WorkflowEventOrigin, expand_message};
+    use caudra_storage::decision_log::{DecisionFilter, DecisionLog};
     use caudra_storage::sessions::{SessionDatabase, SessionRelocation};
     use caudra_storage::workflow::{WorkflowCallState, WorkflowEventKind, WorkflowSourceKind};
     use caudra_workflow::RosterState;
@@ -934,6 +937,7 @@ mod tests {
     use crate::StoredSession;
     use crate::agent::subagent::TaskIdentity;
     use crate::agent::task_runner::{TaskFuture, TaskOutcome, TaskRequest};
+    use crate::decisions::DecisionFeature;
     use crate::subagent_history::{SubagentHistoryLease, SubagentHistoryStore};
     use crate::workflow::state::stored_status;
 
@@ -1072,6 +1076,9 @@ try {
 } catch (error) { result = error; }
 complete(result);
 "#;
+    const DECISION_ONLY_BODY: &str = r#"
+complete(decide(#{ command: "ls" }, #{ ready: #{ type: "noul", instructions: "Is it ready?" } }));
+"#;
     const DECISION_ENGINE_KEY: &str = "experimental.decision_engine";
     const DECISION_DEADLINE_BODY: &str = r#"
 let result = "not caught";
@@ -1146,6 +1153,7 @@ complete(result);
             base_url: Some(DECISION_BASE_URL.parse().unwrap()),
             model: MODEL.into(),
             timeout_ms: DECISION_TIMEOUT_MS,
+            log: true,
             ..DecisionsConfig::default()
         };
         let decisions =
@@ -1248,6 +1256,35 @@ complete(result);
                 assert!(call.is_none());
             }
             runtime.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn workflow_decision_rows_carry_the_session_and_project() {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture.user_workflow(DECIDING, DECISION_ONLY_BODY);
+            let decisions = decision_service(&fixture, None, false)
+                .0
+                .for_session(fixture.session_id);
+            let runtime = fixture.spawn_with_decisions(Some(decisions)).await;
+            let started = start(&runtime.handle(), DECIDING, Some(0)).await;
+            fixture
+                .wait_for(&started.run_id, RunStatus::Completed)
+                .await;
+            runtime.shutdown().await;
+            let log = DecisionLog::open_read_only(&fixture.state_dir)
+                .unwrap()
+                .unwrap();
+            let rows = log.recent(&DecisionFilter::default(), 2).unwrap();
+            assert_eq!(rows.len(), 1);
+            let record = &rows[0].record;
+            assert_eq!(record.feature, DecisionFeature::Workflow.name());
+            assert_eq!(record.session, Some(fixture.session_id.to_string()));
+            assert_eq!(
+                record.project,
+                Some(canonicalize_clean(&fixture.project).display().to_string())
+            );
         });
     }
 

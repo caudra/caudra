@@ -15,7 +15,7 @@ use std::{
     time::Instant,
 };
 
-use super::{DecisionContext, DecisionFeature, DecisionReceipt, Decisions};
+use super::{DecisionFeature, DecisionReceipt, Decisions};
 use crate::{
     ToolDoneEvent, ToolOutput,
     permissions::{canonical_json_sha256, command_pattern},
@@ -27,6 +27,8 @@ const INSTANT: &str = "instant";
 const SHORT: &str = "short";
 const LONG: &str = "long";
 const ENDLESS: &str = "endless";
+pub(super) const ENDLESS_QUESTION: &str = "endless";
+pub(super) const HEAVY_QUESTION: &str = "heavy";
 const TIMEOUT_FIELD: &str = "timeoutSec";
 const HISTORY_CACHE_ENTRIES: usize = 256;
 const MILLIS_PER_SECOND: u64 = 1_000;
@@ -165,11 +167,7 @@ impl Decisions {
             Ok(None) => {}
         }
         if let Some(questions) = duration_questions(plan.threshold_ms) {
-            let context = DecisionContext {
-                project: Some(root.display().to_string()),
-                session: ctx.session_id.as_ref().map(ToString::to_string),
-                ..Default::default()
-            };
+            let context = ctx.permissions.decision_context(Value::Null);
             if let Some(outcome) = self
                 .evaluate(
                     DecisionFeature::ShellDuration,
@@ -247,11 +245,11 @@ fn duration_questions(threshold_ms: u64) -> Option<QuestionSet> {
         QUESTION_SET,
         BTreeMap::from([
             (
-                "endless".into(),
+                ENDLESS_QUESTION.into(),
                 noul("Does this command normally keep running until stopped?"),
             ),
             (
-                "heavy".into(),
+                HEAVY_QUESTION.into(),
                 noul(
                     "Is this command likely to require substantial computation or lengthy network transfers?",
                 ),
@@ -275,7 +273,7 @@ fn prior(
     endless: f64,
     threshold_ms: u64,
 ) -> (Option<Estimate>, bool) {
-    if matches!(response.answers.get("endless"), Some(Answer::Noul(answer)) if answer.noul >= endless)
+    if matches!(response.answers.get(ENDLESS_QUESTION), Some(Answer::Noul(answer)) if answer.noul >= endless)
     {
         return (None, true);
     }
@@ -286,8 +284,7 @@ fn prior(
     if choice == Some(ENDLESS) {
         return (None, true);
     }
-    let is_heavy =
-        matches!(response.answers.get("heavy"), Some(Answer::Noul(answer)) if answer.noul >= heavy);
+    let is_heavy = matches!(response.answers.get(HEAVY_QUESTION), Some(Answer::Noul(answer)) if answer.noul >= heavy);
     let (p50_ms, p90_ms, extend_timeout) = match choice {
         Some(LONG) => (LONG_P50_MS, LONG_P90_MS, true),
         Some(INSTANT) => (INSTANT_MS, INSTANT_MS, false),

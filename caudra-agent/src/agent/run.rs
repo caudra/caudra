@@ -2230,14 +2230,8 @@ impl<'h> Agent<'h> {
     }
 
     fn decision_context(&self) -> DecisionContext {
-        DecisionContext {
-            session: self
-                .session_id
-                .as_ref()
-                .map(|session| session.as_str().to_owned()),
-            project: self.host_cwd.as_ref().map(|cwd| cwd.display().to_string()),
-            meta: json!({"turn": self.turn_id}),
-        }
+        self.permissions
+            .decision_context(json!({"turn": self.turn_id}))
     }
 
     async fn prescreen_goal(&self, condition: &str) -> Option<(Decisions, DecisionOutcome)> {
@@ -3414,7 +3408,7 @@ mod tests {
         TokenUsage, WorkflowEventOrigin, invalid_tool_input,
     };
     use caudra_storage::StateDir;
-    use caudra_storage::decision_log::DecisionLog;
+    use caudra_storage::decision_log::{DecisionFilter, DecisionLog, StatsThresholds};
     use caudra_workspace::{
         AuthenticatedPrincipalId, AuthorityIdentity, PlanRef, ProjectIdentity, ProjectKey,
         ResourceId, ResourceRevision, SourceTrustAnchor, WorkspacePath,
@@ -3585,7 +3579,7 @@ mod tests {
             return;
         };
         assert_eq!(
-            log.stats(None, &Default::default())
+            log.stats(&DecisionFilter::default(), |_| StatsThresholds::default())
                 .unwrap()
                 .iter()
                 .map(|row| row.count)

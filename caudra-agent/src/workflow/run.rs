@@ -56,6 +56,7 @@ const DECISION_REJECTED: &str = "workflow decision request was rejected";
 pub(super) struct RunEnv {
     pub store: WorkflowStore,
     pub decisions: Option<Decisions>,
+    pub project: String,
     pub features: FeatureFlags,
     pub runner: Arc<dyn TaskRunner>,
     pub events: Sender<Envelope>,
@@ -488,12 +489,12 @@ impl Driver {
             .await
             .map_err(host_failure)?;
         let context = DecisionContext {
+            project: Some(self.env.project.clone()),
             meta: json!({
                 "workflow_name": self.snapshot.workflow_name,
                 "run_id": self.snapshot.run_id,
                 "call_key": key.0,
             }),
-            ..DecisionContext::default()
         };
         let cancel = self.cancel.clone();
         let done = self.done_tx.clone();

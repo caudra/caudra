@@ -61,7 +61,7 @@ use caudra_agent::{
     McpServerStatus, McpSnapshot, McpSnapshotReader, SubagentActivity, SubagentProgress,
     TextOutput, ToolAccounting, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
 };
-use caudra_config::decisions::DecisionFeatures;
+use caudra_config::decisions::DecisionsConfig;
 use caudra_config::sandbox::SandboxName;
 use caudra_config::{
     Effect, FeatureFlags, InboundPolicy, PermissionReviewCandidate, PermissionReviewKind,
@@ -167,11 +167,8 @@ const SETUP_MEDIUM_EFFORT: &str = "medium";
 const SETUP_HIGH_EFFORT: &str = "high";
 const SETUP_OFF: &str = "off";
 const DECISIONS_COMMAND: &str = "/decisions";
-const DECISIONS_TEST_BASE_URL: &str = "http://127.0.0.1:9";
+pub(crate) const DECISIONS_TEST_BASE_URL: &str = "http://127.0.0.1:9";
 const DECISIONS_TEST_MODEL: &str = "test-decision-model";
-const DECISIONS_TEST_ERROR: &str = "transport";
-const DECISIONS_NOT_CHECKED: &str = "Cached reachability: unknown (not checked)";
-const DECISIONS_OFF: &str = "Decision engine: off";
 const PERMISSION_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 const PATTERN_TEST_ANALYSIS: &str = "test-analysis/v1";
 const PATTERN_TEST_SOURCE: &str = "history-test";
@@ -515,7 +512,7 @@ fn app_with_hints() -> (App, HintWriterHandle) {
     (app, writer)
 }
 
-fn tempdir_app() -> (TempDir, StateDir, Arc<StorageWriter>, App) {
+pub(crate) fn tempdir_app() -> (TempDir, StateDir, Arc<StorageWriter>, App) {
     let tmp = private_tempdir();
     let dir = StateDir::from_path(tmp.path().to_path_buf());
     let writer = Arc::new(test_writer(dir.clone()));
@@ -10856,7 +10853,10 @@ fn apply_loaded_session_defers_queued_messages_until_respawn() {
 #[test_case(false, PermissionMode::Yolo; "main_yolo")]
 #[test_case(true, PermissionMode::Ask; "task_ask")]
 #[test_case(true, PermissionMode::Yolo; "task_yolo")]
-fn decisions_command_reports_off_without_changing_permissions(task: bool, mode: PermissionMode) {
+fn decisions_command_opens_the_modal_without_changing_permissions(
+    task: bool,
+    mode: PermissionMode,
+) {
     let mut app = if task {
         read_only_task_app()
     } else {
@@ -10864,19 +10864,7 @@ fn decisions_command_reports_off_without_changing_permissions(task: bool, mode: 
     };
     app.permissions.set_session_mode(Some(mode.clone()));
     assert!(app.run_cmdline("decisions", 0).unwrap().is_empty());
-    assert_eq!(
-        app.active_chat().last_message_role(),
-        Some(&DisplayRole::Notice)
-    );
-    let text = app.active_chat().last_message_text();
-    for expected in [
-        DECISIONS_OFF,
-        DECISIONS_NOT_CHECKED,
-        "Logging: disabled",
-        "permission_advice: off",
-    ] {
-        assert!(text.contains(expected), "{text}");
-    }
+    assert!(app.decisions_modal.is_open());
     assert_eq!(app.permissions.mode(), mode);
 }
 
@@ -10894,92 +10882,14 @@ fn decisions_command_reads_configuration_without_probing(mode: PermissionMode) {
     app.permissions.set_decisions(Some(decisions.clone()));
     app.permissions.set_session_mode(Some(mode.clone()));
     assert!(app.execute_command(cmd(DECISIONS_COMMAND), 0).is_empty());
-    let text = app.active_chat().last_message_text();
-    for expected in [
-        DECISIONS_TEST_BASE_URL,
-        DECISIONS_TEST_MODEL,
-        DECISIONS_NOT_CHECKED,
-        "Session tainted: yes",
-    ] {
-        assert!(text.contains(expected), "{text}");
+    let screen = rendered(&mut app);
+    for expected in [DECISIONS_TEST_BASE_URL, DECISIONS_TEST_MODEL] {
+        assert!(screen.contains(expected), "{expected}: {screen}");
     }
     assert_eq!(decisions.status().reachable, None);
     assert_eq!(decisions.status().last_error, None);
     assert!(decisions.is_tainted());
     assert_eq!(app.permissions.mode(), mode);
-}
-
-#[test_case(None, "unknown (not checked)"; "unknown")]
-#[test_case(Some(true), "reachable (last attempt)"; "reachable")]
-#[test_case(Some(false), "offline (last attempt)"; "offline")]
-fn decisions_status_reports_only_cached_health_and_configured_modes(
-    reachable: Option<bool>,
-    expected: &str,
-) {
-    let config = DecisionsConfig {
-        base_url: Some(DECISIONS_TEST_BASE_URL.parse().unwrap()),
-        features: DecisionFeatures {
-            permission_advice: FeatureMode::Advise,
-            auto_screening: FeatureMode::Enforce,
-            shell_effect: FeatureMode::Shadow,
-            ..Default::default()
-        },
-        log: true,
-        ..Default::default()
-    };
-    let status = DecisionStatus {
-        reachable,
-        last_error: Some(DECISIONS_TEST_ERROR),
-        log_failed: true,
-    };
-    let text = decision_status_message(&config, &status, true);
-    for expected in [
-        format!("Cached reachability: {expected}"),
-        format!("Last error: {DECISIONS_TEST_ERROR}"),
-        "Decision engine: configured".into(),
-        "Logging: enabled".into(),
-        "Log write failure: yes".into(),
-        "Session tainted: yes".into(),
-        "permission_advice: advise".into(),
-        "auto_screening: enforce".into(),
-        "shell_effect: shadow".into(),
-        "content_screening: off".into(),
-        "shell_duration: off".into(),
-        "tool_search: off".into(),
-        "skill_suggestions: off".into(),
-        "goal_prescreen: off".into(),
-        "subagent_routing: off".into(),
-    ] {
-        assert!(text.contains(&expected), "{text}");
-    }
-}
-
-#[test_case("https://private-user:private-password@example.com:8443/private-path?private-query#private-fragment", "https://example.com:8443"; "remote")]
-#[test_case("http://private-user:private-password@[::1]:8080/private-path?private-query#private-fragment", "http://[::1]:8080"; "ipv6")]
-fn decisions_status_displays_only_the_endpoint_origin(base_url: &str, origin: &str) {
-    let config = DecisionsConfig {
-        base_url: Some(base_url.parse().unwrap()),
-        model: "test-model\n\u{1b}[2J".into(),
-        api_key_env: "PRIVATE_API_KEY_ENV".into(),
-        ..Default::default()
-    };
-    let text = decision_status_message(&config, &DecisionStatus::default(), false);
-    assert!(
-        text.contains(&format!("Endpoint origin: {origin}\n")),
-        "{text}"
-    );
-    for hidden in [
-        "private-user",
-        "private-password",
-        "private-path",
-        "private-query",
-        "private-fragment",
-        "PRIVATE_API_KEY_ENV",
-        "\u{1b}",
-        "test-model\n",
-    ] {
-        assert!(!text.contains(hidden), "{text}");
-    }
 }
 
 #[test_case(DECISIONS_COMMAND, None; "status")]
@@ -10990,13 +10900,7 @@ fn decisions_command_submission_stays_local(command: &str, expected_flash: Optio
         let actions = type_and_submit(&mut app, command);
         assert!(actions.is_empty());
         assert_eq!(app.status_bar.flash_text(), expected_flash);
-        if expected_flash.is_none() {
-            assert!(
-                app.active_chat()
-                    .last_message_text()
-                    .contains(DECISIONS_OFF)
-            );
-        }
+        assert_eq!(app.decisions_modal.is_open(), expected_flash.is_none());
         assert!(app.queue.is_empty());
         if let Some(steers) = app.subagent_steers.get(TASK_ID) {
             assert!(steers.entries().is_empty());
@@ -16421,6 +16325,10 @@ fn open_tools_modal(app: &mut App) {
     app.tools_modal.open();
 }
 
+fn open_decisions_modal(app: &mut App) {
+    app.decisions_modal.open();
+}
+
 fn open_skills_modal(app: &mut App) {
     app.skills_modal.open();
 }
@@ -16466,6 +16374,7 @@ fn open_argument_prompt(app: &mut App) {
 #[test_case(open_logs_modal    ; "logs_modal")]
 #[test_case(open_docs_modal    ; "docs_modal")]
 #[test_case(open_tools_modal   ; "tools_modal")]
+#[test_case(open_decisions_modal ; "decisions_modal")]
 #[test_case(open_skills_modal  ; "skills_modal")]
 #[test_case(open_storage_modal ; "storage_modal")]
 #[test_case(open_system_prompt_modal ; "system_prompt_modal")]
@@ -16498,6 +16407,7 @@ fn a_press_outside_a_modal_dismisses_it(open: fn(&mut App)) {
 #[test_case(open_logs_modal    ; "logs_modal")]
 #[test_case(open_docs_modal    ; "docs_modal")]
 #[test_case(open_tools_modal   ; "tools_modal")]
+#[test_case(open_decisions_modal ; "decisions_modal")]
 #[test_case(open_skills_modal  ; "skills_modal")]
 #[test_case(open_storage_modal ; "storage_modal")]
 #[test_case(open_system_prompt_modal ; "system_prompt_modal")]
@@ -18966,6 +18876,7 @@ fn open_permission_test_leader(app: &mut App) {
 #[test_case(open_docs_modal; "docs")]
 #[test_case(open_context_modal; "context")]
 #[test_case(open_tools_modal; "tools")]
+#[test_case(open_decisions_modal; "decisions")]
 #[test_case(open_skills_modal; "skills")]
 #[test_case(open_storage_modal; "storage")]
 #[test_case(open_system_prompt_modal; "system_prompt")]

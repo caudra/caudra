@@ -63,7 +63,7 @@ A command with an Experiment entry exists only while that switch is on under `[e
 | `/goal-clear` | Stop the active completion goal | Main only |  |
 | `/goal-model` | Assign the completion goal model | Main only |  |
 | `/auto` | Toggle Auto permissions (skip unmatched prompts, keep safeguards) |  | `decision_engine` |
-| `/decisions` | Show decision engine configuration and cached status |  | `decision_engine` |
+| `/decisions` | Inspect decision engine status, features, activity, and recent decisions |  | `decision_engine` |
 | `/yolo` | Toggle YOLO mode (skip all permission prompts) |  |  |
 | `/thinking` | Set reasoning (off, adaptive/provider default, effort, or token budget) |  |  |
 | `/fast` | Toggle fast mode (models that sell a fast tier) |  |  |

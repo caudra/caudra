@@ -209,6 +209,7 @@ pub enum StatusBarHitTarget {
     Auto,
     Fast,
     Sandbox,
+    Decisions,
 }
 
 impl StatusBarHitTarget {
@@ -240,7 +241,8 @@ impl StatusBarHitTarget {
             | Self::Auto
             | Self::Tasks
             | Self::Shells
-            | Self::Sandbox => ChatScope::Any,
+            | Self::Sandbox
+            | Self::Decisions => ChatScope::Any,
             Self::Mode
             | Self::Model
             | Self::Thinking
@@ -1701,12 +1703,18 @@ fn hoverable(ctx: &StatusBarContext<'_>, target: StatusBarHitTarget) -> bool {
     ) || clickable(ctx, target)
 }
 
+/// A control rather than a label: `/decisions` names what the engine last
+/// failed on.
 fn push_decisions_status(strip: &mut Strip, ctx: &StatusBarContext<'_>) {
     if ctx.decisions_offline && ctx.permission_mode != PermissionMode::Yolo {
-        strip.push(Span::styled(
-            format!("{GAP}{DECISIONS_OFFLINE_LABEL}"),
-            theme::current().tool_warning,
-        ));
+        strip.chip(
+            ctx,
+            StatusBarHitTarget::Decisions,
+            [Span::styled(
+                DECISIONS_OFFLINE_LABEL,
+                theme::current().tool_warning,
+            )],
+        );
     }
 }
 
@@ -2154,6 +2162,8 @@ mod tests {
     const LONG_SANDBOX_BARE_CHIP: &str = "[prowlix-instance-with-..]";
     const MISSING_SANDBOX_HIT_MSG: &str =
         "an attached session must reach its sandbox from the footer";
+    const MISSING_DECISIONS_HIT_MSG: &str =
+        "an offline decision engine must be inspectable from the footer";
     const SANDBOX_CLIPPED_MSG: &str =
         "the bar drew part of the sandbox chip with no hit to click it";
     const SANDBOX_CROWDED_MSG: &str = "the sandbox chip pushed a footer control off the bar";
@@ -3818,7 +3828,7 @@ mod tests {
     #[test_case(PermissionMode::Ask, SPLIT_ROWS; "ask_split")]
     #[test_case(PermissionMode::Auto, SPLIT_ROWS; "auto_split")]
     #[test_case(PermissionMode::Yolo, SPLIT_ROWS; "yolo_split")]
-    fn decisions_offline_is_a_passive_warning_except_in_yolo(
+    fn decisions_offline_is_a_warning_control_except_in_yolo(
         permission_mode: PermissionMode,
         rows: u16,
     ) {
@@ -3832,19 +3842,51 @@ mod tests {
         let drawn = draw(&ctx, BAR_WIDTH, rows);
         let row = rows - 1;
         let text = drawn.row(row);
+        let hit = drawn
+            .hits_on(row)
+            .into_iter()
+            .find(|hit| hit.target == StatusBarHitTarget::Decisions);
         if yolo {
             assert!(!text.contains(DECISIONS_OFFLINE_LABEL));
+            assert_eq!(hit, None);
             return;
         }
+        let hit = hit.expect(MISSING_DECISIONS_HIT_MSG);
         let offset = text.find(DECISIONS_OFFLINE_LABEL).unwrap();
         let start = text[..offset].width();
         let end = start + DECISIONS_OFFLINE_LABEL.width();
+        assert_eq!(
+            (usize::from(hit.area.x), usize::from(hit.area.right())),
+            (start, end)
+        );
         assert!(
             drawn.styles[usize::from(row)][start..end]
                 .iter()
                 .all(|style| style.fg == theme::current().tool_warning.fg)
         );
-        assert!(drawn.hits_on(row).iter().all(|hit| usize::from(hit.area.right()) <= start || usize::from(hit.area.x) >= end));
+        assert!(hit.target.accepts_click());
+    }
+
+    #[test]
+    fn hovering_the_decisions_control_highlights_its_chip_alone() {
+        let (_, hits, styles) = render_at(Fixture {
+            decisions_offline: true,
+            hovered: Some(StatusBarHitTarget::Decisions),
+            ..Default::default()
+        });
+        let hit = hits
+            .iter()
+            .find(|hit| hit.target == StatusBarHitTarget::Decisions)
+            .expect(MISSING_DECISIONS_HIT_MSG);
+        let start = usize::from(hit.area.x);
+        let end = usize::from(hit.area.right());
+
+        assert!(!styles[start - 1].add_modifier.contains(Modifier::REVERSED));
+        assert!(
+            styles[start..end]
+                .iter()
+                .all(|style| style.add_modifier.contains(Modifier::REVERSED))
+        );
     }
 
     #[test_case(SINGLE_ROW; "single")]
@@ -4664,12 +4706,13 @@ mod tests {
     /// Every control that opens a command carries that command's scope, so the
     /// bar cannot refuse a click the palette accepts. `Mode`, `BackToMain`,
     /// `Retry` and `Thinking` are absent because their click runs no command.
-    const SCOPED_COMMANDS: [(StatusBarHitTarget, &str); 5] = [
+    const SCOPED_COMMANDS: [(StatusBarHitTarget, &str); 6] = [
         (StatusBarHitTarget::Model, "/model"),
         (StatusBarHitTarget::Goal, "/goal"),
         (StatusBarHitTarget::Context, "/context"),
         (StatusBarHitTarget::Usage, "/usage"),
         (StatusBarHitTarget::Workflows, "/workflows"),
+        (StatusBarHitTarget::Decisions, "/decisions"),
     ];
     const SCOPE_DRIFT_MSG: &str = "a control and its command must agree on which chat they act on";
     const UNKNOWN_COMMAND_MSG: &str = "a control names a command the builtin table does not have";

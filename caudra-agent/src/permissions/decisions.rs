@@ -82,11 +82,7 @@ fn state(request: &PermissionRequest) -> Value {
 }
 
 fn context(manager: &PermissionManager, request: &PermissionRequest) -> DecisionContext {
-    DecisionContext {
-        project: Some(manager.project_cwd().display().to_string()),
-        meta: json!({"request_id": request.id}),
-        ..Default::default()
-    }
+    manager.decision_context(json!({"request_id": request.id}))
 }
 
 pub(super) fn advisories(decision: &PermissionDecision) -> Vec<PermissionAdvisory> {
@@ -410,6 +406,7 @@ mod tests {
     };
     use caudra_storage::StateDir;
     use caudra_storage::decision_log::{DecisionEffect, DecisionLog};
+    use caudra_storage::id::CaudraId;
     use futures_lite::future;
     use serde_json::{Value, json};
     use std::path::PathBuf;
@@ -1020,8 +1017,14 @@ mod tests {
         manager.set_decisions(Some(service.decisions));
         let inherited = manager.fork();
         manager.decisions().unwrap().mark_tainted();
-        let other_root = manager.fork_session();
-        let next_root = other_root.fork_session();
+        let session = CaudraId::generate();
+        let other_root = manager.fork_session(session);
+        let next_root = other_root.fork_session(CaudraId::generate());
+        assert_eq!(other_root.decisions().unwrap().session(), Some(session));
+        assert_eq!(
+            inherited.decisions().unwrap().session(),
+            manager.decisions().unwrap().session()
+        );
         assert!(inherited.decisions().unwrap().is_tainted());
         assert!(!other_root.decisions().unwrap().is_tainted());
         other_root.decisions().unwrap().mark_tainted();

@@ -496,7 +496,7 @@ fn detail(row: &SessionRow, now: u64) -> String {
     }
 }
 
-fn age(seconds: u64) -> String {
+pub(crate) fn age(seconds: u64) -> String {
     AGE_UNITS
         .iter()
         .find(|(size, _)| seconds >= *size)

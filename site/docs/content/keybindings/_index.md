@@ -259,6 +259,12 @@ Some pickers add extra bindings on top of the defaults:
 | Workflow Inspector | `y` | Copy the visible section |
 | Workflow Inspector | `/` | Filter the run list |
 | Workflow Catalog | `Enter` | Launch a trusted workflow, or trust an untrusted one |
+| Decisions | `Tab` / `Shift+Tab` | Next or previous section |
+| Decisions | `1-4` | Jump to a section |
+| Decisions | `Left` / `Right` | Focus the list or the detail |
+| Decisions | `g` | Cycle the scope: this session, this project, every session |
+| Decisions | `y` | Copy the selected decision as JSON, or the visible section |
+| Decisions | `Ctrl+R` | Read the decision log again |
 | Workbench Explorer | `Ctrl+X h` | Show hidden files |
 | Workbench Explorer | `C` | Fold the tree back to its top level |
 | Workbench Editor | `Ctrl+S` | Save the active file |
@@ -307,13 +313,14 @@ Some of these contexts belong to an [experimental feature](/docs/configuration/#
 - Peer Manager: `cross_session_messaging`
 - Workflow Inspector: `workflows`
 - Workflow Catalog: `workflows`
+- Decisions: `decision_engine`
 - Workbench Transfer: `sandboxes`
 
 ## Context Inheritance
 
 Child contexts inherit their parent's bindings and add their own.
 
-- **Pickers** is the base for: Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker, Stash Picker, Session Picker, Session Relocation, Worktree Picker, Peer Manager, Workflow Inspector, Workflow Catalog
+- **Pickers** is the base for: Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker, Stash Picker, Session Picker, Session Relocation, Worktree Picker, Peer Manager, Workflow Inspector, Workflow Catalog, Decisions
 - **Workbench** is the base for: Workbench Explorer, Workbench Editor, Workbench Source Control, Workbench Search, Workbench Transfer
 
 ## Overriding Keybindings

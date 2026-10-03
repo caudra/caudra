@@ -34,6 +34,7 @@ use crate::animation::{animation_elapsed_ms, spinner_str};
 use crate::components::document_view::COPIED_SELECTION;
 use crate::components::modal::{FooterHits, FooterLine, Modal};
 use crate::components::scrollbar::{ScrollHint, Scrollbar, ScrollbarMouse};
+use crate::components::section_tabs::{SectionTab, tab_strip};
 use crate::components::tool_display::{
     TREE_BRANCH, TREE_LAST, Tense, activity_child_spans, activity_detail, activity_label,
     activity_sigil,
@@ -260,8 +261,8 @@ pub(crate) enum Section {
     Result,
 }
 
-impl Section {
-    const ALL: [Self; 4] = [Self::Overview, Self::Timeline, Self::Agents, Self::Result];
+impl SectionTab for Section {
+    const ALL: &'static [Self] = &[Self::Overview, Self::Timeline, Self::Agents, Self::Result];
 
     fn label(self) -> &'static str {
         match self {
@@ -271,25 +272,9 @@ impl Section {
             Self::Result => "Result",
         }
     }
+}
 
-    fn index(self) -> usize {
-        Self::ALL
-            .iter()
-            .position(|section| *section == self)
-            .unwrap_or_default()
-    }
-
-    fn from_digit(digit: char) -> Option<Self> {
-        let number = digit.to_digit(10)? as usize;
-        Self::ALL.get(number.checked_sub(1)?).copied()
-    }
-
-    fn step(self, delta: isize) -> Self {
-        let len = Self::ALL.len() as isize;
-        let index = (self.index() as isize + delta).rem_euclid(len) as usize;
-        Self::ALL[index]
-    }
-
+impl Section {
     /// The timeline follows its tail, because the newest row is the one a
     /// reader watching a live run wants. Everything else opens at the top.
     fn scroll(self) -> ModalScroll {
@@ -1745,37 +1730,9 @@ impl WorkflowInspector {
 
     fn render_tabs(&mut self, frame: &mut Frame, area: Rect) {
         grab_scope!("workflow_inspector_tabs", area);
-        let t = theme::current();
-        let mut spans = Vec::with_capacity(Section::ALL.len() * 2);
-        let mut hits = Vec::with_capacity(Section::ALL.len());
-        let mut x = area.x;
-        let named = tab_strip_cols() <= area.width;
-        for section in Section::ALL {
-            let digit = section.index() + 1;
-            let text = match named {
-                true => format!("{digit} {}", section.label()),
-                false => digit.to_string(),
-            };
-            let width = u16::try_from(text.len()).unwrap_or(u16::MAX);
-            let style = match section == self.section {
-                true => t.item_selected,
-                false => t.tool_dim,
-            };
-            let hit = Rect::new(x, area.y, width, 1);
-            if hit.right() <= area.right() {
-                hits.push((hit, section));
-            }
-            spans.push(Span::styled(
-                text,
-                hover_style(style, self.pointer.is_some_and(|at| hit.contains(at))),
-            ));
-            spans.push(Span::raw(SECTION_GAP));
-            x = x
-                .saturating_add(width)
-                .saturating_add(u16::try_from(SECTION_GAP.len()).unwrap_or(u16::MAX));
-        }
+        let (line, hits) = tab_strip(self.section, self.pointer, area);
         self.tab_hits = hits;
-        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        frame.render_widget(Paragraph::new(line), area);
     }
 
     fn render_body(&mut self, frame: &mut Frame, area: Rect) {
@@ -2503,16 +2460,6 @@ fn pane_rows(pane: Rect, height: u16) -> Rect {
         0 => Rect::default(),
         _ => Rect { height, ..pane },
     }
-}
-
-/// What the tab strip needs to name every section, including the gap the last
-/// one carries.
-fn tab_strip_cols() -> u16 {
-    let named: usize = Section::ALL
-        .iter()
-        .map(|section| section.label().len() + 1 + SECTION_GAP.len() + 1)
-        .sum();
-    u16::try_from(named).unwrap_or(u16::MAX)
 }
 
 /// A label at exactly `cols` columns, cut with an ellipsis when it is longer,

@@ -9,7 +9,7 @@ use super::{
 };
 
 const QUESTION_SET: &str = "shell_effect.v1";
-const WRITES: &str = "writes_project_files";
+pub(super) const WRITES: &str = "writes_project_files";
 const QUESTIONS: &str = r#"{
     "writes_project_files": {"type":"noul","instructions":"Does executing this shell command modify files in the project tree?"},
     "changes_system_state": {"type":"noul","instructions":"Does executing this shell command change system state beyond the project tree?"}

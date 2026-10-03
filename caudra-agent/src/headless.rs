@@ -1491,7 +1491,7 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
             if let Some(mode) = params.seed_permission_mode {
                 permissions.set_seed_mode(mode);
             }
-            permissions.set_decisions(decisions);
+            permissions.set_decisions(decisions.map(|service| service.for_session(session_id)));
             if let Err(error) = permissions.replace_remote_permission_asset(
                 params
                     .remote_project_context
@@ -2267,7 +2267,7 @@ async fn spawn_prepared_session(
     if let Some(mode) = params.seed_permission_mode {
         permissions.set_seed_mode(mode);
     }
-    permissions.set_decisions(decisions);
+    permissions.set_decisions(decisions.map(|service| service.for_session(session_id)));
     if let Err(error) = permissions.replace_remote_permission_asset(
         params
             .remote_project_context

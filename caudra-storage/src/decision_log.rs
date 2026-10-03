@@ -1,6 +1,6 @@
 use crate::{StateDir, now_epoch};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior, params};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
@@ -21,6 +21,13 @@ const MAX_RECORD_BYTES: usize = 1_048_576;
 const MAX_QUESTIONS: usize = 64;
 const DEFAULT_NOUL_THRESHOLD: f64 = 0.5;
 const DEFAULT_SCORE_TOLERANCE: f64 = 0.1;
+/// Binds a [`DecisionFilter`] as parameters 1 to 3; an unset field matches every row.
+const FILTER: &str = "(?1 IS NULL OR feature = ?1) AND (?2 IS NULL OR session = ?2) \
+    AND (?3 IS NULL OR project = ?3)";
+/// Every stored column, in the order [`logged_decision`] reads them.
+const ROW_COLUMNS: &str = "id, ts, session, project, feature, question_set_id, \
+    question_set_version, endpoint_kind, model, state, questions, answers, error, latency_ms, \
+    mode, effect, meta, label, label_source, label_ts, label_meta";
 const SCHEMA: &str = "
 CREATE TABLE decisions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -140,12 +147,35 @@ pub struct DecisionStats {
     pub count: u64,
     pub error_count: u64,
     pub error_rate: f64,
+    /// Rows whose recorded effect is anything but `none`. Effects are a partial
+    /// record, so this is a floor on what the engine changed.
+    pub acted_count: u64,
     pub labelled_count: u64,
     pub latency_p50_ms: u64,
     pub latency_p95_ms: u64,
     pub compared_labels: u64,
     pub agreeing_labels: u64,
     pub agreement_rate: Option<f64>,
+    /// Epoch seconds of the newest row.
+    pub last_timestamp: u64,
+}
+
+/// Narrows a query to one feature, session or project. An unset field matches
+/// every row, so the default filter reads the whole log.
+#[derive(Debug, Clone, Default)]
+pub struct DecisionFilter<'a> {
+    pub feature: Option<&'a str>,
+    pub session: Option<&'a str>,
+    pub project: Option<&'a str>,
+}
+
+/// One stored row, with its label when it has one.
+#[derive(Clone, Serialize)]
+pub struct LoggedDecision {
+    pub id: i64,
+    #[serde(flatten)]
+    pub record: DecisionRecord,
+    pub label: Option<DecisionLabel>,
 }
 
 pub struct DecisionLog {
@@ -154,6 +184,11 @@ pub struct DecisionLog {
 }
 
 impl DecisionLog {
+    /// Where the log lives in `state_dir`, whether or not it exists.
+    pub fn file_path(state_dir: &StateDir) -> PathBuf {
+        state_dir.persistent_path().join(DECISIONS_DB_FILE)
+    }
+
     /// Disabled logging does no filesystem I/O. Retention uses row creation time in epoch seconds.
     pub fn open(
         state_dir: &StateDir,
@@ -164,7 +199,7 @@ impl DecisionLog {
             return Ok(None);
         }
         fs::create_dir_all(state_dir.persistent_path())?;
-        let path = state_dir.persistent_path().join(DECISIONS_DB_FILE);
+        let path = Self::file_path(state_dir);
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -183,7 +218,7 @@ impl DecisionLog {
 
     /// Maintenance access never creates a database or implicitly enables logging.
     pub fn open_existing(state_dir: &StateDir) -> Result<Option<Self>, DecisionLogError> {
-        let path = state_dir.persistent_path().join(DECISIONS_DB_FILE);
+        let path = Self::file_path(state_dir);
         match fs::symlink_metadata(&path) {
             Ok(_) => Self::connect(path, false).map(Some),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -191,16 +226,39 @@ impl DecisionLog {
         }
     }
 
-    fn connect(path: PathBuf, initialize: bool) -> Result<Self, DecisionLogError> {
-        verify_file(&path)?;
-        for suffix in ["-journal", "-wal", "-shm"] {
-            let mut sidecar = path.as_os_str().to_owned();
-            sidecar.push(suffix);
-            match verify_file(Path::new(&sidecar)) {
-                Err(DecisionLogError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
-                result => result?,
-            }
+    /// Diagnostic access that never creates, initializes, prunes or writes, so
+    /// a reader takes no lock the logging session would wait on. A database
+    /// still being created reads as absent.
+    pub fn open_read_only(state_dir: &StateDir) -> Result<Option<Self>, DecisionLogError> {
+        let path = Self::file_path(state_dir);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
         }
+        verify_files(&path)?;
+        let connection = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        connection.busy_timeout(BUSY_TIMEOUT)?;
+        connection.pragma_update(None, "trusted_schema", false)?;
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        let application: i64 =
+            connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
+        if version == 0 && application == 0 && schema_objects(&connection)? == 0 {
+            return Ok(None);
+        }
+        if version != SCHEMA_VERSION || application != APPLICATION_ID {
+            return Err(DecisionLogError::UnsupportedSchema);
+        }
+        Ok(Some(Self { connection, path }))
+    }
+
+    fn connect(path: PathBuf, initialize: bool) -> Result<Self, DecisionLogError> {
+        verify_files(&path)?;
         let mut connection = Connection::open_with_flags(
             &path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -215,12 +273,7 @@ impl DecisionLog {
         let application: i64 =
             transaction.pragma_query_value(None, "application_id", |row| row.get(0))?;
         if version == 0 && application == 0 && initialize {
-            let objects: i64 = transaction.query_row(
-                "SELECT COUNT(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
-                [],
-                |row| row.get(0),
-            )?;
-            if objects != 0 {
+            if schema_objects(&transaction)? != 0 {
                 return Err(DecisionLogError::UnsupportedSchema);
             }
             transaction.execute_batch(SCHEMA)?;
@@ -347,41 +400,36 @@ impl DecisionLog {
         mut writer: impl Write,
         feature: Option<&str>,
     ) -> Result<u64, DecisionLogError> {
-        let mut statement = self.connection.prepare(
-            "SELECT id, ts, session, project, feature, question_set_id, question_set_version,
-                endpoint_kind, model, state, questions, answers, error, latency_ms, mode,
-                effect, meta, label, label_source, label_ts, label_meta
-             FROM decisions WHERE label IS NOT NULL AND (?1 IS NULL OR feature = ?1) ORDER BY id",
-        )?;
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT {ROW_COLUMNS} FROM decisions
+             WHERE label IS NOT NULL AND (?1 IS NULL OR feature = ?1) ORDER BY id"
+        ))?;
         let mut rows = statement.query([feature])?;
         let mut count = 0;
         while let Some(row) = rows.next()? {
-            let questions = row_json(row, 10)?;
-            let expected = row_json(row, 17)?;
-            validate_label(&questions, &expected)?;
-            let selected: Map<String, Value> = question_map(&expected)?
+            let LoggedDecision { id, record, label } = logged_decision(row)?;
+            let label = label.ok_or(DecisionLogError::Invalid("label"))?;
+            validate_label(&record.questions, &label.expected)?;
+            let selected: Map<String, Value> = question_map(&label.expected)?
                 .keys()
-                .map(|id| (id.clone(), questions[id].clone()))
+                .map(|id| (id.clone(), record.questions[id].clone()))
                 .collect();
-            let feature: String = row.get(4)?;
-            let question_set_id: String = row.get(5)?;
-            let question_set_version: String = row.get(6)?;
-            let source: String = row.get(18)?;
             let example = json!({
-                "state": row_json(row, 9)?,
+                "state": record.state,
                 "questions": selected,
-                "expected": expected,
-                "model": row.get::<_, String>(8)?,
-                "tags": ["caudra", format!("feature:{feature}"),
-                    format!("qset:{question_set_id}@{question_set_version}"), format!("label:{source}")],
+                "expected": label.expected,
+                "model": record.model,
+                "tags": ["caudra", format!("feature:{}", record.feature),
+                    format!("qset:{}@{}", record.question_set_id, record.question_set_version),
+                    format!("label:{}", label.source)],
                 "caudra": {
-                    "id": row.get::<_, i64>(0)?, "timestamp": row_u64(row, 1)?,
-                    "session": row.get::<_, Option<String>>(2)?, "project": row.get::<_, Option<String>>(3)?,
-                    "endpoint_kind": row.get::<_, String>(7)?, "answers": row_json(row, 11)?,
-                    "error": row.get::<_, Option<String>>(12)?, "latency_ms": row_u64(row, 13)?,
-                    "mode": row.get::<_, String>(14)?, "effect": row.get::<_, String>(15)?,
-                    "meta": row_json(row, 16)?, "label_timestamp": row_u64(row, 19)?,
-                    "label_meta": row_json(row, 20)?,
+                    "id": id, "timestamp": record.timestamp,
+                    "session": record.session, "project": record.project,
+                    "endpoint_kind": record.endpoint_kind, "answers": record.answers,
+                    "error": record.error, "latency_ms": record.latency_ms,
+                    "mode": record.mode, "effect": record.effect,
+                    "meta": record.meta, "label_timestamp": label.timestamp,
+                    "label_meta": label.meta,
                 },
             });
             serde_json::to_writer(&mut writer, &example)?;
@@ -392,65 +440,65 @@ impl DecisionLog {
     }
 
     /// Nearest-rank latency percentiles and per-answer agreement; missing answers are not votes.
+    /// `thresholds` is asked once for each feature the filter leaves, because
+    /// features read the same question id against different thresholds.
     pub fn stats(
         &self,
-        feature: Option<&str>,
-        thresholds: &StatsThresholds,
+        filter: &DecisionFilter<'_>,
+        thresholds: impl Fn(&str) -> StatsThresholds,
     ) -> Result<Vec<DecisionStats>, DecisionLogError> {
-        if !valid_probability(thresholds.default_noul)
-            || thresholds
-                .noul_by_question
-                .values()
-                .any(|value| !valid_probability(*value))
-            || !thresholds.score_tolerance.is_finite()
-            || thresholds.score_tolerance < 0.0
-        {
-            return Err(DecisionLogError::Invalid("thresholds"));
-        }
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare(&format!(
             "WITH ranked AS (
-                SELECT feature, error, label, latency_ms,
+                SELECT feature, error, label, latency_ms, effect, ts,
                     ROW_NUMBER() OVER (PARTITION BY feature ORDER BY latency_ms) AS rank,
                     COUNT(*) OVER (PARTITION BY feature) AS n
-                FROM decisions WHERE ?1 IS NULL OR feature = ?1
+                FROM decisions WHERE {FILTER}
              ) SELECT feature, COUNT(*), SUM(error IS NOT NULL), SUM(label IS NOT NULL),
                 MAX(CASE WHEN rank = (n + 1) / 2 THEN latency_ms END),
-                MAX(CASE WHEN rank = (n * 95 + 99) / 100 THEN latency_ms END)
-             FROM ranked GROUP BY feature ORDER BY feature",
-        )?;
+                MAX(CASE WHEN rank = (n * 95 + 99) / 100 THEN latency_ms END),
+                SUM(effect <> 'none'), MAX(ts)
+             FROM ranked GROUP BY feature ORDER BY feature"
+        ))?;
         let mut stats = BTreeMap::new();
-        let mut rows = statement.query([feature])?;
+        let mut rows = statement.query(filter_params(filter))?;
         while let Some(row) = rows.next()? {
             let feature: String = row.get(0)?;
+            let feature_thresholds = thresholds(&feature);
+            validate_thresholds(&feature_thresholds)?;
             let count = row_u64(row, 1)?;
             let error_count = row_u64(row, 2)?;
             stats.insert(
                 feature.clone(),
-                DecisionStats {
-                    feature,
-                    count,
-                    error_count,
-                    error_rate: error_count as f64 / count as f64,
-                    labelled_count: row_u64(row, 3)?,
-                    latency_p50_ms: row_u64(row, 4)?,
-                    latency_p95_ms: row_u64(row, 5)?,
-                    compared_labels: 0,
-                    agreeing_labels: 0,
-                    agreement_rate: None,
-                },
+                (
+                    DecisionStats {
+                        feature,
+                        count,
+                        error_count,
+                        error_rate: error_count as f64 / count as f64,
+                        acted_count: row_u64(row, 6)?,
+                        labelled_count: row_u64(row, 3)?,
+                        latency_p50_ms: row_u64(row, 4)?,
+                        latency_p95_ms: row_u64(row, 5)?,
+                        compared_labels: 0,
+                        agreeing_labels: 0,
+                        agreement_rate: None,
+                        last_timestamp: row_u64(row, 7)?,
+                    },
+                    feature_thresholds,
+                ),
             );
         }
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare(&format!(
             "SELECT feature, questions, answers, label FROM decisions
-             WHERE label IS NOT NULL AND answers IS NOT NULL AND error IS NULL AND (?1 IS NULL OR feature = ?1)",
-        )?;
-        let mut rows = statement.query([feature])?;
+             WHERE label IS NOT NULL AND answers IS NOT NULL AND error IS NULL AND {FILTER}"
+        ))?;
+        let mut rows = statement.query(filter_params(filter))?;
         while let Some(row) = rows.next()? {
             let feature: String = row.get(0)?;
             let questions = row_json(row, 1)?;
             let answers = row_json(row, 2)?;
             let expected = row_json(row, 3)?;
-            if let Some(stats) = stats.get_mut(&feature) {
+            if let Some((stats, thresholds)) = stats.get_mut(&feature) {
                 for (id, label) in question_map(&expected)? {
                     if let Some(agrees) =
                         answer_agrees(id, &questions[id], &answers[id], label, thresholds)
@@ -461,13 +509,39 @@ impl DecisionLog {
                 }
             }
         }
-        for stats in stats.values_mut() {
-            if stats.compared_labels > 0 {
-                stats.agreement_rate =
-                    Some(stats.agreeing_labels as f64 / stats.compared_labels as f64);
-            }
+        Ok(stats
+            .into_values()
+            .map(|(mut stats, _)| {
+                if stats.compared_labels > 0 {
+                    stats.agreement_rate =
+                        Some(stats.agreeing_labels as f64 / stats.compared_labels as f64);
+                }
+                stats
+            })
+            .collect())
+    }
+
+    /// The newest rows the filter leaves, newest first and at most `limit` of them.
+    pub fn recent(
+        &self,
+        filter: &DecisionFilter<'_>,
+        limit: usize,
+    ) -> Result<Vec<LoggedDecision>, DecisionLogError> {
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT {ROW_COLUMNS} FROM decisions WHERE {FILTER} ORDER BY id DESC LIMIT ?4"
+        ))?;
+        let limit = i64::try_from(limit).map_err(|_| DecisionLogError::Invalid("limit"))?;
+        let mut rows = statement.query(params![
+            filter.feature,
+            filter.session,
+            filter.project,
+            limit
+        ])?;
+        let mut decisions = Vec::new();
+        while let Some(row) = rows.next()? {
+            decisions.push(logged_decision(row)?);
         }
-        Ok(stats.into_values().collect())
+        Ok(decisions)
     }
 
     /// Removes rows strictly older than the cutoff, including attached labels.
@@ -495,6 +569,93 @@ fn verify_file(path: &Path) -> Result<(), DecisionLogError> {
         return Err(DecisionLogError::UnsafeFile);
     }
     Ok(())
+}
+
+/// The database and whichever of its sidecars exist.
+fn verify_files(path: &Path) -> Result<(), DecisionLogError> {
+    verify_file(path)?;
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        match verify_file(Path::new(&sidecar)) {
+            Err(DecisionLogError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+            result => result?,
+        }
+    }
+    Ok(())
+}
+
+fn schema_objects(connection: &Connection) -> Result<i64, DecisionLogError> {
+    Ok(connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+fn filter_params<'a>(
+    filter: &DecisionFilter<'a>,
+) -> (Option<&'a str>, Option<&'a str>, Option<&'a str>) {
+    (filter.feature, filter.session, filter.project)
+}
+
+fn validate_thresholds(thresholds: &StatsThresholds) -> Result<(), DecisionLogError> {
+    if !valid_probability(thresholds.default_noul)
+        || thresholds
+            .noul_by_question
+            .values()
+            .any(|value| !valid_probability(*value))
+        || !thresholds.score_tolerance.is_finite()
+        || thresholds.score_tolerance < 0.0
+    {
+        return Err(DecisionLogError::Invalid("thresholds"));
+    }
+    Ok(())
+}
+
+/// Reads a row selected with [`ROW_COLUMNS`].
+fn logged_decision(row: &Row<'_>) -> Result<LoggedDecision, DecisionLogError> {
+    let label = row
+        .get::<_, Option<String>>(17)?
+        .map(|expected| {
+            Ok::<_, DecisionLogError>(DecisionLabel {
+                expected: serde_json::from_str(&expected)?,
+                source: row.get(18)?,
+                timestamp: row_u64(row, 19)?,
+                meta: row_json(row, 20)?,
+            })
+        })
+        .transpose()?;
+    Ok(LoggedDecision {
+        id: row.get(0)?,
+        record: DecisionRecord {
+            timestamp: row_u64(row, 1)?,
+            session: row.get(2)?,
+            project: row.get(3)?,
+            feature: row.get(4)?,
+            question_set_id: row.get(5)?,
+            question_set_version: row.get(6)?,
+            endpoint_kind: row_variant(row, 7)?,
+            model: row.get(8)?,
+            state: row_json(row, 9)?,
+            questions: row_json(row, 10)?,
+            answers: row
+                .get::<_, Option<String>>(11)?
+                .map(|answers| serde_json::from_str(&answers))
+                .transpose()?,
+            error: row.get(12)?,
+            latency_ms: row_u64(row, 13)?,
+            mode: row.get(14)?,
+            effect: row_variant(row, 15)?,
+            meta: row_json(row, 16)?,
+        },
+        label,
+    })
+}
+
+/// A unit enum stored as its serde name.
+fn row_variant<T: DeserializeOwned>(row: &Row<'_>, column: usize) -> Result<T, DecisionLogError> {
+    Ok(serde_json::from_value(Value::String(row.get(column)?))?)
 }
 
 fn bounded_json(value: &impl Serialize) -> Result<(), DecisionLogError> {
@@ -587,15 +748,16 @@ fn answer_agrees(
 #[cfg(test)]
 mod tests {
     use super::{
-        DECISIONS_DB_FILE, DecisionEffect, DecisionLabel, DecisionLog, DecisionLogError,
-        DecisionRecord, EndpointKind, MAX_RECORD_BYTES, SCHEMA_VERSION, SECONDS_PER_DAY,
-        StatsThresholds,
+        DECISIONS_DB_FILE, DecisionEffect, DecisionFilter, DecisionLabel, DecisionLog,
+        DecisionLogError, DecisionRecord, DecisionStats, EndpointKind, MAX_RECORD_BYTES,
+        SCHEMA_VERSION, SECONDS_PER_DAY, StatsThresholds,
     };
     use crate::{StateDir, now_epoch};
+    use rusqlite::Connection;
     use serde_json::{Value, json};
     use std::fs;
     #[cfg(unix)]
-    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
     use tempfile::{TempDir, tempdir};
     use test_case::test_case;
 
@@ -603,13 +765,20 @@ mod tests {
     const RETENTION_DAYS: u64 = 90;
     const ENGINE_ERROR: &str = "engine timeout";
     const PAYLOAD_MARKER: &str = "decision-payload-marker-for-purge-test";
+    const SESSION_A: &str = "session-a";
+    const SESSION_B: &str = "session-b";
+    const PROJECT_A: &str = "project-a";
+    const PROJECT_B: &str = "project-b";
+    const PERMISSION: &str = "permission";
+    const CONTENT: &str = "content";
+    const ROW_LIMIT: usize = 10;
 
     fn record() -> DecisionRecord {
         DecisionRecord {
             timestamp: TIMESTAMP,
-            session: Some("session-a".into()),
-            project: Some("project-a".into()),
-            feature: "permission".into(),
+            session: Some(SESSION_A.into()),
+            project: Some(PROJECT_A.into()),
+            feature: PERMISSION.into(),
             question_set_id: "permission.v1".into(),
             question_set_version: "content-hash-a".into(),
             endpoint_kind: EndpointKind::Local,
@@ -653,6 +822,180 @@ mod tests {
             .unwrap()
             .unwrap();
         (root, state, log)
+    }
+
+    fn all_stats(log: &DecisionLog) -> Vec<DecisionStats> {
+        log.stats(&DecisionFilter::default(), |_| StatsThresholds::default())
+            .unwrap()
+    }
+
+    fn ids(log: &DecisionLog, filter: &DecisionFilter, limit: usize) -> Vec<i64> {
+        log.recent(filter, limit)
+            .unwrap()
+            .into_iter()
+            .map(|decision| decision.id)
+            .collect()
+    }
+
+    /// Rows across two sessions, two projects and two features, in id order:
+    /// A/A/permission, B/A/permission, B/B/content.
+    fn scoped_rows(log: &DecisionLog) -> [i64; 3] {
+        let mut record = record();
+        let first = log.insert(&record).unwrap();
+        record.session = Some(SESSION_B.into());
+        let second = log.insert(&record).unwrap();
+        record.project = Some(PROJECT_B.into());
+        record.feature = CONTENT.into();
+        let third = log.insert(&record).unwrap();
+        [first, second, third]
+    }
+
+    #[test_case(DecisionFilter::default(), &[2, 1, 0]; "all")]
+    #[test_case(DecisionFilter { session: Some(SESSION_B), ..Default::default() }, &[2, 1]; "session")]
+    #[test_case(DecisionFilter { project: Some(PROJECT_A), ..Default::default() }, &[1, 0]; "project")]
+    #[test_case(DecisionFilter { feature: Some(CONTENT), ..Default::default() }, &[2]; "feature")]
+    #[test_case(DecisionFilter { session: Some(SESSION_A), project: Some(PROJECT_B), ..Default::default() }, &[]; "disjoint")]
+    fn stats_and_recent_honour_scope_filters(filter: DecisionFilter, expected: &[usize]) {
+        let (_root, _state, log) = fixture();
+        let rows = scoped_rows(&log);
+        let expected_ids: Vec<i64> = expected.iter().map(|index| rows[*index]).collect();
+        assert_eq!(ids(&log, &filter, ROW_LIMIT), expected_ids);
+        let counted: u64 = log
+            .stats(&filter, |_| StatsThresholds::default())
+            .unwrap()
+            .iter()
+            .map(|stats| stats.count)
+            .sum();
+        assert_eq!(counted, expected.len() as u64);
+    }
+
+    #[test]
+    fn stats_count_acted_rows_and_last_seen() {
+        let (_root, _state, log) = fixture();
+        let mut record = record();
+        let advised = log.insert(&record).unwrap();
+        record.timestamp += 5;
+        let escalated = log.insert(&record).unwrap();
+        record.timestamp -= 3;
+        log.insert(&record).unwrap();
+        log.update_effect(advised, DecisionEffect::Advised).unwrap();
+        log.update_effect(escalated, DecisionEffect::Escalated)
+            .unwrap();
+        let stats = all_stats(&log);
+        assert_eq!(stats[0].count, 3);
+        assert_eq!(stats[0].acted_count, 2);
+        assert_eq!(stats[0].last_timestamp, TIMESTAMP + 5);
+    }
+
+    #[test]
+    fn stats_apply_each_features_thresholds() {
+        let (_root, _state, mut log) = fixture();
+        let mut record = record();
+        for feature in [PERMISSION, CONTENT] {
+            record.feature = feature.into();
+            let id = log.insert(&record).unwrap();
+            log.attach_label(id, &label(json!({"user_approves": true})))
+                .unwrap();
+        }
+        let stats = log
+            .stats(&DecisionFilter::default(), |feature| {
+                let mut thresholds = StatsThresholds::default();
+                if feature == CONTENT {
+                    thresholds
+                        .noul_by_question
+                        .insert("user_approves".into(), 0.9);
+                }
+                thresholds
+            })
+            .unwrap();
+        let agreement = |feature: &str| {
+            stats
+                .iter()
+                .find(|stats| stats.feature == feature)
+                .unwrap()
+                .agreement_rate
+        };
+        assert_eq!(agreement(PERMISSION), Some(1.0));
+        assert_eq!(agreement(CONTENT), Some(0.0));
+    }
+
+    #[test]
+    fn recent_is_newest_first_bounded_and_round_trips_labels() {
+        let (_root, _state, mut log) = fixture();
+        let original = record();
+        let first = log.insert(&original).unwrap();
+        let second = log.insert(&original).unwrap();
+        let newest = log.insert(&original).unwrap();
+        let expected = label(json!({"user_approves": false}));
+        log.attach_label(second, &expected).unwrap();
+        log.update_effect(second, DecisionEffect::Rerouted).unwrap();
+        assert_eq!(
+            ids(&log, &DecisionFilter::default(), 2),
+            vec![newest, second]
+        );
+        let all = log.recent(&DecisionFilter::default(), ROW_LIMIT).unwrap();
+        assert_eq!(all.last().unwrap().id, first);
+        let labelled = all.iter().find(|decision| decision.id == second).unwrap();
+        let mut stored = original.clone();
+        stored.effect = DecisionEffect::Rerouted;
+        assert_eq!(
+            serde_json::to_value(&labelled.record).unwrap(),
+            serde_json::to_value(&stored).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&labelled.label).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        assert!(all[0].label.is_none());
+    }
+
+    #[test]
+    fn read_only_open_never_creates_or_writes() {
+        let root = tempdir().unwrap();
+        let absent = StateDir::from_path(root.path().join("absent"));
+        assert!(DecisionLog::open_read_only(&absent).unwrap().is_none());
+        assert!(!absent.path().exists());
+        let (_root, state, log) = fixture();
+        log.insert(&record()).unwrap();
+        drop(log);
+        let reader = DecisionLog::open_read_only(&state).unwrap().unwrap();
+        assert_eq!(all_stats(&reader)[0].count, 1);
+        assert!(reader.insert(&record()).is_err());
+        assert!(reader.purge().is_err());
+        assert_eq!(all_stats(&reader)[0].count, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_open_treats_a_database_being_created_as_absent() {
+        let root = tempdir().unwrap();
+        let state = StateDir::from_path(root.path().to_path_buf());
+        fs::create_dir_all(state.persistent_path()).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(state.persistent_path().join(DECISIONS_DB_FILE))
+            .unwrap();
+        assert!(DecisionLog::open_read_only(&state).unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_open_rejects_a_foreign_schema() {
+        let root = tempdir().unwrap();
+        let state = StateDir::from_path(root.path().to_path_buf());
+        fs::create_dir_all(state.persistent_path()).unwrap();
+        let path = state.persistent_path().join(DECISIONS_DB_FILE);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("CREATE TABLE foreign_rows (id INTEGER)")
+            .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(matches!(
+            DecisionLog::open_read_only(&state),
+            Err(DecisionLogError::UnsupportedSchema)
+        ));
     }
 
     fn export(log: &DecisionLog, feature: Option<&str>) -> Vec<Value> {
@@ -799,7 +1142,7 @@ mod tests {
         let rows = export(&log, None);
         assert!(rows[0]["caudra"]["answers"].is_null());
         assert_eq!(rows[0]["caudra"]["error"], ENGINE_ERROR);
-        let stats = log.stats(None, &StatsThresholds::default()).unwrap();
+        let stats = all_stats(&log);
         assert_eq!(stats[0].labelled_count, 1);
         assert_eq!(stats[0].error_rate, 1.0);
         assert_eq!(stats[0].agreement_rate, None);
@@ -828,7 +1171,7 @@ mod tests {
             rows[0]["expected"],
             json!({"duration": "long", "difficulty": 1})
         );
-        let stats = log.stats(None, &StatsThresholds::default()).unwrap();
+        let stats = all_stats(&log);
         assert_eq!(stats[0].compared_labels, 2);
         assert_eq!(stats[0].agreeing_labels, 1);
     }
@@ -847,7 +1190,7 @@ mod tests {
         record.error = Some(ENGINE_ERROR.into());
         record.answers = None;
         log.insert(&record).unwrap();
-        let stats = log.stats(None, &StatsThresholds::default()).unwrap();
+        let stats = all_stats(&log);
         assert_eq!(stats.len(), 2);
         assert_eq!(stats[0].feature, "permission");
         assert_eq!(stats[0].count, 20);
@@ -859,12 +1202,16 @@ mod tests {
         thresholds
             .noul_by_question
             .insert("user_approves".into(), 0.8);
-        let stats = log.stats(Some("permission"), &thresholds).unwrap();
+        let filter = DecisionFilter {
+            feature: Some("permission"),
+            ..Default::default()
+        };
+        let stats = log.stats(&filter, |_| thresholds.clone()).unwrap();
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].agreement_rate, Some(0.0));
         thresholds.default_noul = f64::NAN;
         assert!(matches!(
-            log.stats(None, &thresholds),
+            log.stats(&DecisionFilter::default(), |_| thresholds.clone()),
             Err(DecisionLogError::Invalid(_))
         ));
     }
@@ -889,18 +1236,12 @@ mod tests {
         log.insert(&record).unwrap();
         drop(log);
         let existing = DecisionLog::open_existing(&state).unwrap().unwrap();
-        assert_eq!(
-            existing.stats(None, &StatsThresholds::default()).unwrap()[0].count,
-            2
-        );
+        assert_eq!(all_stats(&existing)[0].count, 2);
         drop(existing);
         let reopened = DecisionLog::open(&state, true, RETENTION_DAYS)
             .unwrap()
             .unwrap();
-        assert_eq!(
-            reopened.stats(None, &StatsThresholds::default()).unwrap()[0].count,
-            1
-        );
+        assert_eq!(all_stats(&reopened)[0].count, 1);
         assert!(export(&reopened, None).is_empty());
     }
 
@@ -913,11 +1254,7 @@ mod tests {
         log.attach_label(old, &label(json!({"user_approves": true})))
             .unwrap();
         assert_eq!(log.purge().unwrap(), 1);
-        assert!(
-            log.stats(None, &StatsThresholds::default())
-                .unwrap()
-                .is_empty()
-        );
+        assert!(all_stats(&log).is_empty());
         assert!(export(&log, None).is_empty());
         assert!(
             !fs::read(log.path())
@@ -947,11 +1284,7 @@ mod tests {
             log.insert(&record),
             Err(DecisionLogError::Invalid(_))
         ));
-        assert!(
-            log.stats(None, &StatsThresholds::default())
-                .unwrap()
-                .is_empty()
-        );
+        assert!(all_stats(&log).is_empty());
     }
 
     #[test]
@@ -965,10 +1298,7 @@ mod tests {
             DecisionLog::open(&state, true, RETENTION_DAYS),
             Err(DecisionLogError::UnsupportedSchema)
         ));
-        assert_eq!(
-            log.stats(None, &StatsThresholds::default()).unwrap()[0].count,
-            1
-        );
+        assert_eq!(all_stats(&log)[0].count, 1);
     }
 
     #[cfg(unix)]

@@ -1038,7 +1038,7 @@ impl SpawnCtx {
         let restore_session = !initial_history.is_empty() || session_has_content(&session);
         let (system_prompt_profile_name, system_prompt_profile) =
             self.resolve_prompt_profile(&session)?;
-        let permissions = Arc::new(self.permissions.fork_session());
+        let permissions = Arc::new(self.permissions.fork_session(session.id));
         // Publishing writes the session out so a conversation grant has a row
         // to be fenced against. A session holding nothing has nothing to keep,
         // so it earns its row at its first run instead of at startup.

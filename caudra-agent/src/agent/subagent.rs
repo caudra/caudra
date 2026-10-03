@@ -35,7 +35,7 @@ use super::steering::{SharedSteering, Steering};
 use super::{ModelRoute, resolve_model_for_purpose};
 use crate::background::JobScope;
 use crate::cancel::{CancelMap, CancelSlot};
-use crate::decisions::{DecisionContext, DecisionFeature, DecisionReceipt, Decisions};
+use crate::decisions::{DecisionFeature, DecisionReceipt, Decisions};
 use crate::prompt::PromptId;
 use crate::prompt::profile::SystemPromptProfile;
 use crate::tools::native::batch::{self, MAX_BATCH_SIZE};
@@ -1311,14 +1311,9 @@ async fn route_subagent(
     }
     let questions = subagent_questions()?;
     let state = json!({"task_label": task_label});
-    let context = DecisionContext {
-        session: ctx
-            .session_id
-            .as_ref()
-            .map(|session| session.as_str().to_owned()),
-        project: ctx.host_cwd.as_ref().map(|cwd| cwd.display().to_string()),
-        meta: json!({"input_scope": "task_label_only"}),
-    };
+    let context = ctx
+        .permissions
+        .decision_context(json!({"input_scope": "task_label_only"}));
     let outcome = ctx
         .cancel
         .race(

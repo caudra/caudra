@@ -1,11 +1,12 @@
 use std::{env, io, sync::Arc};
 
+use caudra_agent::decisions::stats_thresholds;
 use caudra_agent::tools::ToolRegistry;
 use caudra_config::Feature;
-use caudra_config::decisions::{DecisionThresholds, DecisionsConfig};
+use caudra_config::decisions::DecisionsConfig;
 use caudra_storage::{
     StateDir,
-    decision_log::{DecisionLog, StatsThresholds},
+    decision_log::{DecisionFilter, DecisionLog},
 };
 use color_eyre::{
     Result,
@@ -38,30 +39,28 @@ pub(super) fn run(action: DecisionAction, cli: &Cli) -> Result<()> {
         );
         return Ok(());
     }
-    let log = DecisionLog::open_existing(&storage).context("open existing decision log")?;
     match action {
         DecisionAction::Stats { feature } => {
             let config = configuration(cli)?;
-            let stats = log
-                .as_ref()
+            let filter = DecisionFilter {
+                feature: feature.as_deref(),
+                ..Default::default()
+            };
+            let stats = DecisionLog::open_read_only(&storage)
+                .context("open existing decision log")?
                 .map(|log| {
-                    let rows = log.stats(feature.as_deref(), &StatsThresholds::default())?;
-                    rows.into_iter()
-                        .map(|row| {
-                            log.stats(
-                                Some(&row.feature),
-                                &stats_thresholds(&config.thresholds, &row.feature),
-                            )
-                        })
-                        .collect::<Result<Vec<_>, _>>()
-                        .map(|rows| rows.into_iter().flatten().collect::<Vec<_>>())
+                    log.stats(&filter, |feature| {
+                        stats_thresholds(&config.thresholds, feature)
+                    })
                 })
                 .transpose()?
                 .unwrap_or_default();
             println!("{}", serde_json::to_string_pretty(&stats)?);
         }
         DecisionAction::Export { feature } => {
-            if let Some(log) = log {
+            if let Some(log) =
+                DecisionLog::open_read_only(&storage).context("open existing decision log")?
+            {
                 log.export_jsonl(io::stdout().lock(), feature.as_deref())?;
             }
         }
@@ -69,7 +68,9 @@ pub(super) fn run(action: DecisionAction, cli: &Cli) -> Result<()> {
             if !yes {
                 bail!("deleting the decision log requires --yes");
             }
-            if let Some(log) = log {
+            if let Some(log) =
+                DecisionLog::open_existing(&storage).context("open existing decision log")?
+            {
                 log.purge()?;
             }
             println!("Decision log purged.");
@@ -83,71 +84,4 @@ fn configuration(cli: &Cli) -> Result<DecisionsConfig> {
     let host = super::cli_plugin_host(cli, Arc::clone(ToolRegistry::global_arc()))?;
     let cwd = env::current_dir().context("resolve working directory")?;
     Ok(super::load_config(&host, cli, &cwd, false)?.decisions)
-}
-
-fn stats_thresholds(config: &DecisionThresholds, feature: &str) -> StatsThresholds {
-    let mut thresholds = StatsThresholds::default();
-    let overrides = &mut thresholds.noul_by_question;
-    match feature {
-        "permission" | "auto" => {
-            let threshold = if feature == "auto" {
-                config.auto_flag
-            } else {
-                config.permission_flag
-            };
-            for flag in [
-                "deletes",
-                "uploads",
-                "credentials",
-                "permissions",
-                "remote_rewrite",
-                "off_task",
-            ] {
-                overrides.insert(flag.into(), threshold);
-            }
-        }
-        "content" => {
-            overrides.insert("injection".into(), config.content_injection);
-            overrides.insert(
-                "addressed_to_agent".into(),
-                config.content_addressed_to_agent,
-            );
-        }
-        "shell_duration" => {
-            overrides.insert("endless".into(), config.shell_endless);
-            overrides.insert("heavy".into(), config.shell_heavy);
-        }
-        "shell_effect" => {
-            if let Some(threshold) = config.shell_writes {
-                overrides.insert("writes_project_files".into(), threshold);
-            }
-        }
-        _ => {}
-    }
-    thresholds
-}
-
-#[cfg(test)]
-mod tests {
-    use super::stats_thresholds;
-    use caudra_config::decisions::DecisionThresholds;
-    use caudra_storage::decision_log::StatsThresholds;
-    use test_case::test_case;
-
-    #[test_case("permission", 0.8; "permission")]
-    #[test_case("auto", 0.9; "auto")]
-    fn configured_thresholds_do_not_reinterpret_approval_labels(feature: &str, expected: f64) {
-        let config = DecisionThresholds {
-            permission_flag: 0.8,
-            auto_flag: 0.9,
-            ..Default::default()
-        };
-        let thresholds = stats_thresholds(&config, feature);
-        assert_eq!(thresholds.noul_by_question["uploads"], expected);
-        assert!(!thresholds.noul_by_question.contains_key("user_approves"));
-        assert_eq!(
-            thresholds.default_noul,
-            StatsThresholds::default().default_noul
-        );
-    }
 }

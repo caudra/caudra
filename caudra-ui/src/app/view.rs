@@ -572,6 +572,12 @@ impl App {
                 overlay_rect = r;
             }
         }
+        if self.decisions_modal.is_open() {
+            let r = self.view_decisions_modal(frame, full);
+            if r.width > 0 {
+                overlay_rect = r;
+            }
+        }
         if self.skills_modal.is_open() {
             let snapshot = self.context_snapshot.get();
             let r = self.skills_modal.view(frame, full, snapshot);

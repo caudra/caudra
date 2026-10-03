@@ -15,7 +15,7 @@ const QUESTIONS: &str = include_str!("questions/permission.json");
 const QUESTION_FILE: &str = "decisions/permission.json";
 const MAX_QUESTION_FILE_BYTES: u64 = 64 * 1024;
 const TAINT_THRESHOLD_FACTOR: f64 = 0.75;
-const FLAGS: [&str; 6] = [
+pub(super) const FLAGS: [&str; 6] = [
     "deletes",
     "uploads",
     "credentials",

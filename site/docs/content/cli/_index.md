@@ -35,7 +35,7 @@ caudra decisions export --feature permission > decisions.jsonl
 caudra decisions purge --yes
 ```
 
-`status` shows effective configuration without contacting the endpoint. Reachability is `not_probed`. `stats` prints JSON with counts, errors, latency percentiles and labelled agreement, using the currently configured thresholds. `export` writes JSONL with only labelled questions in laya-evals format. These commands do not enable logging or create a decision database. `purge --yes` removes recorded decisions and labels, not shell duration history.
+`status` shows effective configuration without contacting the endpoint. Reachability is `not_probed`. `stats` prints JSON with counts, errors, latency percentiles and labelled agreement, using the currently configured thresholds. `acted_count` counts the rows whose effect is not `none`, and `last_timestamp` is the newest row's time in epoch seconds. `export` writes JSONL with only labelled questions in laya-evals format. These commands do not enable logging or create a decision database. `purge --yes` removes recorded decisions and labels, not shell duration history.
 
 `stats` and `export` accept `--feature`. Log feature names are `permission`, `auto`, `shell_effect`, `content`, `shell_duration`, `tool_search`, `skill_suggestions`, `goal`, `subagent_routing`, and `workflow`. They differ from some configuration keys. With no database, statistics are empty and export writes nothing. Administration requires local persistent storage and rejects `--ephemeral` and `--workcell`.
 

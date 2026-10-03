@@ -12,7 +12,7 @@ use tracing::{Instrument, debug, error, info_span, warn};
 use super::change_recording;
 use super::relative_paths::{MAX_SUGGESTIONS, PathBase, PathSuggestion};
 use crate::background::ShellJobMetadata;
-use crate::decisions::{DecisionContext, DecisionFeature, shell_duration::ShellDurationPlan};
+use crate::decisions::{DecisionFeature, shell_duration::ShellDurationPlan};
 use crate::mcp::{McpSession, UNKNOWN_MCP};
 use crate::permissions::{
     PermissionAuthorityProfile, PermissionError, RemotePermissionIdentity, canonical_json,
@@ -603,10 +603,9 @@ pub async fn run(
             .model_output
             .clone()
             .unwrap_or_else(|| done.output.as_text());
-        let context = DecisionContext {
-            project: Some(ctx.permissions.project_cwd().display().to_string()),
-            ..Default::default()
-        };
+        let context = ctx
+            .permissions
+            .decision_context(serde_json::json!({"tool": canonical}));
         if let Ok(Some(Some(receipts))) = ctx
             .cancel
             .race(
@@ -891,11 +890,8 @@ async fn run_inner(
                 let permissions = ctx.permissions.clone();
                 let cancel = ctx.cancel.clone();
                 let plan = ctx.mode.is_planning();
-                let context = DecisionContext {
-                    project: Some(permissions.project_cwd().display().to_string()),
-                    meta: serde_json::json!({"deterministic_read_only": true}),
-                    ..Default::default()
-                };
+                let context = permissions
+                    .decision_context(serde_json::json!({"deterministic_read_only": true}));
                 smol::spawn(async move {
                     let _ = cancel
                         .race(permissions.run_passive_decision(
@@ -1542,10 +1538,7 @@ async fn run_tool_search(
         .permissions
         .decisions()
         .filter(|_| !exact && !ctx.permissions.is_yolo());
-    let context = DecisionContext {
-        project: Some(ctx.permissions.project_cwd().display().to_string()),
-        ..Default::default()
-    };
+    let context = ctx.permissions.decision_context(Value::Null);
     let builtin =
         if let Some(deferral) = ctx
             .deferral

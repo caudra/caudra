@@ -1026,10 +1026,11 @@ impl App {
         );
         let lease = SessionLease::acquire(&self.storage, replacement.id)
             .map_err(|error| format!("Failed to reserve new session: {error}"))?;
+        let permissions = Arc::new(self.permissions.fork_session(replacement.id));
         Ok(PreparedSessionReset {
             session: replacement,
             lease: Arc::new(lease),
-            permissions: Arc::new(self.permissions.fork_session()),
+            permissions,
             conversation_permissions: self.conversation_permissions.deferred(),
         })
     }
@@ -1552,7 +1553,7 @@ impl App {
                 .replace_workspace_cursor(binding)
                 .map_err(|error| error.to_string())?;
         }
-        let permissions = Arc::new(self.permissions.fork_session());
+        let permissions = Arc::new(self.permissions.fork_session(session.id));
         // A loaded session that holds nothing owns no row worth publishing
         // against, so it waits for its first run like a fresh one.
         let conversation_permissions = match self.conversation_permissions.deferred() {
