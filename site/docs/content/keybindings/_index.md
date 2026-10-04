@@ -241,7 +241,7 @@ Some pickers add extra bindings on top of the defaults:
 | Peer Manager | `Enter` | Open the selected message review, inspect a peer, or read a channel; never approve from the list |
 | Peer Manager | `Enter` | In This session, remove the focused topic, switch broadcasts, or subscribe to the typed patterns |
 | Peer Manager | `Ctrl+R` | Refresh peer discovery or the message history without blocking the interface |
-| Peer Manager | `Ctrl+B` | Copy the exact peer target outside filter editing |
+| Peer Manager | `Ctrl+B` | Copy the selected peer's @name or exact target outside filter editing |
 | Peer Manager | `o` | Load the selected channel's older stored messages |
 | Peer Manager | `s` | Subscribe to or unsubscribe from the selected topic, or switch broadcasts on or off |
 | Peer Manager | `y` | Approve the current rendered message review once |

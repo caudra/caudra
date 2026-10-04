@@ -19,8 +19,8 @@ pub use caudra_storage::messages::{ChannelSummary, HistoryVersion, MessageChanne
 use caudra_storage::messages::{
     HistoryChannel, MessageAudience, MessageRecipient, MessageSender, NewMessage, StoredMessage,
 };
-use caudra_storage::random_task_id;
 use caudra_storage::sessions::{PermissionMode, StoredInboundPolicy, StoredPeerControls};
+use caudra_storage::{derived_phrase, random_task_id};
 use event_listener::Event;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -53,6 +53,7 @@ const MAX_CORRELATION_BYTES: usize = 256;
 const MAX_TARGET_BYTES: usize = 128;
 const MAX_HANDLE_BYTES: usize = 32;
 const HANDLE_PREFIX: char = '@';
+const HANDLE_DOMAIN: &str = "caudra.messaging-name.v1";
 const MAX_PEER_NAMES: usize = 4096;
 const MAX_MESSAGE_NAMES: usize = MAX_DEDUP * 3;
 const MAX_NAME_ATTEMPTS: usize = 32;
@@ -96,6 +97,9 @@ const AMBIGUOUS_REPLY: &str = "Peer reply identity is ambiguous without its orig
 const NAME_COLLISION: &str = "Unable to allocate a unique peer name within the attempt limit";
 pub const INVALID_HANDLE: &str = "Messaging names use 1 to 32 lowercase letters, digits, and hyphens, starting with a letter or digit";
 const HANDLE_IN_USE: &str = "is in use by another live session";
+const ANSWERS_TO: &str = "this session answers to";
+const UNTIL_RESUMED: &str = "until it is resumed while that name is free";
+const UNNAMED: &str = "this session has no messaging name";
 const UNKNOWN_HANDLE: &str = "No live session has this messaging name";
 const AMBIGUOUS_HANDLE: &str =
     "Several live sessions advertise this messaging name; use an exact target from list_sessions";
@@ -151,6 +155,7 @@ pub struct PeerInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerSummary {
+    /// `@name`, or a word target for a peer without a messaging name.
     pub target: String,
     #[serde(alias = "name")]
     pub title: String,
@@ -976,6 +981,18 @@ fn handle_in_use(handle: &str) -> String {
     format!("Messaging name {HANDLE_PREFIX}{handle} {HANDLE_IN_USE}")
 }
 
+/// The names a session without a free stored name tries, in order. The
+/// first is the session's own on every run, so it needs no saving; the rest
+/// only matter while the same session is open twice.
+fn generated_handles(session: CaudraId) -> impl Iterator<Item = String> {
+    (0..MAX_NAME_ATTEMPTS as u64).map(move |attempt| {
+        derived_phrase(
+            HANDLE_DOMAIN,
+            &[session.as_bytes().as_slice(), &attempt.to_be_bytes()].concat(),
+        )
+    })
+}
+
 fn message_name() -> Result<String, String> {
     random_task_id().map_err(|error| format!("Peer randomness unavailable: {error}"))
 }
@@ -1156,6 +1173,21 @@ fn audience_members(
         .filter(|peer| subscribed(audience, &peer.topics, peer.broadcasts));
     let selected = matching.by_ref().take(max_fanout).collect();
     (selected, matching.count())
+}
+
+/// Forgets the messaging names more than one of `peers` advertises: such a
+/// name reaches none of them, so they are addressed by word target instead.
+fn forget_shared_handles(peers: &mut [PeerInfo]) {
+    let mut seen = HashSet::new();
+    let shared: HashSet<_> = peers
+        .iter()
+        .filter_map(|peer| peer.handle.clone())
+        .filter(|handle| !seen.insert(handle.clone()))
+        .collect();
+    for peer in peers {
+        peer.handle
+            .take_if(|handle| shared.contains(handle.as_str()));
+    }
 }
 
 /// The one live session holding the messaging name `handle`.
@@ -1427,28 +1459,56 @@ impl PeerSession {
         Ok(())
     }
 
-    /// Claims the session's stored messaging name for this registration. A
-    /// name another live session holds stays stored, so a later registration
-    /// can reclaim it once it is free.
+    /// Claims the messaging name this registration answers to: the stored
+    /// name from `--name` while no other live session holds it, else the
+    /// first free name generated from the session ID. A stored name passed
+    /// over stays stored, so a later registration reclaims it once it is
+    /// free, and the error names the one the session answers to meanwhile.
     pub fn claim_handle(&self) -> Result<(), String> {
-        let handle = {
+        let stored = {
             let state = lock(&self.0.state);
             state.ensure_open()?;
-            match (&state.handle, &state.claim) {
-                (Some(handle), None) => handle.clone(),
-                _ => return Ok(()),
+            if state.claim.is_some() {
+                return Ok(());
             }
+            state.handle.clone()
         };
-        let claim = self
-            .0
-            .host
-            .claim(self.session_id(), &handle)?
-            .ok_or_else(|| handle_in_use(&handle))?;
+        let session = self.session_id();
+        let passed_over = match stored {
+            Some(stored) => match self.0.host.claim(session, &stored) {
+                Ok(Some(claim)) => return self.hold(claim),
+                Ok(None) => Some(handle_in_use(&stored)),
+                Err(error) => Some(error),
+            },
+            None => None,
+        };
+        let claim = match generated_handles(session)
+            .find_map(|handle| self.0.host.claim(session, &handle).transpose())
+        {
+            Some(Ok(claim)) => claim,
+            Some(Err(error)) => return Err(format!("{error}; {UNNAMED}")),
+            None => return Err(format!("{NAME_COLLISION}; {UNNAMED}")),
+        };
+        let address = handle_address(&claim.handle);
+        self.hold(claim)?;
+        match passed_over {
+            Some(reason) => Err(format!("{reason}; {ANSWERS_TO} {address} {UNTIL_RESUMED}")),
+            None => Ok(()),
+        }
+    }
+
+    fn hold(&self, claim: HandleClaim) -> Result<(), String> {
         let mut state = lock(&self.0.state);
         state.ensure_open()?;
         state.claim = Some(claim);
         self.0.host.changed.notify(usize::MAX);
         Ok(())
+    }
+
+    /// The messaging name this registration answers to, which may differ
+    /// from the stored one in [`Self::controls`].
+    pub fn handle(&self) -> Option<String> {
+        lock(&self.0.state).claimed_handle()
     }
 
     pub fn wakes_suppressed(&self) -> bool {
@@ -1531,14 +1591,15 @@ impl PeerSession {
     }
 
     pub async fn list_named(&self) -> Result<Vec<PeerSummary>, String> {
-        let peers = self.list().await?;
+        let mut peers = self.list().await?;
+        forget_shared_handles(&mut peers);
         let mut state = lock(&self.0.state);
         state.ensure_open()?;
         peers
             .into_iter()
             .map(|peer| {
                 Ok(PeerSummary {
-                    target: state.peer_name(&peer.target)?,
+                    target: state.address(&peer)?,
                     title: peer.name,
                     handle: peer.handle,
                     cwd: peer.cwd,
@@ -1802,7 +1863,7 @@ impl PeerSession {
             previous.issued.check_retry(&fingerprint, epoch)?;
             return Ok(previous.fanout(epoch, text));
         }
-        let peers = peers.ok_or(RETRY_EXPIRED)?;
+        let mut peers = peers.ok_or(RETRY_EXPIRED)?;
         let now = Instant::now();
         if !state.has_publish_room(now) {
             return Err(PUBLISH_RATE_EXCEEDED.into());
@@ -1813,13 +1874,14 @@ impl PeerSession {
         }) {
             return Err(RETRY_FULL.into());
         }
+        forget_shared_handles(&mut peers);
         let (selected, skipped) = audience_members(peers, &audience, state.max_fanout);
         let message_id = state.message_names.fresh(None, message_name)?;
         let mut routes = Vec::with_capacity(selected.len());
         let mut recipients = Vec::with_capacity(selected.len());
         for peer in selected {
             recipients.push(RecipientReceipt {
-                target: state.peer_name(&peer.target)?,
+                target: state.address(&peer)?,
                 title: peer.name,
                 handle: peer.handle,
                 status: "unknown".into(),
@@ -2306,6 +2368,15 @@ impl SessionState {
             .ok_or_else(|| UNKNOWN_REPLY.into())
     }
 
+    /// How this session addresses `peer`: by its messaging name, or by a
+    /// word target local to this registration when it has none.
+    fn address(&mut self, peer: &PeerInfo) -> Result<String, String> {
+        match &peer.handle {
+            Some(handle) => Ok(handle_address(handle)),
+            None => self.peer_name(&peer.target),
+        }
+    }
+
     fn peer_name(&mut self, route: &str) -> Result<String, String> {
         Ok(match self.peer_names.name(route, None, peer_name)? {
             Name::Bound(name) => name,
@@ -2554,17 +2625,19 @@ impl SessionInner {
         };
         let preferred =
             valid_name(&delivery.message_id, MESSAGE_WORDS).then_some(delivery.message_id.as_str());
-        let alias = (!delivery.sender.external)
+        let alias = (!delivery.sender.external && delivery.sender.handle.is_none())
             .then(|| state.peer_names.name(sender.as_str(), None, peer_name))
             .transpose()?;
         let name = state
             .message_names
             .name(&identity, preferred, message_name)?;
-        let reply_target = alias.as_ref().map_or("", Name::as_str).to_owned();
+        let reply_target = match &delivery.sender.handle {
+            Some(handle) => handle_address(handle),
+            None => alias.as_ref().map_or("", Name::as_str).to_owned(),
+        };
         let origin = PeerMessageOrigin {
             message_id: name.as_str().to_owned(),
             audience: delivery.audience.clone(),
-            sender_session_id: reply_target.clone(),
             sender_name: delivery.sender.name.clone(),
             sender_handle: delivery.sender.handle.clone(),
             reply_target,
@@ -2950,6 +3023,7 @@ impl HostInner {
 
 #[cfg(all(test, unix))]
 mod tests {
+    use std::collections::HashSet;
     use std::fs::{self, Permissions};
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
@@ -2972,19 +3046,20 @@ mod tests {
 
     use super::history::MessageHistory;
     use super::{
-        AMBIGUOUS_HANDLE, AMBIGUOUS_REPLY, CLAIM_BATCH, CLOSED, DIRECT_PUBLICATION, DUPLICATE,
-        DedupEntry, Delivery, FULL, HANDLE_PREFIX, HELD_BLOCKED, HELD_COHORT, HELD_POLICY,
-        HISTORY_HELD, HandleClaim, INVALID_HANDLE, Issued, MAX_BODY_BYTES, MAX_DEDUP, MAX_HELD,
-        MAX_HISTORY_PAGE, MAX_MESSAGE_NAMES, MAX_NAME_ATTEMPTS, MAX_PEER_NAMES, MAX_PROCESS_BYTES,
-        MAX_SESSION_BYTES, MESSAGE_WORDS, MessageChannel, MessageIdentity, NAME_COLLISION,
-        NOT_HELD, NOT_RECORDED, NOT_SUBSCRIBED, NameTable, Outgoing, PEER_WORDS, POLICY_FLOOR,
-        PUBLISH_RATE_EXCEEDED, PeerDecision, PeerDecisionResult, PeerDescriptor, PeerHost,
-        PeerInfo, PeerSession, PeerSummary, RATE_EXCEEDED, RATE_WINDOW, REFUSED_POLICY, REJECTED,
-        RETRY_FULL, RETRY_WINDOW, REUSED_REQUEST, RecipientStatus, Route, STALE_REVIEW,
+        AMBIGUOUS_HANDLE, AMBIGUOUS_REPLY, ANSWERS_TO, CLAIM_BATCH, CLOSED, DIRECT_PUBLICATION,
+        DUPLICATE, DedupEntry, Delivery, FULL, HANDLE_PREFIX, HELD_BLOCKED, HELD_COHORT,
+        HELD_POLICY, HISTORY_HELD, HandleClaim, INVALID_HANDLE, Issued, MAX_BODY_BYTES, MAX_DEDUP,
+        MAX_HELD, MAX_HISTORY_PAGE, MAX_MESSAGE_NAMES, MAX_NAME_ATTEMPTS, MAX_PEER_NAMES,
+        MAX_PROCESS_BYTES, MAX_SESSION_BYTES, MESSAGE_WORDS, MessageChannel, MessageIdentity,
+        NAME_COLLISION, NOT_HELD, NOT_RECORDED, NOT_SUBSCRIBED, NameTable, Outgoing, PEER_WORDS,
+        POLICY_FLOOR, PUBLISH_RATE_EXCEEDED, PeerDecision, PeerDecisionResult, PeerDescriptor,
+        PeerHost, PeerInfo, PeerSession, PeerSummary, RATE_EXCEEDED, RATE_WINDOW, REFUSED_POLICY,
+        REJECTED, RETRY_FULL, RETRY_WINDOW, REUSED_REQUEST, RecipientStatus, Route, STALE_REVIEW,
         STALE_TARGET, SendReceipt, Sender, TEST_HISTORY_DIRECTORY, UNKNOWN_HANDLE, UNKNOWN_REPLY,
-        UNKNOWN_TARGET, WireMode, handle_in_use, literal, lock, message_name, token,
+        UNKNOWN_TARGET, UNTIL_RESUMED, WireMode, generated_handles, handle_address, handle_in_use,
+        literal, lock, message_name, token,
         topics::{INVALID_PATTERN, INVALID_TOPIC},
-        valid_name, wall_ms,
+        valid_handle, valid_name, wall_ms,
     };
     use crate::AgentMode;
 
@@ -3012,6 +3087,11 @@ mod tests {
     const SENDER_HANDLE: &str = "deployer";
     const MISSING_HANDLE: &str = "nobody-here";
     const MALFORMED_HANDLE: &str = "CI_Watcher";
+    /// Pinned, not computed. A resumed session answers to the name derived
+    /// from its id, so drift here renames every session out from under the
+    /// agents and scripts that know it.
+    const GENERATED_HANDLE: &str = "charmed-logical-mudfish";
+    const PINNED_SESSION: [u8; 16] = [7; 16];
     const LOW_RATE: usize = 2;
     const LOW_FANOUT: usize = 1;
     const TOPIC: &str = "ci.failures";
@@ -3380,8 +3460,7 @@ mod tests {
         let observation = claim.messages()[0].clone();
         let origin = observation.peer_event.as_ref().unwrap();
         assert!(valid_name(&origin.message_id, MESSAGE_WORDS));
-        assert!(valid_name(&origin.sender_session_id, PEER_WORDS));
-        assert_eq!(origin.sender_session_id, origin.reply_target);
+        assert!(valid_name(&origin.reply_target, PEER_WORDS));
         assert!(valid_name(
             origin.reply_to.as_deref().unwrap(),
             MESSAGE_WORDS
@@ -4037,7 +4116,6 @@ mod tests {
             let claim = receiver.claim().unwrap();
             let origin = claim.messages()[0].peer_event.clone().unwrap();
             assert_eq!(origin.message_id, receipt.message_id);
-            assert_eq!(origin.sender_session_id, origin.reply_target);
             assert!(valid_name(&origin.reply_target, PEER_WORDS));
             claim.commit();
             let reply = receiver
@@ -4653,9 +4731,62 @@ mod tests {
             .and_then(|peer| peer.handle.clone())
     }
 
+    #[test]
+    fn generated_names_are_pinned_to_their_session() {
+        let session = CaudraId::from_bytes(PINNED_SESSION);
+        assert_eq!(
+            generated_handles(session).next().as_deref(),
+            Some(GENERATED_HANDLE)
+        );
+    }
+
+    #[test]
+    fn generated_names_are_distinct_three_word_messaging_names() {
+        let names: Vec<_> = generated_handles(CaudraId::from_bytes(PINNED_SESSION)).collect();
+        assert_eq!(names.len(), MAX_NAME_ATTEMPTS);
+        assert!(
+            names
+                .iter()
+                .all(|name| valid_handle(name) && valid_name(name, MESSAGE_WORDS))
+        );
+        assert_eq!(names.iter().collect::<HashSet<_>>().len(), names.len());
+    }
+
+    #[test]
+    fn sessions_answer_to_their_generated_name_while_it_is_free() {
+        smol::block_on(async {
+            let directory = directory();
+            let host = host(directory.path());
+            let session = descriptor(directory.path(), InboundPolicy::Auto);
+            let generated: Vec<_> = generated_handles(session.session_id).collect();
+            let register = || {
+                let registered = host.register(session.clone()).unwrap();
+                registered.claim_handle().unwrap();
+                registered
+            };
+            let first = register();
+            assert_eq!(first.handle().as_ref(), Some(&generated[0]));
+            assert_eq!(first.controls().handle, None);
+            first.close();
+            let resumed = register();
+            assert_eq!(resumed.handle().as_ref(), Some(&generated[0]));
+            resumed.close();
+            let squatter = named(
+                &host,
+                descriptor(directory.path(), InboundPolicy::Auto),
+                &generated[0],
+            );
+            squatter.claim_handle().unwrap();
+            let displaced = register();
+            assert_eq!(displaced.handle().as_ref(), Some(&generated[1]));
+            let listed = squatter.list_named().await.unwrap();
+            assert_eq!(listed[0].target, handle_address(&generated[1]));
+        });
+    }
+
     #[test_case(|session| { session.close(); Some(session) }; "closed")]
     #[test_case(|_| None; "dropped")]
-    fn messaging_names_stay_unique_until_their_holder_ends(
+    fn a_taken_stored_name_gives_way_to_the_generated_one_until_a_later_registration(
         release: fn(PeerSession) -> Option<PeerSession>,
     ) {
         smol::block_on(async {
@@ -4668,24 +4799,78 @@ mod tests {
                 HANDLE,
             );
             holder.claim_handle().unwrap();
-            let waiting = named(
-                &second,
-                descriptor(directory.path(), InboundPolicy::Auto),
-                HANDLE,
+            let session = descriptor(directory.path(), InboundPolicy::Auto);
+            let generated = generated_handles(session.session_id).next().unwrap();
+            let waiting = named(&second, session.clone(), HANDLE);
+            assert_eq!(
+                waiting.claim_handle().unwrap_err(),
+                format!(
+                    "{}; {ANSWERS_TO} {} {UNTIL_RESUMED}",
+                    handle_in_use(HANDLE),
+                    handle_address(&generated)
+                )
             );
-            assert_eq!(waiting.claim_handle().unwrap_err(), handle_in_use(HANDLE));
             assert_eq!(waiting.controls().handle.as_deref(), Some(HANDLE));
+            assert_eq!(waiting.handle().as_ref(), Some(&generated));
             let peers = waiting.list().await.unwrap();
             assert_eq!(advertised(&peers, &holder).as_deref(), Some(HANDLE));
             let peers = holder.list().await.unwrap();
-            assert_eq!(advertised(&peers, &waiting), None);
+            assert_eq!(advertised(&peers, &waiting), Some(generated));
             let _released = release(holder);
-            waiting.claim_handle().unwrap();
+            waiting.close();
+            let resumed = named(&second, session, HANDLE);
+            resumed.claim_handle().unwrap();
             let observer = first
                 .register(descriptor(directory.path(), InboundPolicy::Auto))
                 .unwrap();
             let peers = observer.list().await.unwrap();
-            assert_eq!(advertised(&peers, &waiting).as_deref(), Some(HANDLE));
+            assert_eq!(advertised(&peers, &resumed).as_deref(), Some(HANDLE));
+        });
+    }
+
+    #[test]
+    fn named_sessions_address_and_reply_to_each_other_by_name() {
+        smol::block_on(async {
+            let directory = directory();
+            let host = host(directory.path());
+            let claimed = |handle| {
+                let session = named(
+                    &host,
+                    descriptor(directory.path(), InboundPolicy::Auto),
+                    handle,
+                );
+                session.claim_handle().unwrap();
+                session
+            };
+            let sender = claimed(SENDER_HANDLE);
+            let receiver = claimed(HANDLE);
+            let listed = sender.list_named().await.unwrap();
+            assert_eq!(listed[0].target, handle_address(HANDLE));
+            assert!(lock(&sender.0.state).peer_names.live.is_empty());
+            let sent = sender
+                .send_named(&listed[0].target, TEXT, None, REQUEST_ID)
+                .await
+                .unwrap();
+            assert_eq!(sent.status, QUEUED);
+            let claim = receiver.claim().unwrap();
+            let origin = claim.messages()[0].peer_event.clone().unwrap();
+            claim.commit();
+            assert_eq!(origin.reply_target, handle_address(SENDER_HANDLE));
+            assert!(lock(&receiver.0.state).peer_names.live.is_empty());
+            let reply = receiver
+                .send_named(
+                    &origin.reply_target,
+                    REPLY_TEXT,
+                    Some(&origin.message_id),
+                    REPLY_REQUEST_ID,
+                )
+                .await
+                .unwrap();
+            assert_eq!(reply.status, QUEUED);
+            let claim = sender.claim().unwrap();
+            let replied = claim.messages()[0].peer_event.clone().unwrap();
+            claim.commit();
+            assert_eq!(replied.reply_to.as_deref(), Some(sent.message_id.as_str()));
         });
     }
 
@@ -4783,6 +4968,13 @@ mod tests {
                 AMBIGUOUS_HANDLE
             );
             assert!(receivers.iter().all(|receiver| receiver.claim().is_none()));
+            let listed = sender.list_named().await.unwrap();
+            assert_eq!(listed.len(), receivers.len());
+            assert!(
+                listed
+                    .iter()
+                    .all(|peer| valid_name(&peer.target, PEER_WORDS) && peer.handle.is_none())
+            );
         });
     }
 
@@ -5231,7 +5423,7 @@ mod tests {
     }
 
     #[test_case(|origin| origin.message_id.push('x'); "different_message")]
-    #[test_case(|origin| origin.sender_session_id.push('x'); "different_sender")]
+    #[test_case(|origin| origin.sender_handle = Some(TEXT.into()); "different_sender")]
     #[test_case(|origin| origin.sender_name.push('x'); "different_name")]
     #[test_case(|origin| origin.reply_target.push('x'); "different_incarnation")]
     #[test_case(|origin| origin.reply_to = Some(TEXT.into()); "different_correlation")]

@@ -163,7 +163,6 @@ mod peer_tests {
             PeerMessageOrigin {
                 message_id,
                 audience: PeerAudience::Direct,
-                sender_session_id: self.reply_target.clone(),
                 sender_name: PEER_SENDER.into(),
                 sender_handle: None,
                 reply_target: self.reply_target.clone(),
@@ -367,7 +366,7 @@ mod peer_tests {
                         .peer_event
                         .as_ref()
                         .unwrap()
-                        .sender_session_id,
+                        .reply_target,
                     fixture.reply_target
                 );
             }

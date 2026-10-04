@@ -368,10 +368,10 @@ pub struct PeerMessageOrigin {
     pub message_id: String,
     #[serde(default, skip_serializing_if = "PeerAudience::is_direct")]
     pub audience: PeerAudience,
-    pub sender_session_id: String,
     pub sender_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_handle: Option<String>,
+    /// The sender's `@name`, or a word target when it has no messaging name.
     pub reply_target: String,
     pub reply_to: Option<String>,
     /// Sent by a script outside every session, which has no session id and
@@ -389,9 +389,9 @@ impl PeerMessageOrigin {
         }
     }
 
-    /// `value`, unless the sender is a script that has none.
-    fn session_field<'a>(&self, value: &'a str) -> Option<&'a str> {
-        (!self.external).then_some(value)
+    /// Where a reply goes, unless the sender is a script that has none.
+    fn reply_address(&self) -> Option<&str> {
+        (!self.external).then_some(self.reply_target.as_str())
     }
 }
 
@@ -519,9 +519,7 @@ impl Message {
              audience: {}\n\
              topic: {}\n\
              sender_kind: {}\n\
-             sender_session_id: {}\n\
              sender_name: {}\n\
-             sender_handle: {}\n\
              reply_target: {}\n\
              reply_to: {}\n\
              body: {}\n\
@@ -530,10 +528,8 @@ impl Message {
             peer_literal(json!(origin.audience.label())),
             peer_literal(json!(origin.audience.topic())),
             peer_literal(json!(origin.sender_kind())),
-            peer_literal(json!(origin.session_field(&origin.sender_session_id))),
             peer_literal(json!(origin.sender_name)),
-            peer_literal(json!(origin.sender_handle)),
-            peer_literal(json!(origin.session_field(&origin.reply_target))),
+            peer_literal(json!(origin.reply_address())),
             peer_literal(json!(origin.reply_to)),
             peer_literal(json!(text)),
         );
@@ -1366,6 +1362,7 @@ mod tests {
     const STEERING_TEXT: &str = "Continue with a useful response.";
     const SESSION_ID: &str = "CNK1hV6GWoysH3KQMm5wu";
     const TASK_ID: &str = "toolu_01ABC";
+    const LEGACY_SENDER_SESSION_FIELD: &str = "sender_session_id";
 
     fn hostile_origin() -> PeerMessageOrigin {
         PeerMessageOrigin {
@@ -1373,7 +1370,6 @@ mod tests {
             audience: PeerAudience::Topic {
                 topic: PEER_ATTACK.into(),
             },
-            sender_session_id: PEER_ATTACK.into(),
             sender_name: PEER_ATTACK.into(),
             sender_handle: Some(PEER_ATTACK.into()),
             reply_target: PEER_ATTACK.into(),
@@ -1433,6 +1429,14 @@ mod tests {
         assert_peer_framing(decoded.first_text_content().unwrap(), PEER_TEXT, &origin);
         assert!(decoded.is_observation());
         assert!(decoded.first_user_text().is_none());
+    }
+
+    #[test]
+    fn stored_peer_origins_with_a_sender_session_id_still_load() {
+        let mut stored = json!(peer_message_origin());
+        stored[LEGACY_SENDER_SESSION_FIELD] = json!(SESSION_ID);
+        let decoded: PeerMessageOrigin = serde_json::from_value(stored).unwrap();
+        assert_eq!(decoded, peer_message_origin());
     }
 
     fn session() -> SessionRef {

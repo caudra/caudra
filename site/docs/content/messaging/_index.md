@@ -25,7 +25,7 @@ A project cannot enable the experiment. An inbound setting or saved session cann
 
 `/peers` opens the Sessions view of the peer manager. `/messages` opens its Held messages view, and `/topics` opens its Messages view limited to topics. Switch views with `1`, `2`, and `3`. See [inbound policy and trust](/docs/permissions/#cross-session-messages) before allowing automatic delivery.
 
-Sessions shows a discovery snapshot of eligible live peers. Select a row to inspect its workspace, activity, inbound policy, messaging name, subscriptions, broadcast setting, and exact target. `Ctrl+R` refreshes without blocking the interface. `Ctrl+B` copies the target. A failed refresh keeps the previous snapshot visible with an error.
+Sessions shows a discovery snapshot of eligible live peers. Select a row to inspect its messaging name, workspace, activity, inbound policy, subscriptions, and broadcast setting. `Ctrl+R` refreshes without blocking the interface. `Ctrl+B` copies the name as `@name`, or the word-based target of a peer without a name. A failed refresh keeps the previous snapshot visible with an error.
 
 Press `/` to filter the current list, then Enter to leave filter editing. The Sessions filter also matches messaging names and subscriptions. Enter on a held message opens its review. Read the literal message body, then use `y` to approve once or `n` to review rejection. Rejecting removes the message from the live inbox. Browsing, filtering, and refreshing grant no approval. Tab switches list/detail focus. Esc backs out before closing. Narrow terminals show one pane at a time.
 
@@ -41,13 +41,13 @@ The Held messages view contains messages waiting for this session's review or fo
 
 Open the individual message's review before using an approve or reject command. Review again if the session's mode, workspace, or policy changes. An old review cannot approve a message under new controls.
 
-Press `p` outside filter editing to open This session. It shows this session's messaging name, inbound policy, topic subscriptions, and broadcast setting. Tab and Shift+Tab move between its controls. Select a policy and press `a` to apply it. Relaxing the policy requires confirmation because it can release held messages and start billable turns. Project restrictions remain in force. Enter on a subscribed pattern removes it, and Enter on broadcasts switches them on or off. To subscribe, type one or more patterns in the field and press Enter. An invalid pattern stays in the field with the reason. The name is read-only, and the panel never changes another session's settings.
+Press `p` outside filter editing to open This session. It shows the messaging name this session answers to, inbound policy, topic subscriptions, and broadcast setting. Tab and Shift+Tab move between its controls. Select a policy and press `a` to apply it. Relaxing the policy requires confirmation because it can release held messages and start billable turns. Project restrictions remain in force. Enter on a subscribed pattern removes it, and Enter on broadcasts switches them on or off. To subscribe, type one or more patterns in the field and press Enter. An invalid pattern stays in the field with the reason. The name is read-only, and the panel never changes another session's settings.
 
-You can also ask the agent to find a session and send it a message. It uses `list_sessions` for discovery and `send_message` for delivery. It reaches many sessions at once through [topics and broadcasts](#topics-and-broadcasts), and reads earlier topic messages from the [message history](#message-history). Discovery cards show session labels, [messaging names](#messaging-names), subscriptions, word-based targets, workspaces, and availability, without transcript previews. A title is not a unique address.
+You can also ask the agent to find a session and send it a message. It uses `list_sessions` for discovery and `send_message` for delivery. It reaches many sessions at once through [topics and broadcasts](#topics-and-broadcasts), and reads earlier topic messages from the [message history](#message-history). Discovery cards show session labels, [messaging names](#messaging-names), subscriptions, workspaces, and availability, without transcript previews. A title is not a unique address.
 
-Use the exact target from discovery or an incoming reply address. Targets belong to your current live registration and are never reassigned to a replacement peer. Discover again after restarting or replacing your session. Message names also use generated words, including the names shown by `/messages` for approval or rejection.
+Agents address a session by the messaging name that discovery and incoming messages show. A peer without a name, such as a session from an older Caudra build, gets a word-based target instead. That target belongs to your current live registration and is never reassigned to a replacement peer, so discover again after restarting or replacing your session. Message names also use generated words, including the names shown by `/messages` for approval or rejection.
 
-A live session remembers up to 4,096 targets and 3,072 message names. Beyond that, it forgets the least recently used ones, except those cited by messages still in its inbox. A forgotten target or message name is refused as unknown and is never given to another session or message. Discover the session again, or send without replying to the old message.
+A live session remembers up to 4,096 word-based targets and 3,072 message names. Beyond that, it forgets the least recently used ones, except those cited by messages still in its inbox. A forgotten target or message name is refused as unknown and is never given to another session or message. Discover the session again, or send without replying to the old message.
 
 Accepted messages enter at a safe run boundary. They can also wake an eligible idle TUI session and start a billable model turn. They do not interrupt a running tool or bypass cancellation, permission review, or rate limits. The recipient still applies its own tool permissions.
 
@@ -55,17 +55,19 @@ Opening or closing the manager does not resume cancelled work. While the manager
 
 ## Messaging names
 
-Start a TUI session with `--name` to give it a unique messaging name:
+Every live session has a unique messaging name. Caudra generates it from three words, such as `@calm-proud-otter`, in the same style as plan names. A three-word name costs an agent fewer tokens to read and write than a word-based target. The name comes from the session id, so a resumed session answers to the same name without saving it.
+
+Start a TUI session with `--name` to choose its name:
 
 ```sh
 caudra --name ci-watcher
 ```
 
-A name has 1 to 32 lowercase letters, digits, and hyphens, and starts with a letter or digit. Only one live session can hold a name at a time. Startup fails while another live session holds it, and the error identifies that session when discovery can find it. A new session also takes the name as its title.
+A chosen name suits a fixed role. Scripts and other agents keep reaching `@ci-watcher` after you replace the session with a new one that uses the same name. A name has 1 to 32 lowercase letters, digits, and hyphens, and starts with a letter or digit. Only one live session can hold a name at a time. Startup fails while another live session holds the name you chose, and the error identifies that session when discovery can find it. A new session also takes the chosen name as its title.
 
-Agents address a named session as `@ci-watcher` in `send_message`. Each send looks the name up again, so the message reaches whichever live session holds the name at that moment. Unnamed sessions stay reachable through the word-based targets from discovery.
+Agents address a session as `@ci-watcher` in `send_message`, and scripts use `caudra message send --to ci-watcher`. Each send looks the name up again, so the message reaches whichever live session holds the name at that moment.
 
-The session saves its name and claims it again when you resume it, even if it has received nothing yet. If another live session holds the name by then, the resumed session continues without it and shows a warning. It tries again the next time you resume it. `/rename` changes only the title, so renaming a session never changes its address. Forks and new sessions start without a name.
+The session saves a chosen name and claims it again when you resume it, even if it has received nothing yet. If another live session holds the name by then, the resumed session answers to its generated name and shows a warning. This session in the peer manager lists both names. The session tries the chosen name again the next time you resume it. A session open twice at once answers to a second generated name in its second copy. `/rename` changes only the title, so renaming a session never changes its name. Forks and new sessions get a generated name of their own.
 
 ## Topics and broadcasts
 

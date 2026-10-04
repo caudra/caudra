@@ -1246,7 +1246,9 @@ impl DisplayMessage {
         let name = origin
             .sender_handle
             .as_deref()
-            .map(|handle| format!("Name: {:?}\n", handle_address(handle)))
+            .map(handle_address)
+            .filter(|address| *address != origin.reply_target)
+            .map(|address| format!("Name: {address:?}\n"))
             .unwrap_or_default();
         let audience = if origin.audience.is_direct() {
             String::new()
@@ -1260,11 +1262,8 @@ impl DisplayMessage {
             )
         } else {
             format!(
-                "Peer: {:?}\n{name}{audience}Message: {:?}\nSender session: {:?}\nReply target: {:?}\n\n{safe_body}",
-                origin.sender_name,
-                origin.message_id,
-                origin.sender_session_id,
-                origin.reply_target,
+                "Peer: {:?}\n{name}Reply target: {:?}\n{audience}Message: {:?}\n\n{safe_body}",
+                origin.sender_name, origin.reply_target, origin.message_id,
             )
         };
         Self::new(DisplayRole::PeerMessage(Box::new(origin)), text)

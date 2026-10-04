@@ -417,7 +417,7 @@ mod tests {
                 let claim = receiver.claim().unwrap();
                 let origin = claim.messages()[0].peer_event.clone().unwrap();
                 assert!(origin.external);
-                assert!(origin.sender_session_id.is_empty() && origin.reply_target.is_empty());
+                assert!(origin.reply_target.is_empty());
                 assert_eq!(origin.sender_name, LABEL);
                 claim.commit();
                 return;

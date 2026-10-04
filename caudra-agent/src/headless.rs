@@ -1523,7 +1523,12 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
                     &params.config.messaging,
                     None,
                 ) {
-                    Ok(session) => Some(session),
+                    Ok(session) => {
+                        if let Err(error) = session.claim_handle() {
+                            warn!(%error, "cross-session messaging name unavailable");
+                        }
+                        Some(session)
+                    }
                     Err(error) => {
                         warn!(%error, "cross-session messaging registration unavailable");
                         None

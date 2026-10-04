@@ -163,7 +163,7 @@ pub struct Cli {
     #[arg(long)]
     pub exit_on_done: bool,
 
-    /// Claim a unique cross-session messaging name for the initial session, which a new session also takes as its title
+    /// Give the initial session this cross-session messaging name instead of a generated one; a new session also takes it as its title
     #[arg(long, value_name = "NAME", value_parser = parse_handle, conflicts_with = "print")]
     pub name: Option<String>,
 

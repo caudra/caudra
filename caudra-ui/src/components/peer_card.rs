@@ -59,10 +59,10 @@ pub(crate) fn render(output: &PeerOutput, budget: usize, width: u16) -> (Vec<Lin
                     peer.title.escape_debug().to_string(),
                     theme.tool_prefix,
                 )));
-                if let Some(address) = peer.handle_address() {
-                    lines.push(labelled(NAME_LABEL, &address, theme.tool_path));
-                }
-                lines.push(labelled(TARGET_LABEL, &peer.target, theme.tool_path));
+                lines.push(match peer.handle_address() {
+                    Some(address) => labelled(NAME_LABEL, &address, theme.tool_path),
+                    None => labelled(TARGET_LABEL, &peer.target, theme.tool_path),
+                });
                 lines.push(Line::from(vec![
                     Span::styled(session_state(peer), theme.tool),
                     Span::styled(
@@ -142,7 +142,9 @@ pub(crate) fn render(output: &PeerOutput, budget: usize, width: u16) -> (Vec<Lin
                     ));
                 }
                 lines.push(Line::from(spans));
-                lines.push(labelled(TO_LABEL, &recipient.target, theme.tool_path));
+                if recipient.handle.is_none() {
+                    lines.push(labelled(TO_LABEL, &recipient.target, theme.tool_path));
+                }
                 if let Some(reason) = recipient
                     .reason
                     .as_deref()
@@ -357,7 +359,8 @@ mod tests {
 
     use super::{
         AUDIENCE_LABEL, BROADCAST, BROADCASTS, EMPTY, NAME_LABEL, NO_MESSAGES, NO_RECIPIENTS,
-        NO_TOPICS, OLDER, SKIPPED_LABEL, TOPICS_LABEL, WITHHELD_LABEL, render,
+        NO_TOPICS, OLDER, SKIPPED_LABEL, TARGET_LABEL, TO_LABEL, TOPICS_LABEL, WITHHELD_LABEL,
+        render,
     };
     use crate::components::code_view::{BatchViews, RenderLimits, RowTarget, render_tool_content};
     use crate::theme;
@@ -523,9 +526,9 @@ mod tests {
         assert!(!drawn.contains("session_id"));
     }
 
-    #[test_case(Some(HANDLE), true; "named")]
-    #[test_case(None, false; "unnamed")]
-    fn only_named_peers_show_the_address_send_message_accepts(handle: Option<&str>, shown: bool) {
+    #[test_case(Some(HANDLE); "named")]
+    #[test_case(None; "unnamed")]
+    fn peers_show_their_name_in_place_of_their_target(handle: Option<&str>) {
         let output = PeerOutput::Sessions {
             sessions: vec![PeerSummary {
                 handle: handle.map(str::to_owned),
@@ -533,8 +536,32 @@ mod tests {
             }],
         };
         let drawn = text(&render(&output, usize::MAX, WIDTH).0);
-        assert_eq!(drawn.contains(&format!("{NAME_LABEL}@{HANDLE}")), shown);
-        assert_eq!(drawn.contains(NAME_LABEL), shown);
+        let named = handle.is_some();
+        assert_eq!(drawn.contains(&format!("{NAME_LABEL}@{HANDLE}")), named);
+        assert_eq!(drawn.contains(NAME_LABEL), named);
+        assert_eq!(drawn.contains(&format!("{TARGET_LABEL}{TARGET}")), !named);
+        assert_eq!(drawn.contains(TARGET), !named);
+    }
+
+    #[test_case(Some(HANDLE); "named")]
+    #[test_case(None; "unnamed")]
+    fn recipients_show_their_name_in_place_of_their_target(handle: Option<&str>) {
+        let output = PeerOutput::Published {
+            receipt: PublishReceipt {
+                message_id: MESSAGE.into(),
+                audience: PeerAudience::Broadcast,
+                recipients: vec![RecipientReceipt {
+                    handle: handle.map(str::to_owned),
+                    ..recipient("queued")
+                }],
+                skipped: 0,
+            },
+        };
+        let drawn = text(&render(&output, usize::MAX, WIDTH).0);
+        let named = handle.is_some();
+        assert_eq!(drawn.contains(&format!("@{HANDLE}")), named);
+        assert_eq!(drawn.contains(&format!("{TO_LABEL}{TARGET}")), !named);
+        assert_eq!(drawn.contains(TARGET), !named);
     }
 
     #[test_case(&[], false; "unsubscribed")]
@@ -759,15 +786,20 @@ mod tests {
     }
 
     fn hostile_sessions() -> PeerOutput {
+        let named = PeerSummary {
+            target: HOSTILE.into(),
+            title: HOSTILE.into(),
+            handle: Some(HOSTILE.into()),
+            cwd: PathBuf::from(HOSTILE),
+            topics: vec![HOSTILE.into()],
+            ..session()
+        };
+        let unnamed = PeerSummary {
+            handle: None,
+            ..named.clone()
+        };
         PeerOutput::Sessions {
-            sessions: vec![PeerSummary {
-                target: HOSTILE.into(),
-                title: HOSTILE.into(),
-                handle: Some(HOSTILE.into()),
-                cwd: PathBuf::from(HOSTILE),
-                topics: vec![HOSTILE.into()],
-                ..session()
-            }],
+            sessions: vec![named, unnamed],
         }
     }
 
@@ -789,13 +821,15 @@ mod tests {
                 audience: PeerAudience::Topic {
                     topic: HOSTILE.into(),
                 },
-                recipients: vec![RecipientReceipt {
-                    target: HOSTILE.into(),
-                    title: HOSTILE.into(),
-                    handle: Some(HOSTILE.into()),
-                    status: HOSTILE.into(),
-                    reason: Some(HOSTILE.into()),
-                }],
+                recipients: [Some(HOSTILE.into()), None]
+                    .map(|handle| RecipientReceipt {
+                        target: HOSTILE.into(),
+                        title: HOSTILE.into(),
+                        handle,
+                        status: HOSTILE.into(),
+                        reason: Some(HOSTILE.into()),
+                    })
+                    .into(),
                 skipped: 0,
             },
         }

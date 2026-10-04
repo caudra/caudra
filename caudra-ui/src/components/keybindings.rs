@@ -1356,7 +1356,7 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Single("Ctrl+B"),
-        description: "Copy the exact peer target outside filter editing",
+        description: "Copy the selected peer's @name or exact target outside filter editing",
         context: KeybindContext::PeerManager,
     },
     Keybind {

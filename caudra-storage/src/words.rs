@@ -128,7 +128,7 @@ pub fn random_task_id() -> Result<String, getrandom::Error> {
 /// from landing on one name, and its length prefix keeps the split between
 /// domain and value from being forged by a value that spells out another
 /// domain.
-pub(crate) fn derived_phrase(domain: &str, value: &[u8]) -> String {
+pub fn derived_phrase(domain: &str, value: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update((domain.len() as u64).to_be_bytes());
     hasher.update(domain.as_bytes());

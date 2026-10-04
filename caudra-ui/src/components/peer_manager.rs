@@ -75,6 +75,8 @@ const SELECT_HELD: &str = "Select a held message, then press Enter to review it.
 const PEER_GONE: &str = "This exact peer target is unavailable in the latest discovery snapshot. Select another peer explicitly.";
 const ALIAS_SCOPE: &str = "This exact alias belongs to this session's current live registration. It is not a globally shareable address.";
 const NAME_LABEL: &str = "Name: ";
+const EXACT_TARGET_LABEL: &str = "Exact target: ";
+const NAME_IN_USE: &str = " was in use at launch; resuming while it is free reclaims it";
 const AUDIENCE_LABEL: &str = "Audience: ";
 const TOPICS_LABEL: &str = "Topics: ";
 const BROADCASTS_LABEL: &str = "Broadcasts: ";
@@ -107,7 +109,8 @@ const LOADING_HISTORY: &str = "Loading message history…";
 const LOADING_MESSAGES: &str = "Loading messages…";
 const NOT_LOADED: &str = "Messages are not loaded. Press Ctrl+R to retry.";
 const TOPICS_SCOPE: &str = "Topics only (3 shows every channel) · ";
-const NO_NAME: &str = "No messaging name. Launch Caudra with --name NAME to give this session one.";
+const NO_NAME: &str =
+    "No messaging name. Other sessions reach this one by a word target from their own discovery.";
 const NO_SUBSCRIPTIONS: &str = "No topic subscriptions.";
 const PATTERN_PROMPT: &str = "+ ";
 const PATTERN_PLACEHOLDER: &str = "Add a topic or pattern, such as ci.*";
@@ -638,6 +641,7 @@ pub struct PeerManager {
     refreshed_at: Option<String>,
     inbox: Option<PeerInboxSnapshot>,
     peer_controls: Option<StoredPeerControls>,
+    messaging_name: Option<String>,
     history: History,
     session_browser: Browser,
     held_browser: Browser,
@@ -679,6 +683,7 @@ impl PeerManager {
             refreshed_at: None,
             inbox: None,
             peer_controls: None,
+            messaging_name: None,
             history: History::default(),
             session_browser: Browser::default(),
             held_browser: Browser::default(),
@@ -749,6 +754,17 @@ impl PeerManager {
             row.detail = channel_detail(&row.summary, Some(&controls));
         }
         self.peer_controls = Some(controls);
+        self.invalidate_layout();
+        true
+    }
+
+    /// The name this session answers to this run, which differs from the
+    /// stored one in its controls while another session holds that.
+    pub fn update_messaging_name(&mut self, name: Option<String>) -> bool {
+        if !self.open || self.messaging_name == name {
+            return false;
+        }
+        self.messaging_name = name;
         self.invalidate_layout();
         true
     }
@@ -1342,12 +1358,18 @@ impl PeerManager {
     fn panel_document(&self) -> Option<PanelDocument> {
         let (panel, inbox) = (self.panel.as_ref()?, self.inbox.as_ref()?);
         let override_label = inbox.inbound_override.as_ref().map_or("None", policy_label);
-        let name = match &self.peer_controls {
-            None => format!("{NAME_LABEL}{UNAVAILABLE}"),
-            Some(controls) => controls.handle.as_deref().map_or_else(
-                || NO_NAME.to_owned(),
-                |handle| format!("{NAME_LABEL}{}", literal(&handle_address(handle), false)),
-            ),
+        let name = match (&self.peer_controls, &self.messaging_name) {
+            (None, _) => format!("{NAME_LABEL}{UNAVAILABLE}"),
+            (Some(_), None) => NO_NAME.to_owned(),
+            (Some(controls), Some(name)) => {
+                let mut line = format!("{NAME_LABEL}{}", literal(&handle_address(name), false));
+                if let Some(stored) = controls.handle.as_ref().filter(|stored| *stored != name) {
+                    line.push_str(SEPARATOR);
+                    line.push_str(&literal(&handle_address(stored), false));
+                    line.push_str(NAME_IN_USE);
+                }
+                line
+            }
         };
         let mut lines = vec![
             PANEL_TITLE.to_owned(),
@@ -1447,17 +1469,17 @@ impl PeerManager {
                 .iter()
                 .flatten()
                 .map(|peer| {
-                    let detail = format!(
+                    let status = format!(
                         "{} · {} · {}",
                         activity(peer),
                         policy_label(&peer.inbound),
                         literal(&peer.cwd.to_string_lossy(), false)
                     );
-                    let title = literal(&peer.title, false);
-                    let name = match peer.handle_address() {
-                        Some(address) => format!("{title} · {}", literal(&address, false)),
-                        None => title,
+                    let detail = match peer.handle_address() {
+                        Some(address) => format!("{}{SEPARATOR}{status}", literal(&address, false)),
+                        None => status,
                     };
+                    let name = literal(&peer.title, false);
                     let search = format!(
                         "{} {name} {detail} {} {}",
                         peer.target,
@@ -2473,14 +2495,14 @@ impl PeerManager {
                 || {
                     self.session_browser.selected.as_deref().map_or_else(
                         || SELECT_PEER.to_owned(),
-                        |target| format!("{PEER_GONE}\n\nExact target: {}", literal(target, false)),
+                        |target| format!("{PEER_GONE}\n\n{EXACT_TARGET_LABEL}{}", literal(target, false)),
                     )
                 },
                 |peer| {
-                    let name = peer
-                        .handle_address()
-                        .map(|address| format!("{NAME_LABEL}{}\n", literal(&address, false)))
-                        .unwrap_or_default();
+                    let address = match peer.handle_address() {
+                        Some(address) => format!("{NAME_LABEL}{}", literal(&address, false)),
+                        None => format!("{EXACT_TARGET_LABEL}{}", literal(&peer.target, false)),
+                    };
                     let topics = if peer.topics.is_empty() {
                         NO_TOPICS.to_owned()
                     } else {
@@ -2490,14 +2512,17 @@ impl PeerManager {
                             .collect::<Vec<_>>()
                             .join(LIST_SEPARATOR)
                     };
-                    format!(
-                        "{}\n\n{name}{TOPICS_LABEL}{topics}\n{BROADCASTS_LABEL}{}\nExact target: {}\nWorkspace: {}\n\n{}",
+                    let mut text = format!(
+                        "{}\n\n{address}\n{TOPICS_LABEL}{topics}\n{BROADCASTS_LABEL}{}\nWorkspace: {}",
                         literal(&peer.title, false),
                         if peer.broadcasts { ON } else { OFF },
-                        literal(&peer.target, false),
                         literal(&peer.cwd.to_string_lossy(), false),
-                        ALIAS_SCOPE,
-                    )
+                    );
+                    if peer.handle.is_none() {
+                        text.push_str("\n\n");
+                        text.push_str(ALIAS_SCOPE);
+                    }
+                    text
                 },
             );
             self.session_reader.replace(text);
@@ -2918,31 +2943,31 @@ fn channel_name(summary: &ChannelSummary) -> String {
     match &summary.channel {
         MessageChannel::Topic(topic) => literal(topic, false),
         MessageChannel::Broadcast => BROADCASTS_TITLE.to_owned(),
-        MessageChannel::Direct(_) => {
-            let title = summary.name.as_deref().map(|name| literal(name, false));
-            let handle = summary
-                .handle
-                .as_deref()
-                .map(|handle| literal(&handle_address(handle), false));
-            match (title, handle) {
-                (Some(title), Some(handle)) => format!("{title}{SEPARATOR}{handle}"),
-                (Some(name), None) | (None, Some(name)) => name,
-                (None, None) => UNKNOWN_SESSION.to_owned(),
-            }
-        }
+        MessageChannel::Direct(_) => match (&summary.name, &summary.handle) {
+            (Some(title), _) => literal(title, false),
+            (None, Some(handle)) => literal(&handle_address(handle), false),
+            (None, None) => UNKNOWN_SESSION.to_owned(),
+        },
     }
 }
 
 /// A channel's message count and latest time, and how this session receives
-/// it under `controls`.
+/// it under `controls`. A direct party's messaging name leads, since a list
+/// row clips its title line.
 fn channel_detail(summary: &ChannelSummary, controls: Option<&StoredPeerControls>) -> String {
     let noun = if summary.count == 1 {
         MESSAGE_NOUN
     } else {
         MESSAGES_NOUN
     };
+    let address = match (&summary.channel, &summary.name, &summary.handle) {
+        (MessageChannel::Direct(_), Some(_), Some(handle)) => {
+            format!("{}{SEPARATOR}", literal(&handle_address(handle), false))
+        }
+        _ => String::new(),
+    };
     let mut detail = format!(
-        "{} {noun}{SEPARATOR}{}",
+        "{address}{} {noun}{SEPARATOR}{}",
         summary.count,
         local_time(summary.last_ms)
     );
@@ -3223,16 +3248,17 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        AUDIENCE_LABEL, BINDINGS, BROADCASTS_LABEL, BROADCASTS_ON_LABEL, BROADCASTS_TITLE, Command,
-        Confirmation, DIRECT_LABEL, FLOOR_BLOCKED, FreshInput, HISTORY_FAILED, HISTORY_POLL,
-        HISTORY_STATUS, LEFT_OUT_HINT, LIST_SEPARATOR, LOADING_HISTORY, LoadedPage,
-        MAX_LITERAL_COLS, MAX_ROWS, NAME_LABEL, NO_LONGER_HELD, NO_MATCHES, NO_NAME, NO_PEERS,
-        NO_REPLY_TARGET, NO_TOPIC_HISTORY, NOT_LOADED, NOT_RECEIVING, OLDER_HINT, ON, POLICY_SAVED,
-        Pane, PanelFocus, PeerManager, PeerManagerAction, PeerView, QUEUED, RECEIVING, REJECTED,
-        RETRY_HINT, Reader, ReviewPanel, SEPARATOR, STALE_REVIEW, START_HINT, SUBSCRIBE_LABEL,
-        SUBSCRIBED, SessionPanel, SubscriptionChange, TOPICS_LABEL, TOPICS_SCOPE,
-        UNSUBSCRIBE_LABEL, VIA, WHEEL_STEP, change_label, channel_key, handle_address, literal,
-        message_block, paint_literal, painted_rows, policy_rank,
+        ALIAS_SCOPE, AUDIENCE_LABEL, BINDINGS, BROADCASTS_LABEL, BROADCASTS_ON_LABEL,
+        BROADCASTS_TITLE, Command, Confirmation, DIRECT_LABEL, EXACT_TARGET_LABEL, FLOOR_BLOCKED,
+        FreshInput, HISTORY_FAILED, HISTORY_POLL, HISTORY_STATUS, LEFT_OUT_HINT, LIST_SEPARATOR,
+        LOADING_HISTORY, LoadedPage, MAX_LITERAL_COLS, MAX_ROWS, NAME_IN_USE, NAME_LABEL,
+        NO_LONGER_HELD, NO_MATCHES, NO_NAME, NO_PEERS, NO_REPLY_TARGET, NO_TOPIC_HISTORY,
+        NOT_LOADED, NOT_RECEIVING, OLDER_HINT, ON, POLICY_SAVED, Pane, PanelFocus, PeerManager,
+        PeerManagerAction, PeerView, QUEUED, RECEIVING, REJECTED, RETRY_HINT, Reader, ReviewPanel,
+        SEPARATOR, STALE_REVIEW, START_HINT, SUBSCRIBE_LABEL, SUBSCRIBED, SessionPanel,
+        SubscriptionChange, TOPICS_LABEL, TOPICS_SCOPE, UNSUBSCRIBE_LABEL, VIA, WHEEL_STEP,
+        change_label, channel_key, handle_address, literal, message_block, paint_literal,
+        painted_rows, policy_rank,
     };
     use crate::components::{Overlay, buffer_text};
     use crate::repaint::Cadence;
@@ -3240,6 +3266,9 @@ mod tests {
     const FIRST_TARGET: &str = "calm-fox-brings-dawn";
     const SECOND_TARGET: &str = "calm-fox-brings-rain";
     const HANDLE: &str = "parser-agent";
+    const GENERATED: &str = "quiet-amber-heron";
+    const LONGEST_HANDLE: &str = "abcdefghijklmnopqrstuvwxyz-12345";
+    const LONG_TITLE: &str = "A session title far longer than the list column";
     const FIRST_MESSAGE: &str = "bright-blue-brook";
     const SECOND_MESSAGE: &str = "still-green-pine";
     const TITLE: &str = "Same readable title";
@@ -3624,24 +3653,72 @@ mod tests {
         ));
     }
 
+    fn named_peer(handle: &str) -> PeerSummary {
+        PeerSummary {
+            handle: Some(handle.to_owned()),
+            ..peer(&handle_address(handle))
+        }
+    }
+
     #[test]
-    fn messaging_names_are_searchable_and_shown_in_details() {
+    fn messaging_names_are_searchable() {
         let mut manager = manager(PeerView::Sessions);
-        manager.set_sessions(Ok(vec![
-            peer(FIRST_TARGET),
-            PeerSummary {
-                handle: Some(HANDLE.into()),
-                ..peer(SECOND_TARGET)
-            },
-        ]));
+        manager.set_sessions(Ok(vec![peer(FIRST_TARGET), named_peer(HANDLE)]));
         manager.handle_key(press(KeyCode::Char('/')));
         manager.handle_paste(HANDLE);
         manager.handle_key(press(KeyCode::Enter));
         let entries = manager.entries();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].0, SECOND_TARGET);
-        manager.select(SECOND_TARGET.to_owned());
-        assert!(draw(&mut manager, WIDE, HEIGHT).contains(&format!("{NAME_LABEL}@{HANDLE}")));
+        assert_eq!(entries[0].0, handle_address(HANDLE));
+    }
+
+    #[test_case(named_peer(HANDLE), NAME_LABEL; "named")]
+    #[test_case(peer(FIRST_TARGET), EXACT_TARGET_LABEL; "unnamed")]
+    fn session_details_show_the_address_ctrl_b_copies(peer: PeerSummary, label: &str) {
+        let target = peer.target.clone();
+        let unnamed = peer.handle.is_none();
+        let mut manager = manager(PeerView::Sessions);
+        manager.set_sessions(Ok(vec![peer]));
+        manager.select(target.clone());
+        draw(&mut manager, WIDE, HEIGHT);
+        let detail = &manager.session_reader.text;
+        assert!(detail.contains(&format!("{label}{target}")), "{detail}");
+        assert_eq!(detail.contains(EXACT_TARGET_LABEL), unnamed);
+        assert_eq!(detail.contains(ALIAS_SCOPE), unnamed);
+        assert!(
+            matches!(manager.handle_key(ctrl('b')), PeerManagerAction::Copy(copied) if copied == target)
+        );
+    }
+
+    /// The selected first row fills the detail pane, so the long name can
+    /// only appear in the second row of the list.
+    fn sessions_listing_a_long_name() -> PeerManager {
+        let mut manager = manager(PeerView::Sessions);
+        manager.set_sessions(Ok(vec![
+            peer(FIRST_TARGET),
+            PeerSummary {
+                title: LONG_TITLE.to_owned(),
+                ..named_peer(LONGEST_HANDLE)
+            },
+        ]));
+        manager
+    }
+
+    fn channels_listing_a_long_name() -> PeerManager {
+        browsing(vec![
+            summary(topic()),
+            ChannelSummary {
+                name: Some(LONG_TITLE.to_owned()),
+                handle: Some(LONGEST_HANDLE.to_owned()),
+                ..summary(direct())
+            },
+        ])
+    }
+
+    #[test_case(sessions_listing_a_long_name(); "session_rows")]
+    #[test_case(channels_listing_a_long_name(); "direct_channel_rows")]
+    fn list_rows_keep_the_longest_messaging_name_whole(mut manager: PeerManager) {
+        assert!(draw(&mut manager, WIDE, HEIGHT).contains(&handle_address(LONGEST_HANDLE)));
     }
 
     #[test]
@@ -4175,7 +4252,9 @@ mod tests {
         let screen = draw(&mut manager, WIDE, HEIGHT);
         assert!(screen.contains(NEWEST_TEXT));
         assert!(screen.contains(OLDER_HINT));
-        assert!(screen.contains(&format!("{TITLE}{SEPARATOR}{}", handle_address(HANDLE))));
+        let (_, title, detail) = &manager.entries()[0];
+        assert_eq!(title, TITLE);
+        assert!(detail.starts_with(&format!("{}{SEPARATOR}", handle_address(HANDLE))));
         assert!(!screen.contains(DIRECT_PARTY));
         manager.handle_key(press(KeyCode::Char('/')));
         manager.handle_paste(DIRECT_PARTY);
@@ -4691,16 +4770,32 @@ mod tests {
         );
     }
 
-    #[test_case(Some(HANDLE), &format!("{NAME_LABEL}{}", handle_address(HANDLE)); "named")]
-    #[test_case(None, NO_NAME; "unnamed")]
-    fn this_session_panel_shows_its_messaging_name(handle: Option<&str>, expected: &str) {
+    #[test_case(None, Some(GENERATED), None; "generated")]
+    #[test_case(Some(HANDLE), Some(HANDLE), None; "stored")]
+    #[test_case(Some(HANDLE), Some(GENERATED), Some(HANDLE); "stored_name_in_use")]
+    #[test_case(Some(HANDLE), None, None; "unnamed")]
+    fn this_session_panel_shows_the_name_it_answers_to(
+        stored: Option<&str>,
+        live: Option<&str>,
+        in_use: Option<&str>,
+    ) {
         let mut manager = manager(PeerView::Held);
         manager.update_controls(StoredPeerControls {
-            handle: handle.map(str::to_owned),
+            handle: stored.map(str::to_owned),
             ..StoredPeerControls::default()
         });
+        manager.update_messaging_name(live.map(str::to_owned));
         manager.handle_key(press(KeyCode::Char('p')));
-        assert!(draw(&mut manager, WIDE, HEIGHT).contains(expected));
+        let name = live.map_or_else(
+            || NO_NAME.to_owned(),
+            |live| format!("{NAME_LABEL}{}", handle_address(live)),
+        );
+        let expected = match in_use {
+            Some(stored) => format!("{name}{SEPARATOR}{}{NAME_IN_USE}", handle_address(stored)),
+            None => name,
+        };
+        let panel = manager.panel_document().expect(PANEL_OPEN).text;
+        assert_eq!(panel.lines().nth(1), Some(expected.as_str()));
     }
 
     #[test]
@@ -4744,6 +4839,7 @@ mod tests {
         channel: ChannelSummary,
         message: ChannelMessage,
         controls: StoredPeerControls,
+        name: Option<String>,
         panel: bool,
     }
 
@@ -4759,7 +4855,8 @@ mod tests {
     #[test_case(|shown| shown.channel.handle = Some(HOSTILE.to_owned()), &literal(&handle_address(HOSTILE), false); "direct_handle")]
     #[test_case(|shown| { shown.channel.channel = MessageChannel::Topic(HOSTILE_TOPIC.to_owned()); shown.controls.topics = words(&[HOSTILE_PATTERN]); }, &format!("{VIA}{}", literal(HOSTILE_PATTERN, false)); "via_pattern")]
     #[test_case(|shown| { shown.controls.topics = words(&[HOSTILE]); shown.panel = true; }, &literal(HOSTILE, false); "panel_pattern")]
-    #[test_case(|shown| { shown.controls.handle = Some(HOSTILE.to_owned()); shown.panel = true; }, &format!("{NAME_LABEL}{}", literal(&handle_address(HOSTILE), false)); "panel_name")]
+    #[test_case(|shown| { shown.name = Some(HOSTILE.to_owned()); shown.panel = true; }, &format!("{NAME_LABEL}{}", literal(&handle_address(HOSTILE), false)); "panel_name")]
+    #[test_case(|shown| { shown.name = Some(HANDLE.to_owned()); shown.controls.handle = Some(HOSTILE.to_owned()); shown.panel = true; }, &format!("{SEPARATOR}{}", literal(&handle_address(HOSTILE), false)); "panel_stored_name")]
     fn peer_strings_show_literally_wherever_they_appear(place: fn(&mut Shown), expected: &str) {
         let mut shown = Shown {
             channel: summary(direct()),
@@ -4774,11 +4871,13 @@ mod tests {
                 ..message(NEWEST_SEQ, NEWEST_TEXT)
             },
             controls: controls(&[], false),
+            name: None,
             panel: false,
         };
         place(&mut shown);
         let mut manager = browsing(vec![shown.channel]);
         manager.update_controls(shown.controls);
+        manager.update_messaging_name(shown.name);
         let request = manager.wanted_page().cloned().expect(PAGE_WANTED);
         manager.set_page(
             request.clone(),

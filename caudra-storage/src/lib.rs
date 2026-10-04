@@ -46,7 +46,8 @@ pub mod workspace_binding;
 pub mod worktrees;
 
 pub use words::{
-    DESCRIPTIVE_ID_ATTEMPTS, DESCRIPTIVE_ID_MAX_LEN, DescriptiveIdCandidates, random_task_id,
+    DESCRIPTIVE_ID_ATTEMPTS, DESCRIPTIVE_ID_MAX_LEN, DescriptiveIdCandidates, derived_phrase,
+    random_task_id,
 };
 
 use std::env;

@@ -327,7 +327,6 @@ pub(crate) mod test_support {
     const RUN_ID: &str = "host-workflow";
     const REVISION: u64 = 3;
     const PEER_MESSAGE_ID: &str = "peer-message-id";
-    const PEER_SESSION_ID: &str = "peer-session-id";
     const PEER_NAME: &str = "Parser reviewer";
     const PEER_HANDLE: &str = "parser-reviewer";
     const PEER_TOPIC: &str = "ci.parser";
@@ -345,7 +344,6 @@ pub(crate) mod test_support {
             audience: PeerAudience::Topic {
                 topic: PEER_TOPIC.into(),
             },
-            sender_session_id: PEER_SESSION_ID.into(),
             sender_name: PEER_NAME.into(),
             sender_handle: Some(PEER_HANDLE.into()),
             reply_target: PEER_REPLY_TARGET.into(),
@@ -356,7 +354,6 @@ pub(crate) mod test_support {
 
     pub(crate) fn script_message_origin() -> PeerMessageOrigin {
         PeerMessageOrigin {
-            sender_session_id: String::new(),
             sender_handle: None,
             reply_target: String::new(),
             reply_to: None,
@@ -369,23 +366,17 @@ pub(crate) mod test_support {
         let mut lines = text.lines();
         assert_eq!(lines.next(), Some(PEER_OPEN));
         assert_eq!(lines.next(), Some(PEER_WARNING));
-        let (kind, session, reply_target) = if origin.external {
-            (SCRIPT_SENDER, None, None)
+        let (kind, reply_target) = if origin.external {
+            (SCRIPT_SENDER, None)
         } else {
-            (
-                SESSION_SENDER,
-                Some(origin.sender_session_id.as_str()),
-                Some(origin.reply_target.as_str()),
-            )
+            (SESSION_SENDER, Some(origin.reply_target.as_str()))
         };
         for (label, expected) in [
             ("message_id", Some(origin.message_id.as_str())),
             ("audience", Some(origin.audience.label())),
             ("topic", origin.audience.topic()),
             ("sender_kind", Some(kind)),
-            ("sender_session_id", session),
             ("sender_name", Some(origin.sender_name.as_str())),
-            ("sender_handle", origin.sender_handle.as_deref()),
             ("reply_target", reply_target),
             ("reply_to", origin.reply_to.as_deref()),
             ("body", Some(body)),

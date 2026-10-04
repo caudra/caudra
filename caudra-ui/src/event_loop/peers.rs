@@ -27,8 +27,6 @@ const MESSAGES_HELP: &str = "Usage: /messages [help | approve ID | reject ID | i
 const LOAD_STOPPED: &str = "Peer messaging stopped before returning a result";
 const MODAL_BLOCKED: &str = "Finish the pending session review before opening the peer manager";
 const QUEUED: &str = "Message queued for the next safe boundary; an idle session may start after closing the manager";
-const UNNAMED: &str =
-    "this session continues without it and reclaims it when resumed while it is free";
 const REJECTED: &str = "Message rejected and removed from the live inbox";
 const TOPICS_HELP: &str = "Usage: /topics [help | subscribe PATTERN... | unsubscribe PATTERN... | broadcast on|off]\nRun /topics to browse stored topic messages in the peer manager, where s subscribes to the selected topic and p edits this session's subscriptions. A topic is a dot-separated name such as ci.failures. In a pattern, * matches one segment and a final ** matches one or more. Subscriptions decide which publications reach this session, up to 16 patterns. Broadcasts reach only sessions that turn them on. The inbound policy still decides whether each message is delivered, held, or refused. Subscriptions are kept with the session and restored when it resumes.";
 const TOPICS_LABEL: &str = "Peer topics: ";
@@ -143,6 +141,7 @@ impl PeerRegistration {
                 }
             }
             dirty |= Dirty::from(manager.update_controls(self.session.controls()));
+            dirty |= Dirty::from(manager.update_messaging_name(self.session.handle()));
         }
         dirty |= self.sync_history(manager, generation);
         dirty
@@ -348,7 +347,7 @@ impl SessionRuntime {
         ) {
             Ok(session) => {
                 if let Err(error) = session.claim_handle() {
-                    self.peer_notice(format!("{error}; {UNNAMED}"));
+                    self.peer_notice(error);
                 }
                 self.peer = Some(PeerRegistration::new(session));
             }

@@ -119,7 +119,7 @@ The filters exclude each other. Without one, `log` prints messages of every kind
 | `--yolo` | Skip permission prompts on gated tools (alias: `--dangerously-skip-permissions`). Deny rules still apply |
 | `--auto` | Start in [Auto mode](/docs/permissions/#auto-mode). Needs `experimental.decision_engine`. Cannot be combined with `--yolo` |
 | `--exit-on-done` | Exit when the agent finishes (TUI automation wrappers) |
-| `--name <NAME>` | Claim a unique [messaging name](/docs/messaging/#messaging-names) for the initial TUI session. Needs `experimental.cross_session_messaging` |
+| `--name <NAME>` | Give the initial TUI session this [messaging name](/docs/messaging/#messaging-names) instead of a generated one. Needs `experimental.cross_session_messaging` |
 | `--topic <PATTERN>` | Subscribe the initial TUI session to a [topic pattern](/docs/messaging/#topics-and-broadcasts), in addition to its saved ones (repeatable). Needs `experimental.cross_session_messaging` |
 | `--receive-broadcasts` | Opt the initial TUI session in to [broadcasts](/docs/messaging/#topics-and-broadcasts). Needs `experimental.cross_session_messaging` |
 | `--allowed-tools <LIST>` | Comma-separated allow list (PascalCase or snake_case) |
