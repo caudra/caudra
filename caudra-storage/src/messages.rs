@@ -675,7 +675,7 @@ fn sql_ms(value: u64) -> Result<i64, MessageLogError> {
 mod tests {
     use super::{
         HistoryChannel, MessageAudience, MessageChannel, MessageLog, MessageLogError,
-        MessageRecipient, MessageSender, NewMessage, Retention, SCHEMA, TopicSummary,
+        MessageRecipient, MessageSender, NewMessage, Retention, TopicSummary,
     };
     use crate::StateDir;
     use crate::sessions::{SESSIONS_DB_FILE, SessionError};
@@ -687,10 +687,6 @@ mod tests {
 
     const NOW_MS: u64 = 10_000_000_000;
     const OWNER_FILE_MODE: u32 = 0o600;
-    const LEGACY_FILE: &str = "messages.db";
-    const LEGACY_SIDECARS: [&str; 3] =
-        ["messages.db-wal", "messages.db-shm", "messages.db-journal"];
-    const LEGACY_SIDECAR_BYTES: &[u8] = b"untouched legacy message sidecar";
     const DAY_MS: u64 = 86_400_000;
     const RETENTION_DAYS: u64 = 30;
     const MAX_MESSAGES: u64 = 50_000;
@@ -837,49 +833,6 @@ mod tests {
             MessageLog::open(&state, &retention(), NOW_MS),
             Err(MessageLogError::Session(_))
         ));
-    }
-
-    #[test]
-    fn legacy_history_and_sidecars_are_neither_imported_nor_changed() {
-        let root = tempdir().unwrap();
-        let state = StateDir::from_path(root.path().to_path_buf());
-        let legacy_path = state.path().join(LEGACY_FILE);
-        let legacy = Connection::open(&legacy_path).unwrap();
-        legacy.execute_batch(SCHEMA).unwrap();
-        legacy
-            .execute(
-                "INSERT INTO messages (sender_route, message_id, kind, sender_session, sender_name,
-                sender_mode, sender_permission, external, text, created_ms)
-             VALUES (?1, ?1, 'broadcast', ?2, ?3, 'build', 'ask', 0, ?4, ?5)",
-                params![
-                    ROUTE,
-                    SESSION,
-                    SENDER_NAME,
-                    TEXT,
-                    i64::try_from(NOW_MS).unwrap()
-                ],
-            )
-            .unwrap();
-        drop(legacy);
-        let before = fs::read(&legacy_path).unwrap();
-        for name in LEGACY_SIDECARS {
-            fs::write(state.path().join(name), LEGACY_SIDECAR_BYTES).unwrap();
-        }
-
-        let log = MessageLog::open(&state, &retention(), NOW_MS).unwrap();
-        assert!(
-            log.history(&HistoryChannel::All, None, LIMIT)
-                .unwrap()
-                .is_empty()
-        );
-        assert!(MessageLog::file_path(&state).is_file());
-        assert_eq!(fs::read(&legacy_path).unwrap(), before);
-        for name in LEGACY_SIDECARS {
-            assert_eq!(
-                fs::read(state.path().join(name)).unwrap(),
-                LEGACY_SIDECAR_BYTES
-            );
-        }
     }
 
     #[test]

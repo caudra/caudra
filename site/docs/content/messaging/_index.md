@@ -133,7 +133,7 @@ Each body is limited to 32 KiB of UTF-8. The inbox admits at most 50 messages ac
 
 ## Message history
 
-Every message a session or script sends is recorded in a message history that all sessions of your user share. This covers direct messages, topic messages, and broadcasts. An entry keeps the sender, the audience, the text, and each recipient's outcome as it moves from queued or held to delivered, rejected, or dropped. The history uses tables in the canonical SQLite file `caudra.db` in the [state directory](/docs/configuration/#directory-layout), and only your user can read it. Older `messages.db` files are not imported. Recording happens before sending. When the history cannot record a message, the send fails and no recipient gets it.
+Every message a session or script sends is recorded in a message history that all sessions of your user share. This covers direct messages, topic messages, and broadcasts. An entry keeps the sender, the audience, the text, and each recipient's outcome as it moves from queued or held to delivered, rejected, or dropped. The history uses tables in the canonical SQLite file `caudra.db` in the [state directory](/docs/configuration/#directory-layout), and only your user can read it. Recording happens before sending. When the history cannot record a message, the send fails and no recipient gets it.
 
 The history is a record rather than an inbox, so a message still needs a live recipient when it is sent. Sessions use the history in two ways.
 

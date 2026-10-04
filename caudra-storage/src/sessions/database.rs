@@ -74,20 +74,13 @@ use crate::workflow::{
 use crate::workflow_scratch::{remove_session as remove_scratch_session, session_scratch_bytes};
 use crate::workspace_binding::StoredWorkspaceBinding;
 use crate::{
-    StateDir, StorageError, database_cutover, existing_state_lock, lock_session_artifacts,
+    StateDir, StorageError, existing_state_lock, lock_session_artifacts,
     lock_session_artifacts_within, shared_existing_state_lock, shared_state_lock,
     try_exclusive_existing_state_lock,
 };
 
 pub const SESSIONS_DB_FILE: &str = "caudra.db";
 pub const SESSIONS_DB_LOCK_FILE: &str = "caudra.db.lock";
-const LEGACY_DB_FILE: &str = "caudra.sqlite";
-const LEGACY_LOCK_FILES: [&str; 4] = [
-    "caudra.sqlite.lock",
-    "caudra.sqlite.artifacts.lock",
-    "caudra.sqlite.active.lock",
-    "caudra.sqlite.sweep.lock",
-];
 
 const SCHEMA_VERSION: i64 = 19;
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUD") as i64;
@@ -1360,12 +1353,15 @@ impl SessionDatabase {
 
     pub(crate) fn open_existing_state(state_dir: &StateDir) -> Result<Option<Self>, SessionError> {
         let path = state_dir.path().join(SESSIONS_DB_FILE);
-        let legacy = state_dir.path().join(LEGACY_DB_FILE);
-        let pending = database_cutover::pending(&legacy, &path).map_err(StorageError::from)?;
-        if !pending && !database_cutover::exists(&path).map_err(StorageError::from)? {
-            return Ok(None);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(StorageError::from(error).into()),
         }
-        let migration_lock = writable_migration_lock(state_dir, false)?;
+        let migration_lock = shared_state_lock(
+            &state_dir.path().join(SESSIONS_DB_LOCK_FILE),
+            OWNER_FILE_MODE,
+        )?;
         let connection = open_writable_connection(state_dir, &migration_lock, None, false)?;
         Ok(Some(Self {
             connection,
@@ -1387,7 +1383,19 @@ impl SessionDatabase {
         state_dir: &StateDir,
         retry: Option<&RuntimeRetry<'_>>,
     ) -> Result<Self, SessionError> {
-        let migration_lock = writable_migration_lock(state_dir, retry.is_some())?;
+        let lock_path = state_dir.path().join(SESSIONS_DB_LOCK_FILE);
+        let migration_lock = if retry.is_some() {
+            fs::create_dir_all(state_dir.path()).map_err(StorageError::from)?;
+            ensure_real_directory(state_dir.path(), false).map_err(StorageError::from)?;
+            create_owner_only(&lock_path)?;
+            let file = existing_state_lock(&lock_path)?;
+            file.try_lock_shared()
+                .map_err(io::Error::from)
+                .map_err(StorageError::from)?;
+            file
+        } else {
+            shared_state_lock(&lock_path, OWNER_FILE_MODE)?
+        };
         let connection = open_writable_connection(state_dir, &migration_lock, retry, true)?;
         Ok(Self {
             connection,
@@ -1459,8 +1467,6 @@ impl SessionDatabase {
 
     fn open_read_only_inner(state_dir: &StateDir, nonblocking: bool) -> Result<Self, SessionError> {
         let path = absolute(state_dir.path().join(SESSIONS_DB_FILE)).map_err(StorageError::from)?;
-        database_cutover::pending(&state_dir.path().join(LEGACY_DB_FILE), &path)
-            .map_err(StorageError::from)?;
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
                 return Err(StorageError::Io(io::Error::new(
@@ -4514,73 +4520,6 @@ fn validate_existing_database_sidecars(path: &Path) -> Result<(), SessionError> 
     Ok(())
 }
 
-fn writable_migration_lock(state_dir: &StateDir, nonblocking: bool) -> Result<File, SessionError> {
-    let pending = database_cutover::pending(
-        &state_dir.path().join(LEGACY_DB_FILE),
-        &state_dir.path().join(SESSIONS_DB_FILE),
-    )
-    .map_err(StorageError::from)?;
-    let lock_path = state_dir.path().join(SESSIONS_DB_LOCK_FILE);
-    if !nonblocking && !pending {
-        return Ok(shared_state_lock(&lock_path, OWNER_FILE_MODE)?);
-    }
-    fs::create_dir_all(state_dir.path()).map_err(StorageError::from)?;
-    ensure_real_directory(state_dir.path(), false).map_err(StorageError::from)?;
-    create_owner_only(&lock_path)?;
-    let file = existing_state_lock(&lock_path)?;
-    file.try_lock_shared().map_err(|error| {
-        StorageError::from(if pending {
-            database_cutover::offline_error(error)
-        } else {
-            io::Error::from(error)
-        })
-    })?;
-    Ok(file)
-}
-
-fn cut_over_legacy_database(
-    state_dir: &StateDir,
-    migration_lock: &File,
-) -> Result<(), SessionError> {
-    let old = state_dir.path().join(LEGACY_DB_FILE);
-    let new = state_dir.path().join(SESSIONS_DB_FILE);
-    if !database_cutover::pending(&old, &new).map_err(StorageError::from)? {
-        return Ok(());
-    }
-    migration_lock
-        .try_lock()
-        .map_err(database_cutover::offline_error)
-        .map_err(StorageError::from)?;
-    let mut locks = Vec::with_capacity(LEGACY_LOCK_FILES.len());
-    for name in LEGACY_LOCK_FILES {
-        let path = state_dir.path().join(name);
-        create_owner_only(&path)?;
-        let file = existing_state_lock(&path)?;
-        file.try_lock()
-            .map_err(database_cutover::offline_error)
-            .map_err(StorageError::from)?;
-        locks.push(file);
-    }
-    if database_cutover::pending(&old, &new).map_err(StorageError::from)? {
-        open_owner_only_existing(&old)?;
-        validate_existing_database_sidecars(&old)?;
-        database_cutover::validate_source(&old).map_err(StorageError::from)?;
-        let connection = Connection::open_with_flags(
-            &old,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        )?;
-        connection.busy_timeout(Duration::ZERO)?;
-        connection.set_limit(Limit::SQLITE_LIMIT_LENGTH, MAX_SQLITE_VALUE_BYTES)?;
-        connection.pragma_update(None, "trusted_schema", false)?;
-        verify_application_id(&connection)?;
-        let version = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        reject_unmigratable(version)?;
-        database_cutover::publish(connection, &old, &new).map_err(StorageError::from)?;
-    }
-    migration_lock.lock_shared().map_err(StorageError::from)?;
-    Ok(())
-}
-
 fn open_writable_connection(
     state_dir: &StateDir,
     migration_lock: &File,
@@ -4591,7 +4530,6 @@ fn open_writable_connection(
         fs::create_dir_all(state_dir.path()).map_err(StorageError::from)?;
     }
     ensure_real_directory(state_dir.path(), false).map_err(StorageError::from)?;
-    cut_over_legacy_database(state_dir, migration_lock)?;
     let path = state_dir.path().join(SESSIONS_DB_FILE);
     if create {
         create_owner_only(&path)?;
@@ -10420,7 +10358,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         }
     }
 
-    fn seed_legacy_wal(state: &StateDir) -> CaudraId {
+    fn seed_schema_eighteen_wal(state: &StateDir) -> CaudraId {
         let (_source_temp, source) = state_dir();
         let mut database = SessionDatabase::open_state(&source).unwrap();
         database
@@ -10438,13 +10376,13 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         for suffix in ["", WAL_SUFFIX, SHM_SUFFIX] {
             fs::copy(
                 database_sidecar(&database.path(), suffix),
-                database_sidecar(&state.path().join(LEGACY_DB_FILE), suffix),
+                database_sidecar(&state.path().join(SESSIONS_DB_FILE), suffix),
             )
             .unwrap();
         }
         assert!(
             fs::metadata(database_sidecar(
-                &state.path().join(LEGACY_DB_FILE),
+                &state.path().join(SESSIONS_DB_FILE),
                 WAL_SUFFIX
             ))
             .unwrap()
@@ -10455,19 +10393,10 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
     }
 
     #[test_case(false; "fresh")]
-    #[test_case(true; "schema_eighteen_cutover_with_wal")]
-    fn shared_repositories_start_empty_without_importing_side_databases(legacy: bool) {
+    #[test_case(true; "schema_eighteen_upgrade_with_wal")]
+    fn shared_repositories_start_empty_with_the_current_schema(upgrade: bool) {
         let (_temp, state) = state_dir();
-        let id = legacy.then(|| seed_legacy_wal(&state));
-        for name in ["messages.db", "decisions.db"] {
-            for suffix in ["", WAL_SUFFIX, SHM_SUFFIX, "-journal"] {
-                fs::write(
-                    database_sidecar(&state.path().join(name), suffix),
-                    ARTIFACT_NAME,
-                )
-                .unwrap();
-            }
-        }
+        let id = upgrade.then(|| seed_schema_eighteen_wal(&state));
         let database = SessionDatabase::open_state(&state).unwrap();
         assert_eq!(database.stats().unwrap().schema_version, SCHEMA_VERSION);
         for table in ["messages", "deliveries", "cursors", "decisions"] {
@@ -10491,15 +10420,6 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
                     .is_file()
             );
         }
-        assert!(!state.path().join(LEGACY_DB_FILE).exists());
-        for name in ["messages.db", "decisions.db"] {
-            for suffix in ["", WAL_SUFFIX, SHM_SUFFIX, "-journal"] {
-                assert_eq!(
-                    fs::read(database_sidecar(&state.path().join(name), suffix)).unwrap(),
-                    ARTIFACT_NAME.as_bytes()
-                );
-            }
-        }
         let (_fresh_temp, fresh_state) = state_dir();
         let fresh = SessionDatabase::open_state(&fresh_state).unwrap();
         assert_eq!(
@@ -10507,32 +10427,6 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             schema_objects(&fresh),
             "{MIGRATED_MATCHES_FRESH}"
         );
-    }
-
-    #[test_case(0; "legacy_database_lock")]
-    #[test_case(1; "legacy_artifact_lock")]
-    #[test_case(2; "legacy_lease_catalog")]
-    #[test_case(3; "legacy_sweep")]
-    fn filename_cutover_refuses_old_process_locks(index: usize) {
-        let (_temp, state) = state_dir();
-        seed_legacy_wal(&state);
-        let lock = shared_state_lock(
-            &state.path().join(LEGACY_LOCK_FILES[index]),
-            OWNER_FILE_MODE,
-        )
-        .unwrap();
-        let old = state.path().join(LEGACY_DB_FILE);
-        let before = fs::read(&old).unwrap();
-        let error = SessionDatabase::open_state(&state).err().unwrap();
-        assert!(
-            error
-                .to_string()
-                .contains(database_cutover::OFFLINE_REQUIRED)
-        );
-        assert_eq!(fs::read(&old).unwrap(), before);
-        assert!(!state.path().join(SESSIONS_DB_FILE).exists());
-        drop(lock);
-        SessionDatabase::open_state(&state).unwrap();
     }
 
     #[test_case(false; "missing_root")]
@@ -10553,25 +10447,6 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         if existing_root {
             assert_eq!(fs::read_dir(path).unwrap().count(), 0);
         }
-    }
-
-    #[test_case(false; "read_only_does_not_cut_over")]
-    #[test_case(true; "both_names_refused")]
-    fn filename_cutover_refusal_preserves_legacy_state(both: bool) {
-        let (_temp, state) = state_dir();
-        seed_legacy_wal(&state);
-        let old = state.path().join(LEGACY_DB_FILE);
-        let before = fs::read(&old).unwrap();
-        if both {
-            fs::write(state.path().join(SESSIONS_DB_FILE), ARTIFACT_NAME).unwrap();
-            assert!(SessionDatabase::open_state(&state).is_err());
-            assert_eq!(
-                fs::read(state.path().join(SESSIONS_DB_FILE)).unwrap(),
-                ARTIFACT_NAME.as_bytes()
-            );
-        }
-        assert!(SessionDatabase::open_read_only(&state).is_err());
-        assert_eq!(fs::read(&old).unwrap(), before);
     }
 
     #[test]

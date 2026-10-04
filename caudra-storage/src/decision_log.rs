@@ -648,7 +648,7 @@ fn answer_agrees(
 mod tests {
     use super::{
         DecisionEffect, DecisionFilter, DecisionLabel, DecisionLog, DecisionLogError,
-        DecisionRecord, DecisionStats, EndpointKind, MAX_RECORD_BYTES, SCHEMA, SECONDS_PER_DAY,
+        DecisionRecord, DecisionStats, EndpointKind, MAX_RECORD_BYTES, SECONDS_PER_DAY,
         StatsThresholds,
     };
     use crate::id::CaudraId;
@@ -677,13 +677,6 @@ mod tests {
     const PERMISSION: &str = "permission";
     const CONTENT: &str = "content";
     const ROW_LIMIT: usize = 10;
-    const LEGACY_FILE: &str = "decisions.db";
-    const LEGACY_SIDECARS: [&str; 3] = [
-        "decisions.db-wal",
-        "decisions.db-shm",
-        "decisions.db-journal",
-    ];
-    const LEGACY_SIDECAR_BYTES: &[u8] = b"untouched legacy decision sidecar";
     const STATE_KEY: &str = "decision-purge-preserved";
     const STATE_VALUE: &str = "main database state";
     const SESSION_ID: [u8; 16] = [1; 16];
@@ -1004,46 +997,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn legacy_decisions_and_sidecars_are_neither_imported_nor_changed() {
-        let root = tempdir().unwrap();
-        let state = StateDir::from_path(root.path().to_path_buf());
-        let legacy_path = state.path().join(LEGACY_FILE);
-        let legacy = Connection::open(&legacy_path).unwrap();
-        legacy.execute_batch(SCHEMA).unwrap();
-        legacy
-            .execute(
-                "INSERT INTO decisions (ts, feature, question_set_id, question_set_version,
-                endpoint_kind, model, state, questions, latency_ms, mode, effect, meta)
-             VALUES (?1, ?2, ?2, ?2, 'local', ?2, '{}', ?3, 0, 'shadow', 'none', '{}')",
-                params![
-                    i64::try_from(TIMESTAMP).unwrap(),
-                    PERMISSION,
-                    record().questions.to_string()
-                ],
-            )
-            .unwrap();
-        drop(legacy);
-        let before = fs::read(&legacy_path).unwrap();
-        for name in LEGACY_SIDECARS {
-            fs::write(state.path().join(name), LEGACY_SIDECAR_BYTES).unwrap();
-        }
-        assert!(DecisionLog::open_existing(&state).unwrap().is_none());
-        assert!(DecisionLog::open_read_only(&state).unwrap().is_none());
-        assert!(!DecisionLog::file_path(&state).exists());
-
-        let log = DecisionLog::open(&state, true, u64::MAX).unwrap().unwrap();
-        assert!(all_stats(&log).is_empty());
-        assert!(DecisionLog::file_path(&state).is_file());
-        assert_eq!(fs::read(&legacy_path).unwrap(), before);
-        for name in LEGACY_SIDECARS {
-            assert_eq!(
-                fs::read(state.path().join(name)).unwrap(),
-                LEGACY_SIDECAR_BYTES
-            );
-        }
-    }
-
     #[test_case(true; "messages_first")]
     #[test_case(false; "decisions_first")]
     fn repositories_coexist_and_purge_preserves_sessions_state_and_messages(messages_first: bool) {
@@ -1061,7 +1014,6 @@ mod tests {
         let mut messages = early_messages
             .unwrap_or_else(|| MessageLog::open(&state, &retention, TIMESTAMP).unwrap());
         assert_eq!(log.path(), MessageLog::file_path(&state));
-        assert!(!state.path().join(LEGACY_FILE).exists());
         let session = CaudraId::from_bytes(SESSION_ID).to_string();
         let mut stored_record = record();
         stored_record.session = Some(session.clone());
