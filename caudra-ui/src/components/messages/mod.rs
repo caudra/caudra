@@ -24,7 +24,7 @@ use super::{
         BatchLiveMap, BatchProgressMap, BatchStartedMap, BatchViewMap, CardPolicy, Disclosure,
         RowTarget, ScrollSpan, ScrollWindow,
     },
-    command_text, memory_card, review, task_card, workflow_card,
+    command_text, memory_card, peer_card, review, task_card, workflow_card,
     workflow_card::CardHit,
 };
 use crate::animation::{live_elapsed, spinner_str};
@@ -3896,10 +3896,7 @@ impl MessagesPanel {
     }
 
     fn has_foldable_body(msg: &DisplayMessage) -> bool {
-        matches!(
-            msg.role,
-            DisplayRole::Thinking | DisplayRole::Injected | DisplayRole::PeerMessage(_)
-        )
+        matches!(msg.role, DisplayRole::Thinking | DisplayRole::Injected)
     }
 
     fn streaming_thinking_collapsed(&self) -> bool {
@@ -4536,6 +4533,12 @@ impl MessagesPanel {
                     None,
                     fragment.text.as_str(),
                     false,
+                ),
+                SegmentKind::PeerMessage => (
+                    "Peer message".to_owned(),
+                    None,
+                    fragment.text.as_str(),
+                    true,
                 ),
                 SegmentKind::Assistant => {
                     match message.and_then(|message| message.plan_path.as_deref()) {
@@ -5188,7 +5191,7 @@ impl MessagesPanel {
     /// a reflow about what a closed block looks like.
     fn folded_message(&self, msg: &DisplayMessage) -> BuiltMessage {
         match msg.role {
-            DisplayRole::Injected | DisplayRole::PeerMessage(_) => BuiltMessage::bare(
+            DisplayRole::Injected => BuiltMessage::bare(
                 injected_line(&msg.text),
                 format!("{INJECTED_SEARCH_PREFIX}{}", msg.text),
             ),
@@ -5909,10 +5912,9 @@ fn segment_kind(role: &DisplayRole) -> SegmentKind {
         DisplayRole::Thinking => SegmentKind::Thinking,
         DisplayRole::Error => SegmentKind::Error,
         DisplayRole::Done => SegmentKind::Done,
-        DisplayRole::Notice | DisplayRole::Injected | DisplayRole::PeerMessage(_) => {
-            SegmentKind::Assistant
-        }
+        DisplayRole::Notice | DisplayRole::Injected => SegmentKind::Assistant,
         DisplayRole::TaskDelivery(_) => SegmentKind::TaskDelivery,
+        DisplayRole::PeerMessage(_) => SegmentKind::PeerMessage,
         DisplayRole::Tool(_) => SegmentKind::ToolBlock,
     }
 }
@@ -5933,7 +5935,10 @@ fn segment_styles(
             Some(theme.user_message_style()),
             Some(Style::new().fg(accent)),
         ),
-        SegmentKind::ToolBlock | SegmentKind::Instruction | SegmentKind::TaskDelivery => {
+        SegmentKind::ToolBlock
+        | SegmentKind::Instruction
+        | SegmentKind::TaskDelivery
+        | SegmentKind::PeerMessage => {
             (Some(theme.panel_style()), Some(theme.subtle_border_style()))
         }
         SegmentKind::Error => (Some(theme.panel_style()), Some(theme.error)),
@@ -5966,14 +5971,23 @@ fn build_message_lines(
             ..BuiltMessage::bare(lines, msg.text.clone())
         };
     }
+    if let DisplayRole::PeerMessage(origin) = &msg.role {
+        let (lines, links, search_text) = peer_card::delivery(origin, &msg.text, width);
+        return BuiltMessage {
+            links,
+            ..BuiltMessage::bare(lines, search_text)
+        };
+    }
     let style = match &msg.role {
         DisplayRole::User => user_style(),
         DisplayRole::Assistant => assistant_style(),
         DisplayRole::Thinking => thinking_style(),
         DisplayRole::Error => error_style(),
         DisplayRole::Done => done_style(),
-        DisplayRole::Notice | DisplayRole::Injected | DisplayRole::PeerMessage(_) => notice_style(),
-        DisplayRole::Tool(_) | DisplayRole::TaskDelivery(_) => unreachable!(),
+        DisplayRole::Notice | DisplayRole::Injected => notice_style(),
+        DisplayRole::Tool(_) | DisplayRole::TaskDelivery(_) | DisplayRole::PeerMessage(_) => {
+            unreachable!()
+        }
     };
     let prefix = if msg.plan_path.is_some() {
         ""

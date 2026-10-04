@@ -28,6 +28,7 @@ use caudra_agent::{
     ShellFilterInfo, ShellOutput, SkillOutput, SnapshotLine, SnapshotSpan, SpanStyle,
     SubagentActivity, SubagentProgress, ToolAccounting, ToolInput, ToolOutput,
 };
+use caudra_providers::{PeerAudience, PeerMessageOrigin};
 use caudra_storage::background::ShellJobMetadata;
 use caudra_storage::id::CaudraId;
 use caudra_storage::tool_outputs::ToolOutputRef;
@@ -3101,6 +3102,47 @@ fn selection_across_messages_becomes_a_markdown_document() {
         extract_entire_document(&mut panel),
         "## User\n\nPlease use **care**.\n\n---\n\n## Assistant\n\n# Result\n\nUsed `care`."
     );
+}
+
+#[test]
+fn peer_message_copies_as_its_own_fenced_section() {
+    const ASSISTANT_HEADING: &str = "## Assistant";
+    const REQUEST: &str = "tell me a **joke**";
+    const SCRIPT: &str = "nightly-ci";
+    const REPLY: &str = "Here is one.";
+    const PEER_SECTION: &str = "## Peer message\n\n```";
+    const FENCE: &str = "```";
+    const SECTION_BREAK: &str = "\n\n---\n\n";
+
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::peer(
+        &format!("{ASSISTANT_HEADING}\n\n{REQUEST}"),
+        PeerMessageOrigin {
+            message_id: "kind-amber-fox".into(),
+            audience: PeerAudience::Topic {
+                topic: "test.failures".into(),
+            },
+            sender_name: SCRIPT.into(),
+            sender_handle: None,
+            reply_target: String::new(),
+            reply_to: None,
+            external: true,
+            assignment: None,
+        },
+    ));
+    panel.push(DisplayMessage::new(DisplayRole::Assistant, REPLY.into()));
+
+    let copied = extract_entire_document(&mut panel);
+    let sections: Vec<&str> = copied.split(SECTION_BREAK).collect();
+
+    assert_eq!(sections.len(), 2, "{copied}");
+    let peer = sections[0];
+    assert!(peer.starts_with(PEER_SECTION), "{copied}");
+    assert!(peer.ends_with(FENCE), "{copied}");
+    for expected in [SCRIPT, ASSISTANT_HEADING, REQUEST] {
+        assert!(peer.contains(expected), "{expected}: {copied}");
+    }
+    assert_eq!(sections[1], format!("{ASSISTANT_HEADING}\n\n{REPLY}"));
 }
 
 #[test]

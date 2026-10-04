@@ -8,6 +8,7 @@ pub(super) enum SegmentKind {
     ToolBlock,
     Instruction,
     TaskDelivery,
+    PeerMessage,
     Error,
     Done,
 }
@@ -25,6 +26,7 @@ impl SegmentKind {
             Self::ToolInline | Self::ToolBlock => "transcript_tool",
             Self::Instruction => "transcript_instruction",
             Self::TaskDelivery => "transcript_task_delivery",
+            Self::PeerMessage => "transcript_peer_message",
             Self::Error => "transcript_error",
             Self::Done => "transcript_done",
         }
@@ -56,6 +58,7 @@ impl SegmentChrome {
                 | SegmentKind::ToolBlock
                 | SegmentKind::Instruction
                 | SegmentKind::TaskDelivery
+                | SegmentKind::PeerMessage
                 | SegmentKind::Error
         );
         // A tool row's kind crosses between `ToolInline` and `ToolBlock` every
@@ -161,6 +164,7 @@ mod tests {
     /// other kind on the chrome it already painted.
     #[test_case(SegmentKind::User, 1, true ; "user_is_still_a_card")]
     #[test_case(SegmentKind::Instruction, 1, true ; "instruction_is_still_a_card")]
+    #[test_case(SegmentKind::PeerMessage, 1, true ; "peer_message_is_still_a_card")]
     #[test_case(SegmentKind::Error, 1, true ; "error_is_still_a_card")]
     #[test_case(SegmentKind::Assistant, 0, false ; "assistant_is_still_flat")]
     #[test_case(SegmentKind::Thinking, 0, false ; "thinking_is_still_flat")]

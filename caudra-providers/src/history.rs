@@ -1149,6 +1149,7 @@ mod tests {
         assert!(projected.is_observation());
         assert!(projected.first_user_text().is_none());
         assert_peer_framing(projected.first_text_content().unwrap(), text, &origin);
+        assert_eq!(projected.display_text.as_deref(), Some(text));
         assert_eq!(
             expand_message(projected, None)[0].kind,
             items.last().unwrap().kind

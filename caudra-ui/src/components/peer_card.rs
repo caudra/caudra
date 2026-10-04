@@ -6,7 +6,7 @@ use caudra_agent::{
     },
 };
 use caudra_config::InboundPolicy;
-use caudra_providers::PEER_SCRIPT_SENDER;
+use caudra_providers::{PEER_SCRIPT_SENDER, PeerMessageOrigin};
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use ratatui::{
@@ -17,7 +17,9 @@ use ratatui::{
 use crate::components::code_view::{
     UNCONSTRAINED_WIDTH, WrappedRows, body_window, truncation_line,
 };
+use crate::components::task_card::literal_body;
 use crate::components::tool_display::clamp_to_row;
+use crate::markdown::LinkMap;
 use crate::theme;
 
 const EMPTY: &str = "No reachable peers. Both sessions must enable cross-session messaging.";
@@ -51,6 +53,9 @@ const QUEUED_MEANING: &str = "queued work waits for a group member; queued is no
 const NO_WORK: &str = "This session holds no work assignment";
 const TOPIC_LABEL: &str = "Topic: ";
 const RESULT_LABEL: &str = "Result: ";
+const FROM_LABEL: &str = "From ";
+const REPLY_TARGET_LABEL: &str = "Reply target: ";
+const WORK_LABEL: &str = "Work: ";
 
 pub(crate) fn render(output: &PeerOutput, budget: usize, width: u16) -> (Vec<Line<'static>>, bool) {
     let theme = theme::current();
@@ -216,6 +221,84 @@ pub(crate) fn render(output: &PeerOutput, budget: usize, width: u16) -> (Vec<Lin
         lines.push(notice);
     }
     (lines, hidden > 0)
+}
+
+/// A delivered peer message as its transcript card: who sent it to which
+/// audience, the work it assigns, then the sender's text drawn literally.
+/// Also returns the text a transcript search matches.
+pub(crate) fn delivery(
+    origin: &PeerMessageOrigin,
+    body: &str,
+    width: u16,
+) -> (Vec<Line<'static>>, LinkMap, String) {
+    let theme = theme::current();
+    let name = origin.sender_handle.as_deref().map(handle_address);
+    let mut heading = vec![
+        Span::styled(FROM_LABEL, theme.tool_dim),
+        Span::styled(literal(&origin.sender_name, false), theme.tool_prefix),
+    ];
+    if origin.external {
+        heading.push(Span::styled(
+            format!(" ({PEER_SCRIPT_SENDER})"),
+            theme.tool_dim,
+        ));
+    } else {
+        let address = name.as_deref().unwrap_or(&origin.reply_target);
+        heading.push(Span::styled(
+            format!(" {}", literal(address, false)),
+            theme.tool_path,
+        ));
+    }
+    heading.push(Span::styled(
+        format!(
+            "{SEPARATOR}{}",
+            literal(&origin.audience.to_string(), false)
+        ),
+        theme.tool_dim,
+    ));
+    let mut details = format!("{MESSAGE_LABEL}{}", literal(&origin.message_id, false));
+    if !origin.external
+        && name
+            .as_deref()
+            .is_some_and(|name| name != origin.reply_target)
+    {
+        details.push_str(&format!(
+            "{SEPARATOR}{REPLY_TARGET_LABEL}{}",
+            literal(&origin.reply_target, false)
+        ));
+    }
+    let mut lines = vec![
+        Line::from(heading),
+        Line::from(Span::styled(details, theme.tool_dim)),
+    ];
+    if let Some(work) = &origin.assignment {
+        lines.push(Line::from(vec![
+            Span::styled(WORK_LABEL, theme.tool_dim),
+            Span::styled(literal(&work.work, false), theme.tool_path),
+            Span::styled(
+                format!(
+                    "{SEPARATOR}group {}{SEPARATOR}attempt {} of {}",
+                    literal(&work.group, false),
+                    work.attempt,
+                    work.max_attempts
+                ),
+                theme.tool_dim,
+            ),
+        ]));
+    }
+    let body = literal(body, true);
+    let mut search_text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+    search_text.push_str(&body);
+    let mut lines = WrappedRows::new(lines, 0, width).lines();
+    let mut links = LinkMap::none_for(&lines);
+    if !body.trim().is_empty() {
+        lines.push(Line::default());
+        links.rows.push(Vec::new());
+        let (body, body_links) = literal_body(&body, width);
+        lines.extend(body);
+        links.rows.extend(body_links.rows);
+    }
+    (lines, links, search_text)
 }
 
 fn topic_line(activity: &TopicActivity) -> Line<'static> {
@@ -429,19 +512,20 @@ mod tests {
         BatchToolEntry, BatchToolStatus, PeerOutput, ToolOutput,
         peers::{
             AssignedWork, PeerHistoryPage, PeerSummary, PublishReceipt, QueuedWork,
-            RecipientReceipt, SendReceipt, StoredPeerMessage, TopicActivity,
+            RecipientReceipt, SendReceipt, StoredPeerMessage, TopicActivity, handle_address,
         },
         tools::{ToolEffect, native::peers::SEND_NAME},
     };
     use caudra_config::{InboundPolicy, ToolOutputLines};
-    use caudra_providers::{PEER_SCRIPT_SENDER, PeerAudience};
+    use caudra_providers::{PEER_SCRIPT_SENDER, PeerAssignment, PeerAudience, PeerMessageOrigin};
     use ratatui::text::Line;
     use test_case::test_case;
 
     use super::{
         AUDIENCE_LABEL, BROADCAST, BROADCASTS, EMPTY, GROUPS_LABEL, NAME_LABEL, NO_MESSAGES,
-        NO_RECIPIENTS, NO_TOPICS, NO_WORK, OLDER, QUEUED_LABEL, QUEUED_MEANING, RESULT_LABEL,
-        SKIPPED_LABEL, TARGET_LABEL, TO_LABEL, TOPICS_LABEL, WITHHELD_LABEL, render,
+        NO_RECIPIENTS, NO_TOPICS, NO_WORK, OLDER, QUEUED_LABEL, QUEUED_MEANING, REPLY_TARGET_LABEL,
+        RESULT_LABEL, SKIPPED_LABEL, TARGET_LABEL, TO_LABEL, TOPICS_LABEL, WITHHELD_LABEL,
+        delivery, render,
     };
     use crate::components::code_view::{BatchViews, RenderLimits, RowTarget, render_tool_content};
     use crate::theme;
@@ -1122,5 +1206,137 @@ mod tests {
         );
         assert_eq!(content.rows.len(), content.lines.len());
         assert!(content.highlights.is_empty());
+    }
+
+    fn delivered() -> PeerMessageOrigin {
+        PeerMessageOrigin {
+            message_id: MESSAGE.into(),
+            audience: PeerAudience::Direct,
+            sender_name: NAME.into(),
+            sender_handle: None,
+            reply_target: TARGET.into(),
+            reply_to: None,
+            external: false,
+            assignment: None,
+        }
+    }
+
+    fn delivered_text(origin: &PeerMessageOrigin, body: &str) -> String {
+        text(&delivery(origin, body, WIDTH).0)
+    }
+
+    #[test_case(Some(HANDLE), true, false, false; "named_sender")]
+    #[test_case(Some(HANDLE), false, false, true; "named_sender_stored_with_a_word_target")]
+    #[test_case(None, false, false, false; "unnamed_sender")]
+    #[test_case(None, false, true, false; "script_sender")]
+    fn delivered_messages_name_their_sender_once(
+        handle: Option<&str>,
+        replies_by_name: bool,
+        external: bool,
+        reply_line: bool,
+    ) {
+        let reply_target = match handle {
+            Some(handle) if replies_by_name => handle_address(handle),
+            _ if external => String::new(),
+            _ => TARGET.to_owned(),
+        };
+        let origin = PeerMessageOrigin {
+            sender_handle: handle.map(str::to_owned),
+            reply_target,
+            external,
+            ..delivered()
+        };
+        let drawn = delivered_text(&origin, BODY_LINES[0]);
+        let heading = drawn.lines().next().unwrap();
+        assert!(heading.contains(NAME), "{drawn}");
+        assert_eq!(
+            heading.contains(&format!("({PEER_SCRIPT_SENDER})")),
+            external,
+            "{drawn}"
+        );
+        assert_eq!(drawn.contains(REPLY_TARGET_LABEL), reply_line, "{drawn}");
+        assert!(drawn.contains(MESSAGE), "{drawn}");
+        match handle {
+            Some(handle) => assert_eq!(drawn.matches(&handle_address(handle)).count(), 1),
+            None => assert_eq!(drawn.contains(TARGET), !external, "{drawn}"),
+        }
+    }
+
+    #[test_case(PeerAudience::Direct, "direct"; "direct")]
+    #[test_case(PeerAudience::Topic { topic: TOPIC.into() }, "topic ci.failures"; "topic")]
+    #[test_case(PeerAudience::Broadcast, BROADCAST; "broadcast")]
+    fn delivered_messages_name_their_audience(audience: PeerAudience, shown: &str) {
+        let origin = PeerMessageOrigin {
+            audience,
+            ..delivered()
+        };
+        let drawn = delivered_text(&origin, BODY_LINES[0]);
+        assert!(drawn.lines().next().unwrap().ends_with(shown), "{drawn}");
+    }
+
+    #[test_case(false; "session_publisher")]
+    #[test_case(true; "script_publisher")]
+    fn delivered_work_assignments_name_their_work_group_and_attempt(external: bool) {
+        let origin = PeerMessageOrigin {
+            external,
+            assignment: Some(PeerAssignment {
+                group: GROUP.into(),
+                work: WORK.into(),
+                attempt: ATTEMPT,
+                max_attempts: MAX_ATTEMPTS,
+            }),
+            ..delivered()
+        };
+        let drawn = delivered_text(&origin, BODY_LINES[0]);
+        assert!(
+            drawn.contains(&format!(
+                "Work: {WORK} · group {GROUP} · attempt {ATTEMPT} of {MAX_ATTEMPTS}"
+            )),
+            "{drawn}"
+        );
+    }
+
+    #[test]
+    fn delivered_bodies_keep_their_lines_below_the_attribution() {
+        let (lines, links, search) = delivery(&delivered(), &BODY_LINES.join("\n"), WIDTH);
+        let drawn: Vec<String> = lines.iter().map(ToString::to_string).collect();
+        let blank = drawn.iter().position(|line| line.is_empty()).unwrap();
+        let body: Vec<&str> = drawn[blank + 1..].iter().map(|line| line.trim()).collect();
+        assert_eq!(body, BODY_LINES);
+        assert_eq!(links.rows.len(), lines.len());
+        assert!(search.contains(NAME), "{search}");
+        assert!(search.ends_with(&BODY_LINES.join("\n")), "{search}");
+    }
+
+    #[test]
+    fn delivered_hostile_values_remain_literal_without_terminal_controls() {
+        let origin = PeerMessageOrigin {
+            message_id: HOSTILE.into(),
+            audience: PeerAudience::Topic {
+                topic: HOSTILE.into(),
+            },
+            sender_name: HOSTILE.into(),
+            sender_handle: Some(HOSTILE.into()),
+            reply_target: HOSTILE.into(),
+            assignment: Some(PeerAssignment {
+                group: HOSTILE.into(),
+                work: HOSTILE.into(),
+                attempt: ATTEMPT,
+                max_attempts: MAX_ATTEMPTS,
+            }),
+            ..delivered()
+        };
+        let (lines, _, search) = delivery(&origin, HOSTILE, WIDTH);
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| !span.content.chars().any(char::is_control))
+        );
+        let drawn = text(&lines);
+        assert!(drawn.contains("**literal**"));
+        assert!(!drawn.contains('\u{202e}'));
+        assert!(!search.contains('\u{202e}'));
+        assert!(drawn.contains("\\u{1b}]8;;evil\\u{7}\\r\\n\\t\\u{85}"));
     }
 }

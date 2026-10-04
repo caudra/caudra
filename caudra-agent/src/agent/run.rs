@@ -3147,13 +3147,20 @@ impl AnnouncedMode {
 /// Every harness-authored user message goes through here, so the transcript
 /// can show what was injected rather than only that something was. Mention
 /// preambles are pushed silently: the user already sees the path they typed,
-/// and the file body would swamp the rows that carry new information.
+/// and the file body would swamp the rows that carry new information. A
+/// message with display text, such as a peer message, shows that instead of
+/// the framing the model reads.
 pub(super) fn push_injected(history: &mut History, event_tx: &EventSender, message: Message) {
     if !message.is_mention()
         && let Some(ContentBlock::Text { text }) = message.content.first()
     {
+        let shown = message
+            .display_text
+            .as_ref()
+            .filter(|shown| !shown.is_empty())
+            .unwrap_or(text);
         let _ = event_tx.send(AgentEvent::Injected {
-            text: text.clone(),
+            text: shown.clone(),
             task_event: message.task_event.clone(),
             peer_event: message.peer_event.clone(),
         });

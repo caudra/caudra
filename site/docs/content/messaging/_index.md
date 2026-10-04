@@ -51,6 +51,8 @@ A live session remembers up to 4,096 word-based targets and 3,072 message names.
 
 Accepted messages enter at a safe run boundary. They can also wake an eligible idle TUI session and start a billable model turn. They do not interrupt a running tool or bypass cancellation, permission review, or rate limits. The recipient still applies its own tool permissions.
 
+Caudra presents an accepted message to the agent as a request from its sender. The agent is asked to answer it, or to do the work it asks for within its own mode and permissions, unless that conflicts with your instructions. It replies to a session with `send_message`. A script cannot receive replies, so the agent answers a script's message in its own response. Topic and broadcast messages get a reply only when the sender asks for one, and the agent is told to skip replies that only acknowledge or thank. The transcript shows each received message as a card with its sender, audience, and message name above the literal text. See [inbound policy and trust](/docs/permissions/#cross-session-messages) for what a message cannot do.
+
 Opening or closing the manager does not resume cancelled work. While the manager is open, in any view, an idle session starts no peer-triggered turn. It starts one after the manager closes. Work already running keeps its existing safe-boundary delivery behavior.
 
 ## Messaging names

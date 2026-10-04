@@ -85,7 +85,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use caudra_agent::AgentInput;
-use caudra_agent::peers::{PeerDecision, PeerReviewToken, handle_address};
+use caudra_agent::peers::{PeerDecision, PeerReviewToken};
 use caudra_agent::tools::native::plan::PlanTarget;
 use caudra_agent::tools::{SHELL_TOOL_NAME, ToolEffect};
 use caudra_agent::worktree::Request as WorktreeRequest;
@@ -1234,50 +1234,10 @@ pub struct DisplayMessage {
 }
 
 impl DisplayMessage {
-    pub(crate) fn peer(text: &str, origin: PeerMessageOrigin) -> Self {
-        let safe_body = text
-            .lines()
-            .map(|line| {
-                line.chars()
-                    .flat_map(char::escape_debug)
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let name = origin
-            .sender_handle
-            .as_deref()
-            .map(handle_address)
-            .filter(|address| *address != origin.reply_target)
-            .map(|address| format!("Name: {address:?}\n"))
-            .unwrap_or_default();
-        let audience = if origin.audience.is_direct() {
-            String::new()
-        } else {
-            format!("Audience: {:?}\n", origin.audience.to_string())
-        };
-        let work = origin
-            .assignment
-            .as_ref()
-            .map(|work| {
-                format!(
-                    "Work: {:?} · group {:?} · attempt {} of {}\n",
-                    work.work, work.group, work.attempt, work.max_attempts
-                )
-            })
-            .unwrap_or_default();
-        let text = if origin.external {
-            format!(
-                "Script: {:?}\n{audience}{work}Message: {:?}\n\n{safe_body}",
-                origin.sender_name, origin.message_id,
-            )
-        } else {
-            format!(
-                "Peer: {:?}\n{name}Reply target: {:?}\n{audience}{work}Message: {:?}\n\n{safe_body}",
-                origin.sender_name, origin.reply_target, origin.message_id,
-            )
-        };
-        Self::new(DisplayRole::PeerMessage(Box::new(origin)), text)
+    /// `body` is the sender's own text; the card draws it literally under the
+    /// attribution its origin carries.
+    pub(crate) fn peer(body: &str, origin: PeerMessageOrigin) -> Self {
+        Self::new(DisplayRole::PeerMessage(Box::new(origin)), body.to_owned())
     }
 
     pub(crate) fn injected(text: String, task_event: Option<TaskEventOrigin>) -> Self {

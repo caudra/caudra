@@ -509,13 +509,13 @@ mod peer_tests {
                 .enumerate()
                 .filter_map(|(index, event)| match event {
                     AgentEvent::Injected {
-                        text,
+                        text: shown,
                         peer_event: Some(saved),
                         task_event,
                     } => {
                         assert_eq!(saved, &origin);
                         assert!(task_event.is_none());
-                        assert_eq!(Some(text.as_str()), peers[0].first_text_content());
+                        assert_eq!(shown, text);
                         Some(index)
                     }
                     _ => None,
