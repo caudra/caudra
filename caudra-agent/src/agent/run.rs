@@ -1070,7 +1070,7 @@ impl<'h> Agent<'h> {
             descriptor.permission_mode = self.permissions.mode();
             descriptor.busy = true;
             if human_input {
-                peers.reset_budget();
+                peers.resume_wakes();
                 descriptor.blocked = false;
             }
             if let Err(error) = peers.update(descriptor) {

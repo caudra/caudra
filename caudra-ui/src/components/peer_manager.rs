@@ -567,10 +567,6 @@ impl PeerManager {
             review.resolved = true;
             review.notice = Some(match result {
                 Ok(PeerDecisionResult::Queued) => QUEUED.to_owned(),
-                Ok(PeerDecisionResult::Held { reason }) => format!(
-                    "Approved once, but still held: {}. Not queued or delivered.",
-                    literal(&reason, false)
-                ),
                 Ok(PeerDecisionResult::Rejected) => REJECTED.to_owned(),
                 Err(error) => format!(
                     "Decision failed: {}. Review again before retrying.",
@@ -1886,7 +1882,7 @@ fn policy_description(policy: &InboundPolicy) -> &'static str {
             "Automatic eligibility requires the same canonical workspace, matching Build/Plan mode, and Ask permissions; it does not establish equivalent authority."
         }
         InboundPolicy::Accept => {
-            "Allows wider inbound delivery, subject to existing delivery budgets and safety boundaries; messages may start billable turns."
+            "Delivers from any local session, subject to rate limits and safety boundaries; every accepted message may start a billable turn."
         }
         InboundPolicy::Hold => "Holds arrivals for explicit local approval.",
         InboundPolicy::Refuse => "Rejects new arrivals; existing held messages are not deleted.",
@@ -2037,7 +2033,7 @@ mod tests {
     const TITLE: &str = "Same readable title";
     const WORKSPACE: &str = "/workspace/one";
     const HOLD_REASON: &str = "Local approval required";
-    const BUDGET_REASON: &str = "Delivery budget exhausted";
+    const BLOCKED_REASON: &str = "Receiver is blocked; local input must resume it";
     const FAILURE: &str = "Discovery is unavailable";
     const BODY: &str =
         "# Literal **not bold**\n[not a link](peer-target)\n/messages approve other\n";
@@ -2353,7 +2349,7 @@ mod tests {
         manager.scroll(-20);
         let top = manager.held_reader.document.top();
         let mut current = held(FIRST_MESSAGE);
-        current.reason = BUDGET_REASON.to_owned();
+        current.reason = BLOCKED_REASON.to_owned();
         assert!(manager.update_inbox(snapshot(vec![current.clone(), held(SECOND_MESSAGE)])));
         assert!(!manager.update_inbox(snapshot(vec![current, held(SECOND_MESSAGE)])));
         draw(&mut manager, WIDE, HEIGHT);
@@ -2423,24 +2419,6 @@ mod tests {
             manager.handle_key(press(KeyCode::Char('y'))),
             PeerManagerAction::Consumed
         ));
-    }
-
-    #[test]
-    fn budget_held_approval_is_not_reported_as_queued() {
-        let mut manager = reviewing();
-        manager.decision_pending = true;
-        manager.finish_decision(Ok(PeerDecisionResult::Held {
-            reason: BUDGET_REASON.to_owned(),
-        }));
-        let notice = manager
-            .review
-            .as_ref()
-            .expect(SELECTED_REVIEW)
-            .notice
-            .as_deref()
-            .expect(SELECTED_REVIEW);
-        assert!(notice.contains(BUDGET_REASON));
-        assert!(notice.contains("Not queued or delivered"));
     }
 
     #[test]

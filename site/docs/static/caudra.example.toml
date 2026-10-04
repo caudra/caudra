@@ -357,6 +357,16 @@ version = 1
 # Type: string.
 # inbound = "auto"
 
+# Most peer messages a session admits per minute from all senders together.
+# Project settings may only lower it.
+# Type: usize, at least 1.
+# inbound_per_minute = 64
+
+# Most peer messages a session admits per minute from one sending session.
+# Project settings may only lower it.
+# Type: usize, at least 1.
+# sender_per_minute = 16
+
 [agent.steering]
 # Automatic steering repairs unusable model output and can add bounded guidance
 # about repeated behavior. Each rule has its own table below.

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use caudra_config::{Feature, FeatureFlags, InboundPolicy};
+use caudra_config::{Feature, FeatureFlags, InboundPolicy, MessagingConfig};
 use caudra_providers::{HistoryItem, HistoryItemKind, Message, PeerMessageOrigin, UserOrigin};
 use caudra_storage::id::CaudraId;
 use caudra_storage::random_task_id;
@@ -39,11 +39,8 @@ const MAX_MESSAGE_NAMES: usize = MAX_DEDUP * 3;
 const MAX_NAME_ATTEMPTS: usize = 32;
 const MESSAGE_WORDS: usize = 3;
 const PEER_WORDS: usize = MESSAGE_WORDS * 2;
-const PEER_BUDGET: usize = 16;
 const CLAIM_BATCH: usize = 4;
 const RATE_WINDOW: Duration = Duration::from_secs(60);
-const RECIPIENT_RATE: usize = 64;
-const SENDER_RATE: usize = 16;
 const RETRY_WINDOW: Duration = Duration::from_secs(300);
 const CLOCK_SKEW: Duration = Duration::from_secs(30);
 const CLOSED: &str = "The peer session is closed";
@@ -51,7 +48,8 @@ const REFUSED_POLICY: &str = "Inbound messaging is refused by receiver policy";
 const HELD_POLICY: &str = "Receiver policy requires local approval";
 const HELD_COHORT: &str = "Automatic delivery requires Ask permissions, matching Plan/Build mode, and the same canonical workspace";
 const HELD_BLOCKED: &str = "Receiver is blocked; local input must resume it";
-const HELD_BUDGET: &str = "Peer delivery budget exhausted; genuine local input must reset it";
+const RATE_EXCEEDED: &str = "Recipient peer message rate limit reached";
+const DUPLICATE: &str = "The same text from this sender arrived within the last minute";
 const FULL: &str = "Live inbox capacity reached; no older message was removed";
 const RETRY_FULL: &str = "Live retry identity capacity reached; start a new registration";
 const POLICY_FLOOR: &str = "Cannot weaken the project's configured inbound policy";
@@ -61,7 +59,6 @@ const UNKNOWN_TARGET: &str =
     "Unknown peer address; use a target from peer discovery or an incoming peer message";
 const UNKNOWN_REPLY: &str = "Unknown peer message name for this target";
 const AMBIGUOUS_REPLY: &str = "Peer reply identity is ambiguous without its original sender";
-const SEND_BUDGET: &str = "Peer send budget exhausted; genuine local input must reset it";
 const NAME_FULL: &str = "Live peer name capacity reached; start a new registration";
 const NAME_COLLISION: &str = "Unable to allocate a unique peer name within the attempt limit";
 const STALE_REVIEW: &str = "Held message review is stale; inspect the current held messages again";
@@ -177,7 +174,6 @@ pub enum PeerDecision {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerDecisionResult {
     Queued,
-    Held { reason: String },
     Rejected,
 }
 
@@ -213,16 +209,22 @@ struct SessionState {
     wakes_suppressed: bool,
     epoch: u64,
     next_claim: u64,
-    delivered: usize,
-    sends: usize,
+    inbound_rate: usize,
+    sender_rate: usize,
     bytes: usize,
     inbox: VecDeque<InboxItem>,
     dedup: HashMap<String, DedupEntry>,
     outgoing: HashMap<String, Outgoing>,
     peer_names: HashMap<String, String>,
     message_names: HashMap<String, MessageIdentity>,
-    arrivals: VecDeque<(Instant, String)>,
+    arrivals: VecDeque<Arrival>,
     reviews: HashMap<String, u64>,
+}
+
+struct Arrival {
+    at: Instant,
+    sender: String,
+    text: [u8; 32],
 }
 
 struct InboxItem {
@@ -535,17 +537,20 @@ impl PeerHost {
     }
 
     pub fn register(&self, descriptor: PeerDescriptor) -> Result<PeerSession, String> {
-        self.register_with_controls(descriptor, None, None)
+        self.register_with_controls(descriptor, &MessagingConfig::default(), None)
     }
 
     pub fn register_with_controls(
         &self,
         mut descriptor: PeerDescriptor,
-        floor: Option<InboundPolicy>,
+        messaging: &MessagingConfig,
         controls: Option<StoredPeerControls>,
     ) -> Result<PeerSession, String> {
         validate_descriptor(&descriptor)?;
-        let floor = floor.unwrap_or(InboundPolicy::Accept);
+        let floor = messaging
+            .project_inbound
+            .clone()
+            .unwrap_or(InboundPolicy::Accept);
         let controls = controls.unwrap_or_default();
         let inbound_override = controls
             .inbound
@@ -590,8 +595,8 @@ impl PeerHost {
                 wakes_suppressed: false,
                 epoch: 0,
                 next_claim: 0,
-                delivered: controls.delivered.min(PEER_BUDGET),
-                sends: controls.sends.min(PEER_BUDGET),
+                inbound_rate: messaging.inbound_per_minute,
+                sender_rate: messaging.sender_per_minute,
                 bytes: 0,
                 inbox: VecDeque::new(),
                 dedup: HashMap::new(),
@@ -631,8 +636,6 @@ impl PeerSession {
         let state = lock(&self.0.state);
         StoredPeerControls {
             inbound: state.inbound_override.as_ref().map(stored_policy),
-            delivered: state.delivered,
-            sends: state.sends,
         }
     }
 
@@ -854,9 +857,6 @@ impl PeerSession {
                     state.epoch,
                 )
             } else {
-                if state.sends >= PEER_BUDGET {
-                    return Err(SEND_BUDGET.into());
-                }
                 if state.outgoing.len() >= MAX_DEDUP {
                     return Err(RETRY_FULL.into());
                 }
@@ -884,7 +884,6 @@ impl PeerSession {
                     reply_to: reply_to.map(str::to_owned),
                     reply_sender: reply_sender.map(str::to_owned),
                 };
-                state.sends += 1;
                 let epoch = state.epoch;
                 state.outgoing.insert(
                     request_id.to_owned(),
@@ -1041,12 +1040,7 @@ impl PeerSession {
             PeerDecision::Approve => {
                 state.inbox[index].approved_epoch = Some(state.epoch);
                 state.reevaluate();
-                match &state.inbox[index].state {
-                    ItemState::Held(reason) => PeerDecisionResult::Held {
-                        reason: reason.clone(),
-                    },
-                    _ => PeerDecisionResult::Queued,
-                }
+                PeerDecisionResult::Queued
             }
             PeerDecision::Reject => {
                 let item = state.inbox.remove(index).ok_or(NOT_HELD)?;
@@ -1064,15 +1058,12 @@ impl PeerSession {
         Ok(result)
     }
 
-    pub fn reset_budget(&self) {
+    /// Genuine local input is the only way to clear a cancellation latch.
+    pub fn resume_wakes(&self) {
         let mut state = lock(&self.0.state);
-        if state.open {
-            state.delivered = 0;
-            state.sends = 0;
-            if state.wakes_suppressed {
-                state.epoch += 1;
-            }
+        if state.open && state.wakes_suppressed {
             state.wakes_suppressed = false;
+            state.epoch += 1;
             state.reevaluate();
             self.0.host.changed.notify(usize::MAX);
         }
@@ -1097,19 +1088,11 @@ impl PeerSession {
             return None;
         }
         state.reevaluate();
-        let reserved = state
-            .inbox
-            .iter()
-            .filter(|item| matches!(item.state, ItemState::Claimed(_)))
-            .count();
-        let limit = PEER_BUDGET
-            .saturating_sub(state.delivered.saturating_add(reserved))
-            .min(CLAIM_BATCH);
         state.next_claim += 1;
         let claim_id = state.next_claim;
         let mut messages = Vec::new();
         for item in &mut state.inbox {
-            if messages.len() == limit {
+            if messages.len() == CLAIM_BATCH {
                 break;
             }
             if matches!(item.state, ItemState::Pending) {
@@ -1242,9 +1225,6 @@ impl SessionState {
         if let Some(blocker) = self.approval_blocker() {
             return Some(blocker);
         }
-        if self.delivered >= PEER_BUDGET {
-            return Some(HELD_BUDGET);
-        }
         if approved_epoch == Some(self.epoch) {
             return None;
         }
@@ -1363,6 +1343,7 @@ impl SessionInner {
         }
         let encoded = serde_json::to_vec(&delivery).map_err(|error| error.to_string())?;
         let fingerprint = Sha256::digest(&encoded).into();
+        let text: [u8; 32] = Sha256::digest(delivery.text.as_bytes()).into();
         let dedup_key = delivery.dedup_key();
         let mut state = lock(&self.state);
         if !state.open {
@@ -1416,7 +1397,7 @@ impl SessionInner {
         while state
             .arrivals
             .front()
-            .is_some_and(|(time, _)| now.saturating_duration_since(*time) >= RATE_WINDOW)
+            .is_some_and(|arrival| now.saturating_duration_since(arrival.at) >= RATE_WINDOW)
         {
             state.arrivals.pop_front();
         }
@@ -1424,19 +1405,21 @@ impl SessionInner {
             || delivery.sender.mode == WireMode::ReadOnly
         {
             SendReceipt::new("refused", &delivery.message_id, Some(REFUSED_POLICY))
-        } else if state.arrivals.len() >= RECIPIENT_RATE
+        } else if state
+            .arrivals
+            .iter()
+            .any(|arrival| arrival.sender == sender && arrival.text == text)
+        {
+            SendReceipt::new("refused", &delivery.message_id, Some(DUPLICATE))
+        } else if state.arrivals.len() >= state.inbound_rate
             || state
                 .arrivals
                 .iter()
-                .filter(|(_, peer)| peer == &sender)
+                .filter(|arrival| arrival.sender == sender)
                 .count()
-                >= SENDER_RATE
+                >= state.sender_rate
         {
-            SendReceipt::new(
-                "rate_limited",
-                &delivery.message_id,
-                Some("Recipient peer message rate limit reached"),
-            )
+            SendReceipt::new("rate_limited", &delivery.message_id, Some(RATE_EXCEEDED))
         } else if state.inbox.len() >= MAX_PENDING.min(MAX_HELD)
             || state.bytes + bytes > MAX_SESSION_BYTES
             || self
@@ -1460,7 +1443,11 @@ impl SessionInner {
             let item_state =
                 reason.map_or(ItemState::Pending, |reason| ItemState::Held(reason.into()));
             state.bytes += bytes;
-            state.arrivals.push_back((now, sender));
+            state.arrivals.push_back(Arrival {
+                at: now,
+                sender,
+                text,
+            });
             state.inbox.push_back(InboxItem {
                 delivery: delivery.clone(),
                 origin,
@@ -1504,11 +1491,9 @@ impl PeerClaim {
     fn finish(mut self, stage: bool) {
         let mut state = lock(&self.session.0.state);
         let mut bytes = 0;
-        let mut count = 0;
         let retain = stage && state.open;
         state.inbox.retain_mut(|item| {
             if matches!(item.state, ItemState::Claimed(id) if id == self.claim_id) {
-                count += 1;
                 if retain {
                     item.state = ItemState::Staged;
                     true
@@ -1521,7 +1506,6 @@ impl PeerClaim {
             }
         });
         state.bytes -= bytes;
-        state.delivered = state.delivered.saturating_add(count).min(PEER_BUDGET);
         self.session.0.host.bytes.fetch_sub(bytes, Ordering::AcqRel);
         state.reevaluate();
         self.committed = true;
@@ -1642,7 +1626,10 @@ mod tests {
     use std::thread;
     use std::time::Instant;
 
-    use caudra_config::{FeatureFlags, InboundPolicy};
+    use caudra_config::{
+        DEFAULT_INBOUND_PER_MINUTE, DEFAULT_SENDER_PER_MINUTE, FeatureFlags, InboundPolicy,
+        MessagingConfig,
+    };
     use caudra_providers::{Message, PeerMessageOrigin, expand_message};
     use caudra_storage::id::CaudraId;
     use caudra_storage::sessions::{PermissionMode, StoredInboundPolicy, StoredPeerControls};
@@ -1651,18 +1638,20 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        AMBIGUOUS_REPLY, CLAIM_BATCH, CLOSED, Delivery, FULL, HELD_BLOCKED, HELD_BUDGET,
-        HELD_COHORT, HELD_POLICY, MAX_BODY_BYTES, MAX_DEDUP, MAX_HELD, MAX_MESSAGE_NAMES,
-        MAX_NAME_ATTEMPTS, MAX_PEER_NAMES, MAX_PROCESS_BYTES, MAX_SESSION_BYTES, MESSAGE_WORDS,
-        MessageIdentity, NAME_COLLISION, NAME_FULL, NOT_HELD, Outgoing, PEER_BUDGET, PEER_WORDS,
-        POLICY_FLOOR, PeerDecision, PeerDecisionResult, PeerDescriptor, PeerHost, PeerSession,
-        PeerSummary, RATE_WINDOW, REFUSED_POLICY, REJECTED, RETRY_FULL, RETRY_WINDOW, Route,
-        SEND_BUDGET, STALE_REVIEW, STALE_TARGET, SendReceipt, Sender, UNKNOWN_REPLY,
-        UNKNOWN_TARGET, WireMode, allocate_name, lock, message_name, token, valid_name, wall_ms,
+        AMBIGUOUS_REPLY, CLAIM_BATCH, CLOSED, DUPLICATE, Delivery, FULL, HELD_BLOCKED, HELD_COHORT,
+        HELD_POLICY, MAX_BODY_BYTES, MAX_DEDUP, MAX_HELD, MAX_MESSAGE_NAMES, MAX_NAME_ATTEMPTS,
+        MAX_PEER_NAMES, MAX_PROCESS_BYTES, MAX_SESSION_BYTES, MESSAGE_WORDS, MessageIdentity,
+        NAME_COLLISION, NAME_FULL, NOT_HELD, Outgoing, PEER_WORDS, POLICY_FLOOR, PeerDecision,
+        PeerDecisionResult, PeerDescriptor, PeerHost, PeerSession, PeerSummary, RATE_EXCEEDED,
+        RATE_WINDOW, REFUSED_POLICY, REJECTED, RETRY_FULL, RETRY_WINDOW, Route, STALE_REVIEW,
+        STALE_TARGET, SendReceipt, Sender, UNKNOWN_REPLY, UNKNOWN_TARGET, WireMode, allocate_name,
+        lock, message_name, token, valid_name, wall_ms,
     };
     use crate::AgentMode;
 
     const TEXT: &str = "/compact !not-a-command @not-an-attachment";
+    const OTHER_TEXT: &str = "A separate request with its own text";
+    const REPLY_TEXT: &str = "A reply to the original request";
     const QUEUED: &str = "queued";
     const HELD: &str = "held";
     const REFUSED: &str = "refused";
@@ -1678,6 +1667,10 @@ mod tests {
     const ORIGINAL_REQUEST_ID: &str = "original-request";
     const BUILD_MODE: &str = "build";
     const PLAN_MODE: &str = "plan";
+    const LOW_RATE: usize = 2;
+    /// Delivers more than the removed sixteen-message budget while staying
+    /// under the default recipient rate.
+    const UNBUDGETED_ROUNDS: usize = 8;
 
     pub(super) fn directory() -> TempDir {
         Builder::new()
@@ -1701,6 +1694,13 @@ mod tests {
             inbound,
             blocked: false,
             busy: false,
+        }
+    }
+
+    fn messaging(floor: Option<InboundPolicy>) -> MessagingConfig {
+        MessagingConfig {
+            project_inbound: floor,
+            ..MessagingConfig::default()
         }
     }
 
@@ -1828,7 +1828,6 @@ mod tests {
         let state = lock(&session.0.state);
         assert!(state.outgoing.is_empty());
         assert!(state.message_names.is_empty());
-        assert_eq!(state.sends, 0);
     }
 
     #[test_case(true; "peer_names")]
@@ -1889,6 +1888,7 @@ mod tests {
         let mut original = delivery.clone();
         original.message_id = delivery.reply_to.clone().unwrap();
         original.reply_to = None;
+        original.text = OTHER_TEXT.into();
         session
             .0
             .receive(original, Instant::now(), wall_ms())
@@ -2023,7 +2023,7 @@ mod tests {
     }
 
     #[test]
-    fn suppression_survives_frontend_updates_until_local_budget_reset() {
+    fn suppression_survives_frontend_updates_until_local_input() {
         let (_directory, _host, session) = fixture(InboundPolicy::Auto);
         session
             .0
@@ -2044,7 +2044,7 @@ mod tests {
             session.approve(&held[0].message_id).unwrap_err(),
             HELD_BLOCKED
         );
-        session.reset_budget();
+        session.resume_wakes();
         assert!(!session.wakes_suppressed());
         assert!(session.claim().is_some());
     }
@@ -2146,7 +2146,7 @@ mod tests {
         let session = host
             .register_with_controls(
                 descriptor(directory.path(), InboundPolicy::Auto),
-                Some(InboundPolicy::Auto),
+                &messaging(Some(InboundPolicy::Auto)),
                 None,
             )
             .unwrap();
@@ -2305,65 +2305,125 @@ mod tests {
     }
 
     #[test]
-    fn delivery_budget_reserves_claims_and_requires_human_reset() {
+    fn committed_deliveries_never_exhaust_automatic_delivery() {
         let (_directory, _host, session) = fixture(InboundPolicy::Auto);
-        for _ in 0..PEER_BUDGET + 1 {
-            session
-                .0
-                .receive(delivery(&session), Instant::now(), wall_ms())
-                .unwrap();
-        }
-        let mut claims = Vec::new();
-        for _ in 0..PEER_BUDGET / CLAIM_BATCH {
-            claims.push(session.claim().unwrap());
-        }
-        assert!(session.claim().is_none());
-        for claim in claims {
+        for _ in 0..UNBUDGETED_ROUNDS {
+            for _ in 0..CLAIM_BATCH {
+                let receipt = session
+                    .0
+                    .receive(delivery(&session), Instant::now(), wall_ms())
+                    .unwrap();
+                assert_eq!(receipt.status, QUEUED);
+            }
+            let claim = session.claim().unwrap();
+            assert_eq!(claim.messages().len(), CLAIM_BATCH);
             claim.commit();
+            assert!(session.held().is_empty());
         }
-        assert_eq!(session.held()[0].reason, HELD_BUDGET);
-        session.approve(&session.held()[0].message_id).unwrap();
-        assert!(session.claim().is_none());
-        session.reset_budget();
-        assert!(session.claim().is_some());
+        assert!(!session.has_pending());
     }
 
-    #[test]
-    fn recipient_rate_and_expired_retries_are_bounded() {
-        let (_directory, _host, session) = fixture(InboundPolicy::Auto);
+    fn rated(inbound_per_minute: usize, sender_per_minute: usize) -> (TempDir, PeerSession) {
+        let directory = directory();
+        let session = host(directory.path())
+            .register_with_controls(
+                descriptor(directory.path(), InboundPolicy::Auto),
+                &MessagingConfig {
+                    inbound_per_minute,
+                    sender_per_minute,
+                    ..MessagingConfig::default()
+                },
+                None,
+            )
+            .unwrap();
+        (directory, session)
+    }
+
+    #[test_case(LOW_RATE, DEFAULT_SENDER_PER_MINUTE, false; "recipient_rate")]
+    #[test_case(DEFAULT_INBOUND_PER_MINUTE, LOW_RATE, true; "sender_rate")]
+    fn configured_rates_bound_admission_until_the_window_passes(
+        inbound_per_minute: usize,
+        sender_per_minute: usize,
+        one_sender: bool,
+    ) {
+        let (_directory, session) = rated(inbound_per_minute, sender_per_minute);
         let initial = delivery(&session);
         let now = Instant::now();
-        for _ in 0..super::SENDER_RATE {
-            let mut next = initial.clone();
+        let next = |index: usize| {
+            let mut next = if one_sender {
+                initial.clone()
+            } else {
+                delivery(&session)
+            };
             next.message_id = token().unwrap();
+            next.text = format!("{TEXT} {index}");
+            next
+        };
+        for index in 0..LOW_RATE {
             assert_eq!(
-                session.0.receive(next, now, wall_ms()).unwrap().status,
+                session
+                    .0
+                    .receive(next(index), now, wall_ms())
+                    .unwrap()
+                    .status,
                 QUEUED
             );
         }
+        let limited = session.0.receive(next(LOW_RATE), now, wall_ms()).unwrap();
+        assert_eq!(limited.status, RATE_LIMITED);
+        assert_eq!(limited.reason.as_deref(), Some(RATE_EXCEEDED));
+        if one_sender {
+            let other = session.0.receive(delivery(&session), now, wall_ms());
+            assert_eq!(other.unwrap().status, QUEUED);
+        }
         assert_eq!(
             session
                 .0
-                .receive(initial.clone(), now, wall_ms())
-                .unwrap()
-                .status,
-            RATE_LIMITED
-        );
-        let mut later = initial.clone();
-        later.message_id = token().unwrap();
-        assert_eq!(
-            session
-                .0
-                .receive(later, now + RATE_WINDOW, wall_ms())
+                .receive(next(LOW_RATE + 1), now + RATE_WINDOW, wall_ms())
                 .unwrap()
                 .status,
             QUEUED
         );
+    }
+
+    #[test]
+    fn expired_retries_are_refused() {
+        let (_directory, _host, session) = fixture(InboundPolicy::Auto);
+        let initial = delivery(&session);
         let expired_ms = initial.issued_ms + RETRY_WINDOW.as_millis() as u64 + 1;
         assert_eq!(
-            session.0.receive(initial, now, expired_ms).unwrap().status,
+            session
+                .0
+                .receive(initial, Instant::now(), expired_ms)
+                .unwrap()
+                .status,
             REFUSED
         );
+    }
+
+    #[test]
+    fn repeated_text_from_one_sender_is_refused_within_the_window() {
+        let (_directory, _host, session) = fixture(InboundPolicy::Auto);
+        let first = delivery(&session);
+        let now = Instant::now();
+        let receipt = session.0.receive(first.clone(), now, wall_ms()).unwrap();
+        assert_eq!(receipt.status, QUEUED);
+        assert_eq!(
+            session.0.receive(first.clone(), now, wall_ms()).unwrap(),
+            receipt
+        );
+        let mut repeated = first.clone();
+        repeated.message_id = token().unwrap();
+        let duplicate = session.0.receive(repeated.clone(), now, wall_ms()).unwrap();
+        assert_eq!(duplicate.status, REFUSED);
+        assert_eq!(duplicate.reason.as_deref(), Some(DUPLICATE));
+        let mut other_sender = delivery(&session);
+        other_sender.text = first.text.clone();
+        let other = session.0.receive(other_sender, now, wall_ms()).unwrap();
+        assert_eq!(other.status, QUEUED);
+        repeated.message_id = token().unwrap();
+        let later = session.0.receive(repeated, now + RATE_WINDOW, wall_ms());
+        assert_eq!(later.unwrap().status, QUEUED);
     }
 
     #[test]
@@ -2447,7 +2507,6 @@ mod tests {
                     .unwrap_err(),
                 UNKNOWN_REPLY
             );
-            assert_eq!(sender.controls().sends, 0);
             let receipt = sender
                 .send_named(target, TEXT, None, REQUEST_ID)
                 .await
@@ -2567,7 +2626,6 @@ mod tests {
             let outgoing = state.outgoing.get(REQUEST_ID).unwrap();
             assert_eq!(outgoing.issued_ms, issued_ms);
             assert_eq!(state.message_names.len(), names);
-            assert_eq!(state.sends, 1);
         });
     }
 
@@ -2654,6 +2712,7 @@ mod tests {
         let mut followup = incoming;
         followup.message_id = OTHER_MESSAGE_NAME.into();
         followup.reply_to = Some(MESSAGE_NAME.into());
+        followup.text = OTHER_TEXT.into();
         followup.reply_sender = original_sender.map(|sender| {
             if sender {
                 followup.sender.route.target()
@@ -2729,7 +2788,7 @@ mod tests {
             let followup = second
                 .send_named(
                     &incoming_second.reply_target,
-                    TEXT,
+                    OTHER_TEXT,
                     Some(MESSAGE_NAME),
                     REQUEST_ID,
                 )
@@ -2772,7 +2831,7 @@ mod tests {
                 second
                     .send_named(
                         &incoming_second.reply_target,
-                        TEXT,
+                        OTHER_TEXT,
                         Some(MESSAGE_NAME),
                         REQUEST_ID
                     )
@@ -2785,7 +2844,7 @@ mod tests {
                 second
                     .send_named(
                         &incoming_second.reply_target,
-                        TEXT,
+                        OTHER_TEXT,
                         Some(&incoming_second.message_id),
                         REQUEST_ID
                     )
@@ -2796,7 +2855,7 @@ mod tests {
                 second
                     .send_named(
                         &incoming_second.reply_target,
-                        TEXT,
+                        REPLY_TEXT,
                         Some(&incoming_second.message_id),
                         REPLY_REQUEST_ID
                     )
@@ -2850,9 +2909,8 @@ mod tests {
         });
     }
 
-    #[test_case(false; "send_budget")]
-    #[test_case(true; "retry_capacity")]
-    fn admission_rejections_never_consume_message_names(retry_capacity: bool) {
+    #[test]
+    fn retry_capacity_rejections_never_consume_message_names() {
         smol::block_on(async {
             let (_directory, host, sender) = fixture(InboundPolicy::Auto);
             let receiver = host
@@ -2862,44 +2920,24 @@ mod tests {
             let original = delivery(&sender);
             {
                 let mut state = lock(&sender.0.state);
-                if retry_capacity {
-                    state.outgoing = (0..MAX_DEDUP)
-                        .map(|index| {
-                            (
-                                index.to_string(),
-                                Outgoing {
-                                    fingerprint: [0; 32],
-                                    target: receiver.0.route.target(),
-                                    message_id: MESSAGE_NAME.into(),
-                                    issued_ms: original.issued_ms,
-                                    epoch: state.epoch,
-                                    sender: original.sender.clone(),
-                                    receipt: None,
-                                },
-                            )
-                        })
-                        .collect();
-                } else {
-                    state.sends = PEER_BUDGET;
-                }
+                state.outgoing = (0..MAX_DEDUP)
+                    .map(|index| {
+                        (
+                            index.to_string(),
+                            Outgoing {
+                                fingerprint: [0; 32],
+                                target: receiver.0.route.target(),
+                                message_id: MESSAGE_NAME.into(),
+                                issued_ms: original.issued_ms,
+                                epoch: state.epoch,
+                                sender: original.sender.clone(),
+                                receipt: None,
+                            },
+                        )
+                    })
+                    .collect();
             }
-            let error = if retry_capacity {
-                RETRY_FULL
-            } else {
-                SEND_BUDGET
-            };
             for _ in 0..=MAX_MESSAGE_NAMES {
-                assert_eq!(
-                    sender
-                        .send_named(&target, TEXT, None, REQUEST_ID)
-                        .await
-                        .unwrap_err(),
-                    error
-                );
-            }
-            assert!(lock(&sender.0.state).message_names.is_empty());
-            sender.reset_budget();
-            if retry_capacity {
                 assert_eq!(
                     sender
                         .send_named(&target, TEXT, None, REQUEST_ID)
@@ -2907,55 +2945,37 @@ mod tests {
                         .unwrap_err(),
                     RETRY_FULL
                 );
-            } else {
-                let receipt = sender
-                    .send_named(&target, TEXT, None, REQUEST_ID)
-                    .await
-                    .unwrap();
-                assert_eq!(receipt.status, QUEUED);
-                assert_eq!(
-                    sender
-                        .send_named(&target, TEXT, None, REQUEST_ID)
-                        .await
-                        .unwrap(),
-                    receipt
-                );
-                assert_eq!(lock(&sender.0.state).message_names.len(), 1);
             }
+            assert!(lock(&sender.0.state).message_names.is_empty());
         });
     }
 
     #[test]
-    fn outbound_budget_does_not_reset_on_delivery_or_retry() {
+    fn outbound_volume_is_bounded_per_recipient_not_per_session() {
         smol::block_on(async {
             let (_directory, host, sender) = fixture(InboundPolicy::Auto);
-            let receiver = host
-                .register(descriptor(&sender.descriptor().cwd, InboundPolicy::Auto))
+            let cwd = sender.descriptor().cwd;
+            let first = host
+                .register(descriptor(&cwd, InboundPolicy::Auto))
                 .unwrap();
-            let target = receiver.0.route.target();
-            for index in 0..PEER_BUDGET {
-                assert_eq!(
-                    sender
-                        .send(&target, TEXT, None, &index.to_string())
-                        .await
-                        .unwrap()
-                        .status,
-                    QUEUED
-                );
+            let second = host
+                .register(descriptor(&cwd, InboundPolicy::Auto))
+                .unwrap();
+            let send = async |target: &PeerSession, index: usize| {
+                let text = format!("{TEXT} {index}");
+                let request = format!("{}-{index}", target.session_id());
+                let route = target.0.route.target();
+                sender.send(&route, &text, None, &request).await.unwrap()
+            };
+            for index in 0..DEFAULT_SENDER_PER_MINUTE {
+                assert_eq!(send(&first, index).await.status, QUEUED);
             }
-            assert_eq!(
-                sender.send(&target, TEXT, None, "0").await.unwrap().status,
-                QUEUED
-            );
-            assert_eq!(
-                sender
-                    .send(&target, TEXT, None, "over-budget")
-                    .await
-                    .unwrap_err(),
-                SEND_BUDGET
-            );
-            sender.reset_budget();
-            assert_eq!(lock(&sender.0.state).sends, 0);
+            let limited = send(&first, DEFAULT_SENDER_PER_MINUTE).await;
+            assert_eq!(limited.status, RATE_LIMITED);
+            assert_eq!(limited.reason.as_deref(), Some(RATE_EXCEEDED));
+            for index in 0..DEFAULT_SENDER_PER_MINUTE {
+                assert_eq!(send(&second, index).await.status, QUEUED);
+            }
         });
     }
 
@@ -3011,7 +3031,7 @@ mod tests {
         let session = host
             .register_with_controls(
                 descriptor(directory.path(), InboundPolicy::Auto),
-                floor,
+                &messaging(floor),
                 None,
             )
             .unwrap();
@@ -3044,7 +3064,7 @@ mod tests {
     #[test_case(None, StoredInboundPolicy::Accept, InboundPolicy::Accept; "restored_accept_overrides_global_hold")]
     #[test_case(Some(InboundPolicy::Auto), StoredInboundPolicy::Accept, InboundPolicy::Auto; "restored_accept_clamped_to_project_auto")]
     #[test_case(Some(InboundPolicy::Refuse), StoredInboundPolicy::Hold, InboundPolicy::Refuse; "restored_hold_clamped_to_project_refuse")]
-    fn restored_controls_preserve_override_and_clamp_counters(
+    fn restored_controls_preserve_the_clamped_override(
         floor: Option<InboundPolicy>,
         restored: StoredInboundPolicy,
         expected: InboundPolicy,
@@ -3054,11 +3074,9 @@ mod tests {
         let session = host
             .register_with_controls(
                 descriptor(directory.path(), InboundPolicy::Hold),
-                floor,
+                &messaging(floor),
                 Some(StoredPeerControls {
                     inbound: Some(restored),
-                    delivered: usize::MAX,
-                    sends: usize::MAX,
                 }),
             )
             .unwrap();
@@ -3067,44 +3085,8 @@ mod tests {
             session.controls(),
             StoredPeerControls {
                 inbound: Some(super::stored_policy(&expected)),
-                delivered: PEER_BUDGET,
-                sends: PEER_BUDGET
             }
         );
-        assert!(session.claim().is_none());
-        assert_eq!(
-            smol::block_on(session.send(&session.0.route.target(), TEXT, None, "restored-budget"))
-                .unwrap_err(),
-            SEND_BUDGET
-        );
-        session.reset_budget();
-        assert_eq!(session.controls().delivered, 0);
-        assert_eq!(session.controls().sends, 0);
-    }
-
-    #[test]
-    fn exhausted_restored_deliveries_hold_new_messages() {
-        let directory = directory();
-        let host = host(directory.path());
-        let session = host
-            .register_with_controls(
-                descriptor(directory.path(), InboundPolicy::Auto),
-                None,
-                Some(StoredPeerControls {
-                    inbound: None,
-                    delivered: usize::MAX,
-                    sends: 0,
-                }),
-            )
-            .unwrap();
-        let receipt = session
-            .0
-            .receive(delivery(&session), Instant::now(), wall_ms())
-            .unwrap();
-        assert_eq!(receipt.reason.as_deref(), Some(HELD_BUDGET));
-        assert!(session.claim().is_none());
-        session.reset_budget();
-        assert!(session.claim().is_some());
     }
 
     #[test]
@@ -3188,6 +3170,7 @@ mod tests {
             second.sender.route.generation = token().unwrap();
         } else {
             second.message_id = OTHER_MESSAGE_NAME.into();
+            second.text = OTHER_TEXT.into();
         }
         session.0.receive(first, Instant::now(), wall_ms()).unwrap();
         let receipt = session
@@ -3395,7 +3378,7 @@ mod tests {
             .unwrap();
         session.suppress_wakes();
         let review = session.review_held(&delivery.message_id).unwrap();
-        session.reset_budget();
+        session.resume_wakes();
         assert_eq!(
             session.decide_held(&review.token, decision).unwrap_err(),
             STALE_REVIEW
@@ -3408,19 +3391,15 @@ mod tests {
 
     #[test_case(InboundPolicy::Hold; "hold_floor")]
     #[test_case(InboundPolicy::Auto; "auto_floor")]
-    fn budget_held_approval_reports_actual_disposition_and_preserves_controls(
-        floor: InboundPolicy,
-    ) {
+    fn approval_under_a_restored_hold_queues_exactly_the_reviewed_message(floor: InboundPolicy) {
         let directory = directory();
         let host = host(directory.path());
         let session = host
             .register_with_controls(
                 descriptor(directory.path(), InboundPolicy::Auto),
-                Some(floor.clone()),
+                &messaging(Some(floor.clone())),
                 Some(StoredPeerControls {
                     inbound: Some(StoredInboundPolicy::Hold),
-                    delivered: PEER_BUDGET,
-                    sends: PEER_BUDGET,
                 }),
             )
             .unwrap();
@@ -3442,20 +3421,15 @@ mod tests {
         let review = session
             .review_held(&snapshot.messages[0].message_id)
             .unwrap();
-        assert_eq!(review.summary.reason, HELD_BUDGET);
+        assert_eq!(review.summary.reason, HELD_POLICY);
         assert_eq!(review.summary.approval_blocker, None);
         assert_eq!(
             session
                 .decide_held(&review.token, PeerDecision::Approve)
                 .unwrap(),
-            PeerDecisionResult::Held {
-                reason: HELD_BUDGET.into()
-            }
+            PeerDecisionResult::Queued
         );
         assert_eq!(session.controls(), controls);
-        assert_eq!(session.inbox_snapshot().unwrap(), snapshot);
-        assert!(session.claim().is_none());
-        session.reset_budget();
         assert_eq!(session.inbox_snapshot().unwrap().messages.len(), 1);
         let claim = session.claim().unwrap();
         assert_eq!(claim.messages().len(), 1);
@@ -3532,11 +3506,9 @@ mod tests {
         let claim = session.claim().unwrap();
         let saved = expand_message(&claim.messages()[0], None);
         let bytes = host.0.bytes.load(Ordering::Acquire);
-        assert_eq!(session.controls().delivered, 0);
         session.checkpoint(&saved);
         assert_eq!(host.0.bytes.load(Ordering::Acquire), bytes);
         claim.stage();
-        assert_eq!(session.controls().delivered, 1);
         assert_eq!(host.0.bytes.load(Ordering::Acquire), bytes);
         assert!(session.claim().is_none());
         assert_eq!(session.held_count(), 0);
@@ -3549,7 +3521,6 @@ mod tests {
         assert_eq!(host.0.bytes.load(Ordering::Acquire), 0);
         session.checkpoint(&saved);
         assert_eq!(host.0.bytes.load(Ordering::Acquire), 0);
-        assert_eq!(session.controls().delivered, 1);
         assert_eq!(
             session
                 .0

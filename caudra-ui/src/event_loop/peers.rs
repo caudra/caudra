@@ -155,16 +155,10 @@ fn peer_blocked(app: &App) -> bool {
         || matches!(app.status, Status::Error { .. })
 }
 
-fn decision_notice(result: &PeerDecisionResult) -> String {
+fn decision_notice(result: &PeerDecisionResult) -> &'static str {
     match result {
-        PeerDecisionResult::Queued => QUEUED.into(),
-        PeerDecisionResult::Held { reason } => {
-            format!(
-                "Approval recorded; message remains held: {}",
-                reason.escape_debug()
-            )
-        }
-        PeerDecisionResult::Rejected => REJECTED.into(),
+        PeerDecisionResult::Queued => QUEUED,
+        PeerDecisionResult::Rejected => REJECTED,
     }
 }
 
@@ -214,7 +208,7 @@ impl SessionRuntime {
         };
         match host.register_with_controls(
             self.peer_descriptor(ctx.config.messaging.inbound.clone()),
-            ctx.config.messaging.project_inbound.clone(),
+            &ctx.config.messaging,
             self.app.state.session.meta.peer_controls.clone(),
         ) {
             Ok(session) => {
@@ -449,7 +443,7 @@ impl EventLoop<'_> {
                 let _ = peer.sync_manager(&mut runtime.app);
             } else {
                 runtime.app.flash(match result {
-                    Ok(result) => decision_notice(&result),
+                    Ok(result) => decision_notice(&result).into(),
                     Err(error) => error,
                 });
             }
@@ -530,23 +524,19 @@ impl EventLoop<'_> {
 mod tests {
     use std::future::pending;
 
-    use caudra_agent::peers::PeerDecisionResult;
     use caudra_config::{Feature, FeatureFlags, sandbox::SandboxName};
     use flume::Sender;
     use test_case::test_case;
 
     use super::{
-        DISCOVERY_STOPPED, DiscoveryResult, PeerDiscovery, QUEUED, REJECTED, decision_notice,
-        peer_blocked, peer_eligible, poll_discovery,
+        DISCOVERY_STOPPED, DiscoveryResult, PeerDiscovery, peer_blocked, peer_eligible,
+        poll_discovery,
     };
     use crate::app::{App, tests::test_app};
     use crate::components::{ExitRequest, Status};
 
     const ERROR: &str = "The model request failed";
     const GENERATION: u64 = 7;
-    const HELD_REASON: &str = "Automatic delivery budget exhausted";
-    const HELD_NOTICE: &str =
-        "Approval recorded; message remains held: Automatic delivery budget exhausted";
 
     fn discovery() -> (Sender<DiscoveryResult>, Option<PeerDiscovery>) {
         let (sender, receiver) = flume::bounded(1);
@@ -579,7 +569,7 @@ mod tests {
         assert_eq!(peer_eligible(&app), expected);
     }
 
-    #[test_case(|app| app.automatic_wakes_suppressed = true; "cancelled_or_exhausted")]
+    #[test_case(|app| app.automatic_wakes_suppressed = true; "cancelled")]
     #[test_case(|app| app.cancelling_run = Some(1); "cancellation_in_flight")]
     #[test_case(|app| app.exit_request = ExitRequest::Reload; "reload")]
     #[test_case(|app| app.status = Status::error(ERROR.into()); "request_failure")]
@@ -616,15 +606,5 @@ mod tests {
             assert!(discovery.is_some());
         }
         drop(sender);
-    }
-
-    #[test_case(PeerDecisionResult::Queued, QUEUED; "queued_not_delivered")]
-    #[test_case(PeerDecisionResult::Rejected, REJECTED; "rejected")]
-    #[test_case(PeerDecisionResult::Held { reason: HELD_REASON.into() }, HELD_NOTICE; "approved_but_budget_held")]
-    fn decision_feedback_reports_the_actual_disposition(
-        result: PeerDecisionResult,
-        expected: &str,
-    ) {
-        assert_eq!(decision_notice(&result), expected);
     }
 }

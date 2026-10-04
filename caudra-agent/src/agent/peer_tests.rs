@@ -452,7 +452,7 @@ mod peer_tests {
                     ..
                 }
             )));
-            assert_eq!(fixture.receiver.controls().delivered, 0);
+            assert!(fixture.receiver.has_pending() || fixture.receiver.held_count() == 1);
         });
     }
 
@@ -565,7 +565,7 @@ mod peer_tests {
                 }
             )));
             assert!(fixture.receiver.wakes_suppressed());
-            fixture.receiver.reset_budget();
+            fixture.receiver.resume_wakes();
             let claim = fixture.receiver.claim().expect(PEER_PENDING);
             assert_eq!(claim.messages().len(), 1);
             assert_eq!(claim.messages()[0].peer_event, Some(origin));
@@ -667,7 +667,7 @@ mod peer_tests {
                         .collect::<Vec<_>>(),
                     [&origin.message_id]
                 );
-                fixture.receiver.reset_budget();
+                fixture.receiver.resume_wakes();
                 let claim = fixture.receiver.claim().expect(PEER_PENDING);
                 assert_eq!(claim.messages()[0].peer_event, Some(origin));
             } else {

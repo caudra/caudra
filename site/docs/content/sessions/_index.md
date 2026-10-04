@@ -53,7 +53,7 @@ Sessions shows a discovery snapshot of eligible live peers. Select a row to insp
 
 Press `/` to filter the current list, then Enter to leave filter editing. Enter on a held message opens its review. Read the literal message body, then use `y` to approve once or `n` to review rejection. Rejecting removes the message from the live inbox. Browsing, filtering, and refreshing grant no approval. Tab switches list/detail focus. Esc backs out before closing. Narrow terminals show one pane at a time.
 
-The Held messages view contains messages waiting for this session's review or delivery limits. Recorded messages and send receipts remain in the transcript. Use the agent to send messages.
+The Held messages view contains messages waiting for this session's review or for the session to resume. Recorded messages and send receipts remain in the transcript. Use the agent to send messages.
 
 | Command | Action |
 |---|---|
@@ -71,16 +71,16 @@ You can also ask the agent to find a session and send it a message. It uses `lis
 
 Use the exact target from discovery or an incoming reply address. Targets belong to your current live registration and are never reassigned to a replacement peer. Discover again after restarting or replacing your session. Message names also use generated words, including the names shown by `/messages` for approval or rejection.
 
-Accepted messages enter at a safe run boundary. They can also wake an eligible idle TUI session and start a billable model turn. They do not interrupt a running tool or bypass cancellation, permission review, or delivery limits. The recipient still applies its own tool permissions.
+Accepted messages enter at a safe run boundary. They can also wake an eligible idle TUI session and start a billable model turn. They do not interrupt a running tool or bypass cancellation, permission review, or rate limits. The recipient still applies its own tool permissions.
 
-Approval can leave a message held when its delivery budget is exhausted. Opening or closing the manager does not reset that budget or resume cancelled work. An idle session waits until the modal closes before starting a peer-triggered turn. Work already running keeps its existing safe-boundary delivery behavior.
+Opening or closing the manager does not resume cancelled work. An idle session waits until the modal closes before starting a peer-triggered turn. Work already running keeps its existing safe-boundary delivery behavior.
 
 ### Delivery receipts and lifetime
 
 | Status | Meaning |
 |---|---|
 | `queued` | Accepted into the live inbox, not yet delivered to the model |
-| `held` | Accepted into the live inbox, waiting for approval or an automatic-delivery limit to clear |
+| `held` | Accepted into the live inbox, waiting for approval or for the receiving session to resume |
 | `refused`, `unavailable`, `rate_limited` | Not admitted |
 | `unknown` | Delivery may have been accepted before the connection failed |
 
@@ -90,7 +90,21 @@ Queued and held messages live only in bounded memory. Closing or replacing the r
 
 Each body is limited to 32 KiB of UTF-8. The inbox admits at most 50 messages across pending, held, and claimed states, with a 1 MiB session ceiling and an 8 MiB process ceiling. A full inbox rejects new messages rather than evicting older ones.
 
-Each session can automatically deliver 16 messages and send 16 messages between local user interactions. This shared budget covers all peers and both busy delivery and idle wakes. Exhaustion holds further incoming messages and rejects further sends. Local user input resets the budget. Peer replies, elapsed time, and reloading the session do not.
+### Rate limits and cost
+
+Rate limits are the only volume control. A receiving session admits at most 64 messages per minute in total and 16 per minute from any one sender. Both windows are rolling. A message over either limit gets `rate_limited` and never enters the inbox. Set the limits in the global `caudra.toml`:
+
+```toml
+[agent.messaging]
+inbound_per_minute = 64
+sender_per_minute = 16
+```
+
+A project file can lower these limits but cannot raise them.
+
+The same text from the same sender within one minute gets `refused` as a duplicate. A retry of one message under its original identity is not a duplicate and returns the first receipt.
+
+Two sessions that deliver to each other automatically can keep a conversation going without you. Each accepted message can start a billable model turn. The limits slow such a pair to `sender_per_minute` turns per minute each, and the exchange continues until one side stops. Press Esc in either session to stop it. Cancelling a run stops automatic wakes for that session until your next local input, and messages that arrive meanwhile are held.
 
 ## Background tasks
 

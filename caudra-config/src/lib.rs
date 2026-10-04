@@ -125,6 +125,9 @@ const DEFAULT_STORE_BUDGET: NonZeroU64 =
 
 pub const MIN_OUTPUT_BYTES: usize = 1024;
 pub const MIN_OUTPUT_LINES: usize = 10;
+pub const DEFAULT_INBOUND_PER_MINUTE: usize = 64;
+pub const DEFAULT_SENDER_PER_MINUTE: usize = 16;
+pub const MIN_MESSAGE_RATE: usize = 1;
 pub const MIN_PER_TOOL_OUTPUT_BYTES: usize = 256;
 pub const MIN_PER_TOOL_OUTPUT_LINES: usize = 4;
 pub const MIN_COMPACTION_BUFFER: u32 = 1_000;
@@ -677,6 +680,14 @@ impl RawConfig {
             .project_inbound
             .take()
             .max(messaging.inbound.clone());
+        messaging.project_inbound_per_minute = lowest(
+            messaging.project_inbound_per_minute,
+            messaging.inbound_per_minute.take(),
+        );
+        messaging.project_sender_per_minute = lowest(
+            messaging.project_sender_per_minute,
+            messaging.sender_per_minute.take(),
+        );
         if let Some(inbound) = messaging.inbound.take() {
             self.agent.messaging.inbound = Some(
                 self.agent
@@ -1281,23 +1292,7 @@ impl AgentFileConfig {
         if let Some(steering) = overlay.steering {
             self.steering.get_or_insert_default().merge(steering);
         }
-        if overlay.messaging.inbound.is_some() {
-            self.messaging.inbound = overlay.messaging.inbound;
-        }
-        self.messaging.project_inbound = self
-            .messaging
-            .project_inbound
-            .take()
-            .max(overlay.messaging.project_inbound);
-        if let Some(floor) = &self.messaging.project_inbound {
-            self.messaging.inbound = Some(
-                self.messaging
-                    .inbound
-                    .take()
-                    .unwrap_or_default()
-                    .max(floor.clone()),
-            );
-        }
+        self.messaging.merge(overlay.messaging);
         merge_option!(
             self,
             overlay,
@@ -1336,8 +1331,66 @@ impl AgentFileConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct MessagingFileConfig {
     pub inbound: Option<InboundPolicy>,
+    pub inbound_per_minute: Option<usize>,
+    pub sender_per_minute: Option<usize>,
     #[serde(skip)]
     pub project_inbound: Option<InboundPolicy>,
+    #[serde(skip)]
+    pub project_inbound_per_minute: Option<usize>,
+    #[serde(skip)]
+    pub project_sender_per_minute: Option<usize>,
+}
+
+impl MessagingFileConfig {
+    fn merge(&mut self, overlay: Self) {
+        merge_option!(
+            self,
+            overlay,
+            inbound,
+            inbound_per_minute,
+            sender_per_minute
+        );
+        self.project_inbound_per_minute = lowest(
+            self.project_inbound_per_minute,
+            overlay.project_inbound_per_minute,
+        );
+        self.project_sender_per_minute = lowest(
+            self.project_sender_per_minute,
+            overlay.project_sender_per_minute,
+        );
+        self.project_inbound = self.project_inbound.take().max(overlay.project_inbound);
+        if let Some(floor) = &self.project_inbound {
+            self.inbound = Some(self.inbound.take().unwrap_or_default().max(floor.clone()));
+        }
+    }
+
+    fn resolve(self) -> MessagingConfig {
+        let rate = |value: Option<usize>, ceiling: Option<usize>, default: usize| {
+            value.unwrap_or(default).min(ceiling.unwrap_or(usize::MAX))
+        };
+        MessagingConfig {
+            inbound: self.inbound.unwrap_or_default(),
+            inbound_per_minute: rate(
+                self.inbound_per_minute,
+                self.project_inbound_per_minute,
+                DEFAULT_INBOUND_PER_MINUTE,
+            ),
+            sender_per_minute: rate(
+                self.sender_per_minute,
+                self.project_sender_per_minute,
+                DEFAULT_SENDER_PER_MINUTE,
+            ),
+            project_inbound: self.project_inbound,
+        }
+    }
+}
+
+/// The lower of two optional limits, where `None` sets no limit.
+fn lowest(left: Option<usize>, right: Option<usize>) -> Option<usize> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (left, right) => left.or(right),
+    }
 }
 
 #[derive(Deserialize, Default, Debug)]
@@ -2274,6 +2327,20 @@ pub struct MessagingConfig {
     )]
     pub inbound: InboundPolicy,
 
+    #[config(
+        default = DEFAULT_INBOUND_PER_MINUTE,
+        min = MIN_MESSAGE_RATE,
+        desc = "Most peer messages a session admits per minute from all senders together. Project settings may only lower it"
+    )]
+    pub inbound_per_minute: usize,
+
+    #[config(
+        default = DEFAULT_SENDER_PER_MINUTE,
+        min = MIN_MESSAGE_RATE,
+        desc = "Most peer messages a session admits per minute from one sending session. Project settings may only lower it"
+    )]
+    pub sender_per_minute: usize,
+
     /// The strictest explicit project policy. No project policy leaves session
     /// controls free to choose `Accept`, even when the global default is `Auto`.
     #[config(skip, default = "None")]
@@ -2459,10 +2526,7 @@ impl AgentConfig {
         Self {
             no_rtk,
             steering: Arc::new(file.steering.unwrap_or_default()),
-            messaging: MessagingConfig {
-                inbound: file.messaging.inbound.unwrap_or_default(),
-                project_inbound: file.messaging.project_inbound,
-            },
+            messaging: file.messaging.resolve(),
             system_prompt_profile: file
                 .system_prompt_profile
                 .filter(|profile| profile != "builtin"),
@@ -3156,6 +3220,7 @@ impl Config {
         self.decisions.validate()?;
         self.ui.validate_all()?;
         self.agent.validate()?;
+        self.agent.messaging.validate()?;
         self.agent.steering.validate()?;
         self.provider.validate()?;
         self.storage.validate()?;
@@ -3751,6 +3816,11 @@ mod tests {
     const ZERO_FLASH_DURATION_MS: u64 = 0;
     const NO_DEFAULT_DELETION: &str = "retention must delete nothing until a user opts in";
     const BACKGROUND_REMINDER_FIELD: &str = "background_reminder_turns";
+    const INBOUND_RATE_FIELD: &str = "inbound_per_minute";
+    const SENDER_RATE_FIELD: &str = "sender_per_minute";
+    const LOW_RATE: usize = 4;
+    const MIDDLE_RATE: usize = 32;
+    const HIGH_RATE: usize = 128;
     const CUSTOM_BACKGROUND_REMINDER_TURNS: u32 = 13;
     const UNSIGNED_REMINDER_ERROR: &str = "expected u32";
     const TODO_REMINDER_FIELD: &str = "todo_reminder";
@@ -3906,6 +3976,63 @@ mod tests {
                     .is_none()
             );
         }
+    }
+
+    fn rate_layer(field: &str, value: Option<usize>) -> RawConfig {
+        value.map_or_else(RawConfig::default, |value| {
+            toml::from_str(&format!("[agent.messaging]\n{field} = {value}")).unwrap()
+        })
+    }
+
+    fn resolved_rate(field: &str, messaging: &MessagingConfig) -> usize {
+        match field {
+            INBOUND_RATE_FIELD => messaging.inbound_per_minute,
+            SENDER_RATE_FIELD => messaging.sender_per_minute,
+            _ => unreachable!(),
+        }
+    }
+
+    #[test_case(INBOUND_RATE_FIELD, None, None, None, DEFAULT_INBOUND_PER_MINUTE; "inbound_default")]
+    #[test_case(SENDER_RATE_FIELD, None, None, None, DEFAULT_SENDER_PER_MINUTE; "sender_default")]
+    #[test_case(INBOUND_RATE_FIELD, Some(MIDDLE_RATE), None, None, MIDDLE_RATE; "global_lowers")]
+    #[test_case(INBOUND_RATE_FIELD, Some(HIGH_RATE), None, None, HIGH_RATE; "global_raises")]
+    #[test_case(SENDER_RATE_FIELD, None, Some(LOW_RATE), None, LOW_RATE; "project_lowers_default")]
+    #[test_case(SENDER_RATE_FIELD, None, Some(HIGH_RATE), None, DEFAULT_SENDER_PER_MINUTE; "project_cannot_raise_default")]
+    #[test_case(INBOUND_RATE_FIELD, Some(LOW_RATE), Some(MIDDLE_RATE), None, LOW_RATE; "project_cannot_raise_global")]
+    #[test_case(INBOUND_RATE_FIELD, None, Some(LOW_RATE), Some(HIGH_RATE), LOW_RATE; "global_overlay_cannot_lift_project_ceiling")]
+    #[test_case(SENDER_RATE_FIELD, Some(LOW_RATE), None, Some(MIDDLE_RATE), MIDDLE_RATE; "global_overlay_replaces_global")]
+    fn message_rates_only_fall_in_project_layers(
+        field: &str,
+        global: Option<usize>,
+        project: Option<usize>,
+        overlay: Option<usize>,
+        expected: usize,
+    ) {
+        let mut raw = rate_layer(field, global);
+        raw.merge(rate_layer(field, project));
+        raw.merge_global(rate_layer(field, overlay));
+        let config = raw.into_config(false).unwrap();
+        config.validate().unwrap();
+        assert_eq!(resolved_rate(field, &config.agent.messaging), expected);
+    }
+
+    #[test_case(INBOUND_RATE_FIELD, false; "global_inbound")]
+    #[test_case(SENDER_RATE_FIELD, false; "global_sender")]
+    #[test_case(INBOUND_RATE_FIELD, true; "project_inbound")]
+    #[test_case(SENDER_RATE_FIELD, true; "project_sender")]
+    fn zero_message_rate_is_rejected(field: &str, project: bool) {
+        let below = Some(MIN_MESSAGE_RATE - 1);
+        let mut raw = RawConfig::default();
+        if project {
+            raw.merge(rate_layer(field, below));
+        } else {
+            raw = rate_layer(field, below);
+        }
+        let error = raw.into_config(false).unwrap().validate().unwrap_err();
+        assert!(
+            matches!(error, ConfigError::BelowMinimum { field: refused, .. } if refused == field),
+            "{error}"
+        );
     }
 
     #[test_case("sync", ExecutionMode::Sync)]

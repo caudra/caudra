@@ -257,9 +257,11 @@ The `bash`, `python_execution`, and `task` entries apply only when `ui.scroll_ca
 
 ### `agent.messaging`
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `inbound` | string | `auto` | Inbound cross-session messages: `auto` accepts only compatible trusted peers, `accept` allows wider delivery, `hold` requires approval, `refuse` rejects messages. Project settings may only tighten policy: accept < auto < hold < refuse. Needs `experimental.cross_session_messaging`; accepting messages can start billable turns |
+| Field | Type | Default | Min | Description |
+|-------|------|---------|-----|-------------|
+| `inbound` | string | `auto` | - | Inbound cross-session messages: `auto` accepts only compatible trusted peers, `accept` allows wider delivery, `hold` requires approval, `refuse` rejects messages. Project settings may only tighten policy: accept < auto < hold < refuse. Needs `experimental.cross_session_messaging`; accepting messages can start billable turns |
+| `inbound_per_minute` | usize | `64` | 1 | Most peer messages a session admits per minute from all senders together. Project settings may only lower it |
+| `sender_per_minute` | usize | `16` | 1 | Most peer messages a session admits per minute from one sending session. Project settings may only lower it |
 
 ### `agent.steering`
 

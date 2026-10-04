@@ -56,7 +56,7 @@ Receiving has a separate policy under `[agent.messaging]`:
 | `inbound` | Behavior |
 |---|---|
 | `auto` (default) | Automatic delivery only between Ask-mode sessions with matching Build or Plan mode and the same canonical local working directory. Other cases are held |
-| `accept` | Allows wider delivery, subject to runtime limits. Messages can start billable turns |
+| `accept` | Automatic delivery from any local session, subject to [rate limits](/docs/sessions/#rate-limits-and-cost). Messages can start billable turns |
 | `hold` | Requires local approval before delivery |
 | `refuse` | Rejects incoming messages |
 

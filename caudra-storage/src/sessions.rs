@@ -365,8 +365,6 @@ pub enum StoredInboundPolicy {
 #[serde(default)]
 pub struct StoredPeerControls {
     pub inbound: Option<StoredInboundPolicy>,
-    pub delivered: usize,
-    pub sends: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1643,8 +1641,6 @@ mod tests {
     const FORK_TITLE: &str = "Renamed by hand (fork #1)";
     const MODE_UNCHOSEN: &str = "a new session must not pretend it picked a mode";
     const QUEUED_PROMPT: &str = "queued prompt";
-    const PEER_DELIVERED: usize = 7;
-    const PEER_SENDS: usize = 11;
     const WAKE_SUPPRESSION_FIELD: &str = "automatic_wakes_suppressed";
 
     #[test_case("{}", false; "legacy_default")]
@@ -1684,18 +1680,13 @@ mod tests {
     #[test_case("{}", None; "empty_controls")]
     #[test_case(r#"{"inbound":null}"#, None; "no_override")]
     #[test_case(r#"{"inbound":"hold"}"#, Some(StoredInboundPolicy::Hold); "override_only")]
+    #[test_case(r#"{"inbound":"hold","delivered":7,"sends":11}"#, Some(StoredInboundPolicy::Hold); "legacy_budget_counters_ignored")]
     fn peer_controls_missing_fields_use_defaults(
         source: &str,
         inbound: Option<StoredInboundPolicy>,
     ) {
         let controls: StoredPeerControls = serde_json::from_str(source).unwrap();
-        assert_eq!(
-            controls,
-            StoredPeerControls {
-                inbound,
-                ..Default::default()
-            }
-        );
+        assert_eq!(controls, StoredPeerControls { inbound });
     }
 
     #[test_case(None, None; "no_override")]
@@ -1708,11 +1699,7 @@ mod tests {
         serialized_inbound: Option<&str>,
     ) {
         let (_temp, dir) = state_dir();
-        let controls = StoredPeerControls {
-            inbound,
-            delivered: PEER_DELIVERED,
-            sends: PEER_SENDS,
-        };
+        let controls = StoredPeerControls { inbound };
         let mut session = TestSession::new("model", "/project");
         session.meta.peer_controls = Some(controls.clone());
         let serialized = serde_json::to_value(&session.meta).unwrap();

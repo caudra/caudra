@@ -1520,7 +1520,7 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
                         blocked: false,
                         busy: true,
                     },
-                    params.config.messaging.project_inbound.clone(),
+                    &params.config.messaging,
                     None,
                 ) {
                     Ok(session) => Some(session),

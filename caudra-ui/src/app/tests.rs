@@ -148,8 +148,6 @@ const STALE_PLAN_PATH: &str = "/unreadable/stale-plan.md";
 const COMMITTED_PLAN_REF: &str = "plan-committed";
 const STALE_PLAN_REF: &str = "plan-stale";
 const COMMITTED_PLAN_CALL: &str = "committed-plan-write";
-const PEER_DELIVERED: usize = 11;
-const PEER_SENT: usize = 9;
 const PEER_CONTROL_PROMPT: &str = "Keep the peer controls across a reload.";
 const PEER_MANAGER_TITLE: &str = "Peers";
 const PEER_MANAGER_DRAFT: &str = "Preserve this unsent prompt.";
@@ -10536,8 +10534,6 @@ fn drain_writer(app: App, writer: Arc<StorageWriter>) {
 fn stored_peer_controls() -> StoredPeerControls {
     StoredPeerControls {
         inbound: Some(StoredInboundPolicy::Hold),
-        delivered: PEER_DELIVERED,
-        sends: PEER_SENT,
     }
 }
 
