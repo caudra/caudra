@@ -151,8 +151,34 @@ impl App {
         {
             return actions;
         }
-        if self.workbench.is_open() {
+        if self.stream_modal.is_open() && !self.permission_prompt.is_open() {
             self.clear_control_hovers();
+            match self.stream_modal.handle_mouse(&event) {
+                StreamAction::Ignored => {}
+                StreamAction::Consumed => return Vec::new(),
+                StreamAction::Copy(text) => {
+                    self.copy_to_clipboard(&text);
+                    return Vec::new();
+                }
+                StreamAction::Submit(question) => {
+                    self.continue_btw(question);
+                    return Vec::new();
+                }
+            }
+        }
+        if self.workbench.is_open()
+            && !self.stream_modal.is_open()
+            && !self.permission_prompt.is_open()
+        {
+            self.clear_control_hovers();
+            if self.question_form.is_open()
+                && let Some(action) = self.question_form.handle_mouse(event)
+            {
+                return self.handle_question_form_action(action);
+            }
+            if self.question_form.contains(at) {
+                return Vec::new();
+            }
             let action = self.workbench.handle_mouse(event);
             return self.handle_workbench_action(action);
         }
@@ -222,21 +248,6 @@ impl App {
             };
             self.goal_modal.close();
             return self.run_footer_command(cmdline);
-        }
-        if self.stream_modal.is_open() && !self.permission_prompt.is_open() {
-            self.clear_control_hovers();
-            match self.stream_modal.handle_mouse(&event) {
-                StreamAction::Ignored => {}
-                StreamAction::Consumed => return Vec::new(),
-                StreamAction::Copy(text) => {
-                    self.copy_to_clipboard(&text);
-                    return Vec::new();
-                }
-                StreamAction::Submit(question) => {
-                    self.continue_btw(question);
-                    return Vec::new();
-                }
-            }
         }
         let passive_modal_open =
             self.help_modal.is_open() || self.usage_modal.is_open() || self.float_mgr.is_open();
@@ -463,6 +474,8 @@ impl App {
         // drew: a drag that selected text releases as a selection rather than
         // pressing whatever it ended over.
         if self.question_form.is_open()
+            && !self.stream_modal.is_open()
+            && !self.permission_prompt.is_open()
             && !(event.kind == MouseEventKind::Up(MouseButton::Left) && self.dragging_selection())
             && let Some(action) = self.question_form.handle_mouse(event)
         {
@@ -875,7 +888,16 @@ impl App {
         // The wheel is aggregated into `Msg::Scroll` before `handle_mouse` ever
         // runs, so the workbench has to be offered it here as well or its panes
         // never see a wheel at all. Its rows count downwards.
+        if self.stream_modal.is_open() || self.permission_prompt.is_open() {
+            self.scroll_at(column, row, delta);
+            self.clear_selection_unless_pending_copy();
+            return;
+        }
         if self.workbench.is_open() {
+            if self.question_form.contains(Position::new(column, row)) {
+                self.question_form.scroll(delta);
+                return;
+            }
             self.workbench.scroll(column, row, -delta as isize);
             return;
         }
@@ -1289,7 +1311,10 @@ impl App {
             return Some(Vec::new());
         }
 
-        dismiss!(self.stream_modal);
+        dismiss!(self.stream_modal, {
+            self.stream_modal.dismiss();
+            Vec::new()
+        });
         dismiss!(self.help_modal);
         dismiss!(self.usage_modal);
         dismiss!(self.logs_modal);

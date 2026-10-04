@@ -44,7 +44,7 @@ impl App {
             self.flash(NOTHING_TO_EXTRACT.into());
             return;
         }
-        self.end_btw_thread();
+        self.close_stream_modal();
 
         let (tx, rx) = flume::bounded(64);
         let (trigger, cancel) = CancelToken::new();

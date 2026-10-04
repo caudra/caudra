@@ -41,6 +41,9 @@ const MAX_HEIGHT_PERCENT: u16 = 75;
 /// The form wraps the answer box itself, so a painted line is never clipped.
 const UNCLIPPED: usize = usize::MAX;
 const LINE_BREAK: &str = "\n";
+const ASK_HINT: Hint = Hint::bind(key::QUESTION_ASK_BTW, "Ask /btw");
+const COMPACT_ASK_HINT: Hint = Hint::bind(key::QUESTION_ASK_BTW, "Ask");
+const ASK_HINT_INDEX: usize = 0;
 
 const SHIFT_ENTER: Bind = Bind {
     code: KeyCode::Enter,
@@ -48,25 +51,29 @@ const SHIFT_ENTER: Bind = Bind {
     label: "Shift+Enter",
 };
 
-const EDITING_HINTS: [Hint; 4] = [
+const EDITING_HINTS: [Hint; 5] = [
+    ASK_HINT,
     Hint::bind(key::ENTER, "submit"),
     Hint::bind(SHIFT_ENTER, "newline"),
     Hint::bind(key::ESC, "back"),
     Hint::bind(key::QUIT, "cancel"),
 ];
-const CONFIRMING_HINTS: [Hint; 4] = [
+const CONFIRMING_HINTS: [Hint; 5] = [
+    ASK_HINT,
     Hint::bind(key::ENTER, "submit"),
     Hint::bind(key::SHIFT_TAB, "back"),
     Hint::bind(key::ESC, "dismiss"),
     Hint::bind(key::QUIT, "cancel"),
 ];
-const MULTI_SELECT_HINTS: [Hint; 4] = [
+const MULTI_SELECT_HINTS: [Hint; 5] = [
+    ASK_HINT,
     Hint::bind(key::ENTER, "toggle"),
     Hint::bind(key::TAB, "next"),
     Hint::bind(key::ESC, "dismiss"),
     Hint::bind(key::QUIT, "cancel"),
 ];
-const SINGLE_SELECT_HINTS: [Hint; 4] = [
+const SINGLE_SELECT_HINTS: [Hint; 5] = [
+    ASK_HINT,
     Hint::bind(key::ENTER, "submit"),
     Hint::bind(key::TAB, "next"),
     Hint::bind(key::ESC, "dismiss"),
@@ -75,6 +82,7 @@ const SINGLE_SELECT_HINTS: [Hint; 4] = [
 
 pub enum QuestionFormAction {
     Consumed,
+    AskBtw,
     /// One label list per question, in question order. An empty list is a
     /// question the user skipped.
     Submit(Vec<Vec<String>>),
@@ -217,6 +225,42 @@ impl QuestionForm {
         self.is_open() && self.mode == Mode::EditingCustom
     }
 
+    pub(crate) fn clarification_context(&self) -> String {
+        self.questions
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| self.mode == Mode::Confirming || *index == self.tab)
+            .map(|(index, question)| {
+                let options = question
+                    .options
+                    .iter()
+                    .map(|option| {
+                        if option.description.is_empty() {
+                            format!("- {}", option.label)
+                        } else {
+                            format!("- {}\n  {}", option.label, option.description)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(LINE_BREAK);
+                format!(
+                    "About: {}/{} · {}\n{}\n{}\n{}",
+                    index + 1,
+                    self.questions.len(),
+                    tab_label(index, question),
+                    question.question,
+                    if question.multiple {
+                        MULTI_HINT.trim()
+                    } else {
+                        SINGLE_HINT.trim()
+                    },
+                    options,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
     pub fn close(&mut self) {
         self.questions.clear();
         self.answers.clear();
@@ -229,6 +273,11 @@ impl QuestionForm {
     pub fn handle_key(&mut self, key: KeyEvent) -> QuestionFormAction {
         if !self.is_open() {
             return QuestionFormAction::Consumed;
+        }
+        if key::QUESTION_ASK_BTW.matches(key) {
+            self.hover = None;
+            self.mouse_down = None;
+            return QuestionFormAction::AskBtw;
         }
         self.follow_cursor = true;
         match self.mode {
@@ -260,15 +309,20 @@ impl QuestionForm {
     /// layout clamps this again against the room it actually has.
     pub fn height(&self, width: u16, available: u16) -> u16 {
         let body_width = width.saturating_sub(2);
-        (visual_rows(&self.body(body_width).lines, body_width).total + CHROME_ROWS)
+        (visual_rows(&self.body(body_width, true).lines, body_width).total + CHROME_ROWS)
             .min(available * MAX_HEIGHT_PERCENT / 100)
             .max(CHROME_ROWS + 1)
     }
 
+    #[cfg(test)]
     pub fn view(&mut self, frame: &mut Frame, area: Rect) {
+        self.view_with_focus(frame, area, true);
+    }
+
+    pub(crate) fn view_with_focus(&mut self, frame: &mut Frame, area: Rect, focused: bool) {
         grab_scope!("question_form", area);
         let width = area.width.saturating_sub(2);
-        let body = self.body(width);
+        let body = self.body(width, focused);
         let rows = visual_rows(&body.lines, width);
         self.area = area;
         // The cursor may sit below the fold on a long option list, so the
@@ -290,7 +344,7 @@ impl QuestionForm {
             area,
             body.lines,
             (self.scroll, 0),
-            Some(self.hint()),
+            Some(self.hint(width)),
         );
         self.record_row_hits(&body.spans, &rows, area, visible, hint);
     }
@@ -313,7 +367,7 @@ impl QuestionForm {
                 self.push_line_hit(rows, form, visible, line, span.target);
             }
         }
-        let hints = super::hint_hits(self.hint_pairs(), hint);
+        let hints = super::hint_hits(&self.visible_hints(hint.width), hint);
         for (index, area) in hints.into_iter().enumerate() {
             self.row_hits.push(RowHit {
                 area,
@@ -395,7 +449,10 @@ impl QuestionForm {
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.mouse_down = hit.map(|hit| hit.target);
-                self.aim(hit?, event);
+                let hit = hit?;
+                if hit.target != FormTarget::Hint(ASK_HINT_INDEX) {
+                    self.aim(hit, event);
+                }
                 Some(QuestionFormAction::Consumed)
             }
             // Hovering picks the row out, the same as walking onto it would.
@@ -675,18 +732,28 @@ impl QuestionForm {
         }
     }
 
-    fn hint(&self) -> Line<'static> {
+    fn visible_hints(&self, width: u16) -> Vec<Hint> {
+        let mut hints = self.hint_pairs().to_vec();
+        let area = Rect::new(0, 0, width, 1);
+        if super::hint_hits(&hints[..1], area).is_empty() {
+            hints[ASK_HINT_INDEX] = COMPACT_ASK_HINT;
+        }
+        hints.truncate(super::hint_hits(&hints, area).len());
+        hints
+    }
+
+    fn hint(&self, width: u16) -> Line<'static> {
         let hovered = match self.hover {
             Some(FormTarget::Hint(index)) => Some(index),
             _ => None,
         };
-        super::hint_line_hovered(self.hint_pairs(), hovered)
+        super::hint_line_hovered(&self.visible_hints(width), hovered)
     }
 
-    fn body(&self, width: u16) -> Body {
+    fn body(&self, width: u16, focused: bool) -> Body {
         match self.mode {
             Mode::Confirming => self.review_body(width),
-            _ => self.selecting_body(width),
+            _ => self.selecting_body(width, focused),
         }
     }
 
@@ -731,7 +798,7 @@ impl QuestionForm {
         )
     }
 
-    fn selecting_body(&self, width: u16) -> Body {
+    fn selecting_body(&self, width: u16, focused: bool) -> Body {
         let t = theme::current();
         let question = self.question();
         let mut body = Body::default();
@@ -755,7 +822,7 @@ impl QuestionForm {
             body.push(FormTarget::Option(index), self.option_lines(index, width));
         }
         if self.mode == Mode::EditingCustom {
-            for (index, line) in self.custom_editor_lines().into_iter().enumerate() {
+            for (index, line) in self.custom_editor_lines(focused).into_iter().enumerate() {
                 body.push(FormTarget::Editor(index), vec![line]);
             }
         } else {
@@ -835,7 +902,7 @@ impl QuestionForm {
     /// The answer box, caret and all. A `TextField` always keeps a line, so
     /// an emptied box still draws its prompt row rather than losing a line as
     /// the user clears what they typed.
-    fn custom_editor_lines(&self) -> Vec<Line<'static>> {
+    fn custom_editor_lines(&self, focused: bool) -> Vec<Line<'static>> {
         let t = theme::current();
         let styles = field_styles(Style::default());
         let indent = " ".repeat(CUSTOM_PROMPT.chars().count());
@@ -849,7 +916,7 @@ impl QuestionForm {
                     },
                     t.active,
                 )];
-                spans.extend(caret_spans(&self.custom, index, &styles));
+                spans.extend(caret_spans(&self.custom, index, &styles, focused));
                 Line::from(spans)
             })
             .collect()
@@ -903,8 +970,13 @@ fn ends_with_backslash(field: &TextField) -> bool {
 /// Line `index` of the box with its selection and caret painted on. Nothing
 /// places a terminal cursor over the form, so the caret is painted like the
 /// composer's.
-fn caret_spans(field: &TextField, index: usize, styles: &FieldStyles) -> Vec<Span<'static>> {
-    let overlays = field.overlays(index, styles, true);
+fn caret_spans(
+    field: &TextField,
+    index: usize,
+    styles: &FieldStyles,
+    focused: bool,
+) -> Vec<Span<'static>> {
+    let overlays = field.overlays(index, styles, focused);
     Row {
         text: &field.lines()[index],
         segments: None,
@@ -1784,7 +1856,8 @@ mod tests {
         press(&mut form, KeyCode::Enter);
         press(&mut form, KeyCode::Enter);
         render(&mut form);
-        let action = click_target(&mut form, FormTarget::Hint(0));
+        let index = hint_index(&form, key::ENTER);
+        let action = click_target(&mut form, FormTarget::Hint(index));
         assert!(
             matches!(&action, QuestionFormAction::Submit(picks) if picks.len() == 2),
             "the submit hint has to do what Enter does"
@@ -2109,9 +2182,10 @@ mod tests {
     fn the_marked_hint_is_the_one_a_click_presses() {
         let mut form = opened(two_questions());
         render(&mut form);
-        let (column, row) = target_cell(&form, FormTarget::Hint(1));
+        let index = hint_index(&form, key::TAB);
+        let (column, row) = target_cell(&form, FormTarget::Hint(index));
         form.handle_mouse(mouse(MouseEventKind::Moved, column, row));
-        assert_eq!(form.hover, Some(FormTarget::Hint(1)));
+        assert_eq!(form.hover, Some(FormTarget::Hint(index)));
         click(&mut form, column, row);
         assert_eq!(form.tab, 1, "the next-question hint moved the tab");
     }
@@ -2130,5 +2204,202 @@ mod tests {
         assert_eq!(form.mode, Mode::Confirming, "the review tab opened review");
         assert_eq!(form.hover, None);
         assert!(reversed_cells(&mut form).is_empty(), "{EXPECT_UNMARKED}");
+    }
+
+    const UNCOMMITTED: &str = "uncommitted custom draft";
+    const BTW_TEXT: &str = "/btw";
+    const FULL_QUESTION: &str = "Which choice?\nExplain the tradeoffs.";
+    const FULL_DESCRIPTION: &str = "First detail\nSecond detail";
+    const MANUAL_SCROLL: i32 = -2;
+
+    #[test_case(Mode::Selecting, false, false ; "single_key")]
+    #[test_case(Mode::Selecting, false, true ; "single_footer")]
+    #[test_case(Mode::Selecting, true, false ; "multi_key")]
+    #[test_case(Mode::Selecting, true, true ; "multi_footer")]
+    #[test_case(Mode::EditingCustom, false, false ; "editing_key")]
+    #[test_case(Mode::EditingCustom, false, true ; "editing_footer")]
+    #[test_case(Mode::Confirming, true, false ; "review_key")]
+    #[test_case(Mode::Confirming, true, true ; "review_footer")]
+    fn asking_preserves_answers_editor_and_manual_scroll(mode: Mode, multiple: bool, footer: bool) {
+        let mut question = long_question();
+        question.question = PICK.repeat(usize::from(TERMINAL_WIDTH));
+        question.multiple = multiple;
+        let mut form = opened(vec![question.clone(), question]);
+        form.tab = 1;
+        form.cursor = form.custom_row();
+        form.mode = mode;
+        form.answers = vec![vec![TYPED.into()], vec![OPTION_LABEL.into()]];
+        form.custom.set_text(TYPED);
+        form.custom.insert_text(UNCOMMITTED);
+        form.custom.set_cursor(Cursor::new(0, 1), false);
+        form.custom.set_cursor(Cursor::new(0, 3), true);
+        render(&mut form);
+        form.scroll(i32::from(u16::MAX));
+        form.scroll(MANUAL_SCROLL);
+        render(&mut form);
+        assert!(form.scroll > 0);
+        assert!(!form.follow_cursor);
+
+        let state = |form: &QuestionForm| {
+            (
+                form.mode,
+                form.tab,
+                form.cursor,
+                form.answers.clone(),
+                form.custom.text(),
+                form.custom.cursor(),
+                form.custom.selection(),
+                form.scroll,
+                form.follow_cursor,
+            )
+        };
+        let before = state(&form);
+        let index = hint_index(&form, key::QUESTION_ASK_BTW);
+        let action = if footer {
+            let (column, row) = target_cell(&form, FormTarget::Hint(index));
+            form.handle_mouse(mouse(MouseEventKind::Moved, column, row));
+            assert_eq!(state(&form), before);
+            form.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), column, row));
+            assert_eq!(state(&form), before);
+            render(&mut form);
+            assert_eq!(state(&form), before);
+            form.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), column, row))
+                .unwrap()
+        } else {
+            form.hover = Some(FormTarget::Hint(index));
+            form.mouse_down = form.hover;
+            form.handle_key(key::QUESTION_ASK_BTW.to_key_event())
+        };
+        assert!(matches!(action, QuestionFormAction::AskBtw));
+        assert_eq!(state(&form), before);
+        assert_eq!(form.hover, None);
+        assert_eq!(form.mouse_down, None);
+        render(&mut form);
+        assert_eq!(state(&form), before);
+        form.custom.handle_key(key::UNDO.to_key_event());
+        assert_eq!(form.custom.text(), TYPED);
+    }
+
+    #[test_case(Mode::Selecting ; "selecting")]
+    #[test_case(Mode::EditingCustom ; "editing")]
+    #[test_case(Mode::Confirming ; "review")]
+    fn clarification_context_contains_only_question_definitions(mode: Mode) {
+        let mut questions = two_questions();
+        questions[1].question = FULL_QUESTION.into();
+        questions[1].options[0].description = FULL_DESCRIPTION.into();
+        questions[1].multiple = true;
+        let mut form = opened(questions);
+        form.mode = mode;
+        form.tab = 1;
+        let before = form.clarification_context();
+        form.answers = vec![vec![TYPED.into()], vec![YES.into(), TYPED.into()]];
+        form.custom.set_text(UNCOMMITTED);
+        let context = form.clarification_context();
+        assert_eq!(context, before);
+        assert!(!context.contains(TYPED));
+        assert!(!context.contains(UNCOMMITTED));
+        let active = format!(
+            "About: 2/2 · {SECOND}\n{FULL_QUESTION}\n{}\n- {YES}\n  {FULL_DESCRIPTION}\n- {NO}\n  {NO_DESC}",
+            MULTI_HINT.trim(),
+        );
+        let expected = if mode == Mode::Confirming {
+            format!(
+                "About: 1/2 · {HEADER}\n{PICK}\n{}\n- {YES}\n  {YES_DESC}\n- {NO}\n  {NO_DESC}\n\n{active}",
+                SINGLE_HINT.trim(),
+            )
+        } else {
+            active
+        };
+        assert_eq!(context, expected);
+    }
+
+    #[test_case(false ; "typed")]
+    #[test_case(true ; "pasted")]
+    fn literal_btw_is_custom_answer_text(pasted: bool) {
+        let mut form = opened(vec![question(HEADER, false)]);
+        form.cursor = form.custom_row();
+        press(&mut form, KeyCode::Enter);
+        if pasted {
+            assert!(form.handle_paste(BTW_TEXT));
+        } else {
+            type_text(&mut form, BTW_TEXT);
+        }
+        assert_eq!(form.custom.text(), BTW_TEXT);
+        assert!(matches!(
+            press(&mut form, KeyCode::Enter),
+            QuestionFormAction::Submit(answers) if answers == vec![vec![BTW_TEXT.to_owned()]]
+        ));
+    }
+
+    #[test_case(10, COMPACT_ASK_HINT ; "compact")]
+    #[test_case(15, ASK_HINT ; "ask_only")]
+    #[test_case(30, ASK_HINT ; "narrow")]
+    #[test_case(TERMINAL_WIDTH, ASK_HINT ; "normal")]
+    fn ask_hint_stays_visible_and_clickable(width: u16, expected: Hint) {
+        for mode in [Mode::Selecting, Mode::EditingCustom, Mode::Confirming] {
+            let mut form = opened(two_questions());
+            form.mode = mode;
+            let backend = ratatui::backend::TestBackend::new(width, TERMINAL_HEIGHT);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            let area = Rect::new(0, 0, width, TERMINAL_HEIGHT);
+            terminal.draw(|frame| form.view(frame, area)).unwrap();
+            let index = hint_index(&form, key::QUESTION_ASK_BTW);
+            let hit = hit_area(&form, FormTarget::Hint(index));
+            let text: String = (hit.x..hit.right())
+                .map(|x| terminal.backend().buffer()[(x, hit.y)].symbol())
+                .collect();
+            assert_eq!(
+                text,
+                format!("{} {}", expected.label(), expected.description())
+            );
+            assert!(form.hint(width - 2).width() <= usize::from(width - 2));
+            assert!(matches!(
+                click_target(&mut form, FormTarget::Hint(index)),
+                QuestionFormAction::AskBtw
+            ));
+        }
+    }
+
+    #[test]
+    fn inactive_form_hides_only_the_custom_caret() {
+        let mut form = typing(false);
+        let before = (
+            form.custom.text(),
+            form.custom.cursor(),
+            form.custom.selection(),
+        );
+        let backend = ratatui::backend::TestBackend::new(TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let area = docked(&form);
+        let caret = theme::current().cursor;
+        for focused in [true, false, true] {
+            terminal
+                .draw(|frame| form.view_with_focus(frame, area, focused))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let visible = buffer
+                .content
+                .iter()
+                .any(|cell| Some(cell.fg) == caret.fg && Some(cell.bg) == caret.bg);
+            assert_eq!(visible, focused);
+            assert_eq!(
+                (
+                    form.custom.text(),
+                    form.custom.cursor(),
+                    form.custom.selection()
+                ),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn closed_form_does_not_offer_clarification() {
+        let mut form = QuestionForm::new();
+        assert!(form.clarification_context().is_empty());
+        assert!(matches!(
+            form.handle_key(key::QUESTION_ASK_BTW.to_key_event()),
+            QuestionFormAction::Consumed
+        ));
     }
 }

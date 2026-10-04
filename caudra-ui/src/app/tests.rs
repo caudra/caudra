@@ -55,12 +55,15 @@ use caudra_agent::tools::profile_policy::PLAN_REQUIRED;
 use caudra_agent::tools::{
     SHELL_TOOL_NAME, TODOWRITE_TOOL_NAME, ToolEffect, ToolRegistry, VIEW_IMAGE_TOOL_NAME, native,
 };
-use caudra_agent::types::{AskedQuestion, QuestionOption, TodoItem, TodoPriority, TodoStatus};
+use caudra_agent::types::{
+    AskedQuestion, QuestionEvent, QuestionOption, TodoItem, TodoPriority, TodoStatus,
+};
 use caudra_agent::{
     BatchProgressEvent, BatchToolEntry, BatchToolStatus, CallStage, DoneReason, GoalResult,
     GoalStatus, GoalVerdict, HistorySnapshot, ImageMediaType, McpConfigErrors, McpServerInfo,
     McpServerStatus, McpSnapshot, McpSnapshotReader, SubagentActivity, SubagentProgress,
-    TextOutput, ToolAccounting, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
+    TaskProvenance, TextOutput, ToolAccounting, ToolDoneEvent, ToolOutput, ToolStartEvent,
+    TurnCompleteEvent,
 };
 use caudra_config::decisions::DecisionsConfig;
 use caudra_config::sandbox::SandboxName;
@@ -121,6 +124,13 @@ use tempfile::{Builder, TempDir};
 use test_case::test_case;
 
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const QUESTION_BTW_MAIN_DRAFT: &str = "Keep the main composer draft";
+const QUESTION_BTW_REPLACEMENT: &str = "Which replacement?";
+const QUESTION_BTW_MODEL: &str = "question-btw-model";
+const QUESTION_BTW_COST: f64 = 0.25;
+const QUESTION_BTW_INPUT_TOKENS: u32 = 100;
+const QUESTION_BTW_INVOCATION: &str = "question-btw-invocation";
+const QUESTION_BTW_BACK_CONTROL: usize = 0;
 const LONG_FLASH_DURATION: Duration = Duration::from_secs(60);
 const CONFIRMATION_TIMINGS: [(Duration, bool); 4] = [
     (Duration::from_millis(1500), true),
@@ -16082,6 +16092,460 @@ fn assert_btw_follow_up_in_flight(app: &App) {
         [BTW_HEADER, BTW_FOLLOW_UP_HEADER]
     );
     assert_eq!(app.stream_modal.input_text(), "");
+}
+
+fn question_btw_app() -> (App, flume::Receiver<String>) {
+    let mut app = btw_ready_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.input_box.set_input(QUESTION_BTW_MAIN_DRAFT.into());
+    let (answer_tx, answers) = flume::unbounded();
+    app.answer_tx = Some(answer_tx);
+    open_question(&mut app);
+    app.update(Msg::Key(key(KeyCode::Down)));
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    app.update(Msg::Paste(QUESTION_ANSWER.into()));
+    assert!(app.question_form.text_input_active());
+    (app, answers)
+}
+
+fn rendered_question(app: &mut App) -> String {
+    let (_, bottom, ..) = app.layout_geometry(TEST_AREA);
+    let mut terminal = Terminal::new(TestBackend::new(TEST_AREA.width, TEST_AREA.height)).unwrap();
+    terminal
+        .draw(|frame| app.question_form.view(frame, bottom))
+        .unwrap();
+    buffer_text(terminal.backend().buffer())
+}
+
+fn question_btw_streaming(app: &mut App) -> flume::Sender<StreamEvent> {
+    app.open_question_btw();
+    app.continue_btw(BTW_QUESTION.into());
+    let (tx, rx) = flume::unbounded();
+    let (trigger, _cancel) = caudra_agent::CancelToken::new();
+    app.stream_modal
+        .begin_exchange(BTW_HEADER.into(), rx, trigger);
+    assert!(app.stream_modal.is_clarification());
+    tx
+}
+
+#[test_case(false; "transcript")]
+#[test_case(true; "workbench")]
+fn question_btw_first_composer_owns_keys_and_paste_without_answering(workbench: bool) {
+    let (mut app, answers) = question_btw_app();
+    if workbench {
+        app.execute_command(cmd("/workbench"), 0);
+        assert!(app.workbench.is_open());
+    }
+    let before = rendered_question(&mut app);
+    assert!(before.contains(QUESTION_ANSWER));
+    let history = app.state.session.messages().to_vec();
+    let run_id = app.run_id;
+
+    assert_eq!(kb::QUESTION_ASK_BTW.code, KeyCode::F(2));
+    assert!(
+        app.update(Msg::Key(kb::QUESTION_ASK_BTW.to_key_event()))
+            .is_empty()
+    );
+    assert!(app.stream_modal.is_open());
+    assert!(app.stream_modal.is_clarification());
+    assert!(!app.stream_modal.is_streaming());
+    assert!(app.btw_thread.is_none());
+    assert!(rendered(&mut app).contains(QUESTION_TEXT));
+    assert!(app.update(Msg::Paste(BTW_QUESTION.into())).is_empty());
+    assert!(app.update(Msg::Key(key(KeyCode::Char('!')))).is_empty());
+    assert!(app.update(Msg::Key(key(KeyCode::Backspace))).is_empty());
+    assert_eq!(app.stream_modal.input_text(), BTW_QUESTION);
+    assert_eq!(rendered_question(&mut app), before);
+    assert_eq!(answers.try_recv(), Err(TryRecvError::Empty));
+
+    assert!(app.update(Msg::Key(key(KeyCode::Esc))).is_empty());
+    assert!(!app.stream_modal.is_open());
+    assert!(app.stream_modal.is_clarification());
+    assert!(app.btw_thread.is_none());
+    assert!(
+        app.update(Msg::Key(kb::QUESTION_ASK_BTW.to_key_event()))
+            .is_empty()
+    );
+    assert_eq!(app.stream_modal.input_text(), BTW_QUESTION);
+    assert!(app.update(Msg::Key(key(KeyCode::Enter))).is_empty());
+    let pending = app.btw_thread.as_ref().unwrap().pending().unwrap();
+    assert!(pending.contains(&app.question_form.clarification_context()));
+    assert!(pending.ends_with(BTW_QUESTION));
+    assert_eq!(answers.try_recv(), Err(TryRecvError::Empty));
+    assert!(app.update(Msg::Key(key(KeyCode::Esc))).is_empty());
+    let _ = app.tick();
+
+    assert!(!app.stream_modal.is_open());
+    assert!(app.stream_modal.is_clarification());
+    assert!(app.btw_thread.is_some());
+    assert_eq!(rendered_question(&mut app), before);
+    assert_eq!(app.status, Status::Streaming, "{EXPECT_RUN_LEFT_ALONE}");
+    assert_eq!(app.run_id, run_id, "{EXPECT_RUN_LEFT_ALONE}");
+    assert_eq!(app.state.session.messages(), history.as_slice());
+    assert_eq!(app.input_box.buffer.value(), QUESTION_BTW_MAIN_DRAFT);
+    assert_eq!(answers.try_recv(), Err(TryRecvError::Empty));
+    assert_eq!(app.workbench.is_open(), workbench);
+}
+
+#[test_case(false; "keyboard_back")]
+#[test_case(true; "footer_back")]
+fn question_btw_back_retains_answer_thread_and_unsent_draft(mouse: bool) {
+    let (mut app, answers) = question_btw_app();
+    let before = rendered_question(&mut app);
+    question_btw_streaming(&mut app).send(btw_answer()).unwrap();
+    let _ = app.tick();
+    assert_eq!(app.btw_thread.as_ref().unwrap().exchange_count(), 1);
+    let headers: Vec<String> = app
+        .stream_modal
+        .headers()
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    app.update(Msg::Paste(BTW_FOLLOW_UP.into()));
+
+    if mouse {
+        rendered(&mut app);
+        let back = app.stream_modal.footer_hit(QUESTION_BTW_BACK_CONTROL);
+        assert!(!back.is_empty());
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            assert!(app.update(mouse_event(kind, back.x, back.y)).is_empty());
+        }
+    } else {
+        assert!(app.update(Msg::Key(key(KeyCode::Esc))).is_empty());
+    }
+    let _ = app.tick();
+    assert!(!app.stream_modal.is_open());
+    assert_eq!(rendered_question(&mut app), before);
+    assert_eq!(answers.try_recv(), Err(TryRecvError::Empty));
+
+    app.update(Msg::Key(kb::QUESTION_ASK_BTW.to_key_event()));
+    assert!(app.stream_modal.is_open());
+    assert_eq!(app.stream_modal.headers(), headers);
+    assert_eq!(app.stream_modal.input_text(), BTW_FOLLOW_UP);
+    assert_eq!(app.btw_thread.as_ref().unwrap().exchange_count(), 1);
+    assert_eq!(notice_texts(&mut app), [super::btw::BTW_CUTOFF_MARKER]);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(app.btw_thread.as_ref().unwrap().exchange_count(), 1);
+    assert_eq!(
+        app.btw_thread.as_ref().unwrap().pending(),
+        Some(BTW_FOLLOW_UP)
+    );
+    assert_eq!(answers.try_recv(), Err(TryRecvError::Empty));
+    assert_eq!(app.status, Status::Streaming);
+}
+
+#[test]
+fn question_btw_footer_and_restored_answer_take_input_ahead_of_workbench() {
+    let (mut app, answers) = question_btw_app();
+    app.execute_command(cmd("/workbench"), 0);
+    let mut terminal = Terminal::new(TestBackend::new(TEST_AREA.width, TEST_AREA.height)).unwrap();
+    terminal.draw(|frame| app.view(frame)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let ask = (TEST_AREA.y..TEST_AREA.bottom())
+        .flat_map(|row| {
+            (TEST_AREA.x..TEST_AREA.right() - 1).map(move |column| Position::new(column, row))
+        })
+        .find(|position| {
+            app.question_form.contains(*position)
+                && buffer[(position.x, position.y)].symbol() == "F"
+                && buffer[(position.x + 1, position.y)].symbol() == "2"
+        })
+        .unwrap();
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        assert!(app.update(mouse_event(kind, ask.x, ask.y)).is_empty());
+    }
+    assert!(app.stream_modal.is_open());
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    app.update(Msg::Paste(BTW_FOLLOW_UP.into()));
+    assert!(rendered_question(&mut app).contains(&format!("{QUESTION_ANSWER}{BTW_FOLLOW_UP}")));
+    assert!(app.workbench.is_open());
+    assert_eq!(answers.try_recv(), Err(TryRecvError::Empty));
+}
+
+#[test_case(KeyCode::Enter; "submit")]
+#[test_case(KeyCode::Esc; "dismiss")]
+#[test_case(KeyCode::Char('c'); "cancel")]
+fn question_btw_is_discarded_when_the_form_finishes(code: KeyCode) {
+    let (mut app, answers) = question_btw_app();
+    question_btw_streaming(&mut app).send(btw_answer()).unwrap();
+    let _ = app.tick();
+    app.update(Msg::Paste(BTW_FOLLOW_UP.into()));
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(app.stream_modal.is_clarification());
+    assert_eq!(answers.try_recv(), Err(TryRecvError::Empty));
+    if code == KeyCode::Esc {
+        app.update(Msg::Key(key(KeyCode::Esc)));
+        assert!(app.question_form.is_open());
+    }
+    let event = if code == KeyCode::Char('c') {
+        kb::QUIT.to_key_event()
+    } else {
+        key(code)
+    };
+    let actions = app.update(Msg::Key(event));
+
+    assert!(!app.question_form.is_open());
+    assert!(!app.stream_modal.is_open());
+    assert!(!app.stream_modal.is_clarification());
+    assert!(app.stream_modal.input_text().is_empty());
+    assert!(app.btw_thread.is_none());
+    assert!(notice_texts(&mut app).is_empty());
+    match code {
+        KeyCode::Enter => {
+            assert!(actions.is_empty());
+            let submitted: Vec<Vec<String>> =
+                serde_json::from_str(&answers.try_recv().unwrap()).unwrap();
+            assert_eq!(submitted, vec![vec![QUESTION_ANSWER.to_owned()]]);
+        }
+        KeyCode::Esc => {
+            assert!(actions.is_empty());
+            assert_eq!(answers.try_recv().unwrap(), QUESTION_DISMISSED);
+        }
+        _ => assert!(matches!(
+            actions.as_slice(),
+            [Action::CancelAgent { run_id: 1 }]
+        )),
+    }
+    assert_eq!(answers.try_recv(), Err(TryRecvError::Empty));
+}
+
+#[test_case(false; "visible_clarification")]
+#[test_case(true; "retained_clarification")]
+fn question_btw_is_discarded_when_an_agent_replaces_the_form(hidden: bool) {
+    let (mut app, answers) = question_btw_app();
+    let _tx = question_btw_streaming(&mut app);
+    app.update(Msg::Paste(BTW_FOLLOW_UP.into()));
+    if hidden {
+        app.update(Msg::Key(key(KeyCode::Esc)));
+    }
+    assert!(
+        app.update(agent_msg(AgentEvent::Question(Box::new(QuestionEvent {
+            questions: vec![AskedQuestion {
+                question: QUESTION_BTW_REPLACEMENT.into(),
+                header: QUESTION_HEADER.into(),
+                options: vec![QuestionOption {
+                    label: QUESTION_OPTION.into(),
+                    description: String::new(),
+                }],
+                multiple: false,
+            }],
+        }))))
+        .is_empty()
+    );
+
+    assert!(app.question_form.is_open());
+    assert!(rendered_question(&mut app).contains(QUESTION_BTW_REPLACEMENT));
+    assert!(!app.stream_modal.is_clarification());
+    assert!(!app.stream_modal.is_open());
+    assert!(app.stream_modal.input_text().is_empty());
+    assert!(app.btw_thread.is_none());
+    assert!(notice_texts(&mut app).is_empty());
+    assert_eq!(answers.try_recv(), Err(TryRecvError::Empty));
+    assert_eq!(app.status, Status::Streaming);
+}
+
+#[test_case(false; "subagent_question")]
+#[test_case(true; "task_provenance_without_subagent")]
+fn question_btw_rejects_non_main_questions_without_changing_the_form(task: bool) {
+    let (mut app, answers) = question_btw_app();
+    if task {
+        app.task_interactions.question = Some(Arc::new(TaskProvenance {
+            session_id: app.state.session.id,
+            task_id: TASK_ID.into(),
+            invocation_id: QUESTION_BTW_INVOCATION.into(),
+        }));
+    } else {
+        app.question_subagent = Some(TASK_ID.into());
+    }
+    let before = rendered_question(&mut app);
+    assert!(
+        app.update(Msg::Key(kb::QUESTION_ASK_BTW.to_key_event()))
+            .is_empty()
+    );
+
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(super::btw::CLARIFICATION_MAIN_ONLY)
+    );
+    assert!(!app.stream_modal.is_open());
+    assert!(app.btw_thread.is_none());
+    assert_eq!(rendered_question(&mut app), before);
+    assert_eq!(answers.try_recv(), Err(TryRecvError::Empty));
+    assert_eq!(app.status, Status::Streaming);
+}
+
+#[test]
+fn question_btw_missing_initialization_preserves_the_form() {
+    let (mut app, answers) = question_btw_app();
+    app.btw_prompt = None;
+    let before = rendered_question(&mut app);
+    assert!(
+        app.update(Msg::Key(kb::QUESTION_ASK_BTW.to_key_event()))
+            .is_empty()
+    );
+
+    assert!(!app.stream_modal.is_open());
+    assert!(app.btw_thread.is_none());
+    assert_eq!(rendered_question(&mut app), before);
+    assert_eq!(answers.try_recv(), Err(TryRecvError::Empty));
+    assert_eq!(app.status, Status::Streaming);
+}
+
+#[test]
+fn question_btw_owns_overlapping_wheel_and_mouse_and_outside_click_returns_to_the_form() {
+    let (mut app, answers) = question_btw_app();
+    app.question_form.open(vec![AskedQuestion {
+        question: (0..PEER_MANAGER_QUESTION_LINES)
+            .map(|index| format!("{index}: {QUESTION_TEXT}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        header: QUESTION_HEADER.into(),
+        options: vec![QuestionOption {
+            label: QUESTION_OPTION.into(),
+            description: String::new(),
+        }],
+        multiple: false,
+    }]);
+    app.update(Msg::Key(key(KeyCode::Down)));
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    app.update(Msg::Paste(QUESTION_ANSWER.into()));
+    app.open_question_btw();
+    app.update(Msg::Paste(BTW_QUESTION.into()));
+    let mut terminal = Terminal::new(TestBackend::new(TEST_AREA.width, TEST_AREA.height)).unwrap();
+    terminal.draw(|frame| app.view(frame)).unwrap();
+    let (_, bottom, ..) = app.layout_geometry(TEST_AREA);
+    let positions = || {
+        (bottom.y..bottom.bottom()).flat_map(|row| {
+            (bottom.x..bottom.right()).map(move |column| Position::new(column, row))
+        })
+    };
+    let overlap = positions()
+        .find(|position| {
+            app.stream_modal.contains(*position) && app.question_form.contains(*position)
+        })
+        .unwrap();
+    let outside = positions()
+        .find(|position| {
+            !app.stream_modal.contains(*position) && app.question_form.contains(*position)
+        })
+        .unwrap();
+    let before = rendered_question(&mut app);
+    assert!(before.contains(QUESTION_ANSWER));
+    app.active_chat().enable_auto_scroll();
+
+    for delta in [EDGE_SCROLL_LINES, -EDGE_SCROLL_LINES] {
+        assert!(
+            app.update(Msg::Scroll {
+                column: overlap.x,
+                row: overlap.y,
+                delta,
+            })
+            .is_empty()
+        );
+        assert_eq!(rendered_question(&mut app), before);
+        assert!(app.chats[0].auto_scroll());
+    }
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        assert!(
+            app.update(mouse_event(kind, overlap.x, overlap.y))
+                .is_empty()
+        );
+    }
+    assert!(app.stream_modal.is_open());
+    assert_eq!(rendered_question(&mut app), before);
+    assert_eq!(answers.try_recv(), Err(TryRecvError::Empty));
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        assert!(
+            app.update(mouse_event(kind, outside.x, outside.y))
+                .is_empty()
+        );
+    }
+
+    assert!(!app.stream_modal.is_open());
+    assert!(app.stream_modal.is_clarification());
+    assert_eq!(rendered_question(&mut app), before);
+    assert_eq!(answers.try_recv(), Err(TryRecvError::Empty));
+    assert_eq!(app.status, Status::Streaming);
+    app.open_question_btw();
+    assert_eq!(app.stream_modal.input_text(), BTW_QUESTION);
+}
+
+#[test_case(false; "escape")]
+#[test_case(true; "ctrl_c")]
+fn question_btw_completion_just_before_back_is_billed_once(interrupt: bool) {
+    let (mut app, answers) = question_btw_app();
+    let tx = question_btw_streaming(&mut app);
+    let StreamEvent::Done(mut done) = btw_answer() else {
+        unreachable!()
+    };
+    done.usage.usage.input = QUESTION_BTW_INPUT_TOKENS;
+    done.usage.cost = Some(QUESTION_BTW_COST);
+    done.usage.model = QUESTION_BTW_MODEL.into();
+    tx.send(StreamEvent::Done(done)).unwrap();
+
+    app.update(Msg::Key(if interrupt {
+        kb::QUIT.to_key_event()
+    } else {
+        key(KeyCode::Esc)
+    }));
+    assert!(!app.stream_modal.is_open());
+    let _ = app.tick();
+    app.open_question_btw();
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    let _ = app.tick();
+    app.discard_question_btw();
+    let _ = app.tick();
+
+    assert_eq!(app.state.token_usage.input, QUESTION_BTW_INPUT_TOKENS);
+    assert_eq!(app.state.cost, Some(QUESTION_BTW_COST));
+    assert_eq!(app.chats[0].cost, Some(QUESTION_BTW_COST));
+    let billed =
+        &app.state.session.usage_by_model()[&format!("{TEST_PROVIDER}/{QUESTION_BTW_MODEL}")];
+    assert_eq!(billed.input, QUESTION_BTW_INPUT_TOKENS);
+    assert_eq!(billed.cost, Some(QUESTION_BTW_COST));
+    assert_eq!(answers.try_recv(), Err(TryRecvError::Empty));
+    assert!(app.question_form.is_open());
+    assert_eq!(app.status, Status::Streaming);
+}
+
+#[test]
+fn question_btw_completion_is_billed_to_the_retiring_session() {
+    let (mut app, _) = question_btw_app();
+    let old_session = app.state.session.id;
+    let tx = question_btw_streaming(&mut app);
+    let StreamEvent::Done(mut done) = btw_answer() else {
+        unreachable!()
+    };
+    done.usage.usage.input = QUESTION_BTW_INPUT_TOKENS;
+    done.usage.cost = Some(QUESTION_BTW_COST);
+    done.usage.model = QUESTION_BTW_MODEL.into();
+    tx.send(StreamEvent::Done(done)).unwrap();
+    let next = AppSession::new(&app.state.model.spec(), &app.state.session.cwd);
+    app.apply_loaded_session(next, &test_model()).unwrap();
+    let _ = app.tick();
+
+    assert!(!app.question_form.is_open());
+    assert!(!app.stream_modal.is_clarification());
+    assert!(app.btw_thread.is_none());
+    assert_eq!(app.state.token_usage.input, 0);
+    assert_eq!(app.state.cost, None);
+    let old = crate::load_app_session(old_session, &app.storage).unwrap();
+    let billed = &old.usage_by_model()[&format!("{TEST_PROVIDER}/{QUESTION_BTW_MODEL}")];
+    assert_eq!(billed.input, QUESTION_BTW_INPUT_TOKENS);
+    assert_eq!(billed.cost, Some(QUESTION_BTW_COST));
 }
 
 /// A follow-up typed into the modal extends the same thread: the answered

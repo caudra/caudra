@@ -18,6 +18,11 @@ use crate::components::{DisplayMessage, DisplayRole};
 use super::{App, HISTORY_UNREADABLE};
 
 const TITLE: &str = " /btw ";
+pub(super) const CLARIFICATION_MAIN_ONLY: &str = "Ask /btw is available for main-session questions only; task question context is not supported yet";
+const PROMPT_INITIALIZING: &str = "System prompt is still initializing";
+const CLARIFICATION_REMINDER: &str = "The user is clarifying a pending question form, not answering it. \
+The asking agent is still waiting. Explain the question or choices; do not select, submit, or change \
+answers. The following is the question currently being viewed, not a user decision:";
 /// Drawn where the thread's snapshot of the conversation ends, so the reader
 /// can tell what the side question could and could not see.
 pub(crate) const BTW_CUTOFF_MARKER: &str = "/btw reads the conversation up to here";
@@ -71,6 +76,7 @@ pub(crate) struct BtwThread {
     base: Vec<Message>,
     exchanges: Vec<(String, String)>,
     pending: Option<String>,
+    clarification_context: Option<String>,
 }
 
 impl BtwThread {
@@ -94,6 +100,7 @@ impl BtwThread {
             base,
             exchanges: Vec::new(),
             pending: None,
+            clarification_context: None,
         }
     }
 
@@ -101,6 +108,19 @@ impl BtwThread {
     /// that carried it failed, so the model never answered it.
     fn ask(&mut self, question: String) {
         self.pending = Some(question);
+    }
+
+    fn ask_clarification(&mut self, question: String, context: String) {
+        let changed = self.clarification_context.as_ref() != Some(&context)
+            || self.pending.is_some()
+            || self.exchanges.is_empty();
+        let question = if changed {
+            format!("{CLARIFICATION_REMINDER}\n\n{context}\n\n{question}")
+        } else {
+            question
+        };
+        self.clarification_context = Some(context);
+        self.ask(question);
     }
 
     #[cfg(test)]
@@ -122,6 +142,8 @@ impl BtwThread {
         };
         if let Some(answer) = answer {
             self.exchanges.push((question, answer));
+        } else {
+            self.clarification_context = None;
         }
     }
 
@@ -149,7 +171,47 @@ impl BtwThread {
 }
 
 impl App {
-    pub(crate) fn start_btw(&mut self, question: String) {
+    pub(super) fn open_question_btw(&mut self) {
+        if !self.question_form.is_open() {
+            return;
+        }
+        if self.question_subagent.is_some() || self.task_interactions.question.is_some() {
+            self.flash(CLARIFICATION_MAIN_ONLY.into());
+            return;
+        }
+        if !self
+            .btw_prompt
+            .as_ref()
+            .is_some_and(|prompt| !prompt.load().system.is_empty())
+        {
+            self.flash(PROMPT_INITIALIZING.into());
+            return;
+        }
+        if !self.stream_modal.is_clarification() {
+            self.close_stream_modal();
+        } else {
+            self.settle_stream_modal();
+        }
+        self.autoscroll = None;
+        self.selection_state = None;
+        self.stream_modal
+            .open_clarification(self.question_form.clarification_context());
+    }
+
+    pub(super) fn discard_question_btw(&mut self) {
+        if self.stream_modal.is_clarification() {
+            self.close_stream_modal();
+        }
+    }
+
+    pub(super) fn close_stream_modal(&mut self) {
+        let _ = self.stream_modal.poll();
+        self.settle_stream_modal();
+        self.stream_modal.close();
+        self.end_btw_thread();
+    }
+
+    fn capture_btw_thread(&mut self) -> Option<BtwThread> {
         let items = self
             .shared_history
             .as_ref()
@@ -160,7 +222,7 @@ impl App {
             Err(error) => {
                 self.status_bar
                     .flash(format!("{HISTORY_UNREADABLE}{error}"));
-                return;
+                return None;
             }
         };
         let Some(prompt) = self
@@ -169,14 +231,13 @@ impl App {
             .map(|p| p.load_full())
             .filter(|p| !p.system.is_empty())
         else {
-            self.status_bar
-                .flash("System prompt is still initializing".into());
-            return;
+            self.status_bar.flash(PROMPT_INITIALIZING.into());
+            return None;
         };
+        Some(BtwThread::new(prompt, messages))
+    }
 
-        self.end_btw_thread();
-        let mut thread = BtwThread::new(prompt, messages);
-        thread.ask(question.clone());
+    fn install_btw_thread(&mut self, thread: BtwThread) {
         self.btw_thread = Some(thread);
         // Streaming text is not in history yet and draws below every message,
         // so a marker appended now lands exactly where the snapshot cuts.
@@ -184,6 +245,15 @@ impl App {
             DisplayRole::Notice,
             BTW_CUTOFF_MARKER.into(),
         ));
+    }
+
+    pub(crate) fn start_btw(&mut self, question: String) {
+        let Some(mut thread) = self.capture_btw_thread() else {
+            return;
+        };
+        self.close_stream_modal();
+        thread.ask(question.clone());
+        self.install_btw_thread(thread);
 
         let (tx, rx) = flume::bounded(64);
         let (trigger, cancel) = CancelToken::new();
@@ -200,10 +270,26 @@ impl App {
     /// Asks the next question over the same snapshot and prefix, so the whole
     /// thread stays one cached lineage.
     pub(crate) fn continue_btw(&mut self, question: String) {
+        self.settle_stream_modal();
+        let context = self
+            .stream_modal
+            .is_clarification()
+            .then(|| self.question_form.clarification_context());
+        if context.is_some() && self.btw_thread.is_none() {
+            let Some(thread) = self.capture_btw_thread() else {
+                self.stream_modal.handle_paste(&question);
+                return;
+            };
+            self.install_btw_thread(thread);
+        }
         let Some(thread) = self.btw_thread.as_mut() else {
             return;
         };
-        thread.ask(question.clone());
+        if let Some(context) = context {
+            thread.ask_clarification(question.clone(), context);
+        } else {
+            thread.ask(question.clone());
+        }
         let (tx, rx) = flume::bounded(64);
         let (trigger, cancel) = CancelToken::new();
         self.stream_modal
@@ -354,6 +440,58 @@ mod tests {
     const THINKING_DELTAS: [&str; 2] = ["considering ", "deployment"];
     const TEXT_DELTAS: [&str; 2] = ["it ships ", "in the binary"];
     const EXPECTED_DONE: &str = "expected stream completion after all deltas";
+    const CLARIFY_STORAGE: &str = "About: Q1/2 · Storage\nWhich database?\nSQLite\nPostgreSQL";
+    const CLARIFY_DEPLOYMENT: &str = "About: Q2/2 · Deployment\nWhere should it run?\nLocal\nCloud";
+
+    #[test_case(false ; "same_question")]
+    #[test_case(true ; "different_question")]
+    fn clarification_context_follows_focus_without_repeating_unchanged_questions(changed: bool) {
+        let (called, _requests) = flume::unbounded();
+        let mut thread = BtwThread::new(
+            Arc::new(prompt(FIRST_MODEL, called)),
+            vec![Message::user(BASE.into())],
+        );
+        thread.ask_clarification(Q.into(), CLARIFY_STORAGE.into());
+        let initial = thread.request_messages();
+        let initial_question = user_text(initial.last().unwrap());
+        assert!(initial_question.contains(CLARIFICATION_REMINDER));
+        assert!(initial_question.contains(CLARIFY_STORAGE));
+        assert!(initial_question.ends_with(Q));
+        thread.settle(Some(ANSWER.into()));
+
+        let context = if changed {
+            CLARIFY_DEPLOYMENT
+        } else {
+            CLARIFY_STORAGE
+        };
+        thread.ask_clarification(FOLLOW_UP.into(), context.into());
+        let next = thread.request_messages();
+        assert_eq!(user_text(&next[0]), BASE);
+        assert_eq!(user_text(&next[1]), initial_question);
+        let follow_up = user_text(next.last().unwrap());
+        if changed {
+            assert!(follow_up.contains(CLARIFY_DEPLOYMENT));
+        } else {
+            assert_eq!(follow_up, FOLLOW_UP);
+        }
+    }
+
+    #[test_case(false ; "interrupted")]
+    #[test_case(true ; "failed")]
+    fn clarification_retry_keeps_context_that_never_settled(failed: bool) {
+        let (called, _requests) = flume::unbounded();
+        let mut thread = BtwThread::new(Arc::new(prompt(FIRST_MODEL, called)), Vec::new());
+        thread.ask_clarification(Q.into(), CLARIFY_STORAGE.into());
+        thread.settle(Some(ANSWER.into()));
+        thread.ask_clarification(FOLLOW_UP.into(), CLARIFY_DEPLOYMENT.into());
+        if failed {
+            thread.settle(None);
+        }
+        thread.ask_clarification(FOLLOW_UP.into(), CLARIFY_DEPLOYMENT.into());
+        let messages = thread.request_messages();
+        assert!(user_text(messages.last().unwrap()).contains(CLARIFY_DEPLOYMENT));
+        assert_eq!(thread.exchange_count(), 1);
+    }
 
     /// Hands over the route and messages of every request it answers.
     struct RecordingProvider(flume::Sender<(String, Vec<Message>)>);

@@ -55,6 +55,15 @@ const STATUS_ROW: u16 = 1;
 /// scrolls the prompt away.
 const INPUT_ROW: u16 = 1;
 const FOOTER_ROW: u16 = 1;
+const CLARIFICATION_TITLE: &str = " /btw · Clarify questions ";
+const CLARIFICATION_PLACEHOLDER: &str = "Ask about these choices…";
+const BACK_HINT: &str = " Back to questions";
+const COMPACT_BACK_HINT: &str = " Back";
+const INITIAL_SEND_HINT: &str = " Send";
+const COMPACT_SEND_HINT: &str = " Follow-up";
+const COMPACT_QUEUE_HINT: &str = " Queue";
+const COMPACT_FOOTER_GAP: &str = " ";
+const DRAFT_SEPARATOR: &str = " | ";
 
 const CLOSE_CONTROL: StreamControl = StreamControl {
     label: ESC_LABEL,
@@ -83,6 +92,23 @@ const FOLLOW_UP_FOOTER: [StreamControl; 3] = [
         command: StreamCommand::Copy,
     },
     CLOSE_CONTROL,
+];
+const CLARIFICATION_FOOTER: [StreamControl; 3] = [
+    StreamControl {
+        label: ESC_LABEL,
+        hint: BACK_HINT,
+        command: StreamCommand::Close,
+    },
+    StreamControl {
+        label: SEND_LABEL,
+        hint: INITIAL_SEND_HINT,
+        command: StreamCommand::Send,
+    },
+    StreamControl {
+        label: CTRL_COPY_LABEL,
+        hint: COPY_HINT,
+        command: StreamCommand::Copy,
+    },
 ];
 
 /// What a finished side request cost. It reaches the session ledger through
@@ -275,6 +301,7 @@ pub struct StreamModal {
     open: bool,
     title: &'static str,
     footer: StreamFooter,
+    context: Option<String>,
     exchanges: Vec<Exchange>,
     ms_per_char: u64,
     input: TextField,
@@ -302,6 +329,7 @@ impl StreamModal {
             open: false,
             title: "",
             footer: StreamFooter::Close,
+            context: None,
             exchanges: Vec::new(),
             ms_per_char,
             input: TextField::new(FieldKind::Line),
@@ -333,6 +361,43 @@ impl StreamModal {
         self.begin_exchange(header, rx, cancel);
     }
 
+    pub(crate) fn open_clarification(&mut self, context: String) {
+        if !self.is_clarification() {
+            self.close();
+            self.title = CLARIFICATION_TITLE;
+            self.footer = StreamFooter::FollowUp;
+        }
+        self.context = Some(context);
+        self.open = true;
+    }
+
+    pub(crate) fn is_clarification(&self) -> bool {
+        self.context.is_some()
+    }
+
+    pub(crate) fn dismiss(&mut self) {
+        if !self.is_clarification() {
+            self.close();
+            return;
+        }
+        let _ = self.poll();
+        if self.is_streaming() {
+            self.stop();
+        }
+        if let Some(queued) = self.queued.take() {
+            let draft = self.input.text();
+            if draft.trim().is_empty() {
+                self.input.set_text(&queued);
+            } else if draft.trim() != queued {
+                self.input
+                    .set_text(&format!("{queued}{DRAFT_SEPARATOR}{draft}"));
+            }
+        }
+        self.open = false;
+        self.footer_hits.reset();
+        self.scrollbar = Scrollbar::default();
+    }
+
     /// Appends the next question to the thread and streams its answer under
     /// the ones before it. Replacing the trigger stops whatever was still in
     /// flight, so a caller that wants the previous answer waits for it first.
@@ -354,6 +419,7 @@ impl StreamModal {
     /// dismissed the modal still has to be billed.
     pub fn close(&mut self) {
         self.open = false;
+        self.context = None;
         self.exchanges.clear();
         self.input.clear();
         self.scroll.reset();
@@ -504,7 +570,7 @@ impl StreamModal {
                 .take_question()
                 .map_or(StreamAction::Consumed, StreamAction::Submit),
             StreamCommand::Close => {
-                self.close();
+                self.dismiss();
                 StreamAction::Consumed
             }
         }
@@ -525,7 +591,7 @@ impl StreamModal {
             return StreamAction::Consumed;
         }
         match key_event.code {
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Char(' ') => self.close(),
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char(' ') => self.dismiss(),
             KeyCode::Char('y') if self.footer == StreamFooter::Copy => {
                 return StreamAction::Copy(self.text());
             }
@@ -541,10 +607,10 @@ impl StreamModal {
     /// it stops anything.
     fn handle_follow_up_key(&mut self, key_event: KeyEvent) -> StreamAction {
         match key_event.code {
-            KeyCode::Esc => self.close(),
+            KeyCode::Esc => self.dismiss(),
             KeyCode::Enter => {
                 if self.input.text().trim().is_empty() {
-                    self.close();
+                    self.dismiss();
                 } else if let Some(question) = self.take_question() {
                     return StreamAction::Submit(question);
                 }
@@ -570,9 +636,10 @@ impl StreamModal {
     /// and leaves the thread that asked for it. With nothing running it
     /// dismisses.
     fn interrupt(&mut self) {
+        let _ = self.poll();
         match self.is_streaming() {
             true => self.stop(),
-            false => self.close(),
+            false => self.dismiss(),
         }
     }
 
@@ -598,6 +665,9 @@ impl StreamModal {
     }
 
     fn controls(&self) -> &'static [StreamControl] {
+        if self.is_clarification() {
+            return &CLARIFICATION_FOOTER;
+        }
         match self.footer {
             StreamFooter::Close => &CLOSE_FOOTER,
             StreamFooter::Copy => &COPY_FOOTER,
@@ -608,17 +678,38 @@ impl StreamModal {
     /// Each control is one phrase, key and gloss together, so the pointer
     /// marks and presses the whole of what it reads. The send control says
     /// which of the two things it does, because mid-stream it queues.
-    fn footer_line(&self) -> FooterLine {
+    fn footer_line(&self, width: u16) -> FooterLine {
         let theme = theme::current();
         let mut footer = FooterLine::default();
+        let contextual = self.is_clarification();
+        let gap = if contextual {
+            COMPACT_FOOTER_GAP
+        } else {
+            FOOTER_GAP
+        };
+        let mut used = 0;
         for (index, control) in self.controls().iter().enumerate() {
-            if index > 0 {
-                footer.text(FOOTER_GAP, theme.tool_dim);
-            }
             let hint = match control.command {
+                StreamCommand::Close
+                    if contextual
+                        && control.label.width() + BACK_HINT.width() > usize::from(width) =>
+                {
+                    COMPACT_BACK_HINT
+                }
+                StreamCommand::Send if contextual && self.is_streaming() => COMPACT_QUEUE_HINT,
+                StreamCommand::Send if contextual && !self.exchanges.is_empty() => {
+                    COMPACT_SEND_HINT
+                }
                 StreamCommand::Send if self.is_streaming() => QUEUE_HINT,
                 _ => control.hint,
             };
+            used += control.label.width() + hint.width() + usize::from(index > 0) * gap.width();
+            if contextual && used > usize::from(width) {
+                break;
+            }
+            if index > 0 {
+                footer.text(gap, theme.tool_dim);
+            }
             footer.command(control.label, theme.keybind_key);
             footer.describe(hint, theme.tool_dim);
         }
@@ -644,6 +735,14 @@ impl StreamModal {
         let padded_width = Modal::inner_width(area.width, WIDTH_PERCENT).saturating_sub(H_PAD * 2);
 
         let mut lines: Vec<Line> = Vec::new();
+        if let Some(context) = &self.context {
+            lines.extend(
+                context
+                    .lines()
+                    .map(|line| Line::styled(line.to_owned(), theme.tool_dim)),
+            );
+            lines.push(Line::default());
+        }
         for (index, exchange) in self.exchanges.iter_mut().enumerate() {
             if index > 0 {
                 lines.push(Line::default());
@@ -728,7 +827,7 @@ impl StreamModal {
         if let Some(input) = input {
             frame.render_widget(Paragraph::new(self.input_line(input.width)), input);
         }
-        let footer = self.footer_line();
+        let footer = self.footer_line(footer_row.width);
         self.footer_hits.set(footer.hits(footer_row, 0, 1));
         frame.render_widget(
             Paragraph::new(footer.line(self.footer_hits.hovered())),
@@ -788,6 +887,9 @@ impl StreamModal {
     fn placeholder(&self) -> Option<String> {
         match &self.queued {
             Some(question) => Some(format!("{QUEUED_PREFIX}{question}")),
+            None if !self.is_streaming() && self.is_clarification() => {
+                Some(CLARIFICATION_PLACEHOLDER.to_owned())
+            }
             None => self.is_streaming().then(|| WAITING_PLACEHOLDER.to_owned()),
         }
     }
@@ -862,6 +964,13 @@ mod tests {
     const CONTENT_MISSING: &str = "the streamed section must be visible";
     const STYLE_MISMATCH: &str = "the section must retain its own style";
     const REVEAL_MS_PER_CHAR: u64 = 20;
+    const CONTEXT: &str = "Choose a storage backend\nSQLite or PostgreSQL";
+    const UPDATED_CONTEXT: &str = "Choose a storage backend\nSQLite selected";
+    const DRAFT: &str = "Which is simpler?";
+    const NEWER_DRAFT: &str = "What about backups?";
+    const CLARIFICATION_BACK: usize = 0;
+    const CLARIFICATION_SEND: usize = 1;
+    const CLARIFICATION_COPY: usize = 2;
 
     fn open_modal(
         m: &mut StreamModal,
@@ -1884,5 +1993,294 @@ mod tests {
         draw(&mut m, &mut terminal);
         let settled = terminal.backend().to_string();
         assert!(settled.contains(SEND_HINT.trim()), "{settled}");
+    }
+
+    #[test_case(false ; "enter")]
+    #[test_case(true ; "footer")]
+    fn clarification_opens_an_idle_composer_and_submits_its_first_draft(by_click: bool) {
+        let mut m = StreamModal::new(0);
+        m.open_clarification(CONTEXT.into());
+        assert!(m.is_open() && m.is_clarification() && m.text_input_active());
+        assert!(!m.is_streaming());
+        assert!(m.exchanges.is_empty());
+        assert!(m.text().is_empty());
+        assert_eq!(m.cadence(), Cadence::IDLE);
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
+        draw(&mut m, &mut terminal);
+        let screen = terminal.backend().to_string();
+        for line in CONTEXT.lines() {
+            assert!(screen.contains(line));
+        }
+        assert!(screen.contains(CLARIFICATION_PLACEHOLDER));
+        assert!(screen.contains(&format!("{ESC_LABEL}{BACK_HINT}")));
+        assert!(screen.contains(&format!("{SEND_LABEL}{INITIAL_SEND_HINT}")));
+        let send = m.footer_hit(CLARIFICATION_SEND);
+        assert!(matches!(click(&mut m, send), StreamAction::Consumed));
+        assert!(m.is_open());
+        assert!(m.handle_paste(DRAFT));
+        let action = if by_click {
+            click(&mut m, send)
+        } else {
+            m.handle_key(key_ev(KeyCode::Enter))
+        };
+        assert!(matches!(action, StreamAction::Submit(question) if question == DRAFT));
+        assert!(m.input_text().is_empty());
+        assert!(m.is_open());
+        assert!(!m.is_streaming());
+    }
+
+    #[test]
+    fn clarification_resume_preserves_answers_draft_selection_and_scroll() {
+        const PARAGRAPHS: usize = 20;
+        const SCROLL_OFFSET: u16 = 3;
+        let mut m = StreamModal::new(0);
+        m.open_clarification(CONTEXT.into());
+        let (tx, _cancel) = follow_up(&mut m, HEADER);
+        let answer = format!("{ANSWER}\n\n").repeat(PARAGRAPHS);
+        tx.send(StreamEvent::TextDelta(answer.clone())).unwrap();
+        tx.send(done()).unwrap();
+        let _ = m.poll();
+        type_text(&mut m, DRAFT);
+        m.input.select_all();
+        let selection = m.input.selection();
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
+        draw(&mut m, &mut terminal);
+        m.scroll.scroll_to(SCROLL_OFFSET);
+        let offset = m.scroll.offset();
+        assert!(offset > 0);
+
+        m.dismiss();
+        assert!(!m.is_open() && m.is_clarification());
+        assert!(!m.text_input_active());
+        assert_eq!(m.cadence(), Cadence::IDLE);
+        assert!(!m.handle_paste(NEWER_DRAFT));
+        m.open_clarification(UPDATED_CONTEXT.into());
+        draw(&mut m, &mut terminal);
+        assert!(m.is_open());
+        assert_eq!(m.context.as_deref(), Some(UPDATED_CONTEXT));
+        assert_eq!(m.headers(), [HEADER]);
+        assert_eq!(m.text(), answer);
+        assert_eq!(m.input_text(), DRAFT);
+        assert_eq!(m.input.selection(), selection);
+        assert_eq!(m.scroll.offset(), offset);
+        assert!(matches!(
+            m.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            StreamAction::Copy(text) if text == DRAFT
+        ));
+        assert!(m.is_open());
+    }
+
+    #[test_case(KeyCode::Esc, KeyModifiers::NONE ; "esc")]
+    #[test_case(KeyCode::Enter, KeyModifiers::NONE ; "empty_enter")]
+    #[test_case(KeyCode::Char('c'), KeyModifiers::CONTROL ; "idle_ctrl_c")]
+    fn clarification_back_keys_retain_the_thread(code: KeyCode, modifiers: KeyModifiers) {
+        let mut m = StreamModal::new(0);
+        m.open_clarification(CONTEXT.into());
+        let (tx, _cancel) = follow_up(&mut m, HEADER);
+        tx.send(StreamEvent::TextDelta(ANSWER.into())).unwrap();
+        tx.send(done()).unwrap();
+        let _ = m.poll();
+        assert!(matches!(
+            m.handle_key(KeyEvent::new(code, modifiers)),
+            StreamAction::Consumed
+        ));
+        assert!(!m.is_open() && m.is_clarification());
+        assert_eq!(m.text(), ANSWER);
+    }
+
+    #[test_case(false ; "back")]
+    #[test_case(true ; "ctrl_c_then_back")]
+    fn clarification_stops_only_its_stream_and_retains_partial_sections(interrupt_first: bool) {
+        let mut m = StreamModal::new(0);
+        m.open_clarification(CONTEXT.into());
+        let (tx, cancel) = follow_up(&mut m, HEADER);
+        tx.send(StreamEvent::ThinkingDelta(THINKING.into()))
+            .unwrap();
+        tx.send(StreamEvent::TextDelta(ANSWER.into())).unwrap();
+        if interrupt_first {
+            let _ = m.poll();
+            m.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+            assert!(m.is_open());
+            assert!(!m.is_streaming());
+        }
+        m.dismiss();
+        assert!(cancel.is_cancelled());
+        assert!(!m.is_open() && !m.is_streaming() && m.is_clarification());
+        assert!(tx.send(StreamEvent::TextDelta(NEWER_DRAFT.into())).is_err());
+        assert_eq!(m.text(), format!("{ANSWER}{STOPPED_NOTE}"));
+        assert!(m.take_done().is_none());
+        assert_eq!(m.cadence(), Cadence::IDLE);
+        m.open_clarification(CONTEXT.into());
+        assert!(matches!(m.exchanges[0].outcome, ExchangeOutcome::Stopped));
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT * 2)).unwrap();
+        draw(&mut m, &mut terminal);
+        assert_text_style(&terminal, THINKING, theme::current().thinking);
+        assert_text_style(&terminal, ANSWER, theme::current().assistant);
+    }
+
+    #[test_case("", false ; "queued_only_stopped")]
+    #[test_case(NEWER_DRAFT, false ; "newer_draft_stopped")]
+    #[test_case(DRAFT, false ; "duplicate_draft_stopped")]
+    #[test_case("", true ; "queued_only_done")]
+    #[test_case(NEWER_DRAFT, true ; "newer_draft_done")]
+    fn clarification_dismiss_returns_queued_input_to_an_editable_draft(
+        draft: &str,
+        completed: bool,
+    ) {
+        let mut m = StreamModal::new(0);
+        m.open_clarification(CONTEXT.into());
+        let (tx, _cancel) = follow_up(&mut m, HEADER);
+        type_text(&mut m, DRAFT);
+        assert!(matches!(
+            m.handle_key(key_ev(KeyCode::Enter)),
+            StreamAction::Consumed
+        ));
+        type_text(&mut m, draft);
+        if completed {
+            tx.send(done()).unwrap();
+        }
+        m.dismiss();
+        let expected = if draft.is_empty() || draft == DRAFT {
+            DRAFT.to_owned()
+        } else {
+            format!("{DRAFT}{DRAFT_SEPARATOR}{draft}")
+        };
+        assert_eq!(m.input_text(), expected);
+        assert!(m.take_queued().is_none());
+        assert_eq!(m.take_done().is_some(), completed);
+        m.open_clarification(CONTEXT.into());
+        assert!(matches!(
+            m.handle_key(key_ev(KeyCode::Enter)),
+            StreamAction::Submit(question) if question == expected
+        ));
+    }
+
+    #[test_case(false, false ; "back_done_waiting_in_receiver")]
+    #[test_case(true, false ; "back_done_already_polled")]
+    #[test_case(false, true ; "interrupt_done_waiting_in_receiver")]
+    #[test_case(true, true ; "interrupt_done_already_polled")]
+    fn clarification_dismiss_preserves_completion_usage_and_answer(
+        already_polled: bool,
+        interrupt: bool,
+    ) {
+        let mut m = StreamModal::new(REVEAL_MS_PER_CHAR);
+        m.open_clarification(CONTEXT.into());
+        let (tx, _cancel) = follow_up(&mut m, HEADER);
+        tx.send(StreamEvent::TextDelta(ANSWER.into())).unwrap();
+        tx.send(done()).unwrap();
+        if already_polled {
+            let _ = m.poll();
+        }
+        if interrupt {
+            m.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        } else {
+            m.dismiss();
+        }
+        assert_eq!(m.text(), ANSWER);
+        assert!(matches!(m.exchanges[0].outcome, ExchangeOutcome::Done));
+        assert_eq!(m.cadence(), Cadence::IDLE);
+        m.open_clarification(CONTEXT.into());
+        let outcome = m.take_done().unwrap();
+        assert_eq!(outcome.answer.as_deref(), Some(ANSWER));
+        assert_eq!(outcome.usage.model, MODEL);
+        assert_eq!(outcome.usage.cost, Some(0.5));
+        assert_eq!(outcome.usage.usage.input, 10);
+        assert!(m.take_done().is_none());
+    }
+
+    #[test]
+    fn clarification_copy_excludes_context_and_thinking() {
+        let mut m = StreamModal::new(0);
+        m.open_clarification(CONTEXT.into());
+        let (tx, _cancel) = follow_up(&mut m, HEADER);
+        tx.send(StreamEvent::ThinkingDelta(THINKING.into()))
+            .unwrap();
+        tx.send(StreamEvent::TextDelta(ANSWER.into())).unwrap();
+        tx.send(done()).unwrap();
+        let _ = m.poll();
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT * 2)).unwrap();
+        draw(&mut m, &mut terminal);
+        assert_text_style(&terminal, THINKING, theme::current().thinking);
+        assert!(
+            terminal
+                .backend()
+                .to_string()
+                .contains(CONTEXT.lines().next().unwrap())
+        );
+        assert!(
+            terminal
+                .backend()
+                .to_string()
+                .contains(COMPACT_SEND_HINT.trim())
+        );
+        assert_eq!(m.text(), ANSWER);
+        let copy = m.footer_hit(CLARIFICATION_COPY);
+        assert!(copy.width > 0);
+        assert!(matches!(click(&mut m, copy), StreamAction::Copy(text) if text == ANSWER));
+        assert!(matches!(
+            m.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)),
+            StreamAction::Copy(text) if text == ANSWER
+        ));
+    }
+
+    #[test_case(22, COMPACT_BACK_HINT ; "compact_back")]
+    #[test_case(32, BACK_HINT ; "back_only")]
+    #[test_case(WIDTH, BACK_HINT ; "full_footer")]
+    fn clarification_footer_keeps_back_clickable_on_narrow_screens(width: u16, hint: &str) {
+        let mut m = StreamModal::new(0);
+        m.open_clarification(CONTEXT.into());
+        type_text(&mut m, DRAFT);
+        let mut terminal = Terminal::new(TestBackend::new(width, HEIGHT)).unwrap();
+        draw(&mut m, &mut terminal);
+        assert!(
+            terminal
+                .backend()
+                .to_string()
+                .contains(&format!("{ESC_LABEL}{hint}"))
+        );
+        let back = m.footer_hit(CLARIFICATION_BACK);
+        assert_eq!(usize::from(back.width), ESC_LABEL.width() + hint.width());
+        assert!(matches!(click(&mut m, back), StreamAction::Consumed));
+        assert!(!m.is_open() && m.is_clarification());
+        assert_eq!(m.input_text(), DRAFT);
+    }
+
+    #[test_case(StreamFooter::Close ; "plain")]
+    #[test_case(StreamFooter::Copy ; "extract")]
+    #[test_case(StreamFooter::FollowUp ; "ordinary_btw")]
+    fn ordinary_open_and_dismiss_remain_destructive(footer: StreamFooter) {
+        let mut m = StreamModal::new(0);
+        m.open_clarification(CONTEXT.into());
+        type_text(&mut m, DRAFT);
+        let (tx, cancel) = open_modal(&mut m, HEADER, footer);
+        assert!(!m.is_clarification());
+        assert!(m.input_text().is_empty());
+        tx.send(StreamEvent::TextDelta(ANSWER.into())).unwrap();
+        let _ = m.poll();
+        assert_eq!(m.text(), ANSWER);
+        m.dismiss();
+        assert!(cancel.is_cancelled());
+        assert!(!m.is_open() && !m.is_clarification());
+        assert!(m.exchanges.is_empty());
+        assert!(m.text().is_empty());
+    }
+
+    #[test]
+    fn hard_close_clears_retained_clarification_identity_and_content() {
+        let mut m = StreamModal::new(0);
+        m.open_clarification(CONTEXT.into());
+        let (tx, _cancel) = follow_up(&mut m, HEADER);
+        tx.send(StreamEvent::TextDelta(ANSWER.into())).unwrap();
+        tx.send(done()).unwrap();
+        type_text(&mut m, DRAFT);
+        m.dismiss();
+        m.close();
+        assert!(!m.is_clarification());
+        assert!(m.text().is_empty());
+        assert!(m.input_text().is_empty());
+        assert!(m.take_done().is_some());
+        m.open_clarification(UPDATED_CONTEXT.into());
+        assert!(m.exchanges.is_empty());
+        assert!(!m.is_streaming());
     }
 }

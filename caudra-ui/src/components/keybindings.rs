@@ -175,6 +175,11 @@ pub mod key {
         modifiers: KeyModifiers::NONE,
         label: "F1",
     };
+    pub const QUESTION_ASK_BTW: Bind = Bind {
+        code: KeyCode::F(2),
+        modifiers: KeyModifiers::NONE,
+        label: "F2",
+    };
     pub const COMMAND_PALETTE: Bind = ctrl_bind!('p');
     pub const SCROLL_HALF_UP: Bind = ctrl_bind!('u');
     /// Text fields take plain, Ctrl, Super and Shift arrows, and Alt cannot be
@@ -1002,6 +1007,11 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Alt("↑", "↓"),
         description: "Navigate options",
+        context: KeybindContext::FormInput,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::QUESTION_ASK_BTW.label),
+        description: "Ask /btw about a pending main-agent question without answering it",
         context: KeybindContext::FormInput,
     },
     Keybind {

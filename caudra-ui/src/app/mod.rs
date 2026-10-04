@@ -1564,6 +1564,10 @@ impl App {
                     self.peer_manager.handle_paste(&text);
                     return vec![];
                 }
+                if self.stream_modal.is_open() {
+                    self.stream_modal.handle_paste(&text);
+                    return vec![];
+                }
                 if self.session_relocation_picker.is_open()
                     || self.worktree_picker.is_open()
                     || self.logs_modal.is_open()
@@ -1572,8 +1576,14 @@ impl App {
                     self.route_text_paste(&text);
                     return vec![];
                 }
-                if self.workbench.is_open() && self.workbench.paste(&text) {
-                    return vec![];
+                if self.workbench.is_open() {
+                    if self.question_form.is_open() {
+                        self.question_form.handle_paste(&text);
+                        return vec![];
+                    }
+                    if self.workbench.paste(&text) {
+                        return vec![];
+                    }
                 }
                 if self.paste_editor.handle_paste(&text) {
                     return vec![];
@@ -1627,10 +1637,15 @@ impl App {
     /// is parked on. A dismissal is an unparseable reply by design: the tool
     /// reads anything it cannot make answers of as "the user declined".
     fn handle_question_form_action(&mut self, action: QuestionFormAction) -> Vec<Action> {
-        let answered = !matches!(
+        let answered = matches!(
             action,
-            QuestionFormAction::Consumed | QuestionFormAction::Copy(_)
+            QuestionFormAction::Submit(_)
+                | QuestionFormAction::Dismiss
+                | QuestionFormAction::Cancel
         );
+        if answered {
+            self.discard_question_btw();
+        }
         if answered
             && self
                 .task_interactions
@@ -1648,6 +1663,10 @@ impl App {
         }
         let reply = match action {
             QuestionFormAction::Consumed => return Vec::new(),
+            QuestionFormAction::AskBtw => {
+                self.open_question_btw();
+                return Vec::new();
+            }
             QuestionFormAction::Copy(text) => {
                 self.copy_to_clipboard(&text);
                 return Vec::new();
@@ -1717,12 +1736,12 @@ impl App {
             }
             return None;
         }
-        if self.question_form.is_open() && self.question_form.contains(pos) {
-            self.question_form.scroll(delta);
-            return None;
-        }
         if self.stream_modal.is_open() {
             self.stream_modal.scroll(delta);
+            return None;
+        }
+        if self.question_form.is_open() && self.question_form.contains(pos) {
+            self.question_form.scroll(delta);
             return None;
         }
         if self.help_modal.is_open() {
@@ -4832,6 +4851,7 @@ impl App {
         // A subagent's question routes back through that subagent's own
         // answer channel, so the form remembers which chat asked.
         if let ChatEventResult::Question(event) = result {
+            self.discard_question_btw();
             self.question_form.open(event.questions);
             self.question_subagent = subagent_id;
             return vec![];
@@ -5798,6 +5818,7 @@ impl App {
     pub fn close_all_overlays(&mut self) {
         self.pending_plan_submission = None;
         self.suspend_permission_editor();
+        self.close_stream_modal();
         self.overlays_mut().iter_mut().for_each(|o| o.close());
     }
 
@@ -6148,38 +6169,49 @@ impl App {
     /// evaluator. It deliberately leaves `context_size` alone: the request
     /// never enters history.
     fn tick_stream_modal(&mut self) -> Dirty {
-        let dirty = self.stream_modal.poll();
-        if let Some(done) = self.stream_modal.take_done() {
-            let spend = done.usage;
-            self.state.token_usage += spend.usage;
-            self.add_session_spend(spend.cost, spend.billing);
-            add_chat_spend(self.main_chat(), spend.cost, spend.billing);
-            self.record_model_usage(
-                &spend.provider,
-                &spend.model,
-                spend.purpose,
-                spend.usage,
-                spend.cost,
-                spend.billing,
-            );
-            self.state
-                .goal
-                .record_external_usage(spend.usage, spend.cost, spend.billing);
-            // Only a `/btw` has a thread, so the answer is its own to keep.
-            self.settle_btw(done.answer);
-            // The answered exchange is filed first, so a question queued while
-            // it streamed extends the thread rather than replacing it.
-            if let Some(question) = self.stream_modal.take_queued()
-                && self.btw_thread.is_some()
-            {
-                self.continue_btw(question);
-            }
+        if self.stream_modal.is_clarification() && !self.question_form.is_open() {
+            self.discard_question_btw();
+            return Dirty::YES;
         }
-        if self.btw_thread.is_some() && !self.stream_modal.is_open() {
+        let dirty = self.stream_modal.poll();
+        if self.settle_stream_modal()
+            && self.stream_modal.is_open()
+            && let Some(question) = self.stream_modal.take_queued()
+            && self.btw_thread.is_some()
+        {
+            self.continue_btw(question);
+        }
+        if self.btw_thread.is_some()
+            && !self.stream_modal.is_open()
+            && !self.stream_modal.is_clarification()
+        {
             self.end_btw_thread();
             return Dirty::YES;
         }
         dirty
+    }
+
+    fn settle_stream_modal(&mut self) -> bool {
+        let Some(done) = self.stream_modal.take_done() else {
+            return false;
+        };
+        let spend = done.usage;
+        self.state.token_usage += spend.usage;
+        self.add_session_spend(spend.cost, spend.billing);
+        add_chat_spend(self.main_chat(), spend.cost, spend.billing);
+        self.record_model_usage(
+            &spend.provider,
+            &spend.model,
+            spend.purpose,
+            spend.usage,
+            spend.cost,
+            spend.billing,
+        );
+        self.state
+            .goal
+            .record_external_usage(spend.usage, spend.cost, spend.billing);
+        self.settle_btw(done.answer);
+        true
     }
 
     /// What moves with the clock alone; changes that come from arriving data

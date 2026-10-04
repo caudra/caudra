@@ -1606,6 +1606,7 @@ impl App {
 
     fn retire_current_session(&mut self) -> Result<(), caudra_storage::sessions::SessionError> {
         self.release_revert_confirmation();
+        self.close_stream_modal();
         self.checkpoint_now();
         if self.has_content() {
             self.storage_writer

@@ -129,6 +129,7 @@ These keys work the same in every text field: the composer, a picker's filter, f
 | Key | Action |
 |-----|--------|
 | `↑` / `↓` | Navigate options |
+| `F2` | Ask /btw about a pending main-agent question without answering it |
 | `Enter` | Select option |
 | `Esc` | Close |
 
