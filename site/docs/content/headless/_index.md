@@ -57,7 +57,7 @@ Same JSON fields, same `--output-format` options, same `--verbose` behavior. Scr
 
 ## Cross-session messaging
 
-A local one-shot `--print` run on Unix can participate in [experimental cross-session messaging](/docs/sessions/#cross-session-messaging) while its main agent is active. Enable `experimental.cross_session_messaging = true` in the global `caudra.toml` before starting it. Every participating process needs the opt-in and a restart after changing the switch.
+A local one-shot `--print` run on Unix can participate in [experimental cross-session messaging](/docs/messaging/) while its main agent is active. Enable `experimental.cross_session_messaging = true` in the global `caudra.toml` before starting it. Every participating process needs the opt-in and a restart after changing the switch.
 
 Messages enter only at safe boundaries during the active run. Print does not stay alive waiting for peers or start another run after its final result. Held messages have no interactive approval path, and queued or held messages still in memory disappear when the receiving run closes. A `queued` receipt is not a promise that the model will process the message before exit. Use the TUI's `/messages` review when you need interactive approval.
 

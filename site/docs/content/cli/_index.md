@@ -43,7 +43,7 @@ Labels are partial evidence, not a complete evaluation dataset. Tool-search actu
 
 ## caudra message
 
-Sends and reads [cross-session messages](/docs/sessions/#messages-from-scripts) from scripts. It needs `experimental.cross_session_messaging`, runs on Linux and macOS, and does not start an agent:
+Sends and reads [cross-session messages](/docs/messaging/#messages-from-scripts) from scripts. It needs `experimental.cross_session_messaging`, runs on Linux and macOS, and does not start an agent:
 
 ```bash
 caudra message publish --topic ci.failures "Build 1042 failed"
@@ -52,14 +52,14 @@ caudra message send --to @ci-watcher < report.txt
 caudra message log --topic 'ci.*' --limit 50 --json
 ```
 
-`publish` sends to the live sessions subscribed to one concrete topic. `broadcast` sends to the live sessions that opted in to broadcasts. Both reach at most `max_fanout` sessions, and the receipt counts the rest as skipped. `send` sends to the live session that holds a [messaging name](/docs/sessions/#messaging-names), given with or without its `@`. The text is the last argument. Without it, the command reads stdin, which must not be a terminal. The text must be UTF-8 within 32 KiB, and one trailing line ending on stdin is dropped.
+`publish` sends to the live sessions subscribed to one concrete topic. `broadcast` sends to the live sessions that opted in to broadcasts. Both reach at most `max_fanout` sessions, and the receipt counts the rest as skipped. `send` sends to the live session that holds a [messaging name](/docs/messaging/#messaging-names), given with or without its `@`. The text is the last argument. Without it, the command reads stdin, which must not be a terminal. The text must be UTF-8 within 32 KiB, and one trailing line ending on stdin is dropped.
 
 | Flag | Description |
 |------|-------------|
 | `--from <LABEL>` | The sender name recipients see, `script` by default. Rate limits and duplicate checks count each label as one sender |
 | `--json` | Print the receipt as one JSON object |
 
-Each send prints a receipt with one line per recipient and its [delivery status](/docs/sessions/#delivery-receipts-and-lifetime). `publish` and `broadcast` exit 0 once the message is recorded, even when no live session receives it. A recorded topic message still serves catch-up. `send` exits 1 unless the recipient queued or held the message. Usage errors exit 2. Other failures exit 1, such as a disabled experiment, an unknown name, or a history that cannot record the message.
+Each send prints a receipt with one line per recipient and its [delivery status](/docs/messaging/#delivery-receipts-and-lifetime). `publish` and `broadcast` exit 0 once the message is recorded, even when no live session receives it. A recorded topic message still serves catch-up. `send` exits 1 unless the recipient queued or held the message. Usage errors exit 2. Other failures exit 1, such as a disabled experiment, an unknown name, or a history that cannot record the message.
 
 `log` prints recorded messages oldest first, the newest 20 by default:
 
@@ -119,9 +119,9 @@ The filters exclude each other. Without one, `log` prints messages of every kind
 | `--yolo` | Skip permission prompts on gated tools (alias: `--dangerously-skip-permissions`). Deny rules still apply |
 | `--auto` | Start in [Auto mode](/docs/permissions/#auto-mode). Needs `experimental.decision_engine`. Cannot be combined with `--yolo` |
 | `--exit-on-done` | Exit when the agent finishes (TUI automation wrappers) |
-| `--name <NAME>` | Claim a unique [messaging name](/docs/sessions/#messaging-names) for the initial TUI session. Needs `experimental.cross_session_messaging` |
-| `--topic <PATTERN>` | Subscribe the initial TUI session to a [topic pattern](/docs/sessions/#topics-and-broadcasts), in addition to its saved ones (repeatable). Needs `experimental.cross_session_messaging` |
-| `--receive-broadcasts` | Opt the initial TUI session in to [broadcasts](/docs/sessions/#topics-and-broadcasts). Needs `experimental.cross_session_messaging` |
+| `--name <NAME>` | Claim a unique [messaging name](/docs/messaging/#messaging-names) for the initial TUI session. Needs `experimental.cross_session_messaging` |
+| `--topic <PATTERN>` | Subscribe the initial TUI session to a [topic pattern](/docs/messaging/#topics-and-broadcasts), in addition to its saved ones (repeatable). Needs `experimental.cross_session_messaging` |
+| `--receive-broadcasts` | Opt the initial TUI session in to [broadcasts](/docs/messaging/#topics-and-broadcasts). Needs `experimental.cross_session_messaging` |
 | `--allowed-tools <LIST>` | Comma-separated allow list (PascalCase or snake_case) |
 | `--disallowed-tools <LIST>` | Comma-separated deny list |
 | `--system-prompt-profile <NAME>` | Select a profile from the user `system-prompts` config directory. See [System Prompt Profiles](/docs/system-prompts/) |

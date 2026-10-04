@@ -49,20 +49,22 @@ A user-created fork starts with no conversation grants and no inherited explicit
 
 ## Cross-session messages
 
-[Cross-session messaging](/docs/sessions/#cross-session-messaging) needs the global experimental opt-in in every participating process. Tool permission rules cannot enable it. `send_message` and `publish_message` are side effects subject to outgoing authorization. Rules can treat them differently, because one publication can reach many sessions and wake each of them. ReadOnly sessions cannot send or publish. Plan sessions ask before either unless [YOLO mode](#yolo-mode) is on.
+[Cross-session messaging](/docs/messaging/) needs the global experimental opt-in in every participating process. Tool permission rules cannot enable it. `send_message` and `publish_message` are side effects subject to outgoing authorization. Rules can treat them differently, because one publication can reach many sessions and wake each of them. ReadOnly sessions cannot send or publish. Plan sessions ask before either unless [YOLO mode](#yolo-mode) is on.
 
 Receiving has a separate policy under `[agent.messaging]`:
 
 | `inbound` | Behavior |
 |---|---|
-| `auto` (default) | Automatic delivery only between Ask-mode sessions with matching Build or Plan mode and the same canonical local working directory. Other cases are held, including every message from a [script](/docs/sessions/#messages-from-scripts) |
-| `accept` | Automatic delivery from any local session or script, subject to [rate limits](/docs/sessions/#rate-limits-and-cost). Messages can start billable turns |
+| `auto` (default) | Automatic delivery only between Ask-mode sessions with matching Build or Plan mode and the same canonical local working directory. Other cases are held, including every message from a [script](/docs/messaging/#messages-from-scripts) |
+| `accept` | Automatic delivery from any local session or script, subject to [rate limits](/docs/messaging/#rate-limits-and-cost). Messages can start billable turns |
 | `hold` | Requires local approval before delivery |
 | `refuse` | Rejects incoming messages |
 
 Project configuration may only tighten the effective policy, in the order `accept < auto < hold < refuse`. A user-controlled session setting can replace a global default, including choosing `accept` over `auto`, but cannot relax an explicit project restriction. `/messages` provides review and session policy controls. Approving held content does not approve tool actions it requests, and manual approval cannot override project refusal.
 
-The same policy limits what `read_topic` returns from the [message history](/docs/sessions/#message-history). Under `auto`, stored messages from senders outside the automatic cohort are counted without their text. Under `hold` or `refuse`, the agent cannot read the history. Reading is free of side effects, so it needs no outgoing authorization.
+The policy treats direct messages, topic messages, and broadcasts alike. Subscriptions decide which publications reach a session at all, and the policy then decides whether each one waits for review. Rate limits are the only volume control. Two sessions that deliver to each other automatically can keep starting billable turns until you press Esc in either one. See [rate limits and cost](/docs/messaging/#rate-limits-and-cost).
+
+The same policy limits what `read_topic` returns from the [message history](/docs/messaging/#message-history). Under `auto`, stored messages from senders outside the automatic cohort are counted without their text. Under `hold` or `refuse`, the agent cannot read the history. Reading is free of side effects, so it needs no outgoing authorization.
 
 The history keeps every message as plain text, direct messages included. File permissions keep other users out, but any program running as your user can read it, for example with [`caudra message log`](/docs/cli/#caudra-message).
 
