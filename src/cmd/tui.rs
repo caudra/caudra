@@ -79,6 +79,9 @@ const RELOCATION_DESTINATION_CHANGED: &str =
 const RELOCATION_ROLLBACK_FAILED: &str =
     "Could not restore the original working directory; the UI was not restarted";
 const PROJECT_ENV_PATH: &str = ".caudra/.env";
+const MESSAGING_UNAVAILABLE: &str = "Cross-session messaging unavailable";
+const NAME_NEEDS_LOCAL_MESSAGING: &str =
+    "--name needs cross-session messaging, which only local sessions support";
 const RELOCATION_ENV_RESTART: &str =
     "Run caudra --continue from the destination to load its environment safely";
 const RELOCATION_USAGE_UNCHANGED: &str = "Historical project usage attribution was left unchanged";
@@ -813,6 +816,17 @@ fn project_env_present(cwd: &Path) -> bool {
     }
 }
 
+/// Holds `name` for the session before the UI starts, so a conflict stops
+/// startup instead of leaving scripts to address an unnamed session.
+fn reserve_launch_name(host: &PeerHost, session: &mut AppSession, name: &str) -> Result<()> {
+    smol::block_on(host.reserve_handle(session.id, name)).map_err(|error| eyre!(error))?;
+    session.meta.peer_controls.get_or_insert_default().handle = Some(name.to_owned());
+    if setup::session_history_head(session).is_none() {
+        session.set_title_if_auto(name.to_owned());
+    }
+    Ok(())
+}
+
 fn relocation_moves_live_tabs(tabs: &[SessionTab], request: &SessionRelocation) -> bool {
     tabs.iter().any(|tab| {
         request
@@ -1530,12 +1544,21 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
     } else {
         match PeerHost::start(cli.startup.features) {
             Ok(host) => host.map(Arc::new),
+            Err(error) if cli.name.is_some() => {
+                return Err(eyre!("{MESSAGING_UNAVAILABLE}: {error}"));
+            }
             Err(error) => {
-                warnings.push(format!("Cross-session messaging unavailable: {error}"));
+                warnings.push(format!("{MESSAGING_UNAVAILABLE}: {error}"));
                 None
             }
         }
     };
+    if let Some(name) = &cli.name {
+        let host = peer_host
+            .as_deref()
+            .ok_or_else(|| eyre!(NAME_NEEDS_LOCAL_MESSAGING))?;
+        reserve_launch_name(host, &mut tabs[focused].session, name)?;
+    }
 
     loop {
         let runtime_cwd = if workcell_runtime.is_remote() {
@@ -3885,5 +3908,81 @@ mod tests {
                 .iter()
                 .any(|tool| tool == "shell")
         );
+    }
+
+    #[cfg(unix)]
+    mod launch_name {
+        use std::fs::Permissions;
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::Path;
+        use std::sync::Arc;
+
+        use caudra_agent::History;
+        use caudra_agent::peers::PeerHost;
+        use caudra_providers::Message;
+        use caudra_ui::AppSession;
+        use tempfile::{Builder, TempDir};
+        use test_case::test_case;
+
+        use super::super::reserve_launch_name;
+        use super::{TEST_CWD, TEST_MODEL};
+
+        const LAUNCH_NAME: &str = "ci-watcher";
+        const RESUMED_PROMPT: &str = "Fix the parser";
+        const PRIVATE_MODE: u32 = 0o700;
+        /// Short enough that peer socket paths fit the Unix limit.
+        const PEER_PARENT: &str = "/tmp";
+
+        fn peer_directory() -> TempDir {
+            Builder::new()
+                .permissions(Permissions::from_mode(PRIVATE_MODE))
+                .tempdir_in(Path::new(PEER_PARENT).canonicalize().unwrap())
+                .unwrap()
+        }
+
+        fn peer_host(directory: &TempDir) -> PeerHost {
+            PeerHost::start_in(directory.path().to_owned(), Arc::default()).unwrap()
+        }
+
+        #[test_case(false; "new_session")]
+        #[test_case(true; "resumed_session")]
+        fn launch_name_is_saved_and_titles_only_a_new_session(resumed: bool) {
+            let directory = peer_directory();
+            let mut session = AppSession::new(TEST_MODEL, TEST_CWD);
+            if resumed {
+                session.replace_messages(
+                    History::new(vec![Message::user(RESUMED_PROMPT.into())]).into_items(),
+                );
+            }
+            let title = session.title.clone();
+            reserve_launch_name(&peer_host(&directory), &mut session, LAUNCH_NAME).unwrap();
+            assert_eq!(
+                session
+                    .meta
+                    .peer_controls
+                    .as_ref()
+                    .and_then(|controls| controls.handle.as_deref()),
+                Some(LAUNCH_NAME)
+            );
+            assert_eq!(
+                session.title,
+                if resumed { title } else { LAUNCH_NAME.into() }
+            );
+        }
+
+        #[test]
+        fn launch_name_conflict_stops_startup_before_naming_the_session() {
+            let directory = peer_directory();
+            let holder_host = peer_host(&directory);
+            let mut holder = AppSession::new(TEST_MODEL, TEST_CWD);
+            reserve_launch_name(&holder_host, &mut holder, LAUNCH_NAME).unwrap();
+            let mut session = AppSession::new(TEST_MODEL, TEST_CWD);
+            let title = session.title.clone();
+            let error =
+                reserve_launch_name(&peer_host(&directory), &mut session, LAUNCH_NAME).unwrap_err();
+            assert!(error.to_string().contains(LAUNCH_NAME), "{error}");
+            assert_eq!(session.meta.peer_controls, None);
+            assert_eq!(session.title, title);
+        }
     }
 }

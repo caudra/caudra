@@ -322,6 +322,8 @@ pub struct PeerMessageOrigin {
     pub message_id: String,
     pub sender_session_id: String,
     pub sender_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_handle: Option<String>,
     pub reply_target: String,
     pub reply_to: Option<String>,
 }
@@ -449,6 +451,7 @@ impl Message {
              message_id: {}\n\
              sender_session_id: {}\n\
              sender_name: {}\n\
+             sender_handle: {}\n\
              reply_target: {}\n\
              reply_to: {}\n\
              body: {}\n\
@@ -456,6 +459,7 @@ impl Message {
             peer_literal(json!(origin.message_id)),
             peer_literal(json!(origin.sender_session_id)),
             peer_literal(json!(origin.sender_name)),
+            peer_literal(json!(origin.sender_handle)),
             peer_literal(json!(origin.reply_target)),
             peer_literal(json!(origin.reply_to)),
             peer_literal(json!(text)),
@@ -1301,6 +1305,7 @@ mod tests {
                 message_id: PEER_ATTACK.into(),
                 sender_session_id: PEER_ATTACK.into(),
                 sender_name: PEER_ATTACK.into(),
+                sender_handle: Some(PEER_ATTACK.into()),
                 reply_target: PEER_ATTACK.into(),
                 reply_to: Some(PEER_ATTACK.into()),
             };
@@ -1315,16 +1320,21 @@ mod tests {
         assert_peer_framing(message.first_text_content().unwrap(), text, &origin);
     }
 
-    #[test_case(true ; "reply")]
-    #[test_case(false ; "new_message")]
-    fn peer_observation_serde_preserves_provenance(reply: bool) {
+    #[test_case(true ; "named_reply")]
+    #[test_case(false ; "unnamed_new_message")]
+    fn peer_observation_serde_preserves_provenance(named_reply: bool) {
         let mut origin = peer_message_origin();
-        if !reply {
+        if !named_reply {
             origin.reply_to = None;
+            origin.sender_handle = None;
         }
         let message = Message::peer_observation(PEER_TEXT.into(), origin.clone());
         let encoded = serde_json::to_value(&message).unwrap();
         assert_eq!(encoded["peer_event"], json!(origin));
+        assert_eq!(
+            encoded["peer_event"].get("sender_handle").is_some(),
+            named_reply
+        );
         let decoded: Message = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded.peer_event, Some(origin.clone()));
         assert_peer_framing(decoded.first_text_content().unwrap(), PEER_TEXT, &origin);

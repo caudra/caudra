@@ -306,6 +306,9 @@ fn require_requested_features(cli: &Cli) -> Result<(), FeatureDisabled> {
     if cli.auto || cli.permission_mode.as_deref() == Some(AUTO_PERMISSION_MODE) {
         features.require(Feature::DecisionEngine)?;
     }
+    if cli.name.is_some() {
+        features.require(Feature::CrossSessionMessaging)?;
+    }
     match &cli.command {
         Some(
             Command::Sandbox { .. }
@@ -493,7 +496,7 @@ mod tests {
     use std::sync::Arc;
 
     use caudra_agent::tools::ToolRegistry;
-    use caudra_config::{Feature, FeatureFlags, RawConfig};
+    use caudra_config::{Feature, FeatureDisabled, FeatureFlags, RawConfig};
     use caudra_storage::sessions::PermissionMode;
     use clap::Parser;
     use tempfile::TempDir;
@@ -501,11 +504,12 @@ mod tests {
 
     use super::{
         INIT_LUA_SKIPPED, Result, auto_notice, cli_plugin_host, load_config, load_settings,
-        permission_mode_seed, settings_notices,
+        permission_mode_seed, require_requested_features, settings_notices,
     };
     use crate::cli::Cli;
     use crate::startup::Startup;
 
+    const MESSAGING_NAME: &str = "ci-watcher";
     const GLOBAL_TOML: &str = "config/caudra.toml";
     const GLOBAL_LUA: &str = "config/init.lua";
     const PROJECT_TOML: &str = "project/.caudra/caudra.toml";
@@ -641,6 +645,19 @@ mod tests {
         assert_eq!(config.permissions.decision_engine, !noticed);
         assert_eq!(permission_mode_seed(&config), PermissionMode::Auto);
         assert_eq!(auto_notice(&config).is_some(), noticed);
+    }
+
+    #[test_case(FeatureFlags::NONE, false; "experiment_off")]
+    #[test_case(FeatureFlags::NONE.with(Feature::CrossSessionMessaging), true; "experiment_on")]
+    fn messaging_name_requires_the_experiment(features: FeatureFlags, allowed: bool) {
+        let mut cli = Cli::parse_from(["caudra", "--name", MESSAGING_NAME]);
+        cli.startup.features = features;
+        assert_eq!(
+            require_requested_features(&cli)
+                .err()
+                .map(|FeatureDisabled(feature)| feature),
+            (!allowed).then_some(Feature::CrossSessionMessaging)
+        );
     }
 
     #[test_case(false, false, PermissionMode::Ask; "default_ask")]

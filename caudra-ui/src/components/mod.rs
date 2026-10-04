@@ -85,7 +85,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use caudra_agent::AgentInput;
-use caudra_agent::peers::{PeerDecision, PeerReviewToken};
+use caudra_agent::peers::{PeerDecision, PeerReviewToken, handle_address};
 use caudra_agent::tools::native::plan::PlanTarget;
 use caudra_agent::tools::{SHELL_TOOL_NAME, ToolEffect};
 use caudra_agent::worktree::Request as WorktreeRequest;
@@ -1226,8 +1226,13 @@ impl DisplayMessage {
             })
             .collect::<Vec<_>>()
             .join("\n");
+        let name = origin
+            .sender_handle
+            .as_deref()
+            .map(|handle| format!("Name: {:?}\n", handle_address(handle)))
+            .unwrap_or_default();
         let text = format!(
-            "Peer: {:?}\nMessage: {:?}\nSender session: {:?}\nReply target: {:?}\n\n{safe_body}",
+            "Peer: {:?}\n{name}Message: {:?}\nSender session: {:?}\nReply target: {:?}\n\n{safe_body}",
             origin.sender_name, origin.message_id, origin.sender_session_id, origin.reply_target,
         );
         Self::new(DisplayRole::PeerMessage(Box::new(origin)), text)

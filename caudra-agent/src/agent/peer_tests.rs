@@ -104,7 +104,7 @@ mod peer_tests {
                 .await
                 .unwrap()
                 .into_iter()
-                .find(|peer| peer.name == PEER_RECEIVER)
+                .find(|peer| peer.title == PEER_RECEIVER)
                 .expect(PEER_MISSING)
                 .target;
             let reply_target = receiver
@@ -112,7 +112,7 @@ mod peer_tests {
                 .await
                 .unwrap()
                 .into_iter()
-                .find(|peer| peer.name == PEER_SENDER)
+                .find(|peer| peer.title == PEER_SENDER)
                 .expect(PEER_MISSING)
                 .target;
             let earlier = receiver
@@ -164,6 +164,7 @@ mod peer_tests {
                 message_id,
                 sender_session_id: self.reply_target.clone(),
                 sender_name: PEER_SENDER.into(),
+                sender_handle: None,
                 reply_target: self.reply_target.clone(),
                 reply_to,
             }
@@ -408,7 +409,7 @@ mod peer_tests {
             };
             assert_eq!(sessions.len(), 1);
             assert_eq!(sessions[0].target, fixture.target);
-            assert_eq!(sessions[0].name, PEER_RECEIVER);
+            assert_eq!(sessions[0].title, PEER_RECEIVER);
             assert_eq!(sessions[0].busy, busy);
             let model = done.output.as_text();
             assert!(!model.contains(&fixture.receiver.session_id().to_string()));

@@ -63,6 +63,7 @@ const SELECT_PEER: &str = "Select a peer to inspect its exact target.";
 const SELECT_HELD: &str = "Select a held message, then press Enter to review it.";
 const PEER_GONE: &str = "This exact peer target is unavailable in the latest discovery snapshot. Select another peer explicitly.";
 const ALIAS_SCOPE: &str = "This exact alias belongs to this session's current live registration. It is not a globally shareable address.";
+const NAME_LABEL: &str = "Name: ";
 const PREVIEW_HINT: &str = "Passive preview. Enter or click these details to review the literal message. Selecting and refreshing do not authorize decisions.";
 const POLICIES: [InboundPolicy; 4] = [
     InboundPolicy::Auto,
@@ -672,7 +673,12 @@ impl PeerManager {
                         policy_label(&peer.inbound),
                         literal(&peer.cwd.to_string_lossy(), false)
                     );
-                    (peer.target.clone(), literal(&peer.name, false), detail)
+                    let title = literal(&peer.title, false);
+                    let name = match peer.handle_address() {
+                        Some(address) => format!("{title} · {}", literal(&address, false)),
+                        None => title,
+                    };
+                    (peer.target.clone(), name, detail)
                 })
                 .collect::<Vec<_>>(),
             PeerView::Held => self
@@ -1522,9 +1528,13 @@ impl PeerManager {
                     )
                 },
                 |peer| {
+                    let name = peer
+                        .handle_address()
+                        .map(|address| format!("{NAME_LABEL}{}\n", literal(&address, false)))
+                        .unwrap_or_default();
                     format!(
-                        "{}\n\nExact target: {}\nWorkspace: {}\n\n{}",
-                        literal(&peer.name, false),
+                        "{}\n\n{name}Exact target: {}\nWorkspace: {}\n\n{}",
+                        literal(&peer.title, false),
                         literal(&peer.target, false),
                         literal(&peer.cwd.to_string_lossy(), false),
                         ALIAS_SCOPE,
@@ -2020,14 +2030,15 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        Command, Confirmation, FLOOR_BLOCKED, FreshInput, MAX_LITERAL_COLS, NO_LONGER_HELD,
-        NO_MATCHES, NO_PEERS, Pane, PeerManager, PeerManagerAction, PeerView, QUEUED, REJECTED,
-        Reader, ReviewPanel, STALE_REVIEW, literal, paint_literal, policy_rank,
+        Command, Confirmation, FLOOR_BLOCKED, FreshInput, MAX_LITERAL_COLS, NAME_LABEL,
+        NO_LONGER_HELD, NO_MATCHES, NO_PEERS, Pane, PeerManager, PeerManagerAction, PeerView,
+        QUEUED, REJECTED, Reader, ReviewPanel, STALE_REVIEW, literal, paint_literal, policy_rank,
     };
     use crate::components::buffer_text;
 
     const FIRST_TARGET: &str = "calm-fox-brings-dawn";
     const SECOND_TARGET: &str = "calm-fox-brings-rain";
+    const HANDLE: &str = "parser-agent";
     const FIRST_MESSAGE: &str = "bright-blue-brook";
     const SECOND_MESSAGE: &str = "still-green-pine";
     const TITLE: &str = "Same readable title";
@@ -2050,7 +2061,8 @@ mod tests {
     fn peer(target: &str) -> PeerSummary {
         PeerSummary {
             target: target.to_owned(),
-            name: TITLE.to_owned(),
+            title: TITLE.to_owned(),
+            handle: None,
             cwd: PathBuf::from(WORKSPACE),
             busy: false,
             blocked: false,
@@ -2238,6 +2250,26 @@ mod tests {
             manager.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)),
             PeerManagerAction::Consumed
         ));
+    }
+
+    #[test]
+    fn messaging_names_are_searchable_and_shown_in_details() {
+        let mut manager = manager(PeerView::Sessions);
+        manager.set_sessions(Ok(vec![
+            peer(FIRST_TARGET),
+            PeerSummary {
+                handle: Some(HANDLE.into()),
+                ..peer(SECOND_TARGET)
+            },
+        ]));
+        manager.handle_key(press(KeyCode::Char('/')));
+        manager.handle_paste(HANDLE);
+        manager.handle_key(press(KeyCode::Enter));
+        let entries = manager.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, SECOND_TARGET);
+        manager.select(SECOND_TARGET.to_owned());
+        assert!(draw(&mut manager, WIDE, HEIGHT).contains(&format!("{NAME_LABEL}@{HANDLE}")));
     }
 
     #[test]

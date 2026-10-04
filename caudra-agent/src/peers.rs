@@ -2,6 +2,7 @@
 //! that a peer is an authentic Caudra process or has equivalent permissions.
 
 use std::collections::{HashMap, VecDeque};
+use std::fs::File;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
@@ -34,6 +35,8 @@ const MAX_LABEL_BYTES: usize = 256;
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_CORRELATION_BYTES: usize = 256;
 const MAX_TARGET_BYTES: usize = 128;
+const MAX_HANDLE_BYTES: usize = 32;
+const HANDLE_PREFIX: char = '@';
 const MAX_PEER_NAMES: usize = 4096;
 const MAX_MESSAGE_NAMES: usize = MAX_DEDUP * 3;
 const MAX_NAME_ATTEMPTS: usize = 32;
@@ -61,6 +64,11 @@ const UNKNOWN_REPLY: &str = "Unknown peer message name for this target";
 const AMBIGUOUS_REPLY: &str = "Peer reply identity is ambiguous without its original sender";
 const NAME_FULL: &str = "Live peer name capacity reached; start a new registration";
 const NAME_COLLISION: &str = "Unable to allocate a unique peer name within the attempt limit";
+pub const INVALID_HANDLE: &str = "Messaging names use 1 to 32 lowercase letters, digits, and hyphens, starting with a letter or digit";
+const HANDLE_IN_USE: &str = "is in use by another live session";
+const UNKNOWN_HANDLE: &str = "No live session has this messaging name";
+const AMBIGUOUS_HANDLE: &str =
+    "Several live sessions advertise this messaging name; use an exact target from list_sessions";
 const STALE_REVIEW: &str = "Held message review is stale; inspect the current held messages again";
 const NOT_HELD: &str = "Held message no longer exists";
 const REJECTED: &str = "Rejected by the local receiver";
@@ -87,6 +95,8 @@ pub struct PeerInfo {
     pub target: String,
     pub session_id: CaudraId,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
     pub cwd: PathBuf,
     pub busy: bool,
     pub blocked: bool,
@@ -96,11 +106,26 @@ pub struct PeerInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerSummary {
     pub target: String,
-    pub name: String,
+    #[serde(alias = "name")]
+    pub title: String,
+    #[serde(default)]
+    pub handle: Option<String>,
     pub cwd: PathBuf,
     pub busy: bool,
     pub blocked: bool,
     pub inbound: InboundPolicy,
+}
+
+impl PeerSummary {
+    /// The `@name` form `send_message` accepts, when the session has a name.
+    pub fn handle_address(&self) -> Option<String> {
+        self.handle.as_deref().map(handle_address)
+    }
+}
+
+/// Spells a messaging name the way `send_message` accepts it.
+pub fn handle_address(handle: &str) -> String {
+    format!("{HANDLE_PREFIX}{handle}")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -183,6 +208,7 @@ pub struct PeerHost(Arc<HostInner>);
 struct HostInner {
     incarnation: String,
     sessions: Mutex<HashMap<CaudraId, Weak<SessionInner>>>,
+    reserved: Mutex<HashMap<CaudraId, HandleClaim>>,
     bytes: Arc<AtomicUsize>,
     changed: Event,
     #[cfg(unix)]
@@ -205,6 +231,8 @@ struct SessionState {
     canonical_cwd: Option<PathBuf>,
     floor: InboundPolicy,
     inbound_override: Option<InboundPolicy>,
+    handle: Option<String>,
+    claim: Option<HandleClaim>,
     open: bool,
     wakes_suppressed: bool,
     epoch: u64,
@@ -225,6 +253,13 @@ struct Arrival {
     at: Instant,
     sender: String,
     text: [u8; 32],
+}
+
+/// Holding the open lock file is what makes the name unique; dropping the
+/// claim releases it, as process exit or a crash does.
+struct HandleClaim {
+    handle: String,
+    _lock: File,
 }
 
 struct InboxItem {
@@ -353,6 +388,8 @@ impl From<&AgentMode> for WireMode {
 struct Sender {
     route: Route,
     name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    handle: Option<String>,
     canonical_cwd: Option<PathBuf>,
     mode: WireMode,
     permission_mode: PermissionMode,
@@ -427,6 +464,30 @@ fn valid_name(value: &str, words: usize) -> bool {
         && value
             .split('-')
             .all(|word| !word.is_empty() && word.bytes().all(|byte| byte.is_ascii_lowercase()))
+}
+
+fn valid_handle(value: &str) -> bool {
+    value.len() <= MAX_HANDLE_BYTES
+        && value
+            .bytes()
+            .next()
+            .is_some_and(|first| first.is_ascii_lowercase() || first.is_ascii_digit())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+/// Validates a unique messaging name, as `--name` and `@name` spell it.
+pub fn parse_handle(value: &str) -> Result<String, String> {
+    if valid_handle(value) {
+        Ok(value.to_owned())
+    } else {
+        Err(INVALID_HANDLE.into())
+    }
+}
+
+fn handle_in_use(handle: &str) -> String {
+    format!("Messaging name {HANDLE_PREFIX}{handle} {HANDLE_IN_USE}")
 }
 
 fn message_name() -> Result<String, String> {
@@ -522,6 +583,7 @@ impl PeerHost {
         let host = Arc::new(HostInner {
             incarnation,
             sessions: Mutex::default(),
+            reserved: Mutex::default(),
             bytes,
             changed: Event::new(),
             endpoint,
@@ -590,6 +652,8 @@ impl PeerHost {
                 canonical_cwd: descriptor.cwd.canonicalize().ok(),
                 floor,
                 inbound_override,
+                handle: controls.handle,
+                claim: None,
                 descriptor,
                 open: true,
                 wakes_suppressed: false,
@@ -615,6 +679,27 @@ impl PeerHost {
     pub fn notified(&self) -> impl Future<Output = ()> + Send + 'static {
         self.0.changed.listen()
     }
+
+    /// Claims `handle` for `session` before it registers, so a conflict can stop
+    /// startup. The session's [`PeerSession::claim_handle`] takes the claim over.
+    pub async fn reserve_handle(&self, session: CaudraId, handle: &str) -> Result<(), String> {
+        if let Some(claim) = self.0.claim(session, handle)? {
+            lock(&self.0.reserved).insert(session, claim);
+            return Ok(());
+        }
+        let holder = self.0.discover().await.ok().and_then(|peers| {
+            peers
+                .into_iter()
+                .find(|peer| peer.handle.as_deref() == Some(handle))
+        });
+        Err(match holder {
+            Some(peer) => format!(
+                "Messaging name {HANDLE_PREFIX}{handle} is in use by {:?} in {:?}",
+                peer.name, peer.cwd
+            ),
+            None => handle_in_use(handle),
+        })
+    }
 }
 
 impl PeerSession {
@@ -636,7 +721,32 @@ impl PeerSession {
         let state = lock(&self.0.state);
         StoredPeerControls {
             inbound: state.inbound_override.as_ref().map(stored_policy),
+            handle: state.handle.clone(),
         }
+    }
+
+    /// Claims the session's stored messaging name for this registration. A
+    /// name another live session holds stays stored, so a later registration
+    /// can reclaim it once it is free.
+    pub fn claim_handle(&self) -> Result<(), String> {
+        let handle = {
+            let state = lock(&self.0.state);
+            state.ensure_open()?;
+            match (&state.handle, &state.claim) {
+                (Some(handle), None) => handle.clone(),
+                _ => return Ok(()),
+            }
+        };
+        let claim = self
+            .0
+            .host
+            .claim(self.session_id(), &handle)?
+            .ok_or_else(|| handle_in_use(&handle))?;
+        let mut state = lock(&self.0.state);
+        state.ensure_open()?;
+        state.claim = Some(claim);
+        self.0.host.changed.notify(usize::MAX);
+        Ok(())
     }
 
     pub fn wakes_suppressed(&self) -> bool {
@@ -712,17 +822,12 @@ impl PeerSession {
 
     pub async fn list(&self) -> Result<Vec<PeerInfo>, String> {
         lock(&self.0.state).ensure_open()?;
-        #[cfg(unix)]
-        {
-            let peers = unix::discover(&self.0.host.endpoint).await?;
-            lock(&self.0.state).ensure_open()?;
-            Ok(peers
-                .into_iter()
-                .filter(|peer| peer.target != self.0.route.target())
-                .collect())
-        }
-        #[cfg(not(unix))]
-        Err(UNAVAILABLE.into())
+        let peers = self.0.host.discover().await?;
+        lock(&self.0.state).ensure_open()?;
+        Ok(peers
+            .into_iter()
+            .filter(|peer| peer.target != self.0.route.target())
+            .collect())
     }
 
     pub async fn list_named(&self) -> Result<Vec<PeerSummary>, String> {
@@ -734,7 +839,8 @@ impl PeerSession {
             .map(|peer| {
                 Ok(PeerSummary {
                     target: state.peer_name(&peer.target)?,
-                    name: peer.name,
+                    title: peer.name,
+                    handle: peer.handle,
                     cwd: peer.cwd,
                     busy: peer.busy,
                     blocked: peer.blocked,
@@ -751,29 +857,33 @@ impl PeerSession {
         reply_to: Option<&str>,
         request_id: &str,
     ) -> Result<SendReceipt, String> {
-        if !valid_name(target, PEER_WORDS) {
-            return Err(UNKNOWN_TARGET.into());
-        }
-        let (target, reply_to) = {
+        let route = match target.strip_prefix(HANDLE_PREFIX) {
+            Some(handle) => self.resolve_handle(handle).await?,
+            None if valid_name(target, PEER_WORDS) => {
+                let state = lock(&self.0.state);
+                state.ensure_open()?;
+                state.peer_names.get(target).ok_or(UNKNOWN_TARGET)?.clone()
+            }
+            None => return Err(UNKNOWN_TARGET.into()),
+        };
+        let reply_to = {
             let state = lock(&self.0.state);
             state.ensure_open()?;
-            let route = state.peer_names.get(target).ok_or(UNKNOWN_TARGET)?;
-            let reply_to = reply_to
+            reply_to
                 .map(|name| {
                     state
                         .message_names
                         .get(name)
                         .filter(|identity| {
-                            state.matches_counterpart(identity, route, &self.0.route.target())
+                            state.matches_counterpart(identity, &route, &self.0.route.target())
                         })
                         .cloned()
                         .ok_or(UNKNOWN_REPLY)
                 })
-                .transpose()?;
-            (route.clone(), reply_to)
+                .transpose()?
         };
         self.send_with_reply(
-            &target,
+            &route,
             text,
             reply_to
                 .as_ref()
@@ -782,6 +892,22 @@ impl PeerSession {
             request_id,
         )
         .await
+    }
+
+    /// Names follow their session across restarts, so each send rediscovers
+    /// the live registration that currently holds one.
+    async fn resolve_handle(&self, handle: &str) -> Result<String, String> {
+        let handle = parse_handle(handle)?;
+        let mut holders = self
+            .list()
+            .await?
+            .into_iter()
+            .filter(|peer| peer.handle.as_ref() == Some(&handle));
+        let holder = holders.next().ok_or(UNKNOWN_HANDLE)?;
+        if holders.next().is_some() {
+            return Err(AMBIGUOUS_HANDLE.into());
+        }
+        Ok(holder.target)
     }
 
     pub async fn send(
@@ -876,6 +1002,7 @@ impl PeerSession {
                     sender: Sender {
                         route: self.0.route.clone(),
                         name: state.descriptor.name.clone(),
+                        handle: state.claimed_handle(),
                         canonical_cwd: state.canonical_cwd.clone(),
                         mode: WireMode::from(&state.descriptor.mode),
                         permission_mode: state.descriptor.permission_mode.clone(),
@@ -1131,6 +1258,10 @@ impl PeerSession {
 }
 
 impl SessionState {
+    fn claimed_handle(&self) -> Option<String> {
+        self.claim.as_ref().map(|claim| claim.handle.clone())
+    }
+
     fn matches_counterpart(&self, identity: &MessageIdentity, peer: &str, own: &str) -> bool {
         identity.sender == peer
             || (identity.sender == own
@@ -1290,6 +1421,7 @@ impl SessionInner {
         state.outgoing.clear();
         state.dedup.clear();
         state.reviews.clear();
+        state.claim = None;
         self.host.changed.notify(usize::MAX);
     }
 
@@ -1316,6 +1448,11 @@ impl SessionInner {
             || delivery.text.is_empty()
             || delivery.text.len() > MAX_BODY_BYTES
             || delivery.sender.name.len() > MAX_LABEL_BYTES
+            || delivery
+                .sender
+                .handle
+                .as_deref()
+                .is_some_and(|handle| !valid_handle(handle))
             || delivery
                 .sender
                 .canonical_cwd
@@ -1384,6 +1521,7 @@ impl SessionInner {
             message_id: state.message_name(&sender, &delivery.message_id)?,
             sender_session_id: sender_name.clone(),
             sender_name: delivery.sender.name.clone(),
+            sender_handle: delivery.sender.handle.clone(),
             reply_target: sender_name,
             reply_to,
         };
@@ -1547,6 +1685,34 @@ impl Drop for PeerClaim {
 }
 
 impl HostInner {
+    /// `None` when another live session holds the name.
+    fn claim(&self, session: CaudraId, handle: &str) -> Result<Option<HandleClaim>, String> {
+        let handle = parse_handle(handle)?;
+        if let Some(claim) = lock(&self.reserved).remove(&session)
+            && claim.handle == handle
+        {
+            return Ok(Some(claim));
+        }
+        #[cfg(unix)]
+        {
+            Ok(self.endpoint.lock_handle(&handle)?.map(|lock| HandleClaim {
+                handle,
+                _lock: lock,
+            }))
+        }
+        #[cfg(not(unix))]
+        Err(UNAVAILABLE.into())
+    }
+
+    async fn discover(&self) -> Result<Vec<PeerInfo>, String> {
+        #[cfg(unix)]
+        {
+            unix::discover(&self.endpoint).await
+        }
+        #[cfg(not(unix))]
+        Err(UNAVAILABLE.into())
+    }
+
     fn handle(&self, request: Request) -> Response {
         match request {
             Request::List { version, host }
@@ -1564,6 +1730,7 @@ impl HostInner {
                             target: session.route.target(),
                             session_id: session.route.session,
                             name: state.descriptor.name.clone(),
+                            handle: state.claimed_handle(),
                             cwd: state.descriptor.cwd.clone(),
                             busy: state.descriptor.busy,
                             blocked: state.wakes_suppressed || state.descriptor.blocked,
@@ -1634,18 +1801,19 @@ mod tests {
     use caudra_storage::id::CaudraId;
     use caudra_storage::sessions::{PermissionMode, StoredInboundPolicy, StoredPeerControls};
     use futures_lite::future::poll_once;
-    use tempfile::{Builder, TempDir};
+    use tempfile::{Builder, TempDir, tempfile};
     use test_case::test_case;
 
     use super::{
-        AMBIGUOUS_REPLY, CLAIM_BATCH, CLOSED, DUPLICATE, Delivery, FULL, HELD_BLOCKED, HELD_COHORT,
-        HELD_POLICY, MAX_BODY_BYTES, MAX_DEDUP, MAX_HELD, MAX_MESSAGE_NAMES, MAX_NAME_ATTEMPTS,
-        MAX_PEER_NAMES, MAX_PROCESS_BYTES, MAX_SESSION_BYTES, MESSAGE_WORDS, MessageIdentity,
-        NAME_COLLISION, NAME_FULL, NOT_HELD, Outgoing, PEER_WORDS, POLICY_FLOOR, PeerDecision,
-        PeerDecisionResult, PeerDescriptor, PeerHost, PeerSession, PeerSummary, RATE_EXCEEDED,
-        RATE_WINDOW, REFUSED_POLICY, REJECTED, RETRY_FULL, RETRY_WINDOW, Route, STALE_REVIEW,
-        STALE_TARGET, SendReceipt, Sender, UNKNOWN_REPLY, UNKNOWN_TARGET, WireMode, allocate_name,
-        lock, message_name, token, valid_name, wall_ms,
+        AMBIGUOUS_HANDLE, AMBIGUOUS_REPLY, CLAIM_BATCH, CLOSED, DUPLICATE, Delivery, FULL,
+        HANDLE_PREFIX, HELD_BLOCKED, HELD_COHORT, HELD_POLICY, HandleClaim, INVALID_HANDLE,
+        MAX_BODY_BYTES, MAX_DEDUP, MAX_HELD, MAX_MESSAGE_NAMES, MAX_NAME_ATTEMPTS, MAX_PEER_NAMES,
+        MAX_PROCESS_BYTES, MAX_SESSION_BYTES, MESSAGE_WORDS, MessageIdentity, NAME_COLLISION,
+        NAME_FULL, NOT_HELD, Outgoing, PEER_WORDS, POLICY_FLOOR, PeerDecision, PeerDecisionResult,
+        PeerDescriptor, PeerHost, PeerInfo, PeerSession, PeerSummary, RATE_EXCEEDED, RATE_WINDOW,
+        REFUSED_POLICY, REJECTED, RETRY_FULL, RETRY_WINDOW, Route, STALE_REVIEW, STALE_TARGET,
+        SendReceipt, Sender, UNKNOWN_HANDLE, UNKNOWN_REPLY, UNKNOWN_TARGET, WireMode,
+        allocate_name, handle_in_use, lock, message_name, token, valid_name, wall_ms,
     };
     use crate::AgentMode;
 
@@ -1667,6 +1835,10 @@ mod tests {
     const ORIGINAL_REQUEST_ID: &str = "original-request";
     const BUILD_MODE: &str = "build";
     const PLAN_MODE: &str = "plan";
+    const HANDLE: &str = "ci-watcher";
+    const SENDER_HANDLE: &str = "deployer";
+    const MISSING_HANDLE: &str = "nobody-here";
+    const MALFORMED_HANDLE: &str = "CI_Watcher";
     const LOW_RATE: usize = 2;
     /// Delivers more than the removed sixteen-message budget while staying
     /// under the default recipient rate.
@@ -1735,6 +1907,7 @@ mod tests {
                     generation: token().unwrap(),
                 },
                 name: "sender".into(),
+                handle: None,
                 canonical_cwd: session.descriptor().cwd.canonicalize().ok(),
                 mode: WireMode::Build,
                 permission_mode: PermissionMode::Ask,
@@ -2555,7 +2728,7 @@ mod tests {
             receiver.update(changed).unwrap();
             let listed = sender.list_named().await.unwrap();
             assert_eq!(listed[0].target, *target);
-            assert_eq!(listed[0].name, TEXT);
+            assert_eq!(listed[0].title, TEXT);
             let descriptor = receiver.descriptor();
             receiver.close();
             let replacement = second.register(descriptor).unwrap();
@@ -3077,6 +3250,7 @@ mod tests {
                 &messaging(floor),
                 Some(StoredPeerControls {
                     inbound: Some(restored),
+                    handle: None,
                 }),
             )
             .unwrap();
@@ -3085,8 +3259,161 @@ mod tests {
             session.controls(),
             StoredPeerControls {
                 inbound: Some(super::stored_policy(&expected)),
+                handle: None,
             }
         );
+    }
+
+    fn named(host: &PeerHost, descriptor: PeerDescriptor, handle: &str) -> PeerSession {
+        host.register_with_controls(
+            descriptor,
+            &MessagingConfig::default(),
+            Some(StoredPeerControls {
+                inbound: None,
+                handle: Some(handle.into()),
+            }),
+        )
+        .unwrap()
+    }
+
+    fn advertised(peers: &[PeerInfo], session: &PeerSession) -> Option<String> {
+        peers
+            .iter()
+            .find(|peer| peer.session_id == session.session_id())
+            .and_then(|peer| peer.handle.clone())
+    }
+
+    #[test_case(|session| { session.close(); Some(session) }; "closed")]
+    #[test_case(|_| None; "dropped")]
+    fn messaging_names_stay_unique_until_their_holder_ends(
+        release: fn(PeerSession) -> Option<PeerSession>,
+    ) {
+        smol::block_on(async {
+            let directory = directory();
+            let first = host(directory.path());
+            let second = host(directory.path());
+            let holder = named(
+                &first,
+                descriptor(directory.path(), InboundPolicy::Auto),
+                HANDLE,
+            );
+            holder.claim_handle().unwrap();
+            let waiting = named(
+                &second,
+                descriptor(directory.path(), InboundPolicy::Auto),
+                HANDLE,
+            );
+            assert_eq!(waiting.claim_handle().unwrap_err(), handle_in_use(HANDLE));
+            assert_eq!(waiting.controls().handle.as_deref(), Some(HANDLE));
+            let peers = waiting.list().await.unwrap();
+            assert_eq!(advertised(&peers, &holder).as_deref(), Some(HANDLE));
+            let peers = holder.list().await.unwrap();
+            assert_eq!(advertised(&peers, &waiting), None);
+            let _released = release(holder);
+            waiting.claim_handle().unwrap();
+            let observer = first
+                .register(descriptor(directory.path(), InboundPolicy::Auto))
+                .unwrap();
+            let peers = observer.list().await.unwrap();
+            assert_eq!(advertised(&peers, &waiting).as_deref(), Some(HANDLE));
+        });
+    }
+
+    #[test]
+    fn reserved_names_pass_to_their_session_and_conflicts_name_the_holder() {
+        smol::block_on(async {
+            let directory = directory();
+            let first = host(directory.path());
+            let second = host(directory.path());
+            let descriptor = descriptor(directory.path(), InboundPolicy::Auto);
+            first
+                .reserve_handle(descriptor.session_id, HANDLE)
+                .await
+                .unwrap();
+            assert_eq!(
+                second
+                    .reserve_handle(CaudraId::generate(), HANDLE)
+                    .await
+                    .unwrap_err(),
+                handle_in_use(HANDLE)
+            );
+            let holder = named(&first, descriptor.clone(), HANDLE);
+            holder.claim_handle().unwrap();
+            assert!(lock(&first.0.reserved).is_empty());
+            let conflict = second
+                .reserve_handle(CaudraId::generate(), HANDLE)
+                .await
+                .unwrap_err();
+            assert!(conflict.contains(&descriptor.name), "{conflict}");
+            assert!(
+                conflict.contains(descriptor.cwd.to_str().unwrap()),
+                "{conflict}"
+            );
+        });
+    }
+
+    #[test_case(HANDLE, None; "live_name")]
+    #[test_case(MISSING_HANDLE, Some(UNKNOWN_HANDLE); "unknown_name")]
+    #[test_case(MALFORMED_HANDLE, Some(INVALID_HANDLE); "malformed_name")]
+    #[test_case("", Some(INVALID_HANDLE); "empty_name")]
+    fn messaging_names_address_live_sessions(handle: &str, refusal: Option<&str>) {
+        smol::block_on(async {
+            let directory = directory();
+            let first = host(directory.path());
+            let second = host(directory.path());
+            let sender = named(
+                &first,
+                descriptor(directory.path(), InboundPolicy::Auto),
+                SENDER_HANDLE,
+            );
+            sender.claim_handle().unwrap();
+            let receiver = named(
+                &second,
+                descriptor(directory.path(), InboundPolicy::Auto),
+                HANDLE,
+            );
+            receiver.claim_handle().unwrap();
+            let sent = sender
+                .send_named(&format!("{HANDLE_PREFIX}{handle}"), TEXT, None, REQUEST_ID)
+                .await;
+            let Some(refusal) = refusal else {
+                assert_eq!(sent.unwrap().status, QUEUED);
+                let claim = receiver.claim().unwrap();
+                let origin = claim.messages()[0].peer_event.clone().unwrap();
+                assert_eq!(origin.sender_handle.as_deref(), Some(SENDER_HANDLE));
+                claim.commit();
+                return;
+            };
+            assert_eq!(sent.unwrap_err(), refusal);
+            assert!(receiver.claim().is_none());
+        });
+    }
+
+    #[test]
+    fn names_advertised_twice_are_ambiguous() {
+        smol::block_on(async {
+            let (directory, host, sender) = fixture(InboundPolicy::Auto);
+            let receivers: Vec<_> = (0..2)
+                .map(|_| {
+                    let receiver = host
+                        .register(descriptor(directory.path(), InboundPolicy::Auto))
+                        .unwrap();
+                    lock(&receiver.0.state).claim = Some(HandleClaim {
+                        handle: HANDLE.into(),
+                        _lock: tempfile().unwrap(),
+                    });
+                    receiver
+                })
+                .collect();
+            assert_eq!(
+                sender
+                    .send_named(&format!("{HANDLE_PREFIX}{HANDLE}"), TEXT, None, REQUEST_ID)
+                    .await
+                    .unwrap_err(),
+                AMBIGUOUS_HANDLE
+            );
+            assert!(receivers.iter().all(|receiver| receiver.claim().is_none()));
+        });
     }
 
     #[test]
@@ -3400,6 +3727,7 @@ mod tests {
                 &messaging(Some(floor.clone())),
                 Some(StoredPeerControls {
                     inbound: Some(StoredInboundPolicy::Hold),
+                    handle: None,
                 }),
             )
             .unwrap();

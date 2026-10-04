@@ -55,6 +55,7 @@ jiff = { workspace = true }
 include_dir = { workspace = true }
 
 [dev-dependencies]
+caudra-agent = { workspace = true, features = ["test-support"] }
 test-case = { workspace = true }
 
 [workspace]

@@ -1426,7 +1426,7 @@ fn build_tool_results_map(items: &[HistoryItem]) -> HashMap<&str, ToolResultRef<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use caudra_agent::peers::{PeerSummary, SendReceipt};
+    use caudra_agent::peers::{PeerSummary, SendReceipt, handle_address};
     use caudra_agent::tools::native::peers::{LIST_NAME, SEND_NAME};
     use caudra_agent::tools::{BATCH_TOOL_NAME, SHELL_TOOL_NAME, TOOL_OUTPUT_TOOL_NAME};
     use caudra_agent::{
@@ -1535,6 +1535,7 @@ mod tests {
     const PEER_TARGET: &str = "calm-blue-wren";
     const PEER_MESSAGE: &str = "kind-amber-fox";
     const PEER_REASON: &str = "Needs local review.";
+    const PEER_HANDLE: &str = "release-agent";
     const PEER_MODEL_JSON: &str = "{\"session_id\":\"private-session-id\"}";
     const SESSION_CWD: &str = "/project";
     const TASK_OBSERVATION: &str = "neat-wanted-cowbird completed: All checks passed.";
@@ -2086,7 +2087,8 @@ mod tests {
             PeerOutput::Sessions {
                 sessions: vec![PeerSummary {
                     target: PEER_TARGET.into(),
-                    name: MAIN_NAME.into(),
+                    title: MAIN_NAME.into(),
+                    handle: None,
                     cwd: SESSION_CWD.into(),
                     busy: false,
                     blocked: false,
@@ -2649,6 +2651,7 @@ mod tests {
             message_id: MESSAGE_ID.into(),
             sender_session_id: SENDER_ID.into(),
             sender_name: NAME.into(),
+            sender_handle: None,
             reply_target: REPLY_TARGET.into(),
             reply_to: None,
         };
@@ -2713,6 +2716,25 @@ mod tests {
             .draw(|frame| live.view(frame, area, false, false))
             .unwrap();
         assert_eq!(terminal.backend().buffer(), &folded);
+    }
+
+    #[test_case(Some(PEER_HANDLE); "named_sender")]
+    #[test_case(None; "unnamed_sender")]
+    fn peer_messages_show_the_address_of_a_named_sender(handle: Option<&str>) {
+        const NAME_LINE: &str = "\nName: ";
+        let origin = PeerMessageOrigin {
+            message_id: PEER_MESSAGE.into(),
+            sender_session_id: PEER_TARGET.into(),
+            sender_name: MAIN_NAME.into(),
+            sender_handle: handle.map(str::to_owned),
+            reply_target: PEER_TARGET.into(),
+            reply_to: None,
+        };
+        let shown = DisplayMessage::peer(REPLY_TEXT, origin).text;
+        assert_eq!(shown.contains(NAME_LINE), handle.is_some());
+        if let Some(handle) = handle {
+            assert!(shown.contains(&handle_address(handle)), "{shown}");
+        }
     }
 
     #[test_case(60, "success", DELIVERY_SUCCESS; "narrow_success")]

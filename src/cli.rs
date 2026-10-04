@@ -8,6 +8,7 @@ use clap::{
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 
+use caudra_agent::peers::parse_handle;
 use caudra_agent::tools::all_builtin_tool_names;
 use caudra_config::files::{self, ConfigFile};
 use caudra_config::sandbox::LeaseSeconds;
@@ -158,6 +159,10 @@ pub struct Cli {
     #[arg(long)]
     pub exit_on_done: bool,
 
+    /// Claim a unique cross-session messaging name for the initial session, which a new session also takes as its title
+    #[arg(long, value_name = "NAME", value_parser = parse_handle, conflicts_with = "print")]
+    pub name: Option<String>,
+
     /// Pre-approve tools (comma-separated). Accepts PascalCase (Claude Code) or snake_case.
     #[arg(
         long,
@@ -273,6 +278,7 @@ impl Cli {
             .mut_arg("cwd", |arg| arg.hide(direct_off))
             .mut_arg("credential_ref", |arg| arg.hide(direct_off))
             .mut_arg("auto", |arg| arg.hide(off(Feature::DecisionEngine)))
+            .mut_arg("name", |arg| arg.hide(off(Feature::CrossSessionMessaging)))
             .mut_arg("no_jit", |arg| arg.hide(off(Feature::LuaPlugins)))
             .mut_subcommand("sandbox", |command| command.hide(sandboxes_off))
             .mut_subcommand("remote", |command| {
@@ -1207,6 +1213,7 @@ pub fn normalize_tool_name(name: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use caudra_agent::peers::INVALID_HANDLE;
     use caudra_config::workcell::{
         WorkcellProfiles, WorkcellSelection, WorkcellSelectionError, select_workcell,
     };
@@ -1580,6 +1587,35 @@ mod tests {
                 "raw",
             ])
             .is_err()
+        );
+    }
+
+    #[test_case("ci-watcher", true; "lowercase_words")]
+    #[test_case("9lives", true; "leading_digit")]
+    #[test_case("CI-watcher", false; "uppercase")]
+    #[test_case("-watcher", false; "leading_hyphen")]
+    #[test_case("@ci-watcher", false; "address_prefix")]
+    fn messaging_name_is_validated_while_parsing(name: &str, valid: bool) {
+        let flag = format!("--name={name}");
+        match Cli::try_parse_from(["caudra", flag.as_str()]) {
+            Ok(cli) => {
+                assert!(valid);
+                assert_eq!(cli.name.as_deref(), Some(name));
+            }
+            Err(error) => {
+                assert!(!valid);
+                assert!(error.to_string().contains(INVALID_HANDLE), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn messaging_name_belongs_to_interactive_sessions() {
+        assert_eq!(
+            Cli::try_parse_from(["caudra", "--name", "ci-watcher", "--print"])
+                .err()
+                .map(|error| error.kind()),
+            Some(ErrorKind::ArgumentConflict)
         );
     }
 

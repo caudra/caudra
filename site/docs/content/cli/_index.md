@@ -56,6 +56,7 @@ Labels are partial evidence, not a complete evaluation dataset. Tool-search actu
 | `--no-snapshots` | yes | yes | yes |
 | `-c` / `--continue`, `-s` / `--session` | yes | no (always new session) | yes |
 | `--exit-on-done` | yes | n/a (always exits) | n/a |
+| `--name` | yes | no | no |
 | `--image` | no (use Ctrl+V paste) | yes | via wire protocol |
 | `--verbose`, `--output-format` | no | yes | stream only |
 | `--system-prompt`, `--append-system-prompt` | no | no | yes |
@@ -86,6 +87,7 @@ Labels are partial evidence, not a complete evaluation dataset. Tool-search actu
 | `--yolo` | Skip permission prompts on gated tools (alias: `--dangerously-skip-permissions`). Deny rules still apply |
 | `--auto` | Start in [Auto mode](/docs/permissions/#auto-mode). Needs `experimental.decision_engine`. Cannot be combined with `--yolo` |
 | `--exit-on-done` | Exit when the agent finishes (TUI automation wrappers) |
+| `--name <NAME>` | Claim a unique [messaging name](/docs/sessions/#messaging-names) for the initial TUI session. Needs `experimental.cross_session_messaging` |
 | `--allowed-tools <LIST>` | Comma-separated allow list (PascalCase or snake_case) |
 | `--disallowed-tools <LIST>` | Comma-separated deny list |
 | `--system-prompt-profile <NAME>` | Select a profile from the user `system-prompts` config directory. See [System Prompt Profiles](/docs/system-prompts/) |

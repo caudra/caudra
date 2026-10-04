@@ -67,13 +67,27 @@ Open the individual message's review before using an approve or reject command. 
 
 Press `p` outside filter editing to manage this session's inbound policy. Select an option and press `a` to apply it. Relaxing the policy requires confirmation because it can release held messages and start billable turns. Project restrictions remain in force. This control never changes the selected peer's policy.
 
-You can also ask the agent to find a session and send it a message. It uses `list_sessions` for discovery and `send_message` for delivery. Discovery cards show session labels, word-based targets, workspaces, and availability, without transcript previews. A title is not a unique address.
+You can also ask the agent to find a session and send it a message. It uses `list_sessions` for discovery and `send_message` for delivery. Discovery cards show session labels, [messaging names](#messaging-names), word-based targets, workspaces, and availability, without transcript previews. A title is not a unique address.
 
 Use the exact target from discovery or an incoming reply address. Targets belong to your current live registration and are never reassigned to a replacement peer. Discover again after restarting or replacing your session. Message names also use generated words, including the names shown by `/messages` for approval or rejection.
 
 Accepted messages enter at a safe run boundary. They can also wake an eligible idle TUI session and start a billable model turn. They do not interrupt a running tool or bypass cancellation, permission review, or rate limits. The recipient still applies its own tool permissions.
 
 Opening or closing the manager does not resume cancelled work. An idle session waits until the modal closes before starting a peer-triggered turn. Work already running keeps its existing safe-boundary delivery behavior.
+
+### Messaging names
+
+Start a TUI session with `--name` to give it a unique messaging name:
+
+```sh
+caudra --name ci-watcher
+```
+
+A name has 1 to 32 lowercase letters, digits, and hyphens, and starts with a letter or digit. Only one live session can hold a name at a time. Startup fails while another live session holds it, and the error identifies that session when discovery can find it. A new session also takes the name as its title.
+
+Agents address a named session as `@ci-watcher` in `send_message`. Each send looks the name up again, so the message reaches whichever live session holds the name at that moment. Unnamed sessions stay reachable through the word-based targets from discovery.
+
+The session saves its name and claims it again when you resume it. If another live session holds the name by then, the resumed session continues without it and shows a warning. It tries again the next time you resume it. `/rename` changes only the title, so renaming a session never changes its address. Forks and new sessions start without a name.
 
 ### Delivery receipts and lifetime
 

@@ -840,9 +840,13 @@ impl PeerOutput {
                     } else {
                         "idle"
                     };
+                    let handle = peer
+                        .handle_address()
+                        .map(|address| format!("\nName: {}", address.escape_debug()))
+                        .unwrap_or_default();
                     format!(
-                        "{} · {state} · inbound {:?}\nTarget: {}\nWorkspace: {}",
-                        peer.name.escape_debug(),
+                        "{} · {state} · inbound {:?}{handle}\nTarget: {}\nWorkspace: {}",
+                        peer.title.escape_debug(),
                         peer.inbound,
                         peer.target.escape_debug(),
                         peer.cwd.to_string_lossy().escape_debug(),
@@ -3376,6 +3380,7 @@ mod tests {
     const PEER_TARGET: &str = "calm-quick-fox-kind-brave-owl";
     const PEER_MESSAGE: &str = "clear-small-wren";
     const PEER_NAME: &str = "Parser review";
+    const PEER_HANDLE: &str = "parser-review";
     const PEER_WORKSPACE: &str = "/workspace/parser";
     const PEER_QUEUED: &str = "queued";
     const PEER_HOSTILE: &str = "review\n\r\t\u{1b}[31m\u{202e}text";
@@ -3385,7 +3390,8 @@ mod tests {
             sessions: (0..count)
                 .map(|_| PeerSummary {
                     target: PEER_TARGET.into(),
-                    name: PEER_NAME.into(),
+                    title: PEER_NAME.into(),
+                    handle: Some(PEER_HANDLE.into()),
                     cwd: PEER_WORKSPACE.into(),
                     busy: true,
                     blocked: false,
@@ -3416,12 +3422,13 @@ mod tests {
         assert_eq!(sessions.len(), count);
         for session in sessions {
             assert_eq!(session["target"], PEER_TARGET);
-            assert_eq!(session["name"], PEER_NAME);
+            assert_eq!(session["title"], PEER_NAME);
+            assert_eq!(session["handle"], PEER_HANDLE);
             assert_eq!(session["cwd"], PEER_WORKSPACE);
             assert_eq!(session["busy"], true);
             assert_eq!(session["blocked"], false);
             assert_eq!(session["inbound"], "auto");
-            assert_eq!(session.as_object().unwrap().len(), 6);
+            assert_eq!(session.as_object().unwrap().len(), 7);
         }
         assert_eq!(output.annotation().as_deref(), Some(annotation));
         assert_eq!(output.is_empty_result(), count == 0);
@@ -3430,7 +3437,31 @@ mod tests {
             assert_eq!(output.as_display_text(), PEER_SESSIONS_EMPTY);
         } else {
             assert!(output.as_display_text().contains(PEER_TARGET));
+            assert!(
+                output
+                    .as_display_text()
+                    .contains(&format!("@{PEER_HANDLE}"))
+            );
         }
+    }
+
+    #[test]
+    fn peer_discovery_stored_before_handles_loads_its_title() {
+        let stored = json!({"Peers": {"kind": "sessions", "sessions": [{
+            "target": PEER_TARGET,
+            "name": PEER_NAME,
+            "cwd": PEER_WORKSPACE,
+            "busy": false,
+            "blocked": false,
+            "inbound": "auto",
+        }]}});
+        let ToolOutput::Peers(PeerOutput::Sessions { sessions }) =
+            serde_json::from_value(stored).unwrap()
+        else {
+            panic!("expected stored peer sessions");
+        };
+        assert_eq!(sessions[0].title, PEER_NAME);
+        assert_eq!(sessions[0].handle, None);
     }
 
     #[test_case("queued", "queued", Some(PEER_RECEIPT_ACCEPTED); "queued")]
@@ -3485,7 +3516,8 @@ mod tests {
             PeerOutput::Sessions {
                 sessions: vec![PeerSummary {
                     target: PEER_HOSTILE.into(),
-                    name: PEER_HOSTILE.into(),
+                    title: PEER_HOSTILE.into(),
+                    handle: Some(PEER_HOSTILE.into()),
                     cwd: PEER_HOSTILE.into(),
                     busy: false,
                     blocked: true,

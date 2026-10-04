@@ -1,6 +1,6 @@
 use std::env;
 use std::ffi::CString;
-use std::fs::{self, File, Metadata, OpenOptions};
+use std::fs::{self, File, Metadata, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use super::{
     Delivery, HostInner, MAX_FRAME_BYTES, MAX_LABEL_BYTES, MAX_PATH_BYTES, MAX_SESSIONS,
     PROTOCOL_VERSION, PeerInfo, PeerSession, Request, Response, Route, SendReceipt, lock,
-    valid_token,
+    valid_handle, valid_token,
 };
 
 const DIRECTORY_MODE: u32 = 0o700;
@@ -41,6 +41,8 @@ pub(super) const PARTIAL: &str =
 const UNSAFE_ENTRY: &str = "Peer runtime entry has unsafe ownership, permissions, or type";
 const SOCKET_SUFFIX: &str = ".sock";
 const MANIFEST_SUFFIX: &str = ".json";
+const NAMES_DIRECTORY: &str = "names";
+const LOCK_SUFFIX: &str = ".lock";
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -296,6 +298,40 @@ impl Endpoint {
             return Err("Unsupported or inconsistent peer manifest".into());
         }
         Ok(manifest)
+    }
+
+    /// `None` when another open description holds the lock. Lock files are
+    /// never removed: unlinking one that another process is about to lock
+    /// would let two sessions hold the same name.
+    pub(super) fn lock_handle(&self, handle: &str) -> Result<Option<File>, String> {
+        self.check()?;
+        let names = make_private_directory(&self.directory.join(NAMES_DIRECTORY))?;
+        let directory = checked_directory(&names)?;
+        let name = c_string(Path::new(&format!("{handle}{LOCK_SUFFIX}")))?;
+        // SAFETY: the directory fd and terminated basename remain valid for openat.
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                FILE_MODE as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error().to_string());
+        }
+        // SAFETY: successful openat returns a new owned descriptor.
+        let file = unsafe { File::from_raw_fd(fd) };
+        let metadata = file.metadata().map_err(|error| error.to_string())?;
+        private(&metadata, false)?;
+        if !metadata.is_file() {
+            return Err(UNSAFE_ENTRY.into());
+        }
+        match file.try_lock() {
+            Ok(()) => Ok(Some(file)),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Error(error)) => Err(error.to_string()),
+        }
     }
 
     async fn connect(&self, host: &str) -> Result<Async<UnixStream>, String> {
@@ -585,6 +621,10 @@ pub(super) async fn discover(endpoint: &Endpoint) -> Result<Vec<PeerInfo>, Strin
                         if route.host != host
                             || route.session != peer.session_id
                             || peer.name.len() > MAX_LABEL_BYTES
+                            || peer
+                                .handle
+                                .as_deref()
+                                .is_some_and(|handle| !valid_handle(handle))
                             || peer.cwd.as_os_str().len() > MAX_PATH_BYTES
                         {
                             return Err("Invalid discovered peer metadata".into());

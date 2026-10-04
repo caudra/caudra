@@ -365,6 +365,8 @@ pub enum StoredInboundPolicy {
 #[serde(default)]
 pub struct StoredPeerControls {
     pub inbound: Option<StoredInboundPolicy>,
+    /// The unique messaging name this session reclaims whenever it registers.
+    pub handle: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1642,6 +1644,7 @@ mod tests {
     const MODE_UNCHOSEN: &str = "a new session must not pretend it picked a mode";
     const QUEUED_PROMPT: &str = "queued prompt";
     const WAKE_SUPPRESSION_FIELD: &str = "automatic_wakes_suppressed";
+    const PEER_HANDLE: &str = "ci-watcher";
 
     #[test_case("{}", false; "legacy_default")]
     #[test_case(r#"{"automatic_wakes_suppressed":false}"#, false; "explicit_false")]
@@ -1677,16 +1680,24 @@ mod tests {
         );
     }
 
-    #[test_case("{}", None; "empty_controls")]
-    #[test_case(r#"{"inbound":null}"#, None; "no_override")]
-    #[test_case(r#"{"inbound":"hold"}"#, Some(StoredInboundPolicy::Hold); "override_only")]
-    #[test_case(r#"{"inbound":"hold","delivered":7,"sends":11}"#, Some(StoredInboundPolicy::Hold); "legacy_budget_counters_ignored")]
+    #[test_case("{}", None, None; "empty_controls")]
+    #[test_case(r#"{"inbound":null}"#, None, None; "no_override")]
+    #[test_case(r#"{"inbound":"hold"}"#, Some(StoredInboundPolicy::Hold), None; "override_only")]
+    #[test_case(r#"{"handle":"ci-watcher"}"#, None, Some(PEER_HANDLE); "handle_only")]
+    #[test_case(r#"{"inbound":"hold","delivered":7,"sends":11}"#, Some(StoredInboundPolicy::Hold), None; "legacy_budget_counters_ignored")]
     fn peer_controls_missing_fields_use_defaults(
         source: &str,
         inbound: Option<StoredInboundPolicy>,
+        handle: Option<&str>,
     ) {
         let controls: StoredPeerControls = serde_json::from_str(source).unwrap();
-        assert_eq!(controls, StoredPeerControls { inbound });
+        assert_eq!(
+            controls,
+            StoredPeerControls {
+                inbound,
+                handle: handle.map(str::to_owned),
+            }
+        );
     }
 
     #[test_case(None, None; "no_override")]
@@ -1699,13 +1710,20 @@ mod tests {
         serialized_inbound: Option<&str>,
     ) {
         let (_temp, dir) = state_dir();
-        let controls = StoredPeerControls { inbound };
+        let controls = StoredPeerControls {
+            inbound,
+            handle: Some(PEER_HANDLE.into()),
+        };
         let mut session = TestSession::new("model", "/project");
         session.meta.peer_controls = Some(controls.clone());
         let serialized = serde_json::to_value(&session.meta).unwrap();
         assert_eq!(
             serialized["peer_controls"]["inbound"].as_str(),
             serialized_inbound
+        );
+        assert_eq!(
+            serialized["peer_controls"]["handle"].as_str(),
+            Some(PEER_HANDLE)
         );
         session.save(&dir).unwrap();
 

@@ -329,6 +329,7 @@ pub(crate) mod test_support {
     const PEER_MESSAGE_ID: &str = "peer-message-id";
     const PEER_SESSION_ID: &str = "peer-session-id";
     const PEER_NAME: &str = "Parser reviewer";
+    const PEER_HANDLE: &str = "parser-reviewer";
     const PEER_REPLY_TARGET: &str = "local-reviewer";
     const PEER_REPLY_TO: &str = "original-peer-message";
     const PEER_OPEN: &str = "<peer-message>";
@@ -340,6 +341,7 @@ pub(crate) mod test_support {
             message_id: PEER_MESSAGE_ID.into(),
             sender_session_id: PEER_SESSION_ID.into(),
             sender_name: PEER_NAME.into(),
+            sender_handle: Some(PEER_HANDLE.into()),
             reply_target: PEER_REPLY_TARGET.into(),
             reply_to: Some(PEER_REPLY_TO.into()),
         }
@@ -353,6 +355,7 @@ pub(crate) mod test_support {
             ("message_id", Some(origin.message_id.as_str())),
             ("sender_session_id", Some(origin.sender_session_id.as_str())),
             ("sender_name", Some(origin.sender_name.as_str())),
+            ("sender_handle", origin.sender_handle.as_deref()),
             ("reply_target", Some(origin.reply_target.as_str())),
             ("reply_to", origin.reply_to.as_deref()),
             ("body", Some(body)),

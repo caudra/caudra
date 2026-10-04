@@ -20,6 +20,8 @@ const MESSAGES_HELP: &str = "Usage: /messages [help | approve ID | reject ID | i
 const DISCOVERY_STOPPED: &str = "Peer discovery stopped before returning a result";
 const MODAL_BLOCKED: &str = "Finish the pending session review before opening the peer manager";
 const QUEUED: &str = "Message queued for the next safe boundary; an idle session may start after closing the manager";
+const UNNAMED: &str =
+    "this session continues without it and reclaims it when resumed while it is free";
 const REJECTED: &str = "Message rejected and removed from the live inbox";
 
 type DiscoveryResult = Result<Vec<PeerSummary>, String>;
@@ -212,6 +214,9 @@ impl SessionRuntime {
             self.app.state.session.meta.peer_controls.clone(),
         ) {
             Ok(session) => {
+                if let Err(error) = session.claim_handle() {
+                    self.peer_notice(format!("{error}; {UNNAMED}"));
+                }
                 self.peer = Some(PeerRegistration::new(session));
             }
             Err(error) => self.app.flash(format!("{UNAVAILABLE}: {error}")),

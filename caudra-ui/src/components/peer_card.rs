@@ -13,6 +13,7 @@ use crate::theme;
 
 const EMPTY: &str = "No reachable peers. Both sessions must enable cross-session messaging.";
 const TARGET_LABEL: &str = "Target: ";
+const NAME_LABEL: &str = "Name: ";
 const WORKSPACE_LABEL: &str = "Workspace: ";
 const MESSAGE_LABEL: &str = "Message: ";
 const REASON_LABEL: &str = "Reason: ";
@@ -32,9 +33,12 @@ pub(crate) fn render(output: &PeerOutput, budget: usize, width: u16) -> (Vec<Lin
                     lines.push(Line::default());
                 }
                 lines.push(Line::from(Span::styled(
-                    peer.name.escape_debug().to_string(),
+                    peer.title.escape_debug().to_string(),
                     theme.tool_prefix,
                 )));
+                if let Some(address) = peer.handle_address() {
+                    lines.push(labelled(NAME_LABEL, &address, theme.tool_path));
+                }
                 lines.push(labelled(TARGET_LABEL, &peer.target, theme.tool_path));
                 lines.push(Line::from(vec![
                     Span::styled(session_state(peer), theme.tool),
@@ -140,7 +144,7 @@ mod tests {
     use ratatui::text::Line;
     use test_case::test_case;
 
-    use super::{EMPTY, render};
+    use super::{EMPTY, NAME_LABEL, render};
     use crate::components::code_view::{BatchViews, RenderLimits, RowTarget, render_tool_content};
     use crate::theme;
 
@@ -148,6 +152,7 @@ mod tests {
     const TARGET: &str = "calm-blue-wren";
     const MESSAGE: &str = "kind-amber-fox";
     const NAME: &str = "Review session";
+    const HANDLE: &str = "review-agent";
     const WORKSPACE: &str = "/workspace/review";
     const REASON: &str = "The destination is waiting for the reader to review this message.";
     const HOSTILE: &str = "**literal**\x1b]8;;evil\x07\r\n\t\u{85}\u{202e}";
@@ -157,7 +162,8 @@ mod tests {
     fn session() -> PeerSummary {
         PeerSummary {
             target: TARGET.into(),
-            name: NAME.into(),
+            title: NAME.into(),
+            handle: None,
             cwd: PathBuf::from(WORKSPACE),
             busy: false,
             blocked: false,
@@ -241,6 +247,20 @@ mod tests {
             assert!(drawn.contains(expected), "{drawn}");
         }
         assert!(!drawn.contains("session_id"));
+    }
+
+    #[test_case(Some(HANDLE), true; "named")]
+    #[test_case(None, false; "unnamed")]
+    fn only_named_peers_show_the_address_send_message_accepts(handle: Option<&str>, shown: bool) {
+        let output = PeerOutput::Sessions {
+            sessions: vec![PeerSummary {
+                handle: handle.map(str::to_owned),
+                ..session()
+            }],
+        };
+        let drawn = text(&render(&output, usize::MAX, WIDTH).0);
+        assert_eq!(drawn.contains(&format!("{NAME_LABEL}@{HANDLE}")), shown);
+        assert_eq!(drawn.contains(NAME_LABEL), shown);
     }
 
     #[test]
@@ -337,7 +357,8 @@ mod tests {
             PeerOutput::Sessions {
                 sessions: vec![PeerSummary {
                     target: HOSTILE.into(),
-                    name: HOSTILE.into(),
+                    title: HOSTILE.into(),
+                    handle: Some(HOSTILE.into()),
                     cwd: PathBuf::from(HOSTILE),
                     ..session()
                 }],
