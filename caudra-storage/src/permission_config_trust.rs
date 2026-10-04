@@ -280,6 +280,6 @@ mod tests {
         trust_project(&state_dir, &project, DIGEST).unwrap();
 
         assert!(is_project_trusted(&persistent, &project, DIGEST).unwrap());
-        assert!(!state_dir.path().join("caudra.sqlite").exists());
+        assert!(!state_dir.path().join("caudra.db").exists());
     }
 }

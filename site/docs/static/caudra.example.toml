@@ -897,7 +897,7 @@ version = 1
 # Type: integer.
 # timeout_ms = 800
 
-# Retain bounded decision records in the separate local `decisions.db`.
+# Retain bounded decision records in the local `caudra.db`.
 # Type: boolean.
 # log = false
 

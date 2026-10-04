@@ -148,6 +148,21 @@ impl JournalAdmission {
         }
         Ok(file)
     }
+
+    pub(super) fn lock_for_cutover(self, path: &Path) -> Result<File, RemoteOperationJournalError> {
+        let (file, metadata) =
+            open_source(path)?.ok_or(RemoteOperationJournalError::AdmissionChanged)?;
+        file.try_lock()
+            .map_err(crate::database_cutover::offline_error)?;
+        self.recheck(path)?;
+        if !self.0[0]
+            .as_ref()
+            .is_some_and(|entry| same_file(&entry.metadata, &metadata))
+        {
+            return Err(RemoteOperationJournalError::AdmissionChanged);
+        }
+        Ok(file)
+    }
 }
 
 fn open_source(path: &Path) -> Result<Option<(File, Metadata)>, RemoteOperationJournalError> {

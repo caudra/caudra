@@ -1,5 +1,5 @@
 //! `/decisions`: the engine as the permission manager holds it, beside the
-//! activity `decisions.db` logged, which a blocking thread reads for every
+//! decision log in `caudra.db`, which a blocking thread reads for every
 //! scope at once.
 
 use std::sync::{Arc, LazyLock};
@@ -119,7 +119,7 @@ fn read_decisions(
     }
 }
 
-/// `None` when nothing was ever logged here.
+/// `None` when the canonical database is absent.
 fn read_scopes(
     state_dir: &StateDir,
     thresholds: &DecisionThresholds,
@@ -160,13 +160,15 @@ mod tests {
     use caudra_config::decisions::{DecisionFeatures, FeatureMode};
     use caudra_decision::{DecisionEngine, DecisionError, DecisionRequest, DecisionResponse};
     use caudra_storage::decision_log::{DecisionEffect, DecisionRecord, EndpointKind};
+    use caudra_storage::sessions::{SESSIONS_DB_FILE, SessionDatabase};
     use serde_json::json;
     use tempfile::TempDir;
+    use test_case::test_case;
 
     use super::*;
     use crate::agent::shared_queue;
     use crate::app::Msg;
-    use crate::app::tests::{DECISIONS_TEST_BASE_URL, click_status, tempdir_app};
+    use crate::app::tests::{DECISIONS_TEST_BASE_URL, click_status, private_tempdir, tempdir_app};
     use crate::components::keybindings::key;
     use crate::components::now_secs;
     use crate::components::status_bar::StatusBarHitTarget;
@@ -200,8 +202,7 @@ mod tests {
         }
     }
 
-    /// The log is one file in the state directory, which `test_app` shares
-    /// across the whole run.
+    /// Isolate the canonical database from other apps on this test thread.
     fn isolated_app() -> (TempDir, App) {
         let (tmp, _dir, _writer, mut app) = tempdir_app();
         let (queue, _receiver) = shared_queue::queue();
@@ -296,14 +297,32 @@ mod tests {
         assert_eq!(ready(&state).session, session);
     }
 
-    #[test]
-    fn a_missing_log_reads_as_missing_and_is_never_created() {
-        let (_tmp, mut app) = isolated_app();
+    #[test_case(false; "missing_database_is_not_created")]
+    #[test_case(true; "empty_canonical_database_is_readable")]
+    fn empty_decision_log_reads_the_canonical_database(existing: bool) {
+        let tmp = private_tempdir();
+        let state = StateDir::from_path(tmp.path().to_path_buf());
+        if existing {
+            drop(SessionDatabase::open(&state).unwrap());
+        }
 
-        app.execute_decisions("");
+        let scopes = read_scopes(
+            &state,
+            &DecisionThresholds::default(),
+            OTHER_SESSION,
+            OTHER_PROJECT,
+        )
+        .unwrap();
 
-        assert!(matches!(*settled(&app), DecisionsFetchState::Missing));
-        assert!(!DecisionLog::file_path(&app.storage).exists());
+        assert_eq!(scopes.is_some(), existing);
+        if let Some(scopes) = scopes {
+            assert!(
+                scopes
+                    .iter()
+                    .all(|scope| scope.stats.is_empty() && scope.recent.is_empty())
+            );
+        }
+        assert_eq!(state.path().join(SESSIONS_DB_FILE).exists(), existing);
     }
 
     #[test]

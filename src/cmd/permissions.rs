@@ -20,7 +20,7 @@ use serde_json::json;
 use crate::cli::PermissionAction;
 
 const MAX_CANDIDATE_BYTES: u64 = 1024 * 1024;
-const INVALID_DATABASE_PATH: &str = "--database requires an existing canonical absolute path named caudra.sqlite, without symlink or hard-link aliases";
+const INVALID_DATABASE_PATH: &str = "--database requires an existing canonical absolute path named caudra.db, without symlink or hard-link aliases";
 const AUDIT_DATABASE_UNSUPPORTED: &str =
     "--database is not accepted by permissions audit; use --log to select its input";
 const LIMITATIONS: &[&str] = &[
@@ -250,7 +250,7 @@ mod tests {
         );
     }
 
-    #[test_case("/not/opened/caudra.sqlite"; "audit_rejects_database_without_opening_it")]
+    #[test_case("/not/opened/caudra.db"; "audit_rejects_database_without_opening_it")]
     fn audit_requires_log_selection(path: &str) {
         let action = PermissionAction::Audit {
             log: None,

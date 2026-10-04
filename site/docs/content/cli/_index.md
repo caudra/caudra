@@ -35,7 +35,7 @@ caudra decisions export --feature permission > decisions.jsonl
 caudra decisions purge --yes
 ```
 
-`status` shows effective configuration without contacting the endpoint. Reachability is `not_probed`. `stats` prints JSON with counts, errors, latency percentiles and labelled agreement, using the currently configured thresholds. `acted_count` counts the rows whose effect is not `none`, and `last_timestamp` is the newest row's time in epoch seconds. `export` writes JSONL with only labelled questions in laya-evals format. These commands do not enable logging or create a decision database. `purge --yes` removes recorded decisions and labels, not shell duration history.
+`status` shows effective configuration without contacting the endpoint. Reachability is `not_probed`. `stats` prints JSON with counts, errors, latency percentiles and labelled agreement, using the currently configured thresholds. `acted_count` counts the rows whose effect is not `none`, and `last_timestamp` is the newest row's time in epoch seconds. `export` writes JSONL with only labelled questions in laya-evals format. These commands do not enable logging or create a database. The decision log uses tables in `caudra.db`. `purge --yes` deletes recorded decisions and labels from those live tables, leaving sessions, messages, and shell duration history intact. It does not erase copies in SQLite free pages, WAL files, or backups.
 
 `stats` and `export` accept `--feature`. Log feature names are `permission`, `auto`, `shell_effect`, `content`, `shell_duration`, `tool_search`, `skill_suggestions`, `goal`, `subagent_routing`, and `workflow`. They differ from some configuration keys. With no database, statistics are empty and export writes nothing. Administration requires local persistent storage and rejects `--ephemeral` and `--workcell`.
 
@@ -208,13 +208,13 @@ Audit permission events, discover review-only command patterns, inspect stored r
 
 For interactive New, Edit, Duplicate, Copy, and Revoke controls, use the TUI's [`/permissions` manager](/docs/permissions/#stored-rules). These are not `caudra permissions` subcommands.
 
-`discover`, `inventory`, `repair-review`, and `rebind` accept `--database <ABSOLUTE_CAUDRA_SQLITE>` before or after the subcommand. The path must name an existing canonical absolute `caudra.sqlite` file. Symlink and hard-link aliases are rejected. Selecting a database creates no database or directories. Inventory, repair, and rebind reports identify the selected database path. Discovery reports a hashed source identity.
+`discover`, `inventory`, `repair-review`, and `rebind` accept `--database <ABSOLUTE_CAUDRA_DB>` before or after the subcommand. The path must name an existing canonical absolute `caudra.db` file. Symlink and hard-link aliases are rejected. Selecting a database creates no database or directories. Inventory, repair, and rebind reports identify the selected database path. Discovery reports a hashed source identity.
 
 Without `--database`, commands use this build's data namespace. Development builds default to `caudra-debug`, not the production `caudra` namespace. To preview repair of the standard Linux production database with a development binary, select it explicitly:
 
 ```bash
 ./target/debug/caudra permissions repair-review \
-  --database "$HOME/.local/state/caudra/caudra.sqlite" --json
+  --database "$HOME/.local/state/caudra/caudra.db" --json
 ```
 
 Use the actual production path if your state directory differs. Keep the same `--database` selection when moving from inspection to apply.
@@ -254,7 +254,7 @@ caudra permissions rebind --old-root /work/old --new-root /work/new \
 caudra permissions discover
 caudra permissions discover --project /work/app --limit 10 \
   --since 2026-09-14T00:00:00Z --json
-caudra permissions --database "$HOME/.local/state/caudra/caudra.sqlite" \
+caudra permissions --database "$HOME/.local/state/caudra/caudra.db" \
   discover --project /work/app --limit 5
 ```
 
@@ -266,7 +266,7 @@ caudra permissions --database "$HOME/.local/state/caudra/caudra.sqlite" \
 | `--limit <COUNT>` | Maximum proposals, default 10 and clamped to 1 through 64 |
 | `--since <RFC3339>` | Include history records created at or after this timestamp, based on their UUIDv7 IDs |
 | `--json` | Emit pattern definitions, retained literal values, evidence, per-session counts, analysis diagnostics, assumptions, exclusions, and limits |
-| `--database <ABSOLUTE_CAUDRA_SQLITE>` | Read an explicitly selected database instead of the active data namespace |
+| `--database <ABSOLUTE_CAUDRA_DB>` | Read an explicitly selected database instead of the active data namespace |
 
 The project path must be bounded absolute UTF-8 without parent components or control characters. Historical paths are interpreted lexically, without resolving them through today's filesystem. A session's current stored cwd only approximates its historical project. Timestamps describe history creation, not execution time. Invalid, missing, or future dates are excluded.
 
@@ -307,7 +307,7 @@ Output reports the database path, retried, repaired, recovered, and unavailable 
 
 Before applying, stop every Caudra session and close all storage readers using this database, including old Caudra versions and sessions in other projects. Run `caudra storage path` with the production binary to locate its database, and check the repair report's database path. Apply requires exclusive administrative access and rechecks the stored metadata before committing the replacements atomically.
 
-When there are reviews to repair, apply automatically creates an owner-only, checked SQLite backup beside the database, named `caudra.sqlite.permission-review-<ID>.bak`. Human output prints its exact path after `SQLite backup:`. JSON output reports it in `backup`. A no-op apply creates no backup. Keep the backup private because it contains the full database, including the old metadata and session history.
+When there are reviews to repair, apply automatically creates an owner-only, checked SQLite backup beside the database, named `caudra.db.permission-review-<ID>.bak`. Human output prints its exact path after `SQLite backup:`. JSON output reports it in `backup`. A no-op apply creates no backup. Keep the backup private because it contains the full database, including the old metadata, session history, messages, and decision records.
 
 After a successful apply, restart Caudra with the updated version and inspect `/permissions` or `caudra permissions inventory` against the same database. A failed access check requires closing the remaining readers and rerunning the dry run before applying again. No permission re-approval is needed for a metadata-only repair.
 
@@ -539,6 +539,10 @@ caudra storage vacuum [--pages N]
 caudra storage usage  [--group-by GROUP] [--since DURATION] [--json]
 caudra storage usage  --prune-older-than DURATION
 ```
+
+Application state, peer-message history, and decision logs share `caudra.db`. The remote-operation recovery journal remains separate at `recovery/remote-operations.db`.
+
+Before upgrading from `caudra.sqlite` or `remote-operations.sqlite3`, stop old Caudra processes and close SQLite readers. The first writable open checkpoints pending SQLite data and renames the corresponding database without replacing an existing destination. Conflicting names or orphaned sidecars require offline recovery. Read-only inspection does not rename databases. Keep database files and their WAL sidecars together until the transition finishes. Older `messages.db` and `decisions.db` files are left untouched and are not imported.
 
 `snapshots` lists the [file change record](/docs/sessions/#file-revert) stores largest first, one row per workspace directory with its size, object count, records, holding sessions, open records, and pending reverts. A store whose directory is gone, or that no session works in any more, shows its key instead, and `--json` always gives both. `--records` also lists each holding session with its record count. A store that no existing session holds is reported as orphaned rather than skipped.
 

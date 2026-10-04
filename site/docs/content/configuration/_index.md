@@ -501,7 +501,7 @@ Connection settings and thresholds are global-only. Projects may set individual 
 | `allow_remote` | boolean | `false` | Explicit global consent to send decision context to a non-loopback endpoint. |
 | `allow_http` | boolean | `false` | Global-only opt-in for non-loopback HTTP. Also requires `allow_remote = true`. Use only with transport protection you control, such as a trusted encrypted tunnel. |
 | `timeout_ms` | integer | `800` | Positive decision-request deadline in milliseconds, separate from shell execution timeouts. |
-| `log` | boolean | `false` | Retain bounded decision records in the separate local `decisions.db`. |
+| `log` | boolean | `false` | Retain bounded decision records in the local `caudra.db`. |
 | `log_retention_days` | integer | `90` | Positive retention period for decision records. |
 | `features` | table | `{}` | Per-feature modes below. |
 | `thresholds` | table | `{}` | Probability thresholds, all finite and within 0–1 inclusive. |

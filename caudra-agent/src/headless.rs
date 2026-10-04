@@ -3379,6 +3379,7 @@ mod tests {
         StreamResponse, TaskEventOrigin,
     };
     use caudra_storage::background::TaskRecord;
+    use caudra_storage::decision_log::DecisionLog;
     use caudra_storage::permission_state::PermissionRuleRecord;
     use caudra_storage::permission_state::mutation::{
         PermissionMutation, PermissionRecordIdentity, prepare_mutation,
@@ -3492,7 +3493,7 @@ mod tests {
         first.mark_tainted();
         assert!(manager.decisions().unwrap().is_tainted());
         assert!(!second.is_tainted());
-        assert!(!state.path().join("decisions.db").exists());
+        assert!(!DecisionLog::file_path(&state).exists());
     }
 
     #[test]
@@ -3522,7 +3523,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(!state.path().join("decisions.db").exists());
+        assert!(!DecisionLog::file_path(&state).exists());
     }
 
     #[test_case("!pwd", Some("pwd"); "visible_command")]

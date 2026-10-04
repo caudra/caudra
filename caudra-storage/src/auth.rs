@@ -785,7 +785,7 @@ mod tests {
     fn workcell_credential_crud_is_purpose_specific_and_owner_only() {
         const NAME: &str = "production";
         const TOKEN: &str = "bearer-private-value";
-        const SESSION_DATABASE: &str = "caudra.sqlite";
+        const SESSION_DATABASE: &str = "caudra.db";
 
         let tmp = TempDir::new().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());

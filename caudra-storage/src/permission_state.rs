@@ -1941,7 +1941,7 @@ mod tests {
             PermissionState::open(&persistent).unwrap().records().len(),
             1
         );
-        assert!(!state_dir.path().join("caudra.sqlite").exists());
+        assert!(!state_dir.path().join("caudra.db").exists());
     }
 
     fn review() -> PermissionReview {

@@ -1,7 +1,7 @@
 //! `/decisions`: what the decision engine is set to, how it is doing, and
 //! what it decided. Overview and Features read the configuration and the
 //! service's cached health on every frame. Activity and Recent read
-//! `decisions.db`, which a background task loads for every scope at once.
+//! the decision log in `caudra.db`, loaded for every scope by a background task.
 //! Nothing here changes the engine or contacts it.
 
 mod lines;
@@ -163,10 +163,10 @@ enum FooterCommand {
     Close,
 }
 
-/// What the background read of `decisions.db` produced.
+/// What the background read of the decision log produced.
 pub enum DecisionsFetchState {
     Loading,
-    /// Nothing has been logged on this machine yet.
+    /// The canonical database is absent.
     Missing,
     Ready(Box<DecisionsSnapshot>),
     Failed(String),
@@ -1010,13 +1010,13 @@ mod tests {
     const MODEL: &str = "typesafe-test";
     const CONTROL_MODEL: &str = "test-model\n\u{1b}[2J";
     const BASE_URL: &str = "http://127.0.0.1:8080/typesafe";
-    const LOG_PATH: &str = "/state/decisions.db";
+    const LOG_PATH: &str = "/state/caudra.db";
     const LOADED_AT: &str = "12:34:56";
     const STATE_MARKER: &str = "state-marker";
     const LABEL_KEY: &str = "expected";
     const LABEL_SOURCE: &str = "user";
     const QUESTION_SET_VERSION: &str = "1";
-    const FAILURE: &str = "decisions.db is unreadable";
+    const FAILURE: &str = "decision log is unreadable";
     const ENGINE_ERROR: &str = "unreachable";
     const HIDDEN_URL_PARTS: [&str; 6] = [
         "private-user",

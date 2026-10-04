@@ -9,9 +9,9 @@ use crate::{StateDir, StorageError, shared_state_lock, try_exclusive_state_lock}
 
 use super::{SESSIONS_DB_LOCK_FILE, SessionError};
 
-const ACTIVE_LEASE_PREFIX: &str = "caudra.sqlite.active-";
+const ACTIVE_LEASE_PREFIX: &str = "caudra.db.active-";
 const ACTIVE_LEASE_SUFFIX: &str = ".lock";
-const ACTIVE_LEASE_CATALOG: &str = "caudra.sqlite.active.lock";
+const ACTIVE_LEASE_CATALOG: &str = "caudra.db.active.lock";
 const OWNER_FILE_MODE: u32 = 0o600;
 
 type LeaseKey = (PathBuf, CaudraId);

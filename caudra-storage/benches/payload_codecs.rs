@@ -16,7 +16,7 @@ use rusqlite::{Connection, OpenFlags};
 use std::io::{Read, Write};
 
 const DATABASE_ENV: &str = "CAUDRA_BENCH_DB";
-const DEFAULT_DATABASE: &str = ".local/state/caudra/caudra.sqlite";
+const DEFAULT_DATABASE: &str = ".local/state/caudra/caudra.db";
 const TABLES: [&str; 3] = [
     "main_history_items",
     "tool_outputs",

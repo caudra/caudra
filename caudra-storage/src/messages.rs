@@ -3,24 +3,14 @@
 //! on every topic. One database serves every project, so retention is global.
 
 use crate::StateDir;
+use crate::sessions::{SESSIONS_DB_FILE, SessionDatabase, SessionError};
 use rusqlite::types::{ToSql, Type};
-use rusqlite::{Connection, OpenFlags, Row, TransactionBehavior, params};
+use rusqlite::{Row, TransactionBehavior, params};
 use serde::Serialize;
 use std::cmp::Reverse;
 use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
-use std::io;
-#[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::path::PathBuf;
 
-pub const MESSAGES_DB_FILE: &str = "messages.db";
-const SCHEMA_VERSION: i64 = 1;
-const APPLICATION_ID: i64 = 0x4341_4d4c;
-const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(unix)]
-const OWNER_FILE_MODE: u32 = 0o600;
 const MS_PER_DAY: u64 = 86_400_000;
 const DIRECT: &str = "direct";
 const TOPIC: &str = "topic";
@@ -41,7 +31,7 @@ const DIRECT_FILTER: &str = "m.kind = 'direct' AND EXISTS (
 const NAMED_FILTER: &str = "m.kind = 'direct' AND (m.sender_handle = ?3 OR EXISTS (
     SELECT 1 FROM deliveries d WHERE d.seq = m.seq AND d.recipient_handle = ?3))";
 const ALL_FILTER: &str = "1";
-const SCHEMA: &str = "
+pub(crate) const SCHEMA: &str = "
 CREATE TABLE messages (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
     sender_route TEXT NOT NULL,
@@ -80,18 +70,46 @@ CREATE TABLE cursors (
     seq INTEGER NOT NULL,
     PRIMARY KEY (session, topic)
 );
+CREATE TABLE message_history_revision (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    revision INTEGER NOT NULL CHECK (revision >= 0)
+) STRICT;
+INSERT INTO message_history_revision (id, revision) VALUES (1, 0);
+CREATE TRIGGER messages_insert_revision AFTER INSERT ON messages BEGIN
+    UPDATE message_history_revision SET revision = revision + 1 WHERE id = 1;
+END;
+CREATE TRIGGER messages_update_revision AFTER UPDATE ON messages BEGIN
+    UPDATE message_history_revision SET revision = revision + 1 WHERE id = 1;
+END;
+CREATE TRIGGER messages_delete_revision AFTER DELETE ON messages BEGIN
+    UPDATE message_history_revision SET revision = revision + 1 WHERE id = 1;
+END;
+CREATE TRIGGER deliveries_insert_revision AFTER INSERT ON deliveries BEGIN
+    UPDATE message_history_revision SET revision = revision + 1 WHERE id = 1;
+END;
+CREATE TRIGGER deliveries_update_revision AFTER UPDATE ON deliveries BEGIN
+    UPDATE message_history_revision SET revision = revision + 1 WHERE id = 1;
+END;
+CREATE TRIGGER deliveries_delete_revision AFTER DELETE ON deliveries BEGIN
+    UPDATE message_history_revision SET revision = revision + 1 WHERE id = 1;
+END;
+CREATE TRIGGER cursors_insert_revision AFTER INSERT ON cursors BEGIN
+    UPDATE message_history_revision SET revision = revision + 1 WHERE id = 1;
+END;
+CREATE TRIGGER cursors_update_revision AFTER UPDATE ON cursors BEGIN
+    UPDATE message_history_revision SET revision = revision + 1 WHERE id = 1;
+END;
+CREATE TRIGGER cursors_delete_revision AFTER DELETE ON cursors BEGIN
+    UPDATE message_history_revision SET revision = revision + 1 WHERE id = 1;
+END;
 ";
 
 #[derive(Debug, thiserror::Error)]
 pub enum MessageLogError {
-    #[error("message history I/O failed: {0}")]
-    Io(#[from] io::Error),
+    #[error("message history storage operation failed: {0}")]
+    Session(#[from] SessionError),
     #[error("message history database operation failed: {0}")]
     Sqlite(#[from] rusqlite::Error),
-    #[error("unsupported message history schema")]
-    UnsupportedSchema,
-    #[error("unsafe message history file; expected an owner-only regular file")]
-    UnsafeFile,
     #[error("invalid message history field: {0}")]
     Invalid(&'static str),
 }
@@ -228,17 +246,16 @@ pub struct DeliveryRecord {
 /// Changes whenever the history does, whichever connection wrote.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryVersion {
-    data: i64,
-    local: u64,
+    revision: i64,
 }
 
 pub struct MessageLog {
-    connection: Connection,
+    database: SessionDatabase,
 }
 
 impl MessageLog {
     pub fn file_path(state_dir: &StateDir) -> PathBuf {
-        state_dir.path().join(MESSAGES_DB_FILE)
+        state_dir.path().join(SESSIONS_DB_FILE)
     }
 
     /// Creates the history on first use and prunes it to `retention`.
@@ -247,52 +264,11 @@ impl MessageLog {
         retention: &Retention,
         now_ms: u64,
     ) -> Result<Self, MessageLogError> {
-        fs::create_dir_all(state_dir.path())?;
-        let path = Self::file_path(state_dir);
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(OWNER_FILE_MODE);
-        match options.open(&path) {
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
-        }
-        let log = Self::connect(&path)?;
+        let log = Self {
+            database: SessionDatabase::open_state(state_dir)?,
+        };
         log.prune(retention, now_ms)?;
         Ok(log)
-    }
-
-    fn connect(path: &Path) -> Result<Self, MessageLogError> {
-        verify_files(path)?;
-        let mut connection = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX
-                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        )?;
-        connection.busy_timeout(BUSY_TIMEOUT)?;
-        connection.pragma_update(None, "trusted_schema", false)?;
-        connection.pragma_update(None, "foreign_keys", true)?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let version: i64 =
-            transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        let application: i64 =
-            transaction.pragma_query_value(None, "application_id", |row| row.get(0))?;
-        if version == 0 && application == 0 {
-            if schema_objects(&transaction)? != 0 {
-                return Err(MessageLogError::UnsupportedSchema);
-            }
-            transaction.execute_batch(SCHEMA)?;
-            transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
-            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        } else if version != SCHEMA_VERSION || application != APPLICATION_ID {
-            return Err(MessageLogError::UnsupportedSchema);
-        }
-        transaction.commit()?;
-        // Every live session writes here, so readers must not wait on a writer.
-        connection.pragma_update(None, "journal_mode", "WAL")?;
-        Ok(Self { connection })
     }
 
     /// Records `message` with a pending row for each recipient. Recording a
@@ -306,7 +282,8 @@ impl MessageLog {
         let created = sql_ms(message.created_ms)?;
         let sender = &message.sender;
         let transaction = self
-            .connection
+            .database
+            .connection_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "INSERT INTO messages (sender_route, message_id, kind, topic, sender_session,
@@ -367,7 +344,7 @@ impl MessageLog {
         reason: Option<&str>,
         now_ms: u64,
     ) -> Result<(), MessageLogError> {
-        self.connection.execute(
+        self.database.connection().execute(
             "UPDATE deliveries SET status = ?4, reason = ?5, updated_ms = ?6
              WHERE seq = (SELECT seq FROM messages WHERE sender_route = ?1 AND message_id = ?2)
                AND recipient_session = ?3 AND status IN ('pending', 'unknown')",
@@ -394,7 +371,7 @@ impl MessageLog {
         reason: Option<&str>,
         now_ms: u64,
     ) -> Result<(), MessageLogError> {
-        self.connection.execute(
+        self.database.connection().execute(
             "INSERT INTO deliveries (seq, recipient_session, recipient_name, recipient_handle,
                 status, reason, updated_ms)
              SELECT seq, ?3, ?4, ?5, ?6, ?7, ?8 FROM messages
@@ -426,7 +403,7 @@ impl MessageLog {
         sender_route: &str,
         message_id: &str,
     ) -> Result<(), MessageLogError> {
-        self.connection.execute(
+        self.database.connection().execute(
             "INSERT INTO cursors (session, topic, seq)
              SELECT ?1, topic, seq FROM messages
              WHERE sender_route = ?2 AND message_id = ?3 AND kind = 'topic'
@@ -444,7 +421,7 @@ impl MessageLog {
         matches: impl Fn(&str) -> bool,
         limit: usize,
     ) -> Result<Vec<StoredMessage>, MessageLogError> {
-        let mut statement = self.connection.prepare(&format!(
+        let mut statement = self.database.connection().prepare(&format!(
             "SELECT {MESSAGE_COLUMNS} FROM (
                  SELECT topic, MAX(seq) AS seq FROM messages
                  WHERE kind = 'topic' AND sender_session != ?1
@@ -470,7 +447,7 @@ impl MessageLog {
 
     /// Every topic with a message, most recently active first.
     pub fn directory(&self) -> Result<Vec<TopicSummary>, MessageLogError> {
-        let mut statement = self.connection.prepare(
+        let mut statement = self.database.connection().prepare(
             "SELECT topic, COUNT(*), MAX(seq), MAX(created_ms) FROM messages
              WHERE kind = 'topic' GROUP BY topic ORDER BY MAX(seq) DESC",
         )?;
@@ -504,7 +481,7 @@ impl MessageLog {
             HistoryChannel::Named(handle) => (NAMED_FILTER, vec![handle.clone()]),
             HistoryChannel::All => (ALL_FILTER, Vec::new()),
         };
-        let mut statement = self.connection.prepare(&format!(
+        let mut statement = self.database.connection().prepare(&format!(
             "SELECT {MESSAGE_COLUMNS} FROM messages m
              WHERE m.seq < ?1 AND {filter} ORDER BY m.seq DESC LIMIT ?2"
         ))?;
@@ -529,7 +506,7 @@ impl MessageLog {
                 last_ms: topic.last_ms,
             })
             .collect();
-        channels.extend(self.connection.query_row(
+        channels.extend(self.database.connection().query_row(
             "SELECT COUNT(*), MAX(seq), MAX(created_ms) FROM messages WHERE kind = 'broadcast'",
             [],
             |row| {
@@ -552,7 +529,7 @@ impl MessageLog {
     }
 
     fn conversations(&self, session: &str) -> Result<Vec<ChannelSummary>, MessageLogError> {
-        let mut statement = self.connection.prepare(
+        let mut statement = self.database.connection().prepare(
             "SELECT CASE WHEN m.sender_session = ?1 THEN d.recipient_session
                          ELSE m.sender_session END,
                     m.sender_session = ?1, m.seq, m.created_ms, m.sender_name,
@@ -600,7 +577,7 @@ impl MessageLog {
         if seqs.is_empty() {
             return Ok(Vec::new());
         }
-        let mut statement = self.connection.prepare(
+        let mut statement = self.database.connection().prepare(
             "SELECT seq, recipient_session, recipient_name, recipient_handle, status, reason,
                 updated_ms
              FROM deliveries WHERE seq IN (SELECT value FROM json_each(?1))
@@ -622,10 +599,11 @@ impl MessageLog {
 
     pub fn version(&self) -> Result<HistoryVersion, MessageLogError> {
         Ok(HistoryVersion {
-            data: self
-                .connection
-                .query_row("PRAGMA data_version", [], |row| row.get(0))?,
-            local: self.connection.total_changes(),
+            revision: self.database.connection().query_row(
+                "SELECT revision FROM message_history_revision WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )?,
         })
     }
 
@@ -633,13 +611,13 @@ impl MessageLog {
     /// each topic, then the oldest beyond `retention.max_messages`.
     pub fn prune(&self, retention: &Retention, now_ms: u64) -> Result<usize, MessageLogError> {
         let cutoff = sql_ms(now_ms.saturating_sub(retention.days.saturating_mul(MS_PER_DAY)))?;
-        let aged = self.connection.execute(
+        let aged = self.database.connection().execute(
             "DELETE FROM messages WHERE created_ms < ?1
                AND seq NOT IN (SELECT MAX(seq) FROM messages WHERE kind = 'topic' GROUP BY topic)",
             [cutoff],
         )?;
         let kept = i64::try_from(retention.max_messages).unwrap_or(i64::MAX);
-        let excess = self.connection.execute(
+        let excess = self.database.connection().execute(
             "DELETE FROM messages
              WHERE seq <= (SELECT seq FROM messages ORDER BY seq DESC LIMIT 1 OFFSET ?1)",
             [kept],
@@ -693,48 +671,14 @@ fn sql_ms(value: u64) -> Result<i64, MessageLogError> {
     i64::try_from(value).map_err(|_| MessageLogError::Invalid("timestamp"))
 }
 
-fn verify_file(path: &Path) -> Result<(), MessageLogError> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(MessageLogError::UnsafeFile);
-    }
-    #[cfg(unix)]
-    if metadata.permissions().mode() & 0o777 != OWNER_FILE_MODE {
-        return Err(MessageLogError::UnsafeFile);
-    }
-    Ok(())
-}
-
-/// The database and whichever of its sidecars exist.
-fn verify_files(path: &Path) -> Result<(), MessageLogError> {
-    verify_file(path)?;
-    for suffix in ["-journal", "-wal", "-shm"] {
-        let mut sidecar = path.as_os_str().to_owned();
-        sidecar.push(suffix);
-        match verify_file(Path::new(&sidecar)) {
-            Err(MessageLogError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
-            result => result?,
-        }
-    }
-    Ok(())
-}
-
-fn schema_objects(connection: &Connection) -> Result<i64, MessageLogError> {
-    Ok(connection.query_row(
-        "SELECT COUNT(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
-        [],
-        |row| row.get(0),
-    )?)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        HistoryChannel, MESSAGES_DB_FILE, MessageAudience, MessageChannel, MessageLog,
-        MessageLogError, MessageRecipient, MessageSender, NewMessage, OWNER_FILE_MODE, Retention,
-        TopicSummary,
+        HistoryChannel, MessageAudience, MessageChannel, MessageLog, MessageLogError,
+        MessageRecipient, MessageSender, NewMessage, Retention, SCHEMA, TopicSummary,
     };
     use crate::StateDir;
+    use crate::sessions::{SESSIONS_DB_FILE, SessionError};
     use rusqlite::{Connection, params};
     use std::fs::{self, Permissions};
     use std::os::unix::fs::PermissionsExt;
@@ -742,6 +686,11 @@ mod tests {
     use test_case::test_case;
 
     const NOW_MS: u64 = 10_000_000_000;
+    const OWNER_FILE_MODE: u32 = 0o600;
+    const LEGACY_FILE: &str = "messages.db";
+    const LEGACY_SIDECARS: [&str; 3] =
+        ["messages.db-wal", "messages.db-shm", "messages.db-journal"];
+    const LEGACY_SIDECAR_BYTES: &[u8] = b"untouched legacy message sidecar";
     const DAY_MS: u64 = 86_400_000;
     const RETENTION_DAYS: u64 = 30;
     const MAX_MESSAGES: u64 = 50_000;
@@ -764,6 +713,7 @@ mod tests {
     const PENDING: &str = "pending";
     const HELD: &str = "held";
     const HOLD_REASON: &str = "Receiver policy requires local approval";
+    const SESSION_ID: [u8; 16] = [1; 16];
     const LIMIT: usize = 10;
     /// Above SQLite's default limit of 32,766 bound parameters.
     const MANY_TOPICS: usize = 40_000;
@@ -827,7 +777,8 @@ mod tests {
     }
 
     fn delivery(log: &MessageLog, seq: i64) -> (String, Option<String>, Option<String>) {
-        log.connection
+        log.database
+            .connection()
             .query_row(
                 "SELECT status, reason, recipient_name FROM deliveries
                  WHERE seq = ?1 AND recipient_session = ?2",
@@ -847,7 +798,7 @@ mod tests {
     #[test]
     fn opening_creates_an_owner_only_history_that_reopens() {
         let (root, state, mut log) = fixture();
-        let path = root.path().join(MESSAGES_DB_FILE);
+        let path = root.path().join(SESSIONS_DB_FILE);
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             OWNER_FILE_MODE
@@ -871,7 +822,7 @@ mod tests {
     fn unsafe_or_foreign_files_are_refused() {
         let root = tempdir().unwrap();
         let state = StateDir::from_path(root.path().to_path_buf());
-        let path = root.path().join(MESSAGES_DB_FILE);
+        let path = root.path().join(SESSIONS_DB_FILE);
         Connection::open(&path)
             .unwrap()
             .execute_batch("CREATE TABLE other (value TEXT);")
@@ -879,13 +830,103 @@ mod tests {
         fs::set_permissions(&path, Permissions::from_mode(0o644)).unwrap();
         assert!(matches!(
             MessageLog::open(&state, &retention(), NOW_MS),
-            Err(MessageLogError::UnsafeFile)
+            Err(MessageLogError::Session(SessionError::Storage(_)))
         ));
         fs::set_permissions(&path, Permissions::from_mode(OWNER_FILE_MODE)).unwrap();
         assert!(matches!(
             MessageLog::open(&state, &retention(), NOW_MS),
-            Err(MessageLogError::UnsupportedSchema)
+            Err(MessageLogError::Session(_))
         ));
+    }
+
+    #[test]
+    fn legacy_history_and_sidecars_are_neither_imported_nor_changed() {
+        let root = tempdir().unwrap();
+        let state = StateDir::from_path(root.path().to_path_buf());
+        let legacy_path = state.path().join(LEGACY_FILE);
+        let legacy = Connection::open(&legacy_path).unwrap();
+        legacy.execute_batch(SCHEMA).unwrap();
+        legacy
+            .execute(
+                "INSERT INTO messages (sender_route, message_id, kind, sender_session, sender_name,
+                sender_mode, sender_permission, external, text, created_ms)
+             VALUES (?1, ?1, 'broadcast', ?2, ?3, 'build', 'ask', 0, ?4, ?5)",
+                params![
+                    ROUTE,
+                    SESSION,
+                    SENDER_NAME,
+                    TEXT,
+                    i64::try_from(NOW_MS).unwrap()
+                ],
+            )
+            .unwrap();
+        drop(legacy);
+        let before = fs::read(&legacy_path).unwrap();
+        for name in LEGACY_SIDECARS {
+            fs::write(state.path().join(name), LEGACY_SIDECAR_BYTES).unwrap();
+        }
+
+        let log = MessageLog::open(&state, &retention(), NOW_MS).unwrap();
+        assert!(
+            log.history(&HistoryChannel::All, None, LIMIT)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(MessageLog::file_path(&state).is_file());
+        assert_eq!(fs::read(&legacy_path).unwrap(), before);
+        for name in LEGACY_SIDECARS {
+            assert_eq!(
+                fs::read(state.path().join(name)).unwrap(),
+                LEGACY_SIDECAR_BYTES
+            );
+        }
+    }
+
+    #[test]
+    fn ephemeral_history_uses_only_the_volatile_root() {
+        let root = tempdir().unwrap();
+        let state = StateDir::split(root.path().join("volatile"), root.path().join("persistent"));
+        let mut log = MessageLog::open(&state, &retention(), NOW_MS).unwrap();
+        log.record(&message("a", topic(TOPIC), ROUTE, SESSION), &[])
+            .unwrap();
+        assert_eq!(
+            MessageLog::file_path(&state),
+            state.path().join(SESSIONS_DB_FILE)
+        );
+        assert!(!state.persistent_path().exists());
+        drop(log);
+        let reopened = MessageLog::open(&state, &retention(), NOW_MS).unwrap();
+        assert_eq!(
+            ids(&reopened.history(&HistoryChannel::All, None, LIMIT).unwrap()),
+            ["a"]
+        );
+    }
+
+    #[test]
+    fn future_canonical_schema_is_rejected_before_retention() {
+        let (_root, state, mut log) = fixture();
+        let seq = log
+            .record(&message("a", topic(TOPIC), ROUTE, SESSION), &[recipient()])
+            .unwrap();
+        log.database
+            .connection()
+            .pragma_update(None, "user_version", i32::MAX)
+            .unwrap();
+        let remove_all = Retention {
+            days: 0,
+            max_messages: 0,
+        };
+        assert!(matches!(
+            MessageLog::open(&state, &remove_all, NOW_MS),
+            Err(MessageLogError::Session(
+                SessionError::UnsupportedSchemaVersion { .. }
+            ))
+        ));
+        assert_eq!(
+            ids(&log.history(&HistoryChannel::All, None, LIMIT).unwrap()),
+            ["a"]
+        );
+        assert_eq!(log.deliveries(&[seq]).unwrap().len(), 1);
     }
 
     #[test]
@@ -908,7 +949,8 @@ mod tests {
         assert_eq!(history[0].message.text, TEXT);
         assert_eq!(delivery(&log, seq).0, PENDING);
         let recipients: i64 = log
-            .connection
+            .database
+            .connection()
             .query_row(
                 "SELECT COUNT(*) FROM deliveries WHERE seq = ?1",
                 [seq],
@@ -983,7 +1025,8 @@ mod tests {
             .unwrap();
         log.mark_seen(READER, ROUTE, "missing").unwrap();
         let rows: i64 = log
-            .connection
+            .database
+            .connection()
             .query_row(
                 "SELECT (SELECT COUNT(*) FROM deliveries) + (SELECT COUNT(*) FROM cursors)",
                 [],
@@ -1287,13 +1330,128 @@ mod tests {
             .unwrap();
         let own = log.version().unwrap();
         assert_ne!(own, initial);
+        assert_eq!(other.version().unwrap(), own);
+        log.record(&message("own", topic(TOPIC), ROUTE, SESSION), &[])
+            .unwrap();
+        assert_eq!(log.version().unwrap(), own);
         other
             .record(
                 &message("other", topic(TOPIC), OTHER_ROUTE, OTHER_SESSION),
+                &[recipient()],
+            )
+            .unwrap();
+        let remote = log.version().unwrap();
+        assert_ne!(remote, own);
+        assert_eq!(other.version().unwrap(), remote);
+        other
+            .record_receipt(OTHER_ROUTE, "other", RECIPIENT, QUEUED, None, NOW_MS)
+            .unwrap();
+        let receipt = log.version().unwrap();
+        assert_ne!(receipt, remote);
+        other
+            .transition(OTHER_ROUTE, "other", &recipient(), DELIVERED, None, NOW_MS)
+            .unwrap();
+        let delivered = log.version().unwrap();
+        assert_ne!(delivered, receipt);
+        other
+            .transition(
+                OTHER_ROUTE,
+                "other",
+                &recipient(),
+                HELD,
+                Some(HOLD_REASON),
+                NOW_MS,
+            )
+            .unwrap();
+        let held = log.version().unwrap();
+        assert_ne!(held, delivered);
+        log.mark_seen(READER, OTHER_ROUTE, "other").unwrap();
+        let seen = log.version().unwrap();
+        assert_ne!(seen, held);
+        other
+            .record(
+                &message("later", topic(TOPIC), OTHER_ROUTE, OTHER_SESSION),
                 &[],
             )
             .unwrap();
-        assert_ne!(log.version().unwrap(), own);
+        let later = log.version().unwrap();
+        assert_ne!(later, seen);
+        other.mark_seen(READER, OTHER_ROUTE, "later").unwrap();
+        let seen_later = log.version().unwrap();
+        assert_ne!(seen_later, later);
+        other
+            .prune(
+                &Retention {
+                    days: 0,
+                    max_messages: 0,
+                },
+                NOW_MS,
+            )
+            .unwrap();
+        let pruned = log.version().unwrap();
+        assert_ne!(pruned, seen_later);
+        assert_eq!(other.version().unwrap(), pruned);
+        assert_eq!(log.prune(&retention(), NOW_MS).unwrap(), 0);
+        assert_eq!(log.version().unwrap(), pruned);
+    }
+
+    #[test]
+    fn unrelated_canonical_writes_do_not_change_the_history_version() {
+        let (_root, state, mut log) = fixture();
+        let other = MessageLog::open(&state, &retention(), NOW_MS).unwrap();
+        log.record(&message("a", topic(TOPIC), ROUTE, SESSION), &[])
+            .unwrap();
+        let version = log.version().unwrap();
+        for database in [&log.database, &other.database] {
+            database.global_state_set(TOPIC, &TEXT).unwrap();
+            assert_eq!(log.version().unwrap(), version);
+            assert_eq!(other.version().unwrap(), version);
+            database.connection().execute(
+                "INSERT INTO sessions (id, format_version, title, cwd, model, created_at, updated_at,
+                    token_usage, metadata) VALUES (?1, 1, ?2, ?2, ?2, 0, 0, '{}', '{}')",
+                params![SESSION_ID.as_slice(), SENDER_NAME],
+            ).unwrap();
+            assert_eq!(log.version().unwrap(), version);
+            assert_eq!(other.version().unwrap(), version);
+            for sql in [
+                "UPDATE sessions SET title = title || '.'",
+                "DELETE FROM sessions",
+                "INSERT INTO decisions (ts, feature, question_set_id, question_set_version,
+                    endpoint_kind, model, state, questions, latency_ms, mode, effect, meta)
+                 VALUES (0, 'permission', 'permission', 'v1', 'local', 'model', '{}', '{}', 0, 'shadow', 'none', '{}')",
+                "UPDATE decisions SET effect = 'advised'",
+                "DELETE FROM decisions",
+            ] {
+                database.connection().execute(sql, []).unwrap();
+                assert_eq!(log.version().unwrap(), version);
+                assert_eq!(other.version().unwrap(), version);
+            }
+        }
+    }
+
+    #[test_case("UPDATE messages SET text = text || '.'"; "message_update")]
+    #[test_case("DELETE FROM messages"; "message_delete")]
+    #[test_case("UPDATE deliveries SET reason = status"; "delivery_update")]
+    #[test_case("DELETE FROM deliveries"; "delivery_delete")]
+    #[test_case("UPDATE cursors SET seq = seq + 1"; "cursor_update")]
+    #[test_case("DELETE FROM cursors"; "cursor_delete")]
+    fn history_revision_changes_only_when_messaging_mutations_commit(sql: &str) {
+        let (_root, state, mut log) = fixture();
+        let other = MessageLog::open(&state, &retention(), NOW_MS).unwrap();
+        log.record(&message("a", topic(TOPIC), ROUTE, SESSION), &[recipient()])
+            .unwrap();
+        log.mark_seen(READER, ROUTE, "a").unwrap();
+        let before = log.version().unwrap();
+        let transaction = log.database.connection_mut().transaction().unwrap();
+        transaction.execute(sql, []).unwrap();
+        assert_eq!(other.version().unwrap(), before);
+        transaction.rollback().unwrap();
+        assert_eq!(log.version().unwrap(), before);
+        assert_eq!(other.version().unwrap(), before);
+        log.database.connection().execute(sql, []).unwrap();
+        let after = log.version().unwrap();
+        assert_ne!(after, before);
+        assert_eq!(other.version().unwrap(), after);
     }
 
     #[test]
@@ -1313,7 +1471,8 @@ mod tests {
         assert_eq!(log.prune(&retention(), NOW_MS).unwrap(), 2);
         let remaining = |log: &MessageLog| {
             let mut statement = log
-                .connection
+                .database
+                .connection()
                 .prepare("SELECT message_id FROM messages ORDER BY seq")
                 .unwrap();
             statement
@@ -1330,7 +1489,8 @@ mod tests {
         assert_eq!(log.prune(&bound, NOW_MS).unwrap(), 1);
         assert_eq!(remaining(&log), ["recent"]);
         let deliveries: i64 = log
-            .connection
+            .database
+            .connection()
             .query_row("SELECT COUNT(*) FROM deliveries", [], |row| row.get(0))
             .unwrap();
         assert_eq!(deliveries, 1);

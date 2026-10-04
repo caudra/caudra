@@ -26,7 +26,7 @@ use crate::retention::{self, Decision, GroupBy, KeepPolicy, SessionFacts};
 use crate::tool_outputs::ToolOutputStore;
 use crate::{StateDir, StorageError, lock_session_artifacts, try_exclusive_state_lock};
 
-const SWEEP_LOCK_FILE: &str = "caudra.sqlite.sweep.lock";
+const SWEEP_LOCK_FILE: &str = "caudra.db.sweep.lock";
 const LAST_SWEEP_KEY: &str = "retention.last_sweep_at";
 const CLEANUP_JOBS_PHASE: &str = "completing cleanup jobs";
 const ORPHAN_SCAN_PHASE: &str = "scanning orphaned artifacts";

@@ -11,14 +11,15 @@ use rusqlite::limits::Limit;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
-use crate::StateDir;
 use crate::workspace_binding::StoredWorkspaceBinding;
+use crate::{StateDir, database_cutover};
 
 mod admission;
 
 use admission::JournalAdmission;
 
-pub const REMOTE_OPERATION_JOURNAL_FILE: &str = "remote-operations.sqlite3";
+pub const REMOTE_OPERATION_JOURNAL_FILE: &str = "remote-operations.db";
+const LEGACY_JOURNAL_FILE: &str = "remote-operations.sqlite3";
 const JOURNAL_DIR: &str = "recovery";
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUR") as i64;
 const SCHEMA_VERSION: i64 = 5;
@@ -266,6 +267,7 @@ impl RemoteOperationJournal {
         let directory = state_dir.persistent_path().join(JOURNAL_DIR);
         verify_directory(&directory)?;
         let path = directory.join(REMOTE_OPERATION_JOURNAL_FILE);
+        cut_over_legacy_journal(&directory, &path)?;
         let admission = JournalAdmission::inspect(&path)?;
         let fresh = admission.is_new();
         // Cooperating openers serialize only after the original state is accepted.
@@ -575,6 +577,31 @@ impl RemoteOperationJournal {
         }
         Ok(())
     }
+}
+
+fn cut_over_legacy_journal(
+    directory: &Path,
+    path: &Path,
+) -> Result<(), RemoteOperationJournalError> {
+    let old = directory.join(LEGACY_JOURNAL_FILE);
+    if !database_cutover::pending(&old, path)? {
+        return Ok(());
+    }
+    let admission = JournalAdmission::inspect(&old)?;
+    let _lock = admission.lock_for_cutover(&old)?;
+    if !database_cutover::pending(&old, path)? {
+        return Err(RemoteOperationJournalError::AdmissionChanged);
+    }
+    let connection = Connection::open_with_flags(
+        &old,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    connection.busy_timeout(Duration::ZERO)?;
+    connection.set_limit(Limit::SQLITE_LIMIT_LENGTH, MAX_SQLITE_VALUE_BYTES)?;
+    connection.pragma_update(None, "trusted_schema", false)?;
+    validate_schema(&connection, &old)?;
+    database_cutover::publish(connection, &old, path)?;
+    Ok(())
 }
 
 fn validate_schema(
@@ -935,6 +962,8 @@ mod tests {
     const PREVIOUS_GENERATION: &str = "previous-generation";
     const CRASH_PATH_ENV: &str = "CAUDRA_TEST_JOURNAL_CRASH_PATH";
     const CRASH_SQL_ENV: &str = "CAUDRA_TEST_JOURNAL_CRASH_SQL";
+    const CUTOVER_OPERATION: &str = "cutover-retained";
+    const CUTOVER_UPDATED_AT: u64 = 42;
     const HOT_JOURNAL_MAGIC: &[u8] = b"\xd9\xd5\x05\xf9\x20\xa1\x63\xd7";
     const SPILL_TRANSACTION: &str = "
         PRAGMA cache_size=1; BEGIN IMMEDIATE;
@@ -968,6 +997,102 @@ mod tests {
         JournalSnapshot {
             files,
             directory_permissions: fs::metadata(directory).unwrap().permissions(),
+        }
+    }
+
+    fn legacy_journal() -> (TempDir, StateDir, PathBuf) {
+        let temp = TempDir::new().unwrap();
+        let state = StateDir::from_path(temp.path().join("state"));
+        let mut journal = RemoteOperationJournal::open(&state).unwrap();
+        journal
+            .reserve_before_send(&reservation(CUTOVER_OPERATION, default_binding()))
+            .unwrap();
+        let canonical = journal.path().to_owned();
+        let legacy = canonical.with_file_name(LEGACY_JOURNAL_FILE);
+        drop(journal);
+        fs::rename(canonical, &legacy).unwrap();
+        (temp, state, legacy)
+    }
+
+    #[test_case(false; "committed_wal")]
+    #[test_case(true; "interrupted_after_checkpoint")]
+    fn legacy_filename_cutover_preserves_recovery_state(interrupted: bool) {
+        let (_temp, state, old) = legacy_journal();
+        crash_journal(
+            &old,
+            &format!(
+                "PRAGMA wal_autocheckpoint=0; UPDATE remote_operations SET updated_at={CUTOVER_UPDATED_AT};"
+            ),
+        );
+        assert!(fs::metadata(sidecar(&old, "-wal")).unwrap().len() > 0);
+        if interrupted {
+            let connection = Connection::open(&old).unwrap();
+            connection
+                .pragma_update(None, "journal_mode", "DELETE")
+                .unwrap();
+        }
+        let journal = RemoteOperationJournal::open(&state).unwrap();
+        let pending = journal.list_pending(&default_binding()).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].updated_at, CUTOVER_UPDATED_AT);
+        assert_eq!(
+            journal.path().file_name().unwrap(),
+            REMOTE_OPERATION_JOURNAL_FILE
+        );
+        assert!(!old.exists());
+        let version: i64 = journal
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        drop(journal);
+        RemoteOperationJournal::open(&state).unwrap();
+    }
+
+    #[test_case(false; "idle_old_wal_connection")]
+    #[test_case(true; "old_admission_lock")]
+    fn legacy_filename_cutover_refuses_active_openers(admission_lock: bool) {
+        let (_temp, state, old) = legacy_journal();
+        let connection = Connection::open(&old).unwrap();
+        let _: i64 = connection
+            .query_row("SELECT count(*) FROM remote_operations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let file = File::open(&old).unwrap();
+        if admission_lock {
+            file.lock().unwrap();
+        }
+        let error = RemoteOperationJournal::open(&state).err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains(database_cutover::OFFLINE_REQUIRED),
+            "{error}"
+        );
+        assert!(old.exists());
+        assert!(!old.with_file_name(REMOTE_OPERATION_JOURNAL_FILE).exists());
+        drop(file);
+        drop(connection);
+        RemoteOperationJournal::open(&state).unwrap();
+    }
+
+    #[test_case(false; "both_names")]
+    #[test_case(true; "incompatible_schema_in_wal")]
+    fn legacy_filename_cutover_refusal_leaves_inputs_untouched(incompatible: bool) {
+        let (_temp, state, old) = legacy_journal();
+        if incompatible {
+            crash_journal(
+                &old,
+                &format!("PRAGMA user_version={FUTURE_SCHEMA_VERSION};"),
+            );
+        } else {
+            fs::copy(&old, old.with_file_name(REMOTE_OPERATION_JOURNAL_FILE)).unwrap();
+        }
+        let before = journal_snapshot(&old);
+        for _ in 0..2 {
+            assert!(RemoteOperationJournal::open(&state).is_err());
+            assert_eq!(journal_snapshot(&old), before);
         }
     }
 

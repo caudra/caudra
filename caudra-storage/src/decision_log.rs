@@ -1,22 +1,13 @@
-use crate::{StateDir, now_epoch};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior, params};
+use crate::sessions::{SESSIONS_DB_FILE, SessionDatabase, SessionError};
+use crate::{StateClass, StateDir, StorageError, now_epoch};
+use rusqlite::{OptionalExtension, Row, TransactionBehavior, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-#[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
-pub const DECISIONS_DB_FILE: &str = "decisions.db";
-const SCHEMA_VERSION: i64 = 1;
-const APPLICATION_ID: i64 = 0x4341444c;
 const SECONDS_PER_DAY: u64 = 86_400;
-const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(unix)]
-const OWNER_FILE_MODE: u32 = 0o600;
 const MAX_RECORD_BYTES: usize = 1_048_576;
 const MAX_QUESTIONS: usize = 64;
 const DEFAULT_NOUL_THRESHOLD: f64 = 0.5;
@@ -28,7 +19,7 @@ const FILTER: &str = "(?1 IS NULL OR feature = ?1) AND (?2 IS NULL OR session = 
 const ROW_COLUMNS: &str = "id, ts, session, project, feature, question_set_id, \
     question_set_version, endpoint_kind, model, state, questions, answers, error, latency_ms, \
     mode, effect, meta, label, label_source, label_ts, label_meta";
-const SCHEMA: &str = "
+pub(crate) const SCHEMA: &str = "
 CREATE TABLE decisions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts INTEGER NOT NULL,
@@ -58,16 +49,14 @@ CREATE INDEX decisions_feature ON decisions(feature);
 
 #[derive(Debug, thiserror::Error)]
 pub enum DecisionLogError {
+    #[error("decision log storage operation failed: {0}")]
+    Session(#[from] SessionError),
     #[error("decision log I/O failed: {0}")]
     Io(#[from] io::Error),
     #[error("decision log database operation failed: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("decision log JSON encoding failed: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("unsupported decision log schema")]
-    UnsupportedSchema,
-    #[error("unsafe decision log file; expected an owner-only regular file")]
-    UnsafeFile,
     #[error("invalid decision log field: {0}")]
     Invalid(&'static str),
     #[error("decision log row not found: {0}")]
@@ -179,14 +168,14 @@ pub struct LoggedDecision {
 }
 
 pub struct DecisionLog {
-    connection: Connection,
+    database: SessionDatabase,
     path: PathBuf,
 }
 
 impl DecisionLog {
     /// Where the log lives in `state_dir`, whether or not it exists.
     pub fn file_path(state_dir: &StateDir) -> PathBuf {
-        state_dir.persistent_path().join(DECISIONS_DB_FILE)
+        state_dir.persistent_path().join(SESSIONS_DB_FILE)
     }
 
     /// Disabled logging does no filesystem I/O. Retention uses row creation time in epoch seconds.
@@ -198,18 +187,11 @@ impl DecisionLog {
         if !enabled {
             return Ok(None);
         }
-        fs::create_dir_all(state_dir.persistent_path())?;
-        let path = Self::file_path(state_dir);
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(OWNER_FILE_MODE);
-        match options.open(&path) {
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
-        }
-        let log = Self::connect(path, true)?;
+        let database = SessionDatabase::open_state(&state_dir.for_class(StateClass::Persistent))?;
+        let log = Self {
+            path: database.path(),
+            database,
+        };
         log.prune_before(
             now_epoch().saturating_sub(retention_days.saturating_mul(SECONDS_PER_DAY)),
         )?;
@@ -218,75 +200,24 @@ impl DecisionLog {
 
     /// Maintenance access never creates a database or implicitly enables logging.
     pub fn open_existing(state_dir: &StateDir) -> Result<Option<Self>, DecisionLogError> {
-        let path = Self::file_path(state_dir);
-        match fs::symlink_metadata(&path) {
-            Ok(_) => Self::connect(path, false).map(Some),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Ok(
+            SessionDatabase::open_existing_state(&state_dir.for_class(StateClass::Persistent))?
+                .map(|database| Self {
+                    path: database.path(),
+                    database,
+                }),
+        )
+    }
+
+    pub fn open_read_only(state_dir: &StateDir) -> Result<Option<Self>, DecisionLogError> {
+        match SessionDatabase::open_read_only(&state_dir.for_class(StateClass::Persistent)) {
+            Ok(database) => Ok(Some(Self {
+                path: database.path(),
+                database,
+            })),
+            Err(SessionError::Storage(StorageError::NotFound(_))) => Ok(None),
             Err(error) => Err(error.into()),
         }
-    }
-
-    /// Diagnostic access that never creates, initializes, prunes or writes, so
-    /// a reader takes no lock the logging session would wait on. A database
-    /// still being created reads as absent.
-    pub fn open_read_only(state_dir: &StateDir) -> Result<Option<Self>, DecisionLogError> {
-        let path = Self::file_path(state_dir);
-        match fs::symlink_metadata(&path) {
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        }
-        verify_files(&path)?;
-        let connection = Connection::open_with_flags(
-            &path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX
-                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        )?;
-        connection.busy_timeout(BUSY_TIMEOUT)?;
-        connection.pragma_update(None, "trusted_schema", false)?;
-        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        let application: i64 =
-            connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
-        if version == 0 && application == 0 && schema_objects(&connection)? == 0 {
-            return Ok(None);
-        }
-        if version != SCHEMA_VERSION || application != APPLICATION_ID {
-            return Err(DecisionLogError::UnsupportedSchema);
-        }
-        Ok(Some(Self { connection, path }))
-    }
-
-    fn connect(path: PathBuf, initialize: bool) -> Result<Self, DecisionLogError> {
-        verify_files(&path)?;
-        let mut connection = Connection::open_with_flags(
-            &path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX
-                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        )?;
-        connection.busy_timeout(BUSY_TIMEOUT)?;
-        connection.pragma_update(None, "trusted_schema", false)?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let version: i64 =
-            transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        let application: i64 =
-            transaction.pragma_query_value(None, "application_id", |row| row.get(0))?;
-        if version == 0 && application == 0 && initialize {
-            if schema_objects(&transaction)? != 0 {
-                return Err(DecisionLogError::UnsupportedSchema);
-            }
-            transaction.execute_batch(SCHEMA)?;
-            transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
-            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        } else if version != SCHEMA_VERSION || application != APPLICATION_ID {
-            return Err(DecisionLogError::UnsupportedSchema);
-        }
-        transaction.commit()?;
-        // Rollback journals avoid keeping deleted payloads in a persistent WAL after purge.
-        connection.pragma_update(None, "journal_mode", "DELETE")?;
-        connection.pragma_update(None, "secure_delete", true)?;
-        Ok(Self { connection, path })
     }
 
     pub fn path(&self) -> &Path {
@@ -324,7 +255,7 @@ impl DecisionLog {
                 return Err(DecisionLogError::Invalid("identity"));
             }
         }
-        self.connection.execute(
+        self.database.connection().execute(
             "INSERT INTO decisions (ts, session, project, feature, question_set_id,
                 question_set_version, endpoint_kind, model, state, questions, answers,
                 error, latency_ms, mode, effect, meta)
@@ -352,11 +283,11 @@ impl DecisionLog {
                 serde_json::to_string(&record.meta)?,
             ],
         )?;
-        Ok(self.connection.last_insert_rowid())
+        Ok(self.database.connection().last_insert_rowid())
     }
 
     pub fn update_effect(&self, id: i64, effect: DecisionEffect) -> Result<(), DecisionLogError> {
-        let changed = self.connection.execute(
+        let changed = self.database.connection().execute(
             "UPDATE decisions SET effect = CASE WHEN effect = 'escalated' AND ?2 = 'advised' THEN effect ELSE ?2 END WHERE id = ?1",
             params![id, serde_json::to_value(effect)?.as_str()],
         )?;
@@ -373,7 +304,8 @@ impl DecisionLog {
             return Err(DecisionLogError::Invalid("label_source"));
         }
         let transaction = self
-            .connection
+            .database
+            .connection_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let questions: String = transaction
             .query_row(
@@ -400,7 +332,7 @@ impl DecisionLog {
         mut writer: impl Write,
         feature: Option<&str>,
     ) -> Result<u64, DecisionLogError> {
-        let mut statement = self.connection.prepare(&format!(
+        let mut statement = self.database.connection().prepare(&format!(
             "SELECT {ROW_COLUMNS} FROM decisions
              WHERE label IS NOT NULL AND (?1 IS NULL OR feature = ?1) ORDER BY id"
         ))?;
@@ -447,7 +379,7 @@ impl DecisionLog {
         filter: &DecisionFilter<'_>,
         thresholds: impl Fn(&str) -> StatsThresholds,
     ) -> Result<Vec<DecisionStats>, DecisionLogError> {
-        let mut statement = self.connection.prepare(&format!(
+        let mut statement = self.database.connection().prepare(&format!(
             "WITH ranked AS (
                 SELECT feature, error, label, latency_ms, effect, ts,
                     ROW_NUMBER() OVER (PARTITION BY feature ORDER BY latency_ms) AS rank,
@@ -488,7 +420,7 @@ impl DecisionLog {
                 ),
             );
         }
-        let mut statement = self.connection.prepare(&format!(
+        let mut statement = self.database.connection().prepare(&format!(
             "SELECT feature, questions, answers, label FROM decisions
              WHERE label IS NOT NULL AND answers IS NOT NULL AND error IS NULL AND {FILTER}"
         ))?;
@@ -527,7 +459,7 @@ impl DecisionLog {
         filter: &DecisionFilter<'_>,
         limit: usize,
     ) -> Result<Vec<LoggedDecision>, DecisionLogError> {
-        let mut statement = self.connection.prepare(&format!(
+        let mut statement = self.database.connection().prepare(&format!(
             "SELECT {ROW_COLUMNS} FROM decisions WHERE {FILTER} ORDER BY id DESC LIMIT ?4"
         ))?;
         let limit = i64::try_from(limit).map_err(|_| DecisionLogError::Invalid("limit"))?;
@@ -547,50 +479,17 @@ impl DecisionLog {
     /// Removes rows strictly older than the cutoff, including attached labels.
     pub fn prune_before(&self, cutoff: u64) -> Result<usize, DecisionLogError> {
         Ok(self
-            .connection
+            .database
+            .connection()
             .execute("DELETE FROM decisions WHERE ts < ?1", [sql_u64(cutoff)?])?)
     }
 
-    /// Deletes payloads and reclaims database pages without reusing old row identities.
     pub fn purge(&self) -> Result<usize, DecisionLogError> {
-        let count = self.connection.execute("DELETE FROM decisions", [])?;
-        self.connection.execute_batch("VACUUM")?;
-        Ok(count)
+        Ok(self
+            .database
+            .connection()
+            .execute("DELETE FROM decisions", [])?)
     }
-}
-
-fn verify_file(path: &Path) -> Result<(), DecisionLogError> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(DecisionLogError::UnsafeFile);
-    }
-    #[cfg(unix)]
-    if metadata.permissions().mode() & 0o777 != OWNER_FILE_MODE {
-        return Err(DecisionLogError::UnsafeFile);
-    }
-    Ok(())
-}
-
-/// The database and whichever of its sidecars exist.
-fn verify_files(path: &Path) -> Result<(), DecisionLogError> {
-    verify_file(path)?;
-    for suffix in ["-journal", "-wal", "-shm"] {
-        let mut sidecar = path.as_os_str().to_owned();
-        sidecar.push(suffix);
-        match verify_file(Path::new(&sidecar)) {
-            Err(DecisionLogError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
-            result => result?,
-        }
-    }
-    Ok(())
-}
-
-fn schema_objects(connection: &Connection) -> Result<i64, DecisionLogError> {
-    Ok(connection.query_row(
-        "SELECT COUNT(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
-        [],
-        |row| row.get(0),
-    )?)
 }
 
 fn filter_params<'a>(
@@ -748,12 +647,18 @@ fn answer_agrees(
 #[cfg(test)]
 mod tests {
     use super::{
-        DECISIONS_DB_FILE, DecisionEffect, DecisionFilter, DecisionLabel, DecisionLog,
-        DecisionLogError, DecisionRecord, DecisionStats, EndpointKind, MAX_RECORD_BYTES,
-        SCHEMA_VERSION, SECONDS_PER_DAY, StatsThresholds,
+        DecisionEffect, DecisionFilter, DecisionLabel, DecisionLog, DecisionLogError,
+        DecisionRecord, DecisionStats, EndpointKind, MAX_RECORD_BYTES, SCHEMA, SECONDS_PER_DAY,
+        StatsThresholds,
     };
+    use crate::id::CaudraId;
+    use crate::messages::{
+        HistoryChannel, MessageAudience, MessageLog, MessageRecipient, MessageSender, NewMessage,
+        Retention,
+    };
+    use crate::sessions::{SESSIONS_DB_FILE, SessionError};
     use crate::{StateDir, now_epoch};
-    use rusqlite::Connection;
+    use rusqlite::{Connection, params};
     use serde_json::{Value, json};
     use std::fs;
     #[cfg(unix)]
@@ -772,6 +677,17 @@ mod tests {
     const PERMISSION: &str = "permission";
     const CONTENT: &str = "content";
     const ROW_LIMIT: usize = 10;
+    const LEGACY_FILE: &str = "decisions.db";
+    const LEGACY_SIDECARS: [&str; 3] = [
+        "decisions.db-wal",
+        "decisions.db-shm",
+        "decisions.db-journal",
+    ];
+    const LEGACY_SIDECAR_BYTES: &[u8] = b"untouched legacy decision sidecar";
+    const STATE_KEY: &str = "decision-purge-preserved";
+    const STATE_VALUE: &str = "main database state";
+    const SESSION_ID: [u8; 16] = [1; 16];
+    const MESSAGE_ID: &str = "coexisting-message";
 
     fn record() -> DecisionRecord {
         DecisionRecord {
@@ -967,7 +883,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn read_only_open_treats_a_database_being_created_as_absent() {
+    fn read_only_open_refuses_an_uninitialized_database_without_writing() {
         let root = tempdir().unwrap();
         let state = StateDir::from_path(root.path().to_path_buf());
         fs::create_dir_all(state.persistent_path()).unwrap();
@@ -975,9 +891,33 @@ mod tests {
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(state.persistent_path().join(DECISIONS_DB_FILE))
+            .open(state.persistent_path().join(SESSIONS_DB_FILE))
             .unwrap();
-        assert!(DecisionLog::open_read_only(&state).unwrap().is_none());
+        assert!(matches!(
+            DecisionLog::open_read_only(&state),
+            Err(DecisionLogError::Session(_))
+        ));
+        assert!(fs::read(DecisionLog::file_path(&state)).unwrap().is_empty());
+        assert_eq!(fs::read_dir(state.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_open_refuses_an_uninitialized_database_without_initializing() {
+        let root = tempdir().unwrap();
+        let state = StateDir::from_path(root.path().to_path_buf());
+        let path = state.path().join(SESSIONS_DB_FILE);
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        assert!(matches!(
+            DecisionLog::open_existing(&state),
+            Err(DecisionLogError::Session(_))
+        ));
+        assert!(fs::read(path).unwrap().is_empty());
     }
 
     #[cfg(unix)]
@@ -986,7 +926,7 @@ mod tests {
         let root = tempdir().unwrap();
         let state = StateDir::from_path(root.path().to_path_buf());
         fs::create_dir_all(state.persistent_path()).unwrap();
-        let path = state.persistent_path().join(DECISIONS_DB_FILE);
+        let path = state.persistent_path().join(SESSIONS_DB_FILE);
         Connection::open(&path)
             .unwrap()
             .execute_batch("CREATE TABLE foreign_rows (id INTEGER)")
@@ -994,7 +934,7 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         assert!(matches!(
             DecisionLog::open_read_only(&state),
-            Err(DecisionLogError::UnsupportedSchema)
+            Err(DecisionLogError::Session(_))
         ));
     }
 
@@ -1049,13 +989,188 @@ mod tests {
         let log = DecisionLog::open(&state, true, RETENTION_DAYS)
             .unwrap()
             .unwrap();
-        assert_eq!(log.path(), state.persistent_path().join(DECISIONS_DB_FILE));
+        assert_eq!(log.path(), state.persistent_path().join(SESSIONS_DB_FILE));
         assert!(!state.path().exists());
-        assert_eq!(fs::read_dir(state.persistent_path()).unwrap().count(), 1);
+        log.insert(&record()).unwrap();
+        let existing = DecisionLog::open_existing(&state).unwrap().unwrap();
+        assert_eq!(all_stats(&existing)[0].count, 1);
+        let reader = DecisionLog::open_read_only(&state).unwrap().unwrap();
+        assert_eq!(all_stats(&reader)[0].count, 1);
+        assert!(!state.path().exists());
         #[cfg(unix)]
         assert_eq!(
             fs::metadata(log.path()).unwrap().permissions().mode() & 0o777,
             0o600
+        );
+    }
+
+    #[test]
+    fn legacy_decisions_and_sidecars_are_neither_imported_nor_changed() {
+        let root = tempdir().unwrap();
+        let state = StateDir::from_path(root.path().to_path_buf());
+        let legacy_path = state.path().join(LEGACY_FILE);
+        let legacy = Connection::open(&legacy_path).unwrap();
+        legacy.execute_batch(SCHEMA).unwrap();
+        legacy
+            .execute(
+                "INSERT INTO decisions (ts, feature, question_set_id, question_set_version,
+                endpoint_kind, model, state, questions, latency_ms, mode, effect, meta)
+             VALUES (?1, ?2, ?2, ?2, 'local', ?2, '{}', ?3, 0, 'shadow', 'none', '{}')",
+                params![
+                    i64::try_from(TIMESTAMP).unwrap(),
+                    PERMISSION,
+                    record().questions.to_string()
+                ],
+            )
+            .unwrap();
+        drop(legacy);
+        let before = fs::read(&legacy_path).unwrap();
+        for name in LEGACY_SIDECARS {
+            fs::write(state.path().join(name), LEGACY_SIDECAR_BYTES).unwrap();
+        }
+        assert!(DecisionLog::open_existing(&state).unwrap().is_none());
+        assert!(DecisionLog::open_read_only(&state).unwrap().is_none());
+        assert!(!DecisionLog::file_path(&state).exists());
+
+        let log = DecisionLog::open(&state, true, u64::MAX).unwrap().unwrap();
+        assert!(all_stats(&log).is_empty());
+        assert!(DecisionLog::file_path(&state).is_file());
+        assert_eq!(fs::read(&legacy_path).unwrap(), before);
+        for name in LEGACY_SIDECARS {
+            assert_eq!(
+                fs::read(state.path().join(name)).unwrap(),
+                LEGACY_SIDECAR_BYTES
+            );
+        }
+    }
+
+    #[test_case(true; "messages_first")]
+    #[test_case(false; "decisions_first")]
+    fn repositories_coexist_and_purge_preserves_sessions_state_and_messages(messages_first: bool) {
+        let root = tempdir().unwrap();
+        let state = StateDir::from_path(root.path().to_path_buf());
+        let retention = Retention {
+            days: u64::MAX,
+            max_messages: u64::MAX,
+        };
+        let early_messages =
+            messages_first.then(|| MessageLog::open(&state, &retention, TIMESTAMP).unwrap());
+        let mut log = DecisionLog::open(&state, true, RETENTION_DAYS)
+            .unwrap()
+            .unwrap();
+        let mut messages = early_messages
+            .unwrap_or_else(|| MessageLog::open(&state, &retention, TIMESTAMP).unwrap());
+        assert_eq!(log.path(), MessageLog::file_path(&state));
+        assert!(!state.path().join(LEGACY_FILE).exists());
+        let session = CaudraId::from_bytes(SESSION_ID).to_string();
+        let mut stored_record = record();
+        stored_record.session = Some(session.clone());
+
+        log.database
+            .global_state_set(STATE_KEY, &STATE_VALUE)
+            .unwrap();
+        log.database.connection().execute(
+            "INSERT INTO sessions (id, format_version, title, cwd, model, created_at, updated_at,
+                token_usage, metadata) VALUES (?1, 1, ?2, ?3, ?2, ?4, ?4, '{}', '{}')",
+            params![SESSION_ID.as_slice(), STATE_VALUE, PROJECT_A, i64::try_from(TIMESTAMP).unwrap()],
+        ).unwrap();
+        let seq = messages
+            .record(
+                &NewMessage {
+                    message_id: MESSAGE_ID.into(),
+                    audience: MessageAudience::Topic(CONTENT.into()),
+                    sender: MessageSender {
+                        route: SESSION_A.into(),
+                        session,
+                        name: SESSION_A.into(),
+                        handle: None,
+                        cwd: Some(PROJECT_A.into()),
+                        mode: "build".into(),
+                        permission: "ask".into(),
+                        external: false,
+                    },
+                    text: STATE_VALUE.into(),
+                    reply_to: None,
+                    created_ms: TIMESTAMP,
+                },
+                &[MessageRecipient {
+                    session: SESSION_B.into(),
+                    name: None,
+                    handle: None,
+                }],
+            )
+            .unwrap();
+        messages
+            .mark_seen(SESSION_B, SESSION_A, MESSAGE_ID)
+            .unwrap();
+        let id = log.insert(&stored_record).unwrap();
+        log.attach_label(id, &label(json!({"user_approves": true})))
+            .unwrap();
+        let schema_version: i64 = log
+            .database
+            .connection()
+            .pragma_query_value(None, "schema_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(log.purge().unwrap(), 1);
+        assert!(all_stats(&log).is_empty());
+        assert!(export(&log, None).is_empty());
+        assert_eq!(
+            log.database
+                .global_state_get::<String>(STATE_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(STATE_VALUE)
+        );
+        let session_count: i64 = log
+            .database
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE id = ?1",
+                [SESSION_ID.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(session_count, 1);
+        let after_schema_version: i64 = log
+            .database
+            .connection()
+            .pragma_query_value(None, "schema_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(after_schema_version, schema_version);
+        assert_eq!(
+            messages
+                .history(&HistoryChannel::All, None, ROW_LIMIT)
+                .unwrap()[0]
+                .seq,
+            seq
+        );
+        assert_eq!(messages.deliveries(&[seq]).unwrap().len(), 1);
+        assert!(
+            messages
+                .unseen(SESSION_B, |_| true, ROW_LIMIT)
+                .unwrap()
+                .is_empty()
+        );
+
+        let replacement = log.insert(&stored_record).unwrap();
+        assert!(replacement > id);
+        log.database
+            .connection()
+            .execute(
+                "DELETE FROM sessions WHERE id = ?1",
+                [SESSION_ID.as_slice()],
+            )
+            .unwrap();
+        assert_eq!(
+            ids(&log, &DecisionFilter::default(), ROW_LIMIT),
+            [replacement]
+        );
+        assert_eq!(
+            messages
+                .history(&HistoryChannel::All, None, ROW_LIMIT)
+                .unwrap()[0]
+                .seq,
+            seq
         );
     }
 
@@ -1246,7 +1361,7 @@ mod tests {
     }
 
     #[test]
-    fn purge_erases_payloads_and_does_not_reuse_label_identities() {
+    fn purge_removes_rows_and_does_not_reuse_label_identities() {
         let (_root, _state, mut log) = fixture();
         let mut record = record();
         record.state = json!(PAYLOAD_MARKER);
@@ -1256,12 +1371,6 @@ mod tests {
         assert_eq!(log.purge().unwrap(), 1);
         assert!(all_stats(&log).is_empty());
         assert!(export(&log, None).is_empty());
-        assert!(
-            !fs::read(log.path())
-                .unwrap()
-                .windows(PAYLOAD_MARKER.len())
-                .any(|bytes| bytes == PAYLOAD_MARKER.as_bytes())
-        );
         let new = log.insert(&record).unwrap();
         assert!(new > old);
         assert!(
@@ -1291,12 +1400,15 @@ mod tests {
     fn future_schema_is_rejected_without_pruning() {
         let (_root, state, log) = fixture();
         log.insert(&record()).unwrap();
-        log.connection
-            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+        log.database
+            .connection()
+            .pragma_update(None, "user_version", i32::MAX)
             .unwrap();
         assert!(matches!(
             DecisionLog::open(&state, true, RETENTION_DAYS),
-            Err(DecisionLogError::UnsupportedSchema)
+            Err(DecisionLogError::Session(
+                SessionError::UnsupportedSchemaVersion { .. }
+            ))
         ));
         assert_eq!(all_stats(&log)[0].count, 1);
     }
@@ -1312,14 +1424,14 @@ mod tests {
         symlink(&target, &path).unwrap();
         assert!(matches!(
             DecisionLog::open_existing(&state),
-            Err(DecisionLogError::UnsafeFile)
+            Err(DecisionLogError::Session(SessionError::Storage(_)))
         ));
         fs::remove_file(&path).unwrap();
         fs::rename(target, &path).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(matches!(
             DecisionLog::open_existing(&state),
-            Err(DecisionLogError::UnsafeFile)
+            Err(DecisionLogError::Session(SessionError::Storage(_)))
         ));
     }
 }

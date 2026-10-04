@@ -582,8 +582,8 @@ pub enum Command {
         #[arg(
             long,
             global = true,
-            value_name = "ABSOLUTE_CAUDRA_SQLITE",
-            help = "Select an existing canonical caudra.sqlite path; default uses this build's data namespace. Not accepted by audit"
+            value_name = "ABSOLUTE_CAUDRA_DB",
+            help = "Select an existing canonical caudra.db path; default uses this build's data namespace. Not accepted by audit"
         )]
         database: Option<PathBuf>,
         #[command(subcommand)]
@@ -1317,7 +1317,7 @@ mod tests {
     const SNAPSHOTS_NOT_PARSED: &str = "expected the storage snapshots subcommand";
     const MODEL_SPEC: &str = "openai/gpt-5";
     const PERMISSIONS_NOT_PARSED: &str = "expected permission rebind subcommand";
-    const PERMISSION_DATABASE: &str = "/explicit-copy/caudra.sqlite";
+    const PERMISSION_DATABASE: &str = "/explicit-copy/caudra.db";
     const MESSAGE_NOT_PARSED: &str = "expected a message subcommand";
     const MESSAGING_NAME: &str = "ci-watcher";
     const MESSAGE_TEXT: &str = "Nightly build failed";

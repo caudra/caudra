@@ -719,8 +719,7 @@ mod tests {
         QuestionSet, Usage,
     };
     use caudra_storage::decision_log::{
-        DECISIONS_DB_FILE, DecisionEffect, DecisionFilter, DecisionLabel, DecisionLog,
-        StatsThresholds,
+        DecisionEffect, DecisionFilter, DecisionLabel, DecisionLog, StatsThresholds,
     };
     use caudra_storage::id::CaudraId;
     use caudra_storage::{StateDir, now_epoch};
@@ -1017,7 +1016,7 @@ mod tests {
     }
 
     #[test]
-    fn log_disabled_still_evaluates_without_creating_decision_log() {
+    fn log_disabled_still_evaluates_without_recording_decisions() {
         smol::block_on(async {
             let root = tempfile::tempdir().unwrap();
             let path = root.path().join("not-created");
@@ -1031,6 +1030,7 @@ mod tests {
                 },
             )
             .unwrap();
+            assert!(!path.exists());
             let result = service
                 .permission(
                     PermissionPurpose::Advice,
@@ -1042,7 +1042,14 @@ mod tests {
             assert!(matches!(result.action, Some(PermissionAction::Advice(_))));
             assert!(result.evaluation.receipt.is_none());
             assert_eq!(requests.lock().unwrap().len(), 1);
-            assert!(!path.join(DECISIONS_DB_FILE).exists());
+            let log = DecisionLog::open_read_only(&StateDir::from_path(path))
+                .unwrap()
+                .unwrap();
+            assert!(
+                log.recent(&DecisionFilter::default(), 1)
+                    .unwrap()
+                    .is_empty()
+            );
         });
     }
 

@@ -538,7 +538,7 @@ impl DecisionsConfig {
             min: None,
             max: None,
             env: None,
-            description: "Retain bounded decision records in the separate local `decisions.db`.",
+            description: "Retain bounded decision records in the local `caudra.db`.",
         },
         ConfigField {
             name: "log_retention_days",

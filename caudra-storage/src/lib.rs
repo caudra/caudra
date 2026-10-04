@@ -5,6 +5,7 @@
 pub mod auth;
 pub mod background;
 pub mod checkout;
+mod database_cutover;
 pub mod decision_log;
 pub mod id;
 pub mod input_history;
@@ -73,7 +74,7 @@ const XDG_RUNTIME_DIR_ENV: &str = "XDG_RUNTIME_DIR";
 const EPHEMERAL_DIR_PREFIX: &str = "caudra";
 #[cfg(unix)]
 const STATE_DIRECTORY_MODE: u32 = 0o700;
-const SESSION_ARTIFACT_LOCK_FILE: &str = "caudra.sqlite.artifacts.lock";
+const SESSION_ARTIFACT_LOCK_FILE: &str = "caudra.db.artifacts.lock";
 /// How long a bounded artifact-lock wait sleeps between attempts. `flock`
 /// grants no queue and no fairness, so a waiter polls rather than blocks.
 const ARTIFACT_LOCK_POLL: Duration = Duration::from_millis(20);
