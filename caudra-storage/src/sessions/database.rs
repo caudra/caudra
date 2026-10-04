@@ -4491,11 +4491,18 @@ fn validate_owner_only_metadata(path: &Path, metadata: &Metadata) -> Result<(), 
     Ok(())
 }
 
-fn open_owner_only_existing(path: &Path) -> Result<File, SessionError> {
+/// Checks an existing file without opening it. Closing a descriptor releases
+/// every POSIX lock this process holds on that file, SQLite's included, after
+/// which another process may reset the WAL index that live connections map.
+fn validate_owner_only_existing(path: &Path) -> Result<(), SessionError> {
     validate_owner_only_metadata(
         path,
         &fs::symlink_metadata(path).map_err(StorageError::from)?,
-    )?;
+    )
+}
+
+fn open_owner_only_existing(path: &Path) -> Result<File, SessionError> {
+    validate_owner_only_existing(path)?;
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -4506,13 +4513,13 @@ fn open_owner_only_existing(path: &Path) -> Result<File, SessionError> {
     Ok(file)
 }
 
+/// Checks the sidecars that exist without opening them, for the reason
+/// `validate_owner_only_existing` gives.
 fn validate_existing_database_sidecars(path: &Path) -> Result<(), SessionError> {
     for suffix in DATABASE_SIDECAR_SUFFIXES {
         let path = database_sidecar(path, suffix);
         match fs::symlink_metadata(&path) {
-            Ok(_) => {
-                open_owner_only_existing(&path)?;
-            }
+            Ok(metadata) => validate_owner_only_metadata(&path, &metadata)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(StorageError::from(error).into()),
         }
@@ -4534,7 +4541,7 @@ fn open_writable_connection(
     if create {
         create_owner_only(&path)?;
     } else {
-        open_owner_only_existing(&path)?;
+        validate_owner_only_existing(&path)?;
     }
     validate_existing_database_sidecars(&path)?;
     let mut connection = Connection::open_with_flags(
@@ -6300,6 +6307,8 @@ mod tests {
     use std::iter;
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
+    #[cfg(target_os = "linux")]
+    use std::process;
     use std::sync::Barrier;
 
     use super::*;
@@ -6330,6 +6339,10 @@ mod tests {
     use test_case::test_case;
 
     const CWD: &str = "/project";
+    #[cfg(target_os = "linux")]
+    const PROC_LOCKS: &str = "/proc/locks";
+    #[cfg(target_os = "linux")]
+    const POSIX_LOCK: &str = "POSIX";
     const REMOTE_CWD: &str = ".";
     const MISSING_LEGACY_CWD: &str = "/definitely/missing/legacy/project";
     const MODEL: &str = "test/model";
@@ -10070,6 +10083,52 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             assert_eq!(after[path], before[path]);
         }
         drop(reader_lock);
+    }
+
+    /// The POSIX locks this process holds on `paths`, as `/proc/locks` lists them.
+    #[cfg(target_os = "linux")]
+    fn posix_locks(paths: &[PathBuf]) -> Vec<String> {
+        let pid = process::id().to_string();
+        let inodes: Vec<String> = paths
+            .iter()
+            .map(|path| fs::metadata(path).unwrap().ino().to_string())
+            .collect();
+        let mut locks: Vec<String> = fs::read_to_string(PROC_LOCKS)
+            .unwrap()
+            .lines()
+            .filter_map(|line| {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                let [_, POSIX_LOCK, _, kind, owner, file, start, end] = fields.as_slice() else {
+                    return None;
+                };
+                let inode = file.rsplit(':').next()?;
+                (*owner == pid && inodes.iter().any(|known| known == inode))
+                    .then(|| format!("{inode} {kind} {start} {end}"))
+            })
+            .collect();
+        locks.sort();
+        locks
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opening_another_connection_keeps_the_locks_of_live_ones() {
+        let (_temp, state_dir) = state_dir();
+        let live = SessionDatabase::open_state(&state_dir).unwrap();
+        // A read maps and locks the WAL index, as it is in any working session.
+        live.latest_id(CWD).unwrap();
+        let path = live.path();
+        let files = [path.clone(), database_sidecar(&path, SHM_SUFFIX)];
+        let held = posix_locks(&files);
+        assert!(!held.is_empty());
+
+        let existing = SessionDatabase::open_existing_state(&state_dir)
+            .unwrap()
+            .unwrap();
+        let fresh = SessionDatabase::open_state(&state_dir).unwrap();
+
+        assert_eq!(posix_locks(&files), held);
+        drop((existing, fresh, live));
     }
 
     #[test_case("-wal", false; "blocking_missing_wal")]
