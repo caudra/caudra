@@ -18,6 +18,7 @@ use caudra_agent::command::{self, CustomCommand};
 use caudra_agent::decisions::Decisions;
 use caudra_agent::herdr::HerdrEnv;
 use caudra_agent::peers::PeerHost;
+use caudra_agent::peers::topics::add_patterns;
 use caudra_agent::permissions::pattern_recognition::{PatternCandidate, RecognitionExclusion};
 use caudra_agent::prompt::profile::{PromptProfileCatalog, SystemPromptProfile};
 use caudra_agent::tools::{DescriptionContext, ToolAudience, ToolFilter, ToolRegistry};
@@ -80,8 +81,7 @@ const RELOCATION_ROLLBACK_FAILED: &str =
     "Could not restore the original working directory; the UI was not restarted";
 const PROJECT_ENV_PATH: &str = ".caudra/.env";
 const MESSAGING_UNAVAILABLE: &str = "Cross-session messaging unavailable";
-const NAME_NEEDS_LOCAL_MESSAGING: &str =
-    "--name needs cross-session messaging, which only local sessions support";
+const LAUNCH_NEEDS_LOCAL_MESSAGING: &str = "--name, --topic, and --receive-broadcasts need cross-session messaging, which only local sessions support";
 const RELOCATION_ENV_RESTART: &str =
     "Run caudra --continue from the destination to load its environment safely";
 const RELOCATION_USAGE_UNCHANGED: &str = "Historical project usage attribution was left unchanged";
@@ -827,6 +827,25 @@ fn reserve_launch_name(host: &PeerHost, session: &mut AppSession, name: &str) ->
     Ok(())
 }
 
+/// Adds the launch subscriptions to the ones the session already keeps, so a
+/// resumed session never loses a topic it subscribed to before.
+fn subscribe_launch(session: &mut AppSession, topics: &[String], broadcasts: bool) -> Result<()> {
+    if topics.is_empty() && !broadcasts {
+        return Ok(());
+    }
+    let current = session
+        .meta
+        .peer_controls
+        .as_ref()
+        .map(|controls| controls.topics.as_slice())
+        .unwrap_or_default();
+    let topics = add_patterns(current, topics).map_err(|error| eyre!(error))?;
+    let controls = session.meta.peer_controls.get_or_insert_default();
+    controls.topics = topics;
+    controls.broadcasts |= broadcasts;
+    Ok(())
+}
+
 fn relocation_moves_live_tabs(tabs: &[SessionTab], request: &SessionRelocation) -> bool {
     tabs.iter().any(|tab| {
         request
@@ -1539,12 +1558,13 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
     let mut sweeper = RetentionSweeper::spawn(storage.clone(), stack.config.storage);
     let mut committed_relocation: Option<String> = None;
     let sandboxes = cli.startup.features.enabled(Feature::Sandboxes);
+    let messaging_flags = cli.name.is_some() || !cli.topics.is_empty() || cli.receive_broadcasts;
     let peer_host = if workcell_runtime.is_remote() {
         None
     } else {
         match PeerHost::start(cli.startup.features) {
             Ok(host) => host.map(Arc::new),
-            Err(error) if cli.name.is_some() => {
+            Err(error) if messaging_flags => {
                 return Err(eyre!("{MESSAGING_UNAVAILABLE}: {error}"));
             }
             Err(error) => {
@@ -1553,11 +1573,15 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
             }
         }
     };
-    if let Some(name) = &cli.name {
+    if messaging_flags {
         let host = peer_host
             .as_deref()
-            .ok_or_else(|| eyre!(NAME_NEEDS_LOCAL_MESSAGING))?;
-        reserve_launch_name(host, &mut tabs[focused].session, name)?;
+            .ok_or_else(|| eyre!(LAUNCH_NEEDS_LOCAL_MESSAGING))?;
+        let session = &mut tabs[focused].session;
+        if let Some(name) = &cli.name {
+            reserve_launch_name(host, session, name)?;
+        }
+        subscribe_launch(session, &cli.topics, cli.receive_broadcasts)?;
     }
 
     loop {
@@ -3911,7 +3935,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    mod launch_name {
+    mod launch_messaging {
         use std::fs::Permissions;
         use std::os::unix::fs::PermissionsExt;
         use std::path::Path;
@@ -3919,15 +3943,19 @@ mod tests {
 
         use caudra_agent::History;
         use caudra_agent::peers::PeerHost;
+        use caudra_agent::peers::topics::{MAX_PATTERNS, TOO_MANY_PATTERNS};
         use caudra_providers::Message;
+        use caudra_storage::sessions::StoredPeerControls;
         use caudra_ui::AppSession;
         use tempfile::{Builder, TempDir};
         use test_case::test_case;
 
-        use super::super::reserve_launch_name;
+        use super::super::{reserve_launch_name, subscribe_launch};
         use super::{TEST_CWD, TEST_MODEL};
 
         const LAUNCH_NAME: &str = "ci-watcher";
+        const LAUNCH_TOPIC: &str = "ci.**";
+        const STORED_TOPIC: &str = "deploy";
         const RESUMED_PROMPT: &str = "Fix the parser";
         const PRIVATE_MODE: u32 = 0o700;
         /// Short enough that peer socket paths fit the Unix limit.
@@ -3983,6 +4011,49 @@ mod tests {
             assert!(error.to_string().contains(LAUNCH_NAME), "{error}");
             assert_eq!(session.meta.peer_controls, None);
             assert_eq!(session.title, title);
+        }
+
+        #[test_case(&[], &[], false, None; "no_flags_store_nothing")]
+        #[test_case(&[], &[LAUNCH_TOPIC], false, Some(&[LAUNCH_TOPIC][..]); "new_subscription")]
+        #[test_case(&[STORED_TOPIC], &[LAUNCH_TOPIC, STORED_TOPIC], true, Some(&[STORED_TOPIC, LAUNCH_TOPIC][..]); "resumed_subscriptions_are_kept")]
+        fn launch_subscriptions_add_to_the_stored_ones(
+            stored: &[&str],
+            launched: &[&str],
+            broadcasts: bool,
+            expected: Option<&[&str]>,
+        ) {
+            let mut session = AppSession::new(TEST_MODEL, TEST_CWD);
+            if !stored.is_empty() {
+                session.meta.peer_controls = Some(StoredPeerControls {
+                    topics: patterns(stored),
+                    ..StoredPeerControls::default()
+                });
+            }
+            subscribe_launch(&mut session, &patterns(launched), broadcasts).unwrap();
+            let controls = session.meta.peer_controls;
+            assert_eq!(
+                controls.as_ref().map(|controls| controls.topics.clone()),
+                expected.map(patterns)
+            );
+            assert_eq!(
+                controls.is_some_and(|controls| controls.broadcasts),
+                broadcasts
+            );
+        }
+
+        #[test]
+        fn launch_subscriptions_over_the_limit_stop_startup_unchanged() {
+            let mut session = AppSession::new(TEST_MODEL, TEST_CWD);
+            let launched: Vec<String> = (0..=MAX_PATTERNS)
+                .map(|index| format!("{STORED_TOPIC}-{index}"))
+                .collect();
+            let error = subscribe_launch(&mut session, &launched, true).unwrap_err();
+            assert_eq!(error.to_string(), TOO_MANY_PATTERNS);
+            assert_eq!(session.meta.peer_controls, None);
+        }
+
+        fn patterns(values: &[&str]) -> Vec<String> {
+            values.iter().copied().map(str::to_owned).collect()
         }
     }
 }

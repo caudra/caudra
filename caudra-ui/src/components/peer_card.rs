@@ -1,4 +1,7 @@
-use caudra_agent::{PeerOutput, peers::PeerSummary};
+use caudra_agent::{
+    PeerOutput,
+    peers::{PeerSummary, PublishReceipt, handle_address},
+};
 use caudra_config::InboundPolicy;
 use ratatui::{
     style::Style,
@@ -18,6 +21,13 @@ const WORKSPACE_LABEL: &str = "Workspace: ";
 const MESSAGE_LABEL: &str = "Message: ";
 const REASON_LABEL: &str = "Reason: ";
 const TO_LABEL: &str = "To: ";
+const TOPICS_LABEL: &str = "Topics: ";
+const AUDIENCE_LABEL: &str = "Audience: ";
+const SKIPPED_LABEL: &str = "Not sent, over the fan-out limit: ";
+const BROADCASTS: &str = "Receives broadcasts";
+const NO_RECIPIENTS: &str = "No live recipients";
+const PUBLISHED_MEANING: &str = "acceptance is not proof of delivery or completion";
+const ACCEPTED: &[&str] = &["queued", "held"];
 const SEPARATOR: &str = " · ";
 
 pub(crate) fn render(output: &PeerOutput, budget: usize, width: u16) -> (Vec<Line<'static>>, bool) {
@@ -52,17 +62,16 @@ pub(crate) fn render(output: &PeerOutput, budget: usize, width: u16) -> (Vec<Lin
                     &peer.cwd.to_string_lossy(),
                     theme.tool_path,
                 ));
+                if !peer.topics.is_empty() {
+                    lines.push(labelled(TOPICS_LABEL, &peer.topics.join(", "), theme.tool));
+                }
+                if peer.broadcasts {
+                    lines.push(Line::from(Span::styled(BROADCASTS, theme.tool_dim)));
+                }
             }
         }
         PeerOutput::Sent { target, receipt } => {
-            let (state, meaning) = match receipt.status.as_str() {
-                "queued" => ("Queued", "accepted, not proof of delivery or completion"),
-                "held" => ("Held", "awaiting review, not delivered to the model"),
-                "refused" => ("Refused", "not accepted"),
-                "rate_limited" => ("Rate-limited", "not accepted"),
-                "unavailable" => ("Unavailable", "peer could not be reached"),
-                _ => ("Unknown", "acceptance unconfirmed; do not assume delivery"),
-            };
+            let (state, meaning) = receipt_state(&receipt.status);
             lines.push(Line::from(vec![
                 Span::styled(state, receipt_style(&receipt.status)),
                 Span::styled(format!("{SEPARATOR}{meaning}"), theme.tool_dim),
@@ -77,6 +86,63 @@ pub(crate) fn render(output: &PeerOutput, budget: usize, width: u16) -> (Vec<Lin
                 .filter(|reason| !reason.is_empty())
             {
                 lines.push(labelled(REASON_LABEL, reason, theme.tool));
+            }
+        }
+        PeerOutput::Published { receipt } => {
+            let summary = if receipt.recipients.is_empty() {
+                NO_RECIPIENTS.to_owned()
+            } else {
+                let accepted = receipt
+                    .recipients
+                    .iter()
+                    .filter(|recipient| ACCEPTED.contains(&recipient.status.as_str()))
+                    .count();
+                format!("{accepted} of {} accepted", receipt.recipients.len())
+            };
+            lines.push(Line::from(vec![
+                Span::styled(summary, publication_style(receipt)),
+                Span::styled(format!("{SEPARATOR}{PUBLISHED_MEANING}"), theme.tool_dim),
+            ]));
+            lines.push(labelled(
+                AUDIENCE_LABEL,
+                &receipt.audience.to_string(),
+                theme.tool_path,
+            ));
+            if !receipt.message_id.is_empty() {
+                lines.push(labelled(MESSAGE_LABEL, &receipt.message_id, theme.tool));
+            }
+            for recipient in &receipt.recipients {
+                let mut spans = vec![
+                    Span::styled(
+                        receipt_state(&recipient.status).0,
+                        receipt_style(&recipient.status),
+                    ),
+                    Span::styled(
+                        format!("{SEPARATOR}{}", recipient.title.escape_debug()),
+                        theme.tool_prefix,
+                    ),
+                ];
+                if let Some(handle) = &recipient.handle {
+                    spans.push(Span::styled(
+                        format!(" {}", handle_address(handle).escape_debug()),
+                        theme.tool_path,
+                    ));
+                }
+                lines.push(Line::from(spans));
+                lines.push(labelled(TO_LABEL, &recipient.target, theme.tool_path));
+                if let Some(reason) = recipient
+                    .reason
+                    .as_deref()
+                    .filter(|reason| !reason.is_empty())
+                {
+                    lines.push(labelled(REASON_LABEL, reason, theme.tool));
+                }
+            }
+            if receipt.skipped > 0 {
+                lines.push(Line::from(Span::styled(
+                    format!("{SKIPPED_LABEL}{}", receipt.skipped),
+                    theme.tool_warning,
+                )));
             }
         }
     }
@@ -96,12 +162,36 @@ pub(crate) fn render(output: &PeerOutput, budget: usize, width: u16) -> (Vec<Lin
     (lines, hidden > 0)
 }
 
+fn receipt_state(status: &str) -> (&'static str, &'static str) {
+    match status {
+        "queued" => ("Queued", "accepted, not proof of delivery or completion"),
+        "held" => ("Held", "awaiting review, not delivered to the model"),
+        "refused" => ("Refused", "not accepted"),
+        "rate_limited" => ("Rate-limited", "not accepted"),
+        "unavailable" => ("Unavailable", "peer could not be reached"),
+        _ => ("Unknown", "acceptance unconfirmed; do not assume delivery"),
+    }
+}
+
 fn receipt_style(status: &str) -> Style {
     let theme = theme::current();
     match status {
         "queued" => theme.tool_success,
         "refused" | "unavailable" => theme.tool_error,
         _ => theme.tool_warning,
+    }
+}
+
+/// One recipient's colour when they all agree, a warning when they differ or
+/// nobody was reached.
+fn publication_style(receipt: &PublishReceipt) -> Style {
+    let mut styles = receipt
+        .recipients
+        .iter()
+        .map(|recipient| receipt_style(&recipient.status));
+    match styles.next() {
+        Some(first) if styles.all(|style| style == first) => first,
+        _ => theme::current().tool_warning,
     }
 }
 
@@ -137,14 +227,18 @@ mod tests {
 
     use caudra_agent::{
         BatchToolEntry, BatchToolStatus, PeerOutput, ToolOutput,
-        peers::{PeerSummary, SendReceipt},
+        peers::{PeerSummary, PublishReceipt, RecipientReceipt, SendReceipt},
         tools::{ToolEffect, native::peers::SEND_NAME},
     };
     use caudra_config::{InboundPolicy, ToolOutputLines};
+    use caudra_providers::PeerAudience;
     use ratatui::text::Line;
     use test_case::test_case;
 
-    use super::{EMPTY, NAME_LABEL, render};
+    use super::{
+        AUDIENCE_LABEL, BROADCASTS, EMPTY, NAME_LABEL, NO_RECIPIENTS, SKIPPED_LABEL, TOPICS_LABEL,
+        render,
+    };
     use crate::components::code_view::{BatchViews, RenderLimits, RowTarget, render_tool_content};
     use crate::theme;
 
@@ -158,6 +252,9 @@ mod tests {
     const HOSTILE: &str = "**literal**\x1b]8;;evil\x07\r\n\t\u{85}\u{202e}";
     const STALE_ANNOTATION: &str = "1 lines";
     const RAW_JSON: &str = "{\"status\":\"unknown\"}";
+    const TOPIC: &str = "ci.failures";
+    const PATTERN: &str = "ci.**";
+    const OTHER_PATTERN: &str = "deploy.*";
 
     fn session() -> PeerSummary {
         PeerSummary {
@@ -168,6 +265,31 @@ mod tests {
             busy: false,
             blocked: false,
             inbound: InboundPolicy::Auto,
+            topics: Vec::new(),
+            broadcasts: false,
+        }
+    }
+
+    fn recipient(status: &str) -> RecipientReceipt {
+        RecipientReceipt {
+            target: TARGET.into(),
+            title: NAME.into(),
+            handle: Some(HANDLE.into()),
+            status: status.into(),
+            reason: Some(REASON.into()),
+        }
+    }
+
+    fn publication(statuses: &[&str], skipped: usize) -> PeerOutput {
+        PeerOutput::Published {
+            receipt: PublishReceipt {
+                message_id: MESSAGE.into(),
+                audience: PeerAudience::Topic {
+                    topic: TOPIC.into(),
+                },
+                recipients: statuses.iter().map(|status| recipient(status)).collect(),
+                skipped,
+            },
         }
     }
 
@@ -263,6 +385,56 @@ mod tests {
         assert_eq!(drawn.contains(NAME_LABEL), shown);
     }
 
+    #[test_case(&[], false; "unsubscribed")]
+    #[test_case(&[PATTERN, OTHER_PATTERN], false; "topics")]
+    #[test_case(&[], true; "broadcasts")]
+    fn peer_rows_show_subscriptions_only_when_present(topics: &[&str], broadcasts: bool) {
+        let output = PeerOutput::Sessions {
+            sessions: vec![PeerSummary {
+                topics: topics.iter().copied().map(str::to_owned).collect(),
+                broadcasts,
+                ..session()
+            }],
+        };
+        let drawn = text(&render(&output, usize::MAX, WIDTH).0);
+        assert_eq!(
+            drawn.contains(&format!("{TOPICS_LABEL}{}", topics.join(", "))),
+            !topics.is_empty()
+        );
+        assert_eq!(drawn.contains(BROADCASTS), broadcasts);
+    }
+
+    #[test_case(&["queued", "queued"], 0, "2 of 2 accepted"; "all_queued")]
+    #[test_case(&["queued", "refused"], 0, "1 of 2 accepted"; "mixed")]
+    #[test_case(&["refused", "unavailable"], 0, "0 of 2 accepted"; "none_accepted")]
+    #[test_case(&["held", "unknown"], 4, "1 of 2 accepted"; "skipped_over_fanout")]
+    #[test_case(&[], 0, NO_RECIPIENTS; "nobody_subscribed")]
+    fn publication_receipts_list_every_recipient_outcome(
+        statuses: &[&str],
+        skipped: usize,
+        summary: &str,
+    ) {
+        let (lines, truncated) = render(&publication(statuses, skipped), usize::MAX, WIDTH);
+        let drawn = text(&lines);
+        assert!(!truncated);
+        for expected in [summary, &format!("{AUDIENCE_LABEL}topic {TOPIC}"), MESSAGE] {
+            assert!(drawn.contains(expected), "{drawn}");
+        }
+        assert_eq!(drawn.matches(&format!("@{HANDLE}")).count(), statuses.len());
+        assert_eq!(drawn.matches(REASON).count(), statuses.len());
+        assert_eq!(
+            drawn.contains(&format!("{SKIPPED_LABEL}{skipped}")),
+            skipped > 0
+        );
+        let theme = theme::current();
+        let expected_style = match statuses {
+            ["queued", "queued"] => theme.tool_success,
+            ["refused", "unavailable"] => theme.tool_error,
+            _ => theme.tool_warning,
+        };
+        assert_eq!(lines[0].spans[0].style, expected_style);
+    }
+
     #[test]
     fn empty_discovery_explains_how_to_make_a_peer_reachable() {
         let (lines, truncated) = render(
@@ -341,29 +513,53 @@ mod tests {
         assert!(truncated);
     }
 
-    #[test_case(false; "session_labels")]
-    #[test_case(true; "receipt_labels")]
-    fn hostile_values_remain_literal_without_terminal_controls(sent: bool) {
-        let output = if sent {
-            PeerOutput::Sent {
+    fn hostile_sessions() -> PeerOutput {
+        PeerOutput::Sessions {
+            sessions: vec![PeerSummary {
                 target: HOSTILE.into(),
-                receipt: SendReceipt {
-                    status: HOSTILE.into(),
-                    message_id: HOSTILE.into(),
-                    reason: Some(HOSTILE.into()),
+                title: HOSTILE.into(),
+                handle: Some(HOSTILE.into()),
+                cwd: PathBuf::from(HOSTILE),
+                topics: vec![HOSTILE.into()],
+                ..session()
+            }],
+        }
+    }
+
+    fn hostile_receipt() -> PeerOutput {
+        PeerOutput::Sent {
+            target: HOSTILE.into(),
+            receipt: SendReceipt {
+                status: HOSTILE.into(),
+                message_id: HOSTILE.into(),
+                reason: Some(HOSTILE.into()),
+            },
+        }
+    }
+
+    fn hostile_publication() -> PeerOutput {
+        PeerOutput::Published {
+            receipt: PublishReceipt {
+                message_id: HOSTILE.into(),
+                audience: PeerAudience::Topic {
+                    topic: HOSTILE.into(),
                 },
-            }
-        } else {
-            PeerOutput::Sessions {
-                sessions: vec![PeerSummary {
+                recipients: vec![RecipientReceipt {
                     target: HOSTILE.into(),
                     title: HOSTILE.into(),
                     handle: Some(HOSTILE.into()),
-                    cwd: PathBuf::from(HOSTILE),
-                    ..session()
+                    status: HOSTILE.into(),
+                    reason: Some(HOSTILE.into()),
                 }],
-            }
-        };
+                skipped: 0,
+            },
+        }
+    }
+
+    #[test_case(hostile_sessions(); "session_labels")]
+    #[test_case(hostile_receipt(); "receipt_labels")]
+    #[test_case(hostile_publication(); "publication_labels")]
+    fn hostile_values_remain_literal_without_terminal_controls(output: PeerOutput) {
         let (lines, _) = render(&output, usize::MAX, 0);
         assert!(
             lines

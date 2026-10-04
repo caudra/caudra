@@ -2067,6 +2067,8 @@ mod tests {
             busy: false,
             blocked: false,
             inbound: InboundPolicy::Auto,
+            topics: Vec::new(),
+            broadcasts: false,
         }
     }
 

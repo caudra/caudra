@@ -82,8 +82,9 @@ pub enum HistoryItemKind {
         task_event: Option<TaskEventOrigin>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workflow_event: Option<WorkflowEventOrigin>,
+        /// Boxed because it is rare and inline it would enlarge every item.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        peer_event: Option<PeerMessageOrigin>,
+        peer_event: Option<Box<PeerMessageOrigin>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         standing_reminder: Option<StandingReminderKind>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -646,7 +647,7 @@ fn user_kind(
         steering: message.steering.clone(),
         task_event: message.task_event.clone(),
         workflow_event: message.workflow_event.clone(),
-        peer_event: message.peer_event.clone(),
+        peer_event: message.peer_event.clone().map(Box::new),
         standing_reminder: message.standing_reminder.clone(),
         retained_output_refs: message.retained_output_refs.clone(),
     }
@@ -941,7 +942,7 @@ fn project_group(items: &[HistoryItem]) -> Message {
                     message.steering = steering.clone();
                     message.task_event = task_event.clone();
                     message.workflow_event = workflow_event.clone();
-                    message.peer_event = peer_event.clone();
+                    message.peer_event = peer_event.as_deref().cloned();
                     message.standing_reminder = standing_reminder.clone();
                     if let Some(origin) = task_event {
                         message.retained_subagent_ids.push(origin.task_id.clone());
@@ -1178,7 +1179,7 @@ mod tests {
         let events: Vec<_> = transcript
             .iter()
             .filter_map(|item| match &item.kind {
-                HistoryItemKind::User { peer_event, .. } => peer_event.as_ref(),
+                HistoryItemKind::User { peer_event, .. } => peer_event.as_deref(),
                 _ => None,
             })
             .collect();

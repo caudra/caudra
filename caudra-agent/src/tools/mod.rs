@@ -311,6 +311,7 @@ pub fn feature_exclusions(features: FeatureFlags) -> &'static [&'static str] {
             WORKFLOW_TOOL_NAME,
             native::peers::LIST_NAME,
             native::peers::SEND_NAME,
+            native::peers::PUBLISH_NAME,
         ],
     }
 }

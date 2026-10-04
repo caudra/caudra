@@ -150,6 +150,9 @@ const STALE_PLAN_REF: &str = "plan-stale";
 const COMMITTED_PLAN_CALL: &str = "committed-plan-write";
 const PEER_CONTROL_PROMPT: &str = "Keep the peer controls across a reload.";
 const PEER_HANDLE: &str = "release-agent";
+const PEER_TOPIC: &str = "release.**";
+const PEER_TOPICS_COMMAND: &str = "/topics subscribe ci.*";
+const PEER_TOPICS_ARGS: &str = "subscribe ci.*";
 const PEER_MANAGER_TITLE: &str = "Peers";
 const PEER_MANAGER_DRAFT: &str = "Preserve this unsent prompt.";
 const PEER_MANAGER_PASTE: &str = "peer filter";
@@ -5170,6 +5173,7 @@ fn main_only_commands_still_run_from_the_main_composer() {
 #[test_case("/workflows", Feature::Workflows; "workflows")]
 #[test_case("/peers", Feature::CrossSessionMessaging; "peers")]
 #[test_case("/messages", Feature::CrossSessionMessaging; "messages")]
+#[test_case("/topics", Feature::CrossSessionMessaging; "topics")]
 #[test_case("/deep-research", Feature::Workflows; "workflow_shortcut")]
 #[test_case("/sandbox", Feature::Sandboxes; "sandbox")]
 #[test_case("/decisions", Feature::DecisionEngine; "decisions")]
@@ -5187,16 +5191,16 @@ fn a_command_whose_experiment_is_off_names_the_switch(command: &str, feature: Fe
     assert_eq!(app.permissions.mode(), PermissionMode::Ask);
 }
 
-#[test_case("/peers", false; "sessions")]
-#[test_case("/messages", true; "held")]
-fn peer_commands_leave_runtime_eligibility_to_the_event_loop(command: &str, held: bool) {
+#[test_case("/peers", |actions| matches!(actions, [Action::ListPeers]); "sessions")]
+#[test_case("/messages", |actions| matches!(actions, [Action::PeerMessages(args)] if args.is_empty()); "held")]
+#[test_case(PEER_TOPICS_COMMAND, |actions| matches!(actions, [Action::PeerTopics(args)] if args == PEER_TOPICS_ARGS); "topics")]
+fn peer_commands_leave_runtime_eligibility_to_the_event_loop(
+    command: &str,
+    expected: fn(&[Action]) -> bool,
+) {
     let mut app = test_app();
     let actions = app.run_cmdline(command, 0).unwrap();
-    if held {
-        assert!(matches!(&actions[..], [Action::PeerMessages(args)] if args.is_empty()));
-    } else {
-        assert!(matches!(&actions[..], [Action::ListPeers]));
-    }
+    assert!(expected(&actions));
     assert!(!app.peer_manager.is_open());
     assert!(app.state.session.messages().is_empty());
 }
@@ -10536,6 +10540,8 @@ fn stored_peer_controls() -> StoredPeerControls {
     StoredPeerControls {
         inbound: Some(StoredInboundPolicy::Hold),
         handle: Some(PEER_HANDLE.into()),
+        topics: vec![PEER_TOPIC.into()],
+        broadcasts: true,
     }
 }
 

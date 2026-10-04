@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use caudra_agent::peers::topics::{add_patterns, remove_patterns};
 use caudra_agent::peers::{
     PeerDecision, PeerDecisionResult, PeerDescriptor, PeerReviewToken, PeerSession, PeerSummary,
 };
@@ -23,6 +24,12 @@ const QUEUED: &str = "Message queued for the next safe boundary; an idle session
 const UNNAMED: &str =
     "this session continues without it and reclaims it when resumed while it is free";
 const REJECTED: &str = "Message rejected and removed from the live inbox";
+const TOPICS_HELP: &str = "Usage: /topics [help | subscribe PATTERN... | unsubscribe PATTERN... | broadcast on|off]\nRun /topics to show this session's subscriptions. A topic is a dot-separated name such as ci.failures. In a pattern, * matches one segment and a final ** matches one or more. Subscriptions decide which publications reach this session, up to 16 patterns. Broadcasts reach only sessions that turn them on. The inbound policy still decides whether each message is delivered, held, or refused. Subscriptions are kept with the session and restored when it resumes.";
+const TOPICS_LABEL: &str = "Peer topics: ";
+const NO_TOPICS: &str = "No peer topic subscriptions";
+const BROADCASTS_ON: &str = "broadcasts on";
+const BROADCASTS_OFF: &str = "broadcasts off";
+const SUMMARY_SEPARATOR: &str = " · ";
 
 type DiscoveryResult = Result<Vec<PeerSummary>, String>;
 
@@ -523,25 +530,143 @@ impl EventLoop<'_> {
             _ => self.sessions[index].app.flash(MESSAGES_HELP.into()),
         }
     }
+
+    pub(super) fn peer_topics(&mut self, index: usize, args: &str) {
+        if args.trim() == "help" {
+            let runtime = &mut self.sessions[index];
+            if !runtime.app.refuse_disabled(Feature::CrossSessionMessaging) {
+                runtime.peer_notice(TOPICS_HELP.into());
+            }
+            return;
+        }
+        if !self.peer_command_ready(index) {
+            return;
+        }
+        let runtime = &mut self.sessions[index];
+        let Some(session) = runtime.peer.as_ref().map(|peer| peer.session.clone()) else {
+            return;
+        };
+        let current = session.controls();
+        let args: Vec<String> = args.split_whitespace().map(str::to_owned).collect();
+        let result = match subscription_request(&current.topics, current.broadcasts, &args) {
+            SubscriptionRequest::Show => {
+                Ok(subscriptions_summary(&current.topics, current.broadcasts))
+            }
+            SubscriptionRequest::Usage => Err(TOPICS_HELP.to_owned()),
+            SubscriptionRequest::Change(change) => change.and_then(|(topics, broadcasts)| {
+                let summary = subscriptions_summary(&topics, broadcasts);
+                session
+                    .set_subscriptions(topics, broadcasts)
+                    .map(|()| summary)
+            }),
+        };
+        match result {
+            Ok(summary) => runtime.peer_notice(summary),
+            Err(error) => runtime.app.flash(error),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum SubscriptionRequest {
+    Show,
+    Usage,
+    /// The whole subscription set the command asks for, topics then broadcasts.
+    Change(Result<(Vec<String>, bool), String>),
+}
+
+fn subscription_request(
+    topics: &[String],
+    broadcasts: bool,
+    args: &[String],
+) -> SubscriptionRequest {
+    match args.split_first() {
+        None => SubscriptionRequest::Show,
+        Some((action, patterns)) if action == "subscribe" && !patterns.is_empty() => {
+            SubscriptionRequest::Change(
+                add_patterns(topics, patterns).map(|topics| (topics, broadcasts)),
+            )
+        }
+        Some((action, patterns)) if action == "unsubscribe" && !patterns.is_empty() => {
+            SubscriptionRequest::Change(
+                remove_patterns(topics, patterns).map(|topics| (topics, broadcasts)),
+            )
+        }
+        Some((action, [state])) if action == "broadcast" && (state == "on" || state == "off") => {
+            SubscriptionRequest::Change(Ok((topics.to_vec(), state == "on")))
+        }
+        Some(_) => SubscriptionRequest::Usage,
+    }
+}
+
+fn subscriptions_summary(topics: &[String], broadcasts: bool) -> String {
+    let topics = if topics.is_empty() {
+        NO_TOPICS.to_owned()
+    } else {
+        format!("{TOPICS_LABEL}{}", topics.join(", "))
+    };
+    let broadcasts = if broadcasts {
+        BROADCASTS_ON
+    } else {
+        BROADCASTS_OFF
+    };
+    format!("{topics}{SUMMARY_SEPARATOR}{broadcasts}")
 }
 
 #[cfg(test)]
 mod tests {
     use std::future::pending;
 
+    use caudra_agent::peers::topics::{INVALID_PATTERN, MISSING_PATTERN};
     use caudra_config::{Feature, FeatureFlags, sandbox::SandboxName};
     use flume::Sender;
     use test_case::test_case;
 
     use super::{
-        DISCOVERY_STOPPED, DiscoveryResult, PeerDiscovery, peer_blocked, peer_eligible,
-        poll_discovery,
+        BROADCASTS_OFF, BROADCASTS_ON, DISCOVERY_STOPPED, DiscoveryResult, NO_TOPICS,
+        PeerDiscovery, SubscriptionRequest, TOPICS_LABEL, peer_blocked, peer_eligible,
+        poll_discovery, subscription_request, subscriptions_summary,
     };
     use crate::app::{App, tests::test_app};
     use crate::components::{ExitRequest, Status};
 
     const ERROR: &str = "The model request failed";
     const GENERATION: u64 = 7;
+    const SUBSCRIBED: &str = "ci.*";
+    const ADDED: &str = "deploy.**";
+
+    fn words(values: &[&str]) -> Vec<String> {
+        values.iter().copied().map(str::to_owned).collect()
+    }
+
+    #[test_case(&[], SubscriptionRequest::Show; "no_arguments_show")]
+    #[test_case(&["subscribe", ADDED, SUBSCRIBED], SubscriptionRequest::Change(Ok((words(&[SUBSCRIBED, ADDED]), false))); "subscribe_adds_new_patterns")]
+    #[test_case(&["unsubscribe", SUBSCRIBED], SubscriptionRequest::Change(Ok((Vec::new(), false))); "unsubscribe_removes")]
+    #[test_case(&["unsubscribe", ADDED], SubscriptionRequest::Change(Err(format!("{MISSING_PATTERN}: {ADDED:?}"))); "unsubscribe_names_a_missing_pattern")]
+    #[test_case(&["subscribe", "CI"], SubscriptionRequest::Change(Err(INVALID_PATTERN.into())); "subscribe_validates")]
+    #[test_case(&["broadcast", "on"], SubscriptionRequest::Change(Ok((words(&[SUBSCRIBED]), true))); "broadcast_on")]
+    #[test_case(&["broadcast", "maybe"], SubscriptionRequest::Usage; "broadcast_needs_on_or_off")]
+    #[test_case(&["subscribe"], SubscriptionRequest::Usage; "subscribe_needs_a_pattern")]
+    #[test_case(&["list"], SubscriptionRequest::Usage; "unknown_action")]
+    fn topics_commands_describe_the_whole_subscription_set(
+        args: &[&str],
+        expected: SubscriptionRequest,
+    ) {
+        assert_eq!(
+            subscription_request(&words(&[SUBSCRIBED]), false, &words(args)),
+            expected
+        );
+    }
+
+    #[test_case(&[], false, &format!("{NO_TOPICS} · {BROADCASTS_OFF}"); "nothing")]
+    #[test_case(&[SUBSCRIBED, ADDED], true, &format!("{TOPICS_LABEL}{SUBSCRIBED}, {ADDED} · {BROADCASTS_ON}"); "topics_and_broadcasts")]
+    fn subscription_summaries_name_topics_and_broadcasts(
+        topics: &[&str],
+        broadcasts: bool,
+        expected: &str,
+    ) {
+        assert_eq!(subscriptions_summary(&words(topics), broadcasts), expected);
+    }
 
     fn discovery() -> (Sender<DiscoveryResult>, Option<PeerDiscovery>) {
         let (sender, receiver) = flume::bounded(1);

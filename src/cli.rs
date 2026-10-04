@@ -9,6 +9,7 @@ use color_eyre::Result;
 use color_eyre::eyre::bail;
 
 use caudra_agent::peers::parse_handle;
+use caudra_agent::peers::topics::parse_pattern;
 use caudra_agent::tools::all_builtin_tool_names;
 use caudra_config::files::{self, ConfigFile};
 use caudra_config::sandbox::LeaseSeconds;
@@ -163,6 +164,14 @@ pub struct Cli {
     #[arg(long, value_name = "NAME", value_parser = parse_handle, conflicts_with = "print")]
     pub name: Option<String>,
 
+    /// Subscribe the initial session to a cross-session topic pattern, kept across resumes; repeat for more
+    #[arg(long = "topic", value_name = "PATTERN", value_parser = parse_pattern, conflicts_with = "print")]
+    pub topics: Vec<String>,
+
+    /// Let cross-session broadcasts reach the initial session, kept across resumes
+    #[arg(long, conflicts_with = "print")]
+    pub receive_broadcasts: bool,
+
     /// Pre-approve tools (comma-separated). Accepts PascalCase (Claude Code) or snake_case.
     #[arg(
         long,
@@ -279,6 +288,12 @@ impl Cli {
             .mut_arg("credential_ref", |arg| arg.hide(direct_off))
             .mut_arg("auto", |arg| arg.hide(off(Feature::DecisionEngine)))
             .mut_arg("name", |arg| arg.hide(off(Feature::CrossSessionMessaging)))
+            .mut_arg("topics", |arg| {
+                arg.hide(off(Feature::CrossSessionMessaging))
+            })
+            .mut_arg("receive_broadcasts", |arg| {
+                arg.hide(off(Feature::CrossSessionMessaging))
+            })
             .mut_arg("no_jit", |arg| arg.hide(off(Feature::LuaPlugins)))
             .mut_subcommand("sandbox", |command| command.hide(sandboxes_off))
             .mut_subcommand("remote", |command| {
@@ -1214,6 +1229,7 @@ pub fn normalize_tool_name(name: &str) -> Result<String> {
 mod tests {
     use super::*;
     use caudra_agent::peers::INVALID_HANDLE;
+    use caudra_agent::peers::topics::INVALID_PATTERN;
     use caudra_config::workcell::{
         WorkcellProfiles, WorkcellSelection, WorkcellSelectionError, select_workcell,
     };
@@ -1609,14 +1625,31 @@ mod tests {
         }
     }
 
-    #[test]
-    fn messaging_name_belongs_to_interactive_sessions() {
+    #[test_case(&["--name", "ci-watcher"]; "name")]
+    #[test_case(&["--topic", "ci.*"]; "topic")]
+    #[test_case(&["--receive-broadcasts"]; "broadcasts")]
+    fn messaging_flags_belong_to_interactive_sessions(flags: &[&str]) {
+        let args = ["caudra"].iter().chain(flags).chain(&["--print"]);
         assert_eq!(
-            Cli::try_parse_from(["caudra", "--name", "ci-watcher", "--print"])
-                .err()
-                .map(|error| error.kind()),
+            Cli::try_parse_from(args).err().map(|error| error.kind()),
             Some(ErrorKind::ArgumentConflict)
         );
+    }
+
+    #[test_case(&["--topic=ci.*", "--topic=deploy.**"], Some(&["ci.*", "deploy.**"][..]); "repeated_patterns")]
+    #[test_case(&["--topic=CI"], None; "invalid_pattern")]
+    #[test_case(&["--topic=ci.**.failures"], None; "inner_tail_wildcard")]
+    fn topic_patterns_are_validated_while_parsing(flags: &[&str], expected: Option<&[&str]>) {
+        match Cli::try_parse_from(["caudra"].iter().chain(flags)) {
+            Ok(cli) => assert_eq!(
+                Some(cli.topics),
+                expected.map(|topics| topics.iter().map(|topic| (*topic).to_owned()).collect())
+            ),
+            Err(error) => {
+                assert!(expected.is_none());
+                assert!(error.to_string().contains(INVALID_PATTERN), "{error}");
+            }
+        }
     }
 
     /// Naming a session is how its change records get released by hand, so

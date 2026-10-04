@@ -311,7 +311,7 @@ impl KeyPool {
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use crate::types::PeerMessageOrigin;
+    use crate::types::{PeerAudience, PeerMessageOrigin};
     use crate::{Message, TaskEventOrigin, WorkflowEventOrigin};
     use caudra_storage::tool_outputs::ToolOutputRef;
 
@@ -330,6 +330,7 @@ pub(crate) mod test_support {
     const PEER_SESSION_ID: &str = "peer-session-id";
     const PEER_NAME: &str = "Parser reviewer";
     const PEER_HANDLE: &str = "parser-reviewer";
+    const PEER_TOPIC: &str = "ci.parser";
     const PEER_REPLY_TARGET: &str = "local-reviewer";
     const PEER_REPLY_TO: &str = "original-peer-message";
     const PEER_OPEN: &str = "<peer-message>";
@@ -339,6 +340,9 @@ pub(crate) mod test_support {
     pub(crate) fn peer_message_origin() -> PeerMessageOrigin {
         PeerMessageOrigin {
             message_id: PEER_MESSAGE_ID.into(),
+            audience: PeerAudience::Topic {
+                topic: PEER_TOPIC.into(),
+            },
             sender_session_id: PEER_SESSION_ID.into(),
             sender_name: PEER_NAME.into(),
             sender_handle: Some(PEER_HANDLE.into()),
@@ -353,6 +357,8 @@ pub(crate) mod test_support {
         assert_eq!(lines.next(), Some(PEER_WARNING));
         for (label, expected) in [
             ("message_id", Some(origin.message_id.as_str())),
+            ("audience", Some(origin.audience.label())),
+            ("topic", origin.audience.topic()),
             ("sender_session_id", Some(origin.sender_session_id.as_str())),
             ("sender_name", Some(origin.sender_name.as_str())),
             ("sender_handle", origin.sender_handle.as_deref()),

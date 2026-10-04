@@ -67,7 +67,7 @@ Open the individual message's review before using an approve or reject command. 
 
 Press `p` outside filter editing to manage this session's inbound policy. Select an option and press `a` to apply it. Relaxing the policy requires confirmation because it can release held messages and start billable turns. Project restrictions remain in force. This control never changes the selected peer's policy.
 
-You can also ask the agent to find a session and send it a message. It uses `list_sessions` for discovery and `send_message` for delivery. Discovery cards show session labels, [messaging names](#messaging-names), word-based targets, workspaces, and availability, without transcript previews. A title is not a unique address.
+You can also ask the agent to find a session and send it a message. It uses `list_sessions` for discovery and `send_message` for delivery. It reaches many sessions at once through [topics and broadcasts](#topics-and-broadcasts). Discovery cards show session labels, [messaging names](#messaging-names), subscriptions, word-based targets, workspaces, and availability, without transcript previews. A title is not a unique address.
 
 Use the exact target from discovery or an incoming reply address. Targets belong to your current live registration and are never reassigned to a replacement peer. Discover again after restarting or replacing your session. Message names also use generated words, including the names shown by `/messages` for approval or rejection.
 
@@ -91,6 +91,35 @@ Agents address a named session as `@ci-watcher` in `send_message`. Each send loo
 
 The session saves its name and claims it again when you resume it. If another live session holds the name by then, the resumed session continues without it and shows a warning. It tries again the next time you resume it. `/rename` changes only the title, so renaming a session never changes its address. Forks and new sessions start without a name.
 
+### Topics and broadcasts
+
+A topic message reaches every live session that subscribes to the topic. A broadcast reaches every live session that opted in to broadcasts. Long-running agents use them to coordinate, for example when a CI watcher tells the agents working on a repository that a build failed.
+
+A topic is a dot-separated name such as `ci.failures`. It has 1 to 8 segments within 128 bytes. A segment uses lowercase letters, digits, hyphens, and underscores, and starts with a letter or digit. A subscription is a pattern where `*` matches exactly one segment and a final `**` matches one or more. `ci.*` matches `ci.failures` but not `ci.failures.linux`, and `ci.**` matches both. A session holds at most 16 patterns.
+
+Subscribe when you start a TUI session:
+
+```sh
+caudra --name ci-watcher --topic 'ci.**' --receive-broadcasts
+```
+
+`--topic` is repeatable. It adds to the patterns a resumed session already has and never removes one. `--receive-broadcasts` opts the session in to broadcasts. Change subscriptions later with `/topics`:
+
+| Command | Action |
+|---|---|
+| `/topics` | Show this session's patterns and broadcast setting |
+| `/topics subscribe <pattern>...` | Add one or more patterns |
+| `/topics unsubscribe <pattern>...` | Remove one or more patterns |
+| `/topics broadcast on\|off` | Opt in to broadcasts or out of them |
+
+Only you control subscriptions, and agents have no tool to change them. The session saves them with its other messaging controls and restores them when you resume it. Forks and new sessions start without any. Other sessions see a change the next time they discover peers.
+
+Agents publish with `publish_message`, giving either a concrete `topic` or `broadcast: true`. Wildcards belong only in subscriptions. A session that has not opted in to broadcasts never receives one, so a broadcast cannot wake it.
+
+The publisher discovers live sessions once and keeps the matching ones as the fixed recipient set. It sends to at most `max_fanout` of them and reports the rest as skipped. Each recipient checks its own subscriptions again on arrival and refuses the message as not subscribed when they no longer match. The receipt lists every recipient with its own status. A retry under the same identity sends again only to recipients whose status is `unknown`.
+
+The recipient sees the audience in the message provenance. A reply goes to the publisher alone through `send_message`, as a direct message between the two sessions. Published messages pass the same inbound policy, permission review, and rate limits as direct messages.
+
 ### Delivery receipts and lifetime
 
 | Status | Meaning |
@@ -108,12 +137,14 @@ Each body is limited to 32 KiB of UTF-8. The inbox admits at most 50 messages ac
 
 ### Rate limits and cost
 
-Rate limits are the only volume control. A receiving session admits at most 64 messages per minute in total and 16 per minute from any one sender. Both windows are rolling. A message over either limit gets `rate_limited` and never enters the inbox. Set the limits in the global `caudra.toml`:
+Rate limits are the only volume control. A receiving session admits at most 64 messages per minute in total and 16 per minute from any one sender. A message over either limit gets `rate_limited` and never enters the inbox. A session publishes at most 16 topic or broadcast messages per minute. A publication over that rate is refused before anything is sent, and a retry of an earlier publication does not count. Each publication reaches at most 32 recipients. All windows are rolling. Set the limits in the global `caudra.toml`:
 
 ```toml
 [agent.messaging]
 inbound_per_minute = 64
 sender_per_minute = 16
+publish_per_minute = 16
+max_fanout = 32
 ```
 
 A project file can lower these limits but cannot raise them.

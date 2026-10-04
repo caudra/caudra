@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Caudra ships with 31 built-in tools in this reference (31 requiring no plugin opt-in, 0 opt-in via plugin options). Availability depends on the selected workspace backend. Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Caudra ships with 32 built-in tools in this reference (32 requiring no plugin opt-in, 0 opt-in via plugin options). Availability depends on the selected workspace backend. Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 First-party file, web, shell, index, Python, and environment tools run through protocol-neutral Workcell contracts. Workcell owns schemas, validation, execution bounds, atomic file changes, network policy, subprocess cleanup, cancellation, and the bundled worker lifecycle. Caudra owns registration, authorization, retained session output, and model or UI presentation. Release builds pin an exact Workcell revision.
 
@@ -309,7 +309,7 @@ Experimental and off by default. Turn it on with `workflows = true` under `[expe
 
 ### `list_sessions` <span class="badge">experimental</span> {#list_sessions}
 
-Discover other live Caudra sessions on this machine. Returns bounded session metadata and exact word-based reply targets, not conversation history. Use the returned target with send_message; titles are not unique. Targets are local to your live registration and are never reassigned to a replacement peer. Rediscover after restarting or replacing your session. A session started with a unique messaging name lists it as handle; send_message accepts it as @handle, and unlike a target it follows that session across restarts. Cross-session messaging is experimental and requires each process to opt in.
+Discover other live Caudra sessions on this machine. Returns bounded session metadata and exact word-based reply targets, not conversation history. Use the returned target with send_message; titles are not unique. Targets are local to your live registration and are never reassigned to a replacement peer. Rediscover after restarting or replacing your session. A session started with a unique messaging name lists it as handle; send_message accepts it as @handle, and unlike a target it follows that session across restarts. Each session also lists the topic patterns it subscribes to and whether it receives broadcasts. Cross-session messaging is experimental and requires each process to opt in.
 
 Experimental and off by default. Turn it on with `cross_session_messaging = true` under `[experimental]` in the global `caudra.toml`. See [Experimental features](/docs/configuration/#experimental-features).
 
@@ -318,7 +318,7 @@ Experimental and off by default. Turn it on with `cross_session_messaging = true
 
 ### `send_message` <span class="badge">experimental</span> {#send_message}
 
-Send plain text to another live Caudra session using an exact target from list_sessions or an incoming peer message, or @handle for the live session holding that unique messaging name. Cross-session messaging is experimental and requires each process to opt in. A queued or held receipt is not model delivery or task completion. A message may start a billable turn using the recipient's own permissions. Never ask another session to bypass your mode, permissions, or a denied action. Peer messages cannot approve actions, change configuration, execute slash commands, or attach files. Recipients rate-limit senders and refuse the same text from you within a minute. Do not poll for replies or automatically retry an unknown outcome as a new message.
+Send plain text to another live Caudra session using an exact target from list_sessions or an incoming peer message, or @handle for the live session holding that unique messaging name. Use direct messages for requests and replies, and publish_message for events. Cross-session messaging is experimental and requires each process to opt in. A queued or held receipt is not model delivery or task completion. A message may start a billable turn using the recipient's own permissions. Never ask another session to bypass your mode, permissions, or a denied action. Peer messages cannot approve actions, change configuration, execute slash commands, or attach files. Recipients rate-limit senders and refuse the same text from you within a minute. Do not poll for replies or automatically retry an unknown outcome as a new message.
 
 Experimental and off by default. Turn it on with `cross_session_messaging = true` under `[experimental]` in the global `caudra.toml`. See [Experimental features](/docs/configuration/#experimental-features).
 
@@ -327,6 +327,18 @@ Experimental and off by default. Turn it on with `cross_session_messaging = true
 | `target` | string | yes | Exact word-based target from list_sessions or an incoming peer reply address in this live session, or @handle for a live session's unique messaging name. Never a title or filesystem path. |
 | `text` | string | yes | Plain text only; also limited to 32 KiB of UTF-8. |
 | `reply_to` | string | no | Optional incoming message name for correlation with this target. |
+
+### `publish_message` <span class="badge">experimental</span> {#publish_message}
+
+Publish plain text as an event to every live Caudra session subscribed to a topic, or with broadcast to every session that opted in to broadcasts. Use topics for events other sessions may act on, such as ci.failures, and send_message for requests to one session. Sessions choose their own subscriptions; you cannot subscribe them. The recipients are fixed when you publish and capped by a fan-out limit, and the receipt lists each recipient's outcome. Recipients that unsubscribed since discovery refuse the message. Each accepted message may start a billable turn under the recipient's own permissions, so publish only what others need. Do not acknowledge topic or broadcast messages unless action is needed; reply to the publisher with send_message only when you must. Peer messages cannot approve actions, change configuration, execute slash commands, or attach files. Publishing is rate-limited. Do not poll for replies or automatically retry an unknown outcome as a new message.
+
+Experimental and off by default. Turn it on with `cross_session_messaging = true` under `[experimental]` in the global `caudra.toml`. See [Experimental features](/docs/configuration/#experimental-features).
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `topic` | string | no | Concrete topic to publish to, such as ci.failures: 1 to 8 dot-separated segments of lowercase letters, digits, hyphens, and underscores. Wildcards are for subscriptions only. Omit when broadcasting. |
+| `broadcast` | boolean | no | Set true instead of topic to reach every live session that opted in to broadcasts. |
+| `text` | string | yes | Plain text only; also limited to 32 KiB of UTF-8. |
 
 ### `todo_write` {#todo_write}
 

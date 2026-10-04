@@ -127,6 +127,8 @@ pub const MIN_OUTPUT_BYTES: usize = 1024;
 pub const MIN_OUTPUT_LINES: usize = 10;
 pub const DEFAULT_INBOUND_PER_MINUTE: usize = 64;
 pub const DEFAULT_SENDER_PER_MINUTE: usize = 16;
+pub const DEFAULT_PUBLISH_PER_MINUTE: usize = 16;
+pub const DEFAULT_MAX_FANOUT: usize = 32;
 pub const MIN_MESSAGE_RATE: usize = 1;
 pub const MIN_PER_TOOL_OUTPUT_BYTES: usize = 256;
 pub const MIN_PER_TOOL_OUTPUT_LINES: usize = 4;
@@ -284,6 +286,7 @@ pub const CAUDRA_NATIVE_TOOL_NAMES: &[&str] = &[
     "list_sessions",
     "memory",
     "plan",
+    "publish_message",
     "question",
     "send_message",
     "skill",
@@ -688,6 +691,12 @@ impl RawConfig {
             messaging.project_sender_per_minute,
             messaging.sender_per_minute.take(),
         );
+        messaging.project_publish_per_minute = lowest(
+            messaging.project_publish_per_minute,
+            messaging.publish_per_minute.take(),
+        );
+        messaging.project_max_fanout =
+            lowest(messaging.project_max_fanout, messaging.max_fanout.take());
         if let Some(inbound) = messaging.inbound.take() {
             self.agent.messaging.inbound = Some(
                 self.agent
@@ -1333,12 +1342,18 @@ pub struct MessagingFileConfig {
     pub inbound: Option<InboundPolicy>,
     pub inbound_per_minute: Option<usize>,
     pub sender_per_minute: Option<usize>,
+    pub publish_per_minute: Option<usize>,
+    pub max_fanout: Option<usize>,
     #[serde(skip)]
     pub project_inbound: Option<InboundPolicy>,
     #[serde(skip)]
     pub project_inbound_per_minute: Option<usize>,
     #[serde(skip)]
     pub project_sender_per_minute: Option<usize>,
+    #[serde(skip)]
+    pub project_publish_per_minute: Option<usize>,
+    #[serde(skip)]
+    pub project_max_fanout: Option<usize>,
 }
 
 impl MessagingFileConfig {
@@ -1348,7 +1363,9 @@ impl MessagingFileConfig {
             overlay,
             inbound,
             inbound_per_minute,
-            sender_per_minute
+            sender_per_minute,
+            publish_per_minute,
+            max_fanout
         );
         self.project_inbound_per_minute = lowest(
             self.project_inbound_per_minute,
@@ -1358,6 +1375,11 @@ impl MessagingFileConfig {
             self.project_sender_per_minute,
             overlay.project_sender_per_minute,
         );
+        self.project_publish_per_minute = lowest(
+            self.project_publish_per_minute,
+            overlay.project_publish_per_minute,
+        );
+        self.project_max_fanout = lowest(self.project_max_fanout, overlay.project_max_fanout);
         self.project_inbound = self.project_inbound.take().max(overlay.project_inbound);
         if let Some(floor) = &self.project_inbound {
             self.inbound = Some(self.inbound.take().unwrap_or_default().max(floor.clone()));
@@ -1380,6 +1402,12 @@ impl MessagingFileConfig {
                 self.project_sender_per_minute,
                 DEFAULT_SENDER_PER_MINUTE,
             ),
+            publish_per_minute: rate(
+                self.publish_per_minute,
+                self.project_publish_per_minute,
+                DEFAULT_PUBLISH_PER_MINUTE,
+            ),
+            max_fanout: rate(self.max_fanout, self.project_max_fanout, DEFAULT_MAX_FANOUT),
             project_inbound: self.project_inbound,
         }
     }
@@ -2228,6 +2256,7 @@ impl ToolOutputLines {
                 "batch",
                 "execution_environment",
                 "list_sessions",
+                "publish_message",
                 "question",
                 "send_message",
                 "skill",
@@ -2340,6 +2369,20 @@ pub struct MessagingConfig {
         desc = "Most peer messages a session admits per minute from one sending session. Project settings may only lower it"
     )]
     pub sender_per_minute: usize,
+
+    #[config(
+        default = DEFAULT_PUBLISH_PER_MINUTE,
+        min = MIN_MESSAGE_RATE,
+        desc = "Most topic and broadcast publications a session sends per minute. Project settings may only lower it"
+    )]
+    pub publish_per_minute: usize,
+
+    #[config(
+        default = DEFAULT_MAX_FANOUT,
+        min = MIN_MESSAGE_RATE,
+        desc = "Most live sessions one topic or broadcast publication reaches. Extra recipients are skipped and counted. Project settings may only lower it"
+    )]
+    pub max_fanout: usize,
 
     /// The strictest explicit project policy. No project policy leaves session
     /// controls free to choose `Accept`, even when the global default is `Auto`.
@@ -3818,6 +3861,8 @@ mod tests {
     const BACKGROUND_REMINDER_FIELD: &str = "background_reminder_turns";
     const INBOUND_RATE_FIELD: &str = "inbound_per_minute";
     const SENDER_RATE_FIELD: &str = "sender_per_minute";
+    const PUBLISH_RATE_FIELD: &str = "publish_per_minute";
+    const FANOUT_FIELD: &str = "max_fanout";
     const LOW_RATE: usize = 4;
     const MIDDLE_RATE: usize = 32;
     const HIGH_RATE: usize = 128;
@@ -3988,12 +4033,19 @@ mod tests {
         match field {
             INBOUND_RATE_FIELD => messaging.inbound_per_minute,
             SENDER_RATE_FIELD => messaging.sender_per_minute,
+            PUBLISH_RATE_FIELD => messaging.publish_per_minute,
+            FANOUT_FIELD => messaging.max_fanout,
             _ => unreachable!(),
         }
     }
 
     #[test_case(INBOUND_RATE_FIELD, None, None, None, DEFAULT_INBOUND_PER_MINUTE; "inbound_default")]
     #[test_case(SENDER_RATE_FIELD, None, None, None, DEFAULT_SENDER_PER_MINUTE; "sender_default")]
+    #[test_case(PUBLISH_RATE_FIELD, None, None, None, DEFAULT_PUBLISH_PER_MINUTE; "publish_default")]
+    #[test_case(FANOUT_FIELD, None, None, None, DEFAULT_MAX_FANOUT; "fanout_default")]
+    #[test_case(PUBLISH_RATE_FIELD, None, Some(LOW_RATE), None, LOW_RATE; "project_lowers_publish")]
+    #[test_case(FANOUT_FIELD, None, Some(HIGH_RATE), None, DEFAULT_MAX_FANOUT; "project_cannot_raise_fanout")]
+    #[test_case(FANOUT_FIELD, None, Some(LOW_RATE), Some(HIGH_RATE), LOW_RATE; "global_overlay_cannot_lift_fanout_ceiling")]
     #[test_case(INBOUND_RATE_FIELD, Some(MIDDLE_RATE), None, None, MIDDLE_RATE; "global_lowers")]
     #[test_case(INBOUND_RATE_FIELD, Some(HIGH_RATE), None, None, HIGH_RATE; "global_raises")]
     #[test_case(SENDER_RATE_FIELD, None, Some(LOW_RATE), None, LOW_RATE; "project_lowers_default")]
@@ -4020,6 +4072,8 @@ mod tests {
     #[test_case(SENDER_RATE_FIELD, false; "global_sender")]
     #[test_case(INBOUND_RATE_FIELD, true; "project_inbound")]
     #[test_case(SENDER_RATE_FIELD, true; "project_sender")]
+    #[test_case(PUBLISH_RATE_FIELD, false; "global_publish")]
+    #[test_case(FANOUT_FIELD, true; "project_fanout")]
     fn zero_message_rate_is_rejected(field: &str, project: bool) {
         let below = Some(MIN_MESSAGE_RATE - 1);
         let mut raw = RawConfig::default();
@@ -6375,6 +6429,7 @@ mod tests {
     #[test_case("shell" ; "builtin")]
     #[test_case("list_sessions" ; "peer_discovery")]
     #[test_case("send_message" ; "peer_send")]
+    #[test_case("publish_message" ; "peer_publish")]
     #[test_case("github.create_issue" ; "mcp_tool")]
     #[test_case("github.*" ; "mcp_server")]
     fn agent_disabled_tools_accepts(tool: &str) {

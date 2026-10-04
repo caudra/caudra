@@ -46,7 +46,7 @@ pub const TOOL_POLICY_GROUPS: &[(ToolPolicyGroup, &[&str])] = &[
     (ToolPolicyGroup::Images, &["view_image", "image_generate"]),
     (
         ToolPolicyGroup::Messaging,
-        &["list_sessions", "send_message"],
+        &["list_sessions", "send_message", "publish_message"],
     ),
 ];
 const RESERVED_SELECTORS: &[&str] = &["tool_search", "report_to_parent", "structured_output"];

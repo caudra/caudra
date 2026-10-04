@@ -49,7 +49,7 @@ A user-created fork starts with no conversation grants and no inherited explicit
 
 ## Cross-session messages
 
-[Cross-session messaging](/docs/sessions/#cross-session-messaging) needs the global experimental opt-in in every participating process. Tool permission rules cannot enable it. `send_message` is a side effect subject to outgoing authorization. ReadOnly sessions cannot send. Plan sessions ask before sending unless [YOLO mode](#yolo-mode) is on.
+[Cross-session messaging](/docs/sessions/#cross-session-messaging) needs the global experimental opt-in in every participating process. Tool permission rules cannot enable it. `send_message` and `publish_message` are side effects subject to outgoing authorization. Rules can treat them differently, because one publication can reach many sessions and wake each of them. ReadOnly sessions cannot send or publish. Plan sessions ask before either unless [YOLO mode](#yolo-mode) is on.
 
 Receiving has a separate policy under `[agent.messaging]`:
 
@@ -815,6 +815,6 @@ Use [`caudra decisions`](/docs/cli/#caudra-decisions) to inspect configuration a
 
 An explicit `/yolo` choice is stored with the root conversation. A user-created fork and `/new` start without that explicit state. `--yolo` selects YOLO at startup.
 
-YOLO approves each call once and stores no rule, so turning it off brings back the prompts your rules do not cover. In plan mode it also skips the prompts for commands plan mode cannot prove read-only, for `send_message`, and for `execution_environment`. Plan mode still refuses what it always refuses, such as file writes outside the plan.
+YOLO approves each call once and stores no rule, so turning it off brings back the prompts your rules do not cover. In plan mode it also skips the prompts for commands plan mode cannot prove read-only, for `send_message` and `publish_message`, and for `execution_environment`. Plan mode still refuses what it always refuses, such as file writes outside the plan.
 
 Decision-engine screening never interrupts YOLO, including in plan mode. Engine advice is not shown in YOLO. Deterministic denies and hard capability restrictions still apply.

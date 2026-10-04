@@ -910,6 +910,7 @@ pub enum Action {
     RequestNewSession,
     ListPeers,
     PeerMessages(String),
+    PeerTopics(String),
     RefreshPeers,
     ReviewPeerMessage(String),
     DecidePeerMessage {
@@ -1231,8 +1232,13 @@ impl DisplayMessage {
             .as_deref()
             .map(|handle| format!("Name: {:?}\n", handle_address(handle)))
             .unwrap_or_default();
+        let audience = if origin.audience.is_direct() {
+            String::new()
+        } else {
+            format!("Audience: {:?}\n", origin.audience.to_string())
+        };
         let text = format!(
-            "Peer: {:?}\n{name}Message: {:?}\nSender session: {:?}\nReply target: {:?}\n\n{safe_body}",
+            "Peer: {:?}\n{name}{audience}Message: {:?}\nSender session: {:?}\nReply target: {:?}\n\n{safe_body}",
             origin.sender_name, origin.message_id, origin.sender_session_id, origin.reply_target,
         );
         Self::new(DisplayRole::PeerMessage(Box::new(origin)), text)

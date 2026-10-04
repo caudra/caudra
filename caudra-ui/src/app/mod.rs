@@ -5150,6 +5150,7 @@ impl App {
             "/shells" => self.shells_browse(),
             "/peers" => vec![Action::ListPeers],
             "/messages" => vec![Action::PeerMessages(cmd.args)],
+            "/topics" => vec![Action::PeerTopics(cmd.args)],
             "/workflows" => self.workflows_browse(),
             "/workflow" => self.execute_workflow(&cmd.args),
             "/deep-research" => {

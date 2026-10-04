@@ -1032,7 +1032,7 @@ pub fn history_to_display(
                 text,
                 peer_event: Some(origin),
                 ..
-            } => display.push(DisplayMessage::peer(text, origin.clone())),
+            } => display.push(DisplayMessage::peer(text, (**origin).clone())),
             // An injected item is its own row rather than a candidate for the
             // turn's bubble, so it must not consume the group: a reminder and
             // the message it trails can share one.
@@ -1426,8 +1426,10 @@ fn build_tool_results_map(items: &[HistoryItem]) -> HashMap<&str, ToolResultRef<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use caudra_agent::peers::{PeerSummary, SendReceipt, handle_address};
-    use caudra_agent::tools::native::peers::{LIST_NAME, SEND_NAME};
+    use caudra_agent::peers::{
+        PeerSummary, PublishReceipt, RecipientReceipt, SendReceipt, handle_address,
+    };
+    use caudra_agent::tools::native::peers::{LIST_NAME, PUBLISH_NAME, SEND_NAME};
     use caudra_agent::tools::{BATCH_TOOL_NAME, SHELL_TOOL_NAME, TOOL_OUTPUT_TOOL_NAME};
     use caudra_agent::{
         AgentEvent, BatchProgressEvent, BatchToolEntry, BatchToolStatus, IndexLine,
@@ -1436,8 +1438,9 @@ mod tests {
     };
     use caudra_config::{InboundPolicy, UiConfig};
     use caudra_providers::{
-        Billing, ContentBlock, Message, PeerMessageOrigin, Role, StandingReminderKind,
-        TaskEventOrigin, estimate_tokens_cached, project_messages, token_label,
+        Billing, ContentBlock, Message, PeerAudience, PeerMessageOrigin, Role,
+        StandingReminderKind, TaskEventOrigin, estimate_tokens_cached, project_messages,
+        token_label,
     };
     use caudra_workspace::PlanRef;
     use ratatui::{Terminal, backend::TestBackend};
@@ -1536,6 +1539,7 @@ mod tests {
     const PEER_MESSAGE: &str = "kind-amber-fox";
     const PEER_REASON: &str = "Needs local review.";
     const PEER_HANDLE: &str = "release-agent";
+    const PEER_TOPIC: &str = "ci.failures";
     const PEER_MODEL_JSON: &str = "{\"session_id\":\"private-session-id\"}";
     const SESSION_CWD: &str = "/project";
     const TASK_OBSERVATION: &str = "neat-wanted-cowbird completed: All checks passed.";
@@ -2071,43 +2075,65 @@ mod tests {
         assert_eq!(display[0].annotation.as_deref(), Some(INDEX_ANNOTATION));
     }
 
-    #[test_case(false; "discovery")]
-    #[test_case(true; "receipt")]
-    fn restored_peers_keep_typed_cards_and_display_text_without_lua(sent: bool) {
-        let peer = if sent {
-            PeerOutput::Sent {
+    fn restored_discovery() -> PeerOutput {
+        PeerOutput::Sessions {
+            sessions: vec![PeerSummary {
                 target: PEER_TARGET.into(),
-                receipt: SendReceipt {
-                    status: "held".into(),
-                    message_id: PEER_MESSAGE.into(),
-                    reason: Some(PEER_REASON.into()),
+                title: MAIN_NAME.into(),
+                handle: None,
+                cwd: SESSION_CWD.into(),
+                busy: false,
+                blocked: false,
+                inbound: InboundPolicy::Hold,
+                topics: vec![PEER_TOPIC.into()],
+                broadcasts: true,
+            }],
+        }
+    }
+
+    fn restored_receipt() -> PeerOutput {
+        PeerOutput::Sent {
+            target: PEER_TARGET.into(),
+            receipt: SendReceipt {
+                status: "held".into(),
+                message_id: PEER_MESSAGE.into(),
+                reason: Some(PEER_REASON.into()),
+            },
+        }
+    }
+
+    fn restored_publication() -> PeerOutput {
+        PeerOutput::Published {
+            receipt: PublishReceipt {
+                message_id: PEER_MESSAGE.into(),
+                audience: PeerAudience::Topic {
+                    topic: PEER_TOPIC.into(),
                 },
-            }
-        } else {
-            PeerOutput::Sessions {
-                sessions: vec![PeerSummary {
+                recipients: vec![RecipientReceipt {
                     target: PEER_TARGET.into(),
                     title: MAIN_NAME.into(),
                     handle: None,
-                    cwd: SESSION_CWD.into(),
-                    busy: false,
-                    blocked: false,
-                    inbound: InboundPolicy::Hold,
+                    status: "held".into(),
+                    reason: Some(PEER_REASON.into()),
                 }],
-            }
-        };
+                skipped: 0,
+            },
+        }
+    }
+
+    #[test_case(LIST_NAME, serde_json::json!({}), restored_discovery(), &[SESSION_CWD, MAIN_NAME, PEER_TOPIC]; "discovery")]
+    #[test_case(SEND_NAME, serde_json::json!({"target": PEER_TARGET, "text": PEER_REASON}), restored_receipt(), &[PEER_MESSAGE, PEER_REASON]; "receipt")]
+    #[test_case(PUBLISH_NAME, serde_json::json!({"topic": PEER_TOPIC, "text": PEER_REASON}), restored_publication(), &[PEER_MESSAGE, PEER_REASON, PEER_TOPIC, MAIN_NAME]; "publication")]
+    fn restored_peers_keep_typed_cards_and_display_text_without_lua(
+        tool: &str,
+        input: serde_json::Value,
+        peer: PeerOutput,
+        expected: &[&str],
+    ) {
         let annotation = peer.annotation();
         let serialized = serde_json::to_string(&ToolOutput::Peers(peer)).unwrap();
         let restored: ToolOutput = serde_json::from_str(&serialized).unwrap();
         let outputs = HashMap::from([("t1".into(), Arc::new(restored))]);
-        let (tool, input) = if sent {
-            (
-                SEND_NAME,
-                serde_json::json!({"target": PEER_TARGET, "text": PEER_REASON}),
-            )
-        } else {
-            (LIST_NAME, serde_json::json!({}))
-        };
         let messages = tool_use_pair(tool, input, PEER_MODEL_JSON, false);
         let (display, restores) = display_messages(&messages, &outputs);
         assert!(restores.is_empty());
@@ -2127,12 +2153,8 @@ mod tests {
         assert!(copied.contains(PEER_TARGET));
         assert!(!copied.contains(PEER_MODEL_JSON));
         assert!(!copied.contains("session_id"));
-        if sent {
-            assert!(copied.contains(PEER_MESSAGE));
-            assert!(copied.contains(PEER_REASON));
-        } else {
-            assert!(copied.contains(SESSION_CWD));
-            assert!(copied.contains(MAIN_NAME));
+        for expected in expected {
+            assert!(copied.contains(expected), "{copied}");
         }
     }
 
@@ -2649,6 +2671,7 @@ mod tests {
         const REPLY_TARGET: &str = "opaque-reply-target";
         let origin = PeerMessageOrigin {
             message_id: MESSAGE_ID.into(),
+            audience: PeerAudience::Direct,
             sender_session_id: SENDER_ID.into(),
             sender_name: NAME.into(),
             sender_handle: None,
@@ -2724,6 +2747,7 @@ mod tests {
         const NAME_LINE: &str = "\nName: ";
         let origin = PeerMessageOrigin {
             message_id: PEER_MESSAGE.into(),
+            audience: PeerAudience::Direct,
             sender_session_id: PEER_TARGET.into(),
             sender_name: MAIN_NAME.into(),
             sender_handle: handle.map(str::to_owned),
@@ -2734,6 +2758,27 @@ mod tests {
         assert_eq!(shown.contains(NAME_LINE), handle.is_some());
         if let Some(handle) = handle {
             assert!(shown.contains(&handle_address(handle)), "{shown}");
+        }
+    }
+
+    #[test_case(PeerAudience::Direct, None; "direct")]
+    #[test_case(PeerAudience::Topic { topic: PEER_TOPIC.into() }, Some("\nAudience: \"topic ci.failures\"\n"); "topic")]
+    #[test_case(PeerAudience::Broadcast, Some("\nAudience: \"broadcast\"\n"); "broadcast")]
+    fn peer_messages_name_a_publication_audience(audience: PeerAudience, line: Option<&str>) {
+        const AUDIENCE_LINE: &str = "\nAudience: ";
+        let origin = PeerMessageOrigin {
+            message_id: PEER_MESSAGE.into(),
+            audience,
+            sender_session_id: PEER_TARGET.into(),
+            sender_name: MAIN_NAME.into(),
+            sender_handle: None,
+            reply_target: PEER_TARGET.into(),
+            reply_to: None,
+        };
+        let shown = DisplayMessage::peer(REPLY_TEXT, origin).text;
+        assert_eq!(shown.contains(AUDIENCE_LINE), line.is_some());
+        if let Some(line) = line {
+            assert!(shown.contains(line), "{shown}");
         }
     }
 

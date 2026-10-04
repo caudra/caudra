@@ -225,9 +225,9 @@ version = 1
 # Type: usize, at least 1.
 # web = 3
 
-# Rows for `batch`, `execution_environment`, `list_sessions`, `question`,
-# `send_message`, `skill`, `todo_write`, `tool_output`, `view_image`,
-# `workflow`.
+# Rows for `batch`, `execution_environment`, `list_sessions`,
+# `publish_message`, `question`, `send_message`, `skill`, `todo_write`,
+# `tool_output`, `view_image`, `workflow`.
 # Type: usize, at least 1.
 # other = 3
 
@@ -366,6 +366,16 @@ version = 1
 # Project settings may only lower it.
 # Type: usize, at least 1.
 # sender_per_minute = 16
+
+# Most topic and broadcast publications a session sends per minute. Project
+# settings may only lower it.
+# Type: usize, at least 1.
+# publish_per_minute = 16
+
+# Most live sessions one topic or broadcast publication reaches. Extra
+# recipients are skipped and counted. Project settings may only lower it.
+# Type: usize, at least 1.
+# max_fanout = 32
 
 [agent.steering]
 # Automatic steering repairs unusable model output and can add bounded guidance

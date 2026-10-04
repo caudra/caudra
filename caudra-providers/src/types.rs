@@ -317,9 +317,55 @@ pub struct WorkflowEventOrigin {
     pub revision: u64,
 }
 
+/// Who a peer message was addressed to.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PeerAudience {
+    #[default]
+    Direct,
+    Topic {
+        topic: String,
+    },
+    Broadcast,
+}
+
+impl PeerAudience {
+    pub fn is_direct(&self) -> bool {
+        matches!(self, Self::Direct)
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Topic { .. } => "topic",
+            Self::Broadcast => "broadcast",
+        }
+    }
+
+    pub fn topic(&self) -> Option<&str> {
+        match self {
+            Self::Topic { topic } => Some(topic),
+            Self::Direct | Self::Broadcast => None,
+        }
+    }
+}
+
+/// `topic ci.failures`, `broadcast`, or `direct`. The topic is peer-supplied,
+/// so a display escapes it.
+impl fmt::Display for PeerAudience {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.topic() {
+            Some(topic) => write!(formatter, "{} {topic}", self.label()),
+            None => formatter.write_str(self.label()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerMessageOrigin {
     pub message_id: String,
+    #[serde(default, skip_serializing_if = "PeerAudience::is_direct")]
+    pub audience: PeerAudience,
     pub sender_session_id: String,
     pub sender_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -449,6 +495,8 @@ impl Message {
         let framed = format!(
             "{PEER_MESSAGE_HEADER}\n\
              message_id: {}\n\
+             audience: {}\n\
+             topic: {}\n\
              sender_session_id: {}\n\
              sender_name: {}\n\
              sender_handle: {}\n\
@@ -457,6 +505,8 @@ impl Message {
              body: {}\n\
              {PEER_MESSAGE_FOOTER}",
             peer_literal(json!(origin.message_id)),
+            peer_literal(json!(origin.audience.label())),
+            peer_literal(json!(origin.audience.topic())),
             peer_literal(json!(origin.sender_session_id)),
             peer_literal(json!(origin.sender_name)),
             peer_literal(json!(origin.sender_handle)),
@@ -1303,6 +1353,9 @@ mod tests {
         if hostile_labels {
             origin = PeerMessageOrigin {
                 message_id: PEER_ATTACK.into(),
+                audience: PeerAudience::Topic {
+                    topic: PEER_ATTACK.into(),
+                },
                 sender_session_id: PEER_ATTACK.into(),
                 sender_name: PEER_ATTACK.into(),
                 sender_handle: Some(PEER_ATTACK.into()),
@@ -1320,21 +1373,24 @@ mod tests {
         assert_peer_framing(message.first_text_content().unwrap(), text, &origin);
     }
 
-    #[test_case(true ; "named_reply")]
-    #[test_case(false ; "unnamed_new_message")]
-    fn peer_observation_serde_preserves_provenance(named_reply: bool) {
+    #[test_case(true ; "named_topic_reply")]
+    #[test_case(false ; "unnamed_direct_message")]
+    fn peer_observation_serde_preserves_provenance(named_topic_reply: bool) {
         let mut origin = peer_message_origin();
-        if !named_reply {
+        if !named_topic_reply {
             origin.reply_to = None;
             origin.sender_handle = None;
+            origin.audience = PeerAudience::Direct;
         }
         let message = Message::peer_observation(PEER_TEXT.into(), origin.clone());
         let encoded = serde_json::to_value(&message).unwrap();
         assert_eq!(encoded["peer_event"], json!(origin));
-        assert_eq!(
-            encoded["peer_event"].get("sender_handle").is_some(),
-            named_reply
-        );
+        for field in ["sender_handle", "audience"] {
+            assert_eq!(
+                encoded["peer_event"].get(field).is_some(),
+                named_topic_reply
+            );
+        }
         let decoded: Message = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded.peer_event, Some(origin.clone()));
         assert_peer_framing(decoded.first_text_content().unwrap(), PEER_TEXT, &origin);

@@ -12,8 +12,8 @@ mod peer_tests {
     };
     use caudra_providers::provider::{BoxFuture, Provider};
     use caudra_providers::{
-        CacheKey, HistoryItem, HistoryItemKind, Message, Model, ModelInfo, PeerMessageOrigin,
-        ProviderEvent, RequestOptions, StopReason, StreamResponse,
+        CacheKey, HistoryItem, HistoryItemKind, Message, Model, ModelInfo, PeerAudience,
+        PeerMessageOrigin, ProviderEvent, RequestOptions, StopReason, StreamResponse,
     };
     use caudra_storage::id::CaudraId;
     use caudra_storage::sessions::{PermissionMode, TitleSource};
@@ -162,6 +162,7 @@ mod peer_tests {
         fn origin(&self, message_id: String, reply_to: Option<String>) -> PeerMessageOrigin {
             PeerMessageOrigin {
                 message_id,
+                audience: PeerAudience::Direct,
                 sender_session_id: self.reply_target.clone(),
                 sender_name: PEER_SENDER.into(),
                 sender_handle: None,
@@ -822,7 +823,7 @@ mod peer_tests {
             let saved_origins: Vec<_> = saved
                 .iter()
                 .filter_map(|item| match &item.kind {
-                    HistoryItemKind::User { peer_event, .. } => peer_event.as_ref(),
+                    HistoryItemKind::User { peer_event, .. } => peer_event.as_deref(),
                     _ => None,
                 })
                 .collect();
@@ -884,7 +885,7 @@ mod peer_tests {
                     .collect::<Vec<_>>(),
                 if preserve { vec![&origin] } else { Vec::new() }
             );
-            assert!(agent.history.transcript_items().iter().any(|item| matches!(&item.kind, HistoryItemKind::User { peer_event: Some(saved), .. } if saved == &origin)));
+            assert!(agent.history.transcript_items().iter().any(|item| matches!(&item.kind, HistoryItemKind::User { peer_event: Some(saved), .. } if **saved == origin)));
             let restated: Vec<_> = events
                 .try_iter()
                 .filter_map(|envelope| match envelope.event {

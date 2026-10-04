@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use caudra_config::{Feature, FeatureFlags, InboundPolicy, MessagingConfig};
-use caudra_providers::{HistoryItem, HistoryItemKind, Message, PeerMessageOrigin, UserOrigin};
+use caudra_providers::{
+    HistoryItem, HistoryItemKind, Message, PeerAudience, PeerMessageOrigin, UserOrigin,
+};
 use caudra_storage::id::CaudraId;
 use caudra_storage::random_task_id;
 use caudra_storage::sessions::{PermissionMode, StoredInboundPolicy, StoredPeerControls};
@@ -19,7 +21,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::AgentMode;
+use topics::{parse_topic, pattern_matches, validate_patterns};
 
+pub mod topics;
 #[cfg(unix)]
 mod unix;
 
@@ -44,6 +48,7 @@ const MAX_NAME_ATTEMPTS: usize = 32;
 const MESSAGE_WORDS: usize = 3;
 const PEER_WORDS: usize = MESSAGE_WORDS * 2;
 const CLAIM_BATCH: usize = 4;
+const FANOUT_CONCURRENCY: usize = 8;
 const RATE_WINDOW: Duration = Duration::from_secs(60);
 const RETRY_WINDOW: Duration = Duration::from_secs(300);
 const CLOCK_SKEW: Duration = Duration::from_secs(30);
@@ -54,6 +59,16 @@ const HELD_COHORT: &str = "Automatic delivery requires Ask permissions, matching
 const HELD_BLOCKED: &str = "Receiver is blocked; local input must resume it";
 const RATE_EXCEEDED: &str = "Recipient peer message rate limit reached";
 const DUPLICATE: &str = "The same text from this sender arrived within the last minute";
+const NOT_SUBSCRIBED: &str = "The recipient is not subscribed to this topic or to broadcasts";
+const PUBLISH_RATE_EXCEEDED: &str = "Publication rate limit reached; publish again in a minute";
+const DIRECT_PUBLICATION: &str =
+    "Publish to a topic or to broadcasts; send direct messages with send_message";
+const INVALID_TEXT: &str = "Peer text must contain between 1 byte and 32 KiB of UTF-8";
+const INVALID_CORRELATION: &str = "Peer request/correlation identity exceeds its limit";
+const SEND_BLOCKED: &str = "Blocked or ReadOnly sessions cannot send peer messages";
+const REUSED_REQUEST: &str = "Peer request identity was reused with different content";
+const RETRY_INVALIDATED: &str = "Peer retry invalidated by a session policy or workspace change";
+const RETRY_EXPIRED: &str = "Peer retry identity expired; do not retry as a new message";
 const FULL: &str = "Live inbox capacity reached; no older message was removed";
 const RETRY_FULL: &str = "Live retry identity capacity reached; try again once older messages pass the five-minute retry window";
 const POLICY_FLOOR: &str = "Cannot weaken the project's configured inbound policy";
@@ -102,6 +117,12 @@ pub struct PeerInfo {
     pub busy: bool,
     pub blocked: bool,
     pub inbound: InboundPolicy,
+    /// Builds without audiences never advertise these, so publishers never
+    /// select a peer that would read a publication as a direct message.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub topics: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub broadcasts: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,6 +136,10 @@ pub struct PeerSummary {
     pub busy: bool,
     pub blocked: bool,
     pub inbound: InboundPolicy,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub topics: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub broadcasts: bool,
 }
 
 impl PeerSummary {
@@ -145,6 +170,27 @@ impl SendReceipt {
             reason: reason.map(str::to_owned),
         }
     }
+}
+
+/// One publication's outcome across the recipients frozen when it was issued.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PublishReceipt {
+    pub message_id: String,
+    pub audience: PeerAudience,
+    pub recipients: Vec<RecipientReceipt>,
+    /// Matching sessions past `max_fanout`, which were not sent the message.
+    pub skipped: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecipientReceipt {
+    pub target: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -240,10 +286,16 @@ struct SessionState {
     next_claim: u64,
     inbound_rate: usize,
     sender_rate: usize,
+    publish_rate: usize,
+    max_fanout: usize,
+    topics: Vec<String>,
+    broadcasts: bool,
     bytes: usize,
     inbox: VecDeque<InboxItem>,
     dedup: HashMap<String, DedupEntry>,
     outgoing: HashMap<String, Outgoing>,
+    publications: HashMap<String, Publication>,
+    published: VecDeque<Instant>,
     peer_names: NameTable<String>,
     message_names: NameTable<MessageIdentity>,
     arrivals: VecDeque<Arrival>,
@@ -306,14 +358,15 @@ impl InboxItem {
 struct MessageIdentity {
     sender: String,
     message_id: String,
-    /// Set on this session's own messages, so replies correlate after the
-    /// retry record is gone.
-    recipient: Option<String>,
+    /// Who this session's own message went to, so replies correlate after
+    /// the retry record is gone. A publication keeps its frozen recipients,
+    /// at most `max_fanout` of them.
+    recipients: Vec<String>,
 }
 
 impl MessageIdentity {
     fn involves(&self, peer: &str) -> bool {
-        self.sender == peer || self.recipient.as_deref() == Some(peer)
+        self.sender == peer || self.recipients.iter().any(|recipient| recipient == peer)
     }
 }
 
@@ -360,13 +413,76 @@ struct DedupEntry {
     receipt: SendReceipt,
 }
 
-struct Outgoing {
+/// A message this session issued. A retry must repeat its content within
+/// the retry window, under the session state it was issued in.
+#[derive(Clone)]
+struct Issued {
     fingerprint: [u8; 32],
     message_id: String,
     issued_ms: u64,
     epoch: u64,
     sender: Sender,
+}
+
+impl Issued {
+    fn check_retry(&self, fingerprint: &[u8; 32], epoch: u64) -> Result<(), String> {
+        if &self.fingerprint != fingerprint {
+            Err(REUSED_REQUEST.into())
+        } else if self.epoch != epoch {
+            Err(RETRY_INVALIDATED.into())
+        } else if retry_expired(self.issued_ms, wall_ms()) {
+            Err(RETRY_EXPIRED.into())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+struct Outgoing {
+    issued: Issued,
     receipt: Option<SendReceipt>,
+}
+
+/// A retry resends only to recipients whose outcome is still unknown, and
+/// never rediscovers, so the recipient set stays the one first frozen.
+struct Publication {
+    issued: Issued,
+    /// Recipient routes, in the order of `receipt.recipients`.
+    routes: Vec<String>,
+    receipt: PublishReceipt,
+}
+
+impl Publication {
+    fn delivery(&self, index: usize, text: &str) -> Delivery {
+        Delivery {
+            message_id: self.issued.message_id.clone(),
+            issued_ms: self.issued.issued_ms,
+            target: self.routes[index].clone(),
+            sender: self.issued.sender.clone(),
+            text: text.to_owned(),
+            reply_to: None,
+            reply_sender: None,
+            audience: self.receipt.audience.clone(),
+        }
+    }
+
+    fn unresolved(&self, text: &str) -> Vec<(usize, Delivery)> {
+        self.receipt
+            .recipients
+            .iter()
+            .enumerate()
+            .filter(|(_, recipient)| recipient.status == "unknown")
+            .map(|(index, _)| (index, self.delivery(index, text)))
+            .collect()
+    }
+}
+
+/// A publication ready to send: deliveries carry their recipient's index
+/// in `receipt`.
+struct Fanout {
+    epoch: u64,
+    receipt: PublishReceipt,
+    deliveries: Vec<(usize, Delivery)>,
 }
 
 pub struct PeerClaim {
@@ -446,6 +562,11 @@ struct Delivery {
     reply_to: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reply_sender: Option<String>,
+    /// Omitted from direct messages, which every protocol 1 peer reads.
+    /// Older peers refuse the unknown field rather than read a publication
+    /// as a direct message.
+    #[serde(default, skip_serializing_if = "PeerAudience::is_direct")]
+    audience: PeerAudience,
 }
 
 impl Delivery {
@@ -664,6 +785,29 @@ fn wall_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn check_text(text: &str) -> Result<(), String> {
+    if text.is_empty() || text.len() > MAX_BODY_BYTES {
+        Err(INVALID_TEXT.into())
+    } else {
+        Ok(())
+    }
+}
+
+fn digest(content: &impl Serialize) -> Result<[u8; 32], String> {
+    Ok(Sha256::digest(serde_json::to_vec(content).map_err(|error| error.to_string())?).into())
+}
+
+/// Whether a session with these subscriptions consents to be addressed.
+fn subscribed(audience: &PeerAudience, topics: &[String], broadcasts: bool) -> bool {
+    match audience {
+        PeerAudience::Direct => true,
+        PeerAudience::Topic { topic } => {
+            topics.iter().any(|pattern| pattern_matches(pattern, topic))
+        }
+        PeerAudience::Broadcast => broadcasts,
+    }
+}
+
 fn validate_descriptor(descriptor: &PeerDescriptor) -> Result<(), String> {
     if descriptor.name.len() > MAX_LABEL_BYTES || descriptor.cwd.as_os_str().len() > MAX_PATH_BYTES
     {
@@ -750,6 +894,7 @@ impl PeerHost {
             .clone()
             .unwrap_or(InboundPolicy::Accept);
         let controls = controls.unwrap_or_default();
+        validate_patterns(&controls.topics)?;
         let inbound_override = controls
             .inbound
             .as_ref()
@@ -797,10 +942,16 @@ impl PeerHost {
                 next_claim: 0,
                 inbound_rate: messaging.inbound_per_minute,
                 sender_rate: messaging.sender_per_minute,
+                publish_rate: messaging.publish_per_minute,
+                max_fanout: messaging.max_fanout,
+                topics: controls.topics,
+                broadcasts: controls.broadcasts,
                 bytes: 0,
                 inbox: VecDeque::new(),
                 dedup: HashMap::new(),
                 outgoing: HashMap::new(),
+                publications: HashMap::new(),
+                published: VecDeque::new(),
                 peer_names: NameTable::new(MAX_PEER_NAMES),
                 message_names: NameTable::new(MAX_MESSAGE_NAMES),
                 arrivals: VecDeque::new(),
@@ -858,7 +1009,22 @@ impl PeerSession {
         StoredPeerControls {
             inbound: state.inbound_override.as_ref().map(stored_policy),
             handle: state.handle.clone(),
+            topics: state.topics.clone(),
+            broadcasts: state.broadcasts,
         }
+    }
+
+    /// Publishers select recipients from discovery, so one that has not
+    /// rediscovered may still address this session; it then refuses what it
+    /// no longer subscribes to.
+    pub fn set_subscriptions(&self, topics: Vec<String>, broadcasts: bool) -> Result<(), String> {
+        validate_patterns(&topics)?;
+        let mut state = lock(&self.0.state);
+        state.ensure_open()?;
+        state.topics = topics;
+        state.broadcasts = broadcasts;
+        self.0.host.changed.notify(usize::MAX);
+        Ok(())
     }
 
     /// Claims the session's stored messaging name for this registration. A
@@ -981,6 +1147,8 @@ impl PeerSession {
                     busy: peer.busy,
                     blocked: peer.blocked,
                     inbound: peer.inbound,
+                    topics: peer.topics,
+                    broadcasts: peer.broadcasts,
                 })
             })
             .collect()
@@ -1064,62 +1232,29 @@ impl PeerSession {
         request_id: &str,
     ) -> Result<SendReceipt, String> {
         Route::parse(target)?;
-        if text.is_empty() || text.len() > MAX_BODY_BYTES {
-            return Err("Peer text must contain between 1 byte and 32 KiB of UTF-8".into());
-        }
+        check_text(text)?;
         if request_id.is_empty()
             || request_id.len() > MAX_CORRELATION_BYTES
             || reply_to.is_some_and(|value| value.len() > MAX_CORRELATION_BYTES)
         {
-            return Err("Peer request/correlation identity exceeds its limit".into());
+            return Err(INVALID_CORRELATION.into());
         }
-        let fingerprint: [u8; 32] = Sha256::digest(
-            serde_json::to_vec(&(target, text, reply_to, reply_sender))
-                .map_err(|error| error.to_string())?,
-        )
-        .into();
+        let fingerprint = digest(&(target, text, reply_to, reply_sender))?;
         let (delivery, epoch) = {
             let mut state = lock(&self.0.state);
-            state.ensure_open()?;
-            if state.wakes_suppressed
-                || state.descriptor.blocked
-                || state.descriptor.mode.is_read_only()
-            {
-                return Err("Blocked or ReadOnly sessions cannot send peer messages".into());
-            }
-            if let Some(previous) = state.outgoing.get(request_id) {
-                if previous.fingerprint != fingerprint {
-                    return Err("Peer request identity was reused with different content".into());
-                }
-                if previous.epoch != state.epoch {
-                    return Err(
-                        "Peer retry invalidated by a session policy or workspace change".into(),
-                    );
-                }
-                if retry_expired(previous.issued_ms, wall_ms()) {
-                    return Err("Peer retry identity expired; do not retry as a new message".into());
-                }
+            state.ensure_can_send()?;
+            let issued = if let Some(previous) = state.outgoing.get(request_id) {
+                previous.issued.check_retry(&fingerprint, state.epoch)?;
                 if let Some(receipt) = &previous.receipt
                     && receipt.status != "unknown"
                 {
                     return Ok(receipt.clone());
                 }
-                (
-                    Delivery {
-                        message_id: previous.message_id.clone(),
-                        issued_ms: previous.issued_ms,
-                        target: target.to_owned(),
-                        sender: previous.sender.clone(),
-                        text: text.to_owned(),
-                        reply_to: reply_to.map(str::to_owned),
-                        reply_sender: reply_sender.map(str::to_owned),
-                    },
-                    state.epoch,
-                )
+                previous.issued.clone()
             } else {
                 let issued_ms = wall_ms();
                 if !has_retry_room(&mut state.outgoing, issued_ms, |outgoing| {
-                    outgoing.issued_ms
+                    outgoing.issued.issued_ms
                 }) {
                     return Err(RETRY_FULL.into());
                 }
@@ -1129,48 +1264,199 @@ impl PeerSession {
                     MessageIdentity {
                         sender: self.0.route.target(),
                         message_id: message_id.clone(),
-                        recipient: Some(target.to_owned()),
+                        recipients: vec![target.to_owned()],
                     },
                 );
-                let delivery = Delivery {
+                let issued = Issued {
+                    fingerprint,
                     message_id,
                     issued_ms,
-                    target: target.to_owned(),
-                    sender: Sender {
-                        route: self.0.route.clone(),
-                        name: state.descriptor.name.clone(),
-                        handle: state.claimed_handle(),
-                        canonical_cwd: state.canonical_cwd.clone(),
-                        mode: WireMode::from(&state.descriptor.mode),
-                        permission_mode: state.descriptor.permission_mode.clone(),
-                    },
-                    text: text.to_owned(),
-                    reply_to: reply_to.map(str::to_owned),
-                    reply_sender: reply_sender.map(str::to_owned),
+                    epoch: state.epoch,
+                    sender: state.sender(&self.0.route),
                 };
-                let epoch = state.epoch;
                 state.outgoing.insert(
                     request_id.to_owned(),
                     Outgoing {
-                        fingerprint,
-                        message_id: delivery.message_id.clone(),
-                        issued_ms: delivery.issued_ms,
-                        epoch,
-                        sender: delivery.sender.clone(),
+                        issued: issued.clone(),
                         receipt: None,
                     },
                 );
-                (delivery, epoch)
-            }
+                issued
+            };
+            (
+                Delivery {
+                    message_id: issued.message_id,
+                    issued_ms: issued.issued_ms,
+                    target: target.to_owned(),
+                    sender: issued.sender,
+                    text: text.to_owned(),
+                    reply_to: reply_to.map(str::to_owned),
+                    reply_sender: reply_sender.map(str::to_owned),
+                    audience: PeerAudience::Direct,
+                },
+                issued.epoch,
+            )
         };
-        #[cfg(unix)]
-        let receipt = unix::send(self, delivery, epoch).await;
-        #[cfg(not(unix))]
-        let receipt = SendReceipt::new("unavailable", &delivery.message_id, Some(UNAVAILABLE));
+        let receipt = self.deliver(delivery, epoch).await;
         if let Some(outgoing) = lock(&self.0.state).outgoing.get_mut(request_id) {
             outgoing.receipt = Some(receipt.clone());
         }
         Ok(receipt)
+    }
+
+    /// Sends one message to every live session subscribed to `audience` at
+    /// discovery, up to `max_fanout`. A retry with the same `request_id`
+    /// reuses the recipients first selected and resends only unknown outcomes.
+    pub async fn publish(
+        &self,
+        audience: PeerAudience,
+        text: &str,
+        request_id: &str,
+    ) -> Result<PublishReceipt, String> {
+        match &audience {
+            PeerAudience::Direct => return Err(DIRECT_PUBLICATION.into()),
+            PeerAudience::Topic { topic } => {
+                parse_topic(topic)?;
+            }
+            PeerAudience::Broadcast => {}
+        }
+        check_text(text)?;
+        if request_id.is_empty() || request_id.len() > MAX_CORRELATION_BYTES {
+            return Err(INVALID_CORRELATION.into());
+        }
+        let fingerprint = digest(&(&audience, text))?;
+        let retry = {
+            let mut state = lock(&self.0.state);
+            state.ensure_can_send()?;
+            let retry = state.publications.contains_key(request_id);
+            if !retry && !state.has_publish_room(Instant::now()) {
+                return Err(PUBLISH_RATE_EXCEEDED.into());
+            }
+            retry
+        };
+        let peers = if retry {
+            None
+        } else {
+            Some(self.list().await?)
+        };
+        let Fanout {
+            epoch,
+            mut receipt,
+            deliveries,
+        } = self.prepare_publication(audience, text, request_id, fingerprint, peers)?;
+        for batch in deliveries.chunks(FANOUT_CONCURRENCY) {
+            let sends: Vec<_> = batch
+                .iter()
+                .cloned()
+                .map(|(index, delivery)| {
+                    let session = self.clone();
+                    smol::spawn(async move { (index, session.deliver(delivery, epoch).await) })
+                })
+                .collect();
+            for send in sends {
+                let (index, sent) = send.await;
+                let recipient = &mut receipt.recipients[index];
+                recipient.status = sent.status;
+                recipient.reason = sent.reason;
+            }
+        }
+        if let Some(publication) = lock(&self.0.state).publications.get_mut(request_id) {
+            publication.receipt = receipt.clone();
+        }
+        Ok(receipt)
+    }
+
+    /// Recovers the publication `request_id` names, or records a new one
+    /// from `peers`, which only a first attempt discovers.
+    fn prepare_publication(
+        &self,
+        audience: PeerAudience,
+        text: &str,
+        request_id: &str,
+        fingerprint: [u8; 32],
+        peers: Option<Vec<PeerInfo>>,
+    ) -> Result<Fanout, String> {
+        let mut state = lock(&self.0.state);
+        state.ensure_can_send()?;
+        let epoch = state.epoch;
+        if let Some(previous) = state.publications.get(request_id) {
+            previous.issued.check_retry(&fingerprint, epoch)?;
+            return Ok(Fanout {
+                epoch,
+                receipt: previous.receipt.clone(),
+                deliveries: previous.unresolved(text),
+            });
+        }
+        let peers = peers.ok_or(RETRY_EXPIRED)?;
+        let now = Instant::now();
+        if !state.has_publish_room(now) {
+            return Err(PUBLISH_RATE_EXCEEDED.into());
+        }
+        let issued_ms = wall_ms();
+        if !has_retry_room(&mut state.publications, issued_ms, |publication| {
+            publication.issued.issued_ms
+        }) {
+            return Err(RETRY_FULL.into());
+        }
+        let mut matching = peers
+            .into_iter()
+            .filter(|peer| subscribed(&audience, &peer.topics, peer.broadcasts));
+        let selected: Vec<_> = matching.by_ref().take(state.max_fanout).collect();
+        let skipped = matching.count();
+        let message_id = state.message_names.fresh(None, message_name)?;
+        let mut routes = Vec::with_capacity(selected.len());
+        let mut recipients = Vec::with_capacity(selected.len());
+        for peer in selected {
+            recipients.push(RecipientReceipt {
+                target: state.peer_name(&peer.target)?,
+                title: peer.name,
+                handle: peer.handle,
+                status: "unknown".into(),
+                reason: None,
+            });
+            routes.push(peer.target);
+        }
+        state.bind_message(
+            message_id.clone(),
+            MessageIdentity {
+                sender: self.0.route.target(),
+                message_id: message_id.clone(),
+                recipients: routes.clone(),
+            },
+        );
+        let publication = Publication {
+            issued: Issued {
+                fingerprint,
+                message_id: message_id.clone(),
+                issued_ms,
+                epoch,
+                sender: state.sender(&self.0.route),
+            },
+            routes,
+            receipt: PublishReceipt {
+                message_id,
+                audience,
+                recipients,
+                skipped,
+            },
+        };
+        let fanout = Fanout {
+            epoch,
+            receipt: publication.receipt.clone(),
+            deliveries: publication.unresolved(text),
+        };
+        state.published.push_back(now);
+        state
+            .publications
+            .insert(request_id.to_owned(), publication);
+        Ok(fanout)
+    }
+
+    async fn deliver(&self, delivery: Delivery, epoch: u64) -> SendReceipt {
+        #[cfg(unix)]
+        return unix::send(self, delivery, epoch).await;
+        #[cfg(not(unix))]
+        SendReceipt::new("unavailable", &delivery.message_id, Some(UNAVAILABLE))
     }
 
     pub fn held_count(&self) -> usize {
@@ -1382,7 +1668,7 @@ impl PeerSession {
             let saved = history.iter().any(|saved| matches!(
                 &saved.kind,
                 HistoryItemKind::User { text, origin: UserOrigin::Observation, peer_event: Some(origin), .. }
-                    if Some(origin) == observation.peer_event.as_ref()
+                    if Some(&**origin) == observation.peer_event.as_ref()
                         && Some(text.as_str()) == observation.first_text_content()
             ));
             if saved { released += item.bytes; }
@@ -1448,6 +1734,36 @@ impl SessionState {
             Ok(())
         } else {
             Err(CLOSED.into())
+        }
+    }
+
+    fn has_publish_room(&mut self, now: Instant) -> bool {
+        while self
+            .published
+            .front()
+            .is_some_and(|at| now.saturating_duration_since(*at) >= RATE_WINDOW)
+        {
+            self.published.pop_front();
+        }
+        self.published.len() < self.publish_rate
+    }
+
+    fn ensure_can_send(&self) -> Result<(), String> {
+        self.ensure_open()?;
+        if self.wakes_suppressed || self.descriptor.blocked || self.descriptor.mode.is_read_only() {
+            return Err(SEND_BLOCKED.into());
+        }
+        Ok(())
+    }
+
+    fn sender(&self, route: &Route) -> Sender {
+        Sender {
+            route: route.clone(),
+            name: self.descriptor.name.clone(),
+            handle: self.claimed_handle(),
+            canonical_cwd: self.canonical_cwd.clone(),
+            mode: WireMode::from(&self.descriptor.mode),
+            permission_mode: self.descriptor.permission_mode.clone(),
         }
     }
 
@@ -1541,6 +1857,7 @@ impl SessionInner {
         self.host.bytes.fetch_sub(released, Ordering::AcqRel);
         state.bytes -= released;
         state.outgoing.clear();
+        state.publications.clear();
         state.dedup.clear();
         state.reviews.clear();
         state.claim = None;
@@ -1588,6 +1905,11 @@ impl SessionInner {
                 .reply_sender
                 .as_deref()
                 .is_some_and(|sender| delivery.reply_to.is_none() || Route::parse(sender).is_err())
+            || delivery
+                .audience
+                .topic()
+                .is_some_and(|topic| parse_topic(topic).is_err())
+            || (!delivery.audience.is_direct() && delivery.reply_to.is_some())
         {
             return Err("Invalid peer message metadata or text bounds".into());
         }
@@ -1640,7 +1962,9 @@ impl SessionInner {
         {
             state.arrivals.pop_front();
         }
-        let receipt = if state.descriptor.inbound == InboundPolicy::Refuse
+        let receipt = if !subscribed(&delivery.audience, &state.topics, state.broadcasts) {
+            SendReceipt::new("refused", &delivery.message_id, Some(NOT_SUBSCRIBED))
+        } else if state.descriptor.inbound == InboundPolicy::Refuse
             || delivery.sender.mode == WireMode::ReadOnly
         {
             SendReceipt::new("refused", &delivery.message_id, Some(REFUSED_POLICY))
@@ -1665,7 +1989,7 @@ impl SessionInner {
             let identity = MessageIdentity {
                 sender: sender.clone(),
                 message_id: delivery.message_id.clone(),
-                recipient: None,
+                recipients: Vec::new(),
             };
             let preferred = valid_name(&delivery.message_id, MESSAGE_WORDS)
                 .then_some(delivery.message_id.as_str());
@@ -1675,6 +1999,7 @@ impl SessionInner {
                 .name(&identity, preferred, message_name)?;
             let origin = PeerMessageOrigin {
                 message_id: name.as_str().to_owned(),
+                audience: delivery.audience.clone(),
                 sender_session_id: alias.as_str().to_owned(),
                 sender_name: delivery.sender.name.clone(),
                 sender_handle: delivery.sender.handle.clone(),
@@ -1872,6 +2197,8 @@ impl HostInner {
                             busy: state.descriptor.busy,
                             blocked: state.wakes_suppressed || state.descriptor.blocked,
                             inbound: state.descriptor.inbound.clone(),
+                            topics: state.topics.clone(),
+                            broadcasts: state.broadcasts,
                         })
                     })
                     .collect();
@@ -1933,7 +2260,7 @@ mod tests {
         DEFAULT_INBOUND_PER_MINUTE, DEFAULT_SENDER_PER_MINUTE, FeatureFlags, InboundPolicy,
         MessagingConfig,
     };
-    use caudra_providers::{Message, PeerMessageOrigin, expand_message};
+    use caudra_providers::{Message, PeerAudience, PeerMessageOrigin, expand_message};
     use caudra_storage::id::CaudraId;
     use caudra_storage::sessions::{PermissionMode, StoredInboundPolicy, StoredPeerControls};
     use futures_lite::future::poll_once;
@@ -1941,15 +2268,18 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        AMBIGUOUS_HANDLE, AMBIGUOUS_REPLY, CLAIM_BATCH, CLOSED, DUPLICATE, DedupEntry, Delivery,
-        FULL, HANDLE_PREFIX, HELD_BLOCKED, HELD_COHORT, HELD_POLICY, HandleClaim, INVALID_HANDLE,
-        MAX_BODY_BYTES, MAX_DEDUP, MAX_HELD, MAX_MESSAGE_NAMES, MAX_NAME_ATTEMPTS, MAX_PEER_NAMES,
-        MAX_PROCESS_BYTES, MAX_SESSION_BYTES, MESSAGE_WORDS, MessageIdentity, NAME_COLLISION,
-        NOT_HELD, NameTable, Outgoing, PEER_WORDS, POLICY_FLOOR, PeerDecision, PeerDecisionResult,
-        PeerDescriptor, PeerHost, PeerInfo, PeerSession, PeerSummary, RATE_EXCEEDED, RATE_WINDOW,
-        REFUSED_POLICY, REJECTED, RETRY_FULL, RETRY_WINDOW, Route, STALE_REVIEW, STALE_TARGET,
-        SendReceipt, Sender, UNKNOWN_HANDLE, UNKNOWN_REPLY, UNKNOWN_TARGET, WireMode,
-        handle_in_use, lock, message_name, token, valid_name, wall_ms,
+        AMBIGUOUS_HANDLE, AMBIGUOUS_REPLY, CLAIM_BATCH, CLOSED, DIRECT_PUBLICATION, DUPLICATE,
+        DedupEntry, Delivery, FULL, HANDLE_PREFIX, HELD_BLOCKED, HELD_COHORT, HELD_POLICY,
+        HandleClaim, INVALID_HANDLE, Issued, MAX_BODY_BYTES, MAX_DEDUP, MAX_HELD,
+        MAX_MESSAGE_NAMES, MAX_NAME_ATTEMPTS, MAX_PEER_NAMES, MAX_PROCESS_BYTES, MAX_SESSION_BYTES,
+        MESSAGE_WORDS, MessageIdentity, NAME_COLLISION, NOT_HELD, NOT_SUBSCRIBED, NameTable,
+        Outgoing, PEER_WORDS, POLICY_FLOOR, PUBLISH_RATE_EXCEEDED, PeerDecision,
+        PeerDecisionResult, PeerDescriptor, PeerHost, PeerInfo, PeerSession, PeerSummary,
+        RATE_EXCEEDED, RATE_WINDOW, REFUSED_POLICY, REJECTED, RETRY_FULL, RETRY_WINDOW,
+        REUSED_REQUEST, Route, STALE_REVIEW, STALE_TARGET, SendReceipt, Sender, UNKNOWN_HANDLE,
+        UNKNOWN_REPLY, UNKNOWN_TARGET, WireMode, handle_in_use, lock, message_name, token,
+        topics::{INVALID_PATTERN, INVALID_TOPIC},
+        valid_name, wall_ms,
     };
     use crate::AgentMode;
 
@@ -1978,6 +2308,11 @@ mod tests {
     const MISSING_HANDLE: &str = "nobody-here";
     const MALFORMED_HANDLE: &str = "CI_Watcher";
     const LOW_RATE: usize = 2;
+    const LOW_FANOUT: usize = 1;
+    const TOPIC: &str = "ci.failures";
+    const TOPIC_PATTERN: &str = "ci.*";
+    const OTHER_PATTERN: &str = "deploy.**";
+    const MALFORMED_PATTERN: &str = "CI";
     /// Delivers more than the removed sixteen-message budget while staying
     /// under the default recipient rate.
     const UNBUDGETED_ROUNDS: usize = 8;
@@ -2035,6 +2370,7 @@ mod tests {
             text: TEXT.into(),
             reply_to: None,
             reply_sender: None,
+            audience: PeerAudience::Direct,
             sender: Sender {
                 route: Route {
                     host: token().unwrap(),
@@ -2062,18 +2398,20 @@ mod tests {
             MessageIdentity {
                 sender: session.0.route.target(),
                 message_id: message_id.into(),
-                recipient: Some(target.into()),
+                recipients: vec![target.into()],
             },
         );
         let epoch = state.epoch;
         state.outgoing.insert(
             ORIGINAL_REQUEST_ID.into(),
             Outgoing {
-                fingerprint: [0; 32],
-                message_id: message_id.into(),
-                issued_ms: delivery.issued_ms,
-                epoch,
-                sender: delivery.sender.clone(),
+                issued: Issued {
+                    fingerprint: [0; 32],
+                    message_id: message_id.into(),
+                    issued_ms: delivery.issued_ms,
+                    epoch,
+                    sender: delivery.sender.clone(),
+                },
                 receipt: None,
             },
         );
@@ -2295,7 +2633,7 @@ mod tests {
                 let identity = MessageIdentity {
                     sender: recipient,
                     message_id: OTHER_MESSAGE_NAME.into(),
-                    recipient: None,
+                    recipients: Vec::new(),
                 };
                 state.bind_message(OTHER_MESSAGE_NAME.into(), identity);
             }
@@ -3056,7 +3394,7 @@ mod tests {
                 let mut state = lock(&sender.0.state);
                 let outgoing = state.outgoing.get_mut(REQUEST_ID).unwrap();
                 outgoing.receipt = Some(SendReceipt::new(UNKNOWN, &receipt.message_id, None));
-                (outgoing.issued_ms, state.message_names.live.len())
+                (outgoing.issued.issued_ms, state.message_names.live.len())
             };
             let mut changed = sender.descriptor();
             let previous_name = changed.name.clone();
@@ -3084,7 +3422,7 @@ mod tests {
             assert!(receiver.claim().is_none());
             let state = lock(&sender.0.state);
             let outgoing = state.outgoing.get(REQUEST_ID).unwrap();
-            assert_eq!(outgoing.issued_ms, issued_ms);
+            assert_eq!(outgoing.issued.issued_ms, issued_ms);
             assert_eq!(state.message_names.live.len(), names);
         });
     }
@@ -3376,11 +3714,13 @@ mod tests {
         state.outgoing = (0..MAX_DEDUP)
             .map(|index| {
                 let outgoing = Outgoing {
-                    fingerprint: [0; 32],
-                    message_id: MESSAGE_NAME.into(),
-                    issued_ms,
-                    epoch,
-                    sender: sender.clone(),
+                    issued: Issued {
+                        fingerprint: [0; 32],
+                        message_id: MESSAGE_NAME.into(),
+                        issued_ms,
+                        epoch,
+                        sender: sender.clone(),
+                    },
                     receipt: None,
                 };
                 (index.to_string(), outgoing)
@@ -3557,7 +3897,7 @@ mod tests {
                 &messaging(floor),
                 Some(StoredPeerControls {
                     inbound: Some(restored),
-                    handle: None,
+                    ..StoredPeerControls::default()
                 }),
             )
             .unwrap();
@@ -3566,7 +3906,7 @@ mod tests {
             session.controls(),
             StoredPeerControls {
                 inbound: Some(super::stored_policy(&expected)),
-                handle: None,
+                ..StoredPeerControls::default()
             }
         );
     }
@@ -3576,8 +3916,8 @@ mod tests {
             descriptor,
             &MessagingConfig::default(),
             Some(StoredPeerControls {
-                inbound: None,
                 handle: Some(handle.into()),
+                ..StoredPeerControls::default()
             }),
         )
         .unwrap()
@@ -4034,7 +4374,7 @@ mod tests {
                 &messaging(Some(floor.clone())),
                 Some(StoredPeerControls {
                     inbound: Some(StoredInboundPolicy::Hold),
-                    handle: None,
+                    ..StoredPeerControls::default()
                 }),
             )
             .unwrap();
@@ -4242,5 +4582,306 @@ mod tests {
         receiver.join().unwrap();
         assert!(PeerSession::lookup(session.session_id()).is_none());
         assert!(session.claim().is_none());
+    }
+
+    fn topic_audience() -> PeerAudience {
+        PeerAudience::Topic {
+            topic: TOPIC.into(),
+        }
+    }
+
+    fn patterns(values: &[&str]) -> Vec<String> {
+        values.iter().copied().map(str::to_owned).collect()
+    }
+
+    fn publisher_fixture(messaging: MessagingConfig) -> (TempDir, PeerHost, PeerSession) {
+        let directory = directory();
+        let host = host(directory.path());
+        let session = host
+            .register_with_controls(
+                descriptor(directory.path(), InboundPolicy::Auto),
+                &messaging,
+                None,
+            )
+            .unwrap();
+        (directory, host, session)
+    }
+
+    fn subscriber(host: &PeerHost, cwd: &Path, topics: &[&str], broadcasts: bool) -> PeerSession {
+        host.register_with_controls(
+            descriptor(cwd, InboundPolicy::Auto),
+            &MessagingConfig::default(),
+            Some(StoredPeerControls {
+                topics: patterns(topics),
+                broadcasts,
+                ..StoredPeerControls::default()
+            }),
+        )
+        .unwrap()
+    }
+
+    #[test_case(topic_audience(), 0; "topic_subscribers")]
+    #[test_case(PeerAudience::Broadcast, 1; "broadcast_opt_ins")]
+    fn publications_reach_only_subscribed_sessions(audience: PeerAudience, reached: usize) {
+        smol::block_on(async {
+            let (directory, host, publisher) = publisher_fixture(MessagingConfig::default());
+            publisher
+                .set_subscriptions(patterns(&[TOPIC_PATTERN]), true)
+                .unwrap();
+            let receivers = [
+                subscriber(&host, directory.path(), &[TOPIC_PATTERN], false),
+                subscriber(&host, directory.path(), &[OTHER_PATTERN], true),
+                subscriber(&host, directory.path(), &[], false),
+            ];
+            let receipt = publisher
+                .publish(audience.clone(), TEXT, REQUEST_ID)
+                .await
+                .unwrap();
+            assert_eq!(receipt.audience, audience);
+            assert_eq!(receipt.skipped, 0);
+            assert_eq!(receipt.recipients.len(), 1);
+            assert_eq!(receipt.recipients[0].status, QUEUED);
+            assert!(publisher.claim().is_none());
+            for (index, receiver) in receivers.iter().enumerate() {
+                let claim = receiver.claim();
+                assert_eq!(claim.is_some(), index == reached);
+                if let Some(claim) = claim {
+                    let origin = claim.messages()[0].peer_event.clone().unwrap();
+                    assert_eq!(origin.message_id, receipt.message_id);
+                    assert_eq!(origin.audience, audience);
+                    claim.commit();
+                }
+            }
+        });
+    }
+
+    #[test_case(topic_audience(), &[TOPIC_PATTERN], false; "topic")]
+    #[test_case(PeerAudience::Broadcast, &[], true; "broadcast")]
+    fn recipients_recheck_their_subscriptions_on_arrival(
+        audience: PeerAudience,
+        topics: &[&str],
+        broadcasts: bool,
+    ) {
+        let (_directory, _host, session) = fixture(InboundPolicy::Auto);
+        session
+            .set_subscriptions(patterns(&[OTHER_PATTERN]), false)
+            .unwrap();
+        let mut publication = delivery(&session);
+        publication.audience = audience;
+        let now = Instant::now();
+        let mut arrive = |text: &str| {
+            publication.message_id = token().unwrap();
+            publication.text = text.into();
+            session
+                .0
+                .receive(publication.clone(), now, wall_ms())
+                .unwrap()
+        };
+        let refused = arrive(TEXT);
+        assert_eq!(refused.status, REFUSED);
+        assert_eq!(refused.reason.as_deref(), Some(NOT_SUBSCRIBED));
+        session
+            .set_subscriptions(patterns(topics), broadcasts)
+            .unwrap();
+        assert_eq!(arrive(TEXT).status, QUEUED);
+        session.set_subscriptions(Vec::new(), false).unwrap();
+        assert_eq!(arrive(OTHER_TEXT).reason.as_deref(), Some(NOT_SUBSCRIBED));
+    }
+
+    #[test]
+    fn publications_beyond_the_fanout_limit_are_counted_as_skipped() {
+        smol::block_on(async {
+            let (directory, host, publisher) = publisher_fixture(MessagingConfig {
+                max_fanout: LOW_FANOUT,
+                ..MessagingConfig::default()
+            });
+            let receivers: Vec<_> = (0..=LOW_FANOUT)
+                .map(|_| subscriber(&host, directory.path(), &[TOPIC_PATTERN], false))
+                .collect();
+            let receipt = publisher
+                .publish(topic_audience(), TEXT, REQUEST_ID)
+                .await
+                .unwrap();
+            assert_eq!(receipt.recipients.len(), LOW_FANOUT);
+            assert_eq!(receipt.skipped, receivers.len() - LOW_FANOUT);
+            let reached = receivers.iter().filter_map(PeerSession::claim).count();
+            assert_eq!(reached, LOW_FANOUT);
+        });
+    }
+
+    #[test]
+    fn publication_rate_bounds_new_publications_but_not_retries() {
+        smol::block_on(async {
+            let (directory, host, publisher) = publisher_fixture(MessagingConfig {
+                publish_per_minute: LOW_RATE,
+                ..MessagingConfig::default()
+            });
+            let _receiver = subscriber(&host, directory.path(), &[TOPIC_PATTERN], false);
+            let attempt =
+                |index: usize| (format!("{TEXT} {index}"), format!("{REQUEST_ID}-{index}"));
+            let mut receipts = Vec::new();
+            for index in 0..LOW_RATE {
+                let (text, request_id) = attempt(index);
+                receipts.push(
+                    publisher
+                        .publish(topic_audience(), &text, &request_id)
+                        .await
+                        .unwrap(),
+                );
+            }
+            let (text, request_id) = attempt(LOW_RATE);
+            assert_eq!(
+                publisher
+                    .publish(topic_audience(), &text, &request_id)
+                    .await
+                    .unwrap_err(),
+                PUBLISH_RATE_EXCEEDED
+            );
+            let (text, request_id) = attempt(0);
+            assert_eq!(
+                publisher
+                    .publish(topic_audience(), &text, &request_id)
+                    .await
+                    .unwrap(),
+                receipts[0]
+            );
+            let mut state = lock(&publisher.0.state);
+            assert_eq!(state.publications.len(), LOW_RATE);
+            assert!(!state.has_publish_room(Instant::now()));
+            assert!(state.has_publish_room(Instant::now() + RATE_WINDOW));
+        });
+    }
+
+    #[test]
+    fn publication_retries_resend_only_unknown_outcomes() {
+        smol::block_on(async {
+            let (directory, host, publisher) = publisher_fixture(MessagingConfig::default());
+            let resolved = subscriber(&host, directory.path(), &[TOPIC_PATTERN], false);
+            let unresolved = subscriber(&host, directory.path(), &[TOPIC_PATTERN], false);
+            let receipt = publisher
+                .publish(topic_audience(), TEXT, REQUEST_ID)
+                .await
+                .unwrap();
+            assert!(
+                receipt
+                    .recipients
+                    .iter()
+                    .all(|recipient| recipient.status == QUEUED)
+            );
+            {
+                let mut state = lock(&publisher.0.state);
+                let publication = state.publications.get_mut(REQUEST_ID).unwrap();
+                let index = publication
+                    .routes
+                    .iter()
+                    .position(|route| *route == unresolved.0.route.target())
+                    .unwrap();
+                publication.receipt.recipients[index].status = UNKNOWN.into();
+            }
+            resolved.close();
+            assert_eq!(
+                publisher
+                    .publish(topic_audience(), OTHER_TEXT, REQUEST_ID)
+                    .await
+                    .unwrap_err(),
+                REUSED_REQUEST
+            );
+            assert_eq!(
+                publisher
+                    .publish(topic_audience(), TEXT, REQUEST_ID)
+                    .await
+                    .unwrap(),
+                receipt
+            );
+            assert_eq!(unresolved.claim().unwrap().messages().len(), 1);
+        });
+    }
+
+    #[test]
+    fn publication_recipients_reply_directly_to_the_publisher() {
+        smol::block_on(async {
+            let (directory, host, publisher) = publisher_fixture(MessagingConfig::default());
+            let receiver = subscriber(&host, directory.path(), &[TOPIC_PATTERN], false);
+            let receipt = publisher
+                .publish(topic_audience(), TEXT, REQUEST_ID)
+                .await
+                .unwrap();
+            let claim = receiver.claim().unwrap();
+            let origin = claim.messages()[0].peer_event.clone().unwrap();
+            claim.commit();
+            let reply = receiver
+                .send_named(
+                    &origin.reply_target,
+                    REPLY_TEXT,
+                    Some(&origin.message_id),
+                    REPLY_REQUEST_ID,
+                )
+                .await
+                .unwrap();
+            assert_eq!(reply.status, QUEUED);
+            let claim = publisher.claim().unwrap();
+            let received = claim.messages()[0].peer_event.clone().unwrap();
+            assert_eq!(received.audience, PeerAudience::Direct);
+            assert_eq!(
+                received.reply_to.as_deref(),
+                Some(receipt.message_id.as_str())
+            );
+            assert_eq!(received.reply_target, receipt.recipients[0].target);
+            claim.commit();
+        });
+    }
+
+    #[test_case(&[TOPIC_PATTERN, OTHER_PATTERN], true, None; "patterns_and_broadcasts")]
+    #[test_case(&[TOPIC], false, None; "concrete_topic")]
+    #[test_case(&[MALFORMED_PATTERN], true, Some(INVALID_PATTERN); "malformed_pattern")]
+    fn subscriptions_are_validated_and_survive_reregistration(
+        topics: &[&str],
+        broadcasts: bool,
+        error: Option<&str>,
+    ) {
+        let (_directory, host, session) = fixture(InboundPolicy::Auto);
+        assert_eq!(
+            session
+                .set_subscriptions(patterns(topics), broadcasts)
+                .err()
+                .as_deref(),
+            error
+        );
+        let controls = session.controls();
+        if error.is_none() {
+            assert_eq!(controls.topics, patterns(topics));
+            assert_eq!(controls.broadcasts, broadcasts);
+        } else {
+            assert_eq!(controls, StoredPeerControls::default());
+        }
+        let descriptor = session.descriptor();
+        session.close();
+        let messaging = MessagingConfig::default();
+        let restored = host
+            .register_with_controls(descriptor.clone(), &messaging, Some(controls.clone()))
+            .unwrap();
+        assert_eq!(restored.controls(), controls);
+        restored.close();
+        let corrupted = StoredPeerControls {
+            topics: patterns(&[MALFORMED_PATTERN]),
+            ..controls
+        };
+        assert_eq!(
+            host.register_with_controls(descriptor, &messaging, Some(corrupted))
+                .err()
+                .as_deref(),
+            Some(INVALID_PATTERN)
+        );
+    }
+
+    #[test_case(PeerAudience::Direct, DIRECT_PUBLICATION; "direct")]
+    #[test_case(PeerAudience::Topic { topic: TOPIC_PATTERN.into() }, INVALID_TOPIC; "wildcard_topic")]
+    fn publications_need_a_concrete_topic_or_broadcasts(audience: PeerAudience, error: &str) {
+        let (_directory, _host, session) = fixture(InboundPolicy::Auto);
+        assert_eq!(
+            smol::block_on(session.publish(audience, TEXT, REQUEST_ID)).unwrap_err(),
+            error
+        );
+        assert!(lock(&session.0.state).publications.is_empty());
     }
 }

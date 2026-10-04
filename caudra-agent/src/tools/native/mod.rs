@@ -142,6 +142,11 @@ fn entries(
                 ToolEffect::Mutating,
                 peers::SEND_DESCRIPTION,
             ),
+            entry(
+                peers::PublishMessage,
+                ToolEffect::Mutating,
+                peers::PUBLISH_DESCRIPTION,
+            ),
         ]);
     }
     entries

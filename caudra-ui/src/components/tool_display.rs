@@ -32,7 +32,8 @@ use caudra_markdown::render::truncate_long_lines;
 
 use crate::markdown::{LinkMap, expand_notice, should_truncate, text_to_painted};
 use caudra_agent::tools::native::peers::{
-    LIST_NAME as LIST_SESSIONS_TOOL_NAME, SEND_NAME as SEND_MESSAGE_TOOL_NAME,
+    LIST_NAME as LIST_SESSIONS_TOOL_NAME, PUBLISH_NAME as PUBLISH_MESSAGE_TOOL_NAME,
+    SEND_NAME as SEND_MESSAGE_TOOL_NAME,
 };
 use caudra_agent::tools::native::plan;
 use caudra_agent::{
@@ -536,6 +537,7 @@ const COMPACT_TOOLS: &[(&str, CompactTool)] = &[
     tool_row("sessions", '▤', SESSIONS, &[]),
     tool_row(LIST_SESSIONS_TOOL_NAME, '⇄', PEERS, &[]),
     tool_row(SEND_MESSAGE_TOOL_NAME, '⇄', PEERS, &["text"]),
+    tool_row(PUBLISH_MESSAGE_TOOL_NAME, '⇄', PEERS, &["text"]),
     tool_row("view_image", '→', VIEW, &["path"]),
     tool_row("image_generate", '←', DRAW, &["out", "prompt"]),
 ];
@@ -982,7 +984,14 @@ pub(super) fn header_spans(
     base: Style,
     raw_input: Option<&serde_json::Value>,
 ) -> Vec<Span<'static>> {
-    if names_tool(SEND_MESSAGE_TOOL_NAME, tool) || names_tool(LIST_SESSIONS_TOOL_NAME, tool) {
+    if [
+        SEND_MESSAGE_TOOL_NAME,
+        PUBLISH_MESSAGE_TOOL_NAME,
+        LIST_SESSIONS_TOOL_NAME,
+    ]
+    .iter()
+    .any(|peer_tool| names_tool(peer_tool, tool))
+    {
         return vec![Span::styled(escape_terminal_controls(header), base)];
     }
     if is_shell_command(tool, header, raw_input) {
@@ -1090,7 +1099,10 @@ fn compact_args(
             serde_json::Value::String(text) if header.contains(text.as_str()) => continue,
             serde_json::Value::String(text) => {
                 let text = one_line(text);
-                if tool == Some(SEND_MESSAGE_TOOL_NAME) {
+                if matches!(
+                    tool,
+                    Some(SEND_MESSAGE_TOOL_NAME | PUBLISH_MESSAGE_TOOL_NAME)
+                ) {
                     escape_terminal_controls(&text)
                 } else {
                     text
@@ -1472,7 +1484,7 @@ pub fn append_right_info(
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Indicator {
     InProgress,
     Success,
@@ -1501,14 +1513,28 @@ impl Indicator {
         }
         match (Self::from(status), output) {
             (Self::Success, Some(ToolOutput::Peers(PeerOutput::Sent { receipt, .. }))) => {
-                match receipt.status.as_str() {
-                    "queued" => Self::Success,
-                    "refused" | "unavailable" => Self::Error,
+                Self::peer_receipt(&receipt.status)
+            }
+            (Self::Success, Some(ToolOutput::Peers(PeerOutput::Published { receipt }))) => {
+                let mut outcomes = receipt
+                    .recipients
+                    .iter()
+                    .map(|recipient| Self::peer_receipt(&recipient.status));
+                match outcomes.next() {
+                    Some(first) if outcomes.all(|outcome| outcome == first) => first,
                     _ => Self::Warning,
                 }
             }
             (Self::Success, Some(output)) if found_nothing(output) => Self::Warning,
             (indicator, _) => indicator,
+        }
+    }
+
+    fn peer_receipt(status: &str) -> Self {
+        match status {
+            "queued" => Self::Success,
+            "refused" | "unavailable" => Self::Error,
+            _ => Self::Warning,
         }
     }
 }

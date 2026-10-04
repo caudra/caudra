@@ -367,6 +367,10 @@ pub struct StoredPeerControls {
     pub inbound: Option<StoredInboundPolicy>,
     /// The unique messaging name this session reclaims whenever it registers.
     pub handle: Option<String>,
+    /// Topic patterns whose publications this session receives.
+    pub topics: Vec<String>,
+    /// Whether broadcasts reach this session.
+    pub broadcasts: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1645,6 +1649,7 @@ mod tests {
     const QUEUED_PROMPT: &str = "queued prompt";
     const WAKE_SUPPRESSION_FIELD: &str = "automatic_wakes_suppressed";
     const PEER_HANDLE: &str = "ci-watcher";
+    const PEER_TOPIC: &str = "ci.*";
 
     #[test_case("{}", false; "legacy_default")]
     #[test_case(r#"{"automatic_wakes_suppressed":false}"#, false; "explicit_false")]
@@ -1696,6 +1701,7 @@ mod tests {
             StoredPeerControls {
                 inbound,
                 handle: handle.map(str::to_owned),
+                ..StoredPeerControls::default()
             }
         );
     }
@@ -1713,6 +1719,8 @@ mod tests {
         let controls = StoredPeerControls {
             inbound,
             handle: Some(PEER_HANDLE.into()),
+            topics: vec![PEER_TOPIC.into()],
+            broadcasts: true,
         };
         let mut session = TestSession::new("model", "/project");
         session.meta.peer_controls = Some(controls.clone());
@@ -1725,6 +1733,8 @@ mod tests {
             serialized["peer_controls"]["handle"].as_str(),
             Some(PEER_HANDLE)
         );
+        assert_eq!(serialized["peer_controls"]["topics"][0], PEER_TOPIC);
+        assert_eq!(serialized["peer_controls"]["broadcasts"], true);
         session.save(&dir).unwrap();
 
         let mut restored = TestSession::load(session.id, &dir).unwrap();

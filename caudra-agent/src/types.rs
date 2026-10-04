@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 use strum::Display;
 
 use crate::agent::{GoalResult, GoalVerdict};
-use crate::peers::{PeerSummary, SendReceipt};
+use crate::peers::{PeerSummary, PublishReceipt, SendReceipt, handle_address};
 use crate::permissions::PermissionRequest;
 use crate::tools::native::plan::{self, PlanTarget, PlanWriteResult};
 use crate::tools::{TOOL_OUTPUT_TOOL_NAME, ToolEffect, ToolFailure};
@@ -75,6 +75,12 @@ const PEER_SESSION_NOUN: &str = "session";
 const PEER_SESSIONS_EMPTY: &str = "No other live local sessions.";
 const PEER_RECEIPT_ACCEPTED: &str = "Acceptance is not model delivery or completed work.";
 const PEER_RECEIPT_UNKNOWN: &str = "Acceptance is unconfirmed. Do not retry as a new message.";
+const PEER_RECIPIENT_NOUN: &str = "recipient";
+const PEER_NO_RECIPIENTS: &str = "no live recipients";
+const PEER_SKIPPED_LABEL: &str = "Not sent, over the fan-out limit: ";
+const PEER_SKIPPED_NOUN: &str = "matching session";
+const PEER_TOPICS_LABEL: &str = "\nTopics: ";
+const PEER_BROADCASTS_LINE: &str = "\nReceives broadcasts";
 
 const STATE_KIND_FIELD: &str = "kind";
 /// Results sized by what they cost the model rather than by their lines: a
@@ -809,21 +815,28 @@ pub enum PeerOutput {
         target: String,
         receipt: SendReceipt,
     },
+    Published {
+        receipt: PublishReceipt,
+    },
 }
 
 impl PeerOutput {
     pub fn annotation(&self) -> String {
         match self {
             Self::Sessions { sessions } => counted(sessions.len(), PEER_SESSION_NOUN),
-            Self::Sent { receipt, .. } => match receipt.status.as_str() {
-                "queued" => "queued",
-                "held" => "held for review",
-                "refused" => "refused",
-                "rate_limited" => "rate limited",
-                "unavailable" => "unavailable",
-                _ => "unknown outcome",
+            Self::Sent { receipt, .. } => status_label(&receipt.status).into(),
+            Self::Published { receipt } if receipt.recipients.is_empty() => {
+                PEER_NO_RECIPIENTS.into()
             }
-            .into(),
+            Self::Published { receipt } => format!(
+                "{} of {} accepted",
+                receipt
+                    .recipients
+                    .iter()
+                    .filter(|recipient| accepted(&recipient.status))
+                    .count(),
+                counted(receipt.recipients.len(), PEER_RECIPIENT_NOUN)
+            ),
         }
     }
 
@@ -844,13 +857,21 @@ impl PeerOutput {
                         .handle_address()
                         .map(|address| format!("\nName: {}", address.escape_debug()))
                         .unwrap_or_default();
-                    format!(
+                    let mut text = format!(
                         "{} · {state} · inbound {:?}{handle}\nTarget: {}\nWorkspace: {}",
                         peer.title.escape_debug(),
                         peer.inbound,
                         peer.target.escape_debug(),
                         peer.cwd.to_string_lossy().escape_debug(),
-                    )
+                    );
+                    if !peer.topics.is_empty() {
+                        text.push_str(PEER_TOPICS_LABEL);
+                        text.extend(peer.topics.join(", ").escape_debug());
+                    }
+                    if peer.broadcasts {
+                        text.push_str(PEER_BROADCASTS_LINE);
+                    }
+                    text
                 })
                 .collect::<Vec<_>>()
                 .join("\n\n"),
@@ -865,16 +886,52 @@ impl PeerOutput {
                     text.push('\n');
                     text.extend(reason.escape_debug());
                 }
-                let note = match receipt.status.as_str() {
-                    "queued" | "held" => Some(PEER_RECEIPT_ACCEPTED),
-                    "refused" | "rate_limited" | "unavailable" => None,
-                    _ => Some(PEER_RECEIPT_UNKNOWN),
-                };
-                if let Some(note) = note {
+                if let Some(note) = receipt_note(&receipt.status) {
                     text.push('\n');
                     text.push_str(note);
                 }
                 text
+            }
+            Self::Published { receipt } => {
+                let mut lines = vec![
+                    self.annotation(),
+                    format!("Audience: {}", receipt.audience.to_string().escape_debug()),
+                    format!("Message: {}", receipt.message_id.escape_debug()),
+                ];
+                for recipient in &receipt.recipients {
+                    let handle = recipient
+                        .handle
+                        .as_deref()
+                        .map(|handle| format!(" ({})", handle_address(handle).escape_debug()))
+                        .unwrap_or_default();
+                    lines.push(format!(
+                        "{}{handle} · {}\nTarget: {}",
+                        recipient.title.escape_debug(),
+                        status_label(&recipient.status),
+                        recipient.target.escape_debug(),
+                    ));
+                    if let Some(reason) = &recipient.reason {
+                        lines.push(reason.escape_debug().to_string());
+                    }
+                }
+                if receipt.skipped > 0 {
+                    lines.push(format!(
+                        "{PEER_SKIPPED_LABEL}{}",
+                        counted(receipt.skipped, PEER_SKIPPED_NOUN)
+                    ));
+                }
+                lines.extend(
+                    [PEER_RECEIPT_ACCEPTED, PEER_RECEIPT_UNKNOWN]
+                        .into_iter()
+                        .filter(|note| {
+                            receipt
+                                .recipients
+                                .iter()
+                                .any(|recipient| receipt_note(&recipient.status) == Some(*note))
+                        })
+                        .map(str::to_owned),
+                );
+                lines.join("\n")
             }
         }
     }
@@ -888,8 +945,32 @@ impl PeerOutput {
                 "message_id": receipt.message_id,
                 "reason": receipt.reason,
             }),
+            Self::Published { receipt } => json!(receipt),
         }
         .to_string()
+    }
+}
+
+fn status_label(status: &str) -> &'static str {
+    match status {
+        "queued" => "queued",
+        "held" => "held for review",
+        "refused" => "refused",
+        "rate_limited" => "rate limited",
+        "unavailable" => "unavailable",
+        _ => "unknown outcome",
+    }
+}
+
+fn accepted(status: &str) -> bool {
+    matches!(status, "queued" | "held")
+}
+
+fn receipt_note(status: &str) -> Option<&'static str> {
+    match status {
+        "refused" | "rate_limited" | "unavailable" => None,
+        status if accepted(status) => Some(PEER_RECEIPT_ACCEPTED),
+        _ => Some(PEER_RECEIPT_UNKNOWN),
     }
 }
 
@@ -3085,13 +3166,15 @@ pub struct Envelope {
 mod tests {
     use super::*;
     use caudra_config::InboundPolicy;
-    use caudra_providers::estimate_tokens;
+    use caudra_providers::{PeerAudience, estimate_tokens};
     use caudra_storage::StateDir;
     use caudra_storage::id::SessionRef;
     use caudra_storage::tool_outputs::ToolOutputStore;
     use caudra_workspace::PlanRef;
     use tempfile::TempDir;
     use test_case::test_case;
+
+    use crate::peers::RecipientReceipt;
 
     const PLAN_WRITE_PATH: &str = "/plans/committed.md";
     const PLAN_WRITE_REFERENCE: &str = "plan-committed";
@@ -3383,7 +3466,12 @@ mod tests {
     const PEER_HANDLE: &str = "parser-review";
     const PEER_WORKSPACE: &str = "/workspace/parser";
     const PEER_QUEUED: &str = "queued";
+    const PEER_HELD: &str = "held";
+    const PEER_REFUSED: &str = "refused";
+    const PEER_UNKNOWN: &str = "unknown";
     const PEER_HOSTILE: &str = "review\n\r\t\u{1b}[31m\u{202e}text";
+    const PEER_PATTERN: &str = "ci.**";
+    const PEER_TOPIC: &str = "ci.failures";
 
     fn peer_sessions(count: usize) -> ToolOutput {
         ToolOutput::Peers(PeerOutput::Sessions {
@@ -3396,6 +3484,8 @@ mod tests {
                     busy: true,
                     blocked: false,
                     inbound: InboundPolicy::Auto,
+                    topics: vec![PEER_PATTERN.into()],
+                    broadcasts: true,
                 })
                 .collect(),
         })
@@ -3408,6 +3498,28 @@ mod tests {
                 status: status.into(),
                 message_id: PEER_MESSAGE.into(),
                 reason: None,
+            },
+        })
+    }
+
+    fn peer_publication(statuses: &[&str], skipped: usize) -> ToolOutput {
+        ToolOutput::Peers(PeerOutput::Published {
+            receipt: PublishReceipt {
+                message_id: PEER_MESSAGE.into(),
+                audience: PeerAudience::Topic {
+                    topic: PEER_TOPIC.into(),
+                },
+                recipients: statuses
+                    .iter()
+                    .map(|status| RecipientReceipt {
+                        target: PEER_TARGET.into(),
+                        title: PEER_NAME.into(),
+                        handle: Some(PEER_HANDLE.into()),
+                        status: (*status).into(),
+                        reason: None,
+                    })
+                    .collect(),
+                skipped,
             },
         })
     }
@@ -3428,20 +3540,21 @@ mod tests {
             assert_eq!(session["busy"], true);
             assert_eq!(session["blocked"], false);
             assert_eq!(session["inbound"], "auto");
-            assert_eq!(session.as_object().unwrap().len(), 7);
+            assert_eq!(session["topics"], json!([PEER_PATTERN]));
+            assert_eq!(session["broadcasts"], true);
+            assert_eq!(session.as_object().unwrap().len(), 9);
         }
         assert_eq!(output.annotation().as_deref(), Some(annotation));
         assert_eq!(output.is_empty_result(), count == 0);
         assert_ne!(output.as_text(), output.as_display_text());
+        let display = output.as_display_text();
         if count == 0 {
-            assert_eq!(output.as_display_text(), PEER_SESSIONS_EMPTY);
+            assert_eq!(display, PEER_SESSIONS_EMPTY);
         } else {
-            assert!(output.as_display_text().contains(PEER_TARGET));
-            assert!(
-                output
-                    .as_display_text()
-                    .contains(&format!("@{PEER_HANDLE}"))
-            );
+            assert!(display.contains(PEER_TARGET));
+            assert!(display.contains(&format!("@{PEER_HANDLE}")));
+            assert!(display.contains(&format!("{PEER_TOPICS_LABEL}{PEER_PATTERN}")));
+            assert!(display.contains(PEER_BROADCASTS_LINE));
         }
     }
 
@@ -3462,6 +3575,8 @@ mod tests {
         };
         assert_eq!(sessions[0].title, PEER_NAME);
         assert_eq!(sessions[0].handle, None);
+        assert!(sessions[0].topics.is_empty());
+        assert!(!sessions[0].broadcasts);
     }
 
     #[test_case("queued", "queued", Some(PEER_RECEIPT_ACCEPTED); "queued")]
@@ -3494,9 +3609,45 @@ mod tests {
         }
     }
 
+    #[test_case(&[], 0, PEER_NO_RECIPIENTS, &[]; "no_recipients")]
+    #[test_case(&[PEER_QUEUED, PEER_HELD, PEER_REFUSED], 0, "2 of 3 recipients accepted", &[PEER_RECEIPT_ACCEPTED]; "partly_accepted")]
+    #[test_case(&[PEER_REFUSED, PEER_UNKNOWN], 3, "0 of 2 recipients accepted", &[PEER_RECEIPT_UNKNOWN]; "unknown_and_skipped")]
+    fn peer_publication_counts_recipients_without_claiming_completion(
+        statuses: &[&str],
+        skipped: usize,
+        annotation: &str,
+        notes: &[&str],
+    ) {
+        let output = peer_publication(statuses, skipped);
+        let model: Value = serde_json::from_str(&output.as_text()).unwrap();
+        assert_eq!(model["message_id"], PEER_MESSAGE);
+        assert_eq!(
+            model["audience"],
+            json!({"kind": "topic", "topic": PEER_TOPIC})
+        );
+        assert_eq!(model["skipped"], skipped);
+        assert_eq!(
+            model["recipients"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|recipient| recipient["status"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            statuses
+        );
+        assert_eq!(output.annotation().as_deref(), Some(annotation));
+        let display = output.as_display_text();
+        assert!(display.contains(&format!("Audience: topic {PEER_TOPIC}")));
+        for note in [PEER_RECEIPT_ACCEPTED, PEER_RECEIPT_UNKNOWN] {
+            assert_eq!(display.contains(note), notes.contains(&note));
+        }
+        assert_eq!(display.contains(PEER_SKIPPED_LABEL), skipped > 0);
+    }
+
     #[test_case(peer_sessions(0); "empty_discovery")]
     #[test_case(peer_sessions(2); "discovery")]
     #[test_case(peer_receipt(PEER_QUEUED); "receipt")]
+    #[test_case(peer_publication(&[PEER_QUEUED, PEER_UNKNOWN], 1); "publication")]
     fn peer_output_survives_storage_with_both_projections(output: ToolOutput) {
         let stored = serde_json::to_string(&output).unwrap();
         let restored: ToolOutput = serde_json::from_str(&stored).unwrap();
@@ -3509,41 +3660,65 @@ mod tests {
         );
     }
 
-    #[test_case(true; "session_fields")]
-    #[test_case(false; "receipt_fields")]
-    fn peer_display_escapes_untrusted_fields_without_changing_model_values(sessions: bool) {
-        let output = ToolOutput::Peers(if sessions {
-            PeerOutput::Sessions {
-                sessions: vec![PeerSummary {
+    fn hostile_sessions() -> PeerOutput {
+        PeerOutput::Sessions {
+            sessions: vec![PeerSummary {
+                target: PEER_HOSTILE.into(),
+                title: PEER_HOSTILE.into(),
+                handle: Some(PEER_HOSTILE.into()),
+                cwd: PEER_HOSTILE.into(),
+                busy: false,
+                blocked: true,
+                inbound: InboundPolicy::Hold,
+                topics: vec![PEER_HOSTILE.into()],
+                broadcasts: false,
+            }],
+        }
+    }
+
+    fn hostile_receipt() -> PeerOutput {
+        PeerOutput::Sent {
+            target: PEER_HOSTILE.into(),
+            receipt: SendReceipt {
+                status: PEER_QUEUED.into(),
+                message_id: PEER_HOSTILE.into(),
+                reason: Some(PEER_HOSTILE.into()),
+            },
+        }
+    }
+
+    fn hostile_publication() -> PeerOutput {
+        PeerOutput::Published {
+            receipt: PublishReceipt {
+                message_id: PEER_HOSTILE.into(),
+                audience: PeerAudience::Topic {
+                    topic: PEER_HOSTILE.into(),
+                },
+                recipients: vec![RecipientReceipt {
                     target: PEER_HOSTILE.into(),
                     title: PEER_HOSTILE.into(),
                     handle: Some(PEER_HOSTILE.into()),
-                    cwd: PEER_HOSTILE.into(),
-                    busy: false,
-                    blocked: true,
-                    inbound: InboundPolicy::Hold,
-                }],
-            }
-        } else {
-            PeerOutput::Sent {
-                target: PEER_HOSTILE.into(),
-                receipt: SendReceipt {
-                    status: PEER_QUEUED.into(),
-                    message_id: PEER_HOSTILE.into(),
+                    status: PEER_HOSTILE.into(),
                     reason: Some(PEER_HOSTILE.into()),
-                },
-            }
-        });
+                }],
+                skipped: 0,
+            },
+        }
+    }
+
+    #[test_case(hostile_sessions(), "/sessions/0/target"; "session_fields")]
+    #[test_case(hostile_receipt(), "/target"; "receipt_fields")]
+    #[test_case(hostile_publication(), "/recipients/0/target"; "publication_fields")]
+    fn peer_display_escapes_untrusted_fields_without_changing_model_values(
+        output: PeerOutput,
+        target: &str,
+    ) {
+        let output = ToolOutput::Peers(output);
         let display = output.as_display_text();
         assert!(display.contains(&PEER_HOSTILE.escape_debug().to_string()));
         assert!(!display.contains(['\r', '\t', '\u{1b}', '\u{202e}']));
         let model: Value = serde_json::from_str(&output.as_text()).unwrap();
-        let value = if sessions {
-            &model["sessions"][0]
-        } else {
-            &model
-        };
-        assert_eq!(value["target"], PEER_HOSTILE);
+        assert_eq!(model.pointer(target), Some(&json!(PEER_HOSTILE)));
     }
 
     const SKILL_LOCATION: &str = "builtin:herdr";
