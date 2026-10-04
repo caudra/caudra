@@ -10,6 +10,7 @@ use caudra_agent::peers::{
 };
 use caudra_config::InboundPolicy;
 use caudra_grab::grab_scope;
+use caudra_providers::PEER_SCRIPT_SENDER;
 use caudra_storage::sessions::StoredPeerControls;
 use caudra_workbench::text_field::{FieldKind, TextField, TextKey};
 use crossterm::event::{
@@ -65,6 +66,7 @@ const POLICY_SAVED: &str =
     "This session's inbound policy was updated. Review held messages again before deciding.";
 const FLOOR_BLOCKED: &str = "Disabled by the project inbound floor.";
 const UNAVAILABLE: &str = "Unavailable";
+const NO_REPLY_TARGET: &str = "None; a script takes no replies";
 const NO_MATCHES: &str = "No search matches.";
 const NO_PEERS: &str = "No eligible live peers. Opt in to messaging in another eligible local Caudra session, then refresh.";
 const NO_HELD: &str = "No held messages. Press 3 to browse the stored message history.";
@@ -1474,7 +1476,7 @@ impl PeerManager {
                 .iter()
                 .flat_map(|inbox| &inbox.messages)
                 .map(|held| {
-                    let name = literal(&held.sender_name, false);
+                    let name = held_sender(held);
                     let detail = format!(
                         "{}{SEPARATOR}{}{SEPARATOR}{}",
                         literal(&held.audience.to_string(), false),
@@ -1821,7 +1823,8 @@ impl PeerManager {
                         .review
                         .as_ref()
                         .map(|review| review.summary.reply_target.clone())
-                        .or_else(|| self.selected_held().map(|held| held.reply_target.clone())),
+                        .or_else(|| self.selected_held().map(|held| held.reply_target.clone()))
+                        .filter(|target| !target.is_empty()),
                     PeerView::Messages => None,
                 };
                 return target.map_or(PeerManagerAction::Consumed, PeerManagerAction::Copy);
@@ -2979,6 +2982,9 @@ fn message_block(message: &ChannelMessage) -> String {
         sender.push(' ');
         sender.push_str(&literal(&handle_address(handle), false));
     }
+    if message.external {
+        sender.push_str(&format!(" ({PEER_SCRIPT_SENDER})"));
+    }
     if message.own {
         sender = format!("{sender} ({THIS_SESSION})");
     }
@@ -2989,11 +2995,15 @@ fn message_block(message: &ChannelMessage) -> String {
         literal(&message.text, true)
     );
     for recipient in &message.recipients {
-        let name = match &recipient.name {
+        let mut name = match &recipient.name {
             _ if recipient.own => THIS_SESSION.to_owned(),
             Some(name) => literal(name, false),
             None => UNKNOWN_SESSION.to_owned(),
         };
+        if let Some(handle) = recipient.handle.as_ref().filter(|_| !recipient.own) {
+            name.push(' ');
+            name.push_str(&literal(&handle_address(handle), false));
+        }
         block.push_str(&format!(
             "\n{RECIPIENT_PREFIX}{name}: {}",
             literal(&recipient.status, false)
@@ -3062,21 +3072,36 @@ fn activity(peer: &PeerSummary) -> &'static str {
     }
 }
 
+fn held_sender(held: &HeldMessageSummary) -> String {
+    let name = literal(&held.sender_name, false);
+    if held.external {
+        format!("{name} ({PEER_SCRIPT_SENDER})")
+    } else {
+        name
+    }
+}
+
+/// A script's mode is a placeholder, so its identity names the script
+/// instead.
 fn held_identity(held: &HeldMessageSummary) -> String {
+    let (reply_target, mode) = if held.external {
+        (NO_REPLY_TARGET.to_owned(), PEER_SCRIPT_SENDER.to_owned())
+    } else if held.mode.is_empty() {
+        (literal(&held.reply_target, false), UNAVAILABLE.to_owned())
+    } else {
+        (
+            literal(&held.reply_target, false),
+            literal(&held.mode, false),
+        )
+    };
     format!(
-        "Sender: {}\nExact reply target: {}\n{AUDIENCE_LABEL}{}\nWorkspace: {}\nMode: {}\nMessage: {}",
-        literal(&held.sender_name, false),
-        literal(&held.reply_target, false),
+        "Sender: {}\nExact reply target: {reply_target}\n{AUDIENCE_LABEL}{}\nWorkspace: {}\nMode: {mode}\nMessage: {}",
+        held_sender(held),
         literal(&held.audience.to_string(), false),
         held.workspace.as_ref().map_or_else(
             || UNAVAILABLE.to_owned(),
             |path| literal(&path.to_string_lossy(), false)
         ),
-        if held.mode.is_empty() {
-            UNAVAILABLE.to_owned()
-        } else {
-            literal(&held.mode, false)
-        },
         literal(&held.message_id, false)
     )
 }
@@ -3183,7 +3208,7 @@ mod tests {
         MessageChannel, PeerDecisionResult, PeerInboxSnapshot, PeerSummary, RecipientStatus,
     };
     use caudra_config::InboundPolicy;
-    use caudra_providers::PeerAudience;
+    use caudra_providers::{PEER_SCRIPT_SENDER, PeerAudience};
     use caudra_storage::StateDir;
     use caudra_storage::messages::{MessageLog, Retention};
     use caudra_storage::sessions::StoredPeerControls;
@@ -3202,12 +3227,12 @@ mod tests {
         Confirmation, DIRECT_LABEL, FLOOR_BLOCKED, FreshInput, HISTORY_FAILED, HISTORY_POLL,
         HISTORY_STATUS, LEFT_OUT_HINT, LIST_SEPARATOR, LOADING_HISTORY, LoadedPage,
         MAX_LITERAL_COLS, MAX_ROWS, NAME_LABEL, NO_LONGER_HELD, NO_MATCHES, NO_NAME, NO_PEERS,
-        NO_TOPIC_HISTORY, NOT_LOADED, NOT_RECEIVING, OLDER_HINT, ON, POLICY_SAVED, Pane,
-        PanelFocus, PeerManager, PeerManagerAction, PeerView, QUEUED, RECEIVING, REJECTED,
+        NO_REPLY_TARGET, NO_TOPIC_HISTORY, NOT_LOADED, NOT_RECEIVING, OLDER_HINT, ON, POLICY_SAVED,
+        Pane, PanelFocus, PeerManager, PeerManagerAction, PeerView, QUEUED, RECEIVING, REJECTED,
         RETRY_HINT, Reader, ReviewPanel, SEPARATOR, STALE_REVIEW, START_HINT, SUBSCRIBE_LABEL,
         SUBSCRIBED, SessionPanel, SubscriptionChange, TOPICS_LABEL, TOPICS_SCOPE,
         UNSUBSCRIBE_LABEL, VIA, WHEEL_STEP, change_label, channel_key, handle_address, literal,
-        paint_literal, painted_rows, policy_rank,
+        message_block, paint_literal, painted_rows, policy_rank,
     };
     use crate::components::{Overlay, buffer_text};
     use crate::repaint::Cadence;
@@ -3318,11 +3343,13 @@ mod tests {
             audience: PeerAudience::Direct,
             sender_name: TITLE.to_owned(),
             sender_handle: Some(HANDLE.to_owned()),
+            external: false,
             own: false,
             sent_ms: SENT_MS,
             text: text.to_owned(),
             recipients: vec![RecipientStatus {
                 name: None,
+                handle: None,
                 own: true,
                 status: DELIVERED.to_owned(),
                 reason: None,
@@ -3414,6 +3441,7 @@ mod tests {
             message_id: id.to_owned(),
             sender_name: TITLE.to_owned(),
             reply_target: FIRST_TARGET.to_owned(),
+            external: false,
             workspace: Some(PathBuf::from(WORKSPACE)),
             mode: "Build".to_owned(),
             audience: PeerAudience::Direct,
@@ -4088,6 +4116,36 @@ mod tests {
         assert!(draw(&mut manager, WIDE, HEIGHT).contains(&format!("{AUDIENCE_LABEL}{audience}")));
     }
 
+    #[test]
+    fn held_script_messages_name_the_script_and_offer_no_reply_target() {
+        let mut manager = manager(PeerView::Held);
+        manager.update_inbox(snapshot(vec![HeldMessageSummary {
+            external: true,
+            reply_target: String::new(),
+            ..held(FIRST_MESSAGE)
+        }]));
+        let script = format!("{TITLE} ({PEER_SCRIPT_SENDER})");
+        assert_eq!(manager.entries()[0].1, script);
+        let screen = draw(&mut manager, WIDE, HEIGHT);
+        assert!(screen.contains(&script), "{screen}");
+        assert!(screen.contains(NO_REPLY_TARGET), "{screen}");
+        assert!(matches!(
+            manager.handle_key(ctrl('b')),
+            PeerManagerAction::Consumed
+        ));
+    }
+
+    #[test]
+    fn stored_script_messages_are_marked() {
+        let block = message_block(&ChannelMessage {
+            external: true,
+            sender_handle: None,
+            ..message(NEWEST_SEQ, NEWEST_TEXT)
+        });
+        let heading = format!("{TITLE} ({PEER_SCRIPT_SENDER}){SEPARATOR}");
+        assert!(block.starts_with(&heading), "{block}");
+    }
+
     #[test_case(SubscriptionChange::Subscribe(words(&[ADDED, PATTERN])), Ok((words(&[PATTERN, ADDED]), false)); "subscribe_adds_new_patterns")]
     #[test_case(SubscriptionChange::Unsubscribe(words(&[PATTERN])), Ok((Vec::new(), false)); "unsubscribe_removes")]
     #[test_case(SubscriptionChange::Unsubscribe(words(&[ADDED])), Err(format!("{MISSING_PATTERN}: {ADDED:?}")); "unsubscribe_names_a_missing_pattern")]
@@ -4695,6 +4753,7 @@ mod tests {
     #[test_case(|shown| shown.message.recipients[0].name = Some(HOSTILE.to_owned()), &literal(HOSTILE, false); "recipient_name")]
     #[test_case(|shown| shown.message.recipients[0].status = HOSTILE.to_owned(), &literal(HOSTILE, false); "recipient_status")]
     #[test_case(|shown| shown.message.recipients[0].reason = Some(HOSTILE.to_owned()), &literal(HOSTILE, false); "recipient_reason")]
+    #[test_case(|shown| shown.message.recipients[0].handle = Some(HOSTILE.to_owned()), &literal(&handle_address(HOSTILE), false); "recipient_handle")]
     #[test_case(|shown| shown.channel.channel = MessageChannel::Topic(HOSTILE.to_owned()), &literal(HOSTILE, false); "topic_name")]
     #[test_case(|shown| shown.channel.name = Some(HOSTILE.to_owned()), &literal(HOSTILE, false); "direct_name")]
     #[test_case(|shown| shown.channel.handle = Some(HOSTILE.to_owned()), &literal(&handle_address(HOSTILE), false); "direct_handle")]
@@ -4707,6 +4766,7 @@ mod tests {
             message: ChannelMessage {
                 recipients: vec![RecipientStatus {
                     name: Some(TITLE.to_owned()),
+                    handle: None,
                     own: false,
                     status: DELIVERED.to_owned(),
                     reason: None,

@@ -2,6 +2,7 @@ mod acp;
 mod config;
 mod decisions;
 mod logs;
+mod message;
 mod permissions;
 mod sandbox;
 mod sandbox_transfer;
@@ -323,6 +324,7 @@ fn require_requested_features(cli: &Cli) -> Result<(), FeatureDisabled> {
             features.require(Feature::RemoteWorkcell)
         }
         Some(Command::Decisions { .. }) => features.require(Feature::DecisionEngine),
+        Some(Command::Message { .. }) => features.require(Feature::CrossSessionMessaging),
         _ => Ok(()),
     }
 }
@@ -375,6 +377,7 @@ pub fn dispatch(mut cli: Cli, startup: Result<Startup, ConfigFileError>) -> Resu
         Some(Command::Decisions { action }) => {
             decisions::run(action, &cli)?;
         }
+        Some(Command::Message { action }) => return message::run(action, &cli),
         Some(Command::Auth { action }) => {
             let storage = StateDir::resolve().context("resolve data directory")?;
             match action {
@@ -654,6 +657,8 @@ mod tests {
     #[test_case(FeatureFlags::NONE.with(Feature::CrossSessionMessaging), &["--topic", MESSAGING_TOPIC], true; "topic_experiment_on")]
     #[test_case(FeatureFlags::NONE, &["--receive-broadcasts"], false; "broadcasts_experiment_off")]
     #[test_case(FeatureFlags::NONE.with(Feature::CrossSessionMessaging), &["--receive-broadcasts"], true; "broadcasts_experiment_on")]
+    #[test_case(FeatureFlags::NONE, &["message", "log"], false; "message_command_experiment_off")]
+    #[test_case(FeatureFlags::NONE.with(Feature::CrossSessionMessaging), &["message", "log"], true; "message_command_experiment_on")]
     fn messaging_flags_require_the_experiment(
         features: FeatureFlags,
         flags: &[&str],

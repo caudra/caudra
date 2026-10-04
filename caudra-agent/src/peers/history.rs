@@ -25,6 +25,14 @@ const STOPPED: &str = "The message history writer stopped";
 
 type Job = Box<dyn FnOnce(&mut MessageLog) + Send>;
 
+/// How long the shared history keeps messages, whichever process prunes it.
+pub fn history_retention(messaging: &MessagingConfig) -> Retention {
+    Retention {
+        days: messaging.history_days,
+        max_messages: messaging.history_max_messages,
+    }
+}
+
 /// Queues work for the writer thread. Cheap to clone; every clone feeds the
 /// same thread.
 #[derive(Clone)]
@@ -74,10 +82,7 @@ impl MessageHistory {
         state_dir: &StateDir,
         messaging: &MessagingConfig,
     ) -> Result<(Self, HistoryWriter), String> {
-        let retention = Retention {
-            days: messaging.history_days,
-            max_messages: messaging.history_max_messages,
-        };
+        let retention = history_retention(messaging);
         let log = MessageLog::open(state_dir, &retention, wall_ms())
             .map_err(|error| format!("{UNAVAILABLE}: {error}"))?;
         let (jobs, queue) = flume::unbounded();

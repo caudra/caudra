@@ -53,9 +53,15 @@ struct Manifest {
     socket: String,
 }
 
+/// The private directory where every host publishes its manifest and socket.
+#[derive(Clone)]
+pub(super) struct Directory {
+    path: PathBuf,
+    identity: Metadata,
+}
+
 pub(super) struct Endpoint {
-    directory: PathBuf,
-    directory_identity: Metadata,
+    directory: Directory,
     socket: PathBuf,
     socket_identity: Metadata,
     manifest: PathBuf,
@@ -165,105 +171,31 @@ pub(super) fn runtime_directory() -> Result<PathBuf, String> {
     make_private_directory(&temporary.join(name))
 }
 
-impl Endpoint {
-    pub(super) fn bind(
-        directory: PathBuf,
-        incarnation: &str,
-    ) -> Result<(Self, Async<UnixListener>), String> {
-        let dir = checked_directory(&directory)?;
-        let directory_identity = dir.metadata().map_err(|error| error.to_string())?;
-        private(&directory_identity, true)?;
-        let socket_name = format!("{incarnation}{SOCKET_SUFFIX}");
-        let socket = directory.join(&socket_name);
-        if socket.as_os_str().len() > MAX_SOCKET_PATH {
-            return Err("Peer Unix socket path exceeds the platform limit".into());
-        }
-        let listener = UnixListener::bind(&socket)
-            .map_err(|error| format!("Cannot bind local peer socket: {error}"))?;
-        let socket_identity = fs::symlink_metadata(&socket).map_err(|error| error.to_string())?;
-        if !socket_identity.file_type().is_socket() || socket_identity.uid() != uid() {
-            return Err(UNSAFE_ENTRY.into());
-        }
-        let socket_component = c_string(Path::new(&socket_name))?;
-        // SAFETY: the directory fd and socket basename are live. NOFOLLOW ensures
-        // a replacement symlink cannot cause chmod outside this private directory.
-        let changed = unsafe {
-            libc::fchmodat(
-                dir.as_raw_fd(),
-                socket_component.as_ptr(),
-                libc::S_IRUSR | libc::S_IWUSR,
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        };
-        if changed != 0 {
-            remove_owned(&socket, &socket_identity);
-            return Err(io::Error::last_os_error().to_string());
-        }
-        let current = fs::symlink_metadata(&socket).map_err(|error| error.to_string())?;
-        if !same_file(&socket_identity, &current) {
-            return Err(UNSAFE_ENTRY.into());
-        }
-        private(&current, false)?;
-        let manifest = directory.join(format!("{incarnation}{MANIFEST_SUFFIX}"));
-        let temporary = directory.join(format!("{incarnation}.tmp"));
-        let published = (|| {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(FILE_MODE)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(&temporary)
-                .map_err(|error| error.to_string())?;
-            let identity = file.metadata().map_err(|error| error.to_string())?;
-            private(&identity, false)?;
-            let bytes = serde_json::to_vec(&Manifest {
-                version: PROTOCOL_VERSION,
-                incarnation: incarnation.into(),
-                socket: socket_name,
-            })
+impl Directory {
+    pub(super) fn open(path: PathBuf) -> Result<Self, String> {
+        let identity = checked_directory(&path)?
+            .metadata()
             .map_err(|error| error.to_string())?;
-            let published = file
-                .write_all(&bytes)
-                .and_then(|()| fs::hard_link(&temporary, &manifest));
-            remove_owned(&temporary, &identity);
-            published.map_err(|error| error.to_string())?;
-            Ok::<_, String>(identity)
-        })();
-        let manifest_identity = match published {
-            Ok(identity) => identity,
-            Err(error) => {
-                remove_owned(&socket, &socket_identity);
-                return Err(error);
-            }
-        };
-        let endpoint = Self {
-            directory,
-            directory_identity,
-            socket,
-            socket_identity,
-            manifest,
-            manifest_identity,
-        };
-        let listener = Async::new(listener).map_err(|error| error.to_string())?;
-        Ok((endpoint, listener))
+        private(&identity, true)?;
+        Ok(Self { path, identity })
     }
 
-    fn check(&self) -> Result<(), String> {
-        let file = checked_directory(&self.directory)?;
+    /// Reopens the directory, provided it is still the private one opened.
+    fn verify(&self) -> Result<File, String> {
+        let file = checked_directory(&self.path)?;
         let metadata = file.metadata().map_err(|error| error.to_string())?;
         private(&metadata, true)?;
-        if !same_file(&self.directory_identity, &metadata) {
+        if !same_file(&self.identity, &metadata) {
             return Err(UNSAFE_ENTRY.into());
         }
-        Ok(())
+        Ok(file)
     }
 
     fn read_manifest(&self, host: &str) -> Result<Manifest, String> {
-        self.check()?;
         if !valid_token(host) {
             return Err("Invalid host incarnation".into());
         }
-        let directory = checked_directory(&self.directory)?;
+        let directory = self.verify()?;
         let name = c_string(Path::new(&format!("{host}{MANIFEST_SUFFIX}")))?;
         // SAFETY: both fd and terminated basename remain valid for openat.
         let fd = unsafe {
@@ -305,8 +237,8 @@ impl Endpoint {
     /// never removed: unlinking one that another process is about to lock
     /// would let two sessions hold the same name.
     pub(super) fn lock_handle(&self, handle: &str) -> Result<Option<File>, String> {
-        self.check()?;
-        let names = make_private_directory(&self.directory.join(NAMES_DIRECTORY))?;
+        self.verify()?;
+        let names = make_private_directory(&self.path.join(NAMES_DIRECTORY))?;
         let directory = checked_directory(&names)?;
         let name = c_string(Path::new(&format!("{handle}{LOCK_SUFFIX}")))?;
         // SAFETY: the directory fd and terminated basename remain valid for openat.
@@ -337,7 +269,7 @@ impl Endpoint {
 
     async fn connect(&self, host: &str) -> Result<Async<UnixStream>, String> {
         let manifest = self.read_manifest(host)?;
-        let path = self.directory.join(manifest.socket);
+        let path = self.path.join(manifest.socket);
         let before = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
         private(&before, false)?;
         if !before.file_type().is_socket() {
@@ -346,7 +278,7 @@ impl Endpoint {
         let stream = Async::<UnixStream>::connect(&path)
             .await
             .map_err(|error| error.to_string())?;
-        self.check()?;
+        self.verify()?;
         let after = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
         if !same_file(&before, &after) {
             return Err(UNSAFE_ENTRY.into());
@@ -354,6 +286,93 @@ impl Endpoint {
         private(&after, false)?;
         check_peer_uid(stream.get_ref())?;
         Ok(stream)
+    }
+}
+
+impl Endpoint {
+    pub(super) fn bind(
+        directory: Directory,
+        incarnation: &str,
+    ) -> Result<(Self, Async<UnixListener>), String> {
+        let dir = directory.verify()?;
+        let socket_name = format!("{incarnation}{SOCKET_SUFFIX}");
+        let socket = directory.path.join(&socket_name);
+        if socket.as_os_str().len() > MAX_SOCKET_PATH {
+            return Err("Peer Unix socket path exceeds the platform limit".into());
+        }
+        let listener = UnixListener::bind(&socket)
+            .map_err(|error| format!("Cannot bind local peer socket: {error}"))?;
+        let socket_identity = fs::symlink_metadata(&socket).map_err(|error| error.to_string())?;
+        if !socket_identity.file_type().is_socket() || socket_identity.uid() != uid() {
+            return Err(UNSAFE_ENTRY.into());
+        }
+        let socket_component = c_string(Path::new(&socket_name))?;
+        // SAFETY: the directory fd and socket basename are live. NOFOLLOW ensures
+        // a replacement symlink cannot cause chmod outside this private directory.
+        let changed = unsafe {
+            libc::fchmodat(
+                dir.as_raw_fd(),
+                socket_component.as_ptr(),
+                libc::S_IRUSR | libc::S_IWUSR,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if changed != 0 {
+            remove_owned(&socket, &socket_identity);
+            return Err(io::Error::last_os_error().to_string());
+        }
+        let current = fs::symlink_metadata(&socket).map_err(|error| error.to_string())?;
+        if !same_file(&socket_identity, &current) {
+            return Err(UNSAFE_ENTRY.into());
+        }
+        private(&current, false)?;
+        let manifest = directory
+            .path
+            .join(format!("{incarnation}{MANIFEST_SUFFIX}"));
+        let temporary = directory.path.join(format!("{incarnation}.tmp"));
+        let published = (|| {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(FILE_MODE)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&temporary)
+                .map_err(|error| error.to_string())?;
+            let identity = file.metadata().map_err(|error| error.to_string())?;
+            private(&identity, false)?;
+            let bytes = serde_json::to_vec(&Manifest {
+                version: PROTOCOL_VERSION,
+                incarnation: incarnation.into(),
+                socket: socket_name,
+            })
+            .map_err(|error| error.to_string())?;
+            let published = file
+                .write_all(&bytes)
+                .and_then(|()| fs::hard_link(&temporary, &manifest));
+            remove_owned(&temporary, &identity);
+            published.map_err(|error| error.to_string())?;
+            Ok::<_, String>(identity)
+        })();
+        let manifest_identity = match published {
+            Ok(identity) => identity,
+            Err(error) => {
+                remove_owned(&socket, &socket_identity);
+                return Err(error);
+            }
+        };
+        let endpoint = Self {
+            directory,
+            socket,
+            socket_identity,
+            manifest,
+            manifest_identity,
+        };
+        let listener = Async::new(listener).map_err(|error| error.to_string())?;
+        Ok((endpoint, listener))
+    }
+
+    pub(super) fn directory(&self) -> &Directory {
+        &self.directory
     }
 }
 
@@ -367,7 +386,7 @@ fn remove_owned(path: &Path, identity: &Metadata) {
 
 impl Drop for Endpoint {
     fn drop(&mut self) {
-        if self.check().is_ok() {
+        if self.directory.verify().is_ok() {
             remove_owned(&self.manifest, &self.manifest_identity);
             remove_owned(&self.socket, &self.socket_identity);
         }
@@ -510,6 +529,25 @@ pub(super) fn listen(host: Weak<HostInner>, listener: Async<UnixListener>) -> sm
 }
 
 pub(super) async fn send(session: &PeerSession, delivery: Delivery, epoch: u64) -> SendReceipt {
+    deliver(session.0.host.endpoint.directory(), delivery, || {
+        let state = lock(&session.0.state);
+        state.ensure_open()?;
+        if state.epoch != epoch || state.descriptor.blocked || state.descriptor.mode.is_read_only()
+        {
+            return Err("Peer send invalidated by a session policy or workspace change".into());
+        }
+        Ok(())
+    })
+    .await
+}
+
+/// Delivers to the host `delivery.target` names. `before_write` runs once
+/// connected, the last moment a sender can still withdraw the message.
+pub(super) async fn deliver(
+    directory: &Directory,
+    delivery: Delivery,
+    before_write: impl FnOnce() -> Result<(), String>,
+) -> SendReceipt {
     let message_id = delivery.message_id.clone();
     let route = match Route::parse(&delivery.target) {
         Ok(route) => route,
@@ -528,17 +566,8 @@ pub(super) async fn send(session: &PeerSession, delivery: Delivery, epoch: u64) 
     }
     let mut written = false;
     let result = timeout(IO_TIMEOUT, async {
-        let mut stream = session.0.host.endpoint.connect(&route.host).await?;
-        {
-            let state = lock(&session.0.state);
-            state.ensure_open()?;
-            if state.epoch != epoch
-                || state.descriptor.blocked
-                || state.descriptor.mode.is_read_only()
-            {
-                return Err("Peer send invalidated by a session policy or workspace change".into());
-            }
-        }
+        let mut stream = directory.connect(&route.host).await?;
+        before_write()?;
         // Any failure after the first write may have followed receiver admission.
         written = true;
         write_frame(&mut stream, &request).await?;
@@ -568,11 +597,11 @@ pub(super) async fn send(session: &PeerSession, delivery: Delivery, epoch: u64) 
     })
 }
 
-pub(super) async fn discover(endpoint: &Endpoint) -> Result<Vec<PeerInfo>, String> {
+pub(super) async fn discover(directory: &Directory) -> Result<Vec<PeerInfo>, String> {
     timeout(DISCOVERY_TIMEOUT, async {
-        endpoint.check()?;
+        directory.verify()?;
         let mut hosts = Vec::new();
-        for (index, entry) in fs::read_dir(&endpoint.directory)
+        for (index, entry) in fs::read_dir(&directory.path)
             .map_err(|error| error.to_string())?
             .enumerate()
         {
@@ -597,7 +626,7 @@ pub(super) async fn discover(endpoint: &Endpoint) -> Result<Vec<PeerInfo>, Strin
         let mut peers = Vec::new();
         for host in hosts {
             let response = timeout(IO_TIMEOUT, async {
-                let mut stream = endpoint.connect(&host).await?;
+                let mut stream = directory.connect(&host).await?;
                 write_frame(
                     &mut stream,
                     &Request::List {
@@ -667,11 +696,12 @@ mod tests {
     use caudra_storage::id::CaudraId;
     use caudra_storage::sessions::PermissionMode;
     use futures_lite::{AsyncWriteExt, future};
+    use tempfile::TempDir;
     use test_case::test_case;
 
     use super::{
-        DIRECTORY_MODE, Endpoint, FILE_MODE, MAX_DIRECTORY_ENTRIES, MAX_FRAME_BYTES, PARTIAL,
-        PERMISSION_MASK, Request, Response, UNSAFE_ENTRY, check_peer_uid, discover,
+        DIRECTORY_MODE, Directory, Endpoint, FILE_MODE, MAX_DIRECTORY_ENTRIES, MAX_FRAME_BYTES,
+        PARTIAL, PERMISSION_MASK, Request, Response, UNSAFE_ENTRY, check_peer_uid, discover,
         make_private_directory, read_frame, uid, write_frame,
     };
     use crate::AgentMode;
@@ -681,6 +711,10 @@ mod tests {
 
     const UNKNOWN: &str = "unknown";
     const REFUSED: &str = "refused";
+
+    fn open(directory: &TempDir) -> Directory {
+        Directory::open(directory.path().to_owned()).unwrap()
+    }
 
     #[test]
     fn socket_credentials_confirm_same_uid() {
@@ -736,11 +770,12 @@ mod tests {
     fn private_directory_modes_are_checked_without_repair() {
         let directory = directory();
         fs::set_permissions(directory.path(), Permissions::from_mode(0o755)).unwrap();
-        let error = match Endpoint::bind(directory.path().to_owned(), &token().unwrap()) {
-            Ok(_) => panic!("unsafe directory accepted"),
-            Err(error) => error,
-        };
-        assert_eq!(error, UNSAFE_ENTRY);
+        assert_eq!(
+            Directory::open(directory.path().to_owned())
+                .err()
+                .as_deref(),
+            Some(UNSAFE_ENTRY)
+        );
         assert_eq!(
             fs::metadata(directory.path()).unwrap().permissions().mode() & 0o777,
             0o755
@@ -748,7 +783,7 @@ mod tests {
         fs::set_permissions(directory.path(), Permissions::from_mode(DIRECTORY_MODE)).unwrap();
         let link = directory.path().join("linked-directory");
         symlink(directory.path(), &link).unwrap();
-        assert!(Endpoint::bind(link, &token().unwrap()).is_err());
+        assert!(Directory::open(link).is_err());
     }
 
     #[test]
@@ -756,18 +791,18 @@ mod tests {
         smol::block_on(async {
             let directory = directory();
             let id = token().unwrap();
-            let (endpoint, _listener) = Endpoint::bind(directory.path().to_owned(), &id).unwrap();
+            let (endpoint, _listener) = Endpoint::bind(open(&directory), &id).unwrap();
             let socket = endpoint.socket.clone();
             let manifest = endpoint.manifest.clone();
             let saved = directory.path().join("saved-manifest");
             fs::rename(&manifest, &saved).unwrap();
             symlink(&saved, &manifest).unwrap();
-            assert!(endpoint.read_manifest(&id).is_err());
+            assert!(endpoint.directory.read_manifest(&id).is_err());
             fs::remove_file(&manifest).unwrap();
             fs::rename(&saved, &manifest).unwrap();
             fs::remove_file(&socket).unwrap();
             symlink(&manifest, &socket).unwrap();
-            assert!(endpoint.connect(&id).await.is_err());
+            assert!(endpoint.directory.connect(&id).await.is_err());
             drop(endpoint);
             assert!(
                 fs::symlink_metadata(&socket)
@@ -782,22 +817,24 @@ mod tests {
     fn manifest_mode_is_checked_before_reading() {
         let directory = directory();
         let id = token().unwrap();
-        let (endpoint, _listener) = Endpoint::bind(directory.path().to_owned(), &id).unwrap();
+        let (endpoint, _listener) = Endpoint::bind(open(&directory), &id).unwrap();
         fs::set_permissions(&endpoint.manifest, Permissions::from_mode(0o644)).unwrap();
-        assert!(endpoint.read_manifest(&id).is_err());
+        assert!(endpoint.directory.read_manifest(&id).is_err());
         fs::set_permissions(&endpoint.manifest, Permissions::from_mode(FILE_MODE)).unwrap();
-        assert!(endpoint.read_manifest(&id).is_ok());
+        assert!(endpoint.directory.read_manifest(&id).is_ok());
     }
 
     #[test]
     fn discovery_reports_registry_limit() {
         let directory = directory();
-        let (endpoint, _listener) =
-            Endpoint::bind(directory.path().to_owned(), &token().unwrap()).unwrap();
+        let (endpoint, _listener) = Endpoint::bind(open(&directory), &token().unwrap()).unwrap();
         for index in 0..MAX_DIRECTORY_ENTRIES {
             fs::write(directory.path().join(format!("unrelated-{index}")), []).unwrap();
         }
-        assert_eq!(smol::block_on(discover(&endpoint)).unwrap_err(), PARTIAL);
+        assert_eq!(
+            smol::block_on(discover(&endpoint.directory)).unwrap_err(),
+            PARTIAL
+        );
     }
 
     #[test]
@@ -807,7 +844,13 @@ mod tests {
             let host =
                 PeerHost::start_in(directory.path().to_owned(), Arc::new(AtomicUsize::new(0)))
                     .unwrap();
-            let mut stream = host.0.endpoint.connect(&host.0.incarnation).await.unwrap();
+            let mut stream = host
+                .0
+                .endpoint
+                .directory
+                .connect(&host.0.incarnation)
+                .await
+                .unwrap();
             write_frame(
                 &mut stream,
                 &Request::List {
@@ -821,7 +864,13 @@ mod tests {
                 read_frame::<Response>(&mut stream).await.unwrap(),
                 Response::Error { .. }
             ));
-            let mut stream = host.0.endpoint.connect(&host.0.incarnation).await.unwrap();
+            let mut stream = host
+                .0
+                .endpoint
+                .directory
+                .connect(&host.0.incarnation)
+                .await
+                .unwrap();
             write_frame(
                 &mut stream,
                 &Request::List {
@@ -858,7 +907,7 @@ mod tests {
                 })
                 .unwrap();
             let id = token().unwrap();
-            let (_endpoint, listener) = Endpoint::bind(directory.path().to_owned(), &id).unwrap();
+            let (_endpoint, listener) = Endpoint::bind(open(&directory), &id).unwrap();
             let route = Route {
                 host: id,
                 session: CaudraId::generate(),

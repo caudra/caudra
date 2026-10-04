@@ -3,13 +3,14 @@ use std::path::PathBuf;
 use clap::builder::{PossibleValue, PossibleValuesParser, TypedValueParser};
 use clap::{
     Args, Command as ClapCommand, CommandFactory, Error as CliError, FromArgMatches, Parser,
-    Subcommand, ValueEnum, error::ErrorKind,
+    Subcommand, ValueEnum, error::ErrorKind, value_parser,
 };
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 
-use caudra_agent::peers::parse_handle;
-use caudra_agent::peers::topics::parse_pattern;
+use caudra_agent::peers::script::{DEFAULT_LABEL, parse_label};
+use caudra_agent::peers::topics::{parse_pattern, parse_topic};
+use caudra_agent::peers::{parse_handle, parse_handle_address};
 use caudra_agent::tools::all_builtin_tool_names;
 use caudra_config::files::{self, ConfigFile};
 use caudra_config::sandbox::LeaseSeconds;
@@ -22,6 +23,8 @@ use crate::print::OutputFormat;
 use crate::startup::Startup;
 
 const DEFAULT_LOG_LINES: usize = 200;
+const DEFAULT_MESSAGE_LIMIT: u32 = 20;
+const MAX_MESSAGE_LIMIT: i64 = 1000;
 const PERMISSION_MODE_CONFLICT: &str = "--auto cannot be used with --yolo";
 const NO_REFERENCE: &str = "this file has no reference";
 
@@ -301,6 +304,9 @@ impl Cli {
             })
             .mut_subcommand("decisions", |command| {
                 command.hide(off(Feature::DecisionEngine))
+            })
+            .mut_subcommand("message", |command| {
+                command.hide(off(Feature::CrossSessionMessaging))
             })
             .mut_subcommand("auth", |auth| {
                 auth.mut_subcommand("sandbox", |command| command.hide(sandboxes_off))
@@ -583,6 +589,11 @@ pub enum Command {
         #[command(subcommand)]
         action: PermissionAction,
     },
+    /// Publish, broadcast, send, and read cross-session messages from scripts
+    Message {
+        #[command(subcommand)]
+        action: MessageAction,
+    },
 }
 
 impl Command {
@@ -607,8 +618,71 @@ impl Command {
                 | Self::Skills { .. }
                 | Self::Storage { .. }
                 | Self::Decisions { .. }
+                | Self::Message { .. }
         )
     }
+}
+
+#[derive(Subcommand)]
+pub enum MessageAction {
+    /// Publish to every live session subscribed to a topic
+    Publish {
+        /// The exact topic, such as ci.failures
+        #[arg(long, value_name = "TOPIC", value_parser = parse_topic)]
+        topic: String,
+        #[command(flatten)]
+        message: MessageArgs,
+    },
+    /// Send to every live session that receives broadcasts
+    Broadcast {
+        #[command(flatten)]
+        message: MessageArgs,
+    },
+    /// Send to the live session holding a unique messaging name
+    Send {
+        /// The messaging name, with or without its @
+        #[arg(long, value_name = "NAME", value_parser = parse_handle_address)]
+        to: String,
+        #[command(flatten)]
+        message: MessageArgs,
+    },
+    /// Print recorded messages, oldest first
+    Log {
+        /// Only topics this pattern matches, such as ci.*
+        #[arg(long, value_name = "PATTERN", value_parser = parse_pattern, conflicts_with_all = ["broadcast", "with"])]
+        topic: Option<String>,
+        /// Only broadcasts
+        #[arg(long, conflicts_with = "with")]
+        broadcast: bool,
+        /// Only direct messages to or from whoever held this messaging name
+        #[arg(long, value_name = "NAME", value_parser = parse_handle_address)]
+        with: Option<String>,
+        /// How many of the newest messages to print
+        #[arg(
+            short = 'n',
+            long,
+            value_name = "COUNT",
+            default_value_t = DEFAULT_MESSAGE_LIMIT,
+            value_parser = value_parser!(u32).range(1..=MAX_MESSAGE_LIMIT)
+        )]
+        limit: u32,
+        /// One JSON object per message, without session ids
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Args)]
+pub struct MessageArgs {
+    /// The sender name recipients see; one name shares one rate limit
+    #[arg(long, value_name = "LABEL", default_value = DEFAULT_LABEL, value_parser = parse_label)]
+    pub from: String,
+    /// Print the receipt as JSON
+    #[arg(long)]
+    pub json: bool,
+    /// The message text; read from stdin when omitted
+    #[arg(value_name = "TEXT")]
+    pub text: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -1229,6 +1303,7 @@ pub fn normalize_tool_name(name: &str) -> Result<String> {
 mod tests {
     use super::*;
     use caudra_agent::peers::INVALID_HANDLE;
+    use caudra_agent::peers::script::INVALID_LABEL;
     use caudra_agent::peers::topics::INVALID_PATTERN;
     use caudra_config::workcell::{
         WorkcellProfiles, WorkcellSelection, WorkcellSelectionError, select_workcell,
@@ -1243,6 +1318,10 @@ mod tests {
     const MODEL_SPEC: &str = "openai/gpt-5";
     const PERMISSIONS_NOT_PARSED: &str = "expected permission rebind subcommand";
     const PERMISSION_DATABASE: &str = "/explicit-copy/caudra.sqlite";
+    const MESSAGE_NOT_PARSED: &str = "expected a message subcommand";
+    const MESSAGING_NAME: &str = "ci-watcher";
+    const MESSAGE_TEXT: &str = "Nightly build failed";
+    const SENDER_LABEL: &str = "nightly-ci";
 
     #[test_case(&["caudra", "--auto"]; "root_auto")]
     #[test_case(&["caudra", "acp", "--auto"]; "acp_auto")]
@@ -1650,6 +1729,95 @@ mod tests {
                 assert!(error.to_string().contains(INVALID_PATTERN), "{error}");
             }
         }
+    }
+
+    #[test_case(FeatureFlags::NONE, true; "experiment_off")]
+    #[test_case(FeatureFlags::NONE.with(Feature::CrossSessionMessaging), false; "experiment_on")]
+    fn message_command_is_hidden_until_enabled(features: FeatureFlags, hidden: bool) {
+        let command = Cli::command_for(features);
+        assert_eq!(
+            command
+                .find_subcommand("message")
+                .map(ClapCommand::is_hide_set),
+            Some(hidden)
+        );
+    }
+
+    #[test_case(&["--topic", "ci.failures"], true; "concrete_topic")]
+    #[test_case(&["--topic", "ci.*"], false; "wildcard")]
+    #[test_case(&[], false; "no_topic")]
+    fn message_publish_needs_one_concrete_topic(flags: &[&str], valid: bool) {
+        let args = ["caudra", "message", "publish"]
+            .iter()
+            .chain(flags)
+            .chain(&[MESSAGE_TEXT]);
+        assert_eq!(Cli::try_parse_from(args).is_ok(), valid);
+    }
+
+    #[test_case(MESSAGING_NAME; "bare_name")]
+    #[test_case("@ci-watcher"; "address")]
+    fn message_send_takes_a_name_with_or_without_its_prefix(to: &str) {
+        let args = ["caudra", "message", "send", "--to", to, MESSAGE_TEXT];
+        let Some(Command::Message {
+            action: MessageAction::Send { to, message },
+        }) = Cli::try_parse_from(args).unwrap().command
+        else {
+            panic!("{MESSAGE_NOT_PARSED}");
+        };
+        assert_eq!(to, MESSAGING_NAME);
+        assert_eq!(message.from, DEFAULT_LABEL);
+        assert_eq!(message.text.as_deref(), Some(MESSAGE_TEXT));
+    }
+
+    #[test_case(SENDER_LABEL, true; "plain_label")]
+    #[test_case("", false; "empty_label")]
+    #[test_case("nightly\u{1b}ci", false; "control_character")]
+    fn message_sender_label_is_validated_while_parsing(label: &str, valid: bool) {
+        let flag = format!("--from={label}");
+        match Cli::try_parse_from(["caudra", "message", "broadcast", flag.as_str()]) {
+            Ok(Cli {
+                command:
+                    Some(Command::Message {
+                        action: MessageAction::Broadcast { message },
+                    }),
+                ..
+            }) => {
+                assert!(valid);
+                assert_eq!(message.from, label);
+                assert!(message.text.is_none());
+            }
+            Ok(_) => panic!("{MESSAGE_NOT_PARSED}"),
+            Err(error) => {
+                assert!(!valid);
+                assert!(error.to_string().contains(INVALID_LABEL), "{error}");
+            }
+        }
+    }
+
+    #[test_case(&["--topic", "ci.*", "--broadcast"]; "topic_and_broadcasts")]
+    #[test_case(&["--topic", "ci.*", "--with", MESSAGING_NAME]; "topic_and_name")]
+    #[test_case(&["--broadcast", "--with", MESSAGING_NAME]; "broadcasts_and_name")]
+    fn message_log_takes_one_filter(flags: &[&str]) {
+        let args = ["caudra", "message", "log"].iter().chain(flags);
+        assert_eq!(
+            Cli::try_parse_from(args).err().map(|error| error.kind()),
+            Some(ErrorKind::ArgumentConflict)
+        );
+    }
+
+    #[test_case(&[], Some(DEFAULT_MESSAGE_LIMIT); "default_limit")]
+    #[test_case(&["-n", "1000"], Some(1000); "largest_limit")]
+    #[test_case(&["-n", "0"], None; "zero")]
+    #[test_case(&["--limit", "1001"], None; "over_the_limit")]
+    fn message_log_limit_is_bounded(flags: &[&str], expected: Option<u32>) {
+        let args = ["caudra", "message", "log"].iter().chain(flags);
+        let limit = Cli::try_parse_from(args).ok().map(|cli| match cli.command {
+            Some(Command::Message {
+                action: MessageAction::Log { limit, .. },
+            }) => limit,
+            _ => panic!("{MESSAGE_NOT_PARSED}"),
+        });
+        assert_eq!(limit, expected);
     }
 
     /// Naming a session is how its change records get released by hand, so

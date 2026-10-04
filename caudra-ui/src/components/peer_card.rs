@@ -3,6 +3,7 @@ use caudra_agent::{
     peers::{PeerHistoryPage, PeerSummary, PublishReceipt, TopicActivity, handle_address, literal},
 };
 use caudra_config::InboundPolicy;
+use caudra_providers::PEER_SCRIPT_SENDER;
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use ratatui::{
@@ -231,6 +232,12 @@ fn history_lines(page: &PeerHistoryPage, lines: &mut Vec<Line<'static>>) {
                 theme.tool_path,
             ));
         }
+        if message.external {
+            heading.push(Span::styled(
+                format!(" ({PEER_SCRIPT_SENDER})"),
+                theme.tool_dim,
+            ));
+        }
         heading.push(Span::styled(
             format!("{SEPARATOR}{}", sent_at(message.sent_ms)),
             theme.tool_dim,
@@ -344,7 +351,7 @@ mod tests {
         tools::{ToolEffect, native::peers::SEND_NAME},
     };
     use caudra_config::{InboundPolicy, ToolOutputLines};
-    use caudra_providers::PeerAudience;
+    use caudra_providers::{PEER_SCRIPT_SENDER, PeerAudience};
     use ratatui::text::Line;
     use test_case::test_case;
 
@@ -380,6 +387,7 @@ mod tests {
             topic: topic.map(str::to_owned),
             sender_name: NAME.into(),
             sender_handle: Some(HANDLE.into()),
+            external: false,
             sent_ms: SENT_MS,
             text: text.into(),
         }
@@ -629,6 +637,23 @@ mod tests {
             "{drawn:?}"
         );
         assert_eq!(drawn[1..], BODY_LINES);
+    }
+
+    #[test]
+    fn stored_script_messages_are_marked() {
+        let script = StoredPeerMessage {
+            sender_handle: None,
+            external: true,
+            ..stored(Some(TOPIC), BODY_LINES[0])
+        };
+        let (lines, _) = render(&history(vec![script], 0, None), usize::MAX, WIDTH);
+        let heading = lines[0].to_string();
+        assert!(
+            heading.starts_with(&format!(
+                "{TOPIC} · {NAME} ({PEER_SCRIPT_SENDER}) · {SENT_YEAR}"
+            )),
+            "{heading}"
+        );
     }
 
     #[test_case(2, 0, None; "complete")]

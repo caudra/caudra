@@ -7,8 +7,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use caudra_providers::{
-    AgentError, Billing, ContentBlock, Message, PeerMessageOrigin, Role, StopReason,
-    TaskEventOrigin, TokenUsage, estimate_tokens_cached, token_label,
+    AgentError, Billing, ContentBlock, Message, PEER_SCRIPT_SENDER, PEER_SESSION_SENDER,
+    PeerMessageOrigin, Role, StopReason, TaskEventOrigin, TokenUsage, estimate_tokens_cached,
+    token_label,
 };
 use caudra_storage::background::{JobKind, JobOwner, ShellJobMetadata};
 use caudra_storage::id::CaudraId;
@@ -980,11 +981,15 @@ impl PeerOutput {
                     .messages
                     .iter()
                     .map(|message| {
-                        let handle = message
-                            .sender_handle
-                            .as_deref()
-                            .map(|handle| format!(" ({})", handle_address(handle).escape_debug()))
-                            .unwrap_or_default();
+                        let handle = if message.external {
+                            format!(" ({PEER_SCRIPT_SENDER})")
+                        } else {
+                            message
+                                .sender_handle
+                                .as_deref()
+                                .map(|handle| format!(" ({})", handle_address(handle).escape_debug()))
+                                .unwrap_or_default()
+                        };
                         let body = message
                             .text
                             .lines()
@@ -1049,6 +1054,11 @@ impl PeerOutput {
                     .map(|message| json!({
                         "topic": message.topic,
                         "sender": message.sender_name,
+                        "sender_kind": if message.external {
+                            PEER_SCRIPT_SENDER
+                        } else {
+                            PEER_SESSION_SENDER
+                        },
                         "handle": message.sender_handle.as_deref().map(handle_address),
                         "sent": utc_time(message.sent_ms),
                         "text": message.text,
@@ -3787,6 +3797,7 @@ mod tests {
             topic: Some(value.into()),
             sender_name: value.into(),
             sender_handle: Some(value.into()),
+            external: false,
             sent_ms: PEER_SENT_MS,
             text: value.into(),
         }
@@ -3854,6 +3865,7 @@ mod tests {
                 &json!({
                     "topic": PEER_TOPIC,
                     "sender": PEER_NAME,
+                    "sender_kind": PEER_SESSION_SENDER,
                     "handle": handle_address(PEER_HANDLE),
                     "sent": PEER_SENT_UTC,
                     "text": PEER_BODY,
@@ -3868,6 +3880,27 @@ mod tests {
         assert_eq!(display.contains(PEER_WITHHELD_NOTE), withheld > 0);
         assert_eq!(display.contains(PEER_OLDER_NOTE), before.is_some());
         assert_eq!(display == PEER_HISTORY_EMPTY, empty);
+    }
+
+    #[test_case(false, PEER_SESSION_SENDER; "session_sender")]
+    #[test_case(true, PEER_SCRIPT_SENDER; "script_sender")]
+    fn peer_history_tells_script_senders_from_sessions(external: bool, kind: &str) {
+        let output = ToolOutput::Peers(PeerOutput::History {
+            page: PeerHistoryPage {
+                topic: Some(PEER_PATTERN.into()),
+                messages: vec![StoredPeerMessage {
+                    external,
+                    sender_handle: None,
+                    ..stored_peer_message(PEER_BODY)
+                }],
+                withheld: 0,
+                before: None,
+            },
+        });
+        let model: Value = serde_json::from_str(&output.as_text()).unwrap();
+        assert_eq!(model["messages"][0]["sender_kind"], kind);
+        let script_mark = format!("({PEER_SCRIPT_SENDER})");
+        assert_eq!(output.as_display_text().contains(&script_mark), external);
     }
 
     #[test_case(peer_sessions(0); "empty_discovery")]

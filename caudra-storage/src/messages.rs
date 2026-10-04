@@ -37,7 +37,10 @@ const BROADCAST_FILTER: &str = "m.kind = 'broadcast'";
 const DIRECT_FILTER: &str = "m.kind = 'direct' AND EXISTS (
     SELECT 1 FROM deliveries d WHERE d.seq = m.seq AND (
         (m.sender_session = ?3 AND d.recipient_session = ?4)
-        OR (COALESCE(m.sender_session, m.sender_route) = ?4 AND d.recipient_session = ?3)))";
+        OR (m.sender_session = ?4 AND d.recipient_session = ?3)))";
+const NAMED_FILTER: &str = "m.kind = 'direct' AND (m.sender_handle = ?3 OR EXISTS (
+    SELECT 1 FROM deliveries d WHERE d.seq = m.seq AND d.recipient_handle = ?3))";
+const ALL_FILTER: &str = "1";
 const SCHEMA: &str = "
 CREATE TABLE messages (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -45,7 +48,7 @@ CREATE TABLE messages (
     message_id TEXT NOT NULL,
     kind TEXT NOT NULL CHECK (kind IN ('direct', 'topic', 'broadcast')),
     topic TEXT,
-    sender_session TEXT,
+    sender_session TEXT NOT NULL,
     sender_name TEXT NOT NULL,
     sender_handle TEXT,
     sender_cwd TEXT,
@@ -65,6 +68,7 @@ CREATE TABLE deliveries (
     seq INTEGER NOT NULL REFERENCES messages(seq) ON DELETE CASCADE,
     recipient_session TEXT NOT NULL,
     recipient_name TEXT,
+    recipient_handle TEXT,
     status TEXT NOT NULL,
     reason TEXT,
     updated_ms INTEGER NOT NULL,
@@ -100,7 +104,7 @@ pub enum MessageAudience {
 }
 
 impl MessageAudience {
-    fn kind(&self) -> &'static str {
+    pub fn kind(&self) -> &'static str {
         match self {
             Self::Direct => DIRECT,
             Self::Topic(_) => TOPIC,
@@ -108,7 +112,7 @@ impl MessageAudience {
         }
     }
 
-    fn topic(&self) -> Option<&str> {
+    pub fn topic(&self) -> Option<&str> {
         match self {
             Self::Topic(topic) => Some(topic),
             Self::Direct | Self::Broadcast => None,
@@ -121,13 +125,15 @@ impl MessageAudience {
 pub struct MessageSender {
     /// Unique to one live registration, so it keys a message with its id.
     pub route: String,
-    /// The sending session, or none for a sender outside every session.
-    pub session: Option<String>,
+    /// The sending session. A script sends under the session its label
+    /// names, so each label keeps one conversation.
+    pub session: String,
     pub name: String,
     pub handle: Option<String>,
     pub cwd: Option<String>,
     pub mode: String,
     pub permission: String,
+    /// Sent by a script outside every session, which nothing can reply to.
     pub external: bool,
 }
 
@@ -151,6 +157,7 @@ pub struct StoredMessage {
 pub struct MessageRecipient {
     pub session: String,
     pub name: Option<String>,
+    pub handle: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,6 +185,11 @@ pub enum HistoryChannel {
         session: String,
         peer: String,
     },
+    /// Direct messages to or from whichever session held this messaging
+    /// name at the time.
+    Named(String),
+    /// Every message.
+    All,
 }
 
 /// One channel of the history as a session browses it.
@@ -185,8 +197,7 @@ pub enum HistoryChannel {
 pub enum MessageChannel {
     Topic(String),
     Broadcast,
-    /// The session's direct conversation with another party: that session,
-    /// or the route of a sender outside every session.
+    /// The session's direct conversation with the other party's session.
     Direct(String),
 }
 
@@ -195,8 +206,7 @@ pub struct ChannelSummary {
     pub channel: MessageChannel,
     /// The other party's newest known title, in a direct conversation.
     pub name: Option<String>,
-    /// The other party's messaging name, from the newest message it sent
-    /// with one.
+    /// The other party's newest known messaging name.
     pub handle: Option<String>,
     pub count: u64,
     pub last_seq: i64,
@@ -209,6 +219,7 @@ pub struct DeliveryRecord {
     pub seq: i64,
     pub recipient_session: String,
     pub recipient_name: Option<String>,
+    pub recipient_handle: Option<String>,
     pub status: String,
     pub reason: Option<String>,
     pub updated_ms: u64,
@@ -327,10 +338,18 @@ impl MessageLog {
         )?;
         for recipient in recipients {
             transaction.execute(
-                "INSERT INTO deliveries (seq, recipient_session, recipient_name, status, updated_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO deliveries (seq, recipient_session, recipient_name, recipient_handle,
+                    status, updated_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT (seq, recipient_session) DO NOTHING",
-                params![seq, recipient.session, recipient.name, PENDING, created],
+                params![
+                    seq,
+                    recipient.session,
+                    recipient.name,
+                    recipient.handle,
+                    PENDING,
+                    created
+                ],
             )?;
         }
         transaction.commit()?;
@@ -376,12 +395,13 @@ impl MessageLog {
         now_ms: u64,
     ) -> Result<(), MessageLogError> {
         self.connection.execute(
-            "INSERT INTO deliveries (seq, recipient_session, recipient_name, status, reason,
-                updated_ms)
-             SELECT seq, ?3, ?4, ?5, ?6, ?7 FROM messages
+            "INSERT INTO deliveries (seq, recipient_session, recipient_name, recipient_handle,
+                status, reason, updated_ms)
+             SELECT seq, ?3, ?4, ?5, ?6, ?7, ?8 FROM messages
              WHERE sender_route = ?1 AND message_id = ?2
              ON CONFLICT (seq, recipient_session) DO UPDATE SET
                  recipient_name = COALESCE(excluded.recipient_name, recipient_name),
+                 recipient_handle = COALESCE(excluded.recipient_handle, recipient_handle),
                  status = excluded.status,
                  reason = excluded.reason,
                  updated_ms = excluded.updated_ms",
@@ -390,6 +410,7 @@ impl MessageLog {
                 message_id,
                 recipient.session,
                 recipient.name,
+                recipient.handle,
                 status,
                 reason,
                 sql_ms(now_ms)?
@@ -426,7 +447,7 @@ impl MessageLog {
         let mut statement = self.connection.prepare(&format!(
             "SELECT {MESSAGE_COLUMNS} FROM (
                  SELECT topic, MAX(seq) AS seq FROM messages
-                 WHERE kind = 'topic' AND sender_session IS NOT ?1
+                 WHERE kind = 'topic' AND sender_session != ?1
                  GROUP BY topic
              ) AS newest
              JOIN messages m ON m.seq = newest.seq
@@ -480,6 +501,8 @@ impl MessageLog {
             HistoryChannel::Direct { session, peer } => {
                 (DIRECT_FILTER, vec![session.clone(), peer.clone()])
             }
+            HistoryChannel::Named(handle) => (NAMED_FILTER, vec![handle.clone()]),
+            HistoryChannel::All => (ALL_FILTER, Vec::new()),
         };
         let mut statement = self.connection.prepare(&format!(
             "SELECT {MESSAGE_COLUMNS} FROM messages m
@@ -530,12 +553,12 @@ impl MessageLog {
 
     fn conversations(&self, session: &str) -> Result<Vec<ChannelSummary>, MessageLogError> {
         let mut statement = self.connection.prepare(
-            "SELECT CASE WHEN m.sender_session IS ?1 THEN d.recipient_session
-                         ELSE COALESCE(m.sender_session, m.sender_route) END,
-                    m.sender_session IS ?1, m.seq, m.created_ms, m.sender_name,
-                    m.sender_handle, d.recipient_name
+            "SELECT CASE WHEN m.sender_session = ?1 THEN d.recipient_session
+                         ELSE m.sender_session END,
+                    m.sender_session = ?1, m.seq, m.created_ms, m.sender_name,
+                    m.sender_handle, d.recipient_name, d.recipient_handle
              FROM messages m JOIN deliveries d ON d.seq = m.seq
-             WHERE m.kind = 'direct' AND (m.sender_session IS ?1 OR d.recipient_session = ?1)
+             WHERE m.kind = 'direct' AND (m.sender_session = ?1 OR d.recipient_session = ?1)
              ORDER BY m.seq DESC",
         )?;
         let mut rows = statement.query([session])?;
@@ -544,7 +567,7 @@ impl MessageLog {
         while let Some(row) = rows.next()? {
             let peer: String = row.get(0)?;
             let (name, handle) = if row.get(1)? {
-                (row.get(6)?, None)
+                (row.get(6)?, row.get(7)?)
             } else {
                 (Some(row.get(4)?), row.get(5)?)
             };
@@ -578,7 +601,8 @@ impl MessageLog {
             return Ok(Vec::new());
         }
         let mut statement = self.connection.prepare(
-            "SELECT seq, recipient_session, recipient_name, status, reason, updated_ms
+            "SELECT seq, recipient_session, recipient_name, recipient_handle, status, reason,
+                updated_ms
              FROM deliveries WHERE seq IN (SELECT value FROM json_each(?1))
              ORDER BY seq DESC, recipient_name, recipient_session",
         )?;
@@ -587,9 +611,10 @@ impl MessageLog {
                 seq: row.get(0)?,
                 recipient_session: row.get(1)?,
                 recipient_name: row.get(2)?,
-                status: row.get(3)?,
-                reason: row.get(4)?,
-                updated_ms: row_u64(row, 5)?,
+                recipient_handle: row.get(3)?,
+                status: row.get(4)?,
+                reason: row.get(5)?,
+                updated_ms: row_u64(row, 6)?,
             })
         })?;
         Ok(deliveries.collect::<Result<_, _>>()?)
@@ -729,6 +754,7 @@ mod tests {
     const RECIPIENT_NAME: &str = "ci-watcher";
     const SENDER_NAME: &str = "CI watcher";
     const RENAMED: &str = "Release watcher";
+    const RENAMED_HANDLE: &str = "release-watcher";
     const TOPIC: &str = "ci.failures";
     const OTHER_TOPIC: &str = "deploy.done";
     const TEXT: &str = "The build failed";
@@ -756,24 +782,19 @@ mod tests {
         (root, state, log)
     }
 
-    fn message(
-        id: &str,
-        audience: MessageAudience,
-        route: &str,
-        session: Option<&str>,
-    ) -> NewMessage {
+    fn message(id: &str, audience: MessageAudience, route: &str, session: &str) -> NewMessage {
         NewMessage {
             message_id: id.into(),
             audience,
             sender: MessageSender {
                 route: route.into(),
-                session: session.map(str::to_owned),
+                session: session.into(),
                 name: SENDER_NAME.into(),
                 handle: Some(RECIPIENT_NAME.into()),
                 cwd: Some("/project".into()),
                 mode: "build".into(),
                 permission: "ask".into(),
-                external: session.is_none(),
+                external: false,
             },
             text: TEXT.into(),
             reply_to: None,
@@ -787,10 +808,11 @@ mod tests {
 
     fn record_direct(log: &mut MessageLog, id: &str, from: &str, to: &str) -> i64 {
         log.record(
-            &message(id, MessageAudience::Direct, ROUTE, Some(from)),
+            &message(id, MessageAudience::Direct, ROUTE, from),
             &[MessageRecipient {
                 session: to.into(),
                 name: None,
+                handle: None,
             }],
         )
         .unwrap()
@@ -800,6 +822,7 @@ mod tests {
         MessageRecipient {
             session: RECIPIENT.into(),
             name: None,
+            handle: None,
         }
     }
 
@@ -830,7 +853,7 @@ mod tests {
             OWNER_FILE_MODE
         );
         let seq = log
-            .record(&message("a", topic(TOPIC), ROUTE, Some(SESSION)), &[])
+            .record(&message("a", topic(TOPIC), ROUTE, SESSION), &[])
             .unwrap();
         drop(log);
         let reopened = MessageLog::open(&state, &retention(), NOW_MS).unwrap();
@@ -840,7 +863,7 @@ mod tests {
         assert_eq!(history[0].seq, seq);
         assert_eq!(
             history[0].message,
-            message("a", topic(TOPIC), ROUTE, Some(SESSION))
+            message("a", topic(TOPIC), ROUTE, SESSION)
         );
     }
 
@@ -868,13 +891,14 @@ mod tests {
     #[test]
     fn recording_again_keeps_the_first_message_and_adds_new_recipients() {
         let (_root, _state, mut log) = fixture();
-        let first = message("a", topic(TOPIC), ROUTE, Some(SESSION));
+        let first = message("a", topic(TOPIC), ROUTE, SESSION);
         let seq = log.record(&first, &[recipient()]).unwrap();
         let mut changed = first.clone();
         changed.text = "Changed".into();
         let other = MessageRecipient {
             session: OTHER_SESSION.into(),
             name: Some(RECIPIENT_NAME.into()),
+            handle: None,
         };
         assert_eq!(log.record(&changed, &[recipient(), other]).unwrap(), seq);
         let history = log
@@ -900,13 +924,14 @@ mod tests {
         let (_root, _state, mut log) = fixture();
         let seq = log
             .record(
-                &message("a", MessageAudience::Direct, ROUTE, Some(SESSION)),
+                &message("a", MessageAudience::Direct, ROUTE, SESSION),
                 &[recipient()],
             )
             .unwrap();
         let named = MessageRecipient {
             session: RECIPIENT.into(),
             name: Some(RECIPIENT_NAME.into()),
+            handle: None,
         };
         let receipt = |log: &MessageLog| {
             log.record_receipt(ROUTE, "a", RECIPIENT, QUEUED, None, NOW_MS)
@@ -940,7 +965,7 @@ mod tests {
         let (_root, _state, mut log) = fixture();
         let seq = log
             .record(
-                &message("a", MessageAudience::Direct, ROUTE, Some(SESSION)),
+                &message("a", MessageAudience::Direct, ROUTE, SESSION),
                 &[recipient()],
             )
             .unwrap();
@@ -972,16 +997,11 @@ mod tests {
     fn unseen_messages_are_the_newest_per_matching_topic_from_others() {
         let (_root, _state, mut log) = fixture();
         for (id, audience, route, session) in [
-            ("old", topic(TOPIC), ROUTE, Some(SESSION)),
-            ("new", topic(TOPIC), OTHER_ROUTE, None),
-            ("own", topic(TOPIC), ROUTE, Some(READER)),
-            ("deploy", topic(OTHER_TOPIC), ROUTE, Some(SESSION)),
-            (
-                "broadcast",
-                MessageAudience::Broadcast,
-                ROUTE,
-                Some(SESSION),
-            ),
+            ("old", topic(TOPIC), ROUTE, SESSION),
+            ("new", topic(TOPIC), OTHER_ROUTE, OTHER_SESSION),
+            ("own", topic(TOPIC), ROUTE, READER),
+            ("deploy", topic(OTHER_TOPIC), ROUTE, SESSION),
+            ("broadcast", MessageAudience::Broadcast, ROUTE, SESSION),
         ] {
             log.record(&message(id, audience, route, session), &[])
                 .unwrap();
@@ -1019,7 +1039,7 @@ mod tests {
             ("broadcast", MessageAudience::Broadcast),
         ] {
             seqs.push(
-                log.record(&message(id, audience, ROUTE, Some(SESSION)), &[])
+                log.record(&message(id, audience, ROUTE, SESSION), &[])
                     .unwrap(),
             );
         }
@@ -1071,7 +1091,7 @@ mod tests {
     #[test]
     fn history_reads_more_topics_than_sqlite_allows_parameters() {
         let (_root, _state, mut log) = fixture();
-        log.record(&message("first", topic(TOPIC), ROUTE, Some(SESSION)), &[])
+        log.record(&message("first", topic(TOPIC), ROUTE, SESSION), &[])
             .unwrap();
         let topics = (0..MANY_TOPICS)
             .map(|index| format!("unused.topic-{index}"))
@@ -1088,17 +1108,14 @@ mod tests {
     #[test]
     fn channels_list_topics_broadcasts_and_only_this_sessions_conversations() {
         let (_root, _state, mut log) = fixture();
-        log.record(
-            &message("topic", topic(TOPIC), ROUTE, Some(OTHER_SESSION)),
-            &[],
-        )
-        .unwrap();
+        log.record(&message("topic", topic(TOPIC), ROUTE, OTHER_SESSION), &[])
+            .unwrap();
         log.record(
             &message(
                 "broadcast",
                 MessageAudience::Broadcast,
                 ROUTE,
-                Some(OTHER_SESSION),
+                OTHER_SESSION,
             ),
             &[],
         )
@@ -1138,13 +1155,73 @@ mod tests {
             &MessageRecipient {
                 session: RECIPIENT.into(),
                 name: Some(RENAMED.into()),
+                handle: Some(RENAMED_HANDLE.into()),
             },
             DELIVERED,
             None,
             NOW_MS,
         )
         .unwrap();
-        assert_eq!(conversation(&log).name.as_deref(), Some(RENAMED));
+        let reported = conversation(&log);
+        assert_eq!(reported.name.as_deref(), Some(RENAMED));
+        assert_eq!(reported.handle.as_deref(), Some(RENAMED_HANDLE));
+    }
+
+    #[test]
+    fn recipient_handles_are_recorded_and_kept_until_a_report_names_another() {
+        let (_root, _state, mut log) = fixture();
+        let named = MessageRecipient {
+            handle: Some(RECIPIENT_NAME.into()),
+            ..recipient()
+        };
+        let seq = log
+            .record(&message("a", topic(TOPIC), ROUTE, SESSION), &[named])
+            .unwrap();
+        let handle = |log: &MessageLog| log.deliveries(&[seq]).unwrap()[0].recipient_handle.clone();
+        assert_eq!(handle(&log).as_deref(), Some(RECIPIENT_NAME));
+        log.transition(ROUTE, "a", &recipient(), QUEUED, None, NOW_MS)
+            .unwrap();
+        assert_eq!(handle(&log).as_deref(), Some(RECIPIENT_NAME));
+        let renamed = MessageRecipient {
+            handle: Some(RENAMED_HANDLE.into()),
+            ..recipient()
+        };
+        log.transition(ROUTE, "a", &renamed, DELIVERED, None, NOW_MS)
+            .unwrap();
+        assert_eq!(handle(&log).as_deref(), Some(RENAMED_HANDLE));
+    }
+
+    #[test_case(HistoryChannel::Named(RECIPIENT_NAME.into()), &["to_name", "by_name"]; "named")]
+    #[test_case(HistoryChannel::All, &["to_name", "unrelated", "topic", "by_name"]; "all")]
+    fn named_reads_find_a_names_direct_messages_and_all_reads_everything(
+        channel: HistoryChannel,
+        expected: &[&str],
+    ) {
+        let (_root, _state, mut log) = fixture();
+        let unnamed = |id, audience| {
+            let mut stored = message(id, audience, ROUTE, OTHER_SESSION);
+            stored.sender.handle = None;
+            stored
+        };
+        log.record(
+            &message("by_name", MessageAudience::Direct, ROUTE, SESSION),
+            &[recipient()],
+        )
+        .unwrap();
+        log.record(&message("topic", topic(TOPIC), ROUTE, SESSION), &[])
+            .unwrap();
+        log.record(
+            &unnamed("unrelated", MessageAudience::Direct),
+            &[recipient()],
+        )
+        .unwrap();
+        let named = MessageRecipient {
+            handle: Some(RECIPIENT_NAME.into()),
+            ..recipient()
+        };
+        log.record(&unnamed("to_name", MessageAudience::Direct), &[named])
+            .unwrap();
+        assert_eq!(ids(&log.history(&channel, None, LIMIT).unwrap()), expected);
     }
 
     #[test]
@@ -1174,13 +1251,11 @@ mod tests {
         let recipients = [OTHER_SESSION, RECIPIENT].map(|session| MessageRecipient {
             session: session.into(),
             name: None,
+            handle: None,
         });
         let mut record = |id| {
-            log.record(
-                &message(id, topic(TOPIC), ROUTE, Some(SESSION)),
-                &recipients,
-            )
-            .unwrap()
+            log.record(&message(id, topic(TOPIC), ROUTE, SESSION), &recipients)
+                .unwrap()
         };
         let first = record("first");
         let second = record("second");
@@ -1208,13 +1283,13 @@ mod tests {
         let mut other = MessageLog::open(&state, &retention(), NOW_MS).unwrap();
         let initial = log.version().unwrap();
         assert_eq!(log.version().unwrap(), initial);
-        log.record(&message("own", topic(TOPIC), ROUTE, Some(SESSION)), &[])
+        log.record(&message("own", topic(TOPIC), ROUTE, SESSION), &[])
             .unwrap();
         let own = log.version().unwrap();
         assert_ne!(own, initial);
         other
             .record(
-                &message("other", topic(TOPIC), OTHER_ROUTE, Some(OTHER_SESSION)),
+                &message("other", topic(TOPIC), OTHER_ROUTE, OTHER_SESSION),
                 &[],
             )
             .unwrap();
@@ -1231,7 +1306,7 @@ mod tests {
             ("old-direct", MessageAudience::Direct, old),
             ("recent", MessageAudience::Broadcast, NOW_MS),
         ] {
-            let mut stored = message(id, audience, ROUTE, Some(SESSION));
+            let mut stored = message(id, audience, ROUTE, SESSION);
             stored.created_ms = created_ms;
             log.record(&stored, &[recipient()]).unwrap();
         }
@@ -1266,13 +1341,10 @@ mod tests {
         let (_root, state, mut first) = fixture();
         let mut second = MessageLog::open(&state, &retention(), NOW_MS).unwrap();
         first
-            .record(&message("a", topic(TOPIC), ROUTE, Some(SESSION)), &[])
+            .record(&message("a", topic(TOPIC), ROUTE, SESSION), &[])
             .unwrap();
         second
-            .record(
-                &message("b", topic(TOPIC), OTHER_ROUTE, Some(OTHER_SESSION)),
-                &[],
-            )
+            .record(&message("b", topic(TOPIC), OTHER_ROUTE, OTHER_SESSION), &[])
             .unwrap();
         let ci = HistoryChannel::Topics(vec![TOPIC.into()]);
         assert_eq!(ids(&first.history(&ci, None, LIMIT).unwrap()), ["b", "a"]);

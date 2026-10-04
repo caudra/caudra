@@ -2677,6 +2677,7 @@ mod tests {
             sender_handle: None,
             reply_target: REPLY_TARGET.into(),
             reply_to: None,
+            external: false,
         };
         let mut live = chat();
         live.show_reminders = show_reminders;
@@ -2753,6 +2754,7 @@ mod tests {
             sender_handle: handle.map(str::to_owned),
             reply_target: PEER_TARGET.into(),
             reply_to: None,
+            external: false,
         };
         let shown = DisplayMessage::peer(REPLY_TEXT, origin).text;
         assert_eq!(shown.contains(NAME_LINE), handle.is_some());
@@ -2774,11 +2776,39 @@ mod tests {
             sender_handle: None,
             reply_target: PEER_TARGET.into(),
             reply_to: None,
+            external: false,
         };
         let shown = DisplayMessage::peer(REPLY_TEXT, origin).text;
         assert_eq!(shown.contains(AUDIENCE_LINE), line.is_some());
         if let Some(line) = line {
             assert!(shown.contains(line), "{shown}");
+        }
+    }
+
+    #[test]
+    fn script_messages_name_the_script_without_a_reply_target() {
+        const LABEL: &str = "nightly-ci";
+        const ROUTE_LINES: [&str; 2] = ["Sender session:", "Reply target:"];
+        let origin = PeerMessageOrigin {
+            message_id: PEER_MESSAGE.into(),
+            audience: PeerAudience::Topic {
+                topic: PEER_TOPIC.into(),
+            },
+            sender_session_id: String::new(),
+            sender_name: LABEL.into(),
+            sender_handle: None,
+            reply_target: String::new(),
+            reply_to: None,
+            external: true,
+        };
+        let shown = DisplayMessage::peer(REPLY_TEXT, origin).text;
+        assert!(
+            shown.starts_with(&format!("Script: {LABEL:?}\n")),
+            "{shown}"
+        );
+        assert!(shown.contains(PEER_MESSAGE), "{shown}");
+        for line in ROUTE_LINES {
+            assert!(!shown.contains(line), "{shown}");
         }
     }
 

@@ -26,18 +26,20 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::AgentMode;
+pub use history::history_retention;
 use history::{HistoryWriter, MessageHistory};
 use topics::{parse_pattern, parse_topic, pattern_matches, validate_patterns};
 
 // Nothing opens a history where peer messaging is unavailable.
 #[cfg_attr(not(unix), allow(dead_code))]
 mod history;
+pub mod script;
 pub mod topics;
 #[cfg(unix)]
 mod unix;
 
 const PROTOCOL_VERSION: u32 = 1;
-const MAX_BODY_BYTES: usize = 32 * 1024;
+pub const MAX_BODY_BYTES: usize = 32 * 1024;
 const MAX_FRAME_BYTES: usize = 64 * 1024;
 const MAX_PENDING: usize = 50;
 const MAX_HELD: usize = 50;
@@ -68,6 +70,7 @@ const REFUSED_POLICY: &str = "Inbound messaging is refused by receiver policy";
 const HELD_POLICY: &str = "Receiver policy requires local approval";
 const HELD_COHORT: &str = "Automatic delivery requires Ask permissions, matching Plan/Build mode, and the same canonical workspace";
 const HELD_BLOCKED: &str = "Receiver is blocked; local input must resume it";
+const HELD_EXTERNAL: &str = "Automatic delivery admits only sessions; a script's message needs approval or the inbound policy accept";
 const RATE_EXCEEDED: &str = "Recipient peer message rate limit reached";
 const DUPLICATE: &str = "The same text from this sender arrived within the last minute";
 const NOT_SUBSCRIBED: &str = "The recipient is not subscribed to this topic or to broadcasts";
@@ -225,6 +228,9 @@ pub struct PublishReceipt {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RecipientReceipt {
+    /// The address this sender reaches the recipient at; empty for a
+    /// script, which can only name it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub target: String,
     pub title: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -251,6 +257,9 @@ pub struct StoredPeerMessage {
     pub sender_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_handle: Option<String>,
+    /// Sent by a script outside every session.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub external: bool,
     pub sent_ms: u64,
     pub text: String,
 }
@@ -278,6 +287,8 @@ pub struct ChannelMessage {
     pub audience: PeerAudience,
     pub sender_name: String,
     pub sender_handle: Option<String>,
+    /// Sent by a script outside every session.
+    pub external: bool,
     /// This session sent it.
     pub own: bool,
     pub sent_ms: u64,
@@ -288,6 +299,8 @@ pub struct ChannelMessage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecipientStatus {
     pub name: Option<String>,
+    /// The messaging name the recipient last reported under.
+    pub handle: Option<String>,
     /// This session is the recipient.
     pub own: bool,
     pub status: String,
@@ -317,7 +330,10 @@ pub struct HeldMessage {
 pub struct HeldMessageSummary {
     pub message_id: String,
     pub sender_name: String,
+    /// Empty for a script, which nothing can reply to.
     pub reply_target: String,
+    /// Sent by a script outside every session; its mode means nothing.
+    pub external: bool,
     pub workspace: Option<PathBuf>,
     pub mode: String,
     pub audience: PeerAudience,
@@ -422,7 +438,9 @@ struct SessionState {
 
 struct Arrival {
     at: Instant,
-    sender: String,
+    /// The sending session, which outlives its routes, so a restart or a
+    /// new script run resets neither its rate nor its duplicates.
+    session: CaudraId,
     text: [u8; 32],
 }
 
@@ -476,6 +494,7 @@ impl InboxItem {
             message_id: self.origin.message_id.clone(),
             sender_name: self.delivery.sender.name.clone(),
             reply_target: self.origin.reply_target.clone(),
+            external: self.origin.external,
             workspace: self.delivery.sender.canonical_cwd.clone(),
             mode: self.delivery.sender.mode.as_str().into(),
             audience: self.delivery.audience.clone(),
@@ -585,16 +604,24 @@ struct Publication {
 }
 
 impl Publication {
-    fn delivery(&self, index: usize, text: &str) -> Delivery {
+    /// The delivery every recipient gets, still without a target.
+    fn template(&self, text: &str) -> Delivery {
         Delivery {
             message_id: self.issued.message_id.clone(),
             issued_ms: self.issued.issued_ms,
-            target: self.routes[index].clone(),
+            target: String::new(),
             sender: self.issued.sender.clone(),
             text: text.to_owned(),
             reply_to: None,
             reply_sender: None,
             audience: self.receipt.audience.clone(),
+        }
+    }
+
+    fn delivery(&self, index: usize, text: &str) -> Delivery {
+        Delivery {
+            target: self.routes[index].clone(),
+            ..self.template(text)
         }
     }
 
@@ -613,9 +640,7 @@ impl Publication {
             epoch,
             receipt: self.receipt.clone(),
             deliveries: self.unresolved(text),
-            entry: self
-                .issued
-                .history_entry(&self.receipt.audience, text, None),
+            entry: self.template(text).history_entry(),
             recipients: self
                 .routes
                 .iter()
@@ -624,6 +649,7 @@ impl Publication {
                     Some(MessageRecipient {
                         session: route_session(route)?,
                         name: Some(recipient.title.clone()),
+                        handle: recipient.handle.clone(),
                     })
                 })
                 .collect(),
@@ -739,6 +765,10 @@ struct Sender {
     canonical_cwd: Option<PathBuf>,
     mode: WireMode,
     permission_mode: PermissionMode,
+    /// A script outside every session. Its route reaches nothing, so no
+    /// reply can follow; older peers refuse the unknown field.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    external: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -763,7 +793,7 @@ impl Sender {
     fn history_entry(&self) -> MessageSender {
         MessageSender {
             route: self.route.target(),
-            session: Some(self.route.session.to_string()),
+            session: self.route.session.to_string(),
             name: self.name.clone(),
             handle: self.handle.clone(),
             cwd: self
@@ -772,16 +802,11 @@ impl Sender {
                 .map(|path| path.to_string_lossy().into_owned()),
             mode: self.mode.as_str().into(),
             permission: permission_name(&self.permission_mode).into(),
-            external: false,
+            external: self.external,
         }
     }
 
-    /// The session a stored message came from, or none for a sender outside
-    /// every session.
     fn from_history(sender: &MessageSender) -> Option<Self> {
-        if sender.external {
-            return None;
-        }
         Some(Self {
             route: Route::parse(&sender.route).ok()?,
             name: sender.name.clone(),
@@ -789,33 +814,27 @@ impl Sender {
             canonical_cwd: sender.cwd.as_ref().map(PathBuf::from),
             mode: WireMode::parse(&sender.mode)?,
             permission_mode: parse_permission(&sender.permission)?,
+            external: sender.external,
         })
     }
 }
 
-impl Issued {
-    fn history_entry(
-        &self,
-        audience: &PeerAudience,
-        text: &str,
-        reply_to: Option<&str>,
-    ) -> NewMessage {
+impl Delivery {
+    fn history_entry(&self) -> NewMessage {
         NewMessage {
             message_id: self.message_id.clone(),
-            audience: match audience {
+            audience: match &self.audience {
                 PeerAudience::Direct => MessageAudience::Direct,
                 PeerAudience::Topic { topic } => MessageAudience::Topic(topic.clone()),
                 PeerAudience::Broadcast => MessageAudience::Broadcast,
             },
             sender: self.sender.history_entry(),
-            text: text.to_owned(),
-            reply_to: reply_to.map(str::to_owned),
+            text: self.text.clone(),
+            reply_to: self.reply_to.clone(),
             created_ms: self.issued_ms,
         }
     }
-}
 
-impl Delivery {
     fn dedup_key(&self) -> String {
         format!("{}:{}", self.sender.route.target(), self.message_id)
     }
@@ -869,6 +888,10 @@ impl Delivery {
                 .topic()
                 .is_none_or(|topic| parse_topic(topic).is_ok())
             && (self.audience.is_direct() || self.reply_to.is_none())
+            && (!self.sender.external
+                || (self.reply_to.is_none()
+                    && self.reply_sender.is_none()
+                    && self.sender.handle.is_none()))
     }
 }
 
@@ -942,6 +965,11 @@ pub fn parse_handle(value: &str) -> Result<String, String> {
     } else {
         Err(INVALID_HANDLE.into())
     }
+}
+
+/// Validates a messaging name written with or without its `@`.
+pub fn parse_handle_address(value: &str) -> Result<String, String> {
+    parse_handle(value.strip_prefix(HANDLE_PREFIX).unwrap_or(value))
 }
 
 fn handle_in_use(handle: &str) -> String {
@@ -1094,6 +1122,17 @@ fn digest(content: &impl Serialize) -> Result<[u8; 32], String> {
     Ok(Sha256::digest(serde_json::to_vec(content).map_err(|error| error.to_string())?).into())
 }
 
+fn check_publication(audience: &PeerAudience, text: &str) -> Result<(), String> {
+    match audience {
+        PeerAudience::Direct => return Err(DIRECT_PUBLICATION.into()),
+        PeerAudience::Topic { topic } => {
+            parse_topic(topic)?;
+        }
+        PeerAudience::Broadcast => {}
+    }
+    check_text(text)
+}
+
 /// Whether a session with these subscriptions consents to be addressed.
 fn subscribed(audience: &PeerAudience, topics: &[String], broadcasts: bool) -> bool {
     match audience {
@@ -1103,6 +1142,32 @@ fn subscribed(audience: &PeerAudience, topics: &[String], broadcasts: bool) -> b
         }
         PeerAudience::Broadcast => broadcasts,
     }
+}
+
+/// The sessions `audience` reaches: the first `max_fanout`, and how many
+/// more matched.
+fn audience_members(
+    peers: Vec<PeerInfo>,
+    audience: &PeerAudience,
+    max_fanout: usize,
+) -> (Vec<PeerInfo>, usize) {
+    let mut matching = peers
+        .into_iter()
+        .filter(|peer| subscribed(audience, &peer.topics, peer.broadcasts));
+    let selected = matching.by_ref().take(max_fanout).collect();
+    (selected, matching.count())
+}
+
+/// The one live session holding the messaging name `handle`.
+fn holder(peers: Vec<PeerInfo>, handle: &str) -> Result<PeerInfo, String> {
+    let mut holders = peers
+        .into_iter()
+        .filter(|peer| peer.handle.as_deref() == Some(handle));
+    let holder = holders.next().ok_or(UNKNOWN_HANDLE)?;
+    if holders.next().is_some() {
+        return Err(AMBIGUOUS_HANDLE.into());
+    }
+    Ok(holder)
 }
 
 /// The session `route` addresses, which keys its rows in the history.
@@ -1184,7 +1249,8 @@ impl PeerHost {
         bytes: Arc<AtomicUsize>,
     ) -> Result<Self, String> {
         let incarnation = token()?;
-        let (endpoint, listener) = unix::Endpoint::bind(directory, &incarnation)?;
+        let (endpoint, listener) =
+            unix::Endpoint::bind(unix::Directory::open(directory)?, &incarnation)?;
         let host = Arc::new(HostInner {
             incarnation,
             sessions: Mutex::default(),
@@ -1532,16 +1598,7 @@ impl PeerSession {
     /// the live registration that currently holds one.
     async fn resolve_handle(&self, handle: &str) -> Result<String, String> {
         let handle = parse_handle(handle)?;
-        let mut holders = self
-            .list()
-            .await?
-            .into_iter()
-            .filter(|peer| peer.handle.as_ref() == Some(&handle));
-        let holder = holders.next().ok_or(UNKNOWN_HANDLE)?;
-        if holders.next().is_some() {
-            return Err(AMBIGUOUS_HANDLE.into());
-        }
-        Ok(holder.target)
+        Ok(holder(self.list().await?, &handle)?.target)
     }
 
     pub async fn send(
@@ -1615,26 +1672,24 @@ impl PeerSession {
                 );
                 issued
             };
-            let entry = issued.history_entry(&PeerAudience::Direct, text, reply_to);
-            (
-                Delivery {
-                    message_id: issued.message_id,
-                    issued_ms: issued.issued_ms,
-                    target: target.to_owned(),
-                    sender: issued.sender,
-                    text: text.to_owned(),
-                    reply_to: reply_to.map(str::to_owned),
-                    reply_sender: reply_sender.map(str::to_owned),
-                    audience: PeerAudience::Direct,
-                },
-                issued.epoch,
-                entry,
-            )
+            let delivery = Delivery {
+                message_id: issued.message_id,
+                issued_ms: issued.issued_ms,
+                target: target.to_owned(),
+                sender: issued.sender,
+                text: text.to_owned(),
+                reply_to: reply_to.map(str::to_owned),
+                reply_sender: reply_sender.map(str::to_owned),
+                audience: PeerAudience::Direct,
+            };
+            let entry = delivery.history_entry();
+            (delivery, issued.epoch, entry)
         };
         let history = &self.0.host.history;
         let recipients = vec![MessageRecipient {
             session: recipient.clone(),
             name: None,
+            handle: None,
         }];
         history
             .record(entry, recipients)
@@ -1664,14 +1719,7 @@ impl PeerSession {
         text: &str,
         request_id: &str,
     ) -> Result<PublishReceipt, String> {
-        match &audience {
-            PeerAudience::Direct => return Err(DIRECT_PUBLICATION.into()),
-            PeerAudience::Topic { topic } => {
-                parse_topic(topic)?;
-            }
-            PeerAudience::Broadcast => {}
-        }
-        check_text(text)?;
+        check_publication(&audience, text)?;
         if request_id.is_empty() || request_id.len() > MAX_CORRELATION_BYTES {
             return Err(INVALID_CORRELATION.into());
         }
@@ -1765,11 +1813,7 @@ impl PeerSession {
         }) {
             return Err(RETRY_FULL.into());
         }
-        let mut matching = peers
-            .into_iter()
-            .filter(|peer| subscribed(&audience, &peer.topics, peer.broadcasts));
-        let selected: Vec<_> = matching.by_ref().take(state.max_fanout).collect();
-        let skipped = matching.count();
+        let (selected, skipped) = audience_members(peers, &audience, state.max_fanout);
         let message_id = state.message_names.fresh(None, message_name)?;
         let mut routes = Vec::with_capacity(selected.len());
         let mut recipients = Vec::with_capacity(selected.len());
@@ -1901,6 +1945,7 @@ impl PeerSession {
                     },
                     sender_name: stored.message.sender.name,
                     sender_handle: stored.message.sender.handle,
+                    external: stored.message.sender.external,
                     sent_ms: stored.message.created_ms,
                     text: stored.message.text,
                 })
@@ -1960,6 +2005,7 @@ impl PeerSession {
                 .push(RecipientStatus {
                     own: delivery.recipient_session == session,
                     name: delivery.recipient_name,
+                    handle: delivery.recipient_handle,
                     status: delivery.status,
                     reason: delivery.reason,
                 });
@@ -1971,9 +2017,10 @@ impl PeerSession {
                 ChannelMessage {
                     seq: stored.seq,
                     audience: peer_audience(message.audience),
-                    own: message.sender.session.as_deref() == Some(session.as_str()),
+                    own: message.sender.session == session,
                     sender_name: message.sender.name,
                     sender_handle: message.sender.handle,
+                    external: message.sender.external,
                     sent_ms: message.created_ms,
                     text: message.text,
                     recipients: recipients.remove(&stored.seq).unwrap_or_default(),
@@ -2320,6 +2367,7 @@ impl SessionState {
             canonical_cwd: self.canonical_cwd.clone(),
             mode: WireMode::from(&self.descriptor.mode),
             permission_mode: self.descriptor.permission_mode.clone(),
+            external: false,
         }
     }
 
@@ -2356,6 +2404,7 @@ impl SessionState {
         match self.descriptor.inbound {
             InboundPolicy::Accept => None,
             InboundPolicy::Hold | InboundPolicy::Refuse => Some(HELD_POLICY),
+            InboundPolicy::Auto if delivery.sender.external => Some(HELD_EXTERNAL),
             InboundPolicy::Auto if self.same_cohort(&delivery.sender) => None,
             InboundPolicy::Auto => Some(HELD_COHORT),
         }
@@ -2373,12 +2422,15 @@ impl SessionState {
     }
 
     /// Whether `auto` admits `sender` without review: both sessions share a
-    /// canonical workspace and Plan or Build mode under Ask permissions.
+    /// canonical workspace and Plan or Build mode under Ask permissions. A
+    /// script runs outside every session, so it never qualifies.
     fn same_cohort(&self, sender: &Sender) -> bool {
-        matches!(
-            (&sender.mode, WireMode::from(&self.descriptor.mode)),
-            (WireMode::Build, WireMode::Build) | (WireMode::Plan, WireMode::Plan)
-        ) && self.canonical_cwd.is_some()
+        !sender.external
+            && matches!(
+                (&sender.mode, WireMode::from(&self.descriptor.mode)),
+                (WireMode::Build, WireMode::Build) | (WireMode::Plan, WireMode::Plan)
+            )
+            && self.canonical_cwd.is_some()
             && self.canonical_cwd == sender.canonical_cwd
             && self.descriptor.permission_mode == PermissionMode::Ask
             && sender.permission_mode == PermissionMode::Ask
@@ -2424,6 +2476,7 @@ impl SessionState {
             MessageRecipient {
                 session: self.descriptor.session_id.to_string(),
                 name: Some(self.descriptor.name.clone()),
+                handle: self.claimed_handle(),
             },
             status,
             reason.map(str::to_owned),
@@ -2501,18 +2554,22 @@ impl SessionInner {
         };
         let preferred =
             valid_name(&delivery.message_id, MESSAGE_WORDS).then_some(delivery.message_id.as_str());
-        let alias = state.peer_names.name(sender.as_str(), None, peer_name)?;
+        let alias = (!delivery.sender.external)
+            .then(|| state.peer_names.name(sender.as_str(), None, peer_name))
+            .transpose()?;
         let name = state
             .message_names
             .name(&identity, preferred, message_name)?;
+        let reply_target = alias.as_ref().map_or("", Name::as_str).to_owned();
         let origin = PeerMessageOrigin {
             message_id: name.as_str().to_owned(),
             audience: delivery.audience.clone(),
-            sender_session_id: alias.as_str().to_owned(),
+            sender_session_id: reply_target.clone(),
             sender_name: delivery.sender.name.clone(),
             sender_handle: delivery.sender.handle.clone(),
-            reply_target: alias.as_str().to_owned(),
+            reply_target,
             reply_to,
+            external: delivery.sender.external,
         };
         let bytes = encoded
             + serde_json::to_vec(&Message::peer_observation(
@@ -2534,7 +2591,7 @@ impl SessionInner {
         {
             return Ok(None);
         }
-        if let Name::Fresh(alias) = alias {
+        if let Some(Name::Fresh(alias)) = alias {
             state.bind_peer(alias, sender);
         }
         if let Name::Fresh(name) = name {
@@ -2635,12 +2692,16 @@ impl SessionInner {
                 Some(RETRY_FULL),
             ));
         }
-        let sender = delivery.sender.route.target();
+        let session = delivery.sender.route.session;
         let reply_to = delivery
             .reply_to
             .as_deref()
             .map(|message_id| {
-                state.reply_name(&sender, message_id, delivery.reply_sender.as_deref())
+                state.reply_name(
+                    &delivery.sender.route.target(),
+                    message_id,
+                    delivery.reply_sender.as_deref(),
+                )
             })
             .transpose()?;
         while state
@@ -2670,14 +2731,14 @@ impl SessionInner {
         } else if state
             .arrivals
             .iter()
-            .any(|arrival| arrival.sender == sender && arrival.text == text)
+            .any(|arrival| arrival.session == session && arrival.text == text)
         {
             SendReceipt::new("refused", &delivery.message_id, Some(DUPLICATE))
         } else if state.arrivals.len() >= state.inbound_rate
             || state
                 .arrivals
                 .iter()
-                .filter(|arrival| arrival.sender == sender)
+                .filter(|arrival| arrival.session == session)
                 .count()
                 >= state.sender_rate
         {
@@ -2689,7 +2750,7 @@ impl SessionInner {
                 Some(receipt) => {
                     state.arrivals.push_back(Arrival {
                         at: now,
-                        sender,
+                        session,
                         text,
                     });
                     receipt
@@ -2795,10 +2856,14 @@ impl HostInner {
         }
         #[cfg(unix)]
         {
-            Ok(self.endpoint.lock_handle(&handle)?.map(|lock| HandleClaim {
-                handle,
-                _lock: lock,
-            }))
+            Ok(self
+                .endpoint
+                .directory()
+                .lock_handle(&handle)?
+                .map(|lock| HandleClaim {
+                    handle,
+                    _lock: lock,
+                }))
         }
         #[cfg(not(unix))]
         Err(UNAVAILABLE.into())
@@ -2807,7 +2872,7 @@ impl HostInner {
     async fn discover(&self) -> Result<Vec<PeerInfo>, String> {
         #[cfg(unix)]
         {
-            unix::discover(&self.endpoint).await
+            unix::discover(self.endpoint.directory()).await
         }
         #[cfg(not(unix))]
         Err(UNAVAILABLE.into())
@@ -2965,11 +3030,11 @@ mod tests {
             .unwrap()
     }
 
-    fn host(directory: &Path) -> PeerHost {
+    pub(super) fn host(directory: &Path) -> PeerHost {
         PeerHost::start_in(directory.to_owned(), Arc::new(AtomicUsize::new(0))).unwrap()
     }
 
-    fn descriptor(cwd: &Path, inbound: InboundPolicy) -> PeerDescriptor {
+    pub(super) fn descriptor(cwd: &Path, inbound: InboundPolicy) -> PeerDescriptor {
         PeerDescriptor {
             session_id: CaudraId::generate(),
             name: "peer".into(),
@@ -3022,6 +3087,7 @@ mod tests {
                 canonical_cwd: session.descriptor().cwd.canonicalize().ok(),
                 mode: WireMode::Build,
                 permission_mode: PermissionMode::Ask,
+                external: false,
             },
         }
     }
@@ -3347,6 +3413,7 @@ mod tests {
         let mut first = delivery(&session);
         first.message_id = MESSAGE_NAME.into();
         let mut second = first.clone();
+        second.text = OTHER_TEXT.into();
         if same_host {
             second.sender.route.generation = token().unwrap();
         } else {
@@ -3859,6 +3926,11 @@ mod tests {
         let duplicate = session.0.receive(repeated.clone(), now, wall_ms()).unwrap();
         assert_eq!(duplicate.status, REFUSED);
         assert_eq!(duplicate.reason.as_deref(), Some(DUPLICATE));
+        let mut restarted = repeated.clone();
+        restarted.message_id = token().unwrap();
+        restarted.sender.route.generation = token().unwrap();
+        let restarted = session.0.receive(restarted, now, wall_ms()).unwrap();
+        assert_eq!(restarted.reason.as_deref(), Some(DUPLICATE));
         let mut other_sender = delivery(&session);
         other_sender.text = first.text.clone();
         let other = session.0.receive(other_sender, now, wall_ms()).unwrap();
@@ -4791,11 +4863,11 @@ mod tests {
         let mut first = delivery(&session);
         first.message_id = MESSAGE_NAME.into();
         let mut second = first.clone();
+        second.text = OTHER_TEXT.into();
         if colliding {
             second.sender.route.generation = token().unwrap();
         } else {
             second.message_id = OTHER_MESSAGE_NAME.into();
-            second.text = OTHER_TEXT.into();
         }
         session.0.receive(first, Instant::now(), wall_ms()).unwrap();
         let receipt = session
@@ -5747,6 +5819,7 @@ mod tests {
                 published.recipients,
                 [RecipientStatus {
                     name: Some(watcher.descriptor().name),
+                    handle: None,
                     own: false,
                     status: QUEUED.into(),
                     reason: None,

@@ -41,6 +41,38 @@ caudra decisions purge --yes
 
 Labels are partial evidence, not a complete evaluation dataset. Tool-search actual-use labels and shell-effect observed-filesystem labels are not collected. Effect fields are a partial action record. A value of `none` does not prove that no advice or routing was applied. Redaction is best effort. Review exported states and question text before sharing them. See [decision engine advice](/docs/permissions/#decision-engine-advice) and [configuration](/docs/configuration/#decisions).
 
+## caudra message
+
+Sends and reads [cross-session messages](/docs/sessions/#messages-from-scripts) from scripts. It needs `experimental.cross_session_messaging`, runs on Linux and macOS, and does not start an agent:
+
+```bash
+caudra message publish --topic ci.failures "Build 1042 failed"
+caudra message broadcast --from release "v2.3.0 is tagged"
+caudra message send --to @ci-watcher < report.txt
+caudra message log --topic 'ci.*' --limit 50 --json
+```
+
+`publish` sends to the live sessions subscribed to one concrete topic. `broadcast` sends to the live sessions that opted in to broadcasts. Both reach at most `max_fanout` sessions, and the receipt counts the rest as skipped. `send` sends to the live session that holds a [messaging name](/docs/sessions/#messaging-names), given with or without its `@`. The text is the last argument. Without it, the command reads stdin, which must not be a terminal. The text must be UTF-8 within 32 KiB, and one trailing line ending on stdin is dropped.
+
+| Flag | Description |
+|------|-------------|
+| `--from <LABEL>` | The sender name recipients see, `script` by default. Rate limits and duplicate checks count each label as one sender |
+| `--json` | Print the receipt as one JSON object |
+
+Each send prints a receipt with one line per recipient and its [delivery status](/docs/sessions/#delivery-receipts-and-lifetime). `publish` and `broadcast` exit 0 once the message is recorded, even when no live session receives it. A recorded topic message still serves catch-up. `send` exits 1 unless the recipient queued or held the message. Usage errors exit 2. Other failures exit 1, such as a disabled experiment, an unknown name, or a history that cannot record the message.
+
+`log` prints recorded messages oldest first, the newest 20 by default:
+
+| Flag | Description |
+|------|-------------|
+| `--topic <PATTERN>` | Only topic messages that a subscription pattern matches |
+| `--broadcast` | Only broadcasts |
+| `--with <NAME>` | Only direct messages to or from the session that held this messaging name |
+| `-n`, `--limit <COUNT>` | How many of the newest messages to print, from 1 to 1000 |
+| `--json` | One JSON object per message with `seq`, `message_id`, `sent_ms`, `kind`, `topic`, `sender`, `text`, `reply_to`, and `recipients` |
+
+The filters exclude each other. Without one, `log` prints messages of every kind, direct messages included. JSON output leaves out session ids. `caudra message` uses this machine's persistent storage, so it rejects `--ephemeral` and remote Workcell selectors.
+
 ## Flags by run path
 
 | Flag | TUI | `--print` | SDK (`stream-json`) |

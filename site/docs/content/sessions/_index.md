@@ -31,7 +31,7 @@ behind, so the picker and `caudra --continue` skip it.
 
 ## Cross-session messaging
 
-The experimental messaging MVP lets live main sessions on the same Unix host exchange text, including sessions in separate terminals or TUI tabs. It supports the TUI and an active one-shot `--print` run. Subagents, the SDK, ACP, remote Workcell sessions, and managed sandbox sessions are outside this scope.
+The experimental messaging MVP lets live main sessions on the same Unix host exchange text, including sessions in separate terminals or TUI tabs. It supports the TUI and an active one-shot `--print` run, and scripts can send with [`caudra message`](#messages-from-scripts). Subagents, the SDK, ACP, remote Workcell sessions, and managed sandbox sessions are outside this scope.
 
 Messaging is off by default. Enable it in the **global** `caudra.toml` and restart each participating Caudra process:
 
@@ -53,7 +53,7 @@ Sessions shows a discovery snapshot of eligible live peers. Select a row to insp
 
 Press `/` to filter the current list, then Enter to leave filter editing. The Sessions filter also matches messaging names and subscriptions. Enter on a held message opens its review. Read the literal message body, then use `y` to approve once or `n` to review rejection. Rejecting removes the message from the live inbox. Browsing, filtering, and refreshing grant no approval. Tab switches list/detail focus. Esc backs out before closing. Narrow terminals show one pane at a time.
 
-The Held messages view contains messages waiting for this session's review or for the session to resume. Each row names the audience the message was sent to. Messages browses the [message history](#browse-the-message-history). Received messages and send receipts also stay in the transcript. Use the agent to send messages.
+The Held messages view contains messages waiting for this session's review or for the session to resume. Each row names the audience the message was sent to. A message from a script shows its label marked as a script, and it has no reply target to copy. Messages browses the [message history](#browse-the-message-history). Received messages and send receipts also stay in the transcript. Use the agent to send messages.
 
 | Command | Action |
 |---|---|
@@ -120,6 +120,24 @@ The publisher discovers live sessions once and keeps the matching ones as the fi
 
 The recipient sees the audience in the message provenance. A reply goes to the publisher alone through `send_message`, as a direct message between the two sessions. Published messages pass the same inbound policy, permission review, and rate limits as direct messages.
 
+### Messages from scripts
+
+`caudra message` sends and reads messages from a shell, so a CI job or a git hook can tell your agents about an event:
+
+```sh
+caudra message publish --topic ci.failures --from nightly-ci "Build 1042 failed on linux"
+make test 2>&1 | tail -n 50 | caudra message send --to ci-watcher
+caudra message log --topic 'ci.**' -n 5
+```
+
+The command needs the same global experiment switch and runs on Linux and macOS. It reaches the live sessions of your user on this machine and opens no endpoint of its own. A script can send, but nothing can reply to it. [`caudra message`](/docs/cli/#caudra-message) lists every option and exit code.
+
+The `--from` label names the sender, `script` by default. Recipients see the message as coming from a script rather than a session, and the label tells scripts apart. A script has no messaging name, mode, or reply target. [Rate limits and duplicate checks](#rate-limits-and-cost) count each label as one sender across runs.
+
+The [message history](#message-history) records script messages like any other. A topic message that no live session receives still serves catch-up, so a session that subscribes later catches up on the newest one.
+
+The `auto` inbound policy never delivers a script message automatically, because its trust check compares two sessions and a script is not one. It holds the message for review, and `read_topic` counts script messages as withheld. A session that should wake on script events needs `accept`, set with `/messages inbound accept` or in `[agent.messaging]`. See [inbound policy and trust](/docs/permissions/#cross-session-messages).
+
 ### Delivery receipts and lifetime
 
 | Status | Meaning |
@@ -137,7 +155,7 @@ Each body is limited to 32 KiB of UTF-8. The inbox admits at most 50 messages ac
 
 ### Message history
 
-Every message a session sends is recorded in a message history that all sessions of your user share. This covers direct messages, topic messages, and broadcasts. An entry keeps the sender, the audience, the text, and each recipient's outcome as it moves from queued or held to delivered, rejected, or dropped. The history is the SQLite file `messages.db` in the [state directory](/docs/configuration/#directory-layout), and only your user can read it. Recording happens before sending. When the history cannot record a message, the send fails and no recipient gets it.
+Every message a session or script sends is recorded in a message history that all sessions of your user share. This covers direct messages, topic messages, and broadcasts. An entry keeps the sender, the audience, the text, and each recipient's outcome as it moves from queued or held to delivered, rejected, or dropped. The history is the SQLite file `messages.db` in the [state directory](/docs/configuration/#directory-layout), and only your user can read it. Recording happens before sending. When the history cannot record a message, the send fails and no recipient gets it.
 
 The history is a record rather than an inbox, so a message still needs a live recipient when it is sent. Sessions use the history in two ways.
 
@@ -165,7 +183,7 @@ A project file that sets either key fails to load.
 
 The Messages view of the peer manager lists every stored topic, the broadcasts, and this session's direct conversations, most recently active first. Each row shows its message count and latest activity, and marks a topic this session receives by exact subscription or through a wildcard pattern. `/topics` opens the view limited to topics, and `3` shows every channel again.
 
-Enter reads the selected channel, with the newest message at the bottom. Each message shows its sender, time, and audience, with every recipient's outcome below it. While the reader shows the newest message, it follows new ones as they arrive. `o` loads older messages above the ones on screen. `Ctrl+R` reloads the list and the open channel.
+Enter reads the selected channel, with the newest message at the bottom. Each message shows its sender, time, and audience, with every recipient's outcome below it. A script sender is marked as a script, and a recipient shows the messaging name it held. While the reader shows the newest message, it follows new ones as they arrive. `o` loads older messages above the ones on screen. `Ctrl+R` reloads the list and the open channel.
 
 `s` subscribes this session to the selected topic or unsubscribes it, and on Broadcast it switches broadcasts on or off. A topic that this session receives only through a wildcard pattern needs the [This session](#find-peers-and-review-messages) panel to change that pattern.
 
@@ -186,6 +204,8 @@ max_fanout = 32
 A project file can lower these limits but cannot raise them.
 
 The same text from the same sender within one minute gets `refused` as a duplicate. A retry of one message under its original identity is not a duplicate and returns the first receipt.
+
+The per-sender limit and the duplicate check follow the sending session rather than its process, so a restarted or resumed session keeps its counts. Each `--from` label of a script counts as one sender across runs.
 
 Two sessions that deliver to each other automatically can keep a conversation going without you. Each accepted message can start a billable model turn. The limits slow such a pair to `sender_per_minute` turns per minute each, and the exchange continues until one side stops. Press Esc in either session to stop it. Cancelling a run stops automatic wakes for that session until your next local input, and messages that arrive meanwhile are held.
 

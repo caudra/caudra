@@ -61,6 +61,8 @@ A local one-shot `--print` run on Unix can participate in [experimental cross-se
 
 Messages enter only at safe boundaries during the active run. Print does not stay alive waiting for peers or start another run after its final result. Held messages have no interactive approval path, and queued or held messages still in memory disappear when the receiving run closes. A `queued` receipt is not a promise that the model will process the message before exit. Use the TUI's `/messages` review when you need interactive approval.
 
+To tell running agents about an event from a script or CI job without starting an agent, use [`caudra message`](/docs/cli/#caudra-message).
+
 The same [inbound policy, same-user trust assumption, and provider exposure](/docs/permissions/#cross-session-messages) apply as in the TUI. Persistent SDK stream sessions and ACP do not participate in this MVP. Neither do remote Workcell or managed sandbox sessions. Selecting `--output-format stream-json` alone does not select the SDK path, but `--input-format stream-json` does.
 
 ## SDK / Stream Mode

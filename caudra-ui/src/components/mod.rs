@@ -1253,10 +1253,20 @@ impl DisplayMessage {
         } else {
             format!("Audience: {:?}\n", origin.audience.to_string())
         };
-        let text = format!(
-            "Peer: {:?}\n{name}{audience}Message: {:?}\nSender session: {:?}\nReply target: {:?}\n\n{safe_body}",
-            origin.sender_name, origin.message_id, origin.sender_session_id, origin.reply_target,
-        );
+        let text = if origin.external {
+            format!(
+                "Script: {:?}\n{audience}Message: {:?}\n\n{safe_body}",
+                origin.sender_name, origin.message_id,
+            )
+        } else {
+            format!(
+                "Peer: {:?}\n{name}{audience}Message: {:?}\nSender session: {:?}\nReply target: {:?}\n\n{safe_body}",
+                origin.sender_name,
+                origin.message_id,
+                origin.sender_session_id,
+                origin.reply_target,
+            )
+        };
         Self::new(DisplayRole::PeerMessage(Box::new(origin)), text)
     }
 
