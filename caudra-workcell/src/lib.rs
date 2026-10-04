@@ -2460,17 +2460,7 @@ fn remote_result(
             };
             file_write_result(output, input.content.clone())
         }),
-        ToolKind::FileEdit => deserialize_remote(&structured_content).map(|output| {
-            let Input::FileEdit(input) = input else {
-                unreachable!("tool kind and parsed input are paired")
-            };
-            file_edit_result(
-                output,
-                input.old_string.clone(),
-                input.new_string.clone(),
-                input.replace_all.unwrap_or(false),
-            )
-        }),
+        ToolKind::FileEdit => deserialize_remote(&structured_content).map(file_edit_result),
         ToolKind::FileApplyPatch => deserialize_remote(&structured_content).map(file_patch_result),
         ToolKind::Index => deserialize_remote(&structured_content)
             .map(|output| remote_index_result(output, &model_output)),
@@ -3026,14 +3016,11 @@ impl WorkcellInvocation {
                     Err(error) => failed(error),
                 }
             }
-            (Input::FileEdit(original), PreparedExecution::File(group, Input::FileEdit(input))) => {
+            (Input::FileEdit(_), PreparedExecution::File(group, Input::FileEdit(input))) => {
                 // Captured before the edit runs: a successful write moves the
                 // mtime itself, so checking afterwards would report staleness
                 // this call caused.
                 let stale = stale_notice(ctx, &prepared.mutation_targets);
-                let old_string = original.old_string.clone();
-                let new_string = original.new_string.clone();
-                let replace_all = original.replace_all.unwrap_or(false);
                 match self
                     .host
                     .run(ctx, move |token| async move {
@@ -3045,7 +3032,7 @@ impl WorkcellInvocation {
                         if output.applied {
                             ctx.file_tracker.record_read(Path::new(&output.path));
                         }
-                        file_edit_result(output, old_string, new_string, replace_all)
+                        file_edit_result(output)
                     }
                     Ok(Err(error)) => ToolExecResult::failed(
                         ToolFailure::from_code(error.code()),
@@ -4212,27 +4199,11 @@ fn file_write_result(output: FileWriteOutput, content: String) -> ToolExecResult
     result.with_written_paths(written.into_iter().collect())
 }
 
-fn file_edit_result(
-    output: FileEditOutput,
-    old_string: String,
-    new_string: String,
-    replace_all: bool,
-) -> ToolExecResult {
+fn file_edit_result(output: FileEditOutput) -> ToolExecResult {
     let written = output.applied.then(|| output.path.clone());
-    let result = if replace_all {
-        // Every match moved at once, so there is no single before/after pair
-        // to diff. The patch carries all of them with their real line numbers.
-        ToolExecResult::from(Ok::<_, String>(ToolOutput::Patch {
-            files: vec![patched_file(&output.diff)],
-        }))
-    } else {
-        ToolExecResult::from(Ok::<_, String>(ToolOutput::Diff {
-            path: output.path.clone(),
-            before: old_string,
-            after: new_string,
-            summary: output.diff.patch.clone(),
-        }))
-    };
+    let result = ToolExecResult::from(Ok::<_, String>(ToolOutput::Patch {
+        files: vec![patched_file(&output.diff)],
+    }));
     let result = if output.applied {
         result
     } else {
@@ -9344,7 +9315,7 @@ mod tests {
         let diff = workcell::files::FileDiff {
             file: "/project/src/lib.rs".into(),
             relative_path: "src/lib.rs".into(),
-            patch: "-fn old() {}\n+fn new() {}".into(),
+            patch: EDIT_PATCH.into(),
             additions: 1,
             deletions: 1,
             truncated: false,
@@ -9368,23 +9339,19 @@ mod tests {
             ToolOutput::WriteCode { path, .. } if path.ends_with("lib.rs")
         ));
 
-        let edit = file_edit_result(
-            FileEditOutput {
-                kind: workcell::files::FileEditKind::Edit,
-                path: "/project/src/lib.rs".into(),
-                relative_path: "src/lib.rs".into(),
-                applied: true,
-                diff,
-            },
-            "fn old() {}".into(),
-            "fn new() {}".into(),
-            false,
-        )
+        let edit = file_edit_result(FileEditOutput {
+            kind: workcell::files::FileEditKind::Edit,
+            path: "/project/src/lib.rs".into(),
+            relative_path: "src/lib.rs".into(),
+            applied: true,
+            diff,
+        })
         .output
         .expect("edit output");
         assert!(matches!(
             edit,
-            ToolOutput::Diff { path, .. } if path.ends_with("lib.rs")
+            ToolOutput::Patch { files }
+                if files.len() == 1 && files[0].path == "src/lib.rs" && files[0].patch == EDIT_PATCH
         ));
 
         let patch = file_patch_result(FileApplyPatchOutput {
@@ -9413,9 +9380,90 @@ mod tests {
 
     const OLD_CONTENT: &str = "fn old() {}\n";
     const NEW_CONTENT: &str = "fn new() {}\n";
+    const EDIT_PATH: &str = "/project/src/lib.rs";
+    const EDIT_RELATIVE_PATH: &str = "src/lib.rs";
+    const EDIT_PATCH: &str = "@@ -120,1 +120,1 @@\n-fn old() {}\n+fn new() {}\n";
+    const EDIT_PATCH_MSG: &str = "an edit preserves its positioned patch and receipt metadata";
     const WRITE_CODE_CARD: &str = "write-code";
     const DIFF_CARD: &str = "diff";
     const PATCH_CARD: &str = "patch";
+
+    #[test_case(true, false, None ; "local_applied")]
+    #[test_case(false, false, None ; "local_not_applied")]
+    #[test_case(true, true, None ; "local_truncated")]
+    #[test_case(true, false, Some(false) ; "remote_single_edit")]
+    #[test_case(true, false, Some(true) ; "remote_replace_all")]
+    #[test_case(false, true, Some(false) ; "remote_not_applied_truncated")]
+    fn edit_results_preserve_positioned_patches(
+        applied: bool,
+        truncated: bool,
+        remote_replace_all: Option<bool>,
+    ) {
+        let output = FileEditOutput {
+            kind: workcell::files::FileEditKind::Edit,
+            path: EDIT_PATH.into(),
+            relative_path: EDIT_RELATIVE_PATH.into(),
+            applied,
+            diff: FileDiff {
+                file: EDIT_PATH.into(),
+                relative_path: EDIT_RELATIVE_PATH.into(),
+                patch: EDIT_PATCH.into(),
+                additions: 1,
+                deletions: 1,
+                truncated,
+            },
+        };
+        let model_output = output.model_text().into_owned();
+        let result = if let Some(replace_all) = remote_replace_all {
+            let input = Input::parse(
+                ToolKind::FileEdit,
+                json!({
+                    "filePath": EDIT_PATH,
+                    "oldString": OLD_CONTENT,
+                    "newString": NEW_CONTENT,
+                    "replaceAll": replace_all,
+                }),
+            )
+            .expect(EDIT_PATCH_MSG);
+            remote_result(
+                ToolKind::FileEdit,
+                &input,
+                RemoteToolResultEnvelope {
+                    model_output: model_output.clone(),
+                    structured_content: serde_json::to_value(output).expect(EDIT_PATCH_MSG),
+                    is_error: false,
+                },
+            )
+        } else {
+            file_edit_result(output)
+        };
+        assert!(!result.is_error, "{EDIT_PATCH_MSG}");
+        assert_eq!(
+            result.written_paths,
+            if applied { vec![EDIT_PATH] } else { vec![] },
+            "{EDIT_PATCH_MSG}"
+        );
+        assert_eq!(
+            result.model_suffix.as_deref(),
+            (!applied).then_some(NOT_APPLIED),
+            "{EDIT_PATCH_MSG}"
+        );
+        assert_eq!(result.remote_written_paths, remote_replace_all.is_some());
+        assert_eq!(
+            result.model_output.as_deref(),
+            remote_replace_all.map(|_| model_output.as_str()),
+            "{EDIT_PATCH_MSG}"
+        );
+        let ToolOutput::Patch { files } = result.output.expect(EDIT_PATCH_MSG) else {
+            panic!("{EDIT_PATCH_MSG}");
+        };
+        assert_eq!(files.len(), 1, "{EDIT_PATCH_MSG}");
+        let file = &files[0];
+        assert_eq!(file.path, EDIT_RELATIVE_PATH, "{EDIT_PATCH_MSG}");
+        assert_eq!(file.patch, EDIT_PATCH, "{EDIT_PATCH_MSG}");
+        assert_eq!((file.additions, file.deletions), (1, 1), "{EDIT_PATCH_MSG}");
+        assert_eq!(file.truncated, truncated, "{EDIT_PATCH_MSG}");
+    }
 
     fn write_result(applied: bool, existed: bool, previous: Option<&str>) -> ToolOutput {
         file_write_result(

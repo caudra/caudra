@@ -4319,6 +4319,58 @@ mod tests {
     const BOTH_SIDES: &str = "a wide body numbers both sides of a change";
     const ONE_SIDE: &str = "a narrow body spends its columns on the code";
     const MARGIN_ONLY: &str = "a re-indented line is one row marking only its margin";
+    const POSITIONED_PATCH: &str = "@@ -42,2 +52,3 @@\n first\n+inserted\n tail\n\
+        @@ -70,3 +81,2 @@\n second\n-deleted\n tail\n\
+        @@ -90,3 +100,3 @@\n third\n-old\n+new\n tail\n";
+    const POSITIONED_NARROW_GUTTERS: &[&str] = &[
+        " 42   ", " 53 + ", " 43   ", "...", " 70   ", " 71 - ", " 72   ", "...", " 90   ",
+        " 91 - ", "101 + ", " 92   ",
+    ];
+    const POSITIONED_WIDE_GUTTERS: &[&str] = &[
+        "42  52   ",
+        "    53 + ",
+        "43  54   ",
+        "...",
+        "70  81   ",
+        "71     - ",
+        "72  82   ",
+        "...",
+        "90 100   ",
+        "91     - ",
+        "   101 + ",
+        "92 102   ",
+    ];
+    const GROUPED_PATCH: &str = "@@ -42,20 +52,20 @@\n a0\n a1\n a2\n a3\n a4\n+inserted\n \
+        middle0\n middle1\n middle2\n middle3\n middle4\n middle5\n middle6\n middle7\n\
+        -deleted\n z0\n z1\n z2\n z3\n z4\n z5\n";
+    const GROUPED_NARROW_GUTTERS: &[&str] = &[
+        "44   ", "45   ", "46   ", "57 + ", "47   ", "48   ", "49   ", "...", "52   ", "53   ",
+        "54   ", "55 - ", "56   ", "57   ", "58   ",
+    ];
+    const GROUPED_WIDE_GUTTERS: &[&str] = &[
+        "44 54   ", "45 55   ", "46 56   ", "   57 + ", "47 58   ", "48 59   ", "49 60   ", "...",
+        "52 63   ", "53 64   ", "54 65   ", "55    - ", "56 66   ", "57 67   ", "58 68   ",
+    ];
+    const POSITIONED_GUTTERS_MSG: &str =
+        "gutters combine each hunk's file origins with its re-diffed group offsets";
+
+    #[test_case(POSITIONED_PATCH, 30, false, POSITIONED_NARROW_GUTTERS; "hunks_narrow_plain")]
+    #[test_case(POSITIONED_PATCH, 30, true, POSITIONED_NARROW_GUTTERS; "hunks_narrow_highlighted")]
+    #[test_case(POSITIONED_PATCH, 80, false, POSITIONED_WIDE_GUTTERS; "hunks_wide_plain")]
+    #[test_case(POSITIONED_PATCH, 80, true, POSITIONED_WIDE_GUTTERS; "hunks_wide_highlighted")]
+    #[test_case(GROUPED_PATCH, 30, false, GROUPED_NARROW_GUTTERS; "groups_narrow_plain")]
+    #[test_case(GROUPED_PATCH, 30, true, GROUPED_NARROW_GUTTERS; "groups_narrow_highlighted")]
+    #[test_case(GROUPED_PATCH, 80, false, GROUPED_WIDE_GUTTERS; "groups_wide_plain")]
+    #[test_case(GROUPED_PATCH, 80, true, GROUPED_WIDE_GUTTERS; "groups_wide_highlighted")]
+    fn positioned_patch_gutters(patch: &str, width: u16, highlight: bool, expected: &[&str]) {
+        let rendered = render_patch(&one_file(patch), highlight, width);
+        let gutters: Vec<&str> = rendered
+            .iter()
+            .map(|line| line.spans[0].content.as_ref())
+            .collect();
+
+        assert_eq!(gutters, expected, "{POSITIONED_GUTTERS_MSG}");
+    }
 
     /// A changed row is padded to exactly the body width it was given. One
     /// column over and the paragraph wraps it, doubling every line of every
@@ -4418,18 +4470,29 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_oversized_hunk_keeps_the_wire_order() {
+    #[test_case(1, 1; "file_start")]
+    #[test_case(42, 42; "positioned")]
+    #[test_case(42, 52; "different_origins")]
+    fn an_oversized_hunk_keeps_the_wire_order(before_start: usize, after_start: usize) {
         let half = MAX_REDIFF_LINES / 2 + 1;
         let removed: String = (0..half).map(|i| format!("-line {i}\n")).collect();
         let added: String = (0..half).map(|i| format!("+line {i}\n")).collect();
-        let rendered = patch_rows(&format!("@@ -1,{half} +1,{half} @@\n{removed}{added}"));
+        let rendered = patch_rows(&format!(
+            "@@ -{before_start},{half} +{after_start},{half} @@\n{removed}{added}"
+        ));
         assert_eq!(rendered.len(), half * 2, "{OVERSIZED_MSG}");
-        assert!(
-            rendered[0].ends_with("- line 0") && rendered[half].ends_with("+ line 0"),
-            "{OVERSIZED_MSG}: {:?}",
-            &rendered[..1]
-        );
+        for i in 0..half {
+            assert_eq!(
+                rendered[i].trim_start(),
+                format!("{} - line {i}", before_start + i),
+                "{OVERSIZED_MSG}"
+            );
+            assert_eq!(
+                rendered[half + i].trim_start(),
+                format!("{} + line {i}", after_start + i),
+                "{OVERSIZED_MSG}"
+            );
+        }
     }
 
     fn diff_fg(lines: &[Line<'static>], substr: &str) -> ratatui::style::Color {
