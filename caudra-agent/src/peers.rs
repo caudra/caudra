@@ -1,8 +1,9 @@
 //! Cooperative, same-user live messaging. Socket credentials establish a UID, not
 //! that a peer is an authentic Caudra process or has equivalent permissions.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
@@ -54,15 +55,15 @@ const HELD_BLOCKED: &str = "Receiver is blocked; local input must resume it";
 const RATE_EXCEEDED: &str = "Recipient peer message rate limit reached";
 const DUPLICATE: &str = "The same text from this sender arrived within the last minute";
 const FULL: &str = "Live inbox capacity reached; no older message was removed";
-const RETRY_FULL: &str = "Live retry identity capacity reached; start a new registration";
+const RETRY_FULL: &str = "Live retry identity capacity reached; try again once older messages pass the five-minute retry window";
 const POLICY_FLOOR: &str = "Cannot weaken the project's configured inbound policy";
 const INVALID_TARGET: &str = "Invalid peer target; use an address returned by discovery";
 const STALE_TARGET: &str = "Peer target is closed or belongs to an obsolete registration";
 const UNKNOWN_TARGET: &str =
     "Unknown peer address; use a target from peer discovery or an incoming peer message";
-const UNKNOWN_REPLY: &str = "Unknown peer message name for this target";
+const UNKNOWN_REPLY: &str =
+    "Unknown or expired peer message name for this target; send without reply_to";
 const AMBIGUOUS_REPLY: &str = "Peer reply identity is ambiguous without its original sender";
-const NAME_FULL: &str = "Live peer name capacity reached; start a new registration";
 const NAME_COLLISION: &str = "Unable to allocate a unique peer name within the attempt limit";
 pub const INVALID_HANDLE: &str = "Messaging names use 1 to 32 lowercase letters, digits, and hyphens, starting with a letter or digit";
 const HANDLE_IN_USE: &str = "is in use by another live session";
@@ -243,8 +244,8 @@ struct SessionState {
     inbox: VecDeque<InboxItem>,
     dedup: HashMap<String, DedupEntry>,
     outgoing: HashMap<String, Outgoing>,
-    peer_names: HashMap<String, String>,
-    message_names: HashMap<String, MessageIdentity>,
+    peer_names: NameTable<String>,
+    message_names: NameTable<MessageIdentity>,
     arrivals: VecDeque<Arrival>,
     reviews: HashMap<String, u64>,
 }
@@ -305,6 +306,45 @@ impl InboxItem {
 struct MessageIdentity {
     sender: String,
     message_id: String,
+    /// Set on this session's own messages, so replies correlate after the
+    /// retry record is gone.
+    recipient: Option<String>,
+}
+
+impl MessageIdentity {
+    fn involves(&self, peer: &str) -> bool {
+        self.sender == peer || self.recipient.as_deref() == Some(peer)
+    }
+}
+
+/// Live names for one kind of peer identity. A full table evicts the least
+/// recently used entry that no queued message cites. The evicted name is
+/// retired for the rest of the registration, so a stale name can miss but
+/// never reach a different identity. A retired name costs one hash.
+struct NameTable<T> {
+    live: HashMap<String, Named<T>>,
+    retired: HashSet<u64>,
+    capacity: usize,
+    clock: u64,
+}
+
+struct Named<T> {
+    value: T,
+    used: u64,
+}
+
+/// A name for an identity: already bound, or fresh and not yet bound.
+enum Name {
+    Bound(String),
+    Fresh(String),
+}
+
+impl Name {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Bound(name) | Self::Fresh(name) => name,
+        }
+    }
 }
 
 enum ItemState {
@@ -316,12 +356,12 @@ enum ItemState {
 
 struct DedupEntry {
     fingerprint: [u8; 32],
+    issued_ms: u64,
     receipt: SendReceipt,
 }
 
 struct Outgoing {
     fingerprint: [u8; 32],
-    target: String,
     message_id: String,
     issued_ms: u64,
     epoch: u64,
@@ -498,27 +538,123 @@ fn peer_name() -> Result<String, String> {
     Ok(format!("{}-{}", message_name()?, message_name()?))
 }
 
-fn allocate_name<T>(
-    names: &HashMap<String, T>,
-    capacity: usize,
-    preferred: Option<&str>,
-    mut candidate: impl FnMut() -> Result<String, String>,
-) -> Result<String, String> {
-    if names.len() >= capacity {
-        return Err(NAME_FULL.into());
-    }
-    if let Some(preferred) = preferred
-        && !names.contains_key(preferred)
-    {
-        return Ok(preferred.to_owned());
-    }
-    for _ in 0..MAX_NAME_ATTEMPTS {
-        let name = candidate()?;
-        if !names.contains_key(&name) {
-            return Ok(name);
+impl<T> NameTable<T> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            live: HashMap::new(),
+            retired: HashSet::new(),
+            capacity,
+            clock: 0,
         }
     }
-    Err(NAME_COLLISION.into())
+
+    fn get(&mut self, name: &str) -> Option<&T> {
+        let named = self.live.get_mut(name)?;
+        self.clock += 1;
+        named.used = self.clock;
+        Some(&named.value)
+    }
+
+    fn find(&mut self, matches: impl Fn(&T) -> bool) -> Option<String> {
+        let (name, named) = self
+            .live
+            .iter_mut()
+            .find(|(_, named)| matches(&named.value))?;
+        self.clock += 1;
+        named.used = self.clock;
+        Some(name.clone())
+    }
+
+    fn count(&self, matches: impl Fn(&T) -> bool) -> usize {
+        self.live
+            .values()
+            .filter(|named| matches(&named.value))
+            .count()
+    }
+
+    /// The bound name for `value`, or a fresh one the caller must bind.
+    fn name<Q: ?Sized>(
+        &mut self,
+        value: &Q,
+        preferred: Option<&str>,
+        candidate: impl FnMut() -> Result<String, String>,
+    ) -> Result<Name, String>
+    where
+        T: PartialEq<Q>,
+    {
+        match self.find(|known| known == value) {
+            Some(name) => Ok(Name::Bound(name)),
+            None => self.fresh(preferred, candidate).map(Name::Fresh),
+        }
+    }
+
+    /// A name that is neither live nor retired.
+    fn fresh(
+        &self,
+        preferred: Option<&str>,
+        mut candidate: impl FnMut() -> Result<String, String>,
+    ) -> Result<String, String> {
+        let free = |name: &str| {
+            !self.live.contains_key(name) && !self.retired.contains(&retired_key(name))
+        };
+        if let Some(preferred) = preferred.filter(|name| free(name)) {
+            return Ok(preferred.to_owned());
+        }
+        for _ in 0..MAX_NAME_ATTEMPTS {
+            let name = candidate()?;
+            if free(&name) {
+                return Ok(name);
+            }
+        }
+        Err(NAME_COLLISION.into())
+    }
+
+    /// Binds a name from [`Self::fresh`]. Queued messages cite at most a few
+    /// names per item, far below capacity, so an unpinned entry is always
+    /// there to evict.
+    fn bind(&mut self, name: String, value: T, pinned: impl Fn(&str) -> bool) {
+        if self.live.len() >= self.capacity
+            && let Some(evicted) = self
+                .live
+                .iter()
+                .filter(|(name, _)| !pinned(name))
+                .min_by_key(|(_, named)| named.used)
+                .map(|(name, _)| name.clone())
+        {
+            self.live.remove(&evicted);
+            self.retired.insert(retired_key(&evicted));
+        }
+        self.clock += 1;
+        self.live.insert(
+            name,
+            Named {
+                value,
+                used: self.clock,
+            },
+        );
+    }
+}
+
+fn retired_key(name: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    name.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn retry_expired(issued_ms: u64, now_ms: u64) -> bool {
+    now_ms.saturating_sub(issued_ms) > RETRY_WINDOW.as_millis() as u64
+}
+
+/// Forgets identities no retry can still present, once the table is full.
+fn has_retry_room<V>(
+    table: &mut HashMap<String, V>,
+    now_ms: u64,
+    issued_ms: impl Fn(&V) -> u64,
+) -> bool {
+    if table.len() >= MAX_DEDUP {
+        table.retain(|_, value| !retry_expired(issued_ms(value), now_ms));
+    }
+    table.len() < MAX_DEDUP
 }
 
 fn wall_ms() -> u64 {
@@ -665,8 +801,8 @@ impl PeerHost {
                 inbox: VecDeque::new(),
                 dedup: HashMap::new(),
                 outgoing: HashMap::new(),
-                peer_names: HashMap::new(),
-                message_names: HashMap::new(),
+                peer_names: NameTable::new(MAX_PEER_NAMES),
+                message_names: NameTable::new(MAX_MESSAGE_NAMES),
                 arrivals: VecDeque::new(),
                 reviews: HashMap::new(),
             }),
@@ -860,23 +996,21 @@ impl PeerSession {
         let route = match target.strip_prefix(HANDLE_PREFIX) {
             Some(handle) => self.resolve_handle(handle).await?,
             None if valid_name(target, PEER_WORDS) => {
-                let state = lock(&self.0.state);
+                let mut state = lock(&self.0.state);
                 state.ensure_open()?;
                 state.peer_names.get(target).ok_or(UNKNOWN_TARGET)?.clone()
             }
             None => return Err(UNKNOWN_TARGET.into()),
         };
         let reply_to = {
-            let state = lock(&self.0.state);
+            let mut state = lock(&self.0.state);
             state.ensure_open()?;
             reply_to
                 .map(|name| {
                     state
                         .message_names
                         .get(name)
-                        .filter(|identity| {
-                            state.matches_counterpart(identity, &route, &self.0.route.target())
-                        })
+                        .filter(|identity| identity.involves(&route))
                         .cloned()
                         .ok_or(UNKNOWN_REPLY)
                 })
@@ -962,7 +1096,7 @@ impl PeerSession {
                         "Peer retry invalidated by a session policy or workspace change".into(),
                     );
                 }
-                if wall_ms().saturating_sub(previous.issued_ms) > RETRY_WINDOW.as_millis() as u64 {
+                if retry_expired(previous.issued_ms, wall_ms()) {
                     return Err("Peer retry identity expired; do not retry as a new message".into());
                 }
                 if let Some(receipt) = &previous.receipt
@@ -983,21 +1117,24 @@ impl PeerSession {
                     state.epoch,
                 )
             } else {
-                if state.outgoing.len() >= MAX_DEDUP {
+                let issued_ms = wall_ms();
+                if !has_retry_room(&mut state.outgoing, issued_ms, |outgoing| {
+                    outgoing.issued_ms
+                }) {
                     return Err(RETRY_FULL.into());
                 }
-                let message_id =
-                    allocate_name(&state.message_names, MAX_MESSAGE_NAMES, None, message_name)?;
-                state.message_names.insert(
+                let message_id = state.message_names.fresh(None, message_name)?;
+                state.bind_message(
                     message_id.clone(),
                     MessageIdentity {
                         sender: self.0.route.target(),
                         message_id: message_id.clone(),
+                        recipient: Some(target.to_owned()),
                     },
                 );
                 let delivery = Delivery {
                     message_id,
-                    issued_ms: wall_ms(),
+                    issued_ms,
                     target: target.to_owned(),
                     sender: Sender {
                         route: self.0.route.clone(),
@@ -1016,7 +1153,6 @@ impl PeerSession {
                     request_id.to_owned(),
                     Outgoing {
                         fingerprint,
-                        target: delivery.target.clone(),
                         message_id: delivery.message_id.clone(),
                         issued_ms: delivery.issued_ms,
                         epoch,
@@ -1262,63 +1398,49 @@ impl SessionState {
         self.claim.as_ref().map(|claim| claim.handle.clone())
     }
 
-    fn matches_counterpart(&self, identity: &MessageIdentity, peer: &str, own: &str) -> bool {
-        identity.sender == peer
-            || (identity.sender == own
-                && self.outgoing.values().any(|outgoing| {
-                    outgoing.message_id == identity.message_id && outgoing.target == peer
-                }))
-    }
-
     fn reply_name(
-        &self,
+        &mut self,
         sender: &str,
-        own: &str,
         message_id: &str,
         reply_sender: Option<&str>,
     ) -> Result<String, String> {
-        let mut matches = self.message_names.iter().filter(|(_, identity)| {
+        let replied = |identity: &MessageIdentity| {
             identity.message_id == message_id
-                && reply_sender.is_none_or(|sender| sender == identity.sender)
-                && self.matches_counterpart(identity, sender, own)
-        });
-        let (name, _) = matches.next().ok_or(UNKNOWN_REPLY)?;
-        if matches.next().is_some() {
+                && reply_sender.is_none_or(|reply_sender| reply_sender == identity.sender)
+                && identity.involves(sender)
+        };
+        if self.message_names.count(replied) > 1 {
             return Err(AMBIGUOUS_REPLY.into());
         }
-        Ok(name.clone())
+        self.message_names
+            .find(replied)
+            .ok_or_else(|| UNKNOWN_REPLY.into())
     }
 
     fn peer_name(&mut self, route: &str) -> Result<String, String> {
-        if let Some((name, _)) = self.peer_names.iter().find(|(_, known)| *known == route) {
-            return Ok(name.clone());
-        }
-        let name = allocate_name(&self.peer_names, MAX_PEER_NAMES, None, peer_name)?;
-        self.peer_names.insert(name.clone(), route.to_owned());
-        Ok(name)
+        Ok(match self.peer_names.name(route, None, peer_name)? {
+            Name::Bound(name) => name,
+            Name::Fresh(name) => {
+                self.bind_peer(name.clone(), route.to_owned());
+                name
+            }
+        })
     }
 
-    fn message_name(&mut self, sender: &str, message_id: &str) -> Result<String, String> {
-        let identity = MessageIdentity {
-            sender: sender.to_owned(),
-            message_id: message_id.to_owned(),
-        };
-        if let Some((name, _)) = self
-            .message_names
-            .iter()
-            .find(|(_, known)| **known == identity)
-        {
-            return Ok(name.clone());
-        }
-        let preferred = valid_name(message_id, MESSAGE_WORDS).then_some(message_id);
-        let name = allocate_name(
-            &self.message_names,
-            MAX_MESSAGE_NAMES,
-            preferred,
-            message_name,
-        )?;
-        self.message_names.insert(name.clone(), identity);
-        Ok(name)
+    fn bind_peer(&mut self, name: String, route: String) {
+        let inbox = &self.inbox;
+        self.peer_names.bind(name, route, |name| {
+            inbox.iter().any(|item| item.origin.reply_target == name)
+        });
+    }
+
+    fn bind_message(&mut self, name: String, identity: MessageIdentity) {
+        let inbox = &self.inbox;
+        self.message_names.bind(name, identity, |name| {
+            inbox.iter().any(|item| {
+                item.origin.message_id == name || item.origin.reply_to.as_deref() == Some(name)
+            })
+        });
     }
 
     fn ensure_open(&self) -> Result<(), String> {
@@ -1469,7 +1591,7 @@ impl SessionInner {
         {
             return Err("Invalid peer message metadata or text bounds".into());
         }
-        if now_ms.saturating_sub(delivery.issued_ms) > RETRY_WINDOW.as_millis() as u64
+        if retry_expired(delivery.issued_ms, now_ms)
             || delivery.issued_ms.saturating_sub(now_ms) > CLOCK_SKEW.as_millis() as u64
         {
             return Ok(SendReceipt::new(
@@ -1496,7 +1618,7 @@ impl SessionInner {
             }
             return Ok(previous.receipt.clone());
         }
-        if state.dedup.len() >= MAX_DEDUP {
+        if !has_retry_room(&mut state.dedup, now_ms, |entry| entry.issued_ms) {
             return Ok(SendReceipt::new(
                 "rate_limited",
                 &delivery.message_id,
@@ -1508,30 +1630,9 @@ impl SessionInner {
             .reply_to
             .as_deref()
             .map(|message_id| {
-                state.reply_name(
-                    &sender,
-                    &self.route.target(),
-                    message_id,
-                    delivery.reply_sender.as_deref(),
-                )
+                state.reply_name(&sender, message_id, delivery.reply_sender.as_deref())
             })
             .transpose()?;
-        let sender_name = state.peer_name(&sender)?;
-        let origin = PeerMessageOrigin {
-            message_id: state.message_name(&sender, &delivery.message_id)?,
-            sender_session_id: sender_name.clone(),
-            sender_name: delivery.sender.name.clone(),
-            sender_handle: delivery.sender.handle.clone(),
-            reply_target: sender_name,
-            reply_to,
-        };
-        let bytes = encoded.len()
-            + serde_json::to_vec(&Message::peer_observation(
-                delivery.text.clone(),
-                origin.clone(),
-            ))
-            .map_err(|error| error.to_string())?
-            .len();
         while state
             .arrivals
             .front()
@@ -1558,48 +1659,84 @@ impl SessionInner {
                 >= state.sender_rate
         {
             SendReceipt::new("rate_limited", &delivery.message_id, Some(RATE_EXCEEDED))
-        } else if state.inbox.len() >= MAX_PENDING.min(MAX_HELD)
-            || state.bytes + bytes > MAX_SESSION_BYTES
-            || self
-                .host
-                .bytes
-                .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                    current
-                        .checked_add(bytes)
-                        .filter(|next| *next <= MAX_PROCESS_BYTES)
-                })
-                .is_err()
-        {
+        } else if state.inbox.len() >= MAX_PENDING.min(MAX_HELD) {
             SendReceipt::new("rate_limited", &delivery.message_id, Some(FULL))
         } else {
-            let reason = state.hold_reason(&delivery, None);
-            let receipt = SendReceipt::new(
-                if reason.is_some() { "held" } else { "queued" },
-                &delivery.message_id,
-                reason,
-            );
-            let item_state =
-                reason.map_or(ItemState::Pending, |reason| ItemState::Held(reason.into()));
-            state.bytes += bytes;
-            state.arrivals.push_back(Arrival {
-                at: now,
-                sender,
-                text,
-            });
-            state.inbox.push_back(InboxItem {
-                delivery: delivery.clone(),
-                origin,
-                bytes,
-                state: item_state,
-                approved_epoch: None,
-            });
-            self.host.changed.notify(usize::MAX);
-            receipt
+            let identity = MessageIdentity {
+                sender: sender.clone(),
+                message_id: delivery.message_id.clone(),
+                recipient: None,
+            };
+            let preferred = valid_name(&delivery.message_id, MESSAGE_WORDS)
+                .then_some(delivery.message_id.as_str());
+            let alias = state.peer_names.name(sender.as_str(), None, peer_name)?;
+            let name = state
+                .message_names
+                .name(&identity, preferred, message_name)?;
+            let origin = PeerMessageOrigin {
+                message_id: name.as_str().to_owned(),
+                sender_session_id: alias.as_str().to_owned(),
+                sender_name: delivery.sender.name.clone(),
+                sender_handle: delivery.sender.handle.clone(),
+                reply_target: alias.as_str().to_owned(),
+                reply_to,
+            };
+            let bytes = encoded.len()
+                + serde_json::to_vec(&Message::peer_observation(
+                    delivery.text.clone(),
+                    origin.clone(),
+                ))
+                .map_err(|error| error.to_string())?
+                .len();
+            if state.bytes + bytes > MAX_SESSION_BYTES
+                || self
+                    .host
+                    .bytes
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                        current
+                            .checked_add(bytes)
+                            .filter(|next| *next <= MAX_PROCESS_BYTES)
+                    })
+                    .is_err()
+            {
+                SendReceipt::new("rate_limited", &delivery.message_id, Some(FULL))
+            } else {
+                if let Name::Fresh(alias) = alias {
+                    state.bind_peer(alias, sender.clone());
+                }
+                if let Name::Fresh(name) = name {
+                    state.bind_message(name, identity);
+                }
+                let reason = state.hold_reason(&delivery, None);
+                let receipt = SendReceipt::new(
+                    if reason.is_some() { "held" } else { "queued" },
+                    &delivery.message_id,
+                    reason,
+                );
+                let item_state =
+                    reason.map_or(ItemState::Pending, |reason| ItemState::Held(reason.into()));
+                state.bytes += bytes;
+                state.arrivals.push_back(Arrival {
+                    at: now,
+                    sender,
+                    text,
+                });
+                state.inbox.push_back(InboxItem {
+                    delivery: delivery.clone(),
+                    origin,
+                    bytes,
+                    state: item_state,
+                    approved_epoch: None,
+                });
+                self.host.changed.notify(usize::MAX);
+                receipt
+            }
         };
         state.dedup.insert(
             dedup_key,
             DedupEntry {
                 fingerprint,
+                issued_ms: delivery.issued_ms,
                 receipt: receipt.clone(),
             },
         );
@@ -1783,7 +1920,6 @@ impl HostInner {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::collections::HashMap;
     use std::fs::{self, Permissions};
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
@@ -1805,15 +1941,15 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        AMBIGUOUS_HANDLE, AMBIGUOUS_REPLY, CLAIM_BATCH, CLOSED, DUPLICATE, Delivery, FULL,
-        HANDLE_PREFIX, HELD_BLOCKED, HELD_COHORT, HELD_POLICY, HandleClaim, INVALID_HANDLE,
+        AMBIGUOUS_HANDLE, AMBIGUOUS_REPLY, CLAIM_BATCH, CLOSED, DUPLICATE, DedupEntry, Delivery,
+        FULL, HANDLE_PREFIX, HELD_BLOCKED, HELD_COHORT, HELD_POLICY, HandleClaim, INVALID_HANDLE,
         MAX_BODY_BYTES, MAX_DEDUP, MAX_HELD, MAX_MESSAGE_NAMES, MAX_NAME_ATTEMPTS, MAX_PEER_NAMES,
         MAX_PROCESS_BYTES, MAX_SESSION_BYTES, MESSAGE_WORDS, MessageIdentity, NAME_COLLISION,
-        NAME_FULL, NOT_HELD, Outgoing, PEER_WORDS, POLICY_FLOOR, PeerDecision, PeerDecisionResult,
+        NOT_HELD, NameTable, Outgoing, PEER_WORDS, POLICY_FLOOR, PeerDecision, PeerDecisionResult,
         PeerDescriptor, PeerHost, PeerInfo, PeerSession, PeerSummary, RATE_EXCEEDED, RATE_WINDOW,
         REFUSED_POLICY, REJECTED, RETRY_FULL, RETRY_WINDOW, Route, STALE_REVIEW, STALE_TARGET,
         SendReceipt, Sender, UNKNOWN_HANDLE, UNKNOWN_REPLY, UNKNOWN_TARGET, WireMode,
-        allocate_name, handle_in_use, lock, message_name, token, valid_name, wall_ms,
+        handle_in_use, lock, message_name, token, valid_name, wall_ms,
     };
     use crate::AgentMode;
 
@@ -1828,6 +1964,8 @@ mod tests {
     const MESSAGE_NAME: &str = "brisk-calm-otter";
     const OTHER_MESSAGE_NAME: &str = "gentle-bright-falcon";
     const THIRD_MESSAGE_NAME: &str = "quiet-keen-wren";
+    const FOURTH_MESSAGE_NAME: &str = "steady-warm-heron";
+    const FREE_MESSAGE_NAME: &str = "amber-swift-lark";
     const PEER_NAME: &str = "brisk-calm-otter-gentle-bright-falcon";
     const OTHER_PEER_NAME: &str = "gentle-bright-falcon-brisk-calm-otter";
     const REQUEST_ID: &str = "named-request";
@@ -1886,13 +2024,10 @@ mod tests {
     }
 
     fn delivery(session: &PeerSession) -> Delivery {
-        let message_id = allocate_name(
-            &lock(&session.0.state).message_names,
-            MAX_MESSAGE_NAMES,
-            None,
-            message_name,
-        )
-        .unwrap();
+        let message_id = lock(&session.0.state)
+            .message_names
+            .fresh(None, message_name)
+            .unwrap();
         Delivery {
             message_id,
             issued_ms: wall_ms(),
@@ -1921,24 +2056,20 @@ mod tests {
         delivery.target = target.into();
         delivery.sender.route = session.0.route.clone();
         let mut state = lock(&session.0.state);
-        assert!(
-            state
-                .message_names
-                .insert(
-                    message_id.into(),
-                    MessageIdentity {
-                        sender: session.0.route.target(),
-                        message_id: message_id.into(),
-                    },
-                )
-                .is_none()
+        assert!(state.message_names.get(message_id).is_none());
+        state.bind_message(
+            message_id.into(),
+            MessageIdentity {
+                sender: session.0.route.target(),
+                message_id: message_id.into(),
+                recipient: Some(target.into()),
+            },
         );
         let epoch = state.epoch;
         state.outgoing.insert(
             ORIGINAL_REQUEST_ID.into(),
             Outgoing {
                 fingerprint: [0; 32],
-                target: target.into(),
                 message_id: message_id.into(),
                 issued_ms: delivery.issued_ms,
                 epoch,
@@ -1952,33 +2083,68 @@ mod tests {
     #[test_case(MESSAGE_NAME, OTHER_MESSAGE_NAME; "message_names")]
     #[test_case(PEER_NAME, OTHER_PEER_NAME; "peer_names")]
     fn name_allocation_skips_forced_collisions(used: &str, free: &str) {
-        let names = HashMap::from([(used.to_owned(), TEXT)]);
+        let mut names = NameTable::new(MAX_PEER_NAMES);
+        names.bind(used.to_owned(), TEXT, |_| false);
         let mut candidates = [used, free].into_iter();
         assert_eq!(
-            allocate_name(&names, MAX_PEER_NAMES, Some(used), || {
-                Ok(candidates.next().unwrap().to_owned())
-            })
-            .unwrap(),
+            names
+                .fresh(Some(used), || Ok(candidates.next().unwrap().to_owned()))
+                .unwrap(),
             free
         );
         assert!(candidates.next().is_none());
         assert_eq!(names.get(used), Some(&TEXT));
     }
 
-    #[test_case(true; "capacity_exhaustion")]
-    #[test_case(false; "candidate_exhaustion")]
-    fn name_allocation_exhaustion_preserves_bindings(full: bool) {
-        let names = HashMap::from([(PEER_NAME.to_owned(), TEXT)]);
+    #[test_case(false; "live_name")]
+    #[test_case(true; "retired_name")]
+    fn name_allocation_exhaustion_preserves_bindings(retired: bool) {
+        let mut names = NameTable::new(MAX_PEER_NAMES);
+        names.bind(PEER_NAME.to_owned(), TEXT, |_| false);
+        if retired {
+            names.capacity = names.live.len();
+            names.bind(OTHER_PEER_NAME.to_owned(), TEXT, |_| false);
+        }
         let mut attempts = 0;
-        let capacity = if full { names.len() } else { MAX_PEER_NAMES };
-        let error = allocate_name(&names, capacity, None, || {
-            attempts += 1;
-            Ok(PEER_NAME.to_owned())
-        })
-        .unwrap_err();
-        assert_eq!(error, if full { NAME_FULL } else { NAME_COLLISION });
-        assert_eq!(attempts, if full { 0 } else { MAX_NAME_ATTEMPTS });
-        assert_eq!(names.get(PEER_NAME), Some(&TEXT));
+        let error = names
+            .fresh(Some(PEER_NAME), || {
+                attempts += 1;
+                Ok(PEER_NAME.to_owned())
+            })
+            .unwrap_err();
+        assert_eq!(error, NAME_COLLISION);
+        assert_eq!(attempts, MAX_NAME_ATTEMPTS);
+        assert_eq!(names.get(PEER_NAME).is_none(), retired);
+    }
+
+    #[test_case(None, OTHER_MESSAGE_NAME; "least_recently_used")]
+    #[test_case(Some(OTHER_MESSAGE_NAME), THIRD_MESSAGE_NAME; "queued_citation_pins")]
+    fn full_name_tables_evict_and_retire_one_unpinned_name(pinned: Option<&str>, evicted: &str) {
+        let bound = [MESSAGE_NAME, OTHER_MESSAGE_NAME, THIRD_MESSAGE_NAME];
+        let mut names = NameTable::new(bound.len());
+        for name in bound {
+            names.bind(name.to_owned(), name, |_| false);
+        }
+        assert_eq!(names.get(MESSAGE_NAME), Some(&MESSAGE_NAME));
+        names.bind(
+            FOURTH_MESSAGE_NAME.to_owned(),
+            FOURTH_MESSAGE_NAME,
+            |name| Some(name) == pinned,
+        );
+        assert_eq!(names.live.len(), bound.len());
+        assert!(names.get(evicted).is_none());
+        for name in bound.into_iter().chain([FOURTH_MESSAGE_NAME]) {
+            if name != evicted {
+                assert_eq!(names.get(name), Some(&name));
+            }
+        }
+        let mut candidates = [evicted, FREE_MESSAGE_NAME].into_iter();
+        assert_eq!(
+            names
+                .fresh(Some(evicted), || Ok(candidates.next().unwrap().to_owned()))
+                .unwrap(),
+            FREE_MESSAGE_NAME
+        );
     }
 
     #[test_case(""; "empty")]
@@ -2000,56 +2166,151 @@ mod tests {
         );
         let state = lock(&session.0.state);
         assert!(state.outgoing.is_empty());
-        assert!(state.message_names.is_empty());
+        assert!(state.message_names.live.is_empty());
     }
 
-    #[test_case(true; "peer_names")]
-    #[test_case(false; "message_names")]
-    fn incoming_alias_capacity_is_checked_before_accepting(peer_names: bool) {
-        let (_directory, host, session) = fixture(InboundPolicy::Auto);
-        let delivery = delivery(&session);
-        let known_route = session.0.route.target();
-        {
-            let mut state = lock(&session.0.state);
-            if peer_names {
-                state.peer_names = (1..MAX_PEER_NAMES)
-                    .map(|index| (index.to_string(), index.to_string()))
-                    .collect();
-            } else {
-                state.message_names = (1..MAX_MESSAGE_NAMES)
-                    .map(|index| {
-                        (
-                            index.to_string(),
-                            MessageIdentity {
-                                sender: known_route.clone(),
-                                message_id: index.to_string(),
-                            },
-                        )
-                    })
-                    .collect();
-                state.message_name(&known_route, MESSAGE_NAME).unwrap();
-                assert_eq!(
-                    state.message_name(&known_route, MESSAGE_NAME).unwrap(),
-                    MESSAGE_NAME
-                );
-            }
-            state
-                .peer_names
-                .insert(PEER_NAME.into(), known_route.clone());
-            assert_eq!(state.peer_name(&known_route).unwrap(), PEER_NAME);
-        }
-        assert_eq!(
-            session
+    fn cap_name_tables(session: &PeerSession) {
+        let mut state = lock(&session.0.state);
+        state.peer_names.capacity = state.peer_names.live.len();
+        state.message_names.capacity = state.message_names.live.len();
+    }
+
+    fn receive_and_commit(session: &PeerSession, delivery: Delivery) -> PeerMessageOrigin {
+        let receipt = session
+            .0
+            .receive(delivery, Instant::now(), wall_ms())
+            .unwrap();
+        assert_eq!(receipt.status, QUEUED);
+        let claim = session.claim().unwrap();
+        let origin = claim.messages()[0].peer_event.clone().unwrap();
+        claim.commit();
+        origin
+    }
+
+    #[test]
+    fn evicted_names_are_refused_and_never_rebound() {
+        smol::block_on(async {
+            let (_directory, _host, session) = fixture(InboundPolicy::Auto);
+            let evicted = receive_and_commit(&session, delivery(&session));
+            cap_name_tables(&session);
+            let kept = receive_and_commit(&session, delivery(&session));
+            assert_eq!(
+                session
+                    .send_named(&evicted.reply_target, OTHER_TEXT, None, REQUEST_ID)
+                    .await
+                    .unwrap_err(),
+                UNKNOWN_TARGET
+            );
+            assert_eq!(
+                session
+                    .send_named(
+                        &kept.reply_target,
+                        OTHER_TEXT,
+                        Some(&evicted.message_id),
+                        REQUEST_ID
+                    )
+                    .await
+                    .unwrap_err(),
+                UNKNOWN_REPLY
+            );
+            let mut reused = delivery(&session);
+            reused.message_id = evicted.message_id.clone();
+            let renamed = receive_and_commit(&session, reused);
+            assert_ne!(renamed.message_id, evicted.message_id);
+            assert!(valid_name(&renamed.message_id, MESSAGE_WORDS));
+            assert!(lock(&session.0.state).outgoing.is_empty());
+        });
+    }
+
+    #[test]
+    fn queued_messages_keep_the_names_they_cite() {
+        let (_directory, _host, session) = fixture(InboundPolicy::Hold);
+        let held = delivery(&session);
+        for delivery in [held.clone(), delivery(&session)] {
+            let receipt = session
                 .0
                 .receive(delivery, Instant::now(), wall_ms())
-                .unwrap_err(),
-            NAME_FULL
-        );
+                .unwrap();
+            assert_eq!(receipt.status, HELD);
+        }
+        let summaries = session.inbox_snapshot().unwrap().messages;
+        session.reject(&summaries[1].message_id).unwrap();
+        cap_name_tables(&session);
+        let receipt = session
+            .0
+            .receive(delivery(&session), Instant::now(), wall_ms())
+            .unwrap();
+        assert_eq!(receipt.status, HELD);
+        {
+            let mut state = lock(&session.0.state);
+            assert_eq!(
+                state.peer_names.get(&summaries[0].reply_target),
+                Some(&held.sender.route.target())
+            );
+            assert!(state.message_names.get(&summaries[0].message_id).is_some());
+            assert!(state.peer_names.get(&summaries[1].reply_target).is_none());
+            assert!(state.message_names.get(&summaries[1].message_id).is_none());
+        }
+        let review = session.review_held(&summaries[0].message_id).unwrap();
+        assert_eq!(review.summary.reply_target, summaries[0].reply_target);
+    }
+
+    #[test_case(InboundPolicy::Refuse, WireMode::Build, false, REFUSED; "receiver_policy")]
+    #[test_case(InboundPolicy::Auto, WireMode::ReadOnly, false, REFUSED; "read_only_sender")]
+    #[test_case(InboundPolicy::Auto, WireMode::Build, true, RATE_LIMITED; "process_bytes_full")]
+    fn refused_messages_bind_no_names(
+        inbound: InboundPolicy,
+        mode: WireMode,
+        process_full: bool,
+        status: &str,
+    ) {
+        let (_directory, host, session) = fixture(inbound);
+        let mut delivery = delivery(&session);
+        delivery.sender.mode = mode;
+        if process_full {
+            host.0.bytes.store(MAX_PROCESS_BYTES, Ordering::Release);
+        }
+        let receipt = session
+            .0
+            .receive(delivery, Instant::now(), wall_ms())
+            .unwrap();
+        assert_eq!(receipt.status, status);
         let state = lock(&session.0.state);
-        assert!(state.inbox.is_empty());
-        assert!(state.dedup.is_empty());
-        assert_eq!(state.peer_names.get(PEER_NAME), Some(&known_route));
-        assert_eq!(host.0.bytes.load(Ordering::Acquire), 0);
+        assert!(state.peer_names.live.is_empty());
+        assert!(state.message_names.live.is_empty());
+    }
+
+    #[test_case(false, None; "after_retry_record_is_forgotten")]
+    #[test_case(true, Some(UNKNOWN_REPLY); "after_name_is_evicted")]
+    fn replies_to_own_messages_need_only_the_message_name(evict: bool, error: Option<&str>) {
+        let (_directory, _host, session) = fixture(InboundPolicy::Auto);
+        let mut reply = delivery(&session);
+        let recipient = reply.sender.route.target();
+        record_outgoing(&session, &recipient, MESSAGE_NAME);
+        {
+            let mut state = lock(&session.0.state);
+            state.outgoing.clear();
+            if evict {
+                state.message_names.capacity = state.message_names.live.len();
+                let identity = MessageIdentity {
+                    sender: recipient,
+                    message_id: OTHER_MESSAGE_NAME.into(),
+                    recipient: None,
+                };
+                state.bind_message(OTHER_MESSAGE_NAME.into(), identity);
+            }
+        }
+        reply.reply_to = Some(MESSAGE_NAME.into());
+        let result = session.0.receive(reply, Instant::now(), wall_ms());
+        if let Some(error) = error {
+            assert_eq!(result.unwrap_err(), error);
+            assert!(lock(&session.0.state).peer_names.live.is_empty());
+        } else {
+            assert_eq!(result.unwrap().status, QUEUED);
+            let claim = session.claim().unwrap();
+            let origin = claim.messages()[0].peer_event.as_ref().unwrap();
+            assert_eq!(origin.reply_to.as_deref(), Some(MESSAGE_NAME));
+        }
     }
 
     #[test]
@@ -2157,15 +2418,7 @@ mod tests {
         let (_directory, _host, session) = fixture(InboundPolicy::Auto);
         let mut delivery = delivery(&session);
         delivery.message_id = MESSAGE_NAME.into();
-        let mut state = lock(&session.0.state);
-        state.message_names.insert(
-            MESSAGE_NAME.into(),
-            MessageIdentity {
-                sender: session.0.route.target(),
-                message_id: MESSAGE_NAME.into(),
-            },
-        );
-        drop(state);
+        record_outgoing(&session, &delivery.sender.route.target(), MESSAGE_NAME);
         session
             .0
             .receive(delivery.clone(), Instant::now(), wall_ms())
@@ -2173,16 +2426,16 @@ mod tests {
         let claim = session.claim().unwrap();
         let received = &claim.messages()[0].peer_event.as_ref().unwrap().message_id;
         assert_ne!(received, MESSAGE_NAME);
-        let state = lock(&session.0.state);
+        let mut state = lock(&session.0.state);
         let free = [OTHER_MESSAGE_NAME, THIRD_MESSAGE_NAME]
             .into_iter()
-            .find(|name| !state.message_names.contains_key(*name))
+            .find(|name| !state.message_names.live.contains_key(*name))
             .unwrap();
         let mut candidates = [MESSAGE_NAME, received, free].into_iter();
-        let next = allocate_name(&state.message_names, MAX_MESSAGE_NAMES, None, || {
-            Ok(candidates.next().unwrap().to_owned())
-        })
-        .unwrap();
+        let next = state
+            .message_names
+            .fresh(None, || Ok(candidates.next().unwrap().to_owned()))
+            .unwrap();
         assert_eq!(next, free);
         assert_eq!(
             state.message_names.get(received).unwrap().message_id,
@@ -2574,6 +2827,40 @@ mod tests {
         );
     }
 
+    #[test_case(true, QUEUED; "expired_identities_are_forgotten")]
+    #[test_case(false, RATE_LIMITED; "live_identities_are_kept")]
+    fn full_receipt_tables_forget_only_expired_identities(expired: bool, status: &str) {
+        let (_directory, _host, session) = fixture(InboundPolicy::Auto);
+        let delivery = delivery(&session);
+        let now_ms = delivery.issued_ms;
+        let issued_ms = if expired {
+            now_ms - RETRY_WINDOW.as_millis() as u64 - 1
+        } else {
+            now_ms
+        };
+        lock(&session.0.state).dedup = (0..MAX_DEDUP)
+            .map(|index| {
+                let key = index.to_string();
+                let receipt = SendReceipt::new(QUEUED, &key, None);
+                let entry = DedupEntry {
+                    fingerprint: [0; 32],
+                    issued_ms,
+                    receipt,
+                };
+                (key, entry)
+            })
+            .collect();
+        let receipt = session.0.receive(delivery, Instant::now(), now_ms).unwrap();
+        assert_eq!(receipt.status, status);
+        let state = lock(&session.0.state);
+        if expired {
+            assert_eq!(state.dedup.len(), state.inbox.len());
+        } else {
+            assert_eq!(receipt.reason.as_deref(), Some(RETRY_FULL));
+            assert_eq!(state.dedup.len(), MAX_DEDUP);
+        }
+    }
+
     #[test]
     fn repeated_text_from_one_sender_is_refused_within_the_window() {
         let (_directory, _host, session) = fixture(InboundPolicy::Auto);
@@ -2769,7 +3056,7 @@ mod tests {
                 let mut state = lock(&sender.0.state);
                 let outgoing = state.outgoing.get_mut(REQUEST_ID).unwrap();
                 outgoing.receipt = Some(SendReceipt::new(UNKNOWN, &receipt.message_id, None));
-                (outgoing.issued_ms, state.message_names.len())
+                (outgoing.issued_ms, state.message_names.live.len())
             };
             let mut changed = sender.descriptor();
             let previous_name = changed.name.clone();
@@ -2798,7 +3085,7 @@ mod tests {
             let state = lock(&sender.0.state);
             let outgoing = state.outgoing.get(REQUEST_ID).unwrap();
             assert_eq!(outgoing.issued_ms, issued_ms);
-            assert_eq!(state.message_names.len(), names);
+            assert_eq!(state.message_names.live.len(), names);
         });
     }
 
@@ -2935,8 +3222,8 @@ mod tests {
             UNKNOWN_REPLY
         );
         let state = lock(&session.0.state);
-        assert!(state.peer_names.is_empty());
-        assert!(state.message_names.is_empty());
+        assert!(state.peer_names.live.is_empty());
+        assert!(state.message_names.live.is_empty());
         assert!(state.inbox.is_empty());
     }
 
@@ -3082,34 +3369,34 @@ mod tests {
         });
     }
 
+    fn fill_retry_records(session: &PeerSession, issued_ms: u64) {
+        let sender = delivery(session).sender;
+        let mut state = lock(&session.0.state);
+        let epoch = state.epoch;
+        state.outgoing = (0..MAX_DEDUP)
+            .map(|index| {
+                let outgoing = Outgoing {
+                    fingerprint: [0; 32],
+                    message_id: MESSAGE_NAME.into(),
+                    issued_ms,
+                    epoch,
+                    sender: sender.clone(),
+                    receipt: None,
+                };
+                (index.to_string(), outgoing)
+            })
+            .collect();
+    }
+
     #[test]
     fn retry_capacity_rejections_never_consume_message_names() {
         smol::block_on(async {
             let (_directory, host, sender) = fixture(InboundPolicy::Auto);
-            let receiver = host
+            let _receiver = host
                 .register(descriptor(&sender.descriptor().cwd, InboundPolicy::Auto))
                 .unwrap();
             let target = sender.list_named().await.unwrap().remove(0).target;
-            let original = delivery(&sender);
-            {
-                let mut state = lock(&sender.0.state);
-                state.outgoing = (0..MAX_DEDUP)
-                    .map(|index| {
-                        (
-                            index.to_string(),
-                            Outgoing {
-                                fingerprint: [0; 32],
-                                target: receiver.0.route.target(),
-                                message_id: MESSAGE_NAME.into(),
-                                issued_ms: original.issued_ms,
-                                epoch: state.epoch,
-                                sender: original.sender.clone(),
-                                receipt: None,
-                            },
-                        )
-                    })
-                    .collect();
-            }
+            fill_retry_records(&sender, wall_ms());
             for _ in 0..=MAX_MESSAGE_NAMES {
                 assert_eq!(
                     sender
@@ -3119,7 +3406,27 @@ mod tests {
                     RETRY_FULL
                 );
             }
-            assert!(lock(&sender.0.state).message_names.is_empty());
+            assert!(lock(&sender.0.state).message_names.live.is_empty());
+        });
+    }
+
+    #[test]
+    fn expired_retry_records_free_send_capacity() {
+        smol::block_on(async {
+            let (_directory, host, sender) = fixture(InboundPolicy::Auto);
+            let _receiver = host
+                .register(descriptor(&sender.descriptor().cwd, InboundPolicy::Auto))
+                .unwrap();
+            let target = sender.list_named().await.unwrap().remove(0).target;
+            fill_retry_records(&sender, wall_ms() - 2 * RETRY_WINDOW.as_millis() as u64);
+            let receipt = sender
+                .send_named(&target, TEXT, None, REQUEST_ID)
+                .await
+                .unwrap();
+            assert_eq!(receipt.status, QUEUED);
+            let state = lock(&sender.0.state);
+            assert_eq!(state.outgoing.len(), 1);
+            assert!(state.outgoing.contains_key(REQUEST_ID));
         });
     }
 

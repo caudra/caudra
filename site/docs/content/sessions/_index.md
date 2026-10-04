@@ -71,6 +71,8 @@ You can also ask the agent to find a session and send it a message. It uses `lis
 
 Use the exact target from discovery or an incoming reply address. Targets belong to your current live registration and are never reassigned to a replacement peer. Discover again after restarting or replacing your session. Message names also use generated words, including the names shown by `/messages` for approval or rejection.
 
+A live session remembers up to 4,096 targets and 3,072 message names. Beyond that, it forgets the least recently used ones, except those cited by messages still in its inbox. A forgotten target or message name is refused as unknown and is never given to another session or message. Discover the session again, or send without replying to the old message.
+
 Accepted messages enter at a safe run boundary. They can also wake an eligible idle TUI session and start a billable model turn. They do not interrupt a running tool or bypass cancellation, permission review, or rate limits. The recipient still applies its own tool permissions.
 
 Opening or closing the manager does not resume cancelled work. An idle session waits until the modal closes before starting a peer-triggered turn. Work already running keeps its existing safe-boundary delivery behavior.
