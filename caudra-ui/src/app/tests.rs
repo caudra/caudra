@@ -10589,17 +10589,21 @@ fn peer_controls_survive_checkpoint_and_reload(enabled: bool) {
     );
 }
 
-#[test]
-fn peer_controls_alone_do_not_persist_a_blank_session() {
-    let mut app = test_app();
-    app.state.session_mut().meta.peer_controls = Some(stored_peer_controls());
+#[test_case(StoredPeerControls { inbound: Some(StoredInboundPolicy::Hold), ..StoredPeerControls::default() }, false; "inbound_policy")]
+#[test_case(StoredPeerControls { handle: Some(PEER_HANDLE.into()), ..StoredPeerControls::default() }, true; "messaging_name")]
+#[test_case(StoredPeerControls { topics: vec![PEER_TOPIC.into()], ..StoredPeerControls::default() }, true; "topic")]
+#[test_case(StoredPeerControls { broadcasts: true, ..StoredPeerControls::default() }, true; "broadcasts")]
+fn blank_session_is_saved_only_when_peers_can_reach_it(controls: StoredPeerControls, saved: bool) {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    app.state.session_mut().meta.peer_controls = Some(controls.clone());
     app.checkpoint_now();
+    let id = app.state.session.id;
+    drain_writer(app, writer);
+    let loaded = AppSession::load(id, &dir).ok();
     assert_eq!(
-        app.state.session.meta.peer_controls,
-        Some(stored_peer_controls())
+        loaded.map(|session| session.meta.peer_controls),
+        saved.then_some(Some(controls))
     );
-    assert!(!app.has_content());
-    assert!(!app.state.session.is_persisted());
 }
 
 #[test_case(false; "new_session")]

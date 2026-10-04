@@ -65,7 +65,7 @@ A name has 1 to 32 lowercase letters, digits, and hyphens, and starts with a let
 
 Agents address a named session as `@ci-watcher` in `send_message`. Each send looks the name up again, so the message reaches whichever live session holds the name at that moment. Unnamed sessions stay reachable through the word-based targets from discovery.
 
-The session saves its name and claims it again when you resume it. If another live session holds the name by then, the resumed session continues without it and shows a warning. It tries again the next time you resume it. `/rename` changes only the title, so renaming a session never changes its address. Forks and new sessions start without a name.
+The session saves its name and claims it again when you resume it, even if it has received nothing yet. If another live session holds the name by then, the resumed session continues without it and shows a warning. It tries again the next time you resume it. `/rename` changes only the title, so renaming a session never changes its address. Forks and new sessions start without a name.
 
 ## Topics and broadcasts
 
@@ -88,7 +88,7 @@ caudra --name ci-watcher --topic 'ci.**' --receive-broadcasts
 | `/topics unsubscribe <pattern>...` | Remove one or more patterns |
 | `/topics broadcast on\|off` | Opt in to broadcasts or out of them |
 
-Only you control subscriptions, and agents have no tool to change them. The session saves them with its other messaging controls and restores them when you resume it. Forks and new sessions start without any. Other sessions see a change the next time they discover peers.
+Only you control subscriptions, and agents have no tool to change them. The session saves them with its other messaging controls and restores them when you resume it. A subscription is saved right away, even in a session with no messages yet. Forks and new sessions start without any. Other sessions see a change the next time they discover peers.
 
 Agents publish with `publish_message`, giving either a concrete `topic` or `broadcast: true`. Wildcards belong only in subscriptions. A session that has not opted in to broadcasts never receives one, so a broadcast cannot wake it.
 
