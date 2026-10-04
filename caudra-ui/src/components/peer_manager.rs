@@ -1,14 +1,22 @@
+use std::collections::BTreeMap;
+use std::mem;
+use std::time::Duration;
+
+use caudra_agent::peers::topics::{MAX_PATTERNS, add_patterns, pattern_matches, remove_patterns};
 use caudra_agent::peers::{
-    HeldMessageSummary, HeldReview, PeerDecision, PeerDecisionResult, PeerInboxSnapshot,
-    PeerReviewToken, PeerSummary, deceptive, literal,
+    ChannelMessage, ChannelPage, ChannelSummary, HeldMessageSummary, HeldReview, HistoryVersion,
+    MessageChannel, PeerDecision, PeerDecisionResult, PeerInboxSnapshot, PeerReviewToken,
+    PeerSummary, deceptive, handle_address, literal,
 };
 use caudra_config::InboundPolicy;
 use caudra_grab::grab_scope;
+use caudra_storage::sessions::StoredPeerControls;
 use caudra_workbench::text_field::{FieldKind, TextField, TextKey};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use jiff::Zoned;
+use jiff::tz::TimeZone;
+use jiff::{Timestamp, Zoned};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::Style;
@@ -17,7 +25,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::components::document_view::{DocumentMouse, DocumentView, Painted};
+use crate::components::document_view::{DocumentMouse, DocumentView, MAX_ROWS, Painted};
 use crate::components::keybindings::key;
 use crate::components::modal::{FooterHits, FooterLine, Modal};
 use crate::components::{Overlay, field_styles, hover_style, input_text_style};
@@ -36,12 +44,13 @@ const LIST_ROW_HEIGHT: u16 = 2;
 const MIN_BODY_ROWS: u16 = 2;
 const OPTIONAL_CHROME_ROWS: u16 = 10;
 const FILTER_LIMIT: usize = 1024;
+const PATTERN_FIELD_LIMIT: usize = 1024;
 const WHEEL_STEP: i32 = 3;
-const POLICY_HEADER_ROWS: usize = 4;
-const POLICY_OPTION_ROWS: usize = 3;
-const POLICY_ACTION_COLS: u16 = 10;
+const SESSION_ACTION_COLS: u16 = 16;
 const MAX_LITERAL_COLS: usize = 4096;
+pub(crate) const HISTORY_POLL: Duration = Duration::from_secs(1);
 const REFRESH_TIME_FORMAT: &str = "%H:%M:%S";
+const HISTORY_TIME_FORMAT: &str = "%Y-%m-%d %H:%M";
 const APPROVAL_WARNING: &str = "Approving exposes this message to your model and may start a billable turn. It does not approve requested tool actions.";
 const RELAX_WARNING: &str = "Already held messages may become eligible and start billable model turns. This changes only this session's inbound policy.";
 const REJECT_WARNING: &str =
@@ -58,20 +67,68 @@ const FLOOR_BLOCKED: &str = "Disabled by the project inbound floor.";
 const UNAVAILABLE: &str = "Unavailable";
 const NO_MATCHES: &str = "No search matches.";
 const NO_PEERS: &str = "No eligible live peers. Opt in to messaging in another eligible local Caudra session, then refresh.";
-const NO_HELD: &str = "No held messages. This is not a message history.";
+const NO_HELD: &str = "No held messages. Press 3 to browse the stored message history.";
 const SELECT_PEER: &str = "Select a peer to inspect its exact target.";
 const SELECT_HELD: &str = "Select a held message, then press Enter to review it.";
 const PEER_GONE: &str = "This exact peer target is unavailable in the latest discovery snapshot. Select another peer explicitly.";
 const ALIAS_SCOPE: &str = "This exact alias belongs to this session's current live registration. It is not a globally shareable address.";
 const NAME_LABEL: &str = "Name: ";
+const AUDIENCE_LABEL: &str = "Audience: ";
+const TOPICS_LABEL: &str = "Topics: ";
+const BROADCASTS_LABEL: &str = "Broadcasts: ";
+const NO_TOPICS: &str = "none";
+const ON: &str = "on";
+const OFF: &str = "off";
 const PREVIEW_HINT: &str = "Passive preview. Enter or click these details to review the literal message. Selecting and refreshing do not authorize decisions.";
+const TOPIC_KEY: &str = "topic:";
+const BROADCAST_KEY: &str = "broadcast";
+const DIRECT_KEY: &str = "direct:";
+const BROADCASTS_TITLE: &str = "Broadcasts";
+const UNKNOWN_SESSION: &str = "Unknown session";
+const THIS_SESSION: &str = "this session";
+const SUBSCRIBED: &str = "subscribed";
+const VIA: &str = "via ";
+const RECEIVING: &str = "receiving";
+const NOT_RECEIVING: &str = "not receiving";
+const MESSAGE_NOUN: &str = "message";
+const MESSAGES_NOUN: &str = "messages";
+const RECIPIENT_PREFIX: &str = "  ";
+const OLDER_HINT: &str = "Older messages are stored. Press o to load them.";
+const START_HINT: &str = "Start of this channel's stored messages.";
+const LEFT_OUT_HINT: &str = "Earlier stored messages are left out of this view.";
+const HINT_ROWS: usize = 1;
+const GAP_ROWS: usize = 1;
+const NO_HISTORY: &str = "No stored messages yet. Messages this session sends or receives, and every topic and broadcast message, appear here.";
+const NO_TOPIC_HISTORY: &str = "No stored topic messages yet. Press 3 to show every channel.";
+const SELECT_CHANNEL: &str = "Select a channel to read its stored messages.";
+const LOADING_HISTORY: &str = "Loading message history…";
+const LOADING_MESSAGES: &str = "Loading messages…";
+const NOT_LOADED: &str = "Messages are not loaded. Press Ctrl+R to retry.";
+const TOPICS_SCOPE: &str = "Topics only (3 shows every channel) · ";
+const NO_NAME: &str = "No messaging name. Launch Caudra with --name NAME to give this session one.";
+const NO_SUBSCRIPTIONS: &str = "No topic subscriptions.";
+const PATTERN_PROMPT: &str = "+ ";
+const PATTERN_PLACEHOLDER: &str = "Add a topic or pattern, such as ci.*";
+const SEPARATOR: &str = " · ";
+const HISTORY_STATUS: &str = "Stored message history · Ctrl+R Refresh";
+const HISTORY_FAILED: &str = "History failed: ";
+const RETRY_HINT: &str = " · Ctrl+R Retry";
+const PANEL_TITLE: &str = "This session";
+const SUBSCRIPTIONS_HINT: &str = "Tab moves between the policy, topics, broadcasts, and the field below. Enter removes the selected topic or turns broadcasts on or off.";
+const SUBSCRIBE_LABEL: &str = " Subscribe";
+const UNSUBSCRIBE_LABEL: &str = " Unsubscribe";
+const BROADCASTS_ON_LABEL: &str = " Receive broadcasts";
+const BROADCASTS_OFF_LABEL: &str = " Stop broadcasts";
+const NEXT_LABEL: &str = " Next";
+const DIRECT_LABEL: &str = "direct";
+const LIST_SEPARATOR: &str = ", ";
 const POLICIES: [InboundPolicy; 4] = [
     InboundPolicy::Auto,
     InboundPolicy::Accept,
     InboundPolicy::Hold,
     InboundPolicy::Refuse,
 ];
-const BINDINGS: [(Command, KeyCode, KeyModifiers, &str, &str); 12] = [
+const BINDINGS: [(Command, KeyCode, KeyModifiers, &str, &str); 15] = [
     (
         Command::Sessions,
         KeyCode::Char('1'),
@@ -85,6 +142,13 @@ const BINDINGS: [(Command, KeyCode, KeyModifiers, &str, &str); 12] = [
         KeyModifiers::NONE,
         "2",
         " Held messages",
+    ),
+    (
+        Command::Messages,
+        KeyCode::Char('3'),
+        KeyModifiers::NONE,
+        "3",
+        " Messages",
     ),
     (
         Command::Filter,
@@ -126,7 +190,21 @@ const BINDINGS: [(Command, KeyCode, KeyModifiers, &str, &str); 12] = [
         KeyCode::Char('p'),
         KeyModifiers::NONE,
         "p",
-        " Policy",
+        " This session",
+    ),
+    (
+        Command::Older,
+        KeyCode::Char('o'),
+        KeyModifiers::NONE,
+        "o",
+        " Older",
+    ),
+    (
+        Command::Subscribe,
+        KeyCode::Char('s'),
+        KeyModifiers::NONE,
+        "s",
+        SUBSCRIBE_LABEL,
     ),
     (
         Command::Approve,
@@ -162,6 +240,7 @@ const BINDINGS: [(Command, KeyCode, KeyModifiers, &str, &str); 12] = [
 pub enum PeerView {
     Sessions,
     Held,
+    Messages,
 }
 
 #[derive(Debug)]
@@ -175,19 +254,59 @@ pub enum PeerManagerAction {
         decision: PeerDecision,
     },
     SetInbound(InboundPolicy),
+    Subscribe(SubscriptionChange),
     Copy(String),
+}
+
+/// One edit to this session's subscriptions, applied to whichever set it
+/// holds when the edit lands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubscriptionChange {
+    Subscribe(Vec<String>),
+    Unsubscribe(Vec<String>),
+    Broadcasts(bool),
+}
+
+impl SubscriptionChange {
+    /// The whole subscription set after this change, topics then broadcasts.
+    pub fn apply(
+        &self,
+        topics: &[String],
+        broadcasts: bool,
+    ) -> Result<(Vec<String>, bool), String> {
+        match self {
+            Self::Subscribe(patterns) => {
+                add_patterns(topics, patterns).map(|topics| (topics, broadcasts))
+            }
+            Self::Unsubscribe(patterns) => {
+                remove_patterns(topics, patterns).map(|topics| (topics, broadcasts))
+            }
+            Self::Broadcasts(on) => Ok((topics.to_vec(), *on)),
+        }
+    }
+}
+
+/// A page of one channel the Messages view waits for: the newest messages,
+/// or those before a sequence number.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageRequest {
+    pub channel: MessageChannel,
+    pub before: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
     Sessions,
     Held,
+    Messages,
     Filter,
     Activate,
     Focus,
     Refresh,
     CopyTarget,
     Policy,
+    Older,
+    Subscribe,
     Approve,
     Reject,
     Apply,
@@ -221,6 +340,7 @@ impl Default for Browser {
 #[derive(Default)]
 struct Reader {
     text: String,
+    highlight: Option<usize>,
     revision: u64,
     document: DocumentView<(u64, u64)>,
 }
@@ -236,28 +356,42 @@ impl Reader {
     fn replace(&mut self, text: String) {
         if self.text != text {
             self.text = text;
-            self.revision = self.revision.wrapping_add(1);
-            let text = &self.text;
-            self.document
-                .ensure((self.revision, theme::generation()), 0, || {
-                    paint_literal(text, theme::current().item)
-                });
+            self.repaint();
         }
     }
 
+    /// Marks source line `row` as the focused control.
+    fn highlight(&mut self, row: Option<usize>) {
+        if self.highlight != row {
+            self.highlight = row;
+            self.repaint();
+        }
+    }
+
+    fn repaint(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+        let (text, highlight) = (&self.text, self.highlight);
+        self.document
+            .ensure((self.revision, theme::generation()), 0, || {
+                paint_reader(text, highlight)
+            });
+    }
+
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
-        let style = theme::current().item;
-        let text = &self.text;
+        let (text, highlight) = (&self.text, self.highlight);
         self.document
             .restyle((self.revision, theme::generation()), || {
-                paint_literal(text, style)
+                paint_reader(text, highlight)
             });
-        let body = Rect {
-            width: area.width.saturating_sub(1),
+        let inner = Rect {
             height: area.height.saturating_sub(1),
             ..area
         };
-        self.document.draw(frame, area, body);
+        let body = Rect {
+            width: inner.width.saturating_sub(1),
+            ..inner
+        };
+        self.document.draw(frame, inner, body);
     }
 }
 
@@ -268,9 +402,177 @@ struct ReviewPanel {
     resolved: bool,
 }
 
-struct PolicyDraft {
-    value: InboundPolicy,
+/// The This session panel: a draft inbound policy, and the controls that
+/// edit subscriptions at once.
+struct SessionPanel {
+    policy: InboundPolicy,
     pending: bool,
+    focus: PanelFocus,
+    field: TextField,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PanelFocus {
+    Policy,
+    Pattern(usize),
+    Broadcasts,
+    Field,
+}
+
+/// The panel's document, and the rows its controls landed on.
+struct PanelDocument {
+    text: String,
+    policies: Vec<(usize, InboundPolicy)>,
+    targets: Vec<(usize, PanelFocus)>,
+}
+
+impl PanelDocument {
+    fn focus_row(&self, panel: &SessionPanel) -> Option<usize> {
+        match &panel.focus {
+            PanelFocus::Policy => self
+                .policies
+                .iter()
+                .find(|(_, policy)| policy == &panel.policy)
+                .map(|(row, _)| *row),
+            focus => self
+                .targets
+                .iter()
+                .find(|(_, target)| target == focus)
+                .map(|(row, _)| *row),
+        }
+    }
+}
+
+/// The Messages view: the channel list, the selected channel's loaded
+/// messages, and the loads it waits for. A change to the history while a
+/// load is under way lets that load land, then asks once more. A load whose
+/// answer was an error is asked again at each version poll until one lands.
+#[derive(Default)]
+struct History {
+    channels: Option<Vec<ChannelRow>>,
+    page: Option<LoadedPage>,
+    version: Option<HistoryVersion>,
+    polling: bool,
+    reload: bool,
+    reload_again: bool,
+    request: Option<PageRequest>,
+    refresh: bool,
+    version_error: Option<String>,
+    channels_error: Option<String>,
+    page_error: Option<(PageRequest, String)>,
+    topics_only: bool,
+}
+
+impl History {
+    fn error(&self) -> Option<&str> {
+        self.channels_error
+            .as_deref()
+            .or(self.page_error.as_ref().map(|(_, error)| error.as_str()))
+            .or(self.version_error.as_deref())
+    }
+
+    /// Asks again for each load whose answer was an error, and reports
+    /// whether any was not asked already.
+    fn retry(&mut self) -> bool {
+        let channels = self.channels_error.is_some() && !self.reload;
+        self.reload |= channels;
+        let page = self.request.is_none() && self.page_error.is_some();
+        if page {
+            self.request = self.page_error.as_ref().map(|(request, _)| request.clone());
+        }
+        channels || page
+    }
+}
+
+/// A channel as its row shows it, worked out once per channel list or
+/// change to this session's subscriptions rather than once per frame.
+struct ChannelRow {
+    summary: ChannelSummary,
+    key: String,
+    name: String,
+    detail: String,
+}
+
+impl ChannelRow {
+    fn new(summary: ChannelSummary, controls: Option<&StoredPeerControls>) -> Self {
+        Self {
+            key: channel_key(&summary.channel),
+            name: channel_name(&summary),
+            detail: channel_detail(&summary, controls),
+            summary,
+        }
+    }
+}
+
+struct LoadedPage {
+    channel: MessageChannel,
+    messages: BTreeMap<i64, ChannelMessage>,
+    older: Option<i64>,
+    capped: bool,
+}
+
+impl LoadedPage {
+    /// Takes a page, and reports whether that changed anything. An older page
+    /// adds what lies before the loaded messages. A newest page replaces the
+    /// ones it covers, and all of them once it reaches the channel's oldest
+    /// message or no longer reaches the loaded ones.
+    fn merge(
+        &mut self,
+        older: bool,
+        mut incoming: BTreeMap<i64, ChannelMessage>,
+        before: Option<i64>,
+    ) -> bool {
+        if older {
+            let changed = !incoming.is_empty() || self.older != before;
+            self.messages.append(&mut incoming);
+            self.older = before;
+            return changed;
+        }
+        let newest = self.messages.keys().next_back().copied();
+        let cutoff = before
+            .filter(|oldest| newest.is_some_and(|newest| newest >= *oldest))
+            .unwrap_or(i64::MIN);
+        let replaced = self.messages.split_off(&cutoff);
+        let older = if self.messages.is_empty() {
+            before
+        } else {
+            self.older
+        };
+        let changed = replaced != incoming || older != self.older;
+        self.messages.append(&mut incoming);
+        self.older = older;
+        changed
+    }
+
+    /// The messages as the reader shows them, oldest first under a line
+    /// saying what lies before them. Only the newest that fit in the rows a
+    /// document keeps are shown, so the document never cuts them itself.
+    fn text(&mut self) -> String {
+        let mut remaining = MAX_ROWS - HINT_ROWS;
+        let mut blocks = Vec::new();
+        self.capped = false;
+        for message in self.messages.values().rev() {
+            let block = message_block(message);
+            let rows = painted_rows(&block) + GAP_ROWS;
+            if rows > remaining {
+                self.capped = true;
+                break;
+            }
+            remaining -= rows;
+            blocks.push(block);
+        }
+        let hint = if self.capped {
+            LEFT_OUT_HINT
+        } else if self.older.is_some() {
+            OLDER_HINT
+        } else {
+            START_HINT
+        };
+        blocks.push(hint.to_owned());
+        blocks.reverse();
+        blocks.join("\n\n")
+    }
 }
 
 enum Confirmation {
@@ -333,16 +635,20 @@ pub struct PeerManager {
     discovery_error: Option<String>,
     refreshed_at: Option<String>,
     inbox: Option<PeerInboxSnapshot>,
+    peer_controls: Option<StoredPeerControls>,
+    history: History,
     session_browser: Browser,
     held_browser: Browser,
+    message_browser: Browser,
     session_reader: Reader,
     held_reader: Reader,
-    policy_reader: Reader,
+    message_reader: Reader,
+    panel_reader: Reader,
     filter_focused: bool,
     review: Option<ReviewPanel>,
     review_request: Option<(String, u64)>,
     decision_pending: bool,
-    policy: Option<PolicyDraft>,
+    panel: Option<SessionPanel>,
     confirmation: Option<Confirmation>,
     review_rendered: bool,
     confirmation_rendered: bool,
@@ -353,6 +659,7 @@ pub struct PeerManager {
     detail_area: Rect,
     row_hits: Vec<(Rect, String)>,
     policy_hits: Vec<(Rect, InboundPolicy)>,
+    panel_hits: Vec<(Rect, PanelFocus)>,
     controls: Vec<(Rect, Command)>,
     footer_hits: FooterHits,
     pointer: Option<Position>,
@@ -369,16 +676,20 @@ impl PeerManager {
             discovery_error: None,
             refreshed_at: None,
             inbox: None,
+            peer_controls: None,
+            history: History::default(),
             session_browser: Browser::default(),
             held_browser: Browser::default(),
+            message_browser: Browser::default(),
             session_reader: Reader::default(),
             held_reader: Reader::default(),
-            policy_reader: Reader::default(),
+            message_reader: Reader::default(),
+            panel_reader: Reader::default(),
             filter_focused: false,
             review: None,
             review_request: None,
             decision_pending: false,
-            policy: None,
+            panel: None,
             confirmation: None,
             review_rendered: false,
             confirmation_rendered: false,
@@ -389,6 +700,7 @@ impl PeerManager {
             detail_area: Rect::default(),
             row_hits: Vec::new(),
             policy_hits: Vec::new(),
+            panel_hits: Vec::new(),
             controls: Vec::new(),
             footer_hits: FooterHits::default(),
             pointer: None,
@@ -403,8 +715,160 @@ impl PeerManager {
         self.active = view;
     }
 
+    /// Narrows the Messages view to topic channels, as `/topics` opens it.
+    pub fn show_only_topics(&mut self) {
+        if self.open {
+            self.active = PeerView::Messages;
+            self.history.topics_only = true;
+            self.feedback = None;
+            self.invalidate_layout();
+        }
+    }
+
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    pub fn update_controls(&mut self, controls: StoredPeerControls) -> bool {
+        if !self.open || self.peer_controls.as_ref() == Some(&controls) {
+            return false;
+        }
+        if let Some(panel) = &mut self.panel
+            && let PanelFocus::Pattern(index) = panel.focus
+            && index >= controls.topics.len()
+        {
+            panel.focus = controls
+                .topics
+                .len()
+                .checked_sub(1)
+                .map_or(PanelFocus::Broadcasts, PanelFocus::Pattern);
+        }
+        for row in self.history.channels.iter_mut().flatten() {
+            row.detail = channel_detail(&row.summary, Some(&controls));
+        }
+        self.peer_controls = Some(controls);
+        self.invalidate_layout();
+        true
+    }
+
+    pub fn history_visible(&self) -> bool {
+        self.open && self.active == PeerView::Messages && self.panel.is_none()
+    }
+
+    /// A load the Messages view waits on: a version poll, a channel list, or
+    /// a page.
+    fn history_loading(&self) -> bool {
+        self.history_visible()
+            && (self.history.polling || self.history.reload || self.history.request.is_some())
+    }
+
+    pub fn wanted_channels(&self) -> bool {
+        self.history_visible() && self.history.reload
+    }
+
+    pub fn wanted_page(&self) -> Option<&PageRequest> {
+        self.history
+            .request
+            .as_ref()
+            .filter(|_| self.history_visible())
+    }
+
+    pub fn set_history_polling(&mut self, polling: bool) {
+        self.history.polling = polling;
+    }
+
+    /// Takes the history's current version. A change, the first version seen
+    /// included, reloads the channel list and the selected channel's newest
+    /// page; any other answer asks again for each load that failed.
+    pub fn set_history_version(&mut self, result: Result<HistoryVersion, String>) -> bool {
+        if !self.history_visible() {
+            return false;
+        }
+        let error = result.as_ref().err().map(|error| literal(error, false));
+        let mut changed = self.history.version_error != error;
+        self.history.version_error = error;
+        match result {
+            Ok(version) if self.history.version.as_ref() != Some(&version) => {
+                self.history.version = Some(version);
+                self.mark_stale();
+                changed = true;
+            }
+            _ => changed |= self.history.retry(),
+        }
+        if changed {
+            self.invalidate_layout();
+        }
+        changed
+    }
+
+    /// Takes the channel list asked for, then asks once more if the history
+    /// changed while it loaded. A selected channel the list no longer holds
+    /// gives way to the first one.
+    pub fn set_channels(&mut self, result: Result<Vec<ChannelSummary>, String>) {
+        if !self.wanted_channels() {
+            return;
+        }
+        let again = mem::take(&mut self.history.reload_again);
+        match result {
+            Ok(channels) => {
+                let controls = self.peer_controls.as_ref();
+                self.history.channels = Some(
+                    channels
+                        .into_iter()
+                        .map(|summary| ChannelRow::new(summary, controls))
+                        .collect(),
+                );
+                self.history.reload = again;
+                self.history.channels_error = None;
+                if self.selected_row().is_none() {
+                    self.message_browser.selected = None;
+                    self.clear_page();
+                    self.select_first_channel();
+                }
+            }
+            Err(error) => {
+                self.history.reload = false;
+                self.history.channels_error = Some(literal(&error, false));
+            }
+        }
+        self.invalidate_layout();
+    }
+
+    /// Takes the page asked for, then asks for the newest page if the history
+    /// changed while it loaded. That waits on an error until the page lands.
+    pub fn set_page(&mut self, request: PageRequest, result: Result<ChannelPage, String>) {
+        if self.wanted_page() != Some(&request) {
+            return;
+        }
+        self.history.request = None;
+        match result {
+            Ok(page) => {
+                self.history.page_error = None;
+                self.merge_page(&request, page.messages, page.before);
+                if mem::take(&mut self.history.refresh) {
+                    self.history.request = self.newest_page();
+                }
+            }
+            Err(error) => self.history.page_error = Some((request, literal(&error, false))),
+        }
+        self.invalidate_layout();
+    }
+
+    pub fn finish_subscriptions(&mut self, result: Result<String, String>) {
+        if !self.open {
+            return;
+        }
+        match (result, &mut self.panel) {
+            (Ok(summary), panel) => {
+                if let Some(panel) = panel {
+                    panel.error = None;
+                }
+                self.feedback = Some(literal(&summary, false));
+            }
+            (Err(error), Some(panel)) => panel.error = Some(literal(&error, false)),
+            (Err(error), None) => self.feedback = Some(literal(&error, false)),
+        }
+        self.invalidate_layout();
     }
 
     pub fn is_open(&self) -> bool {
@@ -581,21 +1045,18 @@ impl PeerManager {
     }
 
     pub fn finish_policy(&mut self, result: Result<(), String>) {
-        if !self.open || !self.policy.as_ref().is_some_and(|policy| policy.pending) {
+        let Some(panel) = self
+            .panel
+            .as_mut()
+            .filter(|panel| self.open && panel.pending)
+        else {
             return;
-        }
-        match result {
-            Ok(()) => {
-                self.policy = None;
-                self.feedback = Some(POLICY_SAVED.to_owned());
-            }
-            Err(error) => {
-                if let Some(policy) = &mut self.policy {
-                    policy.pending = false;
-                }
-                self.feedback = Some(literal(&error, false));
-            }
-        }
+        };
+        panel.pending = false;
+        self.feedback = Some(match result {
+            Ok(()) => POLICY_SAVED.to_owned(),
+            Err(error) => literal(&error, false),
+        });
         self.freshness.barrier();
         self.invalidate_layout();
     }
@@ -611,6 +1072,7 @@ impl PeerManager {
         match self.active {
             PeerView::Sessions => &self.session_browser,
             PeerView::Held => &self.held_browser,
+            PeerView::Messages => &self.message_browser,
         }
     }
 
@@ -618,16 +1080,18 @@ impl PeerManager {
         match self.active {
             PeerView::Sessions => &mut self.session_browser,
             PeerView::Held => &mut self.held_browser,
+            PeerView::Messages => &mut self.message_browser,
         }
     }
 
     fn reader_mut(&mut self) -> &mut Reader {
-        if self.policy.is_some() {
-            return &mut self.policy_reader;
+        if self.panel.is_some() {
+            return &mut self.panel_reader;
         }
         match self.active {
             PeerView::Sessions => &mut self.session_reader,
             PeerView::Held => &mut self.held_reader,
+            PeerView::Messages => &mut self.message_reader,
         }
     }
 
@@ -638,8 +1102,319 @@ impl PeerManager {
         self.footer_hits.clear();
         self.row_hits.clear();
         self.policy_hits.clear();
+        self.panel_hits.clear();
         self.list_area = Rect::default();
         self.detail_area = Rect::default();
+    }
+
+    fn selected_row(&self) -> Option<&ChannelRow> {
+        let selected = self.message_browser.selected.as_ref()?;
+        self.history
+            .channels
+            .as_ref()?
+            .iter()
+            .find(|row| &row.key == selected)
+    }
+
+    fn selected_channel(&self) -> Option<MessageChannel> {
+        self.selected_row().map(|row| row.summary.channel.clone())
+    }
+
+    fn select_first_channel(&mut self) {
+        if self.active == PeerView::Messages
+            && self.message_browser.selected.is_none()
+            && let Some((id, _, _)) = self.entries().into_iter().next()
+        {
+            self.select(id);
+        }
+    }
+
+    fn newest_page(&self) -> Option<PageRequest> {
+        self.selected_channel().map(|channel| PageRequest {
+            channel,
+            before: None,
+        })
+    }
+
+    /// The page `o` asks for: none while a page loads, once the oldest
+    /// message is loaded, or once the reader holds all the rows it can.
+    fn older_page(&self) -> Option<PageRequest> {
+        let page = self
+            .history
+            .page
+            .as_ref()
+            .filter(|page| !page.capped && self.history.request.is_none())?;
+        Some(PageRequest {
+            channel: page.channel.clone(),
+            before: Some(page.older?),
+        })
+    }
+
+    /// Reloads what a history change may have touched: the channel list, and
+    /// the selected channel's newest page. A load under way lands first, then
+    /// is followed by one more. Feedback shown until now goes with the change.
+    fn mark_stale(&mut self) {
+        self.feedback = None;
+        let newest = self.newest_page();
+        let history = &mut self.history;
+        history.reload_again |= history.reload;
+        history.reload = true;
+        history.refresh = history.request.is_some();
+        if !history.refresh {
+            history.request = newest;
+        }
+    }
+
+    /// Forgets the loaded messages and any page asked for.
+    fn clear_page(&mut self) {
+        self.history.page = None;
+        self.history.request = None;
+        self.history.refresh = false;
+        self.history.page_error = None;
+        self.message_reader = Reader::default();
+    }
+
+    fn load_selected(&mut self) {
+        let channel = self.selected_channel();
+        if self.history.page.as_ref().map(|page| &page.channel) == channel.as_ref() {
+            return;
+        }
+        self.clear_page();
+        self.history.request = self.newest_page();
+    }
+
+    /// Adds a page of `request`'s channel to what the reader shows, unless it
+    /// changes nothing. The first page lands at the newest message and
+    /// follows it. An older page adds rows only above the loaded messages, so
+    /// they stay where they were on screen.
+    fn merge_page(
+        &mut self,
+        request: &PageRequest,
+        messages: Vec<ChannelMessage>,
+        before: Option<i64>,
+    ) {
+        let incoming = messages
+            .into_iter()
+            .map(|message| (message.seq, message))
+            .collect();
+        let rows = self.message_reader.document.rows();
+        let (page, first) = match &mut self.history.page {
+            Some(page) if page.channel == request.channel => {
+                if !page.merge(request.before.is_some(), incoming, before) {
+                    return;
+                }
+                (page, false)
+            }
+            slot => (
+                slot.insert(LoadedPage {
+                    channel: request.channel.clone(),
+                    messages: incoming,
+                    older: before,
+                    capped: false,
+                }),
+                true,
+            ),
+        };
+        let text = page.text();
+        if first {
+            self.message_reader.set(text);
+            self.message_reader.document.follow();
+        } else {
+            self.message_reader.replace(text);
+            if request.before.is_some() {
+                let added = self.message_reader.document.rows() - rows;
+                self.message_reader.document.insert_above(added);
+            }
+        }
+    }
+
+    /// What `s` does to the selected channel: a topic is subscribed to or
+    /// unsubscribed from exactly, and broadcasts are turned on or off.
+    fn subscription_toggle(&self) -> Option<SubscriptionChange> {
+        let controls = self
+            .peer_controls
+            .as_ref()
+            .filter(|_| self.active == PeerView::Messages && self.panel.is_none())?;
+        match self.selected_channel()? {
+            MessageChannel::Topic(topic) if controls.topics.contains(&topic) => {
+                Some(SubscriptionChange::Unsubscribe(vec![topic]))
+            }
+            MessageChannel::Topic(topic) => Some(SubscriptionChange::Subscribe(vec![topic])),
+            MessageChannel::Broadcast => Some(SubscriptionChange::Broadcasts(!controls.broadcasts)),
+            MessageChannel::Direct(_) => None,
+        }
+    }
+
+    /// What Enter does from the panel's focus: removes the focused topic,
+    /// turns broadcasts over, or subscribes to the field's patterns.
+    fn panel_change(&self) -> Option<SubscriptionChange> {
+        let (panel, controls) = (self.panel.as_ref()?, self.peer_controls.as_ref()?);
+        match panel.focus {
+            PanelFocus::Policy => None,
+            PanelFocus::Pattern(index) => controls
+                .topics
+                .get(index)
+                .map(|pattern| SubscriptionChange::Unsubscribe(vec![pattern.clone()])),
+            PanelFocus::Broadcasts => Some(SubscriptionChange::Broadcasts(!controls.broadcasts)),
+            PanelFocus::Field => Some(SubscriptionChange::Subscribe(
+                panel
+                    .field
+                    .text()
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect(),
+            )),
+        }
+    }
+
+    fn activate_panel(&mut self) -> PeerManagerAction {
+        let (Some(change), Some(controls)) = (self.panel_change(), &self.peer_controls) else {
+            return PeerManagerAction::Consumed;
+        };
+        let Some(panel) = &mut self.panel else {
+            return PeerManagerAction::Consumed;
+        };
+        if let SubscriptionChange::Subscribe(patterns) = &change {
+            if patterns.is_empty() {
+                return PeerManagerAction::Consumed;
+            }
+            if let Err(error) = change.apply(&controls.topics, controls.broadcasts) {
+                panel.error = Some(literal(&error, false));
+                self.invalidate_layout();
+                return PeerManagerAction::Consumed;
+            }
+            panel.field.clear();
+        }
+        panel.error = None;
+        self.freshness.barrier();
+        self.invalidate_layout();
+        PeerManagerAction::Subscribe(change)
+    }
+
+    /// Moves the panel's focus through the policy, each topic, broadcasts,
+    /// and the field, in that order, around the ends only when `wrap`.
+    fn move_panel_focus(&mut self, delta: isize, wrap: bool) {
+        let topics = self
+            .peer_controls
+            .as_ref()
+            .map(|controls| controls.topics.len());
+        let Some(panel) = &mut self.panel else {
+            return;
+        };
+        let mut targets = vec![PanelFocus::Policy];
+        if let Some(topics) = topics {
+            targets.extend((0..topics).map(PanelFocus::Pattern));
+            targets.extend([PanelFocus::Broadcasts, PanelFocus::Field]);
+        }
+        let count = targets.len();
+        let current = targets
+            .iter()
+            .position(|target| target == &panel.focus)
+            .unwrap_or(0);
+        let next = if wrap {
+            Some((current + count).saturating_add_signed(delta) % count)
+        } else {
+            current
+                .checked_add_signed(delta)
+                .filter(|next| *next < count)
+        };
+        if let Some(next) = next {
+            panel.focus = targets.swap_remove(next);
+            self.reveal_panel_focus();
+            self.invalidate_layout();
+        }
+    }
+
+    fn reveal_panel_focus(&mut self) {
+        let row = self.panel_document().and_then(|document| {
+            self.panel
+                .as_ref()
+                .and_then(|panel| document.focus_row(panel))
+        });
+        if let Some(row) = row {
+            self.panel_reader.document.reveal(row);
+        }
+    }
+
+    /// The panel as text, with the rows its policies and controls landed on.
+    fn panel_document(&self) -> Option<PanelDocument> {
+        let (panel, inbox) = (self.panel.as_ref()?, self.inbox.as_ref()?);
+        let override_label = inbox.inbound_override.as_ref().map_or("None", policy_label);
+        let name = match &self.peer_controls {
+            None => format!("{NAME_LABEL}{UNAVAILABLE}"),
+            Some(controls) => controls.handle.as_deref().map_or_else(
+                || NO_NAME.to_owned(),
+                |handle| format!("{NAME_LABEL}{}", literal(&handle_address(handle), false)),
+            ),
+        };
+        let mut lines = vec![
+            PANEL_TITLE.to_owned(),
+            name,
+            String::new(),
+            format!(
+                "Inbound policy · effective {}",
+                policy_label(&inbox.inbound)
+            ),
+            format!("Session override: {override_label}"),
+            format!(
+                "Project floor: {} (options below it are disabled)",
+                policy_label(&inbox.project_floor)
+            ),
+            String::new(),
+        ];
+        let mut policies = Vec::new();
+        for policy in POLICIES {
+            let disabled = policy_rank(&policy) < policy_rank(&inbox.project_floor);
+            policies.push((lines.len(), policy.clone()));
+            lines.push(format!(
+                "{} {}{}",
+                if panel.policy == policy { ">" } else { " " },
+                policy_label(&policy),
+                if disabled {
+                    " · disabled by project"
+                } else {
+                    ""
+                }
+            ));
+            lines.push(format!("  {}", policy_description(&policy)));
+            lines.push(String::new());
+        }
+        lines.push(
+            if panel.pending {
+                "Applying policy…"
+            } else {
+                "Up/Down select a draft; a Apply changes this session. Esc cancels."
+            }
+            .to_owned(),
+        );
+        lines.push("Refuse rejects new arrivals; it does not delete held messages.".to_owned());
+        let mut targets = Vec::new();
+        if let Some(controls) = &self.peer_controls {
+            lines.push(String::new());
+            lines.push(format!(
+                "{TOPICS_LABEL}{} of {MAX_PATTERNS}",
+                controls.topics.len()
+            ));
+            if controls.topics.is_empty() {
+                lines.push(format!("{RECIPIENT_PREFIX}{NO_SUBSCRIPTIONS}"));
+            }
+            for (index, pattern) in controls.topics.iter().enumerate() {
+                targets.push((lines.len(), PanelFocus::Pattern(index)));
+                lines.push(format!("{RECIPIENT_PREFIX}{}", literal(pattern, false)));
+            }
+            targets.push((lines.len(), PanelFocus::Broadcasts));
+            lines.push(format!(
+                "{BROADCASTS_LABEL}{}",
+                if controls.broadcasts { ON } else { OFF }
+            ));
+            lines.push(String::new());
+            lines.push(SUBSCRIPTIONS_HINT.to_owned());
+        }
+        Some(PanelDocument {
+            text: lines.join("\n"),
+            policies,
+            targets,
+        })
     }
 
     fn selected_peer(&self) -> Option<&PeerSummary> {
@@ -659,6 +1434,9 @@ impl PeerManager {
             .find(|held| &held.message_id == selected)
     }
 
+    /// The rows of the active view as id, name, and detail, matched against
+    /// the filter. A channel's id names its direct party's session, so only
+    /// what a row shows is searched.
     fn entries(&self) -> Vec<(String, String, String)> {
         let query = self.browser().filter.text().to_lowercase();
         let entries = match self.active {
@@ -678,7 +1456,17 @@ impl PeerManager {
                         Some(address) => format!("{title} · {}", literal(&address, false)),
                         None => title,
                     };
-                    (peer.target.clone(), name, detail)
+                    let search = format!(
+                        "{} {name} {detail} {} {}",
+                        peer.target,
+                        peer.topics.join(" "),
+                        if peer.broadcasts {
+                            BROADCASTS_TITLE
+                        } else {
+                            ""
+                        }
+                    );
+                    (peer.target.clone(), name, detail, search)
                 })
                 .collect::<Vec<_>>(),
             PeerView::Held => self
@@ -686,26 +1474,41 @@ impl PeerManager {
                 .iter()
                 .flat_map(|inbox| &inbox.messages)
                 .map(|held| {
+                    let name = literal(&held.sender_name, false);
+                    let detail = format!(
+                        "{}{SEPARATOR}{}{SEPARATOR}{}",
+                        literal(&held.audience.to_string(), false),
+                        literal(&held.message_id, false),
+                        literal(&held.reason, false)
+                    );
+                    let search = format!("{} {name} {detail}", held.message_id);
+                    (held.message_id.clone(), name, detail, search)
+                })
+                .collect::<Vec<_>>(),
+            PeerView::Messages => self
+                .history
+                .channels
+                .iter()
+                .flatten()
+                .filter(|row| {
+                    !self.history.topics_only
+                        || matches!(row.summary.channel, MessageChannel::Topic(_))
+                })
+                .map(|row| {
+                    let search = format!("{} {}", row.name, row.detail);
                     (
-                        held.message_id.clone(),
-                        literal(&held.sender_name, false),
-                        format!(
-                            "{} · {}",
-                            literal(&held.message_id, false),
-                            literal(&held.reason, false)
-                        ),
+                        row.key.clone(),
+                        row.name.clone(),
+                        row.detail.clone(),
+                        search,
                     )
                 })
                 .collect::<Vec<_>>(),
         };
         entries
             .into_iter()
-            .filter(|(id, name, detail)| {
-                query.is_empty()
-                    || format!("{id} {name} {detail}")
-                        .to_lowercase()
-                        .contains(&query)
-            })
+            .filter(|(_, _, _, search)| query.is_empty() || search.to_lowercase().contains(&query))
+            .map(|(id, name, detail, _)| (id, name, detail))
             .collect()
     }
 
@@ -715,17 +1518,23 @@ impl PeerManager {
         }
         self.browser_mut().selected = Some(selected);
         self.review_request = None;
-        if self.active == PeerView::Held {
-            if let Some(review) = &mut self.review {
-                review.token = None;
+        match self.active {
+            PeerView::Held => {
+                if let Some(review) = &mut self.review {
+                    review.token = None;
+                }
+                if !self.review.as_ref().is_some_and(|review| review.resolved)
+                    && !self.decision_pending
+                {
+                    self.review = None;
+                    self.held_reader = Reader::default();
+                }
             }
-            if !self.review.as_ref().is_some_and(|review| review.resolved) && !self.decision_pending
-            {
-                self.review = None;
-                self.held_reader = Reader::default();
+            PeerView::Sessions => self.session_reader = Reader::default(),
+            PeerView::Messages => {
+                self.feedback = None;
+                self.load_selected();
             }
-        } else {
-            self.session_reader = Reader::default();
         }
         self.freshness.barrier();
         self.invalidate_layout();
@@ -756,6 +1565,14 @@ impl PeerManager {
                 return PeerManagerAction::Consumed;
             }
             return self.filter_key(event);
+        }
+        if self.field_focused() {
+            if event.kind == KeyEventKind::Repeat
+                && matches!(event.code, KeyCode::Esc | KeyCode::Enter)
+            {
+                return PeerManagerAction::Consumed;
+            }
+            return self.field_key(event);
         }
         if !fresh
             && !matches!(
@@ -789,17 +1606,26 @@ impl PeerManager {
                 .map_or(PeerManagerAction::Consumed, PeerManagerAction::Copy);
         }
         if key::SELECT_ALL.matches(event)
-            && (self.policy.is_some() || self.browser().pane == Pane::Detail)
+            && (self.panel.is_some() || self.browser().pane == Pane::Detail)
         {
             self.reader_mut().document.select_all();
             return PeerManagerAction::Consumed;
         }
-        if self.policy.is_some() {
-            match event.code {
-                KeyCode::Up => self.step_policy(-1),
-                KeyCode::Down => self.step_policy(1),
+        if let Some(panel) = &self.panel {
+            match (event.code, &panel.focus) {
+                (KeyCode::Up, PanelFocus::Policy) => {
+                    self.step_policy(-1);
+                }
+                (KeyCode::Down, PanelFocus::Policy) => {
+                    if !self.step_policy(1) {
+                        self.move_panel_focus(1, false);
+                    }
+                }
+                (KeyCode::Up, _) => self.move_panel_focus(-1, false),
+                (KeyCode::Down, _) => self.move_panel_focus(1, false),
+                (KeyCode::BackTab, _) => self.move_panel_focus(-1, true),
                 _ => {
-                    self.policy_reader.document.handle_scroll_key(event);
+                    self.panel_reader.document.handle_scroll_key(event);
                 }
             }
         } else if event.code == KeyCode::BackTab {
@@ -851,6 +1677,42 @@ impl PeerManager {
         PeerManagerAction::Consumed
     }
 
+    fn field_focused(&self) -> bool {
+        self.confirmation.is_none()
+            && self
+                .panel
+                .as_ref()
+                .is_some_and(|panel| panel.focus == PanelFocus::Field)
+    }
+
+    /// Keys for the pattern field, which takes printable shortcuts as text.
+    fn field_key(&mut self, event: KeyEvent) -> PeerManagerAction {
+        let Some(panel) = &mut self.panel else {
+            return PeerManagerAction::Consumed;
+        };
+        match event.code {
+            KeyCode::Enter => return self.activate_panel(),
+            KeyCode::Esc if panel.field.is_empty() => return self.command(Command::Back),
+            KeyCode::Esc => {
+                panel.field.clear();
+                panel.error = None;
+            }
+            KeyCode::Tab => self.move_panel_focus(1, true),
+            KeyCode::BackTab => self.move_panel_focus(-1, true),
+            KeyCode::Up => self.move_panel_focus(-1, false),
+            KeyCode::Char(character) if deceptive(character) => {}
+            _ => {
+                panel.error = None;
+                if let TextKey::Copy(text) | TextKey::Cut(text) = panel.field.handle_key(event) {
+                    self.invalidate_layout();
+                    return PeerManagerAction::Copy(text);
+                }
+            }
+        }
+        self.invalidate_layout();
+        PeerManagerAction::Consumed
+    }
+
     pub fn handle_paste(&mut self, text: &str) -> bool {
         if !self.open {
             return false;
@@ -858,6 +1720,12 @@ impl PeerManager {
         if self.filter_focused {
             self.browser_mut().filter.paste(&literal(text, false));
             self.browser_mut().offset = 0;
+            self.invalidate_layout();
+        } else if self.field_focused()
+            && let Some(panel) = &mut self.panel
+        {
+            panel.field.paste(&literal(text, false));
+            panel.error = None;
             self.invalidate_layout();
         }
         true
@@ -888,26 +1756,37 @@ impl PeerManager {
                 _ => PeerManagerAction::Consumed,
             };
         }
-        if self.policy.is_some() {
+        if self.panel.is_some() {
             return match command {
-                Command::Back if !self.policy.as_ref().is_some_and(|policy| policy.pending) => {
-                    self.policy = None;
+                Command::Back if !self.panel.as_ref().is_some_and(|panel| panel.pending) => {
+                    self.panel = None;
                     self.invalidate_layout();
                     PeerManagerAction::Consumed
                 }
                 Command::Apply => self.apply_policy(),
+                Command::Activate => self.activate_panel(),
+                Command::Focus => {
+                    self.move_panel_focus(1, true);
+                    PeerManagerAction::Consumed
+                }
                 _ => PeerManagerAction::Consumed,
             };
         }
         match command {
-            Command::Sessions | Command::Held => {
-                self.active = if command == Command::Sessions {
-                    PeerView::Sessions
-                } else {
-                    PeerView::Held
+            Command::Sessions | Command::Held | Command::Messages => {
+                let view = match command {
+                    Command::Sessions => PeerView::Sessions,
+                    Command::Held => PeerView::Held,
+                    _ => PeerView::Messages,
                 };
+                if view == PeerView::Messages && self.active == PeerView::Messages {
+                    self.history.topics_only = false;
+                }
+                self.active = view;
                 self.filter_focused = false;
                 self.review_request = None;
+                self.feedback = None;
+                self.select_first_channel();
                 self.freshness.barrier();
                 self.invalidate_layout();
                 if self.active == PeerView::Sessions && self.sessions.is_none() && !self.discovering
@@ -928,6 +1807,12 @@ impl PeerManager {
                 self.invalidate_layout();
             }
             Command::Activate => return self.activate(),
+            Command::Refresh if self.active == PeerView::Messages => {
+                self.history.channels_error = None;
+                self.history.page_error = None;
+                self.mark_stale();
+                self.invalidate_layout();
+            }
             Command::Refresh => return PeerManagerAction::Refresh,
             Command::CopyTarget => {
                 let target = match self.active {
@@ -937,18 +1822,34 @@ impl PeerManager {
                         .as_ref()
                         .map(|review| review.summary.reply_target.clone())
                         .or_else(|| self.selected_held().map(|held| held.reply_target.clone())),
+                    PeerView::Messages => None,
                 };
                 return target.map_or(PeerManagerAction::Consumed, PeerManagerAction::Copy);
             }
             Command::Policy => {
                 if let Some(inbox) = &self.inbox {
-                    self.policy = Some(PolicyDraft {
-                        value: inbox.inbound.clone(),
+                    self.panel = Some(SessionPanel {
+                        policy: inbox.inbound.clone(),
                         pending: false,
+                        focus: PanelFocus::Policy,
+                        field: TextField::new(FieldKind::Line).limited_to(PATTERN_FIELD_LIMIT),
+                        error: None,
                     });
-                    self.policy_reader = Reader::default();
+                    self.panel_reader = Reader::default();
                     self.feedback = None;
                     self.invalidate_layout();
+                }
+            }
+            Command::Older => {
+                if let Some(request) = self.older_page().filter(|_| self.history_visible()) {
+                    self.history.request = Some(request);
+                    self.invalidate_layout();
+                }
+            }
+            Command::Subscribe => {
+                if let Some(change) = self.subscription_toggle() {
+                    self.freshness.barrier();
+                    return PeerManagerAction::Subscribe(change);
                 }
             }
             Command::Approve => {
@@ -995,7 +1896,7 @@ impl PeerManager {
             return PeerManagerAction::Consumed;
         }
         self.browser_mut().pane = Pane::Detail;
-        if self.active == PeerView::Sessions {
+        if self.active != PeerView::Held {
             self.invalidate_layout();
             return PeerManagerAction::Consumed;
         }
@@ -1032,7 +1933,7 @@ impl PeerManager {
             && self.active == PeerView::Held
             && self.browser().pane == Pane::Detail
             && !self.filter_focused
-            && self.policy.is_none()
+            && self.panel.is_none()
             && !self.decision_pending
             && self.review_rendered
             && self.review_current()
@@ -1102,48 +2003,46 @@ impl PeerManager {
         }
     }
 
-    fn step_policy(&mut self, delta: isize) {
-        let (Some(draft), Some(inbox)) = (&self.policy, &self.inbox) else {
-            return;
+    /// Moves the draft to the next policy the project floor allows, and
+    /// whether there was one. A pending draft holds still but keeps the key.
+    fn step_policy(&mut self, delta: isize) -> bool {
+        let (Some(panel), Some(inbox)) = (&mut self.panel, &self.inbox) else {
+            return false;
         };
-        if draft.pending {
-            return;
+        if panel.pending {
+            return true;
         }
-        let current = POLICIES
+        let mut index = POLICIES
             .iter()
-            .position(|policy| policy == &draft.value)
+            .position(|policy| policy == &panel.policy)
             .unwrap_or(0);
-        let mut index = current;
         while let Some(next) = index
             .checked_add_signed(delta)
             .filter(|next| *next < POLICIES.len())
         {
             index = next;
             if policy_rank(&POLICIES[index]) >= policy_rank(&inbox.project_floor) {
-                if let Some(draft) = &mut self.policy {
-                    draft.value = POLICIES[index].clone();
-                }
-                self.policy_reader
-                    .document
-                    .reveal(POLICY_HEADER_ROWS + index * POLICY_OPTION_ROWS);
+                panel.policy = POLICIES[index].clone();
+                self.reveal_panel_focus();
                 self.invalidate_layout();
-                break;
+                return true;
             }
         }
+        false
     }
 
     fn apply_policy(&mut self) -> PeerManagerAction {
-        let (Some(draft), Some(inbox)) = (&self.policy, &self.inbox) else {
+        let (Some(panel), Some(inbox)) = (&self.panel, &self.inbox) else {
             return PeerManagerAction::Consumed;
         };
-        if draft.pending {
+        if panel.pending {
             return PeerManagerAction::Consumed;
         }
-        if policy_rank(&draft.value) < policy_rank(&inbox.project_floor) {
+        if policy_rank(&panel.policy) < policy_rank(&inbox.project_floor) {
             self.feedback = Some(FLOOR_BLOCKED.to_owned());
             return PeerManagerAction::Consumed;
         }
-        let policy = draft.value.clone();
+        let policy = panel.policy.clone();
         self.freshness.barrier();
         if policy_rank(&policy) < policy_rank(&inbox.inbound) {
             self.confirmation = Some(Confirmation::Relax {
@@ -1158,8 +2057,8 @@ impl PeerManager {
     }
 
     fn submit_policy(&mut self, policy: InboundPolicy) -> PeerManagerAction {
-        if let Some(draft) = &mut self.policy {
-            draft.pending = true;
+        if let Some(panel) = &mut self.panel {
+            panel.pending = true;
         }
         if let Some(review) = &mut self.review {
             review.token = None;
@@ -1176,7 +2075,7 @@ impl PeerManager {
         if !self.open || self.confirmation.is_some() {
             return;
         }
-        if self.policy.is_none() && self.browser().pane == Pane::List {
+        if self.panel.is_none() && self.browser().pane == Pane::List {
             self.step(-(delta.signum() as isize));
         } else {
             self.reader_mut().document.scroll(delta);
@@ -1201,7 +2100,7 @@ impl PeerManager {
             return self.command(command.clone());
         }
         if event.kind == MouseEventKind::Down(MouseButton::Left) && !self.popup.contains(position) {
-            if self.confirmation.is_some() || self.policy.is_some() {
+            if self.confirmation.is_some() || self.panel.is_some() {
                 return self.command(Command::Back);
             }
             self.close();
@@ -1242,13 +2141,26 @@ impl PeerManager {
                 .find(|(area, _)| area.contains(position))
             {
                 let policy = policy.clone();
-                if let (Some(draft), Some(inbox)) = (&mut self.policy, &self.inbox)
-                    && !draft.pending
+                if let (Some(panel), Some(inbox)) = (&mut self.panel, &self.inbox)
+                    && !panel.pending
                     && policy_rank(&policy) >= policy_rank(&inbox.project_floor)
                 {
-                    draft.value = policy;
+                    panel.policy = policy;
+                    panel.focus = PanelFocus::Policy;
                     self.invalidate_layout();
                 }
+                return PeerManagerAction::Consumed;
+            }
+            if let Some((_, focus)) = self
+                .panel_hits
+                .iter()
+                .find(|(area, _)| area.contains(position))
+            {
+                let focus = focus.clone();
+                if let Some(panel) = &mut self.panel {
+                    panel.focus = focus;
+                }
+                self.invalidate_layout();
                 return PeerManagerAction::Consumed;
             }
             if let Some((_, id)) = self
@@ -1261,7 +2173,7 @@ impl PeerManager {
                 self.select(id);
                 return PeerManagerAction::Consumed;
             }
-            if self.detail_area.contains(position) && self.policy.is_none() {
+            if self.detail_area.contains(position) && self.panel.is_none() {
                 self.browser_mut().pane = Pane::Detail;
                 if self.active == PeerView::Held
                     && self.review.is_none()
@@ -1271,7 +2183,7 @@ impl PeerManager {
                 }
             }
         }
-        if self.policy.is_some() || self.browser().pane == Pane::Detail {
+        if self.panel.is_some() || self.browser().pane == Pane::Detail {
             match self.reader_mut().document.handle_mouse(event) {
                 DocumentMouse::Copy(text) => return PeerManagerAction::Copy(text),
                 DocumentMouse::Consumed | DocumentMouse::Passthrough => {}
@@ -1289,6 +2201,7 @@ impl PeerManager {
         self.confirmation_rendered = false;
         self.row_hits.clear();
         self.policy_hits.clear();
+        self.panel_hits.clear();
         let (popup, inner) = Modal {
             title: TITLE,
             width_percent: WIDTH_PERCENT,
@@ -1310,19 +2223,19 @@ impl PeerManager {
             1
         };
         let footer = take_bottom(&mut content, footer_rows);
-        if self.confirmation.is_none() && self.policy.is_none() && content.height > MIN_BODY_ROWS {
+        if self.confirmation.is_none() && self.panel.is_none() && content.height > MIN_BODY_ROWS {
             let tabs = take_top(&mut content, 1);
             self.draw_commands(
                 frame,
                 tabs,
-                &[Command::Sessions, Command::Held],
+                &[Command::Sessions, Command::Held, Command::Messages],
                 &mut controls,
             );
         }
         if content.height >= OPTIONAL_CHROME_ROWS && self.confirmation.is_none() {
             let status = take_top(&mut content, 1);
-            let [status, policy] =
-                Layout::horizontal([Constraint::Fill(1), Constraint::Length(POLICY_ACTION_COLS)])
+            let [status, action] =
+                Layout::horizontal([Constraint::Fill(1), Constraint::Length(SESSION_ACTION_COLS)])
                     .areas(status);
             let inbound = self
                 .inbox
@@ -1333,13 +2246,13 @@ impl PeerManager {
                     .style(theme::current().tool_dim),
                 status,
             );
-            if self.policy.is_none() && !self.filter_focused && self.inbox.is_some() {
-                self.draw_commands(frame, policy, &[Command::Policy], &mut controls);
+            if self.panel.is_none() && !self.filter_focused && self.inbox.is_some() {
+                self.draw_commands(frame, action, &[Command::Policy], &mut controls);
             }
         }
         let filter_visible = self.filter_focused || !self.browser().filter.is_empty();
         if filter_visible
-            && self.policy.is_none()
+            && self.panel.is_none()
             && self.confirmation.is_none()
             && content.height > MIN_BODY_ROWS
         {
@@ -1358,10 +2271,17 @@ impl PeerManager {
             );
             frame.render_widget(Paragraph::new(Line::from(spans)), filter);
         }
-        let feedback = self.feedback.clone().or_else(|| {
-            (self.active == PeerView::Sessions && self.policy.is_none())
-                .then(|| self.discovery_status())
-        });
+        let status = match self.active {
+            _ if self.panel.is_some() => None,
+            PeerView::Sessions => Some(self.discovery_status()),
+            PeerView::Held => None,
+            PeerView::Messages => Some(self.history_status()),
+        };
+        let feedback = if self.history_visible() && self.history.error().is_some() {
+            status
+        } else {
+            self.feedback.clone().or(status)
+        };
         if let Some(feedback) = feedback
             && self.confirmation.is_none()
             && content.height > MIN_BODY_ROWS
@@ -1376,9 +2296,9 @@ impl PeerManager {
         self.detail_area = Rect::default();
         if self.confirmation.is_some() {
             self.draw_confirmation(frame, content);
-        } else if self.policy.is_some() {
+        } else if self.panel.is_some() {
             self.detail_area = content;
-            self.draw_policy(frame, content);
+            self.draw_panel(frame, content);
         } else {
             let (list, detail) = panes(content, &self.browser().pane);
             self.list_area = list;
@@ -1426,6 +2346,23 @@ impl PeerManager {
         )
     }
 
+    fn history_status(&self) -> String {
+        if let Some(error) = self.history.error() {
+            return format!("{HISTORY_FAILED}{error}{RETRY_HINT}");
+        }
+        let scope = if self.history.topics_only {
+            TOPICS_SCOPE
+        } else {
+            ""
+        };
+        let status = if self.history.channels.is_some() {
+            HISTORY_STATUS
+        } else {
+            LOADING_HISTORY
+        };
+        format!("{scope}{status}")
+    }
+
     fn draw_list(&mut self, frame: &mut Frame, area: Rect) {
         grab_scope!("peer_manager_list", area);
         let entries = self.entries();
@@ -1443,6 +2380,15 @@ impl PeerManager {
                         .is_some_and(|inbox| inbox.messages.is_empty()) =>
                 {
                     NO_HELD.to_owned()
+                }
+                PeerView::Messages if self.history.channels.is_none() => self.history_status(),
+                PeerView::Messages if self.message_browser.filter.is_empty() => {
+                    if self.history.topics_only {
+                        NO_TOPIC_HISTORY
+                    } else {
+                        NO_HISTORY
+                    }
+                    .to_owned()
                 }
                 _ => NO_MATCHES.to_owned(),
             };
@@ -1532,9 +2478,19 @@ impl PeerManager {
                         .handle_address()
                         .map(|address| format!("{NAME_LABEL}{}\n", literal(&address, false)))
                         .unwrap_or_default();
+                    let topics = if peer.topics.is_empty() {
+                        NO_TOPICS.to_owned()
+                    } else {
+                        peer.topics
+                            .iter()
+                            .map(|topic| literal(topic, false))
+                            .collect::<Vec<_>>()
+                            .join(LIST_SEPARATOR)
+                    };
                     format!(
-                        "{}\n\n{name}Exact target: {}\nWorkspace: {}\n\n{}",
+                        "{}\n\n{name}{TOPICS_LABEL}{topics}\n{BROADCASTS_LABEL}{}\nExact target: {}\nWorkspace: {}\n\n{}",
                         literal(&peer.title, false),
+                        if peer.broadcasts { ON } else { OFF },
                         literal(&peer.target, false),
                         literal(&peer.cwd.to_string_lossy(), false),
                         ALIAS_SCOPE,
@@ -1543,6 +2499,34 @@ impl PeerManager {
             );
             self.session_reader.replace(text);
             self.session_reader.draw(frame, area);
+            return;
+        }
+        if self.active == PeerView::Messages {
+            let header = self
+                .selected_row()
+                .map(|row| format!("{}\n{}", row.name, row.detail));
+            if let Some(header) = &header {
+                let rows = wrapped_height(header, area.width)
+                    .min(area.height.saturating_sub(MIN_BODY_ROWS));
+                let header_area = take_top(&mut area, rows);
+                frame.render_widget(
+                    Paragraph::new(header.as_str())
+                        .style(theme::current().tool_dim)
+                        .wrap(Wrap { trim: false }),
+                    header_area,
+                );
+            }
+            let loading = self.history.request.is_some() && self.history.page_error.is_none();
+            let placeholder = match (&header, &self.history.page) {
+                (None, _) => Some(SELECT_CHANNEL),
+                (Some(_), Some(_)) => None,
+                (Some(_), None) if loading => Some(LOADING_MESSAGES),
+                (Some(_), None) => Some(NOT_LOADED),
+            };
+            if let Some(placeholder) = placeholder {
+                self.message_reader.set(placeholder.to_owned());
+            }
+            self.message_reader.draw(frame, area);
             return;
         }
         if self.review.is_none() {
@@ -1638,60 +2622,67 @@ impl PeerManager {
         self.held_reader.draw(frame, area);
     }
 
-    fn draw_policy(&mut self, frame: &mut Frame, area: Rect) {
-        let (Some(draft), Some(inbox)) = (&self.policy, &self.inbox) else {
+    /// The panel's document above the pattern field, with an error from the
+    /// last subscription change between them.
+    fn draw_panel(&mut self, frame: &mut Frame, mut area: Rect) {
+        let (Some(document), Some(panel)) = (self.panel_document(), &self.panel) else {
             return;
         };
-        let override_label = inbox.inbound_override.as_ref().map_or("None", policy_label);
-        let mut lines = vec![
-            format!("This session · effective {}", policy_label(&inbox.inbound)),
-            format!("Session override: {override_label}"),
-            format!(
-                "Project floor: {} (options below it are disabled)",
-                policy_label(&inbox.project_floor)
-            ),
-            String::new(),
-        ];
-        let mut option_rows = Vec::new();
-        for policy in POLICIES {
-            let disabled = policy_rank(&policy) < policy_rank(&inbox.project_floor);
-            option_rows.push((lines.len(), policy.clone()));
-            lines.push(format!(
-                "{} {}{}",
-                if draft.value == policy { ">" } else { " " },
-                policy_label(&policy),
-                if disabled {
-                    " · disabled by project"
-                } else {
-                    ""
-                }
-            ));
-            lines.push(format!("  {}", policy_description(&policy)));
-            lines.push(String::new());
+        let focus_row = document.focus_row(panel);
+        let field_area = if self.peer_controls.is_some() {
+            take_bottom(&mut area, 1)
+        } else {
+            Rect::default()
+        };
+        if let Some(error) = &panel.error {
+            let rows =
+                wrapped_height(error, area.width).min(area.height.saturating_sub(MIN_BODY_ROWS));
+            let error_area = take_bottom(&mut area, rows);
+            frame.render_widget(
+                Paragraph::new(error.as_str())
+                    .style(theme::current().tool_warning)
+                    .wrap(Wrap { trim: false }),
+                error_area,
+            );
         }
-        lines.push(
-            if draft.pending {
-                "Applying policy…"
-            } else {
-                "Up/Down select a draft; a Apply changes this session. Esc cancels."
-            }
-            .to_owned(),
-        );
-        lines.push("Refuse rejects new arrivals; it does not delete held messages.".to_owned());
-        self.policy_reader.replace(lines.join("\n"));
-        self.policy_reader.draw(frame, area);
-        let visible = self.policy_reader.document.visible();
-        for (row, policy) in option_rows {
+        if field_area.height > 0 {
+            let theme = theme::current();
+            let mut spans = vec![Span::styled(PATTERN_PROMPT, theme.accent)];
+            spans.extend(
+                panel
+                    .field
+                    .paint(
+                        usize::from(field_area.width).saturating_sub(PATTERN_PROMPT.width()),
+                        &field_styles(input_text_style()),
+                        panel.focus == PanelFocus::Field,
+                        PATTERN_PLACEHOLDER,
+                    )
+                    .spans,
+            );
+            frame.render_widget(Paragraph::new(Line::from(spans)), field_area);
+            self.panel_hits.push((field_area, PanelFocus::Field));
+        }
+        self.panel_reader.replace(document.text);
+        self.panel_reader.highlight(focus_row);
+        self.panel_reader.draw(frame, area);
+        let visible = self.panel_reader.document.visible();
+        let row_area = |row: usize| {
+            Rect::new(
+                area.x,
+                area.y
+                    .saturating_add(u16::try_from(row - visible.start).unwrap_or(u16::MAX)),
+                area.width.saturating_sub(1),
+                1,
+            )
+        };
+        for (row, policy) in document.policies {
             if visible.contains(&row) {
-                self.policy_hits.push((
-                    Rect::new(
-                        area.x,
-                        area.y.saturating_add((row - visible.start) as u16),
-                        area.width.saturating_sub(1),
-                        1,
-                    ),
-                    policy,
-                ));
+                self.policy_hits.push((row_area(row), policy));
+            }
+        }
+        for (row, target) in document.targets {
+            if visible.contains(&row) {
+                self.panel_hits.push((row_area(row), target));
             }
         }
     }
@@ -1737,8 +2728,16 @@ impl PeerManager {
                 vec![Command::Back]
             };
         }
-        if self.policy.is_some() {
-            return vec![Command::Apply, Command::Back];
+        if self.panel.is_some() {
+            let mut commands = Vec::new();
+            if self.panel_change().is_some() {
+                commands.push(Command::Activate);
+            }
+            if !self.field_focused() {
+                commands.push(Command::Apply);
+            }
+            commands.extend([Command::Focus, Command::Back]);
+            return commands;
         }
         if self.filter_focused {
             return vec![Command::Activate, Command::Back];
@@ -1750,8 +2749,18 @@ impl PeerManager {
         if self.can_decide(false) {
             commands.push(Command::Reject);
         }
-        if self.active == PeerView::Sessions {
-            commands.extend([Command::CopyTarget, Command::Refresh]);
+        match self.active {
+            PeerView::Sessions => commands.extend([Command::CopyTarget, Command::Refresh]),
+            PeerView::Held => {}
+            PeerView::Messages => {
+                if self.subscription_toggle().is_some() {
+                    commands.push(Command::Subscribe);
+                }
+                if self.older_page().is_some() {
+                    commands.push(Command::Older);
+                }
+                commands.push(Command::Refresh);
+            }
         }
         commands.extend([
             Command::Activate,
@@ -1814,7 +2823,9 @@ impl PeerManager {
             }
             let active = matches!(
                 (command, &self.active),
-                (Command::Sessions, PeerView::Sessions) | (Command::Held, PeerView::Held)
+                (Command::Sessions, PeerView::Sessions)
+                    | (Command::Held, PeerView::Held)
+                    | (Command::Messages, PeerView::Messages)
             );
             footer.command(
                 label,
@@ -1831,7 +2842,16 @@ impl PeerManager {
                 ),
                 Command::Activate if self.confirmation.is_some() => " Confirm".to_owned(),
                 Command::Activate if self.filter_focused => " Done".to_owned(),
+                Command::Activate if self.panel.is_some() => self
+                    .panel_change()
+                    .map_or(*description, |change| change_label(&change))
+                    .to_owned(),
                 Command::Activate if self.active == PeerView::Held => " Review".to_owned(),
+                Command::Focus if self.panel.is_some() => NEXT_LABEL.to_owned(),
+                Command::Subscribe => self
+                    .subscription_toggle()
+                    .map_or(*description, |change| change_label(&change))
+                    .to_owned(),
                 Command::Back if self.filter_focused => " Clear".to_owned(),
                 _ => (*description).to_owned(),
             };
@@ -1864,8 +2884,141 @@ impl Overlay for PeerManager {
     }
 
     fn cadence(&self) -> Cadence {
-        Cadence::when(self.open && self.discovering, Cadence::PENDING)
+        Cadence::any([
+            Cadence::when(self.open && self.discovering, Cadence::PENDING),
+            Cadence::when(self.history_visible(), Cadence::polling(HISTORY_POLL)),
+            Cadence::when(self.history_loading(), Cadence::PENDING),
+        ])
     }
+}
+
+fn change_label(change: &SubscriptionChange) -> &'static str {
+    match change {
+        SubscriptionChange::Subscribe(_) => SUBSCRIBE_LABEL,
+        SubscriptionChange::Unsubscribe(_) => UNSUBSCRIBE_LABEL,
+        SubscriptionChange::Broadcasts(true) => BROADCASTS_ON_LABEL,
+        SubscriptionChange::Broadcasts(false) => BROADCASTS_OFF_LABEL,
+    }
+}
+
+/// A channel's row id. A direct channel's names the other party's session,
+/// so it is never shown.
+fn channel_key(channel: &MessageChannel) -> String {
+    match channel {
+        MessageChannel::Topic(topic) => format!("{TOPIC_KEY}{topic}"),
+        MessageChannel::Broadcast => BROADCAST_KEY.to_owned(),
+        MessageChannel::Direct(party) => format!("{DIRECT_KEY}{party}"),
+    }
+}
+
+fn channel_name(summary: &ChannelSummary) -> String {
+    match &summary.channel {
+        MessageChannel::Topic(topic) => literal(topic, false),
+        MessageChannel::Broadcast => BROADCASTS_TITLE.to_owned(),
+        MessageChannel::Direct(_) => {
+            let title = summary.name.as_deref().map(|name| literal(name, false));
+            let handle = summary
+                .handle
+                .as_deref()
+                .map(|handle| literal(&handle_address(handle), false));
+            match (title, handle) {
+                (Some(title), Some(handle)) => format!("{title}{SEPARATOR}{handle}"),
+                (Some(name), None) | (None, Some(name)) => name,
+                (None, None) => UNKNOWN_SESSION.to_owned(),
+            }
+        }
+    }
+}
+
+/// A channel's message count and latest time, and how this session receives
+/// it under `controls`.
+fn channel_detail(summary: &ChannelSummary, controls: Option<&StoredPeerControls>) -> String {
+    let noun = if summary.count == 1 {
+        MESSAGE_NOUN
+    } else {
+        MESSAGES_NOUN
+    };
+    let mut detail = format!(
+        "{} {noun}{SEPARATOR}{}",
+        summary.count,
+        local_time(summary.last_ms)
+    );
+    let marker = match &summary.channel {
+        MessageChannel::Topic(topic) => controls.and_then(|controls| {
+            if controls.topics.contains(topic) {
+                return Some(SUBSCRIBED.to_owned());
+            }
+            controls
+                .topics
+                .iter()
+                .find(|pattern| pattern_matches(pattern, topic))
+                .map(|pattern| format!("{VIA}{}", literal(pattern, false)))
+        }),
+        MessageChannel::Broadcast => controls.map(|controls| {
+            if controls.broadcasts {
+                RECEIVING
+            } else {
+                NOT_RECEIVING
+            }
+            .to_owned()
+        }),
+        MessageChannel::Direct(_) => Some(DIRECT_LABEL.to_owned()),
+    };
+    if let Some(marker) = marker {
+        detail.push_str(SEPARATOR);
+        detail.push_str(&marker);
+    }
+    detail
+}
+
+/// One stored message: who sent it when to which audience, its literal
+/// text, and what became of it for each recipient.
+fn message_block(message: &ChannelMessage) -> String {
+    let mut sender = literal(&message.sender_name, false);
+    if let Some(handle) = &message.sender_handle {
+        sender.push(' ');
+        sender.push_str(&literal(&handle_address(handle), false));
+    }
+    if message.own {
+        sender = format!("{sender} ({THIS_SESSION})");
+    }
+    let mut block = format!(
+        "{sender}{SEPARATOR}{}{SEPARATOR}{}\n{}",
+        local_time(message.sent_ms),
+        literal(&message.audience.to_string(), false),
+        literal(&message.text, true)
+    );
+    for recipient in &message.recipients {
+        let name = match &recipient.name {
+            _ if recipient.own => THIS_SESSION.to_owned(),
+            Some(name) => literal(name, false),
+            None => UNKNOWN_SESSION.to_owned(),
+        };
+        block.push_str(&format!(
+            "\n{RECIPIENT_PREFIX}{name}: {}",
+            literal(&recipient.status, false)
+        ));
+        if let Some(reason) = &recipient.reason {
+            block.push_str(SEPARATOR);
+            block.push_str(&literal(reason, false));
+        }
+    }
+    block
+}
+
+fn local_time(ms: u64) -> String {
+    i64::try_from(ms)
+        .ok()
+        .and_then(|ms| Timestamp::from_millisecond(ms).ok())
+        .map_or_else(
+            || UNAVAILABLE.to_owned(),
+            |timestamp| {
+                timestamp
+                    .to_zoned(TimeZone::system())
+                    .strftime(HISTORY_TIME_FORMAT)
+                    .to_string()
+            },
+        )
 }
 
 fn policy_label(policy: &InboundPolicy) -> &'static str {
@@ -1911,9 +3064,10 @@ fn activity(peer: &PeerSummary) -> &'static str {
 
 fn held_identity(held: &HeldMessageSummary) -> String {
     format!(
-        "Sender: {}\nExact reply target: {}\nWorkspace: {}\nMode: {}\nMessage: {}",
+        "Sender: {}\nExact reply target: {}\n{AUDIENCE_LABEL}{}\nWorkspace: {}\nMode: {}\nMessage: {}",
         literal(&held.sender_name, false),
         literal(&held.reply_target, false),
+        literal(&held.audience.to_string(), false),
         held.workspace.as_ref().map_or_else(
             || UNAVAILABLE.to_owned(),
             |path| literal(&path.to_string_lossy(), false)
@@ -1927,28 +3081,53 @@ fn held_identity(held: &HeldMessageSummary) -> String {
     )
 }
 
-fn paint_literal(text: &str, style: Style) -> Painted {
+/// A reader's text in the item style, with source line `highlight` in the
+/// selected one.
+fn paint_reader(text: &str, highlight: Option<usize>) -> Painted {
+    let theme = theme::current();
+    paint_literal(text, |row| {
+        if highlight == Some(row) {
+            theme.item_selected
+        } else {
+            theme.item
+        }
+    })
+}
+
+/// `text` line by line in `style` of each source line, cut into chunks a
+/// document can pan across.
+fn paint_literal(text: &str, style: impl Fn(usize) -> Style) -> Painted {
     let mut lines = Vec::new();
     let mut continuations = Vec::new();
-    for line in text.split('\n') {
+    for (row, line) in text.split('\n').enumerate() {
+        let style = style(row);
         let mut start = 0;
-        let mut columns = 0;
-        let mut continuation = false;
-        for (index, grapheme) in line.grapheme_indices(true) {
-            let width = grapheme.width();
-            if columns + width > MAX_LITERAL_COLS {
-                lines.push(Line::styled(line[start..index].to_owned(), style));
-                continuations.push(continuation);
-                continuation = true;
-                start = index;
-                columns = 0;
-            }
-            columns += width;
+        for end in chunk_ends(line) {
+            lines.push(Line::styled(line[start..end].to_owned(), style));
+            continuations.push(start > 0);
+            start = end;
         }
-        lines.push(Line::styled(line[start..].to_owned(), style));
-        continuations.push(continuation);
     }
     Painted::new(lines, Vec::new(), Vec::new()).with_continuations(continuations)
+}
+
+/// The rows [`paint_literal`] paints `text` as.
+fn painted_rows(text: &str) -> usize {
+    text.split('\n').map(|line| chunk_ends(line).count()).sum()
+}
+
+/// Where each chunk of `line` a document can pan across ends, as a byte
+/// offset.
+fn chunk_ends(line: &str) -> impl Iterator<Item = usize> + '_ {
+    let mut columns = 0;
+    line.grapheme_indices(true)
+        .filter_map(move |(index, grapheme)| {
+            let width = grapheme.width();
+            let cut = columns + width > MAX_LITERAL_COLS;
+            columns = if cut { width } else { columns + width };
+            cut.then_some(index)
+        })
+        .chain([line.len()])
 }
 
 fn wrapped_height(text: &str, width: u16) -> u16 {
@@ -1998,10 +3177,16 @@ fn panes(area: Rect, pane: &Pane) -> (Rect, Rect) {
 mod tests {
     use std::path::PathBuf;
 
+    use caudra_agent::peers::topics::{INVALID_PATTERN, MISSING_PATTERN};
     use caudra_agent::peers::{
-        HeldMessageSummary, PeerDecisionResult, PeerInboxSnapshot, PeerSummary,
+        ChannelMessage, ChannelPage, ChannelSummary, HeldMessageSummary, HistoryVersion,
+        MessageChannel, PeerDecisionResult, PeerInboxSnapshot, PeerSummary, RecipientStatus,
     };
     use caudra_config::InboundPolicy;
+    use caudra_providers::PeerAudience;
+    use caudra_storage::StateDir;
+    use caudra_storage::messages::{MessageLog, Retention};
+    use caudra_storage::sessions::StoredPeerControls;
     use crossterm::event::{
         KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
@@ -2009,14 +3194,23 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::layout::{Position, Rect};
     use ratatui::style::{Color, Style};
+    use ratatui::widgets::Paragraph;
     use test_case::test_case;
 
     use super::{
-        Command, Confirmation, FLOOR_BLOCKED, FreshInput, MAX_LITERAL_COLS, NAME_LABEL,
-        NO_LONGER_HELD, NO_MATCHES, NO_PEERS, Pane, PeerManager, PeerManagerAction, PeerView,
-        QUEUED, REJECTED, Reader, ReviewPanel, STALE_REVIEW, literal, paint_literal, policy_rank,
+        AUDIENCE_LABEL, BINDINGS, BROADCASTS_LABEL, BROADCASTS_ON_LABEL, BROADCASTS_TITLE, Command,
+        Confirmation, DIRECT_LABEL, FLOOR_BLOCKED, FreshInput, HISTORY_FAILED, HISTORY_POLL,
+        HISTORY_STATUS, LEFT_OUT_HINT, LIST_SEPARATOR, LOADING_HISTORY, LoadedPage,
+        MAX_LITERAL_COLS, MAX_ROWS, NAME_LABEL, NO_LONGER_HELD, NO_MATCHES, NO_NAME, NO_PEERS,
+        NO_TOPIC_HISTORY, NOT_LOADED, NOT_RECEIVING, OLDER_HINT, ON, POLICY_SAVED, Pane,
+        PanelFocus, PeerManager, PeerManagerAction, PeerView, QUEUED, RECEIVING, REJECTED,
+        RETRY_HINT, Reader, ReviewPanel, SEPARATOR, STALE_REVIEW, START_HINT, SUBSCRIBE_LABEL,
+        SUBSCRIBED, SessionPanel, SubscriptionChange, TOPICS_LABEL, TOPICS_SCOPE,
+        UNSUBSCRIBE_LABEL, VIA, WHEEL_STEP, change_label, channel_key, handle_address, literal,
+        paint_literal, painted_rows, policy_rank,
     };
-    use crate::components::buffer_text;
+    use crate::components::{Overlay, buffer_text};
+    use crate::repaint::Cadence;
 
     const FIRST_TARGET: &str = "calm-fox-brings-dawn";
     const SECOND_TARGET: &str = "calm-fox-brings-rain";
@@ -2039,6 +3233,167 @@ mod tests {
     const TEST_RENDER: &str = "test backend renders";
     const SELECTED_REVIEW: &str = "review panel exists";
     const POLICY_DRAFT: &str = "policy draft exists";
+    const TOPIC: &str = "ci.failures";
+    const PATTERN: &str = "ci.*";
+    const ADDED: &str = "deploy.**";
+    const INVALID: &str = "CI";
+    const DIRECT_PARTY: &str = "5f0c9b1e-direct-party-session";
+    const NEWEST_TEXT: &str = "quiet-silver-harbor";
+    const OLDER_TEXT: &str = "early-copper-meadow";
+    const NEWER_SEQ: i64 = 64;
+    const NEWEST_SEQ: i64 = 42;
+    const OLDER_SEQ: i64 = 17;
+    const OLDEST_SEQ: i64 = 3;
+    const SENT_MS: u64 = 1_700_000_000_000;
+    const DELIVERED: &str = "delivered";
+    const SUMMARY: &str = "Peer topics: ci.* · broadcasts off";
+    const HISTORY_ERROR: &str = "Message history is unavailable";
+    const CHANNELS_ERROR: &str = "Message channels are unavailable";
+    const PAGE_ERROR: &str = "Channel messages are unavailable";
+    const HOSTILE: &str = "\u{1b}[2J\u{202e}\u{200b}";
+    const HOSTILE_TOPIC: &str = "\u{1b}[2J\u{202e}\u{200b}.failures";
+    const HOSTILE_PATTERN: &str = "\u{1b}[2J\u{202e}\u{200b}.*";
+    const HOSTILE_CHARACTERS: [char; 3] = ['\u{1b}', '\u{202e}', '\u{200b}'];
+    const BOUND: &str = "every command has a key";
+    const VERSION_SEEN: &str = "a history version was seen";
+    const RETENTION: Retention = Retention {
+        days: 1,
+        max_messages: 1,
+    };
+    const HISTORY_OPENS: &str = "test message history opens";
+    const CHANNELS_WANTED: &str = "a channel list is wanted";
+    const PAGE_WANTED: &str = "a page is wanted";
+    const PANEL_OPEN: &str = "This session panel is open";
+    const PATTERN_FIELD_TABS: usize = 3;
+    const READER_ROWS: u16 = 4;
+
+    fn words(values: &[&str]) -> Vec<String> {
+        values.iter().copied().map(str::to_owned).collect()
+    }
+
+    fn ctrl(character: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL)
+    }
+
+    /// Ctrl+R pressed and let go, so the next press is fresh.
+    fn refresh(manager: &mut PeerManager) {
+        let press = ctrl('r');
+        manager.handle_key(press);
+        manager.handle_key(KeyEvent {
+            kind: KeyEventKind::Release,
+            ..press
+        });
+    }
+
+    fn controls(topics: &[&str], broadcasts: bool) -> StoredPeerControls {
+        StoredPeerControls {
+            topics: words(topics),
+            broadcasts,
+            ..StoredPeerControls::default()
+        }
+    }
+
+    fn topic() -> MessageChannel {
+        MessageChannel::Topic(TOPIC.to_owned())
+    }
+
+    fn direct() -> MessageChannel {
+        MessageChannel::Direct(DIRECT_PARTY.to_owned())
+    }
+
+    fn summary(channel: MessageChannel) -> ChannelSummary {
+        ChannelSummary {
+            channel,
+            name: Some(TITLE.to_owned()),
+            handle: Some(HANDLE.to_owned()),
+            count: 1,
+            last_seq: NEWEST_SEQ,
+            last_ms: SENT_MS,
+        }
+    }
+
+    fn message(seq: i64, text: &str) -> ChannelMessage {
+        ChannelMessage {
+            seq,
+            audience: PeerAudience::Direct,
+            sender_name: TITLE.to_owned(),
+            sender_handle: Some(HANDLE.to_owned()),
+            own: false,
+            sent_ms: SENT_MS,
+            text: text.to_owned(),
+            recipients: vec![RecipientStatus {
+                name: None,
+                own: true,
+                status: DELIVERED.to_owned(),
+                reason: None,
+            }],
+        }
+    }
+
+    fn page(channel: MessageChannel, message: ChannelMessage, before: Option<i64>) -> ChannelPage {
+        ChannelPage {
+            channel,
+            messages: vec![message],
+            before,
+        }
+    }
+
+    fn history_version() -> HistoryVersion {
+        let directory = tempfile::tempdir().expect(HISTORY_OPENS);
+        MessageLog::open(
+            &StateDir::from_path(directory.path().to_owned()),
+            &RETENTION,
+            0,
+        )
+        .and_then(|log| log.version())
+        .expect(HISTORY_OPENS)
+    }
+
+    fn load_channels(manager: &mut PeerManager, channels: Vec<ChannelSummary>) {
+        assert!(manager.set_history_version(Ok(history_version())));
+        assert!(manager.wanted_channels(), "{CHANNELS_WANTED}");
+        manager.set_channels(Ok(channels));
+    }
+
+    fn failed(error: &str) -> String {
+        format!("{HISTORY_FAILED}{error}{RETRY_HINT}")
+    }
+
+    fn key_label(command: &Command) -> &'static str {
+        BINDINGS
+            .iter()
+            .find(|(candidate, ..)| candidate == command)
+            .map(|(_, _, _, label, _)| *label)
+            .expect(BOUND)
+    }
+
+    fn browsing(channels: Vec<ChannelSummary>) -> PeerManager {
+        let mut manager = manager(PeerView::Messages);
+        load_channels(&mut manager, channels);
+        manager
+    }
+
+    /// The source lines the message reader shows.
+    fn shown(manager: &PeerManager) -> Vec<String> {
+        let lines: Vec<&str> = manager.message_reader.text.split('\n').collect();
+        manager
+            .message_reader
+            .document
+            .visible()
+            .filter_map(|row| lines.get(row).map(|line| (*line).to_owned()))
+            .collect()
+    }
+
+    fn session_panel(topics: &[&str]) -> PeerManager {
+        let mut manager = manager(PeerView::Held);
+        manager.update_controls(controls(topics, false));
+        manager.handle_key(press(KeyCode::Char('p')));
+        manager
+    }
+
+    fn panel(manager: &PeerManager) -> &SessionPanel {
+        manager.panel.as_ref().expect(PANEL_OPEN)
+    }
 
     fn peer(target: &str) -> PeerSummary {
         PeerSummary {
@@ -2061,6 +3416,7 @@ mod tests {
             reply_target: FIRST_TARGET.to_owned(),
             workspace: Some(PathBuf::from(WORKSPACE)),
             mode: "Build".to_owned(),
+            audience: PeerAudience::Direct,
             reason: HOLD_REASON.to_owned(),
             epoch: FIRST_EPOCH,
             approval_blocker: None,
@@ -2122,6 +3478,7 @@ mod tests {
 
     #[test_case(PeerView::Sessions ; "sessions")]
     #[test_case(PeerView::Held ; "held")]
+    #[test_case(PeerView::Messages ; "messages")]
     fn opening_and_closing_fence_results_and_capture_paste(view: PeerView) {
         let mut manager = manager(view.clone());
         let opening = manager.generation();
@@ -2141,9 +3498,12 @@ mod tests {
 
     #[test_case('1')]
     #[test_case('2')]
+    #[test_case('3')]
     #[test_case('y')]
     #[test_case('n')]
     #[test_case('p')]
+    #[test_case('s')]
+    #[test_case('o')]
     fn printable_shortcuts_are_literal_while_filtering(character: char) {
         let mut manager = manager(PeerView::Held);
         manager.handle_key(press(KeyCode::Char('/')));
@@ -2153,7 +3513,7 @@ mod tests {
         ));
         assert_eq!(manager.held_browser.filter.text(), character.to_string());
         assert_eq!(manager.active, PeerView::Held);
-        assert!(manager.policy.is_none());
+        assert!(manager.panel.is_none());
         assert!(manager.review_request.is_none());
     }
 
@@ -2476,7 +3836,7 @@ mod tests {
         let mut manager = manager(PeerView::Held);
         manager.inbox.as_mut().expect(POLICY_DRAFT).inbound = effective;
         manager.handle_key(press(KeyCode::Char('p')));
-        manager.policy.as_mut().expect(POLICY_DRAFT).value = draft.clone();
+        manager.panel.as_mut().expect(POLICY_DRAFT).policy = draft.clone();
         let action = manager.handle_key(press(KeyCode::Char('a')));
         assert_eq!(manager.confirmation.is_some(), relaxation);
         if relaxation {
@@ -2497,10 +3857,10 @@ mod tests {
         manager.handle_key(press(KeyCode::Char('p')));
         manager.handle_key(press(KeyCode::Up));
         assert_eq!(
-            manager.policy.as_ref().expect(POLICY_DRAFT).value,
+            manager.panel.as_ref().expect(POLICY_DRAFT).policy,
             InboundPolicy::Hold
         );
-        manager.policy.as_mut().expect(POLICY_DRAFT).value = InboundPolicy::Accept;
+        manager.panel.as_mut().expect(POLICY_DRAFT).policy = InboundPolicy::Accept;
         assert!(matches!(
             manager.handle_key(press(KeyCode::Char('a'))),
             PeerManagerAction::Consumed
@@ -2621,7 +3981,7 @@ mod tests {
             )),
             PeerManagerAction::Consumed
         ));
-        assert!(manager.policy.is_none());
+        assert!(manager.panel.is_none());
         assert!(manager.is_open());
     }
 
@@ -2629,7 +3989,7 @@ mod tests {
     #[test_case(Color::White, Color::Black ; "dark")]
     fn literal_reader_keeps_markdown_and_theme_roles(foreground: Color, background: Color) {
         let style = Style::default().fg(foreground).bg(background);
-        let painted = paint_literal(BODY, style);
+        let painted = paint_literal(BODY, |_| style);
         assert_eq!(
             painted
                 .lines()
@@ -2658,7 +4018,9 @@ mod tests {
     #[test_case("\u{1f1eb}\u{1f1f7}", 2; "flag")]
     fn display_chunks_preserve_boundary_graphemes(grapheme: &str, width: usize) {
         let first = format!("{}{grapheme}", "x".repeat(MAX_LITERAL_COLS - width));
-        let painted = paint_literal(&format!("{first}Z"), Style::default());
+        let text = format!("{first}Z");
+        let painted = paint_literal(&text, |_| Style::default());
+        assert_eq!(painted_rows(&text), painted.lines().len());
         assert_eq!(
             painted
                 .lines()
@@ -2688,6 +4050,692 @@ mod tests {
         assert_eq!(manager.session_reader.document.top(), top);
     }
 
+    #[test_case(ADDED; "topic_pattern")]
+    #[test_case(BROADCASTS_TITLE; "broadcasts")]
+    fn subscriptions_are_searchable_and_shown_in_session_details(query: &str) {
+        let mut manager = manager(PeerView::Sessions);
+        manager.set_sessions(Ok(vec![
+            peer(FIRST_TARGET),
+            PeerSummary {
+                topics: words(&[PATTERN, ADDED]),
+                broadcasts: true,
+                ..peer(SECOND_TARGET)
+            },
+        ]));
+        manager.handle_key(press(KeyCode::Char('/')));
+        manager.handle_paste(query);
+        manager.handle_key(press(KeyCode::Enter));
+        let entries = manager.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, SECOND_TARGET);
+        manager.select(SECOND_TARGET.to_owned());
+        let screen = draw(&mut manager, WIDE, HEIGHT);
+        assert!(screen.contains(&format!("{TOPICS_LABEL}{PATTERN}{LIST_SEPARATOR}{ADDED}")));
+        assert!(screen.contains(&format!("{BROADCASTS_LABEL}{ON}")));
+    }
+
+    #[test_case(PeerAudience::Direct; "direct")]
+    #[test_case(PeerAudience::Topic { topic: TOPIC.to_owned() }; "topic")]
+    #[test_case(PeerAudience::Broadcast; "broadcast")]
+    fn held_messages_name_their_audience(audience: PeerAudience) {
+        let mut manager = manager(PeerView::Held);
+        manager.update_inbox(snapshot(vec![HeldMessageSummary {
+            audience: audience.clone(),
+            ..held(FIRST_MESSAGE)
+        }]));
+        let audience = audience.to_string();
+        assert!(manager.entries()[0].2.starts_with(&audience));
+        assert!(draw(&mut manager, WIDE, HEIGHT).contains(&format!("{AUDIENCE_LABEL}{audience}")));
+    }
+
+    #[test_case(SubscriptionChange::Subscribe(words(&[ADDED, PATTERN])), Ok((words(&[PATTERN, ADDED]), false)); "subscribe_adds_new_patterns")]
+    #[test_case(SubscriptionChange::Unsubscribe(words(&[PATTERN])), Ok((Vec::new(), false)); "unsubscribe_removes")]
+    #[test_case(SubscriptionChange::Unsubscribe(words(&[ADDED])), Err(format!("{MISSING_PATTERN}: {ADDED:?}")); "unsubscribe_names_a_missing_pattern")]
+    #[test_case(SubscriptionChange::Subscribe(words(&[INVALID])), Err(INVALID_PATTERN.into()); "subscribe_validates")]
+    #[test_case(SubscriptionChange::Broadcasts(true), Ok((words(&[PATTERN]), true)); "broadcasts_on")]
+    fn subscription_changes_describe_the_whole_set(
+        change: SubscriptionChange,
+        expected: Result<(Vec<String>, bool), String>,
+    ) {
+        assert_eq!(change.apply(&words(&[PATTERN]), false), expected);
+    }
+
+    #[test]
+    fn the_first_channel_opens_at_its_newest_messages_without_its_session_id() {
+        let mut manager = browsing(vec![summary(direct()), summary(topic())]);
+        let request = manager.wanted_page().cloned().expect(PAGE_WANTED);
+        assert_eq!((&request.channel, request.before), (&direct(), None));
+        manager.set_page(
+            request,
+            Ok(page(
+                direct(),
+                message(NEWEST_SEQ, NEWEST_TEXT),
+                Some(NEWEST_SEQ),
+            )),
+        );
+        assert!(manager.wanted_page().is_none());
+        let screen = draw(&mut manager, WIDE, HEIGHT);
+        assert!(screen.contains(NEWEST_TEXT));
+        assert!(screen.contains(OLDER_HINT));
+        assert!(screen.contains(&format!("{TITLE}{SEPARATOR}{}", handle_address(HANDLE))));
+        assert!(!screen.contains(DIRECT_PARTY));
+        manager.handle_key(press(KeyCode::Char('/')));
+        manager.handle_paste(DIRECT_PARTY);
+        assert!(manager.entries().is_empty());
+    }
+
+    #[test]
+    fn answers_nothing_waits_for_are_dropped() {
+        let mut manager = manager(PeerView::Messages);
+        manager.set_channels(Ok(vec![summary(topic())]));
+        assert!(manager.history.channels.is_none());
+        load_channels(
+            &mut manager,
+            vec![summary(topic()), summary(MessageChannel::Broadcast)],
+        );
+        let first = manager.wanted_page().cloned().expect(PAGE_WANTED);
+        manager.handle_key(press(KeyCode::Down));
+        let second = manager.wanted_page().cloned().expect(PAGE_WANTED);
+        assert_eq!(second.channel, MessageChannel::Broadcast);
+        manager.set_page(
+            first,
+            Ok(page(topic(), message(NEWEST_SEQ, NEWEST_TEXT), None)),
+        );
+        assert!(manager.history.page.is_none());
+        assert_eq!(manager.wanted_page(), Some(&second));
+    }
+
+    #[test]
+    fn a_change_during_a_load_lets_it_land_then_asks_once_more() {
+        let mut manager = manager(PeerView::Messages);
+        assert!(manager.set_history_version(Ok(history_version())));
+        refresh(&mut manager);
+        refresh(&mut manager);
+        manager.set_channels(Ok(vec![summary(topic())]));
+        assert_eq!(manager.entries().len(), 1);
+        assert!(manager.wanted_channels(), "{CHANNELS_WANTED}");
+        manager.set_channels(Ok(vec![summary(topic()), summary(direct())]));
+        assert_eq!(manager.entries().len(), 2);
+        assert!(!manager.wanted_channels());
+        let newest = manager.wanted_page().cloned().expect(PAGE_WANTED);
+        refresh(&mut manager);
+        assert_eq!(manager.wanted_page(), Some(&newest));
+        manager.set_page(
+            newest.clone(),
+            Ok(page(topic(), message(OLDER_SEQ, OLDER_TEXT), None)),
+        );
+        assert!(manager.message_reader.text.contains(OLDER_TEXT));
+        assert_eq!(manager.wanted_page(), Some(&newest));
+        manager.set_page(
+            newest,
+            Ok(page(topic(), message(NEWEST_SEQ, NEWEST_TEXT), None)),
+        );
+        assert!(manager.message_reader.text.contains(NEWEST_TEXT));
+        assert!(manager.wanted_page().is_none());
+    }
+
+    #[test_case(false, &[(NEWEST_SEQ, NEWEST_TEXT)], Some(NEWEST_SEQ), false, &[OLDER_SEQ, NEWEST_SEQ], Some(OLDER_SEQ); "unchanged_newest_page")]
+    #[test_case(false, &[(NEWEST_SEQ, OLDER_TEXT)], Some(NEWEST_SEQ), true, &[OLDER_SEQ, NEWEST_SEQ], Some(OLDER_SEQ); "changed_message")]
+    #[test_case(false, &[(NEWER_SEQ, NEWEST_TEXT), (NEWEST_SEQ, NEWEST_TEXT)], Some(NEWEST_SEQ), true, &[OLDER_SEQ, NEWEST_SEQ, NEWER_SEQ], Some(OLDER_SEQ); "newer_message")]
+    #[test_case(false, &[(NEWEST_SEQ, NEWEST_TEXT)], None, true, &[NEWEST_SEQ], None; "whole_channel_drops_pruned_messages")]
+    #[test_case(false, &[(NEWER_SEQ, NEWEST_TEXT)], Some(NEWER_SEQ), true, &[NEWER_SEQ], Some(NEWER_SEQ); "gap_replaces_everything")]
+    #[test_case(true, &[(OLDEST_SEQ, OLDER_TEXT)], None, true, &[OLDEST_SEQ, OLDER_SEQ, NEWEST_SEQ], None; "older_page_adds_below")]
+    fn pages_merge_into_the_loaded_messages(
+        older: bool,
+        incoming: &[(i64, &str)],
+        before: Option<i64>,
+        changed: bool,
+        loaded: &[i64],
+        cursor: Option<i64>,
+    ) {
+        let mut page = LoadedPage {
+            channel: topic(),
+            messages: [
+                message(OLDER_SEQ, OLDER_TEXT),
+                message(NEWEST_SEQ, NEWEST_TEXT),
+            ]
+            .into_iter()
+            .map(|message| (message.seq, message))
+            .collect(),
+            older: Some(OLDER_SEQ),
+            capped: false,
+        };
+        let incoming = incoming
+            .iter()
+            .map(|(seq, text)| (*seq, message(*seq, text)))
+            .collect();
+        assert_eq!(page.merge(older, incoming, before), changed);
+        assert_eq!(page.messages.keys().copied().collect::<Vec<_>>(), loaded);
+        assert_eq!(page.older, cursor);
+    }
+
+    #[test]
+    fn a_newest_page_reaching_the_oldest_message_offers_nothing_older() {
+        let mut manager = browsing(vec![summary(topic())]);
+        let newest = manager.wanted_page().cloned().expect(PAGE_WANTED);
+        manager.set_page(
+            newest,
+            Ok(page(
+                topic(),
+                message(NEWEST_SEQ, NEWEST_TEXT),
+                Some(NEWEST_SEQ),
+            )),
+        );
+        manager.handle_key(press(KeyCode::Char('o')));
+        let older = manager.wanted_page().cloned().expect(PAGE_WANTED);
+        manager.set_page(
+            older,
+            Ok(page(
+                topic(),
+                message(OLDER_SEQ, OLDER_TEXT),
+                Some(OLDER_SEQ),
+            )),
+        );
+        assert!(manager.footer_commands().contains(&Command::Older));
+        refresh(&mut manager);
+        let refreshed = manager.wanted_page().cloned().expect(PAGE_WANTED);
+        manager.set_page(
+            refreshed,
+            Ok(page(topic(), message(NEWEST_SEQ, NEWEST_TEXT), None)),
+        );
+        let text = &manager.message_reader.text;
+        assert!(text.starts_with(START_HINT));
+        assert!(!text.contains(OLDER_TEXT) && !text.contains(OLDER_HINT));
+        assert!(!manager.footer_commands().contains(&Command::Older));
+    }
+
+    #[test]
+    fn a_full_reader_offers_nothing_older_and_never_cuts_rows_itself() {
+        let tall = "\n".repeat(MAX_ROWS / 2);
+        let mut manager = browsing(vec![summary(topic())]);
+        let newest = manager.wanted_page().cloned().expect(PAGE_WANTED);
+        manager.set_page(
+            newest,
+            Ok(ChannelPage {
+                channel: topic(),
+                messages: vec![message(NEWEST_SEQ, &tall), message(OLDER_SEQ, &tall)],
+                before: Some(OLDER_SEQ),
+            }),
+        );
+        let text = &manager.message_reader.text;
+        assert!(text.starts_with(LEFT_OUT_HINT));
+        assert_eq!(
+            usize::from(manager.message_reader.document.rows()),
+            painted_rows(text)
+        );
+        assert!(manager.older_page().is_none());
+        assert!(!manager.footer_commands().contains(&Command::Older));
+    }
+
+    #[test]
+    fn a_change_during_an_older_load_reloads_the_newest_page_after_it() {
+        let mut manager = browsing(vec![summary(topic())]);
+        let newest = manager.wanted_page().cloned().expect(PAGE_WANTED);
+        manager.set_page(
+            newest,
+            Ok(page(
+                topic(),
+                message(NEWEST_SEQ, NEWEST_TEXT),
+                Some(NEWEST_SEQ),
+            )),
+        );
+        manager.handle_key(press(KeyCode::Char('o')));
+        let older = manager.wanted_page().cloned().expect(PAGE_WANTED);
+        assert_eq!(older.before, Some(NEWEST_SEQ));
+        manager.handle_key(ctrl('r'));
+        assert_eq!(manager.wanted_page(), Some(&older));
+        manager.set_page(
+            older,
+            Ok(page(topic(), message(OLDER_SEQ, OLDER_TEXT), None)),
+        );
+        let refreshed = manager.wanted_page().cloned().expect(PAGE_WANTED);
+        assert_eq!((&refreshed.channel, refreshed.before), (&topic(), None));
+        let text = &manager.message_reader.text;
+        assert!(text.contains(OLDER_TEXT) && text.contains(NEWEST_TEXT));
+        assert!(!text.contains(OLDER_HINT));
+    }
+
+    #[test_case(0; "following_the_newest")]
+    #[test_case(WHEEL_STEP; "scrolled_back")]
+    fn older_messages_load_above_without_moving_what_the_reader_shows(scrolled: i32) {
+        let lines = (0..MANY_ROWS)
+            .map(|row| row.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut manager = browsing(vec![summary(topic())]);
+        let newest = manager.wanted_page().cloned().expect(PAGE_WANTED);
+        manager.set_page(
+            newest,
+            Ok(page(topic(), message(NEWEST_SEQ, &lines), Some(NEWEST_SEQ))),
+        );
+        manager.handle_key(press(KeyCode::Tab));
+        draw(&mut manager, WIDE, HEIGHT);
+        manager.scroll(scrolled);
+        draw(&mut manager, WIDE, HEIGHT);
+        let before = shown(&manager);
+        manager.handle_key(press(KeyCode::Char('o')));
+        let older = manager.wanted_page().cloned().expect(PAGE_WANTED);
+        manager.set_page(
+            older,
+            Ok(page(
+                topic(),
+                message(OLDER_SEQ, OLDER_TEXT),
+                Some(OLDER_SEQ),
+            )),
+        );
+        draw(&mut manager, WIDE, HEIGHT);
+        assert!(manager.message_reader.text.contains(OLDER_TEXT));
+        assert!(before.len() > 1);
+        assert_eq!(shown(&manager), before);
+    }
+
+    #[test_case(topic(), &[], false, None, Some(SubscriptionChange::Subscribe(words(&[TOPIC]))); "unsubscribed_topic")]
+    #[test_case(topic(), &[PATTERN], false, Some(format!("{VIA}{PATTERN}").as_str()), Some(SubscriptionChange::Subscribe(words(&[TOPIC]))); "topic_matched_by_a_pattern")]
+    #[test_case(topic(), &[TOPIC], false, Some(SUBSCRIBED), Some(SubscriptionChange::Unsubscribe(words(&[TOPIC]))); "subscribed_topic")]
+    #[test_case(MessageChannel::Broadcast, &[], false, Some(NOT_RECEIVING), Some(SubscriptionChange::Broadcasts(true)); "ignored_broadcasts")]
+    #[test_case(MessageChannel::Broadcast, &[], true, Some(RECEIVING), Some(SubscriptionChange::Broadcasts(false)); "received_broadcasts")]
+    #[test_case(direct(), &[], false, Some(DIRECT_LABEL), None; "direct_conversation")]
+    fn channel_rows_show_and_s_toggles_how_this_session_receives_them(
+        channel: MessageChannel,
+        topics: &[&str],
+        broadcasts: bool,
+        marker: Option<&str>,
+        expected: Option<SubscriptionChange>,
+    ) {
+        let mut manager = browsing(vec![summary(channel)]);
+        manager.update_controls(controls(topics, broadcasts));
+        let detail = manager.entries().remove(0).2;
+        match marker {
+            Some(marker) => assert!(detail.ends_with(&format!("{SEPARATOR}{marker}"))),
+            None => assert_eq!(detail.matches(SEPARATOR).count(), 1),
+        }
+        let screen = draw(&mut manager, WIDE, HEIGHT);
+        let action = manager.handle_key(press(KeyCode::Char('s')));
+        match expected {
+            Some(expected) => {
+                assert!(screen.contains(&format!(
+                    "{}{}",
+                    key_label(&Command::Subscribe),
+                    change_label(&expected)
+                )));
+                assert!(
+                    matches!(action, PeerManagerAction::Subscribe(change) if change == expected)
+                );
+            }
+            None => assert!(matches!(action, PeerManagerAction::Consumed)),
+        }
+    }
+
+    #[test]
+    fn topics_view_lists_topic_channels_until_3_shows_every_channel() {
+        let mut manager = manager(PeerView::Held);
+        manager.show_only_topics();
+        assert_eq!(manager.active, PeerView::Messages);
+        assert!(draw(&mut manager, NARROW, SHORT).contains(TOPICS_SCOPE));
+        load_channels(&mut manager, vec![summary(direct())]);
+        assert!(draw(&mut manager, NARROW, SHORT).contains(NO_TOPIC_HISTORY));
+        refresh(&mut manager);
+        manager.set_channels(Ok(vec![
+            summary(direct()),
+            summary(MessageChannel::Broadcast),
+            summary(topic()),
+        ]));
+        let ids: Vec<String> = manager.entries().into_iter().map(|(id, ..)| id).collect();
+        assert_eq!(ids, [channel_key(&topic())]);
+        assert_eq!(
+            manager.wanted_page().map(|request| &request.channel),
+            Some(&topic())
+        );
+        manager.handle_key(press(KeyCode::Char('3')));
+        assert_eq!(manager.entries().len(), 3);
+        assert!(!draw(&mut manager, WIDE, HEIGHT).contains(TOPICS_SCOPE));
+    }
+
+    #[test]
+    fn showing_every_channel_selects_the_first_when_none_is() {
+        let mut manager = manager(PeerView::Held);
+        manager.show_only_topics();
+        load_channels(&mut manager, vec![summary(direct())]);
+        assert!(manager.message_browser.selected.is_none());
+        assert!(manager.wanted_page().is_none());
+        manager.handle_key(press(KeyCode::Char('3')));
+        assert_eq!(
+            manager.message_browser.selected,
+            Some(channel_key(&direct()))
+        );
+        assert_eq!(
+            manager.wanted_page().map(|request| &request.channel),
+            Some(&direct())
+        );
+    }
+
+    #[test]
+    fn each_failed_load_says_so_and_alone_is_asked_again_each_poll() {
+        let mut manager = manager(PeerView::Messages);
+        let version = history_version();
+        assert!(manager.set_history_version(Ok(version.clone())));
+        manager.set_channels(Err(CHANNELS_ERROR.to_owned()));
+        assert!(!manager.wanted_channels());
+        assert!(draw(&mut manager, WIDE, HEIGHT).contains(&failed(CHANNELS_ERROR)));
+        assert!(manager.set_history_version(Ok(version.clone())));
+        assert!(manager.wanted_channels(), "{CHANNELS_WANTED}");
+        manager.set_channels(Ok(vec![summary(topic())]));
+        let request = manager.wanted_page().cloned().expect(PAGE_WANTED);
+        manager.set_page(request.clone(), Err(PAGE_ERROR.to_owned()));
+        let screen = draw(&mut manager, WIDE, HEIGHT);
+        assert!(screen.contains(&failed(PAGE_ERROR)) && screen.contains(NOT_LOADED));
+        assert!(manager.set_history_version(Ok(version.clone())));
+        assert_eq!(manager.wanted_page(), Some(&request));
+        assert!(!manager.wanted_channels());
+        assert!(draw(&mut manager, WIDE, HEIGHT).contains(NOT_LOADED));
+        manager.set_page(
+            request,
+            Ok(page(topic(), message(NEWEST_SEQ, NEWEST_TEXT), None)),
+        );
+        assert!(manager.history.error().is_none());
+        assert!(!manager.set_history_version(Ok(version)));
+        assert!(manager.set_history_version(Err(HISTORY_ERROR.to_owned())));
+        assert!(!manager.set_history_version(Err(HISTORY_ERROR.to_owned())));
+        assert!(draw(&mut manager, WIDE, HEIGHT).contains(&failed(HISTORY_ERROR)));
+        refresh(&mut manager);
+        assert!(manager.wanted_channels(), "{CHANNELS_WANTED}");
+        assert!(manager.wanted_page().is_some());
+    }
+
+    #[test]
+    fn a_load_that_lands_clears_only_its_own_error() {
+        let mut manager = browsing(vec![summary(topic())]);
+        let version = manager.history.version.clone().expect(VERSION_SEEN);
+        let request = manager.wanted_page().cloned().expect(PAGE_WANTED);
+        refresh(&mut manager);
+        manager.set_channels(Err(CHANNELS_ERROR.to_owned()));
+        manager.set_page(request.clone(), Err(PAGE_ERROR.to_owned()));
+        assert!(manager.set_history_version(Ok(version)));
+        manager.set_page(
+            request,
+            Ok(page(topic(), message(NEWEST_SEQ, NEWEST_TEXT), None)),
+        );
+        assert_eq!(manager.history_status(), failed(CHANNELS_ERROR));
+        manager.set_channels(Ok(vec![summary(topic())]));
+        assert!(manager.history.error().is_none());
+    }
+
+    #[test]
+    fn history_polls_only_while_the_messages_view_shows() {
+        let polling = Cadence::polling(HISTORY_POLL);
+        let loading = Cadence::any([polling, Cadence::PENDING]);
+        let mut manager = manager(PeerView::Held);
+        assert_eq!(manager.cadence(), Cadence::IDLE);
+        manager.handle_key(press(KeyCode::Char('3')));
+        assert_eq!(manager.cadence(), polling);
+        manager.set_history_polling(true);
+        assert_eq!(manager.cadence(), loading);
+        manager.set_history_polling(false);
+        load_channels(&mut manager, vec![summary(topic())]);
+        assert_eq!(manager.cadence(), loading);
+        let request = manager.wanted_page().cloned().expect(PAGE_WANTED);
+        manager.set_page(
+            request,
+            Ok(page(topic(), message(NEWEST_SEQ, NEWEST_TEXT), None)),
+        );
+        assert_eq!(manager.cadence(), polling);
+        manager.handle_key(press(KeyCode::Char('p')));
+        assert_eq!(manager.cadence(), Cadence::IDLE);
+    }
+
+    #[test_case(1, "", UNSUBSCRIBE_LABEL, Some(SubscriptionChange::Unsubscribe(words(&[PATTERN]))); "pattern")]
+    #[test_case(2, "", BROADCASTS_ON_LABEL, Some(SubscriptionChange::Broadcasts(true)); "broadcasts")]
+    #[test_case(PATTERN_FIELD_TABS, ADDED, SUBSCRIBE_LABEL, Some(SubscriptionChange::Subscribe(words(&[ADDED]))); "field")]
+    #[test_case(PATTERN_FIELD_TABS, "", SUBSCRIBE_LABEL, None; "empty_field")]
+    fn panel_enter_changes_what_its_focus_names(
+        tabs: usize,
+        typed: &str,
+        label: &str,
+        expected: Option<SubscriptionChange>,
+    ) {
+        let mut manager = session_panel(&[PATTERN]);
+        for _ in 0..tabs {
+            manager.handle_key(press(KeyCode::Tab));
+        }
+        manager.handle_paste(typed);
+        assert!(
+            draw(&mut manager, WIDE, HEIGHT)
+                .contains(&format!("{}{label}", key_label(&Command::Activate)))
+        );
+        let action = manager.handle_key(press(KeyCode::Enter));
+        match expected {
+            Some(expected) => assert!(
+                matches!(action, PeerManagerAction::Subscribe(change) if change == expected)
+            ),
+            None => assert!(matches!(action, PeerManagerAction::Consumed)),
+        }
+        assert!(panel(&manager).field.is_empty());
+    }
+
+    #[test]
+    fn invalid_patterns_stay_in_the_field_with_the_reason() {
+        let mut manager = session_panel(&[PATTERN]);
+        for _ in 0..PATTERN_FIELD_TABS {
+            manager.handle_key(press(KeyCode::Tab));
+        }
+        manager.handle_paste(INVALID);
+        assert!(matches!(
+            manager.handle_key(press(KeyCode::Enter)),
+            PeerManagerAction::Consumed
+        ));
+        assert_eq!(panel(&manager).error.as_deref(), Some(INVALID_PATTERN));
+        assert_eq!(panel(&manager).field.text(), INVALID);
+        assert!(draw(&mut manager, WIDE, HEIGHT).contains(INVALID_PATTERN));
+        manager.handle_paste(ADDED);
+        assert!(panel(&manager).error.is_none());
+    }
+
+    #[test_case('1')]
+    #[test_case('3')]
+    #[test_case('p')]
+    #[test_case('a')]
+    #[test_case('s')]
+    #[test_case('y')]
+    fn printable_shortcuts_are_literal_in_the_pattern_field(character: char) {
+        let mut manager = session_panel(&[PATTERN]);
+        for _ in 0..PATTERN_FIELD_TABS {
+            manager.handle_key(press(KeyCode::Tab));
+        }
+        assert!(matches!(
+            manager.handle_key(press(KeyCode::Char(character))),
+            PeerManagerAction::Consumed
+        ));
+        assert_eq!(panel(&manager).field.text(), character.to_string());
+        assert_eq!(manager.active, PeerView::Held);
+    }
+
+    #[test]
+    fn escape_clears_the_field_before_leaving_the_panel() {
+        let mut manager = session_panel(&[PATTERN]);
+        for _ in 0..PATTERN_FIELD_TABS {
+            manager.handle_key(press(KeyCode::Tab));
+        }
+        manager.handle_paste(ADDED);
+        manager.handle_key(press(KeyCode::Esc));
+        assert!(panel(&manager).field.is_empty());
+        manager.handle_key(press(KeyCode::Esc));
+        assert!(manager.panel.is_none());
+        assert!(manager.is_open());
+    }
+
+    #[test]
+    fn focus_follows_patterns_removed_elsewhere() {
+        let mut manager = session_panel(&[PATTERN, ADDED]);
+        manager.handle_key(press(KeyCode::Tab));
+        manager.handle_key(press(KeyCode::Tab));
+        assert_eq!(panel(&manager).focus, PanelFocus::Pattern(1));
+        manager.update_controls(controls(&[PATTERN], false));
+        assert_eq!(panel(&manager).focus, PanelFocus::Pattern(0));
+        manager.update_controls(controls(&[], false));
+        assert_eq!(panel(&manager).focus, PanelFocus::Broadcasts);
+    }
+
+    #[test]
+    fn clicking_a_panel_control_focuses_it() {
+        let mut manager = session_panel(&[PATTERN]);
+        draw(&mut manager, WIDE, HEIGHT);
+        let broadcasts = manager
+            .panel_hits
+            .iter()
+            .find(|(_, focus)| focus == &PanelFocus::Broadcasts)
+            .expect(TEST_RENDER)
+            .0;
+        manager.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), broadcasts));
+        assert_eq!(panel(&manager).focus, PanelFocus::Broadcasts);
+    }
+
+    #[test]
+    fn an_applied_policy_keeps_the_panel_open() {
+        let mut manager = manager(PeerView::Held);
+        manager.handle_key(press(KeyCode::Char('p')));
+        manager.panel.as_mut().expect(PANEL_OPEN).policy = InboundPolicy::Refuse;
+        assert!(matches!(
+            manager.handle_key(press(KeyCode::Char('a'))),
+            PeerManagerAction::SetInbound(InboundPolicy::Refuse)
+        ));
+        assert!(panel(&manager).pending);
+        manager.finish_policy(Ok(()));
+        assert!(!panel(&manager).pending);
+        assert_eq!(manager.feedback.as_deref(), Some(POLICY_SAVED));
+    }
+
+    #[test_case(true; "panel")]
+    #[test_case(false; "messages_view")]
+    fn subscription_results_land_where_the_change_was_made(from_panel: bool) {
+        let mut manager = browsing(vec![summary(topic())]);
+        manager.update_controls(controls(&[PATTERN], false));
+        if from_panel {
+            manager.handle_key(press(KeyCode::Char('p')));
+        }
+        manager.finish_subscriptions(Err(HISTORY_ERROR.to_owned()));
+        let panel_error = manager
+            .panel
+            .as_ref()
+            .and_then(|panel| panel.error.as_deref());
+        let error = if from_panel {
+            panel_error
+        } else {
+            manager.feedback.as_deref()
+        };
+        assert_eq!(error, Some(HISTORY_ERROR));
+        manager.finish_subscriptions(Ok(SUMMARY.to_owned()));
+        assert_eq!(manager.feedback.as_deref(), Some(SUMMARY));
+        assert!(
+            manager
+                .panel
+                .as_ref()
+                .is_none_or(|panel| panel.error.is_none())
+        );
+    }
+
+    #[test_case(Some(HANDLE), &format!("{NAME_LABEL}{}", handle_address(HANDLE)); "named")]
+    #[test_case(None, NO_NAME; "unnamed")]
+    fn this_session_panel_shows_its_messaging_name(handle: Option<&str>, expected: &str) {
+        let mut manager = manager(PeerView::Held);
+        manager.update_controls(StoredPeerControls {
+            handle: handle.map(str::to_owned),
+            ..StoredPeerControls::default()
+        });
+        manager.handle_key(press(KeyCode::Char('p')));
+        assert!(draw(&mut manager, WIDE, HEIGHT).contains(expected));
+    }
+
+    #[test]
+    fn the_footer_offers_apply_only_while_the_field_leaves_a_alone() {
+        let mut manager = session_panel(&[PATTERN]);
+        assert!(manager.footer_commands().contains(&Command::Apply));
+        for _ in 0..PATTERN_FIELD_TABS {
+            manager.handle_key(press(KeyCode::Tab));
+        }
+        assert!(manager.field_focused());
+        assert!(!manager.footer_commands().contains(&Command::Apply));
+    }
+
+    #[test_case(ctrl('r'); "history_change")]
+    #[test_case(press(KeyCode::Down); "selection_change")]
+    #[test_case(press(KeyCode::Char('3')); "scope_change")]
+    #[test_case(press(KeyCode::Char('2')); "view_switch")]
+    fn messages_feedback_lasts_until_the_next_change(change: KeyEvent) {
+        let mut manager = browsing(vec![summary(topic()), summary(MessageChannel::Broadcast)]);
+        manager.finish_subscriptions(Ok(SUMMARY.to_owned()));
+        let screen = draw(&mut manager, WIDE, HEIGHT);
+        assert!(screen.contains(SUMMARY) && !screen.contains(HISTORY_STATUS));
+        manager.handle_key(change);
+        assert!(!draw(&mut manager, WIDE, HEIGHT).contains(SUMMARY));
+    }
+
+    #[test]
+    fn feedback_from_another_view_gives_way_to_the_topics_status() {
+        let mut manager = manager(PeerView::Held);
+        manager.feedback = Some(STALE_REVIEW.to_owned());
+        assert!(draw(&mut manager, WIDE, HEIGHT).contains(STALE_REVIEW));
+        manager.show_only_topics();
+        let screen = draw(&mut manager, WIDE, HEIGHT);
+        assert!(!screen.contains(STALE_REVIEW));
+        assert!(screen.contains(&format!("{TOPICS_SCOPE}{LOADING_HISTORY}")));
+    }
+
+    /// What the Messages view shows: one channel, its one message, and this
+    /// session's controls, with the This session panel open or not.
+    struct Shown {
+        channel: ChannelSummary,
+        message: ChannelMessage,
+        controls: StoredPeerControls,
+        panel: bool,
+    }
+
+    #[test_case(|shown| shown.message.sender_name = HOSTILE.to_owned(), &literal(HOSTILE, false); "sender_name")]
+    #[test_case(|shown| shown.message.sender_handle = Some(HOSTILE.to_owned()), &literal(&handle_address(HOSTILE), false); "sender_handle")]
+    #[test_case(|shown| shown.message.text = HOSTILE.to_owned(), &literal(HOSTILE, true); "message_text")]
+    #[test_case(|shown| shown.message.recipients[0].name = Some(HOSTILE.to_owned()), &literal(HOSTILE, false); "recipient_name")]
+    #[test_case(|shown| shown.message.recipients[0].status = HOSTILE.to_owned(), &literal(HOSTILE, false); "recipient_status")]
+    #[test_case(|shown| shown.message.recipients[0].reason = Some(HOSTILE.to_owned()), &literal(HOSTILE, false); "recipient_reason")]
+    #[test_case(|shown| shown.channel.channel = MessageChannel::Topic(HOSTILE.to_owned()), &literal(HOSTILE, false); "topic_name")]
+    #[test_case(|shown| shown.channel.name = Some(HOSTILE.to_owned()), &literal(HOSTILE, false); "direct_name")]
+    #[test_case(|shown| shown.channel.handle = Some(HOSTILE.to_owned()), &literal(&handle_address(HOSTILE), false); "direct_handle")]
+    #[test_case(|shown| { shown.channel.channel = MessageChannel::Topic(HOSTILE_TOPIC.to_owned()); shown.controls.topics = words(&[HOSTILE_PATTERN]); }, &format!("{VIA}{}", literal(HOSTILE_PATTERN, false)); "via_pattern")]
+    #[test_case(|shown| { shown.controls.topics = words(&[HOSTILE]); shown.panel = true; }, &literal(HOSTILE, false); "panel_pattern")]
+    #[test_case(|shown| { shown.controls.handle = Some(HOSTILE.to_owned()); shown.panel = true; }, &format!("{NAME_LABEL}{}", literal(&handle_address(HOSTILE), false)); "panel_name")]
+    fn peer_strings_show_literally_wherever_they_appear(place: fn(&mut Shown), expected: &str) {
+        let mut shown = Shown {
+            channel: summary(direct()),
+            message: ChannelMessage {
+                recipients: vec![RecipientStatus {
+                    name: Some(TITLE.to_owned()),
+                    own: false,
+                    status: DELIVERED.to_owned(),
+                    reason: None,
+                }],
+                ..message(NEWEST_SEQ, NEWEST_TEXT)
+            },
+            controls: controls(&[], false),
+            panel: false,
+        };
+        place(&mut shown);
+        let mut manager = browsing(vec![shown.channel]);
+        manager.update_controls(shown.controls);
+        let request = manager.wanted_page().cloned().expect(PAGE_WANTED);
+        manager.set_page(
+            request.clone(),
+            Ok(ChannelPage {
+                channel: request.channel,
+                messages: vec![shown.message],
+                before: None,
+            }),
+        );
+        if shown.panel {
+            manager.handle_key(press(KeyCode::Char('p')));
+        }
+        let screen = draw(&mut manager, WIDE, HEIGHT);
+        assert!(screen.contains(expected), "{screen}");
+        assert!(!screen.contains(HOSTILE_CHARACTERS), "{screen}");
+    }
+
     #[cfg(unix)]
     mod live {
         use std::{
@@ -2698,7 +4746,7 @@ mod tests {
 
         use caudra_agent::{
             AgentMode,
-            peers::{PeerDecision, PeerDescriptor, PeerHost, PeerSession},
+            peers::{MAX_HISTORY_PAGE, PeerDecision, PeerDescriptor, PeerHost, PeerSession},
         };
         use caudra_config::InboundPolicy;
         use caudra_storage::{id::CaudraId, sessions::PermissionMode};
@@ -2707,14 +4755,16 @@ mod tests {
         use test_case::test_case;
 
         use super::{
-            BODY, Command, NARROW, PeerManager, PeerManagerAction, PeerView, SHORT, TITLE, draw,
-            mouse, press,
+            BODY, CHANNELS_WANTED, Command, HEIGHT, NARROW, PAGE_WANTED, PeerManager,
+            PeerManagerAction, PeerView, SHORT, TITLE, WIDE, draw, mouse, press,
         };
 
         const PRIVATE_MODE: u32 = 0o700;
         const REQUEST: &str = "peer-manager-review-test";
 
-        fn reviewing() -> (TempDir, PeerHost, PeerSession, PeerManager) {
+        /// A receiving session holding what it is sent, and the sender's
+        /// message to it.
+        fn sent() -> (TempDir, PeerHost, PeerSession, PeerSession) {
             let directory = tempfile::tempdir().unwrap();
             fs::set_permissions(directory.path(), Permissions::from_mode(PRIVATE_MODE)).unwrap();
             let host =
@@ -2744,6 +4794,11 @@ mod tests {
                 .unwrap()
                 .target;
             smol::block_on(sender.send(target, BODY, None, REQUEST)).unwrap();
+            (directory, host, receiver, sender)
+        }
+
+        fn reviewing() -> (TempDir, PeerHost, PeerSession, PeerManager) {
+            let (directory, host, receiver, _) = sent();
             let snapshot = receiver.inbox_snapshot().unwrap();
             let id = snapshot.messages[0].message_id.clone();
             let mut manager = PeerManager::new();
@@ -2828,12 +4883,33 @@ mod tests {
                 PeerManagerAction::Consumed
             ));
         }
+
+        #[test]
+        fn stored_direct_messages_name_the_sender_never_its_session() {
+            let (_directory, _host, receiver, sender) = sent();
+            let mut manager = PeerManager::new();
+            manager.open(PeerView::Messages);
+            assert!(manager.set_history_version(smol::block_on(receiver.history_version())));
+            assert!(manager.wanted_channels(), "{CHANNELS_WANTED}");
+            manager.set_channels(smol::block_on(receiver.message_channels()));
+            let request = manager.wanted_page().cloned().expect(PAGE_WANTED);
+            let page = smol::block_on(receiver.channel_messages(
+                request.channel.clone(),
+                request.before,
+                MAX_HISTORY_PAGE,
+            ));
+            manager.set_page(request, page);
+            let screen = draw(&mut manager, WIDE, HEIGHT);
+            assert!(BODY.lines().all(|line| screen.contains(line)));
+            assert!(screen.contains(TITLE));
+            assert!(!screen.contains(&sender.session_id().to_string()));
+        }
     }
 
     #[test]
     fn expanded_control_lines_remain_reachable_beyond_document_pan_limits() {
         let source = literal(&"\u{1b}".repeat(MAX_LITERAL_COLS * 4), true);
-        let painted = paint_literal(&source, Style::default());
+        let painted = paint_literal(&source, |_| Style::default());
         assert!(
             painted
                 .lines()
@@ -2848,5 +4924,32 @@ mod tests {
                 .collect::<String>(),
             source
         );
+    }
+
+    #[test]
+    fn a_reader_paints_its_bars_inside_the_area_it_is_given() {
+        let mut reader = Reader::default();
+        reader.set(FIRST_TARGET.repeat(usize::from(NARROW)));
+        let mut terminal =
+            Terminal::new(TestBackend::new(NARROW, READER_ROWS + 1)).expect(TEST_RENDER);
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                let below = Rect {
+                    y: READER_ROWS,
+                    height: 1,
+                    ..area
+                };
+                frame.render_widget(Paragraph::new(HOLD_REASON), below);
+                reader.draw(
+                    frame,
+                    Rect {
+                        height: READER_ROWS,
+                        ..area
+                    },
+                );
+            })
+            .expect(TEST_RENDER);
+        assert!(buffer_text(terminal.backend().buffer()).contains(HOLD_REASON));
     }
 }

@@ -235,17 +235,20 @@ Some pickers add extra bindings on top of the defaults:
 | Session Picker | `Ctrl+G` | Generate session title |
 | Session Picker | `Ctrl+D` | Delete session (press twice) |
 | Stash Picker | `Ctrl+D` | Delete stash entry (press twice) |
-| Peer Manager | `1` / `2` | Switch Sessions / Held messages outside filter editing |
+| Peer Manager | `1` / `2` / `3` | Switch Sessions / Held messages / Messages outside filter editing |
 | Peer Manager | `/` | Edit the current view's filter; Enter keeps it, Esc clears it |
-| Peer Manager | `Tab` / `Shift+Tab` | Switch list/detail focus |
-| Peer Manager | `Enter` | Open the selected message review or inspect a peer; never approve from the list |
-| Peer Manager | `Ctrl+R` | Refresh peer discovery without blocking the interface |
+| Peer Manager | `Tab` / `Shift+Tab` | Switch list/detail focus, or move between This session's controls |
+| Peer Manager | `Enter` | Open the selected message review, inspect a peer, or read a channel; never approve from the list |
+| Peer Manager | `Enter` | In This session, remove the focused topic, switch broadcasts, or subscribe to the typed patterns |
+| Peer Manager | `Ctrl+R` | Refresh peer discovery or the message history without blocking the interface |
 | Peer Manager | `Ctrl+B` | Copy the exact peer target outside filter editing |
+| Peer Manager | `o` | Load the selected channel's older stored messages |
+| Peer Manager | `s` | Subscribe to or unsubscribe from the selected topic, or switch broadcasts on or off |
 | Peer Manager | `y` | Approve the current rendered message review once |
 | Peer Manager | `n` | Confirm rejection of the current reviewed message |
-| Peer Manager | `p` | Manage this session's inbound policy outside filter editing |
+| Peer Manager | `p` | Open This session: its name, inbound policy, subscriptions, and broadcasts |
 | Peer Manager | `a` | Apply the selected policy, confirming any relaxation |
-| Peer Manager | `Esc` | Cancel confirmation or policy editing, return to the list, then close |
+| Peer Manager | `Esc` | Cancel confirmation, clear the pattern field, or leave This session; then return to the list and close |
 | Workflow Inspector | `p` | Pause the selected run |
 | Workflow Inspector | `r` | Resume the selected run |
 | Workflow Inspector | `s` | Stop the selected run |

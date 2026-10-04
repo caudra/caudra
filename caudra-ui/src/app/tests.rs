@@ -16,6 +16,7 @@ use crate::components::help_modal::HelpTarget;
 use crate::components::input::ChordHint;
 use crate::components::keybindings::{Bind, KeybindContext, key as kb, leader as chord};
 use crate::components::messages::{ASSISTANT_LABEL, ReviewTarget};
+use crate::components::peer_manager::SubscriptionChange;
 use crate::components::projection_modal::UNPREPARED as PROJECTION_UNPREPARED;
 use crate::components::queue_actions::QueueActionKind;
 use crate::components::queue_panel::{QueueAction, QueueHit, QueueHitTarget};
@@ -5194,6 +5195,7 @@ fn a_command_whose_experiment_is_off_names_the_switch(command: &str, feature: Fe
 #[test_case("/peers", |actions| matches!(actions, [Action::ListPeers]); "sessions")]
 #[test_case("/messages", |actions| matches!(actions, [Action::PeerMessages(args)] if args.is_empty()); "held")]
 #[test_case(PEER_TOPICS_COMMAND, |actions| matches!(actions, [Action::PeerTopics(args)] if args == PEER_TOPICS_ARGS); "topics")]
+#[test_case("/topics", |actions| matches!(actions, [Action::PeerTopics(args)] if args.is_empty()); "topics_browse")]
 fn peer_commands_leave_runtime_eligibility_to_the_event_loop(
     command: &str,
     expected: fn(&[Action]) -> bool,
@@ -5207,6 +5209,7 @@ fn peer_commands_leave_runtime_eligibility_to_the_event_loop(
 
 #[test_case(PeerView::Sessions; "sessions")]
 #[test_case(PeerView::Held; "held")]
+#[test_case(PeerView::Messages; "messages")]
 fn peer_manager_is_modal_and_replaces_browse_overlays(view: PeerView) {
     let mut app = test_app();
     app.input_box.set_input(PEER_MANAGER_DRAFT.into());
@@ -5237,6 +5240,8 @@ fn peer_manager_is_modal_and_replaces_browse_overlays(view: PeerView) {
 #[test_case(PeerView::Sessions, true, PEER_MANAGER_PASTE; "sessions_filter")]
 #[test_case(PeerView::Held, false, PEER_MANAGER_PASTE; "held_navigation")]
 #[test_case(PeerView::Held, true, PEER_MANAGER_PASTE; "held_filter")]
+#[test_case(PeerView::Messages, false, PEER_MANAGER_PASTE; "messages_navigation")]
+#[test_case(PeerView::Messages, true, PEER_MANAGER_PASTE; "messages_filter")]
 #[test_case(PeerView::Sessions, false, ""; "empty_clipboard")]
 #[test_case(PeerView::Sessions, true, PEER_MANAGER_IMAGE_PATH; "image_path_filter")]
 fn peer_manager_captures_paste_before_the_hidden_prompt_and_image_detection(
@@ -5375,6 +5380,12 @@ fn peer_manager_operational_actions_are_handed_to_the_event_loop() {
     assert!(matches!(
         &app.handle_peer_manager_action(PeerManagerAction::SetInbound(InboundPolicy::Hold))[..],
         [Action::SetPeerInbound(InboundPolicy::Hold)]
+    ));
+    assert!(matches!(
+        &app.handle_peer_manager_action(PeerManagerAction::Subscribe(
+            SubscriptionChange::Broadcasts(true)
+        ))[..],
+        [Action::PeerSubscribe(SubscriptionChange::Broadcasts(true))]
     ));
     assert!(app.peer_manager.is_open());
     assert!(app.state.session.messages().is_empty());

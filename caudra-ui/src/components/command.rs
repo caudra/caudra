@@ -246,7 +246,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "/topics",
-        description: "Manage this session's peer topic subscriptions and broadcast opt-in",
+        description: "Browse peer topic messages, or change this session's topic subscriptions",
         max_args: usize::MAX,
         scope: ChatScope::MainOnly,
         features: &[Feature::CrossSessionMessaging],

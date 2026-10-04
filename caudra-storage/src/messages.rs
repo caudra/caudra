@@ -3,8 +3,11 @@
 //! on every topic. One database serves every project, so retention is global.
 
 use crate::StateDir;
-use rusqlite::types::Type;
+use rusqlite::types::{ToSql, Type};
 use rusqlite::{Connection, OpenFlags, Row, TransactionBehavior, params};
+use serde::Serialize;
+use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io;
 #[cfg(unix)]
@@ -31,6 +34,10 @@ const MESSAGE_COLUMNS: &str = "m.seq, m.sender_route, m.message_id, m.kind, m.to
 /// may match more topics than SQLite allows parameters.
 const TOPICS_FILTER: &str = "m.kind = 'topic' AND m.topic IN (SELECT value FROM json_each(?3))";
 const BROADCAST_FILTER: &str = "m.kind = 'broadcast'";
+const DIRECT_FILTER: &str = "m.kind = 'direct' AND EXISTS (
+    SELECT 1 FROM deliveries d WHERE d.seq = m.seq AND (
+        (m.sender_session = ?3 AND d.recipient_session = ?4)
+        OR (COALESCE(m.sender_session, m.sender_route) = ?4 AND d.recipient_session = ?3)))";
 const SCHEMA: &str = "
 CREATE TABLE messages (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -166,6 +173,52 @@ pub enum HistoryChannel {
     /// Messages on any of these exact topics.
     Topics(Vec<String>),
     Broadcast,
+    /// Direct messages between `session` and `peer`, in either direction.
+    Direct {
+        session: String,
+        peer: String,
+    },
+}
+
+/// One channel of the history as a session browses it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum MessageChannel {
+    Topic(String),
+    Broadcast,
+    /// The session's direct conversation with another party: that session,
+    /// or the route of a sender outside every session.
+    Direct(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelSummary {
+    pub channel: MessageChannel,
+    /// The other party's newest known title, in a direct conversation.
+    pub name: Option<String>,
+    /// The other party's messaging name, from the newest message it sent
+    /// with one.
+    pub handle: Option<String>,
+    pub count: u64,
+    pub last_seq: i64,
+    pub last_ms: u64,
+}
+
+/// What became of a message for one recipient.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryRecord {
+    pub seq: i64,
+    pub recipient_session: String,
+    pub recipient_name: Option<String>,
+    pub status: String,
+    pub reason: Option<String>,
+    pub updated_ms: u64,
+}
+
+/// Changes whenever the history does, whichever connection wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryVersion {
+    data: i64,
+    local: u64,
 }
 
 pub struct MessageLog {
@@ -420,26 +473,135 @@ impl MessageLog {
     ) -> Result<Vec<StoredMessage>, MessageLogError> {
         let before = before.unwrap_or(i64::MAX);
         let limit = i64::try_from(limit).map_err(|_| MessageLogError::Invalid("limit"))?;
-        let (filter, topics) = match channel {
+        let (filter, values) = match channel {
             HistoryChannel::Topics(topics) if topics.is_empty() => return Ok(Vec::new()),
-            HistoryChannel::Topics(topics) => (
-                TOPICS_FILTER,
-                Some(
-                    serde_json::to_string(topics)
-                        .map_err(|_| MessageLogError::Invalid("topics"))?,
-                ),
-            ),
-            HistoryChannel::Broadcast => (BROADCAST_FILTER, None),
+            HistoryChannel::Topics(topics) => (TOPICS_FILTER, vec![json_list(topics, "topics")?]),
+            HistoryChannel::Broadcast => (BROADCAST_FILTER, Vec::new()),
+            HistoryChannel::Direct { session, peer } => {
+                (DIRECT_FILTER, vec![session.clone(), peer.clone()])
+            }
         };
         let mut statement = self.connection.prepare(&format!(
             "SELECT {MESSAGE_COLUMNS} FROM messages m
              WHERE m.seq < ?1 AND {filter} ORDER BY m.seq DESC LIMIT ?2"
         ))?;
-        let messages = match &topics {
-            Some(topics) => statement.query_map(params![before, limit, topics], stored_message)?,
-            None => statement.query_map(params![before, limit], stored_message)?,
-        };
+        let mut bound: Vec<&dyn ToSql> = vec![&before, &limit];
+        bound.extend(values.iter().map(|value| value as &dyn ToSql));
+        let messages = statement.query_map(bound.as_slice(), stored_message)?;
         Ok(messages.collect::<Result<_, _>>()?)
+    }
+
+    /// Every stored topic, the broadcasts, and `session`'s direct
+    /// conversations, most recently active first.
+    pub fn channels(&self, session: &str) -> Result<Vec<ChannelSummary>, MessageLogError> {
+        let mut channels: Vec<ChannelSummary> = self
+            .directory()?
+            .into_iter()
+            .map(|topic| ChannelSummary {
+                channel: MessageChannel::Topic(topic.topic),
+                name: None,
+                handle: None,
+                count: topic.count,
+                last_seq: topic.last_seq,
+                last_ms: topic.last_ms,
+            })
+            .collect();
+        channels.extend(self.connection.query_row(
+            "SELECT COUNT(*), MAX(seq), MAX(created_ms) FROM messages WHERE kind = 'broadcast'",
+            [],
+            |row| {
+                let Some(last_seq) = row.get(1)? else {
+                    return Ok(None);
+                };
+                Ok(Some(ChannelSummary {
+                    channel: MessageChannel::Broadcast,
+                    name: None,
+                    handle: None,
+                    count: row_u64(row, 0)?,
+                    last_seq,
+                    last_ms: row_u64(row, 2)?,
+                }))
+            },
+        )?);
+        channels.extend(self.conversations(session)?);
+        channels.sort_by_key(|channel| Reverse(channel.last_seq));
+        Ok(channels)
+    }
+
+    fn conversations(&self, session: &str) -> Result<Vec<ChannelSummary>, MessageLogError> {
+        let mut statement = self.connection.prepare(
+            "SELECT CASE WHEN m.sender_session IS ?1 THEN d.recipient_session
+                         ELSE COALESCE(m.sender_session, m.sender_route) END,
+                    m.sender_session IS ?1, m.seq, m.created_ms, m.sender_name,
+                    m.sender_handle, d.recipient_name
+             FROM messages m JOIN deliveries d ON d.seq = m.seq
+             WHERE m.kind = 'direct' AND (m.sender_session IS ?1 OR d.recipient_session = ?1)
+             ORDER BY m.seq DESC",
+        )?;
+        let mut rows = statement.query([session])?;
+        let mut conversations: Vec<ChannelSummary> = Vec::new();
+        let mut positions: HashMap<String, usize> = HashMap::new();
+        while let Some(row) = rows.next()? {
+            let peer: String = row.get(0)?;
+            let (name, handle) = if row.get(1)? {
+                (row.get(6)?, None)
+            } else {
+                (Some(row.get(4)?), row.get(5)?)
+            };
+            match positions.get(&peer) {
+                Some(&position) => {
+                    let conversation = &mut conversations[position];
+                    conversation.count += 1;
+                    conversation.name = conversation.name.take().or(name);
+                    conversation.handle = conversation.handle.take().or(handle);
+                }
+                None => {
+                    positions.insert(peer.clone(), conversations.len());
+                    conversations.push(ChannelSummary {
+                        channel: MessageChannel::Direct(peer),
+                        name,
+                        handle,
+                        count: 1,
+                        last_seq: row.get(2)?,
+                        last_ms: row_u64(row, 3)?,
+                    });
+                }
+            }
+        }
+        Ok(conversations)
+    }
+
+    /// Every recipient outcome of the messages `seqs`, by message and then
+    /// recipient.
+    pub fn deliveries(&self, seqs: &[i64]) -> Result<Vec<DeliveryRecord>, MessageLogError> {
+        if seqs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT seq, recipient_session, recipient_name, status, reason, updated_ms
+             FROM deliveries WHERE seq IN (SELECT value FROM json_each(?1))
+             ORDER BY seq DESC, recipient_name, recipient_session",
+        )?;
+        let deliveries = statement.query_map([json_list(seqs, "seqs")?], |row| {
+            Ok(DeliveryRecord {
+                seq: row.get(0)?,
+                recipient_session: row.get(1)?,
+                recipient_name: row.get(2)?,
+                status: row.get(3)?,
+                reason: row.get(4)?,
+                updated_ms: row_u64(row, 5)?,
+            })
+        })?;
+        Ok(deliveries.collect::<Result<_, _>>()?)
+    }
+
+    pub fn version(&self) -> Result<HistoryVersion, MessageLogError> {
+        Ok(HistoryVersion {
+            data: self
+                .connection
+                .query_row("PRAGMA data_version", [], |row| row.get(0))?,
+            local: self.connection.total_changes(),
+        })
     }
 
     /// Deletes messages older than `retention.days`, except the newest on
@@ -497,6 +659,11 @@ fn row_u64(row: &Row<'_>, column: usize) -> rusqlite::Result<u64> {
         .map_err(|_| rusqlite::Error::InvalidColumnType(column, value.to_string(), Type::Integer))
 }
 
+/// Values bound as one JSON array, however many there are.
+fn json_list(values: &[impl Serialize], field: &'static str) -> Result<String, MessageLogError> {
+    serde_json::to_string(values).map_err(|_| MessageLogError::Invalid(field))
+}
+
 fn sql_ms(value: u64) -> Result<i64, MessageLogError> {
     i64::try_from(value).map_err(|_| MessageLogError::Invalid("timestamp"))
 }
@@ -538,8 +705,9 @@ fn schema_objects(connection: &Connection) -> Result<i64, MessageLogError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        HistoryChannel, MESSAGES_DB_FILE, MessageAudience, MessageLog, MessageLogError,
-        MessageRecipient, MessageSender, NewMessage, OWNER_FILE_MODE, Retention, TopicSummary,
+        HistoryChannel, MESSAGES_DB_FILE, MessageAudience, MessageChannel, MessageLog,
+        MessageLogError, MessageRecipient, MessageSender, NewMessage, OWNER_FILE_MODE, Retention,
+        TopicSummary,
     };
     use crate::StateDir;
     use rusqlite::{Connection, params};
@@ -559,6 +727,8 @@ mod tests {
     const READER: &str = "reader-session";
     const RECIPIENT: &str = "recipient-session";
     const RECIPIENT_NAME: &str = "ci-watcher";
+    const SENDER_NAME: &str = "CI watcher";
+    const RENAMED: &str = "Release watcher";
     const TOPIC: &str = "ci.failures";
     const OTHER_TOPIC: &str = "deploy.done";
     const TEXT: &str = "The build failed";
@@ -598,7 +768,7 @@ mod tests {
             sender: MessageSender {
                 route: route.into(),
                 session: session.map(str::to_owned),
-                name: "CI watcher".into(),
+                name: SENDER_NAME.into(),
                 handle: Some(RECIPIENT_NAME.into()),
                 cwd: Some("/project".into()),
                 mode: "build".into(),
@@ -613,6 +783,17 @@ mod tests {
 
     fn topic(name: &str) -> MessageAudience {
         MessageAudience::Topic(name.into())
+    }
+
+    fn record_direct(log: &mut MessageLog, id: &str, from: &str, to: &str) -> i64 {
+        log.record(
+            &message(id, MessageAudience::Direct, ROUTE, Some(from)),
+            &[MessageRecipient {
+                session: to.into(),
+                name: None,
+            }],
+        )
+        .unwrap()
     }
 
     fn recipient() -> MessageRecipient {
@@ -902,6 +1083,142 @@ mod tests {
                 .unwrap()),
             ["first"]
         );
+    }
+
+    #[test]
+    fn channels_list_topics_broadcasts_and_only_this_sessions_conversations() {
+        let (_root, _state, mut log) = fixture();
+        log.record(
+            &message("topic", topic(TOPIC), ROUTE, Some(OTHER_SESSION)),
+            &[],
+        )
+        .unwrap();
+        log.record(
+            &message(
+                "broadcast",
+                MessageAudience::Broadcast,
+                ROUTE,
+                Some(OTHER_SESSION),
+            ),
+            &[],
+        )
+        .unwrap();
+        record_direct(&mut log, "sent", SESSION, RECIPIENT);
+        record_direct(&mut log, "received", OTHER_SESSION, SESSION);
+        record_direct(&mut log, "unrelated", OTHER_SESSION, RECIPIENT);
+        assert_eq!(
+            log.channels(SESSION)
+                .unwrap()
+                .into_iter()
+                .map(|summary| (summary.channel, summary.count))
+                .collect::<Vec<_>>(),
+            [
+                (MessageChannel::Direct(OTHER_SESSION.into()), 1),
+                (MessageChannel::Direct(RECIPIENT.into()), 1),
+                (MessageChannel::Broadcast, 1),
+                (MessageChannel::Topic(TOPIC.into()), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn conversations_name_the_other_party_from_its_newest_known_details() {
+        let (_root, _state, mut log) = fixture();
+        record_direct(&mut log, "received", RECIPIENT, SESSION);
+        let sent = record_direct(&mut log, "sent", SESSION, RECIPIENT);
+        let conversation = |log: &MessageLog| log.channels(SESSION).unwrap().remove(0);
+        let before_report = conversation(&log);
+        assert_eq!(before_report.count, 2);
+        assert_eq!(before_report.last_seq, sent);
+        assert_eq!(before_report.name.as_deref(), Some(SENDER_NAME));
+        assert_eq!(before_report.handle.as_deref(), Some(RECIPIENT_NAME));
+        log.transition(
+            ROUTE,
+            "sent",
+            &MessageRecipient {
+                session: RECIPIENT.into(),
+                name: Some(RENAMED.into()),
+            },
+            DELIVERED,
+            None,
+            NOW_MS,
+        )
+        .unwrap();
+        assert_eq!(conversation(&log).name.as_deref(), Some(RENAMED));
+    }
+
+    #[test]
+    fn direct_history_reads_one_conversation_in_both_directions() {
+        let (_root, _state, mut log) = fixture();
+        record_direct(&mut log, "sent", SESSION, RECIPIENT);
+        record_direct(&mut log, "elsewhere", SESSION, OTHER_SESSION);
+        let received = record_direct(&mut log, "received", RECIPIENT, SESSION);
+        record_direct(&mut log, "unrelated", RECIPIENT, OTHER_SESSION);
+        let conversation = HistoryChannel::Direct {
+            session: SESSION.into(),
+            peer: RECIPIENT.into(),
+        };
+        assert_eq!(
+            ids(&log.history(&conversation, None, LIMIT).unwrap()),
+            ["received", "sent"]
+        );
+        assert_eq!(
+            ids(&log.history(&conversation, Some(received), LIMIT).unwrap()),
+            ["sent"]
+        );
+    }
+
+    #[test]
+    fn deliveries_list_each_recipient_of_the_requested_messages() {
+        let (_root, _state, mut log) = fixture();
+        let recipients = [OTHER_SESSION, RECIPIENT].map(|session| MessageRecipient {
+            session: session.into(),
+            name: None,
+        });
+        let mut record = |id| {
+            log.record(
+                &message(id, topic(TOPIC), ROUTE, Some(SESSION)),
+                &recipients,
+            )
+            .unwrap()
+        };
+        let first = record("first");
+        let second = record("second");
+        record("unrequested");
+        let deliveries = log.deliveries(&[first, second]).unwrap();
+        assert_eq!(
+            deliveries
+                .iter()
+                .map(|delivery| (delivery.seq, delivery.recipient_session.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (second, OTHER_SESSION),
+                (second, RECIPIENT),
+                (first, OTHER_SESSION),
+                (first, RECIPIENT),
+            ]
+        );
+        assert!(deliveries.iter().all(|delivery| delivery.status == PENDING));
+        assert!(log.deliveries(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_version_changes_with_each_write_from_any_connection() {
+        let (_root, state, mut log) = fixture();
+        let mut other = MessageLog::open(&state, &retention(), NOW_MS).unwrap();
+        let initial = log.version().unwrap();
+        assert_eq!(log.version().unwrap(), initial);
+        log.record(&message("own", topic(TOPIC), ROUTE, Some(SESSION)), &[])
+            .unwrap();
+        let own = log.version().unwrap();
+        assert_ne!(own, initial);
+        other
+            .record(
+                &message("other", topic(TOPIC), OTHER_ROUTE, Some(OTHER_SESSION)),
+                &[],
+            )
+            .unwrap();
+        assert_ne!(log.version().unwrap(), own);
     }
 
     #[test]

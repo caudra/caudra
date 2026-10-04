@@ -15,8 +15,9 @@ use caudra_providers::{
     HistoryItem, HistoryItemKind, Message, PeerAudience, PeerMessageOrigin, UserOrigin,
 };
 use caudra_storage::id::CaudraId;
+pub use caudra_storage::messages::{ChannelSummary, HistoryVersion, MessageChannel};
 use caudra_storage::messages::{
-    MessageAudience, MessageRecipient, MessageSender, NewMessage, StoredMessage,
+    HistoryChannel, MessageAudience, MessageRecipient, MessageSender, NewMessage, StoredMessage,
 };
 use caudra_storage::random_task_id;
 use caudra_storage::sessions::{PermissionMode, StoredInboundPolicy, StoredPeerControls};
@@ -269,6 +270,40 @@ pub struct PeerHistoryPage {
     pub before: Option<i64>,
 }
 
+/// A stored message as the local user browses it: who sent it to which
+/// audience, and what became of it for each recipient.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelMessage {
+    pub seq: i64,
+    pub audience: PeerAudience,
+    pub sender_name: String,
+    pub sender_handle: Option<String>,
+    /// This session sent it.
+    pub own: bool,
+    pub sent_ms: u64,
+    pub text: String,
+    pub recipients: Vec<RecipientStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecipientStatus {
+    pub name: Option<String>,
+    /// This session is the recipient.
+    pub own: bool,
+    pub status: String,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelPage {
+    pub channel: MessageChannel,
+    /// Newest first.
+    pub messages: Vec<ChannelMessage>,
+    /// Pass back as `before` to read older messages; none once the page
+    /// reaches the oldest one.
+    pub before: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct HeldMessage {
     pub message_id: String,
@@ -285,6 +320,7 @@ pub struct HeldMessageSummary {
     pub reply_target: String,
     pub workspace: Option<PathBuf>,
     pub mode: String,
+    pub audience: PeerAudience,
     pub reason: String,
     pub epoch: u64,
     pub approval_blocker: Option<String>,
@@ -442,6 +478,7 @@ impl InboxItem {
             reply_target: self.origin.reply_target.clone(),
             workspace: self.delivery.sender.canonical_cwd.clone(),
             mode: self.delivery.sender.mode.as_str().into(),
+            audience: self.delivery.audience.clone(),
             reason: reason.clone(),
             epoch,
             approval_blocker: approval_blocker.map(str::to_owned),
@@ -1073,6 +1110,14 @@ fn route_session(route: &str) -> Option<String> {
     Route::parse(route)
         .ok()
         .map(|route| route.session.to_string())
+}
+
+fn peer_audience(audience: MessageAudience) -> PeerAudience {
+    match audience {
+        MessageAudience::Direct => PeerAudience::Direct,
+        MessageAudience::Topic(topic) => PeerAudience::Topic { topic },
+        MessageAudience::Broadcast => PeerAudience::Broadcast,
+    }
 }
 
 fn validate_descriptor(descriptor: &PeerDescriptor) -> Result<(), String> {
@@ -1867,6 +1912,85 @@ impl PeerSession {
             withheld,
             before,
         })
+    }
+
+    /// Every stored topic, the broadcasts, and this session's direct
+    /// conversations, most recently active first. Only the local user browses
+    /// these, so the inbound policy filters nothing.
+    pub async fn message_channels(&self) -> Result<Vec<ChannelSummary>, String> {
+        self.0
+            .host
+            .history
+            .channels(self.session_id().to_string())
+            .await
+    }
+
+    /// Messages on `channel`, newest first, each with every recipient's
+    /// outcome.
+    pub async fn channel_messages(
+        &self,
+        channel: MessageChannel,
+        before: Option<i64>,
+        limit: usize,
+    ) -> Result<ChannelPage, String> {
+        let session = self.session_id().to_string();
+        let limit = limit.clamp(1, MAX_HISTORY_PAGE);
+        let read = match &channel {
+            MessageChannel::Topic(topic) => HistoryChannel::Topics(vec![parse_topic(topic)?]),
+            MessageChannel::Broadcast => HistoryChannel::Broadcast,
+            MessageChannel::Direct(peer) => HistoryChannel::Direct {
+                session: session.clone(),
+                peer: peer.clone(),
+            },
+        };
+        let (mut stored, deliveries) = self
+            .0
+            .host
+            .history
+            .channel_page(read, before, limit + 1)
+            .await?;
+        let older = stored.len() > limit;
+        stored.truncate(limit);
+        let before = stored.last().filter(|_| older).map(|oldest| oldest.seq);
+        let mut recipients: HashMap<i64, Vec<RecipientStatus>> = HashMap::new();
+        for delivery in deliveries {
+            recipients
+                .entry(delivery.seq)
+                .or_default()
+                .push(RecipientStatus {
+                    own: delivery.recipient_session == session,
+                    name: delivery.recipient_name,
+                    status: delivery.status,
+                    reason: delivery.reason,
+                });
+        }
+        let messages = stored
+            .into_iter()
+            .map(|stored| {
+                let message = stored.message;
+                ChannelMessage {
+                    seq: stored.seq,
+                    audience: peer_audience(message.audience),
+                    own: message.sender.session.as_deref() == Some(session.as_str()),
+                    sender_name: message.sender.name,
+                    sender_handle: message.sender.handle,
+                    sent_ms: message.created_ms,
+                    text: message.text,
+                    recipients: recipients.remove(&stored.seq).unwrap_or_default(),
+                }
+            })
+            .collect();
+        Ok(ChannelPage {
+            channel,
+            messages,
+            before,
+        })
+    }
+
+    /// Changes whenever the shared history does, so a browser reloads only
+    /// then.
+    pub async fn history_version(&self) -> Result<HistoryVersion, String> {
+        self.0.host.history.version().await
     }
 
     async fn deliver(&self, delivery: Delivery, epoch: u64) -> SendReceipt {
@@ -2787,13 +2911,13 @@ mod tests {
         DedupEntry, Delivery, FULL, HANDLE_PREFIX, HELD_BLOCKED, HELD_COHORT, HELD_POLICY,
         HISTORY_HELD, HandleClaim, INVALID_HANDLE, Issued, MAX_BODY_BYTES, MAX_DEDUP, MAX_HELD,
         MAX_HISTORY_PAGE, MAX_MESSAGE_NAMES, MAX_NAME_ATTEMPTS, MAX_PEER_NAMES, MAX_PROCESS_BYTES,
-        MAX_SESSION_BYTES, MESSAGE_WORDS, MessageIdentity, NAME_COLLISION, NOT_HELD, NOT_RECORDED,
-        NOT_SUBSCRIBED, NameTable, Outgoing, PEER_WORDS, POLICY_FLOOR, PUBLISH_RATE_EXCEEDED,
-        PeerDecision, PeerDecisionResult, PeerDescriptor, PeerHost, PeerInfo, PeerSession,
-        PeerSummary, RATE_EXCEEDED, RATE_WINDOW, REFUSED_POLICY, REJECTED, RETRY_FULL,
-        RETRY_WINDOW, REUSED_REQUEST, Route, STALE_REVIEW, STALE_TARGET, SendReceipt, Sender,
-        TEST_HISTORY_DIRECTORY, UNKNOWN_HANDLE, UNKNOWN_REPLY, UNKNOWN_TARGET, WireMode,
-        handle_in_use, literal, lock, message_name, token,
+        MAX_SESSION_BYTES, MESSAGE_WORDS, MessageChannel, MessageIdentity, NAME_COLLISION,
+        NOT_HELD, NOT_RECORDED, NOT_SUBSCRIBED, NameTable, Outgoing, PEER_WORDS, POLICY_FLOOR,
+        PUBLISH_RATE_EXCEEDED, PeerDecision, PeerDecisionResult, PeerDescriptor, PeerHost,
+        PeerInfo, PeerSession, PeerSummary, RATE_EXCEEDED, RATE_WINDOW, REFUSED_POLICY, REJECTED,
+        RETRY_FULL, RETRY_WINDOW, REUSED_REQUEST, RecipientStatus, Route, STALE_REVIEW,
+        STALE_TARGET, SendReceipt, Sender, TEST_HISTORY_DIRECTORY, UNKNOWN_HANDLE, UNKNOWN_REPLY,
+        UNKNOWN_TARGET, WireMode, handle_in_use, literal, lock, message_name, token,
         topics::{INVALID_PATTERN, INVALID_TOPIC},
         valid_name, wall_ms,
     };
@@ -5567,6 +5691,96 @@ mod tests {
             let oldest = read(newest.before).await;
             assert_eq!(oldest.messages[0].text, TEXT);
             assert_eq!(oldest.before, None);
+        });
+    }
+
+    #[test]
+    fn the_manager_lists_topics_and_only_this_sessions_conversations() {
+        smol::block_on(async {
+            let (directory, host, publisher) = publisher_fixture(MessagingConfig::default());
+            let watcher = subscriber(&host, directory.path(), &[TOPIC_PATTERN], false);
+            let bystander = subscriber(&host, directory.path(), &[], false);
+            publish_each(&publisher, &[TEXT]).await;
+            for (target, text, request) in [
+                (&publisher, OTHER_TEXT, REQUEST_ID),
+                (&bystander, REPLY_TEXT, REPLY_REQUEST_ID),
+            ] {
+                watcher
+                    .send(&target.0.route.target(), text, None, request)
+                    .await
+                    .unwrap();
+            }
+            let channels = publisher.message_channels().await.unwrap();
+            assert_eq!(
+                channels
+                    .iter()
+                    .map(|summary| (&summary.channel, summary.count))
+                    .collect::<Vec<_>>(),
+                [
+                    (&MessageChannel::Direct(watcher.session_id().to_string()), 1),
+                    (&MessageChannel::Topic(TOPIC.into()), 1),
+                ]
+            );
+            assert_eq!(channels[0].name, Some(watcher.descriptor().name));
+        });
+    }
+
+    #[test]
+    fn channel_pages_show_who_sent_each_message_and_every_recipient_outcome() {
+        smol::block_on(async {
+            let (directory, host, publisher) = publisher_fixture(MessagingConfig::default());
+            let watcher = subscriber(&host, directory.path(), &[TOPIC_PATTERN], false);
+            publish_each(&publisher, &[TEXT, OTHER_TEXT]).await;
+            watcher
+                .send(&publisher.0.route.target(), REPLY_TEXT, None, REQUEST_ID)
+                .await
+                .unwrap();
+            let topic = MessageChannel::Topic(TOPIC.into());
+            let newest = publisher
+                .channel_messages(topic.clone(), None, 1)
+                .await
+                .unwrap();
+            let published = &newest.messages[0];
+            assert_eq!((published.text.as_str(), published.own), (OTHER_TEXT, true));
+            assert_eq!(published.audience, topic_audience());
+            assert_eq!(
+                published.recipients,
+                [RecipientStatus {
+                    name: Some(watcher.descriptor().name),
+                    own: false,
+                    status: QUEUED.into(),
+                    reason: None,
+                }]
+            );
+            let oldest = publisher
+                .channel_messages(topic, newest.before, 1)
+                .await
+                .unwrap();
+            assert_eq!(oldest.messages[0].text, TEXT);
+            assert_eq!(oldest.before, None);
+            let conversation = publisher
+                .channel_messages(
+                    MessageChannel::Direct(watcher.session_id().to_string()),
+                    None,
+                    MAX_HISTORY_PAGE,
+                )
+                .await
+                .unwrap();
+            let reply = &conversation.messages[0];
+            assert_eq!((reply.text.as_str(), reply.own), (REPLY_TEXT, false));
+            assert_eq!(reply.audience, PeerAudience::Direct);
+            assert!(reply.recipients.iter().all(|recipient| recipient.own));
+        });
+    }
+
+    #[test]
+    fn the_history_version_moves_when_this_process_records_a_message() {
+        smol::block_on(async {
+            let (_directory, _host, publisher) = publisher_fixture(MessagingConfig::default());
+            let initial = publisher.history_version().await.unwrap();
+            assert_eq!(publisher.history_version().await.unwrap(), initial);
+            publish_each(&publisher, &[TEXT]).await;
+            assert_ne!(publisher.history_version().await.unwrap(), initial);
         });
     }
 

@@ -1,8 +1,10 @@
 use std::collections::HashMap;
+use std::future::Future;
+use std::time::Instant;
 
-use caudra_agent::peers::topics::{add_patterns, remove_patterns};
 use caudra_agent::peers::{
-    PeerDecision, PeerDecisionResult, PeerDescriptor, PeerReviewToken, PeerSession, PeerSummary,
+    ChannelPage, ChannelSummary, HistoryVersion, MAX_HISTORY_PAGE, PeerDecision,
+    PeerDecisionResult, PeerDescriptor, PeerReviewToken, PeerSession, PeerSummary,
 };
 use caudra_config::{Feature, InboundPolicy};
 use flume::{Receiver, TryRecvError};
@@ -12,40 +14,68 @@ use tracing::warn;
 use super::{EventLoop, SessionRuntime, SessionStatus, SpawnCtx};
 use crate::AppSession;
 use crate::app::App;
-use crate::components::{DisplayMessage, DisplayRole, ExitRequest, Status, peer_manager::PeerView};
+use crate::components::peer_manager::{
+    HISTORY_POLL, PageRequest, PeerManager, PeerView, SubscriptionChange,
+};
+use crate::components::{DisplayMessage, DisplayRole, ExitRequest, Status};
 use crate::repaint::Dirty;
 
 const UNAVAILABLE: &str = "Cross-session messaging is unavailable for this runtime";
 const REVIEW_REQUIRED: &str =
     "Message review expired or was not opened; run /messages and open that message's review";
 const MESSAGES_HELP: &str = "Usage: /messages [help | approve ID | reject ID | inbound auto|accept|hold|refuse]\nRun /messages to open the Held messages view. Enter opens one message's review before approval or rejection. Approval accepts that message, not its requested tool actions, and can start a billable model turn. Inbound policy applies to this session and cannot relax project restrictions. Pending messages are live-only and expire when the runtime closes.";
-const DISCOVERY_STOPPED: &str = "Peer discovery stopped before returning a result";
+const LOAD_STOPPED: &str = "Peer messaging stopped before returning a result";
 const MODAL_BLOCKED: &str = "Finish the pending session review before opening the peer manager";
 const QUEUED: &str = "Message queued for the next safe boundary; an idle session may start after closing the manager";
 const UNNAMED: &str =
     "this session continues without it and reclaims it when resumed while it is free";
 const REJECTED: &str = "Message rejected and removed from the live inbox";
-const TOPICS_HELP: &str = "Usage: /topics [help | subscribe PATTERN... | unsubscribe PATTERN... | broadcast on|off]\nRun /topics to show this session's subscriptions. A topic is a dot-separated name such as ci.failures. In a pattern, * matches one segment and a final ** matches one or more. Subscriptions decide which publications reach this session, up to 16 patterns. Broadcasts reach only sessions that turn them on. The inbound policy still decides whether each message is delivered, held, or refused. Subscriptions are kept with the session and restored when it resumes.";
+const TOPICS_HELP: &str = "Usage: /topics [help | subscribe PATTERN... | unsubscribe PATTERN... | broadcast on|off]\nRun /topics to browse stored topic messages in the peer manager, where s subscribes to the selected topic and p edits this session's subscriptions. A topic is a dot-separated name such as ci.failures. In a pattern, * matches one segment and a final ** matches one or more. Subscriptions decide which publications reach this session, up to 16 patterns. Broadcasts reach only sessions that turn them on. The inbound policy still decides whether each message is delivered, held, or refused. Subscriptions are kept with the session and restored when it resumes.";
 const TOPICS_LABEL: &str = "Peer topics: ";
 const NO_TOPICS: &str = "No peer topic subscriptions";
 const BROADCASTS_ON: &str = "broadcasts on";
 const BROADCASTS_OFF: &str = "broadcasts off";
 const SUMMARY_SEPARATOR: &str = " · ";
 
-type DiscoveryResult = Result<Vec<PeerSummary>, String>;
-
 pub(super) struct PeerRegistration {
     session: PeerSession,
     reviewed: HashMap<String, PeerReviewToken>,
     held_count: usize,
-    discovery: Option<PeerDiscovery>,
+    discovery: Option<Load<u64, Vec<PeerSummary>>>,
+    history: HistoryLoads,
     catch_up: Option<Task<()>>,
 }
 
-struct PeerDiscovery {
-    generation: u64,
-    receiver: Receiver<DiscoveryResult>,
+/// One answer a worker owes the open manager, keyed by the opening and the
+/// question asked, so an answer to anything else is never taken.
+struct Load<K, T> {
+    key: K,
+    receiver: Receiver<Result<T, String>>,
     _task: Task<()>,
+}
+
+impl<K, T: Send + 'static> Load<K, T> {
+    fn start(key: K, work: impl Future<Output = Result<T, String>> + Send + 'static) -> Self {
+        let (sender, receiver) = flume::bounded(1);
+        Self {
+            key,
+            receiver,
+            _task: smol::spawn(async move {
+                let _ = sender.try_send(work.await);
+            }),
+        }
+    }
+}
+
+/// What the Messages view waits on: a version poll, a channel list, and a
+/// page, at most one of each. A history change does not restart a load; the
+/// view asks again once it lands.
+#[derive(Default)]
+struct HistoryLoads {
+    version: Option<Load<u64, HistoryVersion>>,
+    polled: Option<(u64, Instant)>,
+    channels: Option<Load<u64, Vec<ChannelSummary>>>,
+    page: Option<Load<(u64, PageRequest), ChannelPage>>,
 }
 
 impl PeerRegistration {
@@ -55,6 +85,7 @@ impl PeerRegistration {
             reviewed: HashMap::new(),
             held_count: 0,
             discovery: None,
+            history: HistoryLoads::default(),
             catch_up: None,
         };
         registration.catch_up();
@@ -76,31 +107,23 @@ impl PeerRegistration {
         if self
             .discovery
             .as_ref()
-            .is_some_and(|discovery| discovery.generation == generation)
+            .is_some_and(|discovery| discovery.key == generation)
         {
             return false;
         }
-        let (sender, receiver) = flume::bounded(1);
         let session = self.session.clone();
-        self.discovery = Some(PeerDiscovery {
-            generation,
-            receiver,
-            _task: smol::spawn(async move {
-                let result = session.list_named().await;
-                let _ = sender.try_send(result);
-            }),
-        });
+        self.discovery = Some(Load::start(generation, async move {
+            session.list_named().await
+        }));
         true
     }
 
     fn sync_manager(&mut self, app: &mut App) -> Dirty {
-        let generation = app
-            .peer_manager
-            .is_open()
-            .then(|| app.peer_manager.generation());
+        let manager = &mut app.peer_manager;
+        let generation = manager.is_open().then(|| manager.generation());
         let mut dirty = Dirty::NO;
-        if let Some(result) = poll_discovery(&mut self.discovery, generation) {
-            app.peer_manager.set_sessions(result);
+        if let Some((_, result)) = poll_load(&mut self.discovery, generation.as_ref()) {
+            manager.set_sessions(result);
             dirty = Dirty::YES;
         }
         if generation.is_some() {
@@ -112,34 +135,121 @@ impl PeerRegistration {
                             .iter()
                             .any(|message| &message.message_id == id)
                     });
-                    dirty |= Dirty::from(app.peer_manager.update_inbox(snapshot));
+                    dirty |= Dirty::from(manager.update_inbox(snapshot));
                 }
                 Err(error) => {
-                    app.peer_manager.set_error(error);
+                    manager.set_error(error);
                     dirty = Dirty::YES;
                 }
             }
+            dirty |= Dirty::from(manager.update_controls(self.session.controls()));
         }
+        dirty |= self.sync_history(manager, generation);
+        dirty
+    }
+
+    /// Hands the Messages view whatever its loads answered, then asks for
+    /// what it still waits on. The version is polled every `HISTORY_POLL`.
+    fn sync_history(&mut self, manager: &mut PeerManager, generation: Option<u64>) -> Dirty {
+        let visible = generation.filter(|_| manager.history_visible());
+        let loads = &mut self.history;
+        let mut dirty = Dirty::NO;
+        if let Some((_, result)) = poll_load(&mut loads.version, visible.as_ref()) {
+            dirty |= Dirty::from(manager.set_history_version(result));
+        }
+        let channels = generation.filter(|_| manager.wanted_channels());
+        if let Some((_, result)) = poll_load(&mut loads.channels, channels.as_ref()) {
+            manager.set_channels(result);
+            dirty = Dirty::YES;
+        }
+        let page = generation.zip(manager.wanted_page().cloned());
+        if let Some(((_, request), result)) = poll_load(&mut loads.page, page.as_ref()) {
+            manager.set_page(request, result);
+            dirty = Dirty::YES;
+        }
+        let now = Instant::now();
+        if let Some(generation) = visible
+            && loads.version.is_none()
+            && poll_due(loads.polled, generation, now)
+        {
+            loads.polled = Some((generation, now));
+            let session = self.session.clone();
+            loads.version = Some(Load::start(generation, async move {
+                session.history_version().await
+            }));
+        }
+        manager.set_history_polling(loads.version.is_some());
+        ensure_load(
+            &mut loads.channels,
+            generation.filter(|_| manager.wanted_channels()),
+            |_| {
+                let session = self.session.clone();
+                async move { session.message_channels().await }
+            },
+        );
+        ensure_load(
+            &mut loads.page,
+            generation.zip(manager.wanted_page().cloned()),
+            |(_, request)| {
+                let session = self.session.clone();
+                let (channel, before) = (request.channel.clone(), request.before);
+                async move {
+                    session
+                        .channel_messages(channel, before, MAX_HISTORY_PAGE)
+                        .await
+                }
+            },
+        );
         dirty
     }
 }
 
-fn poll_discovery(
-    pending: &mut Option<PeerDiscovery>,
-    generation: Option<u64>,
-) -> Option<DiscoveryResult> {
-    let discovery = pending.as_ref()?;
-    if generation != Some(discovery.generation) {
+/// The answer to `wanted`, once it has come. A load that asked anything else
+/// is dropped, which cancels it.
+fn poll_load<K: PartialEq, T>(
+    pending: &mut Option<Load<K, T>>,
+    wanted: Option<&K>,
+) -> Option<(K, Result<T, String>)> {
+    let load = pending.as_ref()?;
+    if wanted != Some(&load.key) {
         *pending = None;
         return None;
     }
-    let result = match discovery.receiver.try_recv() {
+    let result = match load.receiver.try_recv() {
         Ok(result) => result,
         Err(TryRecvError::Empty) => return None,
-        Err(TryRecvError::Disconnected) => Err(DISCOVERY_STOPPED.into()),
+        Err(TryRecvError::Disconnected) => Err(LOAD_STOPPED.into()),
     };
-    *pending = None;
-    Some(result)
+    pending.take().map(|load| (load.key, result))
+}
+
+/// Starts `work` for `wanted` unless a load already asks it, and drops a load
+/// nothing wants.
+fn ensure_load<K, T, F>(
+    pending: &mut Option<Load<K, T>>,
+    wanted: Option<K>,
+    work: impl FnOnce(&K) -> F,
+) where
+    K: PartialEq,
+    T: Send + 'static,
+    F: Future<Output = Result<T, String>> + Send + 'static,
+{
+    match wanted {
+        None => *pending = None,
+        Some(key) if pending.as_ref().is_none_or(|load| load.key != key) => {
+            let work = work(&key);
+            *pending = Some(Load::start(key, work));
+        }
+        Some(_) => {}
+    }
+}
+
+/// Whether the history version is due a poll: at once in a new opening of
+/// the manager, then once every `HISTORY_POLL`.
+fn poll_due(polled: Option<(u64, Instant)>, generation: u64, now: Instant) -> bool {
+    polled.is_none_or(|(opening, at)| {
+        opening != generation || now.saturating_duration_since(at) >= HISTORY_POLL
+    })
 }
 
 impl Drop for PeerRegistration {
@@ -555,36 +665,52 @@ impl EventLoop<'_> {
             }
             return;
         }
+        let args: Vec<String> = args.split_whitespace().map(str::to_owned).collect();
+        match subscription_request(&args) {
+            SubscriptionRequest::Browse => {
+                self.open_peers(index, PeerView::Messages);
+                self.sessions[index].app.peer_manager.show_only_topics();
+            }
+            SubscriptionRequest::Change(change) => self.change_peer_subscriptions(index, change),
+            SubscriptionRequest::Usage => {
+                if self.peer_command_ready(index) {
+                    self.sessions[index].app.flash(TOPICS_HELP.to_owned());
+                }
+            }
+        }
+    }
+
+    /// Applies `change` to the subscriptions this session holds now, then
+    /// offers what the new set has missed. `/topics` and the peer manager both
+    /// change subscriptions here.
+    pub(super) fn change_peer_subscriptions(&mut self, index: usize, change: SubscriptionChange) {
         if !self.peer_command_ready(index) {
             return;
         }
         let runtime = &mut self.sessions[index];
-        let Some(session) = runtime.peer.as_ref().map(|peer| peer.session.clone()) else {
+        let Some(peer) = &mut runtime.peer else {
             return;
         };
-        let current = session.controls();
-        let args: Vec<String> = args.split_whitespace().map(str::to_owned).collect();
-        let request = subscription_request(&current.topics, current.broadcasts, &args);
-        let changing = matches!(request, SubscriptionRequest::Change(Ok(_)));
-        let result = match request {
-            SubscriptionRequest::Show => {
-                Ok(subscriptions_summary(&current.topics, current.broadcasts))
-            }
-            SubscriptionRequest::Usage => Err(TOPICS_HELP.to_owned()),
-            SubscriptionRequest::Change(change) => change.and_then(|(topics, broadcasts)| {
-                let summary = subscriptions_summary(&topics, broadcasts);
-                session
-                    .set_subscriptions(topics, broadcasts)
-                    .map(|()| summary)
-            }),
-        };
+        let current = peer.session.controls();
+        let result =
+            change
+                .apply(&current.topics, current.broadcasts)
+                .and_then(|(topics, broadcasts)| {
+                    let summary = subscriptions_summary(&topics, broadcasts);
+                    peer.session
+                        .set_subscriptions(topics, broadcasts)
+                        .map(|()| summary)
+                });
+        if result.is_ok() {
+            peer.catch_up();
+        }
+        if runtime.app.peer_manager.is_open() {
+            runtime.app.peer_manager.finish_subscriptions(result);
+            let _ = peer.sync_manager(&mut runtime.app);
+            return;
+        }
         match result {
-            Ok(summary) => {
-                if changing && let Some(peer) = &mut runtime.peer {
-                    peer.catch_up();
-                }
-                runtime.peer_notice(summary);
-            }
+            Ok(summary) => runtime.peer_notice(summary),
             Err(error) => runtime.app.flash(error),
         }
     }
@@ -592,31 +718,22 @@ impl EventLoop<'_> {
 
 #[derive(Debug, PartialEq)]
 enum SubscriptionRequest {
-    Show,
+    Browse,
     Usage,
-    /// The whole subscription set the command asks for, topics then broadcasts.
-    Change(Result<(Vec<String>, bool), String>),
+    Change(SubscriptionChange),
 }
 
-fn subscription_request(
-    topics: &[String],
-    broadcasts: bool,
-    args: &[String],
-) -> SubscriptionRequest {
+fn subscription_request(args: &[String]) -> SubscriptionRequest {
     match args.split_first() {
-        None => SubscriptionRequest::Show,
+        None => SubscriptionRequest::Browse,
         Some((action, patterns)) if action == "subscribe" && !patterns.is_empty() => {
-            SubscriptionRequest::Change(
-                add_patterns(topics, patterns).map(|topics| (topics, broadcasts)),
-            )
+            SubscriptionRequest::Change(SubscriptionChange::Subscribe(patterns.to_vec()))
         }
         Some((action, patterns)) if action == "unsubscribe" && !patterns.is_empty() => {
-            SubscriptionRequest::Change(
-                remove_patterns(topics, patterns).map(|topics| (topics, broadcasts)),
-            )
+            SubscriptionRequest::Change(SubscriptionChange::Unsubscribe(patterns.to_vec()))
         }
         Some((action, [state])) if action == "broadcast" && (state == "on" || state == "off") => {
-            SubscriptionRequest::Change(Ok((topics.to_vec(), state == "on")))
+            SubscriptionRequest::Change(SubscriptionChange::Broadcasts(state == "on"))
         }
         Some(_) => SubscriptionRequest::Usage,
     }
@@ -639,18 +756,19 @@ fn subscriptions_summary(topics: &[String], broadcasts: bool) -> String {
 #[cfg(test)]
 mod tests {
     use std::future::pending;
+    use std::time::{Duration, Instant};
 
-    use caudra_agent::peers::topics::{INVALID_PATTERN, MISSING_PATTERN};
     use caudra_config::{Feature, FeatureFlags, sandbox::SandboxName};
     use flume::Sender;
     use test_case::test_case;
 
     use super::{
-        BROADCASTS_OFF, BROADCASTS_ON, DISCOVERY_STOPPED, DiscoveryResult, NO_TOPICS,
-        PeerDiscovery, SubscriptionRequest, TOPICS_LABEL, peer_blocked, peer_eligible,
-        poll_discovery, subscription_request, subscriptions_summary,
+        BROADCASTS_OFF, BROADCASTS_ON, LOAD_STOPPED, Load, NO_TOPICS, SubscriptionRequest,
+        TOPICS_LABEL, ensure_load, peer_blocked, peer_eligible, poll_due, poll_load,
+        subscription_request, subscriptions_summary,
     };
     use crate::app::{App, tests::test_app};
+    use crate::components::peer_manager::{HISTORY_POLL, SubscriptionChange};
     use crate::components::{ExitRequest, Status};
 
     const ERROR: &str = "The model request failed";
@@ -658,27 +776,22 @@ mod tests {
     const SUBSCRIBED: &str = "ci.*";
     const ADDED: &str = "deploy.**";
 
+    type Answer = Result<(), String>;
+
     fn words(values: &[&str]) -> Vec<String> {
         values.iter().copied().map(str::to_owned).collect()
     }
 
-    #[test_case(&[], SubscriptionRequest::Show; "no_arguments_show")]
-    #[test_case(&["subscribe", ADDED, SUBSCRIBED], SubscriptionRequest::Change(Ok((words(&[SUBSCRIBED, ADDED]), false))); "subscribe_adds_new_patterns")]
-    #[test_case(&["unsubscribe", SUBSCRIBED], SubscriptionRequest::Change(Ok((Vec::new(), false))); "unsubscribe_removes")]
-    #[test_case(&["unsubscribe", ADDED], SubscriptionRequest::Change(Err(format!("{MISSING_PATTERN}: {ADDED:?}"))); "unsubscribe_names_a_missing_pattern")]
-    #[test_case(&["subscribe", "CI"], SubscriptionRequest::Change(Err(INVALID_PATTERN.into())); "subscribe_validates")]
-    #[test_case(&["broadcast", "on"], SubscriptionRequest::Change(Ok((words(&[SUBSCRIBED]), true))); "broadcast_on")]
+    #[test_case(&[], SubscriptionRequest::Browse; "no_arguments_browse")]
+    #[test_case(&["subscribe", ADDED, SUBSCRIBED], SubscriptionRequest::Change(SubscriptionChange::Subscribe(words(&[ADDED, SUBSCRIBED]))); "subscribe_names_patterns")]
+    #[test_case(&["unsubscribe", SUBSCRIBED], SubscriptionRequest::Change(SubscriptionChange::Unsubscribe(words(&[SUBSCRIBED]))); "unsubscribe_names_patterns")]
+    #[test_case(&["broadcast", "on"], SubscriptionRequest::Change(SubscriptionChange::Broadcasts(true)); "broadcast_on")]
+    #[test_case(&["broadcast", "off"], SubscriptionRequest::Change(SubscriptionChange::Broadcasts(false)); "broadcast_off")]
     #[test_case(&["broadcast", "maybe"], SubscriptionRequest::Usage; "broadcast_needs_on_or_off")]
     #[test_case(&["subscribe"], SubscriptionRequest::Usage; "subscribe_needs_a_pattern")]
     #[test_case(&["list"], SubscriptionRequest::Usage; "unknown_action")]
-    fn topics_commands_describe_the_whole_subscription_set(
-        args: &[&str],
-        expected: SubscriptionRequest,
-    ) {
-        assert_eq!(
-            subscription_request(&words(&[SUBSCRIBED]), false, &words(args)),
-            expected
-        );
+    fn topics_commands_name_one_subscription_change(args: &[&str], expected: SubscriptionRequest) {
+        assert_eq!(subscription_request(&words(args)), expected);
     }
 
     #[test_case(&[], false, &format!("{NO_TOPICS} · {BROADCASTS_OFF}"); "nothing")]
@@ -691,12 +804,12 @@ mod tests {
         assert_eq!(subscriptions_summary(&words(topics), broadcasts), expected);
     }
 
-    fn discovery() -> (Sender<DiscoveryResult>, Option<PeerDiscovery>) {
+    fn load() -> (Sender<Answer>, Option<Load<u64, ()>>) {
         let (sender, receiver) = flume::bounded(1);
         (
             sender,
-            Some(PeerDiscovery {
-                generation: GENERATION,
+            Some(Load {
+                key: GENERATION,
                 receiver,
                 _task: smol::spawn(pending()),
             }),
@@ -733,31 +846,64 @@ mod tests {
         assert!(peer_blocked(&app));
     }
 
-    #[test_case(Some(GENERATION), true; "current_opening")]
-    #[test_case(Some(GENERATION + 1), false; "reopened_modal")]
-    #[test_case(None, false; "closed_modal")]
-    fn discovery_results_belong_to_one_opening(generation: Option<u64>, accepted: bool) {
-        let (sender, mut discovery) = discovery();
-        sender.send(Ok(Vec::new())).unwrap();
-        let result = poll_discovery(&mut discovery, generation);
+    #[test_case(Some(GENERATION), true; "current_question")]
+    #[test_case(Some(GENERATION + 1), false; "another_question")]
+    #[test_case(None, false; "nothing_wanted")]
+    fn load_results_answer_only_the_question_asked(wanted: Option<u64>, accepted: bool) {
+        let (sender, mut load) = load();
+        sender.send(Ok(())).unwrap();
+        let result = poll_load(&mut load, wanted.as_ref());
         assert_eq!(result.is_some(), accepted);
-        assert!(discovery.is_none());
-        assert!(poll_discovery(&mut discovery, generation).is_none());
+        assert!(load.is_none());
+        assert!(poll_load(&mut load, wanted.as_ref()).is_none());
     }
 
     #[test_case(false; "pending")]
     #[test_case(true; "worker_disconnected")]
-    fn pending_discovery_is_nonblocking_and_reports_worker_loss(disconnect: bool) {
-        let (sender, mut discovery) = discovery();
+    fn pending_loads_are_nonblocking_and_report_worker_loss(disconnect: bool) {
+        let (sender, mut load) = load();
         let sender = (!disconnect).then_some(sender);
-        let result = poll_discovery(&mut discovery, Some(GENERATION));
+        let result = poll_load(&mut load, Some(&GENERATION));
         if disconnect {
-            assert_eq!(result.unwrap().unwrap_err(), DISCOVERY_STOPPED);
-            assert!(discovery.is_none());
+            assert_eq!(result.unwrap().1.unwrap_err(), LOAD_STOPPED);
+            assert!(load.is_none());
         } else {
             assert!(result.is_none());
-            assert!(discovery.is_some());
+            assert!(load.is_some());
         }
         drop(sender);
+    }
+
+    #[test]
+    fn loads_start_once_per_question_and_stop_when_unwanted() {
+        let mut load: Option<Load<u64, ()>> = None;
+        let mut started = Vec::new();
+        for wanted in [
+            Some(GENERATION),
+            Some(GENERATION),
+            Some(GENERATION + 1),
+            None,
+        ] {
+            ensure_load(&mut load, wanted, |key| {
+                started.push(*key);
+                pending()
+            });
+            assert_eq!(load.as_ref().map(|load| load.key), wanted);
+        }
+        assert_eq!(started, [GENERATION, GENERATION + 1]);
+    }
+
+    #[test_case(None, Duration::ZERO, true; "first_poll")]
+    #[test_case(Some(GENERATION), Duration::ZERO, false; "just_polled")]
+    #[test_case(Some(GENERATION), HISTORY_POLL, true; "interval_elapsed")]
+    #[test_case(Some(GENERATION - 1), Duration::ZERO, true; "reopened_manager")]
+    fn history_version_polls_at_once_per_opening_then_every_interval(
+        opening: Option<u64>,
+        elapsed: Duration,
+        due: bool,
+    ) {
+        let polled_at = Instant::now();
+        let polled = opening.map(|opening| (opening, polled_at));
+        assert_eq!(poll_due(polled, GENERATION, polled_at + elapsed), due);
     }
 }

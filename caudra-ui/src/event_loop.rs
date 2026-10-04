@@ -3808,6 +3808,7 @@ impl<'t> EventLoop<'t> {
             Action::ListPeers => self.list_peers(idx),
             Action::PeerMessages(args) => self.peer_messages(idx, &args),
             Action::PeerTopics(args) => self.peer_topics(idx, &args),
+            Action::PeerSubscribe(change) => self.change_peer_subscriptions(idx, change),
             Action::RefreshPeers => self.refresh_peers(idx),
             Action::ReviewPeerMessage(id) => self.review_peer_message(idx, &id),
             Action::DecidePeerMessage { token, decision } => {

@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use caudra_config::MessagingConfig;
 use caudra_storage::StateDir;
 use caudra_storage::messages::{
-    HistoryChannel, MessageLog, MessageLogError, MessageRecipient, NewMessage, Retention,
-    StoredMessage, TopicSummary,
+    ChannelSummary, DeliveryRecord, HistoryChannel, HistoryVersion, MessageLog, MessageLogError,
+    MessageRecipient, NewMessage, Retention, StoredMessage, TopicSummary,
 };
 use flume::{Receiver, Sender};
 
@@ -217,6 +217,30 @@ impl MessageHistory {
             log.history(&channel, before, limit)
         })
         .await
+    }
+
+    pub(super) async fn channels(&self, session: String) -> Result<Vec<ChannelSummary>, String> {
+        self.query(move |log| log.channels(&session)).await
+    }
+
+    /// Messages on `channel`, newest first, with every recipient's outcome.
+    pub(super) async fn channel_page(
+        &self,
+        channel: HistoryChannel,
+        before: Option<i64>,
+        limit: usize,
+    ) -> Result<(Vec<StoredMessage>, Vec<DeliveryRecord>), String> {
+        self.query(move |log| {
+            let messages = log.history(&channel, before, limit)?;
+            let seqs: Vec<i64> = messages.iter().map(|message| message.seq).collect();
+            let deliveries = log.deliveries(&seqs)?;
+            Ok((messages, deliveries))
+        })
+        .await
+    }
+
+    pub(super) async fn version(&self) -> Result<HistoryVersion, String> {
+        self.query(|log| log.version()).await
     }
 }
 

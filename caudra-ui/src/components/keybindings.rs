@@ -1325,8 +1325,8 @@ pub const KEYBINDS: &[Keybind] = &[
         context: KeybindContext::StashPicker,
     },
     Keybind {
-        label: KeyLabel::Multi(&["1", "2"]),
-        description: "Switch Sessions / Held messages outside filter editing",
+        label: KeyLabel::Multi(&["1", "2", "3"]),
+        description: "Switch Sessions / Held messages / Messages outside filter editing",
         context: KeybindContext::PeerManager,
     },
     Keybind {
@@ -1336,22 +1336,37 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Alt("Tab", SHIFT_TAB_LABEL),
-        description: "Switch list/detail focus",
+        description: "Switch list/detail focus, or move between This session's controls",
         context: KeybindContext::PeerManager,
     },
     Keybind {
         label: KeyLabel::Single("Enter"),
-        description: "Open the selected message review or inspect a peer; never approve from the list",
+        description: "Open the selected message review, inspect a peer, or read a channel; never approve from the list",
+        context: KeybindContext::PeerManager,
+    },
+    Keybind {
+        label: KeyLabel::Single("Enter"),
+        description: "In This session, remove the focused topic, switch broadcasts, or subscribe to the typed patterns",
         context: KeybindContext::PeerManager,
     },
     Keybind {
         label: KeyLabel::Single("Ctrl+R"),
-        description: "Refresh peer discovery without blocking the interface",
+        description: "Refresh peer discovery or the message history without blocking the interface",
         context: KeybindContext::PeerManager,
     },
     Keybind {
         label: KeyLabel::Single("Ctrl+B"),
         description: "Copy the exact peer target outside filter editing",
+        context: KeybindContext::PeerManager,
+    },
+    Keybind {
+        label: KeyLabel::Single("o"),
+        description: "Load the selected channel's older stored messages",
+        context: KeybindContext::PeerManager,
+    },
+    Keybind {
+        label: KeyLabel::Single("s"),
+        description: "Subscribe to or unsubscribe from the selected topic, or switch broadcasts on or off",
         context: KeybindContext::PeerManager,
     },
     Keybind {
@@ -1366,7 +1381,7 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Single("p"),
-        description: "Manage this session's inbound policy outside filter editing",
+        description: "Open This session: its name, inbound policy, subscriptions, and broadcasts",
         context: KeybindContext::PeerManager,
     },
     Keybind {
@@ -1376,7 +1391,7 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Single("Esc"),
-        description: "Cancel confirmation or policy editing, return to the list, then close",
+        description: "Cancel confirmation, clear the pattern field, or leave This session; then return to the list and close",
         context: KeybindContext::PeerManager,
     },
     Keybind {

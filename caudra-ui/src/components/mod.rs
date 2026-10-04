@@ -110,6 +110,7 @@ use crate::animation::live_elapsed;
 use crate::selection::wrap_breaks;
 use keybindings::Bind;
 use modal::FooterHits;
+use peer_manager::SubscriptionChange;
 use worktree_picker::WorktreeView;
 
 pub(crate) const CHEVRON: &str = "❯ ";
@@ -818,6 +819,21 @@ impl ModalScroll {
         self.repin();
     }
 
+    /// Lands on the last row and follows it as rows are added, as `End` does.
+    pub fn follow(&mut self) {
+        self.auto_scroll = true;
+        self.offset = self.max_offset;
+    }
+
+    /// Keeps the rows on screen in place after `rows` more were added above
+    /// them, `total` in all. A view following its last row goes on following.
+    pub fn insert_above(&mut self, rows: u16, total: u16) {
+        if !self.auto_scroll {
+            self.offset = self.offset.saturating_add(rows);
+        }
+        self.update_dimensions(total, self.viewport_h);
+    }
+
     pub fn handle_key(&mut self, key_event: KeyEvent) -> bool {
         use keybindings::key;
         match key_event.code {
@@ -838,8 +854,7 @@ impl ModalScroll {
                 self.auto_scroll = false;
             }
             _ if key::SCROLL_BOTTOM.matches(key_event) || key::DOC_BOTTOM.matches(key_event) => {
-                self.auto_scroll = true;
-                self.offset = self.max_offset;
+                self.follow();
             }
             _ => return false,
         }
@@ -911,6 +926,7 @@ pub enum Action {
     ListPeers,
     PeerMessages(String),
     PeerTopics(String),
+    PeerSubscribe(SubscriptionChange),
     RefreshPeers,
     ReviewPeerMessage(String),
     DecidePeerMessage {
@@ -1928,6 +1944,7 @@ mod tests {
     const MODAL_VIEWPORT: u16 = 20;
     const MODAL_MAX_OFFSET: u16 = MODAL_TOTAL - MODAL_VIEWPORT;
     const MODAL_HALF_PAGE: u16 = MODAL_VIEWPORT / 2;
+    const MODAL_ADDED: u16 = 10;
 
     const HANG_PREFIX: &str = "--> ";
     const HANG_WIDTH: u16 = 12;
@@ -2047,6 +2064,21 @@ mod tests {
         scroll.reveal_and_hold(0, 1);
         scroll.update_dimensions(MODAL_TOTAL, MODAL_VIEWPORT);
         assert_eq!(scroll.offset(), 0);
+    }
+
+    #[test_case(false, MODAL_HALF_PAGE + MODAL_ADDED ; "scrolled_back_keeps_its_rows")]
+    #[test_case(true, MODAL_MAX_OFFSET + MODAL_ADDED ; "following_keeps_the_tail")]
+    fn rows_added_above_leave_the_view_where_it_was(following: bool, expected: u16) {
+        let mut scroll = ModalScroll::new_top();
+        scroll.update_dimensions(MODAL_TOTAL, MODAL_VIEWPORT);
+        if following {
+            scroll.follow();
+        } else {
+            scroll.scroll_to(MODAL_HALF_PAGE);
+        }
+
+        scroll.insert_above(MODAL_ADDED, MODAL_TOTAL + MODAL_ADDED);
+        assert_eq!(scroll.offset(), expected);
     }
 
     const MODAL_CONTENT_W: u16 = 90;

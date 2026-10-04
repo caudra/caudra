@@ -2438,6 +2438,7 @@ impl App {
                 return vec![Action::DecidePeerMessage { token, decision }];
             }
             PeerManagerAction::SetInbound(policy) => return vec![Action::SetPeerInbound(policy)],
+            PeerManagerAction::Subscribe(change) => return vec![Action::PeerSubscribe(change)],
         }
         vec![]
     }

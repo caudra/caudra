@@ -26,7 +26,7 @@ use crate::theme;
 
 /// Every modal scrolls by a `u16` offset, so a document keeps no more rows than
 /// one can reach.
-const MAX_ROWS: usize = u16::MAX as usize;
+pub(crate) const MAX_ROWS: usize = u16::MAX as usize;
 /// The notice heading a document cut to [`MAX_ROWS`] takes one row.
 const NOTICE_ROWS: usize = 1;
 const TRUNCATED: &str = "Earlier rows are left out of this view; y copies everything.";
@@ -252,7 +252,7 @@ impl<K: PartialEq> DocumentView<K> {
         self.selection = selection;
     }
 
-    fn rows(&self) -> u16 {
+    pub(crate) fn rows(&self) -> u16 {
         u16::try_from(self.painted.lines.len()).unwrap_or(u16::MAX)
     }
 
@@ -314,6 +314,18 @@ impl<K: PartialEq> DocumentView<K> {
     /// Back to the left margin, for a reader arriving somewhere new.
     pub(crate) fn reset_pan(&mut self) {
         self.scroll.pan_to(0);
+    }
+
+    /// Lands on the last row and follows it as rows are painted, as `End`
+    /// does, until the reader scrolls away from it.
+    pub(crate) fn follow(&mut self) {
+        self.scroll.follow();
+    }
+
+    /// Keeps the rows on screen in place after `rows` more were painted above
+    /// them. A view following its last row goes on following it.
+    pub(crate) fn insert_above(&mut self, rows: u16) {
+        self.scroll.insert_above(rows, self.rows());
     }
 
     /// Brings the next or previous section's first row to the top, as far as
@@ -630,6 +642,10 @@ mod tests {
     const RESTYLE_DROPPED: &str = "restyled rows keep their text, so the sweep over it must stay";
     const JUMP_WRONG: &str = "a jump must bring the section's first row to the top";
     const CAP_WRONG: &str = "a capped document must keep its newest rows behind the notice";
+    const ADDED_ABOVE: usize = 10;
+    const SCROLLED_TO: usize = 4;
+    const INSERT_MOVED: &str = "rows painted above must leave the rows on screen in place";
+    const TAIL_DROPPED: &str = "a view following its last row must go on following it";
 
     fn lines(texts: &[&'static str]) -> Vec<Line<'static>> {
         texts.iter().copied().map(Line::from).collect()
@@ -641,6 +657,15 @@ mod tests {
 
     fn sample() -> Painted {
         Painted::new(lines(&ROWS), lines(&NUMBERS), Vec::new())
+    }
+
+    /// Rows labelled with the index they hold once every row is painted.
+    fn numbered(rows: Range<usize>) -> Painted {
+        Painted::new(
+            rows.map(|row| Line::from(row.to_string())).collect(),
+            Vec::new(),
+            Vec::new(),
+        )
     }
 
     fn opened(painted: Painted) -> DocumentView<u8> {
@@ -847,6 +872,27 @@ mod tests {
         view.jump(jump);
 
         assert_eq!(view.scroll.offset(), expected, "{JUMP_WRONG}");
+    }
+
+    #[test_case(false ; "scrolled_back")]
+    #[test_case(true  ; "following_the_last_row")]
+    fn rows_painted_above_leave_the_view_on_the_rows_it_showed(following: bool) {
+        let mut view = opened(numbered(ADDED_ABOVE..LONG));
+        draw(&mut view);
+        if following {
+            view.follow();
+        } else {
+            view.scroll_to(SCROLLED_TO);
+        }
+        draw(&mut view);
+        let top = view.painted.row_text(view.top());
+
+        view.ensure(OTHER_KEY, GUTTER, || numbered(0..LONG));
+        view.insert_above(u16::try_from(ADDED_ABOVE).unwrap());
+        draw(&mut view);
+
+        assert_eq!(view.painted.row_text(view.top()), top, "{INSERT_MOVED}");
+        assert_eq!(view.visible().end == LONG, following, "{TAIL_DROPPED}");
     }
 
     /// Row 0 is wider than any row kept, so the pan range has to shrink with it.

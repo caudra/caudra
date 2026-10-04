@@ -47,13 +47,13 @@ A project cannot enable the experiment. An inbound setting or saved session cann
 
 ### Find peers and review messages
 
-`/peers` opens the Sessions view of the peer manager. `/messages` opens its Held messages view. Switch between them with `1` and `2`. See [inbound policy and trust](/docs/permissions/#cross-session-messages) before allowing automatic delivery.
+`/peers` opens the Sessions view of the peer manager. `/messages` opens its Held messages view, and `/topics` opens its Messages view limited to topics. Switch views with `1`, `2`, and `3`. See [inbound policy and trust](/docs/permissions/#cross-session-messages) before allowing automatic delivery.
 
-Sessions shows a discovery snapshot of eligible live peers. Select a row to inspect its workspace, activity, inbound policy, and exact target. `Ctrl+R` refreshes without blocking the interface. `Ctrl+B` copies the target. A failed refresh keeps the previous snapshot visible with an error.
+Sessions shows a discovery snapshot of eligible live peers. Select a row to inspect its workspace, activity, inbound policy, messaging name, subscriptions, broadcast setting, and exact target. `Ctrl+R` refreshes without blocking the interface. `Ctrl+B` copies the target. A failed refresh keeps the previous snapshot visible with an error.
 
-Press `/` to filter the current list, then Enter to leave filter editing. Enter on a held message opens its review. Read the literal message body, then use `y` to approve once or `n` to review rejection. Rejecting removes the message from the live inbox. Browsing, filtering, and refreshing grant no approval. Tab switches list/detail focus. Esc backs out before closing. Narrow terminals show one pane at a time.
+Press `/` to filter the current list, then Enter to leave filter editing. The Sessions filter also matches messaging names and subscriptions. Enter on a held message opens its review. Read the literal message body, then use `y` to approve once or `n` to review rejection. Rejecting removes the message from the live inbox. Browsing, filtering, and refreshing grant no approval. Tab switches list/detail focus. Esc backs out before closing. Narrow terminals show one pane at a time.
 
-The Held messages view contains messages waiting for this session's review or for the session to resume. Recorded messages and send receipts remain in the transcript. Use the agent to send messages.
+The Held messages view contains messages waiting for this session's review or for the session to resume. Each row names the audience the message was sent to. Messages browses the [message history](#browse-the-message-history). Received messages and send receipts also stay in the transcript. Use the agent to send messages.
 
 | Command | Action |
 |---|---|
@@ -65,7 +65,7 @@ The Held messages view contains messages waiting for this session's review or fo
 
 Open the individual message's review before using an approve or reject command. Review again if the session's mode, workspace, or policy changes. An old review cannot approve a message under new controls.
 
-Press `p` outside filter editing to manage this session's inbound policy. Select an option and press `a` to apply it. Relaxing the policy requires confirmation because it can release held messages and start billable turns. Project restrictions remain in force. This control never changes the selected peer's policy.
+Press `p` outside filter editing to open This session. It shows this session's messaging name, inbound policy, topic subscriptions, and broadcast setting. Tab and Shift+Tab move between its controls. Select a policy and press `a` to apply it. Relaxing the policy requires confirmation because it can release held messages and start billable turns. Project restrictions remain in force. Enter on a subscribed pattern removes it, and Enter on broadcasts switches them on or off. To subscribe, type one or more patterns in the field and press Enter. An invalid pattern stays in the field with the reason. The name is read-only, and the panel never changes another session's settings.
 
 You can also ask the agent to find a session and send it a message. It uses `list_sessions` for discovery and `send_message` for delivery. It reaches many sessions at once through [topics and broadcasts](#topics-and-broadcasts), and reads earlier topic messages from the [message history](#message-history). Discovery cards show session labels, [messaging names](#messaging-names), subscriptions, word-based targets, workspaces, and availability, without transcript previews. A title is not a unique address.
 
@@ -75,7 +75,7 @@ A live session remembers up to 4,096 targets and 3,072 message names. Beyond tha
 
 Accepted messages enter at a safe run boundary. They can also wake an eligible idle TUI session and start a billable model turn. They do not interrupt a running tool or bypass cancellation, permission review, or rate limits. The recipient still applies its own tool permissions.
 
-Opening or closing the manager does not resume cancelled work. An idle session waits until the modal closes before starting a peer-triggered turn. Work already running keeps its existing safe-boundary delivery behavior.
+Opening or closing the manager does not resume cancelled work. While the manager is open, in any view, an idle session starts no peer-triggered turn. It starts one after the manager closes. Work already running keeps its existing safe-boundary delivery behavior.
 
 ### Messaging names
 
@@ -103,11 +103,11 @@ Subscribe when you start a TUI session:
 caudra --name ci-watcher --topic 'ci.**' --receive-broadcasts
 ```
 
-`--topic` is repeatable. It adds to the patterns a resumed session already has and never removes one. `--receive-broadcasts` opts the session in to broadcasts. Change subscriptions later with `/topics`:
+`--topic` is repeatable. It adds to the patterns a resumed session already has and never removes one. `--receive-broadcasts` opts the session in to broadcasts. Change subscriptions later in the peer manager's This session panel, from its Messages view, or with `/topics`:
 
 | Command | Action |
 |---|---|
-| `/topics` | Show this session's patterns and broadcast setting |
+| `/topics` | Open the Messages view limited to topics |
 | `/topics subscribe <pattern>...` | Add one or more patterns |
 | `/topics unsubscribe <pattern>...` | Remove one or more patterns |
 | `/topics broadcast on\|off` | Opt in to broadcasts or out of them |
@@ -160,6 +160,16 @@ history_max_messages = 50000
 ```
 
 A project file that sets either key fails to load.
+
+### Browse the message history
+
+The Messages view of the peer manager lists every stored topic, the broadcasts, and this session's direct conversations, most recently active first. Each row shows its message count and latest activity, and marks a topic this session receives by exact subscription or through a wildcard pattern. `/topics` opens the view limited to topics, and `3` shows every channel again.
+
+Enter reads the selected channel, with the newest message at the bottom. Each message shows its sender, time, and audience, with every recipient's outcome below it. While the reader shows the newest message, it follows new ones as they arrive. `o` loads older messages above the ones on screen. `Ctrl+R` reloads the list and the open channel.
+
+`s` subscribes this session to the selected topic or unsubscribes it, and on Broadcast it switches broadcasts on or off. A topic that this session receives only through a wildcard pattern needs the [This session](#find-peers-and-review-messages) panel to change that pattern.
+
+The view shows every stored message whatever the inbound policy, because only you read it there. It checks the history for changes once a second while it is on screen. Browsing approves nothing and leaves catch-up unchanged. Session ids never appear, so a direct conversation shows the other session's messaging name or title.
 
 ### Rate limits and cost
 
