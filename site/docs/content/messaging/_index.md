@@ -116,6 +116,73 @@ The [message history](#message-history) records script messages like any other. 
 
 The `auto` inbound policy never delivers a script message automatically, because its trust check compares two sessions and a script is not one. It holds the message for review, and `read_topic` counts script messages as withheld. A session that should wake on script events needs `accept`, set with `/messages inbound accept` or in `[agent.messaging]`. See [inbound policy and trust](/docs/permissions/#cross-session-messages).
 
+## Consumer groups
+
+A topic message reaches every subscriber. A consumer group instead turns each message on its topics into one work item, hands the item to a single member, and tracks it until that member's agent reports an outcome. Use a group when several agents share a queue of jobs, such as one fix per failed build.
+
+Create the group with [`caudra message group`](/docs/cli/#consumer-groups-from-the-shell), then start the sessions that should take its work with `--group`:
+
+```sh
+caudra message group create build-fixes --topic ci.failures --concurrency 2
+caudra --name fixer-1 --group build-fixes
+caudra message publish --topic ci.failures --from nightly-ci "Build 1042 failed on linux"
+```
+
+A member takes work from a script publication like this one only under the `accept` inbound policy, which `/messages inbound accept` sets. See [Messages from scripts](#messages-from-scripts).
+
+Every member shares the group's policy. It names the topic patterns, how many items members work on at once, how many attempts an item gets, and how many unfinished items the group holds. Members cannot change it, and agents have no tool to create, join, or change a group. Groups and their work belong to your user on this machine, so every project sees the same ones.
+
+A group queues work only for messages published after its creation. A matching publication becomes one item per group, even when several of the group's patterns match it. The group keeps its queue while no member is live, and pausing the group keeps the queue while handing out nothing. The publish receipt lists the queued items apart from the live recipients. A queued item still waits for a member to take it and report an outcome.
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending: published
+    pending --> leased: a member takes it
+    leased --> completed: complete
+    leased --> pending: retry, or the lease ran out
+    leased --> failed: fail, or no attempts left
+    leased --> paused: the turn ended without an outcome, or you cancelled it
+    pending --> paused: you paused it
+    paused --> pending: you retried it
+    failed --> pending: you retried it
+    pending --> cancelled: you cancelled it
+    paused --> cancelled: you cancelled it
+```
+
+### How a member works on an item
+
+A live TUI member looks for work while it idles and holds one item at a time across all its groups. It takes only an item whose message its [inbound policy](/docs/permissions/#cross-session-messages) would deliver automatically, so under `auto` it leaves script publications to members with `accept`. A member never takes an item from its own publication, and a ReadOnly session takes none because its agent cannot report an outcome. The item starts a turn of its own as a work assignment that names the group, the work item, and the attempt. A `--print` run never takes work.
+
+The member holds a 120-second lease on the item and renews it every 20 seconds while its turn runs, including waits for the model, a tool, or your permission review. The agent reports the outcome with the `work_assignment` tool:
+
+| Action | Result |
+|---|---|
+| `complete` | The item is done, with an optional summary |
+| `retry` | The attempt failed, and another attempt may succeed. The item returns to the queue after 5 seconds, then 30, until its attempts run out |
+| `fail` | The item failed for good |
+| `list` | Shows the item this session works on and the items it paused |
+
+A reply to the publisher, a finished turn, or a delivered message never completes an item. A turn that ends without an outcome pauses the item with `completion required`, so the item waits for you rather than going to another member. When you press Esc during the turn, Caudra records the pause before the cancellation reaches the turn. Cancelling a run, or a run that ends in an error, also stops the session from taking work until your next local input, as it stops [automatic wakes](#rate-limits-and-cost). A paused item stays paused until you retry or cancel it. Until then, the agent that paused it can still report its outcome, for example after you ask it to finish.
+
+When a member stops renewing its lease, for example because its process crashed, the item returns to the queue once the lease runs out and that attempt counts. Every attempt gets a fresh lease. A member whose lease ran out can no longer report on the item. Caudra stops its turn, and as after any cancelled run, that session takes no work until your next local input. An item therefore runs at least once and sometimes more than once, because an expired attempt may have had effects before another member repeats it. Keep group work safe to repeat, or check its effects before you retry it.
+
+### Join and manage groups
+
+`--group` is repeatable. It adds to the groups a resumed session already belongs to, and startup fails when a group does not exist. A session belongs to at most 8 groups and saves its memberships with its other messaging controls. `/groups` changes them later and manages work:
+
+| Command | Action |
+|---|---|
+| `/groups` | List the groups, mark the ones this session belongs to, and show the work it holds |
+| `/groups join <group>` | Take work from an existing group |
+| `/groups leave <group>` | Stop taking new work from a group. The item the session holds stays its own |
+| `/groups retry <work>` | Queue a paused, failed, or cancelled item again with a full set of attempts |
+| `/groups pause <work>` | Hold a queued item until you retry it |
+| `/groups cancel <work>` | Give up on a queued, paused, or failed item |
+
+Retrying an item can repeat effects of its earlier attempts, so `/groups retry` warns when the item already ran. Membership is separate from subscriptions. A session that subscribes to a topic and also belongs to a group on it receives each message twice, once as a notification and once as work.
+
+Each group counts as one of a publication's `max_fanout` destinations. A group holds at most 1,000 unfinished items, and all groups together hold at most 10,000. A publication that would exceed either limit fails before any session receives it. Pruning never removes the message of an unfinished item.
+
 ## Delivery receipts and lifetime
 
 | Status | Meaning |

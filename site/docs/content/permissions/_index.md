@@ -66,6 +66,8 @@ The policy treats direct messages, topic messages, and broadcasts alike. Subscri
 
 The same policy limits what `read_topic` returns from the [message history](/docs/messaging/#message-history). Under `auto`, stored messages from senders outside the automatic cohort are counted without their text. Under `hold` or `refuse`, the agent cannot read the history. Reading is free of side effects, so it needs no outgoing authorization.
 
+A [consumer group](/docs/messaging/#consumer-groups) member takes only work whose message its policy would deliver automatically. Under `auto` it leaves work from scripts, other workspaces, and other modes to members with `accept`, and under `hold` or `refuse` it takes none. `work_assignment` reports on the session's own work. Its `list` action only reads. `complete`, `retry`, and `fail` change shared work state, so ReadOnly sessions cannot report, and Plan sessions ask first unless [YOLO mode](#yolo-mode) is on. No tool creates, joins, or changes a group.
+
 The history keeps every message as plain text, direct messages included. File permissions keep other users out, but any program running as your user can read it, for example with [`caudra message log`](/docs/cli/#caudra-message).
 
 The peer manager separates browsing from approval. Open one message's review before deciding. Its review expires when the session controls change. The policy view names this session as its scope and shows project restrictions. Applying a less restrictive policy requires confirmation because held messages may become eligible for automatic delivery. Refuse rejects new arrivals and leaves existing held messages available for inspection or rejection.

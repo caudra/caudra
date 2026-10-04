@@ -186,10 +186,14 @@ pub(crate) fn session_has_content(session: &AppSession) -> bool {
         // Plan is the mode a session opens in, so only leaving it is a choice
         // worth keeping an otherwise empty session for.
         || session.meta.mode == Some(caudra_storage::sessions::StoredMode::Build)
-        // A name or a subscription is how peers and scripts reach the session,
-        // so it is worth keeping before the first message. An inbound policy is not.
+        // A name, a subscription, or a group membership is how peers and scripts
+        // reach the session, so it is worth keeping before the first message. An
+        // inbound policy is not.
         || session.meta.peer_controls.as_ref().is_some_and(|controls| {
-            controls.handle.is_some() || !controls.topics.is_empty() || controls.broadcasts
+            controls.handle.is_some()
+                || !controls.topics.is_empty()
+                || controls.broadcasts
+                || !controls.groups.is_empty()
         })
 }
 

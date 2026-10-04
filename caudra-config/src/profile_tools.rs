@@ -51,6 +51,7 @@ pub const TOOL_POLICY_GROUPS: &[(ToolPolicyGroup, &[&str])] = &[
             "send_message",
             "publish_message",
             "read_topic",
+            "work_assignment",
         ],
     ),
 ];

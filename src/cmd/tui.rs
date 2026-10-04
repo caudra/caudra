@@ -17,8 +17,8 @@ use flume::{RecvTimeoutError as PatternRecvError, Sender as ChannelSender};
 use caudra_agent::command::{self, CustomCommand};
 use caudra_agent::decisions::Decisions;
 use caudra_agent::herdr::HerdrEnv;
-use caudra_agent::peers::PeerHost;
 use caudra_agent::peers::topics::add_patterns;
+use caudra_agent::peers::{MAX_MEMBERSHIPS, PeerHost, TOO_MANY_MEMBERSHIPS};
 use caudra_agent::permissions::pattern_recognition::{PatternCandidate, RecognitionExclusion};
 use caudra_agent::prompt::profile::{PromptProfileCatalog, SystemPromptProfile};
 use caudra_agent::tools::{DescriptionContext, ToolAudience, ToolFilter, ToolRegistry};
@@ -846,6 +846,38 @@ fn subscribe_launch(session: &mut AppSession, topics: &[String], broadcasts: boo
     Ok(())
 }
 
+/// Adds the launch groups to the ones the session already belongs to, once
+/// each exists, so a session never waits on a group nobody created.
+fn join_launch_groups(host: &PeerHost, session: &mut AppSession, groups: &[String]) -> Result<()> {
+    if groups.is_empty() {
+        return Ok(());
+    }
+    smol::block_on(host.check_groups(groups)).map_err(|error| eyre!(error))?;
+    let current = session
+        .meta
+        .peer_controls
+        .as_ref()
+        .map(|controls| controls.groups.as_slice())
+        .unwrap_or_default();
+    let groups = add_groups(current, groups)?;
+    session.meta.peer_controls.get_or_insert_default().groups = groups;
+    Ok(())
+}
+
+/// `current` followed by each group of `added` it lacks.
+fn add_groups(current: &[String], added: &[String]) -> Result<Vec<String>> {
+    let mut groups = current.to_vec();
+    for group in added {
+        if !groups.contains(group) {
+            groups.push(group.clone());
+        }
+    }
+    if groups.len() > MAX_MEMBERSHIPS {
+        bail!(TOO_MANY_MEMBERSHIPS);
+    }
+    Ok(groups)
+}
+
 fn relocation_moves_live_tabs(tabs: &[SessionTab], request: &SessionRelocation) -> bool {
     tabs.iter().any(|tab| {
         request
@@ -1558,7 +1590,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
     let mut sweeper = RetentionSweeper::spawn(storage.clone(), stack.config.storage);
     let mut committed_relocation: Option<String> = None;
     let sandboxes = cli.startup.features.enabled(Feature::Sandboxes);
-    let messaging_flags = cli.name.is_some() || !cli.topics.is_empty() || cli.receive_broadcasts;
+    let messaging_flags = cli.requests_messaging();
     let peer_host = if workcell_runtime.is_remote() {
         None
     } else {
@@ -1582,6 +1614,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
             reserve_launch_name(host, session, name)?;
         }
         subscribe_launch(session, &cli.topics, cli.receive_broadcasts)?;
+        join_launch_groups(host, session, &cli.groups)?;
     }
 
     loop {
@@ -3942,20 +3975,23 @@ mod tests {
         use std::sync::Arc;
 
         use caudra_agent::History;
-        use caudra_agent::peers::PeerHost;
         use caudra_agent::peers::topics::{MAX_PATTERNS, TOO_MANY_PATTERNS};
+        use caudra_agent::peers::{MAX_MEMBERSHIPS, PeerHost, TOO_MANY_MEMBERSHIPS};
         use caudra_providers::Message;
+        use caudra_storage::messages::WorkRefusal;
         use caudra_storage::sessions::StoredPeerControls;
         use caudra_ui::AppSession;
         use tempfile::{Builder, TempDir};
         use test_case::test_case;
 
-        use super::super::{reserve_launch_name, subscribe_launch};
+        use super::super::{add_groups, join_launch_groups, reserve_launch_name, subscribe_launch};
         use super::{TEST_CWD, TEST_MODEL};
 
         const LAUNCH_NAME: &str = "ci-watcher";
         const LAUNCH_TOPIC: &str = "ci.**";
         const STORED_TOPIC: &str = "deploy";
+        const LAUNCH_GROUP: &str = "reviewers";
+        const STORED_GROUP: &str = "auditors";
         const RESUMED_PROMPT: &str = "Fix the parser";
         const PRIVATE_MODE: u32 = 0o700;
         /// Short enough that peer socket paths fit the Unix limit.
@@ -4025,15 +4061,15 @@ mod tests {
             let mut session = AppSession::new(TEST_MODEL, TEST_CWD);
             if !stored.is_empty() {
                 session.meta.peer_controls = Some(StoredPeerControls {
-                    topics: patterns(stored),
+                    topics: owned(stored),
                     ..StoredPeerControls::default()
                 });
             }
-            subscribe_launch(&mut session, &patterns(launched), broadcasts).unwrap();
+            subscribe_launch(&mut session, &owned(launched), broadcasts).unwrap();
             let controls = session.meta.peer_controls;
             assert_eq!(
                 controls.as_ref().map(|controls| controls.topics.clone()),
-                expected.map(patterns)
+                expected.map(owned)
             );
             assert_eq!(
                 controls.is_some_and(|controls| controls.broadcasts),
@@ -4052,7 +4088,43 @@ mod tests {
             assert_eq!(session.meta.peer_controls, None);
         }
 
-        fn patterns(values: &[&str]) -> Vec<String> {
+        #[test_case(&[], &[LAUNCH_GROUP], &[LAUNCH_GROUP]; "new_membership")]
+        #[test_case(&[STORED_GROUP], &[LAUNCH_GROUP, STORED_GROUP], &[STORED_GROUP, LAUNCH_GROUP]; "saved_memberships_come_first")]
+        #[test_case(&[], &[LAUNCH_GROUP, LAUNCH_GROUP], &[LAUNCH_GROUP]; "repeated_group_joins_once")]
+        fn launch_groups_add_to_the_saved_ones(
+            stored: &[&str],
+            launched: &[&str],
+            expected: &[&str],
+        ) {
+            assert_eq!(
+                add_groups(&owned(stored), &owned(launched)).unwrap(),
+                owned(expected)
+            );
+        }
+
+        #[test]
+        fn launch_groups_over_the_limit_stop_startup() {
+            let saved: Vec<String> = (0..MAX_MEMBERSHIPS)
+                .map(|index| format!("{STORED_GROUP}-{index}"))
+                .collect();
+            let error = add_groups(&saved, &owned(&[LAUNCH_GROUP])).unwrap_err();
+            assert_eq!(error.to_string(), TOO_MANY_MEMBERSHIPS);
+        }
+
+        #[test_case(&[], false; "no_groups_change_nothing")]
+        #[test_case(&[LAUNCH_GROUP], true; "unknown_group_stops_startup")]
+        fn launch_groups_must_exist_before_the_session_joins(launched: &[&str], refused: bool) {
+            let directory = peer_directory();
+            let mut session = AppSession::new(TEST_MODEL, TEST_CWD);
+            let joined = join_launch_groups(&peer_host(&directory), &mut session, &owned(launched));
+            assert_eq!(
+                joined.err().map(|error| error.to_string()),
+                refused.then(|| WorkRefusal::UnknownGroup(LAUNCH_GROUP.into()).to_string())
+            );
+            assert_eq!(session.meta.peer_controls, None);
+        }
+
+        fn owned(values: &[&str]) -> Vec<String> {
             values.iter().copied().map(str::to_owned).collect()
         }
     }

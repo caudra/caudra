@@ -80,6 +80,8 @@ const NAME_IN_USE: &str = " was in use at launch; resuming while it is free recl
 const AUDIENCE_LABEL: &str = "Audience: ";
 const TOPICS_LABEL: &str = "Topics: ";
 const BROADCASTS_LABEL: &str = "Broadcasts: ";
+const GROUPS_LABEL: &str = "Consumer groups: ";
+const GROUPS_HINT: &str = " · /groups joins or leaves one";
 const NO_TOPICS: &str = "none";
 const ON: &str = "on";
 const OFF: &str = "off";
@@ -1431,6 +1433,10 @@ impl PeerManager {
                 "{BROADCASTS_LABEL}{}",
                 if controls.broadcasts { ON } else { OFF }
             ));
+            lines.push(format!(
+                "{GROUPS_LABEL}{}{GROUPS_HINT}",
+                literal_list(&controls.groups)
+            ));
             lines.push(String::new());
             lines.push(SUBSCRIPTIONS_HINT.to_owned());
         }
@@ -2503,19 +2509,12 @@ impl PeerManager {
                         Some(address) => format!("{NAME_LABEL}{}", literal(&address, false)),
                         None => format!("{EXACT_TARGET_LABEL}{}", literal(&peer.target, false)),
                     };
-                    let topics = if peer.topics.is_empty() {
-                        NO_TOPICS.to_owned()
-                    } else {
-                        peer.topics
-                            .iter()
-                            .map(|topic| literal(topic, false))
-                            .collect::<Vec<_>>()
-                            .join(LIST_SEPARATOR)
-                    };
                     let mut text = format!(
-                        "{}\n\n{address}\n{TOPICS_LABEL}{topics}\n{BROADCASTS_LABEL}{}\nWorkspace: {}",
+                        "{}\n\n{address}\n{TOPICS_LABEL}{}\n{BROADCASTS_LABEL}{}\n{GROUPS_LABEL}{}\nWorkspace: {}",
                         literal(&peer.title, false),
+                        literal_list(&peer.topics),
                         if peer.broadcasts { ON } else { OFF },
+                        literal_list(&peer.groups),
                         literal(&peer.cwd.to_string_lossy(), false),
                     );
                     if peer.handle.is_none() {
@@ -2920,6 +2919,18 @@ impl Overlay for PeerManager {
     }
 }
 
+/// `values` escaped and joined, or `none`.
+fn literal_list(values: &[String]) -> String {
+    if values.is_empty() {
+        return NO_TOPICS.to_owned();
+    }
+    values
+        .iter()
+        .map(|value| literal(value, false))
+        .collect::<Vec<_>>()
+        .join(LIST_SEPARATOR)
+}
+
 fn change_label(change: &SubscriptionChange) -> &'static str {
     match change {
         SubscriptionChange::Subscribe(_) => SUBSCRIBE_LABEL,
@@ -3250,21 +3261,23 @@ mod tests {
     use super::{
         ALIAS_SCOPE, AUDIENCE_LABEL, BINDINGS, BROADCASTS_LABEL, BROADCASTS_ON_LABEL,
         BROADCASTS_TITLE, Command, Confirmation, DIRECT_LABEL, EXACT_TARGET_LABEL, FLOOR_BLOCKED,
-        FreshInput, HISTORY_FAILED, HISTORY_POLL, HISTORY_STATUS, LEFT_OUT_HINT, LIST_SEPARATOR,
-        LOADING_HISTORY, LoadedPage, MAX_LITERAL_COLS, MAX_ROWS, NAME_IN_USE, NAME_LABEL,
-        NO_LONGER_HELD, NO_MATCHES, NO_NAME, NO_PEERS, NO_REPLY_TARGET, NO_TOPIC_HISTORY,
-        NOT_LOADED, NOT_RECEIVING, OLDER_HINT, ON, POLICY_SAVED, Pane, PanelFocus, PeerManager,
-        PeerManagerAction, PeerView, QUEUED, RECEIVING, REJECTED, RETRY_HINT, Reader, ReviewPanel,
-        SEPARATOR, STALE_REVIEW, START_HINT, SUBSCRIBE_LABEL, SUBSCRIBED, SessionPanel,
-        SubscriptionChange, TOPICS_LABEL, TOPICS_SCOPE, UNSUBSCRIBE_LABEL, VIA, WHEEL_STEP,
-        change_label, channel_key, handle_address, literal, message_block, paint_literal,
-        painted_rows, policy_rank,
+        FreshInput, GROUPS_HINT, GROUPS_LABEL, HISTORY_FAILED, HISTORY_POLL, HISTORY_STATUS,
+        LEFT_OUT_HINT, LIST_SEPARATOR, LOADING_HISTORY, LoadedPage, MAX_LITERAL_COLS, MAX_ROWS,
+        NAME_IN_USE, NAME_LABEL, NO_LONGER_HELD, NO_MATCHES, NO_NAME, NO_PEERS, NO_REPLY_TARGET,
+        NO_TOPIC_HISTORY, NO_TOPICS, NOT_LOADED, NOT_RECEIVING, OLDER_HINT, ON, POLICY_SAVED, Pane,
+        PanelFocus, PeerManager, PeerManagerAction, PeerView, QUEUED, RECEIVING, REJECTED,
+        RETRY_HINT, Reader, ReviewPanel, SEPARATOR, STALE_REVIEW, START_HINT, SUBSCRIBE_LABEL,
+        SUBSCRIBED, SessionPanel, SubscriptionChange, TOPICS_LABEL, TOPICS_SCOPE,
+        UNSUBSCRIBE_LABEL, VIA, WHEEL_STEP, change_label, channel_key, handle_address, literal,
+        message_block, paint_literal, painted_rows, policy_rank,
     };
     use crate::components::{Overlay, buffer_text};
     use crate::repaint::Cadence;
 
     const FIRST_TARGET: &str = "calm-fox-brings-dawn";
     const SECOND_TARGET: &str = "calm-fox-brings-rain";
+    const GROUP: &str = "build-fixes";
+    const OTHER_GROUP: &str = "release-triage";
     const HANDLE: &str = "parser-agent";
     const GENERATED: &str = "quiet-amber-heron";
     const LONGEST_HANDLE: &str = "abcdefghijklmnopqrstuvwxyz-12345";
@@ -3462,6 +3475,7 @@ mod tests {
             inbound: InboundPolicy::Auto,
             topics: Vec::new(),
             broadcasts: false,
+            groups: Vec::new(),
         }
     }
 
@@ -4796,6 +4810,27 @@ mod tests {
         };
         let panel = manager.panel_document().expect(PANEL_OPEN).text;
         assert_eq!(panel.lines().nth(1), Some(expected.as_str()));
+    }
+
+    #[test_case(&[], NO_TOPICS; "no_groups")]
+    #[test_case(&[GROUP, OTHER_GROUP], &format!("{GROUP}{LIST_SEPARATOR}{OTHER_GROUP}"); "groups")]
+    fn group_memberships_show_in_session_details_and_this_session(groups: &[&str], listed: &str) {
+        let shown = format!("{GROUPS_LABEL}{listed}");
+        let mut sessions = manager(PeerView::Sessions);
+        sessions.set_sessions(Ok(vec![PeerSummary {
+            groups: words(groups),
+            ..peer(FIRST_TARGET)
+        }]));
+        sessions.select(FIRST_TARGET.to_owned());
+        assert!(draw(&mut sessions, WIDE, HEIGHT).contains(&shown));
+        let mut this_session = manager(PeerView::Held);
+        this_session.update_controls(StoredPeerControls {
+            groups: words(groups),
+            ..StoredPeerControls::default()
+        });
+        this_session.handle_key(press(KeyCode::Char('p')));
+        let panel = this_session.panel_document().expect(PANEL_OPEN).text;
+        assert!(panel.contains(&format!("{shown}{GROUPS_HINT}")), "{panel}");
     }
 
     #[test]

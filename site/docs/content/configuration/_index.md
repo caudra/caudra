@@ -96,7 +96,7 @@ decision_engine = true
 | `remote_workcell` | `false` | Direct [remote Workcell](/docs/remote-workspaces/) connections: the `--workcell-*` flags and `caudra auth workcell`. |
 | `lua_plugins` | `false` | Every use of Lua: [plugins](/docs/plugins/), the [Lua API](/docs/lua-api/), global and project `init.lua`, and the `caudra-plugin-dev` skill. `--no-plugins` still turns Lua off for one run. |
 | `decision_engine` | `false` | The [decision engine](#decisions), [Auto mode](/docs/permissions/#auto-mode), `caudra decisions`, and workflow [`decide()` calls](/docs/workflows/#typed-decisions). |
-| `cross_session_messaging` | `false` | Local [cross-session messaging](/docs/messaging/): the `list_sessions`, `send_message`, `publish_message`, and `read_topic` tools, `/peers`, `/messages`, `/topics`, `caudra message`, live session inboxes, and the message history. Both processes must opt in. |
+| `cross_session_messaging` | `false` | Local [cross-session messaging](/docs/messaging/): the `list_sessions`, `send_message`, `publish_message`, `read_topic`, and `work_assignment` tools, `/peers`, `/messages`, `/topics`, `/groups`, `caudra message`, live session inboxes, consumer groups, and the message history. Both processes must opt in. |
 
 Each switch is independent, so turning one on never turns on another. A missing file, table, or key leaves a switch off, and an unknown key is an error. `caudra remote` and `/remote` work when either `sandboxes` or `remote_workcell` is on, and each session checks the switch for its own source.
 
@@ -226,7 +226,7 @@ The `bash`, `python_execution`, and `task` entries apply only when `ui.scroll_ca
 | `read` | 3 | `file_read` |
 | `write` | 7 | `file_write`, `file_edit`, `file_apply_patch`, `image_generate`, `memory`, `plan` |
 | `web` | 3 | `webfetch`, `websearch` |
-| `other` | 3 | `batch`, `execution_environment`, `list_sessions`, `publish_message`, `question`, `read_topic`, `send_message`, `skill`, `todo_write`, `tool_output`, `view_image`, `workflow` |
+| `other` | 3 | `batch`, `execution_environment`, `list_sessions`, `publish_message`, `question`, `read_topic`, `send_message`, `skill`, `todo_write`, `tool_output`, `view_image`, `work_assignment`, `workflow` |
 
 ### `agent`
 

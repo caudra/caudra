@@ -152,6 +152,11 @@ fn entries(
                 ToolEffect::ReadOnly,
                 peers::READ_DESCRIPTION,
             ),
+            entry(
+                peers::WorkAssignment,
+                ToolEffect::Mutating,
+                peers::WORK_DESCRIPTION,
+            ),
         ]);
     }
     entries

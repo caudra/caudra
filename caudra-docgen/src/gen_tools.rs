@@ -61,6 +61,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "send_message",
             "publish_message",
             "read_topic",
+            "work_assignment",
             "todo_write",
             "plan",
             "memory",

@@ -2,6 +2,16 @@
 //! became of it for each recipient, and how far each session has caught up
 //! on every topic. One database serves every project, so retention is global.
 
+mod groups;
+
+pub(crate) use groups::SCHEMA as GROUP_SCHEMA;
+pub use groups::{
+    Assignment, DEFAULT_CONCURRENCY, DEFAULT_MAX_ATTEMPTS, GroupChange, GroupPolicy, LEASE_MS,
+    MAX_ATTEMPTS, MAX_BACKLOG, MAX_CONCURRENCY, MAX_GROUPS, QueuedWork, Recorded, WorkAttempt,
+    WorkCounts, WorkDetail, WorkFence, WorkFilter, WorkGroup, WorkItem, WorkOutcome, WorkOwner,
+    WorkRefusal, WorkState, Worker,
+};
+
 use crate::StateDir;
 use crate::sessions::{SESSIONS_DB_FILE, SessionDatabase, SessionError};
 use rusqlite::types::{ToSql, Type};
@@ -112,6 +122,10 @@ pub enum MessageLogError {
     Sqlite(#[from] rusqlite::Error),
     #[error("invalid message history field: {0}")]
     Invalid(&'static str),
+    #[error(transparent)]
+    Refused(#[from] WorkRefusal),
+    #[error("could not draw a random lease token: {0}")]
+    Random(getrandom::Error),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,13 +293,28 @@ impl MessageLog {
         message: &NewMessage,
         recipients: &[MessageRecipient],
     ) -> Result<i64, MessageLogError> {
+        Ok(self
+            .record_publication(message, recipients, usize::MAX)?
+            .seq)
+    }
+
+    /// [`Self::record`], which also queues one work item for every consumer
+    /// group a topic message matches, or records nothing when a group is
+    /// full or more than `max_work` groups match. Recording the message
+    /// again reports the work it first queued.
+    pub fn record_publication(
+        &mut self,
+        message: &NewMessage,
+        recipients: &[MessageRecipient],
+        max_work: usize,
+    ) -> Result<Recorded, MessageLogError> {
         let created = sql_ms(message.created_ms)?;
         let sender = &message.sender;
         let transaction = self
             .database
             .connection_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
+        let inserted = transaction.execute(
             "INSERT INTO messages (sender_route, message_id, kind, topic, sender_session,
                 sender_name, sender_handle, sender_cwd, sender_mode, sender_permission, external,
                 text, reply_to, created_ms)
@@ -329,8 +358,15 @@ impl MessageLog {
                 ],
             )?;
         }
+        let work = match message.audience.topic() {
+            Some(topic) if inserted > 0 => {
+                groups::enqueue(&transaction, seq, topic, created, max_work)?
+            }
+            Some(_) => groups::queued(&transaction, seq)?,
+            None => Vec::new(),
+        };
         transaction.commit()?;
-        Ok(seq)
+        Ok(Recorded { seq, work })
     }
 
     /// Applies the sender's receipt for one recipient, unless that recipient
@@ -608,18 +644,28 @@ impl MessageLog {
     }
 
     /// Deletes messages older than `retention.days`, except the newest on
-    /// each topic, then the oldest beyond `retention.max_messages`.
+    /// each topic, then the oldest beyond `retention.max_messages`. Messages
+    /// with unfinished group work survive both until that work finishes;
+    /// finished work goes with its message.
     pub fn prune(&self, retention: &Retention, now_ms: u64) -> Result<usize, MessageLogError> {
         let cutoff = sql_ms(now_ms.saturating_sub(retention.days.saturating_mul(MS_PER_DAY)))?;
         let aged = self.database.connection().execute(
-            "DELETE FROM messages WHERE created_ms < ?1
-               AND seq NOT IN (SELECT MAX(seq) FROM messages WHERE kind = 'topic' GROUP BY topic)",
+            &format!(
+                "DELETE FROM messages WHERE created_ms < ?1
+                   AND seq NOT IN (SELECT MAX(seq) FROM messages WHERE kind = 'topic' GROUP BY topic)
+                   AND seq NOT IN ({})",
+                groups::UNFINISHED_SEQS
+            ),
             [cutoff],
         )?;
         let kept = i64::try_from(retention.max_messages).unwrap_or(i64::MAX);
         let excess = self.database.connection().execute(
-            "DELETE FROM messages
-             WHERE seq <= (SELECT seq FROM messages ORDER BY seq DESC LIMIT 1 OFFSET ?1)",
+            &format!(
+                "DELETE FROM messages
+                 WHERE seq <= (SELECT seq FROM messages ORDER BY seq DESC LIMIT 1 OFFSET ?1)
+                   AND seq NOT IN ({})",
+                groups::UNFINISHED_SEQS
+            ),
             [kept],
         )?;
         Ok(aged + excess)

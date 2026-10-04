@@ -82,7 +82,7 @@ use crate::{
 pub const SESSIONS_DB_FILE: &str = "caudra.db";
 pub const SESSIONS_DB_LOCK_FILE: &str = "caudra.db.lock";
 
-const SCHEMA_VERSION: i64 = 19;
+const SCHEMA_VERSION: i64 = 20;
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUD") as i64;
 /// Pages copied per step of the pre-migration backup. The whole file is copied
 /// under the initialization lock, so this only bounds how long the backup holds
@@ -698,6 +698,11 @@ const MIGRATIONS: &[Migration] = &[
         to: 19,
         sql: crate::messages::SCHEMA,
     },
+    Migration {
+        from: 19,
+        to: 20,
+        sql: crate::messages::GROUP_SCHEMA,
+    },
 ];
 
 const JOB_OWNER_CHECKPOINTS_TABLE: &str = r#"
@@ -948,13 +953,14 @@ CREATE TABLE pending_archives (
 /// What a fresh database gets: every migration already folded in.
 fn full_schema() -> String {
     format!(
-        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{WORKFLOW_RECEIPTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}{JOB_OWNER_CHECKPOINTS_TABLE}{}{}{}{}{}{}",
+        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{WORKFLOW_RECEIPTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}{JOB_OWNER_CHECKPOINTS_TABLE}{}{}{}{}{}{}{}",
         crate::background::TABLES,
         crate::shell_durations::TABLES,
         crate::shell_history::TABLES,
         crate::background::ARCHIVE_SCHEMA,
         crate::messages::SCHEMA,
-        crate::decision_log::SCHEMA
+        crate::decision_log::SCHEMA,
+        crate::messages::GROUP_SCHEMA
     )
 }
 
@@ -6432,7 +6438,10 @@ mod tests {
     const CHILD_TASK: &str = "child-task";
     const OTHER_CHILD_TASK: &str = "other-child-task";
     const BACKGROUND_ARCHIVE_DOWNGRADE: &str = "DROP INDEX background_history; DROP INDEX background_task_version; DROP INDEX background_call_owner; DROP INDEX background_sequence; DROP INDEX background_generation; DROP INDEX background_task_history; DROP INDEX background_owner_history; ALTER TABLE background_tasks DROP COLUMN archived; ALTER TABLE background_tasks DROP COLUMN last_sequence;";
-    const SHARED_REPOSITORIES_DOWNGRADE: &str = "DROP TABLE deliveries; DROP TABLE cursors; DROP TABLE messages; DROP TABLE message_history_revision; DROP TABLE decisions;";
+    const CONSUMER_GROUPS_DOWNGRADE: &str =
+        "DROP TABLE work_attempts; DROP TABLE group_work; DROP TABLE work_groups;";
+    const CONSUMER_GROUPS_PREVIOUS_SCHEMA: i64 = 19;
+    const SHARED_REPOSITORIES_DOWNGRADE: &str = "DROP TABLE work_attempts; DROP TABLE group_work; DROP TABLE work_groups; DROP TABLE deliveries; DROP TABLE cursors; DROP TABLE messages; DROP TABLE message_history_revision; DROP TABLE decisions;";
     const SHARED_REPOSITORIES_PREVIOUS_SCHEMA: i64 = 18;
     const OWNER_CHECKPOINT_PREVIOUS_SCHEMA: i64 = 13;
     const WORKFLOW_DECISION_PREVIOUS_SCHEMA: i64 = 14;
@@ -10458,7 +10467,15 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         let id = upgrade.then(|| seed_schema_eighteen_wal(&state));
         let database = SessionDatabase::open_state(&state).unwrap();
         assert_eq!(database.stats().unwrap().schema_version, SCHEMA_VERSION);
-        for table in ["messages", "deliveries", "cursors", "decisions"] {
+        for table in [
+            "messages",
+            "deliveries",
+            "cursors",
+            "decisions",
+            "work_groups",
+            "group_work",
+            "work_attempts",
+        ] {
             let count: i64 = database
                 .connection
                 .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
@@ -10483,6 +10500,46 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         let fresh = SessionDatabase::open_state(&fresh_state).unwrap();
         assert_eq!(
             schema_objects(&database),
+            schema_objects(&fresh),
+            "{MIGRATED_MATCHES_FRESH}"
+        );
+    }
+
+    #[test]
+    fn consumer_groups_migrate_from_schema_nineteen_keeping_messages() {
+        let (_temp, state) = state_dir();
+        let database = SessionDatabase::open_state(&state).unwrap();
+        database
+            .connection
+            .execute_batch(CONSUMER_GROUPS_DOWNGRADE)
+            .unwrap();
+        database
+            .connection
+            .execute(
+                "INSERT INTO messages (sender_route, message_id, kind, topic, sender_session,
+                    sender_name, sender_mode, sender_permission, external, text, created_ms)
+                 VALUES ('route', 'id', 'topic', 'ci.failures', 'session', 'name', 'build',
+                    'ask', 0, 'text', 1)",
+                [],
+            )
+            .unwrap();
+        database
+            .connection
+            .pragma_update(None, "user_version", CONSUMER_GROUPS_PREVIOUS_SCHEMA)
+            .unwrap();
+        drop(database);
+
+        let migrated = SessionDatabase::open_state(&state).unwrap();
+        assert_eq!(migrated.stats().unwrap().schema_version, SCHEMA_VERSION);
+        let kept: i64 = migrated
+            .connection
+            .query_row("SELECT count(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(kept, 1);
+        let (_fresh_temp, fresh_state) = state_dir();
+        let fresh = SessionDatabase::open_state(&fresh_state).unwrap();
+        assert_eq!(
+            schema_objects(&migrated),
             schema_objects(&fresh),
             "{MIGRATED_MATCHES_FRESH}"
         );
@@ -11231,6 +11288,7 @@ CREATE TABLE subagent_history_items (
         connection
             .execute_batch(
                 &full_schema()
+                    .replace(crate::messages::GROUP_SCHEMA, "")
                     .replace(crate::messages::SCHEMA, "")
                     .replace(crate::decision_log::SCHEMA, "")
                     .replace(crate::background::ARCHIVE_SCHEMA, "")
@@ -11330,6 +11388,7 @@ CREATE TABLE subagents (
         connection
             .execute_batch(
                 &full_schema()
+                    .replace(crate::messages::GROUP_SCHEMA, "")
                     .replace(crate::messages::SCHEMA, "")
                     .replace(crate::decision_log::SCHEMA, "")
                     .replace(crate::background::ARCHIVE_SCHEMA, "")

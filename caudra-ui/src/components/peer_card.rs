@@ -1,6 +1,9 @@
 use caudra_agent::{
     PeerOutput,
-    peers::{PeerHistoryPage, PeerSummary, PublishReceipt, TopicActivity, handle_address, literal},
+    peers::{
+        AssignedWork, PeerHistoryPage, PeerSummary, PublishReceipt, TopicActivity, handle_address,
+        literal,
+    },
 };
 use caudra_config::InboundPolicy;
 use caudra_providers::PEER_SCRIPT_SENDER;
@@ -42,6 +45,12 @@ const WITHHELD_LABEL: &str = "Withheld: ";
 const WITHHELD_MEANING: &str = "senders this session would hold for review";
 const OLDER: &str = "Older messages remain";
 const SENT_FORMAT: &str = "%Y-%m-%d %H:%M";
+const GROUPS_LABEL: &str = "Groups: ";
+const QUEUED_LABEL: &str = "Queued for group ";
+const QUEUED_MEANING: &str = "queued work waits for a group member; queued is not done";
+const NO_WORK: &str = "This session holds no work assignment";
+const TOPIC_LABEL: &str = "Topic: ";
+const RESULT_LABEL: &str = "Result: ";
 
 pub(crate) fn render(output: &PeerOutput, budget: usize, width: u16) -> (Vec<Line<'static>>, bool) {
     let theme = theme::current();
@@ -80,6 +89,9 @@ pub(crate) fn render(output: &PeerOutput, budget: usize, width: u16) -> (Vec<Lin
                 }
                 if peer.broadcasts {
                     lines.push(Line::from(Span::styled(BROADCASTS, theme.tool_dim)));
+                }
+                if !peer.groups.is_empty() {
+                    lines.push(labelled(GROUPS_LABEL, &peer.groups.join(", "), theme.tool));
                 }
             }
         }
@@ -159,7 +171,29 @@ pub(crate) fn render(output: &PeerOutput, budget: usize, width: u16) -> (Vec<Lin
                     theme.tool_warning,
                 )));
             }
+            for queued in &receipt.queued {
+                lines.push(labelled(
+                    QUEUED_LABEL,
+                    &format!("{}: {}", queued.group, queued.work),
+                    theme.tool_path,
+                ));
+            }
+            if !receipt.queued.is_empty() {
+                lines.push(Line::from(Span::styled(QUEUED_MEANING, theme.tool_dim)));
+            }
         }
+        PeerOutput::Work { work } if work.is_empty() => {
+            lines.push(Line::from(Span::styled(NO_WORK, theme.tool_dim)));
+        }
+        PeerOutput::Work { work } => {
+            for item in work {
+                if !lines.is_empty() {
+                    lines.push(Line::default());
+                }
+                work_lines(item, &mut lines);
+            }
+        }
+        PeerOutput::Reported { work } => work_lines(work, &mut lines),
         PeerOutput::Topics { topics } => {
             if topics.is_empty() {
                 lines.push(Line::from(Span::styled(NO_TOPICS, theme.tool_dim)));
@@ -269,6 +303,53 @@ fn history_lines(page: &PeerHistoryPage, lines: &mut Vec<Line<'static>>) {
     }
 }
 
+fn work_lines(work: &AssignedWork, lines: &mut Vec<Line<'static>>) {
+    let theme = theme::current();
+    let (state, style) = work_state(&work.state);
+    lines.push(Line::from(vec![
+        Span::styled(work.work.escape_debug().to_string(), theme.tool_path),
+        Span::styled(
+            format!("{SEPARATOR}group {}{SEPARATOR}", work.group.escape_debug()),
+            theme.tool_dim,
+        ),
+        Span::styled(state, style),
+    ]));
+    lines.push(Line::from(Span::styled(
+        format!(
+            "Attempt {} of {}{SEPARATOR}from {}",
+            work.attempt,
+            work.max_attempts,
+            work.publisher.escape_debug()
+        ),
+        theme.tool_dim,
+    )));
+    if let Some(topic) = &work.topic {
+        lines.push(labelled(TOPIC_LABEL, topic, theme.tool_path));
+    }
+    for (label, text) in [(REASON_LABEL, &work.reason), (RESULT_LABEL, &work.result)] {
+        if let Some(text) = text {
+            lines.push(Line::from(vec![
+                Span::styled(label, theme.tool_dim),
+                Span::styled(literal(text, false), theme.tool),
+            ]));
+        }
+    }
+}
+
+fn work_state(state: &str) -> (&'static str, Style) {
+    let theme = theme::current();
+    match state {
+        "pending" => ("Returned to the queue", theme.tool_dim),
+        "leased" => ("In progress", theme.tool),
+        "pausing" => ("Pausing", theme.tool_warning),
+        "paused" => ("Paused", theme.tool_warning),
+        "completed" => ("Completed", theme.tool_success),
+        "failed" => ("Failed", theme.tool_error),
+        "cancelled" => ("Cancelled", theme.tool_error),
+        _ => ("Unknown state", theme.tool_warning),
+    }
+}
+
 fn sent_at(ms: u64) -> String {
     i64::try_from(ms)
         .ok()
@@ -347,8 +428,8 @@ mod tests {
     use caudra_agent::{
         BatchToolEntry, BatchToolStatus, PeerOutput, ToolOutput,
         peers::{
-            PeerHistoryPage, PeerSummary, PublishReceipt, RecipientReceipt, SendReceipt,
-            StoredPeerMessage, TopicActivity,
+            AssignedWork, PeerHistoryPage, PeerSummary, PublishReceipt, QueuedWork,
+            RecipientReceipt, SendReceipt, StoredPeerMessage, TopicActivity,
         },
         tools::{ToolEffect, native::peers::SEND_NAME},
     };
@@ -358,9 +439,9 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        AUDIENCE_LABEL, BROADCAST, BROADCASTS, EMPTY, NAME_LABEL, NO_MESSAGES, NO_RECIPIENTS,
-        NO_TOPICS, OLDER, SKIPPED_LABEL, TARGET_LABEL, TO_LABEL, TOPICS_LABEL, WITHHELD_LABEL,
-        render,
+        AUDIENCE_LABEL, BROADCAST, BROADCASTS, EMPTY, GROUPS_LABEL, NAME_LABEL, NO_MESSAGES,
+        NO_RECIPIENTS, NO_TOPICS, NO_WORK, OLDER, QUEUED_LABEL, QUEUED_MEANING, RESULT_LABEL,
+        SKIPPED_LABEL, TARGET_LABEL, TO_LABEL, TOPICS_LABEL, WITHHELD_LABEL, render,
     };
     use crate::components::code_view::{BatchViews, RenderLimits, RowTarget, render_tool_content};
     use crate::theme;
@@ -383,6 +464,12 @@ mod tests {
     const SENT_MS: u64 = 1_790_000_000_000;
     const SENT_YEAR: &str = "2026-";
     const HISTORY_SEQ: i64 = 7;
+    const GROUP: &str = "ci-triage";
+    const WORK: &str = "steady-warm-heron";
+    const PAUSED: &str = "paused";
+    const RESULT: &str = "Fixed the flaky linker step.";
+    const ATTEMPT: u32 = 2;
+    const MAX_ATTEMPTS: u32 = 3;
 
     fn stored(topic: Option<&str>, text: &str) -> StoredPeerMessage {
         StoredPeerMessage {
@@ -422,6 +509,7 @@ mod tests {
             inbound: InboundPolicy::Auto,
             topics: Vec::new(),
             broadcasts: false,
+            groups: Vec::new(),
         }
     }
 
@@ -444,6 +532,7 @@ mod tests {
                 },
                 recipients: statuses.iter().map(|status| recipient(status)).collect(),
                 skipped,
+                queued: Vec::new(),
             },
         }
     }
@@ -456,6 +545,20 @@ mod tests {
                 message_id: MESSAGE.into(),
                 reason: Some(REASON.into()),
             },
+        }
+    }
+
+    fn work(state: &str) -> AssignedWork {
+        AssignedWork {
+            work: WORK.into(),
+            group: GROUP.into(),
+            state: state.into(),
+            attempt: ATTEMPT,
+            max_attempts: MAX_ATTEMPTS,
+            topic: Some(TOPIC.into()),
+            publisher: NAME.into(),
+            reason: None,
+            result: None,
         }
     }
 
@@ -555,6 +658,7 @@ mod tests {
                     ..recipient("queued")
                 }],
                 skipped: 0,
+                queued: Vec::new(),
             },
         };
         let drawn = text(&render(&output, usize::MAX, WIDTH).0);
@@ -564,14 +668,20 @@ mod tests {
         assert_eq!(drawn.contains(TARGET), !named);
     }
 
-    #[test_case(&[], false; "unsubscribed")]
-    #[test_case(&[PATTERN, OTHER_PATTERN], false; "topics")]
-    #[test_case(&[], true; "broadcasts")]
-    fn peer_rows_show_subscriptions_only_when_present(topics: &[&str], broadcasts: bool) {
+    #[test_case(&[], false, &[]; "unsubscribed")]
+    #[test_case(&[PATTERN, OTHER_PATTERN], false, &[]; "topics")]
+    #[test_case(&[], true, &[]; "broadcasts")]
+    #[test_case(&[], false, &[GROUP]; "groups")]
+    fn peer_rows_show_subscriptions_only_when_present(
+        topics: &[&str],
+        broadcasts: bool,
+        groups: &[&str],
+    ) {
         let output = PeerOutput::Sessions {
             sessions: vec![PeerSummary {
                 topics: topics.iter().copied().map(str::to_owned).collect(),
                 broadcasts,
+                groups: groups.iter().copied().map(str::to_owned).collect(),
                 ..session()
             }],
         };
@@ -581,6 +691,80 @@ mod tests {
             !topics.is_empty()
         );
         assert_eq!(drawn.contains(BROADCASTS), broadcasts);
+        assert_eq!(
+            drawn.contains(&format!("{GROUPS_LABEL}{}", groups.join(", "))),
+            !groups.is_empty()
+        );
+    }
+
+    #[test]
+    fn queued_work_is_listed_apart_from_live_recipients() {
+        let output = PeerOutput::Published {
+            receipt: PublishReceipt {
+                message_id: MESSAGE.into(),
+                audience: PeerAudience::Topic {
+                    topic: TOPIC.into(),
+                },
+                recipients: Vec::new(),
+                skipped: 0,
+                queued: vec![QueuedWork {
+                    group: GROUP.into(),
+                    work: WORK.into(),
+                }],
+            },
+        };
+        let drawn = text(&render(&output, usize::MAX, WIDTH).0);
+        for expected in [
+            NO_RECIPIENTS,
+            &format!("{QUEUED_LABEL}{GROUP}: {WORK}"),
+            QUEUED_MEANING,
+        ] {
+            assert!(drawn.contains(expected), "{drawn}");
+        }
+    }
+
+    #[test_case("leased", "In progress"; "in_progress")]
+    #[test_case(PAUSED, "Paused"; "paused")]
+    #[test_case("completed", "Completed"; "completed")]
+    #[test_case("failed", "Failed"; "failed")]
+    #[test_case("future_state", "Unknown state"; "unrecognized_is_not_success")]
+    fn work_cards_show_state_attempt_and_outcome(state: &str, label: &str) {
+        let output = PeerOutput::Reported {
+            work: AssignedWork {
+                reason: Some(REASON.into()),
+                result: Some(RESULT.into()),
+                ..work(state)
+            },
+        };
+        let (lines, truncated) = render(&output, usize::MAX, WIDTH);
+        let drawn = text(&lines);
+        assert!(!truncated);
+        for expected in [
+            WORK,
+            GROUP,
+            label,
+            &format!("Attempt {ATTEMPT} of {MAX_ATTEMPTS}"),
+            NAME,
+            TOPIC,
+            REASON,
+            &format!("{RESULT_LABEL}{RESULT}"),
+        ] {
+            assert!(drawn.contains(expected), "{drawn}");
+        }
+        let theme = theme::current();
+        let expected_style = match state {
+            "leased" => theme.tool,
+            "completed" => theme.tool_success,
+            "failed" => theme.tool_error,
+            _ => theme.tool_warning,
+        };
+        assert_eq!(lines[0].spans[2].style, expected_style);
+    }
+
+    #[test]
+    fn an_empty_work_list_says_no_assignment_is_held() {
+        let output = PeerOutput::Work { work: Vec::new() };
+        assert_eq!(text(&render(&output, usize::MAX, WIDTH).0), NO_WORK);
     }
 
     #[test_case(&["queued", "queued"], 0, "2 of 2 accepted"; "all_queued")]
@@ -792,6 +976,7 @@ mod tests {
             handle: Some(HOSTILE.into()),
             cwd: PathBuf::from(HOSTILE),
             topics: vec![HOSTILE.into()],
+            groups: vec![HOSTILE.into()],
             ..session()
         };
         let unnamed = PeerSummary {
@@ -831,7 +1016,26 @@ mod tests {
                     })
                     .into(),
                 skipped: 0,
+                queued: vec![QueuedWork {
+                    group: HOSTILE.into(),
+                    work: HOSTILE.into(),
+                }],
             },
+        }
+    }
+
+    fn hostile_work() -> PeerOutput {
+        PeerOutput::Work {
+            work: vec![AssignedWork {
+                work: HOSTILE.into(),
+                group: HOSTILE.into(),
+                state: HOSTILE.into(),
+                topic: Some(HOSTILE.into()),
+                publisher: HOSTILE.into(),
+                reason: Some(HOSTILE.into()),
+                result: Some(HOSTILE.into()),
+                ..work(PAUSED)
+            }],
         }
     }
 
@@ -861,6 +1065,7 @@ mod tests {
     #[test_case(hostile_sessions(); "session_labels")]
     #[test_case(hostile_receipt(); "receipt_labels")]
     #[test_case(hostile_publication(); "publication_labels")]
+    #[test_case(hostile_work(); "work_labels")]
     #[test_case(hostile_topics(); "topic_labels")]
     #[test_case(hostile_history(); "stored_messages")]
     fn hostile_values_remain_literal_without_terminal_controls(output: PeerOutput) {

@@ -935,6 +935,7 @@ impl<'h> Agent<'h> {
                 if let Some(background) = &self.background {
                     background.suppress_wakes();
                 }
+                self.settle_peer_work(None).await;
                 self.suppress_peer_wakes();
                 self.close_peer_session();
                 return Err(e);
@@ -945,6 +946,7 @@ impl<'h> Agent<'h> {
         {
             background.suppress_wakes();
         }
+        self.settle_peer_work(Some(reason)).await;
         if matches!(reason, DoneReason::MaxTurns | DoneReason::Cancelled)
             || steering::lock(&self.steering).turn_limit_reached(self.config.max_turns)
         {
@@ -1242,6 +1244,14 @@ impl<'h> Agent<'h> {
     fn suppress_peer_wakes(&self) {
         if let Some(peers) = &self.peers {
             peers.suppress_wakes();
+        }
+    }
+
+    /// Pauses group work this turn took in without reporting an outcome.
+    /// `ending` is `None` when the turn failed.
+    async fn settle_peer_work(&self, ending: Option<DoneReason>) {
+        if let Some(peers) = &self.peers {
+            peers.settle_work(ending).await;
         }
     }
 

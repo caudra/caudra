@@ -926,6 +926,7 @@ pub enum Action {
     ListPeers,
     PeerMessages(String),
     PeerTopics(String),
+    PeerGroups(String),
     PeerSubscribe(SubscriptionChange),
     RefreshPeers,
     ReviewPeerMessage(String),
@@ -1255,14 +1256,24 @@ impl DisplayMessage {
         } else {
             format!("Audience: {:?}\n", origin.audience.to_string())
         };
+        let work = origin
+            .assignment
+            .as_ref()
+            .map(|work| {
+                format!(
+                    "Work: {:?} · group {:?} · attempt {} of {}\n",
+                    work.work, work.group, work.attempt, work.max_attempts
+                )
+            })
+            .unwrap_or_default();
         let text = if origin.external {
             format!(
-                "Script: {:?}\n{audience}Message: {:?}\n\n{safe_body}",
+                "Script: {:?}\n{audience}{work}Message: {:?}\n\n{safe_body}",
                 origin.sender_name, origin.message_id,
             )
         } else {
             format!(
-                "Peer: {:?}\n{name}Reply target: {:?}\n{audience}Message: {:?}\n\n{safe_body}",
+                "Peer: {:?}\n{name}Reply target: {:?}\n{audience}{work}Message: {:?}\n\n{safe_body}",
                 origin.sender_name, origin.reply_target, origin.message_id,
             )
         };

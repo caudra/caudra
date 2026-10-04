@@ -301,6 +301,7 @@ pub const CAUDRA_NATIVE_TOOL_NAMES: &[&str] = &[
     "todo_write",
     "tool_output",
     "view_image",
+    "work_assignment",
     "workflow",
 ];
 
@@ -2297,6 +2298,7 @@ impl ToolOutputLines {
                 "todo_write",
                 "tool_output",
                 "view_image",
+                "work_assignment",
                 "workflow",
             ],
         ),
@@ -6532,6 +6534,7 @@ mod tests {
     #[test_case("send_message" ; "peer_send")]
     #[test_case("publish_message" ; "peer_publish")]
     #[test_case("read_topic" ; "peer_history")]
+    #[test_case("work_assignment" ; "peer_work")]
     #[test_case("github.create_issue" ; "mcp_tool")]
     #[test_case("github.*" ; "mcp_server")]
     fn agent_disabled_tools_accepts(tool: &str) {

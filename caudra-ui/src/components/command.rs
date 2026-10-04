@@ -252,6 +252,13 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         features: &[Feature::CrossSessionMessaging],
     },
     BuiltinCommand {
+        name: "/groups",
+        description: "List consumer groups and this session's work, join or leave a group, or retry, pause, or cancel a work item",
+        max_args: 2,
+        scope: ChatScope::MainOnly,
+        features: &[Feature::CrossSessionMessaging],
+    },
+    BuiltinCommand {
         name: "/workflows",
         description: "Browse, trust, and launch workflows",
         max_args: 0,
@@ -1265,6 +1272,7 @@ mod tests {
     #[test_case("/peers", Feature::CrossSessionMessaging; "peers")]
     #[test_case("/messages", Feature::CrossSessionMessaging; "messages")]
     #[test_case("/topics", Feature::CrossSessionMessaging; "topics")]
+    #[test_case("/groups", Feature::CrossSessionMessaging; "groups")]
     #[test_case("/deep-research", Feature::Workflows; "workflow_shortcut")]
     #[test_case("/sandbox", Feature::Sandboxes; "sandbox")]
     #[test_case("/decisions", Feature::DecisionEngine; "decisions")]

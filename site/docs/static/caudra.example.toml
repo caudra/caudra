@@ -227,7 +227,7 @@ version = 1
 
 # Rows for `batch`, `execution_environment`, `list_sessions`,
 # `publish_message`, `question`, `read_topic`, `send_message`, `skill`,
-# `todo_write`, `tool_output`, `view_image`, `workflow`.
+# `todo_write`, `tool_output`, `view_image`, `work_assignment`, `workflow`.
 # Type: usize, at least 1.
 # other = 3
 

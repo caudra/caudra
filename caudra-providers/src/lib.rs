@@ -49,7 +49,7 @@ pub use types::{
     CacheKey, ContentBlock, EFFORT_LEVELS, EMPTY_RESPONSE_MARKER, IMAGE_OMITTED_NOTE,
     INVALID_TOOL_JSON_KEY, ImageMediaType, ImageSource, InvalidToolInput, MAX_TOOL_INPUT_BYTES,
     MIN_THINKING_BUDGET, Message, MessageKind, PEER_SCRIPT_SENDER, PEER_SESSION_SENDER,
-    PeerAudience, PeerMessageOrigin, ProviderEvent, ProviderUsage, ReasoningOption,
+    PeerAssignment, PeerAudience, PeerMessageOrigin, ProviderEvent, ProviderUsage, ReasoningOption,
     ReasoningOptions, ReasoningSource, ReasoningTransport, RequestOptions, ResolvedThinking,
     ResponsesReasoning, Role, StandingReminderKind, SteeringKind, SteeringOrigin, StopReason,
     StreamResponse, THINKING_USAGE, TaskEventOrigin, ThinkingConfig, ToolNameAliases, UsageLimit,

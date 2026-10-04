@@ -371,6 +371,8 @@ pub struct StoredPeerControls {
     pub topics: Vec<String>,
     /// Whether broadcasts reach this session.
     pub broadcasts: bool,
+    /// Consumer groups whose work this session takes.
+    pub groups: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1650,6 +1652,7 @@ mod tests {
     const WAKE_SUPPRESSION_FIELD: &str = "automatic_wakes_suppressed";
     const PEER_HANDLE: &str = "ci-watcher";
     const PEER_TOPIC: &str = "ci.*";
+    const PEER_GROUP: &str = "reviewers";
 
     #[test_case("{}", false; "legacy_default")]
     #[test_case(r#"{"automatic_wakes_suppressed":false}"#, false; "explicit_false")]
@@ -1721,6 +1724,7 @@ mod tests {
             handle: Some(PEER_HANDLE.into()),
             topics: vec![PEER_TOPIC.into()],
             broadcasts: true,
+            groups: vec![PEER_GROUP.into()],
         };
         let mut session = TestSession::new("model", "/project");
         session.meta.peer_controls = Some(controls.clone());
@@ -1735,6 +1739,7 @@ mod tests {
         );
         assert_eq!(serialized["peer_controls"]["topics"][0], PEER_TOPIC);
         assert_eq!(serialized["peer_controls"]["broadcasts"], true);
+        assert_eq!(serialized["peer_controls"]["groups"][0], PEER_GROUP);
         session.save(&dir).unwrap();
 
         let mut restored = TestSession::load(session.id, &dir).unwrap();

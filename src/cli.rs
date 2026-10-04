@@ -2,20 +2,21 @@ use std::path::PathBuf;
 
 use clap::builder::{PossibleValue, PossibleValuesParser, TypedValueParser};
 use clap::{
-    Args, Command as ClapCommand, CommandFactory, Error as CliError, FromArgMatches, Parser,
-    Subcommand, ValueEnum, error::ErrorKind, value_parser,
+    ArgGroup, Args, Command as ClapCommand, CommandFactory, Error as CliError, FromArgMatches,
+    Parser, Subcommand, ValueEnum, error::ErrorKind, value_parser,
 };
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 
 use caudra_agent::peers::script::{DEFAULT_LABEL, parse_label};
 use caudra_agent::peers::topics::{parse_pattern, parse_topic};
-use caudra_agent::peers::{parse_handle, parse_handle_address};
+use caudra_agent::peers::{parse_group, parse_handle, parse_handle_address};
 use caudra_agent::tools::all_builtin_tool_names;
 use caudra_config::files::{self, ConfigFile};
 use caudra_config::sandbox::LeaseSeconds;
 use caudra_config::{Feature, FeatureDisabled, FeatureFlags, is_disableable_tool};
 use caudra_storage::auth::WorkcellCredentialName;
+use caudra_storage::messages::{MAX_ATTEMPTS, MAX_BACKLOG, MAX_CONCURRENCY, WorkState};
 use caudra_storage::retention::{Duration as RetentionDuration, GroupBy, KeepPolicy};
 use caudra_storage::sessions::PermissionMode;
 
@@ -171,6 +172,10 @@ pub struct Cli {
     #[arg(long = "topic", value_name = "PATTERN", value_parser = parse_pattern, conflicts_with = "print")]
     pub topics: Vec<String>,
 
+    /// Make the initial session a member of an existing consumer group, kept across resumes; repeat for more
+    #[arg(long = "group", value_name = "NAME", value_parser = parse_group, conflicts_with = "print")]
+    pub groups: Vec<String>,
+
     /// Let cross-session broadcasts reach the initial session, kept across resumes
     #[arg(long, conflicts_with = "print")]
     pub receive_broadcasts: bool,
@@ -294,6 +299,9 @@ impl Cli {
             .mut_arg("topics", |arg| {
                 arg.hide(off(Feature::CrossSessionMessaging))
             })
+            .mut_arg("groups", |arg| {
+                arg.hide(off(Feature::CrossSessionMessaging))
+            })
             .mut_arg("receive_broadcasts", |arg| {
                 arg.hide(off(Feature::CrossSessionMessaging))
             })
@@ -364,6 +372,14 @@ impl Cli {
 
     pub fn is_sdk_mode(&self) -> bool {
         self.print && matches!(self.input_format, InputFormat::StreamJson)
+    }
+
+    /// Whether a launch flag sets up cross-session messaging for the initial session.
+    pub fn requests_messaging(&self) -> bool {
+        self.name.is_some()
+            || !self.topics.is_empty()
+            || !self.groups.is_empty()
+            || self.receive_broadcasts
     }
 
     /// Lua runs only when the global caudra.toml opts in, and `--no-plugins`
@@ -589,7 +605,7 @@ pub enum Command {
         #[command(subcommand)]
         action: PermissionAction,
     },
-    /// Publish, broadcast, send, and read cross-session messages from scripts
+    /// Publish, broadcast, send, and read cross-session messages, and manage consumer groups, from scripts
     Message {
         #[command(subcommand)]
         action: MessageAction,
@@ -670,6 +686,163 @@ pub enum MessageAction {
         #[arg(long)]
         json: bool,
     },
+    /// Manage consumer groups, which hand each matching topic publication to one member session as work
+    Group {
+        #[command(subcommand)]
+        action: GroupAction,
+    },
+    /// Inspect consumer group work, and retry, pause, or cancel it
+    Work {
+        #[command(subcommand)]
+        action: WorkAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum GroupAction {
+    /// Create a consumer group; topic publications from then on queue its work
+    Create {
+        #[command(flatten)]
+        group: GroupName,
+        /// A topic pattern whose publications become work, such as ci.*; repeat for more
+        #[arg(long = "topic", value_name = "PATTERN", value_parser = parse_pattern, required = true)]
+        topics: Vec<String>,
+        #[command(flatten)]
+        policy: GroupPolicyArgs,
+        /// Print the group as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// List every consumer group with its policy and work counts
+    List {
+        /// One JSON object per group
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show a consumer group with its policy and work counts
+    Show {
+        #[command(flatten)]
+        group: GroupName,
+        /// Print the group as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Change a consumer group's topic patterns or policy
+    #[command(group(
+        ArgGroup::new("changes")
+            .required(true)
+            .multiple(true)
+            .args(["topics", "concurrency", "attempts", "backlog"])
+    ))]
+    Update {
+        #[command(flatten)]
+        group: GroupName,
+        /// Replace the topic patterns with these; repeat for more
+        #[arg(long = "topic", value_name = "PATTERN", value_parser = parse_pattern)]
+        topics: Vec<String>,
+        #[command(flatten)]
+        policy: GroupPolicyArgs,
+        /// Print the group as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop handing a group's work to members; publications still queue it
+    Pause(GroupName),
+    /// Hand a paused group's work to members again
+    Resume(GroupName),
+    /// Delete a consumer group whose work has all finished, together with that work
+    Delete(GroupName),
+}
+
+#[derive(Args)]
+pub struct GroupName {
+    /// The consumer group's name
+    #[arg(value_name = "NAME", value_parser = parse_group)]
+    pub name: String,
+}
+
+#[derive(Args)]
+pub struct GroupPolicyArgs {
+    /// Work items the group's members hold at once
+    #[arg(long, value_name = "N", value_parser = value_parser!(u32).range(1..=i64::from(MAX_CONCURRENCY)))]
+    pub concurrency: Option<u32>,
+    /// Claims a work item gets before it fails
+    #[arg(long, value_name = "N", value_parser = value_parser!(u32).range(1..=i64::from(MAX_ATTEMPTS)))]
+    pub attempts: Option<u32>,
+    /// Unfinished work items the group holds before publishing to its topics is refused
+    #[arg(long, value_name = "N", value_parser = value_parser!(u32).range(1..=i64::from(MAX_BACKLOG)))]
+    pub backlog: Option<u32>,
+}
+
+#[derive(Subcommand)]
+pub enum WorkAction {
+    /// List work items, newest first
+    List {
+        /// Only this consumer group's work
+        #[arg(long, value_name = "NAME", value_parser = parse_group)]
+        group: Option<String>,
+        /// Only work in this state; repeat for more
+        #[arg(long = "state", value_name = "STATE", value_enum)]
+        states: Vec<WorkStateArg>,
+        /// How many of the newest matching items to print
+        #[arg(
+            short = 'n',
+            long,
+            value_name = "COUNT",
+            default_value_t = DEFAULT_MESSAGE_LIMIT,
+            value_parser = value_parser!(u32).range(1..=MAX_MESSAGE_LIMIT)
+        )]
+        limit: u32,
+        /// Only items queued before this one, to page back from the last item printed
+        #[arg(long, value_name = "WORK")]
+        before: Option<String>,
+        /// One JSON object per item, without session ids
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show a work item with its attempts and the message it carries
+    Show(WorkTarget),
+    /// Queue a paused, failed, or cancelled item again with fresh attempts
+    Retry(WorkTarget),
+    /// Hold a pending item back until it is retried
+    Pause(WorkTarget),
+    /// Cancel a pending, paused, or failed item
+    Cancel(WorkTarget),
+}
+
+#[derive(Args)]
+pub struct WorkTarget {
+    /// The work item's name
+    #[arg(value_name = "WORK")]
+    pub work: String,
+    /// Print the item as JSON, without session ids
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum WorkStateArg {
+    Pending,
+    Leased,
+    Pausing,
+    Paused,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl From<WorkStateArg> for WorkState {
+    fn from(state: WorkStateArg) -> Self {
+        match state {
+            WorkStateArg::Pending => Self::Pending,
+            WorkStateArg::Leased => Self::Leased,
+            WorkStateArg::Pausing => Self::Pausing,
+            WorkStateArg::Paused => Self::Paused,
+            WorkStateArg::Completed => Self::Completed,
+            WorkStateArg::Failed => Self::Failed,
+            WorkStateArg::Cancelled => Self::Cancelled,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -1302,9 +1475,9 @@ pub fn normalize_tool_name(name: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use caudra_agent::peers::INVALID_HANDLE;
     use caudra_agent::peers::script::INVALID_LABEL;
     use caudra_agent::peers::topics::INVALID_PATTERN;
+    use caudra_agent::peers::{INVALID_GROUP, INVALID_HANDLE};
     use caudra_config::workcell::{
         WorkcellProfiles, WorkcellSelection, WorkcellSelectionError, select_workcell,
     };
@@ -1322,6 +1495,10 @@ mod tests {
     const MESSAGING_NAME: &str = "ci-watcher";
     const MESSAGE_TEXT: &str = "Nightly build failed";
     const SENDER_LABEL: &str = "nightly-ci";
+    const GROUP_NAME: &str = "reviewers";
+    const GROUP_TOPIC: &str = "ci.*";
+    const WORK_NAME: &str = "steady-maple-wren";
+    const MESSAGING_LAUNCH_FLAGS: [&str; 4] = ["name", "topics", "groups", "receive_broadcasts"];
 
     #[test_case(&["caudra", "--auto"]; "root_auto")]
     #[test_case(&["caudra", "acp", "--auto"]; "acp_auto")]
@@ -1706,6 +1883,7 @@ mod tests {
 
     #[test_case(&["--name", "ci-watcher"]; "name")]
     #[test_case(&["--topic", "ci.*"]; "topic")]
+    #[test_case(&["--group", GROUP_NAME]; "group")]
     #[test_case(&["--receive-broadcasts"]; "broadcasts")]
     fn messaging_flags_belong_to_interactive_sessions(flags: &[&str]) {
         let args = ["caudra"].iter().chain(flags).chain(&["--print"]);
@@ -1741,6 +1919,116 @@ mod tests {
                 .map(ClapCommand::is_hide_set),
             Some(hidden)
         );
+    }
+
+    #[test_case(FeatureFlags::NONE, true; "experiment_off")]
+    #[test_case(FeatureFlags::NONE.with(Feature::CrossSessionMessaging), false; "experiment_on")]
+    fn messaging_launch_flags_are_hidden_until_enabled(features: FeatureFlags, hidden: bool) {
+        let command = Cli::command_for(features);
+        let hidden_flags: Vec<Option<bool>> = MESSAGING_LAUNCH_FLAGS
+            .iter()
+            .map(|id| {
+                command
+                    .get_arguments()
+                    .find(|arg| arg.get_id().as_str() == *id)
+                    .map(|arg| arg.is_hide_set())
+            })
+            .collect();
+        assert_eq!(hidden_flags, [Some(hidden); MESSAGING_LAUNCH_FLAGS.len()]);
+    }
+
+    #[test_case(GROUP_NAME, true; "lowercase_words")]
+    #[test_case("Reviewers", false; "uppercase")]
+    #[test_case("ci_reviewers", false; "underscore")]
+    fn group_names_are_validated_while_parsing(name: &str, valid: bool) {
+        let flag = format!("--group={name}");
+        for args in [
+            vec!["caudra", flag.as_str()],
+            vec!["caudra", "message", "group", "show", name],
+            vec!["caudra", "message", "work", "list", flag.as_str()],
+        ] {
+            match Cli::try_parse_from(&args) {
+                Ok(_) => assert!(valid, "{args:?}"),
+                Err(error) => {
+                    assert!(!valid, "{error}");
+                    assert!(error.to_string().contains(INVALID_GROUP), "{error}");
+                }
+            }
+        }
+    }
+
+    #[test_case(&["create", GROUP_NAME], false; "create_without_topic")]
+    #[test_case(&["create", GROUP_NAME, "--topic", GROUP_TOPIC], true; "create_with_topic")]
+    #[test_case(&["create", GROUP_NAME, "--topic", GROUP_TOPIC, "--concurrency", "2", "--attempts", "5", "--backlog", "10"], true; "create_with_policy")]
+    #[test_case(&["update", GROUP_NAME], false; "update_without_change")]
+    #[test_case(&["update", GROUP_NAME, "--json"], false; "update_with_only_json")]
+    #[test_case(&["update", GROUP_NAME, "--attempts", "5"], true; "update_attempts")]
+    #[test_case(&["update", GROUP_NAME, "--topic", GROUP_TOPIC, "--backlog", "10"], true; "update_topics_and_backlog")]
+    fn group_commands_require_what_they_change(flags: &[&str], valid: bool) {
+        let args = ["caudra", "message", "group"].iter().chain(flags);
+        assert_eq!(
+            Cli::try_parse_from(args).err().map(|error| error.kind()),
+            (!valid).then_some(ErrorKind::MissingRequiredArgument)
+        );
+    }
+
+    #[test_case("--concurrency", MAX_CONCURRENCY; "concurrency")]
+    #[test_case("--attempts", MAX_ATTEMPTS; "attempts")]
+    #[test_case("--backlog", MAX_BACKLOG; "backlog")]
+    fn group_policy_is_bounded_while_parsing(flag: &str, max: u32) {
+        let parse = |value: u32| {
+            let value = value.to_string();
+            let args = [
+                "caudra",
+                "message",
+                "group",
+                "update",
+                GROUP_NAME,
+                flag,
+                value.as_str(),
+            ];
+            Cli::try_parse_from(args).err().map(|error| error.kind())
+        };
+        assert_eq!(parse(max), None);
+        assert_eq!(parse(0), Some(ErrorKind::ValueValidation));
+        assert_eq!(parse(max + 1), Some(ErrorKind::ValueValidation));
+    }
+
+    #[test]
+    fn work_state_values_are_the_storage_names() {
+        for state in WorkStateArg::value_variants() {
+            let value = state.to_possible_value().unwrap();
+            assert_eq!(WorkState::from(*state).as_str(), value.get_name());
+        }
+    }
+
+    #[test]
+    fn work_list_parses_its_filters() {
+        let args = [
+            "caudra", "message", "work", "list", "--group", GROUP_NAME, "--state", "pending",
+            "--state", "failed", "--before", WORK_NAME,
+        ];
+        let Some(Command::Message {
+            action:
+                MessageAction::Work {
+                    action:
+                        WorkAction::List {
+                            group,
+                            states,
+                            limit,
+                            before,
+                            json,
+                        },
+                },
+        }) = Cli::try_parse_from(args).unwrap().command
+        else {
+            panic!("{MESSAGE_NOT_PARSED}");
+        };
+        assert_eq!(group.as_deref(), Some(GROUP_NAME));
+        assert_eq!(states, [WorkStateArg::Pending, WorkStateArg::Failed]);
+        assert_eq!(limit, DEFAULT_MESSAGE_LIMIT);
+        assert_eq!(before.as_deref(), Some(WORK_NAME));
+        assert!(!json);
     }
 
     #[test_case(&["--topic", "ci.failures"], true; "concrete_topic")]

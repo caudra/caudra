@@ -29,8 +29,8 @@ use strum::Display;
 
 use crate::agent::{GoalResult, GoalVerdict};
 use crate::peers::{
-    PeerHistoryPage, PeerSummary, PublishReceipt, SendReceipt, TopicActivity, handle_address,
-    literal,
+    AssignedWork, PeerHistoryPage, PeerSummary, PublishReceipt, SendReceipt, TopicActivity,
+    handle_address, literal,
 };
 use crate::permissions::PermissionRequest;
 use crate::tools::native::plan::{self, PlanTarget, PlanWriteResult};
@@ -102,6 +102,14 @@ const PEER_HANDLE_FIELD: &str = "handle";
 const PEER_RECIPIENTS_FIELD: &str = "recipients";
 const PEER_NAME_LABEL: &str = "Name: ";
 const PEER_TARGET_LABEL: &str = "Target: ";
+const PEER_GROUPS_LABEL: &str = "\nGroups: ";
+const PEER_WORK_NOUN: &str = "work item";
+const PEER_QUEUED_LABEL: &str = "queued for groups";
+const PEER_WORK_QUEUED_NOTE: &str =
+    "Queued work waits for a member of its group to complete it; queued is not done.";
+const PEER_ASSIGNMENT_NOUN: &str = "assignment";
+const PEER_NO_ASSIGNMENTS: &str = "This session holds no work assignment.";
+const PEER_WORK_NOTICE: &str = "Work this session holds, then paused work it last owned. Report an outcome by work name; a paused item waits for a person, though you may still report it.";
 
 const STATE_KIND_FIELD: &str = "kind";
 /// Results sized by what they cost the model rather than by their lines: a
@@ -845,6 +853,14 @@ pub enum PeerOutput {
     History {
         page: PeerHistoryPage,
     },
+    /// The work this session holds and the paused work it last owned.
+    Work {
+        work: Vec<AssignedWork>,
+    },
+    /// An outcome this session reported for its work.
+    Reported {
+        work: AssignedWork,
+    },
 }
 
 impl PeerOutput {
@@ -852,6 +868,8 @@ impl PeerOutput {
         match self {
             Self::Sessions { sessions } => counted(sessions.len(), PEER_SESSION_NOUN),
             Self::Topics { topics } => counted(topics.len(), PEER_TOPIC_NOUN),
+            Self::Work { work } => counted(work.len(), PEER_ASSIGNMENT_NOUN),
+            Self::Reported { work } => work_state_label(&work.state).into(),
             Self::History { page } if page.withheld > 0 => format!(
                 "{}{CARD_ANNOTATION_SEPARATOR}{} {PEER_WITHHELD_LABEL}",
                 counted(page.messages.len(), PEER_MESSAGE_NOUN),
@@ -859,18 +877,29 @@ impl PeerOutput {
             ),
             Self::History { page } => counted(page.messages.len(), PEER_MESSAGE_NOUN),
             Self::Sent { receipt, .. } => status_label(&receipt.status).into(),
-            Self::Published { receipt } if receipt.recipients.is_empty() => {
-                PEER_NO_RECIPIENTS.into()
+            Self::Published { receipt } => {
+                let delivered = if receipt.recipients.is_empty() {
+                    PEER_NO_RECIPIENTS.into()
+                } else {
+                    format!(
+                        "{} of {} accepted",
+                        receipt
+                            .recipients
+                            .iter()
+                            .filter(|recipient| accepted(&recipient.status))
+                            .count(),
+                        counted(receipt.recipients.len(), PEER_RECIPIENT_NOUN)
+                    )
+                };
+                if receipt.queued.is_empty() {
+                    delivered
+                } else {
+                    format!(
+                        "{delivered}{CARD_ANNOTATION_SEPARATOR}{} {PEER_QUEUED_LABEL}",
+                        counted(receipt.queued.len(), PEER_WORK_NOUN)
+                    )
+                }
             }
-            Self::Published { receipt } => format!(
-                "{} of {} accepted",
-                receipt
-                    .recipients
-                    .iter()
-                    .filter(|recipient| accepted(&recipient.status))
-                    .count(),
-                counted(receipt.recipients.len(), PEER_RECIPIENT_NOUN)
-            ),
         }
     }
 
@@ -903,6 +932,10 @@ impl PeerOutput {
                     }
                     if peer.broadcasts {
                         text.push_str(PEER_BROADCASTS_LINE);
+                    }
+                    if !peer.groups.is_empty() {
+                        text.push_str(PEER_GROUPS_LABEL);
+                        text.extend(peer.groups.join(", ").escape_debug());
                     }
                     text
                 })
@@ -954,6 +987,13 @@ impl PeerOutput {
                         counted(receipt.skipped, PEER_SKIPPED_NOUN)
                     ));
                 }
+                lines.extend(receipt.queued.iter().map(|queued| {
+                    format!(
+                        "Queued for group {}: {}",
+                        queued.group.escape_debug(),
+                        queued.work.escape_debug()
+                    )
+                }));
                 lines.extend(
                     [PEER_RECEIPT_ACCEPTED, PEER_RECEIPT_UNKNOWN]
                         .into_iter()
@@ -965,8 +1005,18 @@ impl PeerOutput {
                         })
                         .map(str::to_owned),
                 );
+                if !receipt.queued.is_empty() {
+                    lines.push(PEER_WORK_QUEUED_NOTE.into());
+                }
                 lines.join("\n")
             }
+            Self::Work { work } if work.is_empty() => PEER_NO_ASSIGNMENTS.into(),
+            Self::Work { work } => work
+                .iter()
+                .map(work_display)
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+            Self::Reported { work } => work_display(work),
             Self::Topics { topics } if topics.is_empty() => PEER_TOPICS_EMPTY.into(),
             Self::Topics { topics } => topics
                 .iter()
@@ -1078,8 +1128,55 @@ impl PeerOutput {
                 "withheld": page.withheld,
                 "before": page.before,
             }),
+            Self::Work { work } => json!({
+                "notice": PEER_WORK_NOTICE,
+                "work": work,
+            }),
+            Self::Reported { work } => json!(work),
         }
         .to_string()
+    }
+}
+
+/// One assignment as a person reads it, with every peer-supplied field
+/// escaped.
+fn work_display(work: &AssignedWork) -> String {
+    let mut lines = vec![
+        format!(
+            "{}{CARD_ANNOTATION_SEPARATOR}group {}{CARD_ANNOTATION_SEPARATOR}{}",
+            work.work.escape_debug(),
+            work.group.escape_debug(),
+            work_state_label(&work.state),
+        ),
+        format!(
+            "Attempt {} of {}{CARD_ANNOTATION_SEPARATOR}from {}",
+            work.attempt,
+            work.max_attempts,
+            work.publisher.escape_debug(),
+        ),
+    ];
+    if let Some(topic) = &work.topic {
+        lines.push(format!("Topic: {}", topic.escape_debug()));
+    }
+    lines.extend(
+        [&work.reason, &work.result]
+            .into_iter()
+            .flatten()
+            .map(|text| literal(text, false)),
+    );
+    lines.join("\n")
+}
+
+fn work_state_label(state: &str) -> &'static str {
+    match state {
+        "pending" => "returned to the queue",
+        "leased" => "in progress",
+        "pausing" => "pausing",
+        "paused" => "paused",
+        "completed" => "completed",
+        "failed" => "failed",
+        "cancelled" => "cancelled",
+        _ => "unknown state",
     }
 }
 
@@ -1854,6 +1951,7 @@ impl ToolOutput {
             Self::Memory(output) => output.is_empty(),
             Self::Peers(PeerOutput::Sessions { sessions }) => sessions.is_empty(),
             Self::Peers(PeerOutput::Topics { topics }) => topics.is_empty(),
+            Self::Peers(PeerOutput::Work { work }) => work.is_empty(),
             Self::Peers(PeerOutput::History { page }) => {
                 page.messages.is_empty() && page.withheld == 0
             }
@@ -3326,7 +3424,7 @@ mod tests {
     use tempfile::TempDir;
     use test_case::test_case;
 
-    use crate::peers::{RecipientReceipt, StoredPeerMessage};
+    use crate::peers::{QueuedWork, RecipientReceipt, StoredPeerMessage};
 
     const PLAN_WRITE_PATH: &str = "/plans/committed.md";
     const PLAN_WRITE_REFERENCE: &str = "plan-committed";
@@ -3640,6 +3738,7 @@ mod tests {
             inbound: InboundPolicy::Auto,
             topics: vec![PEER_PATTERN.into()],
             broadcasts: true,
+            groups: Vec::new(),
         }
     }
 
@@ -3685,6 +3784,7 @@ mod tests {
                     .map(|status| peer_recipient(Some(PEER_HANDLE), status))
                     .collect(),
                 skipped,
+                queued: Vec::new(),
             },
         })
     }
@@ -3734,6 +3834,7 @@ mod tests {
                 audience: PeerAudience::Broadcast,
                 recipients: vec![peer_recipient(handle, PEER_QUEUED)],
                 skipped: 0,
+                queued: Vec::new(),
             },
         };
         for (output, pointer) in [(sessions, "/sessions/0"), (publication, "/recipients/0")] {
@@ -3992,6 +4093,7 @@ mod tests {
                     inbound: InboundPolicy::Hold,
                     topics: vec![PEER_HOSTILE.into()],
                     broadcasts: false,
+                    groups: vec![PEER_HOSTILE.into()],
                 })
                 .into(),
         }
@@ -4025,6 +4127,10 @@ mod tests {
                     })
                     .into(),
                 skipped: 0,
+                queued: vec![QueuedWork {
+                    group: PEER_HOSTILE.into(),
+                    work: PEER_HOSTILE.into(),
+                }],
             },
         }
     }

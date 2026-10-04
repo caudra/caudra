@@ -3,8 +3,9 @@ use std::future::Future;
 use std::time::Instant;
 
 use caudra_agent::peers::{
-    ChannelPage, ChannelSummary, HistoryVersion, MAX_HISTORY_PAGE, PeerDecision,
-    PeerDecisionResult, PeerDescriptor, PeerReviewToken, PeerSession, PeerSummary,
+    AssignedWork, ChannelPage, ChannelSummary, HistoryVersion, MAX_HISTORY_PAGE, ManagedWork,
+    PeerDecision, PeerDecisionResult, PeerDescriptor, PeerReviewToken, PeerSession, PeerSummary,
+    WorkAction, WorkGroup, literal,
 };
 use caudra_config::{Feature, InboundPolicy};
 use flume::{Receiver, TryRecvError};
@@ -34,6 +35,20 @@ const NO_TOPICS: &str = "No peer topic subscriptions";
 const BROADCASTS_ON: &str = "broadcasts on";
 const BROADCASTS_OFF: &str = "broadcasts off";
 const SUMMARY_SEPARATOR: &str = " · ";
+const GROUPS_HELP: &str = "Usage: /groups [help | join GROUP | leave GROUP | retry WORK | pause WORK | cancel WORK]\nRun /groups to list the consumer groups, the ones this session takes work from, and the work it holds. A consumer group hands each publication on its topics to one member as a work item, which that member's agent must report completed, retryable, or failed. Create and change groups with caudra message group. A member takes queued work while it idles; leaving stops new work but keeps the item it holds. retry queues a paused, failed, or cancelled item again, which may repeat effects of its earlier attempts; pause holds a queued item; cancel gives up on an item no member is working on. Memberships are kept with the session and restored when it resumes.";
+const GROUPS_BUSY: &str = "The previous /groups command is still running";
+const NO_GROUPS: &str = "No consumer groups; create one with caudra message group create";
+const MEMBER_MARK: &str = "* ";
+const NON_MEMBER_MARK: &str = "  ";
+const GROUP_PAUSED: &str = " · paused";
+const MEMBERS_LEGEND: &str = "* marks a group this session takes work from";
+const MISSING_GROUPS: &str = "Joined groups that no longer exist: ";
+const NO_OWNED_WORK: &str = "This session holds no work";
+const OWNED_WORK: &str = "Work this session holds:";
+const WORK_INDENT: &str = "  ";
+const RETRY_REPEATS: &str = "Earlier attempts may already have had effects; the next member repeats the work from the start";
+const JOINED: &str = "Joined consumer group ";
+const LEFT: &str = "Left consumer group ";
 
 pub(super) struct PeerRegistration {
     session: PeerSession,
@@ -42,6 +57,7 @@ pub(super) struct PeerRegistration {
     discovery: Option<Load<u64, Vec<PeerSummary>>>,
     history: HistoryLoads,
     catch_up: Option<Task<()>>,
+    group_command: Option<Load<(), String>>,
 }
 
 /// One answer a worker owes the open manager, keyed by the opening and the
@@ -85,6 +101,7 @@ impl PeerRegistration {
             discovery: None,
             history: HistoryLoads::default(),
             catch_up: None,
+            group_command: None,
         };
         registration.catch_up();
         registration
@@ -424,13 +441,27 @@ impl SessionRuntime {
     }
 
     fn peer_wake_ready(&self) -> bool {
-        !self.peer_blocked()
-            && !self.app.has_modal_overlay()
-            && self.quiescent()
+        self.peer_idle()
             && self
                 .peer
                 .as_ref()
                 .is_some_and(|peer| peer.session.has_pending())
+    }
+
+    /// Whether a peer message or consumer-group work may start a turn here.
+    fn peer_idle(&self) -> bool {
+        !self.peer_blocked() && !self.app.has_modal_overlay() && self.quiescent()
+    }
+
+    /// Records that the item a cancelled turn worked on pauses, before the
+    /// cancellation reaches that turn, so no other member takes it over.
+    pub(super) fn pause_peer_work(&mut self) {
+        let Some(peer) = &self.peer else {
+            return;
+        };
+        if let Err(error) = smol::block_on(peer.session.request_pause()) {
+            self.peer_notice(error);
+        }
     }
 
     fn peer_notice(&mut self, text: String) {
@@ -460,9 +491,10 @@ impl EventLoop<'_> {
         dirty
     }
 
-    pub(super) fn start_peer_runs(&mut self) -> Dirty {
-        if self.ctx.peer_host.is_none()
-            || self.relocation.is_some()
+    /// Whether a workspace transition keeps every session from starting a
+    /// turn for a peer message or consumer-group work.
+    fn peer_runs_paused(&self) -> bool {
+        self.relocation.is_some()
             || self.sandbox.is_some()
             || self.sandbox_control.is_some()
             || !self.sandbox_workflows.is_empty()
@@ -471,7 +503,10 @@ impl EventLoop<'_> {
                 .iter()
                 .any(|runtime| !runtime.restore_transitions.is_empty())
             || crate::sandbox::transfer::active()
-        {
+    }
+
+    pub(super) fn start_peer_runs(&mut self) -> Dirty {
+        if self.ctx.peer_host.is_none() || self.peer_runs_paused() {
             return Dirty::NO;
         }
         let mut dirty = Dirty::NO;
@@ -486,6 +521,52 @@ impl EventLoop<'_> {
             }
             self.dispatch(index, actions);
             dirty = Dirty::YES;
+        }
+        dirty
+    }
+
+    /// Shows what became of each session's consumer-group work and its
+    /// `/groups` commands, stops a turn whose item another member may now
+    /// take, and lets an idle session look for more work. A session that
+    /// cannot start a turn returns the item it was offered to the queue.
+    pub(super) fn sync_peer_work(&mut self) -> Dirty {
+        let paused = self.peer_runs_paused();
+        let mut dirty = Dirty::NO;
+        for index in 0..self.sessions.len() {
+            let runtime = &mut self.sessions[index];
+            let idle = !paused && runtime.peer_idle();
+            let Some(peer) = &mut runtime.peer else {
+                continue;
+            };
+            if !idle {
+                peer.session.release_offered_work();
+            } else if !peer.session.has_pending() {
+                peer.session.poll_work();
+            }
+            let answer = poll_load(&mut peer.group_command, Some(&()));
+            let notices = peer.session.take_work_notices();
+            if let Some((_, result)) = answer {
+                match result {
+                    Ok(text) => runtime.peer_notice(text),
+                    Err(error) => runtime.app.flash(error),
+                }
+                dirty = Dirty::YES;
+            }
+            if notices.is_empty() {
+                continue;
+            }
+            dirty = Dirty::YES;
+            let stop = notices.iter().any(|notice| notice.stop);
+            for notice in notices {
+                runtime.peer_notice(notice.text);
+            }
+            if stop
+                && (runtime.app.status == Status::Streaming
+                    || runtime.handles.queue.is_processing())
+            {
+                let actions = runtime.app.handle_cancel();
+                self.dispatch(index, actions);
+            }
         }
         dirty
     }
@@ -713,6 +794,148 @@ impl EventLoop<'_> {
             Err(error) => runtime.app.flash(error),
         }
     }
+
+    pub(super) fn peer_groups(&mut self, index: usize, args: &str) {
+        if args.trim() == "help" {
+            let runtime = &mut self.sessions[index];
+            if !runtime.app.refuse_disabled(Feature::CrossSessionMessaging) {
+                runtime.peer_notice(GROUPS_HELP.into());
+            }
+            return;
+        }
+        if !self.peer_command_ready(index) {
+            return;
+        }
+        let runtime = &mut self.sessions[index];
+        let Some(peer) = &mut runtime.peer else {
+            return;
+        };
+        if peer.group_command.is_some() {
+            runtime.app.flash(GROUPS_BUSY.into());
+            return;
+        }
+        let session = peer.session.clone();
+        let args: Vec<String> = args.split_whitespace().map(str::to_owned).collect();
+        let action = match args.as_slice() {
+            [] => None,
+            [action, _] if action == "retry" => Some(WorkAction::Retry),
+            [action, _] if action == "pause" => Some(WorkAction::Pause),
+            [action, _] if action == "cancel" => Some(WorkAction::Cancel),
+            [action, group] if action == "leave" => {
+                let result = session
+                    .leave_group(group)
+                    .map(|()| format!("{LEFT}{group}"));
+                match result {
+                    Ok(text) => runtime.peer_notice(text),
+                    Err(error) => runtime.app.flash(error),
+                }
+                return;
+            }
+            [action, group] if action == "join" => {
+                let group = group.clone();
+                peer.group_command = Some(Load::start((), async move {
+                    session
+                        .join_group(&group)
+                        .await
+                        .map(|()| format!("{JOINED}{group}"))
+                }));
+                return;
+            }
+            _ => {
+                runtime.app.flash(GROUPS_HELP.into());
+                return;
+            }
+        };
+        let work = args.get(1).cloned().unwrap_or_default();
+        peer.group_command = Some(Load::start((), async move {
+            match action {
+                Some(action) => session
+                    .manage_work(&work, action)
+                    .await
+                    .map(|managed| managed_line(&managed)),
+                None => {
+                    let groups = session.consumer_groups().await?;
+                    let work = session.owned_work().await?;
+                    Ok(groups_overview(&groups, &session.groups(), &work))
+                }
+            }
+        }));
+    }
+}
+
+/// The groups of this namespace, marking the ones `members` names, then the
+/// work this session holds.
+fn groups_overview(groups: &[WorkGroup], members: &[String], work: &[AssignedWork]) -> String {
+    let mut lines = Vec::new();
+    if groups.is_empty() {
+        lines.push(NO_GROUPS.to_owned());
+    } else {
+        lines.push(MEMBERS_LEGEND.to_owned());
+    }
+    for group in groups {
+        let mark = if members.contains(&group.name) {
+            MEMBER_MARK
+        } else {
+            NON_MEMBER_MARK
+        };
+        let counts = &group.counts;
+        let mut line = format!(
+            "{mark}{}{SUMMARY_SEPARATOR}{}{SUMMARY_SEPARATOR}concurrency {}, {} attempts, backlog {}{SUMMARY_SEPARATOR}{} pending, {} active, {} paused, {} failed",
+            group.name,
+            group.patterns.join(", "),
+            group.policy.concurrency,
+            group.policy.max_attempts,
+            group.policy.max_backlog,
+            counts.pending,
+            counts.active,
+            counts.paused,
+            counts.failed,
+        );
+        if group.paused {
+            line.push_str(GROUP_PAUSED);
+        }
+        lines.push(line);
+    }
+    let missing: Vec<&str> = members
+        .iter()
+        .filter(|member| !groups.iter().any(|group| &group.name == *member))
+        .map(String::as_str)
+        .collect();
+    if !missing.is_empty() {
+        lines.push(format!("{MISSING_GROUPS}{}", missing.join(", ")));
+    }
+    if work.is_empty() {
+        lines.push(NO_OWNED_WORK.to_owned());
+    } else {
+        lines.push(OWNED_WORK.to_owned());
+        lines.extend(
+            work.iter()
+                .map(|item| format!("{WORK_INDENT}{}", work_line(item))),
+        );
+    }
+    lines.join("\n")
+}
+
+fn work_line(item: &AssignedWork) -> String {
+    let mut line = format!(
+        "{}{SUMMARY_SEPARATOR}group {}{SUMMARY_SEPARATOR}{}{SUMMARY_SEPARATOR}attempt {} of {}",
+        item.work, item.group, item.state, item.attempt, item.max_attempts
+    );
+    if let Some(reason) = &item.reason {
+        line.push_str(SUMMARY_SEPARATOR);
+        line.push_str(&literal(reason, false));
+    }
+    line
+}
+
+/// The item a person's action left, warning when its retry may repeat effects.
+fn managed_line(managed: &ManagedWork) -> String {
+    let line = work_line(&managed.item);
+    if managed.repeats_claims {
+        format!("{line}\n{RETRY_REPEATS}")
+    } else {
+        line
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -761,9 +984,14 @@ mod tests {
     use flume::Sender;
     use test_case::test_case;
 
+    use caudra_agent::peers::{AssignedWork, ManagedWork, WorkGroup};
+    use caudra_storage::messages::{GroupPolicy, WorkCounts};
+
     use super::{
-        BROADCASTS_OFF, BROADCASTS_ON, LOAD_STOPPED, Load, NO_TOPICS, SubscriptionRequest,
-        TOPICS_LABEL, ensure_load, peer_blocked, peer_eligible, poll_due, poll_load,
+        BROADCASTS_OFF, BROADCASTS_ON, GROUP_PAUSED, LOAD_STOPPED, Load, MEMBER_MARK,
+        MEMBERS_LEGEND, MISSING_GROUPS, NO_GROUPS, NO_OWNED_WORK, NO_TOPICS, NON_MEMBER_MARK,
+        OWNED_WORK, RETRY_REPEATS, SubscriptionRequest, TOPICS_LABEL, WORK_INDENT, ensure_load,
+        groups_overview, managed_line, peer_blocked, peer_eligible, poll_due, poll_load,
         subscription_request, subscriptions_summary,
     };
     use crate::app::{App, tests::test_app};
@@ -774,11 +1002,87 @@ mod tests {
     const GENERATION: u64 = 7;
     const SUBSCRIBED: &str = "ci.*";
     const ADDED: &str = "deploy.**";
+    const GROUP: &str = "builds";
+    const OTHER_GROUP: &str = "docs";
+    const GONE_GROUP: &str = "retired";
+    const WORK: &str = "bright-calm-river";
+    const PAUSED: &str = "paused";
+    const TOPIC: &str = "ci.failures";
+    const PUBLISHER: &str = "nightly";
+    const HOSTILE_REASON: &str = "Retry later\x1b[2J";
+    const ESCAPE: char = '\x1b';
 
     type Answer = Result<(), String>;
 
     fn words(values: &[&str]) -> Vec<String> {
         values.iter().copied().map(str::to_owned).collect()
+    }
+
+    fn group(name: &str, paused: bool) -> WorkGroup {
+        WorkGroup {
+            name: name.into(),
+            patterns: words(&[SUBSCRIBED]),
+            policy: GroupPolicy::default(),
+            paused,
+            created_ms: 0,
+            counts: WorkCounts::default(),
+        }
+    }
+
+    fn held_work() -> AssignedWork {
+        AssignedWork {
+            work: WORK.into(),
+            group: GROUP.into(),
+            state: PAUSED.into(),
+            attempt: 1,
+            max_attempts: GroupPolicy::default().max_attempts,
+            topic: Some(TOPIC.into()),
+            publisher: PUBLISHER.into(),
+            reason: Some(HOSTILE_REASON.into()),
+            result: None,
+        }
+    }
+
+    #[test]
+    fn groups_overview_marks_memberships_and_lists_held_work() {
+        let overview = groups_overview(
+            &[group(GROUP, false), group(OTHER_GROUP, true)],
+            &words(&[GROUP, GONE_GROUP]),
+            &[held_work()],
+        );
+        let lines: Vec<&str> = overview.lines().collect();
+        assert_eq!(lines[0], MEMBERS_LEGEND);
+        assert!(lines[1].starts_with(&format!("{MEMBER_MARK}{GROUP}")));
+        assert!(!lines[1].ends_with(GROUP_PAUSED));
+        assert!(lines[2].starts_with(&format!("{NON_MEMBER_MARK}{OTHER_GROUP}")));
+        assert!(lines[2].ends_with(GROUP_PAUSED));
+        assert_eq!(lines[3], format!("{MISSING_GROUPS}{GONE_GROUP}"));
+        assert_eq!(lines[4], OWNED_WORK);
+        assert!(lines[5].starts_with(&format!("{WORK_INDENT}{WORK}")));
+        assert!(!overview.contains(ESCAPE));
+    }
+
+    #[test_case(false; "never_claimed")]
+    #[test_case(true; "claimed_before")]
+    fn retried_work_warns_only_when_earlier_claims_may_repeat(repeats_claims: bool) {
+        let line = managed_line(&ManagedWork {
+            item: held_work(),
+            repeats_claims,
+        });
+        let lines: Vec<&str> = line.lines().collect();
+        assert!(lines[0].starts_with(WORK));
+        assert_eq!(
+            lines.get(1).copied(),
+            repeats_claims.then_some(RETRY_REPEATS)
+        );
+    }
+
+    #[test]
+    fn groups_overview_says_when_there_is_nothing() {
+        assert_eq!(
+            groups_overview(&[], &[], &[]),
+            format!("{NO_GROUPS}\n{NO_OWNED_WORK}")
+        );
     }
 
     #[test_case(&[], SubscriptionRequest::Browse; "no_arguments_browse")]

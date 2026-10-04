@@ -18,7 +18,8 @@ use super::unix::{self, Directory};
 use super::{
     Delivery, FANOUT_CONCURRENCY, MAX_LABEL_BYTES, NOT_RECORDED, PeerInfo, PublishReceipt,
     RecipientReceipt, Route, SendReceipt, Sender, WireMode, audience_members, check_publication,
-    check_text, deceptive, holder, message_name, parse_handle_address, token, wall_ms,
+    check_text, deceptive, holder, message_name, parse_handle_address, recipient_room, token,
+    wall_ms,
 };
 
 const SESSION_DOMAIN: &[u8] = b"caudra script sender\0";
@@ -86,8 +87,13 @@ impl ScriptSender {
         text: &str,
     ) -> Result<PublishReceipt, String> {
         check_publication(&audience, text)?;
-        let (selected, skipped) =
-            audience_members(self.discover().await?, &audience, self.max_fanout);
+        let groups = self
+            .history
+            .group_destinations(&audience)
+            .await
+            .map_err(|error| format!("{NOT_RECORDED}: {error}"))?;
+        let room = recipient_room(groups, self.max_fanout)?;
+        let (selected, skipped) = audience_members(self.discover().await?, &audience, room);
         self.fan_out(audience, text, selected, skipped).await
     }
 
@@ -122,7 +128,8 @@ impl ScriptSender {
         })
     }
 
-    /// Records the message for `peers` first, then delivers it to each.
+    /// Records the message for `peers`, with the work it queues for consumer
+    /// groups, first, then delivers it to each.
     async fn fan_out(
         &self,
         audience: PeerAudience,
@@ -148,8 +155,10 @@ impl ScriptSender {
                 handle: peer.handle.clone(),
             })
             .collect();
-        self.history
-            .record(template.history_entry(), recipients)
+        let max_work = self.max_fanout.saturating_sub(peers.len());
+        let queued = self
+            .history
+            .record_publication(template.history_entry(), recipients, max_work)
             .await
             .map_err(|error| format!("{NOT_RECORDED}: {error}"))?;
         let sender = template.sender.route.target();
@@ -187,6 +196,7 @@ impl ScriptSender {
             audience: template.audience,
             recipients: receipts,
             skipped,
+            queued,
         })
     }
 

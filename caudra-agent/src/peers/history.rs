@@ -8,10 +8,11 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use caudra_config::MessagingConfig;
+use caudra_providers::PeerAudience;
 use caudra_storage::StateDir;
 use caudra_storage::messages::{
     ChannelSummary, DeliveryRecord, HistoryChannel, HistoryVersion, MessageLog, MessageLogError,
-    MessageRecipient, NewMessage, Retention, StoredMessage, TopicSummary,
+    MessageRecipient, NewMessage, QueuedWork, Retention, StoredMessage, TopicSummary, WorkRefusal,
 };
 use flume::{Receiver, Sender};
 
@@ -94,22 +95,40 @@ impl MessageHistory {
     }
 
     /// Runs `job` after everything queued before it and returns its result.
-    async fn query<T: Send + 'static>(
+    /// A refused change reads as the refusal alone.
+    pub(super) async fn query<T: Send + 'static>(
         &self,
         job: impl FnOnce(&mut MessageLog) -> Result<T, MessageLogError> + Send + 'static,
     ) -> Result<T, String> {
         let (reply, result) = flume::bounded(1);
         self.jobs
             .send(Box::new(move |log| {
-                let _ = reply.send(job(log).map_err(|error| format!("{UNAVAILABLE}: {error}")));
+                let _ = reply.send(job(log).map_err(|error| match error {
+                    MessageLogError::Refused(refusal) => refusal.to_string(),
+                    error => format!("{UNAVAILABLE}: {error}"),
+                }));
             }))
             .map_err(|_| STOPPED.to_owned())?;
         result.recv_async().await.map_err(|_| STOPPED.to_owned())?
     }
 
+    /// [`Self::query`], keeping a refused change apart from a history that
+    /// could not answer.
+    pub(super) async fn decide<T: Send + 'static>(
+        &self,
+        job: impl FnOnce(&mut MessageLog) -> Result<T, MessageLogError> + Send + 'static,
+    ) -> Result<Result<T, WorkRefusal>, String> {
+        self.query(move |log| match job(log) {
+            Ok(value) => Ok(Ok(value)),
+            Err(MessageLogError::Refused(refusal)) => Ok(Err(refusal)),
+            Err(error) => Err(error),
+        })
+        .await
+    }
+
     /// Queues `job` without waiting for it. Reports describe what already
     /// happened, so a failure is logged rather than undoing anything.
-    fn report(
+    pub(super) fn report(
         &self,
         job: impl FnOnce(&mut MessageLog) -> Result<(), MessageLogError> + Send + 'static,
     ) {
@@ -129,6 +148,35 @@ impl MessageHistory {
         recipients: Vec<MessageRecipient>,
     ) -> Result<i64, String> {
         self.query(move |log| log.record(&message, &recipients))
+            .await
+    }
+
+    /// Records a publication with the work it queues for consumer groups,
+    /// refusing it whole when more than `max_work` groups would take it.
+    pub(super) async fn record_publication(
+        &self,
+        message: NewMessage,
+        recipients: Vec<MessageRecipient>,
+        max_work: usize,
+    ) -> Result<Vec<QueuedWork>, String> {
+        self.query(move |log| {
+            Ok(log
+                .record_publication(&message, &recipients, max_work)?
+                .work)
+        })
+        .await
+    }
+
+    /// How many consumer groups a publication on `audience` would queue
+    /// work for.
+    pub(super) async fn group_destinations(
+        &self,
+        audience: &PeerAudience,
+    ) -> Result<usize, String> {
+        let Some(topic) = audience.topic().map(str::to_owned) else {
+            return Ok(0);
+        };
+        self.query(move |log| Ok(log.groups_matching(&topic)?.len()))
             .await
     }
 

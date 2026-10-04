@@ -1427,9 +1427,10 @@ fn build_tool_results_map(items: &[HistoryItem]) -> HashMap<&str, ToolResultRef<
 mod tests {
     use super::*;
     use caudra_agent::peers::{
-        PeerSummary, PublishReceipt, RecipientReceipt, SendReceipt, handle_address,
+        AssignedWork, PeerSummary, PublishReceipt, QueuedWork, RecipientReceipt, SendReceipt,
+        handle_address,
     };
-    use caudra_agent::tools::native::peers::{LIST_NAME, PUBLISH_NAME, SEND_NAME};
+    use caudra_agent::tools::native::peers::{LIST_NAME, PUBLISH_NAME, SEND_NAME, WORK_NAME};
     use caudra_agent::tools::{BATCH_TOOL_NAME, SHELL_TOOL_NAME, TOOL_OUTPUT_TOOL_NAME};
     use caudra_agent::{
         AgentEvent, BatchProgressEvent, BatchToolEntry, BatchToolStatus, IndexLine,
@@ -1438,7 +1439,7 @@ mod tests {
     };
     use caudra_config::{InboundPolicy, UiConfig};
     use caudra_providers::{
-        Billing, ContentBlock, Message, PeerAudience, PeerMessageOrigin, Role,
+        Billing, ContentBlock, Message, PeerAssignment, PeerAudience, PeerMessageOrigin, Role,
         StandingReminderKind, TaskEventOrigin, estimate_tokens_cached, project_messages,
         token_label,
     };
@@ -1540,6 +1541,8 @@ mod tests {
     const PEER_REASON: &str = "Needs local review.";
     const PEER_HANDLE: &str = "release-agent";
     const PEER_TOPIC: &str = "ci.failures";
+    const PEER_GROUP: &str = "ci-triage";
+    const PEER_WORK: &str = "steady-warm-heron";
     const PEER_MODEL_JSON: &str = "{\"session_id\":\"private-session-id\"}";
     const SESSION_CWD: &str = "/project";
     const TASK_OBSERVATION: &str = "neat-wanted-cowbird completed: All checks passed.";
@@ -2087,6 +2090,7 @@ mod tests {
                 inbound: InboundPolicy::Hold,
                 topics: vec![PEER_TOPIC.into()],
                 broadcasts: true,
+                groups: vec![PEER_GROUP.into()],
             }],
         }
     }
@@ -2117,13 +2121,34 @@ mod tests {
                     reason: Some(PEER_REASON.into()),
                 }],
                 skipped: 0,
+                queued: vec![QueuedWork {
+                    group: PEER_GROUP.into(),
+                    work: PEER_WORK.into(),
+                }],
             },
         }
     }
 
-    #[test_case(LIST_NAME, serde_json::json!({}), restored_discovery(), &[SESSION_CWD, MAIN_NAME, PEER_TOPIC]; "discovery")]
-    #[test_case(SEND_NAME, serde_json::json!({"target": PEER_TARGET, "text": PEER_REASON}), restored_receipt(), &[PEER_MESSAGE, PEER_REASON]; "receipt")]
-    #[test_case(PUBLISH_NAME, serde_json::json!({"topic": PEER_TOPIC, "text": PEER_REASON}), restored_publication(), &[PEER_MESSAGE, PEER_REASON, PEER_TOPIC, MAIN_NAME]; "publication")]
+    fn restored_report() -> PeerOutput {
+        PeerOutput::Reported {
+            work: AssignedWork {
+                work: PEER_WORK.into(),
+                group: PEER_GROUP.into(),
+                state: "completed".into(),
+                attempt: 1,
+                max_attempts: 3,
+                topic: Some(PEER_TOPIC.into()),
+                publisher: MAIN_NAME.into(),
+                reason: None,
+                result: Some(PEER_REASON.into()),
+            },
+        }
+    }
+
+    #[test_case(LIST_NAME, serde_json::json!({}), restored_discovery(), &[PEER_TARGET, SESSION_CWD, MAIN_NAME, PEER_TOPIC, PEER_GROUP]; "discovery")]
+    #[test_case(SEND_NAME, serde_json::json!({"target": PEER_TARGET, "text": PEER_REASON}), restored_receipt(), &[PEER_TARGET, PEER_MESSAGE, PEER_REASON]; "receipt")]
+    #[test_case(PUBLISH_NAME, serde_json::json!({"topic": PEER_TOPIC, "text": PEER_REASON}), restored_publication(), &[PEER_TARGET, PEER_MESSAGE, PEER_REASON, PEER_TOPIC, MAIN_NAME, PEER_GROUP, PEER_WORK]; "publication")]
+    #[test_case(WORK_NAME, serde_json::json!({"action": "complete", "work": PEER_WORK}), restored_report(), &[PEER_WORK, PEER_GROUP, PEER_TOPIC, MAIN_NAME, PEER_REASON]; "work_report")]
     fn restored_peers_keep_typed_cards_and_display_text_without_lua(
         tool: &str,
         input: serde_json::Value,
@@ -2150,7 +2175,6 @@ mod tests {
             .unwrap()
             .structured_display_text()
             .unwrap();
-        assert!(copied.contains(PEER_TARGET));
         assert!(!copied.contains(PEER_MODEL_JSON));
         assert!(!copied.contains("session_id"));
         for expected in expected {
@@ -2676,6 +2700,7 @@ mod tests {
             reply_target: REPLY_TARGET.into(),
             reply_to: None,
             external: false,
+            assignment: None,
         };
         let mut live = chat();
         live.show_reminders = show_reminders;
@@ -2761,6 +2786,7 @@ mod tests {
             reply_target,
             reply_to: None,
             external: false,
+            assignment: None,
         };
         let shown = DisplayMessage::peer(REPLY_TEXT, origin).text;
         assert_eq!(shown.contains(NAME_LINE), name_line, "{shown}");
@@ -2782,12 +2808,39 @@ mod tests {
             reply_target: PEER_TARGET.into(),
             reply_to: None,
             external: false,
+            assignment: None,
         };
         let shown = DisplayMessage::peer(REPLY_TEXT, origin).text;
         assert_eq!(shown.contains(AUDIENCE_LINE), line.is_some());
         if let Some(line) = line {
             assert!(shown.contains(line), "{shown}");
         }
+    }
+
+    #[test_case(false; "session_publisher")]
+    #[test_case(true; "script_publisher")]
+    fn work_assignments_name_their_work_group_and_attempt(external: bool) {
+        let work_line =
+            format!("\nWork: {PEER_WORK:?} · group {PEER_GROUP:?} · attempt 2 of 3\nMessage: ");
+        let origin = PeerMessageOrigin {
+            message_id: PEER_MESSAGE.into(),
+            audience: PeerAudience::Topic {
+                topic: PEER_TOPIC.into(),
+            },
+            sender_name: MAIN_NAME.into(),
+            sender_handle: None,
+            reply_target: PEER_TARGET.into(),
+            reply_to: None,
+            external,
+            assignment: Some(PeerAssignment {
+                group: PEER_GROUP.into(),
+                work: PEER_WORK.into(),
+                attempt: 2,
+                max_attempts: 3,
+            }),
+        };
+        let shown = DisplayMessage::peer(REPLY_TEXT, origin).text;
+        assert!(shown.contains(&work_line), "{shown}");
     }
 
     #[test]
@@ -2804,6 +2857,7 @@ mod tests {
             reply_target: String::new(),
             reply_to: None,
             external: true,
+            assignment: None,
         };
         let shown = DisplayMessage::peer(REPLY_TEXT, origin).text;
         assert!(

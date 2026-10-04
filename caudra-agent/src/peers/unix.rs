@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::topics::validate_patterns;
+use super::work::valid_memberships;
 use super::{
     Delivery, HostInner, MAX_FRAME_BYTES, MAX_LABEL_BYTES, MAX_PATH_BYTES, MAX_SESSIONS,
     PROTOCOL_VERSION, PeerInfo, PeerSession, Request, Response, Route, SendReceipt, lock,
@@ -657,6 +658,7 @@ pub(super) async fn discover(directory: &Directory) -> Result<Vec<PeerInfo>, Str
                                 .is_some_and(|handle| !valid_handle(handle))
                             || peer.cwd.as_os_str().len() > MAX_PATH_BYTES
                             || validate_patterns(&peer.topics).is_err()
+                            || !valid_memberships(&peer.groups)
                         {
                             return Err("Invalid discovered peer metadata".into());
                         }

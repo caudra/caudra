@@ -307,7 +307,7 @@ fn require_requested_features(cli: &Cli) -> Result<(), FeatureDisabled> {
     if cli.auto || cli.permission_mode.as_deref() == Some(AUTO_PERMISSION_MODE) {
         features.require(Feature::DecisionEngine)?;
     }
-    if cli.name.is_some() || !cli.topics.is_empty() || cli.receive_broadcasts {
+    if cli.requests_messaging() {
         features.require(Feature::CrossSessionMessaging)?;
     }
     match &cli.command {
@@ -514,6 +514,7 @@ mod tests {
 
     const MESSAGING_NAME: &str = "ci-watcher";
     const MESSAGING_TOPIC: &str = "ci.**";
+    const MESSAGING_GROUP: &str = "reviewers";
     const GLOBAL_TOML: &str = "config/caudra.toml";
     const GLOBAL_LUA: &str = "config/init.lua";
     const PROJECT_TOML: &str = "project/.caudra/caudra.toml";
@@ -657,6 +658,8 @@ mod tests {
     #[test_case(FeatureFlags::NONE.with(Feature::CrossSessionMessaging), &["--topic", MESSAGING_TOPIC], true; "topic_experiment_on")]
     #[test_case(FeatureFlags::NONE, &["--receive-broadcasts"], false; "broadcasts_experiment_off")]
     #[test_case(FeatureFlags::NONE.with(Feature::CrossSessionMessaging), &["--receive-broadcasts"], true; "broadcasts_experiment_on")]
+    #[test_case(FeatureFlags::NONE, &["--group", MESSAGING_GROUP], false; "group_experiment_off")]
+    #[test_case(FeatureFlags::NONE.with(Feature::CrossSessionMessaging), &["--group", MESSAGING_GROUP], true; "group_experiment_on")]
     #[test_case(FeatureFlags::NONE, &["message", "log"], false; "message_command_experiment_off")]
     #[test_case(FeatureFlags::NONE.with(Feature::CrossSessionMessaging), &["message", "log"], true; "message_command_experiment_on")]
     fn messaging_flags_require_the_experiment(

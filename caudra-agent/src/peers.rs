@@ -5,17 +5,21 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::mem;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use caudra_config::{Feature, FeatureFlags, InboundPolicy, MessagingConfig};
 use caudra_providers::{
-    HistoryItem, HistoryItemKind, Message, PeerAudience, PeerMessageOrigin, UserOrigin,
+    HistoryItem, HistoryItemKind, Message, PeerAssignment, PeerAudience, PeerMessageOrigin,
+    UserOrigin,
 };
 use caudra_storage::id::CaudraId;
-pub use caudra_storage::messages::{ChannelSummary, HistoryVersion, MessageChannel};
+pub use caudra_storage::messages::{
+    ChannelSummary, HistoryVersion, MessageChannel, QueuedWork, WorkGroup, WorkItem, WorkOutcome,
+    WorkState,
+};
 use caudra_storage::messages::{
     HistoryChannel, MessageAudience, MessageRecipient, MessageSender, NewMessage, StoredMessage,
 };
@@ -29,6 +33,12 @@ use crate::AgentMode;
 pub use history::history_retention;
 use history::{HistoryWriter, MessageHistory};
 use topics::{parse_pattern, parse_topic, pattern_matches, validate_patterns};
+pub use work::{
+    AssignedWork, COMPLETION_REQUIRED, INVALID_GROUP, MAX_MEMBERSHIPS, MAX_OUTCOME_BYTES,
+    ManagedWork, NOT_MEMBER, PAUSED_BY_CANCEL, TOO_MANY_MEMBERSHIPS, WorkAction, WorkNotice,
+    parse_group,
+};
+use work::{Assignments, check_memberships};
 
 // Nothing opens a history where peer messaging is unavailable.
 #[cfg_attr(not(unix), allow(dead_code))]
@@ -37,6 +47,7 @@ pub mod script;
 pub mod topics;
 #[cfg(unix)]
 mod unix;
+mod work;
 
 const PROTOCOL_VERSION: u32 = 1;
 pub const MAX_BODY_BYTES: usize = 32 * 1024;
@@ -151,6 +162,11 @@ pub struct PeerInfo {
     pub topics: Vec<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub broadcasts: bool,
+    /// Consumer groups whose work the session takes. Work never travels to
+    /// a session; it claims work from the history, so older peers that do
+    /// not advertise groups take none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,6 +185,8 @@ pub struct PeerSummary {
     pub topics: Vec<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub broadcasts: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
 }
 
 impl PeerSummary {
@@ -229,6 +247,10 @@ pub struct PublishReceipt {
     pub recipients: Vec<RecipientReceipt>,
     /// Matching sessions past `max_fanout`, which were not sent the message.
     pub skipped: usize,
+    /// Work the publication queued for consumer groups, which keep it
+    /// whether or not a member is live. Queued is not done.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queued: Vec<QueuedWork>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -428,6 +450,9 @@ struct SessionState {
     max_fanout: usize,
     topics: Vec<String>,
     broadcasts: bool,
+    /// Consumer groups whose work this session takes.
+    groups: Vec<String>,
+    work: Assignments,
     bytes: usize,
     inbox: VecDeque<InboxItem>,
     dedup: HashMap<String, DedupEntry>,
@@ -548,6 +573,38 @@ enum Name {
     Fresh(String),
 }
 
+/// The names a received message goes by, which bind only once it is kept.
+struct Naming {
+    sender: String,
+    identity: MessageIdentity,
+    alias: Option<Name>,
+    name: Name,
+}
+
+impl Naming {
+    fn origin(
+        &self,
+        delivery: &Delivery,
+        reply_to: Option<String>,
+        assignment: Option<PeerAssignment>,
+    ) -> PeerMessageOrigin {
+        let reply_target = match &delivery.sender.handle {
+            Some(handle) => handle_address(handle),
+            None => self.alias.as_ref().map_or("", Name::as_str).to_owned(),
+        };
+        PeerMessageOrigin {
+            message_id: self.name.as_str().to_owned(),
+            audience: delivery.audience.clone(),
+            sender_name: delivery.sender.name.clone(),
+            sender_handle: delivery.sender.handle.clone(),
+            reply_target,
+            reply_to,
+            external: delivery.sender.external,
+            assignment,
+        }
+    }
+}
+
 impl Name {
     fn as_str(&self) -> &str {
         match self {
@@ -605,6 +662,9 @@ struct Publication {
     issued: Issued,
     /// Recipient routes, in the order of `receipt.recipients`.
     routes: Vec<String>,
+    /// The consumer groups the publication may queue work for, which the
+    /// fan-out limit leaves after `routes`.
+    max_work: usize,
     receipt: PublishReceipt,
 }
 
@@ -643,6 +703,7 @@ impl Publication {
     fn fanout(&self, epoch: u64, text: &str) -> Fanout {
         Fanout {
             epoch,
+            max_work: self.max_work,
             receipt: self.receipt.clone(),
             deliveries: self.unresolved(text),
             entry: self.template(text).history_entry(),
@@ -666,6 +727,7 @@ impl Publication {
 /// in `receipt`, and the history records `entry` for `recipients` first.
 struct Fanout {
     epoch: u64,
+    max_work: usize,
     receipt: PublishReceipt,
     deliveries: Vec<(usize, Delivery)>,
     entry: NewMessage,
@@ -1175,6 +1237,17 @@ fn audience_members(
     (selected, matching.count())
 }
 
+/// How many live sessions a publication may reach once `groups` consumer
+/// groups take their share of `max_fanout`. Groups are never cut short, so
+/// more of them than that refuses the publication.
+fn recipient_room(groups: usize, max_fanout: usize) -> Result<usize, String> {
+    max_fanout.checked_sub(groups).ok_or_else(|| {
+        format!(
+            "The topic feeds {groups} consumer groups, more than the {max_fanout} destinations one publication may reach"
+        )
+    })
+}
+
 /// Forgets the messaging names more than one of `peers` advertises: such a
 /// name reaches none of them, so they are addressed by word target instead.
 fn forget_shared_handles(peers: &mut [PeerInfo]) {
@@ -1226,6 +1299,41 @@ fn validate_descriptor(descriptor: &PeerDescriptor) -> Result<(), String> {
         return Err("Remote workspaces cannot register local peer messaging".into());
     }
     Ok(())
+}
+
+/// Whether `auto` admits `sender` without review: both sessions share a
+/// canonical workspace and Plan or Build mode under Ask permissions. A script
+/// runs outside every session, so it never qualifies.
+fn same_cohort(
+    mode: &AgentMode,
+    canonical_cwd: Option<&Path>,
+    permission_mode: &PermissionMode,
+    sender: &Sender,
+) -> bool {
+    !sender.external
+        && matches!(
+            (&sender.mode, WireMode::from(mode)),
+            (WireMode::Build, WireMode::Build) | (WireMode::Plan, WireMode::Plan)
+        )
+        && canonical_cwd.is_some()
+        && canonical_cwd == sender.canonical_cwd.as_deref()
+        && *permission_mode == PermissionMode::Ask
+        && sender.permission_mode == PermissionMode::Ask
+}
+
+/// Why `inbound` holds what `sender` sent for review, if it does.
+fn policy_hold(
+    inbound: &InboundPolicy,
+    sender: &Sender,
+    same_cohort: bool,
+) -> Option<&'static str> {
+    match inbound {
+        InboundPolicy::Accept => None,
+        InboundPolicy::Hold | InboundPolicy::Refuse => Some(HELD_POLICY),
+        InboundPolicy::Auto if sender.external => Some(HELD_EXTERNAL),
+        InboundPolicy::Auto if same_cohort => None,
+        InboundPolicy::Auto => Some(HELD_COHORT),
+    }
 }
 
 fn stored_policy(policy: &InboundPolicy) -> StoredInboundPolicy {
@@ -1326,6 +1434,7 @@ impl PeerHost {
             .unwrap_or(InboundPolicy::Accept);
         let controls = controls.unwrap_or_default();
         validate_patterns(&controls.topics)?;
+        check_memberships(&controls.groups)?;
         let inbound_override = controls
             .inbound
             .as_ref()
@@ -1377,6 +1486,8 @@ impl PeerHost {
                 max_fanout: messaging.max_fanout,
                 topics: controls.topics,
                 broadcasts: controls.broadcasts,
+                groups: controls.groups,
+                work: Assignments::default(),
                 bytes: 0,
                 inbox: VecDeque::new(),
                 dedup: HashMap::new(),
@@ -1443,6 +1554,7 @@ impl PeerSession {
             handle: state.handle.clone(),
             topics: state.topics.clone(),
             broadcasts: state.broadcasts,
+            groups: state.groups.clone(),
         }
     }
 
@@ -1572,12 +1684,12 @@ impl PeerSession {
         self.0.close();
     }
 
-    /// Whether a message waits to wake the session. Caught-up messages only
-    /// ride along with a turn something else starts.
+    /// Whether a message or claimed work waits to wake the session.
+    /// Caught-up messages only ride along with a turn something else starts.
     pub fn has_pending(&self) -> bool {
         let mut state = lock(&self.0.state);
         state.reevaluate();
-        state.open && state.inbox.iter().any(InboxItem::is_waiting)
+        state.open && state.has_waiting()
     }
 
     pub async fn list(&self) -> Result<Vec<PeerInfo>, String> {
@@ -1608,6 +1720,7 @@ impl PeerSession {
                     inbound: peer.inbound,
                     topics: peer.topics,
                     broadcasts: peer.broadcasts,
+                    groups: peer.groups,
                 })
             })
             .collect()
@@ -1794,21 +1907,28 @@ impl PeerSession {
             }
             retry
         };
-        let peers = if retry {
+        let history = &self.0.host.history;
+        let destinations = if retry {
             None
         } else {
-            Some(self.list().await?)
+            Some((
+                self.list().await?,
+                history
+                    .group_destinations(&audience)
+                    .await
+                    .map_err(|error| format!("{NOT_RECORDED}: {error}"))?,
+            ))
         };
         let Fanout {
             epoch,
+            max_work,
             mut receipt,
             deliveries,
             entry,
             recipients,
-        } = self.prepare_publication(audience, text, request_id, fingerprint, peers)?;
-        let history = &self.0.host.history;
-        history
-            .record(entry, recipients)
+        } = self.prepare_publication(audience, text, request_id, fingerprint, destinations)?;
+        receipt.queued = history
+            .record_publication(entry, recipients, max_work)
             .await
             .map_err(|error| format!("{NOT_RECORDED}: {error}"))?;
         let sender = self.0.route.target();
@@ -1847,14 +1967,15 @@ impl PeerSession {
     }
 
     /// Recovers the publication `request_id` names, or records a new one
-    /// from `peers`, which only a first attempt discovers.
+    /// for the live `peers` and the consumer groups `audience` reaches, which
+    /// only a first attempt discovers.
     fn prepare_publication(
         &self,
         audience: PeerAudience,
         text: &str,
         request_id: &str,
         fingerprint: [u8; 32],
-        peers: Option<Vec<PeerInfo>>,
+        destinations: Option<(Vec<PeerInfo>, usize)>,
     ) -> Result<Fanout, String> {
         let mut state = lock(&self.0.state);
         state.ensure_can_send()?;
@@ -1863,7 +1984,8 @@ impl PeerSession {
             previous.issued.check_retry(&fingerprint, epoch)?;
             return Ok(previous.fanout(epoch, text));
         }
-        let mut peers = peers.ok_or(RETRY_EXPIRED)?;
+        let (mut peers, groups) = destinations.ok_or(RETRY_EXPIRED)?;
+        let room = recipient_room(groups, state.max_fanout)?;
         let now = Instant::now();
         if !state.has_publish_room(now) {
             return Err(PUBLISH_RATE_EXCEEDED.into());
@@ -1875,7 +1997,7 @@ impl PeerSession {
             return Err(RETRY_FULL.into());
         }
         forget_shared_handles(&mut peers);
-        let (selected, skipped) = audience_members(peers, &audience, state.max_fanout);
+        let (selected, skipped) = audience_members(peers, &audience, room);
         let message_id = state.message_names.fresh(None, message_name)?;
         let mut routes = Vec::with_capacity(selected.len());
         let mut recipients = Vec::with_capacity(selected.len());
@@ -1905,12 +2027,14 @@ impl PeerSession {
                 epoch,
                 sender: state.sender(&self.0.route),
             },
+            max_work: state.max_fanout - routes.len(),
             routes,
             receipt: PublishReceipt {
                 message_id,
                 audience,
                 recipients,
                 skipped,
+                queued: Vec::new(),
             },
         };
         let fanout = publication.fanout(epoch, text);
@@ -2299,12 +2423,17 @@ impl PeerSession {
             return None;
         }
         state.reevaluate();
-        if wake && !state.inbox.iter().any(InboxItem::is_waiting) {
+        if wake && !state.has_waiting() {
             return None;
         }
         state.next_claim += 1;
         let claim_id = state.next_claim;
-        let mut messages = Vec::new();
+        // Work starts turns of its own; it never joins one mid-request.
+        let mut messages: Vec<_> = wake
+            .then(|| state.work.claim(claim_id))
+            .flatten()
+            .into_iter()
+            .collect();
         for item in &mut state.inbox {
             if messages.len() == CLAIM_BATCH {
                 break;
@@ -2403,6 +2532,39 @@ impl SessionState {
         });
     }
 
+    /// The names `delivery` goes by in this registration's conversation.
+    fn naming(&mut self, delivery: &Delivery) -> Result<Naming, String> {
+        let sender = delivery.sender.route.target();
+        let identity = MessageIdentity {
+            sender: sender.clone(),
+            message_id: delivery.message_id.clone(),
+            recipients: Vec::new(),
+        };
+        let preferred =
+            valid_name(&delivery.message_id, MESSAGE_WORDS).then_some(delivery.message_id.as_str());
+        let alias = (!delivery.sender.external && delivery.sender.handle.is_none())
+            .then(|| self.peer_names.name(sender.as_str(), None, peer_name))
+            .transpose()?;
+        let name = self
+            .message_names
+            .name(&identity, preferred, message_name)?;
+        Ok(Naming {
+            sender,
+            identity,
+            alias,
+            name,
+        })
+    }
+
+    fn bind_names(&mut self, naming: Naming) {
+        if let Some(Name::Fresh(alias)) = naming.alias {
+            self.bind_peer(alias, naming.sender);
+        }
+        if let Name::Fresh(name) = naming.name {
+            self.bind_message(name, naming.identity);
+        }
+    }
+
     fn ensure_open(&self) -> Result<(), String> {
         if self.open {
             Ok(())
@@ -2472,13 +2634,11 @@ impl SessionState {
         if approved_epoch == Some(self.epoch) {
             return None;
         }
-        match self.descriptor.inbound {
-            InboundPolicy::Accept => None,
-            InboundPolicy::Hold | InboundPolicy::Refuse => Some(HELD_POLICY),
-            InboundPolicy::Auto if delivery.sender.external => Some(HELD_EXTERNAL),
-            InboundPolicy::Auto if self.same_cohort(&delivery.sender) => None,
-            InboundPolicy::Auto => Some(HELD_COHORT),
-        }
+        policy_hold(
+            &self.descriptor.inbound,
+            &delivery.sender,
+            self.same_cohort(&delivery.sender),
+        )
     }
 
     /// Whether stored messages may be read without a cohort check: `accept`
@@ -2492,22 +2652,21 @@ impl SessionState {
         }
     }
 
-    /// Whether `auto` admits `sender` without review: both sessions share a
-    /// canonical workspace and Plan or Build mode under Ask permissions. A
-    /// script runs outside every session, so it never qualifies.
     fn same_cohort(&self, sender: &Sender) -> bool {
-        !sender.external
-            && matches!(
-                (&sender.mode, WireMode::from(&self.descriptor.mode)),
-                (WireMode::Build, WireMode::Build) | (WireMode::Plan, WireMode::Plan)
-            )
-            && self.canonical_cwd.is_some()
-            && self.canonical_cwd == sender.canonical_cwd
-            && self.descriptor.permission_mode == PermissionMode::Ask
-            && sender.permission_mode == PermissionMode::Ask
+        same_cohort(
+            &self.descriptor.mode,
+            self.canonical_cwd.as_deref(),
+            &self.descriptor.permission_mode,
+            sender,
+        )
+    }
+
+    fn has_waiting(&self) -> bool {
+        self.inbox.iter().any(InboxItem::is_waiting) || self.work.offered()
     }
 
     fn reevaluate(&mut self) {
+        self.reevaluate_work();
         // Moving pending messages to held must not evict accepted messages. Admission
         // caps the combined queue at MAX_HELD so later policy tightening always fits.
         for index in 0..self.inbox.len() {
@@ -2584,6 +2743,7 @@ impl SessionInner {
     }
 
     fn close_locked(&self, state: &mut SessionState) {
+        state.close_work();
         state.open = false;
         state.epoch += 1;
         let mut released = 0;
@@ -2617,33 +2777,8 @@ impl SessionInner {
         reply_to: Option<String>,
         passive: bool,
     ) -> Result<Option<SendReceipt>, String> {
-        let sender = delivery.sender.route.target();
-        let identity = MessageIdentity {
-            sender: sender.clone(),
-            message_id: delivery.message_id.clone(),
-            recipients: Vec::new(),
-        };
-        let preferred =
-            valid_name(&delivery.message_id, MESSAGE_WORDS).then_some(delivery.message_id.as_str());
-        let alias = (!delivery.sender.external && delivery.sender.handle.is_none())
-            .then(|| state.peer_names.name(sender.as_str(), None, peer_name))
-            .transpose()?;
-        let name = state
-            .message_names
-            .name(&identity, preferred, message_name)?;
-        let reply_target = match &delivery.sender.handle {
-            Some(handle) => handle_address(handle),
-            None => alias.as_ref().map_or("", Name::as_str).to_owned(),
-        };
-        let origin = PeerMessageOrigin {
-            message_id: name.as_str().to_owned(),
-            audience: delivery.audience.clone(),
-            sender_name: delivery.sender.name.clone(),
-            sender_handle: delivery.sender.handle.clone(),
-            reply_target,
-            reply_to,
-            external: delivery.sender.external,
-        };
+        let naming = state.naming(&delivery)?;
+        let origin = naming.origin(&delivery, reply_to, None);
         let bytes = encoded
             + serde_json::to_vec(&Message::peer_observation(
                 delivery.text.clone(),
@@ -2664,12 +2799,7 @@ impl SessionInner {
         {
             return Ok(None);
         }
-        if let Some(Name::Fresh(alias)) = alias {
-            state.bind_peer(alias, sender);
-        }
-        if let Name::Fresh(name) = name {
-            state.bind_message(name, identity);
-        }
+        state.bind_names(naming);
         let reason = state.hold_reason(&delivery, None);
         let item = InboxItem {
             delivery,
@@ -2879,6 +3009,7 @@ impl PeerClaim {
         }
         state.bytes -= bytes;
         self.session.0.host.bytes.fetch_sub(bytes, Ordering::AcqRel);
+        state.work.settle_claim(self.claim_id, true);
         state.reevaluate();
         self.committed = true;
         self.session.0.host.changed.notify(usize::MAX);
@@ -2912,6 +3043,7 @@ impl Drop for PeerClaim {
                     .bytes
                     .fetch_sub(released, Ordering::AcqRel);
             }
+            state.work.settle_claim(self.claim_id, false);
             state.reevaluate();
             self.session.0.host.changed.notify(usize::MAX);
         }
@@ -2975,6 +3107,7 @@ impl HostInner {
                             inbound: state.descriptor.inbound.clone(),
                             topics: state.topics.clone(),
                             broadcasts: state.broadcasts,
+                            groups: state.groups.clone(),
                         })
                     })
                     .collect();

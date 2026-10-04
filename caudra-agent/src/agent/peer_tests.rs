@@ -168,6 +168,7 @@ mod peer_tests {
                 reply_target: self.reply_target.clone(),
                 reply_to,
                 external: false,
+                assignment: None,
             }
         }
 

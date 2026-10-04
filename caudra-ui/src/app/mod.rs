@@ -3945,7 +3945,7 @@ impl App {
         actions
     }
 
-    fn handle_cancel(&mut self) -> Vec<Action> {
+    pub(crate) fn handle_cancel(&mut self) -> Vec<Action> {
         if let Err(error) = self.poll_background_delivery() {
             self.flash(error);
         }
@@ -5172,6 +5172,7 @@ impl App {
             "/peers" => vec![Action::ListPeers],
             "/messages" => vec![Action::PeerMessages(cmd.args)],
             "/topics" => vec![Action::PeerTopics(cmd.args)],
+            "/groups" => vec![Action::PeerGroups(cmd.args)],
             "/workflows" => self.workflows_browse(),
             "/workflow" => self.execute_workflow(&cmd.args),
             "/deep-research" => {

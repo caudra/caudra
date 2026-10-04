@@ -32,6 +32,7 @@ pub mod theme;
 pub mod thinking;
 pub mod tool_ledger;
 pub mod tool_outputs;
+pub mod topics;
 pub mod usage_ledger;
 pub mod version;
 pub mod view;

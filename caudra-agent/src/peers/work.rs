@@ -1,0 +1,1288 @@
+//! The runtime side of consumer groups. A member claims work from the shared
+//! history while it idles and offers the item to its next turn as a framed
+//! assignment, renewing the lease for as long as it owns the item. A turn
+//! that ends without reporting an outcome pauses the item, so no other member
+//! repeats its effects unless a person retries it.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
+use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
+
+use caudra_config::InboundPolicy;
+use caudra_providers::{Message, PeerAssignment};
+use caudra_storage::messages::{
+    WorkFence, WorkFilter, WorkGroup, WorkItem, WorkOutcome, WorkState, Worker,
+};
+use caudra_storage::sessions::PermissionMode;
+use serde::{Deserialize, Serialize};
+use tracing::warn;
+
+use super::{
+    Delivery, PeerHost, PeerSession, Route, STALE_REVIEW, Sender, SessionInner, SessionState,
+    WireMode, lock, policy_hold, same_cohort, valid_handle, wall_ms,
+};
+use crate::{AgentMode, DoneReason};
+
+pub const MAX_MEMBERSHIPS: usize = 8;
+pub const MAX_OUTCOME_BYTES: usize = 4 * 1024;
+/// How often an owner renews its lease, well inside the lease itself.
+const HEARTBEAT: Duration = Duration::from_secs(20);
+/// How often an idle member looks for work it may take.
+const WORK_POLL: Duration = Duration::from_secs(3);
+const MAX_OWNED: usize = 16;
+const MAX_NOTICES: usize = 16;
+const MAX_APPROVALS: usize = 64;
+pub const INVALID_GROUP: &str = "Consumer group names use 1 to 32 lowercase letters, digits, and hyphens, starting with a letter or digit";
+pub const TOO_MANY_MEMBERSHIPS: &str = "A session joins at most 8 consumer groups";
+pub const NOT_MEMBER: &str = "This session is not a member of that consumer group";
+pub const INVALID_OUTCOME: &str = "A work outcome needs at most 4 KiB of text";
+pub const COMPLETION_REQUIRED: &str =
+    "Completion required: the turn ended without reporting an outcome";
+pub const PAUSED_BY_CANCEL: &str = "The user cancelled the turn working on it";
+const TURN_LIMIT: &str = "The turn working on it reached its turn limit";
+const TURN_FAILED: &str = "The turn working on it failed";
+const SESSION_CLOSED: &str = "Its session closed while working on it";
+const TOO_MANY_APPROVALS: &str = "Too many work items are approved; claim or reject some first";
+const PAUSE_UNCONFIRMED: &str = "Could not record the pause of work";
+
+/// How far this registration's assignment has come.
+#[derive(Debug, PartialEq, Eq)]
+enum Stage {
+    /// Claimed from the history, waiting for a turn to take it in.
+    Offered,
+    /// In the claim of a turn taking it in.
+    Claimed(u64),
+    /// In the conversation.
+    Started,
+    /// Its turn was cancelled or its session closed, for the reason given;
+    /// the item pauses once that turn stops.
+    Pausing(&'static str),
+}
+
+pub(super) struct OwnedWork {
+    item: WorkItem,
+    token: String,
+    stage: Stage,
+    lease_until_ms: u64,
+    sender: Sender,
+    observation: Message,
+}
+
+/// The consumer-group work of one registration.
+#[derive(Default)]
+pub(super) struct Assignments {
+    owned: Option<OwnedWork>,
+    /// Items the user let this registration take despite its inbound policy,
+    /// with the epoch each approval holds for.
+    approved: HashMap<String, u64>,
+    notices: VecDeque<WorkNotice>,
+    acquiring: bool,
+    polled: Option<Instant>,
+}
+
+/// What became of this session's work, for its person rather than its model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkNotice {
+    pub text: String,
+    /// The turn working on the item should stop: another member may take the
+    /// item over.
+    pub stop: bool,
+}
+
+/// What a person may do to a work item, whichever member it was queued for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkAction {
+    /// Queues a paused, failed, or cancelled item again with fresh attempts.
+    Retry,
+    /// Holds a queued item until a person retries it.
+    Pause,
+    /// Gives up on an item no member is working on.
+    Cancel,
+}
+
+/// Work this session holds or paused, as its model sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssignedWork {
+    pub work: String,
+    pub group: String,
+    pub state: String,
+    pub attempt: u32,
+    pub max_attempts: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    pub publisher: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+}
+
+impl From<&WorkItem> for AssignedWork {
+    fn from(item: &WorkItem) -> Self {
+        Self {
+            work: item.name.clone(),
+            group: item.group.clone(),
+            state: item.state.as_str().into(),
+            attempt: item.attempts,
+            max_attempts: item.max_attempts,
+            topic: item.message.message.audience.topic().map(str::to_owned),
+            publisher: item.message.message.sender.name.clone(),
+            reason: item.reason.clone(),
+            result: item.result.clone(),
+        }
+    }
+}
+
+/// A work item as a person's retry, pause, or cancellation left it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedWork {
+    pub item: AssignedWork,
+    /// A retried item had claims before, so its next member may repeat
+    /// effects those claims already had.
+    pub repeats_claims: bool,
+}
+
+/// What decides, outside the session lock, whether this registration may
+/// take an item.
+struct Admission {
+    route: Route,
+    inbound: InboundPolicy,
+    mode: AgentMode,
+    canonical_cwd: Option<PathBuf>,
+    permission_mode: PermissionMode,
+    approved: HashSet<String>,
+}
+
+impl Admission {
+    fn admits(&self, item: &WorkItem) -> bool {
+        Delivery::from_history(item.message.clone(), &self.route).is_some_and(|delivery| {
+            let sender = &delivery.sender;
+            sender.mode != WireMode::ReadOnly
+                && (self.approved.contains(&item.name)
+                    || policy_hold(
+                        &self.inbound,
+                        sender,
+                        same_cohort(
+                            &self.mode,
+                            self.canonical_cwd.as_deref(),
+                            &self.permission_mode,
+                            sender,
+                        ),
+                    )
+                    .is_none())
+        })
+    }
+}
+
+impl Assignments {
+    /// Whether an item waits for a turn to take it in.
+    pub(super) fn offered(&self) -> bool {
+        self.owned
+            .as_ref()
+            .is_some_and(|work| work.stage == Stage::Offered)
+    }
+
+    /// Puts offered work in claim `claim_id` and returns its framed assignment.
+    pub(super) fn claim(&mut self, claim_id: u64) -> Option<Message> {
+        let work = self
+            .owned
+            .as_mut()
+            .filter(|work| work.stage == Stage::Offered)?;
+        work.stage = Stage::Claimed(claim_id);
+        Some(work.observation.clone())
+    }
+
+    /// Settles the work in claim `claim_id`: in the conversation once
+    /// `taken`, else offered again.
+    pub(super) fn settle_claim(&mut self, claim_id: u64, taken: bool) {
+        if let Some(work) = self
+            .owned
+            .as_mut()
+            .filter(|work| work.stage == Stage::Claimed(claim_id))
+        {
+            work.stage = if taken {
+                Stage::Started
+            } else {
+                Stage::Offered
+            };
+        }
+    }
+
+    fn owns(&self, token: &str) -> bool {
+        self.owned.as_ref().is_some_and(|work| work.token == token)
+    }
+
+    /// The name and token of the work a turn took in.
+    fn taken(&self) -> Option<(String, String)> {
+        self.owned
+            .as_ref()
+            .filter(|work| work.stage != Stage::Offered)
+            .map(|work| (work.item.name.clone(), work.token.clone()))
+    }
+
+    fn notify(&mut self, text: String, stop: bool) {
+        if self.notices.len() == MAX_NOTICES {
+            self.notices.pop_front();
+        }
+        self.notices.push_back(WorkNotice { text, stop });
+    }
+}
+
+impl SessionState {
+    /// Whether this registration may look for work now.
+    fn can_take_work(&self) -> bool {
+        self.open
+            && !self.groups.is_empty()
+            && self.work.owned.is_none()
+            && self.reports_work()
+            && self.approval_blocker().is_none()
+    }
+
+    /// Whether this registration's agent may report how work went, which a
+    /// read-only one may not, so it would only stall the items it took.
+    fn reports_work(&self) -> bool {
+        !matches!(self.descriptor.mode, AgentMode::ReadOnly)
+    }
+
+    /// Whether this registration may take the item `work` from `sender`, as
+    /// its inbound policy and approvals stand.
+    fn admits_work(&self, work: &str, sender: &Sender) -> bool {
+        self.approval_blocker().is_none()
+            && self.reports_work()
+            && sender.mode != WireMode::ReadOnly
+            && (self.work.approved.get(work) == Some(&self.epoch)
+                || policy_hold(&self.descriptor.inbound, sender, self.same_cohort(sender))
+                    .is_none())
+    }
+
+    fn admission(&self, route: &Route) -> Admission {
+        Admission {
+            route: route.clone(),
+            inbound: self.descriptor.inbound.clone(),
+            mode: self.descriptor.mode.clone(),
+            canonical_cwd: self.canonical_cwd.clone(),
+            permission_mode: self.descriptor.permission_mode.clone(),
+            approved: self
+                .work
+                .approved
+                .iter()
+                .filter(|(_, epoch)| **epoch == self.epoch)
+                .map(|(work, _)| work.clone())
+                .collect(),
+        }
+    }
+
+    /// Returns offered work this registration may no longer take to the
+    /// queue, so another member may take it.
+    pub(super) fn reevaluate_work(&mut self) {
+        let release = self.work.owned.as_ref().is_some_and(|work| {
+            work.stage == Stage::Offered
+                && (!self.open
+                    || !self.groups.contains(&work.item.group)
+                    || !self.admits_work(&work.item.name, &work.sender))
+        });
+        if release {
+            self.release_offered();
+        }
+    }
+
+    /// Returns offered work no turn took in to the queue without spending
+    /// one of its attempts.
+    fn release_offered(&mut self) {
+        if let Some(work) = self.work.owned.take_if(|work| work.stage == Stage::Offered) {
+            let OwnedWork { item, token, .. } = work;
+            self.history
+                .report(move |log| log.release_work(&item.name, &token, wall_ms()));
+        }
+    }
+
+    /// Settles the work of a registration that is closing: offered work
+    /// returns to the queue, and work a turn took in pauses, keeping its
+    /// lease while that turn may still run.
+    pub(super) fn close_work(&mut self) {
+        self.release_offered();
+        let busy = self.descriptor.busy;
+        let Some(work) = self
+            .work
+            .owned
+            .as_mut()
+            .filter(|work| matches!(work.stage, Stage::Claimed(_) | Stage::Started))
+        else {
+            return;
+        };
+        let (name, token) = (work.item.name.clone(), work.token.clone());
+        if busy {
+            work.stage = Stage::Pausing(SESSION_CLOSED);
+        } else {
+            self.work.owned = None;
+        }
+        self.history.report(move |log| {
+            log.pause_work(&name, &token, !busy, SESSION_CLOSED, wall_ms())
+                .map(drop)
+        });
+    }
+}
+
+/// Validates a consumer group name, which follows the messaging-name grammar.
+pub fn parse_group(value: &str) -> Result<String, String> {
+    if valid_handle(value) {
+        Ok(value.to_owned())
+    } else {
+        Err(INVALID_GROUP.into())
+    }
+}
+
+pub(super) fn check_memberships(groups: &[String]) -> Result<(), String> {
+    if groups.len() > MAX_MEMBERSHIPS {
+        return Err(TOO_MANY_MEMBERSHIPS.into());
+    }
+    let unique: HashSet<_> = groups.iter().collect();
+    if unique.len() != groups.len() || !groups.iter().all(|group| valid_handle(group)) {
+        return Err(INVALID_GROUP.into());
+    }
+    Ok(())
+}
+
+pub(super) fn valid_memberships(groups: &[String]) -> bool {
+    check_memberships(groups).is_ok()
+}
+
+fn check_outcome(outcome: &WorkOutcome) -> Result<(), String> {
+    let text = match outcome {
+        WorkOutcome::Completed(summary) => summary.as_deref().unwrap_or_default(),
+        WorkOutcome::Retry(reason) | WorkOutcome::Failed(reason) => reason,
+    };
+    if text.len() > MAX_OUTCOME_BYTES {
+        return Err(INVALID_OUTCOME.into());
+    }
+    Ok(())
+}
+
+/// Why a turn that took work in ended without reporting an outcome.
+/// `ending` is `None` when the turn failed.
+fn pause_reason(stage: &Stage, ending: Option<DoneReason>) -> &'static str {
+    match (stage, ending) {
+        (Stage::Pausing(reason), _) => reason,
+        (_, Some(DoneReason::Cancelled)) => PAUSED_BY_CANCEL,
+        (_, Some(DoneReason::EndTurn | DoneReason::MaxTokens)) => COMPLETION_REQUIRED,
+        (_, Some(DoneReason::MaxTurns)) => TURN_LIMIT,
+        (_, None) => TURN_FAILED,
+    }
+}
+
+/// Renews the lease of the work `token` claimed while `session` owns it.
+fn heartbeat(session: Weak<SessionInner>, token: String) {
+    smol::spawn(async move {
+        loop {
+            smol::Timer::after(HEARTBEAT).await;
+            let Some(session) = session.upgrade() else {
+                return;
+            };
+            if !PeerSession(session).renew_work(&token).await {
+                return;
+            }
+        }
+    })
+    .detach();
+}
+
+impl PeerSession {
+    /// The consumer groups this session takes work from.
+    pub fn groups(&self) -> Vec<String> {
+        lock(&self.0.state).groups.clone()
+    }
+
+    /// Joins the existing consumer group `name`, under the policy its creator
+    /// set. A missing group is an error rather than an empty group.
+    pub async fn join_group(&self, name: &str) -> Result<(), String> {
+        let name = parse_group(name)?;
+        {
+            let state = lock(&self.0.state);
+            state.ensure_open()?;
+            if state.groups.contains(&name) {
+                return Ok(());
+            }
+            if state.groups.len() >= MAX_MEMBERSHIPS {
+                return Err(TOO_MANY_MEMBERSHIPS.into());
+            }
+        }
+        let group = name.clone();
+        self.0
+            .host
+            .history
+            .query(move |log| log.group(&group).map(drop))
+            .await?;
+        let mut state = lock(&self.0.state);
+        state.ensure_open()?;
+        if !state.groups.contains(&name) {
+            if state.groups.len() >= MAX_MEMBERSHIPS {
+                return Err(TOO_MANY_MEMBERSHIPS.into());
+            }
+            state.groups.push(name);
+            state.work.polled = None;
+        }
+        self.0.host.changed.notify(usize::MAX);
+        Ok(())
+    }
+
+    /// Stops taking new work from `name`. Work a turn already took in stays
+    /// this session's until it reports an outcome.
+    pub fn leave_group(&self, name: &str) -> Result<(), String> {
+        let mut state = lock(&self.0.state);
+        state.ensure_open()?;
+        if !state.groups.iter().any(|group| group == name) {
+            return Err(NOT_MEMBER.into());
+        }
+        state.groups.retain(|group| group != name);
+        state.reevaluate_work();
+        self.0.host.changed.notify(usize::MAX);
+        Ok(())
+    }
+
+    /// Looks for work in the background, at most every `WORK_POLL`, while
+    /// this session has room for an assignment. Claimed work then waits for
+    /// a turn as a message does.
+    pub fn poll_work(&self) {
+        let now = Instant::now();
+        {
+            let mut state = lock(&self.0.state);
+            if state.work.acquiring
+                || !state.can_take_work()
+                || state
+                    .work
+                    .polled
+                    .is_some_and(|at| now.saturating_duration_since(at) < WORK_POLL)
+            {
+                return;
+            }
+            state.work.acquiring = true;
+            state.work.polled = Some(now);
+        }
+        let session = self.clone();
+        smol::spawn(async move {
+            if let Err(error) = session.acquire_work().await {
+                warn!(%error, "claiming consumer group work failed");
+            }
+            lock(&session.0.state).work.acquiring = false;
+        })
+        .detach();
+    }
+
+    /// Returns work no turn took in to the queue, for a session that cannot
+    /// start a turn for it now, so it never holds an item it is not working on.
+    pub fn release_offered_work(&self) {
+        lock(&self.0.state).release_offered();
+    }
+
+    /// Claims the oldest item of this session's groups that it may take, and
+    /// offers it to the next turn. False when there was none to take or the
+    /// session cannot take work now.
+    pub async fn acquire_work(&self) -> Result<bool, String> {
+        let (worker, groups, admission) = {
+            let state = lock(&self.0.state);
+            if !state.can_take_work() {
+                return Ok(false);
+            }
+            let worker = Worker {
+                session: self.session_id().to_string(),
+                route: self.0.route.target(),
+                name: Some(state.descriptor.name.clone()),
+                handle: state.claimed_handle(),
+            };
+            (worker, state.groups.clone(), state.admission(&self.0.route))
+        };
+        let claimed = self
+            .0
+            .host
+            .history
+            .query(move |log| {
+                log.claim_work(&worker, &groups, wall_ms(), |item| admission.admits(item))
+            })
+            .await?;
+        let Some(assignment) = claimed else {
+            return Ok(false);
+        };
+        let (item, token) = (assignment.work, assignment.token);
+        let mut state = lock(&self.0.state);
+        let delivery =
+            Delivery::from_history(item.message.clone(), &self.0.route).filter(|delivery| {
+                state.can_take_work()
+                    && state.groups.contains(&item.group)
+                    && state.admits_work(&item.name, &delivery.sender)
+            });
+        let naming = delivery.map(|delivery| (state.naming(&delivery), delivery));
+        let Some((Ok(naming), delivery)) = naming else {
+            let (name, release) = (item.name.clone(), token.clone());
+            state
+                .history
+                .report(move |log| log.release_work(&name, &release, wall_ms()));
+            return Ok(false);
+        };
+        let origin = naming.origin(
+            &delivery,
+            None,
+            Some(PeerAssignment {
+                group: item.group.clone(),
+                work: item.name.clone(),
+                attempt: item.attempts,
+                max_attempts: item.max_attempts,
+            }),
+        );
+        state.bind_names(naming);
+        state.work.owned = Some(OwnedWork {
+            lease_until_ms: item.lease_until_ms.unwrap_or_default(),
+            observation: Message::peer_observation(delivery.text, origin),
+            sender: delivery.sender,
+            item,
+            token: token.clone(),
+            stage: Stage::Offered,
+        });
+        drop(state);
+        heartbeat(Arc::downgrade(&self.0), token);
+        self.0.host.changed.notify(usize::MAX);
+        Ok(true)
+    }
+
+    /// Extends the lease of the work `token` claimed. False once this
+    /// registration closed or no longer owns that work, which ends its
+    /// heartbeat: closing paused the work, so its lease may lapse.
+    async fn renew_work(&self, token: &str) -> bool {
+        let name = {
+            let state = lock(&self.0.state);
+            match &state.work.owned {
+                Some(work) if state.open && work.token == token => work.item.name.clone(),
+                _ => return false,
+            }
+        };
+        let renewal = {
+            let (name, token) = (name.clone(), token.to_owned());
+            self.0
+                .host
+                .history
+                .decide(move |log| log.renew_work(&name, &token, wall_ms()))
+                .await
+        };
+        let mut state = lock(&self.0.state);
+        let Some(work) = state.work.owned.as_mut().filter(|work| work.token == token) else {
+            return false;
+        };
+        let lost = match renewal {
+            Ok(Ok(until)) => {
+                work.lease_until_ms = until;
+                return true;
+            }
+            Ok(Err(refusal)) => refusal.to_string(),
+            Err(error) if wall_ms() < work.lease_until_ms => {
+                warn!(%error, work = %name, "renewing a work lease failed");
+                return true;
+            }
+            Err(error) => error,
+        };
+        let stop = work.stage != Stage::Offered;
+        let group = work.item.group.clone();
+        state.work.owned = None;
+        if stop {
+            state.work.notify(
+                format!(
+                    "Lost work {name} of group {group}: {lost}. Stopping the turn working on it."
+                ),
+                true,
+            );
+        }
+        self.0.host.changed.notify(usize::MAX);
+        false
+    }
+
+    /// Reports how the work named `work` went: the item a turn of this
+    /// session took in, or one it owned before it paused. Repeating a
+    /// completion is harmless.
+    pub async fn report_work(
+        &self,
+        work: &str,
+        outcome: WorkOutcome,
+    ) -> Result<AssignedWork, String> {
+        check_outcome(&outcome)?;
+        let (fence, token) = {
+            let state = lock(&self.0.state);
+            state.ensure_open()?;
+            match state.work.taken().filter(|(name, _)| name == work) {
+                Some((_, token)) => (WorkFence::Lease(token.clone()), Some(token)),
+                None => (WorkFence::Owner(self.session_id().to_string()), None),
+            }
+        };
+        let name = work.to_owned();
+        let reported = self
+            .0
+            .host
+            .history
+            .decide(move |log| log.finish_work(&name, &fence, &outcome, wall_ms()))
+            .await?;
+        if let Some(token) = token {
+            let mut state = lock(&self.0.state);
+            if state.work.owns(&token) {
+                state.work.owned = None;
+                self.0.host.changed.notify(usize::MAX);
+            }
+        }
+        reported
+            .map(|item| AssignedWork::from(&item))
+            .map_err(|refusal| refusal.to_string())
+    }
+
+    /// The work a turn of this session took in, then the paused work it last
+    /// owned, newest first.
+    pub async fn owned_work(&self) -> Result<Vec<AssignedWork>, String> {
+        let current = {
+            let state = lock(&self.0.state);
+            state.ensure_open()?;
+            state.work.taken().map(|(name, _)| name)
+        };
+        let filter = WorkFilter {
+            owner: Some(self.session_id().to_string()),
+            states: vec![WorkState::Leased, WorkState::Pausing, WorkState::Paused],
+            ..WorkFilter::default()
+        };
+        let items = self
+            .0
+            .host
+            .history
+            .query(move |log| log.work(&filter, None, MAX_OWNED))
+            .await?;
+        let mut owned: Vec<_> = items
+            .iter()
+            .filter(|item| item.state == WorkState::Paused || current.as_ref() == Some(&item.name))
+            .map(AssignedWork::from)
+            .collect();
+        owned.sort_by_key(|work| current.as_ref() != Some(&work.work));
+        Ok(owned)
+    }
+
+    /// Records, before a cancellation reaches the turn working on this
+    /// session's work, that the item pauses rather than returning to the
+    /// queue. Offered work no turn took in returns to the queue instead.
+    pub async fn request_pause(&self) -> Result<(), String> {
+        let (name, token) = {
+            let mut state = lock(&self.0.state);
+            state.release_offered();
+            let Some(work) = state
+                .work
+                .owned
+                .as_mut()
+                .filter(|work| matches!(work.stage, Stage::Claimed(_) | Stage::Started))
+            else {
+                return Ok(());
+            };
+            work.stage = Stage::Pausing(PAUSED_BY_CANCEL);
+            (work.item.name.clone(), work.token.clone())
+        };
+        let pause = {
+            let (name, token) = (name.clone(), token.clone());
+            self.0
+                .host
+                .history
+                .decide(move |log| {
+                    log.pause_work(&name, &token, false, PAUSED_BY_CANCEL, wall_ms())
+                })
+                .await
+        };
+        match pause {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(refusal)) => {
+                let mut state = lock(&self.0.state);
+                if state.work.owns(&token) {
+                    state.work.owned = None;
+                }
+                Err(refusal.to_string())
+            }
+            Err(error) => Err(format!("{PAUSE_UNCONFIRMED} {name}: {error}")),
+        }
+    }
+
+    /// Pauses the work the ended turn took in without reporting an outcome,
+    /// so it waits for a person instead of another member. `ending` is
+    /// `None` when the turn failed.
+    pub async fn settle_work(&self, ending: Option<DoneReason>) {
+        let taken = lock(&self.0.state)
+            .work
+            .owned
+            .as_ref()
+            .filter(|work| work.stage != Stage::Offered)
+            .map(|work| {
+                (
+                    work.item.name.clone(),
+                    work.token.clone(),
+                    pause_reason(&work.stage, ending),
+                )
+            });
+        let Some((name, token, reason)) = taken else {
+            return;
+        };
+        let pause = {
+            let (name, token) = (name.clone(), token.clone());
+            self.0
+                .host
+                .history
+                .decide(move |log| log.pause_work(&name, &token, true, reason, wall_ms()))
+                .await
+        };
+        let mut state = lock(&self.0.state);
+        if state.work.owns(&token) {
+            state.work.owned = None;
+        }
+        let text = match pause {
+            Ok(Ok(_)) => format!("Paused work {name}: {reason}. /groups to retry or cancel it"),
+            Ok(Err(refusal)) => refusal.to_string(),
+            Err(error) => format!(
+                "{PAUSE_UNCONFIRMED} {name}: {error}; it returns to the queue once its lease lapses"
+            ),
+        };
+        state.work.notify(text, false);
+        self.0.host.changed.notify(usize::MAX);
+    }
+
+    /// Lets this registration take the item `work` despite its inbound
+    /// policy, for as long as the policy `epoch` a person reviewed holds.
+    /// Approval reserves nothing: another member may take the item first.
+    pub fn approve_work(&self, work: &str, epoch: u64) -> Result<(), String> {
+        let mut state = lock(&self.0.state);
+        state.ensure_open()?;
+        if let Some(blocker) = state.approval_blocker() {
+            return Err(blocker.into());
+        }
+        if epoch != state.epoch {
+            return Err(STALE_REVIEW.into());
+        }
+        let current = state.epoch;
+        state
+            .work
+            .approved
+            .retain(|_, approved| *approved == current);
+        if state.work.approved.len() >= MAX_APPROVALS {
+            return Err(TOO_MANY_APPROVALS.into());
+        }
+        state.work.approved.insert(work.to_owned(), current);
+        state.work.polled = None;
+        self.0.host.changed.notify(usize::MAX);
+        Ok(())
+    }
+
+    /// The policy epoch an approval must name, which any change to this
+    /// session's mode, workspace, or inbound policy moves on.
+    pub fn work_epoch(&self) -> u64 {
+        lock(&self.0.state).epoch
+    }
+
+    pub fn take_work_notices(&self) -> Vec<WorkNotice> {
+        lock(&self.0.state).work.notices.drain(..).collect()
+    }
+
+    /// Every consumer group, for a person choosing what to join.
+    pub async fn consumer_groups(&self) -> Result<Vec<WorkGroup>, String> {
+        self.0.host.history.query(|log| log.groups()).await
+    }
+
+    /// Retries, pauses, or cancels the item `work` for this session's person,
+    /// whichever member it was queued for.
+    pub async fn manage_work(&self, work: &str, action: WorkAction) -> Result<ManagedWork, String> {
+        let name = work.to_owned();
+        let (item, repeats_claims) = self
+            .0
+            .host
+            .history
+            .query(move |log| match action {
+                WorkAction::Retry => {
+                    let claimed = !log.work_detail(&name)?.attempts.is_empty();
+                    Ok((log.retry_work(&name, wall_ms())?, claimed))
+                }
+                WorkAction::Pause => Ok((log.hold_work(&name, wall_ms())?, false)),
+                WorkAction::Cancel => Ok((log.cancel_work(&name, wall_ms())?, false)),
+            })
+            .await?;
+        lock(&self.0.state).work.polled = None;
+        Ok(ManagedWork {
+            item: AssignedWork::from(&item),
+            repeats_claims,
+        })
+    }
+}
+
+impl PeerHost {
+    /// Fails unless every group in `groups` exists, so a session never waits
+    /// on a group nobody created.
+    pub async fn check_groups(&self, groups: &[String]) -> Result<(), String> {
+        let groups = groups.to_vec();
+        self.0
+            .history
+            .query(move |log| {
+                groups
+                    .iter()
+                    .try_for_each(|group| log.group(group).map(drop))
+            })
+            .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use caudra_config::{InboundPolicy, MessagingConfig};
+    use caudra_providers::{PeerAssignment, PeerAudience};
+    use caudra_storage::messages::{
+        DEFAULT_MAX_ATTEMPTS, GroupPolicy, LEASE_MS, WorkItem, WorkOutcome, WorkState, Worker,
+    };
+    use caudra_storage::sessions::StoredPeerControls;
+    use tempfile::TempDir;
+    use test_case::test_case;
+
+    use super::{
+        COMPLETION_REQUIRED, INVALID_GROUP, MAX_MEMBERSHIPS, NOT_MEMBER, PAUSED_BY_CANCEL,
+        SESSION_CLOSED, TOO_MANY_MEMBERSHIPS, TURN_FAILED, TURN_LIMIT, WorkAction,
+        check_memberships,
+    };
+    use crate::peers::tests::{descriptor, directory, host};
+    use crate::peers::{
+        PeerDescriptor, PeerHost, PeerSession, REFUSED_POLICY, STALE_REVIEW, lock, wall_ms,
+    };
+    use crate::{AgentMode, DoneReason};
+
+    const GROUP: &str = "ci-triage";
+    const OTHER_GROUP: &str = "deploy-watch";
+    const MISSING_GROUP: &str = "no-such-group";
+    const MALFORMED_GROUP: &str = "CI_Triage";
+    const PATTERN: &str = "ci.*";
+    const TOPIC: &str = "ci.failures";
+    const TEXT: &str = "The nightly build failed";
+    const REQUEST_ID: &str = "nightly-failure";
+    const SUMMARY: &str = "Fixed the flaky linker step";
+    const FAILURE: &str = "The runner ran out of disk";
+    const LEASED: &str = "leased";
+    const COMPLETED: &str = "completed";
+    const LOST: &str = "Lost work";
+    const RECOVERY: &str = "lease-recovery";
+
+    async fn grouped() -> (TempDir, PeerHost, PeerSession) {
+        let directory = directory();
+        let host = host(directory.path());
+        let publisher = host
+            .register(descriptor(directory.path(), InboundPolicy::Auto))
+            .unwrap();
+        create_group(&publisher, GROUP).await;
+        (directory, host, publisher)
+    }
+
+    async fn create_group(session: &PeerSession, name: &str) {
+        let name = name.to_owned();
+        session
+            .0
+            .host
+            .history
+            .query(move |log| {
+                log.create_group(
+                    &name,
+                    &[PATTERN.to_owned()],
+                    &GroupPolicy::default(),
+                    wall_ms(),
+                )
+                .map(drop)
+            })
+            .await
+            .unwrap();
+    }
+
+    fn member(host: &PeerHost, cwd: &Path, inbound: InboundPolicy) -> PeerSession {
+        host.register_with_controls(
+            descriptor(cwd, inbound),
+            &MessagingConfig::default(),
+            Some(StoredPeerControls {
+                groups: vec![GROUP.into()],
+                ..StoredPeerControls::default()
+            }),
+        )
+        .unwrap()
+    }
+
+    async fn publish(publisher: &PeerSession) -> String {
+        let audience = PeerAudience::Topic {
+            topic: TOPIC.into(),
+        };
+        let receipt = publisher.publish(audience, TEXT, REQUEST_ID).await.unwrap();
+        receipt.queued[0].work.clone()
+    }
+
+    async fn item(session: &PeerSession, work: &str) -> WorkItem {
+        let work = work.to_owned();
+        session
+            .0
+            .host
+            .history
+            .query(move |log| log.work_item(&work))
+            .await
+            .unwrap()
+    }
+
+    /// Claims the oldest item and takes it into a turn, as a wake does.
+    async fn start(worker: &PeerSession) {
+        assert!(worker.acquire_work().await.unwrap());
+        worker.claim_wake().unwrap().commit();
+    }
+
+    #[test]
+    fn claimed_work_wakes_one_turn_and_stays_owned_until_reported() {
+        smol::block_on(async {
+            let (directory, host, publisher) = grouped().await;
+            let worker = member(&host, directory.path(), InboundPolicy::Auto);
+            let work = publish(&publisher).await;
+            assert!(!worker.has_pending());
+            assert!(worker.acquire_work().await.unwrap());
+            assert!(worker.has_pending());
+            assert!(worker.claim().is_none());
+            drop(worker.claim_wake().unwrap());
+            let claim = worker.claim_wake().unwrap();
+            let origin = claim.messages()[0].peer_event.clone().unwrap();
+            assert_eq!(
+                origin.assignment,
+                Some(PeerAssignment {
+                    group: GROUP.into(),
+                    work: work.clone(),
+                    attempt: 1,
+                    max_attempts: DEFAULT_MAX_ATTEMPTS,
+                })
+            );
+            claim.commit();
+            assert!(!worker.has_pending());
+            assert!(!worker.acquire_work().await.unwrap());
+            let owned = worker.owned_work().await.unwrap();
+            assert_eq!(owned.len(), 1);
+            assert_eq!(
+                (owned[0].work.as_str(), owned[0].state.as_str()),
+                (work.as_str(), LEASED)
+            );
+            let outcome = WorkOutcome::Completed(Some(SUMMARY.into()));
+            let reported = worker.report_work(&work, outcome.clone()).await.unwrap();
+            assert_eq!(
+                (reported.state.as_str(), reported.result.as_deref()),
+                (COMPLETED, Some(SUMMARY))
+            );
+            assert_eq!(worker.report_work(&work, outcome).await.unwrap(), reported);
+            assert!(worker.owned_work().await.unwrap().is_empty());
+        });
+    }
+
+    #[test_case(Some(DoneReason::EndTurn), COMPLETION_REQUIRED; "end_turn")]
+    #[test_case(Some(DoneReason::MaxTokens), COMPLETION_REQUIRED; "max_tokens")]
+    #[test_case(Some(DoneReason::MaxTurns), TURN_LIMIT; "turn_limit")]
+    #[test_case(Some(DoneReason::Cancelled), PAUSED_BY_CANCEL; "cancelled")]
+    #[test_case(None, TURN_FAILED; "failed")]
+    fn turns_ending_without_an_outcome_pause_their_work(ending: Option<DoneReason>, reason: &str) {
+        smol::block_on(async {
+            let (directory, host, publisher) = grouped().await;
+            let worker = member(&host, directory.path(), InboundPolicy::Auto);
+            let work = publish(&publisher).await;
+            start(&worker).await;
+            worker.settle_work(ending).await;
+            let paused = item(&publisher, &work).await;
+            assert_eq!(
+                (paused.state, paused.reason.as_deref()),
+                (WorkState::Paused, Some(reason))
+            );
+            let notices = worker.take_work_notices();
+            assert!(
+                notices.len() == 1 && notices[0].text.contains(reason) && !notices[0].stop,
+                "{notices:?}"
+            );
+            let other = member(&host, directory.path(), InboundPolicy::Auto);
+            assert!(!other.acquire_work().await.unwrap());
+            let reported = worker
+                .report_work(&work, WorkOutcome::Completed(None))
+                .await
+                .unwrap();
+            assert_eq!(reported.state, COMPLETED);
+        });
+    }
+
+    #[test]
+    fn cancelling_pauses_taken_work_and_returns_offered_work_to_the_queue() {
+        smol::block_on(async {
+            let (directory, host, publisher) = grouped().await;
+            let worker = member(&host, directory.path(), InboundPolicy::Auto);
+            let work = publish(&publisher).await;
+            assert!(worker.acquire_work().await.unwrap());
+            worker.request_pause().await.unwrap();
+            let queued = item(&publisher, &work).await;
+            assert_eq!((queued.state, queued.attempts), (WorkState::Pending, 0));
+            start(&worker).await;
+            worker.request_pause().await.unwrap();
+            assert_eq!(item(&publisher, &work).await.state, WorkState::Pausing);
+            let other = member(&host, directory.path(), InboundPolicy::Auto);
+            assert!(!other.acquire_work().await.unwrap());
+            worker.settle_work(Some(DoneReason::EndTurn)).await;
+            let paused = item(&publisher, &work).await;
+            assert_eq!(
+                (paused.state, paused.reason.as_deref()),
+                (WorkState::Paused, Some(PAUSED_BY_CANCEL))
+            );
+            assert!(!other.acquire_work().await.unwrap());
+        });
+    }
+
+    #[test_case(false, WorkState::Paused; "idle")]
+    #[test_case(true, WorkState::Pausing; "busy")]
+    fn closing_pauses_taken_work_for_the_closed_session(busy: bool, closed: WorkState) {
+        smol::block_on(async {
+            let (directory, host, publisher) = grouped().await;
+            let worker = member(&host, directory.path(), InboundPolicy::Auto);
+            let work = publish(&publisher).await;
+            start(&worker).await;
+            worker
+                .update(PeerDescriptor {
+                    busy,
+                    ..worker.descriptor()
+                })
+                .unwrap();
+            worker.close();
+            let item_after_close = item(&publisher, &work).await;
+            assert_eq!(
+                (item_after_close.state, item_after_close.reason.as_deref()),
+                (closed, Some(SESSION_CLOSED))
+            );
+            worker.settle_work(Some(DoneReason::Cancelled)).await;
+            let paused = item(&publisher, &work).await;
+            assert_eq!(
+                (paused.state, paused.reason.as_deref()),
+                (WorkState::Paused, Some(SESSION_CLOSED))
+            );
+        });
+    }
+
+    #[test_case(|worker: &PeerSession| worker.leave_group(GROUP).unwrap(); "left_the_group")]
+    #[test_case(|worker: &PeerSession| worker.set_inbound(InboundPolicy::Hold).unwrap(); "held_by_policy")]
+    #[test_case(PeerSession::suppress_wakes; "wakes_suppressed")]
+    #[test_case(PeerSession::close; "closed")]
+    fn offered_work_returns_to_the_queue_once_its_member_may_not_take_it(change: fn(&PeerSession)) {
+        smol::block_on(async {
+            let (directory, host, publisher) = grouped().await;
+            let worker = member(&host, directory.path(), InboundPolicy::Auto);
+            let work = publish(&publisher).await;
+            assert!(worker.acquire_work().await.unwrap());
+            change(&worker);
+            assert!(!worker.has_pending());
+            let other = member(&host, directory.path(), InboundPolicy::Auto);
+            assert!(other.acquire_work().await.unwrap());
+            assert_eq!(item(&publisher, &work).await.attempts, 1);
+        });
+    }
+
+    #[test_case(InboundPolicy::Accept, true; "accept")]
+    #[test_case(InboundPolicy::Auto, true; "auto_in_cohort")]
+    #[test_case(InboundPolicy::Hold, false; "hold")]
+    #[test_case(InboundPolicy::Refuse, false; "refuse")]
+    fn members_take_only_work_their_inbound_policy_admits(inbound: InboundPolicy, takes: bool) {
+        smol::block_on(async {
+            let (directory, host, publisher) = grouped().await;
+            let worker = member(&host, directory.path(), inbound);
+            publish(&publisher).await;
+            assert_eq!(worker.acquire_work().await.unwrap(), takes);
+        });
+    }
+
+    #[test]
+    fn approval_admits_held_work_only_for_the_reviewed_epoch() {
+        smol::block_on(async {
+            let (directory, host, publisher) = grouped().await;
+            let worker = member(&host, directory.path(), InboundPolicy::Hold);
+            let work = publish(&publisher).await;
+            let epoch = worker.work_epoch();
+            assert_eq!(
+                worker.approve_work(&work, epoch + 1).unwrap_err(),
+                STALE_REVIEW
+            );
+            worker.approve_work(&work, epoch).unwrap();
+            worker.set_inbound(InboundPolicy::Hold).unwrap();
+            assert!(!worker.acquire_work().await.unwrap());
+            worker.approve_work(&work, worker.work_epoch()).unwrap();
+            assert!(worker.acquire_work().await.unwrap());
+            worker.set_inbound(InboundPolicy::Refuse).unwrap();
+            assert_eq!(
+                worker.approve_work(&work, worker.work_epoch()).unwrap_err(),
+                REFUSED_POLICY
+            );
+        });
+    }
+
+    #[test]
+    fn people_manage_work_of_groups_that_exist() {
+        smol::block_on(async {
+            let (directory, host, publisher) = grouped().await;
+            let worker = member(&host, directory.path(), InboundPolicy::Auto);
+            host.check_groups(&[GROUP.into()]).await.unwrap();
+            let missing = host
+                .check_groups(&[GROUP.into(), MISSING_GROUP.into()])
+                .await
+                .unwrap_err();
+            assert!(missing.contains(MISSING_GROUP), "{missing}");
+            let groups = worker.consumer_groups().await.unwrap();
+            assert_eq!(
+                groups
+                    .iter()
+                    .map(|group| group.name.as_str())
+                    .collect::<Vec<_>>(),
+                [GROUP]
+            );
+            let work = publish(&publisher).await;
+            let paused = worker.manage_work(&work, WorkAction::Pause).await.unwrap();
+            assert_eq!(paused.item.state, WorkState::Paused.as_str());
+            assert!(!worker.acquire_work().await.unwrap());
+            let retried = worker.manage_work(&work, WorkAction::Retry).await.unwrap();
+            assert_eq!(retried.item.state, WorkState::Pending.as_str());
+            let cancelled = worker.manage_work(&work, WorkAction::Cancel).await.unwrap();
+            assert_eq!(cancelled.item.state, WorkState::Cancelled.as_str());
+            assert!(worker.manage_work(&work, WorkAction::Pause).await.is_err());
+            assert!(!worker.acquire_work().await.unwrap());
+            assert_eq!(worker.leave_group(OTHER_GROUP).unwrap_err(), NOT_MEMBER);
+        });
+    }
+
+    #[test_case(false; "held_before_any_claim")]
+    #[test_case(true; "failed_after_a_claim")]
+    fn retries_warn_only_of_claims_whose_effects_may_repeat(claimed: bool) {
+        smol::block_on(async {
+            let (directory, host, publisher) = grouped().await;
+            let worker = member(&host, directory.path(), InboundPolicy::Auto);
+            let work = publish(&publisher).await;
+            if claimed {
+                start(&worker).await;
+                worker
+                    .report_work(&work, WorkOutcome::Failed(FAILURE.into()))
+                    .await
+                    .unwrap();
+            } else {
+                worker.manage_work(&work, WorkAction::Pause).await.unwrap();
+            }
+            let retried = worker.manage_work(&work, WorkAction::Retry).await.unwrap();
+            assert_eq!(
+                (retried.item.state.as_str(), retried.repeats_claims),
+                (WorkState::Pending.as_str(), claimed)
+            );
+        });
+    }
+
+    #[test]
+    fn read_only_members_take_no_work_until_they_can_report() {
+        smol::block_on(async {
+            let (directory, host, publisher) = grouped().await;
+            let worker = member(&host, directory.path(), InboundPolicy::Accept);
+            let build = worker.descriptor();
+            worker
+                .update(PeerDescriptor {
+                    mode: AgentMode::ReadOnly,
+                    ..build.clone()
+                })
+                .unwrap();
+            publish(&publisher).await;
+            assert!(!worker.acquire_work().await.unwrap());
+            worker.update(build).unwrap();
+            assert!(worker.acquire_work().await.unwrap());
+        });
+    }
+
+    #[test]
+    fn publishers_never_take_their_own_work() {
+        smol::block_on(async {
+            let (directory, host, publisher) = grouped().await;
+            publisher.join_group(GROUP).await.unwrap();
+            publish(&publisher).await;
+            assert!(!publisher.acquire_work().await.unwrap());
+            let worker = member(&host, directory.path(), InboundPolicy::Auto);
+            assert!(worker.acquire_work().await.unwrap());
+        });
+    }
+
+    #[test]
+    fn lost_leases_stop_the_turn_and_refuse_stale_reports() {
+        smol::block_on(async {
+            let (directory, host, publisher) = grouped().await;
+            let worker = member(&host, directory.path(), InboundPolicy::Auto);
+            let work = publish(&publisher).await;
+            start(&worker).await;
+            let token = lock(&worker.0.state)
+                .work
+                .owned
+                .as_ref()
+                .unwrap()
+                .token
+                .clone();
+            assert!(worker.renew_work(&token).await);
+            let lapsed = wall_ms() + 2 * LEASE_MS;
+            let recovery = Worker {
+                session: RECOVERY.into(),
+                route: RECOVERY.into(),
+                name: None,
+                handle: None,
+            };
+            publisher
+                .0
+                .host
+                .history
+                .query(move |log| log.claim_work(&recovery, &[], lapsed, |_| false))
+                .await
+                .unwrap();
+            assert_eq!(item(&publisher, &work).await.state, WorkState::Pending);
+            assert!(!worker.renew_work(&token).await);
+            let notices = worker.take_work_notices();
+            assert!(
+                notices.len() == 1 && notices[0].stop && notices[0].text.starts_with(LOST),
+                "{notices:?}"
+            );
+            assert!(
+                worker
+                    .report_work(&work, WorkOutcome::Completed(None))
+                    .await
+                    .is_err()
+            );
+            assert!(worker.owned_work().await.unwrap().is_empty());
+        });
+    }
+
+    #[test_case(&[GROUP, OTHER_GROUP], None; "distinct_groups")]
+    #[test_case(&[GROUP, GROUP], Some(INVALID_GROUP); "duplicate")]
+    #[test_case(&[MALFORMED_GROUP], Some(INVALID_GROUP); "malformed")]
+    fn memberships_are_validated(groups: &[&str], error: Option<&str>) {
+        let groups: Vec<String> = groups.iter().copied().map(str::to_owned).collect();
+        assert_eq!(check_memberships(&groups).err().as_deref(), error);
+    }
+
+    #[test]
+    fn sessions_join_a_bounded_number_of_existing_groups() {
+        smol::block_on(async {
+            let (directory, host, publisher) = grouped().await;
+            let worker = host
+                .register(descriptor(directory.path(), InboundPolicy::Auto))
+                .unwrap();
+            let missing = worker.join_group(MISSING_GROUP).await.unwrap_err();
+            assert!(missing.contains(MISSING_GROUP), "{missing}");
+            let names: Vec<String> = (0..=MAX_MEMBERSHIPS)
+                .map(|index| format!("{OTHER_GROUP}-{index}"))
+                .collect();
+            for name in &names {
+                create_group(&publisher, name).await;
+            }
+            for name in &names[..MAX_MEMBERSHIPS] {
+                worker.join_group(name).await.unwrap();
+            }
+            assert_eq!(
+                worker
+                    .join_group(&names[MAX_MEMBERSHIPS])
+                    .await
+                    .unwrap_err(),
+                TOO_MANY_MEMBERSHIPS
+            );
+            assert_eq!(worker.controls().groups, names[..MAX_MEMBERSHIPS]);
+            assert_eq!(check_memberships(&names).unwrap_err(), TOO_MANY_MEMBERSHIPS);
+            worker.leave_group(&names[0]).unwrap();
+            worker.join_group(GROUP).await.unwrap();
+            assert!(worker.groups().iter().any(|group| group == GROUP));
+        });
+    }
+}

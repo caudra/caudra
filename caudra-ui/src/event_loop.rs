@@ -2407,6 +2407,7 @@ impl<'t> EventLoop<'t> {
         // next wake, which repaints then.
         self.emit_focus_change();
         dirty |= self.sync_peers();
+        dirty |= self.sync_peer_work();
         dirty |= self.start_mailbox_runs();
         dirty |= self.start_peer_runs();
         for runtime in &self.sessions {
@@ -3808,6 +3809,7 @@ impl<'t> EventLoop<'t> {
             Action::ListPeers => self.list_peers(idx),
             Action::PeerMessages(args) => self.peer_messages(idx, &args),
             Action::PeerTopics(args) => self.peer_topics(idx, &args),
+            Action::PeerGroups(args) => self.peer_groups(idx, &args),
             Action::PeerSubscribe(change) => self.change_peer_subscriptions(idx, change),
             Action::RefreshPeers => self.refresh_peers(idx),
             Action::ReviewPeerMessage(id) => self.review_peer_message(idx, &id),
@@ -3834,6 +3836,7 @@ impl<'t> EventLoop<'t> {
             Action::CancelAgent { run_id } => {
                 let rt = &mut self.sessions[idx];
                 rt.notifications.reset();
+                rt.pause_peer_work();
                 let _ = rt.handles.cmd_tx.try_send(AgentCommand::Cancel { run_id });
                 rt.app.stop_background_work();
             }

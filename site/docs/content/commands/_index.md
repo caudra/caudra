@@ -38,6 +38,7 @@ A command with an Experiment entry exists only while that switch is on under `[e
 | `/peers` | Browse live local messaging peers (experimental) | Main only | `cross_session_messaging` |
 | `/messages` | Review held peer messages and manage this session's inbound policy | Main only | `cross_session_messaging` |
 | `/topics` | Browse peer topic messages, or change this session's topic subscriptions | Main only | `cross_session_messaging` |
+| `/groups` | List consumer groups and this session's work, join or leave a group, or retry, pause, or cancel a work item | Main only | `cross_session_messaging` |
 | `/workflows` | Browse, trust, and launch workflows | Main only | `workflows` |
 | `/workflow` | Start a workflow, or list, pause, resume, and stop runs | Main only | `workflows` |
 | `/deep-research` | Research a question with the deep-research workflow | Main only | `workflows` |

@@ -162,8 +162,11 @@ const COMMITTED_PLAN_CALL: &str = "committed-plan-write";
 const PEER_CONTROL_PROMPT: &str = "Keep the peer controls across a reload.";
 const PEER_HANDLE: &str = "release-agent";
 const PEER_TOPIC: &str = "release.**";
+const PEER_GROUP: &str = "release-triage";
 const PEER_TOPICS_COMMAND: &str = "/topics subscribe ci.*";
 const PEER_TOPICS_ARGS: &str = "subscribe ci.*";
+const PEER_GROUPS_COMMAND: &str = "/groups join builds";
+const PEER_GROUPS_ARGS: &str = "join builds";
 const PEER_MANAGER_TITLE: &str = "Peers";
 const PEER_MANAGER_DRAFT: &str = "Preserve this unsent prompt.";
 const PEER_MANAGER_PASTE: &str = "peer filter";
@@ -5185,6 +5188,7 @@ fn main_only_commands_still_run_from_the_main_composer() {
 #[test_case("/peers", Feature::CrossSessionMessaging; "peers")]
 #[test_case("/messages", Feature::CrossSessionMessaging; "messages")]
 #[test_case("/topics", Feature::CrossSessionMessaging; "topics")]
+#[test_case("/groups", Feature::CrossSessionMessaging; "groups")]
 #[test_case("/deep-research", Feature::Workflows; "workflow_shortcut")]
 #[test_case("/sandbox", Feature::Sandboxes; "sandbox")]
 #[test_case("/decisions", Feature::DecisionEngine; "decisions")]
@@ -5206,6 +5210,8 @@ fn a_command_whose_experiment_is_off_names_the_switch(command: &str, feature: Fe
 #[test_case("/messages", |actions| matches!(actions, [Action::PeerMessages(args)] if args.is_empty()); "held")]
 #[test_case(PEER_TOPICS_COMMAND, |actions| matches!(actions, [Action::PeerTopics(args)] if args == PEER_TOPICS_ARGS); "topics")]
 #[test_case("/topics", |actions| matches!(actions, [Action::PeerTopics(args)] if args.is_empty()); "topics_browse")]
+#[test_case(PEER_GROUPS_COMMAND, |actions| matches!(actions, [Action::PeerGroups(args)] if args == PEER_GROUPS_ARGS); "groups")]
+#[test_case("/groups", |actions| matches!(actions, [Action::PeerGroups(args)] if args.is_empty()); "groups_overview")]
 fn peer_commands_leave_runtime_eligibility_to_the_event_loop(
     command: &str,
     expected: fn(&[Action]) -> bool,
@@ -10563,6 +10569,7 @@ fn stored_peer_controls() -> StoredPeerControls {
         handle: Some(PEER_HANDLE.into()),
         topics: vec![PEER_TOPIC.into()],
         broadcasts: true,
+        groups: vec![PEER_GROUP.into()],
     }
 }
 
@@ -10603,6 +10610,7 @@ fn peer_controls_survive_checkpoint_and_reload(enabled: bool) {
 #[test_case(StoredPeerControls { handle: Some(PEER_HANDLE.into()), ..StoredPeerControls::default() }, true; "messaging_name")]
 #[test_case(StoredPeerControls { topics: vec![PEER_TOPIC.into()], ..StoredPeerControls::default() }, true; "topic")]
 #[test_case(StoredPeerControls { broadcasts: true, ..StoredPeerControls::default() }, true; "broadcasts")]
+#[test_case(StoredPeerControls { groups: vec![PEER_GROUP.into()], ..StoredPeerControls::default() }, true; "group")]
 fn blank_session_is_saved_only_when_peers_can_reach_it(controls: StoredPeerControls, saved: bool) {
     let (_tmp, dir, writer, mut app) = tempdir_app();
     app.state.session_mut().meta.peer_controls = Some(controls.clone());
