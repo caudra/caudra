@@ -132,9 +132,9 @@ pub(super) fn advisories(decision: &PermissionDecision) -> Vec<PermissionAdvisor
 
 impl PermissionManager {
     pub async fn run_passive_decision<T>(&self, future: impl Future<Output = T>) -> Option<T> {
-        let revision = self.broker.revision.load(Ordering::Acquire);
-        let changed = self.broker.changed.listen();
-        if self.is_yolo() || self.broker.revision.load(Ordering::Acquire) != revision {
+        let revision = self.broker.passive_revision.load(Ordering::Acquire);
+        let changed = self.broker.passive_changed.listen();
+        if !self.passive_decision_is_current(revision) {
             return None;
         }
         let outcome = future::race(
@@ -145,11 +145,7 @@ impl PermissionManager {
             async { Some(future.await) },
         )
         .await;
-        if self.is_yolo() || self.broker.revision.load(Ordering::Acquire) != revision {
-            None
-        } else {
-            outcome
-        }
+        outcome.filter(|_| self.passive_decision_is_current(revision))
     }
 
     pub(super) async fn screen_auto_candidate(
@@ -414,9 +410,9 @@ mod tests {
         shell_prompt, shell_request, workcell_shell_subject,
     };
     use crate::permissions::{
-        AutoNote, EngineFlag, PendingRegistration, PermissionAnswer, PermissionMode,
-        PermissionResourceAccess, PermissionResourceKind, ScriptLanguage, ShellOpacity,
-        filesystem_permission_resource,
+        AutoNote, EngineFlag, PendingRegistration, PermissionAnswer, PermissionManager,
+        PermissionMode, PermissionResourceAccess, PermissionResourceKind, ScriptLanguage,
+        ShellOpacity, filesystem_permission_resource,
     };
     use crate::tools::PermissionScopes;
     use crate::{AgentEvent, CancelToken, EventSender};
@@ -1065,15 +1061,33 @@ mod tests {
         assert!(next_root.decisions().is_some());
     }
 
-    #[test_case(PermissionMode::Ask; "unchanged_mode_new_revision")]
-    #[test_case(PermissionMode::Yolo; "yolo")]
-    fn passive_decision_stops_immediately_on_revision_change(mode: PermissionMode) {
+    #[test_case(|manager| manager.set_session_mode(Some(PermissionMode::Ask)); "unchanged_mode_new_revision")]
+    #[test_case(|manager| manager.set_session_mode(Some(PermissionMode::Yolo)); "yolo")]
+    #[test_case(|manager| manager.set_decisions(None); "decision_service")]
+    #[test_case(|manager| manager.set_project(Path::new(SHELL_WORKDIR)); "project")]
+    fn passive_decision_stops_immediately_on_revision_change(revoke: fn(&PermissionManager)) {
         smol::block_on(async {
             let manager = default_mgr();
             let mut pending = Box::pin(manager.run_passive_decision(future::pending::<()>()));
             assert!(future::poll_once(&mut pending).await.is_none());
-            manager.set_session_mode(Some(mode));
+            revoke(&manager);
             assert_eq!(future::poll_once(&mut pending).await, Some(None));
+        });
+    }
+
+    #[test]
+    fn passive_decision_outlives_policy_changes() {
+        smol::block_on(async {
+            let manager = default_mgr();
+            let (finish, finished) = flume::bounded(1);
+            let mut running = Box::pin(
+                manager.run_passive_decision(async { finished.recv_async().await.is_ok() }),
+            );
+            assert!(future::poll_once(&mut running).await.is_none());
+            manager.notify_policy_changed(CONTROLLED_REQUEST);
+            assert!(future::poll_once(&mut running).await.is_none());
+            finish.send(()).unwrap();
+            assert_eq!(future::poll_once(&mut running).await, Some(Some(true)));
         });
     }
 

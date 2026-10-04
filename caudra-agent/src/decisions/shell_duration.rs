@@ -118,7 +118,6 @@ impl ShellDurationCache {
 pub(crate) struct ShellDurationPlan {
     decisions: Decisions,
     revision: u64,
-    call_id: String,
     key: ShellDurationKey,
     estimate: Option<Estimate>,
     endless: bool,
@@ -130,7 +129,6 @@ pub(crate) struct ShellDurationPlan {
 impl Decisions {
     pub(crate) async fn shell_duration(
         &self,
-        call_id: &str,
         input: &Value,
         ctx: &ToolContext,
     ) -> Option<ShellDurationPlan> {
@@ -159,7 +157,6 @@ impl Decisions {
         let mut plan = ShellDurationPlan {
             decisions: self.clone(),
             revision: decision_revision,
-            call_id: call_id.to_owned(),
             key,
             estimate: cached,
             endless: false,
@@ -296,8 +293,7 @@ pub(super) fn prior(response: &DecisionResponse, duration: f64, endless: f64) ->
 
 impl ShellDurationPlan {
     pub(crate) fn is_current(&self, ctx: &ToolContext) -> bool {
-        ctx.permissions
-            .passive_decision_is_current_for(self.revision, &self.call_id)
+        ctx.permissions.passive_decision_is_current(self.revision)
             && ctx
                 .permissions
                 .decisions()
@@ -551,7 +547,6 @@ mod tests {
     use std::{iter, sync::Arc, time::Instant};
     use test_case::test_case;
 
-    const CALL: &str = "duration-call";
     const COMMAND: &str = "cargo test -p private-package";
     const FAMILY: &str = "cargo test *";
     const WORKSPACE: &str = "/project";
@@ -587,7 +582,6 @@ mod tests {
         ShellDurationPlan {
             decisions: service(dir, mode),
             revision: 0,
-            call_id: CALL.into(),
             key: history_key(WORKSPACE, ".", COMMAND),
             estimate: Some(Estimate {
                 p50_ms: p90_ms,
@@ -760,7 +754,7 @@ mod tests {
             ctx.host_cwd = remote.then(|| temp.path().to_owned());
             assert!(
                 decisions
-                    .shell_duration(CALL, &json!({"command":COMMAND}), &ctx)
+                    .shell_duration(&json!({"command":COMMAND}), &ctx)
                     .await
                     .is_none()
             );
@@ -781,24 +775,24 @@ mod tests {
             ));
             let ctx = stub_ctx_with_permissions(&AgentMode::Build, permissions);
             let input = json!({"command":COMMAND});
-            let first = decisions.shell_duration(CALL, &input, &ctx).await.unwrap();
+            let first = decisions.shell_duration(&input, &ctx).await.unwrap();
             assert!(first.estimate.is_none());
             for _ in 0..3 {
                 first.clone().record(DurationOutcome::Ok, MINUTES_MS).await;
             }
-            let exact = decisions.shell_duration(CALL, &input, &ctx).await.unwrap();
+            let exact = decisions.shell_duration(&input, &ctx).await.unwrap();
             assert_eq!(exact.estimate.as_ref().unwrap().source, "exact history");
             assert_eq!(exact.estimate.as_ref().unwrap().samples, 3);
             for _ in 0..2 {
                 first.clone().record(DurationOutcome::Ok, MINUTES_MS).await;
             }
             let family = decisions
-                .shell_duration(CALL, &json!({"command":"cargo test --workspace"}), &ctx)
+                .shell_duration(&json!({"command":"cargo test --workspace"}), &ctx)
                 .await
                 .unwrap();
             assert_eq!(family.estimate.unwrap().source, "command family history");
             let other = decisions
-                .shell_duration(CALL, &json!({"command":COMMAND,"workdir":"other"}), &ctx)
+                .shell_duration(&json!({"command":COMMAND,"workdir":"other"}), &ctx)
                 .await
                 .unwrap();
             assert!(other.estimate.is_none());
@@ -852,7 +846,7 @@ mod tests {
             ));
             let ctx = stub_ctx_with_permissions(&AgentMode::Build, permissions);
             let input = json!({"command":COMMAND});
-            let mut plan = decisions.shell_duration(CALL, &input, &ctx).await.unwrap();
+            let mut plan = decisions.shell_duration(&input, &ctx).await.unwrap();
             assert!(plan.estimate.is_none());
             assert!(plan.expected_secs().is_none());
             assert!(plan.inject_timeout(&input, &json!({"properties":{"timeoutSec":{"default":DEFAULT_SECS,"maximum":CAP_SECS}}})).is_none());

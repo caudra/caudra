@@ -827,7 +827,7 @@ async fn run_inner(
             ctx.cancel
                 .race(
                     ctx.permissions
-                        .run_passive_decision(decisions.shell_duration(&id, input, ctx)),
+                        .run_passive_decision(decisions.shell_duration(input, ctx)),
                 )
                 .await
                 .ok()
@@ -1008,10 +1008,9 @@ async fn run_inner(
             }
 
             let header_result = invocation.start_header().await;
-            if ShellDurationPlan::discard_stale(&mut duration_plan, ctx) {
-                invocation.abandon(ctx).await;
-                continue;
-            }
+            // The verdict covers the effective input, so from here a stale plan
+            // only loses its side effects and the call is never authorized again.
+            ShellDurationPlan::discard_stale(&mut duration_plan, ctx);
             let annotation = match (
                 invocation.start_annotation(),
                 duration_plan
@@ -1057,10 +1056,7 @@ async fn run_inner(
                 )
                 .await;
 
-            if ShellDurationPlan::discard_stale(&mut duration_plan, ctx) {
-                invocation.abandon(ctx).await;
-                continue;
-            }
+            ShellDurationPlan::discard_stale(&mut duration_plan, ctx);
 
             // Opened under the guards, so no call naming the same path can
             // change it between this record's capture and this call's write.
@@ -2209,6 +2205,7 @@ mod tests {
     const SHELL_OWNER: &str = "workcell";
     const SHELL_CONTRACT: &str = "shell.execution.v1";
     const SHELL_CALL: &str = "controlled-shell-call";
+    const SIBLING_CALL: &str = "controlled-sibling-call";
     const SHELL_ROOT: &str = "controlled-shell-root";
     const SHELL_COMMAND: &str = "controlled command";
     const SHELL_RESULT: &str = "controlled terminal output";
@@ -2527,6 +2524,65 @@ mod tests {
             key
         }
 
+        async fn approve_sibling(&self) {
+            let root = TempDir::new().unwrap();
+            let (started, _started) = flume::unbounded();
+            let (results, result_rx) = flume::unbounded();
+            self.ctx
+                .registry
+                .register(
+                    Arc::new(ControlledShell {
+                        name: CONTROLLED_SHELL,
+                        timeout: None,
+                        root: root.path().to_owned(),
+                        trace: Arc::default(),
+                        started,
+                        results: result_rx,
+                    }),
+                    ToolSource::Native {
+                        owner: CONTROLLED_SHELL.into(),
+                        contract: CONTROLLED_SHELL.into(),
+                        trusted: true,
+                    },
+                )
+                .unwrap();
+            results
+                .send(ToolExecResult::from(Ok(ToolOutput::Plain(
+                    SHELL_RESULT.into(),
+                ))))
+                .unwrap();
+            let sibling = smol::spawn({
+                let ctx = self.ctx.clone();
+                async move {
+                    run(
+                        &ctx.registry,
+                        None,
+                        SIBLING_CALL.into(),
+                        CONTROLLED_SHELL,
+                        &json!({"command": SHELL_COMMAND}),
+                        &ctx,
+                        Emit::Notify,
+                    )
+                    .await
+                }
+            });
+            let request = loop {
+                if let AgentEvent::PermissionRequest(request) =
+                    self.events.recv_async().await.unwrap().event
+                {
+                    break request;
+                }
+            };
+            assert_eq!(request.id, SIBLING_CALL);
+            assert!(
+                self.ctx
+                    .permissions
+                    .answer(SIBLING_CALL, PermissionAnswer::AllowOnce)
+            );
+            let done = sibling.await;
+            assert!(!done.is_error, "{}", done.output.as_text());
+        }
+
         async fn settled(&self, card: &TaskCard) -> TaskCard {
             let scope = self.ctx.job_scope().unwrap();
             loop {
@@ -2645,7 +2701,7 @@ mod tests {
     #[test_case(false, true, Some(600); "explicit_yolo_during_permission")]
     #[test_case(true, false, Some(600); "explicit_replacement_during_preflight")]
     #[test_case(false, false, Some(600); "explicit_replacement_during_permission")]
-    fn shell_duration_revocation_reauthorizes_original_input(
+    fn shell_duration_revocation_runs_the_authorized_input(
         preflight: bool,
         yolo: bool,
         explicit: Option<u64>,
@@ -2684,8 +2740,9 @@ mod tests {
                     .await
                 }
             });
-            if preflight {
+            let prompted = if preflight {
                 entered.recv_async().await.unwrap();
+                None
             } else {
                 let AgentEvent::PermissionRequest(request) =
                     fixture.events.recv_async().await.unwrap().event
@@ -2701,7 +2758,8 @@ mod tests {
                     request.input_digest,
                     crate::permissions::canonical_json_sha256(&request.input)
                 );
-            }
+                Some(request.input)
+            };
             if yolo {
                 fixture.ctx.permissions.toggle_yolo();
             } else {
@@ -2716,74 +2774,87 @@ mod tests {
                     fixture
                         .ctx
                         .permissions
-                        .answer(SHELL_CALL, crate::permissions::PermissionAnswer::AllowOnce)
+                        .answer(SHELL_CALL, PermissionAnswer::AllowOnce)
                 );
             }
-            if !yolo && (preflight || explicit.is_none()) {
-                loop {
-                    let AgentEvent::PermissionRequest(request) =
-                        fixture.events.recv_async().await.unwrap().event
-                    else {
-                        continue;
+            let authorized = match prompted {
+                Some(prompted) => prompted,
+                None if yolo => input.clone(),
+                None => {
+                    let request = loop {
+                        if let AgentEvent::PermissionRequest(request) =
+                            fixture.events.recv_async().await.unwrap().event
+                        {
+                            break request;
+                        }
                     };
-                    assert_eq!(
-                        request.input_digest,
-                        crate::permissions::canonical_json_sha256(&request.input)
-                    );
-                    let original = request.input == input;
                     assert!(
                         fixture
                             .ctx
                             .permissions
-                            .answer(SHELL_CALL, crate::permissions::PermissionAnswer::AllowOnce)
+                            .answer(SHELL_CALL, PermissionAnswer::AllowOnce)
                     );
-                    if original {
-                        break;
-                    }
+                    request.input
                 }
-            }
-            let done = dispatch.await;
+            };
+            assert_eq!(authorized == input, preflight || explicit.is_some());
+            let mut events = Vec::new();
+            let done = futures_lite::future::or(dispatch, async {
+                loop {
+                    let event = fixture.events.recv_async().await.unwrap().event;
+                    assert!(
+                        !matches!(event, AgentEvent::PermissionRequest(_)),
+                        "{REPROMPTED}"
+                    );
+                    events.push(event);
+                }
+            })
+            .await;
             assert!(!done.is_error, "{}", done.output.as_text());
-            let asynchronous = explicit.is_some_and(|timeout| timeout > DURATION_DEFAULT_SECS);
+            let timeout = authorized["timeoutSec"].as_u64();
+            let asynchronous = timeout.is_some_and(|timeout| timeout > DURATION_DEFAULT_SECS);
             assert_eq!(matches!(done.output, ToolOutput::Tasks(_)), asynchronous);
             if let ToolOutput::Tasks(cards) = &done.output {
                 assert_eq!(
                     cards[0].shell.as_ref().unwrap().timeout_ms,
-                    explicit.unwrap() * 1_000
+                    timeout.unwrap() * 1_000
                 );
                 fixture.settled(&cards[0]).await;
             }
             assert!(done.model_suffix.is_none());
             assert_eq!(
                 *fixture.trace.prepared_input.lock().unwrap(),
-                Some(input.clone())
+                Some(authorized.clone())
             );
+            let reprepared = preflight && explicit.is_none();
             assert_eq!(
                 fixture.trace.prepared.load(Ordering::SeqCst),
-                if explicit.is_some() { 1 } else { 2 }
+                1 + usize::from(reprepared)
             );
             assert_eq!(
                 fixture.trace.abandoned.load(Ordering::SeqCst),
-                usize::from(explicit.is_none())
+                usize::from(reprepared)
             );
             assert_eq!(fixture.trace.executed.load(Ordering::SeqCst), 1);
-            let start = fixture
-                .events
-                .try_iter()
-                .find_map(|envelope| match envelope.event {
+            let start = events
+                .into_iter()
+                .chain(fixture.events.try_iter().map(|envelope| envelope.event))
+                .find_map(|event| match event {
                     AgentEvent::ToolStart(start) => Some(start),
                     _ => None,
                 })
                 .unwrap();
-            assert_eq!(start.raw_input, Some(input));
+            assert_eq!(start.raw_input, Some(authorized));
             assert!(start.annotation.is_none());
             assert_eq!(fixture.started.recv_async().await.unwrap(), asynchronous);
             fixture.tasks.shutdown().await.unwrap();
         });
     }
 
-    #[test]
-    fn shell_duration_survives_the_calls_own_approval() {
+    #[test_case(false, false; "own_answer")]
+    #[test_case(true, false; "rule_edit")]
+    #[test_case(false, true; "sibling_answer")]
+    fn shell_duration_survives_approval_and_policy_changes(rule_edit: bool, sibling_answer: bool) {
         smol::block_on(async {
             let mut fixture = ShellDispatchFixture::named(None, Effect::Ask, SHELL_TOOL).await;
             let key = fixture.duration_history(FeatureMode::Enforce, DURATION_LONG_MS);
@@ -2814,6 +2885,15 @@ mod tests {
                 panic!("expected permission request");
             };
             assert!(request.input["timeoutSec"].as_u64().unwrap() > DURATION_DEFAULT_SECS);
+            if rule_edit {
+                fixture
+                    .ctx
+                    .permissions
+                    .load_structured_conversation_rules(Vec::new());
+            }
+            if sibling_answer {
+                fixture.approve_sibling().await;
+            }
             assert!(
                 fixture
                     .ctx
@@ -2848,7 +2928,7 @@ mod tests {
                 .into_iter()
                 .chain(fixture.events.try_iter().map(|envelope| envelope.event))
                 .find_map(|event| match event {
-                    AgentEvent::ToolStart(start) => Some(start),
+                    AgentEvent::ToolStart(start) if start.id == SHELL_CALL => Some(start),
                     _ => None,
                 })
                 .unwrap();

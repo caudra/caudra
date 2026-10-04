@@ -466,6 +466,7 @@ impl PermissionManager {
             policy_context_error,
             builtin_rules: builtin_rules(cwd, self.state_dir()),
         };
+        self.broker.revoke_passive_decisions();
         self.notify_policy_changed("");
     }
 
@@ -492,6 +493,7 @@ impl PermissionManager {
             policy_context_error,
             builtin_rules: builtin_rules(cwd, self.state_dir()),
         };
+        self.broker.revoke_passive_decisions();
         self.notify_policy_changed("");
     }
 
@@ -577,6 +579,7 @@ impl PermissionManager {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let result = update(&mut self.permission_mode());
+        self.broker.revoke_passive_decisions();
         self.notify_policy_changed("");
         result
     }
@@ -605,6 +608,7 @@ impl PermissionManager {
             .decisions
             .write()
             .unwrap_or_else(|error| error.into_inner()) = decisions;
+        self.broker.revoke_passive_decisions();
         self.notify_policy_changed("");
     }
 
@@ -613,19 +617,13 @@ impl PermissionManager {
     }
 
     pub(crate) fn passive_decision_revision(&self) -> Option<u64> {
-        let revision = self.broker.revision.load(Ordering::Acquire);
+        let revision = self.broker.passive_revision.load(Ordering::Acquire);
         self.passive_decision_is_current(revision)
             .then_some(revision)
     }
 
     pub(crate) fn passive_decision_is_current(&self, revision: u64) -> bool {
-        !self.is_yolo() && self.broker.revision.load(Ordering::Acquire) == revision
-    }
-
-    /// Answering a call's own prompt bumps the revision too, and that alone
-    /// leaves the passive decisions made for the call current.
-    pub(crate) fn passive_decision_is_current_for(&self, revision: u64, call_id: &str) -> bool {
-        !self.is_yolo() && self.broker.bumped_only_by(revision, call_id)
+        !self.is_yolo() && self.broker.passive_revision.load(Ordering::Acquire) == revision
     }
 
     pub fn set_session_mode(&self, stored: Option<PermissionMode>) {
@@ -1296,8 +1294,6 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     const META_KEY: &str = "request_id";
-    const OWN_CALL: &str = "own-call";
-    const SIBLING_CALL: &str = "sibling-call";
     const UNATTRIBUTED: &str = "";
 
     #[test]
@@ -1398,36 +1394,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn passive_decision_revision_rejects_service_replacement() {
-        let manager = default_mgr();
-        let revision = manager.passive_decision_revision().unwrap();
-        manager.set_decisions(None);
-        assert!(!manager.passive_decision_is_current(revision));
-    }
-
-    #[test_case(&[], OWN_CALL, true; "unchanged")]
-    #[test_case(&[OWN_CALL], OWN_CALL, true; "own_answer")]
-    #[test_case(&[OWN_CALL, OWN_CALL], OWN_CALL, true; "own_remembered_answer")]
-    #[test_case(&[SIBLING_CALL], OWN_CALL, false; "sibling_answer")]
-    #[test_case(&[SIBLING_CALL, OWN_CALL], OWN_CALL, false; "sibling_then_own_answer")]
-    #[test_case(&[OWN_CALL, SIBLING_CALL], OWN_CALL, false; "own_then_sibling_answer")]
-    #[test_case(&[OWN_CALL, UNATTRIBUTED], OWN_CALL, false; "own_answer_then_policy_change")]
-    #[test_case(&[UNATTRIBUTED], UNATTRIBUTED, false; "unattributed_call")]
-    fn passive_decision_for_a_call_survives_only_its_own_answer(
-        sources: &[&str],
-        call: &str,
+    #[test_case(|manager| manager.notify_policy_changed(UNATTRIBUTED), true; "policy_change")]
+    #[test_case(|manager| manager.set_decisions(None), false; "decision_service")]
+    #[test_case(|manager| manager.set_project(Path::new(SHELL_WORKDIR)), false; "project")]
+    #[test_case(|manager| manager.set_project_with_config(Path::new(SHELL_WORKDIR), PermissionsConfig::default()), false; "project_config")]
+    fn only_context_changes_revoke_passive_decisions(
+        change: fn(&PermissionManager),
         current: bool,
     ) {
         let manager = default_mgr();
         let revision = manager.passive_decision_revision().unwrap();
-        for source in sources {
-            manager.notify_policy_changed(source);
-        }
-        assert_eq!(
-            manager.passive_decision_is_current_for(revision, call),
-            current
-        );
+        change(&manager);
+        assert_eq!(manager.passive_decision_is_current(revision), current);
     }
 
     #[test]
