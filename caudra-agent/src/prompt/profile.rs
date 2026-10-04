@@ -655,9 +655,13 @@ mod tests {
     const INSPECTION_PROFILE: &str = "inspect";
     const INSPECTION_PARENT: &str = "mistral/ministral-14b-latest";
     const INSPECTION_CHAT: &str = "anthropic/claude-sonnet-4-6";
+    const INSPECTION_OPUS: &str = "anthropic/claude-opus-5-5";
     const INSPECTION_ROUTED: &str = "aperture/mistral/mistral-medium-latest";
     const INSPECTION_UNKNOWN: &str = "caudra-inspection-unknown/model";
     const INCOMPATIBLE_THINKING: &str = "subagent thinking Adaptive is incompatible with model \"mistral/ministral-14b-latest\": model does not support thinking";
+    const OPUS_INCOMPATIBLE_OFF: &str = "subagent thinking Off is incompatible with model \"anthropic/claude-opus-5-5\": model would resolve thinking as low";
+    const OPUS_INCOMPATIBLE_BUDGET: &str = "subagent thinking Budget(8192) is incompatible with model \"anthropic/claude-opus-5-5\": model would resolve thinking as adaptive";
+    const OPUS_INCOMPATIBLE_MINIMAL: &str = "subagent thinking Effort(\"minimal\") is incompatible with model \"anthropic/claude-opus-5-5\": model would resolve thinking as low";
     const INSPECTION_OFFLINE_ENV: &str = "CAUDRA_TEST_PROFILE_INSPECTION_OFFLINE";
     const INSPECTION_OFFLINE_TEST: &str =
         "prompt::profile::tests::inspection_task_bindings_need_no_auth_or_catalog";
@@ -848,6 +852,69 @@ mod tests {
             expected_error.is_none()
         );
         assert!(catalog.resolve(Some(INSPECTION_PROFILE)).unwrap().is_some());
+    }
+
+    #[test_case(Some("adaptive"), "off", None; "adaptive_overrides_inherited_off")]
+    #[test_case(Some("low"), "off", None; "low_overrides_inherited_off")]
+    #[test_case(Some("medium"), "off", None; "medium_overrides_inherited_off")]
+    #[test_case(Some("high"), "off", None; "high_overrides_inherited_off")]
+    #[test_case(Some("xhigh"), "off", None; "xhigh_overrides_inherited_off")]
+    #[test_case(Some("max"), "off", None; "max_overrides_inherited_off")]
+    #[test_case(Some("off"), "adaptive", Some(OPUS_INCOMPATIBLE_OFF); "explicit_off_is_not_promoted")]
+    #[test_case(Some("8192"), "adaptive", Some(OPUS_INCOMPATIBLE_BUDGET); "explicit_budget_is_not_translated")]
+    #[test_case(Some("minimal"), "adaptive", Some(OPUS_INCOMPATIBLE_MINIMAL); "explicit_minimal_is_not_snapped")]
+    #[test_case(None, "off", Some(OPUS_INCOMPATIBLE_OFF); "model_override_inherits_off")]
+    #[test_case(None, "8192", Some(OPUS_INCOMPATIBLE_BUDGET); "model_override_inherits_budget")]
+    #[test_case(None, "minimal", Some(OPUS_INCOMPATIBLE_MINIMAL); "model_override_inherits_minimal")]
+    fn inspection_opus_task_bindings_require_exact_thinking(
+        thinking: Option<&str>,
+        parent_thinking: &str,
+        expected_error: Option<&str>,
+    ) {
+        let catalog = inspection_catalog(Some(INSPECTION_OPUS), thinking);
+        let parent = Model::from_spec(INSPECTION_CHAT).unwrap();
+        let parent_thinking = StoredThinking::parse_setting(parent_thinking)
+            .unwrap()
+            .into();
+        let bindings = catalog.bind_for_tasks_for_inspection(
+            &parent,
+            &parent,
+            &parent_thinking,
+            &ModelPolicy::default(),
+        );
+
+        assert_eq!(
+            bindings.disabled().next(),
+            expected_error.map(|reason| (INSPECTION_PROFILE, reason))
+        );
+        match expected_error {
+            Some(expected_reason) => {
+                assert!(matches!(
+                    bindings.resolve(INSPECTION_PROFILE),
+                    Err(PromptProfileSelectionError::Unavailable { name, reason })
+                        if name == INSPECTION_PROFILE && reason == expected_reason
+                ));
+                assert!(bindings.available().next().is_none());
+            }
+            None => assert!(bindings.resolve(INSPECTION_PROFILE).unwrap().is_some()),
+        }
+        assert!(catalog.get(INSPECTION_PROFILE).is_some());
+        assert!(catalog.resolve(Some(INSPECTION_PROFILE)).unwrap().is_some());
+    }
+
+    #[test]
+    fn inspection_opus_task_bindings_without_overrides_skip_exact_validation() {
+        let catalog = inspection_catalog(None, None);
+        let parent = Model::from_spec(INSPECTION_OPUS).unwrap();
+        let bindings = catalog.bind_for_tasks_for_inspection(
+            &parent,
+            &parent,
+            &ThinkingConfig::Off,
+            &ModelPolicy::default(),
+        );
+
+        assert!(bindings.disabled().next().is_none());
+        assert!(bindings.resolve(INSPECTION_PROFILE).unwrap().is_some());
     }
 
     #[test]

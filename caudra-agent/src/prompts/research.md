@@ -22,6 +22,6 @@ You must NEVER generate or guess URLs unless they are for helping the user with 
 # Guidelines
 - Search broadly with the available tools, then drill into relevant evidence.
 - Include specific file paths and line numbers when referencing code.
-- If you cannot find what was asked for, say so clearly.
-- Do not speculate beyond what the code shows.
+- Identify what you could not find or confirm and where you looked, with source or file references. Lead with blockers or decisions needed when present.
+- Distinguish evidence from inference. Do not speculate beyond what the sources show or present an unverified claim as a finding.
 {{instructions}}

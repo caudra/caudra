@@ -880,9 +880,13 @@ pub fn assemble(id: PromptId, slots: &ResolvedSlots, instructions: &str) -> Stri
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
+    use crate::prompt::profile::{PROFILE_DIR, PromptProfileCatalog};
     use crate::tools::ToolFilter;
     use caudra_workspace::PlanRef;
+    use tempfile::TempDir;
     use test_case::test_case;
 
     const EDIT_MODEL_EFFICIENT_TOOLS: &str =
@@ -895,6 +899,55 @@ mod tests {
     const CUSTOM_EXECUTION_INSTRUCTION: &str =
         "User-authored background and foreground instructions remain intact.";
     const ACTIVE_PLAN: &str = "active-plan";
+    const COMPLETION_PROFILE: &str = "completion";
+    const COMPLETION_OVERLAY: &str = "Keep reports concise.";
+    const CUSTOM_WITH_COMPLETION: &str = "---\nlayout: custom\n---\n{{caudra.identity}}\n{{caudra.conventions}}\n{{caudra.completion}}";
+    const CUSTOM_WITHOUT_COMPLETION: &str =
+        "---\nlayout: custom\n---\n{{caudra.identity}}\n{{caudra.conventions}}";
+    const COMPLETION_GUIDANCE: &[&str] = &[
+        "stated acceptance criteria as the finish line",
+        "plan/read-only boundaries, and approval requirements",
+        "run relevant checks and review the final diff for unintended changes",
+        "If only pending work remains, follow its execution guidance",
+        "checks not run, unresolved failures, and material uncertainty",
+    ];
+    const RESEARCH_READ_ONLY: &str = "Do NOT modify files. You are read-only.";
+    const RESEARCH_EVIDENCE_GAPS: &str =
+        "Identify what you could not find or confirm and where you looked";
+
+    #[test_case(None, true; "builtin")]
+    #[test_case(Some(COMPLETION_OVERLAY), true; "overlay")]
+    #[test_case(Some(CUSTOM_WITH_COMPLETION), true; "custom_completion")]
+    #[test_case(Some(CUSTOM_WITHOUT_COMPLETION), false; "custom_omission")]
+    fn completion_guidance_follows_profile_layout(body: Option<&str>, includes_completion: bool) {
+        let dir = TempDir::new().unwrap();
+        let profile = body.map(|body| {
+            let profiles = dir.path().join(PROFILE_DIR);
+            fs::create_dir(&profiles).unwrap();
+            fs::write(profiles.join(format!("{COMPLETION_PROFILE}.md")), body).unwrap();
+            PromptProfileCatalog::discover_with(Some(dir.path()))
+                .get(COMPLETION_PROFILE)
+                .unwrap()
+        });
+        let slots = ResolvedSlots::default();
+        for prompt in [PromptId::System, PromptId::General, PromptId::Research] {
+            let output = match prompt {
+                PromptId::System => assemble_system(&slots, "", "", profile.as_deref()),
+                _ => assemble_task(prompt, &slots, "", profile.as_deref()),
+            };
+            for guidance in COMPLETION_GUIDANCE {
+                assert_eq!(
+                    output.contains(guidance),
+                    includes_completion && prompt != PromptId::Research,
+                    "{prompt}: {guidance}"
+                );
+            }
+            if prompt == PromptId::Research {
+                assert!(output.contains(RESEARCH_READ_ONLY));
+                assert!(output.contains(RESEARCH_EVIDENCE_GAPS));
+            }
+        }
+    }
 
     #[test_case(false, &["plan", "file_write"], &["plan"]; "local_plan_preferred")]
     #[test_case(true, &["plan", "file_write"], &["plan"]; "remote_plan_preferred")]
