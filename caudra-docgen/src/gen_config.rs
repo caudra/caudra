@@ -132,7 +132,7 @@ fn experiment_scope(feature: Feature) -> &'static str {
               `caudra decisions`, and workflow [`decide()` calls](/docs/workflows/#typed-decisions)."
         }
         Feature::CrossSessionMessaging => {
-            "Local [cross-session messaging](/docs/sessions/#cross-session-messaging): the `list_sessions`, `send_message`, and `publish_message` tools, `/peers`, `/messages`, `/topics`, and live session inboxes. Both processes must opt in."
+            "Local [cross-session messaging](/docs/sessions/#cross-session-messaging): the `list_sessions`, `send_message`, `publish_message`, and `read_topic` tools, `/peers`, `/messages`, `/topics`, live session inboxes, and the message history. Both processes must opt in."
         }
     }
 }

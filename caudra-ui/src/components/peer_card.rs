@@ -1,8 +1,10 @@
 use caudra_agent::{
     PeerOutput,
-    peers::{PeerSummary, PublishReceipt, handle_address},
+    peers::{PeerHistoryPage, PeerSummary, PublishReceipt, TopicActivity, handle_address, literal},
 };
 use caudra_config::InboundPolicy;
+use jiff::Timestamp;
+use jiff::tz::TimeZone;
 use ratatui::{
     style::Style,
     text::{Line, Span},
@@ -29,6 +31,16 @@ const NO_RECIPIENTS: &str = "No live recipients";
 const PUBLISHED_MEANING: &str = "acceptance is not proof of delivery or completion";
 const ACCEPTED: &[&str] = &["queued", "held"];
 const SEPARATOR: &str = " · ";
+const NO_TOPICS: &str = "No stored topic messages";
+const NO_MESSAGES: &str = "No stored messages";
+const BROADCAST: &str = "broadcast";
+const MESSAGE_NOUN: &str = "message";
+const MESSAGES_NOUN: &str = "messages";
+const LAST_LABEL: &str = "last ";
+const WITHHELD_LABEL: &str = "Withheld: ";
+const WITHHELD_MEANING: &str = "senders this session would hold for review";
+const OLDER: &str = "Older messages remain";
+const SENT_FORMAT: &str = "%Y-%m-%d %H:%M";
 
 pub(crate) fn render(output: &PeerOutput, budget: usize, width: u16) -> (Vec<Line<'static>>, bool) {
     let theme = theme::current();
@@ -145,6 +157,13 @@ pub(crate) fn render(output: &PeerOutput, budget: usize, width: u16) -> (Vec<Lin
                 )));
             }
         }
+        PeerOutput::Topics { topics } => {
+            if topics.is_empty() {
+                lines.push(Line::from(Span::styled(NO_TOPICS, theme.tool_dim)));
+            }
+            lines.extend(topics.iter().map(topic_line));
+        }
+        PeerOutput::History { page } => history_lines(page, &mut lines),
     }
     let mut lines = WrappedRows::new(lines, 0, width).lines();
     if budget == 0 {
@@ -160,6 +179,97 @@ pub(crate) fn render(output: &PeerOutput, budget: usize, width: u16) -> (Vec<Lin
         lines.push(notice);
     }
     (lines, hidden > 0)
+}
+
+fn topic_line(activity: &TopicActivity) -> Line<'static> {
+    let noun = if activity.messages == 1 {
+        MESSAGE_NOUN
+    } else {
+        MESSAGES_NOUN
+    };
+    let theme = theme::current();
+    Line::from(vec![
+        Span::styled(activity.topic.escape_debug().to_string(), theme.tool_path),
+        Span::styled(
+            format!(
+                "{SEPARATOR}{} {noun}{SEPARATOR}{LAST_LABEL}{}",
+                activity.messages,
+                sent_at(activity.last_ms)
+            ),
+            theme.tool_dim,
+        ),
+    ])
+}
+
+fn history_lines(page: &PeerHistoryPage, lines: &mut Vec<Line<'static>>) {
+    let theme = theme::current();
+    if page.messages.is_empty() && page.withheld == 0 {
+        lines.push(Line::from(Span::styled(NO_MESSAGES, theme.tool_dim)));
+    }
+    for message in &page.messages {
+        if !lines.is_empty() {
+            lines.push(Line::default());
+        }
+        let mut heading = vec![
+            Span::styled(
+                message
+                    .topic
+                    .as_deref()
+                    .unwrap_or(BROADCAST)
+                    .escape_debug()
+                    .to_string(),
+                theme.tool_path,
+            ),
+            Span::styled(
+                format!("{SEPARATOR}{}", message.sender_name.escape_debug()),
+                theme.tool_prefix,
+            ),
+        ];
+        if let Some(handle) = &message.sender_handle {
+            heading.push(Span::styled(
+                format!(" {}", handle_address(handle).escape_debug()),
+                theme.tool_path,
+            ));
+        }
+        heading.push(Span::styled(
+            format!("{SEPARATOR}{}", sent_at(message.sent_ms)),
+            theme.tool_dim,
+        ));
+        lines.push(Line::from(heading));
+        lines.extend(
+            message
+                .text
+                .lines()
+                .map(|line| Line::from(Span::styled(literal(line, false), theme.tool))),
+        );
+    }
+    if page.withheld > 0 {
+        if !lines.is_empty() {
+            lines.push(Line::default());
+        }
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{WITHHELD_LABEL}{}", page.withheld),
+                theme.tool_warning,
+            ),
+            Span::styled(format!("{SEPARATOR}{WITHHELD_MEANING}"), theme.tool_dim),
+        ]));
+    }
+    if page.before.is_some() {
+        lines.push(Line::from(Span::styled(OLDER, theme.tool_dim)));
+    }
+}
+
+fn sent_at(ms: u64) -> String {
+    i64::try_from(ms)
+        .ok()
+        .and_then(|ms| Timestamp::from_millisecond(ms).ok())
+        .map(|at| {
+            at.to_zoned(TimeZone::system())
+                .strftime(SENT_FORMAT)
+                .to_string()
+        })
+        .unwrap_or_default()
 }
 
 fn receipt_state(status: &str) -> (&'static str, &'static str) {
@@ -227,7 +337,10 @@ mod tests {
 
     use caudra_agent::{
         BatchToolEntry, BatchToolStatus, PeerOutput, ToolOutput,
-        peers::{PeerSummary, PublishReceipt, RecipientReceipt, SendReceipt},
+        peers::{
+            PeerHistoryPage, PeerSummary, PublishReceipt, RecipientReceipt, SendReceipt,
+            StoredPeerMessage, TopicActivity,
+        },
         tools::{ToolEffect, native::peers::SEND_NAME},
     };
     use caudra_config::{InboundPolicy, ToolOutputLines};
@@ -236,8 +349,8 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        AUDIENCE_LABEL, BROADCASTS, EMPTY, NAME_LABEL, NO_RECIPIENTS, SKIPPED_LABEL, TOPICS_LABEL,
-        render,
+        AUDIENCE_LABEL, BROADCAST, BROADCASTS, EMPTY, NAME_LABEL, NO_MESSAGES, NO_RECIPIENTS,
+        NO_TOPICS, OLDER, SKIPPED_LABEL, TOPICS_LABEL, WITHHELD_LABEL, render,
     };
     use crate::components::code_view::{BatchViews, RenderLimits, RowTarget, render_tool_content};
     use crate::theme;
@@ -253,8 +366,39 @@ mod tests {
     const STALE_ANNOTATION: &str = "1 lines";
     const RAW_JSON: &str = "{\"status\":\"unknown\"}";
     const TOPIC: &str = "ci.failures";
+    const OTHER_TOPIC: &str = "deploy.prod";
     const PATTERN: &str = "ci.**";
     const OTHER_PATTERN: &str = "deploy.*";
+    const BODY_LINES: [&str; 2] = ["The linux build failed.", "See job 42."];
+    const SENT_MS: u64 = 1_790_000_000_000;
+    const SENT_YEAR: &str = "2026-";
+    const HISTORY_SEQ: i64 = 7;
+
+    fn stored(topic: Option<&str>, text: &str) -> StoredPeerMessage {
+        StoredPeerMessage {
+            seq: HISTORY_SEQ,
+            topic: topic.map(str::to_owned),
+            sender_name: NAME.into(),
+            sender_handle: Some(HANDLE.into()),
+            sent_ms: SENT_MS,
+            text: text.into(),
+        }
+    }
+
+    fn history(
+        messages: Vec<StoredPeerMessage>,
+        withheld: usize,
+        before: Option<i64>,
+    ) -> PeerOutput {
+        PeerOutput::History {
+            page: PeerHistoryPage {
+                topic: Some(PATTERN.into()),
+                messages,
+                withheld,
+                before,
+            },
+        }
+    }
 
     fn session() -> PeerSummary {
         PeerSummary {
@@ -435,6 +579,82 @@ mod tests {
         assert_eq!(lines[0].spans[0].style, expected_style);
     }
 
+    #[test_case(1, "1 message"; "singular")]
+    #[test_case(3, "3 messages"; "plural")]
+    fn topic_directories_show_each_topic_with_its_count_and_latest_time(
+        messages: usize,
+        count: &str,
+    ) {
+        let output = PeerOutput::Topics {
+            topics: [TOPIC, OTHER_TOPIC]
+                .map(|topic| TopicActivity {
+                    topic: topic.into(),
+                    messages,
+                    last_ms: SENT_MS,
+                })
+                .into(),
+        };
+        let (lines, truncated) = render(&output, usize::MAX, WIDTH);
+        assert!(!truncated);
+        assert_eq!(lines.len(), 2);
+        for (line, topic) in lines.iter().zip([TOPIC, OTHER_TOPIC]) {
+            let drawn = line.to_string();
+            assert!(
+                drawn.starts_with(&format!("{topic} · {count} · last {SENT_YEAR}")),
+                "{drawn}"
+            );
+        }
+    }
+
+    #[test_case(PeerOutput::Topics { topics: Vec::new() }, NO_TOPICS; "topics")]
+    #[test_case(history(Vec::new(), 0, None), NO_MESSAGES; "message_history")]
+    fn empty_history_reads_say_nothing_is_stored(output: PeerOutput, notice: &str) {
+        let (lines, truncated) = render(&output, usize::MAX, WIDTH);
+        assert_eq!(text(&lines), notice);
+        assert!(!truncated);
+    }
+
+    #[test_case(Some(TOPIC), TOPIC; "topic")]
+    #[test_case(None, BROADCAST; "broadcast")]
+    fn stored_messages_show_their_audience_sender_time_and_every_body_line(
+        topic: Option<&str>,
+        audience: &str,
+    ) {
+        let output = history(vec![stored(topic, &BODY_LINES.join("\n"))], 0, None);
+        let (lines, truncated) = render(&output, usize::MAX, WIDTH);
+        assert!(!truncated);
+        let drawn = lines.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert!(
+            drawn[0].starts_with(&format!("{audience} · {NAME} @{HANDLE} · {SENT_YEAR}")),
+            "{drawn:?}"
+        );
+        assert_eq!(drawn[1..], BODY_LINES);
+    }
+
+    #[test_case(2, 0, None; "complete")]
+    #[test_case(2, 3, None; "withheld")]
+    #[test_case(0, 3, None; "everything_withheld")]
+    #[test_case(2, 0, Some(HISTORY_SEQ); "older")]
+    fn history_pages_say_what_was_withheld_and_whether_older_messages_remain(
+        shown: usize,
+        withheld: usize,
+        before: Option<i64>,
+    ) {
+        let messages = BODY_LINES
+            .iter()
+            .take(shown)
+            .map(|body| stored(Some(TOPIC), body))
+            .collect();
+        let drawn = text(&render(&history(messages, withheld, before), usize::MAX, WIDTH).0);
+        assert_eq!(drawn.matches(&format!("@{HANDLE}")).count(), shown);
+        assert_eq!(
+            drawn.contains(&format!("{WITHHELD_LABEL}{withheld}")),
+            withheld > 0
+        );
+        assert_eq!(drawn.contains(OLDER), before.is_some());
+        assert!(!drawn.contains(NO_MESSAGES));
+    }
+
     #[test]
     fn empty_discovery_explains_how_to_make_a_peer_reachable() {
         let (lines, truncated) = render(
@@ -556,9 +776,34 @@ mod tests {
         }
     }
 
+    fn hostile_topics() -> PeerOutput {
+        PeerOutput::Topics {
+            topics: vec![TopicActivity {
+                topic: HOSTILE.into(),
+                messages: 1,
+                last_ms: SENT_MS,
+            }],
+        }
+    }
+
+    fn hostile_history() -> PeerOutput {
+        history(
+            vec![StoredPeerMessage {
+                topic: Some(HOSTILE.into()),
+                sender_name: HOSTILE.into(),
+                sender_handle: Some(HOSTILE.into()),
+                ..stored(None, HOSTILE)
+            }],
+            0,
+            None,
+        )
+    }
+
     #[test_case(hostile_sessions(); "session_labels")]
     #[test_case(hostile_receipt(); "receipt_labels")]
     #[test_case(hostile_publication(); "publication_labels")]
+    #[test_case(hostile_topics(); "topic_labels")]
+    #[test_case(hostile_history(); "stored_messages")]
     fn hostile_values_remain_literal_without_terminal_controls(output: PeerOutput) {
         let (lines, _) = render(&output, usize::MAX, 0);
         assert!(

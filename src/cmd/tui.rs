@@ -1562,7 +1562,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
     let peer_host = if workcell_runtime.is_remote() {
         None
     } else {
-        match PeerHost::start(cli.startup.features) {
+        match PeerHost::start(cli.startup.features, &stack.config.agent.messaging) {
             Ok(host) => host.map(Arc::new),
             Err(error) if messaging_flags => {
                 return Err(eyre!("{MESSAGING_UNAVAILABLE}: {error}"));

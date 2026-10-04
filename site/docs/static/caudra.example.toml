@@ -226,8 +226,8 @@ version = 1
 # web = 3
 
 # Rows for `batch`, `execution_environment`, `list_sessions`,
-# `publish_message`, `question`, `send_message`, `skill`, `todo_write`,
-# `tool_output`, `view_image`, `workflow`.
+# `publish_message`, `question`, `read_topic`, `send_message`, `skill`,
+# `todo_write`, `tool_output`, `view_image`, `workflow`.
 # Type: usize, at least 1.
 # other = 3
 
@@ -376,6 +376,17 @@ version = 1
 # recipients are skipped and counted. Project settings may only lower it.
 # Type: usize, at least 1.
 # max_fanout = 32
+
+# Days the shared message history keeps a message. The newest message on each
+# topic outlives this until `history_max_messages` evicts it. Global config
+# only.
+# Type: u64, at least 1.
+# history_days = 30
+
+# Most messages the shared message history keeps; the oldest go first. Global
+# config only.
+# Type: u64, at least 1.
+# history_max_messages = 50000
 
 [agent.steering]
 # Automatic steering repairs unusable model output and can add bounded guidance

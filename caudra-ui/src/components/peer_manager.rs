@@ -1,6 +1,6 @@
 use caudra_agent::peers::{
     HeldMessageSummary, HeldReview, PeerDecision, PeerDecisionResult, PeerInboxSnapshot,
-    PeerReviewToken, PeerSummary,
+    PeerReviewToken, PeerSummary, deceptive, literal,
 };
 use caudra_config::InboundPolicy;
 use caudra_grab::grab_scope;
@@ -1927,24 +1927,6 @@ fn held_identity(held: &HeldMessageSummary) -> String {
     )
 }
 
-fn deceptive(character: char) -> bool {
-    matches!(character, '\u{00ad}' | '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}')
-}
-
-fn literal(text: &str, newlines: bool) -> String {
-    let mut output = String::with_capacity(text.len());
-    for character in text.chars() {
-        if character == '\n' && newlines {
-            output.push(character);
-        } else if character.is_control() || deceptive(character) {
-            output.extend(character.escape_default());
-        } else {
-            output.push(character);
-        }
-    }
-    output
-}
-
 fn paint_literal(text: &str, style: Style) -> Painted {
     let mut lines = Vec::new();
     let mut continuations = Vec::new();
@@ -2641,18 +2623,6 @@ mod tests {
         ));
         assert!(manager.policy.is_none());
         assert!(manager.is_open());
-    }
-
-    #[test_case(false, "line\\n\\r\\t\\u{1b}\\u{85}\\u{202e}\\u{2066}\\u{200f}終" ; "metadata")]
-    #[test_case(true, "line\n\\r\\t\\u{1b}\\u{85}\\u{202e}\\u{2066}\\u{200f}終" ; "body")]
-    fn terminal_controls_and_bidi_are_literal_but_body_newlines_survive(
-        newlines: bool,
-        expected: &str,
-    ) {
-        assert_eq!(
-            literal("line\n\r\t\u{1b}\u{85}\u{202e}\u{2066}\u{200f}終", newlines),
-            expected
-        );
     }
 
     #[test_case(Color::Black, Color::White ; "light")]

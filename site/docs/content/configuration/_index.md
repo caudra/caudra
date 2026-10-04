@@ -96,7 +96,7 @@ decision_engine = true
 | `remote_workcell` | `false` | Direct [remote Workcell](/docs/remote-workspaces/) connections: the `--workcell-*` flags and `caudra auth workcell`. |
 | `lua_plugins` | `false` | Every use of Lua: [plugins](/docs/plugins/), the [Lua API](/docs/lua-api/), global and project `init.lua`, and the `caudra-plugin-dev` skill. `--no-plugins` still turns Lua off for one run. |
 | `decision_engine` | `false` | The [decision engine](#decisions), [Auto mode](/docs/permissions/#auto-mode), `caudra decisions`, and workflow [`decide()` calls](/docs/workflows/#typed-decisions). |
-| `cross_session_messaging` | `false` | Local [cross-session messaging](/docs/sessions/#cross-session-messaging): the `list_sessions`, `send_message`, and `publish_message` tools, `/peers`, `/messages`, `/topics`, and live session inboxes. Both processes must opt in. |
+| `cross_session_messaging` | `false` | Local [cross-session messaging](/docs/sessions/#cross-session-messaging): the `list_sessions`, `send_message`, `publish_message`, and `read_topic` tools, `/peers`, `/messages`, `/topics`, live session inboxes, and the message history. Both processes must opt in. |
 
 Each switch is independent, so turning one on never turns on another. A missing file, table, or key leaves a switch off, and an unknown key is an error. `caudra remote` and `/remote` work when either `sandboxes` or `remote_workcell` is on, and each session checks the switch for its own source.
 
@@ -226,7 +226,7 @@ The `bash`, `python_execution`, and `task` entries apply only when `ui.scroll_ca
 | `read` | 3 | `file_read` |
 | `write` | 7 | `file_write`, `file_edit`, `file_apply_patch`, `image_generate`, `memory`, `plan` |
 | `web` | 3 | `webfetch`, `websearch` |
-| `other` | 3 | `batch`, `execution_environment`, `list_sessions`, `publish_message`, `question`, `send_message`, `skill`, `todo_write`, `tool_output`, `view_image`, `workflow` |
+| `other` | 3 | `batch`, `execution_environment`, `list_sessions`, `publish_message`, `question`, `read_topic`, `send_message`, `skill`, `todo_write`, `tool_output`, `view_image`, `workflow` |
 
 ### `agent`
 
@@ -264,6 +264,8 @@ The `bash`, `python_execution`, and `task` entries apply only when `ui.scroll_ca
 | `sender_per_minute` | usize | `16` | 1 | Most peer messages a session admits per minute from one sending session. Project settings may only lower it |
 | `publish_per_minute` | usize | `16` | 1 | Most topic and broadcast publications a session sends per minute. Project settings may only lower it |
 | `max_fanout` | usize | `32` | 1 | Most live sessions one topic or broadcast publication reaches. Extra recipients are skipped and counted. Project settings may only lower it |
+| `history_days` | u64 | `30` | 1 | Days the shared message history keeps a message. The newest message on each topic outlives this until `history_max_messages` evicts it. Global config only |
+| `history_max_messages` | u64 | `50000` | 1 | Most messages the shared message history keeps; the oldest go first. Global config only |
 
 ### `agent.steering`
 

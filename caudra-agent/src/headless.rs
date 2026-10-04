@@ -1357,7 +1357,7 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
     let peer_host = if params.workspace_session.is_some() || params.host_cwd.is_some() {
         None
     } else {
-        match PeerHost::start(params.config.features) {
+        match PeerHost::start(params.config.features, &params.config.messaging) {
             Ok(host) => host,
             Err(error) => {
                 warn!(%error, "cross-session messaging unavailable");

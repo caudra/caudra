@@ -33,7 +33,7 @@ use caudra_markdown::render::truncate_long_lines;
 use crate::markdown::{LinkMap, expand_notice, should_truncate, text_to_painted};
 use caudra_agent::tools::native::peers::{
     LIST_NAME as LIST_SESSIONS_TOOL_NAME, PUBLISH_NAME as PUBLISH_MESSAGE_TOOL_NAME,
-    SEND_NAME as SEND_MESSAGE_TOOL_NAME,
+    READ_NAME as READ_TOPIC_TOOL_NAME, SEND_NAME as SEND_MESSAGE_TOOL_NAME,
 };
 use caudra_agent::tools::native::plan;
 use caudra_agent::{
@@ -538,6 +538,7 @@ const COMPACT_TOOLS: &[(&str, CompactTool)] = &[
     tool_row(LIST_SESSIONS_TOOL_NAME, '⇄', PEERS, &[]),
     tool_row(SEND_MESSAGE_TOOL_NAME, '⇄', PEERS, &["text"]),
     tool_row(PUBLISH_MESSAGE_TOOL_NAME, '⇄', PEERS, &["text"]),
+    tool_row(READ_TOPIC_TOOL_NAME, '⇄', PEERS, &[]),
     tool_row("view_image", '→', VIEW, &["path"]),
     tool_row("image_generate", '←', DRAW, &["out", "prompt"]),
 ];
@@ -988,6 +989,7 @@ pub(super) fn header_spans(
         SEND_MESSAGE_TOOL_NAME,
         PUBLISH_MESSAGE_TOOL_NAME,
         LIST_SESSIONS_TOOL_NAME,
+        READ_TOPIC_TOOL_NAME,
     ]
     .iter()
     .any(|peer_tool| names_tool(peer_tool, tool))

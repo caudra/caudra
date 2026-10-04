@@ -11,6 +11,7 @@ pub mod input_history;
 pub mod local_documents;
 pub mod log;
 pub mod mcp_trust;
+pub mod messages;
 pub mod model;
 pub mod paths;
 pub mod permission_config_trust;

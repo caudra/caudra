@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::mem;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
@@ -14,6 +15,9 @@ use caudra_providers::{
     HistoryItem, HistoryItemKind, Message, PeerAudience, PeerMessageOrigin, UserOrigin,
 };
 use caudra_storage::id::CaudraId;
+use caudra_storage::messages::{
+    MessageAudience, MessageRecipient, MessageSender, NewMessage, StoredMessage,
+};
 use caudra_storage::random_task_id;
 use caudra_storage::sessions::{PermissionMode, StoredInboundPolicy, StoredPeerControls};
 use event_listener::Event;
@@ -21,8 +25,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::AgentMode;
-use topics::{parse_topic, pattern_matches, validate_patterns};
+use history::{HistoryWriter, MessageHistory};
+use topics::{parse_pattern, parse_topic, pattern_matches, validate_patterns};
 
+// Nothing opens a history where peer messaging is unavailable.
+#[cfg_attr(not(unix), allow(dead_code))]
+mod history;
 pub mod topics;
 #[cfg(unix)]
 mod unix;
@@ -48,6 +56,8 @@ const MAX_NAME_ATTEMPTS: usize = 32;
 const MESSAGE_WORDS: usize = 3;
 const PEER_WORDS: usize = MESSAGE_WORDS * 2;
 const CLAIM_BATCH: usize = 4;
+const MAX_CATCH_UP: usize = 16;
+pub const MAX_HISTORY_PAGE: usize = 50;
 const FANOUT_CONCURRENCY: usize = 8;
 const RATE_WINDOW: Duration = Duration::from_secs(60);
 const RETRY_WINDOW: Duration = Duration::from_secs(300);
@@ -88,8 +98,18 @@ const AMBIGUOUS_HANDLE: &str =
 const STALE_REVIEW: &str = "Held message review is stale; inspect the current held messages again";
 const NOT_HELD: &str = "Held message no longer exists";
 const REJECTED: &str = "Rejected by the local receiver";
+const HISTORY_HELD: &str =
+    "Reading stored peer messages needs the inbound policy accept or auto in this session";
+const NOT_RECORDED: &str = "Not sent, because the message history could not record it";
+const STATUS_QUEUED: &str = "queued";
+const STATUS_HELD: &str = "held";
+const STATUS_REJECTED: &str = "rejected";
+const STATUS_DELIVERED: &str = "delivered";
+const STATUS_DROPPED: &str = "dropped";
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 const UNAVAILABLE: &str = "Local peer messaging is unavailable on this platform";
+#[cfg(all(any(test, feature = "test-support"), unix))]
+const TEST_HISTORY_DIRECTORY: &str = "history";
 static REGISTRATIONS: OnceLock<Mutex<HashMap<CaudraId, Weak<SessionInner>>>> = OnceLock::new();
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 static PROCESS_BYTES: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
@@ -154,6 +174,26 @@ pub fn handle_address(handle: &str) -> String {
     format!("{HANDLE_PREFIX}{handle}")
 }
 
+pub fn deceptive(character: char) -> bool {
+    matches!(character, '\u{00ad}' | '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}')
+}
+
+/// Peer text for display: terminal controls and invisible or bidirectional
+/// characters are spelled out, and only `newlines` keeps line breaks.
+pub fn literal(text: &str, newlines: bool) -> String {
+    let mut output = String::with_capacity(text.len());
+    for character in text.chars() {
+        if character == '\n' && newlines {
+            output.push(character);
+        } else if character.is_control() || deceptive(character) {
+            output.extend(character.escape_default());
+        } else {
+            output.push(character);
+        }
+    }
+    output
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SendReceipt {
     pub status: String,
@@ -191,6 +231,42 @@ pub struct RecipientReceipt {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TopicActivity {
+    pub topic: String,
+    pub messages: usize,
+    pub last_ms: u64,
+}
+
+/// A stored topic or broadcast message. `seq` orders the history and pages
+/// it; it identifies no session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StoredPeerMessage {
+    pub seq: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    pub sender_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_handle: Option<String>,
+    pub sent_ms: u64,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeerHistoryPage {
+    /// The topic pattern read, or none for broadcasts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    pub messages: Vec<StoredPeerMessage>,
+    /// Messages on the page this session would not accept automatically,
+    /// counted without their text.
+    pub withheld: usize,
+    /// Pass back as `before` to read older messages; none once the page
+    /// reaches the oldest one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -262,15 +338,20 @@ struct HostInner {
     endpoint: unix::Endpoint,
     #[cfg(unix)]
     listener: Mutex<Option<smol::Task<()>>>,
+    history: MessageHistory,
+    /// Declared after `history`, so the queue closes before the join.
+    _writer: HistoryWriter,
 }
 
 #[derive(Clone)]
 pub struct PeerSession(Arc<SessionInner>);
 
 struct SessionInner {
-    host: Arc<HostInner>,
     route: Route,
     state: Mutex<SessionState>,
+    /// Declared after `state`, so its history clone closes before the last
+    /// host drop joins the history writer.
+    host: Arc<HostInner>,
 }
 
 struct SessionState {
@@ -300,6 +381,7 @@ struct SessionState {
     message_names: NameTable<MessageIdentity>,
     arrivals: VecDeque<Arrival>,
     reviews: HashMap<String, u64>,
+    history: MessageHistory,
 }
 
 struct Arrival {
@@ -321,11 +403,29 @@ struct InboxItem {
     bytes: usize,
     state: ItemState,
     approved_epoch: Option<u64>,
+    /// Caught up from the history rather than sent to this session. It
+    /// rides along with the next turn but never starts one.
+    passive: bool,
 }
 
 impl InboxItem {
     fn observation(&self) -> Message {
         Message::peer_observation(self.delivery.text.clone(), self.origin.clone())
+    }
+
+    fn is_waiting(&self) -> bool {
+        !self.passive && matches!(self.state, ItemState::Pending)
+    }
+
+    fn receipt(&self) -> SendReceipt {
+        match &self.state {
+            ItemState::Held(reason) => {
+                SendReceipt::new(STATUS_HELD, &self.delivery.message_id, Some(reason))
+            }
+            ItemState::Pending | ItemState::Claimed(_) | ItemState::Staged => {
+                SendReceipt::new(STATUS_QUEUED, &self.delivery.message_id, None)
+            }
+        }
     }
 
     fn held_summary(
@@ -341,12 +441,7 @@ impl InboxItem {
             sender_name: self.delivery.sender.name.clone(),
             reply_target: self.origin.reply_target.clone(),
             workspace: self.delivery.sender.canonical_cwd.clone(),
-            mode: match self.delivery.sender.mode {
-                WireMode::Build => "build",
-                WireMode::Plan => "plan",
-                WireMode::ReadOnly => "read_only",
-            }
-            .into(),
+            mode: self.delivery.sender.mode.as_str().into(),
             reason: reason.clone(),
             epoch,
             approval_blocker: approval_blocker.map(str::to_owned),
@@ -475,14 +570,38 @@ impl Publication {
             .map(|(index, _)| (index, self.delivery(index, text)))
             .collect()
     }
+
+    fn fanout(&self, epoch: u64, text: &str) -> Fanout {
+        Fanout {
+            epoch,
+            receipt: self.receipt.clone(),
+            deliveries: self.unresolved(text),
+            entry: self
+                .issued
+                .history_entry(&self.receipt.audience, text, None),
+            recipients: self
+                .routes
+                .iter()
+                .zip(&self.receipt.recipients)
+                .filter_map(|(route, recipient)| {
+                    Some(MessageRecipient {
+                        session: route_session(route)?,
+                        name: Some(recipient.title.clone()),
+                    })
+                })
+                .collect(),
+        }
+    }
 }
 
 /// A publication ready to send: deliveries carry their recipient's index
-/// in `receipt`.
+/// in `receipt`, and the history records `entry` for `recipients` first.
 struct Fanout {
     epoch: u64,
     receipt: PublishReceipt,
     deliveries: Vec<(usize, Delivery)>,
+    entry: NewMessage,
+    recipients: Vec<MessageRecipient>,
 }
 
 pub struct PeerClaim {
@@ -539,6 +658,40 @@ impl From<&AgentMode> for WireMode {
     }
 }
 
+impl WireMode {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Build => "build",
+            Self::Plan => "plan",
+            Self::ReadOnly => "read_only",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        [Self::Build, Self::Plan, Self::ReadOnly]
+            .into_iter()
+            .find(|mode| mode.as_str() == value)
+    }
+}
+
+fn permission_name(mode: &PermissionMode) -> &'static str {
+    match mode {
+        PermissionMode::Ask => "ask",
+        PermissionMode::Auto => "auto",
+        PermissionMode::Yolo => "yolo",
+    }
+}
+
+fn parse_permission(value: &str) -> Option<PermissionMode> {
+    [
+        PermissionMode::Ask,
+        PermissionMode::Auto,
+        PermissionMode::Yolo,
+    ]
+    .into_iter()
+    .find(|mode| permission_name(mode) == value)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Sender {
@@ -569,9 +722,116 @@ struct Delivery {
     audience: PeerAudience,
 }
 
+impl Sender {
+    fn history_entry(&self) -> MessageSender {
+        MessageSender {
+            route: self.route.target(),
+            session: Some(self.route.session.to_string()),
+            name: self.name.clone(),
+            handle: self.handle.clone(),
+            cwd: self
+                .canonical_cwd
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
+            mode: self.mode.as_str().into(),
+            permission: permission_name(&self.permission_mode).into(),
+            external: false,
+        }
+    }
+
+    /// The session a stored message came from, or none for a sender outside
+    /// every session.
+    fn from_history(sender: &MessageSender) -> Option<Self> {
+        if sender.external {
+            return None;
+        }
+        Some(Self {
+            route: Route::parse(&sender.route).ok()?,
+            name: sender.name.clone(),
+            handle: sender.handle.clone(),
+            canonical_cwd: sender.cwd.as_ref().map(PathBuf::from),
+            mode: WireMode::parse(&sender.mode)?,
+            permission_mode: parse_permission(&sender.permission)?,
+        })
+    }
+}
+
+impl Issued {
+    fn history_entry(
+        &self,
+        audience: &PeerAudience,
+        text: &str,
+        reply_to: Option<&str>,
+    ) -> NewMessage {
+        NewMessage {
+            message_id: self.message_id.clone(),
+            audience: match audience {
+                PeerAudience::Direct => MessageAudience::Direct,
+                PeerAudience::Topic { topic } => MessageAudience::Topic(topic.clone()),
+                PeerAudience::Broadcast => MessageAudience::Broadcast,
+            },
+            sender: self.sender.history_entry(),
+            text: text.to_owned(),
+            reply_to: reply_to.map(str::to_owned),
+            created_ms: self.issued_ms,
+        }
+    }
+}
+
 impl Delivery {
     fn dedup_key(&self) -> String {
         format!("{}:{}", self.sender.route.target(), self.message_id)
+    }
+
+    fn same_message(&self, other: &Self) -> bool {
+        self.message_id == other.message_id && self.sender.route == other.sender.route
+    }
+
+    /// A stored topic message as `target` would have received it live.
+    fn from_history(stored: StoredMessage, target: &Route) -> Option<Self> {
+        let message = stored.message;
+        let MessageAudience::Topic(topic) = message.audience else {
+            return None;
+        };
+        let delivery = Self {
+            message_id: message.message_id,
+            issued_ms: message.created_ms,
+            target: target.target(),
+            sender: Sender::from_history(&message.sender)?,
+            text: message.text,
+            reply_to: None,
+            reply_sender: None,
+            audience: PeerAudience::Topic { topic },
+        };
+        delivery.has_valid_metadata().then_some(delivery)
+    }
+
+    fn has_valid_metadata(&self) -> bool {
+        (valid_name(&self.message_id, MESSAGE_WORDS) || valid_token(&self.message_id))
+            && valid_token(&self.sender.route.host)
+            && valid_token(&self.sender.route.generation)
+            && !self.text.is_empty()
+            && self.text.len() <= MAX_BODY_BYTES
+            && self.sender.name.len() <= MAX_LABEL_BYTES
+            && self.sender.handle.as_deref().is_none_or(valid_handle)
+            && self
+                .sender
+                .canonical_cwd
+                .as_ref()
+                .is_none_or(|path| path.is_absolute() && path.as_os_str().len() <= MAX_PATH_BYTES)
+            && self
+                .reply_to
+                .as_ref()
+                .is_none_or(|value| value.len() <= MAX_CORRELATION_BYTES)
+            && self
+                .reply_sender
+                .as_deref()
+                .is_none_or(|sender| self.reply_to.is_some() && Route::parse(sender).is_ok())
+            && self
+                .audience
+                .topic()
+                .is_none_or(|topic| parse_topic(topic).is_ok())
+            && (self.audience.is_direct() || self.reply_to.is_none())
     }
 }
 
@@ -808,6 +1068,13 @@ fn subscribed(audience: &PeerAudience, topics: &[String], broadcasts: bool) -> b
     }
 }
 
+/// The session `route` addresses, which keys its rows in the history.
+fn route_session(route: &str) -> Option<String> {
+    Route::parse(route)
+        .ok()
+        .map(|route| route.session.to_string())
+}
+
 fn validate_descriptor(descriptor: &PeerDescriptor) -> Result<(), String> {
     if descriptor.name.len() > MAX_LABEL_BYTES || descriptor.cwd.as_os_str().len() > MAX_PATH_BYTES
     {
@@ -838,7 +1105,12 @@ fn inbound_policy(policy: &StoredInboundPolicy) -> InboundPolicy {
 }
 
 impl PeerHost {
-    pub fn start(features: FeatureFlags) -> Result<Option<Self>, String> {
+    /// Starts messaging when the experiment is on. Fails when the message
+    /// history cannot open, since nothing may be sent unrecorded.
+    pub fn start(
+        features: FeatureFlags,
+        messaging: &MessagingConfig,
+    ) -> Result<Option<Self>, String> {
         if !features.enabled(Feature::CrossSessionMessaging) {
             return Ok(None);
         }
@@ -846,6 +1118,7 @@ impl PeerHost {
         {
             Self::bind(
                 unix::runtime_directory()?,
+                MessageHistory::open_shared(messaging)?,
                 PROCESS_BYTES
                     .get_or_init(|| Arc::new(AtomicUsize::new(0)))
                     .clone(),
@@ -853,11 +1126,18 @@ impl PeerHost {
             .map(Some)
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        Err(UNAVAILABLE.into())
+        {
+            let _ = messaging;
+            Err(UNAVAILABLE.into())
+        }
     }
 
     #[cfg(unix)]
-    fn bind(directory: PathBuf, bytes: Arc<AtomicUsize>) -> Result<Self, String> {
+    fn bind(
+        directory: PathBuf,
+        (history, writer): (MessageHistory, HistoryWriter),
+        bytes: Arc<AtomicUsize>,
+    ) -> Result<Self, String> {
         let incarnation = token()?;
         let (endpoint, listener) = unix::Endpoint::bind(directory, &incarnation)?;
         let host = Arc::new(HostInner {
@@ -868,14 +1148,22 @@ impl PeerHost {
             changed: Event::new(),
             endpoint,
             listener: Mutex::new(None),
+            history,
+            _writer: writer,
         });
         *lock(&host.listener) = Some(unix::listen(Arc::downgrade(&host), listener));
         Ok(Self(host))
     }
 
+    /// Keeps the message history under `directory` too, so hosts started in
+    /// one directory share a history as every host on a machine does.
     #[cfg(all(any(test, feature = "test-support"), unix))]
     pub fn start_in(directory: PathBuf, bytes: Arc<AtomicUsize>) -> Result<Self, String> {
-        Self::bind(directory, bytes)
+        let history = MessageHistory::open_in(
+            &directory.join(TEST_HISTORY_DIRECTORY),
+            &MessagingConfig::default(),
+        )?;
+        Self::bind(directory, history, bytes)
     }
 
     pub fn register(&self, descriptor: PeerDescriptor) -> Result<PeerSession, String> {
@@ -956,6 +1244,7 @@ impl PeerHost {
                 message_names: NameTable::new(MAX_MESSAGE_NAMES),
                 arrivals: VecDeque::new(),
                 reviews: HashMap::new(),
+                history: self.0.history.clone(),
             }),
         });
         sessions.insert(id, Arc::downgrade(&session));
@@ -1112,14 +1401,12 @@ impl PeerSession {
         self.0.close();
     }
 
+    /// Whether a message waits to wake the session. Caught-up messages only
+    /// ride along with a turn something else starts.
     pub fn has_pending(&self) -> bool {
         let mut state = lock(&self.0.state);
         state.reevaluate();
-        state.open
-            && state
-                .inbox
-                .iter()
-                .any(|item| matches!(item.state, ItemState::Pending))
+        state.open && state.inbox.iter().any(InboxItem::is_waiting)
     }
 
     pub async fn list(&self) -> Result<Vec<PeerInfo>, String> {
@@ -1231,7 +1518,7 @@ impl PeerSession {
         reply_sender: Option<&str>,
         request_id: &str,
     ) -> Result<SendReceipt, String> {
-        Route::parse(target)?;
+        let recipient = Route::parse(target)?.session.to_string();
         check_text(text)?;
         if request_id.is_empty()
             || request_id.len() > MAX_CORRELATION_BYTES
@@ -1240,7 +1527,7 @@ impl PeerSession {
             return Err(INVALID_CORRELATION.into());
         }
         let fingerprint = digest(&(target, text, reply_to, reply_sender))?;
-        let (delivery, epoch) = {
+        let (delivery, epoch, entry) = {
             let mut state = lock(&self.0.state);
             state.ensure_can_send()?;
             let issued = if let Some(previous) = state.outgoing.get(request_id) {
@@ -1283,6 +1570,7 @@ impl PeerSession {
                 );
                 issued
             };
+            let entry = issued.history_entry(&PeerAudience::Direct, text, reply_to);
             (
                 Delivery {
                     message_id: issued.message_id,
@@ -1295,9 +1583,27 @@ impl PeerSession {
                     audience: PeerAudience::Direct,
                 },
                 issued.epoch,
+                entry,
             )
         };
+        let history = &self.0.host.history;
+        let recipients = vec![MessageRecipient {
+            session: recipient.clone(),
+            name: None,
+        }];
+        history
+            .record(entry, recipients)
+            .await
+            .map_err(|error| format!("{NOT_RECORDED}: {error}"))?;
+        let (sender, message_id) = (delivery.sender.route.target(), delivery.message_id.clone());
         let receipt = self.deliver(delivery, epoch).await;
+        history.receipt(
+            sender,
+            message_id,
+            recipient,
+            receipt.status.clone(),
+            receipt.reason.clone(),
+        );
         if let Some(outgoing) = lock(&self.0.state).outgoing.get_mut(request_id) {
             outgoing.receipt = Some(receipt.clone());
         }
@@ -1343,18 +1649,38 @@ impl PeerSession {
             epoch,
             mut receipt,
             deliveries,
+            entry,
+            recipients,
         } = self.prepare_publication(audience, text, request_id, fingerprint, peers)?;
+        let history = &self.0.host.history;
+        history
+            .record(entry, recipients)
+            .await
+            .map_err(|error| format!("{NOT_RECORDED}: {error}"))?;
+        let sender = self.0.route.target();
         for batch in deliveries.chunks(FANOUT_CONCURRENCY) {
             let sends: Vec<_> = batch
                 .iter()
                 .cloned()
                 .map(|(index, delivery)| {
                     let session = self.clone();
-                    smol::spawn(async move { (index, session.deliver(delivery, epoch).await) })
+                    let recipient = route_session(&delivery.target);
+                    smol::spawn(async move {
+                        (index, recipient, session.deliver(delivery, epoch).await)
+                    })
                 })
                 .collect();
             for send in sends {
-                let (index, sent) = send.await;
+                let (index, recipient_session, sent) = send.await;
+                if let Some(recipient_session) = recipient_session {
+                    history.receipt(
+                        sender.clone(),
+                        receipt.message_id.clone(),
+                        recipient_session,
+                        sent.status.clone(),
+                        sent.reason.clone(),
+                    );
+                }
                 let recipient = &mut receipt.recipients[index];
                 recipient.status = sent.status;
                 recipient.reason = sent.reason;
@@ -1381,11 +1707,7 @@ impl PeerSession {
         let epoch = state.epoch;
         if let Some(previous) = state.publications.get(request_id) {
             previous.issued.check_retry(&fingerprint, epoch)?;
-            return Ok(Fanout {
-                epoch,
-                receipt: previous.receipt.clone(),
-                deliveries: previous.unresolved(text),
-            });
+            return Ok(previous.fanout(epoch, text));
         }
         let peers = peers.ok_or(RETRY_EXPIRED)?;
         let now = Instant::now();
@@ -1440,16 +1762,111 @@ impl PeerSession {
                 skipped,
             },
         };
-        let fanout = Fanout {
-            epoch,
-            receipt: publication.receipt.clone(),
-            deliveries: publication.unresolved(text),
-        };
+        let fanout = publication.fanout(epoch, text);
         state.published.push_back(now);
         state
             .publications
             .insert(request_id.to_owned(), publication);
         Ok(fanout)
+    }
+
+    /// Offers the newest unseen message on each subscribed topic. A
+    /// caught-up message rides along with the next turn and never starts one.
+    pub async fn catch_up(&self) -> Result<(), String> {
+        let topics = {
+            let state = lock(&self.0.state);
+            state.ensure_open()?;
+            state.topics.clone()
+        };
+        if topics.is_empty() {
+            return Ok(());
+        }
+        let unseen = self
+            .0
+            .host
+            .history
+            .unseen(self.session_id().to_string(), topics, MAX_CATCH_UP)
+            .await?;
+        for stored in unseen.into_iter().rev() {
+            if let Some(delivery) = Delivery::from_history(stored, &self.0.route) {
+                self.0.admit_passive(delivery)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Every stored topic, most recently active first.
+    pub async fn topic_directory(&self) -> Result<Vec<TopicActivity>, String> {
+        lock(&self.0.state).reads_every_message()?;
+        Ok(self
+            .0
+            .host
+            .history
+            .directory()
+            .await?
+            .into_iter()
+            .map(|summary| TopicActivity {
+                topic: summary.topic,
+                messages: usize::try_from(summary.count).unwrap_or(usize::MAX),
+                last_ms: summary.last_ms,
+            })
+            .collect())
+    }
+
+    /// Stored messages on every topic `topic` matches, or on broadcasts
+    /// without one, newest first. Only messages this session would accept
+    /// automatically now keep their text.
+    pub async fn read_history(
+        &self,
+        topic: Option<String>,
+        before: Option<i64>,
+        limit: usize,
+    ) -> Result<PeerHistoryPage, String> {
+        let topic = topic.as_deref().map(parse_pattern).transpose()?;
+        let limit = limit.clamp(1, MAX_HISTORY_PAGE);
+        lock(&self.0.state).reads_every_message()?;
+        let mut stored = self
+            .0
+            .host
+            .history
+            .history(topic.clone(), before, limit + 1)
+            .await?;
+        let older = stored.len() > limit;
+        stored.truncate(limit);
+        let state = lock(&self.0.state);
+        let every_message = state.reads_every_message()?;
+        let before = stored.last().filter(|_| older).map(|oldest| oldest.seq);
+        let mut withheld = 0;
+        let messages = stored
+            .into_iter()
+            .filter_map(|stored| {
+                let sender = &stored.message.sender;
+                if !every_message
+                    && !Sender::from_history(sender)
+                        .is_some_and(|sender| state.same_cohort(&sender))
+                {
+                    withheld += 1;
+                    return None;
+                }
+                Some(StoredPeerMessage {
+                    seq: stored.seq,
+                    topic: match stored.message.audience {
+                        MessageAudience::Topic(topic) => Some(topic),
+                        MessageAudience::Direct | MessageAudience::Broadcast => None,
+                    },
+                    sender_name: stored.message.sender.name,
+                    sender_handle: stored.message.sender.handle,
+                    sent_ms: stored.message.created_ms,
+                    text: stored.message.text,
+                })
+            })
+            .collect();
+        Ok(PeerHistoryPage {
+            topic,
+            messages,
+            withheld,
+            before,
+        })
     }
 
     async fn deliver(&self, delivery: Delivery, epoch: u64) -> SendReceipt {
@@ -1587,7 +2004,10 @@ impl PeerSession {
     ) -> Result<PeerDecisionResult, String> {
         let result = match decision {
             PeerDecision::Approve => {
-                state.inbox[index].approved_epoch = Some(state.epoch);
+                let item = &mut state.inbox[index];
+                item.approved_epoch = Some(state.epoch);
+                // Local approval may start a turn even for a caught-up message.
+                item.passive = false;
                 state.reevaluate();
                 PeerDecisionResult::Queued
             }
@@ -1600,6 +2020,7 @@ impl PeerSession {
                         SendReceipt::new("refused", &item.delivery.message_id, Some(REJECTED));
                 }
                 state.reviews.remove(&item.origin.message_id);
+                state.report_rejected(&item);
                 PeerDecisionResult::Rejected
             }
         };
@@ -1618,25 +2039,36 @@ impl PeerSession {
         }
     }
 
+    /// Claims queued messages for a turn that happens anyway, so caught-up
+    /// messages ride along.
     pub fn claim(&self) -> Option<PeerClaim> {
         let mut state = lock(&self.0.state);
-        self.claim_locked(&mut state)
+        self.claim_locked(&mut state, false)
+    }
+
+    /// Claims queued messages only when one may start a turn of its own.
+    pub fn claim_wake(&self) -> Option<PeerClaim> {
+        let mut state = lock(&self.0.state);
+        self.claim_locked(&mut state, true)
     }
 
     pub fn claim_or_close(&self) -> Option<PeerClaim> {
         let mut state = lock(&self.0.state);
-        let claim = self.claim_locked(&mut state);
+        let claim = self.claim_locked(&mut state, true);
         if claim.is_none() {
             self.0.close_locked(&mut state);
         }
         claim
     }
 
-    fn claim_locked(&self, state: &mut SessionState) -> Option<PeerClaim> {
+    fn claim_locked(&self, state: &mut SessionState, wake: bool) -> Option<PeerClaim> {
         if !state.open {
             return None;
         }
         state.reevaluate();
+        if wake && !state.inbox.iter().any(InboxItem::is_waiting) {
+            return None;
+        }
         state.next_claim += 1;
         let claim_id = state.next_claim;
         let mut messages = Vec::new();
@@ -1800,25 +2232,32 @@ impl SessionState {
         match self.descriptor.inbound {
             InboundPolicy::Accept => None,
             InboundPolicy::Hold | InboundPolicy::Refuse => Some(HELD_POLICY),
-            InboundPolicy::Auto => {
-                let receiver_mode = WireMode::from(&self.descriptor.mode);
-                let compatible = matches!(
-                    (&delivery.sender.mode, &receiver_mode),
-                    (WireMode::Build, WireMode::Build) | (WireMode::Plan, WireMode::Plan)
-                );
-                let same_cwd = self.canonical_cwd.is_some()
-                    && self.canonical_cwd == delivery.sender.canonical_cwd;
-                if compatible
-                    && same_cwd
-                    && self.descriptor.permission_mode == PermissionMode::Ask
-                    && delivery.sender.permission_mode == PermissionMode::Ask
-                {
-                    None
-                } else {
-                    Some(HELD_COHORT)
-                }
-            }
+            InboundPolicy::Auto if self.same_cohort(&delivery.sender) => None,
+            InboundPolicy::Auto => Some(HELD_COHORT),
         }
+    }
+
+    /// Whether stored messages may be read without a cohort check: `accept`
+    /// reads every message, `auto` only what it would admit without review.
+    fn reads_every_message(&self) -> Result<bool, String> {
+        self.ensure_open()?;
+        match self.descriptor.inbound {
+            InboundPolicy::Accept => Ok(true),
+            InboundPolicy::Auto => Ok(false),
+            InboundPolicy::Hold | InboundPolicy::Refuse => Err(HISTORY_HELD.into()),
+        }
+    }
+
+    /// Whether `auto` admits `sender` without review: both sessions share a
+    /// canonical workspace and Plan or Build mode under Ask permissions.
+    fn same_cohort(&self, sender: &Sender) -> bool {
+        matches!(
+            (&sender.mode, WireMode::from(&self.descriptor.mode)),
+            (WireMode::Build, WireMode::Build) | (WireMode::Plan, WireMode::Plan)
+        ) && self.canonical_cwd.is_some()
+            && self.canonical_cwd == sender.canonical_cwd
+            && self.descriptor.permission_mode == PermissionMode::Ask
+            && sender.permission_mode == PermissionMode::Ask
     }
 
     fn reevaluate(&mut self) {
@@ -1830,8 +2269,62 @@ impl SessionState {
                 continue;
             }
             let reason = self.hold_reason(&item.delivery, item.approved_epoch);
-            self.inbox[index].state =
-                reason.map_or(ItemState::Pending, |reason| ItemState::Held(reason.into()));
+            let unchanged = match (&item.state, reason) {
+                (ItemState::Pending, None) => true,
+                (ItemState::Held(held), Some(reason)) => held == reason,
+                _ => false,
+            };
+            if !unchanged {
+                self.inbox[index].state =
+                    reason.map_or(ItemState::Pending, |reason| ItemState::Held(reason.into()));
+                self.report_state(&self.inbox[index]);
+            }
+        }
+    }
+
+    /// Reports whether a received message waits for a turn or for review.
+    fn report_state(&self, item: &InboxItem) {
+        match &item.state {
+            ItemState::Held(reason) => self.report(item, STATUS_HELD, Some(reason)),
+            ItemState::Pending | ItemState::Claimed(_) | ItemState::Staged => {
+                self.report(item, STATUS_QUEUED, None);
+            }
+        }
+    }
+
+    /// Reports what became of a message this session received.
+    fn report(&self, item: &InboxItem, status: &'static str, reason: Option<&str>) {
+        self.history.transition(
+            item.delivery.sender.route.target(),
+            item.delivery.message_id.clone(),
+            MessageRecipient {
+                session: self.descriptor.session_id.to_string(),
+                name: Some(self.descriptor.name.clone()),
+            },
+            status,
+            reason.map(str::to_owned),
+        );
+    }
+
+    /// Reports a message the conversation took in.
+    fn report_delivered(&self, item: &InboxItem) {
+        self.report(item, STATUS_DELIVERED, None);
+        self.report_seen(item);
+    }
+
+    /// Reports a message the user rejected, so catch-up never offers it again.
+    fn report_rejected(&self, item: &InboxItem) {
+        self.report(item, STATUS_REJECTED, Some(REJECTED));
+        self.report_seen(item);
+    }
+
+    fn report_seen(&self, item: &InboxItem) {
+        if item.delivery.audience.topic().is_some() {
+            self.history.seen(
+                self.descriptor.session_id.to_string(),
+                item.delivery.sender.route.target(),
+                item.delivery.message_id.clone(),
+            );
         }
     }
 }
@@ -1846,14 +2339,16 @@ impl SessionInner {
         state.open = false;
         state.epoch += 1;
         let mut released = 0;
-        state.inbox.retain(|item| {
-            if matches!(item.state, ItemState::Claimed(_)) {
-                true
-            } else {
-                released += item.bytes;
-                false
+        for item in mem::take(&mut state.inbox) {
+            match item.state {
+                ItemState::Claimed(_) => state.inbox.push_back(item),
+                ItemState::Staged => released += item.bytes,
+                ItemState::Pending | ItemState::Held(_) => {
+                    released += item.bytes;
+                    state.report(&item, STATUS_DROPPED, Some(CLOSED));
+                }
             }
-        });
+        }
         self.host.bytes.fetch_sub(released, Ordering::AcqRel);
         state.bytes -= released;
         state.outgoing.clear();
@@ -1862,6 +2357,104 @@ impl SessionInner {
         state.reviews.clear();
         state.claim = None;
         self.host.changed.notify(usize::MAX);
+    }
+
+    /// Queues `delivery`, held when policy says so. `None` when it would
+    /// exceed the session or process byte limit.
+    fn enqueue(
+        &self,
+        state: &mut SessionState,
+        delivery: Delivery,
+        encoded: usize,
+        reply_to: Option<String>,
+        passive: bool,
+    ) -> Result<Option<SendReceipt>, String> {
+        let sender = delivery.sender.route.target();
+        let identity = MessageIdentity {
+            sender: sender.clone(),
+            message_id: delivery.message_id.clone(),
+            recipients: Vec::new(),
+        };
+        let preferred =
+            valid_name(&delivery.message_id, MESSAGE_WORDS).then_some(delivery.message_id.as_str());
+        let alias = state.peer_names.name(sender.as_str(), None, peer_name)?;
+        let name = state
+            .message_names
+            .name(&identity, preferred, message_name)?;
+        let origin = PeerMessageOrigin {
+            message_id: name.as_str().to_owned(),
+            audience: delivery.audience.clone(),
+            sender_session_id: alias.as_str().to_owned(),
+            sender_name: delivery.sender.name.clone(),
+            sender_handle: delivery.sender.handle.clone(),
+            reply_target: alias.as_str().to_owned(),
+            reply_to,
+        };
+        let bytes = encoded
+            + serde_json::to_vec(&Message::peer_observation(
+                delivery.text.clone(),
+                origin.clone(),
+            ))
+            .map_err(|error| error.to_string())?
+            .len();
+        if state.bytes + bytes > MAX_SESSION_BYTES
+            || self
+                .host
+                .bytes
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    current
+                        .checked_add(bytes)
+                        .filter(|next| *next <= MAX_PROCESS_BYTES)
+                })
+                .is_err()
+        {
+            return Ok(None);
+        }
+        if let Name::Fresh(alias) = alias {
+            state.bind_peer(alias, sender);
+        }
+        if let Name::Fresh(name) = name {
+            state.bind_message(name, identity);
+        }
+        let reason = state.hold_reason(&delivery, None);
+        let item = InboxItem {
+            delivery,
+            origin,
+            bytes,
+            state: reason.map_or(ItemState::Pending, |reason| ItemState::Held(reason.into())),
+            approved_epoch: None,
+            passive,
+        };
+        let receipt = item.receipt();
+        state.report_state(&item);
+        state.bytes += bytes;
+        state.inbox.push_back(item);
+        self.host.changed.notify(usize::MAX);
+        Ok(Some(receipt))
+    }
+
+    /// Queues a caught-up topic message as a passive item, unless this
+    /// registration already has it or would not accept it live.
+    fn admit_passive(&self, delivery: Delivery) -> Result<(), String> {
+        let encoded = serde_json::to_vec(&delivery)
+            .map_err(|error| error.to_string())?
+            .len();
+        let mut state = lock(&self.state);
+        if !state.open
+            || state.dedup.contains_key(&delivery.dedup_key())
+            || state
+                .inbox
+                .iter()
+                .any(|item| item.delivery.same_message(&delivery))
+            || !subscribed(&delivery.audience, &state.topics, state.broadcasts)
+            || state.descriptor.inbound == InboundPolicy::Refuse
+            || delivery.sender.mode == WireMode::ReadOnly
+            || state.inbox.len() >= MAX_PENDING.min(MAX_HELD)
+        {
+            return Ok(());
+        }
+        self.enqueue(&mut state, delivery, encoded, None, true)?;
+        Ok(())
     }
 
     fn receive(
@@ -1881,36 +2474,7 @@ impl SessionInner {
                 Some(STALE_TARGET),
             ));
         }
-        if !(valid_name(&delivery.message_id, MESSAGE_WORDS) || valid_token(&delivery.message_id))
-            || !valid_token(&delivery.sender.route.host)
-            || !valid_token(&delivery.sender.route.generation)
-            || delivery.text.is_empty()
-            || delivery.text.len() > MAX_BODY_BYTES
-            || delivery.sender.name.len() > MAX_LABEL_BYTES
-            || delivery
-                .sender
-                .handle
-                .as_deref()
-                .is_some_and(|handle| !valid_handle(handle))
-            || delivery
-                .sender
-                .canonical_cwd
-                .as_ref()
-                .is_some_and(|path| !path.is_absolute() || path.as_os_str().len() > MAX_PATH_BYTES)
-            || delivery
-                .reply_to
-                .as_ref()
-                .is_some_and(|value| value.len() > MAX_CORRELATION_BYTES)
-            || delivery
-                .reply_sender
-                .as_deref()
-                .is_some_and(|sender| delivery.reply_to.is_none() || Route::parse(sender).is_err())
-            || delivery
-                .audience
-                .topic()
-                .is_some_and(|topic| parse_topic(topic).is_err())
-            || (!delivery.audience.is_direct() && delivery.reply_to.is_some())
-        {
+        if !delivery.has_valid_metadata() {
             return Err("Invalid peer message metadata or text bounds".into());
         }
         if retry_expired(delivery.issued_ms, now_ms)
@@ -1962,7 +2526,18 @@ impl SessionInner {
         {
             state.arrivals.pop_front();
         }
-        let receipt = if !subscribed(&delivery.audience, &state.topics, state.broadcasts) {
+        let caught_up = state
+            .inbox
+            .iter()
+            .position(|item| item.delivery.same_message(&delivery));
+        let receipt = if let Some(index) = caught_up {
+            // Caught up before it arrived; sent live, it may now start a turn.
+            let item = &mut state.inbox[index];
+            item.passive = false;
+            let receipt = item.receipt();
+            self.host.changed.notify(usize::MAX);
+            receipt
+        } else if !subscribed(&delivery.audience, &state.topics, state.broadcasts) {
             SendReceipt::new("refused", &delivery.message_id, Some(NOT_SUBSCRIBED))
         } else if state.descriptor.inbound == InboundPolicy::Refuse
             || delivery.sender.mode == WireMode::ReadOnly
@@ -1986,75 +2561,16 @@ impl SessionInner {
         } else if state.inbox.len() >= MAX_PENDING.min(MAX_HELD) {
             SendReceipt::new("rate_limited", &delivery.message_id, Some(FULL))
         } else {
-            let identity = MessageIdentity {
-                sender: sender.clone(),
-                message_id: delivery.message_id.clone(),
-                recipients: Vec::new(),
-            };
-            let preferred = valid_name(&delivery.message_id, MESSAGE_WORDS)
-                .then_some(delivery.message_id.as_str());
-            let alias = state.peer_names.name(sender.as_str(), None, peer_name)?;
-            let name = state
-                .message_names
-                .name(&identity, preferred, message_name)?;
-            let origin = PeerMessageOrigin {
-                message_id: name.as_str().to_owned(),
-                audience: delivery.audience.clone(),
-                sender_session_id: alias.as_str().to_owned(),
-                sender_name: delivery.sender.name.clone(),
-                sender_handle: delivery.sender.handle.clone(),
-                reply_target: alias.as_str().to_owned(),
-                reply_to,
-            };
-            let bytes = encoded.len()
-                + serde_json::to_vec(&Message::peer_observation(
-                    delivery.text.clone(),
-                    origin.clone(),
-                ))
-                .map_err(|error| error.to_string())?
-                .len();
-            if state.bytes + bytes > MAX_SESSION_BYTES
-                || self
-                    .host
-                    .bytes
-                    .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                        current
-                            .checked_add(bytes)
-                            .filter(|next| *next <= MAX_PROCESS_BYTES)
-                    })
-                    .is_err()
-            {
-                SendReceipt::new("rate_limited", &delivery.message_id, Some(FULL))
-            } else {
-                if let Name::Fresh(alias) = alias {
-                    state.bind_peer(alias, sender.clone());
+            match self.enqueue(&mut state, delivery.clone(), encoded.len(), reply_to, false)? {
+                Some(receipt) => {
+                    state.arrivals.push_back(Arrival {
+                        at: now,
+                        sender,
+                        text,
+                    });
+                    receipt
                 }
-                if let Name::Fresh(name) = name {
-                    state.bind_message(name, identity);
-                }
-                let reason = state.hold_reason(&delivery, None);
-                let receipt = SendReceipt::new(
-                    if reason.is_some() { "held" } else { "queued" },
-                    &delivery.message_id,
-                    reason,
-                );
-                let item_state =
-                    reason.map_or(ItemState::Pending, |reason| ItemState::Held(reason.into()));
-                state.bytes += bytes;
-                state.arrivals.push_back(Arrival {
-                    at: now,
-                    sender,
-                    text,
-                });
-                state.inbox.push_back(InboxItem {
-                    delivery: delivery.clone(),
-                    origin,
-                    bytes,
-                    state: item_state,
-                    approved_epoch: None,
-                });
-                self.host.changed.notify(usize::MAX);
-                receipt
+                None => SendReceipt::new("rate_limited", &delivery.message_id, Some(FULL)),
             }
         };
         state.dedup.insert(
@@ -2092,19 +2608,17 @@ impl PeerClaim {
         let mut state = lock(&self.session.0.state);
         let mut bytes = 0;
         let retain = stage && state.open;
-        state.inbox.retain_mut(|item| {
+        for mut item in mem::take(&mut state.inbox) {
             if matches!(item.state, ItemState::Claimed(id) if id == self.claim_id) {
-                if retain {
-                    item.state = ItemState::Staged;
-                    true
-                } else {
+                state.report_delivered(&item);
+                if !retain {
                     bytes += item.bytes;
-                    false
+                    continue;
                 }
-            } else {
-                true
+                item.state = ItemState::Staged;
             }
-        });
+            state.inbox.push_back(item);
+        }
         state.bytes -= bytes;
         self.session.0.host.bytes.fetch_sub(bytes, Ordering::AcqRel);
         state.reevaluate();
@@ -2125,14 +2639,14 @@ impl Drop for PeerClaim {
                 }
             } else {
                 let mut released = 0;
-                state.inbox.retain(|item| {
+                for item in mem::take(&mut state.inbox) {
                     if matches!(item.state, ItemState::Claimed(id) if id == self.claim_id) {
                         released += item.bytes;
-                        false
+                        state.report(&item, STATUS_DROPPED, Some(CLOSED));
                     } else {
-                        true
+                        state.inbox.push_back(item);
                     }
-                });
+                }
                 state.bytes -= released;
                 self.session
                     .0
@@ -2267,17 +2781,19 @@ mod tests {
     use tempfile::{Builder, TempDir, tempfile};
     use test_case::test_case;
 
+    use super::history::MessageHistory;
     use super::{
         AMBIGUOUS_HANDLE, AMBIGUOUS_REPLY, CLAIM_BATCH, CLOSED, DIRECT_PUBLICATION, DUPLICATE,
         DedupEntry, Delivery, FULL, HANDLE_PREFIX, HELD_BLOCKED, HELD_COHORT, HELD_POLICY,
-        HandleClaim, INVALID_HANDLE, Issued, MAX_BODY_BYTES, MAX_DEDUP, MAX_HELD,
-        MAX_MESSAGE_NAMES, MAX_NAME_ATTEMPTS, MAX_PEER_NAMES, MAX_PROCESS_BYTES, MAX_SESSION_BYTES,
-        MESSAGE_WORDS, MessageIdentity, NAME_COLLISION, NOT_HELD, NOT_SUBSCRIBED, NameTable,
-        Outgoing, PEER_WORDS, POLICY_FLOOR, PUBLISH_RATE_EXCEEDED, PeerDecision,
-        PeerDecisionResult, PeerDescriptor, PeerHost, PeerInfo, PeerSession, PeerSummary,
-        RATE_EXCEEDED, RATE_WINDOW, REFUSED_POLICY, REJECTED, RETRY_FULL, RETRY_WINDOW,
-        REUSED_REQUEST, Route, STALE_REVIEW, STALE_TARGET, SendReceipt, Sender, UNKNOWN_HANDLE,
-        UNKNOWN_REPLY, UNKNOWN_TARGET, WireMode, handle_in_use, lock, message_name, token,
+        HISTORY_HELD, HandleClaim, INVALID_HANDLE, Issued, MAX_BODY_BYTES, MAX_DEDUP, MAX_HELD,
+        MAX_HISTORY_PAGE, MAX_MESSAGE_NAMES, MAX_NAME_ATTEMPTS, MAX_PEER_NAMES, MAX_PROCESS_BYTES,
+        MAX_SESSION_BYTES, MESSAGE_WORDS, MessageIdentity, NAME_COLLISION, NOT_HELD, NOT_RECORDED,
+        NOT_SUBSCRIBED, NameTable, Outgoing, PEER_WORDS, POLICY_FLOOR, PUBLISH_RATE_EXCEEDED,
+        PeerDecision, PeerDecisionResult, PeerDescriptor, PeerHost, PeerInfo, PeerSession,
+        PeerSummary, RATE_EXCEEDED, RATE_WINDOW, REFUSED_POLICY, REJECTED, RETRY_FULL,
+        RETRY_WINDOW, REUSED_REQUEST, Route, STALE_REVIEW, STALE_TARGET, SendReceipt, Sender,
+        TEST_HISTORY_DIRECTORY, UNKNOWN_HANDLE, UNKNOWN_REPLY, UNKNOWN_TARGET, WireMode,
+        handle_in_use, literal, lock, message_name, token,
         topics::{INVALID_PATTERN, INVALID_TOPIC},
         valid_name, wall_ms,
     };
@@ -2783,7 +3299,11 @@ mod tests {
 
     #[test]
     fn disabled_start_is_inert() {
-        assert!(PeerHost::start(FeatureFlags::NONE).unwrap().is_none());
+        assert!(
+            PeerHost::start(FeatureFlags::NONE, &MessagingConfig::default())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -3803,9 +4323,16 @@ mod tests {
     fn host_cleanup_removes_only_its_own_files() {
         let directory = directory();
         let host = host(directory.path());
-        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
+        let runtime_files = || {
+            fs::read_dir(directory.path())
+                .unwrap()
+                .filter(|entry| entry.as_ref().unwrap().file_name() != TEST_HISTORY_DIRECTORY)
+                .count()
+        };
+        assert_eq!(runtime_files(), 2);
         drop(host);
-        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+        assert_eq!(runtime_files(), 0);
+        assert!(directory.path().join(TEST_HISTORY_DIRECTORY).is_dir());
     }
 
     #[test]
@@ -4883,5 +5410,175 @@ mod tests {
             error
         );
         assert!(lock(&session.0.state).publications.is_empty());
+    }
+
+    fn planner(host: &PeerHost, cwd: &Path) -> PeerSession {
+        host.register(PeerDescriptor {
+            mode: AgentMode::Plan(cwd.join(PLAN_MODE)),
+            ..descriptor(cwd, InboundPolicy::Auto)
+        })
+        .unwrap()
+    }
+
+    async fn publish_each(publisher: &PeerSession, texts: &[&str]) {
+        for (index, text) in texts.iter().enumerate() {
+            publisher
+                .publish(topic_audience(), text, &format!("{REQUEST_ID}-{index}"))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn catch_up_offers_the_newest_unseen_message_per_topic_without_waking() {
+        smol::block_on(async {
+            let (directory, host, publisher) = publisher_fixture(MessagingConfig::default());
+            publish_each(&publisher, &[TEXT, OTHER_TEXT]).await;
+            publisher
+                .set_subscriptions(patterns(&[TOPIC_PATTERN]), false)
+                .unwrap();
+            publisher.catch_up().await.unwrap();
+            assert!(publisher.claim().is_none());
+            let late = subscriber(&host, directory.path(), &[TOPIC_PATTERN], false);
+            late.catch_up().await.unwrap();
+            assert!(!late.has_pending());
+            assert!(late.claim_wake().is_none());
+            let claim = late.claim().unwrap();
+            assert_eq!(claim.messages().len(), 1);
+            let framed = claim.messages()[0].first_text_content().unwrap();
+            assert!(
+                framed.contains(OTHER_TEXT) && !framed.contains(TEXT),
+                "{framed}"
+            );
+            claim.commit();
+            late.catch_up().await.unwrap();
+            assert!(late.claim().is_none());
+        });
+    }
+
+    #[test]
+    fn a_caught_up_message_sent_live_may_wake_the_session() {
+        smol::block_on(async {
+            let (directory, host, publisher) = publisher_fixture(MessagingConfig::default());
+            publish_each(&publisher, &[TEXT]).await;
+            let late = subscriber(&host, directory.path(), &[TOPIC_PATTERN], false);
+            late.catch_up().await.unwrap();
+            let delivery = lock(&late.0.state).inbox[0].delivery.clone();
+            let receipt = late.0.receive(delivery, Instant::now(), wall_ms()).unwrap();
+            assert_eq!(receipt.status, QUEUED);
+            assert!(late.has_pending());
+            assert_eq!(late.claim_wake().unwrap().messages().len(), 1);
+        });
+    }
+
+    #[test_case(PeerDecision::Approve, true; "approval_may_wake")]
+    #[test_case(PeerDecision::Reject, false; "rejection_counts_as_seen")]
+    fn a_held_caught_up_message_follows_its_review(decision: PeerDecision, wakes: bool) {
+        smol::block_on(async {
+            let (directory, host, session) = fixture(InboundPolicy::Auto);
+            session
+                .set_subscriptions(patterns(&[TOPIC_PATTERN]), false)
+                .unwrap();
+            publish_each(&planner(&host, directory.path()), &[TEXT]).await;
+            session.catch_up().await.unwrap();
+            let held = session.held();
+            assert_eq!(held[0].reason, HELD_COHORT);
+            let review = session.review_held(&held[0].message_id).unwrap();
+            session.decide_held(&review.token, decision).unwrap();
+            assert_eq!(session.has_pending(), wakes);
+            session.catch_up().await.unwrap();
+            assert_eq!(session.held_count(), 0);
+            assert_eq!(session.claim().is_some(), wakes);
+        });
+    }
+
+    #[test]
+    fn messages_the_history_cannot_record_are_never_sent() {
+        smol::block_on(async {
+            let directory = directory();
+            let recorded = host(directory.path());
+            let receiver = subscriber(&recorded, directory.path(), &[TOPIC_PATTERN], false);
+            let unrecorded = PeerHost::bind(
+                directory.path().to_owned(),
+                MessageHistory::stopped(),
+                Arc::new(AtomicUsize::new(0)),
+            )
+            .unwrap();
+            let sender = unrecorded
+                .register(descriptor(directory.path(), InboundPolicy::Auto))
+                .unwrap();
+            let sent = sender
+                .send(&receiver.0.route.target(), TEXT, None, REQUEST_ID)
+                .await;
+            let published = sender
+                .publish(topic_audience(), OTHER_TEXT, ORIGINAL_REQUEST_ID)
+                .await;
+            for error in [sent.unwrap_err(), published.unwrap_err()] {
+                assert!(error.starts_with(NOT_RECORDED), "{error}");
+            }
+            assert!(receiver.claim().is_none());
+        });
+    }
+
+    #[test_case(InboundPolicy::Accept, Ok((2, 0)); "accept_reads_every_message")]
+    #[test_case(InboundPolicy::Auto, Ok((1, 1)); "auto_withholds_other_cohorts")]
+    #[test_case(InboundPolicy::Hold, Err(HISTORY_HELD); "hold_reads_nothing")]
+    #[test_case(InboundPolicy::Refuse, Err(HISTORY_HELD); "refuse_reads_nothing")]
+    fn stored_messages_are_read_under_the_inbound_policy(
+        inbound: InboundPolicy,
+        expected: Result<(usize, usize), &str>,
+    ) {
+        smol::block_on(async {
+            let (directory, host, publisher) = publisher_fixture(MessagingConfig::default());
+            publish_each(&publisher, &[TEXT]).await;
+            publish_each(&planner(&host, directory.path()), &[OTHER_TEXT]).await;
+            let reader = host
+                .register(descriptor(directory.path(), inbound))
+                .unwrap();
+            let read = reader
+                .read_history(Some(TOPIC_PATTERN.into()), None, MAX_HISTORY_PAGE)
+                .await
+                .map(|page| (page.messages.len(), page.withheld));
+            assert_eq!(read, expected.map_err(str::to_owned));
+            let topics = reader.topic_directory().await;
+            assert_eq!(
+                topics
+                    .ok()
+                    .map(|topics| (topics[0].topic.clone(), topics[0].messages)),
+                expected.ok().map(|_| (TOPIC.to_owned(), 2))
+            );
+        });
+    }
+
+    #[test]
+    fn history_pages_from_the_newest_message_to_the_oldest() {
+        smol::block_on(async {
+            let (_directory, _host, publisher) = publisher_fixture(MessagingConfig::default());
+            publish_each(&publisher, &[TEXT, OTHER_TEXT]).await;
+            let read = async |before| {
+                publisher
+                    .read_history(Some(TOPIC.into()), before, 1)
+                    .await
+                    .unwrap()
+            };
+            let newest = read(None).await;
+            assert_eq!(newest.messages[0].text, OTHER_TEXT);
+            assert!(newest.before.is_some());
+            let oldest = read(newest.before).await;
+            assert_eq!(oldest.messages[0].text, TEXT);
+            assert_eq!(oldest.before, None);
+        });
+    }
+
+    #[test_case(false, "line\\n\\r\\t\\u{1b}\\u{85}\\u{202e}\\u{2066}\\u{200f}終" ; "metadata")]
+    #[test_case(true, "line\n\\r\\t\\u{1b}\\u{85}\\u{202e}\\u{2066}\\u{200f}終" ; "body")]
+    fn terminal_controls_and_bidi_are_literal_but_body_newlines_survive(
+        newlines: bool,
+        expected: &str,
+    ) {
+        assert_eq!(
+            literal("line\n\r\t\u{1b}\u{85}\u{202e}\u{2066}\u{200f}終", newlines),
+            expected
+        );
     }
 }

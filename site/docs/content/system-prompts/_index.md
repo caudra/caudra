@@ -127,7 +127,7 @@ MCP selectors use canonical `server.tool` names, not provider wire aliases. Plug
 | `delegation` | `task`, `task_control`, `workflow` |
 | `support` | `batch`, `question`, `todo_write`, `plan` |
 | `images` | `view_image`, `image_generate` |
-| `messaging` | `list_sessions`, `send_message`, `publish_message` |
+| `messaging` | `list_sessions`, `send_message`, `publish_message`, `read_topic` |
 
 Select `memory` and `skill` individually. Messaging is optional and separate from support and delegation. It still requires its experimental opt-in, an eligible main-session runtime, peer inbound controls, and outgoing permissions.
 

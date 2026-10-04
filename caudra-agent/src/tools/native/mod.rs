@@ -147,6 +147,11 @@ fn entries(
                 ToolEffect::Mutating,
                 peers::PUBLISH_DESCRIPTION,
             ),
+            entry(
+                peers::ReadTopic,
+                ToolEffect::ReadOnly,
+                peers::READ_DESCRIPTION,
+            ),
         ]);
     }
     entries

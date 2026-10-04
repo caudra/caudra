@@ -67,7 +67,7 @@ Open the individual message's review before using an approve or reject command. 
 
 Press `p` outside filter editing to manage this session's inbound policy. Select an option and press `a` to apply it. Relaxing the policy requires confirmation because it can release held messages and start billable turns. Project restrictions remain in force. This control never changes the selected peer's policy.
 
-You can also ask the agent to find a session and send it a message. It uses `list_sessions` for discovery and `send_message` for delivery. It reaches many sessions at once through [topics and broadcasts](#topics-and-broadcasts). Discovery cards show session labels, [messaging names](#messaging-names), subscriptions, word-based targets, workspaces, and availability, without transcript previews. A title is not a unique address.
+You can also ask the agent to find a session and send it a message. It uses `list_sessions` for discovery and `send_message` for delivery. It reaches many sessions at once through [topics and broadcasts](#topics-and-broadcasts), and reads earlier topic messages from the [message history](#message-history). Discovery cards show session labels, [messaging names](#messaging-names), subscriptions, word-based targets, workspaces, and availability, without transcript previews. A title is not a unique address.
 
 Use the exact target from discovery or an incoming reply address. Targets belong to your current live registration and are never reassigned to a replacement peer. Discover again after restarting or replacing your session. Message names also use generated words, including the names shown by `/messages` for approval or rejection.
 
@@ -131,9 +131,35 @@ The recipient sees the audience in the message provenance. A reply goes to the p
 
 A receipt does not promise a reply or completed work. Do not treat `unknown` as a definite failure and send the same request again under a new identity.
 
-Queued and held messages live only in bounded memory. Closing or replacing the receiving session, exiting, or crashing can discard them. There is no offline inbox or crash-durable delivery guarantee. Messages already recorded in conversation history follow normal session retention. Reloading or rewinding history never sends them again.
+Queued and held messages live only in bounded memory. Closing or replacing the receiving session, exiting, or crashing can discard them. There is no offline inbox or crash-durable delivery guarantee. Messages already recorded in conversation history follow normal session retention. Reloading or rewinding history never sends them again. The [message history](#message-history) keeps a record of every message, and only topic messages return from it, through catch-up.
 
 Each body is limited to 32 KiB of UTF-8. The inbox admits at most 50 messages across pending, held, and claimed states, with a 1 MiB session ceiling and an 8 MiB process ceiling. A full inbox rejects new messages rather than evicting older ones.
+
+### Message history
+
+Every message a session sends is recorded in a message history that all sessions of your user share. This covers direct messages, topic messages, and broadcasts. An entry keeps the sender, the audience, the text, and each recipient's outcome as it moves from queued or held to delivered, rejected, or dropped. The history is the SQLite file `messages.db` in the [state directory](/docs/configuration/#directory-layout), and only your user can read it. Recording happens before sending. When the history cannot record a message, the send fails and no recipient gets it.
+
+The history is a record rather than an inbox, so a message still needs a live recipient when it is sent. Sessions use the history in two ways.
+
+Catch-up brings a session up to date on its topics. When a session registers, changes its subscriptions, or starts a turn, it collects the newest message it has not seen on each topic it subscribes to, at most 16 messages. They join the next turn without starting one. A message counts as seen once the conversation takes it in or you reject it. Caught-up messages pass the same inbound policy as live ones, so a message the policy holds waits in Held messages.
+
+Agents read the history with `read_topic`. Without arguments it lists stored topics with their message counts and latest activity. With a topic or subscription pattern, or with `broadcast: true`, it returns up to 50 messages per page, newest first. While older messages remain, the page also returns a `before` value that reads them. Reading wakes no session and leaves catch-up unchanged. Direct messages stay out of its results. The session's inbound policy decides what its agent may read:
+
+| Inbound policy | `read_topic` returns |
+|---|---|
+| `accept` | Every stored message |
+| `auto` | Messages from senders the session would accept automatically. The rest are counted as withheld, without their text |
+| `hold`, `refuse` | An error |
+
+Caudra removes messages older than `history_days`, except the newest message on each topic, and then the oldest messages beyond `history_max_messages`. Pruning runs when a process opens the history, and at most once an hour while that process uses it. Every project shares one history, so only the global `caudra.toml` can set these limits:
+
+```toml
+[agent.messaging]
+history_days = 30
+history_max_messages = 50000
+```
+
+A project file that sets either key fails to load.
 
 ### Rate limits and cost
 

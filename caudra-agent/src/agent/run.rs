@@ -53,7 +53,7 @@ use crate::decisions::{
 };
 use crate::mcp::{McpRequestSnapshot, McpSession};
 use crate::nudge::Nudge;
-use crate::peers::PeerSession;
+use crate::peers::{PeerClaim, PeerSession};
 use crate::permissions::PermissionManager;
 use crate::template::Vars;
 use crate::tools::ToolFilter;
@@ -1184,11 +1184,26 @@ impl<'h> Agent<'h> {
         push_injected(self.history, &self.event_tx, message);
     }
 
-    fn inject_peer_messages(&mut self) -> bool {
-        self.claim_peer_messages(false)
+    /// Offers caught-up topic messages to this run's first request.
+    async fn catch_up_peers(&self) {
+        if let Some(peers) = &self.peers
+            && let Err(error) = peers.catch_up().await
+        {
+            warn!(%error, "peer message catch-up failed");
+        }
     }
 
-    fn claim_peer_messages(&mut self, finishing: bool) -> bool {
+    /// Claims messages for a request that happens anyway, so caught-up
+    /// messages ride along.
+    fn inject_peer_messages(&mut self) -> bool {
+        self.claim_peer_messages(false, PeerSession::claim)
+    }
+
+    fn claim_peer_messages(
+        &mut self,
+        finishing: bool,
+        claim: fn(&PeerSession) -> Option<PeerClaim>,
+    ) -> bool {
         if self.cancel.is_cancelled()
             || steering::lock(&self.steering).turn_limit_reached(self.config.max_turns)
             || self
@@ -1207,7 +1222,7 @@ impl<'h> Agent<'h> {
         let claim = if finishing && self.close_peers_on_done {
             peers.claim_or_close()
         } else {
-            peers.claim()
+            claim(peers)
         };
         let Some(claim) = claim else {
             return false;
@@ -1252,7 +1267,10 @@ impl<'h> Agent<'h> {
                 }
                 return Ok(DoneReason::MaxTurns);
             }
-            if initial && peer_wake && !self.inject_peer_messages() {
+            if initial {
+                self.catch_up_peers().await;
+            }
+            if initial && peer_wake && !self.claim_peer_messages(false, PeerSession::claim_wake) {
                 return Ok(DoneReason::EndTurn);
             }
             self.inject_owned_results().await?;
@@ -1279,7 +1297,9 @@ impl<'h> Agent<'h> {
                     {
                         continue;
                     }
-                    if reason == DoneReason::EndTurn && self.claim_peer_messages(true) {
+                    if reason == DoneReason::EndTurn
+                        && self.claim_peer_messages(true, PeerSession::claim_wake)
+                    {
                         continue;
                     }
                     return Ok(reason);

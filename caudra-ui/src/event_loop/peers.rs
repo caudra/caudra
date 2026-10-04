@@ -7,6 +7,7 @@ use caudra_agent::peers::{
 use caudra_config::{Feature, InboundPolicy};
 use flume::{Receiver, TryRecvError};
 use smol::Task;
+use tracing::warn;
 
 use super::{EventLoop, SessionRuntime, SessionStatus, SpawnCtx};
 use crate::AppSession;
@@ -38,6 +39,7 @@ pub(super) struct PeerRegistration {
     reviewed: HashMap<String, PeerReviewToken>,
     held_count: usize,
     discovery: Option<PeerDiscovery>,
+    catch_up: Option<Task<()>>,
 }
 
 struct PeerDiscovery {
@@ -48,12 +50,26 @@ struct PeerDiscovery {
 
 impl PeerRegistration {
     fn new(session: PeerSession) -> Self {
-        Self {
+        let mut registration = Self {
             session,
             reviewed: HashMap::new(),
             held_count: 0,
             discovery: None,
-        }
+            catch_up: None,
+        };
+        registration.catch_up();
+        registration
+    }
+
+    /// Offers the newest unseen message on each subscribed topic; they ride
+    /// along with the next turn without starting one.
+    fn catch_up(&mut self) {
+        let session = self.session.clone();
+        self.catch_up = Some(smol::spawn(async move {
+            if let Err(error) = session.catch_up().await {
+                warn!(%error, "peer message catch-up failed");
+            }
+        }));
     }
 
     fn discover(&mut self, generation: u64) -> bool {
@@ -548,7 +564,9 @@ impl EventLoop<'_> {
         };
         let current = session.controls();
         let args: Vec<String> = args.split_whitespace().map(str::to_owned).collect();
-        let result = match subscription_request(&current.topics, current.broadcasts, &args) {
+        let request = subscription_request(&current.topics, current.broadcasts, &args);
+        let changing = matches!(request, SubscriptionRequest::Change(Ok(_)));
+        let result = match request {
             SubscriptionRequest::Show => {
                 Ok(subscriptions_summary(&current.topics, current.broadcasts))
             }
@@ -561,7 +579,12 @@ impl EventLoop<'_> {
             }),
         };
         match result {
-            Ok(summary) => runtime.peer_notice(summary),
+            Ok(summary) => {
+                if changing && let Some(peer) = &mut runtime.peer {
+                    peer.catch_up();
+                }
+                runtime.peer_notice(summary);
+            }
             Err(error) => runtime.app.flash(error),
         }
     }

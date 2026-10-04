@@ -130,6 +130,11 @@ pub const DEFAULT_SENDER_PER_MINUTE: usize = 16;
 pub const DEFAULT_PUBLISH_PER_MINUTE: usize = 16;
 pub const DEFAULT_MAX_FANOUT: usize = 32;
 pub const MIN_MESSAGE_RATE: usize = 1;
+pub const DEFAULT_HISTORY_DAYS: u64 = 30;
+pub const DEFAULT_HISTORY_MAX_MESSAGES: u64 = 50_000;
+pub const MIN_HISTORY_LIMIT: u64 = 1;
+const HISTORY_DAYS_KEY: &str = "agent.messaging.history_days";
+const HISTORY_MAX_MESSAGES_KEY: &str = "agent.messaging.history_max_messages";
 pub const MIN_PER_TOOL_OUTPUT_BYTES: usize = 256;
 pub const MIN_PER_TOOL_OUTPUT_LINES: usize = 4;
 pub const MIN_COMPACTION_BUFFER: u32 = 1_000;
@@ -288,6 +293,7 @@ pub const CAUDRA_NATIVE_TOOL_NAMES: &[&str] = &[
     "plan",
     "publish_message",
     "question",
+    "read_topic",
     "send_message",
     "skill",
     "task",
@@ -565,6 +571,8 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
 pub enum ConfigError {
     #[error("invalid project config: {0} is global-only; projects cannot change permission modes")]
     ProjectPermissionMode(&'static str),
+    #[error("invalid project config: {0} is global-only; every project shares one message history")]
+    ProjectMessageHistory(&'static str),
     #[error(transparent)]
     Decisions(#[from] decisions::DecisionsConfigError),
     #[error("invalid config: agent.steering.{field}: {message}")]
@@ -656,6 +664,9 @@ pub struct RawConfig {
     #[serde(skip)]
     #[doc(hidden)]
     pub project_permission_mode_override: Option<&'static str>,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub project_message_history_override: Option<&'static str>,
     pub always_fast: Option<bool>,
     pub always_thinking: Option<AlwaysThinking>,
     #[serde(default)]
@@ -679,6 +690,14 @@ impl RawConfig {
             .or(overlay.always_auto.map(|_| "always_auto"));
         self.decisions.restrict(mem::take(&mut overlay.decisions));
         let messaging = &mut overlay.agent.messaging;
+        self.project_message_history_override = self
+            .project_message_history_override
+            .or(overlay.project_message_history_override)
+            .or(messaging.history_days.take().map(|_| HISTORY_DAYS_KEY))
+            .or(messaging
+                .history_max_messages
+                .take()
+                .map(|_| HISTORY_MAX_MESSAGES_KEY));
         messaging.project_inbound = messaging
             .project_inbound
             .take()
@@ -716,6 +735,9 @@ impl RawConfig {
         self.project_permission_mode_override = self
             .project_permission_mode_override
             .or(overlay.project_permission_mode_override);
+        self.project_message_history_override = self
+            .project_message_history_override
+            .or(overlay.project_message_history_override);
         merge_option!(self, overlay, always_yolo, always_auto);
         self.decisions.overlay(mem::take(&mut overlay.decisions));
         self.merge_shared(overlay);
@@ -741,6 +763,9 @@ impl RawConfig {
     pub fn into_config(self, no_rtk: bool) -> Result<Config, ConfigError> {
         if let Some(field) = self.project_permission_mode_override {
             return Err(ConfigError::ProjectPermissionMode(field));
+        }
+        if let Some(field) = self.project_message_history_override {
+            return Err(ConfigError::ProjectMessageHistory(field));
         }
         self.validate_plugin_tables()?;
         let index_max_file_size_mb = self.index_max_file_size_mb()?;
@@ -1344,6 +1369,8 @@ pub struct MessagingFileConfig {
     pub sender_per_minute: Option<usize>,
     pub publish_per_minute: Option<usize>,
     pub max_fanout: Option<usize>,
+    pub history_days: Option<u64>,
+    pub history_max_messages: Option<u64>,
     #[serde(skip)]
     pub project_inbound: Option<InboundPolicy>,
     #[serde(skip)]
@@ -1365,7 +1392,9 @@ impl MessagingFileConfig {
             inbound_per_minute,
             sender_per_minute,
             publish_per_minute,
-            max_fanout
+            max_fanout,
+            history_days,
+            history_max_messages
         );
         self.project_inbound_per_minute = lowest(
             self.project_inbound_per_minute,
@@ -1408,6 +1437,10 @@ impl MessagingFileConfig {
                 DEFAULT_PUBLISH_PER_MINUTE,
             ),
             max_fanout: rate(self.max_fanout, self.project_max_fanout, DEFAULT_MAX_FANOUT),
+            history_days: self.history_days.unwrap_or(DEFAULT_HISTORY_DAYS),
+            history_max_messages: self
+                .history_max_messages
+                .unwrap_or(DEFAULT_HISTORY_MAX_MESSAGES),
             project_inbound: self.project_inbound,
         }
     }
@@ -2258,6 +2291,7 @@ impl ToolOutputLines {
                 "list_sessions",
                 "publish_message",
                 "question",
+                "read_topic",
                 "send_message",
                 "skill",
                 "todo_write",
@@ -2383,6 +2417,20 @@ pub struct MessagingConfig {
         desc = "Most live sessions one topic or broadcast publication reaches. Extra recipients are skipped and counted. Project settings may only lower it"
     )]
     pub max_fanout: usize,
+
+    #[config(
+        default = DEFAULT_HISTORY_DAYS,
+        min = MIN_HISTORY_LIMIT,
+        desc = "Days the shared message history keeps a message. The newest message on each topic outlives this until `history_max_messages` evicts it. Global config only"
+    )]
+    pub history_days: u64,
+
+    #[config(
+        default = DEFAULT_HISTORY_MAX_MESSAGES,
+        min = MIN_HISTORY_LIMIT,
+        desc = "Most messages the shared message history keeps; the oldest go first. Global config only"
+    )]
+    pub history_max_messages: u64,
 
     /// The strictest explicit project policy. No project policy leaves session
     /// controls free to choose `Accept`, even when the global default is `Auto`.
@@ -3863,6 +3911,9 @@ mod tests {
     const SENDER_RATE_FIELD: &str = "sender_per_minute";
     const PUBLISH_RATE_FIELD: &str = "publish_per_minute";
     const FANOUT_FIELD: &str = "max_fanout";
+    const HISTORY_DAYS_FIELD: &str = "history_days";
+    const HISTORY_MAX_FIELD: &str = "history_max_messages";
+    const CUSTOM_HISTORY_LIMIT: u64 = 7;
     const LOW_RATE: usize = 4;
     const MIDDLE_RATE: usize = 32;
     const HIGH_RATE: usize = 128;
@@ -4083,6 +4134,56 @@ mod tests {
             raw = rate_layer(field, below);
         }
         let error = raw.into_config(false).unwrap().validate().unwrap_err();
+        assert!(
+            matches!(error, ConfigError::BelowMinimum { field: refused, .. } if refused == field),
+            "{error}"
+        );
+    }
+
+    fn history_layer(field: &str, value: u64) -> RawConfig {
+        toml::from_str(&format!("[agent.messaging]\n{field} = {value}")).unwrap()
+    }
+
+    #[test_case(HISTORY_DAYS_FIELD, None, DEFAULT_HISTORY_DAYS; "days_default")]
+    #[test_case(HISTORY_MAX_FIELD, None, DEFAULT_HISTORY_MAX_MESSAGES; "max_default")]
+    #[test_case(HISTORY_DAYS_FIELD, Some(CUSTOM_HISTORY_LIMIT), CUSTOM_HISTORY_LIMIT; "days_global")]
+    #[test_case(HISTORY_MAX_FIELD, Some(CUSTOM_HISTORY_LIMIT), CUSTOM_HISTORY_LIMIT; "max_global")]
+    fn message_history_limits_resolve_from_global_config(
+        field: &str,
+        global: Option<u64>,
+        expected: u64,
+    ) {
+        let raw = global.map_or_else(RawConfig::default, |value| history_layer(field, value));
+        let config = raw.into_config(false).unwrap();
+        config.validate().unwrap();
+        let messaging = &config.agent.messaging;
+        let resolved = match field {
+            HISTORY_DAYS_FIELD => messaging.history_days,
+            _ => messaging.history_max_messages,
+        };
+        assert_eq!(resolved, expected);
+    }
+
+    #[test_case(HISTORY_DAYS_FIELD, HISTORY_DAYS_KEY; "days")]
+    #[test_case(HISTORY_MAX_FIELD, HISTORY_MAX_MESSAGES_KEY; "max_messages")]
+    fn project_layers_cannot_set_message_history(field: &str, key: &str) {
+        let mut raw = history_layer(field, CUSTOM_HISTORY_LIMIT);
+        raw.merge(history_layer(field, CUSTOM_HISTORY_LIMIT));
+        raw.merge_global(RawConfig::default());
+        assert!(matches!(
+            raw.into_config(false),
+            Err(ConfigError::ProjectMessageHistory(refused)) if refused == key
+        ));
+    }
+
+    #[test_case(HISTORY_DAYS_FIELD; "days")]
+    #[test_case(HISTORY_MAX_FIELD; "max_messages")]
+    fn zero_message_history_limit_is_rejected(field: &str) {
+        let error = history_layer(field, MIN_HISTORY_LIMIT - 1)
+            .into_config(false)
+            .unwrap()
+            .validate()
+            .unwrap_err();
         assert!(
             matches!(error, ConfigError::BelowMinimum { field: refused, .. } if refused == field),
             "{error}"
@@ -6430,6 +6531,7 @@ mod tests {
     #[test_case("list_sessions" ; "peer_discovery")]
     #[test_case("send_message" ; "peer_send")]
     #[test_case("publish_message" ; "peer_publish")]
+    #[test_case("read_topic" ; "peer_history")]
     #[test_case("github.create_issue" ; "mcp_tool")]
     #[test_case("github.*" ; "mcp_server")]
     fn agent_disabled_tools_accepts(tool: &str) {
