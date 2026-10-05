@@ -63,7 +63,8 @@
             || (builtins.match ".*/words/.*" path != null)
             || (builtins.match ".*/decisions/questions/.*" path != null)
             || (builtins.match ".*/caudra-workflow/(builtins|skill)/.*" path != null)
-            || (builtins.match ".*/site/docs/content/.*" path != null)
+            || (builtins.match ".*/site/src/content/docs/.*" path != null)
+            || (lib.hasSuffix "/site/src/data/docs-navigation.json" path)
             || (lib.hasSuffix ".lua" path);
           src = lib.cleanSource ./.;
         };
@@ -268,10 +269,12 @@
         {
           default = craneLib.devShell {
             packages = with pkgs; [
+              bun
               cargo-machete
               cargo-nextest
               git
               just
+              nodejs_24
               openssl
               perl
               pkg-config

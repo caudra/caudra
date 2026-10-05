@@ -1,4 +1,4 @@
-//! Caudra's user documentation as data: the pages under `site/docs/content`, their sections and addresses, the
+//! Caudra's user documentation as data: the pages under `site/src/content/docs`, their sections and addresses, the
 //! index the model reads, the text the TUI renders, and a search over all of it.
 //!
 //! Nothing is embedded here. The binary embeds the Markdown and hands it to [`Library::parse`], so a docs edit
@@ -11,9 +11,11 @@ mod search;
 mod slug;
 
 use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::sync::OnceLock;
 
+use serde::Deserialize;
 use thiserror::Error;
 
 pub use search::{Correction, Hit, Search};
@@ -25,15 +27,11 @@ Load it before answering questions about using or configuring Caudra.";
 pub const SITE_DOCS_URL: &str = "https://caudra.ai/docs/";
 
 const DOCS_PATH: &str = "/docs/";
-const LANDING_PAGE: &str = "_index.md";
-const FRONT_MATTER_FENCE: &str = "+++";
+const LANDING_PAGE: &str = "index";
+const FRONT_MATTER_FENCE: &str = "---";
+const NAVIGATION_FILE: &str = "docs-navigation.json";
 const PAGE_TITLE_LEVEL: u8 = 1;
 const SECTION_LEVEL: u8 = 2;
-const EYEBROW_CLASS: &str = "eyebrow";
-const CARD_TITLE_CLASS: &str = "card-title";
-const CARD_DESCRIPTION_CLASS: &str = "card-desc";
-const CARD_MARKER: &str = "class=\"card\"";
-const HREF_ATTRIBUTE: &str = "href=\"";
 
 /// How the TUI reaches the library the binary parses on first use.
 pub type DocsLibrary = fn() -> &'static Library;
@@ -86,44 +84,116 @@ pub enum DocsError {
     EmptyQuery,
 }
 
-struct Card {
-    slug: &'static str,
+#[derive(Debug, Error, PartialEq, Eq)]
+#[error("Invalid docs source `{path}`: {message}")]
+pub struct SourceError {
+    pub path: String,
+    pub message: String,
+}
+
+impl SourceError {
+    fn new(path: &str, message: impl Into<String>) -> Self {
+        Self {
+            path: path.to_owned(),
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Metadata {
     title: String,
     description: String,
-    group: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Navigation {
+    groups: Vec<Group>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Group {
+    label: String,
+    pages: Vec<String>,
 }
 
 impl Library {
-    /// Builds the library from `(path, contents)` pairs relative to `site/docs/content`. The landing page supplies
-    /// the order, groups, titles and one-line descriptions; each `<slug>/_index.md` is a page.
-    pub fn parse(files: impl IntoIterator<Item = (&'static str, &'static str)>) -> Self {
-        let mut landing = "";
-        let mut sources = Vec::new();
+    /// Validates flat `<slug>.md` sources with YAML metadata and the shared navigation manifest.
+    /// The overview is first, followed by every other page in navigation order.
+    pub fn parse(
+        files: impl IntoIterator<Item = (&'static str, &'static str)>,
+        navigation: &str,
+    ) -> Result<Self, SourceError> {
+        let navigation: Navigation = serde_json::from_str(navigation)
+            .map_err(|error| SourceError::new(NAVIGATION_FILE, error.to_string()))?;
+        let mut sources = BTreeMap::new();
         for (path, text) in files {
-            if path == LANDING_PAGE {
-                landing = text;
-            } else if let Some(slug) = page_slug(path) {
-                sources.push((slug, text));
+            let slug = page_slug(path).ok_or_else(|| {
+                SourceError::new(path, "expected a flat lowercase <slug>.md filename")
+            })?;
+            let page = Page::parse(slug, text)?;
+            if sources.insert(slug, page).is_some() {
+                return Err(SourceError::new(path, "duplicate page source"));
             }
         }
-        let cards = cards(landing);
-        let card_position = |slug: &str| {
-            cards
-                .iter()
-                .position(|card| card.slug == slug)
-                .unwrap_or(usize::MAX)
-        };
-        sources.sort_by_key(|&(slug, _)| (card_position(slug), slug));
-        let pages = sources
-            .into_iter()
-            .map(|(slug, text)| {
-                Page::parse(slug, text, cards.iter().find(|card| card.slug == slug))
-            })
-            .collect();
-        Self {
+        let mut overview = sources
+            .remove(LANDING_PAGE)
+            .ok_or_else(|| SourceError::new("index.md", "missing overview page"))?;
+        overview.group = "Overview".to_owned();
+        let mut pages = vec![overview];
+        let mut listed = BTreeSet::new();
+        let mut labels = BTreeSet::new();
+        for group in navigation.groups {
+            if group.label.trim().is_empty() || group.pages.is_empty() {
+                return Err(SourceError::new(
+                    NAVIGATION_FILE,
+                    "each group needs a nonempty label and pages",
+                ));
+            }
+            if !labels.insert(group.label.clone()) {
+                return Err(SourceError::new(
+                    NAVIGATION_FILE,
+                    format!("duplicate group label `{}`", group.label),
+                ));
+            }
+            for slug in group.pages {
+                if slug == LANDING_PAGE || !listed.insert(slug.clone()) {
+                    return Err(SourceError::new(
+                        NAVIGATION_FILE,
+                        format!(
+                            "page `{slug}` must be listed exactly once; index must not be listed"
+                        ),
+                    ));
+                }
+                let mut page = sources.remove(slug.as_str()).ok_or_else(|| {
+                    SourceError::new(
+                        NAVIGATION_FILE,
+                        format!(
+                            "group `{}` references missing page `{slug}.md`",
+                            group.label
+                        ),
+                    )
+                })?;
+                page.group.clone_from(&group.label);
+                pages.push(page);
+            }
+        }
+        if !sources.is_empty() {
+            return Err(SourceError::new(
+                NAVIGATION_FILE,
+                format!(
+                    "add unlisted pages to a group: {}",
+                    sources.keys().copied().collect::<Vec<_>>().join(", ")
+                ),
+            ));
+        }
+        Ok(Self {
             pages,
             search: OnceLock::new(),
-        }
+        })
     }
 
     pub fn pages(&self) -> &[Page] {
@@ -221,6 +291,7 @@ impl Library {
     }
 
     fn page_index(&self, slug: &str) -> Option<usize> {
+        let slug = if slug.is_empty() { LANDING_PAGE } else { slug };
         self.pages
             .iter()
             .position(|page| page.slug.eq_ignore_ascii_case(slug))
@@ -228,25 +299,31 @@ impl Library {
 }
 
 impl Page {
-    fn parse(slug: &'static str, text: &'static str, card: Option<&Card>) -> Self {
-        let body = markdown::without_comments(strip_front_matter(text));
+    fn parse(slug: &'static str, text: &'static str) -> Result<Self, SourceError> {
+        let path = format!("{slug}.md");
+        let (metadata, text) = metadata(&path, text)?;
+        let text = markdown::without_comments(text);
+        if markdown::headings(&text)
+            .iter()
+            .any(|heading| heading.level == PAGE_TITLE_LEVEL)
+        {
+            return Err(SourceError::new(
+                &path,
+                "put the page title in frontmatter, not a body H1",
+            ));
+        }
+        let body = Cow::Owned(format!("# {}\n\n{}", metadata.title, text.trim_start()));
         let headings = markdown::headings(&body);
-        let title = card
-            .map(|card| card.title.clone())
-            .or_else(|| headings.first().map(|heading| heading.title.clone()))
-            .unwrap_or_else(|| slug.to_owned());
-        Self {
+        Ok(Self {
             slug,
-            title,
-            description: card
-                .map(|card| card.description.clone())
-                .unwrap_or_default(),
-            group: card.map(|card| card.group.clone()).unwrap_or_default(),
+            title: metadata.title,
+            description: metadata.description,
+            group: String::new(),
             display: display::render(&body, slug),
             line_starts: line_starts(&body),
             body,
             headings,
-        }
+        })
     }
 
     /// Heading `index` and its text up to the next heading of the same or a higher level. The page title is the
@@ -292,8 +369,12 @@ pub fn line_starts(text: &str) -> Vec<usize> {
 }
 
 fn page_slug(path: &str) -> Option<&str> {
-    let slug = path.strip_suffix(LANDING_PAGE)?.strip_suffix(['/', '\\'])?;
-    (!slug.is_empty() && !slug.contains(['/', '\\'])).then_some(slug)
+    let slug = path.strip_suffix(".md")?;
+    (!slug.is_empty()
+        && slug
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'))
+    .then_some(slug)
 }
 
 fn split_address(path: &str) -> (&str, Option<&str>) {
@@ -306,78 +387,68 @@ fn split_address(path: &str) -> (&str, Option<&str>) {
     )
 }
 
-fn strip_front_matter(text: &str) -> &str {
-    let Some(rest) = text
-        .strip_prefix(FRONT_MATTER_FENCE)
-        .and_then(|rest| rest.strip_prefix('\n'))
-    else {
-        return text;
-    };
-    let closing = format!("\n{FRONT_MATTER_FENCE}");
-    rest.find(&closing).map_or(text, |end| {
-        rest[end + closing.len()..].trim_start_matches(['\r', '\n'])
-    })
-}
-
-fn cards(landing: &'static str) -> Vec<Card> {
-    let mut group = String::new();
-    let mut cards = Vec::new();
-    for line in landing.lines() {
-        if let Some(eyebrow) = span_text(line, EYEBROW_CLASS) {
-            group = eyebrow.to_owned();
-        }
-        if !line.contains(CARD_MARKER) {
-            continue;
-        }
-        let slug = attribute(line, HREF_ATTRIBUTE)
-            .and_then(|href| href.strip_prefix(DOCS_PATH))
-            .map(|slug| slug.trim_end_matches('/'));
-        let (Some(slug), Some(title)) = (slug, span_text(line, CARD_TITLE_CLASS)) else {
-            continue;
-        };
-        cards.push(Card {
-            slug,
-            title: title.to_owned(),
-            description: span_text(line, CARD_DESCRIPTION_CLASS)
-                .unwrap_or_default()
-                .to_owned(),
-            group: group.clone(),
-        });
+fn metadata<'a>(path: &str, text: &'a str) -> Result<(Metadata, &'a str), SourceError> {
+    let mut lines = text.split_inclusive('\n');
+    let opening = lines.next().unwrap_or_default();
+    if opening.trim_end() != FRONT_MATTER_FENCE {
+        return Err(SourceError::new(
+            path,
+            "start the page with YAML frontmatter fenced by ---",
+        ));
     }
-    cards
-}
-
-fn span_text<'a>(line: &'a str, class: &str) -> Option<&'a str> {
-    let open = format!("<span class=\"{class}\">");
-    let start = line.find(&open)? + open.len();
-    let end = line[start..].find("</span>")?;
-    Some(&line[start..start + end])
-}
-
-fn attribute<'a>(line: &'a str, name: &str) -> Option<&'a str> {
-    let start = line.find(name)? + name.len();
-    let end = line[start..].find('"')?;
-    Some(&line[start..start + end])
+    let start = opening.len();
+    let mut end = start;
+    for line in lines {
+        if line.trim_end() == FRONT_MATTER_FENCE {
+            let metadata: Metadata = serde_yaml::from_str(&text[start..end])
+                .map_err(|error| SourceError::new(path, format!("YAML frontmatter: {error}")))?;
+            for (name, value) in [
+                ("title", &metadata.title),
+                ("description", &metadata.description),
+            ] {
+                if value.trim().is_empty() || value.contains(['\r', '\n']) {
+                    return Err(SourceError::new(
+                        path,
+                        format!("`{name}` must be a nonempty single line"),
+                    ));
+                }
+            }
+            return Ok((metadata, &text[end + line.len()..]));
+        }
+        end += line.len();
+    }
+    Err(SourceError::new(
+        path,
+        "close YAML frontmatter with a line containing ---",
+    ))
 }
 
 #[cfg(test)]
 pub(crate) mod fixture {
     use super::Library;
 
-    /// A library over the given `(slug, page)` pairs, each with a landing card, in the order given.
+    /// A library over Markdown snippets, in the order given, without an overview fixture.
     pub(crate) fn library(pages: &[(&'static str, &'static str)]) -> Library {
-        let landing: String = pages
-            .iter()
-            .map(|(slug, _)| {
-                format!(
-                    "<span class=\"eyebrow\">Group {slug}</span>\n<a class=\"card\" href=\"/docs/{slug}/\"><span class=\"card-title\">{slug}</span><span class=\"card-desc\">About {slug}.</span></a>\n"
-                )
-            })
-            .collect();
-        let files = pages
-            .iter()
-            .map(|(slug, text)| (leak(format!("{slug}/_index.md")), *text));
-        Library::parse(std::iter::once(("_index.md", leak(landing))).chain(files))
+        Library {
+            pages: pages
+                .iter()
+                .map(|(slug, text)| {
+                    let (title, body) = text
+                        .strip_prefix("# ")
+                        .expect("fixture title")
+                        .split_once('\n')
+                        .unwrap();
+                    let source = leak(format!(
+                        "---\ntitle: {}\ndescription: About {slug}.\n---\n{body}",
+                        serde_json::to_string(title).unwrap()
+                    ));
+                    let mut page = super::Page::parse(slug, source).unwrap();
+                    page.group = format!("Group {slug}");
+                    page
+                })
+                .collect(),
+            search: Default::default(),
+        }
     }
 
     pub(crate) fn leak(text: String) -> &'static str {
@@ -394,11 +465,16 @@ pub(crate) mod site {
     use super::Library;
     use super::fixture::leak;
 
-    const CONTENT_DIR: &str = "../site/docs/content";
+    const CONTENT_DIR: &str = "../site/src/content/docs";
 
     /// The real docs, read from disk so the tests always see the current files.
     pub(crate) fn library() -> &'static Library {
-        static LIBRARY: LazyLock<Library> = LazyLock::new(|| Library::parse(files()));
+        static LIBRARY: LazyLock<Library> = LazyLock::new(|| {
+            let navigation =
+                fs::read_to_string(content_dir().join("../../data/docs-navigation.json"))
+                    .expect("docs navigation");
+            Library::parse(files(), &navigation).expect("valid docs sources")
+        });
         &LIBRARY
     }
 
@@ -436,20 +512,102 @@ mod tests {
     use test_case::test_case;
 
     use super::fixture::{leak, library};
-    use super::{DocsError, LANDING_PAGE, SITE_DOCS_URL, Target, cards, site};
+    use super::{DocsError, Library, NAVIGATION_FILE, Page, SITE_DOCS_URL, Target, site};
 
-    const STATIC_DIR: &str = "../static";
-    const ALPHA: &str = "+++\ntitle = \"Alpha\"\n+++\n\n# Alpha\n\nIntro text.\n\n## Shell timeout\n\nThe shell stops.\n\n### Details {#details}\n\nMore detail.\n\n```bash\n## Not a heading\n```\n\n## Tables\n\n| a | b |\n";
-    const BETA: &str = "+++\ntitle = \"Beta\"\n+++\n\n# Beta\n\n## Labels\n\nLabels name things.\n";
+    const STATIC_DIR: &str = "../../../public/docs";
+    const ALPHA: &str = "# Alpha\n\nIntro text.\n\n## Shell timeout\n\nThe shell stops.\n\n### Details {#details}\n\nMore detail.\n\n```bash\n## Not a heading\n```\n\n## Tables\n\n| a | b |\n";
+    const BETA: &str = "# Beta\n\n## Labels\n\nLabels name things.\n";
     const GENERATED: &str = "# Gamma\n\n<!-- caudra-docgen:fields -->\n\n| field | meaning |\n\n<!-- /caudra-docgen:fields -->\n\n## After\n\nText.\n";
     const MARKER_NAME: &str = "docgen";
     const AFTER_HEADING: &str = "## After";
     const SEARCH_LIMIT: usize = 8;
     const MARKER_SHOWN: &str = "a generated region marker reached text a reader or the model sees";
     const HEADING_ADRIFT: &str = "a heading line no longer points at its heading in the display";
+    const OVERVIEW: &str = "---\ntitle: Overview\ndescription: metadataonly\n---\n\nIntroductory wombats.\n\n## Detail {#stable}\n\nBody.\n";
+    const VALID_NAVIGATION: &str = r#"{"groups":[{"label":"Guides","pages":["alpha"]}]}"#;
+    const UNLISTED: &str = "add unlisted pages to a group: alpha";
+    const REPEATED: &str = "page `alpha` must be listed exactly once; index must not be listed";
+    const LISTED_INDEX: &str = "page `index` must be listed exactly once; index must not be listed";
+    const MISSING_PAGE: &str = "group `Guides` references missing page `missing.md`";
+    const EMPTY_GROUP: &str = "each group needs a nonempty label and pages";
 
     fn pages() -> super::Library {
         library(&[("alpha", ALPHA), ("beta", BETA)])
+    }
+
+    #[test_case(r#"{"groups":[]}"#, UNLISTED ; "unlisted_page")]
+    #[test_case(r#"{"groups":[{"label":"Guides","pages":["alpha","alpha"]}]}"#, REPEATED ; "duplicate_page")]
+    #[test_case(r#"{"groups":[{"label":"Guides","pages":["index","alpha"]}]}"#, LISTED_INDEX ; "listed_overview")]
+    #[test_case(r#"{"groups":[{"label":"Guides","pages":["missing"]}]}"#, MISSING_PAGE ; "missing_page")]
+    #[test_case(r#"{"groups":[{"label":"","pages":["alpha"]}]}"#, EMPTY_GROUP ; "empty_label")]
+    #[test_case(r#"{"groups":[{"label":"Guides","pages":[]}]}"#, EMPTY_GROUP ; "empty_group")]
+    fn invalid_navigation_names_the_problem(navigation: &str, expected: &str) {
+        let error = Library::parse([("index.md", OVERVIEW), ("alpha.md", OVERVIEW)], navigation)
+            .err()
+            .expect("invalid navigation");
+        assert_eq!(error.path, NAVIGATION_FILE);
+        assert_eq!(error.message, expected);
+    }
+
+    #[test_case("# Old title\n", "start the page" ; "missing_yaml")]
+    #[test_case("---\ntitle: Title\n", "close YAML" ; "missing_fence")]
+    #[test_case("---\ntitle: Title\n---\n", "missing field `description`" ; "missing_description")]
+    #[test_case("---\ntitle: ''\ndescription: Description\n---\n", "`title` must be" ; "empty_title")]
+    #[test_case("---\ntitle: Title\ndescription: Description\nweight: 2\n---\n", "unknown field `weight`" ; "legacy_metadata")]
+    #[test_case("---\ntitle: Title\ndescription: Description\n---\n# Duplicate\n", "not a body H1" ; "duplicate_title")]
+    fn invalid_metadata_names_the_page(source: &'static str, expected: &str) {
+        let error = Page::parse("invalid", source).unwrap_err();
+        assert_eq!(error.path, "invalid.md");
+        assert!(error.message.contains(expected), "{error}");
+    }
+
+    #[test]
+    fn metadata_is_not_body_text_and_introductions_are_searchable() {
+        let library = Library::parse(
+            [("alpha.md", OVERVIEW), ("index.md", OVERVIEW)],
+            VALID_NAVIGATION,
+        )
+        .unwrap();
+        assert_eq!(
+            library
+                .pages()
+                .iter()
+                .map(|page| page.slug)
+                .collect::<Vec<_>>(),
+            ["index", "alpha"]
+        );
+        for page in library.pages() {
+            assert!(page.body.starts_with("# Overview\n\nIntroductory wombats."));
+            assert!(!page.body.contains("metadataonly"));
+            assert!(!page.display.contains("description:"));
+            assert_eq!(page.headings[1].anchor, "stable");
+        }
+        assert!(library.search("metadataonly", SEARCH_LIMIT).hits.is_empty());
+        let search = library.search("wombats", SEARCH_LIMIT);
+        assert_eq!(search.hits.len(), 2);
+        assert!(search.hits.iter().all(|hit| hit.heading == 0));
+        assert_eq!(
+            library.locate("/docs/"),
+            Some(Target {
+                page: 0,
+                heading: None
+            })
+        );
+        assert!(library.load("/index#overview").unwrap().contains("wombats"));
+        assert!(library.index().contains("metadataonly"));
+    }
+
+    #[test]
+    fn canonical_overview_is_searchable() {
+        let library = site::library();
+        let search = library.search("effective action", SEARCH_LIMIT);
+        assert!(
+            search
+                .hits
+                .iter()
+                .any(|hit| library.pages()[hit.page].slug == "index")
+        );
+        assert!(library.load("/index").unwrap().contains("independent fork"));
     }
 
     #[test]
@@ -529,25 +687,28 @@ mod tests {
     }
 
     #[test]
-    fn every_landing_card_has_a_page_and_every_page_a_card() {
+    fn every_source_is_in_the_validated_library() {
         let dir = site::content_dir();
         let mut on_disk: Vec<&str> = Vec::new();
         for entry in fs::read_dir(&dir).expect("content dir") {
             let path = entry.expect("content entry").path();
-            if path.join(LANDING_PAGE).is_file() {
+            if path.extension().is_some_and(|extension| extension == "md") {
                 on_disk.push(leak(
-                    path.file_name()
-                        .expect("page dir")
+                    path.file_stem()
+                        .expect("page slug")
                         .to_string_lossy()
                         .into_owned(),
                 ));
             }
         }
         on_disk.sort_unstable();
-        let landing = fs::read_to_string(dir.join(LANDING_PAGE)).expect("landing page");
-        let mut carded: Vec<&str> = cards(leak(landing)).iter().map(|card| card.slug).collect();
-        carded.sort_unstable();
-        assert_eq!(carded, on_disk);
+        let mut parsed: Vec<&str> = site::library()
+            .pages()
+            .iter()
+            .map(|page| page.slug)
+            .collect();
+        parsed.sort_unstable();
+        assert_eq!(parsed, on_disk);
     }
 
     #[test]

@@ -59,6 +59,30 @@ gen-docs:
 gen-docs-check:
     "{{ cargo_cmd }}" run -p caudra-docgen -- --check
 
+site-install:
+    bun install --cwd "{{ justfile_directory() }}/site" --frozen-lockfile
+
+site-dev *ARGS:
+    bun run --cwd "{{ justfile_directory() }}/site" dev {{ ARGS }}
+
+site-check:
+    bun run --cwd "{{ justfile_directory() }}/site" check
+
+site-test:
+    bun run --cwd "{{ justfile_directory() }}/site" test
+
+site-build:
+    bun run --cwd "{{ justfile_directory() }}/site" build
+
+site-output:
+    bun run --cwd "{{ justfile_directory() }}/site" test:output
+
+site-browser:
+    bun run --cwd "{{ justfile_directory() }}/site" test:browser
+
+site-preview *ARGS:
+    bun run --cwd "{{ justfile_directory() }}/site" preview {{ ARGS }}
+
 machete:
     cargo machete
 
@@ -67,4 +91,4 @@ bump-workcell *ARGS:
     scripts/bump-workcell.py {{ ARGS }}
 
 # Full CI check
-ci: code-worker fmt-check lint pylint test gen-docs-check machete
+ci: code-worker fmt-check lint pylint test gen-docs-check machete site-install site-check site-test site-build site-output

@@ -2,6 +2,8 @@ use std::fmt::Write;
 
 use caudra_ui::{BUILTIN_COMMANDS, BuiltinCommand, ChatScope};
 
+use crate::page_header;
+
 const MAIN_ONLY_MARK: &str = "Main only";
 
 const MODEL_JOBS: &str = r#"## Model jobs
@@ -206,16 +208,10 @@ fn write_row(out: &mut String, command: &BuiltinCommand) {
 }
 
 pub fn generate() -> String {
-    let mut out = String::new();
-    writeln!(out, "+++").unwrap();
-    writeln!(out, "title = \"Commands\"").unwrap();
-    writeln!(out, "weight = 8").unwrap();
-    writeln!(out, "[extra]").unwrap();
-    writeln!(out, "group = \"Reference\"").unwrap();
-    writeln!(out, "+++").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "# Commands").unwrap();
-    writeln!(out).unwrap();
+    let mut out = page_header(
+        "Commands",
+        "The / palette, sessions, toggles, custom commands.",
+    );
     writeln!(
         out,
         "Type `/` in the input box to open the command palette."

@@ -5,7 +5,11 @@ runs.csv
 /.bin/
 /site/_build/
 /site/.bin/
-/site/docs/public/
+/site/node_modules/
+/site/dist/
+/site/.astro/
+/site/playwright-report/
+/site/test-results/
 /.playwright-mcp/
 /result
 .maki/

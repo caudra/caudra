@@ -12,6 +12,8 @@ use std::sync::Arc;
 
 use caudra_lua::{OptionType, PluginHost};
 
+use crate::{page_header, repository_path};
+
 const DATE_PLACEHOLDER: &str = "YYYY-MM-DD";
 /// The reference documents `plan`, which is only offered with a session plan.
 const WITH_SESSION_PLAN: bool = true;
@@ -379,17 +381,11 @@ fn redact_path(input: &str, target: &str, placeholder: &str) -> String {
     }
 }
 
-/// Plugins bake env-specific values into their `description` at registration:
-/// `bash` interpolates `caudra.uv.cwd()` and `websearch` interpolates
-/// `os.date("%Y-%m-%d")`. Scrub both so `gen-docs-check` is stable across
-/// machines and days. CWD is replaced before HOME so a cwd nested under ~
-/// doesn't get partially mangled.
+/// Scrubs registration-time paths and dates. Use the registry's fixed root, not
+/// the process cwd: running from `/` must not replace every slash in the docs.
 fn redact_env_and_dates(input: &str) -> String {
-    let cwd = std::env::current_dir()
-        .ok()
-        .and_then(|c| c.to_str().map(str::to_owned))
-        .unwrap_or_default();
-    let mut out = redact_path(input, &cwd, "<cwd>");
+    let root = repository_path("");
+    let mut out = redact_path(input, &root.to_string_lossy(), "<cwd>");
     if let Ok(home) = std::env::var("HOME")
         && !home.is_empty()
     {
@@ -412,15 +408,6 @@ fn redact_def(def: &Value) -> Value {
     }
 }
 
-fn write_front_matter(out: &mut String) {
-    writeln!(out, "+++").unwrap();
-    writeln!(out, "title = \"Tools\"").unwrap();
-    writeln!(out, "weight = 4").unwrap();
-    writeln!(out, "[extra]").unwrap();
-    writeln!(out, "group = \"Reference\"").unwrap();
-    writeln!(out, "+++").unwrap();
-}
-
 fn collect_tool_info(
     def_map: &HashMap<String, &Value>,
     entry: &caudra_agent::tools::RegisteredTool,
@@ -438,8 +425,8 @@ fn collect_tool_info(
 /// option defaulting to false, so the badge cannot drift from the defaults.
 fn load_registry_with_builtins() -> (Arc<ToolRegistry>, HashSet<String>) {
     let registry = Arc::new(ToolRegistry::new());
-    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-    let workcell = caudra_workcell::WorkcellHost::new(cwd, None).expect("Workcell host");
+    let workcell =
+        caudra_workcell::WorkcellHost::new(repository_path(""), None).expect("Workcell host");
     workcell
         .register_documented_tools(&registry)
         .expect("Workcell tools");
@@ -501,11 +488,7 @@ pub fn generate() -> String {
     }
 
     let total = tools.len();
-    let mut out = String::new();
-    write_front_matter(&mut out);
-    writeln!(out).unwrap();
-    writeln!(out, "# Tools").unwrap();
-    writeln!(out).unwrap();
+    let mut out = page_header("Tools", "Every built-in tool and its parameters.");
     let opt_in_n = tools.keys().filter(|n| opt_in.contains(**n)).count();
     let default_n = total - opt_in_n;
     writeln!(

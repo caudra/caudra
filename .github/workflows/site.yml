@@ -1,0 +1,61 @@
+name: Website
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      site: ${{ steps.filter.outputs.site }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            site:
+              - "site/**"
+              - "install.sh"
+              - "install.ps1"
+              - "caudra-docgen/**"
+              - "caudra-docs/**"
+              - "justfile"
+              - ".github/workflows/site.yml"
+
+  build:
+    needs: changes
+    if: needs.changes.outputs.site == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: site
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: site/.bun-version
+      - run: bun install --frozen-lockfile
+      - run: bun run check
+      - run: bun run test
+      - run: bun run build
+      - run: bun run test:output
+      - run: bunx --no-install playwright install --with-deps chromium
+      - run: bun run test:browser
+      - uses: actions/upload-artifact@v4
+        with:
+          name: website
+          path: site/dist
+          if-no-files-found: error

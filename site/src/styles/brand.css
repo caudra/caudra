@@ -1,0 +1,31 @@
+@font-face {
+  font-family: 'JetBrains Mono';
+  src: url('/fonts/jetbrains-mono-latin.woff2') format('woff2');
+  font-weight: 100 800;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  src: url('/fonts/jetbrains-mono-latin-italic.woff2') format('woff2');
+  font-weight: 100 800;
+  font-style: italic;
+  font-display: swap;
+}
+:root {
+  --ink: #09254d;
+  --paper: #f2ebdd;
+  --signal: #b52f20;
+  --mono: 'JetBrains Mono', ui-monospace, monospace;
+  --sans: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  scrollbar-color: var(--sl-color-gray-4, #8a8173) var(--sl-color-bg, var(--paper));
+}
+body { scrollbar-color: auto; }
+::selection { background: #b52f20; color: #fff8ec; }
+:focus-visible { outline: 2px solid var(--signal); outline-offset: 4px; }
+@media (forced-colors: active) {
+  :root { scrollbar-color: auto; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; animation: none !important; transition: none !important; }
+}

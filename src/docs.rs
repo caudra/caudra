@@ -1,4 +1,4 @@
-//! The user docs under `site/docs/content`. They are embedded here rather than in `caudra-docs`, so editing a
+//! The user docs under `site/src/content/docs`. They are embedded here rather than in `caudra-docs`, so editing a
 //! page rebuilds this crate alone and not every crate that reads the docs.
 
 use std::sync::LazyLock;
@@ -7,8 +7,11 @@ use caudra_agent::tools::native::skill::BuiltinSkill;
 use caudra_docs::{Library, NAME, SKILL_DESCRIPTION};
 use include_dir::{Dir, File, include_dir};
 
-static CONTENT: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/site/docs/content");
-static LIBRARY: LazyLock<Library> = LazyLock::new(|| Library::parse(markdown_files(&CONTENT)));
+const NAVIGATION: &str = include_str!("../site/src/data/docs-navigation.json");
+static CONTENT: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/site/src/content/docs");
+static LIBRARY: LazyLock<Library> = LazyLock::new(|| {
+    Library::parse(markdown_files(&CONTENT), NAVIGATION).expect("valid embedded documentation")
+});
 
 /// Parsed on first use, so a session that never opens the docs never pays for them.
 pub fn library() -> &'static Library {

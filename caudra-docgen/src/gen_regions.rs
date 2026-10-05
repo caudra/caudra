@@ -326,7 +326,6 @@ fn write_pattern(out: &mut String, name: &str, source: &str) {
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
-    use std::path::Path;
 
     use caudra_config::files::{self, ConfigFile};
     use test_case::test_case;
@@ -407,9 +406,8 @@ start_workflow("review-changes", #{ scope: "main" });
 
     #[test]
     fn every_region_has_one_pair_of_markers_in_its_page() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         for region in REGIONS {
-            let page = fs::read_to_string(root.join(page_path(region.page))).unwrap();
+            let page = fs::read_to_string(page_path(region.page)).unwrap();
             if let Err(error) = region.splice(&page) {
                 panic!("{}: {error}", region.page);
             }

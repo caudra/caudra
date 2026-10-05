@@ -767,37 +767,37 @@ pub(crate) mod fixture {
     pub(super) const SITE_TAIL: &str = "the install script";
     /// Rows enough that a section below them opens at the top of the reader.
     const FILLER_LINES: usize = 30;
-    const LANDING: &str = "\
-<span class=\"eyebrow\">Start</span>
-<a class=\"card\" href=\"/docs/guide/\"><span class=\"card-title\">Guide</span><span class=\"card-desc\">Getting going.</span></a>
-<span class=\"eyebrow\">Reference</span>
-<a class=\"card\" href=\"/docs/permissions/\"><span class=\"card-title\">Permissions</span><span class=\"card-desc\">Who may do what.</span></a>
-";
+    const NAVIGATION: &str = r#"{"groups":[{"label":"Start","pages":["guide"]},{"label":"Reference","pages":["permissions"]}]}"#;
+    const OVERVIEW: &str = "---\ntitle: Overview\ndescription: The manual.\n---\n\nIntroduction.\n";
 
     /// Two pages, each long enough to scroll: a guide that links into the
     /// other page at its top, and out of the docs and into it again at its
     /// foot, and a reference with two hits for [`TERM`] a screen apart.
     pub(crate) fn library() -> &'static Library {
         static LIBRARY: LazyLock<Library> = LazyLock::new(|| {
-            Library::parse([
-                ("_index.md", LANDING),
-                ("guide/_index.md", leak(guide())),
-                ("permissions/_index.md", leak(permissions())),
-            ])
+            Library::parse(
+                [
+                    ("index.md", OVERVIEW),
+                    ("guide.md", leak(guide())),
+                    ("permissions.md", leak(permissions())),
+                ],
+                NAVIGATION,
+            )
+            .expect("valid docs fixture")
         });
         &LIBRARY
     }
 
     fn guide() -> String {
         format!(
-            "# Guide\n\nRead [{MODES_LINK}](/docs/{PERMISSIONS}/#{MODES}) first.\n\n## Install\n\n{}\n## Links\n\nSee [{SITE_HEAD}, where these pages are kept together with the release notes, the changelog and {SITE_TAIL}]({EXTERNAL}).\n\nThen read [{RULES_LINK}](/docs/{PERMISSIONS}/#{RULES}).\n",
+            "---\ntitle: Guide\ndescription: Getting going.\n---\n\nRead [{MODES_LINK}](/docs/{PERMISSIONS}/#{MODES}) first.\n\n## Install\n\n{}\n## Links\n\nSee [{SITE_HEAD}, where these pages are kept together with the release notes, the changelog and {SITE_TAIL}]({EXTERNAL}).\n\nThen read [{RULES_LINK}](/docs/{PERMISSIONS}/#{RULES}).\n",
             filler("Step")
         )
     }
 
     fn permissions() -> String {
         format!(
-            "# Permissions\n\nWho may do what.\n\n## Modes\n\n{}\n## Rules\n\nThe shell {TERM} is thirty seconds.\n\n{}\nA {TERM} stops the command.\n\n{}",
+            "---\ntitle: Permissions\ndescription: Who may do what.\n---\n\nWho may do what.\n\n## Modes\n\n{}\n## Rules\n\nThe shell {TERM} is thirty seconds.\n\n{}\nA {TERM} stops the command.\n\n{}",
             filler("Mode"),
             filler("Rule"),
             filler("Note")
@@ -1164,6 +1164,7 @@ mod tests {
     #[test]
     fn hovering_a_contents_entry_marks_its_title_and_moves_nothing() {
         let mut modal = modal();
+        modal.open(GUIDE);
         modal.handle_key(press(KeyCode::Char('c')));
         let terminal = draw(&mut modal, WIDE);
         let sidebar = modal.sidebar;

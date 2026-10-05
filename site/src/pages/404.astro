@@ -1,0 +1,18 @@
+---
+import SiteHead from '../components/SiteHead.astro';
+import '../styles/brand.css';
+import '../styles/home.css';
+---
+<!doctype html>
+<html lang="en">
+  <head><SiteHead title="Page not found | Caudra" description="This page does not exist. Return to Caudra or browse the documentation." noindex /></head>
+  <body>
+    <header class="site-nav"><nav class="shell nav-inner" aria-label="Primary"><a class="brand" href="/"><img src="/caudra-mark.svg" width="34" height="34" alt="" />caudra</a><a href="/docs/">Docs</a></nav></header>
+    <main class="shell section">
+      <p class="eyebrow">Route not found</p>
+      <h1>404</h1>
+      <p>This page does not exist. Check the address or find your next step in the documentation.</p>
+      <div class="hero-actions"><a class="button primary" href="/docs/">Browse docs</a><a class="button" href="/">Return home</a></div>
+    </main>
+  </body>
+</html>

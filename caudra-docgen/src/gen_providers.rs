@@ -10,13 +10,7 @@ use caudra_providers::{EFFORT_LEVELS, ModelMarker};
 use strum::IntoEnumIterator;
 
 use crate::gen_regions::{footer, keys_table, reference};
-
-const FRONT_MATTER: &str = r#"+++
-title = "Providers"
-weight = 5
-[extra]
-group = "Reference"
-+++"#;
+use crate::page_header;
 
 const MODEL_JOBS_NOTE: &str = r#"## Model jobs
 
@@ -689,10 +683,10 @@ fn write_section(out: &mut String, section: &ProviderSection) {
 }
 
 pub fn generate() -> String {
-    let mut out = String::with_capacity(4096);
-
-    let _ = writeln!(out, "{FRONT_MATTER}\n");
-    let _ = writeln!(out, "# Providers\n");
+    let mut out = page_header(
+        "Providers",
+        "Model catalogs, env vars, providers.toml, model jobs.",
+    );
     let _ = writeln!(
         out,
         "Caudra talks to LLM providers over their HTTP APIs. Model jobs decide \

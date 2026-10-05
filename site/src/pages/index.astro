@@ -1,0 +1,83 @@
+---
+import { Image } from 'astro:assets';
+import SiteHead from '../components/SiteHead.astro';
+import hero from '../assets/caudra-hero-v1.png';
+import '../styles/brand.css';
+import '../styles/home.css';
+
+const capabilities = [
+  ['Evidence-gated completion', 'Set a completion condition with /goal. A private evaluator checks the recorded evidence and continues the run when the condition is unmet.', 'changes-from-maki'],
+  ['Durable task agents', 'Task agents keep stable IDs, separate transcripts, queued guidance, and histories that continue across turns and restored sessions.', 'tools'],
+  ['Guide, queue, or replace', 'Redirect active work at a safe boundary, schedule the next run, or replace a run without losing the rest of the queue.', 'queue'],
+  ['Branchable sessions', 'Fork from a message and restore conversation state, workspace files, or both while preserving the abandoned path.', 'sessions'],
+  ['Bound permission authority', 'Reusable approvals bind to validated input, typed resources, implementation identity, authority, and an explicit lifetime.', 'permissions'],
+  ['Decoupled Workcell tools', 'Workcell owns tool contracts, validation, execution bounds, atomicity, and process cleanup. Caudra binds permissions and presentation.', 'tools'],
+  ['Source-faithful Markdown', 'Read Unicode maths and Mermaid diagrams, pan wide charts, follow validated links, and copy the original Markdown behind rendered cells.', 'markdown'],
+  ['A workbench beside the agent', 'Explore files, edit code, inspect source control, and search your project without leaving the terminal.', 'workbench'],
+];
+const steps = [
+  ['Observe', 'Read repository state and session context.'],
+  ['Select', 'Choose the smallest useful action.'],
+  ['Execute', 'Call a tool, plugin, or subagent.'],
+  ['Verify', 'Inspect output, tests, and side effects.'],
+  ['Adapt', 'Continue, revise, or return control.'],
+];
+---
+<!doctype html>
+<html lang="en">
+  <head><SiteHead title="caudra | context into effective action" description="Caudra is a terminal coding agent that coordinates models, tools, plugins, and subagents while keeping execution visible and under your control." /></head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-nav">
+      <nav class="shell nav-inner" aria-label="Primary">
+        <a class="brand" href="/" aria-label="Caudra home"><img src="/caudra-mark.svg" width="34" height="34" alt="" />caudra</a>
+        <div class="nav-links"><a href="/docs/">Docs</a><a href="https://github.com/caudra/caudra">GitHub</a></div>
+      </nav>
+    </header>
+    <main id="main">
+      <section class="hero">
+        <div class="shell hero-grid">
+          <div class="hero-copy">
+            <p class="eyebrow">Terminal coding agent / independent fork</p>
+            <h1>Context into effective action.</h1>
+            <p class="hero-lede">Caudra coordinates models, native tools, plugins, and subagents to carry software work through to completion. Every action stays visible and under your control.</p>
+            <div class="hero-actions"><a class="button primary" href="/docs/quick-start/">Get started</a><a class="button" href="https://github.com/caudra/caudra">View source</a></div>
+            <div class="install"><code id="install-command">curl -fsSL https://caudra.ai/install.sh | sh</code><button id="copy-install" type="button" aria-label="Copy install command">Copy</button></div>
+            <p class="install-note"><a href="/install.sh">Inspect the script</a> · <a href="/docs/quick-start/#install">Windows and other install options</a></p>
+            <span id="install-status" class="install-note" role="status" aria-live="polite"></span>
+          </div>
+          <div class="hero-art">
+            <Image src={hero} alt="Three context paths converging through a decision aperture into one selected action" widths={[480, 800, 1200]} sizes="(max-width: 850px) 100vw, 50vw" format="webp" loading="eager" fetchpriority="high" />
+            <div class="hero-legend" aria-hidden="true"><span>Context</span><span>Selection</span><span>Action</span></div>
+          </div>
+        </div>
+      </section>
+      <div class="signal-strip"><div class="shell signal-grid">
+        <div><span>Runtime</span><strong>Native Rust TUI</strong></div><div><span>Execution</span><strong>Tools + subagents</strong></div><div><span>Models</span><strong>Provider agnostic</strong></div><div><span>Authority</span><strong>User controlled</strong></div>
+      </div></div>
+      <section class="section shell" aria-labelledby="capabilities">
+        <div class="section-head"><span class="eyebrow">01 / Caudra</span><div><h2 id="capabilities">What Caudra adds.</h2><p>Compared with its Maki foundation, Caudra focuses on durable work, safe intervention, and evidence-backed completion. <a href="/docs/changes-from-maki/">Read the comparison and rationale.</a></p></div></div>
+        <div class="capability-grid">{capabilities.map(([title, description, slug], index) => <article><span class="eyebrow">01.{index + 1}</span><h3><a href={`/docs/${slug}/`}>{title}</a></h3><p>{description}</p></article>)}</div>
+      </section>
+      <section class="section flow" aria-labelledby="loop"><div class="shell">
+        <div class="section-head"><span class="eyebrow">02 / Loop</span><div><h2 id="loop">Outcomes route the next step.</h2><p>The loop stays grounded in current evidence instead of treating the first plan as fixed.</p></div></div>
+        <ol class="flow-grid">{steps.map(([title, description]) => <li><h3>{title}</h3><p>{description}</p></li>)}</ol>
+      </div></section>
+      <section class="section shell" aria-labelledby="control"><div class="section-head"><span class="eyebrow">03 / Control</span><div><h2 id="control">Authority stays explicit.</h2><p>Caudra separates capability from permission. Inspect what runs, scope repeated approvals, steer current work, and stop execution.</p><ul class="control-list"><li>Tree-sitter parses compound shell commands into the permissions they actually need.</li><li>Plan mode restricts writes while you review the proposed path.</li><li>Sessions, queues, rewind, and task transcripts keep execution inspectable.</li></ul><a class="button" href="/docs/permissions/">Understand permissions</a></div></div></section>
+      <section class="section providers" aria-labelledby="models"><div class="shell section-head"><span class="eyebrow">04 / Providers</span><div><h2 id="models">Use the model that fits the work.</h2><p>Built-in providers, compatible APIs, local models, and executable provider adapters share one interface.</p><p>Connect Anthropic, OpenAI, Google, xAI, Copilot, Ollama, llama.cpp, and more. Choose a model for each job.</p><a class="button" href="/docs/providers/">Explore providers</a></div></div></section>
+      <section class="section provenance" aria-labelledby="project"><div class="shell section-head"><span class="eyebrow">05 / Project</span><div><h2 id="project">An independent release line.</h2><p>Caudra is an independent fork of <a href="https://github.com/tontinton/maki">Maki</a>, originally developed by <a href="https://github.com/tontinton">Tony Solomonik</a>. Caudra modifications are maintained by <a href="https://thorstenborn.com">Thorsten Born</a>.</p><div class="hero-actions"><a class="button" href="https://github.com/caudra/caudra">Source repository</a><a class="button" href="https://github.com/caudra/config">Example config</a></div></div></div></section>
+    </main>
+    <footer><div class="shell footer-inner"><a class="brand" href="/"><img src="/caudra-mark.svg" width="42" height="42" alt="" />caudra</a><p>Context → effective action<br /><a href="/docs/">Documentation</a> · <a href="/llms.txt">For language models</a></p></div></footer>
+    <script>
+      document.querySelector<HTMLButtonElement>('#copy-install')?.addEventListener('click', async () => {
+        const status = document.querySelector('#install-status');
+        try {
+          await navigator.clipboard.writeText(document.querySelector('#install-command')!.textContent!);
+          if (status) status.textContent = 'Install command copied.';
+        } catch {
+          if (status) status.textContent = 'Copy unavailable. Select the command above.';
+        }
+      });
+    </script>
+  </body>
+</html>

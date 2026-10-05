@@ -15,8 +15,8 @@ use std::thread;
 
 use caudra_config::files;
 
-const CONTENT_DIR: &str = "site/docs/content";
-const STATIC_DIR: &str = "site/docs/static";
+const CONTENT_DIR: &str = "site/src/content/docs";
+const STATIC_DIR: &str = "site/public/docs";
 
 type Page = (&'static str, fn() -> String);
 
@@ -34,7 +34,22 @@ const PAGES: [Page; 7] = [
 ];
 
 fn page_path(section: &str) -> PathBuf {
-    Path::new(CONTENT_DIR).join(section).join("_index.md")
+    repository_path(CONTENT_DIR).join(format!("{section}.md"))
+}
+
+fn repository_path(path: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("docgen is a workspace member")
+        .join(path)
+}
+
+fn page_header(title: &str, description: &str) -> String {
+    format!(
+        "---\ntitle: {}\ndescription: {}\n---\n\n",
+        serde_json::to_string(title).expect("title string"),
+        serde_json::to_string(description).expect("description string"),
+    )
 }
 
 /// Hand-written pages, with every generated region brought up to date.
@@ -88,7 +103,7 @@ fn main() -> ExitCode {
         running.map(|(path, page)| (path, page.join().unwrap()))
     });
     let examples = files::examples().filter_map(|file| {
-        let path = Path::new(STATIC_DIR).join(gen_config::example_file_name(file));
+        let path = repository_path(STATIC_DIR).join(gen_config::example_file_name(file));
         file.reference().map(|reference| (path, reference))
     });
     let outputs: Vec<(PathBuf, String)> = pages

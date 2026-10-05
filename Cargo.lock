@@ -1004,6 +1004,9 @@ name = "caudra-docs"
 version = "0.1.0"
 dependencies = [
  "memchr",
+ "serde",
+ "serde_json",
+ "serde_yaml",
  "strsim",
  "test-case",
  "thiserror 2.0.18",

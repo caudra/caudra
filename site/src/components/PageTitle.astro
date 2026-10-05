@@ -1,0 +1,36 @@
+---
+import DefaultPageTitle from '@astrojs/starlight/components/PageTitle.astro';
+import { estimatedTokens, pageMarkdown, pagePath } from '../data/docs';
+import { slugify } from '../markdown/compatibility';
+
+const { entry } = Astro.locals.starlightRoute;
+const slug = entry.id === 'docs' ? 'index' : entry.id.replace(/^docs\//, '');
+const page = entry.id === 'docs' || entry.id.startsWith('docs/')
+  ? { slug, title: entry.data.title, description: entry.data.description!, body: entry.body?.trim() ?? '' }
+  : undefined;
+---
+
+{page && <span id={slugify(page.title)} class="title-anchor" aria-hidden="true" />}
+<DefaultPageTitle />
+{page && <div class="page-actions" data-pagefind-ignore>
+  <button type="button" data-copy-markdown={`${pagePath(page.slug)}index.md`}>Copy page Markdown</button>
+  <a href={`${pagePath(page.slug)}index.md`}>View Markdown</a>
+  <span title="Approximate token count: Unicode characters divided by four">~{estimatedTokens(pageMarkdown(page)).toLocaleString('en-US')} tokens</span>
+  <span class="copy-status" role="status" aria-live="polite"></span>
+</div>}
+
+<script>
+  document.querySelectorAll<HTMLButtonElement>('[data-copy-markdown]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const status = button.parentElement?.querySelector('.copy-status');
+      try {
+        const response = await fetch(button.dataset.copyMarkdown!);
+        if (!response.ok) throw new Error('Markdown unavailable');
+        await navigator.clipboard.writeText(await response.text());
+        if (status) status.textContent = 'Copied';
+      } catch {
+        if (status) status.textContent = 'Copy unavailable. Use View Markdown to select the source.';
+      }
+    });
+  });
+</script>

@@ -14,6 +14,7 @@ use caudra_config::{
 };
 
 use crate::gen_providers::join_and;
+use crate::page_header;
 
 const EXAMPLE_SUFFIX: &str = ".example.toml";
 /// The one feature with a section of its own further down the page.
@@ -763,20 +764,14 @@ fn config_dir_files() -> String {
 }
 
 pub fn generate() -> String {
-    let mut out = String::with_capacity(4096);
+    let mut out = page_header(
+        "Configuration",
+        "caudra.toml settings, experimental features, separate profile files, and directory layout.",
+    );
 
     writeln!(
         out,
         "\
-+++
-title = \"Configuration\"
-weight = 2
-[extra]
-group = \"Getting Started\"
-+++
-
-# Configuration
-
 Settings go in `caudra.toml`. It has two places, and both are optional:
 
 - **Global**: `~/.config/caudra/caudra.toml`

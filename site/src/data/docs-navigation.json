@@ -1,0 +1,56 @@
+{
+  "groups": [
+    {
+      "label": "Getting Started",
+      "pages": [
+        "quick-start",
+        "configuration"
+      ]
+    },
+    {
+      "label": "Guides",
+      "pages": [
+        "skills",
+        "remote-workspaces",
+        "sandboxes",
+        "sessions",
+        "messaging",
+        "worktrees",
+        "review",
+        "workbench",
+        "system-prompts",
+        "plugins",
+        "workflows",
+        "automations",
+        "headless",
+        "acp"
+      ]
+    },
+    {
+      "label": "Concepts",
+      "pages": [
+        "token-economy",
+        "context",
+        "changes-from-maki",
+        "queue"
+      ]
+    },
+    {
+      "label": "Reference",
+      "pages": [
+        "tools",
+        "providers",
+        "permissions",
+        "notifications",
+        "mcp",
+        "commands",
+        "keybindings",
+        "markdown",
+        "lua-api",
+        "cli",
+        "logging",
+        "telemetry"
+      ]
+    }
+  ]
+}

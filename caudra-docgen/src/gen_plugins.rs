@@ -1,28 +1,24 @@
 use caudra_lua::docs_render;
 
-const FRONTMATTER: &str = r#"+++
-title = "Plugins"
-weight = 23
-[extra]
-group = "Guides"
-+++
-
-"#;
+use crate::page_header;
 
 const LUA_NOTICE: &str = "Lua plugins are experimental and off by default. Turn them on with `lua_plugins = true` under `[experimental]` in the global `caudra.toml`, then restart Caudra. `--no-plugins` turns Lua off again for one run. See [Experimental features](/docs/configuration/#experimental-features).";
 
-/// Places the opt-in notice under the page title, ahead of anything that
-/// assumes Lua runs.
+/// Removes the renderer's H1 and places the opt-in notice before its body.
 pub fn with_lua_notice(page: &str) -> String {
     match page.split_once('\n') {
-        Some((title, rest)) => format!("{title}\n\n{LUA_NOTICE}\n{rest}"),
-        None => format!("{page}\n\n{LUA_NOTICE}\n"),
+        Some((_, rest)) => format!("{LUA_NOTICE}\n{rest}"),
+        None => format!("{LUA_NOTICE}\n"),
     }
 }
 
 pub fn generate() -> String {
     format!(
-        "{FRONTMATTER}{}",
+        "{}{}",
+        page_header(
+            "Writing caudra plugins",
+            "Add your own tools and commands in Lua, or let the agent write them (experimental)."
+        ),
         with_lua_notice(&docs_render::guide_page())
     )
 }

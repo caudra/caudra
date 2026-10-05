@@ -3,13 +3,7 @@ use caudra_ui::keybindings::{
     ALT_SEP, KEYBINDS, KeyLabel, Keybind, KeybindContext, LEADER_PREFIX, all_contexts,
 };
 
-const FRONTMATTER: &str = "\
-+++
-title = \"Keybindings\"
-weight = 9
-[extra]
-group = \"Reference\"
-+++";
+use crate::page_header;
 
 const TEXT_FIELDS_INTRO: &str = "\
 These keys work the same in every text field: the composer, a picker's filter, \
@@ -241,8 +235,7 @@ fn write_inheritance(out: &mut String) {
 }
 
 pub fn generate() -> String {
-    let mut out = String::from(FRONTMATTER);
-    out.push_str("\n\n# Keybindings\n\n");
+    let mut out = page_header("Keybindings", "Defaults, precedence, rebinding from Lua.");
     write_leader(&mut out);
     write_focus(&mut out);
 
