@@ -1616,6 +1616,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
         subscribe_launch(session, &cli.topics, cli.receive_broadcasts)?;
         join_launch_groups(host, session, &cli.groups)?;
     }
+    let mut joined_groups = !cli.groups.is_empty();
 
     loop {
         let runtime_cwd = if workcell_runtime.is_remote() {
@@ -1736,6 +1737,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                 sessions: std::mem::take(&mut tabs),
                 focused,
                 startup_warnings: std::mem::take(&mut warnings),
+                joined_groups: std::mem::take(&mut joined_groups),
                 storage: storage.clone(),
                 config: stack.config.agent.clone(),
                 ui_config: stack.config.ui.clone(),

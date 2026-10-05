@@ -130,7 +130,7 @@ caudra --name fixer-1 --group build-fixes
 caudra message publish --topic ci.failures --from nightly-ci "Build 1042 failed on linux"
 ```
 
-A member takes work from a script publication like this one only under the `accept` inbound policy, which `/messages inbound accept` sets. See [Messages from scripts](#messages-from-scripts).
+A member takes work from a script publication like this one only under the `accept` inbound policy, which `/messages inbound accept` sets. See [Messages from scripts](#messages-from-scripts). Joining with `--group` or `/groups join` warns when the session's policy skips some work, and `/groups` counts the queued items it skips in each group.
 
 Every member shares the group's policy. It names the topic patterns, how many items members work on at once, how many attempts an item gets, and how many unfinished items the group holds. Members cannot change it, and agents have no tool to create, join, or change a group. Groups and their work belong to your user on this machine, so every project sees the same ones.
 
@@ -174,7 +174,7 @@ When a member stops renewing its lease, for example because its process crashed,
 
 | Command | Action |
 |---|---|
-| `/groups` | List the groups, mark the ones this session belongs to, and show the work it holds |
+| `/groups` | List the groups, mark the ones this session belongs to, count the queued work its inbound policy skips in each, and show the work it holds |
 | `/groups join <group>` | Take work from an existing group |
 | `/groups leave <group>` | Stop taking new work from a group. The item the session holds stays its own |
 | `/groups retry <work>` | Queue a paused, failed, or cancelled item again with a full set of attempts |

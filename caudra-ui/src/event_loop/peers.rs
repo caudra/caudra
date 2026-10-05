@@ -5,7 +5,7 @@ use std::time::Instant;
 use caudra_agent::peers::{
     AssignedWork, ChannelPage, ChannelSummary, HistoryVersion, MAX_HISTORY_PAGE, ManagedWork,
     PeerDecision, PeerDecisionResult, PeerDescriptor, PeerReviewToken, PeerSession, PeerSummary,
-    WorkAction, WorkGroup, literal,
+    PolicyHold, SkippedWork, WorkAction, WorkGroup, literal,
 };
 use caudra_config::{Feature, InboundPolicy};
 use flume::{Receiver, TryRecvError};
@@ -35,7 +35,7 @@ const NO_TOPICS: &str = "No peer topic subscriptions";
 const BROADCASTS_ON: &str = "broadcasts on";
 const BROADCASTS_OFF: &str = "broadcasts off";
 const SUMMARY_SEPARATOR: &str = " · ";
-const GROUPS_HELP: &str = "Usage: /groups [help | join GROUP | leave GROUP | retry WORK | pause WORK | cancel WORK]\nRun /groups to list the consumer groups, the ones this session takes work from, and the work it holds. A consumer group hands each publication on its topics to one member as a work item, which that member's agent must report completed, retryable, or failed. Create and change groups with caudra message group. A member takes queued work while it idles; leaving stops new work but keeps the item it holds. retry queues a paused, failed, or cancelled item again, which may repeat effects of its earlier attempts; pause holds a queued item; cancel gives up on an item no member is working on. Memberships are kept with the session and restored when it resumes.";
+const GROUPS_HELP: &str = "Usage: /groups [help | join GROUP | leave GROUP | retry WORK | pause WORK | cancel WORK]\nRun /groups to list the consumer groups, the ones this session takes work from, the queued work its inbound policy skips, and the work it holds. A consumer group hands each publication on its topics to one member as a work item, which that member's agent must report completed, retryable, or failed. Create and change groups with caudra message group. A member takes queued work while it idles, but only work its inbound policy would deliver automatically; leaving stops new work but keeps the item it holds. retry queues a paused, failed, or cancelled item again, which may repeat effects of its earlier attempts; pause holds a queued item; cancel gives up on an item no member is working on. Memberships are kept with the session and restored when it resumes.";
 const GROUPS_BUSY: &str = "The previous /groups command is still running";
 const NO_GROUPS: &str = "No consumer groups; create one with caudra message group create";
 const MEMBER_MARK: &str = "* ";
@@ -49,6 +49,12 @@ const WORK_INDENT: &str = "  ";
 const RETRY_REPEATS: &str = "Earlier attempts may already have had effects; the next member repeats the work from the start";
 const JOINED: &str = "Joined consumer group ";
 const LEFT: &str = "Left consumer group ";
+const SKIPS: &str = "skips ";
+const SKIPPED_HELD: &str = "under the inbound policy";
+const SKIPPED_SCRIPTS: &str = "from scripts";
+const SKIPPED_COHORT: &str = "from sessions in another workspace or mode";
+const AUTO_SKIPS_WORK: &str = "Inbound auto takes consumer-group work only from sessions in this workspace with the same Plan or Build mode and Ask permissions, so work from scripts and other sessions waits for a member under accept. Run /messages inbound accept to take it here";
+const HELD_SKIPS_WORK: &str = "Inbound hold and refuse take no consumer-group work, so it waits for other members. Run /messages inbound accept or auto to take it here";
 
 pub(super) struct PeerRegistration {
     session: PeerSession,
@@ -469,6 +475,18 @@ impl SessionRuntime {
             .main_chat()
             .push(DisplayMessage::new(DisplayRole::Notice, text));
     }
+
+    /// Warns, once registered, when this session's inbound policy keeps it
+    /// from some work of the consumer groups its launch joined.
+    pub(super) fn warn_joined_groups(&mut self) {
+        let warning = self
+            .peer
+            .as_ref()
+            .and_then(|peer| skip_warning(&peer.session.descriptor().inbound));
+        if let Some(warning) = warning {
+            self.peer_notice(warning.to_owned());
+        }
+    }
 }
 
 impl EventLoop<'_> {
@@ -834,10 +852,8 @@ impl EventLoop<'_> {
             [action, group] if action == "join" => {
                 let group = group.clone();
                 peer.group_command = Some(Load::start((), async move {
-                    session
-                        .join_group(&group)
-                        .await
-                        .map(|()| format!("{JOINED}{group}"))
+                    session.join_group(&group).await?;
+                    Ok(joined_notice(&group, &session.descriptor().inbound))
                 }));
                 return;
             }
@@ -856,16 +872,55 @@ impl EventLoop<'_> {
                 None => {
                     let groups = session.consumer_groups().await?;
                     let work = session.owned_work().await?;
-                    Ok(groups_overview(&groups, &session.groups(), &work))
+                    let skipped = session.skipped_work().await?;
+                    Ok(groups_overview(
+                        &groups,
+                        &session.groups(),
+                        &work,
+                        &skipped,
+                        &session.descriptor().inbound,
+                    ))
                 }
             }
         }));
     }
 }
 
-/// The groups of this namespace, marking the ones `members` names, then the
-/// work this session holds.
-fn groups_overview(groups: &[WorkGroup], members: &[String], work: &[AssignedWork]) -> String {
+/// What `inbound` keeps a consumer-group member from taking, if anything.
+fn skip_warning(inbound: &InboundPolicy) -> Option<&'static str> {
+    match inbound {
+        InboundPolicy::Accept => None,
+        InboundPolicy::Auto => Some(AUTO_SKIPS_WORK),
+        InboundPolicy::Hold | InboundPolicy::Refuse => Some(HELD_SKIPS_WORK),
+    }
+}
+
+fn skip_label(hold: &PolicyHold) -> &'static str {
+    match hold {
+        PolicyHold::Policy => SKIPPED_HELD,
+        PolicyHold::Script => SKIPPED_SCRIPTS,
+        PolicyHold::Cohort => SKIPPED_COHORT,
+    }
+}
+
+/// Confirms joining `group`, warning when `inbound` keeps this session from
+/// some of its work.
+fn joined_notice(group: &str, inbound: &InboundPolicy) -> String {
+    match skip_warning(inbound) {
+        Some(warning) => format!("{JOINED}{group}\n{warning}"),
+        None => format!("{JOINED}{group}"),
+    }
+}
+
+/// The groups of this namespace, marking the ones `members` names with the
+/// queued work `inbound` skips in each, then the work this session holds.
+fn groups_overview(
+    groups: &[WorkGroup],
+    members: &[String],
+    work: &[AssignedWork],
+    skipped: &[SkippedWork],
+    inbound: &InboundPolicy,
+) -> String {
     let mut lines = Vec::new();
     if groups.is_empty() {
         lines.push(NO_GROUPS.to_owned());
@@ -895,6 +950,14 @@ fn groups_overview(groups: &[WorkGroup], members: &[String], work: &[AssignedWor
             line.push_str(GROUP_PAUSED);
         }
         lines.push(line);
+        let skips: Vec<String> = skipped
+            .iter()
+            .filter(|skip| skip.group == group.name)
+            .map(|skip| format!("{} {}", skip.count, skip_label(&skip.hold)))
+            .collect();
+        if !skips.is_empty() {
+            lines.push(format!("{WORK_INDENT}{SKIPS}{}", skips.join(", ")));
+        }
     }
     let missing: Vec<&str> = members
         .iter()
@@ -903,6 +966,11 @@ fn groups_overview(groups: &[WorkGroup], members: &[String], work: &[AssignedWor
         .collect();
     if !missing.is_empty() {
         lines.push(format!("{MISSING_GROUPS}{}", missing.join(", ")));
+    }
+    if !skipped.is_empty()
+        && let Some(warning) = skip_warning(inbound)
+    {
+        lines.push(warning.to_owned());
     }
     if work.is_empty() {
         lines.push(NO_OWNED_WORK.to_owned());
@@ -980,18 +1048,19 @@ mod tests {
     use std::future::pending;
     use std::time::{Duration, Instant};
 
-    use caudra_config::{Feature, FeatureFlags, sandbox::SandboxName};
+    use caudra_config::{Feature, FeatureFlags, InboundPolicy, sandbox::SandboxName};
     use flume::Sender;
     use test_case::test_case;
 
-    use caudra_agent::peers::{AssignedWork, ManagedWork, WorkGroup};
+    use caudra_agent::peers::{AssignedWork, ManagedWork, PolicyHold, SkippedWork, WorkGroup};
     use caudra_storage::messages::{GroupPolicy, WorkCounts};
 
     use super::{
-        BROADCASTS_OFF, BROADCASTS_ON, GROUP_PAUSED, LOAD_STOPPED, Load, MEMBER_MARK,
-        MEMBERS_LEGEND, MISSING_GROUPS, NO_GROUPS, NO_OWNED_WORK, NO_TOPICS, NON_MEMBER_MARK,
-        OWNED_WORK, RETRY_REPEATS, SubscriptionRequest, TOPICS_LABEL, WORK_INDENT, ensure_load,
-        groups_overview, managed_line, peer_blocked, peer_eligible, poll_due, poll_load,
+        AUTO_SKIPS_WORK, BROADCASTS_OFF, BROADCASTS_ON, GROUP_PAUSED, HELD_SKIPS_WORK, JOINED,
+        LOAD_STOPPED, Load, MEMBER_MARK, MEMBERS_LEGEND, MISSING_GROUPS, NO_GROUPS, NO_OWNED_WORK,
+        NO_TOPICS, NON_MEMBER_MARK, OWNED_WORK, RETRY_REPEATS, SKIPPED_COHORT, SKIPPED_SCRIPTS,
+        SKIPS, SubscriptionRequest, TOPICS_LABEL, WORK_INDENT, ensure_load, groups_overview,
+        joined_notice, managed_line, peer_blocked, peer_eligible, poll_due, poll_load,
         subscription_request, subscriptions_summary,
     };
     use crate::app::{App, tests::test_app};
@@ -1043,23 +1112,55 @@ mod tests {
         }
     }
 
+    fn skipped(hold: PolicyHold, count: u64) -> SkippedWork {
+        SkippedWork {
+            group: GROUP.into(),
+            hold,
+            count,
+        }
+    }
+
     #[test]
-    fn groups_overview_marks_memberships_and_lists_held_work() {
+    fn groups_overview_marks_memberships_skipped_work_and_held_work() {
         let overview = groups_overview(
             &[group(GROUP, false), group(OTHER_GROUP, true)],
             &words(&[GROUP, GONE_GROUP]),
             &[held_work()],
+            &[
+                skipped(PolicyHold::Script, 2),
+                skipped(PolicyHold::Cohort, 1),
+            ],
+            &InboundPolicy::Auto,
         );
         let lines: Vec<&str> = overview.lines().collect();
         assert_eq!(lines[0], MEMBERS_LEGEND);
         assert!(lines[1].starts_with(&format!("{MEMBER_MARK}{GROUP}")));
         assert!(!lines[1].ends_with(GROUP_PAUSED));
-        assert!(lines[2].starts_with(&format!("{NON_MEMBER_MARK}{OTHER_GROUP}")));
-        assert!(lines[2].ends_with(GROUP_PAUSED));
-        assert_eq!(lines[3], format!("{MISSING_GROUPS}{GONE_GROUP}"));
-        assert_eq!(lines[4], OWNED_WORK);
-        assert!(lines[5].starts_with(&format!("{WORK_INDENT}{WORK}")));
+        assert_eq!(
+            lines[2],
+            format!("{WORK_INDENT}{SKIPS}2 {SKIPPED_SCRIPTS}, 1 {SKIPPED_COHORT}")
+        );
+        assert!(lines[3].starts_with(&format!("{NON_MEMBER_MARK}{OTHER_GROUP}")));
+        assert!(lines[3].ends_with(GROUP_PAUSED));
+        assert_eq!(lines[4], format!("{MISSING_GROUPS}{GONE_GROUP}"));
+        assert_eq!(lines[5], AUTO_SKIPS_WORK);
+        assert_eq!(lines[6], OWNED_WORK);
+        assert!(lines[7].starts_with(&format!("{WORK_INDENT}{WORK}")));
         assert!(!overview.contains(ESCAPE));
+    }
+
+    #[test_case(InboundPolicy::Accept, None; "accept")]
+    #[test_case(InboundPolicy::Auto, Some(AUTO_SKIPS_WORK); "auto")]
+    #[test_case(InboundPolicy::Hold, Some(HELD_SKIPS_WORK); "hold")]
+    #[test_case(InboundPolicy::Refuse, Some(HELD_SKIPS_WORK); "refuse")]
+    fn joining_warns_when_the_inbound_policy_skips_work(
+        inbound: InboundPolicy,
+        warning: Option<&str>,
+    ) {
+        let notice = joined_notice(GROUP, &inbound);
+        let lines: Vec<&str> = notice.lines().collect();
+        assert_eq!(lines[0], format!("{JOINED}{GROUP}"));
+        assert_eq!(lines.get(1).copied(), warning);
     }
 
     #[test_case(false; "never_claimed")]
@@ -1080,7 +1181,7 @@ mod tests {
     #[test]
     fn groups_overview_says_when_there_is_nothing() {
         assert_eq!(
-            groups_overview(&[], &[], &[]),
+            groups_overview(&[], &[], &[], &[], &InboundPolicy::Auto),
             format!("{NO_GROUPS}\n{NO_OWNED_WORK}")
         );
     }

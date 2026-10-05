@@ -4,7 +4,7 @@
 //! that ends without reporting an outcome pauses the item, so no other member
 //! repeats its effects unless a person retries it.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use super::{
-    Delivery, PeerHost, PeerSession, Route, STALE_REVIEW, Sender, SessionInner, SessionState,
+    Delivery, PeerHost, PeerSession, PolicyHold, Route, Sender, SessionInner, SessionState,
     WireMode, lock, policy_hold, same_cohort, valid_handle, wall_ms,
 };
 use crate::{AgentMode, DoneReason};
@@ -32,7 +32,6 @@ const HEARTBEAT: Duration = Duration::from_secs(20);
 const WORK_POLL: Duration = Duration::from_secs(3);
 const MAX_OWNED: usize = 16;
 const MAX_NOTICES: usize = 16;
-const MAX_APPROVALS: usize = 64;
 pub const INVALID_GROUP: &str = "Consumer group names use 1 to 32 lowercase letters, digits, and hyphens, starting with a letter or digit";
 pub const TOO_MANY_MEMBERSHIPS: &str = "A session joins at most 8 consumer groups";
 pub const NOT_MEMBER: &str = "This session is not a member of that consumer group";
@@ -43,7 +42,6 @@ pub const PAUSED_BY_CANCEL: &str = "The user cancelled the turn working on it";
 const TURN_LIMIT: &str = "The turn working on it reached its turn limit";
 const TURN_FAILED: &str = "The turn working on it failed";
 const SESSION_CLOSED: &str = "Its session closed while working on it";
-const TOO_MANY_APPROVALS: &str = "Too many work items are approved; claim or reject some first";
 const PAUSE_UNCONFIRMED: &str = "Could not record the pause of work";
 
 /// How far this registration's assignment has come.
@@ -73,9 +71,6 @@ pub(super) struct OwnedWork {
 #[derive(Default)]
 pub(super) struct Assignments {
     owned: Option<OwnedWork>,
-    /// Items the user let this registration take despite its inbound policy,
-    /// with the epoch each approval holds for.
-    approved: HashMap<String, u64>,
     notices: VecDeque<WorkNotice>,
     acquiring: bool,
     polled: Option<Instant>,
@@ -143,6 +138,15 @@ pub struct ManagedWork {
     pub repeats_claims: bool,
 }
 
+/// Pending work of one of this session's groups that its inbound policy
+/// passes over for one reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedWork {
+    pub group: String,
+    pub hold: PolicyHold,
+    pub count: u64,
+}
+
 /// What decides, outside the session lock, whether this registration may
 /// take an item.
 struct Admission {
@@ -151,27 +155,38 @@ struct Admission {
     mode: AgentMode,
     canonical_cwd: Option<PathBuf>,
     permission_mode: PermissionMode,
-    approved: HashSet<String>,
 }
 
 impl Admission {
     fn admits(&self, item: &WorkItem) -> bool {
-        Delivery::from_history(item.message.clone(), &self.route).is_some_and(|delivery| {
-            let sender = &delivery.sender;
-            sender.mode != WireMode::ReadOnly
-                && (self.approved.contains(&item.name)
-                    || policy_hold(
-                        &self.inbound,
-                        sender,
-                        same_cohort(
-                            &self.mode,
-                            self.canonical_cwd.as_deref(),
-                            &self.permission_mode,
-                            sender,
-                        ),
-                    )
-                    .is_none())
-        })
+        self.publisher(item)
+            .is_some_and(|sender| self.hold(&sender).is_none())
+    }
+
+    /// Why this registration's inbound policy passes over `item`, if it does.
+    fn passes_over(&self, item: &WorkItem) -> Option<PolicyHold> {
+        self.publisher(item).and_then(|sender| self.hold(&sender))
+    }
+
+    /// The publisher of `item`, unless it is a ReadOnly session, whose work
+    /// no member takes.
+    fn publisher(&self, item: &WorkItem) -> Option<Sender> {
+        Delivery::from_history(item.message.clone(), &self.route)
+            .map(|delivery| delivery.sender)
+            .filter(|sender| sender.mode != WireMode::ReadOnly)
+    }
+
+    fn hold(&self, sender: &Sender) -> Option<PolicyHold> {
+        policy_hold(
+            &self.inbound,
+            sender,
+            same_cohort(
+                &self.mode,
+                self.canonical_cwd.as_deref(),
+                &self.permission_mode,
+                sender,
+            ),
+        )
     }
 }
 
@@ -245,15 +260,13 @@ impl SessionState {
         !matches!(self.descriptor.mode, AgentMode::ReadOnly)
     }
 
-    /// Whether this registration may take the item `work` from `sender`, as
-    /// its inbound policy and approvals stand.
-    fn admits_work(&self, work: &str, sender: &Sender) -> bool {
+    /// Whether this registration may take work from `sender`, as its
+    /// inbound policy stands.
+    fn admits_work(&self, sender: &Sender) -> bool {
         self.approval_blocker().is_none()
             && self.reports_work()
             && sender.mode != WireMode::ReadOnly
-            && (self.work.approved.get(work) == Some(&self.epoch)
-                || policy_hold(&self.descriptor.inbound, sender, self.same_cohort(sender))
-                    .is_none())
+            && policy_hold(&self.descriptor.inbound, sender, self.same_cohort(sender)).is_none()
     }
 
     fn admission(&self, route: &Route) -> Admission {
@@ -263,13 +276,6 @@ impl SessionState {
             mode: self.descriptor.mode.clone(),
             canonical_cwd: self.canonical_cwd.clone(),
             permission_mode: self.descriptor.permission_mode.clone(),
-            approved: self
-                .work
-                .approved
-                .iter()
-                .filter(|(_, epoch)| **epoch == self.epoch)
-                .map(|(work, _)| work.clone())
-                .collect(),
         }
     }
 
@@ -280,7 +286,7 @@ impl SessionState {
             work.stage == Stage::Offered
                 && (!self.open
                     || !self.groups.contains(&work.item.group)
-                    || !self.admits_work(&work.item.name, &work.sender))
+                    || !self.admits_work(&work.sender))
         });
         if release {
             self.release_offered();
@@ -509,7 +515,7 @@ impl PeerSession {
             Delivery::from_history(item.message.clone(), &self.0.route).filter(|delivery| {
                 state.can_take_work()
                     && state.groups.contains(&item.group)
-                    && state.admits_work(&item.name, &delivery.sender)
+                    && state.admits_work(&delivery.sender)
             });
         let naming = delivery.map(|delivery| (state.naming(&delivery), delivery));
         let Some((Ok(naming), delivery)) = naming else {
@@ -741,36 +747,34 @@ impl PeerSession {
         self.0.host.changed.notify(usize::MAX);
     }
 
-    /// Lets this registration take the item `work` despite its inbound
-    /// policy, for as long as the policy `epoch` a person reviewed holds.
-    /// Approval reserves nothing: another member may take the item first.
-    pub fn approve_work(&self, work: &str, epoch: u64) -> Result<(), String> {
-        let mut state = lock(&self.0.state);
-        state.ensure_open()?;
-        if let Some(blocker) = state.approval_blocker() {
-            return Err(blocker.into());
-        }
-        if epoch != state.epoch {
-            return Err(STALE_REVIEW.into());
-        }
-        let current = state.epoch;
-        state
-            .work
-            .approved
-            .retain(|_, approved| *approved == current);
-        if state.work.approved.len() >= MAX_APPROVALS {
-            return Err(TOO_MANY_APPROVALS.into());
-        }
-        state.work.approved.insert(work.to_owned(), current);
-        state.work.polled = None;
-        self.0.host.changed.notify(usize::MAX);
-        Ok(())
-    }
-
-    /// The policy epoch an approval must name, which any change to this
-    /// session's mode, workspace, or inbound policy moves on.
-    pub fn work_epoch(&self) -> u64 {
-        lock(&self.0.state).epoch
+    /// Counts the pending work of this session's groups that its inbound
+    /// policy passes over, by group and reason. Its own publications, which
+    /// it never takes, do not count.
+    pub async fn skipped_work(&self) -> Result<Vec<SkippedWork>, String> {
+        let (groups, admission) = {
+            let state = lock(&self.0.state);
+            state.ensure_open()?;
+            (state.groups.clone(), state.admission(&self.0.route))
+        };
+        let session = self.session_id().to_string();
+        let counts = self
+            .0
+            .host
+            .history
+            .query(move |log| {
+                let mut counts: BTreeMap<(String, PolicyHold), u64> = BTreeMap::new();
+                log.for_each_pending(&groups, &session, |item| {
+                    if let Some(hold) = admission.passes_over(&item) {
+                        *counts.entry((item.group, hold)).or_insert(0) += 1;
+                    }
+                })?;
+                Ok(counts)
+            })
+            .await?;
+        Ok(counts
+            .into_iter()
+            .map(|((group, hold), count)| SkippedWork { group, hold, count })
+            .collect())
     }
 
     pub fn take_work_notices(&self) -> Vec<WorkNotice> {
@@ -838,13 +842,12 @@ mod tests {
 
     use super::{
         COMPLETION_REQUIRED, INVALID_GROUP, MAX_MEMBERSHIPS, NOT_MEMBER, PAUSED_BY_CANCEL,
-        SESSION_CLOSED, TOO_MANY_MEMBERSHIPS, TURN_FAILED, TURN_LIMIT, WorkAction,
+        SESSION_CLOSED, SkippedWork, TOO_MANY_MEMBERSHIPS, TURN_FAILED, TURN_LIMIT, WorkAction,
         check_memberships,
     };
+    use crate::peers::script::tests::script;
     use crate::peers::tests::{descriptor, directory, host};
-    use crate::peers::{
-        PeerDescriptor, PeerHost, PeerSession, REFUSED_POLICY, STALE_REVIEW, lock, wall_ms,
-    };
+    use crate::peers::{PeerDescriptor, PeerHost, PeerSession, PolicyHold, lock, wall_ms};
     use crate::{AgentMode, DoneReason};
 
     const GROUP: &str = "ci-triage";
@@ -861,6 +864,7 @@ mod tests {
     const COMPLETED: &str = "completed";
     const LOST: &str = "Lost work";
     const RECOVERY: &str = "lease-recovery";
+    const SCRIPT_LABEL: &str = "nightly-ci";
 
     async fn grouped() -> (TempDir, PeerHost, PeerSession) {
         let directory = directory();
@@ -1087,27 +1091,41 @@ mod tests {
         });
     }
 
-    #[test]
-    fn approval_admits_held_work_only_for_the_reviewed_epoch() {
+    #[test_case(InboundPolicy::Accept, &[]; "accept_skips_nothing")]
+    #[test_case(InboundPolicy::Auto, &[(PolicyHold::Script, 1), (PolicyHold::Cohort, 1)]; "auto_skips_scripts_and_other_cohorts")]
+    #[test_case(InboundPolicy::Hold, &[(PolicyHold::Policy, 3)]; "hold_skips_all")]
+    #[test_case(InboundPolicy::Refuse, &[(PolicyHold::Policy, 3)]; "refuse_skips_all")]
+    fn skipped_work_counts_what_the_inbound_policy_passes_over(
+        inbound: InboundPolicy,
+        expected: &[(PolicyHold, u64)],
+    ) {
         smol::block_on(async {
+            let elsewhere = directory();
             let (directory, host, publisher) = grouped().await;
-            let worker = member(&host, directory.path(), InboundPolicy::Hold);
-            let work = publish(&publisher).await;
-            let epoch = worker.work_epoch();
-            assert_eq!(
-                worker.approve_work(&work, epoch + 1).unwrap_err(),
-                STALE_REVIEW
-            );
-            worker.approve_work(&work, epoch).unwrap();
-            worker.set_inbound(InboundPolicy::Hold).unwrap();
-            assert!(!worker.acquire_work().await.unwrap());
-            worker.approve_work(&work, worker.work_epoch()).unwrap();
-            assert!(worker.acquire_work().await.unwrap());
-            worker.set_inbound(InboundPolicy::Refuse).unwrap();
-            assert_eq!(
-                worker.approve_work(&work, worker.work_epoch()).unwrap_err(),
-                REFUSED_POLICY
-            );
+            let worker = member(&host, directory.path(), inbound);
+            let outsider = host
+                .register(descriptor(elsewhere.path(), InboundPolicy::Auto))
+                .unwrap();
+            for session in [&publisher, &outsider, &worker] {
+                publish(session).await;
+            }
+            let audience = PeerAudience::Topic {
+                topic: TOPIC.into(),
+            };
+            script(&directory, &MessagingConfig::default(), SCRIPT_LABEL)
+                .publish(audience, TEXT)
+                .await
+                .unwrap();
+            let skipped = worker.skipped_work().await.unwrap();
+            let expected: Vec<SkippedWork> = expected
+                .iter()
+                .map(|(hold, count)| SkippedWork {
+                    group: GROUP.into(),
+                    hold: hold.clone(),
+                    count: *count,
+                })
+                .collect();
+            assert_eq!(skipped, expected);
         });
     }
 

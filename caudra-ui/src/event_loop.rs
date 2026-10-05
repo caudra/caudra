@@ -178,6 +178,9 @@ pub struct EventLoopParams {
     pub sessions: Vec<SessionTab>,
     pub focused: usize,
     pub startup_warnings: Vec<String>,
+    /// The launch joined the focused session to consumer groups, so it warns
+    /// once registered if its inbound policy skips some of their work.
+    pub joined_groups: bool,
     pub storage: StateDir,
     pub config: AgentConfig,
     pub ui_config: UiConfig,
@@ -1451,6 +1454,7 @@ impl<'t> EventLoop<'t> {
             sessions,
             focused,
             mut startup_warnings,
+            joined_groups,
             storage,
             config,
             ui_config,
@@ -1628,6 +1632,9 @@ impl<'t> EventLoop<'t> {
         }
         for runtime in &mut runtimes {
             runtime.install_peer(&ctx);
+        }
+        if joined_groups {
+            runtimes[focused].warn_joined_groups();
         }
 
         let input = InputReader::spawn();

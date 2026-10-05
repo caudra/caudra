@@ -247,7 +247,7 @@ pub fn parse_label(label: &str) -> Result<String, String> {
 }
 
 #[cfg(all(test, unix))]
-mod tests {
+pub(super) mod tests {
     use std::path::Path;
 
     use caudra_config::{InboundPolicy, MessagingConfig};
@@ -288,7 +288,11 @@ mod tests {
         }
     }
 
-    fn script(directory: &TempDir, messaging: &MessagingConfig, label: &str) -> ScriptSender {
+    pub(in crate::peers) fn script(
+        directory: &TempDir,
+        messaging: &MessagingConfig,
+        label: &str,
+    ) -> ScriptSender {
         let path = directory.path();
         let history = MessageHistory::open_in(&path.join(TEST_HISTORY_DIRECTORY), messaging);
         ScriptSender::bind(path.to_owned(), history.unwrap(), messaging, label, path).unwrap()

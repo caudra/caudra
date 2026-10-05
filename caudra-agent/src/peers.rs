@@ -35,8 +35,8 @@ use history::{HistoryWriter, MessageHistory};
 use topics::{parse_pattern, parse_topic, pattern_matches, validate_patterns};
 pub use work::{
     AssignedWork, COMPLETION_REQUIRED, INVALID_GROUP, MAX_MEMBERSHIPS, MAX_OUTCOME_BYTES,
-    ManagedWork, NOT_MEMBER, PAUSED_BY_CANCEL, TOO_MANY_MEMBERSHIPS, WorkAction, WorkNotice,
-    parse_group,
+    ManagedWork, NOT_MEMBER, PAUSED_BY_CANCEL, SkippedWork, TOO_MANY_MEMBERSHIPS, WorkAction,
+    WorkNotice, parse_group,
 };
 use work::{Assignments, check_memberships};
 
@@ -1321,18 +1321,36 @@ fn same_cohort(
         && sender.permission_mode == PermissionMode::Ask
 }
 
+/// Why an inbound policy keeps what a sender sent from reaching the session
+/// on its own, as a message or as consumer-group work.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PolicyHold {
+    /// `hold` and `refuse` admit nothing on their own.
+    Policy,
+    /// `auto` admits no script.
+    Script,
+    /// `auto` admits only sessions of its automatic cohort.
+    Cohort,
+}
+
+impl PolicyHold {
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::Policy => HELD_POLICY,
+            Self::Script => HELD_EXTERNAL,
+            Self::Cohort => HELD_COHORT,
+        }
+    }
+}
+
 /// Why `inbound` holds what `sender` sent for review, if it does.
-fn policy_hold(
-    inbound: &InboundPolicy,
-    sender: &Sender,
-    same_cohort: bool,
-) -> Option<&'static str> {
+fn policy_hold(inbound: &InboundPolicy, sender: &Sender, same_cohort: bool) -> Option<PolicyHold> {
     match inbound {
         InboundPolicy::Accept => None,
-        InboundPolicy::Hold | InboundPolicy::Refuse => Some(HELD_POLICY),
-        InboundPolicy::Auto if sender.external => Some(HELD_EXTERNAL),
+        InboundPolicy::Hold | InboundPolicy::Refuse => Some(PolicyHold::Policy),
+        InboundPolicy::Auto if sender.external => Some(PolicyHold::Script),
         InboundPolicy::Auto if same_cohort => None,
-        InboundPolicy::Auto => Some(HELD_COHORT),
+        InboundPolicy::Auto => Some(PolicyHold::Cohort),
     }
 }
 
@@ -2639,6 +2657,7 @@ impl SessionState {
             &delivery.sender,
             self.same_cohort(&delivery.sender),
         )
+        .map(|hold| hold.reason())
     }
 
     /// Whether stored messages may be read without a cohort check: `accept`

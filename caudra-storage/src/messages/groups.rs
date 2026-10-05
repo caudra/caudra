@@ -609,6 +609,26 @@ impl MessageLog {
             .ok_or_else(|| WorkRefusal::UnknownWork(name.into()).into())
     }
 
+    /// Hands each pending item of `groups` that `session` did not publish to
+    /// `visit`, one at a time, so a caller can tally a long queue.
+    pub fn for_each_pending(
+        &self,
+        groups: &[String],
+        session: &str,
+        mut visit: impl FnMut(WorkItem),
+    ) -> Result<(), MessageLogError> {
+        let mut statement = self.database.connection().prepare(&format!(
+            "SELECT {MESSAGE_COLUMNS}, {WORK_COLUMNS} {WORK_FROM}
+             WHERE w.state = 'pending' AND g.name IN (SELECT value FROM json_each(?1))
+               AND m.sender_session != ?2"
+        ))?;
+        let mut rows = statement.query(params![json_list(groups, "groups")?, session])?;
+        while let Some(row) = rows.next()? {
+            visit(work_row(row)?);
+        }
+        Ok(())
+    }
+
     /// Leases the oldest available item of `groups` that `eligible` accepts,
     /// unless `worker`'s session already holds a lease or every group is at
     /// its concurrency. Items whose leases lapsed return to the queue first.
@@ -1553,6 +1573,24 @@ mod tests {
         publish(&mut log, "a");
         assert!(claim(&mut log, PUBLISHER, NOW_MS).is_none());
         assert!(claim(&mut log, WORKER, NOW_MS).is_some());
+    }
+
+    #[test]
+    fn pending_scans_leave_out_claimed_items_and_own_publications() {
+        let (_root, _state, mut log) = fixture();
+        group(&mut log, &GroupPolicy::default());
+        publish(&mut log, "a");
+        let pending = publish(&mut log, "b");
+        claim(&mut log, OTHER_WORKER, NOW_MS).unwrap();
+        let scanned = |session: &str| {
+            let mut names = Vec::new();
+            log.for_each_pending(&[GROUP.into()], session, |item| names.push(item.name))
+                .unwrap();
+            names
+        };
+
+        assert_eq!(scanned(WORKER), pending);
+        assert!(scanned(PUBLISHER).is_empty());
     }
 
     #[test]
