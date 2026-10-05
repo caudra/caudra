@@ -147,7 +147,7 @@ The implemented schema is in `caudra-config/src/sandbox.rs`: `SandboxProvider`, 
 | `running_ttl_seconds` | integer | required | - | Seconds the sandbox may run before its lease ends. `0` never ends, which needs a provider without a lease cap |
 | `on_exit` | string | `detach` | - | What happens to the sandbox when Caudra exits. `detach` is the only value |
 
-`caudra config example sandboxes` prints every `sandboxes.toml` key with its default, all commented out. [sandboxes.example.toml](/docs/sandboxes.example.toml) holds the same text.
+`caudra config example sandboxes` prints every `sandboxes.toml` key with its default, all commented out. [Reference configs](/docs/reference-configs/#sandboxes-toml) shows the same text.
 
 <!-- /caudra-docgen:sandbox-records -->
 

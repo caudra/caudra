@@ -23,7 +23,7 @@ install-fast: code-worker
 build *ARGS:
     "{{ cargo_cmd }}" build {{ ARGS }}
 
-# Types only, no codegen, no lints. Add `-p <crate>` to make it cheaper still.
+# Types only, no codegen, no lints, always for the whole workspace. For one crate: `cargo check -p <crate> --tests`.
 check *ARGS:
     "{{ cargo_cmd }}" check --workspace --tests {{ ARGS }}
 

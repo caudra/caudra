@@ -1615,6 +1615,16 @@ impl Manager {
         if event.code == KeyCode::Char('c') && event.modifiers == KeyModifiers::CONTROL {
             return self.navigate(Navigation::Back);
         }
+        // A Ctrl chord is never its bare letter, so a form key pressed here
+        // cannot open a list action. AltGr arrives as Ctrl+Alt and still types.
+        if matches!(event.code, KeyCode::Char(_))
+            && event
+                .modifiers
+                .intersection(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                == KeyModifiers::CONTROL
+        {
+            return SandboxAction::None;
+        }
         match event.code {
             KeyCode::Char('v') if self.kind() == Some(RecordKind::Profile) => {
                 self.open_live(live::Kind::Create)
@@ -2528,11 +2538,14 @@ fn read_only_key(event: KeyEvent) -> bool {
 pub(crate) mod tests {
     use super::live::{INSTANCE_ACTIONS, Kind, LEASE_FIELD};
     use super::{
-        CONFLICT, Confirmation, Control, DocumentMode, Focus, Form, Navigation, SAVED,
+        CONFLICT, Confirmation, Control, DocumentMode, Focus, Form, Manager, Navigation, SAVED,
         SandboxAction, SandboxManager, SandboxView, StoreEffect, StoreReply, StoreResult,
         StoreTicket, UNAVAILABLE, UNCAPPED_LEASE_HINT,
     };
-    use crate::components::{Overlay, keybindings::key};
+    use crate::components::{
+        Overlay,
+        keybindings::{Bind, key},
+    };
     use crate::sandbox::{
         LiveOperation, LiveOutcome, LiveReply, SandboxAttachment, SandboxInstanceSnapshot,
         SandboxInstanceState, SandboxWorkcellState,
@@ -4068,14 +4081,14 @@ on_exit = "detach"
         form.editing = true;
         form.fields[form.focus].editor.set_text(value.into());
         let revision = state.revision;
-        state.handle_key(KeyEvent::new(KeyCode::Insert, KeyModifiers::ALT));
+        state.handle_key(key::SANDBOX_APPEND_RULE.to_key_event());
         assert_eq!(state.revision, revision + 1);
         let form = state.form.as_ref().unwrap();
         assert_eq!(form.text(field_key), format!("{value}\n"));
         assert!(form.fields[form.focus].error.is_none());
         state.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL));
         assert_eq!(state.revision, revision + 1);
-        state.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::ALT));
+        state.handle_key(key::SANDBOX_CLEAR_RULE.to_key_event());
         assert_eq!(state.revision, revision + 2);
         let form = state.form.as_ref().unwrap();
         assert!(form.text(field_key).trim().is_empty());
@@ -4086,18 +4099,43 @@ on_exit = "detach"
         );
     }
 
-    #[test_case(KeyCode::Home, 0; "first")]
-    #[test_case(KeyCode::End, 3; "last")]
-    fn live_field_boundaries_preserve_unmodified_cursor_keys(code: KeyCode, expected: usize) {
+    #[test_case(KeyCode::Home, key::SANDBOX_FIRST_FIELD, 0; "first")]
+    #[test_case(KeyCode::End, key::SANDBOX_LAST_FIELD, 3; "last")]
+    fn live_field_boundaries_preserve_unmodified_cursor_keys(
+        cursor: KeyCode,
+        jump: Bind,
+        expected: usize,
+    ) {
         let (_directory, _store, mut manager) = fixture();
         live_instance(&mut manager, false);
         let state = manager.state.as_mut().unwrap();
         state.open_live(super::live::Kind::Network);
         state.live_form.as_mut().unwrap().focus = 1;
-        state.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(cursor, KeyModifiers::NONE));
         assert_eq!(state.live_form.as_ref().unwrap().focus, 1);
-        state.handle_key(KeyEvent::new(code, KeyModifiers::ALT));
+        state.handle_key(jump.to_key_event());
         assert_eq!(state.live_form.as_ref().unwrap().focus, expected);
+    }
+
+    #[test_case(SandboxView::Profiles, key::SANDBOX_APPEND_RULE; "append_rule_is_not_new")]
+    #[test_case(SandboxView::Instances, key::SANDBOX_CLEAR_RULE; "clear_rule_is_not_resume")]
+    #[test_case(SandboxView::Instances, key::SANDBOX_FIRST_FIELD; "first_field_is_not_network")]
+    #[test_case(SandboxView::Images, key::SANDBOX_LAST_FIELD; "last_field_is_not_build")]
+    fn form_keys_outside_a_form_never_run_the_bare_letter(view: SandboxView, bind: Bind) {
+        let (_directory, _store, mut manager) = fixture();
+        live_instance(&mut manager, false);
+        let state = manager.state.as_mut().unwrap();
+        state.go(Navigation::View(view));
+        let observe = |state: &Manager| {
+            (
+                state.form.as_ref().map(|form| form.original.clone()),
+                state.live_form.is_some(),
+                state.status.clone(),
+            )
+        };
+        let before = observe(state);
+        state.handle_key(bind.to_key_event());
+        assert_eq!(observe(state), before);
     }
 
     #[test_case(false; "hover_only")]

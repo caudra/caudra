@@ -2,21 +2,21 @@
   "name": "caudra",
   "type": "dark",
   "colors": {
-    "editor.background": "#09254D",
-    "editor.foreground": "#F2EBDD"
+    "editor.background": "#1B1D24",
+    "editor.foreground": "#F5F5F2"
   },
   "tokenColors": [
     {
       "scope": ["comment", "punctuation.definition.comment"],
-      "settings": { "foreground": "#77766F", "fontStyle": "" }
+      "settings": { "foreground": "#A5A7B0", "fontStyle": "" }
     },
     {
       "scope": ["string", "punctuation.definition.string"],
-      "settings": { "foreground": "#B7CF80" }
+      "settings": { "foreground": "#ACCEB5" }
     },
     {
       "scope": ["string.unquoted"],
-      "settings": { "foreground": "#E5E3D9" }
+      "settings": { "foreground": "#E1E2E8" }
     },
     {
       "scope": [
@@ -25,15 +25,15 @@
         "constant.other",
         "constant.character.escape"
       ],
-      "settings": { "foreground": "#E0A17B" }
+      "settings": { "foreground": "#DBBD8C" }
     },
     {
       "scope": ["keyword", "storage.type", "storage.modifier"],
-      "settings": { "foreground": "#B8B7AE", "fontStyle": "" }
+      "settings": { "foreground": "#C5C7D0", "fontStyle": "" }
     },
     {
       "scope": ["keyword.operator"],
-      "settings": { "foreground": "#8C8B84" }
+      "settings": { "foreground": "#A5A7B0" }
     },
     {
       "scope": [
@@ -43,7 +43,7 @@
         "meta.function-call entity.name",
         "support.function.builtin"
       ],
-      "settings": { "foreground": "#FF7662", "fontStyle": "" }
+      "settings": { "foreground": "#8CA6FF", "fontStyle": "" }
     },
     {
       "scope": [
@@ -53,7 +53,7 @@
         "support.type",
         "support.class"
       ],
-      "settings": { "foreground": "#9FC8D1" }
+      "settings": { "foreground": "#A9C8D5" }
     },
     {
       "scope": [
@@ -63,23 +63,23 @@
         "variable.other.property",
         "meta.object-literal.key"
       ],
-      "settings": { "foreground": "#B8B7AE" }
+      "settings": { "foreground": "#C5C7D0" }
     },
     {
       "scope": ["variable", "variable.parameter"],
-      "settings": { "foreground": "#E5E3D9" }
+      "settings": { "foreground": "#E1E2E8" }
     },
     {
       "scope": ["markup.inserted"],
-      "settings": { "foreground": "#B7CF80" }
+      "settings": { "foreground": "#ACCEB5" }
     },
     {
       "scope": ["markup.deleted"],
-      "settings": { "foreground": "#E0A17B" }
+      "settings": { "foreground": "#E5ADAD" }
     },
     {
       "scope": ["markup.heading"],
-      "settings": { "foreground": "#9FC8D1" }
+      "settings": { "foreground": "#A9C8D5" }
     }
   ]
 }

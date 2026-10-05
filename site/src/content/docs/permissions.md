@@ -602,7 +602,7 @@ deny = ["admin_delete"]
 | `deny` | bool \| string \| string[] | unset | Tools the model may never call, in the same forms as `allow`. `false` in any of the three adds nothing |
 | `default` | string | unset | What a call to a tool of this server that no rule matches does: `allow`, `deny`, or `prompt`. Unset follows the top-level `default` |
 
-`caudra config example permissions` prints every `permissions.toml` key with its default, all commented out. [permissions.example.toml](/docs/permissions.example.toml) holds the same text.
+`caudra config example permissions` prints every `permissions.toml` key with its default, all commented out. [Reference configs](/docs/reference-configs/#permissions-toml) shows the same text.
 
 <!-- /caudra-docgen:permissions-keys -->
 

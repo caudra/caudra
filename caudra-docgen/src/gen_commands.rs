@@ -151,6 +151,8 @@ Each `task` subagent has a separate transcript. Open the task picker with `/task
 
 Background rows show a right-aligned `bg` indicator beside the state or spinner, including after completion. New task IDs come from the description, such as `implement-active-footer-chips`, with `-2`, `-3`, and later suffixes for collisions. Display labels stay unchanged. Shell jobs use safe command labels such as `shell-cargo-test`, falling back to `shell`. Use the returned ID unchanged. Older IDs remain valid for inspection, control, and continuation. See [task and output IDs](/docs/sessions/#task-and-output-ids) for naming and compatibility.
 
+A task's chat opens while the model is still writing its brief. Click the streaming call to read the assignment as it grows. Guidance becomes available when the subagent starts.
+
 An input box appears while the focused task is running. Press Enter to queue guidance for its next turn boundary. Pending guidance stays visible above the input until the subagent consumes it. Task transcripts survive session reloads, and later `task` calls can continue one by passing its `task_id`.
 
 That input box is a full composer. Typing `/` opens the palette, `Ctrl+S` inserts a file path, `Ctrl+X e` edits the draft in the [workbench](/docs/workbench/#plans-memory-notes-and-prompt-drafts), and `Ctrl+V` attaches an image to the guidance. A custom `/project:` or `/user:` command expands its template and steers the focused task rather than the main session.

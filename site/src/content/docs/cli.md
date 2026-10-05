@@ -433,7 +433,7 @@ caudra models --jobs --model anthropic/claude-sonnet-4-6
 
 The plain command streams every model Caudra currently knows about from built-ins, discovery, and catalogs. Each line starts with its model spec and may end with a Small, Fast, or Best supply marker. Warnings from discovery go to stderr.
 
-`--jobs` prints a table with **Job**, **Binding**, and **Resolved** columns for Chat, Plan, Subagent, Compact, Title, Goal, Fast, and Best. The optional global `--model` sets the anchor used to resolve the table and may appear before or after `models`. Without it, the normal saved, configured, or detected model becomes the anchor. It resolves from configuration and locally available model metadata, avoiding the all-provider discovery pass used by the plain command. See [Providers](/docs/providers/#model-jobs) for bindings, defaults, and marker meanings.
+`--jobs` prints a table with **Job**, **Binding**, and **Resolved** columns for Chat, Plan, Subagent, Compact, Title, Goal, Extract, Fast, and Best. The optional global `--model` sets the anchor used to resolve the table and may appear before or after `models`. Without it, the normal saved, configured, or detected model becomes the anchor. It resolves from configuration and locally available model metadata, avoiding the all-provider discovery pass used by the plain command. See [Providers](/docs/providers/#model-jobs) for bindings, defaults, and marker meanings.
 
 ### `caudra mcp`
 
@@ -542,7 +542,7 @@ caudra config example > caudra.example.toml   # keep a copy to read or diff
 
 `example` prints every setting of one TOML file with its type, default, allowed range, environment variable, and description. FILE names one of the TOML files that `caudra config files` lists, with or without `.toml`, and defaults to `caudra`. Everything is commented out apart from `version` and the table headers a file needs, so the whole output is a valid file that changes nothing. To use a setting, copy its line into your file under the same table and remove the `#`. For a record such as `[mcp.NAME]`, copy the header too and put your own name in it.
 
-Neither command needs your settings, so both work even when `caudra.toml` has an error. The same text is available as [caudra.example.toml](/docs/caudra.example.toml) and one `.example.toml` file for each of the others. See [Config files](/docs/configuration/#config-files).
+Neither command needs your settings, so both work even when `caudra.toml` has an error. [Reference configs](/docs/reference-configs/) shows what `example` prints for every TOML file, with a download for each. See [Config files](/docs/configuration/#config-files).
 
 ### `caudra logs`
 

@@ -1,8 +1,11 @@
 import { expect, test } from '@playwright/test';
+import { HEADLINE, METHOD_NOTE } from '../../src/data/home';
+import { COPY_STATUS, INSTALL_COMMAND } from '../../src/data/install';
 
+const VIEWPORT_WIDTHS = [320, 390, 768, 1024, 1280, 1600];
 const SCROLLBAR_COLORS = {
-  dark: 'rgb(101, 118, 142) rgb(9, 37, 77)',
-  light: 'rgb(138, 129, 115) rgb(242, 235, 221)',
+  dark: 'rgb(104, 108, 124) rgb(20, 21, 26)',
+  light: 'rgb(133, 136, 150) rgb(245, 245, 242)',
 };
 
 test('homepage, responsive docs, deep links and copy stay local', async ({ page, baseURL }, testInfo) => {
@@ -12,15 +15,27 @@ test('homepage, responsive docs, deep links and copy stay local', async ({ page,
   page.on('request', (request) => { if (!request.url().startsWith(baseURL!) && !request.url().startsWith('data:')) external.push(request.url()); });
   await page.goto('/');
   await expect(page.locator('html')).toHaveCSS('scrollbar-width', 'auto');
-  await expect(page.locator('html')).toHaveCSS('scrollbar-color', SCROLLBAR_COLORS.light);
-  await expect(page.locator('html')).toHaveCSS('color-scheme', 'light');
-  await expect(page.getByRole('heading', { level: 1 })).toHaveText('Context into effective action.');
+  await expect(page.locator('html')).toHaveCSS('scrollbar-color', SCROLLBAR_COLORS.dark);
+  await expect(page.locator('html')).toHaveCSS('color-scheme', 'dark');
+  await expect(page.getByRole('heading', { level: 1 })).toHaveText(HEADLINE);
   await page.keyboard.press('Tab');
   await expect(page.getByRole('link', { name: 'Skip to content' })).toBeFocused();
-  await page.getByRole('button', { name: 'Copy install command' }).click();
-  await expect(page.getByRole('status')).toHaveText('Install command copied.');
-  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe('curl -fsSL https://caudra.ai/install.sh | sh');
+  const steer = page.locator('#steer');
+  await expect(steer.getByRole('button', { name: 'Guide a subagent' })).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.locator('#recording-btw')).toBeHidden();
+  await steer.getByRole('button', { name: 'Ask /btw' }).click();
+  await expect(page.locator('#recording-btw')).toBeVisible();
+  await expect(page.locator('#recording-steer')).toBeHidden();
+  await expect(steer.getByRole('button', { name: 'Ask /btw' })).toHaveAttribute('aria-pressed', 'true');
+  await steer.getByRole('button', { name: 'Guide a subagent' }).focus();
+  await page.keyboard.press('Enter');
+  await expect(page.locator('#recording-steer')).toBeVisible();
+  const heroInstall = page.locator('#hero-install');
+  await heroInstall.getByRole('button', { name: 'Copy install command' }).click();
+  await expect(heroInstall.getByRole('status')).toHaveText(COPY_STATUS.copied);
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(INSTALL_COMMAND);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.evaluate(() => window.scrollTo({ top: 0, behavior: 'instant' }));
   await page.screenshot({ path: testInfo.outputPath('homepage.png'), fullPage: true });
 
   await page.goto('/docs/tools/#file_read');
@@ -82,8 +97,48 @@ test('Starlight search, theme, mobile navigation and diagrams work', async ({ pa
   await expect(page.locator('.diagram')).toHaveCount(0);
   const response = await page.goto('/this-page-does-not-exist/');
   expect(response?.status()).toBe(404);
-  await expect(page.getByRole('heading', { level: 1 })).toContainText('404');
+  await expect(page.getByRole('heading', { level: 1 })).toHaveText('Nothing at this address.');
   expect((await page.request.get('/docs/not-a-file.example.toml')).status()).toBe(404);
   expect(external).toEqual([]);
   expect(errors).toEqual([]);
+});
+
+test('homepage handles narrow screens, zoom, motion preferences, and copy failure', async ({ page }, testInfo) => {
+  await page.goto('/');
+  await page.evaluate(() => Object.defineProperty(navigator.clipboard, 'writeText', { value: () => Promise.reject(new Error('Clipboard unavailable')) }));
+  const heroInstall = page.locator('#hero-install');
+  await heroInstall.getByRole('button', { name: 'Copy install command' }).click();
+  await expect(heroInstall.getByRole('status')).toHaveText(COPY_STATUS.failed);
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await expect(page.locator('html')).toHaveCSS('scroll-behavior', 'auto');
+  for (const width of VIEWPORT_WIDTHS) {
+    await page.setViewportSize({ width, height: 900 });
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), `horizontal overflow at ${width}px`).toBe(true);
+  }
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await page.locator('html').evaluate((element) => { element.style.fontSize = '200%'; });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'horizontal overflow at 200% text zoom').toBe(true);
+  await page.locator('html').evaluate((element) => { element.style.fontSize = ''; });
+  await page.setViewportSize({ width: 768, height: 1024 });
+  await page.evaluate(() => window.scrollTo({ top: 0, behavior: 'instant' }));
+  await page.screenshot({ path: testInfo.outputPath('homepage-tablet.png'), fullPage: true });
+  await page.emulateMedia({ forcedColors: 'active' });
+  await expect(page.locator('html')).toHaveCSS('scrollbar-color', 'auto');
+});
+
+test('homepage remains useful without JavaScript', async ({ browser, baseURL }) => {
+  const context = await browser.newContext({ javaScriptEnabled: false });
+  const page = await context.newPage();
+  await page.goto(baseURL!);
+  await expect(page.getByRole('heading', { level: 1 })).toHaveText(HEADLINE);
+  await expect(page.locator('#hero-install [data-copy-source]')).toHaveText(INSTALL_COMMAND);
+  await expect(page.locator('[data-copy]')).toHaveCount(2);
+  for (const button of await page.locator('[data-copy]').all()) await expect(button).toBeHidden();
+  await expect(page.locator('#steer .clip-tab-list')).toBeHidden();
+  await expect(page.locator('#recording-steer')).toBeVisible();
+  await expect(page.locator('#recording-btw')).toBeVisible();
+  await expect(page.locator('#method')).toContainText(METHOD_NOTE);
+  await page.getByRole('link', { name: 'Read the quick start' }).click();
+  await expect(page.getByRole('heading', { level: 1 })).toHaveText('Quick Start');
+  await context.close();
 });

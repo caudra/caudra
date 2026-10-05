@@ -82,7 +82,7 @@ The shell modal lists `shell` calls from the main agent, subagents, and workflow
 
 The model can inspect and cancel jobs through [`task_control`](/docs/tools/#task_control). Task `auto` also permits promotion of agent tasks. All actions except `list` require `task_id`. A later `task` call can continue a settled agent task from its saved history, but cannot resume an active or cancelling invocation. Shell jobs cannot be resumed or promoted. Run a new shell call when another command is needed.
 
-Settled tasks and background shell jobs are archived with the session once delivery is complete. Finished history does not consume live admission capacity. In either modal, `Alt+Right` loads older archived entries and `Alt+Left` returns to recent history. Details and task transcripts load on demand. Old IDs, results, and continuation history remain available until the session is deleted or removed by retention. The model can page history with the `next` cursor returned by `task_control list`, passing it as `before` on the next call.
+Settled tasks and background shell jobs are archived with the session once delivery is complete. Finished history does not consume live admission capacity. In either modal, `Ctrl+O` loads older archived entries and `Ctrl+R` returns to recent history. Details and task transcripts load on demand. Old IDs, results, and continuation history remain available until the session is deleted or removed by retention. The model can page history with the `next` cursor returned by `task_control list`, passing it as `before` on the next call.
 
 Shell results retain Workcell's output bounds and filtering. A truncated result can include a `tool_output` reference for the retained output, which is not an unlimited process log. Saved references remain usable after history reloads and forks.
 
@@ -204,9 +204,11 @@ The figure measured is the sum of uncompressed payload sizes, which is a proxy f
 
 Saving carries no such cap, so a long session can grow past one that is set too low. The storage writer warns once when a session reaches 80 percent of the ceiling, while there is still room to act. Trim that session, fork it to carry the useful part forward, or raise the ceiling. `CAUDRA_MAX_EAGER_LOAD_MB` raises it for a single run, which is the quickest way to reach a session that already refuses to open.
 
+Payloads are stored with zstd compression. A save that only adds to a session writes just the new rows, and a load spreads decompression and parsing across CPU cores. The transcript re-lays out only the messages near the viewport, so scrolling stays responsive in a long session.
+
 ## Retention
 
-Sessions have two tiers. A **full** session keeps everything: the conversation, rich tool output records, retained tool output files, rewind archives, and its file change records. A **transcript** session keeps the conversation, subagent transcripts, usage, model, mode, drafts, queue, and permission rules, and can still be resumed. It cannot revert files to its earlier messages, has no `tool_output_read` access to old outputs, and renders old tool calls from their model-facing text. Small structured records such as todo lists stay.
+Sessions have two tiers. A **full** session keeps everything: the conversation, rich tool output records, retained tool output files, rewind archives, and its file change records. A **transcript** session keeps the conversation, subagent transcripts, usage, model, mode, drafts, queue, and permission rules, and can still be resumed. It cannot revert files to its earlier messages, has no `tool_output` access to old outputs, and renders old tool calls from their model-facing text. Small structured records such as todo lists stay.
 
 Trimming moves a session from full to transcript. Forgetting deletes it. A trimmed session that runs again becomes full for its new work and is trimmed again later.
 

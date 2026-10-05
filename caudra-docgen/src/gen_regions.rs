@@ -11,7 +11,8 @@ use caudra_automation::meta::parse_meta;
 use caudra_config::example::{Document, mcp, permissions, sandboxes, workcell};
 use caudra_config::files::{self, ConfigFile};
 
-use crate::gen_config::{example_file_name, write_entries};
+use crate::gen_config::write_entries;
+use crate::gen_reference_configs;
 
 const MARKER_OPEN: &str = "<!-- caudra-docgen:";
 const MARKER_CLOSE: &str = "<!-- /caudra-docgen:";
@@ -279,10 +280,10 @@ pub fn keys_table(document: &Document, paths: &[&str]) -> String {
 pub fn footer(file: &ConfigFile) -> String {
     format!(
         "`{command}` prints every `{name}` key with its default, all commented out. \
-         [{example}](/docs/{example}) holds the same text.",
+         [Reference configs]({link}) shows the same text.",
         command = file.example_command(),
         name = file.name,
-        example = example_file_name(file),
+        link = gen_reference_configs::link(file),
     )
 }
 

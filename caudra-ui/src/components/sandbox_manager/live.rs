@@ -2,7 +2,7 @@ use super::{
     Confirmation, Control, Focus, Manager, ReadSurface, SandboxAction, SandboxView, SnapshotState,
     StoreTicket, TextEditor, editor_action,
     form::{CIDR_HELP, DOMAIN_HELP, LEASE_HELP, network_list_key, parse_cidrs, parse_domains},
-    image,
+    image, key,
     view::hover_style,
 };
 use crate::{
@@ -42,7 +42,7 @@ const LIVE_FIELD_ROWS: u16 = 6;
 const RECOVERY_REQUIRED: &str = "Pending or unknown outcome: Inspect / Reconcile first; acknowledging failure is separate from retrying.";
 const PERSISTENT_REQUIRED: &str =
     "Requires a persistent disk. Stop never silently deletes an ephemeral instance.";
-const LIVE_KEYS: &str = "Ctrl+Enter previews (does not execute). Esc goes back one level and keeps this draft; F6 discards it. Tab changes field; Alt+Home/End selects first/last field. Network F4 evaluates rules only.";
+const LIVE_KEYS: &str = "Ctrl+Enter previews (does not execute). Esc goes back one level and keeps this draft; F6 discards it. Tab changes field; Ctrl+G/Ctrl+B selects first/last field. Network F4 evaluates rules only.";
 const DRAFT_NEW: &str = "Live action draft.";
 const DRAFT_RESTORED: &str = "Retained action draft; nothing was submitted while it was set aside.";
 const DRAFT_KEPT: &str =
@@ -838,14 +838,12 @@ impl Manager {
         if form.fields.is_empty() {
             return SandboxAction::None;
         }
-        if event.modifiers == KeyModifiers::ALT
-            && matches!(event.code, KeyCode::Home | KeyCode::End)
-        {
-            form.focus = if event.code == KeyCode::Home {
-                0
-            } else {
-                form.fields.len() - 1
-            };
+        if key::SANDBOX_FIRST_FIELD.matches(event) {
+            form.focus = 0;
+            return SandboxAction::None;
+        }
+        if key::SANDBOX_LAST_FIELD.matches(event) {
+            form.focus = form.fields.len() - 1;
             return SandboxAction::None;
         }
         if matches!(event.code, KeyCode::Tab | KeyCode::BackTab) {
@@ -1123,9 +1121,9 @@ fn pretty(value: &impl serde::Serialize) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACK_REVIEW, EXTEND_REVIEW, INSTANCE_ACTIONS, Kind, LEASE_FIELD, LEASE_HELP, LiveField,
-        LiveForm, NO_EXPIRY_REVIEW, PAUSE_REVIEW, PERSISTENT_REQUIRED, RECOVERY_REQUIRED,
-        RESTART_REVIEW, TextEditor, image, instance_action_error,
+        ACK_REVIEW, EXTEND_REVIEW, INSTANCE_ACTIONS, Kind, LEASE_FIELD, LEASE_HELP, LIVE_KEYS,
+        LiveField, LiveForm, NO_EXPIRY_REVIEW, PAUSE_REVIEW, PERSISTENT_REQUIRED,
+        RECOVERY_REQUIRED, RESTART_REVIEW, TextEditor, image, instance_action_error, key,
     };
     use crate::components::sandbox_manager::{
         Confirmation, SandboxAction, SnapshotState,
@@ -1145,6 +1143,18 @@ mod tests {
     const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const RAW: &str = "Raw operation JSON override (optional)";
     const PROFILE_LEASE: LeaseSeconds = LeaseSeconds::new(3600);
+    const STALE_KEYS: &str = "the live form key line names a key that is no longer bound";
+
+    #[test]
+    fn live_key_line_names_the_bound_field_jumps() {
+        for bind in [key::SANDBOX_FIRST_FIELD, key::SANDBOX_LAST_FIELD] {
+            assert!(
+                LIVE_KEYS.contains(bind.label),
+                "{STALE_KEYS}: {}",
+                bind.label
+            );
+        }
+    }
 
     #[test_case(Kind::Pause, InstanceState::Running, true; "running_pause")]
     #[test_case(Kind::Restart, InstanceState::Running, true; "running_restart")]

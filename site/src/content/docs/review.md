@@ -17,20 +17,25 @@ Three ways in:
 
 ## Marking a passage
 
-The modal shows the message with a row cursor.
+The modal shows the message with a caret.
 
 | Key | Action |
 |-----|--------|
-| `j` `k` | Move the cursor |
-| `g` `G` | First or last row |
-| `v` | Start extending, press again to collapse |
-| `Enter` | Write a note on the marked rows |
+| `↑` `↓` | Move the caret one row |
+| `←` `→` | Move the caret one character, carrying on to the next row |
+| `PageUp` `PageDown` | Move half a page |
+| `Home` `End` | Start or end of the row |
+| `Ctrl+Home` `Ctrl+End` | Start or end of the message |
+| `Shift` with any motion | Extend the selection. Moving up or down takes whole rows |
+| `Ctrl+A` | Select the whole message |
+| `Ctrl+C` | Copy the selection |
+| `Enter` | Write a note on the selection, or on the caret's row |
 | `n` `p` | Jump to the next or previous note |
-| `e` `d` | Edit or delete the note under the cursor |
+| `e` `d` | Edit or delete the note under the caret |
 | `Ctrl+S` | Send every note to the prompt |
-| `Esc` | Cancel the range, or close |
+| `Esc` | Clear the selection, or close |
 
-Dragging with the mouse marks rows too.
+The mouse selects too. Drag across a passage, or double-click a word. Releasing the button copies what you selected.
 
 A `▌` marks the rows you are about to annotate. A `●` marks rows that already carry a note.
 

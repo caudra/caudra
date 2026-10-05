@@ -27,12 +27,12 @@ Remote sessions load only the client's global configuration. They skip both proj
 
 | File | Scope | Holds | Kept separate because | Reference |
 |------|-------|-------|-----------------------|-----------|
-| [`caudra.toml`](/docs/configuration/) | global, project | settings, and in the global file the [experimental] switches | It is the main file, and only you write it | `caudra config example caudra`, [caudra.example.toml](/docs/caudra.example.toml) |
-| [`permissions.toml`](/docs/permissions/#toml-policy) | global, project | permission rules for tools and MCP servers | It has its own error rule: a file that fails to load denies every tool call | `caudra config example permissions`, [permissions.example.toml](/docs/permissions.example.toml) |
-| [`mcp.toml`](/docs/mcp/) | global, project | MCP servers | Caudra writes it when `/mcp` turns a server on or off, and it starts processes | `caudra config example mcp`, [mcp.example.toml](/docs/mcp.example.toml) |
-| [`providers.toml`](/docs/providers/#providers-toml) | global | model providers and their models | `caudra auth login` and `caudra auth logout` write it, and it can hold API keys | `caudra config example providers`, [providers.example.toml](/docs/providers.example.toml) |
-| [`workcell.toml`](/docs/remote-workspaces/#configure-a-profile) | global | profiles for direct remote Workcell connections (needs `experimental.remote_workcell`) | It decides where credentials go, so it has to be a private file | `caudra config example workcell`, [workcell.example.toml](/docs/workcell.example.toml) |
-| [`sandboxes.toml`](/docs/sandboxes/#configuration-schema) | global | managed sandbox providers, networks, transfers, and profiles (needs `experimental.sandboxes`) | The `/sandbox` manager writes it, and it has to be a private file | `caudra config example sandboxes`, [sandboxes.example.toml](/docs/sandboxes.example.toml) |
+| [`caudra.toml`](/docs/configuration/) | global, project | settings, and in the global file the [experimental] switches | It is the main file, and only you write it | [`caudra config example caudra`](/docs/reference-configs/#caudra-toml) |
+| [`permissions.toml`](/docs/permissions/#toml-policy) | global, project | permission rules for tools and MCP servers | It has its own error rule: a file that fails to load denies every tool call | [`caudra config example permissions`](/docs/reference-configs/#permissions-toml) |
+| [`mcp.toml`](/docs/mcp/) | global, project | MCP servers | Caudra writes it when `/mcp` turns a server on or off, and it starts processes | [`caudra config example mcp`](/docs/reference-configs/#mcp-toml) |
+| [`providers.toml`](/docs/providers/#providers-toml) | global | model providers and their models | `caudra auth login` and `caudra auth logout` write it, and it can hold API keys | [`caudra config example providers`](/docs/reference-configs/#providers-toml) |
+| [`workcell.toml`](/docs/remote-workspaces/#configure-a-profile) | global | profiles for direct remote Workcell connections (needs `experimental.remote_workcell`) | It decides where credentials go, so it has to be a private file | [`caudra config example workcell`](/docs/reference-configs/#workcell-toml) |
+| [`sandboxes.toml`](/docs/sandboxes/#configuration-schema) | global | managed sandbox providers, networks, transfers, and profiles (needs `experimental.sandboxes`) | The `/sandbox` manager writes it, and it has to be a private file | [`caudra config example sandboxes`](/docs/reference-configs/#sandboxes-toml) |
 | [`init.lua`](/docs/plugins/) | global, project | Lua code that sets up plugins (needs `experimental.lua_plugins`) | It is a program, not settings | - |
 | [`.env`](/docs/configuration/#config-files) | global, project | environment variables, such as API keys, for any the environment does not set | It holds secrets | - |
 | [`commands/`](/docs/commands/#custom-commands) | global, project | custom slash commands, one Markdown file each | Each command is a file of its own | - |
@@ -71,7 +71,7 @@ max_file_size_mb = 4
 
 All fields are optional. A file may start with `version = 1`, and a file without it counts as version 1. Typos in field names and values of the wrong type cause an error right away, with the file and line.
 
-For every setting in one file, with its type, default, and description, run [`caudra config example`](/docs/cli/#caudra-config) or download [caudra.example.toml](/docs/caudra.example.toml).
+For every setting in one file, with its type, default, and description, see [Reference configs](/docs/reference-configs/#caudra-toml) or run [`caudra config example`](/docs/cli/#caudra-config).
 
 `provider.allowed_models` is a list of glob patterns for qualified `provider/model-id` specs. `*` also matches `/`, so `opencode/*` includes nested model IDs. When the list is empty or omitted, every model is allowed. `provider.excluded_models` removes matching models after that, so exclusions always win. A project list replaces the matching global list. Omit it to inherit, or use `[]` to clear it. The policy applies to selectors, CLI and API model changes, delegation, and `caudra models`.
 
@@ -205,7 +205,7 @@ Leave `ui.theme` unset to pair the light theme with whatever you last picked fro
 
 When on, Caudra asks the GitHub releases API for the latest version once at startup and shows it in the splash when yours is older. The request carries a `caudra` user agent and nothing else: no session id, no machine id, not even your current version.
 
-It is off by default, so a normal run reaches only the model provider you configured. Set `CAUDRA_ENABLE_UPDATE_CHECK=1` to turn it on for a single run, or `CAUDRA_ENABLE_UPDATE_CHECK=0` to turn it off when your config has it on. The `caudra update` command always checks, because that is what you asked it to do.
+It is off by default, so a normal run sends no update request. A normal run still contacts your model provider, fetches the public [models.dev](https://models.dev/) model catalog when the cached copy is more than a day old, and sends web searches to Exa when the agent uses `websearch`. Set `CAUDRA_ENABLE_UPDATE_CHECK=1` to turn it on for a single run, or `CAUDRA_ENABLE_UPDATE_CHECK=0` to turn it off when your config has it on. The `caudra update` command always checks, because that is what you asked it to do.
 
 ### `ui.tool_output_lines`
 

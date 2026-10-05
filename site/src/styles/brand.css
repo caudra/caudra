@@ -12,16 +12,40 @@
   font-style: italic;
   font-display: swap;
 }
+@font-face {
+  font-family: 'Space Grotesk';
+  src: url('/fonts/space-grotesk.woff2') format('woff2');
+  font-weight: 300 700;
+  font-style: normal;
+  font-display: swap;
+}
 :root {
-  --ink: #09254d;
-  --paper: #f2ebdd;
-  --signal: #b52f20;
+  --ink: #14151a;
+  --paper: #f5f5f2;
+  --signal: #315bff;
+  --signal-bright: #8ca6ff;
+  --signal-deep: #2248df;
+  --signal-wash: #e4e9ff;
+  --signal-night: #222d52;
+  --signal-raised: #1c3dc2;
+  --signal-line: #5a78ec;
+  --panel: #1b1d24;
+  --panel-raised: #252833;
+  --mist: #e8e9ec;
+  --muted: #626675;
+  --muted-dark: #a5a7b0;
+  --soft-dark: #babdc7;
+  --border: #d4d5d9;
+  --border-strong: #a2a5af;
+  --border-dark: #34363f;
+  --border-dark-strong: #444854;
+  --thumb-dark: #686c7c;
   --mono: 'JetBrains Mono', ui-monospace, monospace;
-  --sans: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  scrollbar-color: var(--sl-color-gray-4, #8a8173) var(--sl-color-bg, var(--paper));
+  --sans: 'Space Grotesk', system-ui, sans-serif;
+  scrollbar-color: var(--sl-color-gray-4, #858896) var(--sl-color-bg, var(--paper));
 }
 body { scrollbar-color: auto; }
-::selection { background: #b52f20; color: #fff8ec; }
+::selection { background: var(--signal); color: var(--sl-color-bg, var(--paper)); }
 :focus-visible { outline: 2px solid var(--signal); outline-offset: 4px; }
 @media (forced-colors: active) {
   :root { scrollbar-color: auto; }

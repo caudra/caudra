@@ -19,7 +19,7 @@ use crate::components::code_view::{WrappedRows, truncation_line};
 use crate::components::keybindings::{Bind, key};
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::components::modal::Modal;
-use crate::components::{Hint, Overlay, escape_terminal_controls, task_card};
+use crate::components::{HISTORY_HINTS, Hint, Overlay, escape_terminal_controls, task_card};
 use crate::repaint::Cadence;
 use crate::theme;
 
@@ -43,6 +43,7 @@ const CANCEL: Bind = Bind {
     modifiers: KeyModifiers::CONTROL,
     label: "Ctrl+K",
 };
+const STOP_HINT: Hint = Hint::bind(CANCEL, "stop task");
 
 /// `Preview` is the reason this must not be dropped: the picker moved the
 /// selection but only the app can focus the task behind it, so a discarded
@@ -235,11 +236,9 @@ impl TaskPicker {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> TaskPickerAction {
-        if key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Left | KeyCode::Right)
-        {
-            return TaskPickerAction::History {
-                older: key.code == KeyCode::Right,
-            };
+        let older = key::OLDER_HISTORY.matches(key);
+        if older || key::RECENT_HISTORY.matches(key) {
+            return TaskPickerAction::History { older };
         }
         if PROMOTE.matches(key) || CANCEL.matches(key) {
             let promote = PROMOTE.matches(key);
@@ -396,23 +395,27 @@ impl Overlay for TaskPicker {
 }
 
 fn footer() -> Vec<Hint> {
-    vec![
-        Hint::bind(key::ENTER, "open"),
-        Hint::bind(key::ESC, "cancel"),
-        Hint::inert("Alt+←/→", "recent/older"),
-    ]
+    footer_with(&[])
 }
 
 fn foreground_footer() -> Vec<Hint> {
-    let mut hints = background_footer();
-    hints.push(Hint::bind(PROMOTE, "background"));
-    hints
+    footer_with(&[STOP_HINT, Hint::bind(PROMOTE, "background")])
 }
 
 fn background_footer() -> Vec<Hint> {
-    let mut hints = footer();
-    hints.push(Hint::bind(CANCEL, "stop task"));
-    hints
+    footer_with(&[STOP_HINT])
+}
+
+/// History paging comes last, so a narrow bar drops it before a task control.
+fn footer_with(controls: &[Hint]) -> Vec<Hint> {
+    [
+        Hint::bind(key::ENTER, "open"),
+        Hint::bind(key::ESC, "cancel"),
+    ]
+    .into_iter()
+    .chain(controls.iter().copied())
+    .chain(HISTORY_HINTS)
+    .collect()
 }
 
 /// The main chat comes first and has no status. The subagents follow, running
@@ -804,6 +807,16 @@ mod tests {
         assert!(
             matches!(action, TaskPickerAction::Control { task, promote: actual } if task.invocation_id == INVOCATION && actual == promote)
         );
+    }
+
+    #[test_case(key::OLDER_HISTORY, true; "older")]
+    #[test_case(key::RECENT_HISTORY, false; "recent")]
+    fn history_keys_page_the_archive(bind: Bind, older: bool) {
+        let mut picker = opened();
+        assert!(matches!(
+            picker.handle_key(bind.to_key_event()),
+            TaskPickerAction::History { older: paged } if paged == older
+        ));
     }
 
     #[test_case(true, JobKind::Agent, true; "auto_agent")]

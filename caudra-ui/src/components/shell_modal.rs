@@ -33,7 +33,7 @@ use crate::components::modal::Modal;
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::components::task_card::{self, fact, literal_body, literal_code, status_style};
 use crate::components::{
-    Hint, HintBar, ModalScroll, Overlay, escape_terminal_controls, format_elapsed,
+    HISTORY_HINTS, Hint, HintBar, ModalScroll, Overlay, escape_terminal_controls, format_elapsed,
 };
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::theme;
@@ -452,13 +452,9 @@ impl ShellModal {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> ShellModalAction {
-        if self.page.is_none()
-            && key.modifiers == KeyModifiers::ALT
-            && matches!(key.code, KeyCode::Left | KeyCode::Right)
-        {
-            return ShellModalAction::History {
-                older: key.code == KeyCode::Right,
-            };
+        let older = key::OLDER_HISTORY.matches(key);
+        if self.page.is_none() && (older || key::RECENT_HISTORY.matches(key)) {
+            return ShellModalAction::History { older };
         }
         if STOP.matches(key) {
             return self
@@ -952,17 +948,20 @@ fn notice(text: &'static str) -> Line<'static> {
 }
 
 fn footer() -> Vec<Hint> {
-    vec![
-        Hint::bind(key::ENTER, DETAILS),
-        Hint::bind(key::ESC, CLOSE),
-        Hint::inert("Alt+←/→", "recent/older"),
-    ]
+    footer_with(None)
 }
 
 fn running_footer() -> Vec<Hint> {
-    let mut hints = footer();
-    hints.push(Hint::bind(STOP, STOP_COMMAND));
-    hints
+    footer_with(Some(Hint::bind(STOP, STOP_COMMAND)))
+}
+
+/// History paging comes last, so a narrow bar drops it before the stop control.
+fn footer_with(stop: Option<Hint>) -> Vec<Hint> {
+    [Hint::bind(key::ENTER, DETAILS), Hint::bind(key::ESC, CLOSE)]
+        .into_iter()
+        .chain(stop)
+        .chain(HISTORY_HINTS)
+        .collect()
 }
 
 fn page_hints(stoppable: bool) -> Vec<Hint> {
@@ -1225,6 +1224,21 @@ mod tests {
             ),
             stoppable
         );
+    }
+
+    #[test_case(key::OLDER_HISTORY, true; "older")]
+    #[test_case(key::RECENT_HISTORY, false; "recent")]
+    fn history_keys_page_the_list_but_not_the_details(bind: Bind, older: bool) {
+        let mut modal = opened(vec![running(FIRST_ID, STARTED_MS)], Vec::new());
+        assert!(matches!(
+            modal.handle_key(bind.to_key_event()),
+            ShellModalAction::History { older: paged } if paged == older
+        ));
+        let _ = modal.handle_key(key_event(KeyCode::Enter));
+        assert!(matches!(
+            modal.handle_key(bind.to_key_event()),
+            ShellModalAction::Consumed
+        ));
     }
 
     #[test]

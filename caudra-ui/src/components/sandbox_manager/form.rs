@@ -1,3 +1,4 @@
+use super::super::keybindings::key;
 use super::super::text_editor::TextEditor;
 use caudra_config::sandbox::{
     CidrRule, DomainRule, LeaseSeconds, MAX_NETWORK_RULES, RecordKind, SandboxDraft, SandboxError,
@@ -13,8 +14,8 @@ const POSITIVE: &str = "Use a positive whole number (no units or rounding).";
 pub(super) const LEASE_HELP: &str =
     "Use whole seconds. 0 runs until paused or deleted, which the provider must allow.";
 const BOOLEAN: &str = "Use true or false; this changes saved defaults only.";
-pub(super) const DOMAIN_HELP: &str = "One hostname per line, e.g. api.example.com or *.example.com (subdomains only). No URLs, paths, ports or methods. Enter adds a line; Alt+Insert appends; Alt+Delete clears the current line. Blank lines are ignored. Empty domains AND CIDRs deny all under required enforcement. Operator blocks still win.";
-pub(super) const CIDR_HELP: &str = "One IPv4/IPv6 network per line; normalized at review. Enter adds a line; Alt+Insert appends; Alt+Delete clears the current line. Blank lines are ignored. Operator metadata/private-destination blocks still win.";
+pub(super) const DOMAIN_HELP: &str = "One hostname per line, e.g. api.example.com or *.example.com (subdomains only). No URLs, paths, ports or methods. Enter adds a line; Ctrl+N appends; Ctrl+U clears the current line. Blank lines are ignored. Empty domains AND CIDRs deny all under required enforcement. Operator blocks still win.";
+pub(super) const CIDR_HELP: &str = "One IPv4/IPv6 network per line; normalized at review. Enter adds a line; Ctrl+N appends; Ctrl+U clears the current line. Blank lines are ignored. Operator metadata/private-destination blocks still win.";
 const PROFILE_FIELDS: &[(&str, &str, Input, &str)] = &[
     (
         "provider",
@@ -460,22 +461,17 @@ fn parse_rules(
 }
 
 pub(super) fn network_list_key(editor: &mut TextEditor, event: KeyEvent, limit: usize) -> bool {
-    if event.modifiers != KeyModifiers::ALT {
+    if key::SANDBOX_APPEND_RULE.matches(event) {
+        editor.move_to_end();
+        if !editor.text().is_empty() && !editor.text().ends_with('\n') {
+            editor.handle_paste_bounded("\n", limit);
+        }
+    } else if key::SANDBOX_CLEAR_RULE.matches(event) {
+        editor.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        editor.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::SHIFT));
+        editor.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+    } else {
         return false;
-    }
-    match event.code {
-        KeyCode::Insert => {
-            editor.move_to_end();
-            if !editor.text().is_empty() && !editor.text().ends_with('\n') {
-                editor.handle_paste_bounded("\n", limit);
-            }
-        }
-        KeyCode::Delete => {
-            editor.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
-            editor.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::SHIFT));
-            editor.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
-        }
-        _ => return false,
     }
     true
 }
@@ -510,12 +506,25 @@ fn default_text(key: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_NETWORK_RULES, TextEditor, network_list_key, parse_cidrs, parse_domains};
+    use super::{
+        CIDR_HELP, DOMAIN_HELP, MAX_NETWORK_RULES, TextEditor, key, network_list_key, parse_cidrs,
+        parse_domains,
+    };
+    use crate::components::keybindings::Bind;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use test_case::test_case;
 
     const DOMAIN: &str = "api.example.com";
     const LINE_ERROR: &str = "Domain line 3:";
+    const STALE_HELP: &str = "the rule-list help names a key that is no longer bound";
+
+    #[test_case(DOMAIN_HELP; "domains")]
+    #[test_case(CIDR_HELP; "cidrs")]
+    fn rule_list_help_names_the_bound_keys(help: &str) {
+        for bind in [key::SANDBOX_APPEND_RULE, key::SANDBOX_CLEAR_RULE] {
+            assert!(help.contains(bind.label), "{STALE_HELP}: {}", bind.label);
+        }
+    }
 
     #[test_case(0, false; "at_bound")]
     #[test_case(1, true; "room_for_newline")]
@@ -524,7 +533,7 @@ mod tests {
         editor.set_text(DOMAIN.into());
         assert!(network_list_key(
             &mut editor,
-            KeyEvent::new(KeyCode::Insert, KeyModifiers::ALT),
+            key::SANDBOX_APPEND_RULE.to_key_event(),
             DOMAIN.len() + extra
         ));
         assert_eq!(
@@ -568,14 +577,14 @@ mod tests {
         assert_eq!(parse_cidrs(text).unwrap(), expected);
     }
 
-    #[test_case(KeyCode::Insert, "api.example.com\n"; "append")]
-    #[test_case(KeyCode::Delete, ""; "clear")]
-    fn rule_list_shortcut_is_undoable(code: KeyCode, expected: &str) {
+    #[test_case(key::SANDBOX_APPEND_RULE, "api.example.com\n"; "append")]
+    #[test_case(key::SANDBOX_CLEAR_RULE, ""; "clear")]
+    fn rule_list_shortcut_is_undoable(bind: Bind, expected: &str) {
         let mut editor = TextEditor::new();
         editor.set_text(DOMAIN.into());
         assert!(network_list_key(
             &mut editor,
-            KeyEvent::new(code, KeyModifiers::ALT),
+            bind.to_key_event(),
             usize::MAX,
         ));
         assert_eq!(editor.text(), expected);

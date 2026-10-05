@@ -1,10 +1,19 @@
 import { expect, test } from 'bun:test';
 import { readFile, readdir, stat } from 'node:fs/promises';
-import { load } from 'cheerio';
+import { gzipSync } from 'node:zlib';
+import { load, type CheerioAPI } from 'cheerio';
 import { createMarkdownProcessor } from '@astrojs/markdown-remark';
 import { SITE, estimatedTokens, pageMarkdown, pagePath, readDocs } from '../../src/data/docs';
 import compatibility from '../../src/markdown/compatibility';
+import { CLAUDE_NOTE, GROK_BUILD, HEADLINE, METHOD_NOTE, NINFER, TAGLINE, capabilityGroups, heroClip, inspirations, metrics, stories } from '../../src/data/home';
+import { INSTALL_COMMAND } from '../../src/data/install';
 
+const ILLUSTRATION = 'Illustration';
+const EXPERIMENTAL = 'Experimental';
+const MAINTAINER_ATTRIBUTION = 'Measured by the maintainer in daily use';
+const MIN_CAPABILITIES = 40;
+const FOUNDER_FIGURES = /20 ?(?:B\b|billion)|9[47]%|under a second|<1 s|[12] GB|10k-turn/;
+const OTHER_AGENTS = /OpenCode|Claude Code|Codex|Cursor|Aider|Gemini CLI|Grok Build/i;
 const dist = new URL('../../dist/', import.meta.url);
 const { pages, navigation } = await readDocs();
 const renderer = await createMarkdownProcessor({ smartypants: false, remarkPlugins: [compatibility], syntaxHighlight: false });
@@ -12,6 +21,10 @@ const documents = new Map(await Promise.all(['/', '/404.html', ...pages.map((pag
   const file = path.endsWith('/') ? `${path}index.html` : path;
   return [path, load(await readFile(new URL(`.${file}`, dist), 'utf8'))] as const;
 })));
+
+function homeText($: CheerioAPI, selector: string) {
+  return $(selector).text().replace(/\s+/g, ' ').trim();
+}
 
 function nativeAddresses(markdown: string) {
   const addresses: string[] = [];
@@ -111,4 +124,55 @@ test('runtime assets are self-hosted and source art is not deployed', async () =
   }
   expect(await stat(new URL('caudra-hero-v1.png', dist)).then(() => true).catch(() => false)).toBe(false);
   expect(await stat(new URL('docs/search.json', dist)).then(() => true).catch(() => false)).toBe(false);
+});
+
+test('homepage founder figures are attributed and explained by the method note', () => {
+  const $ = documents.get('/')!;
+  expect($('.proof-list strong').map((_, node) => $(node).text()).get()).toEqual(metrics.map((metric) => metric.value));
+  expect(homeText($, '.proof')).toContain(MAINTAINER_ATTRIBUTION);
+  expect($('.proof a[href="#method"]').length).toBe(1);
+  expect(homeText($, '#method')).toContain(METHOD_NOTE);
+  for (const section of $('main section').toArray()) {
+    const text = $(section).text().replace(/\s+/g, ' ');
+    if (FOUNDER_FIGURES.test(text)) expect(text, `#${$(section).attr('id')}: unattributed founder figure`).toContain('maintainer');
+  }
+  expect(homeText($, '#why')).not.toMatch(OTHER_AGENTS);
+});
+
+test('homepage credits ideas, labels experiments, and makes no automation claims', () => {
+  const $ = documents.get('/')!;
+  expect(homeText($, '.claude-note')).toBe(CLAUDE_NOTE);
+  for (const credit of inspirations) expect($(`#why a[href="${credit.href}"]`).text()).toBe(credit.name);
+  expect($(`#lab a[href="${GROK_BUILD.href}"]`).text()).toBe(GROK_BUILD.name);
+  expect($(`#privacy a[href="${NINFER.href}"]`).text()).toBe(NINFER.name);
+  const items = capabilityGroups.flatMap((group) => group.items);
+  expect(items.length).toBeGreaterThanOrEqual(MIN_CAPABILITIES);
+  expect($('.capability-wall a').map((_, node) => $(node).attr('href')).get()).toEqual(items.map((item) => item.href));
+  for (const item of items) expect($(`.capability-wall a[href="${item.href}"] .tag`).text()).toBe(item.experimental ? EXPERIMENTAL : '');
+  for (const node of $('.experiment-list li, .sandbox').toArray()) expect($(node).find('.tag').first().text()).toBe(EXPERIMENTAL);
+  expect(homeText($, '#lab')).toContain('off by default');
+  expect(homeText($, '#savings')).toContain('RTK-style shell output filtering');
+  expect(homeText($, '#lab')).toContain('JEV decision engine');
+  expect(homeText($, '#sleep')).toContain('needs a running session');
+  expect(homeText($, 'main')).not.toMatch(/\bautomations?\b|\bschedul|\bcron\b/i);
+});
+
+test('homepage has an honest product story, working destinations, and a small entry script', async () => {
+  const $ = documents.get('/')!;
+  expect($('h1').length).toBe(1);
+  expect(homeText($, 'h1')).toBe(HEADLINE);
+  expect(homeText($, '.hero-tagline')).toBe(TAGLINE);
+  expect($('[data-copy-source]').map((_, node) => $(node).text()).get()).toEqual([INSTALL_COMMAND, INSTALL_COMMAND]);
+  expect($('.hero #hero-install').length).toBe(1);
+  expect($('.recording').length).toBe([heroClip, ...stories.flatMap((story) => story.clips)].length);
+  expect(new Set($('.recording-label').map((_, node) => $(node).text()).get())).toEqual(new Set([ILLUSTRATION]));
+  expect($('iframe').length).toBe(0);
+  const ids = $('[id]').map((_, node) => $(node).attr('id')).get();
+  expect(new Set(ids).size).toBe(ids.length);
+  let initialBytes = 0;
+  for (const script of $('script[src]').toArray()) {
+    const path = $(script).attr('src')!;
+    initialBytes += gzipSync(await readFile(new URL(`.${path}`, dist))).length;
+  }
+  expect(initialBytes).toBeLessThan(25 * 1024);
 });

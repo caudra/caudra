@@ -103,7 +103,7 @@ expected_workspace_id = "dev-workspace"
 | `expected_server_id` | string | unset | An identity check: the connection fails unless the server reports this ID |
 | `expected_workspace_id` | string | unset | An identity check: the connection fails unless the workspace reports this ID |
 
-`caudra config example workcell` prints every `workcell.toml` key with its default, all commented out. [workcell.example.toml](/docs/workcell.example.toml) holds the same text.
+`caudra config example workcell` prints every `workcell.toml` key with its default, all commented out. [Reference configs](/docs/reference-configs/#workcell-toml) shows the same text.
 
 <!-- /caudra-docgen:workcell-profile-fields -->
 

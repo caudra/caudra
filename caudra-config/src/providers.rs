@@ -949,7 +949,8 @@ pub fn resolve_api_key_env(slug: &str, def: Option<&ProviderDef>) -> String {
 }
 
 /// The `<SLUG>_BASE_URL` env var name (e.g. `anthropic` -> `ANTHROPIC_BASE_URL`,
-/// `llama-cpp` -> `LLAMA_CPP_BASE_URL`).
+/// `my-proxy` -> `MY_PROXY_BASE_URL`). Ollama and llama.cpp never read it, they
+/// take `OLLAMA_HOST` and `LLAMA_CPP_HOST`.
 pub fn base_url_env_var(slug: &str) -> String {
     format!("{}_BASE_URL", slug.to_uppercase().replace('-', "_"))
 }

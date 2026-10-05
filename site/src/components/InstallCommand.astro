@@ -1,0 +1,34 @@
+---
+import { INSTALL_COMMAND } from '../data/install';
+
+interface Props {
+  id: string;
+}
+
+const { id } = Astro.props;
+---
+<div class="install-command-block" id={id}>
+  <div class="install-command"><span aria-hidden="true">$</span><code data-copy-source>{INSTALL_COMMAND}</code></div>
+  <button class="button primary" type="button" data-copy aria-label="Copy install command" hidden>Copy</button>
+  <span class="install-status" role="status" aria-live="polite" data-copy-status></span>
+</div>
+
+<script>
+  import { COPY_STATUS } from '../data/install';
+
+  for (const button of document.querySelectorAll<HTMLButtonElement>('[data-copy]')) {
+    const block = button.closest('.install-command-block');
+    button.hidden = false;
+    button.addEventListener('click', async () => {
+      const status = block?.querySelector('[data-copy-status]');
+      const command = block?.querySelector('[data-copy-source]')?.textContent;
+      if (!status || !command) return;
+      try {
+        await navigator.clipboard.writeText(command);
+        status.textContent = COPY_STATUS.copied;
+      } catch {
+        status.textContent = COPY_STATUS.failed;
+      }
+    });
+  }
+</script>

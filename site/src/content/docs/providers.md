@@ -60,7 +60,7 @@ You can set multiple API keys in one env var (`ANTHROPIC_API_KEY=sk-1,sk-2,sk-3`
 
 ## Base URL Overrides
 
-Every provider honors a `<SLUG>_BASE_URL` env var (`anthropic` -> `ANTHROPIC_BASE_URL`, `llama-cpp` -> `LLAMA_CPP_BASE_URL`). Set it to the origin of a proxy or a compatible endpoint and Caudra appends the API paths itself:
+Most providers, custom ones included, honor a `<SLUG>_BASE_URL` env var, where `<SLUG>` is the slug in capitals with `_` for `-` (`anthropic` -> `ANTHROPIC_BASE_URL`, `openrouter` -> `OPENROUTER_BASE_URL`). Set it to the origin of a proxy or a compatible endpoint and Caudra appends the API paths itself:
 
 ```sh
 ANTHROPIC_BASE_URL=https://my-proxy.internal caudra
@@ -76,6 +76,8 @@ base_url = "http://xxxx:1234/v1"
 ```
 
 The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discover_models` and `models` are ignored with a warning. Use a custom slug if you need those.
+
+Ollama reads `OLLAMA_HOST` and llama.cpp reads `LLAMA_CPP_HOST`. Neither reads `<SLUG>_BASE_URL`. A `base_url` in `providers.toml` wins over the host variable, and Caudra appends `/v1` to either, so leave it off. Aperture reads `APERTURE_HOST`, which wins over the file. Copilot asks GitHub for the API endpoint of your account and ignores both settings.
 
 ## Built-in Providers
 
@@ -227,7 +229,7 @@ This provider talks the OpenAI-compatible `/v1` API, so it also works with llama
 - **API**: `http://localhost:8080/v1`
 - **Features**: Local or remote inference via LLAMA_CPP_HOST, set optional key via LLAMA_CPP_API_KEY
 
-Connects to any OpenAI-compatible `/v1` endpoint. Point `LLAMA_CPP_HOST` to your server address (defaults to `http://localhost:8080`).
+Connects to any OpenAI-compatible `/v1` endpoint. Set `LLAMA_CPP_HOST` to your server address, such as `http://localhost:8080`, or run `caudra auth login llama-cpp`, which offers that address and saves your answer to `providers.toml`. Without either, Caudra reports that `LLAMA_CPP_HOST` is not set.
 
 ### Mistral
 
@@ -416,7 +418,7 @@ supports_vision = false
 
 The file can start with `version = 1`, and a file without it counts as version 1. Caudra writes the key whenever it saves the file. A newer version stops Caudra with an error rather than being misread. Because `version` belongs to the file, a custom provider cannot use it as a name. See [Config file versions](/docs/configuration/#config-file-versions).
 
-`caudra config example providers` prints every `providers.toml` key with its default, all commented out. [providers.example.toml](/docs/providers.example.toml) holds the same text.
+`caudra config example providers` prints every `providers.toml` key with its default, all commented out. [Reference configs](/docs/reference-configs/#providers-toml) shows the same text.
 
 ### Provider fields
 

@@ -3,7 +3,7 @@ use std::fmt::Write;
 use caudra_config::config_file::CONFIG_VERSION;
 use caudra_config::decisions::{DecisionFeatures, DecisionThresholds, FeatureMode};
 use caudra_config::example::Entry;
-use caudra_config::files::{self, CONFIG_FILES, ConfigFile, Scope};
+use caudra_config::files::{self, CONFIG_FILES, Scope};
 use caudra_config::steering::{SteeringRule, SteeringRulesConfig};
 use caudra_config::{
     AgentConfig, AutomationsConfig, ConfigField, ConfigValue, DEFAULT_MAX_LOG_FILES,
@@ -14,17 +14,12 @@ use caudra_config::{
 };
 
 use crate::gen_providers::join_and;
+use crate::gen_reference_configs;
 use crate::page_header;
 
-const EXAMPLE_SUFFIX: &str = ".example.toml";
 /// The one feature with a section of its own further down the page.
 const SHELL_DURATION_FEATURE: &str = "shell_duration";
 const SHELL_DURATION_LINK: &str = " See [shell duration](#shell-duration).";
-
-/// The file under the site's static root that holds a file's reference.
-pub fn example_file_name(file: &ConfigFile) -> String {
-    format!("{}{EXAMPLE_SUFFIX}", file.stem())
-}
 
 /// Shown bare, since the text is prose rather than a value to copy.
 fn default_cell(value: &ConfigValue) -> String {
@@ -357,8 +352,11 @@ fn write_update_check_section(out: &mut String) {
     .unwrap();
     writeln!(
         out,
-        "It is off by default, so a normal run reaches only the model \
-         provider you configured. Set `CAUDRA_ENABLE_UPDATE_CHECK=1` to turn it \
+        "It is off by default, so a normal run sends no update request. A \
+         normal run still contacts your model provider, fetches the public \
+         [models.dev](https://models.dev/) model catalog when the cached copy \
+         is more than a day old, and sends web searches to Exa when the agent \
+         uses `websearch`. Set `CAUDRA_ENABLE_UPDATE_CHECK=1` to turn it \
          on for a single run, or `CAUDRA_ENABLE_UPDATE_CHECK=0` to turn it off \
          when your config has it on. The `caudra update` command always \
          checks, because that is what you asked it to do.\n"
@@ -732,9 +730,9 @@ fn write_config_files_section(out: &mut String) {
             .unwrap_or_default();
         let reference = if file.example.is_some() {
             format!(
-                "`{}`, [{name}](/docs/{name})",
+                "[`{}`]({})",
                 file.example_command(),
-                name = example_file_name(file)
+                gen_reference_configs::link(file)
             )
         } else {
             "-".to_owned()
@@ -828,7 +826,7 @@ max_file_size_mb = 4
 
 All fields are optional. A file may start with `version = {version}`, and a file without it counts as version {version}. Typos in field names and values of the wrong type cause an error right away, with the file and line.
 
-For every setting in one file, with its type, default, and description, run [`caudra config example`](/docs/cli/#caudra-config) or download [{example_file}](/docs/{example_file}).
+For every setting in one file, with its type, default, and description, see [Reference configs]({reference}) or run [`caudra config example`](/docs/cli/#caudra-config).
 
 `provider.allowed_models` is a list of glob patterns for qualified `provider/model-id` specs. `*` also matches `/`, so `opencode/*` includes nested model IDs. When the list is empty or omitted, every model is allowed. `provider.excluded_models` removes matching models after that, so exclusions always win. A project list replaces the matching global list. Omit it to inherit, or use `[]` to clear it. The policy applies to selectors, CLI and API model changes, delegation, and `caudra models`.
 ",
@@ -838,7 +836,7 @@ For every setting in one file, with its type, default, and description, run [`ca
         max_output_lines = DEFAULT_MAX_OUTPUT_LINES + 1000,
         max_log_files = DEFAULT_MAX_LOG_FILES / 2,
         version = CONFIG_VERSION,
-        example_file = example_file_name(&files::CAUDRA),
+        reference = gen_reference_configs::link(&files::CAUDRA),
     )
     .unwrap();
     write_experimental_section(&mut out);

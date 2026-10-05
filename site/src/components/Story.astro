@@ -1,0 +1,37 @@
+---
+import Clip from './Clip.astro';
+import ClipTabs from './ClipTabs.astro';
+import Inline from './Inline.astro';
+import type { Story } from '../data/home';
+
+interface Props {
+  story: Story;
+}
+
+const { story } = Astro.props;
+const titleId = `${story.id}-title`;
+---
+<section id={story.id} class:list={['story', `tone-${story.tone}`, `layout-${story.layout}`]} aria-labelledby={titleId}>
+  <div class="shell story-grid">
+    <header class="story-copy">
+      <p class="eyebrow story-eyebrow"><span class="story-index">{story.index}</span>{story.eyebrow}</p>
+      <h2 id={titleId}>{story.title.map((line, index) => <>{index > 0 && <>{' '}<br /></>}{line}</>)}</h2>
+      <p class="story-lede"><Inline text={story.lede} /></p>
+    </header>
+    <div class="story-stage">
+      {story.clips.length > 1
+        ? <ClipTabs label={story.eyebrow}>{story.clips.map((clip) => <Clip clip={clip} />)}</ClipTabs>
+        : story.clips.map((clip) => <Clip clip={clip} />)}
+    </div>
+    <ul class="story-points">
+      {story.points.map((point) => <li><h3><Inline text={point.title} /></h3><p><Inline text={point.text} /></p></li>)}
+    </ul>
+    <footer class="story-footer">
+      {story.note && <p class="story-note"><Inline text={story.note} /></p>}
+      {story.credits && (
+        <p class="story-credits">{story.credits.label}{' '}{story.credits.links.map((credit, index) => <>{index > 0 && ' and '}<a href={credit.href}>{credit.name}</a></>)}.</p>
+      )}
+      <a class="text-link" href={story.link.href}>{story.link.label} <span aria-hidden="true">↗</span></a>
+    </footer>
+  </div>
+</section>

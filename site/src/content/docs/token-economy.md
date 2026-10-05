@@ -17,7 +17,9 @@ So Caudra attacks the two multipliers: how much each step adds to context, and h
 
 ## Smaller results
 
-**file_index instead of file_read.** The native `file_index` tool returns a tree-sitter skeleton of a source file: imports, types, signatures, line numbers. Usually 70-90% smaller than the file itself. The agent indexes first, then reads only the ranges it needs.
+**Built-in shell output filtering.** Workcell provides RTK-style output reduction without a separate RTK installation. Built-in rules reduce completed model-facing shell output while keeping the reviewed command and structured capture unchanged. The TUI shows raw output while the command runs, then lets you toggle between filtered and raw views. Filtering is enabled by default. Set `agent.shell_output_filter = false` or use `--no-rtk` to disable it. See [shell output](/docs/tools/#shell). Capture and retention bounds still apply.
+
+**file_index instead of file_read.** The native `file_index` tool returns a tree-sitter skeleton of a source file: imports, types, signatures, line numbers. Usually much smaller than the file itself. The agent indexes first, then reads only the ranges it needs.
 
 Directory indexing follows Workcell's generic listing contract. Instruction files appear as ordinary visible entries, and the call does not discover their contents.
 
@@ -27,6 +29,8 @@ file_read main.rs            index main.rs
 1400 lines in context        60 lines of signatures
                              + file_read offset=812 limit=40
 ```
+
+**Code maps instead of exploring.** `code_map`, `code_context`, `code_refs`, `code_impact`, and `code_expand` show where to start, who calls what, and which tests reach a change, so the agent opens fewer whole files to find out. They build their symbol graph from the source when called, and a repeat call parses only the files that changed. There is no index to build or maintain, and they work without configuration. See [Code Intelligence](/docs/tools/#code-intelligence).
 
 **Subagents as garbage collectors.** A `task` subagent gets its own isolated context. It can search, read files, and hit dead ends without adding its whole transcript to the main conversation. The parent receives its final summary and any intentional [child reports](/docs/sessions/#child-reports). Its transcript stays attached to the task for later `task_id` continuation without inflating the main context. System prompt profiles can assign a different model to their subagents when a task needs a cheaper or stronger model.
 
@@ -40,13 +44,13 @@ one line stays              ~20k tokens stay outside main
 
 **Deferred MCP tools.** An MCP server with 100 tools would ship 100 definitions in every request. Caudra loads a single `tool_search` tool instead; the model searches when it actually needs something and only the matches load. See [MCP](/docs/mcp/#tool-search).
 
-**Deferred built-in tools.** Eight built-ins can start outside the request array behind that same `tool_search` entry. Caudra defers them for small and supply-unknown models, where the shorter array helps and the prompt cache is cheap to rebuild. Known non-small models receive them upfront because loading one mid-session can cost more than carrying all eight. See [Tools loaded on demand](/docs/tools/#which-models-defer).
+**Deferred built-in tools.** Selected built-ins can start outside the request array behind that same `tool_search` entry. Caudra defers them for small and supply-unknown models, where the shorter array helps and the prompt cache is cheap to rebuild. Known non-small models receive them upfront because loading one mid-session can cost more than carrying the full set. See [Tools loaded on demand](/docs/tools/#which-models-defer).
 
 **Managed tool output.** The host enforces `agent.max_output_bytes` and `agent.max_output_lines` after every tool dispatch. The same boundary covers Lua and MCP tools, batch children, nested calls, and local tools. `output_limits` can replace those defaults for one result. The host still performs limiting and retention after dispatch.
 
 Successful text results larger than 8 KiB are retained. This lets Caudra prune older copies from [provider requests](/docs/context/#provider-request-projection) while preserving retrieval. When a result exceeds its effective configured limits, the model receives a bounded head and tail plus an opaque output ID instead of the complete text.
 
-Use `tool_output_grep` with that ID and a regex to find relevant lines. Its `offset` is the first line to search, `limit` caps matches, and `context_before` and `context_after` add nearby lines. Then use `tool_output_read` with a 1-indexed `offset` and line `limit` to page through the needed range. Both tools include an exact next-call hint when more results remain. IDs belong to the current session. [Sessions](/docs/sessions/#managed-tool-outputs) covers retention and cleanup.
+Use [`tool_output`](/docs/tools/#tool_output) with that ID as `output_id` and a regex `pattern` to find relevant lines. Its `offset` is the first line to search, `limit` caps matches, and `context_before` and `context_after` add nearby lines. Omit `pattern` to page through the needed range with a 1-indexed `offset` and line `limit`. The tool includes an exact next-call hint when more results remain. IDs belong to the current session. [Sessions](/docs/sessions/#managed-tool-outputs) covers retention and cleanup.
 
 **Interrupted work is not wasted.** Press Esc on a long tool, or let its deadline hit, and whatever it printed so far still reaches the model, tagged as partial: `shell` keeps its streamed lines, `python_execution` the script output, a `task` subagent its half transcript. Otherwise the next turn starts from nothing and you pay to run it all again.
 
@@ -59,6 +63,8 @@ Every round-trip re-sends the context, so round-trips are the other half of the 
 With `agent.eager_tool_dispatch = true` (the default), tools and batch children start as soon as their complete JSON arguments arrive. They still pass through permission checks, mode restrictions, and file locks. Later argument fragments cannot reset a running or completed child to queued. The old `agent.eager_batch_dispatch` setting remains a fallback when the new setting is absent.
 
 An early call can apply effects before the provider finishes its response. A later argument revision cannot undo those effects. If the stream fails after calls were admitted, Caudra collects their outcomes and tells the model what happened instead of automatically replaying them. Explicit cancellation still stops running work.
+
+The transcript draws each call while the model writes it. A shell command, file contents, Python code, a plan, a memory note, an image prompt, or a subagent brief fills in before the call runs. A `file_edit` shows its path and a growing size until it runs, and a patch names the files it touches.
 
 **JSON syntax repair.** `agent.tool_json_repair = true` enables syntax repair independently of eager execution. Caudra first tries local repairs that preserve argument values. When local repair needs confirmation, one isolated request to the calling model receives only the affected tool schema, malformed arguments, and parser error. It receives no conversation history or execution tools.
 

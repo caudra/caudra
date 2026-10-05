@@ -112,7 +112,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::animation::live_elapsed;
 use crate::selection::wrap_breaks;
-use keybindings::Bind;
+use keybindings::{Bind, key};
 use modal::FooterHits;
 use peer_manager::SubscriptionChange;
 use worktree_picker::WorktreeView;
@@ -120,6 +120,11 @@ use worktree_picker::WorktreeView;
 pub(crate) const CHEVRON: &str = "❯ ";
 /// Selected text in every field, laid over whatever colour it already carries.
 pub(crate) const SELECTION: Style = Style::new().add_modifier(Modifier::REVERSED);
+/// How the `/tasks` and `/shells` lists page through archived history.
+pub(crate) const HISTORY_HINTS: [Hint; 2] = [
+    Hint::bind(key::RECENT_HISTORY, "recent"),
+    Hint::bind(key::OLDER_HISTORY, "older"),
+];
 const DIGIT_GROUP: usize = 3;
 /// Columns a modal pans per key press. Roughly one column of a token table, so
 /// a reader walks the table a field at a time rather than a glyph at a time.

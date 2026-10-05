@@ -1,0 +1,43 @@
+---
+import Inline from './Inline.astro';
+import Recording from './Recording.astro';
+import type { Clip } from '../data/home';
+
+interface Props {
+  clip: Clip;
+}
+
+const { clip } = Astro.props;
+const { diagram } = clip;
+---
+<Recording id={clip.id} title={clip.title} summary={clip.summary} label={clip.label}>
+  <div class:list={['illustration', `illustration-${diagram.kind}`]}>
+    {diagram.kind === 'lanes' && (
+      <div class="lanes" role="img" aria-label={diagram.description}>
+        {diagram.lanes.map((lane) => (
+          <div class="lane">
+            <span class="lane-label"><Inline text={lane.label} /></span>
+            <span class="lane-track">
+              {lane.segments.map((segment) => <span class:list={['lane-segment', `lane-${segment.kind}`]} style={`--start: ${segment.start}; --end: ${segment.end}`} />)}
+              {lane.marker && <span class="lane-marker" style={`--at: ${lane.marker.at}`}>{lane.marker.text}</span>}
+            </span>
+          </div>
+        ))}
+        <span class="lane-legend"><span class="legend-write">Drawn while the model writes</span><span class="legend-run">Running</span></span>
+      </div>
+    )}
+    {diagram.kind === 'steps' && (
+      <ol class="steps">
+        {diagram.steps.map((step) => (
+          <li><span class="step-mark">{step.mark}</span><span class="step-title"><Inline text={step.title} /></span><span class="step-text"><Inline text={step.text} /></span></li>
+        ))}
+      </ol>
+    )}
+    {diagram.kind === 'layout' && (
+      <>
+        <pre class="layout" aria-hidden="true">{diagram.lines.join('\n')}</pre>
+        <p class="sr-only">{diagram.description}</p>
+      </>
+    )}
+  </div>
+</Recording>

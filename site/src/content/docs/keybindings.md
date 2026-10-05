@@ -181,6 +181,8 @@ These keys exist only with `sandboxes = true` under `[experimental]`. See [Exper
 | `h` / `k` | Doctor; Providers: edit lifecycle credential in its purpose store |
 | `i` / `b` / `g` / `l` | Images: approved offline Import, Build, GC or Inspect |
 | `g` / `F4` / `F6` | Live network preview/apply; Test rules (no probe); discard action draft |
+| `Ctrl+N` / `Ctrl+U` | Domain and CIDR lists: append a rule line, or clear the current line |
+| `Ctrl+G` / `Ctrl+B` | Live action forms: focus the first or last field |
 
 See [Managed Sandboxes](/docs/sandboxes/#tui-manager) for instance actions and [image forms](/docs/sandboxes/#images-and-template-catalog) for the host picker and approved probe. File uploads and downloads live in the [workbench Transfer view](/docs/workbench/#transfer), available after attaching to a sandbox. Leaving Transfer requests cancellation and waits for cleanup.
 

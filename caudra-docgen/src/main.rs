@@ -4,6 +4,7 @@ mod gen_keybindings;
 mod gen_lua_api;
 mod gen_plugins;
 mod gen_providers;
+mod gen_reference_configs;
 mod gen_regions;
 mod gen_tools;
 
@@ -23,11 +24,12 @@ type Page = (&'static str, fn() -> String);
 /// One entry per generated page. Every generator is a slow, self-contained
 /// string build (it boots a Lua host, walks the tool registry, and so on), so
 /// they each get a thread.
-const PAGES: [Page; 7] = [
+const PAGES: [Page; 8] = [
     ("tools", gen_tools::generate),
     ("plugins", gen_plugins::generate),
     ("providers", gen_providers::generate),
     ("configuration", gen_config::generate),
+    (gen_reference_configs::SLUG, gen_reference_configs::generate),
     ("lua-api", gen_lua_api::generate),
     ("keybindings", gen_keybindings::generate),
     ("commands", gen_commands::generate),
@@ -103,7 +105,7 @@ fn main() -> ExitCode {
         running.map(|(path, page)| (path, page.join().unwrap()))
     });
     let examples = files::examples().filter_map(|file| {
-        let path = repository_path(STATIC_DIR).join(gen_config::example_file_name(file));
+        let path = repository_path(STATIC_DIR).join(gen_reference_configs::example_file_name(file));
         file.reference().map(|reference| (path, reference))
     });
     let outputs: Vec<(PathBuf, String)> = pages

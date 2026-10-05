@@ -1,112 +1,242 @@
 <p align="center">
-  <img src="./banner.png" alt="caudra: context into effective action" width="100%">
+  <img src="./site/public/social-card.png" alt="caudra. Context into effective action. A coding agent for your whole working day and while you sleep." width="100%">
 </p>
 
 # Caudra
 
-Caudra turns context into effective action. It is a terminal coding agent that coordinates models, tools, plugins, and subagents while keeping execution visible and under your control.
+**A coding agent for your whole working day and while you sleep.**
 
-Caudra is an independent fork maintained at [github.com/caudra/caudra](https://github.com/caudra/caudra). The current release line starts at `0.1.0` and uses a hard-break product identity.
+Caudra is a terminal coding agent written in Rust. It brings steerable subagents, built-in token savings, a full workbench, and a session history you can always return to. Everything ships in one native binary, so there are no plugins to assemble.
 
-Brought to you by [Thorsten Born](https://github.com/tensorninja) ([website](https://thorstenborn.com)).
-
-## Project lineage
-
-Caudra is derived from [Maki](https://github.com/tontinton/maki), originally developed by [Tony Solomonik](https://github.com/tontinton), and includes work by Maki contributors. Maki is licensed under the MIT License, and its contributor history is preserved in this repository.
-
-Caudra modifications are maintained by [Thorsten Born](https://thorstenborn.com). Caudra is not affiliated with or endorsed by the original project.
-
-## Why Caudra
-
-### Effective action
-
-- `file_index` parses supported languages with [tree-sitter](https://tree-sitter.github.io/tree-sitter) and returns compact file structure with exact line ranges.
-- `python_execution` uses [Monty](https://github.com/pydantic/monty) to run bounded, isolated Python over values already in context. It cannot call tools or access host files, processes, or the network. The final expression and printed output return as one tool result.
-- `task` delegates isolated planning or implementation to subagents with selectable models and thinking modes.
-- Tool results feed back into the next decision, so Caudra can inspect failures, change course, and continue.
-
-### Control and visibility
-
-- Native Rust TUI with fast startup, 60 FPS rendering, and low memory use.
-- Tree-sitter shell parsing that reviews each command in a compound expression instead of approving by prefix.
-- Full task transcripts, live steering, session rewind, plan mode, and explicit permission scopes.
-- Headless and SDK modes, ACP support for editors, MCP servers, skills, persistent memory, and image input.
-- Opt-in [OpenTelemetry](https://caudra.ai/docs/telemetry/) export using `caudra.*` metrics and events.
-
-### Extensible by design
-
-Settings live in a plain `caudra.toml` and need no Lua. For deeper changes, Caudra has a Neovim-style Lua API where plugins can add tools, commands, keymaps, and UI. The Lua API is experimental and opt-in: turn it on with `lua_plugins = true` under `[experimental]` in the global `caudra.toml`, as described in [Experimental features](https://caudra.ai/docs/configuration/#experimental-features). See the [example plugins](https://github.com/caudra/caudra/tree/main/plugins) and the [Lua API reference](https://caudra.ai/docs/lua-api/).
-
-## Providers
-
-Caudra supports Anthropic, OpenAI, xAI, Google, Copilot, Ollama, llama.cpp, Mistral, Z.AI, DeepSeek, OpenRouter, Synthetic, TensorX, OpenCode, Aperture, and compatible OpenAI or Anthropic endpoints.
-
-Run `caudra auth login` for the interactive setup, or configure provider environment variables. Dynamic provider scripts live in `~/.config/caudra/providers/`. See the [provider reference](https://caudra.ai/docs/providers/).
-
-## Install
-
-### Linux and macOS
-
-Review the installer before running it:
-
-```sh
-curl -fsSL https://caudra.ai/install.sh -o install.sh
-cat install.sh
-chmod +x install.sh && sh install.sh
-```
-
-Or run the one-liner:
+Leave a session working toward a goal while you are away. When you are back at the keyboard, guide any subagent, ask a side question, or open the code beside the conversation.
 
 ```sh
 curl -fsSL https://caudra.ai/install.sh | sh
 ```
 
-The default install directory is `~/.local/bin`. Set `CAUDRA_INSTALL_DIR` to override it.
+[Website](https://caudra.ai) · [Documentation](https://caudra.ai/docs/) · [Quick start](https://caudra.ai/docs/quick-start/) · [Example config](https://github.com/caudra/config)
 
-### Windows PowerShell
+## Why Caudra exists
 
-```powershell
-irm https://caudra.ai/install.ps1 -OutFile install.ps1
-Get-Content install.ps1
-.\install.ps1
+> I spend most of my working day with coding agents, and I have tried many of them. Each had ideas I liked. I wanted those ideas together, along with a few new techniques, in one standalone binary I could bring into any environment.
+>
+> Caudra is that binary, and I push more than 20 billion tokens a month through it. With another agent, my local history grew by more than 1 GB a day. Caudra keeps over a month of my complete history in less than 2 GB, and a 10k-turn session still loads in under a second.
+>
+> **Thorsten Born**, software engineer and data architect, maintainer of Caudra
+
+In the same daily use, about 97% of Anthropic and 94% of OpenAI prompt tokens came from cache. These figures are the maintainer's own measurements, not benchmarks. Timings were measured by hand, and results depend on models, projects, and hardware.
+
+## A quick tour
+
+### Guide any agent while it works
+
+The input stays open while Caudra works. You can line up the next task, add guidance to the run in progress, or replace it. Running subagents take guidance the same way.
+
+| Key | What happens |
+| --- | --- |
+| `Enter` | Queues your prompt to run after the current one |
+| `Ctrl+X g` | Adds your guidance to the current run before its next model request |
+| `Ctrl+X x` | Stops the current run and starts yours |
+| `/tasks` | Lists the subagents. Open a running one and type, and it reads your guidance at its next turn boundary |
+| `/btw` | Asks a side question without adding it to the conversation |
+
+A subagent's chat opens while the model is still writing its brief, so you can read the task before the subagent starts. When the main agent asks you a question, `F2` opens `/btw` to talk the choices through before you answer.
+
+### Set the finish line and wake to results
+
+`/goal` keeps a session working until a separate evaluator finds evidence that your condition is met, for example "tests pass and clippy is clean". After each work turn, a model call with no tools reads the transcript. If the goal is not met yet, another turn starts. Once it is met, the goal clears itself.
+
+Background tasks and shell jobs report back on their own and wake the agent at a safe boundary, with no polling. Your permission rules decide what may run while you are away. They split shell chains and pipelines into separate commands for approval, and an approval can hold once, for the conversation, for the project, or for every project. Caudra can also notify you when a session finishes or needs your input.
+
+The session has to keep running for this, for example in tmux or [Herdr](https://herdr.dev), and closing it cancels background work. A goal allows 16 automatic continuations by default and pauses whenever it needs your answer. `/goal` looks for evidence in the transcript. It does not prove the work is correct.
+
+### Token savings, built in
+
+Every turn sends the whole conversation again, so a noisy tool result costs tokens on every later turn until compaction. Caudra keeps results small and round trips few.
+
+- Shell output passes through command-aware filters in the style of [RTK](https://www.rtk-ai.app/docs/) before the model reads it, and they are on by default. You still watch the raw output while a command runs, and you can switch between the filtered and raw views afterwards.
+- `file_index` returns a file outline with signatures and line numbers. The `code_*` tools rank symbols and show callers, impact, and the tests that reach a change. They parse the source on the fly, so there is no index to build or maintain and nothing to configure.
+- Oversized results reach the model as a bounded head and tail, and `tool_output` searches the rest. `batch` runs independent calls in one turn, and subagents keep their exploration out of the main context.
+- Caudra sends a per-conversation cache key wherever a provider accepts one, and `/usage` shows the cache hit rate for every model.
+
+### Open the code without leaving
+
+`Ctrl+X w` opens a workbench with a file explorer, tabbed editor, project search, and source control while the session keeps running. It lives in the terminal, so it comes along over SSH.
+
+Read diffs, browse the commit graph, and stage, unstage, or discard changes per file or folder. `Ctrl+X Enter` sends the file, line, or selection you are looking at to the composer as a mention such as `@src/api.ts:L10-L20`, and Caudra puts those lines in the request.
+
+When a reply needs work in places, `Ctrl+X r` opens passage review. Mark the passages, add a note to each, and send every note back as one prompt. Replies render tables, highlighted code, Unicode maths, and Mermaid flowcharts in the terminal, and copying a passage gives you its Markdown source.
+
+### Never lose the thread
+
+Every session keeps its full history, subagent transcripts included, in compact local storage. The `⋮` menu beside a message lets you fork the session there, or revert the conversation, the files, or both. **Revert files** first shows what would change, and choosing it again applies the revert. **Unrevert** puts the files and the conversation back.
+
+Caudra records file changes before and after each tool call that may change files, so a revert touches only the files those calls changed. It cannot undo external side effects such as running processes, databases, network calls, or Git branch state.
+
+To try another approach on the side, `/worktree new` moves the session into a fresh Git worktree along with its conversation and plan.
+
+What the agent learns can outlast the session too. The `memory` tool keeps tagged project notes, such as gotchas and decisions, in Caudra's state directory rather than in your repository, and every checkout of the repository shares them. Each request carries only the tags until the agent needs a note. `/memory` lists the notes so you can read, edit, or delete them.
+
+### Keep any model on task
+
+Smaller local models such as Qwen3.8-27B need more help to finish a task. Caudra nudges the model when a turn stalls, gets cut off, loops, or stops after announcing work. The rules react to what a reply did, so the same defaults work well with flagship models.
+
+- After an empty or cut-off reply, Caudra asks the model to continue. After a reply such as "I will run the tests now" with no tool call, it asks for the work itself. The third identical tool call in a row is refused before it runs.
+- When the model repeats a tool cycle or an answer, or keeps making failed calls, a hint asks it to reconsider its approach. Hints stop at four per run by default and never reopen a finished answer.
+- Every rule is on by default, and budgets cap how often each one fires. Under `[agent.steering]` in `caudra.toml`, you can change a threshold, a budget, or the wording of a nudge for all models or for one exact `provider/model-id`.
+- Each nudge appears in the transcript as a dim row. Click it to read the exact text the model received.
+
+```toml
+# caudra.toml: more patience for one local model
+[agent.steering.models."my-server/qwen3.8-27b".rules.abandoned_turn]
+max_attempts = 4
 ```
 
-Or run:
+A nudge is a message to the model. It cannot run or approve a tool, and every real tool call still passes through validation and your permission rules.
+
+## Use the models you already pay for
+
+Caudra has first-class support for Anthropic and OpenAI and ships 16 built-in providers, among them Google, GitHub Copilot, xAI, Mistral, DeepSeek, OpenRouter, Z.AI, Ollama, and llama.cpp. Custom endpoints that speak a supported API work as well.
+
+Nine model jobs decide which model serves each kind of work: Chat, Plan, Subagent, Compact, Title, Goal, Extract, Fast, and Best. Fast is the preferred small model, and session titles, `/goal` checks, and `/extract` run on it until you bind them. Best is the provider's flagship. In `/model`, you can pin any job to a model or let it follow Chat, Plan, Fast, or Best. A local endpoint can name its own Fast and Best models in `providers.toml`.
+
+You can sign in with a ChatGPT subscription, an existing GitHub Copilot sign-in, or an xAI account, or bring API keys. Claude subscription sign-in is experimental, and Anthropic's terms limit Pro and Max subscriptions to official clients.
+
+## Install
+
+On macOS and Linux:
+
+```sh
+curl -fsSL https://caudra.ai/install.sh | sh
+```
+
+The script installs Caudra to `~/.local/bin`. Set `CAUDRA_INSTALL_DIR` to choose another directory. If you would rather read the script first, download it, look it over, and run it yourself:
+
+```sh
+curl -fsSL https://caudra.ai/install.sh -o install.sh
+less install.sh
+sh install.sh
+```
+
+On Windows, in PowerShell:
 
 ```powershell
 irm https://caudra.ai/install.ps1 | iex
 ```
 
-The Windows installer uses `%LOCALAPPDATA%\caudra` and adds it to the user `PATH`. Set `CAUDRA_INSTALL_DIR` to override it.
+This installs to `%LOCALAPPDATA%\caudra` and adds it to your user `PATH`. In Git Bash, the shell script above works too.
 
-### Other options
+With Nix:
 
 ```sh
-# Main branch
-cargo install --locked --git https://github.com/caudra/caudra.git caudra
-
-# Nix
 nix run github:caudra/caudra
 ```
 
-Prebuilt binaries are available from [GitHub Releases](https://github.com/caudra/caudra/releases/latest).
-
-## Start
-
-From a repository:
+Prebuilt binaries for Linux and macOS on x86_64 and ARM64, and for Windows on x86_64, are on [GitHub Releases](https://github.com/caudra/caudra/releases/latest). To build the main branch yourself:
 
 ```sh
+cargo install --locked --git https://github.com/caudra/caudra.git caudra
+```
+
+A plain `cargo install` build leaves out `python_execution`, the isolated Python tool, because only release builds, Nix, and `just install` from a checkout embed its worker. The other tools work as usual.
+
+## First steps
+
+Connect a provider, then start Caudra in a repository:
+
+```sh
+caudra auth login
+cd my-project
 caudra
 ```
 
-Run `caudra acp` to expose Caudra to an ACP client such as Zed. Use `caudra --print` for scripts and CI.
+`caudra auth login` asks for a provider and a sign-in method. Inside Caudra, `/login` offers the same choices.
+
+Caudra opens in Plan mode. There the agent reads and searches freely, writes nothing but its plan, and asks before any command it cannot prove read-only. When the plan looks right, press `Tab` to switch to Build mode. File edits inside the repository then run without asking. Shell commands and web tools still ask first, and you can remember each approval for the conversation or the project.
+
+Instructions you already wrote for other agents carry over. Caudra reads `AGENTS.md` or `CLAUDE.md` from your repository and picks up skills from `.claude` and `.agents` folders.
+
+A few more things to know on day one:
+
+- `F1` lists every key.
+- `/docs` opens the whole manual inside Caudra, matched to the version you run.
+- `caudra --continue` resumes the most recent session in the current directory.
+- `caudra --print` runs non-interactively for scripts and CI and exits when done.
+- `caudra acp` lets editors that speak the Agent Client Protocol, such as Zed, drive Caudra.
+
+## Experimental features
+
+Some capabilities are implemented and still experimental. Each stays off until you switch it on in the `[experimental]` table of your global `caudra.toml`, which lives at `~/.config/caudra/caudra.toml`, or at `%APPDATA%\caudra\caudra.toml` on Windows. A project's own settings cannot turn them on.
+
+```toml
+[experimental]
+workflows = true
+```
+
+| Switch | What it adds |
+| --- | --- |
+| `workflows` | Durable workflows that run subagents in phases, keep a journal, and can pause and resume. They are heavily inspired by [Grok Build workflows](https://x.ai/news/workflows) and mostly compatible with them. |
+| `sandboxes` | Managed sandboxes that run workspace tools in a separate VM, while provider credentials and the conversation stay on your machine. They need e2b-libvirt infrastructure that you or your operator run. |
+| `decision_engine` | The JEV decision engine and Auto mode. The engine asks an endpoint you configure for typed decisions such as permission advice, content screening, and shell effect predictions. Its predictions add to your permission rules and can miss risks. |
+| `cross_session_messaging` | Messages, topics, and shared work between live sessions on one machine. |
+| `lua_plugins` | Lua extensions with a Neovim-style API for your own commands, tools, and interface behavior. |
+| `remote_workcell` | Workspace tools on a remote Workcell server while the conversation stays on your machine. |
+
+## Privacy
+
+Sessions, retained tool output, and file change records are stored on your machine. Cloud models and network tools still receive what you send them.
+
+There is no tracking. Telemetry stays off unless you send it to a collector you run, and Caudra checks for updates only when you run `caudra update` or turn on the startup check.
+
+Caudra also works offline with a local model. Use Ollama or llama.cpp, or point a `providers.toml` entry at [ninfer-4090](https://github.com/tensorninja/ninfer-4090), the maintainer's custom inference engine for Qwen3.8-27B on a single RTX 4090. Otherwise, a normal run contacts your provider, refreshes the public [models.dev](https://models.dev) catalog at most once a day, and reaches Exa when the agent searches the web.
 
 ## Documentation
 
-- [Quick start](https://caudra.ai/docs/quick-start/)
-- [Tools](https://caudra.ai/docs/tools/)
-- [Configuration](https://caudra.ai/docs/configuration/)
-- [Permissions](https://caudra.ai/docs/permissions/)
-- [Example config](https://github.com/caudra/config)
+The manual lives at [caudra.ai/docs](https://caudra.ai/docs/). The same pages ship inside the binary, so `/docs` works offline too. Good places to start:
 
-The example config includes a [Semble](https://github.com/MinishLab/semble) semantic code-search tool and an [ast-grep](https://ast-grep.github.io) MCP server.
+- [Quick start](https://caudra.ai/docs/quick-start/)
+- [Queue and steering](https://caudra.ai/docs/queue/)
+- [Automatic steering](https://caudra.ai/docs/configuration/#agent-steering)
+- [How Caudra saves tokens](https://caudra.ai/docs/token-economy/)
+- [Workbench](https://caudra.ai/docs/workbench/)
+- [Sessions, forks, and revert](https://caudra.ai/docs/sessions/)
+- [Permissions](https://caudra.ai/docs/permissions/)
+- [Providers](https://caudra.ai/docs/providers/)
+- [Changes from Maki](https://caudra.ai/docs/changes-from-maki/)
+
+For a complete setup to copy from, see the [example config](https://github.com/caudra/config). [Reference configs](https://caudra.ai/docs/reference-configs/) lists every key of each config file with its default.
+
+## Contributing
+
+Caudra is under active development, and bug reports help a lot. Issues and pull requests are welcome on [GitHub](https://github.com/caudra/caudra/issues). Please read [CONTRIBUTING.md](CONTRIBUTING.md) before you start on a larger change.
+
+Caudra is a Rust workspace, and the `justfile` holds the everyday commands:
+
+```sh
+just code-worker   # build the Python worker, once, before the other recipes
+just check         # type-check the workspace
+just lint          # clippy, with warnings as errors
+just test          # the test suite
+just ci            # most CI checks, the website included
+just install       # install from your checkout, Python worker included
+```
+
+The website and docs live in `site/`, built with Astro, Starlight, and Bun. The Markdown pages under `site/src/content/docs/` are also compiled into the binary, so the website and the built-in `/docs` read from the same pages.
+
+## Credits
+
+Caudra is developed and maintained by [Thorsten Born](https://thorstenborn.com). It stands on the shoulders of [Maki](https://github.com/tontinton/maki) by [Tony Solomonik](https://github.com/tontinton) and has grown in its own direction since the fork. The repository keeps Maki's history and includes work by Maki contributors. Caudra is independently maintained and is not affiliated with or endorsed by the original project.
+
+Caudra builds on ideas from these open-source projects, with thanks:
+
+- [RTK](https://www.rtk-ai.app/docs/): shell output filtering
+- [ripwire](https://github.com/redhat-et/ripwire): code maps
+- [Plannotator](https://plannotator.ai/): passage review
+- [Herdr](https://herdr.dev): terminal workspaces for agents
+- [Grok Build](https://x.ai/news/workflows): durable workflows. The built-in `deep-research` workflow is adapted from Grok Build under the Apache License 2.0.
+
+The isolated Python tool runs on [Monty](https://github.com/pydantic/monty) by Pydantic.
+
+## License
+
+Caudra is released under the [MIT License](LICENSE). [NOTICE.md](NOTICE.md) covers attribution and third-party material.

@@ -48,6 +48,7 @@
         "markdown",
         "lua-api",
         "cli",
+        "reference-configs",
         "logging",
         "telemetry"
       ]

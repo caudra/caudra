@@ -289,6 +289,8 @@ pub mod key {
     };
     pub const REFRESH: Bind = ctrl_bind!('r');
     pub const DELETE: Bind = ctrl_bind!('d');
+    pub const RECENT_HISTORY: Bind = ctrl_bind!('r');
+    pub const OLDER_HISTORY: Bind = ctrl_bind!('o');
     /// The editor chords the composer, the paste editor and the review note
     /// share with the workbench.
     pub const DELETE_WORD: Bind = Bind::from_workbench(wb::DELETE_WORD);
@@ -299,6 +301,13 @@ pub mod key {
         modifiers: KeyModifiers::CONTROL,
         label: "Ctrl+Enter",
     };
+    /// Sandbox form keys that act while a text field holds the keyboard, so
+    /// each is a chord no text field decodes. The field jumps reuse the
+    /// transcript's top and bottom keys.
+    pub const SANDBOX_APPEND_RULE: Bind = ctrl_bind!('n');
+    pub const SANDBOX_CLEAR_RULE: Bind = ctrl_bind!('u');
+    pub const SANDBOX_FIRST_FIELD: Bind = SCROLL_TOP;
+    pub const SANDBOX_LAST_FIELD: Bind = SCROLL_BOTTOM;
     pub const SELECT_ALL: Bind = Bind::from_workbench(wb::SELECT_ALL);
     pub const UNDO: Bind = Bind::from_workbench(wb::UNDO);
     /// The workbench's find keys, which `/docs` steps through its search
@@ -682,6 +691,22 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Multi(&["g", "F4", "F6"]),
         description: "Live network preview/apply; Test rules (no probe); discard action draft",
+        context: KeybindContext::SandboxManager,
+    },
+    Keybind {
+        label: KeyLabel::Alt(
+            key::SANDBOX_APPEND_RULE.label,
+            key::SANDBOX_CLEAR_RULE.label,
+        ),
+        description: "Domain and CIDR lists: append a rule line, or clear the current line",
+        context: KeybindContext::SandboxManager,
+    },
+    Keybind {
+        label: KeyLabel::Alt(
+            key::SANDBOX_FIRST_FIELD.label,
+            key::SANDBOX_LAST_FIELD.label,
+        ),
+        description: "Live action forms: focus the first or last field",
         context: KeybindContext::SandboxManager,
     },
     Keybind {
@@ -1918,6 +1943,8 @@ mod tests {
         "this chord is the same byte as Backspace, Tab or Enter and would steal it";
     const CHORD_COLLISION: &str = "two leader chords in one context answer the same second key";
     const LEADER_DRIFT: &str = "the workbench and the host must spend the same key on the prefix";
+    const SANDBOX_KEY_SHADOWS_EDIT: &str =
+        "a sandbox form key runs before the focused field and would shadow this edit";
 
     #[test_case(key::MOVE_SESSION; "move_current")]
     #[test_case(key::MIGRATE_SESSIONS; "migrate")]
@@ -2106,6 +2133,18 @@ mod tests {
         assert!(
             text_field::decode(bind.to_key_event(), FieldKind::Line).is_some(),
             "{TEXT_FIELD_CHORD_UNDECODED}: {}",
+            bind.label
+        );
+    }
+
+    #[test_case(key::SANDBOX_APPEND_RULE ; "append_rule")]
+    #[test_case(key::SANDBOX_CLEAR_RULE ; "clear_rule")]
+    #[test_case(key::SANDBOX_FIRST_FIELD ; "first_field")]
+    #[test_case(key::SANDBOX_LAST_FIELD ; "last_field")]
+    fn sandbox_form_keys_leave_every_field_edit_alone(bind: Bind) {
+        assert!(
+            text_field::decode(bind.to_key_event(), FieldKind::Document).is_none(),
+            "{SANDBOX_KEY_SHADOWS_EDIT}: {}",
             bind.label
         );
     }

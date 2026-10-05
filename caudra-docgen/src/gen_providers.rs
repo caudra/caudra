@@ -67,7 +67,7 @@ You can set multiple API keys in one env var (`ANTHROPIC_API_KEY=sk-1,sk-2,sk-3`
 
 const BASE_URL_OVERRIDES: &str = r#"## Base URL Overrides
 
-Every provider honors a `<SLUG>_BASE_URL` env var (`anthropic` -> `ANTHROPIC_BASE_URL`, `llama-cpp` -> `LLAMA_CPP_BASE_URL`). Set it to the origin of a proxy or a compatible endpoint and Caudra appends the API paths itself:
+Most providers, custom ones included, honor a `<SLUG>_BASE_URL` env var, where `<SLUG>` is the slug in capitals with `_` for `-` (`anthropic` -> `ANTHROPIC_BASE_URL`, `openrouter` -> `OPENROUTER_BASE_URL`). Set it to the origin of a proxy or a compatible endpoint and Caudra appends the API paths itself:
 
 ```sh
 ANTHROPIC_BASE_URL=https://my-proxy.internal caudra
@@ -82,7 +82,9 @@ You can also set `base_url` for a built-in provider in `~/.config/caudra/provide
 base_url = "http://xxxx:1234/v1"
 ```
 
-The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discover_models` and `models` are ignored with a warning. Use a custom slug if you need those."#;
+The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discover_models` and `models` are ignored with a warning. Use a custom slug if you need those.
+
+Ollama reads `OLLAMA_HOST` and llama.cpp reads `LLAMA_CPP_HOST`. Neither reads `<SLUG>_BASE_URL`. A `base_url` in `providers.toml` wins over the host variable, and Caudra appends `/v1` to either, so leave it off. Aperture reads `APERTURE_HOST`, which wins over the file. Copilot asks GitHub for the API endpoint of your account and ignores both settings."#;
 
 const LONG_CONTEXT_NOTE: &str = r#"Recent Claude models accept up to 1M tokens. Caudra runs them at a 372k working window, which keeps cost and latency bounded. That window is an input budget: the model's output allowance sits on top of it rather than inside it, so Caudra holds back less of it before compaction. Add `-1m` to a model id, like `claude-sonnet-4-6-1m`, to open the full 1M window instead. Set `context_window` in `providers.toml` to pick any other size."#;
 
@@ -616,8 +618,10 @@ fn no_catalog_note(kind: ProviderKind) -> &'static str {
              (e.g. `http://localhost:8080` for llama.cpp)."
         }
         ProviderKind::LlamaCpp => {
-            "Connects to any OpenAI-compatible `/v1` endpoint. Point `LLAMA_CPP_HOST` \
-             to your server address (defaults to `http://localhost:8080`)."
+            "Connects to any OpenAI-compatible `/v1` endpoint. Set `LLAMA_CPP_HOST` to your server \
+             address, such as `http://localhost:8080`, or run `caudra auth login llama-cpp`, which \
+             offers that address and saves your answer to `providers.toml`. Without either, Caudra \
+             reports that `LLAMA_CPP_HOST` is not set."
         }
         ProviderKind::Aperture => {
             "Aperture discovers models from your gateway. Set `APERTURE_HOST` to your Tailscale Aperture \

@@ -70,7 +70,7 @@ Keys at the top level of `mcp.toml`, outside any server:
 |-------|------|---------|-------------|
 | `defer_tools` | integer | `10` | Defer MCP tools behind `tool_search` only when the servers offer more than this many. `0` always defers. A project value replaces the global one |
 
-`caudra config example mcp` prints every `mcp.toml` key with its default, all commented out. [mcp.example.toml](/docs/mcp.example.toml) holds the same text.
+`caudra config example mcp` prints every `mcp.toml` key with its default, all commented out. [Reference configs](/docs/reference-configs/#mcp-toml) shows the same text.
 
 <!-- /caudra-docgen:mcp-top-level -->
 

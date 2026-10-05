@@ -57,6 +57,8 @@ Both install to `%LOCALAPPDATA%\caudra` and add it to your user PATH. Override w
 cargo install --locked --git https://github.com/caudra/caudra.git caudra
 ```
 
+This build leaves out [`python_execution`](/docs/tools/#python_execution), because only release builds, Nix, and `just install` from a checkout embed its worker. The other tools work as usual.
+
 ### With Nix
 
 ```sh
@@ -110,7 +112,7 @@ default_model = "anthropic/claude-sonnet-4-6"
 
 Without it, Caudra remembers the last model you used in each mode. Pick a strong model while planning and a cheaper one for building, and `Tab` moves between them with you.
 
-Settings live in `caudra.toml` (Windows: `%APPDATA%\caudra\caudra.toml`) and need no Lua. Workflows, managed sandboxes, direct remote Workcell connections, Lua plugins, and the decision engine are experimental and stay off until you turn them on in the global file. See [Experimental features](/docs/configuration/#experimental-features).
+Settings live in `caudra.toml` (Windows: `%APPDATA%\caudra\caudra.toml`) and need no Lua. Workflows, managed sandboxes, direct remote Workcell connections, Lua plugins, the decision engine, and cross-session messages are experimental and stay off until you turn them on in the global file. See [Experimental features](/docs/configuration/#experimental-features).
 
 ## Teach it your project
 

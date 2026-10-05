@@ -7,6 +7,8 @@ A workflow is a script that runs a plan of subagents and keeps the results. It i
 
 Caudra ships three workflows and discovers the ones you write. Runs are durable. A run that pauses, fails, or is stopped can resume from its journal instead of starting over.
 
+Caudra's workflows are heavily inspired by [Grok Build workflows](https://x.ai/news/workflows) and mostly compatible with them. Agent options accept Grok Build's `capability_mode` spellings, and the built-in `deep-research` workflow is adapted from Grok Build under the Apache License 2.0. Caudra discovers scripts only in its own directories, listed under [Where definitions live](#where-definitions-live).
+
 Workflows are experimental and off by default. Turn them on with `workflows = true` under `[experimental]` in the global `caudra.toml`, then restart Caudra. See [Experimental features](/docs/configuration/#experimental-features). While they are off, Caudra offers no `workflow` tool, workflow commands, status chip, or inspector, and it does not open workflow storage, discover scripts, or resume runs. Saved runs stay on disk.
 
 ## What ships
