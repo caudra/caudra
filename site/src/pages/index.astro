@@ -5,7 +5,7 @@ import Inline from '../components/Inline.astro';
 import InstallCommand from '../components/InstallCommand.astro';
 import SiteHead from '../components/SiteHead.astro';
 import Story from '../components/Story.astro';
-import { CLAUDE_NOTE, HEADLINE, METHOD_NOTE, TAGLINE, capabilityCount, capabilityGroups, experiments, heroClip, inspirations, metrics, modelJobs, modelJobsIntro, privacyPoints, providerNames, sandbox, signIns, stories } from '../data/home';
+import { CLAUDE_NOTE, HEADLINE, HERO_EYEBROW, METHOD_NOTE, TAGLINE, capabilityCount, capabilityGroups, experiments, heroClip, inspirations, metrics, modelJobs, modelJobsIntro, nameStory, privacyPoints, providerNames, sandbox, signIns, stories } from '../data/home';
 import '../styles/brand.css';
 import '../styles/home.css';
 ---
@@ -24,8 +24,8 @@ import '../styles/home.css';
     <main id="main">
       <section class="hero tone-dark" aria-labelledby="hero-title">
         <div class="shell">
-          <p class="eyebrow hero-tagline"><span class="signal-square" aria-hidden="true"></span>{TAGLINE}</p>
-          <h1 id="hero-title">A coding agent for<br /> your whole working day<br /> <span class="accent">and while you sleep<span class="title-stop">.</span></span></h1>
+          <p class="eyebrow hero-eyebrow"><span class="signal-square" aria-hidden="true"></span>{HERO_EYEBROW}</p>
+          <h1 id="hero-title">A coding agent that<br /> turns smart context<br /> into <span class="accent">effective action<span class="title-stop">.</span></span></h1>
           <div class="hero-grid">
             <div class="hero-copy">
               <p class="hero-lede">Caudra brings steerable subagents, built-in token savings, a full workbench, and a session history you can always return to. It all ships in one native binary, so there are no plugins to assemble.</p>
@@ -72,6 +72,21 @@ import '../styles/home.css';
             <ul>{inspirations.map((credit) => <li><a href={credit.href}>{credit.name}</a><span>{credit.idea}</span></li>)}</ul>
           </div>
           <p id="method" class="method-note"><strong>Method</strong>{METHOD_NOTE}</p>
+        </div>
+      </section>
+
+      <section id="name" class="name tone-dark" aria-labelledby="name-title">
+        <div class="shell name-grid">
+          <div class="name-copy">
+            <p class="eyebrow">Why the name</p>
+            <h2 id="name-title">{nameStory.title[0]}<br /> {nameStory.title[1]}</h2>
+            {nameStory.paragraphs.map((text) => <p>{text}</p>)}
+            <p class="fine-print"><Inline text={nameStory.sources} /></p>
+          </div>
+          <figure class="name-loop">
+            <ol>{nameStory.loop.map((step, index) => <li><span>{String(index + 1).padStart(2, '0')}</span>{step}</li>)}</ol>
+            <figcaption><span aria-hidden="true">↑</span>{nameStory.loopNote}</figcaption>
+          </figure>
         </div>
       </section>
 

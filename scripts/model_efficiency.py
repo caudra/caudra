@@ -1310,7 +1310,7 @@ def render_markdown(report):
         "Regenerate with:",
         "",
         "```sh",
-        "python3 scripts/model_efficiency.py --format markdown > docs/model-efficiency.md",
+        "python3 scripts/model_efficiency.py --format markdown",
         "```",
         "",
         "## Read this first",

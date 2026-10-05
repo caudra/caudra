@@ -2,6 +2,7 @@ import { defineConfig } from 'astro/config';
 import { unified } from '@astrojs/markdown-remark';
 import starlight from '@astrojs/starlight';
 import { readDocs, SITE } from './src/data/docs';
+import { SOCIAL_CARD_ALT } from './src/data/home';
 import compatibility from './src/markdown/compatibility';
 import diagrams from './src/markdown/diagrams';
 import publish from './scripts/publish';
@@ -34,7 +35,7 @@ export default defineConfig({
         { tag: 'link', attrs: { rel: 'preload', href: '/fonts/jetbrains-mono-latin.woff2', as: 'font', type: 'font/woff2', crossorigin: 'anonymous' } },
         { tag: 'link', attrs: { rel: 'preload', href: '/fonts/space-grotesk.woff2', as: 'font', type: 'font/woff2', crossorigin: 'anonymous' } },
         { tag: 'meta', attrs: { property: 'og:image', content: `${SITE}/social-card.png` } },
-        { tag: 'meta', attrs: { property: 'og:image:alt', content: 'Caudra. Context into effective action. A coding agent for your whole working day and while you sleep.' } },
+        { tag: 'meta', attrs: { property: 'og:image:alt', content: SOCIAL_CARD_ALT } },
         { tag: 'meta', attrs: { name: 'twitter:card', content: 'summary_large_image' } },
         { tag: 'meta', attrs: { name: 'theme-color', content: '#14151a' } },
       ],

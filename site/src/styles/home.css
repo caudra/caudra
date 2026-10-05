@@ -52,7 +52,7 @@ h3 { margin: 0; font-size: 1.2rem; font-weight: 500; letter-spacing: -.03em; lin
 .nav-install span { margin-left: .8rem; color: var(--accent); }
 
 .hero { padding-block: clamp(3rem, 7vw, 5.5rem) clamp(3.5rem, 7vw, 6rem); }
-.hero-tagline { display: flex; align-items: center; gap: .8rem; margin-bottom: 2.4rem; color: var(--text); }
+.hero-eyebrow { display: flex; align-items: center; gap: .8rem; margin-bottom: 2.4rem; color: var(--text); }
 .signal-square { width: .55rem; height: .55rem; background: var(--accent); }
 .hero-grid { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 2.5rem 5rem; align-items: end; margin-block: 2.8rem 3.5rem; }
 .hero-copy p { max-width: 40rem; margin: 0; color: var(--text-muted); }
@@ -99,7 +99,7 @@ h3 { margin: 0; font-size: 1.2rem; font-weight: 500; letter-spacing: -.03em; lin
 .clip-tab-list button[aria-pressed='true'] { border-color: var(--text); background: var(--text); color: var(--surface); }
 .clip-tab-list button:hover:not([aria-pressed='true']) { border-color: var(--accent); color: var(--accent); }
 
-.founder, .story, .included, .lab { padding-block: clamp(4rem, 9vw, 7.5rem); }
+.founder, .name, .story, .included, .lab { padding-block: clamp(4rem, 9vw, 7.5rem); }
 .founder-grid { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); grid-template-areas: "head head" "compare quote" "built quote" "credits credits" "method method"; gap: 3.5rem 6rem; }
 .founder-head { grid-area: head; }
 .founder-head .eyebrow, .section-head .eyebrow { margin-bottom: 1.5rem; }
@@ -127,6 +127,20 @@ h3 { margin: 0; font-size: 1.2rem; font-weight: 500; letter-spacing: -.03em; lin
 .founder-credits span { color: var(--text-muted); font-size: .85rem; }
 .method-note { grid-area: method; display: flex; flex-wrap: wrap; gap: .3rem 1.5rem; margin: 0; padding: 1.25rem 1.5rem; border: 1px solid var(--line); background: var(--raised); color: var(--text-muted); font-size: .88rem; }
 .method-note strong { color: var(--text); font: 500 .7rem/2 var(--mono); letter-spacing: .12em; text-transform: uppercase; }
+
+.name-grid { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: 3rem 6rem; align-items: center; }
+.name-copy .eyebrow, .name-copy h2 { margin-bottom: 1.5rem; }
+.name-copy p { max-width: 36rem; margin: 0 0 1rem; color: var(--text-muted); }
+.name-copy h2 + p { color: var(--text); font-size: clamp(1.05rem, 1.4vw, 1.2rem); letter-spacing: -.02em; }
+.name-copy .fine-print { margin: 1.5rem 0 0; }
+.name-copy .fine-print a { color: var(--text); }
+.name-loop { margin: 0; }
+.name-loop ol { margin: 0; padding: 0; border-left: 2px solid var(--accent); list-style: none; }
+.name-loop li { display: flex; align-items: baseline; gap: 1.25rem; padding: 1.1rem 0 1.1rem 1.5rem; border-top: 1px solid var(--line); font-size: clamp(1.4rem, 2.6vw, 2.2rem); letter-spacing: -.04em; line-height: 1.15; }
+.name-loop li:first-child { border-top: 0; }
+.name-loop li span { color: var(--accent); font: .75rem/1.6 var(--mono); letter-spacing: 0; }
+.name-loop figcaption { display: flex; gap: .7rem; padding: 1rem 0 0 1.5rem; border-top: 1px solid var(--line); color: var(--text-muted); font: .75rem/1.6 var(--mono); }
+.name-loop figcaption span { color: var(--accent); }
 
 .story-grid { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-areas: "copy" "stage" "points" "footer"; gap: 3rem 5rem; }
 .layout-split .story-grid { grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); grid-template-areas: "copy stage" "points points" "footer footer"; }
@@ -224,7 +238,7 @@ h3 { margin: 0; font-size: 1.2rem; font-weight: 500; letter-spacing: -.03em; lin
 
 @media (max-width: 1100px) {
   .shell { width: calc(100% - 4rem); }
-  .hero-grid, .founder-grid, .models-grid, .jobs-head, .sandbox, .install-grid, .privacy-grid, .section-head, .layout-stacked .story-copy { grid-template-columns: minmax(0, 1fr); }
+  .hero-grid, .founder-grid, .name-grid, .models-grid, .jobs-head, .sandbox, .install-grid, .privacy-grid, .section-head, .layout-stacked .story-copy { grid-template-columns: minmax(0, 1fr); }
   .founder-grid { grid-template-areas: "head" "quote" "compare" "built" "credits" "method"; gap: 2.5rem; }
   .layout-split .story-grid, .layout-split-reverse .story-grid { grid-template-columns: minmax(0, 1fr); grid-template-areas: "copy" "stage" "points" "footer"; }
   .layout-stacked .story-copy { grid-template-areas: "eyebrow" "title" "lede"; }
@@ -239,7 +253,7 @@ h3 { margin: 0; font-size: 1.2rem; font-weight: 500; letter-spacing: -.03em; lin
   .brand { font-size: 1.4rem; }
   .brand img { width: 27px; height: 27px; }
   .hero h1 br { display: none; }
-  .hero-tagline { margin-bottom: 1.8rem; font-size: .6rem; letter-spacing: .08em; }
+  .hero-eyebrow { margin-bottom: 1.8rem; font-size: .6rem; letter-spacing: .08em; }
   .lane { grid-template-columns: minmax(0, 1fr); gap: .2rem; }
   .lane-legend { padding-left: 0; }
   .steps li { grid-template-columns: minmax(0, 1fr); }

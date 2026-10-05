@@ -5,7 +5,7 @@ import { load, type CheerioAPI } from 'cheerio';
 import { createMarkdownProcessor } from '@astrojs/markdown-remark';
 import { SITE, estimatedTokens, pageMarkdown, pagePath, readDocs } from '../../src/data/docs';
 import compatibility from '../../src/markdown/compatibility';
-import { CLAUDE_NOTE, GROK_BUILD, HEADLINE, METHOD_NOTE, NINFER, TAGLINE, capabilityGroups, heroClip, inspirations, metrics, stories } from '../../src/data/home';
+import { CLAUDE_NOTE, GROK_BUILD, HEADLINE, HERO_EYEBROW, METHOD_NOTE, NAME_SOURCES, NINFER, capabilityGroups, heroClip, inspirations, metrics, stories } from '../../src/data/home';
 import { INSTALL_COMMAND } from '../../src/data/install';
 
 const ILLUSTRATION = 'Illustration';
@@ -14,6 +14,8 @@ const MAINTAINER_ATTRIBUTION = 'Measured by the maintainer in daily use';
 const MIN_CAPABILITIES = 40;
 const FOUNDER_FIGURES = /20 ?(?:B\b|billion)|9[47]%|under a second|<1 s|[12] GB|10k-turn/;
 const OTHER_AGENTS = /OpenCode|Claude Code|Codex|Cursor|Aider|Gemini CLI|Grok Build/i;
+const BRAIN_REFERENCES = /\bbrain\b|caudate/i;
+const NAME_STORY = 'name';
 const dist = new URL('../../dist/', import.meta.url);
 const { pages, navigation } = await readDocs();
 const renderer = await createMarkdownProcessor({ smartypants: false, remarkPlugins: [compatibility], syntaxHighlight: false });
@@ -139,6 +141,14 @@ test('homepage founder figures are attributed and explained by the method note',
   expect(homeText($, '#why')).not.toMatch(OTHER_AGENTS);
 });
 
+test('homepage keeps brain references in the cited name story', () => {
+  const $ = documents.get('/')!;
+  for (const section of $('main section').toArray()) {
+    if (BRAIN_REFERENCES.test($(section).text())) expect($(section).attr('id')).toBe(NAME_STORY);
+  }
+  for (const source of NAME_SOURCES) expect($(`#${NAME_STORY} a[href="${source.href}"]`).text()).toBe(source.name);
+});
+
 test('homepage credits ideas, labels experiments, and makes no automation claims', () => {
   const $ = documents.get('/')!;
   expect(homeText($, '.claude-note')).toBe(CLAUDE_NOTE);
@@ -161,7 +171,7 @@ test('homepage has an honest product story, working destinations, and a small en
   const $ = documents.get('/')!;
   expect($('h1').length).toBe(1);
   expect(homeText($, 'h1')).toBe(HEADLINE);
-  expect(homeText($, '.hero-tagline')).toBe(TAGLINE);
+  expect(homeText($, '.hero-eyebrow')).toBe(HERO_EYEBROW);
   expect($('[data-copy-source]').map((_, node) => $(node).text()).get()).toEqual([INSTALL_COMMAND, INSTALL_COMMAND]);
   expect($('.hero #hero-install').length).toBe(1);
   expect($('.recording').length).toBe([heroClip, ...stories.flatMap((story) => story.clips)].length);

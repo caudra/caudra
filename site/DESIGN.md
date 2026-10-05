@@ -1,14 +1,14 @@
 # Website design system
 
-**Context into effective action.** This is the enduring brand tagline. Caudra
-combines an agent and the surrounding development work in one native terminal
-application, for interactive work and unattended runs.
+**A coding agent that turns smart context into effective action.** This is the
+homepage headline. Its short form, “Context into effective action”, serves page
+titles and metadata. Caudra combines an agent and the surrounding development
+work in one native terminal application, for interactive work and unattended
+runs.
 
-The homepage headline is “A coding agent for your whole working day and while
-you sleep.” It complements the tagline rather than replacing it. Day/night copy
-does not claim shipped scheduled automations or background work that survives
-closing its owning session. The homepage shows work in use. The docs prioritize
-reading, navigation, and finding an answer.
+Day/night copy does not claim shipped scheduled automations or background work
+that survives closing its owning session. The homepage shows work in use. The
+docs prioritize reading, navigation, and finding an answer.
 
 ## Principles
 
@@ -84,9 +84,10 @@ Touch and app icons are 180, 192, and 512px. The social image is 1200×630.
 `public/social-card.svg` is the current social artwork. Its text and the wordmark
 are SVG outlines from the licensed font using fontTools, so rendering does not
 depend on installed system fonts. Render the social SVG directly with CairoSVG
-to refresh its PNG. The artwork carries the tagline “Context into effective
-action” and the headline “A coding agent for your whole working day and while
-you sleep.” Keep image alt text consistent with both lines of messaging.
+to refresh its PNG. The artwork carries the hero eyebrow “Open source, for your
+terminal” and the headline “A coding agent that turns smart context into
+effective action.” `SOCIAL_CARD_ALT` in `src/data/home.ts` holds the alt text
+for both lines, so change it together with the artwork.
 Do not reuse the historical aperture/coral artwork kept outside `public/`.
 
 ## Code blocks

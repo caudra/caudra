@@ -1,5 +1,7 @@
 export const TAGLINE = 'Context into effective action';
-export const HEADLINE = 'A coding agent for your whole working day and while you sleep.';
+export const HEADLINE = 'A coding agent that turns smart context into effective action.';
+export const HERO_EYEBROW = 'Open source, for your terminal';
+export const SOCIAL_CARD_ALT = `Caudra. ${HERO_EYEBROW}. ${HEADLINE}`;
 export const METHOD_NOTE = "These are the maintainer's own measurements from daily use, not benchmarks. Timings were measured by hand. Results depend on models, projects, and hardware.";
 export const CLAUDE_NOTE = "Claude subscription sign-in is experimental. Anthropic's terms limit Pro and Max subscriptions to official clients.";
 export const WORKCELL_REPOSITORY = 'https://github.com/tensorninja/workcell-mcp';
@@ -88,6 +90,10 @@ const PLANNOTATOR: Link = { name: 'Plannotator', href: 'https://plannotator.ai/'
 const HERDR: Link = { name: 'Herdr', href: 'https://herdr.dev' };
 export const GROK_BUILD: Link = { name: 'Grok Build workflows', href: 'https://x.ai/news/workflows' };
 export const NINFER: Link = { name: 'ninfer-4090', href: 'https://github.com/tensorninja/ninfer-4090' };
+const GRAHN_2008: Link = { name: 'Grahn, Parkinson and Owen, 2008', href: 'https://www.sciencedirect.com/science/article/abs/pii/S0301008208001019' };
+const LAU_2007: Link = { name: 'Lau and Glimcher, 2007', href: 'https://www.jneurosci.org/content/27/52/14502' };
+const DOI_2020: Link = { name: 'Doi et al., 2020', href: 'https://elifesciences.org/articles/56694' };
+export const NAME_SOURCES = [GRAHN_2008, LAU_2007, DOI_2020];
 
 const linked = ({ name, href }: Link) => `[${name}](${href})`;
 
@@ -120,6 +126,18 @@ export const heroClip: Clip = {
       { label: '`task`', segments: [{ start: 40, end: 72, kind: 'write' }, { start: 72, end: 100, kind: 'run' }], marker: { at: 41, text: 'Chat opens' } },
     ],
   },
+};
+
+export const nameStory = {
+  title: ['Caudra comes', 'from caudate.'],
+  paragraphs: [
+    'Caudra, pronounced KAW-druh, is named after the caudate nucleus. This part of the brain belongs to the circuits that connect evidence and goals to action. Studies link it to learning which actions lead to which outcomes.',
+    'The name describes how Caudra works. It turns the context of your task into an action, then reads the outcome before it chooses the next one.',
+    'The brain is only the inspiration for the name. Caudra is software, and it works toward the goal you set.',
+  ],
+  loop: ['Context and intent', 'Evaluate evidence', 'Select an action', 'Execute with tools', 'Observe the outcome'],
+  loopNote: 'Each outcome becomes evidence for the next step.',
+  sources: `Sources: ${NAME_SOURCES.map(linked).join(', ')}.`,
 };
 
 export const stories: readonly Story[] = [

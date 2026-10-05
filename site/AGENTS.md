@@ -54,12 +54,14 @@ Fine when genuine: anaphora in scannable checklists ("No prompt text / No model 
 
 ## Product identity
 
-- The enduring brand tagline is “Context into effective action”. Keep it distinct from the homepage headline: “A coding agent for your whole working day and while you sleep.”
+- The homepage headline is “A coding agent that turns smart context into effective action.” The short brand line “Context into effective action” serves titles and metadata. Do not show both side by side.
+- Lead with what Caudra does: effective action from coordinated models, tools, and subagents, adapted to each outcome and kept under user control. Prefer concrete actions and outcomes over claims about intelligence. Never imply the agent always knows the right answer.
 - Position Caudra for interactive work and unattended runs: agent work, native tools, a workbench, and resumable sessions in one terminal application.
 - Day/night messaging does not claim shipped scheduled automations or imply that background work survives closing its owning session.
+- Caudra is pronounced KAW-druh, IPA /ˈkɔːdrə/, and is named after the caudate nucleus, part of the brain circuits that connect evidence and goals to action. Brain references belong only in the name story (homepage `#name`, README “Why the name”), which cites Grahn, Parkinson and Owen (2008), Lau and Glimcher (2007), and Doi et al. (2020). The analogy is limited: never imply consciousness, biological equivalence, or goals of its own.
 - State that Caudra is an independent fork when project provenance is relevant.
 - Use `Caudra` for the product and `caudra` for commands, paths, packages, APIs, and the lowercase wordmark.
-- Use only `https://caudra.ai` for the site, docs, and installer origin.
+- Use only `https://caudra.ai` for the site, docs, and installer origin. An unrelated apparel business owns `caudra.com`, so never imply any connection to it.
 - Use `github.com/caudra/caudra` for source and `github.com/caudra/config` for the example config.
 - Telemetry names use the `caudra.*` namespace.
 

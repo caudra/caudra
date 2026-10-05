@@ -1,10 +1,10 @@
 <p align="center">
-  <img src="./site/public/social-card.png" alt="caudra. Context into effective action. A coding agent for your whole working day and while you sleep." width="100%">
+  <img src="./site/public/social-card.png" alt="Caudra. Open source, for your terminal. A coding agent that turns smart context into effective action." width="100%">
 </p>
 
 # Caudra
 
-**A coding agent for your whole working day and while you sleep.**
+**A coding agent that turns smart context into effective action.**
 
 Caudra is a terminal coding agent written in Rust. It brings steerable subagents, built-in token savings, a full workbench, and a session history you can always return to. Everything ships in one native binary, so there are no plugins to assemble.
 
@@ -25,6 +25,12 @@ curl -fsSL https://caudra.ai/install.sh | sh
 > **Thorsten Born**, software engineer and data architect, maintainer of Caudra
 
 In the same daily use, about 97% of Anthropic and 94% of OpenAI prompt tokens came from cache. These figures are the maintainer's own measurements, not benchmarks. Timings were measured by hand, and results depend on models, projects, and hardware.
+
+## Why the name
+
+Caudra, pronounced KAW-druh, is named after the caudate nucleus. This part of the brain belongs to the circuits that connect evidence and goals to action. Studies link it to learning which actions lead to which outcomes ([Grahn, Parkinson and Owen, 2008](https://www.sciencedirect.com/science/article/abs/pii/S0301008208001019), [Lau and Glimcher, 2007](https://www.jneurosci.org/content/27/52/14502), [Doi et al., 2020](https://elifesciences.org/articles/56694)).
+
+The name describes how Caudra works. It turns the context of your task into an action, then reads the outcome before it chooses the next one. The brain is only the inspiration for the name. Caudra is software, and it works toward the goal you set.
 
 ## A quick tour
 
