@@ -6,7 +6,7 @@ const MAX_PDF_PAGES: usize = 200;
 const MAX_PDF_OBJECTS: usize = 20_000;
 const MAX_PDF_STRUCTURE_DEPTH: usize = 64;
 const MAX_PDF_WORK_UNITS: usize = 2_000_000;
-const MAX_EXTRACTED_TEXT_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const MAX_EXTRACTED_TEXT_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PdfExtraction {

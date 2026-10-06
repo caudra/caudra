@@ -1493,8 +1493,11 @@ async fn webfetch_bounds_body_lines_and_classifies_cancellation_and_content_erro
         json!({"url": "https://example.test/large.txt", "format": "text"}),
     )
     .await;
-    assert!(text(&result).contains("line-2000"));
-    assert!(!text(&result).contains("line-2001"));
+    assert!(
+        text(&result).ends_with("line-1999\n[truncated: showing 1999 of 2105 lines]"),
+        "the cut page must end with a notice inside the line bound"
+    );
+    assert!(!text(&result).contains("line-2000"));
     assert_eq!(
         result.structured_content.expect("structured")["truncated"],
         json!(true)
@@ -1532,6 +1535,39 @@ async fn webfetch_bounds_body_lines_and_classifies_cancellation_and_content_erro
     assert_eq!(result.is_error, Some(true));
     assert_eq!(text(&result), "Tool invocation was aborted.");
     assert!(cancellation_http.requests().is_empty());
+}
+
+#[tokio::test]
+async fn a_page_cut_by_the_response_bound_ends_by_saying_so() {
+    let mut cut = response(
+        "https://example.test/long.txt",
+        StatusCode::OK,
+        Some("text/plain"),
+        Bytes::from_static(b"The first part of a long page."),
+    );
+    cut.truncated = true;
+    let group = WebToolGroup::with_dependencies(
+        WebsearchExecutionConfiguration::unconfigured(),
+        dependencies(
+            Arc::new(FakeHttp::with_responses(vec![Ok(cut)])),
+            Arc::new(FakeIcons::default()),
+            default_pdf(),
+        ),
+    );
+    let result = call(
+        &group,
+        "webfetch",
+        json!({"url": "https://example.test/long.txt", "format": "text"}),
+    )
+    .await;
+    assert_eq!(
+        text(&result),
+        "The first part of a long page.\n[truncated: only the first 5 MiB of the response was read]"
+    );
+    assert_eq!(
+        result.structured_content.expect("structured")["truncated"],
+        json!(true)
+    );
 }
 
 #[tokio::test]

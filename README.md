@@ -1442,8 +1442,11 @@ content.
 - `timeout` is one total network-and-primary-parsing deadline in seconds. It defaults to 30 and is
   capped at 60. Optional icon decoration is skipped when that deadline is exhausted.
 - General response bodies are capped at 5 MiB. Model-facing output is independently capped at 2,000
-  lines and 50 KiB. Structured output records the requested URL, final URL, status, content type,
-  selected format, title, extraction method, low-signal indicator, and truncation state when available.
+  lines and 50 KiB. Output cut by any of these limits ends with one line that names it, such as
+  `[truncated: showing 1999 of 2105 lines]` or `[truncated: only the first 5 MiB of the response was
+  read]`, and that line counts inside both output bounds. Structured output records the requested
+  URL, final URL, status, content type, selected format, title, extraction method, low-signal
+  indicator, and truncation state when available.
 - Unsupported non-text content returns an error instead of being decoded as text. JSON, XML,
   JavaScript, XHTML, and other textual media types are returned as bounded text.
 
@@ -1452,7 +1455,8 @@ PDF responses have a separate 6 MiB transfer ceiling and support two explicit mo
 - `pdfMode: "extract"` is the default. Workcell verifies the PDF signature, rejects documents over 200
   pages or other structural limits, bounds extracted text to 2 MiB, normalizes page text, and then
   applies the normal 2,000-line and 50 KiB model-output limits. The structured result reports
-  `pdfMode: "extract"` and whether transfer, parser, or output bounds truncated the result.
+  `pdfMode: "extract"` and whether transfer, parser, or output bounds truncated the result, and a
+  truncated result ends with the line that names the limit.
 - `pdfMode: "attachment"` skips text extraction and returns the complete bounded PDF as an
   `application/pdf` data-URL attachment. The filename is URL-decoded, stripped of traversal and control
   characters, and byte-bounded. Workcell never emits a partial attachment: a truncated or oversized

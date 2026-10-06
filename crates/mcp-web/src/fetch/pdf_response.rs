@@ -10,9 +10,10 @@ use workcell_source_icons::SourceIconError;
 use super::icons;
 use super::input::NormalizedWebfetchInput;
 use super::output::{filename_from_url, normalize_pdf_text, truncate_model_output};
-use super::{WebfetchError, WebfetchExecution};
+use super::{MAX_PDF_RESPONSE_BYTES, MIB, WebfetchError, WebfetchExecution};
 use crate::WebToolDependencies;
 use crate::blocking::{self, BlockingError};
+use crate::pdf::MAX_EXTRACTED_TEXT_BYTES;
 use crate::types::{WebfetchOutput, WebfetchPdfAttachment, WebfetchPdfMode};
 
 pub(super) struct PdfResponse {
@@ -54,7 +55,20 @@ pub(super) async fn execute(
     .map_err(|error| blocking_error(error, timeout_seconds))?;
     let extracted = extracted.map_err(|_| parse_error())?;
     let formatted = normalize_pdf_text(&extracted.text);
-    let bounded = truncate_model_output(&formatted);
+    let source_cut = if response.body_truncated {
+        Some(format!(
+            "the first {} MiB of the PDF",
+            MAX_PDF_RESPONSE_BYTES / MIB
+        ))
+    } else if extracted.truncated {
+        Some(format!(
+            "the first {} MiB of the PDF text",
+            MAX_EXTRACTED_TEXT_BYTES / MIB
+        ))
+    } else {
+        None
+    };
+    let bounded = truncate_model_output(&formatted, source_cut.as_deref());
     let icon = icons::resolve(
         dependencies,
         response.final_url.as_str(),
@@ -79,7 +93,7 @@ pub(super) async fn execute(
             title: extracted.title,
             output: bounded.text.clone(),
             summary_input: None,
-            truncated: response.body_truncated || extracted.truncated || bounded.truncated,
+            truncated: bounded.truncated,
             pdf_attachment: None,
             extraction_method: None,
             extraction_low_signal: None,

@@ -18,8 +18,9 @@ use crate::types::WebfetchOutput;
 pub(crate) use input::{NormalizedWebfetchInput, normalize_input};
 pub(crate) use output::utf8_prefix;
 
-const MAX_RESPONSE_BYTES: usize = 5 * 1024 * 1024;
-pub(super) const MAX_PDF_RESPONSE_BYTES: usize = 6 * 1024 * 1024;
+const MIB: usize = 1024 * 1024;
+const MAX_RESPONSE_BYTES: usize = 5 * MIB;
+pub(super) const MAX_PDF_RESPONSE_BYTES: usize = 6 * MIB;
 pub(super) const MAX_REDIRECTS: usize = 5;
 
 #[derive(Debug, thiserror::Error)]
@@ -156,7 +157,9 @@ pub(crate) async fn execute(
         input.timeout_seconds,
     )
     .await?;
-    let bounded = output::truncate_model_output(&formatted.output);
+    let source_cut = (response.truncated || text_body_truncated)
+        .then(|| format!("the first {} MiB of the response", MAX_RESPONSE_BYTES / MIB));
+    let bounded = output::truncate_model_output(&formatted.output, source_cut.as_deref());
     let summary_input = formatted
         .summary_input
         .as_deref()
