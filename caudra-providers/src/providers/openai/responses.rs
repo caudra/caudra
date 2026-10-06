@@ -13,11 +13,13 @@ use crate::model::Model;
 use crate::provider::WireRequest;
 use crate::providers::ResolvedAuth;
 use crate::{
-    AgentError, CacheKey, ContentBlock, Message, ProviderEvent, ResponsesReasoning, Role,
-    StopReason, StreamResponse, ThinkingConfig, TokenUsage,
+    AgentError, CacheKey, ContentBlock, DocumentSource, Message, ProviderEvent, ResponsesReasoning,
+    Role, StopReason, StreamResponse, ThinkingConfig, TokenUsage,
 };
 
 pub(crate) const RESPONSES_PATH: &str = "/responses";
+/// The API wants a name beside inline file data, and a fetched PDF may have none.
+const UNNAMED_PDF: &str = "document.pdf";
 const NO_BASE_URL: &str = "Responses API requires a base_url in auth";
 pub(crate) const ENCRYPTED_REASONING: &str = "reasoning.encrypted_content";
 pub(crate) const PROMPT_CACHE_KEY_FIELD: &str = "prompt_cache_key";
@@ -98,6 +100,27 @@ pub(crate) fn apply_responses_reasoning(
     }
 }
 
+/// A result carrying documents becomes parts with its text first and each PDF
+/// as an `input_file`. One without stays the plain string.
+fn function_output(text: &str, documents: Option<&[DocumentSource]>) -> Value {
+    let files: Vec<Value> = documents
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|document| {
+            Some(json!({
+                "type": "input_file",
+                "filename": document.filename.as_deref().unwrap_or(UNNAMED_PDF),
+                "file_data": document.data_url()?,
+            }))
+        })
+        .collect();
+    if files.is_empty() {
+        return json!(text);
+    }
+    let text = (!text.trim().is_empty()).then(|| json!({"type": "input_text", "text": text}));
+    Value::Array(text.into_iter().chain(files).collect())
+}
+
 pub(crate) fn convert_input(messages: &[Message]) -> Value {
     let mut input = Vec::new();
 
@@ -125,10 +148,11 @@ pub(crate) fn convert_input(messages: &[Message]) -> Value {
                             content,
                             ..
                         } => {
+                            let documents = msg.tool_result_documents.get(tool_use_id);
                             input.push(json!({
                                 "type": "function_call_output",
                                 "call_id": tool_use_id,
-                                "output": content,
+                                "output": function_output(content, documents.map(Vec::as_slice)),
                             }));
                         }
                         ContentBlock::ToolUse { .. }
@@ -837,10 +861,11 @@ mod tests {
     use super::*;
     use crate::invalid_tool_input;
     use crate::providers::test_support::{
-        PEER_ATTACK, PEER_TEXT, assert_peer_framing, automation_event_origin, peer_message_origin,
+        DOCUMENT_DATA, DOCUMENT_NAME, DOCUMENT_RESULT, PEER_ATTACK, PEER_TEXT, assert_peer_framing,
+        automation_event_origin, document, fetched_document, peer_message_origin,
         task_event_origin, task_observation_with_output_refs, workflow_event_origin,
     };
-    use crate::{StandingReminderKind, SteeringKind};
+    use crate::{PDF_DATA_URL_PREFIX, StandingReminderKind, SteeringKind};
     use futures_lite::io::Cursor;
     use serde_json::json;
     use test_case::test_case;
@@ -993,6 +1018,16 @@ mod tests {
             wire,
             json!([{"type": "message", "role": "user", "content": [{"type": "input_text", "text": framed}]}])
         );
+    }
+
+    #[test_case(Some(DOCUMENT_DATA), json!([
+        {"type": "input_text", "text": DOCUMENT_RESULT},
+        {"type": "input_file", "filename": DOCUMENT_NAME, "file_data": format!("{PDF_DATA_URL_PREFIX}{DOCUMENT_DATA}")},
+    ]) ; "a_held_pdf_follows_the_text")]
+    #[test_case(None, json!(DOCUMENT_RESULT) ; "a_pdf_without_bytes_leaves_plain_text")]
+    fn a_pdf_travels_inside_its_function_output(data: Option<&str>, expected: Value) {
+        let wire = convert_input(&[fetched_document(document(data))]);
+        assert_eq!(wire[0]["output"], expected);
     }
 
     #[test_case("{broken", false ; "malformed_delta")]

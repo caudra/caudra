@@ -5,7 +5,7 @@ use std::slice;
 use caudra_providers::estimate_tokens_cached;
 use caudra_providers::{
     ContentBlock, EMPTY_RESPONSE_MARKER, Message, Model, ReasoningTransport, ResponsesReasoning,
-    Role, SteeringKind, adapt_images_for_model,
+    Role, SteeringKind, adapt_attachments_for_model,
 };
 use serde_json::Value;
 
@@ -37,15 +37,15 @@ pub struct ProjectedHistory {
 
 /// The history exactly as the next request sends it: old results pruned,
 /// reasoning lowered for the target, empty turns filled, tool pairs repaired,
-/// and images described for a model without vision. Borrows when no step
-/// changes anything.
+/// images described for a model without vision, and every PDF the request
+/// cannot carry noted instead. Borrows when no step changes anything.
 pub fn project_request<'a>(
     messages: &'a [Message],
     tools: &Value,
     model: &Model,
     transport: ReasoningTransport,
 ) -> Cow<'a, [Message]> {
-    adapt_images(
+    adapt_attachments(
         model,
         repair_tool_pairs(project_for_target(messages, tools, model, transport)),
     )
@@ -71,7 +71,7 @@ pub fn project_for_inspection(
     };
     let mut projected = project_request(settled, tools, model, transport).into_owned();
     projected.extend(
-        adapt_images(
+        adapt_attachments(
             model,
             project_for_target(slice::from_ref(running), tools, model, transport),
         )
@@ -83,10 +83,10 @@ pub fn project_for_inspection(
     }
 }
 
-fn adapt_images<'a>(model: &Model, messages: Cow<'a, [Message]>) -> Cow<'a, [Message]> {
+fn adapt_attachments<'a>(model: &Model, messages: Cow<'a, [Message]>) -> Cow<'a, [Message]> {
     match messages {
-        Cow::Borrowed(messages) => adapt_images_for_model(model, messages),
-        Cow::Owned(messages) => match adapt_images_for_model(model, &messages) {
+        Cow::Borrowed(messages) => adapt_attachments_for_model(model, messages),
+        Cow::Owned(messages) => match adapt_attachments_for_model(model, &messages) {
             Cow::Borrowed(_) => Cow::Owned(messages),
             Cow::Owned(adapted) => Cow::Owned(adapted),
         },
@@ -127,9 +127,12 @@ fn project<'a>(messages: &'a [Message], tools: &Value) -> Cow<'a, [Message]> {
                     else {
                         return None;
                     };
+                    // A result carrying a PDF is one line of text, so pruning
+                    // it saves nothing: the page budget decides what stays.
                     if tool_names
                         .get(tool_use_id.as_str())
                         .is_some_and(|name| PRUNE_PROTECTED_TOOLS.contains(name))
+                        || message.tool_result_documents.contains_key(tool_use_id)
                     {
                         return None;
                     }

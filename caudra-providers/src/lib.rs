@@ -47,13 +47,14 @@ pub use tokens::{
     estimate_tokens, estimate_tokens_cached, format_hit_rate, format_tokens_u64, token_label,
 };
 pub use types::{
-    AutomationEventOrigin, CacheKey, ContentBlock, EFFORT_LEVELS, EMPTY_RESPONSE_MARKER,
+    AutomationEventOrigin, CacheKey, ContentBlock, DOCUMENT_OMITTED_PREFIX,
+    DOCUMENT_TOKENS_PER_PAGE, DocumentSource, EFFORT_LEVELS, EMPTY_RESPONSE_MARKER,
     IMAGE_OMITTED_NOTE, INVALID_TOOL_JSON_KEY, ImageMediaType, ImageSource, InvalidToolInput,
-    MAX_TOOL_INPUT_BYTES, MIN_THINKING_BUDGET, Message, MessageKind, PEER_AUTOMATION_SENDER,
-    PEER_SCRIPT_SENDER, PEER_SESSION_SENDER, PeerAssignment, PeerAudience, PeerMessageOrigin,
-    ProviderEvent, ProviderUsage, ReasoningOption, ReasoningOptions, ReasoningSource,
-    ReasoningTransport, RequestOptions, ResolvedThinking, ResponsesReasoning, Role,
-    StandingReminderKind, SteeringKind, SteeringOrigin, StopReason, StreamResponse, THINKING_USAGE,
-    TaskEventOrigin, ThinkingConfig, ToolNameAliases, UsageLimit, WorkflowEventOrigin,
-    adapt_images_for_model, invalid_tool_input,
+    MAX_TOOL_INPUT_BYTES, MIN_THINKING_BUDGET, Message, MessageKind, PDF_DATA_URL_PREFIX,
+    PDF_MEDIA_TYPE, PEER_AUTOMATION_SENDER, PEER_SCRIPT_SENDER, PEER_SESSION_SENDER,
+    PeerAssignment, PeerAudience, PeerMessageOrigin, ProviderEvent, ProviderUsage, ReasoningOption,
+    ReasoningOptions, ReasoningSource, ReasoningTransport, RequestOptions, ResolvedThinking,
+    ResponsesReasoning, Role, StandingReminderKind, SteeringKind, SteeringOrigin, StopReason,
+    StreamResponse, THINKING_USAGE, TaskEventOrigin, ThinkingConfig, ToolNameAliases, UsageLimit,
+    WorkflowEventOrigin, adapt_attachments_for_model, invalid_tool_input,
 };

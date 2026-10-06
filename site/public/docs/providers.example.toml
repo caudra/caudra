@@ -115,6 +115,12 @@ version = 1
 # Type: bool. Default: false.
 # supports_vision = <bool>
 
+# `anthropic` and `openai-responses` only. The model reads a PDF that
+# `webfetch` attaches inside its tool result. When it is off, `webfetch`
+# returns the text of the PDF instead.
+# Type: bool. Default: false.
+# supports_pdf = <bool>
+
 # `openai-responses` only. The endpoint honours an explicit
 # `prompt_cache_breakpoint`, so the system prompt closes with one.
 # Type: bool. Default: false.
@@ -186,6 +192,12 @@ version = 1
 # The model accepts images. When false, image input and `view_image` are off.
 # Type: bool. Default: false.
 # supports_vision = <bool>
+
+# `anthropic` and `openai-responses` only. The model reads a PDF that
+# `webfetch` attaches inside its tool result. When it is off, `webfetch`
+# returns the text of the PDF instead.
+# Type: bool. Default: false.
+# supports_pdf = <bool>
 
 # `openai-responses` only. The endpoint honours an explicit
 # `prompt_cache_breakpoint`, so the system prompt closes with one.

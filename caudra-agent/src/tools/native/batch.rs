@@ -289,6 +289,7 @@ impl BatchCall {
             .map(|child| child.pending_entry(ctx))
             .collect();
         let mut model_outputs = vec![None; entries.len()];
+        let mut documents = vec![Vec::new(); entries.len()];
         let entries = Arc::new(Mutex::new(entries));
         // Reserve the complete child roster before any child executes, so
         // concurrent completion cannot choose the collector's bounded prefix.
@@ -353,7 +354,7 @@ impl BatchCall {
                         observations.finish(done.is_error);
                     }
                     publish(&entries, index, &ctx, |entry| settle_entry(entry, &done));
-                    (index, done.model_output)
+                    (index, done.model_output, done.documents)
                 });
                 continue;
             }
@@ -407,7 +408,7 @@ impl BatchCall {
                 })
                 .await;
                 publish(&entries, index, &ctx, |entry| settle_entry(entry, &done));
-                (index, done.model_output)
+                (index, done.model_output, done.documents)
             });
         }
         // A panicked child leaves its entry mid-flight, so anything still
@@ -415,7 +416,10 @@ impl BatchCall {
         // on screen or in the answer.
         for result in set.join_all().await {
             match result {
-                Ok((index, output)) => model_outputs[index] = output,
+                Ok((index, output, child_documents)) => {
+                    model_outputs[index] = output;
+                    documents[index] = child_documents;
+                }
                 Err(message) => tracing::error!(%message, "batch child panicked"),
             }
         }
@@ -426,6 +430,7 @@ impl BatchCall {
         ToolExecResult {
             is_error: cancelled,
             failure: cancelled.then_some(ToolFailure::Cancelled),
+            documents: documents.into_iter().flatten().collect(),
             ..ToolExecResult::from(Ok(ToolOutput::Batch { entries, text }))
         }
     }
@@ -650,6 +655,7 @@ mod tests {
     };
     use crate::tools::test_support::{stub_ctx, stub_ctx_with};
     use crate::tools::{LockKey, STALE_READ_MSG};
+    use caudra_providers::DocumentSource;
     use caudra_storage::sessions::PermissionMode;
     use futures_lite::future;
     use serde_json::json;
@@ -670,6 +676,7 @@ mod tests {
     const RAN_TWICE: &str = "an adopted child must not be run a second time";
     const NEVER_STARTED: &str = "the stream must have started the child before the batch runs";
     const MODEL_RECEIPT: &str = "Saved without echoing the displayed document.";
+    const PAGES_KEY: &str = "pages";
 
     struct ReceiptTool(bool);
 
@@ -757,6 +764,97 @@ mod tests {
             assert!(text.contains(MODEL_RECEIPT), "{text}");
             assert!(!text.contains(BODY), "{text}");
             assert_eq!(text.matches(MODEL_SUFFIX).count(), 1, "{text}");
+        });
+    }
+
+    /// Returns a PDF of as many pages as its call asks for.
+    struct DocumentTool(usize);
+
+    impl Tool for DocumentTool {
+        fn name(&self) -> &str {
+            READ
+        }
+
+        fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
+            Cow::Borrowed(READ)
+        }
+
+        fn schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+            let pages = input[PAGES_KEY]
+                .as_u64()
+                .and_then(|pages| usize::try_from(pages).ok())
+                .unwrap_or_default();
+            Ok(Box::new(Self(pages)))
+        }
+    }
+
+    impl ToolInvocation for DocumentTool {
+        fn start_header(&self) -> HeaderFuture {
+            HeaderFuture::Ready(HeaderResult::plain(READ.into()))
+        }
+
+        fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
+            Box::pin(async move {
+                ToolExecResult::from(Ok(ToolOutput::Markdown(BODY.into()))).with_documents(vec![
+                    DocumentSource {
+                        url: PATTERN.into(),
+                        filename: None,
+                        page_count: self.0,
+                        data: Some(Arc::from(BODY)),
+                    },
+                ])
+            })
+        }
+    }
+
+    #[test]
+    fn a_batch_carries_its_childrens_pdfs_in_roster_order() {
+        const ROSTER_PAGES: [usize; 2] = [2, 5];
+        smol::block_on(async {
+            let mut ctx = observed_batch_ctx();
+            ctx.permissions = Arc::new(PermissionManager::new_nonpersistent(
+                Default::default(),
+                ctx.permissions.project_cwd(),
+                Arc::default(),
+            ));
+            ctx.permissions.set_session_mode(Some(PermissionMode::Yolo));
+            ctx.registry
+                .register_audited(
+                    Arc::new(DocumentTool(0)),
+                    ToolSource::Native {
+                        owner: super::super::OWNER.into(),
+                        contract: READ.into(),
+                        trusted: true,
+                    },
+                    ToolEffect::ReadOnly,
+                )
+                .unwrap();
+            let children: Vec<Value> = ROSTER_PAGES
+                .iter()
+                .map(|pages| json!({ "tool": READ, "parameters": { PAGES_KEY: pages } }))
+                .collect();
+
+            let done = tool_dispatch::run(
+                &ctx.registry,
+                None,
+                BATCH_ID.into(),
+                crate::tools::BATCH_TOOL_NAME,
+                &calls(Value::Array(children)),
+                &ctx,
+                Emit::Silent,
+            )
+            .await;
+
+            let pages: Vec<usize> = done
+                .documents
+                .iter()
+                .map(|document| document.page_count)
+                .collect();
+            assert_eq!(pages, ROSTER_PAGES);
         });
     }
 

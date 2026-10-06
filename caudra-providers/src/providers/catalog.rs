@@ -1247,6 +1247,7 @@ mod tests {
             thinking_override: None,
             supports_vision_override: None,
             supports_cache_breakpoints_override: None,
+            supports_pdf: false,
             pricing: ModelPricing::default(),
             discovered_free: false,
             max_output_tokens: None,

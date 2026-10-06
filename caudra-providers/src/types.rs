@@ -9,6 +9,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::iter;
 use std::sync::Arc;
 
 use caudra_storage::id::SessionRef;
@@ -123,6 +124,57 @@ impl ImageSource {
     }
 }
 
+pub const PDF_MEDIA_TYPE: &str = "application/pdf";
+/// How a PDF arrives from a tool and leaves for a Responses API request.
+pub const PDF_DATA_URL_PREFIX: &str = "data:application/pdf;base64,";
+/// What one attached PDF page is taken to cost: Anthropic's upper estimate of
+/// 3,000 tokens for a page of text, plus the image of the page.
+pub const DOCUMENT_TOKENS_PER_PAGE: usize = 4_500;
+/// Base64 PDF one request may carry, below Anthropic's 32 MB request cap.
+const DOCUMENT_REQUEST_BYTES: usize = 24 * 1024 * 1024;
+pub const DOCUMENT_OMITTED_PREFIX: &str = "[PDF not attached to this request: ";
+const DOCUMENT_OMITTED_SUFFIX: &str = ". Fetch it again to read it.]";
+const DOCUMENT_NOTE_SEPARATOR: &str = "\n\n";
+
+/// A PDF a tool returned for the model to read. It travels inside that
+/// tool's result, so the model treats it as tool output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocumentSource {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+    pub page_count: usize,
+    /// The file as base64. Host-only and held for the live session alone, so
+    /// no saved session or checkpoint ever carries it. A document without it
+    /// reaches the model as a note asking for the file to be fetched again.
+    #[serde(skip)]
+    pub data: Option<Arc<str>>,
+}
+
+impl DocumentSource {
+    pub fn data_url(&self) -> Option<String> {
+        let data = self.data.as_deref()?;
+        Some(format!("{PDF_DATA_URL_PREFIX}{data}"))
+    }
+
+    fn omitted_note(&self) -> String {
+        let name = self
+            .filename
+            .as_deref()
+            .map(|name| format!("{name}, "))
+            .unwrap_or_default();
+        let unit = if self.page_count == 1 {
+            "page"
+        } else {
+            "pages"
+        };
+        format!(
+            "{DOCUMENT_OMITTED_PREFIX}{name}{} {unit} from {}{DOCUMENT_OMITTED_SUFFIX}",
+            self.page_count, self.url
+        )
+    }
+}
+
 pub const IMAGE_OMITTED_NOTE: &str =
     "[image omitted: the current model does not support image input]";
 /// See [`Message::empty_marker`].
@@ -135,33 +187,107 @@ pub const EMPTY_RESPONSE_MARKER: &str = "(empty)";
 /// guessed arguments.
 pub const INVALID_TOOL_JSON_KEY: &str = "INVALID_JSON";
 
+/// What the model can read of the attachments history holds. History keeps
+/// the pixels and the bytes, so switching back to a model that reads them
+/// restores them.
+///
 /// For models without vision, image blocks become a text note instead of a
-/// wire block the API would reject. History keeps the pixels, so switching
-/// back to a vision-capable model restores them.
-pub fn adapt_images_for_model<'a>(model: &Model, messages: &'a [Message]) -> Cow<'a, [Message]> {
+/// wire block the API would reject. A PDF stays attached while the model
+/// reads PDFs and the PDF is among the newest that fit its page budget and the
+/// request byte cap. Every other one, including those a restored session no
+/// longer holds the bytes of, becomes a note at the end of its tool result.
+pub fn adapt_attachments_for_model<'a>(
+    model: &Model,
+    messages: &'a [Message],
+) -> Cow<'a, [Message]> {
     let has_image = |m: &Message| {
         m.content
             .iter()
             .any(|b| matches!(b, ContentBlock::Image { .. }))
     };
-    if model.supports_vision() || !messages.iter().any(has_image) {
+    let strip_images = !model.supports_vision() && messages.iter().any(has_image);
+    let kept = kept_documents(model, messages);
+    if !strip_images && !kept.contains(&false) {
         return Cow::Borrowed(messages);
     }
+    let mut kept = kept.into_iter();
     let adapted = messages
         .iter()
         .map(|m| {
             let mut m = m.clone();
-            for block in &mut m.content {
-                if matches!(block, ContentBlock::Image { .. }) {
-                    *block = ContentBlock::Text {
-                        text: IMAGE_OMITTED_NOTE.into(),
-                    };
+            if strip_images {
+                for block in &mut m.content {
+                    if matches!(block, ContentBlock::Image { .. }) {
+                        *block = ContentBlock::Text {
+                            text: IMAGE_OMITTED_NOTE.into(),
+                        };
+                    }
                 }
             }
+            detach_documents(&mut m, &mut kept);
             m
         })
         .collect();
     Cow::Owned(adapted)
+}
+
+/// Per document in history order, whether it stays attached: the newest that
+/// still hold their bytes, for as long as they fit the model's page budget
+/// and the request byte cap.
+fn kept_documents(model: &Model, messages: &[Message]) -> Vec<bool> {
+    let documents: Vec<&DocumentSource> = messages
+        .iter()
+        .flat_map(Message::result_documents)
+        .collect();
+    let mut kept = vec![false; documents.len()];
+    if !model.supports_pdf {
+        return kept;
+    }
+    let (mut pages, mut bytes) = (model.pdf_page_budget(), DOCUMENT_REQUEST_BYTES);
+    for (keep, document) in kept.iter_mut().zip(documents).rev() {
+        let Some(data) = &document.data else {
+            continue;
+        };
+        if document.page_count > pages || data.len() > bytes {
+            break;
+        }
+        pages -= document.page_count;
+        bytes -= data.len();
+        *keep = true;
+    }
+    kept
+}
+
+/// Leaves attached the documents `kept` names, in
+/// [`Message::result_documents`] order, and turns the rest into notes at the
+/// end of their tool results.
+fn detach_documents(message: &mut Message, kept: &mut impl Iterator<Item = bool>) {
+    for block in &mut message.content {
+        let ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            ..
+        } = block
+        else {
+            continue;
+        };
+        let Some(documents) = message.tool_result_documents.get_mut(tool_use_id) else {
+            continue;
+        };
+        documents.retain(|document| {
+            let keep = kept.next().unwrap_or(false);
+            if !keep {
+                if !content.is_empty() {
+                    content.push_str(DOCUMENT_NOTE_SEPARATOR);
+                }
+                content.push_str(&document.omitted_note());
+            }
+            keep
+        });
+    }
+    message
+        .tool_result_documents
+        .retain(|_, documents| !documents.is_empty());
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -486,6 +612,11 @@ pub struct Message {
     /// as `HistoryItemKind::ToolResult::refused_calls` stores them.
     #[serde(skip)]
     pub refused_tool_calls: BTreeMap<String, Vec<usize>>,
+    /// Host-only: per tool-result call ID, the PDFs that travel inside that
+    /// result. Kept beside the content rather than in it, so no serializer
+    /// derived from `ContentBlock` can send one or drop its bytes.
+    #[serde(skip)]
+    pub tool_result_documents: BTreeMap<String, Vec<DocumentSource>>,
     /// Session-owned artifacts retained by a compacted summary. Host-only:
     /// provider payloads must see retrieval IDs only when summary text cites them.
     #[serde(skip)]
@@ -713,6 +844,25 @@ impl Message {
         self.content
             .iter()
             .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
+    }
+
+    /// The documents of each tool result, in content order. One filed under a
+    /// call with no result in this message is never sent.
+    pub fn result_documents(&self) -> impl Iterator<Item = &DocumentSource> {
+        self.content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { tool_use_id, .. } => {
+                    self.tool_result_documents.get(tool_use_id)
+                }
+                _ => None,
+            })
+            .flatten()
+    }
+
+    /// Turns every document into its note, for a request that carries none.
+    pub fn detach_documents(&mut self) {
+        detach_documents(self, &mut iter::repeat(false));
     }
 }
 
@@ -1428,8 +1578,9 @@ mod tests {
     use super::*;
     use crate::model::ThinkingSupport as Support;
     use crate::providers::test_support::{
-        PEER_ATTACK, PEER_TEXT, assert_peer_framing, assigned_message_origin,
-        automation_message_origin, peer_message_origin, script_message_origin,
+        DOCUMENT_CALL, DOCUMENT_DATA, DOCUMENT_RESULT, PEER_ATTACK, PEER_TEXT, assert_peer_framing,
+        assigned_message_origin, automation_message_origin, document, fetched_document,
+        peer_message_origin, script_message_origin,
     };
     use test_case::test_case;
 
@@ -1751,7 +1902,7 @@ mod tests {
             ..Default::default()
         }];
         assert!(matches!(
-            adapt_images_for_model(&model, &with_image),
+            adapt_attachments_for_model(&model, &with_image),
             Cow::Borrowed(_)
         ));
 
@@ -1759,7 +1910,7 @@ mod tests {
         text_only_model.supports_vision_override = Some(false);
         let no_images = vec![Message::user("hi".into())];
         assert!(matches!(
-            adapt_images_for_model(&text_only_model, &no_images),
+            adapt_attachments_for_model(&text_only_model, &no_images),
             Cow::Borrowed(_)
         ));
     }
@@ -1783,7 +1934,7 @@ mod tests {
             ],
             ..Default::default()
         }];
-        let adapted = adapt_images_for_model(&model, &messages);
+        let adapted = adapt_attachments_for_model(&model, &messages);
         assert_eq!(adapted[0].content.len(), 2);
         assert!(matches!(
             &adapted[0].content[0],
@@ -1792,6 +1943,101 @@ mod tests {
         assert!(
             matches!(&adapted[0].content[1], ContentBlock::Text { text } if text == IMAGE_OMITTED_NOTE)
         );
+    }
+
+    /// Just over half the byte cap, so two such PDFs never share a request.
+    const HALF_THE_BYTE_CAP: usize = DOCUMENT_REQUEST_BYTES / 2 + 1;
+    const BASE64_DIGIT: &str = "A";
+
+    fn tool_result_text(message: &Message) -> &str {
+        match &message.content[0] {
+            ContentBlock::ToolResult { content, .. } => content,
+            block => panic!("expected a tool result, got {block:?}"),
+        }
+    }
+
+    /// A fetch per `(pages, base64 length)`, oldest first. A missing length is
+    /// a PDF a restored session no longer holds.
+    fn fetches(fetches: &[(usize, Option<usize>)]) -> Vec<Message> {
+        fetches
+            .iter()
+            .enumerate()
+            .map(|(call, &(page_count, data_len))| {
+                let call = format!("{DOCUMENT_CALL}-{call}");
+                let document = DocumentSource {
+                    page_count,
+                    data: data_len.map(|len| Arc::from(BASE64_DIGIT.repeat(len))),
+                    ..document(None)
+                };
+                Message {
+                    tool_result_documents: BTreeMap::from([(call.clone(), vec![document])]),
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: call,
+                        content: DOCUMENT_RESULT.into(),
+                        is_error: false,
+                        output_ref: None,
+                    }],
+                    ..Message::default()
+                }
+            })
+            .collect()
+    }
+
+    /// The test model's 200k window budgets 11 pages.
+    #[test_case(&[(5, Some(1)), (4, Some(1)), (2, Some(1))], &[true, true, true] ; "everything_that_fits_stays")]
+    #[test_case(&[(5, Some(1)), (4, Some(1)), (6, Some(1))], &[false, true, true] ; "the_newest_that_fit_the_page_budget")]
+    #[test_case(&[(2, Some(1)), (12, Some(1)), (3, Some(1))], &[false, false, true] ; "an_oversized_pdf_stops_older_ones")]
+    #[test_case(&[(1, Some(1)), (1, None)], &[true, false] ; "a_pdf_without_bytes_is_noted_and_passed_over")]
+    #[test_case(&[(1, Some(HALF_THE_BYTE_CAP)), (1, Some(HALF_THE_BYTE_CAP))], &[false, true] ; "the_request_byte_cap")]
+    fn pdfs_attach_newest_first_within_both_budgets(
+        history: &[(usize, Option<usize>)],
+        attached: &[bool],
+    ) {
+        let mut model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
+        model.supports_pdf = true;
+        let messages = fetches(history);
+        let adapted = adapt_attachments_for_model(&model, &messages);
+        assert_eq!(
+            matches!(adapted, Cow::Borrowed(_)),
+            attached.iter().all(|attached| *attached)
+        );
+        for ((message, original), attached) in adapted.iter().zip(&messages).zip(attached) {
+            assert_eq!(!message.tool_result_documents.is_empty(), *attached);
+            let expected = if *attached {
+                DOCUMENT_RESULT.to_owned()
+            } else {
+                let document = original.result_documents().next().unwrap();
+                format!(
+                    "{DOCUMENT_RESULT}{DOCUMENT_NOTE_SEPARATOR}{}",
+                    document.omitted_note()
+                )
+            };
+            assert_eq!(tool_result_text(message), expected);
+        }
+    }
+
+    #[test]
+    fn a_model_without_pdf_input_reads_each_pdf_as_a_note() {
+        let model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
+        let held = document(Some(DOCUMENT_DATA));
+        let messages = [fetched_document(held.clone())];
+        let adapted = adapt_attachments_for_model(&model, &messages);
+        assert!(adapted[0].tool_result_documents.is_empty());
+        assert_eq!(
+            tool_result_text(&adapted[0]),
+            format!(
+                "{DOCUMENT_RESULT}{DOCUMENT_NOTE_SEPARATOR}{}",
+                held.omitted_note()
+            )
+        );
+        assert!(held.omitted_note().starts_with(DOCUMENT_OMITTED_PREFIX));
+    }
+
+    #[test]
+    fn document_bytes_never_reach_saved_json() {
+        let message = fetched_document(document(Some(DOCUMENT_DATA)));
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(!json.contains(DOCUMENT_DATA));
     }
 
     #[test]
@@ -2180,6 +2426,7 @@ mod tests {
             thinking_override: None,
             supports_vision_override: Some(provider.family().supports_vision()),
             supports_cache_breakpoints_override: None,
+            supports_pdf: false,
             pricing: crate::model::ModelPricing::default(),
             discovered_free: false,
             max_output_tokens: Some(8192),

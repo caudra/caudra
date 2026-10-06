@@ -618,7 +618,7 @@ async fn stream_with_retry_inner(
     speculative: Option<&Arc<SpeculativeRuns>>,
 ) -> Result<StreamResponse, StreamError> {
     let opts = opts.clamped(model);
-    let messages = caudra_providers::adapt_images_for_model(model, messages);
+    let messages = caudra_providers::adapt_attachments_for_model(model, messages);
     let messages = &*messages;
     let mut retry = RetryState::new();
     // `started` restarts per attempt, so total time across a retry storm needs

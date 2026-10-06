@@ -1,13 +1,14 @@
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::fmt::Write;
+use std::mem;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use caudra_providers::{
-    AgentError, AutomationEventOrigin, Billing, ContentBlock, Message, PEER_SCRIPT_SENDER,
+    AgentError, AutomationEventOrigin, Billing, ContentBlock, DocumentSource, Message, PEER_SCRIPT_SENDER,
     PEER_SESSION_SENDER, PeerMessageOrigin, Role, StopReason, TaskEventOrigin, TokenUsage,
     estimate_tokens_cached, token_label,
 };
@@ -2204,6 +2205,10 @@ pub struct ToolDoneEvent {
     pub model_output: Option<String>,
     #[serde(skip)]
     pub model_output_from_ref: bool,
+    /// PDFs the model reads inside this result. Host-only like the model
+    /// text, so no transcript or protocol carries them.
+    #[serde(skip)]
+    pub documents: Vec<DocumentSource>,
     /// What the call cost in wall clock, how it ended, where the tool came
     /// from, and how much of the context window its result took. Filled once,
     /// after bounding, so telemetry and the durable ledger cannot disagree.
@@ -2242,6 +2247,7 @@ impl ToolDoneEvent {
             model_suffix: None,
             model_output: None,
             model_output_from_ref: false,
+            documents: Vec::new(),
             accounting: ToolAccounting::default(),
         }
     }
@@ -2365,10 +2371,14 @@ pub fn tool_results(results: Vec<ToolDoneEvent>) -> Message {
     let mut images = Vec::new();
     let mut tool_result_image_owners = Vec::new();
     let mut refused_tool_calls = BTreeMap::new();
+    let mut tool_result_documents = BTreeMap::new();
     for mut r in results {
         let refused = r.refused_calls();
         if !refused.is_empty() {
             refused_tool_calls.insert(r.id.clone(), refused);
+        }
+        if !r.documents.is_empty() {
+            tool_result_documents.insert(r.id.clone(), mem::take(&mut r.documents));
         }
         let mut result_content = r.model_output.take().unwrap_or_else(|| r.output.as_text());
         append_model_suffix(&mut result_content, r.model_suffix());
@@ -2393,6 +2403,7 @@ pub fn tool_results(results: Vec<ToolDoneEvent>) -> Message {
         content,
         tool_result_image_owners,
         refused_tool_calls,
+        tool_result_documents,
         ..Default::default()
     }
 }
@@ -4459,6 +4470,7 @@ mod tests {
                 model_suffix: None,
                 model_output: None,
                 model_output_from_ref: false,
+                documents: Vec::new(),
                 accounting: ToolAccounting::default(),
             },
             ToolDoneEvent {
@@ -4475,6 +4487,7 @@ mod tests {
                 model_suffix: None,
                 model_output: None,
                 model_output_from_ref: false,
+                documents: Vec::new(),
                 accounting: ToolAccounting::default(),
             },
         ]);
@@ -4505,6 +4518,7 @@ mod tests {
                 model_suffix: None,
                 model_output: None,
                 model_output_from_ref: false,
+                documents: Vec::new(),
                 accounting: ToolAccounting::default(),
             }
             .with_model_suffix(Some(suffix.into()))
@@ -4566,6 +4580,7 @@ mod tests {
             model_suffix: Some("model context".into()),
             model_output: Some("bounded preview".into()),
             model_output_from_ref: false,
+            documents: Vec::new(),
             accounting: ToolAccounting::default(),
         };
 
@@ -4606,6 +4621,7 @@ mod tests {
             model_suffix: None,
             model_output: None,
             model_output_from_ref: false,
+            documents: Vec::new(),
             accounting: ToolAccounting::default(),
         }
         .with_model_suffix(Some(MODEL_SUFFIX.into()));
@@ -4619,6 +4635,33 @@ mod tests {
         assert!(!json.contains("model_suffix"));
         assert!(!json.contains("model_output"));
         assert!(!json.contains(MODEL_SUFFIX));
+    }
+
+    #[test]
+    fn tool_results_keep_each_pdf_beside_its_result_and_never_serialize_it() {
+        const FETCH_CALL: &str = "fetch";
+        const FAILED_CALL: &str = "failed";
+        const PDF_DATA: &str = "JVBERi0xLjc=";
+        let document = DocumentSource {
+            url: "https://example.com/paper.pdf".into(),
+            filename: None,
+            page_count: 3,
+            data: Some(Arc::from(PDF_DATA)),
+        };
+        let mut fetched = ToolDoneEvent::error(FETCH_CALL.into(), "fetched");
+        fetched.is_error = false;
+        fetched.documents = vec![document.clone()];
+        assert!(!serde_json::to_string(&fetched).unwrap().contains(PDF_DATA));
+
+        let message = tool_results(vec![
+            fetched,
+            ToolDoneEvent::error(FAILED_CALL.into(), "failed"),
+        ]);
+
+        assert_eq!(
+            message.tool_result_documents,
+            BTreeMap::from([(FETCH_CALL.to_owned(), vec![document])])
+        );
     }
 
     #[test]
@@ -4644,6 +4687,7 @@ mod tests {
             model_suffix: None,
             model_output: None,
             model_output_from_ref: false,
+            documents: Vec::new(),
             accounting: ToolAccounting::default(),
         };
 
@@ -4800,6 +4844,7 @@ mod tests {
             model_suffix: None,
             model_output: None,
             model_output_from_ref: false,
+            documents: Vec::new(),
             accounting: ToolAccounting::default(),
         };
         assert!(ok_event.wrote_to(Path::new("/plans/slug.md")));
@@ -4895,6 +4940,7 @@ mod tests {
             model_suffix: None,
             model_output: None,
             model_output_from_ref: false,
+            documents: Vec::new(),
             accounting: ToolAccounting::default(),
         };
 
@@ -4929,6 +4975,7 @@ mod tests {
             model_suffix: None,
             model_output: None,
             model_output_from_ref: false,
+            documents: Vec::new(),
             accounting: ToolAccounting::default(),
         };
         assert_eq!(event.written_path(), Some(plan));
@@ -5175,6 +5222,7 @@ mod tests {
             model_suffix: None,
             model_output: None,
             model_output_from_ref: false,
+            documents: Vec::new(),
             accounting: ToolAccounting::default(),
         };
         assert_eq!(event.written_path(), expected);

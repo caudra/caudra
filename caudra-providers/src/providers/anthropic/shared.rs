@@ -14,11 +14,12 @@ use crate::model::{
     StaticReasoningOption,
 };
 use crate::{
-    AgentError, ContentBlock, EMPTY_RESPONSE_MARKER, InvalidToolInput, Message, ProviderEvent,
-    Role, StopReason, StreamResponse, ThinkingConfig, TokenUsage,
+    AgentError, ContentBlock, DocumentSource, EMPTY_RESPONSE_MARKER, InvalidToolInput, Message,
+    PDF_MEDIA_TYPE, ProviderEvent, Role, StopReason, StreamResponse, ThinkingConfig, TokenUsage,
 };
 
 pub(super) const BETA_TOOL_EXAMPLES_BEDROCK: &str = "tool-examples-2025-10-29";
+const BASE64_SOURCE: &str = "base64";
 
 /// Tool names that are also ordinary English words. Prose rewriting only
 /// touches these when they are fenced in backticks or bold, so "a shell command
@@ -234,7 +235,23 @@ pub(super) struct WireContentBlock<'a> {
     pub cache_control: Option<CacheControl>,
 }
 
-pub(super) struct WireContent<'a>(&'a ContentBlock);
+pub(super) struct WireContent<'a> {
+    block: &'a ContentBlock,
+    documents: &'a [DocumentSource],
+}
+
+impl<'a> WireContent<'a> {
+    fn of(block: &'a ContentBlock, message: &'a Message) -> Self {
+        let documents = match block {
+            ContentBlock::ToolResult { tool_use_id, .. } => message
+                .tool_result_documents
+                .get(tool_use_id)
+                .map_or(&[][..], Vec::as_slice),
+            _ => &[],
+        };
+        Self { block, documents }
+    }
+}
 
 impl Serialize for WireContent<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -242,12 +259,12 @@ impl Serialize for WireContent<'_> {
         struct ToolResult<'a> {
             r#type: &'static str,
             tool_use_id: &'a str,
-            content: &'a str,
+            content: ToolResultContent<'a>,
             #[serde(skip_serializing_if = "std::ops::Not::not")]
             is_error: bool,
         }
 
-        match self.0 {
+        match self.block {
             ContentBlock::ToolResult {
                 tool_use_id,
                 content,
@@ -256,13 +273,65 @@ impl Serialize for WireContent<'_> {
             } => ToolResult {
                 r#type: "tool_result",
                 tool_use_id,
-                content,
+                content: ToolResultContent::new(content, self.documents),
                 is_error: *is_error,
             }
             .serialize(serializer),
             block => block.serialize(serializer),
         }
     }
+}
+
+/// A result carrying documents becomes blocks with its text first. One
+/// without stays the plain string every Anthropic-protocol endpoint takes.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum ToolResultContent<'a> {
+    Text(&'a str),
+    Blocks(Vec<ToolResultBlock<'a>>),
+}
+
+impl<'a> ToolResultContent<'a> {
+    fn new(text: &'a str, documents: &'a [DocumentSource]) -> Self {
+        let attached: Vec<_> = documents
+            .iter()
+            .filter_map(|document| {
+                Some(ToolResultBlock::Document {
+                    source: Base64Source {
+                        r#type: BASE64_SOURCE,
+                        media_type: PDF_MEDIA_TYPE,
+                        data: document.data.as_deref()?,
+                    },
+                    title: document.filename.as_deref(),
+                })
+            })
+            .collect();
+        if attached.is_empty() {
+            return Self::Text(text);
+        }
+        let text = (!text.trim().is_empty()).then_some(ToolResultBlock::Text { text });
+        Self::Blocks(text.into_iter().chain(attached).collect())
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ToolResultBlock<'a> {
+    Text {
+        text: &'a str,
+    },
+    Document {
+        source: Base64Source<'a>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        title: Option<&'a str>,
+    },
+}
+
+#[derive(Serialize)]
+struct Base64Source<'a> {
+    r#type: &'static str,
+    media_type: &'static str,
+    data: &'a str,
 }
 
 #[derive(Serialize)]
@@ -278,15 +347,18 @@ fn wire_content(msg: &Message) -> Vec<WireContentBlock<'_>> {
         .content
         .iter()
         .filter(|block| !matches!(block, ContentBlock::Text { text } if text.trim().is_empty()))
-        .map(|inner| WireContentBlock {
-            inner: WireContent(inner),
+        .map(|block| WireContentBlock {
+            inner: WireContent::of(block, msg),
             cache_control: None,
         })
         .collect();
 
     if content.is_empty() {
         content.push(WireContentBlock {
-            inner: WireContent(&EMPTY_CONTENT),
+            inner: WireContent {
+                block: &EMPTY_CONTENT,
+                documents: &[],
+            },
             cache_control: None,
         });
     }
@@ -306,7 +378,7 @@ pub(super) fn build_wire_messages(messages: &[Message]) -> Vec<WireMessage<'_>> 
             // the last block that can carry it. All thinking means no breakpoint,
             // which beats a fatal one.
             if msg_idx + MESSAGE_CACHE_BREAKPOINTS >= len
-                && let Some(block) = content.iter_mut().rfind(|b| !b.inner.0.is_thinking())
+                && let Some(block) = content.iter_mut().rfind(|b| !b.inner.block.is_thinking())
             {
                 block.cache_control = Some(EPHEMERAL);
             }
@@ -1150,12 +1222,13 @@ mod tests {
     use super::EventParser;
     use crate::model::ModelPricing;
     use crate::providers::test_support::{
-        PEER_ATTACK, PEER_TEXT, assert_peer_framing, automation_event_origin, peer_message_origin,
+        DOCUMENT_DATA, DOCUMENT_NAME, DOCUMENT_RESULT, PEER_ATTACK, PEER_TEXT, assert_peer_framing,
+        automation_event_origin, document, fetched_document, peer_message_origin,
         task_event_origin, task_observation_with_output_refs, workflow_event_origin,
     };
     use crate::{
-        ContentBlock, Message, Model, ProviderEvent, StandingReminderKind, SteeringKind,
-        ThinkingConfig, TokenUsage, invalid_tool_input,
+        ContentBlock, Message, Model, PDF_MEDIA_TYPE, ProviderEvent, StandingReminderKind,
+        SteeringKind, ThinkingConfig, TokenUsage, invalid_tool_input,
     };
 
     const STEERING_TEXT: &str = "Continue with a useful response.";
@@ -1344,6 +1417,17 @@ mod tests {
             wire,
             json!([{"role": "user", "content": [{"type": "text", "text": framed, "cache_control": {"type": "ephemeral"}}]}])
         );
+    }
+
+    #[test_case(Some(DOCUMENT_DATA), json!([
+        {"type": "text", "text": DOCUMENT_RESULT},
+        {"type": "document", "source": {"type": "base64", "media_type": PDF_MEDIA_TYPE, "data": DOCUMENT_DATA}, "title": DOCUMENT_NAME},
+    ]) ; "a_held_pdf_follows_the_text")]
+    #[test_case(None, json!(DOCUMENT_RESULT) ; "a_pdf_without_bytes_leaves_plain_text")]
+    fn a_pdf_travels_inside_its_tool_result(data: Option<&str>, expected: Value) {
+        let messages = [fetched_document(document(data))];
+        let wire = serde_json::to_value(super::build_wire_messages(&messages)).unwrap();
+        assert_eq!(wire[0]["content"][0]["content"], expected);
     }
 
     #[test_case("anthropic/claude-sonnet-5", &["low", "medium", "high", "xhigh", "max"] ; "sonnet_5_has_no_minimal")]

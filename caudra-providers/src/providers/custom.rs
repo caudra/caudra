@@ -199,6 +199,11 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
     );
     let supports_vision_override = declared.supports_vision;
     let supports_cache_breakpoints_override = declared.supports_cache_breakpoints;
+    let encodes_documents = matches!(
+        resolve_protocol(slug, Some(def)),
+        Some(Protocol::Anthropic | Protocol::OpenaiResponses)
+    );
+    let supports_pdf = encodes_documents && declared.supports_pdf == Some(true);
     let pricing = Some(&declared)
         .filter(|m| m.has_pricing())
         .map(|m| ModelPricing {
@@ -227,6 +232,7 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
         thinking_override,
         supports_vision_override,
         supports_cache_breakpoints_override,
+        supports_pdf,
         pricing,
         discovered_free: false,
         max_output_tokens,
@@ -595,6 +601,30 @@ mod tests {
 
         assert!(model.supports_vision());
         assert!(model.supports_tool_examples());
+    }
+
+    /// An endpoint may speak a protocol and still refuse a PDF, so only a
+    /// declaration attaches one, and only where Caudra can encode it.
+    #[test_case::test_case("anthropic", Some(true), true ; "anthropic_declared")]
+    #[test_case::test_case("openai-responses", Some(true), true ; "responses_declared")]
+    #[test_case::test_case("anthropic", None, false ; "anthropic_undeclared")]
+    #[test_case::test_case("openai", Some(true), false ; "chat_completions_has_no_encoder")]
+    #[test_case::test_case("google", Some(true), false ; "google_has_no_encoder")]
+    fn a_custom_model_reads_pdfs_only_when_declared_where_they_encode(
+        protocol: &str,
+        declared: Option<bool>,
+        expected: bool,
+    ) {
+        let declared =
+            declared.map_or_else(String::new, |value| format!(r#","supports_pdf":{value}"#));
+        let def: ProviderDef = serde_json::from_str(&format!(
+            r#"{{"protocol":"{protocol}","models":[{{"id":"m"{declared}}}]}}"#
+        ))
+        .unwrap();
+
+        let model = model_from_def(&def, ProviderKind::OpenAi, "declared-pdf-test", "m");
+
+        assert_eq!(model.supports_pdf, expected);
     }
 
     // `opencode` is a builtin whose slug is absent from the `builtin_provider`

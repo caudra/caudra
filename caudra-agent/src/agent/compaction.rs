@@ -143,6 +143,9 @@ pub(super) async fn compact_history(
     let mut compaction_history =
         repair_tool_pairs(Cow::Borrowed(&history.as_slice()[..head_end])).into_owned();
     strip_images(&mut compaction_history);
+    compaction_history
+        .iter_mut()
+        .for_each(Message::detach_documents);
     strip_thinking(&mut compaction_history);
     strip_old_tool_results(&mut compaction_history);
     compaction_history.push(Message::user(summary_prompt(&compaction_history, config)));

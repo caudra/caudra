@@ -979,6 +979,7 @@ mod tests {
             output_ref: None,
             images: Vec::new(),
             refused_calls: Vec::new(),
+            documents: Vec::new(),
         };
         let history = [call, result, task_call(CONTINUATION, "task", Some(task_id))];
         assert_eq!(

@@ -15,6 +15,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use bitflags::bitflags;
 use caudra_config::{ProfileToolExposure, ProfileToolPolicy, ProfileToolSource};
+use caudra_providers::DocumentSource;
 use caudra_storage::local_documents::LocalDocumentError;
 use caudra_storage::tool_ledger::ToolOutcome;
 use caudra_storage::tool_outputs::ToolOutputRef;
@@ -356,6 +357,7 @@ pub struct ToolExecResult {
     pub output_limits: Option<ToolOutputLimits>,
     pub output_ref: Option<ToolOutputRef>,
     pub model_output_from_ref: bool,
+    pub documents: Vec<DocumentSource>,
 }
 
 impl From<Result<ToolOutput, String>> for ToolExecResult {
@@ -374,6 +376,7 @@ impl From<Result<ToolOutput, String>> for ToolExecResult {
             output_limits: None,
             output_ref: None,
             model_output_from_ref: false,
+            documents: Vec::new(),
         }
     }
 }
@@ -401,6 +404,11 @@ impl ToolExecResult {
 
     pub fn with_model_output(mut self, model_output: Option<String>) -> Self {
         self.model_output = model_output;
+        self
+    }
+
+    pub fn with_documents(mut self, documents: Vec<DocumentSource>) -> Self {
+        self.documents = documents;
         self
     }
 

@@ -6,7 +6,9 @@ use std::borrow::Cow;
 use std::fmt::Display;
 use std::mem;
 
-use caudra_providers::{ContentBlock, Message, MessageKind, Role, SteeringKind};
+use caudra_providers::{
+    ContentBlock, DocumentSource, Message, MessageKind, PDF_MEDIA_TYPE, Role, SteeringKind,
+};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
@@ -45,6 +47,8 @@ const REDACTED_LABEL: &str = "redacted thinking";
 const TOOL_USE_LABEL: &str = "tool_use";
 const TOOL_RESULT_LABEL: &str = "tool_result";
 const IMAGE_LABEL: &str = "image";
+const DOCUMENT_LABEL: &str = "document";
+const PAGE_NOUN: &str = "page";
 pub(super) const BASE64_PAD: char = '=';
 const BASE64_DIGIT_BITS: u64 = 6;
 const BYTE_BITS: u64 = 8;
@@ -165,7 +169,33 @@ impl<'a> Document<'a> {
         self.section(tagged(header, host_tags(message), theme.tool_dim), style);
         for block in &message.content {
             self.block(block);
+            if let ContentBlock::ToolResult { tool_use_id, .. } = block {
+                for document in message
+                    .tool_result_documents
+                    .get(tool_use_id)
+                    .into_iter()
+                    .flatten()
+                {
+                    self.document(document);
+                }
+            }
         }
+    }
+
+    /// A PDF the request carries inside the tool result above it.
+    fn document(&mut self, document: &DocumentSource) {
+        let theme = self.theme;
+        let details = [
+            Some(PDF_MEDIA_TYPE.to_owned()),
+            document.filename.clone(),
+            Some(counted(document.page_count, PAGE_NOUN)),
+            document
+                .data
+                .as_deref()
+                .map(|data| format_bytes(decoded_len(data))),
+        ];
+        let label = Span::styled(DOCUMENT_LABEL, theme.accent);
+        self.push(tagged(label, details.into_iter().flatten(), theme.tool_dim));
     }
 
     fn block(&mut self, block: &ContentBlock) {
@@ -431,12 +461,19 @@ mod tests {
     /// Three bytes of base64.
     const IMAGE_DATA: &str = "QUJD";
     const IMAGE_BYTES: u64 = 3;
+    const PDF_URL: &str = "https://example.com/paper.pdf";
+    const PDF_NAME: &str = "paper.pdf";
+    /// `%PDF-1.7`, eight bytes of base64.
+    const PDF_DATA: &str = "JVBERi0xLjc=";
+    const PDF_BYTES: u64 = 8;
+    const PDF_PAGES: usize = 3;
     const INDENT: &str = "    ";
     const INDENTED_TEXT: &str = "    alpha bravo charlie delta echo foxtrot golf hotel";
     const RUNNING_CALLS: usize = 2;
     const TAG_MISSING: &str = "a message header must carry the tags the host knows it by";
     const LABEL_MISSING: &str = "every block must open on the label naming it";
     const PIXELS_SHOWN: &str = "an image is a placeholder, never its pixels";
+    const PDF_BYTES_SHOWN: &str = "a PDF is named by its size, never shown as its bytes";
     const NOT_VERBATIM: &str = "thinking must be shown as written, coloured as markdown source";
     const NOT_PLAIN: &str = "a tool result is data and must not be read as markdown";
     const NOT_COLOURED: &str = "a tool input must be coloured as JSON";
@@ -588,6 +625,39 @@ mod tests {
         assert!(
             !rows.iter().any(|row| row.contains(IMAGE_DATA)),
             "{PIXELS_SHOWN}"
+        );
+    }
+
+    #[test]
+    fn an_attached_pdf_is_shown_under_its_result_by_its_size() {
+        let mut message = tool_result(TEXT, false);
+        message.tool_result_documents.insert(
+            CALL_ID.into(),
+            vec![DocumentSource {
+                url: PDF_URL.into(),
+                filename: Some(PDF_NAME.into()),
+                page_count: PDF_PAGES,
+                data: Some(PDF_DATA.into()),
+            }],
+        );
+        let rows = rows(vec![message]);
+        let result = [TOOL_RESULT_LABEL, CALL_ID].join(SEPARATOR);
+        let result = rows.iter().position(|row| *row == result).unwrap();
+
+        assert_eq!(
+            rows[result + 2],
+            [
+                DOCUMENT_LABEL,
+                PDF_MEDIA_TYPE,
+                PDF_NAME,
+                &counted(PDF_PAGES, PAGE_NOUN),
+                &format_bytes(PDF_BYTES),
+            ]
+            .join(SEPARATOR)
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains(PDF_DATA)),
+            "{PDF_BYTES_SHOWN}"
         );
     }
 

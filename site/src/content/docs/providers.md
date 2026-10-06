@@ -460,6 +460,7 @@ Each `[[SLUG.models]]` entry declares one model:
 | `supports_thinking` | bool | discovered, or the protocol default | The model accepts extended thinking |
 | `requires_thinking` | bool | false | For an API that rejects requests with thinking off. It implies `supports_thinking` and raises thinking to minimal effort when it is off, compaction included |
 | `supports_vision` | bool | false | The model accepts images. When false, image input and `view_image` are off |
+| `supports_pdf` | bool | false | `anthropic` and `openai-responses` only. The model reads a PDF that `webfetch` attaches inside its tool result. When it is off, `webfetch` returns the text of the PDF instead |
 | `supports_cache_breakpoints` | bool | false | `openai-responses` only. The endpoint honours an explicit `prompt_cache_breakpoint`, so the system prompt closes with one |
 | `reasoning_options` | table[] | unset | The reasoning controls the model takes, such as `[{ type = "effort", values = ["low", "high"] }]`. A `type` is `toggle`, `effort` with `values`, or `budget_tokens` with an optional `min` and `max`. `[]` declares that it takes none, so Caudra sends no reasoning level |
 | `pricing_input` | float | 0 | USD per million input tokens |

@@ -573,6 +573,7 @@ mod tests {
             output_ref: None,
             images: Vec::new(),
             refused_calls: Vec::new(),
+            documents: Vec::new(),
         })
     }
 

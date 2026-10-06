@@ -1142,7 +1142,13 @@ impl Provider for Anthropic {
     }
 
     fn adjust_model(&self, model: &mut Model) {
-        model.billing = Billing::from_oauth(self.is_oauth());
+        let mode = self.auth_snapshot().mode;
+        model.billing = Billing::from_oauth(mode == AuthMode::ClaudeOauth);
+        // A custom endpoint speaks the protocol but may refuse a document,
+        // so there a model reads PDFs only when its config declares it.
+        if mode != AuthMode::Injected {
+            model.supports_pdf = true;
+        }
     }
 
     fn reasoning_transport(&self, _model: &Model) -> crate::ReasoningTransport {
@@ -2061,6 +2067,24 @@ data: {\"type\":\"content_block_stop\"}\n";
             model.pricing.cache_read, baseline.cache_read,
             "{RATES_SURVIVE}"
         );
+    }
+
+    /// Anthropic's own API reads PDFs under either sign-in. An injected
+    /// endpoint only speaks the protocol, so there its config decides.
+    #[test_case(AuthMode::ApiKey, true ; "an_api_key")]
+    #[test_case(AuthMode::ClaudeOauth, true ; "a_subscription")]
+    #[test_case(AuthMode::Injected, false ; "an_injected_endpoint")]
+    fn the_first_party_api_reads_pdfs(mode: AuthMode, expected: bool) {
+        let provider = Anthropic::with_auth(
+            Arc::new(Mutex::new(ResolvedAuth::bearer(CREDENTIAL))),
+            crate::providers::Timeouts::default(),
+        );
+        let mut model = Model::from_spec(LONG_CONTEXT_MODEL).unwrap();
+
+        provider.auth_state.lock().unwrap().mode = mode;
+        provider.adjust_model(&mut model);
+
+        assert_eq!(model.supports_pdf, expected);
     }
 
     #[test]

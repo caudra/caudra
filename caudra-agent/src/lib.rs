@@ -77,7 +77,7 @@ use std::path::{Path, PathBuf};
 use tools::native::plan::PlanTarget;
 
 pub use caudra_providers::AgentError;
-pub use caudra_providers::{ContentBlock, Message};
+pub use caudra_providers::{ContentBlock, DocumentSource, Message, PDF_DATA_URL_PREFIX};
 pub use caudra_providers::{EMPTY_RESPONSE_MARKER, ImageMediaType, ImageSource, ThinkingConfig};
 pub use editable_queue::{
     EditableQueue, EditableQueueReceiver, PromptAdmission, QueueDelivery, QueueItemId,

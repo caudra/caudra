@@ -298,6 +298,8 @@ pub struct ModelFields {
     pub requires_thinking: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_vision: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_pdf: Option<bool>,
     /// The endpoint honours OpenAI's explicit `prompt_cache_breakpoint` on a
     /// Responses input block, so the system prompt closes with one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -376,6 +378,15 @@ impl ModelFields {
             max: None,
             env: None,
             description: "The model accepts images. When false, image input and `view_image` are off",
+        },
+        ConfigField {
+            name: "supports_pdf",
+            ty: "bool",
+            default: ConfigValue::Varies(OFF_UNLESS_DECLARED),
+            min: None,
+            max: None,
+            env: None,
+            description: "`anthropic` and `openai-responses` only. The model reads a PDF that `webfetch` attaches inside its tool result. When it is off, `webfetch` returns the text of the PDF instead",
         },
         ConfigField {
             name: "supports_cache_breakpoints",
@@ -473,6 +484,7 @@ impl ModelFields {
             supports_thinking: self.supports_thinking.or(base.supports_thinking),
             requires_thinking: self.requires_thinking.or(base.requires_thinking),
             supports_vision: self.supports_vision.or(base.supports_vision),
+            supports_pdf: self.supports_pdf.or(base.supports_pdf),
             supports_cache_breakpoints: self
                 .supports_cache_breakpoints
                 .or(base.supports_cache_breakpoints),

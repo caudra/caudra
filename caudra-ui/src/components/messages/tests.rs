@@ -1319,6 +1319,7 @@ fn done(id: &str) -> ToolDoneEvent {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     }
 }
@@ -1370,6 +1371,7 @@ fn shell_done(id: &str, filtered: bool) -> ToolDoneEvent {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     }
 }
@@ -1412,6 +1414,7 @@ fn tool_done_updates_start_status(is_error: bool, expected: ToolStatus) {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     });
 
@@ -1449,6 +1452,7 @@ fn tool_done_sets_annotation(tool: &'static str, output: ToolOutput, expected: O
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     });
     assert_eq!(panel.messages[0].annotation.as_deref(), expected);
@@ -1475,6 +1479,7 @@ fn tool_done_annotation_merge(output: &str, expected: Option<&str>) {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     });
     assert_eq!(panel.messages[0].annotation.as_deref(), expected);
@@ -1510,6 +1515,7 @@ fn tool_done_grep_shows_matches() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     });
     let text = &panel.messages[0].text;
@@ -1551,6 +1557,7 @@ fn a_capped_grep_that_matched_nothing_qualifies_the_absence() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     });
     render(&mut panel, 80, 24);
@@ -1783,6 +1790,7 @@ fn unknown_tool_id_is_noop() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     });
     assert!(panel.messages.is_empty());
@@ -1820,6 +1828,7 @@ fn in_progress_tracking() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     });
     assert_eq!(panel.in_progress_count(), 1);
@@ -1838,6 +1847,7 @@ fn in_progress_tracking() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     });
     assert_eq!(panel.in_progress_count(), 0);
@@ -1913,6 +1923,7 @@ fn events_before_cache_built_render_correctly() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     });
     rebuild(&mut panel);
@@ -1964,6 +1975,7 @@ fn bash_live_output_with_code_input() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     });
     let text = seg_text(&panel, "t1");
@@ -1989,6 +2001,7 @@ fn cancel_in_progress_marks_pending_as_error(cache_built: bool) {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     });
     if cache_built {
@@ -2093,6 +2106,7 @@ fn tick_drains_the_highlight_worker() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     });
     rebuild(&mut panel);
@@ -2145,6 +2159,7 @@ fn tool_done_after_cancel_in_progress_does_not_underflow() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     });
     assert_eq!(panel.in_progress_count(), 0);
@@ -2199,6 +2214,7 @@ fn search_text_grep_result_includes_structured_output() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     });
     rebuild(&mut panel);
@@ -2229,6 +2245,7 @@ fn search_text_diff_output_includes_hunks() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     });
     rebuild(&mut panel);
@@ -2254,6 +2271,7 @@ fn search_text_bash_with_code_input() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     });
     rebuild(&mut panel);
@@ -3336,6 +3354,7 @@ fn compact_instruction_copy_keeps_its_semantic_label() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     });
     panel.push(DisplayMessage::new(
@@ -4237,6 +4256,7 @@ fn search_text_includes_truncated_bash_output() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     });
     rebuild(&mut panel);
@@ -4290,6 +4310,7 @@ fn instruction_segment_has_margin_but_no_own_action_handle() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     });
     rebuild(&mut panel);
@@ -4347,6 +4368,7 @@ fn toggle_instruction_segment_expands_and_collapses() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     });
     rebuild(&mut panel);
@@ -4388,6 +4410,7 @@ fn handle_click_on_done_tool_records_click_row() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     });
     panel.tool_snapshot(
@@ -4481,6 +4504,7 @@ fn tool_done_removes_live_buf_and_snapshots_dirty() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     });
 
@@ -4775,6 +4799,7 @@ fn tool_done_without_live_buf_preserves_existing_snapshot() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     });
 
@@ -4806,6 +4831,7 @@ fn tool_done_clean_live_buf_does_not_snapshot() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     });
 
@@ -4840,6 +4866,7 @@ fn bash_tool_with_snapshot(id: &str) -> MessagesPanel {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     });
     panel.tool_snapshot(
@@ -5610,6 +5637,7 @@ fn resize_reflows_tool_segment_and_keeps_instruction_segment() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     });
     render(&mut panel, 80, 10);
@@ -6195,6 +6223,7 @@ fn theme_switch_repaints_highlighted_code() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     });
     render(&mut panel, 80, 20);
@@ -11763,6 +11792,7 @@ fn copying_a_read_body_omits_the_line_number_gutter() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     });
     let area = Rect::new(0, 0, COPY_WIDTH, COPY_HEIGHT);

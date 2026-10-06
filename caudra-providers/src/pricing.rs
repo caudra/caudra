@@ -291,6 +291,7 @@ mod tests {
             thinking_override: None,
             supports_vision_override: None,
             supports_cache_breakpoints_override: None,
+            supports_pdf: false,
             pricing: ModelPricing {
                 input: input_rate,
                 ..ModelPricing::ZERO

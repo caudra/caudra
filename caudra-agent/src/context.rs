@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 
 use caudra_config::{AgentConfig, CompactionBuffer, ProfileToolPolicy};
 use caudra_providers::{
-    ContentBlock, Message, Model, Role, adapt_images_for_model, estimate_tokens_cached,
+    ContentBlock, Message, Model, Role, adapt_attachments_for_model, estimate_tokens_cached,
 };
 use serde_json::Value;
 
@@ -734,7 +734,7 @@ fn account_request(
 ) -> RequestAccounting {
     let (system_prompt, memory_prompt_tokens) = account_system(system);
     let tools = account_tools(base_tools, full_tools);
-    let adapted_messages = adapt_images_for_model(model, projected_messages);
+    let adapted_messages = adapt_attachments_for_model(model, projected_messages);
     let messages = account_messages(adapted_messages.as_ref());
     RequestAccounting {
         usage: ContextUsage {
@@ -1087,8 +1087,8 @@ mod tests {
     use std::thread;
 
     use caudra_providers::{
-        ImageMediaType, ImageSource, MessageKind, ReasoningSource, ReasoningTransport,
-        ResponsesReasoning, Role,
+        DOCUMENT_TOKENS_PER_PAGE, DocumentSource, ImageMediaType, ImageSource, MessageKind,
+        ReasoningSource, ReasoningTransport, ResponsesReasoning, Role,
     };
     use caudra_storage::id::CaudraId;
     use caudra_storage::tool_outputs::ToolOutputRef;
@@ -1115,6 +1115,10 @@ mod tests {
     const TEST_WINDOW: u32 = 200_000;
     const LONG_METADATA_REPETITIONS: usize = 2_048;
     const LARGE_IMAGE_PAYLOAD_BYTES: usize = 256 * 1_024;
+    const PDF_CALL: &str = "fetch-call";
+    const PDF_URL: &str = "https://example.com/paper.pdf";
+    const PDF_DATA: &str = "JVBERi0xLjc=";
+    const PDF_PAGES: usize = 3;
     const SMALL_CALL_COUNT: usize = 192;
     const LOAD_CALL_ID: &str = "load-call";
     const MISSING_INVENTORY_DIR: &str = "/nonexistent/caudra-context-inventory";
@@ -2048,6 +2052,37 @@ mod tests {
         assert_eq!(
             estimate_context_usage(&model, "", &json!([]), &json!([]), &short).messages,
             estimate_context_usage(&model, "", &json!([]), &json!([]), &large).messages
+        );
+    }
+
+    /// A PDF the request can carry is priced per page. One a restored session
+    /// no longer holds is never sent, so it costs nothing.
+    #[test_case(Some(PDF_DATA), PDF_PAGES * DOCUMENT_TOKENS_PER_PAGE ; "a_held_pdf_costs_its_pages")]
+    #[test_case(None, 0 ; "a_pdf_without_bytes_costs_nothing")]
+    fn a_pdf_is_priced_per_page_while_it_can_be_sent(data: Option<&str>, document_tokens: usize) {
+        let result = Message {
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: PDF_CALL.into(),
+                content: USER_TEXT.into(),
+                is_error: false,
+                output_ref: None,
+            }],
+            ..Message::default()
+        };
+        let mut fetched = result.clone();
+        fetched.tool_result_documents.insert(
+            PDF_CALL.into(),
+            vec![DocumentSource {
+                url: PDF_URL.into(),
+                filename: None,
+                page_count: PDF_PAGES,
+                data: data.map(Arc::from),
+            }],
+        );
+
+        assert_eq!(
+            estimate_message_tokens(&[fetched]),
+            estimate_message_tokens(&[result]) + u32::try_from(document_tokens).unwrap()
         );
     }
 

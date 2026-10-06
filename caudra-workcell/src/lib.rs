@@ -42,6 +42,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
 use std::future::Future;
+use std::mem;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -63,13 +64,14 @@ use caudra_agent::tools::{
     expand_tilde, stale_read_message,
 };
 use caudra_agent::{
-    AgentEvent, CodeGraphRow, CodeGraphSource, EnvironmentCommand, EnvironmentFact, GrepFileEntry,
-    GrepMatchGroup, INDEX_TRUNCATED, IndexDirectoryEntry as AgentIndexDirectoryEntry,
+    AgentEvent, CodeGraphRow, CodeGraphSource, DocumentSource, EnvironmentCommand, EnvironmentFact,
+    GrepFileEntry, GrepMatchGroup, INDEX_TRUNCATED,
+    IndexDirectoryEntry as AgentIndexDirectoryEntry,
     IndexDirectoryEntryKind as AgentIndexDirectoryEntryKind, IndexLine as AgentIndexLine,
     IndexLineSemantic as AgentIndexLineSemantic, IndexOutput as AgentIndexOutput,
-    IndexSourceRange as AgentIndexSourceRange, PatchedFile, SearchCap, SharedBuf,
-    ShellFilterInfo as AgentShellFilterInfo, ShellOutput as AgentShellOutput, SnapshotLine,
-    TextOutput, ToolInput, ToolOutput,
+    IndexSourceRange as AgentIndexSourceRange, PDF_DATA_URL_PREFIX, PatchedFile, SearchCap,
+    SharedBuf, ShellFilterInfo as AgentShellFilterInfo, ShellOutput as AgentShellOutput,
+    SnapshotLine, TextOutput, ToolInput, ToolOutput,
 };
 use caudra_config::ShellNativeRedirect;
 use caudra_storage::StateDir;
@@ -218,6 +220,11 @@ const PROXY_ALL_VARS: &[&str] = &["ALL_PROXY", "all_proxy"];
 const PROXY_HTTP_VARS: &[&str] = &["HTTP_PROXY", "http_proxy"];
 const PROXY_HTTPS_VARS: &[&str] = &["HTTPS_PROXY", "https_proxy"];
 const PROXY_BYPASS_VARS: &[&str] = &["NO_PROXY", "no_proxy"];
+/// Where a remote webfetch result carries an attached PDF, as Workcell
+/// serializes it.
+const PDF_ATTACHMENT_FIELD: &str = "pdfAttachment";
+const PDF_ATTACHMENT_URL_FIELD: &str = "url";
+const REMOTE_PDF_NOT_ATTACHED: &str = "[The PDF from the remote Workcell was not attached to this request. Fetch it again with pdfMode='extract' to read its text.]";
 
 /// The labels an environment result is read by, and the few host answers the
 /// rendering has to recognise rather than repeat.
@@ -1288,7 +1295,8 @@ impl WorkcellInvocation {
                     .host
                     .web
                     .prepare_webfetch(input.clone())
-                    .map_err(webfetch_error)?;
+                    .map_err(webfetch_error)?
+                    .with_pdf_attachment_page_limit(ctx.model.pdf_page_budget());
                 let intent = editor_adapter::web_intent(
                     PermissionResourceKind::Url,
                     prepared.permission_url.clone(),
@@ -2474,15 +2482,10 @@ fn remote_result(
             true,
             model_output.clone(),
         )),
-        ToolKind::Webfetch => {
-            let markdown = structured_content["format"] == "markdown";
-            Ok(text_result(
-                &structured_content,
-                model_output.clone(),
-                markdown,
-                model_output.clone(),
-            ))
-        }
+        ToolKind::Webfetch => Ok(remote_webfetch_result(
+            structured_content,
+            model_output.clone(),
+        )),
         ToolKind::CodeMap
         | ToolKind::CodeContext
         | ToolKind::CodeRefs
@@ -4268,17 +4271,51 @@ fn websearch_result(execution: WebExecution<WebsearchOutput>) -> ToolExecResult 
     )
 }
 
-fn webfetch_result(execution: WebExecution<WebfetchOutput>) -> ToolExecResult {
+fn webfetch_result(mut execution: WebExecution<WebfetchOutput>) -> ToolExecResult {
     let markdown = matches!(
         execution.output.format,
         workcell::web::WebfetchFormat::Markdown
     );
+    let documents = take_document(&mut execution.output).into_iter().collect();
     text_result(
         &execution.output,
         execution.model_text.clone(),
         markdown,
         execution.model_text,
     )
+    .with_documents(documents)
+}
+
+/// Moves an attached PDF out of the output before the card state is built
+/// from it, so the saved card names the file and never holds its bytes.
+fn take_document(output: &mut WebfetchOutput) -> Option<DocumentSource> {
+    let attachment = output.pdf_attachment.as_mut()?;
+    let data_url = mem::replace(&mut attachment.url, output.url.clone());
+    let data = data_url.strip_prefix(PDF_DATA_URL_PREFIX)?;
+    Some(DocumentSource {
+        url: output.url.clone(),
+        filename: attachment.filename.clone(),
+        page_count: output.page_count?,
+        data: Some(Arc::from(data)),
+    })
+}
+
+/// A remote Workcell attaches a PDF outside the host's page budget, and the
+/// file never reaches the model from there. The card keeps where it came
+/// from, and the model is told to ask for the text instead.
+fn remote_webfetch_result(mut output: Value, model_output: String) -> ToolExecResult {
+    let markdown = output["format"] == "markdown";
+    let attached = output
+        .get_mut(PDF_ATTACHMENT_FIELD)
+        .and_then(Value::as_object_mut)
+        .and_then(|attachment| attachment.remove(PDF_ATTACHMENT_URL_FIELD))
+        .is_some();
+    let result = text_result(&output, model_output.clone(), markdown, model_output);
+    if attached {
+        result.with_model_suffix(Some(REMOTE_PDF_NOT_ATTACHED.to_owned()))
+    } else {
+        result
+    }
 }
 
 fn shell_result(execution: ShellExecution) -> ToolExecResult {
@@ -4957,8 +4994,19 @@ mod tests {
     use workcell::shell::{
         DEFAULT_TIMEOUT_MS as SHELL_DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_SECS as SHELL_MAX_TIMEOUT_SECS,
     };
+    use workcell::web::{WebfetchFormat, WebfetchPdfAttachment, WebfetchPdfMode};
 
     const PATCH: &str = "*** Begin Patch\n*** Add File: created.txt\n+hello\n*** End Patch";
+    const PDF_URL: &str = "https://example.com/paper.pdf";
+    const PDF_NAME: &str = "paper.pdf";
+    /// `%PDF-1.7`, as base64.
+    const PDF_DATA: &str = "JVBERi0xLjc=";
+    const PDF_PAGES: usize = 3;
+    const PDF_MODEL_TEXT: &str = "PDF fetched successfully. The PDF has 3 pages and is available as an application/pdf attachment.";
+    const PDF_FETCH_KIND: &str = "webfetch";
+    const PDF_FETCH_STATUS: u16 = 200;
+    const PDF_ATTACHMENT_TYPE: &str = "file";
+    const PDF_ATTACHMENT_MIME: &str = "application/pdf";
     const PREVIEW_FLAG_MSG: &str = "a dry-run argument must fail the call rather than write";
     const EXPECT_MENTION_INLINED: &str = "a mention hands the model the file's contents";
     const EXPECT_SLICE_LEAVES_NO_RECORD: &str =
@@ -5497,6 +5545,81 @@ mod tests {
         );
         assert_eq!(remote.model_output.as_deref(), Some(model_output.as_str()));
         assert!(remote.remote_written_paths);
+    }
+
+    fn fetched_pdf(attached: bool) -> WebfetchOutput {
+        WebfetchOutput {
+            kind: PDF_FETCH_KIND,
+            url: PDF_URL.into(),
+            final_url: Some(PDF_URL.into()),
+            content_type: None,
+            format: WebfetchFormat::Markdown,
+            pdf_mode: Some(WebfetchPdfMode::Attachment),
+            status: PDF_FETCH_STATUS,
+            title: Some(PDF_NAME.into()),
+            output: PDF_MODEL_TEXT.into(),
+            summary_input: None,
+            truncated: false,
+            pdf_attachment: attached.then(|| WebfetchPdfAttachment {
+                attachment_type: PDF_ATTACHMENT_TYPE,
+                mime: PDF_ATTACHMENT_MIME,
+                url: format!("{PDF_DATA_URL_PREFIX}{PDF_DATA}"),
+                filename: Some(PDF_NAME.into()),
+                size_bytes: PDF_DATA.len(),
+            }),
+            page_count: Some(PDF_PAGES),
+            pdf_fallback_reason: None,
+            extraction_method: None,
+            extraction_low_signal: None,
+            icon_url: None,
+            icon_data_url: None,
+        }
+    }
+
+    /// The model reads the PDF beside the result, and the card that is saved
+    /// names it without holding its bytes.
+    #[test]
+    fn a_fetched_pdf_reaches_the_model_and_never_the_saved_card() {
+        let result = webfetch_result(WebExecution {
+            output: fetched_pdf(true),
+            model_text: PDF_MODEL_TEXT.into(),
+        });
+
+        assert_eq!(
+            result.documents,
+            [DocumentSource {
+                url: PDF_URL.into(),
+                filename: Some(PDF_NAME.into()),
+                page_count: PDF_PAGES,
+                data: Some(Arc::from(PDF_DATA)),
+            }]
+        );
+        let card = serde_json::to_string(&result.output.unwrap()).unwrap();
+        assert!(!card.contains(PDF_DATA), "{card}");
+    }
+
+    /// A remote Workcell attaches outside the host's page budget, so its PDF
+    /// is dropped from the card and the model is told to fetch the text.
+    #[test_case(true ; "an_attached_pdf_is_dropped_and_explained")]
+    #[test_case(false ; "a_result_without_one_is_left_alone")]
+    fn a_remote_pdf_never_reaches_the_model_or_the_card(attached: bool) {
+        let remote = remote_result(
+            ToolKind::Webfetch,
+            &Input::Webfetch(serde_json::from_value(json!({ "url": PDF_URL })).unwrap()),
+            RemoteToolResultEnvelope {
+                model_output: PDF_MODEL_TEXT.into(),
+                structured_content: serde_json::to_value(fetched_pdf(attached)).unwrap(),
+                is_error: false,
+            },
+        );
+
+        assert!(remote.documents.is_empty());
+        assert_eq!(
+            remote.model_suffix.as_deref(),
+            attached.then_some(REMOTE_PDF_NOT_ATTACHED)
+        );
+        let card = serde_json::to_string(&remote.output.unwrap()).unwrap();
+        assert!(!card.contains(PDF_DATA), "{card}");
     }
 
     fn environment_fixture(populated: bool) -> ExecutionEnvironmentOutput {

@@ -2822,6 +2822,7 @@ fn fresh_session_uses_local_plan_until_matching_tool_completion() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     }))));
 
@@ -2883,6 +2884,7 @@ fn tool_done_transitions_plan_to_ready(
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     }))));
 
@@ -2924,6 +2926,7 @@ fn tool_done_completes_only_the_matching_remote_plan() {
             model_suffix: None,
             model_output: None,
             model_output_from_ref: false,
+            documents: Vec::new(),
             accounting: ToolAccounting::default(),
         })))
     };
@@ -3801,6 +3804,7 @@ fn tool_lifecycle_events_name_the_session_and_tool() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     }))));
 
@@ -3942,6 +3946,7 @@ fn tool_done_msg(id: &str) -> Msg {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     })))
 }
@@ -5042,6 +5047,7 @@ pub(crate) fn finish_subagent(app: &mut App, id: &str, is_error: bool) {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     }))));
 }
@@ -17584,6 +17590,7 @@ pub(crate) fn plan_app() -> App {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     }))));
     app
@@ -17612,6 +17619,7 @@ fn tool_done_write_opens_plan_form(mode: Mode, expect_form: bool) {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     }))));
     assert_eq!(app.plan_form.is_visible(), expect_form);
@@ -17652,6 +17660,7 @@ fn re_edit_keeps_plan_form_visible() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     }))));
     assert!(matches!(app.state.plan, PlanState::Ready(_)));
@@ -18113,6 +18122,7 @@ fn rewrite_plan(app: &mut App) {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     }))));
 }
@@ -21284,6 +21294,7 @@ fn two_tool_results_checkpointed_separately_both_reach_disk() {
             model_suffix: None,
             model_output: None,
             model_output_from_ref: false,
+            documents: Vec::new(),
             accounting: ToolAccounting::default(),
         }))));
         app.checkpoint();

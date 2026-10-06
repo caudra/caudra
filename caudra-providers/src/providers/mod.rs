@@ -312,10 +312,24 @@ impl KeyPool {
 
 #[cfg(test)]
 pub(crate) mod test_support {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
     use crate::types::{PeerAssignment, PeerAudience, PeerMessageOrigin};
-    use crate::{AutomationEventOrigin, Message, TaskEventOrigin, WorkflowEventOrigin};
+    use crate::{
+        AutomationEventOrigin, ContentBlock, DocumentSource, Message, TaskEventOrigin,
+        WorkflowEventOrigin,
+    };
     use caudra_storage::tool_outputs::ToolOutputRef;
     use serde_json::json;
+
+    pub(crate) const DOCUMENT_CALL: &str = "fetch-paper";
+    pub(crate) const DOCUMENT_RESULT: &str = "PDF fetched successfully. The PDF has 3 pages and is available as an application/pdf attachment.";
+    pub(crate) const DOCUMENT_URL: &str = "https://example.com/paper.pdf";
+    pub(crate) const DOCUMENT_NAME: &str = "paper.pdf";
+    /// `%PDF-1.7`, as base64.
+    pub(crate) const DOCUMENT_DATA: &str = "JVBERi0xLjc=";
+    pub(crate) const DOCUMENT_PAGES: usize = 3;
 
     pub(crate) const CREDENTIAL_IN_URL: &str =
         "credentials travel in headers, never in a URL a dry run shows";
@@ -482,6 +496,29 @@ pub(crate) mod test_support {
             automation: AUTOMATION.into(),
             fire_id: FIRE_ID.into(),
             seq: SEQ,
+        }
+    }
+
+    pub(crate) fn document(data: Option<&str>) -> DocumentSource {
+        DocumentSource {
+            url: DOCUMENT_URL.into(),
+            filename: Some(DOCUMENT_NAME.into()),
+            page_count: DOCUMENT_PAGES,
+            data: data.map(Arc::from),
+        }
+    }
+
+    /// The user turn answering a fetch that returned `document`.
+    pub(crate) fn fetched_document(document: DocumentSource) -> Message {
+        Message {
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: DOCUMENT_CALL.into(),
+                content: DOCUMENT_RESULT.into(),
+                is_error: false,
+                output_ref: None,
+            }],
+            tool_result_documents: BTreeMap::from([(DOCUMENT_CALL.into(), vec![document])]),
+            ..Message::default()
         }
     }
 }

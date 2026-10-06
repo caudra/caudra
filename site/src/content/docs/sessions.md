@@ -196,6 +196,10 @@ Each retained output is capped at 100 MiB. Deleting a session deletes its retain
 
 If a failed deletion or interrupted write leaves output without a session, output-store startup cleanup removes it after a seven-day grace period. Retained outputs belonging to a live session remain untouched.
 
+## Fetched PDFs
+
+A PDF that [`webfetch`](/docs/tools/#webfetch) attaches for a model that reads PDFs stays in memory for the live session only. The saved session keeps its URL, file name, and page count, and never its bytes. A resumed or forked session therefore has no file to send, so the model receives a note with those details in its place and can fetch the PDF again to read it.
+
 ## Size ceiling
 
 Opening a session hydrates all of it at once: the conversation, every rich tool output record, and every subagent transcript. `storage.max_eager_load_mb` caps what Caudra will hydrate that way, at 1024 MB by default. A session above the cap refuses to open and names both ways out of it.

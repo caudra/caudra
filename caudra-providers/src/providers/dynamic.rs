@@ -102,6 +102,7 @@ impl ScriptModel {
             ),
             supports_vision_override: self.supports_vision,
             supports_cache_breakpoints_override: None,
+            supports_pdf: false,
             pricing: self.pricing.clone().unwrap_or_default(),
             discovered_free: false,
             max_output_tokens: Some(self.max_output_tokens),

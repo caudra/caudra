@@ -8,9 +8,9 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::types::{
-    AutomationEventOrigin, ContentBlock, ImageSource, Message, MessageKind, PeerMessageOrigin,
-    ReasoningSource, ResponsesReasoning, Role, StandingReminderKind, SteeringOrigin,
-    TaskEventOrigin, WorkflowEventOrigin,
+    AutomationEventOrigin, ContentBlock, DocumentSource, ImageSource, Message, MessageKind,
+    PeerMessageOrigin, ReasoningSource, ResponsesReasoning, Role, StandingReminderKind,
+    SteeringOrigin, TaskEventOrigin, WorkflowEventOrigin,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -138,6 +138,10 @@ pub enum HistoryItemKind {
         /// carry none, so their absence proves nothing.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         refused_calls: Vec<usize>,
+        /// PDFs inside the result. Storage keeps what names them and never
+        /// their bytes, see [`DocumentSource::data`].
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        documents: Vec<DocumentSource>,
     },
 }
 
@@ -591,6 +595,11 @@ fn expand_user_message(message: &Message) -> Vec<HistoryItemKind> {
                         .get(tool_use_id)
                         .cloned()
                         .unwrap_or_default(),
+                    documents: message
+                        .tool_result_documents
+                        .get(tool_use_id)
+                        .cloned()
+                        .unwrap_or_default(),
                 });
                 last_tool_result = Some(kinds.len() - 1);
                 result_indexes.push((tool_use_id.clone(), kinds.len() - 1));
@@ -763,6 +772,7 @@ fn assistant_kind(
             output_ref: output_ref.clone(),
             images: Vec::new(),
             refused_calls: Vec::new(),
+            documents: Vec::new(),
         },
         ContentBlock::Image { source } => HistoryItemKind::User {
             text: String::new(),
@@ -1051,6 +1061,7 @@ fn project_group(items: &[HistoryItem]) -> Message {
                 output_ref,
                 images,
                 refused_calls,
+                documents,
             } => {
                 message.content.push(ContentBlock::ToolResult {
                     tool_use_id: call_id.clone(),
@@ -1058,6 +1069,11 @@ fn project_group(items: &[HistoryItem]) -> Message {
                     is_error: *is_error,
                     output_ref: output_ref.clone(),
                 });
+                if !documents.is_empty() {
+                    message
+                        .tool_result_documents
+                        .insert(call_id.clone(), documents.clone());
+                }
                 result_image_index = message.content.len();
                 result_images.extend(images.iter().cloned());
                 message
@@ -1096,9 +1112,10 @@ mod tests {
     use super::*;
     use crate::EMPTY_RESPONSE_MARKER;
     use crate::providers::test_support::{
-        LEGACY_OUTPUT_ID, PEER_ATTACK, PEER_TEXT, READABLE_OUTPUT_ID, TASK_ID, assert_peer_framing,
-        automation_event_origin, peer_message_origin, task_event_origin,
-        task_observation_with_output_refs, workflow_event_origin,
+        DOCUMENT_CALL, DOCUMENT_DATA, LEGACY_OUTPUT_ID, PEER_ATTACK, PEER_TEXT, READABLE_OUTPUT_ID,
+        TASK_ID, assert_peer_framing, automation_event_origin, document, fetched_document,
+        peer_message_origin, task_event_origin, task_observation_with_output_refs,
+        workflow_event_origin,
     };
     use crate::types::{ImageMediaType, SteeringKind};
     use test_case::test_case;
@@ -2472,6 +2489,7 @@ mod tests {
                 output_ref: None,
                 images: vec![image("first")],
                 refused_calls: Vec::new(),
+                documents: Vec::new(),
             },
             result_group,
             Some(second_call.id),
@@ -2484,6 +2502,7 @@ mod tests {
                 output_ref: None,
                 images: vec![image("second")],
                 refused_calls: Vec::new(),
+                documents: Vec::new(),
             },
             result_group,
             Some(first_result.id),
@@ -2557,6 +2576,7 @@ mod tests {
                 output_ref: None,
                 images: Vec::new(),
                 refused_calls: refused.to_vec(),
+                documents: Vec::new(),
             },
             CaudraId::generate(),
             Some(call.id),
@@ -2579,6 +2599,39 @@ mod tests {
             &expand_message(&messages[1], None)[0].kind,
             HistoryItemKind::ToolResult { refused_calls, .. } if refused_calls == refused
         ));
+    }
+
+    /// The live session reads the PDF from memory. Storage keeps what names
+    /// it, so a restored session reads it as a note instead.
+    #[test]
+    fn a_pdf_keeps_its_bytes_in_memory_and_only_its_name_in_storage() {
+        let call = item(
+            HistoryItemKind::ToolCall {
+                call_id: DOCUMENT_CALL.into(),
+                name: TOOL_NAME.into(),
+                input: json!({}),
+                thought_signature: None,
+                source: None,
+            },
+            CaudraId::generate(),
+            None,
+        );
+        let mut items = vec![call];
+        append_message(&mut items, &fetched_document(document(Some(DOCUMENT_DATA))));
+        let live = project_messages(&items).unwrap();
+        assert_eq!(
+            live[1].result_documents().cloned().collect::<Vec<_>>(),
+            [document(Some(DOCUMENT_DATA))]
+        );
+
+        let stored = serde_json::to_value(&items).unwrap();
+        assert!(!stored.to_string().contains(DOCUMENT_DATA));
+        let restored: Vec<HistoryItem> = serde_json::from_value(stored).unwrap();
+        let restored = project_messages(&restored).unwrap();
+        assert_eq!(
+            restored[1].result_documents().cloned().collect::<Vec<_>>(),
+            [document(None)]
+        );
     }
 
     #[test]
@@ -2657,6 +2710,7 @@ mod tests {
                 output_ref: None,
                 images: Vec::new(),
                 refused_calls: Vec::new(),
+                documents: Vec::new(),
             },
             CaudraId::generate(),
             None,

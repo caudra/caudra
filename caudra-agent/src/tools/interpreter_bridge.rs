@@ -103,6 +103,7 @@ mod tests {
             model_suffix: None,
             model_output: None,
             model_output_from_ref: false,
+            documents: Vec::new(),
             accounting: crate::ToolAccounting::default(),
         }
         .with_model_suffix(Some("model-only context".into()));
@@ -131,6 +132,7 @@ mod tests {
             model_suffix: Some("model-only context".into()),
             model_output: None,
             model_output_from_ref: false,
+            documents: Vec::new(),
             accounting: crate::ToolAccounting::default(),
         };
         let mut ctx = crate::tools::test_support::stub_ctx(&crate::AgentMode::Build);
@@ -160,6 +162,7 @@ mod tests {
             model_suffix: None,
             model_output: Some("exact model output".into()),
             model_output_from_ref: false,
+            documents: Vec::new(),
             accounting: crate::ToolAccounting::default(),
         };
 

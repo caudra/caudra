@@ -845,6 +845,7 @@ mod tests {
             family: ModelFamily::Gemini,
             supports_vision_override: Some(true),
             supports_cache_breakpoints_override: None,
+            supports_pdf: false,
             supports_tool_examples_override: None,
             thinking_override: None,
             pricing: ModelPricing::default(),

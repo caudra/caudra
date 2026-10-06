@@ -16,9 +16,9 @@ use tracing::{Instrument, debug, error, info, info_span, warn};
 use caudra_providers::model_registry::{self, Binding};
 use caudra_providers::provider::{self, Provider};
 use caudra_providers::{
-    Billing, CacheKey, ContentBlock, HistoryItem, HistoryItemKind, Message, Model, ModelError,
-    ModelPurpose, ReasoningSource, RequestOptions, Role, StandingReminderKind, StopReason,
-    StreamResponse, Timeouts, TokenUsage, estimate_tokens_cached,
+    Billing, CacheKey, ContentBlock, DOCUMENT_TOKENS_PER_PAGE, HistoryItem, HistoryItemKind,
+    Message, Model, ModelError, ModelPurpose, ReasoningSource, RequestOptions, Role,
+    StandingReminderKind, StopReason, StreamResponse, Timeouts, TokenUsage, estimate_tokens_cached,
 };
 
 use super::commit_preamble;
@@ -3397,10 +3397,23 @@ pub fn estimate_message_tokens(messages: &[Message]) -> u32 {
             Role::Assistant => ASSISTANT_MESSAGE_FRAMING,
         };
         message.content.iter().fold(
-            total.saturating_add(estimate_tokens_cached(framing)),
+            total
+                .saturating_add(estimate_tokens_cached(framing))
+                .saturating_add(document_tokens(message)),
             |total, block| total.saturating_add(message_block_tokens(block)),
         )
     })
+}
+
+/// A PDF's text and page images, priced per page. Only a document that still
+/// holds its bytes can be sent, so one without them costs nothing.
+fn document_tokens(message: &Message) -> u32 {
+    let tokens: usize = message
+        .result_documents()
+        .filter(|document| document.data.is_some())
+        .map(|document| document.page_count.saturating_mul(DOCUMENT_TOKENS_PER_PAGE))
+        .sum();
+    u32::try_from(tokens).unwrap_or(u32::MAX)
 }
 
 fn message_block_tokens(block: &ContentBlock) -> u32 {

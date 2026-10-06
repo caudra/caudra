@@ -115,6 +115,7 @@ mod tests {
             supports_thinking: Some(true),
             requires_thinking: Some(true),
             supports_vision: Some(true),
+            supports_pdf: Some(true),
             supports_cache_breakpoints: Some(true),
             reasoning_options: Some(ReasoningOptions::default()),
             pricing_input: Some(PRICE),

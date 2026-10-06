@@ -700,6 +700,10 @@ impl Provider for Bedrock {
         crate::ReasoningTransport::AnthropicMessages
     }
 
+    fn adjust_model(&self, model: &mut Model) {
+        model.supports_pdf = true;
+    }
+
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async {
             let new_auth = resolve_bedrock_auth()?;

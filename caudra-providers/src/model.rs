@@ -21,8 +21,14 @@ use crate::manifest::{
 };
 use crate::model_registry::{self, Binding};
 use crate::providers::{anthropic, custom, dynamic};
-use crate::types::ThinkingFields;
+use crate::types::{DOCUMENT_TOKENS_PER_PAGE, ThinkingFields};
 
+/// Pages of PDF one Anthropic request may carry. A quarter of any window up
+/// to 1.8M tokens is fewer pages, so the larger allowance some long-context
+/// models get never comes into play.
+const DOCUMENT_PAGE_LIMIT: usize = 100;
+/// Attached PDFs may fill at most this fraction of the context window.
+const DOCUMENT_WINDOW_DIVISOR: usize = 4;
 const PER_MILLION: f64 = 1_000_000.0;
 const TOKEN_THOUSAND: u64 = 1_000;
 const TOKEN_MILLION: u64 = 1_000_000;
@@ -434,6 +440,11 @@ pub struct Model {
     /// Declared by a custom endpoint that honours OpenAI's explicit
     /// `prompt_cache_breakpoint`; the builtin OpenAI provider decides by family.
     pub supports_cache_breakpoints_override: Option<bool>,
+    /// A PDF can travel inside a tool result to this model. The provider sets
+    /// it in `adjust_model` for a transport its vendor documents or a live
+    /// check confirmed, and a custom endpoint may declare it for a protocol
+    /// Caudra can encode documents in.
+    pub supports_pdf: bool,
     pub pricing: ModelPricing,
     /// Discovery reported an explicit all-zero price. Distinct from a zero
     /// `pricing`, which also covers "no price is known".
@@ -572,6 +583,7 @@ impl Model {
             thinking_override: None,
             supports_vision_override: None,
             supports_cache_breakpoints_override: None,
+            supports_pdf: false,
             pricing,
             discovered_free: discovered_pricing.is_some_and(ModelPricing::is_zero),
             max_output_tokens,
@@ -601,6 +613,7 @@ impl Model {
             thinking_override: ThinkingSupport::from_flags(Some(meta.supports_thinking), false),
             supports_vision_override: Some(meta.supports_vision),
             supports_cache_breakpoints_override: None,
+            supports_pdf: false,
             pricing: ModelPricing {
                 input: meta.input_price,
                 output: meta.output_price,
@@ -675,6 +688,18 @@ impl Model {
 
     pub fn supports_cache_breakpoints(&self) -> bool {
         self.supports_cache_breakpoints_override.unwrap_or(false)
+    }
+
+    /// Pages of attached PDF one request may carry: a quarter of the context
+    /// window at [`DOCUMENT_TOKENS_PER_PAGE`], within the API's page limit.
+    /// Zero when the model reads no PDFs, which tells webfetch to extract the
+    /// text instead.
+    pub fn pdf_page_budget(&self) -> usize {
+        if !self.supports_pdf {
+            return 0;
+        }
+        (self.context_window as usize / DOCUMENT_WINDOW_DIVISOR / DOCUMENT_TOKENS_PER_PAGE)
+            .min(DOCUMENT_PAGE_LIMIT)
     }
 
     /// Which of the two editing contracts this model was trained on, so it is
@@ -1217,6 +1242,21 @@ mod tests {
     #[test_case("anthropic", "anthropic" ; "already_matching_slug_passes_through")]
     fn vendor_slugs_map_onto_builtins(vendor: &str, expected: &str) {
         assert_eq!(builtin_for_vendor(vendor), expected);
+    }
+
+    #[test_case(false, 1_000_000, 0 ; "a_model_without_pdf_input_attaches_none")]
+    #[test_case(true, 200_000, 11 ; "a_quarter_of_a_200k_window")]
+    #[test_case(true, 1_000_000, 55 ; "a_quarter_of_a_1m_window")]
+    #[test_case(true, 2_000_000, DOCUMENT_PAGE_LIMIT ; "never_past_the_api_page_limit")]
+    fn pdf_page_budget_is_a_quarter_of_the_window(
+        supports_pdf: bool,
+        context_window: u32,
+        expected: usize,
+    ) {
+        let mut model = Model::from_spec(OPENAI_CHAT_SPEC).unwrap();
+        model.supports_pdf = supports_pdf;
+        model.context_window = context_window;
+        assert_eq!(model.pdf_page_budget(), expected);
     }
 
     const EPSILON: f64 = 1e-10;

@@ -548,6 +548,7 @@ impl ToolInvocation for LuaToolInvocation {
                         output_limits,
                         output_ref,
                         model_output_from_ref,
+                        documents: Vec::new(),
                     }
                 }
             }

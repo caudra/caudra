@@ -753,6 +753,7 @@ async fn run_inner(
             model_suffix: None,
             model_output: None,
             model_output_from_ref: false,
+            documents: Vec::new(),
             accounting: ToolAccounting::default(),
         }
         .with_failure(failure)
@@ -1371,6 +1372,7 @@ fn finish_invocation(
                 model_suffix: result.model_suffix,
                 model_output: result.model_output,
                 model_output_from_ref: result.model_output_from_ref,
+                documents: result.documents,
                 accounting: ToolAccounting {
                     outcome: result.failure.map(LedgerOutcome::from),
                     ..ToolAccounting::default()
@@ -1596,6 +1598,7 @@ async fn run_tool_search(
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting {
             outcome: is_error.then_some(LedgerOutcome::InvalidInput),
             ..ToolAccounting::default()
@@ -1660,6 +1663,7 @@ async fn run_local_tool(
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting {
             outcome: failure.map(LedgerOutcome::from),
             ..ToolAccounting::default()
@@ -1796,6 +1800,7 @@ async fn execute_mcp_tool(
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        documents: Vec::new(),
         accounting: ToolAccounting::default(),
     };
 

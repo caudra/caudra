@@ -394,6 +394,7 @@ mod tests {
             }),
             supports_vision_override: Some(true),
             supports_cache_breakpoints_override: None,
+            supports_pdf: false,
             pricing: ModelPricing::ZERO,
             discovered_free: false,
             max_output_tokens: Some(131_072),
