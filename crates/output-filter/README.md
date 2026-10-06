@@ -74,7 +74,8 @@ Stages run in a fixed order; later stages assume earlier ones have run.
 4. `strip_lines_matching` **or** `keep_lines_matching` — never both
 5. `truncate_lines_at` — per-line cap, counted in characters
 6. `head_lines` / `tail_lines` — windowing with omission markers
-7. `max_lines` — absolute cap, applied after windowing so markers are counted
+7. `max_lines` — absolute cap, applied after windowing so markers are counted. A success keeps its
+   first lines; a failure keeps its first and last lines around one omission marker
 8. `on_empty` — message when nothing survived
 
 ## Escapes
@@ -179,6 +180,9 @@ it were a library's output.
 - A command that exited non-zero never has its output replaced by a success message. Stages 3 and 8
   are gated on a zero exit status, because a caller cannot distinguish a synthetic `ok` from a real
   one. This diverges deliberately from upstream.
+- A command that exited non-zero keeps the end of its output under `max_lines`. Upstream keeps only
+  the first lines, which cuts the error a long failing build prints last. Stage 7 keeps the first
+  half of the cap and the last half instead. This also diverges deliberately from upstream.
 - Only the built-in corpus is loaded. Rule files discovered on disk are unsupported: a rule read
   from the tree under inspection could rewrite what a model sees.
 - Rule count, pattern count, pattern length, compiled program size, input bytes, and input lines are

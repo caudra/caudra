@@ -906,7 +906,9 @@ string, so shell metacharacters cannot steer rule selection. A rule applies only
 resolves to exactly one non-opaque scope; output from a pipeline or chain belongs to more than one
 program, so no rule is selected for it. The two command-independent reductions below still apply
 there. A rule that would replace output with a success summary is suppressed unless the command
-actually exited zero, so a failing command is never rendered as success.
+actually exited zero, so a failing command is never rendered as success. When a failing command's
+output reaches a rule's line cap, the rendering keeps its first and last lines, so the error printed
+at the end still reaches the model.
 
 The corpus covers common build, test, package-manager, and container commands, including `cargo`,
 `go`, `mvn`, `git`, `npm`, `pip`, `apt`, `pytest`, `jest`, `vitest`, `tar`, `wget`, `docker build`,

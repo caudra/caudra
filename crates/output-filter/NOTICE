@@ -42,6 +42,9 @@ editing the vendored rules:
 
   * `on_empty` and `match_output` short-circuit messages are suppressed when the
     command exited non-zero, so a failing command is never reported as success.
+  * When a command exited non-zero, `max_lines` keeps the first and last lines
+    around one omission marker instead of only the first lines, so the error a
+    long failing build prints last is not cut.
   * Rules are matched against a normalized command scope produced by
     tree-sitter Bash parsing rather than the raw command string.
   * Only the built-in rule set is loaded. Project-local and user-global rule

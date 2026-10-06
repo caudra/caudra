@@ -118,6 +118,17 @@ pub fn builtin() -> &'static Corpus {
     CORPUS.get_or_init(|| compile(RULES).expect("embedded rule corpus is valid"))
 }
 
+/// The built-in corpus with every `max_lines` cap removed, so a test can compare
+/// a capped rendering with the rendering the cap was applied to.
+#[cfg(test)]
+pub(crate) fn builtin_without_line_caps() -> Corpus {
+    let mut corpus = compile(RULES).expect("embedded rule corpus is valid");
+    for rule in &mut corpus.rules {
+        rule.max_lines = None;
+    }
+    corpus
+}
+
 fn compile(document: &str) -> Result<Corpus, String> {
     let parsed: CorpusDocument =
         toml::from_str(document).map_err(|error| format!("corpus is not valid TOML: {error}"))?;

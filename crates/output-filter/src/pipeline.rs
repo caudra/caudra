@@ -32,6 +32,10 @@ impl Rule {
     /// success message. A command that failed never has its output collapsed to
     /// a synthetic "ok", because the caller cannot tell such a message apart
     /// from a genuine success line.
+    ///
+    /// It also decides which lines the `max_lines` cap keeps. A success keeps
+    /// its first lines. A failure keeps its first and last lines around one
+    /// omission marker, because a failure is usually explained at the end.
     #[must_use]
     pub fn apply(&self, stdout: &str, stderr: &str, exit_code: Option<i32>) -> Filtered {
         let succeeded = exit_code == Some(0);
@@ -132,8 +136,14 @@ impl Rule {
             && lines.len() > max
         {
             let dropped = lines.len() - max;
-            lines.truncate(max);
-            lines.push(format!("... ({dropped} lines truncated)"));
+            if succeeded {
+                lines.truncate(max);
+                lines.push(truncated(dropped));
+            } else {
+                let head = max / 2;
+                lines.drain(head..head + dropped);
+                lines.insert(head, omitted(dropped));
+            }
             lossy = true;
         }
 
@@ -206,6 +216,10 @@ fn omitted(count: usize) -> String {
     format!("... ({count} lines omitted)")
 }
 
+fn truncated(count: usize) -> String {
+    format!("... ({count} lines truncated)")
+}
+
 #[cfg(test)]
 mod tests {
     use crate::builtin;
@@ -241,6 +255,76 @@ mod tests {
         let filtered = rule.apply("", "", Some(0));
         assert_eq!(filtered.text, "liquibase: ok");
         assert!(filtered.lossy);
+    }
+
+    fn numbered_lines(prefix: &str, count: usize) -> Vec<String> {
+        (0..count)
+            .map(|index| format!("{prefix} {index}"))
+            .collect()
+    }
+
+    #[test]
+    fn a_capped_failure_keeps_its_first_and_last_lines() {
+        let rule = builtin().rule("just").expect("just rule");
+        let max = rule.max_lines.expect("just caps its output");
+        let lines = numbered_lines("recipe output", max * 4);
+        let input = lines.join("\n");
+        let head = max / 2;
+
+        let failed = rule.apply(&input, "", Some(1));
+        let mut expected = lines[..head].to_vec();
+        expected.push(super::omitted(lines.len() - max));
+        expected.extend_from_slice(&lines[lines.len() - (max - head)..]);
+        assert_eq!(failed.text, expected.join("\n"));
+        assert!(failed.lossy);
+
+        let succeeded = rule.apply(&input, "", Some(0));
+        let mut expected = lines[..max].to_vec();
+        expected.push(super::truncated(lines.len() - max));
+        assert_eq!(succeeded.text, expected.join("\n"));
+    }
+
+    #[test]
+    fn every_capped_rule_keeps_the_end_of_a_failing_output() {
+        let capped = builtin();
+        let uncapped = crate::compile::builtin_without_line_caps();
+        for name in capped.tests().keys() {
+            let rule = capped.rule(name).expect("expectations name a rule");
+            let Some(max) = rule.max_lines else {
+                continue;
+            };
+            // Generic lines cannot satisfy a keep selector, and a window that
+            // already fits under the cap leaves it nothing to do.
+            let window = rule.head_lines.unwrap_or(0) + rule.tail_lines.unwrap_or(0);
+            if !rule.keep_lines_matching.is_empty() || (window > 0 && window < max) {
+                continue;
+            }
+            let input = numbered_lines("failure detail", max * 4).join("\n");
+            let full = uncapped
+                .rule(name)
+                .expect("same corpus")
+                .apply(&input, "", Some(1))
+                .text;
+            let full: Vec<&str> = full.lines().collect();
+            assert!(
+                full.len() > max,
+                "rule `{name}` reduced generic failure output below its cap"
+            );
+
+            let head = max / 2;
+            let mut expected: Vec<String> = full[..head].iter().map(ToString::to_string).collect();
+            expected.push(super::omitted(full.len() - max));
+            expected.extend(
+                full[full.len() - (max - head)..]
+                    .iter()
+                    .map(ToString::to_string),
+            );
+            assert_eq!(
+                rule.apply(&input, "", Some(1)).text,
+                expected.join("\n"),
+                "rule `{name}`"
+            );
+        }
     }
 
     #[test]
