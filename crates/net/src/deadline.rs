@@ -24,6 +24,35 @@ where
     }
 }
 
+/// Run one fallible stage like [`run_until`], judging its failure by the
+/// deadline rather than by what the stage called it.
+///
+/// `timeout_at` polls the stage before its timer, so a task polled after both
+/// expired sees the stage's own failure, and a transport whose timer runs on
+/// the remaining time fails exactly then. A failure that surfaces once the
+/// deadline has passed is therefore the deadline. One that surfaces earlier,
+/// an OS connect timeout included, keeps its own error, so a transport failure
+/// stays retryable. A success is returned whenever it arrives.
+pub(crate) async fn try_run_until<F, T, E>(
+    deadline: Instant,
+    cancellation: &CancellationToken,
+    future: F,
+) -> Result<T, NetError>
+where
+    F: Future<Output = Result<T, E>>,
+    E: Into<NetError>,
+{
+    run_until(deadline, cancellation, future)
+        .await?
+        .map_err(|error| {
+            if Instant::now() >= deadline {
+                NetError::Timeout
+            } else {
+                error.into()
+            }
+        })
+}
+
 pub(crate) async fn sleep_until_or_cancel(
     delay: Duration,
     deadline: Instant,

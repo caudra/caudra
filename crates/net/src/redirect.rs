@@ -6,10 +6,10 @@ use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
 
 use crate::body::read_bounded_body;
-use crate::deadline::{remaining, run_until};
+use crate::deadline::{remaining, try_run_until};
 use crate::{
-    BoundedResponse, FetchOptions, HttpClient, NetError, ProxyRoute, TransportRequest,
-    TransportResponse, TransportRoute, UrlPolicyError,
+    BoundedResponse, HttpClient, NetError, ProxyRoute, RedirectScope, RequestSpec,
+    TransportRequest, TransportResponse, TransportRoute, UrlPolicyError,
 };
 
 const MAX_REDIRECTS: usize = 20;
@@ -17,18 +17,16 @@ const MAX_REDIRECTS: usize = 20;
 impl HttpClient {
     pub(crate) async fn fetch_redirect_chain(
         &self,
-        initial_url: Url,
-        options: &FetchOptions,
+        request: &RequestSpec,
         deadline: Instant,
     ) -> Result<BoundedResponse, NetError> {
-        let mut url = initial_url;
+        let options = &request.options;
+        let mut url = request.url.clone();
         let mut headers = options.headers.clone();
         let redirect_limit = options.max_redirects.min(MAX_REDIRECTS);
         for redirect_count in 0..=redirect_limit {
-            let response = self
-                .execute_hop(&url, &headers, deadline, &options.cancellation)
-                .await?;
-            if !is_redirect(response.status) {
+            let response = self.execute_hop(request, &url, &headers, deadline).await?;
+            let Some(location) = followed_location(request, &response, &url)? else {
                 let body = read_bounded_body(
                     response,
                     options.max_body_bytes,
@@ -43,13 +41,7 @@ impl HttpClient {
                     body: body.bytes,
                     truncated: body.truncated,
                 });
-            }
-
-            let location = response
-                .headers
-                .get(http::header::LOCATION)
-                .and_then(|value| value.to_str().ok())
-                .ok_or_else(|| NetError::Redirect("missing Location header".to_owned()))?;
+            };
             if redirect_count >= redirect_limit {
                 return Err(NetError::Redirect("redirect limit exceeded".to_owned()));
             }
@@ -69,11 +61,12 @@ impl HttpClient {
 
     async fn execute_hop(
         &self,
+        request: &RequestSpec,
         url: &Url,
         headers: &HeaderMap,
         deadline: Instant,
-        cancellation: &CancellationToken,
     ) -> Result<TransportResponse, NetError> {
+        let cancellation = &request.options.cancellation;
         // Every hop gets a fresh policy and DNS check. Validating only the first
         // URL would allow an otherwise public endpoint to redirect into a LAN.
         self.policy.validate_url(url)?;
@@ -86,14 +79,15 @@ impl HttpClient {
                 resolved_addresses: self.resolve_target(url, deadline, cancellation).await?,
             },
         };
-        let request = TransportRequest {
-            method: Method::GET,
+        let hop = TransportRequest {
+            method: request.method.clone(),
             url: url.clone(),
             headers: headers.clone(),
+            body: request.body.clone(),
             route,
             timeout: remaining(deadline)?,
         };
-        Ok(run_until(deadline, cancellation, self.transport.execute(request)).await??)
+        try_run_until(deadline, cancellation, self.transport.execute(hop)).await
     }
 
     async fn resolve_target(
@@ -115,7 +109,7 @@ impl HttpClient {
             }
             Host::Domain(hostname) => {
                 let addresses =
-                    run_until(deadline, cancellation, self.resolver.resolve(hostname)).await??;
+                    try_run_until(deadline, cancellation, self.resolver.resolve(hostname)).await?;
                 if addresses.is_empty() {
                     return Err(NetError::EmptyDnsAnswer(hostname.to_owned()));
                 }
@@ -128,6 +122,64 @@ impl HttpClient {
             }
         }
     }
+}
+
+/// The target the chain follows from `response`, or `None` to end it there.
+///
+/// A body-less GET has nothing to replay, so it follows any redirect status,
+/// leaving the origin of the hop that answered only under
+/// [`RedirectScope::AnyOrigin`]. Anything else follows only a 307 or 308, the
+/// redirects that ask for the same request again, and only within that origin.
+fn followed_location<'a>(
+    request: &RequestSpec,
+    response: &'a TransportResponse,
+    url: &Url,
+) -> Result<Option<&'a str>, NetError> {
+    if request.method != Method::GET || request.body.is_some() {
+        return Ok(replayable_redirect_location(response, url));
+    }
+    let location = redirect_location(response)?;
+    Ok(match request.redirects {
+        RedirectScope::AnyOrigin => location,
+        RedirectScope::SameOrigin => location.filter(|location| !leaves_origin(url, location)),
+    })
+}
+
+/// The target of any redirect. A redirect without one is an error.
+fn redirect_location(response: &TransportResponse) -> Result<Option<&str>, NetError> {
+    if !is_redirect(response.status) {
+        return Ok(None);
+    }
+    location(&response.headers)
+        .map(Some)
+        .ok_or_else(|| NetError::Redirect("missing Location header".to_owned()))
+}
+
+/// The target of a 307 or 308 that stays on the current origin. Every other
+/// response, including such a redirect without a usable target, ends the chain.
+fn replayable_redirect_location<'a>(response: &'a TransportResponse, url: &Url) -> Option<&'a str> {
+    if !matches!(
+        response.status,
+        StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT
+    ) {
+        return None;
+    }
+    location(&response.headers)
+        .filter(|location| url.join(location).is_ok_and(|next| same_origin(url, &next)))
+}
+
+/// Whether `location` resolves against `url` to another origin. A target that
+/// does not resolve is left for the redirect parse to reject, as it is under
+/// any scope.
+fn leaves_origin(url: &Url, location: &str) -> bool {
+    url.join(location)
+        .is_ok_and(|next| !same_origin(url, &next))
+}
+
+fn location(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(http::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
 }
 
 fn is_redirect(status: StatusCode) -> bool {

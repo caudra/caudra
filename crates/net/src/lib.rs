@@ -31,7 +31,9 @@ mod proxy_tests;
 
 pub use classification::{HostClassification, IpClassification, classify_hostname, classify_ip};
 pub use dns::{DnsError, DnsResolver, TokioDnsResolver};
-pub use http_client::{BoundedResponse, FetchOptions, HttpClient};
+pub use http_client::{
+    BoundedResponse, FetchOptions, HttpClient, MAX_REQUEST_BODY_BYTES, RedirectScope, RequestSpec,
+};
 pub use http_error::NetError;
 pub use policy::{OperatorConfiguredPolicy, UrlPolicy, UrlPolicyError};
 pub use proxy::{ProxyConfiguration, ProxyConfigurationError, ProxyEndpoint, ProxyRoute};
@@ -40,6 +42,9 @@ pub use transport::{
     BodyStream, HttpTransport, ReqwestTransport, TransportError, TransportRequest,
     TransportResponse, TransportRoute,
 };
+// Requests and responses are built from these crates' types, so a host names
+// them at exactly the version this client links instead of adding its own.
+pub use {bytes, http};
 
 /// The user agent used by generic Workcell network operations.
 pub const NETWORK_USER_AGENT: &str = "Workcell-Net/0.1";

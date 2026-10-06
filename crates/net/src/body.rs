@@ -1,10 +1,10 @@
 use bytes::{Bytes, BytesMut};
-use futures_util::StreamExt;
+use futures_util::TryStreamExt;
 use http::{HeaderMap, StatusCode};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::deadline::run_until;
+use crate::deadline::try_run_until;
 use crate::{NetError, TransportResponse};
 
 pub(crate) struct ReadBody {
@@ -28,9 +28,9 @@ pub(crate) async fn read_bounded_body(
     loop {
         // Content-Length is only a hint. The stream itself is cut off once the
         // cap is reached, so a lying or absent header cannot grow memory usage.
-        let chunk = run_until(deadline, cancellation, stream.next()).await?;
-        let Some(chunk) = chunk else { break };
-        let chunk = chunk?;
+        let Some(chunk) = try_run_until(deadline, cancellation, stream.try_next()).await? else {
+            break;
+        };
         let remaining = limit.saturating_sub(output.len());
         if chunk.len() > remaining {
             output.extend_from_slice(&chunk[..remaining]);

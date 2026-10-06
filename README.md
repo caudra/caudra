@@ -1037,7 +1037,7 @@ workcell = { git = "https://github.com/tensorninja/workcell-mcp", default-featur
 | --- | --- |
 | `files` | `FileToolGroup`, `PreparedFilePatch`, filesystem schemas and bounded operations |
 | `files-index` | `files` plus `file_index`, its typed output, and the feature-gated parser bundle |
-| `web` | `WebToolGroup`, `PreparedWebsearch`, `PreparedWebfetch`, extraction and provider lowering |
+| `web` | `WebToolGroup`, `PreparedWebsearch`, `PreparedWebfetch`, extraction and provider lowering, and `net`, the bounded HTTP client those tools share |
 | `shell` | `ShellToolGroup`, `PreparedShell`, `ShellPreparationError`, scope analysis, progress streaming, and `output_filter` |
 | `code` | `CodeToolGroup`, isolated interpreter execution (the `python_execution` tool) |
 | `code-bundled` | `code` plus verified extraction of a build-time embedded Monty worker |

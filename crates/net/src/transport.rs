@@ -1,3 +1,4 @@
+use std::fmt;
 use std::net::IpAddr;
 use std::pin::Pin;
 use std::time::Duration;
@@ -69,18 +70,40 @@ pub enum TransportRoute {
 }
 
 /// A single already-validated HTTP request.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct TransportRequest {
-    /// Request method. The high-level client currently emits only GET.
+    /// Request method.
     pub method: Method,
     /// Validated URL for this exact hop.
     pub url: Url,
     /// Caller headers after redirect-sensitive filtering.
     pub headers: HeaderMap,
+    /// Request body, if any.
+    pub body: Option<Bytes>,
     /// Whether this hop is dialled directly or through a proxy.
     pub route: TransportRoute,
     /// Remaining total operation time.
     pub timeout: Duration,
+}
+
+impl fmt::Debug for TransportRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Redacted like `RequestSpec`: paths, queries, header values, and bodies
+        // routinely carry credentials, so only their shape is shown.
+        let route = match self.route {
+            TransportRoute::Direct { .. } => "Direct",
+            TransportRoute::Proxy { .. } => "Proxy",
+        };
+        formatter
+            .debug_struct("TransportRequest")
+            .field("method", &self.method)
+            .field("origin", &self.url.origin().ascii_serialization())
+            .field("header_names", &self.headers.keys().collect::<Vec<_>>())
+            .field("body_bytes", &self.body.as_ref().map(Bytes::len))
+            .field("route", &format_args!("{route}"))
+            .field("timeout", &self.timeout)
+            .finish_non_exhaustive()
+    }
 }
 
 /// An HTTP response whose body has not yet been buffered.
@@ -156,30 +179,37 @@ impl HttpTransport for ReqwestTransport {
         let client = builder
             .build()
             .map_err(|error| TransportError::new(error.to_string()))?;
-        let response = client
+        let mut outgoing = client
             .request(request.method, request.url)
-            .headers(request.headers)
-            .send()
-            .await
-            .map_err(|error| {
-                // A refusal from an enforcing proxy arrives as a failed connect.
-                // The reqwest message is not retained for it: an operator proxy
-                // URL is topology and may carry credentials.
-                if proxied && error.is_connect() {
-                    TransportError::proxy("outbound proxy refused the connection")
-                } else {
-                    TransportError::new(error.to_string())
-                }
-            })?;
+            .headers(request.headers);
+        if let Some(body) = request.body {
+            outgoing = outgoing.body(body);
+        }
+        let response = outgoing.send().await.map_err(|error| {
+            // A refusal from an enforcing proxy arrives as a failed connect.
+            // The reqwest message is not retained for it: an operator proxy
+            // URL is topology and may carry credentials.
+            if proxied && error.is_connect() {
+                TransportError::proxy("outbound proxy refused the connection")
+            } else {
+                transport_error(error)
+            }
+        })?;
         let status = response.status();
         let headers = response.headers().clone();
         let body = response
             .bytes_stream()
-            .map(|result| result.map_err(|error| TransportError::new(error.to_string())));
+            .map(|result| result.map_err(transport_error));
         Ok(TransportResponse {
             status,
             headers,
             body: Box::pin(body),
         })
     }
+}
+
+/// Convert a reqwest failure without the request URL reqwest appends to its
+/// message, because the URL's path or query can carry a credential.
+fn transport_error(error: reqwest::Error) -> TransportError {
+    TransportError::new(error.without_url().to_string())
 }

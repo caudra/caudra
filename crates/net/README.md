@@ -1,8 +1,8 @@
 # workcell-net
 
-`workcell-net` provides shared outbound URL policy and bounded HTTP GET primitives for Rust Workcell
-tools. It is intentionally separate from websearch and webfetch so source icons, redirects, and future
-network tools use the same SSRF rules.
+`workcell-net` provides shared outbound URL policy and bounded HTTP request primitives for Rust
+Workcell tools. It is intentionally separate from websearch and webfetch so source icons, redirects, and
+future network tools use the same SSRF rules.
 
 ## Design
 
@@ -31,7 +31,9 @@ The main types are:
 
 | Type                       | Purpose                                                                          |
 | -------------------------- | -------------------------------------------------------------------------------- |
-| `HttpClient`               | Executes policy-checked bounded GET requests.                                    |
+| `HttpClient`               | Executes policy-checked bounded requests.                                        |
+| `RequestSpec`              | Method, URL, optional body, `RedirectScope`, and `FetchOptions` for `request`.   |
+| `RedirectScope`            | Whether a body-less GET may leave the origin; `get_url` uses `AnyOrigin`.        |
 | `FetchOptions`             | Carries timeout, redirects, body limit, headers, retry policy, and cancellation. |
 | `UrlPolicy`                | Selects public-internet or operator-configured trust semantics.                  |
 | `OperatorConfiguredPolicy` | Explicit exceptions for trusted operator endpoints.                              |
@@ -45,6 +47,41 @@ The main types are:
 `HttpClient::public_internet()` is the default for model- or user-selected URLs. Operator-configured
 policy is reserved for endpoints selected by trusted process configuration, such as a local SearXNG
 instance.
+
+The crate re-exports `http` and `bytes`, so a host builds methods, headers, and bodies from the same
+versions the client links.
+
+## Methods and Bodies
+
+`HttpClient::get` and `get_url` send a GET without a body. `HttpClient::request` sends any method with an
+optional body of at most `MAX_REQUEST_BODY_BYTES` (1 MiB). A larger body fails with
+`NetError::RequestBodyTooLarge` before DNS or any connection.
+
+The client derives framing, connection, and proxy headers itself. A caller header named `Host`,
+`Content-Length`, `Transfer-Encoding`, `Connection`, `Keep-Alive`, `TE`, `Trailer`, `Upgrade`, or
+`Expect`, or any name starting with `Proxy-`, fails with `NetError::ReservedHeader` before DNS or any
+connection. `get` and `get_url` apply the same check. The error names the header, never its value.
+
+`RequestSpec::redirects` sets how far a request may be redirected:
+
+- A GET without a body has nothing to replay. Under `RedirectScope::AnyOrigin` it follows redirects as
+  described above, which is what `get` and `get_url` do. Under `RedirectScope::SameOrigin` it follows
+  a 301, 302, 303, 307, or 308 only when the target has the origin of the hop that answered.
+- Any other request, under either scope, follows only a 307 or 308 that stays on the same origin,
+  re-sending its method, body, and headers, because those are the redirects that ask for the same
+  request again and the origin is the one the caller chose.
+
+A redirect that is not followed ends the chain and is returned with its bounded body as the final
+response, and its target is neither resolved nor contacted. A redirect that would be followed beyond
+`max_redirects` is an error. A body-less GET treats a redirect without a usable `Location` as an
+error; any other request returns it. A followed hop is still validated, resolved, and pinned.
+
+Only idempotent methods are retried: GET, HEAD, PUT, DELETE, OPTIONS, TRACE, and QUERY. Neither a
+transport failure nor a retry status proves the server did nothing, so POST, PATCH, and any extension
+method are attempted once whatever `RetryPolicy` allows.
+
+Transport errors omit the request URL, whose path or query can carry a credential. The crate itself
+emits no logs.
 
 ## Public-Internet Policy
 
@@ -71,8 +108,14 @@ path, resolution and pinning included.
 
 ## Resource Bounds
 
-- Bodies are streamed and stopped at a caller-supplied byte limit.
-- A total deadline covers DNS, connection, redirects, retries, and body reads.
+- Response bodies are streamed and stopped at a caller-supplied byte limit.
+- Request bodies are capped at 1 MiB before any I/O.
+- A total deadline covers DNS, connection, redirects, retries, and body reads. The deadline, not the
+  error, decides what a failure is: a DNS, transport, or proxy failure that surfaces once it has
+  passed is `NetError::Timeout`, which is never retried, whatever the failing stage called it. One
+  that surfaces earlier keeps its own error, so an OS connect timeout inside the budget is a
+  `NetError::Transport` that an idempotent request retries, or on a proxied hop a `NetError::Proxy`
+  that it does not. A response that arrives after the deadline is still returned.
 - Caller cancellation interrupts cooperative DNS and network work.
 - Redirect counts and retry counts are explicit.
 - `Retry-After` parsing is bounded.

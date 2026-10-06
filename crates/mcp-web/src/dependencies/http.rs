@@ -108,9 +108,10 @@ pub trait WebHttpTransport: Send + Sync {
     async fn execute(&self, request: WebHttpRequest) -> Result<WebHttpResponse, WebHttpError>;
 }
 
-/// Production adapter. Public and operator GETs use `workcell-net`; only the
-/// provider-owned fixed HTTPS origins use reqwest directly because they require
-/// redirect handling or methods outside the current bounded GET API.
+/// Production adapter. Public and operator GETs use `workcell-net`, whose
+/// per-hop address policy exists for URLs this crate does not choose. Provider
+/// requests go only to HTTPS origins fixed in this crate, so they use reqwest
+/// directly and keep the credential on that origin by rejecting every redirect.
 #[derive(Clone)]
 pub struct ProductionWebHttpTransport {
     public: HttpClient,

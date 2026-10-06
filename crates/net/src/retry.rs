@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime};
 
 use http::{HeaderMap, StatusCode};
 
-/// Bounded retry behavior for idempotent GET requests.
+/// Bounded retry behavior for idempotent requests.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RetryPolicy {
     /// Number of attempts after the initial request, capped by the caller.

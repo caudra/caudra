@@ -23,6 +23,8 @@ url.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+test-case.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 wiremock.workspace = true
 
 [lints]

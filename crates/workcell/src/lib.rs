@@ -50,6 +50,10 @@ pub use workcell_mcp_shell::{PreparedShell, ShellPreparationError, ShellToolGrou
 pub use workcell_mcp_web as web;
 #[cfg(feature = "web")]
 pub use workcell_mcp_web::{PreparedWebfetch, PreparedWebsearch, WebToolGroup};
+// The bounded client the web tools are built on, for a host that sends its own
+// requests under the same URL policy, DNS pinning, proxy routing, and bounds.
+#[cfg(feature = "web")]
+pub use workcell_net as net;
 // Progress chunks are byte-exact by contract, so a host that displays a redraw
 // stream rather than replaying it has to render one itself.
 #[cfg(feature = "shell")]
