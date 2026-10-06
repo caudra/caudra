@@ -94,8 +94,8 @@
       gitDepHashes = {
         "git+https://github.com/pydantic/monty.git?tag=v1.0.0#85c5d1f6bef038405cfc40a4eed94806e303567e" =
           "sha256-tuDFwYLIprdVyAH47rqYiI4xU3RCuNdkBjIyVM1JeWE=";
-        "git+https://github.com/tensorninja/workcell-mcp?rev=754a82d350d4f23872df7bd7533afe6f2857cc67#754a82d350d4f23872df7bd7533afe6f2857cc67" =
-          "sha256-H7X5Z72G7WOyHccYMpMEVcbBslkZDV2UZT1nAJMaP08=";
+        "git+https://github.com/tensorninja/workcell-mcp?rev=fc2ec434eeab061d812ba56f4820487ac1ed9e55#fc2ec434eeab061d812ba56f4820487ac1ed9e55" =
+          "sha256-iYaunHKmi2+PmMcMVMWpeqD//oaOWLQEg7jTLVTnNjA=";
       };
 
       missingGitDepHashes = builtins.filter (s: !(builtins.hasAttr s gitDepHashes)) gitDepSources;
