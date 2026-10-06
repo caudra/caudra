@@ -34,9 +34,9 @@ const DETAIL_ROWS: u16 = 6;
 const WIDTH_PERCENT: u16 = 85;
 const LIST_ROOM: u16 = 10;
 const PROMOTE: Bind = Bind {
-    code: KeyCode::Char('b'),
+    code: KeyCode::Char('l'),
     modifiers: KeyModifiers::CONTROL,
-    label: "Ctrl+B",
+    label: "Ctrl+L",
 };
 const CANCEL: Bind = Bind {
     code: KeyCode::Char('k'),
@@ -789,7 +789,7 @@ mod tests {
         );
     }
 
-    #[test_case('b'; "b_filters")]
+    #[test_case('l'; "l_filters")]
     #[test_case('k'; "k_filters")]
     fn plain_letters_remain_filter_input(letter: char) {
         let mut picker = opened();

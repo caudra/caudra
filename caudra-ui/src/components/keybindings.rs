@@ -197,7 +197,6 @@ pub mod key {
     pub const SCROLL_LINE_UP: Bind = ctrl_bind!('y');
     pub const SCROLL_LINE_DOWN: Bind = ctrl_bind!('e');
     pub const SCROLL_TOP: Bind = ctrl_bind!('g');
-    pub const SCROLL_BOTTOM: Bind = ctrl_bind!('b');
 
     /// Moves a reporting overlay between the answers it can give: this session,
     /// this project, everything. Bare, since `Ctrl+G` already scrolls to the
@@ -302,12 +301,12 @@ pub mod key {
         label: "Ctrl+Enter",
     };
     /// Sandbox form keys that act while a text field holds the keyboard, so
-    /// each is a chord no text field decodes. The field jumps reuse the
-    /// transcript's top and bottom keys.
+    /// each is a chord no text field decodes. The first field jump reuses the
+    /// transcript's top key, and the last one is `l` for last.
     pub const SANDBOX_APPEND_RULE: Bind = ctrl_bind!('n');
     pub const SANDBOX_CLEAR_RULE: Bind = ctrl_bind!('u');
     pub const SANDBOX_FIRST_FIELD: Bind = SCROLL_TOP;
-    pub const SANDBOX_LAST_FIELD: Bind = SCROLL_BOTTOM;
+    pub const SANDBOX_LAST_FIELD: Bind = ctrl_bind!('l');
     pub const SELECT_ALL: Bind = Bind::from_workbench(wb::SELECT_ALL);
     pub const UNDO: Bind = Bind::from_workbench(wb::UNDO);
     /// The workbench's find keys, which `/docs` steps through its search
@@ -324,6 +323,8 @@ pub mod leader {
     use crossterm::event::{KeyCode, KeyModifiers};
 
     pub const TASKS: Bind = leader_bind!('a');
+    /// `Ctrl+B` is the tmux prefix and never reaches a session inside tmux.
+    pub const SCROLL_BOTTOM: Bind = leader_bind!('b');
     pub const EDIT_INPUT: Bind = leader_bind!('e');
     pub const FILE_PICKER: Bind = leader_bind!('f');
     pub const STEER_PROMPT: Bind = leader_bind!('g');
@@ -346,6 +347,7 @@ pub mod leader {
     /// Every global chord, in the order the which-key panel lists them.
     pub const ALL: &[Bind] = &[
         TASKS,
+        SCROLL_BOTTOM,
         EDIT_INPUT,
         FILE_PICKER,
         STEER_PROMPT,
@@ -855,7 +857,7 @@ pub const KEYBINDS: &[Keybind] = &[
         context: KeybindContext::Editing,
     },
     Keybind {
-        label: KeyLabel::Single(key::SCROLL_BOTTOM.label),
+        label: KeyLabel::Single(leader::SCROLL_BOTTOM.label),
         description: "Scroll to bottom",
         context: KeybindContext::Editing,
     },
@@ -1394,7 +1396,7 @@ pub const KEYBINDS: &[Keybind] = &[
         context: KeybindContext::PeerManager,
     },
     Keybind {
-        label: KeyLabel::Single("Ctrl+B"),
+        label: KeyLabel::Single("Ctrl+Y"),
         description: "Copy the selected peer's @name or exact target outside filter editing",
         context: KeybindContext::PeerManager,
     },
@@ -1941,6 +1943,8 @@ mod tests {
     const ALT_IS_UNREACHABLE: &str = "macOS never reports Option as Alt, so no default may need it";
     const AMBIGUOUS_CONTROL_CODE: &str =
         "this chord is the same byte as Backspace, Tab or Enter and would steal it";
+    const TMUX_PREFIX: &str =
+        "tmux keeps this chord for its prefix, so inside tmux it never arrives";
     const CHORD_COLLISION: &str = "two leader chords in one context answer the same second key";
     const LEADER_DRIFT: &str = "the workbench and the host must spend the same key on the prefix";
     const SANDBOX_KEY_SHADOWS_EDIT: &str =
@@ -2036,6 +2040,19 @@ mod tests {
                 assert_ne!(
                     part, ambiguous,
                     "{AMBIGUOUS_CONTROL_CODE}: {}",
+                    kb.description
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_default_binds_the_tmux_prefix() {
+        for kb in KEYBINDS {
+            for part in kb.label.parts() {
+                assert!(
+                    part.split_whitespace().all(|chord| chord != mod_key!("B")),
+                    "{TMUX_PREFIX}: {part} ({})",
                     kb.description
                 );
             }

@@ -86,7 +86,6 @@ pub const CLOSE: Bind = bind!(KeyCode::Esc, NONE, "Esc");
 /// only exists for a status hint to name it and a click on that hint to press
 /// it.
 pub const ACCEPT: Bind = bind!(KeyCode::Enter, NONE, "Enter");
-pub const TOGGLE_SIDEBAR: Bind = bind!(KeyCode::Char('b'), CTRL, "Ctrl+B");
 pub const FOCUS_NEXT: Bind = bind!(KeyCode::Tab, NONE, "Tab");
 pub const FOCUS_PREV: Bind = bind!(KeyCode::BackTab, KeyModifiers::SHIFT, "Shift+Tab");
 pub const QUICK_OPEN: Bind = bind!(KeyCode::Char('p'), CTRL, "Ctrl+P");
@@ -182,6 +181,9 @@ pub const TOGGLE_WRAP: Bind = leader!(KeyCode::Char('z'), "z");
 /// The transcript spends `v` on its own compact view, which is behind the
 /// workbench while this answers, so the chord only shadows it here.
 pub const TOGGLE_RENDERED: Bind = leader!(KeyCode::Char('v'), "v");
+/// Under the leader because tmux keeps `Ctrl+B` for its prefix. The
+/// transcript's own `b` is behind the workbench while this answers.
+pub const TOGGLE_SIDEBAR: Bind = leader!(KeyCode::Char('b'), "b");
 pub const SHRINK_SIDEBAR: Bind = leader!(KeyCode::Char('-'), "-");
 pub const GROW_SIDEBAR: Bind = leader!(KeyCode::Char('='), "=");
 pub const SHRINK_SECTION: Bind = leader!(KeyCode::Up, "↑");
@@ -199,21 +201,8 @@ pub const TOGGLE_REGEX: Bind = leader!(KeyCode::Char('r'), "r");
 /// characters only reach a pane with no text field.
 #[cfg(test)]
 const GLOBAL_BINDS: &[Bind] = &[
-    CLOSE,
-    TOGGLE_SIDEBAR,
-    FOCUS_NEXT,
-    FOCUS_PREV,
-    QUICK_OPEN,
-    REFRESH,
-    PREV_TAB,
-    NEXT_TAB,
-    SAVE,
-    REVERT,
-    FIND,
-    FIND_NEXT,
-    FIND_PREV,
-    GOTO_LINE,
-    PASTE,
+    CLOSE, FOCUS_NEXT, FOCUS_PREV, QUICK_OPEN, REFRESH, PREV_TAB, NEXT_TAB, SAVE, REVERT, FIND,
+    FIND_NEXT, FIND_PREV, GOTO_LINE, PASTE,
 ];
 
 /// The chords [`crate::text_field::decode`] reads, which the buffer and every
@@ -258,7 +247,6 @@ const EXPLORER_BINDS: &[Bind] = &[COLLAPSE_ALL];
 #[cfg(test)]
 const TRANSFER_BINDS: &[Bind] = &[
     LEADER,
-    TOGGLE_SIDEBAR,
     QUICK_OPEN,
     CLOSE,
     ACCEPT,
@@ -302,6 +290,7 @@ pub const LEADER_BINDS: &[Bind] = &[
     CLOSE_TAB,
     TOGGLE_WRAP,
     TOGGLE_RENDERED,
+    TOGGLE_SIDEBAR,
     SHRINK_SIDEBAR,
     GROW_SIDEBAR,
     SHRINK_SECTION,

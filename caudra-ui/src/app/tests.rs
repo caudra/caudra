@@ -6106,13 +6106,18 @@ fn scroll_outside_msg_area_ignored() {
     assert!(app.chats[0].auto_scroll());
 }
 
+const TMUX_PREFIX: KeyEvent = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
+const TMUX_PREFIX_SCROLLED: &str = "tmux keeps Ctrl+B for its prefix, so it must not scroll";
+
 #[test]
 fn scroll_shortcuts_toggle_auto_scroll() {
     let mut app = test_app();
     app.active_chat().enable_auto_scroll();
     app.update(Msg::Key(kb::SCROLL_TOP.to_key_event()));
     assert!(!app.chats[0].auto_scroll());
-    app.update(Msg::Key(kb::SCROLL_BOTTOM.to_key_event()));
+    app.update(Msg::Key(TMUX_PREFIX));
+    assert!(!app.chats[0].auto_scroll(), "{TMUX_PREFIX_SCROLLED}");
+    press_chord(&mut app, chord::SCROLL_BOTTOM);
     assert!(app.chats[0].auto_scroll());
 }
 
@@ -6222,7 +6227,7 @@ fn ctrl_scroll_binds_ignore_the_focus() {
     assert_eq!(app.active_chat().scroll_top(), 0);
     assert_eq!(app.key_focus, KeyFocus::Composer, "{FOCUS_KEPT}");
 
-    app.update(Msg::Key(kb::SCROLL_BOTTOM.to_key_event()));
+    press_chord(&mut app, chord::SCROLL_BOTTOM);
     assert!(app.chats[0].auto_scroll());
     assert_eq!(app.key_focus, KeyFocus::Composer, "{FOCUS_KEPT}");
 }
@@ -22250,6 +22255,8 @@ const OVERLAY_HIDDEN: &str = "an overlay opened over the workbench must be drawn
 const WORKBENCH_CHORD_DESC: &str = "Narrow / widen the sidebar";
 const PROMPT_UNANSWERABLE: &str =
     "the prompt must answer before the workbench, or the session hangs on it";
+const SIDEBAR_CHORD_LOST: &str =
+    "an open workbench must take Ctrl+X b for its sidebar ahead of the transcript";
 
 fn open_workbench() -> App {
     let mut app = test_app();
@@ -22281,6 +22288,25 @@ fn esc_leaves_the_workbench() {
     let mut app = open_workbench();
     app.update(Msg::Key(key(KeyCode::Esc)));
     assert!(!app.workbench.is_open(), "{WORKBENCH_CLOSES}");
+}
+
+/// Both spend `b` under the leader, and the workbench answers first, so the
+/// transcript hidden behind it stays where it was.
+#[test]
+fn the_sidebar_chord_reaches_an_open_workbench_before_the_transcript() {
+    let mut app = open_workbench();
+    app.active_chat().scroll_to_top();
+
+    press_chord(
+        &mut app,
+        Bind::from_workbench(workbench_keys::TOGGLE_SIDEBAR),
+    );
+
+    assert!(
+        app.workbench.layout().sidebar_collapsed,
+        "{SIDEBAR_CHORD_LOST}"
+    );
+    assert!(!app.chats[0].auto_scroll(), "{SIDEBAR_CHORD_LOST}");
 }
 
 #[test]

@@ -187,9 +187,9 @@ const BINDINGS: [(Command, KeyCode, KeyModifiers, &str, &str); 15] = [
     ),
     (
         Command::CopyTarget,
-        KeyCode::Char('b'),
+        KeyCode::Char('y'),
         KeyModifiers::CONTROL,
-        "Ctrl+B",
+        "Ctrl+Y",
         " Copy target",
     ),
     (
@@ -3653,7 +3653,7 @@ mod tests {
             Some(FIRST_TARGET)
         );
         assert!(
-            matches!(manager.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)), PeerManagerAction::Copy(target) if target == FIRST_TARGET)
+            matches!(manager.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)), PeerManagerAction::Copy(target) if target == FIRST_TARGET)
         );
         manager.set_sessions(Ok(vec![peer(SECOND_TARGET)]));
         assert_eq!(
@@ -3662,7 +3662,7 @@ mod tests {
         );
         assert!(manager.selected_peer().is_none());
         assert!(matches!(
-            manager.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)),
+            manager.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)),
             PeerManagerAction::Consumed
         ));
     }
@@ -3688,7 +3688,7 @@ mod tests {
 
     #[test_case(named_peer(HANDLE), NAME_LABEL; "named")]
     #[test_case(peer(FIRST_TARGET), EXACT_TARGET_LABEL; "unnamed")]
-    fn session_details_show_the_address_ctrl_b_copies(peer: PeerSummary, label: &str) {
+    fn session_details_show_the_address_ctrl_y_copies(peer: PeerSummary, label: &str) {
         let target = peer.target.clone();
         let unnamed = peer.handle.is_none();
         let mut manager = manager(PeerView::Sessions);
@@ -3700,7 +3700,7 @@ mod tests {
         assert_eq!(detail.contains(EXACT_TARGET_LABEL), unnamed);
         assert_eq!(detail.contains(ALIAS_SCOPE), unnamed);
         assert!(
-            matches!(manager.handle_key(ctrl('b')), PeerManagerAction::Copy(copied) if copied == target)
+            matches!(manager.handle_key(ctrl('y')), PeerManagerAction::Copy(copied) if copied == target)
         );
     }
 
@@ -4021,8 +4021,7 @@ mod tests {
         let mut manager = manager(PeerView::Sessions);
         manager.set_sessions(Ok(vec![peer(FIRST_TARGET)]));
         let screen = draw(&mut manager, NARROW, SHORT);
-        assert!(screen.contains("Ctrl+B"));
-        assert!(screen.contains("Ctrl+R"));
+        assert!(screen.contains(key_label(&command)));
         let area = manager
             .controls
             .iter()
@@ -4221,7 +4220,7 @@ mod tests {
         assert!(screen.contains(&script), "{screen}");
         assert!(screen.contains(NO_REPLY_TARGET), "{screen}");
         assert!(matches!(
-            manager.handle_key(ctrl('b')),
+            manager.handle_key(ctrl('y')),
             PeerManagerAction::Consumed
         ));
     }

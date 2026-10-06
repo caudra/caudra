@@ -2018,8 +2018,6 @@ impl App {
             self.active_chat().scroll(half);
         } else if key::SCROLL_TOP.matches(key) {
             self.active_chat().scroll_to_top();
-        } else if key::SCROLL_BOTTOM.matches(key) {
-            self.active_chat().enable_auto_scroll();
         } else if key::PAGE_UP.matches(key) || key::PAGE_DOWN.matches(key) {
             let up = key::PAGE_UP.matches(key);
             if composer_owns && self.active_input_box_mut().page(up) {
@@ -3395,6 +3393,10 @@ impl App {
         }
         if leader::PLAN_TOGGLE.matches(key) {
             self.toggle_plan_or_todo();
+            return vec![];
+        }
+        if leader::SCROLL_BOTTOM.matches(key) {
+            self.active_chat().enable_auto_scroll();
             return vec![];
         }
         if self.status == Status::Streaming {

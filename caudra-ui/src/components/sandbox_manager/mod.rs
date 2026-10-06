@@ -4120,7 +4120,7 @@ on_exit = "detach"
     #[test_case(SandboxView::Profiles, key::SANDBOX_APPEND_RULE; "append_rule_is_not_new")]
     #[test_case(SandboxView::Instances, key::SANDBOX_CLEAR_RULE; "clear_rule_is_not_resume")]
     #[test_case(SandboxView::Instances, key::SANDBOX_FIRST_FIELD; "first_field_is_not_network")]
-    #[test_case(SandboxView::Images, key::SANDBOX_LAST_FIELD; "last_field_is_not_build")]
+    #[test_case(SandboxView::Images, key::SANDBOX_LAST_FIELD; "last_field_is_not_inspect")]
     fn form_keys_outside_a_form_never_run_the_bare_letter(view: SandboxView, bind: Bind) {
         let (_directory, _store, mut manager) = fixture();
         live_instance(&mut manager, false);

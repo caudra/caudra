@@ -3012,13 +3012,6 @@ impl Workbench {
             }
             return Some(WorkbenchAction::Close);
         }
-        if keys::TOGGLE_SIDEBAR.matches(key) {
-            self.sidebar_collapsed = !self.sidebar_collapsed;
-            if self.sidebar_collapsed {
-                self.focus = Focus::Editor;
-            }
-            return Some(WorkbenchAction::Consumed);
-        }
         if keys::QUICK_OPEN.matches(key) {
             self.quick_open();
             return Some(WorkbenchAction::Consumed);
@@ -3093,6 +3086,13 @@ impl Workbench {
                 self.set_sidebar_width(self.sidebar_width.saturating_add_signed(step));
                 return WorkbenchAction::Consumed;
             }
+        }
+        if keys::TOGGLE_SIDEBAR.matches(key) {
+            self.sidebar_collapsed = !self.sidebar_collapsed;
+            if self.sidebar_collapsed {
+                self.focus = Focus::Editor;
+            }
+            return WorkbenchAction::Consumed;
         }
         if self.transfer_input_active() {
             return WorkbenchAction::Consumed;
@@ -5677,10 +5677,11 @@ mod tests {
     #[test]
     fn collapsing_the_sidebar_moves_focus_to_the_editor() {
         let mut workbench = workbench();
-        workbench.handle_key(KeyEvent::new(
-            keys::TOGGLE_SIDEBAR.code,
-            KeyModifiers::CONTROL,
-        ));
+        assert_eq!(
+            workbench.handle_leader(press(keys::TOGGLE_SIDEBAR)),
+            WorkbenchAction::Consumed
+        );
+        assert!(workbench.sidebar_collapsed);
         assert_eq!(workbench.focus(), Focus::Editor);
     }
 

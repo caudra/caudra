@@ -9,9 +9,9 @@ const TEXT_FIELDS_INTRO: &str = "\
 These keys work the same in every text field: the composer, a picker's filter, \
 forms and prompts, `/btw`, and the workbench editor with its fields. Where a \
 surface binds one of them itself, the surface wins. `/btw` keeps `Ctrl+Y` to copy \
-the answer, and the permissions picker keeps `Ctrl+E` to edit and `Ctrl+K` to \
-revoke. In a list, `Home` and `End` move the cursor in its filter, and `Ctrl+Home` \
-and `Ctrl+End` pick the first and last item.\n\n\
+the answer, and the permissions picker keeps `Ctrl+E` to edit, `Ctrl+K` to revoke, \
+and `Ctrl+Y` to copy a rule. In a list, `Home` and `End` move the cursor in its \
+filter, and `Ctrl+Home` and `Ctrl+End` pick the first and last item.\n\n\
 `Ctrl+Z` is undo everywhere, so it never suspends Caudra. A masked field, such as \
 an API key, refuses to select all, copy, or cut. A terminal paste goes to the field \
 that has focus. `Super` chords need a terminal that reports them, such as one with \
@@ -125,7 +125,7 @@ fn write_focus(out: &mut String) {
         "Typing anything takes the focus back, and so does `Esc`. Clicking \
          the transcript gives it the focus, and clicking the composer \
          returns it. The wheel scrolls whatever the pointer is over and \
-         leaves the focus where it is. `Ctrl+U`, `Ctrl+G`, and `Ctrl+B` \
+         leaves the focus where it is. `Ctrl+U`, `Ctrl+G`, and `Ctrl+X b` \
          scroll the transcript wherever the focus sits, and an open modal \
          claims all four navigation keys for itself.\n\n",
     );

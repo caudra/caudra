@@ -678,7 +678,7 @@ impl PermissionsPicker {
                 KeyCode::Char('n') => return self.manage(EditorLaunch::New),
                 KeyCode::Char('e') => return self.edit_selected(false),
                 KeyCode::Char('u') => return self.edit_selected(true),
-                KeyCode::Char('b') => return self.copy_selected(),
+                KeyCode::Char('y') => return self.copy_selected(),
                 KeyCode::Char('f') => {
                     self.cycle_project_filter();
                     return PermissionsPickerAction::Consumed;
@@ -927,7 +927,7 @@ impl PermissionsPicker {
                     "[Edit source ^E]",
                     "[Duplicate ^U]",
                     "[Revoke ^K]",
-                    "[Copy ^B]",
+                    "[Copy ^Y]",
                 ]
             } else {
                 &[
@@ -935,7 +935,7 @@ impl PermissionsPicker {
                     "[Edit ^E]",
                     "[Duplicate ^U]",
                     "[Revoke ^K]",
-                    "[Copy ^B]",
+                    "[Copy ^Y]",
                 ]
             }
         } else {
@@ -3713,7 +3713,7 @@ mod tests {
     #[test_case('n'; "new")]
     #[test_case('e'; "edit")]
     #[test_case('u'; "duplicate")]
-    #[test_case('b'; "copy")]
+    #[test_case('y'; "copy")]
     fn management_shortcuts_return_typed_requests_without_mutation(shortcut: char) {
         let record = record();
         let expected = record.clone();
@@ -3742,7 +3742,7 @@ mod tests {
             PermissionsPickerAction::Editor(super::EditorEvent::Begin(
                 super::EditorLaunch::Copy { source, draft },
             )) => {
-                assert_eq!(shortcut, 'b');
+                assert_eq!(shortcut, 'y');
                 assert_eq!(*source, expected);
                 assert!(draft.is_none());
             }

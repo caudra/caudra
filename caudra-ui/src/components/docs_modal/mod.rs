@@ -716,7 +716,7 @@ fn list_move(key: KeyEvent, selected: usize, count: usize, page: usize) -> Optio
         _ if key::PAGE_UP.matches(key) || key::SCROLL_HALF_UP.matches(key) => up(page),
         _ if key::PAGE_DOWN.matches(key) => down(page),
         _ if LIST_FIRST.matches(key) || key::SCROLL_TOP.matches(key) => 0,
-        _ if LIST_LAST.matches(key) || key::SCROLL_BOTTOM.matches(key) => last,
+        _ if LIST_LAST.matches(key) => last,
         _ => return None,
     })
 }
@@ -828,6 +828,7 @@ mod tests {
     };
     use super::search::{HIT_ROWS, SNIPPET_INDENT};
     use super::*;
+    use crate::components::keybindings::leader;
     use crate::components::{buffer_text, key as press};
 
     const WIDE: u16 = 140;
@@ -1448,6 +1449,7 @@ mod tests {
     #[test_case(LIST_LAST.to_key_event(), Some(SHRUNK_TO - 1) ; "ctrl_end_selects_the_last_row")]
     #[test_case(press(KeyCode::Home), None ; "home_is_left_to_the_field")]
     #[test_case(press(KeyCode::End), None ; "end_is_left_to_the_field")]
+    #[test_case(leader::SCROLL_BOTTOM.to_key_event(), None ; "the_bare_leader_key_is_left_to_the_field")]
     fn only_ctrl_takes_a_list_to_its_ends(event: KeyEvent, expected: Option<usize>) {
         assert_eq!(list_move(event, MIDDLE_ROW, SHRUNK_TO, LIST_PAGE), expected);
     }

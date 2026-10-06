@@ -301,9 +301,7 @@ impl LogsModal {
             _ if key::SCROLL_LINE_UP.matches(event) => self.move_cursor(-1),
             _ if key::SCROLL_LINE_DOWN.matches(event) => self.move_cursor(1),
             _ if key::SCROLL_TOP.matches(event) => self.move_cursor(-(MIN_OVERSCAN as isize)),
-            _ if key::SCROLL_BOTTOM.matches(event) || key::DOC_BOTTOM.matches(event) => {
-                self.reload();
-            }
+            _ if key::DOC_BOTTOM.matches(event) => self.reload(),
             _ => {}
         }
         LogsAction::Consumed
@@ -1128,7 +1126,7 @@ mod tests {
     use super::*;
     use caudra_workbench::scroll::SCROLLBAR_THUMB_HORIZONTAL;
 
-    use crate::components::keybindings::key as kb;
+    use crate::components::keybindings::{Bind, key as kb, leader};
     use crate::components::{buffer_text, key};
     use crate::theme;
     use test_case::test_case;
@@ -1366,6 +1364,18 @@ mod tests {
 
         modal.scroll(-3);
         assert!(modal.follow);
+    }
+
+    #[test_case(kb::DOC_BOTTOM, true ; "end_returns_to_the_newest_record")]
+    #[test_case(leader::SCROLL_BOTTOM, false ; "the_bare_leader_key_stays_put")]
+    fn only_end_returns_to_the_newest_record(bind: Bind, follows: bool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut modal = seeded_modal(tmp.path());
+        modal.scroll(3);
+
+        modal.handle_key(bind.to_key_event());
+
+        assert_eq!(modal.follow, follows);
     }
 
     #[test]

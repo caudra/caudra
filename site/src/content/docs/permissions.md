@@ -445,7 +445,7 @@ The detail pane summarizes the selected rule in plain words: what it allows or r
 | `Ctrl-N` | New rule |
 | `Ctrl-E` | Edit the selected stored rule, or Edit source when a verified local source is available |
 | `Ctrl-U` | Duplicate the selected stored rule |
-| `Ctrl-B` | Copy the selected stored rule, leaving its source unchanged |
+| `Ctrl-Y` | Copy the selected stored rule, leaving its source unchanged |
 | `Ctrl-K` | Start a separate Revoke review |
 | `Ctrl-F` | Cycle All, Here, Other, and History filters. History shows revoked records |
 

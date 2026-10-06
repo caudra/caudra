@@ -11,7 +11,7 @@ Leader chords are written as two keys below, and every one of them is reachable 
 
 `PageUp`, `PageDown`, `Home`, and `End` act on whatever holds the keyboard. While you are typing they belong to the composer, so `Home` and `End` move the text cursor and the page keys scroll a draft too tall to fit. When the draft fits, a page key scrolls the transcript and hands it the focus, so `Home` and `End` then reach the top and bottom of the chat.
 
-Typing anything takes the focus back, and so does `Esc`. Clicking the transcript gives it the focus, and clicking the composer returns it. The wheel scrolls whatever the pointer is over and leaves the focus where it is. `Ctrl+U`, `Ctrl+G`, and `Ctrl+B` scroll the transcript wherever the focus sits, and an open modal claims all four navigation keys for itself.
+Typing anything takes the focus back, and so does `Esc`. Clicking the transcript gives it the focus, and clicking the composer returns it. The wheel scrolls whatever the pointer is over and leaves the focus where it is. `Ctrl+U`, `Ctrl+G`, and `Ctrl+X b` scroll the transcript wherever the focus sits, and an open modal claims all four navigation keys for itself.
 
 Anywhere a scrollbar is shown it can be dragged. Press the thumb and the surface follows the pointer, press the track anywhere else and the thumb jumps there and stays held. Hold `Alt` while dragging to cover an eighth of the distance, which is what makes a long transcript landable. Dragging the transcript bar shows which message the thumb is on.
 
@@ -60,14 +60,14 @@ Holding `Alt` while turning the wheel scrolls four times as far. A middle-click 
 | `Ctrl+U` | Scroll half page up |
 | `Shift+Left` / `Shift+Right` | Pan a wide diagram left / right |
 | `Ctrl+G` | Scroll to top |
-| `Ctrl+B` | Scroll to bottom |
+| `Ctrl+X b` | Scroll to bottom |
 | `Ctrl+Q` / `Ctrl+X q` | Pop queue |
 | `Esc Esc` | Rewind |
 | `Ctrl+X e` | Edit the prompt in the workbench |
 
 ## Text Fields
 
-These keys work the same in every text field: the composer, a picker's filter, forms and prompts, `/btw`, and the workbench editor with its fields. Where a surface binds one of them itself, the surface wins. `/btw` keeps `Ctrl+Y` to copy the answer, and the permissions picker keeps `Ctrl+E` to edit and `Ctrl+K` to revoke. In a list, `Home` and `End` move the cursor in its filter, and `Ctrl+Home` and `Ctrl+End` pick the first and last item.
+These keys work the same in every text field: the composer, a picker's filter, forms and prompts, `/btw`, and the workbench editor with its fields. Where a surface binds one of them itself, the surface wins. `/btw` keeps `Ctrl+Y` to copy the answer, and the permissions picker keeps `Ctrl+E` to edit, `Ctrl+K` to revoke, and `Ctrl+Y` to copy a rule. In a list, `Home` and `End` move the cursor in its filter, and `Ctrl+Home` and `Ctrl+End` pick the first and last item.
 
 `Ctrl+Z` is undo everywhere, so it never suspends Caudra. A masked field, such as an API key, refuses to select all, copy, or cut. A terminal paste goes to the field that has focus. `Super` chords need a terminal that reports them, such as one with the kitty keyboard protocol.
 
@@ -182,7 +182,7 @@ These keys exist only with `sandboxes = true` under `[experimental]`. See [Exper
 | `i` / `b` / `g` / `l` | Images: approved offline Import, Build, GC or Inspect |
 | `g` / `F4` / `F6` | Live network preview/apply; Test rules (no probe); discard action draft |
 | `Ctrl+N` / `Ctrl+U` | Domain and CIDR lists: append a rule line, or clear the current line |
-| `Ctrl+G` / `Ctrl+B` | Live action forms: focus the first or last field |
+| `Ctrl+G` / `Ctrl+L` | Live action forms: focus the first or last field |
 
 See [Managed Sandboxes](/docs/sandboxes/#tui-manager) for instance actions and [image forms](/docs/sandboxes/#images-and-template-catalog) for the host picker and approved probe. File uploads and downloads live in the [workbench Transfer view](/docs/workbench/#transfer), available after attaching to a sandbox. Leaving Transfer requests cancellation and waits for cleanup.
 
@@ -191,7 +191,7 @@ See [Managed Sandboxes](/docs/sandboxes/#tui-manager) for instance actions and [
 | Key | Action |
 |-----|--------|
 | `Esc` / `Ctrl+X w` | Back to the transcript |
-| `Ctrl+B` | Show or hide the sidebar |
+| `Ctrl+X b` | Show or hide the sidebar |
 | `Ctrl+X -` / `Ctrl+X =` | Narrow / widen the sidebar |
 | `Ctrl+X 1` | Explorer |
 | `Ctrl+X 2` | Source control |
@@ -240,7 +240,7 @@ Some pickers add extra bindings on top of the defaults:
 | Peer Manager | `Enter` | Open the selected message review, inspect a peer, or read a channel; never approve from the list |
 | Peer Manager | `Enter` | In This session, remove the focused topic, switch broadcasts, or subscribe to the typed patterns |
 | Peer Manager | `Ctrl+R` | Refresh peer discovery or the message history without blocking the interface |
-| Peer Manager | `Ctrl+B` | Copy the selected peer's @name or exact target outside filter editing |
+| Peer Manager | `Ctrl+Y` | Copy the selected peer's @name or exact target outside filter editing |
 | Peer Manager | `o` | Load the selected channel's older stored messages |
 | Peer Manager | `s` | Subscribe to or unsubscribe from the selected topic, or switch broadcasts on or off |
 | Peer Manager | `y` | Approve the current rendered message review once |

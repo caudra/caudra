@@ -1666,10 +1666,6 @@ impl Workbench {
         if keys::LEADER.matches(key) {
             return WorkbenchAction::Passthrough;
         }
-        if keys::TOGGLE_SIDEBAR.matches(key) {
-            self.sidebar_collapsed = !self.sidebar_collapsed;
-            return WorkbenchAction::Consumed;
-        }
         if keys::QUICK_OPEN.matches(key) {
             return self.leave_transfer(TransferExit::QuickOpen);
         }
@@ -3318,7 +3314,7 @@ mod tests {
         assert_eq!(workbench.handle_leader(grow), WorkbenchAction::Consumed);
         assert!(workbench.sidebar_width > before);
         assert_eq!(
-            press(&mut workbench, keys::TOGGLE_SIDEBAR),
+            workbench.handle_leader(keys::TOGGLE_SIDEBAR.to_key_event()),
             WorkbenchAction::Consumed
         );
         assert!(workbench.sidebar_collapsed);

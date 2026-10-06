@@ -22,7 +22,7 @@ A sidebar on the left, tabs and a buffer on the right, one status row along the 
 └─────────────────────────────────────────────────┘
 ```
 
-`Ctrl+B` hides the sidebar. `Ctrl+X -` and `Ctrl+X =` change its width, and you can drag the divider with the mouse. On a terminal too narrow for both panes the sidebar drops out and the editor keeps the room.
+`Ctrl+X b` hides the sidebar. `Ctrl+X -` and `Ctrl+X =` change its width, and you can drag the divider with the mouse. On a terminal too narrow for both panes the sidebar drops out and the editor keeps the room.
 
 `Tab` and `Shift+Tab` move between the sidebar and the editor. `Ctrl+X 1`, `Ctrl+X 2`, and `Ctrl+X 3` switch the sidebar to the explorer, source control, or search, and put the cursor there. The `FILES`, `GIT`, and `FIND` labels in the sidebar header do the same thing with the mouse.
 
@@ -284,7 +284,7 @@ Empty-directory creation requires negotiated directory-publication support. Loca
 | `X` | Stop the running operation |
 | `Esc` | Close the prompt or panel, then leave Transfer |
 
-The sidebar sums up the changes, what the selection would carry each way, and the last transfer report. `Ctrl+B`, `Ctrl+X -` and `Ctrl+X =` hide and resize it as in the other views. `Ctrl+P` leaves Transfer for the Explorer and opens quick open once cleanup ends.
+The sidebar sums up the changes, what the selection would carry each way, and the last transfer report. `Ctrl+X b`, `Ctrl+X -` and `Ctrl+X =` hide and resize it as in the other views. `Ctrl+P` leaves Transfer for the Explorer and opens quick open once cleanup ends.
 
 The mouse follows the Explorer. Click a row to move the cursor, click its marker or double-click a folder to expand it, and click the check column to select. Double-click a file to open its diff. Toolbar buttons run their action, and clicking a pane header edits that root. Clicking a key in the status row presses it. While a root is being edited, the toolbar waits for it to be confirmed or cancelled, and the status row offers the keys that do either.
 

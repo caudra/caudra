@@ -23,7 +23,7 @@ A project cannot enable the experiment. An inbound setting or saved session cann
 
 `/peers` opens the Sessions view of the peer manager. `/messages` opens its Held messages view, and `/topics` opens its Messages view limited to topics. Switch views with `1`, `2`, and `3`. See [inbound policy and trust](/docs/permissions/#cross-session-messages) before allowing automatic delivery.
 
-Sessions shows a discovery snapshot of eligible live peers. Select a row to inspect its messaging name, workspace, activity, inbound policy, subscriptions, and broadcast setting. `Ctrl+R` refreshes without blocking the interface. `Ctrl+B` copies the name as `@name`, or the word-based target of a peer without a name. A failed refresh keeps the previous snapshot visible with an error.
+Sessions shows a discovery snapshot of eligible live peers. Select a row to inspect its messaging name, workspace, activity, inbound policy, subscriptions, and broadcast setting. `Ctrl+R` refreshes without blocking the interface. `Ctrl+Y` copies the name as `@name`, or the word-based target of a peer without a name. A failed refresh keeps the previous snapshot visible with an error.
 
 Press `/` to filter the current list, then Enter to leave filter editing. The Sessions filter also matches messaging names and subscriptions. Enter on a held message opens its review. Read the literal message body, then use `y` to approve once or `n` to review rejection. Rejecting removes the message from the live inbox. Browsing, filtering, and refreshing grant no approval. Tab switches list/detail focus. Esc backs out before closing. Narrow terminals show one pane at a time.
 

@@ -42,7 +42,7 @@ const LIVE_FIELD_ROWS: u16 = 6;
 const RECOVERY_REQUIRED: &str = "Pending or unknown outcome: Inspect / Reconcile first; acknowledging failure is separate from retrying.";
 const PERSISTENT_REQUIRED: &str =
     "Requires a persistent disk. Stop never silently deletes an ephemeral instance.";
-const LIVE_KEYS: &str = "Ctrl+Enter previews (does not execute). Esc goes back one level and keeps this draft; F6 discards it. Tab changes field; Ctrl+G/Ctrl+B selects first/last field. Network F4 evaluates rules only.";
+const LIVE_KEYS: &str = "Ctrl+Enter previews (does not execute). Esc goes back one level and keeps this draft; F6 discards it. Tab changes field; Ctrl+G/Ctrl+L selects first/last field. Network F4 evaluates rules only.";
 const DRAFT_NEW: &str = "Live action draft.";
 const DRAFT_RESTORED: &str = "Retained action draft; nothing was submitted while it was set aside.";
 const DRAFT_KEPT: &str =

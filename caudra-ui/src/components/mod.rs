@@ -868,9 +868,7 @@ impl ModalScroll {
                 self.offset = 0;
                 self.auto_scroll = false;
             }
-            _ if key::SCROLL_BOTTOM.matches(key_event) || key::DOC_BOTTOM.matches(key_event) => {
-                self.follow();
-            }
+            _ if key::DOC_BOTTOM.matches(key_event) => self.follow(),
             _ => return false,
         }
         true
@@ -2066,6 +2064,17 @@ mod tests {
 
         scroll.reveal_and_hold(0, 1);
         scroll.update_dimensions(MODAL_TOTAL, MODAL_VIEWPORT);
+        assert_eq!(scroll.offset(), 0);
+    }
+
+    /// A leader chord ends on a bare letter, which a modal may be taking as
+    /// typing, so scrolling never answers to one.
+    #[test]
+    fn modal_scroll_leaves_the_bare_leader_key_alone() {
+        let mut scroll = ModalScroll::new_top();
+        scroll.update_dimensions(MODAL_TOTAL, MODAL_VIEWPORT);
+
+        assert!(!scroll.handle_key(keybindings::leader::SCROLL_BOTTOM.to_key_event()));
         assert_eq!(scroll.offset(), 0);
     }
 
