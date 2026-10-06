@@ -19,6 +19,7 @@ bytes.workspace = true
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 dom_query = { version = "=0.28.0", features = ["markdown", "mini_selector"] }
 dom_smoothie = "=0.18.0"
+encoding_rs.workspace = true
 futures-util.workspace = true
 htmd = "=0.5.4"
 http.workspace = true
@@ -36,6 +37,9 @@ tokio.workspace = true
 tokio-util.workspace = true
 url.workspace = true
 workcell-tool-contract.workspace = true
+
+[dev-dependencies]
+test-case.workspace = true
 
 [lints]
 workspace = true

@@ -1571,6 +1571,39 @@ async fn a_page_cut_by_the_response_bound_ends_by_saying_so() {
 }
 
 #[tokio::test]
+async fn a_windows_1251_page_reaches_the_model_as_cyrillic_prose() {
+    let paragraph = "Исследователи из нескольких университетов опубликовали подробный отчёт о том, как изменение климата влияет на сельское хозяйство в северных регионах. В отчёте приводятся данные за двадцать лет наблюдений, а также рекомендации для фермеров и местных властей.";
+    let page = format!(
+        "<html><head><title>Отчёт</title></head><body><article><h1>Отчёт</h1><p>{paragraph}</p></article></body></html>"
+    );
+    let (body, _, _) = encoding_rs::WINDOWS_1251.encode(&page);
+    let group = WebToolGroup::with_dependencies(
+        WebsearchExecutionConfiguration::unconfigured(),
+        dependencies(
+            Arc::new(FakeHttp::with_responses(vec![Ok(response(
+                "https://example.test/report.html",
+                StatusCode::OK,
+                Some("text/html; charset=windows-1251"),
+                Bytes::from(body.into_owned()),
+            ))])),
+            Arc::new(FakeIcons::default()),
+            default_pdf(),
+        ),
+    );
+    let result = call(
+        &group,
+        "webfetch",
+        json!({"url": "https://example.test/report.html"}),
+    )
+    .await;
+    assert!(
+        text(&result).contains(paragraph),
+        "missing Cyrillic prose in {:?}",
+        text(&result)
+    );
+}
+
+#[tokio::test]
 async fn webfetch_pdf_extract_attachment_and_parser_failures_are_classified() {
     let pdf = Bytes::from_static(b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\n%%EOF\n");
     let called = Arc::new(AtomicBool::new(false));

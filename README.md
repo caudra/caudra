@@ -1438,7 +1438,12 @@ content.
   the URL, scheme, credential, special-use-name, and IP-literal checks still run locally.
 - `format` accepts `markdown`, `text`, or `html` and defaults to `markdown`. For HTML pages, Markdown and
   text modes use readability-oriented extraction and remove scripts, styles, iframes, and framework
-  payloads. HTML mode returns bounded raw HTML while still deriving safe title and extraction metadata.
+  payloads. A line counts as a payload by its symbols and braces, never by its letters, so prose in
+  any script survives, and a line of links is dropped only when its addresses make up most of it.
+  HTML mode returns bounded raw HTML while still deriving safe title and extraction metadata.
+- Text is decoded in the encoding named by a byte-order mark, then the `Content-Type` charset, then
+  an HTML `<meta>` declaration in the first 1,024 bytes, and as UTF-8 otherwise. Unknown labels fall
+  back to UTF-8, and malformed bytes become U+FFFD instead of failing the fetch.
 - `timeout` is one total network-and-primary-parsing deadline in seconds. It defaults to 30 and is
   capped at 60. Optional icon decoration is skipped when that deadline is exhausted.
 - General response bodies are capped at 5 MiB. Model-facing output is independently capped at 2,000

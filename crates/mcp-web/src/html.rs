@@ -14,13 +14,19 @@ static SOURCE_NOISE: LazyLock<Regex> = LazyLock::new(|| {
     )
     .expect("source-noise regex")
 });
-static WORD: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"[A-Za-z\u{00C0}-\u{017F}]{3,}").expect("word regex"));
-static URL_HIT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)https?://").expect("URL regex"));
+static WORD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\p{L}{3,}").expect("word regex"));
+static URL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?i)https?://[^\s)\]>"']+"#).expect("URL regex"));
+/// A Markdown link this module's own converter wrote. Its brackets and target
+/// are structure, not the payload the line filter looks for.
+static MARKDOWN_LINK: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[([^\]]*)\]\([^)\s]*\)").expect("Markdown link regex"));
 static BRACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[{}\[\]]").expect("brace regex"));
-static SYMBOL: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"[^a-zA-Z0-9\s.,;:!?"'()\[\]{}\-_/]"#).expect("symbol regex"));
+/// Letters, marks, and digits of every script are text, so only punctuation and
+/// symbols outside ordinary prose count.
+static SYMBOL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"[^\p{L}\p{M}\p{N}\s.,;:!?"'()\[\]{}\-_/]"#).expect("symbol regex")
+});
 
 const SKIP_TAGS: &[&str] = &[
     "script", "style", "meta", "link", "noscript", "iframe", "object", "embed",
@@ -244,18 +250,65 @@ fn is_likely_source_payload_line(line: &str) -> bool {
     if length < 140 {
         return false;
     }
-    if URL_HIT.find_iter(trimmed).count() >= 3 {
+    if is_mostly_urls(trimmed, length) {
         return true;
     }
-    let braces = BRACE.find_iter(trimmed).count();
-    let symbols = SYMBOL.find_iter(trimmed).count();
-    let ratio = symbols as f64 / length as f64;
+    let prose = MARKDOWN_LINK.replace_all(trimmed, "$1");
+    let length = prose.chars().count();
+    let braces = BRACE.find_iter(&prose).count();
+    let symbols = SYMBOL.find_iter(&prose).count();
+    let ratio = symbols as f64 / length.max(1) as f64;
     (length >= 220 && (braces >= 8 || ratio > 0.22)) || ratio > 0.33
+}
+
+/// A line of three or more URLs that make up most of its characters is a list
+/// of asset or tracking addresses. Prose that links three sources is not.
+fn is_mostly_urls(line: &str, length: usize) -> bool {
+    let (count, characters) = URL
+        .find_iter(line)
+        .fold((0, 0), |(count, characters), url| {
+            (count + 1, characters + url.as_str().chars().count())
+        });
+    count >= 3 && characters * 2 > length
 }
 
 #[cfg(test)]
 mod tests {
+    use test_case::test_case;
+
     use super::*;
+
+    const CYRILLIC_PARAGRAPH: &str = "Исследователи из нескольких университетов опубликовали подробный отчёт о том, как изменение климата влияет на сельское хозяйство в северных регионах. В отчёте приводятся данные за двадцать лет наблюдений, а также рекомендации для фермеров и местных властей.";
+    const CHINESE_PARAGRAPH: &str = "研究人员在多所大学发表了一份详细报告，说明气候变化如何影响北方地区的农业生产。报告列出了二十年来的观测数据，并为农民和地方政府提出了具体建议。报告指出，气温上升使生长季节延长，但降水模式的变化也带来了新的风险。作者建议加强灌溉系统建设，推广耐旱作物品种，并建立区域性的气象预警网络。他们还强调，农业保险制度需要根据新的气候条件进行调整，以保护小规模农户的收入。此外，报告呼吁各级政府加大对农业科研的投入，支持高校与企业合作开发适应性技术，并通过培训帮助农民掌握新的种植方法。";
+    const GREEK_PARAGRAPH: &str = "Οι ερευνητές από πολλά πανεπιστήμια δημοσίευσαν μια λεπτομερή έκθεση για το πώς η κλιματική αλλαγή επηρεάζει τη γεωργία στις βόρειες περιοχές. Η έκθεση παρουσιάζει δεδομένα είκοσι ετών παρατηρήσεων και προτείνει συγκεκριμένα μέτρα για τους αγρότες και τις τοπικές αρχές.";
+    const ARABIC_PARAGRAPH: &str = "نشر باحثون من عدة جامعات تقريرا مفصلا حول كيفية تأثير تغير المناخ على الزراعة في المناطق الشمالية. ويعرض التقرير بيانات عشرين عاما من الرصد، ويقدم توصيات محددة للمزارعين والسلطات المحلية، مع التركيز على أنظمة الري والمحاصيل المقاومة للجفاف.";
+    const VIETNAMESE_PARAGRAPH: &str = "Các nhà nghiên cứu từ nhiều trường đại học đã công bố một báo cáo chi tiết về việc biến đổi khí hậu ảnh hưởng đến nông nghiệp ở các vùng phía bắc như thế nào. Báo cáo trình bày dữ liệu quan sát trong hai mươi năm và đưa ra các khuyến nghị cụ thể cho nông dân và chính quyền địa phương.";
+    const LINKED_PARAGRAPH: &str = "The survey combines three sources: the [national weather archive](https://weather.example.test/archive/2025), the [regional crop yield tables](https://agri.example.test/yields/regional), and the [farm insurance claims register](https://insurance.example.test/claims). Each source covers the same twenty-year period.";
+    const MINIFIED_SCRIPT: &str = "!function(e){var t={};function n(r){if(t[r])return t[r].exports;var o=t[r]={i:r,l:!1,exports:{}};return e[r].call(o.exports,o,o.exports,n),o.l=!0,o.exports}n.m=e,n.c=t,n.d=function(e,t,r){n.o(e,t)||Object.defineProperty(e,t,{enumerable:!0,get:r})}}([]);";
+    const ASSET_ADDRESSES: &str = "https://cdn.example.test/assets/app.3f9a1c.js https://cdn.example.test/assets/vendor.77b2e0.js https://cdn.example.test/assets/styles.1d04aa.css https://cdn.example.test/fonts/inter.woff2";
+    const TRACKING_LINKS: &str = "[](https://t.example.test/p?id=1) [](https://t.example.test/p?id=2) [](https://t.example.test/p?id=3) [](https://t.example.test/p?id=4) [](https://t.example.test/p?id=5)";
+    const INLINE_STATE: &str = r#"{"props":{"pageProps":{"items":[{"id":1,"name":"alpha"},{"id":2,"name":"beta"},{"id":3,"name":"gamma"}],"meta":{"total":3,"page":1}}},"page":"/catalog","query":{},"buildId":"a1b2c3","isFallback":false,"gssp":true,"locale":"en"}"#;
+    const FRAMEWORK_STATE: &str = r#"window.__INITIAL_STATE__={"user":null}"#;
+
+    #[test_case(CYRILLIC_PARAGRAPH ; "a Cyrillic paragraph")]
+    #[test_case(CHINESE_PARAGRAPH ; "a Chinese paragraph")]
+    #[test_case(GREEK_PARAGRAPH ; "a Greek paragraph")]
+    #[test_case(ARABIC_PARAGRAPH ; "an Arabic paragraph")]
+    #[test_case(VIETNAMESE_PARAGRAPH ; "a Vietnamese paragraph")]
+    #[test_case(LINKED_PARAGRAPH ; "a paragraph that links three sources")]
+    fn prose_is_never_mistaken_for_a_source_payload(paragraph: &str) {
+        assert!(paragraph.chars().count() > 220);
+        assert!(!is_likely_source_payload_line(paragraph));
+    }
+
+    #[test_case(MINIFIED_SCRIPT ; "a minified script")]
+    #[test_case(ASSET_ADDRESSES ; "a list of asset addresses")]
+    #[test_case(TRACKING_LINKS ; "a row of empty tracking links")]
+    #[test_case(INLINE_STATE ; "inline JSON state")]
+    #[test_case(FRAMEWORK_STATE ; "a framework state marker")]
+    fn source_payloads_are_dropped(line: &str) {
+        assert!(is_likely_source_payload_line(line));
+    }
 
     #[test]
     fn title_and_fallback_use_html_parsing() {

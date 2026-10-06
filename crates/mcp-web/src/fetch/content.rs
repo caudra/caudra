@@ -1,4 +1,8 @@
+use std::sync::LazyLock;
+
+use encoding_rs::{Encoding, UTF_8, UTF_16BE, UTF_16LE};
 use http::{HeaderMap, HeaderValue};
+use regex::bytes::Regex;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -8,6 +12,14 @@ use crate::html::{add_title_context, extract_html_for_prompt};
 use crate::types::WebfetchFormat;
 
 const USER_AGENT: &str = "Workcell-ToolRuntime/0.1";
+/// How far into an HTML document a `<meta>` charset declaration is honored,
+/// matching the prescan length browsers use.
+const META_PRESCAN_BYTES: usize = 1024;
+
+static META_CHARSET: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i-u)<meta[^>]*?charset\s*=\s*["']?\s*([a-z0-9_:.\-]+)"#)
+        .expect("meta charset regex")
+});
 
 pub(super) struct FormattedContent {
     pub output: String,
@@ -116,6 +128,39 @@ pub(super) fn normalized_content_type(headers: &HeaderMap) -> Option<String> {
         .map(str::to_ascii_lowercase)
 }
 
+/// Decodes a text body. A byte-order mark wins, then the Content-Type charset,
+/// then an HTML `<meta>` declaration, then UTF-8. Malformed sequences become
+/// U+FFFD rather than failing the fetch.
+pub(super) fn decode_text(bytes: &[u8], headers: &HeaderMap, html: bool) -> String {
+    let declared = header_charset(headers).or_else(|| html.then(|| meta_charset(bytes)).flatten());
+    let (text, _, _) = declared.unwrap_or(UTF_8).decode(bytes);
+    text.into_owned()
+}
+
+fn header_charset(headers: &HeaderMap) -> Option<&'static Encoding> {
+    let value = headers.get(http::header::CONTENT_TYPE)?.to_str().ok()?;
+    value.split(';').skip(1).find_map(|parameter| {
+        let (name, label) = parameter.split_once('=')?;
+        if !name.trim().eq_ignore_ascii_case("charset") {
+            return None;
+        }
+        Encoding::for_label(label.trim().trim_matches('"').as_bytes())
+    })
+}
+
+fn meta_charset(bytes: &[u8]) -> Option<&'static Encoding> {
+    let prefix = &bytes[..bytes.len().min(META_PRESCAN_BYTES)];
+    let label = META_CHARSET.captures(prefix)?.get(1)?.as_bytes();
+    let encoding = Encoding::for_label(label)?;
+    // A document that declares its encoding in ASCII bytes cannot be UTF-16,
+    // so browsers read such a declaration as UTF-8.
+    Some(if encoding == UTF_16BE || encoding == UTF_16LE {
+        UTF_8
+    } else {
+        encoding
+    })
+}
+
 pub(super) fn is_text_like(value: &str) -> bool {
     value.starts_with("text/")
         || value.contains("json")
@@ -148,5 +193,72 @@ fn blocking_error(error: BlockingError, timeout_seconds: u64) -> WebfetchError {
         BlockingError::Cancelled => WebfetchError::Aborted,
         BlockingError::TimedOut => WebfetchError::timed_out(timeout_seconds),
         BlockingError::Panicked => parse_error(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use encoding_rs::{SHIFT_JIS, WINDOWS_1251};
+    use test_case::test_case;
+
+    use super::*;
+
+    const CYRILLIC: &str = "Привет, мир";
+    const JAPANESE: &str = "日本語の本文";
+    const UMLAUTS: &str = "Grüße";
+    const UTF8_BYTE_ORDER_MARK: &[u8] = b"\xEF\xBB\xBF";
+
+    fn content_type(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_str(value).expect("content type"),
+        );
+        headers
+    }
+
+    #[test]
+    fn a_content_type_charset_decodes_the_body() {
+        let (bytes, _, _) = WINDOWS_1251.encode(CYRILLIC);
+        let headers = content_type("text/plain; charset=windows-1251");
+        assert_eq!(decode_text(&bytes, &headers, false), CYRILLIC);
+    }
+
+    #[test_case(r#"<meta charset="Shift_JIS">"# ; "a meta charset attribute")]
+    #[test_case(r#"<meta http-equiv="Content-Type" content="text/html; charset=Shift_JIS">"# ; "a meta http-equiv declaration")]
+    fn a_meta_declaration_decodes_an_html_body(declaration: &str) {
+        let page = format!("<html><head>{declaration}</head><body>{JAPANESE}</body></html>");
+        let (bytes, _, _) = SHIFT_JIS.encode(&page);
+        assert_eq!(decode_text(&bytes, &content_type("text/html"), true), page);
+    }
+
+    #[test]
+    fn a_content_type_charset_outranks_a_meta_declaration() {
+        let page = format!(r#"<meta charset="utf-8"><p>{CYRILLIC}</p>"#);
+        let (bytes, _, _) = WINDOWS_1251.encode(&page);
+        let headers = content_type("text/html; charset=windows-1251");
+        assert_eq!(decode_text(&bytes, &headers, true), page);
+    }
+
+    #[test]
+    fn a_byte_order_mark_outranks_the_content_type_charset() {
+        let bytes = [UTF8_BYTE_ORDER_MARK, UMLAUTS.as_bytes()].concat();
+        let headers = content_type("text/plain; charset=windows-1252");
+        assert_eq!(decode_text(&bytes, &headers, false), UMLAUTS);
+    }
+
+    #[test]
+    fn an_unknown_charset_label_falls_back_to_utf8() {
+        let headers = content_type("text/plain; charset=no-such-charset");
+        assert_eq!(decode_text(UMLAUTS.as_bytes(), &headers, false), UMLAUTS);
+    }
+
+    #[test]
+    fn a_meta_declaration_in_plain_text_is_only_text() {
+        let body = format!(r#"<meta charset="windows-1251"> {UMLAUTS}"#);
+        assert_eq!(
+            decode_text(body.as_bytes(), &content_type("text/plain"), false),
+            body
+        );
     }
 }

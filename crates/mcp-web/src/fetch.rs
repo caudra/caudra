@@ -146,7 +146,11 @@ pub(crate) async fn execute(
     }
 
     let text_body_truncated = body.len() > MAX_RESPONSE_BYTES;
-    let body = String::from_utf8_lossy(&body[..body.len().min(MAX_RESPONSE_BYTES)]).into_owned();
+    let body = content::decode_text(
+        &body[..body.len().min(MAX_RESPONSE_BYTES)],
+        &response.headers,
+        content::is_html(content_type.as_deref()),
+    );
     let formatted = content::format(
         body.clone(),
         input.format,
