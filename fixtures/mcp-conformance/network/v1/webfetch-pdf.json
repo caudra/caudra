@@ -29,7 +29,8 @@
       "expectedInputPrefix": "%PDF-",
       "result": {
         "text": "PDF body text with useful research evidence.",
-        "title": "PDF Study"
+        "title": "PDF Study",
+        "pageCount": 1
       }
     }
   },
@@ -45,7 +46,8 @@
       "status": 200,
       "title": "PDF Study",
       "output": "PDF body text with useful research evidence.",
-      "truncated": false
+      "truncated": false,
+      "pageCount": 1
     },
     "requestIncludes": [
       {

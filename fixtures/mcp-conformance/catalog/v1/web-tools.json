@@ -170,7 +170,7 @@
       },
       {
         "name": "webfetch",
-        "description": "Fetch content from a URL and return model-facing text.\n\n- The url parameter must be http or https.\n- The format parameter can be markdown, text, or html. It defaults to markdown.\n- The pdfMode parameter can be extract or attachment. It defaults to extract.\n- The timeout parameter is optional, in seconds, defaults to 30, and is capped at 60.\n- HTML pages are simplified for markdown/text output and script/style content is removed.\n- PDF responses are parsed to extracted text by default. Use pdfMode='attachment' to preserve the PDF as a data:application/pdf attachment without text extraction.\n- Model-facing output is bounded and may be truncated; truncated output ends with a line naming the limit that cut it. Structured metadata preserves URL, content type, format, status, and source icon metadata when available.\n- Use websearch first when you need to discover candidate URLs.",
+        "description": "Fetch content from a URL and return model-facing text.\n\n- The url parameter must be http or https.\n- The format parameter can be markdown, text, or html. It defaults to markdown.\n- The pdfMode parameter can be extract or attachment. It defaults to extract.\n- The timeout parameter is optional, in seconds, defaults to 30, and is capped at 60.\n- HTML pages are simplified for markdown/text output and script/style content is removed.\n- PDF responses are parsed to extracted text by default. Use pdfMode='attachment' to preserve the PDF as a data:application/pdf attachment without text extraction. When the host limits attachments, a PDF over the limit is returned as extracted text that says why.\n- Model-facing output is bounded and may be truncated; truncated output ends with a line naming the limit that cut it. Structured metadata preserves URL, content type, format, status, and source icon metadata when available.\n- Use websearch first when you need to discover candidate URLs.",
         "inputSchema": {
           "type": "object",
           "additionalProperties": false,
@@ -273,6 +273,22 @@
                 {
                   "type": "null"
                 }
+              ]
+            },
+            "pageCount": {
+              "description": "Pages in a fetched PDF, when they were counted.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "pdfFallbackReason": {
+              "description": "Why a PDF requested as an attachment was returned as extracted text.",
+              "type": [
+                "string",
+                "null"
               ]
             },
             "extractionMethod": {

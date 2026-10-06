@@ -20,6 +20,9 @@ pub(crate) struct NormalizedWebfetchInput {
     pub headers: HeaderMap,
     pub max_redirects: usize,
     pub max_body_bytes: usize,
+    /// Host-set page limit for PDF attachments. `None` attaches any PDF that
+    /// fits the response bound; `Some(0)` always extracts text instead.
+    pub pdf_attachment_page_limit: Option<usize>,
 }
 
 pub(crate) fn normalize_input(
@@ -64,6 +67,7 @@ pub(crate) fn normalize_input(
         headers: content::headers(input.format),
         max_redirects: MAX_REDIRECTS,
         max_body_bytes: MAX_PDF_RESPONSE_BYTES,
+        pdf_attachment_page_limit: None,
     })
 }
 

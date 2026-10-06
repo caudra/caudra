@@ -1460,12 +1460,17 @@ PDF responses have a separate 6 MiB transfer ceiling and support two explicit mo
 - `pdfMode: "extract"` is the default. Workcell verifies the PDF signature, rejects documents over 200
   pages or other structural limits, bounds extracted text to 2 MiB, normalizes page text, and then
   applies the normal 2,000-line and 50 KiB model-output limits. The structured result reports
-  `pdfMode: "extract"` and whether transfer, parser, or output bounds truncated the result, and a
-  truncated result ends with the line that names the limit.
+  `pdfMode: "extract"`, `pageCount`, and whether transfer, parser, or output bounds truncated the
+  result, and a truncated result ends with the line that names the limit.
 - `pdfMode: "attachment"` skips text extraction and returns the complete bounded PDF as an
   `application/pdf` data-URL attachment. The filename is URL-decoded, stripped of traversal and control
   characters, and byte-bounded. Workcell never emits a partial attachment: a truncated or oversized
   PDF is rejected.
+- An embedding host may cap attachments with `PreparedWebfetch::with_pdf_attachment_page_limit`,
+  which the model can neither see nor set. Workcell then counts the pages before attaching and reports
+  `pageCount`. A PDF over the limit, and every PDF when the limit is 0, is returned as extracted text
+  whose first line gives the reason, which `pdfFallbackReason` repeats. Without a limit, attachment
+  mode never parses the PDF.
 - Responses declared as PDF, and eligible binary responses, must begin with `%PDF-`; mislabeled binary
   content is rejected. Parse failures return a bounded error rather than raw parser diagnostics.
 - HTML and PDF parsing run in bounded in-process blocking jobs. This limits concurrent parser work but

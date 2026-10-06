@@ -118,6 +118,12 @@ pub struct WebfetchOutput {
     pub truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pdf_attachment: Option<WebfetchPdfAttachment>,
+    /// Pages in a fetched PDF, when they were counted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_count: Option<usize>,
+    /// Why a PDF requested as an attachment was returned as extracted text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pdf_fallback_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extraction_method: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]

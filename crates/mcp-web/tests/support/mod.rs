@@ -124,6 +124,7 @@ impl PdfExtractor for FakePdf {
             PdfOutcome::Success => Ok(PdfExtraction {
                 text: "PDF body text with useful research evidence.".to_owned(),
                 title: Some("PDF Study".to_owned()),
+                page_count: 1,
                 truncated: false,
             }),
             PdfOutcome::Failure => Err(PdfExtractionError),

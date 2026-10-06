@@ -16,7 +16,7 @@ const WEBFETCH_DESCRIPTION: &str = r#"Fetch content from a URL and return model-
 - The pdfMode parameter can be extract or attachment. It defaults to extract.
 - The timeout parameter is optional, in seconds, defaults to 30, and is capped at 60.
 - HTML pages are simplified for markdown/text output and script/style content is removed.
-- PDF responses are parsed to extracted text by default. Use pdfMode='attachment' to preserve the PDF as a data:application/pdf attachment without text extraction.
+- PDF responses are parsed to extracted text by default. Use pdfMode='attachment' to preserve the PDF as a data:application/pdf attachment without text extraction. When the host limits attachments, a PDF over the limit is returned as extracted text that says why.
 - Model-facing output is bounded and may be truncated; truncated output ends with a line naming the limit that cut it. Structured metadata preserves URL, content type, format, status, and source icon metadata when available.
 - Use websearch first when you need to discover candidate URLs."#;
 

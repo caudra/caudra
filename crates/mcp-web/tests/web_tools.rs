@@ -11,14 +11,15 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use http::StatusCode;
 use serde_json::{Map, Value, json};
+use test_case::test_case;
 use tokio_util::sync::CancellationToken;
 use workcell_mcp_web::{
     NativePdfExtractor, OperatorConfiguredPolicy, PdfExtraction, PdfExtractionError, PdfExtractor,
     PreparedWebOperation, STALE_WEBSEARCH_CONFIGURATION_ERROR, SerpApiEngine, UrlPolicy,
-    WebHttpError, WebHttpRequestKind, WebOperationError, WebOperationExecution, WebToolGroup,
-    WebfetchError, WebfetchFormat, WebfetchInput, WebfetchPdfMode, WebsearchBackend,
-    WebsearchConfigurationIssue, WebsearchConfigurationSource, WebsearchExecutionConfiguration,
-    WebsearchInput, catalog, specs,
+    WebExecution, WebHttpError, WebHttpRequestKind, WebOperationError, WebOperationExecution,
+    WebToolGroup, WebfetchError, WebfetchFormat, WebfetchInput, WebfetchOutput, WebfetchPdfMode,
+    WebsearchBackend, WebsearchConfigurationIssue, WebsearchConfigurationSource,
+    WebsearchExecutionConfiguration, WebsearchInput, catalog, specs,
 };
 
 use support::*;
@@ -1783,6 +1784,173 @@ fn native_pdf_extractor_safely_rejects_the_synthetic_conformance_asset() {
     assert!(NativePdfExtractor.extract(bytes).is_err());
 }
 
+const FIRST_PAGE_WORDS: &str = "Workcell fixture first page marigold";
+const SECOND_PAGE_WORDS: &str = "Workcell fixture second page juniper";
+const PAGED_PDF_TEXT: &str = "Text from every page.";
+const PAGED_PDF_URL: &str = "https://example.test/paper.pdf";
+
+/// A real two-page PDF with one line of text on each page, built here so the
+/// native extractor is exercised on a valid document instead of a stub.
+fn two_page_pdf() -> Vec<u8> {
+    let page = |contents: usize| {
+        format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents {contents} 0 R >>"
+        )
+    };
+    let text = |words: &str| {
+        let stream = format!("BT /F1 18 Tf 72 720 Td ({words}) Tj ET");
+        format!(
+            "<< /Length {} >>\nstream\n{stream}\nendstream",
+            stream.len()
+        )
+    };
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_owned(),
+        "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_owned(),
+        page(6),
+        page(7),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_owned(),
+        text(FIRST_PAGE_WORDS),
+        text(SECOND_PAGE_WORDS),
+    ];
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::with_capacity(objects.len());
+    for (index, object) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", index + 1).as_bytes());
+    }
+    let xref = pdf.len();
+    let size = objects.len() + 1;
+    pdf.extend_from_slice(format!("xref\n0 {size}\n0000000000 65535 f \n").as_bytes());
+    for offset in offsets {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+    );
+    pdf
+}
+
+#[test]
+fn the_native_extractor_reads_every_page_of_a_real_pdf_in_order() {
+    let pdf = two_page_pdf();
+    let extraction = NativePdfExtractor.extract(&pdf).expect("valid PDF");
+    assert_eq!(extraction.page_count, 2);
+    assert_eq!(NativePdfExtractor.page_count(&pdf).expect("valid PDF"), 2);
+    assert!(!extraction.truncated);
+    let first = extraction.text.find("marigold").expect("first page text");
+    let second = extraction.text.find("juniper").expect("second page text");
+    assert!(
+        first < second,
+        "pages out of order in {:?}",
+        extraction.text
+    );
+}
+
+struct PagedPdf(usize);
+
+impl PdfExtractor for PagedPdf {
+    fn extract(&self, _bytes: &[u8]) -> Result<PdfExtraction, PdfExtractionError> {
+        Ok(PdfExtraction {
+            text: PAGED_PDF_TEXT.to_owned(),
+            title: None,
+            page_count: self.0,
+            truncated: false,
+        })
+    }
+}
+
+async fn fetch_pdf_as_attachment(
+    pdf: Vec<u8>,
+    extractor: Arc<dyn PdfExtractor>,
+    page_limit: usize,
+) -> WebExecution<WebfetchOutput> {
+    let group = WebToolGroup::with_dependencies(
+        WebsearchExecutionConfiguration::unconfigured(),
+        dependencies(
+            Arc::new(FakeHttp::with_responses(vec![Ok(response(
+                PAGED_PDF_URL,
+                StatusCode::OK,
+                Some("application/pdf"),
+                Bytes::from(pdf),
+            ))])),
+            Arc::new(FakeIcons::default()),
+            extractor,
+        ),
+    );
+    let prepared = group
+        .prepare_webfetch(WebfetchInput {
+            url: PAGED_PDF_URL.to_owned(),
+            format: WebfetchFormat::default(),
+            pdf_mode: WebfetchPdfMode::Attachment,
+            timeout: None,
+        })
+        .expect("prepared webfetch")
+        .with_pdf_attachment_page_limit(page_limit);
+    group
+        .execute_webfetch(prepared, CancellationToken::new())
+        .await
+        .expect("webfetch")
+}
+
+#[tokio::test]
+async fn a_pdf_within_the_attachment_page_limit_is_attached_with_its_page_count() {
+    let execution =
+        fetch_pdf_as_attachment(b"%PDF-1.7\npaper".to_vec(), Arc::new(PagedPdf(3)), 3).await;
+    assert_eq!(execution.output.pdf_mode, Some(WebfetchPdfMode::Attachment));
+    assert!(execution.output.pdf_attachment.is_some());
+    assert_eq!(execution.output.page_count, Some(3));
+    assert_eq!(execution.output.pdf_fallback_reason, None);
+    assert_eq!(
+        execution.model_text,
+        "PDF fetched successfully. The PDF has 3 pages and is available as an application/pdf attachment."
+    );
+}
+
+#[test_case(3, 2, "the PDF has 3 pages, above the 2-page attachment limit" ; "a PDF over the limit")]
+#[test_case(1, 0, "PDF attachments are disabled" ; "a limit of zero")]
+#[tokio::test]
+async fn a_pdf_that_cannot_be_attached_arrives_as_text_that_says_why(
+    pages: usize,
+    page_limit: usize,
+    reason: &str,
+) {
+    let execution = fetch_pdf_as_attachment(
+        b"%PDF-1.7\npaper".to_vec(),
+        Arc::new(PagedPdf(pages)),
+        page_limit,
+    )
+    .await;
+    assert_eq!(execution.output.pdf_mode, Some(WebfetchPdfMode::Extract));
+    assert!(execution.output.pdf_attachment.is_none());
+    assert_eq!(execution.output.page_count, Some(pages));
+    assert_eq!(
+        execution.output.pdf_fallback_reason.as_deref(),
+        Some(reason)
+    );
+    assert_eq!(
+        execution.model_text,
+        format!("[Not attached because {reason}. The extracted text follows.]\n\n{PAGED_PDF_TEXT}")
+    );
+}
+
+#[test_case(1, false ; "a limit below the page count")]
+#[test_case(2, true ; "a limit equal to the page count")]
+#[tokio::test]
+async fn the_native_page_count_decides_whether_a_real_pdf_is_attached(
+    page_limit: usize,
+    attached: bool,
+) {
+    let execution =
+        fetch_pdf_as_attachment(two_page_pdf(), Arc::new(NativePdfExtractor), page_limit).await;
+    assert_eq!(execution.output.page_count, Some(2));
+    assert_eq!(execution.output.pdf_attachment.is_some(), attached);
+    assert_eq!(
+        execution.model_text.contains("marigold") && execution.model_text.contains("juniper"),
+        !attached
+    );
+}
+
 #[tokio::test]
 async fn unknown_tools_and_invalid_arguments_are_classified_without_io() {
     let http = Arc::new(FakeHttp::default());
@@ -1975,6 +2143,7 @@ struct FixturePdf {
     expected_prefix: Vec<u8>,
     text: String,
     title: Option<String>,
+    page_count: usize,
 }
 
 impl FixturePdf {
@@ -1990,6 +2159,10 @@ impl FixturePdf {
                 .expect("PDF fixture text")
                 .to_owned(),
             title: value["result"]["title"].as_str().map(str::to_owned),
+            page_count: value["result"]["pageCount"]
+                .as_u64()
+                .and_then(|pages| usize::try_from(pages).ok())
+                .expect("PDF fixture page count"),
         }
     }
 }
@@ -2003,6 +2176,7 @@ impl PdfExtractor for FixturePdf {
         Ok(PdfExtraction {
             text: self.text.clone(),
             title: self.title.clone(),
+            page_count: self.page_count,
             truncated: false,
         })
     }

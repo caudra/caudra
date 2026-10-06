@@ -196,6 +196,8 @@ pub(crate) async fn execute(
             || formatted.truncated
             || bounded.truncated,
         pdf_attachment: None,
+        page_count: None,
+        pdf_fallback_reason: None,
         extraction_method: formatted.extraction_method,
         extraction_low_signal: formatted.extraction_low_signal,
         icon_url: icon.as_ref().map(|value| value.icon_url.clone()),

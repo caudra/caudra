@@ -56,6 +56,16 @@ impl PreparedWebsearch {
 }
 
 impl PreparedWebfetch {
+    /// Attaches a PDF requested with `pdfMode: attachment` only when it has at
+    /// most `pages` pages, so the host can keep attachments inside the model's
+    /// budget. A longer PDF, and every PDF when `pages` is 0, comes back as
+    /// extracted text that says why. The model can neither see nor set this.
+    #[must_use]
+    pub const fn with_pdf_attachment_page_limit(mut self, pages: usize) -> Self {
+        self.input.pdf_attachment_page_limit = Some(pages);
+        self
+    }
+
     #[must_use]
     pub fn retained_bytes(&self) -> usize {
         const HEADER_ENTRY_OVERHEAD: usize = 128;
@@ -210,7 +220,7 @@ impl PreparedWebOperation {
 #[derive(Debug)]
 pub enum WebOperationExecution {
     Websearch(WebExecution<WebsearchOutput>),
-    Webfetch(WebExecution<WebfetchOutput>),
+    Webfetch(Box<WebExecution<WebfetchOutput>>),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -507,7 +517,7 @@ impl WebToolGroup {
                 }
                 self.execute_webfetch(operation.prepared, cancellation)
                     .await
-                    .map(WebOperationExecution::Webfetch)
+                    .map(|execution| WebOperationExecution::Webfetch(Box::new(execution)))
                     .map_err(WebOperationError::Webfetch)
             }
         }

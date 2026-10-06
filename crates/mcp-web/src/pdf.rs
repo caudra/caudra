@@ -12,6 +12,8 @@ pub(crate) const MAX_EXTRACTED_TEXT_BYTES: usize = 2 * 1024 * 1024;
 pub struct PdfExtraction {
     pub text: String,
     pub title: Option<String>,
+    pub page_count: usize,
+    /// The text stopped at the extractor's size limit before the last page.
     pub truncated: bool,
 }
 
@@ -23,6 +25,12 @@ pub struct PdfExtractionError;
 /// blocking worker and contain panics from third-party parsers.
 pub trait PdfExtractor: Send + Sync {
     fn extract(&self, bytes: &[u8]) -> Result<PdfExtraction, PdfExtractionError>;
+
+    /// Counts pages so a host attachment limit can be enforced before the PDF
+    /// is attached. The default extracts the whole document to count them.
+    fn page_count(&self, bytes: &[u8]) -> Result<usize, PdfExtractionError> {
+        self.extract(bytes).map(|extraction| extraction.page_count)
+    }
 }
 
 /// Pure-Rust native extractor selected for production.
@@ -31,13 +39,11 @@ pub struct NativePdfExtractor;
 
 impl PdfExtractor for NativePdfExtractor {
     fn extract(&self, bytes: &[u8]) -> Result<PdfExtraction, PdfExtractionError> {
-        preflight_pdf(bytes)?;
-        let document = PdfDocument::from_bytes(bytes.to_vec()).map_err(|_| PdfExtractionError)?;
-        let object_count = document.all_object_ids().len();
-        if object_count > MAX_PDF_OBJECTS {
-            return Err(PdfExtractionError);
-        }
-        let page_count = document.page_count().map_err(|_| PdfExtractionError)?;
+        let OpenedPdf {
+            document,
+            object_count,
+            page_count,
+        } = open(bytes)?;
         if page_count > MAX_PDF_PAGES
             || page_count.saturating_mul(object_count.max(1)) > MAX_PDF_WORK_UNITS
         {
@@ -64,9 +70,35 @@ impl PdfExtractor for NativePdfExtractor {
         Ok(PdfExtraction {
             text,
             title,
+            page_count,
             truncated,
         })
     }
+
+    fn page_count(&self, bytes: &[u8]) -> Result<usize, PdfExtractionError> {
+        open(bytes).map(|opened| opened.page_count)
+    }
+}
+
+struct OpenedPdf {
+    document: PdfDocument,
+    object_count: usize,
+    page_count: usize,
+}
+
+fn open(bytes: &[u8]) -> Result<OpenedPdf, PdfExtractionError> {
+    preflight_pdf(bytes)?;
+    let document = PdfDocument::from_bytes(bytes.to_vec()).map_err(|_| PdfExtractionError)?;
+    let object_count = document.all_object_ids().len();
+    if object_count > MAX_PDF_OBJECTS {
+        return Err(PdfExtractionError);
+    }
+    let page_count = document.page_count().map_err(|_| PdfExtractionError)?;
+    Ok(OpenedPdf {
+        document,
+        object_count,
+        page_count,
+    })
 }
 
 fn preflight_pdf(bytes: &[u8]) -> Result<(), PdfExtractionError> {

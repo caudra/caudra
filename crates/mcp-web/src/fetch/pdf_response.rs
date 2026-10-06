@@ -16,6 +16,8 @@ use crate::blocking::{self, BlockingError};
 use crate::pdf::MAX_EXTRACTED_TEXT_BYTES;
 use crate::types::{WebfetchOutput, WebfetchPdfAttachment, WebfetchPdfMode};
 
+const ATTACHMENTS_DISABLED: &str = "PDF attachments are disabled";
+
 pub(super) struct PdfResponse {
     pub request: NormalizedWebfetchInput,
     pub status: StatusCode,
@@ -37,15 +39,57 @@ pub(super) async fn execute(
             response.content_type.as_deref().unwrap_or("unknown")
         )));
     }
-    if response.request.pdf_mode == WebfetchPdfMode::Attachment {
-        if response.body_truncated {
-            return Err(WebfetchError::Operation(
-                "PDF response exceeded the attachment size limit.".to_owned(),
-            ));
-        }
-        return attachment(response, dependencies, cancellation, deadline).await;
+    if response.request.pdf_mode == WebfetchPdfMode::Extract {
+        return extract(response, None, dependencies, cancellation, deadline).await;
     }
+    let page_limit = response.request.pdf_attachment_page_limit;
+    if page_limit == Some(0) {
+        let reason = ATTACHMENTS_DISABLED.to_owned();
+        return extract(response, Some(reason), dependencies, cancellation, deadline).await;
+    }
+    if response.body_truncated {
+        return Err(WebfetchError::Operation(
+            "PDF response exceeded the attachment size limit.".to_owned(),
+        ));
+    }
+    let Some(page_limit) = page_limit else {
+        return attachment(response, None, dependencies, cancellation, deadline).await;
+    };
+    let timeout_seconds = response.request.timeout_seconds;
+    let extractor = Arc::clone(&dependencies.pdf);
+    let (page_count, response) = blocking::run_until(deadline, &cancellation, move || {
+        (extractor.page_count(&response.bytes), response)
+    })
+    .await
+    .map_err(|error| blocking_error(error, timeout_seconds))?;
+    let page_count = page_count.map_err(|_| parse_error())?;
+    if page_count > page_limit {
+        let reason = format!(
+            "the PDF has {}, above the {page_limit}-page attachment limit",
+            pages(page_count)
+        );
+        return extract(response, Some(reason), dependencies, cancellation, deadline).await;
+    }
+    attachment(
+        response,
+        Some(page_count),
+        dependencies,
+        cancellation,
+        deadline,
+    )
+    .await
+}
 
+/// Extracts the PDF text. `fallback` names why a requested attachment was
+/// replaced by text, and leads the model text so the model knows it never
+/// received the file.
+async fn extract(
+    response: PdfResponse,
+    fallback: Option<String>,
+    dependencies: &WebToolDependencies,
+    cancellation: CancellationToken,
+    deadline: Instant,
+) -> Result<WebfetchExecution, WebfetchError> {
     let timeout_seconds = response.request.timeout_seconds;
     let extractor = Arc::clone(&dependencies.pdf);
     let (extracted, response) = blocking::run_until(deadline, &cancellation, move || {
@@ -53,8 +97,19 @@ pub(super) async fn execute(
     })
     .await
     .map_err(|error| blocking_error(error, timeout_seconds))?;
-    let extracted = extracted.map_err(|_| parse_error())?;
-    let formatted = normalize_pdf_text(&extracted.text);
+    let extracted = extracted.map_err(|_| match &fallback {
+        Some(reason) => WebfetchError::Operation(format!(
+            "Not attached because {reason}, and the PDF text could not be extracted."
+        )),
+        None => parse_error(),
+    })?;
+    let text = normalize_pdf_text(&extracted.text);
+    let text = match &fallback {
+        Some(reason) => {
+            format!("[Not attached because {reason}. The extracted text follows.]\n\n{text}")
+        }
+        None => text,
+    };
     let source_cut = if response.body_truncated {
         Some(format!(
             "the first {} MiB of the PDF",
@@ -68,7 +123,7 @@ pub(super) async fn execute(
     } else {
         None
     };
-    let bounded = truncate_model_output(&formatted, source_cut.as_deref());
+    let bounded = truncate_model_output(&text, source_cut.as_deref());
     let icon = icons::resolve(
         dependencies,
         response.final_url.as_str(),
@@ -95,6 +150,8 @@ pub(super) async fn execute(
             summary_input: None,
             truncated: bounded.truncated,
             pdf_attachment: None,
+            page_count: Some(extracted.page_count),
+            pdf_fallback_reason: fallback,
             extraction_method: None,
             extraction_low_signal: None,
             icon_url: icon.as_ref().map(|value| value.icon_url.clone()),
@@ -106,6 +163,7 @@ pub(super) async fn execute(
 
 async fn attachment(
     response: PdfResponse,
+    page_count: Option<usize>,
     dependencies: &WebToolDependencies,
     cancellation: CancellationToken,
     deadline: Instant,
@@ -122,9 +180,14 @@ async fn attachment(
         filename: filename.clone(),
         size_bytes: response.bytes.len(),
     };
-    let model_text =
-        "PDF fetched successfully. The PDF is available as an application/pdf attachment."
-            .to_owned();
+    let model_text = match page_count {
+        Some(count) => format!(
+            "PDF fetched successfully. The PDF has {} and is available as an application/pdf attachment.",
+            pages(count)
+        ),
+        None => "PDF fetched successfully. The PDF is available as an application/pdf attachment."
+            .to_owned(),
+    };
     let icon = icons::resolve(
         dependencies,
         response.final_url.as_str(),
@@ -153,6 +216,8 @@ async fn attachment(
             // every emitted data URL contains the complete bounded response.
             truncated: false,
             pdf_attachment: Some(attachment),
+            page_count,
+            pdf_fallback_reason: None,
             extraction_method: None,
             extraction_low_signal: None,
             icon_url: icon.as_ref().map(|value| value.icon_url.clone()),
@@ -160,6 +225,14 @@ async fn attachment(
         },
         model_text,
     })
+}
+
+fn pages(count: usize) -> String {
+    if count == 1 {
+        "1 page".to_owned()
+    } else {
+        format!("{count} pages")
+    }
 }
 
 fn parse_error() -> WebfetchError {
