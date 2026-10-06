@@ -17,6 +17,7 @@ use crate::{page_header, repository_path};
 const DATE_PLACEHOLDER: &str = "YYYY-MM-DD";
 /// The reference documents `plan`, which is only offered with a session plan.
 const WITH_SESSION_PLAN: bool = true;
+const CODE_INTELLIGENCE: &str = "Code Intelligence";
 
 const SECTIONS: &[(&str, &[&str])] = &[
     (
@@ -34,7 +35,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "Code Intelligence",
+        CODE_INTELLIGENCE,
         &[
             "code_map",
             "code_context",
@@ -325,51 +326,56 @@ fn write_tool_entry(out: &mut String, name: &str, info: &ToolInfo, opt_in: &Hash
         .unwrap();
         writeln!(out).unwrap();
     }
-    if name == "task" {
-        writeln!(
-            out,
-            "The published task arguments and instructions follow `agent.task_execution`: `sync` waits for final results and omits `background`, `auto` lets the model choose with `background: true`, and `async` always returns an admission receipt. See [background tasks](/docs/sessions/#background-tasks) for automatic continuation, inspection, and shutdown. The TUI and persistent stream-JSON SDK support background work. Print and ACP resolve `auto` to synchronous execution and withhold strict `async` tools. `batch` alone does not make synchronous calls asynchronous. Resume a task ID only after its invocation settles."
-        )
-        .unwrap();
-        writeln!(out).unwrap();
-    }
-    if name == "python_execution" {
-        writeln!(
-            out,
-            "Release builds include the isolated Monty worker. `WORKCELL_MCP_CODE_WORKER` can override it with an operator-supplied worker binary."
-        )
-        .unwrap();
-        writeln!(out).unwrap();
-    }
-    if name == "shell" {
-        writeln!(
-            out,
-            "`agent.shell_execution` selects `sync`, `auto`, or `async` independently of task execution. In `auto`, a validated requested timeout above `agent.shell_async_threshold_secs` returns an admission receipt. The default threshold is 120 seconds. This is not elapsed-time promotion and never extends the hard execution deadline. Shell has no per-call `background` argument. See [execution policies](/docs/sessions/#execution-policies) for frontend support and child-owned command results."
-        )
-        .unwrap();
-        writeln!(out).unwrap();
-        writeln!(
-            out,
-            "Caudra shows unfiltered output while the command runs. After completion, the TUI switches to the filtered model-facing result when Workcell reduced it. The output footer names every reduction that ran and toggles between filtered and raw views. Filtering is enabled by default and never changes the reviewed command or structured capture. Set `agent.shell_output_filter = false` or use `--no-rtk` to disable it."
-        )
-        .unwrap();
-        writeln!(out).unwrap();
-        writeln!(
-            out,
-            "A progress bar redraws a row instead of printing lines. Caudra renders both the live view and the capture as a terminal would show them, so a bar appears as one updating row rather than a single very long line, and the output printed before it is not pushed out of the retained window. Rendering is decoding rather than filtering, so `--no-rtk` does not disable it; the footer reports how many frames were absorbed."
-        )
-        .unwrap();
-        writeln!(out).unwrap();
-    }
-    if name == "file_glob" || name == "file_grep" {
-        writeln!(
-            out,
-            "A search that reaches its bounds returns what it found instead of failing. The result then reports how much was withheld, and the tool card says how far the scan got, so an absent match is distinguishable from an unsearched file."
-        )
-        .unwrap();
+    for note in tool_notes(name) {
+        writeln!(out, "{note}").unwrap();
         writeln!(out).unwrap();
     }
     write_param_table(out, &params);
+}
+
+/// Paragraphs written under a section heading, before its first tool.
+fn section_notes(section: &str) -> &'static [&'static str] {
+    match section {
+        CODE_INTELLIGENCE => &[
+            "The code tools and `file_index` read 37 languages and formats: Rust, Python, TypeScript, JavaScript, Gleam, Go, HTML, Java, C, C++, CUDA, Objective-C, C#, Ruby, PHP, Swift, Kotlin, Scala, Bash, Lua, Elixir, Markdown, Bazel/Starlark, Zig, Nix, Dart, TOML, YAML, SQL, CSS, JSON, HCL, Containerfile, Make, CMake, Protobuf, and XML.",
+            "Every count and reach set is a lower bound. A call made through dynamic dispatch, a callback, or a macro adds no edge, so a count of zero means that none was found. A symbol name that matches nothing is refused with up to five close matches to try.",
+        ],
+        _ => &[],
+    }
+}
+
+/// Paragraphs a tool's entry carries between its summary and its parameters.
+fn tool_notes(name: &str) -> &'static [&'static str] {
+    match name {
+        "task" => &[
+            "The published task arguments and instructions follow `agent.task_execution`: `sync` waits for final results and omits `background`, `auto` lets the model choose with `background: true`, and `async` always returns an admission receipt. See [background tasks](/docs/sessions/#background-tasks) for automatic continuation, inspection, and shutdown. The TUI and persistent stream-JSON SDK support background work. Print and ACP resolve `auto` to synchronous execution and withhold strict `async` tools. `batch` alone does not make synchronous calls asynchronous. Resume a task ID only after its invocation settles.",
+        ],
+        "file_edit" | "file_apply_patch" => &[
+            "Each model is offered one editor. GPT-5 and later GPT models and the o3, o4, and Codex families get `file_apply_patch`, the patch format they were trained on. Every other model gets `file_edit`.",
+        ],
+        "file_glob" | "file_grep" => &[
+            "A search that reaches its bounds returns what it found instead of failing. The result then reports how much was withheld, and the tool card says how far the scan got, so an absent match is distinguishable from an unsearched file.",
+            "A directory search skips the `.git`, `.ssh`, and `.workcell` directories below it and these credential files, in any letter case: `.env` and `.env.*`, `.npmrc`, `.pypirc`, `.netrc`, files ending in `.key`, and the SSH private keys `id_rsa`, `id_dsa`, `id_ecdsa`, and `id_ed25519`. Naming one of these files by its path still reaches it, subject to [permissions](/docs/permissions/).",
+        ],
+        "view_image" => &["Only models that accept images are offered `view_image`."],
+        "shell" => &[
+            "`agent.shell_execution` selects `sync`, `auto`, or `async` independently of task execution. In `auto`, a validated requested timeout above `agent.shell_async_threshold_secs` returns an admission receipt. The default threshold is 120 seconds. This is not elapsed-time promotion and never extends the hard execution deadline. Shell has no per-call `background` argument. See [execution policies](/docs/sessions/#execution-policies) for frontend support and child-owned command results.",
+            "Caudra shows unfiltered output while the command runs. After completion, the TUI switches to the filtered model-facing result when Workcell reduced it. The output footer names every reduction that ran and toggles between filtered and raw views. Filtering is enabled by default and never changes the reviewed command or structured capture. Set `agent.shell_output_filter = false` or use `--no-rtk` to disable it.",
+            "A rule that would report success applies only when the command exited zero, so a failure is never shown as a success. When a failing command reaches a rule's line cap, the result keeps its first and last lines. Filtering never makes a result larger than the raw output, and a filtered result ends with a `[filtered: …]` line that names the stages which changed it. Most rules come from [RTK](https://github.com/rtk-ai/rtk), credited in Workcell's notice file.",
+            "A progress bar redraws a row instead of printing lines. Caudra renders both the live view and the capture as a terminal would show them, so a bar appears as one updating row rather than a single very long line, and the output printed before it is not pushed out of the retained window. Rendering is decoding rather than filtering, so `--no-rtk` does not disable it. The footer reports how many frames were absorbed.",
+            "Commands start from a cleared environment. [Shell host configuration](/docs/cli/#shell-host-configuration) lists the variables they receive.",
+        ],
+        "python_execution" => &[
+            "Scripts run in a separate worker process with no file system, network, environment variables, or subprocesses, under time, memory, and recursion limits. Host clocks, unseeded randomness, and sleep are refused. Because that isolation fixes what a script can reach, the default permission policy allows the tool without a prompt.",
+            "Release builds include the isolated Monty worker. `WORKCELL_MCP_CODE_WORKER` can override it with an operator-supplied worker binary.",
+        ],
+        "webfetch" => &[
+            "Every URL is checked before a connection opens. A private, loopback, link-local, or carrier-grade NAT address is refused, including an IPv6 form that maps to one, and so is a special-use name such as `localhost`, `.local`, or `home.arpa`. Every address a name resolves to must pass, and the connection goes only to those checked addresses. Up to 5 redirects are followed, each checked the same way, and a redirect to another origin carries only the `Accept`, `Accept-Language`, `Cache-Control`, `Pragma`, `Range`, and `User-Agent` headers. With a proxy configured, the proxy resolves the name and the URL checks still run locally.",
+            "Text is decoded in the character set the response declares through a byte-order mark, the `Content-Type` header, or an HTML `<meta>` tag, and as UTF-8 otherwise. Up to 5 MiB of a response is read, and the model receives at most 2,000 lines or 50 KiB. Cut text ends with a line that names the limit, such as `[truncated: showing 1999 of 2105 lines]`.",
+            "With the default `pdfMode` of `extract`, a PDF of up to 6 MiB and 200 pages arrives as its text. There is no OCR, so a scanned PDF yields little text. With `pdfMode` set to `attachment`, a model that reads PDFs receives the file itself inside the tool result. That covers Claude through an Anthropic API key, a Claude login, or Bedrock, and a custom model on an `anthropic` or `openai-responses` provider that sets [`supports_pdf`](/docs/providers/#model-fields). The PDFs in one request may use a quarter of the context window, counted at 4,500 tokens a page and capped at 100 pages, and an older PDF that no longer fits is replaced by a note that names it. A PDF over that budget, and every PDF for a model that does not read them, arrives as extracted text whose first line says why. Saved sessions keep only a PDF's URL, name, and page count. See [Fetched PDFs](/docs/sessions/#fetched-pdfs).",
+        ],
+        _ => &[],
+    }
 }
 
 /// Replace `target` with `placeholder`. Empty `target` is a no-op.
@@ -532,6 +538,10 @@ pub fn generate() -> String {
         }
         writeln!(out).unwrap();
         writeln!(out, "## {section_name}").unwrap();
+        for note in section_notes(section_name) {
+            writeln!(out).unwrap();
+            writeln!(out, "{note}").unwrap();
+        }
         for name in present {
             let info = tools.get(name).expect("checked above");
             write_tool_entry(&mut out, name, info, &opt_in);

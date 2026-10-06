@@ -74,6 +74,8 @@ Fine when genuine: anaphora in scannable checklists ("No prompt text / No model 
 - Wherever Claude subscription sign-in appears, show that it is experimental and that Anthropic's terms limit Pro and Max subscriptions to official clients. Present ChatGPT, Copilot, and xAI sign-in plainly.
 - Mark every experimental capability as experimental. Never present one as a default.
 - Describe file change records, not snapshots. Built-in web search is Exa. Say "offline with a local model", and name the models.dev catalog refresh and Exa searches where network use matters.
+- Credit Workcell, with a link to its repository, where the file, shell, web, code, and Python tools appear. Tool claims follow the generated Tools page: searches report what they withheld, directory searches skip credential files, `webfetch` refuses private addresses, checks every redirect, decodes declared character sets, and names the limit when it cuts a page, and a failing command keeps its first and last lines. Where a story or the README describes PDF attachments, name the transports that send them and say that other models receive the text.
+- Never call the Python worker a sandbox. Leave out "personalized PageRank", git signals, ripwire benchmark numbers, and Monty startup times, and do not claim that filtering keeps errors.
 
 ## Visual identity
 

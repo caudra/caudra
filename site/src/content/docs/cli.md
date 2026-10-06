@@ -224,7 +224,16 @@ Several other Claude Code flags are accepted and ignored so existing scripts kee
 
 ### Shell host configuration
 
-On Unix, Workcell uses a host-bound absolute Bash executable with `--noprofile --norc -c`. It does not search `PATH` for the shell or implicitly source login files, `.bashrc`, `BASH_ENV`, or `ENV`. Commands still receive the existing environment allowlist, including `PATH`, basic home/user/locale/temp variables, and uppercase and lowercase proxy variables. Arbitrary host variables and startup hooks are not forwarded.
+On Unix, Workcell uses a host-bound absolute Bash executable with `--noprofile --norc -c`. It does not search `PATH` for the shell or implicitly source login files, `.bashrc`, `BASH_ENV`, or `ENV`.
+
+Commands start from a cleared environment. They receive only these variables, each one only when the host has it set:
+
+- `PATH`, `HOME`, `USER`, `LOGNAME`, `TMPDIR`, `TMP`, `TEMP`, `LANG`, `LC_ALL`, and `TERM`.
+- `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` in uppercase and lowercase, with any credentials in their URLs.
+- `HERDR_ENV`, `HERDR_PANE_ID`, `HERDR_TAB_ID`, `HERDR_WORKSPACE_ID`, `HERDR_SOCKET_PATH`, and `HERDR_BIN_PATH`, so a command sees the [Herdr pane](/docs/worktrees/#herdr-integration) Caudra runs in.
+- `ComSpec`, `SystemRoot`, and `WINDIR` on Windows.
+
+Commands also get `NO_COLOR=1` and `CLICOLOR=0`, so tools that honor those conventions print no color codes. An explicit flag such as `--color=always` still wins. Other host variables and startup hooks are not forwarded.
 
 `WORKCELL_BASH_EXECUTABLE` selects an absolute Bash path in the execution host's environment. Runtime selection takes precedence over the same build-time variable. With neither set, Workcell tries `/bin/bash`, then `/usr/bin/bash`. An explicit empty, relative, missing, or invalid override fails instead of falling back. The selected executable is bound and revalidated before execution. A changed executable requires restarting the shell host.
 

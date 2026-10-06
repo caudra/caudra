@@ -88,6 +88,7 @@ const RTK: Link = { name: 'RTK', href: 'https://www.rtk-ai.app/docs/' };
 const RIPWIRE: Link = { name: 'ripwire', href: 'https://github.com/redhat-et/ripwire' };
 const PLANNOTATOR: Link = { name: 'Plannotator', href: 'https://plannotator.ai/' };
 const HERDR: Link = { name: 'Herdr', href: 'https://herdr.dev' };
+const WORKCELL: Link = { name: 'Workcell', href: WORKCELL_REPOSITORY };
 export const GROK_BUILD: Link = { name: 'Grok Build workflows', href: 'https://x.ai/news/workflows' };
 export const NINFER: Link = { name: 'ninfer-4090', href: 'https://github.com/tensorninja/ninfer-4090' };
 const GRAHN_2008: Link = { name: 'Grahn, Parkinson and Owen, 2008', href: 'https://www.sciencedirect.com/science/article/abs/pii/S0301008208001019' };
@@ -232,8 +233,8 @@ export const stories: readonly Story[] = [
     tone: 'signal',
     layout: 'stacked',
     points: [
-      { title: 'RTK-style output filtering', text: 'Command-aware rules trim build and test noise from completed shell output before the model reads it. You watch raw output while the command runs and can switch between filtered and raw views.' },
-      { title: 'Structure before content', text: '`file_index` returns a file outline with signatures and line numbers. The `code_*` tools rank symbols and show callers, impact, and the tests that reach a change. They parse the source on the fly, so there is no index to build or maintain and nothing to configure.' },
+      { title: 'RTK-style output filtering', text: 'Command-aware rules, most of them from RTK, trim build and test noise before the model reads the output, and a filtered result is always smaller than the raw one. A failure is never reported as a success, and a failing command keeps its first and last lines. Progress bars collapse to one row, and you can switch between filtered and raw views.' },
+      { title: 'Structure before content', text: '`file_index` returns a file outline with signatures and line numbers. The `code_*` tools rank symbols and show callers, impact, and the tests they can trace to a change. They parse the source on the fly, so there is no index to build or maintain and nothing to configure.' },
       { title: 'Fewer, smaller turns', text: 'Oversized results reach the model as a bounded head and tail, and `tool_output` searches the rest. `batch` runs independent calls in one turn, and subagents keep their exploration out of the main context.' },
       { title: 'Requests shaped for caching', text: 'Caudra sends a per-conversation cache key where providers accept one, and `/usage` scores the cache hit rate for every model.' },
     ],
@@ -340,7 +341,7 @@ export const stories: readonly Story[] = [
           steps: [
             { mark: '⋮', title: 'Open the menu', text: 'Beside any message in the main transcript.' },
             { mark: '1', title: 'Preview', text: 'Revert files counts what would be created, replaced, or deleted.' },
-            { mark: '2', title: 'Apply', text: 'Repeat the action. Any conflict aborts the whole revert.' },
+            { mark: '2', title: 'Apply', text: 'Repeat the action. A conflict found before writing aborts the whole revert.' },
             { mark: '↶', title: 'Unrevert', text: 'Put the files and the conversation head back.' },
           ],
         },
@@ -361,7 +362,7 @@ export const stories: readonly Story[] = [
       { title: 'Sensible defaults, tuned per model', text: 'Every rule is on by default, and budgets cap how often each one fires. Change a threshold, a budget, or the wording of a nudge for all models, or only for one exact `provider/model-id`.' },
       { title: 'Every nudge in the transcript', text: 'Each nudge appears as a dim row. Click it to read the exact text the model received.' },
     ],
-    note: 'A nudge is a message to the model. It cannot run or approve a tool, and every real tool call still passes through validation and your permission rules.',
+    note: 'In daily use, the `abandoned_turn` rule matched 35 of 386 final Qwen3.8-27B replies and none of 2,185 from Claude and GPT models, as [measured by the maintainer](#method). A nudge is a message to the model. It cannot run or approve a tool, and every real tool call still passes through validation and your permission rules.',
     link: { href: '/docs/configuration/#agent-steering', label: 'Configure automatic steering' },
     clips: [
       {
@@ -376,6 +377,41 @@ export const stories: readonly Story[] = [
             { mark: '2', title: 'Nudge', text: 'The `abandoned_turn` rule asks the model to do that work now.' },
             { mark: '3', title: 'Read the nudge', text: 'A dim row in the transcript holds the exact text the model received.' },
             { mark: '↺', title: 'Continue', text: 'The next reply can call its tools. By default, a third announcement in a row ends the turn as written.' },
+          ],
+        },
+      },
+    ],
+  },
+  {
+    id: 'tools',
+    index: '07',
+    eyebrow: 'Built-in tools',
+    title: ['Tools that say', 'what they missed.'],
+    lede: 'When a tool stops at a limit or leaves something out, its result says what is missing, and the model can go back for it. The file, shell, web, code, and Python tools come from Workcell, which also runs on its own as an MCP server.',
+    tone: 'mist',
+    layout: 'split-reverse',
+    points: [
+      { title: 'Searches that report what they withheld', text: 'A `file_grep` or `file_glob` call that reaches its bounds returns what it found and reports how much it withheld, so the model can tell a missing match from a file it never searched. Directory searches skip credential files such as `.env` and SSH private keys.' },
+      { title: 'Guarded web fetching', text: '`webfetch` refuses private, loopback, and link-local addresses and checks every redirect the same way. Pages arrive in the character set they declare, and a page cut at 2,000 lines or 50 KiB ends with a line that names the limit.' },
+      { title: 'PDFs as text or as the file', text: 'A fetched PDF arrives as its text. In attachment mode, a model that reads PDFs receives the file itself inside the tool result, within a quarter of its context window. Saved sessions keep only the URL, name, and page count.' },
+      { title: 'Python in an isolated worker', text: '`python_execution` runs scripts in a separate worker with no file system, network, environment variables, or subprocesses. That isolation is why the default permission policy runs it without a prompt.' },
+    ],
+    note: 'Attached PDFs reach Claude through Anthropic or Amazon Bedrock, and custom models on a compatible API that declare PDF support. Other models receive the extracted text with a line that says why.',
+    credits: { label: 'Tools provided by', links: [WORKCELL] },
+    link: { href: '/docs/tools/', label: 'Built-in tools' },
+    clips: [
+      {
+        id: 'fetch',
+        title: 'Search and fetch with stated limits',
+        label: 'Search and fetch',
+        summary: 'How a search and a fetch report what they left out.',
+        diagram: {
+          kind: 'steps',
+          steps: [
+            { mark: 'grep', title: 'Search', text: 'A search that reaches its bounds reports how much it withheld.' },
+            { mark: 'URL', title: 'Check', text: 'Private addresses are refused, and every redirect is checked again.' },
+            { mark: '50 KiB', title: 'Cut', text: 'A long page ends with a line that names the limit it reached.' },
+            { mark: 'PDF', title: 'Attach', text: 'A model that reads PDFs receives the file inside the tool result.' },
           ],
         },
       },
@@ -425,14 +461,14 @@ export const capabilityGroups: readonly CapabilityGroup[] = [
   {
     name: 'Tools',
     items: [
-      { name: 'File read, search, edit, and patch', href: '/docs/tools/#file-operations' },
+      { name: 'File read and search, with one editor per model', href: '/docs/tools/#file-operations' },
       { name: 'File outlines with `file_index`', href: '/docs/tools/#file_index' },
-      { name: 'Code maps with no index to maintain', href: '/docs/tools/#code-intelligence' },
+      { name: 'Code maps for 37 languages and formats', href: '/docs/tools/#code-intelligence' },
       { name: 'Shell with output filtering', href: '/docs/tools/#shell' },
       { name: 'Isolated Python for computation', href: '/docs/tools/#python_execution' },
       { name: 'Parallel calls with `batch`', href: '/docs/tools/#batch' },
       { name: 'Retained output search', href: '/docs/tools/#tool_output' },
-      { name: 'Web search and fetch, PDFs included', href: '/docs/tools/#web' },
+      { name: 'Web search and fetch, with PDFs as text or as the file', href: '/docs/tools/#web' },
       { name: 'Image generation with a ChatGPT login', href: '/docs/tools/#image_generate' },
       { name: 'Tool-call JSON repair', href: '/docs/token-economy/#fewer-round-trips' },
       { name: 'Tools loaded on demand', href: '/docs/tools/#tools-loaded-on-demand' },
@@ -529,5 +565,7 @@ export const experiments: readonly Experiment[] = [
 export const privacyPoints: readonly Point[] = [
   { title: 'No tracking', text: 'Telemetry is off unless you send it to a collector you run.' },
   { title: 'Offline with a local model', text: `Use Ollama or llama.cpp without internet access, or point a \`providers.toml\` entry at ${linked(NINFER)}, the maintainer's custom inference engine for Qwen3.8-27B on one RTX\u00a04090. Otherwise a normal run contacts your provider, refreshes the public models.dev catalog at most once a day, and reaches Exa when the agent searches the web.` },
+  { title: 'Commands start from a cleared environment', text: 'Shell commands receive only [a short list of variables](/docs/cli/#shell-host-configuration), such as `PATH`, `HOME`, and proxy settings, so API keys set for Caudra stay out of them.' },
+  { title: 'Private addresses refused', text: '`webfetch` checks every URL and redirect before it connects, and refuses private, loopback, and link-local addresses.' },
   { title: 'Updates on request', text: 'Caudra checks for updates only when you run `caudra update` or turn on the startup check.' },
 ];

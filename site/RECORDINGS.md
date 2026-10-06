@@ -54,7 +54,7 @@ Run the `recording:*` scripts from `site/`. `bun run` starts them in `site/`, so
 
 ## Recording settings
 
-- **Size.** Record `eager`, `steer`, `workbench`, and `sandbox` at 120x34. Record `btw`, `goal`, `filter`, `review`, `revert`, `nudge`, and `resume` at 100x30. Keep the real terminal at least that large and leave it alone during a take. The checker blocks a take with a resize event.
+- **Size.** Record `eager`, `steer`, `workbench`, and `sandbox` at 120x34. Record `btw`, `goal`, `filter`, `review`, `revert`, `nudge`, `fetch`, and `resume` at 100x30. Keep the real terminal at least that large and leave it alone during a take. The checker blocks a take with a resize event.
 - **asciinema.** asciinema 3 writes asciicast v3. asciinema 2 writes v2 and takes `--cols 120 --rows 34` and `-c caudra` in place of `--window-size` and `--command`. The checker and the player read both versions.
 - **Theme.** Set `theme = "caudra-dark"` under `[ui]` in the recording account's `caudra.toml`. Caudra shows `caudra-light` when the terminal reports light mode, so record in a dark terminal. Set `COLORTERM=truecolor`, or `CAUDRA_TRUECOLOR=1`, so the cast keeps the theme's 24-bit colours instead of the 256-colour fallback.
 - **Names.** Use the user `demo`, a neutral host name such as `demo`, and a neutral shell prompt such as `PS1='$ '`. Start Caudra with `--command caudra` so that no shell prompt appears at all. Only the resume and sandbox clips need a shell.
@@ -113,6 +113,7 @@ Placement names a story and clip id in `src/data/home.ts`.
 | Then | `review` | Story 04 `workbench`, second clip | 100x30 | 30 to 45 s |
 | Then | `revert` | Story 05 `thread` | 100x30 | 45 to 60 s |
 | Then | `nudge` | Story 06 `nudges` | 100x30 | 30 to 45 s |
+| Then | `fetch` | Story 07 `tools` | 100x30 | 60 to 90 s |
 | Later | `resume` | Story 05 `thread`, new slot | 100x30 | 20 to 30 s |
 | Later | `sandbox` | New slot, experimental | 120x34 | 45 to 60 s |
 
@@ -228,6 +229,19 @@ Retake when the first reply calls a tool, or adds a question or a summary after 
 
 - **Proves:** a reply that announces work and calls no tool gets one short nudge, the transcript shows its exact text, and the work that follows goes through the normal permission rules.
 - **Must not imply:** that the model stopped early on its own, because the prompt asks for the announcement. It must also not suggest that a nudge runs or approves a tool, or that steering checks the work.
+
+### fetch
+
+Setup: a model that reads PDFs, such as Claude through an Anthropic API key. In the warm-up session, fetch any page on `www.rfc-editor.org` and approve it with `Yes, and always allow ‹scope› in this project`, widening the scope to `any page on www.rfc-editor.org`.
+
+1. Send `Use file_grep with head_limit 5 to find "order" in src, then say whether the result was complete.` The card says how far the scan got.
+2. Send `Fetch https://www.rfc-editor.org/rfc/rfc9110.txt and say where the fetched text stops.` The card ends with a `[truncated: …]` line that names the limit.
+3. Send `Fetch https://www.rfc-editor.org/rfc/rfc8890.pdf with pdfMode attachment, then give its title and page count.` The card reports the page count and an `application/pdf` attachment. The PDF has 10 pages, which fits the budget of a 200k-token context window.
+
+Retake when the model fetches the PDF in extract mode, or answers before a call returns.
+
+- **Proves:** a search that stops at its limit says how much it withheld, a long page ends with a line that names the limit, and a model that reads PDFs receives the file itself, with its page count on the card.
+- **Must not imply:** that every model receives the file, that a resumed session still holds it, or that fetched content is trustworthy because the address checks passed.
 
 ### resume
 

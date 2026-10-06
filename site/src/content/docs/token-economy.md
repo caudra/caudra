@@ -19,18 +19,22 @@ So Caudra attacks the two multipliers: how much each step adds to context, and h
 
 **Built-in shell output filtering.** Workcell provides RTK-style output reduction without a separate RTK installation. Built-in rules reduce completed model-facing shell output while keeping the reviewed command and structured capture unchanged. The TUI shows raw output while the command runs, then lets you toggle between filtered and raw views. Filtering is enabled by default. Set `agent.shell_output_filter = false` or use `--no-rtk` to disable it. See [shell output](/docs/tools/#shell). Capture and retention bounds still apply.
 
+A rule that would replace output with a success summary applies only when the command exited zero, so a failure never reads as a success. When a failing command reaches a rule's line cap, the result keeps its first and last lines, and an error printed at the end still reaches the model. When filtering would save less than its own notice costs, the complete capture is returned instead, so a filtered result is always smaller than the raw output. A filtered result carries a `[filtered: …]` line that names the stages which changed it. Most rules come from [RTK](https://github.com/rtk-ai/rtk), and Workcell credits it in its notice file.
+
+**Progress bars collapse to one row.** A download or training run that redraws its bar with carriage returns writes a single line that can run to hundreds of kilobytes. Workcell decodes that stream into the rows a terminal would show and adds a line counting the redraws it absorbed. This decoding applies to every command, even with filtering disabled. Progress printed one frame per line, as a CI log collector writes it, is collapsed by filtering and announced as `[filtered: progress]`.
+
 **file_index instead of file_read.** The native `file_index` tool returns a tree-sitter skeleton of a source file: imports, types, signatures, line numbers. Usually much smaller than the file itself. The agent indexes first, then reads only the ranges it needs.
 
 Directory indexing follows Workcell's generic listing contract. Instruction files appear as ordinary visible entries, and the call does not discover their contents.
 
 ```
-file_read main.rs            index main.rs
+file_read main.rs            file_index main.rs
 ─────────────────            ─────────────────────────────
 1400 lines in context        60 lines of signatures
                              + file_read offset=812 limit=40
 ```
 
-**Code maps instead of exploring.** `code_map`, `code_context`, `code_refs`, `code_impact`, and `code_expand` show where to start, who calls what, and which tests reach a change, so the agent opens fewer whole files to find out. They build their symbol graph from the source when called, and a repeat call parses only the files that changed. There is no index to build or maintain, and they work without configuration. See [Code Intelligence](/docs/tools/#code-intelligence).
+**Code maps instead of exploring.** `code_map`, `code_context`, `code_refs`, `code_impact`, and `code_expand` show where to start, who calls what, and the tests they can trace to a change, so the agent opens fewer whole files to find out. They build their symbol graph from the source when called, and a repeat call parses only the files that changed. There is no index to build or maintain, and they work without configuration. See [Code Intelligence](/docs/tools/#code-intelligence).
 
 **Subagents as garbage collectors.** A `task` subagent gets its own isolated context. It can search, read files, and hit dead ends without adding its whole transcript to the main conversation. The parent receives its final summary and any intentional [child reports](/docs/sessions/#child-reports). Its transcript stays attached to the task for later `task_id` continuation without inflating the main context. System prompt profiles can assign a different model to their subagents when a task needs a cheaper or stronger model.
 

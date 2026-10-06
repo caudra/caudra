@@ -79,6 +79,8 @@ Writes a file to the local filesystem.
 
 Performs exact string replacements in files.
 
+Each model is offered one editor. GPT-5 and later GPT models and the o3, o4, and Codex families get `file_apply_patch`, the patch format they were trained on. Every other model gets `file_edit`.
+
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `filePath` | string | yes | File path inside the configured root. |
@@ -89,6 +91,8 @@ Performs exact string replacements in files.
 ### `file_apply_patch` {#file_apply_patch}
 
 Use file_apply_patch to edit files with a stripped-down, file-oriented diff format. The patch language is designed to be easy to parse and safe to review.
+
+Each model is offered one editor. GPT-5 and later GPT models and the o3, o4, and Codex families get `file_apply_patch`, the patch format they were trained on. Every other model gets `file_edit`.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -108,6 +112,8 @@ Fast file pattern matching tool for files under the file root.
 
 A search that reaches its bounds returns what it found instead of failing. The result then reports how much was withheld, and the tool card says how far the scan got, so an absent match is distinguishable from an unsearched file.
 
+A directory search skips the `.git`, `.ssh`, and `.workcell` directories below it and these credential files, in any letter case: `.env` and `.env.*`, `.npmrc`, `.pypirc`, `.netrc`, files ending in `.key`, and the SSH private keys `id_rsa`, `id_dsa`, `id_ecdsa`, and `id_ed25519`. Naming one of these files by its path still reaches it, subject to [permissions](/docs/permissions/).
+
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `pattern` | string | yes | Glob pattern supporting *, **, ?, and brace alternatives. |
@@ -118,6 +124,8 @@ A search that reaches its bounds returns what it found instead of failing. The r
 Fast content search tool for files under the file root.
 
 A search that reaches its bounds returns what it found instead of failing. The result then reports how much was withheld, and the tool card says how far the scan got, so an absent match is distinguishable from an unsearched file.
+
+A directory search skips the `.git`, `.ssh`, and `.workcell` directories below it and these credential files, in any letter case: `.env` and `.env.*`, `.npmrc`, `.pypirc`, `.netrc`, files ending in `.key`, and the SSH private keys `id_rsa`, `id_dsa`, `id_ecdsa`, and `id_ed25519`. Naming one of these files by its path still reaches it, subject to [permissions](/docs/permissions/).
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -147,11 +155,17 @@ Page or search managed tool output owned by the current session. Omit `pattern` 
 
 View an image file (png, jpeg, gif, webp) so you can actually see it; it is returned as vision input alongside the tool result. Use instead of `file_read` for images.
 
+Only models that accept images are offered `view_image`.
+
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `path` | string | yes | Path to the image file |
 
 ## Code Intelligence
+
+The code tools and `file_index` read 37 languages and formats: Rust, Python, TypeScript, JavaScript, Gleam, Go, HTML, Java, C, C++, CUDA, Objective-C, C#, Ruby, PHP, Swift, Kotlin, Scala, Bash, Lua, Elixir, Markdown, Bazel/Starlark, Zig, Nix, Dart, TOML, YAML, SQL, CSS, JSON, HCL, Containerfile, Make, CMake, Protobuf, and XML.
+
+Every count and reach set is a lower bound. A call made through dynamic dispatch, a callback, or a macro adds no edge, so a count of zero means that none was found. A symbol name that matches nothing is refused with up to five close matches to try.
 
 ### `code_map` <span class="badge">on demand</span> {#code_map}
 
@@ -221,7 +235,11 @@ Execute a Bash command on the MCP server host.
 
 Caudra shows unfiltered output while the command runs. After completion, the TUI switches to the filtered model-facing result when Workcell reduced it. The output footer names every reduction that ran and toggles between filtered and raw views. Filtering is enabled by default and never changes the reviewed command or structured capture. Set `agent.shell_output_filter = false` or use `--no-rtk` to disable it.
 
-A progress bar redraws a row instead of printing lines. Caudra renders both the live view and the capture as a terminal would show them, so a bar appears as one updating row rather than a single very long line, and the output printed before it is not pushed out of the retained window. Rendering is decoding rather than filtering, so `--no-rtk` does not disable it; the footer reports how many frames were absorbed.
+A rule that would report success applies only when the command exited zero, so a failure is never shown as a success. When a failing command reaches a rule's line cap, the result keeps its first and last lines. Filtering never makes a result larger than the raw output, and a filtered result ends with a `[filtered: …]` line that names the stages which changed it. Most rules come from [RTK](https://github.com/rtk-ai/rtk), credited in Workcell's notice file.
+
+A progress bar redraws a row instead of printing lines. Caudra renders both the live view and the capture as a terminal would show them, so a bar appears as one updating row rather than a single very long line, and the output printed before it is not pushed out of the retained window. Rendering is decoding rather than filtering, so `--no-rtk` does not disable it. The footer reports how many frames were absorbed.
+
+Commands start from a cleared environment. [Shell host configuration](/docs/cli/#shell-host-configuration) lists the variables they receive.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -232,6 +250,8 @@ A progress bar redraws a row instead of printing lines. Caudra renders both the 
 ### `python_execution` <span class="badge">on demand</span> {#python_execution}
 
 Execute a short Python script in an isolated interpreter and return its value and printed output.
+
+Scripts run in a separate worker process with no file system, network, environment variables, or subprocesses, under time, memory, and recursion limits. Host clocks, unseeded randomness, and sleep are refused. Because that isolation fixes what a script can reach, the default permission policy allows the tool without a prompt.
 
 Release builds include the isolated Monty worker. `WORKCELL_MCP_CODE_WORKER` can override it with an operator-supplied worker binary.
 
@@ -430,6 +450,12 @@ Generate a raster image from a text prompt and save it as a PNG. Use for AI-crea
 ### `webfetch` {#webfetch}
 
 Fetch content from a URL and return model-facing text.
+
+Every URL is checked before a connection opens. A private, loopback, link-local, or carrier-grade NAT address is refused, including an IPv6 form that maps to one, and so is a special-use name such as `localhost`, `.local`, or `home.arpa`. Every address a name resolves to must pass, and the connection goes only to those checked addresses. Up to 5 redirects are followed, each checked the same way, and a redirect to another origin carries only the `Accept`, `Accept-Language`, `Cache-Control`, `Pragma`, `Range`, and `User-Agent` headers. With a proxy configured, the proxy resolves the name and the URL checks still run locally.
+
+Text is decoded in the character set the response declares through a byte-order mark, the `Content-Type` header, or an HTML `<meta>` tag, and as UTF-8 otherwise. Up to 5 MiB of a response is read, and the model receives at most 2,000 lines or 50 KiB. Cut text ends with a line that names the limit, such as `[truncated: showing 1999 of 2105 lines]`.
+
+With the default `pdfMode` of `extract`, a PDF of up to 6 MiB and 200 pages arrives as its text. There is no OCR, so a scanned PDF yields little text. With `pdfMode` set to `attachment`, a model that reads PDFs receives the file itself inside the tool result. That covers Claude through an Anthropic API key, a Claude login, or Bedrock, and a custom model on an `anthropic` or `openai-responses` provider that sets [`supports_pdf`](/docs/providers/#model-fields). The PDFs in one request may use a quarter of the context window, counted at 4,500 tokens a page and capped at 100 pages, and an older PDF that no longer fits is replaced by a note that names it. A PDF over that budget, and every PDF for a model that does not read them, arrives as extracted text whose first line says why. Saved sessions keep only a PDF's URL, name, and page count. See [Fetched PDFs](/docs/sessions/#fetched-pdfs).
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

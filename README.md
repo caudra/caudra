@@ -60,8 +60,8 @@ The session has to keep running for this, for example in tmux or [Herdr](https:/
 
 Every turn sends the whole conversation again, so a noisy tool result costs tokens on every later turn until compaction. Caudra keeps results small and round trips few.
 
-- Shell output passes through command-aware filters in the style of [RTK](https://www.rtk-ai.app/docs/) before the model reads it, and they are on by default. You still watch the raw output while a command runs, and you can switch between the filtered and raw views afterwards.
-- `file_index` returns a file outline with signatures and line numbers. The `code_*` tools rank symbols and show callers, impact, and the tests that reach a change. They parse the source on the fly, so there is no index to build or maintain and nothing to configure.
+- Shell output passes through command-aware filters before the model reads it, and they are on by default. Most of the rules come from [RTK](https://www.rtk-ai.app/docs/), and a filtered result is always smaller than the raw one. A failure is never reported as a success, and a failing command keeps its first and last lines. Progress bars collapse to one row. You still watch the raw output while a command runs, and you can switch between the filtered and raw views afterwards.
+- `file_index` returns a file outline with signatures and line numbers. The `code_*` tools rank symbols and show callers, impact, and the tests they can trace to a change. They parse the source on the fly, so there is no index to build or maintain and nothing to configure.
 - Oversized results reach the model as a bounded head and tail, and `tool_output` searches the rest. `batch` runs independent calls in one turn, and subagents keep their exploration out of the main context.
 - Caudra sends a per-conversation cache key wherever a provider accepts one, and `/usage` shows the cache hit rate for every model.
 
@@ -98,7 +98,18 @@ Smaller local models such as Qwen3.8-27B need more help to finish a task. Caudra
 max_attempts = 4
 ```
 
+In daily use, the `abandoned_turn` rule matched 35 of 386 final Qwen3.8-27B replies and none of 2,185 from Claude and GPT models, as [measured by the maintainer](#why-caudra-exists).
+
 A nudge is a message to the model. It cannot run or approve a tool, and every real tool call still passes through validation and your permission rules.
+
+### Tools that say what they missed
+
+When a tool stops at a limit or leaves something out, its result says what is missing, and the model can go back for it. The file, shell, web, code, and Python tools come from [Workcell](https://github.com/tensorninja/workcell-mcp), which also runs on its own as an MCP server.
+
+- A `file_grep` or `file_glob` call that reaches its bounds returns what it found and reports how much it withheld, so the model can tell a missing match from a file it never searched. Directory searches skip credential files such as `.env` and SSH private keys.
+- `webfetch` refuses private, loopback, and link-local addresses and checks every redirect the same way. Pages arrive in the character set they declare, and a page cut at 2,000 lines or 50 KiB ends with a line that names the limit.
+- A fetched PDF arrives as its text. In attachment mode, Claude through Anthropic or Amazon Bedrock receives the file itself inside the tool result, within a quarter of its context window, and so does a custom model on a compatible API that declares PDF support. Other models receive the extracted text with a line that says why. Saved sessions keep only the URL, name, and page count.
+- `python_execution` runs scripts in a separate worker with no file system, network, environment variables, or subprocesses. That isolation is why the default permission policy runs it without a prompt.
 
 ## Use the models you already pay for
 
@@ -192,6 +203,8 @@ workflows = true
 
 Sessions, retained tool output, and file change records are stored on your machine. Cloud models and network tools still receive what you send them.
 
+Shell commands start from a cleared environment and receive only [a short list of variables](https://caudra.ai/docs/cli/#shell-host-configuration), such as `PATH`, `HOME`, and proxy settings, so API keys set for Caudra stay out of them. `webfetch` checks every URL and redirect before it connects, and refuses private, loopback, and link-local addresses.
+
 There is no tracking. Telemetry stays off unless you send it to a collector you run, and Caudra checks for updates only when you run `caudra update` or turn on the startup check.
 
 Caudra also works offline with a local model. Use Ollama or llama.cpp, or point a `providers.toml` entry at [ninfer-4090](https://github.com/tensorninja/ninfer-4090), the maintainer's custom inference engine for Qwen3.8-27B on a single RTX 4090. Otherwise, a normal run contacts your provider, refreshes the public [models.dev](https://models.dev) catalog at most once a day, and reaches Exa when the agent searches the web.
@@ -235,13 +248,13 @@ Caudra is developed and maintained by [Thorsten Born](https://thorstenborn.com).
 
 Caudra builds on ideas from these open-source projects, with thanks:
 
-- [RTK](https://www.rtk-ai.app/docs/): shell output filtering
+- [RTK](https://www.rtk-ai.app/docs/): shell output filtering. Most of Workcell's filter rules are copied from RTK under the Apache License 2.0.
 - [ripwire](https://github.com/redhat-et/ripwire): code maps
 - [Plannotator](https://plannotator.ai/): passage review
 - [Herdr](https://herdr.dev): terminal workspaces for agents
 - [Grok Build](https://x.ai/news/workflows): durable workflows. The built-in `deep-research` workflow is adapted from Grok Build under the Apache License 2.0.
 
-The isolated Python tool runs on [Monty](https://github.com/pydantic/monty) by Pydantic.
+The file, shell, web, code, and Python tools come from [Workcell](https://github.com/tensorninja/workcell-mcp), released under the Apache License 2.0. The isolated Python tool runs on [Monty](https://github.com/pydantic/monty) by Pydantic.
 
 ## License
 

@@ -5,17 +5,23 @@ import { load, type CheerioAPI } from 'cheerio';
 import { createMarkdownProcessor } from '@astrojs/markdown-remark';
 import { SITE, estimatedTokens, pageMarkdown, pagePath, readDocs } from '../../src/data/docs';
 import compatibility from '../../src/markdown/compatibility';
-import { CLAUDE_NOTE, GROK_BUILD, HEADLINE, HERO_EYEBROW, METHOD_NOTE, NAME_SOURCES, NINFER, capabilityGroups, heroClip, inspirations, metrics, stories } from '../../src/data/home';
+import { CLAUDE_NOTE, GROK_BUILD, HEADLINE, HERO_EYEBROW, METHOD_NOTE, NAME_SOURCES, NINFER, WORKCELL_REPOSITORY, capabilityGroups, heroClip, inspirations, metrics, stories } from '../../src/data/home';
 import { INSTALL_COMMAND } from '../../src/data/install';
 
 const ILLUSTRATION = 'Illustration';
 const EXPERIMENTAL = 'Experimental';
 const MAINTAINER_ATTRIBUTION = 'Measured by the maintainer in daily use';
 const MIN_CAPABILITIES = 40;
-const FOUNDER_FIGURES = /20 ?(?:B\b|billion)|9[47]%|under a second|<1 s|[12] GB|10k-turn/;
+const FOUNDER_FIGURES = /20 ?(?:B\b|billion)|9[47]%|under a second|<1 s|[12] GB|10k-turn|35 of 386|2,185/;
+const STEERING_FIGURE = /35 of 386 final Qwen3\.8-27B replies and none of 2,185/;
+const STEERING_STORY = 'nudges';
 const OTHER_AGENTS = /OpenCode|Claude Code|Codex|Cursor|Aider|Gemini CLI|Grok Build/i;
 const BRAIN_REFERENCES = /\bbrain\b|caudate/i;
 const NAME_STORY = 'name';
+const TOOLS_STORY = 'tools';
+const WORKCELL = 'Workcell';
+const UNVERIFIED_TOOL_CLAIMS = /PageRank|personali[sz]ed|microsecond/i;
+const SANDBOX = /sandbox/i;
 const dist = new URL('../../dist/', import.meta.url);
 const { pages, navigation } = await readDocs();
 const renderer = await createMarkdownProcessor({ smartypants: false, remarkPlugins: [compatibility], syntaxHighlight: false });
@@ -138,6 +144,8 @@ test('homepage founder figures are attributed and explained by the method note',
     const text = $(section).text().replace(/\s+/g, ' ');
     if (FOUNDER_FIGURES.test(text)) expect(text, `#${$(section).attr('id')}: unattributed founder figure`).toContain('maintainer');
   }
+  expect(homeText($, `#${STEERING_STORY}`)).toMatch(STEERING_FIGURE);
+  expect($(`#${STEERING_STORY} a[href="#method"]`).length).toBe(1);
   expect(homeText($, '#why')).not.toMatch(OTHER_AGENTS);
 });
 
@@ -165,6 +173,13 @@ test('homepage credits ideas, labels experiments, and makes no automation claims
   expect(homeText($, '#lab')).toContain('JEV decision engine');
   expect(homeText($, '#sleep')).toContain('needs a running session');
   expect(homeText($, 'main')).not.toMatch(/\bautomations?\b|\bschedul|\bcron\b/i);
+});
+
+test('homepage credits Workcell for the tools and keeps to their documented claims', () => {
+  const $ = documents.get('/')!;
+  expect($(`#${TOOLS_STORY} a[href="${WORKCELL_REPOSITORY}"]`).text()).toBe(WORKCELL);
+  expect(homeText($, `#${TOOLS_STORY}`)).not.toMatch(SANDBOX);
+  expect(homeText($, 'main')).not.toMatch(UNVERIFIED_TOOL_CLAIMS);
 });
 
 test('homepage has an honest product story, working destinations, and a small entry script', async () => {

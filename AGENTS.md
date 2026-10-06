@@ -65,7 +65,7 @@ Rust workspace, key crates in root dir:
 - caudra-automation: Runtime-neutral automation language (static `meta` header, args, events, untrusted values, host ABI, engine, validation, dry-run replay, schedules, limits), the `snapshot` read model, and the `request` types. `skill/SKILL.md` is the `caudra-automation-dev` skill, and `tests/examples/` holds the scripts its tests replay, which the skill and the docs page embed. Discovery, trust, the session runtime, and its storage glue live in `caudra-agent/src/automation`
 - caudra-script: The Rhai sandbox workflows and automations share: a restricted engine, a header read without running the script, a bridge that serves host calls while the interpreter runs on its own thread, and canonical JSON and SHA-256 request digests
 
-First-party Workcell tools are native Rust: file_read, file_glob, file_grep, file_write, file_edit, file_apply_patch, index, websearch, webfetch, shell, python_execution, execution_environment, and the code-graph family code_map, code_context, code_refs, code_impact, and code_expand.
+First-party Workcell tools are native Rust: file_read, file_glob, file_grep, file_write, file_edit, file_apply_patch, file_index, websearch, webfetch, shell, python_execution, execution_environment, and the code-graph family code_map, code_context, code_refs, code_impact, and code_expand.
 Caudra owns authorization, registration, and presentation. Workcell owns protocol-neutral contracts,
 validation, bounds, atomicity, network policy, subprocess cleanup, and the bundled Monty worker
 lifecycle. Keep Workcell logic in Workcell rather than duplicating it in `caudra-workcell`.
