@@ -32,7 +32,7 @@ Fine when genuine: anaphora in scannable checklists ("No prompt text / No model 
 
 - [Diátaxis](https://diataxis.fr/): guides for goals, reference for lookup, concepts for understanding.
 - One canonical home per topic; link instead of duplicating.
-- Generated pages (tools, providers, configuration, reference-configs, lua-api, plugins, keybindings, commands) come from `caudra-docgen`: edit the source, run `just gen-docs`, never edit output by hand.
+- Generated pages (tools, providers, configuration, reference-configs, lua-api, plugins, keybindings, commands) come from `caudra-docgen`: edit the source, run `make gen-docs`, never edit output by hand.
 - Hand-written pages can hold generated regions between `<!-- caudra-docgen:NAME -->` and `<!-- /caudra-docgen:NAME -->`. Write around the markers, never between them. The `*.example.toml` files in `examples/` are generated too.
 
 ## Canonical format

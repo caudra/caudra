@@ -73,7 +73,7 @@ let meta = #{
     triggers: [#{ kind: "idle" }],
     limits: #{ max_per_hour: 4 },
     args: #{
-        command: #{ type: "string", default_value: "just test", description: "The test command" },
+        command: #{ type: "string", default_value: "make test", description: "The test command" },
     },
 };
 if event.started_by.kind == "user" { state.asked = 0; }

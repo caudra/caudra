@@ -25,39 +25,42 @@ For a larger change, open an issue first and describe your plan. That covers new
 Install these yourself:
 
 - [rustup](https://rustup.rs). `rust-toolchain.toml` pins Rust 1.99.0, and rustup fetches it with clippy and rustfmt the first time you build.
-- [just](https://github.com/casey/just) for the recipes in the `justfile`, and [cargo-nextest](https://nexte.st) for the tests.
+- GNU Make and Bash for the targets in the `Makefile`, and [cargo-nextest](https://nexte.st) for the tests.
 - Python 3, which builds the worker behind the `python_execution` tool, and [ripgrep](https://github.com/BurntSushi/ripgrep), which some tests call.
 - [stylua](https://github.com/JohnnyMorganz/StyLua), [ruff](https://docs.astral.sh/ruff/), [ty](https://github.com/astral-sh/ty), and [cargo-machete](https://github.com/bnjbvr/cargo-machete) for the formatting and lint checks.
 
-Application development and docs generation do not require Bun, Node.js, or a website checkout.
+On Windows, run Make from Git Bash and install GNU Make separately. CI provisions GNU Make explicitly. The Makefile uses `python3` by default. If your Python 3 executable is named `python`, use `make PYTHON=python <target>`.
+
+Build logic stays in Cargo and Python. Application development, native builds, and docs generation do not require Bun, Node.js, or a website checkout.
 
 ### First build
 
 ```sh
 git clone https://github.com/caudra/caudra
 cd caudra
-just code-worker   # build the Python worker, once
-just run           # start a debug build
+make run           # start a debug build
 ```
 
-Run `just code-worker` before any other recipe. The recipes point the build at the worker it produces, and they fail while that file is missing. The first run downloads and compiles the worker, and later runs reuse it. A plain `cargo build` works without the worker, but that binary has no `python_execution` tool and says so at startup.
+Cargo-compiling targets depend on `code-worker` automatically: `build`, `check`, `run`, `test`, `lint`, `install`, `install-fast`, `gen-docs`, `gen-docs-check`, and the Workcell targets that compile Rust. No manual bootstrap is needed. The first run downloads and compiles the worker, and later runs reuse it. Run `make code-worker` for an optional warmup. A plain `cargo build` works without the worker, but that binary has no `python_execution` tool and says so at startup.
 
-A debug build keeps its own config, sessions, sign-ins, and logs in `caudra-debug` directories, such as `~/.config/caudra-debug/`. Your everyday Caudra keeps using its own, and the two share only project `.caudra/` directories. Sign in once inside the debug build with `just run -- auth login`. Arguments for Caudra always go after the `--`. To choose another directory name, set `CAUDRA_NAMESPACE`.
+A debug build keeps its own config, sessions, sign-ins, and logs in `caudra-debug` directories, such as `~/.config/caudra-debug/`. Your everyday Caudra keeps using its own, and the two share only project `.caudra/` directories. Sign in once inside the debug build with `make run ARGS='-- auth login'`. The `run` target passes `ARGS` to Cargo, so arguments for Caudra go after the `--`. To choose another directory name, set `CAUDRA_NAMESPACE`.
 
 ## Everyday commands
 
-The `justfile` holds the commands that CI runs:
+The `Makefile` holds the commands that CI runs:
 
 ```sh
-just check      # type-check every crate, without codegen
-just lint       # clippy over every crate, warnings are errors
-just test       # every test, under nextest
-just fmt        # format the Rust, Lua, and Python sources
-just gen-docs   # regenerate the generated docs
-just ci         # most application CI checks in one go
+make check      # type-check every crate, without codegen
+make lint       # clippy over every crate, warnings are errors
+make test       # every test, under nextest
+make fmt        # format the Rust, Lua, and Python sources
+make gen-docs   # regenerate the generated docs
+make ci         # most application CI checks in one go
 ```
 
-`just check` and `just test` always cover the whole workspace, even if you add `-p`, and `just lint` does too. The full test suite takes a while, so run cargo directly while you work on one crate:
+Pass extra Cargo flags with `ARGS='...'`, such as `make build ARGS='--release'`, `make check ARGS='--all-targets'`, or `make test ARGS='--no-fail-fast'`.
+
+`make check` and `make test` always cover the whole workspace, even if you add `-p` through `ARGS`, and `make lint` does too. The full test suite takes a while, so run Cargo directly while you work on one crate:
 
 ```sh
 cargo check -p caudra-ui --tests
@@ -65,17 +68,19 @@ cargo clippy -p caudra-ui --tests -- -D warnings
 cargo nextest run -p caudra-ui
 ```
 
-The recipes set `WORKCELL_BUNDLED_MONTY_WORKER` to the worker from `just code-worker`. Export the same value in your shell. Then cargo and `just` build the same way, and switching between them does not trigger rebuilds:
+The Make targets set `WORKCELL_BUNDLED_MONTY_WORKER` to the worker from `make code-worker`. Before using Cargo directly, run `make code-worker` if no Make build has prepared it yet, and export the same value in your shell. Then Cargo and Make build the same way, and switching between them does not trigger rebuilds:
 
 ```sh
 export WORKCELL_BUNDLED_MONTY_WORKER="$PWD/target/code-worker/bin/monty"
 ```
 
+On Windows, use `monty.exe` in that path.
+
 Run tests with nextest rather than `cargo test`. nextest gives every test its own process, and some UI tests share global state that a single process would mix up.
 
 Debug builds leave out debug info for dependencies and vendored C code, which keeps linking fast. Caudra's own crates keep it. To step into one dependency in a debugger, add `[profile.dev.package.<name>] debug = true` to `Cargo.toml`.
 
-Before you ask for review, run `just ci`. CI also runs the macOS and Windows builds and the Nix build. Website checks run in the separate website repository.
+Before you ask for review, run `make ci`. CI also runs the macOS and Windows builds and the Nix build. Website checks run in the separate website repository.
 
 ## Where things live
 
@@ -111,13 +116,13 @@ Put unit tests in a `#[cfg(test)]` module in the same file. Use `#[test_case]` f
 
 - Work on an experimental feature stays behind its `[experimental]` switch. With the switch off, the feature shows no tools, commands, shortcuts, help entries, or status chips, and it does no work at startup.
 - Do not add default key bindings that use Alt. By default, many macOS terminals do not send Option as Alt, so those keys would never arrive.
-- Lua plugins are experimental too. When you change the Lua API, keep names close to Neovim's where that makes plugin code familiar. `just fmt` formats the plugins with stylua.
+- Lua plugins are experimental too. When you change the Lua API, keep names close to Neovim's where that makes plugin code familiar. `make fmt` formats the plugins with stylua.
 
 ## Docs
 
 The user docs live in `docs/content/` as plain Markdown, with navigation in `docs/navigation.json`. The same pages are compiled into the binary for `/docs` and for the agent's `caudra-docs` skill. When a change alters what users see, update its page in the same pull request.
 
-Some pages are generated by `caudra-docgen`: tools, providers, configuration, reference-configs, lua-api, plugins, keybindings, and commands. So are the `*.example.toml` files in `docs/examples/` and the text between `<!-- caudra-docgen:NAME -->` markers in other pages. Edit the source and run `just gen-docs`, never the output. For a new setting, the source is its metadata in `caudra-config`, which also feeds `caudra config example`. CI fails when the generated files are out of date.
+Some pages are generated by `caudra-docgen`: tools, providers, configuration, reference-configs, lua-api, plugins, keybindings, and commands. So are the `*.example.toml` files in `docs/examples/` and the text between `<!-- caudra-docgen:NAME -->` markers in other pages. Edit the source and run `make gen-docs`, never the output. For a new setting, the source is its metadata in `caudra-config`, which also feeds `caudra config example`. CI fails when the generated files are out of date.
 
 Tests resolve every docs link and section anchor, so update the links when you rename a heading. [docs/AGENTS.md](docs/AGENTS.md) holds the voice, structure, and format rules. Source moves must preserve public `/docs/` URLs, example downloads, and section anchors.
 
@@ -127,7 +132,7 @@ The website is maintained separately and consumes these canonical sources. Its d
 
 The file, shell, web, Python, and code-graph tools come from [Workcell](https://github.com/caudra/caudra/tree/main/workcell). Its crates live under `workcell/` as local members of this Rust workspace and share the root `Cargo.lock`.
 
-Edit Workcell in this checkout and use the same cargo and `just` commands as for Caudra. For example, check the adapter after a tool change:
+Edit Workcell in this checkout and use the same Cargo and Make commands as for Caudra. For example, check the adapter after a tool change:
 
 ```sh
 cargo nextest run -p caudra-workcell

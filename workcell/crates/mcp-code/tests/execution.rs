@@ -4,7 +4,7 @@
 //!
 //! These tests assert the behaviour the tool description promises: the value contract, the isolation
 //! claims, and the failure classification an agent is steered by. They need the worker binary, which
-//! is built separately from the workspace (`just code-worker`). Local runs may skip without it;
+//! is built separately from the workspace (`make code-worker`). Local runs may skip without it;
 //! CI sets WORKCELL_REQUIRE_CODE_WORKER so a missing worker fails the suite.
 
 use std::{
@@ -23,7 +23,7 @@ use workcell_mcp_code::{
 };
 
 /// Resolves the worker the same way the server does, plus the in-repo build location so a developer
-/// who ran `just code-worker` needs no extra configuration.
+/// who ran `make code-worker` needs no extra configuration.
 fn worker() -> Option<PathBuf> {
     static WORKER: OnceLock<Option<PathBuf>> = OnceLock::new();
     let worker = WORKER
@@ -68,7 +68,7 @@ fn worker() -> Option<PathBuf> {
         .clone();
     assert!(
         worker.is_some() || std::env::var_os("WORKCELL_REQUIRE_CODE_WORKER").is_none(),
-        "required monty worker is missing; run just code-worker"
+        "required monty worker is missing; run make code-worker"
     );
     worker
 }

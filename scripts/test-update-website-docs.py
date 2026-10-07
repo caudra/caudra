@@ -76,7 +76,7 @@ class FakeAPI:
         ]
         self.jobs[-1]["steps"] = [
             {
-                "name": "Run just gen-docs-check",
+                "name": "Run make gen-docs-check",
                 "status": "completed",
                 "conclusion": "success",
             }
@@ -253,6 +253,17 @@ class UpdateTests(unittest.TestCase):
                 job["conclusion"] = "success"
         self.source.jobs[-1]["steps"][0]["conclusion"] = "skipped"
         self.refuse()
+
+    def test_docgen_requires_one_exact_make_step(self):
+        step = self.source.jobs[-1]["steps"][0]
+        for steps in (
+            [],
+            [step, step],
+            [{**step, "name": "Run just gen-docs-check"}],
+        ):
+            with self.subTest(steps=steps):
+                self.source.jobs[-1]["steps"] = steps
+                self.refuse()
 
     def test_no_content_change_ignores_non_imported_paths(self):
         self.source.trees[NEW] = copy.deepcopy(self.source.trees[OLD]) + [

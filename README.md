@@ -155,7 +155,7 @@ Prebuilt binaries for Linux and macOS on x86_64 and ARM64, and for Windows on x8
 cargo install --locked --git https://github.com/caudra/caudra.git caudra
 ```
 
-A plain `cargo install` build leaves out `python_execution`, the isolated Python tool, because only release builds, Nix, and `just install` from a checkout embed its worker. The other tools work as usual.
+A plain `cargo install` build leaves out `python_execution`, the isolated Python tool, because only release builds, Nix, and `make install` from a checkout embed its worker. The other tools work as usual.
 
 ## First steps
 
@@ -229,16 +229,17 @@ For a complete setup to copy from, see the [example config](https://github.com/c
 
 Caudra is under active development, and bug reports help a lot. Issues and pull requests are welcome on [GitHub](https://github.com/caudra/caudra/issues). Please read [CONTRIBUTING.md](CONTRIBUTING.md) before you start on a larger change.
 
-Caudra is a Rust workspace, and the `justfile` holds the everyday commands:
+Caudra is a Rust workspace, and the `Makefile` holds the everyday commands. It requires GNU Make, Bash, and Python 3. On Windows, use Git Bash with GNU Make installed separately. Python defaults to `python3`, overridable with `make PYTHON=python <target>`.
 
 ```sh
-just code-worker   # build the Python worker, once, before the other recipes
-just check         # type-check the workspace
-just lint          # clippy, with warnings as errors
-just test          # the test suite
-just ci            # most application CI checks
-just install       # install from your checkout, Python worker included
+make check         # type-check the workspace
+make lint          # clippy, with warnings as errors
+make test          # the test suite
+make ci            # most application CI checks
+make install       # install from your checkout, Python worker included
 ```
+
+Cargo-compiling targets build the Python worker automatically. `make code-worker` is an optional warmup. Pass extra flags with `ARGS='...'`, such as `make build ARGS='--release'`. To sign in from a debug build, use `make run ARGS='-- auth login'`.
 
 Canonical docs live in `docs/content/`, with navigation in `docs/navigation.json` and generated config examples in `docs/examples/`. The pages are compiled into the binary for `/docs`. The website is maintained separately and consumes these same sources. Application development and docs generation do not require JavaScript tooling.
 

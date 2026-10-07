@@ -292,10 +292,11 @@
         {
           default = craneLib.devShell {
             packages = with pkgs; [
+              bash
               cargo-machete
               cargo-nextest
               git
-              just
+              gnumake
               openssl
               perl
               pkg-config

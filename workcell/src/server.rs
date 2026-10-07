@@ -5074,7 +5074,7 @@ mod tests {
             built.is_file()
                 || (std::env::var_os("WORKCELL_REQUIRE_CODE_WORKER").is_none()
                     && option_env!("WORKCELL_BUNDLED_MONTY_WORKER").is_none()),
-            "required monty worker is missing; run just code-worker"
+            "required monty worker is missing; run make code-worker"
         );
         built.is_file().then_some(built)
     }

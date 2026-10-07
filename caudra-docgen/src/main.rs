@@ -123,7 +123,7 @@ fn main() -> ExitCode {
         if mismatches == 0 {
             ExitCode::SUCCESS
         } else {
-            eprintln!("docs out of date, run `just gen-docs` to update");
+            eprintln!("docs out of date, run `make gen-docs` to update");
             ExitCode::FAILURE
         }
     } else {

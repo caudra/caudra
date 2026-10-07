@@ -3046,7 +3046,7 @@ where
 }
 
 /// Locates the `monty` worker the way the server does, plus the in-repo build location so a
-/// developer who ran `just code-worker` needs no extra configuration.
+/// developer who ran `make code-worker` needs no extra configuration.
 #[cfg(unix)]
 fn code_worker() -> Option<PathBuf> {
     if let Some(configured) = std::env::var_os("WORKCELL_MCP_CODE_WORKER") {
@@ -3063,7 +3063,7 @@ fn code_worker() -> Option<PathBuf> {
         installed.is_file()
             || (std::env::var_os("WORKCELL_REQUIRE_CODE_WORKER").is_none()
                 && option_env!("WORKCELL_BUNDLED_MONTY_WORKER").is_none()),
-        "required monty worker is missing; run just code-worker"
+        "required monty worker is missing; run make code-worker"
     );
     installed.is_file().then_some(installed)
 }

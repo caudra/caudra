@@ -5,6 +5,7 @@ on:
     branches: ["main"]
     paths:
       - "scripts/**/*.py"
+      - "Makefile"
       - "scripts/attribution-policy.json"
       - "LICENSE"
       - "NOTICE.md"
@@ -20,6 +21,7 @@ on:
     branches: ["main"]
     paths:
       - "scripts/**/*.py"
+      - "Makefile"
       - "scripts/attribution-policy.json"
       - "LICENSE"
       - "NOTICE.md"
@@ -42,6 +44,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - run: python3 scripts/test-make.py
       - run: python3 scripts/test-build-code-worker.py
       - run: python3 scripts/test-build-attribution.py
       - run: python3 scripts/test-install.py
