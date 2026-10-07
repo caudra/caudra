@@ -68,6 +68,9 @@
             || (lib.hasSuffix "/docs/navigation.json" path)
             || (builtins.match ".*/workcell/.*/(queries|rules.*|fixtures|evals)/.*" path != null)
             || (builtins.match ".*/workcell/fixtures/.*" path != null)
+            || (builtins.match ".*/scripts/.*" path != null)
+            || (builtins.match ".*/THIRD_PARTY_LICENSES/.*" path != null)
+            || (builtins.match ".*/(LICENSE[^/]*|COPYING[^/]*|NOTICE[^/]*|THIRD_PARTY[^/]*)" path != null)
             || (lib.hasSuffix ".lua" path);
           src = lib.cleanSource ./.;
         };
@@ -214,8 +217,24 @@
                 "out"
                 "debug"
               ];
+              postBuild = ''
+                worker_source="$(mktemp -d)"
+                cp -r ${montySrc}/. "$worker_source/"
+                chmod -R u+w "$worker_source"
+                mkdir -p "$worker_source/.cargo"
+                cp ${montyVendorDeps}/config.toml "$worker_source/.cargo/config.toml"
+                CARGO_NET_OFFLINE=true python3 scripts/build-attribution.py \
+                  --manifest-path Cargo.toml --package ${packageName} \
+                  --target ${pkgs.stdenv.hostPlatform.rust.rustcTarget} \
+                  --worker-manifest-path "$worker_source/Cargo.toml" \
+                  --worker-package monty-runtime --output-dir licenses
+                test -s licenses/manifest.json
+              '';
               installPhaseCommand = ''
                 mkdir -p $out/bin $debug/bin
+                mkdir -p $out/share/licenses $debug/share/licenses
+                cp -r licenses $out/share/licenses/caudra
+                ln -s $out/share/licenses/caudra $debug/share/licenses/caudra
                 cp target/release/caudra $debug/bin/caudra
                 ln -s ${montyWorker.debug}/bin/monty $debug/bin/monty
                 cp target/release/caudra $out/bin/caudra

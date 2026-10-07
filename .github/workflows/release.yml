@@ -66,6 +66,11 @@ jobs:
               export WORKCELL_BUNDLED_MONTY_WORKER="$PWD/target/code-worker/bin/monty"
               export CARGO_PROFILE_RELEASE_STRIP=none
               cargo build --locked --release --package caudra --target ${{ matrix.target }}
+              python3 scripts/build-attribution.py \
+                --manifest-path Cargo.toml --package caudra --target ${{ matrix.target }} \
+                --worker-manifest-path "$(cat target/code-worker/source-manifest-path)" \
+                --worker-package monty-runtime --output-dir licenses
+              test -s licenses/manifest.json
               mkdir -p target/release-symbols
               cp target/${{ matrix.target }}/release/caudra target/release-symbols/caudra
               cp target/code-worker/symbols/bin/monty target/release-symbols/monty
@@ -84,7 +89,8 @@ jobs:
       - name: Package diagnostic binaries
         run: |
           archive="${BINARY_NAME}-${GITHUB_REF_NAME}-${{ matrix.target }}-symbols.tar.gz"
-          tar czf "$archive" LICENSE NOTICE.md THIRD_PARTY_LICENSES -C target/release-symbols .
+          test -s licenses/manifest.json
+          tar czf "$archive" LICENSE NOTICE.md THIRD_PARTY_LICENSES licenses -C target/release-symbols .
           echo "SYMBOL_ARCHIVE=$archive" >> "$GITHUB_ENV"
 
       - name: Package
@@ -92,7 +98,8 @@ jobs:
           tag="$GITHUB_REF_NAME"
           archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.tar.gz"
           cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "${BINARY_NAME}"
-          tar czf "${archive}" "${BINARY_NAME}" LICENSE NOTICE.md THIRD_PARTY_LICENSES
+          test -s licenses/manifest.json
+          tar czf "${archive}" "${BINARY_NAME}" LICENSE NOTICE.md THIRD_PARTY_LICENSES licenses
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
       - name: Upload artifact
@@ -135,6 +142,11 @@ jobs:
           export WORKCELL_BUNDLED_MONTY_WORKER="$worker"
           export CARGO_PROFILE_RELEASE_STRIP=none
           cargo build --locked --release --package caudra --target ${{ matrix.target }}
+          python3 scripts/build-attribution.py \
+            --manifest-path Cargo.toml --package caudra --target ${{ matrix.target }} \
+            --worker-manifest-path "$(cat target/code-worker/source-manifest-path)" \
+            --worker-package monty-runtime --output-dir licenses
+          test -s licenses/manifest.json
           mkdir -p target/release-symbols
           cp "$PWD/target/code-worker/symbols/bin/"* target/release-symbols/
           if [[ "${{ runner.os }}" == "Windows" ]]; then
@@ -160,7 +172,8 @@ jobs:
         shell: bash
         run: |
           archive="${BINARY_NAME}-${GITHUB_REF_NAME}-${{ matrix.target }}-symbols.tar.gz"
-          tar czf "$archive" LICENSE NOTICE.md THIRD_PARTY_LICENSES -C target/release-symbols .
+          test -s licenses/manifest.json
+          tar czf "$archive" LICENSE NOTICE.md THIRD_PARTY_LICENSES licenses -C target/release-symbols .
           echo "SYMBOL_ARCHIVE=$archive" >> "$GITHUB_ENV"
 
       - name: Package (Unix)
@@ -169,7 +182,8 @@ jobs:
           tag="$GITHUB_REF_NAME"
           archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.tar.gz"
           cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "${BINARY_NAME}"
-          tar czf "${archive}" "${BINARY_NAME}" LICENSE NOTICE.md THIRD_PARTY_LICENSES
+          test -s licenses/manifest.json
+          tar czf "${archive}" "${BINARY_NAME}" LICENSE NOTICE.md THIRD_PARTY_LICENSES licenses
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
       - name: Package (Windows)
@@ -179,7 +193,8 @@ jobs:
           tag="$GITHUB_REF_NAME"
           archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.zip"
           cp "target/${{ matrix.target }}/release/${BINARY_NAME}.exe" "${BINARY_NAME}.exe"
-          7z a "${archive}" "${BINARY_NAME}.exe" LICENSE NOTICE.md THIRD_PARTY_LICENSES
+          test -s licenses/manifest.json
+          7z a "${archive}" "${BINARY_NAME}.exe" LICENSE NOTICE.md THIRD_PARTY_LICENSES licenses
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
       - name: Upload artifact

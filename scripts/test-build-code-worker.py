@@ -71,6 +71,14 @@ class BuildCodeWorkerTests(unittest.TestCase):
         self.worker = self.root / "bin" / "monty"
         self.symbols = self.root / "symbols" / "bin" / "monty"
         self.stamp = self.root / "build-fingerprint"
+        self.source_record = self.root / WORKER.SOURCE_MANIFEST_FILE
+        self.manifest = Path(temporary.name) / "registry" / "Cargo.toml"
+        self.manifest.parent.mkdir()
+        self.manifest.write_text(
+            f'[package]\nname = "monty-runtime"\nversion = "{WORKER.VERSION}"\n'
+        )
+        self.manifest.with_name("Cargo.lock").write_text("version = 4\n")
+        self.emit_manifest = True
         self.toolchain = TOOLCHAIN
         self.emit_pdb = False
         self.pdb_content = PDB
@@ -105,7 +113,11 @@ class BuildCodeWorkerTests(unittest.TestCase):
                 stdout=json.dumps(
                     {
                         "reason": "compiler-artifact",
-                        "target": {"name": "monty"},
+                        "target": {
+                            "name": "monty" if self.emit_manifest else "other",
+                            "kind": ["bin"],
+                        },
+                        "manifest_path": str(self.manifest),
                         "filenames": filenames,
                     }
                 )
@@ -180,6 +192,54 @@ class BuildCodeWorkerTests(unittest.TestCase):
         self.assertEqual(self.stamp.read_bytes(), stamp)
         self.assertEqual(self.worker.read_bytes(), STRIPPED)
         self.assertEqual(self.symbols.read_bytes(), UNSTRIPPED)
+
+    def test_actual_compiler_manifest_is_recorded(self):
+        self.build()
+
+        self.assertEqual(self.source_record.read_text(), str(self.manifest) + "\n")
+
+    def test_missing_source_record_rebuilds(self):
+        self.build()
+        self.source_record.unlink()
+        self.run_mock.reset_mock()
+
+        self.build()
+
+        self.assertEqual(self.run_mock.call_count, 2)
+        self.assertEqual(self.source_record.read_text(), str(self.manifest) + "\n")
+
+    def test_missing_source_lockfile_invalidates_cache(self):
+        self.build()
+        self.manifest.with_name("Cargo.lock").unlink()
+
+        self.assertFalse(
+            WORKER.cached(
+                self.worker,
+                self.symbols,
+                self.stamp,
+                WORKER.fingerprint(TOOLCHAIN, TARGET),
+            )
+        )
+
+    def test_missing_compiler_manifest_preserves_previous_worker(self):
+        self.seed_existing_worker()
+        self.emit_manifest = False
+
+        with self.assertRaisesRegex(RuntimeError, WORKER.SOURCE_ERROR):
+            self.build(force=True)
+
+        self.assert_existing_worker_preserved()
+
+    def test_different_source_version_preserves_previous_worker(self):
+        self.seed_existing_worker()
+        self.manifest.write_text(
+            '[package]\nname = "monty-runtime"\nversion = "0.0.0"\n'
+        )
+
+        with self.assertRaisesRegex(RuntimeError, WORKER.SOURCE_ERROR):
+            self.build(force=True)
+
+        self.assert_existing_worker_preserved()
 
     def test_changed_toolchain_invalidates_fingerprint(self):
         self.build()

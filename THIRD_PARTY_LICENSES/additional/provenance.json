@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "path_base": "repository_root",
-  "scope": "Only the 40 assigned missing-text package versions in the observed application/worker attribution errors. Excludes quote-use, quote-use-macros, siphasher, monty-typeshed and two-face. Does not select build dependencies or audit embedded assets.",
-  "verification": "39 cached .crate SHA-256 values match root or actual worker Cargo.lock. The worker-root monty-runtime archive matches the exact-version crates.io sparse-index checksum because its own lockfile has no checksum. Cached manifests and .cargo_vcs_info.json match the archives. All 40 original manifests match their reported revision Git blobs byte-for-byte. Upstream ancestor license files match pinned Git blob hashes. Legal texts are unmodified. Existing texts are referenced when the exact source revision and contents match. No canonical linked-license replacement texts were needed.",
+  "scope": "The 40 previously assigned application/worker missing-text package versions plus seven exact-version macOS objc2 package dependencies. Excludes quote-use, quote-use-macros, siphasher, monty-typeshed and two-face package entries. Does not select build dependencies or audit embedded assets. Canonical license terms may be referenced from another collected package directory.",
+  "verification": "46 cached .crate SHA-256 values match root or actual worker Cargo.lock. The worker-root monty-runtime archive matches the exact-version crates.io sparse-index checksum because its own lockfile has no checksum. Cached manifests and .cargo_vcs_info.json match the archives. All 47 original manifests match their reported revision Git blobs byte-for-byte. Upstream ancestor legal files match pinned Git blob hashes. Legal texts are unmodified. Existing texts are referenced when exact sources and contents match. The seven objc2 packages explicitly link canonical MIT terms rather than supply full historical license files; those terms are identified separately, with their original text extraction and reuse recorded. Upstream Apple SDK licensing uncertainty remains unresolved.",
   "worker_source": {
     "manifest_pointer": "target/code-worker/source-manifest-path",
     "package": "monty-runtime",
@@ -113,6 +113,34 @@
       "sha256": "117829c3ca21efb132d81a44b55363d395ab8eea18526873bc828da4c0e5f038"
     },
     {
+      "path": "THIRD_PARTY_LICENSES/additional/objc2/LICENSE.md",
+      "kind": "source_license_notice",
+      "sha256": "7f976f7e9cb2d87df7230606feb932c3f21ac0e664045a775b600046ff850c54",
+      "repository": "https://github.com/madsmtm/objc2",
+      "upstream_path": "LICENSE.md",
+      "git_blob_sha1": "540ae4c81adb5f64a9f61e222b688880da24300e",
+      "verified_revisions": [
+        "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
+        "8852b424193ca41602281b3d7540d7c8ed51e49a",
+        "8d214f5477365ffcbcbb7de058c86ed9a518efb7"
+      ],
+      "sources": [
+        {
+          "revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+        },
+        {
+          "revision": "8852b424193ca41602281b3d7540d7c8ed51e49a",
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/8852b424193ca41602281b3d7540d7c8ed51e49a/LICENSE.md"
+        },
+        {
+          "revision": "8d214f5477365ffcbcbb7de058c86ed9a518efb7",
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/8d214f5477365ffcbcbb7de058c86ed9a518efb7/LICENSE.md"
+        }
+      ],
+      "origin": "Verbatim identical upstream licensing notice at all three package VCS pins. Explicitly licenses objc2, objc2-encode and objc2-foundation under MIT, and the other framework crates under Zlib OR Apache-2.0 OR MIT. Links full terms rather than containing them. Its Apple SDK licensing caveat is preserved without asserting legal clearance."
+    },
+    {
       "path": "THIRD_PARTY_LICENSES/additional/tree-sitter-gleam-1.0.0/LICENSE",
       "kind": "license",
       "repository": "https://github.com/gleam-lang/tree-sitter-gleam",
@@ -221,6 +249,18 @@
       "upstream_path": "LICENSE",
       "url": "https://raw.githubusercontent.com/astral-sh/ruff/62914c4b9b79a9e5004374a9c482ad2ed69290e1/LICENSE",
       "git_blob_sha1": "655a0c76fc5539b2f8e63b673741a5fd0e0c5799"
+    },
+    {
+      "path": "THIRD_PARTY_LICENSES/dependencies/siphasher-1.0.3/LICENSE-MIT.txt",
+      "kind": "license",
+      "sha256": "4790c01c0726db5d666ede1ad9b0875ed4789b89c9a38a37c7b214b707b69249",
+      "license_version": "MIT",
+      "referred_by": "THIRD_PARTY_LICENSES/additional/objc2/LICENSE.md",
+      "origin": "Existing canonical OSI MIT terms, reused without modification because each pinned objc2 LICENSE.md explicitly links this license. These are linked canonical terms, not a file shipped at the objc2 revisions. MIT is the common offered alternative for all seven packages.",
+      "url": "https://opensource.org/licenses/MIT",
+      "resolved_url": "https://opensource.org/license/MIT",
+      "source_html_sha256": "a3ff15e09daa488ebb53e0da4b49abdb0c475afc938bbe9dac7e36d6f4ca4f4b",
+      "transformation": "Original collection extracted the heading and four license paragraphs from official OSI HTML, decoded entities and collapsed paragraph whitespace. The existing file is reused byte-for-byte. The copyright template remains unchanged: the pinned objc2 LICENSE.md does not state a copyright holder or year, and none is inferred."
     }
   ],
   "packages": [
@@ -475,6 +515,273 @@
       ],
       "notice_files": [],
       "status": "collected"
+    },
+    {
+      "name": "objc2",
+      "version": "0.6.4",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "3a12a8ed07aefc768292f076dc3ac8c48f3781c8f2d5851dd3d98950e8c5a89f",
+      "declared_license": "MIT",
+      "repository": "https://github.com/madsmtm/objc2",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "8852b424193ca41602281b3d7540d7c8ed51e49a"
+        },
+        "path_in_vcs": "crates/objc2"
+      },
+      "revision": "8852b424193ca41602281b3d7540d7c8ed51e49a",
+      "path_in_vcs": "crates/objc2",
+      "manifest_match": "exact",
+      "manifest_git_blob_sha1": "7fbc44dc579f84f300f3dab81624b5648e0f3edc",
+      "archive_checksum_verified": true,
+      "lockfiles": [
+        "Cargo.lock"
+      ],
+      "archive_checksum_source": "Cargo.lock checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/siphasher-1.0.3/LICENSE-MIT.txt"
+      ],
+      "notice_files": [
+        "THIRD_PARTY_LICENSES/additional/objc2/LICENSE.md"
+      ],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE.md"
+      ],
+      "notes": [
+        "The checksum-verified archive omits license files. Its pinned repository LICENSE.md explicitly grants the declared license options by reference. The canonical MIT terms are supplied as the common permitted alternative, not represented as a historical repository file.",
+        "No copyright holder or year is supplied in the pinned LICENSE.md; no attribution has been inferred from repository ownership or author metadata.",
+        "The upstream notice states uncertainty about redistribution of Apple SDK-derived bindings and points to the Xcode license. This collection preserves that caveat and does not resolve it or claim distribution clearance."
+      ]
+    },
+    {
+      "name": "objc2-app-kit",
+      "version": "0.3.2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "d49e936b501e5c5bf01fda3a9452ff86dc3ea98ad5f283e1455153142d97518c",
+      "declared_license": "Zlib OR Apache-2.0 OR MIT",
+      "repository": "https://github.com/madsmtm/objc2",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b"
+        },
+        "path_in_vcs": "framework-crates/objc2-app-kit"
+      },
+      "revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
+      "path_in_vcs": "framework-crates/objc2-app-kit",
+      "manifest_match": "exact",
+      "manifest_git_blob_sha1": "04bdb6c20dcec3392a64f8595edb7f93e8d2837e",
+      "archive_checksum_verified": true,
+      "lockfiles": [
+        "Cargo.lock"
+      ],
+      "archive_checksum_source": "Cargo.lock checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/siphasher-1.0.3/LICENSE-MIT.txt"
+      ],
+      "notice_files": [
+        "THIRD_PARTY_LICENSES/additional/objc2/LICENSE.md"
+      ],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE.md"
+      ],
+      "notes": [
+        "The checksum-verified archive omits license files. Its pinned repository LICENSE.md explicitly grants the declared license options by reference. The canonical MIT terms are supplied as the common permitted alternative, not represented as a historical repository file.",
+        "No copyright holder or year is supplied in the pinned LICENSE.md; no attribution has been inferred from repository ownership or author metadata.",
+        "The upstream notice states uncertainty about redistribution of Apple SDK-derived bindings and points to the Xcode license. This collection preserves that caveat and does not resolve it or claim distribution clearance."
+      ]
+    },
+    {
+      "name": "objc2-core-foundation",
+      "version": "0.3.2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "2a180dd8642fa45cdb7dd721cd4c11b1cadd4929ce112ebd8b9f5803cc79d536",
+      "declared_license": "Zlib OR Apache-2.0 OR MIT",
+      "repository": "https://github.com/madsmtm/objc2",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b"
+        },
+        "path_in_vcs": "framework-crates/objc2-core-foundation"
+      },
+      "revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
+      "path_in_vcs": "framework-crates/objc2-core-foundation",
+      "manifest_match": "exact",
+      "manifest_git_blob_sha1": "f235f792d5a173d2eec988d3860b275586bc512a",
+      "archive_checksum_verified": true,
+      "lockfiles": [
+        "Cargo.lock"
+      ],
+      "archive_checksum_source": "Cargo.lock checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/siphasher-1.0.3/LICENSE-MIT.txt"
+      ],
+      "notice_files": [
+        "THIRD_PARTY_LICENSES/additional/objc2/LICENSE.md"
+      ],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE.md"
+      ],
+      "notes": [
+        "The checksum-verified archive omits license files. Its pinned repository LICENSE.md explicitly grants the declared license options by reference. The canonical MIT terms are supplied as the common permitted alternative, not represented as a historical repository file.",
+        "No copyright holder or year is supplied in the pinned LICENSE.md; no attribution has been inferred from repository ownership or author metadata.",
+        "The upstream notice states uncertainty about redistribution of Apple SDK-derived bindings and points to the Xcode license. This collection preserves that caveat and does not resolve it or claim distribution clearance."
+      ]
+    },
+    {
+      "name": "objc2-core-graphics",
+      "version": "0.3.2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "e022c9d066895efa1345f8e33e584b9f958da2fd4cd116792e15e07e4720a807",
+      "declared_license": "Zlib OR Apache-2.0 OR MIT",
+      "repository": "https://github.com/madsmtm/objc2",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b"
+        },
+        "path_in_vcs": "framework-crates/objc2-core-graphics"
+      },
+      "revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
+      "path_in_vcs": "framework-crates/objc2-core-graphics",
+      "manifest_match": "exact",
+      "manifest_git_blob_sha1": "7383b6d2ee946101e93508ab57da77b9a2595427",
+      "archive_checksum_verified": true,
+      "lockfiles": [
+        "Cargo.lock"
+      ],
+      "archive_checksum_source": "Cargo.lock checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/siphasher-1.0.3/LICENSE-MIT.txt"
+      ],
+      "notice_files": [
+        "THIRD_PARTY_LICENSES/additional/objc2/LICENSE.md"
+      ],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE.md"
+      ],
+      "notes": [
+        "The checksum-verified archive omits license files. Its pinned repository LICENSE.md explicitly grants the declared license options by reference. The canonical MIT terms are supplied as the common permitted alternative, not represented as a historical repository file.",
+        "No copyright holder or year is supplied in the pinned LICENSE.md; no attribution has been inferred from repository ownership or author metadata.",
+        "The upstream notice states uncertainty about redistribution of Apple SDK-derived bindings and points to the Xcode license. This collection preserves that caveat and does not resolve it or claim distribution clearance."
+      ]
+    },
+    {
+      "name": "objc2-core-services",
+      "version": "0.3.2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "583300ad934cba24ff5292aee751ecc070f7ca6b39a574cc21b7b5e588e06a0b",
+      "declared_license": "Zlib OR Apache-2.0 OR MIT",
+      "repository": "https://github.com/madsmtm/objc2",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b"
+        },
+        "path_in_vcs": "framework-crates/objc2-core-services"
+      },
+      "revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
+      "path_in_vcs": "framework-crates/objc2-core-services",
+      "manifest_match": "exact",
+      "manifest_git_blob_sha1": "f52f185b00db2790425a39bfc8a3bd694e12d608",
+      "archive_checksum_verified": true,
+      "lockfiles": [
+        "Cargo.lock"
+      ],
+      "archive_checksum_source": "Cargo.lock checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/siphasher-1.0.3/LICENSE-MIT.txt"
+      ],
+      "notice_files": [
+        "THIRD_PARTY_LICENSES/additional/objc2/LICENSE.md"
+      ],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE.md"
+      ],
+      "notes": [
+        "The checksum-verified archive omits license files. Its pinned repository LICENSE.md explicitly grants the declared license options by reference. The canonical MIT terms are supplied as the common permitted alternative, not represented as a historical repository file.",
+        "No copyright holder or year is supplied in the pinned LICENSE.md; no attribution has been inferred from repository ownership or author metadata.",
+        "The upstream notice states uncertainty about redistribution of Apple SDK-derived bindings and points to the Xcode license. This collection preserves that caveat and does not resolve it or claim distribution clearance."
+      ]
+    },
+    {
+      "name": "objc2-encode",
+      "version": "4.1.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "ef25abbcd74fb2609453eb695bd2f860d389e457f67dc17cafc8b8cbc89d0c33",
+      "declared_license": "MIT",
+      "repository": "https://github.com/madsmtm/objc2",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "8d214f5477365ffcbcbb7de058c86ed9a518efb7"
+        },
+        "path_in_vcs": "crates/objc2-encode"
+      },
+      "revision": "8d214f5477365ffcbcbb7de058c86ed9a518efb7",
+      "path_in_vcs": "crates/objc2-encode",
+      "manifest_match": "exact",
+      "manifest_git_blob_sha1": "23b775fc8c647005b853e1aa48c5452d776a2cde",
+      "archive_checksum_verified": true,
+      "lockfiles": [
+        "Cargo.lock"
+      ],
+      "archive_checksum_source": "Cargo.lock checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/siphasher-1.0.3/LICENSE-MIT.txt"
+      ],
+      "notice_files": [
+        "THIRD_PARTY_LICENSES/additional/objc2/LICENSE.md"
+      ],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE.md"
+      ],
+      "notes": [
+        "The checksum-verified archive omits license files. Its pinned repository LICENSE.md explicitly grants the declared license options by reference. The canonical MIT terms are supplied as the common permitted alternative, not represented as a historical repository file.",
+        "No copyright holder or year is supplied in the pinned LICENSE.md; no attribution has been inferred from repository ownership or author metadata.",
+        "The upstream notice states uncertainty about redistribution of Apple SDK-derived bindings and points to the Xcode license. This collection preserves that caveat and does not resolve it or claim distribution clearance."
+      ]
+    },
+    {
+      "name": "objc2-foundation",
+      "version": "0.3.2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "e3e0adef53c21f888deb4fa59fc59f7eb17404926ee8a6f59f5df0fd7f9f3272",
+      "declared_license": "MIT",
+      "repository": "https://github.com/madsmtm/objc2",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b"
+        },
+        "path_in_vcs": "framework-crates/objc2-foundation"
+      },
+      "revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
+      "path_in_vcs": "framework-crates/objc2-foundation",
+      "manifest_match": "exact",
+      "manifest_git_blob_sha1": "da0eca22f23d4cb8724c1e888830176b2fd2f5d2",
+      "archive_checksum_verified": true,
+      "lockfiles": [
+        "Cargo.lock"
+      ],
+      "archive_checksum_source": "Cargo.lock checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/siphasher-1.0.3/LICENSE-MIT.txt"
+      ],
+      "notice_files": [
+        "THIRD_PARTY_LICENSES/additional/objc2/LICENSE.md"
+      ],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE.md"
+      ],
+      "notes": [
+        "The checksum-verified archive omits license files. Its pinned repository LICENSE.md explicitly grants the declared license options by reference. The canonical MIT terms are supplied as the common permitted alternative, not represented as a historical repository file.",
+        "No copyright holder or year is supplied in the pinned LICENSE.md; no attribution has been inferred from repository ownership or author metadata.",
+        "The upstream notice states uncertainty about redistribution of Apple SDK-derived bindings and points to the Xcode license. This collection preserves that caveat and does not resolve it or claim distribution clearance.",
+        "The package contains src/copying.rs and src/tests/copying.rs, which implement and test NSCopying behavior. They are Rust source, not license notices; a filename-based license scan can falsely identify them as COPYING material."
+      ]
     },
     {
       "name": "ruff_db",

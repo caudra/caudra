@@ -25,6 +25,16 @@
       "git_blob_sha1": "1de02305f81f6dc087b6229a1d86a31774d2fa31"
     },
     {
+      "path": "THIRD_PARTY_LICENSES/dependencies/clipboard-win-5.4.1/LICENSE",
+      "kind": "license",
+      "sha256": "c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566",
+      "repository": "https://github.com/DoumanAsh/clipboard-win",
+      "revision": "3b27cf2bfd1adcfa6e0264eb51c1025ddaf0f342",
+      "upstream_path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/DoumanAsh/clipboard-win/3b27cf2bfd1adcfa6e0264eb51c1025ddaf0f342/LICENSE",
+      "git_blob_sha1": "36b7cd93cdfbac762f5be4c6ce276df2ea6305c2"
+    },
+    {
       "path": "THIRD_PARTY_LICENSES/dependencies/include_dir-0.7.4/LICENSE",
       "kind": "license",
       "sha256": "9369f62987b3a116111f2edfdc4cc72633e44ddc94d5d0c68659cf537b76a31f",
@@ -227,6 +237,41 @@
       "status": "collected",
       "inspected_ancestor_legal_paths": [
         "LICENSE"
+      ]
+    },
+    {
+      "name": "clipboard-win",
+      "version": "5.4.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "bde03770d3df201d4fb868f2c9c59e66a3e4e2bd06692a0fe701e7103c7e84d4",
+      "declared_license": "BSL-1.0",
+      "authors": [
+        "Douman <douman@gmx.se>"
+      ],
+      "repository": "https://github.com/DoumanAsh/clipboard-win",
+      "revision": "3b27cf2bfd1adcfa6e0264eb51c1025ddaf0f342",
+      "path_in_vcs": "",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "3b27cf2bfd1adcfa6e0264eb51c1025ddaf0f342"
+        },
+        "path_in_vcs": ""
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "7d11bdb05f50620dd6312ccb17b8d7344b083d19",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/clipboard-win-5.4.1/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "lockfile": "Cargo.lock",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "notes": [
+        "The published include list omits LICENSE. The complete BSL-1.0 text is preserved byte-for-byte from the crate's exact reported upstream revision.",
+        "No separate NOTICE or copyright notice was found in the pinned repository legal files or published source. The manifest author is preserved as author metadata, not inferred copyright ownership."
       ]
     },
     {

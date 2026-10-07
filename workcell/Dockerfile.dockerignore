@@ -12,6 +12,8 @@
 !workcell/**
 !vendor/**
 !scripts/build-code-worker.py
+!scripts/build-attribution.py
+!scripts/attribution-policy.json
 !docs/**
 !plugins/**
 !prompts/**

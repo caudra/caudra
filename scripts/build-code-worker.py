@@ -11,6 +11,10 @@ import tomllib
 
 VERSION = "1.0.0"
 EXPECTED_VERSION = f"monty-runtime {VERSION}"
+SOURCE_MANIFEST_FILE = "source-manifest-path"
+SOURCE_ERROR = (
+    "Worker build must identify the pinned monty-runtime manifest and lockfile"
+)
 ROOT = Path(__file__).resolve().parent.parent
 PROFILE = {
     "CARGO_PROFILE_RELEASE_OPT_LEVEL": "3",
@@ -60,15 +64,27 @@ def fingerprint(toolchain: str, target: str) -> str:
     return digest.hexdigest()
 
 
+def validate_source_manifest(manifest: Path) -> None:
+    package = tomllib.loads(manifest.read_text())["package"]
+    if (
+        package.get("name") != "monty-runtime"
+        or package.get("version") != VERSION
+        or not manifest.with_name("Cargo.lock").is_file()
+    ):
+        raise RuntimeError(SOURCE_ERROR)
+
+
 def cached(worker: Path, symbols: Path, stamp: Path, expected: str) -> bool:
     try:
+        manifest = Path((stamp.parent / SOURCE_MANIFEST_FILE).read_text().strip())
+        validate_source_manifest(manifest)
         return (
             json.loads(stamp.read_text())
             == {"fingerprint": expected, "pdb": symbols.with_suffix(".pdb").is_file()}
             and symbols.is_file()
             and worker_version(worker) == EXPECTED_VERSION
         )
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError, KeyError, RuntimeError):
         return False
 
 
@@ -116,15 +132,24 @@ def build(target: str, root: Path, target_dir: Path, force: bool) -> Path:
         )
         staged_symbols = symbols_root / "bin" / name
         staged_pdb = staged_symbols.with_suffix(".pdb")
+        manifests = set()
         for line in cargo.stdout.splitlines():
             artifact = json.loads(line)
             if (
                 artifact.get("reason") == "compiler-artifact"
                 and artifact["target"]["name"] == "monty"
+                and artifact["target"]["kind"] == ["bin"]
             ):
+                manifests.add(Path(artifact["manifest_path"]).resolve())
                 for filename in artifact["filenames"]:
                     if Path(filename).suffix == ".pdb":
                         shutil.copy2(filename, staged_pdb)
+        if len(manifests) != 1:
+            raise RuntimeError(SOURCE_ERROR)
+        manifest = manifests.pop()
+        validate_source_manifest(manifest)
+        staged_manifest = Path(directory) / SOURCE_MANIFEST_FILE
+        staged_manifest.write_text(str(manifest) + "\n")
         staged = Path(directory) / name
         shutil.copy2(staged_symbols, staged)
         if "windows" not in target:
@@ -145,6 +170,7 @@ def build(target: str, root: Path, target_dir: Path, force: bool) -> Path:
         else:
             pdb.unlink(missing_ok=True)
         staged.replace(worker)
+        staged_manifest.replace(root / SOURCE_MANIFEST_FILE)
         staged_stamp.replace(stamp)
     return worker
 

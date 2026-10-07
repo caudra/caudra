@@ -50,6 +50,11 @@ pylint:
     ruff check scripts/
     ty check scripts/
 
+distribution-tests:
+    python3 scripts/test-build-code-worker.py
+    python3 scripts/test-build-attribution.py
+    python3 scripts/test-install.py
+
 gen-docs:
     cargo run -p caudra-docgen
 
@@ -75,4 +80,4 @@ machete:
     cargo machete
 
 # Full CI check
-ci: code-worker fmt-check lint pylint workcell-check-native test workcell-doc-test gen-docs-check machete
+ci: code-worker fmt-check lint pylint distribution-tests workcell-check-native test workcell-doc-test gen-docs-check machete

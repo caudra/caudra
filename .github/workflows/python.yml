@@ -5,20 +5,47 @@ on:
     branches: ["main"]
     paths:
       - "scripts/**/*.py"
+      - "scripts/attribution-policy.json"
+      - "LICENSE"
+      - "NOTICE.md"
+      - "THIRD_PARTY_LICENSES/**"
       - ".github/workflows/python.yml"
       - ".github/workflows/website-docs.yml"
+      - ".github/workflows/release.yml"
+      - "install.sh"
+      - "install.ps1"
+      - "flake.nix"
+      - "workcell/Dockerfile*"
   pull_request:
     branches: ["main"]
     paths:
       - "scripts/**/*.py"
+      - "scripts/attribution-policy.json"
+      - "LICENSE"
+      - "NOTICE.md"
+      - "THIRD_PARTY_LICENSES/**"
       - ".github/workflows/python.yml"
       - ".github/workflows/website-docs.yml"
+      - ".github/workflows/release.yml"
+      - "install.sh"
+      - "install.ps1"
+      - "flake.nix"
+      - "workcell/Dockerfile*"
 
 env:
   RUFF_VERSION: 0.16.2
   TY_VERSION: 0.0.70
 
 jobs:
+  distribution:
+    name: Worker and attribution tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/test-build-code-worker.py
+      - run: python3 scripts/test-build-attribution.py
+      - run: python3 scripts/test-install.py
+
   website-docs:
     name: Website source updater tests
     runs-on: ubuntu-latest
