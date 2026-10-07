@@ -463,7 +463,7 @@ impl ToolInvocation for LuaToolInvocation {
             let recv = async { Some(reply_rx.recv_async().await) };
             let result = match effective_secs {
                 Some(secs) => {
-                    futures_lite::future::race(recv, async move {
+                    futures_lite::future::or(recv, async move {
                         smol::Timer::after(Duration::from_secs(secs)).await;
                         None
                     })
@@ -1841,6 +1841,41 @@ pub(crate) fn coerce_tool_result(result: &LuaValue) -> ToolCallResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::pin;
+
+    use caudra_agent::{AgentMode, tools::test_support::stub_ctx};
+    use futures_lite::future::poll_once;
+
+    const COMPLETED_REPLY: &str = "completed before the backstop";
+
+    #[test_case::test_case(false; "success")]
+    #[test_case::test_case(true; "tool_error")]
+    fn completed_reply_beats_ready_timeout(is_error: bool) {
+        smol::block_on(async {
+            let (tx, rx) = flume::bounded(0);
+            let inv = LuaToolInvocation {
+                tx,
+                timeout: Some(Duration::ZERO),
+                ..invocation(json!({}))
+            };
+            let ctx = stub_ctx(&AgentMode::Build);
+            let mut execution = pin!(Box::new(inv).execute(&ctx));
+            assert!(poll_once(&mut execution).await.is_none());
+            let Request::CallTool { reply, .. } = rx.recv_async().await.unwrap() else {
+                panic!("expected tool call");
+            };
+            let expected = if is_error {
+                Err(COMPLETED_REPLY.into())
+            } else {
+                Ok(COMPLETED_REPLY.into())
+            };
+            reply.send(ToolCallReply::plain(expected.clone())).unwrap();
+
+            let result = execution.await;
+            assert_eq!(result.failure, is_error.then_some(ToolFailure::Other));
+            assert_eq!(result.output.map(|output| output.as_text()), expected);
+        });
+    }
 
     #[test_case::test_case("echo", true ; "simple_name")]
     #[test_case::test_case("tool123", true ; "trailing_digits")]

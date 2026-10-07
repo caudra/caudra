@@ -3960,6 +3960,18 @@ const BASH_PARTIAL_MARKER: &str = "[cancelled by user; output above is partial]"
 const BASH_PARTIAL_PROBE: &str = "XY";
 const BASH_PARTIAL_CMD: &str = "sleep 1 && printf '%s%s\\n' X Y && sleep 30";
 
+fn bash_cancel_host() -> (Arc<ToolRegistry>, PluginHost) {
+    let reg = fresh_registry();
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_builtins(&PluginsConfig {
+        enabled: true,
+        names: vec!["bash".to_owned()],
+        opts: HashMap::new(),
+    })
+    .unwrap();
+    (reg, host)
+}
+
 fn bash_dispatch_context(
     temp: &tempfile::TempDir,
     max_store_bytes: usize,
@@ -4381,6 +4393,7 @@ fn bash_output_limit_finishes_prefix_and_ignores_later_callbacks() {
 /// an error reply ending in the marker, not a bare "cancelled".
 #[test]
 fn cancelled_bash_keeps_streamed_output_as_partial() {
+    let (reg, host) = bash_cancel_host();
     let (tx, events) = flume::unbounded();
     let event_tx = caudra_agent::EventSender::new(tx, 0);
     let (trigger, token) = caudra_agent::CancelToken::new();
@@ -4393,7 +4406,6 @@ fn cancelled_bash_keeps_streamed_output_as_partial() {
     let thread_session = session.clone();
     let (result_tx, result_rx) = flume::bounded(1);
     std::thread::spawn(move || {
-        let (reg, host) = builtins_host();
         let mut ctx = caudra_agent::tools::test_support::stub_ctx_with(
             &caudra_agent::AgentMode::Build,
             Some(&event_tx),
@@ -4451,6 +4463,7 @@ fn cancelled_bash_uses_control_reserve_at_process_output_cap() {
     const PROBE_HEAD: &str = "CAP-";
     const PROBE_TAIL: &str = "END";
 
+    let (reg, host) = bash_cancel_host();
     let (tx, events) = flume::unbounded();
     let event_tx = caudra_agent::EventSender::new(tx, 0);
     let (trigger, token) = caudra_agent::CancelToken::new();
@@ -4473,7 +4486,6 @@ fn cancelled_bash_uses_control_reserve_at_process_output_cap() {
     );
     let (result_tx, result_rx) = flume::bounded(1);
     std::thread::spawn(move || {
-        let (reg, host) = builtins_host();
         let mut ctx = caudra_agent::tools::test_support::stub_ctx_with(
             &caudra_agent::AgentMode::Build,
             Some(&event_tx),
