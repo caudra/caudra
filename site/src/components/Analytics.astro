@@ -1,9 +1,0 @@
----
-const scriptUrl = import.meta.env.VITE_UMAMI_SCRIPT_URL?.trim();
-const websiteId = import.meta.env.VITE_UMAMI_WEBSITE_ID?.trim();
----
-<script>
-  import '../scripts/analytics';
-</script>
-
-{scriptUrl && websiteId && <script is:inline defer data-umami-script data-exclude-hash="true" data-website-id={websiteId} src={scriptUrl} />}

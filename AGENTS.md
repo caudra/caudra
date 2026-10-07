@@ -44,7 +44,7 @@ Dev builds skip debug info for deps and vendored C (our crates keep it); to debu
 
 ## Nix
 
-`nix develop` (dev shell), `nix build`, `nix fmt` (nixfmt), `nix flake check` (includes git-dep-hashes drift, fixed by `just bump-workcell`).
+`nix develop` (dev shell), `nix build`, `nix fmt` (nixfmt), `nix flake check` (includes git-dep-hashes drift).
 
 ## Architecture
 
@@ -60,7 +60,7 @@ Rust workspace, key crates in root dir:
 - caudra-lua: Lua plugin system (API mirrored from neovim for plugin compatibility), built-in plugins in ./plugins dir
 - caudra-acp: ACP ndjson stdio server
 - caudra-workcell: Native Workcell adapter, Caudra authorization integration, and tool-result presentation
-- caudra-docs: The user docs as data: pages, section addresses, the model index, the TUI display text, and full-text search. It embeds nothing. The binary embeds `site/src/content/docs` and `site/src/data/docs-navigation.json` (`src/docs.rs`, root `build.rs`), installs the `caudra-docs` builtin skill, and hands the same `Library` to caudra-ui for the `/docs` modal
+- caudra-docs: The user docs as data: pages, section addresses, the model index, the TUI display text, and full-text search. It embeds nothing. The binary embeds `docs/content` and `docs/navigation.json` (`src/docs.rs`, root `build.rs`), installs the `caudra-docs` builtin skill, and hands the same `Library` to caudra-ui for the `/docs` modal
 - caudra-workflow: Durable workflow scripting engine (Rhai behind a `WorkflowEngine` trait), replay journal, and the neutral catalog/run/request types; the session manager, catalog discovery, storage actor, and native `workflow` tool live in `caudra-agent/src/workflow`
 - caudra-automation: Runtime-neutral automation language (static `meta` header, args, events, untrusted values, host ABI, engine, validation, dry-run replay, schedules, limits), the `snapshot` read model, and the `request` types. `skill/SKILL.md` is the `caudra-automation-dev` skill, and `tests/examples/` holds the scripts its tests replay, which the skill and the docs page embed. Discovery, trust, the session runtime, and its storage glue live in `caudra-agent/src/automation`
 - caudra-script: The Rhai sandbox workflows and automations share: a restricted engine, a header read without running the script, a bridge that serves host calls while the interpreter runs on its own thread, and canonical JSON and SHA-256 request digests
@@ -68,7 +68,8 @@ Rust workspace, key crates in root dir:
 First-party Workcell tools are native Rust: file_read, file_glob, file_grep, file_write, file_edit, file_apply_patch, file_index, websearch, webfetch, shell, python_execution, execution_environment, and the code-graph family code_map, code_context, code_refs, code_impact, and code_expand.
 Caudra owns authorization, registration, and presentation. Workcell owns protocol-neutral contracts,
 validation, bounds, atomicity, network policy, subprocess cleanup, and the bundled Monty worker
-lifecycle. Keep Workcell logic in Workcell rather than duplicating it in `caudra-workcell`.
+lifecycle. Its crates live under `workcell/` in this workspace. Keep Workcell logic there rather than
+duplicating it in `caudra-workcell`.
 
 The code-graph group is read-only and constructed separately from the writable file group, so its
 limits clamp to the file group's. Envelope bounding uses Workcell's own `fit`/`Shrinkable`, and a
@@ -92,16 +93,8 @@ Nix, and release jobs. `WORKCELL_MCP_CODE_WORKER` is an authoritative process-on
 never persist it or silently fall back when it is invalid. Workcell's `CodeToolGroup` retains the
 extracted worker lease for the complete pool lifetime.
 
-Release builds use the Workcell Git revision pinned in `Cargo.toml`. Development recipes in `justfile`
-patch its packages from the sibling `../workcell-mcp` checkout when that repository is present and use
-a temporary lockfile seeded from `Cargo.lock`. Use plain Cargo when intentionally updating dependencies.
-
-Because those recipes read the sibling checkout, a change made there is invisible to a release until it
-is pushed and the pin moves. After pushing `workcell-mcp`, run `just bump-workcell`: it rewrites the
-rev in `Cargo.toml`, updates `Cargo.lock`, and refreshes the flake's git dependency hashes, which are
-keyed by commit and so change with every bump. Pass `--rev` to pin something other than the remote head.
-It needs `nix` on PATH but not the daemon, and refuses to run on a dirty `Cargo.toml`, `Cargo.lock`, or
-`flake.nix`. Local tests keep passing without it, so a Workcell change is not finished until it runs.
+Development and release builds use the same local Workcell workspace members and root `Cargo.lock`.
+Edit `workcell/` directly. There are no sibling checkout overrides or separate Workcell revision bumps.
 
 For worker or release changes, run the production bundled-worker execution test with a real pinned
 worker, not only a catalog check. Release smoke tests must fail when `python_execution` is reserved but
@@ -120,14 +113,14 @@ supported for external plugins; only the built-ins moved to Rust.
 
 ## Docs
 
-The website is a self-contained Astro + Starlight application in `site/`, using Bun and a site-local lockfile. Run `just site-install`, `just site-dev`, `just site-check`, `just site-build`, or `just site-test`. Keep JavaScript dependencies and build output out of the repository root.
+The website is maintained separately and consumes the canonical docs from this repository. Application development, docs generation, and native builds require no JavaScript tooling or website build.
 
-Canonical user docs live in `site/src/content/docs/*.md`, with YAML titles/descriptions and shared ordering in `site/src/data/docs-navigation.json`. Astro and Rust consume these checked-in sources independently. Native builds and offline docs must never depend on Bun, Astro output, or network access.
+Canonical user docs live in `docs/content/*.md`, with YAML titles/descriptions and shared ordering in `docs/navigation.json`. Native builds and offline docs read these checked-in sources directly and must never depend on network access.
 
 Canonical site and installer origin: `https://caudra.ai`. Canonical example config: `github.com/caudra/config`.
 
-Generated by `caudra-docgen` (`just gen-docs` / `just gen-docs-check`): tools, providers, configuration, reference-configs, lua-api, plugins, keybindings, commands. It also writes `site/public/docs/<stem>.example.toml` for every TOML config file (the references that reference-configs shows), and the text between `<!-- caudra-docgen:NAME -->` and `<!-- /caudra-docgen:NAME -->` markers in hand-written pages (`caudra-docgen/src/gen_regions.rs`): config key tables, and the automations page's patterns, read from `caudra-automation/tests/examples/`. Change the metadata in caudra-config (`example/`, `files.rs`, the `FIELDS` tables) or those example scripts, never the generated text.
+Generated by `caudra-docgen` (`just gen-docs` / `just gen-docs-check`): tools, providers, configuration, reference-configs, lua-api, plugins, keybindings, commands. It also writes `docs/examples/<stem>.example.toml` for every TOML config file (the references that reference-configs shows), and the text between `<!-- caudra-docgen:NAME -->` and `<!-- /caudra-docgen:NAME -->` markers in hand-written pages (`caudra-docgen/src/gen_regions.rs`): config key tables, and the automations page's patterns, read from `caudra-automation/tests/examples/`. Change the metadata in caudra-config (`example/`, `files.rs`, the `FIELDS` tables) or those example scripts, never the generated text.
 
 Hand-written: quick-start, permissions, skills, mcp, cli, headless, acp, token-economy, context, sessions, review, workbench, worktrees, system-prompts, queue, notifications, telemetry, markdown, automations, and the docs index.
 
-Style, tone, structure, and website workflow rules: `site/AGENTS.md`. Read it before writing any docs.
+Style, tone, structure, and canonical format rules: `docs/AGENTS.md`. Read it before writing any docs. Website design and publishing rules belong to the separate website repository. Preserve public `/docs/` URLs and section anchors when moving sources.

@@ -64,8 +64,8 @@
             || (builtins.match ".*/decisions/questions/.*" path != null)
             || (builtins.match ".*/caudra-workflow/(builtins|skill)/.*" path != null)
             || (builtins.match ".*/caudra-automation/(skill|tests/examples)/.*" path != null)
-            || (builtins.match ".*/site/src/content/docs/.*" path != null)
-            || (lib.hasSuffix "/site/src/data/docs-navigation.json" path)
+            || (builtins.match ".*/docs/(content|examples)/.*" path != null)
+            || (lib.hasSuffix "/docs/navigation.json" path)
             || (builtins.match ".*/workcell/.*/(queries|rules.*|fixtures|evals)/.*" path != null)
             || (builtins.match ".*/workcell/fixtures/.*" path != null)
             || (lib.hasSuffix ".lua" path);

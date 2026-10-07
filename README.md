@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./site/public/social-card.png" alt="Caudra. Open source, for your terminal. A coding agent that turns smart context into effective action." width="100%">
+  <img src="https://caudra.ai/social-card.png" alt="Caudra. Open source, for your terminal. A coding agent that turns smart context into effective action." width="100%">
 </p>
 
 # Caudra
@@ -104,7 +104,7 @@ A nudge is a message to the model. It cannot run or approve a tool, and every re
 
 ### Tools that say what they missed
 
-When a tool stops at a limit or leaves something out, its result says what is missing, and the model can go back for it. The file, shell, web, code, and Python tools come from [Workcell](https://github.com/tensorninja/workcell-mcp), which also runs on its own as an MCP server.
+When a tool stops at a limit or leaves something out, its result says what is missing, and the model can go back for it. The file, shell, web, code, and Python tools come from [Workcell](https://github.com/caudra/caudra/tree/main/workcell), which also runs on its own as an MCP server.
 
 - A `file_grep` or `file_glob` call that reaches its bounds returns what it found and reports how much it withheld, so the model can tell a missing match from a file it never searched. Directory searches skip credential files such as `.env` and SSH private keys.
 - `webfetch` refuses private, loopback, and link-local addresses and checks every redirect the same way. Pages arrive in the character set they declare, and a page cut at 2,000 lines or 50 KiB ends with a line that names the limit.
@@ -236,11 +236,11 @@ just code-worker   # build the Python worker, once, before the other recipes
 just check         # type-check the workspace
 just lint          # clippy, with warnings as errors
 just test          # the test suite
-just ci            # most CI checks, the website included
+just ci            # most application CI checks
 just install       # install from your checkout, Python worker included
 ```
 
-The website and docs live in `site/`, built with Astro, Starlight, and Bun. The Markdown pages under `site/src/content/docs/` are also compiled into the binary, so the website and the built-in `/docs` read from the same pages.
+Canonical docs live in `docs/content/`, with navigation in `docs/navigation.json` and generated config examples in `docs/examples/`. The pages are compiled into the binary for `/docs`. The website is maintained separately and consumes these same sources. Application development and docs generation do not require JavaScript tooling.
 
 ## Credits
 
@@ -254,7 +254,7 @@ Caudra builds on ideas from these open-source projects, with thanks:
 - [Herdr](https://herdr.dev): terminal workspaces for agents
 - [Grok Build](https://x.ai/news/workflows): durable workflows. The built-in `deep-research` workflow is adapted from Grok Build under the Apache License 2.0.
 
-The file, shell, web, code, and Python tools come from [Workcell](https://github.com/tensorninja/workcell-mcp), released under the Apache License 2.0. The isolated Python tool runs on [Monty](https://github.com/pydantic/monty) by Pydantic.
+The file, shell, web, code, and Python tools come from [Workcell](https://github.com/caudra/caudra/tree/main/workcell), released under the Apache License 2.0 and developed in this workspace under `workcell/`. The isolated Python tool runs on [Monty](https://github.com/pydantic/monty) by Pydantic.
 
 ## License
 

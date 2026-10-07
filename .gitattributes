@@ -1,4 +1,6 @@
 # Keep docs and embedded plugin sources LF so caudra-docgen output is
 # identical on Windows (core.autocrlf) and Unix.
 *.lua text eol=lf
-site/docs/content/** text eol=lf
+docs/content/** text eol=lf
+docs/navigation.json text eol=lf
+docs/examples/** text eol=lf

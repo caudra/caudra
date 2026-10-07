@@ -1,4 +1,4 @@
-//! Caudra's user documentation as data: the pages under `site/src/content/docs`, their sections and addresses, the
+//! Caudra's user documentation as data: the pages under `docs/content`, their sections and addresses, the
 //! index the model reads, the text the TUI renders, and a search over all of it.
 //!
 //! Nothing is embedded here. The binary embeds the Markdown and hands it to [`Library::parse`], so a docs edit
@@ -29,7 +29,7 @@ pub const SITE_DOCS_URL: &str = "https://caudra.ai/docs/";
 const DOCS_PATH: &str = "/docs/";
 const LANDING_PAGE: &str = "index";
 const FRONT_MATTER_FENCE: &str = "---";
-const NAVIGATION_FILE: &str = "docs-navigation.json";
+const NAVIGATION_FILE: &str = "navigation.json";
 const PAGE_TITLE_LEVEL: u8 = 1;
 const SECTION_LEVEL: u8 = 2;
 
@@ -465,14 +465,13 @@ pub(crate) mod site {
     use super::Library;
     use super::fixture::leak;
 
-    const CONTENT_DIR: &str = "../site/src/content/docs";
+    const CONTENT_DIR: &str = "../docs/content";
 
     /// The real docs, read from disk so the tests always see the current files.
     pub(crate) fn library() -> &'static Library {
         static LIBRARY: LazyLock<Library> = LazyLock::new(|| {
-            let navigation =
-                fs::read_to_string(content_dir().join("../../data/docs-navigation.json"))
-                    .expect("docs navigation");
+            let navigation = fs::read_to_string(content_dir().join("../navigation.json"))
+                .expect("docs navigation");
             Library::parse(files(), &navigation).expect("valid docs sources")
         });
         &LIBRARY
@@ -514,7 +513,7 @@ mod tests {
     use super::fixture::{leak, library};
     use super::{DocsError, Library, NAVIGATION_FILE, Page, SITE_DOCS_URL, Target, site};
 
-    const STATIC_DIR: &str = "../../../public/docs";
+    const EXAMPLES_DIR: &str = "../examples";
     const ALPHA: &str = "# Alpha\n\nIntro text.\n\n## Shell timeout\n\nThe shell stops.\n\n### Details {#details}\n\nMore detail.\n\n```bash\n## Not a heading\n```\n\n## Tables\n\n| a | b |\n";
     const BETA: &str = "# Beta\n\n## Labels\n\nLabels name things.\n";
     const GENERATED: &str = "# Gamma\n\n<!-- caudra-docgen:fields -->\n\n| field | meaning |\n\n<!-- /caudra-docgen:fields -->\n\n## After\n\nText.\n";
@@ -722,7 +721,7 @@ mod tests {
     #[test]
     fn every_docs_link_resolves() {
         let library = site::library();
-        let static_dir = site::content_dir().join(STATIC_DIR);
+        let examples_dir = site::content_dir().join(EXAMPLES_DIR);
         let link_open = format!("]({SITE_DOCS_URL}");
         let mut broken = Vec::new();
         for page in library.pages() {
@@ -734,7 +733,7 @@ mod tests {
                     .map_or(rest.len(), |end| target_start + end);
                 let target = &rest[target_start..end];
                 let path = &target[SITE_DOCS_URL.len()..];
-                if !static_dir.join(path).is_file() && library.resolve(path).is_err() {
+                if !examples_dir.join(path).is_file() && library.resolve(path).is_err() {
                     broken.push(format!("{}: {target}", page.slug));
                 }
                 rest = &rest[end..];

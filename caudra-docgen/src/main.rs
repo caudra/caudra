@@ -16,8 +16,8 @@ use std::thread;
 
 use caudra_config::files;
 
-const CONTENT_DIR: &str = "site/src/content/docs";
-const STATIC_DIR: &str = "site/public/docs";
+const CONTENT_DIR: &str = "docs/content";
+const EXAMPLES_DIR: &str = "docs/examples";
 
 type Page = (&'static str, fn() -> String);
 
@@ -105,7 +105,8 @@ fn main() -> ExitCode {
         running.map(|(path, page)| (path, page.join().unwrap()))
     });
     let examples = files::examples().filter_map(|file| {
-        let path = repository_path(STATIC_DIR).join(gen_reference_configs::example_file_name(file));
+        let path =
+            repository_path(EXAMPLES_DIR).join(gen_reference_configs::example_file_name(file));
         file.reference().map(|reference| (path, reference))
     });
     let outputs: Vec<(PathBuf, String)> = pages
