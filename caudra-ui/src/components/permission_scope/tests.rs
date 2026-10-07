@@ -47,7 +47,9 @@ const VALUE: &str = "two words";
 const EMPTY_LITERAL: &str = "\"\"";
 const SECRET: &str = "never-show-sensitive-payload";
 const HEIGHT: u16 = 24;
+#[cfg(unix)]
 const DIRECTORY_MODE: u32 = 0o700;
+#[cfg(unix)]
 const FILE_MODE: u32 = 0o600;
 const LONG_ARGV_COUNT: usize = 24;
 const SHORT_SCOPE_HEIGHT: u16 = 10;

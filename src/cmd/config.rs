@@ -96,16 +96,22 @@ fn location(entry: &Located) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
     use std::path::Path;
 
-    use caudra_config::files::{self, CONFIG_FILES, Scope};
+    #[cfg(unix)]
+    use caudra_config::files::Scope;
+    use caudra_config::files::{self, CONFIG_FILES};
     use tempfile::TempDir;
 
-    use super::{MISSING, PRESENT, SYMLINK, listing};
+    use super::{MISSING, listing};
+    #[cfg(unix)]
+    use super::{PRESENT, SYMLINK};
 
+    #[cfg(unix)]
     const SHARED_FILE: &str = "shared.toml";
 
     fn line_for<'a>(listing: &'a str, path: &Path) -> &'a str {

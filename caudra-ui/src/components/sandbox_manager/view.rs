@@ -1132,7 +1132,7 @@ fn safe(text: &str) -> String {
         .join("\n")
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::{
         Confirmation, Control, DELETED_DISK, Focus, NO_EXPIRY_DEADLINE, PAUSED_DISK, ReadSurface,

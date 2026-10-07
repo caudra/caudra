@@ -134,6 +134,7 @@ pub enum UpdateError {
     ExecScript(std::io::Error),
 
     #[error("install script failed with exit code {0:?}")]
+    #[cfg(not(windows))]
     InstallFailed(Option<i32>),
 
     #[error("no backup found at {0}")]

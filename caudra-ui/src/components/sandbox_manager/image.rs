@@ -640,8 +640,11 @@ impl HostPicker {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::super::tests::fixture;
-    use super::{HostPicker, Kind, PickerControl};
+    #[cfg(unix)]
+    use super::Kind;
+    use super::{HostPicker, PickerControl};
     use crate::components::scrollbar;
     use caudra_workbench::scroll::{SCROLLBAR_THUMB, SCROLLBAR_THUMB_GRABBED};
     use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -1079,6 +1082,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test_case(false; "select_file")]
     #[test_case(true; "cancel")]
     fn picker_manager_mouse_forwarding_never_submits(cancel: bool) {

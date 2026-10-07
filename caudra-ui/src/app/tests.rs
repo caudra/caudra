@@ -476,7 +476,7 @@ thread_local! {
 }
 
 pub(crate) fn private_tempdir() -> TempDir {
-    let mut builder = Builder::new();
+    let builder = &mut Builder::new();
     #[cfg(unix)]
     builder.permissions(fs::Permissions::from_mode(PRIVATE_TEST_DIRECTORY_MODE));
     builder

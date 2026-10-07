@@ -66,6 +66,7 @@ pub enum SaveError {
     ReadOnly(PathBuf),
     #[error("{0} changed on disk since it was opened")]
     Stale(PathBuf),
+    #[cfg(unix)]
     #[error(
         "save may have completed for {path}, but could not be confirmed; reopen and review the source: {source}"
     )]
@@ -813,6 +814,7 @@ mod tests {
     const REFUSED: &str = "a file that cannot be edited must open read-only, not fail";
     const ATOMIC: &str = "a saved file must contain exactly what was written";
     const STALE: &str = "a file written by someone else must not be overwritten unasked";
+    #[cfg(unix)]
     const SOURCE_FILE: &str = "policy.lua";
     #[cfg(unix)]
     const SOURCE_CONTENT: &str = "local policy = {}\n";

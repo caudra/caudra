@@ -1513,6 +1513,7 @@ impl WorkbenchFilesystem for LocalFilesystem {
         };
         read::save(path, &contents, expected).map_err(|error| match error {
             read::SaveError::Stale(_) => BackendError::Conflict,
+            #[cfg(unix)]
             read::SaveError::Unconfirmed { .. } => BackendError::Indeterminate,
             error => BackendError::Local(error.to_string()),
         })?;

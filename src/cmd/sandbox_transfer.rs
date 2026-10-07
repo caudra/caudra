@@ -255,20 +255,24 @@ pub(super) fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CONFIRMATION_REQUIRED, RESPONSE_BYTES, answer, confirmed, response, transfer_permissions,
-    };
+    #[cfg(unix)]
+    use super::transfer_permissions;
+    use super::{CONFIRMATION_REQUIRED, RESPONSE_BYTES, answer, confirmed, response};
     use crate::cli::{Cli, Command, SandboxAction, SandboxTransferMode};
-    use caudra_agent::{
-        AgentEvent, CancelToken, EventSender, permissions::PermissionAnswer,
-        tools::PermissionScopes,
-    };
+    use caudra_agent::permissions::PermissionAnswer;
+    #[cfg(unix)]
+    use caudra_agent::{AgentEvent, CancelToken, EventSender, tools::PermissionScopes};
+    #[cfg(unix)]
     use caudra_config::ToolKey;
+    #[cfg(unix)]
     use caudra_storage::StateDir;
     use clap::Parser;
+    #[cfg(unix)]
     use futures_lite::future;
     use serde_json::{Value, json};
+    #[cfg(unix)]
     use smol::lock::Mutex as AsyncMutex;
+    #[cfg(unix)]
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -276,9 +280,13 @@ mod tests {
 
     const PLAN: &str = "sha256:reviewed";
     const REQUEST: &str = "permission-a";
+    #[cfg(unix)]
     const TOOL: &str = "workspace_transfer";
+    #[cfg(unix)]
     const PERMISSIONS_PATH: &str = ".caudra/permissions.toml";
+    #[cfg(unix)]
     const DENY_TRANSFER: &str = "[workspace_transfer]\ndeny = true\n";
+    #[cfg(unix)]
     const DENY_DEFAULT: &str = "default = 'deny'\n";
 
     #[cfg(unix)]

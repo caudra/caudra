@@ -556,11 +556,11 @@ impl Tab {
             (None, Some(source)) => read::save_local_source(source, path, &contents),
             (None, None) => read::save(path, &contents, self.modified),
         };
-        if matches!(
-            &saved,
-            Err(SaveError::Stale(_) | SaveError::Unconfirmed { .. })
-        ) {
-            self.conflict = true;
+        match &saved {
+            Err(SaveError::Stale(_)) => self.conflict = true,
+            #[cfg(unix)]
+            Err(SaveError::Unconfirmed { .. }) => self.conflict = true,
+            _ => {}
         }
         self.modified = saved?;
         self.snapshot = None;

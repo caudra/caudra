@@ -2116,7 +2116,9 @@ mod tests {
     const DISCOVERY_TEST_PARTIAL: &str = "History sample limit reached";
     const DISCOVERY_SAMPLE_COUNT: &str = "Read 2 of up to 64 sessions: 4 rows of history";
     const DISCOVERY_MINIMUM: &str = "at least 2 sessions";
+    #[cfg(unix)]
     const EXPORT_DIRECTORY_MODE: u32 = 0o700;
+    #[cfg(unix)]
     const EXPORT_ARTIFACT_MODE: u32 = 0o600;
     const EXPORT_LONG_GRANTS: usize = 240;
     const EXPORT_MAX_PAGES: usize = 32;

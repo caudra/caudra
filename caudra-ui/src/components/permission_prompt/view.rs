@@ -1495,8 +1495,11 @@ impl PermissionPrompt {
 #[cfg(test)]
 pub(super) mod tests {
     use std::collections::BTreeMap;
+    #[cfg(unix)]
     use std::fs::{self, OpenOptions, Permissions};
+    #[cfg(unix)]
     use std::io::Write;
+    #[cfg(unix)]
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use std::path::Path;
 
@@ -1517,6 +1520,7 @@ pub(super) mod tests {
     use ratatui::buffer::Buffer;
     use ratatui::style::Color;
     use serde_json::{Value, json};
+    #[cfg(unix)]
     use tempfile::Builder;
     use test_case::test_case;
 
@@ -1562,7 +1566,9 @@ pub(super) mod tests {
     const OPERATION_ATTRIBUTE: &str = "operation";
     const PLAN_PLUGIN: &str = "planner";
     const GENERIC_READ_QUESTION: &str = "Allow reading a file?";
+    #[cfg(unix)]
     const PRIVATE_ARTIFACT_MODE: u32 = 0o600;
+    #[cfg(unix)]
     const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
     pub(crate) const THEMES: [&str; 2] = ["ayu_dark", "ayu_light"];
     pub(crate) const WIDTHS: [u16; 3] = [40, 80, 140];
@@ -1955,6 +1961,7 @@ pub(super) mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     #[ignore = "writes private visual review buffers under /tmp"]
     fn export_permission_prompt_buffers() {

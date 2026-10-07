@@ -1120,28 +1120,36 @@ fn pretty(value: &impl serde::Serialize) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::{
-        ACK_REVIEW, EXTEND_REVIEW, INSTANCE_ACTIONS, Kind, LEASE_FIELD, LEASE_HELP, LIVE_KEYS,
-        LiveField, LiveForm, NO_EXPIRY_REVIEW, PAUSE_REVIEW, PERSISTENT_REQUIRED,
-        RECOVERY_REQUIRED, RESTART_REVIEW, TextEditor, image, instance_action_error, key,
+        ACK_REVIEW, EXTEND_REVIEW, INSTANCE_ACTIONS, LEASE_FIELD, LEASE_HELP, NO_EXPIRY_REVIEW,
+        PAUSE_REVIEW, PERSISTENT_REQUIRED, RECOVERY_REQUIRED, RESTART_REVIEW,
+        instance_action_error,
     };
+    use super::{Kind, LIVE_KEYS, LiveField, LiveForm, TextEditor, image, key};
+    #[cfg(unix)]
     use crate::components::sandbox_manager::{
         Confirmation, SandboxAction, SnapshotState,
         tests::{fixture, live_instance},
     };
+    #[cfg(unix)]
     use crate::sandbox::{LiveOperation, SandboxInstanceState};
+    #[cfg(unix)]
     use caudra_config::sandbox::LeaseSeconds;
+    #[cfg(unix)]
+    use caudra_sandbox::{LifecycleAction, dto::InstanceState};
     use caudra_sandbox::{
-        LifecycleAction,
-        dto::{InstanceState, PROTOCOL_VERSION, TRANSFER_PROTOCOL},
+        dto::{PROTOCOL_VERSION, TRANSFER_PROTOCOL},
         local_admin::AdminOperation,
     };
+    #[cfg(unix)]
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use serde_json::json;
     use test_case::test_case;
 
     const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const RAW: &str = "Raw operation JSON override (optional)";
+    #[cfg(unix)]
     const PROFILE_LEASE: LeaseSeconds = LeaseSeconds::new(3600);
     const STALE_KEYS: &str = "the live form key line names a key that is no longer bound";
 
@@ -1156,6 +1164,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test_case(Kind::Pause, InstanceState::Running, true; "running_pause")]
     #[test_case(Kind::Restart, InstanceState::Running, true; "running_restart")]
     #[test_case(Kind::Resume, InstanceState::Running, false; "running_resume_disabled")]
@@ -1188,6 +1197,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test_case(Kind::Pause; "pause")]
     #[test_case(Kind::Restart; "restart")]
     fn persistent_actions_review_without_implicit_delete(kind: Kind) {
@@ -1226,6 +1236,7 @@ mod tests {
         assert!(state.live_pending.is_none());
     }
 
+    #[cfg(unix)]
     #[test_case("0", Some(LeaseSeconds::NO_EXPIRY); "no_expiry")]
     #[test_case("forever", None; "not_whole_seconds")]
     fn extend_reviews_a_lease_with_no_expiry(text: &str, expected: Option<LeaseSeconds>) {
@@ -1257,6 +1268,7 @@ mod tests {
         assert!(preview.contains(NO_EXPIRY_REVIEW));
     }
 
+    #[cfg(unix)]
     #[test_case(false; "ephemeral_disk")]
     #[test_case(true; "pending_intent")]
     fn disabled_picker_and_shortcut_never_dispatch(pending: bool) {

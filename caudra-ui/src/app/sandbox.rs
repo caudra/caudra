@@ -473,30 +473,43 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{remote_workspace_session, test_app};
+    #[cfg(unix)]
+    use super::super::tests::remote_workspace_session;
+    use super::super::tests::test_app;
     use super::UNSAVED_DRAFT_ERR;
+    #[cfg(unix)]
     use crate::AppSession;
     use crate::app::Msg;
     use crate::components::Overlay;
     use crate::components::Status;
     use crate::components::keybindings::key;
+    #[cfg(unix)]
     use crate::components::permission_prompt::PermissionDecision;
+    #[cfg(unix)]
+    use crate::components::sandbox_manager::SandboxAction;
+    use crate::components::sandbox_manager::SandboxView;
+    #[cfg(unix)]
     use crate::components::sandbox_manager::tests::{fixture, live_instance};
-    use crate::components::sandbox_manager::{SandboxAction, SandboxView};
     use crate::repaint::Dirty;
+    #[cfg(unix)]
     use crate::sandbox::transfer::{
         TransferCommand, TransferLink, TransferScope, transfer_permissions,
     };
+    #[cfg(unix)]
     use crate::sandbox::{
         LiveOperation, LiveOutcome, LiveReply, NETWORK_RECOVERY, NETWORK_SAVE_UNKNOWN,
         NetworkReconcileReport, NetworkReconcileRequest, SandboxSnapshot, SnapshotReply,
         SnapshotState, StoreReply, StoreResult, StoreTicket, execute_store_effect,
     };
+    #[cfg(unix)]
     use caudra_agent::permissions::{PermissionAnswer, PermissionManager, PluginRuleStore};
+    #[cfg(unix)]
     use caudra_agent::workspace_transfer::{
         LocalAccess, LocalRootIdentity, RemoteRootIdentity, TransferAuthorization, TransferRoots,
     };
+    #[cfg(unix)]
     use caudra_agent::{AgentEvent, CancelToken, EventSender};
+    #[cfg(unix)]
     use caudra_config::{
         PermissionsConfig,
         sandbox::{
@@ -505,41 +518,65 @@ mod tests {
         },
     };
     use caudra_providers::{ImageMediaType, ImageSource};
+    #[cfg(unix)]
     use caudra_storage::{
         id::CaudraId, private_file::PrivateFileError, workspace_binding::StoredWorkspaceBinding,
     };
     use caudra_workbench::{Workbench, WorkbenchStyles};
+    #[cfg(unix)]
     use caudra_workcell::NativeTransferAuthorization;
+    #[cfg(unix)]
     use caudra_workspace::WorkspacePath;
-    use crossterm::event::{
-        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-    };
+    use crossterm::event::KeyEvent;
+    #[cfg(unix)]
+    use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    #[cfg(unix)]
     use futures_lite::future;
+    #[cfg(unix)]
     use ratatui::{Terminal, backend::TestBackend};
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+    #[cfg(unix)]
+    use std::sync::Mutex;
+    #[cfg(unix)]
     use std::sync::atomic::Ordering;
-    use std::sync::{Arc, Mutex};
+    #[cfg(unix)]
     use std::time::Duration;
+    #[cfg(unix)]
     use tempfile::TempDir;
     use test_case::test_case;
 
     const UNSAVED: &str = "unsent local draft";
     const IMAGE_DATA: &str = "dGVzdA==";
     const SAVED_BYTES: &str = "saved local file\n";
+    #[cfg(unix)]
     const PERMISSIONS: &str = ".caudra/permissions.toml";
+    #[cfg(unix)]
     const DENY_TRANSFER: &str = "[workspace_transfer]\ndeny = true\n";
+    #[cfg(unix)]
     const DENY_DEFAULT: &str = "default = 'deny'\n";
+    #[cfg(unix)]
     const TRANSFER_TEST_DONE: &str = "test authorization complete";
+    #[cfg(unix)]
     const PERMISSION_TIMEOUT: Duration = Duration::from_secs(10);
+    #[cfg(unix)]
     const DOTENV_KEY: &str = "CAUDRA_TRANSFER_TEST_NO_DOTENV";
+    #[cfg(unix)]
     const PRIVATE_MODE: u32 = 0o700;
+    #[cfg(unix)]
     const SANDBOXES: &str = "sandboxes.toml";
+    #[cfg(unix)]
     static TRANSFER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    #[cfg(unix)]
     const CREATE_NAME: &str = "reviewed-create";
+    #[cfg(unix)]
     const CREATE_REPORT: &str = "Fake lifecycle report: no VM was created";
+    #[cfg(unix)]
     const CREATE_ERROR: &str = "Fake lifecycle failure: outcome unknown; Reconcile before retrying";
+    #[cfg(unix)]
     const NEW_NETWORK: &str = "new-network";
 
     #[test_case(false; "idle_with_unsent_draft")]
@@ -557,6 +594,7 @@ mod tests {
         assert!(app.sandbox_live.queued.is_none());
     }
 
+    #[cfg(unix)]
     #[test_case(false; "lifecycle_worker")]
     #[test_case(true; "network_worker")]
     fn detached_controls_still_serialize_sandbox_workers(network: bool) {
@@ -574,6 +612,7 @@ mod tests {
         assert!(app.sandbox_detached_action_blocker().is_some());
     }
 
+    #[cfg(unix)]
     #[test_case(PrivateFileError::DurabilityUnknown, true; "published_but_not_durable")]
     #[test_case(PrivateFileError::Busy, false; "prepublication_lock_failure")]
     #[test_case(PrivateFileError::Permissions { path: SANDBOXES.into(), mode: PRIVATE_MODE }, false; "prepublication_permission_failure")]
@@ -644,6 +683,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn network_reports_follow_shared_gate_into_other_sessions_and_reopened_managers() {
         let (_directory, store, manager) = fixture();
@@ -694,6 +734,7 @@ mod tests {
         assert!(!network_report_frame(&mut observer).contains("Do not retry Save"));
     }
 
+    #[cfg(unix)]
     fn network_report_frame(app: &mut super::App) -> String {
         let mut terminal = Terminal::new(TestBackend::new(140, 60)).unwrap();
         terminal.draw(|frame| app.view(frame)).unwrap();
@@ -707,6 +748,7 @@ mod tests {
             .join("\n")
     }
 
+    #[cfg(unix)]
     #[test_case(true; "matching_commit")]
     #[test_case(false; "stale_ticket")]
     fn network_save_queues_only_matching_committed_reply(matching: bool) {
@@ -759,6 +801,7 @@ mod tests {
         assert!(app.workspace_session.is_none());
     }
 
+    #[cfg(unix)]
     #[test_case(false; "completed")]
     #[test_case(true; "unknown_disconnect")]
     fn network_worker_completion_never_replays_or_changes_workspace(disconnected: bool) {
@@ -791,6 +834,7 @@ mod tests {
         assert_eq!(app.sandbox_network_dispatch_blocker(), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn network_jobs_wait_for_shared_worker_without_blocking_local_execution() {
         let (_directory, store, _manager) = fixture();
@@ -807,6 +851,7 @@ mod tests {
         assert_eq!(app.sandbox_network_dispatch_blocker(), None);
     }
 
+    #[cfg(unix)]
     fn sandbox_frame(app: &mut super::App) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|frame| app.view(frame)).unwrap();
@@ -819,6 +864,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(unix)]
     fn sandbox_key(app: &mut super::App, code: KeyCode) {
         assert!(
             app.update(Msg::Key(KeyEvent::new(code, KeyModifiers::NONE)))
@@ -826,6 +872,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn create_app() -> (TempDir, super::App) {
         let (directory, _, manager) = fixture();
         let mut app = test_app();
@@ -841,6 +888,7 @@ mod tests {
         (directory, app)
     }
 
+    #[cfg(unix)]
     #[test_case(-2, "> a.qcow2"; "aggregated_down")]
     #[test_case(2, "> c.qcow2"; "aggregated_up")]
     fn host_picker_receives_aggregated_scroll(delta: i32, selected: &str) {
@@ -892,6 +940,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn sandbox_review_selection_copies_without_accepting_action() {
         let (_directory, mut app) = create_app();
@@ -955,6 +1004,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn sandbox_masked_credential_mouse_and_keyboard_never_reach_clipboard() {
         const SECRET: &str = "sandbox-selection-secret";
@@ -996,6 +1046,7 @@ mod tests {
         assert!(app.sandbox_manager.is_open());
     }
 
+    #[cfg(unix)]
     #[test_case(false, false; "key_pending")]
     #[test_case(true, false; "mouse_pending")]
     #[test_case(false, true; "key_gate_rejection")]
@@ -1066,6 +1117,7 @@ mod tests {
         assert!(app.workspace_session.is_none());
     }
 
+    #[cfg(unix)]
     #[test_case(false; "report")]
     #[test_case(true; "failure")]
     fn create_worker_result_is_visible_and_back_does_not_resubmit(failed: bool) {
@@ -1107,6 +1159,7 @@ mod tests {
         drop(snapshot_sender);
     }
 
+    #[cfg(unix)]
     #[test_case(false; "open")]
     #[test_case(true; "closed")]
     fn create_worker_disconnect_never_restores_submittable_form(closed: bool) {
@@ -1133,6 +1186,7 @@ mod tests {
         drop(snapshot_sender);
     }
 
+    #[cfg(unix)]
     #[test_case(false; "current_completion")]
     #[test_case(true; "stale_completion")]
     fn closed_create_late_snapshot_and_reply_never_reopen(stale: bool) {
@@ -1177,6 +1231,7 @@ mod tests {
         assert!(!sandbox_frame(&mut app).join("\n").contains("Sandboxes"));
     }
 
+    #[cfg(unix)]
     #[test_case(false; "keyboard_discard")]
     #[test_case(true; "mouse_discard")]
     fn create_draft_back_retains_and_explicit_discard_drops_it(mouse: bool) {
@@ -1233,6 +1288,7 @@ mod tests {
         assert!(!app.sandbox_manager.is_open());
     }
 
+    #[cfg(unix)]
     #[test_case(false, None, false; "project_a_active_remembers_only_b")]
     #[test_case(true, None, false; "remote_active_remembers_only_b")]
     #[test_case(false, Some(DENY_TRANSFER), false; "project_a_cannot_override_b_deny")]

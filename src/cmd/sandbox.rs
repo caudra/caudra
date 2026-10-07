@@ -535,26 +535,34 @@ fn select_saved_source(args: &mut WorkcellSelectorArgs, name: &SandboxName) -> R
 
 #[cfg(test)]
 mod tests {
-    use super::{LAST_SANDBOX, auth, read_key, recover_session_source, select_saved_source};
-    use crate::cli::{Cli, SandboxAuthAction, WorkcellSelectorArgs};
+    #[cfg(unix)]
+    use super::auth;
+    use super::{LAST_SANDBOX, read_key, recover_session_source, select_saved_source};
+    #[cfg(unix)]
+    use crate::cli::SandboxAuthAction;
+    use crate::cli::{Cli, WorkcellSelectorArgs};
     use caudra_config::sandbox::SandboxName;
     use caudra_storage::{
-        StateDir,
-        auth::WorkcellCredentialName,
-        id::CaudraId,
-        sandbox_auth::{
-            MAX_SANDBOX_API_KEY_BYTES, SandboxCredentialRef, list_sandbox_credentials,
-            load_sandbox_api_key,
-        },
-        state,
+        StateDir, id::CaudraId, sandbox_auth::MAX_SANDBOX_API_KEY_BYTES, state,
         workspace_binding::StoredWorkspaceBinding,
     };
+    #[cfg(unix)]
+    use caudra_storage::{
+        auth::WorkcellCredentialName,
+        sandbox_auth::{SandboxCredentialRef, list_sandbox_credentials, load_sandbox_api_key},
+    };
     use clap::Parser;
-    use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+    #[cfg(unix)]
+    use std::{
+        fs::{self, Permissions},
+        os::unix::fs::PermissionsExt,
+    };
     use test_case::test_case;
 
     const NAME: &str = "original";
     const SECRET: &str = "sandbox-secret-0123456789-abcdefghijk";
+    #[cfg(unix)]
+    const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 
     #[test_case(false; "default_target_never_looks_up_source")]
     #[test_case(true; "explicit_target_never_conflicts_with_source")]
@@ -599,10 +607,11 @@ mod tests {
         assert!(args.credential_ref.is_none());
     }
 
+    #[cfg(unix)]
     #[test]
-    fn auth_crud_uses_purpose_refs_and_bounded_hidden_input() {
+    fn auth_crud_uses_purpose_refs() {
         let temp = tempfile::Builder::new()
-            .permissions(Permissions::from_mode(0o700))
+            .permissions(Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
             .tempdir()
             .unwrap();
         let state = StateDir::from_path(temp.path().join("state"));
@@ -621,22 +630,25 @@ mod tests {
                 .len(),
             64
         );
+        auth(SandboxAuthAction::Delete { name }, &state).unwrap();
+        assert!(load_sandbox_api_key(&state, &reference).unwrap().is_none());
+    }
+
+    #[test]
+    fn hidden_key_input_is_bounded() {
         assert_eq!(
             read_key(format!("{SECRET}\r\n").as_bytes()).unwrap(),
             SECRET
         );
         assert!(read_key(vec![b'x'; MAX_SANDBOX_API_KEY_BYTES + 3].as_slice()).is_err());
-        auth(SandboxAuthAction::Delete { name }, &state).unwrap();
-        assert!(load_sandbox_api_key(&state, &reference).unwrap().is_none());
     }
 
     #[test_case(false; "session_id")]
     #[test_case(true; "continue_source")]
     fn missing_saved_provenance_never_resumes_locally(continue_source: bool) {
-        let temp = tempfile::Builder::new()
-            .permissions(Permissions::from_mode(0o700))
-            .tempdir()
-            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(temp.path(), Permissions::from_mode(PRIVATE_DIRECTORY_MODE)).unwrap();
         let storage = StateDir::from_path(temp.path().join("state"));
         let record = CaudraId::generate();
         let local = StoredWorkspaceBinding::local_from_cwd(".");
