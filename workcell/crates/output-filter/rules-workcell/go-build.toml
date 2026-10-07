@@ -1,0 +1,33 @@
+[filters.go-build]
+description = "Report success for a silent go build, vet, or install"
+match_command = "^go\\s+(build|vet|install|mod\\s+tidy)\\b"
+filter_stderr = true
+strip_lines_matching = [
+  "^go: downloading ",
+  "^go: (finding|extracting) ",
+  "^\\s*$",
+]
+on_empty = "go: ok"
+
+[[tests.go-build]]
+name = "silent success becomes an explicit ok"
+input = ""
+expected = "go: ok"
+
+[[tests.go-build]]
+name = "module downloads are dropped"
+input = """
+go: downloading github.com/example/pkg v1.2.3
+go: downloading github.com/other/pkg v0.4.5
+"""
+expected = "go: ok"
+
+[[tests.go-build]]
+name = "compile errors survive"
+input = """
+go: downloading github.com/example/pkg v1.2.3
+./main.go:5:2: undefined: missingSymbol
+"""
+expected = """
+./main.go:5:2: undefined: missingSymbol
+"""

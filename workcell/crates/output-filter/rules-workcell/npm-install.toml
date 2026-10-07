@@ -1,0 +1,48 @@
+[filters.npm-install]
+description = "Compact npm, pnpm, and yarn install output"
+match_command = "^(npm|pnpm|yarn)\\s+(install|ci|add|i)\\b"
+filter_stderr = true
+strip_lines_matching = [
+  "^npm notice",
+  "^\\s*run `npm fund` for details",
+  "^found 0 vulnerabilities$",
+  "^\\s*$",
+]
+on_empty = "install: ok"
+
+[[tests.npm-install]]
+name = "keeps the package summary and drops filler"
+input = """
+
+added 70 packages, and audited 71 packages in 2s
+
+found 0 vulnerabilities
+"""
+expected = """
+added 70 packages, and audited 71 packages in 2s
+"""
+
+[[tests.npm-install]]
+name = "vulnerability counts and errors survive"
+input = """
+added 70 packages, and audited 71 packages in 2s
+
+3 vulnerabilities (1 moderate, 2 high)
+npm ERR! code ERESOLVE
+"""
+expected = """
+added 70 packages, and audited 71 packages in 2s
+3 vulnerabilities (1 moderate, 2 high)
+npm ERR! code ERESOLVE
+"""
+
+[[tests.npm-install]]
+name = "deprecation warnings are retained"
+input = """
+npm WARN deprecated inflight@1.0.6: This module is not supported
+added 70 packages, and audited 71 packages in 2s
+"""
+expected = """
+npm WARN deprecated inflight@1.0.6: This module is not supported
+added 70 packages, and audited 71 packages in 2s
+"""

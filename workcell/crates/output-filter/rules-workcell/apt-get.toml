@@ -1,0 +1,78 @@
+[filters.apt-get]
+description = "Compact apt package retrieval, unpack, and configure progress"
+# Read-only subcommands are excluded: the listing an `apt list` or `apt search`
+# produces is the answer, not progress around it.
+match_command = "^apt(-get)?\\s+(update|upgrade|dist-upgrade|full-upgrade|install|reinstall|remove|purge|autoremove)\\b"
+filter_stderr = true
+strip_lines_matching = [
+  "^(Get|Hit|Ign):\\d+ ",
+  "^Fetched ",
+  "^Reading package lists",
+  "^Building dependency tree",
+  "^Reading state information",
+  # dpkg redraws this counter with carriage returns, so a single captured line
+  # can carry every percentage step and outweigh the rest of the output.
+  "^\\(Reading database",
+  "^Selecting previously unselected package",
+  "^Preparing to unpack ",
+  "^Unpacking ",
+  "^Setting up ",
+  "^Processing triggers for ",
+  "^debconf: ",
+  "^Need to get ",
+  "^After this operation",
+  "^\\s*$",
+]
+on_empty = "apt: ok"
+
+[[tests.apt-get]]
+name = "update collapses to a success line"
+input = """
+Get:1 http://archive.ubuntu.com/ubuntu noble InRelease [256 kB]
+Get:2 http://archive.ubuntu.com/ubuntu noble-updates InRelease [126 kB]
+Get:8 http://archive.ubuntu.com/ubuntu noble/universe amd64 Packages [19.3 MB]
+Fetched 32.4 MB in 7s (4366 kB/s)
+Reading package lists...
+"""
+expected = "apt: ok"
+
+[[tests.apt-get]]
+name = "install keeps the package plan and drops dpkg progress"
+input = """
+Reading package lists...
+Building dependency tree...
+Reading state information...
+The following additional packages will be installed:
+  libcurl4t64
+The following NEW packages will be installed:
+  curl libcurl4t64
+0 upgraded, 2 newly installed, 0 to remove and 19 not upgraded.
+Need to get 569 kB of archives.
+After this operation, 1485 kB of additional disk space will be used.
+Get:1 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libcurl4t64 amd64 8.5.0-2ubuntu10.13 [343 kB]
+debconf: delaying package configuration, since apt-utils is not installed
+Fetched 569 kB in 1s (442 kB/s)
+(Reading database ... \r(Reading database ... 45%\r(Reading database ... 100%\r(Reading database ... 57343 files and directories currently installed.)\r
+Preparing to unpack .../libcurl4t64_8.5.0-2ubuntu10.13_amd64.deb ...\r
+Unpacking libcurl4t64:amd64 (8.5.0-2ubuntu10.13) ...\r
+Setting up libcurl4t64:amd64 (8.5.0-2ubuntu10.13) ...\r
+"""
+expected = """
+The following additional packages will be installed:
+  libcurl4t64
+The following NEW packages will be installed:
+  curl libcurl4t64
+0 upgraded, 2 newly installed, 0 to remove and 19 not upgraded.
+"""
+
+[[tests.apt-get]]
+name = "errors survive"
+input = """
+Reading package lists...
+Building dependency tree...
+Reading state information...
+E: Unable to locate package this-package-does-not-exist
+"""
+expected = """
+E: Unable to locate package this-package-does-not-exist
+"""

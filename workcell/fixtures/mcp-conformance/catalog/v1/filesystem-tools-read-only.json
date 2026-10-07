@@ -1,0 +1,672 @@
+{
+  "fixtureVersion": 1,
+  "caseID": "catalog.filesystem.sdk-emitted.read-only.v1",
+  "catalogKind": "sdk-emitted",
+  "server": {
+    "name": "workcell-mcp",
+    "version": "0.1.0"
+  },
+  "provenance": [
+    "rust/crates/mcp-files/src/catalog.rs",
+    "rust/crates/mcp-files/tests/catalog_dispatch.rs"
+  ],
+  "configuration": {
+    "allowWrite": false
+  },
+  "expected": {
+    "tools": [
+      {
+        "name": "file_read",
+        "title": "Read file or directory",
+        "description": "Read a file or directory from the local filesystem. If the path does not exist, an error is returned.\n\nUsage:\n- The filePath parameter can be absolute or file-root-relative.\n- An empty filePath is treated as \".\" and reads the file root directory.\n- By default, this tool returns up to 2000 lines from the start of the file.\n- The offset parameter is the line number to start from (1-indexed).\n- To read later sections, call this tool again with a larger offset.\n- Use file_grep to find specific content in large files or files with long lines.\n- If you are unsure of the correct file path, use file_glob to look up filenames by glob pattern.\n- Contents are returned with each line prefixed by its line number as `<line>: <content>`. Directories return sorted entries one per line, with a trailing `/` for subdirectories.\n- Any line longer than 2000 characters is truncated, and total model-facing output is byte-limited.\n- Avoid tiny repeated slices. If you need more context, read a larger window.\n- This first local OSS executor is not sandboxed; hosts can override permission policy before exposing it.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "filePath": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Root-relative or absolute path inside the configured root."
+            },
+            "offset": {
+              "description": "1-indexed starting line.",
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "limit": {
+              "description": "Maximum lines to return.",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            }
+          },
+          "required": [
+            "filePath"
+          ],
+          "$schema": "http://json-schema.org/draft-07/schema#"
+        },
+        "outputSchema": {
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "relativePath": {
+                  "type": "string"
+                },
+                "entryDetails": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/definitions/DirectoryEntryDetail"
+                  }
+                },
+                "truncated": {
+                  "type": "boolean"
+                },
+                "kind": {
+                  "type": "string",
+                  "const": "directory"
+                }
+              },
+              "required": [
+                "kind",
+                "path",
+                "relativePath",
+                "entryDetails",
+                "truncated"
+              ]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "relativePath": {
+                  "type": "string"
+                },
+                "text": {
+                  "type": "string"
+                },
+                "lineStart": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "lineEnd": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "totalLines": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "truncated": {
+                  "type": "boolean"
+                },
+                "kind": {
+                  "type": "string",
+                  "const": "file"
+                }
+              },
+              "required": [
+                "kind",
+                "path",
+                "relativePath",
+                "text",
+                "lineStart",
+                "lineEnd",
+                "totalLines",
+                "truncated"
+              ]
+            }
+          ],
+          "title": "FileReadOutput",
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "definitions": {
+            "DirectoryEntryDetail": {
+              "type": "object",
+              "properties": {
+                "relativePath": {
+                  "type": "string"
+                },
+                "kind": {
+                  "$ref": "#/definitions/FileEntryKind"
+                },
+                "sizeBytes": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "uint64",
+                  "minimum": 0
+                },
+                "lineCount": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "uint",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "relativePath",
+                "kind"
+              ]
+            },
+            "FileEntryKind": {
+              "type": "string",
+              "enum": [
+                "file",
+                "directory"
+              ]
+            }
+          }
+        },
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        },
+        "_meta": {
+          "ai.workcell/presentation-profile": "file.read.v1",
+          "ai.workcell/contract": {
+            "id": "file.read.v1",
+            "version": "v1",
+            "resultVersion": "v1"
+          }
+        }
+      },
+      {
+        "name": "file_glob",
+        "title": "Glob files",
+        "description": "Fast file pattern matching tool for files under the file root.\n\n- Supports glob patterns like \"**/*.js\" or \"src/**/*.ts\".\n- Returns matching file paths with byte sizes and line counts for bounded text files.\n- Use this tool when you need to find files by name patterns.\n- The optional path parameter limits the search root. Omit it to search the file root.\n- An empty path is treated as \".\".\n- Broad searches skip .git, node_modules, and regenerable build output and tool caches such as target, dist, .venv, and __pycache__. Dependency sources such as vendor are not skipped. Pass one of the skipped directories as the path to search inside it.\n- Broad searches also apply the repository's own .gitignore rules. Global and $GIT_DIR/info/exclude rules are not read. A path you name explicitly is never skipped, so passing an ignored directory as the path searches it.\n- Results are truncated to a safe result limit. A truncated result says so on its last line and reports how many files matched in total.\n- When you are doing an open-ended search that may require multiple rounds of globbing and grepping, prefer a higher-level sidequest/task flow once available.\n- This first local OSS executor is not sandboxed; hosts can override permission policy before exposing it.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "pattern": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Glob pattern supporting *, **, ?, and brace alternatives."
+            },
+            "path": {
+              "description": "Optional directory under the configured root.",
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "pattern"
+          ],
+          "$schema": "http://json-schema.org/draft-07/schema#"
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "cwd": {
+              "type": "string"
+            },
+            "relativePath": {
+              "type": "string"
+            },
+            "pattern": {
+              "type": "string"
+            },
+            "files": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/FileListing"
+              }
+            },
+            "count": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "total": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0,
+              "description": "Files matching the pattern. Counting continues past the returned window,\nso this exceeds `count` when results were withheld. Exact when\n`scanComplete` is true, otherwise a lower bound."
+            },
+            "scanComplete": {
+              "type": "boolean",
+              "description": "Whether every candidate the traversal produced was examined. False when\nthe traversal or the match work budget stopped the scan early."
+            },
+            "truncated": {
+              "type": "boolean"
+            },
+            "ignored": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0,
+              "description": "Entries excluded by `.gitignore` rules. An empty result under ignore\nrules must be distinguishable from an empty tree."
+            },
+            "ignoreComplete": {
+              "type": "boolean",
+              "description": "Whether every applicable ignore rule was read and applied. False when a\nbound stopped rule collection, which means the exclusions are a subset of\nwhat the repository asked for."
+            },
+            "prunedRepositories": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Directories not traversed because they are themselves repositories,\nrelative to the searched directory. Populated only when the group is\nconfigured to prune them; naming one as `path` traverses it."
+            }
+          },
+          "required": [
+            "cwd",
+            "relativePath",
+            "pattern",
+            "files",
+            "count",
+            "total",
+            "scanComplete",
+            "truncated"
+          ],
+          "title": "FileGlobOutput",
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "definitions": {
+            "FileListing": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "relativePath": {
+                  "type": "string"
+                },
+                "sizeBytes": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "uint64",
+                  "minimum": 0
+                },
+                "lineCount": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "uint",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "path",
+                "relativePath"
+              ]
+            }
+          }
+        },
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        },
+        "_meta": {
+          "ai.workcell/presentation-profile": "file.list.v1",
+          "ai.workcell/contract": {
+            "id": "file.glob.v1",
+            "version": "v1",
+            "resultVersion": "v1"
+          }
+        }
+      },
+      {
+        "name": "file_grep",
+        "title": "Search file contents",
+        "description": "Fast content search tool for files under the file root.\n\n- Searches file contents using linear-time regular expressions.\n- Supports common regex syntax such as alternation, groups, classes, and repetition. Look-around and backreferences are rejected to guarantee bounded matching time.\n- Filter files by pattern with the include parameter, for example \"*.js\" or \"*.{ts,tsx}\".\n- An empty path is treated as \".\", and an empty include filter is ignored.\n- Returns file paths, line numbers, and matching lines.\n- Use this tool when you need to find files containing specific patterns.\n- Ask for surrounding lines with -A, -B, or -C, exactly as you would from grep. A hit is rendered `path:line: text` and a context line `path:line- text`, with `--` between runs that are not adjacent. Prefer this over piping rg through shell to read a definition.\n- Cap the result yourself with head_limit rather than piping through head.\n- Reach for shell with rg only when the output has to feed another program in a pipeline. Searching to read the result is this tool's job.\n- Broad searches skip binary files, .git, node_modules, and regenerable build output and tool caches such as target, dist, .venv, and __pycache__. Dependency sources such as vendor are not skipped. Pass one of the skipped directories as the path to search inside it.\n- Broad searches also apply the repository's own .gitignore rules. Global and $GIT_DIR/info/exclude rules are not read. A path you name explicitly is never skipped, so passing an ignored directory as the path searches it.\n- Results are truncated to a safe match limit. A truncated result says so on its last line and reports how many files were searched.\n- This first local OSS executor is not sandboxed; hosts can override permission policy before exposing it.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "pattern": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Linear-time regular expression without look-around or backreferences."
+            },
+            "path": {
+              "description": "Optional file or directory under the root.",
+              "type": "string",
+              "minLength": 1
+            },
+            "include": {
+              "description": "Optional file glob filter. `glob` is accepted as an alias.",
+              "type": "string",
+              "minLength": 1
+            },
+            "-A": {
+              "description": "Lines of context after each match.",
+              "type": "integer",
+              "minimum": 0
+            },
+            "-B": {
+              "description": "Lines of context before each match.",
+              "type": "integer",
+              "minimum": 0
+            },
+            "-C": {
+              "description": "Lines of context on both sides. An explicit -A or -B wins.",
+              "type": "integer",
+              "minimum": 0
+            },
+            "head_limit": {
+              "description": "Stop after this many matches.",
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          "required": [
+            "pattern"
+          ],
+          "$schema": "http://json-schema.org/draft-07/schema#"
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "cwd": {
+              "type": "string"
+            },
+            "relativePath": {
+              "type": "string"
+            },
+            "pattern": {
+              "type": "string"
+            },
+            "include": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "rows": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/FileGrepRow"
+              }
+            },
+            "matches": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "filesScanned": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0,
+              "description": "Candidate files actually searched. An exact match total is not reported\nbecause producing one would require reading every remaining file."
+            },
+            "filesListed": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0,
+              "description": "Candidate files the traversal listed. A lower bound when `truncated`."
+            },
+            "truncated": {
+              "type": "boolean"
+            },
+            "ignored": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0,
+              "description": "Entries excluded by `.gitignore` rules. A search that found nothing and a\nsearch that was not allowed to look are different answers."
+            },
+            "ignoreComplete": {
+              "type": "boolean",
+              "description": "Whether every applicable ignore rule was read and applied."
+            }
+          },
+          "required": [
+            "cwd",
+            "relativePath",
+            "pattern",
+            "rows",
+            "matches",
+            "filesScanned",
+            "filesListed",
+            "truncated"
+          ],
+          "title": "FileGrepOutput",
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "definitions": {
+            "FileGrepRow": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "relativePath": {
+                  "type": "string"
+                },
+                "line": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "text": {
+                  "type": "string"
+                },
+                "matched": {
+                  "type": "boolean",
+                  "description": "False for a line carried only as context. Rendering separates the two the\nway grep does, so a reader can tell a hit from its surroundings.",
+                  "default": true
+                }
+              },
+              "required": [
+                "path",
+                "relativePath",
+                "line",
+                "text"
+              ]
+            }
+          }
+        },
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        },
+        "_meta": {
+          "ai.workcell/presentation-profile": "file.search.v1",
+          "ai.workcell/contract": {
+            "id": "file.grep.v1",
+            "version": "v1",
+            "resultVersion": "v1"
+          }
+        }
+      },
+      {
+        "name": "file_index",
+        "title": "Index source file or directory",
+        "description": "Return a compact structural overview of a source file, or a deterministic listing of a directory.\n\n- Use this first to understand file structure before reading specific sections with file_read.\n- File results include imports, declarations, signatures, source ranges, parse recovery status, and semantic output-line metadata.\n- Directory results list directories before files and append / to directory names.\n- The path may be absolute or relative to the configured file root.\n- Unsupported file types, binary files, and non-UTF-8 source are rejected.\n- Parsing, traversal, source, lines, output, admission, and concurrency are bounded by host-only policy.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Root-relative or absolute source file or directory path, limited to 4096 UTF-8 bytes."
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "additionalProperties": false,
+          "$schema": "http://json-schema.org/draft-07/schema#"
+        },
+        "outputSchema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "type": "object",
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "kind",
+                "path",
+                "relativePath",
+                "language",
+                "lines",
+                "sourceLineCount",
+                "parseError",
+                "truncated"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "file"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "relativePath": {
+                  "type": "string"
+                },
+                "language": {
+                  "type": "string"
+                },
+                "lines": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "outputLine",
+                      "text",
+                      "semantic"
+                    ],
+                    "properties": {
+                      "outputLine": {
+                        "type": "integer",
+                        "minimum": 1
+                      },
+                      "text": {
+                        "type": "string"
+                      },
+                      "semantic": {
+                        "type": "string",
+                        "enum": [
+                          "section",
+                          "item",
+                          "dimmed",
+                          "plain"
+                        ]
+                      },
+                      "body": {
+                        "type": "string"
+                      },
+                      "sourceRange": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": [
+                          "startLine",
+                          "endLine"
+                        ],
+                        "properties": {
+                          "startLine": {
+                            "type": "integer",
+                            "minimum": 1
+                          },
+                          "endLine": {
+                            "type": "integer",
+                            "minimum": 1
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
+                "sourceLineCount": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "parseError": {
+                  "type": "boolean"
+                },
+                "truncated": {
+                  "type": "boolean"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "kind",
+                "path",
+                "relativePath",
+                "entries",
+                "totalCount",
+                "truncated"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "directory"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "relativePath": {
+                  "type": "string"
+                },
+                "entries": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "name",
+                      "kind"
+                    ],
+                    "properties": {
+                      "name": {
+                        "type": "string"
+                      },
+                      "kind": {
+                        "type": "string",
+                        "enum": [
+                          "directory",
+                          "file"
+                        ]
+                      }
+                    }
+                  }
+                },
+                "totalCount": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "description": "Exact when truncated is false; otherwise a lower bound on visible entries processed before scanning stopped."
+                },
+                "truncated": {
+                  "type": "boolean"
+                }
+              }
+            }
+          ]
+        },
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        },
+        "_meta": {
+          "ai.workcell/presentation-profile": "file.index.v1",
+          "ai.workcell/contract": {
+            "id": "file.index.v1",
+            "version": "v1",
+            "resultVersion": "v1"
+          }
+        }
+      }
+    ]
+  }
+}

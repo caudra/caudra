@@ -1,0 +1,78 @@
+[filters.jest]
+description = "Drop passing Jest suites and timing filler, keeping failures and the summary"
+match_command = "^(npx\\s+)?jest\\b"
+strip_ansi = true
+filter_stderr = true
+strip_lines_matching = [
+  # A passing suite header and its per-test checkmarks restate the counts the
+  # summary already carries. Failing suites are reported by `FAIL` and are kept.
+  "^PASS ",
+  "^\\s*[\u2713\u221a] ",
+  "^Snapshots:\\s+0 total$",
+  "^Time:\\s",
+  "^Ran all test suites",
+  "^\\s*$",
+]
+on_empty = "jest: ok"
+
+[[tests.jest]]
+name = "a passing run reduces to its counts"
+input = """
+PASS __tests__/sum.test.js
+  \u2713 adds (3 ms)
+  \u2713 adds again (1 ms)
+
+Test Suites: 1 passed, 1 total
+Tests:       2 passed, 2 total
+Snapshots:   0 total
+Time:        0.394 s
+Ran all test suites.
+"""
+expected = """
+Test Suites: 1 passed, 1 total
+Tests:       2 passed, 2 total
+"""
+
+[[tests.jest]]
+name = "failure detail survives"
+input = """
+FAIL __tests__/bad.test.js
+  \u25cf broken
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 5
+    Received: 2
+
+      at Object.toBe (__tests__/bad.test.js:2:42)
+
+PASS __tests__/sum.test.js
+
+Test Suites: 1 failed, 1 passed, 2 total
+Tests:       1 failed, 2 passed, 3 total
+Snapshots:   0 total
+Time:        0.509 s, estimated 1 s
+Ran all test suites.
+"""
+expected = """
+FAIL __tests__/bad.test.js
+  \u25cf broken
+    expect(received).toBe(expected) // Object.is equality
+    Expected: 5
+    Received: 2
+      at Object.toBe (__tests__/bad.test.js:2:42)
+Test Suites: 1 failed, 1 passed, 2 total
+Tests:       1 failed, 2 passed, 3 total
+"""
+
+[[tests.jest]]
+name = "a non-zero snapshot count is retained"
+input = """
+PASS __tests__/sum.test.js
+Test Suites: 1 passed, 1 total
+Snapshots:   2 written, 2 total
+"""
+expected = """
+Test Suites: 1 passed, 1 total
+Snapshots:   2 written, 2 total
+"""

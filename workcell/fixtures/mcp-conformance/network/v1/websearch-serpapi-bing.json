@@ -1,0 +1,67 @@
+{
+  "fixtureVersion": 1,
+  "caseID": "network.websearch.serpapi-bing-lowering",
+  "provenance": [
+    "rust/crates/mcp-web/src/search/serpapi.rs",
+    "SerpApi Bing Search API documentation"
+  ],
+  "tool": "websearch",
+  "input": {
+    "query": "bing query",
+    "country": "gb",
+    "pageno": 2,
+    "safesearch": 1,
+    "limit": 7,
+    "timeoutSec": 23
+  },
+  "configuration": {
+    "enabled": true,
+    "backend": "serpapi-bing",
+    "credential": { "type": "api_key", "key": "serpapi-bing-secret" }
+  },
+  "setup": {
+    "mockResponses": [
+      {
+        "url": "https://serpapi.com/search.json",
+        "method": "GET",
+        "status": 200,
+        "headers": { "content-type": "application/json" },
+        "jsonBody": {
+          "organic_results": [
+            {
+              "title": "Bing result",
+              "link": "https://result.example.test/bing",
+              "snippet": "Bing result via SerpApi."
+            }
+          ]
+        }
+      }
+    ],
+    "unmatchedResponse": { "status": 404, "body": "not found" }
+  },
+  "expected": {
+    "contentText": "1. Bing result [serpapi-bing]\n   URL: https://result.example.test/bing\n   Bing result via SerpApi.",
+    "structuredContent": {
+      "kind": "websearch",
+      "backend": "serpapi",
+      "query": "bing query",
+      "resultsFound": 1,
+      "results": [
+        {
+          "title": "Bing result",
+          "url": "https://result.example.test/bing",
+          "snippet": "Bing result via SerpApi.",
+          "engine": "serpapi-bing"
+        }
+      ]
+    },
+    "requestIncludes": [
+      {
+        "method": "GET",
+        "url": "https://serpapi.com/search.json?api_key=serpapi-bing-secret&engine=bing&q=bing+query&cc=gb&first=11&safeSearch=Moderate",
+        "redirect": "error"
+      }
+    ],
+    "serializedOutputExcludes": ["serpapi-bing-secret"]
+  }
+}

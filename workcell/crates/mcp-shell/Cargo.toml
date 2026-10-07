@@ -1,0 +1,36 @@
+[package]
+name = "workcell-mcp-shell"
+description = "Typed bounded shell execution for Workcell"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[features]
+default = ["mcp"]
+mcp = ["dep:rmcp"]
+
+[dependencies]
+async-trait.workspace = true
+dunce.workspace = true
+rmcp = { workspace = true, optional = true }
+rustix.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+toml.workspace = true
+tree-sitter.workspace = true
+tree-sitter-bash.workspace = true
+workcell-output-filter = { path = "../output-filter" }
+workcell-tool-contract.workspace = true
+workcell-host-contract.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

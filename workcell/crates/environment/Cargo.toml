@@ -1,0 +1,28 @@
+[package]
+name = "workcell-environment"
+description = "Protocol-neutral Workcell execution environment inspection"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[features]
+default = ["mcp"]
+mcp = ["dep:rmcp"]
+
+[dependencies]
+rmcp = { workspace = true, optional = true }
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+workcell-tool-contract.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

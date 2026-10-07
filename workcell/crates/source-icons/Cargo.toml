@@ -1,0 +1,31 @@
+[package]
+name = "workcell-source-icons"
+description = "Safe source icon discovery and PNG normalization"
+readme = "README.md"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+base64.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+http.workspace = true
+image = { workspace = true, features = ["gif", "ico", "jpeg", "png", "webp"] }
+workcell-net = { path = "../net" }
+lru.workspace = true
+resvg = { version = "=0.47.0", default-features = false }
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+wiremock.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,1488 @@
+{
+  "fixtureVersion": 1,
+  "caseID": "catalog.code-graph.sdk-emitted.v1",
+  "catalogKind": "sdk-emitted",
+  "server": {
+    "name": "workcell-code-graph",
+    "version": "0.1.0"
+  },
+  "provenance": [
+    "rust/crates/mcp-code-graph/src/catalog.rs",
+    "rust/crates/mcp-code-graph/src/group.rs",
+    "rust/crates/mcp-code-graph/src/dispatch.rs"
+  ],
+  "expected": {
+    "tools": [
+      {
+        "name": "code_map",
+        "title": "Rank symbols in a tree",
+        "description": "Rank every symbol in a source tree by importance and return the top ones. Start here when you do not know a codebase.\n\n- Importance is personalized PageRank over a call graph recovered from source text by name.\n- Rows carry the defining file and line span, plus in/out reference counts.\n- `path` scopes the map to a subdirectory; absent, or empty, means the whole configured root.\n- The map stops at a directory that is its own repository, and at files the repository's .gitignore excludes. Anything skipped that way is named in the result; pass a nested repository as `path` to map it on its own terms.\n- Counts are FLOORS. Dynamic dispatch, callbacks, function pointers, trait objects and macro-generated call sites contribute no edge, so a count of 0 means none was found, never that none exists.\n- Crawling, parsing, ranking and result size are bounded by host-only policy, and every bound that fires is named in the result.",
+        "inputSchema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Root-relative subdirectory to scope the map to. Absent means the whole configured root, and an empty string is the same as absent."
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Maximum rows to return. Narrows the result; it can never widen it past the host ceiling."
+            }
+          },
+          "additionalProperties": false
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "The subtree that was mapped, root-relative. `.` is the whole root."
+            },
+            "symbols": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/RankedSymbol"
+              }
+            },
+            "shown": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "total": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0,
+              "description": "Symbols in the graph. Exceeds `shown` when the result window withheld some."
+            },
+            "truncated": {
+              "type": "boolean"
+            },
+            "countsFloor": {
+              "type": "boolean",
+              "description": "Always true. See the module docs."
+            },
+            "estimatedTokens": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "graph": {
+              "$ref": "#/definitions/GraphSummary"
+            }
+          },
+          "required": [
+            "path",
+            "symbols",
+            "shown",
+            "total",
+            "truncated",
+            "countsFloor",
+            "estimatedTokens",
+            "graph"
+          ],
+          "title": "CodeMapOutput",
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "definitions": {
+            "RankedSymbol": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "kind": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "lineStart": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "lineEnd": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "rank": {
+                  "type": "number",
+                  "format": "double",
+                  "description": "Personalized PageRank score. Comparable within one result, meaningless across two."
+                },
+                "callers": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0,
+                  "description": "Distinct symbols referencing this one. A floor."
+                },
+                "calls": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0,
+                  "description": "Distinct symbols this one references. A floor."
+                },
+                "testScope": {
+                  "type": "boolean",
+                  "description": "Whether the definition sits in test scope."
+                }
+              },
+              "required": [
+                "name",
+                "kind",
+                "path",
+                "lineStart",
+                "lineEnd",
+                "rank",
+                "callers",
+                "calls",
+                "testScope"
+              ],
+              "description": "One ranked symbol."
+            },
+            "GraphSummary": {
+              "type": "object",
+              "properties": {
+                "filesIndexed": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "filesSkipped": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "symbols": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "resolvedReferences": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0,
+                  "description": "References that resolved to a definition."
+                },
+                "unresolvedReferences": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0,
+                  "description": "References naming something the map never defined. Usually a call into a dependency."
+                },
+                "ambiguousReferences": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0,
+                  "description": "References matching more than one definition, whose weight was split rather than guessed."
+                },
+                "edges": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "prIterations": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0,
+                  "description": "Power iterations performed."
+                },
+                "prConverged": {
+                  "type": "boolean",
+                  "description": "Whether the iteration reached its residual tolerance.\n\nA truncated run produces a document that looks identical to a converged one and does not\nmean the same thing: it is a rank vector caught mid-descent."
+                },
+                "truncatedBy": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Bounds that stopped the crawl, extraction, or ranking, by name. Empty means none did."
+                },
+                "scanComplete": {
+                  "type": "boolean",
+                  "description": "Whether the traversal examined every candidate it produced."
+                },
+                "filesIgnored": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0,
+                  "description": "Files the tree's own `.gitignore` rules kept out of the map."
+                },
+                "prunedRepositories": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Directories not mapped because they are separate repositories.\n\nA vendored repository's symbols would compete with this project's in one rank vector, so the\nmap stops at the boundary. Naming one as `path` maps it on its own terms."
+                }
+              },
+              "required": [
+                "filesIndexed",
+                "filesSkipped",
+                "symbols",
+                "resolvedReferences",
+                "unresolvedReferences",
+                "ambiguousReferences",
+                "edges",
+                "prIterations",
+                "prConverged",
+                "truncatedBy",
+                "scanComplete",
+                "filesIgnored",
+                "prunedRepositories"
+              ],
+              "description": "What the graph run itself had to say.\n\nPresent on every result. A ranking produced from a truncated crawl and one produced from a\ncomplete crawl are different claims, and nothing downstream can tell them apart without this."
+            }
+          }
+        },
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        },
+        "_meta": {
+          "ai.workcell/presentation-profile": "code.map.v1",
+          "ai.workcell/contract": {
+            "id": "code.map.v1",
+            "version": "v1",
+            "resultVersion": "v1"
+          }
+        }
+      },
+      {
+        "name": "code_context",
+        "title": "Find code for a task",
+        "description": "Return the symbols worth reading before making a specific change. Describe the change in your own words.\n\n- `task` is prose: \"where do we invalidate the cache after a write\" works better than a bare identifier.\n- A router classifies the task as identifier-shaped or prose-shaped and reports which, and why.\n- Results fuse a lexical match against symbol names, paths and doc comments with the graph ranking. Only symbols that actually matched participate, so an unrelated task returns nothing rather than the repository's busiest utility.\n- `confidence` is derived from how far the top result separates from the rest. It is a measure of separation, never a claim of correctness, and a single result is always low.\n- Counts are FLOORS; see code_map.",
+        "inputSchema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "type": "object",
+          "properties": {
+            "task": {
+              "type": "string",
+              "minLength": 1,
+              "description": "The change you are about to make, in your own words."
+            },
+            "path": {
+              "type": "string",
+              "description": "Root-relative subdirectory to scope the map to. Absent means the whole configured root, and an empty string is the same as absent."
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Maximum rows to return. Narrows the result; it can never widen it past the host ceiling."
+            }
+          },
+          "required": [
+            "task"
+          ],
+          "additionalProperties": false
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "task": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "shape": {
+              "type": "string",
+              "description": "How the router read the task: `nameExact` or `conceptual`."
+            },
+            "shapeReason": {
+              "type": "string",
+              "description": "Why it read it that way, in one sentence."
+            },
+            "confidence": {
+              "type": "string",
+              "description": "`high`, `medium`, or `low`, derived from score separation. Never a claim of correctness."
+            },
+            "marginPercent": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0,
+              "description": "How far the top score sits above the head's median, as a percentage."
+            },
+            "results": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/RankedSymbol"
+              }
+            },
+            "shown": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "totalMatched": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0,
+              "description": "Symbols with any lexical match. Not every one is returned."
+            },
+            "truncated": {
+              "type": "boolean"
+            },
+            "countsFloor": {
+              "type": "boolean"
+            },
+            "estimatedTokens": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "graph": {
+              "$ref": "#/definitions/GraphSummary"
+            }
+          },
+          "required": [
+            "task",
+            "path",
+            "shape",
+            "shapeReason",
+            "confidence",
+            "marginPercent",
+            "results",
+            "shown",
+            "totalMatched",
+            "truncated",
+            "countsFloor",
+            "estimatedTokens",
+            "graph"
+          ],
+          "title": "CodeContextOutput",
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "definitions": {
+            "RankedSymbol": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "kind": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "lineStart": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "lineEnd": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "rank": {
+                  "type": "number",
+                  "format": "double",
+                  "description": "Personalized PageRank score. Comparable within one result, meaningless across two."
+                },
+                "callers": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0,
+                  "description": "Distinct symbols referencing this one. A floor."
+                },
+                "calls": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0,
+                  "description": "Distinct symbols this one references. A floor."
+                },
+                "testScope": {
+                  "type": "boolean",
+                  "description": "Whether the definition sits in test scope."
+                }
+              },
+              "required": [
+                "name",
+                "kind",
+                "path",
+                "lineStart",
+                "lineEnd",
+                "rank",
+                "callers",
+                "calls",
+                "testScope"
+              ],
+              "description": "One ranked symbol."
+            },
+            "GraphSummary": {
+              "type": "object",
+              "properties": {
+                "filesIndexed": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "filesSkipped": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "symbols": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "resolvedReferences": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0,
+                  "description": "References that resolved to a definition."
+                },
+                "unresolvedReferences": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0,
+                  "description": "References naming something the map never defined. Usually a call into a dependency."
+                },
+                "ambiguousReferences": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0,
+                  "description": "References matching more than one definition, whose weight was split rather than guessed."
+                },
+                "edges": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "prIterations": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0,
+                  "description": "Power iterations performed."
+                },
+                "prConverged": {
+                  "type": "boolean",
+                  "description": "Whether the iteration reached its residual tolerance.\n\nA truncated run produces a document that looks identical to a converged one and does not\nmean the same thing: it is a rank vector caught mid-descent."
+                },
+                "truncatedBy": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Bounds that stopped the crawl, extraction, or ranking, by name. Empty means none did."
+                },
+                "scanComplete": {
+                  "type": "boolean",
+                  "description": "Whether the traversal examined every candidate it produced."
+                },
+                "filesIgnored": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0,
+                  "description": "Files the tree's own `.gitignore` rules kept out of the map."
+                },
+                "prunedRepositories": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Directories not mapped because they are separate repositories.\n\nA vendored repository's symbols would compete with this project's in one rank vector, so the\nmap stops at the boundary. Naming one as `path` maps it on its own terms."
+                }
+              },
+              "required": [
+                "filesIndexed",
+                "filesSkipped",
+                "symbols",
+                "resolvedReferences",
+                "unresolvedReferences",
+                "ambiguousReferences",
+                "edges",
+                "prIterations",
+                "prConverged",
+                "truncatedBy",
+                "scanComplete",
+                "filesIgnored",
+                "prunedRepositories"
+              ],
+              "description": "What the graph run itself had to say.\n\nPresent on every result. A ranking produced from a truncated crawl and one produced from a\ncomplete crawl are different claims, and nothing downstream can tell them apart without this."
+            }
+          }
+        },
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        },
+        "_meta": {
+          "ai.workcell/presentation-profile": "code.map.v1",
+          "ai.workcell/contract": {
+            "id": "code.context.v1",
+            "version": "v1",
+            "resultVersion": "v1"
+          }
+        }
+      },
+      {
+        "name": "code_refs",
+        "title": "List references to a symbol",
+        "description": "List the symbols that reference a given symbol, or the symbols it references.\n\n- `direction` is `callers` (default) or `callees`. The two do not measure the same thing and the result names its own unit.\n- `symbol` may be a bare name or `path::name` to disambiguate. A name matching several definitions returns their union and says so, rather than silently picking one.\n- An unknown symbol is REFUSED with did-you-mean candidates, not answered with zero. A symbol that exists and has no callers returns zero.\n- Counts are FLOORS; see code_map.",
+        "inputSchema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "type": "object",
+          "properties": {
+            "symbol": {
+              "type": "string",
+              "minLength": 1,
+              "description": "A symbol name, optionally qualified as `path::name` to disambiguate."
+            },
+            "direction": {
+              "type": "string",
+              "enum": [
+                "callers",
+                "callees"
+              ],
+              "default": "callers",
+              "description": "`callers` lists symbols referencing this one; `callees` lists the ones it references."
+            },
+            "path": {
+              "type": "string",
+              "description": "Root-relative subdirectory to scope the map to. Absent means the whole configured root, and an empty string is the same as absent."
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Maximum rows to return. Narrows the result; it can never widen it past the host ceiling."
+            }
+          },
+          "required": [
+            "symbol"
+          ],
+          "additionalProperties": false
+        },
+        "outputSchema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "symbol": {
+                  "type": "string"
+                },
+                "direction": {
+                  "type": "string"
+                },
+                "unit": {
+                  "type": "string",
+                  "description": "What one row counts, named for the direction."
+                },
+                "matched": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/definitions/SymbolRef"
+                  },
+                  "description": "Definitions the selector matched. More than one means the answer is a union."
+                },
+                "references": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/definitions/RankedSymbol"
+                  }
+                },
+                "shown": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "total": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "truncated": {
+                  "type": "boolean"
+                },
+                "countsFloor": {
+                  "type": "boolean"
+                },
+                "estimatedTokens": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "graph": {
+                  "$ref": "#/definitions/GraphSummary"
+                }
+              },
+              "required": [
+                "symbol",
+                "direction",
+                "unit",
+                "matched",
+                "references",
+                "shown",
+                "total",
+                "truncated",
+                "countsFloor",
+                "estimatedTokens",
+                "graph"
+              ],
+              "title": "CodeRefsOutput"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "refused": {
+                  "type": "boolean",
+                  "description": "Always true, so a consumer can branch without inspecting the shape."
+                },
+                "selector": {
+                  "type": "string"
+                },
+                "reason": {
+                  "type": "string"
+                },
+                "didYouMean": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Nearest known symbol names, by edit distance. Empty when nothing is close."
+                },
+                "symbolsKnown": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "refused",
+                "selector",
+                "reason",
+                "didYouMean",
+                "symbolsKnown"
+              ],
+              "description": "A selector that named nothing.\n\nDistinct from an empty result on purpose. `code_refs` on a symbol with no callers is the answer\n`0`; `code_refs` on a misspelled symbol is not an answer at all, and returning `0` for it would\nlet a caller conclude something false about code that exists.",
+              "title": "SelectorRefusal"
+            }
+          ],
+          "definitions": {
+            "SymbolRef": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "kind": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "lineStart": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "lineEnd": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "name",
+                "kind",
+                "path",
+                "lineStart",
+                "lineEnd"
+              ],
+              "description": "A symbol named without a rank, used where ordering comes from something else."
+            },
+            "RankedSymbol": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "kind": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "lineStart": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "lineEnd": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "rank": {
+                  "type": "number",
+                  "format": "double",
+                  "description": "Personalized PageRank score. Comparable within one result, meaningless across two."
+                },
+                "callers": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0,
+                  "description": "Distinct symbols referencing this one. A floor."
+                },
+                "calls": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0,
+                  "description": "Distinct symbols this one references. A floor."
+                },
+                "testScope": {
+                  "type": "boolean",
+                  "description": "Whether the definition sits in test scope."
+                }
+              },
+              "required": [
+                "name",
+                "kind",
+                "path",
+                "lineStart",
+                "lineEnd",
+                "rank",
+                "callers",
+                "calls",
+                "testScope"
+              ],
+              "description": "One ranked symbol."
+            },
+            "GraphSummary": {
+              "type": "object",
+              "properties": {
+                "filesIndexed": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "filesSkipped": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "symbols": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "resolvedReferences": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0,
+                  "description": "References that resolved to a definition."
+                },
+                "unresolvedReferences": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0,
+                  "description": "References naming something the map never defined. Usually a call into a dependency."
+                },
+                "ambiguousReferences": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0,
+                  "description": "References matching more than one definition, whose weight was split rather than guessed."
+                },
+                "edges": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "prIterations": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0,
+                  "description": "Power iterations performed."
+                },
+                "prConverged": {
+                  "type": "boolean",
+                  "description": "Whether the iteration reached its residual tolerance.\n\nA truncated run produces a document that looks identical to a converged one and does not\nmean the same thing: it is a rank vector caught mid-descent."
+                },
+                "truncatedBy": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Bounds that stopped the crawl, extraction, or ranking, by name. Empty means none did."
+                },
+                "scanComplete": {
+                  "type": "boolean",
+                  "description": "Whether the traversal examined every candidate it produced."
+                },
+                "filesIgnored": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0,
+                  "description": "Files the tree's own `.gitignore` rules kept out of the map."
+                },
+                "prunedRepositories": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Directories not mapped because they are separate repositories.\n\nA vendored repository's symbols would compete with this project's in one rank vector, so the\nmap stops at the boundary. Naming one as `path` maps it on its own terms."
+                }
+              },
+              "required": [
+                "filesIndexed",
+                "filesSkipped",
+                "symbols",
+                "resolvedReferences",
+                "unresolvedReferences",
+                "ambiguousReferences",
+                "edges",
+                "prIterations",
+                "prConverged",
+                "truncatedBy",
+                "scanComplete",
+                "filesIgnored",
+                "prunedRepositories"
+              ],
+              "description": "What the graph run itself had to say.\n\nPresent on every result. A ranking produced from a truncated crawl and one produced from a\ncomplete crawl are different claims, and nothing downstream can tell them apart without this."
+            }
+          }
+        },
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        },
+        "_meta": {
+          "ai.workcell/presentation-profile": "code.map.v1",
+          "ai.workcell/contract": {
+            "id": "code.refs.v1",
+            "version": "v1",
+            "resultVersion": "v1"
+          }
+        }
+      },
+      {
+        "name": "code_impact",
+        "title": "Show change blast radius",
+        "description": "Show what a change to a symbol could reach, and which tests already cover it.\n\n- Walks call edges backwards from the symbol, up to `depth` hops (default 3, host-capped).\n- Rows report their hop distance, shortest-path first, so the near blast radius is distinguishable from the far one.\n- `testsReaching` is the subset sitting in test scope, determined syntactically from the enclosing constructs rather than from the file path.\n- Reach is a FLOOR. A symbol invoked only through dynamic dispatch will not appear, so an empty result is not evidence that a change is safe.",
+        "inputSchema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "type": "object",
+          "properties": {
+            "symbol": {
+              "type": "string",
+              "minLength": 1,
+              "description": "A symbol name, optionally qualified as `path::name` to disambiguate."
+            },
+            "depth": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 8,
+              "default": 3,
+              "description": "Hops to walk backwards along call edges. Beyond a few hops a reachability set describes the repository rather than a blast radius."
+            },
+            "path": {
+              "type": "string",
+              "description": "Root-relative subdirectory to scope the map to. Absent means the whole configured root, and an empty string is the same as absent."
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Maximum rows to return. Narrows the result; it can never widen it past the host ceiling."
+            }
+          },
+          "required": [
+            "symbol"
+          ],
+          "additionalProperties": false
+        },
+        "outputSchema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "symbol": {
+                  "type": "string"
+                },
+                "depth": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "matched": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/definitions/SymbolRef"
+                  }
+                },
+                "reached": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/definitions/ReachedSymbol"
+                  },
+                  "description": "Symbols that reach the seed within `depth` hops, nearest first."
+                },
+                "testsReaching": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/definitions/ReachedSymbol"
+                  },
+                  "description": "The subset of `reached` sitting in test scope, which is the existing coverage of this change."
+                },
+                "shown": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "total": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "truncated": {
+                  "type": "boolean"
+                },
+                "countsFloor": {
+                  "type": "boolean"
+                },
+                "estimatedTokens": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "graph": {
+                  "$ref": "#/definitions/GraphSummary"
+                }
+              },
+              "required": [
+                "symbol",
+                "depth",
+                "matched",
+                "reached",
+                "testsReaching",
+                "shown",
+                "total",
+                "truncated",
+                "countsFloor",
+                "estimatedTokens",
+                "graph"
+              ],
+              "title": "CodeImpactOutput"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "refused": {
+                  "type": "boolean",
+                  "description": "Always true, so a consumer can branch without inspecting the shape."
+                },
+                "selector": {
+                  "type": "string"
+                },
+                "reason": {
+                  "type": "string"
+                },
+                "didYouMean": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Nearest known symbol names, by edit distance. Empty when nothing is close."
+                },
+                "symbolsKnown": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "refused",
+                "selector",
+                "reason",
+                "didYouMean",
+                "symbolsKnown"
+              ],
+              "description": "A selector that named nothing.\n\nDistinct from an empty result on purpose. `code_refs` on a symbol with no callers is the answer\n`0`; `code_refs` on a misspelled symbol is not an answer at all, and returning `0` for it would\nlet a caller conclude something false about code that exists.",
+              "title": "SelectorRefusal"
+            }
+          ],
+          "definitions": {
+            "SymbolRef": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "kind": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "lineStart": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "lineEnd": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "name",
+                "kind",
+                "path",
+                "lineStart",
+                "lineEnd"
+              ],
+              "description": "A symbol named without a rank, used where ordering comes from something else."
+            },
+            "ReachedSymbol": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "kind": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "lineStart": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "lineEnd": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "hops": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0,
+                  "description": "Edges traversed from the seed. One means a direct caller."
+                },
+                "testScope": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "name",
+                "kind",
+                "path",
+                "lineStart",
+                "lineEnd",
+                "hops",
+                "testScope"
+              ],
+              "description": "A symbol reached by walking the graph, with how far away it is."
+            },
+            "GraphSummary": {
+              "type": "object",
+              "properties": {
+                "filesIndexed": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "filesSkipped": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "symbols": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "resolvedReferences": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0,
+                  "description": "References that resolved to a definition."
+                },
+                "unresolvedReferences": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0,
+                  "description": "References naming something the map never defined. Usually a call into a dependency."
+                },
+                "ambiguousReferences": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0,
+                  "description": "References matching more than one definition, whose weight was split rather than guessed."
+                },
+                "edges": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "prIterations": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0,
+                  "description": "Power iterations performed."
+                },
+                "prConverged": {
+                  "type": "boolean",
+                  "description": "Whether the iteration reached its residual tolerance.\n\nA truncated run produces a document that looks identical to a converged one and does not\nmean the same thing: it is a rank vector caught mid-descent."
+                },
+                "truncatedBy": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Bounds that stopped the crawl, extraction, or ranking, by name. Empty means none did."
+                },
+                "scanComplete": {
+                  "type": "boolean",
+                  "description": "Whether the traversal examined every candidate it produced."
+                },
+                "filesIgnored": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0,
+                  "description": "Files the tree's own `.gitignore` rules kept out of the map."
+                },
+                "prunedRepositories": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Directories not mapped because they are separate repositories.\n\nA vendored repository's symbols would compete with this project's in one rank vector, so the\nmap stops at the boundary. Naming one as `path` maps it on its own terms."
+                }
+              },
+              "required": [
+                "filesIndexed",
+                "filesSkipped",
+                "symbols",
+                "resolvedReferences",
+                "unresolvedReferences",
+                "ambiguousReferences",
+                "edges",
+                "prIterations",
+                "prConverged",
+                "truncatedBy",
+                "scanComplete",
+                "filesIgnored",
+                "prunedRepositories"
+              ],
+              "description": "What the graph run itself had to say.\n\nPresent on every result. A ranking produced from a truncated crawl and one produced from a\ncomplete crawl are different claims, and nothing downstream can tell them apart without this."
+            }
+          }
+        },
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        },
+        "_meta": {
+          "ai.workcell/presentation-profile": "code.impact.v1",
+          "ai.workcell/contract": {
+            "id": "code.impact.v1",
+            "version": "v1",
+            "resultVersion": "v1"
+          }
+        }
+      },
+      {
+        "name": "code_expand",
+        "title": "Expand one symbol",
+        "description": "Return one symbol's source together with its immediate callers and callees.\n\n- `symbol` may be a bare name or `path::name`. When several definitions match, the highest-ranked one is expanded.\n- When the symbol occupies most of a small file, the whole file is returned instead and the result says why: the bundle would cost more than the file it was assembled from.\n- Neighbour lists are FLOORS; see code_map.",
+        "inputSchema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "type": "object",
+          "properties": {
+            "symbol": {
+              "type": "string",
+              "minLength": 1,
+              "description": "A symbol name, optionally qualified as `path::name` to disambiguate."
+            },
+            "path": {
+              "type": "string",
+              "description": "Root-relative subdirectory to scope the map to. Absent means the whole configured root, and an empty string is the same as absent."
+            }
+          },
+          "required": [
+            "symbol"
+          ],
+          "additionalProperties": false
+        },
+        "outputSchema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "symbol": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "kind": {
+                  "type": "string"
+                },
+                "lineStart": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "lineEnd": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "source": {
+                  "type": "string"
+                },
+                "callers": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/definitions/SymbolRef"
+                  },
+                  "description": "Symbols referencing this one. A floor."
+                },
+                "callees": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/definitions/SymbolRef"
+                  },
+                  "description": "Symbols this one references. A floor."
+                },
+                "servedWholeFile": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Set when the whole file was served instead of the ranked bundle.\n\nThe bundle can cost more than the file it was assembled from. When it does, the file is the\ncheaper and more complete answer, and pretending otherwise sells a summary at a premium."
+                },
+                "truncated": {
+                  "type": "boolean"
+                },
+                "countsFloor": {
+                  "type": "boolean"
+                },
+                "estimatedTokens": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "graph": {
+                  "$ref": "#/definitions/GraphSummary"
+                }
+              },
+              "required": [
+                "symbol",
+                "path",
+                "kind",
+                "lineStart",
+                "lineEnd",
+                "source",
+                "callers",
+                "callees",
+                "truncated",
+                "countsFloor",
+                "estimatedTokens",
+                "graph"
+              ],
+              "title": "CodeExpandOutput"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "refused": {
+                  "type": "boolean",
+                  "description": "Always true, so a consumer can branch without inspecting the shape."
+                },
+                "selector": {
+                  "type": "string"
+                },
+                "reason": {
+                  "type": "string"
+                },
+                "didYouMean": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Nearest known symbol names, by edit distance. Empty when nothing is close."
+                },
+                "symbolsKnown": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "refused",
+                "selector",
+                "reason",
+                "didYouMean",
+                "symbolsKnown"
+              ],
+              "description": "A selector that named nothing.\n\nDistinct from an empty result on purpose. `code_refs` on a symbol with no callers is the answer\n`0`; `code_refs` on a misspelled symbol is not an answer at all, and returning `0` for it would\nlet a caller conclude something false about code that exists.",
+              "title": "SelectorRefusal"
+            }
+          ],
+          "definitions": {
+            "SymbolRef": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "kind": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "lineStart": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "lineEnd": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "name",
+                "kind",
+                "path",
+                "lineStart",
+                "lineEnd"
+              ],
+              "description": "A symbol named without a rank, used where ordering comes from something else."
+            },
+            "GraphSummary": {
+              "type": "object",
+              "properties": {
+                "filesIndexed": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "filesSkipped": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "symbols": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "resolvedReferences": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0,
+                  "description": "References that resolved to a definition."
+                },
+                "unresolvedReferences": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0,
+                  "description": "References naming something the map never defined. Usually a call into a dependency."
+                },
+                "ambiguousReferences": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0,
+                  "description": "References matching more than one definition, whose weight was split rather than guessed."
+                },
+                "edges": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "prIterations": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0,
+                  "description": "Power iterations performed."
+                },
+                "prConverged": {
+                  "type": "boolean",
+                  "description": "Whether the iteration reached its residual tolerance.\n\nA truncated run produces a document that looks identical to a converged one and does not\nmean the same thing: it is a rank vector caught mid-descent."
+                },
+                "truncatedBy": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Bounds that stopped the crawl, extraction, or ranking, by name. Empty means none did."
+                },
+                "scanComplete": {
+                  "type": "boolean",
+                  "description": "Whether the traversal examined every candidate it produced."
+                },
+                "filesIgnored": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0,
+                  "description": "Files the tree's own `.gitignore` rules kept out of the map."
+                },
+                "prunedRepositories": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Directories not mapped because they are separate repositories.\n\nA vendored repository's symbols would compete with this project's in one rank vector, so the\nmap stops at the boundary. Naming one as `path` maps it on its own terms."
+                }
+              },
+              "required": [
+                "filesIndexed",
+                "filesSkipped",
+                "symbols",
+                "resolvedReferences",
+                "unresolvedReferences",
+                "ambiguousReferences",
+                "edges",
+                "prIterations",
+                "prConverged",
+                "truncatedBy",
+                "scanComplete",
+                "filesIgnored",
+                "prunedRepositories"
+              ],
+              "description": "What the graph run itself had to say.\n\nPresent on every result. A ranking produced from a truncated crawl and one produced from a\ncomplete crawl are different claims, and nothing downstream can tell them apart without this."
+            }
+          }
+        },
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        },
+        "_meta": {
+          "ai.workcell/presentation-profile": "code.expand.v1",
+          "ai.workcell/contract": {
+            "id": "code.expand.v1",
+            "version": "v1",
+            "resultVersion": "v1"
+          }
+        }
+      }
+    ]
+  }
+}

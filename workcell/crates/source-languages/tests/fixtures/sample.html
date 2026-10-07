@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Workcell fixture</title>
+    <link rel="stylesheet" href="sample.css" />
+    <style>
+      #app-shell {
+        display: grid;
+      }
+    </style>
+  </head>
+  <body>
+    <header id="masthead">
+      <h1>Workcell</h1>
+      <nav id="primary-nav">
+        <a href="#overview">Overview</a>
+        <a href="#details">Details</a>
+      </nav>
+    </header>
+
+    <main id="app-shell">
+      <section id="overview">
+        <h2>Overview</h2>
+        <p>A fixture document for the HTML tags query.</p>
+      </section>
+
+      <section id="details">
+        <h2>Details</h2>
+        <article id="detail-card">
+          <h3>Card</h3>
+          <form id="lookup-form">
+            <label for="query">Query</label>
+            <input id="query" name="query" type="text" />
+            <button id="submit" type="submit">Search</button>
+          </form>
+        </article>
+      </section>
+
+      <table id="results">
+        <tr>
+          <td>empty</td>
+        </tr>
+      </table>
+    </main>
+
+    <footer id="colophon">
+      <p>Fixture</p>
+    </footer>
+
+    <template id="row-template">
+      <tr><td></td></tr>
+    </template>
+
+    <script src="vendor.js"></script>
+    <script>
+      const shell = document.getElementById("app-shell");
+    </script>
+  </body>
+</html>

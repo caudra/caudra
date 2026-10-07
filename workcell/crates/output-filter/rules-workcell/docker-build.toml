@@ -1,0 +1,82 @@
+[filters.docker-build]
+description = "Compact docker build output for the BuildKit and legacy builders"
+match_command = "^docker\\s+(build|buildx\\s+build)\\b"
+filter_stderr = true
+strip_lines_matching = [
+  "^#\\d+ (DONE|CACHED|transferring|resolve |extracting |exporting |naming to |writing image|preparing|sha256:)",
+  "^#\\d+ \\[internal\\] load",
+  "^#\\d+ extracting",
+  "^#0 building with",
+  "^Sending build context to Docker daemon",
+  "^ ---> Running in [0-9a-f]+$",
+  "^ ---> [0-9a-f]+$",
+  "^(Removing|Removed) intermediate container",
+  "^ ---> (Removed|Using cache)",
+  "^[0-9a-f]{8,}: (Pulling fs layer|Waiting|Downloading|Verifying Checksum|Download complete|Extracting|Pull complete|Already exists)",
+  "^Digest: sha256:",
+  "^Status: (Downloaded|Image is up to date)",
+  "^DEPRECATED: The legacy builder",
+  "^\\s+Install the buildx component",
+  "^\\s+https://docs\\.docker\\.com/go/buildx/",
+  "^\\s*$",
+]
+on_empty = "docker build: ok"
+
+[[tests.docker-build]]
+name = "buildkit progress is dropped and step output kept"
+input = """
+#0 building with "default" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile: 168B done
+#1 DONE 0.0s
+
+#5 [2/5] RUN echo "step one"
+#5 0.321 step one
+#5 DONE 1.0s
+
+#9 exporting to image
+#9 writing image sha256:64995dd0 done
+#9 naming to docker.io/library/demo:t1 0.0s done
+#9 DONE 0.3s
+"""
+expected = """
+#5 [2/5] RUN echo "step one"
+#5 0.321 step one
+"""
+
+[[tests.docker-build]]
+name = "legacy builder progress is dropped and step output kept"
+input = """
+Sending build context to Docker daemon  2.048kB
+Step 1/4 : FROM ubuntu:24.04
+ ---> a6f81fb630d5
+Step 2/4 : RUN echo "step one"
+ ---> Running in ff0ac5ce6e0f
+step one
+ ---> Removed intermediate container ff0ac5ce6e0f
+ ---> d8f9f51cbe96
+Successfully built 76a287194304
+Successfully tagged demo:t1
+"""
+expected = """
+Step 1/4 : FROM ubuntu:24.04
+Step 2/4 : RUN echo "step one"
+step one
+Successfully built 76a287194304
+Successfully tagged demo:t1
+"""
+
+[[tests.docker-build]]
+name = "build errors survive"
+input = """
+#5 [2/2] RUN this-command-does-not-exist
+#5 0.399 /bin/sh: this-command-does-not-exist: not found
+#5 ERROR: process "/bin/sh -c this-command-does-not-exist" did not complete successfully: exit code: 127
+#5 DONE 0.4s
+"""
+expected = """
+#5 [2/2] RUN this-command-does-not-exist
+#5 0.399 /bin/sh: this-command-does-not-exist: not found
+#5 ERROR: process "/bin/sh -c this-command-does-not-exist" did not complete successfully: exit code: 127
+"""

@@ -1,0 +1,18 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: catalog
+  labels:
+    app: catalog
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+        - name: server
+          image: catalog:latest
+          ports:
+            - containerPort: 8080
+      volumes:
+        - name: cache
+          emptyDir: {}

@@ -1,0 +1,8 @@
+/target/
+/.env
+*.env.local
+*.log
+.DS_Store
+external_repos/
+__pycache__/
+

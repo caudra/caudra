@@ -1,0 +1,33 @@
+{
+  "fixtureVersion": 1,
+  "caseID": "network.websearch.unconfigured-error-output",
+  "provenance": [
+    "rust/crates/mcp-web/src/search.rs",
+    "rust/crates/mcp-web/tests/web_tools.rs"
+  ],
+  "tool": "websearch",
+  "input": {
+    "query": "opencode plugins"
+  },
+  "configuration": null,
+  "setup": {
+    "environment": {
+      "SEARXNG_URL": null,
+      "SEARXNG_USER": null,
+      "SEARXNG_PASSWORD": null
+    }
+  },
+  "expected": {
+    "contentText": "Error: SEARXNG_URL is not configured. Set it on the Workcell server environment to enable websearch.",
+    "structuredContent": {
+      "kind": "websearch",
+      "backend": "searxng",
+      "query": "opencode plugins",
+      "resultsFound": 0,
+      "results": [],
+      "error": true,
+      "errorMessage": "SEARXNG_URL is not configured. Set it on the Workcell server environment to enable websearch."
+    },
+    "requests": []
+  }
+}

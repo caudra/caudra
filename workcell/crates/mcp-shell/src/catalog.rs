@@ -1,0 +1,137 @@
+//! Protocol-neutral contract metadata and optional MCP conversion for the shell executor.
+//!
+//! The JSON schema is an admission contract, not a security boundary; dispatch validates again.
+//! An MCP client may use annotations and presentation metadata for UX, but the server never trusts
+//! clients to enforce either the unsafe-execution warning or argument constraints.
+
+use crate::types::{DEFAULT_TIMEOUT_SECS, MAX_TIMEOUT_SECS, ShellOutput};
+#[cfg(feature = "mcp")]
+use rmcp::model::{MetaObject, Tool, ToolAnnotations};
+use schemars::{JsonSchema, SchemaGenerator, generate::SchemaSettings};
+use serde_json::{Map, Value, json};
+#[cfg(feature = "mcp")]
+use std::sync::Arc;
+use workcell_tool_contract::{ToolAnnotations as NeutralAnnotations, ToolContract, ToolSpec};
+
+const DESCRIPTION: &str = r#"Execute a Bash command on the MCP server host.
+
+Usage notes:
+- The command parameter is required.
+- Commands must be valid MCP JSON strings, are bounded to 65536 UTF-8 bytes, and are authorized by immutable operator policy before execution. Malformed JSON or non-UTF-8 request payloads are rejected by the MCP transport before tool dispatch.
+- timeoutSec is optional, in seconds from 1 to 21600 (six hours). Omit it unless the command is expected to outlast the 120 second default, so a hung command is reported early. A value outside that range is rejected rather than clamped.
+- A command that does not exit on its own, such as a server or a watcher, runs until its execution timeout unless cancelled.
+- Use workdir instead of embedding cd commands. It must resolve inside the configured root and defaults to ".".
+- Only the initial working directory is root-confined. Execution is unsafe and unsandboxed: commands can mutate host files, access the network, and read inherited environment variables.
+- Prefer the dedicated file tools when they are available and fit the operation, and prefer the code execution tool for pure computation such as arithmetic, statistics, string processing, and JSON reshaping, because it runs isolated from the host.
+- To read part of a file, use file_read with offset and limit rather than sed, awk, head, or tail.
+- Always quote file paths that contain spaces.
+- Non-zero exits are completed results with an exit code so the caller can inspect and continue.
+- Output is streamed through MCP progress notifications; the final result contains bounded tails and completion accounting.
+- The result is already bounded per stream and, by default, reduced by a built-in filter that keeps errors, warnings, and summaries. Run the command directly instead of piping into head or tail: blind truncation defeats that filter entirely, because it applies only to a single-program command, and it withholds live output until the process exits. Piping into rg or grep to search output is fine.
+- Prefer separate streams to 2>&1. Merged output is filtered as stdout, so stderr diagnostics become subject to stdout line caps instead of being carried in full.
+- Descendants that retain output pipes after the command exits are terminated."#;
+
+#[must_use]
+#[cfg(feature = "mcp")]
+pub fn catalog() -> Vec<Tool> {
+    specs().iter().map(to_mcp_tool).collect()
+}
+
+#[must_use]
+pub fn specs() -> Vec<ToolSpec> {
+    // Reject unknown fields to keep client mistakes from silently changing execution semantics.
+    let schema = json!({"type":"object","additionalProperties":false,"properties":{"command":{"type":"string","minLength":1,"description":"Bash command to execute on the MCP server host."},"timeoutSec":{"type":"integer","minimum":1,"maximum":MAX_TIMEOUT_SECS,"default":DEFAULT_TIMEOUT_SECS,"description":"Optional timeout in seconds, from 1 to 21600. Omit it for the 120 second default unless the command needs longer; a value outside that range is rejected."},"workdir":{"type":"string","minLength":1,"description":"Optional configured-root-relative or absolute initial working directory inside the configured root."}},"required":["command"],"$schema":"http://json-schema.org/draft-07/schema#"});
+    // Destructive/idempotent annotations are presentation hints only. The explicit description is
+    // the durable warning that arbitrary commands inherit files, network, and environment access.
+    vec![
+        ToolSpec::new(
+            "shell",
+            Some("Execute shell command"),
+            DESCRIPTION,
+            schema.as_object().expect("schema object").clone(),
+            NeutralAnnotations {
+                read_only_hint: Some(false),
+                destructive_hint: Some(true),
+                idempotent_hint: Some(false),
+                open_world_hint: Some(true),
+            },
+            "shell.result.v1",
+            ToolContract::new("shell.execution.v1", "v1", "v1"),
+        )
+        .with_output_schema(output_schema::<ShellOutput>()),
+    ]
+}
+
+#[cfg(feature = "mcp")]
+fn to_mcp_tool(spec: &ToolSpec) -> Tool {
+    let tool = Tool::new(
+        spec.name,
+        spec.description.clone(),
+        Arc::new(spec.input_schema.clone()),
+    );
+    let tool = match spec.title {
+        Some(title) => tool.with_title(title),
+        None => tool,
+    };
+    let tool = tool.with_raw_output_schema(Arc::new(
+        spec.output_schema.clone().expect("shell output schema"),
+    ));
+    tool.with_annotations(ToolAnnotations::from_raw(
+        None,
+        spec.annotations.read_only_hint,
+        spec.annotations.destructive_hint,
+        spec.annotations.idempotent_hint,
+        spec.annotations.open_world_hint,
+    ))
+    .with_meta(MetaObject(spec.extension_metadata()))
+}
+
+fn output_schema<T: JsonSchema>() -> Map<String, Value> {
+    Value::from(SchemaGenerator::new(SchemaSettings::draft07()).into_root_schema_for::<T>())
+        .as_object()
+        .expect("output schema is an object")
+        .clone()
+}
+
+#[cfg(all(test, feature = "mcp"))]
+mod tests {
+    use super::*;
+    #[test]
+    fn uses_standard_presentation_key() {
+        let tools = catalog();
+        let specs = specs();
+        assert_eq!(tools[0].name, "shell");
+        let description = tools[0].description.as_deref().expect("tool description");
+        assert!(description.contains("Only the initial working directory"));
+        assert!(description.contains("unsafe and unsandboxed"));
+        // Cross-tool steering only works when both descriptions agree on the preference.
+        assert!(description.contains("prefer the code execution tool for pure computation"));
+        // Naming the replacement is what displaces the paging shape a model reaches for by
+        // habit. "Prefer the dedicated file tools" alone is too abstract to compete with a
+        // remembered `sed -n '1,140p'`.
+        assert!(description.contains("use file_read with offset and limit"));
+        // A caller that truncates before the server sees the output defeats the rule corpus, which
+        // applies only to a single-program command, and suppresses live progress. The exemption for
+        // rg and grep keeps this consistent with the filesystem catalog's guidance to search command
+        // output with a pipeline; that agreement cannot be asserted here because this crate does not
+        // depend on mcp-files.
+        assert!(description.contains("instead of piping into head or tail"));
+        assert!(description.contains("Piping into rg or grep to search output is fine"));
+        assert!(description.contains("Prefer separate streams to 2>&1"));
+        assert!(description.contains("runs until its execution timeout unless cancelled"));
+        assert!(description.contains("Descendants that retain output pipes"));
+        assert!(!description.contains("holds the call"));
+        assert!(!description.contains("Background execution is unsupported"));
+        assert_eq!(
+            tools[0].input_schema["properties"]["timeoutSec"]["description"],
+            "Optional timeout in seconds, from 1 to 21600. Omit it for the 120 second default unless the command needs longer; a value outside that range is rejected."
+        );
+        assert_eq!(
+            tools[0].meta.as_ref().unwrap().0[workcell_tool_contract::PRESENTATION_METADATA_KEY],
+            "shell.result.v1"
+        );
+        assert_eq!(specs[0].name, tools[0].name);
+        assert_eq!(specs[0].input_schema, *tools[0].input_schema);
+        assert_eq!(specs[0].contract_id, "shell.execution.v1");
+    }
+}

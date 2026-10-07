@@ -1,0 +1,551 @@
+# Security Policy
+
+## Reporting
+
+Report suspected vulnerabilities privately through GitHub Security Advisories for
+`tensorninja/workcell-mcp`. Do not open a public issue for an unpatched vulnerability or include live
+credentials, private paths, or exploit data in public logs.
+
+## Boundary
+
+Workcell is an execution server, not a sandbox. Filesystem and shell tools run with the operating-system
+identity, mounts, network, capabilities, limits, and credentials granted to the Workcell process.
+Operators are responsible for providing the intended isolation boundary.
+
+When the web tool group is enabled, `websearch` defaults to the credential-free hosted Exa MCP service
+at `https://mcp.exa.ai/mcp`. A search call sends the query and network metadata outside the Workcell
+boundary. Exa is a third-party availability, privacy, terms, and supply-chain dependency and may apply
+anonymous rate limits. Set `WORKCELL_WEBSEARCH_BACKEND=disabled` to retain `webfetch` without search
+egress, or configure another backend. Workcell uses a fixed HTTPS origin, disables redirects and
+ambient environment proxies, bounds responses, and treats remote MCP content and metadata as
+untrusted data.
+
+Web tools honor an operator-configured outbound proxy, taken from the conventional proxy environment
+or from `--http-proxy`/`WORKCELL_MCP_HTTP_PROXY`, and covering `webfetch`, every `websearch` backend,
+and source icons. The selection is a startup snapshot: it is read once, and because a shell command
+changes only its own children's environment, no tool call can influence it. A malformed value stops
+startup instead of falling back to a direct dial.
+
+The `shell` tool forwards the conventional proxy variables to every command it runs, verbatim and
+including credentials, because withholding them makes every network-using command fail closed inside
+a guest whose only egress is an enforcing proxy. A credentialed proxy URL is therefore readable by
+any admitted command; prefer a proxy that authorizes the source over one that requires a password in
+the URL. The Workcell-specific settings do not constrain a shell child, and `--no-http-proxy` does not
+remove an ambient variable from a command's environment. `execution.networkAccess` reports `proxied`
+when such a variable is observed, disclosing presence only.
+
+A proxied request is not resolved by Workcell. Scheme, URL-credential, special-use-hostname, and
+IP-literal policy still reject targets locally before the proxy is contacted, but the address
+decision for a hostname, including DNS rebinding defense, is delegated to the proxy. Deploy this only
+with a proxy that re-checks the resolved address before dialling. Hosts matched by a bypass rule keep
+the full direct path, including resolution and connector pinning.
+
+Provider origins are HTTPS, so a non-intercepting proxy observes only the `CONNECT` target and never a
+search credential. An intercepting proxy trusted by the container's certificate store terminates TLS
+and can read provider credentials and fetched content; that is an operator decision.
+
+Source-icon lookup is disabled by default. `--web-icons` or `WORKCELL_WEB_ICONS=true` opts in for both
+web tools and may issue additional page, icon-link, and fallback favicon requests to public origins.
+Disabled mode omits provider-supplied inline icon data as well as locally resolved icons.
+
+File mutation authority is immutable process configuration. Without `--allow-write` the server omits
+`file_write`, `file_edit`, and `file_apply_patch` from its catalog and does not route calls to those
+names, and the filesystem crate denies direct native calls independently. No tool argument can relax
+this, and the mutation schemas reject unknown fields so a stale argument cannot be dropped into an
+unintended write.
+
+Reviewed transfer adds the byte route `GET|POST /files` because file bytes do not fit bounded MCP tool
+results. It requires an operator-owned `--transfer-root`, authenticated remote-host discovery, a
+configured workspace root, write authority, and the transfer group on Unix. Without that setup the
+capability and route are absent. Ordinary MCP tools remain available without transfer configuration.
+The transfer methods use `POST /mcp`; no additional listener or control plane is involved.
+
+The `/files?reviewed=v1&stage=...` and `download=...` IDs name bounded
+server-held records bound to the principal, workspace generation, process, policy/catalog and cwd.
+They never replace the bearer; every byte request must authenticate and repeat the cwd handle. Only
+the exact reviewed selectors are accepted. Raw `path` queries, unknown parameters, mixed selectors,
+and the removed `file_upload`/`file_download` tool names are refused without workspace writes or mkdir.
+There is no raw-transfer fallback. Origin-bearing browser requests remain forbidden and credentials are removed by
+authentication before dispatch. Neither tokens nor IDs/paths/queries enter request logs.
+
+Upload bytes are anonymous private files, not workspace paths. Quotas reserve declared size before
+admission and remain charged through active leases. Seal checks observed digest and length; execution
+rehashes the content and consumes a typed prepared publication through the shared ledger and file
+mutation lock. The preview names canonical target/ancestor scopes and parent staging effects. Only
+regular files, nonsymlink parents, 0644/0755 metadata, and explicit absent/revision
+preconditions are supported. Missing ancestors require explicit reviewed `createDirectories` entries;
+the byte POST never creates them. The resolver remains `mcp-files`; descriptor-relative no-follow opens
+reinforce its policy rather than adding server-side path resolution. No archive extraction, permission
+policy override, or arbitrary destination in the byte POST is supported.
+
+The additive directory-only publication contract uses the same authenticated prepare/execute ledger
+and durable journal without a byte stage. It requires explicit missing ancestors and `mustNotExist`.
+Native preparation checks write permission and discloses canonical ancestor/target scopes before
+effects; native hosts still own authorization. Descriptor-relative no-follow/no-mount traversal is
+Linux-only and fails closed elsewhere. Directory staging requires an explicit owner-only trusted root
+outside every exported/mutable workspace namespace; the standalone server uses private transfer
+storage, and native embedders must supply a `DirectoryPublicationStaging` handle. The retained root
+descriptor anchors creation and opening, not a name in the attacker-writable destination parent.
+Device mismatch fails before staging. No-replace rename exposes the staged inode at the reviewed
+destination, and the exact held identity is checked
+before descending. A foreign ordinary directory at that destination is not adopted. Expanded paths,
+escaped receipt size and the serialized completion envelope are bounded during preparation. Durable
+completion returns the settled receipt without another fallible cwd lookup. Partial publication is
+indeterminate, not permission to replay; file and directory publications share operation-ID fencing.
+Cleanup verifies the retained identity, removes only that empty staging directory and syncs its parent.
+Failed cleanup or staging that has disappeared/moved is indeterminate even before final publication.
+The trusted-root requirement is not isolation from arbitrary same-UID access to that root outside the
+exported workspace boundary; crash-left directories there require operator reconciliation.
+
+The private journal is process-locked and generation/principal scoped, with count and byte ceilings.
+Publishing is durable before the effect, completed outcomes follow file/directory sync, and an
+interrupted publication is indeterminate rather than retried or inferred successful from matching
+bytes. Terminal records have finite retention; unknown history does not authorize a retry. Unresolved
+records are not silently reclaimed. Every existing private record, including pending files, is
+validated before recovery or cleanup; incompatible formats fail startup without migration, rewriting,
+or deletion. Workspace temporary files may survive a process crash and need
+operator reconciliation. There is no cross-file transaction or implicit undo.
+
+Atomic no-replace publication refuses a destination created at the last instant. Replacement still has
+a revision-check/rename race against external writers; descriptor anchoring prevents following a
+rebound symlink but cannot stop an ancestor being moved. The mutation lock coordinates this server's
+file, workspace, revert, and reviewed-publication paths, not shell children or other processes. Streaming
+downloads validate a selected revision/digest and implement strong If-Match and single-range semantics
+without full buffering. An external writer can still change an open inode during the stream. A client
+must verify the complete digest and length before local publication. Same-UID hostile processes and
+network filesystems that do not honor the required locking/rename/fsync semantics are outside these
+guarantees. The descriptor explicitly does not advertise external-writer atomic replacement.
+
+The optional `ai.workcell/remote-host` discovery extension is served only through authenticated
+`POST /mcp` after the operator configures one server, workspace, workspace-generation, root-project,
+and principal identifier. The stable generation identifies replacement or reset of the configured
+workspace and is independent of the random process instance identifier. The identifiers are disclosure
+labels, not users or tenant records, and the single bearer
+still carries all process authority. Its current-directory handle is resolved once through the
+filesystem confinement policy; the descriptor also exposes the resulting root-relative display path
+and stable catalog and policy revisions. The environment revision reflects either the disclosed
+startup snapshot or nondisclosure. Its custom prepare, execute, release, status, and
+cancel methods remain on authenticated `POST /mcp` and require modern per-request extension
+negotiation. Every preparation is bound to the process instance, principal, workspace, configured
+generation, root project, immutable current-directory handle, catalog and policy revisions, tool
+contract, and argument digest. Generation mismatches are rejected before an instance mismatch can be
+treated as volatile state loss. Durable workspace, session, project-resource, and change-store
+identity consists of server ID, workspace ID, generation, resource namespace version, root-project ID,
+and principal ID; instance ID is used only for volatile operation and watch loss detection.
+Preparation resolves resource intents without executing the tool. A bounded volatile ledger gives
+mutating execution one transition and retains its structured result for same-invocation retries;
+expiry, release, count limits, and byte limits bound abandoned state. Cancellation uses the active
+tool cancellation token, and bounded ordered shell progress is retained without replacing live MCP
+progress delivery. A cancellation before dispatch has `sideEffectsPossible: false`; cancellation after
+a file mutation, direct child, or Git mutation may have started has `sideEffectsPossible: true` and an `indeterminate`
+status because process termination cannot retract or prove the absence of prior effects. Restart is an
+explicit indeterminate boundary. The extension adds no endpoint,
+control plane, tenant, lease broker, transfer ticket, or signing authority, and is never exposed over
+stdio or an unauthenticated HTTP listener.
+
+Remote websearch intent keeps provider connection authority separate from the exact normalized query.
+The query is represented by a query-derived opaque resource ID and bounded display text matching the
+embedded permission query, so authorization does not collapse query disclosure into generic egress.
+
+The extension also serves resolve-directory, stat, deterministic paginated list/traversal, bounded
+revision-bearing text reads, and deterministic paginated text search through that same authenticated
+MCP route. Every relative request repeats the immutable host and root-project binding and names an
+opaque cwd handle. Handles are server-held directory bindings rather than path-bearing tickets;
+resolving a directory creates a fresh one, and rebinding, removal, root escape, or an escaping symlink
+is rejected. Pagination cursors bind the request and its captured generation or result revision.
+Tampering is refused; search result changes are explicitly stale. Search preserves
+bounded traversal coverage and truncation metadata even when no page cursor remains. Text reads expose
+byte continuation within a selected line range, the line containing the first byte, and the last line
+completed by the chunk, so oversized lines and beyond-EOF ranges cannot silently skip or fabricate
+content.
+
+Workspace listing opens no file contents and applies no content byte limit. Its nullable entry
+revisions cannot substitute for stat/read revisions in mutation preconditions. Opaque inventory
+generations serve pagination only. Unreadable or vanished descendants and unsupported file kinds mark
+the bounded response incomplete; a refused root remains an error. Before opening a requested scope,
+listing compares the opened cwd descriptor's directory identity with the original immutable binding.
+Child creation and directory timestamp changes do not invalidate that identity. Scope resolution stays
+relative to the verified cwd descriptor, even if the pathname is subsequently replaced. Listing uses
+its own `BENEATH | NO_SYMLINKS | NO_MAGICLINKS` resolver for enumeration and metadata: ordinary mounts
+and bind mounts remain visible, while change-record and transfer resolvers retain their `NO_XDEV` policy.
+Non-enumerated ancestors use search-only descriptors; only directories being listed require read
+permission. Replacing an ancestor with a symlink cannot redirect metadata reads into a protected or
+external tree; unsupported kernels have no pathname fallback. Blocking enumeration checks a child
+cancellation token between entries, including when its caller is dropped.
+
+Listing pages reuse immutable captured metadata and may be stale relative to later filesystem changes.
+Every page verifies cwd and scope identity plus scope read permission; cached metadata is never
+authority for content reads or writes. Cursors bind a generation, normalized scope, cwd, recursion,
+page bounds, and a private per-inventory receipt nonce. Expiry or unknown generations refuse rather
+than restarting traversal. Records survive the last page for stable retries until their fixed 30-second
+expiry. At most 16 inventories, 200,000 entries, 128 MiB of accounted inventory state, and four workers
+are admitted per filesystem group. Admission reserves each capture's maximum entries and conservative
+memory envelope before allocating the traversal, then releases unused quota. Live receipts are not
+evicted to make room. Shared inventory references own their quota leases, so removing an expired
+record cannot undercount a page still using it. Bounded expiry tasks hold only weak workspace references
+and are aborted with their records; cancelled or dropped captures retain admission until their worker exits.
+
+Workspace watch state is volatile, bounded, and owned by the authenticated remote-host instance. A
+subscription is bound to the same host, workspace generation, principal, root project, and immutable
+cwd handle as its open
+request. Native watcher paths pass through filesystem confinement and are converted to root-relative
+POSIX paths before entering the retained event ring; protected paths and absolute host paths are not
+disclosed. Raw callback queues, subscription count, retained event count and bytes, total events,
+poll size and wait, lifetime, and tombstones are bounded. Close, expiry, process drop, and terminal
+resync remove the native watcher. Restart, cursor tampering, kernel or process queue overflow, backend
+failure, and retention loss return an explicit `fullResync` response rather than an incomplete stream.
+Every subscription owns one abortable expiry task; close, terminal resync, replacement, expiry, and
+host drop abort it instead of retaining a detached sleeper.
+The backend's order is retained, but rename pairing is not portable: known ends become remove/create,
+and ambiguity becomes `rescan`.
+Watch setup diagnostics retain only the initialization/registration phase, backend error category,
+I/O kind, and numeric OS error. Native error messages and path lists are never serialized or logged.
+
+Project-asset discovery is a fixed, versioned server allowlist. It covers recognized project
+instruction files, one-level skill `SKILL.md` sources in the documented compatibility directories,
+`.caudra/workflows/*.rhai`, immediate Markdown files in exactly `.caudra/commands`,
+`.claude/commands`, and `.opencode/commands`, and the exact `.caudra/permissions.toml` source; it has no
+project-controlled extension mechanism. Discovery and reads reuse confined traversal, stat, symlink
+rejection, protected-path policy, text bounds, and content revisions. Discovery admits at most 256
+assets while scanning at most 50,000 entries, 16 MiB of retained path state, and 64 MiB of hashed
+content; paths are at most 4,096 bytes and reads at most 64 KiB. Discovery charges the observed file
+length before reading, caps actual reads at the reservation, and rejects changed metadata. Failed
+reads retain their charge. Exhausting this independent hash budget rejects the discovery rather than
+returning a partial manifest. A bounded partial scan is rejected.
+`.env`, `init.lua`, MCP configuration, plugin configuration or source, general or remote configuration,
+and arbitrary scripts are excluded. The server does not parse, load, execute, or grant trust to any
+discovered source. Instructions, skills, and commands are labeled `declarative`; workflow bytes are
+labeled `clientApprovalRequired`. Permissions are labeled `mixedReviewRequired`, allowing a client to
+apply denies immediately while requiring review of allows against the returned revision.
+
+Prepared workspace create, revision-matched write, mkdir, revision-matched rename, and
+revision-matched delete batches use the existing operation ledger and its idempotent invocation
+response. Workcell cannot make arbitrary multi-file publication atomic. It validates the complete
+batch before publishing, uses atomic same-filesystem replacement or rename for each action, and keeps
+an in-memory reverse rollback journal for failures and cancellation. A rollback failure is reported as
+partial failure. Process termination, kernel failure, or host loss between publications or during
+rollback is a crash boundary that can leave a partial batch; no durable recovery journal is claimed.
+Rename and delete bind regular files by byte digest and file identity, including binary files. Text
+writes and edits retain the UTF-8 and binary-content gates.
+Direct non-interactive exec is likewise prepared into the common ledger, exact-cwd and option bound,
+and admitted only through the immutable shell policy before process creation. Its output progress and
+cancellation are the same bounded mechanisms used by the ordinary shell tool. Discovery advertises
+these implemented subcapabilities as `v1`.
+
+SCM discovery and every repository-relative path start from the same confined immutable cwd/resource
+handles as workspace reads. A repository is accepted only when its ordinary worktree and `.git`
+directory canonicalize inside the configured root. `.git` files, symlinked or external git
+directories, linked worktrees, submodules, bare repositories, and common-directory indirection are
+rejected. Repository handles are process-local bindings rather than path tickets. Status, history,
+diff, and side responses are revision-bearing and bounded; paginated responses use opaque cursors
+bound to the request and observed repository revision. Untracked and conflicted paths remain explicit
+states rather than being folded into a generic dirty bit.
+
+Repository discovery, identity, object decoding, and history traversal use `gix`. Commit object headers
+are checked against the advertised 1 MiB per-object and 16 MiB aggregate `maxLogScanBytes` limits before
+each traversed body is loaded or decoded; commits skipped to reach a cursor consume the same aggregate
+budget. An aggregate stop is returned as a truncated response without a continuation cursor. Shallow
+boundaries are read only from the regular, non-symlink `.git/shallow` file; shallow-path configuration
+overrides are rejected. The reader accepts at most 1 MiB and 10,000 strict object IDs before traversal.
+Before `gix` parses repository configuration, Workcell reads `.git/config` through a confined,
+non-symlink descriptor under the advertised 1 MiB `maxConfigBytes` limit. It retains content and file
+identity and revalidates them immediately before and after `gix` reopens the file; a race is stale.
+Status uses Git's documented porcelain-v2 NUL format, changed-path discovery uses NUL-delimited
+name-status, and textual patches are parsed into typed line records under hard source bounds. Raw stdout
+and stderr are never
+returned. The fixed Git child templates disable hooks and filesystem monitors, suppress prompts,
+ignore global/system configuration, remove helper-affecting environment variables, and reject
+repositories with external filter or diff-driver configuration. Every diff pass disables external
+diff, textconv, and color independently of repository attributes. Remote-host construction first
+bounds and validates `git --version`; an unavailable or invalid Git executable removes the SCM
+capability and is reported through `controlPlaneMissing`.
+There is no client-selected command, option, environment, executable, or generic Git route.
+
+Stage, unstage, and discard are exact prepared operations in the existing ledger. A mutation accepts at
+most 127 paths so its repository intent plus all path intents fit the 128-intent ledger bound.
+Preparation records
+the repository identity, HEAD, index, content-sensitive worktree revision, normalized path set, and
+status preview. Execution serializes against filesystem mutations, checks the index lock and every
+captured revision again, and reports stale, locked, cleanly cancelled, indeterminate post-start
+cancellation, or failed outcomes structurally.
+Retries with the same invocation ID reuse the retained outcome. Discard invokes only tracked-worktree
+restore for the prepared paths; it does not remove untracked content and no clean/reset operation is
+available. A process crash during a Git index update remains a repository recovery boundary.
+
+Change-record support is an explicit authenticated-HTTP, writable-files opt-in. `--snapshot-root` or
+`WORKCELL_MCP_SNAPSHOT_ROOT` must name an existing absolute directory outside the configured workspace.
+Startup rejects a symlink component, ownership by another identity, group/other access on Unix, a path
+that contains the workspace or is contained by it, an unsupported private entry, or more private
+entries than the store's quotas allow. Workcell never falls back to a shared temporary path. The
+private root is operator state: do not mount it into the exposed workspace or serve it independently.
+
+Several processes may share one store. Every store operation holds an exclusive `flock` on the store's
+`lock` file for as long as it runs, taken through a fresh descriptor on a blocking thread and never
+held for the process lifetime; one that cannot take it within 30 seconds reports `busy`. Store files
+are owner-only and published by same-directory create, sync, and rename, so each appears whole or not
+at all. A commit writes the store state, which carries the next sequence number, before the record,
+and deletes the open record last: two processes never commit the same `seq`, and a crash between the
+steps leaves at most an unused number and an open record that can still be finished. A store whose
+state is missing while it holds records, or whose files are in a format this release does not know,
+refuses to open. Data of earlier releases is deleted at open, never interpreted.
+
+Recording is not a prepared operation. Beginning, finishing, and abandoning a record read the
+workspace and write only the private store, under the same authenticated remote-host binding as other
+workspace reads. Holders and client metadata are bounded opaque values that Workcell stores and never
+interprets. A holder is a grouping, not an authorization boundary: any authenticated caller of the
+host may name any holder.
+
+A capture walks the paths a record names, or the directory its workspace scope names, beneath the
+configured root. Every name is opened beneath an already open directory with
+`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV`, so however the tree changes during a walk,
+capture never follows a link or crosses a mount. A symlink is data: the link's raw target is stored
+and never resolved. A named path must be plain and root-relative and is never read through a link. A
+named symlink, a named path behind a link or a non-directory ancestor, or a named file with more than
+one hard link widens its record to the whole tree for both captures, so a write through it is recorded
+where it lands inside the root; a named path the call itself puts behind such an ancestor is kept as
+`blocked`. Protected paths (Git metadata, `.ssh`, `.workcell`, credential-bearing names) and
+configured exclusions are left out whether named or walked; gitignored paths, and everything beneath a
+directory its own repository ignores, wherever a walk starts, are left out of walks, while a named
+file or link is recorded even when ignored. A configured exclusion is resolved through its nearest
+existing ancestor, so a later-created suffix remains excluded; escaping and malformed suffixes fail
+startup. A directory that holds its own repository is never entered, and mounts and special files a
+walk meets are left out. Oversized, unreadable, and unstable files, and named special files, are kept
+as unrecorded paths, which no revert ever writes. Entry-count, path-byte, depth, ignore-rule,
+file-count, total-byte, metadata, open-record, record, journal, and total-storage limits are fixed and
+advertised; a client can only lower the per-record ones, which bound a record in either scope. Objects
+are charged prospectively at the worst case of Git's compression; content the store already holds is
+not charged again. A failed or cancelled capture deletes what it staged; objects it had already named
+reach nothing until collection removes them.
+
+Every object is written under a temporary name and flushed before it takes its name, so a crash leaves
+temporary files for cleanup, never a partial object a later capture would reuse. Every object a
+capture names is synced, with its directory, before the open record or record naming it is written,
+including objects an earlier capture stored. Captures live in a private bare Git repository that reads
+no system, global, or environment Git configuration and that no Git process runs against. Objects are
+named by their Git object IDs and every object is verified against its ID when read, so a tampered
+object fails integrity instead of reverting to altered content. Content that Git's collision detection
+recognizes as a SHA-1 collision attack is refused, and such a file is kept as unreadable. The stat cache
+that spares a whole-tree capture from reading unchanged files trusts only an exact match of device,
+inode, owner, size, and nanosecond change and modification times. It records only files that had not
+changed for five seconds before their capture started, so a write racing a read cannot hide behind an
+unchanged stamp, and a file whose cached object the store no longer holds is read again.
+
+Records that overlap in time are rebased when they finish: a change another record already holds is
+dropped, a later change starts where that record left the path, and a path whose history the two
+cannot tell apart is kept as `interleaved`. No record therefore claims a change it did not observe
+alone, and a revert of one record cannot silently undo another's change.
+
+A revert is authorized against its prepared plan in the existing operation ledger: write and delete
+intents on the deepest path holding every path it touches, for the effects its complete counts
+include, and a write intent on the holder's stack of pending reverts. It changes only paths its
+selected records changed, composed per path, and only where the live entry held what the records left
+there when prepared. A path the records do not chain on, a path a record could not store, and a path
+changed since are conflicts, and a conflict anywhere refuses execution before anything is written.
+Execution refuses unless the records and the holder's stack are still as planned. Each path is
+published through a staged entry beside it and only while the live entry still carries the device,
+inode, size, mode, and timestamps preparation observed; a mismatch stops the revert rather than
+choosing the record over a later edit. No write, link, or unlink goes through a symlinked or
+non-directory ancestor. A reverted file gains no permission the file it replaces lacked, except
+execute for its owner and wherever read was allowed, and a created file gets Git's default mode under
+the umask, which is learned at open from a probe file rather than by changing the process-wide umask.
+Each publication is atomic for one entry, but the complete revert is not. The journal is durable
+before the first effect and records transitions, never paths or content. Termination can happen after
+a publication and before its journal update, so a revert left `publishing` is recomputed from its
+records and the live workspace, under the store lock, when the store next opens or before the next
+revert: fully applied becomes `completed`, one whose remaining paths all still hold what the records
+left there `partial`, and anything else `indeterminate` with reconciliation required. It never replays
+an incomplete revert.
+
+While a revert is pending, its records count as reverted for every holder: no other revert may name
+them and no release may drop them, so two reverts cannot interleave over the same records. Unrevert
+re-applies the holder's whole stack through the same prepared execution, conflict rules, and status
+path, and refuses unless the stack is still the one it planned. Acknowledgement deletes the stack's
+records for every holder. Retention after each commit and prepared cleanup never evict a record a
+pending revert names or one an open record may still rebase onto. Cleanup uses the common ledger: it
+retains the exact stale open records it abandons and records it evicts, binds one server-state
+resource intent to that plan's digest, does at most what it named where that still applies, and then
+deletes only objects nothing reaches. Every open record, every record, and the stat cache remain
+reachability roots, read in full: one that cannot be read fails the collection and nothing is deleted,
+so no object it names is ever mistaken for garbage.
+
+Discovery reports `changes` only after private-store validation and startup recovery succeed. It sets
+`controlPlane: true` only when operations, workspace reads, watch, project assets, writable prepared
+mutation, direct exec, SCM, and changes are all enabled; otherwise `controlPlaneMissing` identifies
+the absent slice. This is a capability summary, not a deployment controller. Change methods add no
+route, user, tenant, signed ticket, bearer, or authority beyond authenticated `POST /mcp`.
+
+Shell requests are parsed into command scopes before execution. Without `--shell-policy` or `--yolo`,
+all shell requests are denied. An explicit deny rejects the entire request before any command starts;
+`--yolo` permits unmatched classified scopes but does not override a deny. If deny rules exist, opaque
+syntax fails closed because Workcell cannot prove that a hidden executable is unmatched. This is an
+application policy layer, not an OS security boundary: allowed programs can still execute indirect
+behavior, so isolation remains mandatory for untrusted commands.
+
+The code tool group is the one place where Workcell adds isolation rather than assuming it. Snippets
+run in a separate `monty` worker process, never in the server process. The worker is given no
+filesystem access, no network access, no ability to spawn processes, and an explicitly empty
+environment, so `os.getenv` and `os.environ` observe nothing from the host and file access raises
+`PermissionError`. Each call is fed a fresh interpreter state, so nothing persists between calls.
+Workcell overrides Monty 1.0's system-clock, entropy, and sleep defaults: those operations suspend
+and are refused, process-time reads return zero, and the virtual timezone is UTC. No mounts or host
+functions are installed. Explicitly seeded random computation and arithmetic on supplied dates
+remain local to the interpreter.
+Snippets are bounded by a caller-supplied timeout capped at 30 seconds, a 256 MiB memory ceiling
+enforced by the worker's global allocator, bounded captured output, and a cap on interpreter
+suspensions. The timeout bounds both an entire feed and each turn, so a suspension cannot reset the
+snippet's execution budget. Shared wire values are costed before expanding them into JSON or repr;
+an oversized expansion is omitted with an explicit notice. A worker that exhausts memory, overflows
+its stack, or otherwise aborts terminates only itself; the supervising server replaces it. This is
+process isolation for a language runtime, not an
+OS sandbox: the worker still runs with the identity and namespace of the deployment, so operator
+isolation remains mandatory.
+
+The optional filesystem indexer parses strict UTF-8 source in-process. Calls read through the normal
+filesystem policy, then run tree-sitter and the bundled first-party extractor logic in `spawn_blocking`
+under a process-wide two-permit semaphore. Source bytes bound parser input, and an absolute deadline
+and cancellation cover blocking-pool queueing, construction, inspection, extraction, and formatting.
+Node-count and depth limits are enforced by post-parse inspection before extraction; tree-sitter does
+not expose a construction-memory ceiling for those limits. Syntax trees and native extractor state are
+dropped after each call; no parser cache or scripting runtime is retained. These controls limit
+accidental and adversarial work but do not turn native parser code into a process-isolated sandbox.
+
+The code-graph tool group reads through the same confined filesystem group and adds no write
+authority, no second path resolver, and no network access. It parses a whole tree rather than one
+file, so its bounds are wider and all of them are host-owned: files per map, traversal entries,
+single-file and total source bytes, a crawl deadline, per-file and whole-tree definition and
+reference ceilings, PageRank iterations, retained cache entries and bytes, result rows, and
+extraction worker count. Parse trees are dropped as each file's facts are extracted, so live memory
+is bounded by worker count rather than by tree size. Extraction and ranking run on a blocking task
+with their own bounded worker pool, which limits concurrent parser work but, exactly as for the
+indexer above, is not CPU or memory containment. Every bound that fires is named in the result rather
+than applied in silence, and reference counts are floors: a zero means none was found, never that
+none exists.
+
+Execution-environment disclosure performs fixed, bounded local probes at startup and whenever the
+`execution_environment` tool is called. A non-root Unix process actively runs
+`sudo -n -- <resolved-true>` during each inspection; this may create audit records, update external
+policy state, refresh the sudo credential timestamp and extend cached authorization lifetime, or invoke
+local or remote PAM and sudo policy plugins. Success proves only that fixed command, while failure can
+mean a password requirement or command-specific denial. A `not-found` result means sudo did not resolve
+through the root-filtered `PATH`, not that no sudo binary exists elsewhere. Effective UID 0 may be
+namespaced or container-confined and does not imply host-level root. These observations disclose
+privilege-relevant capability but do not authorize shell use or bypass shell policy.
+
+All executable probes resolve recognized programs through the process `PATH`, reject targets inside
+the configured root, and execute accepted targets with fixed arguments; they do not pass
+client-provided commands. Probe environments are cleared and selectively inherited, including a
+`PATH` containing only canonical directories outside the configured root and no inherited home or
+temporary-directory variables. Each probe starts from the resolved executable's parent directory
+rather than the workspace. Output, individual processes, and the complete tool inspection have
+deadlines; raw output is discarded after extracting normalized versions. Concurrent tool inspections
+are serialized, cancellation waits for bounded cleanup, and Unix probes use dedicated process groups
+for best-effort descendant termination. Operators must still treat installed executables as code and
+must not treat reported availability or privilege, package-manager, container, sandbox, or network
+classifications as an authorization or isolation boundary. Disable discovery and the tool together
+with `--no-expose-execution-environment`.
+
+The statements above describe the standalone server. Workcell's tool crates are also embeddable
+directly by a native Rust host through the `workcell` facade, and that host becomes the authorization
+layer. Confined constructors (`FileToolGroup::new`, `ShellToolGroup::with_policy`) enforce exactly
+what the server enforces. The `_unconfined` constructors do not, and they are the intended mechanism
+for hosts that authorize paths and commands themselves:
+
+- `FileToolGroup::new_unconfined` disables root confinement and protected-path denial together.
+  Absolute paths and `..` traversal resolve anywhere the process can reach, and credential-bearing
+  entries such as `.env`, `.ssh`, `.netrc`, `*.key`, and `id_rsa` are readable. Its `allow_write`
+  argument independently controls mutation; pass `false` for inspection-only hosting. Broad traversal
+  applies the same authorization decisions `file_read` applies, so a host never authorizes against a
+  view filtered by confinement or protected-path policy. Traversal does skip directories holding
+  regenerable build output by name, which is a relevance filter rather than an authorization one:
+  those paths remain readable, and naming one as an explicit path enumerates it.
+- `ShellToolGroup::new_unconfined` and `with_policy_unconfined` relax only workdir resolution.
+  Permission policy stays fail-closed unless the host supplies its own, and deny rules still reject a
+  request before any command runs.
+
+`ShellToolGroup::with_inherited_environment` forwards the host variables it names to every command,
+unchanged, so any admitted command can read them. Names that decide which Bash runs or how it starts,
+including every `BASH*` name, `ENV`, `SHELLOPTS`, `POSIXLY_CORRECT`, `CDPATH`, `PWD`, `PS4`, and
+`WORKCELL_BASH_EXECUTABLE`, are dropped even when listed, because the command-context analysis a host
+authorizes against assumes Bash started without them.
+
+Prepared operations exist so that authorization can happen before any effect. `prepare_apply_patch`,
+`ShellToolGroup::prepare`, and the web `prepare_*` methods disclose every path, command scope, query,
+or URL a call would touch without reading, writing, or executing anything. A host that commits a
+prepared value without inspecting its resources has performed no authorization, and unconfined mode
+grants that call the full reach of the process. Embedding does not add an isolation boundary;
+deployment isolation remains mandatory exactly as it is for the standalone server.
+
+Recommended controls for untrusted workloads include:
+
+- A dedicated container, VM, microVM, or restricted operating-system account.
+- Read-only root filesystems and narrowly scoped writable mounts.
+- Dropped Linux capabilities and `no-new-privileges`.
+- PID, CPU, memory, output, and wall-clock limits outside the process.
+- Network egress policy appropriate to enabled web and shell behavior.
+- No host socket, credential directory, SSH agent, cloud metadata, or broad secret mounts.
+- Loopback publication or authenticated private networking for HTTP.
+
+## Supported Deployment
+
+The latest release is the supported security line. Linux is the primary production target. Stdio and
+loopback HTTP are suitable for same-host clients. Container HTTP requires a process bearer token and
+must be protected by the deployment network; Workcell does not terminate TLS.
+
+Workcell serves MCP `2026-07-28` first and accepts exactly `2025-11-25` as a compatibility fallback by
+default. Both HTTP eras remain stateless and POST-only: Workcell does not create protocol sessions,
+issue `Mcp-Session-Id`, or enable legacy GET/DELETE lifecycle routes. Use `--modern-only` or
+`WORKCELL_MCP_MODERN_ONLY=true` where accepting legacy request metadata and header semantics is not
+appropriate. Protocol headers are routing and consistency checks, not authentication or authorization.
+
+## Known Residual Risks
+
+- Shell policy is syntactic, not confinement. An allowed command may use absolute paths, change
+  directories, access the network, invoke other executables, or interpret dynamic input.
+- An MCP client can write scripts through enabled mutation tools or shell output, then execute them
+  through an allowed Bash, JavaScript, Python, Perl, or other interpreter. Policy checks the visible
+  invocation, not script contents; denying one utility does not deny equivalent behavior implemented by
+  another allowed executable.
+- Shell output filtering changes what a model reads, not what ran. A rule can omit output a reader
+  would have judged relevant, and the corpus matches on program name, so a different program invoked
+  under a matched name is rendered by that program's rule. Filtering is applied only to
+  single-scope, non-opaque commands, success-summary rules are suppressed unless the command exited
+  zero, and the unfiltered capture stays in the structured result. Use
+  `--no-shell-output-filter` where the raw rendering is required for review.
+- Filesystem authorization is path based and retains a potential time-of-check/time-of-use window under
+  malicious concurrent filesystem mutation.
+- A native host embedding the tool crates with an `_unconfined` constructor supplies the entire
+  authorization layer. Workcell enforces bounded reads, writes, output, deadlines, and cancellation in
+  that configuration, but no path or workdir boundary. A host defect there has the same reach as the
+  process itself.
+- Native document and image parsing occurs in-process. Internal bounds reduce risk but do not replace
+  hard process memory and CPU isolation.
+- Native source indexing and its feature-gated parser bundle also run in-process. Parser defects,
+  construction-memory growth within the source bound, or bound-check defects can affect the server
+  process despite per-call deadlines and post-parse limits.
+- Credential-free Exa MCP search is not private or an availability guarantee. Queries leave the
+  execution boundary, and normalized results can still contain inaccurate or malicious web content.
+- A bearer token authenticates one process endpoint. It does not express per-tool, per-user, or
+  per-request authorization. A token holder can select downloads and prepare/execute publications
+  when reviewed transfer is configured. Client-side review is not a second server-side credential.
+- Selected transfers check identity and content before publication or streaming, but cannot isolate
+  the filesystem from external writers. Clients must verify downloaded length and digest before
+  publishing locally, and replacement retains the revision-check/rename race described above.
+- Monty 1.0 has a version-coupled worker protocol. Workcell pins the
+  `monty-pool` dependency and the installed worker to the same release and they must be upgraded
+  together; the build fails when the pins diverge and the pool reports any remaining skew as a fatal
+  error on the first checkout. Treat interpreter escape as possible and do not rely on the code tool
+  as the only barrier protecting anything sensitive to the deployment.
+- An explicit `--code-worker` path is authoritative. Without one, discovery checks beside the server,
+  then the verified embedded worker, then `PATH`. Embedded bytes are digest-checked and extracted into
+  a private content-addressed cache under an interprocess lease. The `PATH` fallback still trusts the
+  deployment's `PATH`; configure an explicit worker where it is not fully controlled. Set
+  `--code-worker-cache` when the platform cache is unavailable, not writable, or not executable. The
+  configured cache must be controlled by the Workcell process identity and not shared with less-trusted
+  users.
+- The `monty-pool` client links a TLS stack and a WebSocket implementation into the server binary to
+  support a remote worker transport that Workcell never configures. Workcell only ever constructs the
+  local subprocess transport, so that code is unreachable at runtime, but it is present in the binary
+  and contributes third-party unsafe code that `forbid(unsafe_code)` in this workspace does not cover.
+- The code worker's isolation comes from what the interpreter is not given, not from a kernel boundary.
+  A defect in Monty's builtins or in Workcell's suspension handling could expose host capability that
+  the design intends to withhold.

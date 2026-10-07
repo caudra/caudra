@@ -1,0 +1,62 @@
+{
+  "caseID": "shell.progress.redraw-rendered-at-capture",
+  "configuration": {
+    "shellOutputFilter": true,
+    "shellPolicy": "yolo"
+  },
+  "expected": {
+    "contentText": "stdout tail:\nLoading weights: 100%|##########| 851/851\n\nstderr tail:\n\n[2 progress redraws collapsed]",
+    "structuredContent": {
+      "durationMs": "{{DURATION_MS}}",
+      "exitCode": 0,
+      "finalSequence": 1,
+      "kind": "shell",
+      "outputLimitExceeded": false,
+      "relativeWorkdir": ".",
+      "signal": null,
+      "stderr": "",
+      "stderrCaptureTruncated": false,
+      "stderrPreviewTruncated": false,
+      "stderrRedrawsCollapsed": 0,
+      "stderrUtf8Bytes": 0,
+      "stdout": "Loading weights: 100%|##########| 851/851\n",
+      "stdoutCaptureTruncated": false,
+      "stdoutPreviewTruncated": false,
+      "stdoutRedrawsCollapsed": 2,
+      "stdoutUtf8Bytes": 124,
+      "timedOut": false,
+      "timeoutMs": 60000,
+      "version": 1
+    }
+  },
+  "fixtureVersion": 1,
+  "input": {
+    "command": "printf 'Loading weights:   0%%|          | 0/851\\rLoading weights:  50%%|#####     | 425/851\\rLoading weights: 100%%|##########| 851/851\\n'",
+    "timeoutSec": 60
+  },
+  "normalization": {
+    "replacements": [
+      {
+        "placeholder": "{{ROOT}}",
+        "source": "configured canonical filesystem root"
+      },
+      {
+        "placeholder": "{{DURATION_MS}}",
+        "source": "measured command wall-clock duration"
+      }
+    ]
+  },
+  "notes": [
+    "A redraw stream is decoded rather than filtered, so the structured capture holds the rendered row and not the control stream. The exact bytes the command wrote remain reported in stdoutUtf8Bytes, and progress notifications are published before this point.",
+    "The command matches no corpus rule, which is the point: bars are emitted overwhelmingly by programs no rule names."
+  ],
+  "provenance": [
+    "rust/crates/mcp-shell/src/output.rs",
+    "rust/crates/output-filter/src/terminal.rs",
+    "rust/crates/mcp-shell/tests/conformance_fixtures.rs"
+  ],
+  "setup": {
+    "files": []
+  },
+  "tool": "shell"
+}

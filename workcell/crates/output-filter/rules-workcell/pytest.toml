@@ -1,0 +1,52 @@
+[filters.pytest]
+description = "Drop the pytest session header"
+match_command = "^(pytest|py\\.test)\\b|^python3?\\s+-m\\s+pytest\\b"
+filter_stderr = true
+strip_lines_matching = [
+  "^=+ test session starts =+$",
+  "^platform \\w+ -- Python",
+  "^(rootdir|cachedir|configfile|testpaths|plugins):",
+  "^collecting ",
+  "^collected \\d+ items?",
+  "^\\s*$",
+]
+on_empty = "pytest: ok"
+
+[[tests.pytest]]
+name = "drops the session header and keeps results"
+input = """
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.6.0
+rootdir: /work/pydemo
+collected 3 items
+
+test_sample.py ...                                                       [100%]
+
+============================== 3 passed in 0.01s ===============================
+"""
+expected = """
+test_sample.py ...                                                       [100%]
+============================== 3 passed in 0.01s ===============================
+"""
+
+[[tests.pytest]]
+name = "failure detail survives"
+input = """
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.6.0
+collected 1 item
+
+test_sample.py F                                                         [100%]
+
+=================================== FAILURES ===================================
+___________________________________ test_one ___________________________________
+E       assert 1 == 2
+=========================== 1 failed in 0.01s ==================================
+"""
+expected = """
+test_sample.py F                                                         [100%]
+=================================== FAILURES ===================================
+___________________________________ test_one ___________________________________
+E       assert 1 == 2
+=========================== 1 failed in 0.01s ==================================
+"""

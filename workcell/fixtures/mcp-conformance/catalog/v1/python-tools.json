@@ -1,0 +1,217 @@
+{
+  "fixtureVersion": 1,
+  "caseID": "catalog.code.sdk-emitted.v1",
+  "catalogKind": "sdk-emitted",
+  "server": {
+    "name": "workcell-code",
+    "version": "0.1.0"
+  },
+  "provenance": [
+    "rust/crates/mcp-code/src/catalog.rs",
+    "rust/crates/mcp-code/src/group.rs"
+  ],
+  "expected": {
+    "tools": [
+      {
+        "name": "python_execution",
+        "title": "Execute Python code",
+        "description": "Execute a short Python script in an isolated interpreter and return its value and printed output.\n\nUse this for computation: arithmetic and math, summary statistics computed directly since there is no statistics module, date arithmetic, string and text processing, JSON reshaping, regex extraction, sorting and aggregation. Prefer this over the shell tool for anything that is pure computation, because this tool cannot reach the host.\n\nIsolation:\n- No filesystem, no network, no environment variables, and no subprocesses. Use the file tools, webfetch, or shell when the task needs any of those.\n- Runs in a separate worker process under enforced time, memory, and recursion limits.\n- Host clocks, unseeded randomness, and sleep are refused. Seed random explicitly; supply dates and timestamps as data. Process-time reads return zero and the virtual timezone is UTC.\n\nThis is a Python subset, not CPython. It rejects or fails on:\n- Class inheritance, metaclasses, super(), and decorators on methods, so @classmethod, @staticmethod, and @property are unavailable. Simple classes and @dataclass do work.\n- yield and generator functions, match statements, del, try*/except* groups, async with, async for, PEP 695 type aliases, wildcard imports, complex literals, and t-strings.\n- str.translate() and str.maketrans(). str.format(), %-formatting, and f-strings work.\n- Defining exception classes, since classes cannot inherit. Raise a built-in such as ValueError. Exception constructors take at most one string, so OSError(errno, message, path) fails, and raise X from Y parses but silently drops the cause.\n- These builtins, which are undefined and raise NameError: compile, __import__, globals, vars, dir, input, breakpoint, help, exit, super, callable, issubclass, delattr, staticmethod, classmethod, bytearray, complex, memoryview, ascii, aiter, and anext.\n- Function attributes such as __name__.\n\nOnly these standard library modules exist, each covering part of its CPython surface: asyncio, base64, binascii, collections, copy, dataclasses, datetime, functools, itertools, json, math, os, pathlib, random, re, sys, time, typing, unicodedata. There are no third-party packages, and no gc, io, string, struct, operator, statistics, enum, contextlib, hashlib, uuid, or urllib.\n\nUnpacking supports subscript and attribute targets, including x[i], x[j] = x[j], x[i]. eval(), exec(), and locals() work inside the same isolated interpreter; dynamic code gains no host access. Generic aliases such as list[int] work as values as well as annotations.\n\nBehaviour that differs from CPython even where the API exists:\n- map, filter, getattr, setattr, hasattr, and format exist at runtime but are missing from the type stubs, so type checking rejects them before the snippet runs. Use a comprehension instead of map or filter, and f-strings instead of format(). getattr and hasattr also cannot see methods, so hasattr returns False for attributes that do exist. object exists as a type but object() cannot create instances.\n- enumerate, zip, reversed, and generator expressions are eager and return lists, so an infinite iterator never terminates. iter() and the itertools functions stay lazy and single-use.\n- Operators do not dispatch to user-defined dunders, so +, -, <, len(), [], and () ignore __add__, __neg__, __lt__, __len__, __getitem__, and __call__ on your own classes. __init__, __repr__, __str__, __eq__, __hash__, __bool__, __iter__, and __contains__ do work; reach anything else by calling the method directly.\n- re is backed by fancy-regex: no bytes patterns, no VERBOSE flag, no re.subn, and re.sub takes a string replacement only, never a callable.\n- os has no os.path. Use pathlib for path manipulation. sys includes version, version_info, platform, maxsize, and the streams, not the host environment.\n- dataclasses provides @dataclass with no arguments plus is_dataclass; field, asdict, astuple, fields, replace, and options such as frozen= are absent.\n- Only the utf-8, ascii, utf-16, and utf-32 codecs exist.\n\nUsage notes:\n- The code parameter is required and is bounded to 65536 UTF-8 bytes.\n- The value of the final expression is returned. Use print() for intermediate output.\n- Oversized expanded values are omitted with an explicit rendering-budget notice; shared references cannot expand without bound in the host.\n- timeoutSec is optional, in seconds from 1 to 30. Omit it unless the snippet is expected to outlast the 5 second default. A value outside that range is rejected rather than clamped.\n- Each call is independent. No variables, definitions, or imports persist between calls.\n- Snippets are type checked before running unless the operator disables it, so unsupported APIs and unavailable names usually fail before any output is produced.\n- Type annotations are never required. Unannotated code is inferred permissively, so xs = [] then xs.append(1) then xs.append('a') passes. An annotation only adds a constraint that is then enforced, so when a diagnostic names one, widen or remove it rather than annotating more. Annotations themselves are never evaluated.\n- Passing the type check does not guarantee the snippet runs: abc, types, typing_extensions, _collections_abc, and _typeshed resolve during checking and then raise ModuleNotFoundError at import.\n- Raised exceptions are completed results carrying the exception type and message, so the caller can correct the script and retry.",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 65536,
+              "description": "Python source to execute. The value of the final expression is returned."
+            },
+            "timeoutSec": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 30,
+              "default": 5,
+              "description": "Optional timeout in seconds, from 1 to 30. Omit it for the 5 second default unless the snippet needs longer; a value outside that range is rejected."
+            }
+          },
+          "required": [
+            "code"
+          ],
+          "$schema": "http://json-schema.org/draft-07/schema#"
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "type": "integer",
+              "format": "uint8",
+              "minimum": 0,
+              "maximum": 255,
+              "description": "Version of the structured result shape, independent of the MCP protocol version."
+            },
+            "kind": {
+              "type": "string"
+            },
+            "outcome": {
+              "$ref": "#/definitions/Outcome"
+            },
+            "timeoutMs": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "durationMs": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "typeChecked": {
+              "type": "boolean",
+              "description": "Whether the snippet was type checked before running, which decides if `rejected` is possible."
+            },
+            "result": {
+              "description": "Value of the final expression rendered as JSON, or null when it has no JSON representation."
+            },
+            "resultRepr": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "Python `repr` of the same value, which stays faithful where the JSON rendering cannot."
+            },
+            "stdout": {
+              "type": "string"
+            },
+            "stderr": {
+              "type": "string"
+            },
+            "stdoutTruncated": {
+              "type": "boolean"
+            },
+            "stderrTruncated": {
+              "type": "boolean"
+            },
+            "stdoutUtf8Bytes": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "stderrUtf8Bytes": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "exception": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CodeException"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "diagnostic": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "Actionable guidance derived from the failure, aimed at the calling agent rather than a human."
+            },
+            "timedOut": {
+              "type": "boolean"
+            },
+            "memoryExceeded": {
+              "type": "boolean"
+            },
+            "suspensionLimitExceeded": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "version",
+            "kind",
+            "outcome",
+            "timeoutMs",
+            "durationMs",
+            "typeChecked",
+            "result",
+            "stdout",
+            "stderr",
+            "stdoutTruncated",
+            "stderrTruncated",
+            "stdoutUtf8Bytes",
+            "stderrUtf8Bytes",
+            "timedOut",
+            "memoryExceeded",
+            "suspensionLimitExceeded"
+          ],
+          "title": "CodeOutput",
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "definitions": {
+            "Outcome": {
+              "oneOf": [
+                {
+                  "type": "string",
+                  "const": "completed",
+                  "description": "The snippet ran to completion and produced a value."
+                },
+                {
+                  "type": "string",
+                  "const": "exception",
+                  "description": "The snippet ran and raised a Python exception."
+                },
+                {
+                  "type": "string",
+                  "const": "rejected",
+                  "description": "The snippet never ran: type checking or the parser refused it, so there are no side effects."
+                },
+                {
+                  "type": "string",
+                  "const": "limited",
+                  "description": "A time, memory, or round-trip budget stopped execution."
+                },
+                {
+                  "type": "string",
+                  "const": "unavailable",
+                  "description": "The executor could not service the call. Nothing can be inferred about the snippet."
+                }
+              ],
+              "description": "How a call ended. This is the field an agent should branch on before reading anything else."
+            },
+            "CodeException": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "description": "Python exception class name, for example `ValueError`."
+                },
+                "message": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "message"
+              ]
+            }
+          }
+        },
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": false,
+          "openWorldHint": false
+        },
+        "_meta": {
+          "ai.workcell/presentation-profile": "python.result.v1",
+          "ai.workcell/contract": {
+            "id": "python.execution.v1",
+            "version": "v1",
+            "resultVersion": "v1"
+          }
+        }
+      }
+    ]
+  }
+}

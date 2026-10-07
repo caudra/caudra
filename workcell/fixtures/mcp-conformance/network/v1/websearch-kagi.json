@@ -1,0 +1,78 @@
+{
+  "fixtureVersion": 1,
+  "caseID": "network.websearch.kagi-lowering",
+  "provenance": ["rust/crates/mcp-web/src/search/kagi.rs", "Kagi Search API documentation"],
+  "tool": "websearch",
+  "input": {
+    "query": "kagi query",
+    "country": "us",
+    "pageno": 2,
+    "time_range": "month",
+    "safesearch": 2,
+    "limit": 4,
+    "timeoutSec": 17
+  },
+  "configuration": {
+    "enabled": true,
+    "backend": "kagi",
+    "credential": { "type": "api_key", "key": "kagi-fixture-secret" }
+  },
+  "setup": {
+    "mockResponses": [
+      {
+        "url": "https://kagi.com/api/v1/search",
+        "method": "POST",
+        "status": 200,
+        "headers": { "content-type": "application/json" },
+        "jsonBody": {
+          "data": {
+            "search": [
+              {
+                "title": "Kagi result",
+                "url": "https://result.example.test/kagi",
+                "snippet": "Kagi context."
+              }
+            ]
+          }
+        }
+      }
+    ],
+    "unmatchedResponse": { "status": 404, "body": "not found" }
+  },
+  "expected": {
+    "contentText": "1. Kagi result [kagi]\n   URL: https://result.example.test/kagi\n   Kagi context.",
+    "structuredContent": {
+      "kind": "websearch",
+      "backend": "kagi",
+      "query": "kagi query",
+      "resultsFound": 1,
+      "results": [
+        {
+          "title": "Kagi result",
+          "url": "https://result.example.test/kagi",
+          "snippet": "Kagi context.",
+          "engine": "kagi"
+        }
+      ]
+    },
+    "requestIncludes": [
+      {
+        "method": "POST",
+        "url": "https://kagi.com/api/v1/search",
+        "redirect": "error",
+        "headers": { "authorization": "Bearer kagi-fixture-secret" },
+        "jsonBody": {
+          "query": "kagi query",
+          "workflow": "search",
+          "format": "json",
+          "limit": 4,
+          "timeout": 16,
+          "page": 2,
+          "filters": { "region": "US", "after": "2026-06-02" },
+          "safe_search": true
+        }
+      }
+    ],
+    "serializedOutputExcludes": ["kagi-fixture-secret"]
+  }
+}

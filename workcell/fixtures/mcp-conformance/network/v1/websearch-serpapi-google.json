@@ -1,0 +1,69 @@
+{
+  "fixtureVersion": 1,
+  "caseID": "network.websearch.serpapi-google-lowering",
+  "provenance": [
+    "rust/crates/mcp-web/src/search/serpapi.rs",
+    "SerpApi Google Search API documentation"
+  ],
+  "tool": "websearch",
+  "input": {
+    "query": "google query",
+    "country": "us",
+    "language": "en",
+    "pageno": 2,
+    "time_range": "month",
+    "safesearch": 2,
+    "limit": 6,
+    "timeoutSec": 19
+  },
+  "configuration": {
+    "enabled": true,
+    "backend": "serpapi-google",
+    "credential": { "type": "api_key", "key": "serpapi-google-secret" }
+  },
+  "setup": {
+    "mockResponses": [
+      {
+        "url": "https://serpapi.com/search.json",
+        "method": "GET",
+        "status": 200,
+        "headers": { "content-type": "application/json" },
+        "jsonBody": {
+          "organic_results": [
+            {
+              "title": "Google result",
+              "link": "https://result.example.test/google",
+              "snippet": "Google result via SerpApi."
+            }
+          ]
+        }
+      }
+    ],
+    "unmatchedResponse": { "status": 404, "body": "not found" }
+  },
+  "expected": {
+    "contentText": "1. Google result [serpapi-google]\n   URL: https://result.example.test/google\n   Google result via SerpApi.",
+    "structuredContent": {
+      "kind": "websearch",
+      "backend": "serpapi",
+      "query": "google query",
+      "resultsFound": 1,
+      "results": [
+        {
+          "title": "Google result",
+          "url": "https://result.example.test/google",
+          "snippet": "Google result via SerpApi.",
+          "engine": "serpapi-google"
+        }
+      ]
+    },
+    "requestIncludes": [
+      {
+        "method": "GET",
+        "url": "https://serpapi.com/search.json?api_key=serpapi-google-secret&engine=google&q=google+query&num=6&gl=us&hl=en&start=6&tbs=qdr%3Am&safe=active",
+        "redirect": "error"
+      }
+    ],
+    "serializedOutputExcludes": ["serpapi-google-secret"]
+  }
+}

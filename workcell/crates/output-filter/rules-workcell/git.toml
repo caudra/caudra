@@ -1,0 +1,56 @@
+[filters.git]
+description = "Drop git advice blocks and transfer progress"
+match_command = "^git\\b"
+filter_stderr = true
+strip_lines_matching = [
+  "^\\s*\\(use \"git ",
+  "^\\s*\\(commit or discard",
+  "^remote: (Counting|Compressing|Enumerating|Total) ",
+  "^(Receiving|Resolving|Counting|Compressing|Enumerating) objects: ",
+  "^Cloning into ",
+  "^Unpacking objects: ",
+  "^done\\.$",
+  "^\\s*$",
+]
+on_empty = "git: ok"
+
+[[tests.git]]
+name = "status keeps state and drops advice"
+input = """
+On branch master
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   a.txt
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	b.txt
+
+no changes added to commit (use "git add" and/or "git commit -a")
+"""
+expected = """
+On branch master
+Changes not staged for commit:
+	modified:   a.txt
+Untracked files:
+	b.txt
+no changes added to commit (use "git add" and/or "git commit -a")
+"""
+
+[[tests.git]]
+name = "clone progress collapses to a success line"
+input = """
+Cloning into 'clonetarget'...
+done.
+"""
+expected = "git: ok"
+
+[[tests.git]]
+name = "errors survive"
+input = """
+fatal: not a git repository (or any of the parent directories): .git
+"""
+expected = """
+fatal: not a git repository (or any of the parent directories): .git
+"""

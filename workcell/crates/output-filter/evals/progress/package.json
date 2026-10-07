@@ -1,0 +1,9 @@
+{
+  "name": "progress-generators",
+  "private": true,
+  "description": "Third-party progress libraries, installed only so the harness can measure what they write to a pipe.",
+  "dependencies": {
+    "cli-progress": "^3.12.0",
+    "ora": "^8.1.1"
+  }
+}

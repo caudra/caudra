@@ -1,0 +1,44 @@
+[package]
+name = "workcell-mcp-files"
+description = "Typed confined and host-managed filesystem tools for Workcell"
+readme = "README.md"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[features]
+default = ["mcp"]
+index = [
+  "dep:tree-sitter",
+  "dep:workcell-source-languages",
+]
+mcp = ["dep:rmcp"]
+
+[dependencies]
+dunce.workspace = true
+file-format.workspace = true
+notify.workspace = true
+regex.workspace = true
+rustix.workspace = true
+rmcp = { workspace = true, optional = true }
+schemars.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, features = ["preserve_order"] }
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tree-sitter = { workspace = true, optional = true }
+uuid.workspace = true
+workcell-source-languages = { workspace = true, optional = true }
+workcell-tool-contract.workspace = true
+workcell-host-contract.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

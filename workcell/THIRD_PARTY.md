@@ -1,0 +1,53 @@
+# Third-Party Material
+
+Workcell is Apache-2.0. This file records third-party material vendored into the source tree, as
+distinct from crates resolved by Cargo, whose licences are recorded in `Cargo.lock` and audited by
+the dependency check.
+
+## Vendored tree-sitter tags queries
+
+`crates/source-languages/queries/<language>/tags.scm`
+
+Seventeen queries — bash, c, c_sharp, cpp, go, java, json, lua, objc, php, python, ruby, rust, swift,
+toml, typescript, yaml — are seeded from [ripwire](https://github.com/redhat-et/ripwire), Apache-2.0,
+which derived them in turn from the upstream tree-sitter grammar repositories, MIT. Each file states
+its provenance and any deliberate divergence from upstream in its header. CUDA has no query of its
+own: its grammar extends C++'s, and it shares `cpp`. Objective-C's grammar extends C's, and `objc`
+holds only the Objective-C layer that is appended to `c`.
+
+They are not copies. Every seeded query was re-verified against the grammar version vendored here,
+which differs from ripwire's, and capture names were normalized to the vocabulary in
+`crates/source-languages/src/roles.rs`. The divergences ripwire documents — notably the Rust
+`@definition.method` span fix and the `::`-path and turbofish call patterns upstream lacks — are
+carried forward with their reasoning intact, because the reasoning is what makes them reviewable.
+
+The remaining eighteen — cmake, containerfile, css, dart, elixir, gleam, hcl, html, kotlin, make,
+markdown, nix, proto, scala, sql, starlark, xml, zig — are authored here against the vendored
+grammars and carry no upstream provenance.
+
+## Code-graph pipeline
+
+`crates/code-graph/`
+
+The ranking pipeline — the resolution ladder, personalized PageRank over an in-edge graph, the BM25
+lexical lane, and their reciprocal-rank fusion — is a reimplementation of the corresponding stages of
+[ripwire](https://github.com/redhat-et/ripwire), Apache-2.0. No ripwire source is vendored: it is
+C++, this is Rust, and the data structures, bounds, cache, and honesty vocabulary are our own. The
+debt is to the design, and it is recorded here because the design is what makes the two comparable.
+
+Ripwire's on-disk cache blob, its write verbs, its own transport, and its remaining verb families are
+deliberately not ported. `crates/mcp-code-graph/README.md` records the benchmark comparison against
+the upstream binary.
+
+## Output filter rules
+
+`crates/output-filter/rules/`
+
+Vendored verbatim from RTK. The corpus must stay byte-identical so a refresh is a clean copy;
+rules authored here live in `crates/output-filter/rules-workcell/` instead.
+
+## Monty worker
+
+The `monty` worker binary is installed from a pinned upstream release rather than built with the
+workspace, and is not vendored into this tree. `crates/monty-worker` embeds the bytes of that
+release at build time when `WORKCELL_BUNDLED_MONTY_WORKER` is set.

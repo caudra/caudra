@@ -1,0 +1,63 @@
+{
+  "fixtureVersion": 1,
+  "caseID": "filesystem.read.directory",
+  "provenance": [
+    "rust/crates/mcp-files/src/read_operations.rs",
+    "rust/crates/mcp-files/tests/conformance_fixtures.rs"
+  ],
+  "tool": "file_read",
+  "input": {
+    "filePath": "."
+  },
+  "setup": {
+    "files": [
+      {
+        "path": "docs/guide.md",
+        "asset": "assets/filesystem/guide.md"
+      },
+      {
+        "path": "notes.txt",
+        "asset": "assets/filesystem/notes.txt"
+      }
+    ]
+  },
+  "expected": {
+    "contentText": "docs/\nnotes.txt",
+    "structuredContent": {
+      "kind": "directory",
+      "path": "{{ROOT}}",
+      "relativePath": ".",
+      "entryDetails": [
+        {
+          "relativePath": "docs/",
+          "kind": "directory"
+        },
+        {
+          "relativePath": "notes.txt",
+          "kind": "file",
+          "sizeBytes": 22,
+          "lineCount": 4
+        }
+      ],
+      "truncated": false
+    },
+    "postFilesystem": [
+      {
+        "path": "docs/guide.md",
+        "asset": "assets/filesystem/guide.md"
+      },
+      {
+        "path": "notes.txt",
+        "asset": "assets/filesystem/notes.txt"
+      }
+    ]
+  },
+  "normalization": {
+    "replacements": [
+      {
+        "placeholder": "{{ROOT}}",
+        "source": "configured canonical filesystem root"
+      }
+    ]
+  }
+}

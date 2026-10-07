@@ -1,0 +1,45 @@
+[filters.tar]
+description = "Drop the per-member listing that tar -v prints while creating or extracting"
+# Verbose create and extract are matched; `-t` is not, because listing an
+# archive's members is the result the caller asked for rather than progress.
+# The flags must be written as one cluster, as in `tar -xzvf`, since the
+# excluded-character form below cannot span a separated argument.
+match_command = "^tar\\s+-?[^ t]*[cx][^ t]*v[^ t]*(\\s|$)|^tar\\s+-?[^ t]*v[^ t]*[cx][^ t]*(\\s|$)"
+filter_stderr = true
+# Every diagnostic tar emits is prefixed with its own name, so keeping that
+# prefix keeps the warnings and errors while dropping one line per member.
+keep_lines_matching = ["^tar: "]
+on_empty = "tar: ok"
+
+[[tests.tar]]
+name = "the member listing collapses to a success line"
+input = """
+tardemo/
+tardemo/files/
+tardemo/files/f154.txt
+tardemo/files/f131.txt
+tardemo/files/f47.txt
+"""
+expected = "tar: ok"
+
+[[tests.tar]]
+name = "warnings survive the listing"
+input = """
+tar: Removing leading `/' from member names
+/work/pydemo/
+/work/pydemo/test_sample.py
+"""
+expected = """
+tar: Removing leading `/' from member names
+"""
+
+[[tests.tar]]
+name = "errors survive"
+input = """
+tar: missing.tar: Cannot open: No such file or directory
+tar: Error is not recoverable: exiting now
+"""
+expected = """
+tar: missing.tar: Cannot open: No such file or directory
+tar: Error is not recoverable: exiting now
+"""

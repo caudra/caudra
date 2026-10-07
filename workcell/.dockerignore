@@ -1,0 +1,6 @@
+.git
+.github
+target
+.env
+*.env.local
+*.log

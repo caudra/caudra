@@ -1,0 +1,48 @@
+{
+  "fixtureVersion": 1,
+  "caseID": "network.webfetch.text-dispatch",
+  "provenance": [
+    "rust/crates/mcp-web/src/fetch.rs",
+    "rust/crates/mcp-web/tests/web_tools.rs"
+  ],
+  "tool": "webfetch",
+  "input": {
+    "url": "https://example.test/plain.txt",
+    "format": "text"
+  },
+  "setup": {
+    "mockResponses": [
+      {
+        "url": "https://example.test/plain.txt",
+        "status": 200,
+        "headers": {
+          "content-type": "text/plain; charset=utf-8"
+        },
+        "bodyAsset": "assets/network/plain.txt"
+      }
+    ],
+    "unmatchedResponse": {
+      "status": 404,
+      "body": "not found"
+    }
+  },
+  "expected": {
+    "contentText": "hello\nworld\n",
+    "structuredContent": {
+      "kind": "webfetch",
+      "url": "https://example.test/plain.txt",
+      "finalUrl": "https://example.test/plain.txt",
+      "contentType": "text/plain",
+      "format": "text",
+      "status": 200,
+      "output": "hello\nworld\n",
+      "truncated": false
+    },
+    "requestIncludes": [
+      {
+        "method": "GET",
+        "url": "https://example.test/plain.txt"
+      }
+    ]
+  }
+}

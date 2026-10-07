@@ -1,0 +1,64 @@
+[filters.cargo-build]
+description = "Compact cargo build, check, and clippy output"
+match_command = "^cargo\\s+(build|check|clippy)\\b"
+filter_stderr = true
+strip_lines_matching = [
+  "^\\s*Updating (crates\\.io index|git repository)",
+  "^\\s*Downloading crates",
+  "^\\s*Downloaded ",
+  "^\\s*Compiling ",
+  "^\\s*Fresh ",
+  "^\\s*Blocking waiting for file lock",
+  "^\\s*Finished ",
+  "^\\s*$",
+]
+on_empty = "cargo: ok"
+
+[[tests.cargo-build]]
+name = "drops progress and keeps diagnostics"
+input = """
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded itoa v1.0.18
+   Compiling itoa v1.0.18
+   Compiling rustdemo v0.1.0 (/work/rustdemo)
+warning: unused variable: `unused`
+ --> src/main.rs:3:9
+  |
+3 |     let unused = 1;
+  |         ^^^^^^ help: prefix it with an underscore
+  |
+  = note: `#[warn(unused_variables)]` on by default
+warning: `rustdemo` (bin "rustdemo") generated 1 warning
+    Finished dev [unoptimized + debuginfo] target(s) in 0.36s
+"""
+expected = """
+warning: unused variable: `unused`
+ --> src/main.rs:3:9
+  |
+3 |     let unused = 1;
+  |         ^^^^^^ help: prefix it with an underscore
+  |
+  = note: `#[warn(unused_variables)]` on by default
+warning: `rustdemo` (bin "rustdemo") generated 1 warning
+"""
+
+[[tests.cargo-build]]
+name = "errors survive"
+input = """
+   Compiling rustdemo v0.1.0 (/work/rustdemo)
+error[E0308]: mismatched types
+ --> src/main.rs:2:5
+"""
+expected = """
+error[E0308]: mismatched types
+ --> src/main.rs:2:5
+"""
+
+[[tests.cargo-build]]
+name = "a clean build reports success"
+input = """
+   Compiling rustdemo v0.1.0 (/work/rustdemo)
+    Finished dev [unoptimized + debuginfo] target(s) in 0.36s
+"""
+expected = "cargo: ok"

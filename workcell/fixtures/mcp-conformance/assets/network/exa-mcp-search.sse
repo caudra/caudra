@@ -1,0 +1,2 @@
+event: message
+data: {"result":{"content":[{"type":"text","text":"Title: Exa MCP result\nURL: https://result.example.test/exa-mcp\nPublished: N/A\nAuthor: N/A\nHighlights:\nHosted Exa MCP search context.","_meta":{"ignored":"remote-metadata-canary"}}]},"jsonrpc":"2.0","id":1}

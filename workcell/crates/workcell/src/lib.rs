@@ -1,0 +1,72 @@
+#![forbid(unsafe_code)]
+
+//! Protocol-neutral typed APIs for embedding Workcell tools.
+
+pub use workcell_tool_contract::{
+    CatalogRevision, OwnedToolSpec, ToolAnnotations, ToolContract, ToolManifest, ToolSpec,
+};
+
+#[cfg(feature = "host-contract")]
+pub use workcell_host_contract as host_contract;
+
+#[cfg(feature = "environment")]
+pub use workcell_environment as environment;
+#[cfg(feature = "environment")]
+pub use workcell_environment::ExecutionEnvironment;
+#[cfg(feature = "code")]
+pub use workcell_mcp_code as code;
+#[cfg(feature = "code")]
+pub use workcell_mcp_code::CodeToolGroup;
+#[cfg(feature = "code-graph")]
+pub use workcell_mcp_code_graph as code_graph;
+#[cfg(feature = "code-graph")]
+pub use workcell_mcp_code_graph::{
+    CodeContextInput, CodeContextOutput, CodeExpandInput, CodeExpandOutput, CodeGraphError,
+    CodeGraphLimits, CodeGraphToolGroup, CodeImpactInput, CodeImpactOutput, CodeMapInput,
+    CodeMapOutput, CodeRefsInput, CodeRefsOutput, Direction, GraphPhase, GraphProgress,
+    GraphProgressSink, GraphSummary, RankedSymbol, ReachedSymbol, SelectorRefusal, SymbolRef,
+    crawl_filesystem_limits, fit,
+};
+// `ModelText` is the name two groups give their model-facing rendering, so the facade cannot
+// re-export both unqualified. Both stay reachable as `files::ModelText` and
+// `code_graph::ModelText`.
+#[cfg(feature = "code-graph")]
+pub use workcell_mcp_code_graph::ModelText as CodeGraphModelText;
+#[cfg(feature = "files")]
+pub use workcell_mcp_files as files;
+#[cfg(feature = "files")]
+pub use workcell_mcp_files::{FileToolGroup, PreparedFilePatch};
+#[cfg(feature = "files-index")]
+pub use workcell_mcp_files::{
+    INDEX_MAX_DEADLINE_MS, INDEX_MAX_PATH_BYTES, INDEX_PARSER_CONCURRENCY, IndexDirectoryEntry,
+    IndexDirectoryEntryKind, IndexExecutionConfiguration, IndexInput, IndexLimits,
+    IndexLineSemantic, IndexOutput, IndexOutputLine, IndexSourceRange,
+};
+#[cfg(feature = "shell")]
+pub use workcell_mcp_shell as shell;
+#[cfg(feature = "shell")]
+pub use workcell_mcp_shell::{PreparedShell, ShellPreparationError, ShellToolGroup};
+#[cfg(feature = "web")]
+pub use workcell_mcp_web as web;
+#[cfg(feature = "web")]
+pub use workcell_mcp_web::{PreparedWebfetch, PreparedWebsearch, WebToolGroup};
+// The bounded client the web tools are built on, for a host that sends its own
+// requests under the same URL policy, DNS pinning, proxy routing, and bounds.
+#[cfg(feature = "web")]
+pub use workcell_net as net;
+// Progress chunks are byte-exact by contract, so a host that displays a redraw
+// stream rather than replaying it has to render one itself.
+#[cfg(feature = "shell")]
+pub use workcell_output_filter as output_filter;
+
+#[cfg(feature = "scm")]
+pub use workcell_workspace_scm as scm;
+#[cfg(feature = "scm")]
+pub use workcell_workspace_scm::ScmGroup;
+
+#[cfg(feature = "snapshot-store")]
+pub use workcell_snapshot_store as snapshot_store;
+#[cfg(feature = "snapshots")]
+pub use workcell_workspace_snapshot as snapshots;
+#[cfg(feature = "snapshots")]
+pub use workcell_workspace_snapshot::{ChangeStore, SnapshotManager};

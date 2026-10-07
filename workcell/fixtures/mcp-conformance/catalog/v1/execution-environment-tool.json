@@ -1,0 +1,457 @@
+{
+  "fixtureVersion": 1,
+  "caseID": "catalog.execution-environment.sdk-emitted.v1",
+  "catalogKind": "sdk-emitted",
+  "server": {
+    "name": "workcell-mcp",
+    "version": "0.1.0"
+  },
+  "provenance": [
+    "src/execution_environment.rs",
+    "src/server.rs"
+  ],
+  "expected": {
+    "tools": [
+      {
+        "name": "execution_environment",
+        "title": "Inspect execution environment",
+        "description": "Inspect the execution host's current sanitized environment.\n\nUse this tool when command availability, installed versions, privilege access, Git repository status, package-manager metadata, or recognized lockfiles may have changed since server discovery. Each call collects a fresh snapshot using bounded local checks; avoid repeated calls when an earlier result is still sufficient.\n\nThe result reports platform and runtime classifications, the platform's primary system package manager, effective-root status, non-interactive sudo status, enabled tool groups, workspace metadata, and availability and normalized versions for a fixed list of commands. `available` means the fixed executable resolved outside the configured root and could be started, not that every operation it supports is permitted or safe. Version fields are included only when bounded output contains a valid normalized version.\n\nOn Unix, `effectiveRoot` means effective UID 0, which may be namespaced and does not imply host root. When not root, the tool tests `sudo -n -- <resolved-true>`; `available` proves only that fixed command and can refresh the sudo credential timestamp, create audit records, or invoke PAM and policy plugins. Root skips sudo as `not-needed`; unsupported platforms report `not-applicable`.\n\nThe tool accepts no arguments and never runs client-provided commands. It may start fixed local executables with fixed inspection arguments from a working directory outside the configured root; accepted executables may invoke their own subprocesses from the same root-filtered `PATH`. It omits raw paths, environment values, probe output, file contents, tool arguments, and credentials. Privilege, package-manager, container, sandbox, network, and command classifications are best-effort observations; do not use them as security or authorization guarantees.",
+        "inputSchema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        },
+        "outputSchema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "version",
+            "snapshotRevision",
+            "scope",
+            "os",
+            "runtime",
+            "execution",
+            "container",
+            "workspace",
+            "toolGroups",
+            "commands"
+          ],
+          "properties": {
+            "version": {
+              "const": "v1"
+            },
+            "snapshotRevision": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            },
+            "scope": {
+              "const": "server-process"
+            },
+            "os": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "family",
+                "architecture",
+                "pathStyle",
+                "kernelRelease",
+                "distribution",
+                "wsl",
+                "systemPackageManager"
+              ],
+              "properties": {
+                "family": {
+                  "enum": [
+                    "linux",
+                    "macos",
+                    "windows",
+                    "other"
+                  ]
+                },
+                "architecture": {
+                  "enum": [
+                    "x86_64",
+                    "aarch64",
+                    "x86",
+                    "arm",
+                    "other"
+                  ]
+                },
+                "pathStyle": {
+                  "enum": [
+                    "windows",
+                    "posix"
+                  ]
+                },
+                "kernelRelease": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "maxLength": 128
+                },
+                "distribution": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "maxLength": 128
+                },
+                "wsl": {
+                  "type": "boolean"
+                },
+                "systemPackageManager": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "name",
+                    "available"
+                  ],
+                  "properties": {
+                    "name": {
+                      "enum": [
+                        "apt",
+                        "dnf",
+                        "yum",
+                        "apk",
+                        "pacman",
+                        "zypper",
+                        "xbps",
+                        "emerge",
+                        "nix",
+                        "brew",
+                        "winget",
+                        "pkg",
+                        "unknown"
+                      ]
+                    },
+                    "available": {
+                      "type": "boolean"
+                    },
+                    "executable": {
+                      "enum": [
+                        "apt-get",
+                        "dnf",
+                        "yum",
+                        "apk",
+                        "pacman",
+                        "zypper",
+                        "xbps-install",
+                        "emerge",
+                        "nix",
+                        "brew",
+                        "winget",
+                        "pkg"
+                      ]
+                    },
+                    "version": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 64
+                    }
+                  }
+                }
+              }
+            },
+            "runtime": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "name",
+                "version"
+              ],
+              "properties": {
+                "name": {
+                  "const": "workcell-mcp"
+                },
+                "version": {
+                  "type": "string"
+                }
+              }
+            },
+            "execution": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "shell",
+                "sandbox",
+                "networkAccess",
+                "environmentInheritance",
+                "privilege"
+              ],
+              "properties": {
+                "shell": {
+                  "enum": [
+                    "bash",
+                    "cmd",
+                    "other",
+                    "none"
+                  ]
+                },
+                "sandbox": {
+                  "enum": [
+                    "container",
+                    "virtual-machine",
+                    "unknown"
+                  ]
+                },
+                "networkAccess": {
+                  "enum": [
+                    "host-policy",
+                    "proxied"
+                  ]
+                },
+                "environmentInheritance": {
+                  "enum": [
+                    "allowlisted",
+                    "not-applicable"
+                  ]
+                },
+                "privilege": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "effectiveRoot",
+                    "nonInteractiveSudo"
+                  ],
+                  "properties": {
+                    "effectiveRoot": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    },
+                    "nonInteractiveSudo": {
+                      "enum": [
+                        "available",
+                        "unavailable",
+                        "not-found",
+                        "not-needed",
+                        "not-applicable",
+                        "unknown"
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            "container": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "kind",
+                "evidence"
+              ],
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "none",
+                    "docker",
+                    "podman",
+                    "containerd",
+                    "kubernetes",
+                    "lxc",
+                    "devcontainer",
+                    "codespaces",
+                    "wsl",
+                    "container",
+                    "virtual-machine",
+                    "unknown"
+                  ]
+                },
+                "evidence": {
+                  "type": "array",
+                  "uniqueItems": true,
+                  "items": {
+                    "enum": [
+                      "env-container",
+                      "env-codespaces",
+                      "env-devcontainer",
+                      "dockerenv",
+                      "containerenv",
+                      "proc-cgroup",
+                      "systemd-detect-virt",
+                      "wsl-kernel"
+                    ]
+                  }
+                }
+              }
+            },
+            "workspace": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "git",
+                "packageManager"
+              ],
+              "properties": {
+                "git": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "available",
+                    "repository"
+                  ],
+                  "properties": {
+                    "available": {
+                      "type": "boolean"
+                    },
+                    "repository": {
+                      "enum": [
+                        "yes",
+                        "no",
+                        "unknown"
+                      ]
+                    }
+                  }
+                },
+                "packageManager": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "lockfiles"
+                  ],
+                  "properties": {
+                    "declared": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "name"
+                      ],
+                      "properties": {
+                        "name": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 64
+                        },
+                        "version": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 64
+                        }
+                      }
+                    },
+                    "inferred": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 64
+                    },
+                    "lockfiles": {
+                      "type": "array",
+                      "uniqueItems": true,
+                      "items": {
+                        "enum": [
+                          "pnpm-lock.yaml",
+                          "package-lock.json",
+                          "npm-shrinkwrap.json",
+                          "yarn.lock",
+                          "bun.lock",
+                          "bun.lockb"
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "toolGroups": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "files",
+                "web",
+                "shell",
+                "code",
+                "codeGraph"
+              ],
+              "properties": {
+                "files": {
+                  "type": "boolean"
+                },
+                "web": {
+                  "type": "boolean"
+                },
+                "shell": {
+                  "type": "boolean"
+                },
+                "code": {
+                  "type": "boolean"
+                },
+                "codeGraph": {
+                  "type": "boolean"
+                }
+              }
+            },
+            "commands": {
+              "type": "array",
+              "minItems": 24,
+              "maxItems": 24,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "id",
+                  "available"
+                ],
+                "properties": {
+                  "id": {
+                    "enum": [
+                      "bash",
+                      "zsh",
+                      "fish",
+                      "cmd",
+                      "pwsh",
+                      "powershell",
+                      "python3",
+                      "python",
+                      "uv",
+                      "uvx",
+                      "node",
+                      "bun",
+                      "pnpm",
+                      "npm",
+                      "yarn",
+                      "git",
+                      "rg",
+                      "grep",
+                      "docker",
+                      "podman",
+                      "nerdctl",
+                      "docker-compose",
+                      "kubectl",
+                      "devcontainer"
+                    ]
+                  },
+                  "available": {
+                    "type": "boolean"
+                  },
+                  "version": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64
+                  }
+                }
+              }
+            }
+          }
+        },
+        "annotations": {
+          "readOnlyHint": false,
+          "destructiveHint": false,
+          "idempotentHint": false,
+          "openWorldHint": true
+        },
+        "_meta": {
+          "ai.workcell/presentation-profile": "execution-environment.snapshot.v1",
+          "ai.workcell/contract": {
+            "id": "execution-environment.snapshot.v1",
+            "version": "v1",
+            "resultVersion": "v1"
+          }
+        }
+      }
+    ]
+  }
+}

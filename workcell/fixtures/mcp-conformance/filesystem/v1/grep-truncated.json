@@ -1,0 +1,69 @@
+{
+  "fixtureVersion": 1,
+  "caseID": "filesystem.grep.truncated-reports-scan-coverage",
+  "provenance": [
+    "rust/crates/mcp-files/src/read_operations/grep.rs",
+    "rust/crates/mcp-files/src/model_text.rs",
+    "rust/crates/mcp-files/tests/conformance_fixtures.rs"
+  ],
+  "tool": "file_grep",
+  "input": {
+    "pattern": "^alpha"
+  },
+  "configuration": {
+    "limits": {
+      "maxSearchResults": 1
+    }
+  },
+  "setup": {
+    "files": [
+      {
+        "path": "notes.txt",
+        "asset": "assets/filesystem/notes.txt"
+      },
+      {
+        "path": "second.txt",
+        "asset": "assets/filesystem/notes.txt"
+      }
+    ]
+  },
+  "expected": {
+    "contentText": "notes.txt:1: alpha\n[truncated: showing 1 matches from 1 of 2 files searched]",
+    "structuredContent": {
+      "cwd": "{{ROOT}}",
+      "relativePath": ".",
+      "pattern": "^alpha",
+      "rows": [
+        {
+          "path": "{{ROOT}}/notes.txt",
+          "relativePath": "notes.txt",
+          "line": 1,
+          "text": "alpha",
+          "matched": true
+        }
+      ],
+      "matches": 1,
+      "filesScanned": 1,
+      "filesListed": 2,
+      "truncated": true
+    },
+    "postFilesystem": [
+      {
+        "path": "notes.txt",
+        "asset": "assets/filesystem/notes.txt"
+      },
+      {
+        "path": "second.txt",
+        "asset": "assets/filesystem/notes.txt"
+      }
+    ]
+  },
+  "normalization": {
+    "replacements": [
+      {
+        "placeholder": "{{ROOT}}",
+        "source": "configured canonical filesystem root"
+      }
+    ]
+  }
+}

@@ -1,0 +1,57 @@
+workcell-output-filter
+Copyright The Workcell MCP authors
+
+This product includes the declarative command-output filter rules in `rules/`,
+which were copied verbatim from the RTK project.
+
+    RTK (Rust Token Killer)
+    https://github.com/rtk-ai/rtk
+    Copyright Patrick Szymkowiak and the RTK contributors
+    Licensed under the Apache License, Version 2.0
+
+    Vendored revision: aa408534859949ebac1dcc82ec4d25b575a539fa
+    Vendored tag:      dev-0.47.0-rc.386
+    Upstream path:     src/filters/*.toml
+
+The files in `rules/` are unmodified. The filter engine in `src/` is an
+independent implementation and is not derived from RTK source code.
+
+Only RTK's declarative filter corpus is vendored. RTK also implements per-command
+filtering in Rust under `src/cmds/`, where a module both executes the command and
+shapes its output, and in one case substitutes a different command line than the
+caller wrote. None of that is vendored or ported. This crate is a pure output
+transformation: it never spawns a process and never rewrites a command, because
+execution and authorization belong to the shell tool group.
+
+One vendored rule refers to that absent layer. The description in
+`rules/spring-boot.toml` states that `mvn spring-boot:run` is routed to a
+dedicated Maven filter and never reaches the Spring Boot rule. Upstream that
+filter is a Rust module, so the statement does not hold here and the command does
+reach the Spring Boot rule. That is the better fit for application logs, so
+`rules-workcell/maven.toml` matches Maven goals explicitly rather than the `mvn`
+program in order to preserve the routing.
+
+The rules in `rules-workcell/` are original to this project and are not derived
+from RTK. They are kept in a separate directory so that refreshing the vendored
+corpus stays a clean copy of `rules/`, and so that provenance is visible without
+reading individual files. Both directories are concatenated at build time and a
+file name may not appear in both.
+
+Behavioral changes relative to RTK, applied by this engine rather than by
+editing the vendored rules:
+
+  * `on_empty` and `match_output` short-circuit messages are suppressed when the
+    command exited non-zero, so a failing command is never reported as success.
+  * When a command exited non-zero, `max_lines` keeps the first and last lines
+    around one omission marker instead of only the first lines, so the error a
+    long failing build prints last is not cut.
+  * Rules are matched against a normalized command scope produced by
+    tree-sitter Bash parsing rather than the raw command string.
+  * Only the built-in rule set is loaded. Project-local and user-global rule
+    files are deliberately unsupported.
+  * Two reductions are command-independent and have no counterpart upstream:
+    terminal redraw rendering, which decodes a carriage-return control stream
+    into the rows a terminal would show, and progress line collapse, which
+    reduces runs of frames that arrive one per line. Neither is selected by
+    `match_command`, because the programs that emit progress bars are
+    overwhelmingly ones the corpus does not name.

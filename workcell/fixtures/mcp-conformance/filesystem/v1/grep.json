@@ -1,0 +1,64 @@
+{
+  "fixtureVersion": 1,
+  "caseID": "filesystem.grep.anchored-with-include",
+  "provenance": [
+    "rust/crates/mcp-files/src/read_operations.rs",
+    "rust/crates/mcp-files/tests/conformance_fixtures.rs"
+  ],
+  "tool": "file_grep",
+  "input": {
+    "pattern": "^alpha",
+    "include": "*.txt"
+  },
+  "setup": {
+    "files": [
+      {
+        "path": "notes.txt",
+        "asset": "assets/filesystem/notes.txt"
+      }
+    ]
+  },
+  "expected": {
+    "contentText": "notes.txt:1: alpha\nnotes.txt:3: alpha beta",
+    "structuredContent": {
+      "cwd": "{{ROOT}}",
+      "relativePath": ".",
+      "pattern": "^alpha",
+      "include": "*.txt",
+      "rows": [
+        {
+          "path": "{{ROOT}}/notes.txt",
+          "relativePath": "notes.txt",
+          "line": 1,
+          "text": "alpha",
+          "matched": true
+        },
+        {
+          "path": "{{ROOT}}/notes.txt",
+          "relativePath": "notes.txt",
+          "line": 3,
+          "text": "alpha beta",
+          "matched": true
+        }
+      ],
+      "matches": 2,
+      "filesScanned": 1,
+      "filesListed": 1,
+      "truncated": false
+    },
+    "postFilesystem": [
+      {
+        "path": "notes.txt",
+        "asset": "assets/filesystem/notes.txt"
+      }
+    ]
+  },
+  "normalization": {
+    "replacements": [
+      {
+        "placeholder": "{{ROOT}}",
+        "source": "configured canonical filesystem root"
+      }
+    ]
+  }
+}

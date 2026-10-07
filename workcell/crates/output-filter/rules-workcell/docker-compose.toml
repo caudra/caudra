@@ -1,0 +1,63 @@
+[filters.docker-compose]
+description = "Drop Compose resource lifecycle chatter, keeping service output and exit codes"
+# Only lifecycle subcommands are matched. `ps` and `logs` exist to produce the
+# listing they print, and `build` is left to pass through until its output has
+# been captured and a rule written against it.
+match_command = "^docker(\\s+|-)compose\\s+(up|down|start|stop|restart|create|rm|pull)\\b"
+filter_stderr = true
+strip_lines_matching = [
+  "^\\s*(Network|Container|Volume|Image)\\s+\\S+\\s+(Creating|Created|Starting|Started|Stopping|Stopped|Removing|Removed|Recreating|Recreated|Waiting|Healthy|Running|Skipped|Pulling|Pulled|Built)\\b",
+  "^Attaching to ",
+  "^Aborting on container exit",
+  "^\\s*$",
+]
+on_empty = "docker compose: ok"
+
+[[tests.docker-compose]]
+name = "service output and exit codes survive lifecycle chatter"
+input = """
+ Network composedemo_default  Creating
+ Network composedemo_default  Created
+ Container composedemo-two-1  Creating
+ Container composedemo-one-1  Created
+Attaching to one-1, two-1
+two-1  | service two
+one-1  | service one
+\rtwo-1 exited with code 0
+Aborting on container exit...
+ Container composedemo-two-1  Stopping
+ Container composedemo-one-1  Stopped
+\rone-1 exited with code 0
+"""
+expected = """
+two-1  | service two
+one-1  | service one
+\rtwo-1 exited with code 0
+\rone-1 exited with code 0
+"""
+
+[[tests.docker-compose]]
+name = "a teardown collapses to a success line"
+input = """
+ Container composedemo-one-1  Stopping
+ Container composedemo-two-1  Stopping
+ Container composedemo-one-1  Stopped
+ Container composedemo-two-1  Stopped
+ Container composedemo-one-1  Removing
+ Container composedemo-two-1  Removing
+ Container composedemo-one-1  Removed
+ Container composedemo-two-1  Removed
+ Network composedemo_default  Removing
+ Network composedemo_default  Removed
+"""
+expected = "docker compose: ok"
+
+[[tests.docker-compose]]
+name = "errors survive"
+input = """
+ Container composedemo-one-1  Creating
+no such service: nope
+"""
+expected = """
+no such service: nope
+"""

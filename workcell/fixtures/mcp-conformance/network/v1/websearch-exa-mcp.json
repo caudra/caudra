@@ -1,0 +1,77 @@
+{
+  "fixtureVersion": 1,
+  "caseID": "network.websearch.exa-mcp-normalization",
+  "provenance": [
+    "crates/mcp-web/src/search/exa_mcp.rs",
+    "crates/mcp-web/tests/web_tools.rs"
+  ],
+  "tool": "websearch",
+  "input": {
+    "query": "exa mcp query",
+    "limit": 5
+  },
+  "configuration": {
+    "enabled": true,
+    "backend": "exa-mcp"
+  },
+  "setup": {
+    "mockResponses": [
+      {
+        "url": "https://mcp.exa.ai/mcp",
+        "method": "POST",
+        "status": 200,
+        "headers": {
+          "content-type": "text/event-stream"
+        },
+        "bodyAsset": "assets/network/exa-mcp-search.sse"
+      }
+    ],
+    "unmatchedResponse": {
+      "status": 404,
+      "body": "not found"
+    }
+  },
+  "expected": {
+    "contentText": "1. Exa MCP result [exa]\n   URL: https://result.example.test/exa-mcp\n   Hosted Exa MCP search context.",
+    "structuredContent": {
+      "kind": "websearch",
+      "backend": "exa-mcp",
+      "query": "exa mcp query",
+      "resultsFound": 1,
+      "results": [
+        {
+          "title": "Exa MCP result",
+          "url": "https://result.example.test/exa-mcp",
+          "snippet": "Hosted Exa MCP search context.",
+          "engine": "exa"
+        }
+      ]
+    },
+    "requestIncludes": [
+      {
+        "method": "POST",
+        "url": "https://mcp.exa.ai/mcp",
+        "redirect": "error",
+        "headers": {
+          "accept": "application/json, text/event-stream",
+          "content-type": "application/json",
+          "user-agent": "Workcell-ToolRuntime/0.1"
+        },
+        "jsonBody": {
+          "jsonrpc": "2.0",
+          "id": 1,
+          "method": "tools/call",
+          "params": {
+            "name": "web_search_exa",
+            "arguments": {
+              "query": "exa mcp query",
+              "numResults": 5
+            }
+          }
+        }
+      }
+    ],
+    "contentExcludes": ["remote-metadata-canary"],
+    "serializedOutputExcludes": ["remote-metadata-canary"]
+  }
+}

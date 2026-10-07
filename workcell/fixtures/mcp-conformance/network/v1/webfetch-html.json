@@ -1,0 +1,52 @@
+{
+  "fixtureVersion": 1,
+  "caseID": "network.webfetch.html-to-markdown-dispatch",
+  "provenance": [
+    "rust/crates/mcp-web/src/fetch.rs",
+    "rust/crates/mcp-web/src/html.rs",
+    "rust/crates/mcp-web/tests/web_tools.rs"
+  ],
+  "tool": "webfetch",
+  "input": {
+    "url": "https://example.test/article.html"
+  },
+  "setup": {
+    "mockResponses": [
+      {
+        "url": "https://example.test/article.html",
+        "status": 200,
+        "headers": {
+          "content-type": "text/html; charset=utf-8"
+        },
+        "bodyAsset": "assets/network/article.html"
+      }
+    ],
+    "unmatchedResponse": {
+      "status": 404,
+      "body": "not found"
+    }
+  },
+  "expected": {
+    "contentText": "# Research Note\n\nThis language-neutral article contains enough useful words to exercise readability extraction while preserving a [source link](https://example.test/source) for later review. The text describes a general research workflow without domain-specific assumptions or hidden application data.\n\nA second paragraph adds context, evidence, and explanatory detail so the extractor can select the article body with a stable high-signal result.",
+    "structuredContent": {
+      "kind": "webfetch",
+      "url": "https://example.test/article.html",
+      "finalUrl": "https://example.test/article.html",
+      "contentType": "text/html",
+      "format": "markdown",
+      "status": 200,
+      "title": "Research Note",
+      "output": "# Research Note\n\nThis language-neutral article contains enough useful words to exercise readability extraction while preserving a [source link](https://example.test/source) for later review. The text describes a general research workflow without domain-specific assumptions or hidden application data.\n\nA second paragraph adds context, evidence, and explanatory detail so the extractor can select the article body with a stable high-signal result.",
+      "truncated": false,
+      "extractionMethod": "readability",
+      "extractionLowSignal": false
+    },
+    "requestIncludes": [
+      {
+        "method": "GET",
+        "url": "https://example.test/article.html"
+      }
+    ],
+    "contentExcludes": ["removeMe()"]
+  }
+}

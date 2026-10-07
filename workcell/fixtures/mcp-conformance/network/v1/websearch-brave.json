@@ -1,0 +1,87 @@
+{
+  "fixtureVersion": 1,
+  "caseID": "network.websearch.brave-normalization",
+  "provenance": [
+    "rust/crates/mcp-web/src/search/brave.rs",
+    "Brave Web Search API reference: /api-reference/web/search/get"
+  ],
+  "tool": "websearch",
+  "input": {
+    "query": "brave query",
+    "country": "de",
+    "language": "de",
+    "pageno": 3,
+    "time_range": "month",
+    "safesearch": 2,
+    "limit": 20
+  },
+  "configuration": {
+    "enabled": true,
+    "backend": "brave",
+    "credential": {
+      "type": "api_key",
+      "key": "brave-secret"
+    }
+  },
+  "setup": {
+    "mockResponses": [
+      {
+        "url": "https://api.search.brave.com/res/v1/web/search",
+        "method": "GET",
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "jsonBody": {
+          "query": {
+            "original": "brave query",
+            "altered": "brave queries"
+          },
+          "web": {
+            "results": [
+              {
+                "title": "Brave result",
+                "url": "https://result.example.test/brave",
+                "description": "Relevant Brave search context."
+              }
+            ]
+          }
+        }
+      }
+    ],
+    "unmatchedResponse": {
+      "status": 404,
+      "body": "not found"
+    }
+  },
+  "expected": {
+    "contentText": "1. Brave result [brave]\n   URL: https://result.example.test/brave\n   Relevant Brave search context.",
+    "structuredContent": {
+      "kind": "websearch",
+      "backend": "brave",
+      "query": "brave queries",
+      "resultsFound": 1,
+      "results": [
+        {
+          "title": "Brave result",
+          "url": "https://result.example.test/brave",
+          "snippet": "Relevant Brave search context.",
+          "engine": "brave"
+        }
+      ]
+    },
+    "requestIncludes": [
+      {
+        "method": "GET",
+        "url": "https://api.search.brave.com/res/v1/web/search?q=brave+query&count=20&result_filter=web&text_decorations=false&country=DE&search_lang=de&offset=2&freshness=pm&safesearch=strict",
+        "redirect": "error",
+        "headers": {
+          "accept": "application/json",
+          "user-agent": "Workcell-ToolRuntime/0.1",
+          "x-subscription-token": "brave-secret"
+        }
+      }
+    ],
+    "serializedOutputExcludes": ["brave-secret"]
+  }
+}

@@ -1,0 +1,79 @@
+[filters.vitest]
+description = "Drop the Vitest banner, passing files, and timing filler, keeping failures and counts"
+match_command = "^(npx\\s+)?vitest\\b"
+strip_ansi = true
+filter_stderr = true
+strip_lines_matching = [
+  "^\\s*RUN\\s+v\\d",
+  # A passing file line restates the `Test Files` count. Failing files are
+  # marked with a different glyph and are kept.
+  "^\\s*[\u2713\u221a] \\S+ \\(\\d+ tests?\\)",
+  "^\\s*(Start at|Duration)\\s",
+  # Section rules drawn from box characters, including the trailing progress
+  # counter Vitest appends to the last one.
+  "^\\s*[\u23af]+\\s*$",
+  "^\\s*[\u23af]+\\[\\d+/\\d+\\][\u23af]*$",
+  "^\\s*$",
+]
+on_empty = "vitest: ok"
+
+[[tests.vitest]]
+name = "a passing run reduces to its counts"
+input = """
+
+ RUN  v4.1.11 /work/vitestdemo
+
+ \u2713 sum.test.js (2 tests) 3ms
+
+ Test Files  1 passed (1)
+      Tests  2 passed (2)
+   Start at  11:57:28
+   Duration  201ms (transform 21ms, setup 0ms, import 34ms, tests 3ms, environment 0ms)
+"""
+expected = """
+ Test Files  1 passed (1)
+      Tests  2 passed (2)
+"""
+
+[[tests.vitest]]
+name = "failure detail survives"
+input = """
+
+ RUN  v4.1.11 /work/vitestdemo
+
+ \u2713 sum.test.js (2 tests) 4ms
+ \u276f bad.test.js (1 test | 1 failed) 9ms
+   \u00d7 broken 8ms
+
+\u23af\u23af\u23af\u23af\u23af\u23af\u23af Failed Tests 1 \u23af\u23af\u23af\u23af\u23af\u23af\u23af
+
+ FAIL  bad.test.js > broken
+AssertionError: expected 2 to be 5 // Object.is equality
+
+- Expected
++ Received
+
+- 5
++ 2
+
+\u23af\u23af\u23af\u23af\u23af\u23af[1/1]\u23af
+
+
+ Test Files  1 failed | 1 passed (2)
+      Tests  1 failed | 2 passed (3)
+   Start at  11:59:07
+   Duration  236ms (transform 65ms, setup 0ms, import 95ms, tests 13ms, environment 0ms)
+"""
+expected = """
+ \u276f bad.test.js (1 test | 1 failed) 9ms
+   \u00d7 broken 8ms
+\u23af\u23af\u23af\u23af\u23af\u23af\u23af Failed Tests 1 \u23af\u23af\u23af\u23af\u23af\u23af\u23af
+ FAIL  bad.test.js > broken
+AssertionError: expected 2 to be 5 // Object.is equality
+- Expected
++ Received
+- 5
++ 2
+ Test Files  1 failed | 1 passed (2)
+      Tests  1 failed | 2 passed (3)
+"""

@@ -1,0 +1,88 @@
+{
+  "fixtureVersion": 1,
+  "caseID": "network.websearch.exa-normalization",
+  "provenance": [
+    "rust/crates/mcp-web/src/search/exa.rs",
+    "rust/crates/mcp-web/tests/web_tools.rs"
+  ],
+  "tool": "websearch",
+  "input": {
+    "query": "exa query",
+    "limit": 5,
+    "safesearch": 1
+  },
+  "configuration": {
+    "enabled": true,
+    "backend": "exa",
+    "credential": {
+      "type": "api_key",
+      "key": "exa-secret"
+    }
+  },
+  "setup": {
+    "mockResponses": [
+      {
+        "url": "https://api.exa.ai/search",
+        "method": "POST",
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "jsonBody": {
+          "results": [
+            {
+              "title": "Exa result",
+              "url": "https://result.example.test/article",
+              "highlights": ["Relevant Exa", "search context."]
+            }
+          ]
+        }
+      }
+    ],
+    "unmatchedResponse": {
+      "status": 404,
+      "body": "not found"
+    }
+  },
+  "expected": {
+    "contentText": "1. Exa result [exa]\n   URL: https://result.example.test/article\n   Relevant Exa search context.",
+    "structuredContent": {
+      "kind": "websearch",
+      "backend": "exa",
+      "query": "exa query",
+      "resultsFound": 1,
+      "results": [
+        {
+          "title": "Exa result",
+          "url": "https://result.example.test/article",
+          "snippet": "Relevant Exa search context.",
+          "engine": "exa"
+        }
+      ]
+    },
+    "requestIncludes": [
+      {
+        "method": "POST",
+        "url": "https://api.exa.ai/search",
+        "redirect": "error",
+        "headers": {
+          "content-type": "application/json",
+          "user-agent": "Workcell-ToolRuntime/0.1",
+          "x-api-key": "exa-secret"
+        },
+        "jsonBody": {
+          "query": "exa query",
+          "type": "auto",
+          "numResults": 5,
+          "contents": {
+            "highlights": {
+              "maxCharacters": 320
+            }
+          },
+          "moderation": true
+        }
+      }
+    ],
+    "serializedOutputExcludes": ["exa-secret"]
+  }
+}
