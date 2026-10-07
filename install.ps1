@@ -5,6 +5,13 @@ $ProgressPreference = "SilentlyContinue"
 
 $Repo = "caudra/caudra"
 $Binary = "caudra"
+$ReleaseResponseLimit = 4MB
+$ChecksumLimit = 1MB
+$ArchiveLimit = 2GB
+$TransferBufferSize = 32KB
+$ApiTimeoutMilliseconds = 30000
+$AssetTimeoutMilliseconds = 300000
+$AssetRedirectLimit = 3
 $InstallDir = if ($env:CAUDRA_INSTALL_DIR) {
     $env:CAUDRA_INSTALL_DIR
 } else {
@@ -43,18 +50,243 @@ function Get-Target {
     }
 }
 
-function Get-LatestTag {
-    $headers = Get-GitHubHeaders
+function Get-SemVer([string]$Tag) {
+    $pattern = '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?\z'
+    $match = [regex]::Match($Tag, $pattern)
+    if (-not $match.Success) { return $null }
+    $pre = $match.Groups[4].Value
+    foreach ($identifier in ($pre -split '\.')) {
+        if ($identifier -match '^0[0-9]+$') { return $null }
+    }
+    return @{
+        Core = @($match.Groups[1].Value, $match.Groups[2].Value, $match.Groups[3].Value)
+        Pre = $pre
+    }
+}
+
+function Compare-NumericIdentifier([string]$Left, [string]$Right) {
+    if ($Left.Length -ne $Right.Length) { return $Left.Length.CompareTo($Right.Length) }
+    return [string]::CompareOrdinal($Left, $Right)
+}
+
+function Compare-SemVer($Left, $Right) {
+    for ($i = 0; $i -lt 3; $i++) {
+        $comparison = Compare-NumericIdentifier $Left.Core[$i] $Right.Core[$i]
+        if ($comparison -ne 0) { return $comparison }
+    }
+    if (-not $Left.Pre -or -not $Right.Pre) {
+        if ($Left.Pre -eq $Right.Pre) { return 0 }
+        if (-not $Left.Pre) { return 1 }
+        return -1
+    }
+    $a = $Left.Pre -split '\.'
+    $b = $Right.Pre -split '\.'
+    for ($i = 0; $i -lt [Math]::Min($a.Count, $b.Count); $i++) {
+        if ($a[$i] -ceq $b[$i]) { continue }
+        $aNumeric = $a[$i] -match '^[0-9]+$'
+        $bNumeric = $b[$i] -match '^[0-9]+$'
+        if ($aNumeric -and $bNumeric) { return Compare-NumericIdentifier $a[$i] $b[$i] }
+        if ($aNumeric) { return -1 }
+        if ($bNumeric) { return 1 }
+        return [string]::CompareOrdinal($a[$i], $b[$i])
+    }
+    return $a.Count.CompareTo($b.Count)
+}
+
+function Assert-JsonValue([string[]]$Tokens, [ref]$Position, [int]$Depth) {
+    if ($Depth -gt 32 -or $Position.Value -ge $Tokens.Count) { throw 'invalid JSON nesting or truncated value' }
+    $token = $Tokens[$Position.Value++]
+    if ($token -eq '{' -or $token -eq '[') {
+        $object = $token -eq '{'
+        $end = if ($object) { '}' } else { ']' }
+        $keys = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        if ($Position.Value -lt $Tokens.Count -and $Tokens[$Position.Value] -eq $end) { $Position.Value++; return }
+        while ($Position.Value -lt $Tokens.Count) {
+            if ($object) {
+                $key = $Tokens[$Position.Value++]
+                if (-not $key.StartsWith('"') -or -not $keys.Add([regex]::Unescape($key.Substring(1, $key.Length - 2)))) {
+                    throw 'invalid or duplicate JSON member'
+                }
+                if ($Position.Value -ge $Tokens.Count -or $Tokens[$Position.Value++] -ne ':') { throw 'invalid JSON object' }
+            }
+            Assert-JsonValue $Tokens $Position ($Depth + 1)
+            if ($Position.Value -ge $Tokens.Count) { throw 'truncated JSON container' }
+            $separator = $Tokens[$Position.Value++]
+            if ($separator -eq $end) { return }
+            if ($separator -ne ',') { throw 'invalid JSON separator' }
+        }
+        throw 'truncated JSON container'
+    }
+    if ($token -in @('}', ']', ',', ':')) { throw 'invalid JSON value' }
+}
+
+function Assert-ReleaseJson([string]$Content) {
+    $pattern = '\G[ \t\r\n]*("(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|true|false|null|[\[\]{},:])'
+    $matches = [regex]::Matches($Content, $pattern)
+    $tokens = @($matches | ForEach-Object { $_.Groups[1].Value })
+    $consumed = if ($matches.Count) { $matches[$matches.Count - 1].Index + $matches[$matches.Count - 1].Length } else { 0 }
+    if ($Content.Substring($consumed) -notmatch '^[ \t\r\n]*$') { throw 'invalid JSON token' }
+    $position = 0
+    Assert-JsonValue $tokens ([ref]$position) 0
+    if ($position -ne $tokens.Count) { throw 'trailing JSON data' }
+}
+
+function Get-ReleaseResponse([string]$Uri, [bool]$List) {
+    $body = [IO.MemoryStream]::new()
     try {
-        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -Headers $headers
-    } catch {
-        Write-Err "failed to determine latest release tag: $_"
+        Receive-ReleaseData $Uri $body $ReleaseResponseLimit $true
+        $content = [Text.UTF8Encoding]::new($false, $true).GetString($body.ToArray())
+    } finally { $body.Dispose() }
+    Assert-ReleaseJson $content
+    if (($List -and -not $content.TrimStart().StartsWith('[')) -or
+        (-not $List -and -not $content.TrimStart().StartsWith('{'))) { throw 'invalid release response' }
+    $parsed = ConvertFrom-Json -InputObject ('{"release_data":' + $content + '}')
+    if ($List) { return @{ Data = $parsed.release_data } }
+    return @{ Data = @($parsed.release_data) }
+}
+
+function Get-ReleaseCandidate($Release, [string]$Target) {
+    if ($null -eq $Release -or $Release.tag_name -isnot [string] -or
+        $Release.draft -isnot [bool] -or $Release.prerelease -isnot [bool]) { throw 'invalid release metadata' }
+    $version = Get-SemVer $Release.tag_name
+    if ($Release.draft -or -not $version) { return $null }
+    if ($Release.published_at -isnot [datetime] -and
+        ($Release.published_at -isnot [string] -or
+        $Release.published_at -notmatch '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$')) { return $null }
+    if ($Release.prerelease -ne [bool]$version.Pre) { return $null }
+    $archive = "$Binary-$($Release.tag_name)-$Target.zip"
+    $base = "https://github.com/$Repo/releases/download/$($Release.tag_name)/"
+    $usable = $Release.assets -is [array]
+    foreach ($name in @($archive, 'sha256sums.txt', 'install.ps1')) {
+        $assets = @($Release.assets | Where-Object { $_.name -ceq $name })
+        if ($assets.Count -ne 1) { $usable = $false; continue }
+        $asset = $assets[0]
+        if ($asset.state -cne 'uploaded' -or $asset.size -is [string] -or $asset.size -is [bool] -or $asset.size -le 0 -or
+            $asset.browser_download_url -cne ($base + $name)) { $usable = $false }
     }
-    $tag = $release.tag_name
-    if (-not $tag) {
-        Write-Err "failed to determine latest release tag"
+    return @{ Tag = $Release.tag_name; Version = $version; Usable = $usable }
+}
+
+function Resolve-ReleaseTag([string]$Tag, [string]$Channel, [string]$Target) {
+    $releases = @()
+    if ($Tag) {
+        if (-not (Get-SemVer $Tag)) { throw 'expected a v-prefixed SemVer tag' }
+        $response = Get-ReleaseResponse "https://api.github.com/repos/$Repo/releases/tags/$Tag" $false
+        if ($response.Data.Count -ne 1 -or $response.Data[0].tag_name -cne $Tag) { throw 'release tag mismatch' }
+        $releases = $response.Data
+    } else {
+        for ($page = 1; $page -le 10; $page++) {
+            $response = Get-ReleaseResponse "https://api.github.com/repos/$Repo/releases?per_page=100&page=$page" $true
+            if ($response.Data.Count -gt 100) { throw 'invalid release list' }
+            if ($response.Data.Count -eq 0) { break }
+            $releases += $response.Data
+        }
+        if ($page -gt 10) { throw 'release discovery exceeded 10 pages; refusing incomplete selection' }
     }
-    return $tag
+    $best = $null
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($release in $releases) {
+        $candidate = Get-ReleaseCandidate $release $Target
+        if (-not $candidate) { continue }
+        if (-not $seen.Add($candidate.Tag)) { throw 'duplicate release across pages' }
+        $preview = [bool]$candidate.Version.Pre
+        if ($Channel -eq 'stable' -and $preview) { continue }
+        if (-not $best -or ($Channel -eq 'auto' -and $best.Version.Pre -and -not $preview) -or
+            (($Channel -eq 'preview' -or [bool]$best.Version.Pre -eq $preview) -and
+            (Compare-SemVer $candidate.Version $best.Version) -gt 0)) {
+            $best = $candidate
+        }
+    }
+    if (-not $best) { throw 'no published release for requested channel/tag' }
+    if (-not $best.Usable) { throw 'selected release lacks required uploaded assets' }
+    return $best.Tag
+}
+
+function Open-ReleaseResponse([string]$Uri, [hashtable]$Headers, [int]$TimeoutMilliseconds) {
+    $request = [Net.HttpWebRequest]::Create($Uri)
+    $request.AllowAutoRedirect = $false
+    $request.Timeout = $TimeoutMilliseconds
+    $request.ReadWriteTimeout = $TimeoutMilliseconds
+    foreach ($name in $Headers.Keys) {
+        switch ($name) {
+            'User-Agent' { $request.UserAgent = $Headers[$name] }
+            'Accept' { $request.Accept = $Headers[$name] }
+            default { $request.Headers[$name] = $Headers[$name] }
+        }
+    }
+    return $request.GetResponse()
+}
+
+function Receive-ReleaseData([string]$Uri, [IO.Stream]$Output, [long]$MaxBytes, [bool]$Api) {
+    $headers = @{}
+    $timeout = $AssetTimeoutMilliseconds
+    $redirectLimit = $AssetRedirectLimit
+    if ($Api) {
+        if (-not $Uri.StartsWith("https://api.github.com/repos/$Repo/releases", [StringComparison]::Ordinal)) {
+            throw 'refusing non-GitHub API origin'
+        }
+        $headers = Get-GitHubHeaders
+        $timeout = $ApiTimeoutMilliseconds
+        $redirectLimit = 0
+    }
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    for ($redirect = 0; $redirect -le $redirectLimit; $redirect++) {
+        if (([uri]$Uri).Scheme -cne 'https' -or ([uri]$Uri).UserInfo) {
+            throw 'refusing non-HTTPS release origin'
+        }
+        $remaining = $timeout - $clock.ElapsedMilliseconds
+        if ($remaining -le 0) { throw 'release request timed out' }
+        $response = Open-ReleaseResponse $Uri $headers $remaining
+        try {
+            if ([int]$response.StatusCode -in @(301, 302, 303, 307, 308)) {
+                if ($redirect -eq $redirectLimit) { throw 'release redirect limit exceeded' }
+                if (-not $response.Headers['Location']) { throw 'release redirect missing Location' }
+                $Uri = [uri]::new([uri]$Uri, $response.Headers['Location']).AbsoluteUri
+                continue
+            }
+            if ([int]$response.StatusCode -ne 200) { throw "release request returned HTTP $([int]$response.StatusCode)" }
+            if ($response.ContentLength -gt $MaxBytes) { throw 'release response too large' }
+            $inputStream = $response.GetResponseStream()
+            try {
+                $buffer = [byte[]]::new($TransferBufferSize)
+                $total = 0L
+                while ($true) {
+                    $remaining = $timeout - $clock.ElapsedMilliseconds
+                    if ($remaining -le 0) { throw 'release request timed out' }
+                    if ($inputStream.CanTimeout) { $inputStream.ReadTimeout = $remaining }
+                    $count = $inputStream.Read($buffer, 0, [int][Math]::Min([long]$buffer.Length, $MaxBytes - $total + 1))
+                    if ($count -eq 0) { break }
+                    $total += $count
+                    if ($total -gt $MaxBytes) { throw 'release response too large' }
+                    $Output.Write($buffer, 0, $count)
+                }
+                if ($response.ContentLength -ge 0 -and $total -ne $response.ContentLength) { throw 'truncated release response' }
+            } finally { $inputStream.Dispose() }
+            return
+        } finally { $response.Dispose() }
+    }
+}
+
+function Save-ReleaseAsset([string]$Uri, [string]$Destination, [long]$MaxBytes = $ArchiveLimit) {
+    $file = [IO.File]::Create($Destination)
+    try { Receive-ReleaseData $Uri $file $MaxBytes $false } finally { $file.Dispose() }
+}
+
+function Assert-ArchiveChecksum([string]$Manifest, [string]$Archive) {
+    $name = [IO.Path]::GetFileName($Archive)
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $expected = $null
+    foreach ($line in [IO.File]::ReadAllLines($Manifest)) {
+        $match = [regex]::Match($line, '^([0-9a-fA-F]{64}) [ *]([A-Za-z0-9][A-Za-z0-9._+-]*)$')
+        if (-not $match.Success -or -not $seen.Add($match.Groups[2].Value)) {
+            throw 'invalid or duplicate archive checksum'
+        }
+        if ($match.Groups[2].Value -ceq $name) { $expected = $match.Groups[1].Value }
+    }
+    if (-not $expected) { throw 'missing archive checksum' }
+    if ((Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash -ine $expected) {
+        throw 'archive SHA-256 checksum mismatch'
+    }
 }
 
 function Assert-RegularItem($Item) {
@@ -153,11 +385,10 @@ function Install-Payload([string]$Source, [string]$Licenses, [string]$Destinatio
     }
 }
 
-function Install-Caudra([string]$Tag) {
+function Install-Caudra([string]$Tag, [string]$Channel) {
     $target = Get-Target
-    if (-not $Tag) {
-        $Tag = Get-LatestTag
-    }
+    $Tag = Resolve-ReleaseTag $Tag $Channel $target
+    $label = if ((Get-SemVer $Tag).Pre) { ' (Preview)' } else { '' }
 
     $archiveName = "$Binary-$Tag-$target.zip"
     $url = "https://github.com/$Repo/releases/download/$Tag/$archiveName"
@@ -166,8 +397,11 @@ function Install-Caudra([string]$Tag) {
 
     try {
         $zipPath = Join-Path $tmp $archiveName
-        Write-Host "downloading $Binary $Tag for $target..."
-        Invoke-WebRequest -Uri $url -OutFile $zipPath -Headers (Get-GitHubHeaders)
+        Write-Host "downloading $Binary $Tag$label for $target..."
+        Save-ReleaseAsset $url $zipPath
+        $sumsPath = Join-Path $tmp 'sha256sums.txt'
+        Save-ReleaseAsset "https://github.com/$Repo/releases/download/$Tag/sha256sums.txt" $sumsPath $ChecksumLimit
+        Assert-ArchiveChecksum $sumsPath $zipPath
 
         Expand-Archive -Path $zipPath -DestinationPath $tmp -Force
 
@@ -214,7 +448,7 @@ function Install-Caudra([string]$Tag) {
             Write-Err "failed to install binary to $dest or licenses to $licenseDir (try running as Administrator or set CAUDRA_INSTALL_DIR): $_"
         }
 
-        Write-Host "$Binary $Tag installed to $dest"
+        Write-Host "$Binary $Tag$label installed to $dest"
         Write-Host "licenses installed to $licenseDir"
         Add-ToUserPath -Dir $InstallDir
     } finally {
@@ -240,5 +474,26 @@ function Add-ToUserPath([string]$Dir) {
     Write-Host "added $Dir to user PATH (restart terminal if caudra is not found)"
 }
 
-$tag = if ($args.Count -ge 1) { $args[0] } else { $null }
-Install-Caudra -Tag $tag
+function Invoke-CaudraInstaller([string[]]$Arguments) {
+    $tag = ''
+    $channel = 'auto'
+    for ($i = 0; $i -lt $Arguments.Count; $i++) {
+        switch -CaseSensitive ($Arguments[$i]) {
+            '--channel' {
+                if ($channel -ne 'auto' -or ++$i -ge $Arguments.Count -or $Arguments[$i] -cnotin @('stable', 'preview')) {
+                    throw 'usage: install.ps1 [vVERSION | --channel stable|preview]'
+                }
+                $channel = $Arguments[$i]
+            }
+            { $_ -in @('--help', '-h') } { Write-Host 'usage: install.ps1 [vVERSION | --channel stable|preview]'; return }
+            default {
+                if ($tag -or $Arguments[$i].StartsWith('-')) { throw "unexpected argument: $($Arguments[$i])" }
+                $tag = $Arguments[$i]
+            }
+        }
+    }
+    if ($tag -and $channel -ne 'auto') { throw 'a release tag cannot be combined with --channel' }
+    Install-Caudra -Tag $tag -Channel $channel
+}
+
+Invoke-CaudraInstaller $args

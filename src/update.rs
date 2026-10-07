@@ -1,15 +1,32 @@
+use std::collections::HashSet;
 #[cfg(unix)]
 use std::ffi::CString;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
-use caudra_storage::version::{self, VersionError};
+use caudra_config::config_file;
+use caudra_storage::version::{self, Release, UpdateChannel, VersionError};
 use caudra_storage::{StateDir, StorageError};
+use isahc::Request;
+use isahc::config::{Configurable, RedirectPolicy};
+use isahc::http::Uri;
+use sha2::{Digest, Sha256};
 use tempfile::Builder;
 
-const INSTALL_SCRIPT_URL: &str = "https://caudra.ai/install.sh";
+const RELEASE_DOWNLOAD_URL: &str = "https://github.com/caudra/caudra/releases/download";
+const CHECKSUM_FILE: &str = "sha256sums.txt";
+const INSTALLER_BYTES: u64 = 1024 * 1024;
+const CHECKSUM_BYTES: u64 = 64 * 1024;
+const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const REDIRECT_LIMIT: u32 = 5;
+const CHECKSUM_INVALID: &str = "invalid release checksum manifest";
+const CHECKSUM_MISSING: &str = "release checksum manifest must contain exactly one installer entry";
+const CHECKSUM_MISMATCH: &str = "release installer checksum mismatch";
+const WINDOWS_ROLLBACK: &str = "in-process rollback is not supported on Windows; close all Caudra processes and run the versioned PowerShell installer for the previous release";
 const BACKUP_FILENAME: &str = "caudra_backup";
 const INSTALL_DIR_ENV: &str = "CAUDRA_INSTALL_DIR";
 const BACKUP_BINARY: &str = "binary";
@@ -85,10 +102,19 @@ echo "Displaced licenses retained at $license_stage"
 pub enum UpdateError {
     #[error("failed to fetch {url}: {source}")]
     Fetch {
-        url: &'static str,
+        url: String,
         #[source]
-        source: isahc::Error,
+        source: io::Error,
     },
+
+    #[error("{0}")]
+    Integrity(&'static str),
+
+    #[error("this installation is managed by {0}; update it through that package manager")]
+    Managed(&'static str),
+
+    #[error("{0}")]
+    Unsupported(&'static str),
 
     #[error("failed to determine current binary path: {0}")]
     CurrentExe(std::io::Error),
@@ -104,6 +130,7 @@ pub enum UpdateError {
     WriteScript(std::io::Error),
 
     #[error("failed to execute install script: {0}")]
+    #[cfg(not(windows))]
     ExecScript(std::io::Error),
 
     #[error("install script failed with exit code {0:?}")]
@@ -126,19 +153,139 @@ pub enum UpdateError {
     VersionCheck(#[from] VersionError),
 }
 
-fn fetch_script() -> Result<String, UpdateError> {
-    use isahc::ReadResponseExt;
-    isahc::get(INSTALL_SCRIPT_URL)
-        .and_then(|mut r| r.text().map_err(Into::into))
-        .map_err(|source| UpdateError::Fetch {
-            url: INSTALL_SCRIPT_URL,
-            source,
+fn fetch_asset(url: &str, limit: u64) -> Result<Vec<u8>, UpdateError> {
+    let fetch = || -> io::Result<Vec<u8>> {
+        let client = isahc::HttpClient::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(FETCH_TIMEOUT)
+            .redirect_policy(RedirectPolicy::None)
+            .build()
+            .map_err(io::Error::other)?;
+        let started = Instant::now();
+        let mut next = url.to_owned();
+        for redirects in 0..=REDIRECT_LIMIT {
+            if !asset_url_allowed(&next) {
+                return Err(io::Error::other(
+                    "release asset redirect is not an allowed HTTPS origin",
+                ));
+            }
+            let timeout = FETCH_TIMEOUT
+                .checked_sub(started.elapsed())
+                .filter(|duration| !duration.is_zero())
+                .ok_or_else(|| io::Error::other("release asset download timed out"))?;
+            let request = Request::get(&next)
+                .timeout(timeout)
+                .body(())
+                .map_err(io::Error::other)?;
+            let response = match client.send(request) {
+                Ok(response) => response,
+                Err(error) if redirects == 0 => {
+                    return version::curl_fetch(url).map_err(|_| io::Error::other(error));
+                }
+                Err(error) => return Err(io::Error::other(error)),
+            };
+            if response.status().is_redirection() {
+                next = response
+                    .headers()
+                    .get("Location")
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or_else(|| {
+                        io::Error::other("release asset redirect has no valid location")
+                    })?
+                    .to_owned();
+                continue;
+            }
+            if !response.status().is_success() {
+                return Err(io::Error::other(format!("HTTP {}", response.status())));
+            }
+            let mut bytes = Vec::new();
+            response
+                .into_body()
+                .take(limit + 1)
+                .read_to_end(&mut bytes)?;
+            return Ok(bytes);
+        }
+        Err(io::Error::other("release asset redirect limit exceeded"))
+    };
+    let bytes = fetch().map_err(|source| UpdateError::Fetch {
+        url: url.to_owned(),
+        source,
+    })?;
+    if bytes.len() as u64 > limit {
+        return Err(UpdateError::Integrity(
+            "release asset exceeds download limit",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn asset_url_allowed(url: &str) -> bool {
+    url.parse::<Uri>().is_ok_and(|uri| {
+        uri.scheme_str() == Some("https")
+            && matches!(uri.port_u16(), None | Some(443))
+            && matches!(
+                uri.host(),
+                Some(
+                    "github.com"
+                        | "release-assets.githubusercontent.com"
+                        | "objects.githubusercontent.com"
+                )
+            )
+    })
+}
+
+fn verify_checksum(manifest: &[u8], name: &str, bytes: &[u8]) -> Result<(), UpdateError> {
+    let text =
+        std::str::from_utf8(manifest).map_err(|_| UpdateError::Integrity(CHECKSUM_INVALID))?;
+    let mut expected = None;
+    let mut names = HashSet::new();
+    for line in text.lines() {
+        let (hash, filename) = line
+            .split_once("  ")
+            .ok_or(UpdateError::Integrity(CHECKSUM_INVALID))?;
+        if hash.len() != 64
+            || !hash.bytes().all(|b| b.is_ascii_hexdigit())
+            || !filename
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            || !filename
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._+-".contains(&byte))
+        {
+            return Err(UpdateError::Integrity(CHECKSUM_INVALID));
+        }
+        if filename == name && expected.replace(hash).is_some() {
+            return Err(UpdateError::Integrity(CHECKSUM_MISSING));
+        }
+        if !names.insert(filename) {
+            return Err(UpdateError::Integrity(CHECKSUM_INVALID));
+        }
+    }
+    let expected = expected.ok_or(UpdateError::Integrity(CHECKSUM_MISSING))?;
+    if !Sha256::digest(bytes)
+        .iter()
+        .enumerate()
+        .all(|(index, byte)| {
+            u8::from_str_radix(&expected[index * 2..index * 2 + 2], 16) == Ok(*byte)
         })
-        .or_else(|e| {
-            version::curl_fetch(INSTALL_SCRIPT_URL)
-                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-                .map_err(|_| e)
-        })
+    {
+        return Err(UpdateError::Integrity(CHECKSUM_MISMATCH));
+    }
+    Ok(())
+}
+
+fn fetch_script(release: &Release) -> Result<String, UpdateError> {
+    let name = if cfg!(windows) {
+        "install.ps1"
+    } else {
+        "install.sh"
+    };
+    let base = format!("{RELEASE_DOWNLOAD_URL}/{}", release.tag);
+    let manifest = fetch_asset(&format!("{base}/{CHECKSUM_FILE}"), CHECKSUM_BYTES)?;
+    let bytes = fetch_asset(&format!("{base}/{name}"), INSTALLER_BYTES)?;
+    verify_checksum(&manifest, name, &bytes)?;
+    String::from_utf8(bytes).map_err(|_| UpdateError::Integrity("release installer is not UTF-8"))
 }
 
 fn backup_binary(exe_path: &Path, storage: &StateDir) -> Result<PathBuf, UpdateError> {
@@ -294,15 +441,24 @@ fn save_snapshot(exe_path: &Path, backup: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn execute_script(script: &str, install_dir: &Path) -> Result<(), UpdateError> {
+#[cfg(any(not(windows), test))]
+fn installer_command(script: &Path, install_dir: &Path, tag: &str) -> Command {
+    let mut command = Command::new("sh");
+    command
+        .arg(script)
+        .arg(tag)
+        .env(INSTALL_DIR_ENV, install_dir);
+    command
+}
+
+#[cfg(not(windows))]
+fn execute_script(script: &str, install_dir: &Path, tag: &str) -> Result<(), UpdateError> {
     let mut tmp = tempfile::NamedTempFile::new().map_err(UpdateError::WriteScript)?;
     tmp.write_all(script.as_bytes())
         .map_err(UpdateError::WriteScript)?;
     tmp.flush().map_err(UpdateError::WriteScript)?;
 
-    let status = std::process::Command::new("sh")
-        .arg(tmp.path())
-        .env(INSTALL_DIR_ENV, install_dir)
+    let status = installer_command(tmp.path(), install_dir, tag)
         .status()
         .map_err(UpdateError::ExecScript)?;
 
@@ -456,8 +612,13 @@ fn replace_installation(
 }
 
 fn prompt_yes(install_dir: &Path) -> bool {
+    let action = if cfg!(windows) {
+        "Prepare an external update for"
+    } else {
+        "Install to"
+    };
     eprint!(
-        "Install to {} and run this script? [y/N] ",
+        "{action} {} using this script? [y/N] ",
         install_dir.display()
     );
     let _ = std::io::stderr().flush();
@@ -465,18 +626,101 @@ fn prompt_yes(install_dir: &Path) -> bool {
     std::io::stdin().read_line(&mut input).is_ok() && input.trim().eq_ignore_ascii_case("y")
 }
 
-pub fn update(skip_confirm: bool, no_color: bool) -> Result<(), UpdateError> {
-    let latest = version::fetch_latest()?;
-    if !version::is_newer(&latest, version::CURRENT) {
-        println!("Already up to date (v{})", version::CURRENT);
+fn configured_channel() -> UpdateChannel {
+    let load = || {
+        let dir = config_file::resolve_config_dir()?;
+        config_file::load_global_config(&config_file::global_config_path(&dir))
+            .map(|config| config.settings.ui.update_channel.unwrap_or_default())
+    };
+    load().unwrap_or_else(|error| {
+        eprintln!(
+            "warning: cannot read update channel: {error}; using auto (override with --channel)"
+        );
+        UpdateChannel::Auto
+    })
+}
+
+fn package_manager(exe: &Path) -> Option<&'static str> {
+    if exe.starts_with("/nix/store") {
+        return Some("Nix");
+    }
+    if exe.components().any(|part| part.as_os_str() == "Cellar") {
+        return Some("Homebrew");
+    }
+    let cargo_record = exe.parent()?.parent()?.join(".crates2.json");
+    let record: serde_json::Value = serde_json::from_slice(&fs::read(cargo_record).ok()?).ok()?;
+    record
+        .get("installs")?
+        .as_object()?
+        .values()
+        .any(|entry| {
+            entry
+                .get("bins")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|bins| {
+                    bins.iter()
+                        .any(|bin| matches!(bin.as_str(), Some("caudra" | "caudra.exe")))
+                })
+        })
+        .then_some("Cargo")
+}
+
+#[cfg(windows)]
+fn prepare_windows_update(script: &str, install_dir: &Path, tag: &str) -> Result<(), UpdateError> {
+    let mut file = Builder::new()
+        .prefix("caudra-update-")
+        .suffix(".ps1")
+        .tempfile()
+        .map_err(UpdateError::WriteScript)?;
+    file.write_all(script.as_bytes())
+        .map_err(UpdateError::WriteScript)?;
+    let (_, path) = file
+        .keep()
+        .map_err(|error| UpdateError::WriteScript(error.error))?;
+    let quote = |value: &str| format!("'{}'", value.replace('\'', "''"));
+    println!("Not installed yet. Close all Caudra processes, then run in PowerShell:");
+    println!(
+        "$env:{INSTALL_DIR_ENV} = {}",
+        quote(&install_dir.to_string_lossy())
+    );
+    println!("{}", windows_update_command(&path, tag));
+    println!(
+        "Remove the saved installer after it completes: {}",
+        path.display()
+    );
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn windows_update_command(path: &Path, tag: &str) -> String {
+    let script = path.to_string_lossy().replace('\'', "''");
+    format!("powershell.exe -NoProfile -ExecutionPolicy Bypass -File '{script}' '{tag}'")
+}
+
+pub fn update(
+    channel: Option<UpdateChannel>,
+    skip_confirm: bool,
+    no_color: bool,
+) -> Result<(), UpdateError> {
+    let exe_path = current_exe_resolved()?;
+    if let Some(manager) = package_manager(&exe_path) {
+        return Err(UpdateError::Managed(manager));
+    }
+    let channel = channel.unwrap_or_else(configured_channel);
+    let release = version::fetch_release(channel)?;
+    if !version::is_newer(&release.version, version::CURRENT) {
+        println!(
+            "No newer eligible release (installed v{}, selected {}).",
+            version::CURRENT,
+            release.tag
+        );
         return Ok(());
     }
 
     println!("Current version: v{}", version::CURRENT);
-    println!("Latest version:  v{latest}");
+    println!("Selected release: {}", release.tag);
     println!();
 
-    let exe_path = current_exe_resolved()?;
     let install_dir = match std::env::var_os(INSTALL_DIR_ENV).filter(|d| !d.is_empty()) {
         Some(dir) => PathBuf::from(dir),
         None => exe_path
@@ -490,12 +734,13 @@ pub fn update(skip_confirm: bool, no_color: bool) -> Result<(), UpdateError> {
     };
     let storage = StateDir::resolve()?;
 
-    let script = fetch_script()?;
+    let script = fetch_script(&release)?;
 
     if no_color {
         println!("{script}");
     } else {
-        println!("{}", caudra_ui::highlight_ansi("bash", &script));
+        let language = if cfg!(windows) { "powershell" } else { "bash" };
+        println!("{}", caudra_ui::highlight_ansi(language, &script));
     }
 
     if !skip_confirm && !prompt_yes(&install_dir) {
@@ -505,18 +750,32 @@ pub fn update(skip_confirm: bool, no_color: bool) -> Result<(), UpdateError> {
 
     let backup_path = backup_binary(&exe_path, &storage)?;
 
-    execute_script(&script, &install_dir)?;
+    #[cfg(windows)]
+    {
+        prepare_windows_update(&script, &install_dir, &release.tag)?;
+        println!("Previous version saved to: {}", backup_path.display());
+    }
 
-    println!();
-    println!("Updated successfully.");
-    println!("Previous version saved to: {}", backup_path.display());
-    println!("To restore: caudra rollback");
+    #[cfg(not(windows))]
+    {
+        execute_script(&script, &install_dir, &release.tag)?;
+        println!();
+        println!("Updated successfully.");
+        println!("Previous version saved to: {}", backup_path.display());
+        println!("To restore: caudra rollback");
+    }
 
     Ok(())
 }
 
 pub fn rollback() -> Result<(), UpdateError> {
+    if cfg!(windows) {
+        return Err(UpdateError::Unsupported(WINDOWS_ROLLBACK));
+    }
     let exe_path = current_exe_resolved()?;
+    if let Some(manager) = package_manager(&exe_path) {
+        return Err(UpdateError::Managed(manager));
+    }
     let storage = StateDir::resolve()?;
     let backup_path = storage.path().join(BACKUP_FILENAME);
 
@@ -540,15 +799,18 @@ mod tests {
     #[cfg(unix)]
     use std::process::Command;
 
+    use sha2::{Digest, Sha256};
     use tempfile::{TempDir, tempdir};
     use test_case::test_case;
 
     #[cfg(unix)]
     use super::RESTORE_SCRIPT;
     use super::{
-        BACKUP_BINARY, BACKUP_FILENAME, BACKUP_LICENSES, LEGACY_CONTENT, LEGACY_MARKER,
-        LICENSE_ATTRIBUTION, LICENSE_MANIFEST, LICENSE_NOTICE, RESTORE_PREFIX, license_path,
-        needs_sudo, replace_installation, restore_backup, save_snapshot, snapshot_licenses,
+        BACKUP_BINARY, BACKUP_FILENAME, BACKUP_LICENSES, CHECKSUM_INVALID, CHECKSUM_MISMATCH,
+        CHECKSUM_MISSING, INSTALL_DIR_ENV, LEGACY_CONTENT, LEGACY_MARKER, LICENSE_ATTRIBUTION,
+        LICENSE_MANIFEST, LICENSE_NOTICE, RESTORE_PREFIX, asset_url_allowed, installer_command,
+        license_path, needs_sudo, package_manager, replace_installation, restore_backup,
+        save_snapshot, snapshot_licenses, verify_checksum, windows_update_command,
     };
 
     const OLD_BINARY: &str = "previous executable";
@@ -558,6 +820,9 @@ mod tests {
     const MANIFEST: &str = "{\"schema_version\": 1}";
     const EXTRA_FILE: &str = "user-file.txt";
     const EXTRA_CONTENT: &str = "retain this unrelated file";
+    const INSTALLER_NAME: &str = "install.sh";
+    const INSTALLER_CONTENT: &[u8] = b"set -eu\n";
+    const RELEASE_TAG: &str = "v0.2.0-preview.1";
     #[cfg(unix)]
     const FAIL_BINARY_RENAME: &str = r#"
 mv() {
@@ -573,6 +838,112 @@ mv() {
     const SNAPSHOT_MODE: u32 = 0o600;
     #[cfg(unix)]
     const PERMISSION_MASK: u32 = 0o7777;
+
+    #[test_case("https://github.com/caudra/caudra/releases/download/v0.2.0/install.sh", true; "canonical")]
+    #[test_case("https://release-assets.githubusercontent.com/asset", true; "github_cdn")]
+    #[test_case("http://github.com/asset", false; "no_downgrade")]
+    #[test_case("https://github.com.attacker.example/asset", false; "not_github")]
+    #[test_case("https://github.com:444/asset", false; "nonstandard_port")]
+    fn asset_redirects_stay_on_https_github(url: &str, allowed: bool) {
+        assert_eq!(asset_url_allowed(url), allowed);
+    }
+
+    #[test_case("temp/install.ps1", "temp/install.ps1"; "ordinary_path")]
+    #[test_case("user's directory/install.ps1", "user''s directory/install.ps1"; "quoted_path")]
+    fn windows_handoff_uses_process_scoped_execution_policy(path: &str, escaped: &str) {
+        assert_eq!(
+            windows_update_command(Path::new(path), RELEASE_TAG),
+            format!(
+                "powershell.exe -NoProfile -ExecutionPolicy Bypass -File '{escaped}' '{RELEASE_TAG}'"
+            )
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_rollback_refuses_before_touching_files() {
+        assert_eq!(
+            super::rollback().unwrap_err().to_string(),
+            super::WINDOWS_ROLLBACK
+        );
+    }
+
+    #[test_case(false; "one_matching_entry")]
+    #[test_case(true; "uppercase_digest")]
+    fn checksum_verifies_exact_installer(uppercase: bool) {
+        let mut digest: String = Sha256::digest(INSTALLER_CONTENT)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        if uppercase {
+            digest.make_ascii_uppercase();
+        }
+        let manifest = format!("{digest}  {INSTALLER_NAME}\n");
+        verify_checksum(manifest.as_bytes(), INSTALLER_NAME, INSTALLER_CONTENT).unwrap();
+    }
+
+    #[test_case("missing", CHECKSUM_MISSING; "missing_entry")]
+    #[test_case("duplicate", CHECKSUM_MISSING; "duplicate_entry")]
+    #[test_case("mismatch", CHECKSUM_MISMATCH; "corrupt_installer")]
+    #[test_case("malformed", CHECKSUM_INVALID; "malformed_manifest")]
+    fn installer_checksum_fails_closed(case: &str, expected: &str) {
+        let digest: String = Sha256::digest(INSTALLER_CONTENT)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let line = format!("{digest}  {INSTALLER_NAME}\n");
+        let manifest = match case {
+            "missing" => format!("{digest}  another-file\n"),
+            "duplicate" => line.repeat(2),
+            "mismatch" => format!("{}  {INSTALLER_NAME}\n", "0".repeat(64)),
+            _ => "invalid\n".to_owned(),
+        };
+        assert_eq!(
+            verify_checksum(manifest.as_bytes(), INSTALLER_NAME, INSTALLER_CONTENT)
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+    }
+
+    #[test_case("prefix with spaces"; "spaces")]
+    #[test_case("prefix's directory"; "quote")]
+    fn installer_receives_exact_tag_and_destination(destination: &str) {
+        let script = Path::new("downloaded installer.sh");
+        let command = installer_command(script, Path::new(destination), RELEASE_TAG);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [script.as_os_str(), RELEASE_TAG.as_ref()]
+        );
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, value)| key == INSTALL_DIR_ENV && value == Some(destination.as_ref()))
+        );
+    }
+
+    #[test_case("/nix/store/hash-caudra/bin/caudra", Some("Nix"); "nix")]
+    #[test_case("/opt/homebrew/Cellar/caudra/0.2/bin/caudra", Some("Homebrew"); "homebrew")]
+    #[test_case("/usr/local/bin/caudra", None; "unmanaged")]
+    fn managed_installations_are_not_overwritten(exe: &str, expected: Option<&str>) {
+        assert_eq!(package_manager(Path::new(exe)), expected);
+    }
+
+    #[test_case(true; "cargo_owned")]
+    #[test_case(false; "another_cargo_binary")]
+    fn cargo_installation_record_is_respected(owned: bool) {
+        let root = tempdir().unwrap();
+        let bin = if owned { "caudra" } else { "another-cli" };
+        fs::write(
+            root.path().join(".crates2.json"),
+            format!(r#"{{"installs":{{"package":{{"bins":["{bin}"]}}}}}}"#),
+        )
+        .unwrap();
+        assert_eq!(
+            package_manager(&root.path().join("bin/caudra")),
+            owned.then_some("Cargo")
+        );
+    }
 
     fn installation(bundle: bool) -> (TempDir, PathBuf, PathBuf, PathBuf) {
         let root = tempdir().unwrap();

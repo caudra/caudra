@@ -3,9 +3,13 @@ title: "Quick Start"
 description: "Install, connect a provider, first session."
 ---
 
-Install Caudra, connect a provider, and run a first session. Caudra is an independent fork whose release line starts at `0.1.0`.
+Install Caudra, connect a provider, and run a first session. Caudra is an independent fork. Its first public release is 0.2 Preview (`0.2.0-preview.1`).
 
 ## Install
+
+The installers prefer a stable release. While only previews exist, they select the newest preview and label it as such. Network failures stop installation rather than changing channels. Downloaded archives are checked against the release SHA-256 manifest before extraction.
+
+To select a channel explicitly after downloading the shell installer, run `sh install.sh --channel preview` or `sh install.sh --channel stable`. To install an exact version, run `sh install.sh v0.2.0-preview.1`. PowerShell accepts the same arguments, for example `./install.ps1 --channel preview`.
 
 ### Linux / macOS
 
@@ -65,7 +69,9 @@ This build leaves out [`python_execution`](/docs/tools/#python_execution), becau
 nix run github:caudra/caudra
 ```
 
-Or download a pre-built binary from [GitHub Releases](https://github.com/caudra/caudra/releases/latest).
+Or download a pre-built binary from [GitHub Releases](https://github.com/caudra/caudra/releases).
+
+The interactive UI checks for updates in the background by default. It never installs an update automatically. Set `ui.update_check = false` in your config or `CAUDRA_ENABLE_UPDATE_CHECK=0` for one run to disable the check. See [update settings](/docs/configuration/#ui-update-check) and [manual updates](/docs/cli/#caudra-update-caudra-rollback).
 
 ## Connect a provider
 

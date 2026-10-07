@@ -9,7 +9,6 @@ use std::time::Instant;
 
 const LOGO: &str = "caudra";
 const TAGLINE: &str = "turns context into effective action";
-const UPDATE_HINT: &str = " run caudra update to get v";
 const HELP_SEGMENTS: &[(&str, bool)] = &[
     (key::HELP.label, true),
     (" help", false),
@@ -329,7 +328,7 @@ pub struct Splash {
     seed: u64,
     animate: bool,
     tip_idx: usize,
-    latest_version: Option<&'static str>,
+    update_notice: Option<&'static str>,
 }
 
 impl Default for Splash {
@@ -348,7 +347,7 @@ impl Splash {
             seed,
             animate,
             tip_idx: (seed >> u32::BITS) as usize % TIPS.len(),
-            latest_version: None,
+            update_notice: None,
         }
     }
 
@@ -357,10 +356,10 @@ impl Splash {
     /// put a version on screen that no poller ever saw, so a still splash
     /// (`splash_animation = false`) would never show the notice at all.
     pub fn poll_update(&mut self, latest: Option<&'static str>) -> Dirty {
-        if self.latest_version == latest {
+        if self.update_notice == latest {
             return Dirty::NO;
         }
-        self.latest_version = latest;
+        self.update_notice = latest;
         Dirty::YES
     }
 
@@ -406,7 +405,7 @@ impl Splash {
         render_centered_faded(area, buf, fade, 0.75, tag_y, TAGLINE);
         self.render_help(area, buf, fade, help_y, accent);
         self.render_tip(area, buf, fade, tip_y, accent);
-        render_version(area, buf, fade, area.y, self.latest_version);
+        render_version(area, buf, fade, area.y, self.update_notice);
     }
 
     /// The wave field fills the area, and candidate routes bend with it as they
@@ -924,14 +923,14 @@ fn smoothstep(t: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-fn render_version(area: Rect, buf: &mut Buffer, fade: f32, y: u16, new_version: Option<&str>) {
+fn render_version(area: Rect, buf: &mut Buffer, fade: f32, y: u16, notice: Option<&str>) {
     if y >= area.y + area.height {
         return;
     }
     let theme = theme::current();
     let bg = theme.background;
-    let text = match new_version {
-        Some(v) => format!("v{}{UPDATE_HINT}{v}", update::CURRENT),
+    let text = match notice {
+        Some(notice) => format!("v{} {notice}", update::CURRENT),
         None => format!("v{}", update::CURRENT),
     };
     let style = faded_style(
@@ -1047,6 +1046,7 @@ mod tests {
     }
 
     const NEW_VERSION: &str = "99.9.9";
+    const UPDATE_NOTICE: &str = "run caudra update --channel preview to get v99.9.9";
     const UNPOLLED: &str = "an unpolled version must not appear on screen";
     const POLLED: &str = "a polled version must appear on screen";
 
@@ -1084,11 +1084,19 @@ mod tests {
         assert_eq!(splash.poll_update(None), Dirty::NO, "{QUIET}");
         assert!(!rendered(&splash).contains(NEW_VERSION), "{UNPOLLED}");
 
-        assert_eq!(splash.poll_update(Some(NEW_VERSION)), Dirty::YES, "{OWED}");
-        assert_eq!(splash.poll_update(Some(NEW_VERSION)), Dirty::NO, "{QUIET}");
+        assert_eq!(
+            splash.poll_update(Some(UPDATE_NOTICE)),
+            Dirty::YES,
+            "{OWED}"
+        );
+        assert_eq!(
+            splash.poll_update(Some(UPDATE_NOTICE)),
+            Dirty::NO,
+            "{QUIET}"
+        );
 
         let screen = rendered(&splash);
-        assert!(screen.contains(UPDATE_HINT.trim_end()), "{POLLED}");
+        assert!(screen.contains(UPDATE_NOTICE), "{POLLED}");
         assert!(screen.contains(NEW_VERSION), "{POLLED}");
     }
 

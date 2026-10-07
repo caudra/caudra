@@ -275,6 +275,21 @@ mod tests {
     }
 
     #[test]
+    fn update_reference_matches_defaults() {
+        let live = document().render(Render::Live { defaults: true });
+        let example: Value = toml::from_str(&live).unwrap();
+        let config = defaults();
+        assert_eq!(
+            example["ui"]["update_check"].as_bool(),
+            Some(config.ui.update_check)
+        );
+        assert_eq!(
+            example["ui"]["update_channel"].as_str(),
+            Some(config.ui.update_channel.to_string().as_str())
+        );
+    }
+
+    #[test]
     fn messaging_reference_lists_opt_in_and_inbound_defaults() {
         let live = document().render(Render::Live { defaults: true });
         let example: Value = toml::from_str(&live).unwrap();

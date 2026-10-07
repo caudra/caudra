@@ -11,6 +11,7 @@ use caudra_config_macro::ConfigSection;
 use caudra_storage::paths;
 use caudra_storage::retention::{GroupBy, KeepPolicy};
 use caudra_storage::thinking::{StoredThinking, ThinkingParseError};
+use caudra_storage::version::UpdateChannel;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
@@ -1054,6 +1055,7 @@ pub struct UiFileConfig {
     pub tool_output_lines: Option<ToolOutputLinesFile>,
     pub max_input_lines: Option<u32>,
     pub update_check: Option<bool>,
+    pub update_channel: Option<UpdateChannel>,
 }
 
 impl UiFileConfig {
@@ -1080,7 +1082,8 @@ impl UiFileConfig {
             theme_light,
             clock_format,
             max_input_lines,
-            update_check
+            update_check,
+            update_channel
         );
         match (self.tool_output_lines.as_mut(), overlay.tool_output_lines) {
             (Some(base), Some(over)) => base.merge(over),
@@ -2218,11 +2221,14 @@ pub struct UiConfig {
     pub clock_format: ClockFormat,
 
     #[config(
-        default = false,
+        default = true,
         env = "CAUDRA_ENABLE_UPDATE_CHECK",
-        desc = "Ask GitHub for the latest release on startup and show it in the splash. Off by default, so Caudra makes no such request unless you turn this on"
+        desc = "Check GitHub releases in the background at interactive startup and show an update notice. Uses a shared 24-hour cache and never installs automatically. Set false to disable"
     )]
     pub update_check: bool,
+
+    #[config(default = UpdateChannel::Auto, ty = "string", default_doc = "auto", desc = "Release channel: `auto` follows stable from a stable build and preview from a prerelease, including graduation to stable. `stable` excludes prereleases. `preview` includes prereleases and stable releases")]
+    pub update_channel: UpdateChannel,
 
     #[config(
         ty = "string",
@@ -2277,7 +2283,8 @@ impl UiConfig {
             thinking_lines: f.thinking_lines.unwrap_or(DEFAULT_THINKING_LINES),
             show_reminders: f.show_reminders.unwrap_or(true),
             clock_format: f.clock_format.unwrap_or_default(),
-            update_check: f.update_check.unwrap_or(false),
+            update_check: f.update_check.unwrap_or(true),
+            update_channel: f.update_channel.unwrap_or_default(),
             theme: f.theme,
             theme_light: f.theme_light,
             tool_output_lines: ToolOutputLines::from_file(f.tool_output_lines),
@@ -6391,23 +6398,56 @@ mod tests {
     fn update_check_deserializes(enabled: bool) {
         let raw: RawConfig = toml::from_str(&format!("[ui]\nupdate_check = {enabled}\n")).unwrap();
         assert_eq!(raw.ui.update_check, Some(enabled));
+        assert_eq!(raw.into_config(false).unwrap().ui.update_check, enabled);
     }
 
     #[test]
-    fn update_check_missing_defaults_off() {
+    fn update_check_missing_defaults_on() {
         let raw: RawConfig = toml::from_str("").unwrap();
         let config = raw.into_config(false).unwrap();
+        assert!(config.ui.update_check);
+        assert!(UiConfig::default().update_check);
+        assert_eq!(config.ui.update_channel, UpdateChannel::Auto);
+        assert_eq!(UiConfig::default().update_channel, UpdateChannel::Auto);
+    }
+
+    #[test_case(true; "enabled")]
+    #[test_case(false; "disabled")]
+    fn update_check_overlay_wins(enabled: bool) {
+        let mut base: RawConfig =
+            toml::from_str(&format!("[ui]\nupdate_check = {}\n", !enabled)).unwrap();
+        base.merge(toml::from_str(&format!("[ui]\nupdate_check = {enabled}\n")).unwrap());
+        assert_eq!(base.into_config(false).unwrap().ui.update_check, enabled);
+    }
+
+    #[test_case("auto", UpdateChannel::Auto; "auto")]
+    #[test_case("stable", UpdateChannel::Stable; "stable")]
+    #[test_case("preview", UpdateChannel::Preview; "preview")]
+    fn update_channel_deserializes(channel: &str, expected: UpdateChannel) {
+        let raw: RawConfig =
+            toml::from_str(&format!("[ui]\nupdate_channel = '{channel}'\n")).unwrap();
+        assert_eq!(raw.ui.update_channel.as_ref(), Some(&expected));
+        assert_eq!(raw.into_config(false).unwrap().ui.update_channel, expected);
+    }
+
+    #[test_case("'nightly'"; "unknown")]
+    #[test_case("true"; "boolean")]
+    fn update_channel_rejects_invalid(channel: &str) {
         assert!(
-            !config.ui.update_check,
-            "the release check must stay off until asked for"
+            toml::from_str::<RawConfig>(&format!("[ui]\nupdate_channel = {channel}\n")).is_err()
         );
     }
 
-    #[test]
-    fn update_check_overlay_wins() {
-        let mut base: RawConfig = toml::from_str("[ui]\nupdate_check = false\n").unwrap();
-        base.merge(toml::from_str("[ui]\nupdate_check = true\n").unwrap());
-        assert_eq!(base.ui.update_check, Some(true));
+    #[test_case("", UpdateChannel::Preview; "missing_preserves_base")]
+    #[test_case("update_channel = 'auto'", UpdateChannel::Auto; "explicit_auto")]
+    #[test_case("update_channel = 'stable'", UpdateChannel::Stable; "stable_override")]
+    fn update_channel_overlay_wins(field: &str, expected: UpdateChannel) {
+        let mut base: RawConfig =
+            toml::from_str("[ui]\nupdate_check = false\nupdate_channel = 'preview'\n").unwrap();
+        base.merge(toml::from_str(&format!("[ui]\n{field}\n")).unwrap());
+        let config = base.into_config(false).unwrap();
+        assert_eq!(config.ui.update_channel, expected);
+        assert!(!config.ui.update_check);
     }
 
     #[test]

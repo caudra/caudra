@@ -3873,7 +3873,7 @@ impl MessagesPanel {
     pub fn tick(&mut self) -> Dirty {
         let mut dirty = self.drain_highlights() | self.poll_live_bufs();
         if self.show_idle_splash() {
-            dirty |= self.idle_splash.poll_update(update::latest_version());
+            dirty |= self.idle_splash.poll_update(update::latest_notice());
         }
         dirty
     }

@@ -176,10 +176,17 @@ version = 1
 # Type: String.
 # clock_format = "system"
 
-# Ask GitHub for the latest release on startup and show it in the splash. Off
-# by default, so Caudra makes no such request unless you turn this on.
+# Check GitHub releases in the background at interactive startup and show an
+# update notice. Uses a shared 24-hour cache and never installs automatically.
+# Set false to disable.
 # Type: bool. Env: CAUDRA_ENABLE_UPDATE_CHECK.
-# update_check = false
+# update_check = true
+
+# Release channel: `auto` follows stable from a stable build and preview from a
+# prerelease, including graduation to stable. `stable` excludes prereleases.
+# `preview` includes prereleases and stable releases.
+# Type: string.
+# update_channel = "auto"
 
 # Name of the color theme to load at startup, overriding the theme you last
 # picked with `/theme`. Unset keeps your last pick.

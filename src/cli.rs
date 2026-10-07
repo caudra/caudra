@@ -25,6 +25,7 @@ use caudra_storage::auth::WorkcellCredentialName;
 use caudra_storage::messages::{MAX_ATTEMPTS, MAX_BACKLOG, MAX_CONCURRENCY, WorkState};
 use caudra_storage::retention::{Duration as RetentionDuration, GroupBy, KeepPolicy};
 use caudra_storage::sessions::PermissionMode;
+use caudra_storage::version::UpdateChannel;
 
 use crate::print::OutputFormat;
 use crate::startup::Startup;
@@ -572,6 +573,8 @@ pub enum Command {
     },
     /// Update caudra to the latest version
     Update {
+        #[arg(long, help = "Release channel: auto, stable, or preview")]
+        channel: Option<UpdateChannel>,
         /// Skip confirmation prompt
         #[arg(short = 'y', long)]
         yes: bool,
@@ -1557,6 +1560,7 @@ mod tests {
     use test_case::test_case;
 
     const LOGS_NOT_PARSED: &str = "expected the logs subcommand";
+    const UPDATE_NOT_PARSED: &str = "expected the update subcommand";
     const CONFIG_EXAMPLE_NOT_PARSED: &str = "expected the config example subcommand";
     const MODELS_NOT_PARSED: &str = "expected the models subcommand";
     const TRIM_NOT_PARSED: &str = "expected the storage trim subcommand";
@@ -1854,6 +1858,7 @@ mod tests {
     }
 
     #[test_case(&["caudra", "config", "example"], true ; "config_example")]
+    #[test_case(&["caudra", "update"], true ; "update")]
     #[test_case(&["caudra", "config", "files"], true ; "config_files")]
     #[test_case(&["caudra", "logs"], true ; "logs")]
     #[test_case(&["caudra", "rollback"], true ; "rollback")]
@@ -1865,6 +1870,23 @@ mod tests {
             cli.command.as_ref().map(Command::runs_without_config),
             Some(expected)
         );
+    }
+
+    #[test_case("auto", UpdateChannel::Auto; "auto")]
+    #[test_case("stable", UpdateChannel::Stable; "stable")]
+    #[test_case("preview", UpdateChannel::Preview; "preview")]
+    fn update_channel_is_explicit(value: &str, expected: UpdateChannel) {
+        let cli = Cli::try_parse_from(["caudra", "update", "--channel", value]).unwrap();
+        let Some(Command::Update { channel, .. }) = cli.command else {
+            panic!("{UPDATE_NOT_PARSED}");
+        };
+        assert_eq!(channel, Some(expected));
+    }
+
+    #[test_case("nightly"; "unsupported_channel")]
+    #[test_case(""; "empty_channel")]
+    fn update_rejects_unknown_channel(value: &str) {
+        assert!(Cli::try_parse_from(["caudra", "update", "--channel", value]).is_err());
     }
 
     #[test_case(&[], files::CAUDRA.name ; "caudra_toml_by_default")]

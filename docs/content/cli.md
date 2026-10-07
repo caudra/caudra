@@ -456,13 +456,23 @@ Server names come from your [MCP config](/docs/mcp/). On a machine without a bro
 ### `caudra update` / `caudra rollback`
 
 ```bash
-caudra update            # install latest release
-caudra update -y         # skip confirmation
+caudra update
+caudra update --channel stable
+caudra update --channel preview
+caudra update -y
 caudra update --no-color
-caudra rollback          # previous version
+caudra rollback
 ```
 
-Uses the same install locations as the install scripts.
+`update` checks GitHub directly, bypassing the background cache and its opt-out. It reads `ui.update_channel` from your global config unless `--channel` overrides it. Missing or broken config falls back to `auto`, so configuration errors do not prevent recovery. Project settings are not loaded by this command. The UI notice includes an explicit channel when offering an update.
+
+`auto` follows stable releases from a stable build and both previews and stable releases from a preview build. After installing a final release, `auto` follows stable releases. Choose `preview` explicitly to keep receiving previews of future versions. `stable` never selects a prerelease. Ordinary updates never downgrade.
+
+On Unix, `update` shows the selected release and its checksum-verified installer before asking for confirmation. `-y` skips that prompt. The installer receives the exact selected tag and verifies the archive checksum before extraction. The previous binary and its license bundle are saved together for `rollback`. Rollback restores files, not migrations to session data or configuration.
+
+On Windows, `update` saves the verified PowerShell installer and prints an exact command. Close all Caudra processes before running it. Preparing that command does not install the update. In-process `rollback` is unsupported on Windows. Close Caudra and run the installer with the previous release tag instead. Recognized Nix, Homebrew, and Cargo installations must be updated or rolled back through their package manager.
+
+Set `CAUDRA_INSTALL_DIR` to override the destination. Release checksums detect corruption relative to the published manifest. They do not protect against a compromised release publisher.
 
 ### `caudra acp`
 

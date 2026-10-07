@@ -3,7 +3,7 @@ title: "Caudra Docs"
 description: "User documentation for the Caudra terminal coding agent."
 ---
 
-Caudra turns context into effective action. It is an independent fork and terminal coding agent written in Rust, with models, tools, plugins, and subagents coordinated under your control. The hard-break release line starts at `0.1.0`.
+Caudra turns context into effective action. It is an independent fork and terminal coding agent written in Rust, with models, tools, plugins, and subagents coordinated under your control. The first public release is 0.2 Preview.
 
 Inside Caudra, `/docs` opens these pages for the version you run, and `/` searches every page.
 

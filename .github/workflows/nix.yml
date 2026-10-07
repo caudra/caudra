@@ -1,20 +1,35 @@
 name: Nix
 
 on:
+  workflow_call:
+    inputs:
+      source-sha:
+        required: true
+        type: string
   push:
     branches: [main]
   pull_request:
     branches: [main]
+
+env:
+  CAUDRA_ENABLE_UPDATE_CHECK: "0"
 
 jobs:
   changes:
     name: Detect changes
     runs-on: ubuntu-latest
     outputs:
-      code: ${{ steps.filter.outputs.code }}
+      code: ${{ inputs.source-sha != '' && 'true' || steps.filter.outputs.code }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - run: test "$SOURCE_SHA" = "$GITHUB_SHA"
+        env:
+          SOURCE_SHA: ${{ inputs.source-sha || github.sha }}
       - uses: dorny/paths-filter@v3
+        if: inputs.source-sha == ''
         id: filter
         with:
           filters: |
@@ -46,9 +61,13 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       actions: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
       - uses: nixbuild/nix-quick-install-action@v30
         with:
           nix_conf: |
@@ -65,8 +84,21 @@ jobs:
           purge-created: 0
           purge-primary-key: never
       - name: Check hash drift
-        run: nix build .#checks.x86_64-linux.git-dep-hashes
+        run: nix build --no-update-lock-file .#checks.x86_64-linux.git-dep-hashes
       - name: Check Nix formatting
-        run: nix build .#checks.x86_64-linux.fmt
+        run: nix build --no-update-lock-file .#checks.x86_64-linux.fmt
       - name: Build
-        run: nix build
+        run: nix build --no-update-lock-file
+
+  ci-pass:
+    name: Nix CI
+    if: always()
+    needs: [changes, build]
+    runs-on: ubuntu-latest
+    steps:
+      - if: >-
+          needs.changes.result != 'success' ||
+          contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') ||
+          (needs.changes.outputs.code == 'true' && contains(needs.*.result, 'skipped')) ||
+          (inputs.source-sha != '' && needs.changes.outputs.code != 'true')
+        run: exit 1

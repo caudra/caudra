@@ -1,6 +1,11 @@
 name: Rust
 
 on:
+  workflow_call:
+    inputs:
+      source-sha:
+        required: true
+        type: string
   push:
     branches: ["main"]
   pull_request:
@@ -11,16 +16,24 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
   WORKCELL_REQUIRE_CODE_WORKER: "1"
+  CAUDRA_ENABLE_UPDATE_CHECK: "0"
 
 jobs:
   changes:
     name: Detect changes
     runs-on: ubuntu-latest
     outputs:
-      code: ${{ steps.filter.outputs.code }}
+      code: ${{ inputs.source-sha != '' && 'true' || steps.filter.outputs.code }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - run: test "$SOURCE_SHA" = "$GITHUB_SHA"
+        env:
+          SOURCE_SHA: ${{ inputs.source-sha || github.sha }}
       - uses: dorny/paths-filter@v3
+        if: inputs.source-sha == ''
         id: filter
         with:
           filters: |
@@ -52,6 +65,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
       - run: cargo fmt --all -- --check
 
   fmt-lua:
@@ -63,6 +79,9 @@ jobs:
       STYLUA_VERSION: v2.4.1
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
       - name: Install stylua
         run: |
           .github/scripts/retry.sh curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors -o stylua.zip \
@@ -76,27 +95,39 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    env:
+      WORKCELL_BUNDLED_MONTY_WORKER: ${{ github.workspace }}/target/code-worker/bin/monty
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
       - uses: Swatinem/rust-cache@v2
-      - run: make lint
+      - run: make code-worker
+      - run: cargo clippy --locked --all --tests -- -D warnings
 
   test:
     name: Test
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    env:
+      WORKCELL_BUNDLED_MONTY_WORKER: ${{ github.workspace }}/target/code-worker/bin/monty
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
       - run: python3 scripts/test-build-code-worker.py
       - run: sudo apt-get -o Acquire::Retries=5 install -y ripgrep
-      - run: make test
+      - run: make test ARGS=--locked
       # Lives here to reuse the warm target dir instead of building the graph twice.
-      - run: make gen-docs-check
+      - name: Run make gen-docs-check
+        run: cargo run --locked -p caudra-docgen -- --check
 
   machete:
     name: Unused deps
@@ -105,6 +136,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-machete
@@ -119,6 +153,9 @@ jobs:
       WORKCELL_BUNDLED_MONTY_WORKER: ${{ github.workspace }}/target/code-worker/bin/monty
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
       - uses: Swatinem/rust-cache@v2
       - run: python3 scripts/build-code-worker.py
       - run: make -C workcell check-native test-optional-features
@@ -132,8 +169,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
       - uses: Swatinem/rust-cache@v2
-      - run: make build workcell-build
+      - run: make check build workcell-build ARGS=--locked
 
   macos:
     name: Check + Test + Build (macOS)
@@ -142,8 +182,11 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
       - uses: Swatinem/rust-cache@v2
-      - run: make check
+      - run: make check ARGS=--locked
       - name: Workcell macOS native filesystem checks
         run: |
           cargo check --locked -p workcell-mcp-files --all-targets --all-features
@@ -159,18 +202,23 @@ jobs:
           cargo test --locked -p caudra-sandbox local_admin::image
         env:
           WORKCELL_BUNDLED_MONTY_WORKER: ${{ github.workspace }}/target/code-worker/bin/monty
-      - run: make build
+      - run: make build ARGS=--locked
 
   windows:
     name: Lint + Build (Windows)
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: windows-latest
+    env:
+      WORKCELL_BUNDLED_MONTY_WORKER: ${{ github.workspace }}/target/code-worker/bin/monty.exe
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
       - uses: Swatinem/rust-cache@v2
       - name: Install GNU Make and select Git Bash
         shell: pwsh
@@ -180,13 +228,19 @@ jobs:
           "$env:ProgramFiles\Git\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - run: make --version && bash --version
       - run: python3 scripts/test-make.py
-      - run: make lint build
+      - run: make code-worker
+      - run: cargo clippy --locked --all --tests -- -D warnings
+      - run: make build ARGS=--locked
 
   ci-pass:
     name: CI
     if: always()
-    needs: [fmt, fmt-lua, lint, test, machete, workcell-native, build, macos, windows]
+    needs: [changes, fmt, fmt-lua, lint, test, machete, workcell-native, build, macos, windows]
     runs-on: ubuntu-latest
     steps:
-      - if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+      - if: >-
+          needs.changes.result != 'success' ||
+          contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') ||
+          (needs.changes.outputs.code == 'true' && contains(needs.*.result, 'skipped')) ||
+          (inputs.source-sha != '' && needs.changes.outputs.code != 'true')
         run: exit 1

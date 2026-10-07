@@ -127,6 +127,8 @@ On macOS and Linux:
 curl -fsSL https://caudra.ai/install.sh | sh
 ```
 
+The first public release is Caudra 0.2 Preview (`0.2.0-preview.1`). The installer prefers a stable release and selects a preview only when no stable release exists. It verifies the archive checksum before installing. A failed release lookup stops installation rather than switching channels.
+
 The script installs Caudra to `~/.local/bin`. Set `CAUDRA_INSTALL_DIR` to choose another directory. If you would rather read the script first, download it, look it over, and run it yourself:
 
 ```sh
@@ -149,7 +151,7 @@ With Nix:
 nix run github:caudra/caudra
 ```
 
-Prebuilt binaries for Linux and macOS on x86_64 and ARM64, and for Windows on x86_64, are on [GitHub Releases](https://github.com/caudra/caudra/releases/latest). To build the main branch yourself:
+Prebuilt binaries for Linux and macOS on x86_64 and ARM64, and for Windows on x86_64, are on [GitHub Releases](https://github.com/caudra/caudra/releases). To build the main branch yourself:
 
 ```sh
 cargo install --locked --git https://github.com/caudra/caudra.git caudra
@@ -205,7 +207,7 @@ Sessions, retained tool output, and file change records are stored on your machi
 
 Shell commands start from a cleared environment and receive only [a short list of variables](https://caudra.ai/docs/cli/#shell-host-configuration), such as `PATH`, `HOME`, and proxy settings, so API keys set for Caudra stay out of them. `webfetch` checks every URL and redirect before it connects, and refuses private, loopback, and link-local addresses.
 
-There is no tracking. Telemetry stays off unless you send it to a collector you run, and Caudra checks for updates only when you run `caudra update` or turn on the startup check.
+Telemetry stays off unless you send it to a collector you run. The interactive UI checks GitHub for updates in the background by default, with a shared 24-hour cache. GitHub receives your IP address and normal request metadata, but no session data, machine identifier, or installed version. Set `ui.update_check = false` or `CAUDRA_ENABLE_UPDATE_CHECK=0` to disable these checks. Updates are never installed automatically. See [updating and release channels](https://caudra.ai/docs/cli/#caudra-update-caudra-rollback).
 
 Caudra also works offline with a local model. Use Ollama or llama.cpp, or point a `providers.toml` entry at [ninfer-4090](https://github.com/tensorninja/ninfer-4090), the maintainer's custom inference engine for Qwen3.8-27B on a single RTX 4090. Otherwise, a normal run contacts your provider, refreshes the public [models.dev](https://models.dev) catalog at most once a day, and reaches Exa when the agent searches the web.
 

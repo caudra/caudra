@@ -13,6 +13,8 @@ on:
       - ".github/workflows/python.yml"
       - ".github/workflows/website-docs.yml"
       - ".github/workflows/release.yml"
+      - ".github/workflows/rust.yml"
+      - ".github/workflows/nix.yml"
       - "install.sh"
       - "install.ps1"
       - "flake.nix"
@@ -29,6 +31,8 @@ on:
       - ".github/workflows/python.yml"
       - ".github/workflows/website-docs.yml"
       - ".github/workflows/release.yml"
+      - ".github/workflows/rust.yml"
+      - ".github/workflows/nix.yml"
       - "install.sh"
       - "install.ps1"
       - "flake.nix"
@@ -40,14 +44,11 @@ env:
 
 jobs:
   distribution:
-    name: Worker and attribution tests
+    name: Distribution tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: python3 scripts/test-make.py
-      - run: python3 scripts/test-build-code-worker.py
-      - run: python3 scripts/test-build-attribution.py
-      - run: python3 scripts/test-install.py
+      - run: make distribution-tests
 
   website-docs:
     name: Website source updater tests

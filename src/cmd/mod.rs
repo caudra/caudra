@@ -432,8 +432,12 @@ pub fn dispatch(mut cli: Cli, startup: Result<Startup, ConfigFileError>) -> Resu
                 McpAction::Logout { server } => subcmd::mcp_logout(&server, &storage)?,
             }
         }
-        Some(Command::Update { yes, no_color }) => {
-            update::update(yes, no_color).map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
+        Some(Command::Update {
+            channel,
+            yes,
+            no_color,
+        }) => {
+            update::update(channel, yes, no_color).map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
         }
         Some(Command::Rollback) => {
             update::rollback().map_err(|e| color_eyre::eyre::eyre!("{e}"))?;

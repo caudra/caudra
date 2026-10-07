@@ -8,29 +8,84 @@ on:
     tags:
       - "v*"
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
-  WORKCELL_REQUIRE_CODE_WORKER: 1
+  WORKCELL_REQUIRE_CODE_WORKER: "1"
+  CAUDRA_ENABLE_UPDATE_CHECK: "0"
   BINARY_NAME: caudra
-  GH_TOKEN: ${{ github.token }}
-  GH_REPO: ${{ github.repository }}
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  create-release:
-    name: Create Release
+  validate:
+    name: Validate release source
+    if: github.repository == 'caudra/caudra' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - run: python3 scripts/release.py validate
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  verify-rust:
+    needs: validate
+    uses: ./.github/workflows/rust.yml
+    with:
+      source-sha: ${{ github.sha }}
+
+  verify-nix:
+    needs: validate
+    permissions:
+      contents: read
+      actions: write
+    uses: ./.github/workflows/nix.yml
+    with:
+      source-sha: ${{ github.sha }}
+
+  verify-python:
+    name: Verify release Python
+    needs: validate
+    runs-on: ubuntu-latest
+    env:
+      RUFF_VERSION: 0.16.2
+      TY_VERSION: 0.0.70
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install verification tools
+        run: .github/scripts/retry.sh pip install "ruff==${RUFF_VERSION}" "ty==${TY_VERSION}"
+      - run: ruff format --check scripts/
+      - run: make pylint distribution-tests
+      - run: python3 scripts/test-update-website-docs.py
+
+  create-release:
+    name: Prepare guarded draft
+    needs: [verify-rust, verify-nix, verify-python]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       - name: Create draft release
-        run: |
-          .github/scripts/retry.sh bash -c \
-            'gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --draft --title "$GITHUB_REF_NAME" --generate-notes'
+        run: python3 scripts/release.py prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
 
   build-linux:
     name: Build (${{ matrix.target }})
@@ -47,6 +102,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       - name: Build in Alpine container
         run: |
@@ -56,6 +114,8 @@ jobs:
             -e CARGO_TERM_COLOR=always \
             -e CARGO_INCREMENTAL=0 \
             -e WORKCELL_REQUIRE_CODE_WORKER=1 \
+            -e CAUDRA_ENABLE_UPDATE_CHECK=0 \
+            -e GITHUB_REF_NAME \
             alpine:3.21 sh -c '
               set -eu
               apk add --no-cache gcc g++ musl-dev make perl linux-headers curl git ca-certificates pkgconf python3-dev
@@ -75,6 +135,7 @@ jobs:
               cp target/${{ matrix.target }}/release/caudra target/release-symbols/caudra
               cp target/code-worker/symbols/bin/monty target/release-symbols/monty
               strip target/${{ matrix.target }}/release/caudra
+              test "$(target/${{ matrix.target }}/release/caudra --version)" = "caudra ${GITHUB_REF_NAME#v}"
               cargo test --locked --release --target ${{ matrix.target }} \
                 --package caudra-workcell production_host_executes_code_with_the_embedded_worker
               smoke_output="$(OPENAI_API_KEY=release-smoke \
@@ -103,7 +164,15 @@ jobs:
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
       - name: Upload artifact
-        run: .github/scripts/retry.sh gh release upload "$GITHUB_REF_NAME" "$ARCHIVE" "$SYMBOL_ARCHIVE" --clobber
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            ${{ env.ARCHIVE }}
+            ${{ env.SYMBOL_ARCHIVE }}
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
 
   build-other:
     name: Build (${{ matrix.target }})
@@ -122,9 +191,24 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       - name: Install Rust toolchain
         run: rustup toolchain install 1.99.0 --profile minimal --target ${{ matrix.target }}
+
+      - name: Test native platform installer without skipped coverage
+        shell: bash
+        run: |
+          suite=InstallTests
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            python3 -c 'import shutil, sys; sys.exit(0 if shutil.which("pwsh") else "Native PowerShell is required")'
+            suite=PowerShellTests
+          fi
+          python3 scripts/test-install.py "$suite" 2>&1 | tee "$RUNNER_TEMP/installer-tests.log"
+          grep -Eq '^Ran [1-9][0-9]* tests? in ' "$RUNNER_TEMP/installer-tests.log"
+          ! grep -q 'skipped=' "$RUNNER_TEMP/installer-tests.log"
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -160,6 +244,7 @@ jobs:
             cp "$binary" target/release-symbols/
             strip "$binary"
           fi
+          test "$("$binary" --version)" = "${BINARY_NAME} ${GITHUB_REF_NAME#v}"
           cargo test --locked --release --target ${{ matrix.target }} \
             --package caudra-workcell production_host_executes_code_with_the_embedded_worker
           smoke_output="$(OPENAI_API_KEY=release-smoke \
@@ -198,27 +283,40 @@ jobs:
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
       - name: Upload artifact
-        shell: bash
-        run: .github/scripts/retry.sh gh release upload "$GITHUB_REF_NAME" "$ARCHIVE" "$SYMBOL_ARCHIVE" --clobber
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            ${{ env.ARCHIVE }}
+            ${{ env.SYMBOL_ARCHIVE }}
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
 
   publish:
     name: Publish Release
     needs: [build-linux, build-other]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # Serialize Latest selection across different stable tags, not just retries of one tag.
+    concurrency:
+      group: release-publication
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       - name: Download artifacts
-        run: .github/scripts/retry.sh gh release download "$GITHUB_REF_NAME" --dir artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: artifacts
+          merge-multiple: true
 
-      - name: Generate checksums
-        run: |
-          cd artifacts
-          sha256sum * > ../sha256sums.txt
-          cat ../sha256sums.txt
-
-      - name: Upload checksums
-        run: .github/scripts/retry.sh gh release upload "$GITHUB_REF_NAME" sha256sums.txt --clobber
-
-      - name: Mark release as published
-        run: .github/scripts/retry.sh gh release edit "$GITHUB_REF_NAME" --draft=false
+      - name: Stage, verify, and publish complete release
+        run: python3 scripts/release.py publish --artifacts artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}

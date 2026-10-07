@@ -90,6 +90,7 @@ distribution-tests:
 	$(PYTHON) scripts/test-build-code-worker.py
 	$(PYTHON) scripts/test-build-attribution.py
 	$(PYTHON) scripts/test-install.py
+	$(PYTHON) scripts/test-release.py
 
 gen-docs: code-worker
 	$(CARGO) run -p caudra-docgen

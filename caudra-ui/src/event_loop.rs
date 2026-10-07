@@ -1614,7 +1614,7 @@ impl<'t> EventLoop<'t> {
         static PROCESS_WARMUP: std::sync::Once = std::sync::Once::new();
         PROCESS_WARMUP.call_once(|| {
             std::thread::spawn(crate::highlight::warmup);
-            crate::update::spawn_check(ui_config.update_check);
+            crate::update::spawn_check(ui_config.update_check, ui_config.update_channel.clone());
         });
 
         let cwd =

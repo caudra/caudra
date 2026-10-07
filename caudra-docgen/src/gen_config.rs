@@ -344,22 +344,44 @@ fn write_update_check_section(out: &mut String) {
     writeln!(out, "### `ui.update_check`\n").unwrap();
     writeln!(
         out,
-        "When on, Caudra asks the GitHub releases API for the latest version \
-         once at startup and shows it in the splash when yours is older. The \
-         request carries a `caudra` user agent and nothing else: no session id, \
-         no machine id, not even your current version.\n"
+        "Enabled by default in the interactive UI. Caudra checks GitHub releases \
+         in the background at startup and shows a notice when a newer version \
+         is available. A shared on-disk cache reuses successful checks for \
+         24 hours across processes, with backoff after failures. Headless and \
+         ACP runs do not start an update check. Nothing is installed automatically.\n"
     )
     .unwrap();
     writeln!(
         out,
-        "It is off by default, so a normal run sends no update request. A \
-         normal run still contacts your model provider, fetches the public \
+        "GitHub receives your source IP address and normal request metadata, \
+         including a `caudra` user agent. The check sends no session data, \
+         machine identifier, or current version.\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "Set `ui.update_check = false` to disable startup checks. \
+         `CAUDRA_ENABLE_UPDATE_CHECK=0` disables them for one run, and \
+         `CAUDRA_ENABLE_UPDATE_CHECK=1` enables them even when the config says \
+         false. An empty value leaves the config in effect. A normal run \
+         still contacts your model provider, fetches the public \
          [models.dev](https://models.dev/) model catalog when the cached copy \
          is more than a day old, and sends web searches to Exa when the agent \
-         uses `websearch`. Set `CAUDRA_ENABLE_UPDATE_CHECK=1` to turn it \
-         on for a single run, or `CAUDRA_ENABLE_UPDATE_CHECK=0` to turn it off \
-         when your config has it on. The `caudra update` command always \
-         checks, because that is what you asked it to do.\n"
+         uses `websearch`.\n"
+    )
+    .unwrap();
+    writeln!(out, "### `ui.update_channel`\n").unwrap();
+    writeln!(
+        out,
+        "The default, `\"auto\"`, follows stable releases from a stable build \
+         and preview releases from a prerelease build. `\"stable\"` excludes \
+         prereleases. `\"preview\"` includes both prereleases and stable releases, \
+         so a preview can graduate to its stable release. After graduation, \
+         `\"auto\"` follows stable releases.\n\n\
+         Run `caudra update --channel auto`, `caudra update --channel stable`, \
+         or `caudra update --channel preview` to update manually. An explicit \
+         update bypasses the startup cache and opt-out. The splash notice \
+         includes the configured channel in its command.\n"
     )
     .unwrap();
 }

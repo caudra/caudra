@@ -150,6 +150,16 @@ nix fmt           # format the Nix files
 nix flake check   # includes the Git dependency hash check
 ```
 
+## Releases
+
+The first public release is `0.2.0-preview.1`, tagged `v0.2.0-preview.1`. Each preview gets a new numeric suffix. Release candidates may use `-rc.1` before the final `0.2.0`. Published tags and binaries are never replaced. During the `0.x` line, patches preserve compatibility and breaking changes require a minor bump with migration notes.
+
+A release tag must match the workspace version exactly. Pushing it to the canonical repository authorizes CI to verify the exact commit, build all supported targets, stage a draft with installers and checksums, and publish automatically after every required check passes. Prereleases carry GitHub's pre-release flag and cannot become Latest. A failed job leaves publication incomplete rather than exposing a partial release. Ordinary pushes to `main` do not publish binaries.
+
+Release archives include their license bundles and the embedded Python worker. Binary distribution clearance does not imply clearance to distribute every dependency source or build cache. Review the attribution evidence and unresolved exceptions before publication. Repository-level immutable releases and protected release tags are recommended operational settings, not guarantees made by the workflow.
+
+The website deploys separately. Its pinned application source supplies canonical docs and bootstrap installers. Installer changes require a source-pin update after the source commit is available. Self-updates use the installer attached to the selected GitHub Release.
+
 ## Commits and pull requests
 
 Branch from `main` and open your pull request against `main`. Keep each pull request to one change, so it is easy to review and to revert.
