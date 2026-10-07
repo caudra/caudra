@@ -1208,27 +1208,31 @@ mod tests {
     /// command's text says so. `cat notes.md` is confined by every textual rule
     /// there is and still reads whatever the link names.
     #[test_case(&["cat inside.md"] => true ; "a real file inside the project")]
-    #[test_case(&["cat notes.md"] => false ; "a symlink to a file outside it")]
-    #[test_case(&["cat linked/id_rsa"] => false ; "a path through a symlinked directory")]
+    #[cfg_attr(unix, test_case(&["cat notes.md"] => false ; "a symlink to a file outside it"))]
+    #[cfg_attr(unix, test_case(&["cat linked/id_rsa"] => false ; "a path through a symlinked directory"))]
     #[test_case(&["cat missing.md"] => true ; "a name that resolves to nothing is not a path we read")]
     #[test_case(&["find . -name *.rs"] => true ; "a pattern argument still resolves to nothing")]
-    #[test_case(&["cd linked"] => false ; "a move through a symlinked directory")]
+    #[cfg_attr(unix, test_case(&["cd linked"] => false ; "a move through a symlinked directory"))]
     // `sub/escape` leaves the project and `escape` names nothing, so the answer
     // is only right when the operand is resolved against the directory the `cd`
     // reached. Against the workdir it resolves to nothing and reads as confined.
-    #[test_case(&["cd sub", "cat escape"] => false ; "a link the move brings into reach")]
+    #[cfg_attr(unix, test_case(&["cd sub", "cat escape"] => false ; "a link the move brings into reach"))]
     fn a_symlink_out_of_the_project_is_not_confined(commands: &[&str]) -> bool {
         let project = tempfile::tempdir().expect("project");
         let outside = tempfile::tempdir().expect("outside");
         let secret = outside.path().join("id_rsa");
         std::fs::write(&secret, "key").expect("secret");
         std::fs::write(project.path().join("inside.md"), "notes").expect("inside");
-        std::os::unix::fs::symlink(&secret, project.path().join("notes.md")).expect("file link");
-        std::os::unix::fs::symlink(outside.path(), project.path().join("linked"))
-            .expect("dir link");
         std::fs::create_dir(project.path().join("sub")).expect("subdirectory");
-        std::os::unix::fs::symlink(&secret, project.path().join("sub/escape"))
-            .expect("nested link");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&secret, project.path().join("notes.md"))
+                .expect("file link");
+            std::os::unix::fs::symlink(outside.path(), project.path().join("linked"))
+                .expect("dir link");
+            std::os::unix::fs::symlink(&secret, project.path().join("sub/escape"))
+                .expect("nested link");
+        }
         let root = project.path().canonicalize().expect("canonical project");
 
         line_is_confined(&analysis(commands), &root, &root)
@@ -1237,6 +1241,7 @@ mod tests {
     /// The bound is the project, not the directory the command runs from, so a
     /// link that never leaves the project stays confined even when it points
     /// outside the workdir.
+    #[cfg(unix)]
     #[test]
     fn a_link_within_the_project_stays_confined_from_a_subdirectory() {
         let project = tempfile::tempdir().expect("project");

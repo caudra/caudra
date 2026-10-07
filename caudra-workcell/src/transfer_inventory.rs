@@ -15,15 +15,17 @@ use caudra_workspace::{
     CollectionRevision, ContinuationToken, LocalTransferAuthorization, LocalTransferSource,
     ResourceId, ResourceRevision, TransferDigest, WorkspaceError, WorkspacePath,
 };
+#[cfg(unix)]
 use futures_lite::future;
+#[cfg(unix)]
 use smol::{Timer, Unblock};
+#[cfg(unix)]
 use tokio_util::sync::CancellationToken;
 use workcell::host_contract as contract;
 
-use crate::{
-    LocalTransferPublisher, RemoteWorkcellClient,
-    transfer::{IO_TIMEOUT, binary_error},
-};
+#[cfg(unix)]
+use crate::transfer::{IO_TIMEOUT, binary_error};
+use crate::{LocalTransferPublisher, RemoteWorkcellClient};
 
 /// Plan approval, host-local publication permission, dirty-buffer leases, and events are
 /// deliberately separate. This factory supplies no allow-all or remote-to-local approval bridge.
@@ -46,6 +48,9 @@ pub async fn reviewed_workspace_transfer(
     limits: OrchestrationLimits,
     host: ReviewedTransferHost,
 ) -> Result<WorkspaceTransfer, TransferError> {
+    if !cfg!(unix) {
+        return Err(WorkspaceError::UnsupportedEntry.into());
+    }
     let roots = TransferRoots {
         local: LocalRootIdentity::capture(&local_root)?,
         remote: remote_root,
@@ -150,14 +155,17 @@ impl Listings {
 
 pub struct RootedTransferInventory {
     roots: TransferRoots,
+    #[cfg(unix)]
     local: Arc<LocalTransferPublisher>,
     remote: Arc<dyn RemoteInventorySource>,
+    #[cfg(unix)]
     max_file_bytes: u64,
     policy: contract::TransferInventoryPolicy,
     listings: Mutex<Listings>,
 }
 
 impl RootedTransferInventory {
+    #[cfg(unix)]
     pub fn new(
         roots: TransferRoots,
         local: Arc<LocalTransferPublisher>,
@@ -181,6 +189,17 @@ impl RootedTransferInventory {
         })
     }
 
+    #[cfg(not(unix))]
+    pub fn new(
+        _roots: TransferRoots,
+        _local: Arc<LocalTransferPublisher>,
+        _remote: RemoteWorkcellClient,
+        _max_file_bytes: u64,
+        _filters: &TransferFilters,
+    ) -> Result<Self, TransferError> {
+        Err(WorkspaceError::UnsupportedEntry.into())
+    }
+
     fn listings(&self) -> MutexGuard<'_, Listings> {
         self.listings.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -196,6 +215,9 @@ impl RootedTransferInventory {
                     .inventory(&self.roots.remote, inspect, &self.policy)
                     .await?
             }
+            #[cfg(not(unix))]
+            Side::Local => return Err(WorkspaceError::UnsupportedEntry.into()),
+            #[cfg(unix)]
             Side::Local => {
                 if LocalRootIdentity::capture(self.roots.local.canonical_path())?
                     != self.roots.local
@@ -335,6 +357,17 @@ impl TransferInventory for RootedTransferInventory {
         })
     }
 
+    #[cfg(not(unix))]
+    async fn open_local(
+        &self,
+        _root: &LocalRootIdentity,
+        _path: &WorkspacePath,
+        _revision: &ResourceRevision,
+    ) -> Result<LocalTransferSource, TransferError> {
+        Err(WorkspaceError::UnsupportedEntry.into())
+    }
+
+    #[cfg(unix)]
     async fn open_local(
         &self,
         root: &LocalRootIdentity,
@@ -396,7 +429,7 @@ fn node(node: &contract::TransferInventoryNode) -> Result<InventoryNode, Transfe
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::{RemoteInventorySource, RootedTransferInventory};
     use crate::LocalTransferPublisher;

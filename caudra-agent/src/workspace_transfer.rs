@@ -1122,34 +1122,33 @@ fn operation_id() -> Result<OperationId, TransferError> {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::journal::ROTATE_RECORDS;
+    use super::journal::{ROTATE_RECORDS, tests::remote_root};
     use super::{
         CleanBufferLease, ComparisonKind, ExclusionReason, FileOutcome, FilePreview, INSPECT_BYTES,
         Inspection, InventoryContext, InventoryNode, InventoryPage, JournalState, LocalAccess,
         LocalRootIdentity, NodeKind, OrchestrationLimits, PlannedDirectory, PlannedFile,
-        PullBufferGuard, RemoteRootIdentity, RollbackCoverage, ScanLimit, Side, TransferAction,
-        TransferAuthorization, TransferError, TransferEvent, TransferEvents, TransferFilters,
-        TransferInventory, TransferJournal, TransferPhase, TransferPlan, TransferRoots,
-        TransferServices, WorkspaceTransfer, byte_digest, digest, operation_id,
+        PullBufferGuard, RollbackCoverage, ScanLimit, Side, TransferAction, TransferAuthorization,
+        TransferError, TransferEvent, TransferEvents, TransferFilters, TransferInventory,
+        TransferJournal, TransferPhase, TransferPlan, TransferRoots, TransferServices,
+        WorkspaceTransfer, byte_digest, digest, operation_id,
     };
     use crate::{CancelToken, CancelTrigger};
     use async_trait::async_trait;
     use caudra_config::sandbox::TransferPolicy;
     use caudra_storage::private_file::PrivateFileError;
     use caudra_workspace::{
-        AuthenticatedPrincipalId, AuthorityIdentity, ByteRange, CollectionRevision,
-        ContinuationToken, CwdHandle, DirectoryPublicationRequest, DirectoryPublicationStatus,
-        DownloadedTransfer, LocalPublicationState, LocalTransferCondition,
-        LocalTransferDestination, LocalTransferPath, LocalTransferReview, LocalTransferRevision,
-        LocalTransferService, LocalTransferSource, MutationCondition, OperationError,
-        OperationHandle, OperationId, OperationPhase, OperationState, OperationStatus,
-        PreparedDirectoryPublication, PreparedLocalDirectory, PreparedLocalTransfer,
-        PreparedTransferPublication, ProjectIdentity, ProjectKey, PublishedTransferDirectory,
+        ByteRange, CollectionRevision, ContinuationToken, DirectoryPublicationRequest,
+        DirectoryPublicationStatus, DownloadedTransfer, LocalPublicationState,
+        LocalTransferCondition, LocalTransferDestination, LocalTransferPath, LocalTransferReview,
+        LocalTransferRevision, LocalTransferService, LocalTransferSource, MutationCondition,
+        OperationError, OperationHandle, OperationId, OperationPhase, OperationState,
+        OperationStatus, PreparedDirectoryPublication, PreparedLocalDirectory,
+        PreparedLocalTransfer, PreparedTransferPublication, PublishedTransferDirectory,
         ReleaseResult, RemoteTransferFile, RemoteTransferStage, ResourceId, ResourceRevision,
-        ResourceScope, SealedTransfer, SequenceMetadata, SessionBindingId, SessionWorkspaceBinding,
-        SourceTrustAnchor, TransferContent, TransferLimits, TransferMode,
-        TransferPublicationRequest, TransferPublicationState, TransferPublicationStatus,
-        WorkspaceCursor, WorkspaceError, WorkspacePath, WorkspaceTransferService,
+        SealedTransfer, SequenceMetadata, SessionWorkspaceBinding, TransferContent, TransferLimits,
+        TransferMode, TransferPublicationRequest, TransferPublicationState,
+        TransferPublicationStatus, WorkspaceCursor, WorkspaceError, WorkspacePath,
+        WorkspaceTransferService,
     };
     use futures_lite::{
         future,
@@ -1215,37 +1214,6 @@ mod tests {
 
     fn path(value: &str) -> WorkspacePath {
         WorkspacePath::new(value).unwrap()
-    }
-
-    pub(super) fn remote_root(version: &str, subject: &str) -> RemoteRootIdentity {
-        let authority = AuthorityIdentity::new(
-            SourceTrustAnchor::new("test-transfer").unwrap(),
-            "server",
-            "workspace",
-            version,
-            "namespace",
-        )
-        .unwrap();
-        let principal = AuthenticatedPrincipalId::new(authority.clone(), subject).unwrap();
-        let project = ProjectIdentity::new(authority.clone(), ProjectKey::new("project").unwrap());
-        let binding = SessionWorkspaceBinding::new(
-            SessionBindingId::new("binding").unwrap(),
-            authority,
-            principal,
-            project,
-        )
-        .unwrap();
-        let cursor = WorkspaceCursor::new(
-            &binding,
-            ResourceScope::root(ResourceId::new("root").unwrap()),
-            1,
-            CwdHandle::new("cwd").unwrap(),
-        );
-        RemoteRootIdentity {
-            binding,
-            cursor,
-            cwd: WorkspacePath::root(),
-        }
     }
 
     #[derive(Clone)]

@@ -6512,6 +6512,7 @@ mod tests {
     /// A checked-in symlink needs no privileged action from the model: cloning a
     /// repository is enough. Every textual rule says `cat notes.md` is confined,
     /// so only resolving it says otherwise.
+    #[cfg(unix)]
     #[test_case("cat inside.md" => true ; "a real file inside the project")]
     #[test_case("cat notes.md" => false ; "a symlink out of the project")]
     #[test_case("cat linked/id_rsa" => false ; "a path through a symlinked directory")]
@@ -6527,6 +6528,7 @@ mod tests {
         confined_read_preflight_marks(root.path(), command)
     }
 
+    #[cfg(unix)]
     #[test_case(".env", false; "dotenv_alias")]
     #[test_case(".git/config", false; "git_config_alias")]
     #[test_case(".git/HEAD", true; "inert_git_alias")]
@@ -6551,8 +6553,8 @@ mod tests {
     #[test_case("ls caudra-highlight/* | head -30" => vec![true, true] ; "a_listing_piped_to_a_slice")]
     #[test_case("cat caudra-highlight/Cargo.toml && ls caudra-highlight/* | head -30 && wc -l caudra-highlight/src/*" => vec![true, true, true, true] ; "the_reported_line")]
     #[test_case("cat caudra-highlight/.e*" => vec![false] ; "a_dotfile_named_explicitly")]
-    #[test_case("cat escape/*" => vec![false] ; "a_match_linking_out")]
-    #[test_case("cat linked/*" => vec![false] ; "a_glob_through_a_linked_directory")]
+    #[cfg_attr(unix, test_case("cat escape/*" => vec![false] ; "a_match_linking_out"))]
+    #[cfg_attr(unix, test_case("cat linked/*" => vec![false] ; "a_glob_through_a_linked_directory"))]
     #[test_case("ls missing/*" => vec![true] ; "no_match_passes_the_pattern_inside")]
     #[test_case("ls /nonexistent-caudra-root/*" => vec![false] ; "no_match_passes_the_pattern_outside")]
     #[test_case("ls missing/../../*" => vec![false] ; "no_match_passes_a_pattern_climbing_out")]
@@ -6568,9 +6570,13 @@ mod tests {
         std::fs::create_dir(&escape).expect("escape directory");
         std::fs::write(escape.join("notes.md"), "notes").expect("notes");
         std::fs::write(outside.path().join("id_rsa"), "key").expect("secret");
-        std::os::unix::fs::symlink(outside.path().join("id_rsa"), escape.join("secret"))
-            .expect("file link");
-        std::os::unix::fs::symlink(outside.path(), root.path().join("linked")).expect("dir link");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside.path().join("id_rsa"), escape.join("secret"))
+                .expect("file link");
+            std::os::unix::fs::symlink(outside.path(), root.path().join("linked"))
+                .expect("dir link");
+        }
 
         confined_read_preflight_rows(root.path(), command)
     }
@@ -6951,6 +6957,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test_case("left/note"; "left_success")]
     #[test_case("right/note"; "right_success_is_not_left_slash_right")]
     #[test_case("note"; "both_changes_fail")]
@@ -6969,6 +6976,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test_case("notes.txt", true; "all_branches_inside")]
     #[test_case(".env", false; "one_branch_resolves_to_protected_file")]
     fn shell_preflight_applies_protection_to_every_incoming_directory(
@@ -6987,6 +6995,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn shell_preflight_keeps_the_initial_directory_after_a_failed_cd() {
         let root = TempDir::new().expect("tempdir");
@@ -7000,6 +7009,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test_case("cd left | cat note; cat note", vec![true, true, true]; "pipeline_isolation")]
     #[test_case("cd left && cat note", vec![true, false]; "and_success")]
     #[test_case("(cd left && cat note); cat note", vec![true, false, true]; "subshell_isolation")]

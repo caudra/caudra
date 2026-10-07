@@ -6,25 +6,29 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(unix)]
 use async_trait::async_trait;
 use caudra_agent::agent::tool_dispatch::{self, Emit};
+#[cfg(unix)]
+use caudra_agent::permissions::{PermissionSubject, PluginRuleStore};
 use caudra_agent::tools::{
     FileReadTracker, ToolEffect, ToolRegistry, interpreter_ctx, stale_read_message,
+};
+#[cfg(unix)]
+use caudra_agent::workspace_transfer::{
+    CleanBufferLease, ComparisonKind, ExclusionReason, FileOutcome, LocalAccess, LocalRootIdentity,
+    NodeKind, OrchestrationLimits, PlannedFile, PullBufferGuard, RemoteRootIdentity, Side,
+    TransferAction, TransferAuthorization, TransferError, TransferEvent, TransferEvents,
+    TransferFilters, TransferJournal, TransferPlan, TransferRoots,
 };
 use caudra_agent::{
     AgentEvent, AgentMode, CancelToken, EventSender, ToolOutput,
     permissions::{
         PermissionAnswer, PermissionAuthorityProfile, PermissionManager, PermissionResourceAccess,
-        PermissionResourceKind, PermissionSubject, PluginRuleStore, RemotePermissionIdentity,
-    },
-    workspace_transfer::{
-        CleanBufferLease, ComparisonKind, ExclusionReason, FileOutcome, LocalAccess,
-        LocalRootIdentity, NodeKind, OrchestrationLimits, PlannedFile, PullBufferGuard,
-        RemoteRootIdentity, Side, TransferAction, TransferAuthorization, TransferError,
-        TransferEvent, TransferEvents, TransferFilters, TransferJournal, TransferPlan,
-        TransferRoots,
+        PermissionResourceKind, RemotePermissionIdentity,
     },
 };
+#[cfg(unix)]
 use caudra_config::sandbox::TransferPolicy;
 use caudra_config::workcell::{
     ExpectedWorkcellId, RemoteWorkcellSelection, WorkcellEndpoint, WorkcellSourceRef,
@@ -40,22 +44,19 @@ use caudra_workbench::{
     Workbench, WorkbenchBackend, WorkbenchFilesystem, WorkbenchPath, WorkbenchStyles,
     WorkspaceFilesystem,
 };
-use caudra_workcell::{
-    LocalTransferPublisher, RemoteWorkcellHost, ReviewedTransferHost, reviewed_workspace_transfer,
-};
+use caudra_workcell::RemoteWorkcellHost;
+#[cfg(unix)]
+use caudra_workcell::{LocalTransferPublisher, ReviewedTransferHost, reviewed_workspace_transfer};
 use caudra_workcell::{
     NamedBearerCredential, RemoteToolResultEnvelope, RemoteWorkcellClient, RemoteWorkcellError,
 };
+#[cfg(unix)]
 use caudra_workcell::{TransferSession, TransferSessionHost};
+#[cfg(unix)]
 use caudra_workspace::PreparedTransferPublication;
 use caudra_workspace::WorkspaceError;
-use caudra_workspace::{
-    ByteRange, LocalTransferAuthorization, LocalTransferCondition, LocalTransferDestination,
-    LocalTransferPath, LocalTransferReview, LocalTransferService, LocalTransferSource, Mutation,
-    MutationCondition, MutationRequest, OperationId, TransferContent, TransferDigest, TransferMode,
-    TransferPublicationRequest, TransferPublicationState, WorkspaceCapability,
-    WorkspaceMutationService, WorkspaceTransferService, WriteContent,
-};
+#[cfg(unix)]
+use caudra_workspace::{ByteRange, OperationId};
 use caudra_workspace::{
     ChangeOperationPreview, ChangeOperationResult, DirectoryNavigation, ListRequest,
     MutationResult, OperationState, OperationStatus, ReadBytesRequest, ReadTextRequest,
@@ -65,27 +66,39 @@ use caudra_workspace::{
     WorkspaceChangeService, WorkspaceCursor, WorkspacePath, WorkspaceReadService,
     WorkspaceScmReadService, WorkspaceSearchService, WorkspaceWatchService,
 };
+#[cfg(unix)]
+use caudra_workspace::{
+    LocalTransferAuthorization, LocalTransferCondition, LocalTransferDestination,
+    LocalTransferPath, LocalTransferReview, LocalTransferService, LocalTransferSource,
+    TransferContent, TransferDigest, TransferMode, TransferPublicationRequest,
+    TransferPublicationState, WorkspaceTransferService,
+};
+use caudra_workspace::{
+    Mutation, MutationCondition, MutationRequest, WorkspaceCapability, WorkspaceMutationService,
+    WriteContent,
+};
 use caudra_workspace::{ResourceKind, WorkspaceSession};
 use caudra_workspace::{
     ScmDiffRequest, ScmDiffTarget, ScmLogRequest, ScmMutation, ScmReadSideRequest, ScmSide,
     WorkspaceScmMutationService,
 };
+#[cfg(unix)]
 use futures_lite::io::{AsyncReadExt, repeat};
 use image::{DynamicImage, ImageFormat};
 use isahc::AsyncReadResponseExt;
 use ratatui::{Terminal, backend::TestBackend};
 use serde_json::{Value, json};
+#[cfg(unix)]
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::os::unix::fs::{PermissionsExt, symlink};
+#[cfg(unix)]
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    os::unix::fs::{PermissionsExt, symlink},
-    path::Path,
+    collections::BTreeMap,
+    fmt::Write as _,
     sync::atomic::{AtomicBool, Ordering},
 };
-use std::{
-    fmt::{Debug, Write as _},
-    sync::Arc,
-};
+use std::{collections::BTreeSet, fmt::Debug, path::Path, sync::Arc};
 use tokio_util::sync::CancellationToken;
 
 const LIMIT: u32 = 100;
@@ -94,44 +107,78 @@ const RECOVERED_CONTENT: &str = "exactly once\n";
 const TOMBSTONE_CAPACITY: usize = 256;
 const BINARY_BYTES: u64 = 6 * 1024 * 1024;
 const BINARY_BYTE: u8 = 0xff;
+#[cfg(unix)]
 const TRANSFER_CHUNK: usize = 64 * 1024;
+#[cfg(unix)]
 const LOCAL_CANARY: &[u8] = b"client-owned canary";
+#[cfg(unix)]
 const INVENTORY_FIRST: &str = "inventory-seed/deep/first.bin";
+#[cfg(unix)]
 const INVENTORY_SECOND: &str = "inventory-seed/deep/second.bin";
+#[cfg(unix)]
 const INVENTORY_RESTART: &str = "inventory-restart/deep/file.bin";
+#[cfg(unix)]
 const INVENTORY_CONTENT: &[u8] = b"\xff\0reviewed inventory bytes";
+#[cfg(unix)]
 const PARTIAL_ROOT: &str = "partial-tree";
+#[cfg(unix)]
 const PARTIAL_GITIGNORE: &str = "stage/\n";
+#[cfg(unix)]
 const PARTIAL_LEAF: &str = "a/b/c/leaf.txt";
+#[cfg(unix)]
 const PARTIAL_NESTED: [&str; 4] = ["a", "a/b", "a/b/c", PARTIAL_LEAF];
+#[cfg(unix)]
 const PARTIAL_CHANGED: &str = "a/b/changed.txt";
+#[cfg(unix)]
 const PARTIAL_IGNORED: &str = "stage";
+#[cfg(unix)]
 const PARTIAL_IGNORED_FILE: &str = "stage/built.txt";
+#[cfg(unix)]
 const PARTIAL_PROTECTED: &str = ".caudra";
+#[cfg(unix)]
 const PARTIAL_PROTECTED_FILE: &str = ".caudra/state.txt";
+#[cfg(unix)]
 const PARTIAL_SYMLINK: &str = "link";
+#[cfg(unix)]
 const PARTIAL_REPOSITORY: &str = "vendor/repo";
+#[cfg(unix)]
 const PARTIAL_REPOSITORY_MARKER: &str = "vendor/repo/.git/HEAD";
 /// At the leaf's depth and sorted after it, so the breadth-first scan lists the leaf before
 /// this folder overflows Workcell's 4,096-entry inventory.
+#[cfg(unix)]
 const PARTIAL_OVERSIZED: &str = "z/y/bulk";
+#[cfg(unix)]
 const PARTIAL_OVERSIZED_FILES: usize = 4_200;
+#[cfg(unix)]
 const PARTIAL_CONTENT: &[u8] = b"partial tree bytes\n";
+#[cfg(unix)]
 const PARTIAL_LOCAL_EDIT: &[u8] = b"local edit\n";
+#[cfg(unix)]
 const DOTFILES_ROOT: &str = "dotfiles-tree";
 /// Sorts ahead of `DOTFILES_FOLDER` and outgrows Workcell's 4,096-entry inventory, the way a
 /// hidden checkout left a sandbox's `docs` unlisted.
+#[cfg(unix)]
 const DOTFILES_BULK: &str = ".bulk";
+#[cfg(unix)]
 const DOTFILES_FOLDER: &str = "docs";
+#[cfg(unix)]
 const DOTFILES_FILE: &str = "docs/guide.md";
+#[cfg(unix)]
 const PRIVATE_STATE_MODE: u32 = 0o700;
+#[cfg(unix)]
 const NATIVE_FILE: &str = "native/deep/reviewed.txt";
+#[cfg(unix)]
 const NATIVE_UPLOAD_DIRECTORY: &str = "native-empty-upload/deep/leaf";
+#[cfg(unix)]
 const NATIVE_DOWNLOAD_DIRECTORY: &str = "native-empty-download/deep/leaf";
+#[cfg(unix)]
 const NATIVE_UNCERTAIN_DIRECTORY: &str = "native-empty-uncertain";
+#[cfg(unix)]
 const NATIVE_DIRECTORY_FAULT: &[u8] = b"native directory publication";
+#[cfg(unix)]
 const EXECUTE_METHOD: &str = "ai.workcell/execute";
 const RPC_REQUEST_TRACE: &str = "batch-rpc-trace";
+#[cfg(unix)]
 const TRANSFER_SESSION_ID: &str = "transfer-session";
 const ISOLATED_PYTHON_RESOURCE: &str = "isolated-python";
 const PYTHON_SUM: &str = "1 + 1";
@@ -155,6 +202,7 @@ const LAPSED_EXECUTIONS: usize = 1;
 const REMOTE_PREPARATION_CAPACITY: usize = 64;
 /// The shell held before dispatch and the write held at its prompt.
 const HELD_PREPARATIONS: usize = 2;
+#[cfg(unix)]
 const PUBLICATION_OVERWRITE: &str = "written while the publication awaited reconciliation";
 const STALE_EDIT_FILE: &str = "stale-edit.txt";
 const STALE_EDIT_ORIGINAL: &str = "prepared against this\n";
@@ -238,14 +286,18 @@ const WORKBENCH_WORKLOAD_DIRECTORIES: usize = 5_000;
 const WORKBENCH_FILES_PER_DIRECTORY: usize = 4;
 const WORKBENCH_WORKLOAD_TIMEOUT: Duration = Duration::from_secs(420);
 
+#[cfg(unix)]
 struct TransferTestHost {
     root: PathBuf,
     fault: PathBuf,
     lose_response: AtomicBool,
 }
+#[cfg(unix)]
 struct TransferCleanLease;
+#[cfg(unix)]
 impl CleanBufferLease for TransferCleanLease {}
 
+#[cfg(unix)]
 #[async_trait]
 impl TransferAuthorization for TransferTestHost {
     async fn roots(&self, roots: &TransferRoots) -> Result<(), TransferError> {
@@ -292,6 +344,7 @@ impl TransferAuthorization for TransferTestHost {
     }
 }
 
+#[cfg(unix)]
 #[async_trait]
 impl PullBufferGuard for TransferTestHost {
     async fn lock_clean(
@@ -302,11 +355,14 @@ impl PullBufferGuard for TransferTestHost {
         Ok(Box::new(TransferCleanLease))
     }
 }
+#[cfg(unix)]
 impl TransferEvents for TransferTestHost {
     fn emit(&self, _: TransferEvent) {}
 }
 
+#[cfg(unix)]
 struct FactoryLocalApproval;
+#[cfg(unix)]
 #[async_trait]
 impl LocalTransferAuthorization for FactoryLocalApproval {
     async fn authorize(&self, review: &LocalTransferReview) -> Result<(), WorkspaceError> {
@@ -318,6 +374,7 @@ impl LocalTransferAuthorization for FactoryLocalApproval {
     }
 }
 
+#[cfg(unix)]
 async fn production_inventory_transfer(
     client: RemoteWorkcellClient,
     remote_path: &Path,
@@ -545,6 +602,7 @@ async fn production_inventory_transfer(
     client
 }
 
+#[cfg(unix)]
 async fn partial_inventory_tree(client: &RemoteWorkcellClient, remote_path: &Path, fault: &Path) {
     let local = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
@@ -664,6 +722,7 @@ async fn partial_inventory_tree(client: &RemoteWorkcellClient, remote_path: &Pat
     );
 }
 
+#[cfg(unix)]
 async fn skipped_dotfiles_tree(client: &RemoteWorkcellClient, remote_path: &Path, fault: &Path) {
     let local = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
@@ -738,6 +797,7 @@ async fn skipped_dotfiles_tree(client: &RemoteWorkcellClient, remote_path: &Path
     );
 }
 
+#[cfg(unix)]
 async fn native_reviewed_session(
     client: &RemoteWorkcellClient,
     remote_path: &Path,
@@ -1011,8 +1071,10 @@ async fn native_reviewed_session(
     );
 }
 
+#[cfg(unix)]
 struct PullAuthorization;
 
+#[cfg(unix)]
 #[async_trait]
 impl LocalTransferAuthorization for PullAuthorization {
     async fn authorize(&self, review: &LocalTransferReview) -> Result<(), WorkspaceError> {
@@ -1024,6 +1086,7 @@ impl LocalTransferAuthorization for PullAuthorization {
     }
 }
 
+#[cfg(unix)]
 fn binary_content(size: u64) -> TransferContent {
     let mut hash = Sha256::new();
     let chunk = [BINARY_BYTE; TRANSFER_CHUNK];
@@ -1044,6 +1107,7 @@ fn binary_content(size: u64) -> TransferContent {
     }
 }
 
+#[cfg(unix)]
 async fn assert_binary(source: LocalTransferSource, expected: u64) {
     let mut reader = source.into_reader();
     let mut buffer = vec![0; TRANSFER_CHUNK].into_boxed_slice();
@@ -1060,6 +1124,7 @@ async fn assert_binary(source: LocalTransferSource, expected: u64) {
     assert_eq!(received, expected);
 }
 
+#[cfg(unix)]
 #[test]
 fn reviewed_transfer() {
     if env::var_os("WORKCELL_TEST_ENDPOINT").is_none() {

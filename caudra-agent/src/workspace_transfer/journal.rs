@@ -469,7 +469,7 @@ impl TransferJournal {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn compact_before_commit(&self, before: impl FnOnce()) -> Result<(), TransferError> {
         self.change(|data| {
             self.compact(data)?;
@@ -682,11 +682,12 @@ fn merge_base(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::{TransferRoots, namespace_key};
-    use crate::workspace_transfer::{LocalRootIdentity, tests::remote_root};
+    use crate::workspace_transfer::{LocalRootIdentity, RemoteRootIdentity};
     use caudra_workspace::{
-        CwdHandle, ProjectIdentity, ProjectKey, SessionBindingId, SessionWorkspaceBinding,
+        AuthenticatedPrincipalId, AuthorityIdentity, CwdHandle, ProjectIdentity, ProjectKey,
+        ResourceId, ResourceScope, SessionBindingId, SessionWorkspaceBinding, SourceTrustAnchor,
         WorkspaceCursor, WorkspacePath,
     };
     use test_case::test_case;
@@ -695,22 +696,62 @@ mod tests {
     const PRINCIPAL: &str = "principal-a";
     const OTHER: &str = "other";
 
+    pub(in crate::workspace_transfer) fn remote_root(
+        version: &str,
+        subject: &str,
+    ) -> RemoteRootIdentity {
+        let authority = AuthorityIdentity::new(
+            SourceTrustAnchor::new("test-transfer").unwrap(),
+            "server",
+            "workspace",
+            version,
+            "namespace",
+        )
+        .unwrap();
+        let principal = AuthenticatedPrincipalId::new(authority.clone(), subject).unwrap();
+        let project = ProjectIdentity::new(authority.clone(), ProjectKey::new("project").unwrap());
+        let binding = SessionWorkspaceBinding::new(
+            SessionBindingId::new("binding").unwrap(),
+            authority,
+            principal,
+            project,
+        )
+        .unwrap();
+        let cursor = WorkspaceCursor::new(
+            &binding,
+            ResourceScope::root(ResourceId::new("root").unwrap()),
+            1,
+            CwdHandle::new("cwd").unwrap(),
+        );
+        RemoteRootIdentity {
+            binding,
+            cursor,
+            cwd: WorkspacePath::root(),
+        }
+    }
+
     #[test_case("local", false; "host_root")]
+    #[test_case("device", false; "host_device")]
+    #[test_case("inode", false; "host_inode")]
     #[test_case("generation", false; "remote_generation")]
     #[test_case("principal", false; "remote_principal")]
     #[test_case("project", false; "remote_project")]
     #[test_case("cwd", false; "remote_root")]
     #[test_case("session", true; "reconnect_keeps_namespace")]
     fn archive_namespace_tracks_authority_not_connection(variation: &str, same: bool) {
-        let local = tempfile::tempdir().unwrap();
-        let other = tempfile::tempdir().unwrap();
         let roots = TransferRoots {
-            local: LocalRootIdentity::capture(local.path()).unwrap(),
+            local: LocalRootIdentity {
+                canonical_path: "local".into(),
+                device: 1,
+                inode: 1,
+            },
             remote: remote_root(GENERATION, PRINCIPAL),
         };
         let mut changed = roots.clone();
         match variation {
-            "local" => changed.local = LocalRootIdentity::capture(other.path()).unwrap(),
+            "local" => changed.local.canonical_path = OTHER.into(),
+            "device" => changed.local.device += 1,
+            "inode" => changed.local.inode += 1,
             "generation" => changed.remote = remote_root(OTHER, PRINCIPAL),
             "principal" => changed.remote = remote_root(GENERATION, OTHER),
             "cwd" => changed.remote.cwd = WorkspacePath::new(OTHER).unwrap(),

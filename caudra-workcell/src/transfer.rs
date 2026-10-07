@@ -1,39 +1,56 @@
+#[cfg(unix)]
 use std::{
     collections::{BTreeMap, HashMap},
-    fmt::Write as _,
-    fs::{File, Permissions},
+    fs::Permissions,
     future::Future,
-    io::{self, Read, Seek, SeekFrom, Write},
     os::unix::fs::PermissionsExt,
+    time::Instant,
+};
+use std::{
+    fmt::Write as _,
+    fs::File,
+    io::{self, Read, Seek, SeekFrom, Write},
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use async_trait::async_trait;
+#[cfg(unix)]
 use caudra_agent::workspace_transfer::LocalRootIdentity;
+#[cfg(unix)]
 use caudra_storage::{id::CaudraId, private_file::PrivateFile};
+#[cfg(unix)]
 use caudra_workspace::{
-    DirectoryPublicationRequest, DirectoryPublicationStatus, LocalPublicationState,
-    LocalTransferAuthorization, LocalTransferCondition, LocalTransferDestination,
-    LocalTransferPath, LocalTransferReview, LocalTransferRevision, LocalTransferService,
-    LocalTransferSource, OperationId, PreparedLocalDirectory, PreparedLocalTransfer, ResourceId,
-    ResourceRevision, TransferContent, TransferDigest, TransferLimits, TransferMode,
-    WorkspaceError, WorkspacePath,
+    DirectoryPublicationRequest, DirectoryPublicationStatus, LocalTransferCondition,
+    LocalTransferReview, OperationId, PreparedLocalDirectory, ResourceRevision,
+};
+use caudra_workspace::{
+    LocalPublicationState, LocalTransferAuthorization, LocalTransferDestination, LocalTransferPath,
+    LocalTransferRevision, LocalTransferService, LocalTransferSource, PreparedLocalTransfer,
+    ResourceId, TransferContent, TransferDigest, TransferLimits, TransferMode, WorkspaceError,
+    WorkspacePath,
 };
 use futures_lite::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+#[cfg(unix)]
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use smol::Unblock;
+#[cfg(unix)]
 use tokio::runtime::{Builder, Runtime};
+#[cfg(unix)]
 use tokio::task::JoinHandle;
+#[cfg(unix)]
 use tokio_util::sync::CancellationToken;
+#[cfg(unix)]
 use workcell::files::{
     BinaryError, BinaryPublicationContent, FileToolGroup, PreparedBinaryPublication,
 };
 use workcell::host_contract as contract;
 
+#[cfg(unix)]
 mod directory;
+#[cfg(unix)]
 use directory::{DirectoryOutcomes, LocalDirectoryPreparation};
 
 pub(crate) const STREAM_BUFFER_BYTES: usize = 64 * 1024;
@@ -41,14 +58,19 @@ const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_RESERVED_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_STAGES: u32 = 32;
 const MAX_IO: u32 = 4;
+#[cfg(unix)]
 const PRIVATE_FILE_MODE: u32 = 0o600;
 // Copy/hash, async file bridge, HTTP upload/download bridge, and transport buffering.
 const IO_BUFFER_RESERVATION: u64 = 4 * STREAM_BUFFER_BYTES as u64;
+#[cfg(unix)]
 const LOCAL_TTL: Duration = Duration::from_secs(600);
 pub(crate) const IO_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(unix)]
 const MAX_LOCAL_OUTCOMES: usize = 512;
+#[cfg(unix)]
 const MAX_LOCAL_JOURNAL_BYTES: usize = 8 * 1024 * 1024;
 
+#[cfg(unix)]
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LocalOutcome {
@@ -58,6 +80,7 @@ struct LocalOutcome {
     created_directories: Vec<(WorkspacePath, ResourceId)>,
 }
 
+#[cfg(unix)]
 struct LocalOutcomes {
     storage: PrivateFile,
     root: LocalRootIdentity,
@@ -65,6 +88,7 @@ struct LocalOutcomes {
     lock: Mutex<()>,
 }
 
+#[cfg(unix)]
 impl LocalOutcomes {
     fn open(root: LocalRootIdentity, path: PathBuf) -> Result<Self, WorkspaceError> {
         if path.starts_with(root.canonical_path()) || root.canonical_path().starts_with(&path) {
@@ -215,7 +239,7 @@ impl Drop for Reservation {
 
 pub(crate) struct StagedFile {
     pub file: File,
-    pub lease: Reservation,
+    pub _lease: Reservation,
 }
 
 impl Read for StagedFile {
@@ -293,12 +317,19 @@ impl PrivateStaging {
         )?;
         let file = smol::unblock(|| {
             let file = tempfile::tempfile()?;
+            #[cfg(unix)]
             file.set_permissions(Permissions::from_mode(PRIVATE_FILE_MODE))?;
             Ok::<_, io::Error>(file)
         })
         .await
         .map_err(|_| WorkspaceError::Unavailable)?;
-        let mut writer = Unblock::with_capacity(STREAM_BUFFER_BYTES, StagedFile { file, lease });
+        let mut writer = Unblock::with_capacity(
+            STREAM_BUFFER_BYTES,
+            StagedFile {
+                file,
+                _lease: lease,
+            },
+        );
         let mut buffer = vec![0; STREAM_BUFFER_BYTES].into_boxed_slice();
         let mut digest = Sha256::new();
         let mut received = 0u64;
@@ -373,6 +404,7 @@ pub(crate) fn mode(mode: &TransferMode) -> contract::TransferMode {
     }
 }
 
+#[cfg(unix)]
 struct LocalPreparation {
     prepared: PreparedLocalTransfer,
     binary: PreparedBinaryPublication,
@@ -380,8 +412,10 @@ struct LocalPreparation {
     expires: Instant,
 }
 
+#[cfg(unix)]
 pub(crate) struct BinaryRuntime(Option<Runtime>);
 
+#[cfg(unix)]
 impl BinaryRuntime {
     pub(crate) fn spawn<F>(&self, future: F) -> Result<JoinHandle<F::Output>, WorkspaceError>
     where
@@ -396,6 +430,7 @@ impl BinaryRuntime {
     }
 }
 
+#[cfg(unix)]
 impl Drop for BinaryRuntime {
     fn drop(&mut self) {
         if let Some(runtime) = self.0.take() {
@@ -406,6 +441,7 @@ impl Drop for BinaryRuntime {
 
 /// Rooted Pull publication. The host must supply its own authorization policy.
 /// Replacement is checked twice but is not an atomic CAS against external writers.
+#[cfg(unix)]
 pub struct LocalTransferPublisher {
     pub(crate) runtime: BinaryRuntime,
     pub(crate) files: FileToolGroup,
@@ -420,6 +456,7 @@ pub struct LocalTransferPublisher {
     directory_preparations: Mutex<HashMap<OperationId, LocalDirectoryPreparation>>,
 }
 
+#[cfg(unix)]
 impl LocalTransferPublisher {
     pub async fn new(
         root: PathBuf,
@@ -515,6 +552,7 @@ impl LocalTransferPublisher {
     }
 }
 
+#[cfg(unix)]
 #[async_trait]
 impl LocalTransferService for LocalTransferPublisher {
     fn supports_directory_publication(&self) -> bool {
@@ -752,7 +790,7 @@ impl LocalTransferService for LocalTransferPublisher {
             .runtime
             .spawn(async move {
                 let _permit = permit;
-                let _lease = entry.source.lease;
+                let _lease = entry.source._lease;
                 let deadline = cancellation.clone();
                 let monitor = tokio::spawn(async move {
                     tokio::time::sleep(IO_TIMEOUT).await;
@@ -807,6 +845,7 @@ impl LocalTransferService for LocalTransferPublisher {
     }
 }
 
+#[cfg(unix)]
 pub(crate) fn local_revision(
     file: &contract::TransferFile,
 ) -> Result<LocalTransferRevision, WorkspaceError> {
@@ -815,6 +854,7 @@ pub(crate) fn local_revision(
         .map_err(|_| WorkspaceError::Unavailable)
 }
 
+#[cfg(unix)]
 pub(crate) fn binary_error(error: BinaryError) -> WorkspaceError {
     match error {
         BinaryError::Inaccessible => WorkspaceError::PermissionDenied,
@@ -825,6 +865,78 @@ pub(crate) fn binary_error(error: BinaryError) -> WorkspaceError {
     }
 }
 
+#[cfg(not(unix))]
+pub struct LocalTransferPublisher {
+    _unsupported: (),
+}
+
+#[cfg(not(unix))]
+impl LocalTransferPublisher {
+    pub async fn new(
+        _root: PathBuf,
+        _authorization: Arc<dyn LocalTransferAuthorization>,
+    ) -> Result<Self, WorkspaceError> {
+        Err(WorkspaceError::UnsupportedEntry)
+    }
+
+    pub async fn new_durable(
+        _root: PathBuf,
+        _status_path: PathBuf,
+        _authorization: Arc<dyn LocalTransferAuthorization>,
+    ) -> Result<Self, WorkspaceError> {
+        Err(WorkspaceError::UnsupportedEntry)
+    }
+
+    pub fn with_max_file_bytes(self, _maximum: u64) -> Result<Self, WorkspaceError> {
+        Err(WorkspaceError::UnsupportedEntry)
+    }
+}
+
+#[cfg(not(unix))]
+#[async_trait]
+impl LocalTransferService for LocalTransferPublisher {
+    async fn created_directories(
+        &self,
+        _prepared: &PreparedLocalTransfer,
+    ) -> Result<Vec<(WorkspacePath, ResourceId)>, WorkspaceError> {
+        Err(WorkspaceError::UnsupportedEntry)
+    }
+
+    async fn publication_status(
+        &self,
+        _prepared: &PreparedLocalTransfer,
+    ) -> Result<LocalPublicationState, WorkspaceError> {
+        Err(WorkspaceError::UnsupportedEntry)
+    }
+
+    async fn stat(
+        &self,
+        _path: &LocalTransferPath,
+    ) -> Result<(LocalTransferRevision, TransferContent), WorkspaceError> {
+        Err(WorkspaceError::UnsupportedEntry)
+    }
+
+    async fn prepare(
+        &self,
+        _source: LocalTransferSource,
+        _destination: LocalTransferDestination,
+        _expected: TransferContent,
+    ) -> Result<PreparedLocalTransfer, WorkspaceError> {
+        Err(WorkspaceError::UnsupportedEntry)
+    }
+
+    async fn execute(
+        &self,
+        _prepared: &PreparedLocalTransfer,
+    ) -> Result<LocalTransferRevision, WorkspaceError> {
+        Err(WorkspaceError::UnsupportedEntry)
+    }
+
+    async fn release(&self, _prepared: &PreparedLocalTransfer) -> Result<(), WorkspaceError> {
+        Err(WorkspaceError::UnsupportedEntry)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -832,29 +944,36 @@ mod tests {
         encode_digest,
     };
     use async_trait::async_trait;
+    #[cfg(unix)]
     use caudra_workspace::{
-        DirectoryPublicationRequest, LocalPublicationState, LocalTransferAuthorization,
-        LocalTransferCondition, LocalTransferDestination, LocalTransferPath, LocalTransferReview,
-        LocalTransferService, LocalTransferSource, OperationId, TransferContent, TransferMode,
-        TransferPublicationState, WorkspaceError, WorkspacePath,
+        DirectoryPublicationRequest, LocalPublicationState, OperationId, TransferPublicationState,
+        WorkspacePath,
+    };
+    use caudra_workspace::{
+        LocalTransferAuthorization, LocalTransferCondition, LocalTransferDestination,
+        LocalTransferPath, LocalTransferReview, LocalTransferService, LocalTransferSource,
+        TransferContent, TransferMode, WorkspaceError,
     };
     use futures_lite::io::Cursor;
+    #[cfg(unix)]
     use serde_json::Value;
     use sha2::{Digest, Sha256};
-    use std::{
-        fs,
-        os::unix::fs::{MetadataExt, PermissionsExt, symlink},
-        sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        },
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
     };
     use test_case::test_case;
+    #[cfg(unix)]
     use tokio::runtime::Builder;
 
     const BYTES: &[u8] = b"\xff\x00private binary content";
     const CANARY: &[u8] = b"local canary must not change";
+    #[cfg(unix)]
     const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+    #[cfg(unix)]
     const NESTED_DESTINATION: &str = "new/deep/file";
 
     #[cfg(target_os = "linux")]
@@ -895,6 +1014,7 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     #[test_case(false, false; "durable_success")]
     #[test_case(true, false; "racing_destination")]
     #[test_case(false, true; "denied_execute")]
@@ -965,6 +1085,7 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn missing_local_directory_recovery_metadata_is_rejected_without_rewriting() {
         smol::block_on(async {
@@ -1009,6 +1130,7 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     #[test_case(false, false; "reviewed_creation_is_durable")]
     #[test_case(true, false; "racing_directory_is_not_adopted")]
     #[test_case(false, true; "symlink_is_not_followed")]
@@ -1078,6 +1200,7 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     #[test_case(false, false; "confirmed_after_restart")]
     #[test_case(true, false; "interrupted_after_publish_reconciles_actual_digest")]
     #[test_case(true, true; "external_change_remains_indeterminate")]
@@ -1152,6 +1275,7 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     #[test_case(false; "publisher_drop_in_tokio")]
     #[test_case(true; "initialization_failure_in_tokio")]
     fn local_publisher_lifecycle_does_not_require_a_particular_caller_runtime(fail: bool) {
@@ -1174,6 +1298,7 @@ mod tests {
 
     #[async_trait]
     impl LocalTransferAuthorization for Authorization {
+        #[cfg(unix)]
         async fn authorize_directory(
             &self,
             _: &DirectoryPublicationRequest,
@@ -1212,6 +1337,47 @@ mod tests {
         }
     }
 
+    #[cfg(not(unix))]
+    #[test_case(false; "ephemeral")]
+    #[test_case(true; "durable")]
+    fn unsupported_local_publisher_has_no_filesystem_effects(durable: bool) {
+        smol::block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let authorization = Arc::new(Authorization(AtomicBool::new(true)));
+            let result = if durable {
+                LocalTransferPublisher::new_durable(
+                    root.path().into(),
+                    root.path().join("status.json"),
+                    authorization,
+                )
+                .await
+            } else {
+                LocalTransferPublisher::new(root.path().into(), authorization).await
+            };
+            assert!(matches!(result, Err(WorkspaceError::UnsupportedEntry)));
+            assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+            let publisher = LocalTransferPublisher { _unsupported: () };
+            assert!(!publisher.supports_directory_publication());
+            assert_eq!(
+                publisher
+                    .stat(&LocalTransferPath::new("target").unwrap())
+                    .await,
+                Err(WorkspaceError::UnsupportedEntry)
+            );
+            assert_eq!(
+                publisher
+                    .prepare(
+                        source(),
+                        destination("target", LocalTransferCondition::MustNotExist),
+                        expected(),
+                    )
+                    .await,
+                Err(WorkspaceError::UnsupportedEntry)
+            );
+        });
+    }
+
+    #[cfg(unix)]
     #[test_case(false; "no_replace_race")]
     #[test_case(true; "stale_conditional_replace")]
     fn local_preconditions_are_checked_again_after_review(replace: bool) {
@@ -1248,6 +1414,7 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     #[test_case(false; "create_binary")]
     #[test_case(true; "replace_binary")]
     fn local_publication_requires_independent_host_authorization(replace: bool) {
@@ -1290,6 +1457,7 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     #[test_case(false; "symlink_at_prepare")]
     #[test_case(true; "ancestor_swapped_after_review")]
     fn local_publication_never_follows_remote_or_swapped_paths(swapped: bool) {
@@ -1375,9 +1543,12 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let metadata = file.file.metadata().unwrap();
-            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
-            assert_eq!(metadata.nlink(), 0);
+            #[cfg(unix)]
+            {
+                let metadata = file.file.metadata().unwrap();
+                assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+                assert_eq!(metadata.nlink(), 0);
+            }
             assert!(matches!(
                 staging
                     .receive(&mut Cursor::new(BYTES), BYTES.len() as u64, None)
@@ -1390,6 +1561,7 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     #[test_case(false; "released")]
     #[test_case(true; "abandoned")]
     fn local_preparations_do_not_publish_without_execute(abandoned: bool) {
