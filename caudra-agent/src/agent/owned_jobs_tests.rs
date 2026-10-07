@@ -11,7 +11,7 @@ mod owned_jobs_tests {
     use caudra_providers::provider::{BoxFuture, Provider};
     use caudra_providers::{
         CacheKey, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
-        StandingReminderKind, StopReason, StreamResponse,
+        StandingReminderKind, StopReason, StreamResponse, estimate_tokens,
     };
     use caudra_storage::background::ShellJobMetadata;
     use caudra_storage::id::CaudraId;
@@ -580,6 +580,7 @@ mod owned_jobs_tests {
     }
 
     async fn bounded<T>(future: impl Future<Output = T>) -> T {
+        estimate_tokens(COMMAND);
         or(future, async {
             smol::Timer::after(WATCHDOG).await;
             panic!("{STALLED}")

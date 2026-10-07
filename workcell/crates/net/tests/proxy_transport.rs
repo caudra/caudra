@@ -14,6 +14,7 @@ use http::{HeaderMap, Method, StatusCode};
 use test_case::test_case;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use url::Url;
 use workcell_net::{
@@ -25,7 +26,6 @@ use workcell_net::{
 
 const PAYLOAD: &[u8] = br#"{"title":"ship it"}"#;
 const QUERY_SECRET: &str = "query-secret";
-/// Long enough for a local response head to arrive before it expires.
 const STALL_TIMEOUT: Duration = Duration::from_millis(500);
 const STALLED_HEAD: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc";
 
@@ -92,19 +92,22 @@ async fn spawn_recorder(reply: &'static [u8]) -> (SocketAddr, JoinHandle<(String
 
 /// Accept one connection, answer its request with `reply`, and then hold the
 /// connection open without another byte, so only a timer can end the hop.
-async fn spawn_staller(reply: &'static [u8]) -> SocketAddr {
+async fn spawn_staller(reply: &'static [u8], stalled: Arc<Notify>) -> (SocketAddr, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
         // Answering before the request is written would arrive on an idle
         // connection, which the client rejects rather than reads as a reply.
         read_head(&mut stream).await;
         stream.write_all(reply).await.unwrap();
+        if reply.is_empty() {
+            stalled.notify_one();
+        }
         std::future::pending::<()>().await;
         drop(stream);
     });
-    address
+    (address, server)
 }
 
 /// Read up to the blank line that ends a request head, or to end of stream.
@@ -119,8 +122,10 @@ async fn read_head(stream: &mut TcpStream) -> Vec<u8> {
 
 /// Drives the real transport and counts the response heads it returns, so a
 /// stalled-body case can show its hop failed while reading the body.
-#[derive(Default)]
-struct HeadCounter(AtomicUsize);
+struct HeadCounter {
+    heads: AtomicUsize,
+    stalled: Arc<Notify>,
+}
 
 #[async_trait]
 impl HttpTransport for HeadCounter {
@@ -129,7 +134,8 @@ impl HttpTransport for HeadCounter {
         request: TransportRequest,
     ) -> Result<TransportResponse, TransportError> {
         let response = ReqwestTransport.execute(request).await?;
-        self.0.fetch_add(1, Ordering::Relaxed);
+        self.heads.fetch_add(1, Ordering::Relaxed);
+        self.stalled.notify_one();
         Ok(response)
     }
 }
@@ -279,10 +285,14 @@ async fn a_transport_failure_does_not_echo_the_request_url() {
 
 #[test_case(b"", 0 ; "an origin that never answers")]
 #[test_case(STALLED_HEAD, 1 ; "a body that stalls after the head")]
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_hop_the_origin_never_finishes_is_a_timeout(reply: &'static [u8], heads: usize) {
-    let address = spawn_staller(reply).await;
-    let transport = Arc::new(HeadCounter::default());
+    let stalled = Arc::new(Notify::new());
+    let (address, server) = spawn_staller(reply, stalled.clone()).await;
+    let transport = Arc::new(HeadCounter {
+        heads: AtomicUsize::new(0),
+        stalled: stalled.clone(),
+    });
     let client = HttpClient::new(
         UrlPolicy::OperatorConfigured(OperatorConfiguredPolicy {
             allow_non_public_ips: true,
@@ -292,24 +302,34 @@ async fn a_hop_the_origin_never_finishes_is_a_timeout(reply: &'static [u8], head
         Arc::new(TokioDnsResolver),
         transport.clone(),
     );
-    let result = client
-        .request(RequestSpec {
-            method: Method::GET,
-            url: Url::parse(&format!("http://{address}/items?token={QUERY_SECRET}")).unwrap(),
-            body: None,
-            redirects: RedirectScope::SameOrigin,
-            options: FetchOptions {
-                timeout: STALL_TIMEOUT,
-                retry: RetryPolicy::disabled(),
-                ..FetchOptions::default()
-            },
-        })
-        .await;
+    let request = client.request(RequestSpec {
+        method: Method::GET,
+        url: Url::parse(&format!("http://{address}/items?token={QUERY_SECRET}")).unwrap(),
+        body: None,
+        redirects: RedirectScope::SameOrigin,
+        options: FetchOptions {
+            timeout: STALL_TIMEOUT,
+            retry: RetryPolicy::disabled(),
+            ..FetchOptions::default()
+        },
+    });
+    tokio::pin!(request);
+    loop {
+        tokio::select! {
+            result = &mut request => panic!("the hop ended before stalling: {result:?}"),
+            () = stalled.notified() => break,
+            () = tokio::task::yield_now() => {}
+        }
+    }
+    assert_eq!(transport.heads.load(Ordering::Relaxed), heads);
+    tokio::time::advance(STALL_TIMEOUT).await;
+    let result = request.await;
+    server.abort();
 
     let Err(error) = result else {
         panic!("a hop the origin never finishes must fail");
     };
     assert!(matches!(error, NetError::Timeout), "{error:?}");
     assert!(!error.to_string().contains(QUERY_SECRET), "{error}");
-    assert_eq!(transport.0.load(Ordering::Relaxed), heads);
+    assert_eq!(transport.heads.load(Ordering::Relaxed), heads);
 }

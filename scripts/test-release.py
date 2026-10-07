@@ -508,6 +508,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
 
     def test_existing_platform_and_locked_source_gates_are_preserved(self):
         _, rust = self.workflow("rust")
+        self.assertIn('".config/nextest.toml"', rust["changes"])
         self.assertEqual(
             set(rust),
             {

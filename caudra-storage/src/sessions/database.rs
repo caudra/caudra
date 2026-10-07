@@ -6382,6 +6382,8 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
     #[cfg(target_os = "linux")]
+    use std::os::unix::fs::symlink;
+    #[cfg(target_os = "linux")]
     use std::process;
     use std::sync::Barrier;
 
@@ -6418,7 +6420,11 @@ mod tests {
 
     const CWD: &str = "/project";
     #[cfg(target_os = "linux")]
-    const PROC_LOCKS: &str = "/proc/locks";
+    const PROC_FD: &str = "/proc/self/fd";
+    #[cfg(target_os = "linux")]
+    const PROC_FDINFO: &str = "/proc/self/fdinfo";
+    #[cfg(target_os = "linux")]
+    const LOCK_PATH_ALIAS: &str = "lock-path-alias";
     #[cfg(target_os = "linux")]
     const POSIX_LOCK: &str = "POSIX";
     const REMOTE_CWD: &str = ".";
@@ -10274,29 +10280,69 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         drop(reader_lock);
     }
 
-    /// The POSIX locks this process holds on `paths`, as `/proc/locks` lists them.
     #[cfg(target_os = "linux")]
     fn posix_locks(paths: &[PathBuf]) -> Vec<String> {
         let pid = process::id().to_string();
-        let inodes: Vec<String> = paths
+        let paths: Vec<PathBuf> = paths
             .iter()
-            .map(|path| fs::metadata(path).unwrap().ino().to_string())
+            .map(|path| fs::canonicalize(path).unwrap())
             .collect();
-        let mut locks: Vec<String> = fs::read_to_string(PROC_LOCKS)
+        let descriptors: Vec<String> = fs::read_dir(PROC_FD)
             .unwrap()
-            .lines()
+            .filter_map(|entry| {
+                let entry = entry.unwrap();
+                let path = fs::read_link(entry.path()).ok()?;
+                paths.contains(&path).then(|| {
+                    fs::read_to_string(Path::new(PROC_FDINFO).join(entry.file_name())).unwrap()
+                })
+            })
+            .collect();
+        let mut locks: Vec<String> = descriptors
+            .iter()
+            .flat_map(|descriptor| descriptor.lines())
             .filter_map(|line| {
                 let fields: Vec<&str> = line.split_whitespace().collect();
-                let [_, POSIX_LOCK, _, kind, owner, file, start, end] = fields.as_slice() else {
+                let ["lock:", _, POSIX_LOCK, _, kind, owner, file, start, end] = fields.as_slice()
+                else {
                     return None;
                 };
                 let inode = file.rsplit(':').next()?;
-                (*owner == pid && inodes.iter().any(|known| known == inode))
-                    .then(|| format!("{inode} {kind} {start} {end}"))
+                (*owner == pid).then(|| format!("{inode} {kind} {start} {end}"))
             })
             .collect();
         locks.sort();
+        locks.dedup();
         locks
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn posix_lock_observation_resolves_aliases() {
+        let (temp, state_dir) = state_dir();
+        let live = SessionDatabase::open_state(&state_dir).unwrap();
+        live.latest_id(CWD).unwrap();
+        let alias = temp.path().join(LOCK_PATH_ALIAS);
+        symlink(live.path(), &alias).unwrap();
+
+        let held = posix_locks(&[live.path()]);
+        assert_eq!(held.len(), 1);
+        assert_eq!(posix_locks(&[alias]), held);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test_case(""; "database")]
+    #[test_case(SHM_SUFFIX; "shared_memory")]
+    fn posix_lock_observation_detects_descriptor_close(suffix: &str) {
+        let (_temp, state_dir) = state_dir();
+        let live = SessionDatabase::open_state(&state_dir).unwrap();
+        live.latest_id(CWD).unwrap();
+        let path = database_sidecar(&live.path(), suffix);
+        let files = [path.clone()];
+        assert_eq!(posix_locks(&files).len(), 1);
+
+        drop(File::open(path).unwrap());
+
+        assert!(posix_locks(&files).is_empty());
     }
 
     #[cfg(target_os = "linux")]
@@ -10309,7 +10355,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         let path = live.path();
         let files = [path.clone(), database_sidecar(&path, SHM_SUFFIX)];
         let held = posix_locks(&files);
-        assert!(!held.is_empty());
+        assert_eq!(held.len(), files.len());
 
         let existing = SessionDatabase::open_existing_state(&state_dir)
             .unwrap()
