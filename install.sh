@@ -94,7 +94,93 @@ Write-Host \"added \$dir to user PATH (restart terminal if caudra is not found)\
 " || true
 }
 
+validate_path() (
+    path="$1"
+    while [ -n "${path}" ]; do
+        [ ! -L "${path}" ] || err "refusing symlink: ${path}"
+        if [ -e "${path}" ] && [ ! -d "${path}" ] && [ ! -f "${path}" ]; then
+            err "refusing special file: ${path}"
+        fi
+        path="${path%/*}"
+    done
+)
+
+validate_tree() {
+    invalid="$(${elevate:-} find "$1" ! -type f ! -type d -print)" || err "cannot inspect $1"
+    [ -z "${invalid}" ] || err "refusing symlink or special file: ${invalid}"
+}
+
+install_payload() (
+    bundle_stage=""
+    binary_stage=""
+    old_bundle=0
+    new_bundle=0
+    old_binary=0
+    committed=0
+    finish_install() {
+        status=$?
+        trap - EXIT HUP INT TERM
+        recovery_failed=0
+        if [ "${committed}" = 0 ]; then
+            if [ "${old_binary}" = 1 ]; then
+                if ${elevate} test -e "${dest}" || ${elevate} test -L "${dest}"; then
+                    recovery_failed=1
+                else
+                    ${elevate} mv "${binary_stage}/previous" "${dest}" || recovery_failed=1
+                fi
+            fi
+            if [ "${new_bundle}" = 1 ]; then
+                ${elevate} mv "${license_dir}" "${bundle_stage}/new" || recovery_failed=1
+            fi
+            if [ "${old_bundle}" = 1 ]; then
+                if ${elevate} test -e "${license_dir}" || ${elevate} test -L "${license_dir}"; then
+                    recovery_failed=1
+                else
+                    ${elevate} mv "${bundle_stage}/previous" "${license_dir}" || recovery_failed=1
+                fi
+            fi
+        fi
+        if [ "${recovery_failed}" = 1 ]; then
+            echo "error: recovery failed; retained installation data in ${bundle_stage} and ${binary_stage}" >&2
+            exit 1
+        fi
+        for stage in "${bundle_stage}" "${binary_stage}"; do
+            [ -n "${stage}" ] || continue
+            if [ "${committed}" = 1 ] && ${elevate} test -e "${stage}/previous"; then
+                echo "previous installation retained in ${stage}/previous"
+            else
+                ${elevate} rm -rf "${stage}" || status=1
+            fi
+        done
+        exit "${status}"
+    }
+    trap finish_install EXIT
+    trap 'exit 1' HUP INT TERM
+    bundle_stage="$(${elevate} mktemp -d "${license_parent}/.caudra-backup.XXXXXX")" || err "cannot stage licenses"
+    binary_stage="$(${elevate} mktemp -d "${INSTALL_DIR}/.caudra-backup.XXXXXX")" || err "cannot stage binary"
+    ${elevate} cp -R "${tmp}/licenses" "${bundle_stage}/new" || err "failed to stage licenses"
+    ${elevate} cp "${tmp}/${bin_name}" "${binary_stage}/new" || err "failed to stage binary"
+    ${elevate} chmod +x "${binary_stage}/new" || err "failed to make staged binary executable"
+    validate_tree "${bundle_stage}/new"
+    validate_path "${dest}"
+    validate_path "${license_dir}"
+    if [ -e "${license_dir}" ]; then
+        validate_tree "${license_dir}"
+        ${elevate} mv "${license_dir}" "${bundle_stage}/previous" || err "cannot retain previous licenses"
+        old_bundle=1
+    fi
+    ${elevate} mv "${bundle_stage}/new" "${license_dir}" || err "failed to publish licenses"
+    new_bundle=1
+    if [ -e "${dest}" ]; then
+        ${elevate} mv "${dest}" "${binary_stage}/previous" || err "cannot retain previous binary"
+        old_binary=1
+    fi
+    ${elevate} mv "${binary_stage}/new" "${dest}" || err "failed to publish binary"
+    committed=1
+)
+
 main() {
+    elevate=""
     need_cmd curl
 
     if is_windows; then
@@ -139,25 +225,43 @@ main() {
     fi
 
     [ -f "${tmp}/${bin_name}" ] || err "archive did not contain ${bin_name}"
+    [ -s "${tmp}/licenses/manifest.json" ] || err "archive did not contain licenses/manifest.json; legacy archives without a license bundle are not supported"
+    [ -s "${tmp}/licenses/ATTRIBUTION.txt" ] || err "archive did not contain licenses/ATTRIBUTION.txt"
+    [ ! -L "${tmp}/${bin_name}" ] || err "refusing symlink: ${bin_name}"
+    validate_tree "${tmp}/licenses"
 
-    dest="${INSTALL_DIR}/${bin_name}"
-
-    if mkdir -p "${INSTALL_DIR}" 2>/dev/null && [ -w "${INSTALL_DIR}" ]; then
-        mv "${tmp}/${bin_name}" "${dest}"
-        chmod +x "${dest}"
-    elif command -v sudo > /dev/null 2>&1; then
-        echo "installing to ${INSTALL_DIR} (requires sudo)..."
-        sudo sh -c '
-            set -e
-            mkdir -p "$1"
-            mv "$2" "$3"
-            chmod +x "$3"
-        ' caudra-install "${INSTALL_DIR}" "${tmp}/${bin_name}" "${dest}"
-    else
-        err "cannot write to ${INSTALL_DIR} (set CAUDRA_INSTALL_DIR to a writable directory)"
+    if is_windows && command -v cygpath > /dev/null 2>&1; then
+        INSTALL_DIR="$(cygpath -u "${INSTALL_DIR}")" || err "cannot resolve installation directory"
     fi
+    case "${INSTALL_DIR}" in
+        /*) ;;
+        *) INSTALL_DIR="$(pwd)/${INSTALL_DIR}" ;;
+    esac
+    license_parent="${INSTALL_DIR}/../share/licenses"
+    validate_path "${INSTALL_DIR}"
+    validate_path "${license_parent}"
+    if mkdir -p "${INSTALL_DIR}" "${license_parent}" 2>/dev/null &&
+        [ -w "${INSTALL_DIR}" ] && [ -w "${license_parent}" ]; then
+        :
+    elif command -v sudo > /dev/null 2>&1; then
+        echo "installing binary and licenses to ${INSTALL_DIR} (requires sudo)..."
+        elevate="sudo"
+        sudo mkdir -p "${INSTALL_DIR}" "${license_parent}" || err "cannot create installation directories"
+    else
+        err "cannot write to ${INSTALL_DIR} and ${license_parent} (set CAUDRA_INSTALL_DIR to a writable directory)"
+    fi
+    INSTALL_DIR="$(CDPATH= cd -P "${INSTALL_DIR}" && pwd)" || err "cannot resolve installation directory"
+    license_parent="$(CDPATH= cd -P "${license_parent}" && pwd)" || err "cannot resolve license directory"
+    license_dir="${license_parent}/caudra"
+    dest="${INSTALL_DIR}/${bin_name}"
+    validate_path "${dest}"
+    validate_path "${license_dir}"
+    [ ! -e "${dest}" ] || [ -f "${dest}" ] || err "binary destination is not a regular file"
+    [ ! -e "${license_dir}" ] || [ -d "${license_dir}" ] || err "license destination is not a directory"
+    install_payload
 
     echo "${BINARY} ${tag} installed to ${dest}"
+    echo "licenses installed to ${license_dir}"
 
     if is_windows; then
         add_windows_user_path "${INSTALL_DIR}"
