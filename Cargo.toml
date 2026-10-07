@@ -237,6 +237,7 @@ flate2 = "1"
 zstd = "0.13"
 indicatif = "0.18"
 libc = "0.2"
+winapi-util = "0.1.11"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Storage_FileSystem"] }
 nucleo = "0.5"
 nucleo-matcher = "0.3"

@@ -771,8 +771,11 @@ mod tests {
     const CARGO_TEST_STDERR: &str = "warning: future incompatibility\n";
     const PREPARED_TIMEOUT_SECS: u64 = 321;
     const HOURS_LONG_TIMEOUT_SECS: u64 = 10_800;
+    #[cfg(unix)]
     const SHELL_PREPARATION_FAILED_CODE: &str = "shell_preparation_failed";
+    #[cfg(unix)]
     const PATH_OUTSIDE_ROOT_CODE: &str = "path_outside_root";
+    #[cfg(unix)]
     const NOT_FOUND_CODE: &str = "not_found";
 
     async fn group_for_render(output_filter: bool) -> (tempfile::TempDir, ShellToolGroup) {

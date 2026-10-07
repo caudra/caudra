@@ -1,15 +1,16 @@
+#[cfg(not(windows))]
+use std::fs::Metadata;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    fs::Metadata,
     io,
     mem::size_of,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, Weak,
+        Arc, Mutex,
         atomic::{AtomicU8, Ordering},
         mpsc::{Receiver, SyncSender, sync_channel},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher, event::ModifyKind};
@@ -22,24 +23,26 @@ use rustix::{
 };
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
-use std::{ffi::OsStr, fs::File, os::unix::ffi::OsStrExt};
-use tokio::sync::{Notify, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
-use tokio::task::JoinHandle;
+use std::{ffi::OsStr, fs::File, os::unix::ffi::OsStrExt, sync::Weak, time::Instant};
+use tokio::sync::{Notify, OwnedMutexGuard, Semaphore};
 use tokio::{fs, io::AsyncReadExt};
+#[cfg(unix)]
+use tokio::{sync::OwnedSemaphorePermit, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+#[cfg(unix)]
+use workcell_host_contract::MAX_WORKSPACE_LIST_RETAINED_BYTES;
 use workcell_host_contract::{
     ContractVersion, Cursor, DirectoryNavigation, DiscoverProjectAssetsRequest,
     DiscoverProjectAssetsResponse, Identifier, ListRequest, ListResponse, MAX_PAGE_SIZE,
     MAX_PROJECT_ASSET_DISCOVERY_HASH_BYTES, MAX_PROJECT_ASSET_READ_BYTES, MAX_PROJECT_ASSETS,
-    MAX_TEXT_READ_BYTES, MAX_WORKSPACE_LIST_ENTRIES, MAX_WORKSPACE_LIST_RETAINED_BYTES,
-    PROJECT_ASSET_MANIFEST_VERSION, ProjectAsset, ProjectAssetContent, ProjectAssetEncoding,
-    ProjectAssetKind, ProjectAssetManifest, ProjectAssetTrust, ReadProjectAssetRequest,
-    ReadProjectAssetResponse, ReadTextRequest, ReadTextResponse, ResourceId, Revision,
-    SearchTextRequest, SearchTextResponse, StatRequest, StatResponse, TextSearchMatch,
-    WatchEventKind, WatchOpenRequest, WorkspaceDirectory, WorkspaceEntry, WorkspaceEntryKind,
-    WorkspaceMutation, WorkspaceMutationKind, WorkspaceMutationResponse, WorkspaceMutationResult,
-    WorkspacePath,
+    MAX_TEXT_READ_BYTES, MAX_WORKSPACE_LIST_ENTRIES, PROJECT_ASSET_MANIFEST_VERSION, ProjectAsset,
+    ProjectAssetContent, ProjectAssetEncoding, ProjectAssetKind, ProjectAssetManifest,
+    ProjectAssetTrust, ReadProjectAssetRequest, ReadProjectAssetResponse, ReadTextRequest,
+    ReadTextResponse, ResourceId, Revision, SearchTextRequest, SearchTextResponse, StatRequest,
+    StatResponse, TextSearchMatch, WatchEventKind, WatchOpenRequest, WorkspaceDirectory,
+    WorkspaceEntry, WorkspaceEntryKind, WorkspaceMutation, WorkspaceMutationKind,
+    WorkspaceMutationResponse, WorkspaceMutationResult, WorkspacePath,
 };
 
 #[cfg(unix)]
@@ -56,13 +59,20 @@ use crate::{
 
 const MAX_CWD_HANDLES: usize = 256;
 const MAX_CURSORS: usize = 256;
+#[cfg(unix)]
 const LIST_REVISION_NAMESPACE: &str = "inventory:";
+#[cfg(unix)]
 const LIST_CURSOR_PREFIX: &str = "list";
 const MAX_LIST_WORKERS: usize = 4;
+#[cfg(unix)]
 const MAX_LIST_INVENTORIES: usize = 16;
+#[cfg(unix)]
 const MAX_LIST_INVENTORY_ENTRIES: usize = 200_000;
+#[cfg(unix)]
 const MAX_LIST_INVENTORY_BYTES: usize = 128 * 1_024 * 1_024;
+#[cfg(unix)]
 const LIST_INVENTORY_RESERVATION_BYTES: usize = 2 * MAX_WORKSPACE_LIST_RETAINED_BYTES as usize;
+#[cfg(unix)]
 const LIST_INVENTORY_TTL: Duration = Duration::from_secs(30);
 const LIST_CAPACITY_MESSAGE: &str =
     "Workspace listing inventory capacity is exhausted; retry after expiry";
@@ -708,6 +718,7 @@ pub struct WorkspaceWatchBatch {
     pub failure: Option<WorkspaceWatchFailure>,
 }
 
+#[cfg(unix)]
 #[derive(Debug)]
 struct WorkspaceListEntries {
     entries: Vec<WorkspaceEntry>,
@@ -873,8 +884,11 @@ impl WorkspaceWatcher {
 pub(crate) struct WorkspaceState {
     inner: Mutex<WorkspaceStateInner>,
     list_workers: Arc<Semaphore>,
+    #[cfg(unix)]
     list_slots: Arc<Semaphore>,
+    #[cfg(unix)]
     list_entries: Arc<Semaphore>,
+    #[cfg(unix)]
     list_bytes: Arc<Semaphore>,
 }
 
@@ -883,13 +897,17 @@ impl Default for WorkspaceState {
         Self {
             inner: Mutex::default(),
             list_workers: Arc::new(Semaphore::new(MAX_LIST_WORKERS)),
+            #[cfg(unix)]
             list_slots: Arc::new(Semaphore::new(MAX_LIST_INVENTORIES)),
+            #[cfg(unix)]
             list_entries: Arc::new(Semaphore::new(MAX_LIST_INVENTORY_ENTRIES)),
+            #[cfg(unix)]
             list_bytes: Arc::new(Semaphore::new(MAX_LIST_INVENTORY_BYTES)),
         }
     }
 }
 
+#[cfg(unix)]
 impl WorkspaceState {
     fn reserve_listing(&self) -> Result<ListingReservation, WorkspaceError> {
         self.inner
@@ -989,9 +1007,11 @@ struct WorkspaceStateInner {
     directories: HashMap<ResourceId, DirectoryBinding>,
     cursors: HashMap<Cursor, CursorBinding>,
     cursor_order: VecDeque<Cursor>,
+    #[cfg(unix)]
     listings: HashMap<Uuid, ListingRecord>,
 }
 
+#[cfg(unix)]
 impl WorkspaceStateInner {
     fn expire_listings(&mut self, now: Instant) {
         self.listings
@@ -999,6 +1019,7 @@ impl WorkspaceStateInner {
     }
 }
 
+#[cfg(unix)]
 #[derive(Debug)]
 struct ListingReservation {
     _slot: OwnedSemaphorePermit,
@@ -1006,6 +1027,7 @@ struct ListingReservation {
     bytes: OwnedSemaphorePermit,
 }
 
+#[cfg(unix)]
 #[derive(Debug)]
 struct ListingInventory {
     listed: WorkspaceListEntries,
@@ -1019,6 +1041,7 @@ struct ListingInventory {
     _reservation: ListingReservation,
 }
 
+#[cfg(unix)]
 impl ListingInventory {
     fn cursor(&self, offset: usize) -> Result<Cursor, WorkspaceError> {
         let proof = digest_parts(&[
@@ -1058,12 +1081,14 @@ impl ListingInventory {
     }
 }
 
+#[cfg(unix)]
 #[derive(Debug)]
 struct ListingRecord {
     inventory: Arc<ListingInventory>,
     expiry: JoinHandle<()>,
 }
 
+#[cfg(unix)]
 impl Drop for ListingRecord {
     fn drop(&mut self) {
         self.expiry.abort();
@@ -2603,6 +2628,7 @@ fn listing_capacity() -> WorkspaceError {
     FilesystemError::message(LIST_CAPACITY_MESSAGE).into()
 }
 
+#[cfg(unix)]
 async fn expire_listing(workspace: Weak<WorkspaceState>, id: Uuid, deadline: Instant) {
     tokio::time::sleep_until(deadline.into()).await;
     if let Some(workspace) = workspace.upgrade() {
@@ -2874,6 +2900,7 @@ async fn file_revision(
     Revision::new(version.revision()).map_err(|_| WorkspaceError::InvalidRequest)
 }
 
+#[cfg(not(windows))]
 async fn directory_revision(path: &Path) -> Result<Revision, WorkspaceError> {
     let metadata = fs::metadata(path).await.map_err(|error| {
         FilesystemError::io_path("Cannot inspect workspace directory", path, error)
@@ -2881,6 +2908,16 @@ async fn directory_revision(path: &Path) -> Result<Revision, WorkspaceError> {
     directory_revision_from_metadata(path, &metadata)
 }
 
+#[cfg(windows)]
+async fn directory_revision(path: &Path) -> Result<Revision, WorkspaceError> {
+    let (metadata, (volume, index)) = crate::text::read_file_identity(path).await?;
+    if !metadata.is_dir() {
+        return Err(WorkspaceError::InvalidRequest);
+    }
+    digest_parts(&[&path.to_string_lossy(), &format!("{volume}:{index}")])
+}
+
+#[cfg(not(windows))]
 pub(crate) fn directory_revision_from_metadata(
     path: &Path,
     metadata: &Metadata,
@@ -2896,16 +2933,6 @@ pub(crate) fn directory_revision_from_metadata(
 fn directory_identity(metadata: &std::fs::Metadata) -> String {
     use std::os::unix::fs::MetadataExt;
     format!("{}:{}", metadata.dev(), metadata.ino())
-}
-
-#[cfg(windows)]
-fn directory_identity(metadata: &std::fs::Metadata) -> String {
-    use std::os::windows::fs::MetadataExt;
-    format!(
-        "{:?}:{:?}",
-        metadata.volume_serial_number(),
-        metadata.file_index()
-    )
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -2959,6 +2986,7 @@ pub fn root_relative_resource_id(
     .map_err(|_| WorkspaceError::InvalidRequest)
 }
 
+#[cfg(unix)]
 fn workspace_entry_retained_bytes(entry: &WorkspaceEntry) -> usize {
     size_of::<WorkspaceEntry>()
         .saturating_add(entry.path.retained_bytes())
@@ -3024,16 +3052,52 @@ mod tests {
     };
 
     use super::*;
+    #[cfg(unix)]
     use crate::FileReadInput;
     use crate::text::install_snapshot_read_hook;
 
+    #[cfg(unix)]
     const PERMISSION_DENIED_CODE: &str = "filesystem_permission_denied";
+    #[cfg(unix)]
     const STALE_RESOURCE_CODE: &str = "stale_resource";
     const WATCH_UNAVAILABLE_CODE: &str = "watch_unavailable";
     const PRIVATE_DIAGNOSTIC: &str = "/private/root/token-secret";
+    const TEST_RAW_OS_ERROR: i32 = 12345;
+
+    #[tokio::test]
+    async fn cwd_identity_survives_content_changes_but_rejects_directory_replacement() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("directory");
+        std_fs::create_dir(&path).unwrap();
+        let group = FileToolGroup::new(root.path(), false, None).await.unwrap();
+        let initial = group.workspace_root().await.unwrap();
+        let directory = group
+            .workspace_resolve_directory(
+                &initial.handle,
+                &DirectoryNavigation::new("directory").unwrap(),
+            )
+            .await
+            .unwrap();
+        std_fs::write(path.join("child.txt"), "content").unwrap();
+        assert_eq!(
+            group
+                .workspace_directory_path(&directory.handle)
+                .await
+                .unwrap(),
+            "directory"
+        );
+        std_fs::rename(&path, root.path().join("retained")).unwrap();
+        std_fs::create_dir(&path).unwrap();
+        assert!(matches!(
+            group.workspace_directory_path(&directory.handle).await,
+            Err(WorkspaceError::StaleCwd)
+        ));
+    }
+
     #[derive(Eq, Hash, PartialEq)]
     pub(super) enum WorkspaceHookPhase {
         CwdResolved,
+        #[cfg(unix)]
         CwdOpened,
         BeforeRead,
     }
@@ -3079,6 +3143,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn inventory_pages_and_retries_never_rewalk_or_observe_post_capture_changes() {
         use std::sync::atomic::AtomicUsize;
@@ -3136,6 +3201,7 @@ mod tests {
         assert_eq!(rewalks.load(Ordering::SeqCst), 1);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn empty_scopes_have_distinct_inventory_generations_without_retained_receipts() {
         let root = tempdir().unwrap();
@@ -3201,6 +3267,7 @@ mod tests {
         assert_eq!(refused.unwrap_err().code(), PERMISSION_DENIED_CODE);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn inventory_expiry_tasks_do_not_keep_the_workspace_alive_after_owner_drop() {
         let root = tempdir().unwrap();
@@ -3220,6 +3287,7 @@ mod tests {
         assert!(weak.upgrade().is_none());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn inventory_cursors_reject_wrong_scope_cwd_page_bounds_and_forged_offsets() {
         let root = tempdir().unwrap();
@@ -3283,6 +3351,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn cached_pages_still_refuse_replaced_scope_and_cwd_descriptors() {
         for replace_cwd in [false, true] {
@@ -3331,6 +3400,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn inventories_expire_without_requests_and_never_restart_unknown_cursors() {
         let root = tempdir().unwrap();
@@ -3369,6 +3439,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn inventory_capacity_never_evicts_live_receipts_and_arc_leases_remain_charged() {
         let root = tempdir().unwrap();
@@ -3457,6 +3528,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn inventory_admission_reserves_entries_and_bytes_and_rolls_back_partial_reservations() {
         let state = WorkspaceState::default();
@@ -3514,9 +3586,11 @@ mod tests {
             group.workspace_list(&request, &token).await.unwrap_err(),
             WorkspaceError::Filesystem(FilesystemError::Aborted)
         ));
+        #[cfg(unix)]
         assert!(group.workspace.inner.lock().unwrap().listings.is_empty());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn listing_refuses_a_real_cwd_replacement_between_resolution_and_descriptor_open() {
         for scope in [".", "child"] {
@@ -3553,6 +3627,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn adding_children_does_not_invalidate_the_opened_cwd_identity() {
         use std::time::SystemTime;
@@ -3577,6 +3652,7 @@ mod tests {
         assert_eq!(response.entries[0].path.as_str(), "new.txt");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn child_scope_resolution_stays_on_the_verified_cwd_descriptor_after_rename() {
         let root = tempdir().unwrap();
@@ -3718,6 +3794,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn vanished_descendants_leave_readable_siblings_and_an_incomplete_inventory() {
         let root = tempdir().unwrap();
@@ -3789,6 +3866,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn cancellation_during_descriptor_enumeration_stops_before_child_metadata() {
         let root = tempdir().unwrap();
@@ -3809,6 +3887,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn dropping_a_listing_cancels_its_blocking_descriptor_worker() {
         use tokio::sync::oneshot;
@@ -4035,6 +4114,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn metadata_inventory_revisions_cannot_authorize_mutations_or_hide_same_size_changes() {
         const ORIGINAL: &str = "before";
@@ -4103,14 +4183,17 @@ mod tests {
                 matches!(error, WorkspaceError::WatchUnavailable { phase: actual, kind: WorkspaceWatchErrorKind::Io, io_kind: Some(io::ErrorKind::PermissionDenied), raw_os_error: None } if actual == phase)
             );
         }
-        let errno = rustix::io::Errno::NOSPC.raw_os_error();
         let error = watch_unavailable(
             WorkspaceWatchPhase::Register,
-            notify::Error::io(io::Error::from_raw_os_error(errno)),
+            notify::Error::io(io::Error::from_raw_os_error(TEST_RAW_OS_ERROR)),
         );
-        assert!(
-            matches!(error, WorkspaceError::WatchUnavailable { raw_os_error: Some(actual), .. } if actual == errno)
-        );
+        assert!(matches!(
+            error,
+            WorkspaceError::WatchUnavailable {
+                raw_os_error: Some(TEST_RAW_OS_ERROR),
+                ..
+            }
+        ));
         let error = watch_unavailable(
             WorkspaceWatchPhase::Initialize,
             notify::Error::generic(PRIVATE_DIAGNOSTIC),
@@ -4125,6 +4208,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn workspace_reads_searches_and_pages_with_inventory_bound_list_cursors() {
         let root = tempdir().unwrap();
@@ -4320,6 +4404,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn workspace_list_materialization_is_bounded_independently_of_page_size() {
         let root = tempdir().unwrap();
@@ -4357,6 +4442,7 @@ mod tests {
         assert!(listed.next_cursor.is_none());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn workspace_list_never_reads_content_or_applies_content_size_limits() {
         let root = tempdir().unwrap();

@@ -1,4 +1,6 @@
-use std::path::Path;
+use std::{fs::Metadata, path::Path, time::UNIX_EPOCH};
+#[cfg(windows)]
+use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
 
 #[cfg(test)]
 use std::{
@@ -10,6 +12,10 @@ use file_format::FileFormat;
 use sha2::{Digest, Sha256};
 use tokio::{fs, io::AsyncReadExt};
 use tokio_util::sync::CancellationToken;
+#[cfg(windows)]
+use winapi_util::file::information;
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES};
 
 use crate::FilesystemError;
 
@@ -235,23 +241,21 @@ async fn read_file_snapshot_required(
     token: &CancellationToken,
 ) -> Result<(Vec<u8>, FileVersion), FilesystemError> {
     check_cancelled(token)?;
-    let before = fs::metadata(path)
-        .await
-        .map_err(|error| FilesystemError::io_path("Cannot inspect", path, error))?;
+    let (metadata, identity) = read_file_identity(path).await?;
+    let before = file_identity(&metadata, identity);
     let bytes = read_bounded(path, maximum, token).await?;
     #[cfg(test)]
     run_snapshot_read_hook(path);
-    let after = fs::metadata(path)
-        .await
-        .map_err(|error| FilesystemError::io_path("Cannot inspect", path, error))?;
-    if file_identity(&before) != file_identity(&after) {
+    let (metadata, identity) = read_file_identity(path).await?;
+    let after = file_identity(&metadata, identity);
+    if before != after {
         return Err(FilesystemError::message(format!(
             "File changed while it was being read: {}",
             path.to_string_lossy()
         )));
     }
     let version = FileVersion {
-        identity: file_identity(&after),
+        identity: after,
         digest: Sha256::digest(&bytes).into(),
     };
     Ok((bytes, version))
@@ -307,10 +311,7 @@ pub(crate) fn js_length(value: &str) -> usize {
     value.encode_utf16().count()
 }
 
-fn file_identity(metadata: &std::fs::Metadata) -> FileIdentity {
-    use std::time::UNIX_EPOCH;
-
-    let (first, second) = platform_file_identity(metadata);
+fn file_identity(metadata: &Metadata, (first, second): (u64, u64)) -> FileIdentity {
     let modified_nanos = metadata
         .modified()
         .ok()
@@ -324,31 +325,93 @@ fn file_identity(metadata: &std::fs::Metadata) -> FileIdentity {
     }
 }
 
+#[cfg(not(windows))]
+async fn read_file_identity(path: &Path) -> Result<(Metadata, (u64, u64)), FilesystemError> {
+    let metadata = fs::metadata(path)
+        .await
+        .map_err(|error| FilesystemError::io_path("Cannot inspect", path, error))?;
+    let identity = platform_file_identity(&metadata);
+    Ok((metadata, identity))
+}
+
+#[cfg(windows)]
+pub(crate) async fn read_file_identity(
+    path: &Path,
+) -> Result<(Metadata, (u64, u64)), FilesystemError> {
+    let owned_path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let file = OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(owned_path)?;
+        let metadata = file.metadata()?;
+        let info = information(&file)?;
+        Ok((metadata, (info.volume_serial_number(), info.file_index())))
+    })
+    .await
+    .map_err(|_| FilesystemError::message("Cannot inspect file identity: worker failed"))?
+    .map_err(|error| FilesystemError::io_path("Cannot inspect", path, error))
+}
+
 #[cfg(unix)]
-fn platform_file_identity(metadata: &std::fs::Metadata) -> (u64, u64) {
+fn platform_file_identity(metadata: &Metadata) -> (u64, u64) {
     use std::os::unix::fs::MetadataExt;
 
     (metadata.dev(), metadata.ino())
 }
 
-#[cfg(windows)]
-fn platform_file_identity(metadata: &std::fs::Metadata) -> (u64, u64) {
-    use std::os::windows::fs::MetadataExt;
-
-    (
-        metadata.volume_serial_number().map_or(0, u64::from),
-        metadata.file_index().unwrap_or(0),
-    )
-}
-
 #[cfg(not(any(unix, windows)))]
-fn platform_file_identity(metadata: &std::fs::Metadata) -> (u64, u64) {
+fn platform_file_identity(metadata: &Metadata) -> (u64, u64) {
     (metadata.len(), 0)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::is_binary_content;
+    use std::fs::{self, File, FileTimes};
+
+    use tempfile::tempdir;
+    use tokio_util::sync::CancellationToken;
+
+    use super::{is_binary_content, read_file_version_required, validate_snapshot};
+    use crate::FilesystemError;
+
+    #[tokio::test]
+    async fn snapshot_identity_rejects_identical_replacements_but_accepts_hard_links() {
+        const CONTENT: &str = "unchanged content";
+        let root = tempdir().unwrap();
+        let path = root.path().join("file.txt");
+        let alias = root.path().join("alias.txt");
+        let token = CancellationToken::new();
+        fs::write(&path, CONTENT).unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let version = read_file_version_required(&path, CONTENT.len(), &token)
+            .await
+            .unwrap();
+        fs::hard_link(&path, &alias).unwrap();
+        validate_snapshot(&alias, &version, CONTENT.len(), &token)
+            .await
+            .unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, CONTENT).unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(modified))
+            .unwrap();
+        let replacement = read_file_version_required(&path, CONTENT.len(), &token)
+            .await
+            .unwrap();
+        assert_eq!(version.revision(), replacement.revision());
+        assert_eq!(
+            version.identity.modified_nanos,
+            replacement.identity.modified_nanos
+        );
+        assert!(matches!(
+            validate_snapshot(&path, &version, CONTENT.len(), &token).await,
+            Err(FilesystemError::Stale(_))
+        ));
+    }
 
     #[test]
     fn detects_known_binary_signatures_and_unknown_binary_samples() {

@@ -11,6 +11,14 @@ use std::{
 };
 
 use crate::ShellPreparationError;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+#[cfg(windows)]
+use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
+#[cfg(windows)]
+use winapi_util::file::information;
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES};
 
 pub const STALE_WORKDIR_ERROR: &str =
     "Prepared shell workdir is stale because its path or directory identity changed";
@@ -54,9 +62,9 @@ struct WorkdirIdentity {
     #[cfg(unix)]
     inode: u64,
     #[cfg(windows)]
-    volume: Option<u32>,
+    volume: u64,
     #[cfg(windows)]
-    file_index: Option<u64>,
+    file_index: u64,
 }
 
 pub(crate) async fn canonicalize(path: &Path) -> std::io::Result<PathBuf> {
@@ -188,6 +196,7 @@ pub(crate) async fn revalidate(binding: &WorkdirBinding) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(not(windows))]
 async fn identity(path: &Path) -> Result<WorkdirIdentity, String> {
     let metadata = tokio::fs::metadata(path)
         .await
@@ -197,18 +206,9 @@ async fn identity(path: &Path) -> Result<WorkdirIdentity, String> {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
         Ok(WorkdirIdentity {
             device: metadata.dev(),
             inode: metadata.ino(),
-        })
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        Ok(WorkdirIdentity {
-            volume: metadata.volume_serial_number(),
-            file_index: metadata.file_index(),
         })
     }
     #[cfg(not(any(unix, windows)))]
@@ -216,6 +216,32 @@ async fn identity(path: &Path) -> Result<WorkdirIdentity, String> {
         let _ = metadata;
         Ok(WorkdirIdentity {})
     }
+}
+
+#[cfg(windows)]
+async fn identity(path: &Path) -> Result<WorkdirIdentity, String> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let file = OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .map_err(|_| STALE_WORKDIR_ERROR.to_owned())?;
+        if !file
+            .metadata()
+            .map_err(|_| STALE_WORKDIR_ERROR.to_owned())?
+            .is_dir()
+        {
+            return Err(STALE_WORKDIR_ERROR.to_owned());
+        }
+        let info = information(&file).map_err(|_| STALE_WORKDIR_ERROR.to_owned())?;
+        Ok(WorkdirIdentity {
+            volume: info.volume_serial_number(),
+            file_index: info.file_index(),
+        })
+    })
+    .await
+    .map_err(|_| STALE_WORKDIR_ERROR.to_owned())?
 }
 
 fn normalize(path: PathBuf) -> PathBuf {
@@ -249,4 +275,33 @@ fn inside(path: &Path, root: &Path) -> bool {
                 .eq_ignore_ascii_case(&expected.as_os_str().to_string_lossy())
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::{STALE_WORKDIR_ERROR, canonicalize, resolve, revalidate};
+
+    #[tokio::test]
+    async fn directory_identity_accepts_content_changes_but_rejects_replacement() {
+        let root = tempdir().unwrap();
+        let root = canonicalize(root.path()).await.unwrap();
+        let path = root.join("selected");
+        fs::create_dir(&path).unwrap();
+        let binding = resolve(&root, "selected").await.unwrap();
+        fs::write(path.join("child"), "content").unwrap();
+        revalidate(&binding).await.unwrap();
+
+        fs::rename(&path, root.join("original")).unwrap();
+        fs::create_dir(&path).unwrap();
+
+        assert_eq!(revalidate(&binding).await, Err(STALE_WORKDIR_ERROR.into()));
+        fs::remove_dir(&path).unwrap();
+        assert_eq!(revalidate(&binding).await, Err(STALE_WORKDIR_ERROR.into()));
+        fs::write(&path, "not a directory").unwrap();
+        assert_eq!(revalidate(&binding).await, Err(STALE_WORKDIR_ERROR.into()));
+    }
 }

@@ -1,6 +1,8 @@
 #![cfg(feature = "index")]
 
-use std::{fs, path::PathBuf};
+use std::fs;
+#[cfg(unix)]
+use std::path::PathBuf;
 
 use tempfile::tempdir;
 use tokio_util::sync::CancellationToken;

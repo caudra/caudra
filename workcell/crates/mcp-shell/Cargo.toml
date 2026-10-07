@@ -29,6 +29,10 @@ workcell-output-filter.workspace = true
 workcell-tool-contract.workspace = true
 workcell-host-contract.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+winapi-util.workspace = true
+windows-sys.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 
