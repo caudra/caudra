@@ -1,11 +1,14 @@
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::{
+    convert::Infallible,
     process::{Command, Stdio},
     time::Duration,
 };
 
-use reqwest::{Client, Response, StatusCode, header};
+use axum::http::Response as HttpResponse;
+use futures_util::{StreamExt, stream};
+use reqwest::{Body, Client, Response, StatusCode, header};
 use rmcp::ServiceExt;
 use serde_json::{Value, json};
 #[cfg(unix)]
@@ -16,6 +19,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use tempfile::TempDir;
+use test_case::test_case;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use workcell_host_contract::{
@@ -64,12 +68,13 @@ async fn fixture_server() -> (TempDir, WorkcellServer) {
 async fn fixture_server_with_policy(
     shell_policy: ShellPermissionPolicy,
 ) -> (TempDir, WorkcellServer) {
-    fixture_server_with_options(shell_policy, false).await
+    fixture_server_with_options(shell_policy, false, true).await
 }
 
 async fn fixture_server_with_options(
     shell_policy: ShellPermissionPolicy,
     modern_only: bool,
+    shell_output_filter: bool,
 ) -> (TempDir, WorkcellServer) {
     let root = tempfile::tempdir().expect("temporary root");
     tokio::fs::write(root.path().join("visible.txt"), "visible\n")
@@ -99,7 +104,7 @@ async fn fixture_server_with_options(
             web_icons: false,
             proxy: ProxyConfiguration::direct(),
             shell_policy,
-            shell_output_filter: true,
+            shell_output_filter,
             honor_gitignore: true,
             code: CodeConfiguration {
                 worker: WorkerSource::Discover {
@@ -221,7 +226,7 @@ async fn stdio_supports_legacy_initialization_and_shell_progress() {
 #[tokio::test]
 async fn stdio_modern_only_rejects_legacy_initialization() {
     let (_root, server) =
-        fixture_server_with_options(ShellPermissionPolicy::restricted(), true).await;
+        fixture_server_with_options(ShellPermissionPolicy::restricted(), true, true).await;
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
     let server_task = tokio::spawn(async move { server.serve(server_transport).await });
     let (read, mut write) = tokio::io::split(client_transport);
@@ -2391,7 +2396,8 @@ async fn authenticated_watch_replays_changes_and_assets_remain_allowlisted_bytes
 #[cfg(unix)]
 #[tokio::test]
 async fn http_streams_standard_shell_progress_before_the_result() {
-    let (_root, server) = fixture_server_with_policy(ShellPermissionPolicy::yolo()).await;
+    let (_root, server) =
+        fixture_server_with_options(ShellPermissionPolicy::yolo(), false, false).await;
     let http = HttpServer::start(
         server,
         0,
@@ -2445,7 +2451,8 @@ async fn http_streams_standard_shell_progress_before_the_result() {
 #[cfg(unix)]
 #[tokio::test]
 async fn http_supports_stateless_legacy_calls_and_progress() {
-    let (_root, server) = fixture_server_with_policy(ShellPermissionPolicy::yolo()).await;
+    let (_root, server) =
+        fixture_server_with_options(ShellPermissionPolicy::yolo(), false, false).await;
     let http = HttpServer::start(
         server,
         0,
@@ -2533,7 +2540,7 @@ async fn http_supports_stateless_legacy_calls_and_progress() {
 #[tokio::test]
 async fn http_modern_only_rejects_legacy_and_advertises_only_modern() {
     let (_root, server) =
-        fixture_server_with_options(ShellPermissionPolicy::restricted(), true).await;
+        fixture_server_with_options(ShellPermissionPolicy::restricted(), true, true).await;
     let http = HttpServer::start(
         server,
         0,
@@ -2830,6 +2837,36 @@ fn git_text(path: &std::path::Path, arguments: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
+#[test_case("\n", "\n"; "lf")]
+#[test_case("\r\n", "\r\n"; "crlf")]
+#[test_case("\n", "\r\n"; "lf_then_crlf")]
+#[test_case("\r\n", "\n"; "crlf_then_lf")]
+#[tokio::test(start_paused = true)]
+async fn sse_reader_drains_coalesced_comments_and_messages_without_another_chunk(
+    newline: &str,
+    result_newline: &str,
+) {
+    let progress = json!({"method": "notifications/progress", "params": {"progress": 1}});
+    let result = json!({"id": 1, "result": {}});
+    let separator = newline.repeat(2);
+    let result_separator = result_newline.repeat(2);
+    let chunk = format!(
+        ": keep-alive{separator}: keep-alive{separator}data: {progress}{separator}data: {result}{result_separator}"
+    );
+    let body =
+        Body::wrap_stream(stream::iter([Ok::<_, Infallible>(chunk)]).chain(stream::pending()));
+    let mut response = Response::from(
+        HttpResponse::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(body)
+            .unwrap(),
+    );
+    let mut buffer = Vec::new();
+    assert_eq!(next_sse_json(&mut response, &mut buffer).await, progress);
+    assert_eq!(next_sse_json(&mut response, &mut buffer).await, result);
+    assert!(buffer.is_empty());
+}
+
 async fn next_sse_json(response: &mut Response, buffer: &mut Vec<u8>) -> Value {
     assert_eq!(
         response.headers()[header::CONTENT_TYPE]
@@ -2844,12 +2881,14 @@ async fn next_sse_json(response: &mut Response, buffer: &mut Vec<u8>) -> Value {
             .windows(4)
             .position(|window| window == b"\r\n\r\n")
             .map(|end| (end, 4))
-            .or_else(|| {
+            .into_iter()
+            .chain(
                 buffer
                     .windows(2)
                     .position(|window| window == b"\n\n")
-                    .map(|end| (end, 2))
-            });
+                    .map(|end| (end, 2)),
+            )
+            .min_by_key(|(end, _)| *end);
         if let Some((end, separator_bytes)) = boundary {
             let event = buffer.drain(..end + separator_bytes).collect::<Vec<_>>();
             let event = std::str::from_utf8(&event).expect("UTF-8 SSE event");
@@ -2859,6 +2898,7 @@ async fn next_sse_json(response: &mut Response, buffer: &mut Vec<u8>) -> Value {
             }) {
                 return serde_json::from_str(data).expect("SSE JSON-RPC message");
             }
+            continue;
         }
         let chunk = tokio::time::timeout(Duration::from_secs(2), response.chunk())
             .await

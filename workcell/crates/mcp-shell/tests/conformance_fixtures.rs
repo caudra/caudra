@@ -6,20 +6,25 @@
 //! contract change rather than an incidental one.
 //!
 //! Cases run a fixture-provided `Makefile` so the command output is fully
-//! determined by the corpus rather than by the host. Only wall-clock duration is
-//! normalized; every other field is compared exactly.
+//! determined by the corpus rather than by the host. Wall-clock duration and
+//! pipe-read chunk count are normalized; progress continuity and the terminal
+//! sequence are checked against the delivered chunks.
 
 #![cfg(all(unix, feature = "mcp"))]
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use rmcp::model::{CallToolResult, ContentBlock};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
-use workcell_mcp_shell::{ShellPermissionPolicy, ShellToolGroup};
+use workcell_mcp_shell::{
+    ShellPermissionPolicy, ShellProgressChunk, ShellProgressSink, ShellStream, ShellToolGroup,
+};
 
 const CASES: &[&str] = &[
     "filtered-single-scope.json",
@@ -30,6 +35,17 @@ const CASES: &[&str] = &[
     "redraw-rendered-at-capture.json",
     "progress-lines-collapsed.json",
 ];
+
+#[derive(Default)]
+struct RecordingProgress(Mutex<Vec<ShellProgressChunk>>);
+
+#[async_trait]
+impl ShellProgressSink for RecordingProgress {
+    async fn publish(&self, chunk: ShellProgressChunk) -> Result<(), String> {
+        self.0.lock().unwrap().push(chunk);
+        Ok(())
+    }
+}
 
 #[tokio::test]
 async fn shell_dispatch_matches_shared_conformance_fixtures() {
@@ -70,6 +86,10 @@ async fn run_case(case: &str) {
             {
                 "placeholder": "{{DURATION_MS}}",
                 "source": "measured command wall-clock duration"
+            },
+            {
+                "placeholder": "{{FINAL_SEQUENCE}}",
+                "source": "observed progress chunk count, checked for continuity and byte totals"
             }
         ]),
         "{case} introduced an unreviewed normalization"
@@ -93,18 +113,57 @@ async fn run_case(case: &str) {
         .unwrap_or_else(|error| panic!("initialize {case}: {error}"))
         .with_output_filter(output_filter);
 
+    let progress = Arc::new(RecordingProgress::default());
     let result = group
-        .dispatch(
+        .dispatch_with_progress(
             fixture["tool"].as_str().expect("fixture tool"),
             fixture["input"].clone(),
             CancellationToken::new(),
-            None,
+            Some(progress.clone()),
         )
         .await
         .expect("known fixture tool")
         .unwrap_or_else(|error| panic!("dispatch {case}: {error}"));
 
+    assert_progress(case, &result, &progress.0.lock().unwrap());
     assert_result(case, &result, &fixture["expected"], temporary.path());
+}
+
+fn assert_progress(case: &str, result: &CallToolResult, chunks: &[ShellProgressChunk]) {
+    let structured = result
+        .structured_content
+        .as_ref()
+        .expect("structured content");
+    assert_eq!(
+        structured["finalSequence"],
+        json!(chunks.len()),
+        "{case}: terminal progress sequence"
+    );
+    let mut stdout_bytes = 0;
+    let mut stderr_bytes = 0;
+    for (index, chunk) in chunks.iter().enumerate() {
+        assert_eq!(chunk.version, 1, "{case}: progress version");
+        assert_eq!(
+            chunk.sequence,
+            (index + 1) as u64,
+            "{case}: progress continuity"
+        );
+        assert!(!chunk.text.is_empty(), "{case}: empty progress chunk");
+        match chunk.stream {
+            ShellStream::Stdout => stdout_bytes += chunk.text.len(),
+            ShellStream::Stderr => stderr_bytes += chunk.text.len(),
+        }
+    }
+    assert_eq!(
+        structured["stdoutUtf8Bytes"],
+        json!(stdout_bytes),
+        "{case}: stdout progress bytes"
+    );
+    assert_eq!(
+        structured["stderrUtf8Bytes"],
+        json!(stderr_bytes),
+        "{case}: stderr progress bytes"
+    );
 }
 
 fn fixture_root() -> PathBuf {
@@ -197,8 +256,7 @@ fn assert_result(case: &str, result: &CallToolResult, expected: &Value, root: &P
     );
 }
 
-/// Replaces the canonical root in strings and the measured duration, which is
-/// the only field whose value cannot be reproduced.
+/// Chunk boundaries depend on pipe scheduling; their sequence is checked before normalization.
 fn normalize(value: Value, root: &str) -> Value {
     match value {
         Value::String(value) => Value::String(value.replace(root, "{{ROOT}}")),
@@ -211,6 +269,8 @@ fn normalize(value: Value, root: &str) -> Value {
                 .map(|(key, value)| {
                     if key == "durationMs" {
                         (key, Value::String("{{DURATION_MS}}".into()))
+                    } else if key == "finalSequence" {
+                        (key, Value::String("{{FINAL_SEQUENCE}}".into()))
                     } else {
                         (key, normalize(value, root))
                     }

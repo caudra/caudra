@@ -9,7 +9,7 @@
     "structuredContent": {
       "durationMs": "{{DURATION_MS}}",
       "exitCode": 0,
-      "finalSequence": 1,
+      "finalSequence": "{{FINAL_SEQUENCE}}",
       "kind": "shell",
       "outputLimitExceeded": false,
       "relativeWorkdir": ".",
@@ -43,6 +43,10 @@
       {
         "placeholder": "{{DURATION_MS}}",
         "source": "measured command wall-clock duration"
+      },
+      {
+        "placeholder": "{{FINAL_SEQUENCE}}",
+        "source": "observed progress chunk count, checked for continuity and byte totals"
       }
     ]
   },
