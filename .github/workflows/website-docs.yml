@@ -42,11 +42,13 @@ jobs:
           sparse-checkout: scripts/update-website-docs.py
           sparse-checkout-cone-mode: false
       - name: Revalidate canonical Rust run before minting website credential
+        id: preflight
         run: python3 scripts/update-website-docs.py --verify-only --run-id "$RUN_ID"
         env:
           SOURCE_TOKEN: ${{ github.token }}
       - uses: actions/create-github-app-token@v3
         id: website-token
+        if: steps.preflight.outputs.eligible == 'true'
         with:
           app-id: ${{ vars.WEBSITE_APP_ID }}
           private-key: ${{ secrets.WEBSITE_APP_PRIVATE_KEY }}
@@ -55,6 +57,7 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
       - name: Propose manifest-only website update
+        if: steps.preflight.outputs.eligible == 'true'
         run: python3 scripts/update-website-docs.py --run-id "$RUN_ID" --app-slug "$APP_SLUG"
         env:
           SOURCE_TOKEN: ${{ github.token }}

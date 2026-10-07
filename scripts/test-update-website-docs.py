@@ -3,11 +3,13 @@
 import base64
 import copy
 import importlib.util
+import io
 import json
 import os
 import subprocess
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 SPEC = importlib.util.spec_from_file_location(
@@ -113,6 +115,8 @@ class FakeAPI:
         }
 
     def request(self, repo, path, method="GET", data=None, missing=False):
+        if repo is None and path == f"users/{BOT['login']}":
+            return BOT
         expected = "caudra/caudra" if self.source else "caudra/website"
         if repo != expected:
             raise AssertionError(f"Token used for wrong repository: {repo}")
@@ -615,6 +619,210 @@ class UpdateTests(unittest.TestCase):
                             "git/ref/heads/automation/docs-source",
                             missing=True,
                         )
+
+
+class VerifyTests(unittest.TestCase):
+    def setUp(self):
+        self.source = FakeAPI(source=True)
+        self.website = FakeAPI()
+        self.source.jobs.extend(
+            {"name": name, "status": "completed", "conclusion": "success"}
+            for name in ("Detect changes", "CI")
+        )
+
+    def filtered(self):
+        for job in self.source.jobs:
+            if job["name"] in UPDATER.REQUIRED_JOBS:
+                job["conclusion"] = "skipped"
+                job.pop("steps", None)
+
+    def cli(self, event="workflow_run", verify_only=True):
+        with TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            output.write_text("existing=value\n")
+            stdout, stderr = io.StringIO(), io.StringIO()
+            args = ["update-website-docs.py", "--run-id", "42"]
+            args += ["--verify-only"] if verify_only else ["--app-slug", "docs-app"]
+            with (
+                patch.dict(
+                    os.environ,
+                    {"GITHUB_EVENT_NAME": event, "GITHUB_OUTPUT": str(output)},
+                    clear=True,
+                ),
+                patch.object(
+                    UPDATER, "GitHub", side_effect=[self.source, self.website]
+                ),
+                patch.object(UPDATER.sys, "argv", args),
+                patch.object(UPDATER.sys, "stdout", stdout),
+                patch.object(UPDATER.sys, "stderr", stderr),
+            ):
+                status = UPDATER.main()
+            self.assertEqual(self.website.mutations, [])
+            return status, stdout.getvalue(), stderr.getvalue(), output.read_text()
+
+    def assert_cli_refused(self, **kwargs):
+        status, stdout, stderr, output = self.cli(**kwargs)
+        self.assertEqual(status, 1)
+        self.assertEqual(stdout, "")
+        self.assertTrue(stderr.startswith("Refused: "), stderr)
+        self.assertEqual(output, "existing=value\n")
+
+    def test_filtered_is_never_verified_or_publishable(self):
+        self.filtered()
+        with self.assertRaises(UPDATER.PathFilteredRun):
+            UPDATER.verified_source(self.source, 42)
+        with self.assertRaises(UPDATER.PathFilteredRun):
+            UPDATER.update(self.source, self.website, 42, BOT)
+        self.assertEqual(self.website.mutations, [])
+        self.assert_cli_refused(verify_only=False)
+
+    def test_filtered_noop_only_for_automatic_preflight(self):
+        self.filtered()
+        status, stdout, stderr, output = self.cli()
+        self.assertEqual(status, 0)
+        self.assertIn("No-op:", stdout)
+        self.assertIn("path filtering", stdout)
+        self.assertNotIn(NEW, stdout)
+        self.assertEqual(stderr, "")
+        self.assertEqual(output, "existing=value\neligible=false\n")
+        for event in ("workflow_dispatch", "", "push"):
+            with self.subTest(event=event):
+                self.assert_cli_refused(event=event)
+
+    def test_verified_preflight_emits_positive_eligibility(self):
+        for event in ("workflow_run", "workflow_dispatch", ""):
+            with self.subTest(event=event):
+                status, stdout, stderr, output = self.cli(event=event)
+                self.assertEqual(status, 0)
+                self.assertEqual(stdout, f"Verified source: {NEW}\n")
+                self.assertEqual(stderr, "")
+                self.assertEqual(output, "existing=value\neligible=true\n")
+
+    def test_successful_jobs_without_docgen_never_emit_eligibility(self):
+        step = self.source.jobs[2]["steps"][0]
+        for steps in ([], [step, step], [{**step, "conclusion": "skipped"}]):
+            with self.subTest(steps=steps):
+                self.source.jobs[2]["steps"] = steps
+                self.assert_cli_refused()
+
+    def test_filtered_still_requires_canonical_current_run(self):
+        for target, key, value in (
+            ("workflow", "path", ".github/workflows/other.yml"),
+            ("workflow", "state", "disabled_manually"),
+            ("run", "id", 43),
+            ("run", "workflow_id", 12),
+            ("run", "path", ".github/workflows/other.yml"),
+            ("run", "repository", {"full_name": "attacker/caudra"}),
+            ("run", "head_repository", {"full_name": "attacker/caudra"}),
+            ("run", "event", "pull_request"),
+            ("run", "head_branch", "feature"),
+            ("run", "head_sha", "main"),
+            ("run", "head_sha", OLD),
+            ("run", "conclusion", "failure"),
+            ("run", "status", "in_progress"),
+            ("run", "run_attempt", 0),
+            ("run", "run_attempt", True),
+            ("run", "run_attempt", "1"),
+        ):
+            with self.subTest(target=target, key=key, value=value):
+                self.setUp()
+                self.filtered()
+                getattr(self.source, target)[key] = value
+                self.assert_cli_refused()
+
+    def test_filtered_requires_unique_completed_jobs_and_successful_gates(self):
+        for index in range(5):
+            for outcome in (
+                "missing",
+                "duplicate",
+                "failure",
+                "cancelled",
+                "in_progress",
+                None,
+                "opposite",
+            ):
+                with self.subTest(index=index, outcome=outcome):
+                    self.setUp()
+                    self.filtered()
+                    job = self.source.jobs[index]
+                    if outcome == "missing":
+                        self.source.jobs.pop(index)
+                    elif outcome == "duplicate":
+                        self.source.jobs.append(job.copy())
+                    elif outcome == "in_progress":
+                        job["status"] = outcome
+                    else:
+                        job["conclusion"] = (
+                            ("success" if index < 3 else "skipped")
+                            if outcome == "opposite"
+                            else outcome
+                        )
+                    self.assert_cli_refused()
+
+    def test_filtered_classification_reads_all_attempt_pages(self):
+        self.filtered()
+        self.source.jobs = [
+            {"name": f"other-{i}"} for i in range(101)
+        ] + self.source.jobs
+        self.source.run["run_attempt"] = 2
+        original = self.source.request
+
+        def request(repo, path, **kwargs):
+            if "/jobs?" in path:
+                self.assertIn("/attempts/2/", path)
+                path = path.replace("/attempts/2/", "/attempts/1/")
+            return original(repo, path, **kwargs)
+
+        with patch.object(self.source, "request", side_effect=request):
+            self.assertEqual(self.cli()[3], "existing=value\neligible=false\n")
+            self.source.jobs.insert(0, self.source.jobs[-1].copy())
+            self.assert_cli_refused()
+
+    def test_filtered_cannot_hide_incomplete_or_excessive_pagination(self):
+        self.filtered()
+        original = self.source.request
+        for total in (4, 6):
+            with self.subTest(total=total):
+
+                def request(repo, path, total=total, **kwargs):
+                    result = original(repo, path, **kwargs)
+                    if "/jobs?" in path:
+                        result["total_count"] = total
+                    return result
+
+                with patch.object(self.source, "request", side_effect=request):
+                    self.assert_cli_refused()
+                    with patch.object(UPDATER, "MAX_PAGES", 1):
+                        self.assert_cli_refused()
+
+    def test_workflow_gates_both_privileged_steps_on_positive_eligibility(self):
+        workflow = (
+            Path(__file__).resolve().parents[1] / ".github/workflows/website-docs.yml"
+        ).read_text()
+        steps = workflow.split("\n      - ")
+        preflight = next(step for step in steps if "--verify-only" in step)
+        mint = next(
+            step for step in steps if "actions/create-github-app-token@" in step
+        )
+        propose = next(step for step in steps if "--app-slug" in step)
+        self.assertIn("id: preflight\n", preflight)
+        self.assertNotIn("WEBSITE_TOKEN", preflight)
+        self.assertLess(steps.index(preflight), steps.index(mint))
+        self.assertLess(steps.index(mint), steps.index(propose))
+        for step in (mint, propose):
+            self.assertEqual(
+                [
+                    line.strip()
+                    for line in step.splitlines()
+                    if line.strip().startswith("if:")
+                ],
+                ["if: steps.preflight.outputs.eligible == 'true'"],
+            )
+        self.assertIn("app-id: ${{ vars.WEBSITE_APP_ID }}", mint)
+        self.assertIn("private-key: ${{ secrets.WEBSITE_APP_PRIVATE_KEY }}", mint)
+        self.assertNotIn("continue-on-error", workflow)
+        self.assertIn("ref: ${{ github.workflow_sha }}", workflow)
+        self.assertIn("persist-credentials: false", workflow)
 
 
 if __name__ == "__main__":

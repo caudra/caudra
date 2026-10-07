@@ -28,6 +28,10 @@ class Refusal(RuntimeError):
     pass
 
 
+class PathFilteredRun(Refusal):
+    pass
+
+
 def require(condition, message):
     if not condition:
         raise Refusal(message)
@@ -159,17 +163,30 @@ def verified_source(source, run_id):
         )
     else:
         raise Refusal("Too many workflow jobs")
+    required = []
     for name in REQUIRED_JOBS:
         matches = [job for job in jobs if job["name"] == name]
+        require(len(matches) == 1, "Required Rust job is missing or duplicated")
+        required.append(matches[0])
+    if all(
+        job.get("status") == "completed" and job.get("conclusion") == "skipped"
+        for job in required
+    ):
+        for name in ("Detect changes", "CI"):
+            matches = [job for job in jobs if job["name"] == name]
+            require(
+                len(matches) == 1 and successful(matches[0]),
+                "Path-filter gate did not pass",
+            )
+        raise PathFilteredRun("Rust verification was skipped by path filtering")
+    for job in required:
         require(
-            len(matches) == 1 and successful(matches[0]),
+            successful(job),
             "Required Rust verification did not pass",
         )
-        if name == "Test":
+        if job["name"] == "Test":
             steps = [
-                step
-                for step in matches[0].get("steps", [])
-                if step["name"] == DOCGEN_STEP
+                step for step in job.get("steps", []) if step["name"] == DOCGEN_STEP
             ]
             require(
                 len(steps) == 1 and successful(steps[0]),
@@ -480,7 +497,7 @@ def main():
     parser.add_argument(
         "--verify-only",
         action="store_true",
-        help="Validate source using SOURCE_TOKEN only",
+        help="Validate source using SOURCE_TOKEN only; path-filtered workflow_run is a no-op",
     )
     parser.add_argument(
         "--app-slug", help="GitHub App slug from actions/create-github-app-token"
@@ -489,7 +506,19 @@ def main():
     try:
         source = GitHub(os.environ.get("SOURCE_TOKEN"))
         if args.verify_only:
-            print(f"Verified source: {verified_source(source, args.run_id)}")
+            try:
+                revision = verified_source(source, args.run_id)
+            except PathFilteredRun as error:
+                if os.environ.get("GITHUB_EVENT_NAME") != "workflow_run":
+                    raise
+                eligible = "false"
+                print(f"No-op: {error}; website publishing requires full verification")
+            else:
+                eligible = "true"
+                print(f"Verified source: {revision}")
+            if output := os.environ.get("GITHUB_OUTPUT"):
+                with open(output, "a", encoding="utf-8") as stream:
+                    stream.write(f"eligible={eligible}\n")
         else:
             require(
                 args.app_slug and re.fullmatch(r"[a-z0-9][a-z0-9-]*", args.app_slug),
