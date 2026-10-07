@@ -99,7 +99,7 @@ gen-docs-check: code-worker
 	$(CARGO) run -p caudra-docgen -- --check
 
 workcell-build: code-worker
-	$(CARGO) build --locked --package workcell-mcp $(ARGS)
+	$(CARGO) build $(if $(filter --locked,$(ARGS)),,--locked) --package workcell-mcp $(ARGS)
 
 workcell-run: code-worker
 	$(CARGO) run --locked --package workcell-mcp -- $(ARGS)

@@ -146,6 +146,29 @@ class MakeTests(unittest.TestCase):
             ],
         )
 
+    def test_workcell_build_locks_once_and_preserves_cargo_arguments(self):
+        for arguments in ("", "--locked", "--locked --target-dir 'two  spaces'"):
+            with self.subTest(arguments=arguments):
+                result = self.run_make("workcell-build", f"ARGS={arguments}")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                args = self.records()[-1]["args"]
+                self.assertEqual(args.count("--locked"), 1)
+                self.assertEqual(args[0], "build")
+                self.assertEqual(args[args.index("--package") + 1], "workcell-mcp")
+                if "--target-dir" in arguments:
+                    self.assertEqual(args[-2:], ["--target-dir", "two  spaces"])
+
+    def test_ci_build_targets_share_locked_arguments(self):
+        result = self.run_make("check", "build", "workcell-build", "ARGS=--locked")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        records = self.records()
+        self.assertEqual(
+            [record["kind"] for record in records],
+            ["worker", "cargo", "cargo", "cargo"],
+        )
+        for record in records[1:]:
+            self.assertEqual(record["args"].count("--locked"), 1)
+
     def test_windows_worker_suffix_is_exported(self):
         result = self.run_make("OS=Windows_NT", "build")
         self.assertEqual(result.returncode, 0, result.stderr)
