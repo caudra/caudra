@@ -87,6 +87,8 @@ jobs:
         run: nix build --no-update-lock-file .#checks.x86_64-linux.git-dep-hashes
       - name: Check Nix formatting
         run: nix build --no-update-lock-file .#checks.x86_64-linux.fmt
+      - name: Check patched dependency sources
+        run: nix build --no-update-lock-file .#checks.x86_64-linux.dummy-src
       - name: Build
         run: nix build --no-update-lock-file
 

@@ -75,6 +75,16 @@
           src = lib.cleanSource ./.;
         };
 
+      mkWorkspaceDummySrc =
+        craneLib:
+        craneLib.mkDummySrc {
+          src = mkWorkspaceSrc craneLib;
+          extraDummyScript = ''
+            rm -rf "$out/vendor/crossterm"
+            cp -r ${./vendor/crossterm} "$out/vendor/crossterm"
+          '';
+        };
+
       cargoLockParsed = builtins.fromTOML (builtins.readFile ./Cargo.lock);
 
       # Exact Cargo.lock source strings (with fragment) of all git deps
@@ -200,7 +210,7 @@
             // {
               pname = "${packageName}-deps";
               inherit version;
-              src = workspaceSrc;
+              dummySrc = mkWorkspaceDummySrc craneLib;
             }
           );
         in
@@ -262,6 +272,14 @@
 
       checks = forEachSystem (
         system: pkgs: {
+          dummy-src =
+            let
+              dummySrc = mkWorkspaceDummySrc (mkCraneLib pkgs);
+            in
+            pkgs.runCommandLocal "check-dummy-src" { } ''
+              diff -r ${./vendor/crossterm} ${dummySrc}/vendor/crossterm
+              touch $out
+            '';
           git-dep-hashes =
             if missingGitDepHashes == [ ] && staleGitDepHashes == [ ] then
               pkgs.runCommandLocal "git-dep-hashes" { } "touch $out"
