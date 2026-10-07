@@ -3,25 +3,25 @@ name = "workcell-source-icons"
 description = "Safe source icon discovery and PNG normalization"
 readme = "README.md"
 edition.workspace = true
-license.workspace = true
+license = "Apache-2.0"
 repository.workspace = true
 rust-version.workspace = true
-version.workspace = true
+version = "0.1.0"
 
 [dependencies]
-base64.workspace = true
+base64-022.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
 http.workspace = true
 image = { workspace = true, features = ["gif", "ico", "jpeg", "png", "webp"] }
-workcell-net = { path = "../net" }
+workcell-net.workspace = true
 lru.workspace = true
-resvg = { version = "=0.47.0", default-features = false }
+resvg.workspace = true
 serde.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros"] }
 tokio-util.workspace = true
-url.workspace = true
+url = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
 async-trait.workspace = true

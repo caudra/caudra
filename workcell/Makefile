@@ -4,15 +4,15 @@ SHELL := /bin/bash
 CARGO ?= cargo
 DOCKER ?= docker
 PYTHON ?= python3
+REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/..)
+export CARGO_TARGET_DIR := $(REPO_ROOT)/target
 IMAGE ?= workcell-mcp
 TAG ?= local
 ROOT ?=
 PORT ?= 3001
 ARGS ?=
-# Must match the `monty-pool` pin in Cargo.toml; `code-worker` enforces it.
-MONTY_VERSION ?= 1.0.0
-CODE_WORKER_ROOT ?= target/code-worker
-CODE_WORKER_BUILD ?= target/code-worker-build
+CODE_WORKER_ROOT ?= $(CARGO_TARGET_DIR)/code-worker
+CODE_WORKER_BUILD ?= $(CARGO_TARGET_DIR)/code-worker-build
 CODE_WORKER ?= $(CODE_WORKER_ROOT)/bin/monty
 BUNDLED_CODE_WORKER_ENV := WORKCELL_BUNDLED_MONTY_WORKER
 
@@ -34,11 +34,11 @@ help:
 		'  make code-worker   Install the pinned monty worker binary for the code tool group' \
 		'  make fmt           Format the Rust workspace' \
 		'  make fmt-check     Verify formatting without changing files' \
-		'  make check         Type-check all workspace targets' \
+		'  make check         Type-check all Workcell targets' \
 		'  make check-native  Type-check the protocol-neutral facade without any MCP adapter' \
 		'  make clippy        Run Clippy with warnings denied' \
-		'  make test          Run all workspace tests with the lockfile' \
-		'  make build         Build the debug workspace with the lockfile' \
+		'  make test          Run all Workcell tests with the root lockfile' \
+		'  make build         Build the debug server with the root lockfile' \
 		'  make release       Build the optimized binary with the lockfile' \
 		'  make release-fast  Build an optimized binary without LTO for local iteration' \
 		'  make ci            Run the complete local CI verification' \
@@ -60,32 +60,27 @@ help:
 # `--no-default-features` drops Monty's standalone CLI, leaving a binary that only serves
 # `monty subprocess` and cannot run a REPL, a file, or `-c`.
 #
-# `scripts/build-code-worker.py` fixes the worker's profile and install command instead of taking
+# The root `scripts/build-code-worker.py` fixes the worker's profile and install command instead of taking
 # Cargo's defaults, so every checkout builds the same worker and a shared CODE_WORKER_BUILD reuses
 # compiled artifacts. It publishes a stripped `bin/monty`, keeps the unstripped build at
 # `symbols/bin/monty` for diagnostics, and rebuilds when the helper, toolchain, target, or RUSTFLAGS
 # no longer match its stamp. Any other CODE_WORKER belongs to the caller: it is version-checked,
 # never built or stripped.
 code-worker:
-	@lock_version=$$(awk '/^name = "monty-pool"$$/ { getline; gsub(/[",]/, "", $$3); print $$3 }' Cargo.lock); \
-	if [[ "$$lock_version" != "$(MONTY_VERSION)" ]]; then \
-		printf '%s\n' "monty-pool is pinned to $$lock_version but MONTY_VERSION is $(MONTY_VERSION);" \
-			'the worker protocol is version-coupled, so update both together'; \
-		exit 2; \
-	fi
-	@if [[ "$(CODE_WORKER)" == "$(CODE_WORKER_ROOT)/bin/monty" ]]; then \
-		$(PYTHON) scripts/build-code-worker.py --version "$(MONTY_VERSION)" \
+	@expected=$$($(PYTHON) "$(REPO_ROOT)/scripts/build-code-worker.py" --check-version) || exit 2; \
+	if [[ "$(CODE_WORKER)" == "$(CODE_WORKER_ROOT)/bin/monty" ]]; then \
+		$(PYTHON) "$(REPO_ROOT)/scripts/build-code-worker.py" \
 			--root "$(CODE_WORKER_ROOT)" --target-dir "$(CODE_WORKER_BUILD)"; \
-	elif ! "$(CODE_WORKER)" --version 2>&1 | grep -qxF 'monty-runtime $(MONTY_VERSION)'; then \
-		printf '%s\n' 'CODE_WORKER=$(CODE_WORKER) must be an executable reporting monty-runtime $(MONTY_VERSION)'; \
+	elif ! "$(CODE_WORKER)" --version 2>&1 | grep -qxF "$$expected"; then \
+		printf '%s\n' "CODE_WORKER=$(CODE_WORKER) must be an executable reporting $$expected"; \
 		exit 2; \
 	fi
 	@# The server finds the worker beside its own executable, which is the same rule the container
 	@# relies on. Placing a copy in each Cargo profile directory makes `cargo run` and a direct
 	@# `./target/<profile>/workcell-mcp` work with no configuration, exactly like the image.
 	@for profile in debug release release-fast; do \
-		mkdir -p "target/$$profile"; \
-		install -m 0755 "$(CODE_WORKER)" "target/$$profile/monty"; \
+		mkdir -p "$(CARGO_TARGET_DIR)/$$profile"; \
+		install -m 0755 "$(CODE_WORKER)" "$(CARGO_TARGET_DIR)/$$profile/monty"; \
 	done
 	@printf '%s\n' 'copied $(CODE_WORKER) beside the debug, release, and release-fast binaries'
 
@@ -96,7 +91,7 @@ fmt-check:
 	$(CARGO) fmt --all --check
 
 check:
-	$(CARGO) check --workspace --all-targets --locked
+	$(CARGO) check --package 'workcell*' --all-targets --locked
 
 # `check` cannot cover the native path. Cargo unifies features across a workspace build, and the
 # standalone server depends on every tool crate with `features = ["mcp"]`, so `--workspace` always
@@ -121,27 +116,27 @@ check-native:
 		--features code-bundled -- -D warnings
 	@# A non-optional rmcp dependency anywhere in the tool crates would silently pull a transport
 	@# into every native host. Assert its absence rather than trusting the feature declarations.
-	@if $(CARGO) tree --locked --package workcell --no-default-features \
-		--features "$(NATIVE_FEATURES)" --prefix none 2>/dev/null \
-		| grep -q '^rmcp '; then \
+	@tree=$$($(CARGO) tree --locked --package workcell --no-default-features \
+		--features "$(NATIVE_FEATURES)" --prefix none) || exit 1; \
+	if printf '%s\n' "$$tree" | grep -q '^rmcp '; then \
 		printf '%s\n' 'rmcp is reachable from the protocol-neutral facade; an MCP dependency is no longer optional'; \
 		exit 2; \
 	fi
-	@if $(CARGO) tree --locked --package workcell --no-default-features \
-		--features code-bundled --prefix none 2>/dev/null \
-		| grep -q '^rmcp '; then \
+	@tree=$$($(CARGO) tree --locked --package workcell --no-default-features \
+		--features code-bundled --prefix none) || exit 1; \
+	if printf '%s\n' "$$tree" | grep -q '^rmcp '; then \
 		printf '%s\n' 'rmcp is reachable from the bundled native code facade'; \
 		exit 2; \
 	fi
-	@if $(CARGO) tree --locked --package workcell --no-default-features \
-		--features files --prefix none 2>/dev/null \
-		| grep -Eq '^(mlua|tree-sitter)[ -]'; then \
+	@tree=$$($(CARGO) tree --locked --package workcell --no-default-features \
+		--features files --prefix none) || exit 1; \
+	if printf '%s\n' "$$tree" | grep -Eq '^(mlua|tree-sitter)[ -]'; then \
 		printf '%s\n' 'the base files facade reaches the optional index parser bundle'; \
 		exit 2; \
 	fi
-	@if $(CARGO) tree --locked --package workcell --no-default-features \
-		--features files-index --prefix none 2>/dev/null \
-		| grep -q '^mlua '; then \
+	@tree=$$($(CARGO) tree --locked --package workcell --no-default-features \
+		--features files-index --prefix none) || exit 1; \
+	if printf '%s\n' "$$tree" | grep -q '^mlua '; then \
 		printf '%s\n' 'the native index facade reaches a Lua interpreter'; \
 		exit 2; \
 	fi
@@ -151,13 +146,14 @@ check-native:
 	@printf '%s\n' 'native facade builds for every tool group with no MCP dependency'
 
 clippy:
-	$(CARGO) clippy --workspace --all-targets --locked -- -D warnings
+	$(CARGO) clippy --package 'workcell*' --all-targets --locked -- -D warnings
 
 # Build-time bundling is separate from the runtime override, so tests exercise both embedded and
 # explicit-path worker sources without leaking operator configuration into CLI tests.
 test: code-worker test-optional-features
-	$(PYTHON) scripts/test-build-code-worker.py
-	$(BUNDLED_CODE_WORKER_ENV)="$(abspath $(CODE_WORKER))" $(CARGO) test --workspace --locked
+	$(PYTHON) "$(REPO_ROOT)/scripts/test-build-code-worker.py"
+	WORKCELL_REQUIRE_CODE_WORKER=1 $(BUNDLED_CODE_WORKER_ENV)="$(abspath $(CODE_WORKER))" \
+		$(CARGO) test --package 'workcell*' --locked
 
 # Optional features are dark to `--workspace` until something in the workspace turns them on, and a
 # feature nothing exercises is a feature nothing protects. These run the crates that carry one.
@@ -170,7 +166,7 @@ test-optional-features:
 		-- -D warnings
 
 build:
-	$(CARGO) build --workspace --locked
+	$(CARGO) build --package workcell-mcp --locked
 
 release: code-worker
 	$(BUNDLED_CODE_WORKER_ENV)="$(abspath $(CODE_WORKER))" \
@@ -182,23 +178,22 @@ release-fast: code-worker
 
 ci: code-worker fmt-check check check-native clippy test release
 
-# Installs the worker into the same Cargo bin directory, so the installed server finds it beside
-# itself. Without this the code tool group would be enabled but unusable after a plain install.
+# The installed server carries the bundled worker; build input is not a runtime override.
 install: code-worker
 	$(BUNDLED_CODE_WORKER_ENV)="$(abspath $(CODE_WORKER))" $(CARGO) install --path . --locked
 
-run:
+run: code-worker
 	@test -n "$(ROOT)" || { printf '%s\n' 'ROOT is required, for example: make run ROOT=/absolute/workspace'; exit 2; }
-	$(CARGO) run --locked -- $(ARGS) "$(ROOT)"
+	$(CARGO) run --locked --package workcell-mcp -- $(ARGS) "$(ROOT)"
 
 run-web:
-	$(CARGO) run --locked -- --tool-group web $(ARGS)
+	$(CARGO) run --locked --package workcell-mcp -- --tool-group web $(ARGS)
 
 clean:
 	$(CARGO) clean
 
 docker-build:
-	$(DOCKER) build --tag "$(IMAGE):$(TAG)" .
+	$(DOCKER) build --file "$(REPO_ROOT)/workcell/Dockerfile" --tag "$(IMAGE):$(TAG)" "$(REPO_ROOT)"
 
 docker-smoke: docker-build
 	$(DOCKER) run --rm "$(IMAGE):$(TAG)" --version
@@ -215,10 +210,10 @@ docker-smoke: docker-build
 		'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"container-smoke","version":"1"}}}' \
 		'{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' \
 		'{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
-		'{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"index","arguments":{"path":"LICENSE.md"}}}' \
+		'{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"file_index","arguments":{"path":"LICENSE.md"}}}' \
 		| $(DOCKER) run --rm --interactive "$(IMAGE):$(TAG)" --tool-group files \
 			/usr/share/doc/workcell-mcp); \
-	printf '%s\n' "$$output" | grep -q '"name":"index"' \
+	printf '%s\n' "$$output" | grep -q '"name":"file_index"' \
 		|| { printf '%s\n' 'packaged index catalog is incomplete'; exit 2; }; \
 	printf '%s\n' "$$output" | grep -q '"kind":"file".*"language":"markdown"' \
 		|| { printf '%s\n' 'packaged index execution failed'; exit 2; }

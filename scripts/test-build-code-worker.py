@@ -28,6 +28,7 @@ OLD_STAMP = "previous fingerprint"
 PUBLICATION_ERROR = "cannot publish worker"
 PDB = b"matching worker diagnostic symbols"
 VERSION_ERROR = f"Bundled worker must report {WORKER.EXPECTED_VERSION}"
+VERSION_SKEW_ERROR = "update the pool and worker together"
 RELEASE_PROFILE = {
     "CARGO_PROFILE_RELEASE_OPT_LEVEL": "3",
     "CARGO_PROFILE_RELEASE_DEBUG": "0",
@@ -39,6 +40,29 @@ RELEASE_PROFILE = {
 
 
 class BuildCodeWorkerTests(unittest.TestCase):
+    def test_worker_version_must_match_every_locked_pool(self):
+        for versions in ([], ["0.0.0"], [WORKER.VERSION, "0.0.0"]):
+            with self.subTest(versions=versions), tempfile.TemporaryDirectory() as root:
+                lockfile = Path(root) / "Cargo.lock"
+                lockfile.write_text(
+                    "package = []\n"
+                    if not versions
+                    else "".join(
+                        f'[[package]]\nname = "monty-pool"\nversion = "{v}"\n'
+                        for v in versions
+                    )
+                )
+                with self.assertRaisesRegex(RuntimeError, VERSION_SKEW_ERROR):
+                    WORKER.validate_version(lockfile)
+
+    def test_matching_pool_version_is_accepted(self):
+        with tempfile.TemporaryDirectory() as root:
+            lockfile = Path(root) / "Cargo.lock"
+            lockfile.write_text(
+                f'[[package]]\nname = "monty-pool"\nversion = "{WORKER.VERSION}"\n'
+            )
+            WORKER.validate_version(lockfile)
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="test-code-worker-")
         self.addCleanup(temporary.cleanup)

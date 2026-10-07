@@ -3,13 +3,13 @@ name = "workcell-mcp-code-graph"
 description = "Repository-scale symbol map, retrieval, and impact tools over a confined source tree"
 readme = "README.md"
 edition.workspace = true
-license.workspace = true
+license = "Apache-2.0"
 repository.workspace = true
 rust-version.workspace = true
-version.workspace = true
+version = "0.1.0"
 
 [features]
-default = ["mcp"]
+default = []
 mcp = ["dep:rmcp"]
 # Repository history signals. Optional for the same reason they are optional in the engine: the map
 # is complete without them.
@@ -22,7 +22,7 @@ schemars.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros"] }
 tokio-util.workspace = true
 workcell-code-graph.workspace = true
 # The confined resolver. This crate never opens a path itself; every read goes through the

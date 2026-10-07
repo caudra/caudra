@@ -3,7 +3,7 @@
 ## Reporting
 
 Report suspected vulnerabilities privately through GitHub Security Advisories for
-`tensorninja/workcell-mcp`. Do not open a public issue for an unpatched vulnerability or include live
+`caudra/caudra`. Do not open a public issue for an unpatched vulnerability or include live
 credentials, private paths, or exploit data in public logs.
 
 ## Boundary

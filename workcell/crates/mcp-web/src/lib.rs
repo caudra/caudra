@@ -13,6 +13,8 @@
 //! PDFs can produce different text or no title. The MCP shape, normalization,
 //! limits, attachment mode, and failure classification remain compatible.
 
+extern crate base64_022 as base64;
+
 mod blocking;
 mod catalog;
 mod config;

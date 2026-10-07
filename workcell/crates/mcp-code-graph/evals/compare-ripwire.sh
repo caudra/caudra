@@ -12,7 +12,7 @@
 # gap that did not exist.
 #
 #   cargo build --release --example code_map_bench -p workcell-mcp-code-graph
-#   crates/mcp-code-graph/evals/compare-ripwire.sh <tree> [<tree> ...]
+#   workcell/crates/mcp-code-graph/evals/compare-ripwire.sh <tree> [<tree> ...]
 #
 # RUNS=n overrides the repetition count. Medians are reported; a single run measures page-cache
 # state as much as anything else.
@@ -20,7 +20,8 @@
 set -uo pipefail
 
 RUNS=${RUNS:-7}
-BENCH=${BENCH:-./target/release/examples/code_map_bench}
+REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../.." && pwd)
+BENCH=${BENCH:-$REPO_ROOT/target/release/examples/code_map_bench}
 CACHE=${RIPWIRE_CACHE:-/tmp/ripwire-$(id -u)}
 
 if ! command -v ripwire >/dev/null; then

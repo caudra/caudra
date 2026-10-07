@@ -10,6 +10,7 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
+  WORKCELL_REQUIRE_CODE_WORKER: "1"
 
 jobs:
   changes:
@@ -28,8 +29,11 @@ jobs:
               - "Cargo.lock"
               - "rust-toolchain.toml"
               - "build.rs"
+              - "install.sh"
+              - "install.ps1"
               - "src/**"
               - "caudra-*/**"
+              - "workcell/**"
               - "plugins/**"
               - "scripts/build-code-worker.py"
               - "scripts/test-build-code-worker.py"
@@ -110,6 +114,21 @@ jobs:
           tool: cargo-machete
       - run: cargo machete
 
+  workcell-native:
+    name: Workcell native features
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    env:
+      WORKCELL_BUNDLED_MONTY_WORKER: ${{ github.workspace }}/target/code-worker/bin/monty
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: python3 scripts/build-code-worker.py
+      - run: make -C workcell check-native test-optional-features
+      - run: cargo test --locked -p workcell-mcp-code --no-default-features --features mcp,bundled-worker --test execution
+      - run: cargo test --locked --doc --package 'workcell*'
+
   build:
     name: Build
     needs: changes
@@ -123,6 +142,7 @@ jobs:
           tool: just
       - run: just code-worker
       - run: just build
+      - run: just workcell-build
 
   macos:
     name: Check + Test + Build (macOS)
@@ -137,6 +157,12 @@ jobs:
           tool: just
       - run: just code-worker
       - run: just check
+      - name: Workcell macOS native filesystem checks
+        run: |
+          cargo check --locked -p workcell-mcp-files --all-targets --all-features
+          cargo check --locked -p workcell --no-default-features --features files-index,snapshots
+          cargo test --locked -p workcell-mcp-files --lib staged_files_keep_exact_permission_bits
+          cargo test --locked -p workcell-mcp-files --lib metadata_descriptors_refuse_unsupported_platforms
       - run: cargo test --locked -p caudra-agent directory_ancestry_respects_sticky_permissions
         env:
           WORKCELL_BUNDLED_MONTY_WORKER: ${{ github.workspace }}/target/code-worker/bin/monty
@@ -166,7 +192,7 @@ jobs:
   ci-pass:
     name: CI
     if: always()
-    needs: [fmt, fmt-lua, lint, test, machete, build, macos, windows]
+    needs: [fmt, fmt-lua, lint, test, machete, workcell-native, build, macos, windows]
     runs-on: ubuntu-latest
     steps:
       - if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')

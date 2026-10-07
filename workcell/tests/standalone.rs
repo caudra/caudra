@@ -11,7 +11,10 @@ use serde_json::{Value, json};
 #[cfg(unix)]
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
-use std::{fmt::Write as _, path::Path};
+use std::{
+    fmt::Write as _,
+    path::{Path, PathBuf},
+};
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 #[cfg(unix)]
@@ -3003,22 +3006,31 @@ where
 }
 
 /// Locates the `monty` worker the way the server does, plus the in-repo build location so a
-/// developer who ran `make code-worker` needs no extra configuration.
-fn code_worker() -> Option<std::path::PathBuf> {
+/// developer who ran `just code-worker` needs no extra configuration.
+#[cfg(unix)]
+fn code_worker() -> Option<PathBuf> {
     if let Some(configured) = std::env::var_os("WORKCELL_MCP_CODE_WORKER") {
         return Some(configured.into());
     }
-    let installed = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("target/code-worker/bin")
-        .join(workcell_mcp_code::WORKER_FILE_NAME);
+    let installed = option_env!("WORKCELL_BUNDLED_MONTY_WORKER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../target/code-worker/bin")
+                .join(workcell_mcp_code::WORKER_FILE_NAME)
+        });
+    assert!(
+        installed.is_file()
+            || (std::env::var_os("WORKCELL_REQUIRE_CODE_WORKER").is_none()
+                && option_env!("WORKCELL_BUNDLED_MONTY_WORKER").is_none()),
+        "required monty worker is missing; run just code-worker"
+    );
     installed.is_file().then_some(installed)
 }
 
 /// Exercises the full catalog, including the code group, over a real stdio session.
 ///
-/// The code group needs the separately built worker binary, so this skips with an explicit message
-/// rather than silently passing when it is absent. CI builds the worker and sets the environment
-/// variable, so the skip only applies to a local checkout that has not run `make code-worker`.
+/// Local runs may skip without a worker; CI requires it with WORKCELL_REQUIRE_CODE_WORKER.
 #[cfg(unix)]
 #[tokio::test]
 async fn stdio_serves_the_full_catalog_including_python_execution() {

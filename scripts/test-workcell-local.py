@@ -767,8 +767,9 @@ def main():
                     WORKCELL_TEST_FAULT=str(temp / "drop-operation-response"),
                 )
                 command = [
-                    str(repo / "scripts" / "dev-cargo.sh"),
+                    "cargo",
                     "test",
+                    "--locked",
                     "-p",
                     "caudra-workcell",
                     "--test",

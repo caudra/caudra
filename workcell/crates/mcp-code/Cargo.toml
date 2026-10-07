@@ -2,24 +2,24 @@
 name = "workcell-mcp-code"
 description = "Typed isolated Python code execution for Workcell"
 edition.workspace = true
-license.workspace = true
+license = "Apache-2.0"
 repository.workspace = true
 rust-version.workspace = true
-version.workspace = true
+version = "0.1.0"
 
 [features]
-default = ["mcp"]
+default = []
 bundled-worker = ["dep:workcell-monty-worker"]
 mcp = ["dep:rmcp"]
 
 [dependencies]
 monty-pool.workspace = true
-monty-types.workspace = true
+monty-types-registry.workspace = true
 rmcp = { workspace = true, optional = true }
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros"] }
 tokio-util.workspace = true
 workcell-tool-contract.workspace = true
 workcell-monty-worker = { workspace = true, optional = true }

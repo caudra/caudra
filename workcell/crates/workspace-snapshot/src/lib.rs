@@ -7,6 +7,8 @@
 //! Several processes may share one store: every operation takes the store's lock for as long as
 //! it runs, and never longer.
 
+extern crate rustix_038 as rustix;
+
 mod capture;
 mod cleanup;
 mod format;

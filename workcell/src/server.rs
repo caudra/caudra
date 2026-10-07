@@ -5060,14 +5060,23 @@ mod tests {
     }
 
     fn test_worker() -> Option<PathBuf> {
-        let configured = std::env::var_os("WORKCELL_MCP_CODE_WORKER").map(PathBuf::from);
-        let built = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target/code-worker/bin")
-            .join(WORKER_FILE_NAME);
-        configured
-            .into_iter()
-            .chain([built])
-            .find(|path| path.is_file())
+        if let Some(configured) = std::env::var_os("WORKCELL_MCP_CODE_WORKER") {
+            return Some(configured.into());
+        }
+        let built = option_env!("WORKCELL_BUNDLED_MONTY_WORKER")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../target/code-worker/bin")
+                    .join(WORKER_FILE_NAME)
+            });
+        assert!(
+            built.is_file()
+                || (std::env::var_os("WORKCELL_REQUIRE_CODE_WORKER").is_none()
+                    && option_env!("WORKCELL_BUNDLED_MONTY_WORKER").is_none()),
+            "required monty worker is missing; run just code-worker"
+        );
+        built.is_file().then_some(built)
     }
 
     fn running_operation(

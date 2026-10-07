@@ -63,8 +63,11 @@
             || (builtins.match ".*/words/.*" path != null)
             || (builtins.match ".*/decisions/questions/.*" path != null)
             || (builtins.match ".*/caudra-workflow/(builtins|skill)/.*" path != null)
+            || (builtins.match ".*/caudra-automation/(skill|tests/examples)/.*" path != null)
             || (builtins.match ".*/site/src/content/docs/.*" path != null)
             || (lib.hasSuffix "/site/src/data/docs-navigation.json" path)
+            || (builtins.match ".*/workcell/.*/(queries|rules.*|fixtures|evals)/.*" path != null)
+            || (builtins.match ".*/workcell/fixtures/.*" path != null)
             || (lib.hasSuffix ".lua" path);
           src = lib.cleanSource ./.;
         };
@@ -94,8 +97,8 @@
       gitDepHashes = {
         "git+https://github.com/pydantic/monty.git?tag=v1.0.0#85c5d1f6bef038405cfc40a4eed94806e303567e" =
           "sha256-tuDFwYLIprdVyAH47rqYiI4xU3RCuNdkBjIyVM1JeWE=";
-        "git+https://github.com/tensorninja/workcell-mcp?rev=fc2ec434eeab061d812ba56f4820487ac1ed9e55#fc2ec434eeab061d812ba56f4820487ac1ed9e55" =
-          "sha256-iYaunHKmi2+PmMcMVMWpeqD//oaOWLQEg7jTLVTnNjA=";
+        "git+https://github.com/modelcontextprotocol/rust-sdk.git?rev=9334c97f0d6e177546fc33593148aa3f942cb1f8#9334c97f0d6e177546fc33593148aa3f942cb1f8" =
+          "sha256-X9WsE8CB5rBwXClvZibtKA6ajoYuAOIA3mj4ETN9gyQ=";
       };
 
       missingGitDepHashes = builtins.filter (s: !(builtins.hasAttr s gitDepHashes)) gitDepSources;
@@ -254,7 +257,8 @@
                 src = lib.cleanSource ./.;
               }
               ''
-                find "$src" -name '*.nix' -type f -exec nixfmt --check {} +
+                find "$src" -type d -name fixtures -prune -o \
+                  -name '*.nix' -type f -exec nixfmt --check {} +
                 touch $out
               '';
         }
@@ -269,12 +273,10 @@
         {
           default = craneLib.devShell {
             packages = with pkgs; [
-              bun
               cargo-machete
               cargo-nextest
               git
               just
-              nodejs_24
               openssl
               perl
               pkg-config

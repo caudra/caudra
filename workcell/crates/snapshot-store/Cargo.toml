@@ -2,10 +2,10 @@
 name = "workcell-snapshot-store"
 description = "Git object storage for bounded, content-addressed workspace snapshots"
 edition.workspace = true
-license.workspace = true
+license = "Apache-2.0"
 repository.workspace = true
 rust-version.workspace = true
-version.workspace = true
+version = "0.1.0"
 
 [dependencies]
 gix.workspace = true

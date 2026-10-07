@@ -3,23 +3,16 @@
 # dependency tree is known to satisfy, and `--no-default-features` drops Monty's standalone CLI,
 # leaving a binary that only serves `monty subprocess`.
 #
-# MONTY_VERSION must match the `monty-pool` pin in Cargo.toml: the worker protocol is version-coupled.
+# Build from the repository root: docker build -f workcell/Dockerfile .
 FROM rust:1.99.0-bookworm AS worker
 
-ARG MONTY_VERSION=1.0.0
-
-# The profile is the one scripts/build-code-worker.py pins, inlined so the image needs no Python.
-# The unstripped build stays under /out/symbols for the diagnostics stage.
-RUN CARGO_PROFILE_RELEASE_OPT_LEVEL=3 \
-    CARGO_PROFILE_RELEASE_DEBUG=0 \
-    CARGO_PROFILE_RELEASE_STRIP=none \
-    CARGO_PROFILE_RELEASE_LTO=thin \
-    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 \
-    CARGO_PROFILE_RELEASE_PANIC=unwind \
-    cargo install monty-runtime --version "=${MONTY_VERSION}" --locked --no-default-features \
-      --root /out/symbols \
-    && mkdir /out/bin \
-    && strip -o /out/bin/monty /out/symbols/bin/monty
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends python3 \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+COPY Cargo.lock ./
+COPY scripts/build-code-worker.py scripts/build-code-worker.py
+RUN python3 scripts/build-code-worker.py --root /out --target-dir /build/target/code-worker-build
 
 FROM rust:1.99.0-bookworm AS builder
 
@@ -28,10 +21,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
-COPY Cargo.toml Cargo.lock ./
-COPY crates crates
-COPY src src
-COPY README.md ./
+COPY . .
 
 # Built as a single package rather than `--workspace`: the workspace build is only used for
 # verification, and the shipped server must not link anything the code group needs. Symbols are
@@ -41,7 +31,7 @@ RUN CARGO_PROFILE_RELEASE_STRIP=none cargo build --locked --release --package wo
     && strip -o /out/bin/workcell-mcp target/release/workcell-mcp
 
 # Unstripped executables for symbolizing a crash, exported rather than run:
-# `docker build --target diagnostics --output <directory> .`
+# `docker build -f workcell/Dockerfile --target diagnostics --output <directory> .`
 FROM scratch AS diagnostics
 
 COPY --from=builder /build/target/release/workcell-mcp /workcell-mcp
@@ -60,7 +50,8 @@ COPY --from=builder /out/bin/workcell-mcp /usr/local/bin/workcell-mcp
 # The server discovers the worker beside its own executable, so no configuration is needed in the
 # image. Keep the file name `monty`: it is what the discovery path looks for.
 COPY --from=worker /out/bin/monty /usr/local/bin/monty
-COPY LICENSE.md THIRD_PARTY_LICENSES/Monty.txt /usr/share/doc/workcell-mcp/
+COPY workcell/LICENSE.md workcell/THIRD_PARTY.md workcell/THIRD_PARTY_LICENSES/Monty.txt THIRD_PARTY_LICENSES/RTK.txt /usr/share/doc/workcell-mcp/
+COPY workcell/crates/output-filter/NOTICE /usr/share/doc/workcell-mcp/RTK-NOTICE
 
 USER 10001:10001
 EXPOSE 3001

@@ -3,10 +3,10 @@ name = "workcell-source-languages"
 description = "Language detection, tree-sitter grammar selection, and vendored tags queries for Workcell"
 readme = "README.md"
 edition.workspace = true
-license.workspace = true
+license = "Apache-2.0"
 repository.workspace = true
 rust-version.workspace = true
-version.workspace = true
+version = "0.1.0"
 
 [dependencies]
 tree-sitter.workspace = true

@@ -1337,7 +1337,7 @@ def main():
     parser.add_argument("--caudra", default=str(REPO / "target/debug/caudra"))
     parser.add_argument(
         "--workcell",
-        default=str(REPO.parent / "workcell-mcp/target/release/workcell-mcp"),
+        default=str(REPO / "target/release/workcell-mcp"),
     )
     parser.add_argument("--iron-proxy", default=shutil.which("iron-proxy"))
     args = parser.parse_args()

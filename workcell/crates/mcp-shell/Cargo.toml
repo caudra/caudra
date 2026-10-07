@@ -2,30 +2,30 @@
 name = "workcell-mcp-shell"
 description = "Typed bounded shell execution for Workcell"
 edition.workspace = true
-license.workspace = true
+license = "Apache-2.0"
 repository.workspace = true
 rust-version.workspace = true
-version.workspace = true
+version = "0.1.0"
 
 [features]
-default = ["mcp"]
+default = []
 mcp = ["dep:rmcp"]
 
 [dependencies]
 async-trait.workspace = true
 dunce.workspace = true
 rmcp = { workspace = true, optional = true }
-rustix.workspace = true
+rustix-038.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros"] }
 tokio-util.workspace = true
-toml.workspace = true
+toml-09.workspace = true
 tree-sitter.workspace = true
 tree-sitter-bash.workspace = true
-workcell-output-filter = { path = "../output-filter" }
+workcell-output-filter.workspace = true
 workcell-tool-contract.workspace = true
 workcell-host-contract.workspace = true
 

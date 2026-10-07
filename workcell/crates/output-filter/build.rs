@@ -5,6 +5,8 @@
 //! then parses a single embedded document instead of walking a directory, which
 //! keeps rule loading independent of the filesystem the server is pointed at.
 
+extern crate toml_09 as toml;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::{env, fs};

@@ -1,8 +1,5 @@
 monty_worker_name := if os_family() == "windows" { "monty.exe" } else { "monty" }
 monty_worker := justfile_directory() + "/target/code-worker/bin/" + monty_worker_name
-workcell_root := justfile_directory() + "/../workcell-mcp/crates"
-cargo_cmd := justfile_directory() + "/scripts/dev-cargo.sh"
-export WORKCELL_LOCAL := workcell_root + "/workcell"
 export WORKCELL_BUNDLED_MONTY_WORKER := monty_worker
 
 default:
@@ -21,23 +18,23 @@ install-fast: code-worker
     cargo install --locked --path . --force --profile release-fast
 
 build *ARGS:
-    "{{ cargo_cmd }}" build {{ ARGS }}
+    cargo build {{ ARGS }}
 
 # Types only, no codegen, no lints, always for the whole workspace. For one crate: `cargo check -p <crate> --tests`.
 check *ARGS:
-    "{{ cargo_cmd }}" check --workspace --tests {{ ARGS }}
+    cargo check --workspace --tests {{ ARGS }}
 
 run *ARGS:
-    "{{ cargo_cmd }}" run {{ ARGS }}
+    cargo run --package caudra {{ ARGS }}
 
 test *ARGS:
-    "{{ cargo_cmd }}" nextest run --workspace {{ ARGS }}
+    WORKCELL_REQUIRE_CODE_WORKER=1 cargo nextest run --workspace {{ ARGS }}
 
 lint:
-    "{{ cargo_cmd }}" clippy --all --tests -- -D warnings
+    cargo clippy --all --tests -- -D warnings
 
 lint-fix:
-    "{{ cargo_cmd }}" clippy --all --tests --fix
+    cargo clippy --all --tests --fix
 
 fmt-check:
     cargo fmt --all -- --check
@@ -54,41 +51,28 @@ pylint:
     ty check scripts/
 
 gen-docs:
-    "{{ cargo_cmd }}" run -p caudra-docgen
+    cargo run -p caudra-docgen
 
 gen-docs-check:
-    "{{ cargo_cmd }}" run -p caudra-docgen -- --check
+    cargo run -p caudra-docgen -- --check
 
-site-install:
-    bun install --cwd "{{ justfile_directory() }}/site" --frozen-lockfile
+workcell-build *ARGS:
+    cargo build --locked --package workcell-mcp {{ ARGS }}
 
-site-dev *ARGS:
-    bun run --cwd "{{ justfile_directory() }}/site" dev {{ ARGS }}
+workcell-run *ARGS: code-worker
+    cargo run --locked --package workcell-mcp -- {{ ARGS }}
 
-site-check:
-    bun run --cwd "{{ justfile_directory() }}/site" check
+workcell-release: code-worker
+    cargo build --locked --release --package workcell-mcp
 
-site-test:
-    bun run --cwd "{{ justfile_directory() }}/site" test
+workcell-check-native:
+    make -C workcell check-native
 
-site-build:
-    bun run --cwd "{{ justfile_directory() }}/site" build
-
-site-output:
-    bun run --cwd "{{ justfile_directory() }}/site" test:output
-
-site-browser:
-    bun run --cwd "{{ justfile_directory() }}/site" test:browser
-
-site-preview *ARGS:
-    bun run --cwd "{{ justfile_directory() }}/site" preview {{ ARGS }}
+workcell-doc-test:
+    cargo test --locked --doc --package 'workcell*'
 
 machete:
     cargo machete
 
-# Pin Workcell at its latest pushed commit and refresh the flake's dependency hashes.
-bump-workcell *ARGS:
-    scripts/bump-workcell.py {{ ARGS }}
-
 # Full CI check
-ci: code-worker fmt-check lint pylint test gen-docs-check machete site-install site-check site-test site-build site-output
+ci: code-worker fmt-check lint pylint workcell-check-native test workcell-doc-test gen-docs-check machete

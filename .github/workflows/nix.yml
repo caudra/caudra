@@ -32,6 +32,13 @@ jobs:
               - "words/**"
               - "site/src/content/docs/**"
               - "site/src/data/docs-navigation.json"
+              - "site/public/docs/*.example.toml"
+              - "workcell/**"
+              - "caudra-automation/skill/**"
+              - "caudra-automation/tests/examples/**"
+              - "caudra-workflow/builtins/**"
+              - "caudra-workflow/skill/**"
+              - "decisions/questions/**"
               - ".github/workflows/nix.yml"
 
   build:

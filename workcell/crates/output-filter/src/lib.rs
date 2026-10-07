@@ -42,6 +42,8 @@
 //! are deliberately not supported, because a rule read from the tree under
 //! inspection would let that tree rewrite what the model sees.
 
+extern crate toml_09 as toml;
+
 mod compile;
 pub(crate) mod escape;
 mod pipeline;

@@ -3,23 +3,23 @@ name = "workcell-net"
 description = "Bounded outbound HTTP and SSRF policy for Workcell tools"
 readme = "README.md"
 edition.workspace = true
-license.workspace = true
+license = "Apache-2.0"
 repository.workspace = true
 rust-version.workspace = true
-version.workspace = true
+version = "0.1.0"
 
 [dependencies]
 async-trait.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
 http.workspace = true
-httpdate = "1.0.3"
+httpdate.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros"] }
 tokio-util.workspace = true
-url.workspace = true
+url = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
 proptest.workspace = true

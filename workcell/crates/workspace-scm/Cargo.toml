@@ -2,21 +2,21 @@
 name = "workcell-workspace-scm"
 description = "Protocol-neutral structured SCM operations for confined Workcell workspaces"
 edition.workspace = true
-license.workspace = true
+license = "Apache-2.0"
 repository.workspace = true
 rust-version.workspace = true
-version.workspace = true
+version = "0.1.0"
 
 [dependencies]
 gix.workspace = true
-rustix.workspace = true
+rustix-038.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
+sha2 = { workspace = true, default-features = true }
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros"] }
 tokio-util.workspace = true
-uuid.workspace = true
+uuid = { workspace = true, features = ["v4"] }
 workcell-host-contract.workspace = true
 workcell-mcp-files.workspace = true
 

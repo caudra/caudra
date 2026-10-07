@@ -1,7 +1,7 @@
 # Third-Party Material
 
 Workcell is Apache-2.0. This file records third-party material vendored into the source tree, as
-distinct from crates resolved by Cargo, whose licences are recorded in `Cargo.lock` and audited by
+distinct from crates resolved by Cargo, whose licences are recorded in the repository-root `Cargo.lock` and audited by
 the dependency check.
 
 ## Vendored tree-sitter tags queries

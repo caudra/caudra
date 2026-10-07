@@ -4972,6 +4972,7 @@ mod tests {
     use smol::lock::Mutex as AsyncMutex;
     use smol::net::TcpListener;
     use std::any::TypeId;
+    use std::env;
     use std::fs;
     use std::io::ErrorKind;
     use std::ops::RangeInclusive;
@@ -4996,6 +4997,8 @@ mod tests {
     };
     use workcell::web::{WebfetchFormat, WebfetchPdfAttachment, WebfetchPdfMode};
 
+    const REQUIRED_CODE_WORKER: &str = "WORKCELL_REQUIRE_CODE_WORKER";
+    const MISSING_REQUIRED_WORKER: &str = "the required worker was not embedded";
     const PATCH: &str = "*** Begin Patch\n*** Add File: created.txt\n+hello\n*** End Patch";
     const PDF_URL: &str = "https://example.com/paper.pdf";
     const PDF_NAME: &str = "paper.pdf";
@@ -8624,8 +8627,9 @@ mod tests {
     fn production_host_executes_code_with_the_embedded_worker() {
         if !bundled_worker_available() {
             assert!(
-                option_env!("WORKCELL_BUNDLED_MONTY_WORKER").is_none(),
-                "the configured worker was not embedded"
+                option_env!("WORKCELL_BUNDLED_MONTY_WORKER").is_none()
+                    && env::var_os(REQUIRED_CODE_WORKER).is_none(),
+                "{MISSING_REQUIRED_WORKER}"
             );
             return;
         }

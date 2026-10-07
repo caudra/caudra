@@ -2,6 +2,8 @@
 
 //! Typed, sanitized execution-environment inspection with an optional MCP adapter.
 
+extern crate rustix_038 as rustix;
+
 use std::{
     collections::BTreeMap,
     ffi::OsStr,

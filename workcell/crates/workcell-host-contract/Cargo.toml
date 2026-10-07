@@ -2,10 +2,10 @@
 name = "workcell-host-contract"
 description = "Protocol-neutral remote operation contract for Workcell hosts"
 edition.workspace = true
-license.workspace = true
+license = "Apache-2.0"
 repository.workspace = true
 rust-version.workspace = true
-version.workspace = true
+version = "0.1.0"
 
 [dependencies]
 serde.workspace = true

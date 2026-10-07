@@ -3,10 +3,10 @@ name = "workcell-code-graph"
 description = "Symbol extraction, reference resolution, and ranking over a source tree"
 readme = "README.md"
 edition.workspace = true
-license.workspace = true
+license = "Apache-2.0"
 repository.workspace = true
 rust-version.workspace = true
-version.workspace = true
+version = "0.1.0"
 
 [features]
 default = []
@@ -17,7 +17,7 @@ git = ["dep:gix"]
 [dependencies]
 gix = { workspace = true, optional = true }
 lru.workspace = true
-sha2.workspace = true
+sha2 = { workspace = true, default-features = true }
 tree-sitter.workspace = true
 workcell-source-languages.workspace = true
 

@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+extern crate rustix_038 as rustix;
+
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs::{File, Metadata},

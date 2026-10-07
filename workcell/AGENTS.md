@@ -6,6 +6,10 @@ Workcell MCP is a standalone, harness-independent MCP execution server for files
 isolated code, and execution-environment tools. It is designed to run directly or inside an
 operator-provided container, VM, sandbox, or host.
 
+This subtree belongs to Caudra's root Cargo workspace. Its crates retain Apache-2.0 licensing and
+explicit versions. The root owns dependency declarations, the lockfile, build profiles, and the target
+directory. Keep the neutral libraries independent of Caudra's agent, UI, and storage crates.
+
 The server is intentionally single-environment. Do not add users, teams, workspaces, tenant routing,
 deployment controllers, lease brokers, ontology tools, or harness-specific state.
 
@@ -162,14 +166,14 @@ cargo test -p <crate>
 Run before considering a change complete:
 
 ```bash
-make
+make -C workcell
 ```
 
-`make` defaults to `ci`: `code-worker`, `fmt-check`, `check`, `check-native`, `clippy`, `test`,
+From the repository root, `make -C workcell` defaults to `ci`: `code-worker`, `fmt-check`, `check`, `check-native`, `clippy`, `test`,
 `release`. It costs minutes, so it is the gate rather than the loop. There are no per-crate targets;
 use Cargo directly while iterating.
 
-`make` includes `check-native`, which builds every `workcell` facade feature with no MCP adapter and
+That gate includes `check-native`, which builds every `workcell` facade feature with no MCP adapter and
 fails if `rmcp` becomes reachable from the neutral tree. A workspace-wide `cargo check` cannot catch
 that regression, because feature unification always resolves `mcp` in.
 
@@ -177,7 +181,7 @@ For code worker or packaging changes, verify both explicit-path and bundled sour
 real snippet through an optimized binary copied away from any adjacent worker. This proves the
 embedded fallback works rather than accidentally resolving the development worker.
 
-For code-graph changes that could affect cost, re-run `cargo run --release --example code_map_bench`
+For code-graph changes that could affect cost, re-run `cargo run -p workcell-mcp-code-graph --release --example code_map_bench`
 over a real tree. The standing target is the upstream `ripwire` binary with its on-disk cache warm,
 measured against this pipeline with no cache at all. That comparison is deliberately unfair to us: we
 have no persistent cache, so the target is what one would have to buy. Keep it that way rather than
@@ -185,7 +189,7 @@ crediting the in-process fact cache, which does not survive a process and is not
 `crates/mcp-code-graph/README.md` records the current numbers and the host they came from.
 
 For transport or container changes, also build the image and perform a real discovery/list/call smoke
-test against the resulting process. Use `make docker-smoke` as the minimum image check.
+test against the resulting process. Use `make -C workcell docker-smoke` as the minimum image check.
 
 ## Documentation
 

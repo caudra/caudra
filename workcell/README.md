@@ -4,6 +4,10 @@ Workcell MCP is a portable, harness-independent execution server for filesystem,
 tools. Run it directly over stdio or deploy it inside a container, VM, sandbox, or dedicated host and
 connect any compatible MCP client.
 
+Workcell is developed in the [Caudra repository](https://github.com/caudra/caudra/tree/main/workcell).
+Its server and reusable libraries share Caudra's Cargo workspace and lockfile while retaining their
+Apache-2.0 license. Run the build commands below from the Caudra repository root.
+
 Workcell owns no users, teams, workspaces, deployment records, or tenant routing. One server process
 represents one execution environment; optional remote-host identifiers are opaque operator labels,
 not records managed by Workcell.
@@ -88,15 +92,15 @@ that has no filesystem, no network, no subprocesses, and an empty environment, s
 and no policy. It is for computation, not for reaching the host. It requires the `monty` worker
 binary, which is installed from a pinned release rather than built with the workspace. Workcell
 release/install builds embed it, the container ships it beside the server, and source builds produce
-it with `make code-worker`. An explicit `--code-worker` is authoritative; otherwise discovery checks
+it with `make -C workcell code-worker`. An explicit `--code-worker` is authoritative; otherwise discovery checks
 beside the server, then the embedded worker, then `PATH`. When no worker is available, startup fails
 rather than exposing a tool that cannot run.
 
 ## Requirements
 
 - Rust 1.99 for source builds
-- Python 3.11 or later for the worker build helper that `make code-worker` and `make test` run
-- The `python_execution` tool group needs the pinned `monty` worker binary: `make code-worker`
+- Python 3.11 or later for the worker build helper that `make -C workcell code-worker` and `make -C workcell test` run
+- The `python_execution` tool group needs the pinned `monty` worker binary: `make -C workcell code-worker`
 - Linux is the primary production target
 - Bash is required for the shell tool in the production container
 
@@ -105,10 +109,10 @@ rather than exposing a tool that cannot run.
 Build and run all tools over stdio:
 
 ```bash
-cargo build --release --locked
+make -C workcell release
 ./target/release/workcell-mcp \
   --allow-write \
-  --shell-policy shell-policy.example.toml \
+  --shell-policy workcell/shell-policy.example.toml \
   /absolute/workspace/root
 ```
 
@@ -299,7 +303,7 @@ an `Authorization: Bearer ...` header.
 Build the image:
 
 ```bash
-docker build -t workcell-mcp:local .
+docker build -f workcell/Dockerfile -t workcell-mcp:local .
 ```
 
 The image ships stripped executables. The `diagnostics` stage exports the unstripped server and
@@ -307,7 +311,7 @@ worker from the builder and worker stages the image copies, so with the image's 
 their symbols match the shipped binaries:
 
 ```bash
-docker build --target diagnostics --output target/diagnostics .
+docker build -f workcell/Dockerfile --target diagnostics --output target/diagnostics .
 ```
 
 Generate a bearer token and run a hardened container:
@@ -1032,7 +1036,7 @@ only what it uses:
 
 ```toml
 [dependencies]
-workcell = { git = "https://github.com/tensorninja/workcell-mcp", default-features = false, features = ["files"] }
+workcell = { git = "https://github.com/caudra/caudra", branch = "main", default-features = false, features = ["files"] }
 ```
 
 | Feature | Provides |
@@ -1107,13 +1111,13 @@ traversal reports those entries too, so a host can always discover what a call w
 `allow_write = false` keeps that reach read-only. `ShellToolGroup::new_unconfined` relaxes workdir
 resolution while leaving permission policy fail-closed.
 
-Run `make check-native` to verify every facade feature builds with no MCP adapter linked.
+Run `make -C workcell check-native` to verify every facade feature builds with no MCP adapter linked.
 
 `CodeConfiguration` selects an explicit external worker, a bundled-only worker with a host-provided
 cache root, or discovery. Discovery checks beside the host executable, then the configured bundle,
 then `PATH`. Explicit paths are authoritative and never fall back. Set
 `WORKCELL_BUNDLED_MONTY_WORKER` while compiling `code-bundled` to embed a target-matching worker;
-`make release`, `make release-fast`, and `make install` do this automatically. The standalone
+`make -C workcell release`, `make -C workcell release-fast`, and `make -C workcell install` do this automatically. The standalone
 cache defaults to the platform cache directory and can be overridden with `--code-worker-cache` or
 `WORKCELL_MCP_CODE_WORKER_CACHE`. Configure one explicitly when the platform cache directory cannot be
 determined, and keep it owned by the Workcell process identity rather than sharing it across users.
@@ -1121,28 +1125,30 @@ determined, and keep it owned by the Workcell process identity rather than shari
 ## Development
 
 ```bash
-make
+make -C workcell
 ```
 
-Plain `make` runs the complete local CI pipeline. Run `make help` for focused formatting, checking,
-testing, installation, local execution, and container targets. `make docker-run
+`make -C workcell` runs the Workcell CI pipeline. Run `make -C workcell help` for focused formatting, checking,
+testing, installation, local execution, and container targets. `make -C workcell docker-run
 ROOT=/absolute/workspace` starts the hardened HTTP topology documented above and requires
 `WORKCELL_MCP_HTTP_TOKEN` in the invoking environment.
 
 Release builds trade compile time for size: thin LTO over one codegen unit, with symbols stripped.
-Set `CARGO_PROFILE_RELEASE_STRIP=none` to keep them. `make release-fast` builds
+Set `CARGO_PROFILE_RELEASE_STRIP=none` to keep them. `make -C workcell release-fast` builds
 `target/release-fast/workcell-mcp` at the same optimization level without LTO and with parallel,
 incremental codegen. It is for local iteration rather than distribution: the binary is larger and
 less optimized across crates, and the incremental cache under `target/release-fast` costs extra disk
-space. `make code-worker` publishes a
+space. `make -C workcell code-worker` publishes a
 stripped `target/code-worker/bin/monty`, keeps the unstripped build at
 `target/code-worker/symbols/bin/monty`, and rebuilds both when the helper, toolchain, target, or
 `RUSTFLAGS` change.
 
-The conformance fixtures under `fixtures/mcp-conformance` are committed compatibility contracts for
+The conformance fixtures under `workcell/fixtures/mcp-conformance` are committed compatibility contracts for
 tool schemas and bounded behavior. Update fixtures deliberately when a public tool contract changes.
 
 ## Project Layout
+
+Paths below are relative to `workcell/`. Build outputs live in the repository-root `target/`.
 
 ```text
 src/                   Workcell host, transports, CLI, and process policy

@@ -11,6 +11,8 @@
 
 #![forbid(unsafe_code)]
 
+extern crate monty_types_registry as monty_types;
+
 // Lower-level worker/session helpers remain private so native and MCP calls share lifecycle bounds.
 mod catalog;
 mod diagnose;

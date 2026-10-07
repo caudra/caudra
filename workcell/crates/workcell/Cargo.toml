@@ -2,10 +2,10 @@
 name = "workcell"
 description = "Protocol-neutral typed Workcell tool facade"
 edition.workspace = true
-license.workspace = true
+license = "Apache-2.0"
 repository.workspace = true
 rust-version.workspace = true
-version.workspace = true
+version = "0.1.0"
 
 [features]
 default = []
@@ -31,8 +31,8 @@ workcell-mcp-code-graph = { workspace = true, optional = true }
 workcell-mcp-files = { workspace = true, optional = true }
 workcell-mcp-shell = { workspace = true, optional = true }
 workcell-mcp-web = { workspace = true, optional = true }
-workcell-net = { path = "../net", optional = true }
-workcell-output-filter = { path = "../output-filter", optional = true }
+workcell-net = { workspace = true, optional = true }
+workcell-output-filter = { workspace = true, optional = true }
 workcell-snapshot-store = { workspace = true, optional = true }
 workcell-tool-contract.workspace = true
 workcell-workspace-scm = { workspace = true, optional = true }

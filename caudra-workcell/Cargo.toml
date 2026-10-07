@@ -31,7 +31,7 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
-workcell = { workspace = true }
+workcell = { workspace = true, features = ["files-index", "web", "shell", "code-bundled", "code-graph-git", "environment", "host-contract", "snapshots"] }
 
 [dev-dependencies]
 caudra-workbench = { workspace = true }

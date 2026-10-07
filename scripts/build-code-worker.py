@@ -7,6 +7,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+import tomllib
+
 VERSION = "1.0.0"
 EXPECTED_VERSION = f"monty-runtime {VERSION}"
 ROOT = Path(__file__).resolve().parent.parent
@@ -18,6 +20,16 @@ PROFILE = {
     "CARGO_PROFILE_RELEASE_CODEGEN_UNITS": "1",
     "CARGO_PROFILE_RELEASE_PANIC": "unwind",
 }
+
+
+def validate_version(lockfile: Path) -> None:
+    packages = tomllib.loads(lockfile.read_text())["package"]
+    versions = {p["version"] for p in packages if p["name"] == "monty-pool"}
+    if versions != {VERSION}:
+        raise RuntimeError(
+            f"monty-pool versions {sorted(versions)} do not match worker {VERSION}; "
+            "update the pool and worker together"
+        )
 
 
 def worker_version(worker: Path) -> str | None:
@@ -145,7 +157,12 @@ def main() -> None:
         "--target-dir", type=Path, default=ROOT / "target" / "code-worker-build"
     )
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--check-version", action="store_true")
     args = parser.parse_args()
+    validate_version(ROOT / "Cargo.lock")
+    if args.check_version:
+        print(EXPECTED_VERSION)
+        return
     worker = build(
         args.target, args.root.resolve(), args.target_dir.resolve(), args.force
     )

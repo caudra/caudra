@@ -60,7 +60,8 @@ caudra-agent = { workspace = true, features = ["test-support"] }
 test-case = { workspace = true }
 
 [workspace]
-exclude = ["vendor/crossterm"]
+exclude = ["vendor/crossterm", "workcell/crates/output-filter/evals"]
+default-members = ["."]
 members = [
   "caudra-acp",
   "caudra-agent",
@@ -87,6 +88,25 @@ members = [
   "caudra-workcell",
   "caudra-workspace",
   "caudra-workflow",
+  "workcell",
+  "workcell/crates/code-graph",
+  "workcell/crates/environment",
+  "workcell/crates/mcp-code",
+  "workcell/crates/mcp-code-graph",
+  "workcell/crates/mcp-files",
+  "workcell/crates/mcp-shell",
+  "workcell/crates/mcp-web",
+  "workcell/crates/monty-worker",
+  "workcell/crates/net",
+  "workcell/crates/output-filter",
+  "workcell/crates/snapshot-store",
+  "workcell/crates/source-icons",
+  "workcell/crates/source-languages",
+  "workcell/crates/tool-contract",
+  "workcell/crates/workcell",
+  "workcell/crates/workcell-host-contract",
+  "workcell/crates/workspace-scm",
+  "workcell/crates/workspace-snapshot",
 ]
 resolver = "3"
 
@@ -125,7 +145,24 @@ caudra-workbench = { path = "caudra-workbench" }
 caudra-workcell = { path = "caudra-workcell" }
 caudra-workspace = { path = "caudra-workspace" }
 caudra-workflow = { path = "caudra-workflow" }
-workcell = { git = "https://github.com/tensorninja/workcell-mcp", rev = "fc2ec434eeab061d812ba56f4820487ac1ed9e55", default-features = false, features = ["files-index", "web", "shell", "code-bundled", "code-graph-git", "environment", "host-contract", "snapshots"] }
+workcell = { path = "workcell/crates/workcell", default-features = false }
+workcell-code-graph = { path = "workcell/crates/code-graph", default-features = false }
+workcell-environment = { path = "workcell/crates/environment", default-features = false }
+workcell-host-contract = { path = "workcell/crates/workcell-host-contract" }
+workcell-mcp-code = { path = "workcell/crates/mcp-code", default-features = false }
+workcell-mcp-code-graph = { path = "workcell/crates/mcp-code-graph", default-features = false }
+workcell-mcp-files = { path = "workcell/crates/mcp-files", default-features = false }
+workcell-mcp-shell = { path = "workcell/crates/mcp-shell", default-features = false }
+workcell-mcp-web = { path = "workcell/crates/mcp-web", default-features = false }
+workcell-monty-worker = { path = "workcell/crates/monty-worker" }
+workcell-net = { path = "workcell/crates/net" }
+workcell-output-filter = { path = "workcell/crates/output-filter" }
+workcell-snapshot-store = { path = "workcell/crates/snapshot-store" }
+workcell-source-icons = { path = "workcell/crates/source-icons" }
+workcell-source-languages = { path = "workcell/crates/source-languages" }
+workcell-tool-contract = { path = "workcell/crates/tool-contract" }
+workcell-workspace-scm = { path = "workcell/crates/workspace-scm" }
+workcell-workspace-snapshot = { path = "workcell/crates/workspace-snapshot" }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 rusqlite = { version = "0.40", default-features = false, features = ["backup", "bundled", "cache", "limits"] }
@@ -150,7 +187,7 @@ ignore = "0.4"
 memchr = "2"
 strsim = "0.11"
 strum = { version = "0.28", features = ["derive"] }
-htmd = "0.5"
+htmd = "=0.5.4"
 tempfile = "3"
 regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl"] }
 tiktoken-rs = "0.12"
@@ -254,6 +291,45 @@ tokio-util = "0.7"
 wait-timeout = "0.2"
 inventory = "0.3"
 rhai = { version = "1.26", default-features = false, features = ["std", "serde", "internals", "no_time", "no_module"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
+base64-022 = { package = "base64", version = "0.22.1" }
+bytes = "1.12.1"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+dom_query = { version = "=0.28.0", features = ["markdown", "mini_selector"] }
+dom_smoothie = "=0.18.0"
+dunce = "1.0.5"
+encoding_rs = "0.8.35"
+file-format = { version = "0.29.0", default-features = false }
+futures-util = "0.3.32"
+http = "1.4.2"
+httpdate = "1.0.3"
+lru = "0.18.1"
+monty-pool = "=1.0.0"
+monty-types-registry = { package = "monty-types", version = "=1.0.0" }
+notify-8 = { package = "notify", version = "8.2.0", default-features = false, features = ["macos_kqueue"] }
+pdf_oxide = { version = "0.3.74", default-features = false }
+proptest = "1.11.0"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream"] }
+resvg = { version = "=0.47.0", default-features = false }
+rmcp = { git = "https://github.com/modelcontextprotocol/rust-sdk.git", rev = "9334c97f0d6e177546fc33593148aa3f942cb1f8", default-features = false, features = ["server", "transport-io", "transport-streamable-http-server"] }
+rustix-038 = { package = "rustix", version = "0.38.44", features = ["fs", "process"] }
+schemars = "1.2.1"
+subtle = "2.6.1"
+toml-09 = { package = "toml", version = "0.9.8" }
+tree-sitter-cmake = "0.7.5"
+tree-sitter-cuda = "0.21.2"
+tree-sitter-objc = "3.0.2"
+tree-sitter-proto = "0.6.0"
+tree-sitter-xml = "0.7.0"
+wiremock = "0.6.5"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
 
 [profile.release]
 strip = "symbols"

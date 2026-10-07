@@ -12,6 +12,7 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
+  WORKCELL_REQUIRE_CODE_WORKER: 1
   BINARY_NAME: caudra
   GH_TOKEN: ${{ github.token }}
   GH_REPO: ${{ github.repository }}
@@ -54,6 +55,7 @@ jobs:
             -w /workspace \
             -e CARGO_TERM_COLOR=always \
             -e CARGO_INCREMENTAL=0 \
+            -e WORKCELL_REQUIRE_CODE_WORKER=1 \
             alpine:3.21 sh -c '
               set -eu
               apk add --no-cache gcc g++ musl-dev make perl linux-headers curl git ca-certificates pkgconf python3-dev
@@ -63,7 +65,7 @@ jobs:
               python3 scripts/build-code-worker.py --target ${{ matrix.target }}
               export WORKCELL_BUNDLED_MONTY_WORKER="$PWD/target/code-worker/bin/monty"
               export CARGO_PROFILE_RELEASE_STRIP=none
-              cargo build --locked --release --target ${{ matrix.target }}
+              cargo build --locked --release --package caudra --target ${{ matrix.target }}
               mkdir -p target/release-symbols
               cp target/${{ matrix.target }}/release/caudra target/release-symbols/caudra
               cp target/code-worker/symbols/bin/monty target/release-symbols/monty
@@ -132,7 +134,7 @@ jobs:
           fi
           export WORKCELL_BUNDLED_MONTY_WORKER="$worker"
           export CARGO_PROFILE_RELEASE_STRIP=none
-          cargo build --locked --release --target ${{ matrix.target }}
+          cargo build --locked --release --package caudra --target ${{ matrix.target }}
           mkdir -p target/release-symbols
           cp "$PWD/target/code-worker/symbols/bin/"* target/release-symbols/
           if [[ "${{ runner.os }}" == "Windows" ]]; then

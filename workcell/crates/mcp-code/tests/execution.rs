@@ -4,10 +4,13 @@
 //!
 //! These tests assert the behaviour the tool description promises: the value contract, the isolation
 //! claims, and the failure classification an agent is steered by. They need the worker binary, which
-//! is built separately from the workspace (`make code-worker`), so they skip with an explicit
-//! message when it is absent rather than silently passing.
+//! is built separately from the workspace (`just code-worker`). Local runs may skip without it;
+//! CI sets WORKCELL_REQUIRE_CODE_WORKER so a missing worker fails the suite.
 
-use std::{path::PathBuf, sync::OnceLock};
+use std::{
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
 
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -20,18 +23,32 @@ use workcell_mcp_code::{
 };
 
 /// Resolves the worker the same way the server does, plus the in-repo build location so a developer
-/// who ran `make code-worker` needs no extra configuration.
+/// who ran `just code-worker` needs no extra configuration.
 fn worker() -> Option<PathBuf> {
     static WORKER: OnceLock<Option<PathBuf>> = OnceLock::new();
-    WORKER
+    let worker = WORKER
         .get_or_init(|| {
             if let Some(configured) = std::env::var_os("WORKCELL_MCP_CODE_WORKER") {
                 let configured = PathBuf::from(configured);
-                return usable_worker(&configured).then_some(configured);
+                assert!(
+                    usable_worker(&configured),
+                    "configured monty worker is unusable"
+                );
+                return Some(configured);
             }
-            let installed = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../target/code-worker/bin")
-                .join(WORKER_FILE_NAME);
+            let installed = option_env!("WORKCELL_BUNDLED_MONTY_WORKER")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("../../../target/code-worker/bin")
+                        .join(WORKER_FILE_NAME)
+                });
+            if option_env!("WORKCELL_BUNDLED_MONTY_WORKER").is_some() {
+                assert!(
+                    usable_worker(&installed),
+                    "build-input monty worker is unusable"
+                );
+            }
             if usable_worker(&installed) {
                 return Some(installed);
             }
@@ -48,10 +65,15 @@ fn worker() -> Option<PathBuf> {
                 .map(|directory| directory.join(WORKER_FILE_NAME))
                 .find(|candidate| usable_worker(candidate))
         })
-        .clone()
+        .clone();
+    assert!(
+        worker.is_some() || std::env::var_os("WORKCELL_REQUIRE_CODE_WORKER").is_none(),
+        "required monty worker is missing; run just code-worker"
+    );
+    worker
 }
 
-fn usable_worker(path: &std::path::Path) -> bool {
+fn usable_worker(path: &Path) -> bool {
     let Ok(metadata) = std::fs::metadata(path) else {
         return false;
     };
@@ -170,8 +192,9 @@ async fn preparation_rejects_invalid_limits_before_worker_execution() {
 async fn bundled_worker_executes_without_an_external_path() {
     if !bundled_worker_available() {
         assert!(
-            option_env!("WORKCELL_BUNDLED_MONTY_WORKER").is_none(),
-            "the configured worker was not embedded"
+            option_env!("WORKCELL_BUNDLED_MONTY_WORKER").is_none()
+                && std::env::var_os("WORKCELL_REQUIRE_CODE_WORKER").is_none(),
+            "the required worker was not embedded"
         );
         return;
     }

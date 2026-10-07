@@ -2,22 +2,22 @@
 name = "workcell-environment"
 description = "Protocol-neutral Workcell execution environment inspection"
 edition.workspace = true
-license.workspace = true
+license = "Apache-2.0"
 repository.workspace = true
 rust-version.workspace = true
-version.workspace = true
+version = "0.1.0"
 
 [features]
-default = ["mcp"]
+default = []
 mcp = ["dep:rmcp"]
 
 [dependencies]
 rmcp = { workspace = true, optional = true }
-rustix.workspace = true
+rustix-038.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
-tokio.workspace = true
+sha2 = { workspace = true, default-features = true }
+tokio = { workspace = true, features = ["macros"] }
 tokio-util.workspace = true
 workcell-tool-contract.workspace = true
 

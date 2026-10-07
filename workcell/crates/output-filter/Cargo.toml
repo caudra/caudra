@@ -3,18 +3,18 @@ name = "workcell-output-filter"
 description = "Bounded declarative command-output filtering for Workcell tools"
 readme = "README.md"
 edition.workspace = true
-license.workspace = true
+license = "Apache-2.0"
 repository.workspace = true
 rust-version.workspace = true
-version.workspace = true
+version = "0.1.0"
 
 [dependencies]
-regex.workspace = true
+regex = { workspace = true, default-features = true }
 serde.workspace = true
-toml.workspace = true
+toml-09.workspace = true
 
 [build-dependencies]
-toml.workspace = true
+toml-09.workspace = true
 
 [lints]
 workspace = true
