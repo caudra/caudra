@@ -9,7 +9,7 @@ const { id } = Astro.props;
 ---
 <div class="install-command-block" id={id}>
   <div class="install-command"><span aria-hidden="true">$</span><code data-copy-source>{INSTALL_COMMAND}</code></div>
-  <button class="button primary" type="button" data-copy aria-label="Copy install command" hidden>Copy</button>
+  <button class="button primary" type="button" data-copy data-umami-event={`install:copy-click-${id}`} aria-label="Copy install command" hidden>Copy</button>
   <span class="install-status" role="status" aria-live="polite" data-copy-status></span>
 </div>
 

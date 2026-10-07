@@ -12,6 +12,7 @@ const { story } = Astro.props;
 const titleId = `${story.id}-title`;
 ---
 <section id={story.id} class:list={['story', `tone-${story.tone}`, `layout-${story.layout}`]} aria-labelledby={titleId}>
+  <span class="story-numeral" aria-hidden="true">{story.index}</span>
   <div class="shell story-grid">
     <header class="story-copy">
       <p class="eyebrow story-eyebrow"><span class="story-index">{story.index}</span>{story.eyebrow}</p>
@@ -31,7 +32,7 @@ const titleId = `${story.id}-title`;
       {story.credits && (
         <p class="story-credits">{story.credits.label}{' '}{story.credits.links.map((credit, index) => <>{index > 0 && ' and '}<a href={credit.href}>{credit.name}</a></>)}.</p>
       )}
-      <a class="text-link" href={story.link.href}>{story.link.label} <span aria-hidden="true">↗</span></a>
+      <a class="text-link" href={story.link.href} data-umami-event={`docs:${story.id}`}>{story.link.label} <span aria-hidden="true">↗</span></a>
     </footer>
   </div>
 </section>

@@ -13,8 +13,8 @@ const page = entry.id === 'docs' || entry.id.startsWith('docs/')
 {page && <span id={slugify(page.title)} class="title-anchor" aria-hidden="true" />}
 <DefaultPageTitle />
 {page && <div class="page-actions" data-pagefind-ignore>
-  <button type="button" data-copy-markdown={`${pagePath(page.slug)}index.md`}>Copy page Markdown</button>
-  <a href={`${pagePath(page.slug)}index.md`}>View Markdown</a>
+  <button type="button" data-copy-markdown={`${pagePath(page.slug)}index.md`} data-umami-event="docs:copy-markdown-click">Copy page Markdown</button>
+  <a href={`${pagePath(page.slug)}index.md`} data-umami-event="docs:view-markdown">View Markdown</a>
   <span title="Approximate token count: Unicode characters divided by four">~{estimatedTokens(pageMarkdown(page)).toLocaleString('en-US')} tokens</span>
   <span class="copy-status" role="status" aria-live="polite"></span>
 </div>}

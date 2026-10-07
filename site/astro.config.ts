@@ -28,7 +28,7 @@ export default defineConfig({
         ...navigation.groups.map(({ label, pages }) => ({ label, items: pages.map((slug) => ({ slug: `docs/${slug}` })) })),
       ],
       customCss: ['./src/styles/brand.css', './src/styles/docs.css'],
-      components: { PageTitle: './src/components/PageTitle.astro', MarkdownContent: './src/components/DocsContent.astro' },
+      components: { Head: './src/components/DocsHead.astro', PageTitle: './src/components/PageTitle.astro', MarkdownContent: './src/components/DocsContent.astro' },
       head: [
         { tag: 'link', attrs: { rel: 'manifest', href: '/site.webmanifest' } },
         { tag: 'link', attrs: { rel: 'apple-touch-icon', href: '/apple-touch-icon.png' } },

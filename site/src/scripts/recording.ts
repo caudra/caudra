@@ -41,6 +41,15 @@ class CaudraRecording extends HTMLElement {
     this.addEventListener('click', (event) => {
       const button = (event.target as Element).closest<HTMLButtonElement>('button[data-action], button[data-time]');
       if (!button || button.disabled) return;
+      if (document.querySelector('script[data-umami-script]') && window.umami) {
+        const action = button.dataset.action === 'play' && this.playing ? 'pause' : button.dataset.action ?? 'chapter';
+        try {
+          window.umami.track(`recording:${action}-click`, {
+            recording: this.dataset.recordingId!,
+            ...(button.dataset.time !== undefined ? { time: button.dataset.time } : {}),
+          });
+        } catch {}
+      }
       if (button.dataset.action === 'fullscreen') {
         void this.querySelector<HTMLElement>('.recording-stage')!.requestFullscreen().catch(() => {
           this.status('Fullscreen is unavailable. Scroll the terminal horizontally to inspect it.');

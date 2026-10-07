@@ -8,6 +8,8 @@ runs.csv
 /site/node_modules/
 /site/dist/
 /site/.astro/
+/site/.env
+/site/.env.*
 /site/playwright-report/
 /site/test-results/
 /.playwright-mcp/

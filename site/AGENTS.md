@@ -84,6 +84,7 @@ Fine when genuine: anaphora in scannable checklists ("No prompt text / No model 
 - Lead the homepage with real product workflows and generous typography. Keep docs focused on reading and standard Starlight navigation, search, and themes.
 - Preserve native-width main scrollbars, thin docs sidebars, visible keyboard focus, reduced-motion support, and system-controlled forced colors.
 - Keep original TUI colors in product captures. The website palette does not change the terminal themes.
-- Do not use fake sessions, dummy playback controls, invented metrics, stock AI art, gradients, glass effects, glow fields, or fake terminal title bars. Missing recordings remain an explicit asset dependency.
+- Do not use fake sessions, dummy playback controls, invented metrics, stock AI art, gradients, glass effects, glow fields, or fake terminal title bars. The one exception is the single cobalt light behind the hero clip. Missing recordings remain an explicit asset dependency.
 - Record, check, and publish terminal footage as `RECORDINGS.md` describes. Until a reviewed recording exists, its slot shows a small static diagram captioned "Illustration". Diagrams show order or structure, never invented output, timing, or interface chrome.
 - Use flat surfaces, purposeful borders, and small opacity or transform transitions. Do not hide essential content behind animation or playback.
+- Homepage scroll motion lives in `src/styles/motion.css` and follows the rules in `DESIGN.md` under "Scroll motion". `tests/browser/motion.spec.ts` enforces them.

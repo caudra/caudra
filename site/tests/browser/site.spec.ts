@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test';
+import { expect, test, isAnalyticsRequest } from './fixtures';
 import { HEADLINE, METHOD_NOTE } from '../../src/data/home';
 import { COPY_STATUS, INSTALL_COMMAND } from '../../src/data/install';
 
@@ -12,7 +12,7 @@ test('homepage, responsive docs, deep links and copy stay local', async ({ page,
   const external: string[] = [];
   const errors: string[] = [];
   page.on('pageerror', (error) => errors.push(error.message));
-  page.on('request', (request) => { if (!request.url().startsWith(baseURL!) && !request.url().startsWith('data:')) external.push(request.url()); });
+  page.on('request', (request) => { if (!request.url().startsWith(baseURL!) && !request.url().startsWith('data:') && !isAnalyticsRequest(request.url(), baseURL!)) external.push(request.url()); });
   await page.goto('/');
   await expect(page.locator('html')).toHaveCSS('scrollbar-width', 'auto');
   await expect(page.locator('html')).toHaveCSS('scrollbar-color', SCROLLBAR_COLORS.dark);
@@ -78,7 +78,7 @@ test('Starlight search, theme, mobile navigation and diagrams work', async ({ pa
   const external: string[] = [];
   const errors: string[] = [];
   page.on('pageerror', (error) => errors.push(error.message));
-  page.on('request', (request) => { if (!request.url().startsWith(baseURL!) && !request.url().startsWith('data:')) external.push(request.url()); });
+  page.on('request', (request) => { if (!request.url().startsWith(baseURL!) && !request.url().startsWith('data:') && !isAnalyticsRequest(request.url(), baseURL!)) external.push(request.url()); });
   await page.goto('/docs/');
   await page.getByRole('button', { name: /Search/ }).click();
   await page.getByRole('textbox', { name: 'Search', exact: true }).fill('permissions');

@@ -18,7 +18,7 @@ description: "Every TOML config file in full, with each key commented out and de
 # brackets, such as <string>, marks a setting that has no default. The global
 # file is ~/.config/caudra/caudra.toml, or %APPDATA%\caudra\caudra.toml on
 # Windows. A project .caudra/caudra.toml takes the same settings, except
-# [experimental] and the ones marked global-only.
+# [experimental], [automations], and the ones marked global-only.
 #
 # caudra.toml holds the settings only you write. Other files hold what Caudra
 # writes itself, or what needs rules of its own: permissions.toml (permission
@@ -84,6 +84,10 @@ version = 1
 # Turn on cross-session messages.
 # Type: bool.
 # cross_session_messaging = false
+
+# Turn on automations.
+# Type: bool.
+# automations = false
 
 [ui]
 
@@ -237,7 +241,7 @@ version = 1
 # Type: usize, at least 1.
 # web = 3
 
-# Rows for `batch`, `execution_environment`, `list_sessions`,
+# Rows for `automation`, `batch`, `execution_environment`, `list_sessions`,
 # `publish_message`, `question`, `read_topic`, `send_message`, `skill`,
 # `todo_write`, `tool_output`, `view_image`, `work_assignment`, `workflow`.
 # Type: usize, at least 1.
@@ -1019,6 +1023,25 @@ version = 1
 # Type: float. Default: unset.
 # shell_writes = <float>
 
+[automations]
+# Limits for automations, which need `automations = true` under [experimental].
+# Only the global caudra.toml may hold this table.
+
+# Most turns automations may start in one session per rolling hour, shared by
+# all of its automations.
+# Type: u32, 1 to 600.
+# turns_per_hour = 20
+
+# Stop automation-started turns after this many since the last human input.
+# Human input resets the count, and unset means no cap.
+# Type: u32, 1 to 10000. Default: unset.
+# max_unattended_turns = <u32>
+
+# Let `http()` in automations reach loopback and private network hosts. Without
+# it, automations reach public hosts only.
+# Type: bool.
+# allow_private_network = false
+
 [plugins]
 # Bundled tools are on by default. Turn one off with `enabled = false` in its
 # own table, such as [plugins.websearch]. Names: bash, batch, edit, glob, grep,
@@ -1042,6 +1065,11 @@ version = 1
 # workflows. Needs `experimental.workflows`.
 # Type: boolean.
 # workflow_dev = true
+
+# Offer the builtin caudra-automation-dev skill for writing automations. Needs
+# `experimental.automations`.
+# Type: boolean.
+# automation_dev = true
 
 # Offer the builtin caudra-docs skill: this build's user documentation, loaded
 # one page or section at a time.

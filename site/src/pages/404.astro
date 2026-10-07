@@ -7,12 +7,12 @@ import '../styles/brand.css';
   <head><SiteHead title="Page not found | Caudra" description="This page does not exist. Return to Caudra or browse the documentation." noindex /></head>
   <body>
     <a class="skip-link" href="#main">Skip to content</a>
-    <header><nav aria-label="Primary"><a class="brand" href="/"><img src="/caudra-mark.svg" width="40" height="40" alt="" />caudra</a><a href="/docs/">Docs</a></nav></header>
+    <header><nav aria-label="Primary"><a class="brand" href="/" data-umami-event="404:nav-home"><img src="/caudra-mark.svg" width="40" height="40" alt="" />caudra</a><a href="/docs/" data-umami-event="404:nav-docs">Docs</a></nav></header>
     <main id="main" tabindex="-1">
       <p class="eyebrow">404 / Route not found</p>
       <h1>Nothing at this address.</h1>
       <p>This page does not exist. Check the address or find your next step in the documentation.</p>
-      <div class="actions"><a class="primary" href="/docs/">Browse docs <span aria-hidden="true">↗</span></a><a href="/">Return home <span aria-hidden="true">↗</span></a></div>
+      <div class="actions"><a class="primary" href="/docs/" data-umami-event="404:docs">Browse docs <span aria-hidden="true">↗</span></a><a href="/" data-umami-event="404:home">Return home <span aria-hidden="true">↗</span></a></div>
     </main>
   </body>
 </html>

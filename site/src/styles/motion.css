@@ -1,0 +1,70 @@
+@keyframes depth-progress { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+@keyframes depth-reveal { from { opacity: 0; transform: translateY(1.5rem); } to { opacity: 1; transform: none; } }
+@keyframes depth-headline { to { opacity: .2; transform: scale(.86); } }
+@keyframes depth-headline-line { to { transform: translateY(var(--drift)); } }
+@keyframes depth-mark { to { transform: translateY(35vh); } }
+@keyframes depth-tilt { from { transform: rotateX(14deg) scale(.92); } to { transform: none; } }
+@keyframes depth-light { from { opacity: .25; } to { opacity: 1; } }
+@keyframes depth-numeral { from { transform: translateY(12rem); } to { transform: translateY(-12rem); } }
+@keyframes depth-rise { from { translate: 0 2rem; } to { translate: 0 -2rem; } }
+@keyframes depth-sink { from { translate: 0 -2rem; } to { translate: 0 2rem; } }
+@keyframes depth-step { from { color: var(--text-muted); } to { color: var(--text); } }
+@keyframes depth-rail { from { transform: scaleY(0); } to { transform: scaleY(1); } }
+@keyframes depth-wipe { from { clip-path: polygon(0 0, 100% 0, 100% 100%, 0 0); } to { clip-path: polygon(0 0, 100% 0, 100% 0, 0 0); } }
+@keyframes depth-wordmark { from { transform: translateY(35%); } to { transform: none; } }
+
+@media screen and (prefers-reduced-motion: no-preference) {
+  @supports (animation-timeline: view()) {
+    main > section { view-timeline: --section; }
+
+    .site-nav::after { content: ''; position: absolute; inset: auto 0 -1px; height: 2px; background: var(--accent); transform-origin: left; pointer-events: none; animation-name: depth-progress; animation-timing-function: linear; animation-fill-mode: both; animation-timeline: scroll(root); }
+
+    :is(.proof-list li, .story-points li, .job-list > div, .capability-group, .experiment-list li, .privacy-list li, .storage-compare > div) { animation-name: depth-reveal; animation-timing-function: linear; animation-fill-mode: both; animation-timeline: view(); animation-range: entry 0% entry 70%; }
+    :is(.proof-list li, .story-points li, .job-list > div, .experiment-list li, .privacy-list li, .storage-compare > div):nth-child(2) { animation-range: entry 8% entry 78%; }
+    :is(.proof-list li, .story-points li, .job-list > div, .experiment-list li, .privacy-list li):nth-child(3) { animation-range: entry 16% entry 86%; }
+    :is(.proof-list li, .story-points li, .job-list > div, .experiment-list li, .privacy-list li):nth-child(4) { animation-range: entry 24% entry 94%; }
+
+    .hero-stage { position: relative; }
+    .hero-stage::before { content: ''; position: absolute; z-index: -1; inset: -8% -6%; background: radial-gradient(closest-side, rgb(49 91 255 / .35), transparent); pointer-events: none; }
+
+    @media (min-width: 761px) {
+      .hero h1 { transform-origin: left top; animation-name: depth-headline; animation-timing-function: linear; animation-fill-mode: both; animation-timeline: scroll(root); animation-range: 0 70vh; }
+      .hero-line { display: inline-block; animation-name: depth-headline-line; animation-timing-function: linear; animation-fill-mode: both; animation-timeline: scroll(root); animation-range: 0 70vh; }
+      .hero-line:nth-of-type(1) { --drift: -3rem; }
+      .hero-line:nth-of-type(2) { --drift: -2rem; }
+      .hero-line:nth-of-type(3) { --drift: -1rem; }
+      .hero-mark { animation-name: depth-mark; animation-timing-function: linear; animation-fill-mode: both; animation-timeline: scroll(root); animation-range: 0 100vh; }
+      .hero-stage { view-timeline: --stage; perspective: 1600px; }
+      .hero-stage > * { transform-origin: center bottom; animation-name: depth-tilt; animation-timing-function: linear; animation-fill-mode: both; animation-timeline: --stage; animation-range: entry 0% entry 100%; }
+      .hero-stage::before { animation-name: depth-light; animation-timing-function: linear; animation-fill-mode: both; animation-timeline: --stage; animation-range: entry 0% entry 100%; }
+
+      .story-numeral { animation-name: depth-numeral; animation-timing-function: linear; animation-fill-mode: both; animation-timeline: --section; animation-range: cover; }
+
+      .tone-light + section { --prev-surface: var(--paper); }
+      .tone-mist + section { --prev-surface: var(--mist); }
+      .tone-dark + section { --prev-surface: var(--ink); }
+      .tone-signal + section { --prev-surface: var(--signal-deep); }
+      main > section + section { position: relative; }
+      main > section + section::before { content: ''; position: absolute; inset: 0 0 auto; height: clamp(2rem, 5vw, 3.5rem); background: var(--prev-surface); pointer-events: none; animation-name: depth-wipe; animation-timing-function: linear; animation-fill-mode: both; animation-timeline: --section; animation-range: entry 0% entry 100%; }
+
+      .footer-wordmark { animation-name: depth-wordmark; animation-timing-function: linear; animation-fill-mode: both; animation-timeline: view(); animation-range: entry 0% entry 80%; }
+    }
+
+    @media (min-width: 1101px) {
+      :is(.layout-split, .layout-split-reverse) .story-copy { animation-name: depth-rise; animation-timing-function: linear; animation-fill-mode: both; animation-timeline: --section; animation-range: cover; }
+      :is(.layout-split, .layout-split-reverse) .story-stage { animation-name: depth-sink; animation-timing-function: linear; animation-fill-mode: both; animation-timeline: --section; animation-range: cover; }
+    }
+
+    @media (min-width: 1101px) and (min-height: 700px) {
+      .name-grid { min-block-size: 140vh; align-items: start; }
+      .name-loop { position: sticky; top: calc(76px + 2rem); }
+      .name-loop ol { position: relative; border-left-color: var(--line); }
+      .name-loop ol::before { content: ''; position: absolute; inset: 0 auto 0 -2px; width: 2px; background: var(--accent); transform-origin: top; animation-name: depth-rail; animation-timing-function: linear; animation-fill-mode: both; animation-timeline: --section; animation-range: contain 0% contain 100%; }
+      .name-loop li { animation-name: depth-step; animation-timing-function: linear; animation-fill-mode: both; animation-timeline: --section; animation-range: contain 0% contain 20%; }
+      .name-loop li:nth-child(2) { animation-range: contain 20% contain 40%; }
+      .name-loop li:nth-child(3) { animation-range: contain 40% contain 60%; }
+      .name-loop li:nth-child(4) { animation-range: contain 60% contain 80%; }
+      .name-loop li:nth-child(5) { animation-range: contain 80% contain 100%; }
+    }
+  }
+}

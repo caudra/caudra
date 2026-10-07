@@ -111,7 +111,7 @@ inside product recordings unchanged.
 
 - display serifs and full-page monospace marketing typography
 - competing identity palettes
-- gradients, glass effects, star fields, glows, and decorative washes
+- gradients, glass effects, star fields, glows, and decorative washes, apart from the single cobalt light behind the hero clip
 - mascots, food imagery, brains, neural networks, and generic AI symbols
 - hover lifts, pill badges, rounded marketing cards, and fake terminal title bars
 - shadows outside the search modal and mobile navigation
@@ -133,6 +133,30 @@ that a recording duration measures performance.
 The proof strip shows the maintainer's own measurements from daily use. Each
 figure stays attributed where it appears and links to the method note. They are
 observations, not general benchmarks.
+
+## Scroll motion
+
+The homepage gains depth from CSS scroll-driven animations in
+`src/styles/motion.css`. There is no script and no motion library, and the page
+never takes over scrolling.
+
+- Every rule sits inside `screen`, `prefers-reduced-motion: no-preference`, and
+  `@supports (animation-timeline: view())`. Other visitors see the static page.
+- Animate `transform`, `translate`, `scale`, `rotate`, `opacity`, or
+  `clip-path`. The name loop steps may also animate `color`, from the muted text
+  color to the full one.
+- Name keyframes with the `depth-` prefix. The browser test checks every
+  `depth-` animation for its timeline and properties.
+- Below 761px, keep the entry reveals, the progress line, and the static hero
+  light. Layered parallax, the tilt, and the wipes start at 761px. The name
+  loop pins only in windows at least 1101px wide and taller than 700px.
+- Text stays legible at every scroll position. Reveals start at the viewport
+  edge and finish while the item is still entering.
+- Decorative layers are `aria-hidden`, ignore the pointer, sit behind content,
+  and disappear in forced colors.
+- Clip decorative overflow with `overflow: clip`. An ancestor with `overflow:
+  hidden` or `auto` becomes the scroll container that `view()` measures, which
+  freezes the animation.
 
 ## Performance
 

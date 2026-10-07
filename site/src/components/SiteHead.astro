@@ -1,4 +1,5 @@
 ---
+import Analytics from './Analytics.astro';
 import { SITE } from '../data/docs';
 import { SOCIAL_CARD_ALT } from '../data/home';
 
@@ -31,3 +32,4 @@ const canonical = new URL(Astro.url.pathname, SITE);
 <meta name="twitter:title" content={title} />
 <meta name="twitter:description" content={description} />
 <meta name="twitter:image" content={`${SITE}/social-card.png`} />
+<Analytics />

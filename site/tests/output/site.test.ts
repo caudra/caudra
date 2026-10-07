@@ -22,6 +22,9 @@ const TOOLS_STORY = 'tools';
 const WORKCELL = 'Workcell';
 const UNVERIFIED_TOOL_CLAIMS = /PageRank|personali[sz]ed|microsecond/i;
 const SANDBOX = /sandbox/i;
+const UMAMI_SCRIPT_URL = process.env.VITE_UMAMI_SCRIPT_URL?.trim() ?? '';
+const UMAMI_WEBSITE_ID = process.env.VITE_UMAMI_WEBSITE_ID?.trim() ?? '';
+const ANALYTICS_ENABLED = Boolean(UMAMI_SCRIPT_URL && UMAMI_WEBSITE_ID);
 const dist = new URL('../../dist/', import.meta.url);
 const { pages, navigation } = await readDocs();
 const renderer = await createMarkdownProcessor({ smartypants: false, remarkPlugins: [compatibility], syntaxHighlight: false });
@@ -32,6 +35,12 @@ const documents = new Map(await Promise.all(['/', '/404.html', ...pages.map((pag
 
 function homeText($: CheerioAPI, selector: string) {
   return $(selector).text().replace(/\s+/g, ' ').trim();
+}
+
+function configuredTracker($: CheerioAPI) {
+  return $('script[data-umami-script][defer]').filter((_, node) => ANALYTICS_ENABLED
+    && $(node).attr('src') === UMAMI_SCRIPT_URL
+    && $(node).attr('data-website-id') === UMAMI_WEBSITE_ID);
 }
 
 function nativeAddresses(markdown: string) {
@@ -58,6 +67,42 @@ function nativeAddresses(markdown: string) {
   return addresses;
 }
 
+test('analytics is emitted exactly once on every page only with complete configuration', () => {
+  const count = ANALYTICS_ENABLED ? 1 : 0;
+  for (const [path, $] of documents) {
+    expect($('script[data-umami-script], script[data-website-id]').length, path).toBe(count);
+    expect(configuredTracker($).length, `${path}: configured deferred tracker`).toBe(count);
+    if (UMAMI_SCRIPT_URL) {
+      expect($('script[src]').filter((_, node) => $(node).attr('src') === UMAMI_SCRIPT_URL).length, `${path}: tracker source`).toBe(count);
+    }
+    if (ANALYTICS_ENABLED) {
+      expect(configuredTracker($).attr('data-exclude-hash'), path).toBe('true');
+      expect(configuredTracker($).attr('async'), path).toBeUndefined();
+      expect(configuredTracker($).attr('type'), path).toBeUndefined();
+      expect(configuredTracker($).text(), path).toBe('');
+    }
+  }
+});
+
+test('key actions retain their declarative analytics events', () => {
+  const $ = documents.get('/')!;
+  for (const id of ['hero-install', 'install-command']) {
+    expect($(`#${id} [data-copy]`).attr('data-umami-event')).toBe(`install:copy-click-${id}`);
+  }
+  for (const [href, event] of [['/docs/', 'nav:docs'], ['https://github.com/caudra/caudra', 'nav:github'], ['#install', 'nav:install']]) {
+    expect($(`nav a[href="${href}"]`).attr('data-umami-event')).toBe(event);
+  }
+  for (const page of pages) {
+    const path = pagePath(page.slug);
+    const doc = documents.get(path)!;
+    expect(doc('[data-copy-markdown]').attr('data-umami-event'), path).toBe('docs:copy-markdown-click');
+    expect(doc(`.page-actions a[href="${path}index.md"]`).attr('data-umami-event'), path).toBe('docs:view-markdown');
+  }
+  const missing = documents.get('/404.html')!;
+  expect(missing('.actions a[href="/"]').attr('data-umami-event')).toBe('404:home');
+  expect(missing('.actions a[href="/docs/"]').attr('data-umami-event')).toBe('404:docs');
+});
+
 test('every canonical document has one title, description, canonical, source copy and native section addresses', async () => {
   for (const page of pages) {
     const path = pagePath(page.slug);
@@ -82,7 +127,9 @@ test('every canonical document has one title, description, canonical, source cop
 test('all internal HTML, asset, download and fragment links resolve', async () => {
   const checked = new Set<string>();
   for (const [path, $] of documents) {
+    const tracker = configuredTracker($);
     for (const element of $('[href], [src]').toArray()) {
+      if (tracker.is(element)) continue;
       const destination = $(element).attr('href') ?? $(element).attr('src')!;
       const url = new URL(destination, `${SITE}${path}`);
       if (url.origin !== SITE || checked.has(url.href)) continue;
@@ -123,9 +170,11 @@ test('installers and examples are byte-for-byte copies, with search and SEO outp
   expect(sitemap).not.toContain('/404');
 });
 
-test('runtime assets are self-hosted and source art is not deployed', async () => {
+test('runtime assets are self-hosted except the configured tracker and source art is not deployed', async () => {
   for (const [path, $] of documents) {
+    const tracker = configuredTracker($);
     for (const node of $('script[src], img[src], link[rel="stylesheet"], link[rel="preload"], link[rel="modulepreload"]').toArray()) {
+      if (tracker.is(node)) continue;
       const source = $(node).attr('src') ?? $(node).attr('href')!;
       expect(new URL(source, SITE).origin, `${path}: ${source}`).toBe(SITE);
     }
@@ -195,9 +244,23 @@ test('homepage has an honest product story, working destinations, and a small en
   const ids = $('[id]').map((_, node) => $(node).attr('id')).get();
   expect(new Set(ids).size).toBe(ids.length);
   let initialBytes = 0;
+  const tracker = configuredTracker($);
   for (const script of $('script[src]').toArray()) {
+    if (tracker.is(script)) continue;
     const path = $(script).attr('src')!;
     initialBytes += gzipSync(await readFile(new URL(`.${path}`, dist))).length;
   }
   expect(initialBytes).toBeLessThan(25 * 1024);
+});
+
+test('homepage depth layers are decorative and hidden from assistive technology', () => {
+  const $ = documents.get('/')!;
+  for (const story of stories) {
+    const numeral = $(`#${story.id} > .story-numeral`);
+    expect(numeral.length, `#${story.id}`).toBe(1);
+    expect(numeral.attr('aria-hidden')).toBe('true');
+    expect(numeral.text()).toBe(story.index);
+  }
+  expect($('#hero > .hero-mark[aria-hidden="true"]').length).toBe(1);
+  expect($('.hero-line').map((_, node) => $(node).text()).get().join(' ').replace(/\s+/g, ' ')).toBe(HEADLINE);
 });

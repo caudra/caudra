@@ -15,7 +15,7 @@ const captionId = `recording-${id}-caption`;
 
 <figure class="recording" id={`recording-${id}`} data-label={label} aria-labelledby={captionId}>
   {recording ? (
-    <caudra-recording data-recording={JSON.stringify(recording)}>
+    <caudra-recording data-recording-id={id} data-recording={JSON.stringify(recording)}>
       <div class="recording-stage" style={`--recording-ratio: ${recording.poster.width} / ${recording.poster.height}`}>
         <img class="recording-poster" src={recording.poster.src} alt={recording.poster.alt} width={recording.poster.width} height={recording.poster.height} loading="lazy" decoding="async" />
         <div class="recording-viewport" hidden tabindex="0" role="region" aria-label={`${recording.title} terminal recording. Scroll horizontally to inspect the terminal.`}>

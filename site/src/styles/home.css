@@ -51,7 +51,11 @@ h3 { margin: 0; font-size: 1.2rem; font-weight: 500; letter-spacing: -.03em; lin
 .nav-install { padding: .5rem 1rem; border: 1px solid var(--line-strong); font-size: .85rem; text-decoration: none; }
 .nav-install span { margin-left: .8rem; color: var(--accent); }
 
-.hero { padding-block: clamp(3rem, 7vw, 5.5rem) clamp(3.5rem, 7vw, 6rem); }
+.hero { position: relative; isolation: isolate; overflow: clip; padding-block: clamp(3rem, 7vw, 5.5rem) clamp(3.5rem, 7vw, 6rem); }
+.hero-mark { position: absolute; z-index: -1; top: clamp(2rem, 6vw, 5rem); right: -6vw; width: min(46vw, 40rem); fill: none; pointer-events: none; }
+.hero-mark-band path { stroke: var(--border-dark); stroke-width: 12; }
+.hero-mark-band .hero-mark-route { stroke: var(--signal-night); }
+.hero-mark-core path { stroke: var(--surface); stroke-width: 11; }
 .hero-eyebrow { display: flex; align-items: center; gap: .8rem; margin-bottom: 2.4rem; color: var(--text); }
 .signal-square { width: .55rem; height: .55rem; background: var(--accent); }
 .hero-grid { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 2.5rem 5rem; align-items: end; margin-block: 2.8rem 3.5rem; }
@@ -142,6 +146,9 @@ h3 { margin: 0; font-size: 1.2rem; font-weight: 500; letter-spacing: -.03em; lin
 .name-loop figcaption { display: flex; gap: .7rem; padding: 1rem 0 0 1.5rem; border-top: 1px solid var(--line); color: var(--text-muted); font: .75rem/1.6 var(--mono); }
 .name-loop figcaption span { color: var(--accent); }
 
+.story { position: relative; isolation: isolate; overflow: clip; }
+.story-numeral { position: absolute; z-index: -1; top: clamp(2rem, 6vw, 5rem); right: -.04em; color: transparent; -webkit-text-stroke: 1px color-mix(in srgb, var(--line) 70%, var(--surface)); font-size: clamp(12rem, 26vw, 24rem); font-weight: 500; letter-spacing: -.08em; line-height: .8; pointer-events: none; user-select: none; }
+.layout-split .story-numeral { right: auto; left: -.04em; }
 .story-grid { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-areas: "copy" "stage" "points" "footer"; gap: 3rem 5rem; }
 .layout-split .story-grid { grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); grid-template-areas: "copy stage" "points points" "footer footer"; }
 .layout-split-reverse .story-grid { grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); grid-template-areas: "stage copy" "points points" "footer footer"; }
@@ -227,7 +234,7 @@ h3 { margin: 0; font-size: 1.2rem; font-weight: 500; letter-spacing: -.03em; lin
 .install p:not(.eyebrow) { color: var(--text-muted); }
 .install-card { min-width: 0; padding: 1.5rem; border: 1px solid var(--line-strong); background: var(--raised); }
 .install-card .install-command-block { background: var(--surface); }
-.site-footer { overflow: hidden; border-top: 1px solid var(--line); }
+.site-footer { overflow: clip; border-top: 1px solid var(--line); }
 .footer-top { display: flex; align-items: center; justify-content: space-between; gap: 2rem; padding-block: 2rem; }
 .footer-top > div { display: flex; flex-wrap: wrap; gap: 1.5rem; color: var(--text-muted); font-size: .8rem; }
 .footer-top a { text-decoration: none; }
@@ -273,4 +280,6 @@ h3 { margin: 0; font-size: 1.2rem; font-weight: 500; letter-spacing: -.03em; lin
   .signal-square, .lane-run, .lane-legend > .legend-run::before { forced-color-adjust: none; background: CanvasText; }
   .clip-tab-list button[aria-pressed='true'] { border: 2px solid Highlight; }
   .primary, .clip-tab-list button { border: 1px solid ButtonText; }
+  .story-numeral, .hero-mark { display: none; }
+  .hero-stage::before, main > section + section::before { content: none; }
 }

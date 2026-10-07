@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, analyticsEnabled, isAnalyticsRequest, type Page } from './fixtures';
 import { heroClip, stories } from '../../src/data/home';
 
 const ILLUSTRATION_LABEL = 'Illustration';
@@ -19,6 +19,7 @@ async function mountRecording(page: Page, id: string) {
     const scopes = document.querySelector('.recording')?.getAttributeNames().filter((name) => name.startsWith('data-astro-cid-')) ?? [];
     const classes = [...document.querySelector('.recording')!.classList].filter((name) => name.startsWith('astro-'));
     const element = document.createElement('caudra-recording');
+    element.dataset.recordingId = id;
     element.dataset.recording = JSON.stringify({
       title: id, summary: 'Test only', src: `/recordings/${id}.cast`,
       poster: { src: '/recordings/test.png', alt: 'Test only', width: 800, height: 400 },
@@ -41,6 +42,22 @@ async function mountRecording(page: Page, id: string) {
   return page.locator(`#${id}`);
 }
 
+async function expectRecordingEvents(page: Page, events: { event: string; data: Record<string, string> }[]) {
+  const expected = analyticsEnabled ? events : [];
+  const recorded = await page.evaluate(() => {
+    const analytics = window as unknown as {
+      analyticsEvents?: string[];
+      analyticsEventData?: { event: string; data: Record<string, string> }[];
+    };
+    return {
+      events: (analytics.analyticsEvents ?? []).filter((event) => event.startsWith('recording:')),
+      data: (analytics.analyticsEventData ?? []).filter(({ event }) => event.startsWith('recording:')),
+    };
+  });
+  expect(recorded.events).toEqual(expected.map(({ event }) => event));
+  expect(recorded.data).toEqual(expected);
+}
+
 test('empty manifest shows honest illustrations without media or play controls', async ({ page, baseURL }) => {
   const requests: string[] = [];
   page.on('request', (request) => requests.push(request.url()));
@@ -52,7 +69,7 @@ test('empty manifest shows honest illustrations without media or play controls',
     await expect(figure.getByRole('button', { name: /play|watch/i })).toHaveCount(0);
   }
   expect(requests.filter((url) => /asciinema|\.cast(?:$|\?)/.test(url))).toEqual([]);
-  expect(requests.filter((url) => !url.startsWith(baseURL!))).toEqual([]);
+  expect(requests.filter((url) => !url.startsWith(baseURL!) && !isAnalyticsRequest(url, baseURL!))).toEqual([]);
 });
 
 test('illustration captions and summaries survive without JavaScript', async ({ browser, baseURL }) => {
@@ -76,6 +93,10 @@ test('explicit keyboard playback loads local v2/v3 casts, chapters, replay and o
   const first = await mountRecording(page, 'first');
   expect(requests.filter((url) => url.endsWith('.cast'))).toEqual([]);
   expect(requests.filter((url) => /asciinema/.test(url))).toEqual([]);
+  for (const button of await first.locator('button:disabled').all()) {
+    await button.dispatchEvent('click');
+  }
+  await expectRecordingEvents(page, []);
   await first.getByRole('button', { name: 'Play recording', exact: true }).focus();
   await page.keyboard.press('Enter');
   await expect(first.getByRole('button', { name: 'Pause recording', exact: true })).toBeVisible();
@@ -93,7 +114,15 @@ test('explicit keyboard playback loads local v2/v3 casts, chapters, replay and o
   await expect(first.locator('.ap-wrapper')).toHaveCount(0);
   await expect(page.locator('.ap-wrapper')).toHaveCount(1);
   expect(requests.filter((url) => url.endsWith('.cast'))).toHaveLength(2);
-  expect(requests.filter((url) => !url.startsWith(baseURL!) && !url.startsWith('data:'))).toEqual([]);
+  expect(requests.filter((url) => !url.startsWith(baseURL!) && !url.startsWith('data:') && !isAnalyticsRequest(url, baseURL!))).toEqual([]);
+  await expectRecordingEvents(page, [
+    { event: 'recording:play-click', data: { recording: 'first' } },
+    { event: 'recording:chapter-click', data: { recording: 'first', time: '20' } },
+    { event: 'recording:replay-click', data: { recording: 'first' } },
+    { event: 'recording:pause-click', data: { recording: 'first' } },
+    { event: 'recording:play-click', data: { recording: 'first' } },
+    { event: 'recording:play-click', data: { recording: 'second' } },
+  ]);
 });
 
 test('offscreen and hidden playback pauses without auto-resume and disconnect releases resources', async ({ page }) => {
@@ -127,6 +156,9 @@ test('offscreen and hidden playback pauses without auto-resume and disconnect re
   await recording.getByRole('button', { name: 'Play recording', exact: true }).click();
   await expect(recording.getByRole('button', { name: 'Pause recording', exact: true })).toBeVisible();
   await expect(recording.locator('.ap-wrapper')).toHaveCount(1);
+  await expectRecordingEvents(page, Array.from({ length: 3 }, () => ({
+    event: 'recording:play-click', data: { recording: 'lifecycle' },
+  })));
 });
 
 test('load and parse errors restore a useful poster and allow retry', async ({ page }) => {
@@ -142,6 +174,24 @@ test('load and parse errors restore a useful poster and allow retry', async ({ p
   await expect(recording.getByRole('button', { name: 'Pause recording', exact: true })).toBeVisible();
 });
 
+for (const unavailable of ['script', 'global', 'throwing'] as const) {
+  test(`playback works with ${unavailable} analytics unavailable`, async ({ page }) => {
+    await page.route('**/recordings/*.cast', (route) => route.fulfill({ contentType: 'text/plain', body: CAST_V2 }));
+    await page.goto('/');
+    await page.evaluate((unavailable) => {
+      if (unavailable === 'script') document.querySelector('script[data-umami-script]')?.remove();
+      else if (unavailable === 'global') delete window.umami;
+      else window.umami = { track: () => { throw new Error('Analytics unavailable'); } };
+    }, unavailable);
+    const recording = await mountRecording(page, 'untracked');
+    await recording.getByRole('button', { name: 'Play recording', exact: true }).click();
+    await expect(recording.getByRole('button', { name: 'Pause recording', exact: true })).toBeVisible();
+    await recording.getByRole('button', { name: 'Pause recording', exact: true }).click();
+    await expect(recording.getByRole('button', { name: 'Play recording', exact: true })).toBeVisible();
+    await expectRecordingEvents(page, []);
+  });
+}
+
 test('fullscreen is keyboard accessible and playback remains opt-in with reduced motion', async ({ page }) => {
   await page.emulateMedia({ reducedMotion: 'reduce' });
   await page.route('**/recordings/*.cast', (route) => route.fulfill({ contentType: 'text/plain', body: CAST_V2 }));
@@ -151,7 +201,8 @@ test('fullscreen is keyboard accessible and playback remains opt-in with reduced
   await recording.getByRole('button', { name: 'Play recording', exact: true }).click();
   await expect(recording.getByRole('button', { name: 'Pause recording', exact: true })).toBeVisible();
   const fullscreen = recording.getByRole('button', { name: 'Fullscreen', exact: true });
-  if (await page.evaluate(() => document.fullscreenEnabled)) {
+  const fullscreenEnabled = await page.evaluate(() => document.fullscreenEnabled);
+  if (fullscreenEnabled) {
     await fullscreen.focus();
     await page.keyboard.press('Enter');
     await expect.poll(() => page.evaluate(() => document.fullscreenElement?.classList.contains('recording-stage'))).toBe(true);
@@ -163,6 +214,11 @@ test('fullscreen is keyboard accessible and playback remains opt-in with reduced
   await recording.getByRole('button', { name: 'Pause recording', exact: true }).focus();
   await page.keyboard.press('Enter');
   await expect(recording.getByRole('button', { name: 'Play recording', exact: true })).toBeFocused();
+  await expectRecordingEvents(page, [
+    { event: 'recording:play-click', data: { recording: 'accessible' } },
+    ...(fullscreenEnabled ? [{ event: 'recording:fullscreen-click', data: { recording: 'accessible' } }] : []),
+    { event: 'recording:pause-click', data: { recording: 'accessible' } },
+  ]);
 });
 
 test('a pending fetch cannot resume a recording hidden during loading', async ({ page }) => {
@@ -177,6 +233,8 @@ test('a pending fetch cannot resume a recording hidden during loading', async ({
   const request = page.waitForRequest('**/recordings/pending.cast');
   await recording.getByRole('button', { name: 'Play recording', exact: true }).click();
   await request;
+  await expect(recording.locator('[data-action="play"]')).toBeDisabled();
+  await recording.locator('[data-action="play"]').dispatchEvent('click');
   await page.evaluate(() => {
     Object.defineProperty(document, 'hidden', { configurable: true, value: true });
     document.dispatchEvent(new Event('visibilitychange'));
@@ -185,6 +243,9 @@ test('a pending fetch cannot resume a recording hidden during loading', async ({
   await expect(recording.locator('[data-action="play"]')).toBeEnabled();
   await expect(recording.locator('[data-action="play"]')).toHaveText('Play recording');
   await expect(recording.locator('.ap-playback-button')).toHaveAttribute('aria-label', 'Play');
+  await expectRecordingEvents(page, [
+    { event: 'recording:play-click', data: { recording: 'pending' } },
+  ]);
 });
 
 test('stylesheet failure restores the poster and retry shares one loaded stylesheet', async ({ page }) => {
