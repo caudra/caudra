@@ -4,6 +4,7 @@ description = "Agent runtime, tool orchestration, and session logic for Caudra."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+license.workspace = true
 
 [features]
 test-support = []

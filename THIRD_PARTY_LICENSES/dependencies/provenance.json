@@ -1,0 +1,1120 @@
+{
+  "schema_version": 1,
+  "path_base": "repository_root",
+  "scope": "Only explicitly requested missing-license package families. Packages are pinned by root Cargo.lock, except worker packages with a separate lockfile_evidence record. This collection does not select dependencies for any build target or assert complete distribution compliance.",
+  "verification": "Cached .crate SHA-256 values match the applicable lockfile. Cached Cargo.toml, Cargo.toml.orig and .cargo_vcs_info.json match the archives. Original package manifests match the reported revision Git blobs, allowing only the recorded CRLF difference. Upstream license files match their Git blob hashes. Official linked license terms and source notice excerpts are identified separately, with any text extraction recorded.",
+  "files": [
+    {
+      "path": "THIRD_PARTY_LICENSES/Monty.txt",
+      "kind": "license",
+      "sha256": "5841db47ee6e1f0becafe2d19ca43c08cbc6d2c0952822ccf88cbbf2bd0749bd",
+      "repository": "https://github.com/pydantic/monty",
+      "revision": "85c5d1f6bef038405cfc40a4eed94806e303567e",
+      "upstream_path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/pydantic/monty/85c5d1f6bef038405cfc40a4eed94806e303567e/LICENSE",
+      "git_blob_sha1": "d30ac52dc1727d9b88cc1ce816a70ca66dc5df31"
+    },
+    {
+      "path": "THIRD_PARTY_LICENSES/dependencies/agent-client-protocol-schema-1.7.0/LICENSE",
+      "kind": "license",
+      "sha256": "f250d08cee4549b22b3b4aaaf3a743473336fd280316df5d0340717e5127a221",
+      "repository": "https://github.com/agentclientprotocol/agent-client-protocol",
+      "revision": "272bf799f35a258c6a4107a0410ed361e83683d3",
+      "upstream_path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/agentclientprotocol/agent-client-protocol/272bf799f35a258c6a4107a0410ed361e83683d3/LICENSE",
+      "git_blob_sha1": "1de02305f81f6dc087b6229a1d86a31774d2fa31"
+    },
+    {
+      "path": "THIRD_PARTY_LICENSES/dependencies/include_dir-0.7.4/LICENSE",
+      "kind": "license",
+      "sha256": "9369f62987b3a116111f2edfdc4cc72633e44ddc94d5d0c68659cf537b76a31f",
+      "repository": "https://github.com/Michael-F-Bryan/include_dir",
+      "revision": "d742c6fffce99ee89da91b934e7ce6fb2a82680c",
+      "upstream_path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/Michael-F-Bryan/include_dir/d742c6fffce99ee89da91b934e7ce6fb2a82680c/LICENSE",
+      "git_blob_sha1": "be6d221e1d05e22a3daf07e3d073f4d55c88e7af"
+    },
+    {
+      "path": "THIRD_PARTY_LICENSES/dependencies/mlua-sys-0.12.0/LICENSE",
+      "kind": "license",
+      "sha256": "63b61a30d3e3abcfcb1bda4b99f4eea9fdb7d6ab05fbc513461fef6cf89baf29",
+      "repository": "https://github.com/mlua-rs/mlua",
+      "revision": "4fd87af2157b0a7ecd22ba299848e4ca3d462efe",
+      "upstream_path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/mlua-rs/mlua/4fd87af2157b0a7ecd22ba299848e4ca3d462efe/LICENSE",
+      "git_blob_sha1": "66f2fa32dff88afeceb8d5f9e3093f6b9b604f98"
+    },
+    {
+      "path": "THIRD_PARTY_LICENSES/dependencies/monty-typeshed-1.0.0/LICENSE-typeshed",
+      "kind": "embedded_component_license",
+      "sha256": "295f8538c94ae5c3043301cf7cff1c852dab6a786a8ddee471e061b40d5ecabe",
+      "repository": "https://github.com/python/typeshed",
+      "revision": "0e16ea31d2e188fdc126cb31e7c4fcc6b5a8da96",
+      "upstream_path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/python/typeshed/0e16ea31d2e188fdc126cb31e7c4fcc6b5a8da96/LICENSE",
+      "git_blob_sha1": "13264487581f82433dadf18a99613a7d215fd448"
+    },
+    {
+      "path": "THIRD_PARTY_LICENSES/dependencies/ratatui-termina-0.1.0/LICENSE",
+      "kind": "license",
+      "sha256": "50eb43e8d742c9c61a9391e42b2184fce54dbd1893a1bb1c85b8c9ee217ab1f5",
+      "repository": "https://github.com/ratatui/ratatui",
+      "revision": "e665c36cb14752a61cd777fbd06dbef8474f2add",
+      "upstream_path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/ratatui/ratatui/e665c36cb14752a61cd777fbd06dbef8474f2add/LICENSE",
+      "git_blob_sha1": "776bf200770e7bb9b264f3cf41ad09e2a83a1509"
+    },
+    {
+      "path": "THIRD_PARTY_LICENSES/dependencies/rhai_codegen-3.2.0/LICENSE-APACHE.txt",
+      "kind": "license",
+      "sha256": "a6cba85bc92e0cff7a450b1d873c0eaa2e9fc96bf472df0247a26bec77bf3ff9",
+      "repository": "https://github.com/rhaiscript/rhai",
+      "revision": "b247dd730de3f2c97fa1e46f138a17f9d844de67",
+      "upstream_path": "LICENSE-APACHE.txt",
+      "url": "https://raw.githubusercontent.com/rhaiscript/rhai/b247dd730de3f2c97fa1e46f138a17f9d844de67/LICENSE-APACHE.txt",
+      "git_blob_sha1": "d9a10c0d8e868ebf8da0b3dc95bb0be634c34bfe"
+    },
+    {
+      "path": "THIRD_PARTY_LICENSES/dependencies/rhai_codegen-3.2.0/LICENSE-MIT.txt",
+      "kind": "license",
+      "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
+      "repository": "https://github.com/rhaiscript/rhai",
+      "revision": "b247dd730de3f2c97fa1e46f138a17f9d844de67",
+      "upstream_path": "LICENSE-MIT.txt",
+      "url": "https://raw.githubusercontent.com/rhaiscript/rhai/b247dd730de3f2c97fa1e46f138a17f9d844de67/LICENSE-MIT.txt",
+      "git_blob_sha1": "31aa79387f27e730e33d871925e152e35e428031"
+    },
+    {
+      "path": "THIRD_PARTY_LICENSES/dependencies/ruff-0.0.14/LICENSE",
+      "kind": "license",
+      "sha256": "2597d854122b77ddc71971564ca2350a37608575ce324adc5650a2b2051c8f18",
+      "repository": "https://github.com/astral-sh/ruff",
+      "revision": "62914c4b9b79a9e5004374a9c482ad2ed69290e1",
+      "upstream_path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/astral-sh/ruff/62914c4b9b79a9e5004374a9c482ad2ed69290e1/LICENSE",
+      "git_blob_sha1": "655a0c76fc5539b2f8e63b673741a5fd0e0c5799"
+    },
+    {
+      "path": "THIRD_PARTY_LICENSES/dependencies/selectors-0.38.0/LICENSE-MPL-2.0.txt",
+      "kind": "license",
+      "sha256": "3f3d9e0024b1921b067d6f7f88deb4a60cbe7a78e76c64e3f1d7fc3b779b9d04",
+      "url": "https://www.mozilla.org/media/MPL/2.0/index.txt",
+      "resolved_url": "https://www.mozilla.org/media/MPL/2.0/index.txt",
+      "license_version": "MPL-2.0",
+      "origin": "Unmodified version 2.0 text from Mozilla, the license steward, as identified by the pinned selectors source header. This is not a license file supplied by the selectors repository."
+    },
+    {
+      "path": "THIRD_PARTY_LICENSES/dependencies/selectors-0.38.0/NOTICE",
+      "kind": "source_license_notice",
+      "sha256": "766674381e88a468d55e07de3596987391cf0e8beebe51baf4fddf11078785b3",
+      "repository": "https://github.com/servo/stylo",
+      "revision": "572ecba2d1600e7c3d490586692a209faf703baa",
+      "upstream_path": "selectors/lib.rs",
+      "url": "https://raw.githubusercontent.com/servo/stylo/572ecba2d1600e7c3d490586692a209faf703baa/selectors/lib.rs",
+      "source_git_blob_sha1": "e60fe5be257f03091569b56a149e7c95ab186bfb",
+      "source_lines": [
+        1,
+        3
+      ],
+      "origin": "Verbatim license header. No copyright holder inferred."
+    },
+    {
+      "path": "THIRD_PARTY_LICENSES/dependencies/simd-0.8.0/LICENSE",
+      "kind": "license",
+      "sha256": "71674605ec4c087fe9eb534e3e4f9e26eb2e4aabcd76a29fd156c6a844d44b3d",
+      "repository": "https://github.com/Nugine/simd",
+      "revision": "d74c030d9dc4f3cae02146d1f497ff62726ef09a",
+      "upstream_path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/Nugine/simd/d74c030d9dc4f3cae02146d1f497ff62726ef09a/LICENSE",
+      "git_blob_sha1": "2c7eabb59093ea117d73b20effdd0414f87b2af2"
+    },
+    {
+      "path": "THIRD_PARTY_LICENSES/dependencies/siphasher-1.0.3/COPYING",
+      "kind": "copyright_and_license_notice",
+      "sha256": "c962ee4d1d05ddc138b202b2540219ebc57893fcf97b364852094a9a94ce1365",
+      "repository": "https://github.com/jedisct1/rust-siphash",
+      "revision": "451f67d73a772cba325728109bbfa247750ed076",
+      "upstream_path": "COPYING",
+      "url": "https://raw.githubusercontent.com/jedisct1/rust-siphash/451f67d73a772cba325728109bbfa247750ed076/COPYING",
+      "git_blob_sha1": "f65e1ba0980f3eaf077c246e127990f7a350f82e"
+    },
+    {
+      "path": "THIRD_PARTY_LICENSES/dependencies/siphasher-1.0.3/LICENSE-APACHE.txt",
+      "kind": "license",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "license_version": "Apache-2.0",
+      "referred_by": "THIRD_PARTY_LICENSES/dependencies/siphasher-1.0.3/COPYING",
+      "origin": "Canonical license terms explicitly referenced by the pinned COPYING notice. No full license text file exists in that upstream revision.",
+      "url": "https://www.apache.org/licenses/LICENSE-2.0",
+      "transformation": "None. Unmodified plain-text response from the Apache Software Foundation."
+    },
+    {
+      "path": "THIRD_PARTY_LICENSES/dependencies/siphasher-1.0.3/LICENSE-MIT.txt",
+      "kind": "license",
+      "sha256": "4790c01c0726db5d666ede1ad9b0875ed4789b89c9a38a37c7b214b707b69249",
+      "license_version": "MIT",
+      "referred_by": "THIRD_PARTY_LICENSES/dependencies/siphasher-1.0.3/COPYING",
+      "origin": "Canonical license terms explicitly referenced by the pinned COPYING notice. No full license text file exists in that upstream revision.",
+      "url": "https://opensource.org/licenses/MIT",
+      "resolved_url": "https://opensource.org/license/MIT",
+      "source_html_sha256": "a3ff15e09daa488ebb53e0da4b49abdb0c475afc938bbe9dac7e36d6f4ca4f4b",
+      "transformation": "Extract the heading and four license paragraphs from the official OSI HTML page, decoding HTML entities and collapsing paragraph whitespace. Preserve the copyright template unchanged. Actual package copyright is in the pinned COPYING file."
+    },
+    {
+      "path": "THIRD_PARTY_LICENSES/dependencies/taffy-0.12.2/LICENSE.md",
+      "kind": "license",
+      "sha256": "a7083ef3dd41a65eeb2162c2c091b0082e2724fb4c6ed029b363c7840d244ecd",
+      "repository": "https://github.com/DioxusLabs/taffy",
+      "revision": "bb351fcc056c93dbb967292acc4242a5d1c46b3c",
+      "upstream_path": "LICENSE.md",
+      "url": "https://raw.githubusercontent.com/DioxusLabs/taffy/bb351fcc056c93dbb967292acc4242a5d1c46b3c/LICENSE.md",
+      "git_blob_sha1": "d45edd34912e6f6339bdce580c0c6c0300c4f6f6"
+    },
+    {
+      "path": "THIRD_PARTY_LICENSES/dependencies/tiktoken-rs-0.12.0/LICENSE",
+      "kind": "license",
+      "sha256": "f7c6ddf9d84fd7b8ad5917e4074d4c05e4c1dfb752a28a0058f06bd0f5e2edcc",
+      "repository": "https://github.com/zurawiki/tiktoken-rs",
+      "revision": "32de8dc0526d67f2c266c4e5e7c6a8ec5a0ce3d7",
+      "upstream_path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/zurawiki/tiktoken-rs/32de8dc0526d67f2c266c4e5e7c6a8ec5a0ce3d7/LICENSE",
+      "git_blob_sha1": "39aa2a22b04e732499c3f3cf6df84f50215d8f5f"
+    },
+    {
+      "path": "THIRD_PARTY_LICENSES/dependencies/vtparse-0.6.2/LICENSE.md",
+      "kind": "license",
+      "sha256": "37db33bbbd7348969eda397b89a16f252d56c1ca7481b6ccaf56ccdcbab5dcca",
+      "repository": "https://github.com/wez/wezterm",
+      "revision": "edeae72b5fc55c7fa4aa1d08bbefd08c5493f757",
+      "upstream_path": "LICENSE.md",
+      "url": "https://raw.githubusercontent.com/wez/wezterm/edeae72b5fc55c7fa4aa1d08bbefd08c5493f757/LICENSE.md",
+      "git_blob_sha1": "cf22ae0b4062eb94de58d05012bd8ef3ebfc8f15"
+    },
+    {
+      "path": "THIRD_PARTY_LICENSES/dependencies/wezterm-input-types-0.1.0/LICENSE.md",
+      "kind": "license",
+      "sha256": "37db33bbbd7348969eda397b89a16f252d56c1ca7481b6ccaf56ccdcbab5dcca",
+      "repository": "https://github.com/wez/wezterm",
+      "revision": "d5ca5509b95edc31291ba29bd1fcbf3f0b12c92d",
+      "upstream_path": "LICENSE.md",
+      "url": "https://raw.githubusercontent.com/wez/wezterm/d5ca5509b95edc31291ba29bd1fcbf3f0b12c92d/LICENSE.md",
+      "git_blob_sha1": "cf22ae0b4062eb94de58d05012bd8ef3ebfc8f15"
+    }
+  ],
+  "packages": [
+    {
+      "name": "agent-client-protocol-schema",
+      "version": "1.7.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "ca98360c7bb8cc97d7acd49e2a8a851c3f7bee6b2f0535036d8ab86b5fcd223d",
+      "declared_license": "Apache-2.0",
+      "repository": "https://github.com/agentclientprotocol/agent-client-protocol",
+      "revision": "272bf799f35a258c6a4107a0410ed361e83683d3",
+      "path_in_vcs": "agent-client-protocol-schema",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "272bf799f35a258c6a4107a0410ed361e83683d3"
+        },
+        "path_in_vcs": "agent-client-protocol-schema"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "f27d166d2dcbe238f4f51deebb80edaa5a23be57",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/agent-client-protocol-schema-1.7.0/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ]
+    },
+    {
+      "name": "include_dir",
+      "version": "0.7.4",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "923d117408f1e49d914f1a379a309cffe4f18c05cf4e3d12e613a15fc81bd0dd",
+      "declared_license": "MIT",
+      "repository": "https://github.com/Michael-F-Bryan/include_dir",
+      "revision": "d742c6fffce99ee89da91b934e7ce6fb2a82680c",
+      "path_in_vcs": "include_dir",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "d742c6fffce99ee89da91b934e7ce6fb2a82680c"
+        },
+        "path_in_vcs": "include_dir"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "fe9b9216858e221c73e0cb87a0e65c804174ceaa",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/include_dir-0.7.4/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ]
+    },
+    {
+      "name": "include_dir_macros",
+      "version": "0.7.4",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "7cab85a7ed0bd5f0e76d93846e0147172bed2e2d3f859bcc33a8d9699cad1a75",
+      "declared_license": "MIT",
+      "repository": "https://github.com/Michael-F-Bryan/include_dir",
+      "revision": "d742c6fffce99ee89da91b934e7ce6fb2a82680c",
+      "path_in_vcs": "macros",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "d742c6fffce99ee89da91b934e7ce6fb2a82680c"
+        },
+        "path_in_vcs": "macros"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "8990fbc7e4cd1a0fffe413be6736305cf4dcea4f",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/include_dir-0.7.4/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ]
+    },
+    {
+      "name": "mlua-sys",
+      "version": "0.12.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "b806d7ade031f5d6607eae3e283fb034cb795a76247dd0d1ba753c8c42debccf",
+      "declared_license": "MIT",
+      "repository": "https://github.com/mlua-rs/mlua",
+      "revision": "4fd87af2157b0a7ecd22ba299848e4ca3d462efe",
+      "path_in_vcs": "mlua-sys",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "4fd87af2157b0a7ecd22ba299848e4ca3d462efe"
+        },
+        "path_in_vcs": "mlua-sys"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "c1b3fa190c6a009905fce3ecc01846ff19e78d49",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/mlua-sys-0.12.0/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ]
+    },
+    {
+      "name": "monty-fs",
+      "version": "1.0.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "9b832703ccfaedaae9930ec8984eb37db2998b0fd1ab97bd556551dd4479e5b4",
+      "declared_license": "MIT",
+      "repository": "https://github.com/pydantic/monty",
+      "revision": "85c5d1f6bef038405cfc40a4eed94806e303567e",
+      "path_in_vcs": "crates/monty-fs",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "85c5d1f6bef038405cfc40a4eed94806e303567e"
+        },
+        "path_in_vcs": "crates/monty-fs"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "53959d77e15dfaf5f4f3a50f98bf2b6ab43b317c",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/Monty.txt"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "notes": [
+        "The registry crate revision matches the locked Monty Git workspace revision. Existing THIRD_PARTY_LICENSES/Monty.txt is byte-identical to its root LICENSE, verified against both the cached Git object and the pinned upstream Git blob."
+      ]
+    },
+    {
+      "name": "monty-macros",
+      "version": "1.0.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "18acfe594cfe965254e684f128ec6e0a2e63774bf4ec8eb7eb5b13fd4a182a22",
+      "declared_license": "MIT",
+      "repository": "https://github.com/pydantic/monty",
+      "revision": "85c5d1f6bef038405cfc40a4eed94806e303567e",
+      "path_in_vcs": "crates/monty-macros",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "85c5d1f6bef038405cfc40a4eed94806e303567e"
+        },
+        "path_in_vcs": "crates/monty-macros"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "8099a65dc71a4ba6710ad2b5403c4ecb3c8f5485",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/Monty.txt"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "notes": [
+        "The registry crate revision matches the locked Monty Git workspace revision. Existing THIRD_PARTY_LICENSES/Monty.txt is byte-identical to its root LICENSE, verified against both the cached Git object and the pinned upstream Git blob."
+      ]
+    },
+    {
+      "name": "monty-pool",
+      "version": "1.0.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "0132326a4dc93d42ced6738e638d38a96cf977963316aaf1df5fafefa8d69136",
+      "declared_license": "MIT",
+      "repository": "https://github.com/pydantic/monty",
+      "revision": "85c5d1f6bef038405cfc40a4eed94806e303567e",
+      "path_in_vcs": "crates/monty-pool",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "85c5d1f6bef038405cfc40a4eed94806e303567e"
+        },
+        "path_in_vcs": "crates/monty-pool"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "4c8a2e21685110ee422554258a7071d166c5139b",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/Monty.txt"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "notes": [
+        "The registry crate revision matches the locked Monty Git workspace revision. Existing THIRD_PARTY_LICENSES/Monty.txt is byte-identical to its root LICENSE, verified against both the cached Git object and the pinned upstream Git blob."
+      ]
+    },
+    {
+      "name": "monty-proto",
+      "version": "1.0.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "1ecd13d16939361f670687b545ff20d726f0bcdb4c35f1a5a04fa4cb3ed3e5ae",
+      "declared_license": "MIT",
+      "repository": "https://github.com/pydantic/monty",
+      "revision": "85c5d1f6bef038405cfc40a4eed94806e303567e",
+      "path_in_vcs": "crates/monty-proto",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "85c5d1f6bef038405cfc40a4eed94806e303567e"
+        },
+        "path_in_vcs": "crates/monty-proto"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "e3a039a02a17b52d63cac3392388564f0dbc43ab",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/Monty.txt"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "notes": [
+        "The registry crate revision matches the locked Monty Git workspace revision. Existing THIRD_PARTY_LICENSES/Monty.txt is byte-identical to its root LICENSE, verified against both the cached Git object and the pinned upstream Git blob."
+      ]
+    },
+    {
+      "name": "monty-types",
+      "version": "1.0.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "eb42ab8791581458d83352f53028cf84a9225ab22e9c6093e12fd06877ce7ac4",
+      "declared_license": "MIT",
+      "repository": "https://github.com/pydantic/monty",
+      "revision": "85c5d1f6bef038405cfc40a4eed94806e303567e",
+      "path_in_vcs": "crates/monty-types",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "85c5d1f6bef038405cfc40a4eed94806e303567e"
+        },
+        "path_in_vcs": "crates/monty-types"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "c6423a9e8577d40ef0cf0ae40717f8a23b849328",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/Monty.txt"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "notes": [
+        "The registry crate revision matches the locked Monty Git workspace revision. Existing THIRD_PARTY_LICENSES/Monty.txt is byte-identical to its root LICENSE, verified against both the cached Git object and the pinned upstream Git blob."
+      ]
+    },
+    {
+      "name": "monty-typeshed",
+      "version": "1.0.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "ea247929a0eb5bb8b13f9d86ce335c68232f15a211b622ffbdbcb6029d74c8c9",
+      "declared_license": "MIT",
+      "repository": "https://github.com/pydantic/monty",
+      "revision": "85c5d1f6bef038405cfc40a4eed94806e303567e",
+      "path_in_vcs": "crates/monty-typeshed",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "85c5d1f6bef038405cfc40a4eed94806e303567e"
+        },
+        "path_in_vcs": "crates/monty-typeshed"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "33a1010d38dd57806a7d0bde35141745310af3b9",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/Monty.txt",
+        "THIRD_PARTY_LICENSES/dependencies/monty-typeshed-1.0.0/LICENSE-typeshed"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "lockfile_evidence": {
+        "package": "monty-runtime",
+        "version": "1.0.0",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "archive_checksum": "000d04b3bc56ca99aa2c74927fc4abaf90b6baa08ef2e3759e64298a01fe97a0",
+        "path": "Cargo.lock",
+        "sha256": "1734dc50783b06047bad339befec164e9c422d4d998c30117fbc907aa0eb312b"
+      },
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "embedded_components": [
+        {
+          "name": "typeshed",
+          "path_in_package": "vendor/typeshed",
+          "repository": "https://github.com/python/typeshed",
+          "revision": "0e16ea31d2e188fdc126cb31e7c4fcc6b5a8da96",
+          "license_description": "Apache-2.0 with MIT-licensed portions, as specified by the complete upstream LICENSE.",
+          "license_files": [
+            "THIRD_PARTY_LICENSES/dependencies/monty-typeshed-1.0.0/LICENSE-typeshed"
+          ],
+          "revision_evidence": {
+            "package_path": "vendor/typeshed/source_commit.txt",
+            "upstream_path": "crates/monty-typeshed/vendor/typeshed/source_commit.txt",
+            "sha256": "83853a922c911705229bcdb52f510ae0b8f516433f6e9172cec36690ff684b43",
+            "git_blob_sha1": "b6bb86f7988833266ddfe21eb4d9362623e46bf8"
+          },
+          "derivation_evidence": {
+            "package_path": "README.md",
+            "source_line_ranges": [
+              [
+                3,
+                4
+              ],
+              [
+                14,
+                16
+              ],
+              [
+                20,
+                29
+              ]
+            ],
+            "sha256": "7713053dd464e3022e546de4d5cc1589be1bc182c0b9cb96b5b3bd248601523e",
+            "git_blob_sha1": "9936fc0ef89211a07bbd0929861adf460adb1b92"
+          }
+        }
+      ],
+      "notes": [
+        "This explicitly requested worker package is absent from root Cargo.lock. Its registry checksum comes from the published monty-runtime 1.0.0 Cargo.lock, whose archive checksum was verified against the cached crates.io index.",
+        "The checksum-verified package README identifies the embedded stubs as a filtered typeshed subset with Monty custom overrides and acknowledges derivation from Ruff ty_vendored. source_commit.txt pins the typeshed revision. The README does not pin an intermediate Ruff revision, so none is asserted.",
+        "Existing THIRD_PARTY_LICENSES/Monty.txt covers the Monty-authored portions. The separately preserved typeshed LICENSE includes the Apache-2.0 terms and the MIT notice for Jukka Lehtosalo and contributors."
+      ]
+    },
+    {
+      "name": "quote-use",
+      "version": "0.8.4",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "9619db1197b497a36178cfc736dc96b271fe918875fbf1344c436a7e93d0321e",
+      "declared_license": "MIT",
+      "repository": "https://github.com/ModProg/quote-use",
+      "revision": "05096f346f8b17fba8a57a235b958917ad9d99e0",
+      "path_in_vcs": "",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "05096f346f8b17fba8a57a235b958917ad9d99e0"
+        },
+        "path_in_vcs": ""
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "c613970704b51da7777a3c5bb278eb3761d501c9",
+      "manifest_match": "exact",
+      "license_files": [],
+      "notice_files": [],
+      "status": "unresolved",
+      "inspected_ancestor_legal_paths": [],
+      "inspected_recursive_tree_sha1": "05096f346f8b17fba8a57a235b958917ad9d99e0",
+      "inspected_recursive_tree_truncated": false,
+      "notes": [
+        "The checksum-verified published Cargo.toml declares MIT. Neither the published crate nor the complete pinned upstream tree contains a LICENSE, NOTICE, COPYING, or COPYRIGHT file. The cached source and README provide no copyright or license text. No copyright holder or replacement grant has been fabricated. Exact upstream license and copyright text remains unresolved."
+      ]
+    },
+    {
+      "name": "quote-use-macros",
+      "version": "0.8.4",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "82ebfb7faafadc06a7ab141a6f67bcfb24cb8beb158c6fe933f2f035afa99f35",
+      "declared_license": "MIT",
+      "repository": "https://github.com/ModProg/quote-use",
+      "revision": "05096f346f8b17fba8a57a235b958917ad9d99e0",
+      "path_in_vcs": "quote-use-macros",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "05096f346f8b17fba8a57a235b958917ad9d99e0"
+        },
+        "path_in_vcs": "quote-use-macros"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "e792f85db94df3de43112ea394c0d7bb8fb118bd",
+      "manifest_match": "exact",
+      "license_files": [],
+      "notice_files": [],
+      "status": "unresolved",
+      "inspected_ancestor_legal_paths": [],
+      "inspected_recursive_tree_sha1": "05096f346f8b17fba8a57a235b958917ad9d99e0",
+      "inspected_recursive_tree_truncated": false,
+      "notes": [
+        "The checksum-verified published Cargo.toml declares MIT. Neither the published crate nor the complete pinned upstream tree contains a LICENSE, NOTICE, COPYING, or COPYRIGHT file. The cached source and README provide no copyright or license text. No copyright holder or replacement grant has been fabricated. Exact upstream license and copyright text remains unresolved."
+      ]
+    },
+    {
+      "name": "ratatui-termina",
+      "version": "0.1.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "c0bf912d9e66f057a759d92e386a280ea886b352ab757d6ac4d653c7ed2c43c2",
+      "declared_license": "MIT",
+      "repository": "https://github.com/ratatui/ratatui",
+      "revision": "e665c36cb14752a61cd777fbd06dbef8474f2add",
+      "path_in_vcs": "ratatui-termina",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "e665c36cb14752a61cd777fbd06dbef8474f2add"
+        },
+        "path_in_vcs": "ratatui-termina"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "5266570b65bd80bd905fbd3a63f7fbb47e9b150d",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/ratatui-termina-0.1.0/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ]
+    },
+    {
+      "name": "rhai_codegen",
+      "version": "3.2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "3cd3a7535e50bf36857e7be7bec276d334e8c2dfa469c2201226fd01638ea5ca",
+      "declared_license": "MIT OR Apache-2.0",
+      "repository": "https://github.com/rhaiscript/rhai",
+      "revision": "b247dd730de3f2c97fa1e46f138a17f9d844de67",
+      "path_in_vcs": "codegen",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "b247dd730de3f2c97fa1e46f138a17f9d844de67"
+        },
+        "path_in_vcs": "codegen"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "d906a8356fb3e19494299101bf7c144d86d310dc",
+      "manifest_match": "CRLF in published manifest, LF in Git",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/rhai_codegen-3.2.0/LICENSE-APACHE.txt",
+        "THIRD_PARTY_LICENSES/dependencies/rhai_codegen-3.2.0/LICENSE-MIT.txt"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE-APACHE.txt",
+        "LICENSE-MIT.txt"
+      ]
+    },
+    {
+      "name": "ruff_python_ast",
+      "version": "0.0.14",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "6aa1de604c478a790cfbcc9c1fef3060e619ed87dd776c6614862ed7e59dc461",
+      "declared_license": "MIT",
+      "repository": "https://github.com/astral-sh/ruff",
+      "revision": "62914c4b9b79a9e5004374a9c482ad2ed69290e1",
+      "path_in_vcs": "crates/ruff_python_ast",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "62914c4b9b79a9e5004374a9c482ad2ed69290e1"
+        },
+        "path_in_vcs": "crates/ruff_python_ast"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "88a6fd697688e915318d82621faa05159eeef2e2",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/ruff-0.0.14/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "notes": [
+        "The complete upstream root LICENSE is preserved, including bundled third-party notices. No attempt was made to trim notices to an inferred dependency graph."
+      ]
+    },
+    {
+      "name": "ruff_python_codegen",
+      "version": "0.0.14",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "61039f2c61869bdabf2e5448b561ab6546b787718926c78973ebfefe03f84298",
+      "declared_license": "MIT",
+      "repository": "https://github.com/astral-sh/ruff",
+      "revision": "62914c4b9b79a9e5004374a9c482ad2ed69290e1",
+      "path_in_vcs": "crates/ruff_python_codegen",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "62914c4b9b79a9e5004374a9c482ad2ed69290e1"
+        },
+        "path_in_vcs": "crates/ruff_python_codegen"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "c7b22059b9aa5f274eafd993d73cece60ef3d833",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/ruff-0.0.14/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "notes": [
+        "The complete upstream root LICENSE is preserved, including bundled third-party notices. No attempt was made to trim notices to an inferred dependency graph."
+      ]
+    },
+    {
+      "name": "ruff_python_literal",
+      "version": "0.0.14",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "3b6025882ae43876fda9867693e14d1d749acefb3db2763d81bfa32a8cd92682",
+      "declared_license": "MIT",
+      "repository": "https://github.com/astral-sh/ruff",
+      "revision": "62914c4b9b79a9e5004374a9c482ad2ed69290e1",
+      "path_in_vcs": "crates/ruff_python_literal",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "62914c4b9b79a9e5004374a9c482ad2ed69290e1"
+        },
+        "path_in_vcs": "crates/ruff_python_literal"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "4873ec2a0024551966e9b6262f2bd64cc04a22c3",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/ruff-0.0.14/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "notes": [
+        "The complete upstream root LICENSE is preserved, including bundled third-party notices. No attempt was made to trim notices to an inferred dependency graph."
+      ]
+    },
+    {
+      "name": "ruff_python_parser",
+      "version": "0.0.14",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "b44b423a842d5d2f10807189a260ba677d4eacdc98c5d0459b66bef67fb78d97",
+      "declared_license": "MIT",
+      "repository": "https://github.com/astral-sh/ruff",
+      "revision": "62914c4b9b79a9e5004374a9c482ad2ed69290e1",
+      "path_in_vcs": "crates/ruff_python_parser",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "62914c4b9b79a9e5004374a9c482ad2ed69290e1"
+        },
+        "path_in_vcs": "crates/ruff_python_parser"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "a89b5bdce24e978ba3c58bd6dfbdc8f9a6ace8f0",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/ruff-0.0.14/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "notes": [
+        "The complete upstream root LICENSE is preserved, including bundled third-party notices. No attempt was made to trim notices to an inferred dependency graph."
+      ]
+    },
+    {
+      "name": "ruff_python_stdlib",
+      "version": "0.0.14",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "ea8c1e6e69f7570e1f24c7a26ef93f6fd1475e2d76aa9ca4a78093c1f80523cb",
+      "declared_license": "MIT",
+      "repository": "https://github.com/astral-sh/ruff",
+      "revision": "62914c4b9b79a9e5004374a9c482ad2ed69290e1",
+      "path_in_vcs": "crates/ruff_python_stdlib",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "62914c4b9b79a9e5004374a9c482ad2ed69290e1"
+        },
+        "path_in_vcs": "crates/ruff_python_stdlib"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "cd860bb69003b26e1093f7687c16072ac7f039e6",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/ruff-0.0.14/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "notes": [
+        "The complete upstream root LICENSE is preserved, including bundled third-party notices. No attempt was made to trim notices to an inferred dependency graph."
+      ]
+    },
+    {
+      "name": "ruff_python_trivia",
+      "version": "0.0.14",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "990dadfad3aa3fd63040d98056112e5a377af8ada0c9c7659e8907a4b3c7cb34",
+      "declared_license": "MIT",
+      "repository": "https://github.com/astral-sh/ruff",
+      "revision": "62914c4b9b79a9e5004374a9c482ad2ed69290e1",
+      "path_in_vcs": "crates/ruff_python_trivia",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "62914c4b9b79a9e5004374a9c482ad2ed69290e1"
+        },
+        "path_in_vcs": "crates/ruff_python_trivia"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "45056758b488400889e6719b4c911cb007ed9d19",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/ruff-0.0.14/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "notes": [
+        "The complete upstream root LICENSE is preserved, including bundled third-party notices. No attempt was made to trim notices to an inferred dependency graph."
+      ]
+    },
+    {
+      "name": "ruff_source_file",
+      "version": "0.0.14",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "ed11e9366de40e79707c0e575afd8beffad58ec94c253577d516b8679cf98308",
+      "declared_license": "MIT",
+      "repository": "https://github.com/astral-sh/ruff",
+      "revision": "62914c4b9b79a9e5004374a9c482ad2ed69290e1",
+      "path_in_vcs": "crates/ruff_source_file",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "62914c4b9b79a9e5004374a9c482ad2ed69290e1"
+        },
+        "path_in_vcs": "crates/ruff_source_file"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "01048740ddb3f67d6dc91ec08bf4d4494f533538",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/ruff-0.0.14/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "notes": [
+        "The complete upstream root LICENSE is preserved, including bundled third-party notices. No attempt was made to trim notices to an inferred dependency graph."
+      ]
+    },
+    {
+      "name": "ruff_text_size",
+      "version": "0.0.14",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "5a4edc941f215495170a1bda0beeeb31db2fdcd67beecfe7f29d94b2663e1965",
+      "declared_license": "MIT",
+      "repository": "https://github.com/astral-sh/ruff",
+      "revision": "62914c4b9b79a9e5004374a9c482ad2ed69290e1",
+      "path_in_vcs": "crates/ruff_text_size",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "62914c4b9b79a9e5004374a9c482ad2ed69290e1"
+        },
+        "path_in_vcs": "crates/ruff_text_size"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "e8e650b28e9c59ec1f053b803ed33d8975818868",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/ruff-0.0.14/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "notes": [
+        "The complete upstream root LICENSE is preserved, including bundled third-party notices. No attempt was made to trim notices to an inferred dependency graph."
+      ]
+    },
+    {
+      "name": "selectors",
+      "version": "0.38.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "8adfa1c298912827b8a28b223b3b874357397ae706e6190acd9bf28cee99114d",
+      "declared_license": "MPL-2.0",
+      "repository": "https://github.com/servo/stylo",
+      "revision": "572ecba2d1600e7c3d490586692a209faf703baa",
+      "path_in_vcs": "selectors",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "572ecba2d1600e7c3d490586692a209faf703baa"
+        },
+        "path_in_vcs": "selectors"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "de27b2e60e22ba384db4b4a5abaa2a96f5779274",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/selectors-0.38.0/LICENSE-MPL-2.0.txt"
+      ],
+      "notice_files": [
+        "THIRD_PARTY_LICENSES/dependencies/selectors-0.38.0/NOTICE"
+      ],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [],
+      "notes": [
+        "The pinned source header explicitly identifies MPL 2.0 and links to Mozilla. No package-local or ancestor license text exists in the pinned upstream tree. The license is supplied verbatim from the steward. No copyright holder is inferred. Distribution must separately satisfy MPL source-availability obligations."
+      ]
+    },
+    {
+      "name": "siphasher",
+      "version": "1.0.3",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649",
+      "declared_license": "MIT/Apache-2.0",
+      "repository": "https://github.com/jedisct1/rust-siphash",
+      "revision": "451f67d73a772cba325728109bbfa247750ed076",
+      "path_in_vcs": "",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "451f67d73a772cba325728109bbfa247750ed076"
+        },
+        "path_in_vcs": ""
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "99684ca99d2b637cf48fb8df34fb4b018d86a6b6",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/siphasher-1.0.3/LICENSE-MIT.txt",
+        "THIRD_PARTY_LICENSES/dependencies/siphasher-1.0.3/LICENSE-APACHE.txt"
+      ],
+      "notice_files": [
+        "THIRD_PARTY_LICENSES/dependencies/siphasher-1.0.3/COPYING"
+      ],
+      "status": "collected",
+      "lockfile": "Cargo.lock",
+      "inspected_ancestor_legal_paths": [
+        "COPYING"
+      ],
+      "notes": [
+        "The pinned revision contains only COPYING, whose Rust Project Developers and Frank Denis copyright notices are preserved verbatim. It explicitly refers to the Apache 2.0 and MIT license URLs. Full terms were obtained from those official sources, not fabricated as files present at the revision. The MIT copyright template is unchanged because the actual copyright notice is supplied separately in COPYING."
+      ]
+    },
+    {
+      "name": "taffy",
+      "version": "0.12.2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "340a09581f29809fc0df82a3955501dc7f2a21f887e5d1c13dbe288fe1c0bef4",
+      "declared_license": "MIT",
+      "repository": "https://github.com/DioxusLabs/taffy",
+      "revision": "bb351fcc056c93dbb967292acc4242a5d1c46b3c",
+      "path_in_vcs": "",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "bb351fcc056c93dbb967292acc4242a5d1c46b3c"
+        },
+        "path_in_vcs": ""
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "aedf09c25540312deaace25ae34922d118430ab2",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/taffy-0.12.2/LICENSE.md"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE.md"
+      ]
+    },
+    {
+      "name": "tiktoken-rs",
+      "version": "0.12.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "027853bbf8c7763b77c5c595f1c271c7d536ced7d6f83452911b944621e57fc2",
+      "declared_license": "MIT",
+      "repository": "https://github.com/zurawiki/tiktoken-rs",
+      "revision": "32de8dc0526d67f2c266c4e5e7c6a8ec5a0ce3d7",
+      "path_in_vcs": "tiktoken-rs",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "32de8dc0526d67f2c266c4e5e7c6a8ec5a0ce3d7"
+        },
+        "path_in_vcs": "tiktoken-rs"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "84d19401f6d141a57bfd173ecea9034ca03c84ff",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/tiktoken-rs-0.12.0/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ]
+    },
+    {
+      "name": "uuid-simd",
+      "version": "0.8.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "23b082222b4f6619906941c17eb2297fff4c2fb96cb60164170522942a200bd8",
+      "declared_license": "MIT",
+      "repository": "https://github.com/Nugine/simd",
+      "revision": "d74c030d9dc4f3cae02146d1f497ff62726ef09a",
+      "path_in_vcs": "crates/uuid-simd",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "d74c030d9dc4f3cae02146d1f497ff62726ef09a"
+        },
+        "path_in_vcs": "crates/uuid-simd"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "2a8b4d6764b3286c45fa87dca4ba0b0b66ef3122",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/simd-0.8.0/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ]
+    },
+    {
+      "name": "vsimd",
+      "version": "0.8.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64",
+      "declared_license": "MIT",
+      "repository": "https://github.com/Nugine/simd",
+      "revision": "d74c030d9dc4f3cae02146d1f497ff62726ef09a",
+      "path_in_vcs": "crates/vsimd",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "d74c030d9dc4f3cae02146d1f497ff62726ef09a"
+        },
+        "path_in_vcs": "crates/vsimd"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "513f24596f46c00c81527b439aac33472a0ff078",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/simd-0.8.0/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ]
+    },
+    {
+      "name": "vtparse",
+      "version": "0.6.2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "6d9b2acfb050df409c972a37d3b8e08cdea3bddb0c09db9d53137e504cfabed0",
+      "declared_license": "MIT",
+      "repository": "https://github.com/wez/wezterm",
+      "revision": "edeae72b5fc55c7fa4aa1d08bbefd08c5493f757",
+      "path_in_vcs": "vtparse",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "edeae72b5fc55c7fa4aa1d08bbefd08c5493f757"
+        },
+        "path_in_vcs": "vtparse"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "a14141c3b8929fd795ecddea26178ecf88915e0a",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/vtparse-0.6.2/LICENSE.md"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE.md"
+      ]
+    },
+    {
+      "name": "wezterm-input-types",
+      "version": "0.1.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "7012add459f951456ec9d6c7e6fc340b1ce15d6fc9629f8c42853412c029e57e",
+      "declared_license": "MIT",
+      "repository": "https://github.com/wez/wezterm",
+      "revision": "d5ca5509b95edc31291ba29bd1fcbf3f0b12c92d",
+      "path_in_vcs": "wezterm-input-types",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "d5ca5509b95edc31291ba29bd1fcbf3f0b12c92d"
+        },
+        "path_in_vcs": "wezterm-input-types"
+      },
+      "archive_checksum_verified": true,
+      "manifest_git_blob_sha1": "6b459956d13c61467a178624b61aacb30c0ef4a1",
+      "manifest_match": "exact",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/wezterm-input-types-0.1.0/LICENSE.md"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE.md"
+      ]
+    }
+  ]
+}

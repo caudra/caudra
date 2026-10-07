@@ -6,12 +6,16 @@ which were copied verbatim from the RTK project.
 
     RTK (Rust Token Killer)
     https://github.com/rtk-ai/rtk
-    Copyright Patrick Szymkowiak and the RTK contributors
+    Copyright 2024 rtk-ai and rtk-ai Labs
     Licensed under the Apache License, Version 2.0
 
     Vendored revision: aa408534859949ebac1dcc82ec4d25b575a539fa
     Vendored tag:      dev-0.47.0-rc.386
     Upstream path:     src/filters/*.toml
+
+The copyright above is reproduced from LICENSE at the vendored revision.
+That revision has no root NOTICE. Its full LICENSE is preserved in the
+repository-root THIRD_PARTY_LICENSES/RTK.txt.
 
 The files in `rules/` are unmodified. The filter engine in `src/` is an
 independent implementation and is not derived from RTK source code.

@@ -4,6 +4,7 @@ description = "OpenTelemetry export and instrumentation for Caudra."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+license.workspace = true
 
 [dependencies]
 caudra-config = { workspace = true }

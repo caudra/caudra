@@ -258,4 +258,4 @@ The file, shell, web, code, and Python tools come from [Workcell](https://github
 
 ## License
 
-Caudra is released under the [MIT License](LICENSE). [NOTICE.md](NOTICE.md) covers attribution and third-party material.
+Caudra's first-party work is licensed under the [Apache License, Version 2.0](LICENSE) from this transition forward. Maki-derived code and prior MIT-licensed Caudra work retain their [MIT terms](THIRD_PARTY_LICENSES/Maki.txt). Third-party material retains its own MIT, Apache-2.0, or file-level license terms. [NOTICE.md](NOTICE.md) covers the prospective transition, attribution, and third-party exceptions.

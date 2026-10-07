@@ -1,3 +1,11 @@
+RTK declarative output-filter rules
+Source: https://github.com/rtk-ai/rtk
+Revision: aa408534859949ebac1dcc82ec4d25b575a539fa (dev-0.47.0-rc.386)
+Upstream material: src/filters/*.toml
+Local material: workcell/crates/output-filter/rules/*.toml
+The following LICENSE is verbatim from that revision. No root NOTICE exists
+at that revision. Workcell's engine is an independent implementation.
+
                                  Apache License
                            Version 2.0, January 2004
                         http://www.apache.org/licenses/

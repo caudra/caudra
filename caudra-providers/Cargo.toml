@@ -4,6 +4,7 @@ description = "LLM provider integrations and model catalog for Caudra."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+license.workspace = true
 
 [dependencies]
 serde = { workspace = true }

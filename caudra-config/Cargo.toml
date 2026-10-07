@@ -4,6 +4,7 @@ description = "Configuration loading and policy types for Caudra."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+license.workspace = true
 
 [dependencies]
 caudra-config-macro = { workspace = true }

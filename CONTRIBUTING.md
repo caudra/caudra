@@ -172,4 +172,8 @@ CI runs on every pull request. It checks Rust and Lua formatting, runs clippy an
 
 ## License and attribution
 
-Caudra is released under the [MIT License](LICENSE), and contributions are accepted under the same license. [NOTICE.md](NOTICE.md) records where the code comes from. If you adapt code from another project, keep its license: add the license text to `THIRD_PARTY_LICENSES/` and a note to `NOTICE.md`.
+New first-party contributions intentionally submitted for inclusion in Caudra are accepted under the [Apache License, Version 2.0](LICENSE), subject to its contribution terms. If you intend different terms, state them explicitly before submitting so the maintainers can review them.
+
+This policy applies going forward. Maki-derived code and prior MIT-licensed Caudra contributions retain their [MIT terms](THIRD_PARTY_LICENSES/Maki.txt). It does not change historical license grants or assert an Apache patent grant from prior MIT contributors. [NOTICE.md](NOTICE.md) records the transition and where the code comes from.
+
+If you adapt code from another project, retain its license and copyright and attribution notices, including file-level notices. Add the license text to `THIRD_PARTY_LICENSES/` and a note to `NOTICE.md`. Third-party MIT, Apache-2.0, and other applicable terms remain in force.

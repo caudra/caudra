@@ -6,7 +6,7 @@ authors = [
   "Thorsten Born <tensorninja@caudra.ai>",
 ]
 description = "Terminal coding agent that turns context into effective action."
-license = "MIT"
+license.workspace = true
 repository = "https://github.com/caudra/caudra"
 homepage = "https://caudra.ai"
 readme = "README.md"
@@ -116,7 +116,7 @@ edition = "2024"
 authors = [
   "Thorsten Born <tensorninja@caudra.ai>",
 ]
-license = "MIT"
+license = "Apache-2.0"
 repository = "https://github.com/caudra/caudra"
 rust-version = "1.99"
 

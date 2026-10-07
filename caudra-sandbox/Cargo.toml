@@ -4,6 +4,7 @@ description = "Managed sandbox lifecycle, durable intents, and attach authority 
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+license.workspace = true
 
 [dependencies]
 caudra-config.workspace = true

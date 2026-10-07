@@ -1,0 +1,1480 @@
+{
+  "schema_version": 1,
+  "path_base": "repository_root",
+  "scope": "Only the 40 assigned missing-text package versions in the observed application/worker attribution errors. Excludes quote-use, quote-use-macros, siphasher, monty-typeshed and two-face. Does not select build dependencies or audit embedded assets.",
+  "verification": "39 cached .crate SHA-256 values match root or actual worker Cargo.lock. The worker-root monty-runtime archive matches the exact-version crates.io sparse-index checksum because its own lockfile has no checksum. Cached manifests and .cargo_vcs_info.json match the archives. All 40 original manifests match their reported revision Git blobs byte-for-byte. Upstream ancestor license files match pinned Git blob hashes. Legal texts are unmodified. Existing texts are referenced when the exact source revision and contents match. No canonical linked-license replacement texts were needed.",
+  "worker_source": {
+    "manifest_pointer": "target/code-worker/source-manifest-path",
+    "package": "monty-runtime",
+    "version": "1.0.0",
+    "lockfile": "Cargo.lock beside the selected worker manifest"
+  },
+  "files": [
+    {
+      "path": "THIRD_PARTY_LICENSES/Monty.txt",
+      "kind": "license",
+      "sha256": "5841db47ee6e1f0becafe2d19ca43c08cbc6d2c0952822ccf88cbbf2bd0749bd",
+      "repository": "https://github.com/pydantic/monty",
+      "revision": "85c5d1f6bef038405cfc40a4eed94806e303567e",
+      "upstream_path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/pydantic/monty/85c5d1f6bef038405cfc40a4eed94806e303567e/LICENSE",
+      "git_blob_sha1": "d30ac52dc1727d9b88cc1ce816a70ca66dc5df31"
+    },
+    {
+      "path": "THIRD_PARTY_LICENSES/TreeSitterQueries.txt",
+      "kind": "license_collection",
+      "sha256": "c314f4a715ed4f179a01ca374d05a37b69798510b014c8d25de5052d58520392",
+      "origin": "Existing verified query-origin license collection. The component license text and its exact upstream revision occur verbatim in this file.",
+      "component_sources": [
+        {
+          "repository": "https://github.com/tree-sitter/tree-sitter-cpp",
+          "revision": "f41e1a044c8a84ea9fa8577fdd2eab92ec96de02",
+          "upstream_path": "LICENSE",
+          "url": "https://raw.githubusercontent.com/tree-sitter/tree-sitter-cpp/f41e1a044c8a84ea9fa8577fdd2eab92ec96de02/LICENSE",
+          "git_blob_sha1": "4b52d191cead337b11e274b79459a86f1b5a7779",
+          "sha256": "2e0110e07abef7c2548b26ec9d6969775617ca539a0dc8dbeeb14d6452c711d1"
+        },
+        {
+          "repository": "https://github.com/tree-sitter/tree-sitter-java",
+          "revision": "94703d5a6bed02b98e438d7cad1136c01a60ba2c",
+          "upstream_path": "LICENSE",
+          "url": "https://raw.githubusercontent.com/tree-sitter/tree-sitter-java/94703d5a6bed02b98e438d7cad1136c01a60ba2c/LICENSE",
+          "git_blob_sha1": "4e0446f76ca7d380d615e31b5500711df66a9ea2",
+          "sha256": "52ed137b039cd9c46409bc22e89938af911c95b157feae2d040b51e6084369a7"
+        },
+        {
+          "repository": "https://github.com/tree-sitter/tree-sitter-json",
+          "revision": "ee35a6ebefcef0c5c416c0d1ccec7370cfca5a24",
+          "upstream_path": "LICENSE",
+          "url": "https://raw.githubusercontent.com/tree-sitter/tree-sitter-json/ee35a6ebefcef0c5c416c0d1ccec7370cfca5a24/LICENSE",
+          "git_blob_sha1": "4b52d191cead337b11e274b79459a86f1b5a7779",
+          "sha256": "2e0110e07abef7c2548b26ec9d6969775617ca539a0dc8dbeeb14d6452c711d1"
+        },
+        {
+          "repository": "https://github.com/tree-sitter-grammars/tree-sitter-lua",
+          "revision": "10fe0054734eec83049514ea2e718b2a56acd0c9",
+          "upstream_path": "LICENSE.md",
+          "url": "https://raw.githubusercontent.com/tree-sitter-grammars/tree-sitter-lua/10fe0054734eec83049514ea2e718b2a56acd0c9/LICENSE.md",
+          "git_blob_sha1": "ff0407e77c183db53bf525741a76314e15e8f6ea",
+          "sha256": "9a32b02e4c917b1ce6b5e79d8ea81e25cefd7f27d89c7235f2afb262c06cf32e"
+        },
+        {
+          "repository": "https://github.com/tree-sitter-grammars/tree-sitter-objc",
+          "revision": "18802acf31d0b5c1c1d50bdbc9eb0e1636cab9ed",
+          "upstream_path": "LICENSE",
+          "url": "https://raw.githubusercontent.com/tree-sitter-grammars/tree-sitter-objc/18802acf31d0b5c1c1d50bdbc9eb0e1636cab9ed/LICENSE",
+          "git_blob_sha1": "5af536362c15275bb3a57445bc5be23b349cd1de",
+          "sha256": "099c44248f8cf353123211318680e93465587c005a4b3730ce8cb5334de043d6"
+        },
+        {
+          "repository": "https://github.com/tree-sitter/tree-sitter-ruby",
+          "revision": "71bd32fb7607035768799732addba884a37a6210",
+          "upstream_path": "LICENSE",
+          "url": "https://raw.githubusercontent.com/tree-sitter/tree-sitter-ruby/71bd32fb7607035768799732addba884a37a6210/LICENSE",
+          "git_blob_sha1": "2a79f435f473717691c5e2b356fbf3e758ba930d",
+          "sha256": "ee006f02a3d856df282e409be2a86e24a65bb573a98b9c28343771141351bb6b"
+        },
+        {
+          "repository": "https://github.com/tree-sitter-grammars/tree-sitter-toml",
+          "revision": "64b56832c2cffe41758f28e05c756a3a98d16f41",
+          "upstream_path": "LICENSE",
+          "url": "https://raw.githubusercontent.com/tree-sitter-grammars/tree-sitter-toml/64b56832c2cffe41758f28e05c756a3a98d16f41/LICENSE",
+          "git_blob_sha1": "7bf071b1d83ca0644118769f568c978bb7ccf3ae",
+          "sha256": "b727eee929bee836e8102cecf749a795b199f291b58c885bcd81cae727ac5a46"
+        },
+        {
+          "repository": "https://github.com/tree-sitter/tree-sitter-typescript",
+          "revision": "f975a621f4e7f532fe322e13c4f79495e0a7b2e7",
+          "upstream_path": "LICENSE",
+          "url": "https://raw.githubusercontent.com/tree-sitter/tree-sitter-typescript/f975a621f4e7f532fe322e13c4f79495e0a7b2e7/LICENSE",
+          "git_blob_sha1": "aa9f858db5722d9576104726471b11cc0e31f131",
+          "sha256": "49bf33cf78ef5897e4e161ce1517df7de1ae5042a65b6bcfd44401e0fc606559"
+        }
+      ]
+    },
+    {
+      "path": "THIRD_PARTY_LICENSES/additional/alloc-stdlib-0.2.4/LICENSE",
+      "kind": "license",
+      "repository": "https://github.com/dropbox/rust-alloc-no-stdlib",
+      "revision": "ae42d22078b98549e987d2f03d12df7b984fde47",
+      "upstream_path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/dropbox/rust-alloc-no-stdlib/ae42d22078b98549e987d2f03d12df7b984fde47/LICENSE",
+      "git_blob_sha1": "cd496ba72eb37e83a44958358d1f89a8a28cbc15",
+      "sha256": "c0c56f26d9c051cac4d200c34c84e7ae9aaa853e01a982a1df08b09931e518ae"
+    },
+    {
+      "path": "THIRD_PARTY_LICENSES/additional/jsonschema-0.52.1/LICENSE",
+      "kind": "license",
+      "repository": "https://github.com/Stranger6667/jsonschema",
+      "revision": "94546ceb734c6076e73c4a6723de98804ad63ae6",
+      "upstream_path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/Stranger6667/jsonschema/94546ceb734c6076e73c4a6723de98804ad63ae6/LICENSE",
+      "git_blob_sha1": "20c070f6401feda6f47be1b158f4f5a4a9d14062",
+      "sha256": "117829c3ca21efb132d81a44b55363d395ab8eea18526873bc828da4c0e5f038"
+    },
+    {
+      "path": "THIRD_PARTY_LICENSES/additional/tree-sitter-gleam-1.0.0/LICENSE",
+      "kind": "license",
+      "repository": "https://github.com/gleam-lang/tree-sitter-gleam",
+      "revision": "066704e4826699e754d351e3bbe12bf2e51de9d8",
+      "upstream_path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/gleam-lang/tree-sitter-gleam/066704e4826699e754d351e3bbe12bf2e51de9d8/LICENSE",
+      "git_blob_sha1": "d645695673349e3947e8e5ae42332d0ac3164cd7",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "path": "THIRD_PARTY_LICENSES/additional/tree-sitter-html-0.23.2/LICENSE",
+      "kind": "license",
+      "repository": "https://github.com/tree-sitter/tree-sitter-html",
+      "revision": "5a5ca8551a179998360b4a4ca2c0f366a35acc03",
+      "upstream_path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/tree-sitter/tree-sitter-html/5a5ca8551a179998360b4a4ca2c0f366a35acc03/LICENSE",
+      "git_blob_sha1": "4b52d191cead337b11e274b79459a86f1b5a7779",
+      "sha256": "2e0110e07abef7c2548b26ec9d6969775617ca539a0dc8dbeeb14d6452c711d1"
+    },
+    {
+      "path": "THIRD_PARTY_LICENSES/additional/tree-sitter-kotlin-ng-1.1.0/LICENSE",
+      "kind": "license",
+      "repository": "https://github.com/tree-sitter-grammars/tree-sitter-kotlin",
+      "revision": "77dd60ea0a9003ce062c9728a513ffe1aaff8c82",
+      "upstream_path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/tree-sitter-grammars/tree-sitter-kotlin/77dd60ea0a9003ce062c9728a513ffe1aaff8c82/LICENSE",
+      "git_blob_sha1": "4e8c9b38350135b69d7137e508d29e8980794569",
+      "sha256": "0eea8dc45e89deeb03c7799bbbc7b4688f365fb274562f4540ecfebdea82e727"
+    },
+    {
+      "path": "THIRD_PARTY_LICENSES/additional/tree-sitter-make-1.1.1/LICENSE",
+      "kind": "license",
+      "repository": "https://github.com/tree-sitter-grammars/tree-sitter-make",
+      "revision": "5e9e8f8ff3387b0edcaa90f46ddf3629f4cfeb1d",
+      "upstream_path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/tree-sitter-grammars/tree-sitter-make/5e9e8f8ff3387b0edcaa90f46ddf3629f4cfeb1d/LICENSE",
+      "git_blob_sha1": "5c279ffb8001a7c2d293764beda5fa8b38d4243e",
+      "sha256": "28eecdb75b6de2d9020603531461444bf54db827ee2fb345a8fcf4dbee7c2ad1"
+    },
+    {
+      "path": "THIRD_PARTY_LICENSES/additional/tree-sitter-md-0.5.3/LICENSE",
+      "kind": "license",
+      "repository": "https://github.com/tree-sitter-grammars/tree-sitter-markdown",
+      "revision": "f969cd3ae3f9fbd4e43205431d0ae286014c05b5",
+      "upstream_path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/tree-sitter-grammars/tree-sitter-markdown/f969cd3ae3f9fbd4e43205431d0ae286014c05b5/LICENSE",
+      "git_blob_sha1": "c125939af9e397f845811e9d8f31e07dc69170db",
+      "sha256": "52ec8a1bf8256511e2a92613e0bb41ffefba3897f16fa958d7bb28c466dd4804"
+    },
+    {
+      "path": "THIRD_PARTY_LICENSES/additional/tree-sitter-sequel-0.3.11/LICENSE",
+      "kind": "license",
+      "repository": "https://github.com/derekstride/tree-sitter-sql",
+      "revision": "7b51ecda191d36b92f5a90a8d1bc3faef1c7b8b8",
+      "upstream_path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/derekstride/tree-sitter-sql/7b51ecda191d36b92f5a90a8d1bc3faef1c7b8b8/LICENSE",
+      "git_blob_sha1": "b976c9b4c70b2aad4bb31de3d6504193dc0be83c",
+      "sha256": "3b3e4e4252d5d7d1c18e1257005f23242bf0580ad619204fd093c99b8c56748d"
+    },
+    {
+      "path": "THIRD_PARTY_LICENSES/additional/tree-sitter-starlark-1.3.0/LICENSE",
+      "kind": "license",
+      "repository": "https://github.com/tree-sitter-grammars/tree-sitter-starlark",
+      "revision": "a453dbf3ba433db0e5ec621a38a7e59d72e4dc69",
+      "upstream_path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/tree-sitter-grammars/tree-sitter-starlark/a453dbf3ba433db0e5ec621a38a7e59d72e4dc69/LICENSE",
+      "git_blob_sha1": "5af536362c15275bb3a57445bc5be23b349cd1de",
+      "sha256": "099c44248f8cf353123211318680e93465587c005a4b3730ce8cb5334de043d6"
+    },
+    {
+      "path": "THIRD_PARTY_LICENSES/additional/tree-sitter-xml-0.7.0/LICENSE",
+      "kind": "license",
+      "repository": "https://github.com/tree-sitter-grammars/tree-sitter-xml",
+      "revision": "4b64dd3a03ec002258d6268d712fd93716d6ab57",
+      "upstream_path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/tree-sitter-grammars/tree-sitter-xml/4b64dd3a03ec002258d6268d712fd93716d6ab57/LICENSE",
+      "git_blob_sha1": "7094a20529cd00436ad0cab177e635308982b1ef",
+      "sha256": "3297073719030b7261afd78b7267931ccc03a27f7a65ca6fc644316180f71bf6"
+    },
+    {
+      "path": "THIRD_PARTY_LICENSES/additional/tree-sitter-zig-1.1.2/LICENSE",
+      "kind": "license",
+      "repository": "https://github.com/tree-sitter-grammars/tree-sitter-zig",
+      "revision": "b670c8df85a1568f498aa5c8cae42f51a90473c0",
+      "upstream_path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/tree-sitter-grammars/tree-sitter-zig/b670c8df85a1568f498aa5c8cae42f51a90473c0/LICENSE",
+      "git_blob_sha1": "4e8c9b38350135b69d7137e508d29e8980794569",
+      "sha256": "0eea8dc45e89deeb03c7799bbbc7b4688f365fb274562f4540ecfebdea82e727"
+    },
+    {
+      "path": "THIRD_PARTY_LICENSES/dependencies/mlua-sys-0.12.0/LICENSE",
+      "kind": "license",
+      "sha256": "63b61a30d3e3abcfcb1bda4b99f4eea9fdb7d6ab05fbc513461fef6cf89baf29",
+      "repository": "https://github.com/mlua-rs/mlua",
+      "revision": "4fd87af2157b0a7ecd22ba299848e4ca3d462efe",
+      "upstream_path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/mlua-rs/mlua/4fd87af2157b0a7ecd22ba299848e4ca3d462efe/LICENSE",
+      "git_blob_sha1": "66f2fa32dff88afeceb8d5f9e3093f6b9b604f98"
+    },
+    {
+      "path": "THIRD_PARTY_LICENSES/dependencies/ruff-0.0.14/LICENSE",
+      "kind": "license",
+      "sha256": "2597d854122b77ddc71971564ca2350a37608575ce324adc5650a2b2051c8f18",
+      "repository": "https://github.com/astral-sh/ruff",
+      "revision": "62914c4b9b79a9e5004374a9c482ad2ed69290e1",
+      "upstream_path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/astral-sh/ruff/62914c4b9b79a9e5004374a9c482ad2ed69290e1/LICENSE",
+      "git_blob_sha1": "655a0c76fc5539b2f8e63b673741a5fd0e0c5799"
+    }
+  ],
+  "packages": [
+    {
+      "name": "alloc-stdlib",
+      "version": "0.2.4",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "0e76a019e91224d279006ff972f1e984179a6e9feb050adba6ce8274aef23195",
+      "archive_checksum_verified": true,
+      "declared_license": "BSD-3-Clause",
+      "repository": "https://github.com/dropbox/rust-alloc-no-stdlib",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "ae42d22078b98549e987d2f03d12df7b984fde47"
+        },
+        "path_in_vcs": "alloc-stdlib"
+      },
+      "revision": "ae42d22078b98549e987d2f03d12df7b984fde47",
+      "path_in_vcs": "alloc-stdlib",
+      "manifest_git_blob_sha1": "b4d83ae7b6473ea017a91800f995d5b095463cd0",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "Cargo.lock"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/additional/alloc-stdlib-0.2.4/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected"
+    },
+    {
+      "name": "jsonschema-regex",
+      "version": "0.52.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "f5d90ea83fa606c96f0b4737ecedf1fa6b624272022edc42039565f8d8af0b78",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/Stranger6667/jsonschema",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "94546ceb734c6076e73c4a6723de98804ad63ae6"
+        },
+        "path_in_vcs": "crates/jsonschema-regex"
+      },
+      "revision": "94546ceb734c6076e73c4a6723de98804ad63ae6",
+      "path_in_vcs": "crates/jsonschema-regex",
+      "manifest_git_blob_sha1": "41e172465a0827916e21f995e86df3e6c5225535",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "Cargo.lock"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/additional/jsonschema-0.52.1/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected"
+    },
+    {
+      "name": "jsonschema-value",
+      "version": "0.52.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "da4ab4cbe58181a117d8c3582844ce20b07184319b51ba6d756596c1c451aebc",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/Stranger6667/jsonschema",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "94546ceb734c6076e73c4a6723de98804ad63ae6"
+        },
+        "path_in_vcs": "crates/jsonschema-value"
+      },
+      "revision": "94546ceb734c6076e73c4a6723de98804ad63ae6",
+      "path_in_vcs": "crates/jsonschema-value",
+      "manifest_git_blob_sha1": "2fa6e47137d3f5d312527a743f981b61addec0ef",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "Cargo.lock"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/additional/jsonschema-0.52.1/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected"
+    },
+    {
+      "name": "mlua_derive",
+      "version": "0.12.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "87de1e4bdfaa4bb99d8c1449d8a34b0f19e649ef68eb5d4e8dbf1e9ec6f4a084",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/mlua-rs/mlua",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "4fd87af2157b0a7ecd22ba299848e4ca3d462efe"
+        },
+        "path_in_vcs": "mlua_derive"
+      },
+      "revision": "4fd87af2157b0a7ecd22ba299848e4ca3d462efe",
+      "path_in_vcs": "mlua_derive",
+      "manifest_git_blob_sha1": "da1f2b593e682516e7bb391ac80bec90fe3b10c0",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "Cargo.lock"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/mlua-sys-0.12.0/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected"
+    },
+    {
+      "name": "monty",
+      "version": "1.0.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "2146a40e2752039fd9e0582d141b832b4de4a9cb113a830cd46afbd79798ea89",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/pydantic/monty/",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "85c5d1f6bef038405cfc40a4eed94806e303567e"
+        },
+        "path_in_vcs": "crates/monty"
+      },
+      "revision": "85c5d1f6bef038405cfc40a4eed94806e303567e",
+      "path_in_vcs": "crates/monty",
+      "manifest_git_blob_sha1": "c66034a1e5248438acc372dc4a55ad2136285616",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "Cargo.lock",
+        "monty-runtime-1.0.0/Cargo.lock (worker source selected by target/code-worker/source-manifest-path)"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/Monty.txt"
+      ],
+      "notice_files": [],
+      "status": "collected"
+    },
+    {
+      "name": "monty-alloc",
+      "version": "1.0.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "8ec3304f593d027c1157791e11e102d65a4ef0231d93d5f56a48f1cbb99df9b7",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/pydantic/monty/",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "85c5d1f6bef038405cfc40a4eed94806e303567e"
+        },
+        "path_in_vcs": "crates/monty-alloc"
+      },
+      "revision": "85c5d1f6bef038405cfc40a4eed94806e303567e",
+      "path_in_vcs": "crates/monty-alloc",
+      "manifest_git_blob_sha1": "c8d3c8761da010324056cdc5f31e2fe9fab52e5b",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "monty-runtime-1.0.0/Cargo.lock (worker source selected by target/code-worker/source-manifest-path)"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/Monty.txt"
+      ],
+      "notice_files": [],
+      "status": "collected"
+    },
+    {
+      "name": "monty-runtime",
+      "version": "1.0.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "000d04b3bc56ca99aa2c74927fc4abaf90b6baa08ef2e3759e64298a01fe97a0",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/pydantic/monty/",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "85c5d1f6bef038405cfc40a4eed94806e303567e"
+        },
+        "path_in_vcs": "crates/monty-runtime"
+      },
+      "revision": "85c5d1f6bef038405cfc40a4eed94806e303567e",
+      "path_in_vcs": "crates/monty-runtime",
+      "manifest_git_blob_sha1": "7411d9b0ede8170f8fe8f177f0963d30490f0287",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "monty-runtime-1.0.0/Cargo.lock (worker source selected by target/code-worker/source-manifest-path)"
+      ],
+      "archive_checksum_source": "Cached crates.io sparse-index mo/nt/monty-runtime record for version 1.0.0",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/Monty.txt"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "notes": [
+        "The worker root package has no source/checksum in its own Cargo.lock. Its .crate SHA-256 was verified against the exact-version crates.io index record instead. The worker source pointer resolves to this cached published package."
+      ]
+    },
+    {
+      "name": "monty-type-checking",
+      "version": "1.0.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "8853a103b69f8fc47b435033b32b80eeec17ee5dd03c5e28067a023e3dccac08",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/pydantic/monty/",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "85c5d1f6bef038405cfc40a4eed94806e303567e"
+        },
+        "path_in_vcs": "crates/monty-type-checking"
+      },
+      "revision": "85c5d1f6bef038405cfc40a4eed94806e303567e",
+      "path_in_vcs": "crates/monty-type-checking",
+      "manifest_git_blob_sha1": "a43876768ef5e6199fa0ba7c315c222a2343c859",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "monty-runtime-1.0.0/Cargo.lock (worker source selected by target/code-worker/source-manifest-path)"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/Monty.txt"
+      ],
+      "notice_files": [],
+      "status": "collected"
+    },
+    {
+      "name": "ruff_db",
+      "version": "0.0.14",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "87865e21ccc5da729edbe16bf8fd6bc0d8f97183b23e432dbf1c75f37896a9fc",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/astral-sh/ruff",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "62914c4b9b79a9e5004374a9c482ad2ed69290e1"
+        },
+        "path_in_vcs": "crates/ruff_db"
+      },
+      "revision": "62914c4b9b79a9e5004374a9c482ad2ed69290e1",
+      "path_in_vcs": "crates/ruff_db",
+      "manifest_git_blob_sha1": "bda41110548344643e8929a8fa19cb9cc0f817ac",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "monty-runtime-1.0.0/Cargo.lock (worker source selected by target/code-worker/source-manifest-path)"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/ruff-0.0.14/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected"
+    },
+    {
+      "name": "ruff_diagnostics",
+      "version": "0.0.14",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "3ad300b25e4bf76831905415a0d9eefa5edd5e3da5ba1bac934cbc368e3d3f47",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/astral-sh/ruff",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "62914c4b9b79a9e5004374a9c482ad2ed69290e1"
+        },
+        "path_in_vcs": "crates/ruff_diagnostics"
+      },
+      "revision": "62914c4b9b79a9e5004374a9c482ad2ed69290e1",
+      "path_in_vcs": "crates/ruff_diagnostics",
+      "manifest_git_blob_sha1": "d0462a979ddc8e7a6b3764f174d93fa273c40a55",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "monty-runtime-1.0.0/Cargo.lock (worker source selected by target/code-worker/source-manifest-path)"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/ruff-0.0.14/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected"
+    },
+    {
+      "name": "ruff_index",
+      "version": "0.0.14",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "3c9a735ae02d7c9343fd409b199e063de972c773aa596d4fc5468172b4e6f14b",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/astral-sh/ruff",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "62914c4b9b79a9e5004374a9c482ad2ed69290e1"
+        },
+        "path_in_vcs": "crates/ruff_index"
+      },
+      "revision": "62914c4b9b79a9e5004374a9c482ad2ed69290e1",
+      "path_in_vcs": "crates/ruff_index",
+      "manifest_git_blob_sha1": "9a5dcc611e8b1d5bf53bb028c024e54b933e935b",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "monty-runtime-1.0.0/Cargo.lock (worker source selected by target/code-worker/source-manifest-path)"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/ruff-0.0.14/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected"
+    },
+    {
+      "name": "ruff_macros",
+      "version": "0.0.14",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "86d07871452a1708c4794437880df354b9d44cd92eede9bb7ee4eb265ee9455a",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/astral-sh/ruff",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "62914c4b9b79a9e5004374a9c482ad2ed69290e1"
+        },
+        "path_in_vcs": "crates/ruff_macros"
+      },
+      "revision": "62914c4b9b79a9e5004374a9c482ad2ed69290e1",
+      "path_in_vcs": "crates/ruff_macros",
+      "manifest_git_blob_sha1": "e9bc68e90050eb083a08a509504e6c396f261239",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "monty-runtime-1.0.0/Cargo.lock (worker source selected by target/code-worker/source-manifest-path)"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/ruff-0.0.14/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected"
+    },
+    {
+      "name": "ruff_memory_usage",
+      "version": "0.0.14",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "12e66c773ebb716329e615febf9571cd61219072602da6da962e089d52e9e039",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/astral-sh/ruff",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "62914c4b9b79a9e5004374a9c482ad2ed69290e1"
+        },
+        "path_in_vcs": "crates/ruff_memory_usage"
+      },
+      "revision": "62914c4b9b79a9e5004374a9c482ad2ed69290e1",
+      "path_in_vcs": "crates/ruff_memory_usage",
+      "manifest_git_blob_sha1": "75123dcfa067486c590ee52befaeb48364e8a3a8",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "monty-runtime-1.0.0/Cargo.lock (worker source selected by target/code-worker/source-manifest-path)"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/ruff-0.0.14/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected"
+    },
+    {
+      "name": "ruff_notebook",
+      "version": "0.0.14",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "391c4665c6871a4c849ed6750a6a6f9bc0f64bf2af6edffba0fdd7a9a5550e13",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/astral-sh/ruff",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "62914c4b9b79a9e5004374a9c482ad2ed69290e1"
+        },
+        "path_in_vcs": "crates/ruff_notebook"
+      },
+      "revision": "62914c4b9b79a9e5004374a9c482ad2ed69290e1",
+      "path_in_vcs": "crates/ruff_notebook",
+      "manifest_git_blob_sha1": "7bd0d0d016ff200cdaaf4b11b80cd49b51a14af5",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "monty-runtime-1.0.0/Cargo.lock (worker source selected by target/code-worker/source-manifest-path)"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/ruff-0.0.14/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected"
+    },
+    {
+      "name": "ruff_python_edits",
+      "version": "0.0.14",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "c5331a30a52c6f08a4fcd59cb9195dea1cee93f775736773eefaab2b30aab898",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/astral-sh/ruff",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "62914c4b9b79a9e5004374a9c482ad2ed69290e1"
+        },
+        "path_in_vcs": "crates/ruff_python_edits"
+      },
+      "revision": "62914c4b9b79a9e5004374a9c482ad2ed69290e1",
+      "path_in_vcs": "crates/ruff_python_edits",
+      "manifest_git_blob_sha1": "8f0bc6f024b9a60f0a08a46878196111f4ef5d77",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "monty-runtime-1.0.0/Cargo.lock (worker source selected by target/code-worker/source-manifest-path)"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/ruff-0.0.14/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected"
+    },
+    {
+      "name": "ruff_python_importer",
+      "version": "0.0.14",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "38b17eb806844fcaab982a82777316d34f8f6c50733918e071bd11a5feae0d11",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/astral-sh/ruff",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "62914c4b9b79a9e5004374a9c482ad2ed69290e1"
+        },
+        "path_in_vcs": "crates/ruff_python_importer"
+      },
+      "revision": "62914c4b9b79a9e5004374a9c482ad2ed69290e1",
+      "path_in_vcs": "crates/ruff_python_importer",
+      "manifest_git_blob_sha1": "933cf59156da0ecaf0dd4adbf277195ab877f301",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "monty-runtime-1.0.0/Cargo.lock (worker source selected by target/code-worker/source-manifest-path)"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/ruff-0.0.14/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected"
+    },
+    {
+      "name": "ruff_ranged_value",
+      "version": "0.0.14",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "2f8e255bdee86430eb66b1317d751a1b4cba60a4fe56b15ce3c58b900fb5baec",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/astral-sh/ruff",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "62914c4b9b79a9e5004374a9c482ad2ed69290e1"
+        },
+        "path_in_vcs": "crates/ruff_ranged_value"
+      },
+      "revision": "62914c4b9b79a9e5004374a9c482ad2ed69290e1",
+      "path_in_vcs": "crates/ruff_ranged_value",
+      "manifest_git_blob_sha1": "b6b62e4c362116bbd1be06aa5d5a3535ebc2b179",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "monty-runtime-1.0.0/Cargo.lock (worker source selected by target/code-worker/source-manifest-path)"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/ruff-0.0.14/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected"
+    },
+    {
+      "name": "tree-sitter-cpp",
+      "version": "0.23.4",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "df2196ea9d47b4ab4a31b9297eaa5a5d19a0b121dceb9f118f6790ad0ab94743",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/tree-sitter/tree-sitter-cpp",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "f41e1a044c8a84ea9fa8577fdd2eab92ec96de02"
+        },
+        "path_in_vcs": ""
+      },
+      "revision": "f41e1a044c8a84ea9fa8577fdd2eab92ec96de02",
+      "path_in_vcs": "",
+      "manifest_git_blob_sha1": "f1534b9d10f3dee43245a52368f51df89f916266",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "Cargo.lock"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/TreeSitterQueries.txt"
+      ],
+      "notice_files": [],
+      "status": "collected"
+    },
+    {
+      "name": "tree-sitter-gleam",
+      "version": "1.0.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "f0175c53793bda5d444360dd5add25463d18d66afb7f521d6791e2fc61bf2fb3",
+      "archive_checksum_verified": true,
+      "declared_license": "Apache-2.0",
+      "repository": "https://github.com/tree-sitter/tree-sitter-gleam",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "066704e4826699e754d351e3bbe12bf2e51de9d8"
+        },
+        "path_in_vcs": ""
+      },
+      "revision": "066704e4826699e754d351e3bbe12bf2e51de9d8",
+      "path_in_vcs": "",
+      "manifest_git_blob_sha1": "0e5e6ed62283626ae70fb2bfcea036ce80678000",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "Cargo.lock"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "resolved_repository": "https://github.com/gleam-lang/tree-sitter-gleam",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/additional/tree-sitter-gleam-1.0.0/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "notes": [
+        "The published repository URL tree-sitter/tree-sitter-gleam returns 404. The exact .cargo_vcs_info revision is present in gleam-lang/tree-sitter-gleam and its Cargo.toml matches the published Cargo.toml.orig byte-for-byte. License and manifest were fetched at that immutable revision, not HEAD."
+      ]
+    },
+    {
+      "name": "tree-sitter-html",
+      "version": "0.23.2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "261b708e5d92061ede329babaaa427b819329a9d427a1d710abb0f67bbef63ee",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/tree-sitter/tree-sitter-html",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "5a5ca8551a179998360b4a4ca2c0f366a35acc03"
+        },
+        "path_in_vcs": ""
+      },
+      "revision": "5a5ca8551a179998360b4a4ca2c0f366a35acc03",
+      "path_in_vcs": "",
+      "manifest_git_blob_sha1": "fc936a404c99c8e9c863d2b1771f9e845852824b",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "Cargo.lock"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/additional/tree-sitter-html-0.23.2/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected"
+    },
+    {
+      "name": "tree-sitter-java",
+      "version": "0.23.5",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "0aa6cbcdc8c679b214e616fd3300da67da0e492e066df01bcf5a5921a71e90d6",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/tree-sitter/tree-sitter-java",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "94703d5a6bed02b98e438d7cad1136c01a60ba2c"
+        },
+        "path_in_vcs": ""
+      },
+      "revision": "94703d5a6bed02b98e438d7cad1136c01a60ba2c",
+      "path_in_vcs": "",
+      "manifest_git_blob_sha1": "0127a317192a83e1da506ec15ba4215ab19a3452",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "Cargo.lock"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/TreeSitterQueries.txt"
+      ],
+      "notice_files": [],
+      "status": "collected"
+    },
+    {
+      "name": "tree-sitter-json",
+      "version": "0.24.8",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "4d727acca406c0020cffc6cf35516764f36c8e3dc4408e5ebe2cb35a947ec471",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/tree-sitter/tree-sitter-json",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "ee35a6ebefcef0c5c416c0d1ccec7370cfca5a24"
+        },
+        "path_in_vcs": ""
+      },
+      "revision": "ee35a6ebefcef0c5c416c0d1ccec7370cfca5a24",
+      "path_in_vcs": "",
+      "manifest_git_blob_sha1": "4fcaff12ce16ad30d197434fe6b6c7f0f4e8d452",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "Cargo.lock"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/TreeSitterQueries.txt"
+      ],
+      "notice_files": [],
+      "status": "collected"
+    },
+    {
+      "name": "tree-sitter-kotlin-ng",
+      "version": "1.1.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "e800ebbda938acfbf224f4d2c34947a31994b1295ee6e819b65226c7b51b4450",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/tree-sitter-grammars/tree-sitter-kotlin",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "77dd60ea0a9003ce062c9728a513ffe1aaff8c82"
+        },
+        "path_in_vcs": ""
+      },
+      "revision": "77dd60ea0a9003ce062c9728a513ffe1aaff8c82",
+      "path_in_vcs": "",
+      "manifest_git_blob_sha1": "09739161e32bfe3ca6f9a74082dfea741fd48224",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "Cargo.lock"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/additional/tree-sitter-kotlin-ng-1.1.0/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected"
+    },
+    {
+      "name": "tree-sitter-lua",
+      "version": "0.5.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "8daaf5f4235188a58603c39760d5fa5d4b920d36a299c934adddae757f32a10c",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/tree-sitter-grammars/tree-sitter-lua",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "10fe0054734eec83049514ea2e718b2a56acd0c9"
+        },
+        "path_in_vcs": ""
+      },
+      "revision": "10fe0054734eec83049514ea2e718b2a56acd0c9",
+      "path_in_vcs": "",
+      "manifest_git_blob_sha1": "d01a262b19997b2d4d47495ed1f5ea131911ae55",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE.md"
+      ],
+      "lockfiles": [
+        "Cargo.lock"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/TreeSitterQueries.txt"
+      ],
+      "notice_files": [],
+      "status": "collected"
+    },
+    {
+      "name": "tree-sitter-make",
+      "version": "1.1.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "c5998dc7cbcbdab19fae8aefef982bf2d6544513d8d2e69cc44aec4c63810104",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/tree-sitter-grammars/tree-sitter-make",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "5e9e8f8ff3387b0edcaa90f46ddf3629f4cfeb1d"
+        },
+        "path_in_vcs": ""
+      },
+      "revision": "5e9e8f8ff3387b0edcaa90f46ddf3629f4cfeb1d",
+      "path_in_vcs": "",
+      "manifest_git_blob_sha1": "e236e6cb4cd6f83af5d131698f76077a9cbea84d",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "Cargo.lock"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/additional/tree-sitter-make-1.1.1/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected"
+    },
+    {
+      "name": "tree-sitter-md",
+      "version": "0.5.3",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "2efd398be546456c814598ee56c0f51769a77241511b4a58077815d120afa882",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/tree-sitter-grammars/tree-sitter-markdown",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "f969cd3ae3f9fbd4e43205431d0ae286014c05b5"
+        },
+        "path_in_vcs": ""
+      },
+      "revision": "f969cd3ae3f9fbd4e43205431d0ae286014c05b5",
+      "path_in_vcs": "",
+      "manifest_git_blob_sha1": "55de61a3dfb5f4960374cb9ce07ebecfe41ef035",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "Cargo.lock"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/additional/tree-sitter-md-0.5.3/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected"
+    },
+    {
+      "name": "tree-sitter-objc",
+      "version": "3.0.2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "9ca8bb556423fc176f0535e79d525f783a6684d3c9da81bf9d905303c129e1d2",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/tree-sitter-grammars/tree-sitter-objc",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "18802acf31d0b5c1c1d50bdbc9eb0e1636cab9ed"
+        },
+        "path_in_vcs": ""
+      },
+      "revision": "18802acf31d0b5c1c1d50bdbc9eb0e1636cab9ed",
+      "path_in_vcs": "",
+      "manifest_git_blob_sha1": "c201e190cebeb094268aeb1ddab6a274ad212c42",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "Cargo.lock"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/TreeSitterQueries.txt"
+      ],
+      "notice_files": [],
+      "status": "collected"
+    },
+    {
+      "name": "tree-sitter-ruby",
+      "version": "0.23.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "be0484ea4ef6bb9c575b4fdabde7e31340a8d2dbc7d52b321ac83da703249f95",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/tree-sitter/tree-sitter-ruby",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "71bd32fb7607035768799732addba884a37a6210"
+        },
+        "path_in_vcs": ""
+      },
+      "revision": "71bd32fb7607035768799732addba884a37a6210",
+      "path_in_vcs": "",
+      "manifest_git_blob_sha1": "ccc37ab8a30bdf8da1a4511ead774c9c3fb0a0a2",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "Cargo.lock"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/TreeSitterQueries.txt"
+      ],
+      "notice_files": [],
+      "status": "collected"
+    },
+    {
+      "name": "tree-sitter-sequel",
+      "version": "0.3.11",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "9d198ad3c319c02e43c21efa1ec796b837afcb96ffaef1a40c1978fbdcec7d17",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/derekstride/tree-sitter-sql.git",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "7b51ecda191d36b92f5a90a8d1bc3faef1c7b8b8",
+          "dirty": true
+        },
+        "path_in_vcs": ""
+      },
+      "revision": "7b51ecda191d36b92f5a90a8d1bc3faef1c7b8b8",
+      "path_in_vcs": "",
+      "manifest_git_blob_sha1": "5d368835f7477b79982294a726ead4a7607421ea",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "Cargo.lock"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/additional/tree-sitter-sequel-0.3.11/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected",
+      "notes": [
+        "The published archive records git.dirty=true. Cargo.toml.orig matches the pinned revision exactly, and that revision supplies this license text. This does not establish that every published source file equals the clean revision."
+      ]
+    },
+    {
+      "name": "tree-sitter-starlark",
+      "version": "1.3.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "8934f282d085cc4b9ee28aa688aa3fbe8aa3766201c2a6252f411d45b4c3a721",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/tree-sitter-grammars/tree-sitter-starlark",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "a453dbf3ba433db0e5ec621a38a7e59d72e4dc69"
+        },
+        "path_in_vcs": ""
+      },
+      "revision": "a453dbf3ba433db0e5ec621a38a7e59d72e4dc69",
+      "path_in_vcs": "",
+      "manifest_git_blob_sha1": "bb9b1b8ae5606d7816379509835c9a15e845457a",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "Cargo.lock"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/additional/tree-sitter-starlark-1.3.0/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected"
+    },
+    {
+      "name": "tree-sitter-toml-ng",
+      "version": "0.7.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "e9adc2c898ae49730e857d75be403da3f92bb81d8e37a2f918a08dd10de5ebb1",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/tree-sitter-grammars/tree-sitter-toml",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "64b56832c2cffe41758f28e05c756a3a98d16f41"
+        },
+        "path_in_vcs": ""
+      },
+      "revision": "64b56832c2cffe41758f28e05c756a3a98d16f41",
+      "path_in_vcs": "",
+      "manifest_git_blob_sha1": "84edd57637a72c11e56def6200fc309d45e894fa",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "Cargo.lock"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/TreeSitterQueries.txt"
+      ],
+      "notice_files": [],
+      "status": "collected"
+    },
+    {
+      "name": "tree-sitter-typescript",
+      "version": "0.23.2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "6c5f76ed8d947a75cc446d5fccd8b602ebf0cde64ccf2ffa434d873d7a575eff",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/tree-sitter/tree-sitter-typescript",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "f975a621f4e7f532fe322e13c4f79495e0a7b2e7"
+        },
+        "path_in_vcs": ""
+      },
+      "revision": "f975a621f4e7f532fe322e13c4f79495e0a7b2e7",
+      "path_in_vcs": "",
+      "manifest_git_blob_sha1": "0e7032c85ae0e18015e523e678ed3aa599dbc425",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "Cargo.lock"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/TreeSitterQueries.txt"
+      ],
+      "notice_files": [],
+      "status": "collected"
+    },
+    {
+      "name": "tree-sitter-xml",
+      "version": "0.7.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "e670041f591d994f54d597ddcd8f4ebc930e282c4c76a42268743b71f0c8b6b3",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/tree-sitter-grammars/tree-sitter-xml",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "4b64dd3a03ec002258d6268d712fd93716d6ab57"
+        },
+        "path_in_vcs": ""
+      },
+      "revision": "4b64dd3a03ec002258d6268d712fd93716d6ab57",
+      "path_in_vcs": "",
+      "manifest_git_blob_sha1": "4cafe71f3124ca817be9def513b094f05b5df56a",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "Cargo.lock"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/additional/tree-sitter-xml-0.7.0/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected"
+    },
+    {
+      "name": "tree-sitter-zig",
+      "version": "1.1.2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "ab11fc124851b0db4dd5e55983bbd9631192e93238389dcd44521715e5d53e28",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/tree-sitter-grammars/tree-sitter-zig",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "b670c8df85a1568f498aa5c8cae42f51a90473c0"
+        },
+        "path_in_vcs": ""
+      },
+      "revision": "b670c8df85a1568f498aa5c8cae42f51a90473c0",
+      "path_in_vcs": "",
+      "manifest_git_blob_sha1": "7a462ea8962fb7412298450256a28277c1fa8522",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "Cargo.lock"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/additional/tree-sitter-zig-1.1.2/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected"
+    },
+    {
+      "name": "ty_combine",
+      "version": "0.0.14",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "de677e80db2061cacd5cc3f1d32a122fb7b601ba8904e4c1a714e265453f4183",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/astral-sh/ruff",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "62914c4b9b79a9e5004374a9c482ad2ed69290e1"
+        },
+        "path_in_vcs": "crates/ty_combine"
+      },
+      "revision": "62914c4b9b79a9e5004374a9c482ad2ed69290e1",
+      "path_in_vcs": "crates/ty_combine",
+      "manifest_git_blob_sha1": "680681a96a350726d7f202e1adf4922d70716fbc",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "monty-runtime-1.0.0/Cargo.lock (worker source selected by target/code-worker/source-manifest-path)"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/ruff-0.0.14/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected"
+    },
+    {
+      "name": "ty_module_resolver",
+      "version": "0.0.14",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "3ea2bef761b110e6ad5b0cc42ae071ba393266bc0d0938dfe5bc2809118059e9",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/astral-sh/ruff",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "62914c4b9b79a9e5004374a9c482ad2ed69290e1"
+        },
+        "path_in_vcs": "crates/ty_module_resolver"
+      },
+      "revision": "62914c4b9b79a9e5004374a9c482ad2ed69290e1",
+      "path_in_vcs": "crates/ty_module_resolver",
+      "manifest_git_blob_sha1": "dea7c785af263334ac30a5199943a327dde744a0",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "monty-runtime-1.0.0/Cargo.lock (worker source selected by target/code-worker/source-manifest-path)"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/ruff-0.0.14/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected"
+    },
+    {
+      "name": "ty_python_core",
+      "version": "0.0.14",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "ce875d7dcdf819db79618cdf2023a5493a8173cd7395eb1e9470a8ec7575a6c6",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/astral-sh/ruff",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "62914c4b9b79a9e5004374a9c482ad2ed69290e1"
+        },
+        "path_in_vcs": "crates/ty_python_core"
+      },
+      "revision": "62914c4b9b79a9e5004374a9c482ad2ed69290e1",
+      "path_in_vcs": "crates/ty_python_core",
+      "manifest_git_blob_sha1": "740c2dc951b79c41ae4ff16a8194dec500c1ed30",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "monty-runtime-1.0.0/Cargo.lock (worker source selected by target/code-worker/source-manifest-path)"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/ruff-0.0.14/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected"
+    },
+    {
+      "name": "ty_python_semantic",
+      "version": "0.0.14",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "7adcef02a5cffcc52863ba0f5928ad7451f8e5403082d234bbe1dff91f5d7a89",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/astral-sh/ruff",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "62914c4b9b79a9e5004374a9c482ad2ed69290e1"
+        },
+        "path_in_vcs": "crates/ty_python_semantic"
+      },
+      "revision": "62914c4b9b79a9e5004374a9c482ad2ed69290e1",
+      "path_in_vcs": "crates/ty_python_semantic",
+      "manifest_git_blob_sha1": "dd83f085cab619b84f7350c1b66a9b5d255e670b",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "monty-runtime-1.0.0/Cargo.lock (worker source selected by target/code-worker/source-manifest-path)"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/ruff-0.0.14/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected"
+    },
+    {
+      "name": "ty_site_packages",
+      "version": "0.0.14",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "b1ac21186f9bd5a853e7f5447900081e0e46bf5288f63a35c37cab7b79c237b0",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/astral-sh/ruff",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "62914c4b9b79a9e5004374a9c482ad2ed69290e1"
+        },
+        "path_in_vcs": "crates/ty_site_packages"
+      },
+      "revision": "62914c4b9b79a9e5004374a9c482ad2ed69290e1",
+      "path_in_vcs": "crates/ty_site_packages",
+      "manifest_git_blob_sha1": "4e185a4ffe373e77be5341ceec9e5e20004c4633",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "monty-runtime-1.0.0/Cargo.lock (worker source selected by target/code-worker/source-manifest-path)"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/ruff-0.0.14/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected"
+    },
+    {
+      "name": "ty_static",
+      "version": "0.0.14",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "ed63664107dcb76725bd47f4dcc67fd8aff1a79db5f61b98a5749cb68a65b835",
+      "archive_checksum_verified": true,
+      "declared_license": "MIT",
+      "repository": "https://github.com/astral-sh/ruff",
+      "cargo_vcs_info": {
+        "git": {
+          "sha1": "62914c4b9b79a9e5004374a9c482ad2ed69290e1"
+        },
+        "path_in_vcs": "crates/ty_static"
+      },
+      "revision": "62914c4b9b79a9e5004374a9c482ad2ed69290e1",
+      "path_in_vcs": "crates/ty_static",
+      "manifest_git_blob_sha1": "b1562587db702e3d2f8a3325528f377676d09bcc",
+      "manifest_match": "exact",
+      "inspected_ancestor_legal_paths": [
+        "LICENSE"
+      ],
+      "lockfiles": [
+        "monty-runtime-1.0.0/Cargo.lock (worker source selected by target/code-worker/source-manifest-path)"
+      ],
+      "archive_checksum_source": "Applicable lockfile checksum",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/dependencies/ruff-0.0.14/LICENSE"
+      ],
+      "notice_files": [],
+      "status": "collected"
+    }
+  ]
+}
