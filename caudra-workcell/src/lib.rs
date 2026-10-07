@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod automation_http;
 mod changes;
 pub mod editor_adapter;
 mod native_redirect;
@@ -13,6 +14,7 @@ mod transfer_authorization;
 mod transfer_inventory;
 mod transfer_session;
 
+pub use automation_http::{AutomationHttpClient, automation_http_client};
 pub use changes::{ChangeInventory, LocalChangeStore, LocalChangeStores, PreparedStoreCleanup};
 pub use pattern_analysis::{
     BashContextAssumptions, BashContextIssue, BashOperatorKind, BashSpan,
@@ -112,9 +114,9 @@ use workcell::shell::{
     ShellPreparationError, ShellProgressChunk, ShellProgressSink, ShellStream, ShellToolGroup,
 };
 use workcell::web::{
-    PreparedWebfetch, PreparedWebsearch, ProxyConfiguration, WebExecution, WebToolGroup,
-    WebfetchError, WebfetchInput, WebfetchOutput, WebsearchExecutionConfiguration, WebsearchInput,
-    WebsearchOutput,
+    PreparedWebfetch, PreparedWebsearch, ProxyConfiguration, ProxyConfigurationError, WebExecution,
+    WebToolGroup, WebfetchError, WebfetchInput, WebfetchOutput, WebsearchExecutionConfiguration,
+    WebsearchInput, WebsearchOutput,
 };
 use workcell::{CodeToolGroup, ExecutionEnvironment};
 use workcell::{OwnedToolSpec, ToolSpec};
@@ -456,8 +458,12 @@ impl WorkcellHost {
                 None
             }
         };
-        let (proxy, proxy_warning) = ambient_proxy();
-        warnings.extend(proxy_warning);
+        let proxy = ambient_proxy().unwrap_or_else(|error| {
+            warnings.push(format!(
+                "Workcell web tools are dialling directly: the proxy environment is unusable ({error})"
+            ));
+            ProxyConfiguration::direct()
+        });
         let projects = HashMap::from([(
             project_cwd,
             ProjectGroups {
@@ -911,32 +917,25 @@ impl Tool for WorkcellTool {
     }
 }
 
-/// The outbound proxy for the web tools, read from the ambient environment.
+/// The outbound proxy for the web tools and automations' `http()`, read from the
+/// ambient environment.
 ///
 /// Workcell already forwards these variables to every `shell` child, so without
 /// this the two disagree: behind an enforcing proxy `shell curl` would reach the
 /// network and `webfetch` would not.
 ///
-/// An unusable value never fails host construction. Refusing to start over a
-/// malformed `NO_PROXY` entry would take the whole session down for a setting
-/// that only affects two tools, so it degrades to a direct dial and says so.
-fn ambient_proxy() -> (ProxyConfiguration, Option<String>) {
+/// An unusable value never fails startup. Refusing to start over a malformed
+/// `NO_PROXY` entry would take the whole session down for a setting that only
+/// affects outbound requests, so callers degrade to a direct dial and say so.
+/// The error never carries the value: a proxy URL may hold credentials.
+fn ambient_proxy() -> Result<ProxyConfiguration, ProxyConfigurationError> {
     let first = |names: &[&str]| names.iter().find_map(|name| std::env::var(name).ok());
-    match ProxyConfiguration::from_values(
+    ProxyConfiguration::from_values(
         first(PROXY_HTTP_VARS).as_deref(),
         first(PROXY_HTTPS_VARS).as_deref(),
         first(PROXY_ALL_VARS).as_deref(),
         first(PROXY_BYPASS_VARS).as_deref(),
-    ) {
-        Ok(proxy) => (proxy, None),
-        // The error never carries the value: a proxy URL may hold credentials.
-        Err(error) => (
-            ProxyConfiguration::direct(),
-            Some(format!(
-                "Workcell web tools are dialling directly: the proxy environment is unusable ({error})"
-            )),
-        ),
-    }
+    )
 }
 
 fn reject_unknown_fields(spec: &ToolSpec, input: &Value) -> Result<(), String> {

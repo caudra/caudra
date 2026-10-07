@@ -37,6 +37,7 @@ The docs are sorted by what you came here to do:
     <a class="card" href="/docs/system-prompts/"><span class="card-title">System Prompts</span><span class="card-desc">Create named prompt profiles without copying Caudra's dynamic prompt.</span></a>
     <a class="card" href="/docs/plugins/"><span class="card-title">Plugins</span><span class="card-desc">Add your own tools and commands in Lua, or let the agent write them (experimental).</span></a>
     <a class="card" href="/docs/workflows/"><span class="card-title">Workflows</span><span class="card-desc">Durable multi-agent scripts that pause, resume, and report back (experimental).</span></a>
+    <a class="card" href="/docs/automations/"><span class="card-title">Automations</span><span class="card-desc">Scripts that react to session events and act while nobody is typing (experimental).</span></a>
     <a class="card" href="/docs/headless/"><span class="card-title">Headless Mode</span><span class="card-desc">--print for scripts and CI. Drop-in Claude Code compatible.</span></a>
     <a class="card" href="/docs/acp/"><span class="card-title">ACP</span><span class="card-desc">Drive Caudra from your editor, like Zed, over the Agent Client Protocol.</span></a>
   </div>

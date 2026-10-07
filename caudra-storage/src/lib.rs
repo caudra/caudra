@@ -3,9 +3,12 @@
 //! `atomic_write_permissions` sets file mode before persist (for auth keys at 0600).
 
 pub mod auth;
+#[path = "sessions/automation.rs"]
+pub mod automation;
 pub mod background;
 pub mod checkout;
 pub mod decision_log;
+pub mod digest_trust;
 pub mod id;
 pub mod input_history;
 pub mod local_documents;

@@ -1,0 +1,24 @@
+[package]
+name = "caudra-automation"
+description = "Runtime-neutral automations: Rhai scripts whose triggers react to session events and whose actions go through a small host ABI."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+caudra-script = { workspace = true, features = ["rhai"] }
+humantime = { workspace = true }
+jiff = { workspace = true, features = ["tzdb-bundle-platform", "tzdb-zoneinfo"] }
+regex = { workspace = true, features = ["unicode-case"] }
+rhai = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+jiff = { workspace = true, features = ["tzdb-bundle-always"] }
+test-case = { workspace = true }

@@ -10,6 +10,7 @@ rust-version.workspace = true
 
 [dependencies]
 caudra-agent = { workspace = true }
+caudra-automation = { workspace = true }
 caudra-config = { workspace = true }
 caudra-storage = { workspace = true }
 caudra-workspace = { workspace = true }

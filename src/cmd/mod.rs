@@ -250,6 +250,9 @@ fn configure_native_tools(agent: &AgentConfig) {
     if agent.builtin_skills.workflow_dev && agent.features.enabled(Feature::Workflows) {
         install_builtin_skill(caudra_agent::workflow::workflow_dev_skill());
     }
+    if agent.builtin_skills.automation_dev && agent.features.enabled(Feature::Automations) {
+        install_builtin_skill(caudra_agent::automation::skill::automation_dev_skill());
+    }
     if agent.builtin_skills.docs {
         install_builtin_skill(docs::skill());
     }
@@ -309,6 +312,9 @@ fn require_requested_features(cli: &Cli) -> Result<(), FeatureDisabled> {
     }
     if cli.requests_messaging() {
         features.require(Feature::CrossSessionMessaging)?;
+    }
+    if !cli.automations.is_empty() {
+        features.require(Feature::Automations)?;
     }
     match &cli.command {
         Some(
@@ -515,6 +521,7 @@ mod tests {
     const MESSAGING_NAME: &str = "ci-watcher";
     const MESSAGING_TOPIC: &str = "ci.**";
     const MESSAGING_GROUP: &str = "reviewers";
+    const AUTOMATION_ARMING: &str = r#"goal-chain={"goals":["The login tests pass"]}"#;
     const GLOBAL_TOML: &str = "config/caudra.toml";
     const GLOBAL_LUA: &str = "config/init.lua";
     const PROJECT_TOML: &str = "project/.caudra/caudra.toml";
@@ -674,6 +681,19 @@ mod tests {
                 .err()
                 .map(|FeatureDisabled(feature)| feature),
             (!allowed).then_some(Feature::CrossSessionMessaging)
+        );
+    }
+
+    #[test_case(FeatureFlags::NONE, false; "experiment_off")]
+    #[test_case(FeatureFlags::NONE.with(Feature::Automations), true; "experiment_on")]
+    fn automation_flag_requires_the_experiment(features: FeatureFlags, allowed: bool) {
+        let mut cli = Cli::parse_from(["caudra", "--automation", AUTOMATION_ARMING]);
+        cli.startup.features = features;
+        assert_eq!(
+            require_requested_features(&cli)
+                .err()
+                .map(|FeatureDisabled(feature)| feature),
+            (!allowed).then_some(Feature::Automations)
         );
     }
 

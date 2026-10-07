@@ -5,12 +5,14 @@ pub mod catalog;
 mod handle;
 mod manager;
 mod run;
+mod settled;
 mod skill;
 mod state;
 pub mod store;
 
 pub use handle::{WorkflowHandle, WorkflowTransition, WorkspaceRebind};
 pub use manager::{RuntimeDeps, WorkflowRuntime};
+pub use settled::SettledRuns;
 pub use skill::workflow_dev_skill;
 
 pub async fn prepare_workspace_transition(

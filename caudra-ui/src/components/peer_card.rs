@@ -1217,6 +1217,7 @@ mod tests {
             reply_target: TARGET.into(),
             reply_to: None,
             external: false,
+            automation: None,
             assignment: None,
         }
     }

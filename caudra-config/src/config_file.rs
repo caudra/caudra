@@ -151,7 +151,7 @@ mod tests {
     use crate::experimental::{Feature, FeatureFlags};
     use test_case::test_case;
 
-    const EVERY_FLAG: &str = "[experimental]\nworkflows = true\nsandboxes = true\nremote_workcell = true\nlua_plugins = true\ndecision_engine = true\ncross_session_messaging = true\n";
+    const EVERY_FLAG: &str = "[experimental]\nworkflows = true\nsandboxes = true\nremote_workcell = true\nlua_plugins = true\ndecision_engine = true\ncross_session_messaging = true\nautomations = true\n";
 
     fn write(contents: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -182,6 +182,8 @@ mod tests {
     #[test_case("[experimental]\ncross_session_messaging = false\n", FeatureFlags::NONE; "messaging_false")]
     #[test_case("[experimental]\ncross_session_messaging = true\n", FeatureFlags::NONE.with(Feature::CrossSessionMessaging); "messaging_only")]
     #[test_case("[experimental]\nworkflows = true\ncross_session_messaging = false\n", FeatureFlags::NONE.with(Feature::Workflows); "messaging_independent_of_workflows")]
+    #[test_case("[experimental]\nautomations = false\n", FeatureFlags::NONE; "automations_false")]
+    #[test_case("[experimental]\nautomations = true\n", FeatureFlags::NONE.with(Feature::Automations); "automations_alone_enables_no_messaging_or_workflows")]
     fn global_flags_resolve(contents: &str, expected: FeatureFlags) {
         let (_dir, path) = write(contents);
         assert_eq!(load_global_config(&path).unwrap().features, expected);
@@ -243,6 +245,7 @@ mod tests {
     #[test_case(EVERY_FLAG; "enabled_flags")]
     #[test_case("[experimental]\ncross_session_messaging = true\n"; "messaging_enabled")]
     #[test_case("[experimental]\ncross_session_messaging = false\n"; "messaging_disabled")]
+    #[test_case("[experimental]\nautomations = true\n"; "automations_enabled")]
     fn project_files_cannot_hold_experiments(contents: &str) {
         let dir = tempfile::tempdir().unwrap();
         let path = project_config_path(dir.path());

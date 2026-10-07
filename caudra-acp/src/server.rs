@@ -635,6 +635,7 @@ async fn prepare_session(
         // the sandbox holds, so a host overlay here would be a guess.
         host_cwd: None,
         local_documents: runtime.local_documents.clone(),
+        automations: None,
     })
     .await
     .map_err(|error| AcpError::internal_error().data(json_str(&error)))?;

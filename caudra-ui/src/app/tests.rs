@@ -89,10 +89,10 @@ use caudra_storage::permission_patterns::{
 use caudra_storage::plans::PlanFile;
 use caudra_storage::prompt_stash::{PromptStash, StashEntry};
 use caudra_storage::sessions::{
-    PermissionMode, SessionLocation, SessionMeta, StoredActiveGoal, StoredGoalVerdict, StoredImage,
-    StoredInboundPolicy, StoredMode, StoredPasteRange, StoredPeerControls, StoredPromptAdmission,
-    StoredQueuedDraft, StoredQueuedPrompt, StoredSubagent, StoredSubagentOutcome, StoredTokenUsage,
-    UnrecordedCall,
+    PermissionMode, SessionLocation, SessionMeta, StoredActiveGoal, StoredAutomationControls,
+    StoredGoalVerdict, StoredImage, StoredInboundPolicy, StoredMode, StoredPasteRange,
+    StoredPeerControls, StoredPromptAdmission, StoredQueuedDraft, StoredQueuedPrompt,
+    StoredSubagent, StoredSubagentOutcome, StoredTokenUsage, UnrecordedCall,
 };
 use caudra_storage::state::{self as stored_state, SCOPE_GLOBAL, StateKey};
 use caudra_storage::thinking::StoredThinking;
@@ -1085,7 +1085,10 @@ fn typing_and_submit() {
 #[test]
 fn mailbox_wake_starts_without_an_empty_user_bubble() {
     let mut app = test_app();
-    let actions = app.start_mailbox_run(vec![Message::observation("failed".into())]);
+    let actions = app.start_mailbox_run(
+        vec![Message::observation("failed".into())],
+        StartedBy::Mailbox,
+    );
 
     assert!(matches!(
         &actions[..],
@@ -1104,7 +1107,7 @@ fn empty_mailbox_wake_leaves_peer_claim_to_admission(suppressed: bool) {
     let mut app = test_app();
     app.automatic_wakes_suppressed = suppressed;
     let run_id = app.run_id;
-    let actions = app.start_mailbox_run(Vec::new());
+    let actions = app.start_mailbox_run(Vec::new(), StartedBy::Mailbox);
     if suppressed {
         assert!(actions.is_empty());
         assert_eq!(app.run_id, run_id);
@@ -1137,7 +1140,7 @@ fn normal_done_keeps_background_continuation_eligible(stopped: bool) {
         assert!(app.cancelling_run.is_none());
     }
     let observation = Message::observation(REPORT.into());
-    let actions = app.start_mailbox_run(vec![observation.clone()]);
+    let actions = app.start_mailbox_run(vec![observation.clone()], StartedBy::Mailbox);
     if stopped {
         assert!(actions.is_empty());
         assert!(app.automatic_wakes_suppressed);
@@ -1150,8 +1153,11 @@ fn normal_done_keeps_background_continuation_eligible(stopped: bool) {
         assert_eq!(app.main_chat().last_message_text(), FINAL);
         app.update(agent_msg_with_run_id(done(), app.run_id));
         assert!(
-            !app.start_mailbox_run(vec![Message::observation(REPORT.into())])
-                .is_empty()
+            !app.start_mailbox_run(
+                vec![Message::observation(REPORT.into())],
+                StartedBy::Mailbox
+            )
+            .is_empty()
         );
     }
 }
@@ -1168,8 +1174,11 @@ fn terminal_limits_suppress_background_continuation(reason: DoneReason) {
         reason,
     }));
     assert!(
-        app.start_mailbox_run(vec![Message::observation(REPORT.into())])
-            .is_empty()
+        app.start_mailbox_run(
+            vec![Message::observation(REPORT.into())],
+            StartedBy::Mailbox
+        )
+        .is_empty()
     );
 }
 
@@ -1189,6 +1198,7 @@ mod background_runtime {
         SubagentInfo, TaskProvenance,
     };
     use caudra_agent::{BatchToolStatus, SubagentActivity, ToolDoneEvent, ToolOutput};
+    use caudra_automation::event::StartedBy;
     use caudra_config::{Feature, FeatureFlags, ModelPolicy};
     use caudra_lua::EventHandle;
     use caudra_providers::provider::{BoxFuture, Provider};
@@ -1625,6 +1635,7 @@ mod background_runtime {
                             text,
                             task_event: None,
                             peer_event: None,
+                            automation_event: None,
                         } if text.contains(caudra_agent::prompt::ENVIRONMENT_MARKER) => {
                             assert!(summary_seen);
                             assert!(reminder.is_none(), "{SNAPSHOT_STAYS_LAST}");
@@ -1634,6 +1645,7 @@ mod background_runtime {
                             text,
                             task_event: None,
                             peer_event: None,
+                            automation_event: None,
                         } => {
                             assert!(summary_seen);
                             assert!(!done);
@@ -1827,7 +1839,9 @@ mod background_runtime {
             background.notified().await;
             let messages = background.claim_messages().unwrap();
             assert!(!messages.is_empty());
-            let actions = fixture.app.start_mailbox_run(messages);
+            let actions = fixture
+                .app
+                .start_mailbox_run(messages, StartedBy::Background);
             enqueue(&fixture.app, &fixture.handles, actions);
             let request = fixture.requests.recv_async().await.unwrap();
             assert!(!fixture.handles.execution_mode.load().is_planning());
@@ -1892,7 +1906,9 @@ mod background_runtime {
             } else {
                 let messages = background.claim_messages().unwrap();
                 assert!(messages.iter().any(|message| message.task_event.is_some()));
-                let actions = fixture.app.start_mailbox_run(messages);
+                let actions = fixture
+                    .app
+                    .start_mailbox_run(messages, StartedBy::Background);
                 enqueue(&fixture.app, &fixture.handles, actions);
                 let request = fixture.requests.recv_async().await.unwrap();
                 assert!(
@@ -2490,7 +2506,9 @@ mod background_runtime {
             background.notified().await;
             let messages = background.claim_messages().unwrap();
             assert!(!messages.is_empty());
-            let actions = fixture.app.start_mailbox_run(messages);
+            let actions = fixture
+                .app
+                .start_mailbox_run(messages, StartedBy::Background);
             enqueue(&fixture.app, &fixture.handles, actions);
             let request = fixture.requests.recv_async().await.unwrap();
             assert!(!fixture.handles.execution_mode.load().is_planning());
@@ -5190,6 +5208,7 @@ fn main_only_commands_still_run_from_the_main_composer() {
 #[test_case("/topics", Feature::CrossSessionMessaging; "topics")]
 #[test_case("/groups", Feature::CrossSessionMessaging; "groups")]
 #[test_case("/deep-research", Feature::Workflows; "workflow_shortcut")]
+#[test_case("/automations", Feature::Automations; "automations")]
 #[test_case("/sandbox", Feature::Sandboxes; "sandbox")]
 #[test_case("/decisions", Feature::DecisionEngine; "decisions")]
 #[test_case("/auto", Feature::DecisionEngine; "auto")]
@@ -8891,6 +8910,7 @@ fn clicking_task_delivery_opens_chat_named_by_typed_origin(restored: bool) {
                 text: DELIVERY_TEXT.into(),
                 task_event: Some(origin),
                 peer_event: None,
+                automation_event: None,
             },
             None,
         );
@@ -10401,6 +10421,15 @@ fn session_has_content_covers_each_branch() {
     session.meta.mode = Some(StoredMode::Plan);
     assert!(!session_has_content(&session));
 
+    session.meta.automations = Some(StoredAutomationControls::default());
+    assert!(!session_has_content(&session));
+    session.meta.automations = Some(StoredAutomationControls {
+        armed: vec!["nightly".into()],
+        ..StoredAutomationControls::default()
+    });
+    assert!(session_has_content(&session));
+    session.meta.automations = None;
+
     crate::push_history_message(&mut session, Message::user("hello".into()));
     assert!(session_has_content(&session));
 }
@@ -10728,7 +10757,11 @@ fn automatic_wake_suppression_survives_reload(reason: DoneReason, startup: bool,
             .unwrap();
     }
     assert!(restored.automatic_wakes_suppressed);
-    assert!(restored.start_mailbox_run(Vec::new()).is_empty());
+    assert!(
+        restored
+            .start_mailbox_run(Vec::new(), StartedBy::Mailbox)
+            .is_empty()
+    );
     restored.checkpoint_now();
     assert!(restored.state.session.meta.automatic_wakes_suppressed);
 
@@ -20546,6 +20579,9 @@ const BUMP_TITLE: &str = "title bump ";
 const TOOL_IDS: [&str; 2] = ["tool-a", "tool-b"];
 const FINISHED_TASK_ID: &str = "task-finished";
 const UNFINISHED_TASK_ID: &str = "task-unfinished";
+const NOTICE_AUTOMATION: &str = "watchdog";
+const NOTICE_TEXT: &str = "still working";
+const NOTICE_FILLER: &str = "x";
 
 #[test]
 fn turn_response_normalizes_text_and_truncates_unicode() {
@@ -20598,6 +20634,7 @@ fn turn_response_stops_after_bounded_large_input() {
 #[test_case(Notification::QuestionRequested, "Question requested", true ; "question")]
 #[test_case(Notification::PlanReady, "Plan ready", true ; "plan")]
 #[test_case(Notification::error_completion(), "Agent stopped with an error", false ; "error_completion")]
+#[test_case(Notification::automation_notice(NOTICE_AUTOMATION, NOTICE_TEXT), &format!("{AUTOMATION_NOTICE_PREFIX} {NOTICE_AUTOMATION}: {NOTICE_TEXT}"), false ; "automation_notice")]
 fn notification_message_and_urgency(
     notification: Notification,
     expected_message: &str,
@@ -20605,6 +20642,22 @@ fn notification_message_and_urgency(
 ) {
     assert_eq!(notification.message(), expected_message);
     assert_eq!(notification.is_urgent(), urgent);
+}
+
+#[test]
+fn automation_notice_text_is_cut_like_a_response_preview() {
+    let notice = Notification::automation_notice(
+        NOTICE_AUTOMATION,
+        &NOTICE_FILLER.repeat(NOTIFICATION_PREVIEW_CHARS * 2),
+    );
+
+    assert_eq!(
+        notice,
+        Notification::AutomationNotice {
+            automation: NOTICE_AUTOMATION.into(),
+            text: NOTICE_FILLER.repeat(NOTIFICATION_PREVIEW_CHARS),
+        }
+    );
 }
 
 #[test]
@@ -22343,4 +22396,657 @@ fn the_workbench_reports_its_own_keybind_contexts() {
         !contexts.contains(&KeybindContext::Editing),
         "the composer keymap must not be offered while the composer is hidden"
     );
+}
+
+/// The session's side of its automation runtime, against a real runtime of the session.
+pub(crate) mod automation_runtime {
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use caudra_agent::AgentEvent;
+    use caudra_agent::automation::handle::AutomationHandle;
+    use caudra_agent::automation::manager::{AutomationRuntime, GOAL_ACTIVE, RuntimeDeps};
+    use caudra_agent::automation::testing::{AutomationFixture, until};
+    use caudra_automation::event::{InputKind, SessionStatus};
+    use caudra_automation::request::{AutomationError, AutomationRequest, GoalClaim, OutboxClaim};
+    use caudra_automation::snapshot::{
+        AutomationEvent, AutomationState, ErrorView, FiringStatus, FiringSummary, PauseSource,
+        SettleBlocker,
+    };
+    use caudra_config::ToolKey;
+    use caudra_providers::AutomationEventOrigin;
+    use caudra_storage::id::CaudraId;
+    use caudra_storage::sessions::{StoredAutomationControls, StoredPauseSource};
+    use ratatui::layout::Rect;
+    use serde_json::json;
+    use test_case::test_case;
+
+    use super::{
+        App, Msg, PendingInput, Status, cancel_app, chord, click_at, click_status, kb,
+        open_question, press_chord, rendered, rendered_wide, screen_hit, test_app, type_and_submit,
+    };
+    use crate::app::automation::{
+        ARM_WORD, ARMED_PREFIX, ARMS_ONCE_SAVED, AutomationLink, DISARM_WORD, DISARMED_PREFIX,
+        FAILED_AT_LINE, INSPECTOR_HINT, InputWait,
+    };
+    use crate::app::{Mode, PlanState, REVERT_BUSY_MSG};
+    use crate::components::Action;
+    use crate::components::automation_inspector::AutomationAction;
+    use crate::components::status_bar::{AutomationChip, StatusBarHitTarget};
+
+    pub(crate) const COURIER_MESSAGE: &str = "check CI";
+    const COURIER: &str = "courier";
+    const AUTOMATIONS_COMMAND: &str = "/automations";
+    const MISSING: &str = "missing";
+    const LINE: u32 = 7;
+    const OTHER_LINE: u32 = 8;
+    const ERROR_KIND: &str = "runtime";
+    const ERROR_MESSAGE: &str = "boom";
+    /// No state reaches this revision in a test, so a write at it conflicts.
+    const WRONG_REVISION: u64 = 1_000;
+    const ANSWER_DROPPED: &str = "an answer for a session the tab has left must not land";
+    const ONE_FLASH_A_MINUTE: &str = "a second failure within the minute must not flash again";
+    const FIRING_SHOWN: &str = "the inspector must open on the trace of the delivery clicked";
+    /// Wide enough that the trace heading shows the whole firing id.
+    const INSPECTOR_WIDTH: u16 = 160;
+    const NOTHING_CLAIMED: &str = "a turn that is not admitted must leave its item in the outbox";
+    const STOPPING_IS_NO_FAILURE: &str =
+        "a runtime that stopped keeps its items, which is no failure to show";
+    const ARMED_TRIGGER: &str = r#"triggers: [#{ kind: "armed" }]"#;
+    const STORED_ARMED: &str = "nightly";
+    const GOAL: &str = "the tests pass";
+    const OTHER_GOAL: &str = "the build is green";
+    const CONTINUATION_LIMIT: u32 = 3;
+    const FIRE_ID: &str = "fire-1";
+    const PLAN_FILE: &str = "plan.md";
+    const TOOL: &str = "bash";
+    const PERMISSION_ID: &str = "permission";
+    const PERMISSION_ARG: &str = "execute";
+    const PROMPT: &str = "carry on";
+    const RUN_ID: u64 = 1;
+    const STATUS_SINCE: i64 = 0;
+    const COURIER_QUEUED: &str = "the courier must queue its message as it is armed";
+    const TURN_STARTS: &str = "the delivery's turn must start whatever became of its goal";
+    const CONTROLS_SAVED: &str = "a session its runtime serves must save the runtime's controls";
+    const OPENING_ANSWERED: &str =
+        "the opening must ask for other sessions' automations and the script it opens on";
+
+    /// A runtime of an app's session in the app's state directory, with a fixture's scripts and
+    /// clock, linked the way `AgentHandles::start_automations` links it.
+    pub(crate) struct LinkedAutomations {
+        handle: AutomationHandle,
+        runtime: AutomationRuntime,
+        _fixture: AutomationFixture,
+    }
+
+    impl LinkedAutomations {
+        /// The session's record goes first: arming waits on it.
+        fn new(app: &mut App, fixture: AutomationFixture, launch: &[&str]) -> Self {
+            let storage = app.storage.clone();
+            app.state.session_mut().save(&storage).unwrap();
+            Self::spawn(app, fixture, launch)
+        }
+
+        /// The courier's script in a session with no record yet, so what it arms waits for one.
+        fn unsaved(app: &mut App) -> Self {
+            Self::spawn(app, courier_fixture(), &[])
+        }
+
+        fn spawn(app: &mut App, fixture: AutomationFixture, launch: &[&str]) -> Self {
+            let runtime = smol::block_on(AutomationRuntime::spawn(RuntimeDeps {
+                state_dir: app.storage.clone(),
+                ..fixture.deps(app.state.session.id, launch)
+            }))
+            .unwrap();
+            let handle = runtime.handle();
+            app.automation = AutomationLink::new(
+                handle.clone(),
+                app.automation_facts(false, None, STATUS_SINCE),
+            );
+            Self {
+                handle,
+                runtime,
+                _fixture: fixture,
+            }
+        }
+
+        fn idle(app: &mut App) -> Self {
+            Self::new(app, AutomationFixture::default(), &[])
+        }
+
+        /// Armed from the command line with a courier whose `next` message already waits.
+        pub(crate) fn courier(app: &mut App) -> Self {
+            let linked = Self::new(app, courier_fixture(), &[COURIER]);
+            smol::block_on(until(&linked.handle, |state| {
+                state
+                    .recent
+                    .iter()
+                    .any(|firing| !firing.status.is_pending())
+            }));
+            assert_eq!(linked.handle.state().outbox.len(), 1, "{COURIER_QUEUED}");
+            linked
+        }
+
+        /// Waits until the runtime has handled everything sent to it before.
+        fn sync(&self) {
+            smol::block_on(self.handle.request(AutomationRequest::List)).unwrap();
+        }
+
+        pub(crate) fn state(&self) -> Arc<AutomationState> {
+            self.sync();
+            self.handle.state()
+        }
+
+        pub(crate) fn stop(self) {
+            smol::block_on(self.runtime.shutdown());
+        }
+    }
+
+    /// A user script that queues its `next` message as it is armed.
+    fn courier_fixture() -> AutomationFixture {
+        let fixture = AutomationFixture::default();
+        fixture.script(
+            &fixture.user_scripts(),
+            COURIER,
+            ARMED_TRIGGER,
+            &format!(r#"message("{COURIER_MESSAGE}");"#),
+        );
+        fixture
+    }
+
+    fn automations_command(app: &mut App, args: &str) {
+        type_and_submit(app, &format!("{AUTOMATIONS_COMMAND} {args}"));
+    }
+
+    fn inspect_courier() -> AutomationRequest {
+        AutomationRequest::Inspect {
+            name: COURIER.into(),
+            session_id: None,
+        }
+    }
+
+    /// Opens the inspector on the courier and lands both answers the opening asks for, in
+    /// whichever order they come.
+    fn open_inspector_on_courier(app: &mut App) {
+        app.open_automation_inspector(Some(COURIER));
+        let answered = [app.await_automation_reply(), app.await_automation_reply()];
+        assert!(
+            answered.contains(&inspect_courier())
+                && answered.contains(&AutomationRequest::Sessions { limit: None }),
+            "{OPENING_ANSWERED}: {answered:?}"
+        );
+    }
+
+    /// The courier's firing, as a script error at `line` would have ended it.
+    fn failure(linked: &LinkedAutomations, line: Option<u32>) -> AutomationEvent {
+        let firing = linked.state().recent[0].clone();
+        AutomationEvent::Firing {
+            firing: Box::new(FiringSummary {
+                status: FiringStatus::Failed,
+                error: Some(ErrorView {
+                    kind: ERROR_KIND.into(),
+                    message: ERROR_MESSAGE.into(),
+                    line,
+                    column: None,
+                }),
+                ..firing
+            }),
+            absorbed: None,
+        }
+    }
+
+    fn armed_courier(unseen_failures: usize) -> AutomationChip {
+        AutomationChip {
+            armed: 1,
+            unseen_failures,
+        }
+    }
+
+    fn start_a_run(app: &mut App) {
+        app.status = Status::Streaming;
+        app.run_id = RUN_ID;
+    }
+
+    fn press_esc_twice_during_a_run(app: &mut App) {
+        start_a_run(app);
+        cancel_app(app);
+    }
+
+    fn press_ctrl_c_during_a_run(app: &mut App) {
+        start_a_run(app);
+        app.update(Msg::Key(kb::QUIT.to_key_event()));
+    }
+
+    fn cancel_the_question(app: &mut App) {
+        start_a_run(app);
+        open_question(app);
+        let _ = rendered(app);
+        app.update(Msg::Key(kb::QUIT.to_key_event()));
+    }
+
+    fn permission_prompt(app: &mut App) {
+        app.permission_prompt.open(
+            PERMISSION_ID.into(),
+            ToolKey::native(TOOL),
+            vec![PERMISSION_ARG.into()],
+            None,
+        );
+    }
+
+    fn auth_retry(app: &mut App) {
+        app.pending_input = PendingInput::AuthRetry {
+            waiters: HashSet::from([None]),
+        };
+    }
+
+    fn ready_plan(app: &mut App) {
+        app.state.mode = Mode::Plan;
+        app.state.plan = PlanState::Ready(PathBuf::from(PLAN_FILE));
+        app.plan_form.on_plan_ready();
+    }
+
+    fn ready_plan_during_a_run(app: &mut App) {
+        ready_plan(app);
+        start_a_run(app);
+    }
+
+    fn goal_claim(replace: bool) -> OutboxClaim {
+        OutboxClaim {
+            automation: COURIER.into(),
+            fire_id: FIRE_ID.into(),
+            seq: 0,
+            text: COURIER_MESSAGE.into(),
+            attach: None,
+            goal: Some(GoalClaim {
+                condition: GOAL.into(),
+                continuation_limit: Some(CONTINUATION_LIMIT),
+                replace,
+            }),
+        }
+    }
+
+    fn goal_condition(app: &App) -> Option<String> {
+        app.state
+            .goal
+            .snapshot()
+            .map(|goal| goal.condition.to_string())
+    }
+
+    #[test_case(press_esc_twice_during_a_run, Some(PauseSource::User) ; "esc_esc_during_a_run")]
+    #[test_case(press_ctrl_c_during_a_run, Some(PauseSource::User) ; "ctrl_c_during_a_run")]
+    #[test_case(cancel_the_question, Some(PauseSource::User) ; "question_cancel")]
+    #[test_case(cancel_app, None ; "esc_esc_while_idle")]
+    fn stopping_the_run_pauses_every_automation_of_the_session(
+        stop: fn(&mut App),
+        expected: Option<PauseSource>,
+    ) {
+        let mut app = test_app();
+        let linked = LinkedAutomations::idle(&mut app);
+
+        stop(&mut app);
+
+        let pause = linked.state().session.controls.pause.clone();
+        assert_eq!(pause.map(|latch| latch.source), expected);
+        linked.stop();
+    }
+
+    #[test]
+    fn a_prompt_from_the_user_lifts_the_pause() {
+        let mut app = test_app();
+        let linked = LinkedAutomations::idle(&mut app);
+        app.pause_automations();
+        assert!(linked.state().session.controls.pause.is_some());
+
+        type_and_submit(&mut app, PROMPT);
+
+        assert_eq!(linked.state().session.controls.pause, None);
+        linked.stop();
+    }
+
+    #[test_case(|_| {}, false, None ; "nothing")]
+    #[test_case(|_| {}, true, Some(InputKind::Messages) ; "held_messages")]
+    #[test_case(permission_prompt, true, Some(InputKind::Permission) ; "a_permission_prompt_before_held_messages")]
+    #[test_case(open_question, false, Some(InputKind::Question) ; "a_question")]
+    #[test_case(auth_retry, false, Some(InputKind::Auth) ; "an_auth_retry")]
+    #[test_case(ready_plan, false, Some(InputKind::Plan) ; "a_ready_plan")]
+    #[test_case(ready_plan_during_a_run, false, None ; "a_plan_while_the_run_goes_on")]
+    fn the_session_waits_on_a_person_for_what_holds_it(
+        setup: fn(&mut App),
+        held_messages: bool,
+        expected: Option<InputKind>,
+    ) {
+        let mut app = test_app();
+        setup(&mut app);
+        assert_eq!(
+            app.input_wait(held_messages).map(|wait| wait.input),
+            expected
+        );
+    }
+
+    #[test]
+    fn a_permission_wait_names_the_tool_it_asks_for() {
+        let mut app = test_app();
+        permission_prompt(&mut app);
+        assert_eq!(
+            app.input_wait(false),
+            Some(InputWait {
+                input: InputKind::Permission,
+                tool: Some(TOOL.into()),
+            })
+        );
+    }
+
+    #[test_case(|_| {}, false, SessionStatus::Idle ; "idle")]
+    #[test_case(|_| {}, true, SessionStatus::NeedsInput ; "held_messages")]
+    #[test_case(ready_plan, false, SessionStatus::Idle ; "a_ready_plan")]
+    #[test_case(start_a_run, false, SessionStatus::Working ; "a_run")]
+    #[test_case(permission_prompt, false, SessionStatus::NeedsInput ; "a_permission_prompt")]
+    fn facts_show_the_status_peers_see(
+        setup: fn(&mut App),
+        held_messages: bool,
+        expected: SessionStatus,
+    ) {
+        let mut app = test_app();
+        setup(&mut app);
+        assert_eq!(
+            app.automation_facts(held_messages, None, STATUS_SINCE)
+                .status,
+            expected
+        );
+    }
+
+    #[test_case(start_a_run ; "a_run_goes_on")]
+    #[test_case(|app| { press_chord(app, chord::HELP); } ; "a_modal_is_open")]
+    #[test_case(|app| app.cancelling_run = Some(RUN_ID) ; "a_cancel_is_in_flight")]
+    #[test_case(|app| app.observe_automations(false, None, vec![SettleBlocker::PromptQueued]) ; "unsettled")]
+    #[test_case(|app| app.pause_automations() ; "paused")]
+    fn a_delivery_waits_while_the_session_cannot_take_its_turn(hold: fn(&mut App)) {
+        let mut app = test_app();
+        let linked = LinkedAutomations::courier(&mut app);
+        assert!(app.automation_delivery_due());
+
+        hold(&mut app);
+        linked.sync();
+
+        assert!(!app.automation_delivery_due());
+        linked.stop();
+    }
+
+    #[test]
+    fn a_goal_delivery_sets_its_goal_before_its_turn() {
+        let mut app = test_app();
+
+        let actions = app.start_automation_run(goal_claim(false));
+
+        assert_eq!(goal_condition(&app).as_deref(), Some(GOAL));
+        assert_eq!(app.state.goal.continuation_limit(), CONTINUATION_LIMIT);
+        assert!(
+            matches!(&actions[..], [Action::SendMessage(_)]),
+            "{TURN_STARTS}"
+        );
+    }
+
+    #[test_case(false, OTHER_GOAL, true ; "keeps_it")]
+    #[test_case(true, GOAL, false ; "replaces_it_when_asked")]
+    fn an_active_goal_stays_unless_the_delivery_replaces_it(
+        replace: bool,
+        expected: &str,
+        refused: bool,
+    ) {
+        let mut app = test_app();
+        app.state.goal.set(OTHER_GOAL).unwrap();
+
+        let actions = app.start_automation_run(goal_claim(replace));
+
+        assert_eq!(goal_condition(&app).as_deref(), Some(expected));
+        assert_eq!(
+            app.status_bar
+                .flash_text()
+                .is_some_and(|flash| flash.contains(COURIER) && flash.ends_with(GOAL_ACTIVE)),
+            refused
+        );
+        assert!(
+            matches!(&actions[..], [Action::SendMessage(_)]),
+            "{TURN_STARTS}"
+        );
+    }
+
+    #[test]
+    fn a_save_keeps_what_the_runtime_holds_for_the_session() {
+        let mut app = test_app();
+        let linked = LinkedAutomations::courier(&mut app);
+        app.pause_automations();
+        linked.sync();
+
+        app.checkpoint();
+
+        let stored = app
+            .state
+            .session
+            .meta
+            .automations
+            .clone()
+            .expect(CONTROLS_SAVED);
+        assert_eq!(stored.armed, [COURIER]);
+        assert_eq!(
+            stored.pause.map(|latch| latch.source),
+            Some(StoredPauseSource::User)
+        );
+        linked.stop();
+    }
+
+    #[test_case(false ; "no_runtime")]
+    #[test_case(true ; "the_runtime_of_another_session")]
+    fn without_its_runtime_a_save_keeps_the_stored_controls(stale_runtime: bool) {
+        let mut app = test_app();
+        let linked = stale_runtime.then(|| LinkedAutomations::courier(&mut app));
+        let stored = StoredAutomationControls {
+            armed: vec![STORED_ARMED.into()],
+            ..StoredAutomationControls::default()
+        };
+        let session = app.state.session_mut();
+        session.id = CaudraId::generate();
+        session.meta.automations = Some(stored.clone());
+
+        app.checkpoint();
+
+        assert_eq!(app.state.session.meta.automations, Some(stored));
+        if let Some(linked) = linked {
+            linked.stop();
+        }
+    }
+
+    #[test_case(&format!("{DISARM_WORD} {COURIER}"), &format!("{DISARMED_PREFIX}{COURIER}") ; "disarm")]
+    #[test_case(&format!("{ARM_WORD} {COURIER}"), &format!("{ARMED_PREFIX}{COURIER}") ; "arm_again")]
+    #[test_case(
+        &format!("{ARM_WORD} {MISSING}"),
+        &AutomationError::UnknownAutomation { name: MISSING.into() }.to_string();
+        "refused"
+    )]
+    fn an_arming_from_the_command_line_flashes_what_the_runtime_answered(
+        args: &str,
+        expected: &str,
+    ) {
+        let mut app = test_app();
+        let linked = LinkedAutomations::courier(&mut app);
+
+        automations_command(&mut app, args);
+        app.await_automation_reply();
+
+        assert_eq!(app.status_bar.flash_text(), Some(expected));
+        linked.stop();
+    }
+
+    #[test]
+    fn an_arming_in_an_unsaved_session_says_it_arms_once_saved() {
+        let mut app = test_app();
+        let linked = LinkedAutomations::unsaved(&mut app);
+
+        automations_command(&mut app, &format!("{ARM_WORD} {COURIER}"));
+        app.await_automation_reply();
+
+        assert_eq!(
+            app.status_bar.flash_text(),
+            Some(format!("{COURIER}{ARMS_ONCE_SAVED}").as_str())
+        );
+        linked.stop();
+    }
+
+    #[test]
+    fn an_answer_for_a_session_the_tab_has_left_is_dropped() {
+        let mut app = test_app();
+        let linked = LinkedAutomations::courier(&mut app);
+        automations_command(&mut app, &format!("{DISARM_WORD} {COURIER}"));
+        app.state.session_mut().id = CaudraId::generate();
+
+        app.await_automation_reply();
+
+        assert_eq!(app.status_bar.flash_text(), None, "{ANSWER_DROPPED}");
+        linked.stop();
+    }
+
+    /// A conflicting state write lands in the inspector, which asks for the script again.
+    #[test]
+    fn an_answer_reaches_the_inspector_and_what_it_asks_next_goes_out() {
+        let mut app = test_app();
+        let linked = LinkedAutomations::courier(&mut app);
+        open_inspector_on_courier(&mut app);
+
+        app.handle_automation_action(AutomationAction::Request(AutomationRequest::SetState {
+            name: COURIER.into(),
+            state: json!({}),
+            expected_revision: WRONG_REVISION,
+        }));
+        app.await_automation_reply();
+
+        assert_eq!(app.await_automation_reply(), inspect_courier());
+        linked.stop();
+    }
+
+    #[test]
+    fn an_event_while_the_inspector_is_open_asks_again_for_what_moved() {
+        let mut app = test_app();
+        let linked = LinkedAutomations::courier(&mut app);
+        open_inspector_on_courier(&mut app);
+        smol::block_on(linked.handle.request(AutomationRequest::Disarm {
+            name: COURIER.into(),
+        }))
+        .unwrap();
+        let disarmed = linked.state().find(COURIER).cloned().unwrap();
+
+        let _ = app.handle_automation_event(AutomationEvent::Automation(Box::new(disarmed)));
+
+        assert_eq!(app.await_automation_reply(), inspect_courier());
+        assert_eq!(app.status_bar.automations(), &AutomationChip::default());
+        linked.stop();
+    }
+
+    #[test]
+    fn failures_count_on_the_chip_and_flash_once_until_the_inspector_shows_them() {
+        let mut app = test_app();
+        let linked = LinkedAutomations::courier(&mut app);
+
+        let _ = app.handle_automation_event(failure(&linked, Some(LINE)));
+        let _ = app.handle_automation_event(failure(&linked, Some(OTHER_LINE)));
+
+        assert_eq!(app.status_bar.automations(), &armed_courier(2));
+        assert_eq!(
+            app.status_bar.flash_text(),
+            Some(format!("{COURIER}{FAILED_AT_LINE}{LINE}{INSPECTOR_HINT}").as_str()),
+            "{ONE_FLASH_A_MINUTE}"
+        );
+
+        automations_command(&mut app, "");
+        let _ = app.handle_automation_event(failure(&linked, None));
+
+        assert!(app.automation_inspector.is_open());
+        assert_eq!(app.status_bar.automations(), &armed_courier(0));
+        linked.stop();
+    }
+
+    #[test]
+    fn the_chip_counts_what_is_armed_and_a_click_on_it_opens_the_inspector() {
+        let mut app = test_app();
+        let linked = LinkedAutomations::courier(&mut app);
+        let _ = app.poll_automations();
+        assert_eq!(app.status_bar.automations(), &armed_courier(0));
+
+        assert!(click_status(&mut app, StatusBarHitTarget::Automations).is_empty());
+
+        assert!(app.automation_inspector.is_open());
+        linked.stop();
+    }
+
+    #[test]
+    fn a_click_on_a_delivery_opens_the_inspector_on_its_firing() {
+        let mut app = test_app();
+        let linked = LinkedAutomations::courier(&mut app);
+        let fire_id = linked.state().recent[0].fire_id.clone();
+        let _ = app.chats[0].handle_event(
+            AgentEvent::Injected {
+                text: COURIER_MESSAGE.into(),
+                task_event: None,
+                peer_event: None,
+                automation_event: Some(AutomationEventOrigin {
+                    automation: COURIER.into(),
+                    fire_id: fire_id.clone(),
+                    seq: 0,
+                }),
+            },
+            None,
+        );
+        let (row, column) = screen_hit(&mut app, COURIER);
+
+        click_at(&mut app, Rect::new(column, row, 1, 1));
+
+        assert!(app.automation_inspector.is_open());
+        assert!(
+            rendered_wide(&mut app, INSPECTOR_WIDTH).contains(&fire_id),
+            "{FIRING_SHOWN}"
+        );
+        linked.stop();
+    }
+
+    #[test]
+    fn a_delivery_claims_its_item_once_its_turn_is_admitted() {
+        let mut app = test_app();
+        let linked = LinkedAutomations::courier(&mut app);
+
+        let actions = app.deliver_automation_item();
+
+        assert!(
+            matches!(actions.as_deref(), Some([Action::SendMessage(_)])),
+            "{TURN_STARTS}"
+        );
+        assert!(linked.state().outbox.is_empty());
+        linked.stop();
+    }
+
+    #[test]
+    fn a_turn_that_is_not_admitted_claims_nothing() {
+        let mut app = test_app();
+        let linked = LinkedAutomations::courier(&mut app);
+        app.cancelling_run = Some(RUN_ID);
+
+        assert!(app.deliver_automation_item().is_none());
+
+        assert_eq!(app.status_bar.flash_text(), Some(REVERT_BUSY_MSG));
+        assert_eq!(linked.state().outbox.len(), 1, "{NOTHING_CLAIMED}");
+        linked.stop();
+    }
+
+    #[test]
+    fn a_stopped_runtime_keeps_its_items_without_a_flash() {
+        let mut app = test_app();
+        LinkedAutomations::courier(&mut app).stop();
+
+        assert!(app.deliver_automation_item().is_none());
+
+        assert_eq!(
+            app.status_bar.flash_text(),
+            None,
+            "{STOPPING_IS_NO_FAILURE}"
+        );
+    }
 }

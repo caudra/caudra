@@ -517,6 +517,7 @@ mod tests {
             task_event: None,
             peer_event: None,
             workflow_event: None,
+            automation_event: None,
             standing_reminder: None,
             retained_output_refs: Vec::new(),
         })

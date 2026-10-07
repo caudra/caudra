@@ -112,6 +112,11 @@ pub enum WorkflowError {
     UnknownRun { run_id: String },
     #[error("workflow run {run_id:?} is {status} and cannot take that action")]
     InvalidTransition { run_id: String, status: RunStatus },
+    /// The session is not taking new runs or resumes right now: its workspace
+    /// is changing, background admission is closed, or the request predates
+    /// the session's current generation.
+    #[error("workflow runtime: {0}")]
+    NotAdmitted(String),
     #[error("workflow storage: {0}")]
     Storage(String),
     #[error("workflow runtime: {0}")]
@@ -135,6 +140,7 @@ mod tests {
     const NAME: &str = "review";
     const AMBIGUOUS_MESSAGE: &str =
         "workflow \"review\" is declared more than once in the project, user scope";
+    const REFUSAL: &str = "workspace transition in progress";
 
     #[test]
     fn requests_are_adjacently_tagged() {
@@ -184,6 +190,20 @@ mod tests {
         assert_eq!(
             serde_json::to_value(WorkflowError::Storage("locked".into())).unwrap(),
             json!({"kind": "storage", "detail": "locked"})
+        );
+    }
+
+    #[test]
+    fn a_refusal_reads_as_a_runtime_error_but_serializes_apart() {
+        let refusal = WorkflowError::NotAdmitted(REFUSAL.into());
+
+        assert_eq!(
+            refusal.to_string(),
+            WorkflowError::Internal(REFUSAL.into()).to_string()
+        );
+        assert_eq!(
+            serde_json::to_value(&refusal).unwrap(),
+            json!({"kind": "not_admitted", "detail": REFUSAL})
         );
     }
 }

@@ -59,6 +59,10 @@ use super::{
     SessionRelocation, SessionRelocationResult, SessionSummary, StoredSubagent,
     StoredSubagentOutcome, StoredSubagentTaskSpec, StoredTokenUsage, StoredToolUsage, next_epoch,
 };
+use crate::automation::{
+    SESSION_AUTOMATION_BYTES, automation_running, automation_totals, relocate_automations,
+    trim_automations,
+};
 use crate::background::{JobOwner, accept_owned_job_event};
 use crate::id::CaudraId;
 use crate::retention::SessionFacts;
@@ -82,7 +86,7 @@ use crate::{
 pub const SESSIONS_DB_FILE: &str = "caudra.db";
 pub const SESSIONS_DB_LOCK_FILE: &str = "caudra.db.lock";
 
-const SCHEMA_VERSION: i64 = 20;
+const SCHEMA_VERSION: i64 = 22;
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUD") as i64;
 /// Pages copied per step of the pre-migration backup. The whole file is copied
 /// under the initialization lock, so this only bounds how long the backup holds
@@ -193,6 +197,7 @@ const INVALID_SQLITE_URI_PATH: &str = "SQLite URI paths must be valid UTF-8 on t
 const RELOCATION_REMOTE: &str = "remote sessions cannot be relocated";
 const RELOCATION_PENDING_REVERT: &str = "the source workspace has a pending revert or restore";
 const RELOCATION_WORKFLOW: &str = "stop active or resumable workflows before relocating";
+const RELOCATION_AUTOMATION: &str = "stop running automation firings before relocating";
 /// The character after [`MAIN_SEPARATOR`], so every path below a directory
 /// sorts before `<directory>` followed by this.
 const AFTER_SEPARATOR: char = '0';
@@ -703,7 +708,45 @@ const MIGRATIONS: &[Migration] = &[
         to: 20,
         sql: crate::messages::GROUP_SCHEMA,
     },
+    Migration {
+        from: 20,
+        to: 21,
+        sql: crate::automation::TABLES,
+    },
+    Migration {
+        from: 21,
+        to: 22,
+        sql: AUTOMATION_MESSAGING_SCHEMA,
+    },
 ];
+
+/// Which automation sent a message for its session, a stamp ordering every
+/// insert and state change of group work that is never reused, and the
+/// delivery a consuming firing keeps from its session.
+const AUTOMATION_MESSAGING_SCHEMA: &str = r#"
+ALTER TABLE messages ADD COLUMN sender_automation TEXT;
+CREATE INDEX messages_publisher ON messages(sender_session, seq) WHERE kind = 'topic';
+CREATE TABLE work_change_clock (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    changed INTEGER NOT NULL CHECK (changed >= 0)
+) STRICT;
+ALTER TABLE group_work ADD COLUMN changed INTEGER NOT NULL DEFAULT 0;
+UPDATE group_work SET changed = id;
+INSERT INTO work_change_clock (id, changed) SELECT 1, coalesce(max(changed), 0) FROM group_work;
+CREATE UNIQUE INDEX group_work_changed ON group_work(changed);
+CREATE TRIGGER group_work_insert_changed AFTER INSERT ON group_work BEGIN
+    UPDATE work_change_clock SET changed = changed + 1 WHERE id = 1;
+    UPDATE group_work SET changed = (SELECT changed FROM work_change_clock WHERE id = 1)
+    WHERE id = NEW.id;
+END;
+CREATE TRIGGER group_work_state_changed AFTER UPDATE OF state ON group_work
+WHEN OLD.state IS NOT NEW.state BEGIN
+    UPDATE work_change_clock SET changed = changed + 1 WHERE id = 1;
+    UPDATE group_work SET changed = (SELECT changed FROM work_change_clock WHERE id = 1)
+    WHERE id = NEW.id;
+END;
+ALTER TABLE automation_firings ADD COLUMN delivery TEXT CHECK(delivery IS NULL OR json_valid(delivery));
+"#;
 
 const JOB_OWNER_CHECKPOINTS_TABLE: &str = r#"
 CREATE TABLE job_owner_checkpoints (
@@ -953,14 +996,15 @@ CREATE TABLE pending_archives (
 /// What a fresh database gets: every migration already folded in.
 fn full_schema() -> String {
     format!(
-        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{WORKFLOW_RECEIPTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}{JOB_OWNER_CHECKPOINTS_TABLE}{}{}{}{}{}{}{}",
+        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{WORKFLOW_RECEIPTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}{JOB_OWNER_CHECKPOINTS_TABLE}{}{}{}{}{}{}{}{}{AUTOMATION_MESSAGING_SCHEMA}",
         crate::background::TABLES,
         crate::shell_durations::TABLES,
         crate::shell_history::TABLES,
         crate::background::ARCHIVE_SCHEMA,
         crate::messages::SCHEMA,
         crate::decision_log::SCHEMA,
-        crate::messages::GROUP_SCHEMA
+        crate::messages::GROUP_SCHEMA,
+        crate::automation::TABLES
     )
 }
 
@@ -1141,6 +1185,9 @@ pub struct SessionStorageStats {
     pub workflow_run_count: u64,
     pub workflow_call_count: u64,
     pub workflow_bytes: u64,
+    pub automation_firing_count: u64,
+    pub automation_action_count: u64,
+    pub automation_bytes: u64,
     pub background_invocation_count: u64,
     pub background_bytes: u64,
     pub tool_output_file_bytes: u64,
@@ -1160,6 +1207,10 @@ pub struct TrimReport {
     pub workflow_call_bytes: u64,
     pub workflow_event_rows: u64,
     pub workflow_event_bytes: u64,
+    pub automation_firing_rows: u64,
+    pub automation_action_rows: u64,
+    pub automation_source_rows: u64,
+    pub automation_bytes: u64,
     pub artifact_bytes: u64,
 }
 
@@ -1897,6 +1948,7 @@ impl SessionDatabase {
             self.connection
                 .query_row("SELECT count(*) FROM cleanup_jobs", [], |row| row.get(0))?;
         let workflow = workflow_totals(&self.connection)?;
+        let automation = automation_totals(&self.connection)?;
         let (background_invocation_count, background_bytes) = self.connection.query_row(
             "SELECT count(*), coalesce(sum(bytes), 0) + (SELECT coalesce(sum(length(event_id)), 0) FROM background_receipts) + (SELECT coalesce(sum(byte_count + length(CAST(invocation_id AS BLOB)) + length(CAST(task_id AS BLOB))), 0) FROM job_owner_checkpoints) FROM background_tasks",
             [],
@@ -1922,6 +1974,9 @@ impl SessionDatabase {
             workflow_run_count: workflow.run_count,
             workflow_call_count: workflow.call_count,
             workflow_bytes: workflow.bytes,
+            automation_firing_count: automation.firing_count,
+            automation_action_count: automation.action_count,
+            automation_bytes: automation.bytes,
             background_invocation_count: from_i64(
                 background_invocation_count,
                 "background invocation count",
@@ -2094,12 +2149,13 @@ impl SessionDatabase {
     }
 
     /// Scalar facts for every session, or for one working directory. Payload
-    /// tables are never joined to plan retention; workflow rows contribute
-    /// their accounted size only.
+    /// tables are never joined to plan retention; workflow and automation rows
+    /// contribute their accounted size only.
     pub fn session_facts(&self, cwd: Option<&str>) -> Result<Vec<SessionFacts>, SessionError> {
         let mut statement = self.connection.prepare(&format!(
             "SELECT id, title, cwd, created_at, updated_at, last_opened_at, pinned, trimmed_at,\
-                    logical_bytes + {SESSION_WORKFLOW_BYTES} + {SESSION_OWNER_CHECKPOINT_BYTES} + {} + {}, \
+                    logical_bytes + {SESSION_WORKFLOW_BYTES} + {SESSION_AUTOMATION_BYTES} \
+                    + {SESSION_OWNER_CHECKPOINT_BYTES} + {} + {}, \
                     json_extract(metadata, '$.pending_revert') IS NOT NULL \
              FROM sessions WHERE ?1 IS NULL OR cwd = ?1 \
              ORDER BY max(updated_at, coalesce(last_opened_at, 0)) DESC, id DESC",
@@ -2156,6 +2212,7 @@ impl SessionDatabase {
             params![id.as_bytes().as_slice(), TRIM_KEEP_OUTPUT_BYTES],
         )?;
         let workflow = trim_workflow_runs(&transaction, id)?;
+        let automation = trim_automations(&transaction, id)?;
         let removed_rows = from_i64_usize(rows, "trimmed tool output rows")?;
         let removed_bytes = from_i64_usize(bytes, "trimmed tool output bytes")?;
         let metadata = metadata_without(&root.metadata, [RECORD_COVERAGE_FIELD])?;
@@ -2198,6 +2255,10 @@ impl SessionDatabase {
             workflow_call_bytes: workflow.call_bytes,
             workflow_event_rows: workflow.event_rows,
             workflow_event_bytes: workflow.event_bytes,
+            automation_firing_rows: automation.firing_rows,
+            automation_action_rows: automation.action_rows,
+            automation_source_rows: automation.source_rows,
+            automation_bytes: automation.bytes,
             artifact_bytes,
         })
     }
@@ -2859,6 +2920,12 @@ impl SessionDatabase {
                     reason: RELOCATION_WORKFLOW,
                 });
             }
+            if automation_running(&transaction, expected.id)? {
+                return Err(SessionError::RelocationBlocked {
+                    id: expected.id,
+                    reason: RELOCATION_AUTOMATION,
+                });
+            }
             if crate::background::protects_session(&transaction, expected.id)? {
                 return Err(SessionError::BackgroundTasksPending { id: expected.id });
             }
@@ -2893,6 +2960,7 @@ impl SessionDatabase {
                 expected.id,
                 &[WorkflowRunStatus::Failed, WorkflowRunStatus::Cancelled],
             )?;
+            relocate_automations(&transaction, expected.id)?;
             sources
                 .entry(&expected.cwd)
                 .or_default()
@@ -6191,7 +6259,7 @@ fn query_tool_usage(
     Ok(values)
 }
 
-fn id_from_row(row: &rusqlite::Row<'_>, index: usize) -> Result<CaudraId, SessionError> {
+pub(crate) fn id_from_row(row: &rusqlite::Row<'_>, index: usize) -> Result<CaudraId, SessionError> {
     let bytes: Vec<u8> = row.get(index)?;
     id_from_bytes(&bytes, "session id")
 }
@@ -6318,6 +6386,10 @@ mod tests {
     use std::sync::Barrier;
 
     use super::*;
+    use crate::automation::{
+        AutomationArming, AutomationFiringStatus, AutomationOrigin, AutomationScope,
+        AutomationTrigger, INTERRUPTED_BY_RELOCATION, NewAutomationFiring,
+    };
     use crate::background::{JobPayload, ShellJobMetadata, TaskEvent, TaskRecord};
     use crate::permission_state::StructuredPermissionEffect;
     use crate::sessions::change_stores::fake::{FakeStore, FakeStores, REFUSED};
@@ -6423,6 +6495,16 @@ mod tests {
     const RELOCATION_FAILURE: &str = "injected relocation failure";
     const RELOCATION_RUN: &str = "relocation-run";
     const RELOCATION_STORE: &str = "source-workspace-key";
+    const RELOCATION_FIRING: &str = "relocation-firing";
+    const RELOCATION_PROJECT_AUTOMATION: &str = "project-automation";
+    const RELOCATION_USER_AUTOMATION: &str = "user-automation";
+    const RELOCATION_DIGEST: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const RELOCATION_AUTOMATION_UNCHANGED: &str =
+        "a relocation refused for a running firing must change nothing";
+    const RELOCATION_SETTLES_AUTOMATIONS: &str =
+        "a relocation must interrupt waiting firings and disarm only project automations";
+    const EMPTY_JSON_OBJECT: &str = "{}";
     const LEDGER_PROVIDER: &str = "test/provider";
     const OTHER_LEDGER_PROVIDER: &str = "other/provider";
     const OTHER_LEDGER_MODEL: &str = "other/model";
@@ -6438,10 +6520,13 @@ mod tests {
     const CHILD_TASK: &str = "child-task";
     const OTHER_CHILD_TASK: &str = "other-child-task";
     const BACKGROUND_ARCHIVE_DOWNGRADE: &str = "DROP INDEX background_history; DROP INDEX background_task_version; DROP INDEX background_call_owner; DROP INDEX background_sequence; DROP INDEX background_generation; DROP INDEX background_task_history; DROP INDEX background_owner_history; ALTER TABLE background_tasks DROP COLUMN archived; ALTER TABLE background_tasks DROP COLUMN last_sequence;";
-    const CONSUMER_GROUPS_DOWNGRADE: &str =
-        "DROP TABLE work_attempts; DROP TABLE group_work; DROP TABLE work_groups;";
+    const AUTOMATION_MESSAGING_DOWNGRADE: &str = "DROP TRIGGER group_work_state_changed; DROP TRIGGER group_work_insert_changed; DROP INDEX group_work_changed; ALTER TABLE group_work DROP COLUMN changed; DROP TABLE work_change_clock; DROP INDEX messages_publisher; ALTER TABLE messages DROP COLUMN sender_automation; ALTER TABLE automation_firings DROP COLUMN delivery;";
+    const AUTOMATION_MESSAGING_PREVIOUS_SCHEMA: i64 = 21;
+    const AUTOMATIONS_DOWNGRADE: &str = "DROP TRIGGER group_work_state_changed; DROP TRIGGER group_work_insert_changed; DROP INDEX group_work_changed; ALTER TABLE group_work DROP COLUMN changed; DROP TABLE work_change_clock; DROP INDEX messages_publisher; ALTER TABLE messages DROP COLUMN sender_automation; DROP TABLE automation_actions; DROP TABLE automation_firings; DROP TABLE automation_sources; DROP TABLE automation_bindings;";
+    const AUTOMATIONS_PREVIOUS_SCHEMA: i64 = 20;
+    const CONSUMER_GROUPS_DOWNGRADE: &str = "DROP TABLE automation_actions; DROP TABLE automation_firings; DROP TABLE automation_sources; DROP TABLE automation_bindings; DROP TABLE work_attempts; DROP TABLE group_work; DROP TABLE work_groups; DROP TABLE work_change_clock; DROP INDEX messages_publisher; ALTER TABLE messages DROP COLUMN sender_automation;";
     const CONSUMER_GROUPS_PREVIOUS_SCHEMA: i64 = 19;
-    const SHARED_REPOSITORIES_DOWNGRADE: &str = "DROP TABLE work_attempts; DROP TABLE group_work; DROP TABLE work_groups; DROP TABLE deliveries; DROP TABLE cursors; DROP TABLE messages; DROP TABLE message_history_revision; DROP TABLE decisions;";
+    const SHARED_REPOSITORIES_DOWNGRADE: &str = "DROP TABLE automation_actions; DROP TABLE automation_firings; DROP TABLE automation_sources; DROP TABLE automation_bindings; DROP TABLE work_attempts; DROP TABLE group_work; DROP TABLE work_groups; DROP TABLE work_change_clock; DROP TABLE deliveries; DROP TABLE cursors; DROP TABLE messages; DROP TABLE message_history_revision; DROP TABLE decisions;";
     const SHARED_REPOSITORIES_PREVIOUS_SCHEMA: i64 = 18;
     const OWNER_CHECKPOINT_PREVIOUS_SCHEMA: i64 = 13;
     const WORKFLOW_DECISION_PREVIOUS_SCHEMA: i64 = 14;
@@ -8902,6 +8987,101 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         );
     }
 
+    #[test_case(false; "waiting")]
+    #[test_case(true; "running_blocks")]
+    fn relocation_settles_automations_or_waits_for_a_running_firing(running: bool) {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let session = TestSession::new(MODEL, CWD);
+        database.save(&session, None).unwrap();
+        for (automation, scope) in [
+            (RELOCATION_PROJECT_AUTOMATION, AutomationScope::Project),
+            (RELOCATION_USER_AUTOMATION, AutomationScope::User),
+        ] {
+            database
+                .upsert_automation_binding(&AutomationArming {
+                    session_id: session.id,
+                    automation: automation.into(),
+                    scope,
+                    origin: AutomationOrigin::Manual,
+                    armed: true,
+                    args: EMPTY_JSON_OBJECT.into(),
+                    args_digest: None,
+                })
+                .unwrap();
+        }
+        database
+            .insert_automation_firing(&NewAutomationFiring {
+                fire_id: RELOCATION_FIRING.into(),
+                session_id: session.id,
+                automation: RELOCATION_PROJECT_AUTOMATION.into(),
+                digest: RELOCATION_DIGEST.into(),
+                trigger: AutomationTrigger::MessageReceived,
+                trigger_index: 0,
+                event: EMPTY_JSON_OBJECT.into(),
+                event_key: None,
+                consumed: false,
+            })
+            .unwrap();
+        if running {
+            database.start_automation_firing(RELOCATION_FIRING).unwrap();
+        }
+        let request = relocation_request(&database, CWD, false);
+
+        let result = database.relocate_sessions(&request);
+
+        let firing = database
+            .load_automation_firing(RELOCATION_FIRING)
+            .unwrap()
+            .unwrap()
+            .firing
+            .summary;
+        let armed = |automation| {
+            database
+                .load_automation_binding(session.id, automation)
+                .unwrap()
+                .unwrap()
+                .armed
+        };
+        if running {
+            assert!(matches!(
+                result,
+                Err(SessionError::RelocationBlocked {
+                    reason: RELOCATION_AUTOMATION,
+                    ..
+                })
+            ));
+            assert_eq!(
+                database.local_session_locations().unwrap(),
+                request.sessions,
+                "{RELOCATION_AUTOMATION_UNCHANGED}"
+            );
+            assert_eq!(
+                (firing.status, armed(RELOCATION_PROJECT_AUTOMATION)),
+                (AutomationFiringStatus::Running, true),
+                "{RELOCATION_AUTOMATION_UNCHANGED}"
+            );
+        } else {
+            assert_eq!(result.unwrap().sessions_moved, 1);
+            assert_eq!(
+                (firing.status, firing.reason.as_deref()),
+                (
+                    AutomationFiringStatus::Interrupted,
+                    Some(INTERRUPTED_BY_RELOCATION)
+                ),
+                "{RELOCATION_SETTLES_AUTOMATIONS}"
+            );
+            assert!(
+                !armed(RELOCATION_PROJECT_AUTOMATION),
+                "{RELOCATION_SETTLES_AUTOMATIONS}"
+            );
+            assert!(
+                armed(RELOCATION_USER_AUTOMATION),
+                "{RELOCATION_SETTLES_AUTOMATIONS}"
+            );
+        }
+    }
+
     #[test_case(WorkflowRunStatus::Failed; "failed")]
     #[test_case(WorkflowRunStatus::Cancelled; "cancelled")]
     fn relocation_preserves_unselected_workflows(status: WorkflowRunStatus) {
@@ -10545,6 +10725,110 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         );
     }
 
+    #[test]
+    fn automations_migrate_from_schema_twenty_keeping_sessions() {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open_state(&state).unwrap();
+        let session = TestSession::new(MODEL, CWD);
+        database.save(&session, None).unwrap();
+        database
+            .connection
+            .execute_batch(AUTOMATIONS_DOWNGRADE)
+            .unwrap();
+        database
+            .connection
+            .pragma_update(None, "user_version", AUTOMATIONS_PREVIOUS_SCHEMA)
+            .unwrap();
+        drop(database);
+
+        let migrated = SessionDatabase::open_state(&state).unwrap();
+
+        assert_eq!(migrated.stats().unwrap().schema_version, SCHEMA_VERSION);
+        let kept: TestSession = migrated.load(session.id).unwrap();
+        assert_eq!(kept.id, session.id);
+        assert!(
+            migrated
+                .load_automation_bindings(session.id)
+                .unwrap()
+                .is_empty()
+        );
+        let (_fresh_temp, fresh_state) = state_dir();
+        let fresh = SessionDatabase::open_state(&fresh_state).unwrap();
+        assert_eq!(
+            schema_objects(&migrated),
+            schema_objects(&fresh),
+            "{MIGRATED_MATCHES_FRESH}"
+        );
+    }
+
+    #[test]
+    fn automation_messaging_migrates_from_schema_twenty_one_stamping_existing_work() {
+        const EXISTING_STAMPS: [i64; 2] = [1, 2];
+        const NEXT_STAMP: i64 = 3;
+        let (_temp, state) = state_dir();
+        let database = SessionDatabase::open_state(&state).unwrap();
+        database
+            .connection
+            .execute_batch(AUTOMATION_MESSAGING_DOWNGRADE)
+            .unwrap();
+        database
+            .connection
+            .execute_batch(
+                "INSERT INTO messages (sender_route, message_id, kind, topic, sender_session,
+                    sender_name, sender_mode, sender_permission, external, text, created_ms)
+                 VALUES ('route', 'id', 'topic', 'ci.failures', 'session', 'name', 'build',
+                    'ask', 0, 'text', 1);
+                 INSERT INTO work_groups (name, patterns, concurrency, max_attempts, max_backlog,
+                    paused, created_ms, updated_ms)
+                 VALUES ('deploy', '[\"ci.*\"]', 1, 3, 10, 0, 1, 1),
+                    ('triage', '[\"ci.*\"]', 1, 3, 10, 0, 1, 1);
+                 INSERT INTO group_work (group_id, seq, name, state, attempts, available_ms,
+                    created_ms, updated_ms)
+                 SELECT id, 1, name || '-work', 'pending', 0, 1, 1, 1 FROM work_groups ORDER BY id;",
+            )
+            .unwrap();
+        database
+            .connection
+            .pragma_update(None, "user_version", AUTOMATION_MESSAGING_PREVIOUS_SCHEMA)
+            .unwrap();
+        drop(database);
+
+        let migrated = SessionDatabase::open_state(&state).unwrap();
+
+        assert_eq!(migrated.stats().unwrap().schema_version, SCHEMA_VERSION);
+        let stamps = || -> Vec<i64> {
+            let mut statement = migrated
+                .connection
+                .prepare("SELECT changed FROM group_work ORDER BY id")
+                .unwrap();
+            statement
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(stamps(), EXISTING_STAMPS);
+        migrated
+            .connection
+            .execute("UPDATE group_work SET state = 'cancelled' WHERE id = 1", [])
+            .unwrap();
+        assert_eq!(stamps(), [NEXT_STAMP, EXISTING_STAMPS[1]]);
+        let automation: Option<String> = migrated
+            .connection
+            .query_row("SELECT sender_automation FROM messages", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(automation, None);
+        let (_fresh_temp, fresh_state) = state_dir();
+        let fresh = SessionDatabase::open_state(&fresh_state).unwrap();
+        assert_eq!(
+            schema_objects(&migrated),
+            schema_objects(&fresh),
+            "{MIGRATED_MATCHES_FRESH}"
+        );
+    }
+
     #[test_case(false; "missing_root")]
     #[test_case(true; "existing_empty_root")]
     fn existing_state_open_never_initializes_missing_storage(existing_root: bool) {
@@ -11288,6 +11572,8 @@ CREATE TABLE subagent_history_items (
         connection
             .execute_batch(
                 &full_schema()
+                    .replace(AUTOMATION_MESSAGING_SCHEMA, "")
+                    .replace(crate::automation::TABLES, "")
                     .replace(crate::messages::GROUP_SCHEMA, "")
                     .replace(crate::messages::SCHEMA, "")
                     .replace(crate::decision_log::SCHEMA, "")
@@ -11388,6 +11674,8 @@ CREATE TABLE subagents (
         connection
             .execute_batch(
                 &full_schema()
+                    .replace(AUTOMATION_MESSAGING_SCHEMA, "")
+                    .replace(crate::automation::TABLES, "")
                     .replace(crate::messages::GROUP_SCHEMA, "")
                     .replace(crate::messages::SCHEMA, "")
                     .replace(crate::decision_log::SCHEMA, "")

@@ -334,7 +334,7 @@ struct Driver {
 
 impl Drop for Driver {
     fn drop(&mut self) {
-        if self.env.published.load().runs.iter().any(|run| {
+        if self.env.published.state.load().runs.iter().any(|run| {
             run.run_id == self.snapshot.run_id
                 && run.execution_epoch == self.epoch
                 && run.status == RunStatus::Active

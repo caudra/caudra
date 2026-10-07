@@ -10,7 +10,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-mod json;
 mod timeline;
 
 use caudra_agent::SubagentProgress;
@@ -32,6 +31,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::animation::{animation_elapsed_ms, spinner_str};
 use crate::components::document_view::COPIED_SELECTION;
+use crate::components::json_tree::{self, JsonRow};
 use crate::components::modal::{FooterHits, FooterLine, Modal};
 use crate::components::scrollbar::{ScrollHint, Scrollbar, ScrollbarMouse};
 use crate::components::section_tabs::{SectionTab, tab_strip};
@@ -42,12 +42,11 @@ use crate::components::tool_display::{
 use crate::components::workflow_card::{
     AGENTS_SUFFIX, TOKENS_SUFFIX, phase_strip_line, status_span,
 };
-use crate::components::workflow_inspector::json::JsonRow;
 use crate::components::workflow_inspector::timeline::{TimelineRow, span_bar, timeline};
 use crate::components::{
-    ModalScroll, Overlay, ToolProgress, chevron_span, escape_terminal_controls, field_styles,
-    format_compact, format_elapsed, format_integer, hover_style, input_text_style, now_secs,
-    visual_rows,
+    ModalScroll, Overlay, ToolProgress, ascii_key, chevron_span, escape_terminal_controls,
+    field_styles, format_compact, format_elapsed, format_integer, hover_style, input_text_style,
+    now_secs, visual_rows,
 };
 use crate::markdown::text_to_painted;
 use crate::repaint::Cadence;
@@ -187,12 +186,6 @@ const FOOTER_RUNGS: [(bool, &str); 3] =
     [(true, SECTION_GAP), (false, SECTION_GAP), (false, KEY_GAP)];
 /// The prompt takes every key, so its footer names no click targets.
 const BUDGET_FOOTER: [(&str, &str); 2] = [("Enter", "Resume"), ("Esc", "Cancel")];
-
-/// The keybinding tables quote the label; the inspector matches the key.
-/// One spelling feeds both.
-const fn ascii_key(label: &str) -> char {
-    label.as_bytes()[0] as char
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunControl {
@@ -1252,7 +1245,7 @@ impl WorkflowInspector {
     /// written in when it does not.
     fn json_rows(&self, part: &BodyPart<'_>) -> Vec<JsonRow> {
         match self.json_body(part.text) {
-            Some(value) => json::rows(&value, self.fold_set(part.scope)).unwrap_or_default(),
+            Some(value) => json_tree::rows(&value, self.fold_set(part.scope)).unwrap_or_default(),
             None => indented(part.text, part.style)
                 .into_iter()
                 .map(plain_row)
@@ -1263,7 +1256,7 @@ impl WorkflowInspector {
     /// The nodes a part offers the cursor, without paying to paint them.
     fn json_folds(&self, part: &BodyPart<'_>) -> Vec<usize> {
         match self.json_body(part.text) {
-            Some(value) => json::folds(&value, self.fold_set(part.scope)),
+            Some(value) => json_tree::folds(&value, self.fold_set(part.scope)),
             None => Vec::new(),
         }
     }
@@ -1513,7 +1506,7 @@ impl WorkflowInspector {
         let Some(result) = run.result.as_ref().filter(|result| !has_report(result)) else {
             return Vec::new();
         };
-        json::folds(result, self.fold_set(FoldScope::Result))
+        json_tree::folds(result, self.fold_set(FoldScope::Result))
             .into_iter()
             .map(|node| Item::Fold(FoldScope::Result, node))
             .collect()
@@ -2340,7 +2333,7 @@ fn result_lines(
             Some(report) => lines.extend(report_lines(report, width)),
             None => {
                 lines.push(Line::styled(RESULT_LABEL, t.tool_dim));
-                let rows = json::rows(result, inspector.fold_set(FoldScope::Result))
+                let rows = json_tree::rows(result, inspector.fold_set(FoldScope::Result))
                     .unwrap_or_else(|| vec![plain_row(Line::raw(result.to_string()))]);
                 for row in rows {
                     let mark = match row.fold {

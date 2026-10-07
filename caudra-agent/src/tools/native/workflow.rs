@@ -286,6 +286,7 @@ fn failure_of(error: &WorkflowError) -> ToolFailure {
         | WorkflowError::InvalidTransition { .. } => ToolFailure::InvalidInput,
         WorkflowError::Unavailable
         | WorkflowError::TooManyRuns { .. }
+        | WorkflowError::NotAdmitted(_)
         | WorkflowError::Storage(_)
         | WorkflowError::Internal(_) => ToolFailure::Other,
     }

@@ -19,7 +19,7 @@ use super::tool_display::{
 };
 use super::{
     DisplayMessage, DisplayRole, DisplaySource, ToolProgress, ToolRole, ToolStatus,
-    apply_scroll_rows,
+    apply_scroll_rows, automation_inspector,
     code_view::{
         BatchLiveMap, BatchProgressMap, BatchStartedMap, BatchViewMap, CardPolicy, Disclosure,
         RowTarget, ScrollSpan, ScrollWindow,
@@ -47,6 +47,7 @@ use caudra_agent::types::WorkflowRunCard;
 use caudra_config::{ClockFormat, ToolOutputLines, UiConfig};
 use caudra_grab::grab_leaf;
 use caudra_markdown::render::SpanSource;
+use caudra_providers::AutomationEventOrigin;
 use caudra_workflow::RunSnapshot;
 
 use std::borrow::Cow;
@@ -2170,6 +2171,25 @@ impl MessagesPanel {
                 }
             }
             _ => self.task_cards.get(call_id).and_then(agent_target),
+        }
+    }
+
+    /// The firing whose delivery a click at `row` landed on. The whole row
+    /// answers, heading and body alike.
+    pub(crate) fn automation_hit_at(&self, row: u16, area: Rect) -> Option<AutomationEventOrigin> {
+        if area.height == 0 {
+            return None;
+        }
+        let width = self.viewport_width;
+        let doc_row = self.doc_row(row, area);
+        let (_, segment, start) = self.cache.segment_at_row(doc_row, width)?;
+        let rel = u16::try_from(doc_row - start).ok()?;
+        if rel < segment.chrome(width).margin_top {
+            return None;
+        }
+        match &self.messages.get(segment.msg_index?)?.role {
+            DisplayRole::AutomationDelivery(origin) => Some(origin.as_ref().clone()),
+            _ => None,
         }
     }
 
@@ -4534,6 +4554,12 @@ impl MessagesPanel {
                     fragment.text.as_str(),
                     false,
                 ),
+                SegmentKind::AutomationDelivery => (
+                    "Automation delivery".to_owned(),
+                    None,
+                    fragment.text.as_str(),
+                    false,
+                ),
                 SegmentKind::PeerMessage => (
                     "Peer message".to_owned(),
                     None,
@@ -5718,7 +5744,9 @@ enum DisplayKey<'a> {
 fn display_key(message: &DisplayMessage) -> Option<DisplayKey<'_>> {
     match &message.role {
         DisplayRole::Tool(tool) => Some(DisplayKey::Tool(&tool.id)),
-        DisplayRole::TaskDelivery(_) | DisplayRole::PeerMessage(_) => Some(DisplayKey::Delivery),
+        DisplayRole::TaskDelivery(_)
+        | DisplayRole::AutomationDelivery(_)
+        | DisplayRole::PeerMessage(_) => Some(DisplayKey::Delivery),
         DisplayRole::User
         | DisplayRole::Assistant
         | DisplayRole::Thinking
@@ -5839,6 +5867,9 @@ fn same_display_item(left: &DisplayMessage, right: &DisplayMessage) -> bool {
     match (&left.role, &right.role) {
         (DisplayRole::Tool(left), DisplayRole::Tool(right)) => left.id == right.id,
         (DisplayRole::TaskDelivery(left), DisplayRole::TaskDelivery(right)) => left == right,
+        (DisplayRole::AutomationDelivery(left), DisplayRole::AutomationDelivery(right)) => {
+            left == right
+        }
         (DisplayRole::PeerMessage(left), DisplayRole::PeerMessage(right)) => left == right,
         (DisplayRole::User, DisplayRole::User)
         | (DisplayRole::Assistant, DisplayRole::Assistant)
@@ -5914,6 +5945,7 @@ fn segment_kind(role: &DisplayRole) -> SegmentKind {
         DisplayRole::Done => SegmentKind::Done,
         DisplayRole::Notice | DisplayRole::Injected => SegmentKind::Assistant,
         DisplayRole::TaskDelivery(_) => SegmentKind::TaskDelivery,
+        DisplayRole::AutomationDelivery(_) => SegmentKind::AutomationDelivery,
         DisplayRole::PeerMessage(_) => SegmentKind::PeerMessage,
         DisplayRole::Tool(_) => SegmentKind::ToolBlock,
     }
@@ -5938,6 +5970,7 @@ fn segment_styles(
         SegmentKind::ToolBlock
         | SegmentKind::Instruction
         | SegmentKind::TaskDelivery
+        | SegmentKind::AutomationDelivery
         | SegmentKind::PeerMessage => {
             (Some(theme.panel_style()), Some(theme.subtle_border_style()))
         }
@@ -5971,6 +6004,13 @@ fn build_message_lines(
             ..BuiltMessage::bare(lines, msg.text.clone())
         };
     }
+    if let DisplayRole::AutomationDelivery(origin) = &msg.role {
+        let (lines, links) = automation_inspector::transcript::row(origin, &msg.text, width);
+        return BuiltMessage {
+            links,
+            ..BuiltMessage::bare(lines, msg.text.clone())
+        };
+    }
     if let DisplayRole::PeerMessage(origin) = &msg.role {
         let (lines, links, search_text) = peer_card::delivery(origin, &msg.text, width);
         return BuiltMessage {
@@ -5985,7 +6025,10 @@ fn build_message_lines(
         DisplayRole::Error => error_style(),
         DisplayRole::Done => done_style(),
         DisplayRole::Notice | DisplayRole::Injected => notice_style(),
-        DisplayRole::Tool(_) | DisplayRole::TaskDelivery(_) | DisplayRole::PeerMessage(_) => {
+        DisplayRole::Tool(_)
+        | DisplayRole::TaskDelivery(_)
+        | DisplayRole::AutomationDelivery(_)
+        | DisplayRole::PeerMessage(_) => {
             unreachable!()
         }
     };

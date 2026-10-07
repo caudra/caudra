@@ -9,6 +9,8 @@ group = "Guides"
 
 The experimental messaging MVP lets live main sessions on the same Unix host exchange text, including sessions in separate terminals or TUI tabs. It supports the TUI and an active one-shot `--print` run, and scripts can send with [`caudra message`](#messages-from-scripts). Subagents, the SDK, ACP, remote Workcell sessions, and managed sandbox sessions are outside this scope.
 
+An [automation](/docs/automations/#messaging) can take part too. Its `message_received` trigger reacts to the messages its session receives, and with `consume` it takes them from the model. It sends with `reply`, `send`, `publish`, and `broadcast`.
+
 Messaging is off by default. Enable it in the **global** `caudra.toml` and restart each participating Caudra process:
 
 ```toml
@@ -202,7 +204,7 @@ Each body is limited to 32 KiB of UTF-8. The inbox admits at most 50 messages ac
 
 ## Message history
 
-Every message a session or script sends is recorded in a message history that all sessions of your user share. This covers direct messages, topic messages, and broadcasts. An entry keeps the sender, the audience, the text, and each recipient's outcome as it moves from queued or held to delivered, rejected, or dropped. The history uses tables in the canonical SQLite file `caudra.db` in the [state directory](/docs/configuration/#directory-layout), and only your user can read it. Recording happens before sending. When the history cannot record a message, the send fails and no recipient gets it.
+Every message a session or script sends is recorded in a message history that all sessions of your user share. This covers direct messages, topic messages, and broadcasts. An entry keeps the sender, the audience, the text, and each recipient's outcome as it moves from queued or held to delivered, rejected, or dropped. A queued message that one of the recipient's [automations](/docs/automations/#messaging) consumes and keeps moves to consumed instead, and the [Messages view](#browse-the-message-history) names the automation beside that outcome. A message the automation hands back returns to normal delivery. The history uses tables in the canonical SQLite file `caudra.db` in the [state directory](/docs/configuration/#directory-layout), and only your user can read it. Recording happens before sending. When the history cannot record a message, the send fails and no recipient gets it.
 
 The history is a record rather than an inbox, so a message still needs a live recipient when it is sent. Sessions use the history in two ways.
 

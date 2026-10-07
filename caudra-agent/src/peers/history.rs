@@ -158,8 +158,8 @@ impl MessageHistory {
         message: NewMessage,
         recipients: Vec<MessageRecipient>,
         max_work: usize,
-    ) -> Result<Vec<QueuedWork>, String> {
-        self.query(move |log| {
+    ) -> Result<Result<Vec<QueuedWork>, WorkRefusal>, String> {
+        self.decide(move |log| {
             Ok(log
                 .record_publication(&message, &recipients, max_work)?
                 .work)

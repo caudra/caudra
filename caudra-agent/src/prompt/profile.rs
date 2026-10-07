@@ -4,6 +4,8 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
 
+use caudra_automation::args::{ArgsError, MAX_ARGS_JSON_BYTES};
+use caudra_automation::meta::{INVALID_NAME, is_valid_name};
 use caudra_config::{ModelPolicy, ProfileToolPolicy};
 use caudra_providers::model_registry::Binding;
 use caudra_providers::{
@@ -11,6 +13,7 @@ use caudra_providers::{
 };
 use caudra_storage::thinking::{StoredThinking, ThinkingParseError};
 use serde::Deserialize;
+use serde_json::Value;
 use thiserror::Error;
 
 use crate::agent::{resolve_purpose_model, resolve_purpose_model_for_inspection};
@@ -39,6 +42,7 @@ struct Frontmatter {
     subagent_model: Option<String>,
     subagent_thinking: Option<FrontmatterThinking>,
     tools: ProfileToolPolicy,
+    automations: Vec<FrontmatterAutomation>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -57,6 +61,34 @@ impl FrontmatterThinking {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(
+    untagged,
+    expecting = "expected an automation name, or a map with a name and optional args"
+)]
+enum FrontmatterAutomation {
+    Name(String),
+    Configured(ProfileAutomation),
+}
+
+/// An automation the profile arms. `args` seed the session's binding only the first time the
+/// profile arms it, so later edits survive.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileAutomation {
+    pub name: String,
+    pub args: Option<Value>,
+}
+
+impl From<FrontmatterAutomation> for ProfileAutomation {
+    fn from(automation: FrontmatterAutomation) -> Self {
+        match automation {
+            FrontmatterAutomation::Name(name) => Self { name, args: None },
+            FrontmatterAutomation::Configured(automation) => automation,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SystemPromptProfile {
     name: Arc<str>,
@@ -65,6 +97,7 @@ pub struct SystemPromptProfile {
     subagent_model: Option<Binding>,
     subagent_thinking: Option<StoredThinking>,
     tools: ProfileToolPolicy,
+    automations: Vec<ProfileAutomation>,
     body: Arc<str>,
     path: Arc<Path>,
 }
@@ -72,6 +105,10 @@ pub struct SystemPromptProfile {
 impl SystemPromptProfile {
     pub fn tools(&self) -> &ProfileToolPolicy {
         &self.tools
+    }
+
+    pub fn automations(&self) -> &[ProfileAutomation] {
+        &self.automations
     }
 
     pub fn name(&self) -> &str {
@@ -455,6 +492,12 @@ enum PromptProfileError {
     DuplicateDirective { directive: String, line: usize },
     #[error("{{{{caudra.default}}}} cannot be combined with component directives")]
     DefaultMixedWithComponents,
+    #[error("automations: {name:?} {INVALID_NAME}")]
+    InvalidAutomationName { name: String },
+    #[error("automations: {name:?} is listed more than once")]
+    DuplicateAutomation { name: String },
+    #[error("automations: {name:?}: {error}")]
+    InvalidAutomationArgs { name: String, error: ArgsError },
 }
 
 fn validate_profile_name(name: &str) -> Result<(), PromptProfileError> {
@@ -558,9 +601,53 @@ fn load_profile(path: &Path, name: Arc<str>) -> Result<SystemPromptProfile, Prom
         subagent_model,
         subagent_thinking,
         tools: frontmatter.tools,
+        automations: profile_automations(frontmatter.automations)?,
         body: Arc::from(body),
         path: Arc::from(path),
     })
+}
+
+/// Names follow the automation name rules, and args must fit what an arming accepts.
+fn profile_automations(
+    listed: Vec<FrontmatterAutomation>,
+) -> Result<Vec<ProfileAutomation>, PromptProfileError> {
+    let mut automations: Vec<ProfileAutomation> = Vec::with_capacity(listed.len());
+    for automation in listed.into_iter().map(ProfileAutomation::from) {
+        if !is_valid_name(&automation.name) {
+            return Err(PromptProfileError::InvalidAutomationName {
+                name: automation.name,
+            });
+        }
+        if automations
+            .iter()
+            .any(|earlier| earlier.name == automation.name)
+        {
+            return Err(PromptProfileError::DuplicateAutomation {
+                name: automation.name,
+            });
+        }
+        if let Some(args) = &automation.args
+            && let Err(error) = check_profile_args(args)
+        {
+            return Err(PromptProfileError::InvalidAutomationArgs {
+                name: automation.name,
+                error,
+            });
+        }
+        automations.push(automation);
+    }
+    Ok(automations)
+}
+
+fn check_profile_args(args: &Value) -> Result<(), ArgsError> {
+    if !args.is_object() {
+        return Err(ArgsError::NotAnObject);
+    }
+    let bytes = serde_json::to_vec(args).map_or(usize::MAX, |json| json.len());
+    if bytes > MAX_ARGS_JSON_BYTES {
+        return Err(ArgsError::TooLarge(bytes));
+    }
+    Ok(())
 }
 
 fn parse_frontmatter(text: &str) -> Result<(Frontmatter, &str, usize), PromptProfileError> {
@@ -640,10 +727,12 @@ mod tests {
     use std::env;
     use std::process::Command;
 
+    use caudra_automation::meta::MAX_NAME_BYTES;
     use caudra_config::ModelPolicy;
     use caudra_providers::{Model, ThinkingConfig, catalog_providers_if_available, model_registry};
     use caudra_storage::StateDir;
     use caudra_storage::thinking::StoredThinking;
+    use serde_json::json;
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -665,6 +754,12 @@ mod tests {
     const INSPECTION_OFFLINE_ENV: &str = "CAUDRA_TEST_PROFILE_INSPECTION_OFFLINE";
     const INSPECTION_OFFLINE_TEST: &str =
         "prompt::profile::tests::inspection_task_bindings_need_no_auth_or_catalog";
+    const AUTOMATION_PROFILE: &str = "worker";
+    const JOIN_SWARM: &str = "join-swarm";
+    const GOAL_CHAIN: &str = "goal-chain";
+    const NOT_KEBAB_CASE: &str = "Join_Swarm";
+    /// The compact JSON around the string in `{k: …}` args.
+    const ARGS_FRAME: &str = r#"{"k":""}"#;
 
     fn inspection_catalog(model: Option<&str>, thinking: Option<&str>) -> PromptProfileCatalog {
         let name: Arc<str> = Arc::from(INSPECTION_PROFILE);
@@ -676,6 +771,7 @@ mod tests {
             subagent_thinking: thinking
                 .map(|thinking| StoredThinking::parse_setting(thinking).unwrap()),
             tools: ProfileToolPolicy::default(),
+            automations: Vec::new(),
             body: Arc::from(""),
             path: Arc::from(Path::new(INSPECTION_PROFILE)),
         };
@@ -1371,5 +1467,96 @@ mod tests {
         assert!(general.contains("# When done"));
         assert!(!general.contains("# Guidelines"));
         assert!(general.ends_with(crate::prompt::REMINDERS_PROMPT));
+    }
+
+    fn load_frontmatter(frontmatter: &str) -> Result<SystemPromptProfile, PromptProfileError> {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(format!("{AUTOMATION_PROFILE}.md"));
+        fs::write(&path, format!("---\n{frontmatter}\n---\nWork the queue.")).unwrap();
+        load_profile(&path, Arc::from(AUTOMATION_PROFILE))
+    }
+
+    fn automations_with_args(args: &str) -> String {
+        format!("automations: [{{name: {GOAL_CHAIN}, args: {args}}}]")
+    }
+
+    #[test_case("description: Worker", Vec::new(); "omitted")]
+    #[test_case(&format!("automations: [{JOIN_SWARM}]"), vec![ProfileAutomation { name: JOIN_SWARM.into(), args: None }]; "bare_name")]
+    #[test_case(
+        &format!(r#"automations: [{JOIN_SWARM}, {{name: {GOAL_CHAIN}, args: {{goals: ["A"]}}}}]"#),
+        vec![
+            ProfileAutomation { name: JOIN_SWARM.into(), args: None },
+            ProfileAutomation { name: GOAL_CHAIN.into(), args: Some(json!({"goals": ["A"]})) },
+        ];
+        "map_with_args"
+    )]
+    fn profile_automations_are_listed_in_order(
+        frontmatter: &str,
+        expected: Vec<ProfileAutomation>,
+    ) {
+        let profile = load_frontmatter(frontmatter).unwrap();
+
+        assert_eq!(profile.automations(), expected.as_slice());
+    }
+
+    #[test_case(NOT_KEBAB_CASE; "not_kebab_case")]
+    #[test_case(&"a".repeat(MAX_NAME_BYTES + 1); "too_long")]
+    fn an_invalid_automation_name_is_refused(name: &str) {
+        let error = load_frontmatter(&format!("automations: [{name}]")).unwrap_err();
+
+        assert!(
+            matches!(&error, PromptProfileError::InvalidAutomationName { name: refused } if refused == name),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_repeated_automation_is_refused() {
+        let error = load_frontmatter(&format!(
+            "automations: [{JOIN_SWARM}, {{name: {JOIN_SWARM}}}]"
+        ))
+        .unwrap_err();
+
+        assert!(
+            matches!(&error, PromptProfileError::DuplicateAutomation { name } if name == JOIN_SWARM),
+            "{error}"
+        );
+    }
+
+    #[test_case("[A]"; "list")]
+    #[test_case("text"; "string")]
+    fn automation_args_must_be_an_object(args: &str) {
+        let error = load_frontmatter(&automations_with_args(args)).unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                PromptProfileError::InvalidAutomationArgs { name, error: ArgsError::NotAnObject }
+                    if name == GOAL_CHAIN
+            ),
+            "{error}"
+        );
+    }
+
+    #[test_case(0 => None; "at_the_limit")]
+    #[test_case(1 => Some(ArgsError::TooLarge(MAX_ARGS_JSON_BYTES + 1)); "one_byte_over")]
+    fn automation_args_are_bounded(excess: usize) -> Option<ArgsError> {
+        let text = "x".repeat(MAX_ARGS_JSON_BYTES - ARGS_FRAME.len() + excess);
+        match load_frontmatter(&automations_with_args(&format!("{{k: {text}}}"))) {
+            Ok(_) => None,
+            Err(PromptProfileError::InvalidAutomationArgs { error, .. }) => Some(error),
+            Err(other) => panic!("{other}"),
+        }
+    }
+
+    #[test_case(&format!("[{{name: {GOAL_CHAIN}, arg: {{}}}}]"); "unknown_key")]
+    #[test_case("[{args: {}}]"; "missing_name")]
+    fn a_malformed_automation_entry_is_invalid_frontmatter(list: &str) {
+        let error = load_frontmatter(&format!("automations: {list}")).unwrap_err();
+
+        assert!(
+            matches!(error, PromptProfileError::InvalidFrontmatter(_)),
+            "{error}"
+        );
     }
 }

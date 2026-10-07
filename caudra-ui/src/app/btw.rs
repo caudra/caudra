@@ -251,6 +251,7 @@ impl App {
         let Some(mut thread) = self.capture_btw_thread() else {
             return;
         };
+        self.renew_question_wait();
         self.close_stream_modal();
         thread.ask(question.clone());
         self.install_btw_thread(thread);
@@ -290,6 +291,7 @@ impl App {
         } else {
             thread.ask(question.clone());
         }
+        self.renew_question_wait();
         let (tx, rx) = flume::bounded(64);
         let (trigger, cancel) = CancelToken::new();
         self.stream_modal

@@ -112,6 +112,7 @@ macro_rules! text_enum {
         }
     };
 }
+pub(crate) use text_enum;
 
 text_enum! {
     WorkflowRunStatus as "workflow run status" {
@@ -1049,7 +1050,11 @@ fn read_call(row: &Row<'_>) -> Result<WorkflowCallRow, SessionError> {
     })
 }
 
-fn parse_column<T>(row: &Row<'_>, index: usize, field: &'static str) -> Result<T, SessionError>
+pub(crate) fn parse_column<T>(
+    row: &Row<'_>,
+    index: usize,
+    field: &'static str,
+) -> Result<T, SessionError>
 where
     T: FromStr<Err = UnknownVariant>,
 {

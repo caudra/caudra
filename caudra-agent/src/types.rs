@@ -7,9 +7,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use caudra_providers::{
-    AgentError, Billing, ContentBlock, Message, PEER_SCRIPT_SENDER, PEER_SESSION_SENDER,
-    PeerMessageOrigin, Role, StopReason, TaskEventOrigin, TokenUsage, estimate_tokens_cached,
-    token_label,
+    AgentError, AutomationEventOrigin, Billing, ContentBlock, Message, PEER_SCRIPT_SENDER,
+    PEER_SESSION_SENDER, PeerMessageOrigin, Role, StopReason, TaskEventOrigin, TokenUsage,
+    estimate_tokens_cached, token_label,
 };
 use caudra_storage::background::{JobKind, JobOwner, ShellJobMetadata};
 use caudra_storage::id::CaudraId;
@@ -29,7 +29,8 @@ use strum::Display;
 
 use crate::agent::{GoalResult, GoalVerdict};
 use crate::peers::{
-    AssignedWork, PeerHistoryPage, PeerSummary, PublishReceipt, SendReceipt, TopicActivity,
+    AssignedWork, PeerHistoryPage, PeerSummary, PublishReceipt, STATUS_HELD, STATUS_QUEUED,
+    STATUS_RATE_LIMITED, STATUS_REFUSED, STATUS_UNAVAILABLE, SendReceipt, TopicActivity,
     handle_address, literal,
 };
 use crate::permissions::PermissionRequest;
@@ -1198,22 +1199,22 @@ fn utc_time(ms: u64) -> Option<String> {
 
 fn status_label(status: &str) -> &'static str {
     match status {
-        "queued" => "queued",
-        "held" => "held for review",
-        "refused" => "refused",
-        "rate_limited" => "rate limited",
-        "unavailable" => "unavailable",
+        STATUS_QUEUED => "queued",
+        STATUS_HELD => "held for review",
+        STATUS_REFUSED => "refused",
+        STATUS_RATE_LIMITED => "rate limited",
+        STATUS_UNAVAILABLE => "unavailable",
         _ => "unknown outcome",
     }
 }
 
 fn accepted(status: &str) -> bool {
-    matches!(status, "queued" | "held")
+    matches!(status, STATUS_QUEUED | STATUS_HELD)
 }
 
 fn receipt_note(status: &str) -> Option<&'static str> {
     match status {
-        "refused" | "rate_limited" | "unavailable" => None,
+        STATUS_REFUSED | STATUS_RATE_LIMITED | STATUS_UNAVAILABLE => None,
         status if accepted(status) => Some(PEER_RECEIPT_ACCEPTED),
         _ => Some(PEER_RECEIPT_UNKNOWN),
     }
@@ -2599,6 +2600,8 @@ pub enum AgentEvent {
         task_event: Option<TaskEventOrigin>,
         #[serde(skip_serializing_if = "Option::is_none")]
         peer_event: Option<PeerMessageOrigin>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        automation_event: Option<AutomationEventOrigin>,
     },
     /// Deferred tools moved into the request array. Reported because the user
     /// is paying for it: the tools array changes, so the provider's prompt

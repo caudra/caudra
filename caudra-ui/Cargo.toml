@@ -7,6 +7,7 @@ authors.workspace = true
 
 [dependencies]
 caudra-agent = { workspace = true }
+caudra-automation = { workspace = true }
 caudra-config = { workspace = true }
 caudra-sandbox = { workspace = true }
 caudra-diff = { workspace = true }

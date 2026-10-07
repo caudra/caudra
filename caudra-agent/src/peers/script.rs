@@ -10,8 +10,6 @@ use caudra_storage::messages::MessageRecipient;
 use caudra_storage::sessions::PermissionMode;
 use sha2::{Digest, Sha256};
 
-#[cfg(not(unix))]
-use super::UNAVAILABLE;
 use super::history::{HistoryWriter, MessageHistory};
 #[cfg(unix)]
 use super::unix::{self, Directory};
@@ -21,6 +19,8 @@ use super::{
     check_text, deceptive, holder, message_name, parse_handle_address, recipient_room, token,
     wall_ms,
 };
+#[cfg(not(unix))]
+use super::{STATUS_UNAVAILABLE, UNAVAILABLE};
 
 const SESSION_DOMAIN: &[u8] = b"caudra script sender\0";
 const SESSION_BYTES: usize = 16;
@@ -124,7 +124,7 @@ impl ScriptSender {
         }
         #[cfg(not(unix))]
         smol::spawn(async move {
-            SendReceipt::new("unavailable", &delivery.message_id, Some(UNAVAILABLE))
+            SendReceipt::new(STATUS_UNAVAILABLE, &delivery.message_id, Some(UNAVAILABLE))
         })
     }
 
@@ -160,6 +160,7 @@ impl ScriptSender {
             .history
             .record_publication(template.history_entry(), recipients, max_work)
             .await
+            .and_then(|recorded| recorded.map_err(|refusal| refusal.to_string()))
             .map_err(|error| format!("{NOT_RECORDED}: {error}"))?;
         let sender = template.sender.route.target();
         let mut receipts = Vec::with_capacity(peers.len());
@@ -216,6 +217,7 @@ impl ScriptSender {
             mode: WireMode::Build,
             permission_mode: PermissionMode::Ask,
             external: true,
+            automation: None,
         })
     }
 }

@@ -272,8 +272,8 @@ impl ToolFilter {
                     .collect(),
             )
         };
-        let mut exclude: Vec<&str> = extra_exclude.to_vec();
-        exclude.extend(feature_exclusions(config.features));
+        let mut exclude: Vec<&str> = feature_exclusions(config.features).collect();
+        exclude.extend_from_slice(extra_exclude);
         exclude.extend(credential_exclusions());
         exclude.extend(config.disabled_tools.iter().map(|s| s.as_str()));
         base.excluding(&exclude)
@@ -299,23 +299,11 @@ pub fn capability_exclusions(model: &Model) -> &'static [&'static str] {
 
 /// A tool whose experiment is off leaves every catalog, even one an allowlist
 /// asks for by name: only the global caudra.toml can turn it on.
-pub fn feature_exclusions(features: FeatureFlags) -> &'static [&'static str] {
-    match (
-        features.enabled(Feature::Workflows),
-        features.enabled(Feature::CrossSessionMessaging),
-    ) {
-        (true, true) => &[],
-        (false, true) => &[WORKFLOW_TOOL_NAME],
-        (true, false) => native::peers::TOOL_NAMES,
-        (false, false) => &[
-            WORKFLOW_TOOL_NAME,
-            native::peers::LIST_NAME,
-            native::peers::SEND_NAME,
-            native::peers::PUBLISH_NAME,
-            native::peers::READ_NAME,
-            native::peers::WORK_NAME,
-        ],
-    }
+pub fn feature_exclusions(features: FeatureFlags) -> impl Iterator<Item = &'static str> {
+    EXPERIMENTAL_TOOLS
+        .iter()
+        .filter(move |(feature, _)| !features.enabled(*feature))
+        .flat_map(|(_, names)| names.iter().copied())
 }
 
 /// Same gate for tools that need a credential the user may not have. Offering
@@ -341,6 +329,7 @@ fn exclusions_without(openai_subscription: bool) -> &'static [&'static str] {
     }
 }
 
+pub const AUTOMATION_TOOL_NAME: &str = "automation";
 pub const BATCH_TOOL_NAME: &str = "batch";
 pub const PYTHON_EXECUTION_TOOL_NAME: &str = "python_execution";
 pub const EXECUTION_ENVIRONMENT_TOOL_NAME: &str = "execution_environment";
@@ -363,6 +352,12 @@ pub const TODOWRITE_TOOL_NAME: &str = "todo_write";
 pub const TOOL_OUTPUT_TOOL_NAME: &str = "tool_output";
 pub const VIEW_IMAGE_TOOL_NAME: &str = "view_image";
 pub const WORKFLOW_TOOL_NAME: &str = "workflow";
+/// The tools each experiment registers.
+const EXPERIMENTAL_TOOLS: &[(Feature, &[&str])] = &[
+    (Feature::Workflows, &[WORKFLOW_TOOL_NAME]),
+    (Feature::CrossSessionMessaging, native::peers::TOOL_NAMES),
+    (Feature::Automations, &[AUTOMATION_TOOL_NAME]),
+];
 
 /// Containers own nested tool calls: their result is the list of children
 /// rather than output of their own. Callers use this to follow the children

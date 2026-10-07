@@ -22,6 +22,7 @@ path = "src/main.rs"
 async-trait = { workspace = true }
 caudra-ui = { workspace = true }
 caudra-agent = { workspace = true }
+caudra-automation = { workspace = true }
 caudra-acp = { workspace = true }
 caudra-config = { workspace = true }
 caudra-sandbox = { workspace = true }
@@ -63,6 +64,7 @@ exclude = ["vendor/crossterm"]
 members = [
   "caudra-acp",
   "caudra-agent",
+  "caudra-automation",
   "caudra-config",
   "caudra-decision",
   "caudra-sandbox",
@@ -76,6 +78,7 @@ members = [
   "caudra-markdown",
   "caudra-otel",
   "caudra-providers",
+  "caudra-script",
   "caudra-storage",
   "caudra-config-macro",
   "caudra-lua-macro",
@@ -107,6 +110,8 @@ caudra-diff = { path = "caudra-diff" }
 caudra-docs = { path = "caudra-docs" }
 caudra-interpreter = { path = "caudra-interpreter" }
 caudra-providers = { path = "caudra-providers" }
+caudra-script = { path = "caudra-script", default-features = false }
+caudra-automation = { path = "caudra-automation" }
 caudra-storage = { path = "caudra-storage" }
 caudra-ui = { path = "caudra-ui" }
 caudra-lua = { path = "caudra-lua" }
@@ -120,7 +125,7 @@ caudra-workbench = { path = "caudra-workbench" }
 caudra-workcell = { path = "caudra-workcell" }
 caudra-workspace = { path = "caudra-workspace" }
 caudra-workflow = { path = "caudra-workflow" }
-workcell = { git = "https://github.com/tensorninja/workcell-mcp", rev = "0a215f7575b72b71e0dff2635e3a42e8ac2a1457", default-features = false, features = ["files-index", "web", "shell", "code-bundled", "code-graph-git", "environment", "host-contract", "snapshots"] }
+workcell = { git = "https://github.com/tensorninja/workcell-mcp", rev = "754a82d350d4f23872df7bd7533afe6f2857cc67", default-features = false, features = ["files-index", "web", "shell", "code-bundled", "code-graph-git", "environment", "host-contract", "snapshots"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 rusqlite = { version = "0.40", default-features = false, features = ["backup", "bundled", "cache", "limits"] }

@@ -1480,6 +1480,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                     platform: workcell_runtime.display().platform.clone(),
                 }
             }),
+            automations: stack.config.automations,
         })
         .context("run sdk mode")?;
         super::sandbox::remember_session_source(
@@ -1617,6 +1618,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
         join_launch_groups(host, session, &cli.groups)?;
     }
     let mut joined_groups = !cli.groups.is_empty();
+    let mut launch_automations = std::mem::take(&mut cli.automations);
 
     loop {
         let runtime_cwd = if workcell_runtime.is_remote() {
@@ -1738,8 +1740,10 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                 focused,
                 startup_warnings: std::mem::take(&mut warnings),
                 joined_groups: std::mem::take(&mut joined_groups),
+                launch_automations: std::mem::take(&mut launch_automations),
                 storage: storage.clone(),
                 config: stack.config.agent.clone(),
+                automations: stack.config.automations.clone(),
                 ui_config: stack.config.ui.clone(),
                 snapshots: stack.config.storage.snapshots,
                 change_factory,

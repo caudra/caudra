@@ -40,6 +40,8 @@ const BACKGROUND_WAITING_LABEL: &str = " waiting for background work";
 const BACK_TO_MAIN_LABEL: &str = "[< Main]";
 const TASKS_LABEL: &str = "tasks";
 const SHELLS_LABEL: &str = "shell";
+const AUTOMATIONS_CHIP_LABEL: &str = "auto";
+const AUTOMATION_FAILURES_LABEL: &str = "failed";
 /// Replaces the countdown under the pointer: the control has to say what a
 /// click does, and the seconds left stop mattering once you mean to skip them.
 const RETRY_NOW_LABEL: &str = " · retry now";
@@ -112,6 +114,14 @@ const GAUGE_CLOSE: &str = "\u{258f}";
 pub struct WorkflowChip {
     pub named: String,
     pub counts: String,
+}
+
+/// What the bar says about the session's automations: how many are armed,
+/// and how many firings failed since the inspector was last opened.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AutomationChip {
+    pub armed: usize,
+    pub unseen_failures: usize,
 }
 
 /// `[wf: deep-research · Research 2/4]` for the one run working now,
@@ -210,6 +220,7 @@ pub enum StatusBarHitTarget {
     Fast,
     Sandbox,
     Decisions,
+    Automations,
 }
 
 impl StatusBarHitTarget {
@@ -248,6 +259,7 @@ impl StatusBarHitTarget {
             | Self::Thinking
             | Self::Goal
             | Self::Workflows
+            | Self::Automations
             | Self::Fast
             | Self::Retry => ChatScope::MainOnly,
         }
@@ -818,6 +830,7 @@ pub struct StatusBar {
     branch_update_rx: Option<flume::Receiver<()>>,
     cwd: Option<String>,
     marquee: Marquee,
+    automations: AutomationChip,
 }
 
 #[derive(Default)]
@@ -902,7 +915,16 @@ impl StatusBar {
             branch_update_rx: (!remote).then(|| spawn_branch_watcher(cwd)).flatten(),
             cwd: (!remote).then(|| cwd.to_owned()),
             marquee: Marquee::default(),
+            automations: AutomationChip::default(),
         }
+    }
+
+    /// Whether the chip changed, so a caller feeding it every tick repaints
+    /// only when it did.
+    pub fn set_automations(&mut self, chip: AutomationChip) -> Dirty {
+        let changed = self.automations != chip;
+        self.automations = chip;
+        Dirty::from(changed)
     }
 
     pub fn flash(&mut self, msg: String) {
@@ -916,6 +938,11 @@ impl StatusBar {
     #[cfg(test)]
     pub fn flash_text(&self) -> Option<&str> {
         self.flash.as_ref().map(|(s, ..)| s.as_str())
+    }
+
+    #[cfg(test)]
+    pub fn automations(&self) -> &AutomationChip {
+        &self.automations
     }
 
     pub fn refresh_cwd(&mut self, cwd: &str) {
@@ -1036,6 +1063,7 @@ impl StatusBar {
         push_resume(&mut left, ctx);
         push_goal(&mut left, ctx);
         push_activity(&mut left, ctx);
+        push_automations(&mut left, ctx, &self.automations);
         if ctx.background_waiting {
             left.push(Span::styled(
                 BACKGROUND_WAITING_LABEL,
@@ -1104,6 +1132,7 @@ impl StatusBar {
         activity.push(self.spinner_slot(ctx));
         push_goal(&mut activity, ctx);
         push_activity(&mut activity, ctx);
+        push_automations(&mut activity, ctx, &self.automations);
         let mut messages = Strip::default();
         if ctx.background_waiting {
             messages.push(Span::styled(
@@ -1396,6 +1425,29 @@ fn push_activity(strip: &mut Strip<'_>, ctx: &StatusBarContext<'_>) {
             );
         }
     }
+}
+
+/// `[auto · 3]`, red with the failures nobody has looked at yet.
+fn push_automations(strip: &mut Strip<'_>, ctx: &StatusBarContext<'_>, chip: &AutomationChip) {
+    let (label, style) = match chip.unseen_failures {
+        0 if chip.armed == 0 => return,
+        0 => (
+            format!("[{AUTOMATIONS_CHIP_LABEL} · {}]", chip.armed),
+            control_style(ctx, StatusBarHitTarget::Automations),
+        ),
+        failures => (
+            format!(
+                "[{AUTOMATIONS_CHIP_LABEL} · {} · {failures} {AUTOMATION_FAILURES_LABEL}]",
+                chip.armed
+            ),
+            theme::current().error,
+        ),
+    };
+    strip.chip(
+        ctx,
+        StatusBarHitTarget::Automations,
+        [Span::styled(label, style)],
+    );
 }
 
 /// The error and its countdown answer as one control, and under the pointer
@@ -2245,6 +2297,7 @@ mod tests {
         background_waiting: bool,
         retry_info: Option<&'a RetryInfo>,
         workflows: Option<WorkflowChip>,
+        automations: AutomationChip,
         main_chat: bool,
         model_id: &'a str,
         pending_model: Option<&'a str>,
@@ -2274,6 +2327,7 @@ mod tests {
                 background_waiting: false,
                 retry_info: None,
                 workflows: None,
+                automations: AutomationChip::default(),
                 main_chat: true,
                 model_id: MODEL_ID,
                 pending_model: None,
@@ -2381,7 +2435,10 @@ mod tests {
     }
 
     fn draw(ctx: &StatusBarContext<'_>, width: u16, rows: u16) -> Drawn {
-        let mut bar = StatusBar::new(FLASH_TTL, ".", false);
+        draw_bar(&mut StatusBar::new(FLASH_TTL, ".", false), ctx, width, rows)
+    }
+
+    fn draw_bar(bar: &mut StatusBar, ctx: &StatusBarContext<'_>, width: u16, rows: u16) -> Drawn {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, rows)).unwrap();
         let mut hits = Vec::new();
@@ -2404,19 +2461,24 @@ mod tests {
     }
 
     fn render_at(fixture: Fixture<'_>) -> (String, Vec<StatusBarHit>, Vec<Style>) {
-        let width = fixture.width;
         let Drawn {
             mut rows,
             mut styles,
             hits,
-        } = draw(&fixture.into_ctx(), width, SINGLE_ROW);
+        } = render_fixture(fixture, SINGLE_ROW);
         (rows.swap_remove(0), hits, styles.swap_remove(0))
     }
 
     /// The fixture on a terminal tall enough to split the footer.
     fn render_rows(fixture: Fixture<'_>) -> Drawn {
+        render_fixture(fixture, SPLIT_ROWS)
+    }
+
+    fn render_fixture(fixture: Fixture<'_>, rows: u16) -> Drawn {
         let width = fixture.width;
-        draw(&fixture.into_ctx(), width, SPLIT_ROWS)
+        let mut bar = StatusBar::new(FLASH_TTL, ".", false);
+        let _ = bar.set_automations(fixture.automations.clone());
+        draw_bar(&mut bar, &fixture.into_ctx(), width, rows)
     }
 
     fn render(global_cost: Option<f64>, show_global: bool, yolo: bool) -> String {
@@ -3638,6 +3700,72 @@ mod tests {
         }
     }
 
+    const ARMED_AUTOMATIONS: usize = 3;
+    const UNSEEN_FAILURES: usize = 2;
+    const NO_AUTOMATION_CHIP_MSG: &str = "nothing armed and nothing failed draws no chip";
+
+    #[test_case(0, 0; "nothing_armed")]
+    #[test_case(ARMED_AUTOMATIONS, 0; "armed_count")]
+    #[test_case(ARMED_AUTOMATIONS, UNSEEN_FAILURES; "failures_turn_it_red")]
+    #[test_case(0, UNSEEN_FAILURES; "failures_outlive_disarming")]
+    fn automation_chip_counts_armed_and_turns_red_on_unseen_failures(
+        armed: usize,
+        unseen_failures: usize,
+    ) {
+        for rows in [SINGLE_ROW, SPLIT_ROWS] {
+            let drawn = render_fixture(
+                Fixture {
+                    automations: AutomationChip {
+                        armed,
+                        unseen_failures,
+                    },
+                    ..Default::default()
+                },
+                rows,
+            );
+            let hit = drawn
+                .hits
+                .iter()
+                .find(|hit| hit.target == StatusBarHitTarget::Automations)
+                .copied();
+            if armed == 0 && unseen_failures == 0 {
+                assert!(hit.is_none(), "{NO_AUTOMATION_CHIP_MSG}");
+                let prefix = format!("[{AUTOMATIONS_CHIP_LABEL} ·");
+                assert!(
+                    drawn.rows.iter().all(|row| !row.contains(&prefix)),
+                    "{NO_AUTOMATION_CHIP_MSG}"
+                );
+                continue;
+            }
+            let hit = hit.expect(MISSING_HIT_MSG);
+            let (label, colour) = match unseen_failures {
+                0 => (
+                    format!("[{AUTOMATIONS_CHIP_LABEL} · {armed}]"),
+                    theme::current().status_notice.fg,
+                ),
+                failures => (
+                    format!(
+                        "[{AUTOMATIONS_CHIP_LABEL} · {armed} · {failures} {AUTOMATION_FAILURES_LABEL}]"
+                    ),
+                    theme::current().error.fg,
+                ),
+            };
+            assert_eq!(drawn.glyphs(hit), label);
+            assert!(drawn.styles(hit).iter().all(|style| style.fg == colour));
+        }
+    }
+
+    #[test]
+    fn an_unchanged_automation_chip_asks_for_no_repaint() {
+        let mut bar = StatusBar::new(FLASH_TTL, ".", false);
+        let chip = AutomationChip {
+            armed: ARMED_AUTOMATIONS,
+            unseen_failures: 0,
+        };
+        assert_eq!(bar.set_automations(chip.clone()), Dirty::YES);
+        assert_eq!(bar.set_automations(chip), Dirty::NO);
+    }
+
     #[test_case(false; "plain")]
     #[test_case(true; "goal_retry_workflows_sandbox")]
     fn activity_hits_follow_mode_shortening_and_never_claim_clipped_chips(crowded: bool) {
@@ -4649,7 +4777,7 @@ mod tests {
         );
     }
 
-    const ALL_CONTROLS: [StatusBarHitTarget; 9] = [
+    const ALL_CONTROLS: [StatusBarHitTarget; 10] = [
         StatusBarHitTarget::BackToMain,
         StatusBarHitTarget::Mode,
         StatusBarHitTarget::Model,
@@ -4658,6 +4786,7 @@ mod tests {
         StatusBarHitTarget::Context,
         StatusBarHitTarget::Usage,
         StatusBarHitTarget::Workflows,
+        StatusBarHitTarget::Automations,
         StatusBarHitTarget::Retry,
     ];
     const TASK_CONTROLS: [StatusBarHitTarget; 3] = [
@@ -4690,6 +4819,10 @@ mod tests {
             goal: Some(&goal),
             retry_info: Some(&retry),
             workflows: ladder_workflows(),
+            automations: AutomationChip {
+                armed: ARMED_AUTOMATIONS,
+                unseen_failures: 0,
+            },
             ..Default::default()
         });
 
@@ -4706,12 +4839,13 @@ mod tests {
     /// Every control that opens a command carries that command's scope, so the
     /// bar cannot refuse a click the palette accepts. `Mode`, `BackToMain`,
     /// `Retry` and `Thinking` are absent because their click runs no command.
-    const SCOPED_COMMANDS: [(StatusBarHitTarget, &str); 6] = [
+    const SCOPED_COMMANDS: [(StatusBarHitTarget, &str); 7] = [
         (StatusBarHitTarget::Model, "/model"),
         (StatusBarHitTarget::Goal, "/goal"),
         (StatusBarHitTarget::Context, "/context"),
         (StatusBarHitTarget::Usage, "/usage"),
         (StatusBarHitTarget::Workflows, "/workflows"),
+        (StatusBarHitTarget::Automations, "/automations"),
         (StatusBarHitTarget::Decisions, "/decisions"),
     ];
     const SCOPE_DRIFT_MSG: &str = "a control and its command must agree on which chat they act on";

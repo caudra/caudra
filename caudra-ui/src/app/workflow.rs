@@ -959,6 +959,13 @@ mod tests {
         AgentEvent, AgentMode, CancelMap, CancelToken, Envelope, EventSender, HistorySnapshot,
         SubagentActivity, SubagentInfo, SubagentProgress,
     };
+    use caudra_automation::event::StartedBy;
+    use caudra_automation::host::ActionKind;
+    use caudra_automation::meta::TriggerKind;
+    use caudra_automation::request::{AutomationRequest, AutomationResponse};
+    use caudra_automation::snapshot::{
+        ActionRow, ActionStatus, AutomationState, FiringDetail, FiringStatus, FiringSummary,
+    };
     use caudra_config::FeatureFlags;
     use caudra_workflow::{
         AgentRosterEntry, CatalogEntry, RosterState, RunDetail, RunHistoryEntry, RunUsage,
@@ -1021,6 +1028,11 @@ mod tests {
     const RAISED_BUDGET: u32 = 24;
     const AMBIGUITY_IS_NOT_A_GUESS: &str =
         "a selector several runs answer to controls none of them";
+    const FIRE_ID: &str = "fire-1";
+    const STARTER: &str = "starter";
+    const ACTION_SEQ: u64 = 1;
+    const OPENS_THE_RUN: &str =
+        "Enter on a started run hands the screen to the workflow inspector, on that run";
 
     pub(crate) fn run(status: RunStatus) -> RunSnapshot {
         RunSnapshot {
@@ -1261,7 +1273,7 @@ mod tests {
         app.workflow.apply(done);
         end_turn(&mut app);
         let messages = claim(&mut app);
-        let actions = app.start_mailbox_run(messages);
+        let actions = app.start_mailbox_run(messages, StartedBy::Workflow);
         assert!(
             matches!(actions.as_slice(), [Action::SendMessage(input)] if input.message.is_empty() && input.preamble.len() == 1)
         );
@@ -1761,6 +1773,89 @@ mod tests {
             app.workflow_inspector.selected(),
             Some(OTHER_RUN_ID),
             "{RETURNS_WHERE_IT_LEFT}"
+        );
+    }
+
+    /// A firing whose one action started [`RUN_ID`], with an event that folds
+    /// nothing so the action is the trace's first item.
+    fn started_trace() -> FiringDetail {
+        FiringDetail {
+            firing: FiringSummary {
+                fire_id: FIRE_ID.into(),
+                automation: STARTER.into(),
+                digest: String::new(),
+                trigger: TriggerKind::Armed,
+                trigger_index: 0,
+                event_key: None,
+                consumed: false,
+                status: FiringStatus::Completed,
+                reason: None,
+                error: None,
+                repeats: 1,
+                attempts: 0,
+                operations: 0,
+                state_outcome: None,
+                queued_at: 0,
+                deferred_until: None,
+                started_at: None,
+                finished_at: None,
+                action_count: 1,
+                first_action: Some(ActionKind::StartWorkflow),
+            },
+            event: Value::Null,
+            event_cut: false,
+            state_patch: None,
+            patch_cut: false,
+            actions: vec![ActionRow {
+                seq: ACTION_SEQ,
+                kind: ActionKind::StartWorkflow,
+                line: None,
+                column: None,
+                status: ActionStatus::Done,
+                summary: String::new(),
+                error: None,
+                target: Some(RUN_ID.into()),
+                delivery: None,
+                expires_at: None,
+                wait: None,
+                turn_outcome: None,
+                turn_cost: None,
+                started_at: 0,
+                finished_at: None,
+                delivered_at: None,
+                request_cut: false,
+                result_cut: false,
+            }],
+            error_source: None,
+        }
+    }
+
+    #[test]
+    fn enter_on_a_started_run_in_an_automation_trace_opens_it_in_the_inspector() {
+        let mut app = scripted_app();
+        app.workflow.apply(run(RunStatus::Active));
+        app.workflow.apply(RunSnapshot {
+            run_id: OTHER_RUN_ID.into(),
+            ..run(RunStatus::Completed)
+        });
+        let _ = app
+            .automation_inspector
+            .open(Arc::new(AutomationState::default()), Some(FIRE_ID));
+        let _ = app.automation_inspector.apply_response(
+            &AutomationRequest::Firing {
+                fire_id: FIRE_ID.into(),
+            },
+            Ok(AutomationResponse::Firing(Box::new(started_trace()))),
+        );
+
+        app.update(Msg::Key(key(KeyCode::Enter)));
+
+        assert!(!app.automation_inspector.is_open(), "{OPENS_THE_RUN}");
+        assert!(app.workflow_inspector.is_open(), "{OPENS_THE_RUN}");
+        assert_eq!(
+            app.workflow_inspector.selected(),
+            Some(RUN_ID),
+            "{OPENS_THE_RUN}"
         );
     }
 

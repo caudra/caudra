@@ -64,6 +64,7 @@ const CALL_NAME_FIELD: &str = "name";
 const INVALID_BACKGROUND_BINDING: &str =
     "workflow background binding must be unique and session-owned";
 const STALE_ADMISSION: &str = "workflow admission belongs to an obsolete session generation";
+const WORKSPACE_TRANSITION_IN_PROGRESS: &str = "workspace transition in progress";
 
 pub struct RuntimeDeps {
     pub state_dir: StateDir,
@@ -120,9 +121,9 @@ impl WorkflowRuntime {
             restore_timeline(&mut snapshot, &store.load_events(row.run_id.clone()).await?);
             runs.push(snapshot);
         }
-        let published: Published = Arc::new(ArcSwap::from_pointee(WorkflowState { runs }));
+        let published = Published::new(WorkflowState { runs });
         let (requests, inbox) = flume::unbounded();
-        let handle = WorkflowHandle::new(requests, Arc::clone(&published));
+        let handle = WorkflowHandle::new(requests, published.clone());
         #[cfg(test)]
         let test_store = store.clone();
         let (root_trigger, root) = CancelToken::new();
@@ -237,6 +238,7 @@ impl Manager {
                         || self
                             .env
                             .published
+                            .state
                             .load()
                             .runs
                             .iter()
@@ -315,7 +317,9 @@ impl Manager {
                 WorkflowRequest::Start(_) | WorkflowRequest::Resume { .. }
             )
         {
-            return Err(internal("workspace transition in progress"));
+            return Err(WorkflowError::NotAdmitted(
+                WORKSPACE_TRANSITION_IN_PROGRESS.to_owned(),
+            ));
         }
         let _admission = if matches!(
             request,
@@ -323,9 +327,12 @@ impl Manager {
         ) {
             match self.background.get() {
                 Some(background) => {
-                    let guard = background.workflow_admission().await.map_err(internal)?;
+                    let guard = background
+                        .workflow_admission()
+                        .await
+                        .map_err(WorkflowError::NotAdmitted)?;
                     if generation != Some(background.generation()) {
-                        return Err(internal(STALE_ADMISSION));
+                        return Err(WorkflowError::NotAdmitted(STALE_ADMISSION.to_owned()));
                     }
                     Some(guard)
                 }
@@ -590,7 +597,7 @@ impl Manager {
         match run_id {
             Some(run_id) => Ok(WorkflowResponse::Run(Box::new(self.find(run_id)?))),
             None => Ok(WorkflowResponse::Runs(
-                self.env.published.load().runs.clone(),
+                self.env.published.state.load().runs.clone(),
             )),
         }
     }
@@ -664,7 +671,7 @@ impl Manager {
     async fn ack(&self, run_id: String, revision: u64) -> Result<WorkflowResponse, WorkflowError> {
         let acked = self.env.store.ack_outbox(run_id.clone(), revision).await?;
         if acked {
-            self.env.published.rcu(|state| {
+            self.env.published.state.rcu(|state| {
                 let mut runs = state.runs.clone();
                 if let Some(run) = runs
                     .iter_mut()
@@ -749,6 +756,7 @@ impl Manager {
     fn find(&self, run_id: &str) -> Result<RunSnapshot, WorkflowError> {
         self.env
             .published
+            .state
             .load()
             .runs
             .iter()
@@ -763,6 +771,7 @@ impl Manager {
         let active = self
             .env
             .published
+            .state
             .load()
             .runs
             .iter()
@@ -779,7 +788,7 @@ impl Manager {
     /// `name`, or `name-2`, `name-3`, ... once the session already has a run
     /// by that name.
     fn unique_display_name(&self, name: &str) -> String {
-        let state = self.env.published.load();
+        let state = self.env.published.state.load();
         let taken = |candidate: &str| state.runs.iter().any(|run| run.display_name == candidate);
         if !taken(name) {
             return name.to_owned();
@@ -788,6 +797,14 @@ impl Manager {
             .map(|suffix| format!("{name}{DISPLAY_NAME_SEPARATOR}{suffix}"))
             .find(|candidate| !taken(candidate))
             .unwrap_or_else(|| name.to_owned())
+    }
+}
+
+/// Every way the manager ends, a shutdown, its last handle going away, or a
+/// shutdown abandoned midway, ends the settle feeds with it.
+impl Drop for Manager {
+    fn drop(&mut self) {
+        self.env.published.close();
     }
 }
 
@@ -916,6 +933,7 @@ fn internal(error: impl std::fmt::Display) -> WorkflowError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::fs;
     use std::path::Path;
     use std::sync::Mutex;
@@ -929,6 +947,7 @@ mod tests {
     use caudra_storage::sessions::{SessionDatabase, SessionRelocation};
     use caudra_storage::workflow::{WorkflowCallState, WorkflowEventKind, WorkflowSourceKind};
     use caudra_workflow::RosterState;
+    use futures_lite::future::poll_once;
     use serde_json::json;
     use tempfile::TempDir;
     use test_case::test_case;
@@ -939,6 +958,7 @@ mod tests {
     use crate::agent::task_runner::{TaskFuture, TaskOutcome, TaskRequest};
     use crate::decisions::DecisionFeature;
     use crate::subagent_history::{SubagentHistoryLease, SubagentHistoryStore};
+    use crate::workflow::SettledRuns;
     use crate::workflow::state::stored_status;
 
     const MODEL: &str = "test/model";
@@ -953,7 +973,10 @@ complete([first.output.echo, second.output.echo]);
     const PROJECT_WORKFLOWS: &str = ".caudra/workflows";
     const SCRIPT_EXTENSION: &str = "rhai";
     const BLOCK_PREFIX: &str = "block-";
+    const HOLD_PREFIX: &str = "hold-";
+    const CANCEL_PREFIX: &str = "cancel-";
     const FAIL_PREFIX: &str = "fail-";
+    const FLAKY_PREFIX: &str = "flaky-";
     const FAILURE: &str = "boom";
     const CANCELLED: &str = "cancelled";
     const TOKENS_PER_AGENT: u64 = 10;
@@ -1035,6 +1058,30 @@ complete(note);
 let first = agent("one", #{ label: "block-1" });
 complete(first.output.echo);
 "#;
+    const HOLDING: &str = "holding";
+    const HOLDING_BODY: &str = r#"
+let first = agent("one", #{ label: "hold-1" });
+complete(first.output.echo);
+"#;
+    const CANCELLING: &str = "cancelling";
+    const CANCELLING_BODY: &str = r#"
+let first = agent("one", #{ label: "cancel-1" });
+complete(first.output.echo);
+"#;
+    const FLAKY: &str = "flaky";
+    const FLAKY_BODY: &str = r#"
+let first = agent("one", #{ label: "flaky-1" });
+complete(first.output.echo);
+"#;
+    /// Fails as soon as `fail-a` does, while `block-b` still runs.
+    const SPLIT: &str = "split";
+    const SPLIT_BODY: &str = r#"
+let results = parallel([
+    #{ prompt: "a", label: "fail-a" },
+    #{ prompt: "b", label: "block-b" },
+]);
+complete(results);
+"#;
 
     const EVENTS_CLOSED: &str = "the runtime dropped its event channel mid-run";
     const RUNNER_STOPPED: &str = "the runtime stopped before its agents started";
@@ -1049,6 +1096,16 @@ complete(first.output.echo);
     const TIMELINE_IS_KEPT: &str = "phases and log lines must be stored with the run";
     const SCRATCH_PREVIEW_IS_ITS_PATH: &str = "a scratch call previews the bare path it wrote";
     const HISTORY_IS_FOREIGN: &str = "history must list only other sessions' runs";
+    const FEED_LEFT_OPEN: &str = "a settle feed must end once its runtime has shut down";
+    const LATE_USAGE_ADVANCES_THE_REVISION: &str =
+        "an agent finishing after the outcome must advance the revision of the settled run";
+    const STOP_ANSWERS_THE_RUN: &str = "a stop must answer with the stopped run";
+    const REPUBLISH_SETTLED_AGAIN: &str = "a republished terminal state must not settle again";
+    const HELD_RUN_SETTLED: &str = "a paused or budget-limited run must not settle";
+    const SEEDED_RUN_SETTLED: &str =
+        "a run that ended before the feed opened must not settle until it ends again";
+    const RESUME_ADVANCES_THE_REVISION: &str =
+        "each settle of a resumed run must carry a newer revision";
     const DECIDING: &str = "deciding";
     const DECISION_MODEL: &str = "workflow/model";
     const DECISION_SECRET: &str = "workflow-test-secret";
@@ -1473,9 +1530,12 @@ complete(result);
     }
 
     /// Answers each agent by its label: `block-*` parks until released or
-    /// cancelled, `fail-*` fails without opening a session, anything else
-    /// succeeds echoing its prompt. Every start is announced so a test can
-    /// wait for an agent to be in flight without sleeping.
+    /// cancelled, `hold-*` parks until released even past a cancellation,
+    /// `cancel-*` reports itself cancelled, `fail-*` fails without opening a
+    /// session, `flaky-*` fails the same way unless a release is queued for
+    /// it, and anything else succeeds echoing its prompt. Every start is
+    /// announced so a test can wait for an agent to be in flight without
+    /// sleeping.
     struct FakeRunner {
         history: SubagentHistoryStore,
         started: flume::Sender<String>,
@@ -1534,8 +1594,12 @@ complete(result);
                         .push((label.clone(), events.workflow().cloned()));
                     let _ = self.started.send(label.clone());
                     let task_id = Some(request.task.requested().unwrap().to_owned());
-                    if label.starts_with(BLOCK_PREFIX)
-                        && cancel.race(self.release.recv_async()).await.is_err()
+                    if label.starts_with(HOLD_PREFIX) {
+                        let _ = self.release.recv_async().await;
+                    }
+                    if label.starts_with(CANCEL_PREFIX)
+                        || (label.starts_with(BLOCK_PREFIX)
+                            && cancel.race(self.release.recv_async()).await.is_err())
                     {
                         return TaskOutcome {
                             task_id,
@@ -1548,7 +1612,9 @@ complete(result);
                             duration_ms: 0,
                         };
                     }
-                    if label.starts_with(FAIL_PREFIX) {
+                    if label.starts_with(FAIL_PREFIX)
+                        || (label.starts_with(FLAKY_PREFIX) && self.release.try_recv().is_err())
+                    {
                         return TaskOutcome {
                             task_id: None,
                             mode: None,
@@ -1855,6 +1921,23 @@ complete(result);
             .iter()
             .map(|record| record.title.as_str())
             .collect()
+    }
+
+    /// A settle as the automation side keys it.
+    type Settle = (String, RunStatus, u64);
+
+    fn settle(run: &RunSnapshot) -> Settle {
+        (run.run_id.clone(), run.status, run.revision)
+    }
+
+    fn settles(settled: Option<Vec<RunSnapshot>>) -> Option<Vec<Settle>> {
+        settled.map(|runs| runs.iter().map(settle).collect())
+    }
+
+    /// One look at `feed` without waiting: `None` while nothing new has
+    /// settled, `Some(None)` once the feed has ended.
+    async fn look(feed: &mut SettledRuns) -> Option<Option<Vec<Settle>>> {
+        poll_once(feed.next()).await.map(settles)
     }
 
     async fn run_history(handle: &WorkflowHandle) -> Vec<RunHistoryEntry> {
@@ -3142,7 +3225,10 @@ complete(result);
             background.rearm();
             release.send(()).unwrap();
             parked.await.unwrap();
-            assert_eq!(queued.await, Err(internal(STALE_ADMISSION)));
+            assert_eq!(
+                queued.await,
+                Err(WorkflowError::NotAdmitted(STALE_ADMISSION.into()))
+            );
             assert_eq!(
                 database.load_workflow_runs(fixture.session_id).unwrap(),
                 before
@@ -3271,6 +3357,331 @@ complete(result);
             .await;
             assert!(matches!(refused, Err(WorkflowError::Unavailable)));
             assert!(!fixture.config.join(USER_WORKFLOWS).exists());
+        });
+    }
+
+    /// `reached` is where the run is when the test ends it: that status, or
+    /// its first agent running when `None`. `stop` then stops it, and the
+    /// shutdown that follows interrupts whatever still runs. The feed looks
+    /// only once everything has been published.
+    #[test_case(ECHO, ECHO_BODY, None, Some(RunStatus::Completed), false => RunStatus::Completed; "completed")]
+    #[test_case(FAILING, FAILING_BODY, None, Some(RunStatus::Failed), false => RunStatus::Failed; "failed")]
+    #[test_case(CANCELLING, CANCELLING_BODY, None, Some(RunStatus::Cancelled), false => RunStatus::Cancelled; "cancelled")]
+    #[test_case(BLOCKING, BLOCKING_BODY, None, None, true => RunStatus::Cancelled; "stop_running")]
+    #[test_case(PAUSING, PAUSING_BODY, None, Some(RunStatus::Paused), true => RunStatus::Cancelled; "stop_paused")]
+    #[test_case(PAIR, PAIR_BODY, Some(1), Some(RunStatus::BudgetLimited), true => RunStatus::Cancelled; "stop_budget_limited")]
+    #[test_case(BLOCKING, BLOCKING_BODY, None, None, false => RunStatus::Interrupted; "shutdown")]
+    fn each_way_a_run_ends_settles_it_once(
+        name: &str,
+        body: &str,
+        agent_budget: Option<u32>,
+        reached: Option<RunStatus>,
+        stop: bool,
+    ) -> RunStatus {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture.user_workflow(name, body);
+            let runtime = fixture.spawn().await;
+            let handle = runtime.handle();
+            let mut feed = handle.observe_settled();
+            let started = start(&handle, name, agent_budget).await;
+            match reached {
+                Some(status) => {
+                    fixture.wait_for(&started.run_id, status).await;
+                }
+                None => {
+                    fixture.started().await;
+                }
+            }
+            if stop {
+                run(
+                    &handle,
+                    WorkflowRequest::Stop {
+                        run_id: started.run_id,
+                    },
+                )
+                .await;
+            }
+            runtime.shutdown().await;
+            let ended = handle.state().runs[0].clone();
+            assert_eq!(look(&mut feed).await, Some(Some(vec![settle(&ended)])));
+            assert_eq!(look(&mut feed).await, Some(None), "{FEED_LEFT_OPEN}");
+            ended.status
+        })
+    }
+
+    #[test_case(PAUSING, PAUSING_BODY, None, false, RunStatus::Paused; "script_pause")]
+    #[test_case(BLOCKING, BLOCKING_BODY, None, true, RunStatus::Paused; "pause_request")]
+    #[test_case(PAIR, PAIR_BODY, Some(1), false, RunStatus::BudgetLimited; "budget_limit")]
+    fn a_run_held_short_of_its_end_never_settles(
+        name: &str,
+        body: &str,
+        agent_budget: Option<u32>,
+        pause: bool,
+        held: RunStatus,
+    ) {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture.user_workflow(name, body);
+            let runtime = fixture.spawn().await;
+            let handle = runtime.handle();
+            let mut feed = handle.observe_settled();
+            let started = start(&handle, name, agent_budget).await;
+            if pause {
+                fixture.started().await;
+                run(
+                    &handle,
+                    WorkflowRequest::Pause {
+                        run_id: started.run_id,
+                    },
+                )
+                .await;
+            } else {
+                fixture.wait_for(&started.run_id, held).await;
+            }
+            runtime.shutdown().await;
+            assert_eq!(handle.state().runs[0].status, held);
+            assert_eq!(look(&mut feed).await, Some(None), "{HELD_RUN_SETTLED}");
+        });
+    }
+
+    /// The second attempt fails like the first, so only the new revision
+    /// tells its settle apart.
+    #[test]
+    fn a_resumed_run_settles_again_under_its_new_revision() {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture.user_workflow(FLAKY, FLAKY_BODY);
+            let runtime = fixture.spawn().await;
+            let handle = runtime.handle();
+            let mut feed = handle.observe_settled();
+            let run_id = start(&handle, FLAKY, None).await.run_id;
+            let failed = fixture.wait_for(&run_id, RunStatus::Failed).await;
+            assert_eq!(look(&mut feed).await, Some(Some(vec![settle(&failed)])));
+
+            resume(&handle, &run_id, None).await.unwrap();
+            let failed_again = fixture.wait_for(&run_id, RunStatus::Failed).await;
+            assert_eq!(
+                look(&mut feed).await,
+                Some(Some(vec![settle(&failed_again)]))
+            );
+            fixture.release.send(()).unwrap();
+            resume(&handle, &run_id, None).await.unwrap();
+            let completed = fixture.wait_for(&run_id, RunStatus::Completed).await;
+            assert_eq!(look(&mut feed).await, Some(Some(vec![settle(&completed)])));
+
+            assert!(
+                failed.revision < failed_again.revision,
+                "{RESUME_ADVANCES_THE_REVISION}"
+            );
+            assert!(
+                failed_again.revision < completed.revision,
+                "{RESUME_ADVANCES_THE_REVISION}"
+            );
+            runtime.shutdown().await;
+        });
+    }
+
+    /// The stop settles the run while its agent still holds the attempt
+    /// open; that agent's stale write and the reloads, the manager's second
+    /// publish, and the acknowledgement that follow republish the same
+    /// terminal state.
+    #[test]
+    fn republishing_a_stopped_run_settles_nothing_more() {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture.user_workflow(HOLDING, HOLDING_BODY);
+            let runtime = fixture.spawn().await;
+            let handle = runtime.handle();
+            let mut feed = handle.observe_settled();
+            let run_id = start(&handle, HOLDING, None).await.run_id;
+            fixture.started().await;
+            let mut stop = Box::pin(handle.request(WorkflowRequest::Stop {
+                run_id: run_id.clone(),
+            }));
+            assert!(poll_once(&mut stop).await.is_none());
+
+            let settled = feed.next().await;
+            fixture.release.send(()).unwrap();
+            let Ok(WorkflowResponse::Run(stopped)) = stop.await else {
+                panic!("{STOP_ANSWERS_THE_RUN}");
+            };
+
+            assert_eq!(settles(settled), Some(vec![settle(&stopped)]));
+            assert_eq!(look(&mut feed).await, None, "{REPUBLISH_SETTLED_AGAIN}");
+            fixture.save_receipt(&stopped, false);
+            assert_eq!(
+                handle
+                    .request(WorkflowRequest::AckCompletion {
+                        run_id,
+                        revision: stopped.revision,
+                    })
+                    .await,
+                Ok(WorkflowResponse::Acked(true))
+            );
+            runtime.shutdown().await;
+            assert_eq!(
+                look(&mut feed).await,
+                Some(None),
+                "{REPUBLISH_SETTLED_AGAIN}"
+            );
+        });
+    }
+
+    #[test]
+    fn usage_landing_after_the_outcome_settles_nothing_more() {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture.user_workflow(SPLIT, SPLIT_BODY);
+            let runtime = fixture.spawn().await;
+            let handle = runtime.handle();
+            let mut feed = handle.observe_settled();
+            let run_id = start(&handle, SPLIT, None).await.run_id;
+            let failed = fixture.wait_for(&run_id, RunStatus::Failed).await;
+            assert_eq!(look(&mut feed).await, Some(Some(vec![settle(&failed)])));
+
+            fixture.release.send(()).unwrap();
+            let late = fixture.wait_for(&run_id, RunStatus::Failed).await;
+
+            assert!(
+                late.revision > failed.revision,
+                "{LATE_USAGE_ADVANCES_THE_REVISION}"
+            );
+            assert_eq!(look(&mut feed).await, None, "{REPUBLISH_SETTLED_AGAIN}");
+            runtime.shutdown().await;
+            assert_eq!(
+                look(&mut feed).await,
+                Some(None),
+                "{REPUBLISH_SETTLED_AGAIN}"
+            );
+        });
+    }
+
+    /// Nobody polls the feed until both runs are done, so a publication
+    /// that waited for its subscriber would have held them up. The flaky run
+    /// fails, then completes once resumed, before that one look.
+    #[test]
+    fn a_late_look_finds_every_run_that_settled_meanwhile() {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture
+                .user_workflow(ECHO, ECHO_BODY)
+                .user_workflow(FLAKY, FLAKY_BODY);
+            let runtime = fixture.spawn().await;
+            let handle = runtime.handle();
+            let mut feed = handle.observe_settled();
+            let echo_id = start(&handle, ECHO, None).await.run_id;
+            let echoed = fixture.wait_for(&echo_id, RunStatus::Completed).await;
+            let flaky_id = start(&handle, FLAKY, None).await.run_id;
+            fixture.wait_for(&flaky_id, RunStatus::Failed).await;
+            fixture.release.send(()).unwrap();
+            resume(&handle, &flaky_id, None).await.unwrap();
+            let recovered = fixture.wait_for(&flaky_id, RunStatus::Completed).await;
+
+            let found: HashSet<Settle> = look(&mut feed)
+                .await
+                .flatten()
+                .into_iter()
+                .flatten()
+                .collect();
+
+            assert_eq!(found, HashSet::from([settle(&echoed), settle(&recovered)]));
+            runtime.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn a_run_that_ended_before_the_feed_opened_settles_only_once_resumed() {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture
+                .user_workflow(ECHO, ECHO_BODY)
+                .user_workflow(FLAKY, FLAKY_BODY);
+            let runtime = fixture.spawn().await;
+            let handle = runtime.handle();
+            let echo_id = start(&handle, ECHO, None).await.run_id;
+            fixture.wait_for(&echo_id, RunStatus::Completed).await;
+            let flaky_id = start(&handle, FLAKY, None).await.run_id;
+            fixture.wait_for(&flaky_id, RunStatus::Failed).await;
+            let mut feed = handle.observe_settled();
+
+            fixture.release.send(()).unwrap();
+            resume(&handle, &flaky_id, None).await.unwrap();
+            let recovered = fixture.wait_for(&flaky_id, RunStatus::Completed).await;
+
+            assert_eq!(
+                look(&mut feed).await,
+                Some(Some(vec![settle(&recovered)])),
+                "{SEEDED_RUN_SETTLED}"
+            );
+            runtime.shutdown().await;
+            assert_eq!(look(&mut feed).await, Some(None), "{SEEDED_RUN_SETTLED}");
+        });
+    }
+
+    /// An abandoned runtime is one whose shutdown the UI gave up on, which
+    /// drops the manager's task wherever it was.
+    #[test_case(false; "shut_down")]
+    #[test_case(true; "abandoned")]
+    fn a_feed_ends_with_its_runtime_and_a_closed_one_opens_none(abandoned: bool) {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            let runtime = fixture.spawn().await;
+            let handle = runtime.handle();
+            let mut feed = handle.observe_settled();
+
+            if abandoned {
+                runtime.task.cancel().await;
+            } else {
+                runtime.shutdown().await;
+            }
+
+            assert_eq!(look(&mut feed).await, Some(None), "{FEED_LEFT_OPEN}");
+            assert_eq!(
+                look(&mut handle.observe_settled()).await,
+                Some(None),
+                "{FEED_LEFT_OPEN}"
+            );
+        });
+    }
+
+    /// Each refusal keeps the reason it gave as an internal error, so its
+    /// text reads as before.
+    #[test]
+    fn refused_admissions_keep_their_reason_under_their_own_variant() {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture.user_workflow(ECHO, ECHO_BODY);
+            let runtime = fixture.spawn().await;
+            let handle = runtime.handle();
+            let transition = handle.suspend().await.unwrap();
+            assert_eq!(
+                start_result(&handle, ECHO).await,
+                Err(WorkflowError::NotAdmitted(
+                    WORKSPACE_TRANSITION_IN_PROGRESS.into()
+                ))
+            );
+            drop(transition);
+
+            let background = BackgroundTasks::spawn(fixture.state_dir.clone(), fixture.session_id)
+                .await
+                .unwrap();
+            handle.bind_background(background.clone()).await.unwrap();
+            let reserved = background.suspend().unwrap();
+            let reason = background.workflow_admission().await.unwrap_err();
+            assert_eq!(
+                start_result(&handle, ECHO).await,
+                Err(WorkflowError::NotAdmitted(reason))
+            );
+            drop(reserved);
+            background.stop().await.unwrap();
+            let reason = background.workflow_admission().await.unwrap_err();
+            assert_eq!(
+                start_result(&handle, ECHO).await,
+                Err(WorkflowError::NotAdmitted(reason))
+            );
+            runtime.shutdown().await;
+            background.shutdown().await.unwrap();
         });
     }
 }

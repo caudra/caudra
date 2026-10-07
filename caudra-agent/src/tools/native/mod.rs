@@ -9,6 +9,7 @@
 //! renders directly, instead of a `BufferSnapshot` that has to be repainted by
 //! the Lua thread on every load, click, and theme change.
 
+pub mod automation;
 pub mod batch;
 pub mod image_generate;
 pub mod memory;
@@ -128,6 +129,13 @@ fn entries(
             workflow::WorkflowTool,
             ToolEffect::Orchestrator,
             workflow::DESCRIPTION,
+        ));
+    }
+    if features.enabled(Feature::Automations) {
+        entries.push(entry(
+            automation::AutomationTool,
+            ToolEffect::ReadOnly,
+            automation::DESCRIPTION,
         ));
     }
     if features.enabled(Feature::CrossSessionMessaging) {
@@ -412,17 +420,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn workflow_registers_only_when_its_experiment_is_on() {
-        let registers_workflow = |features| {
+    #[test_case(Feature::Workflows, crate::tools::WORKFLOW_TOOL_NAME; "workflow")]
+    #[test_case(Feature::Automations, crate::tools::AUTOMATION_TOOL_NAME; "automation")]
+    fn experimental_tool_registers_only_when_its_experiment_is_on(feature: Feature, name: &str) {
+        let registers = |features| {
             entries(skill::SkillTool::default(), features)
                 .iter()
-                .any(|(tool, ..)| tool.name() == crate::tools::WORKFLOW_TOOL_NAME)
+                .any(|(tool, ..)| tool.name() == name)
         };
-        assert!(!registers_workflow(FeatureFlags::NONE));
-        assert!(registers_workflow(
-            FeatureFlags::NONE.with(Feature::Workflows)
-        ));
+        assert!(!registers(FeatureFlags::all().without(feature)));
+        assert!(registers(FeatureFlags::NONE.with(feature)));
     }
 
     #[test_case(FeatureFlags::NONE, false; "disabled")]

@@ -48,7 +48,7 @@ pub use database::{
     ToolLedgerEntry, TrimReport, UsageBucket, WAL_RETENTION_LIMIT_BYTES, WORKSPACE_CHANGES_DIR,
     eager_load_limit, set_eager_load_limit,
 };
-pub(crate) use database::{from_i64, to_i64};
+pub(crate) use database::{from_i64, id_from_row, to_i64};
 pub use lease::SessionLease;
 pub use types::PermissionMode;
 
@@ -375,6 +375,66 @@ pub struct StoredPeerControls {
     pub groups: Vec<String>,
 }
 
+/// Who set a session's automation pause latch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StoredPauseSource {
+    /// Esc Esc, Ctrl-C while streaming, or the question form's Cancel.
+    User,
+    Sdk,
+    /// `pause_automations()` in a firing of `automation`.
+    Script {
+        automation: String,
+    },
+    Inspector,
+}
+
+/// Holds every automation of the session until human input clears it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredPauseLatch {
+    pub reason: String,
+    pub source: StoredPauseSource,
+    /// Unix milliseconds.
+    pub at: i64,
+}
+
+/// When each automation-started turn of the rolling hour started, ascending unix milliseconds.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredTurnWindow {
+    pub turns: Vec<i64>,
+}
+
+/// Automation-started turns since the last human input.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredUnattendedTurns {
+    pub count: u32,
+}
+
+/// Erroring automation-started runs since the last clean one or human input, and how long the
+/// next delivery waits for it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredDeliveryBackoff {
+    pub errors: u32,
+    pub until: Option<i64>,
+}
+
+/// The session-wide automation counters, as the automation runtime last published them. Each
+/// part has the serialized shape of its `caudra_automation` counterpart, so converting either
+/// way loses nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StoredAutomationControls {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pause: Option<StoredPauseLatch>,
+    pub turn_window: StoredTurnWindow,
+    pub unattended: StoredUnattendedTurns,
+    pub delivery_backoff: StoredDeliveryBackoff,
+    /// The armed automations by name, sorted. Their bindings live in the database, but this is
+    /// what keeps a session armed only with a schedule worth saving.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub armed: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -436,6 +496,8 @@ pub struct SessionMeta {
     pub permission_mode: Option<PermissionMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_controls: Option<StoredPeerControls>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automations: Option<StoredAutomationControls>,
     /// Calls that ran without a change record, whose changes a file revert
     /// leaves in place. Oldest first, and only the newest
     /// [`MAX_UNRECORDED_CALLS`].
@@ -1608,11 +1670,12 @@ mod tests {
     use super::StoredThinking;
     use super::{
         ARCHIVE_DIR, ARCHIVE_KEEP, ARCHIVE_MAX_BYTES, DEFAULT_TITLE, LOG_FORMAT_VERSION,
-        MAX_TITLE_LEN, SESSION_VERSION, SESSIONS_DIR, StoredImage, StoredInboundPolicy, StoredMode,
-        StoredPasteRange, StoredPeerControls, StoredPromptAdmission, StoredQueuedDraft,
-        StoredQueuedPrompt, StoredSubagent, StoredSubagentOutcome, StoredSubagentTaskSpec,
-        StoredTokenUsage, generate_title, meta_record, next_epoch, persisted_session_ids,
-        write_full_session,
+        MAX_TITLE_LEN, SESSION_VERSION, SESSIONS_DIR, StoredAutomationControls,
+        StoredDeliveryBackoff, StoredImage, StoredInboundPolicy, StoredMode, StoredPasteRange,
+        StoredPauseLatch, StoredPauseSource, StoredPeerControls, StoredPromptAdmission,
+        StoredQueuedDraft, StoredQueuedPrompt, StoredSubagent, StoredSubagentOutcome,
+        StoredSubagentTaskSpec, StoredTokenUsage, StoredTurnWindow, StoredUnattendedTurns,
+        generate_title, meta_record, next_epoch, persisted_session_ids, write_full_session,
     };
     use super::{
         HistorySnapshot, MAX_UNRECORDED_CALLS, PendingConversationRevert, PermissionMode, Session,
@@ -1653,6 +1716,10 @@ mod tests {
     const PEER_HANDLE: &str = "ci-watcher";
     const PEER_TOPIC: &str = "ci.*";
     const PEER_GROUP: &str = "reviewers";
+    const AUTOMATIONS_FIELD: &str = "automations";
+    const AUTOMATION_NAME: &str = "nightly-report";
+    const PAUSE_REASON: &str = "stopped by the user";
+    const PAUSED_AT: i64 = 1_700_000_000_000;
 
     #[test_case("{}", false; "legacy_default")]
     #[test_case(r#"{"automatic_wakes_suppressed":false}"#, false; "explicit_false")]
@@ -1747,6 +1814,69 @@ mod tests {
         let cloned = restored.clone();
         restored.meta.peer_controls = None;
         assert_eq!(cloned.meta.peer_controls, Some(controls));
+    }
+
+    #[test_case("{}"; "missing_automations")]
+    #[test_case(r#"{"automations":null}"#; "null_automations")]
+    fn automation_controls_missing_from_old_metadata_are_omitted(source: &str) {
+        let meta: SessionMeta = serde_json::from_str(source).unwrap();
+        assert_eq!(meta.automations, None);
+        assert!(
+            serde_json::to_value(meta)
+                .unwrap()
+                .get(AUTOMATIONS_FIELD)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn automation_controls_missing_parts_use_defaults() {
+        let controls: StoredAutomationControls =
+            serde_json::from_value(serde_json::json!({"armed": [AUTOMATION_NAME]})).unwrap();
+
+        assert_eq!(
+            controls,
+            StoredAutomationControls {
+                armed: vec![AUTOMATION_NAME.into()],
+                ..StoredAutomationControls::default()
+            }
+        );
+    }
+
+    #[test]
+    fn automation_controls_survive_storage() {
+        let (_temp, dir) = state_dir();
+        let controls = StoredAutomationControls {
+            pause: Some(StoredPauseLatch {
+                reason: PAUSE_REASON.into(),
+                source: StoredPauseSource::Script {
+                    automation: AUTOMATION_NAME.into(),
+                },
+                at: PAUSED_AT,
+            }),
+            turn_window: StoredTurnWindow {
+                turns: vec![PAUSED_AT - 1, PAUSED_AT],
+            },
+            unattended: StoredUnattendedTurns { count: 3 },
+            delivery_backoff: StoredDeliveryBackoff {
+                errors: 2,
+                until: Some(PAUSED_AT + 1),
+            },
+            armed: vec![AUTOMATION_NAME.into()],
+        };
+        let mut session = TestSession::new("model", "/project");
+        session.meta.automations = Some(controls.clone());
+        let serialized = serde_json::to_value(&session.meta).unwrap();
+        assert_eq!(
+            serialized[AUTOMATIONS_FIELD]["pause"]["source"],
+            serde_json::json!({"kind": "script", "automation": AUTOMATION_NAME})
+        );
+        assert_eq!(serialized[AUTOMATIONS_FIELD]["armed"][0], AUTOMATION_NAME);
+        session.save(&dir).unwrap();
+
+        let restored = TestSession::load(session.id, &dir).unwrap();
+
+        assert_eq!(restored.meta.automations, Some(controls));
     }
 
     #[test_case(None; "legacy_default")]

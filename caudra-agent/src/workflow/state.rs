@@ -1,7 +1,7 @@
 //! The published read model: how a stored row reads as a snapshot, and how
 //! one run's change lands in the session-wide [`WorkflowState`].
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
@@ -12,9 +12,55 @@ use caudra_workflow::{
     AgentRosterEntry, LogLine, MAX_PHASE_HISTORY, MAX_RUN_LOG_ENTRIES, PhaseRecord, RunEvent,
     RunEventKind, RunSnapshot, RunStatus, RunUsage, SourceKind, WorkflowState, parse_meta,
 };
+use flume::{Sender, TrySendError};
 use tracing::warn;
 
-pub(super) type Published = Arc<ArcSwap<WorkflowState>>;
+use super::settled::SettledRuns;
+
+/// The session's read model and the settle feeds watching it. `feeds` is
+/// `None` once the runtime has shut down.
+#[derive(Clone)]
+pub(super) struct Published {
+    pub state: Arc<ArcSwap<WorkflowState>>,
+    feeds: Arc<Mutex<Option<Vec<Sender<()>>>>>,
+}
+
+impl Published {
+    pub fn new(state: WorkflowState) -> Self {
+        Self {
+            state: Arc::new(ArcSwap::from_pointee(state)),
+            feeds: Arc::new(Mutex::new(Some(Vec::new()))),
+        }
+    }
+
+    /// Registers the feed before it reads the state, so a publication its
+    /// seed misses still wakes it. A closed runtime gives an ended feed.
+    pub fn observe_settled(&self) -> SettledRuns {
+        let (wake, woken) = flume::bounded(1);
+        if let Some(feeds) = self.feeds().as_mut() {
+            feeds.push(wake);
+        }
+        SettledRuns::new(woken, Arc::clone(&self.state))
+    }
+
+    /// Ends every feed once it has reported what already settled, and
+    /// refuses new ones.
+    pub fn close(&self) {
+        self.feeds().take();
+    }
+
+    /// Never blocks: a wake still pending covers this one too. A feed whose
+    /// subscriber is gone is dropped.
+    fn wake(&self) {
+        if let Some(feeds) = self.feeds().as_mut() {
+            feeds.retain(|feed| !matches!(feed.try_send(()), Err(TrySendError::Disconnected(()))));
+        }
+    }
+
+    fn feeds(&self) -> MutexGuard<'_, Option<Vec<Sender<()>>>> {
+        self.feeds.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 pub(super) fn snapshot_from_row(row: &WorkflowRunRow) -> RunSnapshot {
     let roster: Vec<AgentRosterEntry> = serde_json::from_str(&row.roster).unwrap_or_else(|error| {
@@ -140,9 +186,9 @@ pub(super) fn run_event(row: &WorkflowEventRow) -> RunEvent {
 }
 
 /// Replaces the run's entry, or files a new run at the front so the model
-/// stays newest-first like the store's own listing.
+/// stays newest-first like the store's own listing, then wakes every feed.
 pub(super) fn publish(published: &Published, snapshot: &RunSnapshot) {
-    published.rcu(|state| {
+    published.state.rcu(|state| {
         let mut runs = state.runs.clone();
         match runs.iter().position(|run| run.run_id == snapshot.run_id) {
             Some(index) => runs[index] = snapshot.clone(),
@@ -150,6 +196,7 @@ pub(super) fn publish(published: &Published, snapshot: &RunSnapshot) {
         }
         WorkflowState { runs }
     });
+    published.wake();
 }
 
 pub(super) fn now_secs() -> u64 {

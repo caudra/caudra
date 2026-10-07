@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+use std::fs;
 use std::path::PathBuf;
 
 use clap::builder::{PossibleValue, PossibleValuesParser, TypedValueParser};
@@ -7,11 +9,15 @@ use clap::{
 };
 use color_eyre::Result;
 use color_eyre::eyre::bail;
+use serde_json::Value;
 
 use caudra_agent::peers::script::{DEFAULT_LABEL, parse_label};
 use caudra_agent::peers::topics::{parse_pattern, parse_topic};
 use caudra_agent::peers::{parse_group, parse_handle, parse_handle_address};
 use caudra_agent::tools::all_builtin_tool_names;
+use caudra_automation::args::ArgsError;
+use caudra_automation::meta::{INVALID_NAME, is_valid_name};
+use caudra_automation::request::ProfileArming;
 use caudra_config::files::{self, ConfigFile};
 use caudra_config::sandbox::LeaseSeconds;
 use caudra_config::{Feature, FeatureDisabled, FeatureFlags, is_disableable_tool};
@@ -28,6 +34,14 @@ const DEFAULT_MESSAGE_LIMIT: u32 = 20;
 const MAX_MESSAGE_LIMIT: i64 = 1000;
 const PERMISSION_MODE_CONFLICT: &str = "--auto cannot be used with --yolo";
 const NO_REFERENCE: &str = "this file has no reference";
+const AUTOMATION_FLAG: &str = "--automation";
+const AUTOMATION_ARGS_SEPARATOR: char = '=';
+const AUTOMATION_ARGS_FILE: char = '@';
+const AUTOMATION_ACP_CONFLICT: &str = "cannot be used with acp";
+const AUTOMATION_REPEATED: &str = "is given more than once";
+const AUTOMATION_NAME: &str = "automation name";
+const AUTOMATION_ARGS_UNREADABLE: &str = "cannot read the args file";
+const AUTOMATION_ARGS_INVALID: &str = "args are not valid JSON";
 
 #[derive(Clone, ValueEnum, Default)]
 pub enum PromptVariant {
@@ -180,6 +194,15 @@ pub struct Cli {
     #[arg(long, conflicts_with = "print")]
     pub receive_broadcasts: bool,
 
+    /// Arm an automation in the initial session. NAME=JSON gives its args as a JSON object, and NAME=@FILE reads that object from a file. Repeat for more automations, naming each once
+    #[arg(
+        long = "automation",
+        value_name = "NAME[=JSON|@FILE]",
+        value_parser = parse_automation,
+        conflicts_with = "print"
+    )]
+    pub automations: Vec<ProfileArming>,
+
     /// Pre-approve tools (comma-separated). Accepts PascalCase (Claude Code) or snake_case.
     #[arg(
         long,
@@ -305,6 +328,7 @@ impl Cli {
             .mut_arg("receive_broadcasts", |arg| {
                 arg.hide(off(Feature::CrossSessionMessaging))
             })
+            .mut_arg("automations", |arg| arg.hide(off(Feature::Automations)))
             .mut_arg("no_jit", |arg| arg.hide(off(Feature::LuaPlugins)))
             .mut_subcommand("sandbox", |command| command.hide(sandboxes_off))
             .mut_subcommand("remote", |command| {
@@ -327,6 +351,23 @@ impl Cli {
             return Err(
                 Self::command().error(ErrorKind::ArgumentConflict, PERMISSION_MODE_CONFLICT)
             );
+        }
+        if !self.automations.is_empty() && matches!(self.command, Some(Command::Acp { .. })) {
+            return Err(Self::command().error(
+                ErrorKind::ArgumentConflict,
+                format!("{AUTOMATION_FLAG} {AUTOMATION_ACP_CONFLICT}"),
+            ));
+        }
+        let mut armed = HashSet::new();
+        if let Some(repeated) = self
+            .automations
+            .iter()
+            .find(|arming| !armed.insert(arming.name.as_str()))
+        {
+            return Err(Self::command().error(
+                ErrorKind::ArgumentConflict,
+                format!("{AUTOMATION_FLAG} {} {AUTOMATION_REPEATED}", repeated.name),
+            ));
         }
         Ok(self)
     }
@@ -386,6 +427,38 @@ impl Cli {
     /// still forces it off.
     pub fn runs_lua(&self) -> bool {
         !self.no_plugins && self.startup.features.enabled(Feature::LuaPlugins)
+    }
+}
+
+/// `NAME`, `NAME=JSON` or `NAME=@FILE`, split at the first `=`. A relative FILE resolves
+/// against the working directory.
+fn parse_automation(value: &str) -> Result<ProfileArming, String> {
+    let (name, args) = match value.split_once(AUTOMATION_ARGS_SEPARATOR) {
+        Some((name, args)) => (name, Some(args)),
+        None => (value, None),
+    };
+    if !is_valid_name(name) {
+        return Err(format!("{AUTOMATION_NAME} {name:?} {INVALID_NAME}"));
+    }
+    Ok(ProfileArming {
+        name: name.to_owned(),
+        args: args.map(automation_args).transpose()?,
+    })
+}
+
+fn automation_args(given: &str) -> Result<Value, String> {
+    let parsed = match given.strip_prefix(AUTOMATION_ARGS_FILE) {
+        Some(path) => {
+            let json = fs::read_to_string(path)
+                .map_err(|error| format!("{AUTOMATION_ARGS_UNREADABLE} {path}: {error}"))?;
+            serde_json::from_str(&json)
+        }
+        None => serde_json::from_str(given),
+    };
+    match parsed {
+        Ok(args @ Value::Object(_)) => Ok(args),
+        Ok(_) => Err(ArgsError::NotAnObject.to_string()),
+        Err(error) => Err(format!("{AUTOMATION_ARGS_INVALID}: {error}")),
     }
 }
 
@@ -1499,6 +1572,18 @@ mod tests {
     const GROUP_TOPIC: &str = "ci.*";
     const WORK_NAME: &str = "steady-maple-wren";
     const MESSAGING_LAUNCH_FLAGS: [&str; 4] = ["name", "topics", "groups", "receive_broadcasts"];
+    const AUTOMATIONS_ARG: &str = "automations";
+    const AUTOMATION: &str = "goal-chain";
+    const OTHER_AUTOMATION: &str = "keep-going";
+    const AUTOMATION_ARGS: &str = r#"{"goals":["The login tests pass"]}"#;
+    const AUTOMATION_ARGS_FILE_NAME: &str = "goals.json";
+
+    fn arming(name: &str, args: Option<&str>) -> ProfileArming {
+        ProfileArming {
+            name: name.to_owned(),
+            args: args.map(|json| serde_json::from_str(json).unwrap()),
+        }
+    }
 
     #[test_case(&["caudra", "--auto"]; "root_auto")]
     #[test_case(&["caudra", "acp", "--auto"]; "acp_auto")]
@@ -1935,6 +2020,111 @@ mod tests {
             })
             .collect();
         assert_eq!(hidden_flags, [Some(hidden); MESSAGING_LAUNCH_FLAGS.len()]);
+    }
+
+    #[test]
+    fn automation_flags_arm_each_automation_in_order() {
+        let with_args = format!("{AUTOMATION}{AUTOMATION_ARGS_SEPARATOR}{AUTOMATION_ARGS}");
+        let cli = Cli::try_parse_from([
+            "caudra",
+            AUTOMATION_FLAG,
+            with_args.as_str(),
+            AUTOMATION_FLAG,
+            OTHER_AUTOMATION,
+        ])
+        .and_then(Cli::validate)
+        .unwrap();
+        assert_eq!(
+            cli.automations,
+            [
+                arming(AUTOMATION, Some(AUTOMATION_ARGS)),
+                arming(OTHER_AUTOMATION, None)
+            ]
+        );
+    }
+
+    #[test_case(true; "readable_file")]
+    #[test_case(false; "missing_file")]
+    fn automation_args_can_come_from_a_file(exists: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(AUTOMATION_ARGS_FILE_NAME);
+        if exists {
+            fs::write(&path, AUTOMATION_ARGS).unwrap();
+        }
+        let flag = format!(
+            "{AUTOMATION}{AUTOMATION_ARGS_SEPARATOR}{AUTOMATION_ARGS_FILE}{}",
+            path.display()
+        );
+        match Cli::try_parse_from(["caudra", AUTOMATION_FLAG, flag.as_str()]) {
+            Ok(cli) => {
+                assert!(exists);
+                assert_eq!(cli.automations, [arming(AUTOMATION, Some(AUTOMATION_ARGS))]);
+            }
+            Err(error) => {
+                assert!(!exists);
+                assert!(
+                    error.to_string().contains(AUTOMATION_ARGS_UNREADABLE),
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    #[test_case("Goal-Chain", INVALID_NAME; "uppercase_name")]
+    #[test_case(r#"={"goals":[]}"#, INVALID_NAME; "missing_name")]
+    #[test_case(r#"goal-chain=["The login tests pass"]"#, &ArgsError::NotAnObject.to_string(); "array_args")]
+    #[test_case("goal-chain={goals", AUTOMATION_ARGS_INVALID; "malformed_json")]
+    #[test_case("goal-chain=", AUTOMATION_ARGS_INVALID; "empty_args")]
+    fn automation_flag_is_validated_while_parsing(value: &str, expected: &str) {
+        let error = Cli::try_parse_from(["caudra", AUTOMATION_FLAG, value])
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        assert!(error.contains(expected), "{error}");
+    }
+
+    #[test]
+    fn automation_flag_names_each_automation_once() {
+        let with_args = format!("{AUTOMATION}{AUTOMATION_ARGS_SEPARATOR}{AUTOMATION_ARGS}");
+        let error = Cli::try_parse_from([
+            "caudra",
+            AUTOMATION_FLAG,
+            AUTOMATION,
+            AUTOMATION_FLAG,
+            with_args.as_str(),
+        ])
+        .and_then(Cli::validate)
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+        assert!(error.to_string().contains(AUTOMATION_REPEATED), "{error}");
+    }
+
+    #[test_case(&["--print"]; "print")]
+    #[test_case(&["--print", "--input-format", "stream-json"]; "sdk")]
+    #[test_case(&["acp"]; "acp")]
+    fn automation_flag_belongs_to_interactive_sessions(flags: &[&str]) {
+        let args = ["caudra", AUTOMATION_FLAG, AUTOMATION].iter().chain(flags);
+        assert_eq!(
+            Cli::try_parse_from(args)
+                .and_then(Cli::validate)
+                .err()
+                .map(|error| error.kind()),
+            Some(ErrorKind::ArgumentConflict)
+        );
+    }
+
+    #[test_case(FeatureFlags::NONE, true; "experiment_off")]
+    #[test_case(FeatureFlags::NONE.with(Feature::Automations), false; "experiment_on")]
+    fn automation_flag_is_hidden_until_enabled(features: FeatureFlags, hidden: bool) {
+        let command = Cli::command_for(features);
+        assert_eq!(
+            command
+                .get_arguments()
+                .find(|arg| arg.get_id().as_str() == AUTOMATIONS_ARG)
+                .map(|arg| arg.is_hide_set()),
+            Some(hidden)
+        );
     }
 
     #[test_case(GROUP_NAME, true; "lowercase_words")]

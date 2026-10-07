@@ -8,6 +8,7 @@ pub(super) enum SegmentKind {
     ToolBlock,
     Instruction,
     TaskDelivery,
+    AutomationDelivery,
     PeerMessage,
     Error,
     Done,
@@ -26,6 +27,7 @@ impl SegmentKind {
             Self::ToolInline | Self::ToolBlock => "transcript_tool",
             Self::Instruction => "transcript_instruction",
             Self::TaskDelivery => "transcript_task_delivery",
+            Self::AutomationDelivery => "transcript_automation_delivery",
             Self::PeerMessage => "transcript_peer_message",
             Self::Error => "transcript_error",
             Self::Done => "transcript_done",
@@ -58,6 +60,7 @@ impl SegmentChrome {
                 | SegmentKind::ToolBlock
                 | SegmentKind::Instruction
                 | SegmentKind::TaskDelivery
+                | SegmentKind::AutomationDelivery
                 | SegmentKind::PeerMessage
                 | SegmentKind::Error
         );

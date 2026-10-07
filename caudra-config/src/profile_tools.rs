@@ -37,7 +37,7 @@ pub const TOOL_POLICY_GROUPS: &[(ToolPolicyGroup, &[&str])] = &[
     ),
     (
         ToolPolicyGroup::Delegation,
-        &["task", "task_control", "workflow"],
+        &["task", "task_control", "workflow", "automation"],
     ),
     (
         ToolPolicyGroup::Support,

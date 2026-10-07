@@ -294,6 +294,13 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         features: &[Feature::Workflows],
     },
     BuiltinCommand {
+        name: "/automations",
+        description: "Inspect, trust, and pause automations (arm NAME [{json}] | disarm NAME)",
+        max_args: usize::MAX,
+        scope: ChatScope::MainOnly,
+        features: &[Feature::Automations],
+    },
+    BuiltinCommand {
         name: "/sessions",
         description: "Browse and switch sessions",
         max_args: 0,
@@ -1274,6 +1281,7 @@ mod tests {
     #[test_case("/topics", Feature::CrossSessionMessaging; "topics")]
     #[test_case("/groups", Feature::CrossSessionMessaging; "groups")]
     #[test_case("/deep-research", Feature::Workflows; "workflow_shortcut")]
+    #[test_case("/automations", Feature::Automations; "automations")]
     #[test_case("/sandbox", Feature::Sandboxes; "sandbox")]
     #[test_case("/decisions", Feature::DecisionEngine; "decisions")]
     #[test_case("/auto", Feature::DecisionEngine; "auto")]

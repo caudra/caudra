@@ -155,15 +155,21 @@ pub const DEFAULT_SKILL_PLUGIN_DEV: bool = false;
 /// On by default: the skill is how the model learns to write a workflow for
 /// the session it is in, and a workflow is the answer to many multi-step asks.
 pub const DEFAULT_SKILL_WORKFLOW_DEV: bool = true;
+/// On by default, like `workflow_dev`: the skill is how the model learns to
+/// write an automation, and it stays out of the catalog until
+/// `experimental.automations` is on.
+pub const DEFAULT_SKILL_AUTOMATION_DEV: bool = true;
 /// On by default: questions about Caudra itself are common, the catalog entry
 /// is one line, and the pages load a section at a time only when asked for.
 pub const DEFAULT_SKILL_DOCS: bool = true;
 const SKILL_PLUGIN_DEV_FIELD: &str = "plugin_dev";
 const SKILL_WORKFLOW_DEV_FIELD: &str = "workflow_dev";
+const SKILL_AUTOMATION_DEV_FIELD: &str = "automation_dev";
 const SKILL_DOCS_FIELD: &str = "docs";
-const SKILL_FIELDS: [&str; 3] = [
+const SKILL_FIELDS: [&str; 4] = [
     SKILL_PLUGIN_DEV_FIELD,
     SKILL_WORKFLOW_DEV_FIELD,
+    SKILL_AUTOMATION_DEV_FIELD,
     SKILL_DOCS_FIELD,
 ];
 const TASK_MAX_CONCURRENT_FIELD: &str = "max_concurrent";
@@ -175,6 +181,16 @@ pub const MIN_INDEX_MAX_FILE_SIZE_MB: usize = 1;
 /// Workcell briefly holds the input bytes and parser-owned source together,
 /// so this caps those two buffers at 32 MiB before tree allocation.
 pub const MAX_INDEX_MAX_FILE_SIZE_MB: usize = 16;
+const AUTOMATIONS_SECTION: &str = "automations";
+const TURNS_PER_HOUR_FIELD: &str = "turns_per_hour";
+const MAX_UNATTENDED_TURNS_FIELD: &str = "max_unattended_turns";
+const ALLOW_PRIVATE_NETWORK_FIELD: &str = "allow_private_network";
+pub const DEFAULT_AUTOMATION_TURNS_PER_HOUR: u32 = 20;
+pub const MIN_AUTOMATION_TURNS_PER_HOUR: u32 = 1;
+pub const MAX_AUTOMATION_TURNS_PER_HOUR: u32 = 600;
+pub const MIN_MAX_UNATTENDED_TURNS: u32 = 1;
+pub const MAX_MAX_UNATTENDED_TURNS: u32 = 10_000;
+pub const DEFAULT_ALLOW_PRIVATE_NETWORK: bool = false;
 
 pub const DEFAULT_BUILTINS: &[&str] = &[
     "bash",
@@ -253,6 +269,15 @@ pub const NATIVE_PLUGIN_OPTIONS: &[(&str, &[ConfigField])] = &[
                 description: "Offer the builtin caudra-workflow-dev skill for writing and running workflows. Needs `experimental.workflows`.",
             },
             ConfigField {
+                name: SKILL_AUTOMATION_DEV_FIELD,
+                ty: "boolean",
+                default: ConfigValue::Bool(DEFAULT_SKILL_AUTOMATION_DEV),
+                min: None,
+                max: None,
+                env: None,
+                description: "Offer the builtin caudra-automation-dev skill for writing automations. Needs `experimental.automations`.",
+            },
+            ConfigField {
                 name: SKILL_DOCS_FIELD,
                 ty: "boolean",
                 default: ConfigValue::Bool(DEFAULT_SKILL_DOCS),
@@ -286,6 +311,7 @@ pub const ACTIVE_DEFAULT_LUA_PLUGINS: &[&str] = &[];
 /// Caudra's own native tools: session-shaped work, orchestration, and the
 /// interactive surfaces. Workcell owns everything protocol-neutral.
 pub const CAUDRA_NATIVE_TOOL_NAMES: &[&str] = &[
+    "automation",
     "batch",
     "image_generate",
     "list_sessions",
@@ -363,6 +389,7 @@ pub const DEFERRED_BUILTIN_TOOLS: &[DeferredBuiltin] = &[
     DeferredBuiltin::alone("python_execution"),
     DeferredBuiltin::alone("plan"),
     DeferredBuiltin::alone("workflow"),
+    DeferredBuiltin::alone("automation"),
 ];
 
 pub struct DeferredBuiltin {
@@ -574,6 +601,10 @@ pub enum ConfigError {
     ProjectPermissionMode(&'static str),
     #[error("invalid project config: {0} is global-only; every project shares one message history")]
     ProjectMessageHistory(&'static str),
+    #[error(
+        "invalid project config: [automations] is global-only; move it to the global caudra.toml"
+    )]
+    ProjectAutomations,
     #[error(transparent)]
     Decisions(#[from] decisions::DecisionsConfigError),
     #[error("invalid config: agent.steering.{field}: {message}")]
@@ -584,6 +615,14 @@ pub enum ConfigError {
         field: &'static str,
         value: u64,
         min: u64,
+    },
+    #[error("invalid config: {section}.{field} = {value} is out of range ({min} to {max})")]
+    OutOfRange {
+        section: &'static str,
+        field: &'static str,
+        value: u32,
+        min: u32,
+        max: u32,
     },
     #[error("invalid config: always_thinking: {0}")]
     Thinking(#[from] ThinkingParseError),
@@ -631,6 +670,25 @@ fn check(
     Ok(())
 }
 
+fn check_range(
+    section: &'static str,
+    field: &'static str,
+    value: u32,
+    min: u32,
+    max: u32,
+) -> Result<(), ConfigError> {
+    if (min..=max).contains(&value) {
+        return Ok(());
+    }
+    Err(ConfigError::OutOfRange {
+        section,
+        field,
+        value,
+        min,
+        max,
+    })
+}
+
 macro_rules! merge_option {
     ($self:ident, $overlay:ident, $($field:ident),+) => {
         $(if $overlay.$field.is_some() { $self.$field = $overlay.$field; })+
@@ -668,6 +726,9 @@ pub struct RawConfig {
     #[serde(skip)]
     #[doc(hidden)]
     pub project_message_history_override: Option<&'static str>,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub project_automations_override: bool,
     pub always_fast: Option<bool>,
     pub always_thinking: Option<AlwaysThinking>,
     #[serde(default)]
@@ -677,6 +738,9 @@ pub struct RawConfig {
     pub storage: StorageFileConfig,
     pub telemetry: TelemetryConfig,
     pub worktrees: WorktreesConfig,
+    /// `Some` for any `[automations]` table, even an empty one, so a project
+    /// layer that holds one is refused.
+    pub automations: Option<AutomationsFileConfig>,
     pub plugins: HashMap<String, PluginFileConfig>,
 }
 
@@ -689,6 +753,8 @@ impl RawConfig {
             .or(overlay.project_permission_mode_override)
             .or(overlay.always_yolo.map(|_| "always_yolo"))
             .or(overlay.always_auto.map(|_| "always_auto"));
+        self.project_automations_override |=
+            overlay.project_automations_override || overlay.automations.is_some();
         self.decisions.restrict(mem::take(&mut overlay.decisions));
         let messaging = &mut overlay.agent.messaging;
         self.project_message_history_override = self
@@ -739,7 +805,11 @@ impl RawConfig {
         self.project_message_history_override = self
             .project_message_history_override
             .or(overlay.project_message_history_override);
+        self.project_automations_override |= overlay.project_automations_override;
         merge_option!(self, overlay, always_yolo, always_auto);
+        if let Some(automations) = overlay.automations.take() {
+            self.automations.get_or_insert_default().merge(automations);
+        }
         self.decisions.overlay(mem::take(&mut overlay.decisions));
         self.merge_shared(overlay);
     }
@@ -768,6 +838,9 @@ impl RawConfig {
         if let Some(field) = self.project_message_history_override {
             return Err(ConfigError::ProjectMessageHistory(field));
         }
+        if self.project_automations_override {
+            return Err(ConfigError::ProjectAutomations);
+        }
         self.validate_plugin_tables()?;
         let index_max_file_size_mb = self.index_max_file_size_mb()?;
         let task_max_concurrent = self.task_max_concurrent()?;
@@ -795,9 +868,11 @@ impl RawConfig {
             storage: StorageConfig::from_file(self.storage),
             telemetry: self.telemetry,
             worktrees: self.worktrees,
+            automations: AutomationsConfig::from_file(self.automations.unwrap_or_default()),
             permissions: PermissionsConfig::default(),
             plugins: PluginsConfig::from_plugins(self.plugins),
         };
+        config.automations.validate()?;
         // Validate merged steering for every loader, without extending legacy field validation.
         config.agent.steering.validate()?;
         Ok(config)
@@ -923,6 +998,8 @@ impl RawConfig {
         Ok(BuiltinSkills {
             plugin_dev: self.skill_flag(SKILL_PLUGIN_DEV_FIELD, DEFAULT_SKILL_PLUGIN_DEV)?,
             workflow_dev: self.skill_flag(SKILL_WORKFLOW_DEV_FIELD, DEFAULT_SKILL_WORKFLOW_DEV)?,
+            automation_dev: self
+                .skill_flag(SKILL_AUTOMATION_DEV_FIELD, DEFAULT_SKILL_AUTOMATION_DEV)?,
             docs: self.skill_flag(SKILL_DOCS_FIELD, DEFAULT_SKILL_DOCS)?,
         })
     }
@@ -2003,6 +2080,7 @@ pub struct Config {
     pub storage: StorageConfig,
     pub telemetry: TelemetryConfig,
     pub worktrees: WorktreesConfig,
+    pub automations: AutomationsConfig,
     pub permissions: PermissionsConfig,
     pub plugins: PluginsConfig,
 }
@@ -2287,6 +2365,7 @@ impl ToolOutputLines {
         (
             "other",
             &[
+                "automation",
                 "batch",
                 "execution_environment",
                 "list_sessions",
@@ -2666,6 +2745,7 @@ impl AgentConfig {
 pub struct BuiltinSkills {
     pub plugin_dev: bool,
     pub workflow_dev: bool,
+    pub automation_dev: bool,
     pub docs: bool,
 }
 
@@ -2674,6 +2754,7 @@ impl Default for BuiltinSkills {
         Self {
             plugin_dev: DEFAULT_SKILL_PLUGIN_DEV,
             workflow_dev: DEFAULT_SKILL_WORKFLOW_DEV,
+            automation_dev: DEFAULT_SKILL_AUTOMATION_DEV,
             docs: DEFAULT_SKILL_DOCS,
         }
     }
@@ -3267,6 +3348,105 @@ impl WorktreesConfig {
     }
 }
 
+#[derive(Deserialize, Default, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct AutomationsFileConfig {
+    pub turns_per_hour: Option<u32>,
+    pub max_unattended_turns: Option<u32>,
+    pub allow_private_network: Option<bool>,
+}
+
+impl AutomationsFileConfig {
+    fn merge(&mut self, overlay: Self) {
+        merge_option!(
+            self,
+            overlay,
+            turns_per_hour,
+            max_unattended_turns,
+            allow_private_network
+        );
+    }
+}
+
+/// Session-wide limits on automations, set only in the global config so a
+/// repository cannot raise them or open private networks to `http()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutomationsConfig {
+    pub turns_per_hour: u32,
+    pub max_unattended_turns: Option<u32>,
+    pub allow_private_network: bool,
+}
+
+impl AutomationsConfig {
+    pub const FIELDS: &[ConfigField] = &[
+        ConfigField {
+            name: TURNS_PER_HOUR_FIELD,
+            ty: "u32",
+            default: ConfigValue::U64(DEFAULT_AUTOMATION_TURNS_PER_HOUR as u64),
+            min: Some(MIN_AUTOMATION_TURNS_PER_HOUR as u64),
+            max: Some(MAX_AUTOMATION_TURNS_PER_HOUR as u64),
+            env: None,
+            description: "Most turns automations may start in one session per rolling hour, shared by all of its automations",
+        },
+        ConfigField {
+            name: MAX_UNATTENDED_TURNS_FIELD,
+            ty: "u32",
+            default: ConfigValue::Unset,
+            min: Some(MIN_MAX_UNATTENDED_TURNS as u64),
+            max: Some(MAX_MAX_UNATTENDED_TURNS as u64),
+            env: None,
+            description: "Stop automation-started turns after this many since the last human input. Human input resets the count, and unset means no cap",
+        },
+        ConfigField {
+            name: ALLOW_PRIVATE_NETWORK_FIELD,
+            ty: "bool",
+            default: ConfigValue::Bool(DEFAULT_ALLOW_PRIVATE_NETWORK),
+            min: None,
+            max: None,
+            env: None,
+            description: "Let `http()` in automations reach loopback and private network hosts. Without it, automations reach public hosts only",
+        },
+    ];
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        check_range(
+            AUTOMATIONS_SECTION,
+            TURNS_PER_HOUR_FIELD,
+            self.turns_per_hour,
+            MIN_AUTOMATION_TURNS_PER_HOUR,
+            MAX_AUTOMATION_TURNS_PER_HOUR,
+        )?;
+        if let Some(turns) = self.max_unattended_turns {
+            check_range(
+                AUTOMATIONS_SECTION,
+                MAX_UNATTENDED_TURNS_FIELD,
+                turns,
+                MIN_MAX_UNATTENDED_TURNS,
+                MAX_MAX_UNATTENDED_TURNS,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn from_file(f: AutomationsFileConfig) -> Self {
+        Self {
+            turns_per_hour: f
+                .turns_per_hour
+                .unwrap_or(DEFAULT_AUTOMATION_TURNS_PER_HOUR),
+            max_unattended_turns: f.max_unattended_turns,
+            allow_private_network: f
+                .allow_private_network
+                .unwrap_or(DEFAULT_ALLOW_PRIVATE_NETWORK),
+        }
+    }
+}
+
+impl Default for AutomationsConfig {
+    fn default() -> Self {
+        Self::from_file(AutomationsFileConfig::default())
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct PluginsConfig {
     pub enabled: bool,
@@ -3318,6 +3498,7 @@ impl Config {
         self.provider.validate()?;
         self.storage.validate()?;
         self.storage.snapshots.validate()?;
+        self.automations.validate()?;
         Ok(())
     }
 }
@@ -3778,7 +3959,9 @@ fn env_file_layers(
     (vars, project_keys)
 }
 
-fn global_env_value(key: &str) -> Result<Option<String>, std::env::VarError> {
+/// `key` as the process environment or the global `.env` set it. A key the project's `.env` set
+/// reads as unset, so a repository cannot plant a credential or a secret URL.
+pub fn global_env_value(key: &str) -> Result<Option<String>, std::env::VarError> {
     if PROJECT_ENV_KEYS
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -3929,6 +4112,10 @@ mod tests {
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     const ABC_SOURCE_DIGEST: &str =
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    const AUTOMATIONS_TABLE: &str = "[automations]";
+    const UNKNOWN_FIELD_ERROR: &str = "unknown field";
+    const CUSTOM_TURNS_PER_HOUR: u32 = 30;
+    const CUSTOM_UNATTENDED_TURNS: u32 = 50;
 
     #[test_case(b"", EMPTY_SOURCE_DIGEST; "empty_source")]
     #[test_case(b"abc", ABC_SOURCE_DIGEST; "known_source")]
@@ -4189,6 +4376,100 @@ mod tests {
         assert!(
             matches!(error, ConfigError::BelowMinimum { field: refused, .. } if refused == field),
             "{error}"
+        );
+    }
+
+    fn automations_layer(options: &str) -> RawConfig {
+        toml::from_str(&format!("{AUTOMATIONS_TABLE}\n{options}")).unwrap()
+    }
+
+    #[test_case(""; "no_table")]
+    #[test_case(AUTOMATIONS_TABLE; "empty_table")]
+    fn automations_default_to_no_unattended_cap_and_public_hosts(source: &str) {
+        let raw: RawConfig = toml::from_str(source).unwrap();
+        let automations = raw.into_config(false).unwrap().automations;
+        assert_eq!(
+            automations.turns_per_hour,
+            DEFAULT_AUTOMATION_TURNS_PER_HOUR
+        );
+        assert_eq!(automations.max_unattended_turns, None);
+        assert!(!automations.allow_private_network);
+    }
+
+    #[test_case(TURNS_PER_HOUR_FIELD, MIN_AUTOMATION_TURNS_PER_HOUR; "turns_per_hour_minimum")]
+    #[test_case(TURNS_PER_HOUR_FIELD, MAX_AUTOMATION_TURNS_PER_HOUR; "turns_per_hour_maximum")]
+    #[test_case(MAX_UNATTENDED_TURNS_FIELD, MIN_MAX_UNATTENDED_TURNS; "unattended_minimum")]
+    #[test_case(MAX_UNATTENDED_TURNS_FIELD, MAX_MAX_UNATTENDED_TURNS; "unattended_maximum")]
+    fn automation_limits_accept_their_bounds(field: &str, value: u32) {
+        let config = automations_layer(&format!("{field} = {value}"))
+            .into_config(false)
+            .unwrap();
+        config.validate().unwrap();
+        let resolved = if field == TURNS_PER_HOUR_FIELD {
+            Some(config.automations.turns_per_hour)
+        } else {
+            config.automations.max_unattended_turns
+        };
+        assert_eq!(resolved, Some(value));
+    }
+
+    #[test_case(TURNS_PER_HOUR_FIELD, MIN_AUTOMATION_TURNS_PER_HOUR - 1; "turns_per_hour_below_minimum")]
+    #[test_case(TURNS_PER_HOUR_FIELD, MAX_AUTOMATION_TURNS_PER_HOUR + 1; "turns_per_hour_above_maximum")]
+    #[test_case(MAX_UNATTENDED_TURNS_FIELD, MIN_MAX_UNATTENDED_TURNS - 1; "unattended_below_minimum")]
+    #[test_case(MAX_UNATTENDED_TURNS_FIELD, MAX_MAX_UNATTENDED_TURNS + 1; "unattended_above_maximum")]
+    fn automation_limits_out_of_range_are_rejected(field: &str, value: u32) {
+        let error = automations_layer(&format!("{field} = {value}"))
+            .into_config(false)
+            .err()
+            .expect("out-of-range automation limit");
+        assert!(
+            matches!(
+                error,
+                ConfigError::OutOfRange { section, field: refused, value: rejected, .. }
+                    if section == AUTOMATIONS_SECTION && refused == field && rejected == value
+            ),
+            "{error}"
+        );
+    }
+
+    #[test_case("turn_per_hour = 5", UNKNOWN_FIELD_ERROR; "unknown_field")]
+    #[test_case("allow_private_network = 'yes'", BOOLEAN_EXPECTED_ERROR; "string_switch")]
+    #[test_case("turns_per_hour = -1", UNSIGNED_REMINDER_ERROR; "negative_rate")]
+    fn invalid_automations_config_is_rejected(source: &str, expected: &str) {
+        let error = toml::from_str::<RawConfig>(&format!("{AUTOMATIONS_TABLE}\n{source}"))
+            .expect_err("invalid automations option");
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+
+    #[test_case(""; "empty_table")]
+    #[test_case("turns_per_hour = 1"; "lower_rate")]
+    #[test_case("max_unattended_turns = 1"; "unattended_cap")]
+    #[test_case("allow_private_network = true"; "private_network")]
+    fn project_layers_cannot_hold_automations(options: &str) {
+        let mut raw = automations_layer("");
+        raw.merge(automations_layer(options));
+        raw.merge_global(RawConfig::default());
+        assert!(matches!(
+            raw.into_config(false),
+            Err(ConfigError::ProjectAutomations)
+        ));
+    }
+
+    #[test]
+    fn global_layers_merge_automations_field_by_field() {
+        let mut raw =
+            automations_layer(&format!("{TURNS_PER_HOUR_FIELD} = {CUSTOM_TURNS_PER_HOUR}"));
+        raw.merge_global(automations_layer(&format!(
+            "{MAX_UNATTENDED_TURNS_FIELD} = {CUSTOM_UNATTENDED_TURNS}\n{ALLOW_PRIVATE_NETWORK_FIELD} = true"
+        )));
+        raw.merge(RawConfig::default());
+        assert_eq!(
+            raw.into_config(false).unwrap().automations,
+            AutomationsConfig {
+                turns_per_hour: CUSTOM_TURNS_PER_HOUR,
+                max_unattended_turns: Some(CUSTOM_UNATTENDED_TURNS),
+                allow_private_network: true,
+            }
         );
     }
 
@@ -5112,6 +5393,7 @@ mod tests {
             storage: StorageConfig::default(),
             telemetry: TelemetryConfig::default(),
             worktrees: WorktreesConfig::default(),
+            automations: AutomationsConfig::default(),
             permissions: PermissionsConfig::default(),
             plugins: PluginsConfig::default(),
         };
@@ -6316,15 +6598,17 @@ mod tests {
         assert!(error.to_string().contains(expected), "{error}");
     }
 
-    #[test_case("", DEFAULT_SKILL_PLUGIN_DEV, DEFAULT_SKILL_WORKFLOW_DEV, DEFAULT_SKILL_DOCS ; "defaults")]
-    #[test_case("plugin_dev = true", true, DEFAULT_SKILL_WORKFLOW_DEV, DEFAULT_SKILL_DOCS ; "plugin_dev_alone")]
-    #[test_case("workflow_dev = false", DEFAULT_SKILL_PLUGIN_DEV, false, DEFAULT_SKILL_DOCS ; "workflow_dev_alone")]
-    #[test_case("docs = false", DEFAULT_SKILL_PLUGIN_DEV, DEFAULT_SKILL_WORKFLOW_DEV, false ; "docs_alone")]
-    #[test_case("plugin_dev = true\nworkflow_dev = false\ndocs = false", true, false, false ; "all")]
+    #[test_case("", DEFAULT_SKILL_PLUGIN_DEV, DEFAULT_SKILL_WORKFLOW_DEV, DEFAULT_SKILL_AUTOMATION_DEV, DEFAULT_SKILL_DOCS ; "defaults")]
+    #[test_case("plugin_dev = true", true, DEFAULT_SKILL_WORKFLOW_DEV, DEFAULT_SKILL_AUTOMATION_DEV, DEFAULT_SKILL_DOCS ; "plugin_dev_alone")]
+    #[test_case("workflow_dev = false", DEFAULT_SKILL_PLUGIN_DEV, false, DEFAULT_SKILL_AUTOMATION_DEV, DEFAULT_SKILL_DOCS ; "workflow_dev_alone")]
+    #[test_case("automation_dev = false", DEFAULT_SKILL_PLUGIN_DEV, DEFAULT_SKILL_WORKFLOW_DEV, false, DEFAULT_SKILL_DOCS ; "automation_dev_alone")]
+    #[test_case("docs = false", DEFAULT_SKILL_PLUGIN_DEV, DEFAULT_SKILL_WORKFLOW_DEV, DEFAULT_SKILL_AUTOMATION_DEV, false ; "docs_alone")]
+    #[test_case("plugin_dev = true\nworkflow_dev = false\nautomation_dev = false\ndocs = false", true, false, false, false ; "all")]
     fn skill_flags_are_read_independently(
         options: &str,
         plugin_dev: bool,
         workflow_dev: bool,
+        automation_dev: bool,
         docs: bool,
     ) {
         let raw: RawConfig = toml::from_str(&format!("[plugins.skill]\n{options}\n")).unwrap();
@@ -6334,9 +6618,16 @@ mod tests {
             BuiltinSkills {
                 plugin_dev,
                 workflow_dev,
+                automation_dev,
                 docs,
             }
         );
+    }
+
+    #[test]
+    fn automation_dev_skill_is_offered_by_default() {
+        let config = RawConfig::default().into_config(false).unwrap();
+        assert!(config.agent.builtin_skills.automation_dev);
     }
 
     #[test_case("workflow_dev = \"no\"", "expected a boolean" ; "wrong_type")]

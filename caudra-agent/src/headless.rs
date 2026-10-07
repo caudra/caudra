@@ -4,22 +4,28 @@ use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::decisions::Decisions;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use async_lock::Mutex;
+use caudra_automation::event::{GoalView, SessionStatus, SessionView, StartedBy, WorkView};
+use caudra_automation::request::{AutomationError, OutboxClaim, SessionSignal};
+use caudra_automation::snapshot::{AutomationEvent, PauseSource, SettleBlocker};
+use caudra_automation::untrusted::Untrusted;
 #[cfg(test)]
 use caudra_config::ToolKey;
 use caudra_config::decisions::DecisionsConfig;
-use caudra_config::{Feature, FeatureFlags, ModelPolicy, SnapshotsConfig};
+use caudra_config::{AutomationsConfig, Feature, FeatureFlags, ModelPolicy, SnapshotsConfig};
 use caudra_providers::Timeouts;
-use caudra_providers::model::{Model, ModelPurpose};
+use caudra_providers::model::{Billing, Model, ModelPurpose};
+use caudra_providers::pricing::settle_session;
 use caudra_providers::provider::{self, Provider};
 use caudra_providers::{
-    CacheKey, HistoryItem, HistoryItemKind, Message, TokenUsage, WorkflowEventOrigin,
-    active_history_items, merge_history_items, resolve_history_head, transcript_history_items,
+    AutomationEventOrigin, CacheKey, HistoryItem, HistoryItemKind, Message, TokenUsage,
+    WorkflowEventOrigin, active_history_items, merge_history_items, resolve_history_head,
+    transcript_history_items,
 };
 #[cfg(test)]
 use caudra_providers::{ContentBlock, Role};
@@ -31,9 +37,10 @@ use caudra_storage::permission_state::mutation::{
 };
 use caudra_storage::sessions::{
     PermissionMode, SessionCursor, SessionDatabase, SessionError, SessionLease, StoredMode,
-    StoredPlanTarget, StoredSubagent, StoredSubagentOutcome,
+    StoredPlanTarget, StoredSubagent, StoredSubagentOutcome, add_cost,
 };
 use caudra_storage::tool_outputs::ToolOutputStore;
+use caudra_storage::usage_ledger::LedgerPurpose;
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
 use caudra_storage::{StateDir, StorageError};
 use caudra_workflow::{
@@ -44,17 +51,29 @@ use caudra_workspace::{
     OperationState, OperationStatus, RecordHolder, UNREVEALED_ROOT, WorkspaceCursor,
     WorkspaceError, WorkspaceSession,
 };
+use event_listener::Event;
 use flume::Receiver;
 use serde::Deserialize;
 use serde_json::Value;
-use tracing::{error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::agent::change_recording::{ChangeRecorder, ChangeSource, cover_records};
 use crate::agent::task_runner::{
     HostExtras, ModeResolver, ModelResolver, SubagentTaskRunner, WorkflowHostContext,
 };
 use crate::agent::{self, History};
-use crate::background::{BackgroundTasks, BackgroundTransition};
+use crate::automation::catalog::Frontend;
+use crate::automation::clock::Clock;
+use crate::automation::frontend::{
+    SessionSignals, claim_next, delivery_due, goal_finished, launch_armings, mode_name, run_end,
+    saved_controls, set_claimed_goal, stop_runtime, wake_origin,
+};
+use crate::automation::handle::AutomationHandle;
+use crate::automation::http::HttpClient;
+use crate::automation::manager::{AutomationRuntime, RuntimeDeps as AutomationDeps};
+use crate::automation::outbox::claim_message;
+use crate::automation::workflows::Workflows;
+use crate::background::{BackgroundTasks, BackgroundTransition, SessionWork};
 use crate::cancel::{CancelMap, CancelToken, CancelTrigger};
 use crate::commits;
 use crate::mentions;
@@ -73,9 +92,10 @@ use crate::types::{BACKGROUND_EVENT_RUN_ID, TodoItem};
 use crate::workflow::{RuntimeDeps, WorkflowHandle, WorkflowRuntime, WorkspaceRebind};
 use crate::{
     Agent, AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams,
-    DoneReason, Envelope, EventSender, GoalHandle, ImageSource, McpHandle, McpSession,
-    PermissionsConfig, SessionMailbox, StoredSession, SubagentHistorySnapshot,
-    SubagentHistoryStore, ThinkingConfig, ToolOutput, ToolOutputLines, open_stored_session,
+    DoneReason, Envelope, EventSender, ExtractedCommand, GoalHandle, ImageSource, InterruptSource,
+    McpHandle, McpSession, PermissionsConfig, SessionMailbox, StoredSession,
+    SubagentHistorySnapshot, SubagentHistoryStore, ThinkingConfig, ToolOutput, ToolOutputLines,
+    open_stored_session,
 };
 
 /// Bytes of a run's report or result carried into the next prompt.
@@ -93,6 +113,11 @@ const SESSION_DATABASE_UNAVAILABLE: &str = "session database unavailable";
 const DECISIONS_STARTUP_FAILED: &str = "Decision engine initialization failed; check decisions configuration, credentials and question overrides";
 const STALE_WORKFLOW_CONTROL: &str =
     "Workflow control was superseded by a session stop or mode change";
+const PERSIST_FAILED: &str = "Failed to persist session";
+/// Automation events the host has not taken yet; past this the oldest is dropped, as the
+/// runtime drops its own.
+const AUTOMATION_EVENT_CAPACITY: usize = 1024;
+const MILLIS_PER_SECOND: i64 = 1_000;
 
 struct SessionPermissionPublication {
     database: Arc<StdMutex<SessionDatabase>>,
@@ -145,6 +170,11 @@ struct SessionStore {
     created: bool,
     subagent_history: SubagentHistoryStore,
     persisted_subagent_history: SubagentHistorySnapshot,
+    /// Restored from the session and written back on every save.
+    goal: GoalHandle,
+    /// The runtime serving the session, whose controls every save keeps; `None` leaves the
+    /// stored controls as they are.
+    automations: Option<AutomationHandle>,
 }
 
 impl SessionStore {
@@ -304,15 +334,25 @@ impl SessionStore {
             lease,
             database: database.map(|database| Arc::new(StdMutex::new(database))),
             cursor,
+            goal: GoalHandle::from_meta(&session.meta),
             session,
             created,
             subagent_history,
             persisted_subagent_history,
+            automations: None,
         }
     }
 
     fn save(&mut self) -> Result<(), SessionError> {
         self.session.updated_at = caudra_storage::now_epoch();
+        let goal = self.goal.stored();
+        let meta = &mut self.session.meta;
+        meta.active_goal = goal.active;
+        meta.goal_result = goal.result;
+        meta.goal_continuation_limit = goal.continuation_limit;
+        if let Some(automations) = &self.automations {
+            meta.automations = Some(saved_controls(automations));
+        }
         if self.database.is_none() {
             self.database = SessionDatabase::open(&self.dir)
                 .map_err(|error| warn!(%error, "session database unavailable"))
@@ -1698,6 +1738,22 @@ pub struct InteractiveParams {
     /// where `{cwd}` names a path inside the VM and this one does not.
     pub host_cwd: Option<PathBuf>,
     pub local_documents: Option<Arc<LocalDocumentStore>>,
+    /// `Some` serves the session's automations while `experimental.automations` is on.
+    pub automations: Option<AutomationParams>,
+}
+
+/// What a session's automation runtime needs from its host.
+pub struct AutomationParams {
+    /// The mode an automation run starts in while no prompt has set the session's mode,
+    /// thinking and speed. The session's facts name it too.
+    pub mode: ModeResolver,
+    pub fast: bool,
+    pub config: AutomationsConfig,
+    pub clock: Arc<dyn Clock>,
+    /// Performs `http()`; without one every `http()` fails as unavailable.
+    pub http: Option<Arc<dyn HttpClient>>,
+    /// Holds the user's `automations/`; `None` reads the real config directory.
+    pub user_config_dir: Option<PathBuf>,
 }
 
 pub struct InteractiveHandle {
@@ -1715,6 +1771,13 @@ pub struct InteractiveHandle {
     pub permissions: Arc<PermissionManager>,
     /// The session's workflow runtime, when `workflow_mode` asked for one.
     pub workflow: Option<WorkflowHandle>,
+    /// The session's goal, the one every run of it pursues.
+    pub goal: GoalHandle,
+    /// The session's automation runtime, when `automations` asked for one and it started.
+    pub automations: Option<AutomationHandle>,
+    /// What the runtime fired and what its scripts asked the host to show. Past its capacity
+    /// the oldest event is dropped; disconnected once no runtime serves the session.
+    pub automation_events: Receiver<AutomationEvent>,
     mode_route: Arc<InteractiveModeRoute>,
     workspace_change_tx: flume::Sender<WorkspaceChangeRequest>,
     remote_workspace: Option<Arc<StdMutex<RemoteWorkspaceState>>>,
@@ -1727,6 +1790,8 @@ pub struct InteractiveRun {
     pub automatic: bool,
     pub task_event_ids: Vec<String>,
     pub workflow_events: Vec<WorkflowEventOrigin>,
+    /// The automation deliveries the run starts with.
+    pub automation_events: Vec<AutomationEventOrigin>,
 }
 
 #[derive(Default)]
@@ -1763,6 +1828,541 @@ struct BackgroundDelivery {
 impl Drop for BackgroundDelivery {
     fn drop(&mut self) {
         self.tasks.release_messages(&self.messages);
+    }
+}
+
+/// The session's prompt queue as a run sees it: a waiting prompt holds back the goal check and
+/// the guide and peer deliveries a run takes. Each prompt starts a run of its own, so a run never
+/// takes one.
+struct QueuedPrompts(Receiver<AgentInput>);
+
+impl InterruptSource for QueuedPrompts {
+    fn poll(&self) -> Option<ExtractedCommand> {
+        None
+    }
+
+    fn has_pending_input(&self) -> bool {
+        !self.0.is_empty()
+    }
+}
+
+/// The main run whose goal evaluation last deferred behind session work, as
+/// the event stream reports it. Every forwarded event wakes the check-in and
+/// the automations' settle watch, since any of them can be that work settling.
+#[derive(Default)]
+struct GoalDeferral {
+    run_id: StdMutex<Option<u64>>,
+    changed: Event,
+}
+
+impl GoalDeferral {
+    fn observe(&self, envelope: &Envelope) {
+        if matches!(envelope.event, AgentEvent::GoalDeferred { .. }) {
+            *self.lock() = Some(envelope.run_id);
+        }
+        self.changed.notify(usize::MAX);
+    }
+
+    fn deferred(&self, run_id: u64) -> bool {
+        *self.lock() == Some(run_id)
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Option<u64>> {
+        self.run_id
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+}
+
+/// Resolves once `due` holds, looking again whenever an event is forwarded,
+/// background work changes, or the last foreground task ends.
+async fn until_due(
+    due: impl Fn() -> bool,
+    deferral: &GoalDeferral,
+    background: Option<&BackgroundTasks>,
+    tasks: &CancelMap<String>,
+) {
+    loop {
+        let forwarded = deferral.changed.listen();
+        let background_changed = background.map(BackgroundTasks::listen);
+        if due() {
+            return;
+        }
+        futures_lite::future::or(
+            futures_lite::future::or(forwarded, async {
+                match background_changed {
+                    Some(changed) => changed.await,
+                    None => futures_lite::future::pending().await,
+                }
+            }),
+            async {
+                if tasks.active_count() == 0 {
+                    futures_lite::future::pending::<()>().await;
+                }
+                tasks.wait_for_idle().await;
+            },
+        )
+        .await;
+    }
+}
+
+/// A run nobody typed, under the mode, thinking and speed of the last prompt
+/// that was typed.
+fn automatic_input(
+    (mode, thinking, fast): &(AgentMode, ThinkingConfig, bool),
+    preamble: Vec<Message>,
+) -> AgentInput {
+    AgentInput {
+        message: String::new(),
+        mode: mode.clone(),
+        plan: None,
+        thinking: thinking.clone(),
+        fast: *fast,
+        images: Vec::new(),
+        mentions: Vec::new(),
+        commits: Vec::new(),
+        preamble,
+        prompt: None,
+        resume: false,
+    }
+}
+
+/// The main agent records its own turns into the goal; what its subagents
+/// spend is added here, as the TUI and print mode add it.
+fn record_subagent_goal_usage(goal: &GoalHandle, envelope: &Envelope) {
+    if envelope.subagent.is_none() {
+        return;
+    }
+    match &envelope.event {
+        AgentEvent::TurnComplete(turn) => {
+            goal.record_external_usage(turn.usage, turn.cost, turn.billing);
+        }
+        AgentEvent::ModelUsage {
+            usage,
+            cost,
+            billing,
+            ..
+        } => goal.record_external_usage(*usage, *cost, *billing),
+        _ => {}
+    }
+}
+
+/// `mode`, unless a control has set the session's mode since.
+fn routed_mode(route: &Arc<InteractiveModeRoute>, mode: ModeResolver) -> ModeResolver {
+    let route = Arc::clone(route);
+    Arc::new(move || {
+        route
+            .mode
+            .load_full()
+            .map_or_else(|| mode(), |mode| (*mode).clone())
+    })
+}
+
+/// What `event` adds to the session's API spend, in USD; a subscription pays for the rest.
+fn billed_cost(event: &AgentEvent) -> Option<f64> {
+    let (cost, billing) = match event {
+        AgentEvent::TurnComplete(turn) => (turn.cost, turn.billing),
+        AgentEvent::ModelUsage { cost, billing, .. }
+        | AgentEvent::GoalEvaluation { cost, billing, .. }
+        | AgentEvent::GoalEvaluationFailed { cost, billing, .. }
+        | AgentEvent::SessionTitle { cost, billing, .. } => (*cost, *billing),
+        _ => return None,
+    };
+    cost.filter(|_| matches!(billing, Billing::Api))
+}
+
+/// What the session billed before it resumed here, priced as the TUI prices a resume, without
+/// touching the stored record.
+fn restored_cost(session: &StoredSession, model: &Model) -> Option<f64> {
+    let fast = session.meta.fast && model.supports_fast();
+    settle_session(
+        &session.token_usage,
+        &mut session.usage_by_model().clone(),
+        model,
+        fast,
+    )
+    .billed
+}
+
+/// The session as automation events show it. Headless sessions have no `@name`, no groups and
+/// no question tool, so they never wait on input.
+fn session_view(
+    session_id: CaudraId,
+    title: &str,
+    mode: &AgentMode,
+    goal: &GoalHandle,
+    cost: Option<f64>,
+    status: SessionStatus,
+    status_since: i64,
+) -> SessionView {
+    SessionView {
+        id: session_id.to_string(),
+        title: Untrusted::text(title),
+        name: None,
+        mode: mode_name(mode).into(),
+        status,
+        status_since,
+        goal: goal.snapshot().map(|goal| GoalView {
+            condition: goal.condition.to_string(),
+            evaluations: goal.evaluations,
+        }),
+        cost,
+        groups: Vec::new(),
+        work: WorkView::default(),
+    }
+}
+
+/// Events for the host, bounded: past capacity the oldest is dropped, and the runtime's mirror
+/// still holds it.
+#[derive(Clone)]
+struct HostEvents {
+    sender: flume::Sender<AutomationEvent>,
+    oldest: Receiver<AutomationEvent>,
+}
+
+impl HostEvents {
+    fn new() -> (Self, Receiver<AutomationEvent>) {
+        let (sender, receiver) = flume::bounded(AUTOMATION_EVENT_CAPACITY);
+        let events = Self {
+            sender,
+            oldest: receiver.clone(),
+        };
+        (events, receiver)
+    }
+
+    fn push(&self, event: AutomationEvent) {
+        let Err(flume::TrySendError::Full(event)) = self.sender.try_send(event) else {
+            return;
+        };
+        debug!("oldest automation event for the host dropped");
+        let _ = self.oldest.try_recv();
+        let _ = self.sender.try_send(event);
+    }
+}
+
+/// A session's automation runtime as the loop, its forwarder and its events task share it.
+struct SessionAutomations {
+    handle: AutomationHandle,
+    /// The mode an automation run starts in while no prompt has set the session's continuation.
+    mode: ModeResolver,
+    fast: bool,
+    host: HostEvents,
+    tally: StdMutex<AutomationTally>,
+}
+
+/// What the runtime heard from the session, so each signal goes out on a change only.
+struct AutomationTally {
+    signals: SessionSignals,
+    /// The main run the runtime last heard start; it is in flight until the forwarder hands
+    /// over its end.
+    run: Option<u64>,
+    /// The session's running API spend in USD, the bill it resumed with included.
+    cost: Option<f64>,
+}
+
+impl SessionAutomations {
+    fn tally(&self) -> MutexGuard<'_, AutomationTally> {
+        self.tally.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// Tells the runtime what the session looks like now: its facts, then what keeps it from
+    /// settling. A `Busy` session is working.
+    fn observe(&self, title: &str, goal: &GoalHandle, blockers: Vec<SettleBlocker>) {
+        let now = self.handle.now_ms();
+        let status = if blockers.contains(&SettleBlocker::Busy) {
+            SessionStatus::Working
+        } else {
+            SessionStatus::Idle
+        };
+        let mode = (self.mode)();
+        let signals = {
+            let mut tally = self.tally();
+            tally.signals.observe_goal(goal.snapshot());
+            let facts = session_view(
+                self.handle.session_id(),
+                title,
+                &mode,
+                goal,
+                tally.cost,
+                status,
+                tally.signals.status_since(status, now),
+            );
+            [
+                tally.signals.facts(facts),
+                tally.signals.settle(blockers, now),
+            ]
+        };
+        for signal in signals.into_iter().flatten() {
+            self.handle.signal(signal);
+        }
+    }
+
+    /// A main run started, so the session is busy until the forwarder hands over its end.
+    fn run_started(&self, run_id: u64, started_by: StartedBy, title: &str, goal: &GoalHandle) {
+        {
+            let mut tally = self.tally();
+            tally.run = Some(run_id);
+            let cost = tally.cost;
+            tally
+                .signals
+                .run_started(started_by, self.handle.now_ms(), cost);
+        }
+        self.observe(title, goal, vec![SettleBlocker::Busy]);
+    }
+
+    /// Follows a forwarded event: the session's spend, the goal's end, and for the main run in
+    /// flight the automation messages it took, its response so far and its end.
+    fn forwarded(&self, envelope: &Envelope, goal: &GoalHandle) {
+        let signal = {
+            let mut tally = self.tally();
+            add_cost(&mut tally.cost, billed_cost(&envelope.event));
+            let main_run = envelope.subagent.is_none()
+                && envelope.task.is_none()
+                && tally.signals.running()
+                && tally.run == Some(envelope.run_id);
+            match &envelope.event {
+                AgentEvent::GoalFinished { result } => Some(goal_finished(result)),
+                AgentEvent::GoalClearedAfterError { condition, message } => {
+                    Some(tally.signals.goal_cleared(condition, message))
+                }
+                AgentEvent::GoalEvaluation { .. } | AgentEvent::GoalEvaluationFailed { .. } => {
+                    tally.signals.observe_goal(goal.snapshot());
+                    None
+                }
+                AgentEvent::Injected {
+                    automation_event: Some(origin),
+                    ..
+                } if main_run => {
+                    tally.signals.injected(origin);
+                    None
+                }
+                AgentEvent::TurnComplete(turn)
+                    if main_run && matches!(turn.purpose, LedgerPurpose::Chat) =>
+                {
+                    tally.signals.turn_complete(&turn.message);
+                    None
+                }
+                event if main_run => run_end(event).map(|(outcome, error)| {
+                    let cost = tally.cost;
+                    tally.signals.run_ended(outcome, error, cost)
+                }),
+                _ => None,
+            }
+        };
+        if let Some(signal) = signal {
+            self.handle.signal(signal);
+        }
+    }
+
+    /// Whether the blockers would tell the runtime anything new.
+    fn changes(&self, blockers: &[SettleBlocker]) -> bool {
+        self.tally().signals.changes(blockers)
+    }
+
+    /// What keeps the session from settling: `Busy` while session work is pending or a run is,
+    /// then `others`.
+    fn blockers(&self, work_pending: bool, mut others: Vec<SettleBlocker>) -> Vec<SettleBlocker> {
+        if work_pending || self.running() {
+            others.insert(0, SettleBlocker::Busy);
+        }
+        others
+    }
+
+    /// Whether a main run started whose end the forwarder has not handed over yet. Its last
+    /// response and cost come with that end, so the session stays busy until then.
+    fn running(&self) -> bool {
+        self.tally().signals.running()
+    }
+
+    /// The run a failure outside the loop's own runs reports under: the one in flight, or the
+    /// last to end.
+    fn last_run(&self) -> u64 {
+        self.tally().run.unwrap_or_default()
+    }
+
+    /// Whether a `next` item could start a turn now: the runtime heard the session settle, and
+    /// an item waits on nothing that still holds.
+    fn due(&self) -> bool {
+        self.tally().signals.settled() && delivery_due(&self.handle)
+    }
+
+    /// The mode, thinking and speed of an automation run no prompt has set them for.
+    fn fallback(&self, thinking: &ThinkingConfig) -> (AgentMode, ThinkingConfig, bool) {
+        ((self.mode)(), thinking.clone(), self.fast)
+    }
+
+    /// Claims the next item for the turn about to start. A stopping runtime keeps its items.
+    async fn claim(&self) -> Option<OutboxClaim> {
+        let session_id = self.handle.session_id();
+        match claim_next(&self.handle).await {
+            Ok(claim) => claim,
+            Err(AutomationError::Unavailable) => {
+                debug!(%session_id, "automation runtime stopped before its delivery claim");
+                None
+            }
+            Err(error) => {
+                warn!(%error, %session_id, "automation delivery claim failed");
+                None
+            }
+        }
+    }
+
+    /// Sets the goal a claim asks for; a refusal reaches the host as a notice, and the turn
+    /// starts either way.
+    fn set_goal(&self, goal: &GoalHandle, claim: &OutboxClaim) {
+        if let Some(requested) = &claim.goal
+            && let Some(refusal) = set_claimed_goal(goal, requested)
+        {
+            self.host.push(AutomationEvent::Notice {
+                automation: claim.automation.clone(),
+                fire_id: Some(claim.fire_id.clone()),
+                text: refusal,
+            });
+        }
+    }
+}
+
+/// Serves the runtime's events, taking what is queued before `stop` closes: saves the session
+/// the runtime asks to be saved, wakes the loop for outbox and session news, and hands firings
+/// and notices to the host. The session's record exists before its runtime starts, so a save
+/// request only writes it again.
+async fn serve_automation_events(
+    automations: Arc<SessionAutomations>,
+    stop: Receiver<()>,
+    store: Arc<Mutex<Option<SessionStore>>>,
+    wake: flume::Sender<()>,
+    errors: flume::Sender<Envelope>,
+) {
+    let events = automations.handle.events();
+    loop {
+        let event = futures_lite::future::or(async { events.recv_async().await.ok() }, async {
+            let _ = stop.recv_async().await;
+            None
+        })
+        .await;
+        match event {
+            None => break,
+            Some(AutomationEvent::SaveSession) => {
+                let Some(saved) = store.lock().await.as_mut().map(SessionStore::save) else {
+                    continue;
+                };
+                match saved {
+                    Ok(()) => automations.handle.signal(SessionSignal::Saved),
+                    Err(error) => {
+                        let _ = EventSender::new(errors.clone(), automations.last_run()).send(
+                            AgentEvent::Error {
+                                message: format!("{PERSIST_FAILED}: {error}"),
+                            },
+                        );
+                    }
+                }
+            }
+            Some(AutomationEvent::Outbox(_) | AutomationEvent::Session(_)) => {
+                let _ = wake.try_send(());
+            }
+            Some(event @ (AutomationEvent::Firing { .. } | AutomationEvent::Notice { .. })) => {
+                automations.host.push(event);
+            }
+            Some(AutomationEvent::Automation(_)) => {}
+        }
+    }
+}
+
+/// A session's automation runtime, ready to start beside its workflow runtime.
+struct PendingAutomations {
+    deps: AutomationDeps,
+    mode: ModeResolver,
+    fast: bool,
+}
+
+impl PendingAutomations {
+    /// What the runtime starts from: the session as its record has it on opening.
+    fn new(
+        automation: AutomationParams,
+        params: &InteractiveParams,
+        store: &SessionStore,
+        mode_route: &Arc<InteractiveModeRoute>,
+        model: &Model,
+    ) -> Self {
+        let session_id = store.session.id;
+        let mode = routed_mode(mode_route, automation.mode);
+        let facts = session_view(
+            session_id,
+            &store.session.title,
+            &mode(),
+            &store.goal,
+            restored_cost(&store.session, model),
+            SessionStatus::Idle,
+            automation.clock.now_ms() / MILLIS_PER_SECOND,
+        );
+        let deps = AutomationDeps {
+            state_dir: store.dir.clone(),
+            session_id,
+            cwd: params.initial_wd.clone(),
+            user_config_dir: automation.user_config_dir,
+            remote: params.workspace_session.is_some()
+                || params
+                    .workspace_binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.sandbox_record().is_some()),
+            features: params.config.features,
+            frontend: Frontend::Sdk,
+            config: automation.config,
+            controls: store.session.meta.automations.clone(),
+            launch: launch_armings(params.system_prompt_profile.as_deref(), Vec::new()),
+            facts,
+            clock: automation.clock,
+            http: automation.http,
+            workflows: None,
+        };
+        Self {
+            deps,
+            mode,
+            fast: automation.fast,
+        }
+    }
+
+    /// Starts the runtime, which starts its workflows through `workflow`, and has every save of
+    /// `store` keep its controls. One that cannot start leaves the session without automations.
+    async fn spawn(
+        self,
+        workflow: Option<&WorkflowHandle>,
+        store: &mut SessionStore,
+    ) -> Option<(
+        AutomationRuntime,
+        SessionAutomations,
+        Receiver<AutomationEvent>,
+    )> {
+        let Self {
+            mut deps,
+            mode,
+            fast,
+        } = self;
+        deps.workflows = workflow.map(|workflow| Arc::new(workflow.clone()) as Arc<dyn Workflows>);
+        let session_id = deps.session_id;
+        let facts = deps.facts.clone();
+        let runtime = AutomationRuntime::spawn(deps)
+            .await
+            .map_err(
+                |error| warn!(%error, %session_id, "automation runtime unavailable for this session"),
+            )
+            .ok()?;
+        info!(%session_id, "automation runtime started");
+        let handle = runtime.handle();
+        store.automations = Some(handle.clone());
+        let (host, events) = HostEvents::new();
+        let automations = SessionAutomations {
+            handle,
+            mode,
+            fast,
+            host,
+            tally: StdMutex::new(AutomationTally {
+                cost: facts.cost,
+                signals: SessionSignals::new(facts),
+                run: None,
+            }),
+        };
+        Some((runtime, automations, events))
     }
 }
 
@@ -1823,6 +2423,9 @@ impl InteractiveHandle {
             session_lease,
             permissions,
             workflow: None,
+            goal: GoalHandle::default(),
+            automations: None,
+            automation_events: flume::unbounded().1,
             mode_route: Arc::default(),
             workspace_change_tx: flume::unbounded().0,
             remote_workspace: None,
@@ -1871,7 +2474,14 @@ impl InteractiveHandle {
         Ok(())
     }
 
+    /// The host's only explicit stop: it holds every automation of the session until the next
+    /// prompt, idle or not, before it stops the session's work.
     pub async fn interrupt(&self) -> Result<(), String> {
+        if let Some(automations) = &self.automations {
+            automations.signal(SessionSignal::Pause {
+                by: PauseSource::Sdk,
+            });
+        }
         self.mode_route.control_epoch.fetch_add(1, Ordering::AcqRel);
         let _admission = self.mode_route.admission.lock().await;
         self.mode_route.cancel_run();
@@ -2126,7 +2736,7 @@ pub async fn prepare_interactive(
     );
     store
         .save()
-        .map_err(|error| InteractiveStartError(format!("Failed to persist session: {error}")))?;
+        .map_err(|error| InteractiveStartError(format!("{PERSIST_FAILED}: {error}")))?;
     Ok(PreparedInteractive {
         params,
         history: history.with_todos(store.todos()),
@@ -2229,6 +2839,8 @@ async fn spawn_prepared_session(
     let session_id = session_ref.id();
     let session_lease = Arc::clone(&params.session_lease);
     let subagent_history = store.subagent_history.clone();
+    let goal = store.goal.clone();
+    let goal_deferral = Arc::new(GoalDeferral::default());
     let state_dir = store.dir.clone();
     let background = if background_enabled {
         Some(
@@ -2250,6 +2862,13 @@ async fn spawn_prepared_session(
     let (workspace_change_tx, workspace_change_rx) = flume::unbounded::<WorkspaceChangeRequest>();
     let (workflow_wake_tx, workflow_wake_rx) = flume::bounded::<()>(1);
     let mode_route = Arc::new(InteractiveModeRoute::default());
+    let pending_automations = params
+        .automations
+        .take()
+        .filter(|_| params.config.features.enabled(Feature::Automations))
+        .map(|automation| {
+            PendingAutomations::new(automation, &params, &store, &mode_route, &model)
+        });
     let remote_workspace = params
         .workspace_session
         .clone()
@@ -2364,15 +2983,7 @@ async fn spawn_prepared_session(
     )));
     let mut runtime = match params.workflow_mode.take() {
         Some(mode) => {
-            let mode: ModeResolver = Arc::new({
-                let mode_route = Arc::clone(&mode_route);
-                move || {
-                    mode_route
-                        .mode
-                        .load_full()
-                        .map_or_else(|| mode(), |mode| (*mode).clone())
-                }
-            });
+            let mode = routed_mode(&mode_route, mode);
             let model: ModelResolver = Arc::new({
                 let live_model = Arc::clone(&live_model);
                 move || {
@@ -2427,6 +3038,19 @@ async fn spawn_prepared_session(
         }
         return Err(InteractiveStartError(error.to_string()));
     }
+    let started = match (pending_automations, store.lock().await.as_mut()) {
+        (Some(pending), Some(session_store)) => {
+            pending.spawn(workflow.as_ref(), session_store).await
+        }
+        _ => None,
+    };
+    let (automation_runtime, automations, automation_events) = match started {
+        Some((runtime, automations, events)) => {
+            (Some(runtime), Some(Arc::new(automations)), events)
+        }
+        None => (None, None, flume::bounded(0).1),
+    };
+    let (automation_wake_tx, automation_wake_rx) = flume::bounded::<()>(1);
     if background_enabled
         && workflow
             .as_ref()
@@ -2450,12 +3074,17 @@ async fn spawn_prepared_session(
         let background = background.clone();
         let live_model = Arc::clone(&live_model);
         let remote_workspace = remote_workspace.clone();
+        let goal = goal.clone();
+        let automations = automations.clone();
         async move {
             let event_forwarder = smol::spawn({
                 let store = Arc::clone(&store);
                 let raw_tx = raw_tx.clone();
                 let background = background.clone();
                 let workflow_wake_tx = workflow_wake_tx.clone();
+                let goal = goal.clone();
+                let goal_deferral = Arc::clone(&goal_deferral);
+                let automations = automations.clone();
                 async move {
                     while let Ok(envelope) = agent_rx.recv_async().await {
                         if (envelope.task.is_some() || envelope.run_id == BACKGROUND_EVENT_RUN_ID)
@@ -2465,6 +3094,12 @@ async fn spawn_prepared_session(
                         {
                             continue;
                         }
+                        record_subagent_goal_usage(&goal, &envelope);
+                        // Before the deferral wakes the settle watch, so it sees the run's end.
+                        if let Some(automations) = &automations {
+                            automations.forwarded(&envelope, &goal);
+                        }
+                        goal_deferral.observe(&envelope);
                         let persistence_error = if let Some(store) = &mut *store.lock().await {
                             store.record_event(&envelope).err()
                         } else {
@@ -2489,7 +3124,7 @@ async fn spawn_prepared_session(
                             && raw_tx
                                 .send_async(Envelope {
                                     event: AgentEvent::Error {
-                                        message: format!("Failed to persist session: {error}"),
+                                        message: format!("{PERSIST_FAILED}: {error}"),
                                     },
                                     subagent: None,
                                     run_id,
@@ -2504,8 +3139,23 @@ async fn spawn_prepared_session(
                     }
                 }
             });
+            let automation_events_task = automations.as_ref().map(|automations| {
+                let (stop, stopped) = flume::bounded::<()>(1);
+                let task = smol::spawn(serve_automation_events(
+                    Arc::clone(automations),
+                    stopped,
+                    Arc::clone(&store),
+                    automation_wake_tx,
+                    raw_tx.clone(),
+                ));
+                (stop, task)
+            });
             let mut run_id: u64 = 0;
             let mut continuation: Option<(AgentMode, ThinkingConfig, bool)> = None;
+            // The control epoch the last run started under: a stop, an
+            // interrupt or a mode change since then calls its check-in off,
+            // as stopping work does in the TUI.
+            let mut run_epoch = 0;
 
             loop {
                 if background_enabled && input_rx.is_disconnected() {
@@ -2517,6 +3167,62 @@ async fn spawn_prepared_session(
                     Stop,
                     Background,
                     Workflow,
+                    GoalCheckin,
+                    Automation,
+                }
+                // The TUI's check-in rule: the last run deferred its goal
+                // evaluation, the goal is still active, nothing stopped the
+                // session since, no prompt waits, and the work it deferred
+                // behind has settled.
+                let checkin_due = || {
+                    run_id
+                        .checked_sub(1)
+                        .is_some_and(|last| goal_deferral.deferred(last))
+                        && mode_route.control_epoch.load(Ordering::Acquire) == run_epoch
+                        && continuation.is_some()
+                        && input_rx.is_empty()
+                        && goal.snapshot().is_some()
+                        && !SessionWork::capture(
+                            background.as_ref(),
+                            workflow.as_ref(),
+                            base.subagent_cancels.active_count(),
+                        )
+                        .pending()
+                };
+                // What keeps the session from settling, as its automations see it. Completions
+                // keep the session busy and wait ahead of them only once a continuation lets a
+                // wake deliver them; until then the next run carries them, whoever starts it.
+                let settle_blockers = |automations: &SessionAutomations| {
+                    let work = SessionWork::capture(
+                        background.as_ref(),
+                        workflow.as_ref(),
+                        base.subagent_cancels.active_count(),
+                    );
+                    let completions = background
+                        .as_ref()
+                        .is_some_and(BackgroundTasks::has_pending)
+                        || workflow
+                            .as_ref()
+                            .is_some_and(|workflow| workflow.pending_completions() > 0);
+                    let wakes_deliver = background_enabled && continuation.is_some();
+                    automations.blockers(
+                        work.running
+                            || work.unavailable
+                            || (work.settling && (wakes_deliver || !completions)),
+                        [
+                            (!input_rx.is_empty()).then_some(SettleBlocker::PromptQueued),
+                            (wakes_deliver && completions).then_some(SettleBlocker::MailboxWake),
+                            (background_enabled && checkin_due())
+                                .then_some(SettleBlocker::GoalCheckin),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .collect(),
+                    )
+                };
+                if let Some(automations) = &automations {
+                    let title = session_title(&store).await;
+                    automations.observe(&title, &goal, settle_blockers(automations));
                 }
                 let next = futures_lite::future::or(
                     async {
@@ -2525,45 +3231,121 @@ async fn spawn_prepared_session(
                         }
                         NextInput::Stop
                     },
-                    futures_lite::future::or(
-                        async { NextInput::Prompt(Box::new(input_rx.recv_async().await)) },
+                    async {
+                        // What follows a run reaches the runtime after the run's end does.
+                        if let Some(automations) = &automations {
+                            until_due(
+                                || !automations.running(),
+                                &goal_deferral,
+                                background.as_ref(),
+                                &base.subagent_cancels,
+                            )
+                            .await;
+                        }
                         futures_lite::future::or(
-                            async {
-                                NextInput::Workspace(Box::new(
-                                    workspace_change_rx.recv_async().await,
-                                ))
-                            },
+                            async { NextInput::Prompt(Box::new(input_rx.recv_async().await)) },
                             futures_lite::future::or(
                                 async {
-                                    if let Some(background) = &background {
-                                        background.notified().await;
-                                    } else {
-                                        futures_lite::future::pending::<()>().await;
-                                    }
-                                    NextInput::Background
+                                    NextInput::Workspace(Box::new(
+                                        workspace_change_rx.recv_async().await,
+                                    ))
                                 },
-                                async {
-                                    if !background_enabled {
-                                        futures_lite::future::pending::<()>().await;
-                                    }
-                                    if workflow_wake_rx.recv_async().await.is_err() {
-                                        futures_lite::future::pending::<()>().await;
-                                    }
-                                    NextInput::Workflow
-                                },
+                                futures_lite::future::or(
+                                    async {
+                                        if let Some(background) = &background {
+                                            background.notified().await;
+                                        } else {
+                                            futures_lite::future::pending::<()>().await;
+                                        }
+                                        NextInput::Background
+                                    },
+                                    futures_lite::future::or(
+                                        async {
+                                            if !background_enabled {
+                                                futures_lite::future::pending::<()>().await;
+                                            }
+                                            if workflow_wake_rx.recv_async().await.is_err() {
+                                                futures_lite::future::pending::<()>().await;
+                                            }
+                                            NextInput::Workflow
+                                        },
+                                        futures_lite::future::or(
+                                            async {
+                                                if !background_enabled {
+                                                    futures_lite::future::pending::<()>().await;
+                                                }
+                                                until_due(
+                                                    &checkin_due,
+                                                    &goal_deferral,
+                                                    background.as_ref(),
+                                                    &base.subagent_cancels,
+                                                )
+                                                .await;
+                                                NextInput::GoalCheckin
+                                            },
+                                            async {
+                                                let Some(automations) = &automations else {
+                                                    return futures_lite::future::pending().await;
+                                                };
+                                                // Runtime news, or blockers the runtime has not
+                                                // heard.
+                                                futures_lite::future::or(
+                                                    async {
+                                                        if automation_wake_rx
+                                                            .recv_async()
+                                                            .await
+                                                            .is_err()
+                                                        {
+                                                            futures_lite::future::pending::<()>()
+                                                                .await;
+                                                        }
+                                                    },
+                                                    until_due(
+                                                        || {
+                                                            automations.changes(&settle_blockers(
+                                                                automations,
+                                                            ))
+                                                        },
+                                                        &goal_deferral,
+                                                        background.as_ref(),
+                                                        &base.subagent_cancels,
+                                                    ),
+                                                )
+                                                .await;
+                                                NextInput::Automation
+                                            },
+                                        ),
+                                    ),
+                                ),
                             ),
-                        ),
-                    ),
+                        )
+                        .await
+                    },
                 )
                 .await;
                 let admission = mode_route.admission.lock().await;
                 let _turn = mode_route.turn.lock().await;
-                let automatic = matches!(next, NextInput::Background | NextInput::Workflow);
+                let automatic = matches!(
+                    next,
+                    NextInput::Background
+                        | NextInput::Workflow
+                        | NextInput::GoalCheckin
+                        | NextInput::Automation
+                );
+                let origin = match &next {
+                    NextInput::Prompt(_) => Some(StartedBy::User),
+                    NextInput::GoalCheckin => Some(StartedBy::Goal),
+                    _ => None,
+                };
+                let delivering = matches!(next, NextInput::Automation);
                 let mut input = match next {
                     NextInput::Prompt(received) => {
                         let Ok(input) = *received else {
                             break;
                         };
+                        if let Some(automations) = &automations {
+                            automations.handle.signal(SessionSignal::HumanInput);
+                        }
                         if let Some(background) = &background {
                             background.rearm();
                         }
@@ -2575,7 +3357,7 @@ async fn spawn_prepared_session(
                         continue;
                     }
                     NextInput::Background | NextInput::Workflow => {
-                        let Some((mode, thinking, fast)) = &continuation else {
+                        let Some(continuation) = &continuation else {
                             continue;
                         };
                         let Some(background) = &background else {
@@ -2585,18 +3367,32 @@ async fn spawn_prepared_session(
                             Ok(permit) => drop(permit),
                             Err(_) => continue,
                         }
-                        AgentInput {
-                            message: String::new(),
-                            mode: mode.clone(),
-                            plan: None,
-                            thinking: thinking.clone(),
-                            fast: *fast,
-                            images: Vec::new(),
-                            mentions: Vec::new(),
-                            commits: Vec::new(),
-                            preamble: Vec::new(),
-                            prompt: None,
-                            resume: false,
+                        automatic_input(continuation, Vec::new())
+                    }
+                    NextInput::GoalCheckin => {
+                        let (Some(continuation), Some(active)) = (&continuation, goal.snapshot())
+                        else {
+                            continue;
+                        };
+                        automatic_input(
+                            continuation,
+                            vec![Message::synthetic(agent::goal_checkin_message(
+                                &active.condition,
+                            ))],
+                        )
+                    }
+                    NextInput::Automation => {
+                        let Some(automations) = &automations else {
+                            continue;
+                        };
+                        if !input_rx.is_empty() || !automations.due() {
+                            continue;
+                        }
+                        match &continuation {
+                            Some(continuation) => automatic_input(continuation, Vec::new()),
+                            None => {
+                                automatic_input(&automations.fallback(&params.thinking), Vec::new())
+                            }
                         }
                     }
                     NextInput::Workspace(change) => {
@@ -2762,7 +3558,20 @@ async fn spawn_prepared_session(
                     },
                     None => None,
                 };
+                // The runtime records an item delivered as it hands it over, so the claim comes
+                // after everything that could still call this turn off.
+                let claim = match &automations {
+                    Some(automations) if delivering && input_rx.is_empty() => {
+                        automations.claim().await
+                    }
+                    _ => None,
+                };
+                if let (Some(automations), Some(claim)) = (&automations, &claim) {
+                    automations.set_goal(&goal, claim);
+                    input.preamble.push(claim_message(claim));
+                }
                 if automatic
+                    && input.preamble.is_empty()
                     && workflow_delivery.is_empty()
                     && delivery
                         .as_ref()
@@ -2770,6 +3579,13 @@ async fn spawn_prepared_session(
                 {
                     continue;
                 }
+                continuation.get_or_insert_with(|| {
+                    (input.mode.clone(), input.thinking.clone(), input.fast)
+                });
+                run_epoch = mode_route.control_epoch.load(Ordering::Acquire);
+                let background_messages = delivery
+                    .as_ref()
+                    .map_or(0, |delivery| delivery.messages.len());
                 if let Some(delivery) = &delivery {
                     input
                         .preamble
@@ -2795,7 +3611,29 @@ async fn spawn_prepared_session(
                             .iter()
                             .filter_map(|message| message.workflow_event.clone())
                             .collect(),
+                        automation_events: input
+                            .preamble
+                            .iter()
+                            .filter_map(|message| message.automation_event.clone())
+                            .collect(),
                     });
+                }
+                if let Some(automations) = &automations {
+                    let started_by = match claim {
+                        Some(OutboxClaim {
+                            automation,
+                            fire_id,
+                            ..
+                        }) => StartedBy::Automation {
+                            automation,
+                            fire_id,
+                        },
+                        None => origin.unwrap_or_else(|| {
+                            wake_origin(false, workflow_delivery.len(), background_messages)
+                        }),
+                    };
+                    let title = session_title(&store).await;
+                    automations.run_started(run_id, started_by, &title, &goal);
                 }
                 let input_mode = input.mode.clone();
                 let session_plan = input.session_plan();
@@ -3074,6 +3912,8 @@ async fn spawn_prepared_session(
                 .with_user_response_rx(Arc::clone(&answer_rx))
                 .with_cancel(cancel.clone())
                 .with_local_tools(Arc::clone(&params.local_tools))
+                .with_goal(goal.clone())
+                .with_interrupt_source(Arc::new(QueuedPrompts(input_rx.clone())))
                 .with_mcp(mcp.clone());
 
                 let result = agent.run(input).await;
@@ -3103,7 +3943,7 @@ async fn spawn_prepared_session(
                     }
                     if let Err(error) = store.record_turn(&history, model.spec(), &permissions) {
                         let _ = EventSender::new(raw_tx.clone(), run_id).send(AgentEvent::Error {
-                            message: format!("Failed to persist session: {error}"),
+                            message: format!("{PERSIST_FAILED}: {error}"),
                         });
                     } else {
                         persisted = true;
@@ -3140,6 +3980,15 @@ async fn spawn_prepared_session(
                 run_id += 1;
             }
 
+            // Automations stop first, so no firing outlives the work it may have started, and
+            // the final save keeps the stopped runtime's last controls.
+            if let Some(runtime) = automation_runtime {
+                stop_runtime(runtime).await;
+            }
+            if let Some((stop, events)) = automation_events_task {
+                drop(stop);
+                events.await;
+            }
             // Active runs are interrupted and their agents drained before the
             // session is saved, so nothing writes to it afterwards.
             base.subagent_cancels.cancel_all();
@@ -3159,7 +4008,7 @@ async fn spawn_prepared_session(
                 store.sync_permissions(&permissions);
                 if let Err(error) = store.save() {
                     let _ = EventSender::new(raw_tx.clone(), run_id).send(AgentEvent::Error {
-                        message: format!("Failed to persist session: {error}"),
+                        message: format!("{PERSIST_FAILED}: {error}"),
                     });
                 }
             }
@@ -3184,11 +4033,23 @@ async fn spawn_prepared_session(
         session_lease,
         permissions,
         workflow,
+        goal,
+        automations: automations.map(|automations| automations.handle.clone()),
+        automation_events,
         mode_route,
         workspace_change_tx,
         remote_workspace,
         task,
     })
+}
+
+async fn session_title(store: &Mutex<Option<SessionStore>>) -> String {
+    store
+        .lock()
+        .await
+        .as_ref()
+        .map(|store| store.session.title.clone())
+        .unwrap_or_default()
 }
 
 async fn stop_session_work(
@@ -3374,6 +4235,12 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    use caudra_automation::event::{
+        ArmedReason, Event as FiredEvent, EventDetail, GoalVerdict as FinishedVerdict,
+    };
+    use caudra_automation::limits::ROLLING_WINDOW_MS;
+    use caudra_automation::request::{AutomationRequest, AutomationResponse};
+    use caudra_automation::snapshot::{ArmOrigin, FiringStatus, FiringSummary, WaitReason};
     use caudra_providers::{
         AgentError, ProviderEvent, RequestOptions, StandingReminderKind, StopReason,
         StreamResponse, TaskEventOrigin,
@@ -3394,6 +4261,9 @@ mod tests {
     use super::*;
     use crate::agent::subagent::TaskIdentity;
     use crate::agent::task_runner::TaskRequest;
+    use crate::automation::clock::FakeClock;
+    use crate::automation::manager::{GOAL_ACTIVE, PAUSED_BY_SDK};
+    use crate::automation::testing::AutomationFixture;
     use crate::background::TaskDelivery;
     use crate::permissions::{
         PermissionAnswer, PermissionError, PermissionLifetime, PermissionRequest, RevokedRuleScope,
@@ -3407,6 +4277,7 @@ mod tests {
     use crate::types::ToolDoneEvent;
     use crate::types::{TodoPriority, TodoStatus};
     use crate::workflow::store::WorkflowStore;
+    use crate::{GoalResult, GoalVerdict, TurnCompleteEvent};
 
     const SESSION_ID: &str = "CNK1hV6GWoysH3KQMm5wu";
     const CWD: &str = "/project";
@@ -4951,6 +5822,17 @@ complete(#{ report: first.output });
             workspace: Option<WorkspaceSession>,
             background: bool,
         ) -> InteractiveHandle {
+            self.spawn_with(workflows, workspace, background, None)
+                .await
+        }
+
+        async fn spawn_with(
+            &self,
+            workflows: bool,
+            workspace: Option<WorkspaceSession>,
+            background: bool,
+            automations: Option<AutomationParams>,
+        ) -> InteractiveHandle {
             let binding = workspace.as_ref().map(|workspace| {
                 StoredWorkspaceBinding::new_with_cursor(
                     workspace.binding().clone(),
@@ -5029,6 +5911,7 @@ complete(#{ report: first.output });
                 remote_project_context: context,
                 host_cwd: None,
                 local_documents: self.local_documents.clone(),
+                automations,
             };
             spawn_prepared_session(
                 PreparedInteractive {
@@ -5398,6 +6281,217 @@ complete(#{ report: first.output });
             assert_eq!(session.provider.user_prompts(), vec![PROMPT, SECOND_PROMPT]);
             assert!(handle.run_rx.try_iter().all(|run| !run.automatic));
             shutdown_interactive(handle).await;
+        });
+    }
+
+    const GOAL: &str = "the findings are summarized";
+    const OTHER_GOAL: &str = "the findings are filed";
+    const GOAL_REASON: &str = "the summary is in the transcript";
+    const GOAL_LIMIT: u32 = 3;
+    const PROMPT_FIRST: &str = "a prompt sent during a goal run must start before the goal goes on";
+    const EVALUATED_AFTER_PROMPT: &str =
+        "the goal must be evaluated at the end of the prompt's run";
+
+    fn text_answer() -> StreamResponse {
+        StreamResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: ANSWER.into(),
+                }],
+                ..Default::default()
+            },
+            stop_reason: Some(StopReason::EndTurn),
+            ..Default::default()
+        }
+    }
+
+    fn goal_met() -> StreamResponse {
+        let mut response = text_answer();
+        response.message.content = vec![ContentBlock::Text {
+            text: serde_json::json!({"ok": true, "reason": GOAL_REASON, "impossible": false})
+                .to_string(),
+        }];
+        response
+    }
+
+    async fn turn_events(events: &Receiver<Envelope>) -> Vec<AgentEvent> {
+        let mut seen = Vec::new();
+        loop {
+            let envelope = events.recv_async().await.expect(EVENTS_CLOSED);
+            match envelope.event {
+                AgentEvent::Done { .. } if envelope.subagent.is_none() => return seen,
+                AgentEvent::Error { message } => panic!("turn failed: {message}"),
+                event => seen.push(event),
+            }
+        }
+    }
+
+    #[test]
+    fn a_restored_goal_drives_the_next_run_and_is_saved_after_it_and_at_shutdown() {
+        smol::block_on(async {
+            let session = WorkflowSession::new(false);
+            let (responses, rx) = flume::unbounded();
+            *session.provider.responses.lock().unwrap() = Some(rx);
+            let mut stored = SessionStore::open_in(
+                session.state_dir.clone(),
+                session_id(),
+                &session.project.to_string_lossy(),
+                MODEL_SPEC,
+            )
+            .unwrap();
+            stored.goal.set(GOAL).unwrap();
+            stored.goal.set_continuation_limit(GOAL_LIMIT);
+            stored.save().unwrap();
+            drop(stored);
+            let handle = session.spawn(false).await;
+            assert_eq!(handle.goal.active_condition().as_deref(), Some(GOAL));
+            assert_eq!(handle.goal.continuation_limit(), GOAL_LIMIT);
+
+            responses.send(text_answer()).unwrap();
+            responses.send(goal_met()).unwrap();
+            handle.input_tx.send(prompt(PROMPT)).unwrap();
+            let events = turn_events(&handle.event_rx).await;
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::GoalFinished { .. }))
+            );
+            handle.interrupt().await.unwrap();
+            let meta = StoredSession::load(session_id(), &session.state_dir)
+                .unwrap()
+                .meta;
+            assert!(meta.active_goal.is_none());
+            let result = meta.goal_result.unwrap();
+            assert_eq!(result.condition, GOAL);
+            assert_eq!(result.reason, GOAL_REASON);
+            assert_eq!(meta.goal_continuation_limit, Some(GOAL_LIMIT));
+
+            handle.goal.set(OTHER_GOAL).unwrap();
+            shutdown_interactive(handle).await;
+            let meta = StoredSession::load(session_id(), &session.state_dir)
+                .unwrap()
+                .meta;
+            assert_eq!(meta.active_goal.unwrap().condition, OTHER_GOAL);
+            assert!(meta.goal_result.is_none());
+            assert_eq!(meta.goal_continuation_limit, Some(GOAL_LIMIT));
+        });
+    }
+
+    #[test]
+    fn a_deferred_goal_checks_in_once_its_work_settles() {
+        const CHILD: &str = "goal-child";
+        smol::block_on(async {
+            let session = WorkflowSession::new(false);
+            let (responses, rx) = flume::unbounded();
+            *session.provider.responses.lock().unwrap() = Some(rx);
+            let handle = session.spawn_session(false, None, true).await;
+            let tasks = handle.background.as_ref().unwrap();
+            handle.goal.set(GOAL).unwrap();
+            handle.input_tx.send(prompt(PROMPT)).unwrap();
+            session.started.recv_async().await.unwrap();
+            let _child = background_child(tasks, CHILD).await;
+            responses.send(text_answer()).unwrap();
+            let deferred = turn_events(&handle.event_rx).await;
+            assert!(
+                deferred
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::GoalDeferred { .. }))
+            );
+
+            tasks.stop().await.unwrap();
+            session.started.recv_async().await.unwrap();
+            let checkin = agent::goal_checkin_message(GOAL);
+            assert!(
+                session
+                    .provider
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .iter()
+                    .any(|message| message.first_text_content() == Some(checkin.as_str()))
+            );
+            responses.send(text_answer()).unwrap();
+            responses.send(goal_met()).unwrap();
+            let checked = turn_events(&handle.event_rx).await;
+            assert!(
+                checked
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::GoalFinished { .. }))
+            );
+
+            responses.send(text_answer()).unwrap();
+            handle.input_tx.send(prompt(SECOND_PROMPT)).unwrap();
+            wait_for_turn(&handle.event_rx).await;
+            let runs: Vec<_> = handle.run_rx.try_iter().map(|run| run.automatic).collect();
+            assert_eq!(runs, [false, true, false]);
+            shutdown_interactive(handle).await;
+        });
+    }
+
+    #[test]
+    fn a_goal_deferral_belongs_to_the_run_that_deferred() {
+        const DEFERRED_RUN: u64 = 3;
+        let deferral = GoalDeferral::default();
+        deferral.observe(&Envelope {
+            event: AgentEvent::GoalDeferred {
+                active_background_tasks: 1,
+            },
+            subagent: None,
+            run_id: DEFERRED_RUN,
+            task: None,
+            workflow: None,
+        });
+
+        assert!(deferral.deferred(DEFERRED_RUN));
+        assert!(!deferral.deferred(DEFERRED_RUN + 1));
+    }
+
+    #[test]
+    fn a_prompt_sent_during_a_goal_run_starts_first_and_its_run_evaluates_the_goal() {
+        smol::block_on(async {
+            let session = WorkflowSession::new(false);
+            let (responses, rx) = flume::unbounded();
+            *session.provider.responses.lock().unwrap() = Some(rx);
+            let handle = session.spawn_session(false, None, true).await;
+            handle.goal.set(GOAL).unwrap();
+            handle.input_tx.send(prompt(PROMPT)).unwrap();
+            session.started.recv_async().await.unwrap();
+            handle.input_tx.send(prompt(SECOND_PROMPT)).unwrap();
+
+            responses.send(text_answer()).unwrap();
+            session.started.recv_async().await.unwrap();
+            let next = session.provider.requests.lock().unwrap()[1].clone();
+            assert!(
+                next.iter()
+                    .any(|message| message.first_text_content() == Some(SECOND_PROMPT)),
+                "{PROMPT_FIRST}"
+            );
+            responses.send(text_answer()).unwrap();
+            responses.send(goal_met()).unwrap();
+            let goal_run = turn_events(&handle.event_rx).await;
+            let prompt_run = turn_events(&handle.event_rx).await;
+            let runs: Vec<_> = handle.run_rx.try_iter().map(|run| run.automatic).collect();
+            shutdown_interactive(handle).await;
+
+            assert!(
+                goal_run
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::GoalDeferred { .. }))
+                    && !goal_run
+                        .iter()
+                        .any(|event| matches!(event, AgentEvent::GoalEvaluating { .. })),
+                "{PROMPT_FIRST}"
+            );
+            assert_eq!(runs, [false, false], "{PROMPT_FIRST}");
+            assert!(
+                prompt_run
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::GoalFinished { .. })),
+                "{EVALUATED_AFTER_PROMPT}"
+            );
         });
     }
 
@@ -6385,5 +7479,859 @@ complete(#{ report: first.output });
             completion_block(&run),
             "Workflow echo-2 (echo) finished with status paused.\nPaused: check the draft\nError: boom"
         );
+    }
+
+    const AUTOMATION_DESCRIPTION: &str = "Drives a headless session";
+    const AUTOMATIONS_DIR: &str = "automations";
+    const COURIER: &str = "courier";
+    const GREETER: &str = "greeter";
+    const WATCHER: &str = "watcher";
+    const GOALS: &str = "goals";
+    const GUIDE: &str = "guide";
+    const AUTOMATION_MESSAGE: &str = "check CI";
+    const GUIDANCE: &str = "check the parser first";
+    /// A tool no session offers, so a call to it fails and the run asks the model again.
+    const UNOFFERED_TOOL: &str = "unoffered_tool";
+    const UNOFFERED_CALL: &str = "unoffered-call";
+    const ARMED_TRIGGER: &str = r#"#{ kind: "armed" }"#;
+    const IDLE_TRIGGER: &str = r#"#{ kind: "idle" }"#;
+    const GOAL_FINISHED_TRIGGER: &str = r#"#{ kind: "goal_finished" }"#;
+    const ARM_ALWAYS: &str = r#"arm: "always""#;
+    const LOG_BODY: &str = r#"log("seen");"#;
+    const FALLBACK_PLAN: &str = "fallback-plan.md";
+    const AUTOMATION_START_MS: i64 = 1_790_000_000_000;
+    const AUTOMATION_TITLE: &str = "Ship the release";
+    const AUTOMATION_RUN: u64 = 0;
+    /// USD.
+    const TURN_COST: f64 = 0.25;
+    const TURN_FAILURE: &str = "boom";
+    const TURN_WINDOW: Duration = Duration::from_millis(ROLLING_WINDOW_MS.unsigned_abs());
+
+    const NO_AUTOMATIONS: &str = "the session must start its automation runtime";
+    const NO_CONTROLS: &str = "every save must keep the runtime's controls";
+    const NO_CLAIM: &str = "a settled session must claim the queued message";
+    const NOT_A_TRACE: &str = "a firing request must answer with its trace";
+    const RUNTIME_CLOSED: &str = "the runtime must answer while the session runs";
+    const FALLBACK_RUN: &str = "a run no prompt came before must run under the fallback mode";
+    const CLAIM_CARRIED: &str = "the run must carry the message it claimed";
+    const REGISTERED: &str = "the runtime must be registered exactly while it serves the session";
+    const PAUSED_BY_INTERRUPT: &str = "an interrupt must pause the session's automations";
+    const PROMPT_UNPAUSES: &str =
+        "a prompt must clear the latch, and armed must fire with reason unpaused";
+    const PAUSED_BY_SDK_REQUEST: &str =
+        "an SDK pause request must hold the session's automations as the SDK's";
+    const RUN_GOES_ON: &str = "an SDK pause request must let the run in progress reach its answer";
+    const STOP_NEVER_PAUSES: &str = "neither a stop nor EOF may pause the session's automations";
+    const NOTHING_AFTER_EOF: &str = "no automation run may start after EOF";
+    const IDLE_ONCE: &str = "idle must fire once per busy period";
+    const UNTIL_RUN_END: &str =
+        "the session must stay busy until the forwarder hands over the run's end";
+    const IDLE_CARRIES_RUN: &str = "idle must carry who started the period and its last run";
+    const CLAIMED_GOAL_SET: &str = "a claimed goal must be set before its turn";
+    const HELD_UNTIL_CLOCK: &str = "a delivery the turn rate holds must wait for its time";
+    const REFUSAL_NOTICED: &str = "a refused claimed goal must reach the host as a notice";
+    const GOAL_REPORTED: &str = "a goal that ends must fire goal_finished with its verdict";
+    const ERROR_BACKS_OFF: &str =
+        "an error ending a claimed run must back deliveries off without pausing";
+    const SAVED_FIRST: &str = "a save request must save the session before its arming binds";
+    const REARMS_ON_RESUME: &str = "a binding must re-arm on resume";
+    const GUIDE_QUEUED: &str = "the guide item must wait in the outbox";
+    const GUIDE_HELD: &str = "a guide item must not join a run while a prompt waits";
+    const GUIDE_AFTER_PROMPT: &str = "a guide item must join the waiting prompt's run after it";
+    const COMPLETION_CARRIED: &str =
+        "a completion no wake can deliver must ride with the first automation run";
+
+    /// A [`WorkflowSession`] with its workflow runtime, as an SDK session has one, that serves
+    /// automations from its own user scripts on a fake clock, and falls back to plan mode for a
+    /// run no prompt came before.
+    struct AutomatedSession {
+        session: WorkflowSession,
+        config_dir: TempDir,
+        clock: Arc<FakeClock>,
+    }
+
+    impl AutomatedSession {
+        fn new() -> Self {
+            Self {
+                session: WorkflowSession::new(false),
+                config_dir: TempDir::new().unwrap(),
+                clock: FakeClock::new(AUTOMATION_START_MS),
+            }
+        }
+
+        fn script(&self, name: &str, triggers: &[&str], fields: &[&str], body: &str) {
+            write_script(
+                &self.config_dir.path().join(AUTOMATIONS_DIR),
+                name,
+                triggers,
+                fields,
+                body,
+            );
+        }
+
+        async fn spawn(&self, config: AutomationsConfig) -> InteractiveHandle {
+            let fallback = AgentMode::Plan(self.session.project.join(FALLBACK_PLAN));
+            let automations = AutomationParams {
+                mode: Arc::new(move || fallback.clone()),
+                fast: false,
+                config,
+                clock: Arc::clone(&self.clock) as Arc<dyn Clock>,
+                http: None,
+                user_config_dir: Some(self.config_dir.path().to_path_buf()),
+            };
+            self.session
+                .spawn_with(true, None, true, Some(automations))
+                .await
+        }
+    }
+
+    /// `<name>.rhai` in `dir`, a user script, which needs no trust.
+    fn write_script(dir: &Path, name: &str, triggers: &[&str], fields: &[&str], body: &str) {
+        let fields: String = fields.iter().map(|field| format!(", {field}")).collect();
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{name}.{SCRIPT_EXTENSION}")),
+            format!(
+                "let meta = #{{ name: \"{name}\", description: \"{AUTOMATION_DESCRIPTION}\", triggers: [{}]{fields} }};\n{body}",
+                triggers.join(", ")
+            ),
+        )
+        .unwrap();
+    }
+
+    fn message_body() -> String {
+        format!(r#"message("{AUTOMATION_MESSAGE}");"#)
+    }
+
+    fn goal_body() -> String {
+        format!(r#"set_goal("{GOAL}", #{{ replace: false }});"#)
+    }
+
+    fn guide_body() -> String {
+        format!(r#"message("{GUIDANCE}", #{{ delivery: "guide" }});"#)
+    }
+
+    fn unoffered_call() -> StreamResponse {
+        StreamResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use(
+                    UNOFFERED_CALL,
+                    UNOFFERED_TOOL,
+                    serde_json::json!({}),
+                )],
+                ..Default::default()
+            },
+            stop_reason: Some(StopReason::ToolUse),
+            ..Default::default()
+        }
+    }
+
+    fn position_of(request: &[Message], text: &str) -> Option<usize> {
+        request.iter().position(|message| {
+            message
+                .first_text_content()
+                .is_some_and(|content| content.contains(text))
+        })
+    }
+
+    /// Ends the session as the SDK does at stdin EOF.
+    async fn eof(handle: InteractiveHandle) {
+        let InteractiveHandle {
+            input_tx,
+            cancel_tx,
+            task,
+            ..
+        } = handle;
+        drop(input_tx);
+        let _ = cancel_tx.try_send(());
+        task.await;
+    }
+
+    /// Returns once the runtime has handled everything signalled before.
+    async fn barrier(handle: &AutomationHandle) {
+        handle
+            .request(AutomationRequest::List)
+            .await
+            .expect(RUNTIME_CLOSED);
+    }
+
+    /// The next firing of `name` that ended as `status`.
+    async fn firing(
+        events: &Receiver<AutomationEvent>,
+        name: &str,
+        status: FiringStatus,
+    ) -> FiringSummary {
+        loop {
+            if let AutomationEvent::Firing { firing, .. } =
+                events.recv_async().await.expect(EVENTS_CLOSED)
+                && firing.automation == name
+                && firing.status == status
+            {
+                return *firing;
+            }
+        }
+    }
+
+    /// The next notice handed to the host: the automation it names, the firing it came from,
+    /// and its text.
+    async fn notice(events: &Receiver<AutomationEvent>) -> (String, Option<String>, String) {
+        loop {
+            if let AutomationEvent::Notice {
+                automation,
+                fire_id,
+                text,
+            } = events.recv_async().await.expect(EVENTS_CLOSED)
+            {
+                return (automation, fire_id, text);
+            }
+        }
+    }
+
+    async fn fired_on(handle: &AutomationHandle, fire_id: &str) -> EventDetail {
+        let trace = AutomationRequest::Firing {
+            fire_id: fire_id.to_owned(),
+        };
+        match handle.request(trace).await {
+            Ok(AutomationResponse::Firing(detail)) => {
+                serde_json::from_value::<FiredEvent>(detail.event)
+                    .unwrap()
+                    .detail
+            }
+            other => panic!("{NOT_A_TRACE}: {other:?}"),
+        }
+    }
+
+    /// The store of the fixture's saved session.
+    fn fixture_store(fixture: &AutomationFixture) -> SessionStore {
+        SessionStore::open_in(
+            fixture.state_dir().clone(),
+            fixture.session_id(),
+            &fixture.project().to_string_lossy(),
+            MODEL_SPEC,
+        )
+        .unwrap()
+    }
+
+    /// `store`'s runtime as the SDK serves it, the events it hands the host, and the store that
+    /// keeps its controls.
+    async fn served(
+        fixture: &AutomationFixture,
+        mut store: SessionStore,
+    ) -> (
+        AutomationRuntime,
+        Arc<SessionAutomations>,
+        Receiver<AutomationEvent>,
+        Arc<Mutex<Option<SessionStore>>>,
+    ) {
+        let pending = PendingAutomations {
+            deps: AutomationDeps {
+                frontend: Frontend::Sdk,
+                ..fixture.deps(store.session.id, &[])
+            },
+            mode: Arc::new(|| AgentMode::Build),
+            fast: false,
+        };
+        let (runtime, automations, host) =
+            pending.spawn(None, &mut store).await.expect(NO_AUTOMATIONS);
+        (
+            runtime,
+            Arc::new(automations),
+            host,
+            Arc::new(Mutex::new(Some(store))),
+        )
+    }
+
+    fn main_run(event: AgentEvent) -> Envelope {
+        Envelope {
+            event,
+            subagent: None,
+            run_id: AUTOMATION_RUN,
+            task: None,
+            workflow: None,
+        }
+    }
+
+    fn answered(cost: f64) -> AgentEvent {
+        AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
+            message: text_answer().message,
+            usage: TokenUsage::default(),
+            model: MODEL_SPEC.into(),
+            provider: String::new(),
+            purpose: LedgerPurpose::Chat,
+            cost: Some(cost),
+            billing: Billing::Api,
+            context_size: None,
+            context_window: 0,
+        }))
+    }
+
+    fn ended() -> AgentEvent {
+        AgentEvent::Done {
+            usage: TokenUsage::default(),
+            num_turns: 1,
+            reason: DoneReason::EndTurn,
+        }
+    }
+
+    fn arm(name: &str) -> AutomationRequest {
+        AutomationRequest::Arm {
+            name: name.to_owned(),
+            args: None,
+            origin: ArmOrigin::Manual,
+        }
+    }
+
+    #[test]
+    fn an_armed_message_starts_the_first_run_under_the_fallback_mode() {
+        smol::block_on(async {
+            let session = AutomatedSession::new();
+            session.script(COURIER, &[ARMED_TRIGGER], &[ARM_ALWAYS], &message_body());
+            let handle = session.spawn(AutomationsConfig::default()).await;
+            assert!(
+                AutomationHandle::lookup(session_id()).is_some(),
+                "{REGISTERED}"
+            );
+
+            let run = handle.run_rx.recv_async().await.unwrap();
+            wait_for_turn(&handle.event_rx).await;
+            eof(handle).await;
+
+            assert!(run.automatic);
+            let claimed: Vec<_> = run
+                .automation_events
+                .iter()
+                .map(|origin| origin.automation.as_str())
+                .collect();
+            assert_eq!(claimed, [COURIER], "{CLAIM_CARRIED}");
+            let request = session.session.provider.requests.lock().unwrap()[0].clone();
+            assert!(
+                request
+                    .iter()
+                    .any(|message| message.automation_event.is_some()
+                        && message
+                            .first_text_content()
+                            .is_some_and(|text| text.contains(AUTOMATION_MESSAGE))),
+                "{CLAIM_CARRIED}"
+            );
+            let meta = StoredSession::load(session_id(), &session.session.state_dir)
+                .unwrap()
+                .meta;
+            assert_eq!(meta.mode, Some(StoredMode::Plan), "{FALLBACK_RUN}");
+            assert!(
+                AutomationHandle::lookup(session_id()).is_none(),
+                "{REGISTERED}"
+            );
+        });
+    }
+
+    #[test_case(false; "idle")]
+    #[test_case(true; "mid_run")]
+    fn an_interrupt_pauses_automations_until_the_next_prompt(mid_run: bool) {
+        smol::block_on(async {
+            let session = AutomatedSession::new();
+            session.script(GREETER, &[ARMED_TRIGGER], &[ARM_ALWAYS], LOG_BODY);
+            let (responses, rx) = flume::unbounded();
+            *session.session.provider.responses.lock().unwrap() = Some(rx);
+            let handle = session.spawn(AutomationsConfig::default()).await;
+            let automations = handle.automations.clone().expect(NO_AUTOMATIONS);
+            firing(&handle.automation_events, GREETER, FiringStatus::Completed).await;
+            if mid_run {
+                handle.input_tx.send(prompt(PROMPT)).unwrap();
+                session.session.started.recv_async().await.unwrap();
+            }
+
+            handle.interrupt().await.unwrap();
+            barrier(&automations).await;
+            let latch = automations.state().session.controls.pause.clone();
+            assert_eq!(
+                latch.map(|latch| latch.reason).as_deref(),
+                Some(PAUSED_BY_SDK),
+                "{PAUSED_BY_INTERRUPT}"
+            );
+
+            handle.input_tx.send(prompt(SECOND_PROMPT)).unwrap();
+            session.session.started.recv_async().await.unwrap();
+            barrier(&automations).await;
+            assert!(
+                automations.state().session.controls.pause.is_none(),
+                "{PROMPT_UNPAUSES}"
+            );
+            responses.send(text_answer()).unwrap();
+            let unpaused =
+                firing(&handle.automation_events, GREETER, FiringStatus::Completed).await;
+            assert_eq!(
+                fired_on(&automations, &unpaused.fire_id).await,
+                EventDetail::Armed {
+                    reason: ArmedReason::Unpaused
+                },
+                "{PROMPT_UNPAUSES}"
+            );
+            eof(handle).await;
+        });
+    }
+
+    /// What `automation_pause` asks of the runtime: unlike an interrupt, it holds the
+    /// automations and leaves the run in progress alone.
+    #[test]
+    fn an_sdk_pause_request_holds_automations_while_the_run_goes_on() {
+        smol::block_on(async {
+            let session = AutomatedSession::new();
+            session.script(GREETER, &[ARMED_TRIGGER], &[ARM_ALWAYS], LOG_BODY);
+            let (responses, rx) = flume::unbounded();
+            *session.session.provider.responses.lock().unwrap() = Some(rx);
+            let handle = session.spawn(AutomationsConfig::default()).await;
+            let automations = handle.automations.clone().expect(NO_AUTOMATIONS);
+            firing(&handle.automation_events, GREETER, FiringStatus::Completed).await;
+            handle.input_tx.send(prompt(PROMPT)).unwrap();
+            session.session.started.recv_async().await.unwrap();
+
+            let paused = automations
+                .request(AutomationRequest::Pause {
+                    by: PauseSource::Sdk,
+                })
+                .await;
+            responses.send(text_answer()).unwrap();
+            let run = turn_events(&handle.event_rx).await;
+            eof(handle).await;
+
+            let Ok(AutomationResponse::Controls(view)) = paused else {
+                panic!("{PAUSED_BY_SDK_REQUEST}: {paused:?}");
+            };
+            assert_eq!(
+                view.controls.pause.map(|latch| latch.source),
+                Some(PauseSource::Sdk),
+                "{PAUSED_BY_SDK_REQUEST}"
+            );
+            assert!(
+                run.iter()
+                    .any(|event| matches!(event, AgentEvent::TurnComplete(_))),
+                "{RUN_GOES_ON}"
+            );
+        });
+    }
+
+    #[test]
+    fn neither_a_stop_nor_eof_pauses_automations() {
+        smol::block_on(async {
+            let session = AutomatedSession::new();
+            session.script(GREETER, &[ARMED_TRIGGER], &[ARM_ALWAYS], LOG_BODY);
+            let handle = session.spawn(AutomationsConfig::default()).await;
+            firing(&handle.automation_events, GREETER, FiringStatus::Completed).await;
+
+            handle.cancel_tx.send_async(()).await.unwrap();
+            // A bounded channel of one takes the second stop once the loop took the first.
+            handle.cancel_tx.send_async(()).await.unwrap();
+            eof(handle).await;
+
+            let controls = StoredSession::load(session_id(), &session.session.state_dir)
+                .unwrap()
+                .meta
+                .automations
+                .expect(NO_CONTROLS);
+            assert_eq!(controls.pause, None, "{STOP_NEVER_PAUSES}");
+            assert_eq!(controls.armed, [GREETER], "{NO_CONTROLS}");
+        });
+    }
+
+    #[test]
+    fn no_automation_run_starts_after_eof() {
+        smol::block_on(async {
+            let session = AutomatedSession::new();
+            session.script(COURIER, &[ARMED_TRIGGER], &[], &message_body());
+            let (_responses, rx) = flume::unbounded();
+            *session.session.provider.responses.lock().unwrap() = Some(rx);
+            let handle = session.spawn(AutomationsConfig::default()).await;
+            let automations = handle.automations.clone().expect(NO_AUTOMATIONS);
+            handle.input_tx.send(prompt(PROMPT)).unwrap();
+            session.session.started.recv_async().await.unwrap();
+            automations.request(arm(COURIER)).await.unwrap();
+            firing(&handle.automation_events, COURIER, FiringStatus::Completed).await;
+
+            eof(handle).await;
+
+            assert_eq!(
+                session.session.provider.requests.lock().unwrap().len(),
+                1,
+                "{NOTHING_AFTER_EOF}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_guide_item_waits_for_a_queued_prompt_and_joins_its_run() {
+        smol::block_on(async {
+            let session = AutomatedSession::new();
+            session.script(GUIDE, &[ARMED_TRIGGER], &[], &guide_body());
+            let (responses, rx) = flume::unbounded();
+            *session.session.provider.responses.lock().unwrap() = Some(rx);
+            let handle = session.spawn(AutomationsConfig::default()).await;
+            let automations = handle.automations.clone().expect(NO_AUTOMATIONS);
+            handle.input_tx.send(prompt(PROMPT)).unwrap();
+            session.session.started.recv_async().await.unwrap();
+            automations.request(arm(GUIDE)).await.unwrap();
+            firing(&handle.automation_events, GUIDE, FiringStatus::Completed).await;
+            barrier(&automations).await;
+            assert_eq!(automations.state().outbox.len(), 1, "{GUIDE_QUEUED}");
+            handle.input_tx.send(prompt(SECOND_PROMPT)).unwrap();
+
+            responses.send(unoffered_call()).unwrap();
+            session.session.started.recv_async().await.unwrap();
+            responses.send(text_answer()).unwrap();
+            session.session.started.recv_async().await.unwrap();
+            responses.send(text_answer()).unwrap();
+            wait_for_turn(&handle.event_rx).await;
+            wait_for_turn(&handle.event_rx).await;
+            eof(handle).await;
+
+            let requests = session.session.provider.requests.lock().unwrap().clone();
+            assert_eq!(position_of(&requests[1], GUIDANCE), None, "{GUIDE_HELD}");
+            let prompted = position_of(&requests[2], SECOND_PROMPT).expect(GUIDE_AFTER_PROMPT);
+            let guided = position_of(&requests[2], GUIDANCE).expect(GUIDE_AFTER_PROMPT);
+            assert!(prompted < guided, "{GUIDE_AFTER_PROMPT}");
+        });
+    }
+
+    #[test]
+    fn a_completion_no_wake_can_deliver_rides_with_the_first_automation_run() {
+        smol::block_on(async {
+            let session = AutomatedSession::new();
+            session.script(COURIER, &[ARMED_TRIGGER], &[], &message_body());
+            let handle = session.spawn(AutomationsConfig::default()).await;
+            let automations = handle.automations.clone().expect(NO_AUTOMATIONS);
+            let workflow = handle.workflow.clone().expect(NO_RUNTIME);
+            let finished = trust_and_start(&workflow).await;
+            wait_for_run(&handle.event_rx, &finished.run_id, RunStatus::Completed).await;
+
+            automations.request(arm(COURIER)).await.unwrap();
+            let run = handle.run_rx.recv_async().await.unwrap();
+            wait_for_turn(&handle.event_rx).await;
+            eof(handle).await;
+
+            let claimed: Vec<_> = run
+                .automation_events
+                .iter()
+                .map(|origin| origin.automation.as_str())
+                .collect();
+            let completed: Vec<_> = run
+                .workflow_events
+                .iter()
+                .map(|origin| origin.run_id.as_str())
+                .collect();
+            assert_eq!(
+                (run.automatic, claimed, completed),
+                (true, vec![COURIER], vec![finished.run_id.as_str()]),
+                "{COMPLETION_CARRIED}"
+            );
+        });
+    }
+
+    #[test_case(false; "a_prompt")]
+    #[test_case(true; "an_automation")]
+    fn idle_names_who_started_the_busy_period(automated: bool) {
+        smol::block_on(async {
+            let session = AutomatedSession::new();
+            session.script(WATCHER, &[IDLE_TRIGGER], &[ARM_ALWAYS], LOG_BODY);
+            if automated {
+                session.script(COURIER, &[ARMED_TRIGGER], &[ARM_ALWAYS], &message_body());
+            }
+            let handle = session.spawn(AutomationsConfig::default()).await;
+            let automations = handle.automations.clone().expect(NO_AUTOMATIONS);
+            let started_by = if automated {
+                let courier =
+                    firing(&handle.automation_events, COURIER, FiringStatus::Completed).await;
+                StartedBy::Automation {
+                    automation: COURIER.into(),
+                    fire_id: courier.fire_id,
+                }
+            } else {
+                handle.input_tx.send(prompt(PROMPT)).unwrap();
+                StartedBy::User
+            };
+
+            let idle = firing(&handle.automation_events, WATCHER, FiringStatus::Completed).await;
+            let EventDetail::Idle(detail) = fired_on(&automations, &idle.fire_id).await else {
+                panic!("{IDLE_CARRIES_RUN}");
+            };
+            eof(handle).await;
+
+            assert_eq!(
+                (detail.started_by, detail.runs, detail.last_response),
+                (started_by, 1, Untrusted::text(ANSWER)),
+                "{IDLE_CARRIES_RUN}"
+            );
+            let idles = automations
+                .state()
+                .recent
+                .iter()
+                .filter(|firing| firing.automation == WATCHER)
+                .count();
+            assert_eq!(idles, 1, "{IDLE_ONCE}");
+        });
+    }
+
+    #[test]
+    fn a_claimed_goal_is_set_before_its_turn() {
+        smol::block_on(async {
+            let session = AutomatedSession::new();
+            session.script(GOALS, &[ARMED_TRIGGER], &[ARM_ALWAYS], &goal_body());
+            let (_responses, rx) = flume::unbounded();
+            *session.session.provider.responses.lock().unwrap() = Some(rx);
+            let handle = session.spawn(AutomationsConfig::default()).await;
+
+            session.session.started.recv_async().await.unwrap();
+            let active = handle.goal.active_condition();
+            eof(handle).await;
+
+            assert_eq!(active.as_deref(), Some(GOAL), "{CLAIMED_GOAL_SET}");
+        });
+    }
+
+    #[test]
+    fn a_goal_the_turn_rate_holds_waits_for_the_clock_and_a_refusal_reaches_the_host() {
+        smol::block_on(async {
+            let session = AutomatedSession::new();
+            session.script(COURIER, &[ARMED_TRIGGER], &[ARM_ALWAYS], &message_body());
+            session.script(GOALS, &[IDLE_TRIGGER], &[ARM_ALWAYS], &goal_body());
+            let handle = session
+                .spawn(AutomationsConfig {
+                    turns_per_hour: 1,
+                    ..AutomationsConfig::default()
+                })
+                .await;
+            let automations = handle.automations.clone().expect(NO_AUTOMATIONS);
+            let claimed = firing(&handle.automation_events, GOALS, FiringStatus::Completed).await;
+            barrier(&automations).await;
+            let waits: Vec<_> = automations
+                .state()
+                .outbox
+                .iter()
+                .map(|item| item.wait)
+                .collect();
+            assert!(
+                matches!(waits[..], [Some(WaitReason::TurnRateFull { .. })]),
+                "{HELD_UNTIL_CLOCK}"
+            );
+
+            handle.goal.set(OTHER_GOAL).unwrap();
+            session.clock.advance(TURN_WINDOW);
+            let refused = notice(&handle.automation_events).await;
+            eof(handle).await;
+
+            assert_eq!(
+                refused,
+                (
+                    GOALS.to_owned(),
+                    Some(claimed.fire_id),
+                    GOAL_ACTIVE.to_owned()
+                ),
+                "{REFUSAL_NOTICED}"
+            );
+        });
+    }
+
+    #[test]
+    fn the_session_settles_only_once_the_forwarder_hands_over_the_run_end() {
+        smol::block_on(async {
+            let fixture = AutomationFixture::default();
+            write_script(
+                &fixture.user_scripts(),
+                WATCHER,
+                &[IDLE_TRIGGER],
+                &[ARM_ALWAYS],
+                LOG_BODY,
+            );
+            let (runtime, automations, ..) = served(&fixture, fixture_store(&fixture)).await;
+            let events = automations.handle.events();
+            let goal = GoalHandle::default();
+
+            automations.run_started(AUTOMATION_RUN, StartedBy::User, AUTOMATION_TITLE, &goal);
+            automations.forwarded(&main_run(answered(TURN_COST)), &goal);
+            assert_eq!(
+                automations.blockers(false, Vec::new()),
+                [SettleBlocker::Busy],
+                "{UNTIL_RUN_END}"
+            );
+            automations.forwarded(&main_run(ended()), &goal);
+            let blockers = automations.blockers(false, Vec::new());
+            automations.observe(AUTOMATION_TITLE, &goal, blockers);
+            let idle = firing(&events, WATCHER, FiringStatus::Completed).await;
+            let EventDetail::Idle(detail) = fired_on(&automations.handle, &idle.fire_id).await
+            else {
+                panic!("{IDLE_CARRIES_RUN}");
+            };
+            stop_runtime(runtime).await;
+
+            assert_eq!(
+                (detail.last_response, detail.cost),
+                (Untrusted::text(ANSWER), Some(TURN_COST)),
+                "{IDLE_CARRIES_RUN}"
+            );
+        });
+    }
+
+    fn met_goal() -> AgentEvent {
+        AgentEvent::GoalFinished {
+            result: GoalResult {
+                condition: GOAL.into(),
+                verdict: GoalVerdict::Met,
+                reason: GOAL_REASON.into(),
+                evaluations: 1,
+                duration: Duration::ZERO,
+                usage: TokenUsage::default(),
+                cost: None,
+                subscription_cost: None,
+            },
+        }
+    }
+
+    fn cleared_goal() -> AgentEvent {
+        AgentEvent::GoalClearedAfterError {
+            condition: GOAL.into(),
+            message: TURN_FAILURE.into(),
+        }
+    }
+
+    #[test_case(met_goal(), FinishedVerdict::Met; "met")]
+    #[test_case(cleared_goal(), FinishedVerdict::Cleared; "cleared_after_an_error")]
+    fn a_goal_that_ends_fires_goal_finished(event: AgentEvent, verdict: FinishedVerdict) {
+        smol::block_on(async {
+            let fixture = AutomationFixture::default();
+            write_script(
+                &fixture.user_scripts(),
+                WATCHER,
+                &[GOAL_FINISHED_TRIGGER],
+                &[ARM_ALWAYS],
+                LOG_BODY,
+            );
+            let (runtime, automations, ..) = served(&fixture, fixture_store(&fixture)).await;
+            let events = automations.handle.events();
+
+            automations.forwarded(&main_run(event), &GoalHandle::default());
+            let finished = firing(&events, WATCHER, FiringStatus::Completed).await;
+            let EventDetail::GoalFinished(detail) =
+                fired_on(&automations.handle, &finished.fire_id).await
+            else {
+                panic!("{GOAL_REPORTED}");
+            };
+            stop_runtime(runtime).await;
+
+            assert_eq!(
+                (detail.verdict, detail.condition.as_str()),
+                (verdict, GOAL),
+                "{GOAL_REPORTED}"
+            );
+        });
+    }
+
+    #[test]
+    fn an_error_ending_a_claimed_run_backs_deliveries_off_without_pausing() {
+        smol::block_on(async {
+            let fixture = AutomationFixture::default();
+            write_script(
+                &fixture.user_scripts(),
+                COURIER,
+                &[ARMED_TRIGGER],
+                &[ARM_ALWAYS],
+                &message_body(),
+            );
+            let (runtime, automations, ..) = served(&fixture, fixture_store(&fixture)).await;
+            firing(
+                &automations.handle.events(),
+                COURIER,
+                FiringStatus::Completed,
+            )
+            .await;
+            let goal = GoalHandle::default();
+
+            let claim = automations.claim().await.expect(NO_CLAIM);
+            let started_by = StartedBy::Automation {
+                automation: claim.automation,
+                fire_id: claim.fire_id,
+            };
+            automations.run_started(AUTOMATION_RUN, started_by, AUTOMATION_TITLE, &goal);
+            automations.forwarded(
+                &main_run(AgentEvent::Error {
+                    message: TURN_FAILURE.into(),
+                }),
+                &goal,
+            );
+            barrier(&automations.handle).await;
+            let controls = automations.handle.state().session.controls.clone();
+            stop_runtime(runtime).await;
+
+            assert_eq!(
+                (controls.delivery_backoff.errors, controls.pause),
+                (1, None),
+                "{ERROR_BACKS_OFF}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_save_request_saves_the_session_before_its_arming_binds_and_a_resume_rearms_it() {
+        smol::block_on(async {
+            let fixture = AutomationFixture::default();
+            write_script(
+                &fixture.user_scripts(),
+                GREETER,
+                &[ARMED_TRIGGER],
+                &[],
+                LOG_BODY,
+            );
+            let unsaved = StoredSession::new(MODEL_SPEC, &fixture.project().to_string_lossy());
+            let session = unsaved.id;
+            let lease = Arc::new(SessionLease::acquire(fixture.state_dir(), session).unwrap());
+            let store =
+                SessionStore::from_session(fixture.state_dir().clone(), unsaved, true, lease);
+            let (runtime, automations, host, store) = served(&fixture, store).await;
+            let (stop, stopped) = flume::bounded(1);
+            let (wake, _woken) = flume::bounded(1);
+            let (errors, _) = flume::unbounded();
+            let events = smol::spawn(serve_automation_events(
+                Arc::clone(&automations),
+                stopped,
+                Arc::clone(&store),
+                wake,
+                errors,
+            ));
+
+            automations.handle.request(arm(GREETER)).await.unwrap();
+            firing(&host, GREETER, FiringStatus::Completed).await;
+            assert!(
+                StoredSession::load(session, fixture.state_dir()).is_ok(),
+                "{SAVED_FIRST}"
+            );
+            stop_runtime(runtime).await;
+            drop(stop);
+            events.await;
+            let mut closing = store.lock().await.take().unwrap();
+            closing.save().unwrap();
+            drop(closing);
+
+            let controls = StoredSession::load(session, fixture.state_dir())
+                .unwrap()
+                .meta
+                .automations;
+            let resumed = AutomationRuntime::spawn(AutomationDeps {
+                frontend: Frontend::Sdk,
+                controls,
+                ..fixture.deps(session, &[])
+            })
+            .await
+            .expect(NO_AUTOMATIONS);
+            let rearmed =
+                firing(&resumed.handle().events(), GREETER, FiringStatus::Completed).await;
+            let reason = fired_on(&resumed.handle(), &rearmed.fire_id).await;
+            stop_runtime(resumed).await;
+
+            assert_eq!(
+                reason,
+                EventDetail::Armed {
+                    reason: ArmedReason::Resume
+                },
+                "{REARMS_ON_RESUME}"
+            );
+        });
     }
 }

@@ -134,7 +134,7 @@ A single-session move retains that session's own counters but leaves the shared 
 
 Before a whole-project rename, stop other Caudra processes using the source directory, including ephemeral runs. Caudra drains the invoking runtime's usage writes before committing the move and aborts if that drain fails. Only ledger rows present at the relocation transaction are reattributed. There is no permanent redirect, so new work started at the old directory records usage there again.
 
-Session IDs and conversations are preserved. Active source plans and approvals are detached. Files are not moved, and file changes made before the move can no longer be reverted. If moving live tabs requires a project environment reload, Caudra exits after committing and asks you to run `caudra --continue` from the destination.
+Session IDs and conversations are preserved. Active source plans and approvals are detached. A running [automation](/docs/automations/#storage) firing blocks the move. The move interrupts the session's waiting firings and disarms its project automations, whose scripts belong to the old directory. User automations stay armed. Files are not moved, and file changes made before the move can no longer be reverted. If moving live tabs requires a project environment reload, Caudra exits after committing and asks you to run `caudra --continue` from the destination.
 
 ### Other checkouts of a repository
 
@@ -146,7 +146,7 @@ Run `caudra --ephemeral` for a session that leaves no session record behind. Set
 
 Caudra creates a private temporary state root under `XDG_RUNTIME_DIR` or the [scratch directory](/docs/configuration/#directory-layout). Session rows, tool outputs, file change records, input history, and stashed prompts use that root. It is removed when Caudra exits through its normal success or error paths. A forced process kill can leave the temporary root for the operating system to clean up.
 
-Credentials, configuration, trust, model preferences, plans, memory notes, and logs keep their normal persistent locations. Project and global permission decisions remain durable. Ephemeral mode starts with an empty session store, so saved sessions and the persisted tab layout are unavailable during that run.
+Credentials, configuration, trust, model preferences, plans, memory notes, and logs keep their normal persistent locations. Project and global permission decisions remain durable. Ephemeral mode starts with an empty session store, so saved sessions and the persisted tab layout are unavailable during that run. The [automation inspector](/docs/automations/#other-sessions) lists other sessions from that store too, so an ephemeral run and the sessions outside it never see each other's automations.
 
 Managed sandbox lifecycle records and transfer recovery journals also remain persistent. `--ephemeral` is not a disposable-VM or automatic-delete policy.
 
@@ -186,7 +186,7 @@ The menu offers:
 | Completed tool | Includes the call and result | Empty |
 | Incomplete tool call | Includes the call; history repair supplies an unavailable result | Empty |
 
-The child receives a new session ID and a title such as `Original title (fork #1)`. It copies the selected ancestor path, reachable tool outputs and subagent histories, and model and execution settings. It also holds the parent's [file change records](#file-revert), so the child can revert files too, and it copies no file data. It gets its own copy of the parent's [plan](/docs/tools/#plan), ready to implement if the parent's was. If that copy fails, the child starts without a plan and Caudra shows a warning. Usage totals, goals, queues, pending revert state, conversation permission rules, and explicit YOLO state start clean.
+The child receives a new session ID and a title such as `Original title (fork #1)`. It copies the selected ancestor path, reachable tool outputs and subagent histories, and model and execution settings. It also holds the parent's [file change records](#file-revert), so the child can revert files too, and it copies no file data. It gets its own copy of the parent's [plan](/docs/tools/#plan), ready to implement if the parent's was. If that copy fails, the child starts without a plan and Caudra shows a warning. Usage totals, goals, queues, pending revert state, conversation permission rules, and explicit YOLO state start clean. So do [automations](/docs/automations/#storage): the child copies none of their bindings, args, state, or firings.
 
 Subtasks are different from user-created forks. They share the root conversation's permission rules. Resuming that root restores its rules, while `/new` starts a clean root.
 
@@ -255,7 +255,7 @@ The change record section lists the stores largest first, one per workspace dire
 
 Measuring walks the stores on disk, so the modal opens immediately and fills in when the walk finishes. The same figures are available without the TUI from `caudra storage stats` and `caudra storage snapshots`.
 
-Recording keeps each store near its [size budget](#limits) on its own. To reclaim more, trim the sessions that use a store: `caudra storage trim <ID>`. Trimming releases the session's local file change records and drops its retained tool output files, rewind archives, and the journals and timelines of its workflow runs. The conversation stays and stays resumable. Records that another session still holds, such as a fork, stay in the store, and the rest are deleted. Pinned sessions are refused and a session open in another process is skipped, so the command is safe to run while Caudra is up. Add `--dry-run` to see the session and its artifact size first.
+Recording keeps each store near its [size budget](#limits) on its own. To reclaim more, trim the sessions that use a store: `caudra storage trim <ID>`. Trimming releases the session's local file change records and drops its retained tool output files, rewind archives, the journals and timelines of its workflow runs, and the firings, actions, and script versions of its [automations](/docs/automations/#storage). The conversation stays and stays resumable, and the automations keep their bindings and state. Records that another session still holds, such as a fork, stay in the store, and the rest are deleted. Pinned sessions are refused and a session open in another process is skipped, so the command is safe to run while Caudra is up. Add `--dry-run` to see the session and its artifact size first.
 
 ## Conversation revert
 

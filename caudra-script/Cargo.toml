@@ -1,0 +1,22 @@
+[package]
+name = "caudra-script"
+description = "The Rhai sandbox that workflow and automation scripts share: a restricted engine, a static header reader, a host-call bridge, and request digests."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["rhai"]
+rhai = ["dep:rhai"]
+
+[dependencies]
+rhai = { workspace = true, optional = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+test-case = { workspace = true }

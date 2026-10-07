@@ -10,13 +10,13 @@ rust-version.workspace = true
 
 [features]
 default = ["rhai"]
-rhai = ["dep:rhai"]
+rhai = ["dep:rhai", "caudra-script/rhai"]
 
 [dependencies]
+caudra-script = { workspace = true }
 rhai = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

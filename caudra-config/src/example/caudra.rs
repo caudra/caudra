@@ -4,9 +4,9 @@ use crate::experimental::{Feature, FeatureFlags};
 use crate::files::{self, CONFIG_FILES};
 use crate::steering::{SteeringConfig, SteeringRule, SteeringRulesConfig};
 use crate::{
-    AgentConfig, ConfigValue, DEFAULT_BUILTINS, MIN_TOOL_OUTPUT_LINES, MessagingConfig,
-    NATIVE_PLUGIN_OPTIONS, ProviderConfig, RetentionConfig, SnapshotsConfig, StorageConfig,
-    TOP_LEVEL_FIELDS, TelemetryConfig, ToolOutputLines, UiConfig, WorktreesConfig,
+    AgentConfig, AutomationsConfig, ConfigValue, DEFAULT_BUILTINS, MIN_TOOL_OUTPUT_LINES,
+    MessagingConfig, NATIVE_PLUGIN_OPTIONS, ProviderConfig, RetentionConfig, SnapshotsConfig,
+    StorageConfig, TOP_LEVEL_FIELDS, TelemetryConfig, ToolOutputLines, UiConfig, WorktreesConfig,
 };
 
 use super::{Document, Entry, Header, Table, code_list, global_location, preamble};
@@ -18,7 +18,7 @@ const USAGE: &str = "To change a setting, copy its line into your caudra.toml un
      [table] header, remove the \"#\", and set your value. A value in angle brackets, such as \
      <string>, marks a setting that has no default.";
 const PROJECT_SCOPE: &str = "A project .caudra/caudra.toml takes the same settings, except \
-     [experimental] and the ones marked global-only.";
+     [experimental], [automations], and the ones marked global-only.";
 const EXPERIMENTAL_ABOUT: &str = "Experimental features stay off until you turn them on, and each \
      switch is independent. Only the global caudra.toml may hold this table. Caudra reads it once \
      at startup, so a change needs a restart.";
@@ -38,6 +38,8 @@ const DECISION_FEATURES_ABOUT: &str = "`off` turns a feature off, `shadow` colle
      feature's own behavior. Each feature lists the modes it takes.";
 const THRESHOLDS_ABOUT: &str = "Probabilities between 0 and 1. Flags trigger at or above their \
      threshold, and goal prescreening skips at or below its own.";
+const AUTOMATIONS_ABOUT: &str = "Limits for automations, which need `automations = true` under \
+     [experimental]. Only the global caudra.toml may hold this table.";
 
 /// Every `caudra.toml` setting with its default, type, bounds, and
 /// environment variable.
@@ -126,6 +128,11 @@ fn tables() -> Vec<Table> {
             DecisionThresholds::FIELDS,
         )
         .about(THRESHOLDS_ABOUT),
+        Table::of(
+            Header::Fixed("automations".into()),
+            AutomationsConfig::FIELDS,
+        )
+        .about(AUTOMATIONS_ABOUT),
         Table::new(Header::Fixed("plugins".into()), Vec::new()).about(plugins_about()),
     ]);
     tables.extend(
@@ -213,9 +220,7 @@ mod tests {
         format!(
             "{:?}",
             (
-                config.always_yolo,
-                config.always_auto,
-                config.always_fast,
+                (config.always_yolo, config.always_auto, config.always_fast),
                 &config.always_thinking,
                 &config.ui,
                 &config.agent,
@@ -223,6 +228,7 @@ mod tests {
                 &config.storage,
                 &config.telemetry,
                 &config.worktrees,
+                &config.automations,
                 &config.decisions,
                 &config.plugins,
             )
@@ -254,6 +260,7 @@ mod tests {
             &config.agent,
             &config.provider,
             &config.storage,
+            &config.automations,
             &config.decisions,
         );
         let built_in = (
@@ -261,6 +268,7 @@ mod tests {
             &defaults.agent,
             &defaults.provider,
             &defaults.storage,
+            &defaults.automations,
             &defaults.decisions,
         );
         assert_eq!(format!("{stated:?}"), format!("{built_in:?}"));

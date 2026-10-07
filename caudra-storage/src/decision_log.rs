@@ -1040,6 +1040,7 @@ mod tests {
                         mode: "build".into(),
                         permission: "ask".into(),
                         external: false,
+                        automation: None,
                     },
                     text: STATE_VALUE.into(),
                     reply_to: None,

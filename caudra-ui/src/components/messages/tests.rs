@@ -3127,6 +3127,7 @@ fn peer_message_copies_as_its_own_fenced_section() {
             reply_target: String::new(),
             reply_to: None,
             external: true,
+            automation: None,
             assignment: None,
         },
     ));

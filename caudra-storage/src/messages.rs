@@ -7,9 +7,9 @@ mod groups;
 pub(crate) use groups::SCHEMA as GROUP_SCHEMA;
 pub use groups::{
     Assignment, DEFAULT_CONCURRENCY, DEFAULT_MAX_ATTEMPTS, GroupChange, GroupPolicy, LEASE_MS,
-    MAX_ATTEMPTS, MAX_BACKLOG, MAX_CONCURRENCY, MAX_GROUPS, QueuedWork, Recorded, WorkAttempt,
-    WorkCounts, WorkDetail, WorkFence, WorkFilter, WorkGroup, WorkItem, WorkOutcome, WorkOwner,
-    WorkRefusal, WorkState, Worker,
+    MAX_ATTEMPTS, MAX_BACKLOG, MAX_CONCURRENCY, MAX_GROUPS, MAX_OUTSTANDING, PAUSED_BY_USER,
+    QueuedWork, Recorded, WorkAttempt, WorkCounts, WorkDetail, WorkFence, WorkFilter, WorkGroup,
+    WorkItem, WorkOutcome, WorkOwner, WorkRefusal, WorkState, Worker,
 };
 
 use crate::StateDir;
@@ -29,7 +29,7 @@ const PENDING: &str = "pending";
 /// Every message column of `messages m`, in the order [`stored_message`] reads them.
 const MESSAGE_COLUMNS: &str = "m.seq, m.sender_route, m.message_id, m.kind, m.topic, \
     m.sender_session, m.sender_name, m.sender_handle, m.sender_cwd, m.sender_mode, \
-    m.sender_permission, m.external, m.text, m.reply_to, m.created_ms";
+    m.sender_permission, m.external, m.text, m.reply_to, m.created_ms, m.sender_automation";
 /// Topics arrive as one JSON array rather than a parameter each, so a pattern
 /// may match more topics than SQLite allows parameters.
 const TOPICS_FILTER: &str = "m.kind = 'topic' AND m.topic IN (SELECT value FROM json_each(?3))";
@@ -167,6 +167,8 @@ pub struct MessageSender {
     pub permission: String,
     /// Sent by a script outside every session, which nothing can reply to.
     pub external: bool,
+    /// The automation that sent the message on its session's behalf.
+    pub automation: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -317,8 +319,8 @@ impl MessageLog {
         let inserted = transaction.execute(
             "INSERT INTO messages (sender_route, message_id, kind, topic, sender_session,
                 sender_name, sender_handle, sender_cwd, sender_mode, sender_permission, external,
-                text, reply_to, created_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                text, reply_to, created_ms, sender_automation)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
              ON CONFLICT (sender_route, message_id) DO NOTHING",
             params![
                 sender.route,
@@ -335,6 +337,7 @@ impl MessageLog {
                 message.text,
                 message.reply_to,
                 created,
+                sender.automation,
             ],
         )?;
         let seq: i64 = transaction.query_row(
@@ -694,6 +697,7 @@ fn stored_message(row: &Row<'_>) -> rusqlite::Result<StoredMessage> {
                 mode: row.get(9)?,
                 permission: row.get(10)?,
                 external: row.get(11)?,
+                automation: row.get(15)?,
             },
             text: row.get(12)?,
             reply_to: row.get(13)?,
@@ -749,6 +753,7 @@ mod tests {
     const TOPIC: &str = "ci.failures";
     const OTHER_TOPIC: &str = "deploy.done";
     const TEXT: &str = "The build failed";
+    const AUTOMATION: &str = "ci-triage";
     const QUEUED: &str = "queued";
     const DELIVERED: &str = "delivered";
     const UNKNOWN: &str = "unknown";
@@ -787,6 +792,7 @@ mod tests {
                 mode: "build".into(),
                 permission: "ask".into(),
                 external: false,
+                automation: None,
             },
             text: TEXT.into(),
             reply_to: None,
@@ -858,6 +864,17 @@ mod tests {
             history[0].message,
             message("a", topic(TOPIC), ROUTE, SESSION)
         );
+    }
+
+    #[test_case(None; "session")]
+    #[test_case(Some(AUTOMATION); "automation")]
+    fn history_keeps_the_automation_that_sent_a_message(automation: Option<&str>) {
+        let (_root, _state, mut log) = fixture();
+        let mut sent = message("a", topic(TOPIC), ROUTE, SESSION);
+        sent.sender.automation = automation.map(str::to_owned);
+        log.record(&sent, &[]).unwrap();
+        let history = log.history(&HistoryChannel::All, None, LIMIT).unwrap();
+        assert_eq!(history[0].message, sent);
     }
 
     #[test]

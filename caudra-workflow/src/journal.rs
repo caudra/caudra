@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
 
+pub use caudra_script::canonical_json;
+use caudra_script::sha256_hex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 use crate::host::{AgentRequest, AgentResult, DecisionRequest, DecisionResult};
 
@@ -11,7 +11,7 @@ pub const MAX_JOURNAL_ENTRIES: usize = 16_384;
 pub const MAX_JOURNAL_BYTES: usize = 64 * 1024 * 1024;
 
 const HASH_VERSION_TAG: &str = "caudra-workflow/journal/v1\n";
-const HEX_DIGEST_LEN: usize = 64;
+const KIND_SEPARATOR: &[u8] = b"\n";
 const SCRATCH_NAME_FIELD: &str = "name";
 const SCRATCH_CONTENT_FIELD: &str = "content";
 
@@ -78,27 +78,6 @@ impl std::fmt::Display for RequestHash {
     }
 }
 
-/// JSON with object keys sorted recursively and no whitespace, so equal values hash equally.
-pub fn canonical_json(value: &Value) -> String {
-    fn canonicalise(value: &Value) -> Value {
-        match value {
-            Value::Object(map) => {
-                let mut sorted: Vec<(&String, &Value)> = map.iter().collect();
-                sorted.sort_unstable_by(|left, right| left.0.cmp(right.0));
-                Value::Object(
-                    sorted
-                        .into_iter()
-                        .map(|(key, value)| (key.clone(), canonicalise(value)))
-                        .collect(),
-                )
-            }
-            Value::Array(items) => Value::Array(items.iter().map(canonicalise).collect()),
-            scalar => scalar.clone(),
-        }
-    }
-    canonicalise(value).to_string()
-}
-
 /// The JSON the engine hashes for `agent` and `parallel` calls.
 pub fn agent_request_value(request: &AgentRequest) -> Value {
     serde_json::to_value(request).expect("AgentRequest is plain JSON data")
@@ -114,16 +93,12 @@ pub fn scratch_request_value(name: &str, content: &str) -> Value {
 }
 
 pub fn hash_request(kind: CallKind, request: &Value) -> RequestHash {
-    let mut hasher = Sha256::new();
-    hasher.update(HASH_VERSION_TAG.as_bytes());
-    hasher.update(kind.as_str().as_bytes());
-    hasher.update(b"\n");
-    hasher.update(canonical_json(request).as_bytes());
-    let mut hex = String::with_capacity(HEX_DIGEST_LEN);
-    for byte in hasher.finalize() {
-        write!(hex, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    RequestHash(hex)
+    RequestHash(sha256_hex(&[
+        HASH_VERSION_TAG.as_bytes(),
+        kind.as_str().as_bytes(),
+        KIND_SEPARATOR,
+        canonical_json(request).as_bytes(),
+    ]))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -284,6 +259,7 @@ impl Journal {
 
 #[cfg(test)]
 mod tests {
+    use caudra_script::HEX_DIGEST_LEN;
     use serde_json::json;
     use test_case::test_case;
 

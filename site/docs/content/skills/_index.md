@@ -26,7 +26,7 @@ Project skills work the same way at each level of the walk from your current dir
 
 The `.claude`, `.opencode` and `.agents` directories are there so skills you already wrote for other agents keep working. Once you make a `.caudra/skills/` next to them, they stop being read. An empty `~/.config/caudra/skills/` counts as existing, so it switches the compatibility directories off. Delete it if you want them back.
 
-Levels still combine: a skill at the repo root and a skill in a subdirectory both load. When two skills share a name, the one found last wins, so project skills beat personal ones and the repo root beats a nested directory. The builtins `caudra-docs`, `caudra-workflow-dev` and `caudra-plugin-dev` sit below all of them and any file of the same name replaces one.
+Levels still combine: a skill at the repo root and a skill in a subdirectory both load. When two skills share a name, the one found last wins, so project skills beat personal ones and the repo root beats a nested directory. The builtins `caudra-docs`, `caudra-workflow-dev`, `caudra-automation-dev` and `caudra-plugin-dev` sit below all of them and any file of the same name replaces one.
 
 Run `caudra skills --dirs` or `/skills` to see every candidate directory and which one won.
 
@@ -79,7 +79,7 @@ caudra skills --dirs          # candidate directories: selected, superseded, or 
 
 ## The builtins
 
-Caudra ships three skills. Each is a normal entry in the `skill` tool's list, and a `SKILL.md` of the same name in any of your directories replaces it. `caudra-workflow-dev` and `caudra-plugin-dev` also need their [experimental feature](/docs/configuration/#experimental-features). Your own Markdown skills need no experimental switch.
+Caudra ships four skills. Each is a normal entry in the `skill` tool's list, and a `SKILL.md` of the same name in any of your directories replaces it. `caudra-workflow-dev`, `caudra-automation-dev` and `caudra-plugin-dev` also need their [experimental feature](/docs/configuration/#experimental-features). Your own Markdown skills need no experimental switch.
 
 ### caudra-docs
 
@@ -102,6 +102,12 @@ It needs `experimental.workflows`. With workflows on, it is on by default. It is
 
 The agent writes to the project directory when the plan belongs to the repository and to your user directory when it is personal. A project script still needs your approval in `/workflows` before it can start. The agent cannot grant that.
 
+### caudra-automation-dev
+
+It needs `experimental.automations`. With automations on, it is on by default. It is the complete authoring guide for [automations](/docs/automations/#write-one): where a script goes and which scope to choose, the header and its triggers, every event field and host function, how untrusted text and state behave, the limits and how to end a loop, the parts of Rhai that trip people up, complete worked scripts, and a table of common mistakes with their fixes. The worked scripts are the examples Caudra's own test suite replays against scripted events, so they cannot drift from the engine.
+
+The agent validates the script with the [`automation` tool](/docs/tools/#automation) and ends its turn with the line that arms it. A project script still needs your trust in `/automations`, and only you can arm a script.
+
 ### caudra-plugin-dev
 
 It needs `experimental.lua_plugins`. With Lua on, it is still off by default. It teaches the agent how to write caudra Lua plugins, and on load it writes the full Lua API reference to a file in the state dir, so the agent can read it in pieces instead of swallowing it whole. It carries the same guide you can read in [Plugins](/docs/plugins/), so "write me a plugin that ..." is usually enough.
@@ -111,9 +117,10 @@ Each builtin has a switch under `plugins.skill`:
 ```toml
 # ~/.config/caudra/caudra.toml
 [plugins.skill]
+automation_dev = true
 docs = false
 plugin_dev = true
 workflow_dev = false
 ```
 
-`plugin_dev` and `workflow_dev` have no effect while their experimental feature is off. `docs = false` removes the skill only, and `/docs` keeps working.
+`automation_dev`, `plugin_dev` and `workflow_dev` have no effect while their experimental feature is off. `docs = false` removes the skill only, and `/docs` keeps working.

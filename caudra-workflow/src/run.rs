@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+#[cfg(feature = "rhai")]
+use caudra_script::SandboxLimits;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -118,6 +120,20 @@ impl Default for EngineLimits {
             max_log_entries: DEFAULT_MAX_LOG_ENTRIES,
             max_log_bytes: DEFAULT_MAX_LOG_BYTES,
             wall_time: DEFAULT_WALL_TIME,
+        }
+    }
+}
+
+#[cfg(feature = "rhai")]
+impl From<&EngineLimits> for SandboxLimits {
+    fn from(limits: &EngineLimits) -> Self {
+        Self {
+            max_operations: limits.max_operations,
+            max_call_levels: limits.max_call_levels,
+            max_expr_depth: limits.max_expr_depth,
+            max_string_size: limits.max_string_size,
+            max_array_size: limits.max_array_size,
+            max_map_size: limits.max_map_size,
         }
     }
 }

@@ -97,6 +97,7 @@ decision_engine = true
 | `lua_plugins` | `false` | Every use of Lua: [plugins](/docs/plugins/), the [Lua API](/docs/lua-api/), global and project `init.lua`, and the `caudra-plugin-dev` skill. `--no-plugins` still turns Lua off for one run. |
 | `decision_engine` | `false` | The [decision engine](#decisions), [Auto mode](/docs/permissions/#auto-mode), `caudra decisions`, and workflow [`decide()` calls](/docs/workflows/#typed-decisions). |
 | `cross_session_messaging` | `false` | Local [cross-session messaging](/docs/messaging/): the `list_sessions`, `send_message`, `publish_message`, `read_topic`, and `work_assignment` tools, `/peers`, `/messages`, `/topics`, `/groups`, `caudra message`, live session inboxes, consumer groups, and the message history. Both processes must opt in. |
+| `automations` | `false` | [Automations](/docs/automations/): scripts that act on session events when their conditions hold, within the limits in [`[automations]`](#automations), and the `caudra-automation-dev` skill. Messaging triggers and actions also need `cross_session_messaging`, and workflow triggers and actions also need `workflows`. |
 
 Each switch is independent, so turning one on never turns on another. A missing file, table, or key leaves a switch off, and an unknown key is an error. `caudra remote` and `/remote` work when either `sandboxes` or `remote_workcell` is on, and each session checks the switch for its own source.
 
@@ -226,7 +227,7 @@ The `bash`, `python_execution`, and `task` entries apply only when `ui.scroll_ca
 | `read` | 3 | `file_read` |
 | `write` | 7 | `file_write`, `file_edit`, `file_apply_patch`, `image_generate`, `memory`, `plan` |
 | `web` | 3 | `webfetch`, `websearch` |
-| `other` | 3 | `batch`, `execution_environment`, `list_sessions`, `publish_message`, `question`, `read_topic`, `send_message`, `skill`, `todo_write`, `tool_output`, `view_image`, `work_assignment`, `workflow` |
+| `other` | 3 | `automation`, `batch`, `execution_environment`, `list_sessions`, `publish_message`, `question`, `read_topic`, `send_message`, `skill`, `todo_write`, `tool_output`, `view_image`, `work_assignment`, `workflow` |
 
 ### `agent`
 
@@ -570,6 +571,16 @@ With `agent.shell_execution = "auto"`, Enforce estimates can select synchronous 
 
 Only the permission question set currently supports a user-global file override: `~/.config/caudra/decisions/permission.json`. It must be a regular JSON file no larger than 64 KiB, retain all required question IDs as `noul`, and pass question validation. It is read when a base URL is set and permission advice or Auto screening is enabled. Projects cannot supply this override. Other feature question sets have no file override.
 
+### `[automations]`
+
+| Field | Type | Default | Min | Max | Description |
+|-------|------|---------|-----|-----|-------------|
+| `turns_per_hour` | u32 | `20` | 1 | 600 | Most turns automations may start in one session per rolling hour, shared by all of its automations |
+| `max_unattended_turns` | u32 | unset | 1 | 10000 | Stop automation-started turns after this many since the last human input. Human input resets the count, and unset means no cap |
+| `allow_private_network` | bool | `false` | - | - | Let `http()` in automations reach loopback and private network hosts. Without it, automations reach public hosts only |
+
+[Automations](/docs/automations/) are experimental and need `automations = true` under [`[experimental]`](#experimental-features). Only the global `caudra.toml` may hold this table. Caudra rejects a project `.caudra/caudra.toml` that contains it, even an empty one, so a repository cannot raise these limits or let automations reach a private network.
+
 ## Plugins
 
 The `plugins` table turns bundled features and plugins on or off and passes options to them. All bundled features are on by default. Set `enabled = false` to turn one off.
@@ -606,6 +617,7 @@ enabled = false
 |-------|------|---------|-------------|
 | `plugin_dev` | boolean | `false` | Offer the builtin caudra-plugin-dev skill for writing caudra plugins. Needs `experimental.lua_plugins`. |
 | `workflow_dev` | boolean | `true` | Offer the builtin caudra-workflow-dev skill for writing and running workflows. Needs `experimental.workflows`. |
+| `automation_dev` | boolean | `true` | Offer the builtin caudra-automation-dev skill for writing automations. Needs `experimental.automations`. |
 | `docs` | boolean | `true` | Offer the builtin caudra-docs skill: this build's user documentation, loaded one page or section at a time. |
 
 ### `plugins.task`
@@ -618,7 +630,7 @@ enabled = false
 
 ## Validation
 
-If a value is below its minimum, Caudra shows a `ConfigError` with the field name, value, and minimum.
+If a value is below its minimum or above its maximum, Caudra shows a `ConfigError` with the field name, the value, and the bound it crossed.
 
 ## Directory layout
 

@@ -168,6 +168,7 @@ mod peer_tests {
                 reply_target: self.reply_target.clone(),
                 reply_to,
                 external: false,
+                automation: None,
                 assignment: None,
             }
         }
@@ -512,9 +513,11 @@ mod peer_tests {
                         text: shown,
                         peer_event: Some(saved),
                         task_event,
+                        automation_event,
                     } => {
                         assert_eq!(saved, &origin);
                         assert!(task_event.is_none());
+                        assert!(automation_event.is_none());
                         assert_eq!(shown, text);
                         Some(index)
                     }

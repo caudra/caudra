@@ -124,6 +124,7 @@ impl BackgroundReminderContext<'_> {
                 text,
                 task_event: None,
                 peer_event: None,
+                automation_event: None,
             });
         }
     }

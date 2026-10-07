@@ -37,7 +37,8 @@ use caudra_agent::{
 use caudra_config::{ToolOutputLines, UiConfig};
 use caudra_lua::WinView;
 use caudra_providers::{
-    CaudraId, HistoryItem, HistoryItemKind, SteeringKind, SteeringOrigin, UserOrigin,
+    AutomationEventOrigin, CaudraId, HistoryItem, HistoryItemKind, SteeringKind, SteeringOrigin,
+    UserOrigin,
 };
 use caudra_storage::usage_ledger::LedgerPurpose;
 use caudra_storage::view::ViewMode;
@@ -406,8 +407,19 @@ impl Chat {
             }
             AgentEvent::Injected {
                 text,
+                automation_event: Some(origin),
+                peer_event: None,
+                ..
+            } => {
+                self.messages_panel.flush();
+                self.messages_panel
+                    .push(DisplayMessage::automation(text, origin));
+            }
+            AgentEvent::Injected {
+                text,
                 task_event: Some(origin),
                 peer_event: None,
+                ..
             } => {
                 self.messages_panel.flush();
                 self.messages_panel
@@ -417,6 +429,7 @@ impl Chat {
                 text,
                 task_event: None,
                 peer_event: None,
+                ..
             } => {
                 if self.show_reminders {
                     self.messages_panel.flush();
@@ -844,6 +857,11 @@ impl Chat {
         self.messages_panel.task_hit_at(row, area)
     }
 
+    /// The firing whose delivery a click at `row` landed on.
+    pub(crate) fn automation_hit_at(&self, row: u16, area: Rect) -> Option<AutomationEventOrigin> {
+        self.messages_panel.automation_hit_at(row, area)
+    }
+
     pub(crate) fn task_prompt(&self, call_id: &str) -> Option<String> {
         self.messages_panel.task_prompt(call_id)
     }
@@ -1036,6 +1054,15 @@ pub fn history_to_display(
             } => display.push(DisplayMessage::peer(
                 display_text.as_deref().unwrap_or(text),
                 (**origin).clone(),
+            )),
+            HistoryItemKind::User {
+                text,
+                display_text,
+                automation_event: Some(origin),
+                ..
+            } => display.push(DisplayMessage::automation(
+                display_text.clone().unwrap_or_else(|| text.clone()),
+                origin.clone(),
             )),
             // An injected item is its own row rather than a candidate for the
             // turn's bubble, so it must not consume the group: a reminder and
@@ -1556,6 +1583,12 @@ mod tests {
     const DELIVERY_PREVIEW: &str =
         "First useful line.\nResult truncated; tool_output calm-blue-wren";
     const DELIVERY_UNICODE: &str = "調査の結果は正常です。界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界";
+    const AUTOMATION_NAME: &str = "ci-watch";
+    const AUTOMATION_FIRE_ID: &str = "fire-quiet-otter";
+    const AUTOMATION_SEQ: u32 = 2;
+    const AUTOMATION_TEXT: &str = "The nightly build failed on main.";
+    const AUTOMATION_FRAMED: &str =
+        "<automation name=\"ci-watch\">The nightly build failed on main.</automation>";
 
     fn chat() -> Chat {
         Chat::new(
@@ -2674,6 +2707,7 @@ mod tests {
                     text: BACKGROUND_REMINDER.into(),
                     task_event: None,
                     peer_event: None,
+                    automation_event: None,
                 },
                 None,
             ),
@@ -2705,6 +2739,7 @@ mod tests {
             reply_target: REPLY_TARGET.into(),
             reply_to: None,
             external: false,
+            automation: None,
             assignment: None,
         };
         let mut live = chat();
@@ -2714,6 +2749,7 @@ mod tests {
                 text: body.clone(),
                 task_event: None,
                 peer_event: Some(origin.clone()),
+                automation_event: None,
             },
             None,
         );
@@ -2781,6 +2817,7 @@ mod tests {
                 text: text.clone(),
                 task_event: Some(origin.clone()),
                 peer_event: None,
+                automation_event: None,
             },
             None,
         );
@@ -2876,6 +2913,7 @@ mod tests {
                 text,
                 task_event: origin,
                 peer_event: None,
+                automation_event: None,
             },
             None,
         );
@@ -2896,6 +2934,83 @@ mod tests {
             chat.task_hit_at(row, area).as_deref(),
             typed.then_some(TASK_ID)
         );
+    }
+
+    #[test_case(40 ; "narrow")]
+    #[test_case(127 ; "wide")]
+    fn automation_delivery_live_and_reloaded_rows_agree_and_name_the_firing(width: u16) {
+        let origin = AutomationEventOrigin {
+            automation: AUTOMATION_NAME.into(),
+            fire_id: AUTOMATION_FIRE_ID.into(),
+            seq: AUTOMATION_SEQ,
+        };
+        let mut live = chat();
+        live.show_reminders = false;
+        live.handle_event(
+            AgentEvent::Injected {
+                text: AUTOMATION_TEXT.into(),
+                task_event: None,
+                peer_event: None,
+                automation_event: Some(origin.clone()),
+            },
+            None,
+        );
+        let area = Rect::new(0, 0, width, 40);
+        let mut terminal = Terminal::new(TestBackend::new(width, area.height)).unwrap();
+        terminal
+            .draw(|frame| live.view(frame, area, false, false))
+            .unwrap();
+        let before = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..area.height)
+            .map(|row| {
+                (0..width)
+                    .map(|column| before[(column, row)].symbol())
+                    .collect()
+            })
+            .collect();
+        let shown = rows.concat();
+        assert_eq!(shown.matches(AUTOMATION_NAME).count(), 1, "{shown}");
+        assert!(!shown.contains(AUTOMATION_FIRE_ID), "{shown}");
+        let heading = rows
+            .iter()
+            .position(|line| line.contains(AUTOMATION_NAME))
+            .unwrap() as u16;
+        let last_word = AUTOMATION_TEXT.rsplit(' ').next().unwrap();
+        let body = rows
+            .iter()
+            .rposition(|line| line.contains(last_word))
+            .unwrap() as u16;
+        assert!(body > heading, "{shown}");
+        for row in [heading, body] {
+            assert_eq!(live.automation_hit_at(row, area), Some(origin.clone()));
+        }
+        assert_eq!(live.task_hit_at(heading, area), None);
+
+        let message = Message {
+            display_text: Some(AUTOMATION_TEXT.into()),
+            ..Message::automation_observation(AUTOMATION_FRAMED.into(), origin.clone())
+        };
+        let encoded = serde_json::to_value(message).unwrap();
+        let restored: Message = serde_json::from_value(encoded).unwrap();
+        let history = crate::history_items(&[restored]);
+        let (display, _) = history_to_display(
+            &history,
+            &empty_outputs(),
+            &ToolOutputLines::default(),
+            false,
+        );
+        assert_eq!(display.len(), 1);
+        assert_eq!(
+            display[0].role,
+            DisplayRole::AutomationDelivery(Box::new(origin.clone()))
+        );
+        assert_eq!(display[0].text, AUTOMATION_TEXT);
+        live.load_messages(display);
+        terminal
+            .draw(|frame| live.view(frame, area, false, false))
+            .unwrap();
+        assert_eq!(terminal.backend().buffer(), &before);
+        assert_eq!(live.automation_hit_at(heading, area), Some(origin));
     }
 
     /// The exact shape of a fresh session: the environment and the mode are
@@ -3292,6 +3407,7 @@ mod tests {
                 text: INJECTED_TEXT.into(),
                 task_event: None,
                 peer_event: None,
+                automation_event: None,
             },
             None,
         );

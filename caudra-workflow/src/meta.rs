@@ -132,29 +132,19 @@ fn require_within(field: &'static str, value: &str, max: usize) -> Result<(), Me
 /// `let meta = <literal>` built only from string, array, and map literals.
 #[cfg(feature = "rhai")]
 pub fn parse_meta(source: &str) -> Result<WorkflowMeta, MetaError> {
-    use rhai::{ASTFlags, Expr, OptimizationLevel, Stmt};
-    use serde_json::Value;
+    use caudra_script::{HeaderError, SandboxLimits, ScalarKind, parse_header};
 
-    use crate::engine::restricted_engine;
     use crate::run::EngineLimits;
 
-    fn literal_to_json(expr: &Expr) -> Result<Value, MetaError> {
-        match expr {
-            Expr::StringConstant(text, _) => Ok(Value::String(text.to_string())),
-            Expr::Array(items, _) => items
-                .iter()
-                .map(literal_to_json)
-                .collect::<Result<Vec<Value>, MetaError>>()
-                .map(Value::Array),
-            Expr::Map(map, _) => map
-                .0
-                .iter()
-                .map(|(key, value)| Ok((key.name.to_string(), literal_to_json(value)?)))
-                .collect::<Result<serde_json::Map<String, Value>, MetaError>>()
-                .map(Value::Object),
-            other => Err(MetaError::NonLiteral {
-                position: other.position().to_string(),
-            }),
+    fn meta_error(error: HeaderError) -> MetaError {
+        match error {
+            HeaderError::Parse(error) => MetaError::Parse(error.to_string()),
+            HeaderError::NotFirst => MetaError::MetaNotFirst,
+            HeaderError::NonLiteral { position } | HeaderError::NonFinite { position } => {
+                MetaError::NonLiteral {
+                    position: position.to_string(),
+                }
+            }
         }
     }
 
@@ -164,19 +154,13 @@ pub fn parse_meta(source: &str) -> Result<WorkflowMeta, MetaError> {
             max: MAX_SOURCE_BYTES,
         });
     }
-    let mut engine = restricted_engine(&EngineLimits::default());
-    engine.set_optimization_level(OptimizationLevel::None);
-    let ast = engine
-        .compile(source)
-        .map_err(|error| MetaError::Parse(error.to_string()))?;
-    let literal = match ast.statements().first() {
-        Some(Stmt::Var(var, flags, _))
-            if !flags.contains(ASTFlags::CONSTANT) && var.0.name.as_str() == META_VARIABLE =>
-        {
-            literal_to_json(&var.1)?
-        }
-        _ => return Err(MetaError::MetaNotFirst),
-    };
+    let literal = parse_header(
+        source,
+        &SandboxLimits::from(&EngineLimits::default()),
+        META_VARIABLE,
+        &[ScalarKind::String],
+    )
+    .map_err(meta_error)?;
     let meta: WorkflowMeta = serde_json::from_value(literal)
         .map_err(|error| MetaError::InvalidShape(error.to_string()))?;
     meta.validate()?;

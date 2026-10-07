@@ -263,6 +263,21 @@ Some pickers add extra bindings on top of the defaults:
 | Workflow Inspector | `y` | Copy the visible section |
 | Workflow Inspector | `/` | Filter the run list |
 | Workflow Catalog | `Enter` | Launch a trusted workflow, or trust an untrusted one |
+| Automation Inspector | `Enter` | Open the row under the cursor: a firing's trace, an action's request and result, or a JSON node |
+| Automation Inspector | `Space` | Arm or disarm the selected automation |
+| Automation Inspector | `e` | Edit the selected automation's state or args |
+| Automation Inspector | `Ctrl+S` | Save the state or args being edited |
+| Automation Inspector | `t` | Trust the selected project script at the digest shown |
+| Automation Inspector | `p` | Pause or resume every automation in the session |
+| Automation Inspector | `c` | Clear the selected automation's state, after confirming |
+| Automation Inspector | `x` | Drop the waiting firing or outbox item under the cursor |
+| Automation Inspector | `r` | Dry-run the finished firing under the cursor against the script as it is now |
+| Automation Inspector | `o` | Open the script, at the failing line for a failed firing |
+| Automation Inspector | `y` | Copy the firing under the cursor as markdown |
+| Automation Inspector | `/` | Filter the list by name, description, or a session's title or @name |
+| Automation Inspector | `Tab` / `Shift+Tab` | Next or previous section |
+| Automation Inspector | `1-4` | Jump to a section |
+| Automation Inspector | `Left` / `Right` | Focus the list or the section |
 | Decisions | `Tab` / `Shift+Tab` | Next or previous section |
 | Decisions | `1-4` | Jump to a section |
 | Decisions | `Left` / `Right` | Focus the list or the detail |
@@ -317,6 +332,7 @@ Some of these contexts belong to an [experimental feature](/docs/configuration/#
 - Peer Manager: `cross_session_messaging`
 - Workflow Inspector: `workflows`
 - Workflow Catalog: `workflows`
+- Automation Inspector: `automations`
 - Decisions: `decision_engine`
 - Workbench Transfer: `sandboxes`
 
@@ -324,7 +340,7 @@ Some of these contexts belong to an [experimental feature](/docs/configuration/#
 
 Child contexts inherit their parent's bindings and add their own.
 
-- **Pickers** is the base for: Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker, Stash Picker, Session Picker, Session Relocation, Worktree Picker, Peer Manager, Workflow Inspector, Workflow Catalog, Decisions
+- **Pickers** is the base for: Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker, Stash Picker, Session Picker, Session Relocation, Worktree Picker, Peer Manager, Workflow Inspector, Workflow Catalog, Automation Inspector, Decisions
 - **Workbench** is the base for: Workbench Explorer, Workbench Editor, Workbench Source Control, Workbench Search, Workbench Transfer
 
 ## Overriding Keybindings

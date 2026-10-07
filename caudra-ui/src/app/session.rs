@@ -16,11 +16,11 @@ use crate::components::{
 };
 use crate::input_document::InputDraft;
 use crate::repaint::{Dirty, Watch};
+use caudra_agent::GoalHandle;
 use caudra_agent::HistorySnapshot;
 use caudra_agent::agent::estimate_message_tokens;
 use caudra_agent::peers::PeerSession;
 use caudra_agent::permissions::PermissionManager;
-use caudra_agent::{GoalHandle, GoalStatus};
 use caudra_config::Feature;
 use caudra_providers::{
     HistoryItem, HistoryItemKind, HistoryProjectionError, ImageSource, Model, TokenUsage,
@@ -29,9 +29,9 @@ use caudra_providers::{
 use caudra_storage::id::CaudraId;
 use caudra_storage::sessions::{
     PendingConversationRevert, SessionDatabase, SessionLease, SessionLocation, SessionMeta,
-    StoredActiveGoal, StoredGoalResult, StoredImage, StoredMode, StoredPasteRange,
-    StoredPlanTarget, StoredPromptAdmission, StoredQueuedDraft, StoredQueuedPrompt, StoredSubagent,
-    StoredSubagentOutcome, StoredSubagentTaskSpec,
+    StoredImage, StoredMode, StoredPasteRange, StoredPlanTarget, StoredPromptAdmission,
+    StoredQueuedDraft, StoredQueuedPrompt, StoredSubagent, StoredSubagentOutcome,
+    StoredSubagentTaskSpec,
 };
 use caudra_storage::tool_outputs::{ToolOutputId, ToolOutputRef, ToolOutputStore};
 use caudra_storage::worktrees::{self, CheckoutSessions};
@@ -58,12 +58,6 @@ struct PreparedSessionReset {
     lease: Arc<SessionLease>,
     permissions: Arc<PermissionManager>,
     conversation_permissions: ConversationPermissions,
-}
-
-/// Saturates rather than wraps: a goal left open for longer than `u64`
-/// milliseconds is not a number worth panicking over.
-fn as_millis(duration: Duration) -> u64 {
-    duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 fn plan_target(plan: &PlanState) -> Option<StoredPlanTarget> {
@@ -195,6 +189,12 @@ pub(crate) fn session_has_content(session: &AppSession) -> bool {
                 || controls.broadcasts
                 || !controls.groups.is_empty()
         })
+        // An armed schedule fires in a session nobody has typed in yet.
+        || session
+            .meta
+            .automations
+            .as_ref()
+            .is_some_and(|controls| !controls.armed.is_empty())
 }
 
 impl App {
@@ -430,6 +430,7 @@ impl App {
         } else {
             self.recoverable_queue.clone()
         };
+        let goal = state.goal.stored();
         let mut meta = SessionMeta {
             system_prompt_profile: if state.system_prompt_profile_override {
                 state.session.meta.system_prompt_profile.clone()
@@ -531,34 +532,18 @@ impl App {
                 .collect(),
             thinking: Some(state.thinking.clone().into()),
             fast: state.fast,
-            active_goal: state.goal.snapshot().map(|goal| {
-                Box::new(StoredActiveGoal {
-                    condition: goal.condition.to_string(),
-                    evaluations: goal.evaluations,
-                    elapsed_ms: as_millis(goal.elapsed()),
-                    usage: goal.usage.spent(goal.cost, goal.subscription_cost),
-                    last_verdict: goal.last_verdict.map(Into::into),
-                    last_reason: goal.last_reason.map(|reason| reason.to_string()),
-                })
-            }),
-            goal_result: match state.goal.status() {
-                Some(GoalStatus::Finished(goal)) => Some(Box::new(StoredGoalResult {
-                    condition: goal.condition.to_string(),
-                    verdict: goal.verdict.into(),
-                    reason: goal.reason.to_string(),
-                    evaluations: goal.evaluations,
-                    duration_ms: as_millis(goal.duration),
-                    usage: goal.usage.spent(goal.cost, goal.subscription_cost),
-                })),
-                Some(GoalStatus::Active(_)) | None => None,
-            },
-            goal_continuation_limit: Some(state.goal.continuation_limit()),
+            active_goal: goal.active,
+            goal_result: goal.result,
+            goal_continuation_limit: goal.continuation_limit,
             automatic_wakes_suppressed: self.automatic_wakes_suppressed
                 || peer.as_ref().is_some_and(PeerSession::wakes_suppressed),
             permission_mode: self.permissions.persisted_mode(),
             peer_controls: peer
                 .map(|peer| peer.controls())
                 .or_else(|| state.session.meta.peer_controls.clone()),
+            automations: self
+                .stored_automation_controls()
+                .or_else(|| state.session.meta.automations.clone()),
             unrecorded: state.session.meta.unrecorded.clone(),
             record_coverage: state.session.meta.record_coverage.clone(),
         };

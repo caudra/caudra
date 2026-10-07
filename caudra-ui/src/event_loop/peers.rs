@@ -1,20 +1,23 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::time::Instant;
 
+use caudra_agent::automation::handle::AutomationHandle;
 use caudra_agent::peers::{
     AssignedWork, ChannelPage, ChannelSummary, HistoryVersion, MAX_HISTORY_PAGE, ManagedWork,
     PeerDecision, PeerDecisionResult, PeerDescriptor, PeerReviewToken, PeerSession, PeerSummary,
-    PolicyHold, SkippedWork, WorkAction, WorkGroup, literal,
+    PolicyHold, SkippedWork, WorkAction, WorkGroup, handle_address, literal,
 };
+use caudra_automation::event::StartedBy;
 use caudra_config::{Feature, InboundPolicy};
 use flume::{Receiver, TryRecvError};
 use smol::Task;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use super::{EventLoop, SessionRuntime, SessionStatus, SpawnCtx};
 use crate::AppSession;
 use crate::app::App;
+use crate::components::automation_inspector::REREAD_EVERY;
 use crate::components::peer_manager::{
     HISTORY_POLL, PageRequest, PeerManager, PeerView, SubscriptionChange,
 };
@@ -62,6 +65,8 @@ pub(super) struct PeerRegistration {
     held_count: usize,
     discovery: Option<Load<u64, Vec<PeerSummary>>>,
     history: HistoryLoads,
+    work_facts: WorkFacts,
+    online: OnlineSessions,
     catch_up: Option<Task<()>>,
     group_command: Option<Load<(), String>>,
 }
@@ -98,6 +103,34 @@ struct HistoryLoads {
     page: Option<Load<(u64, PageRequest), ChannelPage>>,
 }
 
+/// A version poll's answer: the version and the work the history then had, or nothing when the
+/// version has not moved since the last answer.
+type WorkPoll = Option<(HistoryVersion, Vec<AssignedWork>)>;
+
+/// The work the history says this session holds or paused, for its automations.
+#[derive(Default)]
+struct WorkFacts {
+    load: Option<Load<(), WorkPoll>>,
+    polled: Option<Instant>,
+    version: Option<HistoryVersion>,
+}
+
+impl WorkFacts {
+    /// Asks again at once, dropping a load that may have read the history before a report.
+    fn restart(&mut self) {
+        self.load = None;
+        self.polled = None;
+    }
+}
+
+/// The sessions the live directory lists, by id, read for the automation inspector's online
+/// marks while it is open.
+#[derive(Default)]
+struct OnlineSessions {
+    load: Option<Load<(), HashSet<String>>>,
+    polled: Option<Instant>,
+}
+
 impl PeerRegistration {
     fn new(session: PeerSession) -> Self {
         let mut registration = Self {
@@ -106,6 +139,8 @@ impl PeerRegistration {
             held_count: 0,
             discovery: None,
             history: HistoryLoads::default(),
+            work_facts: WorkFacts::default(),
+            online: OnlineSessions::default(),
             catch_up: None,
             group_command: None,
         };
@@ -224,6 +259,40 @@ impl PeerRegistration {
         );
         dirty
     }
+
+    /// Hands an open automation inspector the sessions the live directory lists, read again
+    /// every `REREAD_EVERY` while it stays open, and at once when it opens again.
+    fn sync_online(&mut self, app: &mut App) {
+        let online = &mut self.online;
+        if !app.automation_inspector_open() {
+            *online = OnlineSessions::default();
+            return;
+        }
+        match poll_load(&mut online.load, Some(&())) {
+            Some((_, Ok(sessions))) => app.set_automation_online(sessions),
+            Some((_, Err(error))) => {
+                debug!(session = %self.session.session_id(), %error, "live peer directory not read");
+            }
+            None => {}
+        }
+        let now = Instant::now();
+        if online.load.is_some()
+            || online
+                .polled
+                .is_some_and(|at| now.saturating_duration_since(at) < REREAD_EVERY)
+        {
+            return;
+        }
+        online.polled = Some(now);
+        let session = self.session.clone();
+        online.load = Some(Load::start((), async move {
+            let peers = session.list().await?;
+            Ok(peers
+                .into_iter()
+                .map(|peer| peer.session_id.to_string())
+                .collect())
+        }));
+    }
 }
 
 /// The answer to `wanted`, once it has come. A load that asked anything else
@@ -329,11 +398,72 @@ impl SessionRuntime {
     }
 
     pub(super) fn display_status(&self) -> SessionStatus {
-        if self.peer.as_ref().is_some_and(|peer| peer.held_count > 0) {
+        if self.holds_peer_messages() {
             SessionStatus::NeedsInput
         } else {
             SessionStatus::of(&self.app)
         }
+    }
+
+    /// Held peer messages wait on a person to approve or reject them.
+    pub(super) fn holds_peer_messages(&self) -> bool {
+        self.peer.as_ref().is_some_and(|peer| peer.held_count > 0)
+    }
+
+    /// Peer messages or offered group work wait to be claimed; held messages do not.
+    pub(super) fn peer_work_pending(&self) -> bool {
+        self.peer
+            .as_ref()
+            .is_some_and(|peer| peer.session.has_pending())
+    }
+
+    /// The session's `@name`, absent while messaging is off.
+    pub(super) fn messaging_name(&self) -> Option<String> {
+        self.peer
+            .as_ref()
+            .and_then(|peer| peer.session.handle())
+            .map(|handle| handle_address(&handle))
+    }
+
+    /// Hands the automations the consumer groups the registration has now, the paused work
+    /// once the history changed, and the sessions the live directory lists to an open
+    /// inspector; none of these while messaging is off. Version polls go out every
+    /// `HISTORY_POLL`, off the loop.
+    pub(super) fn sync_peer_facts(&mut self) {
+        let Some(peer) = &mut self.peer else {
+            self.app.clear_automation_peer_facts();
+            return;
+        };
+        self.app.set_automation_groups(peer.session.groups());
+        peer.sync_online(&mut self.app);
+        let facts = &mut peer.work_facts;
+        match poll_load(&mut facts.load, Some(&())) {
+            Some((_, Ok(Some((version, work))))) => {
+                facts.version = Some(version);
+                self.app.set_automation_paused_work(&work);
+            }
+            Some((_, Err(error))) => {
+                debug!(session = %peer.session.session_id(), %error, "group work facts not loaded");
+            }
+            Some((_, Ok(None))) | None => {}
+        }
+        let now = Instant::now();
+        if facts.load.is_some()
+            || facts
+                .polled
+                .is_some_and(|at| now.saturating_duration_since(at) < HISTORY_POLL)
+        {
+            return;
+        }
+        facts.polled = Some(now);
+        let (session, seen) = (peer.session.clone(), facts.version.clone());
+        facts.load = Some(Load::start((), async move {
+            let version = session.history_version().await?;
+            if seen.as_ref() == Some(&version) {
+                return Ok(None);
+            }
+            Ok(Some((version, session.owned_work().await?)))
+        }));
     }
 
     fn peer_blocked(&self) -> bool {
@@ -372,6 +502,10 @@ impl SessionRuntime {
                 if let Err(error) = session.claim_handle() {
                     self.peer_notice(error);
                 }
+                if let Some(automations) = AutomationHandle::lookup(self.id()) {
+                    automations.attach_messaging(Some(session.clone()));
+                    session.set_observer(Some(automations.message_observer()));
+                }
                 self.peer = Some(PeerRegistration::new(session));
             }
             Err(error) => self.app.flash(format!("{UNAVAILABLE}: {error}")),
@@ -398,7 +532,12 @@ impl SessionRuntime {
             );
             self.app.checkpoint_now();
         }
-        self.peer.take();
+        if let Some(peer) = self.peer.take() {
+            peer.session.set_observer(None);
+            if let Some(automations) = AutomationHandle::lookup(peer.session.session_id()) {
+                automations.attach_messaging(None);
+            }
+        }
         self.app.peer_manager.close();
     }
 
@@ -447,11 +586,7 @@ impl SessionRuntime {
     }
 
     fn peer_wake_ready(&self) -> bool {
-        self.peer_idle()
-            && self
-                .peer
-                .as_ref()
-                .is_some_and(|peer| peer.session.has_pending())
+        self.peer_idle() && self.peer_work_pending()
     }
 
     /// Whether a peer message or consumer-group work may start a turn here.
@@ -533,7 +668,9 @@ impl EventLoop<'_> {
                 continue;
             }
             // Admission owns the claim; a failed start must leave the inbox untouched.
-            let actions = self.sessions[index].app.start_mailbox_run(Vec::new());
+            let actions = self.sessions[index]
+                .app
+                .start_mailbox_run(Vec::new(), StartedBy::Mailbox);
             if actions.is_empty() {
                 self.sessions[index].app.suppress_background_wakes();
             }
@@ -547,6 +684,8 @@ impl EventLoop<'_> {
     /// `/groups` commands, stops a turn whose item another member may now
     /// take, and lets an idle session look for more work. A session that
     /// cannot start a turn returns the item it was offered to the queue.
+    /// The outcomes reach its automations before the tick's settle, so a
+    /// run's outcomes land in the `idle` of its own busy period.
     pub(super) fn sync_peer_work(&mut self) -> Dirty {
         let paused = self.peer_runs_paused();
         let mut dirty = Dirty::NO;
@@ -563,6 +702,11 @@ impl EventLoop<'_> {
             }
             let answer = poll_load(&mut peer.group_command, Some(&()));
             let notices = peer.session.take_work_notices();
+            let reports = peer.session.take_work_reports();
+            if !reports.is_empty() {
+                peer.work_facts.restart();
+                runtime.app.automation_work_reported(reports);
+            }
             if let Some((_, result)) = answer {
                 match result {
                     Ok(text) => runtime.peer_notice(text),

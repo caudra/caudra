@@ -377,8 +377,8 @@ fn manage_work(
                 .transpose()?;
             let filter = WorkFilter {
                 group,
-                owner: None,
                 states: states.into_iter().map(WorkState::from).collect(),
+                ..WorkFilter::default()
             };
             let items = log.work(&filter, before, limit as usize)?;
             if items.is_empty() && !json {
@@ -1017,6 +1017,7 @@ mod tests {
                     mode: "build".into(),
                     permission: "ask".into(),
                     external,
+                    automation: None,
                 },
                 text: text.into(),
                 reply_to: None,

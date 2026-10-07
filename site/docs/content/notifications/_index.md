@@ -20,12 +20,15 @@ Caudra uses these messages:
 - `Authentication required` when authentication needs attention.
 - `Question requested` for a question prompt.
 - `Plan ready` when a plan is ready.
+- `automation <name>: <text>` when an [automation](/docs/automations/#actions)
+  calls `notify()`, with the text cut to 200 characters. The status bar flashes
+  it too.
 
-Response previews can appear in your operating system's notification history.
-Caudra does not include tool arguments, permission scopes, question bodies, plan
-content, or error details. Use `bell` for a message-free alert, or use `off`
-to disable notifications if response text should not reach notification
-history.
+Response previews and automation notices can appear in your operating system's
+notification history. Caudra does not include tool arguments, permission scopes,
+question bodies, plan content, or error details. Use `bell` for a message-free
+alert, or use `off` to disable notifications if that text should not reach
+notification history.
 
 ## Configuration
 

@@ -505,6 +505,11 @@ impl App {
         render_if_open!(self.shell_modal);
         render_if_open!(self.workflow_inspector);
         render_if_open!(self.workflow_catalog_picker);
+        if self.automation_inspector.is_open() {
+            overlay_rect = self
+                .automation_inspector
+                .view(frame, full, self.workflow.runs());
+        }
         render_if_open!(self.session_picker);
         render_if_open!(self.session_relocation_picker);
         render_if_open!(self.worktree_picker);

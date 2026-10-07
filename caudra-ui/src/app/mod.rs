@@ -4,6 +4,7 @@
 //! places, one per transition: `start_run`, `handle_cancel`, and
 //! `AgentHandles::respawn`. Everything else only reads it.
 
+pub(crate) mod automation;
 pub(crate) mod background_delivery;
 mod btw;
 mod decisions;
@@ -52,6 +53,7 @@ use crate::app::workbench::StoredDocument;
 use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT, format_with_images};
 use crate::clipboard::{ClipboardState, CopyResult};
+use crate::components::automation_inspector::{AutomationAction, AutomationInspector};
 use crate::components::command::{CommandAction, CommandPalette, ParsedCommand, disabled_feature};
 use crate::components::command_modal::{CommandModal, CommandModalAction};
 use crate::components::commit_popup::{CommitAction, CommitIndex, CommitPopup};
@@ -141,6 +143,7 @@ use caudra_agent::{
     ImageSource, McpConfigErrors, McpPromptInfo, McpSnapshotReader, Mention, PromptAdmission,
     QueueItemId, SharedHistory, SteeringQueue, SubagentInfo, ToolOutput, project_for_inspection,
 };
+use caudra_automation::event::{StartedBy, TurnOutcome};
 use caudra_config::{
     Feature, FeatureDisabled, FeatureFlags, ModelPolicy, PermissionsConfig, SnapshotsConfig,
     UiConfig,
@@ -233,6 +236,7 @@ const PERMISSION_BLOCKER: &str = "Permission requested";
 const AUTH_BLOCKER: &str = "Authentication required";
 const PLAN_BLOCKER: &str = "Plan ready";
 const QUESTION_BLOCKER: &str = "Question requested";
+const AUTOMATION_NOTICE_PREFIX: &str = "automation";
 /// Never valid JSON, so the tool reads it as the dismissal it is.
 const QUESTION_DISMISSED: &str = "dismissed";
 const LOGIN_BLOCKER: &str = "Provider login required";
@@ -259,17 +263,29 @@ pub(crate) const MAIN_ONLY_CMD_MSG: &str = "Command applies to the main session"
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Notification {
-    TurnComplete { response: Option<String> },
-    PermissionRequested { tool: Option<String> },
+    TurnComplete {
+        response: Option<String>,
+    },
+    PermissionRequested {
+        tool: Option<String>,
+    },
     AuthenticationRequired,
     QuestionRequested,
     PlanReady,
+    /// What an automation's `notify()` asked to show.
+    AutomationNotice {
+        automation: String,
+        text: String,
+    },
 }
 
 impl Notification {
-    /// Prompts blocking the agent outrank turn completions.
+    /// Prompts blocking the agent outrank turn completions and automation notices.
     pub(crate) fn is_urgent(&self) -> bool {
-        !matches!(self, Self::TurnComplete { .. })
+        !matches!(
+            self,
+            Self::TurnComplete { .. } | Self::AutomationNotice { .. }
+        )
     }
 
     pub(crate) fn message(&self) -> String {
@@ -284,12 +300,23 @@ impl Notification {
             Self::AuthenticationRequired => AUTH_BLOCKER.into(),
             Self::QuestionRequested => QUESTION_BLOCKER.into(),
             Self::PlanReady => PLAN_BLOCKER.into(),
+            Self::AutomationNotice { automation, text } => {
+                format!("{AUTOMATION_NOTICE_PREFIX} {automation}: {text}")
+            }
         }
     }
 
     pub(crate) fn error_completion() -> Self {
         Self::TurnComplete {
             response: Some("Agent stopped with an error".into()),
+        }
+    }
+
+    /// Cut like a response preview, since both can land in the system's notification history.
+    pub(crate) fn automation_notice(automation: &str, text: &str) -> Self {
+        Self::AutomationNotice {
+            automation: automation.to_owned(),
+            text: normalize_preview(text).unwrap_or_default(),
         }
     }
 }
@@ -466,6 +493,8 @@ pub struct App {
     pub(super) workflow_return: Option<String>,
     pub(super) workflow_catalog_picker: WorkflowCatalogPicker,
     pub(crate) workflow: workflow::WorkflowUi,
+    pub(crate) automation: automation::AutomationLink,
+    pub(super) automation_inspector: AutomationInspector,
     pub(super) question_form: QuestionForm,
     pub(super) session_picker: SessionPicker,
     pub(super) session_relocation_picker: SessionRelocationPicker,
@@ -741,6 +770,8 @@ impl App {
             workflow_return: None,
             workflow_catalog_picker: WorkflowCatalogPicker::new(),
             workflow: workflow::WorkflowUi::new(),
+            automation: automation::AutomationLink::default(),
+            automation_inspector: AutomationInspector::new(),
             question_form: QuestionForm::new(),
             session_picker: SessionPicker::new(),
             session_relocation_picker: SessionRelocationPicker::new(),
@@ -1675,6 +1706,7 @@ impl App {
             // path, and the run only moves again when the user says so.
             QuestionFormAction::Cancel => {
                 self.question_form.close();
+                self.pause_automations();
                 return match self.question_subagent.take() {
                     Some(task_id) => self.cancel_subagent(task_id),
                     None => self.handle_cancel(),
@@ -1835,6 +1867,11 @@ impl App {
             return None;
         }
         try_picker!(self.workflow_catalog_picker);
+        if self.automation_inspector.is_open() {
+            let action = self.automation_inspector.scroll_at(pos, delta);
+            self.handle_automation_action(action);
+            return None;
+        }
         // Not `try_picker!`: scrolling the task list previews the task behind
         // the float, and only the app can carry that out.
         if self.task_picker.is_open() {
@@ -1904,6 +1941,7 @@ impl App {
             }
             return Some(if !self.is_main_chat() || self.input_box.is_empty() {
                 if self.status == Status::Streaming {
+                    self.pause_automations();
                     return Some(self.handle_cancel());
                 }
                 self.quit()
@@ -2408,6 +2446,19 @@ impl App {
             guard_repeat!(false);
             let action = self.workflow_catalog_picker.handle_key(key);
             return Some(self.handle_workflow_catalog_action(action));
+        }
+        if self.automation_inspector.is_open() {
+            guard_repeat!(self.automation_inspector.text_input_active());
+            // The editor hands back only the chord it must not swallow, so
+            // `Ctrl+C` with nothing selected still reaches the app.
+            match self
+                .automation_inspector
+                .handle_key(key, self.workflow.runs())
+            {
+                AutomationAction::Passthrough => return None,
+                action => self.handle_automation_action(action),
+            }
+            return Some(vec![]);
         }
 
         // Last of the overlays. The workbench is a full-screen view, not a
@@ -3815,6 +3866,7 @@ impl App {
                             && t.elapsed() < CONFIRMATION_DURATION
                         {
                             if streaming || self.has_session_work() {
+                                self.pause_automations();
                                 self.handle_cancel()
                             } else {
                                 self.open_rewind_picker()
@@ -4394,6 +4446,7 @@ impl App {
                 if cancelled_error {
                     self.queue.resume();
                 }
+                self.automation_run_ended(TurnOutcome::Cancelled, None);
             }
             // A snapshot dropped here degrades the tool body to llm_output.
             if let AgentEvent::ToolSnapshot { id, .. }
@@ -4415,6 +4468,23 @@ impl App {
                 &envelope.event,
                 AgentEvent::Done { .. } | AgentEvent::Error { .. }
             );
+        let automation_run_end = (run_ended && envelope.task.is_none() && self.has_automations())
+            .then(|| automation::run_end(&envelope.event))
+            .flatten();
+        if envelope.subagent.is_none()
+            && let AgentEvent::Injected {
+                automation_event,
+                peer_event,
+                ..
+            } = &envelope.event
+        {
+            if let Some(origin) = automation_event {
+                self.automation_injected(origin);
+            }
+            if let Some(origin) = peer_event {
+                self.automation_peer_injected(origin);
+            }
+        }
 
         if envelope.subagent.is_none()
             && matches!(
@@ -4580,6 +4650,9 @@ impl App {
             self.state.token_usage += tc.usage;
             self.add_session_spend(tc.cost, tc.billing);
             add_chat_spend(&mut self.chats[chat_idx], tc.cost, tc.billing);
+            if main_agent && matches!(tc.purpose, LedgerPurpose::Chat) {
+                self.automation_turn_complete(&tc.message);
+            }
             if subagent_id.is_some() {
                 self.state
                     .goal
@@ -4676,6 +4749,7 @@ impl App {
                 return vec![];
             }
             AgentEvent::GoalFinished { result } => {
+                self.automation_goal_finished(&result);
                 let (role, label) = match result.verdict {
                     GoalVerdict::Met => (DisplayRole::Done, "Goal achieved"),
                     GoalVerdict::Impossible | GoalVerdict::NotMet => {
@@ -4744,6 +4818,7 @@ impl App {
                 return vec![];
             }
             AgentEvent::GoalClearedAfterError { condition, message } => {
+                self.automation_goal_cleared(&condition, &message);
                 self.main_chat().push(DisplayMessage::new(
                     DisplayRole::Error,
                     format!("Goal cleared after an unrecoverable error: {condition} ({message})"),
@@ -4945,6 +5020,9 @@ impl App {
         }
         if run_ended {
             self.refresh_record_index();
+        }
+        if let Some((outcome, error)) = automation_run_end {
+            self.automation_run_ended(outcome, error);
         }
         vec![]
     }
@@ -5184,6 +5262,7 @@ impl App {
             "/root-cause" => {
                 self.execute_builtin_workflow(workflow::ROOT_CAUSE_WORKFLOW, &cmd.args)
             }
+            "/automations" => self.execute_automations(&cmd.args),
             "/sessions" => self.sessions_browse(),
             "/move-session" | "/migrate-sessions" => {
                 let destination = cmd.args.trim();
@@ -5601,7 +5680,7 @@ impl App {
         }
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 44] {
+    fn overlays(&self) -> [&dyn Overlay; 45] {
         [
             &self.workbench,
             &self.logs_modal,
@@ -5642,6 +5721,7 @@ impl App {
             &self.peer_manager,
             &self.workflow_inspector,
             &self.workflow_catalog_picker,
+            &self.automation_inspector,
             &self.question_form,
             &self.session_picker,
             &self.session_relocation_picker,
@@ -5650,7 +5730,7 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 44] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 45] {
         [
             &mut self.workbench,
             &mut self.logs_modal,
@@ -5691,6 +5771,7 @@ impl App {
             &mut self.peer_manager,
             &mut self.workflow_inspector,
             &mut self.workflow_catalog_picker,
+            &mut self.automation_inspector,
             &mut self.question_form,
             &mut self.session_picker,
             &mut self.session_relocation_picker,
@@ -5854,6 +5935,7 @@ impl App {
             | self.commit_popup.tick()
             | self.refresh_session_picker()
             | self.poll_workflow_replies()
+            | self.poll_automations()
             | self.poll_task_controls()
             | self.poll_task_history()
             | self.poll_shells()
@@ -6233,6 +6315,7 @@ impl App {
             Cadence::when(self.autoscroll.is_some(), Cadence::SMOOTH),
             Cadence::any(self.chats.iter().map(Chat::cadence)),
             self.which_key.cadence(),
+            self.automation_cadence(),
             // The `#` popup is not an overlay, so its spinner has to be asked
             // for here rather than through `overlays`.
             self.commit_popup.cadence(),
@@ -6366,6 +6449,10 @@ impl App {
             return;
         }
         try_picker!(self.workflow_catalog_picker);
+        if let Some(action) = self.automation_inspector.handle_paste(text) {
+            self.handle_automation_action(action);
+            return;
+        }
         try_picker!(self.session_picker);
         try_picker!(self.session_relocation_picker);
         try_picker!(self.worktree_picker);
@@ -6520,7 +6607,7 @@ impl App {
     /// replaced, so the input takes its plan from the session that runs it.
     pub(crate) fn finish_plan_handoff(&mut self, mut handoff: PlanHandoff) -> Vec<Action> {
         handoff.input.plan = self.state.plan.target();
-        let actions = self.start_admitted_run(handoff.input, String::new());
+        let actions = self.start_admitted_run(handoff.input, String::new(), StartedBy::User);
         self.leave_plan();
         self.main_chat()
             .push(DisplayMessage::plan(handoff.content, handoff.source));

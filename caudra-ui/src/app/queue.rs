@@ -5,6 +5,7 @@ use std::ops::Range;
 
 use caudra_agent::{AgentInput, AgentMode};
 use caudra_agent::{PromptAdmission, QueueDelivery, QueueItemId, is_run_failure_marker};
+use caudra_automation::event::StartedBy;
 use caudra_providers::{HistoryItemKind, ImageMediaType, ImageSource};
 use caudra_storage::id::CaudraId;
 
@@ -1085,7 +1086,7 @@ impl App {
             } else {
                 format_with_images(&submission.text, submission.input.images.len())
             };
-            SubmitOutcome::Started(self.start_run(*submission.input, display))
+            SubmitOutcome::Started(self.start_run(*submission.input, display, StartedBy::User))
         }
     }
 
@@ -1252,6 +1253,7 @@ impl App {
         if self.automatic_wakes_suppressed {
             self.rearm_background();
         }
+        self.human_input();
         shared.push(submission.into_queue_item(self.run_id, admission));
         true
     }
@@ -1405,6 +1407,7 @@ impl App {
             self.cancelling_run = None;
             self.rearm_background();
         }
+        self.automation_queue_consumed();
         self.goal_deferred = false;
         self.queue.clamp_focus();
         self.status = Status::Streaming;
@@ -1421,6 +1424,7 @@ impl App {
             self.cancelling_run = None;
             self.rearm_background();
         }
+        self.automation_queue_consumed();
         self.goal_deferred = false;
         self.queue.clamp_focus();
         self.status = Status::Streaming;
@@ -1436,19 +1440,20 @@ impl App {
     pub(super) fn start_from_queue(&mut self, msg: &QueuedMessage) -> Vec<Action> {
         let display = format_with_images(&msg.text, msg.images.len());
         let input = self.build_agent_input(msg);
-        self.start_run(input, display)
+        self.start_run(input, display, StartedBy::User)
     }
 
     pub(crate) fn start_mailbox_run(
         &mut self,
         preamble: Vec<caudra_providers::Message>,
+        started_by: StartedBy,
     ) -> Vec<Action> {
         if self.automatic_wakes_suppressed || self.status != Status::Idle {
             return Vec::new();
         }
         let mut input = self.continuation_input();
         input.preamble = preamble;
-        self.start_run(input, String::new())
+        self.start_run(input, String::new(), started_by)
     }
 
     /// Whether the last run died mid-turn and left a transcript a resume can pick back up. The
@@ -1503,18 +1508,23 @@ impl App {
         input.preamble.push(caudra_providers::Message::synthetic(
             caudra_agent::goal_checkin_message(&goal.condition),
         ));
-        self.start_run(input, String::new())
+        self.start_run(input, String::new(), StartedBy::Goal)
     }
 
     /// The one place a fresh run starts: every path that emits
     /// `Action::SendMessage` must go through here so `run_id` bumps exactly
     /// once per run.
-    pub(super) fn start_run(&mut self, input: AgentInput, display: String) -> Vec<Action> {
+    pub(super) fn start_run(
+        &mut self,
+        input: AgentInput,
+        display: String,
+        started_by: StartedBy,
+    ) -> Vec<Action> {
         if let Err(error) = self.admit_run() {
             self.flash(error);
             return Vec::new();
         }
-        self.start_admitted_run(input, display)
+        self.start_admitted_run(input, display, started_by)
     }
 
     pub(crate) fn check_run_admission(&self) -> Result<(), String> {
@@ -1535,12 +1545,19 @@ impl App {
             .map_err(|error| format!("{PERMISSION_PUBLISH_ERR}: {error}"))
     }
 
-    pub(super) fn start_admitted_run(&mut self, input: AgentInput, display: String) -> Vec<Action> {
+    pub(super) fn start_admitted_run(
+        &mut self,
+        input: AgentInput,
+        display: String,
+        started_by: StartedBy,
+    ) -> Vec<Action> {
         self.run_id += 1;
         self.background_delivery.invalidate();
         if !input.message.is_empty() || !input.images.is_empty() || input.resume {
             self.rearm_background();
+            self.human_input();
         }
+        self.automation_run_started(started_by);
         self.goal_deferred = false;
         self.clear_exit_request();
         // New work supersedes text held for recovery after an agent error.

@@ -1,3 +1,4 @@
+pub(crate) mod automation_inspector;
 pub(crate) mod code_view;
 pub mod command;
 pub(crate) mod command_modal;
@@ -16,6 +17,7 @@ pub(crate) mod goal_modal;
 pub(crate) mod help_modal;
 pub mod input;
 pub(crate) mod json_text;
+pub(crate) mod json_tree;
 pub mod keybindings;
 pub(crate) mod list_picker;
 pub(crate) mod login_picker;
@@ -95,7 +97,9 @@ use caudra_agent::{
 };
 use caudra_config::InboundPolicy;
 use caudra_providers::model_registry::Binding;
-use caudra_providers::{CaudraId, HistoryItem, ModelPurpose, PeerMessageOrigin, TaskEventOrigin};
+use caudra_providers::{
+    AutomationEventOrigin, CaudraId, HistoryItem, ModelPurpose, PeerMessageOrigin, TaskEventOrigin,
+};
 use caudra_storage::sessions::SessionRelocation;
 use caudra_workbench::text_field::FieldStyles;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
@@ -680,6 +684,12 @@ pub fn is_ctrl(key: &KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT)
 }
 
+/// The key a one-letter label names. The keybinding tables quote the label and
+/// a modal matches the key, so one spelling feeds both.
+pub(crate) const fn ascii_key(label: &str) -> char {
+    label.as_bytes()[0] as char
+}
+
 /// The character a key types with neither Ctrl nor Alt held, so a letter
 /// command never swallows a chord spelled with the same letter.
 pub(crate) fn plain_char(key: &KeyEvent) -> Option<char> {
@@ -1247,6 +1257,10 @@ impl DisplayMessage {
         Self::new(role, text)
     }
 
+    pub(crate) fn automation(text: String, origin: AutomationEventOrigin) -> Self {
+        Self::new(DisplayRole::AutomationDelivery(Box::new(origin)), text)
+    }
+
     pub fn new(role: DisplayRole, text: String) -> Self {
         Self {
             role,
@@ -1364,6 +1378,9 @@ pub enum DisplayRole {
     /// something a model or a person said.
     Notice,
     TaskDelivery(Box<TaskEventOrigin>),
+    /// What an automation's firing gave the model. The heading names the
+    /// automation, and a click anywhere on the row opens the firing.
+    AutomationDelivery(Box<AutomationEventOrigin>),
     PeerMessage(Box<PeerMessageOrigin>),
     /// A message the harness wrote into the conversation. Unlike a notice it
     /// has a body worth reading, so it collapses to its heading and opens on a

@@ -26,6 +26,7 @@ use crate::sandbox::{
     LiveOperation, NETWORK_RECOVERY, NetworkGate, SandboxAttachment, SandboxConnector,
     SandboxControl, SandboxReadiness,
 };
+use caudra_agent::automation::frontend::wake_origin;
 use caudra_agent::background::BackgroundTransition;
 use caudra_agent::command::CustomCommand;
 use caudra_agent::herdr::{HerdrEnv, resume_command_line};
@@ -40,8 +41,12 @@ use caudra_agent::worktree::{Backend, Request as WorktreeRequest, counterpart, l
 use caudra_agent::{
     AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle, mcp,
 };
+use caudra_automation::request::ProfileArming;
+use caudra_automation::snapshot::{AutomationEvent, SettleBlocker};
 use caudra_config::sandbox::SandboxName;
-use caudra_config::{Feature, ModelPolicy, SnapshotsConfig, UiConfig, load_permissions};
+use caudra_config::{
+    AutomationsConfig, Feature, ModelPolicy, SnapshotsConfig, UiConfig, load_permissions,
+};
 use caudra_docs::DocsLibrary;
 use caudra_lua::{
     EventHandle, HintReader, KeymapReader, LuaCommandReader, ModelRequest, SessionRequest,
@@ -181,8 +186,11 @@ pub struct EventLoopParams {
     /// The launch joined the focused session to consumer groups, so it warns
     /// once registered if its inbound policy skips some of their work.
     pub joined_groups: bool,
+    /// `--automation` entries, armed in the session focused at launch only.
+    pub launch_automations: Vec<ProfileArming>,
     pub storage: StateDir,
     pub config: AgentConfig,
+    pub automations: AutomationsConfig,
     pub ui_config: UiConfig,
     pub snapshots: SnapshotsConfig,
     /// Opens the change records of a local session's directory.
@@ -252,6 +260,8 @@ struct RunNotificationState {
     response_candidate: Option<String>,
     pending_completion: Option<PendingCompletion>,
     last_attention: Option<Notification>,
+    /// The newest `notify()` text since the last reconcile.
+    pending_notice: Option<Notification>,
 }
 
 impl RunNotificationState {
@@ -295,6 +305,19 @@ impl RunNotificationState {
         self.pending_completion = None;
     }
 
+    /// Only a firing's `notify()` reaches the terminal. An arming refusal carries error details,
+    /// which notifications leave out.
+    fn on_automation_event(&mut self, event: &AutomationEvent) {
+        if let AutomationEvent::Notice {
+            automation,
+            fire_id: Some(_),
+            text,
+        } = event
+        {
+            self.pending_notice = Some(Notification::automation_notice(automation, text));
+        }
+    }
+
     /// True between `Done`/`Error` and the run's `QueueDrained`. An exit must
     /// not fire in that window: a queued follow-up may still start a new run.
     fn waiting_for_drain(&self) -> bool {
@@ -326,7 +349,10 @@ impl RunNotificationState {
                 None
             }
         };
-        (!terminal_focused).then(|| prompt.or(completion)).flatten()
+        let notice = self.pending_notice.take();
+        (!terminal_focused)
+            .then(|| prompt.or(notice).or(completion))
+            .flatten()
     }
 }
 
@@ -357,6 +383,25 @@ fn prepend_preamble(preamble: &mut Vec<Message>, mut leading: Vec<Message>) {
 
 fn is_current_top_level(current_run_id: u64, envelope: &Envelope) -> bool {
     envelope.run_id == current_run_id && envelope.subagent.is_none()
+}
+
+/// The `--automation` entries each launch tab arms: all of them in the tab that takes focus,
+/// clamped the way the loop clamps it, and none elsewhere.
+fn launch_armings(
+    tabs: usize,
+    focused: usize,
+    mut automations: Vec<ProfileArming>,
+) -> Vec<Vec<ProfileArming>> {
+    let focused = focused.min(tabs.saturating_sub(1));
+    (0..tabs)
+        .map(|index| {
+            if index == focused {
+                std::mem::take(&mut automations)
+            } else {
+                Vec::new()
+            }
+        })
+        .collect()
 }
 
 fn select_notification(
@@ -442,8 +487,12 @@ impl SessionRuntime {
     }
 
     fn work_quiescent(&self) -> bool {
+        self.handles.queue.is_empty() && self.running_quiescent()
+    }
+
+    /// Nothing runs or waits to report back, whatever the queue holds.
+    fn running_quiescent(&self) -> bool {
         self.parent_ready()
-            && self.handles.queue.is_empty()
             && !self.app.has_session_work()
             && self.handles.active_background_tasks() == 0
             && self
@@ -470,6 +519,53 @@ impl SessionRuntime {
 
     fn parent_ready(&self) -> bool {
         self.delivery_idle() && !self.app.holds_recovery_text()
+    }
+
+    /// What keeps the session from settling, as its automations see it; empty once it has.
+    fn settle_blockers(&self) -> Vec<SettleBlocker> {
+        let status = SessionStatus::of(&self.app);
+        let input = (status == SessionStatus::NeedsInput)
+            .then(|| self.app.input_wait(false))
+            .flatten();
+        [
+            (status == SessionStatus::Working || !self.running_quiescent())
+                .then_some(SettleBlocker::Busy),
+            input.map(|wait| SettleBlocker::NeedsInput(wait.input)),
+            (!self.handles.queue.is_empty()).then_some(SettleBlocker::PromptQueued),
+            self.peer_work_pending()
+                .then_some(SettleBlocker::PeerMessages),
+            self.handles
+                .mailbox_wake_pending()
+                .then_some(SettleBlocker::MailboxWake),
+            self.app
+                .goal_checkin_due()
+                .then_some(SettleBlocker::GoalCheckin),
+            (!self.handles.agent_rx.is_empty()).then_some(SettleBlocker::AgentEvents),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    /// Tells the session's automations what this tick saw, then claims the turn its next `next`
+    /// delivery asks for once nothing waits ahead of it. The claim marks the item delivered, so
+    /// it comes only after every check that could stop the turn.
+    fn sync_automations(&mut self) -> Option<Vec<Action>> {
+        if !self.app.has_automations() {
+            return None;
+        }
+        self.sync_peer_facts();
+        let blockers = self.settle_blockers();
+        let held_messages = self.holds_peer_messages();
+        let name = self.messaging_name();
+        self.app.observe_automations(held_messages, name, blockers);
+        if !self.parent_ready()
+            || crate::sandbox::transfer::active()
+            || !self.app.automation_delivery_due()
+        {
+            return None;
+        }
+        self.app.deliver_automation_item()
     }
 
     fn herdr_observation(&self) -> HerdrObservation {
@@ -836,6 +932,7 @@ struct SpawnCtx {
     storage: StateDir,
     background_enabled: bool,
     config: AgentConfig,
+    automations: AutomationsConfig,
     ui_config: UiConfig,
     snapshots: SnapshotsConfig,
     change_factory: Option<ChangeServiceFactory>,
@@ -893,11 +990,14 @@ impl SpawnCtx {
         session.meta.mode = mode;
         let lease = SessionLease::acquire(&self.storage, session.id)
             .map_err(|error| format!("Failed to reserve new session: {error}"))?;
-        self.spawn_runtime(SessionTab {
-            session,
-            lease: Arc::new(lease),
-            cursor: None,
-        })
+        self.spawn_runtime(
+            SessionTab {
+                session,
+                lease: Arc::new(lease),
+                cursor: None,
+            },
+            Vec::new(),
+        )
     }
 
     /// The session that implements a plan starts in Build, so it never makes
@@ -954,7 +1054,12 @@ impl SpawnCtx {
         Ok(profile)
     }
 
-    fn spawn_runtime(&self, tab: SessionTab) -> Result<SessionRuntime, String> {
+    /// `automations` are `--automation` entries, which only the session focused at launch takes.
+    fn spawn_runtime(
+        &self,
+        tab: SessionTab,
+        automations: Vec<ProfileArming>,
+    ) -> Result<SessionRuntime, String> {
         let started = Instant::now();
         let mut phase_start = started;
         let mut lap = || {
@@ -1063,7 +1168,7 @@ impl SpawnCtx {
         let permissions_ms = lap();
         let subagent_history = crate::agent::stored_subagent_history(&session);
         let subagent_history_ms = lap();
-        let handles = AgentHandles::spawn(
+        let mut handles = AgentHandles::spawn(
             &self.model_slot,
             initial_history,
             archived_history,
@@ -1159,6 +1264,7 @@ impl SpawnCtx {
         // once the restore that draws it has run.
         app.refresh_workflow_cards();
         app.set_pattern_suggestion_loader(self.pattern_suggestion_loader.clone());
+        handles.start_automations(&mut app, &self.automations, automations);
         info!(
             session_id = %session_id,
             prepare_ms,
@@ -1350,6 +1456,7 @@ enum Wake {
     InputGone,
     Ui(UiAction),
     Agent(usize, Box<caudra_agent::Envelope>),
+    Automation(usize, Box<AutomationEvent>),
     Background,
     Delivery(usize, Box<DeliveryReply>),
     Shell(usize, ShellEvent),
@@ -1455,8 +1562,10 @@ impl<'t> EventLoop<'t> {
             focused,
             mut startup_warnings,
             joined_groups,
+            launch_automations,
             storage,
             config,
+            automations,
             ui_config,
             snapshots,
             change_factory,
@@ -1553,6 +1662,7 @@ impl<'t> EventLoop<'t> {
             storage,
             background_enabled: !exit_on_done,
             config,
+            automations,
             ui_config,
             snapshots,
             change_factory,
@@ -1597,9 +1707,11 @@ impl<'t> EventLoop<'t> {
         }
         let recover_sessions_ms = lap();
 
+        let armings = launch_armings(sessions.len(), focused, launch_automations);
         let mut runtimes: Vec<SessionRuntime> = sessions
             .into_iter()
-            .map(|tab| ctx.spawn_runtime(tab))
+            .zip(armings)
+            .map(|(tab, cli)| ctx.spawn_runtime(tab, cli))
             .collect::<Result<_, _>>()
             .map_err(|error| eyre!(error))?;
         ctx.allow_workspace_recovery = true;
@@ -1808,6 +1920,11 @@ impl<'t> EventLoop<'t> {
                     res.ok().map(|env| Wake::Agent(i, Box::new(env)))
                 });
             }
+            if let Some(events) = rt.handles.automation_events() {
+                sel = sel.recv(events, move |res| {
+                    res.ok().map(|event| Wake::Automation(i, Box::new(event)))
+                });
+            }
             sel = sel.recv(&rt.shell_rx, move |res| {
                 res.ok().map(|ev| Wake::Shell(i, ev))
             });
@@ -1821,6 +1938,11 @@ impl<'t> EventLoop<'t> {
             Wake::InputGone => return Err(eyre!("terminal input reader stopped")),
             Wake::Ui(action) => self.handle_ui_action(action),
             Wake::Agent(i, envelope) => self.handle_agent(i, envelope),
+            Wake::Automation(i, event) => {
+                let session = &mut self.sessions[i];
+                session.notifications.on_automation_event(&event);
+                let _ = session.app.handle_automation_event(*event);
+            }
             Wake::Background => {}
             Wake::Delivery(index, reply) => {
                 if let Err(error) = self.sessions[index].app.apply_delivery_reply(*reply) {
@@ -2427,6 +2549,7 @@ impl<'t> EventLoop<'t> {
             runtime.handles.queue.allow_next_turn(ready);
         }
         dirty |= self.start_goal_checkins();
+        dirty |= self.sync_automations();
         self.emit_status_changes();
         self.publish_live_sessions();
         dirty |= self.emit_task_changes();
@@ -2724,6 +2847,7 @@ impl<'t> EventLoop<'t> {
                     return None;
                 }
                 let mut preamble = runtime.handles.claim_mailbox_wake();
+                let woken = !preamble.is_empty();
                 match runtime.app.claim_workflow_completions() {
                     Ok(messages) => preamble.extend(messages),
                     Err(error) => {
@@ -2733,6 +2857,7 @@ impl<'t> EventLoop<'t> {
                         return None;
                     }
                 }
+                let claimed_before_background = preamble.len();
                 if let Some(background) = &runtime.handles.background {
                     match background.claim_messages() {
                         Ok(messages) => {
@@ -2747,18 +2872,39 @@ impl<'t> EventLoop<'t> {
                         }
                     }
                 }
-                (!preamble.is_empty()).then_some((index, preamble))
+                let started_by = wake_origin(
+                    woken,
+                    claimed_before_background,
+                    preamble.len() - claimed_before_background,
+                );
+                (!preamble.is_empty()).then_some((index, preamble, started_by))
             })
             .collect();
 
         let dirty = Dirty::from(!ready.is_empty());
-        for (index, preamble) in ready {
-            let actions = self.sessions[index].app.start_mailbox_run(preamble);
+        for (index, preamble, started_by) in ready {
+            let actions = self.sessions[index]
+                .app
+                .start_mailbox_run(preamble, started_by);
             if actions.is_empty() {
                 self.sessions[index].app.suppress_background_wakes();
                 self.sessions[index].app.release_background_claims();
             }
             self.dispatch(index, actions);
+        }
+        dirty
+    }
+
+    /// Lets each session's automations see this tick, and a settled session start the turn its
+    /// next `next` delivery asks for. Unlike the wakes above, a delivery goes on while automatic
+    /// wakes are suppressed: the runtime's own latch and limits hold it.
+    fn sync_automations(&mut self) -> Dirty {
+        let mut dirty = Dirty::NO;
+        for index in 0..self.sessions.len() {
+            if let Some(actions) = self.sessions[index].sync_automations() {
+                self.dispatch(index, actions);
+                dirty = Dirty::YES;
+            }
         }
         dirty
     }
@@ -2867,11 +3013,14 @@ impl<'t> EventLoop<'t> {
                         return;
                     }
                 };
-                let runtime = match self.ctx.spawn_runtime(SessionTab {
-                    session,
-                    lease,
-                    cursor: None,
-                }) {
+                let runtime = match self.ctx.spawn_runtime(
+                    SessionTab {
+                        session,
+                        lease,
+                        cursor: None,
+                    },
+                    Vec::new(),
+                ) {
                     Ok(runtime) => runtime,
                     Err(error) => {
                         let _ = reply_tx.send(Err(error));
@@ -3157,11 +3306,14 @@ impl<'t> EventLoop<'t> {
             drop(old_lease);
             return Ok(());
         }
-        let runtime = self.ctx.spawn_runtime(SessionTab {
-            session,
-            lease,
-            cursor: None,
-        })?;
+        let runtime = self.ctx.spawn_runtime(
+            SessionTab {
+                session,
+                lease,
+                cursor: None,
+            },
+            Vec::new(),
+        )?;
         let idx = self.push_runtime(runtime);
         self.focused = idx;
         Ok(())
@@ -3808,6 +3960,8 @@ impl<'t> EventLoop<'t> {
             lua_handle,
             Some(Arc::clone(&rt.lease)),
         );
+        rt.handles
+            .start_automations(&mut rt.app, &self.ctx.automations, Vec::new());
         rt.install_peer(&self.ctx);
     }
 
@@ -3921,11 +4075,14 @@ impl<'t> EventLoop<'t> {
                 if let Some(draft) = draft {
                     install_fork_draft(&mut session, draft);
                 }
-                let runtime = match self.ctx.spawn_runtime(SessionTab {
-                    session,
-                    lease,
-                    cursor: None,
-                }) {
+                let runtime = match self.ctx.spawn_runtime(
+                    SessionTab {
+                        session,
+                        lease,
+                        cursor: None,
+                    },
+                    Vec::new(),
+                ) {
                     Ok(runtime) => runtime,
                     Err(error) => {
                         self.sessions[idx].app.flash(error);
@@ -4287,6 +4444,7 @@ impl<'t> EventLoop<'t> {
             .app
             .flash(format!("System prompt: {name}"));
         self.respawn_agent(idx, history);
+        self.sessions[idx].app.sync_automation_profile();
     }
 
     fn refresh_models(&self) {
@@ -4586,6 +4744,7 @@ fn background_flash(title: &str, previous: SessionStatus, status: SessionStatus)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::tests::automation_runtime::{COURIER_MESSAGE, LinkedAutomations};
     use crate::app::tests::{plan_app, private_tempdir, test_app};
     use crate::app::{Mode, PlanState};
     use crate::components::docs_modal::fixture as docs_fixture;
@@ -4594,8 +4753,9 @@ mod tests {
     use caudra_agent::background::BackgroundTasks;
     use caudra_agent::tools::native::plan::PlanTarget;
     use caudra_agent::{AgentMode, DoneReason, McpSnapshotReader};
+    use caudra_automation::event::InputKind;
     use caudra_config::sandbox::Revision;
-    use caudra_config::{FeatureFlags, PermissionsConfig};
+    use caudra_config::{FeatureFlags, PermissionsConfig, ToolKey};
     use caudra_providers::provider::BoxFuture;
     use caudra_providers::{
         AgentError, CacheKey, ModelInfo, ProviderEvent, RequestOptions, StreamResponse,
@@ -4644,6 +4804,7 @@ mod tests {
                 features: FeatureFlags::NONE,
                 ..Default::default()
             },
+            automations: AutomationsConfig::default(),
             ui_config: UiConfig::default(),
             snapshots: SnapshotsConfig::default(),
             change_factory: None,
@@ -4892,6 +5053,14 @@ mod tests {
     const RELOCATION_PENDING_ERR: &str = "has a pending restore; resolve it before moving sessions";
     const RELOCATION_INPUT_HISTORY: usize = 100;
     const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+    const LAUNCH_AUTOMATION: &str = "nightly";
+    const PERMISSION_ID: &str = "permission";
+    const PERMISSION_TOOL: &str = "bash";
+    const CLAIMED_ONLY_WHEN_DELIVERED: &str =
+        "a delivery must leave the outbox exactly when its turn starts";
+    const NOTICE_AUTOMATION: &str = "watchdog";
+    const NOTICE_TEXT: &str = "still working";
+    const NOTICE_FIRE_ID: &str = "notice-firing";
 
     fn relocation_app(storage: StateDir, cwd: &Path, writer: Arc<StorageWriter>) -> App {
         let session = AppSession::new(RELOCATION_MODEL, cwd.to_str().unwrap());
@@ -5298,6 +5467,66 @@ mod tests {
         );
     }
 
+    fn automation_notice() -> Notification {
+        Notification::AutomationNotice {
+            automation: NOTICE_AUTOMATION.into(),
+            text: NOTICE_TEXT.into(),
+        }
+    }
+
+    fn notice_event(fire_id: Option<&str>) -> AutomationEvent {
+        AutomationEvent::Notice {
+            automation: NOTICE_AUTOMATION.into(),
+            fire_id: fire_id.map(str::to_owned),
+            text: NOTICE_TEXT.into(),
+        }
+    }
+
+    #[test_case(notice_event(Some(NOTICE_FIRE_ID)), Some(automation_notice()) ; "a_firings_notify")]
+    #[test_case(notice_event(None), None ; "an_arming_refusal")]
+    #[test_case(AutomationEvent::SaveSession, None ; "another_event")]
+    fn only_a_firings_notify_reaches_the_terminal(
+        event: AutomationEvent,
+        expected: Option<Notification>,
+    ) {
+        let mut state = RunNotificationState::default();
+        state.on_automation_event(&event);
+
+        assert_eq!(
+            state.reconcile(None, SessionStatus::Working, true, false),
+            expected
+        );
+    }
+
+    #[test_case(false, true ; "fires_when_unfocused")]
+    #[test_case(true, false ; "focused_terminal_swallows")]
+    fn automation_notice_is_decided_on_first_reconcile(terminal_focused: bool, fires: bool) {
+        let mut state = RunNotificationState::default();
+        state.on_automation_event(&notice_event(Some(NOTICE_FIRE_ID)));
+
+        let first = state.reconcile(None, SessionStatus::Working, true, terminal_focused);
+        assert_eq!(first, fires.then(automation_notice));
+        assert_eq!(
+            state.reconcile(None, SessionStatus::Working, true, false),
+            None
+        );
+    }
+
+    #[test_case(Some(Notification::QuestionRequested), Notification::QuestionRequested ; "prompt_outranks_notice")]
+    #[test_case(None, automation_notice() ; "notice_outranks_completion")]
+    fn automation_notice_ranks_between_prompts_and_completions(
+        attention: Option<Notification>,
+        expected: Notification,
+    ) {
+        let mut state = due_completion();
+        state.on_automation_event(&notice_event(Some(NOTICE_FIRE_ID)));
+
+        assert_eq!(
+            state.reconcile(attention, SessionStatus::Idle, true, false),
+            Some(expected)
+        );
+    }
+
     #[test]
     fn notification_selection_prefers_priority_then_session_order() {
         let completion = Notification::TurnComplete { response: None };
@@ -5523,5 +5752,105 @@ mod tests {
 
         assert!(error.contains("Use /cd"), "{error}");
         assert!(error.contains(&session.id.to_string()), "{error}");
+    }
+
+    #[test_case(3, 1, &[0, 1, 0] ; "the_focused_tab")]
+    #[test_case(2, 5, &[0, 1] ; "a_focus_past_the_last_tab")]
+    fn command_line_automations_arm_only_the_tab_that_takes_focus(
+        tabs: usize,
+        focused: usize,
+        expected: &[usize],
+    ) {
+        let launch = vec![ProfileArming {
+            name: LAUNCH_AUTOMATION.into(),
+            args: None,
+        }];
+
+        let armed: Vec<usize> = launch_armings(tabs, focused, launch)
+            .iter()
+            .map(Vec::len)
+            .collect();
+
+        assert_eq!(armed, expected);
+    }
+
+    /// A fresh session whose agent loop waits for its first prompt.
+    fn idle_runtime() -> SessionRuntime {
+        let mut source = plan_app();
+        plan_spawn_context(&mut source)
+            .spawn_fresh_runtime(&source.state.session, None)
+            .unwrap()
+    }
+
+    fn start_a_run(runtime: &mut SessionRuntime) {
+        runtime.app.status = Status::Streaming;
+    }
+
+    fn open_a_permission_prompt(runtime: &mut SessionRuntime) {
+        runtime.app.permission_prompt.open(
+            PERMISSION_ID.into(),
+            ToolKey::native(PERMISSION_TOOL),
+            Vec::new(),
+            None,
+        );
+    }
+
+    fn leave_an_agent_event(runtime: &mut SessionRuntime) {
+        runtime
+            .handles
+            .agent_tx
+            .send(Envelope {
+                task: None,
+                event: AgentEvent::TextDelta {
+                    text: String::new(),
+                },
+                subagent: None,
+                run_id: runtime.app.run_id,
+                workflow: None,
+            })
+            .unwrap();
+    }
+
+    #[test_case(|_| {}, &[] ; "nothing_holds_it")]
+    #[test_case(start_a_run, &[SettleBlocker::Busy] ; "a_run")]
+    #[test_case(open_a_permission_prompt, &[SettleBlocker::NeedsInput(InputKind::Permission)] ; "a_permission_prompt")]
+    #[test_case(leave_an_agent_event, &[SettleBlocker::AgentEvents] ; "an_unhandled_agent_event")]
+    fn a_session_settles_once_nothing_holds_it(
+        hold: fn(&mut SessionRuntime),
+        expected: &[SettleBlocker],
+    ) {
+        let mut runtime = idle_runtime();
+
+        hold(&mut runtime);
+
+        assert_eq!(runtime.settle_blockers(), expected);
+        runtime.handles.cancel();
+    }
+
+    #[test_case(|_| {}, true ; "settled")]
+    #[test_case(|runtime| runtime.app.automatic_wakes_suppressed = true, true ; "automatic_wakes_suppressed")]
+    #[test_case(start_a_run, false ; "a_run_goes_on")]
+    #[test_case(leave_an_agent_event, false ; "agent_events_go_first")]
+    fn a_settled_session_starts_the_turn_its_next_delivery_asks_for(
+        hold: fn(&mut SessionRuntime),
+        delivers: bool,
+    ) {
+        let mut runtime = idle_runtime();
+        let linked = LinkedAutomations::courier(&mut runtime.app);
+        hold(&mut runtime);
+
+        let actions = runtime.sync_automations();
+
+        let delivered = actions.is_some_and(|actions| {
+            matches!(&actions[..], [Action::SendMessage(input)] if input.preamble.iter().any(|message| message.display_text.as_deref() == Some(COURIER_MESSAGE)))
+        });
+        assert_eq!(delivered, delivers);
+        assert_eq!(
+            linked.state().outbox.is_empty(),
+            delivers,
+            "{CLAIMED_ONLY_WHEN_DELIVERED}"
+        );
+        linked.stop();
+        runtime.handles.cancel();
     }
 }

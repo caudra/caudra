@@ -5,7 +5,7 @@ use std::fmt::Write;
 use strum::EnumIter;
 use unicode_width::UnicodeWidthStr;
 
-use crate::components::{decisions_modal, workflow_inspector};
+use crate::components::{automation_inspector, decisions_modal, workflow_inspector};
 
 /// Spelled once because three tables quote it.
 const SHIFT_TAB_LABEL: &str = "Shift+Tab";
@@ -385,6 +385,7 @@ pub enum KeybindContext {
     PeerManager,
     WorkflowInspector,
     WorkflowCatalogPicker,
+    AutomationInspector,
     Decisions,
     SandboxManager,
     Workbench,
@@ -424,6 +425,7 @@ impl KeybindContext {
             Self::PeerManager => "Peer Manager",
             Self::WorkflowInspector => "Workflow Inspector",
             Self::WorkflowCatalogPicker => "Workflow Catalog",
+            Self::AutomationInspector => "Automation Inspector",
             Self::Decisions => "Decisions",
             Self::SandboxManager => "Sandbox Manager",
             Self::Workbench => "Workbench",
@@ -441,6 +443,7 @@ impl KeybindContext {
         match self {
             Self::PeerManager => Some(Feature::CrossSessionMessaging),
             Self::WorkflowInspector | Self::WorkflowCatalogPicker => Some(Feature::Workflows),
+            Self::AutomationInspector => Some(Feature::Automations),
             Self::Decisions => Some(Feature::DecisionEngine),
             Self::SandboxManager | Self::WorkbenchTransfer => Some(Feature::Sandboxes),
             _ => None,
@@ -463,6 +466,7 @@ impl KeybindContext {
             | Self::PeerManager
             | Self::WorkflowInspector
             | Self::WorkflowCatalogPicker
+            | Self::AutomationInspector
             | Self::Decisions => Some(Self::Picker),
             Self::WorkbenchExplorer
             | Self::WorkbenchEditor
@@ -1468,6 +1472,81 @@ pub const KEYBINDS: &[Keybind] = &[
         label: KeyLabel::Single("Enter"),
         description: "Launch a trusted workflow, or trust an untrusted one",
         context: KeybindContext::WorkflowCatalogPicker,
+    },
+    Keybind {
+        label: KeyLabel::Single("Enter"),
+        description: "Open the row under the cursor: a firing's trace, an action's request and result, or a JSON node",
+        context: KeybindContext::AutomationInspector,
+    },
+    Keybind {
+        label: KeyLabel::Single(automation_inspector::ARM_LABEL),
+        description: "Arm or disarm the selected automation",
+        context: KeybindContext::AutomationInspector,
+    },
+    Keybind {
+        label: KeyLabel::Single(automation_inspector::EDIT_LABEL),
+        description: "Edit the selected automation's state or args",
+        context: KeybindContext::AutomationInspector,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::SAVE.label),
+        description: "Save the state or args being edited",
+        context: KeybindContext::AutomationInspector,
+    },
+    Keybind {
+        label: KeyLabel::Single(automation_inspector::TRUST_LABEL),
+        description: "Trust the selected project script at the digest shown",
+        context: KeybindContext::AutomationInspector,
+    },
+    Keybind {
+        label: KeyLabel::Single(automation_inspector::PAUSE_LABEL),
+        description: "Pause or resume every automation in the session",
+        context: KeybindContext::AutomationInspector,
+    },
+    Keybind {
+        label: KeyLabel::Single(automation_inspector::CLEAR_LABEL),
+        description: "Clear the selected automation's state, after confirming",
+        context: KeybindContext::AutomationInspector,
+    },
+    Keybind {
+        label: KeyLabel::Single(automation_inspector::DROP_LABEL),
+        description: "Drop the waiting firing or outbox item under the cursor",
+        context: KeybindContext::AutomationInspector,
+    },
+    Keybind {
+        label: KeyLabel::Single(automation_inspector::DRY_RUN_LABEL),
+        description: "Dry-run the finished firing under the cursor against the script as it is now",
+        context: KeybindContext::AutomationInspector,
+    },
+    Keybind {
+        label: KeyLabel::Single(automation_inspector::SCRIPT_LABEL),
+        description: "Open the script, at the failing line for a failed firing",
+        context: KeybindContext::AutomationInspector,
+    },
+    Keybind {
+        label: KeyLabel::Single(automation_inspector::COPY_LABEL),
+        description: "Copy the firing under the cursor as markdown",
+        context: KeybindContext::AutomationInspector,
+    },
+    Keybind {
+        label: KeyLabel::Single(automation_inspector::FILTER_LABEL),
+        description: "Filter the list by name, description, or a session's title or @name",
+        context: KeybindContext::AutomationInspector,
+    },
+    Keybind {
+        label: KeyLabel::Alt("Tab", SHIFT_TAB_LABEL),
+        description: "Next or previous section",
+        context: KeybindContext::AutomationInspector,
+    },
+    Keybind {
+        label: KeyLabel::Single("1-4"),
+        description: "Jump to a section",
+        context: KeybindContext::AutomationInspector,
+    },
+    Keybind {
+        label: KeyLabel::Alt("Left", "Right"),
+        description: "Focus the list or the section",
+        context: KeybindContext::AutomationInspector,
     },
     Keybind {
         label: KeyLabel::Alt("Tab", SHIFT_TAB_LABEL),

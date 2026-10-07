@@ -40,6 +40,8 @@ use super::streaming::{StreamError, stream_with_retry};
 use super::title;
 use super::tool_dispatch::{self, RecentCalls, ResponseObservations};
 use crate::agent::change_recording::ChangeRecorder;
+use crate::automation::handle::AutomationHandle;
+use crate::automation::outbox::claim_message;
 use crate::background::{BackgroundTasks, JobScope, SessionWork};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::context::{
@@ -69,6 +71,7 @@ use crate::{
     CommitRef, DoneReason, EventSender, ExtractedCommand, InterruptSource, Mention,
     QueueConsumedItem, SessionMailbox, SubagentHistoryStore, TurnCompleteEvent,
 };
+use caudra_automation::request::AutomationError;
 use caudra_config::decisions::FeatureMode;
 use caudra_config::{Feature, ModelPolicy, ProfileToolPolicy, ToolOutputLines};
 use caudra_decision::{Answer, Question, QuestionSet, QuestionType};
@@ -447,6 +450,8 @@ pub struct Agent<'h> {
     peers: Option<PeerSession>,
     close_peers_on_done: bool,
     checkpoint_peer_delivery: bool,
+    /// The session's automation runtime, held by its main run only.
+    automation: Option<AutomationHandle>,
     context_publisher: Option<ContextPublisher>,
     timeouts: caudra_providers::Timeouts,
     file_tracker: Arc<FileReadTracker>,
@@ -510,6 +515,7 @@ impl<'h> Agent<'h> {
             run.deferred
                 .retain(|tool| !names.contains(&tool.name.as_ref()));
         }
+        let automation = main_run_automation(&params);
         let jobs = params
             .jobs
             .clone()
@@ -605,6 +611,7 @@ impl<'h> Agent<'h> {
             peers,
             close_peers_on_done: false,
             checkpoint_peer_delivery: false,
+            automation,
             context_publisher: params.context_publisher,
             file_tracker: params.file_tracker,
             path_locks: params.path_locks,
@@ -905,6 +912,7 @@ impl<'h> Agent<'h> {
                         text: CANCEL_MARKER.into(),
                         task_event: None,
                         peer_event: None,
+                        automation_event: None,
                     });
                 }
                 self.publish_prepared_context();
@@ -929,6 +937,7 @@ impl<'h> Agent<'h> {
                         text,
                         task_event: None,
                         peer_event: None,
+                        automation_event: None,
                     });
                 }
                 self.publish_prepared_context();
@@ -1201,18 +1210,22 @@ impl<'h> Agent<'h> {
         self.claim_peer_messages(false, PeerSession::claim)
     }
 
-    fn claim_peer_messages(
-        &mut self,
-        finishing: bool,
-        claim: fn(&PeerSession) -> Option<PeerClaim>,
-    ) -> bool {
-        if self.cancel.is_cancelled()
+    /// A stopped run, or a person waiting to be heard, holds every delivery back.
+    fn deliveries_held(&self) -> bool {
+        self.cancel.is_cancelled()
             || steering::lock(&self.steering).turn_limit_reached(self.config.max_turns)
             || self
                 .interrupt_source
                 .as_ref()
                 .is_some_and(|source| source.has_pending_input())
-        {
+    }
+
+    fn claim_peer_messages(
+        &mut self,
+        finishing: bool,
+        claim: fn(&PeerSession) -> Option<PeerClaim>,
+    ) -> bool {
+        if self.deliveries_held() {
             if finishing {
                 self.close_peer_session();
             }
@@ -1244,6 +1257,48 @@ impl<'h> Agent<'h> {
     fn suppress_peer_wakes(&self) {
         if let Some(peers) = &self.peers {
             peers.suppress_wakes();
+        }
+    }
+
+    /// Hands the automation outbox's `guide` items, in queue order, to a request that happens
+    /// anyway. The end of a turn never claims them, so guidance never extends a run; what is
+    /// left starts the next one.
+    async fn inject_automation_guidance(&mut self) {
+        let Some(automation) = &self.automation else {
+            return;
+        };
+        if self.deliveries_held() {
+            return;
+        }
+        let mut claimed = false;
+        loop {
+            match automation.claim_guidance().await {
+                Ok(Some(claim)) => {
+                    push_injected(self.history, &self.event_tx, claim_message(&claim));
+                    claimed = true;
+                }
+                Ok(None) => break,
+                Err(AutomationError::Unavailable) => {
+                    debug!(
+                        session = %automation.session_id(),
+                        turn = self.turn_id,
+                        "automation runtime stopped before its guidance claim"
+                    );
+                    break;
+                }
+                Err(error) => {
+                    warn!(
+                        session = %automation.session_id(),
+                        turn = self.turn_id,
+                        %error,
+                        "automation guidance not claimed"
+                    );
+                    break;
+                }
+            }
+        }
+        if claimed {
+            self.publish_prepared_context();
         }
     }
 
@@ -1287,6 +1342,7 @@ impl<'h> Agent<'h> {
             if !initial || !peer_wake {
                 self.inject_peer_messages();
             }
+            self.inject_automation_guidance().await;
             if initial {
                 self.inject_advisory();
                 initial = false;
@@ -3144,6 +3200,18 @@ impl AnnouncedMode {
     }
 }
 
+/// The session's automation runtime, for its main run alone: a subagent or a task never takes
+/// an automation's deliveries. Remote sessions have one too, arming user scripts only.
+fn main_run_automation(params: &AgentParams) -> Option<AutomationHandle> {
+    if !params.config.features.enabled(Feature::Automations)
+        || params.audience != ToolAudience::MAIN
+        || params.root_tool_use_id.is_some()
+    {
+        return None;
+    }
+    AutomationHandle::lookup(params.session_id.as_ref()?.id())
+}
+
 /// Every harness-authored user message goes through here, so the transcript
 /// can show what was injected rather than only that something was. Mention
 /// preambles are pushed silently: the user already sees the path they typed,
@@ -3163,6 +3231,7 @@ pub(super) fn push_injected(history: &mut History, event_tx: &EventSender, messa
             text: shown.clone(),
             task_event: message.task_event.clone(),
             peer_event: message.peer_event.clone(),
+            automation_event: message.automation_event.clone(),
         });
     }
     history.push(message);
@@ -3178,6 +3247,7 @@ fn last_announced<'a>(history: &'a [Message], markers: &[&str]) -> Option<&'a st
                 && message.task_event.is_none()
                 && message.peer_event.is_none()
                 && message.workflow_event.is_none()
+                && message.automation_event.is_none()
                 && message.standing_reminder.is_none()
         })
         .find_map(|message| {
@@ -3423,6 +3493,7 @@ fn add_opaque_blob_tokens(total: &mut u32, blob: &str) {
 
 #[cfg(test)]
 mod tests {
+    include!("automation_tests.rs");
     include!("owned_jobs_tests.rs");
     include!("peer_tests.rs");
 
@@ -3440,9 +3511,9 @@ mod tests {
     };
     use caudra_providers::provider::{BoxFuture, Provider};
     use caudra_providers::{
-        ContentBlock, InvalidToolInput, Message, Model, ProviderEvent, RequestOptions, Role,
-        StandingReminderKind, SteeringKind, StopReason, StreamResponse, TaskEventOrigin,
-        TokenUsage, WorkflowEventOrigin, invalid_tool_input,
+        AutomationEventOrigin, ContentBlock, InvalidToolInput, Message, Model, ProviderEvent,
+        RequestOptions, Role, StandingReminderKind, SteeringKind, StopReason, StreamResponse,
+        TaskEventOrigin, TokenUsage, WorkflowEventOrigin, invalid_tool_input,
     };
     use caudra_storage::StateDir;
     use caudra_storage::decision_log::{DecisionFilter, DecisionLog, StatsThresholds};
@@ -3487,6 +3558,11 @@ mod tests {
         r#"{"error":{"type":"rate_limit_error","message":"input tokens per minute exceeded"}}"#;
     const RETRY_REASON: &str = "Rate limited: rate_limit_error: input tokens per minute exceeded";
     const EXPECTED_RETRY_BUDGET: u32 = 8;
+    const TASK_EVENT_KEY: &str = "task_event";
+    const AUTOMATION_EVENT_KEY: &str = "automation_event";
+    const AUTOMATION: &str = "nightly-review";
+    const AUTOMATION_FIRE_ID: &str = "opaque-firing";
+    const AUTOMATION_SEQ: u32 = 1;
 
     #[test]
     fn peer_wake_without_a_claim_does_not_request_the_model() {
@@ -5143,69 +5219,82 @@ mod tests {
         history: &mut History,
         tool_output_store: Option<Arc<ToolOutputStore>>,
     ) -> (Agent<'_>, flume::Receiver<Envelope>) {
+        make_agent_configured(provider, history, |params| {
+            params.tool_output_store = tool_output_store;
+        })
+    }
+
+    /// `configure` adjusts the parameters every test agent starts from.
+    fn make_agent_configured(
+        provider: impl Provider + 'static,
+        history: &mut History,
+        configure: impl FnOnce(&mut AgentParams),
+    ) -> (Agent<'_>, flume::Receiver<Envelope>) {
         let (raw_tx, event_rx) = flume::unbounded();
         let provider: Arc<dyn Provider> = Arc::new(provider);
         let model = default_model();
-        let agent = Agent::new(
-            AgentParams {
-                provider: Arc::clone(&provider),
-                model: model.clone(),
-                chat_provider: provider,
-                chat_model: model,
-                // Scripted providers count responses, and a compaction with
-                // requirements on spends one more of them than the script
-                // expects; the extraction has its own tests.
-                config: AgentConfig {
-                    compaction_requirements: false,
-                    ..AgentConfig::default()
-                },
-                tool_output_lines: ToolOutputLines::default(),
-                tool_output_store,
-                permissions: Arc::new(PermissionManager::new_nonpersistent(
-                    caudra_config::PermissionsConfig {
-                        default: caudra_config::DefaultEffect::Allow,
-                        rules: vec![],
-                        decision_engine: true,
-                        ..Default::default()
-                    },
-                    std::path::PathBuf::from("/tmp"),
-                    Arc::default(),
-                )),
-                session_id: None,
-                cache_key: None,
-                workspace_session: None,
-                remote_project_context: None,
-                host_cwd: None,
-                local_documents: None,
-                task_environment: crate::template::env_vars(),
-                root_tool_use_id: None,
-                mailbox: None,
-                context_publisher: None,
-                timeouts: caudra_providers::Timeouts::default(),
-                file_tracker: FileReadTracker::fresh(),
-                path_locks: PathLocks::fresh(),
-                changes: None,
-                prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
-                prompt_profiles: Arc::new(crate::prompt::profile::PromptProfileCatalog::default()),
-                default_task_prompt_profile_name: Arc::from(
-                    crate::prompt::profile::BUILTIN_PROFILE_NAME,
-                ),
-                active_prompt_profile_name: Some(Arc::from(
-                    crate::prompt::profile::BUILTIN_PROFILE_NAME,
-                )),
-                subagent_cancels: Arc::new(crate::cancel::CancelMap::new()),
-                subagent_history: SubagentHistoryStore::default(),
-                registry: Arc::new(crate::tools::ToolRegistry::new()),
-                audience: ToolAudience::MAIN,
-                tool_filter: crate::tools::ToolFilter::All,
-                tool_ceiling: ToolFilter::All,
-                profile_tool_policy: Arc::default(),
-                model_policy: Arc::new(ModelPolicy::default()),
-                workflow: None,
-                background: None,
-                jobs: None,
-                task_id: None,
+        let mut params = AgentParams {
+            provider: Arc::clone(&provider),
+            model: model.clone(),
+            chat_provider: provider,
+            chat_model: model,
+            // Scripted providers count responses, and a compaction with
+            // requirements on spends one more of them than the script
+            // expects; the extraction has its own tests.
+            config: AgentConfig {
+                compaction_requirements: false,
+                ..AgentConfig::default()
             },
+            tool_output_lines: ToolOutputLines::default(),
+            tool_output_store: None,
+            permissions: Arc::new(PermissionManager::new_nonpersistent(
+                caudra_config::PermissionsConfig {
+                    default: caudra_config::DefaultEffect::Allow,
+                    rules: vec![],
+                    decision_engine: true,
+                    ..Default::default()
+                },
+                std::path::PathBuf::from("/tmp"),
+                Arc::default(),
+            )),
+            session_id: None,
+            cache_key: None,
+            workspace_session: None,
+            remote_project_context: None,
+            host_cwd: None,
+            local_documents: None,
+            task_environment: crate::template::env_vars(),
+            root_tool_use_id: None,
+            mailbox: None,
+            context_publisher: None,
+            timeouts: caudra_providers::Timeouts::default(),
+            file_tracker: FileReadTracker::fresh(),
+            path_locks: PathLocks::fresh(),
+            changes: None,
+            prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
+            prompt_profiles: Arc::new(crate::prompt::profile::PromptProfileCatalog::default()),
+            default_task_prompt_profile_name: Arc::from(
+                crate::prompt::profile::BUILTIN_PROFILE_NAME,
+            ),
+            active_prompt_profile_name: Some(Arc::from(
+                crate::prompt::profile::BUILTIN_PROFILE_NAME,
+            )),
+            subagent_cancels: Arc::new(crate::cancel::CancelMap::new()),
+            subagent_history: SubagentHistoryStore::default(),
+            registry: Arc::new(crate::tools::ToolRegistry::new()),
+            audience: ToolAudience::MAIN,
+            tool_filter: crate::tools::ToolFilter::All,
+            tool_ceiling: ToolFilter::All,
+            profile_tool_policy: Arc::default(),
+            model_policy: Arc::new(ModelPolicy::default()),
+            workflow: None,
+            background: None,
+            jobs: None,
+            task_id: None,
+        };
+        configure(&mut params);
+        let agent = Agent::new(
+            params,
             AgentRunParams {
                 history,
                 system: "system".into(),
@@ -6212,21 +6301,32 @@ mod tests {
         });
     }
 
-    #[test_case(false; "task_like_text_has_no_origin")]
-    #[test_case(true; "typed_task_origin_is_preserved")]
-    fn injected_preamble_origin_is_copied_from_message(attributed: bool) {
+    fn automation_origin() -> AutomationEventOrigin {
+        AutomationEventOrigin {
+            automation: AUTOMATION.into(),
+            fire_id: AUTOMATION_FIRE_ID.into(),
+            seq: AUTOMATION_SEQ,
+        }
+    }
+
+    #[test_case(None; "task_like_text_has_no_origin")]
+    #[test_case(Some(TASK_EVENT_KEY); "typed_task_origin_is_preserved")]
+    #[test_case(Some(AUTOMATION_EVENT_KEY); "typed_automation_origin_is_preserved")]
+    fn injected_preamble_origin_is_copied_from_message(attributed: Option<&str>) {
         const TASK: &str = "friendly-task-name";
         const INVOCATION: &str = "opaque-invocation";
         const EVENT: &str = "opaque-event";
         const TEXT: &str = "Task friendly-task-name: success.\n\nVerified the result.";
         smol::block_on(async {
-            let origin = attributed.then(|| TaskEventOrigin {
+            let mut message = Message::observation(TEXT.into());
+            message.task_event = (attributed == Some(TASK_EVENT_KEY)).then(|| TaskEventOrigin {
                 task_id: TASK.into(),
                 invocation_id: INVOCATION.into(),
                 event_id: EVENT.into(),
             });
-            let mut message = Message::observation(TEXT.into());
-            message.task_event = origin.clone();
+            message.automation_event =
+                (attributed == Some(AUTOMATION_EVENT_KEY)).then(automation_origin);
+            let expected = (message.task_event.clone(), message.automation_event.clone());
             let original = serde_json::to_value(&message).unwrap();
             let mut history = History::new(Vec::new());
             let (mut agent, event_rx) = make_agent(
@@ -6247,14 +6347,19 @@ mod tests {
                 .unwrap();
             let wire = serde_json::to_value(&event).unwrap();
             let AgentEvent::Injected {
-                text, task_event, ..
+                text,
+                task_event,
+                automation_event,
+                ..
             } = event
             else {
                 unreachable!()
             };
             assert_eq!(text, TEXT);
-            assert_eq!(task_event, origin);
-            assert_eq!(wire.get("task_event").is_some(), attributed);
+            assert_eq!((task_event, automation_event), expected);
+            for key in [TASK_EVENT_KEY, AUTOMATION_EVENT_KEY] {
+                assert_eq!(wire.get(key).is_some(), attributed == Some(key));
+            }
             assert_eq!(
                 serde_json::to_value(&history.as_slice()[0]).unwrap(),
                 original
@@ -6576,6 +6681,14 @@ mod tests {
                     run_id: "workflow".into(),
                     revision: 1,
                 },
+            ),
+            Message::automation_observation(
+                format!(
+                    "{}\n{}",
+                    crate::prompt::BUILD_MODE_MARKER,
+                    crate::prompt::ENVIRONMENT_MARKER
+                ),
+                automation_origin(),
             ),
         ];
         assert!(matches!(last_announced_mode(&history), AnnouncedMode::Plan));

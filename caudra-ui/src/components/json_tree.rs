@@ -1,6 +1,7 @@
-//! The JSON a workflow call was given or answered with, as rows a reader can
-//! fold. A result is often a deep object, and one long pretty-printed dump
-//! buries every row under it, so each container is a row that can be closed.
+//! JSON an inspector shows, such as a workflow call's request and result or an
+//! automation's event and state, as rows a reader can fold. Such a value is
+//! often a deep object, and one long pretty-printed dump buries every row
+//! under it, so each container is a row that can be closed.
 //!
 //! A node is named by where it sits in a walk of the whole value, so the name
 //! does not move when an ancestor closes and the fold survives a redraw. The

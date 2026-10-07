@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Caudra ships with 34 built-in tools in this reference (34 requiring no plugin opt-in, 0 opt-in via plugin options). Availability depends on the selected workspace backend. Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Caudra ships with 35 built-in tools in this reference (35 requiring no plugin opt-in, 0 opt-in via plugin options). Availability depends on the selected workspace backend. Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 First-party file, web, shell, index, Python, and environment tools run through protocol-neutral Workcell contracts. Workcell owns schemas, validation, execution bounds, atomic file changes, network policy, subprocess cleanup, cancellation, and the bundled worker lifecycle. Caudra owns registration, authorization, retained session output, and model or UI presentation. Release builds pin an exact Workcell revision.
 
@@ -42,11 +42,11 @@ Run [`caudra tools`](/docs/cli/) to see the resulting set, including which rule 
 
 ## Tools loaded on demand
 
-The default loading policy lets 10 built-in tools start outside the request array. The model sees a `tool_search` entry instead, and one call with a query loads the matching tools for the rest of the session. Sessions that never need them never pay for their descriptions. An explicit profile policy can make other native, local or remote Workcell, Lua/plugin, local callback, or MCP tools lazy too. A known-name direct call to an eligible lazy tool is valid and loads its schema. `tool_search` disappears when no eligible pending tools remain.
+The default loading policy lets 11 built-in tools start outside the request array. The model sees a `tool_search` entry instead, and one call with a query loads the matching tools for the rest of the session. Sessions that never need them never pay for their descriptions. An explicit profile policy can make other native, local or remote Workcell, Lua/plugin, local callback, or MCP tools lazy too. A known-name direct call to an eligible lazy tool is valid and loads its schema. `tool_search` disappears when no eligible pending tools remain.
 
 `code_map`, `code_context`, `code_refs`, `code_impact`, and `code_expand` load together as the code graph bundle, limited to eligible lazy members. Profile policy groups do not create additional loading bundles.
 
-`execution_environment`, `image_generate`, `python_execution`, `plan`, and `workflow` load on their own.
+`execution_environment`, `image_generate`, `python_execution`, `plan`, `workflow`, and `automation` load on their own.
 
 Loading changes the tool array, so the provider's prompt cache prefix resets and the next request re-reads the history as fresh input. Caudra posts a notice naming what loaded when it happens.
 
@@ -306,6 +306,19 @@ Experimental and off by default. Turn it on with `workflows = true` under `[expe
 | `agent_budget` | integer | no | Most agents the run may launch, for start and resume. |
 | `run_id` | string | no | Run id, for status, inspect, pause, resume, and stop. |
 | `limit` | integer | no | Most runs a history answer lists. |
+
+### `automation` <span class="badge">experimental</span> <span class="badge">on demand</span> {#automation}
+
+Read this session's automations: short Rhai scripts that react to events in one session, such as the session going idle, a goal finishing, or a schedule coming due. Load the `caudra-automation-dev` skill before writing or debugging one.
+
+Experimental and off by default. Turn it on with `automations = true` under `[experimental]` in the global `caudra.toml`. See [Experimental features](/docs/configuration/#experimental-features).
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `action` | string | yes | What to do. |
+| `name` | string | no | Automation name: required for validate, and narrows history to one automation. |
+| `fire_id` | string | no | A firing of this session, for history: its event, actions and state patch. |
+| `limit` | integer | no | Most firings a history answer lists: 20 by default, at most 50. |
 
 ### `list_sessions` <span class="badge">experimental</span> {#list_sessions}
 

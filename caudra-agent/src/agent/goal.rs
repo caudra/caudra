@@ -10,7 +10,9 @@ use caudra_providers::{
     AgentError, Billing, ContentBlock, Message, Model, ModelPurpose, RequestOptions, Timeouts,
     TokenUsage,
 };
-use caudra_storage::sessions::{StoredActiveGoal, StoredGoalVerdict};
+use caudra_storage::sessions::{
+    SessionMeta, StoredActiveGoal, StoredGoalResult, StoredGoalVerdict,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use strum::Display;
@@ -114,6 +116,15 @@ pub enum GoalStatus {
     Finished(GoalResult),
 }
 
+/// A goal as `SessionMeta` keeps it: the active goal, the last finished one,
+/// and the session's continuation limit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredGoal {
+    pub active: Option<Box<StoredActiveGoal>>,
+    pub result: Option<Box<StoredGoalResult>>,
+    pub continuation_limit: Option<u32>,
+}
+
 struct GoalState {
     generation: u64,
     active: Option<GoalSnapshot>,
@@ -169,6 +180,61 @@ impl GoalHandle {
             });
         }
         handle
+    }
+
+    /// Reopens everything a session stored of its goal: the active goal, the
+    /// result of the last finished one, and the continuation limit.
+    pub fn from_meta(meta: &SessionMeta) -> Self {
+        let handle = Self::restored(meta.active_goal.as_deref());
+        if let Some(limit) = meta.goal_continuation_limit {
+            handle.set_continuation_limit(limit);
+        }
+        if let Some(stored) = meta.goal_result.as_deref() {
+            handle.restore_finished(GoalResult {
+                condition: Arc::from(stored.condition.as_str()),
+                verdict: stored.verdict.into(),
+                reason: Arc::from(stored.reason.as_str()),
+                evaluations: stored.evaluations,
+                duration: Duration::from_millis(stored.duration_ms),
+                usage: stored.usage.into(),
+                cost: stored.usage.cost,
+                subscription_cost: stored.usage.subscription_cost,
+            });
+        }
+        handle
+    }
+
+    /// The goal as [`Self::from_meta`] reads it back. A finished result is
+    /// kept only while no goal is active.
+    pub fn stored(&self) -> StoredGoal {
+        let state = self.lock();
+        StoredGoal {
+            active: state.active.as_ref().map(|goal| {
+                Box::new(StoredActiveGoal {
+                    condition: goal.condition.to_string(),
+                    evaluations: goal.evaluations,
+                    elapsed_ms: saturating_millis(goal.elapsed()),
+                    usage: goal.usage.spent(goal.cost, goal.subscription_cost),
+                    last_verdict: goal.last_verdict.map(Into::into),
+                    last_reason: goal.last_reason.as_deref().map(str::to_owned),
+                })
+            }),
+            result: state
+                .finished
+                .as_ref()
+                .filter(|_| state.active.is_none())
+                .map(|goal| {
+                    Box::new(StoredGoalResult {
+                        condition: goal.condition.to_string(),
+                        verdict: goal.verdict.into(),
+                        reason: goal.reason.to_string(),
+                        evaluations: goal.evaluations,
+                        duration_ms: saturating_millis(goal.duration),
+                        usage: goal.usage.spent(goal.cost, goal.subscription_cost),
+                    })
+                }),
+            continuation_limit: Some(state.continuation_limit),
+        }
     }
 
     pub fn set(&self, condition: &str) -> Result<GoalSnapshot, GoalError> {
@@ -304,12 +370,13 @@ impl GoalHandle {
         }
 
         let active = state.active.take().expect("active goal checked above");
+        let duration = active.elapsed();
         state.finished = Some(GoalResult {
             condition: active.condition,
             verdict,
             reason,
             evaluations: active.evaluations,
-            duration: active.started_at.elapsed(),
+            duration,
             usage: active.usage,
             cost: active.cost,
             subscription_cost: active.subscription_cost,
@@ -769,6 +836,12 @@ fn truncate_output(output: &str) -> String {
     output.chars().take(2_000).collect()
 }
 
+/// Saturates rather than wraps: a goal left open for longer than `u64`
+/// milliseconds is not a number worth panicking over.
+fn saturating_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 fn add_cost(total: &mut Option<f64>, cost: Option<f64>) {
     if let Some(cost) = cost {
         *total = Some(total.unwrap_or_default() + cost);
@@ -848,6 +921,10 @@ mod tests {
     const IMAGE_DATA: &str = "aGk=";
     const ANSWER_JSON: &str = r#"{"ok":true,"reason":"tests pass","impossible":false}"#;
     const NO_TOOL_BLOCKS: &str = "flattening must leave no tool blocks behind";
+    const VERIFIED: &str = "verified";
+    const ELAPSED_BEFORE_RESUME_MS: u64 = 90_000;
+    const COUNTS_TIME_BEFORE_RESUME: &str =
+        "a resumed goal's duration must include the time it ran before the resume";
 
     struct NullProvider;
 
@@ -988,6 +1065,30 @@ mod tests {
         };
         assert_eq!(result.verdict, GoalVerdict::Met);
         assert_eq!(result.reason.as_ref(), "verified");
+    }
+
+    #[test]
+    fn a_resumed_goal_finishes_with_the_time_it_ran_before_the_resume() {
+        let handle = GoalHandle::restored(Some(&StoredActiveGoal {
+            condition: PROMPT.to_owned(),
+            evaluations: 0,
+            elapsed_ms: ELAPSED_BEFORE_RESUME_MS,
+            usage: Default::default(),
+            last_verdict: None,
+            last_reason: None,
+        }));
+        let goal = handle.snapshot().expect("the stored goal must resume");
+        assert!(matches!(
+            handle.apply_evaluation(goal.generation, GoalVerdict::Met, Arc::from(VERIFIED)),
+            GoalApply::Terminal
+        ));
+        let Some(GoalStatus::Finished(result)) = handle.status() else {
+            panic!("finished goal missing");
+        };
+        assert!(
+            result.duration >= Duration::from_millis(ELAPSED_BEFORE_RESUME_MS),
+            "{COUNTS_TIME_BEFORE_RESUME}"
+        );
     }
 
     #[test]

@@ -57,6 +57,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "task",
             "task_control",
             "workflow",
+            "automation",
             "list_sessions",
             "send_message",
             "publish_message",
@@ -279,9 +280,9 @@ fn write_param_table(out: &mut String, params: &[Param]) {
 
 /// The experiment that keeps `name` out of every catalog while it is off.
 fn experiment(name: &str) -> Option<Feature> {
-    Feature::ALL
-        .into_iter()
-        .find(|&feature| feature_exclusions(FeatureFlags::all().without(feature)).contains(&name))
+    Feature::ALL.into_iter().find(|&feature| {
+        feature_exclusions(FeatureFlags::all().without(feature)).any(|excluded| excluded == name)
+    })
 }
 
 fn write_tool_entry(out: &mut String, name: &str, info: &ToolInfo, opt_in: &HashSet<String>) {

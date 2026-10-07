@@ -21,8 +21,9 @@ use super::topics::validate_patterns;
 use super::work::valid_memberships;
 use super::{
     Delivery, HostInner, MAX_FRAME_BYTES, MAX_LABEL_BYTES, MAX_PATH_BYTES, MAX_SESSIONS,
-    PROTOCOL_VERSION, PeerInfo, PeerSession, Request, Response, Route, SendReceipt, lock,
-    valid_handle, valid_token,
+    OLDER_RECIPIENT, PROTOCOL_VERSION, PeerInfo, PeerSession, Request, Response, Route,
+    STATUS_HELD, STATUS_QUEUED, STATUS_RATE_LIMITED, STATUS_REFUSED, STATUS_UNAVAILABLE,
+    STATUS_UNKNOWN, SendReceipt, lock, valid_handle, valid_token,
 };
 
 const DIRECTORY_MODE: u32 = 0o700;
@@ -38,6 +39,7 @@ const MAX_CONNECTIONS: usize = 16;
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const TIMEOUT: &str = "Local peer transport timed out";
+const HUNG_UP: &str = "The recipient hung up without answering";
 pub(super) const PARTIAL: &str =
     "Peer discovery is partial: registry, response, or time limit reached";
 const UNSAFE_ENTRY: &str = "Peer runtime entry has unsafe ownership, permissions, or type";
@@ -447,6 +449,34 @@ async fn read_frame<T: DeserializeOwned>(stream: &mut Async<UnixStream>) -> Resu
         .read_exact(&mut length)
         .await
         .map_err(|error| error.to_string())?;
+    read_body(stream, length).await
+}
+
+/// The response to a request, or `None` when the peer hung up without
+/// writing a byte, as a peer does with a request it cannot read.
+async fn read_response(stream: &mut Async<UnixStream>) -> Result<Option<Response>, String> {
+    let mut length = [0_u8; 4];
+    let (first, rest) = length.split_at_mut(1);
+    if stream
+        .read(first)
+        .await
+        .map_err(|error| error.to_string())?
+        == 0
+    {
+        return Ok(None);
+    }
+    stream
+        .read_exact(rest)
+        .await
+        .map_err(|error| error.to_string())?;
+    read_body(stream, length).await.map(Some)
+}
+
+/// The rest of a frame whose length prefix was `length`.
+async fn read_body<T: DeserializeOwned>(
+    stream: &mut Async<UnixStream>,
+    length: [u8; 4],
+) -> Result<T, String> {
     let length = u32::from_be_bytes(length) as usize;
     if length == 0 || length > MAX_FRAME_BYTES {
         return Err("Peer JSON frame exceeds the 64 KiB limit".into());
@@ -530,10 +560,13 @@ pub(super) fn listen(host: Weak<HostInner>, listener: Async<UnixListener>) -> sm
 }
 
 pub(super) async fn send(session: &PeerSession, delivery: Delivery, epoch: u64) -> SendReceipt {
+    let automation = delivery.sender.automation.is_some();
     deliver(session.0.host.endpoint.directory(), delivery, || {
         let state = lock(&session.0.state);
         state.ensure_open()?;
-        if state.epoch != epoch || state.descriptor.blocked || state.descriptor.mode.is_read_only()
+        if state.epoch != epoch
+            || (state.descriptor.blocked && !automation)
+            || state.descriptor.mode.is_read_only()
         {
             return Err("Peer send invalidated by a session policy or workspace change".into());
         }
@@ -550,9 +583,10 @@ pub(super) async fn deliver(
     before_write: impl FnOnce() -> Result<(), String>,
 ) -> SendReceipt {
     let message_id = delivery.message_id.clone();
+    let marked = delivery.sender.automation.is_some();
     let route = match Route::parse(&delivery.target) {
         Ok(route) => route,
-        Err(reason) => return SendReceipt::new("refused", &message_id, Some(&reason)),
+        Err(reason) => return SendReceipt::new(STATUS_REFUSED, &message_id, Some(&reason)),
     };
     let request = Request::Send {
         version: PROTOCOL_VERSION,
@@ -560,7 +594,7 @@ pub(super) async fn deliver(
     };
     if !serde_json::to_vec(&request).is_ok_and(|bytes| bytes.len() <= MAX_FRAME_BYTES) {
         return SendReceipt::new(
-            "refused",
+            STATUS_REFUSED,
             &message_id,
             Some("Peer JSON frame exceeds the 64 KiB limit"),
         );
@@ -572,26 +606,37 @@ pub(super) async fn deliver(
         // Any failure after the first write may have followed receiver admission.
         written = true;
         write_frame(&mut stream, &request).await?;
-        match read_frame::<Response>(&mut stream).await? {
-            Response::Receipt { receipt }
+        match read_response(&mut stream).await? {
+            Some(Response::Receipt { receipt })
                 if receipt.message_id == message_id
                     && matches!(
                         receipt.status.as_str(),
-                        "queued" | "held" | "refused" | "rate_limited"
+                        STATUS_QUEUED | STATUS_HELD | STATUS_REFUSED | STATUS_RATE_LIMITED
                     ) =>
             {
                 Ok(receipt)
             }
-            Response::Error { reason } => {
-                Ok(SendReceipt::new("refused", &message_id, Some(&reason)))
+            Some(Response::Error { reason }) => {
+                Ok(SendReceipt::new(STATUS_REFUSED, &message_id, Some(&reason)))
             }
+            // An older peer cannot read the automation marker, so it hangs up.
+            None if marked => Ok(SendReceipt::new(
+                STATUS_REFUSED,
+                &message_id,
+                Some(OLDER_RECIPIENT),
+            )),
+            None => Err(HUNG_UP.into()),
             _ => Err("Invalid peer send response".into()),
         }
     })
     .await;
     result.unwrap_or_else(|reason| {
         SendReceipt::new(
-            if written { "unknown" } else { "unavailable" },
+            if written {
+                STATUS_UNKNOWN
+            } else {
+                STATUS_UNAVAILABLE
+            },
             &message_id,
             Some(&reason),
         )
@@ -688,31 +733,90 @@ pub(super) async fn discover(directory: &Directory) -> Result<Vec<PeerInfo>, Str
 #[cfg(test)]
 mod tests {
     use std::fs::{self, Permissions};
+    use std::ops::Not;
     use std::os::unix::fs::{PermissionsExt, symlink};
-    use std::os::unix::net::UnixStream;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
 
     use async_io::Async;
     use caudra_config::InboundPolicy;
+    use caudra_providers::PeerAudience;
     use caudra_storage::id::CaudraId;
     use caudra_storage::sessions::PermissionMode;
-    use futures_lite::{AsyncWriteExt, future};
+    use futures_lite::{AsyncReadExt, AsyncWriteExt, future};
+    use serde::{Deserialize, Serialize};
     use tempfile::TempDir;
     use test_case::test_case;
 
     use super::{
         DIRECTORY_MODE, Directory, Endpoint, FILE_MODE, MAX_DIRECTORY_ENTRIES, MAX_FRAME_BYTES,
-        PARTIAL, PERMISSION_MASK, Request, Response, UNSAFE_ENTRY, check_peer_uid, discover,
-        make_private_directory, read_frame, uid, write_frame,
+        OLDER_RECIPIENT, PARTIAL, PERMISSION_MASK, Request, Response, STATUS_HELD, STATUS_QUEUED,
+        STATUS_RATE_LIMITED, STATUS_REFUSED, STATUS_UNKNOWN, SendReceipt, UNSAFE_ENTRY,
+        check_peer_uid, discover, make_private_directory, read_frame, uid, write_frame,
     };
     use crate::AgentMode;
+    use crate::peers::tests::{descriptor, directory};
     use crate::peers::{
-        MESSAGE_WORDS, PeerDescriptor, PeerHost, Route, lock, tests::directory, token, valid_name,
+        MESSAGE_WORDS, PeerDescriptor, PeerHost, PeerSession, Route, SendFailureKind, SendOrigin,
+        WireMode, lock, token, valid_name,
     };
 
     const UNKNOWN: &str = "unknown";
     const REFUSED: &str = "refused";
+    const AUTOMATION: &str = "nightly-digest";
+    const TEXT: &str = "The nightly build failed";
+    const REQUEST_ID: &str = "automation:fire-1:0";
+
+    /// A send request as a peer from before the automation marker reads it.
+    #[derive(Serialize, Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+    enum OlderRequest {
+        Send {
+            version: u32,
+            delivery: OlderDelivery,
+        },
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct OlderDelivery {
+        message_id: String,
+        issued_ms: u64,
+        target: String,
+        sender: OlderSender,
+        text: String,
+        reply_to: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_sender: Option<String>,
+        #[serde(default, skip_serializing_if = "PeerAudience::is_direct")]
+        audience: PeerAudience,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct OlderSender {
+        route: Route,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handle: Option<String>,
+        canonical_cwd: Option<PathBuf>,
+        mode: WireMode,
+        permission_mode: PermissionMode,
+        #[serde(default, skip_serializing_if = "Not::not")]
+        external: bool,
+    }
+
+    /// How a recipient answers one send.
+    enum Answer {
+        Status(&'static str),
+        /// A receipt for some other message.
+        Mismatched,
+        /// What a peer from before the automation marker answers, which
+        /// reads ordinary traffic byte for byte.
+        Older,
+    }
 
     fn open(directory: &TempDir) -> Directory {
         Directory::open(directory.path().to_owned()).unwrap()
@@ -946,6 +1050,103 @@ mod tests {
                     .unwrap()
                     .status,
                 REFUSED
+            );
+        });
+    }
+
+    /// A session, and a recipient it knows by a word target whose host the
+    /// test answers for.
+    fn fake_recipient(directory: &TempDir) -> (PeerSession, Endpoint, Async<UnixListener>, String) {
+        let host =
+            PeerHost::start_in(directory.path().to_owned(), Arc::new(AtomicUsize::new(0))).unwrap();
+        let sender = host
+            .register(descriptor(directory.path(), InboundPolicy::Auto))
+            .unwrap();
+        let id = token().unwrap();
+        let (endpoint, listener) = Endpoint::bind(open(directory), &id).unwrap();
+        let route = Route {
+            host: id,
+            session: CaudraId::generate(),
+            generation: token().unwrap(),
+        };
+        let target = lock(&sender.0.state).peer_name(&route.target()).unwrap();
+        (sender, endpoint, listener, target)
+    }
+
+    /// Answers the next send on `listener` as `answer` says.
+    async fn answer(listener: &Async<UnixListener>, answer: Answer) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut length = [0_u8; 4];
+        stream.read_exact(&mut length).await.unwrap();
+        let mut frame = vec![0; u32::from_be_bytes(length) as usize];
+        stream.read_exact(&mut frame).await.unwrap();
+        let Request::Send { delivery, .. } = serde_json::from_slice::<Request>(&frame).unwrap()
+        else {
+            panic!("expected a delivery");
+        };
+        let (status, message_id) = match answer {
+            Answer::Status(status) => (status, delivery.message_id),
+            Answer::Mismatched => (STATUS_QUEUED, token().unwrap()),
+            Answer::Older => match serde_json::from_slice::<OlderRequest>(&frame) {
+                Ok(older) => {
+                    assert_eq!(serde_json::to_vec(&older).unwrap(), frame);
+                    (STATUS_QUEUED, delivery.message_id)
+                }
+                Err(_) => return,
+            },
+        };
+        let receipt = SendReceipt::new(status, &message_id, None);
+        write_frame(&mut stream, &Response::Receipt { receipt })
+            .await
+            .unwrap();
+    }
+
+    #[test_case(SendOrigin::Session, Ok(STATUS_QUEUED); "ordinary_traffic")]
+    #[test_case(SendOrigin::Automation(AUTOMATION.into()), Err(OLDER_RECIPIENT); "marked_traffic")]
+    fn older_peers_read_ordinary_traffic_unchanged_and_refuse_the_marker(
+        origin: SendOrigin,
+        expected: Result<&str, &str>,
+    ) {
+        smol::block_on(async {
+            let directory = directory();
+            let (sender, _endpoint, listener, target) = fake_recipient(&directory);
+            let (sent, ()) = future::zip(
+                sender.send_from(&origin, &target, TEXT, None, REQUEST_ID),
+                answer(&listener, Answer::Older),
+            )
+            .await;
+            assert_eq!(
+                sent.map(|receipt| receipt.status)
+                    .map_err(|failure| (failure.kind, failure.reason)),
+                expected
+                    .map(str::to_owned)
+                    .map_err(|reason| (SendFailureKind::Refused, reason.to_owned()))
+            );
+        });
+    }
+
+    #[test_case(Answer::Status(STATUS_QUEUED), Ok(STATUS_QUEUED); "queued")]
+    #[test_case(Answer::Status(STATUS_HELD), Ok(STATUS_HELD); "held")]
+    #[test_case(Answer::Mismatched, Ok(STATUS_UNKNOWN); "unknown")]
+    #[test_case(Answer::Status(STATUS_REFUSED), Err(SendFailureKind::Refused); "refused")]
+    #[test_case(Answer::Status(STATUS_RATE_LIMITED), Err(SendFailureKind::RateLimited); "rate_limited")]
+    fn automation_sends_report_what_the_recipient_answered(
+        given: Answer,
+        expected: Result<&str, SendFailureKind>,
+    ) {
+        smol::block_on(async {
+            let directory = directory();
+            let (sender, _endpoint, listener, target) = fake_recipient(&directory);
+            let origin = SendOrigin::Automation(AUTOMATION.into());
+            let (sent, ()) = future::zip(
+                sender.send_from(&origin, &target, TEXT, None, REQUEST_ID),
+                answer(&listener, given),
+            )
+            .await;
+            assert_eq!(
+                sent.map(|receipt| receipt.status)
+                    .map_err(|failure| failure.kind),
+                expected.map(str::to_owned)
             );
         });
     }

@@ -24,7 +24,15 @@ pub(super) const BETA_TOOL_EXAMPLES_BEDROCK: &str = "tool-examples-2025-10-29";
 /// touches these when they are fenced in backticks or bold, so "a shell command
 /// pipeline" survives while `` `shell` `` is renamed with everything else.
 const AMBIGUOUS_TOOL_WORDS: &[&str] = &[
-    "batch", "index", "memory", "question", "shell", "skill", "task", "workflow",
+    "automation",
+    "batch",
+    "index",
+    "memory",
+    "question",
+    "shell",
+    "skill",
+    "task",
+    "workflow",
 ];
 
 /// Longest wire name the messages API accepts.
@@ -1142,8 +1150,8 @@ mod tests {
     use super::EventParser;
     use crate::model::ModelPricing;
     use crate::providers::test_support::{
-        PEER_ATTACK, PEER_TEXT, assert_peer_framing, peer_message_origin, task_event_origin,
-        task_observation_with_output_refs, workflow_event_origin,
+        PEER_ATTACK, PEER_TEXT, assert_peer_framing, automation_event_origin, peer_message_origin,
+        task_event_origin, task_observation_with_output_refs, workflow_event_origin,
     };
     use crate::{
         ContentBlock, Message, Model, ProviderEvent, StandingReminderKind, SteeringKind,
@@ -1313,6 +1321,7 @@ mod tests {
     #[test_case(Message::task_observation(STEERING_TEXT.into(), task_event_origin()) ; "task_event")]
     #[test_case(task_observation_with_output_refs(STEERING_TEXT); "retained_task_outputs")]
     #[test_case(Message::workflow_observation(STEERING_TEXT.into(), workflow_event_origin()) ; "workflow_event")]
+    #[test_case(Message::automation_observation(STEERING_TEXT.into(), automation_event_origin()) ; "automation_event")]
     #[test_case(Message::standing_reminder(STEERING_TEXT.into(), StandingReminderKind::BackgroundWork) ; "background_reminder")]
     fn observation_metadata_is_not_on_wire(message: Message) {
         let messages = [message];
@@ -1454,11 +1463,13 @@ mod tests {
     #[test_case("nothing to do", "nothing to do" ; "untouched_prose")]
     #[test_case("", "" ; "empty")]
     #[test_case("café file_read", "café mcp_File_read" ; "multibyte_neighbour")]
+    #[test_case("an automation from `caudra-automation-dev`", "an automation from `caudra-automation-dev`" ; "skill_name_is_not_a_mention")]
     fn tool_mentions_rewrite_by_fencing(text: &str, expected: &str) {
         let renames = HashMap::from([
             ("file_read".to_string(), "mcp_File_read".to_string()),
             ("code_map".to_string(), "mcp_Code_map".to_string()),
             ("shell".to_string(), "mcp_Shell".to_string()),
+            ("automation".to_string(), "mcp_Automation".to_string()),
         ]);
         assert_eq!(rewrite_tool_mentions(text, &renames), expected);
     }

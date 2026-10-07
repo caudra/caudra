@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use caudra_agent::GoalHandle;
 use caudra_agent::prompt::profile::{BUILTIN_PROFILE_NAME, SystemPromptProfile};
-use caudra_agent::{GoalHandle, GoalResult};
 use caudra_config::ModelPolicy;
 use caudra_providers::provider::adjust_model;
 use caudra_providers::{
@@ -137,22 +137,7 @@ impl SessionState {
             0 => counted_turns(session.messages()),
             turns => turns,
         };
-        let goal = GoalHandle::restored(session.meta.active_goal.as_deref());
-        if let Some(limit) = session.meta.goal_continuation_limit {
-            goal.set_continuation_limit(limit);
-        }
-        if let Some(stored) = session.meta.goal_result.as_ref() {
-            goal.restore_finished(GoalResult {
-                condition: Arc::from(stored.condition.as_str()),
-                verdict: stored.verdict.into(),
-                reason: Arc::from(stored.reason.as_str()),
-                evaluations: stored.evaluations,
-                duration: std::time::Duration::from_millis(stored.duration_ms),
-                usage: stored.usage.into(),
-                cost: stored.usage.cost,
-                subscription_cost: stored.usage.subscription_cost,
-            });
-        }
+        let goal = GoalHandle::from_meta(&session.meta);
 
         let applied_model = model.spec();
 

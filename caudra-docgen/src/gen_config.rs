@@ -6,11 +6,11 @@ use caudra_config::example::Entry;
 use caudra_config::files::{self, CONFIG_FILES, ConfigFile, Scope};
 use caudra_config::steering::{SteeringRule, SteeringRulesConfig};
 use caudra_config::{
-    AgentConfig, ConfigField, ConfigValue, DEFAULT_MAX_LOG_FILES, DEFAULT_MAX_OUTPUT_LINES,
-    DEFAULT_MOUSE_SCROLL_LINES, DecisionsConfig, Feature, FeatureFlags, MIN_TOOL_OUTPUT_LINES,
-    MessagingConfig, NATIVE_PLUGIN_OPTIONS, ProviderConfig, RetentionConfig, SnapshotsConfig,
-    SteeringConfig, StorageConfig, TOP_LEVEL_FIELDS, TelemetryConfig, ToolOutputLines, UiConfig,
-    WorktreesConfig,
+    AgentConfig, AutomationsConfig, ConfigField, ConfigValue, DEFAULT_MAX_LOG_FILES,
+    DEFAULT_MAX_OUTPUT_LINES, DEFAULT_MOUSE_SCROLL_LINES, DecisionsConfig, Feature, FeatureFlags,
+    MIN_TOOL_OUTPUT_LINES, MessagingConfig, NATIVE_PLUGIN_OPTIONS, ProviderConfig, RetentionConfig,
+    SnapshotsConfig, SteeringConfig, StorageConfig, TOP_LEVEL_FIELDS, TelemetryConfig,
+    ToolOutputLines, UiConfig, WorktreesConfig,
 };
 
 use crate::gen_providers::join_and;
@@ -133,6 +133,12 @@ fn experiment_scope(feature: Feature) -> &'static str {
         }
         Feature::CrossSessionMessaging => {
             "Local [cross-session messaging](/docs/messaging/): the `list_sessions`, `send_message`, `publish_message`, `read_topic`, and `work_assignment` tools, `/peers`, `/messages`, `/topics`, `/groups`, `caudra message`, live session inboxes, consumer groups, and the message history. Both processes must opt in."
+        }
+        Feature::Automations => {
+            "[Automations](/docs/automations/): scripts that act on session events when their \
+             conditions hold, within the limits in [`[automations]`](#automations), and the \
+             `caudra-automation-dev` skill. Messaging triggers and actions also need \
+             `cross_session_messaging`, and workflow triggers and actions also need `workflows`."
         }
     }
 }
@@ -406,6 +412,19 @@ fn write_worktrees_section(out: &mut String) {
          opens as a grouped Herdr workspace. `directory` applies only to worktrees git \
          creates. See [Worktrees](/docs/worktrees/) for what `/worktree` does with each \
          backend.\n"
+    )
+    .unwrap();
+}
+
+fn write_automations_section(out: &mut String) {
+    write_section(out, "[automations]", AutomationsConfig::FIELDS);
+    writeln!(
+        out,
+        "[Automations](/docs/automations/) are experimental and need `automations = true` under \
+         [`[experimental]`](#experimental-features). Only the global `caudra.toml` may hold this \
+         table. Caudra rejects a project `.caudra/caudra.toml` that contains it, even an empty \
+         one, so a repository cannot raise these limits or let automations reach a private \
+         network.\n"
     )
     .unwrap();
 }
@@ -849,6 +868,7 @@ For every setting in one file, with its type, default, and description, run [`ca
     write_telemetry_section(&mut out);
     write_worktrees_section(&mut out);
     write_decisions_section(&mut out);
+    write_automations_section(&mut out);
 
     writeln!(out, "## Plugins\n").unwrap();
     writeln!(
@@ -890,8 +910,8 @@ enabled = false
     writeln!(out, "## Validation\n").unwrap();
     writeln!(
         out,
-        "If a value is below its minimum, Caudra shows a `ConfigError` with the field name, \
-         value, and minimum."
+        "If a value is below its minimum or above its maximum, Caudra shows a `ConfigError` with \
+         the field name, the value, and the bound it crossed."
     )
     .unwrap();
 

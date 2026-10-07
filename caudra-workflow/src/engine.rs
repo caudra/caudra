@@ -1,10 +1,12 @@
-use std::any::Any;
-use std::cell::RefCell;
+use std::cell::{Cell, OnceCell, RefCell};
+use std::num::NonZeroU64;
 use std::rc::Rc;
-use std::sync::mpsc::{self, Sender};
-use std::thread;
 use std::time::Instant;
 
+use caudra_script::{
+    BridgeClosed, HostBridge, HostKind, InterpreterError, SandboxLimits, restricted_engine,
+    run_interpreter,
+};
 use rhai::{Array, Dynamic, Engine, EvalAltResult, Map, Position, Scope};
 use serde::Serialize;
 use serde_json::Value;
@@ -19,10 +21,9 @@ use crate::journal::{
 use crate::run::{EngineLimits, PauseKind, WorkflowOutcome};
 
 const INTERPRETER_THREAD_NAME: &str = "caudra-workflow";
-const INTERPRETER_STACK_BYTES: usize = 32 * 1024 * 1024;
 /// Operations between deadline and cancellation polls; each poll is one host round trip.
-const PROGRESS_POLL_OPS: u64 = 16_384;
-const DISABLED_SYMBOLS: [&str; 3] = ["eval", "print", "debug"];
+const PROGRESS_POLL_OPS: NonZeroU64 = NonZeroU64::new(16_384).unwrap();
+const UNAVAILABLE_IN: &str = "workflow scripts; end a run with complete() or pause()";
 const ARGS_VARIABLE: &str = "args";
 
 const OPT_PROMPT: &str = "prompt";
@@ -90,7 +91,7 @@ impl WorkflowEngine for RhaiEngine {
     fn compile(&self, source: &str) -> Result<(), EngineError> {
         let limits = EngineLimits::default();
         check_source_size(source, limits.max_source_bytes)?;
-        restricted_engine(&limits)
+        restricted_engine(&SandboxLimits::from(&limits), UNAVAILABLE_IN)
             .compile(source)
             .map(drop)
             .map_err(|error| EngineError::Compile(error.to_string()))
@@ -105,59 +106,56 @@ impl WorkflowEngine for RhaiEngine {
             limits,
             agent_budget,
         } = params;
-        let (jobs_tx, jobs_rx) = mpsc::channel();
-        thread::scope(|scope| {
-            let interpreter = thread::Builder::new()
-                .name(INTERPRETER_THREAD_NAME.into())
-                .stack_size(INTERPRETER_STACK_BYTES)
-                .spawn_scoped(scope, move || {
-                    evaluate(
-                        source,
-                        args,
-                        journal,
-                        limits,
-                        agent_budget,
-                        HostBridge(jobs_tx),
-                    )
-                });
-            let interpreter = match interpreter {
-                Ok(handle) => handle,
-                Err(error) => {
-                    return WorkflowOutcome::Failed(format!(
-                        "could not start the workflow interpreter: {error}"
-                    ));
+        run_interpreter(INTERPRETER_THREAD_NAME, host, move |bridge| {
+            evaluate(source, args, journal, limits, agent_budget, bridge)
+        })
+        .unwrap_or_else(|error| {
+            WorkflowOutcome::Failed(match error {
+                InterpreterError::Spawn(error) => {
+                    format!("could not start the workflow interpreter: {error}")
                 }
-            };
-            for job in jobs_rx {
-                job(host);
-            }
-            interpreter
-                .join()
-                .unwrap_or_else(|panic| WorkflowOutcome::Failed(panic_message(panic.as_ref())))
+                InterpreterError::Panicked(detail) => {
+                    format!("workflow interpreter panicked: {detail}")
+                }
+            })
         })
     }
 }
 
 type ScriptResult<T> = Result<T, Box<EvalAltResult>>;
-type HostJob = Box<dyn FnOnce(&dyn WorkflowHost) + Send>;
 
-/// Ends the run. Travels inside `EvalAltResult::ErrorTerminated`, which scripts cannot catch.
+/// Host calls borrow the run's `dyn WorkflowHost` for as long as the run lends it.
+struct WorkflowHosts;
+
+impl HostKind for WorkflowHosts {
+    type Host<'h> = dyn WorkflowHost + 'h;
+}
+
+/// Ends the run, in `EvalAltResult::ErrorTerminated`. A closure called by an array method hands
+/// even that to `catch`, so the session latches the first one and every later host call and
+/// operation raises it again.
 #[derive(Clone)]
 enum Terminal {
     Complete(Value),
     Pause { kind: PauseKind, message: String },
     Cancelled,
     BudgetLimited,
+    TooManyOperations,
     Fatal(String),
 }
 
 impl Terminal {
-    fn into_outcome(self) -> WorkflowOutcome {
+    /// `position` is where the run stopped, if an error carried one out of the script. Only the
+    /// operations limit reports it, so its failure reads as Rhai's own error does.
+    fn into_outcome(self, position: Position) -> WorkflowOutcome {
         match self {
             Self::Complete(value) => WorkflowOutcome::Completed(value),
             Self::Pause { kind, message } => WorkflowOutcome::Paused { kind, message },
             Self::Cancelled => WorkflowOutcome::Cancelled,
             Self::BudgetLimited => WorkflowOutcome::BudgetLimited,
+            Self::TooManyOperations => {
+                WorkflowOutcome::Failed(EvalAltResult::ErrorTooManyOperations(position).to_string())
+            }
             Self::Fatal(error) => WorkflowOutcome::Failed(error),
         }
     }
@@ -172,6 +170,12 @@ impl From<Terminal> for Box<EvalAltResult> {
     }
 }
 
+impl From<BridgeClosed> for Terminal {
+    fn from(_: BridgeClosed) -> Self {
+        Self::Fatal(HOST_GONE.into())
+    }
+}
+
 fn fatal(message: impl Into<String>) -> Box<EvalAltResult> {
     Terminal::Fatal(message.into()).into()
 }
@@ -183,29 +187,8 @@ fn runtime_error(message: impl Into<String>) -> Box<EvalAltResult> {
     ))
 }
 
-/// Ships host work to the thread that owns the `&dyn WorkflowHost` and waits for the answer.
-#[derive(Clone)]
-struct HostBridge(Sender<HostJob>);
-
-impl HostBridge {
-    fn call<T: Send + 'static>(
-        &self,
-        job: impl FnOnce(&dyn WorkflowHost) -> T + Send + 'static,
-    ) -> Result<T, Terminal> {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        self.0
-            .send(Box::new(move |host| {
-                let _ = reply_tx.send(job(host));
-            }))
-            .map_err(|_| Terminal::Fatal(HOST_GONE.into()))?;
-        reply_rx
-            .recv()
-            .map_err(|_| Terminal::Fatal(HOST_GONE.into()))
-    }
-}
-
-fn host_result<T>(reply: Result<Result<T, HostError>, Terminal>) -> ScriptResult<T> {
-    match reply? {
+fn host_result<T>(reply: Result<Result<T, HostError>, BridgeClosed>) -> ScriptResult<T> {
+    match reply.map_err(Terminal::from)? {
         Ok(value) => Ok(value),
         Err(HostError::Cancelled) => Err(Terminal::Cancelled.into()),
         Err(HostError::BudgetExhausted) => Err(Terminal::BudgetLimited.into()),
@@ -223,14 +206,83 @@ struct RunState {
 }
 
 struct Session {
-    host: HostBridge,
+    host: HostBridge<WorkflowHosts>,
     journal: Journal,
     limits: EngineLimits,
     agent_budget: u32,
+    latched: OnceCell<Terminal>,
+    operations: Cell<u64>,
     state: RefCell<RunState>,
 }
 
 impl Session {
+    /// Wraps every host function that can reach the host or end the run: a latched terminal is
+    /// raised again before the call does anything, and the first terminal a call raises is latched.
+    fn guard<T>(&self, call: impl FnOnce() -> ScriptResult<T>) -> ScriptResult<T> {
+        if let Some(terminal) = self.latched.get() {
+            return Err(terminal.clone().into());
+        }
+        call().inspect_err(|error| {
+            if let EvalAltResult::ErrorTerminated(token, _) = &**error
+                && let Some(terminal) = token.read_lock::<Terminal>()
+            {
+                self.latch(terminal.clone());
+            }
+        })
+    }
+
+    /// Called for every operation, so it counts the run's total: Rhai counts a closure's
+    /// operations on a copy of its state that the closure's return discards. A latched terminal
+    /// is raised again at once, the operations limit is latched at its last operation, before
+    /// Rhai's own error could be caught in a closure, and the deadline and host cancellation are
+    /// checked every [`PROGRESS_POLL_OPS`].
+    fn progress(
+        &self,
+        max_operations: Option<NonZeroU64>,
+        deadline: Option<Instant>,
+    ) -> Option<Terminal> {
+        let operations = self.operations.get() + 1;
+        self.operations.set(operations);
+        if let Some(terminal) = self.latched.get() {
+            return Some(terminal.clone());
+        }
+        let terminal = if max_operations.is_some_and(|max| operations >= max.get()) {
+            Terminal::TooManyOperations
+        } else if !operations.is_multiple_of(PROGRESS_POLL_OPS.get()) {
+            return None;
+        } else if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            Terminal::Fatal(format!(
+                "workflow exceeded its wall-time limit of {:?}",
+                self.limits.wall_time
+            ))
+        } else {
+            match self.host.call(|host| host.is_cancelled()) {
+                Ok(false) => return None,
+                Ok(true) => Terminal::Cancelled,
+                Err(closed) => closed.into(),
+            }
+        };
+        Some(self.latch(terminal).clone())
+    }
+
+    /// The first terminal wins: a later one only raises it again.
+    fn latch(&self, terminal: Terminal) -> &Terminal {
+        self.latched.get_or_init(|| terminal)
+    }
+
+    /// A latched terminal ends the run however evaluation ended after the script caught it.
+    fn finish(&self, result: ScriptResult<()>) -> WorkflowOutcome {
+        let position = result
+            .as_ref()
+            .err()
+            .map_or(Position::NONE, |error| error.position());
+        match (self.latched.get(), result) {
+            (Some(terminal), _) => terminal.clone().into_outcome(position),
+            (None, Ok(())) => WorkflowOutcome::Completed(Value::Null),
+            (None, Err(error)) => outcome_from_error(*error),
+        }
+    }
+
     fn reserve_keys(&self, count: usize) -> ScriptResult<CallKey> {
         let count = u64::try_from(count).map_err(|_| fatal(KEY_OVERFLOW))?;
         let mut state = self.state.borrow_mut();
@@ -283,7 +335,7 @@ impl Session {
         if self.replaying() {
             return Ok(());
         }
-        Ok(self.host.call(job)?)
+        Ok(self.host.call(job).map_err(Terminal::from)?)
     }
 
     /// What the script has spent and what it has left, as a map the script reads
@@ -478,12 +530,6 @@ fn agent_request(positional_prompt: Option<&str>, options: Map) -> ScriptResult<
     Ok(request)
 }
 
-fn unavailable(name: &str) -> ScriptResult<()> {
-    Err(runtime_error(format!(
-        "{name}() is unavailable in workflow scripts; end a run with complete() or pause()"
-    )))
-}
-
 fn decision_request(
     state: Dynamic,
     questions: Dynamic,
@@ -536,99 +582,86 @@ pub(crate) fn check_source_size(source: &str, max: usize) -> Result<(), EngineEr
     Ok(())
 }
 
-/// A full engine with `eval`/`print`/`debug` disabled, `sleep`/`exit` stubbed to errors, and every
-/// resource limit applied. `import` and `timestamp` are compiled out by the `no_module` and
-/// `no_time` features.
-pub(crate) fn restricted_engine(limits: &EngineLimits) -> Engine {
-    let mut engine = Engine::new();
-    engine
-        .set_max_operations(limits.max_operations)
-        .set_max_call_levels(limits.max_call_levels)
-        .set_max_expr_depths(limits.max_expr_depth, limits.max_expr_depth)
-        .set_max_string_size(limits.max_string_size)
-        .set_max_array_size(limits.max_array_size)
-        .set_max_map_size(limits.max_map_size);
-    for symbol in DISABLED_SYMBOLS {
-        engine.disable_symbol(symbol);
-    }
-    engine.register_fn("sleep", |_seconds: i64| unavailable("sleep"));
-    engine.register_fn("sleep", |_seconds: f64| unavailable("sleep"));
-    engine.register_fn("exit", || unavailable("exit"));
-    engine.register_fn("exit", |_value: Dynamic| unavailable("exit"));
-    engine
-}
-
 fn register_host_api(engine: &mut Engine, session: &Rc<Session>) {
     let s = Rc::clone(session);
     engine.register_fn(
         "decide",
         move |state: Dynamic, questions: Dynamic| -> ScriptResult<Dynamic> {
-            s.decide(decision_request(state, questions, Map::new())?)
+            s.guard(|| s.decide(decision_request(state, questions, Map::new())?))
         },
     );
     let s = Rc::clone(session);
     engine.register_fn(
         "decide",
         move |state: Dynamic, questions: Dynamic, options: Map| -> ScriptResult<Dynamic> {
-            s.decide(decision_request(state, questions, options)?)
+            s.guard(|| s.decide(decision_request(state, questions, options)?))
         },
     );
     let s = Rc::clone(session);
     engine.register_fn("agent", move |prompt: &str| -> ScriptResult<Dynamic> {
-        s.agent(agent_request(Some(prompt), Map::new())?)
+        s.guard(|| s.agent(agent_request(Some(prompt), Map::new())?))
     });
     let s = Rc::clone(session);
     engine.register_fn(
         "agent",
         move |prompt: &str, options: Map| -> ScriptResult<Dynamic> {
-            s.agent(agent_request(Some(prompt), options)?)
+            s.guard(|| s.agent(agent_request(Some(prompt), options)?))
         },
     );
     let s = Rc::clone(session);
     engine.register_fn("parallel", move |items: Array| -> ScriptResult<Array> {
-        let requests = items
-            .into_iter()
-            .map(|item| {
-                item.try_cast::<Map>()
-                    .ok_or_else(|| runtime_error(PARALLEL_ITEM_TYPE))
-                    .and_then(|options| agent_request(None, options))
-            })
-            .collect::<ScriptResult<Vec<AgentRequest>>>()?;
-        s.parallel(requests)
+        s.guard(|| {
+            let requests = items
+                .into_iter()
+                .map(|item| {
+                    item.try_cast::<Map>()
+                        .ok_or_else(|| runtime_error(PARALLEL_ITEM_TYPE))
+                        .and_then(|options| agent_request(None, options))
+                })
+                .collect::<ScriptResult<Vec<AgentRequest>>>()?;
+            s.parallel(requests)
+        })
     });
     let s = Rc::clone(session);
     engine.register_fn("phase", move |title: &str| -> ScriptResult<()> {
         let title = title.to_owned();
-        s.emit(title.len(), move |host| host.phase(&title))
+        s.guard(|| s.emit(title.len(), move |host| host.phase(&title)))
     });
     let s = Rc::clone(session);
     engine.register_fn("log", move |message: &str| -> ScriptResult<()> {
         let message = message.to_owned();
-        s.emit(message.len(), move |host| host.log(&message))
+        s.guard(|| s.emit(message.len(), move |host| host.log(&message)))
     });
     let s = Rc::clone(session);
     engine.register_fn(
         "write_scratch_file",
         move |name: &str, content: &str| -> ScriptResult<String> {
-            s.write_scratch_file(name.to_owned(), content.to_owned())
+            s.guard(|| s.write_scratch_file(name.to_owned(), content.to_owned()))
         },
     );
     let s = Rc::clone(session);
     engine.register_fn("complete", move |value: Dynamic| -> ScriptResult<()> {
-        Err(s.complete(dynamic_to_json(&value)?))
+        s.guard(|| Err(s.complete(dynamic_to_json(&value)?)))
     });
     let s = Rc::clone(session);
     engine.register_fn("complete", move || -> ScriptResult<()> {
-        Err(s.complete(Value::Null))
+        s.guard(|| Err(s.complete(Value::Null)))
     });
-    engine.register_fn("pause", |kind: &str, message: &str| -> ScriptResult<()> {
-        let kind = PauseKind::new(kind).map_err(|error| runtime_error(error.to_string()))?;
-        Err(Terminal::Pause {
-            kind,
-            message: message.to_owned(),
-        }
-        .into())
-    });
+    let s = Rc::clone(session);
+    engine.register_fn(
+        "pause",
+        move |kind: &str, message: &str| -> ScriptResult<()> {
+            s.guard(|| {
+                let kind =
+                    PauseKind::new(kind).map_err(|error| runtime_error(error.to_string()))?;
+                Err(Terminal::Pause {
+                    kind,
+                    message: message.to_owned(),
+                }
+                .into())
+            })
+        },
+    );
     let s = Rc::clone(session);
     engine.register_fn("budget", move || -> Map { s.budget() });
     engine.register_fn("json_encode", |value: Dynamic| -> ScriptResult<String> {
@@ -643,7 +676,7 @@ fn evaluate(
     journal: &Journal,
     limits: &EngineLimits,
     agent_budget: u32,
-    host: HostBridge,
+    host: HostBridge<WorkflowHosts>,
 ) -> WorkflowOutcome {
     if let Err(error) = check_source_size(source, limits.max_source_bytes) {
         return WorkflowOutcome::Failed(error.to_string());
@@ -664,6 +697,8 @@ fn evaluate(
         journal: journal.clone(),
         limits: limits.clone(),
         agent_budget,
+        latched: OnceCell::new(),
+        operations: Cell::default(),
         state: RefCell::new(RunState {
             next_key: CallKey::FIRST,
             log_entries: 0,
@@ -671,25 +706,15 @@ fn evaluate(
             agents_issued: 0,
         }),
     });
-    let mut engine = restricted_engine(limits);
+    let mut engine = restricted_engine(&SandboxLimits::from(limits), UNAVAILABLE_IN);
     register_host_api(&mut engine, &session);
+    let max_operations = NonZeroU64::new(engine.max_operations());
     let deadline = Instant::now().checked_add(limits.wall_time);
     let progress_session = Rc::clone(&session);
-    engine.on_progress(move |operations| {
-        if !operations.is_multiple_of(PROGRESS_POLL_OPS) {
-            return None;
-        }
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            return Some(Dynamic::from(Terminal::Fatal(format!(
-                "workflow exceeded its wall-time limit of {:?}",
-                progress_session.limits.wall_time
-            ))));
-        }
-        match progress_session.host.call(|host| host.is_cancelled()) {
-            Ok(false) => None,
-            Ok(true) => Some(Dynamic::from(Terminal::Cancelled)),
-            Err(terminal) => Some(Dynamic::from(terminal)),
-        }
+    engine.on_progress(move |_| {
+        progress_session
+            .progress(max_operations, deadline)
+            .map(Dynamic::from)
     });
     let ast = match engine.compile(source) {
         Ok(ast) => ast,
@@ -699,29 +724,19 @@ fn evaluate(
     };
     let mut scope = Scope::new();
     scope.push_dynamic(ARGS_VARIABLE, args);
-    match engine.run_ast_with_scope(&mut scope, &ast) {
-        Ok(()) => WorkflowOutcome::Completed(Value::Null),
-        Err(error) => outcome_from_error(*error),
-    }
+    session.finish(engine.run_ast_with_scope(&mut scope, &ast))
 }
 
 fn outcome_from_error(error: EvalAltResult) -> WorkflowOutcome {
     match error {
-        EvalAltResult::ErrorTerminated(token, _) => token.try_cast::<Terminal>().map_or_else(
-            || WorkflowOutcome::Failed(FOREIGN_TERMINATION.into()),
-            Terminal::into_outcome,
-        ),
+        EvalAltResult::ErrorTerminated(token, position) => {
+            token.try_cast::<Terminal>().map_or_else(
+                || WorkflowOutcome::Failed(FOREIGN_TERMINATION.into()),
+                |terminal| terminal.into_outcome(position),
+            )
+        }
         other => WorkflowOutcome::Failed(other.to_string()),
     }
-}
-
-fn panic_message(panic: &(dyn Any + Send)) -> String {
-    let detail = panic
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| panic.downcast_ref::<&str>().copied())
-        .unwrap_or("unknown panic");
-    format!("workflow interpreter panicked: {detail}")
 }
 
 #[cfg(test)]
@@ -751,6 +766,11 @@ mod tests {
         let questions = #{ ready: #{ type: "noul", instructions: "Ready?" } };
         complete(decide(args, questions, #{ model: "test-decision-model", timeout_ms: 400 }));"#;
     const HOST_CALL_LIMIT: &str = "host calls";
+    const CAUGHT: &str = "caught";
+    const AFTER_CATCH: &str = "after the catch";
+    const HOST_AFTER_TERMINAL: &str = "a caught terminal must stop every later host call";
+    const TEST_MAX_OPERATIONS: u64 = 10_000;
+    const TOO_MANY_OPERATIONS: &str = "Too many operations";
     const REPLAY_DIVERGENCE: &str = "diverged";
     const BUDGET_COUNTS_ISSUED: &str =
         "budget() counts every agent the script asked for, one per parallel item";
@@ -1238,6 +1258,28 @@ mod tests {
         assert!(failure_message(outcome).contains("operations"));
     }
 
+    #[test_case("while true {}"; "at_top_level")]
+    #[test_case("fn spin() { loop {} } spin();"; "in_a_script_function")]
+    fn an_uncaught_operations_overrun_reads_as_rhais_own_error(body: &str) {
+        let limits = EngineLimits {
+            max_operations: TEST_MAX_OPERATIONS,
+            ..EngineLimits::default()
+        };
+        let rhai_error = restricted_engine(&SandboxLimits::from(&limits), UNAVAILABLE_IN)
+            .run(&script(body))
+            .expect_err("Rhai stops a runaway loop at its operations limit");
+        assert_eq!(
+            run_with(
+                body,
+                &Value::Null,
+                &Journal::new(),
+                &FakeHost::echo(),
+                &limits
+            ),
+            WorkflowOutcome::Failed(rhai_error.to_string())
+        );
+    }
+
     #[test]
     fn wall_time_deadline_fails_deterministically() {
         let limits = EngineLimits {
@@ -1379,6 +1421,103 @@ mod tests {
             r#"try { agent("p"); } catch (e) { complete("caught"); }"#,
             &FakeHost::failing(error),
         )
+    }
+
+    /// Rhai wraps whatever a closure called by an array method raises in `ErrorInFunctionCall`,
+    /// which `catch` intercepts even when it carries a terminal.
+    #[test_case("[1].map(|x| complete(true))", None => WorkflowOutcome::Completed(json!(true)); "complete_in_map")]
+    #[test_case("[1].find(|x| complete(true))", None => WorkflowOutcome::Completed(json!(true)); "complete_in_find")]
+    #[test_case(r#"[1].map(|x| pause("user", "wait"))"#, None => matches WorkflowOutcome::Paused { .. }; "pause_in_map")]
+    #[test_case(r#"[1].filter(|x| pause("user", "wait"))"#, None => matches WorkflowOutcome::Paused { .. }; "pause_in_filter")]
+    #[test_case(r#"[1].map(|x| agent("p"))"#, Some(HostError::Cancelled) => WorkflowOutcome::Cancelled; "cancelled_in_map")]
+    #[test_case(r#"[1].filter(|x| agent("p"))"#, Some(HostError::Cancelled) => WorkflowOutcome::Cancelled; "cancelled_in_filter")]
+    #[test_case(r#"[1].find(|x| agent("p"))"#, Some(HostError::BudgetExhausted) => WorkflowOutcome::BudgetLimited; "budget_in_find")]
+    fn a_terminal_caught_from_a_closure_still_ends_the_run(
+        closure: &str,
+        failure: Option<HostError>,
+    ) -> WorkflowOutcome {
+        let host = failure.map_or_else(FakeHost::echo, FakeHost::failing);
+        let outcome = run(
+            &format!(
+                r#"try {{ {closure}; }} catch (e) {{ agent("{AFTER_CATCH}"); complete("{CAUGHT}"); }}"#
+            ),
+            &host,
+        );
+        assert!(
+            host.requests()
+                .iter()
+                .all(|(_, request)| request.prompt != AFTER_CATCH),
+            "{HOST_AFTER_TERMINAL}"
+        );
+        outcome
+    }
+
+    #[test_case("[1].filter(|x| complete(true))", None => WorkflowOutcome::Completed(json!(true)); "complete_in_filter")]
+    #[test_case(r#"[1].find(|x| pause("user", "wait"))"#, None => matches WorkflowOutcome::Paused { .. }; "pause_in_find")]
+    #[test_case(r#"[1].find(|x| agent("p"))"#, Some(HostError::Cancelled) => WorkflowOutcome::Cancelled; "cancelled_in_find")]
+    #[test_case(r#"[1].map(|x| agent("p"))"#, Some(HostError::BudgetExhausted) => WorkflowOutcome::BudgetLimited; "budget_in_map")]
+    fn a_terminal_swallowed_from_a_closure_still_ends_the_run(
+        closure: &str,
+        failure: Option<HostError>,
+    ) -> WorkflowOutcome {
+        run(
+            &format!("try {{ {closure}; }} catch {{}}"),
+            &failure.map_or_else(FakeHost::echo, FakeHost::failing),
+        )
+    }
+
+    #[test]
+    fn a_cancellation_polled_inside_a_closure_still_cancels() {
+        let host = FakeHost {
+            cancelled: true,
+            ..FakeHost::echo()
+        };
+        let body = format!(
+            r#"try {{ [1].map(|x| {{ loop {{}} }}); }} catch (e) {{ agent("{AFTER_CATCH}"); }}"#
+        );
+        assert_eq!(run(&body, &host), WorkflowOutcome::Cancelled);
+        assert!(host.requests().is_empty(), "{HOST_AFTER_TERMINAL}");
+    }
+
+    /// A closure runs on a copy of Rhai's operation count, so after a caught overrun the script
+    /// carries on with the count it had before the call.
+    #[test_case("catch {}"; "then_ends")]
+    #[test_case(r#"catch (e) { agent("p"); }"#; "then_calls_the_host")]
+    fn an_operations_overrun_caught_from_a_closure_still_fails_the_run(handler: &str) {
+        let host = FakeHost::echo();
+        let limits = EngineLimits {
+            max_operations: TEST_MAX_OPERATIONS,
+            ..EngineLimits::default()
+        };
+        let outcome = run_with(
+            &format!("try {{ [1].map(|x| {{ loop {{}} }}); }} {handler}"),
+            &Value::Null,
+            &Journal::new(),
+            &host,
+            &limits,
+        );
+        let message = failure_message(outcome);
+        assert!(message.starts_with(TOO_MANY_OPERATIONS), "{message}");
+        assert!(host.requests().is_empty(), "{HOST_AFTER_TERMINAL}");
+    }
+
+    /// Each closure call runs under a third of the limit, on a copy of Rhai's count that its
+    /// return discards, so no copy reaches the limit, while the ten rounds run three times it.
+    #[test]
+    fn operations_in_closure_calls_add_up_to_the_limit() {
+        let limits = EngineLimits {
+            max_operations: TEST_MAX_OPERATIONS,
+            ..EngineLimits::default()
+        };
+        let outcome = run_with(
+            "for round in 0..10 { [1].map(|x| { let i = 0; while i < 500 { i += 1; } }); }",
+            &Value::Null,
+            &Journal::new(),
+            &FakeHost::echo(),
+            &limits,
+        );
+        let message = failure_message(outcome);
+        assert!(message.starts_with(TOO_MANY_OPERATIONS), "{message}");
     }
 
     #[test]

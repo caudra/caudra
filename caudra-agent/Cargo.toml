@@ -11,6 +11,7 @@ test-support = []
 [dependencies]
 async-trait = { workspace = true }
 caudra-providers = { workspace = true }
+caudra-automation = { workspace = true }
 caudra-config = { workspace = true }
 caudra-decision = { workspace = true }
 caudra-diff = { workspace = true }

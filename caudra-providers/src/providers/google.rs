@@ -756,8 +756,9 @@ async fn parse_sse(
 mod tests {
     use super::*;
     use crate::providers::test_support::{
-        CREDENTIAL_IN_URL, PEER_ATTACK, PEER_TEXT, assert_peer_framing, peer_message_origin,
-        task_event_origin, task_observation_with_output_refs, workflow_event_origin,
+        CREDENTIAL_IN_URL, PEER_ATTACK, PEER_TEXT, assert_peer_framing, automation_event_origin,
+        peer_message_origin, task_event_origin, task_observation_with_output_refs,
+        workflow_event_origin,
     };
     use crate::{ReasoningOptions, StandingReminderKind, SteeringKind};
     use std::sync::Arc;
@@ -800,6 +801,7 @@ mod tests {
     #[test_case(Message::task_observation(STEERING_TEXT.into(), task_event_origin()) ; "task_event")]
     #[test_case(task_observation_with_output_refs(STEERING_TEXT); "retained_task_outputs")]
     #[test_case(Message::workflow_observation(STEERING_TEXT.into(), workflow_event_origin()) ; "workflow_event")]
+    #[test_case(Message::automation_observation(STEERING_TEXT.into(), automation_event_origin()) ; "automation_event")]
     #[test_case(Message::standing_reminder(STEERING_TEXT.into(), StandingReminderKind::BackgroundWork) ; "background_reminder")]
     fn observation_metadata_is_not_on_wire(message: Message) {
         let wire = convert_messages(&[message]);

@@ -46,6 +46,7 @@ const PREVIEW_KEYS: &[(&str, &[&str])] = &[
     ("report_to_parent", &["title"]),
     ("skill", &["name"]),
     ("workflow", &["action"]),
+    ("automation", &["action"]),
     ("code_map", &["path"]),
     ("code_context", &["task"]),
     ("code_refs", &["symbol"]),

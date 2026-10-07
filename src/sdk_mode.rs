@@ -15,8 +15,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use caudra_agent::automation::clock::SystemClock;
+use caudra_agent::automation::handle::AutomationHandle;
 use caudra_agent::background::BackgroundTasks;
-use caudra_agent::headless::{self, InteractiveHandle, InteractiveParams, InteractiveRun};
+use caudra_agent::headless::{
+    self, AutomationParams, InteractiveHandle, InteractiveParams, InteractiveRun,
+};
 use caudra_agent::mcp;
 use caudra_agent::permissions::{
     PermissionAnswer, PermissionLifetime, PermissionManager, PluginRuleStore,
@@ -26,18 +30,23 @@ use caudra_agent::prompt::profile::{BUILTIN_PROFILE_NAME, PromptProfileCatalog};
 use caudra_agent::tools::QUESTION_TOOL_NAME;
 use caudra_agent::types::{BACKGROUND_EVENT_RUN_ID, TaskProvenance, WorkflowProvenance};
 use caudra_agent::{
-    AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, History,
-    PermissionsConfig, StoredSession,
+    AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, GoalHandle, GoalResult,
+    GoalSnapshot, GoalStatus, GoalVerdict, History, PermissionsConfig, StoredSession,
+    goal_kickoff_message,
 };
+use caudra_automation::request::{
+    AutomationError, AutomationRequest, AutomationResponse, DropTarget,
+};
+use caudra_automation::snapshot::{ArmOrigin, AutomationEvent, FiringSummary, PauseSource};
 use caudra_config::decisions::DecisionsConfig;
 use caudra_config::{
-    ExecutionMode, Feature, FeatureDisabled, ModelPolicy, SnapshotsConfig,
+    AutomationsConfig, ExecutionMode, Feature, FeatureDisabled, ModelPolicy, SnapshotsConfig,
     effective_shell_execution, effective_task_execution,
 };
 use caudra_providers::model::Model;
 use caudra_providers::{
-    Billing, HistoryItem, HistoryItemKind, ImageSource, StopReason, ThinkingConfig, Timeouts,
-    TokenUsage, WorkflowEventOrigin, add_cost,
+    AutomationEventOrigin, Billing, HistoryItem, HistoryItemKind, ImageSource, Message, StopReason,
+    ThinkingConfig, Timeouts, TokenUsage, WorkflowEventOrigin, add_cost,
 };
 use caudra_storage::id::SessionRef;
 use caudra_storage::local_documents::LocalDocumentStore;
@@ -49,6 +58,7 @@ use caudra_storage::sessions::{
 use caudra_storage::tool_outputs::{ToolOutputRef, ToolOutputStore};
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
 use caudra_storage::{StateDir, StorageError};
+use caudra_workcell::automation_http_client;
 use caudra_workflow::{
     LaunchRequest, WorkflowError, WorkflowEvent, WorkflowRequest, WorkflowResponse,
 };
@@ -57,7 +67,8 @@ use caudra_workspace::WorkspaceSession;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 use flume::{Receiver, Sender};
-use serde::Serialize;
+use futures_lite::future;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::warn;
 
@@ -93,6 +104,78 @@ const WORKFLOW_CONTROLS: &[&str] = &[
     WORKFLOW_TRUST,
     WORKFLOW_ACK,
 ];
+const GOAL_SYSTEM_SUBTYPE: &str = "goal";
+const GOAL_SET: &str = "goal_set";
+const GOAL_CLEAR: &str = "goal_clear";
+const GOAL_STATUS: &str = "goal_status";
+/// Every `control_request` subtype the session goal answers, as the init
+/// message advertises them.
+const GOAL_CONTROLS: &[&str] = &[GOAL_SET, GOAL_CLEAR, GOAL_STATUS];
+const GOAL_ACTIVE: &str = "active";
+const GOAL_FINISHED: &str = "finished";
+const NO_GOAL: &str = "none";
+const SESSION_CLOSED: &str = "the session is closed";
+const AUTOMATION_FIRED_SUBTYPE: &str = "automation_fired";
+const AUTOMATION_NOTICE_SUBTYPE: &str = "automation_notice";
+const AUTOMATION_LIST: &str = "automation_list";
+const AUTOMATION_VALIDATE: &str = "automation_validate";
+const AUTOMATION_ARM: &str = "automation_arm";
+const AUTOMATION_DISARM: &str = "automation_disarm";
+const AUTOMATION_TRUST: &str = "automation_trust";
+const AUTOMATION_INSPECT: &str = "automation_inspect";
+const AUTOMATION_HISTORY: &str = "automation_history";
+const AUTOMATION_FIRING: &str = "automation_firing";
+const AUTOMATION_SET_ARGS: &str = "automation_set_args";
+const AUTOMATION_SET_STATE: &str = "automation_set_state";
+const AUTOMATION_CLEAR_STATE: &str = "automation_clear_state";
+const AUTOMATION_DROP: &str = "automation_drop";
+const AUTOMATION_DRY_RUN: &str = "automation_dry_run";
+const AUTOMATION_PAUSE: &str = "automation_pause";
+const AUTOMATION_RESUME: &str = "automation_resume";
+/// Every `control_request` subtype the automation runtime answers, as the
+/// init message advertises them.
+const AUTOMATION_CONTROLS: &[&str] = &[
+    AUTOMATION_LIST,
+    AUTOMATION_VALIDATE,
+    AUTOMATION_ARM,
+    AUTOMATION_DISARM,
+    AUTOMATION_TRUST,
+    AUTOMATION_INSPECT,
+    AUTOMATION_HISTORY,
+    AUTOMATION_FIRING,
+    AUTOMATION_DRY_RUN,
+    AUTOMATION_SET_ARGS,
+    AUTOMATION_SET_STATE,
+    AUTOMATION_CLEAR_STATE,
+    AUTOMATION_DROP,
+    AUTOMATION_PAUSE,
+    AUTOMATION_RESUME,
+];
+/// The keys an automation control's reply carries the runtime's answer and
+/// its structured error under.
+const AUTOMATION_REPLY: &str = "automation";
+const AUTOMATION_ERROR_REPLY: &str = "automation_error";
+const NAME_FIELD: &str = "name";
+const ARGS_FIELD: &str = "args";
+const DIGEST_FIELD: &str = "digest";
+const SESSION_ID_FIELD: &str = "session_id";
+const FIRE_ID_FIELD: &str = "fire_id";
+const LIMIT_FIELD: &str = "limit";
+const STATE_FIELD: &str = "state";
+const EXPECTED_REVISION_FIELD: &str = "expected_revision";
+const SEQ_FIELD: &str = "seq";
+const STRING_KIND: FieldKind<String> = FieldKind {
+    name: "a string",
+    read: |value| value.as_str().map(str::to_owned),
+};
+const OBJECT_KIND: FieldKind<Value> = FieldKind {
+    name: "an object",
+    read: |value| value.is_object().then(|| value.clone()),
+};
+const INTEGER_KIND: FieldKind<u64> = FieldKind {
+    name: "an integer",
+    read: Value::as_u64,
+};
 
 const TOOL_NAME_MAP: &[(&str, &str)] = &[
     ("file_apply_patch", "FileApplyPatch"),
@@ -275,6 +358,211 @@ struct WorkflowSystemPayload<'a> {
     workflow: Option<&'a WorkflowProvenance>,
 }
 
+/// The `system` / `automation_fired` body: a firing that ended, under the
+/// summary's own names, and the earlier quiet skip it absorbed, whose row a
+/// client drops.
+#[derive(Serialize)]
+struct AutomationFiredPayload<'a> {
+    #[serde(flatten)]
+    firing: &'a FiringSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    absorbed: Option<String>,
+}
+
+/// The `system` / `automation_notice` body: what a script's `notify()` asks
+/// the client to show, or why the session refused an arming or a claimed
+/// goal. `fire_id` names the firing it came from, when one did.
+#[derive(Serialize)]
+struct AutomationNoticePayload {
+    automation: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fire_id: Option<String>,
+    text: String,
+}
+
+/// The `system` / `goal` body: one goal event, named by `kind`. Only the main
+/// agent pursues the session goal, so no run or workflow keys come with it.
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum GoalSystemPayload<'a> {
+    Evaluating {
+        evaluation: u32,
+    },
+    Evaluation {
+        verdict: GoalVerdict,
+        reason: &'a str,
+        evaluation: u32,
+        applied: bool,
+        usage: TokenUsage,
+        cost: Option<f64>,
+        billing: Billing,
+        model: &'a str,
+    },
+    EvaluationFailed {
+        evaluation: u32,
+        message: &'a str,
+        applied: bool,
+        usage: TokenUsage,
+        cost: Option<f64>,
+        billing: Billing,
+        model: &'a str,
+    },
+    Deferred {
+        active_background_tasks: usize,
+    },
+    Finished(GoalReport<'a>),
+    LoopCap {
+        evaluations: u32,
+        continuations: u32,
+        limit: u32,
+    },
+    TurnLimit {
+        evaluations: u32,
+    },
+    ClearedAfterError {
+        condition: &'a str,
+        message: &'a str,
+    },
+}
+
+impl<'a> GoalSystemPayload<'a> {
+    /// `None` for an event that is not about the goal.
+    fn from_event(event: &'a AgentEvent) -> Option<Self> {
+        Some(match event {
+            AgentEvent::GoalEvaluating { evaluation } => Self::Evaluating {
+                evaluation: *evaluation,
+            },
+            AgentEvent::GoalEvaluation {
+                verdict,
+                reason,
+                evaluation,
+                applied,
+                usage,
+                cost,
+                billing,
+                model,
+            } => Self::Evaluation {
+                verdict: *verdict,
+                reason,
+                evaluation: *evaluation,
+                applied: *applied,
+                usage: *usage,
+                cost: *cost,
+                billing: *billing,
+                model,
+            },
+            AgentEvent::GoalEvaluationFailed {
+                evaluation,
+                message,
+                applied,
+                usage,
+                cost,
+                billing,
+                model,
+            } => Self::EvaluationFailed {
+                evaluation: *evaluation,
+                message,
+                applied: *applied,
+                usage: *usage,
+                cost: *cost,
+                billing: *billing,
+                model,
+            },
+            AgentEvent::GoalDeferred {
+                active_background_tasks,
+            } => Self::Deferred {
+                active_background_tasks: *active_background_tasks,
+            },
+            AgentEvent::GoalFinished { result } => Self::Finished(result.into()),
+            AgentEvent::GoalLoopCap {
+                evaluations,
+                continuations,
+                limit,
+            } => Self::LoopCap {
+                evaluations: *evaluations,
+                continuations: *continuations,
+                limit: *limit,
+            },
+            AgentEvent::GoalTurnLimit { evaluations } => Self::TurnLimit {
+                evaluations: *evaluations,
+            },
+            AgentEvent::GoalClearedAfterError { condition, message } => {
+                Self::ClearedAfterError { condition, message }
+            }
+            _ => return None,
+        })
+    }
+}
+
+/// A goal under the names its `finished` event uses: the result of one that
+/// finished, or how far one still active has come.
+#[derive(Serialize)]
+struct GoalReport<'a> {
+    condition: &'a str,
+    verdict: Option<GoalVerdict>,
+    reason: Option<&'a str>,
+    evaluations: u32,
+    duration_ms: u128,
+    usage: TokenUsage,
+    cost: Option<f64>,
+    subscription_cost: Option<f64>,
+}
+
+impl<'a> From<&'a GoalResult> for GoalReport<'a> {
+    fn from(result: &'a GoalResult) -> Self {
+        Self {
+            condition: &result.condition,
+            verdict: Some(result.verdict),
+            reason: Some(&result.reason),
+            evaluations: result.evaluations,
+            duration_ms: result.duration.as_millis(),
+            usage: result.usage,
+            cost: result.cost,
+            subscription_cost: result.subscription_cost,
+        }
+    }
+}
+
+impl<'a> From<&'a GoalSnapshot> for GoalReport<'a> {
+    fn from(goal: &'a GoalSnapshot) -> Self {
+        Self {
+            condition: &goal.condition,
+            verdict: goal.last_verdict,
+            reason: goal.last_reason.as_deref(),
+            evaluations: goal.evaluations,
+            duration_ms: goal.elapsed().as_millis(),
+            usage: goal.usage,
+            cost: goal.cost,
+            subscription_cost: goal.subscription_cost,
+        }
+    }
+}
+
+/// What `goal_status` answers, and `goal_set` once its goal is set: the active
+/// goal, else the last finished one, and the session's continuation limit.
+#[derive(Serialize)]
+struct GoalStatusReply<'a> {
+    status: &'static str,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    goal: Option<GoalReport<'a>>,
+    continuation_limit: u32,
+}
+
+/// What `goal_clear` answers: the condition of the goal it stopped, or null
+/// when none was active.
+#[derive(Serialize)]
+struct GoalClearReply<'a> {
+    cleared: Option<&'a str>,
+}
+
+/// A client's `/goal <condition>`. `kickoff` defaults to true.
+#[derive(Deserialize)]
+struct GoalSetRequest {
+    condition: String,
+    continuation_limit: Option<u32>,
+    kickoff: Option<bool>,
+}
+
 #[derive(Serialize)]
 struct UserMessage {
     role: &'static str,
@@ -313,6 +601,9 @@ struct RunInfo {
     automatic: bool,
     task_event_ids: Vec<String>,
     workflow_events: Vec<WorkflowEventOrigin>,
+    /// The automation messages the run took: the claims it started with,
+    /// then the guide items injected into it, in order.
+    automation_events: Vec<AutomationEventOrigin>,
 }
 
 impl From<&InteractiveRun> for RunInfo {
@@ -322,6 +613,7 @@ impl From<&InteractiveRun> for RunInfo {
             automatic: run.automatic,
             task_event_ids: run.task_event_ids.clone(),
             workflow_events: run.workflow_events.clone(),
+            automation_events: run.automation_events.clone(),
         }
     }
 }
@@ -647,6 +939,54 @@ impl SdkWriter {
         }))
     }
 
+    fn emit_answer(&self, request_id: &str, answer: Result<Value, String>) -> Result<()> {
+        match answer {
+            Ok(response) => self.emit_control_response(request_id, Some(response), None),
+            Err(error) => self.emit_control_response(request_id, None, Some(error)),
+        }
+    }
+
+    /// A firing goes out once it has ended, a notice as its script sent it.
+    fn emit_automation(&self, event: AutomationEvent) -> Result<()> {
+        match event {
+            AutomationEvent::Firing { firing, absorbed } if !firing.status.is_pending() => self
+                .emit_system(
+                    AUTOMATION_FIRED_SUBTYPE,
+                    serde_json::to_value(AutomationFiredPayload {
+                        firing: &firing,
+                        absorbed,
+                    })?,
+                ),
+            AutomationEvent::Notice {
+                automation,
+                fire_id,
+                text,
+            } => self.emit_system(
+                AUTOMATION_NOTICE_SUBTYPE,
+                serde_json::to_value(AutomationNoticePayload {
+                    automation,
+                    fire_id,
+                    text,
+                })?,
+            ),
+            AutomationEvent::Firing { .. }
+            | AutomationEvent::Session(_)
+            | AutomationEvent::Automation(_)
+            | AutomationEvent::Outbox(_)
+            | AutomationEvent::SaveSession => Ok(()),
+        }
+    }
+
+    /// Emits the automation events as they arrive, and returns only when one
+    /// cannot go out: once their channel closes, the agent events alone end
+    /// the pump.
+    async fn emit_automations<T>(&self, automation_rx: &Receiver<AutomationEvent>) -> Result<T> {
+        while let Ok(event) = automation_rx.recv_async().await {
+            self.emit_automation(event)?;
+        }
+        future::pending().await
+    }
+
     fn emit_direct_command_result(
         &self,
         output: caudra_agent::headless::RemoteCommandOutput,
@@ -690,6 +1030,7 @@ pub struct SdkParams {
     pub remote_project_context:
         Option<Arc<caudra_agent::remote_project_context::RemoteProjectContext>>,
     pub local_documents: Option<Arc<LocalDocumentStore>>,
+    pub automations: AutomationsConfig,
 }
 
 struct Shared {
@@ -731,6 +1072,50 @@ impl Shared {
     }
 }
 
+/// What a client's text needs to run as a typed prompt: the mode the session
+/// is in, and the mentions and commits the text names.
+struct PromptContext<'a> {
+    shared: &'a Mutex<Shared>,
+    cwd: &'a Path,
+    remote: bool,
+    thinking: &'a ThinkingConfig,
+    fast: bool,
+}
+
+impl PromptContext<'_> {
+    fn input(&self, prompt: String, images: Vec<ImageSource>) -> AgentInput {
+        let mode = self.shared.lock().unwrap().agent_mode(self.cwd);
+        let mentions = if self.remote {
+            caudra_agent::mentions::scan_remote(&prompt)
+                .into_iter()
+                .map(|(_, mention)| mention)
+                .collect()
+        } else {
+            caudra_agent::mentions::scan(&prompt, |path| self.cwd.join(path).exists())
+                .into_iter()
+                .map(|(_, mention)| mention)
+                .collect()
+        };
+        let commits = caudra_agent::commits::scan(&prompt, |_| true)
+            .into_iter()
+            .map(|(_, commit)| commit)
+            .collect();
+        AgentInput {
+            message: prompt,
+            mode,
+            plan: None,
+            images,
+            mentions,
+            commits,
+            preamble: Vec::new(),
+            thinking: self.thinking.clone(),
+            fast: self.fast,
+            prompt: None,
+            resume: false,
+        }
+    }
+}
+
 pub fn run(params: SdkParams) -> Result<()> {
     let SdkParams {
         cli,
@@ -752,6 +1137,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         workspace_session,
         remote_project_context,
         local_documents,
+        automations,
     } = params;
     cli.warn_ignored_flags();
     if let Some(max) = cli.max_turns {
@@ -921,6 +1307,17 @@ pub fn run(params: SdkParams) -> Result<()> {
         model_policy: Arc::clone(&model_policy),
         plugin_rules,
         local_tools: Default::default(),
+        automations: config
+            .features
+            .enabled(Feature::Automations)
+            .then(|| AutomationParams {
+                mode: workflow_mode.clone(),
+                fast,
+                config: automations,
+                clock: Arc::new(SystemClock::new()),
+                http: automation_http_client(),
+                user_config_dir: None,
+            }),
         workflow_mode: Some(workflow_mode),
         workspace_binding: workspace_binding.clone(),
         remote_environment: remote_environment.clone(),
@@ -975,6 +1372,7 @@ pub fn run(params: SdkParams) -> Result<()> {
                 "output_style": "default",
             }),
             handle.workflow.is_some(),
+            handle.automations.is_some(),
             &config,
             handle.background.is_some(),
         ),
@@ -996,8 +1394,15 @@ pub fn run(params: SdkParams) -> Result<()> {
         auxiliary_usage: TokenUsage::default(),
         request_counter: 0,
     }
-    .spawn(handle.event_rx.clone());
+    .spawn(handle.event_rx.clone(), handle.automation_events.clone());
 
+    let prompts = PromptContext {
+        shared: &shared,
+        cwd: &cwd,
+        remote: remote_environment.is_some(),
+        thinking: &thinking,
+        fast,
+    };
     let input_result = (|| -> Result<()> {
         for line in io::stdin().lock().lines() {
             let line = line.context("read stdin")?;
@@ -1074,39 +1479,7 @@ pub fn run(params: SdkParams) -> Result<()> {
                         writer.emit_direct_command_result(output, started.elapsed().as_millis())?;
                         continue;
                     }
-                    let mode = {
-                        let mut shared = shared.lock().unwrap();
-                        shared.agent_mode(&cwd)
-                    };
-                    let mentions = if remote_environment.is_some() {
-                        caudra_agent::mentions::scan_remote(&prompt)
-                            .into_iter()
-                            .map(|(_, mention)| mention)
-                            .collect()
-                    } else {
-                        caudra_agent::mentions::scan(&prompt, |path| cwd.join(path).exists())
-                            .into_iter()
-                            .map(|(_, mention)| mention)
-                            .collect()
-                    };
-                    let commits = caudra_agent::commits::scan(&prompt, |_| true)
-                        .into_iter()
-                        .map(|(_, commit)| commit)
-                        .collect();
-                    let input = AgentInput {
-                        message: prompt,
-                        mode,
-                        plan: None,
-                        images,
-                        mentions,
-                        commits,
-                        preamble: Vec::new(),
-                        thinking: thinking.clone(),
-                        fast,
-                        prompt: None,
-                        resume: false,
-                    };
-                    if handle.input_tx.send(input).is_err() {
+                    if handle.input_tx.send(prompts.input(prompt, images)).is_err() {
                         break;
                     }
                 }
@@ -1120,7 +1493,7 @@ pub fn run(params: SdkParams) -> Result<()> {
                         &cr,
                         &writer,
                         &handle,
-                        &shared,
+                        &prompts,
                         &startup_model,
                         &model_policy,
                     )?;
@@ -1153,9 +1526,14 @@ pub fn run(params: SdkParams) -> Result<()> {
 
         Ok(())
     })();
-    let _ = handle.cancel_tx.try_send(());
-    let InteractiveHandle { input_tx, task, .. } = handle;
+    let InteractiveHandle {
+        input_tx,
+        cancel_tx,
+        task,
+        ..
+    } = handle;
     drop(input_tx);
+    let _ = cancel_tx.try_send(());
     smol::block_on(async {
         task.await;
         pump.await;
@@ -1806,7 +2184,7 @@ fn handle_control_request(
     cr: &InboundControlRequest,
     writer: &SdkWriter,
     handle: &InteractiveHandle,
-    shared: &Mutex<Shared>,
+    prompts: &PromptContext,
     startup_model: &Model,
     model_policy: &ModelPolicy,
 ) -> Result<()> {
@@ -1841,14 +2219,16 @@ fn handle_control_request(
                         Some(FeatureDisabled(Feature::DecisionEngine).to_string()),
                     ),
                 Some(mode) => {
-                    let execution_mode = mode.preserve_plan(shared.lock().unwrap().permission_mode);
-                    let agent_mode = shared
+                    let execution_mode =
+                        mode.preserve_plan(prompts.shared.lock().unwrap().permission_mode);
+                    let agent_mode = prompts
+                        .shared
                         .lock()
                         .unwrap()
                         .agent_mode_for(execution_mode, &handle.permissions.project_cwd());
                     match smol::block_on(handle.set_mode(agent_mode, mode.storage_mode())) {
                         Ok(()) => {
-                            shared.lock().unwrap().permission_mode = execution_mode;
+                            prompts.shared.lock().unwrap().permission_mode = execution_mode;
                             writer.emit_control_response(&cr.request_id, ok, None)
                         }
                         Err(error) => {
@@ -1870,7 +2250,7 @@ fn handle_control_request(
             match resolve_set_model(cr.request.extra.get("model"), startup_model, model_policy) {
                 Some(model) => match smol::block_on(handle.set_model(model)) {
                     Ok(model) => {
-                        shared.lock().unwrap().model = model;
+                        prompts.shared.lock().unwrap().model = model;
                         writer.emit_control_response(&cr.request_id, ok, None)
                     }
                     Err(error) => writer.emit_control_response(
@@ -1886,18 +2266,41 @@ fn handle_control_request(
                 ),
             }
         }
-        other => match workflow_request(other, &cr.request.extra) {
-            Some(Ok(request)) => {
-                forward_workflow_request(writer, &cr.request_id, handle.workflow_control(request));
-                Ok(())
+        GOAL_SET => writer.emit_answer(
+            &cr.request_id,
+            goal_set(&cr.request.extra, &handle.goal, prompts, &handle.input_tx),
+        ),
+        GOAL_CLEAR => writer.emit_answer(&cr.request_id, goal_clear(&handle.goal)),
+        GOAL_STATUS => writer.emit_answer(&cr.request_id, goal_status(&handle.goal)),
+        other => {
+            if let Some(request) = automation_request(other, &cr.request.extra) {
+                return answer_automation_control(
+                    writer,
+                    &cr.request_id,
+                    request,
+                    handle.automations.as_ref(),
+                );
             }
-            Some(Err(message)) => writer.emit_control_response(&cr.request_id, None, Some(message)),
-            None => writer.emit_control_response(
-                &cr.request_id,
-                None,
-                Some(format!("unsupported: {other}")),
-            ),
-        },
+            match workflow_request(other, &cr.request.extra) {
+                Some(Ok(request)) => {
+                    forward_control(
+                        writer,
+                        &cr.request_id,
+                        handle.workflow_control(request),
+                        workflow_control_response,
+                    );
+                    Ok(())
+                }
+                Some(Err(message)) => {
+                    writer.emit_control_response(&cr.request_id, None, Some(message))
+                }
+                None => writer.emit_control_response(
+                    &cr.request_id,
+                    None,
+                    Some(format!("unsupported: {other}")),
+                ),
+            }
+        }
     }
 }
 
@@ -1954,13 +2357,83 @@ fn handle_task_control_request(
     }
 }
 
+/// `/goal <condition>` for a client. The condition is validated as `/goal`
+/// validates it, the limit clamped as the TUI clamps it, and an active goal
+/// replaced as `/goal` replaces it. Unless `kickoff` is false, the kickoff
+/// goes out as `/goal` sends it, along the path a typed prompt takes.
+fn goal_set(
+    extra: &Value,
+    goal: &GoalHandle,
+    prompts: &PromptContext,
+    input_tx: &Sender<AgentInput>,
+) -> Result<Value, String> {
+    let request =
+        GoalSetRequest::deserialize(extra).map_err(|error| format!("{GOAL_SET}: {error}"))?;
+    let active = goal
+        .set(&request.condition)
+        .map_err(|error| error.to_string())?;
+    if let Some(limit) = request.continuation_limit {
+        goal.set_continuation_limit(limit);
+    }
+    if request.kickoff.unwrap_or(true) {
+        let mut input = prompts.input(active.condition.to_string(), Vec::new());
+        input
+            .preamble
+            .push(Message::synthetic(goal_kickoff_message(&active.condition)));
+        input_tx
+            .send(input)
+            .map_err(|_| SESSION_CLOSED.to_owned())?;
+    }
+    goal_status(goal)
+}
+
+/// `/goal clear`: the active goal stops, and a finished one stays on record.
+fn goal_clear(goal: &GoalHandle) -> Result<Value, String> {
+    let cleared = goal.clear();
+    serde_json::to_value(GoalClearReply {
+        cleared: cleared.as_ref().map(|goal| &*goal.condition),
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn goal_status(goal: &GoalHandle) -> Result<Value, String> {
+    let status = goal.status();
+    let (status, report) = match &status {
+        Some(GoalStatus::Active(goal)) => (GOAL_ACTIVE, Some(GoalReport::from(goal))),
+        Some(GoalStatus::Finished(result)) => (GOAL_FINISHED, Some(GoalReport::from(result))),
+        None => (NO_GOAL, None),
+    };
+    serde_json::to_value(GoalStatusReply {
+        status,
+        goal: report,
+        continuation_limit: goal.continuation_limit(),
+    })
+    .map_err(|error| error.to_string())
+}
+
 /// The init message with what the session can do beyond the Claude Code
-/// shape: `workflows` says whether a runtime is attached, and
-/// `workflow_controls` names the `control_request` subtypes it answers.
-fn init_payload(mut payload: Value, workflows: bool, config: &AgentConfig, jobs: bool) -> Value {
-    let controls: &[&str] = if workflows { WORKFLOW_CONTROLS } else { &[] };
+/// shape: `workflows` and `automations` say whether those runtimes are
+/// attached, and `workflow_controls`, `automation_controls` and
+/// `goal_controls` name the `control_request` subtypes the runtimes and the
+/// session goal answer.
+fn init_payload(
+    mut payload: Value,
+    workflows: bool,
+    automations: bool,
+    config: &AgentConfig,
+    jobs: bool,
+) -> Value {
+    let workflow_controls: &[&str] = if workflows { WORKFLOW_CONTROLS } else { &[] };
+    let automation_controls: &[&str] = if automations {
+        AUTOMATION_CONTROLS
+    } else {
+        &[]
+    };
     payload["workflows"] = Value::Bool(workflows);
-    payload["workflow_controls"] = serde_json::json!(controls);
+    payload["workflow_controls"] = serde_json::json!(workflow_controls);
+    payload["automations"] = Value::Bool(automations);
+    payload["automation_controls"] = serde_json::json!(automation_controls);
+    payload["goal_controls"] = serde_json::json!(GOAL_CONTROLS);
     let task_mode = effective_task_execution(config, jobs);
     let shell_mode = effective_shell_execution(config, jobs);
     let background_capable = |mode: &Option<ExecutionMode>| {
@@ -2046,22 +2519,175 @@ fn workflow_request(subtype: &str, extra: &Value) -> Option<Result<WorkflowReque
     Some(request)
 }
 
-/// Answers off the stdin thread: a pause or stop waits for the run's agents
-/// to stop, and the client's permission replies must keep flowing meanwhile.
-fn forward_workflow_request(
+/// Answers off the stdin thread: a workflow pause or stop waits for the run's
+/// agents to stop, and the client's permission replies must keep flowing
+/// meanwhile.
+fn forward_control<T: 'static>(
     writer: &SdkWriter,
     request_id: &str,
-    answer: impl Future<Output = Result<WorkflowResponse, WorkflowError>> + Send + 'static,
+    answer: impl Future<Output = T> + Send + 'static,
+    reply: fn(T) -> (Option<Value>, Option<String>),
 ) {
     let writer = writer.clone();
     let request_id = request_id.to_owned();
     smol::spawn(async move {
-        let (response, error) = workflow_control_response(answer.await);
+        let (response, error) = reply(answer.await);
         if let Err(error) = writer.emit_control_response(&request_id, response, error) {
-            warn!(%error, request_id, "workflow control response not delivered");
+            warn!(%error, request_id, "control response not delivered");
         }
     })
     .detach();
+}
+
+/// How a control field reads, and what a refusal calls its type.
+struct FieldKind<T> {
+    name: &'static str,
+    read: fn(&Value) -> Option<T>,
+}
+
+/// One control's fields, read so that a refusal names the control and the
+/// field.
+struct ControlFields<'a> {
+    subtype: &'a str,
+    extra: &'a Value,
+}
+
+impl ControlFields<'_> {
+    /// An absent or null field reads as `None`; any other value must be of
+    /// `kind`.
+    fn optional<T>(&self, field: &str, kind: FieldKind<T>) -> Result<Option<T>, String> {
+        match self.extra.get(field) {
+            None | Some(Value::Null) => Ok(None),
+            Some(value) => (kind.read)(value)
+                .map(Some)
+                .ok_or_else(|| field_refusal(self.subtype, field, kind.name)),
+        }
+    }
+
+    fn required<T>(&self, field: &str, kind: FieldKind<T>) -> Result<T, String> {
+        let name = kind.name;
+        self.optional(field, kind)?
+            .ok_or_else(|| field_refusal(self.subtype, field, name))
+    }
+}
+
+fn field_refusal(subtype: &str, field: &str, kind: &str) -> String {
+    format!("{subtype} requires {kind} {field}")
+}
+
+/// `None` when `subtype` is not an automation control; `Some(Err)` names the
+/// field an automation control lacks, or carries as another type.
+fn automation_request(subtype: &str, extra: &Value) -> Option<Result<AutomationRequest, String>> {
+    let fields = ControlFields { subtype, extra };
+    let request = || -> Result<Option<AutomationRequest>, String> {
+        Ok(Some(match subtype {
+            AUTOMATION_LIST => AutomationRequest::List,
+            AUTOMATION_VALIDATE => AutomationRequest::Validate {
+                name: fields.required(NAME_FIELD, STRING_KIND)?,
+            },
+            AUTOMATION_ARM => AutomationRequest::Arm {
+                name: fields.required(NAME_FIELD, STRING_KIND)?,
+                args: fields.optional(ARGS_FIELD, OBJECT_KIND)?,
+                origin: ArmOrigin::Sdk,
+            },
+            AUTOMATION_DISARM => AutomationRequest::Disarm {
+                name: fields.required(NAME_FIELD, STRING_KIND)?,
+            },
+            AUTOMATION_TRUST => AutomationRequest::Trust {
+                name: fields.required(NAME_FIELD, STRING_KIND)?,
+                digest: fields.required(DIGEST_FIELD, STRING_KIND)?,
+            },
+            AUTOMATION_INSPECT => AutomationRequest::Inspect {
+                name: fields.required(NAME_FIELD, STRING_KIND)?,
+                session_id: fields.optional(SESSION_ID_FIELD, STRING_KIND)?,
+            },
+            AUTOMATION_HISTORY => AutomationRequest::History {
+                name: fields.optional(NAME_FIELD, STRING_KIND)?,
+                fire_id: fields.optional(FIRE_ID_FIELD, STRING_KIND)?,
+                limit: fields
+                    .optional(LIMIT_FIELD, INTEGER_KIND)?
+                    .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX)),
+            },
+            AUTOMATION_FIRING => AutomationRequest::Firing {
+                fire_id: fields.required(FIRE_ID_FIELD, STRING_KIND)?,
+            },
+            AUTOMATION_DRY_RUN => AutomationRequest::DryRun {
+                fire_id: fields.required(FIRE_ID_FIELD, STRING_KIND)?,
+            },
+            AUTOMATION_SET_ARGS => AutomationRequest::SetArgs {
+                name: fields.required(NAME_FIELD, STRING_KIND)?,
+                args: fields.required(ARGS_FIELD, OBJECT_KIND)?,
+            },
+            AUTOMATION_SET_STATE => AutomationRequest::SetState {
+                name: fields.required(NAME_FIELD, STRING_KIND)?,
+                state: fields.required(STATE_FIELD, OBJECT_KIND)?,
+                expected_revision: fields.required(EXPECTED_REVISION_FIELD, INTEGER_KIND)?,
+            },
+            AUTOMATION_CLEAR_STATE => AutomationRequest::ClearState {
+                name: fields.required(NAME_FIELD, STRING_KIND)?,
+                expected_revision: fields.required(EXPECTED_REVISION_FIELD, INTEGER_KIND)?,
+            },
+            AUTOMATION_DROP => {
+                let fire_id = fields.required(FIRE_ID_FIELD, STRING_KIND)?;
+                AutomationRequest::Drop(match fields.optional(SEQ_FIELD, INTEGER_KIND)? {
+                    Some(seq) => DropTarget::OutboxItem { fire_id, seq },
+                    None => DropTarget::Firing { fire_id },
+                })
+            }
+            AUTOMATION_PAUSE => AutomationRequest::Pause {
+                by: PauseSource::Sdk,
+            },
+            AUTOMATION_RESUME => AutomationRequest::Resume,
+            _ => return Ok(None),
+        }))
+    };
+    request().transpose()
+}
+
+/// Without a runtime every automation control answers unavailable, whatever
+/// it asked. With one, a control whose fields make no request is refused by
+/// name, and the runtime answers the rest off the stdin thread.
+fn answer_automation_control(
+    writer: &SdkWriter,
+    request_id: &str,
+    request: Result<AutomationRequest, String>,
+    automations: Option<&AutomationHandle>,
+) -> Result<()> {
+    let Some(automations) = automations else {
+        let (response, error) = automation_control_response(Err(AutomationError::Unavailable));
+        return writer.emit_control_response(request_id, response, error);
+    };
+    match request {
+        Ok(request) => {
+            let automations = automations.clone();
+            forward_control(
+                writer,
+                request_id,
+                async move { automations.request(request).await },
+                automation_control_response,
+            );
+            Ok(())
+        }
+        Err(message) => writer.emit_control_response(request_id, None, Some(message)),
+    }
+}
+
+/// A success carries the runtime's answer under `automation`; a failure is an
+/// error response whose message is the error's text, with the structured
+/// error under `automation_error`.
+fn automation_control_response(
+    answer: Result<AutomationResponse, AutomationError>,
+) -> (Option<Value>, Option<String>) {
+    match answer {
+        Ok(response) => (
+            Some(serde_json::json!({ AUTOMATION_REPLY: response })),
+            None,
+        ),
+        Err(error) => (
+            Some(serde_json::json!({ AUTOMATION_ERROR_REPLY: error })),
+            Some(error.to_string()),
+        ),
+    }
 }
 
 /// A success carries the runtime's answer under `workflow`; a failure is an
@@ -2273,13 +2899,35 @@ struct EventPump {
 }
 
 impl EventPump {
-    fn spawn(mut self, event_rx: Receiver<Envelope>) -> smol::Task<()> {
+    /// Agent events and automation events go out from this one task, in the
+    /// order they arrive. The agent events end it once the session ends,
+    /// after what the automations sent before then; the automation events
+    /// closing first, as they start out without a runtime, only stops their
+    /// reading.
+    fn spawn(
+        mut self,
+        event_rx: Receiver<Envelope>,
+        automation_rx: Receiver<AutomationEvent>,
+    ) -> smol::Task<()> {
         smol::spawn(async move {
-            while let Ok(envelope) = event_rx.recv_async().await {
-                if let Err(e) = self.handle(envelope) {
-                    warn!(error = %e, "sdk event pump stopped");
-                    break;
+            let pumped: Result<()> = async {
+                loop {
+                    let next = future::or(
+                        async { Ok(event_rx.recv_async().await.ok()) },
+                        self.writer.emit_automations(&automation_rx),
+                    )
+                    .await?;
+                    let Some(envelope) = next else {
+                        return automation_rx
+                            .try_iter()
+                            .try_for_each(|event| self.writer.emit_automation(event));
+                    };
+                    self.handle(envelope)?;
                 }
+            }
+            .await;
+            if let Err(error) = pumped {
+                warn!(%error, "sdk event pump stopped");
             }
         })
     }
@@ -2301,6 +2949,15 @@ impl EventPump {
         match billing {
             Billing::Api => add_cost(&mut self.cost, cost),
             Billing::Subscription => add_cost(&mut self.subscription_cost, cost),
+        }
+    }
+
+    fn emit_goal(&self, event: &AgentEvent) -> Result<()> {
+        match GoalSystemPayload::from_event(event) {
+            Some(payload) => self
+                .writer
+                .emit_system(GOAL_SYSTEM_SUBTYPE, serde_json::to_value(payload)?),
+            None => Ok(()),
         }
     }
 
@@ -2452,10 +3109,25 @@ impl EventPump {
             | AgentEvent::ToolHeaderSnapshot { .. }
             | AgentEvent::LiveToolBuf { .. }
             | AgentEvent::Nudge { .. }
-            | AgentEvent::Injected { .. }
             | AgentEvent::ToolsLoaded { .. }
             | AgentEvent::Unrecorded { .. }
             | AgentEvent::PromptProgress { .. } => {}
+            // The claims a run starts with are on record already and come back
+            // here as its preamble lands; a guide item joins the run mid-way.
+            AgentEvent::Injected {
+                automation_event, ..
+            } => {
+                if parent_event
+                    && let Some(origin) = automation_event
+                    && let Some(run) = self
+                        .run
+                        .as_mut()
+                        .filter(|run| run.run_id == envelope.run_id)
+                    && !run.automation_events.contains(origin)
+                {
+                    run.automation_events.push(origin.clone());
+                }
+            }
             AgentEvent::TaskAdmitted(task) => {
                 self.writer.emit_system(
                     "task_admitted",
@@ -2487,12 +3159,13 @@ impl EventPump {
             | AgentEvent::GoalDeferred { .. }
             | AgentEvent::GoalLoopCap { .. }
             | AgentEvent::GoalTurnLimit { .. }
-            | AgentEvent::GoalClearedAfterError { .. } => {}
+            | AgentEvent::GoalClearedAfterError { .. } => self.emit_goal(&envelope.event)?,
             AgentEvent::GoalEvaluation { cost, billing, .. }
             | AgentEvent::GoalEvaluationFailed { cost, billing, .. } => {
                 if !detached {
                     self.add_spend(*cost, *billing);
                 }
+                self.emit_goal(&envelope.event)?;
             }
             AgentEvent::Retry {
                 attempt,
@@ -2721,13 +3394,32 @@ fn map_tool_names_in_content(content: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use caudra_agent::automation::catalog::{Frontend, UNAVAILABLE_IN_SDK};
+    use caudra_agent::automation::frontend::set_claimed_goal;
+    use caudra_agent::automation::manager::{AutomationRuntime, PAUSED_BY_SDK, RuntimeDeps};
+    use caudra_agent::automation::testing::{AutomationFixture, FakeWorkflows};
+    use caudra_agent::automation::workflows::Workflows;
     use caudra_agent::permissions::PermissionRequest;
     use caudra_agent::tools::PermissionScopes;
     use caudra_agent::types::WORKFLOW_EVENT_RUN_ID;
-    use caudra_agent::{SubagentInfo, TaskCard, ToolOutput};
+    use std::time::Duration;
+
+    use caudra_agent::{
+        DEFAULT_GOAL_CONTINUATION_LIMIT, GoalError, MAX_GOAL_CHARS, SubagentInfo, TaskCard,
+        ToolOutput,
+    };
+    use caudra_automation::event::{ArmedReason, Event, EventDetail};
+    use caudra_automation::host::ActionKind;
+    use caudra_automation::meta::TriggerKind;
+    use caudra_automation::replay::{Answer, DRY_RUN_ID};
+    use caudra_automation::request::{GoalClaim, REPLAY_NOT_FINISHED, UNAVAILABLE};
+    use caudra_automation::snapshot::{ErrorView, FiringStatus, StateOutcome};
     use caudra_providers::{ContentBlock, Message, Role, TaskEventOrigin};
     use caudra_storage::background::{JobPayload, ShellJobMetadata, TaskRecord};
-    use caudra_storage::sessions::SessionDatabase;
+    use caudra_storage::id::CaudraId;
+    use caudra_storage::sessions::{
+        SessionDatabase, StoredAutomationControls, StoredDeliveryBackoff, StoredUnattendedTurns,
+    };
     use caudra_storage::usage_ledger::LedgerPurpose;
     use caudra_workflow::{RunSnapshot, RunStatus, RunUsage, SourceKind};
     use clap::Parser;
@@ -2775,7 +3467,7 @@ mod tests {
                     shell_execution: shell.clone(),
                     ..Default::default()
                 };
-                let payload = init_payload(serde_json::json!({}), false, &config, jobs);
+                let payload = init_payload(serde_json::json!({}), false, false, &config, jobs);
                 assert_eq!(
                     payload["task_execution"]["configured"],
                     serde_json::json!(task)
@@ -3034,6 +3726,7 @@ mod tests {
             automatic: false,
             task_event_ids: Vec::new(),
             workflow_events: Vec::new(),
+            automation_events: Vec::new(),
         });
         pump.result_text = REPAIR_PARENT.into();
         pump.synth.text_delta(&pump.model_id(), REPAIR_PARENT);
@@ -3230,6 +3923,7 @@ mod tests {
                 run_id: WORKFLOW_RUN.into(),
                 revision: RUN,
             }],
+            automation_events: Vec::new(),
         })
         .unwrap();
         pump.handle(Envelope {
@@ -5098,7 +5792,12 @@ mod tests {
             out_tx,
         };
 
-        forward_workflow_request(&writer, "req_1", async { Err(WorkflowError::Unavailable) });
+        forward_control(
+            &writer,
+            "req_1",
+            async { Err(WorkflowError::Unavailable) },
+            workflow_control_response,
+        );
 
         let message: Value =
             serde_json::from_str(&smol::block_on(out_rx.recv_async()).unwrap()).unwrap();
@@ -5115,13 +5814,1252 @@ mod tests {
         let payload = init_payload(
             serde_json::json!({"cwd": "/tmp"}),
             workflows,
+            false,
             &AgentConfig::default(),
             false,
         );
         assert_eq!(payload["cwd"], "/tmp");
+        assert_eq!(
+            payload["goal_controls"],
+            serde_json::json!([GOAL_SET, GOAL_CLEAR, GOAL_STATUS])
+        );
         (
             payload["workflows"].as_bool().unwrap(),
             payload["workflow_controls"].as_array().unwrap().len(),
         )
+    }
+
+    const GOAL_CONDITION: &str = "the suite passes";
+    const OTHER_GOAL_CONDITION: &str = "the suite is fast";
+    const GOAL_REASON: &str = "two tests still fail";
+    const GOAL_MODEL: &str = "anthropic/claude-haiku";
+    const GOAL_FAILURE: &str = "evaluator returned no text";
+    const GOAL_COST: f64 = 0.125;
+    const GOAL_EVALUATION: u32 = 2;
+    const GOAL_CONTINUATIONS: u32 = 1;
+    const GOAL_LIMIT: u32 = 4;
+    const GOAL_DURATION_MS: u64 = 1_500;
+    const GOAL_TASKS: usize = 2;
+    const GOAL_CWD: &str = "/project";
+    static GOAL_THINKING: ThinkingConfig = ThinkingConfig::Off;
+
+    fn goal_result() -> GoalResult {
+        GoalResult {
+            condition: Arc::from(GOAL_CONDITION),
+            verdict: GoalVerdict::Met,
+            reason: Arc::from(GOAL_REASON),
+            evaluations: GOAL_EVALUATION,
+            duration: Duration::from_millis(GOAL_DURATION_MS),
+            usage: TokenUsage::default(),
+            cost: Some(GOAL_COST),
+            subscription_cost: None,
+        }
+    }
+
+    /// A goal event, the `goal` message fields it must become, and the
+    /// spend it adds to the turn.
+    fn goal_event(kind: &str) -> (AgentEvent, Value, Option<f64>) {
+        match kind {
+            "evaluating" => (
+                AgentEvent::GoalEvaluating {
+                    evaluation: GOAL_EVALUATION,
+                },
+                serde_json::json!({"evaluation": GOAL_EVALUATION}),
+                None,
+            ),
+            "evaluation" => (
+                AgentEvent::GoalEvaluation {
+                    verdict: GoalVerdict::NotMet,
+                    reason: GOAL_REASON.into(),
+                    evaluation: GOAL_EVALUATION,
+                    applied: true,
+                    usage: TokenUsage::default(),
+                    cost: Some(GOAL_COST),
+                    billing: Billing::Api,
+                    model: GOAL_MODEL.into(),
+                },
+                serde_json::json!({
+                    "verdict": "not_met",
+                    "reason": GOAL_REASON,
+                    "evaluation": GOAL_EVALUATION,
+                    "applied": true,
+                    "cost": GOAL_COST,
+                    "model": GOAL_MODEL,
+                }),
+                Some(GOAL_COST),
+            ),
+            "evaluation_failed" => (
+                AgentEvent::GoalEvaluationFailed {
+                    evaluation: GOAL_EVALUATION,
+                    message: GOAL_FAILURE.into(),
+                    applied: false,
+                    usage: TokenUsage::default(),
+                    cost: Some(GOAL_COST),
+                    billing: Billing::Api,
+                    model: GOAL_MODEL.into(),
+                },
+                serde_json::json!({
+                    "evaluation": GOAL_EVALUATION,
+                    "message": GOAL_FAILURE,
+                    "applied": false,
+                    "cost": GOAL_COST,
+                    "model": GOAL_MODEL,
+                }),
+                Some(GOAL_COST),
+            ),
+            "deferred" => (
+                AgentEvent::GoalDeferred {
+                    active_background_tasks: GOAL_TASKS,
+                },
+                serde_json::json!({"active_background_tasks": GOAL_TASKS}),
+                None,
+            ),
+            "finished" => (
+                AgentEvent::GoalFinished {
+                    result: goal_result(),
+                },
+                serde_json::json!({
+                    "condition": GOAL_CONDITION,
+                    "verdict": "met",
+                    "reason": GOAL_REASON,
+                    "evaluations": GOAL_EVALUATION,
+                    "duration_ms": GOAL_DURATION_MS,
+                    "cost": GOAL_COST,
+                }),
+                None,
+            ),
+            "loop_cap" => (
+                AgentEvent::GoalLoopCap {
+                    evaluations: GOAL_EVALUATION,
+                    continuations: GOAL_CONTINUATIONS,
+                    limit: GOAL_LIMIT,
+                },
+                serde_json::json!({
+                    "evaluations": GOAL_EVALUATION,
+                    "continuations": GOAL_CONTINUATIONS,
+                    "limit": GOAL_LIMIT,
+                }),
+                None,
+            ),
+            "turn_limit" => (
+                AgentEvent::GoalTurnLimit {
+                    evaluations: GOAL_EVALUATION,
+                },
+                serde_json::json!({"evaluations": GOAL_EVALUATION}),
+                None,
+            ),
+            "cleared_after_error" => (
+                AgentEvent::GoalClearedAfterError {
+                    condition: GOAL_CONDITION.into(),
+                    message: GOAL_FAILURE.into(),
+                },
+                serde_json::json!({"condition": GOAL_CONDITION, "message": GOAL_FAILURE}),
+                None,
+            ),
+            other => unreachable!("no goal event is named {other}"),
+        }
+    }
+
+    #[test_case("evaluating"; "evaluating")]
+    #[test_case("evaluation"; "evaluation")]
+    #[test_case("evaluation_failed"; "evaluation_failed")]
+    #[test_case("deferred"; "deferred")]
+    #[test_case("finished"; "finished")]
+    #[test_case("loop_cap"; "loop_cap")]
+    #[test_case("turn_limit"; "turn_limit")]
+    #[test_case("cleared_after_error"; "cleared_after_error")]
+    fn a_goal_event_is_a_goal_system_message(kind: &str) {
+        let (event, fields, spend) = goal_event(kind);
+        let (mut pump, out_rx, _) =
+            permission_event_pump(permission_manager(), PermissionMode::Default);
+
+        pump.handle(Envelope {
+            event,
+            subagent: None,
+            run_id: 1,
+            task: None,
+            workflow: None,
+        })
+        .unwrap();
+
+        let message = next_message(&out_rx);
+        assert_eq!(message["type"], "system");
+        assert_eq!(message["subtype"], GOAL_SYSTEM_SUBTYPE);
+        assert_eq!(message["kind"], kind);
+        for (key, value) in fields.as_object().unwrap() {
+            assert_eq!(&message[key], value, "{kind}.{key}");
+        }
+        assert!(out_rx.is_empty());
+        assert_eq!(pump.cost, spend);
+    }
+
+    fn goal_prompts(shared: &Mutex<Shared>) -> PromptContext<'_> {
+        PromptContext {
+            shared,
+            cwd: Path::new(GOAL_CWD),
+            remote: false,
+            thinking: &GOAL_THINKING,
+            fast: false,
+        }
+    }
+
+    #[test_case(serde_json::json!({"condition": GOAL_CONDITION, "continuation_limit": GOAL_LIMIT}), true; "kickoff_by_default")]
+    #[test_case(serde_json::json!({"condition": GOAL_CONDITION, "continuation_limit": GOAL_LIMIT, "kickoff": false}), false; "without_kickoff")]
+    fn goal_set_replaces_the_goal_and_queues_its_kickoff_as_a_typed_prompt(
+        request: Value,
+        kickoff: bool,
+    ) {
+        let shared = shared_with_pending(HashMap::new());
+        let goal = GoalHandle::default();
+        goal.set(OTHER_GOAL_CONDITION).unwrap();
+        let (input_tx, input_rx) = flume::unbounded();
+
+        let reply = goal_set(&request, &goal, &goal_prompts(&shared), &input_tx).unwrap();
+
+        assert_eq!(goal.active_condition().as_deref(), Some(GOAL_CONDITION));
+        assert_eq!(reply["status"], GOAL_ACTIVE);
+        assert_eq!(reply["condition"], GOAL_CONDITION);
+        assert_eq!(reply["evaluations"], 0);
+        assert_eq!(reply["continuation_limit"], GOAL_LIMIT);
+        let queued: Vec<_> = input_rx.try_iter().collect();
+        assert_eq!(queued.len(), usize::from(kickoff));
+        if let Some(input) = queued.first() {
+            let kickoff = goal_kickoff_message(GOAL_CONDITION);
+            assert_eq!(input.message, GOAL_CONDITION);
+            assert_eq!(input.mode, AgentMode::Build);
+            assert_eq!(
+                input
+                    .preamble
+                    .iter()
+                    .map(|message| message.first_text_content())
+                    .collect::<Vec<_>>(),
+                [Some(kickoff.as_str())]
+            );
+        }
+    }
+
+    #[test_case(" ", GoalError::Empty; "empty")]
+    #[test_case(&"x".repeat(MAX_GOAL_CHARS + 1), GoalError::TooLong; "too_long")]
+    fn goal_set_refuses_what_goal_refuses(condition: &str, error: GoalError) {
+        let shared = shared_with_pending(HashMap::new());
+        let goal = GoalHandle::default();
+        goal.set(OTHER_GOAL_CONDITION).unwrap();
+        let (input_tx, input_rx) = flume::unbounded();
+
+        let refusal = goal_set(
+            &serde_json::json!({"condition": condition}),
+            &goal,
+            &goal_prompts(&shared),
+            &input_tx,
+        )
+        .unwrap_err();
+
+        assert_eq!(refusal, error.to_string());
+        assert_eq!(
+            goal.active_condition().as_deref(),
+            Some(OTHER_GOAL_CONDITION)
+        );
+        assert!(input_rx.is_empty());
+    }
+
+    #[test]
+    fn goal_clear_answers_the_goal_it_stopped_and_keeps_a_finished_one() {
+        let goal = GoalHandle::default();
+        assert_eq!(goal_clear(&goal).unwrap()["cleared"], Value::Null);
+        goal.set(GOAL_CONDITION).unwrap();
+        assert_eq!(goal_clear(&goal).unwrap()["cleared"], GOAL_CONDITION);
+        assert!(goal.snapshot().is_none());
+
+        goal.restore_finished(goal_result());
+        assert_eq!(goal_clear(&goal).unwrap()["cleared"], Value::Null);
+        assert_eq!(goal_status(&goal).unwrap()["status"], GOAL_FINISHED);
+    }
+
+    #[test]
+    fn goal_status_reports_the_goal_under_the_finished_payload_names() {
+        let goal = GoalHandle::default();
+        assert_eq!(
+            goal_status(&goal).unwrap(),
+            serde_json::json!({
+                "status": NO_GOAL,
+                "continuation_limit": DEFAULT_GOAL_CONTINUATION_LIMIT,
+            })
+        );
+
+        goal.set_continuation_limit(GOAL_LIMIT);
+        goal.restore_finished(goal_result());
+        let (_, mut expected, _) = goal_event("finished");
+        expected["status"] = GOAL_FINISHED.into();
+        expected["continuation_limit"] = GOAL_LIMIT.into();
+        expected["subscription_cost"] = Value::Null;
+        expected["usage"] = serde_json::to_value(TokenUsage::default()).unwrap();
+        assert_eq!(goal_status(&goal).unwrap(), expected);
+
+        goal.set(OTHER_GOAL_CONDITION).unwrap();
+        let active = goal_status(&goal).unwrap();
+        assert_eq!(active["status"], GOAL_ACTIVE);
+        assert_eq!(active["condition"], OTHER_GOAL_CONDITION);
+        assert_eq!(active["verdict"], Value::Null);
+        assert_eq!(active["evaluations"], 0);
+    }
+
+    const AUTOMATION_NAME: &str = "deploy-watch";
+    const GUIDE_AUTOMATION: &str = "ci-guide";
+    const FIRE_ID: &str = "fire-2";
+    const ABSORBED_FIRE_ID: &str = "fire-1";
+    const GUIDE_FIRE_ID: &str = "fire-3";
+    const SCRIPT_DIGEST: &str = "sha256:5f0c2a";
+    const AUTOMATION_SESSION: &str = "session-7";
+    const AUTOMATION_BRANCH: &str = "main";
+    const EVENT_KEY: &str = "message-7";
+    const FIRING_REASON: &str = "the deploy is still running";
+    const SCRIPT_ERROR_KIND: &str = "runtime";
+    const SCRIPT_ERROR: &str = "index out of bounds";
+    const SCRIPT_LINE: u32 = 3;
+    const SCRIPT_COLUMN: u32 = 9;
+    const TRIGGER_INDEX: u32 = 1;
+    const FIRING_REPEATS: u64 = 2;
+    const FIRING_ATTEMPTS: u64 = 1;
+    const FIRING_OPERATIONS: u64 = 4;
+    const FIRING_ACTIONS: u64 = 1;
+    const FIRED_AT_MS: i64 = 1_790_000_000_000;
+    const STATE_REVISION: u64 = 3;
+    const HISTORY_LIMIT: usize = 5;
+    const NEGATIVE_LIMIT: i64 = -1;
+    const OUTBOX_SEQ: u64 = 2;
+    const CLAIM_SEQ: u32 = 0;
+    const GUIDE_SEQ: u32 = 1;
+    const NOTICE_TEXT: &str = "deploy finished";
+    const AUTOMATION_PROMPT: &str = "check CI";
+    const CONTROL_ID: &str = "req_automation";
+    const INTERRUPT: &str = "interrupt";
+    const ARMED_TRIGGER: &str = r#"triggers: [#{ kind: "armed" }]"#;
+    const WIRE_IDS: [&str; 2] = ["session_id", "uuid"];
+    const PUMP_ROUNDS: usize = 3;
+    const UNATTENDED_TURNS: u32 = 2;
+    const BACKOFF_ERRORS: u32 = 1;
+    const RUNTIME_STARTS: &str = "the fixture's runtime must start";
+    const PUMP_WRITING: &str = "the pump must keep writing while the session runs";
+    const GOAL_KEPT: &str = "an active goal must refuse a claim that does not replace it";
+    const EVENTS_OPEN: &str = "the runtime's events must stay open while the test reads them";
+    const START_HELD: &str = "the running firing must wait on its workflow start";
+    const QUEUED_BEHIND: &str = "arming again while a firing runs must queue its event";
+    const NOT_A_DRY_RUN: &str = "a dry run of a finished firing must answer with its detail";
+    const NOT_CONTROLS: &str = "a pause and a resume must answer with the session's controls";
+    const LATCHED: &str = "automation_pause must set the latch";
+    const NOT_A_TRACE: &str = "a firing request must answer with its trace";
+
+    fn sdk_writer() -> (SdkWriter, Receiver<String>) {
+        let (out_tx, out_rx) = flume::unbounded();
+        let writer = SdkWriter {
+            session_id: SessionRef::generate(),
+            out_tx,
+        };
+        (writer, out_rx)
+    }
+
+    /// A message without the ids every message carries.
+    fn without_wire_ids(mut message: Value) -> Value {
+        for id in WIRE_IDS {
+            message.as_object_mut().unwrap().remove(id);
+        }
+        message
+    }
+
+    async fn next_line(out_rx: &Receiver<String>) -> Value {
+        serde_json::from_str(&out_rx.recv_async().await.expect(PUMP_WRITING)).unwrap()
+    }
+
+    fn automation_args() -> Value {
+        serde_json::json!({ "branch": AUTOMATION_BRANCH })
+    }
+
+    #[test_case(AUTOMATION_LIST, serde_json::json!({}) => AutomationRequest::List; "list")]
+    #[test_case(AUTOMATION_VALIDATE, serde_json::json!({"name": AUTOMATION_NAME}) => AutomationRequest::Validate { name: AUTOMATION_NAME.into() }; "validate")]
+    #[test_case(AUTOMATION_ARM, serde_json::json!({"name": AUTOMATION_NAME, "args": automation_args()}) => AutomationRequest::Arm { name: AUTOMATION_NAME.into(), args: Some(automation_args()), origin: ArmOrigin::Sdk }; "arm")]
+    #[test_case(AUTOMATION_ARM, serde_json::json!({"name": AUTOMATION_NAME, "args": null}) => AutomationRequest::Arm { name: AUTOMATION_NAME.into(), args: None, origin: ArmOrigin::Sdk }; "arm_with_its_stored_args")]
+    #[test_case(AUTOMATION_DISARM, serde_json::json!({"name": AUTOMATION_NAME}) => AutomationRequest::Disarm { name: AUTOMATION_NAME.into() }; "disarm")]
+    #[test_case(AUTOMATION_TRUST, serde_json::json!({"name": AUTOMATION_NAME, "digest": SCRIPT_DIGEST}) => AutomationRequest::Trust { name: AUTOMATION_NAME.into(), digest: SCRIPT_DIGEST.into() }; "trust")]
+    #[test_case(AUTOMATION_INSPECT, serde_json::json!({"name": AUTOMATION_NAME}) => AutomationRequest::Inspect { name: AUTOMATION_NAME.into(), session_id: None }; "inspect")]
+    #[test_case(AUTOMATION_INSPECT, serde_json::json!({"name": AUTOMATION_NAME, "session_id": AUTOMATION_SESSION}) => AutomationRequest::Inspect { name: AUTOMATION_NAME.into(), session_id: Some(AUTOMATION_SESSION.into()) }; "inspect_another_session")]
+    #[test_case(AUTOMATION_HISTORY, serde_json::json!({}) => AutomationRequest::History { name: None, fire_id: None, limit: None }; "history")]
+    #[test_case(AUTOMATION_HISTORY, serde_json::json!({"name": AUTOMATION_NAME, "fire_id": FIRE_ID, "limit": HISTORY_LIMIT}) => AutomationRequest::History { name: Some(AUTOMATION_NAME.into()), fire_id: Some(FIRE_ID.into()), limit: Some(HISTORY_LIMIT) }; "history_narrowed")]
+    #[test_case(AUTOMATION_FIRING, serde_json::json!({"fire_id": FIRE_ID}) => AutomationRequest::Firing { fire_id: FIRE_ID.into() }; "firing")]
+    #[test_case(AUTOMATION_DRY_RUN, serde_json::json!({"fire_id": FIRE_ID}) => AutomationRequest::DryRun { fire_id: FIRE_ID.into() }; "dry_run")]
+    #[test_case(AUTOMATION_SET_ARGS, serde_json::json!({"name": AUTOMATION_NAME, "args": automation_args()}) => AutomationRequest::SetArgs { name: AUTOMATION_NAME.into(), args: automation_args() }; "set_args")]
+    #[test_case(AUTOMATION_SET_STATE, serde_json::json!({"name": AUTOMATION_NAME, "state": automation_args(), "expected_revision": STATE_REVISION}) => AutomationRequest::SetState { name: AUTOMATION_NAME.into(), state: automation_args(), expected_revision: STATE_REVISION }; "set_state")]
+    #[test_case(AUTOMATION_CLEAR_STATE, serde_json::json!({"name": AUTOMATION_NAME, "expected_revision": STATE_REVISION}) => AutomationRequest::ClearState { name: AUTOMATION_NAME.into(), expected_revision: STATE_REVISION }; "clear_state")]
+    #[test_case(AUTOMATION_DROP, serde_json::json!({"fire_id": FIRE_ID}) => AutomationRequest::Drop(DropTarget::Firing { fire_id: FIRE_ID.into() }); "drop_a_firing")]
+    #[test_case(AUTOMATION_DROP, serde_json::json!({"fire_id": FIRE_ID, "seq": OUTBOX_SEQ}) => AutomationRequest::Drop(DropTarget::OutboxItem { fire_id: FIRE_ID.into(), seq: OUTBOX_SEQ }); "drop_an_outbox_item")]
+    #[test_case(AUTOMATION_PAUSE, serde_json::json!({}) => AutomationRequest::Pause { by: PauseSource::Sdk }; "pause")]
+    #[test_case(AUTOMATION_RESUME, serde_json::json!({}) => AutomationRequest::Resume; "resume")]
+    fn automation_controls_map_to_runtime_requests(
+        subtype: &str,
+        extra: Value,
+    ) -> AutomationRequest {
+        automation_request(subtype, &extra).unwrap().unwrap()
+    }
+
+    #[test_case(AUTOMATION_VALIDATE, serde_json::json!({}), NAME_FIELD, STRING_KIND.name; "validate_without_name")]
+    #[test_case(AUTOMATION_ARM, serde_json::json!({"args": automation_args()}), NAME_FIELD, STRING_KIND.name; "arm_without_name")]
+    #[test_case(AUTOMATION_ARM, serde_json::json!({"name": AUTOMATION_NAME, "args": AUTOMATION_BRANCH}), ARGS_FIELD, OBJECT_KIND.name; "arm_with_args_that_are_not_an_object")]
+    #[test_case(AUTOMATION_DISARM, serde_json::json!({"name": STATE_REVISION}), NAME_FIELD, STRING_KIND.name; "disarm_with_a_numeric_name")]
+    #[test_case(AUTOMATION_TRUST, serde_json::json!({"name": AUTOMATION_NAME}), DIGEST_FIELD, STRING_KIND.name; "trust_without_digest")]
+    #[test_case(AUTOMATION_INSPECT, serde_json::json!({"name": AUTOMATION_NAME, "session_id": STATE_REVISION}), SESSION_ID_FIELD, STRING_KIND.name; "inspect_with_a_numeric_session_id")]
+    #[test_case(AUTOMATION_HISTORY, serde_json::json!({"fire_id": STATE_REVISION}), FIRE_ID_FIELD, STRING_KIND.name; "history_with_a_numeric_fire_id")]
+    #[test_case(AUTOMATION_HISTORY, serde_json::json!({"limit": NEGATIVE_LIMIT}), LIMIT_FIELD, INTEGER_KIND.name; "history_with_a_negative_limit")]
+    #[test_case(AUTOMATION_FIRING, serde_json::json!({}), FIRE_ID_FIELD, STRING_KIND.name; "firing_without_fire_id")]
+    #[test_case(AUTOMATION_DRY_RUN, serde_json::json!({}), FIRE_ID_FIELD, STRING_KIND.name; "dry_run_without_fire_id")]
+    #[test_case(AUTOMATION_DRY_RUN, serde_json::json!({"fire_id": STATE_REVISION}), FIRE_ID_FIELD, STRING_KIND.name; "dry_run_with_a_numeric_fire_id")]
+    #[test_case(AUTOMATION_SET_ARGS, serde_json::json!({"name": AUTOMATION_NAME}), ARGS_FIELD, OBJECT_KIND.name; "set_args_without_args")]
+    #[test_case(AUTOMATION_SET_STATE, serde_json::json!({"name": AUTOMATION_NAME, "expected_revision": STATE_REVISION}), STATE_FIELD, OBJECT_KIND.name; "set_state_without_state")]
+    #[test_case(AUTOMATION_SET_STATE, serde_json::json!({"name": AUTOMATION_NAME, "state": automation_args()}), EXPECTED_REVISION_FIELD, INTEGER_KIND.name; "set_state_without_expected_revision")]
+    #[test_case(AUTOMATION_CLEAR_STATE, serde_json::json!({"name": AUTOMATION_NAME, "expected_revision": AUTOMATION_BRANCH}), EXPECTED_REVISION_FIELD, INTEGER_KIND.name; "clear_state_with_a_text_revision")]
+    #[test_case(AUTOMATION_DROP, serde_json::json!({"seq": OUTBOX_SEQ}), FIRE_ID_FIELD, STRING_KIND.name; "drop_without_fire_id")]
+    #[test_case(AUTOMATION_DROP, serde_json::json!({"fire_id": FIRE_ID, "seq": FIRE_ID}), SEQ_FIELD, INTEGER_KIND.name; "drop_with_a_text_seq")]
+    fn an_automation_control_with_a_missing_or_mistyped_field_is_refused_by_name(
+        subtype: &str,
+        extra: Value,
+        field: &str,
+        kind: &str,
+    ) {
+        assert_eq!(
+            automation_request(subtype, &extra).unwrap().unwrap_err(),
+            field_refusal(subtype, field, kind)
+        );
+    }
+
+    #[test_case(INTERRUPT; "a_session_control")]
+    #[test_case(WORKFLOW_LIST; "a_workflow_control")]
+    fn a_subtype_outside_the_automation_controls_is_not_one(subtype: &str) {
+        assert!(automation_request(subtype, &serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn an_automation_answer_is_a_success_control_response_under_automation() {
+        let (writer, out_rx) = sdk_writer();
+        let (response, error) = automation_control_response(Ok(AutomationResponse::State {
+            revision: STATE_REVISION,
+        }));
+
+        writer
+            .emit_control_response(CONTROL_ID, response, error)
+            .unwrap();
+
+        assert_eq!(
+            without_wire_ids(next_message(&out_rx)),
+            serde_json::json!({
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": CONTROL_ID,
+                    "response": {"automation": {"kind": "state", "detail": {"revision": STATE_REVISION}}},
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn an_automation_error_is_an_error_control_response_with_the_structured_error() {
+        let (writer, out_rx) = sdk_writer();
+        let error = AutomationError::StateConflict {
+            name: AUTOMATION_NAME.into(),
+            current: STATE_REVISION,
+        };
+        let (response, text) = automation_control_response(Err(error.clone()));
+
+        writer
+            .emit_control_response(CONTROL_ID, response, text)
+            .unwrap();
+
+        assert_eq!(
+            without_wire_ids(next_message(&out_rx)),
+            serde_json::json!({
+                "type": "control_response",
+                "response": {
+                    "subtype": "error",
+                    "request_id": CONTROL_ID,
+                    "error": error.to_string(),
+                    "response": {"automation_error": {
+                        "kind": "state_conflict",
+                        "detail": {"name": AUTOMATION_NAME, "current": STATE_REVISION},
+                    }},
+                },
+            })
+        );
+    }
+
+    /// A session handle the stdin loop answers controls from, with `automations` as its runtime.
+    fn control_session(
+        state_dir: &StateDir,
+        session_id: CaudraId,
+        automations: Option<AutomationHandle>,
+    ) -> InteractiveHandle {
+        let lease = Arc::new(SessionLease::acquire(state_dir, session_id).unwrap());
+        let mut session =
+            InteractiveHandle::for_test(lease, permission_manager(), flume::unbounded().0);
+        session.automations = automations;
+        session
+    }
+
+    /// Answers `subtype` as the stdin loop answers a `control_request`.
+    fn send_control(writer: &SdkWriter, session: &InteractiveHandle, subtype: &str, extra: Value) {
+        let shared = shared_with_pending(HashMap::new());
+        let model = shared.lock().unwrap().model.clone();
+        handle_control_request(
+            &InboundControlRequest {
+                request_id: CONTROL_ID.into(),
+                request: InboundControlRequestInner {
+                    subtype: subtype.into(),
+                    extra,
+                },
+            },
+            writer,
+            session,
+            &goal_prompts(&shared),
+            &model,
+            &ModelPolicy::default(),
+        )
+        .unwrap();
+    }
+
+    #[test_case(AUTOMATION_LIST; "list")]
+    #[test_case(AUTOMATION_VALIDATE; "validate")]
+    #[test_case(AUTOMATION_ARM; "arm")]
+    #[test_case(AUTOMATION_DISARM; "disarm")]
+    #[test_case(AUTOMATION_TRUST; "trust")]
+    #[test_case(AUTOMATION_INSPECT; "inspect")]
+    #[test_case(AUTOMATION_HISTORY; "history")]
+    #[test_case(AUTOMATION_FIRING; "firing")]
+    #[test_case(AUTOMATION_DRY_RUN; "dry_run")]
+    #[test_case(AUTOMATION_SET_ARGS; "set_args")]
+    #[test_case(AUTOMATION_SET_STATE; "set_state")]
+    #[test_case(AUTOMATION_CLEAR_STATE; "clear_state")]
+    #[test_case(AUTOMATION_DROP; "drop")]
+    #[test_case(AUTOMATION_PAUSE; "pause")]
+    #[test_case(AUTOMATION_RESUME; "resume")]
+    fn without_a_runtime_an_automation_control_answers_unavailable(subtype: &str) {
+        let state = TempDir::new().unwrap();
+        let session = control_session(
+            &StateDir::from_path(state.path().to_path_buf()),
+            SessionRef::generate().id(),
+            None,
+        );
+        let (writer, out_rx) = sdk_writer();
+
+        send_control(&writer, &session, subtype, serde_json::json!({}));
+
+        let reply = next_message(&out_rx);
+        assert_eq!(reply["response"]["subtype"], "error");
+        assert_eq!(reply["response"]["error"], UNAVAILABLE);
+        assert_eq!(
+            reply["response"]["response"],
+            serde_json::json!({"automation_error": {"kind": "unavailable"}})
+        );
+    }
+
+    #[test_case(true => (true, serde_json::json!([
+        AUTOMATION_LIST,
+        AUTOMATION_VALIDATE,
+        AUTOMATION_ARM,
+        AUTOMATION_DISARM,
+        AUTOMATION_TRUST,
+        AUTOMATION_INSPECT,
+        AUTOMATION_HISTORY,
+        AUTOMATION_FIRING,
+        AUTOMATION_DRY_RUN,
+        AUTOMATION_SET_ARGS,
+        AUTOMATION_SET_STATE,
+        AUTOMATION_CLEAR_STATE,
+        AUTOMATION_DROP,
+        AUTOMATION_PAUSE,
+        AUTOMATION_RESUME,
+    ])); "with_a_runtime")]
+    #[test_case(false => (false, serde_json::json!([])); "without_a_runtime")]
+    fn init_advertises_automation_support(automations: bool) -> (bool, Value) {
+        let payload = init_payload(
+            serde_json::json!({}),
+            false,
+            automations,
+            &AgentConfig::default(),
+            false,
+        );
+        (
+            payload["automations"].as_bool().unwrap(),
+            payload["automation_controls"].clone(),
+        )
+    }
+
+    fn firing_event(status: FiringStatus, absorbed: Option<&str>) -> AutomationEvent {
+        AutomationEvent::Firing {
+            firing: Box::new(FiringSummary {
+                fire_id: FIRE_ID.into(),
+                automation: AUTOMATION_NAME.into(),
+                digest: SCRIPT_DIGEST.into(),
+                trigger: TriggerKind::MessageReceived,
+                trigger_index: TRIGGER_INDEX,
+                event_key: Some(EVENT_KEY.into()),
+                consumed: true,
+                status,
+                reason: Some(FIRING_REASON.into()),
+                error: Some(ErrorView {
+                    kind: SCRIPT_ERROR_KIND.into(),
+                    message: SCRIPT_ERROR.into(),
+                    line: Some(SCRIPT_LINE),
+                    column: Some(SCRIPT_COLUMN),
+                }),
+                repeats: FIRING_REPEATS,
+                attempts: FIRING_ATTEMPTS,
+                operations: FIRING_OPERATIONS,
+                state_outcome: Some(StateOutcome::Conflict),
+                queued_at: FIRED_AT_MS,
+                deferred_until: Some(FIRED_AT_MS),
+                started_at: Some(FIRED_AT_MS),
+                finished_at: Some(FIRED_AT_MS),
+                action_count: FIRING_ACTIONS,
+                first_action: Some(ActionKind::Message),
+            }),
+            absorbed: absorbed.map(str::to_owned),
+        }
+    }
+
+    #[test_case(FiringStatus::Queued => false; "queued")]
+    #[test_case(FiringStatus::Deferred => false; "deferred")]
+    #[test_case(FiringStatus::Running => false; "running")]
+    #[test_case(FiringStatus::Completed => true; "completed")]
+    #[test_case(FiringStatus::Skipped => true; "skipped")]
+    #[test_case(FiringStatus::Released => true; "released")]
+    #[test_case(FiringStatus::Failed => true; "failed")]
+    #[test_case(FiringStatus::RateLimited => true; "rate_limited")]
+    #[test_case(FiringStatus::Cancelled => true; "cancelled")]
+    #[test_case(FiringStatus::Paused => true; "paused")]
+    #[test_case(FiringStatus::Dropped => true; "dropped")]
+    #[test_case(FiringStatus::Interrupted => true; "interrupted")]
+    fn a_firing_reaches_the_wire_once_it_ended(status: FiringStatus) -> bool {
+        let (writer, out_rx) = sdk_writer();
+
+        writer.emit_automation(firing_event(status, None)).unwrap();
+
+        let reported: Vec<Value> = out_rx
+            .try_iter()
+            .map(|line| serde_json::from_str(&line).unwrap())
+            .collect();
+        assert!(reported.len() <= 1);
+        reported.first().is_some_and(|fired| {
+            fired["subtype"] == AUTOMATION_FIRED_SUBTYPE && fired["status"] == status.as_str()
+        })
+    }
+
+    /// A wire contract: the summary's own names beside the subtype, and `absorbed` only when
+    /// the firing took a quiet skip's place.
+    #[test_case(Some(ABSORBED_FIRE_ID); "absorbing_a_quiet_skip")]
+    #[test_case(None; "on_its_own")]
+    fn automation_fired_is_the_firing_summary_under_its_own_names(absorbed: Option<&str>) {
+        let (writer, out_rx) = sdk_writer();
+
+        writer
+            .emit_automation(firing_event(FiringStatus::Failed, absorbed))
+            .unwrap();
+
+        let mut expected = serde_json::json!({
+            "type": "system",
+            "subtype": AUTOMATION_FIRED_SUBTYPE,
+            "fire_id": FIRE_ID,
+            "automation": AUTOMATION_NAME,
+            "digest": SCRIPT_DIGEST,
+            "trigger": "message_received",
+            "trigger_index": TRIGGER_INDEX,
+            "event_key": EVENT_KEY,
+            "consumed": true,
+            "status": "failed",
+            "reason": FIRING_REASON,
+            "error": {
+                "kind": SCRIPT_ERROR_KIND,
+                "message": SCRIPT_ERROR,
+                "line": SCRIPT_LINE,
+                "column": SCRIPT_COLUMN,
+            },
+            "repeats": FIRING_REPEATS,
+            "attempts": FIRING_ATTEMPTS,
+            "operations": FIRING_OPERATIONS,
+            "state_outcome": "conflict",
+            "queued_at": FIRED_AT_MS,
+            "deferred_until": FIRED_AT_MS,
+            "started_at": FIRED_AT_MS,
+            "finished_at": FIRED_AT_MS,
+            "action_count": FIRING_ACTIONS,
+            "first_action": "message",
+        });
+        if let Some(absorbed) = absorbed {
+            expected["absorbed"] = absorbed.into();
+        }
+        assert_eq!(without_wire_ids(next_message(&out_rx)), expected);
+        assert!(out_rx.is_empty());
+    }
+
+    /// What the session answers a claimed goal while another goal is active.
+    fn claimed_goal_refusal() -> String {
+        let goal = GoalHandle::default();
+        goal.set(OTHER_GOAL_CONDITION).unwrap();
+        let claim = GoalClaim {
+            condition: GOAL_CONDITION.into(),
+            continuation_limit: None,
+            replace: false,
+        };
+        set_claimed_goal(&goal, &claim).expect(GOAL_KEPT)
+    }
+
+    #[test_case(NOTICE_TEXT.to_owned(), Some(FIRE_ID); "a_script_notice")]
+    #[test_case(claimed_goal_refusal(), Some(FIRE_ID); "a_claimed_goal_refusal")]
+    #[test_case(UNAVAILABLE_IN_SDK.to_owned(), None; "an_arming_refusal")]
+    fn a_notice_is_an_automation_notice_message(text: String, fire_id: Option<&str>) {
+        let (writer, out_rx) = sdk_writer();
+
+        writer
+            .emit_automation(AutomationEvent::Notice {
+                automation: AUTOMATION_NAME.into(),
+                fire_id: fire_id.map(str::to_owned),
+                text: text.clone(),
+            })
+            .unwrap();
+
+        let mut expected = serde_json::json!({
+            "type": "system",
+            "subtype": AUTOMATION_NOTICE_SUBTYPE,
+            "automation": AUTOMATION_NAME,
+            "text": text,
+        });
+        if let Some(fire_id) = fire_id {
+            expected[FIRE_ID_FIELD] = fire_id.into();
+        }
+        assert_eq!(without_wire_ids(next_message(&out_rx)), expected);
+    }
+
+    fn automation_origin(automation: &str, fire_id: &str, seq: u32) -> AutomationEventOrigin {
+        AutomationEventOrigin {
+            automation: automation.into(),
+            fire_id: fire_id.into(),
+            seq,
+        }
+    }
+
+    /// How a run's automation message reads on the wire.
+    fn origin_entry(origin: &AutomationEventOrigin) -> Value {
+        serde_json::json!({
+            "automation": origin.automation,
+            "fire_id": origin.fire_id,
+            "seq": origin.seq,
+        })
+    }
+
+    fn injected(
+        run_id: u64,
+        subagent: Option<SubagentInfo>,
+        origin: &AutomationEventOrigin,
+    ) -> Envelope {
+        Envelope {
+            event: AgentEvent::Injected {
+                text: AUTOMATION_PROMPT.into(),
+                task_event: None,
+                peer_event: None,
+                automation_event: Some(origin.clone()),
+            },
+            subagent,
+            run_id,
+            task: None,
+            workflow: None,
+        }
+    }
+
+    #[test]
+    fn a_run_reports_its_claims_then_the_guide_items_injected_into_it() {
+        const RUN: u64 = 7;
+        let (mut pump, out_rx, _) =
+            permission_event_pump(permission_manager(), PermissionMode::Default);
+        let (run_tx, run_rx) = flume::unbounded();
+        pump.run_rx = run_rx;
+        let claim = automation_origin(AUTOMATION_NAME, FIRE_ID, CLAIM_SEQ);
+        let first_guide = automation_origin(GUIDE_AUTOMATION, GUIDE_FIRE_ID, CLAIM_SEQ);
+        let second_guide = automation_origin(GUIDE_AUTOMATION, GUIDE_FIRE_ID, GUIDE_SEQ);
+        let elsewhere = automation_origin(GUIDE_AUTOMATION, ABSORBED_FIRE_ID, CLAIM_SEQ);
+        run_tx
+            .send(InteractiveRun {
+                run_id: RUN,
+                started: Instant::now(),
+                automatic: true,
+                task_event_ids: Vec::new(),
+                workflow_events: Vec::new(),
+                automation_events: vec![claim.clone()],
+            })
+            .unwrap();
+        let subagent = SubagentInfo {
+            parent_tool_use_id: RETRY_PARENT.into(),
+            task_id: RETRY_PARENT.into(),
+            name: RETRY_PARENT.into(),
+            prompt: None,
+            model: None,
+            thinking: None,
+            fast: false,
+            answer_tx: None,
+            steer_tx: None,
+        };
+
+        for envelope in [
+            injected(RUN, None, &claim),
+            injected(RUN, None, &first_guide),
+            injected(RUN, Some(subagent), &elsewhere),
+            injected(RUN - 1, None, &elsewhere),
+            injected(RUN, None, &second_guide),
+            Envelope {
+                event: AgentEvent::Done {
+                    usage: TokenUsage::default(),
+                    num_turns: 1,
+                    reason: DoneReason::EndTurn,
+                },
+                subagent: None,
+                run_id: RUN,
+                task: None,
+                workflow: None,
+            },
+        ] {
+            pump.handle(envelope).unwrap();
+        }
+
+        let start = next_message(&out_rx);
+        assert_eq!(start["subtype"], "turn_start");
+        assert_eq!(
+            start["automation_events"],
+            serde_json::json!([origin_entry(&claim)])
+        );
+        let result = next_message(&out_rx);
+        assert_eq!(
+            result["run"]["automation_events"],
+            serde_json::json!([
+                origin_entry(&claim),
+                origin_entry(&first_guide),
+                origin_entry(&second_guide),
+            ])
+        );
+        assert!(out_rx.is_empty());
+    }
+
+    fn goal_envelope() -> Envelope {
+        Envelope {
+            event: goal_event("evaluating").0,
+            subagent: None,
+            run_id: 1,
+            task: None,
+            workflow: None,
+        }
+    }
+
+    fn notice(text: &str) -> AutomationEvent {
+        AutomationEvent::Notice {
+            automation: AUTOMATION_NAME.into(),
+            fire_id: Some(FIRE_ID.into()),
+            text: text.into(),
+        }
+    }
+
+    /// One task writes both streams, so each message goes out as it arrives. The automation
+    /// events closing, as they do without a runtime, never stops the agent events; the agent
+    /// events ending stops the pump while the automation events stay open.
+    #[test_case(true; "with_automations")]
+    #[test_case(false; "without_automations")]
+    fn the_pump_writes_both_streams_until_the_agent_events_end(automations: bool) {
+        smol::block_on(async {
+            let (pump, out_rx, _) =
+                permission_event_pump(permission_manager(), PermissionMode::Default);
+            let (event_tx, event_rx) = flume::unbounded();
+            let (automation_tx, automation_rx) = flume::unbounded();
+            let automation_tx = automations.then_some(automation_tx);
+            let pump = pump.spawn(event_rx, automation_rx);
+
+            let mut subtypes = Vec::new();
+            for _ in 0..PUMP_ROUNDS {
+                event_tx.send(goal_envelope()).unwrap();
+                subtypes.push(next_line(&out_rx).await["subtype"].clone());
+                if let Some(automation_tx) = &automation_tx {
+                    automation_tx.send(notice(NOTICE_TEXT)).unwrap();
+                    subtypes.push(next_line(&out_rx).await["subtype"].clone());
+                }
+            }
+            drop(event_tx);
+            pump.await;
+
+            let round: &[&str] = if automations {
+                &[GOAL_SYSTEM_SUBTYPE, AUTOMATION_NOTICE_SUBTYPE]
+            } else {
+                &[GOAL_SYSTEM_SUBTYPE]
+            };
+            assert_eq!(subtypes, round.repeat(PUMP_ROUNDS));
+            drop(automation_tx);
+        });
+    }
+
+    #[test]
+    fn the_pump_writes_what_automations_sent_before_the_session_ended() {
+        smol::block_on(async {
+            let (pump, out_rx, _) =
+                permission_event_pump(permission_manager(), PermissionMode::Default);
+            let (event_tx, event_rx) = flume::unbounded::<Envelope>();
+            let (automation_tx, automation_rx) = flume::unbounded();
+            for text in [NOTICE_TEXT, AUTOMATION_PROMPT] {
+                automation_tx.send(notice(text)).unwrap();
+            }
+            drop(event_tx);
+
+            pump.spawn(event_rx, automation_rx).await;
+
+            let texts: Vec<Value> = out_rx
+                .try_iter()
+                .map(|line| serde_json::from_str::<Value>(&line).unwrap()["text"].clone())
+                .collect();
+            assert_eq!(texts, [NOTICE_TEXT, AUTOMATION_PROMPT]);
+            drop(automation_tx);
+        });
+    }
+
+    /// The fixture's deps as an SDK session hands them to its runtime.
+    fn sdk_deps(fixture: &AutomationFixture) -> RuntimeDeps {
+        RuntimeDeps {
+            frontend: Frontend::Sdk,
+            ..fixture.deps(fixture.session_id(), &[])
+        }
+    }
+
+    /// A runtime serving the fixture's session as an SDK session serves it.
+    async fn sdk_runtime(fixture: &AutomationFixture) -> AutomationRuntime {
+        AutomationRuntime::spawn(sdk_deps(fixture))
+            .await
+            .expect(RUNTIME_STARTS)
+    }
+
+    /// The writer is a rendezvous: an answer written on the calling thread would wait there for
+    /// a reader that only comes once the call returned.
+    #[test]
+    fn an_automation_control_is_answered_off_the_stdin_thread() {
+        let fixture = AutomationFixture::default();
+        let runtime = smol::block_on(sdk_runtime(&fixture));
+        let (out_tx, out_rx) = flume::bounded(0);
+        let writer = SdkWriter {
+            session_id: SessionRef::generate(),
+            out_tx,
+        };
+
+        answer_automation_control(
+            &writer,
+            CONTROL_ID,
+            Ok(AutomationRequest::List),
+            Some(&runtime.handle()),
+        )
+        .unwrap();
+
+        let reply: Value = serde_json::from_str(&out_rx.recv().unwrap()).unwrap();
+        assert_eq!(reply["response"]["subtype"], "success");
+        assert_eq!(
+            reply["response"]["response"]["automation"]["kind"],
+            "automations"
+        );
+        smol::block_on(runtime.shutdown());
+    }
+
+    /// The SDK's part of the plan's end-to-end run, on a real runtime without the headless loop:
+    /// a control that names no script is refused by name, `automation_arm` arms as the SDK's,
+    /// the firing it starts reaches the wire once, as it ended, beside its `notify()`, and the
+    /// `interrupt` control pauses the session's automations.
+    #[test]
+    fn an_sdk_arming_fires_through_the_runtime_onto_the_wire() {
+        let fixture = AutomationFixture::default();
+        fixture.script(
+            &fixture.user_scripts(),
+            AUTOMATION_NAME,
+            ARMED_TRIGGER,
+            &format!(r#"message("{AUTOMATION_PROMPT}"); notify("{NOTICE_TEXT}");"#),
+        );
+        let runtime = smol::block_on(sdk_runtime(&fixture));
+        let automations = runtime.handle();
+        let session = control_session(
+            fixture.state_dir(),
+            fixture.session_id(),
+            Some(automations.clone()),
+        );
+        let (pump, out_rx, _) =
+            permission_event_pump(permission_manager(), PermissionMode::Default);
+        let writer = pump.writer.clone();
+        let (event_tx, event_rx) = flume::unbounded();
+        let pump = pump.spawn(event_rx, automations.events());
+
+        send_control(&writer, &session, AUTOMATION_ARM, serde_json::json!({}));
+        let refusal = next_message(&out_rx);
+        send_control(
+            &writer,
+            &session,
+            AUTOMATION_ARM,
+            serde_json::json!({"name": AUTOMATION_NAME}),
+        );
+        let completed = |message: &Value| {
+            message["subtype"] == AUTOMATION_FIRED_SUBTYPE
+                && message["status"] == FiringStatus::Completed.as_str()
+        };
+        let noticed = |message: &Value| message["subtype"] == AUTOMATION_NOTICE_SUBTYPE;
+        let (mut armed, mut wire) = (None, Vec::new());
+        smol::block_on(async {
+            while armed.is_none() || !wire.iter().any(completed) || !wire.iter().any(noticed) {
+                let message = next_line(&out_rx).await;
+                if message["type"] == "control_response" {
+                    armed = Some(message);
+                } else {
+                    wire.push(message);
+                }
+            }
+        });
+        send_control(&writer, &session, INTERRUPT, serde_json::json!({}));
+        smol::block_on(automations.request(AutomationRequest::List)).unwrap();
+        let pause = automations.state().session.controls.pause.clone();
+        drop(event_tx);
+        smol::block_on(pump);
+        smol::block_on(runtime.shutdown());
+        let (interrupted, rest): (Vec<Value>, Vec<Value>) = out_rx
+            .try_iter()
+            .map(|line| serde_json::from_str::<Value>(&line).unwrap())
+            .partition(|message| message["type"] == "control_response");
+        wire.extend(rest);
+
+        assert_eq!(refusal["response"]["subtype"], "error");
+        assert_eq!(
+            refusal["response"]["error"],
+            field_refusal(AUTOMATION_ARM, NAME_FIELD, STRING_KIND.name)
+        );
+        let armed = &armed.unwrap()["response"];
+        assert_eq!(armed["subtype"], "success");
+        assert_eq!(armed["response"]["automation"]["kind"], "automation");
+        assert_eq!(
+            armed["response"]["automation"]["detail"]["armed"],
+            ArmOrigin::Sdk.as_str()
+        );
+        let mut subtypes: Vec<&Value> = wire.iter().map(|message| &message["subtype"]).collect();
+        subtypes.sort_by_key(|subtype| subtype.as_str());
+        assert_eq!(
+            subtypes,
+            [AUTOMATION_FIRED_SUBTYPE, AUTOMATION_NOTICE_SUBTYPE]
+        );
+        let fired = wire.iter().find(|message| completed(message)).unwrap();
+        assert_eq!(fired["automation"], AUTOMATION_NAME);
+        assert_eq!(fired["trigger"], "armed");
+        let notice = wire.iter().find(|message| noticed(message)).unwrap();
+        assert_eq!(notice["automation"], AUTOMATION_NAME);
+        assert_eq!(notice[FIRE_ID_FIELD], fired[FIRE_ID_FIELD]);
+        assert_eq!(notice["text"], NOTICE_TEXT);
+        assert_eq!(interrupted.len(), 1);
+        assert_eq!(interrupted[0]["response"]["subtype"], "success");
+        assert_eq!(pause.map(|latch| latch.source), Some(PauseSource::Sdk));
+    }
+
+    /// A runtime serving the fixture's session, a stdin loop that answers controls from it, and
+    /// the wire their replies go out on.
+    struct WiredRuntime {
+        runtime: AutomationRuntime,
+        session: InteractiveHandle,
+        writer: SdkWriter,
+        out_rx: Receiver<String>,
+    }
+
+    impl WiredRuntime {
+        fn spawn(fixture: &AutomationFixture, deps: RuntimeDeps) -> Self {
+            let runtime = smol::block_on(AutomationRuntime::spawn(deps)).expect(RUNTIME_STARTS);
+            let session = control_session(
+                fixture.state_dir(),
+                fixture.session_id(),
+                Some(runtime.handle()),
+            );
+            let (writer, out_rx) = sdk_writer();
+            Self {
+                runtime,
+                session,
+                writer,
+                out_rx,
+            }
+        }
+
+        /// Sends `subtype` as a client does, and waits for its reply.
+        fn control(&self, subtype: &str, extra: Value) -> Value {
+            send_control(&self.writer, &self.session, subtype, extra);
+            smol::block_on(next_line(&self.out_rx))
+        }
+    }
+
+    /// The next firing the runtime reports in `status`.
+    async fn reported(events: &Receiver<AutomationEvent>, status: FiringStatus) -> FiringSummary {
+        loop {
+            if let AutomationEvent::Firing { firing, .. } =
+                events.recv_async().await.expect(EVENTS_OPEN)
+                && firing.status == status
+            {
+                return *firing;
+            }
+        }
+    }
+
+    /// The runtime's answer a control reply carries, or the error it refused the control with.
+    fn answered(reply: &Value) -> Result<AutomationResponse, AutomationError> {
+        let body = &reply["response"]["response"];
+        match body.get(AUTOMATION_REPLY) {
+            Some(answer) => Ok(serde_json::from_value(answer.clone()).unwrap()),
+            None => Err(serde_json::from_value(body[AUTOMATION_ERROR_REPLY].clone()).unwrap()),
+        }
+    }
+
+    /// A finished firing runs again under the placeholder id, and the action it took is
+    /// recorded rather than performed.
+    #[test]
+    fn automation_dry_run_answers_a_finished_firing_with_its_trace() {
+        let fixture = AutomationFixture::default();
+        fixture.script(
+            &fixture.user_scripts(),
+            AUTOMATION_NAME,
+            ARMED_TRIGGER,
+            &format!(r#"notify("{NOTICE_TEXT}");"#),
+        );
+        let wired = WiredRuntime::spawn(&fixture, sdk_deps(&fixture));
+        let events = wired.runtime.handle().events();
+
+        wired.control(AUTOMATION_ARM, serde_json::json!({"name": AUTOMATION_NAME}));
+        let fired = smol::block_on(reported(&events, FiringStatus::Completed));
+        let reply = wired.control(
+            AUTOMATION_DRY_RUN,
+            serde_json::json!({"fire_id": fired.fire_id}),
+        );
+        smol::block_on(wired.runtime.shutdown());
+
+        let Ok(AutomationResponse::DryRun(detail)) = answered(&reply) else {
+            panic!("{NOT_A_DRY_RUN}: {reply}");
+        };
+        let kinds: Vec<ActionKind> = detail.trace.actions.iter().map(|row| row.kind).collect();
+        assert_eq!(detail.fire_id, fired.fire_id);
+        assert_eq!(detail.trace.firing.fire_id, DRY_RUN_ID);
+        assert_eq!(detail.trace.firing.automation, AUTOMATION_NAME);
+        assert_eq!(kinds, [ActionKind::Notify]);
+        assert_eq!(detail.answers, [Answer::Recorded]);
+    }
+
+    /// An event that waits behind its automation's running firing has not finished, so it
+    /// cannot run again yet.
+    #[test]
+    fn automation_dry_run_refuses_a_queued_firing_as_not_replayable() {
+        let fixture = AutomationFixture::default();
+        fixture.script(
+            &fixture.user_scripts(),
+            AUTOMATION_NAME,
+            &format!(r#"{ARMED_TRIGGER}, workflows: ["{WORKFLOW_NAME}"]"#),
+            &format!(r#"start_workflow("{WORKFLOW_NAME}", #{{}});"#),
+        );
+        let (workflows, starts, _settles) = FakeWorkflows::new();
+        let wired = WiredRuntime::spawn(
+            &fixture,
+            RuntimeDeps {
+                workflows: Some(workflows as Arc<dyn Workflows>),
+                ..sdk_deps(&fixture)
+            },
+        );
+        let arm = serde_json::json!({"name": AUTOMATION_NAME});
+
+        wired.control(AUTOMATION_ARM, arm.clone());
+        let held = starts.recv().expect(START_HELD);
+        wired.control(AUTOMATION_ARM, arm);
+        let queued = wired
+            .runtime
+            .handle()
+            .state()
+            .recent
+            .iter()
+            .find(|firing| firing.status == FiringStatus::Queued)
+            .expect(QUEUED_BEHIND)
+            .fire_id
+            .clone();
+        let reply = wired.control(AUTOMATION_DRY_RUN, serde_json::json!({"fire_id": queued}));
+        drop(starts);
+        drop(held);
+        smol::block_on(wired.runtime.shutdown());
+
+        let refusal = AutomationError::NotReplayable {
+            fire_id: queued,
+            reason: REPLAY_NOT_FINISHED.into(),
+        };
+        assert_eq!(reply["response"]["error"], refusal.to_string());
+        assert_eq!(answered(&reply), Err(refusal));
+    }
+
+    /// `automation_pause` sets the latch as the SDK's. `automation_resume` lifts it without a
+    /// prompt, so `armed` fires with reason `unpaused` while the unattended turns and the
+    /// delivery backoff that human input resets stay as they were. The replies are checked
+    /// before the wait for that firing, so a control that went wrong fails instead of waiting.
+    #[test]
+    fn automation_pause_and_resume_set_and_lift_the_latch_without_human_input() {
+        let fixture = AutomationFixture::default();
+        fixture.script(
+            &fixture.user_scripts(),
+            AUTOMATION_NAME,
+            ARMED_TRIGGER,
+            &format!(r#"notify("{NOTICE_TEXT}");"#),
+        );
+        let counted = StoredAutomationControls {
+            unattended: StoredUnattendedTurns {
+                count: UNATTENDED_TURNS,
+            },
+            delivery_backoff: StoredDeliveryBackoff {
+                errors: BACKOFF_ERRORS,
+                until: None,
+            },
+            ..StoredAutomationControls::default()
+        };
+        let wired = WiredRuntime::spawn(
+            &fixture,
+            RuntimeDeps {
+                controls: Some(counted),
+                ..sdk_deps(&fixture)
+            },
+        );
+        let automations = wired.runtime.handle();
+        let events = automations.events();
+
+        wired.control(AUTOMATION_ARM, serde_json::json!({"name": AUTOMATION_NAME}));
+        smol::block_on(reported(&events, FiringStatus::Completed));
+        let paused = answered(&wired.control(AUTOMATION_PAUSE, serde_json::json!({})));
+        let resumed = answered(&wired.control(AUTOMATION_RESUME, serde_json::json!({})));
+        let (Ok(AutomationResponse::Controls(paused)), Ok(AutomationResponse::Controls(resumed))) =
+            (paused, resumed)
+        else {
+            panic!("{NOT_CONTROLS}");
+        };
+        let latch = paused.controls.pause.expect(LATCHED);
+        assert_eq!(
+            (latch.source, latch.reason.as_str()),
+            (PauseSource::Sdk, PAUSED_BY_SDK)
+        );
+        assert_eq!(resumed.controls.pause, None);
+        assert_eq!(
+            (
+                resumed.controls.unattended.count,
+                resumed.controls.delivery_backoff.errors
+            ),
+            (UNATTENDED_TURNS, BACKOFF_ERRORS)
+        );
+        let unpaused = smol::block_on(reported(&events, FiringStatus::Completed));
+        let trace = smol::block_on(automations.request(AutomationRequest::Firing {
+            fire_id: unpaused.fire_id,
+        }));
+        smol::block_on(wired.runtime.shutdown());
+
+        let Ok(AutomationResponse::Firing(trace)) = trace else {
+            panic!("{NOT_A_TRACE}: {trace:?}");
+        };
+        let event: Event = serde_json::from_value(trace.event).unwrap();
+        assert_eq!(
+            event.detail,
+            EventDetail::Armed {
+                reason: ArmedReason::Unpaused
+            }
+        );
     }
 }

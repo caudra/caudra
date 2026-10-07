@@ -4,12 +4,14 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::iter;
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use caudra_automation::meta::is_valid_name;
 use caudra_config::{Feature, FeatureFlags, InboundPolicy, MessagingConfig};
 use caudra_providers::{
     HistoryItem, HistoryItemKind, Message, PeerAssignment, PeerAudience, PeerMessageOrigin,
@@ -28,10 +30,15 @@ use caudra_storage::{derived_phrase, random_task_id};
 use event_listener::Event;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tracing::warn;
 
 use crate::AgentMode;
 pub use history::history_retention;
 use history::{HistoryWriter, MessageHistory};
+pub use observe::{
+    MessageKey, MessageObserver, ObservedMessage, ObservedSender, SendFailure, SendFailureKind,
+    SendOrigin, StoredDelivery, WorkCursor, WorkPause, WorkReported,
+};
 use topics::{parse_pattern, parse_topic, pattern_matches, validate_patterns};
 pub use work::{
     AssignedWork, COMPLETION_REQUIRED, INVALID_GROUP, MAX_MEMBERSHIPS, MAX_OUTCOME_BYTES,
@@ -43,6 +50,7 @@ use work::{Assignments, check_memberships};
 // Nothing opens a history where peer messaging is unavailable.
 #[cfg_attr(not(unix), allow(dead_code))]
 mod history;
+mod observe;
 pub mod script;
 pub mod topics;
 #[cfg(unix)]
@@ -96,6 +104,7 @@ const REUSED_REQUEST: &str = "Peer request identity was reused with different co
 const RETRY_INVALIDATED: &str = "Peer retry invalidated by a session policy or workspace change";
 const RETRY_EXPIRED: &str = "Peer retry identity expired; do not retry as a new message";
 const FULL: &str = "Live inbox capacity reached; no older message was removed";
+const UNNAMEABLE: &str = "The receiver could not name the message in its conversation";
 const RETRY_FULL: &str = "Live retry identity capacity reached; try again once older messages pass the five-minute retry window";
 const POLICY_FLOOR: &str = "Cannot weaken the project's configured inbound policy";
 const INVALID_TARGET: &str = "Invalid peer target; use an address returned by discovery";
@@ -120,8 +129,14 @@ const REJECTED: &str = "Rejected by the local receiver";
 const HISTORY_HELD: &str =
     "Reading stored peer messages needs the inbound policy accept or auto in this session";
 const NOT_RECORDED: &str = "Not sent, because the message history could not record it";
-const STATUS_QUEUED: &str = "queued";
-const STATUS_HELD: &str = "held";
+const OLDER_RECIPIENT: &str = "The recipient hung up without answering, as an older Caudra refuses a message from an automation";
+pub const STATUS_QUEUED: &str = "queued";
+pub const STATUS_HELD: &str = "held";
+pub const STATUS_REFUSED: &str = "refused";
+pub const STATUS_RATE_LIMITED: &str = "rate_limited";
+pub const STATUS_UNAVAILABLE: &str = "unavailable";
+pub const STATUS_UNKNOWN: &str = "unknown";
+pub const STATUS_CONSUMED: &str = "consumed";
 const STATUS_REJECTED: &str = "rejected";
 const STATUS_DELIVERED: &str = "delivered";
 const STATUS_DROPPED: &str = "dropped";
@@ -464,6 +479,7 @@ struct SessionState {
     arrivals: VecDeque<Arrival>,
     reviews: HashMap<String, u64>,
     history: MessageHistory,
+    observer: Option<Arc<dyn MessageObserver>>,
 }
 
 struct Arrival {
@@ -490,6 +506,8 @@ struct InboxItem {
     /// Caught up from the history rather than sent to this session. It
     /// rides along with the next turn but never starts one.
     passive: bool,
+    /// Handed back by an automation, so no observer sees it again.
+    released: bool,
 }
 
 impl InboxItem {
@@ -506,9 +524,39 @@ impl InboxItem {
             ItemState::Held(reason) => {
                 SendReceipt::new(STATUS_HELD, &self.delivery.message_id, Some(reason))
             }
-            ItemState::Pending | ItemState::Claimed(_) | ItemState::Staged => {
-                SendReceipt::new(STATUS_QUEUED, &self.delivery.message_id, None)
-            }
+            ItemState::Pending
+            | ItemState::Consumed
+            | ItemState::Claimed(_)
+            | ItemState::Staged => SendReceipt::new(STATUS_QUEUED, &self.delivery.message_id, None),
+        }
+    }
+
+    fn observed(&self) -> ObservedMessage {
+        let sender = &self.delivery.sender;
+        let handle = self.origin.reply_target.clone();
+        ObservedMessage {
+            key: MessageKey::of(&self.delivery),
+            audience: self.delivery.audience.clone(),
+            sender: match (sender.external, &sender.automation) {
+                (true, _) => ObservedSender::Script {
+                    label: sender.name.clone(),
+                },
+                (false, Some(automation)) => ObservedSender::Automation {
+                    handle,
+                    automation: automation.clone(),
+                },
+                (false, None) => ObservedSender::Session { handle },
+            },
+            title: sender.name.clone(),
+            cwd: sender.canonical_cwd.clone(),
+            text: self.delivery.text.clone(),
+            reply_to: self.origin.reply_to.clone(),
+            held: matches!(self.state, ItemState::Held(_)),
+            catch_up: self.passive,
+            delivery: StoredDelivery {
+                delivery: self.delivery.clone(),
+                catch_up: self.passive,
+            },
         }
     }
 
@@ -600,6 +648,7 @@ impl Naming {
             reply_target,
             reply_to,
             external: delivery.sender.external,
+            automation: delivery.sender.automation.clone(),
             assignment,
         }
     }
@@ -616,6 +665,9 @@ impl Name {
 enum ItemState {
     Pending,
     Held(String),
+    /// Taken by an automation instead of the model, until the automation
+    /// settles or releases it.
+    Consumed,
     Claimed(u64),
     Staged,
 }
@@ -638,13 +690,16 @@ struct Issued {
 }
 
 impl Issued {
-    fn check_retry(&self, fingerprint: &[u8; 32], epoch: u64) -> Result<(), String> {
+    fn check_retry(&self, fingerprint: &[u8; 32], epoch: u64) -> Result<(), SendFailure> {
         if &self.fingerprint != fingerprint {
-            Err(REUSED_REQUEST.into())
+            Err(SendFailure::invalid(REUSED_REQUEST))
         } else if self.epoch != epoch {
-            Err(RETRY_INVALIDATED.into())
+            Err(SendFailure::new(
+                SendFailureKind::Refused,
+                RETRY_INVALIDATED,
+            ))
         } else if retry_expired(self.issued_ms, wall_ms()) {
-            Err(RETRY_EXPIRED.into())
+            Err(SendFailure::invalid(RETRY_EXPIRED))
         } else {
             Ok(())
         }
@@ -695,7 +750,7 @@ impl Publication {
             .recipients
             .iter()
             .enumerate()
-            .filter(|(_, recipient)| recipient.status == "unknown")
+            .filter(|(_, recipient)| recipient.status == STATUS_UNKNOWN)
             .map(|(index, _)| (index, self.delivery(index, text)))
             .collect()
     }
@@ -836,6 +891,10 @@ struct Sender {
     /// reply can follow; older peers refuse the unknown field.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     external: bool,
+    /// The automation that sent the message on its session's behalf. Older
+    /// peers refuse the unknown field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    automation: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -870,6 +929,7 @@ impl Sender {
             mode: self.mode.as_str().into(),
             permission: permission_name(&self.permission_mode).into(),
             external: self.external,
+            automation: self.automation.clone(),
         }
     }
 
@@ -882,6 +942,7 @@ impl Sender {
             mode: WireMode::parse(&sender.mode)?,
             permission_mode: parse_permission(&sender.permission)?,
             external: sender.external,
+            automation: sender.automation.clone(),
         })
     }
 }
@@ -903,7 +964,7 @@ impl Delivery {
     }
 
     fn dedup_key(&self) -> String {
-        format!("{}:{}", self.sender.route.target(), self.message_id)
+        MessageKey::of(self).to_string()
     }
 
     fn same_message(&self, other: &Self) -> bool {
@@ -958,7 +1019,9 @@ impl Delivery {
             && (!self.sender.external
                 || (self.reply_to.is_none()
                     && self.reply_sender.is_none()
-                    && self.sender.handle.is_none()))
+                    && self.sender.handle.is_none()
+                    && self.sender.automation.is_none()))
+            && self.sender.automation.as_deref().is_none_or(is_valid_name)
     }
 }
 
@@ -1043,16 +1106,25 @@ fn handle_in_use(handle: &str) -> String {
     format!("Messaging name {HANDLE_PREFIX}{handle} {HANDLE_IN_USE}")
 }
 
+/// The messaging name a session that never stored one answers to while it
+/// is free: the first it tries, the same on every run.
+pub fn default_handle(session: CaudraId) -> String {
+    generated_handle(session, 0)
+}
+
 /// The names a session without a free stored name tries, in order. The
-/// first is the session's own on every run, so it needs no saving; the rest
-/// only matter while the same session is open twice.
+/// first is its [`default_handle`], so it needs no saving; the rest only
+/// matter while the same session is open twice.
 fn generated_handles(session: CaudraId) -> impl Iterator<Item = String> {
-    (0..MAX_NAME_ATTEMPTS as u64).map(move |attempt| {
-        derived_phrase(
-            HANDLE_DOMAIN,
-            &[session.as_bytes().as_slice(), &attempt.to_be_bytes()].concat(),
-        )
-    })
+    iter::once(default_handle(session))
+        .chain((1..MAX_NAME_ATTEMPTS as u64).map(move |attempt| generated_handle(session, attempt)))
+}
+
+fn generated_handle(session: CaudraId, attempt: u64) -> String {
+    derived_phrase(
+        HANDLE_DOMAIN,
+        &[session.as_bytes().as_slice(), &attempt.to_be_bytes()].concat(),
+    )
 }
 
 fn message_name() -> Result<String, String> {
@@ -1517,6 +1589,7 @@ impl PeerHost {
                 arrivals: VecDeque::new(),
                 reviews: HashMap::new(),
                 history: self.0.history.clone(),
+                observer: None,
             }),
         });
         sessions.insert(id, Arc::downgrade(&session));
@@ -1751,15 +1824,10 @@ impl PeerSession {
         reply_to: Option<&str>,
         request_id: &str,
     ) -> Result<SendReceipt, String> {
-        let route = match target.strip_prefix(HANDLE_PREFIX) {
-            Some(handle) => self.resolve_handle(handle).await?,
-            None if valid_name(target, PEER_WORDS) => {
-                let mut state = lock(&self.0.state);
-                state.ensure_open()?;
-                state.peer_names.get(target).ok_or(UNKNOWN_TARGET)?.clone()
-            }
-            None => return Err(UNKNOWN_TARGET.into()),
-        };
+        let route = self
+            .route_to(target)
+            .await
+            .map_err(|failure| failure.reason)?;
         let reply_to = {
             let mut state = lock(&self.0.state);
             state.ensure_open()?;
@@ -1775,6 +1843,7 @@ impl PeerSession {
                 .transpose()?
         };
         self.send_with_reply(
+            &SendOrigin::Session,
             &route,
             text,
             reply_to
@@ -1784,13 +1853,74 @@ impl PeerSession {
             request_id,
         )
         .await
+        .map_err(|failure| failure.reason)
+    }
+
+    /// Sends `text` to `target`, an `@name` or a word target, as `origin`
+    /// sends it. A refused, rate-limited, or unavailable delivery fails;
+    /// `unknown` is a receipt, since the recipient may have taken it.
+    pub async fn send_from(
+        &self,
+        origin: &SendOrigin,
+        target: &str,
+        text: &str,
+        reply_to: Option<&MessageKey>,
+        request_id: &str,
+    ) -> Result<SendReceipt, SendFailure> {
+        origin.check()?;
+        let route = self.route_to(target).await?;
+        if let Some(key) = reply_to {
+            Route::parse(&key.sender_route).map_err(SendFailure::invalid)?;
+        }
+        let receipt = self
+            .send_with_reply(
+                origin,
+                &route,
+                text,
+                reply_to.map(|key| key.message_id.as_str()),
+                reply_to.map(|key| key.sender_route.as_str()),
+                request_id,
+            )
+            .await?;
+        let kind = match receipt.status.as_str() {
+            STATUS_REFUSED => SendFailureKind::Refused,
+            STATUS_RATE_LIMITED => SendFailureKind::RateLimited,
+            STATUS_UNAVAILABLE => SendFailureKind::Unavailable,
+            _ => return Ok(receipt),
+        };
+        Err(SendFailure::new(
+            kind,
+            receipt.reason.unwrap_or(receipt.status),
+        ))
+    }
+
+    /// The live registration `target` names: an `@name`, or a word target
+    /// from this session's conversations.
+    async fn route_to(&self, target: &str) -> Result<String, SendFailure> {
+        match target.strip_prefix(HANDLE_PREFIX) {
+            Some(handle) => self.resolve_handle(handle).await,
+            None if valid_name(target, PEER_WORDS) => {
+                let mut state = lock(&self.0.state);
+                state.ensure_open().map_err(SendFailure::unavailable)?;
+                state.peer_names.get(target).cloned().ok_or_else(|| {
+                    SendFailure::new(SendFailureKind::UnknownRecipient, UNKNOWN_TARGET)
+                })
+            }
+            None => Err(SendFailure::new(
+                SendFailureKind::UnknownRecipient,
+                UNKNOWN_TARGET,
+            )),
+        }
     }
 
     /// Names follow their session across restarts, so each send rediscovers
     /// the live registration that currently holds one.
-    async fn resolve_handle(&self, handle: &str) -> Result<String, String> {
-        let handle = parse_handle(handle)?;
-        Ok(holder(self.list().await?, &handle)?.target)
+    async fn resolve_handle(&self, handle: &str) -> Result<String, SendFailure> {
+        let handle = parse_handle(handle).map_err(SendFailure::invalid)?;
+        let peers = self.list().await.map_err(SendFailure::unavailable)?;
+        holder(peers, &handle)
+            .map(|peer| peer.target)
+            .map_err(|reason| SendFailure::new(SendFailureKind::UnknownRecipient, reason))
     }
 
     pub async fn send(
@@ -1800,34 +1930,47 @@ impl PeerSession {
         reply_to: Option<&str>,
         request_id: &str,
     ) -> Result<SendReceipt, String> {
-        self.send_with_reply(target, text, reply_to, None, request_id)
-            .await
+        self.send_with_reply(
+            &SendOrigin::Session,
+            target,
+            text,
+            reply_to,
+            None,
+            request_id,
+        )
+        .await
+        .map_err(|failure| failure.reason)
     }
 
     async fn send_with_reply(
         &self,
+        origin: &SendOrigin,
         target: &str,
         text: &str,
         reply_to: Option<&str>,
         reply_sender: Option<&str>,
         request_id: &str,
-    ) -> Result<SendReceipt, String> {
-        let recipient = Route::parse(target)?.session.to_string();
-        check_text(text)?;
+    ) -> Result<SendReceipt, SendFailure> {
+        let recipient = Route::parse(target)
+            .map_err(SendFailure::invalid)?
+            .session
+            .to_string();
+        check_text(text).map_err(SendFailure::invalid)?;
         if request_id.is_empty()
             || request_id.len() > MAX_CORRELATION_BYTES
             || reply_to.is_some_and(|value| value.len() > MAX_CORRELATION_BYTES)
         {
-            return Err(INVALID_CORRELATION.into());
+            return Err(SendFailure::invalid(INVALID_CORRELATION));
         }
-        let fingerprint = digest(&(target, text, reply_to, reply_sender))?;
+        let fingerprint = digest(&(target, text, reply_to, reply_sender, origin.automation()))
+            .map_err(SendFailure::invalid)?;
         let (delivery, epoch, entry) = {
             let mut state = lock(&self.0.state);
-            state.ensure_can_send()?;
+            state.ensure_can_send(origin)?;
             let issued = if let Some(previous) = state.outgoing.get(request_id) {
                 previous.issued.check_retry(&fingerprint, state.epoch)?;
                 if let Some(receipt) = &previous.receipt
-                    && receipt.status != "unknown"
+                    && receipt.status != STATUS_UNKNOWN
                 {
                     return Ok(receipt.clone());
                 }
@@ -1837,9 +1980,12 @@ impl PeerSession {
                 if !has_retry_room(&mut state.outgoing, issued_ms, |outgoing| {
                     outgoing.issued.issued_ms
                 }) {
-                    return Err(RETRY_FULL.into());
+                    return Err(SendFailure::new(SendFailureKind::RateLimited, RETRY_FULL));
                 }
-                let message_id = state.message_names.fresh(None, message_name)?;
+                let message_id = state
+                    .message_names
+                    .fresh(None, message_name)
+                    .map_err(SendFailure::unavailable)?;
                 state.bind_message(
                     message_id.clone(),
                     MessageIdentity {
@@ -1853,7 +1999,7 @@ impl PeerSession {
                     message_id,
                     issued_ms,
                     epoch: state.epoch,
-                    sender: state.sender(&self.0.route),
+                    sender: state.sender(&self.0.route, origin),
                 };
                 state.outgoing.insert(
                     request_id.to_owned(),
@@ -1886,7 +2032,7 @@ impl PeerSession {
         history
             .record(entry, recipients)
             .await
-            .map_err(|error| format!("{NOT_RECORDED}: {error}"))?;
+            .map_err(|error| SendFailure::unavailable(format!("{NOT_RECORDED}: {error}")))?;
         let (sender, message_id) = (delivery.sender.route.target(), delivery.message_id.clone());
         let receipt = self.deliver(delivery, epoch).await;
         history.receipt(
@@ -1911,30 +2057,50 @@ impl PeerSession {
         text: &str,
         request_id: &str,
     ) -> Result<PublishReceipt, String> {
-        check_publication(&audience, text)?;
+        self.publish_from(&SendOrigin::Session, audience, text, request_id)
+            .await
+            .map_err(|failure| failure.reason)
+    }
+
+    /// [`Self::publish`] as `origin` sends it. Each recipient's outcome stays
+    /// in the receipt; only the publication as a whole fails.
+    pub async fn publish_from(
+        &self,
+        origin: &SendOrigin,
+        audience: PeerAudience,
+        text: &str,
+        request_id: &str,
+    ) -> Result<PublishReceipt, SendFailure> {
+        origin.check()?;
+        check_publication(&audience, text).map_err(SendFailure::invalid)?;
         if request_id.is_empty() || request_id.len() > MAX_CORRELATION_BYTES {
-            return Err(INVALID_CORRELATION.into());
+            return Err(SendFailure::invalid(INVALID_CORRELATION));
         }
-        let fingerprint = digest(&(&audience, text))?;
+        let fingerprint =
+            digest(&(&audience, text, origin.automation())).map_err(SendFailure::invalid)?;
         let retry = {
             let mut state = lock(&self.0.state);
-            state.ensure_can_send()?;
+            state.ensure_can_send(origin)?;
             let retry = state.publications.contains_key(request_id);
             if !retry && !state.has_publish_room(Instant::now()) {
-                return Err(PUBLISH_RATE_EXCEEDED.into());
+                return Err(SendFailure::new(
+                    SendFailureKind::RateLimited,
+                    PUBLISH_RATE_EXCEEDED,
+                ));
             }
             retry
         };
         let history = &self.0.host.history;
+        let unrecorded = |error| SendFailure::unavailable(format!("{NOT_RECORDED}: {error}"));
         let destinations = if retry {
             None
         } else {
             Some((
-                self.list().await?,
+                self.list().await.map_err(SendFailure::unavailable)?,
                 history
                     .group_destinations(&audience)
                     .await
-                    .map_err(|error| format!("{NOT_RECORDED}: {error}"))?,
+                    .map_err(unrecorded)?,
             ))
         };
         let Fanout {
@@ -1944,11 +2110,19 @@ impl PeerSession {
             deliveries,
             entry,
             recipients,
-        } = self.prepare_publication(audience, text, request_id, fingerprint, destinations)?;
+        } = self.prepare_publication(
+            origin,
+            audience,
+            text,
+            request_id,
+            fingerprint,
+            destinations,
+        )?;
         receipt.queued = history
             .record_publication(entry, recipients, max_work)
             .await
-            .map_err(|error| format!("{NOT_RECORDED}: {error}"))?;
+            .map_err(unrecorded)?
+            .map_err(SendFailure::refused_work)?;
         let sender = self.0.route.target();
         for batch in deliveries.chunks(FANOUT_CONCURRENCY) {
             let sends: Vec<_> = batch
@@ -1989,42 +2163,51 @@ impl PeerSession {
     /// only a first attempt discovers.
     fn prepare_publication(
         &self,
+        origin: &SendOrigin,
         audience: PeerAudience,
         text: &str,
         request_id: &str,
         fingerprint: [u8; 32],
         destinations: Option<(Vec<PeerInfo>, usize)>,
-    ) -> Result<Fanout, String> {
+    ) -> Result<Fanout, SendFailure> {
         let mut state = lock(&self.0.state);
-        state.ensure_can_send()?;
+        state.ensure_can_send(origin)?;
         let epoch = state.epoch;
         if let Some(previous) = state.publications.get(request_id) {
             previous.issued.check_retry(&fingerprint, epoch)?;
             return Ok(previous.fanout(epoch, text));
         }
-        let (mut peers, groups) = destinations.ok_or(RETRY_EXPIRED)?;
-        let room = recipient_room(groups, state.max_fanout)?;
+        let (mut peers, groups) =
+            destinations.ok_or_else(|| SendFailure::invalid(RETRY_EXPIRED))?;
+        let room = recipient_room(groups, state.max_fanout)
+            .map_err(|reason| SendFailure::new(SendFailureKind::GroupFull, reason))?;
         let now = Instant::now();
         if !state.has_publish_room(now) {
-            return Err(PUBLISH_RATE_EXCEEDED.into());
+            return Err(SendFailure::new(
+                SendFailureKind::RateLimited,
+                PUBLISH_RATE_EXCEEDED,
+            ));
         }
         let issued_ms = wall_ms();
         if !has_retry_room(&mut state.publications, issued_ms, |publication| {
             publication.issued.issued_ms
         }) {
-            return Err(RETRY_FULL.into());
+            return Err(SendFailure::new(SendFailureKind::RateLimited, RETRY_FULL));
         }
         forget_shared_handles(&mut peers);
         let (selected, skipped) = audience_members(peers, &audience, room);
-        let message_id = state.message_names.fresh(None, message_name)?;
+        let message_id = state
+            .message_names
+            .fresh(None, message_name)
+            .map_err(SendFailure::unavailable)?;
         let mut routes = Vec::with_capacity(selected.len());
         let mut recipients = Vec::with_capacity(selected.len());
         for peer in selected {
             recipients.push(RecipientReceipt {
-                target: state.address(&peer)?,
+                target: state.address(&peer).map_err(SendFailure::unavailable)?,
                 title: peer.name,
                 handle: peer.handle,
-                status: "unknown".into(),
+                status: STATUS_UNKNOWN.into(),
                 reason: None,
             });
             routes.push(peer.target);
@@ -2043,7 +2226,7 @@ impl PeerSession {
                 message_id: message_id.clone(),
                 issued_ms,
                 epoch,
-                sender: state.sender(&self.0.route),
+                sender: state.sender(&self.0.route, origin),
             },
             max_work: state.max_fanout - routes.len(),
             routes,
@@ -2248,7 +2431,7 @@ impl PeerSession {
         #[cfg(unix)]
         return unix::send(self, delivery, epoch).await;
         #[cfg(not(unix))]
-        SendReceipt::new("unavailable", &delivery.message_id, Some(UNAVAILABLE))
+        SendReceipt::new(STATUS_UNAVAILABLE, &delivery.message_id, Some(UNAVAILABLE))
     }
 
     pub fn held_count(&self) -> usize {
@@ -2379,11 +2562,10 @@ impl PeerSession {
     ) -> Result<PeerDecisionResult, String> {
         let result = match decision {
             PeerDecision::Approve => {
-                let item = &mut state.inbox[index];
-                item.approved_epoch = Some(state.epoch);
-                // Local approval may start a turn even for a caught-up message.
-                item.passive = false;
+                state.inbox[index].approved_epoch = Some(state.epoch);
                 state.reevaluate();
+                // Local approval may start a turn even for a caught-up message.
+                state.inbox[index].passive = false;
                 PeerDecisionResult::Queued
             }
             PeerDecision::Reject => {
@@ -2392,7 +2574,7 @@ impl PeerSession {
                 self.0.host.bytes.fetch_sub(item.bytes, Ordering::AcqRel);
                 if let Some(entry) = state.dedup.get_mut(&item.delivery.dedup_key()) {
                     entry.receipt =
-                        SendReceipt::new("refused", &item.delivery.message_id, Some(REJECTED));
+                        SendReceipt::new(STATUS_REFUSED, &item.delivery.message_id, Some(REJECTED));
                 }
                 state.reviews.remove(&item.origin.message_id);
                 state.report_rejected(&item);
@@ -2488,6 +2670,136 @@ impl PeerSession {
         });
         state.bytes -= released;
         self.0.host.bytes.fetch_sub(released, Ordering::AcqRel);
+    }
+
+    /// Installs `observer`, which first sees every message already waiting
+    /// for review or a turn. Replacing or removing an observer queues the
+    /// messages it consumed and has not settled again.
+    pub fn set_observer(&self, observer: Option<Arc<dyn MessageObserver>>) {
+        let mut state = lock(&self.0.state);
+        if !state.open {
+            return;
+        }
+        for item in &mut state.inbox {
+            if matches!(item.state, ItemState::Consumed) {
+                item.state = ItemState::Pending;
+            }
+        }
+        state.observer = observer;
+        for index in 0..state.inbox.len() {
+            if matches!(
+                state.inbox[index].state,
+                ItemState::Pending | ItemState::Held(_)
+            ) {
+                state.offer(index);
+            }
+        }
+        self.0.host.changed.notify(usize::MAX);
+    }
+
+    /// Takes the message `key` names out of the inbox once `automation`,
+    /// which consumed it, keeps it. The history records it as consumed, and
+    /// catch-up never offers it again. False when the message is no longer
+    /// consumed, because a replaced observer queued it again or the session
+    /// closed.
+    pub fn settle_consumed(&self, key: &MessageKey, automation: &str) -> bool {
+        let mut state = lock(&self.0.state);
+        let consumed = state
+            .inbox
+            .iter()
+            .position(|item| {
+                matches!(item.state, ItemState::Consumed) && MessageKey::of(&item.delivery) == *key
+            })
+            .and_then(|index| state.inbox.remove(index));
+        let Some(item) = consumed else {
+            return false;
+        };
+        state.bytes -= item.bytes;
+        self.0.host.bytes.fetch_sub(item.bytes, Ordering::AcqRel);
+        state.report(&item.delivery, STATUS_CONSUMED, Some(automation));
+        state.report_seen(&item);
+        true
+    }
+
+    /// Undoes the take of the message `key` names while it is still
+    /// consumed: it waits for a turn again, where no observer sees it again.
+    /// False, changing nothing, when no consumed message has that key, as
+    /// when a replaced observer queued it again or the session closed.
+    pub fn return_consumed(&self, key: &MessageKey) -> bool {
+        let mut state = lock(&self.0.state);
+        let Some(item) = state.inbox.iter_mut().find(|item| {
+            matches!(item.state, ItemState::Consumed) && MessageKey::of(&item.delivery) == *key
+        }) else {
+            return false;
+        };
+        item.state = ItemState::Pending;
+        item.released = true;
+        self.0.host.changed.notify(usize::MAX);
+        true
+    }
+
+    /// Returns a consumed message to normal delivery, where no observer sees
+    /// it again. One still in the inbox waits for a turn again; one that left
+    /// it is admitted again under the current inbound policy, or dropped
+    /// when the inbox has no room for it or cannot name it. Fails only when
+    /// the session is closed.
+    pub async fn release_consumed(&self, stored: &StoredDelivery) -> Result<(), String> {
+        let delivery = Delivery {
+            target: self.0.route.target(),
+            ..stored.delivery.clone()
+        };
+        let encoded = serde_json::to_vec(&delivery)
+            .map_err(|error| error.to_string())?
+            .len();
+        let mut state = lock(&self.0.state);
+        state.ensure_open()?;
+        if let Some(item) = state
+            .inbox
+            .iter_mut()
+            .find(|item| item.delivery.same_message(&delivery))
+        {
+            item.released = true;
+            if matches!(item.state, ItemState::Consumed) {
+                item.state = ItemState::Pending;
+                self.0.host.changed.notify(usize::MAX);
+            }
+            return Ok(());
+        }
+        let reply_to = delivery.reply_to.as_deref().and_then(|message_id| {
+            state
+                .reply_name(
+                    &delivery.sender.route.target(),
+                    message_id,
+                    delivery.reply_sender.as_deref(),
+                )
+                .ok()
+        });
+        let admitted = if state.inbox.len() < MAX_PENDING.min(MAX_HELD) {
+            self.0.enqueue(
+                &mut state,
+                delivery.clone(),
+                encoded,
+                reply_to,
+                stored.catch_up,
+                true,
+            )
+        } else {
+            Ok(None)
+        };
+        let (reason, error) = match admitted {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => (FULL, None),
+            Err(error) => (UNNAMEABLE, Some(error)),
+        };
+        warn!(
+            session = %self.session_id(),
+            key = %delivery.dedup_key(),
+            reason,
+            error,
+            "dropped a released peer message"
+        );
+        state.report(&delivery, STATUS_DROPPED, Some(reason));
+        Ok(())
     }
 }
 
@@ -2602,15 +2914,20 @@ impl SessionState {
         self.published.len() < self.publish_rate
     }
 
-    fn ensure_can_send(&self) -> Result<(), String> {
-        self.ensure_open()?;
-        if self.wakes_suppressed || self.descriptor.blocked || self.descriptor.mode.is_read_only() {
-            return Err(SEND_BLOCKED.into());
+    /// An automation sends while its session is blocked or its wakes are
+    /// suppressed, since errors never pause automations.
+    fn ensure_can_send(&self, origin: &SendOrigin) -> Result<(), SendFailure> {
+        self.ensure_open().map_err(SendFailure::unavailable)?;
+        if self.descriptor.mode.is_read_only() {
+            return Err(SendFailure::new(SendFailureKind::ReadOnly, SEND_BLOCKED));
+        }
+        if origin.automation().is_none() && (self.wakes_suppressed || self.descriptor.blocked) {
+            return Err(SendFailure::new(SendFailureKind::Refused, SEND_BLOCKED));
         }
         Ok(())
     }
 
-    fn sender(&self, route: &Route) -> Sender {
+    fn sender(&self, route: &Route, origin: &SendOrigin) -> Sender {
         Sender {
             route: route.clone(),
             name: self.descriptor.name.clone(),
@@ -2619,6 +2936,7 @@ impl SessionState {
             mode: WireMode::from(&self.descriptor.mode),
             permission_mode: self.descriptor.permission_mode.clone(),
             external: false,
+            automation: origin.automation().map(str::to_owned),
         }
     }
 
@@ -2690,7 +3008,10 @@ impl SessionState {
         // caps the combined queue at MAX_HELD so later policy tightening always fits.
         for index in 0..self.inbox.len() {
             let item = &self.inbox[index];
-            if matches!(item.state, ItemState::Claimed(_) | ItemState::Staged) {
+            if matches!(
+                item.state,
+                ItemState::Consumed | ItemState::Claimed(_) | ItemState::Staged
+            ) {
                 continue;
             }
             let reason = self.hold_reason(&item.delivery, item.approved_epoch);
@@ -2700,28 +3021,46 @@ impl SessionState {
                 _ => false,
             };
             if !unchanged {
+                let was_held = matches!(item.state, ItemState::Held(_));
                 self.inbox[index].state =
                     reason.map_or(ItemState::Pending, |reason| ItemState::Held(reason.into()));
                 self.report_state(&self.inbox[index]);
+                if was_held != reason.is_some() {
+                    self.offer(index);
+                }
             }
+        }
+    }
+
+    /// Shows the observer the message at `index` as it becomes held or
+    /// queued. A queued message the observer takes becomes consumed.
+    fn offer(&mut self, index: usize) {
+        let item = &self.inbox[index];
+        let Some(observer) = self.observer.as_ref().filter(|_| !item.released) else {
+            return;
+        };
+        let message = item.observed();
+        if observer.observe(&message).is_some() && !message.held {
+            self.inbox[index].state = ItemState::Consumed;
         }
     }
 
     /// Reports whether a received message waits for a turn or for review.
     fn report_state(&self, item: &InboxItem) {
         match &item.state {
-            ItemState::Held(reason) => self.report(item, STATUS_HELD, Some(reason)),
-            ItemState::Pending | ItemState::Claimed(_) | ItemState::Staged => {
-                self.report(item, STATUS_QUEUED, None);
-            }
+            ItemState::Held(reason) => self.report(&item.delivery, STATUS_HELD, Some(reason)),
+            ItemState::Pending
+            | ItemState::Consumed
+            | ItemState::Claimed(_)
+            | ItemState::Staged => self.report(&item.delivery, STATUS_QUEUED, None),
         }
     }
 
     /// Reports what became of a message this session received.
-    fn report(&self, item: &InboxItem, status: &'static str, reason: Option<&str>) {
+    fn report(&self, delivery: &Delivery, status: &'static str, reason: Option<&str>) {
         self.history.transition(
-            item.delivery.sender.route.target(),
-            item.delivery.message_id.clone(),
+            delivery.sender.route.target(),
+            delivery.message_id.clone(),
             MessageRecipient {
                 session: self.descriptor.session_id.to_string(),
                 name: Some(self.descriptor.name.clone()),
@@ -2734,13 +3073,13 @@ impl SessionState {
 
     /// Reports a message the conversation took in.
     fn report_delivered(&self, item: &InboxItem) {
-        self.report(item, STATUS_DELIVERED, None);
+        self.report(&item.delivery, STATUS_DELIVERED, None);
         self.report_seen(item);
     }
 
     /// Reports a message the user rejected, so catch-up never offers it again.
     fn report_rejected(&self, item: &InboxItem) {
-        self.report(item, STATUS_REJECTED, Some(REJECTED));
+        self.report(&item.delivery, STATUS_REJECTED, Some(REJECTED));
         self.report_seen(item);
     }
 
@@ -2770,9 +3109,9 @@ impl SessionInner {
             match item.state {
                 ItemState::Claimed(_) => state.inbox.push_back(item),
                 ItemState::Staged => released += item.bytes,
-                ItemState::Pending | ItemState::Held(_) => {
+                ItemState::Pending | ItemState::Consumed | ItemState::Held(_) => {
                     released += item.bytes;
-                    state.report(&item, STATUS_DROPPED, Some(CLOSED));
+                    state.report(&item.delivery, STATUS_DROPPED, Some(CLOSED));
                 }
             }
         }
@@ -2783,10 +3122,12 @@ impl SessionInner {
         state.dedup.clear();
         state.reviews.clear();
         state.claim = None;
+        state.observer = None;
         self.host.changed.notify(usize::MAX);
     }
 
-    /// Queues `delivery`, held when policy says so. `None` when it would
+    /// Queues `delivery`, held when policy says so, and shows it to the
+    /// observer unless an automation `released` it. `None` when it would
     /// exceed the session or process byte limit.
     fn enqueue(
         &self,
@@ -2795,6 +3136,7 @@ impl SessionInner {
         encoded: usize,
         reply_to: Option<String>,
         passive: bool,
+        released: bool,
     ) -> Result<Option<SendReceipt>, String> {
         let naming = state.naming(&delivery)?;
         let origin = naming.origin(&delivery, reply_to, None);
@@ -2827,11 +3169,13 @@ impl SessionInner {
             state: reason.map_or(ItemState::Pending, |reason| ItemState::Held(reason.into())),
             approved_epoch: None,
             passive,
+            released,
         };
         let receipt = item.receipt();
         state.report_state(&item);
         state.bytes += bytes;
         state.inbox.push_back(item);
+        state.offer(state.inbox.len() - 1);
         self.host.changed.notify(usize::MAX);
         Ok(Some(receipt))
     }
@@ -2856,7 +3200,7 @@ impl SessionInner {
         {
             return Ok(());
         }
-        self.enqueue(&mut state, delivery, encoded, None, true)?;
+        self.enqueue(&mut state, delivery, encoded, None, true, false)?;
         Ok(())
     }
 
@@ -2872,7 +3216,7 @@ impl SessionInner {
             || route.session != self.route.session
         {
             return Ok(SendReceipt::new(
-                "refused",
+                STATUS_REFUSED,
                 &delivery.message_id,
                 Some(STALE_TARGET),
             ));
@@ -2884,7 +3228,7 @@ impl SessionInner {
             || delivery.issued_ms.saturating_sub(now_ms) > CLOCK_SKEW.as_millis() as u64
         {
             return Ok(SendReceipt::new(
-                "refused",
+                STATUS_REFUSED,
                 &delivery.message_id,
                 Some("Peer message retry window expired or clock differs"),
             ));
@@ -2896,7 +3240,7 @@ impl SessionInner {
         let mut state = lock(&self.state);
         if !state.open {
             return Ok(SendReceipt::new(
-                "refused",
+                STATUS_REFUSED,
                 &delivery.message_id,
                 Some(CLOSED),
             ));
@@ -2909,7 +3253,7 @@ impl SessionInner {
         }
         if !has_retry_room(&mut state.dedup, now_ms, |entry| entry.issued_ms) {
             return Ok(SendReceipt::new(
-                "rate_limited",
+                STATUS_RATE_LIMITED,
                 &delivery.message_id,
                 Some(RETRY_FULL),
             ));
@@ -2945,17 +3289,17 @@ impl SessionInner {
             self.host.changed.notify(usize::MAX);
             receipt
         } else if !subscribed(&delivery.audience, &state.topics, state.broadcasts) {
-            SendReceipt::new("refused", &delivery.message_id, Some(NOT_SUBSCRIBED))
+            SendReceipt::new(STATUS_REFUSED, &delivery.message_id, Some(NOT_SUBSCRIBED))
         } else if state.descriptor.inbound == InboundPolicy::Refuse
             || delivery.sender.mode == WireMode::ReadOnly
         {
-            SendReceipt::new("refused", &delivery.message_id, Some(REFUSED_POLICY))
+            SendReceipt::new(STATUS_REFUSED, &delivery.message_id, Some(REFUSED_POLICY))
         } else if state
             .arrivals
             .iter()
             .any(|arrival| arrival.session == session && arrival.text == text)
         {
-            SendReceipt::new("refused", &delivery.message_id, Some(DUPLICATE))
+            SendReceipt::new(STATUS_REFUSED, &delivery.message_id, Some(DUPLICATE))
         } else if state.arrivals.len() >= state.inbound_rate
             || state
                 .arrivals
@@ -2964,11 +3308,23 @@ impl SessionInner {
                 .count()
                 >= state.sender_rate
         {
-            SendReceipt::new("rate_limited", &delivery.message_id, Some(RATE_EXCEEDED))
+            SendReceipt::new(
+                STATUS_RATE_LIMITED,
+                &delivery.message_id,
+                Some(RATE_EXCEEDED),
+            )
         } else if state.inbox.len() >= MAX_PENDING.min(MAX_HELD) {
-            SendReceipt::new("rate_limited", &delivery.message_id, Some(FULL))
+            SendReceipt::new(STATUS_RATE_LIMITED, &delivery.message_id, Some(FULL))
         } else {
-            match self.enqueue(&mut state, delivery.clone(), encoded.len(), reply_to, false)? {
+            let enqueued = self.enqueue(
+                &mut state,
+                delivery.clone(),
+                encoded.len(),
+                reply_to,
+                false,
+                false,
+            )?;
+            match enqueued {
                 Some(receipt) => {
                     state.arrivals.push_back(Arrival {
                         at: now,
@@ -2977,7 +3333,7 @@ impl SessionInner {
                     });
                     receipt
                 }
-                None => SendReceipt::new("rate_limited", &delivery.message_id, Some(FULL)),
+                None => SendReceipt::new(STATUS_RATE_LIMITED, &delivery.message_id, Some(FULL)),
             }
         };
         state.dedup.insert(
@@ -3050,7 +3406,7 @@ impl Drop for PeerClaim {
                 for item in mem::take(&mut state.inbox) {
                     if matches!(item.state, ItemState::Claimed(id) if id == self.claim_id) {
                         released += item.bytes;
-                        state.report(&item, STATUS_DROPPED, Some(CLOSED));
+                        state.report(&item.delivery, STATUS_DROPPED, Some(CLOSED));
                     } else {
                         state.inbox.push_back(item);
                     }
@@ -3159,7 +3515,7 @@ impl HostInner {
                     },
                     None => Response::Receipt {
                         receipt: SendReceipt::new(
-                            "refused",
+                            STATUS_REFUSED,
                             &delivery.message_id,
                             Some(STALE_TARGET),
                         ),
@@ -3180,11 +3536,12 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::slice::from_ref;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Instant;
 
+    use caudra_automation::meta::INVALID_NAME;
     use caudra_config::{
         DEFAULT_INBOUND_PER_MINUTE, DEFAULT_SENDER_PER_MINUTE, FeatureFlags, InboundPolicy,
         MessagingConfig,
@@ -3197,19 +3554,23 @@ mod tests {
     use test_case::test_case;
 
     use super::history::MessageHistory;
+    use super::script::tests::script;
     use super::{
         AMBIGUOUS_HANDLE, AMBIGUOUS_REPLY, ANSWERS_TO, CLAIM_BATCH, CLOSED, DIRECT_PUBLICATION,
         DUPLICATE, DedupEntry, Delivery, FULL, HANDLE_PREFIX, HELD_BLOCKED, HELD_COHORT,
-        HELD_POLICY, HISTORY_HELD, HandleClaim, INVALID_HANDLE, Issued, MAX_BODY_BYTES, MAX_DEDUP,
-        MAX_HELD, MAX_HISTORY_PAGE, MAX_MESSAGE_NAMES, MAX_NAME_ATTEMPTS, MAX_PEER_NAMES,
-        MAX_PROCESS_BYTES, MAX_SESSION_BYTES, MESSAGE_WORDS, MessageChannel, MessageIdentity,
-        NAME_COLLISION, NOT_HELD, NOT_RECORDED, NOT_SUBSCRIBED, NameTable, Outgoing, PEER_WORDS,
-        POLICY_FLOOR, PUBLISH_RATE_EXCEEDED, PeerDecision, PeerDecisionResult, PeerDescriptor,
-        PeerHost, PeerInfo, PeerSession, PeerSummary, RATE_EXCEEDED, RATE_WINDOW, REFUSED_POLICY,
-        REJECTED, RETRY_FULL, RETRY_WINDOW, REUSED_REQUEST, RecipientStatus, Route, STALE_REVIEW,
-        STALE_TARGET, SendReceipt, Sender, TEST_HISTORY_DIRECTORY, UNKNOWN_HANDLE, UNKNOWN_REPLY,
-        UNKNOWN_TARGET, UNTIL_RESUMED, WireMode, generated_handles, handle_address, handle_in_use,
-        literal, lock, message_name, token,
+        HELD_POLICY, HISTORY_HELD, HandleClaim, HistoryChannel, INVALID_HANDLE, INVALID_TARGET,
+        INVALID_TEXT, Issued, MAX_BODY_BYTES, MAX_DEDUP, MAX_HELD, MAX_HISTORY_PAGE,
+        MAX_MESSAGE_NAMES, MAX_NAME_ATTEMPTS, MAX_PEER_NAMES, MAX_PROCESS_BYTES, MAX_SESSION_BYTES,
+        MESSAGE_WORDS, MessageChannel, MessageIdentity, MessageKey, MessageObserver,
+        NAME_COLLISION, NOT_HELD, NOT_RECORDED, NOT_SUBSCRIBED, NameTable, ObservedMessage,
+        ObservedSender, Outgoing, PEER_WORDS, POLICY_FLOOR, PUBLISH_RATE_EXCEEDED, PeerDecision,
+        PeerDecisionResult, PeerDescriptor, PeerHost, PeerInfo, PeerSession, PeerSummary,
+        RATE_EXCEEDED, RATE_WINDOW, REFUSED_POLICY, REJECTED, RETRY_FULL, RETRY_WINDOW,
+        REUSED_REQUEST, RecipientStatus, Route, SEND_BLOCKED, STALE_REVIEW, STALE_TARGET,
+        STATUS_CONSUMED, STATUS_DELIVERED, STATUS_DROPPED, STATUS_HELD, STATUS_QUEUED, SendFailure,
+        SendFailureKind, SendOrigin, SendReceipt, Sender, StoredDelivery, TEST_HISTORY_DIRECTORY,
+        UNKNOWN_HANDLE, UNKNOWN_REPLY, UNKNOWN_TARGET, UNTIL_RESUMED, WireMode, generated_handles,
+        handle_address, handle_in_use, literal, lock, message_name, token,
         topics::{INVALID_PATTERN, INVALID_TOPIC},
         valid_handle, valid_name, wall_ms,
     };
@@ -3253,6 +3614,12 @@ mod tests {
     /// Delivers more than the removed sixteen-message budget while staying
     /// under the default recipient rate.
     const UNBUDGETED_ROUNDS: usize = 8;
+    const AUTOMATION: &str = "nightly-digest";
+    const OTHER_AUTOMATION: &str = "release-notes";
+    const MALFORMED_AUTOMATION: &str = "Nightly Digest";
+    const MALFORMED_ROUTE: &str = "not-a-route";
+    const SCRIPT_LABEL: &str = "nightly-ci";
+    const SINGLE_RATE: usize = 1;
 
     pub(super) fn directory() -> TempDir {
         Builder::new()
@@ -3320,6 +3687,7 @@ mod tests {
                 mode: WireMode::Build,
                 permission_mode: PermissionMode::Ask,
                 external: false,
+                automation: None,
             },
         }
     }
@@ -6210,6 +6578,728 @@ mod tests {
         assert_eq!(
             literal("line\n\r\t\u{1b}\u{85}\u{202e}\u{2066}\u{200f}終", newlines),
             expected
+        );
+    }
+
+    /// Sees every message, and takes the queued ones for `taker`.
+    #[derive(Default)]
+    pub(super) struct Recorder {
+        taker: Option<String>,
+        seen: Mutex<Vec<ObservedMessage>>,
+    }
+
+    impl Recorder {
+        pub(super) fn taking(automation: &str) -> Self {
+            Self {
+                taker: Some(automation.into()),
+                ..Self::default()
+            }
+        }
+
+        pub(super) fn seen(&self) -> Vec<ObservedMessage> {
+            lock(&self.seen).clone()
+        }
+
+        fn keys(&self) -> Vec<(MessageKey, bool)> {
+            self.seen()
+                .into_iter()
+                .map(|message| (message.key, message.held))
+                .collect()
+        }
+    }
+
+    impl MessageObserver for Recorder {
+        fn observe(&self, message: &ObservedMessage) -> Option<String> {
+            lock(&self.seen).push(message.clone());
+            self.taker.clone()
+        }
+    }
+
+    pub(super) fn observe(session: &PeerSession, recorder: Recorder) -> Arc<Recorder> {
+        let recorder = Arc::new(recorder);
+        session.set_observer(Some(recorder.clone()));
+        recorder
+    }
+
+    /// Two sessions of one host in one workspace.
+    fn conversation(inbound: InboundPolicy) -> (TempDir, PeerHost, PeerSession, PeerSession) {
+        let directory = directory();
+        let host = host(directory.path());
+        let sender = host
+            .register(descriptor(directory.path(), InboundPolicy::Auto))
+            .unwrap();
+        let receiver = host
+            .register(descriptor(directory.path(), inbound))
+            .unwrap();
+        (directory, host, sender, receiver)
+    }
+
+    fn word_target(sender: &PeerSession, route: &Route) -> String {
+        lock(&sender.0.state).peer_name(&route.target()).unwrap()
+    }
+
+    /// What the history records of `receiver`'s copy of the newest message
+    /// `sender` sent it.
+    async fn recorded(receiver: &PeerSession, sender: &PeerSession) -> (String, Option<String>) {
+        let channel = MessageChannel::Direct(sender.session_id().to_string());
+        let page = receiver.channel_messages(channel, None, 1).await.unwrap();
+        let recipient = &page.messages[0].recipients[0];
+        (recipient.status.clone(), recipient.reason.clone())
+    }
+
+    fn block(session: &PeerSession) {
+        let blocked = PeerDescriptor {
+            blocked: true,
+            ..session.descriptor()
+        };
+        session.update(blocked).unwrap();
+    }
+
+    fn unblock(session: &PeerSession) {
+        let unblocked = PeerDescriptor {
+            blocked: false,
+            ..session.descriptor()
+        };
+        session.update(unblocked).unwrap();
+    }
+
+    fn approve_held(session: &PeerSession) {
+        let held = session.held();
+        session.approve(&held[0].message_id).unwrap();
+    }
+
+    fn hold_everything(session: &PeerSession) {
+        session.set_inbound(InboundPolicy::Hold).unwrap();
+    }
+
+    fn unchanged(_: &PeerSession) {}
+
+    #[test_case(InboundPolicy::Accept, unchanged, unchanged, &[false]; "queued_on_arrival")]
+    #[test_case(InboundPolicy::Hold, unchanged, unchanged, &[true]; "held_on_arrival")]
+    #[test_case(InboundPolicy::Hold, unchanged, approve_held, &[true, false]; "approved_after_review")]
+    #[test_case(InboundPolicy::Accept, block, unblock, &[true, false]; "held_while_blocked_then_queued")]
+    #[test_case(InboundPolicy::Accept, PeerSession::suppress_wakes, PeerSession::resume_wakes, &[true, false]; "held_while_wakes_were_suppressed_then_queued")]
+    #[test_case(InboundPolicy::Accept, unchanged, hold_everything, &[false, true]; "held_by_a_later_policy")]
+    fn observers_see_each_move_to_held_or_queued_once(
+        inbound: InboundPolicy,
+        before: fn(&PeerSession),
+        after: fn(&PeerSession),
+        held: &[bool],
+    ) {
+        let (_directory, _host, session) = fixture(inbound);
+        before(&session);
+        let recorder = observe(&session, Recorder::default());
+        let delivery = delivery(&session);
+        session
+            .0
+            .receive(delivery.clone(), Instant::now(), wall_ms())
+            .unwrap();
+        after(&session);
+        session.has_pending();
+        session.held();
+        let seen = recorder.seen();
+        assert_eq!(
+            seen.iter().map(|message| message.held).collect::<Vec<_>>(),
+            held
+        );
+        assert!(
+            seen.iter()
+                .all(|message| message.key == MessageKey::of(&delivery) && !message.catch_up)
+        );
+    }
+
+    #[test]
+    fn caught_up_messages_carry_their_live_key_and_settled_ones_are_never_offered_again() {
+        smol::block_on(async {
+            let (directory, host, publisher) = publisher_fixture(MessagingConfig::default());
+            let published = publisher
+                .publish(topic_audience(), TEXT, REQUEST_ID)
+                .await
+                .unwrap();
+            let late = subscriber(&host, directory.path(), &[TOPIC_PATTERN], false);
+            let recorder = observe(&late, Recorder::taking(AUTOMATION));
+            late.catch_up().await.unwrap();
+            let caught_up = recorder.seen().remove(0);
+            assert!(caught_up.catch_up && !caught_up.held);
+            assert_eq!(
+                caught_up.key,
+                MessageKey {
+                    sender_route: publisher.0.route.target(),
+                    message_id: published.message_id,
+                }
+            );
+            let live = caught_up.delivery.delivery.clone();
+            let receipt = late.0.receive(live, Instant::now(), wall_ms()).unwrap();
+            assert_eq!(receipt.status, STATUS_QUEUED);
+            assert!(!late.has_pending());
+            late.settle_consumed(&caught_up.key, AUTOMATION);
+            late.catch_up().await.unwrap();
+            assert_eq!(recorder.seen().len(), 1);
+            assert!(late.claim().is_none());
+        });
+    }
+
+    #[test]
+    fn new_observers_see_what_waits_and_removed_ones_return_what_they_took() {
+        let (_directory, _host, session) = fixture(InboundPolicy::Auto);
+        let receive = |delivery: &Delivery| {
+            session
+                .0
+                .receive(delivery.clone(), Instant::now(), wall_ms())
+                .unwrap();
+        };
+        receive(&delivery(&session));
+        session.claim().unwrap().stage();
+        receive(&delivery(&session));
+        let _claimed = session.claim().unwrap();
+        let queued = delivery(&session);
+        receive(&queued);
+        let mut held = delivery(&session);
+        held.sender.canonical_cwd = None;
+        receive(&held);
+        let waiting = [
+            (MessageKey::of(&queued), false),
+            (MessageKey::of(&held), true),
+        ];
+        let taker = observe(&session, Recorder::taking(AUTOMATION));
+        assert_eq!(taker.keys(), waiting);
+        assert!(!session.has_pending());
+        session.set_observer(None);
+        assert!(session.has_pending());
+        assert!(!session.settle_consumed(&waiting[0].0, AUTOMATION));
+        assert!(session.has_pending());
+        let replacement = observe(&session, Recorder::taking(OTHER_AUTOMATION));
+        assert_eq!(replacement.keys(), waiting);
+        assert!(!session.has_pending());
+        let watcher = observe(&session, Recorder::default());
+        assert_eq!(watcher.keys(), waiting);
+        assert!(session.has_pending());
+        assert_eq!(taker.keys(), waiting);
+    }
+
+    #[test_case(|session: &PeerSession, key: &MessageKey| assert!(session.settle_consumed(key, AUTOMATION)); "settled")]
+    #[test_case(|session: &PeerSession, _: &MessageKey| session.close(); "closed")]
+    fn consumed_messages_wake_nothing_and_count_until_they_leave(
+        leave: fn(&PeerSession, &MessageKey),
+    ) {
+        let (_directory, host, session) = fixture(InboundPolicy::Accept);
+        observe(&session, Recorder::taking(AUTOMATION));
+        let delivery = delivery(&session);
+        let receipt = session
+            .0
+            .receive(delivery.clone(), Instant::now(), wall_ms())
+            .unwrap();
+        assert_eq!(receipt.status, STATUS_QUEUED);
+        assert!(!session.has_pending());
+        assert!(session.claim_wake().is_none());
+        assert!(session.claim().is_none());
+        assert_ne!(host.0.bytes.load(Ordering::Acquire), 0);
+        leave(&session, &MessageKey::of(&delivery));
+        assert_eq!(host.0.bytes.load(Ordering::Acquire), 0);
+        assert!(lock(&session.0.state).inbox.is_empty());
+    }
+
+    #[test]
+    fn settling_records_the_automation_that_consumed_the_message() {
+        smol::block_on(async {
+            let (_directory, _host, sender, receiver) = conversation(InboundPolicy::Accept);
+            let recorder = observe(&receiver, Recorder::taking(AUTOMATION));
+            sender
+                .send(&receiver.0.route.target(), TEXT, None, REQUEST_ID)
+                .await
+                .unwrap();
+            receiver.settle_consumed(&recorder.seen()[0].key, AUTOMATION);
+            assert_eq!(
+                recorded(&receiver, &sender).await,
+                (STATUS_CONSUMED.to_owned(), Some(AUTOMATION.to_owned()))
+            );
+        });
+    }
+
+    #[test_case(false; "from_the_inbox")]
+    #[test_case(true; "after_a_restart")]
+    fn released_messages_reach_the_model_and_end_delivered(restart: bool) {
+        smol::block_on(async {
+            let (directory, _host, sender, mut receiver) = conversation(InboundPolicy::Accept);
+            let restarted = host(directory.path());
+            let mut recorder = observe(&receiver, Recorder::taking(AUTOMATION));
+            sender
+                .send(&receiver.0.route.target(), TEXT, None, REQUEST_ID)
+                .await
+                .unwrap();
+            let consumed = recorder.seen().remove(0);
+            let mut stored = consumed.delivery;
+            if restart {
+                receiver.settle_consumed(&consumed.key, AUTOMATION);
+                assert_eq!(recorded(&receiver, &sender).await.0, STATUS_CONSUMED);
+                let saved = serde_json::to_string(&stored).unwrap();
+                let descriptor = receiver.descriptor();
+                receiver.close();
+                receiver = restarted.register(descriptor).unwrap();
+                recorder = observe(&receiver, Recorder::taking(AUTOMATION));
+                stored = serde_json::from_str::<StoredDelivery>(&saved).unwrap();
+            }
+            receiver.release_consumed(&stored).await.unwrap();
+            let claim = receiver.claim().unwrap();
+            assert_eq!(claim.messages().len(), 1);
+            claim.commit();
+            assert_eq!(
+                recorded(&receiver, &sender).await,
+                (STATUS_DELIVERED.to_owned(), None)
+            );
+            assert_eq!(recorder.seen().len(), usize::from(!restart));
+        });
+    }
+
+    #[test]
+    fn released_messages_are_never_offered_again() {
+        smol::block_on(async {
+            let (_directory, _host, session) = fixture(InboundPolicy::Accept);
+            let first = observe(&session, Recorder::taking(AUTOMATION));
+            session
+                .0
+                .receive(delivery(&session), Instant::now(), wall_ms())
+                .unwrap();
+            session
+                .release_consumed(&first.seen()[0].delivery)
+                .await
+                .unwrap();
+            let second = observe(&session, Recorder::taking(OTHER_AUTOMATION));
+            session
+                .0
+                .receive(delivery(&session), Instant::now(), wall_ms())
+                .unwrap();
+            let taken = second.seen().remove(0);
+            session.settle_consumed(&taken.key, OTHER_AUTOMATION);
+            session.release_consumed(&taken.delivery).await.unwrap();
+            assert_eq!(session.claim().unwrap().messages().len(), 2);
+            assert_eq!((first.seen().len(), second.seen().len()), (1, 1));
+        });
+    }
+
+    #[test]
+    fn messages_given_back_reach_the_model_once_and_are_never_offered_again() {
+        let (_directory, host, session) = fixture(InboundPolicy::Accept);
+        let taker = observe(&session, Recorder::taking(AUTOMATION));
+        let received = delivery(&session);
+        session
+            .0
+            .receive(received.clone(), Instant::now(), wall_ms())
+            .unwrap();
+        let key = MessageKey::of(&received);
+        assert!(!session.return_consumed(&MessageKey::of(&delivery(&session))));
+        assert!(!session.has_pending());
+        let notified = host.notified();
+        assert!(session.return_consumed(&key));
+        assert!(smol::block_on(poll_once(notified)).is_some());
+        assert!(!session.return_consumed(&key));
+        let watcher = observe(&session, Recorder::taking(OTHER_AUTOMATION));
+        let claim = session.claim().unwrap();
+        assert_eq!(claim.messages().len(), 1);
+        claim.commit();
+        assert!(session.claim().is_none());
+        assert!(!session.return_consumed(&key));
+        assert_eq!((taker.seen().len(), watcher.seen().len()), (1, 0));
+    }
+
+    #[test]
+    fn released_messages_are_admitted_under_the_current_policy() {
+        smol::block_on(async {
+            let (_directory, _host, sender, receiver) = conversation(InboundPolicy::Accept);
+            let recorder = observe(&receiver, Recorder::taking(AUTOMATION));
+            sender
+                .send(&receiver.0.route.target(), TEXT, None, REQUEST_ID)
+                .await
+                .unwrap();
+            let consumed = recorder.seen().remove(0);
+            receiver.settle_consumed(&consumed.key, AUTOMATION);
+            receiver.set_inbound(InboundPolicy::Hold).unwrap();
+            receiver.release_consumed(&consumed.delivery).await.unwrap();
+            assert!(!receiver.has_pending());
+            assert_eq!(receiver.held()[0].reason, HELD_POLICY);
+            assert_eq!(
+                recorded(&receiver, &sender).await,
+                (STATUS_HELD.to_owned(), Some(HELD_POLICY.to_owned()))
+            );
+            assert_eq!(recorder.seen().len(), 1);
+        });
+    }
+
+    #[test]
+    fn releases_the_inbox_has_no_room_for_are_dropped() {
+        smol::block_on(async {
+            let (_directory, host, sender, receiver) = conversation(InboundPolicy::Accept);
+            let recorder = observe(&receiver, Recorder::taking(AUTOMATION));
+            sender
+                .send(&receiver.0.route.target(), TEXT, None, REQUEST_ID)
+                .await
+                .unwrap();
+            let consumed = recorder.seen().remove(0);
+            receiver.settle_consumed(&consumed.key, AUTOMATION);
+            host.0.bytes.store(MAX_PROCESS_BYTES, Ordering::Release);
+            receiver.release_consumed(&consumed.delivery).await.unwrap();
+            host.0.bytes.store(0, Ordering::Release);
+            assert!(lock(&receiver.0.state).inbox.is_empty());
+            assert_eq!(
+                recorded(&receiver, &sender).await,
+                (STATUS_DROPPED.to_owned(), Some(FULL.to_owned()))
+            );
+        });
+    }
+
+    #[test]
+    fn marked_messages_name_their_automation_to_the_model_and_the_history() {
+        smol::block_on(async {
+            let (_directory, _host, sender, receiver) = conversation(InboundPolicy::Auto);
+            let origin = SendOrigin::Automation(AUTOMATION.into());
+            let target = word_target(&sender, &receiver.0.route);
+            sender
+                .send_from(&origin, &target, TEXT, None, REQUEST_ID)
+                .await
+                .unwrap();
+            let claim = receiver.claim().unwrap();
+            let message = &claim.messages()[0];
+            let event = message.peer_event.as_ref().unwrap();
+            assert_eq!(event.automation.as_deref(), Some(AUTOMATION));
+            let framed = message.first_text_content().unwrap();
+            assert!(framed.contains(AUTOMATION), "{framed}");
+            let channel = HistoryChannel::Direct {
+                session: receiver.session_id().to_string(),
+                peer: sender.session_id().to_string(),
+            };
+            let (stored, _) = receiver
+                .0
+                .host
+                .history
+                .channel_page(channel, None, 1)
+                .await
+                .unwrap();
+            assert_eq!(
+                stored[0].message.sender.automation.as_deref(),
+                Some(AUTOMATION)
+            );
+        });
+    }
+
+    #[test]
+    fn automations_answer_the_messages_they_consume() {
+        smol::block_on(async {
+            let (_directory, _host, sender, receiver) = conversation(InboundPolicy::Auto);
+            let recorder = observe(&receiver, Recorder::taking(AUTOMATION));
+            let sent = sender
+                .send(&receiver.0.route.target(), TEXT, None, REQUEST_ID)
+                .await
+                .unwrap();
+            let consumed = recorder.seen().remove(0);
+            let ObservedSender::Session { handle } = &consumed.sender else {
+                panic!("expected a session sender, got {:?}", consumed.sender);
+            };
+            let origin = SendOrigin::Automation(AUTOMATION.into());
+            let reply = receiver
+                .send_from(
+                    &origin,
+                    handle,
+                    REPLY_TEXT,
+                    Some(&consumed.key),
+                    REPLY_REQUEST_ID,
+                )
+                .await
+                .unwrap();
+            assert_eq!(reply.status, STATUS_QUEUED);
+            let claim = sender.claim().unwrap();
+            let replied = claim.messages()[0].peer_event.clone().unwrap();
+            assert_eq!(replied.reply_to.as_deref(), Some(sent.message_id.as_str()));
+            assert_eq!(replied.automation.as_deref(), Some(AUTOMATION));
+        });
+    }
+
+    #[test_case(InboundPolicy::Auto, true, STATUS_QUEUED, None; "auto_admits_its_cohort")]
+    #[test_case(InboundPolicy::Auto, false, STATUS_HELD, Some(HELD_COHORT); "auto_holds_other_cohorts")]
+    #[test_case(InboundPolicy::Hold, true, STATUS_HELD, Some(HELD_POLICY); "hold_holds_every_sender")]
+    #[test_case(InboundPolicy::Accept, false, STATUS_QUEUED, None; "accept_admits_every_sender")]
+    fn marked_senders_are_judged_as_their_session(
+        inbound: InboundPolicy,
+        same_cwd: bool,
+        status: &str,
+        reason: Option<&str>,
+    ) {
+        let (_directory, _host, session) = fixture(inbound);
+        let mut delivery = delivery(&session);
+        delivery.sender.automation = Some(AUTOMATION.into());
+        if !same_cwd {
+            delivery.sender.canonical_cwd = None;
+        }
+        let receipt = session
+            .0
+            .receive(delivery, Instant::now(), wall_ms())
+            .unwrap();
+        assert_eq!(
+            (receipt.status.as_str(), receipt.reason.as_deref()),
+            (status, reason)
+        );
+    }
+
+    #[test_case(false, Some(AUTOMATION), true; "marked_session")]
+    #[test_case(true, Some(AUTOMATION), false; "marked_script")]
+    #[test_case(false, Some(MALFORMED_AUTOMATION), false; "malformed_marker")]
+    #[test_case(true, None, true; "script")]
+    fn only_sessions_carry_a_well_formed_automation_marker(
+        external: bool,
+        automation: Option<&str>,
+        valid: bool,
+    ) {
+        let (_directory, _host, session) = fixture(InboundPolicy::Accept);
+        let mut delivery = delivery(&session);
+        delivery.sender.external = external;
+        delivery.sender.automation = automation.map(str::to_owned);
+        assert_eq!(delivery.has_valid_metadata(), valid);
+    }
+
+    #[test]
+    fn scripts_are_observed_by_their_label() {
+        smol::block_on(async {
+            let directory = directory();
+            let host = host(directory.path());
+            let receiver = named(
+                &host,
+                descriptor(directory.path(), InboundPolicy::Accept),
+                HANDLE,
+            );
+            receiver.claim_handle().unwrap();
+            let recorder = observe(&receiver, Recorder::default());
+            script(&directory, &MessagingConfig::default(), SCRIPT_LABEL)
+                .send(HANDLE, TEXT)
+                .await
+                .unwrap();
+            assert_eq!(
+                recorder.seen()[0].sender,
+                ObservedSender::Script {
+                    label: SCRIPT_LABEL.into()
+                }
+            );
+        });
+    }
+
+    #[test_case(block, SendOrigin::Session, Err(SendFailureKind::Refused); "blocked_session")]
+    #[test_case(block, SendOrigin::Automation(AUTOMATION.into()), Ok(STATUS_QUEUED); "blocked_automation")]
+    #[test_case(PeerSession::suppress_wakes, SendOrigin::Session, Err(SendFailureKind::Refused); "suppressed_session")]
+    #[test_case(PeerSession::suppress_wakes, SendOrigin::Automation(AUTOMATION.into()), Ok(STATUS_QUEUED); "suppressed_automation")]
+    fn only_automations_send_while_their_session_is_stopped(
+        stop: fn(&PeerSession),
+        origin: SendOrigin,
+        expected: Result<&str, SendFailureKind>,
+    ) {
+        smol::block_on(async {
+            let (_directory, _host, sender, receiver) = conversation(InboundPolicy::Accept);
+            receiver
+                .set_subscriptions(patterns(&[TOPIC_PATTERN]), false)
+                .unwrap();
+            let target = word_target(&sender, &receiver.0.route);
+            stop(&sender);
+            let sent = sender
+                .send_from(&origin, &target, TEXT, None, REQUEST_ID)
+                .await
+                .map(|receipt| receipt.status);
+            let published = sender
+                .publish_from(&origin, topic_audience(), OTHER_TEXT, ORIGINAL_REQUEST_ID)
+                .await
+                .map(|receipt| receipt.recipients[0].status.clone());
+            let expected = expected
+                .map(str::to_owned)
+                .map_err(|kind| (kind, SEND_BLOCKED.to_owned()));
+            for outcome in [sent, published] {
+                assert_eq!(
+                    outcome.map_err(|failure| (failure.kind, failure.reason)),
+                    expected
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn automation_retries_return_the_first_receipt_and_keep_their_origin() {
+        smol::block_on(async {
+            let (_directory, _host, sender, receiver) = conversation(InboundPolicy::Accept);
+            let target = word_target(&sender, &receiver.0.route);
+            let origin = SendOrigin::Automation(AUTOMATION.into());
+            let first = sender
+                .send_from(&origin, &target, TEXT, None, REQUEST_ID)
+                .await
+                .unwrap();
+            let retried = sender
+                .send_from(&origin, &target, TEXT, None, REQUEST_ID)
+                .await
+                .unwrap();
+            assert_eq!(retried, first);
+            for origin in [
+                SendOrigin::Session,
+                SendOrigin::Automation(OTHER_AUTOMATION.into()),
+            ] {
+                let reused = sender
+                    .send_from(&origin, &target, TEXT, None, REQUEST_ID)
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    (reused.kind, reused.reason.as_str()),
+                    (SendFailureKind::Invalid, REUSED_REQUEST)
+                );
+            }
+            assert_eq!(receiver.claim().unwrap().messages().len(), 1);
+        });
+    }
+
+    /// What stops an automation's message.
+    enum Cause {
+        RecipientRefuses,
+        RecipientRate,
+        PublishRate,
+        SenderClosed,
+        SenderReadOnly,
+        RecipientGone,
+        Unrecorded,
+        UnknownName,
+        UnknownWords,
+        EmptyText,
+        WildcardTopic,
+        MalformedMarker,
+        MalformedReply,
+    }
+
+    async fn failure(cause: Cause) -> SendFailure {
+        let directory = directory();
+        let host = host(directory.path());
+        let unrecorded = PeerHost::bind(
+            directory.path().to_owned(),
+            MessageHistory::stopped(),
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .unwrap();
+        let limited = MessagingConfig {
+            sender_per_minute: SINGLE_RATE,
+            publish_per_minute: SINGLE_RATE,
+            ..MessagingConfig::default()
+        };
+        let register = |host: &PeerHost, inbound| {
+            host.register_with_controls(descriptor(directory.path(), inbound), &limited, None)
+                .unwrap()
+        };
+        let receiver = register(
+            &host,
+            match cause {
+                Cause::RecipientRefuses => InboundPolicy::Refuse,
+                _ => InboundPolicy::Accept,
+            },
+        );
+        let sender = match cause {
+            Cause::Unrecorded => register(&unrecorded, InboundPolicy::Auto),
+            _ => register(&host, InboundPolicy::Auto),
+        };
+        let automation = SendOrigin::Automation(AUTOMATION.into());
+        let target = word_target(&sender, &receiver.0.route);
+        let (origin, target, text, reply_to) = match cause {
+            Cause::PublishRate => {
+                sender
+                    .publish_from(
+                        &automation,
+                        topic_audience(),
+                        OTHER_TEXT,
+                        ORIGINAL_REQUEST_ID,
+                    )
+                    .await
+                    .unwrap();
+                return sender
+                    .publish_from(&automation, topic_audience(), TEXT, REQUEST_ID)
+                    .await
+                    .unwrap_err();
+            }
+            Cause::WildcardTopic => {
+                let wildcard = PeerAudience::Topic {
+                    topic: TOPIC_PATTERN.into(),
+                };
+                return sender
+                    .publish_from(&automation, wildcard, TEXT, REQUEST_ID)
+                    .await
+                    .unwrap_err();
+            }
+            Cause::RecipientRate => {
+                sender
+                    .send_from(&automation, &target, OTHER_TEXT, None, ORIGINAL_REQUEST_ID)
+                    .await
+                    .unwrap();
+                (automation, target, TEXT, None)
+            }
+            Cause::SenderClosed => {
+                sender.close();
+                (automation, target, TEXT, None)
+            }
+            Cause::SenderReadOnly => {
+                let read_only = PeerDescriptor {
+                    mode: AgentMode::ReadOnly,
+                    ..sender.descriptor()
+                };
+                sender.update(read_only).unwrap();
+                (automation, target, TEXT, None)
+            }
+            Cause::RecipientGone => {
+                let gone = Route {
+                    host: token().unwrap(),
+                    session: CaudraId::generate(),
+                    generation: token().unwrap(),
+                };
+                (automation, word_target(&sender, &gone), TEXT, None)
+            }
+            Cause::UnknownName => (
+                automation,
+                format!("{HANDLE_PREFIX}{MISSING_HANDLE}"),
+                TEXT,
+                None,
+            ),
+            Cause::UnknownWords => (automation, PEER_NAME.to_owned(), TEXT, None),
+            Cause::EmptyText => (automation, target, "", None),
+            Cause::MalformedMarker => (
+                SendOrigin::Automation(MALFORMED_AUTOMATION.into()),
+                target,
+                TEXT,
+                None,
+            ),
+            Cause::MalformedReply => {
+                let reply_to = MessageKey {
+                    sender_route: MALFORMED_ROUTE.into(),
+                    message_id: MESSAGE_NAME.into(),
+                };
+                (automation, target, TEXT, Some(reply_to))
+            }
+            Cause::RecipientRefuses | Cause::Unrecorded => (automation, target, TEXT, None),
+        };
+        sender
+            .send_from(&origin, &target, text, reply_to.as_ref(), REQUEST_ID)
+            .await
+            .unwrap_err()
+    }
+
+    #[test_case(Cause::RecipientRefuses, SendFailureKind::Refused, Some(REFUSED_POLICY); "recipient_refuses")]
+    #[test_case(Cause::RecipientRate, SendFailureKind::RateLimited, Some(RATE_EXCEEDED); "recipient_rate")]
+    #[test_case(Cause::PublishRate, SendFailureKind::RateLimited, Some(PUBLISH_RATE_EXCEEDED); "publish_rate")]
+    #[test_case(Cause::SenderClosed, SendFailureKind::Unavailable, Some(CLOSED); "sender_closed")]
+    #[test_case(Cause::SenderReadOnly, SendFailureKind::ReadOnly, Some(SEND_BLOCKED); "sender_read_only")]
+    #[test_case(Cause::RecipientGone, SendFailureKind::Unavailable, None; "recipient_not_running")]
+    #[test_case(Cause::Unrecorded, SendFailureKind::Unavailable, Some(NOT_RECORDED); "unrecorded")]
+    #[test_case(Cause::UnknownName, SendFailureKind::UnknownRecipient, Some(UNKNOWN_HANDLE); "unknown_name")]
+    #[test_case(Cause::UnknownWords, SendFailureKind::UnknownRecipient, Some(UNKNOWN_TARGET); "unknown_word_target")]
+    #[test_case(Cause::EmptyText, SendFailureKind::Invalid, Some(INVALID_TEXT); "empty_text")]
+    #[test_case(Cause::WildcardTopic, SendFailureKind::Invalid, Some(INVALID_TOPIC); "wildcard_topic")]
+    #[test_case(Cause::MalformedMarker, SendFailureKind::Invalid, Some(INVALID_NAME); "malformed_marker")]
+    #[test_case(Cause::MalformedReply, SendFailureKind::Invalid, Some(INVALID_TARGET); "malformed_reply")]
+    fn automation_sends_fail_with_the_kind_of_their_cause(
+        cause: Cause,
+        kind: SendFailureKind,
+        reason: Option<&str>,
+    ) {
+        let failure = smol::block_on(failure(cause));
+        assert_eq!(failure.kind, kind, "{failure:?}");
+        assert!(
+            reason.is_none_or(|reason| failure.reason.contains(reason)),
+            "{failure:?}"
         );
     }
 }

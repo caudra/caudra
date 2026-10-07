@@ -79,6 +79,7 @@ pub(super) const PROJECT_READ_TOOLS: &[&str] = &[
 /// Tools whose reach is fixed by their own construction rather than by an
 /// argument, so a scope would describe nothing a caller can steer.
 pub(super) const TRUSTED_UNSCOPED_TOOLS: &[&str] = &[
+    "automation",
     "batch",
     "python_execution",
     "question",

@@ -536,6 +536,7 @@ mod tests {
     use arc_swap::ArcSwap;
     use caudra_agent::tools::native::plan::{self, PlanTarget, PlanWriteResult};
     use caudra_agent::{AgentEvent, PromptAdmission, ToolDoneEvent};
+    use caudra_automation::event::StartedBy;
     use caudra_providers::{ImageMediaType, ImageSource, Message};
     use caudra_storage::id::CaudraId;
     use caudra_storage::sessions::StoredMode;
@@ -899,7 +900,10 @@ mod tests {
             app.state.goal.set(GOAL).unwrap();
             app.start_goal_checkin()
         } else {
-            app.start_mailbox_run(vec![Message::synthetic(MAILBOX_RESULT.into())])
+            app.start_mailbox_run(
+                vec![Message::synthetic(MAILBOX_RESULT.into())],
+                StartedBy::Mailbox,
+            )
         };
 
         let [Action::SendMessage(input)] = actions.as_slice() else {
@@ -934,7 +938,10 @@ mod tests {
         assert_eq!(composed.plan, bound);
 
         app.status = Status::Idle;
-        let actions = app.start_mailbox_run(vec![Message::synthetic(MAILBOX_RESULT.into())]);
+        let actions = app.start_mailbox_run(
+            vec![Message::synthetic(MAILBOX_RESULT.into())],
+            StartedBy::Mailbox,
+        );
         let [Action::SendMessage(automatic)] = actions.as_slice() else {
             panic!("{EXPECTED_SEND}");
         };

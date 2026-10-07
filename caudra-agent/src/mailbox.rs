@@ -74,6 +74,11 @@ impl SessionMailbox {
         state.wake = false;
         state.pending.drain(..).collect()
     }
+
+    /// Whether a wake waits, left for [`Self::claim_wake`]: a session with one is not settled.
+    pub fn wake_pending(&self) -> bool {
+        lock(&self.state).wake
+    }
 }
 
 impl Drop for SessionMailbox {
@@ -95,6 +100,8 @@ impl Drop for SessionMailbox {
 
 #[cfg(test)]
 mod tests {
+    use test_case::test_case;
+
     use super::*;
 
     fn text(message: &Message) -> &str {
@@ -140,6 +147,19 @@ mod tests {
             ["quiet", "wake"]
         );
         assert!(mailbox.drain().is_empty());
+    }
+
+    #[test_case(false; "quiet")]
+    #[test_case(true; "waking")]
+    fn a_pending_wake_is_seen_without_being_claimed(wake: bool) {
+        let id = CaudraId::generate();
+        let mailbox = SessionMailbox::register(id);
+        SessionMailbox::notify(id, "built".into(), wake).unwrap();
+
+        assert_eq!(mailbox.wake_pending(), wake);
+        assert_eq!(mailbox.wake_pending(), wake);
+        assert_eq!(mailbox.claim_wake().len(), usize::from(wake));
+        assert!(!mailbox.wake_pending());
     }
 
     #[test]

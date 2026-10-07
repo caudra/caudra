@@ -48,6 +48,8 @@ Plain text after the name becomes `args.query` and `args.objective`. A JSON obje
 
 The model can launch workflows too, through the `workflow` tool, when the session has a runtime. It sees the same catalog you do and the same trust rules. See [Tools](/docs/tools/#workflow) for the tool contract.
 
+An [automation](/docs/automations/#workflows) can start a run with `start_workflow()`, such as a nightly review, and act on its result through a `workflow_finished` trigger.
+
 ## Watching a run
 
 A launch draws a card in the transcript, whether you typed the command or the model called the `workflow` tool. The header names the run and reads its status, phase, agents admitted against the budget, and tokens spent. Below it sits the phase strip, the agents working right now, and the last three log lines. When the run settles the log lines give way to the report, the scratch file path, and any error. The report is markdown a model wrote, and the card draws it the way the transcript draws every other model answer. A run that spent its budget says so on the card and asks for a higher one. Click the scratch file path to open it in the [workbench](/docs/workbench/). Click anywhere else on the card to open the inspector on that run. A card the tool drew is part of the tool result and comes back on restore, brought up to date from the runtime, because the stored copy is frozen at the moment of launch and the run is not. The card of a slash launch is not saved with the session, so a resumed transcript keeps a one line notice of what the run came to instead.

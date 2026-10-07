@@ -20,7 +20,7 @@ use tracing::warn;
 
 use super::{
     Delivery, PeerHost, PeerSession, PolicyHold, Route, Sender, SessionInner, SessionState,
-    WireMode, lock, policy_hold, same_cohort, valid_handle, wall_ms,
+    WireMode, WorkCursor, WorkReported, lock, policy_hold, same_cohort, valid_handle, wall_ms,
 };
 use crate::{AgentMode, DoneReason};
 
@@ -32,6 +32,8 @@ const HEARTBEAT: Duration = Duration::from_secs(20);
 const WORK_POLL: Duration = Duration::from_secs(3);
 const MAX_OWNED: usize = 16;
 const MAX_NOTICES: usize = 16;
+/// Outcomes kept for a runtime that takes them; older ones give way.
+const MAX_REPORTS: usize = 64;
 pub const INVALID_GROUP: &str = "Consumer group names use 1 to 32 lowercase letters, digits, and hyphens, starting with a letter or digit";
 pub const TOO_MANY_MEMBERSHIPS: &str = "A session joins at most 8 consumer groups";
 pub const NOT_MEMBER: &str = "This session is not a member of that consumer group";
@@ -39,9 +41,9 @@ pub const INVALID_OUTCOME: &str = "A work outcome needs at most 4 KiB of text";
 pub const COMPLETION_REQUIRED: &str =
     "Completion required: the turn ended without reporting an outcome";
 pub const PAUSED_BY_CANCEL: &str = "The user cancelled the turn working on it";
-const TURN_LIMIT: &str = "The turn working on it reached its turn limit";
-const TURN_FAILED: &str = "The turn working on it failed";
-const SESSION_CLOSED: &str = "Its session closed while working on it";
+pub(super) const TURN_LIMIT: &str = "The turn working on it reached its turn limit";
+pub(super) const TURN_FAILED: &str = "The turn working on it failed";
+pub(super) const SESSION_CLOSED: &str = "Its session closed while working on it";
 const PAUSE_UNCONFIRMED: &str = "Could not record the pause of work";
 
 /// How far this registration's assignment has come.
@@ -72,6 +74,7 @@ pub(super) struct OwnedWork {
 pub(super) struct Assignments {
     owned: Option<OwnedWork>,
     notices: VecDeque<WorkNotice>,
+    reports: VecDeque<WorkReported>,
     acquiring: bool,
     polled: Option<Instant>,
 }
@@ -242,6 +245,13 @@ impl Assignments {
         }
         self.notices.push_back(WorkNotice { text, stop });
     }
+
+    fn record(&mut self, report: WorkReported) {
+        if self.reports.len() == MAX_REPORTS {
+            self.reports.pop_front();
+        }
+        self.reports.push_back(report);
+    }
 }
 
 impl SessionState {
@@ -321,7 +331,10 @@ impl SessionState {
         if busy {
             work.stage = Stage::Pausing(SESSION_CLOSED);
         } else {
+            let group = work.item.group.clone();
             self.work.owned = None;
+            self.work
+                .record(WorkReported::paused(group, name.clone(), SESSION_CLOSED));
         }
         self.history.report(move |log| {
             log.pause_work(&name, &token, !busy, SESSION_CLOSED, wall_ms())
@@ -624,16 +637,18 @@ impl PeerSession {
             .history
             .decide(move |log| log.finish_work(&name, &fence, &outcome, wall_ms()))
             .await?;
-        if let Some(token) = token {
-            let mut state = lock(&self.0.state);
-            if state.work.owns(&token) {
-                state.work.owned = None;
-                self.0.host.changed.notify(usize::MAX);
-            }
+        let mut state = lock(&self.0.state);
+        if let Some(token) = token
+            && state.work.owns(&token)
+        {
+            state.work.owned = None;
+            self.0.host.changed.notify(usize::MAX);
         }
-        reported
-            .map(|item| AssignedWork::from(&item))
-            .map_err(|refusal| refusal.to_string())
+        let item = reported.map_err(|refusal| refusal.to_string())?;
+        if let Some(report) = WorkReported::reported(&item) {
+            state.work.record(report);
+        }
+        Ok(AssignedWork::from(&item))
     }
 
     /// The work a turn of this session took in, then the paused work it last
@@ -716,12 +731,13 @@ impl PeerSession {
             .filter(|work| work.stage != Stage::Offered)
             .map(|work| {
                 (
+                    work.item.group.clone(),
                     work.item.name.clone(),
                     work.token.clone(),
                     pause_reason(&work.stage, ending),
                 )
             });
-        let Some((name, token, reason)) = taken else {
+        let Some((group, name, token, reason)) = taken else {
             return;
         };
         let pause = {
@@ -737,7 +753,12 @@ impl PeerSession {
             state.work.owned = None;
         }
         let text = match pause {
-            Ok(Ok(_)) => format!("Paused work {name}: {reason}. /groups to retry or cancel it"),
+            Ok(Ok(_)) => {
+                state
+                    .work
+                    .record(WorkReported::paused(group, name.clone(), reason));
+                format!("Paused work {name}: {reason}. /groups to retry or cancel it")
+            }
             Ok(Err(refusal)) => refusal.to_string(),
             Err(error) => format!(
                 "{PAUSE_UNCONFIRMED} {name}: {error}; it returns to the queue once its lease lapses"
@@ -781,6 +802,47 @@ impl PeerSession {
         lock(&self.0.state).work.notices.drain(..).collect()
     }
 
+    /// What became of this session's group work since the last call, oldest
+    /// first.
+    pub fn take_work_reports(&self) -> Vec<WorkReported> {
+        lock(&self.0.state).work.reports.drain(..).collect()
+    }
+
+    /// The stamp of the latest change to any work item, where a cursor over
+    /// this session's published work starts.
+    pub async fn work_cursor(&self) -> Result<WorkCursor, String> {
+        self.0
+            .host
+            .history
+            .query(|log| log.last_work_change())
+            .await
+            .map(WorkCursor)
+    }
+
+    /// Up to `limit` items that this session's publications queued and that
+    /// changed after `after`, with their stamps, oldest change first. Two
+    /// changes between calls show as the item's latest state.
+    pub async fn published_work_since(
+        &self,
+        after: WorkCursor,
+        limit: usize,
+    ) -> Result<Vec<(WorkCursor, WorkItem)>, String> {
+        let filter = WorkFilter {
+            publisher: Some(self.session_id().to_string()),
+            ..WorkFilter::default()
+        };
+        let items = self
+            .0
+            .host
+            .history
+            .query(move |log| log.work_changed_after(&filter, after.0, limit))
+            .await?;
+        Ok(items
+            .into_iter()
+            .map(|item| (WorkCursor(item.changed), item))
+            .collect())
+    }
+
     /// Every consumer group, for a person choosing what to join.
     pub async fn consumer_groups(&self) -> Result<Vec<WorkGroup>, String> {
         self.0.host.history.query(|log| log.groups()).await
@@ -790,6 +852,7 @@ impl PeerSession {
     /// whichever member it was queued for.
     pub async fn manage_work(&self, work: &str, action: WorkAction) -> Result<ManagedWork, String> {
         let name = work.to_owned();
+        let held = action == WorkAction::Pause;
         let (item, repeats_claims) = self
             .0
             .host
@@ -803,7 +866,15 @@ impl PeerSession {
                 WorkAction::Cancel => Ok((log.cancel_work(&name, wall_ms())?, false)),
             })
             .await?;
-        lock(&self.0.state).work.polled = None;
+        let mut state = lock(&self.0.state);
+        state.work.polled = None;
+        if held && let Some(reason) = &item.reason {
+            state.work.record(WorkReported::paused(
+                item.group.clone(),
+                item.name.clone(),
+                reason,
+            ));
+        }
         Ok(ManagedWork {
             item: AssignedWork::from(&item),
             repeats_claims,
@@ -831,10 +902,12 @@ impl PeerHost {
 mod tests {
     use std::path::Path;
 
+    use caudra_automation::event::WorkOutcome as ReportedOutcome;
     use caudra_config::{InboundPolicy, MessagingConfig};
     use caudra_providers::{PeerAssignment, PeerAudience};
     use caudra_storage::messages::{
-        DEFAULT_MAX_ATTEMPTS, GroupPolicy, LEASE_MS, WorkItem, WorkOutcome, WorkState, Worker,
+        DEFAULT_MAX_ATTEMPTS, GroupPolicy, LEASE_MS, MAX_GROUPS, MAX_OUTSTANDING, MessageAudience,
+        NewMessage, WorkItem, WorkOutcome, WorkRefusal, WorkState, Worker,
     };
     use caudra_storage::sessions::StoredPeerControls;
     use tempfile::TempDir;
@@ -846,8 +919,12 @@ mod tests {
         check_memberships,
     };
     use crate::peers::script::tests::script;
-    use crate::peers::tests::{descriptor, directory, host};
-    use crate::peers::{PeerDescriptor, PeerHost, PeerSession, PolicyHold, lock, wall_ms};
+    use crate::peers::tests::{Recorder, descriptor, directory, host, observe};
+    use crate::peers::{
+        PeerDescriptor, PeerHost, PeerSession, PolicyHold, PublishReceipt, SendFailure,
+        SendFailureKind, SendOrigin, WorkCursor, WorkPause, WorkReported, lock, recipient_room,
+        token, wall_ms,
+    };
     use crate::{AgentMode, DoneReason};
 
     const GROUP: &str = "ci-triage";
@@ -865,6 +942,11 @@ mod tests {
     const LOST: &str = "Lost work";
     const RECOVERY: &str = "lease-recovery";
     const SCRIPT_LABEL: &str = "nightly-ci";
+    const AUTOMATION: &str = "nightly-digest";
+    const PAGE: usize = 8;
+    const SINGLE: usize = 1;
+    const SINGLE_BACKLOG: u32 = 1;
+    const BOTH_GROUPS: [&str; 2] = [GROUP, OTHER_GROUP];
 
     async fn grouped() -> (TempDir, PeerHost, PeerSession) {
         let directory = directory();
@@ -872,24 +954,19 @@ mod tests {
         let publisher = host
             .register(descriptor(directory.path(), InboundPolicy::Auto))
             .unwrap();
-        create_group(&publisher, GROUP).await;
+        create_group(&publisher, GROUP, GroupPolicy::default()).await;
         (directory, host, publisher)
     }
 
-    async fn create_group(session: &PeerSession, name: &str) {
+    async fn create_group(session: &PeerSession, name: &str, policy: GroupPolicy) {
         let name = name.to_owned();
         session
             .0
             .host
             .history
             .query(move |log| {
-                log.create_group(
-                    &name,
-                    &[PATTERN.to_owned()],
-                    &GroupPolicy::default(),
-                    wall_ms(),
-                )
-                .map(drop)
+                log.create_group(&name, &[PATTERN.to_owned()], &policy, wall_ms())
+                    .map(drop)
             })
             .await
             .unwrap();
@@ -1284,7 +1361,7 @@ mod tests {
                 .map(|index| format!("{OTHER_GROUP}-{index}"))
                 .collect();
             for name in &names {
-                create_group(&publisher, name).await;
+                create_group(&publisher, name, GroupPolicy::default()).await;
             }
             for name in &names[..MAX_MEMBERSHIPS] {
                 worker.join_group(name).await.unwrap();
@@ -1302,5 +1379,309 @@ mod tests {
             worker.join_group(GROUP).await.unwrap();
             assert!(worker.groups().iter().any(|group| group == GROUP));
         });
+    }
+
+    fn topic() -> PeerAudience {
+        PeerAudience::Topic {
+            topic: TOPIC.into(),
+        }
+    }
+
+    /// Publishes the `index`th of distinct messages as `origin` sends them.
+    async fn publish_as(
+        publisher: &PeerSession,
+        origin: &SendOrigin,
+        index: usize,
+    ) -> Result<PublishReceipt, SendFailure> {
+        let text = format!("{TEXT} {index}");
+        let request_id = format!("{REQUEST_ID}-{index}");
+        publisher
+            .publish_from(origin, topic(), &text, &request_id)
+            .await
+    }
+
+    fn names(page: &[(WorkCursor, WorkItem)]) -> Vec<&str> {
+        page.iter().map(|(_, item)| item.name.as_str()).collect()
+    }
+
+    #[test_case(InboundPolicy::Auto, false, true; "auto_in_cohort")]
+    #[test_case(InboundPolicy::Auto, true, false; "auto_elsewhere")]
+    #[test_case(InboundPolicy::Accept, true, true; "accept_elsewhere")]
+    fn members_judge_marked_publications_as_their_session(
+        inbound: InboundPolicy,
+        elsewhere: bool,
+        takes: bool,
+    ) {
+        smol::block_on(async {
+            let other = directory();
+            let (directory, host, publisher) = grouped().await;
+            let cwd = if elsewhere {
+                other.path()
+            } else {
+                directory.path()
+            };
+            let worker = member(&host, cwd, inbound);
+            let automation = SendOrigin::Automation(AUTOMATION.into());
+            publish_as(&publisher, &automation, 0).await.unwrap();
+            assert_eq!(worker.acquire_work().await.unwrap(), takes);
+            if takes {
+                let claim = worker.claim_wake().unwrap();
+                let origin = claim.messages()[0].peer_event.clone().unwrap();
+                assert_eq!(origin.automation.as_deref(), Some(AUTOMATION));
+            }
+        });
+    }
+
+    #[test]
+    fn group_work_never_reaches_the_observer() {
+        smol::block_on(async {
+            let (directory, host, publisher) = grouped().await;
+            let worker = member(&host, directory.path(), InboundPolicy::Auto);
+            let recorder = observe(&worker, Recorder::taking(AUTOMATION));
+            publish(&publisher).await;
+            assert!(worker.acquire_work().await.unwrap());
+            assert!(worker.claim_wake().is_some());
+            assert!(recorder.seen().is_empty());
+        });
+    }
+
+    #[test]
+    fn published_work_pages_by_change_and_holds_only_this_sessions_items() {
+        smol::block_on(async {
+            let (directory, host, publisher) = grouped().await;
+            let bystander = host
+                .register(descriptor(directory.path(), InboundPolicy::Auto))
+                .unwrap();
+            let start = publisher.work_cursor().await.unwrap();
+            let work = |receipt: PublishReceipt| receipt.queued[0].work.clone();
+            let first = work(
+                publish_as(&publisher, &SendOrigin::Session, 0)
+                    .await
+                    .unwrap(),
+            );
+            publish_as(&bystander, &SendOrigin::Session, 0)
+                .await
+                .unwrap();
+            let second = work(
+                publish_as(&publisher, &SendOrigin::Session, 1)
+                    .await
+                    .unwrap(),
+            );
+            let page = publisher.published_work_since(start, SINGLE).await.unwrap();
+            assert_eq!(names(&page), [first.as_str()]);
+            let rest = publisher
+                .published_work_since(page[0].0, PAGE)
+                .await
+                .unwrap();
+            assert_eq!(names(&rest), [second.as_str()]);
+            let latest = rest[0].0;
+            assert!(page[0].0 < latest);
+            let none = publisher.published_work_since(latest, PAGE).await.unwrap();
+            assert!(none.is_empty());
+            let worker = member(&host, directory.path(), InboundPolicy::Auto);
+            worker.claim_handle().unwrap();
+            assert!(worker.acquire_work().await.unwrap());
+            let changed = publisher.published_work_since(latest, PAGE).await.unwrap();
+            assert_eq!(names(&changed), [first.as_str()]);
+            let (cursor, item) = &changed[0];
+            assert!(*cursor > latest);
+            assert_eq!(publisher.work_cursor().await.unwrap(), *cursor);
+            assert_eq!(
+                (
+                    item.group.as_str(),
+                    &item.state,
+                    item.attempts,
+                    item.max_attempts
+                ),
+                (GROUP, &WorkState::Leased, 1, DEFAULT_MAX_ATTEMPTS)
+            );
+            assert_eq!(item.owner.as_ref().unwrap().handle, worker.handle());
+            assert_eq!(
+                item.message.message.audience,
+                MessageAudience::Topic(TOPIC.into())
+            );
+        });
+    }
+
+    /// How the turn that took work in ends, or what a person does to it.
+    enum Ending {
+        Turn(Option<DoneReason>),
+        Close,
+        Person,
+    }
+
+    #[test_case(Ending::Turn(Some(DoneReason::EndTurn)), WorkPause::CompletionRequired; "completion_required")]
+    #[test_case(Ending::Turn(Some(DoneReason::Cancelled)), WorkPause::Cancelled; "cancelled")]
+    #[test_case(Ending::Turn(Some(DoneReason::MaxTurns)), WorkPause::TurnLimit; "turn_limit")]
+    #[test_case(Ending::Turn(None), WorkPause::TurnFailed; "turn_failed")]
+    #[test_case(Ending::Close, WorkPause::SessionClosed; "session_closed")]
+    #[test_case(Ending::Person, WorkPause::Manual; "paused_by_a_person")]
+    fn work_reports_name_the_pause_that_stopped_the_work(ending: Ending, pause: WorkPause) {
+        smol::block_on(async {
+            let (directory, host, publisher) = grouped().await;
+            let worker = member(&host, directory.path(), InboundPolicy::Auto);
+            let work = publish(&publisher).await;
+            match ending {
+                Ending::Turn(done) => {
+                    start(&worker).await;
+                    worker.settle_work(done).await;
+                }
+                Ending::Close => {
+                    start(&worker).await;
+                    worker.close();
+                }
+                Ending::Person => {
+                    worker.manage_work(&work, WorkAction::Pause).await.unwrap();
+                }
+            }
+            let paused = WorkReported {
+                group: GROUP.into(),
+                work,
+                outcome: ReportedOutcome::Paused,
+                pause: Some(pause),
+                detail: None,
+            };
+            assert_eq!(worker.take_work_reports(), [paused]);
+            assert!(worker.take_work_reports().is_empty());
+        });
+    }
+
+    #[test_case(WorkOutcome::Completed(Some(SUMMARY.into())), ReportedOutcome::Completed, SUMMARY; "completed")]
+    #[test_case(WorkOutcome::Retry(FAILURE.into()), ReportedOutcome::Retry, FAILURE; "retried")]
+    #[test_case(WorkOutcome::Failed(FAILURE.into()), ReportedOutcome::Failed, FAILURE; "failed")]
+    fn work_reports_carry_the_outcome_the_agent_reported(
+        outcome: WorkOutcome,
+        reported: ReportedOutcome,
+        detail: &str,
+    ) {
+        smol::block_on(async {
+            let (directory, host, publisher) = grouped().await;
+            let worker = member(&host, directory.path(), InboundPolicy::Auto);
+            let work = publish(&publisher).await;
+            start(&worker).await;
+            worker.report_work(&work, outcome).await.unwrap();
+            let expected = WorkReported {
+                group: GROUP.into(),
+                work,
+                outcome: reported,
+                pause: None,
+                detail: Some(detail.into()),
+            };
+            assert_eq!(worker.take_work_reports(), [expected]);
+        });
+    }
+
+    /// What leaves consumer groups no room for a publication.
+    enum Full {
+        Backlog,
+        Outstanding,
+        Fanout,
+        Destinations,
+    }
+
+    /// Queues work in `GROUP` and `MAX_GROUPS - 1` more groups until one more
+    /// publication would exceed the outstanding limit.
+    async fn fill_outstanding(publisher: &PeerSession) {
+        for index in 1..MAX_GROUPS {
+            let name = format!("{OTHER_GROUP}-{index}");
+            create_group(publisher, &name, GroupPolicy::default()).await;
+        }
+        let sender = lock(&publisher.0.state)
+            .sender(&publisher.0.route, &SendOrigin::Session)
+            .history_entry();
+        let messages: Vec<NewMessage> = (0..MAX_OUTSTANDING / MAX_GROUPS)
+            .map(|_| NewMessage {
+                message_id: token().unwrap(),
+                audience: MessageAudience::Topic(TOPIC.into()),
+                sender: sender.clone(),
+                text: TEXT.into(),
+                reply_to: None,
+                created_ms: wall_ms(),
+            })
+            .collect();
+        publisher
+            .0
+            .host
+            .history
+            .query(move |log| {
+                messages.iter().try_for_each(|message| {
+                    log.record_publication(message, &[], usize::MAX).map(drop)
+                })
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn group_full(full: Full) -> (SendFailure, String) {
+        let directory = directory();
+        let host = host(directory.path());
+        let max_fanout = match full {
+            Full::Fanout | Full::Destinations => SINGLE,
+            Full::Backlog | Full::Outstanding => MessagingConfig::default().max_fanout,
+        };
+        let messaging = MessagingConfig {
+            max_fanout,
+            ..MessagingConfig::default()
+        };
+        let publisher = host
+            .register_with_controls(
+                descriptor(directory.path(), InboundPolicy::Auto),
+                &messaging,
+                None,
+            )
+            .unwrap();
+        let automation = SendOrigin::Automation(AUTOMATION.into());
+        let single_backlog = GroupPolicy {
+            max_backlog: SINGLE_BACKLOG,
+            ..GroupPolicy::default()
+        };
+        match full {
+            Full::Backlog => {
+                create_group(&publisher, GROUP, single_backlog).await;
+                publish_as(&publisher, &automation, 0).await.unwrap();
+                let failure = publish_as(&publisher, &automation, 1).await.unwrap_err();
+                (failure, WorkRefusal::BacklogFull(GROUP.into()).to_string())
+            }
+            Full::Outstanding => {
+                create_group(&publisher, GROUP, GroupPolicy::default()).await;
+                fill_outstanding(&publisher).await;
+                let failure = publish_as(&publisher, &automation, 0).await.unwrap_err();
+                (failure, WorkRefusal::OutstandingFull.to_string())
+            }
+            Full::Fanout => {
+                create_group(&publisher, GROUP, single_backlog).await;
+                publish_as(&publisher, &automation, 0).await.unwrap();
+                publish_as(&publisher, &automation, 1).await.unwrap_err();
+                create_group(&publisher, OTHER_GROUP, GroupPolicy::default()).await;
+                let failure = publish_as(&publisher, &automation, 1).await.unwrap_err();
+                let refusal = WorkRefusal::GroupFanout {
+                    groups: BOTH_GROUPS.len(),
+                    room: SINGLE,
+                };
+                (failure, refusal.to_string())
+            }
+            Full::Destinations => {
+                for group in BOTH_GROUPS {
+                    create_group(&publisher, group, GroupPolicy::default()).await;
+                }
+                let failure = publish_as(&publisher, &automation, 0).await.unwrap_err();
+                (
+                    failure,
+                    recipient_room(BOTH_GROUPS.len(), SINGLE).unwrap_err(),
+                )
+            }
+        }
+    }
+
+    #[test_case(Full::Backlog; "backlog_full")]
+    #[test_case(Full::Outstanding; "outstanding_full")]
+    #[test_case(Full::Fanout; "group_fanout")]
+    #[test_case(Full::Destinations; "more_groups_than_destinations")]
+    fn publications_consumer_groups_have_no_room_for_fail_as_group_full(full: Full) {
+        let (failure, reason) = smol::block_on(group_full(full));
+        assert_eq!(
+            (failure.kind, failure.reason),
+            (SendFailureKind::GroupFull, reason)
+        );
     }
 }

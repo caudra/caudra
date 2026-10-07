@@ -115,7 +115,9 @@ One-shot headless mode accepts the same form:
 caudra --print --prompt '/goal tests pass and cargo clippy is clean'
 ```
 
-Headless mode waits for tracked background agents before evaluating. An impossible condition, evaluator failure, continuation cap, or turn limit produces an error result."#;
+Headless mode waits for tracked background agents before evaluating. An impossible condition, evaluator failure, continuation cap, or turn limit produces an error result.
+
+An SDK stream session sets and watches its goal through control requests rather than a `/goal` prompt, and reports each evaluation and outcome as a `goal` system message. See [Goals](/docs/headless/#goals) in Headless Mode."#;
 
 const RESUMING: &str = r#"## Resuming after an interruption
 

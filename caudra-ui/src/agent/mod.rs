@@ -1,4 +1,5 @@
 mod agent_loop;
+mod automation;
 mod cancel_map;
 mod command_router;
 pub(crate) mod shared_queue;
@@ -11,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use caudra_agent::automation::workflows::Workflows;
 use caudra_agent::background::{BackgroundTasks, BackgroundTransition};
 use caudra_agent::context::{ContextKey, ContextStore};
 use caudra_agent::permissions::PermissionManager;
@@ -24,7 +26,10 @@ use caudra_agent::{
     McpConfigErrors, McpHandle, McpSnapshotReader, Nudge, SessionMailbox, SharedHistory,
     SubagentHistoryStore, ToolOutputLines,
 };
-use caudra_config::ModelPolicy;
+use caudra_automation::event::SessionView;
+use caudra_automation::request::ProfileArming;
+use caudra_automation::snapshot::AutomationEvent;
+use caudra_config::{AutomationsConfig, ModelPolicy};
 use caudra_lua::EventHandle;
 use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
@@ -34,6 +39,7 @@ use caudra_storage::sessions::SessionLease;
 use caudra_storage::tool_outputs::ToolOutputStore;
 use caudra_workspace::WorkspaceSession;
 use futures_lite::future;
+use jiff::Timestamp;
 
 use self::cancel_map::new_run_cancel_map;
 use caudra_providers::provider::Provider;
@@ -42,6 +48,7 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::app::App;
+use crate::app::automation::AutomationLink;
 use crate::app::background_delivery::DeliveryFence;
 use crate::app::file_revert::RecorderSlot;
 
@@ -49,6 +56,7 @@ use self::agent_loop::AgentLoop;
 pub(crate) use self::agent_loop::ToolsPreviewSource;
 #[cfg(test)]
 pub(crate) use self::agent_loop::tests::tools_preview_source;
+use self::automation::{AutomationSession, AutomationSpawn};
 use self::command_router::spawn_command_router;
 pub(crate) use self::shared_queue::{QueueSender, QueuedMessage};
 pub(crate) use self::workflow::SharedMode;
@@ -131,6 +139,9 @@ pub(crate) struct AgentHandles {
     /// Session-lifetime: `respawn` carries it over untouched and only a change
     /// of session id replaces it.
     workflow: Option<WorkflowSession>,
+    /// Session-lifetime like `workflow`, but started once the app exists, by
+    /// [`Self::start_automations`]: its launch facts come from the app.
+    automation: Option<AutomationSession>,
     pub(crate) background: Option<BackgroundTasks>,
     delivery_fence: Arc<DeliveryFence>,
     background_enabled: bool,
@@ -235,9 +246,12 @@ impl AgentHandles {
         self.workflow.as_ref().map(WorkflowSession::handle)
     }
 
-    /// Interrupts every run of this session and waits for the runtime to
+    /// Interrupts every run of this session and waits for the runtimes to
     /// close. Idempotent, so exit can call it ahead of the agent join.
+    /// Automations stop first, so no firing starts during the teardown and no
+    /// run it interrupts reaches them.
     pub(crate) fn shutdown_workflow(&mut self) {
+        self.shutdown_automations();
         if let Some(background) = self.background.take()
             && let Err(error) = smol::block_on(background.shutdown())
         {
@@ -246,6 +260,79 @@ impl AgentHandles {
         if let Some(workflow) = self.workflow.take() {
             workflow.shutdown();
         }
+    }
+
+    /// The app keeps its handle, whose mirror holds the final counters for
+    /// the save that follows.
+    fn shutdown_automations(&mut self) {
+        if let Some(automation) = self.automation.take() {
+            automation.shutdown();
+        }
+    }
+
+    /// Starts this session's automation runtime unless one already serves
+    /// it, and points the app at it. Only the session focused at launch
+    /// takes the CLI's `cli` entries.
+    pub(crate) fn start_automations(
+        &mut self,
+        app: &mut App,
+        config: &AutomationsConfig,
+        cli: Vec<ProfileArming>,
+    ) {
+        if self.automation.is_some() {
+            return;
+        }
+        let facts = app.automation_facts(false, None, Timestamp::now().as_second());
+        self.automation =
+            AutomationSession::spawn(self.automation_spawn(app, config, cli, facts.clone()));
+        app.automation = self
+            .automation
+            .as_ref()
+            .map_or_else(AutomationLink::default, |automation| {
+                AutomationLink::new(automation.handle(), facts)
+            });
+    }
+
+    /// What this session's automation runtime starts from. It reaches the
+    /// session's workflow runtime only while one runs, which `respawn` keeps
+    /// true by restarting the automations whenever that runtime changes.
+    fn automation_spawn<'a>(
+        &'a self,
+        app: &'a App,
+        config: &AutomationsConfig,
+        cli: Vec<ProfileArming>,
+        facts: SessionView,
+    ) -> AutomationSpawn<'a> {
+        AutomationSpawn {
+            state_dir: app.storage.clone(),
+            session_id: app.state.session.id,
+            workspace_session: self.workspace_session.as_ref(),
+            sandbox: app
+                .state
+                .session
+                .workspace_binding()
+                .is_some_and(|binding| binding.sandbox_record().is_some()),
+            project_cwd: app.permissions.project_cwd(),
+            features: app.features,
+            config: config.clone(),
+            controls: app.state.session.meta.automations.clone(),
+            profile: app.state.system_prompt_profile.as_deref(),
+            cli,
+            facts,
+            workflows: self
+                .workflow_handle()
+                .map(|handle| Arc::new(handle) as Arc<dyn Workflows>),
+        }
+    }
+
+    pub(crate) fn automation_events(&self) -> Option<&flume::Receiver<AutomationEvent>> {
+        self.automation.as_ref().map(AutomationSession::events)
+    }
+
+    pub(crate) fn mailbox_wake_pending(&self) -> bool {
+        self.mailbox
+            .as_ref()
+            .is_some_and(SessionMailbox::wake_pending)
     }
 
     pub(crate) fn mcp_reader(&self) -> McpSnapshotReader {
@@ -311,7 +398,8 @@ impl AgentHandles {
         }
     }
 
-    pub(crate) fn cancel(self) {
+    pub(crate) fn cancel(mut self) {
+        self.shutdown_automations();
         let _ = self.cmd_tx.try_send(AgentCommand::CancelAll);
     }
 
@@ -381,6 +469,27 @@ impl AgentHandles {
             self.subagent_history.clone()
         } else {
             stored_subagent_history(&app.state.session)
+        };
+        // Automations stop before anything below is torn down. They hold the
+        // workflow runtime they started with, so they follow it as well as the
+        // session, and `start_automations` gives the next ones the new handle.
+        let workflow_kept = self
+            .workflow
+            .as_ref()
+            .is_some_and(|current| current.session_id() == app.state.session.id);
+        let automation = match self.automation.take() {
+            Some(current)
+                if current.session_id() == app.state.session.id
+                    && (workflow_kept || self.workflow.is_none()) =>
+            {
+                Some(current)
+            }
+            stale => {
+                if let Some(stale) = stale {
+                    retire_automations(stale, app);
+                }
+                None
+            }
         };
         let background = if same_session && self.background.is_some() {
             self.background.clone()
@@ -464,6 +573,13 @@ impl AgentHandles {
             self.local_documents.clone(),
         );
         let old = mem::replace(self, new);
+        self.automation = match automation {
+            Some(started_without) if !workflow_kept && self.workflow.is_some() => {
+                retire_automations(started_without, app);
+                None
+            }
+            kept => kept,
+        };
         // Repoint the app at the new queue before dropping `old`, otherwise the app keeps
         // the last old `QueueSender` alive and the old loop parks in `recv_notify` forever.
         if same_session {
@@ -519,6 +635,13 @@ pub(crate) fn join_all(tasks: Vec<smol::Task<()>>, timeout: Duration) -> bool {
         }
         finished
     })
+}
+
+/// Stops a runtime `respawn` will not carry over, so the app cannot reach it
+/// if the next one fails to start.
+fn retire_automations(automation: AutomationSession, app: &mut App) {
+    automation.shutdown();
+    app.automation = AutomationLink::default();
 }
 
 /// Where a new agent generation gets its workflow runtime from.
@@ -724,6 +847,7 @@ fn spawn_agent_internal(
         prompt_profiles,
         mailbox,
         workflow,
+        automation: None,
         background,
         background_enabled,
         delivery_fence,
@@ -857,7 +981,14 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Instant;
 
+    use caudra_agent::automation::manager::RuntimeDeps;
+    use caudra_agent::automation::store::AutomationStore;
+    use caudra_agent::automation::testing::AutomationFixture;
+    use caudra_agent::automation::workflows::NO_WORKFLOWS;
     use caudra_agent::{AgentEvent, AgentInput, PromptAdmission};
+    use caudra_automation::host::{Failure, FailureKind};
+    use caudra_automation::request::{AutomationRequest, AutomationResponse};
+    use caudra_automation::snapshot::{ActionRow, ActionStatus, AutomationState};
     use caudra_config::{Feature, FeatureFlags, PermissionsConfig};
     use caudra_providers::provider::BoxFuture;
     use caudra_providers::{
@@ -886,6 +1017,21 @@ mod tests {
     const ROUTE_REQUEST_MISSING: &str = "runtime did not request the expected model route";
     const REVIEW_WORKFLOW: &str = "review-changes";
     const WORKFLOW_BUDGET: u32 = 1;
+    const STARTER: &str = "starter";
+    const STARTER_FIELDS: &str = r#"triggers: [#{ kind: "armed" }], workflows: ["review-changes"]"#;
+    const START_BODY: &str =
+        r#"start_workflow("review-changes", #{ scope: "main" }, #{ agent_budget: 1 });"#;
+    const WATCHER: &str = "watcher";
+    const WATCHER_FIELDS: &str = r#"triggers: [#{ kind: "workflow_finished", workflows: ["review-changes"], statuses: ["interrupted"] }]"#;
+    const WATCHER_BODY: &str = r#"notify("interrupted");"#;
+    const FIRING_LIMIT: usize = 16;
+    const AUTOMATIONS_ON: &str = "the app enables automations";
+    const AUTOMATIONS_STARTED: &str = "the automation runtime started";
+    const AUTOMATION_EVENTS_STOPPED: &str = "the automation runtime stopped publishing";
+    const ONE_ACTION: &str = "the firing made one call";
+    const RUN_REACHED: &str = "the start reached the session's workflow runtime";
+    const NO_FIRING_FOR_TEARDOWN: &str =
+        "a run interrupted by the shutdown must not reach automations that are going away";
 
     struct StubProvider(Option<flume::Sender<String>>);
 
@@ -1348,6 +1494,172 @@ mod tests {
             caudra_providers::HistoryItemKind::User { text, .. }
                 if text == RESUMED_HISTORY_TEXT
         ));
+    }
+
+    /// An app with automations and workflows on, whose session has its record,
+    /// and its handles, with a workflow runtime when `workflows`.
+    fn automated_session(workflows: bool) -> (App, AgentHandles, AutomationFixture) {
+        let mut app = crate::app::tests::test_app();
+        app.features = FeatureFlags::all();
+        Arc::make_mut(&mut app.state.session)
+            .save(&app.storage)
+            .unwrap();
+        let (handles, _, permissions) = stub_spawn_with_session(
+            Vec::new(),
+            Some(SessionRef::from(app.state.session.id)),
+            None,
+            workflows.then(|| app.storage.clone()),
+        );
+        permissions.set_session_mode(Some(PermissionMode::Yolo));
+        (app, handles, AutomationFixture::default())
+    }
+
+    /// The runtime `start_automations` would start, arming `script` from the
+    /// command line, with the fixture's user scripts in place of the user's.
+    fn start_automations_with(
+        handles: &mut AgentHandles,
+        app: &App,
+        fixture: &AutomationFixture,
+        script: &str,
+    ) {
+        let cli = vec![ProfileArming {
+            name: script.to_owned(),
+            args: None,
+        }];
+        let facts = app.automation_facts(false, None, 0);
+        let deps = handles
+            .automation_spawn(app, &AutomationsConfig::default(), cli, facts)
+            .deps()
+            .expect(AUTOMATIONS_ON);
+        handles.automation = AutomationSession::start(RuntimeDeps {
+            user_config_dir: fixture.deps(app.state.session.id, &[]).user_config_dir,
+            ..deps
+        });
+        assert!(handles.automation.is_some(), "{AUTOMATIONS_STARTED}");
+    }
+
+    /// Reads the session's own event feed, which a second receiver would split.
+    fn automations_until(
+        handles: &AgentHandles,
+        ready: impl Fn(&AutomationState) -> bool,
+    ) -> Arc<AutomationState> {
+        let automation = handles.automation.as_ref().expect(AUTOMATIONS_STARTED);
+        loop {
+            let state = automation.handle().state();
+            if ready(&state) {
+                return state;
+            }
+            automation
+                .events()
+                .recv_timeout(LONG_TIMEOUT)
+                .expect(AUTOMATION_EVENTS_STOPPED);
+        }
+    }
+
+    fn only_action(handles: &AgentHandles, script: &str) -> ActionRow {
+        let state = automations_until(handles, |state| {
+            state
+                .recent
+                .iter()
+                .any(|firing| firing.automation == script && !firing.status.is_pending())
+        });
+        let fire_id = state.recent[0].fire_id.clone();
+        let automation = handles.automation.as_ref().expect(AUTOMATIONS_STARTED);
+        let Ok(AutomationResponse::Firing(detail)) = smol::block_on(
+            automation
+                .handle()
+                .request(AutomationRequest::Firing { fire_id }),
+        ) else {
+            panic!("{ONE_ACTION}");
+        };
+        detail.actions.into_iter().next().expect(ONE_ACTION)
+    }
+
+    #[test]
+    fn started_automations_start_runs_on_the_sessions_workflow_runtime() {
+        let (app, mut handles, fixture) = automated_session(true);
+        fixture.script(&fixture.user_scripts(), STARTER, STARTER_FIELDS, START_BODY);
+
+        start_automations_with(&mut handles, &app, &fixture, STARTER);
+        let action = only_action(&handles, STARTER);
+
+        assert_eq!(action.status, ActionStatus::Done, "{:?}", action.error);
+        let run_id = action.target.expect(RUN_REACHED);
+        assert!(
+            handles
+                .workflow_handle()
+                .expect(RUN_REACHED)
+                .state()
+                .runs
+                .iter()
+                .any(|run| run.run_id == run_id),
+            "{RUN_REACHED}"
+        );
+        handles.shutdown_workflow();
+        smol::block_on(handles.into_task().cancel());
+    }
+
+    #[test]
+    fn without_a_workflow_runtime_a_start_is_unavailable() {
+        let (app, mut handles, fixture) = automated_session(false);
+        fixture.script(&fixture.user_scripts(), STARTER, STARTER_FIELDS, START_BODY);
+
+        start_automations_with(&mut handles, &app, &fixture, STARTER);
+        let action = only_action(&handles, STARTER);
+
+        assert_eq!(
+            (action.status, action.error),
+            (
+                ActionStatus::Failed,
+                Some(Failure::new(FailureKind::Unavailable, NO_WORKFLOWS).to_string())
+            )
+        );
+        handles.shutdown_workflow();
+        smol::block_on(handles.into_task().cancel());
+    }
+
+    /// The runs a shutdown interrupts settle as it closes the workflow
+    /// runtime, so a watcher that still ran would record a firing for each.
+    #[test]
+    fn automations_stop_before_the_shutdown_interrupts_their_runs() {
+        let (app, mut handles, fixture) = automated_session(true);
+        let (requests, received) = flume::unbounded();
+        handles.effective_model_slot.store(Arc::new(ModelSlot {
+            model: crate::components::test_model(),
+            provider: Arc::new(StubProvider(Some(requests))),
+        }));
+        fixture.script(
+            &fixture.user_scripts(),
+            WATCHER,
+            WATCHER_FIELDS,
+            WATCHER_BODY,
+        );
+        start_automations_with(&mut handles, &app, &fixture, WATCHER);
+        automations_until(&handles, |state| {
+            state
+                .find(WATCHER)
+                .is_some_and(|watcher| watcher.armed.is_some())
+        });
+        let response = smol::block_on(handles.workflow_handle().unwrap().request(
+            WorkflowRequest::Start(LaunchRequest {
+                name: REVIEW_WORKFLOW.into(),
+                args: serde_json::json!({"scope": PROBE_TEXT}),
+                agent_budget: Some(WORKFLOW_BUDGET),
+            }),
+        ))
+        .unwrap();
+        assert!(matches!(response, WorkflowResponse::Started(_)));
+        received
+            .recv_timeout(LONG_TIMEOUT)
+            .expect(ROUTE_REQUEST_MISSING);
+
+        handles.shutdown_workflow();
+
+        let store = AutomationStore::spawn(app.storage.clone(), app.state.session.id).unwrap();
+        let firings = smol::block_on(store.load_firings(Some(WATCHER.into()), FIRING_LIMIT));
+        smol::block_on(store.shutdown());
+        assert_eq!(firings.unwrap(), [], "{NO_FIRING_FOR_TEARDOWN}");
+        smol::block_on(handles.into_task().cancel());
     }
 
     #[test]

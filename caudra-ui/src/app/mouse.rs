@@ -342,6 +342,20 @@ impl App {
             ) {
                 return actions;
             }
+        } else if self.automation_inspector.is_open() {
+            if let Some(actions) = self.route_overlay_mouse(
+                event,
+                |app, event| {
+                    app.automation_inspector
+                        .handle_mouse(event, app.workflow.runs())
+                },
+                |app, action| {
+                    app.handle_automation_action(action);
+                    Vec::new()
+                },
+            ) {
+                return actions;
+            }
         } else if self.mcp_picker.is_open() {
             if let Some(actions) = self.route_overlay_mouse(
                 event,
@@ -765,6 +779,13 @@ impl App {
                                 && let Some(path) = self.chats[0].memory_hit_at(event.row, area)
                             {
                                 self.open_memory_note(&path);
+                                return Vec::new();
+                            }
+                            if self.active_chat == 0
+                                && let Some(origin) =
+                                    self.chats[0].automation_hit_at(event.row, area)
+                            {
+                                self.open_automation_inspector(Some(&origin.fire_id));
                                 return Vec::new();
                             }
                             if self.active_chat == 0
@@ -1196,6 +1217,11 @@ impl App {
                 self.clear_control_hovers();
                 self.execute_workflow("")
             }
+            StatusBarHitTarget::Automations => {
+                self.clear_control_hovers();
+                self.open_automation_inspector(None);
+                Vec::new()
+            }
             StatusBarHitTarget::Sandbox => {
                 self.clear_control_hovers();
                 self.open_sandbox("");
@@ -1371,6 +1397,7 @@ impl App {
         dismiss!(self.memory_picker);
         dismiss!(self.workflow_inspector);
         dismiss!(self.workflow_catalog_picker);
+        dismiss!(self.automation_inspector);
         dismiss!(self.task_picker, {
             let action = self.task_picker.cancel();
             self.handle_task_picker_action(action)

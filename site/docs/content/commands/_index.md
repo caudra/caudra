@@ -44,6 +44,7 @@ A command with an Experiment entry exists only while that switch is on under `[e
 | `/deep-research` | Research a question with the deep-research workflow | Main only | `workflows` |
 | `/review-changes` | Review a change from independent angles with the review-changes workflow | Main only | `workflows` |
 | `/root-cause` | Diagnose a failure with the root-cause workflow | Main only | `workflows` |
+| `/automations` | Inspect, trust, and pause automations (arm NAME [{json}] \| disarm NAME) | Main only | `automations` |
 | `/sessions` | Browse and switch sessions |  |  |
 | `/rename` | Rename the current session |  |  |
 | `/model` | Switch chat model or assign job models | Main only |  |
@@ -178,6 +179,8 @@ caudra --print --prompt '/goal tests pass and cargo clippy is clean'
 ```
 
 Headless mode waits for tracked background agents before evaluating. An impossible condition, evaluator failure, continuation cap, or turn limit produces an error result.
+
+An SDK stream session sets and watches its goal through control requests rather than a `/goal` prompt, and reports each evaluation and outcome as a `goal` system message. See [Goals](/docs/headless/#goals) in Headless Mode.
 
 ## Context window
 

@@ -38,18 +38,25 @@ const LEASE_EXPIRED: &str = "Its worker stopped renewing the lease";
 const NO_ATTEMPTS_LEFT: &str = "no attempts are left";
 const ORPHANED_PAUSE: &str = "Its worker stopped responding while pausing it";
 const CANCELLED_BY_USER: &str = "Cancelled by the user";
-const PAUSED_BY_USER: &str = "Paused by the user";
+/// The reason of an item a person took out of the queue.
+pub const PAUSED_BY_USER: &str = "Paused by the user";
 const ATTEMPT_COMPLETED: &str = "completed";
 const ATTEMPT_RETRIED: &str = "retried";
 const ATTEMPT_FAILED: &str = "failed";
 const ATTEMPT_PAUSED: &str = "paused";
 const ATTEMPT_EXPIRED: &str = "expired";
-const FIRST_WORK_COLUMN: usize = 15;
+const FIRST_WORK_COLUMN: usize = 16;
 const WORK_COLUMNS: &str = "w.id, w.name, g.name, w.state, w.attempts, g.max_attempts, \
     w.available_ms, w.owner_session, w.owner_name, w.owner_handle, w.lease_until_ms, w.reason, \
-    w.result, w.created_ms, w.updated_ms";
+    w.result, w.created_ms, w.updated_ms, w.changed";
 const WORK_FROM: &str =
     "FROM group_work w JOIN work_groups g ON g.id = w.group_id JOIN messages m ON m.seq = w.seq";
+/// What a [`WorkFilter`] selects besides its publisher, over `?2` to `?4`.
+const WORK_FILTER: &str = "(?2 IS NULL OR g.name = ?2) AND (?3 IS NULL OR w.owner_session = ?3)
+    AND (?4 = '[]' OR w.state IN (SELECT value FROM json_each(?4)))";
+/// Narrows a work query to the publications of session `?5`, which
+/// `messages_publisher` finds.
+const PUBLISHER_FILTER: &str = "AND m.kind = 'topic' AND m.sender_session = ?5";
 const GROUP_COLUMNS: &str = "g.name, g.patterns, g.concurrency, g.max_attempts, g.max_backlog, \
     g.paused, g.created_ms, \
     COALESCE(SUM(w.state = 'pending'), 0), \
@@ -324,6 +331,9 @@ pub struct WorkItem {
     pub result: Option<String>,
     pub created_ms: u64,
     pub updated_ms: u64,
+    /// The stamp of the item's insert or latest state change. Every such
+    /// change in any group takes a larger one, and none is ever reused.
+    pub changed: u64,
     pub message: StoredMessage,
 }
 
@@ -370,6 +380,8 @@ pub struct WorkFilter {
     pub owner: Option<String>,
     /// Every state when empty.
     pub states: Vec<WorkState>,
+    /// The session whose publication queued the item.
+    pub publisher: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -550,21 +562,63 @@ impl MessageLog {
         before: Option<i64>,
         limit: usize,
     ) -> Result<Vec<WorkItem>, MessageLogError> {
+        self.filtered_work(
+            filter,
+            "w.id < ?1",
+            "w.id DESC",
+            before.unwrap_or(i64::MAX),
+            limit,
+        )
+    }
+
+    /// Up to `limit` items `filter` selects whose latest change took a stamp
+    /// after `after`, oldest change first.
+    pub fn work_changed_after(
+        &self,
+        filter: &WorkFilter,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<WorkItem>, MessageLogError> {
+        let after = i64::try_from(after).map_err(|_| MessageLogError::Invalid("stamp"))?;
+        self.filtered_work(filter, "w.changed > ?1", "w.changed", after, limit)
+    }
+
+    /// The newest stamp any insert or state change of work took.
+    pub fn last_work_change(&self) -> Result<u64, MessageLogError> {
+        Ok(self.database.connection().query_row(
+            "SELECT changed FROM work_change_clock WHERE id = 1",
+            [],
+            |row| row_u64(row, 0),
+        )?)
+    }
+
+    fn filtered_work(
+        &self,
+        filter: &WorkFilter,
+        cursor: &str,
+        order: &str,
+        position: i64,
+        limit: usize,
+    ) -> Result<Vec<WorkItem>, MessageLogError> {
         let limit = i64::try_from(limit).map_err(|_| MessageLogError::Invalid("limit"))?;
         let states: Vec<&str> = filter.states.iter().map(WorkState::as_str).collect();
+        let publisher = if filter.publisher.is_some() {
+            PUBLISHER_FILTER
+        } else {
+            ""
+        };
         let mut statement = self.database.connection().prepare(&format!(
             "SELECT {MESSAGE_COLUMNS}, {WORK_COLUMNS} {WORK_FROM}
-             WHERE w.id < ?1 AND (?2 IS NULL OR g.name = ?2)
-               AND (?3 IS NULL OR w.owner_session = ?3)
-               AND (?4 = '[]' OR w.state IN (SELECT value FROM json_each(?4)))
-             ORDER BY w.id DESC LIMIT ?5"
+             WHERE {cursor} AND {WORK_FILTER} {publisher}
+             ORDER BY {order} LIMIT ?6"
         ))?;
         let items = statement.query_map(
             params![
-                before.unwrap_or(i64::MAX),
+                position,
                 filter.group,
                 filter.owner,
                 json_list(&states, "states")?,
+                filter.publisher,
                 limit
             ],
             work_row,
@@ -708,6 +762,11 @@ impl MessageLog {
              SELECT ?1, COALESCE(MAX(attempt), 0) + 1, ?2, ?3, ?4, ?5
              FROM work_attempts WHERE work_id = ?1",
             params![work.id, worker.session, worker.name, worker.handle, now],
+        )?;
+        work.changed = transaction.query_row(
+            "SELECT changed FROM group_work WHERE id = ?1",
+            [work.id],
+            |row| row_u64(row, 0),
         )?;
         transaction.commit()?;
         work.state = WorkState::Leased;
@@ -1266,6 +1325,7 @@ fn work_row(row: &Row<'_>) -> rusqlite::Result<WorkItem> {
         result: row.get(column(12))?,
         created_ms: row_u64(row, column(13))?,
         updated_ms: row_u64(row, column(14))?,
+        changed: row_u64(row, column(15))?,
         message: stored_message(row)?,
     })
 }
@@ -1323,6 +1383,7 @@ mod tests {
     const INVALID_PATTERN_TEXT: &str = "CI..failures";
     const ROUTE: &str = "host:session:generation";
     const PUBLISHER: &str = "publisher-session";
+    const OTHER_PUBLISHER: &str = "other-publisher-session";
     const WORKER: &str = "worker-session";
     const OTHER_WORKER: &str = "other-worker-session";
     const TEXT: &str = "Review the change";
@@ -1361,6 +1422,7 @@ mod tests {
                 mode: "build".into(),
                 permission: "ask".into(),
                 external: false,
+                automation: None,
             },
             text: TEXT.into(),
             reply_to: None,
@@ -2102,5 +2164,79 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn every_insert_and_state_change_takes_a_new_larger_stamp_across_reopens() {
+        let (_root, state, mut log) = fixture();
+        group(&mut log, &GroupPolicy::default());
+        let name = publish(&mut log, "a").remove(0);
+        let stamp = |log: &MessageLog, name: &str| log.work_item(name).unwrap().changed;
+        let queued = stamp(&log, &name);
+        let assignment = claim(&mut log, WORKER, NOW_MS).unwrap();
+        let claimed = stamp(&log, &name);
+        log.renew_work(&name, &assignment.token, NOW_MS).unwrap();
+        let renewed = stamp(&log, &name);
+        log.finish_work(
+            &name,
+            &lease(&assignment),
+            &WorkOutcome::Completed(None),
+            NOW_MS,
+        )
+        .unwrap();
+        let completed = stamp(&log, &name);
+        assert_eq!(log.last_work_change().unwrap(), completed);
+        log.delete_group(GROUP).unwrap();
+        drop(log);
+
+        let mut reopened = MessageLog::open(&state, &retention(), NOW_MS).unwrap();
+        group(&mut reopened, &GroupPolicy::default());
+        let later = publish(&mut reopened, "b").remove(0);
+        let republished = stamp(&reopened, &later);
+
+        assert!(queued < claimed);
+        assert_eq!(assignment.work.changed, claimed);
+        assert_eq!(renewed, claimed);
+        assert!(claimed < completed);
+        assert!(completed < republished);
+        assert_eq!(reopened.last_work_change().unwrap(), republished);
+    }
+
+    #[test]
+    fn changed_work_filters_by_publisher_and_pages_by_stamp() {
+        let (_root, _state, mut log) = fixture();
+        group(&mut log, &GroupPolicy::default());
+        let mine: Vec<String> = ["a", "b", "c"]
+            .into_iter()
+            .flat_map(|id| publish(&mut log, id))
+            .collect();
+        log.record_publication(
+            &message("d", MessageAudience::Topic(TOPIC.into()), OTHER_PUBLISHER),
+            &[],
+            usize::MAX,
+        )
+        .unwrap();
+        claim(&mut log, WORKER, NOW_MS).unwrap();
+        let filter = WorkFilter {
+            publisher: Some(PUBLISHER.into()),
+            ..WorkFilter::default()
+        };
+
+        let mut paged = Vec::new();
+        let mut after = 0;
+        while let Some(item) = log.work_changed_after(&filter, after, 1).unwrap().pop() {
+            after = item.changed;
+            paged.push(item.name);
+        }
+
+        assert_eq!(
+            paged,
+            [mine[1].as_str(), mine[2].as_str(), mine[0].as_str()]
+        );
+        let every = log
+            .work_changed_after(&WorkFilter::default(), 0, PAGE)
+            .unwrap();
+        assert_eq!(every.len(), mine.len() + 1);
+        assert!(every.is_sorted_by(|older, newer| older.changed < newer.changed));
     }
 }

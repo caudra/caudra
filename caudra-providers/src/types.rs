@@ -53,6 +53,7 @@ so check before repeating any.";
 const WORK_ASSIGNMENT_FOOTER: &str = "</work-assignment>";
 pub const PEER_SESSION_SENDER: &str = "session";
 pub const PEER_SCRIPT_SENDER: &str = "script";
+pub const PEER_AUTOMATION_SENDER: &str = "automation";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageMediaType {
@@ -335,6 +336,15 @@ pub struct WorkflowEventOrigin {
     pub revision: u64,
 }
 
+/// The automation firing that queued a message, and the message's place
+/// among those the firing queued.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AutomationEventOrigin {
+    pub automation: String,
+    pub fire_id: String,
+    pub seq: u32,
+}
+
 /// Who a peer message was addressed to.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -394,6 +404,9 @@ pub struct PeerMessageOrigin {
     /// nothing can reply to.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub external: bool,
+    /// The automation that sent the message on its session's behalf.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignment: Option<PeerAssignment>,
 }
@@ -412,6 +425,8 @@ impl PeerMessageOrigin {
     pub fn sender_kind(&self) -> &'static str {
         if self.external {
             PEER_SCRIPT_SENDER
+        } else if self.automation.is_some() {
+            PEER_AUTOMATION_SENDER
         } else {
             PEER_SESSION_SENDER
         }
@@ -453,6 +468,8 @@ pub struct Message {
     pub task_event: Option<TaskEventOrigin>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_event: Option<WorkflowEventOrigin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automation_event: Option<AutomationEventOrigin>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_event: Option<PeerMessageOrigin>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -540,13 +557,26 @@ impl Message {
         }
     }
 
+    pub fn automation_observation(text: String, origin: AutomationEventOrigin) -> Self {
+        Self {
+            automation_event: Some(origin),
+            ..Self::observation(text)
+        }
+    }
+
     pub fn peer_observation(text: String, origin: PeerMessageOrigin) -> Self {
+        let automation = origin
+            .automation
+            .as_ref()
+            .map(|automation| format!("sender_automation: {}\n", peer_literal(json!(automation))))
+            .unwrap_or_default();
         let mut framed = format!(
             "{PEER_MESSAGE_HEADER}\n\
              message_id: {}\n\
              audience: {}\n\
              topic: {}\n\
              sender_kind: {}\n\
+             {automation}\
              sender_name: {}\n\
              reply_target: {}\n\
              reply_to: {}\n\
@@ -1398,8 +1428,8 @@ mod tests {
     use super::*;
     use crate::model::ThinkingSupport as Support;
     use crate::providers::test_support::{
-        PEER_ATTACK, PEER_TEXT, assert_peer_framing, assigned_message_origin, peer_message_origin,
-        script_message_origin,
+        PEER_ATTACK, PEER_TEXT, assert_peer_framing, assigned_message_origin,
+        automation_message_origin, peer_message_origin, script_message_origin,
     };
     use test_case::test_case;
 
@@ -1420,6 +1450,7 @@ mod tests {
             reply_target: PEER_ATTACK.into(),
             reply_to: Some(PEER_ATTACK.into()),
             external: false,
+            automation: Some(PEER_ATTACK.into()),
             assignment: None,
         }
     }
@@ -1437,6 +1468,7 @@ mod tests {
     #[test_case(PEER_ATTACK, peer_message_origin ; "host_markers_and_terminal_escapes")]
     #[test_case(PEER_ATTACK, hostile_origin ; "adversarial_labels")]
     #[test_case(PEER_ATTACK, script_message_origin ; "script_sender")]
+    #[test_case(PEER_ATTACK, automation_message_origin ; "automation_sender")]
     #[test_case(PEER_ATTACK, assigned_message_origin ; "work_assignment")]
     #[test_case("", peer_message_origin ; "empty_body")]
     fn peer_observation_quotes_data_without_granting_authority(
@@ -1458,6 +1490,7 @@ mod tests {
     #[test_case(peer_message_origin, &["sender_handle", "audience"] ; "named_topic_reply")]
     #[test_case(direct_origin, &[] ; "unnamed_direct_message")]
     #[test_case(script_message_origin, &["audience", "external"] ; "script_topic_message")]
+    #[test_case(automation_message_origin, &["sender_handle", "audience", "automation"] ; "automation_topic_message")]
     #[test_case(assigned_message_origin, &["audience", "external", "assignment"] ; "assigned_topic_message")]
     fn peer_observation_serde_preserves_provenance(
         origin: fn() -> PeerMessageOrigin,
@@ -1467,7 +1500,13 @@ mod tests {
         let message = Message::peer_observation(PEER_TEXT.into(), origin.clone());
         let encoded = serde_json::to_value(&message).unwrap();
         assert_eq!(encoded["peer_event"], json!(origin));
-        for field in ["sender_handle", "audience", "external", "assignment"] {
+        for field in [
+            "sender_handle",
+            "audience",
+            "external",
+            "automation",
+            "assignment",
+        ] {
             assert_eq!(
                 encoded["peer_event"].get(field).is_some(),
                 present.contains(&field)

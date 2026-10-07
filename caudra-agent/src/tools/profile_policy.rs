@@ -248,7 +248,7 @@ pub fn tool_available(
         return local_decision(name, local, &filter, &ctx.profile_tool_policy).available();
     }
     if let Some(entry) = registry.get(name) {
-        if super::feature_exclusions(ctx.config.features).contains(&name)
+        if super::feature_exclusions(ctx.config.features).any(|excluded| excluded == name)
             || (name == super::TASK_TOOL_NAME
                 && effective_task_execution(&ctx.config, ctx.background.is_some()).is_none())
             || (name == super::SHELL_TOOL_NAME
@@ -431,6 +431,7 @@ mod tests {
     }
 
     #[test_case("workflow", false; "feature_off")]
+    #[test_case("automation", false; "automations_off")]
     #[test_case("shell", false; "async_without_scope")]
     #[test_case("shell", true; "sync_without_scope")]
     fn profile_cannot_enable_absent_runtime(name: &'static str, sync: bool) {
