@@ -3,8 +3,6 @@
 //! owner-only and appear whole or not at all. Every operation that writes or collects takes the
 //! store lock, so several processes can share one store.
 
-#[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 #[cfg(test)]
 use std::sync::{
     Mutex, PoisonError,
@@ -14,8 +12,12 @@ use std::{
     fs::{self, File, Metadata, OpenOptions},
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
-    thread,
     time::{Duration, Instant, SystemTime},
+};
+#[cfg(unix)]
+use std::{
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    thread,
 };
 
 use tokio_util::sync::CancellationToken;
@@ -28,7 +30,9 @@ use workcell_host_contract::{
 use workcell_snapshot_store::RACY_MARGIN;
 use workcell_snapshot_store::{ObjectStore, StoreOptions};
 
-use crate::{MAX_STORE_RECORDS, SnapshotError, check_cancelled, format::StoredVersion};
+#[cfg(unix)]
+use crate::check_cancelled;
+use crate::{MAX_STORE_RECORDS, SnapshotError, format::StoredVersion};
 
 pub(crate) const REPOSITORY: &str = "repo";
 pub(crate) const OPEN: &str = "open";
@@ -36,6 +40,7 @@ pub(crate) const RECORDS: &str = "records";
 pub(crate) const REVERTS: &str = "reverts";
 pub(crate) const EVICTED: &str = "evicted";
 const STATE: &str = "state";
+#[cfg(unix)]
 const LOCK: &str = "lock";
 pub(crate) const METADATA_SUFFIX: &str = ".json";
 pub(crate) const DIGEST_PREFIX: &str = "sha256:";
@@ -82,6 +87,7 @@ const TEMPORARY_SUFFIX: &str = ".tmp";
 const PRIVATE_ENTRY_SLACK: usize = 64;
 const MAX_PRIVATE_ENTRIES: usize =
     MAX_STORE_RECORDS + MAX_OPEN_RECORDS + MAX_REVERT_JOURNALS + PRIVATE_ENTRY_SLACK;
+#[cfg(unix)]
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 #[cfg(unix)]
 const PRIVATE_FILE_MODE: u32 = 0o600;
@@ -674,15 +680,14 @@ fn validate_private_permissions(metadata: &Metadata) -> Result<(), SnapshotError
 /// Creates a private directory, or accepts one already there, even one another process created
 /// a moment ago.
 fn create_private_directory(path: &Path) -> Result<(), SnapshotError> {
-    let created = match fs::create_dir(path) {
-        Ok(()) => true,
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
+    match fs::create_dir(path) {
+        Ok(()) => {
+            #[cfg(unix)]
+            fs::set_permissions(path, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
+                .map_err(|_| SnapshotError::InvalidConfiguration)?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
         Err(_) => return Err(SnapshotError::InvalidConfiguration),
-    };
-    #[cfg(unix)]
-    if created {
-        fs::set_permissions(path, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
-            .map_err(|_| SnapshotError::InvalidConfiguration)?;
     }
     let metadata = fs::symlink_metadata(path).map_err(|_| SnapshotError::InvalidConfiguration)?;
     if !metadata.file_type().is_dir() {

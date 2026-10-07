@@ -140,7 +140,7 @@ fn private_subdir(parent: &Path, name: &str) -> Result<PathBuf, WorkerError> {
         }
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let mut builder = fs::DirBuilder::new();
+            let builder = &mut fs::DirBuilder::new();
             #[cfg(unix)]
             builder.mode(DIRECTORY_MODE);
             if let Err(error) = builder.create(&path)
@@ -396,10 +396,10 @@ mod tests {
     #[cfg(workcell_bundled_monty_worker)]
     use super::bundled;
     #[cfg(unix)]
-    use super::{DIRECTORY_MODE, LOCK_MODE, USE_LOCK, WORKER_MODE};
+    use super::{DIRECTORY_MODE, EXTRACTION_LOCK, LOCK_MODE, USE_LOCK, WORKER_MODE};
     use super::{
-        EXTRACTION_LOCK, IO_BUFFER_BYTES, MAX_WORKER_BYTES, WorkerArtifact, WorkerError,
-        atomic_extract, decode_worker, encode_digest, extract_at, prepare_cache_root,
+        IO_BUFFER_BYTES, MAX_WORKER_BYTES, WorkerArtifact, WorkerError, atomic_extract,
+        decode_worker, encode_digest, extract_at, prepare_cache_root,
     };
 
     const FIRST_WORKER: &[u8] = b"first worker";

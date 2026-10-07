@@ -1267,19 +1267,19 @@ fn is_executable_file(metadata: &std::fs::Metadata, _path: &Path) -> bool {
     }
 }
 
-fn configure_probe_process(command: &mut Command) {
+fn configure_probe_process(_command: &mut Command) {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        command.as_std_mut().process_group(0);
+        _command.as_std_mut().process_group(0);
     }
 }
 
-async fn terminate_probe(child: &mut tokio::process::Child, pid: Option<u32>) {
+async fn terminate_probe(child: &mut tokio::process::Child, _pid: Option<u32>) {
     #[cfg(unix)]
     {
         use rustix::process::{Pid, Signal, kill_process_group};
-        if let Some(pid) = pid
+        if let Some(pid) = _pid
             .and_then(|pid| i32::try_from(pid).ok())
             .and_then(Pid::from_raw)
         {

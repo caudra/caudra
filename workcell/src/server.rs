@@ -1295,10 +1295,12 @@ impl WorkcellServer {
         {
             BeginExecution::Terminal(status) | BeginExecution::Running(status) => Ok(*status),
             BeginExecution::Start {
-                mut operation,
+                operation,
                 cancellation,
                 lease,
             } => {
+                #[cfg(unix)]
+                let mut operation = operation;
                 #[cfg(unix)]
                 if let PreparedRemoteOperation::TransferPublication(prepared) = operation.as_mut() {
                     prepared.bind_execution(
@@ -3648,11 +3650,13 @@ mod tests {
 
     use tempfile::TempDir;
     use test_case::test_case;
+    #[cfg(unix)]
     use workcell_host_contract::{
         ExecuteRequest, MAX_SNAPSHOT_FILE_BYTES, MAX_SNAPSHOT_FILES, MAX_SNAPSHOT_TOTAL_BYTES,
         OperationState, RecordClientMetadata, RecordHolder, RecordLimits, RecordRequest,
-        RecordScope, RevertCounts, SnapshotLimit,
+        RecordScope,
     };
+    use workcell_host_contract::{RevertCounts, SnapshotLimit};
     use workcell_mcp_code::{WORKER_FILE_NAME, WorkerSource};
     use workcell_mcp_files::{
         WorkspaceWatchErrorKind, WorkspaceWatchPhase, catalog as file_catalog,

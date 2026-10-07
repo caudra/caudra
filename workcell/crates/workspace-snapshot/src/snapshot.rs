@@ -10,6 +10,7 @@ use crate::SnapshotError;
 
 /// Git treats a file as executable when its owner may execute it.
 pub(crate) const OWNER_EXECUTABLE: u32 = 0o100;
+#[cfg(unix)]
 pub(crate) const PERMISSION_BITS: u32 = 0o777;
 #[cfg(not(unix))]
 const FILE_MODE: u32 = 0o644;

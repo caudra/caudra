@@ -411,7 +411,9 @@ fn create_file(path: &Path, content: &[u8], private: bool) -> io::Result<()> {
 }
 
 fn open_options(private: bool) -> OpenOptions {
-    let mut options = OpenOptions::new();
+    let options = OpenOptions::new();
+    #[cfg(unix)]
+    let mut options = options;
     #[cfg(unix)]
     if private {
         use std::os::unix::fs::OpenOptionsExt;
@@ -423,7 +425,9 @@ fn open_options(private: bool) -> OpenOptions {
 }
 
 fn object_options() -> OpenOptions {
-    let mut options = OpenOptions::new();
+    let options = OpenOptions::new();
+    #[cfg(unix)]
+    let mut options = options;
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;

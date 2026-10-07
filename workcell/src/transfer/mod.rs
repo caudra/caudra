@@ -21,6 +21,7 @@ const OCTET_STREAM: &str = "application/octet-stream";
 #[derive(Clone, Debug)]
 pub(crate) struct TransferGroup {
     files: FileToolGroup,
+    #[cfg(unix)]
     max_transfer_bytes: usize,
     #[cfg(unix)]
     pub(crate) reviewed: Option<reviewed::ReviewedTransfers>,
@@ -30,11 +31,12 @@ impl TransferGroup {
     pub async fn new(
         root: impl AsRef<Path>,
         allow_write: bool,
-        max_transfer_bytes: usize,
+        _max_transfer_bytes: usize,
     ) -> Result<Self, FilesystemError> {
         Ok(Self {
             files: FileToolGroup::new(root, allow_write, None).await?,
-            max_transfer_bytes,
+            #[cfg(unix)]
+            max_transfer_bytes: _max_transfer_bytes,
             #[cfg(unix)]
             reviewed: None,
         })
@@ -59,6 +61,7 @@ impl TransferGroup {
         }
     }
 
+    #[cfg(unix)]
     pub fn max_transfer_bytes(&self) -> usize {
         self.max_transfer_bytes
     }

@@ -2909,6 +2909,7 @@ async fn next_sse_json(response: &mut Response, buffer: &mut Vec<u8>) -> Value {
     }
 }
 
+#[cfg(unix)]
 fn assert_progress(
     message: &Value,
     expected_token: Value,
@@ -2980,6 +2981,7 @@ fn legacy_initialize_request(id: u64, protocol_version: &str) -> Value {
     })
 }
 
+#[cfg(unix)]
 fn legacy_request(id: u64, method: &str, params: Value) -> Value {
     json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
 }

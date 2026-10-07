@@ -2,12 +2,14 @@
 
 extern crate rustix_038 as rustix;
 
+#[cfg(unix)]
+use std::path::Component;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs::{File, Metadata},
     io::Read,
     mem::size_of,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex, OnceLock},
     time::Duration,

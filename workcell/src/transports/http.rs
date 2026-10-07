@@ -27,12 +27,13 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use super::{TransportError, TransportOutcome, shutdown_signal};
+#[cfg(unix)]
+use crate::transfer;
 use crate::{
     cli::HttpBindMode,
     http_policy::{self, HttpPolicy},
     remote_host::RemoteHostConfiguration,
     server::WorkcellServer,
-    transfer,
 };
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -179,16 +180,18 @@ impl HttpServer {
                 Arc::new(NeverSessionManager::default()),
                 transport_config,
             );
-        let mut router = Router::new().nest_service(http_policy::ENDPOINT_PATH, service);
+        let router = Router::new().nest_service(http_policy::ENDPOINT_PATH, service);
         #[cfg(unix)]
-        if let Some(group) = transfer {
-            router = router.route(
+        let router = if let Some(group) = transfer {
+            router.route(
                 transfer::ENDPOINT_PATH,
                 get(transfer::endpoints::download)
                     .post(transfer::endpoints::upload)
                     .with_state(group),
-            );
-        }
+            )
+        } else {
+            router
+        };
         let router = router
             .layer(middleware::from_fn_with_state(
                 configuration.authentication,
