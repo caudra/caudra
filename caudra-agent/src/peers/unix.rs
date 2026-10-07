@@ -734,7 +734,7 @@ pub(super) async fn discover(directory: &Directory) -> Result<Vec<PeerInfo>, Str
 mod tests {
     use std::fs::{self, Permissions};
     use std::ops::Not;
-    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::os::unix::fs::{PermissionsExt, chown, symlink};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -852,7 +852,12 @@ mod tests {
     #[test_case(0o1777, uid() == 0; "shared_sticky_requires_root")]
     fn directory_ancestry_respects_sticky_permissions(mode: u32, allowed: bool) {
         let parent = directory();
+        chown(parent.path(), None, Some(unsafe { libc::getegid() })).unwrap();
         fs::set_permissions(parent.path(), Permissions::from_mode(mode)).unwrap();
+        assert_eq!(
+            fs::metadata(parent.path()).unwrap().permissions().mode() & PERMISSION_MASK,
+            mode
+        );
         let child = parent.path().join("private");
 
         let result = make_private_directory(&child);
