@@ -6,17 +6,26 @@ on:
     paths:
       - "scripts/**/*.py"
       - ".github/workflows/python.yml"
+      - ".github/workflows/website-docs.yml"
   pull_request:
     branches: ["main"]
     paths:
       - "scripts/**/*.py"
       - ".github/workflows/python.yml"
+      - ".github/workflows/website-docs.yml"
 
 env:
   RUFF_VERSION: 0.16.2
   TY_VERSION: 0.0.70
 
 jobs:
+  website-docs:
+    name: Website source updater tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/test-update-website-docs.py
+
   lint:
     name: Ruff
     runs-on: ubuntu-latest

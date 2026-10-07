@@ -1,0 +1,62 @@
+name: Website docs source
+
+on:
+  workflow_run:
+    workflows: [Rust]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Successful canonical Rust push/main run ID to revalidate
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: website-docs-source
+  cancel-in-progress: false
+
+jobs:
+  propose:
+    if: >-
+      github.repository == 'caudra/caudra' && github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_repository.full_name == 'caudra/caudra' &&
+        github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.conclusion == 'success'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RUN_ID: ${{ github.event.workflow_run.id || inputs.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: caudra/caudra
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          sparse-checkout: scripts/update-website-docs.py
+          sparse-checkout-cone-mode: false
+      - name: Revalidate canonical Rust run before minting website credential
+        run: python3 scripts/update-website-docs.py --verify-only --run-id "$RUN_ID"
+        env:
+          SOURCE_TOKEN: ${{ github.token }}
+      - uses: actions/create-github-app-token@v2
+        id: website-token
+        with:
+          app-id: ${{ vars.WEBSITE_APP_ID }}
+          private-key: ${{ secrets.WEBSITE_APP_PRIVATE_KEY }}
+          owner: caudra
+          repositories: website
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Propose manifest-only website update
+        run: python3 scripts/update-website-docs.py --run-id "$RUN_ID" --app-slug "$APP_SLUG"
+        env:
+          SOURCE_TOKEN: ${{ github.token }}
+          WEBSITE_TOKEN: ${{ steps.website-token.outputs.token }}
+          APP_SLUG: ${{ steps.website-token.outputs.app-slug }}
