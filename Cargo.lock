@@ -10498,7 +10498,6 @@ dependencies = [
  "httpdate",
  "proptest",
  "reqwest",
- "serde",
  "test-case",
  "thiserror 2.0.18",
  "tokio",
