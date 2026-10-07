@@ -139,7 +139,7 @@ pub(crate) mod tests {
     const DIRECTORY_MODE: u32 = 0o700;
 
     pub(crate) fn tempdir() -> TempDir {
-        let mut builder = Builder::new();
+        let builder = &mut Builder::new();
         #[cfg(unix)]
         builder.permissions(fs::Permissions::from_mode(DIRECTORY_MODE));
         builder

@@ -22,6 +22,7 @@ const PLAN_REF_PREFIX: &str = "plan-";
 const MEMORY_REF_PREFIX: &str = "memory-";
 const MAX_DOCUMENT_BYTES: usize = 1024 * 1024;
 const MAX_MEMORY_DOCUMENTS: usize = 1024;
+#[cfg(unix)]
 const OWNER_ONLY_DIR_MODE: u32 = 0o700;
 const OWNER_ONLY_FILE_MODE: u32 = 0o600;
 
@@ -1204,7 +1205,7 @@ mod tests {
 
     #[test]
     fn traversal_and_symlinks_are_rejected() {
-        let (root, store, project) = store();
+        let (_root, store, project) = store();
         assert!(matches!(
             store.write_memory(&project, "../escape.md", "no"),
             Err(LocalDocumentError::InvalidMemoryName)
@@ -1222,7 +1223,7 @@ mod tests {
             ));
 
             fs::remove_file(memory_dir.join("linked.md")).expect("remove symlink");
-            let outside = root.path().join("outside");
+            let outside = _root.path().join("outside");
             fs::create_dir(&outside).expect("outside dir");
             fs::write(outside.join("victim.md"), "keep").expect("outside file");
             symlink(&outside, memory_dir.join("linked")).expect("directory symlink");

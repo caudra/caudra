@@ -73,6 +73,8 @@ use paths::state_dir;
 
 #[cfg(windows)]
 const RENAME_ATTEMPTS: usize = 20;
+#[cfg(windows)]
+const NUL_IN_PATH: &str = "path contains an embedded NUL";
 const XDG_RUNTIME_DIR_ENV: &str = "XDG_RUNTIME_DIR";
 const EPHEMERAL_DIR_PREFIX: &str = "caudra";
 #[cfg(unix)]
@@ -528,6 +530,10 @@ fn retry_rename_with(src: &Path, dest: &Path, replace: bool) -> std::io::Result<
     };
     if let Some(permissions) = &original_permissions {
         let mut writable = permissions.clone();
+        #[expect(
+            clippy::permissions_set_readonly_false,
+            reason = "Windows replacement requires clearing the read-only attribute, not changing Unix permissions"
+        )]
         writable.set_readonly(false);
         fs::set_permissions(dest, writable)?;
     }
@@ -551,7 +557,7 @@ fn retry_rename_with(src: &Path, dest: &Path, replace: bool) -> std::io::Result<
     if result.is_err()
         && let Some(permissions) = original_permissions
     {
-        let _ = fs::set_permissions(dest, permissions);
+        fs::set_permissions(dest, permissions)?;
     }
     result
 }
@@ -579,6 +585,9 @@ fn move_file_write_through(src: &Path, dest: &Path, replace: bool) -> io::Result
 
 #[cfg(windows)]
 fn windows_wide_path(path: &Path) -> io::Result<Vec<u16>> {
+    if path.as_os_str().encode_wide().any(|unit| unit == 0) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, NUL_IN_PATH));
+    }
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -606,6 +615,8 @@ pub fn now_epoch() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use test_case::test_case;
 
     const CWD: &str = "/repo";
     const INPUT_HISTORY_KEY: &str = "input.history";
@@ -614,6 +625,10 @@ mod tests {
     const PERSISTENT_TRACE: &str = "ephemeral session data reached the persistent root";
     const PROMPT_STASH_KEY: &str = "input.stash";
     const REPLACEMENT: &[u8] = b"replacement";
+    #[cfg(windows)]
+    const INVALID_RENAME_SOURCE: &str = "invalid\0source";
+    #[cfg(windows)]
+    const NUL_PATH_SUFFIX: &str = "\0ignored";
     #[cfg(unix)]
     const FILE_MODE_MASK: u32 = 0o777;
 
@@ -684,6 +699,77 @@ mod tests {
         atomic_write(&path, REPLACEMENT).unwrap();
 
         assert_eq!(fs::read(path).unwrap(), REPLACEMENT);
+    }
+
+    #[cfg(windows)]
+    #[test_case(true; "source")]
+    #[test_case(false; "destination")]
+    fn rename_rejects_nul_paths_without_using_the_truncated_path(invalid_source: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let destination = dir.path().join("destination");
+        fs::write(&source, REPLACEMENT).unwrap();
+        fs::write(&destination, ORIGINAL).unwrap();
+        let mut invalid = if invalid_source {
+            &source
+        } else {
+            &destination
+        }
+        .as_os_str()
+        .to_os_string();
+        invalid.push(NUL_PATH_SUFFIX);
+        let (source_argument, destination_argument) = if invalid_source {
+            (PathBuf::from(invalid), destination.clone())
+        } else {
+            (source.clone(), PathBuf::from(invalid))
+        };
+
+        let error =
+            move_file_write_through(&source_argument, &destination_argument, true).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), NUL_IN_PATH);
+        assert_eq!(fs::read(source).unwrap(), REPLACEMENT);
+        assert_eq!(fs::read(destination).unwrap(), ORIGINAL);
+    }
+
+    #[cfg(windows)]
+    #[test_case(false; "no_replace")]
+    #[test_case(true; "replace")]
+    fn failed_rename_preserves_readonly_destination(replace: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state");
+        fs::write(&path, ORIGINAL).unwrap();
+        let original_permissions = fs::metadata(&path).unwrap().permissions();
+        let mut readonly = original_permissions.clone();
+        readonly.set_readonly(true);
+        fs::set_permissions(&path, readonly).unwrap();
+
+        let error =
+            retry_rename_with(&dir.path().join(INVALID_RENAME_SOURCE), &path, replace).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(fs::metadata(&path).unwrap().permissions().readonly());
+        assert_eq!(fs::read(&path).unwrap(), ORIGINAL);
+        fs::set_permissions(path, original_permissions).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn atomic_write_preserves_readonly_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state");
+        fs::write(&path, ORIGINAL).unwrap();
+        let original_permissions = fs::metadata(&path).unwrap().permissions();
+        let mut readonly = original_permissions.clone();
+        readonly.set_readonly(true);
+        fs::set_permissions(&path, readonly).unwrap();
+
+        atomic_write(&path, REPLACEMENT).unwrap();
+
+        assert!(fs::metadata(&path).unwrap().permissions().readonly());
+        assert_eq!(fs::read(&path).unwrap(), REPLACEMENT);
+        fs::set_permissions(path, original_permissions).unwrap();
     }
 
     #[test]

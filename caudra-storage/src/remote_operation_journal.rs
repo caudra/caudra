@@ -22,7 +22,9 @@ pub const REMOTE_OPERATION_JOURNAL_FILE: &str = "remote-operations.db";
 const JOURNAL_DIR: &str = "recovery";
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUR") as i64;
 const SCHEMA_VERSION: i64 = 5;
+#[cfg(unix)]
 const OWNER_FILE_MODE: u32 = 0o600;
+#[cfg(unix)]
 const OWNER_DIR_MODE: u32 = 0o700;
 const PAGE_SIZE: i64 = 4096;
 const MAX_PAGE_COUNT: i64 = 4096;
@@ -651,15 +653,13 @@ fn verify_directory(path: &Path) -> Result<(), RemoteOperationJournalError> {
                 path.display()
             )));
         }
-        Ok(metadata) =>
-        {
-            #[cfg(unix)]
-            if metadata.uid() != rustix::process::geteuid().as_raw() {
-                return Err(RemoteOperationJournalError::UnsafeStorage(
-                    "journal directory must be owned by the current user".into(),
-                ));
-            }
+        #[cfg(unix)]
+        Ok(metadata) if metadata.uid() != rustix::process::geteuid().as_raw() => {
+            return Err(RemoteOperationJournalError::UnsafeStorage(
+                "journal directory must be owned by the current user".into(),
+            ));
         }
+        Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => {
             return Err(RemoteOperationJournalError::PersistentStateUnavailable(
@@ -700,10 +700,10 @@ fn create_owner_only(path: &Path) -> Result<File, RemoteOperationJournalError> {
     Ok(options.open(path)?)
 }
 
-fn verify_owner_only(metadata: &fs::Metadata) -> Result<(), RemoteOperationJournalError> {
+fn verify_owner_only(_metadata: &fs::Metadata) -> Result<(), RemoteOperationJournalError> {
     #[cfg(unix)]
-    if metadata.uid() != rustix::process::geteuid().as_raw()
-        || metadata.permissions().mode() & 0o077 != 0
+    if _metadata.uid() != rustix::process::geteuid().as_raw()
+        || _metadata.permissions().mode() & 0o077 != 0
     {
         return Err(RemoteOperationJournalError::UnsafeStorage(
             "journal file must be owner-only and owned by the current user".into(),

@@ -658,8 +658,11 @@ mod tests {
     };
     use crate::sessions::{SESSIONS_DB_FILE, SessionError};
     use crate::{StateDir, now_epoch};
-    use rusqlite::{Connection, params};
+    #[cfg(unix)]
+    use rusqlite::Connection;
+    use rusqlite::params;
     use serde_json::{Value, json};
+    #[cfg(unix)]
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};

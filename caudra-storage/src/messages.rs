@@ -730,12 +730,15 @@ mod tests {
     use crate::StateDir;
     use crate::sessions::{SESSIONS_DB_FILE, SessionError};
     use rusqlite::{Connection, params};
+    #[cfg(unix)]
     use std::fs::{self, Permissions};
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tempfile::{TempDir, tempdir};
     use test_case::test_case;
 
     const NOW_MS: u64 = 10_000_000_000;
+    #[cfg(unix)]
     const OWNER_FILE_MODE: u32 = 0o600;
     const DAY_MS: u64 = 86_400_000;
     const RETENTION_DAYS: u64 = 30;
@@ -847,6 +850,8 @@ mod tests {
     fn opening_creates_an_owner_only_history_that_reopens() {
         let (root, state, mut log) = fixture();
         let path = root.path().join(SESSIONS_DB_FILE);
+        assert!(path.is_file());
+        #[cfg(unix)]
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             OWNER_FILE_MODE
@@ -886,12 +891,15 @@ mod tests {
             .unwrap()
             .execute_batch("CREATE TABLE other (value TEXT);")
             .unwrap();
-        fs::set_permissions(&path, Permissions::from_mode(0o644)).unwrap();
-        assert!(matches!(
-            MessageLog::open(&state, &retention(), NOW_MS),
-            Err(MessageLogError::Session(SessionError::Storage(_)))
-        ));
-        fs::set_permissions(&path, Permissions::from_mode(OWNER_FILE_MODE)).unwrap();
+        #[cfg(unix)]
+        {
+            fs::set_permissions(&path, Permissions::from_mode(0o644)).unwrap();
+            assert!(matches!(
+                MessageLog::open(&state, &retention(), NOW_MS),
+                Err(MessageLogError::Session(SessionError::Storage(_)))
+            ));
+            fs::set_permissions(&path, Permissions::from_mode(OWNER_FILE_MODE)).unwrap();
+        }
         assert!(matches!(
             MessageLog::open(&state, &retention(), NOW_MS),
             Err(MessageLogError::Session(_))

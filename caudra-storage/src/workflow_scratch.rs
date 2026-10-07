@@ -18,6 +18,7 @@ const MAX_NAME_BYTES: usize = 128;
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_FILES_PER_RUN: u64 = 64;
 const MAX_RUN_BYTES: u64 = 16 * 1024 * 1024;
+#[cfg(unix)]
 const DIRECTORY_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
 const NAME_EMPTY: &str = "empty";
@@ -198,7 +199,7 @@ fn ensure_real_directory(path: &Path, create: bool) -> io::Result<()> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound && create => {
-            let mut builder = fs::DirBuilder::new();
+            let builder = &mut fs::DirBuilder::new();
             #[cfg(unix)]
             builder.mode(DIRECTORY_MODE);
             match builder.create(path) {
@@ -292,7 +293,9 @@ mod tests {
     const NAME: &str = "notes.md";
     const CONTENT: &[u8] = b"first draft";
     const REPLACEMENT: &[u8] = b"second draft, longer";
+    #[cfg(unix)]
     const REJECTS_LINK: &str = "a symlink must never be written through";
+    #[cfg(unix)]
     const REJECTS_SIBLING_LINK: &str = "a symlinked level must never be traversed";
     const OVERWRITE_IS_ATOMIC: &str = "a rewrite must leave exactly the new content";
     const REWRITE_CHARGES_DIFFERENCE: &str = "rewriting a file must not count it twice";

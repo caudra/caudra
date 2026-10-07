@@ -1,4 +1,6 @@
-use std::fs::{self, File, Metadata, OpenOptions, Permissions};
+#[cfg(unix)]
+use std::fs::Permissions;
+use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -8,9 +10,11 @@ use rusqlite::{Connection, OpenFlags, limits::Limit};
 use sha2::{Digest, Sha256};
 
 use super::{
-    MAX_DATABASE_BYTES, MAX_SQLITE_VALUE_BYTES, OWNER_DIR_MODE, OWNER_FILE_MODE,
-    RemoteOperationJournalError, sidecar, validate_schema, verify_owner_only,
+    MAX_DATABASE_BYTES, MAX_SQLITE_VALUE_BYTES, RemoteOperationJournalError, sidecar,
+    validate_schema, verify_owner_only,
 };
+#[cfg(unix)]
+use super::{OWNER_DIR_MODE, OWNER_FILE_MODE};
 
 const DATABASE_SUFFIXES: [&str; 4] = ["", "-wal", "-shm", "-journal"];
 const MAX_ADMISSION_BYTES: u64 = MAX_DATABASE_BYTES * 4;

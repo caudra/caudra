@@ -9,7 +9,9 @@ use std::sync::OnceLock;
 use etcetera::base_strategy::BaseStrategy;
 
 const NAMESPACE_ENV: &str = "CAUDRA_NAMESPACE";
+#[cfg(unix)]
 const DIRECTORY_MODE: u32 = 0o700;
+#[cfg(unix)]
 const GROUP_OTHER_WRITE: u32 = 0o022;
 
 /// Debug builds get their own directory so a development run never shares
@@ -300,7 +302,7 @@ pub fn ensure_private_dir(path: &Path) -> Result<PathBuf, std::io::Error> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let mut builder = fs::DirBuilder::new();
+            let builder = &mut fs::DirBuilder::new();
             #[cfg(unix)]
             builder.mode(DIRECTORY_MODE);
             match builder.create(path) {
@@ -467,8 +469,11 @@ mod tests {
 
     use super::*;
 
+    #[cfg(unix)]
     const MODE_MASK: u32 = 0o777;
+    #[cfg(unix)]
     const SHARED_MODE: u32 = 0o755;
+    #[cfg(unix)]
     const GROUP_WRITABLE_MODE: u32 = 0o775;
 
     struct TestStrategy {

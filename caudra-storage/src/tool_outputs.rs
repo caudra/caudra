@@ -648,7 +648,7 @@ impl OutputDirectory {
         #[cfg(unix)]
         rustix::fs::fsync(&self.fd).map_err(std::io::Error::from)?;
         #[cfg(not(unix))]
-        crate::sync_parent_dir_durable(&self.path.join("entry")).map_err(std::io::Error::from)?;
+        crate::sync_parent_dir_io(&self.path.join("entry"))?;
         Ok(())
     }
 

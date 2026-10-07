@@ -140,6 +140,7 @@ const WAL_JOURNAL_MODE: &str = "wal";
 const PARALLEL_DECODE_MIN_ROWS: usize = 256;
 const DECODE_WORKER_PANICKED: &str = "a payload decode worker panicked";
 const OWNER_FILE_MODE: u32 = 0o600;
+#[cfg(unix)]
 const OTHER_USER_PERMISSIONS: u32 = 0o077;
 const WAL_SUFFIX: &str = "-wal";
 const SHM_SUFFIX: &str = "-shm";
