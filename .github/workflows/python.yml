@@ -45,31 +45,31 @@ env:
 jobs:
   distribution:
     name: Distribution tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: make distribution-tests
 
   website-docs:
     name: Website source updater tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: python3 scripts/test-update-website-docs.py
 
   lint:
     name: Ruff
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: .github/scripts/retry.sh pip install "ruff==${RUFF_VERSION}"
       - run: ruff check scripts/
       - run: ruff format --check scripts/
 
   typecheck:
     name: ty
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: .github/scripts/retry.sh pip install "ty==${TY_VERSION}"
       - run: ty check scripts/

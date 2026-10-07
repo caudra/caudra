@@ -17,18 +17,18 @@ env:
 jobs:
   changes:
     name: Detect changes
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       code: ${{ inputs.source-sha != '' && 'true' || steps.filter.outputs.code }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
       - run: test "$SOURCE_SHA" = "$GITHUB_SHA"
         env:
           SOURCE_SHA: ${{ inputs.source-sha || github.sha }}
-      - uses: dorny/paths-filter@v3
+      - uses: dorny/paths-filter@v4
         if: inputs.source-sha == ''
         id: filter
         with:
@@ -59,12 +59,12 @@ jobs:
   build:
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       actions: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
@@ -94,7 +94,7 @@ jobs:
     name: Nix CI
     if: always()
     needs: [changes, build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - if: >-
           needs.changes.result != 'success' ||

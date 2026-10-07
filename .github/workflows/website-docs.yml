@@ -29,12 +29,12 @@ jobs:
         github.event.workflow_run.head_repository.full_name == 'caudra/caudra' &&
         github.event.workflow_run.head_branch == 'main' &&
         github.event.workflow_run.conclusion == 'success'))
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
       RUN_ID: ${{ github.event.workflow_run.id || inputs.run_id }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: caudra/caudra
           ref: ${{ github.workflow_sha }}
@@ -45,7 +45,7 @@ jobs:
         run: python3 scripts/update-website-docs.py --verify-only --run-id "$RUN_ID"
         env:
           SOURCE_TOKEN: ${{ github.token }}
-      - uses: actions/create-github-app-token@v2
+      - uses: actions/create-github-app-token@v3
         id: website-token
         with:
           app-id: ${{ vars.WEBSITE_APP_ID }}

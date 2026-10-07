@@ -401,6 +401,24 @@ class ReleaseTests(unittest.TestCase):
 
 
 class ReleaseWorkflowTests(unittest.TestCase):
+    def test_actions_use_node24_versions_and_ubuntu_is_pinned(self):
+        versions = {
+            "actions/checkout": "v7",
+            "dorny/paths-filter": "v4",
+            "actions/upload-artifact": "v7",
+            "actions/download-artifact": "v8",
+            "actions/create-github-app-token": "v3",
+        }
+        for workflow in WORKFLOWS.glob("*.yml"):
+            with self.subTest(workflow=workflow.name):
+                text = workflow.read_text()
+                self.assertNotRegex(
+                    text, r"(?m)^\s*(?:runs-on|runner):\s*ubuntu-latest\s*$"
+                )
+                for action, version in re.findall(r"uses:\s*([^\s@]+)@([^\s]+)", text):
+                    if action in versions:
+                        self.assertEqual(version, versions[action], action)
+
     def workflow(self, name):
         text = (WORKFLOWS / f"{name}.yml").read_text()
         header, jobs = text.split("\njobs:\n", 1)
@@ -450,13 +468,13 @@ class ReleaseWorkflowTests(unittest.TestCase):
                 self.assertIn(
                     "SOURCE_SHA: ${{ inputs.source-sha || github.sha }}", changes
                 )
-                self.assertIn("uses: dorny/paths-filter@v3", changes)
+                self.assertIn("uses: dorny/paths-filter@v4", changes)
                 self.assertIn("if: inputs.source-sha == ''", changes)
                 for job, body in jobs.items():
                     if job not in ("changes", "ci-pass"):
                         self.assertIn("needs: changes", body)
                         self.assertIn("if: needs.changes.outputs.code == 'true'", body)
-                    for checkout in body.split("uses: actions/checkout@v4")[1:]:
+                    for checkout in body.split("uses: actions/checkout@v7")[1:]:
                         self.assertTrue(
                             checkout.startswith(
                                 "\n        with:\n          ref: ${{ github.sha }}\n"
