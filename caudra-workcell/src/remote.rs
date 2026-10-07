@@ -67,6 +67,8 @@ const ACCEPT_VALUE: &str = "application/json, text/event-stream";
 const OCTET_STREAM: &str = "application/octet-stream";
 const MAX_HTTP_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SSE_EVENT_BYTES: usize = 2 * 1024 * 1024;
+const SSE_LF_DELIMITER: &[u8] = b"\n\n";
+const SSE_CRLF_DELIMITER: &[u8] = b"\r\n\r\n";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const EVENT_QUEUE_CAPACITY: usize = 256;
 const CONNECTION_CONNECTED: u8 = 0;
@@ -660,6 +662,7 @@ impl RemoteTransport {
         let mut buffer = Vec::new();
         let mut chunk = [0_u8; 8192];
         let mut total = 0_usize;
+        let mut searched = 0;
         loop {
             let read = response
                 .body_mut()
@@ -674,7 +677,7 @@ impl RemoteTransport {
                 return Err(RemoteWorkcellError::InvalidProtocol);
             }
             buffer.extend_from_slice(&chunk[..read]);
-            while let Some(end) = sse_event_end(&buffer) {
+            while let Some(end) = sse_event_end(&buffer, &mut searched) {
                 if end > MAX_SSE_EVENT_BYTES {
                     return Err(RemoteWorkcellError::InvalidProtocol);
                 }
@@ -4894,19 +4897,28 @@ fn same_url_origin(left: &Url, right: &Url) -> bool {
         && left.port_or_known_default() == right.port_or_known_default()
 }
 
-fn sse_event_end(buffer: &[u8]) -> Option<usize> {
-    let lf = buffer
-        .windows(2)
-        .position(|window| window == b"\n\n")
-        .map(|position| (position, position + 2));
-    let crlf = buffer
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|position| (position, position + 4));
-    match (lf, crlf) {
+fn sse_event_end(buffer: &[u8], searched: &mut usize) -> Option<usize> {
+    let remaining = &buffer[*searched..];
+    let lf = remaining
+        .windows(SSE_LF_DELIMITER.len())
+        .position(|window| window == SSE_LF_DELIMITER)
+        .map(|position| (position, position + SSE_LF_DELIMITER.len()));
+    let crlf = remaining
+        .windows(SSE_CRLF_DELIMITER.len())
+        .position(|window| window == SSE_CRLF_DELIMITER)
+        .map(|position| (position, position + SSE_CRLF_DELIMITER.len()));
+    let end = match (lf, crlf) {
         (Some(left), Some(right)) => Some(if left.0 <= right.0 { left.1 } else { right.1 }),
         (Some((_, end)), None) | (None, Some((_, end))) => Some(end),
         (None, None) => None,
+    };
+    if let Some(end) = end {
+        let end = *searched + end;
+        *searched = 0;
+        Some(end)
+    } else {
+        *searched = buffer.len().saturating_sub(SSE_CRLF_DELIMITER.len() - 1);
+        None
     }
 }
 
@@ -6759,13 +6771,14 @@ mod tests {
         OperationRegistry, PendingRemoteOperation, PreparedWorkspaceContext, RecoveryOperation,
         RemoteEvent, RemoteInner, RemoteMutationJournal, RemotePreparedToolCall, RemoteTransport,
         RemoteWorkcellClient, RemoteWorkcellError, ResourceCache, SHELL_CONTRACT_ID,
-        SHELL_EXECUTION_TIMEOUT, StoredOperation, ToolListWire, WORKSPACE_MUTATION_KIND,
-        WatchRegistry, canonical_journal_policy, convert_status, execution_timeout, freeze_catalog,
-        join_workspace_path, map_rpc_error, numeric_loopback, pagination_flags,
-        parse_content_range, project_asset_kind, project_asset_trust, recovery_status,
-        require_full_remote_parity, require_nonzero_within, same_descriptor_except_instance,
-        serialized_items_bytes, source_trust_anchor, unix_millis, validate_capabilities,
-        validate_selector_id, watch_path_within, workspace_capabilities,
+        SHELL_EXECUTION_TIMEOUT, SSE_CRLF_DELIMITER, SSE_LF_DELIMITER, StoredOperation,
+        ToolListWire, WORKSPACE_MUTATION_KIND, WatchRegistry, canonical_journal_policy,
+        convert_status, execution_timeout, freeze_catalog, join_workspace_path, map_rpc_error,
+        numeric_loopback, pagination_flags, parse_content_range, project_asset_kind,
+        project_asset_trust, recovery_status, require_full_remote_parity, require_nonzero_within,
+        same_descriptor_except_instance, serialized_items_bytes, source_trust_anchor,
+        sse_event_end, unix_millis, validate_capabilities, validate_selector_id, watch_path_within,
+        workspace_capabilities,
     };
     use crate::transfer::PrivateStaging;
     use crate::{
@@ -10627,13 +10640,40 @@ mod tests {
 
     #[test]
     fn oversized_complete_sse_event_is_rejected_before_parsing() {
-        let body = format!("data: {}\n\n", "x".repeat(MAX_SSE_EVENT_BYTES));
+        let body = format!(
+            "data: {{\"jsonrpc\":\"2.0\",\"id\":$ID,\"result\":\"{}\"}}\n\n",
+            "x".repeat(MAX_SSE_EVENT_BYTES)
+        );
         let (endpoint, server) = serve_once(body, "text/event-stream");
         let (transport, _) = RemoteTransport::new(&endpoint, None).unwrap();
         let result =
             smol::block_on(transport.request("test", json!({}), 1024, &CancellationToken::new()));
         assert_eq!(result, Err(RemoteWorkcellError::InvalidProtocol));
         server.join().unwrap();
+    }
+
+    #[test_case(SSE_LF_DELIMITER; "lf")]
+    #[test_case(SSE_CRLF_DELIMITER; "crlf")]
+    fn fragmented_sse_scans_only_new_bytes_and_delimiter_overlap(delimiter: &[u8]) {
+        let mut buffer = Vec::new();
+        let mut searched = 0;
+        let mut scanned = 0;
+        for _ in 0..MAX_SSE_EVENT_BYTES {
+            buffer.push(b'x');
+            scanned += buffer.len() - searched;
+            assert_eq!(sse_event_end(&buffer, &mut searched), None);
+            assert!(scanned <= buffer.len() * SSE_CRLF_DELIMITER.len());
+        }
+        for byte in &delimiter[..delimiter.len() - 1] {
+            buffer.push(*byte);
+            assert_eq!(sse_event_end(&buffer, &mut searched), None);
+        }
+        buffer.push(*delimiter.last().unwrap());
+        assert_eq!(sse_event_end(&buffer, &mut searched), Some(buffer.len()));
+        assert_eq!(searched, 0);
+        buffer.clear();
+        buffer.extend_from_slice(delimiter);
+        assert_eq!(sse_event_end(&buffer, &mut searched), Some(delimiter.len()));
     }
 
     #[test]
