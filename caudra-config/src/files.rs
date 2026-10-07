@@ -247,6 +247,7 @@ fn state(path: &Path) -> FileState {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
@@ -256,8 +257,10 @@ mod tests {
 
     use super::{CONFIG_FILES, FileState, MCP, PROVIDERS, Scope, find_example, locate};
     use crate::PROJECT_DIR;
+    #[cfg(unix)]
     use crate::config_file::CONFIG_FILE;
 
+    #[cfg(unix)]
     const SYMLINK_TARGET: &str = "shared.toml";
 
     #[test_case("mcp", MCP.name ; "stem")]

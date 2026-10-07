@@ -1489,6 +1489,7 @@ mod tests {
     };
     use caudra_config::{DefaultEffect, Effect, PermissionRule, PermissionsConfig, ToolKey};
     use caudra_storage::StateDir;
+    #[cfg(unix)]
     use caudra_storage::projects::project_document_dirs;
     use std::collections::HashMap;
     use std::path::{MAIN_SEPARATOR_STR, Path, PathBuf};
@@ -1498,9 +1499,13 @@ mod tests {
     const LOCAL_SOURCE_DIR: &str = "loaded";
     const LOCAL_SOURCE_BYTES: &[u8] = b"[shell]\ndeny = ['git push *']\n";
     const REPLACEMENT_SOURCE_BYTES: &[u8] = b"[shell]\nallow = ['*']\n";
+    #[cfg(unix)]
     const PROJECT_DOCUMENT: &str = "notes.md";
+    #[cfg(unix)]
     const DOCUMENT_ESCAPE_LINK: &str = "escape";
+    #[cfg(unix)]
     const READ_TOOL: &str = "read";
+    #[cfg(unix)]
     const WRITE_TOOL: &str = "write";
     const REMOTE_SCRATCH_ROOT: &str = "/var/folders/xy/caudra";
     const REMOTE_SCRATCH_PROJECT: &str = "/var/folders/xy/caudra/happy-cute-tick";

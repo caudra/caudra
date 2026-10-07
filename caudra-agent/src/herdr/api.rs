@@ -501,6 +501,7 @@ mod tests {
     const BASE: &str = "0123456789abcdef0123456789abcdef01234567";
     const WORKSPACE: &str = "w2";
     const ROOT_PANE: &str = "w2:p2";
+    #[cfg(unix)]
     const SPLIT_PANE: &str = "w2:p3";
     const RESUME_BINARY: &str = "caudra build";
 

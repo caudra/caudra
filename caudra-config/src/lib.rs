@@ -5421,6 +5421,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn permissions_load_from_a_read_only_global_config_dir() {
         use std::os::unix::fs::PermissionsExt;

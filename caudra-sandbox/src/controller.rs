@@ -1519,6 +1519,7 @@ mod tests {
     };
     use futures_lite::future;
     use serde_json::{Value, json};
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::{
         fs,
@@ -1548,6 +1549,7 @@ mod tests {
     const HEAD_ROUTE: &str = "/daemon/v1/templates/base";
     const REQUEST_DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const NAME: &str = "saved";
+    #[cfg(unix)]
     const PRIVATE_MODE: u32 = 0o700;
     const DOMAIN: &str = "example.test";
     const CHANGED_EXECUTION: &str = "execution-resumed";
@@ -3276,10 +3278,15 @@ mod tests {
     }
 
     fn tempdir() -> TempDir {
-        tempfile::Builder::new()
-            .permissions(std::fs::Permissions::from_mode(PRIVATE_MODE))
-            .tempdir()
-            .unwrap()
+        #[cfg(unix)]
+        {
+            tempfile::Builder::new()
+                .permissions(fs::Permissions::from_mode(PRIVATE_MODE))
+                .tempdir()
+                .unwrap()
+        }
+        #[cfg(not(unix))]
+        TempDir::new().unwrap()
     }
 
     #[derive(Clone, serde::Serialize, serde::Deserialize)]

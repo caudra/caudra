@@ -57,8 +57,10 @@ pub mod topics;
 mod unix;
 mod work;
 
+#[cfg(unix)]
 const PROTOCOL_VERSION: u32 = 1;
 pub const MAX_BODY_BYTES: usize = 32 * 1024;
+#[cfg(unix)]
 const MAX_FRAME_BYTES: usize = 64 * 1024;
 const MAX_PENDING: usize = 50;
 const MAX_HELD: usize = 50;
@@ -84,6 +86,7 @@ pub const MAX_HISTORY_PAGE: usize = 50;
 const FANOUT_CONCURRENCY: usize = 8;
 const RATE_WINDOW: Duration = Duration::from_secs(60);
 const RETRY_WINDOW: Duration = Duration::from_secs(300);
+#[cfg(unix)]
 const CLOCK_SKEW: Duration = Duration::from_secs(30);
 const CLOSED: &str = "The peer session is closed";
 const REFUSED_POLICY: &str = "Inbound messaging is refused by receiver policy";
@@ -91,8 +94,11 @@ const HELD_POLICY: &str = "Receiver policy requires local approval";
 const HELD_COHORT: &str = "Automatic delivery requires Ask permissions, matching Plan/Build mode, and the same canonical workspace";
 const HELD_BLOCKED: &str = "Receiver is blocked; local input must resume it";
 const HELD_EXTERNAL: &str = "Automatic delivery admits only sessions; a script's message needs approval or the inbound policy accept";
+#[cfg(unix)]
 const RATE_EXCEEDED: &str = "Recipient peer message rate limit reached";
+#[cfg(unix)]
 const DUPLICATE: &str = "The same text from this sender arrived within the last minute";
+#[cfg(unix)]
 const NOT_SUBSCRIBED: &str = "The recipient is not subscribed to this topic or to broadcasts";
 const PUBLISH_RATE_EXCEEDED: &str = "Publication rate limit reached; publish again in a minute";
 const DIRECT_PUBLICATION: &str =
@@ -108,6 +114,7 @@ const UNNAMEABLE: &str = "The receiver could not name the message in its convers
 const RETRY_FULL: &str = "Live retry identity capacity reached; try again once older messages pass the five-minute retry window";
 const POLICY_FLOOR: &str = "Cannot weaken the project's configured inbound policy";
 const INVALID_TARGET: &str = "Invalid peer target; use an address returned by discovery";
+#[cfg(unix)]
 const STALE_TARGET: &str = "Peer target is closed or belongs to an obsolete registration";
 const UNKNOWN_TARGET: &str =
     "Unknown peer address; use a target from peer discovery or an incoming peer message";
@@ -129,6 +136,7 @@ const REJECTED: &str = "Rejected by the local receiver";
 const HISTORY_HELD: &str =
     "Reading stored peer messages needs the inbound policy accept or auto in this session";
 const NOT_RECORDED: &str = "Not sent, because the message history could not record it";
+#[cfg(unix)]
 const OLDER_RECIPIENT: &str = "The recipient hung up without answering, as an older Caudra refuses a message from an automation";
 pub const STATUS_QUEUED: &str = "queued";
 pub const STATUS_HELD: &str = "held";
@@ -459,7 +467,9 @@ struct SessionState {
     wakes_suppressed: bool,
     epoch: u64,
     next_claim: u64,
+    #[cfg(unix)]
     inbound_rate: usize,
+    #[cfg(unix)]
     sender_rate: usize,
     publish_rate: usize,
     max_fanout: usize,
@@ -476,12 +486,14 @@ struct SessionState {
     published: VecDeque<Instant>,
     peer_names: NameTable<String>,
     message_names: NameTable<MessageIdentity>,
+    #[cfg(unix)]
     arrivals: VecDeque<Arrival>,
     reviews: HashMap<String, u64>,
     history: MessageHistory,
     observer: Option<Arc<dyn MessageObserver>>,
 }
 
+#[cfg(unix)]
 struct Arrival {
     at: Instant,
     /// The sending session, which outlives its routes, so a restart or a
@@ -673,7 +685,9 @@ enum ItemState {
 }
 
 struct DedupEntry {
+    #[cfg(unix)]
     fingerprint: [u8; 32],
+    #[cfg(unix)]
     issued_ms: u64,
     receipt: SendReceipt,
 }
@@ -1025,6 +1039,7 @@ impl Delivery {
     }
 }
 
+#[cfg(unix)]
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
@@ -1038,6 +1053,7 @@ enum Request {
     },
 }
 
+#[cfg(unix)]
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Response {
@@ -1570,7 +1586,9 @@ impl PeerHost {
                 wakes_suppressed: false,
                 epoch: 0,
                 next_claim: 0,
+                #[cfg(unix)]
                 inbound_rate: messaging.inbound_per_minute,
+                #[cfg(unix)]
                 sender_rate: messaging.sender_per_minute,
                 publish_rate: messaging.publish_per_minute,
                 max_fanout: messaging.max_fanout,
@@ -1586,6 +1604,7 @@ impl PeerHost {
                 published: VecDeque::new(),
                 peer_names: NameTable::new(MAX_PEER_NAMES),
                 message_names: NameTable::new(MAX_MESSAGE_NAMES),
+                #[cfg(unix)]
                 arrivals: VecDeque::new(),
                 reviews: HashMap::new(),
                 history: self.0.history.clone(),
@@ -2431,7 +2450,10 @@ impl PeerSession {
         #[cfg(unix)]
         return unix::send(self, delivery, epoch).await;
         #[cfg(not(unix))]
-        SendReceipt::new(STATUS_UNAVAILABLE, &delivery.message_id, Some(UNAVAILABLE))
+        {
+            let _ = epoch;
+            SendReceipt::new(STATUS_UNAVAILABLE, &delivery.message_id, Some(UNAVAILABLE))
+        }
     }
 
     pub fn held_count(&self) -> usize {
@@ -3204,6 +3226,7 @@ impl SessionInner {
         Ok(())
     }
 
+    #[cfg(unix)]
     fn receive(
         &self,
         delivery: Delivery,
@@ -3458,6 +3481,7 @@ impl HostInner {
         Err(UNAVAILABLE.into())
     }
 
+    #[cfg(unix)]
     fn handle(&self, request: Request) -> Response {
         match request {
             Request::List { version, host }

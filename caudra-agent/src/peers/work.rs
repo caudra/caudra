@@ -363,6 +363,7 @@ pub(super) fn check_memberships(groups: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(unix)]
 pub(super) fn valid_memberships(groups: &[String]) -> bool {
     check_memberships(groups).is_ok()
 }
@@ -900,6 +901,36 @@ impl PeerHost {
 
 #[cfg(test)]
 mod tests {
+    use super::{INVALID_GROUP, MAX_MEMBERSHIPS, TOO_MANY_MEMBERSHIPS, check_memberships};
+    use test_case::test_case;
+
+    const GROUP: &str = "ci-triage";
+    const OTHER_GROUP: &str = "deploy-watch";
+    const MALFORMED_GROUP: &str = "CI_Triage";
+
+    #[test_case(&[GROUP, OTHER_GROUP], None; "distinct_groups")]
+    #[test_case(&[GROUP, GROUP], Some(INVALID_GROUP); "duplicate")]
+    #[test_case(&[MALFORMED_GROUP], Some(INVALID_GROUP); "malformed")]
+    fn memberships_are_validated(groups: &[&str], error: Option<&str>) {
+        let groups: Vec<String> = groups.iter().copied().map(str::to_owned).collect();
+        assert_eq!(check_memberships(&groups).err().as_deref(), error);
+    }
+
+    #[test]
+    fn memberships_are_bounded() {
+        let groups: Vec<String> = (0..=MAX_MEMBERSHIPS)
+            .map(|index| format!("{GROUP}-{index}"))
+            .collect();
+        assert!(check_memberships(&groups[..MAX_MEMBERSHIPS]).is_ok());
+        assert_eq!(
+            check_memberships(&groups).unwrap_err(),
+            TOO_MANY_MEMBERSHIPS
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
     use std::path::Path;
 
     use caudra_automation::event::WorkOutcome as ReportedOutcome;
@@ -914,9 +945,8 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        COMPLETION_REQUIRED, INVALID_GROUP, MAX_MEMBERSHIPS, NOT_MEMBER, PAUSED_BY_CANCEL,
-        SESSION_CLOSED, SkippedWork, TOO_MANY_MEMBERSHIPS, TURN_FAILED, TURN_LIMIT, WorkAction,
-        check_memberships,
+        COMPLETION_REQUIRED, MAX_MEMBERSHIPS, NOT_MEMBER, PAUSED_BY_CANCEL, SESSION_CLOSED,
+        SkippedWork, TOO_MANY_MEMBERSHIPS, TURN_FAILED, TURN_LIMIT, WorkAction, check_memberships,
     };
     use crate::peers::script::tests::script;
     use crate::peers::tests::{Recorder, descriptor, directory, host, observe};
@@ -930,7 +960,6 @@ mod tests {
     const GROUP: &str = "ci-triage";
     const OTHER_GROUP: &str = "deploy-watch";
     const MISSING_GROUP: &str = "no-such-group";
-    const MALFORMED_GROUP: &str = "CI_Triage";
     const PATTERN: &str = "ci.*";
     const TOPIC: &str = "ci.failures";
     const TEXT: &str = "The nightly build failed";
@@ -1338,14 +1367,6 @@ mod tests {
             );
             assert!(worker.owned_work().await.unwrap().is_empty());
         });
-    }
-
-    #[test_case(&[GROUP, OTHER_GROUP], None; "distinct_groups")]
-    #[test_case(&[GROUP, GROUP], Some(INVALID_GROUP); "duplicate")]
-    #[test_case(&[MALFORMED_GROUP], Some(INVALID_GROUP); "malformed")]
-    fn memberships_are_validated(groups: &[&str], error: Option<&str>) {
-        let groups: Vec<String> = groups.iter().copied().map(str::to_owned).collect();
-        assert_eq!(check_memberships(&groups).err().as_deref(), error);
     }
 
     #[test]

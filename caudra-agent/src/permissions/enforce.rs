@@ -1224,7 +1224,7 @@ pub(super) mod tests {
     pub(in crate::permissions) async fn active_plan_fixture(
         remote: bool,
     ) -> (TempDir, ToolContext, PermissionIntent, Value) {
-        let mut builder = Builder::new();
+        let builder = &mut Builder::new();
         #[cfg(unix)]
         builder.permissions(Permissions::from_mode(PRIVATE_DIRECTORY_MODE));
         let root = builder

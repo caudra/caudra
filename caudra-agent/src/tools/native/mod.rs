@@ -251,7 +251,7 @@ mod tests {
     const DIRECTORY_MODE: u32 = 0o700;
 
     pub(super) fn tempdir() -> TempDir {
-        let mut builder = Builder::new();
+        let builder = &mut Builder::new();
         #[cfg(unix)]
         builder.permissions(Permissions::from_mode(DIRECTORY_MODE));
         builder

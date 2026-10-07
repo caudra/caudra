@@ -53,15 +53,20 @@ impl DestinationIdentity {
             bail!("destination must be its explicit canonical directory, not an alias");
         }
         let directory = open_directory(root)?;
-        let metadata = directory.metadata()?;
         #[cfg(unix)]
-        return Ok(Self {
-            root: root.to_owned(),
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        });
+        {
+            let metadata = directory.metadata()?;
+            Ok(Self {
+                root: root.to_owned(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            })
+        }
         #[cfg(not(unix))]
-        bail!("permission rebinding requires a supported physical directory identity");
+        {
+            let _ = directory;
+            bail!("permission rebinding requires a supported physical directory identity");
+        }
     }
 
     fn recheck(&self, directory: &File) -> Result<()> {
@@ -92,7 +97,7 @@ fn open_directory(root: &Path) -> Result<File> {
     #[cfg(not(unix))]
     {
         let _ = root;
-        bail!("no-follow permission directory handles are unsupported on this platform")
+        bail!("no-follow permission directory handles are unsupported on this platform");
     }
 }
 
@@ -594,11 +599,11 @@ mod tests {
     use caudra_storage::id::CaudraId;
     use caudra_storage::permission_state::{
         PermissionExecutorKind, PermissionLifetime, PermissionResourceAccess,
-        PermissionResourceConstraint, PermissionState,
+        PermissionResourceConstraint,
     };
     #[cfg(unix)]
     use caudra_storage::permission_state::{
-        PermissionStateError, inventory_fingerprint, replace_reviewed,
+        PermissionState, PermissionStateError, inventory_fingerprint, replace_reviewed,
     };
     use test_case::test_case;
 
@@ -606,10 +611,11 @@ mod tests {
         ANCESTOR_RESTRICTION, DestinationIdentity, INPUT_UNSUPPORTED, Path,
         PermissionArgumentConstraint, PermissionResourceKind, PermissionResourceSelector,
         PermissionRuleRecord, PermissionSubject, RESTRICTIVE_BLOCKER, RebindCandidates,
-        RebindClassification, StateDir, StructuredPermissionEffect, StructuredPermissionRule,
-        WORKDIR, apply, fs, inventory, open_directory, preview, read_inventory, validate_absolute,
-        value_digest,
+        RebindClassification, StructuredPermissionEffect, StructuredPermissionRule, WORKDIR,
+        inventory, preview, validate_absolute, value_digest,
     };
+    #[cfg(unix)]
+    use super::{StateDir, apply, fs, open_directory, read_inventory};
 
     const OLD: &str = "/historical/project";
     const NEW: &str = "/destination/project";
