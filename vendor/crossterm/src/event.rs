@@ -137,6 +137,8 @@ use crate::{
     event::{filter::EventFilter, internal::InternalEvent},
 };
 use std::fmt::{self, Display};
+#[cfg(unix)]
+use std::io;
 use std::time::Duration;
 
 use bitflags::bitflags;
@@ -186,6 +188,11 @@ use std::io::{ErrorKind, Result as IoResult};
 /// ```
 pub fn poll(timeout: Duration) -> std::io::Result<bool> {
     internal::poll(Some(timeout), &EventFilter)
+}
+
+#[cfg(unix)]
+pub fn query_program_status(timeout: Duration) -> io::Result<bool> {
+    internal::query_program_status(timeout)
 }
 
 /// Reads a single [`Event`](enum.Event.html).

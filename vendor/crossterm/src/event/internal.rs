@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::io::{self, stdout};
 use std::time::Duration;
 
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
@@ -13,6 +15,15 @@ pub(crate) fn lock_event_reader() -> MappedMutexGuard<'static, InternalEventRead
     MutexGuard::map(EVENT_READER.lock(), |reader| {
         reader.get_or_insert_with(InternalEventReader::default)
     })
+}
+
+#[cfg(unix)]
+pub(crate) fn query_program_status(timeout: Duration) -> io::Result<bool> {
+    let timeout = PollTimeout::new(Some(timeout));
+    let Some(mut reader) = try_lock_event_reader_for(timeout.leftover().unwrap_or_default()) else {
+        return Ok(false);
+    };
+    reader.query_program_status(timeout.leftover().unwrap_or_default(), &mut stdout().lock())
 }
 
 fn try_lock_event_reader_for(
@@ -74,4 +85,5 @@ pub(crate) enum InternalEvent {
     KeyboardEnhancementFlags(KeyboardEnhancementFlags),
     /// Attributes and architectural class of the terminal.
     PrimaryDeviceAttributes,
+    ProgramStatusSupported,
 }

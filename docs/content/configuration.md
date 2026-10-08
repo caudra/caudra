@@ -151,7 +151,7 @@ To keep using `init.lua`, set `lua_plugins = true` under `[experimental]`. Its `
 | `splash_animation` | bool | `true` | - | - | Show splash animation on startup |
 | `scrollbar` | bool | `true` | - | - | Show vertical scrollbar in scrollable areas |
 | `touch` | string | `auto` | - | - | Touch-friendly pointer handling: auto, on, or off. Widens the scrollbar's hit zone so a finger can tap it, scrolls one line per wheel event instead of mouse_scroll_lines, and leaves text selection to the terminal. Auto detects Termux around Caudra itself, which SSH does not carry, so set this to on when reaching Caudra from a phone over SSH |
-| `notifications` | string | `auto` | - | - | Terminal notification method: auto, osc9, bell, or off. Auto is off in a Herdr pane, where Herdr shows its own notification when Caudra is blocked or finished |
+| `notifications` | string | `auto` | - | - | Terminal notification method: auto, osc9, bell, or off. Auto reports OSC 7501 program status when supported, otherwise uses OSC 9 or BEL. Native Herdr reporting takes precedence in a Herdr pane. Explicit osc9, bell, and off skip program status detection |
 | `math` | string | `unicode` | - | - | How LaTeX maths renders: unicode (approximate with Unicode) or raw (show the LaTeX source) |
 | `mermaid` | string | `unicode` | - | - | How mermaid flowcharts render: unicode (draw them with box-drawing characters) or off (leave the fence as code) |
 | `flash_duration_ms` | u64 | `10000` | - | - | Duration of ordinary status-bar messages (ms). Confirmation prompts use a fixed 3-second window |

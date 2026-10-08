@@ -9,6 +9,10 @@ use crate::event::{
 
 use crate::event::internal::InternalEvent;
 
+const OSC_SEQUENCE_LIMIT: usize = 4096;
+const PROGRAM_STATUS_REPLY_PREFIX: &[u8] = b"\x1b]7501;?";
+const PROGRAM_STATUS_KEY_LIMIT: usize = 16;
+
 // Event parsing
 //
 // This code (& previous one) are kind of ugly. We have to think about this,
@@ -127,6 +131,51 @@ pub(crate) fn parse_event(
                 .map(InternalEvent::Event)
         }),
     }
+}
+
+fn osc_terminated(buffer: &[u8]) -> bool {
+    buffer.ends_with(b"\x1b\\") || buffer.ends_with(b"\x07")
+}
+
+fn parse_osc(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
+    if buffer.len() > OSC_SEQUENCE_LIMIT {
+        return Err(could_not_parse_event_error());
+    }
+    if !osc_terminated(buffer) {
+        return Ok(None);
+    }
+    let payload = buffer
+        .strip_suffix(b"\x1b\\")
+        .or_else(|| buffer.strip_suffix(b"\x07"));
+    let fields = payload.and_then(|payload| payload.strip_prefix(PROGRAM_STATUS_REPLY_PREFIX));
+    if fields.is_some_and(valid_program_status_fields) {
+        Ok(Some(InternalEvent::ProgramStatusSupported))
+    } else {
+        Err(could_not_parse_event_error())
+    }
+}
+
+fn valid_program_status_fields(fields: &[u8]) -> bool {
+    if fields.is_empty() {
+        return true;
+    }
+    let Some(fields) = fields.strip_prefix(b":") else {
+        return false;
+    };
+    fields.split(|byte| *byte == b':').all(|field| {
+        let Some(equals) = field.iter().position(|byte| *byte == b'=') else {
+            return false;
+        };
+        let key = field[..equals].trim_ascii();
+        let value = field[equals + 1..].trim_ascii();
+        !key.is_empty()
+            && key.len() <= PROGRAM_STATUS_KEY_LIMIT
+            && key.iter().all(u8::is_ascii_lowercase)
+            && value.iter().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(byte, b'_' | b'.' | b',' | b'+' | b'/' | b'=' | b'-')
+            })
+    })
 }
 
 // converts KeyCode to KeyEvent (adds shift modifier in case of uppercase characters)
@@ -1654,6 +1703,8 @@ mod tests {
 pub(crate) struct Parser {
     buffer: Vec<u8>,
     internal_events: VecDeque<InternalEvent>,
+    discarding_osc: bool,
+    program_status_query: bool,
 }
 
 impl Default for Parser {
@@ -1676,18 +1727,51 @@ impl Default for Parser {
             // method implementation, all events are consumed before the next TTY_BUFFER
             // is processed -> events pushed.
             internal_events: VecDeque::with_capacity(128),
+            discarding_osc: false,
+            program_status_query: false,
         }
     }
 }
 
 impl Parser {
+    #[cfg(unix)]
+    pub(crate) fn set_program_status_query(&mut self, enabled: bool) {
+        self.program_status_query = enabled;
+        if !enabled {
+            if self.buffer.starts_with(b"\x1b]") && self.buffer.len() > 2 {
+                self.buffer.clear();
+            }
+            self.discarding_osc = false;
+            self.flush();
+        }
+    }
+
     pub(crate) fn advance(&mut self, buffer: &[u8], more: bool) {
         for (idx, byte) in buffer.iter().enumerate() {
             let more = idx + 1 < buffer.len() || more;
 
             self.buffer.push(*byte);
 
-            match parse_event(&self.buffer, more) {
+            if self.program_status_query
+                && self.buffer.starts_with(b"\x1b]")
+                && (self.discarding_osc || self.buffer.len() > OSC_SEQUENCE_LIMIT)
+            {
+                self.discarding_osc = !osc_terminated(&self.buffer);
+                if self.discarding_osc {
+                    self.buffer.truncate(2);
+                    self.buffer.push(*byte);
+                } else {
+                    self.buffer.clear();
+                }
+                continue;
+            }
+
+            let event = if self.program_status_query && self.buffer.starts_with(b"\x1b]") {
+                parse_osc(&self.buffer)
+            } else {
+                parse_event(&self.buffer, more || self.program_status_query)
+            };
+            match event {
                 Ok(Some(ie)) => {
                     self.internal_events.push_back(ie);
                     self.buffer.clear();
@@ -1924,5 +2008,141 @@ mod parser_flush_tests {
         let mut p = Parser::default();
         p.flush();
         assert!(p.next().is_none());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod program_status_tests {
+    use super::{OSC_SEQUENCE_LIMIT, Parser, parse_osc};
+    use crate::event::{Event, KeyCode, KeyEvent, KeyModifiers, internal::InternalEvent};
+    use test_case::test_case;
+
+    const SUPPORTED: &[u8] = b"\x1b]7501;?\x1b\\";
+
+    #[test_case(SUPPORTED; "st")]
+    #[test_case(b"\x1b]7501;?\x07"; "bel")]
+    #[test_case(b"\x1b]7501;?:version=2:features=one,two\x1b\\"; "future_fields_st")]
+    #[test_case(b"\x1b]7501;?:version=2:future=\x07"; "future_fields_bel")]
+    #[test_case(b"\x1b]7501;?: version = 2 \x07"; "field_whitespace")]
+    fn complete_program_status_reply_survives_every_split(reply: &[u8]) {
+        assert_eq!(
+            parse_osc(reply).unwrap(),
+            Some(InternalEvent::ProgramStatusSupported)
+        );
+        for split in 1..reply.len() {
+            let mut parser = Parser::default();
+            parser.set_program_status_query(true);
+            parser.advance(&reply[..split], false);
+            assert_eq!(parser.next(), None);
+            parser.advance(&reply[split..], false);
+            assert_eq!(parser.next(), Some(InternalEvent::ProgramStatusSupported));
+            assert_eq!(parser.next(), None);
+        }
+    }
+
+    #[test_case(b"\x1b]75010;?\x07"; "wrong_osc")]
+    #[test_case(b"\x1b]7501;?suffix\x07"; "prefix_match")]
+    #[test_case(b"\x1b]7501;state=idle\x07"; "report_not_reply")]
+    #[test_case(b"\x1b]7501;?:\x07"; "empty_field")]
+    #[test_case(b"\x1b]7501;?:version\x07"; "missing_equals")]
+    #[test_case(b"\x1b]7501;?:=2\x07"; "empty_key")]
+    #[test_case(b"\x1b]7501;?:version=2;other=3\x07"; "invalid_value")]
+    #[test_case(b"\x1b]7501;?:future=bad\x00value\x07"; "control_in_value")]
+    #[test_case(b"\x1b]7501;?\x1b[31m\x07"; "embedded_escape")]
+    #[test_case(b"\x1b]2;\x1b]7501;?\x07"; "nested_osc")]
+    fn malformed_program_status_reply_never_becomes_input(reply: &[u8]) {
+        assert!(parse_osc(reply).is_err());
+        let input = [reply, b"a", SUPPORTED].concat();
+        for split in 0..=input.len() {
+            let mut parser = Parser::default();
+            parser.set_program_status_query(true);
+            parser.advance(&input[..split], false);
+            parser.advance(&input[split..], false);
+            assert_eq!(
+                parser.collect::<Vec<_>>(),
+                vec![
+                    InternalEvent::Event(Event::Key(KeyCode::Char('a').into())),
+                    InternalEvent::ProgramStatusSupported,
+                ]
+            );
+        }
+    }
+
+    #[test_case(b"\x1b]7501;?"; "unterminated")]
+    #[test_case(b"\x1b]7501;?\x1b"; "partial_st")]
+    fn incomplete_program_status_reply_does_not_capture_input_after_query(reply: &[u8]) {
+        let mut parser = Parser::default();
+        parser.set_program_status_query(true);
+        parser.advance(reply, false);
+        parser.set_program_status_query(false);
+        parser.flush();
+        assert_eq!(parser.next(), None);
+        assert!(parser.buffer.is_empty());
+        parser.advance(b"a", false);
+        assert_eq!(
+            parser.next(),
+            Some(InternalEvent::Event(Event::Key(KeyCode::Char('a').into())))
+        );
+    }
+
+    #[test_case(false; "without_probe")]
+    #[test_case(true; "after_probe")]
+    fn alt_close_bracket_retains_normal_input_behavior(probe: bool) {
+        let mut parser = Parser::default();
+        if probe {
+            parser.set_program_status_query(true);
+            parser.advance(SUPPORTED, false);
+            assert_eq!(parser.next(), Some(InternalEvent::ProgramStatusSupported));
+            parser.set_program_status_query(false);
+        }
+        parser.advance(b"\x1b]a", false);
+        assert_eq!(
+            parser.collect::<Vec<_>>(),
+            vec![
+                InternalEvent::Event(Event::Key(KeyEvent::new(
+                    KeyCode::Char(']'),
+                    KeyModifiers::ALT
+                ))),
+                InternalEvent::Event(Event::Key(KeyCode::Char('a').into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn oversized_unterminated_reply_does_not_poison_input_after_probe() {
+        let mut parser = Parser::default();
+        parser.set_program_status_query(true);
+        parser.advance(b"\x1b]7501;?:future=", false);
+        parser.advance(&vec![b'x'; OSC_SEQUENCE_LIMIT], false);
+        assert!(parser.discarding_osc);
+        parser.set_program_status_query(false);
+        parser.advance(b"a", false);
+        assert_eq!(
+            parser.collect::<Vec<_>>(),
+            vec![InternalEvent::Event(Event::Key(KeyCode::Char('a').into()))]
+        );
+    }
+
+    #[test_case(OSC_SEQUENCE_LIMIT, true; "at_limit")]
+    #[test_case(OSC_SEQUENCE_LIMIT + 1, false; "over_limit")]
+    #[test_case(OSC_SEQUENCE_LIMIT * 2, false; "oversize")]
+    fn program_status_reply_is_bounded_without_leaking_tail(length: usize, supported: bool) {
+        const PREFIX: &[u8] = b"\x1b]7501;?:future=";
+        const ST: &[u8] = b"\x1b\\";
+        let reply = [PREFIX, &vec![b'x'; length - PREFIX.len() - ST.len()], ST].concat();
+        let mut parser = Parser::default();
+        parser.set_program_status_query(true);
+        for byte in reply {
+            parser.advance(&[byte], false);
+            assert!(parser.buffer.len() <= OSC_SEQUENCE_LIMIT);
+        }
+        if supported {
+            assert_eq!(parser.next(), Some(InternalEvent::ProgramStatusSupported));
+        }
+        parser.advance(b"z", false);
+        assert_eq!(
+            parser.collect::<Vec<_>>(),
+            vec![InternalEvent::Event(Event::Key(KeyCode::Char('z').into()))]
+        );
     }
 }

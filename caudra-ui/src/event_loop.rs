@@ -39,7 +39,8 @@ use caudra_agent::workflow::WorkflowTransition;
 use caudra_agent::worktree::git::Git;
 use caudra_agent::worktree::{Backend, Request as WorktreeRequest, counterpart, label};
 use caudra_agent::{
-    AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle, mcp,
+    AgentConfig, AgentEvent, CancelToken, DoneReason, Envelope, McpCommand, McpConfigErrors,
+    McpHandle, mcp,
 };
 use caudra_automation::request::ProfileArming;
 use caudra_automation::snapshot::{AutomationEvent, SettleBlocker};
@@ -71,7 +72,6 @@ use caudra_storage::workspace_binding::StoredWorkspaceBinding;
 use caudra_storage::worktrees;
 use caudra_workbench::WorkbenchAction;
 use caudra_workspace::WorkspaceControlCommand;
-#[cfg(not(windows))]
 use crossterm::event::KeyEventKind;
 use crossterm::event::{
     Event, KeyModifiers, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
@@ -112,7 +112,7 @@ use crate::{
 use crate::{load_app_session, open_app_session_with_cursor};
 
 use crate::storage_writer::StorageWriter;
-use crate::terminal;
+use crate::terminal::{self, ProgramBlockKind, ProgramStatus, ProgramStatusReporter};
 
 /// Max events handled per frame so a flood cannot starve rendering.
 const DRAIN_BUDGET: usize = 256;
@@ -259,6 +259,7 @@ enum PendingCompletion {
 struct RunNotificationState {
     response_candidate: Option<String>,
     pending_completion: Option<PendingCompletion>,
+    outcome: Option<ProgramStatus>,
     last_attention: Option<Notification>,
     /// The newest `notify()` text since the last reconcile.
     pending_notice: Option<Notification>,
@@ -272,6 +273,7 @@ impl RunNotificationState {
     fn on_queue_item_consumed(&mut self) {
         self.response_candidate = None;
         self.pending_completion = None;
+        self.outcome = None;
     }
 
     fn on_turn_complete(&mut self, message: &Message) {
@@ -279,16 +281,24 @@ impl RunNotificationState {
     }
 
     fn on_done(&mut self, event: &AgentEvent) {
-        let notification = match event {
-            AgentEvent::Done { .. } => Notification::TurnComplete {
-                response: self.response_candidate.take(),
-            },
+        let (notification, outcome) = match event {
+            AgentEvent::Done { reason, .. } => (
+                Notification::TurnComplete {
+                    response: self.response_candidate.take(),
+                },
+                match reason {
+                    DoneReason::EndTurn => Some(ProgramStatus::Done),
+                    DoneReason::Cancelled => None,
+                    DoneReason::MaxTurns | DoneReason::MaxTokens => Some(ProgramStatus::Error),
+                },
+            ),
             AgentEvent::Error { .. } => {
                 self.response_candidate = None;
-                Notification::error_completion()
+                (Notification::error_completion(), Some(ProgramStatus::Error))
             }
             _ => return,
         };
+        self.outcome = outcome;
         self.pending_completion = Some(PendingCompletion::WaitingForQueueDrain(notification));
     }
 
@@ -303,6 +313,23 @@ impl RunNotificationState {
 
     fn on_manual_exit(&mut self) {
         self.pending_completion = None;
+        self.outcome = None;
+    }
+
+    fn program_status(&self, status: ProgramStatus, busy: bool) -> ProgramStatus {
+        if matches!(status, ProgramStatus::Blocked(_)) {
+            status
+        } else if status == ProgramStatus::Working || busy {
+            ProgramStatus::Working
+        } else {
+            self.outcome.unwrap_or(ProgramStatus::Idle)
+        }
+    }
+
+    fn reconcile_program_status(&mut self, terminal_focused: bool) -> Option<Notification> {
+        let notice = self.pending_notice.take();
+        self.reconcile(None, SessionStatus::Idle, true, true);
+        (!terminal_focused).then_some(notice).flatten()
     }
 
     /// Only a firing's `notify()` reaches the terminal. An arming refusal carries error details,
@@ -578,6 +605,88 @@ impl SessionRuntime {
             self.app.shell.active_ids().len(),
         )
     }
+
+    fn program_status(&self) -> ProgramStatus {
+        self.program_status_with_agent_stopped(
+            self.handles.is_finished() && self.handles.agent_rx.is_empty(),
+        )
+    }
+
+    fn program_status_with_agent_stopped(&self, agent_stopped: bool) -> ProgramStatus {
+        let status = if self.holds_peer_messages() {
+            ProgramStatus::Blocked(Some(ProgramBlockKind::Permission))
+        } else {
+            self.app.program_status()
+        };
+        self.notifications.program_status(
+            status,
+            runtime_busy(
+                self.app.has_session_work(),
+                agent_stopped || self.handles.queue.is_empty(),
+                !agent_stopped && self.handles.queue.is_processing(),
+                self.handles.active_background_tasks(),
+                self.app.shell.active_ids().len(),
+            ) || self
+                .handles
+                .background
+                .as_ref()
+                .is_some_and(|background| background.has_pending())
+                || !self.app.background_claims.is_empty()
+                || self.app.background_delivery.pending()
+                || (self.notifications.waiting_for_drain() && !agent_stopped),
+        )
+    }
+}
+
+fn aggregate_program_status(statuses: impl IntoIterator<Item = ProgramStatus>) -> ProgramStatus {
+    statuses
+        .into_iter()
+        .fold(ProgramStatus::Idle, |selected, candidate| {
+            let priority = |status| match status {
+                ProgramStatus::Idle => 0,
+                ProgramStatus::Done => 1,
+                ProgramStatus::Error => 2,
+                ProgramStatus::Working => 3,
+                ProgramStatus::Blocked(_) => 4,
+            };
+            if priority(candidate) > priority(selected) {
+                candidate
+            } else {
+                selected
+            }
+        })
+}
+
+fn acknowledges_program_status(event: &Event) -> bool {
+    match event {
+        Event::Key(key) => key.kind != KeyEventKind::Release,
+        Event::Paste(_) => true,
+        Event::Mouse(mouse) => matches!(
+            mouse.kind,
+            MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        ),
+        _ => false,
+    }
+}
+
+fn exit_program_status(status: ProgramStatus, exit_on_done: bool, failed: bool) -> ProgramStatus {
+    if failed {
+        ProgramStatus::Error
+    } else if exit_on_done && matches!(status, ProgramStatus::Done | ProgramStatus::Error) {
+        status
+    } else {
+        ProgramStatus::Idle
+    }
+}
+
+fn runtime_busy(
+    app_working: bool,
+    queue_empty: bool,
+    queue_processing: bool,
+    background_tasks: usize,
+    shell_commands: usize,
+) -> bool {
+    app_working || !queue_empty || queue_processing || background_tasks > 0 || shell_commands > 0
 }
 
 fn runtime_observation(
@@ -590,12 +699,13 @@ fn runtime_observation(
 ) -> HerdrObservation {
     if let Some(message) = blocker {
         HerdrObservation::blocked(message)
-    } else if app_working
-        || !queue_empty
-        || queue_processing
-        || background_tasks > 0
-        || shell_commands > 0
-    {
+    } else if runtime_busy(
+        app_working,
+        queue_empty,
+        queue_processing,
+        background_tasks,
+        shell_commands,
+    ) {
         HerdrObservation::working()
     } else {
         HerdrObservation::idle()
@@ -1365,6 +1475,7 @@ pub(crate) struct EventLoop<'t> {
     last_workspace_tabs: Option<WorkspaceTabsSnapshot>,
     terminal_focused: bool,
     notifier: Option<terminal::TerminalNotifier>,
+    program_status_reporter: Option<ProgramStatusReporter>,
     ctx: SpawnCtx,
     input: InputReader,
     auto_theme: Option<AutoSwitch>,
@@ -1653,6 +1764,8 @@ impl<'t> EventLoop<'t> {
 
         let notifier =
             terminal::TerminalNotifier::new(ui_config.notifications, herdr_reporter.is_some());
+        let program_status_reporter =
+            ProgramStatusReporter::detect(ui_config.notifications, herdr_reporter.is_some());
         let mut ctx = SpawnCtx {
             peer_host: peer_host.filter(|_| {
                 config.features.enabled(Feature::CrossSessionMessaging)
@@ -1761,6 +1874,7 @@ impl<'t> EventLoop<'t> {
             last_workspace_tabs: None,
             terminal_focused: false,
             notifier,
+            program_status_reporter,
             ctx,
             input,
             auto_theme,
@@ -1891,7 +2005,12 @@ impl<'t> EventLoop<'t> {
         };
         // Fatal errors still save every session, kill MCP process groups,
         // and drain the storage writer before the process exits.
-        let report = self.shutdown()?;
+        let status = exit_program_status(
+            self.program_status(),
+            self.sessions[self.focused].app.exit_on_done,
+            result.is_err(),
+        );
+        let report = self.shutdown(status)?;
         result.map(|()| report)
     }
 
@@ -2553,6 +2672,7 @@ impl<'t> EventLoop<'t> {
         self.emit_status_changes();
         self.publish_live_sessions();
         dirty |= self.emit_task_changes();
+        self.emit_program_status();
         self.emit_notifications();
         if let Some(reporter) = &self.herdr_reporter {
             reporter.observe(HerdrStatus {
@@ -2688,6 +2808,9 @@ impl<'t> EventLoop<'t> {
             terminal::open_in_editor(path, self.terminal)
         };
         self.terminal_focused = false;
+        if let Some(reporter) = &mut self.program_status_reporter {
+            reporter.invalidate();
+        }
         match result {
             Ok(code) => code,
             Err(e) => {
@@ -2754,18 +2877,40 @@ impl<'t> EventLoop<'t> {
         dirty | self.focused_app().refresh_task_picker()
     }
 
+    fn program_status(&self) -> ProgramStatus {
+        aggregate_program_status(self.sessions.iter().map(SessionRuntime::program_status))
+    }
+
+    fn emit_program_status(&mut self) {
+        if self.program_status_reporter.is_none() {
+            return;
+        }
+        let status = self.program_status();
+        if let Some(reporter) = &mut self.program_status_reporter
+            && let Err(error) = reporter.observe(status)
+        {
+            warn!(%error, "program status reporting disabled after write failure");
+            self.program_status_reporter = None;
+        }
+    }
+
     fn emit_notifications(&mut self) {
         let Some(notifier) = &self.notifier else {
             return;
         };
         let mut selected = None;
         for rt in &mut self.sessions {
-            let candidate = rt.notifications.reconcile(
-                rt.app.attention(),
-                rt.last_status,
-                rt.handles.queue.is_empty(),
-                self.terminal_focused,
-            );
+            let candidate = if self.program_status_reporter.is_some() {
+                rt.notifications
+                    .reconcile_program_status(self.terminal_focused)
+            } else {
+                rt.notifications.reconcile(
+                    rt.app.attention(),
+                    rt.last_status,
+                    rt.handles.queue.is_empty(),
+                    self.terminal_focused,
+                )
+            };
             selected = select_notification(selected, candidate);
         }
         if let Some(notification) = selected
@@ -3335,10 +3480,22 @@ impl<'t> EventLoop<'t> {
     fn handle_input(&mut self, raw: Event) {
         let mut pending = Some(raw);
         while let Some(ev) = pending.take() {
+            let runtime = &self.sessions[self.focused];
+            let acknowledge = (self.program_status_reporter.is_some()
+                && acknowledges_program_status(&ev)
+                && matches!(
+                    runtime.program_status(),
+                    ProgramStatus::Done | ProgramStatus::Error
+                ))
+            .then_some(runtime.id());
             let (msg, leftover) = self.translate(ev);
             if let Some(msg) = msg {
                 let actions = self.sessions[self.focused].app.update(msg);
                 self.dispatch(self.focused, actions);
+            }
+            let runtime = &mut self.sessions[self.focused];
+            if acknowledge == Some(runtime.id()) {
+                runtime.notifications.outcome = None;
             }
             pending = leftover;
         }
@@ -4243,6 +4400,9 @@ impl<'t> EventLoop<'t> {
                 });
                 drop(pause);
                 self.terminal_focused = false;
+                if let Some(reporter) = &mut self.program_status_reporter {
+                    reporter.invalidate();
+                }
 
                 match result {
                     Ok(()) => {
@@ -4528,7 +4688,7 @@ impl<'t> EventLoop<'t> {
         drained
     }
 
-    fn shutdown(mut self) -> Result<ShutdownReport> {
+    fn shutdown(mut self, status: ProgramStatus) -> Result<ShutdownReport> {
         let started = Instant::now();
         let relocating =
             self.relocation.is_some() || self.sandbox.is_some() || self.sandbox_control.is_some();
@@ -4675,6 +4835,15 @@ impl<'t> EventLoop<'t> {
             total_ms = started.elapsed().as_millis() as u64,
             "ui shutdown phases"
         );
+        if let Some(reporter) = &mut self.program_status_reporter
+            && let Err(error) = reporter.observe(if relocation_error.is_some() {
+                ProgramStatus::Error
+            } else {
+                status
+            })
+        {
+            warn!(%error, "failed to report final program status");
+        }
         if let Some(error) = relocation_error {
             return Err(eyre!("{RELOCATION_SHUTDOWN_ERR}: {error}"));
         }
@@ -4752,7 +4921,7 @@ mod tests {
     use crate::sandbox::transfer::{TransferCommand, TransferLink, TransferScope};
     use caudra_agent::background::BackgroundTasks;
     use caudra_agent::tools::native::plan::PlanTarget;
-    use caudra_agent::{AgentMode, DoneReason, McpSnapshotReader};
+    use caudra_agent::{AgentMode, McpSnapshotReader, SubagentInfo, ToolDoneEvent};
     use caudra_automation::event::InputKind;
     use caudra_config::sandbox::Revision;
     use caudra_config::{FeatureFlags, PermissionsConfig, ToolKey};
@@ -4770,6 +4939,8 @@ mod tests {
     const MISSING_PLAN_PROFILE: &str = "missing-plan-handoff-profile";
     const PLAN_TRANSACTION_BLOCKED: &str = "plan handoff did not fail at its admission boundary";
     const PLANNED_PROMPT: &str = "Plan the change.";
+    const STATUS_ERROR: &str = "provider stopped";
+    const STATUS_RUN_ID: u64 = 7;
 
     struct PlanProvider;
 
@@ -5404,6 +5575,174 @@ mod tests {
         state
     }
 
+    #[test_case(DoneReason::EndTurn, ProgramStatus::Done; "completed")]
+    #[test_case(DoneReason::Cancelled, ProgramStatus::Idle; "cancelled")]
+    #[test_case(DoneReason::MaxTurns, ProgramStatus::Error; "turn_limit")]
+    #[test_case(DoneReason::MaxTokens, ProgramStatus::Error; "token_limit")]
+    fn program_outcome_waits_for_drain_and_survives_notification_delivery(
+        reason: DoneReason,
+        expected: ProgramStatus,
+    ) {
+        let mut state = RunNotificationState::default();
+        state.on_done(&AgentEvent::Done {
+            usage: TokenUsage::default(),
+            num_turns: 1,
+            reason,
+        });
+        assert_eq!(
+            state.program_status(ProgramStatus::Idle, state.waiting_for_drain()),
+            ProgramStatus::Working
+        );
+        state.on_drain();
+        state.reconcile(None, SessionStatus::Idle, true, true);
+        assert_eq!(state.program_status(ProgramStatus::Idle, false), expected);
+    }
+
+    #[test]
+    fn terminal_error_is_retained_until_new_work() {
+        let mut state = RunNotificationState::default();
+        state.on_done(&AgentEvent::Error {
+            message: STATUS_ERROR.into(),
+        });
+        assert_eq!(
+            state.program_status(ProgramStatus::Idle, state.waiting_for_drain()),
+            ProgramStatus::Working
+        );
+        state.on_drain();
+        assert_eq!(
+            state.program_status(ProgramStatus::Idle, false),
+            ProgramStatus::Error
+        );
+        state.on_queue_item_consumed();
+        assert_eq!(
+            state.program_status(ProgramStatus::Idle, false),
+            ProgramStatus::Idle
+        );
+    }
+
+    #[test]
+    fn recoverable_tool_error_does_not_finish_the_program() {
+        let mut state = RunNotificationState::default();
+        state.on_done(&AgentEvent::ToolDone(Box::new(ToolDoneEvent::error(
+            PERMISSION_ID.into(),
+            STATUS_ERROR,
+        ))));
+        assert!(!state.waiting_for_drain());
+        assert_eq!(state.outcome, None);
+        assert_eq!(
+            state.program_status(ProgramStatus::Working, false),
+            ProgramStatus::Working
+        );
+    }
+
+    #[test_case(RunNotificationState::on_queue_item_consumed; "queued_followup")]
+    #[test_case(RunNotificationState::reset; "new_run_or_cancel")]
+    #[test_case(RunNotificationState::on_manual_exit; "manual_exit")]
+    fn interrupted_completion_does_not_reappear_after_drain(
+        interrupt: fn(&mut RunNotificationState),
+    ) {
+        let mut state = RunNotificationState::default();
+        state.on_done(&done_event());
+        interrupt(&mut state);
+        state.on_drain();
+        assert_eq!(
+            state.program_status(ProgramStatus::Idle, false),
+            ProgramStatus::Idle
+        );
+    }
+
+    #[test_case(false; "unfocused")]
+    #[test_case(true; "focused")]
+    fn program_status_suppresses_legacy_completion_but_preserves_automation_notices(focused: bool) {
+        let mut state = due_completion();
+        state.on_automation_event(&notice_event(Some(NOTICE_FIRE_ID)));
+        assert_eq!(
+            state.reconcile_program_status(focused),
+            (!focused).then(automation_notice)
+        );
+        assert_eq!(state.reconcile_program_status(false), None);
+        assert_eq!(
+            state.program_status(ProgramStatus::Idle, false),
+            ProgramStatus::Done
+        );
+    }
+
+    #[test_case(ProgramStatus::Working, false, ProgramStatus::Working; "app_work")]
+    #[test_case(ProgramStatus::Idle, true, ProgramStatus::Working; "background_work")]
+    #[test_case(ProgramStatus::Blocked(None), true, ProgramStatus::Blocked(None); "blocked_while_busy")]
+    fn live_work_outranks_a_pending_program_outcome(
+        status: ProgramStatus,
+        busy: bool,
+        expected: ProgramStatus,
+    ) {
+        let state = due_completion();
+        assert_eq!(state.program_status(status, busy), expected);
+        assert_eq!(
+            state.program_status(ProgramStatus::Idle, false),
+            ProgramStatus::Done
+        );
+    }
+
+    #[test_case(ProgramStatus::Idle, ProgramStatus::Done, ProgramStatus::Done; "done_over_idle")]
+    #[test_case(ProgramStatus::Done, ProgramStatus::Error, ProgramStatus::Error; "error_over_done")]
+    #[test_case(ProgramStatus::Error, ProgramStatus::Working, ProgramStatus::Working; "work_over_error")]
+    #[test_case(ProgramStatus::Working, ProgramStatus::Blocked(None), ProgramStatus::Blocked(None); "blocked_over_work")]
+    fn pane_program_status_aggregates_all_sessions(
+        first: ProgramStatus,
+        second: ProgramStatus,
+        expected: ProgramStatus,
+    ) {
+        assert_eq!(aggregate_program_status([first, second]), expected);
+        assert_eq!(aggregate_program_status([second, first]), expected);
+    }
+
+    #[test_case(ProgramStatus::Done, true, false, ProgramStatus::Done; "exit_on_done")]
+    #[test_case(ProgramStatus::Error, true, false, ProgramStatus::Error; "exit_on_error")]
+    #[test_case(ProgramStatus::Working, false, false, ProgramStatus::Idle; "manual_exit_working")]
+    #[test_case(ProgramStatus::Blocked(None), false, false, ProgramStatus::Idle; "manual_exit_blocked")]
+    #[test_case(ProgramStatus::Done, false, false, ProgramStatus::Idle; "manual_exit_done")]
+    #[test_case(ProgramStatus::Working, false, true, ProgramStatus::Error; "fatal_ui_error")]
+    fn program_status_exit_lifetime(
+        status: ProgramStatus,
+        exit_on_done: bool,
+        failed: bool,
+        expected: ProgramStatus,
+    ) {
+        assert_eq!(exit_program_status(status, exit_on_done, failed), expected);
+    }
+
+    #[test_case(Event::FocusGained, false; "focus_is_not_acknowledgment")]
+    #[test_case(Event::Resize(80, 24), false; "resize_is_not_acknowledgment")]
+    #[test_case(Event::Key(key(KeyCode::Enter)), true; "key_acknowledges")]
+    #[test_case(Event::Paste(PLANNED_PROMPT.into()), true; "paste_acknowledges")]
+    fn program_outcome_requires_user_interaction(event: Event, expected: bool) {
+        assert_eq!(acknowledges_program_status(&event), expected);
+    }
+
+    #[test_case(STATUS_RUN_ID, false, true; "current_parent")]
+    #[test_case(STATUS_RUN_ID + 1, false, false; "stale_run")]
+    #[test_case(STATUS_RUN_ID, true, false; "child_completion")]
+    fn completion_filters_current_top_level_run(run_id: u64, child: bool, expected: bool) {
+        let envelope = Envelope {
+            event: done_event(),
+            run_id,
+            subagent: child.then(|| SubagentInfo {
+                parent_tool_use_id: PERMISSION_ID.into(),
+                task_id: PERMISSION_ID.into(),
+                name: PERMISSION_TOOL.into(),
+                prompt: None,
+                model: None,
+                thinking: None,
+                fast: false,
+                answer_tx: None,
+                steer_tx: None,
+            }),
+            task: None,
+            workflow: None,
+        };
+        assert_eq!(is_current_top_level(STATUS_RUN_ID, &envelope), expected);
+    }
+
     #[test]
     fn completion_waits_for_queue_drain() {
         let mut state = RunNotificationState {
@@ -5622,6 +5961,20 @@ mod tests {
             ),
             HerdrObservation::working()
         );
+        let state = due_completion();
+        assert_eq!(
+            state.program_status(
+                ProgramStatus::Idle,
+                runtime_busy(
+                    app_working,
+                    queue_empty,
+                    queue_processing,
+                    background_tasks,
+                    shell_commands
+                ),
+            ),
+            ProgramStatus::Working,
+        );
     }
 
     #[test]
@@ -5780,6 +6133,38 @@ mod tests {
         plan_spawn_context(&mut source)
             .spawn_fresh_runtime(&source.state.session, None)
             .unwrap()
+    }
+
+    #[test_case(|_| {}, ProgramStatus::Done; "settled")]
+    #[test_case(start_a_run, ProgramStatus::Working; "new_work")]
+    #[test_case(open_a_permission_prompt, ProgramStatus::Blocked(Some(ProgramBlockKind::Permission)); "permission")]
+    fn runtime_program_status_reconciles_live_app_and_outcome(
+        change: fn(&mut SessionRuntime),
+        expected: ProgramStatus,
+    ) {
+        let mut runtime = idle_runtime();
+        runtime.notifications = due_completion();
+        change(&mut runtime);
+        assert_eq!(runtime.program_status(), expected);
+        runtime.handles.cancel();
+    }
+
+    #[test_case(false, ProgramStatus::Working; "live_agent_must_drain")]
+    #[test_case(true, ProgramStatus::Error; "stopped_agent_cannot_drain")]
+    fn startup_failure_without_exit_on_done_resolves_program_status(
+        agent_stopped: bool,
+        expected: ProgramStatus,
+    ) {
+        let mut runtime = idle_runtime();
+        assert!(!runtime.app.exit_on_done);
+        runtime.notifications.on_done(&AgentEvent::Error {
+            message: STATUS_ERROR.into(),
+        });
+        assert_eq!(
+            runtime.program_status_with_agent_stopped(agent_stopped),
+            expected
+        );
+        runtime.handles.cancel();
     }
 
     fn start_a_run(runtime: &mut SessionRuntime) {

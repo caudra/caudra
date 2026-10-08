@@ -65,6 +65,10 @@ impl UnixInternalEventSource {
 }
 
 impl EventSource for UnixInternalEventSource {
+    fn set_program_status_query(&mut self, enabled: bool) {
+        self.parser.set_program_status_query(enabled);
+    }
+
     fn try_read(&mut self, timeout: Option<Duration>) -> io::Result<Option<InternalEvent>> {
         if let Some(event) = self.parser.next() {
             return Ok(Some(event));

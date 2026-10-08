@@ -104,3 +104,5 @@ Caudra detects Herdr from the environment Herdr gives every process it starts in
 - the command that resumes the focused session, `caudra --session <id>`.
 
 After a Herdr restart, Herdr runs that command in the restored pane, so the focused tab comes back. Other tabs stay available in `/sessions`. See [CLI](/docs/cli/) for how reporting works and [Notifications](/docs/notifications/#herdr) for how notifications change inside Herdr.
+
+Native Herdr reporting takes precedence over [OSC 7501 pane status](/docs/notifications/#persistent-pane-status), so Caudra does not probe for or send OSC 7501 while the native reporter is active.

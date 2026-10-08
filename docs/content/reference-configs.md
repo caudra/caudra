@@ -107,9 +107,10 @@ version = 1
 # Type: string.
 # touch = "auto"
 
-# Terminal notification method: auto, osc9, bell, or off. Auto is off in a
-# Herdr pane, where Herdr shows its own notification when Caudra is blocked or
-# finished.
+# Terminal notification method: auto, osc9, bell, or off. Auto reports OSC 7501
+# program status when supported, otherwise uses OSC 9 or BEL. Native Herdr
+# reporting takes precedence in a Herdr pane. Explicit osc9, bell, and off skip
+# program status detection.
 # Type: string.
 # notifications = "auto"
 

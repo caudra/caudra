@@ -125,6 +125,7 @@ use crate::input_document::InputDraft;
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::sandbox::{SandboxWorkers, StoreReply};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
+use crate::terminal::{ProgramBlockKind, ProgramStatus};
 use crate::{AppSession, PatternDiscoveryMode, PatternDiscoveryOutcome, PatternSuggestionLoader};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use caudra_agent::background::{BackgroundTasks, ShellSnapshot};
@@ -5841,6 +5842,52 @@ impl App {
         ]
         .into_iter()
         .find_map(|(blocked, message)| blocked.then_some(Cow::Borrowed(message)))
+    }
+
+    pub(crate) fn program_status(&self) -> ProgramStatus {
+        let block = match self.attention() {
+            Some(Notification::PermissionRequested { .. })
+                if !self.permission_mutation_pending() =>
+            {
+                Some(ProgramBlockKind::Permission)
+            }
+            Some(Notification::AuthenticationRequired) => Some(ProgramBlockKind::Auth),
+            Some(Notification::QuestionRequested | Notification::PlanReady) => {
+                Some(ProgramBlockKind::Question)
+            }
+            Some(
+                Notification::PermissionRequested { .. }
+                | Notification::TurnComplete { .. }
+                | Notification::AutomationNotice { .. },
+            )
+            | None => None,
+        };
+        if let Some(block) = block {
+            return ProgramStatus::Blocked(Some(block));
+        }
+        if self.question_form.is_open() {
+            return ProgramStatus::Blocked(Some(ProgramBlockKind::Question));
+        }
+        if (self.mcp_picker.is_open() && self.mcp_picker.has_awaiting_trust())
+            || (self.permissions_picker.is_open()
+                && !self.permission_mutation_pending()
+                && self.permissions.needs_project_permission_config_trust())
+        {
+            return ProgramStatus::Blocked(Some(ProgramBlockKind::Permission));
+        }
+        if self.sandbox_manager.dirty() && !self.sandbox_manager.pending() {
+            return ProgramStatus::Blocked(None);
+        }
+        if self.has_lifecycle_work()
+            || self.sandbox_network_reconciliation_pending()
+            || crate::sandbox::transfer::active()
+            || self.sandbox_manager.pending()
+            || self.permission_mutation_pending()
+        {
+            ProgramStatus::Working
+        } else {
+            ProgramStatus::Idle
+        }
     }
 
     pub(crate) fn has_lifecycle_work(&self) -> bool {

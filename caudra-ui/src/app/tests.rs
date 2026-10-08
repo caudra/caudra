@@ -21,6 +21,10 @@ use crate::components::projection_modal::UNPREPARED as PROJECTION_UNPREPARED;
 use crate::components::queue_actions::QueueActionKind;
 use crate::components::queue_panel::{QueueAction, QueueHit, QueueHitTarget};
 use crate::components::rewind_picker::RewindEntry;
+#[cfg(unix)]
+use crate::components::sandbox_manager::SandboxAction;
+#[cfg(unix)]
+use crate::components::sandbox_manager::tests::fixture as sandbox_manager_fixture;
 use crate::components::status_bar::StatusBarHitTarget;
 use crate::components::storage_modal::{
     EXPANDED_TITLE as STORAGE_EXPANDED_TITLE, TITLE as STORAGE_TITLE,
@@ -35,6 +39,7 @@ use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{SelectableZone, SelectionState, SelectionZone};
 use crate::test_pattern_discovery_report;
 use arc_swap::ArcSwap;
+use async_lock::Mutex as AsyncMutex;
 use caudra_agent::command::CustomCommand;
 use caudra_agent::commits::repo::CommitSummary;
 use caudra_agent::context::{
@@ -47,23 +52,24 @@ use caudra_agent::permissions::pattern_recognition::{
     CandidateEvidence, InvocationOutcome, ObservationProvenance, PatternCandidate, SupportCount,
 };
 use caudra_agent::permissions::{
-    PermissionManager, PermissionRequest, PermissionResourceSelector, PermissionRuleRecord,
-    RuleOrigin,
+    PermissionAnswer, PermissionLifetime, PermissionManager, PermissionRequest,
+    PermissionResourceSelector, PermissionRuleRecord, RuleOrigin,
 };
 use caudra_agent::tools::native::plan::{self, PlanTarget, PlanWriteResult};
 use caudra_agent::tools::profile_policy::PLAN_REQUIRED;
 use caudra_agent::tools::{
-    SHELL_TOOL_NAME, TODOWRITE_TOOL_NAME, ToolEffect, ToolRegistry, VIEW_IMAGE_TOOL_NAME, native,
+    PermissionScopes, SHELL_TOOL_NAME, TODOWRITE_TOOL_NAME, ToolEffect, ToolRegistry,
+    VIEW_IMAGE_TOOL_NAME, native,
 };
 use caudra_agent::types::{
     AskedQuestion, QuestionEvent, QuestionOption, TodoItem, TodoPriority, TodoStatus,
 };
 use caudra_agent::{
-    BatchProgressEvent, BatchToolEntry, BatchToolStatus, CallStage, DoneReason, GoalResult,
-    GoalStatus, GoalVerdict, HistorySnapshot, ImageMediaType, McpConfigErrors, McpServerInfo,
-    McpServerStatus, McpSnapshot, McpSnapshotReader, SubagentActivity, SubagentProgress,
-    TaskProvenance, TextOutput, ToolAccounting, ToolDoneEvent, ToolOutput, ToolStartEvent,
-    TurnCompleteEvent,
+    BatchProgressEvent, BatchToolEntry, BatchToolStatus, CallStage, CancelToken, DoneReason,
+    EventSender, GoalResult, GoalStatus, GoalVerdict, HistorySnapshot, ImageMediaType,
+    McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader, SharedBuf,
+    SubagentActivity, SubagentProgress, TaskProvenance, TextOutput, ToolAccounting, ToolDoneEvent,
+    ToolOutput, ToolStartEvent, TurnCompleteEvent,
 };
 use caudra_config::decisions::DecisionsConfig;
 use caudra_config::sandbox::SandboxName;
@@ -72,7 +78,9 @@ use caudra_config::{
     PermissionRule, PermissionSource, PermissionsConfig, ToolKey, UiConfig,
 };
 use caudra_lua::test_support::{HintWriterHandle, hint_writer_pair};
-use caudra_lua::{BuiltinAction, HintReader, KeymapReader, LuaCommandInfo, LuaCommandReader};
+use caudra_lua::{
+    BuiltinAction, FloatConfig, HintReader, KeymapReader, LuaCommandInfo, LuaCommandReader,
+};
 use caudra_providers::model_registry::{self, Binding};
 use caudra_providers::{
     Billing, ContentBlock, HistoryItem, HistoryItemKind, Message, RequestOptions, Role,
@@ -124,6 +132,10 @@ use tempfile::{Builder, TempDir};
 use test_case::test_case;
 
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const PROGRAM_STATUS_DECISION: &str = "User decisions must remain distinct from automatic work";
+const PROGRAM_STATUS_AUTOMATIC: &str = "Automatic work must not request user intervention";
+#[cfg(unix)]
+const PROGRAM_STATUS_SAVE: &str = "Sandbox save must await durable acknowledgment";
 const QUESTION_BTW_MAIN_DRAFT: &str = "Keep the main composer draft";
 const QUESTION_BTW_REPLACEMENT: &str = "Which replacement?";
 const QUESTION_BTW_MODEL: &str = "question-btw-model";
@@ -20726,6 +20738,297 @@ fn lifecycle_blocker_reads_like_the_notification() {
             .as_str()
         )
     );
+}
+
+#[test_case(Status::Idle, ProgramStatus::Idle; "idle")]
+#[test_case(Status::Streaming, ProgramStatus::Working; "streaming")]
+fn program_status_without_user_decisions(status: Status, expected: ProgramStatus) {
+    let mut app = test_app();
+    app.status = status;
+    assert_eq!(app.program_status(), expected, "{PROGRAM_STATUS_AUTOMATIC}");
+}
+
+#[test_case(ToolKey::native(SHELL_TOOL_NAME); "named_tool")]
+#[test_case(ToolKey::Wildcard; "wildcard_tool")]
+fn program_status_permission_outranks_auth_and_streaming(tool: ToolKey) {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.pending_input = PendingInput::AuthRetry {
+        waiters: HashSet::from([None]),
+    };
+    app.permission_prompt.open(
+        PREVIEW_PERMISSION_ID.into(),
+        tool,
+        vec![PREVIEW_PERMISSION_COMMAND.into()],
+        None,
+    );
+    assert_eq!(
+        app.program_status(),
+        ProgramStatus::Blocked(Some(ProgramBlockKind::Permission)),
+        "{PROGRAM_STATUS_DECISION}"
+    );
+    app.permission_prompt.close();
+    assert_eq!(
+        app.program_status(),
+        ProgramStatus::Blocked(Some(ProgramBlockKind::Auth)),
+        "{PROGRAM_STATUS_DECISION}"
+    );
+    app.pending_input = PendingInput::None;
+    assert_eq!(app.program_status(), ProgramStatus::Working);
+}
+
+#[test_case(Status::Idle; "idle_question")]
+#[test_case(Status::Streaming; "streaming_question")]
+fn program_status_question_form_requires_a_decision(status: Status) {
+    let mut app = test_app();
+    app.status = status;
+    app.question_form.open(vec![AskedQuestion {
+        question: QUESTION_TEXT.into(),
+        header: QUESTION_HEADER.into(),
+        options: vec![QuestionOption {
+            label: QUESTION_OPTION.into(),
+            description: String::new(),
+        }],
+        multiple: false,
+    }]);
+    assert_eq!(
+        app.program_status(),
+        ProgramStatus::Blocked(Some(ProgramBlockKind::Question)),
+        "{PROGRAM_STATUS_DECISION}"
+    );
+    app.question_form.close();
+    assert_eq!(
+        app.program_status(),
+        if app.status == Status::Streaming {
+            ProgramStatus::Working
+        } else {
+            ProgramStatus::Idle
+        }
+    );
+}
+
+#[test_case(Status::Idle, true, ProgramStatus::Blocked(Some(ProgramBlockKind::Question)); "ready_plan")]
+#[test_case(Status::Streaming, true, ProgramStatus::Working; "plan_still_running")]
+#[test_case(Status::Idle, false, ProgramStatus::Idle; "hidden_plan")]
+fn program_status_plan_decision(status: Status, visible: bool, expected: ProgramStatus) {
+    let mut app = test_app();
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Ready(PathBuf::from(HANDOFF_PLAN_FILE));
+    app.plan_form.on_plan_ready();
+    if !visible {
+        app.plan_form.hide();
+    }
+    app.status = status;
+    assert_eq!(app.program_status(), expected, "{PROGRAM_STATUS_DECISION}");
+}
+
+#[test_case(false; "mcp_trust")]
+#[test_case(true; "project_permission_trust")]
+fn program_status_trust_requires_an_open_decision(project_permissions: bool) {
+    let mut app = if project_permissions {
+        app_awaiting_permission_config_trust()
+    } else {
+        let mut app = test_app();
+        app.mcp_picker = awaiting_mcp_picker();
+        app
+    };
+    assert_eq!(app.program_status(), ProgramStatus::Idle);
+    if project_permissions {
+        app.open_awaiting_permission_config_trust(false);
+        app.finish_permission_jobs();
+    } else {
+        app.open_awaiting_mcp_trust(false);
+    }
+    assert_eq!(
+        app.program_status(),
+        ProgramStatus::Blocked(Some(ProgramBlockKind::Permission)),
+        "{PROGRAM_STATUS_DECISION}"
+    );
+    app.permissions_picker.close();
+    app.mcp_picker.close();
+    assert_eq!(app.program_status(), ProgramStatus::Idle);
+}
+
+#[test_case("/login"; "login")]
+#[test_case("/permissions"; "permissions_settings")]
+#[test_case("/mcp"; "mcp_settings")]
+fn program_status_settings_are_not_user_blockers(command: &str) {
+    let mut app = test_app();
+    app.execute_command(cmd(command), 0);
+    app.finish_permission_jobs();
+    assert!(app.any_overlay_open());
+    assert_eq!(app.program_status(), ProgramStatus::Idle);
+    app.status = Status::Streaming;
+    assert_eq!(app.program_status(), ProgramStatus::Working);
+}
+
+#[test_case(false; "restoring")]
+#[test_case(true; "subagent_retry")]
+fn program_status_background_lifecycle_work(retrying: bool) {
+    let mut app = if retrying {
+        app_with_retrying_subagent()
+    } else {
+        test_app()
+    };
+    app.status = Status::Idle;
+    app.restoring.store(!retrying, Ordering::Relaxed);
+    assert_eq!(
+        app.program_status(),
+        ProgramStatus::Working,
+        "{PROGRAM_STATUS_AUTOMATIC}"
+    );
+}
+
+#[test_case(false, ProgramStatus::Idle; "passive_float")]
+#[test_case(true, ProgramStatus::Blocked(Some(ProgramBlockKind::Question)); "input_float")]
+fn program_status_float_attention(needs_input: bool, expected: ProgramStatus) {
+    let mut app = test_app();
+    let buffer = Arc::new(SharedBuf::new());
+    let config = FloatConfig {
+        needs_input,
+        ..Default::default()
+    };
+    let (event_tx, _event_rx) = flume::bounded(1);
+    let (_command_tx, command_rx) = flume::bounded(1);
+    app.float_mgr
+        .open(buffer, config, true, event_tx, command_rx);
+    assert_eq!(app.program_status(), expected, "{PROGRAM_STATUS_DECISION}");
+}
+
+#[test_case(StreamFooter::FollowUp; "follow_up")]
+#[test_case(StreamFooter::Close; "close")]
+fn program_status_stream_modal_is_working(footer: StreamFooter) {
+    let mut app = test_app();
+    let (_sender, receiver) = flume::bounded(1);
+    let (trigger, _cancel) = CancelToken::new();
+    app.stream_modal.open(
+        QUESTION_HEADER,
+        QUESTION_TEXT.into(),
+        footer,
+        receiver,
+        trigger,
+    );
+    assert_eq!(app.status, Status::Idle);
+    assert_eq!(
+        app.program_status(),
+        ProgramStatus::Working,
+        "{PROGRAM_STATUS_AUTOMATIC}"
+    );
+}
+
+#[test_case(false; "visible_picker")]
+#[test_case(true; "closed_picker")]
+fn program_status_permission_persistence_is_automatic(closed: bool) {
+    let mut app = test_app();
+    app.permissions = Arc::new(PermissionManager::new_persistent_in(
+        PermissionsConfig::default(),
+        app.permissions.project_cwd(),
+        Arc::default(),
+        app.storage.clone(),
+    ));
+    app.open_permissions_picker().unwrap();
+    app.finish_permission_jobs();
+    let manager = Arc::clone(&app.permissions);
+    let (event_tx, event_rx) = flume::unbounded();
+    let event_sender = EventSender::new(event_tx, app.run_id);
+    let (_response_tx, response_rx) = flume::unbounded();
+    let (_cancel_trigger, cancel) = CancelToken::new();
+    let task = smol::spawn(async move {
+        let responses = AsyncMutex::new(response_rx);
+        manager
+            .enforce(
+                &ToolKey::native(SHELL_TOOL_NAME),
+                &PermissionScopes::single(STAGED_COMMAND.into()),
+                &serde_json::json!({"command": STAGED_COMMAND}),
+                &event_sender,
+                Some(&responses),
+                PREVIEW_PERMISSION_ID,
+                &cancel,
+                None,
+            )
+            .await
+    });
+    let envelope = event_rx.recv_timeout(PERMISSION_TEST_TIMEOUT).unwrap();
+    assert!(matches!(envelope.event, AgentEvent::PermissionRequest(_)));
+    app.permission_prompt.open(
+        PREVIEW_PERMISSION_ID.into(),
+        ToolKey::native(SHELL_TOOL_NAME),
+        vec![STAGED_COMMAND.into()],
+        None,
+    );
+    assert_eq!(
+        app.program_status(),
+        ProgramStatus::Blocked(Some(ProgramBlockKind::Permission))
+    );
+    app.request_permission_answer(PermissionDecision {
+        request_id: PREVIEW_PERMISSION_ID.into(),
+        answer: PermissionAnswer::AllowAlwaysLocal,
+    });
+    assert!(app.permission_mutation_pending());
+    assert!(app.permissions_picker.is_open());
+    assert!(app.permission_prompt.is_open());
+    if closed {
+        app.permissions_picker.close();
+    }
+    assert_eq!(
+        app.program_status(),
+        ProgramStatus::Working,
+        "{PROGRAM_STATUS_AUTOMATIC}"
+    );
+    app.finish_permission_jobs();
+    assert_eq!(app.permissions.pending_count(), 0);
+    assert!(smol::block_on(task).is_ok());
+    assert!(
+        app.permissions
+            .structured_rule_inventory()
+            .unwrap()
+            .iter()
+            .any(|record| record.rule.lifetime == PermissionLifetime::Project)
+    );
+    assert_eq!(app.program_status(), ProgramStatus::Idle);
+}
+
+#[cfg(unix)]
+#[test_case(false, ProgramStatus::Blocked(None); "unsaved_draft")]
+#[test_case(true, ProgramStatus::Working; "draft_awaiting_persistence")]
+fn program_status_sandbox_draft_and_save(pending: bool, expected: ProgramStatus) {
+    let (_directory, _store, manager) = sandbox_manager_fixture();
+    let mut app = test_app();
+    app.sandbox_manager = manager;
+    app.sandbox_manager.handle_key(key(KeyCode::Delete));
+    app.sandbox_manager.handle_key(key(KeyCode::Char('s')));
+    assert!(app.sandbox_manager.dirty());
+    if pending {
+        assert!(
+            matches!(
+                app.sandbox_manager.handle_key(kb::SAVE.to_key_event()),
+                SandboxAction::Store { .. }
+            ),
+            "{PROGRAM_STATUS_SAVE}"
+        );
+    }
+    assert_eq!(app.sandbox_manager.pending(), pending);
+    assert_eq!(app.program_status(), expected, "{PROGRAM_STATUS_DECISION}");
+}
+
+#[cfg(unix)]
+#[test_case(false, ProgramStatus::Working; "reconciling")]
+#[test_case(true, ProgramStatus::Blocked(Some(ProgramBlockKind::Permission)); "permission_during_reconciliation")]
+fn program_status_network_reconciliation(permission: bool, expected: ProgramStatus) {
+    let (_directory, store, _manager) = sandbox_manager_fixture();
+    let mut app = test_app();
+    let (_sender, receiver) = flume::bounded(1);
+    app.sandbox_live.network_reply =
+        Some((store.load().unwrap().saved().revision().clone(), receiver));
+    if permission {
+        app.permission_prompt.open(
+            PREVIEW_PERMISSION_ID.into(),
+            ToolKey::Wildcard,
+            Vec::new(),
+            None,
+        );
+    }
+    assert_eq!(app.program_status(), expected, "{PROGRAM_STATUS_DECISION}");
 }
 
 #[test]

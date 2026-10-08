@@ -99,6 +99,10 @@ fn read_complete(fd: &FileDesc, buf: &mut [u8]) -> io::Result<usize> {
 }
 
 impl EventSource for UnixInternalEventSource {
+    fn set_program_status_query(&mut self, enabled: bool) {
+        self.parser.set_program_status_query(enabled);
+    }
+
     fn try_read(&mut self, timeout: Option<Duration>) -> io::Result<Option<InternalEvent>> {
         let timeout = PollTimeout::new(timeout);
 

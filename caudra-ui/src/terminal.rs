@@ -5,6 +5,8 @@ use std::path::Path;
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant};
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use caudra_config::NotificationMethod;
 use color_eyre::Result;
 use crossterm::Command;
@@ -30,6 +32,7 @@ const POP_WINDOW_TITLE_SEQUENCE: &str = "\u{1b}[23;2t";
 const OSC8_OPEN: &str = "\u{1b}]8;;";
 const OSC8_CLOSE: &str = "\u{1b}]8;;\u{1b}\\";
 const STRING_TERMINATOR: &str = "\u{1b}\\";
+const PROGRAM_STATUS_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
 /// Raw mode is already on when the tmux query runs, so a wedged tmux server
 /// must not be able to hang startup with Ctrl-C disabled.
 const TMUX_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
@@ -79,6 +82,94 @@ pub(crate) enum ResolvedNotifier {
 pub(crate) struct TerminalNotifier {
     notifier: ResolvedNotifier,
     mux: TerminalMux,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProgramStatus {
+    Idle,
+    Working,
+    Blocked(Option<ProgramBlockKind>),
+    Done,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProgramBlockKind {
+    Permission,
+    Question,
+    Auth,
+}
+
+pub(crate) struct ProgramStatusReporter {
+    last_written: Option<ProgramStatus>,
+}
+
+impl ProgramStatusReporter {
+    pub(crate) fn detect(configured: NotificationMethod, herdr: bool) -> Option<Self> {
+        Self::detect_with(configured, herdr, |timeout| {
+            #[cfg(unix)]
+            {
+                crossterm::event::query_program_status(timeout)
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = timeout;
+                Ok(false)
+            }
+        })
+    }
+
+    fn detect_with(
+        configured: NotificationMethod,
+        herdr: bool,
+        query: impl FnOnce(Duration) -> io::Result<bool>,
+    ) -> Option<Self> {
+        if configured != NotificationMethod::Auto || herdr {
+            return None;
+        }
+        query(PROGRAM_STATUS_QUERY_TIMEOUT)
+            .unwrap_or(false)
+            .then_some(Self { last_written: None })
+    }
+
+    pub(crate) fn observe(&mut self, status: ProgramStatus) -> io::Result<()> {
+        self.observe_with(status, &mut stdout().lock())
+    }
+
+    fn observe_with(&mut self, status: ProgramStatus, output: &mut impl Write) -> io::Result<()> {
+        if self.last_written == Some(status) {
+            return Ok(());
+        }
+        output.write_all(program_status_sequence(status).as_bytes())?;
+        output.flush()?;
+        self.last_written = Some(status);
+        Ok(())
+    }
+
+    pub(crate) fn invalidate(&mut self) {
+        self.last_written = None;
+    }
+}
+
+fn program_status_sequence(status: ProgramStatus) -> String {
+    let (state, kind, message) = match status {
+        ProgramStatus::Idle => ("idle", "", "Ready"),
+        ProgramStatus::Working => ("working", "", "Working"),
+        ProgramStatus::Blocked(None) => ("blocked", "", "Waiting for input"),
+        ProgramStatus::Blocked(Some(ProgramBlockKind::Permission)) => {
+            ("blocked", ":kind=permission", "Waiting for permission")
+        }
+        ProgramStatus::Blocked(Some(ProgramBlockKind::Question)) => {
+            ("blocked", ":kind=question", "Waiting for an answer")
+        }
+        ProgramStatus::Blocked(Some(ProgramBlockKind::Auth)) => {
+            ("blocked", ":kind=auth", "Authentication required")
+        }
+        ProgramStatus::Done => ("done", "", "Task complete"),
+        ProgramStatus::Error => ("error", "", "Task failed"),
+    };
+    let message = STANDARD.encode(message);
+    format!("\u{1b}]7501;state={state}{kind}:app=caudra:msg={message}{STRING_TERMINATOR}")
 }
 
 impl TerminalNotifier {
@@ -512,6 +603,149 @@ mod tests {
     const EXPECTED_KEYBOARD_ENHANCEMENTS: &str = "\u{1b}[>3u";
     const APPEARANCE_SUBSCRIBE: &[u8] = b"\x1b[?2031h\x1b[?996n";
     const APPEARANCE_UNSUBSCRIBE: &[u8] = b"\x1b[?2031l";
+    const PROGRAM_STATUS_SEQUENCE_LIMIT: usize = 4096;
+    const IDLE_STATUS_SEQUENCE: &[u8] = b"\x1b]7501;state=idle:app=caudra:msg=UmVhZHk=\x1b\\";
+    const WORKING_STATUS_SEQUENCE: &[u8] =
+        b"\x1b]7501;state=working:app=caudra:msg=V29ya2luZw==\x1b\\";
+
+    #[test_case(ProgramStatus::Idle, IDLE_STATUS_SEQUENCE; "idle")]
+    #[test_case(ProgramStatus::Working, WORKING_STATUS_SEQUENCE; "working")]
+    #[test_case(ProgramStatus::Blocked(None), b"\x1b]7501;state=blocked:app=caudra:msg=V2FpdGluZyBmb3IgaW5wdXQ=\x1b\\"; "blocked")]
+    #[test_case(ProgramStatus::Blocked(Some(ProgramBlockKind::Permission)), b"\x1b]7501;state=blocked:kind=permission:app=caudra:msg=V2FpdGluZyBmb3IgcGVybWlzc2lvbg==\x1b\\"; "permission")]
+    #[test_case(ProgramStatus::Blocked(Some(ProgramBlockKind::Question)), b"\x1b]7501;state=blocked:kind=question:app=caudra:msg=V2FpdGluZyBmb3IgYW4gYW5zd2Vy\x1b\\"; "question")]
+    #[test_case(ProgramStatus::Blocked(Some(ProgramBlockKind::Auth)), b"\x1b]7501;state=blocked:kind=auth:app=caudra:msg=QXV0aGVudGljYXRpb24gcmVxdWlyZWQ=\x1b\\"; "auth")]
+    #[test_case(ProgramStatus::Done, b"\x1b]7501;state=done:app=caudra:msg=VGFzayBjb21wbGV0ZQ==\x1b\\"; "done")]
+    #[test_case(ProgramStatus::Error, b"\x1b]7501;state=error:app=caudra:msg=VGFzayBmYWlsZWQ=\x1b\\"; "error")]
+    fn program_status_reports_are_raw_bounded_and_deduplicated(
+        status: ProgramStatus,
+        expected: &[u8],
+    ) {
+        let mut reporter = ProgramStatusReporter { last_written: None };
+        let mut output = Vec::new();
+        reporter.observe_with(status, &mut output).unwrap();
+        reporter.observe_with(status, &mut output).unwrap();
+        assert_eq!(output, expected);
+        assert!(output.len() <= PROGRAM_STATUS_SEQUENCE_LIMIT);
+
+        let sequence = String::from_utf8(output.clone()).unwrap();
+        let (_, message) = sequence.split_once(":msg=").unwrap();
+        let message = STANDARD
+            .decode(message.strip_suffix(STRING_TERMINATOR).unwrap())
+            .unwrap();
+        assert!(
+            message
+                .iter()
+                .all(|byte| byte.is_ascii() && !byte.is_ascii_control())
+        );
+
+        reporter.invalidate();
+        reporter.observe_with(status, &mut output).unwrap();
+        assert_eq!(output, [expected, expected].concat());
+    }
+
+    #[test_case(NotificationMethod::Off, false; "off")]
+    #[test_case(NotificationMethod::Off, true; "off_inside_herdr")]
+    #[test_case(NotificationMethod::Bell, false; "bell")]
+    #[test_case(NotificationMethod::Bell, true; "bell_inside_herdr")]
+    #[test_case(NotificationMethod::Osc9, false; "osc9")]
+    #[test_case(NotificationMethod::Osc9, true; "osc9_inside_herdr")]
+    #[test_case(NotificationMethod::Auto, true; "auto_inside_herdr")]
+    fn program_status_routing_skips_probe(configured: NotificationMethod, herdr: bool) {
+        assert!(
+            ProgramStatusReporter::detect_with(configured, herdr, |_| {
+                panic!("program status probe must not run")
+            })
+            .is_none()
+        );
+    }
+
+    #[test_case(Some(true), true; "supported")]
+    #[test_case(Some(false), false; "unsupported_or_timeout")]
+    #[test_case(None, false; "unavailable")]
+    fn program_status_auto_probes_raw_immediate_terminal(reply: Option<bool>, expected: bool) {
+        let reporter =
+            ProgramStatusReporter::detect_with(NotificationMethod::Auto, false, |timeout| {
+                assert_eq!(timeout, Duration::from_millis(500));
+                reply.ok_or_else(|| io::ErrorKind::BrokenPipe.into())
+            });
+        assert_eq!(reporter.is_some(), expected);
+    }
+
+    #[test_case(None, Some(ProgramBlockKind::Permission); "generic_to_permission")]
+    #[test_case(Some(ProgramBlockKind::Permission), Some(ProgramBlockKind::Question); "permission_to_question")]
+    #[test_case(Some(ProgramBlockKind::Question), Some(ProgramBlockKind::Auth); "question_to_auth")]
+    fn program_status_deduplication_includes_block_kind(
+        first: Option<ProgramBlockKind>,
+        second: Option<ProgramBlockKind>,
+    ) {
+        let mut reporter = ProgramStatusReporter { last_written: None };
+        let mut output = Vec::new();
+        for status in [
+            ProgramStatus::Blocked(first),
+            ProgramStatus::Blocked(second),
+        ] {
+            reporter.observe_with(status, &mut output).unwrap();
+        }
+        assert_eq!(
+            output,
+            format!(
+                "{}{}",
+                program_status_sequence(ProgramStatus::Blocked(first)),
+                program_status_sequence(ProgramStatus::Blocked(second))
+            )
+            .as_bytes()
+        );
+    }
+
+    struct FailingStatusWriter {
+        fail_on_flush: bool,
+    }
+
+    impl Write for FailingStatusWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.fail_on_flush {
+                Ok(bytes.len())
+            } else {
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+    }
+
+    #[test_case(false; "write_failure")]
+    #[test_case(true; "flush_failure")]
+    fn program_status_failed_writes_preserve_last_success_and_retry(fail_on_flush: bool) {
+        let mut reporter = ProgramStatusReporter { last_written: None };
+        let mut output = Vec::new();
+        reporter
+            .observe_with(ProgramStatus::Idle, &mut output)
+            .unwrap();
+        let error = reporter
+            .observe_with(
+                ProgramStatus::Working,
+                &mut FailingStatusWriter { fail_on_flush },
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(reporter.last_written, Some(ProgramStatus::Idle));
+        reporter
+            .observe_with(ProgramStatus::Idle, &mut output)
+            .unwrap();
+        assert_eq!(output, IDLE_STATUS_SEQUENCE);
+        reporter
+            .observe_with(ProgramStatus::Working, &mut output)
+            .unwrap();
+        reporter
+            .observe_with(ProgramStatus::Working, &mut output)
+            .unwrap();
+        assert_eq!(
+            output,
+            [IDLE_STATUS_SEQUENCE, WORKING_STATUS_SEQUENCE].concat()
+        );
+    }
 
     #[test_case(true, APPEARANCE_SUBSCRIBE; "subscribe_then_query")]
     #[test_case(false, APPEARANCE_UNSUBSCRIBE; "unsubscribe")]

@@ -46,6 +46,19 @@ impl Filter for PrimaryDeviceAttributesFilter {
 #[derive(Debug, Clone)]
 pub(crate) struct EventFilter;
 
+#[cfg(unix)]
+pub(crate) struct ProgramStatusFilter;
+
+#[cfg(unix)]
+impl Filter for ProgramStatusFilter {
+    fn eval(&self, event: &InternalEvent) -> bool {
+        matches!(
+            event,
+            InternalEvent::ProgramStatusSupported | InternalEvent::PrimaryDeviceAttributes
+        )
+    }
+}
+
 impl Filter for EventFilter {
     fn eval(&self, event: &InternalEvent) -> bool {
         matches!(*event, InternalEvent::Event(_))
