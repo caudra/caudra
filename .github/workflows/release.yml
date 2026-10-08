@@ -122,7 +122,9 @@ jobs:
               git config --global --add safe.directory /workspace
               curl --proto "=https" --tlsv1.2 --retry 5 --retry-delay 2 --retry-all-errors -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.99.0 --profile minimal --target ${{ matrix.target }}
               . "$HOME/.cargo/env"
+              cargo fetch --locked --manifest-path Cargo.toml
               python3 scripts/build-code-worker.py --target ${{ matrix.target }}
+              cargo fetch --locked --manifest-path "$(cat target/code-worker/source-manifest-path)"
               export WORKCELL_BUNDLED_MONTY_WORKER="$PWD/target/code-worker/bin/monty"
               export CARGO_PROFILE_RELEASE_STRIP=none
               cargo build --locked --release --package caudra --target ${{ matrix.target }}
@@ -217,7 +219,9 @@ jobs:
       - name: Build
         shell: bash
         run: |
+          cargo fetch --locked --manifest-path Cargo.toml
           python3 scripts/build-code-worker.py --target ${{ matrix.target }}
+          cargo fetch --locked --manifest-path "$(cat target/code-worker/source-manifest-path)"
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             worker="$PWD/target/code-worker/bin/monty.exe"
           else

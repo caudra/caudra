@@ -570,6 +570,23 @@ class ReleaseWorkflowTests(unittest.TestCase):
         ):
             self.assertIn(command, nix["build"])
 
+    def test_release_prefetches_both_locked_graphs_before_caudra_build(self):
+        _, jobs = self.workflow("release")
+        commands = (
+            "cargo fetch --locked --manifest-path Cargo.toml",
+            "python3 scripts/build-code-worker.py --target ${{ matrix.target }}",
+            'cargo fetch --locked --manifest-path "$(cat target/code-worker/source-manifest-path)"',
+            "cargo build --locked --release --package caudra --target ${{ matrix.target }}",
+            "python3 scripts/build-attribution.py \\",
+        )
+        for job in ("build-linux", "build-other"):
+            with self.subTest(job=job):
+                lines = [line.strip() for line in jobs[job].splitlines()]
+                for command in commands:
+                    self.assertEqual(lines.count(command), 1, command)
+                positions = [lines.index(command) for command in commands]
+                self.assertEqual(positions, sorted(positions))
+
     def test_built_binary_version_must_match_release_tag(self):
         _, jobs = self.workflow("release")
         for job in ("build-linux", "build-other"):
