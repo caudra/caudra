@@ -46,6 +46,7 @@ use caudra_agent::{
 };
 use caudra_automation::request::ProfileArming;
 use caudra_automation::snapshot::{AutomationEvent, SettleBlocker};
+use caudra_config::providers::ProvidersConfig;
 use caudra_config::sandbox::SandboxName;
 use caudra_config::{
     AutomationsConfig, Feature, ModelPolicy, SnapshotsConfig, UiConfig, load_permissions,
@@ -56,6 +57,7 @@ use caudra_lua::{
     TaskRequest, UiAction, UiReply,
 };
 use caudra_providers::Timeouts;
+use caudra_providers::manifest::ManifestRegistry;
 use caudra_providers::provider::{Provider, fetch_all_models, from_model};
 use caudra_providers::{HistoryItem, Message, Model};
 use caudra_storage::StateDir;
@@ -1682,6 +1684,13 @@ fn spawn_model_fetch(
     }
 }
 
+fn should_open_startup_login(needs_login: bool, providers: &ProvidersConfig) -> bool {
+    needs_login
+        && !providers.providers.iter().any(|(slug, definition)| {
+            definition.protocol.is_some() && ManifestRegistry::get(slug).is_none()
+        })
+}
+
 impl<'t> EventLoop<'t> {
     pub(crate) fn new(
         terminal: &'t mut ratatui::DefaultTerminal,
@@ -1867,11 +1876,13 @@ impl<'t> EventLoop<'t> {
         let app = &mut runtimes[focused].app;
         app.install_initial_seed(initial_seed);
         app.exit_on_done = exit_on_done;
-        if needs_login {
+        let show_login =
+            needs_login && should_open_startup_login(needs_login, &ProvidersConfig::load());
+        if show_login {
             app.login_picker.open(app.storage.clone());
         }
-        app.open_awaiting_mcp_trust(needs_login);
-        app.open_awaiting_permission_config_trust(needs_login);
+        app.open_awaiting_mcp_trust(show_login);
+        app.open_awaiting_permission_config_trust(show_login);
         if !ctx.mcp_config_errors.is_empty() {
             let msg = format!("MCP config error: {}", ctx.mcp_config_errors);
             app.flash(msg);
@@ -4948,6 +4959,7 @@ mod tests {
     use caudra_agent::tools::native::plan::PlanTarget;
     use caudra_agent::{AgentMode, McpSnapshotReader, SubagentInfo, ToolDoneEvent};
     use caudra_automation::event::InputKind;
+    use caudra_config::providers::{Protocol, ProviderDef};
     use caudra_config::sandbox::Revision;
     use caudra_config::{FeatureFlags, PermissionsConfig, ToolKey};
     use caudra_providers::provider::BoxFuture;
@@ -4970,6 +4982,43 @@ mod tests {
     const AUTH_CHILD_TEST: &str = "event_loop::tests::oauth_login_child";
     const AUTH_CHILD_EXIT: &str = "CAUDRA_TEST_AUTH_CHILD_EXIT";
     const AUTH_CHILD_FAILURE: i32 = 17;
+    const CUSTOM_PROVIDER: &str = "custom-startup-provider";
+    const BUILTIN_PROVIDER: &str = "anthropic";
+    const OPENCODE_PROVIDER: &str = "opencode";
+    const OPENCODE_GO_PROVIDER: &str = "opencode-go";
+
+    #[test_case(&[], true; "empty_config")]
+    #[test_case(&[(CUSTOM_PROVIDER, Some(Protocol::Openai))], false; "custom_openai")]
+    #[test_case(&[(CUSTOM_PROVIDER, Some(Protocol::OpenaiResponses))], false; "custom_responses")]
+    #[test_case(&[(CUSTOM_PROVIDER, Some(Protocol::Anthropic))], false; "custom_anthropic")]
+    #[test_case(&[(CUSTOM_PROVIDER, Some(Protocol::Google))], false; "custom_google")]
+    #[test_case(&[(CUSTOM_PROVIDER, None)], true; "custom_without_protocol")]
+    #[test_case(&[(BUILTIN_PROVIDER, None)], true; "builtin_override")]
+    #[test_case(&[(BUILTIN_PROVIDER, Some(Protocol::Openai))], true; "builtin_with_protocol")]
+    #[test_case(&[(OPENCODE_PROVIDER, Some(Protocol::Openai))], true; "opencode_with_protocol")]
+    #[test_case(&[(OPENCODE_GO_PROVIDER, Some(Protocol::Openai))], true; "opencode_go_with_protocol")]
+    #[test_case(&[(BUILTIN_PROVIDER, None), (CUSTOM_PROVIDER, Some(Protocol::Openai))], false; "mixed_providers")]
+    fn startup_login_respects_custom_provider_config(
+        definitions: &[(&str, Option<Protocol>)],
+        opens_without_model: bool,
+    ) {
+        let mut providers = ProvidersConfig::default();
+        for &(slug, protocol) in definitions {
+            providers.upsert(
+                slug.into(),
+                ProviderDef {
+                    protocol,
+                    ..Default::default()
+                },
+            );
+        }
+
+        assert_eq!(
+            should_open_startup_login(true, &providers),
+            opens_without_model
+        );
+        assert!(!should_open_startup_login(false, &providers));
+    }
 
     #[test]
     fn anthropic_login_uses_current_executable_and_explicit_oauth() {
