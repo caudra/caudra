@@ -128,6 +128,7 @@ use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use crate::terminal::{ProgramBlockKind, ProgramStatus};
 use crate::{AppSession, PatternDiscoveryMode, PatternDiscoveryOutcome, PatternSuggestionLoader};
 use arc_swap::{ArcSwap, ArcSwapOption};
+use caudra_agent::agent::task_runner::WorkflowHostContext;
 use caudra_agent::background::{BackgroundTasks, ShellSnapshot};
 use caudra_agent::commits::repo;
 use caudra_agent::context::{ContextKey, ContextSnapshot, ContextStore};
@@ -428,7 +429,7 @@ pub struct App {
     pub(crate) input_box: InputBox,
     subagent_input_box: InputBox,
     subagent_input_task: Option<String>,
-    subagent_drafts: HashMap<String, InputDraft>,
+    subagent_drafts: HashMap<String, InputState>,
     pub(super) command_palette: CommandPalette,
     pub(crate) no_commands: bool,
     pub(super) command_modal: CommandModal,
@@ -546,6 +547,8 @@ pub struct App {
     pub exit_request: ExitRequest,
     pub(crate) exit_on_done: bool,
     pub(crate) background: Option<BackgroundTasks>,
+    pub(crate) task_host: Option<Arc<WorkflowHostContext>>,
+    task_continuation: Option<tasks::TaskContinuation>,
     /// The foreground shell tracker's last snapshot, polled every tick for the
     /// footer chip and the `/shells` modal.
     shell_snapshot: Watch<ShellSnapshot>,
@@ -812,6 +815,8 @@ impl App {
             exit_request: ExitRequest::None,
             exit_on_done: false,
             background: None,
+            task_host: None,
+            task_continuation: None,
             shell_snapshot: Watch::default(),
             task_interactions: tasks::TaskInteractions::default(),
             task_controls: tasks::TaskControls::default(),
@@ -1168,9 +1173,15 @@ impl App {
         }
     }
 
-    fn active_subagent_can_steer(&self) -> bool {
-        self.active_subagent_id()
-            .is_some_and(|id| self.subagent_steers.contains_key(id))
+    fn active_subagent_has_composer(&self) -> bool {
+        self.active_subagent_id().is_some_and(|id| {
+            self.subagent_steers.contains_key(id)
+                || self.task_continuation_target(id).is_some()
+                || self
+                    .task_continuation
+                    .as_ref()
+                    .is_some_and(|pending| pending.task_id() == id)
+        })
     }
 
     fn active_input_box(&self) -> &InputBox {
@@ -1344,18 +1355,18 @@ impl App {
         }
         self.paste_editor.close();
         if let Some(previous) = self.subagent_input_task.take() {
-            let draft = self.subagent_input_box.draft();
-            if draft.is_empty() {
+            if self.subagent_input_box.is_empty() {
                 self.subagent_drafts.remove(&previous);
             } else {
-                self.subagent_drafts.insert(previous, draft);
+                self.subagent_drafts
+                    .insert(previous, self.subagent_input_box.take_state());
             }
         }
         let draft = next
             .as_ref()
             .and_then(|id| self.subagent_drafts.remove(id))
-            .unwrap_or_default();
-        self.subagent_input_box.set_draft(draft);
+            .unwrap_or_else(|| InputState::new(InputDraft::default(), Vec::new()));
+        self.subagent_input_box.set_state(draft);
         self.subagent_input_task = next;
         // Runs on every chat switch, so this is the single point that stops a
         // dropdown opened over one composer from surviving into another.
@@ -1934,7 +1945,7 @@ impl App {
             }
             self.command_palette.close();
             if !self.is_main_chat()
-                && self.active_subagent_can_steer()
+                && self.active_subagent_has_composer()
                 && !self.subagent_input_box.is_empty()
             {
                 self.subagent_input_box.discard();
@@ -1955,7 +1966,7 @@ impl App {
             let input_empty = if self.is_main_chat() {
                 self.input_box.is_empty()
             } else {
-                !self.active_subagent_can_steer() || self.subagent_input_box.is_empty()
+                !self.active_subagent_has_composer() || self.subagent_input_box.is_empty()
             };
             if self.status != Status::Idle || !input_empty {
                 self.last_exit = None;
@@ -2044,7 +2055,7 @@ impl App {
         !self.plan_form_active()
             && !self.question_form.is_open()
             && (self.is_main_chat()
-                || self.active_subagent_can_steer()
+                || self.active_subagent_has_composer()
                 || self.queue_editor_active())
     }
 
@@ -3258,7 +3269,7 @@ impl App {
         }
 
         if !self.is_main_chat() {
-            if self.active_subagent_can_steer() {
+            if self.active_subagent_has_composer() {
                 return self.handle_subagent_chat_key(key);
             }
             return match key.code {
@@ -3509,7 +3520,7 @@ impl App {
     /// Whether a composer is drawn, which is what
     /// [`crate::app::view`] renders on and therefore what may take text.
     fn composer_is_visible(&self) -> bool {
-        self.is_main_chat() || self.active_subagent_can_steer() || self.queue_editor_active()
+        self.is_main_chat() || self.active_subagent_has_composer() || self.queue_editor_active()
     }
 
     fn handle_subagent_submit(&mut self, sub: Submission) -> Vec<Action> {
@@ -3520,7 +3531,7 @@ impl App {
             self.focus_active_queue();
             return vec![];
         }
-        if sub.text.trim().is_empty() {
+        if sub.text.trim().is_empty() && sub.images.is_empty() {
             return vec![];
         }
         let Some(task_id) = self.active_subagent_id().map(str::to_owned) else {
@@ -3549,6 +3560,24 @@ impl App {
         commits: Vec<CommitRef>,
         draft: InputDraft,
     ) -> Vec<Action> {
+        if self
+            .task_continuation
+            .as_ref()
+            .is_some_and(|pending| pending.task_id() == task_id)
+            || !self.subagent_steers.contains_key(task_id)
+        {
+            self.start_task_continuation(
+                task_id,
+                Submission {
+                    text,
+                    images,
+                    mentions,
+                    commits,
+                    draft,
+                },
+            );
+            return vec![];
+        }
         let Some(tx) = self.subagent_steers.get(task_id) else {
             self.subagent_input_box.set_draft(draft);
             return vec![];
@@ -4306,7 +4335,9 @@ impl App {
             });
             info.name.clone_from(&card.label);
             if info.prompt.is_none() {
-                info.prompt = self.chats[0].task_prompt(&card.call_id);
+                info.prompt = self
+                    .task_continuation_prompt(card)
+                    .or_else(|| self.chats[0].task_prompt(&card.call_id));
             }
             self.resolve_or_create_chat(&info);
             self.chats[0].task_card_update(card.clone());
@@ -5507,16 +5538,13 @@ impl App {
         let mentions = self.scan_mentions(&text);
         let commits = self.scan_commits(&text);
         if let Some(task_id) = self.active_subagent_id().map(str::to_owned)
-            && self.subagent_steers.contains_key(&task_id)
+            && self.active_subagent_has_composer()
         {
-            return self.steer_task(
-                &task_id,
-                text,
-                Vec::new(),
-                mentions,
-                commits,
-                InputDraft::default(),
-            );
+            let draft = InputDraft {
+                text: text.clone(),
+                paste_ranges: Vec::new(),
+            };
+            return self.steer_task(&task_id, text, Vec::new(), mentions, commits, draft);
         }
         self.submit_or_queue(QueuedMessage {
             text,
@@ -5986,6 +6014,7 @@ impl App {
             | self.poll_workflow_replies()
             | self.poll_automations()
             | self.poll_task_controls()
+            | self.poll_task_continuation()
             | self.poll_task_history()
             | self.poll_shells()
             | self.tick_workbench()
@@ -6507,7 +6536,8 @@ impl App {
         try_picker!(self.worktree_picker);
         try_picker!(self.question_form);
         try_picker!(self.login_picker);
-        if !self.is_main_chat() && !(self.active_subagent_can_steer() || self.queue_editor_active())
+        if !self.is_main_chat()
+            && !(self.active_subagent_has_composer() || self.queue_editor_active())
         {
             return;
         }

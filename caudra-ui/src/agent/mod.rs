@@ -12,24 +12,26 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use caudra_agent::agent::task_runner::WorkflowHostContext;
 use caudra_agent::automation::workflows::Workflows;
 use caudra_agent::background::{BackgroundTasks, BackgroundTransition};
 use caudra_agent::context::{ContextKey, ContextStore};
 use caudra_agent::permissions::PermissionManager;
 use caudra_agent::prompt::profile::PromptProfileCatalog;
 use caudra_agent::prompt::profile::{BUILTIN_PROFILE_NAME, SystemPromptProfile};
-use caudra_agent::tools::PathLocks;
+use caudra_agent::remote_project_context::{RemoteProjectContext, load_remote_project_context};
+use caudra_agent::tools::{PathLocks, ToolContext};
 use caudra_agent::types::TodoItem;
-use caudra_agent::workflow::WorkflowHandle;
+use caudra_agent::workflow::{WorkflowHandle, WorkspaceRebind, prepare_workspace_transition};
 use caudra_agent::{
-    AgentConfig, AgentMode, CancelMap, CancelToken, Envelope, HistorySnapshot, McpCommand,
-    McpConfigErrors, McpHandle, McpSnapshotReader, Nudge, SessionMailbox, SharedHistory,
-    SubagentHistoryStore, ToolOutputLines,
+    AgentConfig, AgentMode, CancelMap, CancelToken, Envelope, EventSender, HistorySnapshot,
+    McpCommand, McpConfigErrors, McpHandle, McpSnapshotReader, Nudge, SessionMailbox,
+    SharedHistory, SubagentHistoryStore, ToolOutputLines,
 };
 use caudra_automation::event::SessionView;
 use caudra_automation::request::ProfileArming;
 use caudra_automation::snapshot::AutomationEvent;
-use caudra_config::{AutomationsConfig, ModelPolicy};
+use caudra_config::{AutomationsConfig, FeatureFlags, ModelPolicy};
 use caudra_lua::EventHandle;
 use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
@@ -43,7 +45,7 @@ use jiff::Timestamp;
 
 use self::cancel_map::new_run_cancel_map;
 use caudra_providers::provider::Provider;
-use caudra_providers::{HistoryItem, Message, Model, RequestOptions, project_messages};
+use caudra_providers::{AgentError, HistoryItem, Message, Model, RequestOptions, project_messages};
 use serde_json::Value;
 use tracing::{info, warn};
 
@@ -78,6 +80,96 @@ pub(crate) fn reserve_background_transition(
         Err(BACKGROUND_TRANSITION_BUSY.into())
     }))?;
     Ok(transition)
+}
+
+pub(crate) async fn task_context(
+    host: &WorkflowHostContext,
+    workflow: Option<&WorkflowHandle>,
+    cancel: CancelToken,
+    events: EventSender,
+    call_id: &str,
+) -> Result<ToolContext, String> {
+    let mut host = host.clone();
+    if let Some(workspace) = &host.workspace_session {
+        let (context, cwd) = refresh_remote_context(
+            workspace,
+            host.remote_project_context.as_deref(),
+            &host.permissions,
+            workflow,
+            &host.subagent_cancels,
+            host.config.features,
+        )
+        .await
+        .map_err(|error| error.user_message())?;
+        host.loaded_instructions =
+            caudra_agent::agent::load_remote_instructions(&context, host.host_cwd.as_deref())
+                .loaded;
+        host.remote_project_context = Some(context);
+        host.task_environment = host.task_environment.set("{cwd}", cwd);
+    }
+    host.tool_context(cancel, events, call_id).await
+}
+
+async fn refresh_remote_context(
+    workspace: &WorkspaceSession,
+    previous: Option<&RemoteProjectContext>,
+    permissions: &PermissionManager,
+    workflow: Option<&WorkflowHandle>,
+    subagent_cancels: &CancelMap<String>,
+    features: FeatureFlags,
+) -> Result<(Arc<RemoteProjectContext>, String), AgentError> {
+    let result = async {
+        let context = load_remote_project_context(workspace, features)
+            .await
+            .map_err(|error| AgentError::Tool {
+                tool: "remote_project_context".into(),
+                message: format!("Remote project context unavailable: {error}"),
+            })?;
+        let cwd = caudra_agent::workspace_logical_cwd(workspace)
+            .await
+            .map_err(|message| AgentError::Tool {
+                tool: "remote_project_context".into(),
+                message,
+            })?;
+        let changed =
+            previous.is_none_or(|old| old.manifest_revision() != context.manifest_revision());
+        let transition = if changed {
+            prepare_workspace_transition(
+                workflow,
+                subagent_cancels.active_count(),
+                WorkspaceRebind {
+                    workspace: workspace.clone(),
+                    context: Arc::clone(&context),
+                    cwd: cwd.clone(),
+                },
+            )
+            .await
+            .map_err(|message| AgentError::Tool {
+                tool: "remote_project_context".into(),
+                message,
+            })?
+        } else {
+            None
+        };
+        permissions
+            .replace_remote_permission_asset(context.permissions())
+            .map_err(|error| AgentError::Tool {
+                tool: "remote_permissions".into(),
+                message: format!("Remote permission policy unavailable: {error}"),
+            })?;
+        if let Some(transition) = transition {
+            transition
+                .commit()
+                .await
+                .map_err(|error| AgentError::Tool {
+                    tool: "workflow".into(),
+                    message: error.to_string(),
+                })?;
+        }
+        Ok((context, cwd))
+    }
+    .await;
+    result.inspect_err(|_| permissions.invalidate_remote_permission_asset())
 }
 
 pub(crate) struct ModelSlot {
@@ -143,6 +235,7 @@ pub(crate) struct AgentHandles {
     /// [`Self::start_automations`]: its launch facts come from the app.
     automation: Option<AutomationSession>,
     pub(crate) background: Option<BackgroundTasks>,
+    pub(crate) task_host: Option<Arc<WorkflowHostContext>>,
     delivery_fence: Arc<DeliveryFence>,
     background_enabled: bool,
     session_id: Option<CaudraId>,
@@ -388,6 +481,7 @@ impl AgentHandles {
         app.state.goal = self.goal.clone();
         app.workflow.set_handle(self.workflow_handle());
         app.background = self.background.clone();
+        app.task_host = self.task_host.clone();
         app.background_delivery.invalidate();
         app.background_delivery.fence = Arc::clone(&self.delivery_fence);
         let restore_tx =
@@ -821,6 +915,11 @@ fn spawn_agent_internal(
     );
 
     let tools_preview_source = Arc::new(agent_loop.tools_preview_source());
+    let task_host = agent_loop
+        .task_host()
+        .map(Arc::new)
+        .map_err(|error| warn!(%error, "task continuation host unavailable"))
+        .ok();
     let task = smol::spawn(async move {
         let _session_lease = session_lease;
         agent_loop.run().await;
@@ -850,6 +949,7 @@ fn spawn_agent_internal(
         automation: None,
         background,
         background_enabled,
+        task_host,
         delivery_fence,
         session_id: session_id.map(|session| session.id()),
         subagent_history,
@@ -1255,6 +1355,53 @@ mod tests {
         let mut app = crate::app::tests::test_app();
         respawn(&mut handles, &model_slot, &permissions, &mut app);
         assert!(Arc::ptr_eq(&handles.path_locks, &before));
+    }
+
+    #[test_case(AgentMode::Build; "build")]
+    #[test_case(AgentMode::ReadOnly; "read_only")]
+    #[test_case(AgentMode::Plan(PLAN_PATH.into()); "plan")]
+    fn task_host_without_workflows_tracks_live_session_and_respawn(mode: AgentMode) {
+        let (mut handles, model_slot, permissions) = stub_spawn();
+        let mut app = crate::app::tests::test_app();
+        handles.apply_to_app(&mut app);
+        let host = Arc::clone(handles.task_host.as_ref().unwrap());
+        assert!(handles.workflow_handle().is_none());
+        assert!(Arc::ptr_eq(app.task_host.as_ref().unwrap(), &host));
+        assert!(Arc::ptr_eq(&host.permissions, &permissions));
+        assert!(Arc::ptr_eq(&host.path_locks, &handles.path_locks));
+        assert!(Arc::ptr_eq(
+            &host.subagent_cancels,
+            &handles.subagent_cancels
+        ));
+
+        handles.execution_mode.store(Arc::new(mode.clone()));
+        let selected = model_slot.load_full();
+        let mut model = selected.model.clone();
+        model.id = COMMITTED_MODEL.into();
+        handles.effective_model_slot.store(Arc::new(ModelSlot {
+            model,
+            provider: Arc::clone(&selected.provider),
+        }));
+        assert_eq!((host.mode)(), mode);
+        assert_eq!((host.model)().1.id, COMMITTED_MODEL);
+
+        respawn(&mut handles, &model_slot, &permissions, &mut app);
+        let replacement = handles.task_host.as_ref().unwrap();
+        assert!(!Arc::ptr_eq(replacement, &host));
+        assert!(Arc::ptr_eq(app.task_host.as_ref().unwrap(), replacement));
+        assert!(Arc::ptr_eq(&replacement.path_locks, &host.path_locks));
+        assert!(Arc::ptr_eq(
+            &replacement.subagent_cancels,
+            &handles.subagent_cancels
+        ));
+        assert!(!Arc::ptr_eq(
+            &replacement.subagent_cancels,
+            &host.subagent_cancels
+        ));
+        assert_eq!(
+            replacement.session_id.as_ref().unwrap().id(),
+            app.state.session.id
+        );
     }
 
     #[test_case(false; "build_with_pending_plan")]

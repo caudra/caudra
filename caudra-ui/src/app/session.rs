@@ -607,6 +607,8 @@ impl App {
 
     pub(super) fn reset_ui_chrome(&mut self) {
         self.execution_mode = None;
+        self.task_host = None;
+        self.task_continuation = None;
         self.release_background_claims();
         self.task_interactions = super::tasks::TaskInteractions::default();
         self.background_saved_revision = None;

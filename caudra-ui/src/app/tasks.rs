@@ -8,12 +8,12 @@
 
 use caudra_agent::background::{BackgroundTasks, SessionWork, ShellSnapshot};
 use caudra_agent::types::BACKGROUND_EVENT_RUN_ID;
-use caudra_agent::{AgentEvent, Envelope, SubagentInfo, TaskCard, TaskProvenance};
+use caudra_agent::{AgentEvent, CancelToken, Envelope, SubagentInfo, TaskCard, TaskProvenance};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use caudra_config::ExecutionMode;
-use caudra_providers::project_messages;
+use caudra_providers::{RequestOptions, project_messages};
 use caudra_storage::background::{JobKind, JobOwner};
 use caudra_storage::id::CaudraId;
 use caudra_workflow::{AgentRosterEntry, RosterState, RunSnapshot, RunStatus};
@@ -22,9 +22,11 @@ use serde::Serialize;
 use crate::app::App;
 use crate::app::background_delivery::{DeliveryJob, DeliveryKey};
 
+use crate::components::input::{InputState, Submission};
 use crate::components::shell_modal;
 use crate::components::task_picker::TaskPickerAction;
 use crate::components::{Action, DisplayRole};
+use crate::input_document::InputDraft;
 use crate::repaint::Dirty;
 
 pub(crate) const MAIN_TASK_ID: &str = "main";
@@ -35,6 +37,32 @@ const TASK_USAGE: &str = "Usage: /tasks [list | status <id> | cancel <id>]";
 const AUTO_TASK_USAGE: &str = "Usage: /tasks [list | status <id> | background <id> | cancel <id>]";
 const TASK_UNAVAILABLE: &str = "Background tasks are unavailable in this session";
 const PROMOTION_UNAVAILABLE: &str = "Only agent tasks in auto execution mode can be promoted";
+pub(super) const CONTINUATION_PENDING: &str =
+    "A task continuation is being admitted; your draft is kept";
+pub(super) const CONTINUATION_TEXT_ONLY: &str = "Task continuation accepts text only; remove images, file mentions, and commit references to retry";
+pub(super) const CONTINUATION_SETTLING: &str =
+    "Task is still settling; your draft is kept. Submit again after it finishes";
+const CONTINUATION_UNAVAILABLE: &str =
+    "This task cannot be continued right now; your draft is kept";
+const CONTINUATION_STALE: &str =
+    "Task continuation was interrupted by a session change or stop; your draft is kept";
+
+pub(super) struct TaskContinuation {
+    session: CaudraId,
+    epoch: u64,
+    task: TaskCard,
+    request_id: String,
+    prompt: String,
+    draft: InputDraft,
+    _job: smol::Task<()>,
+    reply: flume::Receiver<Result<TaskCard, String>>,
+}
+
+impl TaskContinuation {
+    pub(super) fn task_id(&self) -> &str {
+        &self.task.task_id
+    }
+}
 
 /// How a chat ended, from the vaguest to the most specific. `SubagentHistory`
 /// only sees the transcript close, and the `ToolDone` carrying `is_error`
@@ -189,6 +217,194 @@ fn roster_state(run: &RunSnapshot, agent: &AgentRosterEntry) -> &'static str {
 }
 
 impl App {
+    pub(super) fn task_continuation_target(&self, task_id: &str) -> Option<TaskCard> {
+        let runtime = self.background.as_ref()?;
+        if runtime.session_id() != self.state.session.id {
+            return None;
+        }
+        self.task_history_cards().into_iter().find(|task| {
+            task.task_id == task_id
+                && task.kind == JobKind::Agent
+                && task.owner == JobOwner::Main
+                && task.background
+                && (task.state == "failed" || task.active())
+        })
+    }
+
+    pub(super) fn start_task_continuation(&mut self, task_id: &str, sub: Submission) {
+        self.subagent_input_box
+            .set_state(InputState::new(sub.draft.clone(), sub.images.clone()));
+        if self.task_continuation.is_some() {
+            self.flash(CONTINUATION_PENDING.into());
+            return;
+        }
+        if !sub.images.is_empty() || !sub.mentions.is_empty() || !sub.commits.is_empty() {
+            self.flash(CONTINUATION_TEXT_ONLY.into());
+            return;
+        }
+        let Some(task) = self.task_continuation_target(task_id) else {
+            self.flash(CONTINUATION_UNAVAILABLE.into());
+            return;
+        };
+        if task.active() {
+            self.flash(CONTINUATION_SETTLING.into());
+            return;
+        }
+        let (Some(runtime), Some(host), Some(events)) = (
+            self.background.clone(),
+            self.task_host.clone(),
+            self.restore_event_tx.clone(),
+        ) else {
+            self.flash(TASK_UNAVAILABLE.into());
+            return;
+        };
+        let session = self.state.session.id;
+        let epoch = self.background_delivery.fence.epoch();
+        let fence = Arc::clone(&self.background_delivery.fence);
+        let request_id = CaudraId::generate().to_string();
+        let call_id = request_id.clone();
+        let expected = task.clone();
+        let prompt = sub.text.clone();
+        let plan = self.state.plan.target();
+        let workflow = self.workflow.runtime_handle();
+        let opts = RequestOptions {
+            thinking: self.state.thinking.clone(),
+            fast: self.state.fast,
+        };
+        let (sender, reply) = flume::bounded(1);
+        let continuation = async move {
+            if fence.epoch() != epoch {
+                return Err(CONTINUATION_STALE.into());
+            }
+            let (_trigger, cancel) = CancelToken::new();
+            let mut ctx =
+                crate::agent::task_context(&host, workflow.as_ref(), cancel, events, &call_id)
+                    .await?;
+            ctx.plan = plan;
+            ctx.opts = opts;
+            ctx.jobs = Some(runtime.main_scope());
+            if fence.epoch() != epoch {
+                return Err(CONTINUATION_STALE.into());
+            }
+            runtime
+                .resume_failed(&ctx, &expected, call_id, prompt)
+                .await
+        };
+        let job = smol::spawn(async move {
+            let _ = sender.send(continuation.await);
+        });
+        self.task_continuation = Some(TaskContinuation {
+            session,
+            epoch,
+            task,
+            request_id,
+            prompt: sub.text,
+            draft: sub.draft,
+            _job: job,
+            reply,
+        });
+    }
+
+    pub(super) fn task_continuation_prompt(&self, task: &TaskCard) -> Option<String> {
+        self.task_continuation
+            .as_ref()
+            .filter(|pending| {
+                pending.session == self.state.session.id
+                    && pending.task.generation == task.generation
+                    && pending.task.task_id == task.task_id
+                    && pending.request_id == task.call_id
+            })
+            .map(|pending| pending.prompt.clone())
+    }
+
+    pub(super) fn poll_task_continuation(&mut self) -> Dirty {
+        let Some(result) =
+            self.task_continuation
+                .as_ref()
+                .and_then(|pending| match pending.reply.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(flume::TryRecvError::Empty) => None,
+                    Err(flume::TryRecvError::Disconnected) => {
+                        Some(Err(CONTINUATION_UNAVAILABLE.into()))
+                    }
+                })
+        else {
+            return Dirty::NO;
+        };
+        let Some(pending) = self.task_continuation.take() else {
+            return Dirty::NO;
+        };
+        if pending.session != self.state.session.id
+            || self
+                .background
+                .as_ref()
+                .is_none_or(|runtime| runtime.generation() != pending.task.generation)
+        {
+            return Dirty::YES;
+        }
+        match result {
+            Ok(task) => {
+                if !self.task_history_cards().iter().any(|current| {
+                    current.task_id == task.task_id && current.invocation_id == task.invocation_id
+                }) {
+                    return Dirty::YES;
+                }
+                if self.subagent_input_task.as_deref() == Some(&task.task_id) {
+                    if self.subagent_input_box.draft() == pending.draft
+                        && self.subagent_input_box.pending_images().is_empty()
+                    {
+                        self.subagent_input_box.discard();
+                    }
+                } else if let Some(state) = self.subagent_drafts.remove(&task.task_id) {
+                    let (draft, images) = state.into_parts();
+                    if draft != pending.draft || !images.is_empty() {
+                        self.subagent_drafts
+                            .insert(task.task_id.clone(), InputState::new(draft, images));
+                    }
+                }
+                if !self.chats.iter().any(|chat| {
+                    chat.task_id().is_some_and(|id| id.as_ref() == task.task_id)
+                        && chat
+                            .parent_tool_use_id()
+                            .is_some_and(|id| id.as_ref() == task.call_id)
+                }) {
+                    self.resolve_or_create_chat(&SubagentInfo {
+                        task_id: task.task_id.clone(),
+                        parent_tool_use_id: task.call_id.clone(),
+                        name: task.label.clone(),
+                        prompt: Some(pending.prompt),
+                        model: None,
+                        thinking: None,
+                        fast: false,
+                        answer_tx: None,
+                        steer_tx: None,
+                    });
+                }
+                let _ = self.reconcile_tasks();
+            }
+            Err(error) => {
+                if self.active_subagent_id() == Some(pending.task.task_id.as_str())
+                    && pending.epoch == self.background_delivery.fence.epoch()
+                    && self.task_history_cards().iter().any(|task| {
+                        task.task_id == pending.task.task_id
+                            && task.invocation_id == pending.task.invocation_id
+                    })
+                {
+                    self.flash(error);
+                }
+            }
+        }
+        Dirty::YES
+    }
+
+    #[cfg(test)]
+    pub(super) async fn flush_task_continuation(&mut self) {
+        if let Some(pending) = &mut self.task_continuation {
+            (&mut pending._job).await;
+        }
+        let _ = self.poll_task_continuation();
+    }
+
     #[cfg(test)]
     pub(super) async fn flush_task_controls(&mut self) {
         for job in std::mem::take(&mut self.task_controls.jobs) {

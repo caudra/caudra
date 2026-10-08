@@ -5,6 +5,7 @@ use crate::app::background_delivery::DeliveryFence;
 use crate::app::file_revert::RecorderSlot;
 use arc_swap::ArcSwap;
 use caudra_agent::agent;
+use caudra_agent::agent::task_runner::{HostExtras, WorkflowHostContext};
 use caudra_agent::background::BackgroundTasks;
 use caudra_agent::context::{
     BuiltinToolsInput, ContextCapture, ContextInventory, ContextMcpInventory, ContextPublisher,
@@ -13,6 +14,7 @@ use caudra_agent::context::{
 use caudra_agent::mcp::config::McpServerStatus;
 use caudra_agent::mcp::{McpHandle, McpRequestSnapshot, McpSession};
 use caudra_agent::permissions::PermissionManager;
+use caudra_agent::prompt::ResolvedSlots;
 use caudra_agent::prompt::profile::{
     BUILTIN_PROFILE_NAME, PromptProfileCatalog, SystemPromptProfile, TaskProfileBindings,
 };
@@ -25,7 +27,7 @@ use caudra_agent::tools::{
     ToolAudience, ToolDefinitions, ToolFilter, ToolRegistry, deferral,
 };
 use caudra_agent::types::TodoItem;
-use caudra_agent::workflow::{WorkflowHandle, WorkspaceRebind};
+use caudra_agent::workflow::WorkflowHandle;
 use caudra_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams,
     BackgroundReminderContext, CancelMap, CancelToken, CancelTrigger, DoneReason, Envelope,
@@ -47,7 +49,9 @@ use tracing::error;
 use super::cancel_map::RunCancelMap;
 use super::shared_queue::{QueueItem, QueueReceiver};
 use super::workflow::SharedMode;
-use super::{BtwPrompt, ModelSlot, SharedBtwPrompt};
+use super::{BtwPrompt, ModelSlot, SharedBtwPrompt, refresh_remote_context};
+
+const TASK_CONTEXT_UNAVAILABLE: &str = "Remote project context unavailable for task continuation";
 
 pub(crate) struct ToolsPreviewSource {
     pub(crate) registry: Arc<ToolRegistry>,
@@ -725,53 +729,8 @@ impl AgentLoop {
         let (trigger, cancel) = CancelToken::new();
         self.set_cancel_trigger(run_id, trigger);
 
-        let active_prompt_profile_name: Arc<str> = Arc::from(
-            self.system_prompt_profile
-                .as_ref()
-                .map_or(BUILTIN_PROFILE_NAME, |profile| profile.name()),
-        );
-
         let mut agent = Agent::new(
-            AgentParams {
-                provider: Arc::clone(&effective_slot.provider),
-                model: effective_slot.model.clone(),
-                chat_provider: Arc::clone(&selected_slot.provider),
-                chat_model: selected_slot.model.clone(),
-                config: self.config.clone(),
-                tool_output_lines: self.tool_output_lines,
-                tool_output_store: self.tool_output_store.clone(),
-                permissions: Arc::clone(&self.permissions),
-                session_id: self.session_id.clone(),
-                cache_key: self.session_id.as_ref().map(CacheKey::session),
-                workspace_session: self.workspace_session.clone(),
-                remote_project_context: self.remote_project_context.clone(),
-                host_cwd: self.host_cwd.clone(),
-                local_documents: self.local_documents.clone(),
-                task_environment: caudra_agent::template::env_vars(),
-                root_tool_use_id: None,
-                mailbox: self.mailbox.clone(),
-                context_publisher: Some(self.context_publisher.clone()),
-                timeouts: self.timeouts,
-                file_tracker: Arc::clone(&self.file_tracker),
-                path_locks: Arc::clone(&self.path_locks),
-                changes: self.change_recorder.load_full().as_deref().cloned(),
-                prompt_slots: Arc::new(prompt_slots),
-                prompt_profiles: Arc::clone(&self.prompt_profiles),
-                default_task_prompt_profile_name: Arc::clone(&active_prompt_profile_name),
-                active_prompt_profile_name: Some(active_prompt_profile_name),
-                subagent_cancels: Arc::clone(&self.subagent_cancels),
-                subagent_history: self.subagent_history.clone(),
-                registry: Arc::clone(caudra_agent::tools::ToolRegistry::global_arc()),
-                audience: ToolAudience::MAIN,
-                tool_ceiling: ToolFilter::ceiling_from_config(&self.config, &[]),
-                profile_tool_policy: Arc::new(self.profile_tool_policy()),
-                tool_filter,
-                model_policy: Arc::clone(&self.model_policy),
-                workflow: self.workflow.clone(),
-                background: self.background.clone(),
-                jobs: None,
-                task_id: None,
-            },
+            self.agent_params(&effective_slot, &selected_slot, prompt_slots, tool_filter),
             AgentRunParams {
                 history: &mut self.history,
                 system,
@@ -818,6 +777,103 @@ impl AgentLoop {
         }
 
         result.map(|_| ())
+    }
+
+    fn agent_params(
+        &self,
+        effective_slot: &ModelSlot,
+        selected_slot: &ModelSlot,
+        prompt_slots: ResolvedSlots,
+        tool_filter: ToolFilter,
+    ) -> AgentParams {
+        let active_prompt_profile_name: Arc<str> = Arc::from(
+            self.system_prompt_profile
+                .as_ref()
+                .map_or(BUILTIN_PROFILE_NAME, |profile| profile.name()),
+        );
+        AgentParams {
+            provider: Arc::clone(&effective_slot.provider),
+            model: effective_slot.model.clone(),
+            chat_provider: Arc::clone(&selected_slot.provider),
+            chat_model: selected_slot.model.clone(),
+            config: self.config.clone(),
+            tool_output_lines: self.tool_output_lines,
+            tool_output_store: self.tool_output_store.clone(),
+            permissions: Arc::clone(&self.permissions),
+            session_id: self.session_id.clone(),
+            cache_key: self.session_id.as_ref().map(CacheKey::session),
+            workspace_session: self.workspace_session.clone(),
+            remote_project_context: self.remote_project_context.clone(),
+            host_cwd: self.host_cwd.clone(),
+            local_documents: self.local_documents.clone(),
+            task_environment: template::env_vars(),
+            root_tool_use_id: None,
+            mailbox: self.mailbox.clone(),
+            context_publisher: Some(self.context_publisher.clone()),
+            timeouts: self.timeouts,
+            file_tracker: Arc::clone(&self.file_tracker),
+            path_locks: Arc::clone(&self.path_locks),
+            changes: self.change_recorder.load_full().as_deref().cloned(),
+            prompt_slots: Arc::new(prompt_slots),
+            prompt_profiles: Arc::clone(&self.prompt_profiles),
+            default_task_prompt_profile_name: Arc::clone(&active_prompt_profile_name),
+            active_prompt_profile_name: Some(active_prompt_profile_name),
+            subagent_cancels: Arc::clone(&self.subagent_cancels),
+            subagent_history: self.subagent_history.clone(),
+            registry: Arc::clone(ToolRegistry::global_arc()),
+            audience: ToolAudience::MAIN,
+            tool_ceiling: ToolFilter::ceiling_from_config(&self.config, &[]),
+            profile_tool_policy: Arc::new(self.profile_tool_policy()),
+            tool_filter,
+            model_policy: Arc::clone(&self.model_policy),
+            workflow: self.workflow.clone(),
+            background: self.background.clone(),
+            jobs: None,
+            task_id: None,
+        }
+    }
+
+    pub(super) fn task_host(&self) -> Result<WorkflowHostContext, String> {
+        let selected_slot = self.model_slot.load();
+        let mut params = self.agent_params(
+            &self.effective_model_slot.load(),
+            &selected_slot,
+            self.lua_handle.collect_prompt_slots(&self.config),
+            ToolFilter::ceiling_from_config(&self.config, &[]),
+        );
+        if let Some(workspace) = &self.workspace_session {
+            let cwd = smol::block_on(caudra_agent::workspace_logical_cwd(workspace))?;
+            params.task_environment = params.task_environment.set("{cwd}", cwd);
+        }
+        let loaded_instructions = match &self.remote_project_context {
+            Some(context) => {
+                agent::load_remote_instructions(context, self.host_cwd.as_deref()).loaded
+            }
+            None if self.workspace_session.is_some() => {
+                return Err(TASK_CONTEXT_UNAVAILABLE.into());
+            }
+            None => agent::load_instructions(&params.task_environment.apply("{cwd}")).loaded,
+        };
+        Ok(WorkflowHostContext::from_agent_params(
+            &params,
+            HostExtras {
+                mcp: self.mcp.clone(),
+                loaded_instructions,
+                user_response_rx: Some(Arc::clone(&self.answer_rx)),
+            },
+            Arc::new({
+                let model_slot = Arc::clone(&self.effective_model_slot);
+                move || {
+                    let slot = model_slot.load();
+                    (Arc::clone(&slot.provider), Arc::new(slot.model.clone()))
+                }
+            }),
+            Arc::new({
+                let mode = Arc::clone(&self.mode);
+                move || AgentMode::clone(&mode.load())
+            }),
+            Arc::clone(&self.subagent_cancels),
+        ))
     }
 
     /// Base tools only. MCP definitions are injected per request by
@@ -905,63 +961,18 @@ impl AgentLoop {
 
     async fn read_instructions(&mut self) -> Result<Instructions, AgentError> {
         if let Some(workspace) = &self.workspace_session {
-            let context = match caudra_agent::remote_project_context::load_remote_project_context(
+            let (context, cwd) = refresh_remote_context(
                 workspace,
+                self.remote_project_context.as_deref(),
+                &self.permissions,
+                self.workflow.as_ref(),
+                &self.subagent_cancels,
                 self.config.features,
             )
-            .await
-            {
-                Ok(context) => context,
-                Err(error) => {
-                    self.permissions.invalidate_remote_permission_asset();
-                    return Err(AgentError::Tool {
-                        tool: "remote_project_context".into(),
-                        message: format!("Remote project context unavailable: {error}"),
-                    });
-                }
-            };
-            let changed = self
-                .remote_project_context
-                .as_ref()
-                .is_none_or(|old| old.manifest_revision() != context.manifest_revision());
-            let transition = if changed {
-                caudra_agent::workflow::prepare_workspace_transition(
-                    self.workflow.as_ref(),
-                    self.subagent_cancels.active_count(),
-                    WorkspaceRebind {
-                        workspace: workspace.clone(),
-                        context: Arc::clone(&context),
-                        cwd: self.vars.apply("{cwd}").into_owned(),
-                    },
-                )
-                .await
-                .map_err(|message| {
-                    self.permissions.invalidate_remote_permission_asset();
-                    AgentError::Tool {
-                        tool: "remote_project_context".into(),
-                        message,
-                    }
-                })?
-            } else {
-                None
-            };
-            self.permissions
-                .replace_remote_permission_asset(context.permissions())
-                .map_err(|error| AgentError::Tool {
-                    tool: "remote_permissions".into(),
-                    message: format!("Remote permission policy unavailable: {error}"),
-                })?;
+            .await?;
             let instructions = agent::load_remote_instructions(&context, self.host_cwd.as_deref());
             self.remote_project_context = Some(context);
-            if let Some(transition) = transition {
-                transition
-                    .commit()
-                    .await
-                    .map_err(|error| AgentError::Tool {
-                        tool: "workflow".into(),
-                        message: error.to_string(),
-                    })?;
-            }
+            self.vars = self.vars.clone().set("{cwd}", cwd);
             return Ok(instructions);
         }
         let cwd = self.vars.apply("{cwd}").into_owned();

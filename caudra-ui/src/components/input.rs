@@ -62,6 +62,7 @@ const PLACEHOLDER_SUGGESTIONS: &[&str] = &[
 const QUEUE_PLACEHOLDER: &str = "Queue another prompt...";
 const QUEUE_EDIT_PLACEHOLDER: &str = "Edit queued message...";
 const STEER_PLACEHOLDER: &str = "Steer this task...";
+const RESUME_TASK_PLACEHOLDER: &str = "Continue this failed task...";
 const ASK_PREFIX: &str = "Ask caudra to ";
 const ASK_SUFFIX: &str = "...";
 const BLANK_PLACEHOLDER: &str = " ";
@@ -112,6 +113,7 @@ pub enum Placeholder {
     Queue,
     QueueEdit,
     Steer,
+    ResumeTask,
 }
 
 /// What a click or the pointer landed on in the composer, when it landed on
@@ -632,6 +634,7 @@ impl InputBox {
                 Placeholder::Queue => (QUEUE_PLACEHOLDER, Vec::new()),
                 Placeholder::QueueEdit => (QUEUE_EDIT_PLACEHOLDER, Vec::new()),
                 Placeholder::Steer => (STEER_PLACEHOLDER, Vec::new()),
+                Placeholder::ResumeTask => (RESUME_TASK_PLACEHOLDER, Vec::new()),
                 Placeholder::Blank => (BLANK_PLACEHOLDER, Vec::new()),
             };
             let mut spans = vec![super::chevron_span()];

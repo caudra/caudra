@@ -1207,7 +1207,7 @@ mod background_runtime {
     use caudra_agent::types::BACKGROUND_EVENT_RUN_ID;
     use caudra_agent::{
         AgentConfig, AgentEvent, DoneReason, Envelope, McpConfigErrors, SubagentHistoryStore,
-        SubagentInfo, TaskProvenance,
+        SubagentInfo, TaskCard, TaskProvenance,
     };
     use caudra_agent::{BatchToolStatus, SubagentActivity, ToolDoneEvent, ToolOutput};
     use caudra_automation::event::StartedBy;
@@ -1229,7 +1229,7 @@ mod background_runtime {
     use serde_json::{Value, json};
     use test_case::test_case;
 
-    use super::{App, Msg, Status, subagent_info, test_app};
+    use super::{App, ImageMediaType, ImageSource, Msg, Status, subagent_info, test_app};
     use crate::AppSession;
     use crate::agent::shared_queue::QueueItem;
     use crate::agent::{AgentHandles, ModelSlot, QueuedMessage, reserve_background_transition};
@@ -1264,10 +1264,14 @@ mod background_runtime {
     const WORKFLOW_BUDGET: u32 = 1;
     const TIMEOUT: Duration = Duration::from_secs(30);
     const REPEATED_CHECKPOINTS: usize = 16;
+    const FAILED: &str = "failed";
+    const RETRY_TASK: &str = "Retry the audit using its existing context.";
+    const NEXT_TASK_DRAFT: &str = "Keep this newer guidance.";
     static REGISTER: Once = Once::new();
 
     struct Request {
         messages: Vec<Message>,
+        events: flume::Sender<ProviderEvent>,
         reply: flume::Sender<Result<StreamResponse, AgentError>>,
     }
 
@@ -1280,20 +1284,47 @@ mod background_runtime {
             messages: &'a [Message],
             _: &'a str,
             _: &'a Value,
-            _: &'a flume::Sender<ProviderEvent>,
+            events: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a CacheKey>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 let (reply, result) = flume::bounded(1);
+                let (event_tx, event_rx) = flume::unbounded();
                 self.0
                     .send_async(Request {
                         messages: messages.to_vec(),
+                        events: event_tx,
                         reply,
                     })
                     .await
                     .map_err(|_| AgentError::Channel)?;
-                result.recv_async().await.map_err(|_| AgentError::Channel)?
+                loop {
+                    let response = futures_lite::future::or(
+                        async {
+                            result
+                                .recv_async()
+                                .await
+                                .map(Some)
+                                .map_err(|_| AgentError::Channel)
+                        },
+                        async {
+                            let event = event_rx
+                                .recv_async()
+                                .await
+                                .map_err(|_| AgentError::Channel)?;
+                            events
+                                .send_async(event)
+                                .await
+                                .map_err(|_| AgentError::Channel)?;
+                            Ok(None)
+                        },
+                    )
+                    .await?;
+                    if let Some(response) = response {
+                        return response;
+                    }
+                }
             })
         }
 
@@ -1335,6 +1366,10 @@ mod background_runtime {
         }
 
         async fn after_final_with_reminders(show_reminders: bool) -> Self {
+            Self::after_final_with_options(show_reminders, false).await
+        }
+
+        async fn after_final_with_options(show_reminders: bool, rearm: bool) -> Self {
             REGISTER.call_once(|| {
                 native::register(ToolRegistry::global(), FeatureFlags::all()).unwrap()
             });
@@ -1390,6 +1425,11 @@ mod background_runtime {
                 true,
             );
             handles.apply_to_app(&mut app);
+            if rearm {
+                let background = handles.background.as_ref().unwrap();
+                background.stop().await.unwrap();
+                background.rearm();
+            }
             let SubmitOutcome::Started(actions) = app.submit_prompt(QueuedMessage {
                 text: PARENT.into(),
                 images: Vec::new(),
@@ -1464,6 +1504,31 @@ mod background_runtime {
                 run_id: self.app.run_id,
             });
             self.requests.recv_async().await.unwrap()
+        }
+
+        async fn fail_child(&mut self) -> TaskCard {
+            let background = self.handles.background.as_ref().unwrap().clone();
+            let task = background
+                .list()
+                .into_iter()
+                .find(|task| task.call_id == TASK)
+                .unwrap();
+            self.app.focus_task(&task.task_id).unwrap();
+            self.app.sync_subagent_input_target();
+            self.child.reply.send(Err(AgentError::Channel)).unwrap();
+            loop {
+                let changed = background.listen();
+                if background.resident_status(&task.task_id).unwrap().state == FAILED {
+                    break;
+                }
+                changed.await;
+            }
+            while let Ok(envelope) = self.handles.agent_rx.try_recv() {
+                self.app.update(Msg::Agent(Box::new(envelope)));
+            }
+            let _ = self.app.reconcile_tasks();
+            assert!(!self.app.subagent_steers.contains_key(&task.task_id));
+            background.resident_status(&task.task_id).unwrap()
         }
 
         async fn drain_parent(&mut self) {
@@ -1555,6 +1620,281 @@ mod background_runtime {
             panic!("background TUI test did not reach its event barrier");
         })
         .await;
+    }
+
+    #[test_case(false, false, false; "admission_reply_first")]
+    #[test_case(true, false, false; "agent_event_first")]
+    #[test_case(false, true, false; "archived_admission_reply_first")]
+    #[test_case(true, true, false; "archived_agent_event_first")]
+    #[test_case(false, false, true; "after_stop_and_rearm")]
+    fn failed_background_task_composer_continues_same_history(
+        events_first: bool,
+        archived: bool,
+        rearmed: bool,
+    ) {
+        smol::block_on(bounded(async {
+            let mut fixture = Fixture::after_final_with_options(true, rearmed).await;
+            let task = fixture.fail_child().await;
+            if archived {
+                let background = fixture.handles.background.as_ref().unwrap().clone();
+                let messages = background.claim_messages().unwrap();
+                assert!(!messages.is_empty());
+                fixture.app.shared_history = None;
+                fixture.app.state.session_mut().meta.history_head = None;
+                fixture
+                    .app
+                    .state
+                    .session_mut()
+                    .replace_messages(crate::history_items(&messages));
+                fixture
+                    .app
+                    .storage_writer
+                    .save_sync(Arc::clone(&fixture.app.state.session))
+                    .unwrap();
+                background.finalize_messages(&messages).await.unwrap();
+                assert!(background.resident_status(&task.task_id).is_none());
+            }
+            let chat_index = fixture.app.active_chat;
+            assert!(fixture.app.composer_is_visible());
+            assert!(fixture.app.composer_is_interactive());
+            fixture.app.update(Msg::Paste(RETRY_TASK.into()));
+            assert!(super::rendered(&mut fixture.app).contains(RETRY_TASK));
+            let parent_messages = fixture.app.chats[0].message_count();
+            assert!(
+                fixture
+                    .app
+                    .update(Msg::Key(super::key(KeyCode::Enter)))
+                    .is_empty()
+            );
+            assert_eq!(fixture.app.subagent_input_box.draft().text, RETRY_TASK);
+            assert!(
+                fixture
+                    .app
+                    .update(Msg::Key(super::key(KeyCode::Enter)))
+                    .is_empty()
+            );
+            assert_eq!(
+                fixture.app.status_bar.flash_text(),
+                Some(crate::app::tasks::CONTINUATION_PENDING)
+            );
+
+            let request = fixture.requests.recv_async().await.unwrap();
+            fixture.app.background_delivery.invalidate();
+            request
+                .events
+                .send(ProviderEvent::TextDelta {
+                    text: REPORT.into(),
+                })
+                .unwrap();
+            assert!(request.messages.iter().any(|message| {
+                message
+                    .first_text_content()
+                    .is_some_and(|text| text.starts_with(CHILD))
+            }));
+            assert!(request.messages.iter().any(|message| {
+                message
+                    .first_text_content()
+                    .is_some_and(|text| text.starts_with(RETRY_TASK))
+            }));
+            if events_first {
+                while !fixture.app.subagent_steers.contains_key(&task.task_id) {
+                    let envelope = fixture.handles.agent_rx.recv_async().await.unwrap();
+                    fixture.app.update(Msg::Agent(Box::new(envelope)));
+                }
+            }
+            fixture.app.flush_task_continuation().await;
+            while !fixture.app.subagent_steers.contains_key(&task.task_id) {
+                let envelope = fixture.handles.agent_rx.recv_async().await.unwrap();
+                fixture.app.update(Msg::Agent(Box::new(envelope)));
+            }
+            assert!(fixture.app.subagent_input_box.is_empty());
+            assert_eq!(fixture.app.active_chat, chat_index);
+            assert_eq!(fixture.app.chats[0].message_count(), parent_messages);
+            let resumed = fixture
+                .handles
+                .background
+                .as_ref()
+                .unwrap()
+                .resident_status(&task.task_id)
+                .unwrap();
+            assert_ne!(resumed.invocation_id, task.invocation_id);
+            assert_ne!(resumed.call_id, task.call_id);
+            let chat = &fixture.app.chats[chat_index];
+            assert_eq!(
+                (0..chat.message_count())
+                    .filter(|&index| chat
+                        .message_at(index)
+                        .is_some_and(|message| message.role == DisplayRole::User
+                            && message.text == RETRY_TASK))
+                    .count(),
+                1
+            );
+            assert!(fixture.app.subagent_steers.contains_key(&task.task_id));
+            fixture
+                .app
+                .subagent_input_box
+                .set_input(NEXT_TASK_DRAFT.into());
+            fixture.app.update(Msg::Key(super::key(KeyCode::Enter)));
+            assert_eq!(
+                fixture.app.subagent_steers[&task.task_id].entries()[0].text,
+                NEXT_TASK_DRAFT
+            );
+            assert!(fixture.requests.is_empty());
+            drop(request);
+            fixture.close().await;
+        }));
+    }
+
+    #[test_case(false; "edited_draft")]
+    #[test_case(true; "changed_focus")]
+    fn task_continuation_admission_does_not_overwrite_newer_input(change_focus: bool) {
+        smol::block_on(bounded(async {
+            let mut fixture = Fixture::after_final().await;
+            let task = fixture.fail_child().await;
+            fixture.app.subagent_input_box.set_input(RETRY_TASK.into());
+            fixture.app.update(Msg::Key(super::key(KeyCode::Enter)));
+            fixture
+                .app
+                .subagent_input_box
+                .set_input(NEXT_TASK_DRAFT.into());
+            if change_focus {
+                fixture
+                    .app
+                    .focus_task(crate::app::tasks::MAIN_TASK_ID)
+                    .unwrap();
+                fixture.app.sync_subagent_input_target();
+                fixture.app.input_box.set_input(PARENT.into());
+            }
+            let request = fixture.requests.recv_async().await.unwrap();
+            fixture.app.flush_task_continuation().await;
+            assert_eq!(
+                fixture.app.input_box.buffer.value(),
+                if change_focus { PARENT } else { "" }
+            );
+            fixture.app.focus_task(&task.task_id).unwrap();
+            fixture.app.sync_subagent_input_target();
+            assert_eq!(fixture.app.subagent_input_box.draft().text, NEXT_TASK_DRAFT);
+            drop(request);
+            fixture.close().await;
+        }));
+    }
+
+    #[test_case(false; "draft_preserved")]
+    #[test_case(true; "attachments_preserved")]
+    fn failed_task_keeps_draft_across_focus_and_rejected_submission(with_image: bool) {
+        smol::block_on(bounded(async {
+            let mut fixture = Fixture::after_final().await;
+            let task_id = fixture.handles.background.as_ref().unwrap().list()[0]
+                .task_id
+                .clone();
+            fixture.app.focus_task(&task_id).unwrap();
+            fixture.app.sync_subagent_input_target();
+            fixture
+                .app
+                .update(Msg::Paste("first\nsecond\nthird".into()));
+            let draft = fixture.app.subagent_input_box.draft();
+            if with_image {
+                fixture
+                    .app
+                    .subagent_input_box
+                    .attach_image(ImageSource::new(
+                        ImageMediaType::Png,
+                        Arc::from(super::IMAGE_DATA),
+                    ));
+            }
+            let task = fixture.fail_child().await;
+            assert_eq!(fixture.app.subagent_input_box.draft(), draft);
+            fixture
+                .app
+                .focus_task(crate::app::tasks::MAIN_TASK_ID)
+                .unwrap();
+            fixture.app.sync_subagent_input_target();
+            fixture.app.focus_task(&task.task_id).unwrap();
+            fixture.app.sync_subagent_input_target();
+            assert_eq!(fixture.app.subagent_input_box.draft(), draft);
+            if !with_image {
+                fixture
+                    .handles
+                    .background
+                    .as_ref()
+                    .unwrap()
+                    .stop()
+                    .await
+                    .unwrap();
+            }
+            fixture.app.update(Msg::Key(super::key(KeyCode::Enter)));
+            fixture.app.flush_task_continuation().await;
+            assert_eq!(fixture.app.subagent_input_box.draft(), draft);
+            assert_eq!(
+                fixture.app.subagent_input_box.pending_images().len(),
+                usize::from(with_image)
+            );
+            if with_image {
+                assert_eq!(
+                    fixture.app.status_bar.flash_text(),
+                    Some(crate::app::tasks::CONTINUATION_TEXT_ONLY)
+                );
+            }
+            assert!(fixture.requests.is_empty());
+            fixture.close().await;
+        }));
+    }
+
+    #[test]
+    fn settling_background_task_preserves_submission_without_launching() {
+        smol::block_on(bounded(async {
+            let mut fixture = Fixture::after_final().await;
+            let task = fixture.handles.background.as_ref().unwrap().list()[0].clone();
+            fixture.app.focus_task(&task.task_id).unwrap();
+            fixture.app.sync_subagent_input_target();
+            fixture.app.preserve_unconsumed_steers(&task.task_id);
+            fixture.app.subagent_input_box.set_input(RETRY_TASK.into());
+            assert!(
+                fixture
+                    .app
+                    .update(Msg::Key(super::key(KeyCode::Enter)))
+                    .is_empty()
+            );
+            assert_eq!(fixture.app.subagent_input_box.draft().text, RETRY_TASK);
+            assert_eq!(
+                fixture.app.status_bar.flash_text(),
+                Some(crate::app::tasks::CONTINUATION_SETTLING)
+            );
+            assert!(fixture.app.task_continuation.is_none());
+            assert!(fixture.requests.is_empty());
+            fixture.close().await;
+        }));
+    }
+
+    #[test_case(false; "succeeded")]
+    #[test_case(true; "cancelled")]
+    fn nonfailed_background_task_does_not_keep_a_continuation_composer(cancelled: bool) {
+        smol::block_on(bounded(async {
+            let mut fixture = Fixture::after_final().await;
+            let background = fixture.handles.background.as_ref().unwrap().clone();
+            let task = background.list()[0].clone();
+            fixture.app.focus_task(&task.task_id).unwrap();
+            fixture.app.sync_subagent_input_target();
+            if cancelled {
+                background.cancel(&task.task_id).await.unwrap();
+            } else {
+                fixture.child.reply.send(final_response()).unwrap();
+            }
+            loop {
+                let changed = background.listen();
+                if !background.resident_status(&task.task_id).unwrap().active() {
+                    break;
+                }
+                changed.await;
+            }
+            while let Ok(envelope) = fixture.handles.agent_rx.try_recv() {
+                fixture.app.update(Msg::Agent(Box::new(envelope)));
+            }
+            let _ = fixture.app.reconcile_tasks();
+            assert!(!fixture.app.composer_is_visible());
+            assert!(!fixture.app.composer_is_interactive());
+            fixture.close().await;
+        }));
     }
 
     #[test_case(false, false; "hidden_task")]
@@ -6196,7 +6536,7 @@ fn steerable_task_app() -> App {
         info,
     ));
     app.focus_task(TASK_ID).unwrap();
-    assert!(app.active_subagent_can_steer());
+    assert!(app.active_subagent_has_composer());
     app
 }
 
@@ -20494,7 +20834,7 @@ fn task_esc_confirmation_uses_fixed_window(steerable: bool, flash_duration: Dura
         } else {
             app_with_active_subagent()
         };
-        assert_eq!(app.active_subagent_can_steer(), steerable);
+        assert_eq!(app.active_subagent_has_composer(), steerable);
         app.status_bar.flash_duration = flash_duration;
 
         assert!(app.update(Msg::Key(key(KeyCode::Esc))).is_empty());

@@ -58,6 +58,11 @@ const ADMISSION_CANCELLED: &str = "background task admission cancelled";
 const TRANSITION: &str = "background task admission is reserved for a workspace transition";
 const FOREIGN_SESSION: &str = "task context belongs to a different session";
 const SELECTED_HISTORY_MISSING: &str = "selected task history version is unavailable";
+const FAILED_TASK_REQUIRED: &str =
+    "only a failed managed agent task owned by this session can be continued";
+const TASK_SETTLING: &str = "task failure is still settling; try again after settlement";
+const EMPTY_CONTINUATION: &str = "a task continuation requires a non-empty follow-up";
+const RETRY_MISMATCH: &str = "task retry differs from the admitted request";
 const INTERRUPTED: &str = "Execution interrupted by session shutdown or crash; effects may require reconciliation before explicit resume.";
 const TASK_SYNC: &str = "task_execution = sync requires completed task results";
 const TASK_ASYNC: &str = "task_execution = async requires task admission receipts";
@@ -1656,8 +1661,88 @@ impl BackgroundTasks {
     pub(crate) async fn execute(
         &self,
         ctx: &ToolContext,
+        request: TaskRequest,
+        background: bool,
+    ) -> Result<TaskDelivery, String> {
+        self.execute_admitted(ctx, request, background, None).await
+    }
+
+    pub fn can_resume_failed(&self, expected: &TaskCard) -> bool {
+        let state = self.lock();
+        expected.kind == JobKind::Agent
+            && expected.owner == JobOwner::Main
+            && expected.state == "failed"
+            && expected.generation == state.generation
+            && state.open
+            && !state.shutdown
+            && state.failure.is_none()
+            && state.pending_stops == 0
+            && state.transition.is_none()
+            && !state.closed_owners.contains(&JobOwner::Main)
+            && task_delivery_policy(&state.task_execution, true).is_ok()
+            && state
+                .records
+                .values()
+                .chain(&state.recent)
+                .filter(|record| record.task_id == expected.task_id)
+                .max_by_key(|record| record.sequence)
+                .is_some_and(|record| {
+                    record.invocation_id == expected.invocation_id
+                        && record.kind() == JobKind::Agent
+                        && record.owner == JobOwner::Main
+                        && (record.state == "failed" || record.active())
+                })
+    }
+
+    pub async fn resume_failed(
+        &self,
+        ctx: &ToolContext,
+        expected: &TaskCard,
+        request_id: String,
+        prompt: String,
+    ) -> Result<TaskCard, String> {
+        if ctx.session_id.as_ref().map(|session| session.as_str())
+            != Some(self.0.session.to_string().as_str())
+            || ctx.jobs.as_ref().is_some_and(|jobs| {
+                jobs.owner() != &JobOwner::Main || jobs.session_id() != self.0.session
+            })
+        {
+            return Err(FOREIGN_SESSION.into());
+        }
+        if prompt.trim().is_empty() {
+            return Err(EMPTY_CONTINUATION.into());
+        }
+        let request = TaskRequest {
+            prompt: Some(prompt),
+            label: expected.label.clone(),
+            task: TaskIdentity::Continue(expected.task_id.clone()),
+            mode: None,
+            profile: None,
+            model_job: None,
+            output_schema: None,
+            call_id: request_id.clone(),
+            provenance: None,
+        };
+        let ctx = ToolContext {
+            tool_use_id: Some(request_id.clone()),
+            root_tool_use_id: Some(request_id),
+            ..ctx.clone()
+        };
+        match self
+            .execute_admitted(&ctx, request, true, Some(expected))
+            .await?
+        {
+            TaskDelivery::Background(card) => Ok(*card),
+            TaskDelivery::Foreground(..) => Err(TASK_ASYNC.into()),
+        }
+    }
+
+    async fn execute_admitted(
+        &self,
+        ctx: &ToolContext,
         mut request: TaskRequest,
         background: bool,
+        expected: Option<&TaskCard>,
     ) -> Result<TaskDelivery, String> {
         if ctx
             .session_id
@@ -1677,19 +1762,72 @@ impl BackgroundTasks {
         if self.lock().transition.is_some() {
             return Err(TRANSITION.into());
         }
-        let contract = json!({"call_id":request.call_id,"task":format!("{:?}", request.task),"background":background,"prompt":request.prompt,"label":request.label,"mode":request.mode,"profile":request.profile,"schema":request.output_schema,"model":ctx.model.spec(),"thinking":ctx.opts.thinking.to_string(),"fast":ctx.opts.fast,"workspace":ctx.task_environment.apply("{cwd}"),"root":ctx.root_tool_use_id});
+        let mut contract = json!({"call_id":request.call_id,"task":format!("{:?}", request.task),"background":background,"prompt":request.prompt,"label":request.label,"mode":request.mode,"profile":request.profile,"schema":request.output_schema,"model":ctx.model.spec(),"thinking":ctx.opts.thinking.to_string(),"fast":ctx.opts.fast,"workspace":ctx.task_environment.apply("{cwd}"),"root":ctx.root_tool_use_id});
+        if let Some(expected) = expected {
+            if expected.kind != JobKind::Agent
+                || expected.owner != JobOwner::Main
+                || expected.state != "failed"
+            {
+                return Err(FAILED_TASK_REQUIRED.into());
+            }
+            if expected.generation != admission.scope.generation()
+                || ctx
+                    .jobs
+                    .as_ref()
+                    .is_some_and(|jobs| jobs.generation() != expected.generation)
+            {
+                return Err(STALE_INVOCATION.into());
+            }
+            task_delivery_policy(&self.lock().task_execution, background)?;
+            contract["human_continuation"] = json!({
+                "invocation_id": expected.invocation_id,
+                "generation": expected.generation,
+            });
+        }
         let retry = self
             .retry_record(&JobOwner::Main, &request.call_id, &admission)
             .await?;
         if let Some(record) = retry {
             if record.request != contract {
-                return Err("task retry differs from the admitted request".into());
+                return Err(RETRY_MISMATCH.into());
+            }
+            if expected.is_some() {
+                let latest = self.prior_record(&record.task_id, None, &admission).await?;
+                if record.generation != admission.scope.generation()
+                    || latest.is_none_or(|latest| latest.invocation_id != record.invocation_id)
+                {
+                    return Err(STALE_INVOCATION.into());
+                }
+                admission.check()?;
             }
             drop(gate);
             return self
                 .wait_delivery(ctx, &record.invocation_id, &record.task_id)
                 .await;
         }
+        let failed_checkpoint = if let Some(expected) = expected {
+            let prior = self
+                .prior_record(&expected.task_id, None, &admission)
+                .await?
+                .ok_or_else(|| FAILED_TASK_REQUIRED.to_owned())?;
+            if prior.invocation_id != expected.invocation_id
+                || prior.generation != expected.generation
+            {
+                return Err(STALE_INVOCATION.into());
+            }
+            if prior.active() {
+                return Err(TASK_SETTLING.into());
+            }
+            if prior.kind() != JobKind::Agent
+                || prior.owner != JobOwner::Main
+                || prior.state != "failed"
+            {
+                return Err(FAILED_TASK_REQUIRED.into());
+            }
+            Some(prior)
+        } else {
+            None
+        };
         let gate = self.archive_settled(gate, Some(admission.clone())).await?;
         admission.check()?;
         {
@@ -1801,11 +1939,19 @@ impl BackgroundTasks {
         let mut owned = ctx.clone();
         if request.task.is_continuation() {
             let snapshot = owned.subagent_history.snapshot();
-            let selected = owned.subagent_history.selected_version(&task_id);
+            let selected = if failed_checkpoint.is_some() {
+                None
+            } else {
+                owned.subagent_history.selected_version(&task_id)
+            };
             let existing = snapshot.records().get(&task_id);
-            let prior = self
-                .prior_record(&task_id, selected.as_deref(), &admission)
-                .await?;
+            let prior = match failed_checkpoint {
+                Some(prior) => Some(prior),
+                None => {
+                    self.prior_record(&task_id, selected.as_deref(), &admission)
+                        .await?
+                }
+            };
             if let Some(version) = &selected
                 && existing.is_none()
                 && prior.is_none()
@@ -1884,7 +2030,7 @@ impl BackgroundTasks {
             generation,
             state: "queued".into(),
             background,
-            receipt_accepted: false,
+            receipt_accepted: expected.is_some(),
             mode: prepared.mode().to_string(),
             request: contract,
             outcome: None,
@@ -2148,6 +2294,7 @@ fn bounded(text: &str, maximum: usize) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::mem::replace;
     use std::slice::from_ref;
     use std::sync::{
         Arc, Mutex,
@@ -2164,7 +2311,7 @@ mod tests {
     };
     use caudra_storage::{
         StateDir,
-        background::{BackgroundLookup, JobOwner, TaskEvent, TaskRecord},
+        background::{BackgroundLookup, JobKind, JobOwner, TaskEvent, TaskRecord},
         id::CaudraId,
         sessions::SessionDatabase,
         tool_outputs::ToolOutputStore,
@@ -2175,9 +2322,10 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        ADMISSION_CANCELLED, Admission, BackgroundTasks, CLOSED, FOREIGN_SESSION, MAX_REPORT_BYTES,
-        MAX_REPORTS, MAX_RESULT_BYTES, SELECTED_HISTORY_MISSING, STALE_INVOCATION, TASK_ASYNC,
-        TASK_OUTPUT_LABEL, TASK_PROMOTION, TASK_SYNC, TRANSITION, TaskDelivery, TaskReporter,
+        ADMISSION_CANCELLED, Admission, BackgroundTasks, CLOSED, EMPTY_CONTINUATION,
+        FAILED_TASK_REQUIRED, FOREIGN_SESSION, MAX_REPORT_BYTES, MAX_REPORTS, MAX_RESULT_BYTES,
+        RETRY_MISMATCH, SELECTED_HISTORY_MISSING, STALE_INVOCATION, TASK_ASYNC, TASK_OUTPUT_LABEL,
+        TASK_PROMOTION, TASK_SETTLING, TASK_SYNC, TRANSITION, TaskDelivery, TaskReporter,
         TaskStatus,
     };
     use crate::{
@@ -2186,7 +2334,7 @@ mod tests {
         SubagentTaskSpec, TaskProvenance, ToolOutput,
         agent::{
             compact_with_session,
-            subagent::TaskIdentity,
+            subagent::{BUILD_FROM_READ_ONLY, TaskIdentity},
             task_runner::{TaskOutcome, TaskRequest},
         },
         background_reminder::RuntimeHealth,
@@ -2209,6 +2357,7 @@ mod tests {
     const SUCCEEDED: &str = "succeeded";
     const BLOCKED: &str = "blocked";
     const CANCELLED: &str = "cancelled";
+    const FAILED: &str = "failed";
     const SUMMARY: &str = "Earlier task findings were compacted into this summary.";
     const PREMATURE_ACK: &str =
         "task event must be durably saved in parent history before acknowledgment";
@@ -3429,6 +3578,27 @@ mod tests {
             self.started.recv_async().await.unwrap();
         }
 
+        async fn failed() -> Self {
+            let mut fixture = Self::new().await;
+            fixture.ctx.session_id = Some(fixture.session.id.into());
+            fixture.launch().await;
+            fixture.fail_and_reset_provider().await;
+            fixture
+        }
+
+        async fn fail_and_reset_provider(&mut self) {
+            let (responses, receiver) = flume::unbounded();
+            drop(replace(&mut self.responses, responses));
+            self.settled().await;
+            assert_eq!(self.tasks.status(&self.task_id()).unwrap().state, FAILED);
+            let (start, started) = flume::unbounded();
+            self.started = started;
+            self.ctx.provider = Arc::new(ControlledProvider {
+                responses: receiver,
+                started: start,
+            });
+        }
+
         async fn settled(&self) {
             loop {
                 let listener = self.tasks.0.changed.listen();
@@ -3746,6 +3916,510 @@ mod tests {
                     .is_err()
             );
             assert_eq!(fixture.ctx.subagent_history.active_count(), 1);
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn human_continuation_preserves_history_and_delivers_without_tool_acknowledgment() {
+        smol::block_on(async {
+            let mut fixture = Fixture::failed().await;
+            let failed = fixture.tasks.status(&fixture.task_id()).unwrap();
+            let previous = fixture.tasks.record(&failed.invocation_id).unwrap();
+            assert!(!previous.receipt_accepted);
+            assert!(fixture.tasks.can_resume_failed(&failed));
+            let resumed = fixture
+                .tasks
+                .resume_failed(
+                    &fixture.ctx,
+                    &failed,
+                    NEXT_CALL.into(),
+                    SECOND_PROMPT.into(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resumed.task_id, failed.task_id);
+            assert_ne!(resumed.invocation_id, failed.invocation_id);
+            assert_eq!(resumed.call_id, NEXT_CALL);
+            assert_eq!(resumed.root_call_id, NEXT_CALL);
+            assert!(!fixture.tasks.can_resume_failed(&failed));
+            let current = fixture.tasks.record(&resumed.invocation_id).unwrap();
+            assert_eq!(current.history, previous.history);
+            assert_eq!(current.spec, previous.spec);
+            assert!(current.receipt_accepted);
+            let durable = fixture
+                .tasks
+                .lookup(BackgroundLookup::Invocation(&resumed.invocation_id), None)
+                .unwrap()
+                .unwrap();
+            assert!(durable.receipt_accepted);
+            let observed = fixture.started.recv_async().await.unwrap();
+            let text = serde_json::to_string(&observed).unwrap();
+            assert_eq!(text.matches(PROMPT).count(), 1);
+            assert_eq!(text.matches(SECOND_PROMPT).count(), 1);
+            let retry = fixture
+                .tasks
+                .resume_failed(
+                    &fixture.ctx,
+                    &failed,
+                    NEXT_CALL.into(),
+                    SECOND_PROMPT.into(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(retry.invocation_id, resumed.invocation_id);
+            assert_eq!(
+                fixture
+                    .tasks
+                    .resume_failed(
+                        &fixture.ctx,
+                        &failed,
+                        NEXT_CALL.into(),
+                        REWOUND_PROMPT.into(),
+                    )
+                    .await
+                    .unwrap_err(),
+                RETRY_MISMATCH
+            );
+            assert_eq!(
+                fixture
+                    .tasks
+                    .resume_failed(
+                        &fixture.ctx,
+                        &failed,
+                        REWOUND_CALL.into(),
+                        SECOND_PROMPT.into(),
+                    )
+                    .await
+                    .unwrap_err(),
+                STALE_INVOCATION
+            );
+            assert!(fixture.started.is_empty());
+            fixture.responses.send(final_response()).unwrap();
+            fixture.settled().await;
+            let delivered = fixture.tasks.claim_messages().unwrap();
+            let origins = delivered
+                .iter()
+                .filter_map(|message| message.task_event.as_ref())
+                .collect::<Vec<_>>();
+            assert_eq!(origins.len(), 1);
+            assert_eq!(origins[0].invocation_id, resumed.invocation_id);
+            fixture.save(&delivered);
+            fixture.tasks.finalize_messages(&delivered).await.unwrap();
+            let retry = fixture
+                .tasks
+                .resume_failed(
+                    &fixture.ctx,
+                    &failed,
+                    NEXT_CALL.into(),
+                    SECOND_PROMPT.into(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(retry.invocation_id, resumed.invocation_id);
+            assert!(fixture.started.is_empty());
+            let mut continuation = request(REWOUND_CALL);
+            continuation.task = TaskIdentity::Continue(failed.task_id.clone());
+            fixture
+                .tasks
+                .execute(&fixture.ctx, continuation, true)
+                .await
+                .unwrap();
+            assert_eq!(
+                fixture
+                    .tasks
+                    .resume_failed(
+                        &fixture.ctx,
+                        &failed,
+                        NEXT_CALL.into(),
+                        SECOND_PROMPT.into(),
+                    )
+                    .await
+                    .unwrap_err(),
+                STALE_INVOCATION
+            );
+            fixture.tasks.shutdown().await.unwrap();
+            let recovered = BackgroundTasks::spawn(fixture.dir.clone(), fixture.session.id)
+                .await
+                .unwrap();
+            assert!(
+                recovered
+                    .record(&resumed.invocation_id)
+                    .unwrap()
+                    .receipt_accepted
+            );
+            recovered.shutdown().await.unwrap();
+        });
+    }
+
+    #[test_case(true, TASK; "loaded_stale_selection")]
+    #[test_case(false, TASK; "unloaded_stale_selection")]
+    #[test_case(false, MISSING_VERSION; "missing_frontend_selection")]
+    fn human_continuation_restores_exact_failed_checkpoint(loaded: bool, selected: &str) {
+        smol::block_on(async {
+            let mut fixture = Fixture::failed().await;
+            let first = fixture.tasks.status(&fixture.task_id()).unwrap();
+            let original = fixture.tasks.record(&first.invocation_id).unwrap();
+            let second = fixture
+                .tasks
+                .resume_failed(&fixture.ctx, &first, NEXT_CALL.into(), SECOND_PROMPT.into())
+                .await
+                .unwrap();
+            fixture.started.recv_async().await.unwrap();
+            fixture.fail_and_reset_provider().await;
+            let expected = fixture.tasks.status(&first.task_id).unwrap();
+            assert_eq!(expected.invocation_id, second.invocation_id);
+            assert_eq!(expected.generation, fixture.tasks.generation());
+            let checkpoint = fixture.tasks.record(&expected.invocation_id).unwrap();
+            assert_ne!(checkpoint.history, original.history);
+            let histories = if loaded {
+                HashMap::from([(
+                    first.task_id.clone(),
+                    Arc::new(serde_json::from_value::<Vec<Message>>(original.history).unwrap()),
+                )])
+            } else {
+                HashMap::new()
+            };
+            fixture.ctx.subagent_history = SubagentHistoryStore::seeded_with_versions(
+                histories,
+                HashMap::from([(
+                    first.task_id.clone(),
+                    serde_json::from_value::<SubagentTaskSpec>(original.spec).unwrap(),
+                )]),
+                HashMap::from([(first.task_id.clone(), selected.into())]),
+            );
+            fixture.ctx.jobs = Some(fixture.tasks.main_scope());
+            let resumed = fixture
+                .tasks
+                .resume_failed(
+                    &fixture.ctx,
+                    &expected,
+                    REWOUND_CALL.into(),
+                    REWOUND_PROMPT.into(),
+                )
+                .await
+                .unwrap();
+            let current = fixture.tasks.record(&resumed.invocation_id).unwrap();
+            assert_eq!(current.history, checkpoint.history);
+            assert_eq!(current.spec, checkpoint.spec);
+            assert_eq!(
+                fixture
+                    .ctx
+                    .subagent_history
+                    .selected_version(&first.task_id)
+                    .as_deref(),
+                Some(NEXT_CALL),
+            );
+            let observed = fixture.started.recv_async().await.unwrap();
+            let text = serde_json::to_string(&observed).unwrap();
+            assert_eq!(text.matches(PROMPT).count(), 1);
+            assert_eq!(text.matches(SECOND_PROMPT).count(), 1);
+            assert_eq!(text.matches(REWOUND_PROMPT).count(), 1);
+            fixture.responses.send(final_response()).unwrap();
+            fixture.settled().await;
+            assert_eq!(
+                fixture
+                    .ctx
+                    .subagent_history
+                    .selected_version(&first.task_id)
+                    .as_deref(),
+                Some(REWOUND_CALL),
+            );
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test_case(SUCCEEDED; "succeeded")]
+    #[test_case(CANCELLED; "cancelled")]
+    #[test_case(BLOCKED; "blocked")]
+    fn human_continuation_requires_failed_managed_target(state: &str) {
+        smol::block_on(async {
+            let fixture = Fixture::failed().await;
+            let mut failed = fixture.tasks.status(&fixture.task_id()).unwrap();
+            failed.state = state.into();
+            assert!(!fixture.tasks.can_resume_failed(&failed));
+            assert_eq!(
+                fixture
+                    .tasks
+                    .resume_failed(
+                        &fixture.ctx,
+                        &failed,
+                        NEXT_CALL.into(),
+                        SECOND_PROMPT.into(),
+                    )
+                    .await
+                    .unwrap_err(),
+                FAILED_TASK_REQUIRED
+            );
+            failed.state = FAILED.into();
+            failed.owner = JobOwner::Child {
+                invocation_id: INVOCATION.into(),
+            };
+            assert!(!fixture.tasks.can_resume_failed(&failed));
+            assert_eq!(
+                fixture
+                    .tasks
+                    .resume_failed(
+                        &fixture.ctx,
+                        &failed,
+                        NEXT_CALL.into(),
+                        SECOND_PROMPT.into(),
+                    )
+                    .await
+                    .unwrap_err(),
+                FAILED_TASK_REQUIRED
+            );
+            failed.owner = JobOwner::Main;
+            failed.kind = JobKind::Shell;
+            assert!(!fixture.tasks.can_resume_failed(&failed));
+            assert_eq!(
+                fixture
+                    .tasks
+                    .resume_failed(
+                        &fixture.ctx,
+                        &failed,
+                        NEXT_CALL.into(),
+                        SECOND_PROMPT.into(),
+                    )
+                    .await
+                    .unwrap_err(),
+                FAILED_TASK_REQUIRED
+            );
+            assert!(fixture.started.is_empty());
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn human_continuation_rejects_unsettled_and_superseded_failure() {
+        smol::block_on(async {
+            let mut fixture = Fixture::new().await;
+            fixture.ctx.session_id = Some(fixture.session.id.into());
+            fixture.launch().await;
+            let mut expected = fixture.tasks.status(&fixture.task_id()).unwrap();
+            expected.state = FAILED.into();
+            assert!(fixture.tasks.can_resume_failed(&expected));
+            assert_eq!(
+                fixture
+                    .tasks
+                    .resume_failed(
+                        &fixture.ctx,
+                        &expected,
+                        NEXT_CALL.into(),
+                        SECOND_PROMPT.into(),
+                    )
+                    .await
+                    .unwrap_err(),
+                TASK_SETTLING
+            );
+            fixture.responses.send(final_response()).unwrap();
+            fixture.settled().await;
+            assert_eq!(
+                fixture
+                    .tasks
+                    .resume_failed(
+                        &fixture.ctx,
+                        &expected,
+                        NEXT_CALL.into(),
+                        SECOND_PROMPT.into(),
+                    )
+                    .await
+                    .unwrap_err(),
+                FAILED_TASK_REQUIRED
+            );
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn human_continuation_rejections_leave_history_and_admission_untouched() {
+        smol::block_on(async {
+            let mut fixture = Fixture::failed().await;
+            let failed = fixture.tasks.status(&fixture.task_id()).unwrap();
+            let mut stale = failed.clone();
+            stale.generation += 1;
+            assert_eq!(
+                fixture
+                    .tasks
+                    .resume_failed(&fixture.ctx, &stale, NEXT_CALL.into(), SECOND_PROMPT.into(),)
+                    .await
+                    .unwrap_err(),
+                STALE_INVOCATION
+            );
+            fixture.ctx.session_id = Some(CaudraId::generate().into());
+            assert_eq!(
+                fixture
+                    .tasks
+                    .resume_failed(
+                        &fixture.ctx,
+                        &failed,
+                        NEXT_CALL.into(),
+                        SECOND_PROMPT.into(),
+                    )
+                    .await
+                    .unwrap_err(),
+                FOREIGN_SESSION
+            );
+            fixture.ctx.session_id = Some(fixture.session.id.into());
+            assert_eq!(
+                fixture
+                    .tasks
+                    .resume_failed(&fixture.ctx, &failed, NEXT_CALL.into(), String::new(),)
+                    .await
+                    .unwrap_err(),
+                EMPTY_CONTINUATION
+            );
+            fixture.tasks.set_task_execution(ExecutionMode::Sync);
+            assert!(!fixture.tasks.can_resume_failed(&failed));
+            assert_eq!(
+                fixture
+                    .tasks
+                    .resume_failed(
+                        &fixture.ctx,
+                        &failed,
+                        NEXT_CALL.into(),
+                        SECOND_PROMPT.into(),
+                    )
+                    .await
+                    .unwrap_err(),
+                TASK_SYNC
+            );
+            fixture.tasks.set_task_execution(ExecutionMode::Auto);
+            fixture.ctx.mode = AgentMode::ReadOnly;
+            assert_eq!(
+                fixture
+                    .tasks
+                    .resume_failed(
+                        &fixture.ctx,
+                        &failed,
+                        NEXT_CALL.into(),
+                        SECOND_PROMPT.into(),
+                    )
+                    .await
+                    .unwrap_err(),
+                BUILD_FROM_READ_ONLY
+            );
+            fixture.ctx.mode = AgentMode::Build;
+            let (trigger, cancel) = CancelToken::new();
+            fixture.ctx.cancel = cancel;
+            trigger.cancel();
+            assert_eq!(
+                fixture
+                    .tasks
+                    .resume_failed(
+                        &fixture.ctx,
+                        &failed,
+                        NEXT_CALL.into(),
+                        SECOND_PROMPT.into(),
+                    )
+                    .await
+                    .unwrap_err(),
+                ADMISSION_CANCELLED
+            );
+            fixture.ctx.cancel = CancelToken::none();
+            assert_eq!(
+                fixture.tasks.status(&failed.task_id).unwrap().invocation_id,
+                failed.invocation_id
+            );
+            assert_eq!(fixture.ctx.subagent_history.active_count(), 0);
+            assert!(fixture.started.is_empty());
+            fixture.tasks.stop().await.unwrap();
+            assert!(!fixture.tasks.can_resume_failed(&failed));
+            assert_eq!(
+                fixture
+                    .tasks
+                    .resume_failed(
+                        &fixture.ctx,
+                        &failed,
+                        NEXT_CALL.into(),
+                        SECOND_PROMPT.into(),
+                    )
+                    .await
+                    .unwrap_err(),
+                CLOSED
+            );
+            fixture.tasks.rearm();
+            assert_eq!(
+                fixture
+                    .tasks
+                    .resume_failed(
+                        &fixture.ctx,
+                        &failed,
+                        NEXT_CALL.into(),
+                        SECOND_PROMPT.into(),
+                    )
+                    .await
+                    .unwrap_err(),
+                STALE_INVOCATION
+            );
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test_case(false; "caller_drop_keeps_human_receipt")]
+    #[test_case(true; "stop_drains_human_admission")]
+    fn human_continuation_handoff_is_durable_without_caller(stop: bool) {
+        smol::block_on(async {
+            let fixture = Fixture::failed().await;
+            let failed = fixture.tasks.status(&fixture.task_id()).unwrap();
+            let (committed_tx, committed_rx) = flume::bounded(1);
+            let (resume_tx, resume_rx) = flume::bounded(1);
+            fixture
+                .tasks
+                .pause_admission_for_test(committed_tx, resume_rx);
+            let tasks = fixture.tasks.clone();
+            let ctx = fixture.ctx.clone();
+            let expected = failed.clone();
+            let caller = smol::spawn(async move {
+                tasks
+                    .resume_failed(&ctx, &expected, NEXT_CALL.into(), SECOND_PROMPT.into())
+                    .await
+            });
+            committed_rx.recv_async().await.unwrap();
+            let admitted = fixture
+                .tasks
+                .lookup(
+                    BackgroundLookup::Call {
+                        owner: &JobOwner::Main,
+                        generation: None,
+                        call_id: NEXT_CALL,
+                    },
+                    None,
+                )
+                .unwrap()
+                .unwrap();
+            assert!(admitted.receipt_accepted);
+            caller.cancel().await;
+            if stop {
+                let mut stopping = Box::pin(fixture.tasks.stop());
+                assert!(poll_once(&mut stopping).await.is_none());
+                resume_tx.send(()).unwrap();
+                stopping.await.unwrap();
+                assert!(fixture.started.is_empty());
+                assert_eq!(
+                    fixture.tasks.status(&failed.task_id).unwrap().state,
+                    CANCELLED
+                );
+                assert!(!fixture.tasks.has_pending());
+            } else {
+                resume_tx.send(()).unwrap();
+                fixture.started.recv_async().await.unwrap();
+                let retry = fixture
+                    .tasks
+                    .resume_failed(
+                        &fixture.ctx,
+                        &failed,
+                        NEXT_CALL.into(),
+                        SECOND_PROMPT.into(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(retry.invocation_id, admitted.invocation_id);
+                fixture.responses.send(final_response()).unwrap();
+                fixture.settled().await;
+                assert!(fixture.tasks.has_pending());
+            }
+            assert!(fixture.tasks.lock().admitting.is_empty());
             fixture.tasks.shutdown().await.unwrap();
         });
     }

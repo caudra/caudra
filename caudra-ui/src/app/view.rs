@@ -255,7 +255,7 @@ impl App {
             queue_panel::height(&self.active_queue_entries())
                 + self.todo_panel.height()
                 + panel_h
-                + if self.active_subagent_can_steer() || self.queue_editor_active() {
+                + if self.active_subagent_has_composer() || self.queue_editor_active() {
                     self.subagent_input_box.height(inner.width).min(max_bottom)
                 } else {
                     1
@@ -372,14 +372,19 @@ impl App {
             for &(idx, rect) in &layout.panel_windows {
                 self.float_mgr.view_panel(frame, idx, rect);
             }
-            if self.active_subagent_can_steer() || self.queue_editor_active() {
+            if self.active_subagent_has_composer() || self.queue_editor_active() {
                 self.subagent_input_box.view(
                     frame,
                     layout.input_area,
                     if self.queue_editor_active() {
                         Placeholder::QueueEdit
-                    } else {
+                    } else if self
+                        .active_subagent_id()
+                        .is_some_and(|id| self.subagent_steers.contains_key(id))
+                    {
                         Placeholder::Steer
+                    } else {
+                        Placeholder::ResumeTask
                     },
                     self.separator_style(),
                     self.composer_holds_keys(),
@@ -792,7 +797,7 @@ impl App {
         }
 
         if !self.is_main_chat()
-            && !self.active_subagent_can_steer()
+            && !self.active_subagent_has_composer()
             && layout.bottom_area.height > 0
         {
             self.zones.push_overlay(layout.bottom_area);
