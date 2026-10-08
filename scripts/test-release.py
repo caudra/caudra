@@ -478,6 +478,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
             "actions/upload-artifact": "v7",
             "actions/download-artifact": "v8",
             "actions/create-github-app-token": "v3",
+            "actions/setup-python": "v6",
         }
         for workflow in WORKFLOWS.glob("*.yml"):
             with self.subTest(workflow=workflow.name):
@@ -539,6 +540,24 @@ class ReleaseWorkflowTests(unittest.TestCase):
                 "x86_64-pc-windows-msvc": "blacksmith-16vcpu-windows-2025",
             },
         )
+
+    def test_native_jobs_select_supported_python_before_scripts_and_worker(self):
+        setup = (
+            "uses: actions/setup-python@v6\n"
+            "        with:\n"
+            '          python-version: "3.13"\n'
+        )
+        worker = "uses: ./.github/actions/code-worker"
+        for workflow in ("rust", "release"):
+            _, jobs = self.workflow(workflow)
+            for job, body in jobs.items():
+                if worker not in body:
+                    continue
+                with self.subTest(workflow=workflow, job=job):
+                    self.assertEqual(body.count(setup), 1)
+                    self.assertLess(body.index(setup), body.index(worker))
+                    for invocation in re.finditer(r"\bpython3\s", body):
+                        self.assertLess(body.index(setup), invocation.start())
 
     def test_release_requires_reusable_rust_nix_and_python_before_drafting(self):
         header, jobs = self.workflow("release")

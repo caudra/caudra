@@ -105,6 +105,9 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
       - uses: Swatinem/rust-cache@v2
       - uses: ./.github/actions/code-worker
       - run: make code-worker
@@ -122,6 +125,9 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
       - uses: Swatinem/rust-cache@v2
       - uses: ./.github/actions/code-worker
       - uses: taiki-e/install-action@v2
@@ -161,6 +167,9 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
       - uses: Swatinem/rust-cache@v2
       - uses: ./.github/actions/code-worker
       - run: python3 scripts/build-code-worker.py
@@ -178,6 +187,9 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
       - uses: Swatinem/rust-cache@v2
       - uses: ./.github/actions/code-worker
       - run: make check build workcell-build ARGS=--locked
@@ -192,6 +204,9 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
       - uses: Swatinem/rust-cache@v2
       - uses: ./.github/actions/code-worker
       - run: make check ARGS=--locked
@@ -227,6 +242,9 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
       - uses: Swatinem/rust-cache@v2
       - name: Install GNU Make and select Git Bash
         shell: pwsh

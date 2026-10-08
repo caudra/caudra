@@ -229,6 +229,10 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
 
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
       - name: Install Rust toolchain
         run: rustup toolchain install 1.99.0 --profile minimal --target ${{ matrix.target }}
 
