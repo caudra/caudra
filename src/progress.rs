@@ -95,6 +95,11 @@ pub fn install() {
     });
 }
 
+pub fn uninstall() {
+    MIGRATION.clear();
+    PRUNE.clear();
+}
+
 fn render_migration(bar: &mut Option<ProgressBar>, event: MigrationEvent) {
     match event {
         MigrationEvent::Started { from, to } => {
@@ -174,17 +179,76 @@ fn advance(bar: Option<&ProgressBar>, message: &str, done: u64, total: u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{SandboxProgress, sandbox_message};
+    use super::{SandboxProgress, sandbox_message, uninstall};
     use crate::cli::Cli;
+    use caudra_config::StorageConfig;
+    use caudra_storage::StateDir;
+    use caudra_storage::sessions::SessionDatabase;
+    use caudra_storage::sessions::progress::{MIGRATION, PRUNE, PruneEvent};
+    use caudra_storage::sessions::sweep::prune;
     use clap::Parser;
     use indicatif::ProgressDrawTarget;
+    use std::env;
     use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::process::Command;
+    use std::sync::{Arc, Mutex};
     use test_case::test_case;
 
     const SANDBOX_NAME: &str = "saved-dev";
     const CONNECT_MESSAGE: &str = "Connecting to sandbox 'saved-dev'";
     const RESUME_MESSAGE: &str = "Resuming sandbox 'saved-dev' and connecting to Workcell";
     const STARTUP_ERROR: &str = "startup failed";
+    const PROGRESS_CHILD: &str = "CAUDRA_TEST_PROGRESS_CHILD";
+    const PROGRESS_TEST: &str = "progress::tests::uninstall_detaches_storage_progress";
+    const CHECKPOINT_PHASE: &str = "checkpointing the WAL";
+    const MIGRATION_DETACHED: &str = "uninstall must release the migration sink";
+    const PRUNE_DETACHED: &str = "uninstall must release the prune sink";
+    const PRUNE_QUIET: &str = "pruning after uninstall must not report console progress";
+
+    #[test]
+    fn uninstall_detaches_storage_progress() {
+        if env::var_os(PROGRESS_CHILD).is_none() {
+            let output = Command::new(env::current_exe().unwrap())
+                .args(["--exact", PROGRESS_TEST, "--nocapture"])
+                .env(PROGRESS_CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let migration = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&migration);
+        MIGRATION.set(move |event| seen.lock().unwrap().push(event));
+        let phases = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&phases);
+        PRUNE.set(move |event| seen.lock().unwrap().push(event));
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(temp.path().to_path_buf());
+        let mut database = SessionDatabase::open(&storage).unwrap();
+        let budget = StorageConfig::default().snapshots.store_budget();
+        let report = prune(&mut database, &storage, budget, false).unwrap();
+        assert!(report.checkpoint.is_some());
+        assert!(phases.lock().unwrap().contains(&PruneEvent::Phase {
+            label: CHECKPOINT_PHASE,
+        }));
+
+        for _ in 0..2 {
+            uninstall();
+            assert_eq!(Arc::strong_count(&migration), 1, "{MIGRATION_DETACHED}");
+            assert_eq!(Arc::strong_count(&phases), 1, "{PRUNE_DETACHED}");
+            phases.lock().unwrap().clear();
+            let report = prune(&mut database, &storage, budget, false).unwrap();
+            assert!(report.checkpoint.is_some());
+            assert!(phases.lock().unwrap().is_empty(), "{PRUNE_QUIET}");
+        }
+    }
 
     #[test_case(false, CONNECT_MESSAGE; "connect")]
     #[test_case(true, RESUME_MESSAGE; "resume")]

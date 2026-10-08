@@ -1588,6 +1588,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
     }
     let mut teardown = Teardown::default();
     let mut herdr_reporter = HerdrReporter::from_env();
+    crate::progress::uninstall();
     let mut sweeper = RetentionSweeper::spawn(storage.clone(), stack.config.storage);
     let mut committed_relocation: Option<String> = None;
     let sandboxes = cli.startup.features.enabled(Feature::Sandboxes);
