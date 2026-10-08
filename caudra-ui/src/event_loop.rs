@@ -9,8 +9,10 @@
 
 use std::borrow::Cow;
 use std::collections::HashSet;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -148,6 +150,28 @@ const WORKTREE_REPOSITORY_ERR: &str =
 const SESSION_OPEN_ELSEWHERE: &str =
     "Another Caudra has that session open, so only its workspace was focused";
 const NO_CHANGE_STORES: &str = "The file change record stores could not be opened";
+const ANTHROPIC_LOGIN_ARGS: [&str; 5] = ["auth", "login", "anthropic", "--method", "oauth"];
+const AUTH_EXECUTABLE_ERR: &str = "could not locate the Caudra executable for login";
+const AUTH_PROCESS_ERR: &str = "could not run the OAuth login process";
+const AUTH_EXIT_ERR: &str = "OAuth login process failed";
+
+fn anthropic_login_command() -> Result<Command> {
+    let mut command = Command::new(env::current_exe().wrap_err(AUTH_EXECUTABLE_ERR)?);
+    command
+        .args(ANTHROPIC_LOGIN_ARGS)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    Ok(command)
+}
+
+fn run_oauth_login(mut command: Command) -> Result<()> {
+    let status = command.status().wrap_err(AUTH_PROCESS_ERR)?;
+    if !status.success() {
+        return Err(eyre!("{AUTH_EXIT_ERR}: {status}"));
+    }
+    Ok(())
+}
 
 /// The prompt that opened a session, which is what its title is about.
 fn opening_prompt<M: TitleSource>(messages: &[M]) -> Result<String, String> {
@@ -4392,10 +4416,10 @@ impl<'t> EventLoop<'t> {
                 };
                 let result = terminal::with_normal_terminal(self.terminal, || match provider {
                     crate::components::SubscriptionProvider::Anthropic => {
-                        caudra_providers::anthropic_auth::login_browser_callback(&storage)
+                        anthropic_login_command().and_then(run_oauth_login)
                     }
                     crate::components::SubscriptionProvider::OpenAi => {
-                        caudra_providers::openai_auth::login(&storage)
+                        caudra_providers::openai_auth::login(&storage).map_err(Into::into)
                     }
                 });
                 drop(pause);
@@ -4417,9 +4441,10 @@ impl<'t> EventLoop<'t> {
                             provider.display_name()
                         ));
                     }
-                    Err(error) => self.sessions[idx]
-                        .app
-                        .flash(format!("{} login failed: {error}", provider.display_name())),
+                    Err(error) => self.sessions[idx].app.flash(format!(
+                        "{} login failed: {error:#}",
+                        provider.display_name()
+                    )),
                 }
             }
             Action::Bind(purpose, binding) => {
@@ -4933,6 +4958,7 @@ mod tests {
     use caudra_storage::sessions::PendingConversationRevert;
     use caudra_workspace::WorkspacePath;
     use crossterm::event::{ColorScheme, KeyCode};
+    use std::process;
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -4941,6 +4967,51 @@ mod tests {
     const PLANNED_PROMPT: &str = "Plan the change.";
     const STATUS_ERROR: &str = "provider stopped";
     const STATUS_RUN_ID: u64 = 7;
+    const AUTH_CHILD_TEST: &str = "event_loop::tests::oauth_login_child";
+    const AUTH_CHILD_EXIT: &str = "CAUDRA_TEST_AUTH_CHILD_EXIT";
+    const AUTH_CHILD_FAILURE: i32 = 17;
+
+    #[test]
+    fn anthropic_login_uses_current_executable_and_explicit_oauth() {
+        let command = anthropic_login_command().unwrap();
+        assert_eq!(command.get_program(), env::current_exe().unwrap());
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["auth", "login", "anthropic", "--method", "oauth"]
+        );
+        assert_eq!(command.get_envs().count(), 0);
+        assert!(command.get_current_dir().is_none());
+    }
+
+    #[test_case(0; "successful_child")]
+    #[test_case(AUTH_CHILD_FAILURE; "failed_child")]
+    fn oauth_login_waits_for_child_result(exit_code: i32) {
+        let mut command = Command::new(env::current_exe().unwrap());
+        command
+            .args(["--exact", AUTH_CHILD_TEST])
+            .env(AUTH_CHILD_EXIT, exit_code.to_string());
+        let result = run_oauth_login(command);
+        if exit_code == 0 {
+            result.unwrap();
+        } else {
+            assert!(result.unwrap_err().to_string().contains(AUTH_EXIT_ERR));
+        }
+    }
+
+    #[test]
+    fn oauth_login_child() {
+        if let Ok(exit_code) = env::var(AUTH_CHILD_EXIT) {
+            process::exit(exit_code.parse().unwrap());
+        }
+    }
+
+    #[test]
+    fn oauth_login_reports_launch_failure() {
+        let temp = TempDir::new().unwrap();
+        let command = Command::new(temp.path().join("missing-caudra"));
+        let error = run_oauth_login(command).unwrap_err();
+        assert_eq!(error.to_string(), AUTH_PROCESS_ERR);
+    }
 
     struct PlanProvider;
 

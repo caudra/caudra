@@ -551,6 +551,10 @@ fn config_error(message: &str) -> AgentError {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use test_case::test_case;
+
+    const AUTH_CODE: &str = "auth-code";
+    const EXPECTED_STATE: &str = "expected";
 
     #[test]
     fn authorization_url_contains_required_fields() {
@@ -583,20 +587,19 @@ mod tests {
         assert_ne!(verifier, state);
     }
 
-    #[test]
-    fn code_and_state_input_is_accepted() {
-        let parsed = parse_callback_input("auth-code#expected", "expected").unwrap();
-        assert_eq!(parsed.code.as_deref(), Some("auth-code"));
+    #[test_case("http://localhost:1234/callback?code=auth-code&state=expected"; "redirect_url")]
+    #[test_case("auth-code#expected"; "code_and_state")]
+    fn callback_input_is_accepted(input: &str) {
+        let parsed = parse_callback_input(input, EXPECTED_STATE).unwrap();
+        assert_eq!(parsed.code.as_deref(), Some(AUTH_CODE));
+        assert!(parsed.error.is_none());
     }
 
-    #[test]
-    fn callback_url_requires_matching_state() {
-        let error = parse_callback_input(
-            "http://localhost:1234/callback?code=abc&state=wrong",
-            "expected",
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("state mismatch"));
+    #[test_case("http://localhost:1234/callback?code=auth-code&state=wrong"; "redirect_url")]
+    #[test_case("auth-code#wrong"; "code_and_state")]
+    fn callback_input_requires_matching_state(input: &str) {
+        let error = parse_callback_input(input, EXPECTED_STATE).unwrap_err();
+        assert!(matches!(error, AgentError::Config { message } if message == STATE_MISMATCH));
     }
 
     #[test]
