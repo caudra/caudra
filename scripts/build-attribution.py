@@ -368,6 +368,8 @@ def load_graph(manifest, package, target, worker=False):
                 *common,
             ],
             text=True,
+            encoding="utf-8",
+            errors="strict",
             cwd=manifest.parent,
             env=environment,
         )
@@ -394,6 +396,8 @@ def load_graph(manifest, package, target, worker=False):
             *common,
         ],
         text=True,
+        encoding="utf-8",
+        errors="strict",
         cwd=manifest.parent,
         env=environment,
     )
@@ -415,6 +419,8 @@ def load_graph(manifest, package, target, worker=False):
             *common,
         ],
         text=True,
+        encoding="utf-8",
+        errors="strict",
         cwd=manifest.parent,
         env=environment,
     )
@@ -799,7 +805,12 @@ def discover_rust_runtime(manifest, repository, policy):
         )
     try:
         version = subprocess.check_output(
-            ["rustc", "-vV"], text=True, cwd=manifest.parent, env=environment
+            ["rustc", "-vV"],
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            cwd=manifest.parent,
+            env=environment,
         )
         fields = dict(
             line.split(": ", 1) for line in version.splitlines() if ": " in line
@@ -818,6 +829,8 @@ def discover_rust_runtime(manifest, repository, policy):
         reported_root = subprocess.check_output(
             ["rustc", "--print", "sysroot"],
             text=True,
+            encoding="utf-8",
+            errors="strict",
             cwd=manifest.parent,
             env=environment,
         ).strip()

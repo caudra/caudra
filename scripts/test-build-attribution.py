@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -25,6 +26,22 @@ MPL = "Mozilla Public License Version 2.0\n3.1. Distribution of Source Form\n10.
 RUNTIME_REPORT = b'<html><title>Copyright notices for The Rust Standard Library</title><a href="licenses/MIT.txt">MIT</a></html>\n'
 RUNTIME_VERSION = "1.99.0"
 RUNTIME_COMMIT = "b940084d7eb6a299eb4bfeb8e34901bc051e7ac4"
+NON_ASCII_TEXT = "café-描"
+INVALID_UTF8 = b"\xff"
+
+
+def captured_output(data, **kwargs):
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.buffer.write(bytes.fromhex(sys.argv[1]))",
+            data.hex(),
+        ],
+        stdout=subprocess.PIPE,
+        check=True,
+        **kwargs,
+    ).stdout
 
 
 class AttributionTests(unittest.TestCase):
@@ -121,6 +138,50 @@ class AttributionTests(unittest.TestCase):
                 call.kwargs["env"]["RUSTUP_TOOLCHAIN"],
                 os.environ.get("RUSTUP_TOOLCHAIN", RUNTIME_VERSION),
             )
+
+    def test_cargo_streams_decode_strict_utf8_under_windows_locale(self):
+        package = self.package("fixture")
+        package.update(source=None, description=NON_ASCII_TEXT)
+        manifest = self.root / NON_ASCII_TEXT / "Cargo.toml"
+        Path(package["manifest_path"]).parent.rename(manifest.parent)
+        package["manifest_path"] = str(manifest)
+        metadata = {"packages": [package], "workspace_root": str(manifest.parent)}
+        row = f"fixture v1.0.0 ({manifest.parent})\n"
+        streams = [
+            json.dumps(metadata, ensure_ascii=False).encode("utf-8"),
+            ("0" + row).encode("utf-8"),
+            row.encode("utf-8"),
+        ]
+        for invalid_stream in (None, 0, 1, 2):
+            outputs = iter(
+                INVALID_UTF8 if index == invalid_stream else data
+                for index, data in enumerate(streams)
+            )
+            with (
+                self.subTest(invalid_stream=invalid_stream),
+                patch.object(subprocess, "_text_encoding", return_value="cp1252"),
+                patch.object(
+                    attribution.subprocess,
+                    "check_output",
+                    side_effect=lambda command, outputs=outputs, **kwargs: (
+                        captured_output(next(outputs), **kwargs)
+                    ),
+                ),
+            ):
+                if invalid_stream is not None:
+                    with self.assertRaises(UnicodeDecodeError):
+                        attribution.load_graph(manifest, "fixture", "fixture-target")
+                else:
+                    result = attribution.load_graph(
+                        manifest, "fixture", "fixture-target"
+                    )
+                    self.assertEqual(
+                        result["selected"][0]["description"], NON_ASCII_TEXT
+                    )
+                    self.assertEqual(
+                        result["selected"][0]["manifest_path"], str(manifest)
+                    )
+                    self.assertEqual(result["runtime_ids"], [package["id"]])
 
     def test_policy_requires_actual_license_text(self):
         with self.assertRaisesRegex(attribution.AttributionError, "evidence"):
@@ -869,7 +930,7 @@ class RustRuntimeTests(unittest.TestCase):
         self.version = f"rustc {RUNTIME_VERSION}\nrelease: {RUNTIME_VERSION}\ncommit-hash: {RUNTIME_COMMIT}\nhost: fixture-host\n"
 
     def test_pinned_toolchain_is_preserved_across_manifest_directories(self):
-        def compiler(command, *, text, cwd, env):
+        def compiler(command, *, text, cwd, env, encoding, errors):
             self.assertTrue(text)
             self.assertEqual(env["RUSTUP_TOOLCHAIN"], RUNTIME_VERSION)
             self.assertIn(cwd, [self.manifest.parent, self.root / "worker"])
@@ -889,7 +950,7 @@ class RustRuntimeTests(unittest.TestCase):
     def test_explicit_conflicting_toolchain_is_not_silently_replaced(self):
         override = "1.98.0"
 
-        def compiler(command, *, text, cwd, env):
+        def compiler(command, *, text, cwd, env, encoding, errors):
             self.assertEqual(env["RUSTUP_TOOLCHAIN"], override)
             return self.version.replace(RUNTIME_VERSION, override)
 
@@ -919,6 +980,43 @@ class RustRuntimeTests(unittest.TestCase):
         self.assertEqual(run.call_args_list[0].args[0], ["rustc", "-vV"])
         self.assertEqual(run.call_args_list[1].args[0], ["rustc", "--print", "sysroot"])
         return result
+
+    def test_rustc_streams_decode_strict_utf8_under_windows_locale(self):
+        sysroot = self.sysroot.with_name(NON_ASCII_TEXT)
+        self.sysroot.rename(sysroot)
+        streams = [
+            (self.version + f"fixture: {NON_ASCII_TEXT}\n").encode("utf-8"),
+            (str(sysroot) + "\n").encode("utf-8"),
+        ]
+        for invalid_stream in (None, 0, 1):
+            outputs = iter(
+                INVALID_UTF8 if index == invalid_stream else data
+                for index, data in enumerate(streams)
+            )
+            with (
+                self.subTest(invalid_stream=invalid_stream),
+                patch.object(subprocess, "_text_encoding", return_value="cp1252"),
+                patch.object(
+                    attribution.subprocess,
+                    "check_output",
+                    side_effect=lambda command, outputs=outputs, **kwargs: (
+                        captured_output(next(outputs), **kwargs)
+                    ),
+                ),
+            ):
+                if invalid_stream is not None:
+                    with self.assertRaises(UnicodeDecodeError):
+                        attribution.discover_rust_runtime(
+                            self.manifest, self.root, self.policy
+                        )
+                else:
+                    result = attribution.discover_rust_runtime(
+                        self.manifest, self.root, self.policy
+                    )
+                    self.assertEqual(result["release"], RUNTIME_VERSION)
+                    self.assertEqual(
+                        result["files"]["COPYRIGHT-library.html"], RUNTIME_REPORT
+                    )
 
     def test_runtime_missing_empty_or_wrong_report_refuses(self):
         report = self.docs / "COPYRIGHT-library.html"
