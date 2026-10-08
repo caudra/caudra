@@ -48,6 +48,7 @@ const MAX_REPORT_BYTES: usize = 16 * 1024;
 const MAX_PENDING_BYTES: usize = 2 * 1024 * 1024;
 const MAX_BATCH_BYTES: usize = 64 * 1024;
 const MAX_RESULT_BYTES: usize = 32 * 1024;
+const MAX_SHELL_COMMAND_BYTES: usize = 8 * 1024;
 const TASK_OUTPUT_LABEL: &str = "output-task";
 const STALE_INVOCATION: &str =
     "task invocation or session generation changed; refresh before controlling it";
@@ -1339,12 +1340,14 @@ impl BackgroundTasks {
             }
             let truncated = body.len() > MAX_RESULT_BYTES;
             let body = bounded(&body, MAX_RESULT_BYTES);
-            let label = if record.kind() == JobKind::Shell {
-                "Shell"
-            } else {
-                "Task"
+            let mut text = match &record.payload {
+                JobPayload::Shell(metadata) => format!(
+                    "Shell {}: {kind}.\n\nCommand:\n{}\n\n{body}",
+                    record.task_id,
+                    bounded(&metadata.command, MAX_SHELL_COMMAND_BYTES)
+                ),
+                JobPayload::Agent => format!("Task {}: {kind}.\n\n{body}", record.task_id),
             };
-            let mut text = format!("{label} {}: {kind}.\n\n{body}", record.task_id);
             let reference = event
                 .terminal
                 .then_some(record.output_ref.as_ref())

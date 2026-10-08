@@ -647,16 +647,19 @@ mod tests {
         );
     }
 
-    #[test_case(false; "card")]
-    #[test_case(true; "delivery")]
-    fn shell_output_is_literal_without_chat_or_link_targets(delivered: bool) {
+    #[test_case(false, true; "card")]
+    #[test_case(true, true; "delivery")]
+    #[test_case(true, false; "legacy_delivery")]
+    fn shell_output_is_literal_without_chat_or_link_targets(delivered: bool, command: bool) {
         const OUTPUT: &str = "**literal** `code` [link](https://example.com/task)";
+        const COMMAND: &str =
+            "printf '**literal** `code`'\nprintf '[link](https://example.com/task)'";
         let mut card = task(json!(OUTPUT));
         card.kind = JobKind::Shell;
         card.shell = Some(Box::new(ShellJobMetadata {
             call_id: card.call_id.clone(),
             root_call_id: card.root_call_id.clone(),
-            command: "printf output".into(),
+            command: COMMAND.into(),
             workdir: ".".into(),
             timeout_ms: 120_000,
             mode: "build".into(),
@@ -667,9 +670,14 @@ mod tests {
                 invocation_id: card.invocation_id.clone(),
                 event_id: "event".into(),
             };
+            let body = if command {
+                format!("Command:\n{COMMAND}\n\n{OUTPUT}")
+            } else {
+                OUTPUT.into()
+            };
             delivery(
                 &origin,
-                &format!("Shell {}: success.\n\n{OUTPUT}", card.task_id),
+                &format!("Shell {}: success.\n\n{body}", card.task_id),
                 100,
             )
         } else {
@@ -680,6 +688,11 @@ mod tests {
             (lines, links)
         };
         assert!(text(&lines).contains(OUTPUT));
+        if command {
+            for line in COMMAND.lines() {
+                assert!(text(&lines).contains(line));
+            }
+        }
         assert!(!text(&lines).contains("open chat"));
         assert!(links.is_aligned(&lines));
         assert!(links.rows.iter().flatten().all(Option::is_none));

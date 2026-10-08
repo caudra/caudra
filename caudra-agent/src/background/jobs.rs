@@ -748,7 +748,10 @@ mod tests {
             },
             task_runner::{ModelResolver, SubagentTaskRunner, TaskRunner, WorkflowHostContext},
         },
-        background::{ADMISSION_CANCELLED, tests::hold_writer},
+        background::{
+            ADMISSION_CANCELLED, MAX_BATCH_BYTES, MAX_RESULT_BYTES, MAX_SHELL_COMMAND_BYTES,
+            tests::hold_writer,
+        },
         background_reminder::render,
         cancel::{CancelMap, CancelToken},
         tools::{DEADLINE_EXCEEDED, Deadline, LocalTools, test_support::stub_ctx},
@@ -760,6 +763,8 @@ mod tests {
     const CHILD: &str = "child-invocation";
     const OTHER: &str = "other-invocation";
     const COMMAND: &str = "printf bounded-output";
+    const MULTILINE_COMMAND: &str =
+        "printf '**literal** `code`'\nprintf '<html> & output' > destination\n";
     const OUTPUT: &str = "bounded-output";
     const TIMEOUT_MS: u64 = 120_000;
     const LITERAL_OUTPUT: &str = "<html> & output > destination\n";
@@ -1779,9 +1784,16 @@ mod tests {
         });
     }
 
-    #[test_case(false; "main_shell")]
-    #[test_case(true; "child_shell")]
-    fn shell_envelopes_validate_owner_and_deliver_literal_output(child: bool) {
+    #[test_case(false, false, COMMAND; "main_success")]
+    #[test_case(true, false, COMMAND; "child_success")]
+    #[test_case(false, true, COMMAND; "main_failure")]
+    #[test_case(true, true, COMMAND; "child_failure")]
+    #[test_case(false, false, MULTILINE_COMMAND; "multiline_command")]
+    fn shell_envelopes_validate_owner_and_deliver_literal_output(
+        child: bool,
+        failed: bool,
+        command: &str,
+    ) {
         smol::block_on(async {
             let fixture = Fixture::new().await;
             let scope = if child {
@@ -1790,11 +1802,18 @@ mod tests {
                 fixture.tasks.main_scope()
             };
             let card = scope
-                .admit_shell(metadata(), &fixture.history, |_, _| async {
-                    let mut done = ToolDoneEvent::error(CALL.into(), LITERAL_OUTPUT);
-                    done.is_error = false;
-                    done
-                })
+                .admit_shell(
+                    ShellJobMetadata {
+                        command: command.into(),
+                        ..metadata()
+                    },
+                    &fixture.history,
+                    move |_, _| async move {
+                        let mut done = ToolDoneEvent::error(CALL.into(), LITERAL_OUTPUT);
+                        done.is_error = failed;
+                        done
+                    },
+                )
                 .await
                 .unwrap();
             fixture.tasks.join_jobs().await.unwrap();
@@ -1839,10 +1858,67 @@ mod tests {
                 .unwrap()
                 .first_text_content()
                 .unwrap();
+            let status = if failed { "failure" } else { "success" };
             assert_eq!(
                 result,
-                format!("Shell {}: success.\n\n{LITERAL_OUTPUT}", card.task_id)
+                format!(
+                    "Shell {}: {status}.\n\nCommand:\n{command}\n\n{LITERAL_OUTPUT}",
+                    card.task_id
+                )
             );
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test_case(false; "main_shell")]
+    #[test_case(true; "child_shell")]
+    fn oversized_shell_command_does_not_block_delivery(child: bool) {
+        const MULTIBYTE: &str = "界";
+        const TRUNCATED: &str = "[truncated; inspect task status]";
+        const OUTPUT_BYTE: &str = "x";
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let scope = if child {
+                fixture.tasks.child_scope(CHILD)
+            } else {
+                fixture.tasks.main_scope()
+            };
+            let command = MULTIBYTE.repeat(MAX_BATCH_BYTES / MULTIBYTE.len() + 1);
+            let output = OUTPUT_BYTE.repeat(MAX_RESULT_BYTES);
+            let retained_output = output.clone();
+            let card = scope
+                .admit_shell(
+                    ShellJobMetadata {
+                        command,
+                        ..metadata()
+                    },
+                    &fixture.history,
+                    move |_, _| async move {
+                        let mut done = ToolDoneEvent::error(CALL.into(), retained_output);
+                        done.is_error = false;
+                        done
+                    },
+                )
+                .await
+                .unwrap();
+            fixture.tasks.join_jobs().await.unwrap();
+            scope.settle_launches(&[receipt()]).await.unwrap();
+            let messages = scope.claim_messages().unwrap();
+            let result = messages
+                .iter()
+                .find(|message| message.task_event.is_some())
+                .unwrap()
+                .first_text_content()
+                .unwrap();
+            let prefix = MULTIBYTE.repeat(MAX_SHELL_COMMAND_BYTES / MULTIBYTE.len());
+            assert_eq!(
+                result,
+                format!(
+                    "Shell {}: success.\n\nCommand:\n{prefix}\n{TRUNCATED}\n\n{output}",
+                    card.task_id
+                )
+            );
+            assert!(result.len() < MAX_BATCH_BYTES);
             fixture.tasks.shutdown().await.unwrap();
         });
     }
