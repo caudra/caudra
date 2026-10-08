@@ -26,6 +26,9 @@ const SEPARATOR: &str = " · ";
 const BACKGROUND_BADGE: &str = " [background]";
 const OPEN_CHAT: &str = " · open chat";
 pub(crate) const COMMAND_LABEL: &str = "Command";
+const SHELL_COMMAND_PREFIX: &str = "Command:\n";
+const SHELL_LANGUAGE: &str = "bash";
+const MIN_COMMAND_FENCE_LENGTH: usize = 3;
 const LINE_BREAK: char = '\n';
 /// How a line break inside a command reads on its one row.
 const ESCAPED_LINE_BREAK: &str = "\\n";
@@ -174,7 +177,7 @@ pub(crate) fn delivery(
         lines.push(Line::default());
         links.rows.push(Vec::new());
         let (body, body_links) = if shell {
-            literal_body(body.trim(), width)
+            shell_delivery_body(body.trim(), width)
         } else {
             markdown_body(body.trim(), width)
         };
@@ -182,6 +185,38 @@ pub(crate) fn delivery(
         links.rows.extend(body_links.rows);
     }
     (lines, links)
+}
+
+fn shell_delivery_body(body: &str, width: u16) -> (Vec<Line<'static>>, LinkMap) {
+    let Some((command, output)) = shell_delivery_command(body) else {
+        return literal_body(body, width);
+    };
+    let (mut lines, _) = literal_body(SHELL_COMMAND_PREFIX, width);
+    lines.extend(literal_code(command, SHELL_LANGUAGE, width));
+    if command.lines().next_back() == Some("") {
+        lines.extend(indented(vec![Line::default()]));
+    }
+    if !output.is_empty() {
+        lines.extend(indented(vec![Line::default()]));
+        lines.extend(literal_body(output, width).0);
+    }
+    let links = LinkMap::none_for(&lines);
+    (lines, links)
+}
+
+fn shell_delivery_command(body: &str) -> Option<(&str, &str)> {
+    let (opening, fenced) = body.strip_prefix(SHELL_COMMAND_PREFIX)?.split_once('\n')?;
+    let fence = opening.strip_suffix(SHELL_LANGUAGE)?;
+    if fence.len() < MIN_COMMAND_FENCE_LENGTH || !fence.bytes().all(|byte| byte == b'`') {
+        return None;
+    }
+    let (command, rest) = fenced.split_once(&format!("\n{fence}"))?;
+    let output = if rest.is_empty() {
+        rest
+    } else {
+        rest.strip_prefix("\n\n")?
+    };
+    Some((command, output))
 }
 
 /// `script` is the code the card holding these jobs already drew, which a
@@ -434,6 +469,7 @@ mod tests {
     use super::{
         BACKGROUND_BADGE, COMMAND_LABEL, LINE_BREAK, MAX_HIGHLIGHTED_BYTES, OPEN_CHAT,
         command_fact, delivery, fact, literal_body, literal_code, markdown_body, render,
+        shell_delivery_body, shell_delivery_command,
     };
     use crate::chat::history_to_display;
     use crate::components::command_text::deferring;
@@ -478,6 +514,8 @@ mod tests {
     const SAME_TEXT: &str = "colouring changes neither the text nor where it breaks";
     const COLOURED: &str = "a command within the budget is coloured";
     const PLAIN: &str = "a command past the budget is drawn plain";
+    const SHELL_OUTPUT: &str = "stdout tail:\necho \"not a command\" | cat\n\n```bash\n**literal** `code`\n```\nstderr tail:\n[link](https://example.com/task)\n[shell status: exit code 0]";
+    const FENCED_COMMAND: &str = "cat <<'EOF'\n\n```\n````\nEOF";
 
     fn text(lines: &[Line<'_>]) -> String {
         lines
@@ -671,7 +709,7 @@ mod tests {
                 event_id: "event".into(),
             };
             let body = if command {
-                format!("Command:\n{COMMAND}\n\n{OUTPUT}")
+                format!("Command:\n```bash\n{COMMAND}\n```\n\n{OUTPUT}")
             } else {
                 OUTPUT.into()
             };
@@ -696,6 +734,110 @@ mod tests {
         assert!(!text(&lines).contains("open chat"));
         assert!(links.is_aligned(&lines));
         assert!(links.rows.iter().flatten().all(Option::is_none));
+    }
+
+    #[test_case(COLOURED_COMMAND, "```", WIDE_WIDTH; "one_line")]
+    #[test_case(HEREDOC_COMMAND, "```", WIDE_WIDTH; "heredoc")]
+    #[test_case(FENCED_COMMAND, "`````", WIDE_WIDTH; "blank_lines_and_embedded_fences")]
+    #[test_case("printf '\u{1b}[31mred\u{7}'", "```", WIDE_WIDTH; "terminal_controls")]
+    #[test_case("echo '界 λ' | cat", "```", NARROW_WIDTH; "unicode")]
+    #[test_case(COLOURED_COMMAND, "```", NARROW_WIDTH; "narrow_wrapping")]
+    fn shell_delivery_highlights_only_the_command(command: &str, fence: &str, width: u16) {
+        coloured();
+        let body = format!("Command:\n{fence}bash\n{command}\n{fence}\n\n{SHELL_OUTPUT}");
+        assert_eq!(shell_delivery_command(&body), Some((command, SHELL_OUTPUT)));
+        let (lines, links) = shell_delivery_body(&body, width);
+        let code = literal_code(command, SHELL, width);
+        let (output, _) = literal_body(SHELL_OUTPUT, width);
+        assert_eq!(&lines[1..1 + code.len()], code.as_slice());
+        assert_eq!(&lines[lines.len() - output.len()..], output.as_slice());
+        assert_eq!(lines.len(), code.len() + output.len() + 2);
+        let colours: HashSet<_> = code
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter_map(|span| span.style.fg)
+            .collect();
+        assert!(colours.len() > 1, "{COLOURED}");
+        assert!(
+            output
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| span.style.fg.is_none())
+        );
+        assert!(lines.iter().all(|line| line.width() <= width as usize));
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| { !span.content.chars().any(char::is_control) })
+        );
+        assert!(links.is_aligned(&lines));
+        assert!(links.rows.iter().flatten().all(Option::is_none));
+    }
+
+    #[test_case("echo done\n", 1; "terminated_line")]
+    #[test_case("echo done\n\n", 2; "trailing_blank_line")]
+    #[test_case("echo done\n\n\n", 3; "trailing_blank_lines")]
+    #[test_case("\necho done", 2; "leading_blank_line")]
+    #[test_case("\n", 1; "blank_command")]
+    fn shell_delivery_preserves_command_blank_lines(command: &str, rows: usize) {
+        let body = format!("Command:\n```bash\n{command}\n```\n\n{SHELL_OUTPUT}");
+        assert_eq!(shell_delivery_command(&body), Some((command, SHELL_OUTPUT)));
+        let (lines, _) = shell_delivery_body(&body, WIDE_WIDTH);
+        let (output, _) = literal_body(SHELL_OUTPUT, WIDE_WIDTH);
+        assert_eq!(lines.len(), rows + output.len() + 2);
+        let shown: Vec<_> = lines[1..1 + rows].iter().map(Line::to_string).collect();
+        let expected: Vec<_> = command.lines().map(|line| format!("  {line}")).collect();
+        assert_eq!(shown, expected);
+    }
+
+    #[test_case("Command:\necho done\n\noutput"; "legacy_unfenced_command")]
+    #[test_case("stdout tail:\n```bash\necho done\n```"; "legacy_output")]
+    #[test_case("Command:\n```bash\necho done"; "missing_closing_fence")]
+    #[test_case("Command:\n```bash\necho done\n````\n\noutput"; "mismatched_closing_fence")]
+    #[test_case("Command:\n```bash\necho done\n``` suffix\n\noutput"; "non_standalone_closing_fence")]
+    #[test_case("Command:\n``bash\necho done\n``\n\noutput"; "short_fence")]
+    #[test_case("Command:\n```rust\necho done\n```\n\noutput"; "wrong_language")]
+    #[test_case("Command:\nabcdbash\necho done\nabcd\n\noutput"; "invalid_fence")]
+    fn unfenced_or_malformed_shell_deliveries_remain_literal(body: &str) {
+        assert_eq!(shell_delivery_command(body), None);
+        let (lines, links) = shell_delivery_body(body, WIDE_WIDTH);
+        assert_eq!(lines, literal_body(body, WIDE_WIDTH).0);
+        assert!(links.is_aligned(&lines));
+        assert!(links.rows.iter().flatten().all(Option::is_none));
+    }
+
+    #[test_case(false; "empty_output")]
+    #[test_case(true; "whitespace_output")]
+    fn fenced_shell_delivery_without_output_still_shows_command(whitespace: bool) {
+        let output = if whitespace { " \n\t" } else { "" };
+        let body = format!("Command:\n```bash\n{COLOURED_COMMAND}\n```\n\n{output}");
+        let (lines, links) = shell_delivery_body(body.trim(), WIDE_WIDTH);
+        assert_eq!(
+            &lines[1..],
+            literal_code(COLOURED_COMMAND, SHELL, WIDE_WIDTH)
+        );
+        assert!(links.is_aligned(&lines));
+    }
+
+    #[test_case(false; "within_budget")]
+    #[test_case(true; "past_budget")]
+    fn fenced_shell_delivery_keeps_highlighting_budget(past_budget: bool) {
+        coloured();
+        let command = if past_budget {
+            format!("{COLOURED_COMMAND}\n{}", "#".repeat(MAX_HIGHLIGHTED_BYTES))
+        } else {
+            COLOURED_COMMAND.into()
+        };
+        let body = format!("Command:\n```bash\n{command}\n```\n\n{SHELL_OUTPUT}");
+        let (lines, _) = shell_delivery_body(&body, WIDE_WIDTH);
+        let code = literal_code(&command, SHELL, WIDE_WIDTH);
+        assert_eq!(&lines[1..1 + code.len()], code.as_slice());
+        let coloured = code
+            .iter()
+            .flat_map(|line| &line.spans)
+            .any(|span| span.style.fg.is_some());
+        assert_eq!(coloured, !past_budget);
     }
 
     fn shell_job(metadata: bool) -> TaskCard {

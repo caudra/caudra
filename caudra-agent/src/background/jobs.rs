@@ -784,7 +784,10 @@ mod tests {
     const OTHER: &str = "other-invocation";
     const COMMAND: &str = "printf bounded-output";
     const MULTILINE_COMMAND: &str =
-        "printf '**literal** `code`'\nprintf '<html> & output' > destination\n";
+        "printf '**literal** `code`'\n\ncat <<'EOF' > destination\n<html> & output\n\nEOF\n";
+    const BACKTICK_COMMAND: &str = "cat <<'EOF'\n```\n\n`````embedded````\nEOF\n";
+    const COMMAND_FENCE: &str = "```";
+    const BACKTICK_COMMAND_FENCE: &str = "``````";
     const OUTPUT: &str = "bounded-output";
     const TIMEOUT_MS: u64 = 120_000;
     const LITERAL_OUTPUT: &str = "<html> & output > destination\n";
@@ -1867,15 +1870,23 @@ mod tests {
         });
     }
 
-    #[test_case(false, false, COMMAND; "main_success")]
-    #[test_case(true, false, COMMAND; "child_success")]
-    #[test_case(false, true, COMMAND; "main_failure")]
-    #[test_case(true, true, COMMAND; "child_failure")]
-    #[test_case(false, false, MULTILINE_COMMAND; "multiline_command")]
+    #[test_case(false, false, COMMAND, COMMAND_FENCE; "main_success")]
+    #[test_case(true, false, COMMAND, COMMAND_FENCE; "child_success")]
+    #[test_case(false, true, COMMAND, COMMAND_FENCE; "main_failure")]
+    #[test_case(true, true, COMMAND, COMMAND_FENCE; "child_failure")]
+    #[test_case(false, false, MULTILINE_COMMAND, COMMAND_FENCE; "main_multiline_success")]
+    #[test_case(true, false, MULTILINE_COMMAND, COMMAND_FENCE; "child_multiline_success")]
+    #[test_case(false, true, MULTILINE_COMMAND, COMMAND_FENCE; "main_multiline_failure")]
+    #[test_case(true, true, MULTILINE_COMMAND, COMMAND_FENCE; "child_multiline_failure")]
+    #[test_case(false, false, BACKTICK_COMMAND, BACKTICK_COMMAND_FENCE; "main_backticks_success")]
+    #[test_case(true, false, BACKTICK_COMMAND, BACKTICK_COMMAND_FENCE; "child_backticks_success")]
+    #[test_case(false, true, BACKTICK_COMMAND, BACKTICK_COMMAND_FENCE; "main_backticks_failure")]
+    #[test_case(true, true, BACKTICK_COMMAND, BACKTICK_COMMAND_FENCE; "child_backticks_failure")]
     fn shell_envelopes_validate_owner_and_deliver_literal_output(
         child: bool,
         failed: bool,
         command: &str,
+        fence: &str,
     ) {
         smol::block_on(async {
             let fixture = Fixture::new().await;
@@ -1945,7 +1956,7 @@ mod tests {
             assert_eq!(
                 result,
                 format!(
-                    "Shell {}: {status}.\n\nCommand:\n{command}\n\n{LITERAL_OUTPUT}",
+                    "Shell {}: {status}.\n\nCommand:\n{fence}bash\n{command}\n{fence}\n\n{LITERAL_OUTPUT}",
                     card.task_id
                 )
             );
@@ -1953,9 +1964,11 @@ mod tests {
         });
     }
 
-    #[test_case(false; "main_shell")]
-    #[test_case(true; "child_shell")]
-    fn oversized_shell_command_does_not_block_delivery(child: bool) {
+    #[test_case(false, false; "main_shell")]
+    #[test_case(true, false; "child_shell")]
+    #[test_case(false, true; "main_shell_longest_fence")]
+    #[test_case(true, true; "child_shell_longest_fence")]
+    fn oversized_shell_command_does_not_block_delivery(child: bool, longest_fence: bool) {
         const MULTIBYTE: &str = "界";
         const TRUNCATED: &str = "[truncated; inspect task status]";
         const OUTPUT_BYTE: &str = "x";
@@ -1966,7 +1979,20 @@ mod tests {
             } else {
                 fixture.tasks.main_scope()
             };
-            let command = MULTIBYTE.repeat(MAX_BATCH_BYTES / MULTIBYTE.len() + 1);
+            let prefix = if longest_fence {
+                "`".repeat(MAX_SHELL_COMMAND_BYTES)
+            } else {
+                MULTIBYTE.repeat(MAX_SHELL_COMMAND_BYTES / MULTIBYTE.len())
+            };
+            let command = format!(
+                "{prefix}{}",
+                MULTIBYTE.repeat(MAX_BATCH_BYTES / MULTIBYTE.len() + 1)
+            );
+            let fence = if longest_fence {
+                "`".repeat(MAX_SHELL_COMMAND_BYTES + 1)
+            } else {
+                COMMAND_FENCE.into()
+            };
             let output = OUTPUT_BYTE.repeat(MAX_RESULT_BYTES);
             let retained_output = output.clone();
             let card = scope
@@ -1993,15 +2019,21 @@ mod tests {
                 .unwrap()
                 .first_text_content()
                 .unwrap();
-            let prefix = MULTIBYTE.repeat(MAX_SHELL_COMMAND_BYTES / MULTIBYTE.len());
             assert_eq!(
                 result,
                 format!(
-                    "Shell {}: success.\n\nCommand:\n{prefix}\n{TRUNCATED}\n\n{output}",
+                    "Shell {}: success.\n\nCommand:\n{fence}bash\n{prefix}\n{TRUNCATED}\n{fence}\n\n{output}",
                     card.task_id
                 )
             );
             assert!(result.len() < MAX_BATCH_BYTES);
+            assert!(
+                messages
+                    .iter()
+                    .map(|message| message.first_text_content().unwrap().len())
+                    .sum::<usize>()
+                    < MAX_BATCH_BYTES
+            );
             fixture.tasks.shutdown().await.unwrap();
         });
     }

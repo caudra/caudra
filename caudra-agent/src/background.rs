@@ -50,6 +50,7 @@ const MAX_PENDING_BYTES: usize = 2 * 1024 * 1024;
 const MAX_BATCH_BYTES: usize = 64 * 1024;
 const MAX_RESULT_BYTES: usize = 32 * 1024;
 const MAX_SHELL_COMMAND_BYTES: usize = 8 * 1024;
+const MIN_SHELL_COMMAND_FENCE_LENGTH: usize = 3;
 const TASK_OUTPUT_LABEL: &str = "output-task";
 const STALE_INVOCATION: &str =
     "task invocation or session generation changed; refresh before controlling it";
@@ -1410,11 +1411,19 @@ impl BackgroundTasks {
             let truncated = body.len() > MAX_RESULT_BYTES;
             let body = bounded(&body, MAX_RESULT_BYTES);
             let mut text = match &record.payload {
-                JobPayload::Shell(metadata) => format!(
-                    "Shell {}: {kind}.\n\nCommand:\n{}\n\n{body}",
-                    record.task_id,
-                    bounded(&metadata.command, MAX_SHELL_COMMAND_BYTES)
-                ),
+                JobPayload::Shell(metadata) => {
+                    let command = bounded(&metadata.command, MAX_SHELL_COMMAND_BYTES);
+                    let longest_run = command
+                        .split(|character| character != '`')
+                        .map(str::len)
+                        .max()
+                        .unwrap_or_default();
+                    let fence = "`".repeat((longest_run + 1).max(MIN_SHELL_COMMAND_FENCE_LENGTH));
+                    format!(
+                        "Shell {}: {kind}.\n\nCommand:\n{fence}bash\n{command}\n{fence}\n\n{body}",
+                        record.task_id
+                    )
+                }
                 JobPayload::Agent => format!("Task {}: {kind}.\n\n{body}", record.task_id),
             };
             let reference = event
