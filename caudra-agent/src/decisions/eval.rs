@@ -15,7 +15,7 @@ use std::fmt::Debug;
 use std::future::Future;
 use std::time::Instant;
 
-use caudra_config::decisions::{DecisionsConfig, FeatureMode};
+use caudra_config::decisions::{DecisionProtocol, FeatureMode, RawDecisionsConfig};
 use caudra_decision::{Answer, QuestionSet};
 use caudra_providers::ModelPurpose;
 use caudra_storage::StateDir;
@@ -40,9 +40,9 @@ use crate::types::{TodoItem, TodoPriority, TodoStatus};
 
 const URL_ENV: &str = "CAUDRA_DECISION_EVAL_URL";
 const MODEL_ENV: &str = "CAUDRA_DECISION_EVAL_MODEL";
-const DEFAULT_MODEL: &str = "jev-latest";
+const PROTOCOL_ENV: &str = "CAUDRA_DECISION_EVAL_PROTOCOL";
+const PROTOCOL_INVALID: &str = "CAUDRA_DECISION_EVAL_PROTOCOL must be typesafe or openai";
 const URL_MISSING: &str = "set CAUDRA_DECISION_EVAL_URL to the decision engine base URL";
-const URL_INVALID: &str = "CAUDRA_DECISION_EVAL_URL is not a URL";
 const SERVICE_INVALID: &str = "the evaluation decision service could not be built";
 const SET_INVALID: &str = "a built-in question set is invalid";
 const FEATURE_DISABLED: &str = "the evaluation service has the feature disabled";
@@ -228,15 +228,23 @@ fn decision_eval() {
 }
 
 fn service(url: &str, state_dir: StateDir) -> Decisions {
-    let mut config = DecisionsConfig {
-        base_url: Some(url.parse().expect(URL_INVALID)),
-        model: env::var(MODEL_ENV).unwrap_or_else(|_| DEFAULT_MODEL.into()),
-        allow_remote: true,
-        allow_http: true,
-        timeout_ms: TIMEOUT_MS,
-        log: false,
-        ..DecisionsConfig::default()
-    };
+    let protocol = env::var(PROTOCOL_ENV).map_or(DecisionProtocol::TypeSafe, |value| {
+        serde_json::from_value(Value::String(value)).expect(PROTOCOL_INVALID)
+    });
+    let mut raw = RawDecisionsConfig::default();
+    raw.protocol = Some(protocol);
+    raw.base_url = Some(url.into());
+    raw.model = env::var(MODEL_ENV).ok();
+    raw.allow_remote = Some(true);
+    raw.allow_http = Some(true);
+    raw.timeout_ms = Some(TIMEOUT_MS);
+    raw.log = Some(false);
+    let mut config = raw.resolve(None).expect(SERVICE_INVALID);
+    println!(
+        "Decision evaluation: protocol={} model={}",
+        config.protocol.as_str(),
+        config.model
+    );
     let features = &mut config.features;
     features.permission_advice = FeatureMode::Advise;
     features.shell_effect = FeatureMode::Advise;

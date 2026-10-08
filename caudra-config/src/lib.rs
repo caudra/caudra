@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::{self, Write};
 use std::fs;
 use std::mem;
@@ -53,7 +53,7 @@ const PROCESS_ONLY_ENV_VARS: &[&str] = &[
     "HERDR_TAB_ID",
     "WORKCELL_MCP_CODE_WORKER",
 ];
-static PROJECT_ENV_KEYS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+static PROJECT_ENV_FALLBACKS: Mutex<Option<HashMap<String, Option<String>>>> = Mutex::new(None);
 
 pub mod config_file;
 pub mod config_version;
@@ -3930,16 +3930,18 @@ fn load_env_files_with_global(cwd: &Path, global: Option<&Path>) {
 }
 
 fn load_env_files_scoped(cwd: &Path, global: Option<&Path>, include_project: bool) {
-    let (vars, project_keys) = env_file_layers(cwd, global, include_project);
-    let mut project_env_keys = PROJECT_ENV_KEYS
+    let (vars, mut project_fallbacks) = env_file_layers(cwd, global, include_project);
+    let mut project_env_fallbacks = PROJECT_ENV_FALLBACKS
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     for (key, value) in vars {
         if env_file_var_is_allowed(&key) && std::env::var_os(&key).is_none() {
-            if project_keys.contains(&key) {
-                project_env_keys
-                    .get_or_insert_with(HashSet::new)
-                    .insert(key.clone());
+            if let Some(fallback) = project_fallbacks.remove(&key) {
+                project_env_fallbacks
+                    .get_or_insert_with(HashMap::new)
+                    .insert(key.clone(), fallback);
+            } else if let Some(fallbacks) = project_env_fallbacks.as_mut() {
+                fallbacks.remove(&key);
             }
             // SAFETY: single-threaded at startup, before any async runtime
             unsafe { std::env::set_var(&key, &value) };
@@ -3951,7 +3953,7 @@ fn env_file_layers(
     cwd: &Path,
     global: Option<&Path>,
     include_project: bool,
-) -> (HashMap<String, String>, HashSet<String>) {
+) -> (HashMap<String, String>, HashMap<String, Option<String>>) {
     let mut vars = HashMap::new();
     if let Some(path) = global {
         collect_env_vars(&path.join(ENV_FILE), &mut vars);
@@ -3961,21 +3963,24 @@ fn env_file_layers(
         collect_env_vars(&cwd.join(PROJECT_DIR).join(ENV_FILE), &mut project_vars);
         project_vars.remove(decisions::BASE_URL_ENV);
     }
-    let project_keys: HashSet<_> = project_vars.keys().cloned().collect();
+    let project_fallbacks = project_vars
+        .keys()
+        .map(|key| (key.clone(), vars.remove(key)))
+        .collect();
     vars.extend(project_vars);
-    (vars, project_keys)
+    (vars, project_fallbacks)
 }
 
 /// `key` as the process environment or the global `.env` set it. A key the project's `.env` set
-/// reads as unset, so a repository cannot plant a credential or a secret URL.
+/// reads as its shadowed global value or unset, so a repository cannot plant a credential or a secret URL.
 pub fn global_env_value(key: &str) -> Result<Option<String>, std::env::VarError> {
-    if PROJECT_ENV_KEYS
+    if let Some(fallback) = PROJECT_ENV_FALLBACKS
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .as_ref()
-        .is_some_and(|keys| keys.contains(key))
+        .and_then(|fallbacks| fallbacks.get(key))
     {
-        return Ok(None);
+        return Ok(fallback.clone());
     }
     match std::env::var(key) {
         Ok(value) => Ok(Some(value)),
@@ -4090,7 +4095,8 @@ pub fn global_config_dir() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::config_version::CONFIG_VERSION_KEY;
-    use std::fs;
+    use crate::decisions::{DecisionProtocol, RawDecisionsConfig};
+    use std::{env, fs, process::Command};
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -4123,6 +4129,8 @@ mod tests {
     const UNKNOWN_FIELD_ERROR: &str = "unknown field";
     const CUSTOM_TURNS_PER_HOUR: u32 = 30;
     const CUSTOM_UNATTENDED_TURNS: u32 = 50;
+    const DECISION_ENV_CHILD: &str = "CAUDRA_TEST_DECISION_ENV_CHILD";
+    const DECISION_ENV_TEST: &str = "tests::decision_protocol_environment";
 
     #[test_case(b"", EMPTY_SOURCE_DIGEST; "empty_source")]
     #[test_case(b"abc", ABC_SOURCE_DIGEST; "known_source")]
@@ -6137,12 +6145,150 @@ mod tests {
             format!("{}={PROJECT_BASE_URL}", decisions::BASE_URL_ENV),
         )
         .unwrap();
-        let (vars, project_keys) = env_file_layers(dir.path(), Some(&global), true);
+        let (vars, project_fallbacks) = env_file_layers(dir.path(), Some(&global), true);
         assert_eq!(
             vars.get(decisions::BASE_URL_ENV).map(String::as_str),
             has_global.then_some(GLOBAL_BASE_URL)
         );
-        assert!(!project_keys.contains(decisions::BASE_URL_ENV));
+        assert!(!project_fallbacks.contains_key(decisions::BASE_URL_ENV));
+    }
+
+    #[test_case(DecisionProtocol::TypeSafe; "typesafe")]
+    #[test_case(DecisionProtocol::OpenAI; "openai")]
+    fn decision_protocol_environment(protocol: DecisionProtocol) {
+        const CONFIGURED: &str = "http://127.0.0.1/configured/v1";
+        const PROCESS: &str = "http://127.0.0.1/process/v1";
+        const GLOBAL: &str = "http://127.0.0.1/global/v1";
+        const PROJECT: &str = "http://127.0.0.1/project/v1";
+        const INVALID: &str = "not-an-absolute-url";
+        const KEY: &str = "CAUDRA_TEST_DECISION_COLLIDING_KEY";
+        const PROCESS_CREDENTIAL: &str = "process-test-credential";
+        const GLOBAL_CREDENTIAL: &str = "global-test-credential";
+        const PROJECT_CREDENTIAL: &str = "project-test-credential";
+
+        if env::var_os(DECISION_ENV_CHILD).is_none() {
+            let status = Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    &format!("{DECISION_ENV_TEST}::{}", protocol.as_str()),
+                ])
+                .env(DECISION_ENV_CHILD, "1")
+                .env(decisions::BASE_URL_ENV, INVALID)
+                .env(decisions::OPENAI_BASE_URL_ENV, INVALID)
+                .env(protocol.base_url_env(), PROCESS)
+                .env_remove(KEY)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let raw: RawDecisionsConfig = toml::from_str(&format!(
+            "protocol = '{}'\nbase_url = '{CONFIGURED}'",
+            protocol.as_str()
+        ))
+        .unwrap();
+        let resolved_base = || {
+            raw.clone()
+                .resolve_env()
+                .unwrap()
+                .base_url
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(resolved_base(), PROCESS);
+        let mut disabled = raw.clone();
+        disabled.base_url = None;
+        assert!(disabled.clone().resolve_env().unwrap().endpoint().is_none());
+        unsafe { env::set_var(protocol.base_url_env(), INVALID) };
+        assert!(disabled.resolve_env().unwrap().endpoint().is_none());
+        let error = raw.clone().resolve_env().unwrap_err();
+        assert!(matches!(
+            &error,
+            decisions::DecisionsConfigError::Environment { variable, .. }
+                if *variable == protocol.base_url_env()
+        ));
+        assert!(error.to_string().contains(protocol.base_url_env()));
+        unsafe { env::remove_var(protocol.base_url_env()) };
+        assert_eq!(resolved_base(), CONFIGURED);
+
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        fs::create_dir_all(&global).unwrap();
+        fs::write(
+            global.join(ENV_FILE),
+            format!("{}={GLOBAL}", protocol.base_url_env()),
+        )
+        .unwrap();
+        load_env_files_scoped(dir.path(), Some(&global), false);
+        assert_eq!(resolved_base(), GLOBAL);
+
+        let project = dir.path().join(PROJECT_DIR);
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            project.join(ENV_FILE),
+            format!("{}={PROJECT}", protocol.base_url_env()),
+        )
+        .unwrap();
+        unsafe { env::set_var(protocol.base_url_env(), PROCESS) };
+        load_env_files_scoped(dir.path(), Some(&global), true);
+        assert_eq!(resolved_base(), PROCESS);
+        unsafe { env::remove_var(protocol.base_url_env()) };
+        load_env_files_scoped(dir.path(), None, true);
+        assert_eq!(resolved_base(), CONFIGURED);
+        assert_eq!(global_env_value(protocol.base_url_env()).unwrap(), None);
+        match protocol {
+            DecisionProtocol::TypeSafe => assert!(env::var_os(protocol.base_url_env()).is_none()),
+            DecisionProtocol::OpenAI => {
+                assert_eq!(env::var(protocol.base_url_env()).unwrap(), PROJECT)
+            }
+        }
+
+        unsafe { env::remove_var(protocol.base_url_env()) };
+        load_env_files_scoped(dir.path(), Some(&global), true);
+        assert_eq!(resolved_base(), GLOBAL);
+        assert_eq!(
+            global_env_value(protocol.base_url_env())
+                .unwrap()
+                .as_deref(),
+            Some(GLOBAL)
+        );
+        assert_eq!(
+            env::var(protocol.base_url_env()).unwrap(),
+            if protocol == DecisionProtocol::OpenAI {
+                PROJECT
+            } else {
+                GLOBAL
+            }
+        );
+
+        fs::write(global.join(ENV_FILE), format!("{KEY}={GLOBAL_CREDENTIAL}")).unwrap();
+        fs::write(
+            project.join(ENV_FILE),
+            format!("{KEY}={PROJECT_CREDENTIAL}"),
+        )
+        .unwrap();
+        let config = DecisionsConfig {
+            api_key_env: KEY.into(),
+            ..DecisionsConfig::default()
+        };
+        unsafe { env::set_var(KEY, PROCESS_CREDENTIAL) };
+        load_env_files_scoped(dir.path(), Some(&global), true);
+        assert_eq!(
+            config.api_key().unwrap().as_deref(),
+            Some(PROCESS_CREDENTIAL)
+        );
+        unsafe { env::remove_var(KEY) };
+        load_env_files_scoped(dir.path(), Some(&global), true);
+        assert_eq!(env::var(KEY).unwrap(), PROJECT_CREDENTIAL);
+        assert_eq!(
+            config.api_key().unwrap().as_deref(),
+            Some(GLOBAL_CREDENTIAL)
+        );
+        unsafe { env::remove_var(KEY) };
+        load_env_files_scoped(dir.path(), None, true);
+        assert_eq!(env::var(KEY).unwrap(), PROJECT_CREDENTIAL);
+        assert_eq!(config.api_key().unwrap(), None);
     }
 
     #[test]

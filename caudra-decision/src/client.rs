@@ -11,6 +11,7 @@ use jiff::fmt::rfc2822::DateTimeParser;
 use url::Url;
 
 use crate::engine::{DecisionEngine, DecisionError, check_deadline};
+use crate::openai;
 use crate::question_set::bounded_json;
 use crate::wire::{DecisionRequest, DecisionResponse, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES};
 
@@ -27,10 +28,28 @@ pub struct HttpDecisionClient {
     client: HttpClient,
     endpoint: Uri,
     authorization: Option<HeaderValue>,
+    protocol: Protocol,
+}
+
+enum Protocol {
+    TypeSafe,
+    OpenAi,
 }
 
 impl HttpDecisionClient {
     pub fn new(endpoint: &str, api_key: Option<&str>) -> Result<Self, DecisionError> {
+        Self::with_protocol(endpoint, api_key, Protocol::TypeSafe)
+    }
+
+    pub fn openai(endpoint: &str, api_key: Option<&str>) -> Result<Self, DecisionError> {
+        Self::with_protocol(endpoint, api_key, Protocol::OpenAi)
+    }
+
+    fn with_protocol(
+        endpoint: &str,
+        api_key: Option<&str>,
+        protocol: Protocol,
+    ) -> Result<Self, DecisionError> {
         let url = Url::parse(endpoint).map_err(|_| {
             DecisionError::Rejected("endpoint must be an absolute HTTP or HTTPS URL")
         })?;
@@ -71,6 +90,7 @@ impl HttpDecisionClient {
             client,
             endpoint,
             authorization,
+            protocol,
         })
     }
 
@@ -79,7 +99,10 @@ impl HttpDecisionClient {
         request: &DecisionRequest,
         deadline: Instant,
     ) -> Result<DecisionResponse, DecisionError> {
-        let body = bounded_json(request, MAX_REQUEST_BYTES)?;
+        let body = match self.protocol {
+            Protocol::TypeSafe => bounded_json(request, MAX_REQUEST_BYTES)?,
+            Protocol::OpenAi => openai::encode(request)?,
+        };
         let mut retries = 0;
         loop {
             check_deadline(deadline)?;
@@ -153,9 +176,12 @@ impl HttpDecisionClient {
                 return Err(DecisionError::Invalid("response exceeds the byte limit"));
             }
             check_deadline(deadline)?;
-            let response: DecisionResponse = serde_json::from_slice(&bytes).map_err(|_| {
-                DecisionError::Invalid("response does not match the decision JSON schema")
-            })?;
+            let response = match self.protocol {
+                Protocol::TypeSafe => serde_json::from_slice(&bytes).map_err(|_| {
+                    DecisionError::Invalid("response does not match the decision JSON schema")
+                })?,
+                Protocol::OpenAi => openai::decode(&bytes, request)?,
+            };
             response.validate_for(request)?;
             check_deadline(deadline)?;
             return Ok(response);
@@ -232,12 +258,14 @@ mod tests {
     use async_io::{Async, Timer};
     use futures_lite::future;
     use isahc::http::{HeaderMap, HeaderName, HeaderValue};
+    use serde_json::{Value, json};
     use test_case::test_case;
 
     use super::{BACKOFF_INITIAL, BACKOFF_MAX, HttpDecisionClient, backoff, retry_delay};
-    use crate::engine::{DecisionEngine, DecisionError};
+    use crate::engine::{CachedDecisionEngine, DecisionEngine, DecisionError};
+    use crate::openai::tests as openai_fixture;
     use crate::wire::{
-        DecisionResponse, MAX_RESPONSE_BYTES,
+        DecisionRequest, DecisionResponse, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
         tests::{request, response},
     };
 
@@ -253,6 +281,8 @@ mod tests {
     const LATER_HTTP_DATE: &str = "Wed, 21 Oct 2015 07:28:00 GMT";
     const EARLIER_HTTP_DATE: &str = "Wed, 21 Oct 2015 07:27:00 GMT";
     const DIRECT_REQUEST_TEST: &str = "client::tests::sends_full_endpoint_bearer_and_wire_body";
+    const OPENAI_DIRECT_REQUEST_TEST: &str =
+        "client::tests::sends_openai_full_endpoint_bearer_and_text_fixture";
 
     struct Server {
         endpoint: String,
@@ -331,12 +361,21 @@ mod tests {
         HttpDecisionClient::new(endpoint, Some(TEST_TOKEN)).unwrap()
     }
 
-    #[test]
-    fn ambient_proxies_cannot_redirect_decision_requests() {
+    fn client_for(endpoint: &str, openai: bool) -> HttpDecisionClient {
+        if openai {
+            HttpDecisionClient::openai(endpoint, Some(TEST_TOKEN)).unwrap()
+        } else {
+            client(endpoint)
+        }
+    }
+
+    #[test_case(DIRECT_REQUEST_TEST; "typesafe")]
+    #[test_case(OPENAI_DIRECT_REQUEST_TEST; "openai")]
+    fn ambient_proxies_cannot_redirect_decision_requests(test: &str) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let proxy = format!("http://{}", listener.local_addr().unwrap());
         let mut command = Command::new(env::current_exe().unwrap());
-        command.args(["--exact", DIRECT_REQUEST_TEST, "--nocapture"]);
+        command.args(["--exact", test, "--nocapture"]);
         for name in [
             "http_proxy",
             "https_proxy",
@@ -377,6 +416,187 @@ mod tests {
                 .contains(&format!("authorization: bearer {TEST_TOKEN}"))
         );
         assert!(sent.contains(&serde_json::to_string(&request()).unwrap()));
+    }
+
+    #[test]
+    fn sends_openai_full_endpoint_bearer_and_text_fixture() {
+        let server = server(vec![http_response(
+            STATUS_OK,
+            &openai_fixture::response().to_string(),
+            "",
+        )]);
+        let endpoint = server
+            .endpoint
+            .replace("/v1/systemone", "/v1/decisions?version=test");
+        let result = future::block_on(
+            client_for(&endpoint, true)
+                .decide(&openai_fixture::request(), Instant::now() + TEST_TIMEOUT),
+        );
+        server.task.join().unwrap();
+        assert_eq!(result.unwrap(), openai_fixture::normalized());
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let sent = &requests[0];
+        assert!(sent.starts_with("POST /v1/decisions?version=test HTTP/1.1"));
+        assert!(
+            sent.to_ascii_lowercase()
+                .contains(&format!("authorization: bearer {TEST_TOKEN}"))
+        );
+        let body: Value = serde_json::from_str(sent.rsplit_once("\r\n").unwrap().1).unwrap();
+        assert_eq!(body, openai_fixture::encoded());
+    }
+
+    #[test_case(408; "request_timeout")]
+    #[test_case(429; "rate_limit")]
+    #[test_case(500; "internal_error")]
+    #[test_case(503; "unavailable")]
+    #[test_case(529; "overloaded")]
+    fn openai_retries_with_the_same_encoded_request(status: u16) {
+        let server = server(vec![
+            http_response(status, "ignored", RETRY_NOW),
+            http_response(STATUS_OK, &openai_fixture::response().to_string(), ""),
+        ]);
+        let result = future::block_on(
+            client_for(&server.endpoint, true)
+                .decide(&openai_fixture::request(), Instant::now() + TEST_TIMEOUT),
+        );
+        server.task.join().unwrap();
+        assert_eq!(result.unwrap(), openai_fixture::normalized());
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], requests[1]);
+    }
+
+    #[test_case(400, 1; "bad_request")]
+    #[test_case(401, 1; "unauthorized")]
+    #[test_case(404, 1; "not_found")]
+    #[test_case(422, 1; "unprocessable")]
+    #[test_case(503, 3; "retry_limit")]
+    fn openai_http_failures_respect_retry_limits(status: u16, attempts: usize) {
+        let server = server(vec![http_response(status, TEST_TOKEN, RETRY_NOW); attempts]);
+        let result = future::block_on(
+            client_for(&server.endpoint, true)
+                .decide(&openai_fixture::request(), Instant::now() + TEST_TIMEOUT),
+        );
+        server.task.join().unwrap();
+        assert_eq!(result, Err(DecisionError::Http { status }));
+        assert_eq!(server.requests.lock().unwrap().len(), attempts);
+    }
+
+    #[test]
+    fn openai_cache_hit_is_only_local_and_usage_is_preserved() {
+        let server = server(vec![http_response(
+            STATUS_OK,
+            &openai_fixture::response().to_string(),
+            "",
+        )]);
+        let engine = CachedDecisionEngine::new(client_for(&server.endpoint, true), 1);
+        let first = future::block_on(
+            engine.decide(&openai_fixture::request(), Instant::now() + TEST_TIMEOUT),
+        )
+        .unwrap();
+        assert_eq!(first, openai_fixture::normalized());
+        let second = future::block_on(
+            engine.decide(&openai_fixture::request(), Instant::now() + TEST_TIMEOUT),
+        )
+        .unwrap();
+        let mut expected = first;
+        expected.cache_hit = true;
+        assert_eq!(second, expected);
+        server.task.join().unwrap();
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+    }
+
+    #[test_case("/questions/queue/criteria"; "choice_option_order")]
+    #[test_case("/questions/damaged/instructions"; "instruction_order")]
+    #[test_case("/questions/damaged/criteria"; "predicate_criteria_order")]
+    #[test_case("/state"; "state_order")]
+    #[test_case("/state/metadata"; "nested_state_order")]
+    fn cache_distinguishes_request_object_order(pointer: &str) {
+        let first = openai_fixture::request();
+        let mut reordered = serde_json::to_value(&first).unwrap();
+        let map = reordered
+            .pointer_mut(pointer)
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        *map = map
+            .iter()
+            .rev()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let second: DecisionRequest = serde_json::from_value(reordered).unwrap();
+        let server = server(vec![
+            http_response(
+                STATUS_OK,
+                &openai_fixture::response().to_string(),
+                ""
+            );
+            2
+        ]);
+        let engine = CachedDecisionEngine::new(client_for(&server.endpoint, true), 2);
+        for request in [&first, &second] {
+            let result =
+                future::block_on(engine.decide(request, Instant::now() + TEST_TIMEOUT)).unwrap();
+            assert!(!result.cache_hit);
+            let cached =
+                future::block_on(engine.decide(request, Instant::now() + TEST_TIMEOUT)).unwrap();
+            assert!(cached.cache_hit);
+            assert_eq!(cached.answers, result.answers);
+            assert_eq!(cached.usage, result.usage);
+        }
+        server.task.join().unwrap();
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_ne!(requests[0], requests[1]);
+    }
+
+    #[test_case(false; "refusal")]
+    #[test_case(true; "invalid_response")]
+    fn openai_failures_are_not_retried_or_cached(invalid: bool) {
+        let mut response = openai_fixture::response();
+        if invalid {
+            response["answers"][0]["probability"] = json!(-1);
+        } else {
+            response["answers"][0] = json!({"type": "refusal", "name": "damaged"});
+        }
+        let server = server(vec![http_response(STATUS_OK, &response.to_string(), ""); 2]);
+        let engine = CachedDecisionEngine::new(client_for(&server.endpoint, true), 1);
+        for _ in 0..2 {
+            let result = future::block_on(
+                engine.decide(&openai_fixture::request(), Instant::now() + TEST_TIMEOUT),
+            );
+            if invalid {
+                assert!(matches!(result, Err(DecisionError::Invalid(_))));
+            } else {
+                assert_eq!(result, Err(DecisionError::Refused));
+            }
+        }
+        server.task.join().unwrap();
+        assert_eq!(server.requests.lock().unwrap().len(), 2);
+    }
+
+    #[test_case(false; "singleton_choice")]
+    #[test_case(true; "oversized_rendered_request")]
+    fn rejects_openai_request_before_connecting(oversized: bool) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}/v1/decisions", listener.local_addr().unwrap());
+        let mut request = openai_fixture::request();
+        if oversized {
+            request.questions.get_mut("damaged").unwrap().instructions =
+                json!(["\\".repeat(MAX_REQUEST_BYTES / 3)]);
+        } else {
+            request.questions.get_mut("queue").unwrap().criteria = Some(json!({"only": null}));
+        }
+        request.validate().unwrap();
+        let result = future::block_on(
+            client_for(&endpoint, true).decide(&request, Instant::now() + TEST_TIMEOUT),
+        );
+        assert!(matches!(result, Err(DecisionError::Rejected(_))));
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+        );
     }
 
     fn decide_with(replies: Vec<String>) -> (Result<DecisionResponse, DecisionError>, usize) {
@@ -481,8 +701,9 @@ mod tests {
         assert_eq!(backoff(retries, jitter), expected);
     }
 
-    #[test]
-    fn does_not_follow_redirects_with_credentials() {
+    #[test_case(false; "typesafe")]
+    #[test_case(true; "openai")]
+    fn does_not_follow_redirects_with_credentials(openai: bool) {
         let target = TcpListener::bind("127.0.0.1:0").unwrap();
         target.set_nonblocking(true).unwrap();
         let location = format!(
@@ -491,7 +712,7 @@ mod tests {
         );
         let server = server(vec![http_response(STATUS_REDIRECT, "", &location)]);
         let result = future::block_on(
-            client(&server.endpoint).decide(&request(), Instant::now() + TEST_TIMEOUT),
+            client_for(&server.endpoint, openai).decide(&request(), Instant::now() + TEST_TIMEOUT),
         );
         server.task.join().unwrap();
         assert_eq!(
@@ -520,9 +741,11 @@ mod tests {
         assert!(!format!("{error:?} {error}").contains(TEST_TOKEN));
     }
 
-    #[test_case(false; "declared_length")]
-    #[test_case(true; "streamed_without_length")]
-    fn bounds_response_bytes(streamed: bool) {
+    #[test_case(false, false; "typesafe_declared_length")]
+    #[test_case(true, false; "typesafe_streamed_without_length")]
+    #[test_case(false, true; "openai_declared_length")]
+    #[test_case(true, true; "openai_streamed_without_length")]
+    fn bounds_response_bytes(streamed: bool, openai: bool) {
         let body = " ".repeat(MAX_RESPONSE_BYTES + 1);
         let reply = if streamed {
             format!("HTTP/1.1 {STATUS_OK} Test\r\nConnection: close\r\n\r\n{body}")
@@ -531,7 +754,7 @@ mod tests {
         };
         let server = server(vec![reply]);
         let result = future::block_on(
-            client(&server.endpoint).decide(&request(), Instant::now() + TEST_TIMEOUT),
+            client_for(&server.endpoint, openai).decide(&request(), Instant::now() + TEST_TIMEOUT),
         );
         server.task.join().unwrap();
         assert!(matches!(result, Err(DecisionError::Invalid(_))));
@@ -548,9 +771,11 @@ mod tests {
         assert!(matches!(result, Err(DecisionError::Invalid(_))));
     }
 
-    #[test_case(false; "waiting_for_headers")]
-    #[test_case(true; "waiting_for_body")]
-    fn deadline_includes_response_streaming(headers: bool) {
+    #[test_case(false, false; "typesafe_waiting_for_headers")]
+    #[test_case(true, false; "typesafe_waiting_for_body")]
+    #[test_case(false, true; "openai_waiting_for_headers")]
+    #[test_case(true, true; "openai_waiting_for_body")]
+    fn deadline_includes_response_streaming(headers: bool, openai: bool) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}/v1/systemone", listener.local_addr().unwrap());
         let (release, hold) = mpsc::channel();
@@ -562,7 +787,7 @@ mod tests {
             }
             hold.recv_timeout(TEST_TIMEOUT).unwrap();
         });
-        let client = client(&endpoint);
+        let client = client_for(&endpoint, openai);
         let deadline = Instant::now() + STREAM_DEADLINE;
         let result = future::block_on(client.decide(&request(), deadline));
         release.send(()).unwrap();
@@ -570,12 +795,14 @@ mod tests {
         assert_eq!(result, Err(DecisionError::Timeout));
     }
 
-    #[test]
-    fn expired_deadline_does_not_connect() {
+    #[test_case(false; "typesafe")]
+    #[test_case(true; "openai")]
+    fn expired_deadline_does_not_connect(openai: bool) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let endpoint = format!("http://{}/v1/systemone", listener.local_addr().unwrap());
-        let result = future::block_on(client(&endpoint).decide(&request(), Instant::now()));
+        let result =
+            future::block_on(client_for(&endpoint, openai).decide(&request(), Instant::now()));
         assert_eq!(result, Err(DecisionError::Timeout));
         assert!(listener.accept().is_err());
     }
@@ -586,6 +813,10 @@ mod tests {
     fn rejects_unsafe_endpoint(endpoint: &str) {
         assert!(matches!(
             HttpDecisionClient::new(endpoint, None),
+            Err(DecisionError::Rejected(_))
+        ));
+        assert!(matches!(
+            HttpDecisionClient::openai(endpoint, None),
             Err(DecisionError::Rejected(_))
         ));
     }

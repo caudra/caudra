@@ -501,9 +501,10 @@ Connection settings and thresholds are global-only. Projects may set individual 
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `base_url` | string | unset | Decision API base URL, such as `https://api.typesafe.ai`. Caudra appends `/v1/systemone` and keeps any path prefix. `TYPESAFE_BASE_URL` replaces a configured value. HTTPS required except for numeric loopback HTTP or explicit `allow_http` consent. No credentials, query, fragment, whitespace, or control characters. |
-| `model` | string | `jev-latest` | Decision model identifier, nonblank and without control characters. |
-| `api_key_env` | string | `TYPESAFE_API_KEY` | Environment variable containing the optional credential, never the credential itself. Project environment values are excluded. |
+| `protocol` | string | `typesafe` | Global-only decision wire protocol: `typesafe` or `openai`. Never inferred from the URL, model, or environment. Selecting a protocol does not enable decisions. |
+| `base_url` | string | unset | Global-only decision API base URL. TypeSafe uses a root such as `https://api.typesafe.ai` and appends `/v1/systemone`; OpenAI uses a versioned base such as `https://api.openai.com/v1` and appends `/decisions`. Path prefixes are preserved; full endpoints are rejected. Only the selected protocol's `TYPESAFE_BASE_URL` or `OPENAI_BASE_URL`, from the process or global environment, replaces an explicitly configured base. Environment alone never enables decisions. HTTPS required except for numeric loopback HTTP or explicit `allow_http` consent. No credentials, query, fragment, whitespace, or control characters. |
+| `model` | string | `jev-latest` for typesafe; `gpt-6-luna` for openai | Decision model identifier, nonblank and without control characters. |
+| `api_key_env` | string | `TYPESAFE_API_KEY` for typesafe; `OPENAI_API_KEY` for openai | Environment variable containing the optional credential, never the credential itself. Project environment values are excluded. |
 | `allow_remote` | boolean | `false` | Explicit global consent to send decision context to a non-loopback endpoint. |
 | `allow_http` | boolean | `false` | Global-only opt-in for non-loopback HTTP. Also requires `allow_remote = true`. Use only with transport protection you control, such as a trusted encrypted tunnel. |
 | `timeout_ms` | integer | `800` | Positive decision-request deadline in milliseconds, separate from shell execution timeouts. |
@@ -512,7 +513,7 @@ Connection settings and thresholds are global-only. Projects may set individual 
 | `features` | table | `{}` | Per-feature modes below. |
 | `thresholds` | table | `{}` | Probability thresholds, all finite and within 0–1 inclusive. |
 
-Caudra sends each request to `base_url` with `/v1/systemone` appended. A path prefix stays in place, so a server mounted under `/typesafe` uses `base_url = "http://127.0.0.1:8080/typesafe"` and receives requests at `/typesafe/v1/systemone`. Leave `/v1/systemone` out of `base_url`. The hosted API also needs remote consent:
+`protocol = "typesafe"` is the default. It appends `/v1/systemone` to the root base URL. A path prefix stays in place, so a server mounted under `/typesafe` uses `base_url = "http://127.0.0.1:8080/typesafe"` and receives requests at `/typesafe/v1/systemone`. Leave `/v1/systemone` out of `base_url`. The default model is `jev-latest` and the default key variable is `TYPESAFE_API_KEY`. The hosted API needs explicit remote consent:
 
 ```toml
 [decisions]
@@ -520,7 +521,27 @@ base_url = "https://api.typesafe.ai"
 allow_remote = true
 ```
 
-`TYPESAFE_BASE_URL` replaces the whole configured base URL, path prefix included, and passes the same URL and transport opt-in checks. It applies only when `base_url` is set, so the variable alone never activates the engine. Project `.env` files cannot set it.
+`protocol = "openai"` appends `/decisions` to a versioned base URL. Use `https://api.openai.com/v1` for the hosted OpenAI Decisions API. The default model is `gpt-6-luna` and the default key variable is `OPENAI_API_KEY`. Explicit `model` and `api_key_env` values override these protocol-specific defaults. Hosted OpenAI also needs remote consent:
+
+```toml
+[decisions]
+protocol = "openai"
+base_url = "https://api.openai.com/v1"
+allow_remote = true
+```
+
+For a local ninfer server, use the OpenAI protocol with the actual served model name. `systemone-decision-v7` is not a Luna alias:
+
+```toml
+[decisions]
+protocol = "openai"
+base_url = "http://127.0.0.1:8080/v1"
+model = "systemone-decision-v7"
+```
+
+`TYPESAFE_BASE_URL` for `typesafe`, or `OPENAI_BASE_URL` for `openai`, replaces the whole configured base URL, path prefix included, and passes the same URL and transport opt-in checks. Only the selected protocol's variable applies, and only when `base_url` is set. A variable alone never activates the engine. Overrides and API keys come from the global environment, not project `.env` files. Neither protocol implies remote or HTTP consent.
+
+Both protocols send text only. OpenAI maps native boolean questions to predicates, retaining the true and false criteria in the instruction text. Answers normalize to the same typed results, including workflow `noul` probabilities. A refusal fails the whole evaluation without applying partial answers.
 
 Caudra retries HTTP 408, 429, and 5xx responses at most twice. Each retry waits for the delay the server requests in `retry-after-ms` or `Retry-After`, or else for an exponential backoff that starts near half a second. No retry waits past `timeout_ms`, so under the default 800 ms deadline most retries need a short server-requested delay. Connection failures, 401, 422, and other client errors fail at once.
 

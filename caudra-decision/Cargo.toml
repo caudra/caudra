@@ -1,6 +1,6 @@
 [package]
 name = "caudra-decision"
-description = "Runtime-neutral TypeSafe System One decision contracts and client"
+description = "Runtime-neutral decision contracts and TypeSafe System One and OpenAI Decisions clients"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

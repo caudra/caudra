@@ -839,6 +839,7 @@ mod tests {
 
     #[test_case(DecisionError::Unreachable)]
     #[test_case(DecisionError::Timeout)]
+    #[test_case(DecisionError::Refused)]
     fn failed_engine_preserves_timeout_and_delivery(error: DecisionError) {
         smol::block_on(async {
             let temp = tempfile::tempdir().unwrap();

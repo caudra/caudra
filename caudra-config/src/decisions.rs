@@ -1,5 +1,3 @@
-use std::env;
-
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
@@ -8,9 +6,13 @@ use crate::workcell::{WorkcellEndpoint, WorkcellEndpointError};
 use crate::{ConfigField, ConfigValue};
 
 pub const BASE_URL_ENV: &str = "TYPESAFE_BASE_URL";
+pub const OPENAI_BASE_URL_ENV: &str = "OPENAI_BASE_URL";
 pub const SYSTEM_ONE_PATH: &str = "/v1/systemone";
+pub const OPENAI_DECISIONS_PATH: &str = "/decisions";
 const DEFAULT_MODEL: &str = "jev-latest";
 const DEFAULT_API_KEY_ENV: &str = "TYPESAFE_API_KEY";
+const OPENAI_DEFAULT_MODEL: &str = "gpt-6-luna";
+const OPENAI_DEFAULT_API_KEY_ENV: &str = "OPENAI_API_KEY";
 const DEFAULT_TIMEOUT_MS: u64 = 800;
 const DEFAULT_LOG_RETENTION_DAYS: u32 = 90;
 const DEFAULT_FLAG_THRESHOLD: f64 = 0.85;
@@ -20,6 +22,66 @@ const DEFAULT_QUESTION_TOOL_NUDGE: f64 = 0.85;
 const INVALID_BASE_URL_MESSAGE: &str = "must be an absolute HTTP(S) URL without credentials, query, fragment, whitespace or control characters";
 const FULL_ENDPOINT_MESSAGE: &str =
     "Caudra appends /v1/systemone; set base_url to the part before it";
+const OPENAI_FULL_ENDPOINT_MESSAGE: &str = "Caudra appends /decisions; set base_url to the versioned API base, such as https://api.openai.com/v1";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DecisionProtocol {
+    #[default]
+    TypeSafe,
+    OpenAI,
+}
+
+impl DecisionProtocol {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::TypeSafe => "typesafe",
+            Self::OpenAI => "openai",
+        }
+    }
+
+    pub const fn base_url_env(&self) -> &'static str {
+        match self {
+            Self::TypeSafe => BASE_URL_ENV,
+            Self::OpenAI => OPENAI_BASE_URL_ENV,
+        }
+    }
+
+    const fn default_model(&self) -> &'static str {
+        match self {
+            Self::TypeSafe => DEFAULT_MODEL,
+            Self::OpenAI => OPENAI_DEFAULT_MODEL,
+        }
+    }
+
+    const fn default_api_key_env(&self) -> &'static str {
+        match self {
+            Self::TypeSafe => DEFAULT_API_KEY_ENV,
+            Self::OpenAI => OPENAI_DEFAULT_API_KEY_ENV,
+        }
+    }
+
+    const fn endpoint_path(&self) -> &'static str {
+        match self {
+            Self::TypeSafe => SYSTEM_ONE_PATH,
+            Self::OpenAI => OPENAI_DECISIONS_PATH,
+        }
+    }
+
+    const fn full_endpoint_message(&self) -> &'static str {
+        match self {
+            Self::TypeSafe => FULL_ENDPOINT_MESSAGE,
+            Self::OpenAI => OPENAI_FULL_ENDPOINT_MESSAGE,
+        }
+    }
+
+    fn environment_error(&self, source: DecisionsConfigError) -> DecisionsConfigError {
+        DecisionsConfigError::Environment {
+            variable: self.base_url_env(),
+            source: Box::new(source),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -61,8 +123,11 @@ pub enum DecisionsConfigError {
         "invalid project config: decisions.{0} is global-only; projects may only disable features or logging and shorten log retention"
     )]
     ProjectOverride(&'static str),
-    #[error("TYPESAFE_BASE_URL environment override rejected: {0}")]
-    Environment(Box<DecisionsConfigError>),
+    #[error("{variable} environment override rejected: {source}")]
+    Environment {
+        variable: &'static str,
+        source: Box<DecisionsConfigError>,
+    },
 }
 
 fn invalid(field: &'static str, message: &'static str) -> DecisionsConfigError {
@@ -313,6 +378,7 @@ impl DecisionThresholds {
 #[serde(default, deny_unknown_fields)]
 pub struct RawDecisionsConfig {
     pub base_url: Option<String>,
+    pub protocol: Option<DecisionProtocol>,
     pub model: Option<String>,
     pub api_key_env: Option<String>,
     pub allow_remote: Option<bool>,
@@ -331,6 +397,7 @@ pub struct RawDecisionsConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecisionsConfig {
     pub base_url: Option<Url>,
+    pub protocol: DecisionProtocol,
     pub model: String,
     pub api_key_env: String,
     pub allow_remote: bool,
@@ -347,6 +414,7 @@ impl Default for DecisionsConfig {
     fn default() -> Self {
         Self {
             base_url: None,
+            protocol: DecisionProtocol::default(),
             model: DEFAULT_MODEL.into(),
             api_key_env: DEFAULT_API_KEY_ENV.into(),
             allow_remote: false,
@@ -372,6 +440,7 @@ impl RawDecisionsConfig {
         }
         replace!(
             base_url,
+            protocol,
             model,
             api_key_env,
             allow_remote,
@@ -399,6 +468,7 @@ impl RawDecisionsConfig {
         }
         for (field, present) in [
             ("base_url", overlay.base_url.is_some()),
+            ("protocol", overlay.protocol.is_some()),
             ("model", overlay.model.is_some()),
             ("api_key_env", overlay.api_key_env.is_some()),
             ("allow_remote", overlay.allow_remote.is_some()),
@@ -445,23 +515,27 @@ impl RawDecisionsConfig {
         }
         let allow_remote = self.allow_remote.unwrap_or(false);
         let allow_http = self.allow_http.unwrap_or(false);
+        let protocol = self.protocol.unwrap_or_default();
         let base_url = self
             .base_url
             .as_deref()
             .map(|configured| {
-                let configured = parse_base_url(configured, allow_remote, allow_http)?;
+                let configured = parse_base_url(configured, &protocol, allow_remote, allow_http)?;
                 base_url_override.map_or(Ok(configured), |value| {
-                    parse_base_url(value, allow_remote, allow_http)
-                        .map_err(|error| DecisionsConfigError::Environment(Box::new(error)))
+                    parse_base_url(value, &protocol, allow_remote, allow_http)
+                        .map_err(|error| protocol.environment_error(error))
                 })
             })
             .transpose()?;
         let config = DecisionsConfig {
             base_url,
-            model: self.model.unwrap_or_else(|| DEFAULT_MODEL.into()),
+            model: self
+                .model
+                .unwrap_or_else(|| protocol.default_model().into()),
             api_key_env: self
                 .api_key_env
-                .unwrap_or_else(|| DEFAULT_API_KEY_ENV.into()),
+                .unwrap_or_else(|| protocol.default_api_key_env().into()),
+            protocol,
             allow_remote,
             allow_http,
             timeout_ms: self.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS),
@@ -481,14 +555,9 @@ impl RawDecisionsConfig {
         if self.base_url.is_none() {
             return self.resolve(None);
         }
-        let base_url = env::var(BASE_URL_ENV)
-            .map(Some)
-            .or_else(|error| match error {
-                env::VarError::NotPresent => Ok(None),
-                env::VarError::NotUnicode(_) => Err(DecisionsConfigError::Environment(Box::new(
-                    invalid("base_url", "must be UTF-8"),
-                ))),
-            })?;
+        let protocol = self.protocol.clone().unwrap_or_default();
+        let base_url = crate::global_env_value(protocol.base_url_env())
+            .map_err(|_| protocol.environment_error(invalid("base_url", "must be UTF-8")))?;
         self.resolve(base_url.as_deref())
     }
 }
@@ -496,18 +565,27 @@ impl RawDecisionsConfig {
 impl DecisionsConfig {
     pub const FIELDS: &[ConfigField] = &[
         ConfigField {
+            name: "protocol",
+            ty: "string",
+            default: ConfigValue::Str("typesafe"),
+            min: None,
+            max: None,
+            env: None,
+            description: "Global-only decision wire protocol: `typesafe` or `openai`. Never inferred from the URL, model, or environment. Selecting a protocol does not enable decisions.",
+        },
+        ConfigField {
             name: "base_url",
             ty: "string",
             default: ConfigValue::Unset,
             min: None,
             max: None,
             env: None,
-            description: "Decision API base URL, such as `https://api.typesafe.ai`. Caudra appends `/v1/systemone` and keeps any path prefix. `TYPESAFE_BASE_URL` replaces a configured value. HTTPS required except for numeric loopback HTTP or explicit `allow_http` consent. No credentials, query, fragment, whitespace, or control characters.",
+            description: "Global-only decision API base URL. TypeSafe uses a root such as `https://api.typesafe.ai` and appends `/v1/systemone`; OpenAI uses a versioned base such as `https://api.openai.com/v1` and appends `/decisions`. Path prefixes are preserved; full endpoints are rejected. Only the selected protocol's `TYPESAFE_BASE_URL` or `OPENAI_BASE_URL`, from the process or global environment, replaces an explicitly configured base. Environment alone never enables decisions. HTTPS required except for numeric loopback HTTP or explicit `allow_http` consent. No credentials, query, fragment, whitespace, or control characters.",
         },
         ConfigField {
             name: "model",
             ty: "string",
-            default: ConfigValue::Str(DEFAULT_MODEL),
+            default: ConfigValue::Varies("`jev-latest` for typesafe; `gpt-6-luna` for openai"),
             min: None,
             max: None,
             env: None,
@@ -516,7 +594,9 @@ impl DecisionsConfig {
         ConfigField {
             name: "api_key_env",
             ty: "string",
-            default: ConfigValue::Str(DEFAULT_API_KEY_ENV),
+            default: ConfigValue::Varies(
+                "`TYPESAFE_API_KEY` for typesafe; `OPENAI_API_KEY` for openai",
+            ),
             min: None,
             max: None,
             env: None,
@@ -591,8 +671,9 @@ impl DecisionsConfig {
         self.base_url.as_ref().map(|base_url| {
             let mut endpoint = base_url.clone();
             endpoint.set_path(&format!(
-                "{}{SYSTEM_ONE_PATH}",
-                base_url.path().trim_end_matches('/')
+                "{}{}",
+                base_url.path().trim_end_matches('/'),
+                self.protocol.endpoint_path()
             ));
             endpoint
         })
@@ -600,7 +681,12 @@ impl DecisionsConfig {
 
     pub fn validate(&self) -> Result<(), DecisionsConfigError> {
         if let Some(base_url) = &self.base_url {
-            parse_base_url(base_url.as_str(), self.allow_remote, self.allow_http)?;
+            parse_base_url(
+                base_url.as_str(),
+                &self.protocol,
+                self.allow_remote,
+                self.allow_http,
+            )?;
         }
         let mut key = self.api_key_env.bytes();
         if !key
@@ -648,6 +734,7 @@ impl DecisionsConfig {
 
 fn parse_base_url(
     base_url: &str,
+    protocol: &DecisionProtocol,
     allow_remote: bool,
     allow_http: bool,
 ) -> Result<Url, DecisionsConfigError> {
@@ -669,8 +756,12 @@ fn parse_base_url(
         ),
         Err(_) => return Err(invalid("base_url", INVALID_BASE_URL_MESSAGE)),
     };
-    if url.path().trim_end_matches('/').ends_with(SYSTEM_ONE_PATH) {
-        return Err(invalid("base_url", FULL_ENDPOINT_MESSAGE));
+    if url
+        .path()
+        .trim_end_matches('/')
+        .ends_with(protocol.endpoint_path())
+    {
+        return Err(invalid("base_url", protocol.full_endpoint_message()));
     }
     if !is_loopback && !allow_remote {
         return Err(invalid(
@@ -690,8 +781,9 @@ fn parse_base_url(
 #[cfg(test)]
 mod tests {
     use super::{
-        DecisionsConfig, DecisionsConfigError, FULL_ENDPOINT_MESSAGE, FeatureMode,
-        INVALID_BASE_URL_MESSAGE, RawDecisionsConfig, invalid,
+        DecisionProtocol, DecisionsConfig, DecisionsConfigError, FULL_ENDPOINT_MESSAGE,
+        FeatureMode, INVALID_BASE_URL_MESSAGE, OPENAI_FULL_ENDPOINT_MESSAGE, RawDecisionsConfig,
+        invalid,
     };
     use crate::{ConfigError, RawConfig};
     use test_case::test_case;
@@ -709,10 +801,12 @@ mod tests {
     const REMOTE_HTTP_ENDPOINT: &str = "http://decisions.example.test:443/v1/systemone";
     const BASE_URL_SIZE_LIMIT: usize = 2048;
     const REMOVED_ENDPOINT_MESSAGE: &str = "unknown field `endpoint`, expected one of `base_url`";
+    const CUSTOM_MODEL: &str = "custom-model";
+    const CUSTOM_API_KEY_ENV: &str = "CUSTOM_DECISION_API_KEY";
 
     fn environment_error_field(error: DecisionsConfigError) -> Option<&'static str> {
         match error {
-            DecisionsConfigError::Environment(error) => match *error {
+            DecisionsConfigError::Environment { source, .. } => match *source {
                 DecisionsConfigError::Invalid { field, .. } => Some(field),
                 _ => None,
             },
@@ -744,6 +838,66 @@ mod tests {
                 .base_url
                 .is_none()
         );
+    }
+
+    #[test_case("", DecisionProtocol::TypeSafe, "jev-latest", "TYPESAFE_API_KEY"; "omitted")]
+    #[test_case("protocol = 'typesafe'", DecisionProtocol::TypeSafe, "jev-latest", "TYPESAFE_API_KEY"; "typesafe")]
+    #[test_case("protocol = 'openai'", DecisionProtocol::OpenAI, "gpt-6-luna", "OPENAI_API_KEY"; "openai")]
+    fn protocol_defaults_never_activate_decisions(
+        source: &str,
+        protocol: DecisionProtocol,
+        model: &str,
+        api_key_env: &str,
+    ) {
+        let raw: RawDecisionsConfig = toml::from_str(source).unwrap();
+        let config = raw.resolve(Some(REMOTE_BASE_URL)).unwrap();
+        assert_eq!(config.protocol, protocol);
+        assert_eq!(config.model, model);
+        assert_eq!(config.api_key_env, api_key_env);
+        assert!(config.endpoint().is_none());
+        assert!(!config.features.any_enabled());
+        assert!(!config.allow_remote);
+        assert!(!config.allow_http);
+        assert!(!config.log);
+        assert_eq!(serde_json::to_value(&protocol).unwrap(), protocol.as_str());
+    }
+
+    #[test_case("typesafe"; "typesafe")]
+    #[test_case("openai"; "openai")]
+    fn protocol_preserves_explicit_model_and_credential_name(protocol: &str) {
+        let raw: RawDecisionsConfig = toml::from_str(&format!(
+            "protocol = '{protocol}'\nmodel = '{CUSTOM_MODEL}'\napi_key_env = '{CUSTOM_API_KEY_ENV}'"
+        ))
+        .unwrap();
+        let config = raw.resolve(None).unwrap();
+        assert_eq!(config.model, CUSTOM_MODEL);
+        assert_eq!(config.api_key_env, CUSTOM_API_KEY_ENV);
+    }
+
+    #[test_case("unknown")]
+    #[test_case("OpenAI")]
+    #[test_case("type_safe")]
+    #[test_case("")]
+    fn unknown_protocols_are_rejected(protocol: &str) {
+        assert!(toml::from_str::<RawDecisionsConfig>(&format!("protocol = '{protocol}'")).is_err());
+    }
+
+    #[test_case("typesafe", "openai", "gpt-6-luna", "OPENAI_API_KEY")]
+    #[test_case("openai", "typesafe", "jev-latest", "TYPESAFE_API_KEY")]
+    fn global_protocol_overlay_resolves_omitted_defaults(
+        initial: &str,
+        overlay: &str,
+        model: &str,
+        api_key_env: &str,
+    ) {
+        let mut global: RawConfig =
+            toml::from_str(&format!("[decisions]\nprotocol = '{initial}'")).unwrap();
+        global
+            .merge_global(toml::from_str(&format!("[decisions]\nprotocol = '{overlay}'")).unwrap());
+        let config = global.into_config(false).unwrap().decisions;
+        assert_eq!(config.protocol.as_str(), overlay);
+        assert_eq!(config.model, model);
+        assert_eq!(config.api_key_env, api_key_env);
     }
 
     #[test_case("permission_advice", true, false)]
@@ -791,39 +945,108 @@ mod tests {
     #[test_case("https://decisions.example.test?api_key=secret", true, false; "query")]
     #[test_case("file:///etc/passwd", true, false; "unsupported_scheme")]
     fn base_url_policy(base_url: &str, allow_remote: bool, valid: bool) {
-        let raw = RawDecisionsConfig {
-            base_url: Some(base_url.into()),
-            allow_remote: Some(allow_remote),
-            ..RawDecisionsConfig::default()
-        };
-        assert_eq!(raw.resolve(None).is_ok(), valid);
+        for protocol in [DecisionProtocol::TypeSafe, DecisionProtocol::OpenAI] {
+            let raw = RawDecisionsConfig {
+                base_url: Some(base_url.into()),
+                protocol: Some(protocol),
+                allow_remote: Some(allow_remote),
+                ..RawDecisionsConfig::default()
+            };
+            assert_eq!(raw.resolve(None).is_ok(), valid);
+        }
     }
 
-    #[test_case(LOCAL_ENDPOINT; "origin")]
-    #[test_case(PREFIXED_ENDPOINT; "prefix")]
-    #[test_case("http://127.0.0.1:8080/typesafe/v1/systemone/"; "trailing_slash")]
-    fn base_url_is_not_the_full_endpoint(base_url: &str) {
+    #[test_case(DecisionProtocol::TypeSafe, LOCAL_ENDPOINT, FULL_ENDPOINT_MESSAGE; "origin")]
+    #[test_case(DecisionProtocol::TypeSafe, PREFIXED_ENDPOINT, FULL_ENDPOINT_MESSAGE; "prefix")]
+    #[test_case(DecisionProtocol::TypeSafe, "http://127.0.0.1:8080/typesafe/v1/systemone/", FULL_ENDPOINT_MESSAGE; "trailing_slash")]
+    #[test_case(DecisionProtocol::OpenAI, "https://api.openai.com/v1/decisions", OPENAI_FULL_ENDPOINT_MESSAGE; "openai")]
+    #[test_case(DecisionProtocol::OpenAI, "http://127.0.0.1/proxy/v1/decisions/", OPENAI_FULL_ENDPOINT_MESSAGE; "openai_prefix_trailing_slash")]
+    fn base_url_is_not_the_full_endpoint(
+        protocol: DecisionProtocol,
+        base_url: &str,
+        message: &'static str,
+    ) {
         let raw = RawDecisionsConfig {
             base_url: Some(base_url.into()),
+            protocol: Some(protocol),
+            allow_remote: Some(true),
             ..RawDecisionsConfig::default()
         };
-        assert_eq!(
-            raw.resolve(None),
-            Err(invalid("base_url", FULL_ENDPOINT_MESSAGE))
-        );
+        assert_eq!(raw.clone().resolve(None), Err(invalid("base_url", message)));
+        let mut override_raw = raw;
+        override_raw.base_url = Some(LOCAL_BASE_URL.into());
+        let error = override_raw.resolve(Some(base_url)).unwrap_err();
+        assert!(matches!(
+            error,
+            DecisionsConfigError::Environment { source, .. }
+                if *source == invalid("base_url", message)
+        ));
     }
 
-    #[test_case(LOCAL_BASE_URL, LOCAL_ENDPOINT; "origin")]
-    #[test_case("http://127.0.0.1:8000/", LOCAL_ENDPOINT; "origin_trailing_slash")]
-    #[test_case(PREFIXED_BASE_URL, PREFIXED_ENDPOINT; "prefix")]
-    #[test_case("http://127.0.0.1:8080/typesafe/", PREFIXED_ENDPOINT; "prefix_trailing_slash")]
-    #[test_case("https://api.typesafe.ai", "https://api.typesafe.ai/v1/systemone"; "hosted")]
-    fn endpoint_appends_the_system_one_path(base_url: &str, endpoint: &str) {
-        let config = DecisionsConfig {
-            base_url: Some(Url::parse(base_url).unwrap()),
-            ..DecisionsConfig::default()
+    #[test_case(DecisionProtocol::TypeSafe, LOCAL_BASE_URL, LOCAL_ENDPOINT; "origin")]
+    #[test_case(DecisionProtocol::TypeSafe, "http://127.0.0.1:8000/", LOCAL_ENDPOINT; "origin_trailing_slash")]
+    #[test_case(DecisionProtocol::TypeSafe, PREFIXED_BASE_URL, PREFIXED_ENDPOINT; "prefix")]
+    #[test_case(DecisionProtocol::TypeSafe, "http://127.0.0.1:8080/typesafe/", PREFIXED_ENDPOINT; "prefix_trailing_slash")]
+    #[test_case(DecisionProtocol::TypeSafe, "https://api.typesafe.ai", "https://api.typesafe.ai/v1/systemone"; "hosted")]
+    #[test_case(DecisionProtocol::OpenAI, "https://api.openai.com/v1", "https://api.openai.com/v1/decisions"; "openai")]
+    #[test_case(DecisionProtocol::OpenAI, "http://127.0.0.1:8000/proxy/v1///", "http://127.0.0.1:8000/proxy/v1/decisions"; "openai_prefix")]
+    #[test_case(DecisionProtocol::OpenAI, "http://[::1]:8000/v1/", "http://[::1]:8000/v1/decisions"; "openai_ipv6")]
+    #[test_case(DecisionProtocol::TypeSafe, "https://api.openai.com/v1", "https://api.openai.com/v1/v1/systemone"; "url_does_not_select_protocol")]
+    #[test_case(DecisionProtocol::OpenAI, "https://api.typesafe.ai", "https://api.typesafe.ai/decisions"; "url_does_not_change_protocol")]
+    fn endpoint_appends_the_protocol_path(
+        protocol: DecisionProtocol,
+        base_url: &str,
+        endpoint: &str,
+    ) {
+        let raw = RawDecisionsConfig {
+            base_url: Some(base_url.into()),
+            protocol: Some(protocol),
+            allow_remote: Some(true),
+            ..RawDecisionsConfig::default()
         };
-        assert_eq!(config.endpoint().unwrap().as_str(), endpoint);
+        for environment in [None, Some(base_url)] {
+            let config = raw.clone().resolve(environment).unwrap();
+            assert_eq!(config.endpoint().unwrap().as_str(), endpoint);
+        }
+    }
+
+    #[test_case(false, false, Some("allow_remote"); "no_consent")]
+    #[test_case(false, true, Some("allow_remote"); "only_http_consent")]
+    #[test_case(true, false, Some("allow_http"); "only_remote_consent")]
+    #[test_case(true, true, None; "both_consents")]
+    fn openai_remote_http_requires_both_consents(
+        allow_remote: bool,
+        allow_http: bool,
+        error_field: Option<&str>,
+    ) {
+        for environment in [None, Some(REMOTE_HTTP_BASE_URL)] {
+            let raw = RawDecisionsConfig {
+                protocol: Some(DecisionProtocol::OpenAI),
+                base_url: Some(if environment.is_some() {
+                    LOCAL_BASE_URL.into()
+                } else {
+                    REMOTE_HTTP_BASE_URL.into()
+                }),
+                allow_remote: Some(allow_remote),
+                allow_http: Some(allow_http),
+                ..RawDecisionsConfig::default()
+            };
+            let result = raw.resolve(environment);
+            match error_field {
+                Some(expected) => {
+                    let error = result.unwrap_err();
+                    let field = match error {
+                        DecisionsConfigError::Invalid { field, .. } => Some(field),
+                        error => environment_error_field(error),
+                    };
+                    assert_eq!(field, Some(expected));
+                }
+                None => assert_eq!(
+                    result.unwrap().endpoint().unwrap().as_str(),
+                    format!("{REMOTE_HTTP_BASE_URL}/decisions")
+                ),
+            }
+        }
     }
 
     #[test_case(REMOTE_HTTP_BASE_URL; "dns")]
@@ -899,16 +1122,19 @@ mod tests {
     #[test_case("/v1/systemone"; "relative")]
     #[test_case(""; "empty")]
     fn http_opt_in_does_not_relax_url_validation(base_url: &str) {
-        let raw = RawDecisionsConfig {
-            base_url: Some(base_url.into()),
-            allow_remote: Some(true),
-            allow_http: Some(true),
-            ..RawDecisionsConfig::default()
-        };
-        assert_eq!(
-            raw.resolve(None),
-            Err(invalid("base_url", INVALID_BASE_URL_MESSAGE))
-        );
+        for protocol in [DecisionProtocol::TypeSafe, DecisionProtocol::OpenAI] {
+            let raw = RawDecisionsConfig {
+                base_url: Some(base_url.into()),
+                protocol: Some(protocol),
+                allow_remote: Some(true),
+                allow_http: Some(true),
+                ..RawDecisionsConfig::default()
+            };
+            assert_eq!(
+                raw.resolve(None),
+                Err(invalid("base_url", INVALID_BASE_URL_MESSAGE))
+            );
+        }
     }
 
     #[test_case(BASE_URL_SIZE_LIMIT, true; "at_limit")]
@@ -1036,7 +1262,6 @@ mod tests {
     #[test_case("https://user:secret@decisions.example.test"; "credentials")]
     #[test_case("https://decisions.example.test/#secret"; "fragment")]
     #[test_case("https://decisions.example.test/?api_key=secret"; "query")]
-    #[test_case("https://decisions.example.test/v1/systemone"; "full_endpoint")]
     #[test_case("http://user:secret@decisions.example.test"; "http_credentials")]
     #[test_case("http://@decisions.example.test"; "http_empty_userinfo")]
     #[test_case("http://decisions.example.test/#secret"; "http_fragment")]
@@ -1045,21 +1270,27 @@ mod tests {
     #[test_case("http://decisions.example.test/ "; "http_whitespace")]
     #[test_case(""; "empty")]
     fn environment_override_cannot_smuggle_url_components(base_url: &str) {
-        let raw = RawDecisionsConfig {
-            base_url: Some(LOCAL_BASE_URL.into()),
-            allow_remote: Some(true),
-            allow_http: Some(true),
-            ..RawDecisionsConfig::default()
-        };
-        assert_eq!(
-            environment_error_field(raw.resolve(Some(base_url)).unwrap_err()),
-            Some("base_url")
-        );
+        for protocol in [DecisionProtocol::TypeSafe, DecisionProtocol::OpenAI] {
+            let raw = RawDecisionsConfig {
+                base_url: Some(LOCAL_BASE_URL.into()),
+                protocol: Some(protocol),
+                allow_remote: Some(true),
+                allow_http: Some(true),
+                ..RawDecisionsConfig::default()
+            };
+            assert_eq!(
+                environment_error_field(raw.resolve(Some(base_url)).unwrap_err()),
+                Some("base_url")
+            );
+        }
     }
 
-    #[test_case("http://127.0.0.1//other.example.test/predict", None, "127.0.0.1", "//other.example.test/predict/v1/systemone"; "configured")]
-    #[test_case(LOCAL_BASE_URL, Some("http://127.0.0.2:8001//other.example.test"), "127.0.0.2", "//other.example.test/v1/systemone"; "environment")]
+    #[test_case(DecisionProtocol::TypeSafe, "http://127.0.0.1//other.example.test/predict", None, "127.0.0.1", "//other.example.test/predict/v1/systemone"; "configured")]
+    #[test_case(DecisionProtocol::TypeSafe, LOCAL_BASE_URL, Some("http://127.0.0.2:8001//other.example.test"), "127.0.0.2", "//other.example.test/v1/systemone"; "environment")]
+    #[test_case(DecisionProtocol::OpenAI, "http://127.0.0.1//other.example.test/v1", None, "127.0.0.1", "//other.example.test/v1/decisions"; "openai_configured")]
+    #[test_case(DecisionProtocol::OpenAI, LOCAL_BASE_URL, Some("http://127.0.0.2:8001//other.example.test/v1"), "127.0.0.2", "//other.example.test/v1/decisions"; "openai_environment")]
     fn double_slash_paths_never_reinterpret_the_authority(
+        protocol: DecisionProtocol,
         base_url: &str,
         environment: Option<&str>,
         host: &str,
@@ -1067,6 +1298,7 @@ mod tests {
     ) {
         let raw = RawDecisionsConfig {
             base_url: Some(base_url.into()),
+            protocol: Some(protocol),
             ..RawDecisionsConfig::default()
         };
         let endpoint = raw.resolve(environment).unwrap().endpoint().unwrap();
@@ -1075,6 +1307,8 @@ mod tests {
     }
 
     #[test_case("base_url = 'https://decisions.example.test'", "base_url")]
+    #[test_case("protocol = 'typesafe'", "protocol")]
+    #[test_case("protocol = 'openai'", "protocol")]
     #[test_case("allow_remote = true", "allow_remote")]
     #[test_case("allow_http = true", "allow_http")]
     #[test_case("allow_http = false", "allow_http")]

@@ -986,7 +986,7 @@ fn plain_text(lines: &[Line<'static>]) -> String {
 mod tests {
     use std::sync::Arc;
 
-    use caudra_config::decisions::{DecisionFeatures, FeatureMode};
+    use caudra_config::decisions::{DecisionFeatures, DecisionProtocol, FeatureMode};
     use caudra_storage::decision_log::{
         DecisionEffect, DecisionLabel, DecisionRecord, EndpointKind,
     };
@@ -1255,6 +1255,24 @@ mod tests {
         assert!(screen.contains(kept_row), "{screen}");
         assert!(overview.contains(ENGINE_CONFIGURED), "{overview}");
         assert!(overview.contains(MODEL), "{overview}");
+    }
+
+    #[test_case(DecisionProtocol::TypeSafe, "typesafe"; "typesafe")]
+    #[test_case(DecisionProtocol::OpenAI, "openai"; "openai")]
+    fn the_overview_shows_the_protocol(protocol: DecisionProtocol, expected: &str) {
+        let mut fixture = Fixture::new(true);
+        fixture.config.protocol = protocol;
+        let mut modal = opened(DecisionsFetchState::Loading);
+
+        let screen = draw(&mut modal, &fixture, WIDE, TALL);
+
+        assert!(
+            screen.lines().any(|line| {
+                let mut fields = line.split_whitespace();
+                fields.any(|field| field == "Protocol") && fields.next() == Some(expected)
+            }),
+            "{screen}"
+        );
     }
 
     #[test_case(DecisionsFetchState::Loading, READING; "loading")]

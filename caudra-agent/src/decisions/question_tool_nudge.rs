@@ -163,6 +163,7 @@ mod tests {
 
     #[test_case(DecisionError::Timeout; "timeout")]
     #[test_case(DecisionError::Unreachable; "unreachable")]
+    #[test_case(DecisionError::Refused; "refused")]
     #[test_case(DecisionError::Invalid(ERROR); "invalid")]
     #[test_case(DecisionError::Rejected(ERROR); "rejected")]
     #[test_case(DecisionError::Http { status: 503 }; "http")]

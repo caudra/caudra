@@ -94,6 +94,7 @@ pub(super) fn overview(ctx: &DecisionsModalContext, theme: &Theme) -> Vec<Line<'
         }
         None => lines.push(field("Status", ENGINE_OFF, theme)),
     }
+    lines.push(field("Protocol", config.protocol.as_str(), theme));
     lines.push(field(
         "Model",
         escape_terminal_controls(&config.model),

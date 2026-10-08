@@ -50,6 +50,7 @@ const DECISION_TIMEOUT: &str = "workflow decision deadline exceeded";
 const DECISION_FAILED: &str = "workflow decision engine failed";
 const DECISION_INVALID: &str = "workflow decision response was invalid";
 const DECISION_REJECTED: &str = "workflow decision request was rejected";
+const DECISION_REFUSED: &str = "workflow decision was refused by the engine";
 
 /// What every attempt shares with the runtime that launched it.
 #[derive(Clone)]
@@ -1166,6 +1167,7 @@ fn decision_failure(error: DecisionError) -> HostError {
         DecisionError::Timeout => DECISION_TIMEOUT,
         DecisionError::Invalid(_) => DECISION_INVALID,
         DecisionError::Rejected(_) => DECISION_REJECTED,
+        DecisionError::Refused => DECISION_REFUSED,
     };
     HostError::Failed(message.to_owned())
 }

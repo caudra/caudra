@@ -2,6 +2,7 @@
 
 pub mod client;
 pub mod engine;
+mod openai;
 pub mod question_set;
 pub mod wire;
 

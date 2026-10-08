@@ -877,22 +877,33 @@ version = 1
 # The typed decision engine. It needs `decision_engine = true` under
 # [experimental]. Connection settings and thresholds are global-only.
 
-# Decision API base URL, such as `https://api.typesafe.ai`. Caudra appends
-# `/v1/systemone` and keeps any path prefix. `TYPESAFE_BASE_URL` replaces a
-# configured value. HTTPS required except for numeric loopback HTTP or explicit
-# `allow_http` consent. No credentials, query, fragment, whitespace, or control
-# characters.
+# Global-only decision wire protocol: `typesafe` or `openai`. Never inferred
+# from the URL, model, or environment. Selecting a protocol does not enable
+# decisions.
+# Type: string.
+# protocol = "typesafe"
+
+# Global-only decision API base URL. TypeSafe uses a root such as
+# `https://api.typesafe.ai` and appends `/v1/systemone`; OpenAI uses a
+# versioned base such as `https://api.openai.com/v1` and appends `/decisions`.
+# Path prefixes are preserved; full endpoints are rejected. Only the selected
+# protocol's `TYPESAFE_BASE_URL` or `OPENAI_BASE_URL`, from the process or
+# global environment, replaces an explicitly configured base. Environment alone
+# never enables decisions. HTTPS required except for numeric loopback HTTP or
+# explicit `allow_http` consent. No credentials, query, fragment, whitespace,
+# or control characters.
 # Type: string. Default: unset.
 # base_url = <string>
 
 # Decision model identifier, nonblank and without control characters.
-# Type: string.
-# model = "jev-latest"
+# Type: string. Default: `jev-latest` for typesafe; `gpt-6-luna` for openai.
+# model = <string>
 
 # Environment variable containing the optional credential, never the credential
 # itself. Project environment values are excluded.
-# Type: string.
-# api_key_env = "TYPESAFE_API_KEY"
+# Type: string. Default: `TYPESAFE_API_KEY` for typesafe; `OPENAI_API_KEY` for
+# openai.
+# api_key_env = <string>
 
 # Explicit global consent to send decision context to a non-loopback endpoint.
 # Type: boolean.

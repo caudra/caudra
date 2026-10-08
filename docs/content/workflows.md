@@ -195,7 +195,7 @@ Precedence runs from most specific configuration to least. A `subagent_model` pi
 
 ### Typed decisions
 
-`decide()` calls the System One endpoint under the `base_url` in your global [`decisions` configuration](/docs/configuration/#decisions) and needs `experimental.decision_engine` as well as `experimental.workflows`. With the engine switch on, it is available even when passive decision features are configured off. YOLO bypasses permission-related decision checks, while explicit `decide()` calls and unrelated passive features still follow their configuration. A non-loopback base URL requires `allow_remote = true`. Calls go directly to that endpoint without ambient proxies or HTTP redirects.
+`decide()` calls the endpoint selected by `protocol` and `base_url` in your global [`decisions` configuration](/docs/configuration/#decisions) and needs `experimental.decision_engine` as well as `experimental.workflows`. The default `typesafe` protocol calls System One. `openai` calls OpenAI Decisions or a compatible ninfer server. With the engine switch on, it is available even when passive decision features are configured off. YOLO bypasses permission-related decision checks, while explicit `decide()` calls and unrelated passive features still follow their configuration. A non-loopback base URL requires `allow_remote = true`. Calls go directly to that endpoint without ambient proxies or HTTP redirects. Both protocols send text only.
 
 ```rhai
 let result = decide(
@@ -212,9 +212,11 @@ complete(answer.output);
 
 Questions are keyed by ID. Supported types are `noul`, `choice`, and `score`. A `noul` answer holds only a probability, in `noul`. A choice needs a map from each option name to its description, or to `()` for none. A score needs an ordered array of 2 to 10 levels. Choice and score answers also carry `confidence`. Calls allow at most 64 questions, 255 choices per question, and 512 options in total.
 
+The OpenAI protocol maps `noul` questions to predicates and normalizes their answers back to the same `noul` probability. The script-facing result stays `#{ answers, model }`, so switching protocols does not change the example above. Native boolean questions retain their true and false criteria in the predicate instruction text. OpenAI choices require at least two options.
+
 The optional third argument accepts `model` and `timeout_ms`. A positive timeout is capped at the configured decision deadline. States are redacted and bounded to 1,500 serialized bytes, with depth and node limits. Oversized states are rejected rather than silently shortened. Dynamic question descriptions are also redacted. A question is rejected if redaction would change an option name, a score level, or a question ID. Redaction is best effort, so keep credentials and sensitive material out of both states and questions.
 
-Endpoint errors and timeouts are catchable Rhai errors. A successful result is saved before the script continues and replayed on resume without another endpoint call. Calls that failed or were interrupted before their result was committed can run again. The workflow journal omits the decision request body. The separate opt-in decision log stores the redacted state that was sent, questions, and answers. Workflow effects remain `none` there, even if the script acts on an answer.
+Endpoint errors, refusals, and timeouts are catchable Rhai errors. A refused answer fails the whole evaluation without returning partial answers. A successful result is saved before the script continues and replayed on resume without another endpoint call. Calls that failed or were interrupted before their result was committed can run again. The workflow journal omits the decision request body. The separate opt-in decision log stores the redacted state that was sent, questions, and answers. Workflow effects remain `none` there, even if the script acts on an answer.
 
 While the engine switch is off, a new `decide()` call raises a catchable error before anything reaches the journal. A decision the run already recorded still replays as its saved value, so resuming an older run works.
 

@@ -205,9 +205,11 @@ fn plugins_about() -> String {
 mod tests {
     use super::document;
     use crate::config_file::GlobalConfigFile;
+    use crate::decisions::DecisionProtocol;
     use crate::example::Render;
     use crate::experimental::FeatureFlags;
     use crate::{Config, RawConfig};
+    use test_case::test_case;
     use toml::Value;
 
     const MODEL: &str = "provider/model";
@@ -272,6 +274,31 @@ mod tests {
             &defaults.decisions,
         );
         assert_eq!(format!("{stated:?}"), format!("{built_in:?}"));
+    }
+
+    #[test_case(DecisionProtocol::TypeSafe, "jev-latest", "TYPESAFE_API_KEY"; "typesafe")]
+    #[test_case(DecisionProtocol::OpenAI, "gpt-6-luna", "OPENAI_API_KEY"; "openai")]
+    fn reference_does_not_pin_protocol_dependent_defaults(
+        protocol: DecisionProtocol,
+        model: &str,
+        api_key_env: &str,
+    ) {
+        let live = document().render(Render::Live { defaults: true });
+        let mut example: Value = toml::from_str(&live).unwrap();
+        let decisions = example["decisions"].as_table_mut().unwrap();
+        assert!(!decisions.contains_key("model"));
+        assert!(!decisions.contains_key("api_key_env"));
+        decisions.insert("protocol".into(), Value::String(protocol.as_str().into()));
+        let config = GlobalConfigFile::parse(&toml::to_string(&example).unwrap())
+            .unwrap()
+            .settings
+            .into_config(false)
+            .unwrap();
+        assert_eq!(config.decisions.protocol, protocol);
+        assert_eq!(config.decisions.model, model);
+        assert_eq!(config.decisions.api_key_env, api_key_env);
+        assert!(config.decisions.endpoint().is_none());
+        assert!(!config.decisions.features.any_enabled());
     }
 
     #[test]

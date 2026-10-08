@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use futures_lite::future;
 use thiserror::Error;
 
-use crate::question_set::{bounded_json, content_hash};
+use crate::question_set::{bounded_json, request_hash};
 use crate::wire::{DecisionRequest, DecisionResponse, MAX_RESPONSE_BYTES};
 
 pub const MAX_CACHE_ENTRIES: usize = 256;
@@ -21,6 +21,8 @@ pub enum DecisionError {
     Timeout,
     #[error("decision engine returned HTTP {status}")]
     Http { status: u16 },
+    #[error("decision engine refused the request")]
+    Refused,
     #[error("invalid decision response: {0}")]
     Invalid(&'static str),
     #[error("decision request rejected: {0}")]
@@ -83,7 +85,7 @@ impl<E: DecisionEngine> DecisionEngine for CachedDecisionEngine<E> {
     ) -> Result<DecisionResponse, DecisionError> {
         check_deadline(deadline)?;
         request.validate()?;
-        let key = content_hash(request)?;
+        let key = request_hash(request)?;
         check_deadline(deadline)?;
         let cached = self
             .cache

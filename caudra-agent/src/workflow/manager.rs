@@ -1286,6 +1286,7 @@ complete(result);
     #[test_case(Some(DecisionError::Unreachable); "unreachable")]
     #[test_case(Some(DecisionError::Timeout); "timeout")]
     #[test_case(Some(DecisionError::Invalid(FAILURE)); "invalid")]
+    #[test_case(Some(DecisionError::Refused); "refused")]
     fn workflow_decision_failure_is_catchable(error: Option<DecisionError>) {
         smol::block_on(async {
             let fixture = Fixture::new();

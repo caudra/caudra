@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 
 use async_io::Timer;
 use caudra_config::decisions::{
-    DecisionFeature as FeatureSetting, DecisionFeatures, DecisionThresholds, DecisionsConfig,
-    DecisionsConfigError, FeatureMode,
+    DecisionFeature as FeatureSetting, DecisionFeatures, DecisionProtocol, DecisionThresholds,
+    DecisionsConfig, DecisionsConfigError, FeatureMode,
 };
 use caudra_decision::{
     CachedDecisionEngine, DecisionEngine, DecisionError, DecisionRequest, DecisionResponse,
@@ -31,7 +31,7 @@ use caudra_storage::sessions::SessionError;
 use caudra_storage::usage_ledger::{LedgerPurpose, TurnUsage, UsageLedger};
 use caudra_storage::{StateDir, now_epoch};
 use futures_lite::future;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use thiserror::Error;
 use url::{Host, Url};
 
@@ -46,6 +46,7 @@ const STATE_REJECTED: &str = "state exceeds the bounded redacted context";
 const DEADLINE_REJECTED: &str = "timeout exceeds the supported clock range";
 const USAGE_PROVIDER: &str = "decision";
 const EFFECT_RECORD_TIMEOUT: Duration = Duration::from_secs(5);
+const PROTOCOL_META: &str = "protocol";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecisionFeature {
@@ -265,7 +266,14 @@ impl Decisions {
             .endpoint()
             .map(|endpoint| {
                 let api_key = config.api_key()?;
-                let client = HttpDecisionClient::new(endpoint.as_str(), api_key.as_deref())?;
+                let client = match config.protocol {
+                    DecisionProtocol::TypeSafe => {
+                        HttpDecisionClient::new(endpoint.as_str(), api_key.as_deref())
+                    }
+                    DecisionProtocol::OpenAI => {
+                        HttpDecisionClient::openai(endpoint.as_str(), api_key.as_deref())
+                    }
+                }?;
                 Ok::<_, DecisionsError>(Arc::new(CachedDecisionEngine::new(client, CACHE_ENTRIES))
                     as Arc<dyn DecisionEngine>)
             })
@@ -451,7 +459,8 @@ impl Decisions {
                 .status
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            status.reachable = Some(result.is_ok());
+            status.reachable =
+                Some(result.is_ok() || matches!(result, Err(DecisionError::Refused)));
             status.last_error = result.as_ref().err().map(error_kind);
         }
         caudra_otel::emit::decision(
@@ -538,8 +547,7 @@ impl Decisions {
             latency_ms,
             mode: mode_name(self.mode(feature)).into(),
             effect: DecisionEffect::None,
-            meta: DecisionState::new(&context.meta)
-                .map_or(Value::Null, |meta| meta.value().clone()),
+            meta: record_meta(&context.meta, &self.config().protocol),
         };
         let writer = log.clone();
         let state_dir = self.0.state_dir.clone();
@@ -695,6 +703,30 @@ fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+fn record_meta(context: &Value, protocol: &DecisionProtocol) -> Value {
+    let mut meta = Map::from_iter([(PROTOCOL_META.into(), json!(protocol.as_str()))]);
+    let Ok(context) = DecisionState::new(context) else {
+        return Value::Object(meta);
+    };
+    if let Some(fields) = context.value().as_object() {
+        for (key, value) in fields {
+            if key == PROTOCOL_META {
+                continue;
+            }
+            meta.insert(key.clone(), value.clone());
+            if DecisionState::new(&Value::Object(meta.clone())).is_err() {
+                meta.remove(key);
+            }
+        }
+    } else if !context.value().is_null() {
+        meta.insert("context".into(), context.value().clone());
+        if DecisionState::new(&Value::Object(meta.clone())).is_err() {
+            meta.remove("context");
+        }
+    }
+    Value::Object(meta)
+}
+
 fn mode_name(mode: &FeatureMode) -> &'static str {
     match mode {
         FeatureMode::Off => "off",
@@ -711,20 +743,24 @@ fn error_kind(error: &DecisionError) -> &'static str {
         DecisionError::Http { .. } => "http",
         DecisionError::Invalid(_) => "invalid",
         DecisionError::Rejected(_) => "rejected",
+        DecisionError::Refused => "refused",
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
-    use std::time::Instant;
+    use std::net::TcpListener;
+    use std::sync::{Arc, LazyLock, Mutex};
+    use std::time::{Duration, Instant};
 
     use std::collections::BTreeSet;
 
+    use async_io::{Async, Timer};
     use async_trait::async_trait;
     use caudra_config::decisions::{
-        DecisionFeatures, DecisionThresholds, DecisionsConfig, FeatureMode,
+        DecisionFeatures, DecisionProtocol, DecisionThresholds, DecisionsConfig, FeatureMode,
     };
+    use caudra_decision::wire::MAX_REQUEST_BYTES;
     use caudra_decision::{
         Answer, DecisionEngine, DecisionError, DecisionRequest, DecisionResponse, NoulAnswer,
         QuestionSet, Usage,
@@ -733,14 +769,18 @@ mod tests {
         DecisionEffect, DecisionFilter, DecisionLabel, DecisionLog, StatsThresholds,
     };
     use caudra_storage::id::CaudraId;
+    use caudra_storage::usage_ledger::UsageLedger;
     use caudra_storage::{StateDir, now_epoch};
     use futures_lite::future;
+    use futures_lite::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use serde_json::{Value, json};
     use test_case::test_case;
 
+    use super::state::MAX_STATE_BYTES;
     use super::{
-        DecisionContext, DecisionFeature, Decisions, DecisionsError, PermissionAction,
-        PermissionPurpose, STATE_REJECTED, stats_thresholds,
+        DecisionContext, DecisionFeature, Decisions, DecisionsError, PROTOCOL_META,
+        PermissionAction, PermissionPurpose, STATE_REJECTED, questions, record_meta,
+        stats_thresholds,
     };
 
     const SECRET: &str = "never-store-this-credential";
@@ -751,6 +791,19 @@ mod tests {
     const TEST_TIMEOUT_MS: u64 = 10;
     const TEST_NORMAL_TIMEOUT_MS: u64 = 5_000;
     const LABEL_SOURCE: &str = "user";
+    const HTTP_TEST_TIMEOUT: Duration = Duration::from_secs(15);
+    const HTTP_TEST_PATH: &str = "POST /v1/decisions HTTP/1.1\r\n";
+    const HTTP_TEST_TOKENS: u64 = 17;
+    const HTTP_TEST_CACHED_TOKENS: u64 = 5;
+    const REFUSED_ERROR: &str = "refused";
+    const HTTP_TEST_CREDENTIAL_ENV: &str = "CAUDRA_DECISION_TEST_NO_CREDENTIAL";
+    const HTTP_TEST_TIMEOUT_MESSAGE: &str = "decision HTTP integration test timed out";
+    static CHOICE_SET: LazyLock<Option<QuestionSet>> = LazyLock::new(|| {
+        Some(QuestionSet::new("routing", serde_json::from_value(json!({
+            "tool": {"type": "choice", "instructions": {"question": "Which tool fits?"}, "criteria": {"candidate_0": "Reads files", "none": "No match"}},
+            "skill": {"type": "choice", "instructions": "Which skill fits?", "criteria": {"z_skill": "Best match", "a_skill": "Weaker match", "none": "No match"}}
+        })).unwrap()).unwrap())
+    });
 
     enum Behavior {
         Answer(f64),
@@ -817,6 +870,233 @@ mod tests {
         config.features.permission_advice = FeatureMode::Advise;
         config.features.auto_screening = FeatureMode::Enforce;
         config
+    }
+
+    #[test_case(DecisionProtocol::TypeSafe)]
+    #[test_case(DecisionProtocol::OpenAI)]
+    fn protocol_metadata_is_host_owned_redacted_and_bounded(protocol: DecisionProtocol) {
+        let context = json!({PROTOCOL_META: "forged", "api_key": SECRET, "feature_field": true});
+        let meta = record_meta(&context, &protocol);
+        assert_eq!(meta[PROTOCOL_META], protocol.as_str());
+        assert_eq!(meta["feature_field"], true);
+        assert!(!meta.to_string().contains(SECRET));
+        let context = json!({"large": "x".repeat(MAX_STATE_BYTES - 12)});
+        let meta = record_meta(&context, &protocol);
+        assert_eq!(meta[PROTOCOL_META], protocol.as_str());
+        assert!(meta.to_string().len() <= MAX_STATE_BYTES);
+        assert!(super::DecisionState::new(&meta).is_ok());
+    }
+
+    #[test_case(FeatureMode::Shadow, false; "shadow")]
+    #[test_case(FeatureMode::Enforce, true; "enforce")]
+    fn refusal_is_logged_and_auto_fails_closed(mode: FeatureMode, escalates: bool) {
+        smol::block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let state_dir = StateDir::from_path(root.path().into());
+            let mut config = config(true);
+            config.protocol = DecisionProtocol::OpenAI;
+            config.features.auto_screening = mode;
+            let service = Decisions::with_engine(
+                config,
+                &state_dir,
+                FakeEngine {
+                    requests: Arc::new(Mutex::new(Vec::new())),
+                    behavior: Behavior::Error(DecisionError::Refused),
+                },
+            )
+            .unwrap();
+            let result = service
+                .permission(
+                    PermissionPurpose::AutoScreening,
+                    &json!({"command": "pwd"}),
+                    &DecisionContext::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.evaluation.result, Err(DecisionError::Refused));
+            assert_eq!(
+                matches!(result.action, Some(PermissionAction::Escalate(_))),
+                escalates
+            );
+            assert_eq!(service.status().last_error, Some(REFUSED_ERROR));
+            assert_eq!(service.status().reachable, Some(true));
+            let log = DecisionLog::open_read_only(&state_dir).unwrap().unwrap();
+            let rows = log.recent(&DecisionFilter::default(), 1).unwrap();
+            assert_eq!(rows[0].record.error.as_deref(), Some(REFUSED_ERROR));
+            assert!(rows[0].record.answers.is_none());
+            assert_eq!(rows[0].record.meta[PROTOCOL_META], "openai");
+        });
+    }
+
+    async fn serve_openai(listener: Async<TcpListener>) {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert_eq!(line, HTTP_TEST_PATH);
+        let mut length = 0;
+        loop {
+            line.clear();
+            assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+            if line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                length = value.trim().parse().unwrap();
+            }
+        }
+        assert!(length <= MAX_REQUEST_BYTES);
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).await.unwrap();
+        let request: Value = serde_json::from_slice(&body).unwrap();
+        assert!(request["input"].is_string());
+        assert!(request.get("state").is_none());
+        let answers: Vec<_> = request["questions"].as_array().unwrap().iter().map(|question| {
+            assert!(question["instructions"].is_string());
+            assert!(question.get("criteria").is_none());
+            let name = &question["name"];
+            match question["type"].as_str().unwrap() {
+                "predicate" => json!({"name": name, "type": "predicate", "probability": 0.0}),
+                "choice" => {
+                    let choices = question["choices"].as_array().unwrap();
+                    let probabilities: Vec<_> = choices.iter().enumerate().map(|(index, choice)| json!({"value": choice["value"], "probability": if index == 0 {1.0} else {0.0}})).collect();
+                    json!({"name": name, "type": "choice", "choice": choices[0]["value"], "confidence": 1.0, "probabilities": probabilities})
+                }
+                "score" => {
+                    let probabilities: Vec<_> = question["levels"].as_array().unwrap().iter().enumerate().map(|(index, level)| {
+                        json!({"value": index, "label": level["label"], "probability": if index == 0 {1.0} else {0.0}})
+                    }).collect();
+                    json!({"name": name, "type": "score", "score": 0.0, "confidence": 1.0, "probabilities": probabilities})
+                }
+                kind => panic!("unexpected built-in question type: {kind}"),
+            }
+        }).collect();
+        let response = json!({"model": request["model"], "answers": answers, "usage": {"input_tokens": HTTP_TEST_TOKENS, "output_tokens": 0, "total_tokens": HTTP_TEST_TOKENS, "input_tokens_details": {"cached_tokens": HTTP_TEST_CACHED_TOKENS, "cache_write_tokens": 0}, "output_tokens_details": {"reasoning_tokens": 0}}}).to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+            response.len()
+        );
+        reader
+            .get_mut()
+            .write_all(response.as_bytes())
+            .await
+            .unwrap();
+    }
+
+    #[test_case(&questions::PERMISSION; "permission")]
+    #[test_case(&questions::SHELL_DURATION; "duration")]
+    #[test_case(&questions::SHELL_EFFECT; "shell_effect")]
+    #[test_case(&questions::CONTENT; "content")]
+    #[test_case(&questions::GOAL; "goal")]
+    #[test_case(&questions::SUBAGENT; "subagent")]
+    #[test_case(&questions::QUESTION_TOOL_NUDGE; "question_tool")]
+    #[test_case(&CHOICE_SET; "routing")]
+    fn openai_builtins_use_native_http_and_preserve_logs_and_cache(
+        set: &LazyLock<Option<QuestionSet>>,
+    ) {
+        smol::block_on(future::race(
+            async {
+                let listener = Async::new(TcpListener::bind("127.0.0.1:0").unwrap()).unwrap();
+                let root = tempfile::tempdir().unwrap();
+                let state_dir = StateDir::from_path(root.path().into());
+                let mut config = config(true);
+                config.protocol = DecisionProtocol::OpenAI;
+                config.base_url = Some(
+                    format!("http://{}/v1", listener.get_ref().local_addr().unwrap())
+                        .parse()
+                        .unwrap(),
+                );
+                config.api_key_env = HTTP_TEST_CREDENTIAL_ENV.into();
+                config.features = Default::default();
+                let session = CaudraId::generate();
+                let service = Decisions::new(config, &state_dir)
+                    .unwrap()
+                    .for_session(session);
+                let context = DecisionContext {
+                    project: Some("/test/project".into()),
+                    meta: json!({"api_key": SECRET}),
+                };
+                let state = json!({"command": "pwd"});
+                let set = set.as_ref().unwrap();
+                let (_, outcome) = future::zip(
+                    serve_openai(listener),
+                    service.evaluate(DecisionFeature::Workflow, &state, set, &context),
+                )
+                .await;
+                let outcome = outcome.unwrap();
+                let response = outcome.result.unwrap();
+                assert!(!response.cache_hit);
+                assert!(response.answers.keys().eq(set.questions().keys()));
+                for (name, answer) in &response.answers {
+                    if let Answer::Choice(answer) = answer {
+                        let criteria = set.questions()[name]
+                            .criteria
+                            .as_ref()
+                            .unwrap()
+                            .as_object()
+                            .unwrap();
+                        assert_eq!(&answer.choice, criteria.keys().next().unwrap());
+                    }
+                }
+                let expected = response
+                    .answers
+                    .iter()
+                    .map(|(name, answer)| {
+                        (
+                            name.clone(),
+                            match answer {
+                                Answer::Noul(_) => json!(false),
+                                Answer::Choice(answer) => json!(answer.choice),
+                                Answer::Score(_) => json!(0),
+                            },
+                        )
+                    })
+                    .collect();
+                service
+                    .attach_label(
+                        outcome.receipt.as_ref().unwrap(),
+                        &DecisionLabel {
+                            expected: Value::Object(expected),
+                            source: LABEL_SOURCE.into(),
+                            timestamp: now_epoch(),
+                            meta: Value::Null,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let cached = service
+                    .evaluate(DecisionFeature::Workflow, &state, set, &context)
+                    .await
+                    .unwrap()
+                    .result
+                    .unwrap();
+                assert!(cached.cache_hit);
+                assert_eq!(cached.answers, response.answers);
+                let ledger = UsageLedger::open(&state_dir).unwrap().lifetime().unwrap();
+                assert_eq!(ledger.input, HTTP_TEST_TOKENS);
+                assert_eq!(ledger.output, 0);
+                let log = DecisionLog::open_read_only(&state_dir).unwrap().unwrap();
+                let rows = log.recent(&DecisionFilter::default(), 2).unwrap();
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows.iter().filter(|row| row.label.is_some()).count(), 1);
+                for row in rows {
+                    assert_eq!(row.record.session, Some(session.to_string()));
+                    assert_eq!(row.record.project, context.project);
+                    assert_eq!(row.record.meta[PROTOCOL_META], "openai");
+                    assert!(!row.record.meta.to_string().contains(SECRET));
+                    assert_eq!(
+                        row.record.answers,
+                        Some(serde_json::to_value(&response.answers).unwrap())
+                    );
+                }
+            },
+            async {
+                Timer::after(HTTP_TEST_TIMEOUT).await;
+                panic!("{HTTP_TEST_TIMEOUT_MESSAGE}");
+            },
+        ));
     }
 
     #[test]

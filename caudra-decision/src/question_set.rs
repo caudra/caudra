@@ -3,11 +3,13 @@ use std::io::{self, Write};
 
 use serde::Serialize;
 use serde::ser::{SerializeMap, SerializeSeq, Serializer};
-use serde_json::Value;
+use serde_json::{Serializer as JsonSerializer, Value};
 use sha2::{Digest, Sha256};
 
 use crate::engine::DecisionError;
-use crate::wire::{MAX_REQUEST_BYTES, QuestionType, Questions, validate_questions};
+use crate::wire::{
+    DecisionRequest, MAX_REQUEST_BYTES, QuestionType, Questions, validate_questions,
+};
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct QuestionSet {
@@ -67,10 +69,18 @@ pub(crate) fn content_hash(value: &impl Serialize) -> Result<String, DecisionErr
     let value = serde_json::from_slice(&bytes)
         .map_err(|_| DecisionError::Rejected("request cannot be serialized"))?;
     let bytes = bounded_json(&Canonical(&value), MAX_REQUEST_BYTES)?;
-    Ok(Sha256::digest(bytes)
+    Ok(hash_bytes(&bytes))
+}
+
+pub(crate) fn request_hash(request: &DecisionRequest) -> Result<String, DecisionError> {
+    Ok(hash_bytes(&bounded_json(request, MAX_REQUEST_BYTES)?))
+}
+
+fn hash_bytes(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect())
+        .collect()
 }
 
 pub(crate) fn bounded_json(value: &impl Serialize, limit: usize) -> Result<Vec<u8>, DecisionError> {
@@ -82,6 +92,25 @@ pub(crate) fn bounded_json(value: &impl Serialize, limit: usize) -> Result<Vec<u
         DecisionError::Rejected("JSON exceeds its byte limit or cannot be serialized")
     })?;
     Ok(writer.bytes)
+}
+
+pub(crate) fn rendered_text(value: &Value) -> Result<String, DecisionError> {
+    if let Value::String(text) = value {
+        if text.len() > MAX_REQUEST_BYTES {
+            return Err(DecisionError::Rejected("text exceeds the byte limit"));
+        }
+        return Ok(text.clone());
+    }
+    let mut writer = BoundedWriter {
+        bytes: Vec::new(),
+        limit: MAX_REQUEST_BYTES,
+    };
+    value
+        .serialize(&mut JsonSerializer::pretty(&mut writer))
+        .map_err(|_| {
+            DecisionError::Rejected("text exceeds its byte limit or cannot be serialized")
+        })?;
+    String::from_utf8(writer.bytes).map_err(|_| DecisionError::Rejected("text is not UTF-8"))
 }
 
 struct BoundedWriter {
@@ -133,8 +162,8 @@ mod tests {
     use serde_json::json;
     use test_case::test_case;
 
-    use super::{QuestionSet, bounded_json, content_hash};
-    use crate::wire::{QuestionType, tests::request};
+    use super::{QuestionSet, bounded_json, content_hash, request_hash};
+    use crate::wire::{MAX_REQUEST_BYTES, QuestionType, tests::request};
 
     #[test]
     fn hashes_canonical_content_not_object_order() {
@@ -162,6 +191,37 @@ mod tests {
             first.version(),
             QuestionSet::new("permission", changed).unwrap().version()
         );
+    }
+
+    #[test]
+    fn question_versions_still_ignore_criteria_order() {
+        let mut first = request();
+        let question = first.questions.get_mut("writes").unwrap();
+        question.kind = QuestionType::Choice;
+        question.criteria = Some(json!({"zeta": null, "alpha": null, "none": null}));
+        let mut second = first.clone();
+        second.questions.get_mut("writes").unwrap().criteria =
+            Some(json!({"alpha": null, "zeta": null, "none": null}));
+        assert_ne!(
+            request_hash(&first).unwrap(),
+            request_hash(&second).unwrap()
+        );
+        assert_eq!(
+            QuestionSet::new("ordered", first.questions)
+                .unwrap()
+                .version(),
+            QuestionSet::new("reordered", second.questions)
+                .unwrap()
+                .version()
+        );
+    }
+
+    #[test]
+    fn request_hash_enforces_byte_limit() {
+        let mut request = request();
+        request.questions.get_mut("writes").unwrap().instructions =
+            json!("x".repeat(MAX_REQUEST_BYTES));
+        assert!(request_hash(&request).is_err());
     }
 
     #[test_case("writes", QuestionType::Noul, true; "present")]

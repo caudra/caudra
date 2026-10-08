@@ -92,14 +92,14 @@ impl Question {
         Ok(())
     }
 
-    fn choice_options(&self) -> Result<&Map<String, Value>, DecisionError> {
+    pub(crate) fn choice_options(&self) -> Result<&Map<String, Value>, DecisionError> {
         self.criteria
             .as_ref()
             .and_then(Value::as_object)
             .ok_or(DecisionError::Rejected("choice criteria must be an object"))
     }
 
-    fn score_levels(&self) -> Result<&[Value], DecisionError> {
+    pub(crate) fn score_levels(&self) -> Result<&[Value], DecisionError> {
         self.criteria
             .as_ref()
             .and_then(Value::as_array)
