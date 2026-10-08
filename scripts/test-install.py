@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+import hashlib
+import io
 import json
 import os
 import shutil
@@ -16,10 +18,10 @@ HTTP_HELPER = Path(__file__).with_name("test-install-http.py")
 POWERSHELL = shutil.which("pwsh") or shutil.which("powershell")
 OLD_BINARY = b"previous executable"
 NEW_BINARY = b"replacement executable"
-OLD_MANIFEST = b"previous manifest\n"
+OLD_MANIFEST = b'{"schema_version":1,"previous":true}\n'
 OLD_ATTRIBUTION = b"previous attribution\n"
 BUNDLE_FILES = {
-    "manifest.json": b'{"version":1}\n',
+    "manifest.json": b'{"schema_version":1}\n',
     "ATTRIBUTION.txt": b"Dependency attribution\n",
     "LICENSE": b"Application license\n",
     "NOTICE": b"Application notice\n",
@@ -297,6 +299,213 @@ class ReleaseCases(unittest.TestCase):
 
     binary_name = "caudra"
 
+    def test_published_legacy_archive_root_notices_are_not_installed(self):
+        extras = {
+            "LICENSE": b"Legacy archive license\n",
+            "NOTICE.md": b"Legacy archive notice\n",
+            "THIRD_PARTY_LICENSES/nested/LICENSE": b"Legacy archive dependency\n",
+        }
+        for name, content in extras.items():
+            path = self.payload / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.install_dir / self.binary_name).read_bytes(), NEW_BINARY)
+        for name, content in BUNDLE_FILES.items():
+            self.assertEqual((self.license_dir / name).read_bytes(), content)
+        self.assertEqual(
+            {path.name for path in self.install_dir.iterdir()}, {self.binary_name}
+        )
+        self.assertFalse((self.license_dir / "NOTICE.md").exists())
+        self.assertFalse((self.license_dir / "THIRD_PARTY_LICENSES").exists())
+
+    def test_unknown_archive_root_is_rejected_before_extraction(self):
+        self.seed_installation()
+        (self.payload / "unknown-root").write_bytes(NEW_BINARY)
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unsafe", result.stderr)
+        self.assert_previous_installation()
+        self.assertFalse((self.root / "extracted").exists())
+
+    def compact_payload(self):
+        bundle = self.payload / "licenses"
+        stream = io.BytesIO()
+        with tarfile.open(fileobj=stream, mode="w:gz") as archive:
+            for name, data in BUNDLE_FILES.items():
+                entry = tarfile.TarInfo(name)
+                entry.size = len(data)
+                archive.addfile(entry, io.BytesIO(data))
+        shutil.rmtree(bundle)
+        bundle.mkdir()
+        files = {
+            "LICENSE": BUNDLE_FILES["LICENSE"],
+            "NOTICE": BUNDLE_FILES["NOTICE"],
+            "THIRD_PARTY_NOTICES.txt": b"Dependency notices\n",
+            "ATTRIBUTION.txt": b"CAUDRA-ATTRIBUTION compact-v2\nEvidence: attribution.tar.gz\n",
+            "attribution.tar.gz": stream.getvalue(),
+        }
+        manifest = {
+            "schema_version": 2,
+            "layout": "compact",
+            "target": "x86_64-pc-windows-msvc"
+            if self.binary_name.endswith(".exe")
+            else "x86_64-unknown-linux-musl",
+            "files": [
+                {"path": name, "sha256": hashlib.sha256(data).hexdigest()}
+                for name, data in files.items()
+            ],
+        }
+        files["manifest.json"] = json.dumps(manifest).encode()
+        for name, data in files.items():
+            (bundle / name).write_bytes(data)
+        return files
+
+    def test_compact_install_and_layout_transitions(self):
+        files = self.compact_payload()
+        for _ in range(2):
+            result = self.install()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual({p.name for p in self.license_dir.iterdir()}, set(files))
+            for name, data in files.items():
+                self.assertEqual((self.license_dir / name).read_bytes(), data)
+        shutil.rmtree(self.payload / "licenses")
+        for name, data in BUNDLE_FILES.items():
+            path = self.payload / "licenses" / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.license_dir / "dependencies/example/LICENSE").is_file())
+        self.compact_payload()
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(list(self.license_dir.iterdir())), 6)
+
+    def test_invalid_compact_preserves_previous_pair(self):
+        self.seed_installation()
+        for case in (
+            "missing",
+            "corrupt",
+            "extra",
+            "directory",
+            "unsupported",
+            "marker",
+            "target",
+            "duplicate",
+            "path",
+        ):
+            with self.subTest(case=case):
+                self.compact_payload()
+                bundle = self.payload / "licenses"
+                manifest = json.loads((bundle / "manifest.json").read_bytes())
+                if case == "missing":
+                    (bundle / "attribution.tar.gz").unlink()
+                elif case == "corrupt":
+                    (bundle / "attribution.tar.gz").write_bytes(b"corrupted companion")
+                elif case == "extra":
+                    (bundle / "extra").write_bytes(b"unexpected")
+                elif case == "directory":
+                    (bundle / "attribution.tar.gz").unlink()
+                    (bundle / "attribution.tar.gz").mkdir()
+                elif case == "marker":
+                    (bundle / "ATTRIBUTION.txt").write_bytes(OLD_ATTRIBUTION)
+                elif case == "unsupported":
+                    manifest["schema_version"] = 3
+                elif case == "target":
+                    manifest["target"] = "unsupported-target"
+                elif case == "duplicate":
+                    manifest["files"][1] = manifest["files"][0]
+                elif case == "path":
+                    manifest["files"][0]["path"] = "../LICENSE"
+                (bundle / "manifest.json").write_text(json.dumps(manifest))
+                result = self.install()
+                self.assertNotEqual(result.returncode, 0, case)
+                self.assert_previous_installation()
+
+    def test_managed_backups_are_bounded_and_ambiguous_backups_untouched(self):
+        self.compact_payload()
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        ambiguous = self.install_dir / ".caudra-backup.ambiguous"
+        ambiguous.mkdir()
+        (ambiguous / "previous").write_bytes(OLD_BINARY)
+        for _ in range(3):
+            result = self.install()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                len(list(self.install_dir.glob(".caudra-backup.*/managed-pair"))), 1
+            )
+            self.assertEqual(
+                len(
+                    list(self.license_dir.parent.glob(".caudra-backup.*/managed-pair"))
+                ),
+                1,
+            )
+            self.assertEqual((ambiguous / "previous").read_bytes(), OLD_BINARY)
+
+    def test_matching_updater_snapshot_avoids_duplicate_backup(self):
+        self.compact_payload()
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        snapshot = self.root / "snapshot"
+        snapshot.mkdir()
+        shutil.copyfile(self.install_dir / self.binary_name, snapshot / "binary")
+        shutil.copytree(self.license_dir, snapshot / "licenses")
+        self.env["CAUDRA_UPDATE_SNAPSHOT"] = str(snapshot)
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(list(self.install_dir.glob(".caudra-backup.*")), [])
+        self.assertEqual(list(self.license_dir.parent.glob(".caudra-backup.*")), [])
+        self.assertTrue((snapshot / "licenses/attribution.tar.gz").is_file())
+        (snapshot / "binary").write_bytes(OLD_BINARY)
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            len(list(self.install_dir.glob(".caudra-backup.*/previous"))), 1
+        )
+
+    def test_failed_compact_update_keeps_previous_managed_backup(self):
+        self.compact_payload()
+        for _ in range(2):
+            result = self.install()
+            self.assertEqual(result.returncode, 0, result.stderr)
+        backups = list(self.install_dir.glob(".caudra-backup.*/previous"))
+        self.env["TEST_PUBLISH_FAILURE"] = "1"
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(
+            list(self.install_dir.glob(".caudra-backup.*/previous")), backups
+        )
+        self.assertEqual((self.install_dir / self.binary_name).read_bytes(), NEW_BINARY)
+        self.assertTrue((self.license_dir / "attribution.tar.gz").is_file())
+
+    def test_unusable_matching_snapshot_keeps_installer_backup(self):
+        self.compact_payload()
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        snapshot = self.root / "snapshot"
+        snapshot.mkdir()
+        shutil.copyfile(self.install_dir / self.binary_name, snapshot / "binary")
+        shutil.copytree(self.license_dir, snapshot / "licenses")
+        self.env["CAUDRA_UPDATE_SNAPSHOT"] = str(snapshot)
+        for extra in ("unexpected", "no-license-bundle"):
+            with self.subTest(extra=extra):
+                (snapshot / extra).write_bytes(OLD_BINARY)
+                result = self.install()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    len(list(self.install_dir.glob(".caudra-backup.*/previous"))), 1
+                )
+                self.assertEqual(
+                    len(
+                        list(self.license_dir.parent.glob(".caudra-backup.*/previous"))
+                    ),
+                    1,
+                )
+                (snapshot / extra).unlink()
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="install-test-")
         self.addCleanup(self.temporary.cleanup)
@@ -313,6 +522,7 @@ class ReleaseCases(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(content)
         self.archive = self.root / "release.tar.gz"
+        self.archive_entries = []
         self.scenario = {"explicit": release("v0.1.0"), "pages": [[release("v0.1.0")]]}
         self.env: dict[str, str] = {
             **os.environ,
@@ -325,14 +535,15 @@ class ReleaseCases(unittest.TestCase):
             "TEST_SCENARIO": str(self.root / "scenario.json"),
             "TEST_REQUEST_LOG": str(self.root / "requests.jsonl"),
         }
-        for key in ("GITHUB_TOKEN", "GH_TOKEN"):
+        for key in ("GITHUB_TOKEN", "GH_TOKEN", "CAUDRA_UPDATE_SNAPSHOT"):
             self.env.pop(key, None)
         if self.binary_name == "caudra.exe":
             return
         self.command("curl", f'exec "{sys.executable}" "{HTTP_HELPER}" "$@"')
         self.command(
             "tar",
-            f'touch "{self.root / "extracted"}"\nexec "{shutil.which("tar")}" "$@"',
+            f'case "$1" in x*) touch "{self.root / "extracted"}";; esac\n'
+            f'exec "{shutil.which("tar")}" "$@"',
         )
         self.command("uname", 'case "$1" in -s) echo Linux;; -m) echo x86_64;; esac')
         self.command(
@@ -377,6 +588,15 @@ class ReleaseCases(unittest.TestCase):
         with tarfile.open(self.archive, "w:gz") as archive:
             for child in sorted(self.payload.iterdir()):
                 archive.add(child, arcname=child.name)
+            for name, kind in self.archive_entries:
+                entry = tarfile.TarInfo(name)
+                entry.type = kind
+                entry.linkname = (
+                    "licenses/NOTICE"
+                    if kind in (tarfile.LNKTYPE, tarfile.SYMTYPE)
+                    else ""
+                )
+                archive.addfile(entry)
         return subprocess.run(
             ["sh", str(INSTALLER), *(args if args is not None else ["v0.1.0"])],
             cwd=self.root,
@@ -396,6 +616,7 @@ class ReleaseCases(unittest.TestCase):
         self.license_dir.mkdir(parents=True)
         (self.license_dir / "manifest.json").write_bytes(OLD_MANIFEST)
         (self.license_dir / "ATTRIBUTION.txt").write_bytes(OLD_ATTRIBUTION)
+        (self.license_dir / "NOTICE").write_bytes(BUNDLE_FILES["NOTICE"])
 
     def assert_previous_installation(self):
         self.assertEqual((self.install_dir / self.binary_name).read_bytes(), OLD_BINARY)
@@ -415,7 +636,42 @@ class ReleaseCases(unittest.TestCase):
 
 @unittest.skipUnless(os.name == "posix", "Exercises the POSIX installer")
 class InstallTests(ReleaseCases):
+    def test_unsafe_archive_entries_are_rejected_before_extraction(self):
+        self.seed_installation()
+        for name, kind in (
+            ("../escaped", tarfile.REGTYPE),
+            (str(self.root / "escaped"), tarfile.REGTYPE),
+            ("licenses/../../escaped", tarfile.REGTYPE),
+            ("licenses/NOTICE", tarfile.REGTYPE),
+            ("licenses/link", tarfile.SYMTYPE),
+            ("licenses/link", tarfile.LNKTYPE),
+            ("licenses/pipe", tarfile.FIFOTYPE),
+        ):
+            with self.subTest(name=name, kind=kind):
+                self.archive_entries = [(name, kind)]
+                result = self.install()
+                self.assertNotEqual(result.returncode, 0)
+                self.assert_previous_installation()
+                self.assertFalse((self.root / "extracted").exists())
+                self.assertFalse((self.root / "escaped").exists())
+
+    def test_retention_does_not_follow_backup_symlinks(self):
+        self.compact_payload()
+        for _ in range(2):
+            result = self.install()
+            self.assertEqual(result.returncode, 0, result.stderr)
+        stage = next(self.license_dir.parent.glob(".caudra-backup.*"))
+        outside = self.root / "outside-backup"
+        stage.rename(outside)
+        stage.symlink_to(outside, target_is_directory=True)
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(stage.is_symlink())
+        self.assertTrue((outside / "previous/attribution.tar.gz").is_file())
+
     def test_minimal_path_without_python_or_jq_and_available_hashers(self):
+        expanded = self.root / "expanded"
+        shutil.copytree(self.payload / "licenses", expanded)
         for hasher in ("sha256sum", "shasum", "openssl"):
             executable = shutil.which(hasher)
             if executable is None:
@@ -445,6 +701,15 @@ class InstallTests(ReleaseCases):
                 result = self.install([])
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assert_installed()
+                compact = self.compact_payload()
+                result = self.install([])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    {p.name: p.read_bytes() for p in self.license_dir.iterdir()},
+                    compact,
+                )
+                shutil.rmtree(self.payload / "licenses")
+                shutil.copytree(expanded, self.payload / "licenses")
 
     def test_credentials_are_api_only_without_redirects(self):
         self.env["GITHUB_TOKEN"] = "fixture-token"

@@ -28,20 +28,33 @@ jobs:
     name: Validate release source
     if: github.repository == 'caudra/caudra' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
+    outputs:
+      profile: ${{ steps.runners.outputs.profile }}
+      runners: ${{ steps.runners.outputs.runners }}
+      attribution-layout: ${{ steps.source.outputs.attribution-layout }}
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - run: python3 scripts/test-ci-runners.py
+      - name: Resolve runner profile
+        id: runners
+        run: python3 scripts/ci-runners.py >> "$GITHUB_OUTPUT"
+        env:
+          CAUDRA_RUNNER_PROFILE: ${{ vars.CAUDRA_RUNNER_PROFILE || 'github' }}
       - run: python3 scripts/release.py validate
+        id: source
         env:
           GH_TOKEN: ${{ github.token }}
+          CAUDRA_EXPANDED_ATTRIBUTION: ${{ vars.CAUDRA_EXPANDED_ATTRIBUTION }}
 
   verify-rust:
     needs: validate
     uses: ./.github/workflows/rust.yml
     with:
       source-sha: ${{ github.sha }}
+      runner-profile: ${{ needs.validate.outputs.profile }}
 
   verify-nix:
     needs: validate
@@ -51,6 +64,7 @@ jobs:
     uses: ./.github/workflows/nix.yml
     with:
       source-sha: ${{ github.sha }}
+      runner-profile: ${{ needs.validate.outputs.profile }}
 
   verify-python:
     name: Verify release Python
@@ -69,10 +83,11 @@ jobs:
       - run: ruff format --check scripts/
       - run: make pylint distribution-tests
       - run: python3 scripts/test-update-website-docs.py
+      - run: python3 scripts/test-time-command.py
 
   create-release:
     name: Prepare guarded draft
-    needs: [verify-rust, verify-nix, verify-python]
+    needs: [validate, verify-rust, verify-nix, verify-python]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -83,22 +98,26 @@ jobs:
           persist-credentials: false
 
       - name: Create draft release
-        run: python3 scripts/release.py prepare
+        run: python3 scripts/release.py prepare --layout "$ATTRIBUTION_LAYOUT"
         env:
           GH_TOKEN: ${{ github.token }}
+          ATTRIBUTION_LAYOUT: ${{ needs.validate.outputs.attribution-layout }}
 
   build-linux:
     name: Build (${{ matrix.target }})
-    needs: create-release
-    runs-on: ${{ matrix.runner }}
+    needs: [validate, create-release]
+    runs-on: ${{ fromJSON(needs.validate.outputs.runners)[matrix.runner] }}
+    env:
+      ATTRIBUTION_LAYOUT: ${{ needs.validate.outputs.attribution-layout }}
+      CAUDRA_RUNNER_PROFILE: ${{ needs.validate.outputs.profile }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
-            runner: blacksmith-16vcpu-ubuntu-2404
+            runner: linux_x64_heavy
           - target: aarch64-unknown-linux-musl
-            runner: blacksmith-16vcpu-ubuntu-2404-arm
+            runner: linux_arm64
 
     steps:
       - uses: actions/checkout@v7
@@ -119,11 +138,20 @@ jobs:
             ${{ runner.temp }}/alpine-cargo/registry/cache
             ${{ runner.temp }}/alpine-cargo/git/db
 
+      - uses: ./.github/actions/musl-worker
+        id: worker
+        with:
+          target: ${{ matrix.target }}
+
       - name: Build in Alpine container
+        env:
+          ALPINE_IMAGE: ${{ steps.worker.outputs.image }}
+          RUST_TOOLCHAIN: ${{ steps.worker.outputs.toolchain }}
         run: |
           docker run --rm \
-            -v "${{ github.workspace }}:/workspace" \
+            -v "$GITHUB_WORKSPACE:/workspace" \
             -v "$RUNNER_TEMP/alpine-cargo:/cargo" \
+            -v "$GITHUB_WORKSPACE/target/code-worker/source:/cargo/registry/src" \
             -w /workspace \
             -e CARGO_HOME=/cargo \
             -e CARGO_TERM_COLOR=always \
@@ -132,30 +160,34 @@ jobs:
             -e WORKCELL_REQUIRE_CODE_WORKER=1 \
             -e CAUDRA_ENABLE_UPDATE_CHECK=0 \
             -e GITHUB_REF_NAME \
-            alpine:3.21 sh -c '
+            -e ATTRIBUTION_LAYOUT \
+            -e CAUDRA_RUNNER_PROFILE \
+            -e RUST_TOOLCHAIN \
+            "$ALPINE_IMAGE" sh -c '
               set -eu
               apk add --no-cache gcc g++ musl-dev make perl linux-headers curl git ca-certificates pkgconf python3-dev
               git config --global --add safe.directory /workspace
-              curl --proto "=https" --tlsv1.2 --retry 5 --retry-delay 2 --retry-all-errors -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.99.0 --profile minimal --target ${{ matrix.target }}
+              curl --proto "=https" --tlsv1.2 --retry 5 --retry-delay 2 --retry-all-errors -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain "$RUST_TOOLCHAIN" --profile minimal --target ${{ matrix.target }}
               . "$CARGO_HOME/env"
-              cargo fetch --locked --manifest-path Cargo.toml
-              python3 scripts/build-code-worker.py --target ${{ matrix.target }}
-              cargo fetch --locked --manifest-path "$(cat target/code-worker/source-manifest-path)"
+              python3 scripts/time-command.py application-fetch cargo fetch --locked --manifest-path Cargo.toml
+              python3 scripts/time-command.py worker-fetch cargo fetch --locked --manifest-path "$(cat target/code-worker/source-manifest-path)"
               export WORKCELL_BUNDLED_MONTY_WORKER="$PWD/target/code-worker/bin/monty"
               export CARGO_PROFILE_RELEASE_STRIP=none
-              cargo build --locked --release --package caudra --target ${{ matrix.target }}
-              python3 scripts/build-attribution.py \
+              python3 scripts/time-command.py application-build cargo build --locked --release --package caudra --target ${{ matrix.target }} --timings
+              python3 scripts/time-command.py attribution python3 scripts/build-attribution.py \
                 --manifest-path Cargo.toml --package caudra --target ${{ matrix.target }} \
                 --worker-manifest-path "$(cat target/code-worker/source-manifest-path)" \
-                --worker-package monty-runtime --output-dir licenses
+                --worker-package monty-runtime --output-dir licenses --layout "$ATTRIBUTION_LAYOUT"
               test -s licenses/manifest.json
               mkdir -p target/release-symbols
               cp target/${{ matrix.target }}/release/caudra target/release-symbols/caudra
               cp target/code-worker/symbols/bin/monty target/release-symbols/monty
               strip target/${{ matrix.target }}/release/caudra
               test "$(target/${{ matrix.target }}/release/caudra --version)" = "caudra ${GITHUB_REF_NAME#v}"
-              cargo test --locked --release --target ${{ matrix.target }} \
-                --package caudra-workcell production_host_executes_code_with_the_embedded_worker
+              python3 scripts/time-command.py smoke-build cargo test --locked --release --target ${{ matrix.target }} \
+                -p caudra-workcell --test embedded_worker --no-run --timings
+              python3 scripts/time-command.py smoke-execute cargo test --locked --release --target ${{ matrix.target }} \
+                -p caudra-workcell --test embedded_worker
               smoke_output="$(OPENAI_API_KEY=release-smoke \
                 XDG_CACHE_HOME="$PWD/target/release-smoke-cache" \
                 target/${{ matrix.target }}/release/caudra --model openai/gpt-5.1 \
@@ -181,11 +213,20 @@ jobs:
             ${{ runner.temp }}/alpine-cargo/registry/cache
             ${{ runner.temp }}/alpine-cargo/git/db
 
+      - name: Upload build timings
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: timings-${{ matrix.target }}
+          path: target/cargo-timings/
+          if-no-files-found: ignore
+          overwrite: true
+
       - name: Package diagnostic binaries
         run: |
           archive="${BINARY_NAME}-${GITHUB_REF_NAME}-${{ matrix.target }}-symbols.tar.gz"
           test -s licenses/manifest.json
-          tar czf "$archive" LICENSE NOTICE.md THIRD_PARTY_LICENSES licenses -C target/release-symbols .
+          python3 scripts/time-command.py package-symbols tar czf "$archive" licenses -C target/release-symbols .
           echo "SYMBOL_ARCHIVE=$archive" >> "$GITHUB_ENV"
 
       - name: Package
@@ -194,7 +235,7 @@ jobs:
           archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.tar.gz"
           cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "${BINARY_NAME}"
           test -s licenses/manifest.json
-          tar czf "${archive}" "${BINARY_NAME}" LICENSE NOTICE.md THIRD_PARTY_LICENSES licenses
+          python3 scripts/time-command.py package tar czf "${archive}" "${BINARY_NAME}" licenses
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
       - name: Upload artifact
@@ -210,18 +251,21 @@ jobs:
 
   build-other:
     name: Build (${{ matrix.target }})
-    needs: create-release
-    runs-on: ${{ matrix.runner }}
+    needs: [validate, create-release]
+    runs-on: ${{ fromJSON(needs.validate.outputs.runners)[matrix.runner] }}
+    env:
+      ATTRIBUTION_LAYOUT: ${{ needs.validate.outputs.attribution-layout }}
+      CAUDRA_RUNNER_PROFILE: ${{ needs.validate.outputs.profile }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-apple-darwin
-            runner: macos-15-intel
+            runner: macos_x64
           - target: aarch64-apple-darwin
-            runner: blacksmith-6vcpu-macos-15
+            runner: macos_arm64
           - target: x86_64-pc-windows-msvc
-            runner: blacksmith-16vcpu-windows-2025
+            runner: windows_x64
 
     steps:
       - uses: actions/checkout@v7
@@ -254,13 +298,15 @@ jobs:
           cache-on-failure: true
 
       - uses: ./.github/actions/code-worker
+        with:
+          timing: "true"
 
       - name: Build
         shell: bash
         run: |
-          cargo fetch --locked --manifest-path Cargo.toml
-          python3 scripts/build-code-worker.py --target ${{ matrix.target }}
-          cargo fetch --locked --manifest-path "$(cat target/code-worker/source-manifest-path)"
+          python3 scripts/time-command.py application-fetch cargo fetch --locked --manifest-path Cargo.toml
+          python3 scripts/time-command.py worker-validation python3 scripts/build-code-worker.py --target ${{ matrix.target }}
+          python3 scripts/time-command.py worker-fetch cargo fetch --locked --manifest-path "$(cat target/code-worker/source-manifest-path)"
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             worker="$PWD/target/code-worker/bin/monty.exe"
           else
@@ -268,11 +314,11 @@ jobs:
           fi
           export WORKCELL_BUNDLED_MONTY_WORKER="$worker"
           export CARGO_PROFILE_RELEASE_STRIP=none
-          cargo build --locked --release --package caudra --target ${{ matrix.target }}
-          python3 scripts/build-attribution.py \
+          python3 scripts/time-command.py application-build cargo build --locked --release --package caudra --target ${{ matrix.target }} --timings
+          python3 scripts/time-command.py attribution python3 scripts/build-attribution.py \
             --manifest-path Cargo.toml --package caudra --target ${{ matrix.target }} \
             --worker-manifest-path "$(cat target/code-worker/source-manifest-path)" \
-            --worker-package monty-runtime --output-dir licenses
+            --worker-package monty-runtime --output-dir licenses --layout "$ATTRIBUTION_LAYOUT"
           test -s licenses/manifest.json
           mkdir -p target/release-symbols
           cp "$PWD/target/code-worker/symbols/bin/"* target/release-symbols/
@@ -288,20 +334,31 @@ jobs:
             strip "$binary"
           fi
           test "$("$binary" --version)" = "${BINARY_NAME} ${GITHUB_REF_NAME#v}"
-          cargo test --locked --release --target ${{ matrix.target }} \
-            --package caudra-workcell production_host_executes_code_with_the_embedded_worker
+          python3 scripts/time-command.py smoke-build cargo test --locked --release --target ${{ matrix.target }} \
+            -p caudra-workcell --test embedded_worker --no-run --timings
+          python3 scripts/time-command.py smoke-execute cargo test --locked --release --target ${{ matrix.target }} \
+            -p caudra-workcell --test embedded_worker
           smoke_output="$(OPENAI_API_KEY=release-smoke \
             XDG_CACHE_HOME="$PWD/target/release-smoke-cache" \
             "$binary" --model openai/gpt-5.1 tools --enabled-only --names 2>&1)"
           printf '%s\n' "$smoke_output" | grep -qx python_execution
           ! printf '%s\n' "$smoke_output" | grep -q 'Workcell python_execution is unavailable'
 
+      - name: Upload build timings
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: timings-${{ matrix.target }}
+          path: target/cargo-timings/
+          if-no-files-found: ignore
+          overwrite: true
+
       - name: Package diagnostic binaries
         shell: bash
         run: |
           archive="${BINARY_NAME}-${GITHUB_REF_NAME}-${{ matrix.target }}-symbols.tar.gz"
           test -s licenses/manifest.json
-          tar czf "$archive" LICENSE NOTICE.md THIRD_PARTY_LICENSES licenses -C target/release-symbols .
+          python3 scripts/time-command.py package-symbols tar czf "$archive" licenses -C target/release-symbols .
           echo "SYMBOL_ARCHIVE=$archive" >> "$GITHUB_ENV"
 
       - name: Package (Unix)
@@ -311,7 +368,7 @@ jobs:
           archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.tar.gz"
           cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "${BINARY_NAME}"
           test -s licenses/manifest.json
-          tar czf "${archive}" "${BINARY_NAME}" LICENSE NOTICE.md THIRD_PARTY_LICENSES licenses
+          python3 scripts/time-command.py package tar czf "${archive}" "${BINARY_NAME}" licenses
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
       - name: Package (Windows)
@@ -322,7 +379,7 @@ jobs:
           archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.zip"
           cp "target/${{ matrix.target }}/release/${BINARY_NAME}.exe" "${BINARY_NAME}.exe"
           test -s licenses/manifest.json
-          7z a "${archive}" "${BINARY_NAME}.exe" LICENSE NOTICE.md THIRD_PARTY_LICENSES licenses
+          python3 scripts/time-command.py package 7z a "${archive}" "${BINARY_NAME}.exe" licenses
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
       - name: Upload artifact
@@ -338,7 +395,7 @@ jobs:
 
   publish:
     name: Publish Release
-    needs: [build-linux, build-other]
+    needs: [validate, build-linux, build-other]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -360,6 +417,7 @@ jobs:
           merge-multiple: true
 
       - name: Stage, verify, and publish complete release
-        run: python3 scripts/release.py publish --artifacts artifacts
+        run: python3 scripts/release.py publish --artifacts artifacts --layout "$ATTRIBUTION_LAYOUT"
         env:
           GH_TOKEN: ${{ github.token }}
+          ATTRIBUTION_LAYOUT: ${{ needs.validate.outputs.attribution-layout }}

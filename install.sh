@@ -169,6 +169,28 @@ function release(path, tag, pre, asset, name, base, archive, i, required, found,
     if (!found[archive] || !found["sha256sums.txt"] || !found[installer]) usable = 0
     print tag "\t" (pre ? "preview" : "stable") "\t" usable
 }
+function bundle( schema, layout, files, entry, name, hash, i) {
+    schema = values["root" SUBSEP "schema_version"]
+    layout = values["root" SUBSEP "layout"]
+    if (kinds["root"] != "{" || kinds["root" SUBSEP "schema_version"] != "number") fail("invalid bundle manifest")
+    if (schema == "1" && (!("root" SUBSEP "layout" in kinds) ||
+        (kinds["root" SUBSEP "layout"] == "string" && layout == "expanded")) && index(marker, "CAUDRA-ATTRIBUTION ") != 1) {
+        print "expanded"; return
+    }
+    if (schema != "2" || layout != "compact" || marker != "CAUDRA-ATTRIBUTION compact-v2") fail("unsupported or inconsistent bundle layout")
+    if (kinds["root" SUBSEP "target"] != "string" || values["root" SUBSEP "target"] != target) fail("bundle target mismatch")
+    files = "root" SUBSEP "files"
+    if (kinds[files] != "[" || sizes[files] != 5) fail("invalid compact file inventory")
+    print "compact"
+    for (i = 0; i < 5; i++) {
+        entry = files SUBSEP i
+        name = values[entry SUBSEP "path"]; hash = values[entry SUBSEP "sha256"]
+        if (kinds[entry] != "{" || kinds[entry SUBSEP "path"] != "string" ||
+            name !~ /^(LICENSE|NOTICE|THIRD_PARTY_NOTICES[.]txt|ATTRIBUTION[.]txt|attribution[.]tar[.]gz)$/ || seen[name]++ ||
+            kinds[entry SUBSEP "sha256"] != "string" || length(hash) != 64 || hash ~ /[^0-9a-f]/) fail("invalid compact file hash")
+        print name " " hash
+    }
+}
 BEGIN {
     if (mode == "tag") exit !semver(tag)
     if (mode == "select") {
@@ -188,6 +210,7 @@ BEGIN {
     while ((getline line) > 0) json = json line "\n"
     pos = 1; value("root", 0); ws()
     if (pos <= length(json)) fail("trailing JSON data")
+    if (mode == "bundle") { bundle(); exit }
     if (mode == "single") {
         if (values["root" SUBSEP "tag_name"] != tag) fail("release tag mismatch")
         release("root")
@@ -322,6 +345,116 @@ validate_tree() {
     [ -z "${invalid}" ] || err "refusing symlink or special file: ${invalid}"
 }
 
+validate_archive() {
+    if [ "${archive_ext}" = zip ]; then
+        unzip -Z -1 "${tmp}/${archive_name}" > "${tmp}/entries" || err "cannot inspect archive"
+        unzip -Z -l "${tmp}/${archive_name}" > "${tmp}/types" || err "cannot inspect archive types"
+    else
+        tar tzf "${tmp}/${archive_name}" > "${tmp}/entries" || err "cannot inspect archive"
+        tar tvzf "${tmp}/${archive_name}" > "${tmp}/types" || err "cannot inspect archive types"
+    fi
+    [ "$(wc -c < "${tmp}/entries")" -le 16777216 ] || err "archive inventory too large"
+    awk -v binary="${bin_name}" -v extension="${archive_ext}" '
+        { name = $0; sub(/^\.\//, "", name); sub(/\/$/, "", name) }
+        name ~ /[[:cntrl:]\\:]/ || name ~ /(^|\/)\.\.?($|\/)/ || name ~ /\/\// ||
+            (name != binary && name != "LICENSE" && name != "NOTICE.md" &&
+                name != "licenses" && name !~ /^licenses\// &&
+                name != "THIRD_PARTY_LICENSES" && name !~ /^THIRD_PARTY_LICENSES\//) ||
+            seen[extension == "zip" ? tolower(name) : name]++ { exit 1 }
+        extension == "zip" && (name ~ /[. ]($|\/)/ || toupper(name) ~ /(^|\/)(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])([.]|\/|$)/) { exit 1 }
+        END { if (NR > 100000) exit 1 }
+    ' "${tmp}/entries" || err "unsafe or duplicate archive path"
+    awk -v extension="${archive_ext}" -v count="$(wc -l < "${tmp}/entries")" '
+        function item(size) {
+            if (size !~ /^[0-9]+$/ || size + bytes > 2147483648) exit 1
+            bytes += size; entries++
+        }
+        extension != "zip" {
+            if (substr($0, 1, 1) !~ /^[-d]$/) exit 1
+            item($2 ~ /^[0-9]+$/ ? $5 : $3); next
+        }
+        substr($0, 2, 9) ~ /^[rwxstST?-]+$/ {
+            if (substr($0, 1, 1) !~ /^[-d]$/) exit 1
+            item($4)
+        }
+        END { if (entries != count) exit 1 }
+    ' "${tmp}/types" || err "refusing symlink, hard link, special file or oversized archive"
+}
+
+validate_bundle() (
+    bundle="$1"
+    for required in manifest.json ATTRIBUTION.txt NOTICE; do
+        ${elevate} test -f "${bundle}/${required}" && ${elevate} test -s "${bundle}/${required}" || err "archive did not contain licenses/${required}"
+    done
+    validate_tree "${bundle}"
+    [ "$(${elevate} wc -c "${bundle}/manifest.json" | awk '{ print $1 }')" -le 16777216 ] || err "bundle manifest too large"
+    marker="$(${elevate} awk 'NR == 1 { print; exit }' "${bundle}/ATTRIBUTION.txt")"
+    ${elevate} awk -v mode=bundle -v target="${target}" -v marker="${marker}" -f "${tmp}/releases.awk" \
+        "${bundle}/manifest.json" > "${tmp}/bundle-files" || err "invalid license bundle"
+    IFS= read -r layout < "${tmp}/bundle-files"
+    if [ "${layout}" = compact ]; then
+        [ "$(${elevate} find "${bundle}" -type f -print | wc -l)" -eq 6 ] &&
+            [ "$(${elevate} find "${bundle}" -type d -print | wc -l)" -eq 1 ] || err "compact bundle must contain exactly six regular files"
+        while read -r name expected; do
+            [ "${name}" != compact ] || continue
+            ${elevate} test -f "${bundle}/${name}" && ${elevate} test -s "${bundle}/${name}" || err "missing compact file: ${name}"
+            case "${sha_tool}" in
+                sha256sum) actual="$(${elevate} sha256sum "${bundle}/${name}")" ;;
+                shasum) actual="$(${elevate} shasum -a 256 "${bundle}/${name}")" ;;
+                openssl) actual="$(${elevate} openssl dgst -sha256 "${bundle}/${name}")"; actual="${actual##* }" ;;
+            esac
+            [ "${actual%% *}" = "${expected}" ] || err "compact file checksum mismatch: ${name}"
+        done < "${tmp}/bundle-files"
+        ${elevate} gzip -t "${bundle}/attribution.tar.gz" || err "corrupt attribution companion"
+    fi
+)
+
+prune_backup_pairs() (
+    keep="$1"
+    for binary_backup in "${INSTALL_DIR}"/.caudra-backup.*; do
+        [ "${binary_backup}" != "${keep}" ] || continue
+        suffix="${binary_backup##*/}"
+        case "${suffix#.caudra-backup.}" in ''|*[!A-Za-z0-9]*) continue ;; esac
+        bundle_backup="${license_parent}/${suffix}"
+        (
+            validate_path "${binary_backup}" || exit 1
+            validate_path "${bundle_backup}" || exit 1
+            validate_tree "${binary_backup}" || exit 1
+            validate_tree "${bundle_backup}" || exit 1
+            ${elevate} test -f "${binary_backup}/previous" &&
+                ${elevate} test -d "${bundle_backup}/previous" || exit 1
+            for stage in "${binary_backup}" "${bundle_backup}"; do
+                [ "$(${elevate} find "${stage}" ! -path "${stage}" -prune -print | wc -l)" -eq 2 ] || exit 1
+                ${elevate} test -f "${stage}/managed-pair" || exit 1
+                [ "$(${elevate} wc -c "${stage}/managed-pair" | awk '{ print $1 }')" -le 8192 ] || exit 1
+                [ "$(${elevate} cat "${stage}/managed-pair")" = "${pair_owner}" ] || exit 1
+            done
+            validate_bundle "${bundle_backup}/previous" >/dev/null 2>&1 || exit 1
+            ${elevate} rm -rf "${bundle_backup}" "${binary_backup}"
+        ) 2>/dev/null || :
+    done
+)
+
+snapshot_matches_previous() (
+    snapshot="${CAUDRA_UPDATE_SNAPSHOT:-}"
+    [ -n "${snapshot}" ] && command -v diff >/dev/null 2>&1 || exit 1
+    validate_path "${snapshot}" || exit 1
+    validate_tree "${snapshot}" || exit 1
+    [ "$(${elevate} find "${snapshot}" ! -path "${snapshot}" -prune -print | wc -l)" -eq 2 ] || exit 1
+    ${elevate} test -f "${snapshot}/binary" &&
+        ${elevate} test -f "${binary_stage}/previous" || exit 1
+    ${elevate} diff -q "${snapshot}/binary" "${binary_stage}/previous" >/dev/null || exit 1
+    if [ "${old_bundle}" = 1 ]; then
+        ${elevate} test -d "${snapshot}/licenses" || exit 1
+        validate_bundle "${snapshot}/licenses" >/dev/null 2>&1 || exit 1
+        ${elevate} diff -qr "${snapshot}/licenses" "${bundle_stage}/previous" >/dev/null || exit 1
+    else
+        ${elevate} test -f "${snapshot}/no-license-bundle" || exit 1
+        printf '%s\n' 'The previous installation did not contain a license bundle.' |
+            ${elevate} diff -q - "${snapshot}/no-license-bundle" >/dev/null || exit 1
+    fi
+)
+
 install_payload() (
     bundle_stage=""
     binary_stage=""
@@ -329,6 +462,9 @@ install_payload() (
     new_bundle=0
     old_binary=0
     committed=0
+    retain_previous=1
+    previous_complete=0
+    pair_owner="$(printf 'caudra-install-pair-v1\n%s\n%s' "${dest}" "${license_dir}")"
     finish_install() {
         status=$?
         trap - EXIT HUP INT TERM
@@ -358,7 +494,7 @@ install_payload() (
         fi
         for stage in "${bundle_stage}" "${binary_stage}"; do
             [ -n "${stage}" ] || continue
-            if [ "${committed}" = 1 ] && ${elevate} test -e "${stage}/previous"; then
+            if [ "${committed}" = 1 ] && [ "${retain_previous}" = 1 ] && ${elevate} test -e "${stage}/previous"; then
                 echo "previous installation retained in ${stage}/previous"
             else
                 ${elevate} rm -rf "${stage}" || status=1
@@ -368,10 +504,15 @@ install_payload() (
     }
     trap finish_install EXIT
     trap 'exit 1' HUP INT TERM
+    if [ -f "${dest}" ] && [ -d "${license_dir}" ] && validate_bundle "${license_dir}" >/dev/null 2>&1; then
+        previous_complete=1
+    fi
     bundle_stage="$(${elevate} mktemp -d "${license_parent}/.caudra-backup.XXXXXX")" || err "cannot stage licenses"
-    binary_stage="$(${elevate} mktemp -d "${INSTALL_DIR}/.caudra-backup.XXXXXX")" || err "cannot stage binary"
-    ${elevate} cp -R "${tmp}/licenses" "${bundle_stage}/new" || err "failed to stage licenses"
-    ${elevate} cp "${tmp}/${bin_name}" "${binary_stage}/new" || err "failed to stage binary"
+    next_binary_stage="${INSTALL_DIR}/${bundle_stage##*/}"
+    ${elevate} mkdir -m 700 "${next_binary_stage}" || err "cannot stage binary"
+    binary_stage="${next_binary_stage}"
+    ${elevate} cp -R "${payload}/licenses" "${bundle_stage}/new" || err "failed to stage licenses"
+    ${elevate} cp "${payload}/${bin_name}" "${binary_stage}/new" || err "failed to stage binary"
     ${elevate} chmod +x "${binary_stage}/new" || err "failed to make staged binary executable"
     validate_tree "${bundle_stage}/new"
     validate_path "${dest}"
@@ -389,6 +530,15 @@ install_payload() (
     fi
     ${elevate} mv "${binary_stage}/new" "${dest}" || err "failed to publish binary"
     committed=1
+    if snapshot_matches_previous; then
+        retain_previous=0
+        prune_backup_pairs "${binary_stage}"
+    elif [ "${previous_complete}" = 1 ]; then
+        printf '%s\n' "${pair_owner}" > "${tmp}/managed-pair"
+        ${elevate} cp "${tmp}/managed-pair" "${binary_stage}/managed-pair" &&
+            ${elevate} cp "${tmp}/managed-pair" "${bundle_stage}/managed-pair" || err "cannot mark retained backup pair"
+        prune_backup_pairs "${binary_stage}"
+    fi
 )
 
 main() {
@@ -455,17 +605,17 @@ main() {
     download "${url}/${archive_name}" "${tmp}/${archive_name}" || err "archive download failed"
     download "${url}/sha256sums.txt" "${tmp}/sha256sums.txt" 1048576 || err "checksum download failed"
     verify_archive
+    validate_archive
+    payload="$(mktemp -d "${tmp}/payload.XXXXXX")"
     if [ "${archive_ext}" = "zip" ]; then
-        unzip -qo "${tmp}/${archive_name}" -d "${tmp}"
+        unzip -qo "${tmp}/${archive_name}" -d "${payload}"
     else
-        tar xzf "${tmp}/${archive_name}" -C "${tmp}"
+        tar xzf "${tmp}/${archive_name}" -C "${payload}"
     fi
 
-    [ -f "${tmp}/${bin_name}" ] || err "archive did not contain ${bin_name}"
-    [ -s "${tmp}/licenses/manifest.json" ] || err "archive did not contain licenses/manifest.json; legacy archives without a license bundle are not supported"
-    [ -s "${tmp}/licenses/ATTRIBUTION.txt" ] || err "archive did not contain licenses/ATTRIBUTION.txt"
-    [ ! -L "${tmp}/${bin_name}" ] || err "refusing symlink: ${bin_name}"
-    validate_tree "${tmp}/licenses"
+    [ -f "${payload}/${bin_name}" ] || err "archive did not contain ${bin_name}"
+    [ ! -L "${payload}/${bin_name}" ] || err "refusing symlink: ${bin_name}"
+    validate_bundle "${payload}/licenses"
 
     if is_windows && command -v cygpath > /dev/null 2>&1; then
         INSTALL_DIR="$(cygpath -u "${INSTALL_DIR}")" || err "cannot resolve installation directory"

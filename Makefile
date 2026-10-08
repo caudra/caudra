@@ -86,6 +86,8 @@ pylint:
 	ty check scripts/
 
 distribution-tests:
+	$(PYTHON) scripts/test-ci-runners.py
+	$(PYTHON) scripts/test-time-command.py
 	$(PYTHON) scripts/test-make.py
 	$(PYTHON) scripts/test-build-code-worker.py
 	$(PYTHON) scripts/test-build-attribution.py

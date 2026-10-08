@@ -1,5 +1,9 @@
 name: Cached native code worker
 description: Restore, validate, and save the optimized worker and its pinned source
+inputs:
+  timing:
+    description: Report the release worker phase duration
+    default: "false"
 runs:
   using: composite
   steps:
@@ -32,7 +36,14 @@ runs:
           target/code-worker/source-manifest-path
           ${{ steps.identity.outputs.source }}
     - shell: bash
-      run: python3 scripts/build-code-worker.py
+      env:
+        TIME_WORKER: ${{ inputs.timing }}
+      run: |
+        if [[ "$TIME_WORKER" == "true" ]]; then
+          python3 scripts/time-command.py worker python3 scripts/build-code-worker.py
+        else
+          python3 scripts/build-code-worker.py
+        fi
     - uses: actions/cache/save@v5
       if: steps.cache.outputs.cache-hit != 'true'
       with:

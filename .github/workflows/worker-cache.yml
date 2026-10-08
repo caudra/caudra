@@ -1,0 +1,42 @@
+name: Warm musl worker cache
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "rust-toolchain.toml"
+      - "scripts/build-code-worker.py"
+      - ".cargo/**"
+      - ".github/actions/musl-worker/**"
+      - ".github/workflows/worker-cache.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: worker-cache-main
+  cancel-in-progress: false
+
+jobs:
+  warm:
+    if: github.repository == 'caudra/caudra' && github.ref == 'refs/heads/main'
+    runs-on: ${{ matrix.runner }}
+    env:
+      CAUDRA_RUNNER_PROFILE: github
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/musl-worker
+        with:
+          target: ${{ matrix.target }}

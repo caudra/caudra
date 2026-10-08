@@ -156,6 +156,14 @@ The first public release is `0.2.0-preview.1`, tagged `v0.2.0-preview.1`. Each p
 
 A release tag must match the workspace version exactly. Pushing it to the canonical repository authorizes CI to verify the exact commit, build all supported targets, stage a draft with installers and checksums, and publish automatically after every required check passes. Prereleases carry GitHub's pre-release flag and cannot become Latest. A failed job leaves publication incomplete rather than exposing a partial release. Ordinary pushes to `main` do not publish binaries.
 
+Write reviewed release notes in `release-notes/<version>.md` before tagging. Describe user-visible changes, known limitations and migration steps. The pipeline reads this file from the tagged commit and adds the title, preview status and source link. Missing notes or unresolved placeholders stop validation. The same content is used for draft creation and publication, so manual draft edits are not the authoring workflow.
+
+Set the GitHub Actions repository variable `CAUDRA_RUNNER_PROFILE` to select a reviewed runner mapping. An unset value defaults to `github`, using standard GitHub-hosted runners. `blacksmith` selects accelerated runners where supported. `ubicloud-blacksmith` selects Ubicloud for Linux and Blacksmith for Apple Silicon macOS and Windows. Intel macOS and lightweight control jobs remain on GitHub. The mappings live in `scripts/ci-runners.py`. Unknown profiles stop validation.
+
+The hybrid profile requires the Ubicloud integration and account-level Premium Runners setting. Premium applies to x64. Ubicloud ARM runners use Ampere hardware, and workflow labels still use `ubicloud-standard-*`. Selecting a profile does not configure provider accounts or guarantee a particular delivered CPU. Changing the variable does not migrate running jobs.
+
+`CAUDRA_EXPANDED_ATTRIBUTION=false` or `0` selects compact attribution, also the default when unset. The installed bundle keeps readable licenses and notices plus a compressed evidence/source companion. `true` or `1` selects the expanded audit tree. Both modes perform the same license validation. The selected mode is recorded in artifacts and fixed for the release attempt. Installers follow the verified artifact rather than querying repository variables.
+
 Release archives include their license bundles and the embedded Python worker. Binary distribution clearance does not imply clearance to distribute every dependency source or build cache. Review the attribution evidence and unresolved exceptions before publication. Repository-level immutable releases and protected release tags are recommended operational settings, not guarantees made by the workflow.
 
 The website deploys separately. Its pinned application source supplies canonical docs and bootstrap installers. Installer changes require a source-pin update after the source commit is available. Self-updates use the installer attached to the selected GitHub Release.

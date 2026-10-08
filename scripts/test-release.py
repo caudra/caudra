@@ -3,14 +3,18 @@
 import copy
 import hashlib
 import importlib.util
+import io
+import json
 import os
 import re
 import runpy
 import shutil
 import subprocess
+import tarfile
 import tempfile
 import textwrap
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -26,6 +30,7 @@ TAG = "v0.2.0-preview.1"
 COMMIT = "a" * 40
 OTHER_COMMIT = "b" * 40
 TITLE = "Caudra 0.2 Preview 1"
+COMPACT_POLICY = "<!-- caudra-attribution-layout: compact -->"
 DRAFT = {
     "id": 123,
     "tag_name": TAG,
@@ -34,6 +39,7 @@ DRAFT = {
     "immutable": False,
     "prerelease": True,
     "assets": [],
+    "body": COMPACT_POLICY,
 }
 PUBLISHED_ERROR = "Published releases must never be modified"
 INVENTORY_ERROR = "Asset inventory mismatch"
@@ -41,7 +47,9 @@ UPLOAD_ERROR = "simulated interrupted upload"
 WORKFLOWS = Path(__file__).resolve().parent.parent / ".github/workflows"
 SMOKE_WORKER_WARNING = "Workcell python_execution is unavailable"
 SMOKE_STARTUP_ERROR = "resolve data directory: Permission denied"
+CURATED_NOTES = "### Highlights\n\nVersion-specific user-facing changes.\n"
 WORKER_ACTION = WORKFLOWS.parent / "actions/code-worker/action.yml"
+MUSL_WORKER_ACTION = WORKFLOWS.parent / "actions/musl-worker/action.yml"
 WORKER_CACHE_PATHS = (
     "target/code-worker/bin",
     "target/code-worker/symbols",
@@ -68,6 +76,13 @@ class ReleaseTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(prefix="release test ")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
+        root_patch = patch.object(RELEASE, "ROOT", self.root)
+        root_patch.start()
+        self.addCleanup(root_patch.stop)
+        notes = self.root / "release-notes"
+        notes.mkdir()
+        for tag in (TAG, "v0.2.0"):
+            (notes / f"{tag[1:]}.md").write_text(CURATED_NOTES, encoding="utf-8")
         (self.root / "Cargo.toml").write_text(
             '[package]\nname = "caudra"\nversion.workspace = true\n'
             '[workspace]\nmembers = ["workcell", "workcell/crates/tool-contract"]\n'
@@ -99,10 +114,128 @@ class ReleaseTests(unittest.TestCase):
         self.publish_after_upload = False
         self.fail_upload = None
 
-    def seed_archives(self):
-        for name in RELEASE.asset_names(TAG):
-            if name not in RELEASE.INSTALLERS:
-                (self.artifacts / name).write_bytes(f"archive: {name}\n".encode())
+    @staticmethod
+    def file_records(files):
+        return [
+            {
+                "path": name,
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "size": len(data),
+            }
+            for name, data in sorted(files.items())
+        ]
+
+    @staticmethod
+    def tar_bytes(files):
+        output = io.BytesIO()
+        with tarfile.open(fileobj=output, mode="w:gz") as archive:
+            for name, data in files.items():
+                member = tarfile.TarInfo(name)
+                member.size = len(data)
+                archive.addfile(member, io.BytesIO(data))
+        return output.getvalue()
+
+    def attribution_files(self, target, layout="compact"):
+        evidence = {
+            "LICENSE": b"license text\n",
+            "NOTICE": b"copyright notice\n",
+            "ATTRIBUTION.txt": b"inventory\n",
+            "policy.json": b"{}\n",
+            "graphs/artifact/Cargo.lock": b"version = 4\n",
+            "graphs/worker/Cargo.lock": b"version = 4\n",
+            "rust-runtime/COPYRIGHT-library.html": b"runtime legal report\n",
+        }
+        graphs = [
+            {
+                "name": name,
+                "package": package,
+                "version": version,
+                "default_features": name != "worker",
+                "lockfile": f"graphs/{name}/Cargo.lock",
+                "packages": ["fixture"],
+            }
+            for name, package, version in (
+                ("artifact", "caudra", TAG[1:]),
+                ("worker", "monty-runtime", "1.0.0"),
+            )
+        ]
+        evidence["manifest.json"] = json.dumps(
+            {
+                "schema_version": 1,
+                "target": target,
+                "files": self.file_records(evidence),
+                "graphs": graphs,
+                "packages": [
+                    {
+                        "id": "fixture",
+                        "notices": ["LICENSE"],
+                        "selected_license": ["MIT"],
+                    }
+                ],
+                "rust_runtime": [
+                    {
+                        "graphs": ["artifact", "worker"],
+                        "report": "rust-runtime/COPYRIGHT-library.html",
+                        "files": [{"path": "rust-runtime/COPYRIGHT-library.html"}],
+                    }
+                ],
+            }
+        ).encode()
+        if layout == "expanded":
+            return evidence
+        files = {
+            "LICENSE": evidence["LICENSE"],
+            "NOTICE": evidence["NOTICE"],
+            "THIRD_PARTY_NOTICES.txt": b"dependency license text\n",
+            "ATTRIBUTION.txt": RELEASE.COMPACT_MARKER + b"See attribution.tar.gz\n",
+            "attribution.tar.gz": self.tar_bytes(evidence),
+        }
+        files["manifest.json"] = json.dumps(
+            {
+                "schema_version": 2,
+                "layout": "compact",
+                "target": target,
+                "files": self.file_records(files),
+                "graphs": [
+                    {key: graph[key] for key in RELEASE.GRAPH_IDENTITY}
+                    for graph in graphs
+                ],
+                "evidence_manifest": {
+                    "archive": "attribution.tar.gz",
+                    "member": "manifest.json",
+                    "sha256": hashlib.sha256(evidence["manifest.json"]).hexdigest(),
+                    "size": len(evidence["manifest.json"]),
+                },
+            }
+        ).encode()
+        return files
+
+    def seed_archives(self, layout="compact"):
+        for target in RELEASE.TARGETS:
+            files = {
+                f"licenses/{name}": data
+                for name, data in self.attribution_files(target, layout).items()
+            }
+            for name in RELEASE.asset_names(TAG):
+                if target not in name:
+                    continue
+                path = self.artifacts / name
+                payload = {
+                    **files,
+                    "caudra.exe"
+                    if target.endswith("windows-msvc")
+                    else "caudra": b"binary fixture",
+                }
+                if name.endswith("-symbols.tar.gz"):
+                    payload[
+                        "monty.exe" if target.endswith("windows-msvc") else "monty"
+                    ] = b"worker symbols fixture"
+                if name.endswith(".zip"):
+                    with zipfile.ZipFile(path, "w") as archive:
+                        for member, data in payload.items():
+                            archive.writestr(member, data)
+                else:
+                    path.write_bytes(self.tar_bytes(payload))
 
     def fake_api(self, path, payload=None):
         if path.startswith("git/ref/tags/"):
@@ -137,14 +270,14 @@ class ReleaseTests(unittest.TestCase):
             self.fail(f"Unexpected release operation: {arguments}")
         return ""
 
-    def publish(self):
+    def publish(self, layout="compact"):
         with (
             patch.object(RELEASE, "ROOT", self.root),
             patch.object(RELEASE, "api", side_effect=self.fake_api),
             patch.object(RELEASE, "releases", side_effect=lambda: [self.remote]),
             patch.object(RELEASE, "gh", side_effect=self.fake_gh),
         ):
-            RELEASE.publish(TAG, COMMIT, self.artifacts)
+            RELEASE.publish(TAG, COMMIT, self.artifacts, layout)
 
     def test_strict_semver(self):
         valid = (
@@ -188,18 +321,13 @@ class ReleaseTests(unittest.TestCase):
         self.assertIsNone(RELEASE.version("v0.2.0+build.1")[1])
         self.assertEqual(RELEASE.version("v0.2.0-rc.1")[1], "rc.1")
 
-    def test_release_notes_state_preview_limits_migration_and_exact_provenance(self):
+    def test_release_notes_include_curated_content_and_exact_provenance(self):
         notes = RELEASE.release_notes(TAG, COMMIT)
         for expected in (
             f"## {TITLE}",
             "Preview / prerelease.",
-            "Experimental features remain subject to change",
-            "manually running the external PowerShell installer",
-            "Rollback is unsupported on Windows pending native verification",
-            "do not imply complete native-platform or end-to-end verification",
-            "Back up your data before upgrading",
-            "data migrations are not reversed",
-            "not restored",
+            CURATED_NOTES.strip(),
+            COMPACT_POLICY,
             f"Tag: `{TAG}`",
             f"[{COMMIT}](https://github.com/caudra/caudra/commit/{COMMIT})",
             "[Canonical documentation](https://caudra.ai/docs/)",
@@ -213,6 +341,169 @@ class ReleaseTests(unittest.TestCase):
         notes = RELEASE.release_notes("v0.2.0", COMMIT)
         self.assertIn("Stable release.", notes)
         self.assertNotIn("Preview / prerelease", notes)
+
+    def test_notes_must_exist_for_the_exact_version_and_be_reviewed(self):
+        path = self.root / "release-notes" / f"{TAG[1:]}.md"
+        for content in (
+            "",
+            "  \n",
+            "TODO: write changes",
+            "{{ highlights }}",
+            COMPACT_POLICY,
+        ):
+            with self.subTest(content=content), self.assertRaises(ValueError):
+                path.write_text(content)
+                RELEASE.release_notes(TAG, COMMIT)
+        path.unlink()
+        with self.assertRaisesRegex(ValueError, "Missing version-specific"):
+            RELEASE.release_notes(TAG, COMMIT)
+        path.symlink_to(self.root / "release-notes" / "0.2.0.md")
+        with self.assertRaisesRegex(ValueError, "Missing version-specific"):
+            RELEASE.release_notes(TAG, COMMIT)
+
+    def test_attribution_variable_has_a_compact_default_and_strict_values(self):
+        for value in ("", "false", "0", " FALSE ", "\t0\n"):
+            with self.subTest(value=value):
+                self.assertEqual(RELEASE.attribution_layout(value), "compact")
+        for value in ("true", "1", " TRUE "):
+            with self.subTest(value=value):
+                self.assertEqual(RELEASE.attribution_layout(value), "expanded")
+        for value in ("yes", "2", "compact", "false\ntrue", "$(false)"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                RELEASE.attribution_layout(value)
+
+    def test_draft_layout_cannot_change_between_attempts(self):
+        for body in (
+            "",
+            COMPACT_POLICY * 2,
+            COMPACT_POLICY.replace("compact", "expanded"),
+        ):
+            with self.subTest(body=body), self.assertRaisesRegex(ValueError, "layout"):
+                RELEASE.assert_release_policy({**DRAFT, "body": body}, "compact")
+
+    def test_expanded_archives_require_explicit_expanded_policy(self):
+        self.seed_archives("expanded")
+        with self.assertRaisesRegex(ValueError, "layout"):
+            self.publish()
+        self.assertFalse(self.upload_calls)
+        self.remote["body"] = COMPACT_POLICY.replace("compact", "expanded")
+        self.publish("expanded")
+        self.assertFalse(self.remote["draft"])
+
+    def test_expanded_manifest_requires_legal_evidence_and_resolvable_references(self):
+        target = RELEASE.TARGETS[0]
+        for mutation in ("empty", "graphs", "packages", "notice", "runtime", "source"):
+            files = self.attribution_files(target, "expanded")
+            manifest = json.loads(files["manifest.json"])
+            if mutation == "empty":
+                files = {}
+                manifest["files"] = []
+            elif mutation in ("graphs", "packages"):
+                manifest[mutation] = []
+            elif mutation == "notice":
+                manifest["packages"][0]["notices"] = ["missing"]
+            elif mutation == "runtime":
+                manifest["rust_runtime"] = []
+            else:
+                manifest["packages"][0]["selected_license"] = ["MPL-2.0"]
+            files["manifest.json"] = json.dumps(manifest).encode()
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                RELEASE.validate_attribution(files, target, "expanded")
+
+    def test_compact_manifest_rejects_wrong_target_missing_and_corrupt_files(self):
+        target = RELEASE.TARGETS[0]
+        for mutation in (
+            "target",
+            "missing",
+            "corrupt",
+            "extra",
+            "evidence",
+            "duplicate",
+        ):
+            files = self.attribution_files(target)
+            manifest = json.loads(files["manifest.json"])
+            if mutation == "target":
+                manifest["target"] = RELEASE.TARGETS[1]
+            elif mutation == "missing":
+                del files["NOTICE"]
+            elif mutation == "corrupt":
+                files["NOTICE"] = b"changed"
+            elif mutation == "extra":
+                files["unexpected"] = b"extra"
+            elif mutation == "evidence":
+                manifest["evidence_manifest"]["sha256"] = "0" * 64
+            else:
+                manifest["files"].append(manifest["files"][0])
+            files["manifest.json"] = json.dumps(manifest).encode()
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                RELEASE.validate_attribution(files, target, "compact")
+
+    def test_empty_ancillary_notice_is_preserved_alongside_license_text(self):
+        target = RELEASE.TARGETS[0]
+        files = self.attribution_files(target, "expanded")
+        manifest = json.loads(files.pop("manifest.json"))
+        files["packages/fixture/AUTHORS"] = b""
+        manifest["packages"][0]["notices"].append("packages/fixture/AUTHORS")
+        manifest["files"] = self.file_records(files)
+        files["manifest.json"] = json.dumps(manifest).encode()
+        RELEASE.validate_attribution(files, target, "expanded")
+        manifest["packages"][0]["notices"] = ["packages/fixture/AUTHORS"]
+        files["manifest.json"] = json.dumps(manifest).encode()
+        with self.assertRaisesRegex(ValueError, "Missing package legal notices"):
+            RELEASE.validate_attribution(files, target, "expanded")
+
+    def test_archives_reject_unsafe_members_before_publication(self):
+        for name in (
+            "../escape",
+            "/absolute",
+            "licenses/../escape",
+            "C:/escape",
+            "licenses\\escape",
+        ):
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(ValueError, "Unsafe archive"),
+                tarfile.open(
+                    fileobj=io.BytesIO(self.tar_bytes({name: b"bad"})), mode="r:gz"
+                ) as archive,
+            ):
+                RELEASE.read_attribution(archive, "licenses/")
+
+    def test_archive_binary_is_required_before_any_upload(self):
+        target = RELEASE.TARGETS[0]
+        for payload in (
+            {},
+            {"caudra": b""},
+            {"caudra": b"binary", "unexpected": b"extra"},
+        ):
+            self.seed_archives()
+            files = {
+                f"licenses/{name}": data
+                for name, data in self.attribution_files(target).items()
+            }
+            path = self.artifacts / f"caudra-{TAG}-{target}.tar.gz"
+            path.write_bytes(self.tar_bytes(files | payload))
+            with (
+                self.subTest(payload=payload),
+                self.assertRaisesRegex(ValueError, "binary/symbol inventory"),
+            ):
+                self.publish()
+            self.assertFalse(self.upload_calls)
+        for kind in (tarfile.SYMTYPE, tarfile.LNKTYPE, tarfile.FIFOTYPE):
+            output = io.BytesIO()
+            with tarfile.open(fileobj=output, mode="w:gz") as archive:
+                member = tarfile.TarInfo("licenses/NOTICE")
+                member.type = kind
+                member.linkname = "outside"
+                archive.addfile(member)
+            with (
+                self.subTest(kind=kind),
+                self.assertRaisesRegex(ValueError, "Unsafe archive type"),
+                tarfile.open(
+                    fileobj=io.BytesIO(output.getvalue()), mode="r:gz"
+                ) as archive,
+            ):
+                RELEASE.read_attribution(archive, "licenses/")
 
     def test_source_requires_canonical_repository_tag_version_and_exact_checkout(self):
         with patch.object(
@@ -239,7 +530,7 @@ class ReleaseTests(unittest.TestCase):
                     RELEASE.validate_source(repository, ref, sha, self.root)
 
     def test_checked_in_workspace_packages_inherit_the_release_version(self):
-        RELEASE.validate_workspace_versions(RELEASE.ROOT)
+        RELEASE.validate_workspace_versions(Path(__file__).resolve().parent.parent)
 
     def test_source_rejects_independent_package_versions_even_when_labels_match(self):
         for member in (".", "workcell", "workcell/crates/tool-contract"):
@@ -496,31 +787,41 @@ class ReleaseWorkflowTests(unittest.TestCase):
         sections = re.split(r"(?m)^  ([a-z][a-z0-9-]*):\n", jobs)[1:]
         return header, dict(zip(sections[::2], sections[1::2], strict=True))
 
-    def test_heavy_jobs_use_sized_runners_without_moving_control_jobs(self):
-        accelerated = {
+    def test_heavy_jobs_use_resolved_runners_without_moving_control_jobs(self):
+        roles = {
             "rust": {
-                "lint": "blacksmith-8vcpu-ubuntu-2404",
-                "test": "blacksmith-16vcpu-ubuntu-2404",
-                "workcell-native": "blacksmith-8vcpu-ubuntu-2404",
-                "build": "blacksmith-16vcpu-ubuntu-2404",
-                "macos": "blacksmith-6vcpu-macos-15",
-                "windows": "blacksmith-16vcpu-windows-2025",
+                "lint": "linux_x64",
+                "test": "linux_x64_heavy",
+                "workcell-native": "linux_x64",
+                "build": "linux_x64_heavy",
+                "macos": "macos_arm64",
+                "windows": "windows_x64",
             },
-            "nix": {"build": "blacksmith-8vcpu-ubuntu-2404"},
+            "nix": {"build": "linux_x64"},
         }
-        for workflow, runners in accelerated.items():
+        for workflow, runners in roles.items():
             _, jobs = self.workflow(workflow)
             for job, body in jobs.items():
                 with self.subTest(workflow=workflow, job=job):
+                    expected = "ubuntu-24.04"
+                    if job in runners:
+                        expected = (
+                            "${{ fromJSON(needs.changes.outputs.runners)."
+                            + runners[job]
+                            + " }}"
+                        )
                     self.assertEqual(
-                        re.findall(r"(?m)^    runs-on: (\S+)$", body),
-                        [runners.get(job, "ubuntu-24.04")],
+                        re.findall(r"(?m)^    runs-on: (.+)$", body), [expected]
                     )
         _, jobs = self.workflow("release")
         targets = {}
         for job, body in jobs.items():
             if job in ("build-linux", "build-other"):
-                self.assertIn("runs-on: ${{ matrix.runner }}", body)
+                self.assertIn(
+                    "runs-on: ${{ fromJSON(needs.validate.outputs.runners)[matrix.runner] }}",
+                    body,
+                )
+                self.assertIn("needs: [validate, create-release]", body)
                 entries = re.findall(r"- target: (\S+)\n\s+runner: (\S+)", body)
                 for target, runner in entries:
                     self.assertNotIn(target, targets)
@@ -533,13 +834,61 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertEqual(
             targets,
             {
-                "x86_64-unknown-linux-musl": "blacksmith-16vcpu-ubuntu-2404",
-                "aarch64-unknown-linux-musl": "blacksmith-16vcpu-ubuntu-2404-arm",
-                "x86_64-apple-darwin": "macos-15-intel",
-                "aarch64-apple-darwin": "blacksmith-6vcpu-macos-15",
-                "x86_64-pc-windows-msvc": "blacksmith-16vcpu-windows-2025",
+                "x86_64-unknown-linux-musl": "linux_x64_heavy",
+                "aarch64-unknown-linux-musl": "linux_arm64",
+                "x86_64-apple-darwin": "macos_x64",
+                "aarch64-apple-darwin": "macos_arm64",
+                "x86_64-pc-windows-msvc": "windows_x64",
             },
         )
+
+    def test_runner_profiles_resolve_once_in_control_jobs_without_shell_interpolation(
+        self,
+    ):
+        for workflow, control in (
+            ("rust", "changes"),
+            ("nix", "changes"),
+            ("release", "validate"),
+        ):
+            with self.subTest(workflow=workflow):
+                header, jobs = self.workflow(workflow)
+                body = jobs[control]
+                invocation = 'run: python3 scripts/ci-runners.py >> "$GITHUB_OUTPUT"'
+                self.assertEqual("".join(jobs.values()).count(invocation), 1)
+                self.assertIn(invocation, body)
+                self.assertIn("run: python3 scripts/test-ci-runners.py", body)
+                self.assertIn("id: runners", body)
+                for output in ("profile", "runners"):
+                    self.assertIn(
+                        f"{output}: ${{{{ steps.runners.outputs.{output} }}}}", body
+                    )
+                selection = "vars.CAUDRA_RUNNER_PROFILE || 'github'"
+                if control == "changes":
+                    selection = "inputs.runner-profile || " + selection
+                    self.assertIn(
+                        "runner-profile:\n        required: false\n        type: string",
+                        header,
+                    )
+                    for path in (
+                        "scripts/ci-runners.py",
+                        "scripts/test-ci-runners.py",
+                        "scripts/test-release.py",
+                    ):
+                        self.assertIn(f'- "{path}"', body)
+                    self.assertLess(body.index(invocation), body.index("id: filter"))
+                self.assertIn(
+                    "env:\n          CAUDRA_RUNNER_PROFILE: ${{ " + selection + " }}",
+                    body,
+                )
+                self.assertEqual(
+                    "".join(jobs.values()).count("vars.CAUDRA_RUNNER_PROFILE"), 1
+                )
+        _, release = self.workflow("release")
+        for workflow in ("rust", "nix"):
+            self.assertIn(
+                "runner-profile: ${{ needs.validate.outputs.profile }}",
+                release[f"verify-{workflow}"],
+            )
 
     def test_native_jobs_select_supported_python_before_scripts_and_worker(self):
         setup = (
@@ -567,7 +916,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
             self.assertIn("needs: validate", job)
             self.assertIn("source-sha: ${{ github.sha }}", job)
         self.assertIn(
-            "needs: [verify-rust, verify-nix, verify-python]", jobs["create-release"]
+            "needs: [validate, verify-rust, verify-nix, verify-python]",
+            jobs["create-release"],
         )
         self.assertIn("needs: validate", jobs["verify-python"])
         for command in (
@@ -696,18 +1046,34 @@ class ReleaseWorkflowTests(unittest.TestCase):
         _, jobs = self.workflow("release")
         commands = (
             "cargo fetch --locked --manifest-path Cargo.toml",
-            "python3 scripts/build-code-worker.py --target ${{ matrix.target }}",
             'cargo fetch --locked --manifest-path "$(cat target/code-worker/source-manifest-path)"',
             "cargo build --locked --release --package caudra --target ${{ matrix.target }}",
             "python3 scripts/build-attribution.py \\",
         )
         for job in ("build-linux", "build-other"):
             with self.subTest(job=job):
-                lines = [line.strip() for line in jobs[job].splitlines()]
+                lines = [
+                    re.sub(
+                        r"^python3 scripts/time-command\.py [\w-]+ ", "", line.strip()
+                    ).removesuffix(" --timings")
+                    for line in jobs[job].splitlines()
+                ]
                 for command in commands:
                     self.assertEqual(lines.count(command), 1, command)
                 positions = [lines.index(command) for command in commands]
                 self.assertEqual(positions, sorted(positions))
+                if job == "build-linux":
+                    self.assertLess(
+                        jobs[job].index("uses: ./.github/actions/musl-worker"),
+                        jobs[job].index("Build in Alpine container"),
+                    )
+                else:
+                    self.assertLess(
+                        lines.index(
+                            "python3 scripts/build-code-worker.py --target ${{ matrix.target }}"
+                        ),
+                        positions[1],
+                    )
 
     def test_built_binary_version_must_match_release_tag(self):
         _, jobs = self.workflow("release")
@@ -723,11 +1089,16 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn("restore-keys:", restore)
         self.assertNotIn("if:", restore)
         validate, save = validate_and_save.split("uses: actions/cache/save@v5", 1)
-        self.assertIn("run: python3 scripts/build-code-worker.py", validate)
+        self.assertIn("python3 scripts/build-code-worker.py", validate)
+        self.assertIn("TIME_WORKER: ${{ inputs.timing }}", validate)
+        self.assertIn(
+            "python3 scripts/time-command.py worker python3 scripts/build-code-worker.py",
+            validate,
+        )
         self.assertNotIn("if:", validate)
         self.assertIn("if: steps.cache.outputs.cache-hit != 'true'", save)
         self.assertIn("key: ${{ steps.cache.outputs.cache-primary-key }}", save)
-        paths = re.findall(r"(?m)^          (\S.+)$", action)
+        paths = re.findall(r"(?m)^          (\S.+)$", restore + save)
         self.assertEqual(paths, list(WORKER_CACHE_PATHS) * 2)
         for identity in (
             '["rustc", "-vV"]',
@@ -770,6 +1141,79 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("key: release-${{ matrix.target }}", cache)
         self.assertIn("cache-on-failure: true", cache)
         self.assertNotIn("github.ref", cache)
+
+    def test_release_layout_is_frozen_and_passed_to_all_artifacts(self):
+        _, jobs = self.workflow("release")
+        self.assertEqual(
+            "".join(jobs.values()).count("vars.CAUDRA_EXPANDED_ATTRIBUTION"), 1
+        )
+        self.assertIn(
+            "attribution-layout: ${{ steps.source.outputs.attribution-layout }}",
+            jobs["validate"],
+        )
+        for name in ("create-release", "build-linux", "build-other", "publish"):
+            with self.subTest(job=name):
+                self.assertIn(
+                    "ATTRIBUTION_LAYOUT: ${{ needs.validate.outputs.attribution-layout }}",
+                    jobs[name],
+                )
+                self.assertIn('--layout "$ATTRIBUTION_LAYOUT"', jobs[name])
+        self.assertIn("-e ATTRIBUTION_LAYOUT", jobs["build-linux"])
+        self.assertNotIn(
+            "LICENSE NOTICE.md THIRD_PARTY_LICENSES licenses", "".join(jobs.values())
+        )
+
+    def test_release_executes_only_the_dedicated_worker_smoke_target(self):
+        _, jobs = self.workflow("release")
+        for name in ("build-linux", "build-other"):
+            with self.subTest(job=name):
+                body = jobs[name]
+                self.assertEqual(body.count("--test embedded_worker"), 2)
+                self.assertIn("--test embedded_worker --no-run --timings", body)
+                self.assertIn(
+                    "time-command.py smoke-execute cargo test --locked --release", body
+                )
+                self.assertNotIn("caudra-workcell production_host_executes", body)
+                self.assertIn("path: target/cargo-timings/", body)
+        self.assertIn('WORKCELL_REQUIRE_CODE_WORKER: "1"', self.workflow("release")[0])
+
+    def test_musl_cache_keeps_worker_identity_and_source_without_build_targets(self):
+        _, jobs = self.workflow("release")
+        body = jobs["build-linux"]
+        cache = MUSL_WORKER_ACTION.read_text()
+        self.assertNotIn("restore-keys:", cache)
+        self.assertIn("steps.identity.outputs.key", cache)
+        self.assertIn("scripts/build-code-worker.py", cache)
+        self.assertIn("musl-worker-v2-alpine-3.21-", cache)
+        self.assertIn('"$ALPINE_IMAGE" sh -c', body)
+        self.assertIn("source-manifest-path", cache)
+        self.assertIn("steps.identity.outputs.source", cache)
+        self.assertIn('worker["validate_version"](Path("Cargo.lock"))', cache)
+        self.assertIn('python3 scripts/build-code-worker.py --target "$TARGET"', cache)
+        self.assertNotIn("code-worker-build", cache)
+        self.assertNotIn("target/release", cache)
+        self.assertIn("uses: ./.github/actions/musl-worker", body)
+        self.assertIn("ALPINE_IMAGE: ${{ steps.worker.outputs.image }}", body)
+        for text in (body, cache):
+            self.assertIn(
+                '"$GITHUB_WORKSPACE/target/code-worker/source:/cargo/registry/src"',
+                text,
+            )
+
+    def test_musl_warmer_only_produces_from_trusted_main_on_github(self):
+        header, jobs = self.workflow("worker-cache")
+        self.assertIn("workflow_dispatch:", header)
+        self.assertIn("branches: [main]", header)
+        self.assertNotIn("pull_request", header)
+        self.assertIn(
+            "github.repository == 'caudra/caudra' && github.ref == 'refs/heads/main'",
+            jobs["warm"],
+        )
+        self.assertIn("uses: ./.github/actions/musl-worker", jobs["warm"])
+        self.assertIn("runner: ubuntu-24.04\n", jobs["warm"])
+        self.assertIn("runner: ubuntu-24.04-arm\n", jobs["warm"])
+        self.assertNotIn("vars.CAUDRA_RUNNER_PROFILE", jobs["warm"])
+        self.assertNotIn("cargo build", jobs["warm"])
 
     def test_worker_identity_reuses_hosts_but_separates_flags_toolchains_and_paths(
         self,

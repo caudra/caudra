@@ -3,6 +3,8 @@ use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs;
 use std::io::{self, Read, Write};
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -13,6 +15,7 @@ use caudra_storage::{StateDir, StorageError};
 use isahc::Request;
 use isahc::config::{Configurable, RedirectPolicy};
 use isahc::http::Uri;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tempfile::Builder;
 
@@ -36,6 +39,21 @@ const LEGACY_CONTENT: &str = "The previous installation did not contain a licens
 const LICENSE_MANIFEST: &str = "manifest.json";
 const LICENSE_NOTICE: &str = "NOTICE";
 const LICENSE_ATTRIBUTION: &str = "ATTRIBUTION.txt";
+const COMPACT_MARKER: &str = "CAUDRA-ATTRIBUTION compact-v2";
+const ATTRIBUTION_FORMAT_PREFIX: &[u8] = b"CAUDRA-ATTRIBUTION ";
+const COMPACT_FILES: [&str; 5] = [
+    "LICENSE",
+    LICENSE_NOTICE,
+    "THIRD_PARTY_NOTICES.txt",
+    LICENSE_ATTRIBUTION,
+    "attribution.tar.gz",
+];
+const BUNDLE_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+const BUNDLE_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const HASH_BUFFER_BYTES: usize = 32 * 1024;
+#[cfg(windows)]
+const UNSAFE_FILE_ATTRIBUTES: u32 = 0x440;
+const SNAPSHOT_ENV: &str = "CAUDRA_UPDATE_SNAPSHOT";
 const RESTORE_PREFIX: &str = ".caudra-rollback.";
 const LEGACY_WARNING: &str =
     "Warning: this backup predates retained license bundles; no matching notices are available.";
@@ -95,7 +113,11 @@ fi
 mv -- "$binary_stage/next" "$dest_binary"
 committed=true
 rmdir -- "$binary_stage" || :
-echo "Displaced licenses retained at $license_stage"
+if [ "${5:-retain}" = compact ] || [ ! -e "$license_stage/previous" ]; then
+    rm -rf -- "$license_stage"
+else
+    echo "Displaced licenses retained at $license_stage"
+fi
 "#;
 
 #[derive(Debug, thiserror::Error)]
@@ -309,9 +331,9 @@ fn license_path(exe_path: &Path) -> io::Result<PathBuf> {
 fn check_path(path: &Path) -> io::Result<()> {
     for ancestor in path.ancestors() {
         match fs::symlink_metadata(ancestor) {
-            Ok(metadata) if metadata.is_symlink() => {
+            Ok(metadata) if unsafe_metadata(&metadata) => {
                 return Err(io::Error::other(format!(
-                    "refusing symlink at {}",
+                    "refusing symlink, reparse point or special file at {}",
                     ancestor.display()
                 )));
             }
@@ -323,17 +345,25 @@ fn check_path(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn unsafe_metadata(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    if metadata.file_attributes() & UNSAFE_FILE_ATTRIBUTES != 0 {
+        return true;
+    }
+    !metadata.is_file() && !metadata.is_dir()
+}
+
 fn check_tree(path: &Path) -> io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
+    if unsafe_metadata(&metadata) {
+        return Err(io::Error::other(
+            "license tree contains an unsafe file type",
+        ));
+    }
     if metadata.is_dir() {
         for entry in fs::read_dir(path)? {
             check_tree(&entry?.path())?;
         }
-    } else if !metadata.is_file() {
-        return Err(io::Error::other(format!(
-            "expected a regular file or directory at {}",
-            path.display()
-        )));
     }
     Ok(())
 }
@@ -351,7 +381,92 @@ fn check_bundle(path: &Path) -> io::Result<()> {
             )));
         }
     }
+    let manifest = read_bundle_manifest(path)?;
+    let mut marker = Vec::new();
+    fs::File::open(path.join(LICENSE_ATTRIBUTION))?
+        .take(COMPACT_MARKER.len() as u64 + 1)
+        .read_to_end(&mut marker)?;
+    let compact = marker.strip_suffix(b"\n").unwrap_or(&marker) == COMPACT_MARKER.as_bytes();
+    match (manifest.schema_version, manifest.layout.as_deref(), compact) {
+        (1, None | Some("expanded"), false) if !marker.starts_with(ATTRIBUTION_FORMAT_PREFIX) => {
+            return Ok(());
+        }
+        (2, Some("compact"), true) => {}
+        _ => {
+            return Err(io::Error::other(
+                "unsupported or inconsistent bundle layout",
+            ));
+        }
+    }
+    if manifest.target.as_deref().is_none_or(str::is_empty) {
+        return Err(io::Error::other("compact bundle has no target"));
+    }
+    let files = manifest
+        .files
+        .ok_or_else(|| io::Error::other("compact bundle has no file inventory"))?;
+    if files.len() != COMPACT_FILES.len() || fs::read_dir(path)?.count() != COMPACT_FILES.len() + 1
+    {
+        return Err(io::Error::other(
+            "compact bundle must contain exactly six files",
+        ));
+    }
+    let mut seen = HashSet::new();
+    for file in files {
+        if !COMPACT_FILES.contains(&file.path.as_str()) || !seen.insert(file.path.clone()) {
+            return Err(io::Error::other("invalid compact file inventory"));
+        }
+        let source = path.join(&file.path);
+        let metadata = fs::symlink_metadata(&source)?;
+        if !metadata.is_file() || metadata.len() == 0 || metadata.len() > BUNDLE_FILE_BYTES {
+            return Err(io::Error::other("invalid compact file type or size"));
+        }
+        let mut source = fs::File::open(source)?;
+        let mut hash = Sha256::new();
+        let mut buffer = [0; HASH_BUFFER_BYTES];
+        loop {
+            let count = source.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            hash.update(&buffer[..count]);
+        }
+        let digest: String = hash
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        if digest != file.sha256 {
+            return Err(io::Error::other("compact file checksum mismatch"));
+        }
+    }
     Ok(())
+}
+
+fn is_complete_compact_bundle(path: &Path) -> bool {
+    check_bundle(path).is_ok()
+        && read_bundle_manifest(path).is_ok_and(|manifest| manifest.schema_version == 2)
+}
+
+#[derive(Deserialize)]
+struct BundleManifest {
+    schema_version: u64,
+    layout: Option<String>,
+    target: Option<String>,
+    files: Option<Vec<BundleFile>>,
+}
+
+#[derive(Deserialize)]
+struct BundleFile {
+    path: String,
+    sha256: String,
+}
+
+fn read_bundle_manifest(path: &Path) -> io::Result<BundleManifest> {
+    let file = fs::File::open(path.join(LICENSE_MANIFEST))?;
+    if file.metadata()?.len() > BUNDLE_MANIFEST_BYTES {
+        return Err(io::Error::other("bundle manifest too large"));
+    }
+    serde_json::from_reader(file.take(BUNDLE_MANIFEST_BYTES)).map_err(io::Error::other)
 }
 
 fn copy_tree(source: &Path, destination: &Path) -> io::Result<()> {
@@ -453,13 +568,19 @@ fn installer_command(script: &Path, install_dir: &Path, tag: &str) -> Command {
 }
 
 #[cfg(not(windows))]
-fn execute_script(script: &str, install_dir: &Path, tag: &str) -> Result<(), UpdateError> {
+fn execute_script(
+    script: &str,
+    install_dir: &Path,
+    tag: &str,
+    backup: &Path,
+) -> Result<(), UpdateError> {
     let mut tmp = tempfile::NamedTempFile::new().map_err(UpdateError::WriteScript)?;
     tmp.write_all(script.as_bytes())
         .map_err(UpdateError::WriteScript)?;
     tmp.flush().map_err(UpdateError::WriteScript)?;
 
     let status = installer_command(tmp.path(), install_dir, tag)
+        .env(SNAPSHOT_ENV, backup)
         .status()
         .map_err(UpdateError::ExecScript)?;
 
@@ -502,7 +623,7 @@ fn restore_backup(backup_path: &Path, exe_path: &Path) -> Result<(), UpdateError
     let licenses = license_path(exe_path).map_err(err)?;
     check_path(&licenses).map_err(err)?;
     if licenses.try_exists().map_err(err)? {
-        check_bundle(&licenses).map_err(err)?;
+        check_tree(&licenses).map_err(err)?;
     }
     let (binary, saved_licenses) = if fs::metadata(backup_path).map_err(err)?.is_dir() {
         (
@@ -532,7 +653,12 @@ fn restore_backup(backup_path: &Path, exe_path: &Path) -> Result<(), UpdateError
         .arg(binary)
         .arg(saved_licenses.as_deref().unwrap_or_else(|| Path::new("")))
         .arg(exe_path)
-        .arg(licenses)
+        .arg(&licenses)
+        .arg(if is_complete_compact_bundle(&licenses) {
+            "compact"
+        } else {
+            "retain"
+        })
         .status()
         .map_err(err)?;
     if !status.success() {
@@ -567,9 +693,15 @@ fn restore_files(
     if let Some(saved) = saved_licenses {
         copy_tree(saved, &license_stage.path().join("next"))?;
     }
+    let remove_displaced = is_complete_compact_bundle(licenses);
     let license_stage = license_stage.keep();
-    println!("Displaced licenses retained at {}", license_stage.display());
-    replace_installation(binary_stage.path(), &license_stage, exe_path, licenses)
+    replace_installation(binary_stage.path(), &license_stage, exe_path, licenses)?;
+    if remove_displaced || !license_stage.join("previous").try_exists()? {
+        fs::remove_dir_all(&license_stage)?;
+    } else {
+        println!("Displaced licenses retained at {}", license_stage.display());
+    }
+    Ok(())
 }
 
 fn replace_installation(
@@ -667,7 +799,12 @@ fn package_manager(exe: &Path) -> Option<&'static str> {
 }
 
 #[cfg(windows)]
-fn prepare_windows_update(script: &str, install_dir: &Path, tag: &str) -> Result<(), UpdateError> {
+fn prepare_windows_update(
+    script: &str,
+    install_dir: &Path,
+    tag: &str,
+    backup: &Path,
+) -> Result<(), UpdateError> {
     let mut file = Builder::new()
         .prefix("caudra-update-")
         .suffix(".ps1")
@@ -684,6 +821,7 @@ fn prepare_windows_update(script: &str, install_dir: &Path, tag: &str) -> Result
         "$env:{INSTALL_DIR_ENV} = {}",
         quote(&install_dir.to_string_lossy())
     );
+    println!("$env:{SNAPSHOT_ENV} = {}", quote(&backup.to_string_lossy()));
     println!("{}", windows_update_command(&path, tag));
     println!(
         "Remove the saved installer after it completes: {}",
@@ -753,13 +891,13 @@ pub fn update(
 
     #[cfg(windows)]
     {
-        prepare_windows_update(&script, &install_dir, &release.tag)?;
+        prepare_windows_update(&script, &install_dir, &release.tag, &backup_path)?;
         println!("Previous version saved to: {}", backup_path.display());
     }
 
     #[cfg(not(windows))]
     {
-        execute_script(&script, &install_dir, &release.tag)?;
+        execute_script(&script, &install_dir, &release.tag, &backup_path)?;
         println!();
         println!("Updated successfully.");
         println!("Previous version saved to: {}", backup_path.display());
@@ -813,6 +951,7 @@ mod tests {
         license_path, needs_sudo, package_manager, replace_installation, restore_backup,
         save_snapshot, snapshot_licenses, verify_checksum, windows_update_command,
     };
+    use super::{COMPACT_FILES, COMPACT_MARKER, check_bundle, is_complete_compact_bundle};
 
     const OLD_BINARY: &str = "previous executable";
     const NEW_BINARY: &str = "current executable";
@@ -824,6 +963,16 @@ mod tests {
     const INSTALLER_NAME: &str = "install.sh";
     const INSTALLER_CONTENT: &[u8] = b"set -eu\n";
     const RELEASE_TAG: &str = "v0.2.0-preview.1";
+    const COMPACT_TARGET: &str = "x86_64-unknown-linux-musl";
+    const COMPANION: &[u8] = &[
+        31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 237, 205, 49, 10, 131, 64, 20, 132, 225, 87, 123, 10,
+        241, 0, 225, 169, 155, 20, 185, 76, 88, 194, 138, 6, 92, 193, 103, 108, 130, 119, 119, 147,
+        38, 96, 31, 17, 242, 127, 205, 12, 211, 76, 239, 99, 215, 4, 155, 78, 15, 27, 162, 252,
+        134, 38, 23, 231, 62, 153, 108, 83, 181, 58, 127, 251, 123, 47, 213, 185, 90, 114, 149, 29,
+        60, 109, 242, 99, 186, 151, 255, 244, 42, 236, 222, 134, 222, 223, 230, 48, 90, 55, 196,
+        226, 90, 46, 153, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 142, 110, 5, 22, 68, 234, 21,
+        0, 40, 0, 0,
+    ];
     #[cfg(unix)]
     const FAIL_BINARY_RENAME: &str = r#"
 mv() {
@@ -970,6 +1119,165 @@ mv() {
         fs::write(path.join(LICENSE_NOTICE), notice).unwrap();
         fs::write(path.join(LICENSE_ATTRIBUTION), notice).unwrap();
         fs::write(path.join("third-party/nested/LICENSE"), notice).unwrap();
+    }
+
+    fn write_compact_bundle(path: &Path) {
+        fs::create_dir_all(path).unwrap();
+        let mut files = Vec::new();
+        for name in COMPACT_FILES {
+            let content = match name {
+                LICENSE_ATTRIBUTION => format!("{COMPACT_MARKER}\n").into_bytes(),
+                "attribution.tar.gz" => COMPANION.to_owned(),
+                _ => OLD_NOTICE.as_bytes().to_owned(),
+            };
+            fs::write(path.join(name), &content).unwrap();
+            let digest: String = Sha256::digest(&content)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            files.push(serde_json::json!({"path": name, "sha256": digest}));
+        }
+        fs::write(
+            path.join(LICENSE_MANIFEST),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 2,
+                "layout": "compact",
+                "target": COMPACT_TARGET,
+                "files": files,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test_case(false; "compact_to_expanded")]
+    #[test_case(true; "compact_to_compact")]
+    fn compact_snapshot_and_rollback_keep_companion_compressed(compact: bool) {
+        let (_root, exe, licenses, backup) = installation(false);
+        write_compact_bundle(&licenses);
+        save_snapshot(&exe, &backup).unwrap();
+        fs::remove_dir_all(&licenses).unwrap();
+        if compact {
+            write_compact_bundle(&licenses);
+        } else {
+            write_bundle(&licenses, NEW_NOTICE);
+        }
+        fs::write(&exe, NEW_BINARY).unwrap();
+        restore_backup(&backup, &exe).unwrap();
+        assert_eq!(fs::read_to_string(&exe).unwrap(), OLD_BINARY);
+        check_bundle(&licenses).unwrap();
+        assert_eq!(
+            fs::read_dir(&licenses).unwrap().count(),
+            COMPACT_FILES.len() + 1
+        );
+        assert_eq!(
+            fs::read(licenses.join("attribution.tar.gz")).unwrap(),
+            COMPANION
+        );
+        if compact {
+            assert!(
+                fs::read_dir(licenses.parent().unwrap())
+                    .unwrap()
+                    .all(|entry| {
+                        !entry
+                            .unwrap()
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(RESTORE_PREFIX)
+                    })
+            );
+        }
+    }
+
+    #[test_case("missing"; "missing_companion")]
+    #[test_case("corrupt"; "corrupt_companion")]
+    #[test_case("extra"; "extra_file")]
+    #[test_case("directory"; "directory_companion")]
+    #[test_case("schema"; "unsupported_schema")]
+    #[test_case("marker"; "inconsistent_marker")]
+    fn invalid_compact_backup_never_replaces_installation(case: &str) {
+        let (_root, exe, licenses, backup) = installation(false);
+        write_compact_bundle(&licenses);
+        save_snapshot(&exe, &backup).unwrap();
+        let saved = backup.join(BACKUP_LICENSES);
+        match case {
+            "missing" => fs::remove_file(saved.join("attribution.tar.gz")).unwrap(),
+            "corrupt" => fs::write(saved.join("attribution.tar.gz"), NEW_NOTICE).unwrap(),
+            "extra" => fs::write(saved.join(EXTRA_FILE), EXTRA_CONTENT).unwrap(),
+            "directory" => {
+                fs::remove_file(saved.join("attribution.tar.gz")).unwrap();
+                fs::create_dir(saved.join("attribution.tar.gz")).unwrap();
+            }
+            "marker" => fs::write(saved.join(LICENSE_ATTRIBUTION), NEW_NOTICE).unwrap(),
+            _ => fs::write(saved.join(LICENSE_MANIFEST), "{\"schema_version\":3}").unwrap(),
+        }
+        fs::write(&exe, NEW_BINARY).unwrap();
+        assert!(restore_backup(&backup, &exe).is_err());
+        assert_eq!(fs::read_to_string(exe).unwrap(), NEW_BINARY);
+        check_bundle(&licenses).unwrap();
+    }
+
+    #[test_case("missing", false; "missing_current_companion")]
+    #[test_case("corrupt", false; "corrupt_current_companion")]
+    #[test_case("extra", false; "extra_current_file")]
+    #[test_case("schema", false; "unsupported_current_schema")]
+    #[test_case("manifest", false; "invalid_current_manifest")]
+    #[cfg_attr(unix, test_case("missing", true; "privileged_missing_current_companion"))]
+    #[cfg_attr(unix, test_case("corrupt", true; "privileged_corrupt_current_companion"))]
+    #[cfg_attr(unix, test_case("extra", true; "privileged_extra_current_file"))]
+    #[cfg_attr(unix, test_case("schema", true; "privileged_unsupported_current_schema"))]
+    #[cfg_attr(unix, test_case("manifest", true; "privileged_invalid_current_manifest"))]
+    fn valid_snapshot_restores_and_retains_damaged_current_bundle(case: &str, privileged: bool) {
+        let (_root, exe, licenses, backup) = installation(false);
+        write_compact_bundle(&licenses);
+        save_snapshot(&exe, &backup).unwrap();
+        fs::write(&exe, NEW_BINARY).unwrap();
+        match case {
+            "missing" => fs::remove_file(licenses.join("attribution.tar.gz")).unwrap(),
+            "corrupt" => fs::write(licenses.join("attribution.tar.gz"), NEW_NOTICE).unwrap(),
+            "extra" => fs::write(licenses.join(EXTRA_FILE), EXTRA_CONTENT).unwrap(),
+            "schema" => {
+                fs::write(licenses.join(LICENSE_MANIFEST), "{\"schema_version\":3}").unwrap()
+            }
+            _ => fs::write(licenses.join(LICENSE_MANIFEST), NEW_NOTICE).unwrap(),
+        }
+        let contents = |path: &Path| {
+            let mut files: Vec<_> = fs::read_dir(path)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    (entry.file_name(), fs::read(entry.path()).unwrap())
+                })
+                .collect();
+            files.sort_by(|left, right| left.0.cmp(&right.0));
+            files
+        };
+        let damaged = contents(&licenses);
+        assert!(!is_complete_compact_bundle(&licenses));
+        if privileged {
+            #[cfg(unix)]
+            {
+                let status = Command::new("sh")
+                    .args(["-c", RESTORE_SCRIPT, "caudra-restore-test"])
+                    .arg(backup.join(BACKUP_BINARY))
+                    .arg(snapshot_licenses(&backup).unwrap().unwrap())
+                    .arg(&exe)
+                    .arg(&licenses)
+                    .arg(if is_complete_compact_bundle(&licenses) {
+                        "compact"
+                    } else {
+                        "retain"
+                    })
+                    .status()
+                    .unwrap();
+                assert!(status.success());
+            }
+        } else {
+            restore_backup(&backup, &exe).unwrap();
+        }
+        assert_eq!(fs::read_to_string(exe).unwrap(), OLD_BINARY);
+        check_bundle(&licenses).unwrap();
+        assert_eq!(contents(&retained_licenses(&licenses)), damaged);
     }
 
     fn retained_licenses(licenses: &Path) -> PathBuf {

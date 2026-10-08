@@ -6,6 +6,9 @@ on:
       source-sha:
         required: true
         type: string
+      runner-profile:
+        required: false
+        type: string
   push:
     branches: [main]
   pull_request:
@@ -20,6 +23,8 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       code: ${{ inputs.source-sha != '' && 'true' || steps.filter.outputs.code }}
+      profile: ${{ steps.runners.outputs.profile }}
+      runners: ${{ steps.runners.outputs.runners }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -28,6 +33,12 @@ jobs:
       - run: test "$SOURCE_SHA" = "$GITHUB_SHA"
         env:
           SOURCE_SHA: ${{ inputs.source-sha || github.sha }}
+      - run: python3 scripts/test-ci-runners.py
+      - name: Resolve runner profile
+        id: runners
+        run: python3 scripts/ci-runners.py >> "$GITHUB_OUTPUT"
+        env:
+          CAUDRA_RUNNER_PROFILE: ${{ inputs.runner-profile || vars.CAUDRA_RUNNER_PROFILE || 'github' }}
       - uses: dorny/paths-filter@v4
         if: inputs.source-sha == ''
         id: filter
@@ -55,11 +66,14 @@ jobs:
               - "caudra-workflow/skill/**"
               - "decisions/questions/**"
               - ".github/workflows/nix.yml"
+              - "scripts/ci-runners.py"
+              - "scripts/test-ci-runners.py"
+              - "scripts/test-release.py"
 
   build:
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ${{ fromJSON(needs.changes.outputs.runners).linux_x64 }}
     permissions:
       contents: read
       actions: write

@@ -320,6 +320,147 @@ function Assert-RegularTree([string]$Path) {
     }
 }
 
+function Assert-ArchiveEntries([string]$Path) {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = [IO.Compression.ZipFile]::OpenRead($Path)
+    try {
+        if ($zip.Entries.Count -gt 100000) { throw 'archive inventory too large' }
+        $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        $size = 0L
+        foreach ($entry in $zip.Entries) {
+            $name = $entry.FullName.TrimEnd('/')
+            if ($name -cmatch '[\x00-\x1f\x7f\\:]|(^|/)\.\.?($|/)|//|[. ]($|/)' -or
+                ($name -cnotin @('caudra.exe', 'LICENSE', 'NOTICE.md', 'licenses', 'THIRD_PARTY_LICENSES') -and
+                    -not $name.StartsWith('licenses/') -and -not $name.StartsWith('THIRD_PARTY_LICENSES/')) -or
+                -not $seen.Add($name)) { throw 'unsafe or duplicate archive path' }
+            foreach ($part in ($name -split '/')) {
+                if ($part -match '^(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])([.]|$)') { throw 'unsafe archive device path' }
+            }
+            $kind = ($entry.ExternalAttributes -shr 16) -band 0xF000
+            if ($kind -notin @(0, 0x8000, 0x4000) -or ($entry.ExternalAttributes -band 0x440) -ne 0 -or
+                ($kind -eq 0x4000 -and -not $entry.FullName.EndsWith('/'))) { throw 'refusing archive link or special file' }
+            $size += $entry.Length
+            if ($size -gt $ArchiveLimit) { throw 'expanded archive too large' }
+        }
+    } finally { $zip.Dispose() }
+}
+
+function Read-BundleManifest([string]$Path) {
+    if ((Get-Item -LiteralPath $Path).Length -gt 16MB) { throw 'bundle manifest too large' }
+    $text = [IO.File]::ReadAllText($Path)
+    $tokens = [regex]::Matches($text, '"(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"|[{}\[\]:,]|true|false|null|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?')
+    $stack = [Collections.Generic.Stack[object]]::new()
+    $end = 0
+    for ($i = 0; $i -lt $tokens.Count; $i++) {
+        $token = $tokens[$i]
+        if ($text.Substring($end, $token.Index - $end) -notmatch '^\s*$') { throw 'invalid bundle JSON' }
+        $end = $token.Index + $token.Length
+        if ($token.Value -in @('{', '[')) {
+            $stack.Push([Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase))
+            if ($stack.Count -gt 32) { throw 'bundle nesting limit exceeded' }
+        } elseif ($token.Value -in @('}', ']')) {
+            if ($stack.Count -eq 0) { throw 'invalid bundle JSON' }
+            $null = $stack.Pop()
+        } elseif ($token.Value.StartsWith('"') -and $i + 1 -lt $tokens.Count -and $tokens[$i + 1].Value -eq ':') {
+            $key = ConvertFrom-Json -InputObject $token.Value
+            if ($stack.Count -eq 0 -or -not $stack.Peek().Add($key)) { throw 'duplicate bundle JSON member' }
+        }
+    }
+    if ($stack.Count -ne 0 -or $text.Substring($end) -notmatch '^\s*$') { throw 'invalid bundle JSON' }
+    return ConvertFrom-Json -InputObject $text
+}
+
+function Assert-LicenseBundle([string]$Path, [string]$Target) {
+    Assert-RegularTree $Path
+    foreach ($name in @('manifest.json', 'NOTICE', 'ATTRIBUTION.txt')) {
+        $file = Join-Path $Path $name
+        if (-not (Test-Path -LiteralPath $file -PathType Leaf) -or (Get-Item -LiteralPath $file).Length -eq 0) {
+            throw "archive did not contain licenses/$name"
+        }
+    }
+    $manifest = Read-BundleManifest (Join-Path $Path 'manifest.json')
+    if ($manifest.schema_version -isnot [int] -and $manifest.schema_version -isnot [long]) {
+        throw 'invalid bundle schema version'
+    }
+    $reader = [IO.File]::OpenText((Join-Path $Path 'ATTRIBUTION.txt'))
+    try { $marker = $reader.ReadLine() } finally { $reader.Dispose() }
+    $layout = $manifest.PSObject.Properties['layout']
+    if ($manifest.schema_version -ceq 1 -and (-not $layout -or $layout.Value -ceq 'expanded') -and
+        $marker -cnotlike 'CAUDRA-ATTRIBUTION *') { return }
+    if ($manifest.schema_version -cne 2 -or -not $layout -or $layout.Value -isnot [string] -or $layout.Value -cne 'compact' -or
+        $marker -cne 'CAUDRA-ATTRIBUTION compact-v2' -or $manifest.target -cne $Target) {
+        throw 'unsupported or inconsistent bundle layout'
+    }
+    $names = @('LICENSE', 'NOTICE', 'THIRD_PARTY_NOTICES.txt', 'ATTRIBUTION.txt', 'attribution.tar.gz')
+    $children = @(Get-ChildItem -LiteralPath $Path -Force)
+    if ($children.Count -ne 6 -or @($children | Where-Object { $_.PSIsContainer }).Count -ne 0 -or
+        $manifest.files -isnot [array] -or @($manifest.files).Count -ne 5) { throw 'compact bundle must contain exactly six regular files' }
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($file in $manifest.files) {
+        if ($file.path -cnotin $names -or -not $seen.Add($file.path) -or $file.sha256 -cnotmatch '^[0-9a-f]{64}$') {
+            throw 'invalid compact file inventory'
+        }
+        $source = Join-Path $Path $file.path
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf) -or (Get-Item -LiteralPath $source).Length -eq 0 -or
+            (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash -ine $file.sha256) { throw 'compact file checksum mismatch' }
+    }
+}
+
+function Remove-PreviousBackupPairs([string]$Destination, [string]$LicenseDir, [string]$Keep, [string]$Owner) {
+    foreach ($candidate in (Get-ChildItem -LiteralPath (Split-Path $Destination -Parent) -Force)) {
+        if ($candidate.Name -cnotmatch '^\.caudra-backup\.[A-Za-z0-9]+$' -or $candidate.FullName -eq $Keep) { continue }
+        $bundle = Join-Path (Split-Path $LicenseDir -Parent) $candidate.Name
+        try {
+            foreach ($stage in @($candidate.FullName, $bundle)) {
+                Assert-SafePath $stage
+                Assert-RegularTree $stage
+                if (@(Get-ChildItem -LiteralPath $stage -Force).Count -ne 2) { throw 'unrecognized backup contents' }
+                $marker = Join-Path $stage 'managed-pair'
+                if (-not (Test-Path -LiteralPath $marker -PathType Leaf) -or (Get-Item -LiteralPath $marker).Length -gt 8192 -or
+                    [IO.File]::ReadAllText($marker) -cne $Owner) { throw 'unrecognized backup ownership' }
+            }
+            if (-not (Test-Path -LiteralPath (Join-Path $candidate.FullName 'previous') -PathType Leaf) -or
+                -not (Test-Path -LiteralPath (Join-Path $bundle 'previous') -PathType Container)) { continue }
+            Assert-LicenseBundle (Join-Path $bundle 'previous') (Get-Target)
+            Remove-Item -LiteralPath $bundle -Recurse -Force
+            Remove-Item -LiteralPath $candidate.FullName -Recurse -Force
+        } catch { Write-Verbose "Leaving unrecognized or inaccessible backup: $_" }
+    }
+}
+
+function Test-SameTree([string]$Left, [string]$Right) {
+    $a = Get-Item -LiteralPath $Left -Force
+    $b = Get-Item -LiteralPath $Right -Force
+    if ($a.PSIsContainer -ne $b.PSIsContainer) { return $false }
+    if (-not $a.PSIsContainer) {
+        return $a.Length -eq $b.Length -and
+            (Get-FileHash -LiteralPath $Left -Algorithm SHA256).Hash -ceq (Get-FileHash -LiteralPath $Right -Algorithm SHA256).Hash
+    }
+    $children = @(Get-ChildItem -LiteralPath $Left -Force)
+    if ($children.Count -ne @(Get-ChildItem -LiteralPath $Right -Force).Count) { return $false }
+    foreach ($child in $children) {
+        $other = Join-Path $Right $child.Name
+        if (-not (Test-Path -LiteralPath $other) -or -not (Test-SameTree $child.FullName $other)) { return $false }
+    }
+    return $true
+}
+
+function Test-PreviousSnapshot([string]$BinaryStage, [string]$BundleStage, [bool]$OldBundle) {
+    $snapshot = $env:CAUDRA_UPDATE_SNAPSHOT
+    if (-not $snapshot) { return $false }
+    try {
+        Assert-SafePath $snapshot
+        Assert-RegularTree $snapshot
+        if (@(Get-ChildItem -LiteralPath $snapshot -Force).Count -ne 2) { return $false }
+        if (-not (Test-SameTree (Join-Path $snapshot 'binary') (Join-Path $BinaryStage 'previous'))) { return $false }
+        if ($OldBundle) {
+            Assert-LicenseBundle (Join-Path $snapshot 'licenses') (Get-Target)
+            return Test-SameTree (Join-Path $snapshot 'licenses') (Join-Path $BundleStage 'previous')
+        }
+        return [IO.File]::ReadAllText((Join-Path $snapshot 'no-license-bundle')) -ceq "The previous installation did not contain a license bundle.`n"
+    } catch { return $false }
+}
+
 function Install-Payload([string]$Source, [string]$Licenses, [string]$Destination, [string]$LicenseDir) {
     $suffix = '.caudra-backup.' + [guid]::NewGuid().ToString('N')
     $bundleStage = Join-Path (Split-Path $LicenseDir -Parent) $suffix
@@ -328,8 +469,16 @@ function Install-Payload([string]$Source, [string]$Licenses, [string]$Destinatio
     $newBundle = $false
     $oldBinary = $false
     $committed = $false
+    $retainPrevious = $true
     $recoveryFailed = $false
     $createdStages = @()
+    $previousComplete = $false
+    if ((Test-Path -LiteralPath $Destination -PathType Leaf) -and (Test-Path -LiteralPath $LicenseDir -PathType Container)) {
+        try {
+            Assert-LicenseBundle $LicenseDir (Get-Target)
+            $previousComplete = $true
+        } catch { Write-Verbose "Previous bundle is not eligible for automatic backup rotation: $_" }
+    }
     try {
         New-Item -ItemType Directory -Path $bundleStage | Out-Null
         $createdStages += $bundleStage
@@ -354,6 +503,16 @@ function Install-Payload([string]$Source, [string]$Licenses, [string]$Destinatio
         }
         Move-Item -LiteralPath (Join-Path $binaryStage 'new') -Destination $Destination
         $committed = $true
+        $owner = "caudra-install-pair-v1`n$Destination`n$LicenseDir`n"
+        if (Test-PreviousSnapshot $binaryStage $bundleStage $oldBundle) {
+            $retainPrevious = $false
+            Remove-PreviousBackupPairs $Destination $LicenseDir $binaryStage $owner
+        } elseif ($previousComplete) {
+            foreach ($stage in @($binaryStage, $bundleStage)) {
+                [IO.File]::WriteAllText((Join-Path $stage 'managed-pair'), $owner)
+            }
+            Remove-PreviousBackupPairs $Destination $LicenseDir $binaryStage $owner
+        }
     } finally {
         if (-not $committed) {
             try {
@@ -375,7 +534,7 @@ function Install-Payload([string]$Source, [string]$Licenses, [string]$Destinatio
         }
         if (-not $recoveryFailed) {
             foreach ($stage in $createdStages) {
-                if ($committed -and (Test-Path -LiteralPath (Join-Path $stage 'previous'))) {
+                if ($committed -and $retainPrevious -and (Test-Path -LiteralPath (Join-Path $stage 'previous'))) {
                     Write-Host "previous installation retained in $stage/previous"
                 } elseif (Test-Path -LiteralPath $stage) {
                     Remove-Item -LiteralPath $stage -Recurse -Force
@@ -403,14 +562,16 @@ function Install-Caudra([string]$Tag, [string]$Channel) {
         Save-ReleaseAsset "https://github.com/$Repo/releases/download/$Tag/sha256sums.txt" $sumsPath $ChecksumLimit
         Assert-ArchiveChecksum $sumsPath $zipPath
 
-        Expand-Archive -Path $zipPath -DestinationPath $tmp -Force
+        Assert-ArchiveEntries $zipPath
+        $payload = Join-Path $tmp 'payload'
+        Expand-Archive -Path $zipPath -DestinationPath $payload -Force
 
         $exeName = "$Binary.exe"
-        $src = Join-Path $tmp $exeName
+        $src = Join-Path $payload $exeName
         if (-not (Test-Path -LiteralPath $src)) {
             Write-Err "archive did not contain $exeName"
         }
-        $licenses = Join-Path $tmp "licenses"
+        $licenses = Join-Path $payload "licenses"
         $manifest = Join-Path $licenses "manifest.json"
         if (-not (Test-Path -LiteralPath $manifest -PathType Leaf) -or (Get-Item -LiteralPath $manifest).Length -eq 0) {
             Write-Err "archive did not contain licenses/manifest.json; legacy archives without a license bundle are not supported"
@@ -421,6 +582,7 @@ function Install-Caudra([string]$Tag, [string]$Channel) {
         }
         Assert-RegularTree $src
         Assert-RegularTree $licenses
+        Assert-LicenseBundle $licenses $target
         if (-not (Test-Path -LiteralPath $src -PathType Leaf)) {
             throw "binary source is not a regular file"
         }

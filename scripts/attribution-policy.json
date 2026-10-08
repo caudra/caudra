@@ -3,6 +3,13 @@
   "rust_runtime": {
     "release": "1.99.0",
     "commit_hash": "b940084d7eb6a299eb4bfeb8e34901bc051e7ac4",
+    "required_license_files": [
+      "licenses/Apache-2.0.txt",
+      "licenses/BSD-2-Clause.txt",
+      "licenses/MIT.txt",
+      "licenses/Unicode-3.0.txt"
+    ],
+    "required_license_reason": "The pinned COPYRIGHT-library.html names Apache-2.0 OR MIT for the in-tree library, Unicode-3.0 for library/core/src/unicode, and BSD-2-Clause AND (Apache-2.0 OR MIT) for library/std/src/sys/sync/mutex/fuchsia.rs without local license links. Require their installed canonical texts in addition to all linked licenses; preserve all other supplied legal files unchanged.",
     "reason": "Match rust-toolchain.toml and the reported compiler revision for both artifact and worker; preserve the installed COPYRIGHT-library.html and canonical licenses verbatim, not compiler-only COPYRIGHT.html."
   },
   "description": "Reviewed supplemental license evidence for exact package versions. File hashes prevent silent replacement. Unknown SPDX identifiers and absent license texts fail closed. This policy is not legal clearance.",

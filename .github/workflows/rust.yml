@@ -6,6 +6,9 @@ on:
       source-sha:
         required: true
         type: string
+      runner-profile:
+        required: false
+        type: string
   push:
     branches: ["main"]
   pull_request:
@@ -24,6 +27,8 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       code: ${{ inputs.source-sha != '' && 'true' || steps.filter.outputs.code }}
+      profile: ${{ steps.runners.outputs.profile }}
+      runners: ${{ steps.runners.outputs.runners }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -32,6 +37,12 @@ jobs:
       - run: test "$SOURCE_SHA" = "$GITHUB_SHA"
         env:
           SOURCE_SHA: ${{ inputs.source-sha || github.sha }}
+      - run: python3 scripts/test-ci-runners.py
+      - name: Resolve runner profile
+        id: runners
+        run: python3 scripts/ci-runners.py >> "$GITHUB_OUTPUT"
+        env:
+          CAUDRA_RUNNER_PROFILE: ${{ inputs.runner-profile || vars.CAUDRA_RUNNER_PROFILE || 'github' }}
       - uses: dorny/paths-filter@v4
         if: inputs.source-sha == ''
         id: filter
@@ -50,6 +61,9 @@ jobs:
               - "plugins/**"
               - "scripts/build-code-worker.py"
               - "scripts/test-build-code-worker.py"
+              - "scripts/ci-runners.py"
+              - "scripts/test-ci-runners.py"
+              - "scripts/test-release.py"
               - "docs/content/**"
               - "docs/navigation.json"
               - "docs/examples/**"
@@ -97,7 +111,7 @@ jobs:
     name: Lint
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ${{ fromJSON(needs.changes.outputs.runners).linux_x64 }}
     env:
       WORKCELL_BUNDLED_MONTY_WORKER: ${{ github.workspace }}/target/code-worker/bin/monty
     steps:
@@ -117,7 +131,7 @@ jobs:
     name: Test
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: blacksmith-16vcpu-ubuntu-2404
+    runs-on: ${{ fromJSON(needs.changes.outputs.runners).linux_x64_heavy }}
     env:
       WORKCELL_BUNDLED_MONTY_WORKER: ${{ github.workspace }}/target/code-worker/bin/monty
     steps:
@@ -159,7 +173,7 @@ jobs:
     name: Workcell native features
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ${{ fromJSON(needs.changes.outputs.runners).linux_x64 }}
     env:
       WORKCELL_BUNDLED_MONTY_WORKER: ${{ github.workspace }}/target/code-worker/bin/monty
     steps:
@@ -181,7 +195,7 @@ jobs:
     name: Build
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: blacksmith-16vcpu-ubuntu-2404
+    runs-on: ${{ fromJSON(needs.changes.outputs.runners).linux_x64_heavy }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -198,7 +212,7 @@ jobs:
     name: Check + Test + Build (macOS)
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: blacksmith-6vcpu-macos-15
+    runs-on: ${{ fromJSON(needs.changes.outputs.runners).macos_arm64 }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -231,7 +245,7 @@ jobs:
     name: Lint + Build (Windows)
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: blacksmith-16vcpu-windows-2025
+    runs-on: ${{ fromJSON(needs.changes.outputs.runners).windows_x64 }}
     env:
       WORKCELL_BUNDLED_MONTY_WORKER: ${{ github.workspace }}/target/code-worker/bin/monty.exe
     defaults:

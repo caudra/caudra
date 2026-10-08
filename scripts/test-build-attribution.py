@@ -1,5 +1,6 @@
 import copy
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -26,8 +27,37 @@ MPL = "Mozilla Public License Version 2.0\n3.1. Distribution of Source Form\n10.
 RUNTIME_REPORT = b'<html><title>Copyright notices for The Rust Standard Library</title><a href="licenses/MIT.txt">MIT</a></html>\n'
 RUNTIME_VERSION = "1.99.0"
 RUNTIME_COMMIT = "b940084d7eb6a299eb4bfeb8e34901bc051e7ac4"
+RUNTIME_REQUIRED_LICENSES = (
+    "licenses/Apache-2.0.txt",
+    "licenses/BSD-2-Clause.txt",
+    "licenses/MIT.txt",
+    "licenses/Unicode-3.0.txt",
+)
+# In-tree exception entries from Rust 1.99.0 COPYRIGHT-library.html, lines 66-73/158-165.
+RUNTIME_UNLINKED_EXCEPTIONS = b"""<p>
+<b>File/Directory:</b> <code>library/core/src/unicode</code>
+</p>
+<p><b>License:</b> Unicode-3.0</p>
+<p><b>Copyright:</b> 1991-2024 Unicode, Inc</p>
+<p>
+<b>File/Directory:</b> <code>library/std/src/sys/sync/mutex/fuchsia.rs</code>
+</p>
+<p><b>License:</b> BSD-2-Clause AND (Apache-2.0 OR MIT)</p>
+<p><b>Copyright:</b> 2016 The Fuchsia Authors</p>
+<p><b>Copyright:</b> The Rust Project Developers (see https://thanks.rust-lang.org)</p>
+"""
 NON_ASCII_TEXT = "café-描"
 INVALID_UTF8 = b"\xff"
+COMPACT_FILES = {
+    "LICENSE",
+    "NOTICE",
+    "THIRD_PARTY_NOTICES.txt",
+    "ATTRIBUTION.txt",
+    "manifest.json",
+    "attribution.tar.gz",
+}
+NATIVE_NOTICE = b"/* Copyright Native authors\r\nSPDX-License-Identifier: MPL-2.0 */"
+SOURCE_BYTES = b"// corresponding source\n\x00\xff"
 
 
 def captured_output(data, **kwargs):
@@ -550,6 +580,316 @@ class AttributionTests(unittest.TestCase):
             )
         self.assertEqual((bundles[0] / "NOTICE").read_text(), "Root attribution")
 
+    def compact_fixture(self):
+        (self.root / "LICENSE").write_bytes(MIT.encode())
+        (self.root / "NOTICE").write_bytes(NON_ASCII_TEXT.encode() + b"\r\n")
+        supplements = self.root / "THIRD_PARTY_LICENSES"
+        supplements.mkdir()
+        (supplements / "Inherited.txt").write_bytes(MIT.encode())
+        (self.root / "Cargo.lock").write_text("version = 4\n")
+        app = self.package("app")
+        worker = self.package("worker", "MPL-2.0")
+        for package, text in ((app, MIT), (worker, MPL)):
+            root = Path(package["manifest_path"]).parent
+            (root / "LICENSE").write_bytes(text.encode())
+            (root / "source.rs").write_bytes(SOURCE_BYTES)
+        native = Path(app["manifest_path"]).parent / "native"
+        native.mkdir()
+        (native / "COPYING").write_bytes(MPL.encode())
+        (native / "source.c").write_bytes(NATIVE_NOTICE + b"\nint value = 42;\n")
+        graphs = [
+            (
+                label,
+                {
+                    "workspace_root": str(self.root),
+                    "artifact_root": package,
+                    "selected": [package],
+                },
+            )
+            for label, package in (("artifact", app), ("worker", worker))
+        ]
+        evidence = self.root / "evidence"
+        evidence.mkdir()
+        attribution.write_bundle(evidence, self.root, graphs, "fixture-target", {})
+        return evidence, graphs
+
+    def test_compact_six_files_hashes_label_and_exact_deterministic_evidence(self):
+        evidence, _ = self.compact_fixture()
+        original = {
+            path.relative_to(evidence).as_posix(): path.read_bytes()
+            for path in evidence.rglob("*")
+            if path.is_file()
+        }
+        outputs = [self.root / name for name in ("compact-one", "compact-two")]
+        for output, timestamp in zip(outputs, (123456789, 987654321), strict=True):
+            for path in evidence.rglob("*"):
+                os.utime(path, (timestamp, timestamp))
+            attribution.write_compact_bundle(output, evidence)
+        self.assertEqual(
+            {p.name: p.read_bytes() for p in outputs[0].iterdir()},
+            {p.name: p.read_bytes() for p in outputs[1].iterdir()},
+        )
+        output = outputs[0]
+        self.assertEqual({p.name for p in output.iterdir()}, COMPACT_FILES)
+        self.assertTrue(
+            all(p.is_file() and not p.is_symlink() for p in output.iterdir())
+        )
+        manifest = json.loads((output / "manifest.json").read_bytes())
+        self.assertEqual(
+            (manifest["schema_version"], manifest["layout"]), (2, "compact")
+        )
+        self.assertEqual(manifest["target"], "fixture-target")
+        self.assertEqual(manifest["distribution"], "binary-artifact")
+        self.assertEqual(
+            [
+                (g["name"], g["package"], g["version"], g["default_features"])
+                for g in manifest["graphs"]
+            ],
+            [("artifact", "app", "1.0.0", True), ("worker", "worker", "1.0.0", False)],
+        )
+        self.assertEqual(
+            [entry["path"] for entry in manifest["files"]],
+            sorted(COMPACT_FILES - {"manifest.json"}),
+        )
+        for entry in manifest["files"]:
+            data = (output / entry["path"]).read_bytes()
+            self.assertEqual(
+                (entry["sha256"], entry["size"]), (attribution.digest(data), len(data))
+            )
+        for name in ("LICENSE", "NOTICE"):
+            self.assertEqual((output / name).read_bytes(), original[name])
+        instructions = (output / "ATTRIBUTION.txt").read_bytes()
+        self.assertEqual(instructions.splitlines()[0], b"CAUDRA-ATTRIBUTION compact-v2")
+        self.assertIn(b"companion's sources/*.tar.gz", instructions)
+        self.assertTrue(instructions.endswith(original["ATTRIBUTION.txt"]))
+        reference = manifest["evidence_manifest"]
+        self.assertEqual(reference["archive"], "attribution.tar.gz")
+        self.assertEqual(reference["member"], "manifest.json")
+        self.assertEqual(
+            reference["sha256"], attribution.digest(original["manifest.json"])
+        )
+        self.assertEqual(reference["size"], len(original["manifest.json"]))
+        with tarfile.open(output / reference["archive"]) as archive:
+            self.assertEqual(archive.getnames(), sorted(original))
+            for member in archive:
+                self.assertTrue(member.isfile())
+                self.assertEqual(
+                    (member.mtime, member.uid, member.gid, member.mode),
+                    (0, 0, 0, 0o644),
+                )
+                extracted = archive.extractfile(member)
+                assert extracted is not None
+                self.assertEqual(extracted.read(), original[member.name])
+        inner = json.loads(original["manifest.json"])
+        self.assertEqual(inner["schema_version"], 1)
+        self.assertEqual(
+            len([p for p in inner["packages"] if p.get("source_archive")]), 2
+        )
+        for package in inner["packages"]:
+            with tarfile.open(
+                fileobj=io.BytesIO(original[package["source_archive"]])
+            ) as archive:
+                source = archive.extractfile("source.rs")
+                assert source is not None
+                self.assertEqual(source.read(), SOURCE_BYTES)
+                for entry in package["source_files"]:
+                    extracted = archive.extractfile(entry["path"])
+                    assert extracted is not None
+                    data = extracted.read()
+                    self.assertEqual(entry["sha256"], attribution.digest(data))
+        notices = (output / "THIRD_PARTY_NOTICES.txt").read_bytes()
+        for text in (
+            MIT.encode(),
+            MPL.encode(),
+            NATIVE_NOTICE,
+            RUNTIME_REPORT,
+            original["NOTICE"],
+        ):
+            self.assertEqual(notices.count(text), 1)
+        for package in inner["packages"]:
+            for path in package["notices"]:
+                self.assertIn(("Companion member: " + path).encode(), notices)
+                self.assertIn(original[path], notices)
+            self.assertIn(("id: " + package["id"]).encode(), notices)
+        self.assertIn(b"Native source path: native/source.c", notices)
+        self.assertIn(b"graphs: artifact", notices)
+        self.assertIn(b"graphs: worker", notices)
+        self.assertNotIn(b"int value = 42;", notices)
+
+    def test_compact_rejects_bad_inventory_paths_hashes_and_unlisted_files(self):
+        evidence, _ = self.compact_fixture()
+        path = evidence / "manifest.json"
+        original = path.read_bytes()
+        for bad_path in (
+            "../outside",
+            "/absolute",
+            "C:/escape",
+            "foo\\bar",
+            "./LICENSE",
+            "manifest.json",
+        ):
+            with self.subTest(path=bad_path):
+                manifest = json.loads(original)
+                manifest["files"][0]["path"] = bad_path
+                path.write_text(json.dumps(manifest), encoding="utf-8")
+                with self.assertRaises(attribution.AttributionError):
+                    attribution.write_compact_bundle(self.root / "compact", evidence)
+                self.assertFalse((self.root / "compact").exists())
+        for field, value in (("sha256", "0" * 64), ("size", -1)):
+            manifest = json.loads(original)
+            manifest["files"][0][field] = value
+            path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(attribution.AttributionError, "hash/size"):
+                attribution.write_compact_bundle(self.root / "compact", evidence)
+        path.write_bytes(original)
+        (evidence / "unlisted").write_bytes(b"extra")
+        with self.assertRaisesRegex(attribution.AttributionError, "inventory"):
+            attribution.write_compact_bundle(self.root / "compact", evidence)
+
+    def test_compact_rejects_duplicate_and_malformed_inventory_entries(self):
+        evidence, _ = self.compact_fixture()
+        path = evidence / "manifest.json"
+        original = json.loads(path.read_bytes())
+        malformed = [None, {}, "LICENSE", [None], ["LICENSE"], [{}]]
+        malformed.extend([{"path": value}] for value in (None, 1, True, [], {}))
+        duplicate = copy.deepcopy(original["files"])
+        duplicate.append(copy.deepcopy(duplicate[0]))
+        malformed.append(duplicate)
+        for entries in malformed:
+            with self.subTest(entries=entries):
+                manifest = {**original, "files": entries}
+                path.write_text(json.dumps(manifest), encoding="utf-8")
+                with self.assertRaisesRegex(attribution.AttributionError, "inventory"):
+                    attribution.write_compact_bundle(self.root / "compact", evidence)
+                self.assertFalse((self.root / "compact").exists())
+
+    def test_compact_rejects_symlinks_and_existing_or_nested_output(self):
+        evidence, _ = self.compact_fixture()
+        output = self.root / "compact"
+        output.mkdir()
+        marker = output / "preserve"
+        marker.write_bytes(MIT.encode())
+        with self.assertRaisesRegex(attribution.AttributionError, "already exist"):
+            attribution.write_compact_bundle(output, evidence)
+        self.assertEqual(marker.read_bytes(), MIT.encode())
+        with self.assertRaisesRegex(attribution.AttributionError, "outside"):
+            attribution.write_compact_bundle(evidence / "nested", evidence)
+        link = self.root / "link"
+        link.symlink_to(output, target_is_directory=True)
+        with self.assertRaisesRegex(attribution.AttributionError, "already exist"):
+            attribution.write_compact_bundle(link, evidence)
+        broken = self.root / "broken"
+        broken.symlink_to(self.root / "missing")
+        with self.assertRaisesRegex(attribution.AttributionError, "already exist"):
+            attribution.write_compact_bundle(broken, evidence)
+        for target in (output, self.root / "LICENSE"):
+            with self.subTest(target=target):
+                escape = evidence / "escape"
+                escape.symlink_to(target, target_is_directory=target.is_dir())
+                with self.assertRaisesRegex(attribution.AttributionError, "symlink"):
+                    attribution.write_compact_bundle(self.root / "fresh", evidence)
+                escape.unlink()
+
+    def test_compact_rejects_non_utf8_legal_text_without_replacement(self):
+        evidence, _ = self.compact_fixture()
+        manifest = json.loads((evidence / "manifest.json").read_bytes())
+        entry = next(entry for entry in manifest["files"] if entry["path"] == "NOTICE")
+        entry.update(attribution.emit_file(evidence, "NOTICE", INVALID_UTF8))
+        (evidence / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        with self.assertRaises(UnicodeDecodeError):
+            attribution.write_compact_bundle(self.root / "compact", evidence)
+        self.assertFalse((self.root / "compact").exists())
+
+    def test_cli_defaults_to_compact_and_expanded_preserves_schema_one(self):
+        evidence, graphs = self.compact_fixture()
+        for layout in (None, "compact", "expanded"):
+            with self.subTest(layout=layout):
+                output = self.root / (layout or "default")
+                arguments = [
+                    "build-attribution.py",
+                    "--manifest-path",
+                    str(self.root / "Cargo.toml"),
+                    "--package",
+                    "caudra",
+                    "--target",
+                    "fixture-target",
+                    "--worker-manifest-path",
+                    str(self.root / "worker/Cargo.toml"),
+                    "--worker-package",
+                    "monty-runtime",
+                    "--output-dir",
+                    str(output),
+                ]
+                if layout:
+                    arguments += ["--layout", layout]
+                with (
+                    patch.object(attribution, "ROOT", self.root),
+                    patch.object(attribution.sys, "argv", arguments),
+                    patch.object(attribution, "load_policy", return_value={}),
+                    patch.object(
+                        attribution, "load_graph", side_effect=[g for _, g in graphs]
+                    ),
+                    patch.object(attribution.sys, "stdout"),
+                ):
+                    self.assertEqual(attribution.main(), 0)
+                if layout == "expanded":
+                    self.assertEqual(
+                        {
+                            p.relative_to(evidence): p.read_bytes()
+                            for p in evidence.rglob("*")
+                            if p.is_file()
+                        },
+                        {
+                            p.relative_to(output): p.read_bytes()
+                            for p in output.rglob("*")
+                            if p.is_file()
+                        },
+                    )
+                else:
+                    self.assertEqual({p.name for p in output.iterdir()}, COMPACT_FILES)
+
+    def test_failed_compact_cli_cleans_staging_without_publishing(self):
+        _, graphs = self.compact_fixture()
+        before = set(self.root.iterdir())
+        output = self.root / "output"
+
+        def fail_compaction(staged, evidence):
+            self.assertTrue((evidence / "manifest.json").is_file())
+            staged.mkdir()
+            (staged / "partial").write_bytes(MIT.encode())
+            raise OSError("fixture write failure")
+
+        with (
+            patch.object(attribution, "ROOT", self.root),
+            patch.object(
+                attribution.sys,
+                "argv",
+                [
+                    "build-attribution.py",
+                    "--manifest-path",
+                    str(self.root / "Cargo.toml"),
+                    "--package",
+                    "caudra",
+                    "--target",
+                    "fixture-target",
+                    "--worker-manifest-path",
+                    str(self.root / "worker/Cargo.toml"),
+                    "--worker-package",
+                    "monty-runtime",
+                    "--output-dir",
+                    str(output),
+                ],
+            ),
+            patch.object(attribution, "load_policy", return_value={}),
+            patch.object(attribution, "load_graph", side_effect=[g for _, g in graphs]),
+            patch.object(
+                attribution, "write_compact_bundle", side_effect=fail_compaction
+            ),
+            patch.object(attribution.sys, "stderr"),
+        ):
+            self.assertEqual(attribution.main(), 1)
+        self.assertEqual(set(self.root.iterdir()), before)
+
     @unittest.skipUnless(
         shutil.which("git"), "Git needed for checkout integration fixture"
     )
@@ -1013,8 +1353,10 @@ class RustRuntimeTests(unittest.TestCase):
         (self.docs / "COPYRIGHT.html").write_text("COMPILER ONLY - DO NOT COPY")
         (self.docs / "licenses/MIT.txt").write_text(MIT)
         (self.docs / "licenses/Apache-2.0.txt").write_text("Apache license fixture")
+        (self.docs / "licenses/BSD-2-Clause.txt").write_text("BSD license fixture")
+        (self.docs / "licenses/Unicode-3.0.txt").write_text("Unicode license fixture")
         self.policy = {
-            "rust_runtime": {"release": RUNTIME_VERSION, "commit_hash": RUNTIME_COMMIT}
+            "rust_runtime": json.loads(attribution.POLICY.read_bytes())["rust_runtime"]
         }
         self.version = f"rustc {RUNTIME_VERSION}\nrelease: {RUNTIME_VERSION}\ncommit-hash: {RUNTIME_COMMIT}\nhost: fixture-host\n"
 
@@ -1153,6 +1495,76 @@ class RustRuntimeTests(unittest.TestCase):
         (self.docs / "licenses/MIT.txt").write_bytes(b"")
         with self.assertRaisesRegex(attribution.AttributionError, "Rust runtime"):
             self.discover()
+
+    def test_runtime_requires_reviewed_unlinked_exception_licenses(self):
+        self.assertEqual(
+            self.policy["rust_runtime"]["required_license_files"],
+            list(RUNTIME_REQUIRED_LICENSES),
+        )
+        report = RUNTIME_REPORT.replace(
+            b"</html>", RUNTIME_UNLINKED_EXCEPTIONS + b"</html>"
+        )
+        (self.docs / "COPYRIGHT-library.html").write_bytes(report)
+        links = attribution.RuntimeLinks()
+        links.feed(report.decode())
+        links.close()
+        self.assertEqual(links.licenses, {"licenses/MIT.txt"})
+        original = self.discover()["files"]
+        self.assertEqual(original["COPYRIGHT-library.html"], report)
+        for relative in RUNTIME_REQUIRED_LICENSES:
+            with self.subTest(relative=relative):
+                path = self.docs / relative
+                self.assertEqual(original[relative], path.read_bytes())
+                path.unlink()
+                with self.assertRaisesRegex(
+                    attribution.AttributionError, "license text missing"
+                ) as error:
+                    self.discover()
+                self.assertIn(relative, str(error.exception))
+                path.write_bytes(original[relative])
+
+    def test_runtime_policy_rejects_missing_or_malformed_required_license_inventory(
+        self,
+    ):
+        original = copy.deepcopy(self.policy["rust_runtime"])
+        del self.policy["rust_runtime"]["required_license_files"]
+        with self.assertRaisesRegex(
+            attribution.AttributionError, "required_license_files"
+        ):
+            self.discover()
+        for inventory in (
+            None,
+            [],
+            {},
+            "licenses/MIT.txt",
+            [None],
+            [1],
+            [[]],
+            ["licenses/MIT.txt", "licenses/MIT.txt"],
+            ["../MIT.txt"],
+            ["/licenses/MIT.txt"],
+            ["licenses/../MIT.txt"],
+            ["licenses\\MIT.txt"],
+            ["licenses/sub/MIT.txt"],
+            ["licenses/MIT.html"],
+            ["licenses/MIT.txt?query"],
+            ["licenses/./MIT.txt"],
+        ):
+            with self.subTest(inventory=inventory):
+                self.policy["rust_runtime"] = {
+                    **original,
+                    "required_license_files": inventory,
+                }
+                with self.assertRaisesRegex(
+                    attribution.AttributionError, "Rust runtime"
+                ):
+                    self.discover()
+        for invalid in (None, [], "runtime"):
+            self.policy["rust_runtime"] = invalid
+            with self.assertRaisesRegex(
+                attribution.AttributionError, "policy must be an object"
+            ):
+                self.discover()
 
     def test_runtime_nix_symlinks_preserve_exact_bytes_and_deterministic_hashes(self):
         store = self.root / "nix-store-docs"

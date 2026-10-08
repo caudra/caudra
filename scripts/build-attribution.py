@@ -29,6 +29,8 @@ POLICY = Path(__file__).with_name("attribution-policy.json")
 EXCLUDED_DIRS = {".git", "target", "__pycache__", ".venv", "node_modules"}
 WORKSPACE_BUILD_ENTRIES = {".git", ".cargo", ".cargo-ok", "target"}
 BINARY_DISTRIBUTION = "binary-artifact"
+COMPACT_LABEL = "CAUDRA-ATTRIBUTION compact-v2"
+EVIDENCE_ARCHIVE = "attribution.tar.gz"
 RUST_RUNTIME_REPORT = "COPYRIGHT-library.html"
 RUST_RUNTIME_SCOPE = "Upstream Rust library-wide notices, preserved as supplied: conservative across targets, not a per-artifact link map. Canonical license texts do not by their presence alone imply applicability."
 LICENSE_NAME = re.compile(
@@ -796,6 +798,26 @@ def discover_rust_runtime(manifest, repository, policy):
     manifest = manifest.resolve()
     environment = rust_environment(repository)
     expected = policy.get("rust_runtime", {})
+    if not isinstance(expected, dict):
+        raise AttributionError("Rust runtime policy must be an object")
+    required_files = expected.get("required_license_files")
+    if not isinstance(required_files, list) or not required_files:
+        raise AttributionError(
+            "Rust runtime policy requires a nonempty required_license_files list"
+        )
+    required = {"licenses/MIT.txt", "licenses/Apache-2.0.txt"}
+    reviewed = set()
+    for relative in required_files:
+        if (
+            not isinstance(relative, str)
+            or not re.fullmatch(r"licenses/[A-Za-z0-9][A-Za-z0-9.+_-]*\.txt", relative)
+            or relative in reviewed
+        ):
+            raise AttributionError(
+                f"Invalid Rust runtime required license path: {relative!r}"
+            )
+        reviewed.add(relative)
+    required.update(reviewed)
     pinned_release = tomllib.loads(
         regular_file(repository / "rust-toolchain.toml").decode()
     )["toolchain"]["channel"]
@@ -858,7 +880,7 @@ def discover_rust_runtime(manifest, repository, policy):
         relative = "licenses/" + path.name
         safe_relative(relative)
         collected[relative] = runtime_legal_file(path)
-    required = links.licenses | {"licenses/MIT.txt", "licenses/Apache-2.0.txt"}
+    required.update(links.licenses)
     if missing := required - collected.keys():
         raise AttributionError(
             "Rust runtime license text missing: " + ", ".join(sorted(missing))
@@ -1174,6 +1196,195 @@ def write_bundle(
     return manifest
 
 
+def validated_bundle(root):
+    inventory = {p.relative_to(root).as_posix() for p in files(root, excluded=set())}
+    manifest_bytes = regular_file(confined_file(root, "manifest.json"))
+    manifest = json.loads(manifest_bytes.decode("utf-8"))
+    if manifest["schema_version"] != 1:
+        raise AttributionError("Compact layout requires schema 1 evidence")
+    entries = manifest.get("files")
+    if not isinstance(entries, list):
+        raise AttributionError("Evidence inventory files must be a list")
+    expected = {"manifest.json"}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise AttributionError("Evidence inventory entry must be an object")
+        relative = entry.get("path")
+        if (
+            not isinstance(relative, str)
+            or safe_relative(relative).as_posix() != relative
+            or relative in expected
+        ):
+            raise AttributionError(f"Invalid evidence inventory path: {relative!r}")
+        data = regular_file(confined_file(root, relative))
+        if entry["size"] != len(data) or entry["sha256"] != digest(data):
+            raise AttributionError(f"Evidence hash/size mismatch: {relative}")
+        expected.add(relative)
+    if expected != inventory:
+        raise AttributionError("Evidence inventory does not match staged files")
+    return manifest, manifest_bytes, inventory
+
+
+def compact_notices(root, manifest, inventory):
+    references = {}
+
+    def reference(path, association):
+        safe_relative(path)
+        if path not in inventory:
+            raise AttributionError(f"Missing legal evidence member: {path}")
+        references.setdefault(path, set()).add(association)
+
+    for path in inventory:
+        if path in ("LICENSE", "NOTICE") or path.startswith("THIRD_PARTY_LICENSES/"):
+            reference(path, "Distribution legal evidence")
+    for runtime in manifest["rust_runtime"]:
+        for entry in runtime["files"]:
+            reference(
+                entry["path"],
+                f"Rust runtime {runtime['release']} ({runtime['commit_hash']}); "
+                + "graphs: "
+                + ", ".join(runtime["graphs"]),
+            )
+    for package in manifest["packages"]:
+        graphs = sorted(
+            graph["name"]
+            for graph in manifest["graphs"]
+            if package["id"] in graph["packages"]
+        )
+        association = (
+            f"Package: {package['name']} {package['version']}; id: {package['id']}; "
+            f"source: {package['source']}; graphs: {', '.join(graphs)}; "
+            f"declared: {package['declared_license']}; "
+            f"selected: {' AND '.join(package['selected_license'])}"
+        )
+        for path in package["notices"]:
+            reference(path, association)
+            native_prefix = f"packages/{package['id']}/native-notices/"
+            if path.startswith(native_prefix):
+                reference(
+                    path,
+                    "Native source path: "
+                    + path[len(native_prefix) :].removesuffix(".txt"),
+                )
+    texts = {}
+    for path, associations in sorted(references.items()):
+        data = regular_file(confined_file(root, path))
+        data.decode("utf-8")
+        texts.setdefault(data, []).append((path, sorted(associations)))
+    sections = [
+        (
+            b"THIRD-PARTY NOTICES\n\n"
+            b"Identical byte-for-byte texts are printed once, with every evidence association.\n"
+            b"Member paths below are inside attribution.tar.gz, not loose files.\n"
+            b"The companion manifest.json retains complete graph, package, native-source-path,\n"
+            b"license-selection and corresponding-source associations. No legal text is filtered.\n"
+        )
+    ]
+    for data, associations in texts.items():
+        lines = ["", "=" * 72, "Text SHA-256: " + digest(data)]
+        for path, owners in associations:
+            lines.append("Companion member: " + path)
+            lines.extend("  " + owner for owner in owners)
+        lines.append("--- BEGIN ORIGINAL TEXT ---\n")
+        sections.extend(
+            [
+                "\n".join(lines).encode("utf-8"),
+                data,
+                b"\n--- END ORIGINAL TEXT ---\n",
+            ]
+        )
+    return b"".join(sections)
+
+
+def require_fresh_output(output):
+    if output.exists() or output.is_symlink():
+        raise AttributionError(f"Output must not already exist: {output}")
+
+
+def write_compact_bundle(output, evidence):
+    require_fresh_output(output)
+    if output.resolve().is_relative_to(evidence.resolve()):
+        raise AttributionError("Compact output must be outside the evidence directory")
+    manifest, manifest_bytes, inventory = validated_bundle(evidence)
+    notices = compact_notices(evidence, manifest, inventory)
+    attribution = regular_file(confined_file(evidence, "ATTRIBUTION.txt"))
+    attribution.decode("utf-8")
+    output.mkdir()
+    emitted = [
+        emit_file(output, name, regular_file(confined_file(evidence, name)))
+        for name in ("LICENSE", "NOTICE")
+    ]
+    emitted.append(emit_file(output, "THIRD_PARTY_NOTICES.txt", notices))
+    instructions = f"""{COMPACT_LABEL}
+
+Preserve all six files in this compact attribution bundle together.
+This inventory is not legal clearance. THIRD_PARTY_NOTICES.txt preserves
+deduplicated legal texts and their evidence associations without filtering.
+
+Complete original evidence is supplied offline in {EVIDENCE_ARCHIVE}.
+Extract it into a fresh directory to obtain the original schema 1 manifest.json,
+LICENSE, NOTICE, THIRD_PARTY_LICENSES, policy, locked graphs, package/native
+notices, Rust runtime notices, and corresponding-source archives.
+The outer manifest.json hashes the five companion/document files; the inner
+manifest.json hashes the expanded evidence and each corresponding source file.
+
+MPL source availability: complete corresponding package sources are in the
+companion's sources/*.tar.gz members. After expanding {EVIDENCE_ARCHIVE},
+extract each source archive into its own fresh directory, entirely offline.
+Cargo.lock files are in the companion's graphs/ directory.
+
+ORIGINAL INVENTORY (all file paths below are relative to the companion root):
+
+""".encode()
+    emitted.append(emit_file(output, "ATTRIBUTION.txt", instructions + attribution))
+    with (
+        (output / EVIDENCE_ARCHIVE).open("wb") as destination,
+        gzip.GzipFile(
+            filename="", mode="wb", fileobj=destination, mtime=0
+        ) as compressed,
+        tarfile.open(
+            fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT
+        ) as archive,
+    ):
+        for relative in sorted(inventory):
+            data = regular_file(confined_file(evidence, relative))
+            entry = tarfile.TarInfo(relative)
+            entry.size = len(data)
+            entry.mode = 0o644
+            archive.addfile(entry, io.BytesIO(data))
+    data = regular_file(output / EVIDENCE_ARCHIVE)
+    emitted.append(
+        {"path": EVIDENCE_ARCHIVE, "sha256": digest(data), "size": len(data)}
+    )
+    compact = {
+        "schema_version": 2,
+        "layout": "compact",
+        "target": manifest["target"],
+        "distribution": manifest["distribution"],
+        "scope": manifest["scope"],
+        "graphs": [
+            {
+                key: graph[key]
+                for key in ("name", "package", "version", "default_features")
+            }
+            for graph in manifest["graphs"]
+        ],
+        "evidence_manifest": {
+            "archive": EVIDENCE_ARCHIVE,
+            "member": "manifest.json",
+            "sha256": digest(manifest_bytes),
+            "size": len(manifest_bytes),
+        },
+        "files": sorted(emitted, key=lambda entry: entry["path"]),
+    }
+    emit_file(
+        output,
+        "manifest.json",
+        (json.dumps(compact, indent=2, sort_keys=True) + "\n").encode(),
+    )
+    return compact
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest-path", type=Path, required=True)
@@ -1184,10 +1395,10 @@ def main():
         "--worker-package", choices=("monty-runtime", "monty"), required=True
     )
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--layout", choices=("compact", "expanded"), default="compact")
     args = parser.parse_args()
     try:
-        if args.output_dir.exists() or args.output_dir.is_symlink():
-            raise AttributionError(f"Output must not already exist: {args.output_dir}")
+        require_fresh_output(args.output_dir)
         policy = load_policy(ROOT)
         graphs = [
             (
@@ -1211,6 +1422,11 @@ def main():
             staged = Path(temporary) / "licenses"
             staged.mkdir()
             manifest = write_bundle(staged, ROOT, graphs, args.target, policy)
+            if args.layout == "compact":
+                compact = Path(temporary) / "compact"
+                write_compact_bundle(compact, staged)
+                staged = compact
+            require_fresh_output(args.output_dir)
             staged.rename(args.output_dir)
         size = sum(p.stat().st_size for p in args.output_dir.rglob("*") if p.is_file())
         print(

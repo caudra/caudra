@@ -1,0 +1,97 @@
+name: Cached musl code worker
+description: Prepare a validated Alpine worker and pinned source for releases or main-branch warming
+inputs:
+  target:
+    description: Native musl target
+    required: true
+outputs:
+  image:
+    description: Immutable Alpine image used to build the worker
+    value: ${{ steps.identity.outputs.image }}
+  toolchain:
+    description: Pinned Rust channel used to build the worker
+    value: ${{ steps.identity.outputs.toolchain }}
+runs:
+  using: composite
+  steps:
+    - id: identity
+      shell: python3 {0}
+      env:
+        TARGET: ${{ inputs.target }}
+      run: |
+        import os
+        from pathlib import Path
+        import runpy
+        import subprocess
+        import tomllib
+
+        target = os.environ["TARGET"]
+        if target not in ("x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"):
+            raise ValueError("A native Linux musl target is required")
+        worker = runpy.run_path("scripts/build-code-worker.py")
+        worker["validate_version"](Path("Cargo.lock"))
+        toolchain = tomllib.loads(Path("rust-toolchain.toml").read_text())["toolchain"]["channel"]
+        subprocess.run(["docker", "pull", "alpine:3.21"], check=True)
+        image = subprocess.check_output(
+            ["docker", "image", "inspect", "--format", "{{.Id}}", "alpine:3.21"], text=True
+        ).strip()
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+            output.write(f"image={image}\n")
+            output.write(f"toolchain={toolchain}\n")
+            output.write(f"key=musl-worker-v2-alpine-3.21-{target}-{image.removeprefix('sha256:')}\n")
+            output.write(f"source=target/code-worker/source/*/monty-runtime-{worker['VERSION']}\n")
+    - uses: actions/cache/restore@v5
+      id: cache
+      with:
+        key: ${{ steps.identity.outputs.key }}-${{ hashFiles('rust-toolchain.toml', '.cargo/**', 'scripts/build-code-worker.py', '.github/actions/musl-worker/**') }}
+        path: |
+          target/code-worker/bin
+          target/code-worker/symbols
+          target/code-worker/build-fingerprint
+          target/code-worker/source-manifest-path
+          ${{ steps.identity.outputs.source }}
+    - name: Validate or build musl worker
+      shell: bash
+      env:
+        TARGET: ${{ inputs.target }}
+        ALPINE_IMAGE: ${{ steps.identity.outputs.image }}
+        RUST_TOOLCHAIN: ${{ steps.identity.outputs.toolchain }}
+      run: |
+        mkdir -p target/code-worker/source "$RUNNER_TEMP/alpine-cargo"
+        docker run --rm \
+          -v "$GITHUB_WORKSPACE:/workspace" \
+          -v "$RUNNER_TEMP/alpine-cargo:/cargo" \
+          -v "$GITHUB_WORKSPACE/target/code-worker/source:/cargo/registry/src" \
+          -w /workspace \
+          -e CARGO_HOME=/cargo \
+          -e CARGO_TERM_COLOR=always \
+          -e CARGO_INCREMENTAL=0 \
+          -e CARGO_NET_RETRY=10 \
+          -e TARGET -e RUST_TOOLCHAIN -e CAUDRA_RUNNER_PROFILE \
+          "$ALPINE_IMAGE" sh -c '
+            set -eu
+            apk add --no-cache gcc g++ musl-dev make perl linux-headers curl git ca-certificates pkgconf python3-dev
+            git config --global --add safe.directory /workspace
+            curl --proto "=https" --tlsv1.2 --retry 5 --retry-delay 2 --retry-all-errors -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain "$RUST_TOOLCHAIN" --profile minimal --target "$TARGET"
+            . "$CARGO_HOME/env"
+            python3 scripts/time-command.py worker python3 scripts/build-code-worker.py --target "$TARGET"
+          '
+    - name: Restore worker ownership after Alpine
+      if: always()
+      shell: bash
+      run: |
+        for directory in target "$RUNNER_TEMP/alpine-cargo"; do
+          if [ -d "$directory" ]; then
+            sudo chown -R "$(id -u):$(id -g)" "$directory"
+          fi
+        done
+    - uses: actions/cache/save@v5
+      if: steps.cache.outputs.cache-hit != 'true'
+      with:
+        key: ${{ steps.cache.outputs.cache-primary-key }}
+        path: |
+          target/code-worker/bin
+          target/code-worker/symbols
+          target/code-worker/build-fingerprint
+          target/code-worker/source-manifest-path
+          ${{ steps.identity.outputs.source }}
