@@ -166,7 +166,11 @@ The hybrid profile requires the Ubicloud integration and account-level Premium R
 
 Release archives include their license bundles and the embedded Python worker. Binary distribution clearance does not imply clearance to distribute every dependency source or build cache. Review the attribution evidence and unresolved exceptions before publication. Repository-level immutable releases and protected release tags are recommended operational settings, not guarantees made by the workflow.
 
-The website deploys separately. Its pinned application source supplies canonical docs and bootstrap installers. Installer changes require a source-pin update after the source commit is available. Self-updates use the installer attached to the selected GitHub Release.
+The website deploys separately. Verified development commits propose a `docs-source.json` update in the website repository. The GitHub App merges only its unchanged, pin-only PR after the canonical website checks pass. Website `main` deploys to a persistent preview, while pull requests retain their own previews. This flow does not require GitHub's native auto-merge feature or bypass branch protections.
+
+After the complete release workflow succeeds, the source automation dispatches the published release identity to the website repository. The website independently verifies the release, successful source run, and exact tag commit before building production inputs. Production uses that release commit, not a newer development pin. Drafts, failed releases, moved tags, and stale automatic release requests cannot promote a preview to production. Self-updates use the installer attached to the selected GitHub Release.
+
+Configure `WEBSITE_APP_ID` and `WEBSITE_APP_PRIVATE_KEY` in the application repository. Install the App only on the website repository with Contents and Pull requests write permissions and Actions read permission. The latter lets the bot verify private website CI before merging. Deploy the website workflow changes before enabling the source automation changes so development pin updates cannot reach the old production-on-main path.
 
 ## Commits and pull requests
 

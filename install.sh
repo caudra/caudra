@@ -289,13 +289,72 @@ path_has_dir() {
     esac
 }
 
+quote_shell_arg() {
+    printf '%s\n' "$1" | awk -v shell="${2:-sh}" '
+        BEGIN { printf "\047" }
+        {
+            if (NR > 1) printf "\n"
+            for (i = 1; i <= length($0); i++) {
+                c = substr($0, i, 1)
+                if (c == "\047") printf "\047\"\047\"\047"
+                else if (shell == "fish" && c == "\\") printf "\\\\"
+                else printf "%s", c
+            }
+        }
+        END { printf "\047" }
+    '
+}
+
+warn_root_install() {
+    if is_windows || [ "$(id -u)" != 0 ]; then
+        return 0
+    fi
+    if [ -z "${CAUDRA_INSTALL_DIR:-}" ]; then
+        printf 'warning: running as root; the default installation in %s is for root, not other users.\n' "${INSTALL_DIR}" >&2
+        printf '%s\n' 'For a personal installation, rerun as your normal user without sudo.' >&2
+    else
+        printf 'warning: running as root; installing to the explicitly selected directory %s.\n' "${INSTALL_DIR}" >&2
+        printf '%s\n' "PATH guidance is for root's shell; other users may need to configure their own PATH." >&2
+    fi
+}
+
 warn_path() {
     dir="$1"
+    shell_name="${SHELL:-}"
+    shell_name="${shell_name##*/}"
+    quoted_dir="$(quote_shell_arg "${dir}" "${shell_name}")"
+    printf '\n%s\n  %s\n' 'Run Caudra now (no PATH change needed):' "$(quote_shell_arg "${dir}/${BINARY}" "${shell_name}")"
     if path_has_dir "${dir}"; then
         return 0
     fi
-    echo "note: ${dir} is not in PATH; add it to your shell config, e.g.:"
-    echo "  export PATH=\"${dir}:\$PATH\""
+    printf '\nnote: %s is not in PATH.\n' "${dir}"
+    printf '%s\n' 'The installer runs as a child process and cannot change PATH in your current terminal.'
+    printf '%s\n' 'No shell startup files were changed. Copy and run the commands below yourself.'
+    case "${shell_name}" in
+        fish)
+            printf '\n%s\n  set -gx PATH %s $PATH\n  caudra\n' 'For this fish terminal:' "${quoted_dir}"
+            printf '\n%s\n  fish_add_path --prepend -- %s\n' 'For future fish sessions, run once (persists in fish_user_paths):' "${quoted_dir}"
+            ;;
+        *)
+            printf '\n%s\n  export PATH=%s:"$PATH"\n  caudra\n' 'For this terminal (zsh, bash, or POSIX sh):' "${quoted_dir}"
+            case "${shell_name}" in
+                zsh)
+                    printf '\nFor future zsh terminals, add this line to %s:\n' "$(quote_shell_arg "${ZDOTDIR-${HOME}}/.zshrc")"
+                    ;;
+                bash)
+                    printf '\nFor future interactive bash terminals, add this line to %s:\n' "$(quote_shell_arg "${HOME}/.bashrc")"
+                    ;;
+                *)
+                    printf '\n%s\n' 'For future sessions, add this line to your shell startup file (for POSIX sh, ~/.profile):'
+                    ;;
+            esac
+            printf '  export PATH=%s:"$PATH"\n' "${quoted_dir}"
+            if [ "${shell_name}" = bash ]; then
+                printf '%s\n' 'For login bash terminals, ensure ~/.bash_profile (or your active login profile) sources ~/.bashrc, or add the same line there.'
+            fi
+            printf '%s\n' 'Then open a new terminal, or run the export command above in this one.'
+            ;;
+    esac
 }
 
 warn_shadowed() {
@@ -591,6 +650,7 @@ main() {
     fi
 
     INSTALL_DIR="${CAUDRA_INSTALL_DIR:-$(default_install_dir)}"
+    warn_root_install
 
     tmp="$(mktemp -d)"
     trap 'rm -rf "${tmp}"' EXIT

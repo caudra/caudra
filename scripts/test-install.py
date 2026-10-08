@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -20,6 +21,10 @@ OLD_BINARY = b"previous executable"
 NEW_BINARY = b"replacement executable"
 OLD_MANIFEST = b'{"schema_version":1,"previous":true}\n'
 OLD_ATTRIBUTION = b"previous attribution\n"
+RUN_NOW = "Run Caudra now (no PATH change needed):"
+CHILD_PATH_NOTICE = "cannot change PATH in your current terminal"
+NO_SHELL_EDITS = "No shell startup files were changed."
+ROOT_WARNING = "warning: running as root"
 BUNDLE_FILES = {
     "manifest.json": b'{"schema_version":1}\n',
     "ATTRIBUTION.txt": b"Dependency attribution\n",
@@ -528,6 +533,7 @@ class ReleaseCases(unittest.TestCase):
             **os.environ,
             "PATH": f"{self.commands}{os.pathsep}{os.environ['PATH']}",
             "HOME": str(self.root / "home"),
+            "SHELL": "/bin/sh",
             "TMPDIR": str(self.root),
             "CAUDRA_INSTALL_DIR": str(self.install_dir),
             "TEST_ARCHIVE": str(self.archive),
@@ -535,7 +541,7 @@ class ReleaseCases(unittest.TestCase):
             "TEST_SCENARIO": str(self.root / "scenario.json"),
             "TEST_REQUEST_LOG": str(self.root / "requests.jsonl"),
         }
-        for key in ("GITHUB_TOKEN", "GH_TOKEN", "CAUDRA_UPDATE_SNAPSHOT"):
+        for key in ("GITHUB_TOKEN", "GH_TOKEN", "CAUDRA_UPDATE_SNAPSHOT", "ZDOTDIR"):
             self.env.pop(key, None)
         if self.binary_name == "caudra.exe":
             return
@@ -546,6 +552,7 @@ class ReleaseCases(unittest.TestCase):
             f'exec "{shutil.which("tar")}" "$@"',
         )
         self.command("uname", 'case "$1" in -s) echo Linux;; -m) echo x86_64;; esac')
+        self.command("id", "printf '1000\\n'")
         self.command(
             "sudo",
             'printf "%s\\n" "$*" >> "$TEST_SUDO_LOG"\n'
@@ -636,6 +643,163 @@ class ReleaseCases(unittest.TestCase):
 
 @unittest.skipUnless(os.name == "posix", "Exercises the POSIX installer")
 class InstallTests(ReleaseCases):
+    def test_shell_specific_path_guidance_does_not_edit_startup_files(self):
+        home = Path(self.env["HOME"])
+        zdotdir = home / "user's zsh config"
+        self.env["ZDOTDIR"] = str(zdotdir)
+        configs = [
+            home / ".profile",
+            home / ".bashrc",
+            home / ".bash_profile",
+            home / ".zshrc",
+            zdotdir / ".zshrc",
+            home / ".config/fish/config.fish",
+        ]
+        for path in configs:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("# user configuration\n")
+        before = {path: path.read_bytes() for path in home.rglob("*") if path.is_file()}
+        for shell in ("zsh", "bash", "fish", "sh", "unknown", ""):
+            with self.subTest(shell=shell):
+                if shell:
+                    self.env["SHELL"] = f"/bin/{shell}"
+                else:
+                    self.env.pop("SHELL", None)
+                result = self.install()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(RUN_NOW, result.stdout)
+                self.assertIn(CHILD_PATH_NOTICE, result.stdout)
+                self.assertIn(NO_SHELL_EDITS, result.stdout)
+                self.assertNotIn(ROOT_WARNING, result.stderr)
+                if shell == "fish":
+                    self.assertIn("set -gx PATH ", result.stdout)
+                    self.assertIn("fish_add_path --prepend -- ", result.stdout)
+                    self.assertNotIn("export PATH=", result.stdout)
+                else:
+                    self.assertIn("export PATH=", result.stdout)
+                    if shell == "zsh":
+                        self.assertIn(
+                            shlex.quote(str(zdotdir / ".zshrc")), result.stdout
+                        )
+                        self.assertNotIn(str(home / ".zshrc"), result.stdout)
+                    elif shell == "bash":
+                        self.assertIn(str(home / ".bashrc"), result.stdout)
+                        self.assertIn("~/.bash_profile", result.stdout)
+                    else:
+                        self.assertIn("POSIX sh, ~/.profile", result.stdout)
+                self.assertEqual(
+                    {
+                        path: path.read_bytes()
+                        for path in home.rglob("*")
+                        if path.is_file()
+                    },
+                    before,
+                )
+
+    def test_zsh_guidance_defaults_to_home_without_creating_config(self):
+        self.env["SHELL"] = "/bin/zsh"
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(str(Path(self.env["HOME"]) / ".zshrc"), result.stdout)
+        self.assertFalse(Path(self.env["HOME"]).exists())
+
+    def test_printed_commands_handle_shell_metacharacters(self):
+        self.install_dir = (
+            self.root / "user's $HOME `false` $(false) \\\" prefix" / "bin"
+        )
+        self.env["CAUDRA_INSTALL_DIR"] = str(self.install_dir)
+        marker = "installed caudra executed"
+        (self.payload / self.binary_name).write_text(
+            f"#!/bin/sh\nprintf '%s\\n' '{marker}'\n"
+        )
+        for shell in ("sh", "bash", "zsh", "fish"):
+            with self.subTest(shell=shell):
+                executable = shutil.which(shell)
+                if executable is None:
+                    self.skipTest(f"{shell} is not installed")
+                self.env["SHELL"] = executable
+                result = self.install()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                lines = result.stdout.splitlines()
+                direct = lines[lines.index(RUN_NOW) + 1].strip()
+                path_command = next(
+                    line.strip()
+                    for line in lines
+                    if line.startswith(("  export PATH=", "  set -gx PATH "))
+                )
+                commands = [direct, f"{path_command}\ncaudra"]
+                if shell == "fish":
+                    commands.append(
+                        next(
+                            line.strip()
+                            for line in lines
+                            if line.startswith("  fish_add_path ")
+                        )
+                        + "\ncaudra"
+                    )
+                    commands.append("caudra")
+                for command in commands:
+                    execution = subprocess.run(
+                        [executable, "-c", command],
+                        env={
+                            **self.env,
+                            "XDG_CONFIG_HOME": str(self.root / "fish-config"),
+                        },
+                        cwd=self.root,
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                        check=False,
+                    )
+                    self.assertEqual(execution.returncode, 0, execution.stderr)
+                    self.assertEqual(execution.stdout.strip(), marker)
+
+    def test_path_already_contains_install_directory(self):
+        self.env["PATH"] += os.pathsep + str(self.install_dir)
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(RUN_NOW, result.stdout)
+        self.assertNotIn(CHILD_PATH_NOTICE, result.stdout)
+        self.assertNotIn("export PATH=", result.stdout)
+
+    def test_similar_path_entry_does_not_suppress_guidance(self):
+        self.env["PATH"] += os.pathsep + str(self.install_dir) + "-other"
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(CHILD_PATH_NOTICE, result.stdout)
+
+    def test_shadowed_binary_still_reports_direct_invocation(self):
+        self.command("caudra", "exit 1")
+        self.env["PATH"] += os.pathsep + str(self.install_dir)
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(RUN_NOW, result.stdout)
+        self.assertIn(shlex.quote(str(self.install_dir / "caudra")), result.stdout)
+        self.assertIn(f"which shadows {self.install_dir / 'caudra'}", result.stdout)
+
+    def test_default_root_install_warns_about_user_scope(self):
+        self.command("id", "printf '0\\n'")
+        self.env.pop("CAUDRA_INSTALL_DIR")
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(ROOT_WARNING, result.stderr)
+        self.assertIn("for root, not other users", result.stderr)
+        self.assertIn("without sudo", result.stderr)
+        default_binary = Path(self.env["HOME"]) / ".local/bin/caudra"
+        self.assertEqual(default_binary.read_bytes(), NEW_BINARY)
+        self.assertIn(str(default_binary.parent), result.stderr)
+
+    def test_explicit_root_install_does_not_claim_directory_is_root_only(self):
+        self.command("id", "printf '0\\n'")
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(ROOT_WARNING, result.stderr)
+        self.assertIn("explicitly selected directory", result.stderr)
+        self.assertIn(str(self.install_dir), result.stderr)
+        self.assertNotIn("for root, not other users", result.stderr)
+        self.assertIn("other users may need to configure their own PATH", result.stderr)
+        self.assert_installed()
+
     def test_unsafe_archive_entries_are_rejected_before_extraction(self):
         self.seed_installation()
         for name, kind in (
@@ -679,7 +843,7 @@ class InstallTests(ReleaseCases):
             with self.subTest(hasher=hasher):
                 commands = self.root / hasher
                 commands.mkdir()
-                for name in ("curl", "uname", "cp", "mv", "mkdir", "tar"):
+                for name in ("curl", "uname", "id", "cp", "mv", "mkdir", "tar"):
                     (commands / name).symlink_to(self.commands / name)
                 for name in (
                     "sh",
@@ -772,6 +936,10 @@ class InstallTests(ReleaseCases):
         self.env["CAUDRA_INSTALL_DIR"] = "custom prefix/bin"
         result = self.install()
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(shlex.quote(str(self.install_dir / "caudra")), result.stdout)
+        self.assertIn(
+            f"export PATH={shlex.quote(str(self.install_dir))}:", result.stdout
+        )
         self.assert_installed()
 
     def test_missing_bundle_preserves_previous_binary(self):

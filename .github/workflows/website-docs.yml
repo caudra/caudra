@@ -2,13 +2,12 @@ name: Website docs source
 
 on:
   workflow_run:
-    workflows: [Rust]
+    workflows: [Rust, Release]
     types: [completed]
-    branches: [main]
   workflow_dispatch:
     inputs:
       run_id:
-        description: Successful canonical Rust push/main run ID to revalidate
+        description: Successful canonical Rust push/main or Release push/tag run ID to revalidate
         required: true
         type: string
 
@@ -17,7 +16,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: website-docs-source
+  group: website-docs-source-${{ github.event.workflow_run.name || format('manual-{0}', inputs.run_id) }}
   cancel-in-progress: false
 
 jobs:
@@ -27,10 +26,9 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
        (github.event.workflow_run.event == 'push' &&
         github.event.workflow_run.head_repository.full_name == 'caudra/caudra' &&
-        github.event.workflow_run.head_branch == 'main' &&
         github.event.workflow_run.conclusion == 'success'))
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 40
     env:
       RUN_ID: ${{ github.event.workflow_run.id || inputs.run_id }}
     steps:
@@ -41,14 +39,24 @@ jobs:
           persist-credentials: false
           sparse-checkout: scripts/update-website-docs.py
           sparse-checkout-cone-mode: false
-      - name: Revalidate canonical Rust run before minting website credential
+      - name: Revalidate canonical Rust or Release run before minting website credential
         id: preflight
         run: python3 scripts/update-website-docs.py --verify-only --run-id "$RUN_ID"
         env:
           SOURCE_TOKEN: ${{ github.token }}
+      - name: Check website App configuration
+        if: steps.preflight.outputs.eligible == 'true'
+        env:
+          APP_ID: ${{ vars.WEBSITE_APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.WEBSITE_APP_PRIVATE_KEY }}
+        run: |
+          if [[ -z "$APP_ID" || -z "$APP_PRIVATE_KEY" ]]; then
+            echo "::error::Set WEBSITE_APP_ID repository variable and WEBSITE_APP_PRIVATE_KEY secret for the website App installation."
+            exit 1
+          fi
       - uses: actions/create-github-app-token@v3
         id: website-token
-        if: steps.preflight.outputs.eligible == 'true'
+        if: steps.preflight.outputs.eligible == 'true' && steps.preflight.outputs.kind == 'rust'
         with:
           app-id: ${{ vars.WEBSITE_APP_ID }}
           private-key: ${{ secrets.WEBSITE_APP_PRIVATE_KEY }}
@@ -56,10 +64,26 @@ jobs:
           repositories: website
           permission-contents: write
           permission-pull-requests: write
-      - name: Propose manifest-only website update
-        if: steps.preflight.outputs.eligible == 'true'
+          permission-actions: read
+      - name: Propose and CI-gate manifest-only preview update
+        if: steps.preflight.outputs.eligible == 'true' && steps.preflight.outputs.kind == 'rust'
         run: python3 scripts/update-website-docs.py --run-id "$RUN_ID" --app-slug "$APP_SLUG"
         env:
           SOURCE_TOKEN: ${{ github.token }}
           WEBSITE_TOKEN: ${{ steps.website-token.outputs.token }}
           APP_SLUG: ${{ steps.website-token.outputs.app-slug }}
+      - uses: actions/create-github-app-token@v3
+        id: release-token
+        if: steps.preflight.outputs.eligible == 'true' && steps.preflight.outputs.kind == 'release'
+        with:
+          app-id: ${{ vars.WEBSITE_APP_ID }}
+          private-key: ${{ secrets.WEBSITE_APP_PRIVATE_KEY }}
+          owner: caudra
+          repositories: website
+          permission-contents: write
+      - name: Dispatch verified published release for production
+        if: steps.preflight.outputs.eligible == 'true' && steps.preflight.outputs.kind == 'release'
+        run: python3 scripts/update-website-docs.py --run-id "$RUN_ID"
+        env:
+          SOURCE_TOKEN: ${{ github.token }}
+          WEBSITE_TOKEN: ${{ steps.release-token.outputs.token }}

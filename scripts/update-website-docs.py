@@ -7,10 +7,19 @@ import os
 import re
 import subprocess
 import sys
+import time
+from datetime import datetime, timezone
+from urllib.parse import quote
 
 SOURCE = "caudra/caudra"
 WEBSITE = "caudra/website"
 WORKFLOW = ".github/workflows/rust.yml"
+RELEASE_WORKFLOW = ".github/workflows/release.yml"
+RELEASE_TAG = re.compile(
+    r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
+    r"(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
+)
 BRANCH = "automation/docs-source"
 MANIFEST = "docs-source.json"
 SHA = re.compile(r"[0-9a-f]{40}")
@@ -22,6 +31,23 @@ DOCGEN_STEP = "Run make gen-docs-check"
 COMMIT_PREFIX = "docs: update source to "
 PAGE_SIZE = 100
 MAX_PAGES = 100
+MAX_TAG_DEPTH = 16
+WEBSITE_WORKFLOW = ".github/workflows/site.yml"
+WEBSITE_STEPS = {
+    "Run bun run test:import",
+    "Run bun run check",
+    "Run bun run test",
+    "Run bun run build",
+    "Run bun run test:output",
+    "Run bun run workers:check",
+    "Run bun run test:browser",
+    "Verify incomplete analytics configuration stays disabled",
+    "Verify enabled analytics with a mocked tracker",
+    "Build and verify deployment artifact",
+}
+CI_WAIT_SECONDS = 30 * 60
+CI_POLL_SECONDS = 30
+CI_TIMEOUT = "Timed out waiting for canonical Website CI; PR left open, retry run_id"
 
 
 class Refusal(RuntimeError):
@@ -105,10 +131,17 @@ class GitHub:
         code = int(status[1]) if status else 0
         if missing and code == 404:
             return None
+        if repo == WEBSITE and path.startswith("actions/") and code == 403:
+            raise Refusal(
+                "Website CI is unreadable: grant the website GitHub App Actions: read "
+                "and approve its installation permissions, then retry"
+            )
         require(
             result.returncode == 0 and 200 <= code < 300 and separator,
             f"GitHub API request failed: {method} {endpoint}",
         )
+        if code == 204 and not body.strip():
+            return None
         try:
             return json.loads(body)
         except ValueError:
@@ -198,6 +231,261 @@ def verified_source(source, run_id):
     if current != revision:
         raise SupersededRun("Verified source is no longer current main")
     return revision
+
+
+def eligible_tag(tag):
+    match = RELEASE_TAG.fullmatch(tag) if isinstance(tag, str) else None
+    return bool(match) and all(
+        not part.isdigit() or part == "0" or not part.startswith("0")
+        for part in (match[4] or "").split(".")
+    )
+
+
+def published_at(release):
+    value = release.get("published_at")
+    require(isinstance(value, str), "Published release is missing its publication time")
+    timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    require(timestamp.tzinfo is not None, "Release publication time needs a timezone")
+    return timestamp.astimezone(timezone.utc)
+
+
+def verified_release(source, run_id):
+    require(type(run_id) is int and run_id > 0, "Expected a positive Release run ID")
+    workflow = source.request(SOURCE, "actions/workflows/release.yml")
+    require(
+        workflow["path"] == RELEASE_WORKFLOW and workflow["state"] == "active",
+        "Release workflow identity is invalid",
+    )
+    run = source.request(SOURCE, f"actions/runs/{run_id}")
+    require(
+        run["id"] == run_id
+        and run["workflow_id"] == workflow["id"]
+        and run["path"] == RELEASE_WORKFLOW
+        and run["repository"]["full_name"] == SOURCE
+        and run["head_repository"]["full_name"] == SOURCE
+        and run["event"] == "push"
+        and successful(run),
+        "Run must be a completed successful canonical Release push/tag run",
+    )
+    tag = run["head_branch"]
+    require(eligible_tag(tag), "Release run must name a strict v-prefixed SemVer tag")
+    revision = sha(run["head_sha"])
+    target = source.request(SOURCE, f"git/ref/tags/{quote(tag, safe='')}")["object"]
+    seen = set()
+    while target["type"] == "tag":
+        object_sha = sha(target["sha"])
+        require(
+            object_sha not in seen and len(seen) < MAX_TAG_DEPTH,
+            "Cyclic or excessively nested annotated release tag",
+        )
+        seen.add(object_sha)
+        target = source.request(SOURCE, f"git/tags/{object_sha}")["object"]
+    require(
+        target["type"] == "commit" and sha(target["sha"]) == revision,
+        "Release tag no longer resolves to the verified run revision",
+    )
+    release = source.request(SOURCE, f"releases/tags/{quote(tag, safe='')}")
+    require(
+        release["tag_name"] == tag
+        and release.get("draft") is False
+        and type(release.get("id")) is int
+        and release["id"] > 0,
+        "Release must be published, non-draft, and match the run tag",
+    )
+    publication = published_at(release)
+    candidates = []
+    for page in range(1, MAX_PAGES + 1):
+        releases = source.request(SOURCE, f"releases?per_page={PAGE_SIZE}&page={page}")
+        require(isinstance(releases, list), "Invalid releases response")
+        candidates.extend(
+            item
+            for item in releases
+            if item.get("draft") is False and eligible_tag(item.get("tag_name"))
+        )
+        if len(releases) < PAGE_SIZE:
+            break
+    else:
+        raise Refusal("Too many releases to verify latest publication")
+    require(candidates, "No eligible published Caudra release found")
+    latest_time = max(published_at(item) for item in candidates)
+    latest = [item for item in candidates if published_at(item) == latest_time]
+    require(len(latest) == 1, "Latest eligible published release is ambiguous")
+    if latest[0]["id"] != release["id"] or latest_time != publication:
+        raise SupersededRun("Release is no longer the latest eligible publication")
+    require(latest[0]["tag_name"] == tag, "Published release identity changed")
+    return {"version": 1, "run_id": run_id, "tag": tag, "revision": revision}
+
+
+def run_kind(source, run_id):
+    require(type(run_id) is int and run_id > 0, "Expected a positive workflow run ID")
+    run = source.request(SOURCE, f"actions/runs/{run_id}")
+    kinds = {WORKFLOW: "rust", RELEASE_WORKFLOW: "release"}
+    require(run.get("path") in kinds, "Run must use canonical Rust or Release workflow")
+    return kinds[run["path"]]
+
+
+def dispatch_release(source, website, run_id):
+    payload = verified_release(source, run_id)
+    require(
+        verified_release(source, run_id) == payload,
+        "Release provenance changed before dispatch; retry its canonical run",
+    )
+    website.request(
+        WEBSITE,
+        "dispatches",
+        method="POST",
+        data={"event_type": "caudra-release", "client_payload": payload},
+    )
+    return (
+        f"Website release dispatch sent for {payload['tag']} at {payload['revision']}"
+    )
+
+
+def action_items(api, repo, path, key):
+    items = []
+    separator = "&" if "?" in path else "?"
+    for page in range(1, MAX_PAGES + 1):
+        result = api.request(repo, f"{path}{separator}per_page={PAGE_SIZE}&page={page}")
+        items.extend(result[key])
+        if len(items) == result["total_count"]:
+            return items
+        require(
+            result[key] and len(items) < result["total_count"],
+            "Incomplete Actions response",
+        )
+    raise Refusal("Too many Actions results to verify safely")
+
+
+def verified_website_ci(website, number, main, branch):
+    workflow = website.request(WEBSITE, "actions/workflows/site.yml")
+    require(
+        workflow["path"] == WEBSITE_WORKFLOW
+        and workflow["name"] == "Website"
+        and workflow["state"] == "active",
+        "Canonical Website workflow identity is invalid",
+    )
+    runs = action_items(
+        website,
+        WEBSITE,
+        f"actions/workflows/{workflow['id']}/runs?event=pull_request&head_sha={branch}",
+        "workflow_runs",
+    )
+    if not runs:
+        return None
+    require(
+        all(type(run.get("id")) is int and run["id"] > 0 for run in runs),
+        "Invalid Website workflow run ID",
+    )
+    run_id = max(run["id"] for run in runs)
+    run = website.request(WEBSITE, f"actions/runs/{run_id}")
+    require(
+        run["id"] == run_id
+        and run["workflow_id"] == workflow["id"]
+        and run["path"] == WEBSITE_WORKFLOW
+        and run["repository"]["full_name"] == WEBSITE
+        and run["head_repository"]["full_name"] == WEBSITE
+        and run["event"] == "pull_request"
+        and run["head_branch"] == BRANCH
+        and run["head_sha"] == branch,
+        "Website CI must be a canonical pull_request run for this exact bot branch",
+    )
+    pulls = run["pull_requests"]
+    require(
+        len(pulls) == 1
+        and pulls[0]["number"] == number
+        and pulls[0]["head"]["sha"] == branch
+        and pulls[0]["base"]["sha"] == main
+        and pulls[0]["base"]["ref"] == "main",
+        "Website CI did not verify this exact PR head and current main; rebase and retry",
+    )
+    if run["status"] != "completed":
+        require(
+            run["status"]
+            in {"queued", "in_progress", "waiting", "requested", "pending"},
+            "Unexpected Website CI status",
+        )
+        return None
+    require(
+        successful(run),
+        "Website CI failed, was cancelled, or skipped; PR was not merged",
+    )
+    attempt = run["run_attempt"]
+    require(type(attempt) is int and attempt > 0, "Invalid Website workflow attempt")
+    jobs = action_items(
+        website, WEBSITE, f"actions/runs/{run_id}/attempts/{attempt}/jobs", "jobs"
+    )
+    builds = [job for job in jobs if job["name"] == "build"]
+    require(
+        len(builds) == 1 and successful(builds[0]),
+        "Required Website build job did not pass",
+    )
+    for name in WEBSITE_STEPS:
+        steps = [step for step in builds[0].get("steps", []) if step["name"] == name]
+        require(
+            len(steps) == 1 and successful(steps[0]),
+            "Required Website test/build step did not pass",
+        )
+    return run_id, attempt
+
+
+def merge_verified_pull(source, website, run_id, bot, main, branch, pull, guard):
+    deadline = time.monotonic() + CI_WAIT_SECONDS
+    while True:
+        require(time.monotonic() < deadline, CI_TIMEOUT)
+        guard()
+        verified = verified_website_ci(website, pull["number"], main, branch)
+        require(time.monotonic() < deadline, CI_TIMEOUT)
+        if verified:
+            break
+        print("Waiting for canonical Website pull-request verification", flush=True)
+        time.sleep(min(CI_POLL_SECONDS, max(0, deadline - time.monotonic())))
+    revision = verified_source(source, run_id)
+    pending, ancestry = owned_branch(website, main, branch, bot)
+    require(
+        pending == revision and ancestry == "ahead",
+        "Merge requires the current verified pin on a bot-owned branch",
+    )
+    _, main_tree = tree_at(website, WEBSITE, main)
+    _, branch_tree = tree_at(website, WEBSITE, branch)
+    require(
+        changed_paths(main_tree, branch_tree) == [MANIFEST],
+        "Merge requires an exact manifest-only change",
+    )
+    repo = website.request(WEBSITE, "")
+    method = "squash" if repo.get("allow_squash_merge") is True else "merge"
+    require(
+        method == "squash" or repo.get("allow_merge_commit") is True,
+        "Enable squash or merge commits for caudra/website; no rebase or bypass is used",
+    )
+    require(
+        verified_website_ci(website, pull["number"], main, branch) == verified,
+        "Website CI changed before merge; retry",
+    )
+    guard()
+    current = website.request(WEBSITE, f"pulls/{pull['number']}")
+    require(
+        current["state"] == "open"
+        and current.get("draft") is False
+        and bot_owned(current.get("user"), bot)
+        and current["head"]["sha"] == branch
+        and current["head"]["ref"] == BRANCH
+        and current["head"]["repo"]["full_name"] == WEBSITE
+        and current["base"]["sha"] == main
+        and current["base"]["ref"] == "main"
+        and current["base"]["repo"]["full_name"] == WEBSITE,
+        "Pull request changed before merge; retry without rebasing or bypassing",
+    )
+    guard()
+    result = website.request(
+        WEBSITE,
+        f"pulls/{pull['number']}/merge",
+        method="PUT",
+        data={"sha": branch, "merge_method": method},
+    )
+    require(
+        result.get("merged") is True,
+        "GitHub refused the conditional PR merge; inspect CI and retry",
+    )
 
 
 def tree_at(api, repo, revision):
@@ -448,7 +736,7 @@ def update(source, website, run_id, bot):
         branch = commit_sha
     title = "docs: update verified Caudra source"
     body = (
-        f"Update `{MANIFEST}` only. Website CI must verify this pin before review/merge.\n\n"
+        f"Update `{MANIFEST}` only. Canonical website CI must verify this pin before bot merge.\n\n"
         f"Source: `{SOURCE}`\n\nPrevious: `{old}`\n\nProposed: `{revision}`\n\n"
         f"Verified Rust push/main run: `{run_id}` (format, lint, tests, documentation drift).\n\n"
         "Changed publishing inputs (blob or mode):\n"
@@ -457,7 +745,10 @@ def update(source, website, run_id, bot):
             if changes
             else "None; supersedes the pending source update.\n"
         )
-        + "\nNo automatic merge or deployment.\n"
+        + "\nThe App waits for canonical Website PR tests/build, then requests an ordinary "
+        "expected-SHA merge without admin bypass. "
+        "Main updates the automatic preview only. Production requires a separately "
+        "verified successful Caudra Release run; preview1 remains immutable.\n"
     )
     if pull:
         if (
@@ -475,7 +766,7 @@ def update(source, website, run_id, bot):
                 },
             )
     else:
-        mutate(
+        pull = mutate(
             "pulls",
             "POST",
             {
@@ -486,18 +777,19 @@ def update(source, website, run_id, bot):
                 "maintainer_can_modify": False,
             },
         )
-    return f"Website source update proposed at {revision}"
+    merge_verified_pull(source, website, run_id, bot, main, branch, pull, guard)
+    return f"Website source update merged after canonical CI at {revision}"
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Propose verified Caudra publishing inputs to caudra/website"
+        description="Publish verified Caudra preview inputs or dispatch a verified release"
     )
     parser.add_argument(
         "--run-id",
         type=int,
         required=True,
-        help="Canonical Rust push/main workflow run ID",
+        help="Canonical Rust push/main or Release push/tag workflow run ID",
     )
     parser.add_argument(
         "--verify-only",
@@ -510,9 +802,14 @@ def main():
     args = parser.parse_args()
     try:
         source = GitHub(os.environ.get("SOURCE_TOKEN"))
+        kind = run_kind(source, args.run_id)
         if args.verify_only:
             try:
-                revision = verified_source(source, args.run_id)
+                revision = (
+                    verified_source(source, args.run_id)
+                    if kind == "rust"
+                    else verified_release(source, args.run_id)["revision"]
+                )
             except (PathFilteredRun, SupersededRun) as error:
                 if os.environ.get("GITHUB_EVENT_NAME") != "workflow_run":
                     raise
@@ -524,6 +821,14 @@ def main():
             if output := os.environ.get("GITHUB_OUTPUT"):
                 with open(output, "a", encoding="utf-8") as stream:
                     stream.write(f"eligible={eligible}\n")
+                    if eligible == "true":
+                        stream.write(f"kind={kind}\n")
+        elif kind == "release":
+            print(
+                dispatch_release(
+                    source, GitHub(os.environ.get("WEBSITE_TOKEN")), args.run_id
+                )
+            )
         else:
             require(
                 args.app_slug and re.fullmatch(r"[a-z0-9][a-z0-9-]*", args.app_slug),

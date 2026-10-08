@@ -93,6 +93,25 @@ class FakeAPI:
         self.commits = {}
         self.comparison = None
         self.truncated = False
+        self.site_workflow = {
+            "id": 100,
+            "name": "Website",
+            "path": UPDATER.WEBSITE_WORKFLOW,
+            "state": "active",
+        }
+        self.site_run: dict = {}
+        self.site_jobs: list[dict] = [
+            {
+                "name": "build",
+                "status": "completed",
+                "conclusion": "success",
+                "steps": [
+                    {"name": name, "status": "completed", "conclusion": "success"}
+                    for name in sorted(UPDATER.WEBSITE_STEPS)
+                ],
+            }
+        ]
+        self.repo_settings = {"allow_squash_merge": True, "allow_merge_commit": True}
 
     def bot_commit(self, sha):
         return {
@@ -106,12 +125,32 @@ class FakeAPI:
         return {
             "number": 10,
             "state": "open",
+            "draft": False,
             "user": BOT.copy(),
             "head": {
                 "ref": "automation/docs-source",
                 "repo": {"full_name": "caudra/website"},
+                "sha": self.branch,
             },
-            "base": {"ref": "main", "repo": {"full_name": "caudra/website"}},
+            "base": {
+                "ref": "main",
+                "repo": {"full_name": "caudra/website"},
+                "sha": self.main,
+            },
+        }
+
+    def website_run(self):
+        return {
+            **self.run,
+            "id": 101,
+            "workflow_id": 100,
+            "path": UPDATER.WEBSITE_WORKFLOW,
+            "repository": {"full_name": UPDATER.WEBSITE},
+            "head_repository": {"full_name": UPDATER.WEBSITE},
+            "event": "pull_request",
+            "head_branch": UPDATER.BRANCH,
+            "head_sha": self.branch,
+            "pull_requests": [self.pull()],
         }
 
     def request(self, repo, path, method="GET", data=None, missing=False):
@@ -138,6 +177,9 @@ class FakeAPI:
                 if data.get("force") is True:
                     raise AssertionError("Force update forbidden")
                 self.branch = data["sha"]
+                self.comparison = None
+                for pull in self.prs:
+                    pull["head"]["sha"] = self.branch
                 return {}
             if path == "pulls":
                 self.prs.append(self.pull())
@@ -151,7 +193,30 @@ class FakeAPI:
             if path == "pulls/10":
                 self.prs[0].update(data)
                 return self.prs[0]
+            if path == "pulls/10/merge":
+                self.main = self.branch
+                self.prs.clear()
+                return {"merged": True}
+            if path == "dispatches":
+                return None
             raise AssertionError(f"Unexpected mutation {path}")
+        if path == "":
+            return self.repo_settings
+        if path == "actions/workflows/site.yml":
+            return self.site_workflow
+        if path.startswith("actions/workflows/100/runs?"):
+            run = self.site_run or self.website_run()
+            return {"total_count": 1, "workflow_runs": [run]}
+        if path == "actions/runs/101":
+            return self.site_run or self.website_run()
+        if path.startswith("actions/runs/101/attempts/1/jobs?"):
+            page = int(path.rsplit("=", 1)[1])
+            return {
+                "total_count": len(self.site_jobs),
+                "jobs": self.site_jobs[(page - 1) * 100 : page * 100],
+            }
+        if path == "pulls/10":
+            return self.prs[0]
         if path == "actions/workflows/rust.yml":
             return self.workflow
         if path == "actions/runs/42":
@@ -206,6 +271,9 @@ class UpdateTests(unittest.TestCase):
     def setUp(self):
         self.source = FakeAPI(source=True)
         self.website = FakeAPI()
+        merge = patch.object(UPDATER, "merge_verified_pull")
+        self.merge = merge.start()
+        self.addCleanup(merge.stop)
 
     def update(self):
         return UPDATER.update(self.source, self.website, 42, BOT)
@@ -698,7 +766,7 @@ class VerifyTests(unittest.TestCase):
                 self.assertEqual(status, 0)
                 self.assertEqual(stdout, f"Verified source: {NEW}\n")
                 self.assertEqual(stderr, "")
-                self.assertEqual(output, "existing=value\neligible=true\n")
+                self.assertEqual(output, "existing=value\neligible=true\nkind=rust\n")
 
     def test_superseded_run_is_only_an_automatic_preflight_noop(self):
         self.source.main = OLD
@@ -897,13 +965,528 @@ class VerifyTests(unittest.TestCase):
                     for line in step.splitlines()
                     if line.strip().startswith("if:")
                 ],
-                ["if: steps.preflight.outputs.eligible == 'true'"],
+                [
+                    "if: steps.preflight.outputs.eligible == 'true' && steps.preflight.outputs.kind == 'rust'"
+                ],
             )
         self.assertIn("app-id: ${{ vars.WEBSITE_APP_ID }}", mint)
         self.assertIn("private-key: ${{ secrets.WEBSITE_APP_PRIVATE_KEY }}", mint)
         self.assertNotIn("continue-on-error", workflow)
         self.assertIn("ref: ${{ github.workflow_sha }}", workflow)
         self.assertIn("persist-credentials: false", workflow)
+        self.assertIn("workflows: [Rust, Release]", workflow)
+        self.assertIn(
+            "group: website-docs-source-${{ github.event.workflow_run.name || format('manual-{0}', inputs.run_id) }}",
+            workflow,
+        )
+        self.assertIn("cancel-in-progress: false", workflow)
+        self.assertNotIn("branches:", workflow)
+        self.assertIn("permission-actions: read", mint)
+        release_mint = next(step for step in steps if "id: release-token" in step)
+        self.assertIn("permission-contents: write", release_mint)
+        self.assertNotIn("permission-actions:", release_mint)
+        self.assertNotIn("permission-pull-requests:", release_mint)
+        self.assertIn("steps.preflight.outputs.kind == 'release'", release_mint)
+        self.assertLess(steps.index(preflight), steps.index(release_mint))
+
+
+class MergeTests(unittest.TestCase):
+    def setUp(self):
+        self.source = FakeAPI(source=True)
+        self.website = FakeAPI()
+        sleeper = patch.object(
+            UPDATER.time, "sleep", side_effect=AssertionError("Unexpected wait")
+        )
+        sleeper.start()
+        self.addCleanup(sleeper.stop)
+
+    def update(self):
+        return UPDATER.update(self.source, self.website, 42, BOT)
+
+    def pending(self):
+        self.website.branch = BRANCH
+        self.website.prs = [self.website.pull()]
+        self.website.site_run = self.website.website_run()
+
+    def refused_merge(self):
+        with self.assertRaises(UPDATER.Refusal):
+            self.update()
+        self.assertFalse(
+            any(path.endswith("/merge") for path, _, _ in self.website.mutations)
+        )
+
+    def test_real_update_merges_only_after_ci_with_expected_sha_and_retries_noop(self):
+        self.assertIn("merged after canonical CI", self.update())
+        self.assertEqual(
+            self.website.mutations[-1],
+            ("pulls/10/merge", "PUT", {"sha": COMMIT, "merge_method": "squash"}),
+        )
+        self.assertEqual(self.source.mutations, [])
+        self.website.mutations.clear()
+        self.assertIn("no update needed", self.update())
+        self.assertEqual(self.website.mutations, [])
+
+    def test_merge_commit_fallback_and_no_rebase_or_admin_api(self):
+        self.website.repo_settings["allow_squash_merge"] = False
+        self.update()
+        self.assertEqual(
+            self.website.mutations[-1][2], {"sha": COMMIT, "merge_method": "merge"}
+        )
+        self.setUp()
+        self.website.repo_settings = {}
+        self.refused_merge()
+
+    def test_wrong_workflow_identity_or_run_provenance_never_merges(self):
+        cases = (
+            ("workflow", "path", ".github/workflows/other.yml"),
+            ("workflow", "name", "Other"),
+            ("workflow", "state", "disabled_manually"),
+            ("run", "workflow_id", 999),
+            ("run", "path", ".github/workflows/other.yml"),
+            ("run", "event", "push"),
+            ("run", "head_branch", "main"),
+            ("run", "head_sha", OLD),
+            ("run", "repository", {"full_name": "attacker/website"}),
+            ("run", "head_repository", {"full_name": "attacker/website"}),
+            ("run", "pull_requests", []),
+            ("run", "run_attempt", True),
+        )
+        for target, key, value in cases:
+            with self.subTest(target=target, key=key):
+                self.setUp()
+                self.pending()
+                item = (
+                    self.website.site_workflow
+                    if target == "workflow"
+                    else self.website.site_run
+                )
+                item[key] = value
+                self.refused_merge()
+
+    def test_failed_or_skipped_website_verification_never_merges(self):
+        for outcome in ("failure", "cancelled", "skipped", "neutral", "timed_out"):
+            for scope in ("run", "job", "step"):
+                with self.subTest(outcome=outcome, scope=scope):
+                    self.setUp()
+                    self.pending()
+                    item = {
+                        "run": self.website.site_run,
+                        "job": self.website.site_jobs[0],
+                        "step": self.website.site_jobs[0]["steps"][0],
+                    }[scope]
+                    item["conclusion"] = outcome
+                    self.refused_merge()
+        for scope in ("job", "step"):
+            for change in ("missing", "duplicate"):
+                with self.subTest(scope=scope, change=change):
+                    self.setUp()
+                    items = (
+                        self.website.site_jobs
+                        if scope == "job"
+                        else self.website.site_jobs[0]["steps"]
+                    )
+                    if change == "missing":
+                        items.clear()
+                    else:
+                        items.append(copy.deepcopy(items[0]))
+                    self.refused_merge()
+
+    def test_ci_at_old_base_or_wrong_pr_is_refused(self):
+        for field, value in (("base", OLD), ("head", OLD), ("number", 11)):
+            self.setUp()
+            self.pending()
+            pull = self.website.site_run["pull_requests"][0]
+            if field == "number":
+                pull[field] = value
+            else:
+                pull[field]["sha"] = value
+            self.refused_merge()
+
+    def test_pending_ci_wait_is_bounded_and_does_not_merge(self):
+        self.pending()
+        self.website.site_run["status"] = "in_progress"
+        with (
+            patch.object(
+                UPDATER.time, "monotonic", side_effect=[0, 0, UPDATER.CI_WAIT_SECONDS]
+            ),
+            self.assertRaisesRegex(UPDATER.Refusal, "Timed out"),
+        ):
+            self.update()
+        self.assertFalse(
+            any(path.endswith("/merge") for path, _, _ in self.website.mutations)
+        )
+
+    def test_missing_then_pending_then_successful_ci_waits_without_real_sleep(self):
+        original = UPDATER.verified_website_ci
+        calls = 0
+
+        def verify(*args):
+            nonlocal calls
+            calls += 1
+            return None if calls <= 2 else original(*args)
+
+        with (
+            patch.object(UPDATER, "verified_website_ci", side_effect=verify),
+            patch.object(UPDATER.time, "sleep") as sleeper,
+            patch.object(UPDATER.sys, "stdout", io.StringIO()),
+        ):
+            self.update()
+        self.assertEqual(sleeper.call_count, 2)
+        self.assertTrue(
+            all(
+                0 <= call.args[0] <= UPDATER.CI_POLL_SECONDS
+                for call in sleeper.call_args_list
+            )
+        )
+
+    def test_ci_revalidation_catches_new_attempt(self):
+        with patch.object(
+            UPDATER, "verified_website_ci", side_effect=[(101, 1), (101, 2)]
+        ):
+            self.refused_merge()
+
+    def test_source_run_revalidated_after_ci(self):
+        def race(path, method):
+            if path == "actions/runs/101":
+                self.source.run["conclusion"] = "failure"
+
+        self.website.before_request = race
+        self.refused_merge()
+
+    def test_missing_ci_waits_but_incomplete_pagination_fails_closed(self):
+        original = self.website.request
+        for total in (0, 1):
+            with self.subTest(total=total):
+
+                def request(repo, path, total=total, **kwargs):
+                    if path.startswith("actions/workflows/100/runs?"):
+                        return {"total_count": total, "workflow_runs": []}
+                    return original(repo, path, **kwargs)
+
+                with patch.object(self.website, "request", side_effect=request):
+                    if total == 0:
+                        self.assertIsNone(
+                            UPDATER.verified_website_ci(self.website, 10, MAIN, BRANCH)
+                        )
+                    else:
+                        with self.assertRaises(UPDATER.Refusal):
+                            UPDATER.verified_website_ci(self.website, 10, MAIN, BRANCH)
+
+    def test_merge_refusal_is_not_retried_or_reported_as_success(self):
+        original = self.website.request
+
+        def request(repo, path, **kwargs):
+            result = original(repo, path, **kwargs)
+            return {"merged": False} if path.endswith("/merge") else result
+
+        with (
+            patch.object(self.website, "request", side_effect=request),
+            self.assertRaisesRegex(UPDATER.Refusal, "GitHub refused"),
+        ):
+            self.update()
+        self.assertEqual(
+            sum(path.endswith("/merge") for path, _, _ in self.website.mutations), 1
+        )
+
+    def test_newest_run_cannot_be_hidden_by_older_success(self):
+        self.pending()
+        original = self.website.request
+
+        def request(repo, path, **kwargs):
+            if path.startswith("actions/workflows/100/runs?"):
+                return {"total_count": 2, "workflow_runs": [{"id": 100}, {"id": 101}]}
+            return original(repo, path, **kwargs)
+
+        self.website.site_run["conclusion"] = "failure"
+        with patch.object(self.website, "request", side_effect=request):
+            self.refused_merge()
+
+    def test_final_head_base_source_and_human_edit_races_are_refused(self):
+        for target in ("head", "base", "source", "human", "draft"):
+            with self.subTest(target=target):
+                self.setUp()
+
+                def race(path, method, target=target):
+                    if path == "pulls/10" and method == "GET":
+                        if target == "head":
+                            self.website.branch = OLD
+                        elif target == "base":
+                            self.website.main = OLD
+                        elif target == "source":
+                            self.source.main = OLD
+                        elif target == "draft":
+                            self.website.prs[0]["draft"] = True
+                        else:
+                            self.website.prs[0]["user"]["type"] = "User"
+
+                self.website.before_request = race
+                self.refused_merge()
+
+    def test_successful_ci_cannot_hide_human_branch_commit(self):
+        def race(path, method):
+            if path == "actions/runs/101":
+                commit = self.website.bot_commit(COMMIT)
+                commit["author"]["type"] = "User"
+                self.website.commits[COMMIT] = commit
+
+        self.website.before_request = race
+        self.refused_merge()
+
+    def test_ci_job_pagination_is_complete(self):
+        self.website.site_jobs = [
+            {"name": f"other-{i}"} for i in range(101)
+        ] + self.website.site_jobs
+        self.update()
+
+    def test_actions_permission_error_is_actionable_without_secrets(self):
+        result = subprocess.CompletedProcess(
+            [], 1, stdout="HTTP/2.0 403 Forbidden\n\n{}", stderr="secret"
+        )
+        with patch.object(UPDATER.subprocess, "run", return_value=result):
+            with self.assertRaisesRegex(UPDATER.Refusal, "Actions: read") as error:
+                UPDATER.GitHub("secret").request(
+                    UPDATER.WEBSITE, "actions/workflows/site.yml"
+                )
+            self.assertNotIn("secret", str(error.exception))
+
+
+class ReleaseAPI(FakeAPI):
+    def __init__(self):
+        super().__init__(source=True)
+        self.workflow["path"] = UPDATER.RELEASE_WORKFLOW
+        self.run.update(path=UPDATER.RELEASE_WORKFLOW, head_branch="v0.2.0-preview.1")
+        self.release = {
+            "id": 50,
+            "tag_name": self.run["head_branch"],
+            "draft": False,
+            "prerelease": True,
+            "published_at": "2026-10-08T12:00:00Z",
+        }
+        self.releases = [self.release]
+        self.tag = {"type": "commit", "sha": NEW}
+        self.tags = {}
+
+    def request(self, repo, path, method="GET", data=None, missing=False):
+        if repo == UPDATER.SOURCE and method == "GET":
+            if path == "actions/workflows/release.yml":
+                return self.workflow
+            if path.startswith("git/ref/tags/"):
+                return {"object": self.tag}
+            if path.startswith("git/tags/"):
+                return {"object": self.tags[path.removeprefix("git/tags/")]}
+            if path.startswith("releases/tags/"):
+                return self.release
+            if path.startswith("releases?"):
+                page = int(path.rsplit("=", 1)[1])
+                return self.releases[(page - 1) * 100 : page * 100]
+        return super().request(repo, path, method, data, missing)
+
+
+class ReleaseTests(unittest.TestCase):
+    def setUp(self):
+        self.source = ReleaseAPI()
+        self.website = FakeAPI()
+
+    def dispatch(self):
+        return UPDATER.dispatch_release(self.source, self.website, 42)
+
+    def refuse(self):
+        with self.assertRaises((UPDATER.Refusal, ValueError)):
+            self.dispatch()
+        self.assertEqual(self.website.mutations, [])
+
+    def test_exact_dispatch_contract_includes_prerelease(self):
+        self.dispatch()
+        self.assertEqual(
+            self.website.mutations,
+            [
+                (
+                    "dispatches",
+                    "POST",
+                    {
+                        "event_type": "caudra-release",
+                        "client_payload": {
+                            "version": 1,
+                            "run_id": 42,
+                            "tag": "v0.2.0-preview.1",
+                            "revision": NEW,
+                        },
+                    },
+                )
+            ],
+        )
+        self.assertEqual(self.source.mutations, [])
+
+    def test_annotated_tag_is_peeled_and_retagged_or_cyclic_tag_refused(self):
+        self.source.tag = {"type": "tag", "sha": BLOB}
+        self.source.tags[BLOB] = {"type": "tag", "sha": TREE}
+        self.source.tags[TREE] = {"type": "commit", "sha": NEW}
+        self.dispatch()
+        self.website.mutations.clear()
+        self.source.tags[TREE] = {"type": "commit", "sha": OLD}
+        self.refuse()
+        self.source.tags[TREE] = {"type": "tag", "sha": BLOB}
+        self.refuse()
+
+    def test_release_identity_status_and_publication_are_required(self):
+        for target, key, value in (
+            ("workflow", "path", UPDATER.WORKFLOW),
+            ("workflow", "state", "disabled_manually"),
+            ("run", "workflow_id", 100),
+            ("run", "id", 43),
+            ("run", "path", UPDATER.WORKFLOW),
+            ("run", "event", "workflow_dispatch"),
+            ("run", "repository", {"full_name": "attacker/caudra"}),
+            ("run", "head_repository", {"full_name": "attacker/caudra"}),
+            ("run", "head_branch", "main"),
+            ("run", "head_sha", "A" * 40),
+            ("run", "status", "in_progress"),
+            ("run", "conclusion", "failure"),
+            ("release", "draft", True),
+            ("release", "tag_name", "v0.3.0"),
+            ("release", "published_at", None),
+            ("release", "published_at", "2026-10-08"),
+            ("release", "id", True),
+            ("tag", "sha", OLD),
+            ("tag", "type", "tree"),
+        ):
+            with self.subTest(target=target, key=key, value=value):
+                self.setUp()
+                getattr(self.source, target)[key] = value
+                self.refuse()
+
+    def test_strict_tags_and_positive_run_ids(self):
+        for tag in ("v1.0.0", "v0.2.0-preview.1", "v1.2.3+build.4"):
+            self.assertTrue(UPDATER.eligible_tag(tag))
+        for tag in (
+            "vfoo",
+            "v01.0.0",
+            "v1.0.0-01",
+            "../v1.0.0",
+            "v1.0.0/x",
+            "v1.0.0?x",
+            None,
+        ):
+            self.assertFalse(UPDATER.eligible_tag(tag))
+        for run_id in (0, -1, True, "42"):
+            with self.assertRaises(UPDATER.Refusal):
+                UPDATER.verified_release(self.source, run_id)
+
+    def test_latest_uses_publication_time_across_pages_including_prereleases(self):
+        self.source.releases = [
+            {"id": i, "tag_name": f"v1.0.{i}", "draft": True} for i in range(100)
+        ] + [self.source.release]
+        self.dispatch()
+        self.website.mutations.clear()
+        self.source.releases.append(
+            {
+                "id": 999,
+                "tag_name": "v0.2.0-preview.2",
+                "draft": False,
+                "prerelease": True,
+                "published_at": "2026-10-08T12:01:00Z",
+            }
+        )
+        self.refuse()
+
+    def test_ambiguous_or_unlisted_release_and_excessive_pagination_refused(self):
+        self.source.releases.append({**self.source.release, "id": 51})
+        self.refuse()
+        self.source.releases = []
+        self.refuse()
+        self.source.releases = [self.source.release] * 100
+        with patch.object(UPDATER, "MAX_PAGES", 1):
+            self.refuse()
+
+    def test_release_rechecked_immediately_before_dispatch(self):
+        original = UPDATER.verified_release
+        calls = 0
+
+        def verify(*args):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                self.source.tag["sha"] = OLD
+            return original(*args)
+
+        with patch.object(UPDATER, "verified_release", side_effect=verify):
+            self.refuse()
+        self.assertEqual(calls, 2)
+
+    def test_dispatch_204_is_success_but_empty_200_is_not_json(self):
+        for code in (204, 200):
+            result = subprocess.CompletedProcess(
+                [], 0, stdout=f"HTTP/2.0 {code} OK\r\n\r\n", stderr=""
+            )
+            with patch.object(UPDATER.subprocess, "run", return_value=result):
+                if code == 204:
+                    self.assertIsNone(
+                        UPDATER.GitHub("secret").request(
+                            UPDATER.WEBSITE, "dispatches", method="POST", data={}
+                        )
+                    )
+                else:
+                    with self.assertRaises(UPDATER.Refusal):
+                        UPDATER.GitHub("secret").request(
+                            UPDATER.WEBSITE, "dispatches", method="POST", data={}
+                        )
+
+    def test_release_preflight_emits_kind_without_website_credential(self):
+        with TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            with (
+                patch.dict(os.environ, {"GITHUB_OUTPUT": str(output)}, clear=True),
+                patch.object(UPDATER, "GitHub", return_value=self.source) as client,
+                patch.object(
+                    UPDATER.sys, "argv", ["update", "--run-id", "42", "--verify-only"]
+                ),
+                patch.object(UPDATER.sys, "stdout", io.StringIO()),
+            ):
+                self.assertEqual(UPDATER.main(), 0)
+            client.assert_called_once()
+            self.assertEqual(output.read_text(), "eligible=true\nkind=release\n")
+
+    def test_manual_release_dispatch_needs_no_pr_bot_identity(self):
+        with (
+            patch.dict(
+                os.environ, {"GITHUB_EVENT_NAME": "workflow_dispatch"}, clear=True
+            ),
+            patch.object(UPDATER, "GitHub", side_effect=[self.source, self.website]),
+            patch.object(UPDATER.sys, "argv", ["update", "--run-id", "42"]),
+            patch.object(UPDATER.sys, "stdout", io.StringIO()),
+        ):
+            self.assertEqual(UPDATER.main(), 0)
+        self.assertEqual(len(self.website.mutations), 1)
+        self.assertEqual(self.website.mutations[0][0], "dispatches")
+
+    def test_stale_release_manual_retry_refused_automatic_preflight_noop(self):
+        self.source.releases.append(
+            {**self.source.release, "id": 51, "published_at": "2026-10-09T12:00:00Z"}
+        )
+        for event, expected in (("workflow_dispatch", 1), ("workflow_run", 0)):
+            with TemporaryDirectory() as directory:
+                output = Path(directory) / "output"
+                with (
+                    patch.dict(
+                        os.environ,
+                        {"GITHUB_OUTPUT": str(output), "GITHUB_EVENT_NAME": event},
+                        clear=True,
+                    ),
+                    patch.object(UPDATER, "GitHub", return_value=self.source) as client,
+                    patch.object(
+                        UPDATER.sys,
+                        "argv",
+                        ["update", "--run-id", "42", "--verify-only"],
+                    ),
+                    patch.object(UPDATER.sys, "stdout", io.StringIO()),
+                    patch.object(UPDATER.sys, "stderr", io.StringIO()),
+                ):
+                    self.assertEqual(UPDATER.main(), expected)
+                client.assert_called_once()
+                self.assertEqual(
+                    output.read_text() if output.exists() else "",
+                    "eligible=false\n" if expected == 0 else "",
+                )
 
 
 if __name__ == "__main__":
