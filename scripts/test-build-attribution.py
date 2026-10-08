@@ -533,6 +533,10 @@ class AttributionTests(unittest.TestCase):
         package = self.package()
         package["source"] = "git+https://example.invalid/source#" + "a" * 40
         manifest = Path(package["manifest_path"])
+        manifest.write_text(
+            '[package]\nname = "dependency"\nversion = { workspace = true }\n'
+        )
+        original = manifest.read_bytes()
         policy = {
             "git_sources": {
                 package["source"]: {
@@ -561,6 +565,25 @@ class AttributionTests(unittest.TestCase):
         )
         manifest.write_text("unverified manifest")
         with self.assertRaisesRegex(attribution.AttributionError, "manifest"):
+            attribution.package_licenses(package, self.root, policy)
+        resolved = original.replace(b"{ workspace = true }", b'"1.0.0"')
+        manifest.write_bytes(resolved)
+        with self.assertRaisesRegex(attribution.AttributionError, "manifest"):
+            attribution.package_licenses(package, self.root, policy)
+        preserved = manifest.with_name("Cargo.toml.orig")
+        preserved.write_bytes(original)
+        self.assertEqual(
+            attribution.package_licenses(package, self.root, policy)[2], ["MIT"]
+        )
+        self.assertEqual(manifest.read_bytes(), resolved)
+        preserved.write_bytes(original + b"\ntampered")
+        with self.assertRaisesRegex(attribution.AttributionError, "manifest"):
+            attribution.package_licenses(package, self.root, policy)
+        preserved.unlink()
+        original_path = self.root / "original-manifest"
+        original_path.write_bytes(original)
+        preserved.symlink_to(original_path)
+        with self.assertRaisesRegex(attribution.AttributionError, "symlink"):
             attribution.package_licenses(package, self.root, policy)
 
     def test_unreviewed_vendored_git_never_guesses_parent_license(self):

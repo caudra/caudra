@@ -182,6 +182,20 @@
           vendorDeps = craneLib.vendorCargoDeps {
             src = workspaceSrc;
             outputHashes = gitDepHashes;
+            overrideVendorGitCheckout =
+              _: drv:
+              drv.overrideAttrs (previous: {
+                postInstall = (previous.postInstall or "") + ''
+                  cargo metadata --offline --format-version 1 --no-deps |
+                    jq -r '.packages[] | [.manifest_path, (.name + "-" + .version)] | @tsv' |
+                    while IFS=$'\t' read -r manifest package; do
+                      if [ -f "$out/$package/Cargo.toml" ]; then
+                        cmp <(crane-resolve-workspace-inheritance "$manifest") "$out/$package/Cargo.toml" || exit 1
+                        cp "$manifest" "$out/$package/Cargo.toml.orig"
+                      fi
+                    done
+                '';
+              });
           };
           cargoVendorDir = pkgs.runCommandLocal "vendor-cargo-deps" { } ''
             cp -rL ${vendorDeps} $out

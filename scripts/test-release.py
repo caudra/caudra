@@ -554,7 +554,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         for command in (
             "nix build --no-update-lock-file .#checks.x86_64-linux.git-dep-hashes",
             "nix build --no-update-lock-file .#checks.x86_64-linux.fmt",
-            "run: nix build --no-update-lock-file\n",
+            "run: nix build --no-update-lock-file -L\n",
         ):
             self.assertIn(command, nix["build"])
 

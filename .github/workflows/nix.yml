@@ -92,7 +92,7 @@ jobs:
       - name: Check attribution vendor preparation
         run: nix build --no-update-lock-file .#checks.x86_64-linux.vendor-attribution
       - name: Build
-        run: nix build --no-update-lock-file
+        run: nix build --no-update-lock-file -L
 
   ci-pass:
     name: Nix CI
