@@ -744,11 +744,77 @@ class ReleaseWorkflowTests(unittest.TestCase):
         cleanup = cleanup.split("\n      - ", 1)[0]
         self.assertIn("if: always()", cleanup)
         self.assertIn('sudo chown -R "$(id -u):$(id -g)"', cleanup)
-        self.assertIn('target/ licenses/ "$RUNNER_TEMP/alpine-cargo"', cleanup)
+        self.assertIn(
+            'for directory in target licenses "$RUNNER_TEMP/alpine-cargo"', cleanup
+        )
         self.assertLess(
             linux.index("Restore ownership after Alpine"),
             linux.index("uses: actions/cache/save@v5"),
         )
+
+    @unittest.skipUnless(
+        os.name == "posix" and shutil.which("bash"), "Unix and Bash required"
+    )
+    def test_alpine_preparation_leaves_attribution_output_fresh_and_cleanup_handles_failures(
+        self,
+    ):
+        _, release = self.workflow("release")
+        linux = release["build-linux"]
+        prepare = linux.split("- name: Prepare Alpine cache directories", 1)[1]
+        prepare = prepare.split("\n      - ", 1)[0].split("run: ", 1)[1].strip()
+        cleanup = linux.split("- name: Restore ownership after Alpine", 1)[1]
+        cleanup = cleanup.split("\n      - ", 1)[0].split("run: |\n", 1)[1]
+        cleanup = textwrap.dedent(cleanup)
+        for phase in ("before_setup", "before_attribution", "after_attribution"):
+            with (
+                self.subTest(phase=phase),
+                tempfile.TemporaryDirectory(prefix="alpine cache ") as temporary,
+            ):
+                root = Path(temporary).resolve()
+                cache = root / "runner temp" / "alpine-cargo"
+                licenses = root / "licenses"
+                record = root / "ownership"
+                environment = os.environ | {
+                    "RUNNER_TEMP": str(cache.parent),
+                    "RECORD": str(record),
+                }
+                expected = []
+                if phase != "before_setup":
+                    subprocess.run(
+                        ["bash", "-euo", "pipefail", "-c", prepare],
+                        cwd=root,
+                        env=environment,
+                        check=True,
+                    )
+                    self.assertTrue((root / "target").is_dir())
+                    self.assertTrue(cache.is_dir())
+                    self.assertFalse(licenses.exists())
+                    expected = ["target", str(cache)]
+                if phase == "after_attribution":
+                    licenses.mkdir()
+                    (licenses / "manifest.json").write_text("verified bundle")
+                    expected.insert(1, "licenses")
+                subprocess.run(
+                    [
+                        "bash",
+                        "-euo",
+                        "pipefail",
+                        "-c",
+                        'sudo() { printf "%s\\n" "$4" >> "$RECORD"; }\n' + cleanup,
+                    ],
+                    cwd=root,
+                    env=environment,
+                    check=True,
+                )
+                self.assertEqual(
+                    record.read_text().splitlines() if record.exists() else [], expected
+                )
+                if phase == "after_attribution":
+                    self.assertEqual(
+                        (licenses / "manifest.json").read_text(), "verified bundle"
+                    )
+                else:
+                    self.assertFalse(licenses.exists())
 
 
 @unittest.skipUnless(

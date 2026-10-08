@@ -107,7 +107,7 @@ jobs:
           persist-credentials: false
 
       - name: Prepare Alpine cache directories
-        run: mkdir -p target licenses "$RUNNER_TEMP/alpine-cargo"
+        run: mkdir -p target "$RUNNER_TEMP/alpine-cargo"
 
       - uses: actions/cache/restore@v5
         id: cargo-cache
@@ -166,7 +166,12 @@ jobs:
 
       - name: Restore ownership after Alpine
         if: always()
-        run: sudo chown -R "$(id -u):$(id -g)" target/ licenses/ "$RUNNER_TEMP/alpine-cargo"
+        run: |
+          for directory in target licenses "$RUNNER_TEMP/alpine-cargo"; do
+            if [ -d "$directory" ]; then
+              sudo chown -R "$(id -u):$(id -g)" "$directory"
+            fi
+          done
 
       - uses: actions/cache/save@v5
         if: ${{ !cancelled() && steps.cargo-cache.outputs.cache-primary-key != '' && steps.cargo-cache.outputs.cache-hit != 'true' }}
