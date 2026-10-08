@@ -32,8 +32,8 @@ use crate::components::storage_modal::{
 use crate::components::stream_modal::{StreamDone, StreamEvent, StreamFooter, StreamUsage};
 use crate::components::usage_modal::SCOPE_KEY;
 use crate::components::{
-    DisplaySource, ExitRequest, ForkedSession, SubscriptionProvider, ToolProgress, buffer_text,
-    key, test_model,
+    DisplaySource, ExitRequest, ForkedSession, SubscriptionProvider, ToolProgress, ToolStatus,
+    buffer_text, key, test_model,
 };
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{SelectableZone, SelectionState, SelectionZone};
@@ -14936,6 +14936,99 @@ fn retry_clears_in_progress_tools() {
     }));
     assert_eq!(app.chats[0].in_progress_count(), 0);
     assert!(app.chats[0].retry().is_some());
+}
+
+#[test_case(false, true; "hidden_reminder_settles_partial_output")]
+#[test_case(true, true; "visible_reminder_settles_partial_output")]
+#[test_case(false, false; "hidden_reminders_ordinary_retry_discards_partial_output")]
+#[test_case(true, false; "visible_reminders_ordinary_retry_discards_partial_output")]
+fn retry_preserves_partial_output_only_after_injected_settlement(
+    show_reminders: bool,
+    settled: bool,
+) {
+    const TOOL_ID: &str = "completed-before-interruption";
+    const OUTPUT: &str = "completed tool output";
+    const TEXT: &str = "partial post-tool text";
+    const THINKING: &str = "partial post-tool reasoning";
+    const INTERRUPTION: &str = "The response was interrupted after tools completed.";
+
+    let mut app = test_app();
+    app.ui_config.show_reminders = show_reminders;
+    app.chats[0] = Chat::new(
+        app.chats[0].name.clone(),
+        Path::new(&app.state.session.cwd),
+        app.ui_config.clone(),
+        EventHandle::disconnected_for_test(),
+    );
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.update(agent_msg(tool_start(TOOL_ID, SHELL_TOOL_NAME)));
+    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        id: TOOL_ID.into(),
+        tool: SHELL_TOOL_NAME.into(),
+        output: ToolOutput::Plain(OUTPUT.into()),
+        is_error: false,
+        annotation: None,
+        written_path: None,
+        written_paths: Vec::new(),
+        remote_written_paths: false,
+        output_ref: None,
+        output_limits: None,
+        model_suffix: None,
+        model_output: None,
+        model_output_from_ref: false,
+        documents: Vec::new(),
+        accounting: ToolAccounting::default(),
+    }))));
+    app.update(agent_msg(AgentEvent::TextDelta { text: TEXT.into() }));
+    app.update(agent_msg(AgentEvent::ThinkingDelta {
+        text: THINKING.into(),
+    }));
+    assert!(!app.chats[0].streaming_text_is_empty());
+    assert!(!app.chats[0].streaming_thinking_is_empty());
+
+    if settled {
+        app.update(agent_msg(AgentEvent::Injected {
+            text: INTERRUPTION.into(),
+            task_event: None,
+            peer_event: None,
+            automation_event: None,
+        }));
+    }
+    app.update(agent_msg(retry_event()));
+
+    let chat = &app.chats[0];
+    assert!(chat.retry().is_some());
+    assert!(chat.streaming_text_is_empty());
+    assert!(chat.streaming_thinking_is_empty());
+    assert_eq!(chat.in_progress_count(), 0);
+    assert_eq!(
+        chat.message_count(),
+        1 + usize::from(settled) * (2 + usize::from(show_reminders)),
+    );
+    let card = chat.message_at(0).unwrap();
+    assert!(matches!(
+        &card.role,
+        DisplayRole::Tool(tool) if tool.id == TOOL_ID && tool.status == ToolStatus::Success
+    ));
+    assert!(card.text.contains(OUTPUT));
+    assert!(matches!(
+        card.tool_output.as_deref(),
+        Some(ToolOutput::Plain(output)) if output.text == OUTPUT
+    ));
+    if settled {
+        let thinking = chat.message_at(1).unwrap();
+        assert_eq!(thinking.role, DisplayRole::Thinking);
+        assert_eq!(thinking.text, THINKING);
+        let text = chat.message_at(2).unwrap();
+        assert_eq!(text.role, DisplayRole::Assistant);
+        assert_eq!(text.text, TEXT);
+        if show_reminders {
+            let reminder = chat.message_at(3).unwrap();
+            assert_eq!(reminder.role, DisplayRole::Injected);
+            assert_eq!(reminder.text, INTERRUPTION);
+        }
+    }
 }
 
 /// The countdown is a control, not just a label: clicking it asks the agent to

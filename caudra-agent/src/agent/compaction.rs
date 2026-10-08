@@ -21,7 +21,7 @@ use super::requirements::{
 };
 use super::run::{estimate_message_tokens, push_injected, stranded_reminders};
 use super::side_model::{self, SideModel};
-use super::streaming::{StreamError, stream_with_retry};
+use super::streaming::{StreamError, StreamRetry, stream_with_retry};
 use crate::cancel::CancelToken;
 use crate::nudge::Nudge;
 use crate::{
@@ -170,6 +170,7 @@ pub(super) async fn compact_history(
                 RequestOptions::default(),
                 None,
                 None,
+                &mut StreamRetry::default(),
             )
             .await
             {

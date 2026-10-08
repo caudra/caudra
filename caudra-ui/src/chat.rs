@@ -431,8 +431,8 @@ impl Chat {
                 peer_event: None,
                 ..
             } => {
+                self.messages_panel.flush();
                 if self.show_reminders {
-                    self.messages_panel.flush();
                     let row = DisplayMessage::injected(text, None);
                     match self.stall_pending.then_some(self.stall_row).flatten() {
                         Some(index) => self.messages_panel.replace(index, row),

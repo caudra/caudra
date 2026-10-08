@@ -24,8 +24,9 @@ mod owned_jobs_tests {
     use test_case::test_case;
 
     use super::{
-        Agent, History, MockProvider, default_input, empty_response, install_todo_tool, make_agent,
-        make_agent_with_output_store, mixed_todos, text_response, todo_reminders,
+        Agent, History, LONG_RETRY_AFTER, MockProvider, PartialStreamProvider, default_input,
+        empty_response, install_partial_stream_tool, install_todo_tool, make_agent,
+        make_agent_with_output_store, mixed_todos, retry_error, text_response, todo_reminders,
         tool_use_response,
     };
     use crate::agent::subagent::TaskIdentity;
@@ -34,6 +35,7 @@ mod owned_jobs_tests {
     };
     use crate::background::{BackgroundTasks, JobScope};
     use crate::cancel::CancelMap;
+    use crate::nudge::Nudge;
     use crate::tools::registry::{
         ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolInvocation, ToolSource,
     };
@@ -369,6 +371,86 @@ mod owned_jobs_tests {
             assert!(reminded(&requests[2]));
             assert_eq!(todo_reminders(&history), 1);
             assert!(fixture.tasks.work().settling, "{SETTLING_DOES_NOT_HOLD}");
+            fixture.tasks.shutdown().await.unwrap();
+        }));
+    }
+
+    #[test_case(false; "top_level")]
+    #[test_case(true; "unfinished_batch")]
+    fn partial_stream_retry_delivers_background_completion_before_next_request(batch: bool) {
+        smol::block_on(bounded(async {
+            let fixture = Fixture::new().await;
+            let scope = fixture.tasks.main_scope();
+            let (execution, control) = execution();
+            let job = scope
+                .admit_shell(metadata(), &fixture.history, move |cancel, _| {
+                    execution.run(cancel)
+                })
+                .await
+                .unwrap();
+            loop {
+                let revision = scope.revision();
+                if scope.status(&job.task_id).unwrap().state == "running" {
+                    break;
+                }
+                scope.wait_for_change(revision).await.unwrap();
+            }
+            let provider = PartialStreamProvider::new(
+                vec![
+                    (true, Err(retry_error(LONG_RETRY_AFTER))),
+                    (false, Ok(response(FINAL))),
+                ],
+                batch,
+            );
+            let requests = Arc::clone(&provider.requests);
+            let mut history = receipt_history();
+            let (mut agent, events) = make_agent(provider, &mut history);
+            agent.background = Some(fixture.tasks.clone());
+            Arc::make_mut(&mut agent.config.steering).enabled = Some(false);
+            let executed = install_partial_stream_tool(&mut agent);
+            let retry_now = Nudge::default();
+            let mut agent = agent.with_retry_now(retry_now.clone());
+            {
+                let mut turn = pin!(agent.turn());
+                drive(turn.as_mut(), async {
+                    loop {
+                        if matches!(
+                            events.recv_async().await.unwrap().event,
+                            AgentEvent::Retry { attempt: 1, .. }
+                        ) {
+                            break;
+                        }
+                    }
+                })
+                .await;
+                assert_eq!(executed.load(Ordering::SeqCst), 1);
+                control.finish.send(()).unwrap();
+                terminal(&scope).await;
+                assert!(control.cleaned.load(Ordering::Acquire));
+                assert_eq!(requests.lock().unwrap().len(), 1);
+                retry_now.notify();
+                turn.await.unwrap();
+            }
+            agent.turn().await.unwrap();
+            {
+                let requests = requests.lock().unwrap();
+                assert_eq!(requests.len(), 2);
+                assert!(
+                    requests[0]
+                        .iter()
+                        .all(|message| message.task_event.is_none())
+                );
+                let completion = requests[1]
+                    .iter()
+                    .find(|message| {
+                        message
+                            .task_event
+                            .as_ref()
+                            .is_some_and(|event| event.invocation_id == job.invocation_id)
+                    })
+                    .unwrap();
+                assert!(completion.first_text_content().unwrap().contains(OUTPUT));
+            }
             fixture.tasks.shutdown().await.unwrap();
         }));
     }

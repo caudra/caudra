@@ -923,6 +923,7 @@ impl TaskRunner for SubagentTaskRunner {
 mod tests {
     use std::borrow::Cow;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     use caudra_config::steering::SteeringModelConfig;
     use caudra_config::{Feature, FeatureFlags};
@@ -934,6 +935,8 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::AgentEvent;
+    use crate::agent::history::is_run_failure_marker;
     use crate::cancel::CancelTrigger;
     use crate::permissions::PermissionMode;
     use crate::tools::DescriptionContext;
@@ -970,6 +973,9 @@ mod tests {
     const DEFAULT_TRUNCATION_ATTEMPTS: u32 = 3;
     const ORDINARY_TOOL_ROUNDS: u32 = 4;
     const SCRIPT_EXHAUSTED: &str = "script exhausted";
+    const EAGER_PROBE: &str = "eager_probe";
+    const TRANSIENT_STATUS: u16 = 503;
+    const PROVIDER_RETRIES: usize = 8;
     const COMPACTED_SUMMARY: &str = "Earlier investigation was compacted.";
     const COMPACTION_HISTORY_MESSAGES: usize = 32;
     const COMPACTION_HISTORY_REPEATS: usize = 512;
@@ -1732,6 +1738,225 @@ mod tests {
         let mut ctx = stub_ctx_with(&mode, None, Some(CALL_ID));
         ctx.provider = Arc::new(provider);
         ctx
+    }
+
+    #[derive(Clone)]
+    struct EagerProbe {
+        executions: Arc<Mutex<Vec<String>>>,
+        started: flume::Sender<()>,
+    }
+
+    impl Tool for EagerProbe {
+        fn name(&self) -> &str {
+            EAGER_PROBE
+        }
+
+        fn description(&self, _: &DescriptionContext) -> Cow<'_, str> {
+            Cow::Borrowed(EAGER_PROBE)
+        }
+
+        fn schema(&self) -> Value {
+            json!({"type": "object", "properties": {"attempt": {"type": "integer"}}})
+        }
+
+        fn parse(&self, _: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+            Ok(Box::new(self.clone()))
+        }
+    }
+
+    impl ToolInvocation for EagerProbe {
+        fn start_header(&self) -> HeaderFuture {
+            HeaderFuture::Ready(HeaderResult::plain(EAGER_PROBE.into()))
+        }
+
+        fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
+            Box::pin(async move {
+                self.executions
+                    .lock()
+                    .unwrap()
+                    .push(ctx.tool_use_id.clone().unwrap());
+                self.started.send(()).unwrap();
+                Ok::<_, String>(crate::ToolOutput::Plain(MOCK_TOOL_OUTPUT.into())).into()
+            })
+        }
+    }
+
+    struct InterruptedToolProvider {
+        failures: usize,
+        started: flume::Receiver<()>,
+        requests: Arc<Mutex<Vec<Vec<Message>>>>,
+    }
+
+    impl Provider for InterruptedToolProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            messages: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            events: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a CacheKey>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                let attempt = {
+                    let mut requests = self.requests.lock().unwrap();
+                    requests.push(messages.to_vec());
+                    requests.len()
+                };
+                if attempt > self.failures {
+                    return Ok(text_response(SUMMARY, SECOND_TURN));
+                }
+                let id = format!("{EAGER_PROBE}-{attempt}");
+                events
+                    .send(ProviderEvent::ToolUseStart {
+                        id: id.clone(),
+                        name: EAGER_PROBE.into(),
+                        source_ordinal: Some(0),
+                    })
+                    .unwrap();
+                events
+                    .send(ProviderEvent::ToolInputDelta {
+                        id,
+                        delta: json!({"attempt": attempt}).to_string(),
+                    })
+                    .unwrap();
+                self.started.recv_async().await.unwrap();
+                Err(AgentError::Api {
+                    status: TRANSIENT_STATUS,
+                    message: BOOM.into(),
+                    retry_after: Some(Duration::ZERO),
+                })
+            })
+        }
+
+        fn list_models(
+            &self,
+        ) -> BoxFuture<'_, Result<Vec<caudra_providers::ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
+    }
+
+    #[test_case(1, true; "recovers_in_same_task")]
+    #[test_case(PROVIDER_RETRIES + 1, false; "exhausts_eight_retries")]
+    fn interrupted_eager_tools_settle_before_task_provider_retries(failures: usize, success: bool) {
+        smol::block_on(async {
+            let (started_tx, started_rx) = flume::unbounded();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let executions = Arc::new(Mutex::new(Vec::new()));
+            let mut ctx = ctx_with(
+                AgentMode::Build,
+                InterruptedToolProvider {
+                    failures,
+                    started: started_rx,
+                    requests: Arc::clone(&requests),
+                },
+            );
+            let steering = Arc::make_mut(&mut ctx.config.steering);
+            steering.enabled = Some(false);
+            steering.rules.truncation.enabled = Some(false);
+            ctx.registry
+                .register_audited(
+                    Arc::new(EagerProbe {
+                        executions: Arc::clone(&executions),
+                        started: started_tx,
+                    }),
+                    NamedMock::source(),
+                    ToolEffect::ReadOnly,
+                )
+                .unwrap();
+            let (events_tx, events_rx) = flume::unbounded();
+            ctx.event_tx = EventSender::new(events_tx, 0);
+
+            let outcome = run_task(&ctx, request(TaskIdentity::Derive, None)).await;
+
+            assert_eq!(outcome.success, success, "{outcome:?}");
+            assert!(!outcome.cancelled);
+            assert_eq!(outcome.task_id.as_deref(), Some(LABEL_ID));
+            if success {
+                assert_eq!(outcome.output, json!(SUMMARY));
+                assert_eq!(outcome.error, None);
+            } else {
+                assert_eq!(outcome.output, Value::Null);
+                assert_eq!(
+                    outcome.error,
+                    Some(format!(
+                        "{ERROR_PREFIX}{}",
+                        AgentError::api(TRANSIENT_STATUS, BOOM)
+                    ))
+                );
+            }
+            assert_retired(&ctx, LABEL_ID);
+            let expected_calls: Vec<_> = (1..=failures)
+                .map(|attempt| format!("{EAGER_PROBE}-{attempt}"))
+                .collect();
+            assert_eq!(*executions.lock().unwrap(), expected_calls);
+            {
+                let requests = requests.lock().unwrap();
+                assert_eq!(requests.len(), failures + usize::from(success));
+                for (attempt, messages) in requests.iter().enumerate() {
+                    let results: Vec<_> = messages
+                        .iter()
+                        .flat_map(|message| &message.content)
+                        .filter_map(|block| match block {
+                            ContentBlock::ToolResult {
+                                tool_use_id,
+                                content,
+                                is_error,
+                                ..
+                            } => {
+                                assert!(!is_error);
+                                assert_eq!(content, MOCK_TOOL_OUTPUT);
+                                Some(tool_use_id.clone())
+                            }
+                            ContentBlock::Text { text } => {
+                                assert!(!is_run_failure_marker(text));
+                                None
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(results, expected_calls[..attempt]);
+                }
+            }
+            let mut settled = Vec::new();
+            let mut retries = 0;
+            while settled.len() < failures || retries < failures.min(PROVIDER_RETRIES) {
+                let envelope = events_rx.recv_async().await.unwrap();
+                let Some(child) = envelope.subagent else {
+                    continue;
+                };
+                assert_eq!(child.task_id, LABEL_ID);
+                assert_eq!(child.parent_tool_use_id, CALL_ID);
+                match envelope.event {
+                    AgentEvent::ToolDone(done) => {
+                        assert!(!done.is_error);
+                        settled.push(done.id);
+                    }
+                    AgentEvent::Retry {
+                        attempt, delay_ms, ..
+                    } => {
+                        retries += 1;
+                        assert_eq!(attempt as usize, retries);
+                        assert_eq!(delay_ms, 0);
+                        assert_eq!(settled, expected_calls[..retries]);
+                    }
+                    AgentEvent::Error { message } => panic!("{message}"),
+                    _ => {}
+                }
+            }
+            assert_eq!(retries, failures.min(PROVIDER_RETRIES));
+            assert_eq!(settled, expected_calls);
+            let history = ctx.subagent_history.snapshot();
+            assert_eq!(history.records().len(), 1);
+            let markers = history.records()[LABEL_ID]
+                .messages()
+                .iter()
+                .flat_map(|message| &message.content)
+                .filter(|block| matches!(block, ContentBlock::Text { text } if is_run_failure_marker(text)))
+                .count();
+            assert_eq!(markers, usize::from(!success));
+        });
     }
 
     fn request(task: TaskIdentity, mode: Option<SubagentTaskMode>) -> TaskRequest {

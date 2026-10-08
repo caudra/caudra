@@ -1,6 +1,5 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
-use std::env;
 use std::path::{Path, PathBuf};
 use std::slice;
 use std::sync::{
@@ -8,6 +7,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
+use std::{env, mem};
 
 use crate::tools::json_repair::RepairState;
 use serde_json::{Map, Value, json};
@@ -36,7 +36,7 @@ use super::speculative::SpeculativeRuns;
 use super::steering::{
     self, NO_PROGRESS_RULE, Observed, Recovery, RecoveryAction, SharedSteering, Steering,
 };
-use super::streaming::{StreamError, stream_with_retry};
+use super::streaming::{StreamError, StreamRetry, stream_with_retry};
 use super::title;
 use super::tool_dispatch::{self, RecentCalls, ResponseObservations};
 use crate::agent::change_recording::ChangeRecorder;
@@ -407,6 +407,7 @@ pub struct Agent<'h> {
     interrupt_source: Option<Arc<dyn InterruptSource>>,
     cancel: CancelToken,
     retry_now: Nudge,
+    stream_retry: StreamRetry,
     total_usage: TokenUsage,
     measured: Option<MeasuredContext>,
     num_turns: u32,
@@ -579,6 +580,7 @@ impl<'h> Agent<'h> {
             interrupt_source: None,
             cancel: CancelToken::none(),
             retry_now: Nudge::default(),
+            stream_retry: StreamRetry::default(),
             total_usage: TokenUsage::default(),
             measured: None,
             num_turns: 0,
@@ -837,6 +839,7 @@ impl<'h> Agent<'h> {
             self.recent_calls = RecentCalls::with_threshold(state.repeat_threshold());
             self.steering = Arc::new(Mutex::new(state));
         }
+        self.stream_retry = StreamRetry::default();
         if let Some(background) = &self.background {
             self.steering = background.steering(Arc::clone(&self.steering));
             self.shared_steering = true;
@@ -1662,6 +1665,7 @@ impl<'h> Agent<'h> {
                 SpeculativeRuns::new(&ctx, self.mcp.clone()).with_recent(self.recent_calls.clone()),
             )
         });
+        let mut stream_retry = mem::take(&mut self.stream_retry);
         let stream_result = {
             let (tools, mcp) = self.request_tools();
             repair_state.register_definitions(tools.as_ref());
@@ -1684,9 +1688,11 @@ impl<'h> Agent<'h> {
                 self.opts.clone(),
                 self.cache_key.as_ref(),
                 self.speculative.as_ref(),
+                &mut stream_retry,
             )
             .await
         };
+        self.stream_retry = stream_retry;
         self.drain_repair_usage(&repair_state);
         let mut interrupted = None;
         let mut response = match stream_result {
@@ -1881,6 +1887,21 @@ impl<'h> Agent<'h> {
             }
             return Ok(TurnOutcome::Continue);
         }
+        let retrying = if let Some(error) = interrupted.take_if(|error| error.is_retryable()) {
+            self.stream_retry
+                .wait(
+                    error,
+                    &*self.provider,
+                    &self.model,
+                    Some(&self.event_tx),
+                    &self.cancel,
+                    &self.retry_now,
+                )
+                .await?;
+            true
+        } else {
+            false
+        };
         let compacted = !preflight_compacted && self.try_auto_compact().await?;
         if self.cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
@@ -1910,6 +1931,10 @@ impl<'h> Agent<'h> {
                 self.publish_prepared_context();
                 return Ok(TurnOutcome::Continue);
             }
+        }
+        if retrying {
+            self.publish_prepared_context();
+            return Ok(TurnOutcome::Continue);
         }
         // A captured structured report satisfies missing prose only. This is
         // deliberately not an error handler: cancellation, failed dispatch,
@@ -3524,9 +3549,9 @@ mod tests {
     };
     use caudra_providers::provider::{BoxFuture, Provider};
     use caudra_providers::{
-        AutomationEventOrigin, ContentBlock, InvalidToolInput, Message, Model, ProviderEvent,
-        RequestOptions, Role, StandingReminderKind, SteeringKind, StopReason, StreamResponse,
-        TaskEventOrigin, TokenUsage, WorkflowEventOrigin, invalid_tool_input,
+        AutomationEventOrigin, ContentBlock, InvalidToolInput, Message, Model, ModelInfo,
+        ProviderEvent, RequestOptions, Role, StandingReminderKind, SteeringKind, StopReason,
+        StreamResponse, TaskEventOrigin, TokenUsage, WorkflowEventOrigin, invalid_tool_input,
     };
     use caudra_storage::StateDir;
     use caudra_storage::decision_log::{DecisionFilter, DecisionLog, StatsThresholds};
@@ -3534,6 +3559,7 @@ mod tests {
         AuthenticatedPrincipalId, AuthorityIdentity, PlanRef, ProjectIdentity, ProjectKey,
         ResourceId, ResourceRevision, SourceTrustAnchor, WorkspacePath,
     };
+    use isahc::error::ErrorKind as HttpErrorKind;
     use serde_json::Value;
     use test_case::test_case;
 
@@ -3545,6 +3571,7 @@ mod tests {
     use crate::mcp::tool_names;
     use crate::permissions::{PermissionManager, PermissionMode};
     use crate::remote_project_context::{RemoteAssetIdentity, RemoteSkill};
+    use crate::tools::native::batch::BatchTool;
     use crate::tools::native::todo_write::TodoWrite;
     use crate::tools::registry::ToolSource;
     use crate::tools::{TODOWRITE_TOOL_NAME, ToolEffect, audited_local_tool, local_tool};
@@ -3571,6 +3598,7 @@ mod tests {
         r#"{"error":{"type":"rate_limit_error","message":"input tokens per minute exceeded"}}"#;
     const RETRY_REASON: &str = "Rate limited: rate_limit_error: input tokens per minute exceeded";
     const EXPECTED_RETRY_BUDGET: u32 = 8;
+    const PARTIAL_CALL_PREFIX: &str = "partial-call-";
     const TASK_EVENT_KEY: &str = "task_event";
     const AUTOMATION_EVENT_KEY: &str = "automation_event";
     const AUTOMATION: &str = "nightly-review";
@@ -4788,6 +4816,101 @@ mod tests {
         captured_tools: Arc<Mutex<Vec<Value>>>,
         captured_models: Arc<Mutex<Vec<String>>>,
         captured_messages: Arc<Mutex<Vec<Vec<Message>>>>,
+    }
+
+    struct PartialStreamProvider {
+        responses: Mutex<VecDeque<(bool, Result<StreamResponse, AgentError>)>>,
+        requests: Arc<Mutex<Vec<Vec<Message>>>>,
+        batch: bool,
+    }
+
+    impl PartialStreamProvider {
+        fn new(responses: Vec<(bool, Result<StreamResponse, AgentError>)>, batch: bool) -> Self {
+            Self {
+                responses: Mutex::new(responses.into()),
+                requests: Arc::default(),
+                batch,
+            }
+        }
+    }
+
+    impl Provider for PartialStreamProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            messages: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            events: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a CacheKey>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                let call = {
+                    let mut requests = self.requests.lock().unwrap();
+                    requests.push(messages.to_vec());
+                    requests.len()
+                };
+                let (admit, response) = self.responses.lock().unwrap().pop_front().unwrap();
+                if admit {
+                    let id = format!("{PARTIAL_CALL_PREFIX}{call}");
+                    events
+                        .send(ProviderEvent::ToolUseStart {
+                            id: id.clone(),
+                            name: if self.batch {
+                                BATCH_TOOL_NAME
+                            } else {
+                                TEST_TOOL
+                            }
+                            .into(),
+                            source_ordinal: None,
+                        })
+                        .unwrap();
+                    let input = json!({"attempt": call});
+                    let delta = if self.batch {
+                        format!(
+                            "{{\"tool_calls\":[{{\"tool\":\"{TEST_TOOL}\",\"parameters\":{input}}},"
+                        )
+                    } else {
+                        input.to_string()
+                    };
+                    events
+                        .send(ProviderEvent::ToolInputDelta { id, delta })
+                        .unwrap();
+                }
+                response
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    fn install_partial_stream_tool(agent: &mut Agent<'_>) -> Arc<AtomicUsize> {
+        agent.config.eager_tool_dispatch = true;
+        agent.tools = json!([{"name": TEST_TOOL, "input_schema": {"type": "object"}}]);
+        agent
+            .registry
+            .register(
+                Arc::new(BatchTool),
+                ToolSource::Native {
+                    owner: crate::tools::native::OWNER.into(),
+                    contract: BATCH_TOOL_NAME.into(),
+                    trusted: true,
+                },
+            )
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let executed = Arc::clone(&calls);
+        agent.local_tools = Arc::new(HashMap::from([(
+            TEST_TOOL.into(),
+            audited_local_tool(ToolEffect::Isolated, move |_, _| {
+                executed.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(TEST_TOOL_RESULT.into()) })
+            }),
+        )]));
+        calls
     }
 
     impl MockProvider {
@@ -8529,6 +8652,274 @@ mod tests {
             assert_eq!(
                 calls.load(Ordering::SeqCst),
                 EXPECTED_RETRY_BUDGET as usize + 1
+            );
+        });
+    }
+
+    #[test_case(false, false; "top_level_without_steering")]
+    #[test_case(false, true; "top_level_without_truncation")]
+    #[test_case(true, false; "unfinished_batch_without_steering")]
+    #[test_case(true, true; "unfinished_batch_without_truncation")]
+    fn partial_stream_retries_after_settlement(batch: bool, steering_enabled: bool) {
+        smol::block_on(async {
+            let provider = PartialStreamProvider::new(
+                vec![
+                    (true, Err(retry_error(Duration::ZERO))),
+                    (false, Ok(text_response(StopReason::EndTurn))),
+                ],
+                batch,
+            );
+            let requests = Arc::clone(&provider.requests);
+            let mut history = History::default();
+            let (mut agent, events) = make_agent(provider, &mut history);
+            let policy = Arc::make_mut(&mut agent.config.steering);
+            policy.enabled = Some(steering_enabled);
+            policy.rules.truncation.enabled = Some(false);
+            let executed = install_partial_stream_tool(&mut agent);
+            assert_eq!(
+                agent.run(default_input()).await.unwrap(),
+                DoneReason::EndTurn
+            );
+            drop(agent);
+            assert_eq!(executed.load(Ordering::SeqCst), 1);
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(
+                requests[1]
+                    .iter()
+                    .flat_map(|message| &message.content)
+                    .any(|block| {
+                        matches!(
+                            block,
+                            ContentBlock::ToolResult {
+                                is_error: false,
+                                ..
+                            }
+                        )
+                    })
+            );
+            let events = drain_events(&events);
+            let settled = events
+                .iter()
+                .position(|event| matches!(event.event, AgentEvent::ToolResultsSubmitted { .. }))
+                .unwrap();
+            let retry = events
+                .iter()
+                .position(|event| {
+                    matches!(
+                        event.event,
+                        AgentEvent::Retry {
+                            attempt: 1,
+                            delay_ms: 0,
+                            ..
+                        }
+                    )
+                })
+                .unwrap();
+            assert!(settled < retry);
+            assert!(
+                events[..retry]
+                    .iter()
+                    .any(|event| matches!(event.event, AgentEvent::Injected { .. }))
+            );
+        });
+    }
+
+    #[test_case(false; "partial_failures")]
+    #[test_case(true; "mixed_pre_admission_and_partial_failures")]
+    fn partial_stream_retries_share_the_transport_budget(mixed: bool) {
+        smol::block_on(async {
+            let responses = (0..=EXPECTED_RETRY_BUDGET)
+                .map(|attempt| (!mixed || attempt % 2 == 1, Err(retry_error(Duration::ZERO))))
+                .collect();
+            let provider = PartialStreamProvider::new(responses, false);
+            let requests = Arc::clone(&provider.requests);
+            let mut history = History::default();
+            let (mut agent, events) = make_agent(provider, &mut history);
+            Arc::make_mut(&mut agent.config.steering).enabled = Some(false);
+            let executed = install_partial_stream_tool(&mut agent);
+            assert!(matches!(
+                agent.run(default_input()).await,
+                Err(AgentError::Api {
+                    status: RETRY_STATUS,
+                    ..
+                })
+            ));
+            drop(agent);
+            assert_eq!(
+                requests.lock().unwrap().len(),
+                EXPECTED_RETRY_BUDGET as usize + 1
+            );
+            assert_eq!(
+                executed.load(Ordering::SeqCst),
+                if mixed {
+                    EXPECTED_RETRY_BUDGET as usize / 2
+                } else {
+                    EXPECTED_RETRY_BUDGET as usize + 1
+                }
+            );
+            let attempts: Vec<_> = drain_events(&events)
+                .into_iter()
+                .filter_map(|event| match event.event {
+                    AgentEvent::Retry { attempt, .. } => Some(attempt),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(attempts, (1..=EXPECTED_RETRY_BUDGET).collect::<Vec<_>>());
+        });
+    }
+
+    #[test_case(false; "nudge_recovers_http_error")]
+    #[test_case(true; "cancel_during_http_backoff")]
+    fn partial_stream_http_recovery_respects_user_control(cancelled: bool) {
+        smol::block_on(async {
+            let error = AgentError::Http(HttpErrorKind::ConnectionFailed.into());
+            let provider = PartialStreamProvider::new(
+                vec![
+                    (true, Err(error)),
+                    (false, Ok(text_response(StopReason::EndTurn))),
+                ],
+                false,
+            );
+            let requests = Arc::clone(&provider.requests);
+            let mut history = History::default();
+            let (mut agent, events) = make_agent(provider, &mut history);
+            Arc::make_mut(&mut agent.config.steering).enabled = Some(false);
+            let executed = install_partial_stream_tool(&mut agent);
+            let (trigger, cancel) = CancelToken::new();
+            let retry_now = Nudge::default();
+            let mut agent = agent.with_cancel(cancel).with_retry_now(retry_now.clone());
+            let pump = smol::spawn(async move {
+                let mut trigger = Some(trigger);
+                while let Ok(event) = events.recv_async().await {
+                    if matches!(event.event, AgentEvent::Retry { .. }) {
+                        if cancelled {
+                            trigger.take().unwrap().cancel();
+                        } else {
+                            retry_now.notify();
+                        }
+                    }
+                }
+            });
+            assert_eq!(
+                agent.run(default_input()).await.unwrap(),
+                if cancelled {
+                    DoneReason::Cancelled
+                } else {
+                    DoneReason::EndTurn
+                }
+            );
+            drop(agent);
+            pump.await;
+            assert_eq!(executed.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                requests.lock().unwrap().len(),
+                if cancelled { 1 } else { 2 }
+            );
+        });
+    }
+
+    #[test_case(false; "successful_response")]
+    #[test_case(true; "new_external_invocation")]
+    fn partial_stream_retry_budget_resets_at_recovery_boundaries(new_invocation: bool) {
+        smol::block_on(async {
+            let mut responses: Vec<_> = (0..EXPECTED_RETRY_BUDGET)
+                .map(|_| (true, Err(retry_error(Duration::ZERO))))
+                .collect();
+            responses.push(if new_invocation {
+                (false, Err(retry_error(Duration::ZERO)))
+            } else {
+                (false, Ok(tool_use_response(TEST_TOOL, json!({}))))
+            });
+            responses.extend(
+                (0..EXPECTED_RETRY_BUDGET).map(|_| (true, Err(retry_error(Duration::ZERO)))),
+            );
+            responses.push((false, Ok(text_response(StopReason::EndTurn))));
+            let provider = PartialStreamProvider::new(responses, false);
+            let requests = Arc::clone(&provider.requests);
+            let mut history = History::default();
+            let (mut agent, events) = make_agent(provider, &mut history);
+            Arc::make_mut(&mut agent.config.steering).enabled = Some(false);
+            let executed = install_partial_stream_tool(&mut agent);
+            if new_invocation {
+                assert!(matches!(
+                    agent.run(default_input()).await,
+                    Err(AgentError::Api {
+                        status: RETRY_STATUS,
+                        ..
+                    })
+                ));
+            }
+            assert_eq!(
+                agent.run(default_input()).await.unwrap(),
+                DoneReason::EndTurn
+            );
+            drop(agent);
+            assert_eq!(
+                requests.lock().unwrap().len(),
+                2 * (EXPECTED_RETRY_BUDGET as usize + 1)
+            );
+            assert_eq!(
+                executed.load(Ordering::SeqCst),
+                2 * EXPECTED_RETRY_BUDGET as usize + usize::from(!new_invocation)
+            );
+            let attempts: Vec<_> = drain_events(&events)
+                .into_iter()
+                .filter_map(|event| match event.event {
+                    AgentEvent::Retry { attempt, .. } => Some(attempt),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                attempts,
+                (1..=EXPECTED_RETRY_BUDGET)
+                    .cycle()
+                    .take(2 * EXPECTED_RETRY_BUDGET as usize)
+                    .collect::<Vec<_>>()
+            );
+        });
+    }
+
+    #[test_case(Some(1), true; "hard_turn_limit")]
+    #[test_case(None, false; "nonretryable_failure")]
+    fn partial_stream_recovery_preserves_terminal_exits(max_turns: Option<u32>, transient: bool) {
+        smol::block_on(async {
+            let provider = PartialStreamProvider::new(
+                vec![(
+                    true,
+                    Err(if transient {
+                        retry_error(Duration::ZERO)
+                    } else {
+                        AgentError::api(AUTH_ERROR_STATUS, RETRY_BODY)
+                    }),
+                )],
+                false,
+            );
+            let requests = Arc::clone(&provider.requests);
+            let mut history = History::default();
+            let (mut agent, events) = make_agent(provider, &mut history);
+            agent.config.max_turns = max_turns;
+            Arc::make_mut(&mut agent.config.steering).enabled = Some(false);
+            let executed = install_partial_stream_tool(&mut agent);
+            let result = agent.run(default_input()).await;
+            if transient {
+                assert_eq!(result.unwrap(), DoneReason::MaxTurns);
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(AgentError::Api {
+                        status: AUTH_ERROR_STATUS,
+                        ..
+                    })
+                ));
+            }
+            drop(agent);
+            assert_eq!(executed.load(Ordering::SeqCst), 1);
+            assert_eq!(requests.lock().unwrap().len(), 1);
+            assert!(
+                !drain_events(&events)
+                    .iter()
+                    .any(|event| matches!(event.event, AgentEvent::Retry { .. }))
             );
         });
     }

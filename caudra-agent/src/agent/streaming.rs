@@ -542,6 +542,140 @@ impl From<StreamError> for AgentError {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct StreamRetry {
+    state: RetryState,
+    first_attempt_at: Option<Instant>,
+}
+
+impl StreamRetry {
+    pub(crate) async fn wait(
+        &mut self,
+        error: AgentError,
+        provider: &dyn Provider,
+        model: &Model,
+        event_tx: Option<&EventSender>,
+        cancel: &CancelToken,
+        retry_now: &Nudge,
+    ) -> Result<(), AgentError> {
+        if !error.is_retryable() {
+            return Err(error);
+        }
+        let first_attempt_at = *self.first_attempt_at.get_or_insert_with(Instant::now);
+        if error.should_rotate_key()
+            && let Ok(true) = provider.rotate_key().await
+        {
+            warn!(
+                target: target::PROVIDER,
+                event = EVENT_KEY_ROTATED,
+                provider = %model.provider,
+                error_kind = error.kind(),
+                status = error.status(),
+                "rotated API key after error"
+            );
+        }
+        let hint_ms = error
+            .retry_after()
+            .and_then(|after| u64::try_from(after.as_millis()).ok());
+        let (attempt, delay, source) = match self.state.decide(error.retry_after()) {
+            RetryDecision::Wait {
+                attempt,
+                delay,
+                source,
+            } => (attempt, delay, source),
+            RetryDecision::GiveUp(reason) => {
+                warn!(
+                    target: target::PROVIDER,
+                    event = EVENT_RETRY_EXHAUSTED,
+                    provider = %model.provider,
+                    model = %model.id,
+                    attempt = self.state.attempts(),
+                    max_retries = MAX_RETRIES,
+                    reason = reason.as_str(),
+                    retry_after_ms = hint_ms,
+                    status = error.status(),
+                    error_kind = error.kind(),
+                    elapsed_ms = first_attempt_at.elapsed().as_millis() as u64,
+                    outcome = OUTCOME_ERROR,
+                    "giving up after retrying"
+                );
+                return Err(error);
+            }
+        };
+        let Some((deadline, delay_ms)) = retry_schedule(Instant::now(), delay) else {
+            warn!(
+                target: target::PROVIDER,
+                event = EVENT_RETRY_EXHAUSTED,
+                provider = %model.provider,
+                model = %model.id,
+                attempt,
+                reason = UNREPRESENTABLE_RETRY_DELAY,
+                delay_secs = delay.as_secs(),
+                status = error.status(),
+                error_kind = error.kind(),
+                outcome = OUTCOME_ERROR,
+                "provider retry delay cannot be scheduled"
+            );
+            return Err(error);
+        };
+        warn!(
+            target: target::PROVIDER,
+            event = EVENT_RETRY,
+            provider = %model.provider,
+            model = %model.id,
+            attempt,
+            max_retries = MAX_RETRIES,
+            delay_ms,
+            delay_source = source.as_str(),
+            retry_after_ms = hint_ms,
+            status = error.status(),
+            error_kind = error.kind(),
+            error = %error,
+            "retryable, will retry"
+        );
+        let nudged = retry_now.listen();
+        if let Some(event_tx) = event_tx {
+            event_tx.send(AgentEvent::Retry {
+                attempt,
+                message: error.retry_message(),
+                delay_ms,
+            })?;
+        }
+        let waited = async {
+            futures_lite::future::race(
+                async {
+                    smol::Timer::at(deadline).await;
+                },
+                async {
+                    nudged.await;
+                },
+            )
+            .await;
+        };
+        futures_lite::future::race(waited, cancel.cancelled()).await;
+        if cancel.is_cancelled() {
+            return Err(AgentError::Cancelled);
+        }
+        Ok(())
+    }
+
+    fn recovered(&mut self, model: &Model) {
+        if self.state.attempts() > 0 {
+            info!(
+                target: target::PROVIDER,
+                event = EVENT_RETRY_RECOVERED,
+                provider = %model.provider,
+                model = %model.id,
+                attempt = self.state.attempts(),
+                elapsed_ms = self.first_attempt_at.map_or(0, |started| started.elapsed().as_millis() as u64),
+                outcome = OUTCOME_OK,
+                "request succeeded after retrying"
+            );
+        }
+        *self = Self::default();
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn stream_with_retry(
     provider: &dyn Provider,
@@ -555,6 +689,7 @@ pub(crate) async fn stream_with_retry(
     opts: RequestOptions,
     cache_key: Option<&CacheKey>,
     speculative: Option<&Arc<SpeculativeRuns>>,
+    retry: &mut StreamRetry,
 ) -> Result<StreamResponse, StreamError> {
     stream_with_retry_inner(
         provider,
@@ -569,6 +704,7 @@ pub(crate) async fn stream_with_retry(
         opts,
         cache_key,
         speculative,
+        retry,
     )
     .await
 }
@@ -598,6 +734,7 @@ pub(crate) async fn stream_silent_with_retry(
         opts,
         cache_key,
         None,
+        &mut StreamRetry::default(),
     )
     .await
 }
@@ -616,14 +753,12 @@ async fn stream_with_retry_inner(
     opts: RequestOptions,
     cache_key: Option<&CacheKey>,
     speculative: Option<&Arc<SpeculativeRuns>>,
+    retry: &mut StreamRetry,
 ) -> Result<StreamResponse, StreamError> {
     let opts = opts.clamped(model);
     let messages = caudra_providers::adapt_attachments_for_model(model, messages);
     let messages = &*messages;
-    let mut retry = RetryState::new();
-    // `started` restarts per attempt, so total time across a retry storm needs
-    // its own clock.
-    let first_attempt_at = Instant::now();
+    retry.first_attempt_at.get_or_insert_with(Instant::now);
     loop {
         if let Some(runs) = speculative {
             runs.begin_attempt();
@@ -673,23 +808,12 @@ async fn stream_with_retry_inner(
                     provider.reasoning_transport(model),
                 ));
                 emit_api_request(model, &r, opts, started.elapsed());
-                if retry.attempts() > 0 {
-                    info!(
-                        target: target::PROVIDER,
-                        event = EVENT_RETRY_RECOVERED,
-                        provider = %model.provider,
-                        model = %model.id,
-                        attempt = retry.attempts(),
-                        elapsed_ms = first_attempt_at.elapsed().as_millis() as u64,
-                        outcome = OUTCOME_OK,
-                        "request succeeded after retrying"
-                    );
-                }
+                retry.recovered(model);
                 return Ok(r);
             }
             Err(e) if speculative.is_some_and(|runs| runs.has_admitted()) => {
                 if !matches!(e, AgentError::Cancelled) {
-                    emit_api_error(model, &e, retry.attempts() + 1, started.elapsed());
+                    emit_api_error(model, &e, retry.state.attempts() + 1, started.elapsed());
                 }
                 let Some(runs) = speculative else {
                     return Err(e.into());
@@ -734,7 +858,7 @@ async fn stream_with_retry_inner(
                     event = EVENT_REQUEST_FINISHED,
                     provider = %model.provider,
                     model = %model.id,
-                    attempt = retry.attempts() + 1,
+                    attempt = retry.state.attempts() + 1,
                     duration_ms = started.elapsed().as_millis() as u64,
                     outcome = OUTCOME_CANCELLED,
                     "request cancelled"
@@ -745,78 +869,7 @@ async fn stream_with_retry_inner(
                 });
             }
             Err(e) if e.is_retryable() => {
-                emit_api_error(model, &e, retry.attempts() + 1, started.elapsed());
-                if e.should_rotate_key()
-                    && let Ok(true) = provider.rotate_key().await
-                {
-                    warn!(
-                        target: target::PROVIDER,
-                        event = EVENT_KEY_ROTATED,
-                        provider = %model.provider,
-                        error_kind = e.kind(),
-                        status = e.status(),
-                        "rotated API key after error"
-                    );
-                }
-                let hint_ms = e
-                    .retry_after()
-                    .and_then(|after| u64::try_from(after.as_millis()).ok());
-                let (attempt, delay, source) = match retry.decide(e.retry_after()) {
-                    RetryDecision::Wait {
-                        attempt,
-                        delay,
-                        source,
-                    } => (attempt, delay, source),
-                    RetryDecision::GiveUp(reason) => {
-                        warn!(
-                            target: target::PROVIDER,
-                            event = EVENT_RETRY_EXHAUSTED,
-                            provider = %model.provider,
-                            model = %model.id,
-                            attempt = retry.attempts(),
-                            max_retries = MAX_RETRIES,
-                            reason = reason.as_str(),
-                            retry_after_ms = hint_ms,
-                            status = e.status(),
-                            error_kind = e.kind(),
-                            elapsed_ms = first_attempt_at.elapsed().as_millis() as u64,
-                            outcome = OUTCOME_ERROR,
-                            "giving up after retrying"
-                        );
-                        return Err(e.into());
-                    }
-                };
-                let Some((deadline, delay_ms)) = retry_schedule(Instant::now(), delay) else {
-                    warn!(
-                        target: target::PROVIDER,
-                        event = EVENT_RETRY_EXHAUSTED,
-                        provider = %model.provider,
-                        model = %model.id,
-                        attempt,
-                        reason = UNREPRESENTABLE_RETRY_DELAY,
-                        delay_secs = delay.as_secs(),
-                        status = e.status(),
-                        error_kind = e.kind(),
-                        outcome = OUTCOME_ERROR,
-                        "provider retry delay cannot be scheduled"
-                    );
-                    return Err(e.into());
-                };
-                warn!(
-                    target: target::PROVIDER,
-                    event = EVENT_RETRY,
-                    provider = %model.provider,
-                    model = %model.id,
-                    attempt,
-                    max_retries = MAX_RETRIES,
-                    delay_ms,
-                    delay_source = source.as_str(),
-                    retry_after_ms = hint_ms,
-                    status = e.status(),
-                    error_kind = e.kind(),
-                    error = %e,
-                    "retryable, will retry"
-                );
+                emit_api_error(model, &e, retry.state.attempts() + 1, started.elapsed());
                 // The attempt's children outlive their ids: the message they
                 // were dispatched for is gone, so whatever they went on to
                 // report would name a row the retry will never draw. What
@@ -825,38 +878,19 @@ async fn stream_with_retry_inner(
                 if let Some(runs) = speculative {
                     runs.abandon_unfinished();
                 }
-                // Listening before the event goes out: a nudge is dropped when
-                // nothing is waiting, and announcing the wait first invites one
-                // to arrive in the gap before it starts.
-                let nudged = retry_now.listen();
-                if let Some(event_tx) = event_tx {
-                    event_tx.send(AgentEvent::Retry {
-                        attempt,
-                        message: e.retry_message(),
-                        delay_ms,
+                retry
+                    .wait(e, provider, model, event_tx, cancel, retry_now)
+                    .await
+                    .map_err(|error| match error {
+                        AgentError::Cancelled => StreamError::Cancelled {
+                            streamed: String::new(),
+                            reasoning: Vec::new(),
+                        },
+                        error => StreamError::Other(error),
                     })?;
-                }
-                let waited = async {
-                    futures_lite::future::race(
-                        async {
-                            smol::Timer::at(deadline).await;
-                        },
-                        async {
-                            nudged.await;
-                        },
-                    )
-                    .await;
-                };
-                futures_lite::future::race(waited, cancel.cancelled()).await;
-                if cancel.is_cancelled() {
-                    return Err(StreamError::Cancelled {
-                        streamed: String::new(),
-                        reasoning: Vec::new(),
-                    });
-                }
             }
             Err(e) => {
-                emit_api_error(model, &e, retry.attempts() + 1, started.elapsed());
+                emit_api_error(model, &e, retry.state.attempts() + 1, started.elapsed());
                 // The status is reported but never the body: see
                 // `error_description`.
                 warn!(
@@ -864,7 +898,7 @@ async fn stream_with_retry_inner(
                     event = EVENT_REQUEST_FAILED,
                     provider = %model.provider,
                     model = %model.id,
-                    attempt = retry.attempts() + 1,
+                    attempt = retry.state.attempts() + 1,
                     status = e.status(),
                     error_kind = e.kind(),
                     auth = e.is_auth_error(),
@@ -966,6 +1000,235 @@ mod tests {
     const EARLY_FAILURE: &str = "earlier call failed";
     const QUOTA_RESET: Duration = Duration::from_secs(13 * 3_600);
     const WEEKLY_RESET: Duration = Duration::from_secs(7 * 24 * 3_600);
+    const RETRY_STATUS: u16 = 503;
+    const RETRY_MODEL: &str = "anthropic/claude-sonnet-4-20250514";
+
+    struct RetryProvider {
+        calls: AtomicUsize,
+        failures: usize,
+        delay: Duration,
+    }
+
+    impl RetryProvider {
+        fn error(&self) -> AgentError {
+            AgentError::Api {
+                status: RETRY_STATUS,
+                message: TRANSPORT_FAILURE.into(),
+                retry_after: Some(self.delay),
+            }
+        }
+    }
+
+    impl Provider for RetryProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a CacheKey>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                if self.calls.fetch_add(1, Ordering::SeqCst) < self.failures {
+                    Err(self.error())
+                } else {
+                    Ok(StreamResponse::default())
+                }
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[test_case(false ; "shared_exhaustion")]
+    #[test_case(true ; "successful_response_resets")]
+    fn continuation_and_stream_share_retry_budget(recover: bool) {
+        smol::block_on(async {
+            let provider = RetryProvider {
+                calls: AtomicUsize::new(0),
+                failures: if recover { 1 } else { usize::MAX },
+                delay: Duration::ZERO,
+            };
+            let model = Model::from_spec(RETRY_MODEL).unwrap();
+            let (events, rx) = flume::unbounded();
+            let sender = EventSender::new(events, 0);
+            let cancel = CancelToken::none();
+            let nudge = Nudge::default();
+            let mut retry = StreamRetry::default();
+            retry
+                .wait(
+                    provider.error(),
+                    &provider,
+                    &model,
+                    Some(&sender),
+                    &cancel,
+                    &nudge,
+                )
+                .await
+                .unwrap();
+            let first_attempt_at = retry.first_attempt_at;
+            let result = stream_with_retry(
+                &provider,
+                &model,
+                &[],
+                "",
+                &json!([]),
+                &sender,
+                &cancel,
+                &nudge,
+                RequestOptions::default(),
+                None,
+                None,
+                &mut retry,
+            )
+            .await;
+            let expected_attempts = if recover { 2 } else { MAX_RETRIES };
+            let attempts: Vec<_> = rx
+                .drain()
+                .filter_map(|envelope| match envelope.event {
+                    AgentEvent::Retry { attempt, .. } => Some(attempt),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(attempts, (1..=expected_attempts).collect::<Vec<_>>());
+            assert_eq!(
+                provider.calls.load(Ordering::SeqCst),
+                expected_attempts as usize
+            );
+            if recover {
+                assert!(result.is_ok());
+                assert_eq!(retry.state.attempts(), 0);
+                assert_eq!(retry.first_attempt_at, None);
+                retry
+                    .wait(provider.error(), &provider, &model, None, &cancel, &nudge)
+                    .await
+                    .unwrap();
+                assert_eq!(retry.state.attempts(), 1);
+            } else {
+                assert!(matches!(result, Err(StreamError::Other(AgentError::Api {
+                    status: RETRY_STATUS,
+                    message,
+                    retry_after: Some(Duration::ZERO),
+                })) if message == TRANSPORT_FAILURE));
+                assert_eq!(retry.state.attempts(), MAX_RETRIES);
+                assert_eq!(retry.first_attempt_at, first_attempt_at);
+                let error = retry
+                    .wait(
+                        provider.error(),
+                        &provider,
+                        &model,
+                        Some(&sender),
+                        &cancel,
+                        &nudge,
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.to_string(), provider.error().to_string());
+                assert!(rx.is_empty());
+            }
+        });
+    }
+
+    #[test_case(false ; "nudge")]
+    #[test_case(true ; "cancellation")]
+    fn shared_retry_wait_preserves_hint_and_can_be_interrupted(cancelled: bool) {
+        smol::block_on(async {
+            let provider = RetryProvider {
+                calls: AtomicUsize::new(0),
+                failures: usize::MAX,
+                delay: QUOTA_RESET,
+            };
+            let model = Model::from_spec(RETRY_MODEL).unwrap();
+            let (events, rx) = flume::unbounded();
+            let sender = EventSender::new(events, 0);
+            let (trigger, cancel) = CancelToken::new();
+            let mut trigger = Some(trigger);
+            let nudge = Nudge::default();
+            let mut retry = StreamRetry::default();
+            let wait = retry.wait(
+                provider.error(),
+                &provider,
+                &model,
+                Some(&sender),
+                &cancel,
+                &nudge,
+            );
+            let (result, ()) = futures_lite::future::zip(wait, async {
+                let envelope = rx.recv_async().await.unwrap();
+                assert!(matches!(envelope.event, AgentEvent::Retry {
+                    attempt: 1,
+                    delay_ms,
+                    ..
+                } if u128::from(delay_ms) == QUOTA_RESET.as_millis()));
+                if cancelled {
+                    trigger.take().unwrap().cancel();
+                } else {
+                    nudge.notify();
+                }
+            })
+            .await;
+            if cancelled {
+                assert!(matches!(result, Err(AgentError::Cancelled)));
+            } else {
+                assert!(result.is_ok());
+            }
+            assert_eq!(retry.state.attempts(), 1);
+        });
+    }
+
+    #[test]
+    fn stream_retry_cancellation_preserves_empty_stream_error() {
+        smol::block_on(async {
+            let provider = RetryProvider {
+                calls: AtomicUsize::new(0),
+                failures: usize::MAX,
+                delay: QUOTA_RESET,
+            };
+            let model = Model::from_spec(RETRY_MODEL).unwrap();
+            let (events, rx) = flume::unbounded();
+            let sender = EventSender::new(events, 0);
+            let (trigger, cancel) = CancelToken::new();
+            let nudge = Nudge::default();
+            let tools = json!([]);
+            let mut retry = StreamRetry::default();
+            let request = stream_with_retry(
+                &provider,
+                &model,
+                &[],
+                "",
+                &tools,
+                &sender,
+                &cancel,
+                &nudge,
+                RequestOptions::default(),
+                None,
+                None,
+                &mut retry,
+            );
+            let (result, ()) = futures_lite::future::zip(request, async {
+                loop {
+                    if matches!(
+                        rx.recv_async().await.unwrap().event,
+                        AgentEvent::Retry { .. }
+                    ) {
+                        trigger.cancel();
+                        break;
+                    }
+                }
+            })
+            .await;
+            assert!(
+                matches!(result, Err(StreamError::Cancelled { streamed, reasoning })
+                if streamed.is_empty() && reasoning.is_empty())
+            );
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(retry.state.attempts(), 1);
+        });
+    }
 
     #[test_case(Duration::ZERO ; "immediate")]
     #[test_case(QUOTA_RESET ; "subscription_quota_reset")]
@@ -1311,6 +1574,10 @@ mod tests {
             };
             let tools = json!([]);
             let nudge = Nudge::default();
+            let mut retry = StreamRetry::default();
+            for _ in 0..MAX_RETRIES {
+                retry.state.decide(Some(Duration::ZERO));
+            }
             let request = stream_with_retry(
                 &provider,
                 &ctx.model,
@@ -1323,6 +1590,7 @@ mod tests {
                 RequestOptions::default(),
                 None,
                 Some(&runs),
+                &mut retry,
             );
             let result = futures_lite::future::race(request, async {
                 if cancelled {
@@ -1340,6 +1608,7 @@ mod tests {
                 panic!("expected an admitted partial response");
             };
             runs.settled().await;
+            assert_eq!(retry.state.attempts(), MAX_RETRIES);
             assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
             assert_eq!(executed.load(Ordering::SeqCst), 1);
             assert_eq!(matches!(error, AgentError::Cancelled), cancelled);
