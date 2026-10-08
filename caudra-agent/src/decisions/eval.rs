@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 
 use super::{
     DecisionContext, DecisionFeature, DecisionOutcome, Decisions, PermissionAction, content,
-    permission, questions, shell_duration, shell_effect,
+    permission, question_tool_nudge, questions, shell_duration, shell_effect,
 };
 use crate::SubagentTaskMode;
 use crate::agent::subagent::{RoutingTask, routing_state, subagent_job};
@@ -64,6 +64,8 @@ const DURATION_LEVELS: [&str; 4] = ["instant", "seconds", "minutes", "endless"];
 #[derive(Deserialize)]
 struct Fixture<C> {
     baseline: Tally,
+    #[serde(default)]
+    baseline_note: Option<String>,
     cases: Vec<C>,
 }
 
@@ -159,6 +161,15 @@ struct ToolCase {
     expect: String,
 }
 
+#[derive(Deserialize)]
+struct QuestionToolCase {
+    label: String,
+    cohort: String,
+    user_request: String,
+    assistant_reply: String,
+    needed: bool,
+}
+
 #[test]
 #[ignore = "needs CAUDRA_DECISION_EVAL_URL"]
 fn decision_eval() {
@@ -205,6 +216,12 @@ fn decision_eval() {
                 |case| tool_search_case(decisions, case),
             )
             .await,
+            run(
+                "question_tool_nudge",
+                include_str!("eval/question_tool_nudge.json"),
+                |case| question_tool_nudge_case(decisions, case),
+            )
+            .await,
         ]
     });
     assert!(passed.iter().all(|passed| *passed), "{REGRESSED}");
@@ -229,6 +246,7 @@ fn service(url: &str, state_dir: StateDir) -> Decisions {
     features.skill_suggestions = FeatureMode::Advise;
     features.goal_prescreen = FeatureMode::Enforce;
     features.subagent_routing = FeatureMode::Enforce;
+    features.question_tool_nudge = FeatureMode::Advise;
     Decisions::new(config, &state_dir).expect(SERVICE_INVALID)
 }
 
@@ -239,6 +257,9 @@ async fn run<C: DeserializeOwned, F: Future<Output = Scored>>(
 ) -> bool {
     let fixture: Fixture<C> = serde_json::from_str(fixture)
         .unwrap_or_else(|error| panic!("{feature} fixture is invalid: {error}"));
+    if let Some(note) = &fixture.baseline_note {
+        println!("{feature} baseline: {note}");
+    }
     let mut measured = Tally::default();
     let mut latencies = Vec::new();
     for case in fixture.cases {
@@ -339,6 +360,109 @@ fn scored<T: Debug>(
         verdicts,
         latency_ms,
     }
+}
+
+#[test]
+#[ignore = "needs CAUDRA_DECISION_EVAL_URL"]
+fn question_tool_nudge_eval() {
+    let url = env::var(URL_ENV).expect(URL_MISSING);
+    let temp = tempfile::tempdir().unwrap();
+    let decisions = service(&url, StateDir::from_path(temp.path().into()));
+    let passed = smol::block_on(run(
+        "question_tool_nudge",
+        include_str!("eval/question_tool_nudge.json"),
+        |case| question_tool_nudge_case(&decisions, case),
+    ));
+    assert!(passed, "{REGRESSED}");
+}
+
+fn question_tool_verdict(outcome: &DecisionOutcome, threshold: f64, needed: bool) -> Verdict {
+    let chosen = question_tool_nudge::should_nudge(&FeatureMode::Advise, outcome, threshold);
+    matched(
+        question_tool_nudge::probability(outcome).is_some(),
+        chosen.then_some(true),
+        needed.then_some(true),
+    )
+}
+
+async fn question_tool_nudge_case(decisions: &Decisions, case: QuestionToolCase) -> Scored {
+    let questions = questions::QUESTION_TOOL_NUDGE.as_ref().expect(SET_INVALID);
+    let state =
+        question_tool_nudge::state(&case.user_request, &case.assistant_reply).expect(UNREACHED);
+    let outcome = evaluate(
+        decisions,
+        DecisionFeature::QuestionToolNudge,
+        state.value(),
+        questions,
+    )
+    .await;
+    let verdict = question_tool_verdict(
+        &outcome,
+        decisions.config().thresholds.question_tool_nudge,
+        case.needed,
+    );
+    scored(
+        (case.cohort, case.label),
+        question_tool_nudge::probability(&outcome),
+        vec![verdict],
+        outcome.latency_ms,
+    )
+}
+
+#[test]
+fn question_tool_fixture_preserves_the_reviewed_and_held_out_cohort() {
+    let fixture: Fixture<QuestionToolCase> =
+        serde_json::from_str(include_str!("eval/question_tool_nudge.json")).unwrap();
+    let cases = &fixture.cases;
+    assert_eq!(cases.len(), 36);
+    assert_eq!(cases.iter().filter(|case| case.needed).count(), 16);
+    assert_eq!(
+        cases
+            .iter()
+            .map(|case| &case.label)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        cases.len()
+    );
+    for (cohort, count, positive) in [
+        ("reviewed_paraphrase", 12, 7),
+        ("synthetic_initial", 12, 3),
+        ("synthetic_held_out", 12, 6),
+    ] {
+        let group: Vec<_> = cases.iter().filter(|case| case.cohort == cohort).collect();
+        assert_eq!(group.len(), count);
+        assert_eq!(group.iter().filter(|case| case.needed).count(), positive);
+    }
+    for case in cases {
+        let state = question_tool_nudge::state(&case.user_request, &case.assistant_reply).unwrap();
+        assert!(state.value().to_string().len() <= super::state::MAX_STATE_BYTES);
+    }
+    assert!(
+        cases
+            .iter()
+            .any(|case| case.label == "rust_quiz_known_miss" && case.needed)
+    );
+    assert_eq!(fixture.baseline.right, 35);
+    assert_eq!(fixture.baseline.wrong, 0);
+    assert_eq!(fixture.baseline.undecided, 1);
+}
+
+#[test]
+fn question_tool_quiz_miss_is_not_scored_as_success() {
+    let outcome = DecisionOutcome {
+        result: Ok(serde_json::from_value(json!({
+            "model": "test",
+            "answers": {question_tool_nudge::QUESTION: {"type": "noul", "noul": 0.5212}},
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        }))
+        .unwrap()),
+        latency_ms: 0,
+        receipt: None,
+    };
+    assert_eq!(
+        question_tool_verdict(&outcome, DECIDED, true),
+        Verdict::Undecided
+    );
 }
 
 async fn shell_duration_case(decisions: &Decisions, case: DurationCase) -> Scored {

@@ -744,11 +744,9 @@ impl App {
             },
             workflows: workflow_chip(self.workflow.runs()),
             permission_mode: self.permissions.mode(),
-            decisions_offline: !self.permissions.is_yolo()
-                && self.permissions.decisions().is_some_and(|decisions| {
-                    decisions.config().base_url.is_some()
-                        && decisions.status().reachable == Some(false)
-                }),
+            decisions_offline: self.permissions.decisions().is_some_and(|decisions| {
+                decisions.config().base_url.is_some() && decisions.status().reachable == Some(false)
+            }),
             restoring: self.restoring.load(Ordering::Relaxed),
             background_waiting: self.waiting_for_background(),
             goal: goal.as_ref(),

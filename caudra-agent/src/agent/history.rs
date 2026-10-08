@@ -109,9 +109,11 @@ impl History {
     /// Every item a reader scrolls: the archive, then the active chain. Not a
     /// valid request; it crosses every compaction seam.
     pub fn transcript_items(&self) -> Vec<HistoryItem> {
-        let mut items = self.archived.clone();
-        items.extend_from_slice(self.active_items());
-        items
+        self.transcript().cloned().collect()
+    }
+
+    pub(super) fn transcript(&self) -> impl DoubleEndedIterator<Item = &HistoryItem> {
+        self.archived.iter().chain(self.active_items())
     }
 
     /// Bumped by `replace` and `truncate` but not by `extend`, so a caller can

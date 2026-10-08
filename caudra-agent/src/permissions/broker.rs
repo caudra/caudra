@@ -40,8 +40,8 @@ impl PermissionBroker {
         self.changed.notify(usize::MAX);
     }
 
-    /// Passive decisions rest on the permission mode, the decision service
-    /// and the project, so answers and rule edits leave them current.
+    /// Passive decisions rest on the decision service and the project,
+    /// so permission modes, answers and rule edits leave them current.
     pub(super) fn revoke_passive_decisions(&self) {
         self.passive_revision.fetch_add(1, Ordering::Release);
         self.passive_changed.notify(usize::MAX);

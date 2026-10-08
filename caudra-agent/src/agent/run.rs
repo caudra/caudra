@@ -18,7 +18,8 @@ use caudra_providers::provider::{self, Provider};
 use caudra_providers::{
     Billing, CacheKey, ContentBlock, DOCUMENT_TOKENS_PER_PAGE, HistoryItem, HistoryItemKind,
     Message, Model, ModelError, ModelPurpose, ReasoningSource, RequestOptions, Role,
-    StandingReminderKind, StopReason, StreamResponse, Timeouts, TokenUsage, estimate_tokens_cached,
+    StandingReminderKind, StopReason, StreamResponse, Timeouts, TokenUsage, UserOrigin,
+    estimate_tokens_cached,
 };
 
 use super::commit_preamble;
@@ -51,7 +52,7 @@ use crate::context::{
 use crate::decisions::questions as decision_questions;
 use crate::decisions::{
     DecisionContext, DecisionFeature, DecisionOutcome, DecisionReceipt, Decisions, push_fitting,
-    redact_decision_text, redacted_excerpt,
+    question_tool_nudge, redact_decision_text, redacted_excerpt,
 };
 use crate::mcp::{McpRequestSnapshot, McpSession};
 use crate::nudge::Nudge;
@@ -61,7 +62,7 @@ use crate::template::Vars;
 use crate::tools::ToolFilter;
 use crate::tools::native::plan::PlanTarget;
 use crate::tools::native::skill::{self, SkillInventoryEntry};
-use crate::tools::{BATCH_TOOL_NAME, SKILL_TOOL_NAME};
+use crate::tools::{BATCH_TOOL_NAME, QUESTION_TOOL_NAME, SKILL_TOOL_NAME};
 use crate::tools::{BuiltinDeferral, DeferralSession, DeferredTool};
 use crate::tools::{Deadline, FileReadTracker, LocalTools, PathLocks, ToolAudience, ToolContext};
 use crate::types::TodoItem;
@@ -1388,6 +1389,119 @@ impl<'h> Agent<'h> {
         self.audience.contains(ToolAudience::MAIN) && self.root_tool_use_id.is_none()
     }
 
+    fn can_nudge_question(&self) -> bool {
+        self.is_main_session()
+            && self.tool_context().tool_available(QUESTION_TOOL_NAME)
+            && (self.local_tools.contains_key(QUESTION_TOOL_NAME)
+                || self.user_response_rx.as_ref().is_some_and(|receiver| {
+                    receiver.try_lock().is_some_and(|rx| !rx.is_disconnected())
+                }))
+            && !self.terminal_report_ready()
+            && !self.cancel.is_cancelled()
+            && !self
+                .interrupt_source
+                .as_ref()
+                .is_some_and(|source| source.has_pending_input())
+    }
+
+    async fn remind_question_tool(&mut self) -> Result<Option<TurnOutcome>, AgentError> {
+        if !self.can_nudge_question() {
+            return Ok(None);
+        }
+        let Some(revision) = self.permissions.passive_decision_revision() else {
+            return Ok(None);
+        };
+        let feature = DecisionFeature::QuestionToolNudge;
+        let Some(decisions) = self.permissions.decisions().filter(|d| d.enabled(&feature)) else {
+            return Ok(None);
+        };
+        let Some(request) = question_nudge_request(self.history) else {
+            return Ok(None);
+        };
+        let Some(state) = self
+            .response_text
+            .as_deref()
+            .and_then(|reply| question_tool_nudge::state(request, reply))
+        else {
+            return Ok(None);
+        };
+        let Some(questions) = decision_questions::QUESTION_TOOL_NUDGE.as_ref() else {
+            return Ok(None);
+        };
+        let outcome = self
+            .cancel
+            .race(self.permissions.run_passive_decision(decisions.evaluate(
+                feature,
+                state.value(),
+                questions,
+                &self.decision_context(),
+            )))
+            .await
+            .map_err(|_| AgentError::Cancelled)?;
+        let Some(outcome) = outcome.flatten() else {
+            return Ok(None);
+        };
+        if self.terminal_report_ready() {
+            return Ok(Some(TurnOutcome::Done(DoneReason::EndTurn)));
+        }
+        if self.handle_queued_command().await? {
+            return Ok(Some(TurnOutcome::Continue));
+        }
+        if self.cancel.is_cancelled() {
+            return Err(AgentError::Cancelled);
+        }
+        if !self.can_nudge_question()
+            || !question_tool_nudge::should_nudge(
+                decisions.mode(&DecisionFeature::QuestionToolNudge),
+                &outcome,
+                decisions.config().thresholds.question_tool_nudge,
+            )
+        {
+            return Ok(None);
+        }
+        let head = self.history.item_head();
+        self.inject_automation_guidance().await;
+        let queued = self.handle_queued_command().await?;
+        if self.cancel.is_cancelled() {
+            return Err(AgentError::Cancelled);
+        }
+        if self.terminal_report_ready()
+            || self
+                .interrupt_source
+                .as_ref()
+                .is_some_and(|source| source.has_pending_input())
+        {
+            return Ok(Some(TurnOutcome::Done(DoneReason::EndTurn)));
+        }
+        let arrivals = self
+            .background
+            .as_ref()
+            .map(BackgroundTasks::claim_messages)
+            .transpose()
+            .map_err(Self::job_error)?
+            .unwrap_or_default();
+        self.push_arrivals(arrivals);
+        self.inject_peer_messages();
+        if queued || self.history.item_head() != head {
+            return Ok(Some(TurnOutcome::Continue));
+        }
+        if !self.can_nudge_question()
+            || !self.permissions.passive_decision_is_current(revision)
+            || self
+                .workflow
+                .as_ref()
+                .is_some_and(|work| work.pending_completions() > 0)
+        {
+            return Ok(None);
+        }
+        self.response_text = None;
+        self.push_injected(Message::synthetic(question_tool_nudge::REMINDER.into()));
+        if let Some(receipt) = &outcome.receipt {
+            decisions.record_effect_detached(receipt, DecisionEffect::Advised);
+        }
+        Ok(Some(TurnOutcome::Continue))
+    }
+
     /// Holds a handoff back to the user, once per run, while the todo list
     /// still has open items, reporting whether the reminder went in. Work that
     /// is still running skips it: its report wakes the agent, and the run that
@@ -2005,6 +2119,13 @@ impl<'h> Agent<'h> {
         // Explicit user input and goal evaluation retain their own continuation policy.
         let handoff = !has_tools && !(compacted && stop_reason != Some(StopReason::MaxTokens));
         let done_reason = DoneReason::from(stop_reason);
+        if handoff
+            && stop_reason == Some(StopReason::EndTurn)
+            && let Some(outcome) = self.remind_question_tool().await?
+        {
+            self.publish_prepared_context();
+            return Ok(outcome);
+        }
         // Checked ahead of goal completion, which evaluates the goal or defers
         // it behind queued next prompts, so both follow the reminder. Returning
         // here keeps the reminder the last message of its request.
@@ -2087,18 +2208,16 @@ impl<'h> Agent<'h> {
         if !self.goal_completion_ready() {
             return self.defer_goal(done_reason);
         }
-        if !self.permissions.is_yolo()
-            && prescreen.as_ref().is_some_and(|(decisions, outcome)| {
-                should_skip_goal(
-                    decisions.mode(&DecisionFeature::GoalPrescreen),
-                    outcome,
-                    decisions.config().thresholds.goal_skip_below,
-                    self.goal_prescreen_skips,
-                    self.goal_blocks,
-                    self.goal.continuation_limit(),
-                )
-            })
-        {
+        if prescreen.as_ref().is_some_and(|(decisions, outcome)| {
+            should_skip_goal(
+                decisions.mode(&DecisionFeature::GoalPrescreen),
+                outcome,
+                decisions.config().thresholds.goal_skip_below,
+                self.goal_prescreen_skips,
+                self.goal_blocks,
+                self.goal.continuation_limit(),
+            )
+        }) {
             if !self.goal.is_generation_active(goal.generation) {
                 return Ok(TurnOutcome::Done(done_reason));
             }
@@ -2304,7 +2423,7 @@ impl<'h> Agent<'h> {
     }
 
     async fn suggest_skill(&mut self, task: &str) -> Option<SkillSuggestion> {
-        if self.permissions.is_yolo() || task.trim().is_empty() {
+        if task.trim().is_empty() {
             return None;
         }
         let decisions = self.permissions.decisions()?;
@@ -2327,8 +2446,7 @@ impl<'h> Agent<'h> {
             .ok()
             .flatten()
             .flatten()?;
-        if !self.permissions.is_yolo()
-            && decisions.mode(&DecisionFeature::SkillSuggestions) == &FeatureMode::Advise
+        if decisions.mode(&DecisionFeature::SkillSuggestions) == &FeatureMode::Advise
             && let Some(name) = suggested_skill(
                 &outcome,
                 &candidates,
@@ -2355,9 +2473,6 @@ impl<'h> Agent<'h> {
     }
 
     async fn prescreen_goal(&self, condition: &str) -> Option<(Decisions, DecisionOutcome)> {
-        if self.permissions.is_yolo() {
-            return None;
-        }
         let decisions = self.permissions.decisions()?;
         if !decisions.enabled(&DecisionFeature::GoalPrescreen) {
             return None;
@@ -2967,6 +3082,26 @@ impl SkillSuggestion {
     }
 }
 
+fn question_nudge_request(history: &History) -> Option<&str> {
+    for item in history.transcript().rev() {
+        if let HistoryItemKind::User {
+            text,
+            origin,
+            display_text,
+            ..
+        } = &item.kind
+        {
+            if *origin == UserOrigin::Synthetic && text == question_tool_nudge::REMINDER {
+                return None;
+            }
+            if *origin == UserOrigin::Turn {
+                return Some(display_text.as_deref().unwrap_or(text));
+            }
+        }
+    }
+    None
+}
+
 /// A page or search such as `caudra-docs/tools#shell` counts as loading its
 /// skill, so suggestions stop offering it.
 fn loaded_skills(history: &[HistoryItem]) -> BTreeSet<String> {
@@ -3534,6 +3669,7 @@ mod tests {
     include!("automation_tests.rs");
     include!("owned_jobs_tests.rs");
     include!("peer_tests.rs");
+    include!("question_nudge_tests.rs");
 
     use std::collections::{HashMap, VecDeque};
     use std::slice;
@@ -3782,7 +3918,7 @@ mod tests {
     #[test_case(FeatureMode::Enforce, false, false, 0.0, true, 1; "enforce_skips")]
     #[test_case(FeatureMode::Shadow, false, false, 0.0, false, 1; "shadow_evaluates")]
     #[test_case(FeatureMode::Off, false, false, 0.0, false, 0; "off_never_calls")]
-    #[test_case(FeatureMode::Enforce, true, false, 0.0, false, 0; "yolo_never_calls")]
+    #[test_case(FeatureMode::Enforce, true, false, 0.0, true, 1; "yolo_prescreens")]
     #[test_case(FeatureMode::Enforce, false, true, 0.0, false, 1; "error_evaluates")]
     #[test_case(FeatureMode::Enforce, false, false, 0.5, false, 1; "uncertain_evaluates")]
     #[test_case(FeatureMode::Enforce, false, false, 0.05, true, 1; "threshold_inclusive")]
@@ -3913,11 +4049,19 @@ mod tests {
         });
     }
 
-    #[test_case(FeatureMode::Advise, 1.0, false, true; "advised_after_injection")]
-    #[test_case(FeatureMode::Shadow, 1.0, false, false; "shadow_has_no_effect")]
-    #[test_case(FeatureMode::Advise, 0.1, false, false; "uncertain_has_no_effect")]
-    #[test_case(FeatureMode::Advise, 1.0, true, false; "failure_has_no_effect")]
-    fn decision_skill_effect(mode: FeatureMode, confidence: f64, fail: bool, injected: bool) {
+    #[test_case(FeatureMode::Advise, 1.0, false, true, PermissionMode::Ask; "advised_after_injection")]
+    #[test_case(FeatureMode::Advise, 1.0, false, true, PermissionMode::Auto; "auto_advises")]
+    #[test_case(FeatureMode::Advise, 1.0, false, true, PermissionMode::Yolo; "yolo_advises")]
+    #[test_case(FeatureMode::Shadow, 1.0, false, false, PermissionMode::Ask; "shadow_has_no_effect")]
+    #[test_case(FeatureMode::Advise, 0.1, false, false, PermissionMode::Ask; "uncertain_has_no_effect")]
+    #[test_case(FeatureMode::Advise, 1.0, true, false, PermissionMode::Ask; "failure_has_no_effect")]
+    fn decision_skill_effect(
+        mode: FeatureMode,
+        confidence: f64,
+        fail: bool,
+        injected: bool,
+        permission_mode: PermissionMode,
+    ) {
         smol::block_on(async {
             let directory = tempfile::tempdir().unwrap();
             let mut history = History::new(Vec::new());
@@ -3966,6 +4110,7 @@ mod tests {
                 fail,
                 Arc::new(AtomicUsize::new(0)),
             )));
+            agent.permissions.set_session_mode(Some(permission_mode));
             agent.suggest_skill(DECISION_SKILL_TASK).await;
             assert_eq!(agent.history.as_slice().len(), usize::from(injected));
             if injected {

@@ -17,6 +17,7 @@ use futures_lite::future;
 use serde_json::{Value, json};
 use smol::Task;
 use std::future::Future;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tracing::warn;
@@ -132,7 +133,7 @@ pub(super) fn advisories(decision: &PermissionDecision) -> Vec<PermissionAdvisor
 
 impl PermissionManager {
     pub async fn run_passive_decision<T>(&self, future: impl Future<Output = T>) -> Option<T> {
-        let revision = self.broker.passive_revision.load(Ordering::Acquire);
+        let revision = self.passive_decision_revision()?;
         let changed = self.broker.passive_changed.listen();
         if !self.passive_decision_is_current(revision) {
             return None;
@@ -146,6 +147,30 @@ impl PermissionManager {
         )
         .await;
         outcome.filter(|_| self.passive_decision_is_current(revision))
+    }
+
+    pub(crate) fn run_permission_decision<T, F: Future<Output = T>>(
+        &self,
+        future: F,
+    ) -> impl Future<Output = Option<T>> + use<T, F> {
+        let revision = self.broker.revision.load(Ordering::Acquire);
+        let changed = self.broker.changed.listen();
+        let eligible = self.permission_decision_revision().is_some();
+        let broker = Arc::clone(&self.broker);
+        async move {
+            if !eligible || broker.revision.load(Ordering::Acquire) != revision {
+                return None;
+            }
+            let outcome = future::race(
+                async {
+                    changed.await;
+                    None
+                },
+                async { Some(future.await) },
+            )
+            .await;
+            outcome.filter(|_| broker.revision.load(Ordering::Acquire) == revision)
+        }
     }
 
     pub(super) async fn screen_auto_candidate(
@@ -276,12 +301,15 @@ impl PermissionManager {
             .filter(|service| service.enabled(&DecisionFeature::PermissionAdvice))?;
         let input = state(request);
         let context = context(self, request);
-        Some(smol::spawn(async move {
-            let decision = service
+        let evaluation_service = service.clone();
+        let decision = self.run_permission_decision(async move {
+            evaluation_service
                 .permission(PermissionPurpose::Advice, &input, &context)
-                .await;
-            (service, decision)
-        }))
+                .await
+        });
+        Some(smol::spawn(
+            async move { (service, decision.await.flatten()) },
+        ))
     }
 
     pub(super) fn shell_effect_advice(
@@ -302,10 +330,15 @@ impl PermissionManager {
             .filter(|service| service.enabled(&DecisionFeature::ShellEffect))?;
         let command = request.input.get("command")?.as_str()?.to_owned();
         let context = context(self, request);
-        Some(smol::spawn(async move {
-            let decision = service.shell_effect(&command, false, plan, &context).await;
-            (service, decision)
-        }))
+        let evaluation_service = service.clone();
+        let decision = self.run_permission_decision(async move {
+            evaluation_service
+                .shell_effect(&command, false, plan, &context)
+                .await
+        });
+        Some(smol::spawn(
+            async move { (service, decision.await.flatten()) },
+        ))
     }
 }
 
@@ -1061,10 +1094,9 @@ mod tests {
         assert!(next_root.decisions().is_some());
     }
 
-    #[test_case(|manager| manager.set_session_mode(Some(PermissionMode::Ask)); "unchanged_mode_new_revision")]
-    #[test_case(|manager| manager.set_session_mode(Some(PermissionMode::Yolo)); "yolo")]
     #[test_case(|manager| manager.set_decisions(None); "decision_service")]
     #[test_case(|manager| manager.set_project(Path::new(SHELL_WORKDIR)); "project")]
+    #[test_case(|manager| manager.set_project_with_config(Path::new(SHELL_WORKDIR), PermissionsConfig::default()); "project_config")]
     fn passive_decision_stops_immediately_on_revision_change(revoke: fn(&PermissionManager)) {
         smol::block_on(async {
             let manager = default_mgr();
@@ -1075,8 +1107,12 @@ mod tests {
         });
     }
 
-    #[test]
-    fn passive_decision_outlives_policy_changes() {
+    #[test_case(|manager| manager.notify_policy_changed(CONTROLLED_REQUEST); "policy_change")]
+    #[test_case(|manager| manager.set_session_mode(Some(PermissionMode::Ask)); "ask")]
+    #[test_case(|manager| manager.set_session_mode(Some(PermissionMode::Auto)); "auto")]
+    #[test_case(|manager| manager.set_session_mode(Some(PermissionMode::Yolo)); "yolo")]
+    #[test_case(|manager| { manager.toggle_yolo(); manager.toggle_yolo(); }; "yolo_round_trip")]
+    fn passive_decision_outlives_policy_changes(change: fn(&PermissionManager)) {
         smol::block_on(async {
             let manager = default_mgr();
             let (finish, finished) = flume::bounded(1);
@@ -1084,24 +1120,75 @@ mod tests {
                 manager.run_passive_decision(async { finished.recv_async().await.is_ok() }),
             );
             assert!(future::poll_once(&mut running).await.is_none());
-            manager.notify_policy_changed(CONTROLLED_REQUEST);
+            change(&manager);
             assert!(future::poll_once(&mut running).await.is_none());
             finish.send(()).unwrap();
             assert_eq!(future::poll_once(&mut running).await, Some(Some(true)));
         });
     }
 
-    #[test_case(false, Some(true); "ordinary_completion")]
-    #[test_case(true, None; "already_yolo_does_not_poll_work")]
-    fn passive_decision_never_starts_in_yolo(yolo: bool, expected: Option<bool>) {
+    #[test_case(PermissionMode::Ask; "ask")]
+    #[test_case(PermissionMode::Auto; "auto")]
+    #[test_case(PermissionMode::Yolo; "yolo")]
+    fn passive_decision_starts_in_all_modes(mode: PermissionMode) {
         smol::block_on(async {
             let manager = default_mgr();
-            if yolo {
-                manager.toggle_yolo();
-            }
+            manager.set_session_mode(Some(mode));
             let called = AtomicUsize::new(0);
             let outcome = manager
                 .run_passive_decision(async {
+                    called.fetch_add(1, Ordering::Relaxed);
+                    true
+                })
+                .await;
+            assert_eq!(outcome, Some(true));
+            assert_eq!(called.load(Ordering::Relaxed), 1);
+        });
+    }
+
+    #[test_case(|manager| manager.set_decisions(None); "service")]
+    #[test_case(|manager| manager.set_project(Path::new(SHELL_WORKDIR)); "project")]
+    fn passive_decision_rechecks_revision_when_work_finishes(change: fn(&PermissionManager)) {
+        smol::block_on(async {
+            let manager = default_mgr();
+            assert_eq!(
+                manager
+                    .run_passive_decision(async {
+                        change(&manager);
+                        true
+                    })
+                    .await,
+                None
+            );
+        });
+    }
+
+    #[test_case(|manager| manager.notify_policy_changed(CONTROLLED_REQUEST); "policy")]
+    #[test_case(|manager| manager.set_session_mode(Some(PermissionMode::Ask)); "ask")]
+    #[test_case(|manager| manager.set_session_mode(Some(PermissionMode::Auto)); "auto")]
+    #[test_case(|manager| manager.set_session_mode(Some(PermissionMode::Yolo)); "yolo")]
+    #[test_case(|manager| { manager.toggle_yolo(); manager.toggle_yolo(); }; "yolo_round_trip")]
+    #[test_case(|manager| manager.set_decisions(None); "service")]
+    #[test_case(|manager| manager.set_project(Path::new(SHELL_WORKDIR)); "project")]
+    fn permission_decision_stops_on_policy_changes(change: fn(&PermissionManager)) {
+        smol::block_on(async {
+            let manager = default_mgr();
+            let mut pending = Box::pin(manager.run_permission_decision(future::pending::<()>()));
+            assert!(future::poll_once(&mut pending).await.is_none());
+            change(&manager);
+            assert_eq!(future::poll_once(&mut pending).await, Some(None));
+        });
+    }
+
+    #[test_case(false, Some(true); "ask")]
+    #[test_case(true, None; "yolo")]
+    fn permission_decision_never_starts_in_yolo(yolo: bool, expected: Option<bool>) {
+        smol::block_on(async {
+            let manager = default_mgr();
+            manager.set_session_mode(Some(PermissionMode::from(yolo)));
+            let called = AtomicUsize::new(0);
+            let outcome = manager
+                .run_permission_decision(async {
                     called.fetch_add(1, Ordering::Relaxed);
                     true
                 })
@@ -1111,19 +1198,91 @@ mod tests {
         });
     }
 
-    #[test]
-    fn passive_decision_rechecks_revision_when_work_finishes() {
+    #[test_case(|manager| manager.set_session_mode(Some(PermissionMode::Yolo)); "yolo")]
+    #[test_case(|manager| { manager.toggle_yolo(); manager.toggle_yolo(); }; "yolo_round_trip")]
+    #[test_case(|manager| manager.set_decisions(None); "service")]
+    fn permission_decision_rechecks_revision_when_work_finishes(change: fn(&PermissionManager)) {
         smol::block_on(async {
             let manager = default_mgr();
             assert_eq!(
                 manager
-                    .run_passive_decision(async {
-                        manager.set_session_mode(Some(PermissionMode::Ask));
+                    .run_permission_decision(async {
+                        change(&manager);
                         true
                     })
                     .await,
                 None
             );
+        });
+    }
+
+    fn advisory_service(behavior: Behavior, delayed: bool) -> Service {
+        let mut config = DecisionsConfig {
+            base_url: Some(BASE_URL.parse().unwrap()),
+            timeout_ms: TIMEOUT_MS,
+            ..Default::default()
+        };
+        config.features.permission_advice = FeatureMode::Advise;
+        config.features.shell_effect = FeatureMode::Advise;
+        configured_service(behavior, config, delayed)
+    }
+
+    #[test_case(None, false; "permission_yolo")]
+    #[test_case(Some(false), false; "shell_yolo")]
+    #[test_case(Some(true), false; "read_only_shell_yolo")]
+    #[test_case(None, true; "permission_yolo_round_trip")]
+    #[test_case(Some(false), true; "shell_yolo_round_trip")]
+    #[test_case(Some(true), true; "read_only_shell_yolo_round_trip")]
+    fn advisory_guard_rejects_mode_changes_before_first_poll(
+        shell: Option<bool>,
+        round_trip: bool,
+    ) {
+        smol::block_on(async {
+            let service = advisory_service(Behavior::Probability(1.0), false);
+            let manager = default_mgr();
+            manager.set_decisions(Some(service.decisions.clone()));
+            let request = shell_request(&[FIRST_COMMAND], workcell_shell_subject());
+            let input = state(&request);
+            let context = manager.decision_context(Value::Null);
+            let evaluation_service = service.decisions.clone();
+            let guarded = manager.run_permission_decision(async move {
+                if let Some(read_only) = shell {
+                    evaluation_service
+                        .shell_effect(FIRST_COMMAND, read_only, true, &context)
+                        .await
+                } else {
+                    evaluation_service
+                        .permission(PermissionPurpose::Advice, &input, &context)
+                        .await
+                }
+            });
+            manager.toggle_yolo();
+            if round_trip {
+                manager.toggle_yolo();
+            }
+            assert!(smol::spawn(guarded).await.is_none());
+            assert_eq!(service.calls.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    #[test_case(false; "permission")]
+    #[test_case(true; "shell")]
+    fn spawned_advice_is_cancelled_when_entering_yolo(shell: bool) {
+        smol::block_on(async {
+            let service = advisory_service(Behavior::Pending, true);
+            let manager = default_mgr();
+            manager.set_decisions(Some(service.decisions.clone()));
+            let request = shell_request(&[FIRST_COMMAND], workcell_shell_subject());
+            let task = if shell {
+                manager.shell_effect_advice(&request, true)
+            } else {
+                manager.permission_advice(&request)
+            }
+            .unwrap();
+            service.started.recv_async().await.unwrap();
+            manager.toggle_yolo();
+            assert!(task.await.1.is_none());
+            assert_eq!(service.calls.load(Ordering::Relaxed), 1);
         });
     }
 

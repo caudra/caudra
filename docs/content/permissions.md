@@ -803,9 +803,11 @@ Each warning is a `⚠` line above the answers, with the predicted likelihood, s
 
 `shell_effect = "advise"` can warn about possible project writes during Plan review when `thresholds.shell_writes` is explicitly configured. This is caution only. Deterministic checks still decide read-only access. Shadow labels use the deterministic classifier, not observed filesystem changes.
 
-`content_screening = "advise"` samples web and MCP results. When both injection and agent-addressed signals cross their thresholds, Caudra adds caution and tightens upload and credential screening for the session. It keeps the content available. Sampling and predictions can miss an attack, so this is not an injection barrier.
+`content_screening = "advise"` samples web and MCP results. When both injection and agent-addressed signals cross their thresholds, Caudra adds caution and marks the session for tighter upload and credential screening in Auto. This also works in YOLO, with tighter permission screening taking effect if you later switch to Auto. It keeps the content available. Sampling and predictions can miss an attack, so this is not an injection barrier.
 
 Shell duration advice applies only to eligible local native shell calls. Measured history outranks model estimates. Enforce can fill an omitted timeout and choose delivery at admission, but never changes an explicit timeout or promotes a running synchronous call based on elapsed time. A filled timeout appears in the permission prompt, and approving the call approves that timeout. Endless predictions give caution only. See [shell duration configuration](/docs/configuration/#shell-duration) for the limits and separate history storage.
+
+The optional [question-tool nudge](/docs/configuration/#question-tool-nudge) can remind the main-session assistant to use `question` when its attempted final reply asks you for a choice, clarification, or approval. It is separate from permission checks and defaults to `off`.
 
 Set `log = true` to retain bounded, redacted decision states and answers in decision-log tables in `caudra.db`. A state over the bound is never sent. Its row records a `rejected` error and the state's size in place of the state. Redaction is best effort both before transmission and before storage. It is not a guarantee that sensitive text has been removed. Human permission answers can supply training labels, but approval is not proof that a predicted effect occurred. Effect fields are a partial action record. A value of `none` does not prove that no advice or routing was applied. Tool-search records do not have actual-use labels, and shell-effect records do not have observed-filesystem labels.
 
@@ -821,4 +823,4 @@ An explicit `/yolo` choice is stored with the root conversation. A user-created 
 
 YOLO approves each call once and stores no rule, so turning it off brings back the prompts your rules do not cover. In plan mode it also skips the prompts for commands plan mode cannot prove read-only, for `send_message` and `publish_message`, and for `execution_environment`. Plan mode still refuses what it always refuses, such as file writes outside the plan.
 
-Decision-engine screening never interrupts YOLO, including in plan mode. Engine advice is not shown in YOLO. Deterministic denies and hard capability restrictions still apply.
+YOLO bypasses decision-engine permission advice, Auto screening, and permission-related shell-effect checks, including in plan mode. Shell duration, content screening, tool search, skill selection, goal prescreening, subagent routing, and the question-tool nudge still follow their feature settings. An unreachable engine can still show `[decisions offline]`. Deterministic denies and hard capability restrictions still apply.

@@ -622,7 +622,10 @@ fn write_decisions_section(out: &mut String) {
          `off` disables the feature. `shadow` collects predictions without applying them. \
          `advise` adds caution or suggestions. `enforce` applies only the feature-specific behavior \
          listed below, never permission grants or relaxed executor restrictions. \
-         Unsupported modes are configuration errors. Passive features are suppressed in YOLO.\n\n\
+         Unsupported modes are configuration errors. YOLO bypasses permission advice, Auto screening, \
+         and permission-related shell-effect checks. Shell duration, content screening, tool search, \
+         skill selection, goal prescreening, subagent routing, and the question-tool nudge still follow \
+         their feature settings in YOLO. Deterministic denies and hard restrictions still apply.\n\n\
          | Feature | Default | Supported modes | Behavior beyond shadow |\n\
          |---------|---------|-----------------|------------------------|\n",
         timeout_ms = DecisionsConfig::default().timeout_ms,
@@ -685,6 +688,22 @@ fn write_decisions_section(out: &mut String) {
          `agent.shell_async_threshold_secs`. Explicit sync/async settings still win. Elapsed \
          runtime never promotes a synchronous call to asynchronous delivery. An admission \
          receipt is not completion or success.\n\n\
+         #### Question-tool nudge\n\n\
+         `question_tool_nudge` defaults to `off` and supports `off`, `shadow`, and `advise`. \
+         It checks an attempted final prose reply for a live request for the user to clarify, choose, \
+         supply information, or approve a next step. It needs a configured engine and a usable \
+         `question` tool with an answer channel in the main session. Subagents and frontends without \
+         that channel are excluded. YOLO does not disable it.\n\n\
+         In `shadow`, the prediction leaves the reply unchanged. In `advise`, a score at or above \
+         `decisions.thresholds.question_tool_nudge` (default `0.85`) adds a normal system reminder \
+         asking the assistant to use `question` for the outstanding answer. The original reply stays \
+         in history. The reminder follows the `show_reminders` display preference and can occur at \
+         most once per genuine user-input episode. Synthetic reminders, retries, and resume do not \
+         renew that allowance. It never fabricates a tool call, an answer, or approval.\n\n\
+         The request contains redacted excerpts of the current visible reply and relevant user \
+         request within the 1,500-byte serialized state limit. Long replies retain an opening and \
+         a larger tail, so questions in the omitted middle can be missed. Errors, timeouts, invalid \
+         answers, and scores below the threshold leave the reply unchanged.\n\n\
          #### Question overrides\n\n\
          Only the permission question set currently supports a user-global file override: \
          `~/.config/caudra/decisions/permission.json`. It must be a regular JSON file no larger \

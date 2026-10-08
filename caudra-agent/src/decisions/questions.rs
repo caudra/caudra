@@ -26,6 +26,12 @@ pub(crate) static GOAL: LazyLock<Option<QuestionSet>> =
     LazyLock::new(|| embedded("goal.v1", include_str!("questions/goal.json")));
 pub(crate) static SUBAGENT: LazyLock<Option<QuestionSet>> =
     LazyLock::new(|| embedded("subagent.v1", include_str!("questions/subagent.json")));
+pub(crate) static QUESTION_TOOL_NUDGE: LazyLock<Option<QuestionSet>> = LazyLock::new(|| {
+    embedded(
+        "question_tool_nudge.v1",
+        include_str!("questions/question_tool_nudge.json"),
+    )
+});
 
 fn embedded(id: &str, json: &str) -> Option<QuestionSet> {
     QuestionSet::new(id, serde_json::from_str(json).ok()?).ok()
@@ -37,12 +43,14 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        CONTENT, GOAL, LazyLock, PERMISSION, QuestionSet, SHELL_DURATION, SHELL_EFFECT, SUBAGENT,
+        CONTENT, GOAL, LazyLock, PERMISSION, QUESTION_TOOL_NUDGE, QuestionSet, SHELL_DURATION,
+        SHELL_EFFECT, SUBAGENT,
     };
     use crate::agent::GOAL_MET_QUESTION;
     use crate::agent::subagent::DIFFICULTY_QUESTION;
     use crate::decisions::content::{ADDRESSED_TO_AGENT, INJECTION};
     use crate::decisions::permission::FLAGS;
+    use crate::decisions::question_tool_nudge::QUESTION;
     use crate::decisions::shell_duration::{DURATION_QUESTION, ENDLESS_QUESTION};
     use crate::decisions::shell_effect::{CHANGES_SYSTEM, WRITES};
 
@@ -54,6 +62,7 @@ mod tests {
     #[test_case(&CONTENT, &[(INJECTION, QuestionType::Noul), (ADDRESSED_TO_AGENT, QuestionType::Noul)]; "content")]
     #[test_case(&GOAL, &[(GOAL_MET_QUESTION, QuestionType::Noul)]; "goal")]
     #[test_case(&SUBAGENT, &[(DIFFICULTY_QUESTION, QuestionType::Score)]; "subagent")]
+    #[test_case(&QUESTION_TOOL_NUDGE, &[(QUESTION, QuestionType::Noul)]; "question_tool_nudge")]
     fn every_embedded_question_set_is_valid(
         set: &LazyLock<Option<QuestionSet>>,
         required: &[(&str, QuestionType)],

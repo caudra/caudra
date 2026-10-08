@@ -195,7 +195,7 @@ Precedence runs from most specific configuration to least. A `subagent_model` pi
 
 ### Typed decisions
 
-`decide()` calls the System One endpoint under the `base_url` in your global [`decisions` configuration](/docs/configuration/#decisions) and needs `experimental.decision_engine` as well as `experimental.workflows`. With the engine switch on, it is available even when passive decision features are off, including in YOLO. A non-loopback base URL requires `allow_remote = true`. Calls go directly to that endpoint without ambient proxies or HTTP redirects.
+`decide()` calls the System One endpoint under the `base_url` in your global [`decisions` configuration](/docs/configuration/#decisions) and needs `experimental.decision_engine` as well as `experimental.workflows`. With the engine switch on, it is available even when passive decision features are configured off. YOLO bypasses permission-related decision checks, while explicit `decide()` calls and unrelated passive features still follow their configuration. A non-loopback base URL requires `allow_remote = true`. Calls go directly to that endpoint without ambient proxies or HTTP redirects.
 
 ```rhai
 let result = decide(

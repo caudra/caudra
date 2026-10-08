@@ -15,7 +15,7 @@ use std::{collections::VecDeque, sync::Arc, thread, time::Instant};
 use super::{DecisionFeature, DecisionReceipt, Decisions, push_fitting, questions};
 use crate::{
     ToolDoneEvent, ToolOutput,
-    permissions::{canonical_json_sha256, command_pattern},
+    permissions::{PassiveDecisionRevision, canonical_json_sha256, command_pattern},
     tools::{ToolContext, ToolExecResult},
 };
 
@@ -117,7 +117,7 @@ impl ShellDurationCache {
 #[derive(Clone)]
 pub(crate) struct ShellDurationPlan {
     decisions: Decisions,
-    revision: u64,
+    revision: PassiveDecisionRevision,
     key: ShellDurationKey,
     estimate: Option<Estimate>,
     endless: bool,
@@ -134,7 +134,6 @@ impl Decisions {
     ) -> Option<ShellDurationPlan> {
         let decision_revision = ctx.permissions.passive_decision_revision()?;
         if *self.mode(&DecisionFeature::ShellDuration) == FeatureMode::Off
-            || ctx.permissions.is_yolo()
             || ctx.cancel.is_cancelled()
             || ctx.host_cwd.is_some()
             || ctx.workspace_session.is_some()
@@ -581,7 +580,13 @@ mod tests {
     fn plan(dir: &StateDir, mode: FeatureMode, p90_ms: u64) -> ShellDurationPlan {
         ShellDurationPlan {
             decisions: service(dir, mode),
-            revision: 0,
+            revision: PermissionManager::new_nonpersistent(
+                PermissionsConfig::default(),
+                WORKSPACE.into(),
+                Arc::default(),
+            )
+            .passive_decision_revision()
+            .unwrap(),
             key: history_key(WORKSPACE, ".", COMMAND),
             estimate: Some(Estimate {
                 p50_ms: p90_ms,
@@ -735,9 +740,10 @@ mod tests {
     }
 
     #[test_case(FeatureMode::Off, false, false)]
-    #[test_case(FeatureMode::Enforce, true, false)]
+    #[test_case(FeatureMode::Off, true, false)]
     #[test_case(FeatureMode::Enforce, false, true)]
-    fn disabled_yolo_and_remote_do_no_io(mode: FeatureMode, yolo: bool, remote: bool) {
+    #[test_case(FeatureMode::Enforce, true, true)]
+    fn disabled_and_remote_do_no_io(mode: FeatureMode, yolo: bool, remote: bool) {
         smol::block_on(async {
             let temp = tempfile::tempdir().unwrap();
             let path = temp.path().join("absent-state");
@@ -762,14 +768,18 @@ mod tests {
         });
     }
 
-    #[test]
-    fn endpoint_free_history_precedes_prior_and_separates_workdirs() {
+    #[test_case(false; "ask")]
+    #[test_case(true; "yolo")]
+    fn endpoint_free_history_precedes_prior_and_separates_workdirs(yolo: bool) {
         smol::block_on(async {
             let temp = tempfile::tempdir().unwrap();
             let dir = StateDir::from_path(temp.path().join("state"));
             let decisions = service(&dir, FeatureMode::Enforce);
             let permissions = Arc::new(PermissionManager::new_nonpersistent(
-                PermissionsConfig::default(),
+                PermissionsConfig {
+                    yolo,
+                    ..Default::default()
+                },
                 temp.path().to_owned(),
                 Arc::default(),
             ));

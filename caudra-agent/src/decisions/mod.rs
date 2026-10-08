@@ -2,6 +2,7 @@ mod content;
 #[cfg(test)]
 mod eval;
 mod permission;
+pub(crate) mod question_tool_nudge;
 pub(crate) mod questions;
 pub(crate) mod shell_duration;
 mod shell_effect;
@@ -58,11 +59,12 @@ pub enum DecisionFeature {
     SkillSuggestions,
     GoalPrescreen,
     SubagentRouting,
+    QuestionToolNudge,
 }
 
 impl DecisionFeature {
     /// Configured features in `[decisions.features]` order, then workflow.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::PermissionAdvice,
         Self::AutoScreening,
         Self::ShellEffect,
@@ -72,6 +74,7 @@ impl DecisionFeature {
         Self::SkillSuggestions,
         Self::GoalPrescreen,
         Self::SubagentRouting,
+        Self::QuestionToolNudge,
         Self::Workflow,
     ];
 
@@ -89,6 +92,7 @@ impl DecisionFeature {
             Self::SkillSuggestions => "skill_suggestions",
             Self::GoalPrescreen => "goal",
             Self::SubagentRouting => "subagent_routing",
+            Self::QuestionToolNudge => "question_tool_nudge",
         }
     }
 
@@ -106,6 +110,7 @@ impl DecisionFeature {
             Self::SkillSuggestions => Some("skill_suggestions"),
             Self::GoalPrescreen => Some("goal_prescreen"),
             Self::SubagentRouting => Some("subagent_routing"),
+            Self::QuestionToolNudge => Some("question_tool_nudge"),
         }
     }
 
@@ -129,6 +134,7 @@ impl DecisionFeature {
             Self::SkillSuggestions => &features.skill_suggestions,
             Self::GoalPrescreen => &features.goal_prescreen,
             Self::SubagentRouting => &features.subagent_routing,
+            Self::QuestionToolNudge => &features.question_tool_nudge,
         }
     }
 }
@@ -162,6 +168,11 @@ pub fn stats_thresholds(config: &DecisionThresholds, feature: &str) -> StatsThre
             config.shell_endless,
         );
         thresholds.score_tolerance = shell_duration::LEVEL_TOLERANCE;
+    } else if feature == DecisionFeature::QuestionToolNudge.name() {
+        overrides.insert(
+            question_tool_nudge::QUESTION.into(),
+            config.question_tool_nudge,
+        );
     } else if feature == DecisionFeature::ShellEffect.name()
         && let Some(threshold) = config.shell_writes
     {
@@ -877,6 +888,43 @@ mod tests {
         for feature in DecisionFeature::ALL {
             assert_eq!(feature.setting().is_some(), feature.config_key().is_some());
         }
+    }
+
+    #[test_case(false, FeatureMode::Advise, false; "no_api")]
+    #[test_case(true, FeatureMode::Off, false; "off")]
+    #[test_case(true, FeatureMode::Shadow, true; "shadow")]
+    #[test_case(true, FeatureMode::Advise, true; "advise")]
+    fn question_tool_nudge_requires_api_and_feature(api: bool, mode: FeatureMode, expected: bool) {
+        smol::block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let mut config = config(false);
+            if !api {
+                config.base_url = None;
+            }
+            config.features.question_tool_nudge = mode;
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let service = Decisions::with_engine(
+                config,
+                &StateDir::from_path(root.path().into()),
+                FakeEngine {
+                    requests: requests.clone(),
+                    behavior: Behavior::Answer(1.0),
+                },
+            )
+            .unwrap();
+            let state =
+                super::question_tool_nudge::state("Fix the controls", "Which zoom level?").unwrap();
+            let outcome = service
+                .evaluate(
+                    DecisionFeature::QuestionToolNudge,
+                    state.value(),
+                    super::questions::QUESTION_TOOL_NUDGE.as_ref().unwrap(),
+                    &DecisionContext::default(),
+                )
+                .await;
+            assert_eq!(outcome.is_some(), expected);
+            assert_eq!(requests.lock().unwrap().len(), usize::from(expected));
+        });
     }
 
     #[test_case("permission", 0.8; "permission")]

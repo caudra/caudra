@@ -530,7 +530,7 @@ Redaction is best effort. Decision context can include commands, task text, tool
 
 #### `decisions.features`
 
-`off` disables the feature. `shadow` collects predictions without applying them. `advise` adds caution or suggestions. `enforce` applies only the feature-specific behavior listed below, never permission grants or relaxed executor restrictions. Unsupported modes are configuration errors. Passive features are suppressed in YOLO.
+`off` disables the feature. `shadow` collects predictions without applying them. `advise` adds caution or suggestions. `enforce` applies only the feature-specific behavior listed below, never permission grants or relaxed executor restrictions. Unsupported modes are configuration errors. YOLO bypasses permission advice, Auto screening, and permission-related shell-effect checks. Shell duration, content screening, tool search, skill selection, goal prescreening, subagent routing, and the question-tool nudge still follow their feature settings in YOLO. Deterministic denies and hard restrictions still apply.
 
 | Feature | Default | Supported modes | Behavior beyond shadow |
 |---------|---------|-----------------|------------------------|
@@ -543,6 +543,7 @@ Redaction is best effort. Decision context can include commands, task text, tool
 | `skill_suggestions` | `off` | `off`, `shadow`, `advise` | Suggest a shortlisted skill. The agent still chooses whether to load it. |
 | `goal_prescreen` | `off` | `off`, `shadow`, `enforce` | Skip an unlikely-to-pass goal evaluation within the continuation budget and continue work. Only the normal evaluator can certify completion. |
 | `subagent_routing` | `off` | `off`, `shadow`, `enforce` | Choose a model job for a new unpinned subagent from its task label, mode, profile, and a redacted prompt excerpt. Explicit jobs, profile pins, and continuations keep their routing. |
+| `question_tool_nudge` | `off` | `off`, `shadow`, `advise` | At a main-session handoff with a usable question tool, advise adds one visible reminder per user-input episode to ask a live user question through that tool. Shadow only evaluates. Uses a redacted, bounded request and reply excerpt; uncertainty and failures leave the reply unchanged. |
 
 #### `decisions.thresholds`
 
@@ -559,6 +560,7 @@ Flag thresholds trigger at or above the configured value. Goal prescreening uses
 | `routing_confidence` | float | `0.9` | Confidence required for tool search and skill suggestions. Tool-search choice probability must also meet it. Subagent routing picks the Fast model when this much difficulty probability is at or below routine work, and the Best model when this much is on open-ended work. |
 | `goal_skip_below` | float | `0.05` | Skip an evaluator at or below this completion probability, within the continuation budget. |
 | `shell_writes` | float | unset | Optional project-write warning threshold. Omission leaves the warning disabled. No built-in enforcement threshold. |
+| `question_tool_nudge` | float | `0.85` | Minimum noul score for a question-tool reminder. Provisional, not a calibrated probability; advise only, and errors or uncertainty never reopen the turn. |
 
 #### Shell duration
 
@@ -571,6 +573,14 @@ Measured runs are labeled by fixed boundaries. A run within 1 second exited at o
 In `advise`, estimates and warnings leave execution unchanged. In `enforce`, an omitted `timeoutSec` may receive a default based on 1.5 times estimated p90, bounded by the tool schema's default and maximum. An explicit timeout is never changed. An endless prediction gives caution only and does not remove the execution deadline.
 
 With `agent.shell_execution = "auto"`, Enforce estimates can select synchronous or asynchronous delivery at admission, bounded by the effective timeout and `agent.shell_async_threshold_secs`. Explicit sync/async settings still win. Elapsed runtime never promotes a synchronous call to asynchronous delivery. An admission receipt is not completion or success.
+
+#### Question-tool nudge
+
+`question_tool_nudge` defaults to `off` and supports `off`, `shadow`, and `advise`. It checks an attempted final prose reply for a live request for the user to clarify, choose, supply information, or approve a next step. It needs a configured engine and a usable `question` tool with an answer channel in the main session. Subagents and frontends without that channel are excluded. YOLO does not disable it.
+
+In `shadow`, the prediction leaves the reply unchanged. In `advise`, a score at or above `decisions.thresholds.question_tool_nudge` (default `0.85`) adds a normal system reminder asking the assistant to use `question` for the outstanding answer. The original reply stays in history. The reminder follows the `show_reminders` display preference and can occur at most once per genuine user-input episode. Synthetic reminders, retries, and resume do not renew that allowance. It never fabricates a tool call, an answer, or approval.
+
+The request contains redacted excerpts of the current visible reply and relevant user request within the 1,500-byte serialized state limit. Long replies retain an opening and a larger tail, so questions in the omitted middle can be missed. Errors, timeouts, invalid answers, and scores below the threshold leave the reply unchanged.
 
 #### Question overrides
 

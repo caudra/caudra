@@ -655,6 +655,7 @@ mod tests {
     };
     use crate::tools::test_support::{stub_ctx, stub_ctx_with};
     use crate::tools::{LockKey, STALE_READ_MSG};
+    use async_lock::Barrier;
     use caudra_providers::DocumentSource;
     use caudra_storage::sessions::PermissionMode;
     use futures_lite::future;
@@ -1998,17 +1999,35 @@ mod tests {
     const KEY_FIELD: &str = "key";
     const REMOTE_FILE: &str = "/workspace/contended.rs";
     const OTHER_REMOTE_FILE: &str = "/workspace/other.rs";
+    const EXPECT_PREPARATION_LOCK: &str =
+        "a remote write's key stays locked from preparation through execution";
 
     /// Stands in for a remote write, whose preparation fixes the version of
     /// the file it will replace. The gauge counts calls between the start of
     /// preparation and the end of execution, the span its key has to cover.
     struct PreparingTool {
         gauge: Arc<Gauge>,
+        gate: Arc<Barrier>,
     }
 
     struct PreparingCall {
         gauge: Arc<Gauge>,
+        gate: Arc<Barrier>,
         key: Option<String>,
+    }
+
+    impl PreparingCall {
+        async fn rendezvous(&self, ctx: &ToolContext) {
+            self.gate.wait().await;
+            if let Some(key) = &self.key {
+                assert!(
+                    future::poll_once(ctx.path_locks.acquire(&[LockKey::Remote(key.clone())], &[]))
+                        .await
+                        .is_none(),
+                    "{EXPECT_PREPARATION_LOCK}"
+                );
+            }
+        }
     }
 
     impl ToolInvocation for PreparingCall {
@@ -2020,18 +2039,18 @@ mod tests {
         }
         fn preflight<'a>(
             &'a self,
-            _ctx: &'a ToolContext,
+            ctx: &'a ToolContext,
         ) -> BoxFuture<'a, Result<Option<PermissionIntent>, ToolError>> {
             Box::pin(async move {
                 let depth = self.gauge.inside.fetch_add(1, Ordering::SeqCst) + 1;
                 self.gauge.peak.fetch_max(depth, Ordering::SeqCst);
-                future::yield_now().await;
+                self.rendezvous(ctx).await;
                 Ok(None)
             })
         }
-        fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
+        fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
             Box::pin(async move {
-                future::yield_now().await;
+                self.rendezvous(ctx).await;
                 self.gauge.inside.fetch_sub(1, Ordering::SeqCst);
                 ToolExecResult::from(Ok::<_, String>(ToolOutput::Plain(BODY.into())))
             })
@@ -2051,6 +2070,7 @@ mod tests {
         fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
             Ok(Box::new(PreparingCall {
                 gauge: Arc::clone(&self.gauge),
+                gate: Arc::clone(&self.gate),
                 key: input[KEY_FIELD].as_str().map(str::to_owned),
             }))
         }
@@ -2074,6 +2094,7 @@ mod tests {
             .register(
                 Arc::new(PreparingTool {
                     gauge: Arc::clone(&gauge),
+                    gate: Arc::new(Barrier::new(expected_peak)),
                 }),
                 ToolSource::Native {
                     owner: super::super::OWNER.into(),

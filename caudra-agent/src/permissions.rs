@@ -44,6 +44,7 @@ pub use structured::{
 
 pub mod editor;
 mod manager;
+pub(crate) use manager::PassiveDecisionRevision;
 pub use manager::{PermissionManager, PermissionProjectFilter, RevokedRuleScope};
 mod policy;
 pub use policy::{

@@ -16,6 +16,7 @@ const DEFAULT_LOG_RETENTION_DAYS: u32 = 90;
 const DEFAULT_FLAG_THRESHOLD: f64 = 0.85;
 const DEFAULT_CONFIDENCE_THRESHOLD: f64 = 0.9;
 const DEFAULT_GOAL_SKIP_BELOW: f64 = 0.05;
+const DEFAULT_QUESTION_TOOL_NUDGE: f64 = 0.85;
 const INVALID_BASE_URL_MESSAGE: &str = "must be an absolute HTTP(S) URL without credentials, query, fragment, whitespace or control characters";
 const FULL_ENDPOINT_MESSAGE: &str =
     "Caudra appends /v1/systemone; set base_url to the part before it";
@@ -145,6 +146,8 @@ features! {
         "Skip an unlikely-to-pass goal evaluation within the continuation budget and continue work. Only the normal evaluator can certify completion.";
     subagent_routing: [Enforce],
         "Choose a model job for a new unpinned subagent from its task label, mode, profile, and a redacted prompt excerpt. Explicit jobs, profile pins, and continuations keep their routing.";
+    question_tool_nudge: [Advise],
+        "At a main-session handoff with a usable question tool, advise adds one visible reminder per user-input episode to ask a live user question through that tool. Shadow only evaluates. Uses a redacted, bounded request and reply excerpt; uncertainty and failures leave the reply unchanged.";
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -158,6 +161,7 @@ pub struct DecisionThresholds {
     pub shell_duration: f64,
     pub routing_confidence: f64,
     pub goal_skip_below: f64,
+    pub question_tool_nudge: f64,
     pub shell_writes: Option<f64>,
 }
 
@@ -172,6 +176,7 @@ impl Default for DecisionThresholds {
             shell_duration: DEFAULT_CONFIDENCE_THRESHOLD,
             routing_confidence: DEFAULT_CONFIDENCE_THRESHOLD,
             goal_skip_below: DEFAULT_GOAL_SKIP_BELOW,
+            question_tool_nudge: DEFAULT_QUESTION_TOOL_NUDGE,
             shell_writes: None,
         }
     }
@@ -260,6 +265,15 @@ impl DecisionThresholds {
             env: None,
             description: "Optional project-write warning threshold. Omission leaves the warning disabled. No built-in enforcement threshold.",
         },
+        ConfigField {
+            name: "question_tool_nudge",
+            ty: "float",
+            default: ConfigValue::F64(DEFAULT_QUESTION_TOOL_NUDGE),
+            min: None,
+            max: None,
+            env: None,
+            description: "Minimum noul score for a question-tool reminder. Provisional, not a calibrated probability; advise only, and errors or uncertainty never reopen the turn.",
+        },
     ];
 
     fn validate(&self) -> Result<(), DecisionsConfigError> {
@@ -278,6 +292,10 @@ impl DecisionThresholds {
                 Some(self.routing_confidence),
             ),
             ("thresholds.goal_skip_below", Some(self.goal_skip_below)),
+            (
+                "thresholds.question_tool_nudge",
+                Some(self.question_tool_nudge),
+            ),
             ("thresholds.shell_writes", self.shell_writes),
         ] {
             if value.is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value)) {
@@ -713,6 +731,11 @@ mod tests {
         assert!(!config.allow_http);
         assert!(!config.log);
         assert!(config.thresholds.shell_writes.is_none());
+        assert_eq!(config.features.question_tool_nudge, FeatureMode::Off);
+        assert_eq!(
+            config.thresholds.question_tool_nudge,
+            super::DEFAULT_QUESTION_TOOL_NUDGE
+        );
         assert!(
             RawConfig::default()
                 .into_config(false)
@@ -732,6 +755,7 @@ mod tests {
     #[test_case("skill_suggestions", true, false)]
     #[test_case("goal_prescreen", false, true)]
     #[test_case("subagent_routing", false, true)]
+    #[test_case("question_tool_nudge", true, false)]
     fn feature_modes_are_validated(feature: &str, advise: bool, enforce: bool) {
         for (mode, allowed) in [
             ("off", true),
@@ -1060,6 +1084,15 @@ mod tests {
     #[test_case("log = true", "log")]
     #[test_case("log_retention_days = 365", "log_retention_days")]
     #[test_case("[decisions.thresholds]\nauto_flag = 1.0", "thresholds")]
+    #[test_case("[decisions.thresholds]\nquestion_tool_nudge = 0.5", "thresholds")]
+    #[test_case(
+        "[decisions.features]\nquestion_tool_nudge = 'advise'",
+        "features.question_tool_nudge"
+    )]
+    #[test_case(
+        "[decisions.features]\nquestion_tool_nudge = 'shadow'",
+        "features.question_tool_nudge"
+    )]
     #[test_case(
         "[decisions.features]\nauto_screening = 'shadow'",
         "features.auto_screening"
@@ -1147,6 +1180,28 @@ mod tests {
         assert!(!config.auto_screening_restricted);
     }
 
+    #[test_case("off", FeatureMode::Off; "project_disables")]
+    #[test_case("", FeatureMode::Advise; "project_preserves")]
+    fn question_tool_nudge_project_can_only_disable(mode: &str, expected: FeatureMode) {
+        let mut global: RawConfig =
+            toml::from_str("[decisions.features]\nquestion_tool_nudge = 'advise'").unwrap();
+        let source = if mode.is_empty() {
+            String::new()
+        } else {
+            format!("[decisions.features]\nquestion_tool_nudge = '{mode}'")
+        };
+        global.merge(toml::from_str(&source).unwrap());
+        assert_eq!(
+            global
+                .into_config(false)
+                .unwrap()
+                .decisions
+                .features
+                .question_tool_nudge,
+            expected
+        );
+    }
+
     #[test_case("api_key_env = 'Bearer secret'", "api_key_env")]
     #[test_case("api_key_env = 'KEY=secret'", "api_key_env")]
     #[test_case("api_key_env = '9KEY'", "api_key_env")]
@@ -1158,6 +1213,22 @@ mod tests {
     #[test_case("[thresholds]\nauto_flag = inf", "thresholds.auto_flag")]
     #[test_case("[thresholds]\nshell_writes = 1.1", "thresholds.shell_writes")]
     #[test_case("[thresholds]\ngoal_skip_below = -0.1", "thresholds.goal_skip_below")]
+    #[test_case(
+        "[thresholds]\nquestion_tool_nudge = -0.1",
+        "thresholds.question_tool_nudge"
+    )]
+    #[test_case(
+        "[thresholds]\nquestion_tool_nudge = 1.1",
+        "thresholds.question_tool_nudge"
+    )]
+    #[test_case(
+        "[thresholds]\nquestion_tool_nudge = nan",
+        "thresholds.question_tool_nudge"
+    )]
+    #[test_case(
+        "[thresholds]\nquestion_tool_nudge = inf",
+        "thresholds.question_tool_nudge"
+    )]
     fn invalid_global_settings_are_rejected(source: &str, field: &str) {
         let raw: RawDecisionsConfig = toml::from_str(source).unwrap();
         assert!(

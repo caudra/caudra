@@ -974,6 +974,14 @@ version = 1
 # Type: string.
 # subagent_routing = "off"
 
+# At a main-session handoff with a usable question tool, advise adds one
+# visible reminder per user-input episode to ask a live user question through
+# that tool. Shadow only evaluates. Uses a redacted, bounded request and reply
+# excerpt; uncertainty and failures leave the reply unchanged. Modes: off,
+# shadow, advise.
+# Type: string.
+# question_tool_nudge = "off"
+
 [decisions.thresholds]
 # Probabilities between 0 and 1. Flags trigger at or above their threshold, and
 # goal prescreening skips at or below its own.
@@ -1018,6 +1026,12 @@ version = 1
 # disabled. No built-in enforcement threshold.
 # Type: float. Default: unset.
 # shell_writes = <float>
+
+# Minimum noul score for a question-tool reminder. Provisional, not a
+# calibrated probability; advise only, and errors or uncertainty never reopen
+# the turn.
+# Type: float.
+# question_tool_nudge = 0.85
 
 [automations]
 # Limits for automations, which need `automations = true` under [experimental].

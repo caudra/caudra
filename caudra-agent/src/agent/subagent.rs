@@ -39,6 +39,7 @@ use crate::decisions::questions as decision_questions;
 use crate::decisions::{
     DecisionFeature, DecisionReceipt, DecisionState, Decisions, redacted_excerpt,
 };
+use crate::permissions::PassiveDecisionRevision;
 use crate::prompt::PromptId;
 use crate::prompt::profile::SystemPromptProfile;
 use crate::tools::native::batch::{self, MAX_BATCH_SIZE};
@@ -1301,7 +1302,7 @@ async fn reserve_fresh(
 
 struct SubagentRoute {
     purpose: ModelPurpose,
-    revision: u64,
+    revision: PassiveDecisionRevision,
     decisions: Decisions,
     receipt: Option<DecisionReceipt>,
 }
@@ -1856,6 +1857,9 @@ mod tests {
     }
 
     #[test_case(false, false, false, true, FeatureMode::Enforce; "yolo")]
+    #[test_case(true, false, false, true, FeatureMode::Enforce; "yolo_continuation")]
+    #[test_case(false, true, false, true, FeatureMode::Enforce; "yolo_explicit_job")]
+    #[test_case(false, false, true, true, FeatureMode::Enforce; "yolo_profile_pin")]
     #[test_case(true, false, false, false, FeatureMode::Enforce; "continuation")]
     #[test_case(false, true, false, false, FeatureMode::Enforce; "explicit_job")]
     #[test_case(false, false, true, false, FeatureMode::Enforce; "profile_pin")]
@@ -1873,6 +1877,7 @@ mod tests {
             ctx.permissions
                 .set_session_mode(Some(PermissionMode::from(yolo)));
             let calls = Arc::new(AtomicUsize::new(0));
+            let routed = !continuation && !explicit && !pinned && mode == FeatureMode::Enforce;
             ctx.permissions.set_decisions(Some(routing_decisions(
                 &directory,
                 mode,
@@ -1893,16 +1898,16 @@ mod tests {
                 )
                 .await
                 .map(|route| route.purpose),
-                None
+                routed.then_some(ModelPurpose::Fast)
             );
-            assert_eq!(calls.load(Ordering::Relaxed), 0);
+            assert_eq!(calls.load(Ordering::Relaxed), usize::from(routed));
             assert_eq!(ctx.permissions.is_yolo(), yolo);
         });
     }
     #[test_case(false, None, FeatureMode::Enforce, false, false, DecisionEffect::Rerouted; "selected_different_model")]
     #[test_case(true, None, FeatureMode::Enforce, false, false, DecisionEffect::None; "selected_same_model")]
-    #[test_case(false, Some(false), FeatureMode::Enforce, false, false, DecisionEffect::None; "yolo_during_resolution")]
-    #[test_case(false, Some(true), FeatureMode::Enforce, false, false, DecisionEffect::None; "stale_revision_after_leaving_yolo")]
+    #[test_case(false, Some(false), FeatureMode::Enforce, false, false, DecisionEffect::Rerouted; "yolo_during_resolution")]
+    #[test_case(false, Some(true), FeatureMode::Enforce, false, false, DecisionEffect::Rerouted; "yolo_round_trip_during_resolution")]
     #[test_case(false, None, FeatureMode::Shadow, false, false, DecisionEffect::None; "shadow_route")]
     #[test_case(false, None, FeatureMode::Enforce, true, false, DecisionEffect::None; "decision_error")]
     #[test_case(false, None, FeatureMode::Enforce, false, true, DecisionEffect::None; "failed_creation")]

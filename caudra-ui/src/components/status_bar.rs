@@ -1758,7 +1758,7 @@ fn hoverable(ctx: &StatusBarContext<'_>, target: StatusBarHitTarget) -> bool {
 /// A control rather than a label: `/decisions` names what the engine last
 /// failed on.
 fn push_decisions_status(strip: &mut Strip, ctx: &StatusBarContext<'_>) {
-    if ctx.decisions_offline && ctx.permission_mode != PermissionMode::Yolo {
+    if ctx.decisions_offline {
         strip.chip(
             ctx,
             StatusBarHitTarget::Decisions,
@@ -3956,11 +3956,10 @@ mod tests {
     #[test_case(PermissionMode::Ask, SPLIT_ROWS; "ask_split")]
     #[test_case(PermissionMode::Auto, SPLIT_ROWS; "auto_split")]
     #[test_case(PermissionMode::Yolo, SPLIT_ROWS; "yolo_split")]
-    fn decisions_offline_is_a_warning_control_except_in_yolo(
+    fn decisions_offline_is_a_warning_control_in_every_mode(
         permission_mode: PermissionMode,
         rows: u16,
     ) {
-        let yolo = permission_mode == PermissionMode::Yolo;
         let ctx = Fixture {
             permission_mode,
             decisions_offline: true,
@@ -3974,11 +3973,6 @@ mod tests {
             .hits_on(row)
             .into_iter()
             .find(|hit| hit.target == StatusBarHitTarget::Decisions);
-        if yolo {
-            assert!(!text.contains(DECISIONS_OFFLINE_LABEL));
-            assert_eq!(hit, None);
-            return;
-        }
         let hit = hit.expect(MISSING_DECISIONS_HIT_MSG);
         let offset = text.find(DECISIONS_OFFLINE_LABEL).unwrap();
         let start = text[..offset].width();
@@ -3995,9 +3989,12 @@ mod tests {
         assert!(hit.target.accepts_click());
     }
 
-    #[test]
-    fn hovering_the_decisions_control_highlights_its_chip_alone() {
+    #[test_case(PermissionMode::Ask; "ask")]
+    #[test_case(PermissionMode::Auto; "auto")]
+    #[test_case(PermissionMode::Yolo; "yolo")]
+    fn hovering_the_decisions_control_highlights_its_chip_alone(permission_mode: PermissionMode) {
         let (_, hits, styles) = render_at(Fixture {
+            permission_mode,
             decisions_offline: true,
             hovered: Some(StatusBarHitTarget::Decisions),
             ..Default::default()
@@ -4017,15 +4014,33 @@ mod tests {
         );
     }
 
-    #[test_case(SINGLE_ROW; "single")]
-    #[test_case(SPLIT_ROWS; "split")]
-    fn decisions_status_is_absent_without_a_cached_failure(rows: u16) {
-        let drawn = draw(&Fixture::default().into_ctx(), BAR_WIDTH, rows);
+    #[test_case(PermissionMode::Ask, SINGLE_ROW; "ask_single")]
+    #[test_case(PermissionMode::Auto, SINGLE_ROW; "auto_single")]
+    #[test_case(PermissionMode::Yolo, SINGLE_ROW; "yolo_single")]
+    #[test_case(PermissionMode::Ask, SPLIT_ROWS; "ask_split")]
+    #[test_case(PermissionMode::Auto, SPLIT_ROWS; "auto_split")]
+    #[test_case(PermissionMode::Yolo, SPLIT_ROWS; "yolo_split")]
+    fn decisions_status_is_absent_without_a_cached_failure(
+        permission_mode: PermissionMode,
+        rows: u16,
+    ) {
+        let ctx = Fixture {
+            permission_mode,
+            ..Default::default()
+        }
+        .into_ctx();
+        let drawn = draw(&ctx, BAR_WIDTH, rows);
         assert!(
             drawn
                 .rows
                 .iter()
                 .all(|row| !row.contains(DECISIONS_OFFLINE_LABEL))
+        );
+        assert!(
+            drawn
+                .hits
+                .iter()
+                .all(|hit| hit.target != StatusBarHitTarget::Decisions)
         );
     }
 

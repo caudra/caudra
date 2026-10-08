@@ -236,6 +236,12 @@ pub struct PermissionManager {
     pattern_dismissals: Arc<Mutex<PatternDismissals>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PassiveDecisionRevision(u64);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PermissionDecisionRevision(u64);
+
 #[derive(Clone)]
 struct PermissionModeState {
     seed: PermissionMode,
@@ -579,7 +585,6 @@ impl PermissionManager {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let result = update(&mut self.permission_mode());
-        self.broker.revoke_passive_decisions();
         self.notify_policy_changed("");
         result
     }
@@ -616,14 +621,28 @@ impl PermissionManager {
         self.update_mode(|state| state.seed = seed);
     }
 
-    pub(crate) fn passive_decision_revision(&self) -> Option<u64> {
-        let revision = self.broker.passive_revision.load(Ordering::Acquire);
+    pub(crate) fn passive_decision_revision(&self) -> Option<PassiveDecisionRevision> {
+        let revision =
+            PassiveDecisionRevision(self.broker.passive_revision.load(Ordering::Acquire));
         self.passive_decision_is_current(revision)
             .then_some(revision)
     }
 
-    pub(crate) fn passive_decision_is_current(&self, revision: u64) -> bool {
-        !self.is_yolo() && self.broker.passive_revision.load(Ordering::Acquire) == revision
+    pub(crate) fn passive_decision_is_current(&self, revision: PassiveDecisionRevision) -> bool {
+        self.broker.passive_revision.load(Ordering::Acquire) == revision.0
+    }
+
+    pub(super) fn permission_decision_revision(&self) -> Option<PermissionDecisionRevision> {
+        let revision = PermissionDecisionRevision(self.broker.revision.load(Ordering::Acquire));
+        self.permission_decision_is_current(revision)
+            .then_some(revision)
+    }
+
+    pub(super) fn permission_decision_is_current(
+        &self,
+        revision: PermissionDecisionRevision,
+    ) -> bool {
+        !self.is_yolo() && self.broker.revision.load(Ordering::Acquire) == revision.0
     }
 
     pub fn set_session_mode(&self, stored: Option<PermissionMode>) {
@@ -1382,16 +1401,21 @@ mod tests {
     #[test_case(PermissionMode::Ask; "ask_revision")]
     #[test_case(PermissionMode::Auto; "auto_revision")]
     #[test_case(PermissionMode::Yolo; "yolo_revision")]
-    fn passive_decision_revision_rejects_mode_changes(mode: PermissionMode) {
+    fn decision_revisions_separate_permission_modes(mode: PermissionMode) {
         let manager = default_mgr();
         let revision = manager.passive_decision_revision().unwrap();
+        let permission_revision = manager.permission_decision_revision().unwrap();
         assert!(manager.passive_decision_is_current(revision));
         manager.set_session_mode(Some(mode.clone()));
-        assert!(!manager.passive_decision_is_current(revision));
+        assert!(manager.passive_decision_is_current(revision));
+        assert!(!manager.permission_decision_is_current(permission_revision));
         assert_eq!(
-            manager.passive_decision_revision().is_none(),
+            manager.permission_decision_revision().is_none(),
             mode == PermissionMode::Yolo
         );
+        manager.set_session_mode(Some(PermissionMode::Ask));
+        assert!(manager.passive_decision_is_current(revision));
+        assert!(!manager.permission_decision_is_current(permission_revision));
     }
 
     #[test_case(|manager| manager.notify_policy_changed(UNATTRIBUTED), true; "policy_change")]
