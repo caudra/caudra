@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -201,6 +202,36 @@ class BuildCodeWorkerTests(unittest.TestCase):
     def test_missing_source_record_rebuilds(self):
         self.build()
         self.source_record.unlink()
+        self.run_mock.reset_mock()
+
+        self.build()
+
+        self.assertEqual(self.run_mock.call_count, 2)
+        self.assertEqual(self.source_record.read_text(), str(self.manifest) + "\n")
+
+    def test_restored_worker_and_pinned_source_skip_recompilation(self):
+        self.build()
+        archive = self.root.parent / "cache"
+        shutil.copytree(self.root, archive / "worker")
+        shutil.copytree(self.manifest.parent, archive / "source")
+        shutil.rmtree(self.root)
+        shutil.rmtree(self.manifest.parent)
+        shutil.copytree(archive / "worker", self.root)
+        shutil.copytree(archive / "source", self.manifest.parent)
+        self.run_mock.reset_mock()
+
+        self.assertEqual(self.build(), self.worker)
+
+        self.run_mock.assert_not_called()
+        self.assertEqual(self.worker.read_bytes(), STRIPPED)
+        self.assertEqual(self.symbols.read_bytes(), UNSTRIPPED)
+        self.assertEqual(self.source_record.read_text(), str(self.manifest) + "\n")
+
+    def test_restored_worker_with_relocated_source_rebuilds(self):
+        self.build()
+        relocated = self.manifest.parent.with_name("relocated-registry")
+        self.manifest.parent.rename(relocated)
+        self.manifest = relocated / self.manifest.name
         self.run_mock.reset_mock()
 
         self.build()

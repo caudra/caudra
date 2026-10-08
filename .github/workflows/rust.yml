@@ -58,6 +58,8 @@ jobs:
               - "scripts/test-make.py"
               - ".config/nextest.toml"
               - ".github/workflows/rust.yml"
+              - ".github/actions/code-worker/**"
+              - ".cargo/config.toml"
 
   fmt:
     name: Format (Rust)
@@ -104,6 +106,7 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
       - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/code-worker
       - run: make code-worker
       - run: cargo clippy --locked --all --tests -- -D warnings
 
@@ -120,6 +123,7 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
       - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/code-worker
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
@@ -158,6 +162,7 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
       - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/code-worker
       - run: python3 scripts/build-code-worker.py
       - run: make -C workcell check-native test-optional-features
       - run: cargo test --locked -p workcell-mcp-code --no-default-features --features mcp,bundled-worker --test execution
@@ -174,6 +179,7 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
       - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/code-worker
       - run: make check build workcell-build ARGS=--locked
 
   macos:
@@ -187,6 +193,7 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
       - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/code-worker
       - run: make check ARGS=--locked
       - name: Workcell macOS native filesystem checks
         run: |
@@ -229,6 +236,7 @@ jobs:
           "$env:ProgramFiles\Git\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - run: make --version && bash --version
       - run: python3 scripts/test-make.py
+      - uses: ./.github/actions/code-worker
       - run: make code-worker
       - run: cargo clippy --locked --all --tests -- -D warnings
       - run: make build ARGS=--locked

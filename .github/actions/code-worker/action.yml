@@ -1,0 +1,45 @@
+name: Cached native code worker
+description: Restore, validate, and save the optimized worker and its pinned source
+runs:
+  using: composite
+  steps:
+    - id: identity
+      shell: python3 {0}
+      run: |
+        import hashlib
+        import os
+        from pathlib import Path
+        import runpy
+        import subprocess
+
+        worker = runpy.run_path("scripts/build-code-worker.py")
+        toolchain = subprocess.check_output(["rustc", "-vV"], text=True)
+        target = next(line.removeprefix("host: ") for line in toolchain.splitlines() if line.startswith("host: "))
+        cargo_home = Path(os.environ.get("CARGO_HOME", Path.home() / ".cargo")).resolve()
+        location = hashlib.sha256(f"{Path.cwd()}\0{cargo_home}".encode()).hexdigest()
+        fingerprint = worker["fingerprint"](toolchain, target)
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+            output.write(f"key=native-worker-v1-{target}-{fingerprint}-{location}\n")
+            output.write(f"source={cargo_home.as_posix()}/registry/src/*/monty-runtime-{worker['VERSION']}\n")
+    - uses: actions/cache/restore@v5
+      id: cache
+      with:
+        key: ${{ steps.identity.outputs.key }}-${{ hashFiles('.cargo/config.toml', '.github/actions/code-worker/action.yml') }}
+        path: |
+          target/code-worker/bin
+          target/code-worker/symbols
+          target/code-worker/build-fingerprint
+          target/code-worker/source-manifest-path
+          ${{ steps.identity.outputs.source }}
+    - shell: bash
+      run: python3 scripts/build-code-worker.py
+    - uses: actions/cache/save@v5
+      if: steps.cache.outputs.cache-hit != 'true'
+      with:
+        key: ${{ steps.cache.outputs.cache-primary-key }}
+        path: |
+          target/code-worker/bin
+          target/code-worker/symbols
+          target/code-worker/build-fingerprint
+          target/code-worker/source-manifest-path
+          ${{ steps.identity.outputs.source }}

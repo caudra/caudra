@@ -5,9 +5,11 @@ import hashlib
 import importlib.util
 import os
 import re
+import runpy
 import shutil
 import subprocess
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -39,6 +41,18 @@ UPLOAD_ERROR = "simulated interrupted upload"
 WORKFLOWS = Path(__file__).resolve().parent.parent / ".github/workflows"
 SMOKE_WORKER_WARNING = "Workcell python_execution is unavailable"
 SMOKE_STARTUP_ERROR = "resolve data directory: Permission denied"
+WORKER_ACTION = WORKFLOWS.parent / "actions/code-worker/action.yml"
+WORKER_CACHE_PATHS = (
+    "target/code-worker/bin",
+    "target/code-worker/symbols",
+    "target/code-worker/build-fingerprint",
+    "target/code-worker/source-manifest-path",
+    "${{ steps.identity.outputs.source }}",
+)
+ALPINE_CACHE_PATHS = (
+    "${{ runner.temp }}/alpine-cargo/registry/cache",
+    "${{ runner.temp }}/alpine-cargo/git/db",
+)
 SMOKE_DIRECTORIES = (
     "HOME",
     "XDG_CONFIG_HOME",
@@ -593,6 +607,148 @@ class ReleaseWorkflowTests(unittest.TestCase):
             self.assertIn("--version)", jobs[job])
             self.assertIn("${GITHUB_REF_NAME#v}", jobs[job])
         self.assertIn("-e GITHUB_REF_NAME", jobs["build-linux"])
+
+    def test_native_worker_cache_is_shared_and_saved_before_workspace_cleanup(self):
+        action = WORKER_ACTION.read_text()
+        restore, validate_and_save = action.split("    - shell: bash\n", 1)
+        self.assertIn("uses: actions/cache/restore@v5", restore)
+        self.assertNotIn("restore-keys:", restore)
+        self.assertNotIn("if:", restore)
+        validate, save = validate_and_save.split("uses: actions/cache/save@v5", 1)
+        self.assertIn("run: python3 scripts/build-code-worker.py", validate)
+        self.assertNotIn("if:", validate)
+        self.assertIn("if: steps.cache.outputs.cache-hit != 'true'", save)
+        self.assertIn("key: ${{ steps.cache.outputs.cache-primary-key }}", save)
+        paths = re.findall(r"(?m)^          (\S.+)$", action)
+        self.assertEqual(paths, list(WORKER_CACHE_PATHS) * 2)
+        for identity in (
+            '["rustc", "-vV"]',
+            'worker["fingerprint"](toolchain, target)',
+            "Path.cwd()",
+            "cargo_home",
+            "hashFiles('.cargo/config.toml', '.github/actions/code-worker/action.yml')",
+            "/registry/src/*/monty-runtime-{worker['VERSION']}",
+        ):
+            self.assertIn(identity, action)
+        for isolated_key in ("github.ref", "github.sha", "github.job", "runner.temp"):
+            self.assertNotIn(isolated_key, action)
+        _, rust = self.workflow("rust")
+        _, release = self.workflow("release")
+        for job in ("lint", "test", "workcell-native", "build", "macos", "windows"):
+            with self.subTest(job=job):
+                self.assertEqual(
+                    rust[job].count("uses: ./.github/actions/code-worker"), 1
+                )
+                self.assertLess(
+                    rust[job].index("uses: Swatinem/rust-cache@v2"),
+                    rust[job].index("uses: ./.github/actions/code-worker"),
+                )
+        native = release["build-other"]
+        self.assertLess(
+            native.index("uses: Swatinem/rust-cache@v2"),
+            native.index("uses: ./.github/actions/code-worker"),
+        )
+        self.assertLess(
+            native.index("uses: ./.github/actions/code-worker"),
+            native.index("      - name: Build\n"),
+        )
+        self.assertIn('".github/actions/code-worker/**"', rust["changes"])
+        self.assertIn('".cargo/config.toml"', rust["changes"])
+
+    def test_native_release_dependency_cache_is_stable_and_survives_failure(self):
+        _, release = self.workflow("release")
+        cache = release["build-other"].split("uses: Swatinem/rust-cache@v2", 1)[1]
+        cache = cache.split("\n      - ", 1)[0]
+        self.assertIn("key: release-${{ matrix.target }}", cache)
+        self.assertIn("cache-on-failure: true", cache)
+        self.assertNotIn("github.ref", cache)
+
+    def test_worker_identity_reuses_hosts_but_separates_flags_toolchains_and_paths(
+        self,
+    ):
+        script = WORKER_ACTION.read_text().split("      run: |\n", 1)[1]
+        script = textwrap.dedent(script.split("    - uses:", 1)[0])
+        toolchain = (
+            "rustc 1.99.0\ncommit-hash: original\nhost: x86_64-unknown-linux-gnu\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            output = root / "output"
+            identity_script = root / "identity.py"
+            identity_script.write_text(script)
+
+            def identity(ref, flags="", compiler=toolchain, cargo_home=root / "cargo"):
+                output.write_text("")
+                with (
+                    patch.dict(
+                        os.environ,
+                        {
+                            "GITHUB_OUTPUT": str(output),
+                            "CARGO_HOME": str(cargo_home),
+                            "GITHUB_REF": ref,
+                            "RUSTFLAGS": flags,
+                        },
+                    ),
+                    patch("subprocess.check_output", return_value=compiler),
+                ):
+                    runpy.run_path(str(identity_script))
+                return dict(
+                    line.split("=", 1) for line in output.read_text().splitlines()
+                )
+
+            main = identity("refs/heads/main")
+            self.assertEqual(main, identity(f"refs/tags/{TAG}"))
+            self.assertNotEqual(
+                main["key"], identity("refs/heads/main", "-C opt-level=2")["key"]
+            )
+            self.assertNotEqual(
+                main["key"],
+                identity(
+                    "refs/heads/main", compiler=toolchain.replace("original", "changed")
+                )["key"],
+            )
+            self.assertNotEqual(
+                main["key"],
+                identity("refs/heads/main", cargo_home=root / "relocated")["key"],
+            )
+            self.assertTrue(
+                main["source"].startswith(
+                    f"{(root / 'cargo').as_posix()}/registry/src/*/monty-runtime-"
+                )
+            )
+
+    def test_alpine_cache_contains_only_downloads_with_compatible_identity(self):
+        _, release = self.workflow("release")
+        linux = release["build-linux"]
+        restore = linux.split("uses: actions/cache/restore@v5", 1)[1]
+        restore = restore.split("\n      - ", 1)[0]
+        save = linux.split("uses: actions/cache/save@v5", 1)[1]
+        save = save.split("\n      - ", 1)[0]
+        for operation in (restore, save):
+            self.assertEqual(
+                re.findall(r"(?m)^            (.+)$", operation.split("path: |", 1)[1]),
+                list(ALPINE_CACHE_PATHS),
+            )
+        self.assertIn("alpine-cargo-v1-3.21-${{ matrix.target }}-", restore)
+        self.assertIn("hashFiles('rust-toolchain.toml', '.cargo/config.toml')", restore)
+        self.assertIn(
+            "hashFiles('Cargo.lock', 'scripts/build-code-worker.py')", restore
+        )
+        self.assertNotIn("github.ref", restore)
+        self.assertIn("!cancelled()", save)
+        self.assertIn("steps.cargo-cache.outputs.cache-hit != 'true'", save)
+        self.assertIn('"$RUNNER_TEMP/alpine-cargo:/cargo"', linux)
+        self.assertIn("-e CARGO_HOME=/cargo", linux)
+        self.assertIn('. "$CARGO_HOME/env"', linux)
+        cleanup = linux.split("- name: Restore ownership after Alpine", 1)[1]
+        cleanup = cleanup.split("\n      - ", 1)[0]
+        self.assertIn("if: always()", cleanup)
+        self.assertIn('sudo chown -R "$(id -u):$(id -g)"', cleanup)
+        self.assertIn('target/ licenses/ "$RUNNER_TEMP/alpine-cargo"', cleanup)
+        self.assertLess(
+            linux.index("Restore ownership after Alpine"),
+            linux.index("uses: actions/cache/save@v5"),
+        )
 
 
 @unittest.skipUnless(

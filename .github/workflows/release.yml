@@ -106,13 +106,29 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
 
+      - name: Prepare Alpine cache directories
+        run: mkdir -p target licenses "$RUNNER_TEMP/alpine-cargo"
+
+      - uses: actions/cache/restore@v5
+        id: cargo-cache
+        with:
+          key: alpine-cargo-v1-3.21-${{ matrix.target }}-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml') }}-${{ hashFiles('Cargo.lock', 'scripts/build-code-worker.py') }}
+          restore-keys: |
+            alpine-cargo-v1-3.21-${{ matrix.target }}-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml') }}-
+          path: |
+            ${{ runner.temp }}/alpine-cargo/registry/cache
+            ${{ runner.temp }}/alpine-cargo/git/db
+
       - name: Build in Alpine container
         run: |
           docker run --rm \
             -v "${{ github.workspace }}:/workspace" \
+            -v "$RUNNER_TEMP/alpine-cargo:/cargo" \
             -w /workspace \
+            -e CARGO_HOME=/cargo \
             -e CARGO_TERM_COLOR=always \
             -e CARGO_INCREMENTAL=0 \
+            -e CARGO_NET_RETRY \
             -e WORKCELL_REQUIRE_CODE_WORKER=1 \
             -e CAUDRA_ENABLE_UPDATE_CHECK=0 \
             -e GITHUB_REF_NAME \
@@ -121,7 +137,7 @@ jobs:
               apk add --no-cache gcc g++ musl-dev make perl linux-headers curl git ca-certificates pkgconf python3-dev
               git config --global --add safe.directory /workspace
               curl --proto "=https" --tlsv1.2 --retry 5 --retry-delay 2 --retry-all-errors -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.99.0 --profile minimal --target ${{ matrix.target }}
-              . "$HOME/.cargo/env"
+              . "$CARGO_HOME/env"
               cargo fetch --locked --manifest-path Cargo.toml
               python3 scripts/build-code-worker.py --target ${{ matrix.target }}
               cargo fetch --locked --manifest-path "$(cat target/code-worker/source-manifest-path)"
@@ -147,7 +163,18 @@ jobs:
               printf "%s\n" "$smoke_output" | grep -qx python_execution
               ! printf "%s\n" "$smoke_output" | grep -q "Workcell python_execution is unavailable"
               '
-          sudo chown -R $(id -u):$(id -g) target/
+
+      - name: Restore ownership after Alpine
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" target/ licenses/ "$RUNNER_TEMP/alpine-cargo"
+
+      - uses: actions/cache/save@v5
+        if: ${{ !cancelled() && steps.cargo-cache.outputs.cache-primary-key != '' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        with:
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+          path: |
+            ${{ runner.temp }}/alpine-cargo/registry/cache
+            ${{ runner.temp }}/alpine-cargo/git/db
 
       - name: Package diagnostic binaries
         run: |
@@ -214,7 +241,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}-${{ github.ref_name }}
+          key: release-${{ matrix.target }}
+          cache-on-failure: true
+
+      - uses: ./.github/actions/code-worker
 
       - name: Build
         shell: bash
