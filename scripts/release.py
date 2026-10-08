@@ -30,6 +30,7 @@ SEMVER = re.compile(
     r"(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
 )
 SHA = re.compile(r"[0-9a-f]{40}")
+VERSION_INHERITANCE_ERROR = "package.version must inherit workspace.package.version"
 
 
 def require(condition: bool, message: str) -> None:
@@ -94,6 +95,20 @@ not restored. An older executable may be incompatible with migrated data.
 """
 
 
+def validate_workspace_versions(root: Path) -> str:
+    with (root / "Cargo.toml").open("rb") as manifest:
+        workspace = tomllib.load(manifest)["workspace"]
+    for member in (".", *workspace["members"]):
+        path = Path(member) / "Cargo.toml"
+        with (root / path).open("rb") as manifest:
+            package = tomllib.load(manifest)["package"]
+        require(
+            package.get("version") == {"workspace": True},
+            f"{path.as_posix()}: {VERSION_INHERITANCE_ERROR}",
+        )
+    return workspace["package"]["version"]
+
+
 def validate_source(repository: str, ref: str, sha: str, root: Path) -> str:
     require(repository == REPOSITORY, "Releases are restricted to caudra/caudra")
     require(ref.startswith("refs/tags/"), "Release source must be a tag")
@@ -102,8 +117,7 @@ def validate_source(repository: str, ref: str, sha: str, root: Path) -> str:
     require(
         SHA.fullmatch(sha) is not None, "Release source must be an exact commit SHA"
     )
-    with (root / "Cargo.toml").open("rb") as manifest:
-        workspace_version = tomllib.load(manifest)["workspace"]["package"]["version"]
+    workspace_version = validate_workspace_versions(root)
     require(tag[1:] == workspace_version, "Tag does not match root workspace version")
     head = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=root, text=True

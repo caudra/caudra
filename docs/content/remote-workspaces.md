@@ -5,7 +5,7 @@ description: "Connect to Workcell with explicit workspace identity and remote ex
 
 Connect Caudra to a Workcell server when the repository and execution environment live on another host. Caudra keeps its terminal UI, model connections, and session state on the client. Workspace operations run at the selected endpoint.
 
-Use compatible client and server builds. A matching version label alone does not establish compatibility. The pinned Workcell dependency includes reviewed-transfer contracts, with a hard break from older remote contracts. Incompatible persisted state fails without migration. See [compatibility and release status](/docs/sandboxes/#compatibility-and-release-status) for the exact pin and supported state formats.
+Use compatible client and server builds. Release versions may differ if the server satisfies the client's protocol and capability requirements. A matching version label alone does not establish compatibility. Reviewed-transfer contracts have a hard break from older remote contracts. Incompatible persisted state fails without migration. See [compatibility and release status](/docs/sandboxes/#compatibility-and-release-status) for the release policy and supported state formats.
 
 This guide covers direct Workcell connections, where you provision the host and manage its process, credentials, TLS and storage. For optional e2b-libvirt lifecycle management, profiles, the template catalog and reviewed file transfers, use [Managed Sandboxes](/docs/sandboxes/). A failed remote connection never switches execution to the local checkout.
 
@@ -13,7 +13,7 @@ Direct Workcell connections are experimental and off by default. Turn them on wi
 
 ## Prepare the server
 
-Use a matching Workcell build with a working Python execution worker. A generic MCP endpoint or a read-only Workcell server is insufficient. Caudra requires the full first-party catalog with matching schemas, contract and result versions, annotations, and presentation metadata.
+Use a compatible Workcell build with a working Python execution worker. A generic MCP endpoint or a read-only Workcell server is insufficient. Caudra requires the full first-party catalog with matching schemas, contract and result versions, annotations, and presentation metadata.
 
 Live discovery must advertise these capabilities. Capability contracts use version `v1`, and declared limits must pass Caudra's bounds checks. Listed methods and guarantees must be enabled unless stated otherwise.
 

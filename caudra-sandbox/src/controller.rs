@@ -3900,19 +3900,43 @@ mod tests {
         );
     }
 
-    #[test_case("protocolVersion", json!("old"))]
-    #[test_case("transferProtocol", json!("workcell-raw-v1"); "raw_transfer_is_not_compatible")]
-    #[test_case("remoteWorkspace", json!(false))]
-    #[test_case("workspaceSnapshots", json!(false))]
-    #[test_case("reviewedTransfer", json!(false))]
-    fn incompatible_images_cannot_launch(field: &str, value: Value) {
+    #[test_case(env!("CARGO_PKG_VERSION"); "matching_package_version")]
+    #[test_case("0.0.1"; "older_package_version")]
+    #[test_case("999.0.0"; "newer_package_version")]
+    #[test_case("vendor-1.2.3+build.4"; "independent_package_label")]
+    fn image_compatibility_uses_contracts_not_package_versions(version: &str) {
+        let mut value = template();
+        value["workcell"]["version"] = json!(version);
+        let template = serde_json::from_value::<Template>(value).unwrap();
+        template.manifest.validate().unwrap();
+        assert!(template_entry(&template).unwrap().workcell_compatible);
+    }
+
+    #[test_case("protocolVersion", json!("old"), false; "incompatible_protocol")]
+    #[test_case("protocolVersion", json!(""), false; "empty_protocol")]
+    #[test_case("transferProtocol", json!("workcell-raw-v1"), false; "raw_transfer_is_not_compatible")]
+    #[test_case("transferProtocol", json!(""), false; "empty_transfer_protocol")]
+    #[test_case("remoteWorkspace", json!(false), false; "no_remote_workspace")]
+    #[test_case("workspaceSnapshots", json!(false), true; "snapshots_required_for_launch_not_import")]
+    #[test_case("reviewedTransfer", json!(false), false; "no_reviewed_transfer")]
+    fn incompatible_images_cannot_launch(field: &str, value: Value, importable: bool) {
         let mut template = template();
+        template["workcell"]["version"] = json!(env!("CARGO_PKG_VERSION"));
         template["workcell"][field] = value;
-        assert!(
-            !template_entry(&serde_json::from_value::<Template>(template).unwrap())
-                .unwrap()
-                .workcell_compatible
-        );
+        let template = serde_json::from_value::<Template>(template).unwrap();
+        assert_eq!(template.manifest.validate().is_ok(), importable);
+        assert!(!template_entry(&template).unwrap().workcell_compatible);
+    }
+
+    #[test_case("protocolVersion")]
+    #[test_case("transferProtocol")]
+    #[test_case("remoteWorkspace")]
+    #[test_case("workspaceSnapshots")]
+    #[test_case("reviewedTransfer")]
+    fn images_must_declare_required_workcell_contracts(field: &str) {
+        let mut value = template();
+        value["workcell"].as_object_mut().unwrap().remove(field);
+        assert!(serde_json::from_value::<Template>(value).is_err());
     }
 
     #[test_case("transferProtocol", true; "current_wire_field")]

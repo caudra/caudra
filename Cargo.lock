@@ -10270,7 +10270,7 @@ dependencies = [
 
 [[package]]
 name = "workcell"
-version = "0.1.0"
+version = "0.2.0-preview.1"
 dependencies = [
  "workcell-environment",
  "workcell-host-contract",
@@ -10289,7 +10289,7 @@ dependencies = [
 
 [[package]]
 name = "workcell-code-graph"
-version = "0.1.0"
+version = "0.2.0-preview.1"
 dependencies = [
  "gix",
  "lru",
@@ -10303,7 +10303,7 @@ dependencies = [
 
 [[package]]
 name = "workcell-environment"
-version = "0.1.0"
+version = "0.2.0-preview.1"
 dependencies = [
  "rmcp",
  "rustix 0.38.44",
@@ -10318,7 +10318,7 @@ dependencies = [
 
 [[package]]
 name = "workcell-host-contract"
-version = "0.1.0"
+version = "0.2.0-preview.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -10327,7 +10327,7 @@ dependencies = [
 
 [[package]]
 name = "workcell-mcp"
-version = "0.1.0"
+version = "0.2.0-preview.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -10364,7 +10364,7 @@ dependencies = [
 
 [[package]]
 name = "workcell-mcp-code"
-version = "0.1.0"
+version = "0.2.0-preview.1"
 dependencies = [
  "monty-pool",
  "monty-types 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -10381,7 +10381,7 @@ dependencies = [
 
 [[package]]
 name = "workcell-mcp-code-graph"
-version = "0.1.0"
+version = "0.2.0-preview.1"
 dependencies = [
  "async-trait",
  "rmcp",
@@ -10399,7 +10399,7 @@ dependencies = [
 
 [[package]]
 name = "workcell-mcp-files"
-version = "0.1.0"
+version = "0.2.0-preview.1"
 dependencies = [
  "dunce",
  "file-format",
@@ -10427,7 +10427,7 @@ dependencies = [
 
 [[package]]
 name = "workcell-mcp-shell"
-version = "0.1.0"
+version = "0.2.0-preview.1"
 dependencies = [
  "async-trait",
  "dunce",
@@ -10452,7 +10452,7 @@ dependencies = [
 
 [[package]]
 name = "workcell-mcp-web"
-version = "0.1.0"
+version = "0.2.0-preview.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -10483,7 +10483,7 @@ dependencies = [
 
 [[package]]
 name = "workcell-monty-worker"
-version = "0.1.0"
+version = "0.2.0-preview.1"
 dependencies = [
  "flate2",
  "libc",
@@ -10495,7 +10495,7 @@ dependencies = [
 
 [[package]]
 name = "workcell-net"
-version = "0.1.0"
+version = "0.2.0-preview.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -10514,7 +10514,7 @@ dependencies = [
 
 [[package]]
 name = "workcell-output-filter"
-version = "0.1.0"
+version = "0.2.0-preview.1"
 dependencies = [
  "regex",
  "serde",
@@ -10523,7 +10523,7 @@ dependencies = [
 
 [[package]]
 name = "workcell-snapshot-store"
-version = "0.1.0"
+version = "0.2.0-preview.1"
 dependencies = [
  "gix",
  "serde",
@@ -10535,7 +10535,7 @@ dependencies = [
 
 [[package]]
 name = "workcell-source-icons"
-version = "0.1.0"
+version = "0.2.0-preview.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -10556,7 +10556,7 @@ dependencies = [
 
 [[package]]
 name = "workcell-source-languages"
-version = "0.1.0"
+version = "0.2.0-preview.1"
 dependencies = [
  "test-case",
  "tree-sitter",
@@ -10600,7 +10600,7 @@ dependencies = [
 
 [[package]]
 name = "workcell-tool-contract"
-version = "0.1.0"
+version = "0.2.0-preview.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -10609,7 +10609,7 @@ dependencies = [
 
 [[package]]
 name = "workcell-workspace-scm"
-version = "0.1.0"
+version = "0.2.0-preview.1"
 dependencies = [
  "gix",
  "rustix 0.38.44",
@@ -10627,7 +10627,7 @@ dependencies = [
 
 [[package]]
 name = "workcell-workspace-snapshot"
-version = "0.1.0"
+version = "0.2.0-preview.1"
 dependencies = [
  "rustix 0.38.44",
  "serde",

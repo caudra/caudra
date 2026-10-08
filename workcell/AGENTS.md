@@ -7,8 +7,14 @@ isolated code, and execution-environment tools. It is designed to run directly o
 operator-provided container, VM, sandbox, or host.
 
 This subtree belongs to Caudra's root Cargo workspace. Its crates retain Apache-2.0 licensing and
-explicit versions. The root owns dependency declarations, the lockfile, build profiles, and the target
-directory. Keep the neutral libraries independent of Caudra's agent, UI, and storage crates.
+inherit the root release version with `version.workspace = true`. The root owns dependency
+declarations, the lockfile, build profiles, and the target directory. Keep the neutral libraries
+independent of Caudra's agent, UI, and storage crates.
+
+Release versions identify source builds, not remote compatibility. Separately deployed servers may
+have different release versions. Gate connections on supported protocols, versioned contracts, and
+required capabilities, never package-version equality. Keep wire and persisted-format versions
+independent of the release version. A breaking contract needs a new contract version.
 
 The server is intentionally single-environment. Do not add users, teams, workspaces, tenant routing,
 deployment controllers, lease brokers, ontology tools, or harness-specific state.

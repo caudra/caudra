@@ -11,7 +11,13 @@ Managed sandboxes are experimental and off by default. Turn them on with `sandbo
 
 ## Compatibility and release status
 
-Caudra pins its Workcell dependency in `Cargo.toml`. Reviewed transfers require compatible remote contracts, and empty-directory publication requires its additional negotiated capability. Matching version labels alone do not establish compatibility. There is no raw-transfer fallback.
+Caudra and the first-party Workcell crates share the root `Cargo.toml` release version and lockfile. The standalone `workcell-mcp` binary inherits that version. Deployed clients and servers can have different release versions. Connection checks use supported protocols, versioned contracts and required capabilities. Matching version labels alone do not establish compatibility.
+
+Protocol, tool-contract and persisted-format versions are independent of the package version. Reviewed transfers require compatible remote contracts, and empty-directory publication requires its additional negotiated capability. There is no raw-transfer fallback.
+
+During previews, use client and server builds from the same source release as the baseline. Other release pairs need explicit cross-version testing before being treated as supported. Discovery checks and same-source tests do not establish a cross-version support window. A newer server is not automatically compatible with an older client.
+
+Pin deployed Workcell binaries by digest and retain their source revision in your build records. Managed images use immutable catalog revisions. Updating Caudra does not replace the Workcell binary in existing sandboxes. Build or import a reviewed image revision for new instances, and plan existing-instance upgrades separately after resolving in-flight operations. See [Images and template catalog](#images-and-template-catalog).
 
 Use compatible Caudra, e2b-libvirt and in-guest Workcell builds. Image manifests require `protocolVersion = "2026-07-28"`, `transferProtocol = "workcell-reviewed-v1"`, `remoteWorkspace = true` and `reviewedTransfer = true`. Caudra also validates workspace identity and the [required live capabilities](/docs/remote-workspaces/#prepare-the-server), including file change records, reviewed publication and the complete operation lifecycle, before attachment. Doctor reads provider metadata but does not boot-test an image.
 

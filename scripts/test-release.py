@@ -69,8 +69,24 @@ class ReleaseTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         (self.root / "Cargo.toml").write_text(
+            '[package]\nname = "caudra"\nversion.workspace = true\n'
+            '[workspace]\nmembers = ["workcell", "workcell/crates/tool-contract"]\n'
+            'exclude = ["vendor/example"]\n'
             f'[workspace.package]\nversion = "{TAG[1:]}"\n'
         )
+        for member, name in (
+            ("workcell", "workcell-mcp"),
+            ("workcell/crates/tool-contract", "workcell-tool-contract"),
+            ("vendor/example", "example"),
+        ):
+            directory = self.root / member
+            directory.mkdir(parents=True)
+            version = (
+                'version = "1.0.0"' if name == "example" else "version.workspace = true"
+            )
+            (directory / "Cargo.toml").write_text(
+                f'[package]\nname = "{name}"\n{version}\n'
+            )
         for name in RELEASE.INSTALLERS:
             (self.root / name).write_bytes(f"installer source: {name}\n".encode())
         self.artifacts = self.root / "artifacts"
@@ -221,6 +237,34 @@ class ReleaseTests(unittest.TestCase):
                     self.assertRaises(ValueError),
                 ):
                     RELEASE.validate_source(repository, ref, sha, self.root)
+
+    def test_checked_in_workspace_packages_inherit_the_release_version(self):
+        RELEASE.validate_workspace_versions(RELEASE.ROOT)
+
+    def test_source_rejects_independent_package_versions_even_when_labels_match(self):
+        for member in (".", "workcell", "workcell/crates/tool-contract"):
+            path = Path(member) / "Cargo.toml"
+            manifest = self.root / path
+            original = manifest.read_text()
+            for version in ('version = "0.1.0"', f'version = "{TAG[1:]}"', ""):
+                with (
+                    self.subTest(member=member, version=version),
+                    patch.object(RELEASE.subprocess, "check_output") as checkout,
+                    self.assertRaisesRegex(
+                        ValueError,
+                        re.escape(
+                            f"{path.as_posix()}: {RELEASE.VERSION_INHERITANCE_ERROR}"
+                        ),
+                    ),
+                ):
+                    manifest.write_text(
+                        original.replace("version.workspace = true", version)
+                    )
+                    RELEASE.validate_source(
+                        RELEASE.REPOSITORY, f"refs/tags/{TAG}", COMMIT, self.root
+                    )
+                checkout.assert_not_called()
+            manifest.write_text(original)
 
     def test_lightweight_and_annotated_tags_resolve_to_exact_commit(self):
         commit = {"object": {"type": "commit", "sha": COMMIT}}
