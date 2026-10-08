@@ -651,12 +651,14 @@ class VerifyTests(unittest.TestCase):
                 ),
                 patch.object(
                     UPDATER, "GitHub", side_effect=[self.source, self.website]
-                ),
+                ) as client,
                 patch.object(UPDATER.sys, "argv", args),
                 patch.object(UPDATER.sys, "stdout", stdout),
                 patch.object(UPDATER.sys, "stderr", stderr),
             ):
                 status = UPDATER.main()
+            if verify_only:
+                client.assert_called_once()
             self.assertEqual(self.website.mutations, [])
             return status, stdout.getvalue(), stderr.getvalue(), output.read_text()
 
@@ -698,14 +700,41 @@ class VerifyTests(unittest.TestCase):
                 self.assertEqual(stderr, "")
                 self.assertEqual(output, "existing=value\neligible=true\n")
 
+    def test_superseded_run_is_only_an_automatic_preflight_noop(self):
+        self.source.main = OLD
+        for filtered in (False, True):
+            with self.subTest(filtered=filtered):
+                refusal = UPDATER.SupersededRun
+                if filtered:
+                    self.filtered()
+                    refusal = UPDATER.PathFilteredRun
+                with self.assertRaises(refusal):
+                    UPDATER.verified_source(self.source, 42)
+                with self.assertRaises(refusal):
+                    UPDATER.update(self.source, self.website, 42, BOT)
+                status, stdout, stderr, output = self.cli()
+                self.assertEqual(status, 0)
+                self.assertIn("No-op:", stdout)
+                self.assertIn(
+                    "path filtering" if filtered else "no longer current main", stdout
+                )
+                self.assertNotIn("Verified source:", stdout)
+                self.assertEqual(stderr, "")
+                self.assertEqual(output, "existing=value\neligible=false\n")
+                for event in ("workflow_dispatch", "", "push"):
+                    self.assert_cli_refused(event=event)
+                self.assert_cli_refused(verify_only=False)
+
     def test_successful_jobs_without_docgen_never_emit_eligibility(self):
         step = self.source.jobs[2]["steps"][0]
         for steps in ([], [step, step], [{**step, "conclusion": "skipped"}]):
-            with self.subTest(steps=steps):
-                self.source.jobs[2]["steps"] = steps
-                self.assert_cli_refused()
+            for current in (NEW, OLD):
+                with self.subTest(steps=steps, current=current):
+                    self.source.main = current
+                    self.source.jobs[2]["steps"] = steps
+                    self.assert_cli_refused()
 
-    def test_filtered_still_requires_canonical_current_run(self):
+    def test_nonpublishable_runs_still_require_canonical_identity(self):
         for target, key, value in (
             ("workflow", "path", ".github/workflows/other.yml"),
             ("workflow", "state", "disabled_manually"),
@@ -717,20 +746,52 @@ class VerifyTests(unittest.TestCase):
             ("run", "event", "pull_request"),
             ("run", "head_branch", "feature"),
             ("run", "head_sha", "main"),
-            ("run", "head_sha", OLD),
+            ("run", "head_repository", None),
             ("run", "conclusion", "failure"),
             ("run", "status", "in_progress"),
             ("run", "run_attempt", 0),
             ("run", "run_attempt", True),
             ("run", "run_attempt", "1"),
         ):
-            with self.subTest(target=target, key=key, value=value):
-                self.setUp()
-                self.filtered()
-                getattr(self.source, target)[key] = value
-                self.assert_cli_refused()
+            for filtered, current in ((True, NEW), (True, OLD), (False, OLD)):
+                with self.subTest(
+                    target=target,
+                    key=key,
+                    value=value,
+                    filtered=filtered,
+                    current=current,
+                ):
+                    self.setUp()
+                    if filtered:
+                        self.filtered()
+                    self.source.main = current
+                    getattr(self.source, target)[key] = value
+                    self.assert_cli_refused()
 
-    def test_filtered_requires_unique_completed_jobs_and_successful_gates(self):
+    def test_nonpublishable_runs_still_require_valid_current_main(self):
+        for ref in (
+            None,
+            {"object": {"type": "tree", "sha": OLD}},
+            {"object": {"type": "commit", "sha": "main"}},
+        ):
+            for filtered in (False, True):
+                with self.subTest(ref=ref, filtered=filtered):
+                    self.setUp()
+                    if filtered:
+                        self.filtered()
+                    original = self.source.request
+
+                    def request(repo, path, ref=ref, original=original, **kwargs):
+                        return (
+                            ref
+                            if path == "git/ref/heads/main"
+                            else original(repo, path, **kwargs)
+                        )
+
+                    with patch.object(self.source, "request", side_effect=request):
+                        self.assert_cli_refused()
+
+    def test_nonpublishable_runs_require_valid_jobs_and_filter_gates(self):
         for index in range(5):
             for outcome in (
                 "missing",
@@ -741,59 +802,79 @@ class VerifyTests(unittest.TestCase):
                 None,
                 "opposite",
             ):
-                with self.subTest(index=index, outcome=outcome):
-                    self.setUp()
+                for filtered, current in ((True, NEW), (True, OLD), (False, OLD)):
+                    if not filtered and index >= 3:
+                        continue
+                    with self.subTest(
+                        index=index, outcome=outcome, filtered=filtered, current=current
+                    ):
+                        self.setUp()
+                        if filtered:
+                            self.filtered()
+                        self.source.main = current
+                        job = self.source.jobs[index]
+                        if outcome == "missing":
+                            self.source.jobs.pop(index)
+                        elif outcome == "duplicate":
+                            self.source.jobs.append(job.copy())
+                        elif outcome == "in_progress":
+                            job["status"] = outcome
+                        else:
+                            job["conclusion"] = (
+                                (
+                                    "success"
+                                    if job["conclusion"] == "skipped"
+                                    else "skipped"
+                                )
+                                if outcome == "opposite"
+                                else outcome
+                            )
+                        self.assert_cli_refused()
+
+    def test_nonpublishable_classification_reads_all_attempt_pages(self):
+        for filtered, current in ((True, NEW), (True, OLD), (False, OLD)):
+            with self.subTest(filtered=filtered, current=current):
+                self.setUp()
+                if filtered:
                     self.filtered()
-                    job = self.source.jobs[index]
-                    if outcome == "missing":
-                        self.source.jobs.pop(index)
-                    elif outcome == "duplicate":
-                        self.source.jobs.append(job.copy())
-                    elif outcome == "in_progress":
-                        job["status"] = outcome
-                    else:
-                        job["conclusion"] = (
-                            ("success" if index < 3 else "skipped")
-                            if outcome == "opposite"
-                            else outcome
-                        )
-                    self.assert_cli_refused()
+                self.source.main = current
+                self.source.jobs = [
+                    {"name": f"other-{i}"} for i in range(101)
+                ] + self.source.jobs
+                self.source.run["run_attempt"] = 2
+                original = self.source.request
 
-    def test_filtered_classification_reads_all_attempt_pages(self):
-        self.filtered()
-        self.source.jobs = [
-            {"name": f"other-{i}"} for i in range(101)
-        ] + self.source.jobs
-        self.source.run["run_attempt"] = 2
-        original = self.source.request
-
-        def request(repo, path, **kwargs):
-            if "/jobs?" in path:
-                self.assertIn("/attempts/2/", path)
-                path = path.replace("/attempts/2/", "/attempts/1/")
-            return original(repo, path, **kwargs)
-
-        with patch.object(self.source, "request", side_effect=request):
-            self.assertEqual(self.cli()[3], "existing=value\neligible=false\n")
-            self.source.jobs.insert(0, self.source.jobs[-1].copy())
-            self.assert_cli_refused()
-
-    def test_filtered_cannot_hide_incomplete_or_excessive_pagination(self):
-        self.filtered()
-        original = self.source.request
-        for total in (4, 6):
-            with self.subTest(total=total):
-
-                def request(repo, path, total=total, **kwargs):
-                    result = original(repo, path, **kwargs)
+                def request(repo, path, original=original, **kwargs):
                     if "/jobs?" in path:
-                        result["total_count"] = total
-                    return result
+                        self.assertIn("/attempts/2/", path)
+                        path = path.replace("/attempts/2/", "/attempts/1/")
+                    return original(repo, path, **kwargs)
 
                 with patch.object(self.source, "request", side_effect=request):
+                    self.assertEqual(self.cli()[3], "existing=value\neligible=false\n")
+                    self.source.jobs.insert(0, self.source.jobs[-3].copy())
                     self.assert_cli_refused()
-                    with patch.object(UPDATER, "MAX_PAGES", 1):
+
+    def test_nonpublishable_runs_cannot_hide_incomplete_or_excessive_pagination(self):
+        for filtered, current in ((True, NEW), (True, OLD), (False, OLD)):
+            self.setUp()
+            if filtered:
+                self.filtered()
+            self.source.main = current
+            original = self.source.request
+            for total in (4, 6):
+                with self.subTest(total=total, filtered=filtered, current=current):
+
+                    def request(repo, path, total=total, original=original, **kwargs):
+                        result = original(repo, path, **kwargs)
+                        if "/jobs?" in path:
+                            result["total_count"] = total
+                        return result
+
+                    with patch.object(self.source, "request", side_effect=request):
                         self.assert_cli_refused()
+                        with patch.object(UPDATER, "MAX_PAGES", 1):
+                            self.assert_cli_refused()
 
     def test_workflow_gates_both_privileged_steps_on_positive_eligibility(self):
         workflow = (

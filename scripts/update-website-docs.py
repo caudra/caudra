@@ -32,6 +32,10 @@ class PathFilteredRun(Refusal):
     pass
 
 
+class SupersededRun(Refusal):
+    pass
+
+
 def require(condition, message):
     if not condition:
         raise Refusal(message)
@@ -143,9 +147,8 @@ def verified_source(source, run_id):
         "Run must be a successful canonical Rust push/main run",
     )
     revision = sha(run["head_sha"])
-    require(
-        head(source, SOURCE) == revision, "Verified source is no longer current main"
-    )
+    current = head(source, SOURCE)
+    require(current is not None, "Current source main is unavailable")
     attempt = run["run_attempt"]
     require(type(attempt) is int and attempt > 0, "Invalid workflow attempt")
     jobs = []
@@ -192,6 +195,8 @@ def verified_source(source, run_id):
                 len(steps) == 1 and successful(steps[0]),
                 "Documentation drift check did not pass",
             )
+    if current != revision:
+        raise SupersededRun("Verified source is no longer current main")
     return revision
 
 
@@ -497,7 +502,7 @@ def main():
     parser.add_argument(
         "--verify-only",
         action="store_true",
-        help="Validate source using SOURCE_TOKEN only; path-filtered workflow_run is a no-op",
+        help="Validate source using SOURCE_TOKEN only; path-filtered or superseded workflow_run is a no-op",
     )
     parser.add_argument(
         "--app-slug", help="GitHub App slug from actions/create-github-app-token"
@@ -508,11 +513,11 @@ def main():
         if args.verify_only:
             try:
                 revision = verified_source(source, args.run_id)
-            except PathFilteredRun as error:
+            except (PathFilteredRun, SupersededRun) as error:
                 if os.environ.get("GITHUB_EVENT_NAME") != "workflow_run":
                     raise
                 eligible = "false"
-                print(f"No-op: {error}; website publishing requires full verification")
+                print(f"No-op: {error}; source is not eligible for website publishing")
             else:
                 eligible = "true"
                 print(f"Verified source: {revision}")
