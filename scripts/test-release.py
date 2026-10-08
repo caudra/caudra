@@ -908,6 +908,68 @@ class ReleaseWorkflowTests(unittest.TestCase):
                     for invocation in re.finditer(r"\bpython3\s", body):
                         self.assertLess(body.index(setup), invocation.start())
 
+    def test_native_installer_gates_provision_shells_and_reject_skipped_coverage(self):
+        provision = "name: Provision macOS installer shells"
+        suite = "name: Test native platform installer without skipped coverage"
+        provisioning = textwrap.dedent("""\
+            if ! command -v fish >/dev/null 2>&1; then
+              brew install fish
+            fi
+            for shell in sh bash zsh fish; do
+              command -v "$shell"
+            done
+        """)
+        guards = textwrap.dedent("""\
+            grep -Eq '^Ran [1-9][0-9]* tests? in ' "$RUNNER_TEMP/installer-tests.log"
+            ! grep -q 'skipped=' "$RUNNER_TEMP/installer-tests.log"
+        """)
+        for workflow, job in (("rust", "macos"), ("release", "build-other")):
+            with self.subTest(workflow=workflow):
+                _, jobs = self.workflow(workflow)
+                body = jobs[job]
+                steps = re.split(r"(?m)^      - ", body)
+                provision_step = next(
+                    step for step in steps if step.startswith(provision)
+                )
+                suite_step = next(step for step in steps if step.startswith(suite))
+                for step in (provision_step, suite_step):
+                    self.assertIn("shell: bash\n", step)
+                provision_header, provision_run = provision_step.split(
+                    "        run: |\n"
+                )
+                suite_header, suite_run = suite_step.split("        run: |\n")
+                self.assertEqual(
+                    textwrap.dedent(provision_run).strip(), provisioning.strip()
+                )
+                self.assertNotIn("if:", suite_header)
+                self.assertNotIn("continue-on-error:", body)
+                if workflow == "release":
+                    self.assertIn("if: runner.os == 'macOS'\n", provision_header)
+                    selection = textwrap.dedent("""\
+                        suite=InstallTests
+                        if [[ "${{ runner.os }}" == "Windows" ]]; then
+                          python3 -c 'import shutil, sys; sys.exit(0 if shutil.which("pwsh") else "Native PowerShell is required")'
+                          suite=PowerShellTests
+                        fi
+                    """)
+                    argument = '"$suite"'
+                else:
+                    self.assertNotIn("if:", provision_header)
+                    self.assertIn('- "scripts/test-install.py"', jobs["changes"])
+                    selection = ""
+                    argument = "InstallTests"
+                self.assertEqual(
+                    textwrap.dedent(suite_run).strip(),
+                    selection
+                    + f"python3 scripts/test-install.py {argument} 2>&1 "
+                    + '| tee "$RUNNER_TEMP/installer-tests.log"\n'
+                    + guards.strip(),
+                )
+                self.assertLess(body.index(provision), body.index(suite))
+                self.assertLess(
+                    body.index(suite), body.index("uses: ./.github/actions/code-worker")
+                )
+
     def test_release_requires_reusable_rust_nix_and_python_before_drafting(self):
         header, jobs = self.workflow("release")
         for name in ("rust", "nix"):

@@ -63,6 +63,7 @@ jobs:
               - "scripts/test-build-code-worker.py"
               - "scripts/ci-runners.py"
               - "scripts/test-ci-runners.py"
+              - "scripts/test-install.py"
               - "scripts/test-release.py"
               - "docs/content/**"
               - "docs/navigation.json"
@@ -221,6 +222,21 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
+      - name: Provision macOS installer shells
+        shell: bash
+        run: |
+          if ! command -v fish >/dev/null 2>&1; then
+            brew install fish
+          fi
+          for shell in sh bash zsh fish; do
+            command -v "$shell"
+          done
+      - name: Test native platform installer without skipped coverage
+        shell: bash
+        run: |
+          python3 scripts/test-install.py InstallTests 2>&1 | tee "$RUNNER_TEMP/installer-tests.log"
+          grep -Eq '^Ran [1-9][0-9]* tests? in ' "$RUNNER_TEMP/installer-tests.log"
+          ! grep -q 'skipped=' "$RUNNER_TEMP/installer-tests.log"
       - uses: Swatinem/rust-cache@v2
       - uses: ./.github/actions/code-worker
       - run: make check ARGS=--locked

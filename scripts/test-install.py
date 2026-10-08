@@ -659,30 +659,41 @@ class InstallTests(ReleaseCases):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("# user configuration\n")
         before = {path: path.read_bytes() for path in home.rglob("*") if path.is_file()}
-        for shell in ("zsh", "bash", "fish", "sh", "unknown", ""):
+        for shell in ("zsh", "bash", "fish", "sh", "unknown", "", None):
             with self.subTest(shell=shell):
-                if shell:
-                    self.env["SHELL"] = f"/bin/{shell}"
-                else:
+                if shell is None:
                     self.env.pop("SHELL", None)
+                    probe = subprocess.run(
+                        ["sh", "-c", 'printf "%s" "${SHELL-}"'],
+                        cwd=self.root,
+                        env=self.env,
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                        check=True,
+                    )
+                    expected_shell = probe.stdout.rsplit("/", 1)[-1]
+                else:
+                    self.env["SHELL"] = f"/bin/{shell}" if shell else ""
+                    expected_shell = shell
                 result = self.install()
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn(RUN_NOW, result.stdout)
                 self.assertIn(CHILD_PATH_NOTICE, result.stdout)
                 self.assertIn(NO_SHELL_EDITS, result.stdout)
                 self.assertNotIn(ROOT_WARNING, result.stderr)
-                if shell == "fish":
+                if expected_shell == "fish":
                     self.assertIn("set -gx PATH ", result.stdout)
                     self.assertIn("fish_add_path --prepend -- ", result.stdout)
                     self.assertNotIn("export PATH=", result.stdout)
                 else:
                     self.assertIn("export PATH=", result.stdout)
-                    if shell == "zsh":
+                    if expected_shell == "zsh":
                         self.assertIn(
                             shlex.quote(str(zdotdir / ".zshrc")), result.stdout
                         )
                         self.assertNotIn(str(home / ".zshrc"), result.stdout)
-                    elif shell == "bash":
+                    elif expected_shell == "bash":
                         self.assertIn(str(home / ".bashrc"), result.stdout)
                         self.assertIn("~/.bash_profile", result.stdout)
                     else:

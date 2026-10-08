@@ -280,6 +280,17 @@ jobs:
       - name: Install Rust toolchain
         run: rustup toolchain install 1.99.0 --profile minimal --target ${{ matrix.target }}
 
+      - name: Provision macOS installer shells
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          if ! command -v fish >/dev/null 2>&1; then
+            brew install fish
+          fi
+          for shell in sh bash zsh fish; do
+            command -v "$shell"
+          done
+
       - name: Test native platform installer without skipped coverage
         shell: bash
         run: |
