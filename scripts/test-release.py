@@ -495,6 +495,51 @@ class ReleaseWorkflowTests(unittest.TestCase):
         sections = re.split(r"(?m)^  ([a-z][a-z0-9-]*):\n", jobs)[1:]
         return header, dict(zip(sections[::2], sections[1::2], strict=True))
 
+    def test_heavy_jobs_use_sized_runners_without_moving_control_jobs(self):
+        accelerated = {
+            "rust": {
+                "lint": "blacksmith-8vcpu-ubuntu-2404",
+                "test": "blacksmith-16vcpu-ubuntu-2404",
+                "workcell-native": "blacksmith-8vcpu-ubuntu-2404",
+                "build": "blacksmith-16vcpu-ubuntu-2404",
+                "macos": "blacksmith-6vcpu-macos-15",
+                "windows": "blacksmith-16vcpu-windows-2025",
+            },
+            "nix": {"build": "blacksmith-8vcpu-ubuntu-2404"},
+        }
+        for workflow, runners in accelerated.items():
+            _, jobs = self.workflow(workflow)
+            for job, body in jobs.items():
+                with self.subTest(workflow=workflow, job=job):
+                    self.assertEqual(
+                        re.findall(r"(?m)^    runs-on: (\S+)$", body),
+                        [runners.get(job, "ubuntu-24.04")],
+                    )
+        _, jobs = self.workflow("release")
+        targets = {}
+        for job, body in jobs.items():
+            if job in ("build-linux", "build-other"):
+                self.assertIn("runs-on: ${{ matrix.runner }}", body)
+                entries = re.findall(r"- target: (\S+)\n\s+runner: (\S+)", body)
+                for target, runner in entries:
+                    self.assertNotIn(target, targets)
+                    targets[target] = runner
+            elif "runs-on:" in body:
+                self.assertEqual(
+                    re.findall(r"(?m)^    runs-on: (\S+)$", body),
+                    ["ubuntu-24.04"],
+                )
+        self.assertEqual(
+            targets,
+            {
+                "x86_64-unknown-linux-musl": "blacksmith-16vcpu-ubuntu-2404",
+                "aarch64-unknown-linux-musl": "blacksmith-16vcpu-ubuntu-2404-arm",
+                "x86_64-apple-darwin": "macos-15-intel",
+                "aarch64-apple-darwin": "blacksmith-6vcpu-macos-15",
+                "x86_64-pc-windows-msvc": "blacksmith-16vcpu-windows-2025",
+            },
+        )
+
     def test_release_requires_reusable_rust_nix_and_python_before_drafting(self):
         header, jobs = self.workflow("release")
         for name in ("rust", "nix"):
