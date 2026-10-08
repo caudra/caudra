@@ -342,6 +342,7 @@ def tree_edges(tree, packages):
 
 def rust_environment(repository):
     environment = os.environ.copy()
+    environment["CARGO_TERM_COLOR"] = "never"
     channel = tomllib.loads(regular_file(repository / "rust-toolchain.toml").decode())[
         "toolchain"
     ]["channel"]

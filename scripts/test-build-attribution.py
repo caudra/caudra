@@ -80,18 +80,28 @@ class AttributionTests(unittest.TestCase):
             "resolve": {"nodes": [{"id": "worker", "deps": []}]},
             "workspace_root": str(self.root),
         }
-        with patch.object(
-            attribution.subprocess,
-            "check_output",
-            side_effect=[
-                json.dumps(metadata),
-                "0monty-runtime v1.0.0 (" + str(self.root) + ")\n",
-                "monty-runtime v1.0.0 (" + str(self.root) + ")\n",
-            ],
-        ) as run:
+        inherited = {
+            "CARGO_TERM_COLOR": "always",
+            "RUSTFLAGS": "--cfg attribution_fixture",
+            "CARGO_PROFILE_RELEASE_STRIP": "none",
+        }
+        with (
+            patch.dict(os.environ, inherited),
+            patch.object(
+                attribution.subprocess,
+                "check_output",
+                side_effect=[
+                    json.dumps(metadata),
+                    "0monty-runtime v1.0.0 (" + str(self.root) + ")\n",
+                    "monty-runtime v1.0.0 (" + str(self.root) + ")\n",
+                ],
+            ) as run,
+        ):
             attribution.load_graph(
                 manifest, "monty-runtime", "aarch64-apple-darwin", True
             )
+            for key, value in inherited.items():
+                self.assertEqual(os.environ[key], value)
         commands = [c.args[0] for c in run.call_args_list]
         for command in commands:
             self.assertIn("--locked", command)
@@ -105,6 +115,8 @@ class AttributionTests(unittest.TestCase):
             [call.kwargs["cwd"] for call in run.call_args_list], [manifest.parent] * 3
         )
         for call in run.call_args_list:
+            for key, value in (inherited | {"CARGO_TERM_COLOR": "never"}).items():
+                self.assertEqual(call.kwargs["env"][key], value)
             self.assertEqual(
                 call.kwargs["env"]["RUSTUP_TOOLCHAIN"],
                 os.environ.get("RUSTUP_TOOLCHAIN", RUNTIME_VERSION),
@@ -737,6 +749,8 @@ class AttributionTests(unittest.TestCase):
             "other",
             "macro-host",
             "host-helper",
+            "shared",
+            "leaf",
         )
         (self.root / "Cargo.toml").write_text(
             '[workspace]\nresolver = "2"\nmembers = ' + json.dumps(names) + "\n"
@@ -751,6 +765,7 @@ class AttributionTests(unittest.TestCase):
         with (self.root / "app/Cargo.toml").open("a") as file:
             file.write("""[dependencies]
 normal = { path = "../normal" }
+shared = { path = "../shared" }
 macro-host = { path = "../macro-host" }
 [build-dependencies]
 builder = { path = "../builder" }
@@ -762,6 +777,7 @@ windows = { path = "../windows" }
 """)
         with (self.root / "normal/Cargo.toml").open("a") as file:
             file.write("""[dependencies]
+shared = { path = "../shared" }
 optional = { path = "../optional", optional = true }
 [features]
 extra = ["dep:optional"]
@@ -774,6 +790,8 @@ extra = ["dep:optional"]
             file.write(
                 '[lib]\nproc-macro = true\n[dependencies]\nhost-helper = { path = "../host-helper" }\n'
             )
+        with (self.root / "shared/Cargo.toml").open("a") as file:
+            file.write('[dependencies]\nleaf = { path = "../leaf" }\n')
         manifest = self.root / "Cargo.toml"
         subprocess.run(
             [
@@ -786,12 +804,33 @@ extra = ["dep:optional"]
             check=True,
             capture_output=True,
         )
+        outputs = []
+        check_output = subprocess.check_output
+
+        def query(*args, **kwargs):
+            output = check_output(*args, **kwargs)
+            outputs.append(output)
+            return output
+
         for target, expected in (
             ("x86_64-unknown-linux-gnu", {"app", "normal", "builder"}),
+            ("aarch64-apple-darwin", {"app", "normal", "builder"}),
             ("x86_64-pc-windows-msvc", {"app", "normal", "builder", "windows"}),
         ):
-            with self.subTest(target=target):
-                graph = attribution.load_graph(manifest, "app", target)
+            with (
+                self.subTest(target=target),
+                patch.dict(os.environ, {"CARGO_TERM_COLOR": "always"}),
+            ):
+                outputs.clear()
+                with patch.object(
+                    attribution.subprocess, "check_output", side_effect=query
+                ):
+                    graph = attribution.load_graph(manifest, "app", target)
+                self.assertEqual(len(outputs), 3)
+                for tree in outputs[1:]:
+                    self.assertIn(" (*)", tree)
+                    self.assertNotIn("\x1b", tree)
+                expected |= {"shared", "leaf"}
                 self.assertEqual(
                     {p["name"] for p in graph["selected"]},
                     expected | {"macro-host", "host-helper"},
