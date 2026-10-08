@@ -550,6 +550,95 @@ class AttributionTests(unittest.TestCase):
             )
         self.assertEqual((bundles[0] / "NOTICE").read_text(), "Root attribution")
 
+    @unittest.skipUnless(
+        shutil.which("git"), "Git needed for checkout integration fixture"
+    )
+    def test_autocrlf_checkout_preserves_pinned_license_bytes(self):
+        repository = Path(__file__).resolve().parent.parent
+        checkout = self.root / "checkout"
+        checkout.mkdir()
+        shutil.copyfile(repository / ".gitattributes", checkout / ".gitattributes")
+        shutil.copytree(
+            repository / "THIRD_PARTY_LICENSES", checkout / "THIRD_PARTY_LICENSES"
+        )
+        canonical_crlf = checkout / "THIRD_PARTY_LICENSES" / "canonical-crlf.txt"
+        canonical_crlf.write_bytes(MIT.replace("\n", "\r\n").encode())
+        control = checkout / "control.txt"
+        control.write_bytes(MIT.encode())
+        git = [
+            "git",
+            "-c",
+            "core.autocrlf=true",
+            "-c",
+            "core.safecrlf=false",
+            "-c",
+            f"core.attributesFile={os.devnull}",
+        ]
+        env = {
+            **os.environ,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+        }
+        for args in (["init", "--quiet"], ["add", "."]):
+            subprocess.run(
+                git + args, cwd=checkout, env=env, check=True, capture_output=True
+            )
+        shutil.rmtree(checkout / "THIRD_PARTY_LICENSES")
+        control.unlink()
+        subprocess.run(
+            git + ["checkout-index", "--all", "--force"],
+            cwd=checkout,
+            env=env,
+            check=True,
+            capture_output=True,
+        )
+        self.assertEqual(control.read_bytes(), MIT.replace("\n", "\r\n").encode())
+        self.assertEqual(
+            canonical_crlf.read_bytes(), MIT.replace("\n", "\r\n").encode()
+        )
+        policy = attribution.load_policy(checkout)
+        entries = [
+            entry
+            for package in policy["packages"].values()
+            for entry in package.get("files", [])
+        ]
+        entries += [
+            notice
+            for source in policy["git_sources"].values()
+            for notice in source["notices"]
+            if "path" in notice
+        ]
+        self.assertTrue(entries)
+        for entry in entries:
+            with self.subTest(path=entry["path"]):
+                data = attribution.regular_file(
+                    attribution.confined_file(checkout, entry["path"])
+                )
+                self.assertEqual(attribution.digest(data), entry["sha256"])
+
+    def test_supplement_rejects_changed_line_endings(self):
+        package = self.package()
+        license_path = self.root / "supplement.txt"
+        license_path.write_bytes(MIT.encode())
+        policy = {
+            "packages": {
+                "dependency@1.0.0": {
+                    "files": [
+                        {
+                            "path": "supplement.txt",
+                            "sha256": attribution.digest(MIT.encode()),
+                        }
+                    ]
+                }
+            }
+        }
+        self.assertEqual(
+            attribution.package_licenses(package, self.root, policy)[2], ["MIT"]
+        )
+        license_path.write_bytes(MIT.replace("\n", "\r\n").encode())
+        with self.assertRaisesRegex(attribution.AttributionError, "hash mismatch"):
+            attribution.package_licenses(package, self.root, policy)
+
     def test_supplement_requires_matching_hash(self):
         package = self.package()
         license_path = self.root / "supplement.txt"

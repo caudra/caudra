@@ -4,3 +4,4 @@
 docs/content/** text eol=lf
 docs/navigation.json text eol=lf
 docs/examples/** text eol=lf
+THIRD_PARTY_LICENSES/** -text
