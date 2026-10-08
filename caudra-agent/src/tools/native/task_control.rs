@@ -121,6 +121,7 @@ impl ToolInvocation for ControlCall {
     }
     fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
         Box::pin(async move {
+            let mut model_output = None;
             let result = async {
                 if self.action == "background"
                     && (effective_task_execution(&ctx.config, ctx.background.is_some())
@@ -160,9 +161,10 @@ impl ToolInvocation for ControlCall {
                             cards.push(card);
                         }
                     }
-                    return Ok(ToolOutput::Plain(
-                        json!({"tasks":cards.iter().map(TaskCard::model_value).collect::<Vec<_>>(), "next":page.next}).to_string().into(),
-                    ));
+                    model_output = Some(
+                        json!({"tasks":cards.iter().map(TaskCard::model_value).collect::<Vec<_>>(), "next":page.next}).to_string(),
+                    );
+                    return Ok(ToolOutput::Tasks(cards));
                 }
                 let id = self.task_id.as_deref().unwrap_or_default();
                 if self.action != "background"
@@ -197,7 +199,7 @@ impl ToolInvocation for ControlCall {
             }
             .await;
             match result {
-                Ok(output) => ToolExecResult::from(Ok(output)),
+                Ok(output) => ToolExecResult::from(Ok(output)).with_model_output(model_output),
                 Err(error) => ToolExecResult::failed(error.failure, error.message),
             }
         })

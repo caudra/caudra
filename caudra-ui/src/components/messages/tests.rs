@@ -55,6 +55,10 @@ const NEXT_TASK_CALL: &str = "continued-launch";
 const NEXT_INVOCATION: &str = "next-private-invocation";
 const FOREGROUND_RESULT: &str = "The foreground investigation found the answer.";
 const CONTROL_RESULT: &str = "second-task-result";
+const CONTROL_TASK_COUNT: &str = "3 tasks";
+const CONTROL_HISTORY_CURSOR: &str = "history-pagination-invocation";
+const CONTROL_WRAPPED_LABEL: &str =
+    "Inspect 界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界";
 const READABLE_RESULT: &str = "readable first line\nreadable second line";
 const OUTCOME_PREVIEW: &str =
     r#"{"error":null,"output":"readable first line\nreadable second line"#;
@@ -677,23 +681,33 @@ fn task_control_list_rows_keep_distinct_chat_targets(restored: bool, depth: usiz
         if depth > 0 {
             BATCH_TOOL_NAME
         } else {
-            "task_control"
+            TASK_CONTROL_TOOL
         },
     )]);
     panel.set_view(ViewMode::Expanded);
     let first = live_task_card(TOOL_ID, LIVE_STATE);
     let mut second = live_task_card(NEXT_TASK_CALL, FAILED_STATE);
     second.task_id = NEXT_TASK_CALL.into();
-    second.label = "Inspect 界界界界界界界界界界界界界界界界界界界界界界".into();
+    second.label = CONTROL_WRAPPED_LABEL.into();
     second.result = Some(serde_json::json!(CONTROL_RESULT));
-    let mut output = ToolOutput::Tasks(vec![first, second]);
+    let mut shell = shell_job(JOB_ID);
+    shell.state = COMPLETED_STATE.into();
+    shell.result = Some(serde_json::json!(TASK_SUCCESS));
+    let cards = vec![first, second, shell];
+    let model_output = serde_json::json!({
+        "tasks": cards.iter().map(TaskCard::model_value).collect::<Vec<_>>(),
+        "next": {"sequence": 1, "invocation_id": CONTROL_HISTORY_CURSOR}
+    })
+    .to_string();
+    let mut output = ToolOutput::Tasks(cards);
     for level in 0..depth {
         output = ToolOutput::Batch {
             entries: vec![BatchToolEntry {
+                annotation: output.annotation(),
                 output: Some(output),
                 status: BatchToolStatus::Success,
                 ..running_child(if level == 0 {
-                    "task_control"
+                    TASK_CONTROL_TOOL
                 } else {
                     BATCH_TOOL_NAME
                 })
@@ -708,6 +722,7 @@ fn task_control_list_rows_keep_distinct_chat_targets(restored: bool, depth: usiz
     };
     panel.tool_done(ToolDoneEvent {
         output,
+        model_output: Some(model_output),
         ..done(TOOL_ID)
     });
     if restored {
@@ -717,6 +732,7 @@ fn task_control_list_rows_keep_distinct_chat_targets(restored: bool, depth: usiz
         panel.toggle_batch_child(TOOL_ID, 0);
     }
     let shown = visible_text(&render(&mut panel, width, 60));
+    assert!(shown.contains(CONTROL_TASK_COUNT), "{shown}");
     for id in [LIVE_TASK_ID, NEXT_TASK_CALL] {
         let row = screen_row_of(&shown, id).unwrap() as u16;
         assert_eq!(
@@ -733,22 +749,63 @@ fn task_control_list_rows_keep_distinct_chat_targets(restored: bool, depth: usiz
             .as_deref(),
         Some(NEXT_TASK_CALL)
     );
+    let wrapped_rows: Vec<_> = shown
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.contains('界'))
+        .map(|(row, _)| row as u16)
+        .collect();
+    assert_eq!(wrapped_rows.len() > 1, width == 60, "{shown}");
+    for row in wrapped_rows {
+        assert_eq!(
+            panel
+                .task_hit_at(row, Rect::new(0, 0, width, 60))
+                .as_deref(),
+            Some(NEXT_TASK_CALL)
+        );
+    }
+    let compact: String = shown
+        .chars()
+        .filter(|ch| !ch.is_whitespace() && *ch != '┃')
+        .collect();
+    let command: String = JOB_COMMAND
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    assert_eq!(compact.matches(&command).count(), 1, "{shown}");
+    for marker in [JOB_ID, COMMAND_LABEL, TASK_SUCCESS] {
+        let row = screen_row_of(&shown, marker).unwrap() as u16;
+        assert_eq!(panel.task_hit_at(row, Rect::new(0, 0, width, 60)), None);
+    }
+    assert!(shown.contains(COMPLETED_STATE), "{shown}");
     assert!(shown.contains(FAILED_STATE), "{shown}");
     assert!(shown.contains(LIVE_STATE), "{shown}");
     assert!(!shown.contains(METADATA_SENTINEL));
+    assert!(!shown.contains(CONTROL_HISTORY_CURSOR), "{shown}");
+    assert!(!shown.contains("\"tasks\""), "{shown}");
+    assert!(!shown.contains("\"next\""), "{shown}");
 }
 
 #[test]
 fn task_control_live_overlay_keeps_other_tasks_and_recorded_results() {
-    let mut panel = panel_with_tools(&[(TOOL_ID, "task_control")]);
+    let mut panel = panel_with_tools(&[(TOOL_ID, TASK_CONTROL_TOOL)]);
     panel.set_view(ViewMode::Expanded);
     let first = live_task_card(NEXT_TASK_CALL, LIVE_STATE);
     let mut second = live_task_card("another-call", COMPLETED_STATE);
     second.task_id = "another-task".into();
     second.invocation_id = NEXT_INVOCATION.into();
     second.result = Some(serde_json::json!(CONTROL_RESULT));
+    let mut shell = shell_job(JOB_ID);
+    shell.state = COMPLETED_STATE.into();
+    let cards = vec![first, second, shell];
+    let model_output = serde_json::json!({
+        "tasks": cards.iter().map(TaskCard::model_value).collect::<Vec<_>>(),
+        "next": {"sequence": 1, "invocation_id": CONTROL_HISTORY_CURSOR}
+    })
+    .to_string();
     panel.tool_done(ToolDoneEvent {
-        output: ToolOutput::Tasks(vec![first, second]),
+        output: ToolOutput::Tasks(cards),
+        model_output: Some(model_output),
         ..done(TOOL_ID)
     });
     let before = visible_text(&render(&mut panel, 127, 40));
@@ -758,6 +815,10 @@ fn task_control_live_overlay_keeps_other_tasks_and_recorded_results() {
     assert!(after.contains(BLOCKED_STATE), "{after}");
     assert!(!after.contains(LIVE_STATE), "{after}");
     assert!(after.contains(CONTROL_RESULT), "{after}");
+    assert!(after.contains(CONTROL_TASK_COUNT), "{after}");
+    assert!(after.contains(JOB_ID), "{after}");
+    assert_eq!(after.matches(JOB_COMMAND).count(), 1, "{after}");
+    assert!(!after.contains(CONTROL_HISTORY_CURSOR), "{after}");
 }
 
 #[test_case(false; "background_continuation")]

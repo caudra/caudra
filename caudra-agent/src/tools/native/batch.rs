@@ -661,6 +661,7 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::slice::from_ref;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use test_case::test_case;
 
@@ -677,6 +678,8 @@ mod tests {
     const NEVER_STARTED: &str = "the stream must have started the child before the batch runs";
     const MODEL_RECEIPT: &str = "Saved without echoing the displayed document.";
     const PAGES_KEY: &str = "pages";
+    const TASK_CONTROL: &str = "task_control";
+    const HISTORY_INVOCATION: &str = "archived-task-invocation";
 
     struct ReceiptTool(bool);
 
@@ -1585,6 +1588,46 @@ mod tests {
     const MODEL_SUFFIX: &str = "<task_metadata>\ntask_id: task-1\n</task_metadata>";
     const EXPECT_MODEL_ONLY: &str = "guidance a child addressed to the model belongs in the answer the model reads, never in \
          the annotation the card draws beside the child's header";
+
+    #[test]
+    fn task_control_history_retains_model_pagination_and_typed_batch_snapshot() {
+        let card = serde_json::from_value(json!({
+            "task_id": READ, "invocation_id": HISTORY_INVOCATION,
+            "call_id": READ, "root_call_id": READ,
+            "label": BODY, "state": "succeeded", "background": true, "mode": "build",
+            "generation": 1, "created_at": 1, "updated_at": 1
+        }))
+        .unwrap();
+        let output = ToolOutput::Tasks(vec![card]);
+        let model = json!({
+            "tasks": serde_json::from_str::<Value>(&output.as_text()).unwrap(),
+            "next": {"sequence": 1, "invocation_id": HISTORY_INVOCATION}
+        })
+        .to_string();
+        let mut done = ToolDoneEvent::error(READ.into(), BODY);
+        done.is_error = false;
+        done.output = output;
+        done.model_output = Some(model.clone());
+        let mut row = entry(TASK_CONTROL, BatchToolStatus::Pending, BODY);
+        settle_entry(&mut row, &done);
+        let text = render_llm(from_ref(&row), &[done.model_output]);
+        let batch = ToolOutput::Batch {
+            entries: vec![row],
+            text,
+        };
+        let restored: ToolOutput =
+            serde_json::from_value(serde_json::to_value(batch).unwrap()).unwrap();
+        assert!(restored.as_text().contains(&model));
+        let ToolOutput::Batch { entries, .. } = restored else {
+            panic!("expected batch")
+        };
+        let Some(ToolOutput::Tasks(cards)) = &entries[0].output else {
+            panic!("expected task cards")
+        };
+        assert_eq!(cards[0].invocation_id, HISTORY_INVOCATION);
+        assert_eq!(cards[0].call_id, READ);
+        assert!(!cards[0].display_text().contains(HISTORY_INVOCATION));
+    }
 
     #[test]
     fn typed_task_receipt_retains_model_suffix_in_batch_and_snapshot() {

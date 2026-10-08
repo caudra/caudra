@@ -2114,7 +2114,7 @@ mod tests {
     use crate::{
         AgentEvent, AgentMode, BackgroundReminderContext, CancelToken, Envelope, EventSender,
         History, StoredSession, SubagentHistoryError, SubagentHistoryStore, SubagentTaskMode,
-        SubagentTaskSpec, TaskProvenance,
+        SubagentTaskSpec, TaskProvenance, ToolOutput,
         agent::{
             compact_with_session,
             subagent::TaskIdentity,
@@ -2895,6 +2895,7 @@ mod tests {
                 .execute(&fixture.ctx)
                 .await;
             assert!(!result.is_error);
+            assert!(result.model_output.is_none());
             let output = result.output.unwrap();
             let crate::ToolOutput::Tasks(cards) = &output else {
                 panic!("expected task cards")
@@ -2907,6 +2908,143 @@ mod tests {
             }
             assert!(machine[0].get("invocation_id").is_none());
             assert!(!output.as_display_text().contains(INVOCATION));
+        });
+    }
+
+    #[test_case(false, 1; "unscoped_paginated")]
+    #[test_case(false, 2; "unscoped_complete")]
+    #[test_case(true, 1; "owned_paginated")]
+    #[test_case(true, 2; "owned_complete")]
+    fn task_control_history_keeps_cards_and_model_pagination(scoped: bool, limit: usize) {
+        smol::block_on(async {
+            let mut fixture = Fixture::new().await;
+            let owner = if scoped {
+                JobOwner::Child {
+                    invocation_id: EVENT.into(),
+                }
+            } else {
+                JobOwner::Main
+            };
+            let reference = ToolOutputStore::new(fixture.dir.clone())
+                .put(fixture.session.id, RESULT)
+                .unwrap();
+            for (sequence, task, invocation, call) in [
+                (1, TASK, INVOCATION, TASK),
+                (2, SECOND_TASK, NEXT_INVOCATION, NEXT_CALL),
+            ] {
+                let mut record = projection_record();
+                record.sequence = sequence;
+                record.task_id = task.into();
+                record.invocation_id = invocation.into();
+                record.request = json!({"call_id": call, "label": PROMPT});
+                record.owner = owner.clone();
+                record.generation = fixture.tasks.generation();
+                record.state = SUCCEEDED.into();
+                record.receipt_accepted = true;
+                record.output_ref = Some(reference.clone());
+                record.outcome = Some(json!({"output": RESULT}));
+                fixture.tasks.persist(record).await.unwrap();
+            }
+            if scoped {
+                let mut foreign = projection_record();
+                foreign.task_id = MISSING_VERSION.into();
+                foreign.invocation_id = MISSING_VERSION.into();
+                foreign.sequence = 3;
+                foreign.state = SUCCEEDED.into();
+                foreign.receipt_accepted = true;
+                foreign.outcome = Some(json!({"output": RESULT}));
+                fixture.tasks.persist(foreign).await.unwrap();
+            }
+            let gate = fixture.tasks.0.gate.lock_arc().await;
+            drop(fixture.tasks.archive_settled(gate).await.unwrap());
+            fixture
+                .tasks
+                .lock()
+                .recent
+                .retain(|record| record.invocation_id == NEXT_INVOCATION);
+            let mut resident = projection_record();
+            resident.task_id = REWOUND_CALL.into();
+            resident.invocation_id = REWOUND_CALL.into();
+            resident.owner = owner.clone();
+            resident.generation = fixture.tasks.generation();
+            fixture.tasks.persist(resident).await.unwrap();
+            fixture.ctx.background = Some(fixture.tasks.clone());
+            if scoped {
+                fixture.ctx.jobs = Some(fixture.tasks.child_scope(EVENT));
+            }
+            let result = TaskControl
+                .parse(&json!({"action": "list", "limit": limit}))
+                .unwrap()
+                .execute(&fixture.ctx)
+                .await;
+            assert!(!result.is_error);
+            let ToolOutput::Tasks(cards) = result.output.unwrap() else {
+                panic!("expected task cards")
+            };
+            assert_eq!(cards.len(), limit + 1);
+            assert_eq!(cards[0].task_id, REWOUND_CALL);
+            assert_eq!(cards[1].invocation_id, NEXT_INVOCATION);
+            assert_eq!(cards[1].call_id, NEXT_CALL);
+            assert!(cards.iter().all(|card| card.owner == owner));
+            let model: Value = serde_json::from_str(&result.model_output.unwrap()).unwrap();
+            assert_eq!(model["tasks"][1]["task_id"], SECOND_TASK);
+            assert_eq!(model["tasks"][1]["output_ref"], json!(reference));
+            assert_eq!(
+                model["tasks"][1]["read_output"],
+                json!({"tool": "tool_output", "output_id": reference.id, "offset": 1})
+            );
+            for task in model["tasks"].as_array().unwrap() {
+                assert!(task.get("invocation_id").is_none());
+                assert!(task.get("call_id").is_none());
+            }
+            if limit == 1 {
+                assert_eq!(
+                    model["next"],
+                    json!({"sequence": 2, "invocation_id": NEXT_INVOCATION})
+                );
+                let next = TaskControl
+                    .parse(&json!({"action": "list", "before": model["next"], "limit": limit}))
+                    .unwrap()
+                    .execute(&fixture.ctx)
+                    .await;
+                let ToolOutput::Tasks(cards) = next.output.unwrap() else {
+                    panic!("expected task cards")
+                };
+                assert_eq!(cards.len(), 1);
+                assert_eq!(cards[0].invocation_id, INVOCATION);
+                assert_eq!(cards[0].call_id, TASK);
+                let model: Value = serde_json::from_str(&next.model_output.unwrap()).unwrap();
+                assert_eq!(model["tasks"][0]["task_id"], TASK);
+                assert!(model["next"].is_null());
+            } else {
+                assert_eq!(cards[2].invocation_id, INVOCATION);
+                assert!(model["next"].is_null());
+            }
+        });
+    }
+
+    #[test_case(false; "unscoped")]
+    #[test_case(true; "owned")]
+    fn task_control_empty_list_keeps_typed_array(scoped: bool) {
+        smol::block_on(async {
+            let mut fixture = Fixture::new().await;
+            fixture.ctx.background = Some(fixture.tasks.clone());
+            if scoped {
+                fixture.ctx.jobs = Some(fixture.tasks.main_scope());
+            }
+            let result = TaskControl
+                .parse(&json!({"action": "list"}))
+                .unwrap()
+                .execute(&fixture.ctx)
+                .await;
+            assert!(!result.is_error);
+            assert!(result.model_output.is_none());
+            let output = result.output.unwrap();
+            assert!(matches!(&output, ToolOutput::Tasks(cards) if cards.is_empty()));
+            assert_eq!(
+                serde_json::from_str::<Value>(&output.as_text()).unwrap(),
+                json!([])
+            );
         });
     }
 
