@@ -766,8 +766,11 @@ mod tests {
             task_runner::{ModelResolver, SubagentTaskRunner, TaskRunner, WorkflowHostContext},
         },
         background::{
-            ADMISSION_CANCELLED, MAX_BATCH_BYTES, MAX_RESULT_BYTES, MAX_SHELL_COMMAND_BYTES,
-            tests::hold_writer,
+            ADMISSION_CANCELLED, MAX_BATCH_BYTES, MAX_HISTORY_PAGE, MAX_INVOCATIONS,
+            MAX_RESULT_BYTES, MAX_SHELL_COMMAND_BYTES,
+            tests::{
+                ARCHIVE_LIFECYCLE_COUNT, assert_archive_count, hold_writer, seed_archived_tasks,
+            },
         },
         background_reminder::render,
         cancel::{CancelMap, CancelToken},
@@ -909,14 +912,15 @@ mod tests {
         });
     }
 
-    #[test]
-    fn archived_shell_retry_keeps_outcome_and_never_replays_factory() {
+    #[test_case(0; "empty_archive")]
+    #[test_case(MAX_HISTORY_PAGE - ARCHIVE_LIFECYCLE_COUNT; "history_page_boundary")]
+    #[test_case(MAX_INVOCATIONS - ARCHIVE_LIFECYCLE_COUNT; "lifetime_capacity_boundary")]
+    fn archived_shell_retry_keeps_outcome_and_never_replays_factory(archived_count: usize) {
         smol::block_on(async {
             let mut fixture = Fixture::new().await;
             let scope = fixture.tasks.main_scope();
-            let count = super::MAX_INVOCATIONS + 2;
             let mut first = None;
-            for index in 0..count {
+            for index in 0..ARCHIVE_LIFECYCLE_COUNT {
                 let metadata = ShellJobMetadata {
                     call_id: format!("{CALL}-{index}"),
                     ..metadata()
@@ -940,9 +944,17 @@ mod tests {
             }
             let first = first.unwrap();
             fixture.tasks.shutdown().await.unwrap();
+            let template = fixture
+                .tasks
+                .record_invocation(&first.invocation_id)
+                .await
+                .unwrap();
+            seed_archived_tasks(&fixture.dir, fixture.session.id, &template, archived_count);
             let restored = BackgroundTasks::spawn(fixture.dir.clone(), fixture.session.id)
                 .await
                 .unwrap();
+            let count = archived_count + ARCHIVE_LIFECYCLE_COUNT;
+            assert_archive_count(&restored, count).await;
             let retried = restored
                 .main_scope()
                 .admit_shell(
@@ -971,7 +983,12 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            restored.join_jobs().await.unwrap();
             restored.shutdown().await.unwrap();
+            let gate = restored.0.gate.lock_arc().await;
+            drop(restored.archive_settled(gate, None).await.unwrap());
+            assert!(restored.lock().records.is_empty());
+            assert_archive_count(&restored, count + 1).await;
         });
     }
 

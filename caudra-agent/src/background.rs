@@ -2311,9 +2311,9 @@ mod tests {
     };
     use caudra_storage::{
         StateDir,
-        background::{BackgroundLookup, JobKind, JobOwner, TaskEvent, TaskRecord},
+        background::{BackgroundLookup, JobKind, JobOwner, JobPayload, TaskEvent, TaskRecord},
         id::CaudraId,
-        sessions::SessionDatabase,
+        sessions::{RuntimeRetry, SessionDatabase},
         tool_outputs::ToolOutputStore,
     };
     use futures_lite::future::poll_once;
@@ -2323,10 +2323,10 @@ mod tests {
 
     use super::{
         ADMISSION_CANCELLED, Admission, BackgroundTasks, CLOSED, EMPTY_CONTINUATION,
-        FAILED_TASK_REQUIRED, FOREIGN_SESSION, MAX_REPORT_BYTES, MAX_REPORTS, MAX_RESULT_BYTES,
-        RETRY_MISMATCH, SELECTED_HISTORY_MISSING, STALE_INVOCATION, TASK_ASYNC, TASK_OUTPUT_LABEL,
-        TASK_PROMOTION, TASK_SETTLING, TASK_SYNC, TRANSITION, TaskDelivery, TaskReporter,
-        TaskStatus,
+        FAILED_TASK_REQUIRED, FOREIGN_SESSION, MAX_HISTORY_PAGE, MAX_INVOCATIONS, MAX_REPORT_BYTES,
+        MAX_REPORTS, MAX_RESULT_BYTES, RETRY_MISMATCH, SELECTED_HISTORY_MISSING, STALE_INVOCATION,
+        TASK_ASYNC, TASK_OUTPUT_LABEL, TASK_PROMOTION, TASK_SETTLING, TASK_SYNC, TRANSITION,
+        TaskDelivery, TaskReporter, TaskStatus,
     };
     use crate::{
         AgentEvent, AgentMode, BackgroundReminderContext, CancelToken, Envelope, EventSender,
@@ -2380,6 +2380,8 @@ mod tests {
     const WRITER_KEY: &str = "held-writer";
     const ADMISSION_SAVE: &str = "background admission save";
     const RUNTIME_DEADLINE: &str = "deadline exceeded";
+    const SEEDED_TASK: &str = "seeded-archived-task";
+    pub(super) const ARCHIVE_LIFECYCLE_COUNT: usize = 2;
 
     pub(super) async fn hold_writer(dir: StateDir) -> (flume::Sender<()>, smol::Task<()>) {
         let (locked_tx, locked_rx) = flume::bounded(1);
@@ -4424,13 +4426,66 @@ mod tests {
         });
     }
 
-    #[test]
-    fn sequential_tasks_archive_without_a_lifetime_admission_cap() {
+    pub(super) fn seed_archived_tasks(
+        dir: &StateDir,
+        session: CaudraId,
+        template: &TaskRecord,
+        count: usize,
+    ) {
+        assert!(template.settled());
+        let database = SessionDatabase::open(dir).unwrap();
+        let (_, sequence) = database.background_watermarks(session).unwrap();
+        for index in 0..count {
+            let mut record = template.clone();
+            record.task_id = format!("{SEEDED_TASK}-{index}");
+            record.invocation_id = record.task_id.clone();
+            record.root_call_id = record.task_id.clone();
+            record.request["call_id"] = json!(record.task_id);
+            if let JobPayload::Shell(metadata) = &mut record.payload {
+                metadata.call_id = record.task_id.clone();
+                metadata.root_call_id = record.root_call_id.clone();
+            }
+            record.sequence = sequence + index as u64 + 1;
+            record.receipt_accepted = true;
+            record.events.clear();
+            let retry = RuntimeRetry::new(None, &|| false);
+            database
+                .save_background_task_runtime(session, &record, &retry)
+                .unwrap();
+            assert!(
+                database
+                    .archive_background_task_runtime(session, &record, &retry)
+                    .unwrap()
+            );
+        }
+    }
+
+    pub(super) async fn assert_archive_count(tasks: &BackgroundTasks, count: usize) {
+        let mut before = None;
+        let mut remaining = count;
+        loop {
+            let page = tasks
+                .history_page(before, super::MAX_HISTORY_PAGE)
+                .await
+                .unwrap();
+            assert_eq!(page.tasks.len(), remaining.min(super::MAX_HISTORY_PAGE));
+            remaining -= page.tasks.len();
+            assert_eq!(page.next.is_some(), remaining != 0);
+            let Some(next) = page.next else {
+                break;
+            };
+            before = Some(next);
+        }
+    }
+
+    #[test_case(0; "empty_archive")]
+    #[test_case(MAX_HISTORY_PAGE - ARCHIVE_LIFECYCLE_COUNT; "history_page_boundary")]
+    #[test_case(MAX_INVOCATIONS - ARCHIVE_LIFECYCLE_COUNT; "lifetime_capacity_boundary")]
+    fn sequential_tasks_archive_without_a_lifetime_admission_cap(archived_count: usize) {
         smol::block_on(async {
             let fixture = Fixture::new().await;
-            let count = super::MAX_INVOCATIONS + 2;
             let mut first = None;
-            for index in 0..count {
+            for index in 0..ARCHIVE_LIFECYCLE_COUNT {
                 let call = format!("{TASK}-{index}");
                 let mut request = request(&call);
                 request.label = call.clone();
@@ -4457,10 +4512,34 @@ mod tests {
             assert_eq!(status.result, first.result);
             assert_eq!(status.output_ref, first.output_ref);
             fixture.tasks.shutdown().await.unwrap();
+            let template = fixture
+                .tasks
+                .record_invocation(&first.invocation_id)
+                .await
+                .unwrap();
+            seed_archived_tasks(&fixture.dir, fixture.session.id, &template, archived_count);
             let restored = BackgroundTasks::spawn(fixture.dir.clone(), fixture.session.id)
                 .await
                 .unwrap();
             assert!(restored.lock().records.is_empty());
+            let count = archived_count + ARCHIVE_LIFECYCLE_COUNT;
+            assert_eq!(
+                restored.lock().recent.len(),
+                count.min(super::MAX_HISTORY_PAGE)
+            );
+            if count > super::MAX_HISTORY_PAGE {
+                assert!(
+                    restored
+                        .lock()
+                        .recent
+                        .iter()
+                        .all(|record| record.invocation_id != first.invocation_id)
+                );
+            }
+            let status = restored.status_async(&first.task_id).await.unwrap();
+            assert_eq!(status.invocation_id, first.invocation_id);
+            assert_eq!(status.result, first.result);
+            assert_eq!(status.output_ref, first.output_ref);
             let mut retry = request(&format!("{TASK}-0"));
             retry.label = retry.call_id.clone();
             assert!(matches!(
@@ -4468,12 +4547,7 @@ mod tests {
                 TaskDelivery::Foreground(..)
             ));
             assert!(fixture.started.is_empty());
-            let page = restored
-                .history_page(None, super::MAX_HISTORY_PAGE)
-                .await
-                .unwrap();
-            assert_eq!(page.tasks.len(), super::MAX_HISTORY_PAGE);
-            assert!(page.next.is_some());
+            assert_archive_count(&restored, count).await;
             fixture.responses.send(final_response()).unwrap();
             assert!(matches!(
                 restored
@@ -4483,6 +4557,10 @@ mod tests {
                 TaskDelivery::Foreground(..)
             ));
             restored.shutdown().await.unwrap();
+            let gate = restored.0.gate.lock_arc().await;
+            drop(restored.archive_settled(gate, None).await.unwrap());
+            assert!(restored.lock().records.is_empty());
+            assert_archive_count(&restored, count + 1).await;
         });
     }
 
