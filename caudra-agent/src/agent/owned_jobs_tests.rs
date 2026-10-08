@@ -71,6 +71,9 @@ mod owned_jobs_tests {
         "the finished shell's report reaches the model before the todo reminder";
     const SETTLING_DOES_NOT_HOLD: &str =
         "a report still awaiting acknowledgement does not hold the reminder back";
+    const WRITER_SCOPE: &str = "child-checkpoint-contention-test";
+    const WRITER_KEY: &str = "held-writer";
+    const CHECKPOINT_SAVE: &str = "job checkpoint save";
 
     struct OutputShell;
 
@@ -588,6 +591,23 @@ mod owned_jobs_tests {
         .await
     }
 
+    async fn hold_writer(dir: StateDir) -> (flume::Sender<()>, smol::Task<()>) {
+        let (locked_tx, locked_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        let writer = smol::spawn(smol::unblock(move || {
+            SessionDatabase::open_state(&dir)
+                .unwrap()
+                .state_update(WRITER_SCOPE, WRITER_KEY, |value: &mut bool| {
+                    *value = true;
+                    locked_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+                .unwrap();
+        }));
+        locked_rx.recv_async().await.unwrap();
+        (release_tx, writer)
+    }
+
     async fn drive<F: Future, T>(run: Pin<&mut F>, next: impl Future<Output = T>) -> T {
         or(
             async {
@@ -694,11 +714,13 @@ mod owned_jobs_tests {
                     break candidate;
                 }
             };
-            let expected_error = SessionError::JobOwnerTaskMismatch {
-                invocation_id: owner.into(),
-                task_id: conflicting_task.clone(),
-            }
-            .to_string();
+            let expected_error = format!(
+                "{CHECKPOINT_SAVE}: {}",
+                SessionError::JobOwnerTaskMismatch {
+                    invocation_id: owner.into(),
+                    task_id: conflicting_task.clone(),
+                }
+            );
             agent.task_id = Some(conflicting_task);
             agent.report_ready = Some(Arc::new(AtomicBool::new(true)));
             completed_control.finish.send(()).unwrap();
@@ -866,9 +888,13 @@ mod owned_jobs_tests {
         }));
     }
 
-    #[test_case(false; "early_prose")]
-    #[test_case(true; "early_structured_report")]
-    fn child_parks_without_polling_and_observes_completion_before_success(structured: bool) {
+    #[test_case(false, false; "early_prose")]
+    #[test_case(true, false; "early_structured_report")]
+    #[test_case(false, true; "checkpoint_writer_contention")]
+    fn child_parks_without_polling_and_observes_completion_before_success(
+        structured: bool,
+        contended: bool,
+    ) {
         smol::block_on(bounded(async {
             let fixture = Fixture::new().await;
             let scope = fixture.tasks.child_scope(OWNER);
@@ -882,12 +908,13 @@ mod owned_jobs_tests {
             agent.report_ready = Some(Arc::clone(&ready));
             agent.tools = json!([{"name": LOCAL_TOOL, "input_schema": {"type": "object"}}]);
             let tool_scope = scope.clone();
+            let tool_execution = Arc::clone(&execution);
             agent.local_tools = Arc::new(HashMap::from([(
                 LOCAL_TOOL.into(),
                 local_tool(move |_, ctx| {
                     let scope = tool_scope.clone();
                     let history = ctx.subagent_history.clone();
-                    let execution = execution.lock().unwrap().take().expect(JOB_REEXECUTED);
+                    let execution = tool_execution.lock().unwrap().take().expect(JOB_REEXECUTED);
                     Box::pin(async move {
                         scope
                             .admit_shell(metadata(), &history, move |cancel, _| {
@@ -926,6 +953,18 @@ mod owned_jobs_tests {
                 no_done(&events);
                 assert!(scope.pending());
                 control.finish.send(()).unwrap();
+                if contended {
+                    terminal(&scope).await;
+                    let (release, writer) = hold_writer(fixture.dir.clone()).await;
+                    let checks = fixture.tasks.observe_saves_for_test();
+                    drive(run.as_mut(), checks.recv_async()).await.unwrap();
+                    drive(run.as_mut(), checks.recv_async()).await.unwrap();
+                    assert!(poll_once(run.as_mut()).await.is_none(), "{PREMATURE_DONE}");
+                    assert!(requests.try_recv().is_err());
+                    no_completion_or_success(&events);
+                    release.send(()).unwrap();
+                    writer.await;
+                }
                 let request = drive(run.as_mut(), requests.recv_async()).await.unwrap();
                 let event = request
                     .iter()
@@ -951,6 +990,40 @@ mod owned_jobs_tests {
             assert_eq!(agent.response_text(), Some(FINAL));
             assert_eq!(agent.num_turns, 3);
             assert!(control.cleaned.load(Ordering::Acquire));
+            assert!(execution.lock().unwrap().is_none());
+            assert!(!agent.inject_owned_results().await.unwrap());
+            assert!(scope.claim_messages().unwrap().is_empty());
+            assert!(fixture.tasks.claim_messages().unwrap().is_empty());
+            let checkpoint = fixture.checkpoint(OWNER);
+            assert_eq!(
+                checkpoint
+                    .iter()
+                    .filter(|message| message.task_event.is_some())
+                    .count(),
+                1
+            );
+            assert_eq!(
+                checkpoint
+                    .iter()
+                    .flat_map(|message| &message.content)
+                    .filter(|block| {
+                        matches!(block, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == CALL)
+                    })
+                    .count(),
+                1
+            );
+            let database = SessionDatabase::open(&fixture.dir).unwrap();
+            let records = database.background_tasks(fixture.session.id).unwrap();
+            assert_eq!(records.len(), 1);
+            assert!(records[0].receipt_accepted);
+            assert_eq!(records[0].events.len(), 1);
+            assert!(records[0].events[0].accepted);
+            let root = StoredSession::load(fixture.session.id, &fixture.dir).unwrap();
+            assert_eq!(root.revision(), fixture.session.revision());
+            assert_eq!(
+                serde_json::to_value(root.messages()).unwrap(),
+                serde_json::to_value(fixture.session.messages()).unwrap()
+            );
             assert!(events.try_iter().any(|event| matches!(
                 event.event,
                 AgentEvent::Done {

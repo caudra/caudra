@@ -95,10 +95,11 @@ const BACKUP_PAGES_PER_STEP: c_int = 1024;
 const INCREMENTAL_AUTO_VACUUM: i64 = 2;
 const PAGE_SIZE: i64 = 4096;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const RUNTIME_CONTENTION_BUDGET: Duration = Duration::from_secs(30);
 const RUNTIME_INITIAL_BACKOFF: Duration = Duration::from_millis(10);
 const RUNTIME_MAX_BACKOFF: Duration = Duration::from_millis(100);
-const RUNTIME_MAX_ATTEMPTS: usize = 64;
 const RUNTIME_CONNECTION_SETUP: &str = "connection setup";
+const RUNTIME_OWNER_CHECKPOINT: &str = "job owner checkpoint";
 const INITIALIZATION_LOCKED: &str = "session database initialization is locked";
 const WAL_AUTO_CHECKPOINT_PAGES: i64 = 1000;
 /// What `journal_size_limit` keeps. The WAL is a ring buffer that a checkpoint
@@ -1299,8 +1300,8 @@ impl<'a> RuntimeRetry<'a> {
         let started = Instant::now();
         Self {
             started,
-            deadline: deadline.map_or(started + BUSY_TIMEOUT, |deadline| {
-                deadline.min(started + BUSY_TIMEOUT)
+            deadline: deadline.map_or(started + RUNTIME_CONTENTION_BUDGET, |deadline| {
+                deadline.min(started + RUNTIME_CONTENTION_BUDGET)
             }),
             cancelled,
             retries: Cell::new(0),
@@ -1340,10 +1341,7 @@ impl<'a> RuntimeRetry<'a> {
         loop {
             self.check_at(operation, now())?;
             match attempt() {
-                Ok(value) => {
-                    self.check_at(operation, now())?;
-                    return Ok(value);
-                }
+                Ok(value) => return Ok(value),
                 Err(SessionError::Sqlite(source))
                     if matches!(source.sqlite_error_code(), Some(ErrorCode::DatabaseBusy)) =>
                 {
@@ -1356,7 +1354,7 @@ impl<'a> RuntimeRetry<'a> {
                     let remaining = self.deadline.saturating_duration_since(current);
                     let extended_code = source.sqlite_error().map(|error| error.extended_code);
                     let elapsed = current.saturating_duration_since(self.started);
-                    if attempts >= RUNTIME_MAX_ATTEMPTS || remaining <= backoff {
+                    if remaining <= backoff {
                         warn!(
                             operation,
                             attempts,
@@ -1435,6 +1433,31 @@ impl SessionDatabase {
     ) -> Result<Self, SessionError> {
         retry.check(RUNTIME_CONNECTION_SETUP)?;
         Self::open_state_inner(state_dir, Some(retry))
+    }
+
+    pub(crate) fn runtime_transaction<T>(
+        &self,
+        retry: &RuntimeRetry<'_>,
+        operation: &'static str,
+        mut write: impl FnMut(&Transaction<'_>) -> Result<T, SessionError>,
+    ) -> Result<T, SessionError> {
+        self.connection.busy_timeout(Duration::ZERO)?;
+        retry.run(operation, || {
+            let transaction =
+                Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+            let result = (|| {
+                let value = write(&transaction)?;
+                retry.check(operation)?;
+                transaction.commit()?;
+                Ok(value)
+            })();
+            if result.is_err() && !self.connection.is_autocommit() {
+                self.connection
+                    .execute_batch("ROLLBACK")
+                    .map_err(|source| SessionError::RuntimeRollback { operation, source })?;
+            }
+            result
+        })
     }
 
     fn open_state_inner(
@@ -2297,6 +2320,34 @@ impl SessionDatabase {
         task_id: &str,
         messages: &[M],
     ) -> Result<(), SessionError> {
+        self.checkpoint_job_owner_inner(session, owner_invocation_id, task_id, messages, None)
+    }
+
+    pub fn checkpoint_job_owner_runtime<M: Serialize>(
+        &self,
+        session: CaudraId,
+        owner_invocation_id: &str,
+        task_id: &str,
+        messages: &[M],
+        retry: &RuntimeRetry<'_>,
+    ) -> Result<(), SessionError> {
+        self.checkpoint_job_owner_inner(
+            session,
+            owner_invocation_id,
+            task_id,
+            messages,
+            Some(retry),
+        )
+    }
+
+    fn checkpoint_job_owner_inner<M: Serialize>(
+        &self,
+        session: CaudraId,
+        owner_invocation_id: &str,
+        task_id: &str,
+        messages: &[M],
+        retry: Option<&RuntimeRetry<'_>>,
+    ) -> Result<(), SessionError> {
         validate_owner_checkpoint_ids(owner_invocation_id, task_id)?;
         validate_len(
             "job owner checkpoint messages",
@@ -2319,48 +2370,58 @@ impl SessionDatabase {
         let owner = JobOwner::Child {
             invocation_id: owner_invocation_id.to_owned(),
         };
-        let transaction =
-            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        let existing_task: Option<String> = transaction.query_row(
+        let messages = serialized
+            .into_iter()
+            .map(|message| serde_json::from_str(&message).map_err(StorageError::from))
+            .collect::<Result<Vec<Value>, _>>()?;
+        let write = |transaction: &Transaction<'_>| {
+            let existing_task: Option<String> = transaction.query_row(
             "SELECT task_id FROM job_owner_checkpoints WHERE session_id = ?1 AND invocation_id = ?2",
             params![session.as_bytes().as_slice(), owner_invocation_id],
             |row| row.get(0),
         ).optional()?;
-        if existing_task
-            .as_deref()
-            .is_some_and(|existing| existing != task_id)
-        {
-            return Err(SessionError::JobOwnerTaskMismatch {
-                invocation_id: owner_invocation_id.to_owned(),
-                task_id: task_id.to_owned(),
-            });
-        }
-        let (count, existing_bytes): (i64, i64) = transaction.query_row(
+            if existing_task
+                .as_deref()
+                .is_some_and(|existing| existing != task_id)
+            {
+                return Err(SessionError::JobOwnerTaskMismatch {
+                    invocation_id: owner_invocation_id.to_owned(),
+                    task_id: task_id.to_owned(),
+                });
+            }
+            let (count, existing_bytes): (i64, i64) = transaction.query_row(
             "SELECT count(*), coalesce(sum(byte_count + length(CAST(invocation_id AS BLOB)) + length(CAST(task_id AS BLOB))), 0) FROM job_owner_checkpoints c WHERE session_id = ?1 AND invocation_id != ?2 AND NOT EXISTS (SELECT 1 FROM background_tasks b WHERE b.session_id = c.session_id AND b.invocation_id = c.invocation_id AND b.archived = 1)",
             params![session.as_bytes().as_slice(), owner_invocation_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        validate_len(
-            "job owner checkpoints",
-            from_i64_usize(count, OWNER_CHECKPOINT_FIELD)?.saturating_add(1),
-            MAX_OWNER_CHECKPOINTS,
-        )?;
-        validate_len(
-            "job owner checkpoint session bytes",
-            from_i64_usize(existing_bytes, OWNER_CHECKPOINT_FIELD)?
-                .saturating_add(bytes)
-                .saturating_add(owner_invocation_id.len())
-                .saturating_add(task_id.len()),
-            MAX_OWNER_CHECKPOINT_SESSION_BYTES,
-        )?;
-        transaction.execute(
+            validate_len(
+                "job owner checkpoints",
+                from_i64_usize(count, OWNER_CHECKPOINT_FIELD)?.saturating_add(1),
+                MAX_OWNER_CHECKPOINTS,
+            )?;
+            validate_len(
+                "job owner checkpoint session bytes",
+                from_i64_usize(existing_bytes, OWNER_CHECKPOINT_FIELD)?
+                    .saturating_add(bytes)
+                    .saturating_add(owner_invocation_id.len())
+                    .saturating_add(task_id.len()),
+                MAX_OWNER_CHECKPOINT_SESSION_BYTES,
+            )?;
+            transaction.execute(
             "INSERT INTO job_owner_checkpoints(session_id, invocation_id, task_id, payload, byte_count) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(session_id, invocation_id) DO UPDATE SET payload = excluded.payload, byte_count = excluded.byte_count",
             params![session.as_bytes().as_slice(), owner_invocation_id, task_id, compressed, to_i64(bytes, OWNER_CHECKPOINT_FIELD)?],
         )?;
-        for message in serialized {
-            let message = serde_json::from_str(&message).map_err(StorageError::from)?;
-            accept_owned_job_event(&transaction, session, &owner, &message)?;
+            for message in &messages {
+                accept_owned_job_event(transaction, session, &owner, message)?;
+            }
+            Ok(())
+        };
+        if let Some(retry) = retry {
+            return self.runtime_transaction(retry, RUNTIME_OWNER_CHECKPOINT, write);
         }
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        write(&transaction)?;
         transaction.commit()?;
         Ok(())
     }
@@ -4619,12 +4680,19 @@ fn open_writable_connection(
         validate_owner_only_existing(&path)?;
     }
     validate_existing_database_sidecars(&path)?;
-    let mut connection = Connection::open_with_flags(
-        &path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-    )?;
+    let open = || {
+        Ok(Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?)
+    };
+    let mut connection = if let Some(retry) = retry {
+        retry.run(RUNTIME_CONNECTION_SETUP, open)?
+    } else {
+        open()?
+    };
     connection.busy_timeout(if retry.is_some() {
         Duration::ZERO
     } else {
@@ -4664,17 +4732,18 @@ fn open_writable_connection(
             })?;
         } else {
             retry.check(RUNTIME_CONNECTION_SETUP)?;
-            initialize(&mut connection, state_dir, true)?;
+            initialize(&mut connection, state_dir, Some(retry))?;
         }
     } else {
         configure_wal_retention(&connection, true)?;
-        initialize(&mut connection, state_dir, false)?;
+        initialize(&mut connection, state_dir, None)?;
     }
     if cutover {
         migration_lock.lock_shared().map_err(StorageError::from)?;
     }
     if let Some(retry) = retry {
         retry.run(RUNTIME_CONNECTION_SETUP, || configure(&connection))?;
+        retry.check(RUNTIME_CONNECTION_SETUP)?;
     } else {
         configure(&connection)?;
     }
@@ -5230,7 +5299,7 @@ fn backfill_workspace_bindings(transaction: &Transaction<'_>) -> Result<(), Sess
 fn initialize(
     connection: &mut Connection,
     state_dir: &StateDir,
-    nonblocking: bool,
+    retry: Option<&RuntimeRetry<'_>>,
 ) -> Result<(), SessionError> {
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version == SCHEMA_VERSION {
@@ -5240,7 +5309,7 @@ fn initialize(
 
     // Caudra initializers serialize on the existing artifact lock, while the
     // SQLite exclusive mode below also excludes non-cooperating connections.
-    let _initialization_lock = if nonblocking {
+    let _initialization_lock = if retry.is_some() {
         lock_session_artifacts_within(state_dir, Duration::ZERO)?.ok_or_else(|| {
             StorageError::Io(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -5256,6 +5325,12 @@ fn initialize(
     }
     reject_unmigratable(version)?;
     if version != 0 {
+        if retry.is_some() {
+            return Err(SessionError::RuntimeMigrationRequired {
+                found: version,
+                supported: SCHEMA_VERSION,
+            });
+        }
         migrate_to_current(connection, state_dir, version)?;
         return configure_current_schema(connection);
     }
@@ -5265,7 +5340,17 @@ fn initialize(
     // appearing between validation and the first persistent setting.
     connection.pragma_update(None, "locking_mode", "EXCLUSIVE")?;
     let locked_version = {
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+        let begin = || {
+            Ok(Transaction::new_unchecked(
+                connection,
+                TransactionBehavior::Exclusive,
+            )?)
+        };
+        let transaction = if let Some(retry) = retry {
+            retry.run(RUNTIME_CONNECTION_SETUP, begin)?
+        } else {
+            begin()?
+        };
         let locked_version: i64 =
             transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if locked_version != 0 && locked_version != SCHEMA_VERSION {
@@ -6375,9 +6460,10 @@ fn pragma_u64(connection: &Connection, name: &str) -> Result<u64, SessionError> 
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     #[cfg(unix)]
     use std::ffi::OsString;
+    use std::ffi::{CStr, c_char, c_void};
     use std::fs::{self, TryLockError};
     use std::iter;
     #[cfg(unix)]
@@ -6386,6 +6472,7 @@ mod tests {
     use std::os::unix::fs::symlink;
     #[cfg(target_os = "linux")]
     use std::process;
+    use std::ptr::null_mut;
     use std::sync::Barrier;
 
     use super::*;
@@ -6645,17 +6732,77 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         ));
         assert!(clock.get() < retry.deadline);
         assert!(retry.deadline - clock.get() <= RUNTIME_MAX_BACKOFF);
-        assert!(retry.retries.get() <= RUNTIME_MAX_ATTEMPTS);
+        assert_eq!(
+            retry.deadline - retry.started,
+            shorter.unwrap_or(RUNTIME_CONTENTION_BUDGET)
+        );
     }
 
     #[test]
-    fn runtime_retry_counts_attempt_waits_and_shares_attempt_budget() {
+    fn runtime_retry_recovers_beyond_old_time_and_attempt_limits() {
+        let retry = RuntimeRetry::new(None, &|| false);
+        let clock = Cell::new(retry.started);
+        let recovery = retry.started + RUNTIME_CONTENTION_BUDGET / 2;
+        retry
+            .run_with_clock(
+                RUNTIME_CONNECTION_SETUP,
+                || {
+                    if clock.get() < recovery {
+                        Err(sqlite_failure(ffi::SQLITE_BUSY))
+                    } else {
+                        Ok(())
+                    }
+                },
+                || clock.get(),
+                |wait| clock.set(clock.get() + wait),
+            )
+            .unwrap();
+        assert!(clock.get() - retry.started > BUSY_TIMEOUT);
+        assert!(clock.get() < retry.deadline);
+    }
+
+    #[test]
+    fn runtime_retry_shares_elapsed_budget_across_stages() {
+        let retry = RuntimeRetry::new(None, &|| false);
+        let clock = Cell::new(retry.started);
+        let setup_end = retry.started + RUNTIME_CONTENTION_BUDGET / 2;
+        retry
+            .run_with_clock(
+                RUNTIME_CONNECTION_SETUP,
+                || {
+                    if clock.get() < setup_end {
+                        Err(sqlite_failure(ffi::SQLITE_BUSY))
+                    } else {
+                        Ok(())
+                    }
+                },
+                || clock.get(),
+                |wait| clock.set(clock.get() + wait),
+            )
+            .unwrap();
+        let setup_attempts = retry.retries.get();
+        let result: Result<(), _> = retry.run_with_clock(
+            RUNTIME_OWNER_CHECKPOINT,
+            || Err(sqlite_failure(ffi::SQLITE_BUSY)),
+            || clock.get(),
+            |wait| clock.set(clock.get() + wait),
+        );
+        assert!(matches!(
+            result,
+            Err(SessionError::RuntimeContention { operation: RUNTIME_OWNER_CHECKPOINT, attempts, elapsed, .. })
+                if attempts > setup_attempts && elapsed < RUNTIME_CONTENTION_BUDGET
+        ));
+        assert!(retry.deadline - clock.get() <= RUNTIME_MAX_BACKOFF);
+    }
+
+    #[test]
+    fn runtime_retry_counts_time_spent_in_attempt() {
         let retry = RuntimeRetry::new(None, &|| false);
         let clock = Cell::new(retry.started);
         let result: Result<(), _> = retry.run_with_clock(
             RUNTIME_CONNECTION_SETUP,
             || {
-                clock.set(clock.get() + BUSY_TIMEOUT);
+                clock.set(retry.deadline);
                 Err(sqlite_failure(ffi::SQLITE_BUSY))
             },
             || clock.get(),
@@ -6665,20 +6812,214 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             result,
             Err(SessionError::RuntimeContention { attempts: 1, .. })
         ));
+    }
 
-        let result: Result<(), _> = retry.run_with_clock(
-            RUNTIME_CONNECTION_SETUP,
-            || Err(sqlite_failure(ffi::SQLITE_BUSY)),
-            || retry.started,
-            |_| {},
+    #[test_case(false; "deadline_after_commit")]
+    #[test_case(true; "cancellation_after_commit")]
+    fn runtime_retry_preserves_committed_success(cancel: bool) {
+        let cancelled = Cell::new(false);
+        let is_cancelled = || cancelled.get();
+        let retry = RuntimeRetry::new(None, &is_cancelled);
+        let clock = Cell::new(retry.started);
+        let (_temp, state) = state_dir();
+        let database = SessionDatabase::open_state(&state).unwrap();
+        retry.run_with_clock(
+            RUNTIME_OWNER_CHECKPOINT,
+            || {
+                database.runtime_transaction(&retry, RUNTIME_OWNER_CHECKPOINT, |transaction| {
+                    transaction.execute(
+                        "INSERT INTO state(scope, key, value, updated_at) VALUES (?1, ?1, 'null', 0)",
+                        params![ARTIFACT_NAME],
+                    )?;
+                    Ok(())
+                })?;
+                if cancel {
+                    cancelled.set(true);
+                } else {
+                    clock.set(retry.deadline);
+                }
+                Ok(())
+            },
+            || clock.get(),
+            |_| unreachable!(),
+        ).unwrap();
+        assert_eq!(
+            database
+                .state_get::<Value>(ARTIFACT_NAME, ARTIFACT_NAME)
+                .unwrap(),
+            Some(Value::Null)
+        );
+    }
+
+    #[test_case(ffi::SQLITE_BUSY; "busy")]
+    #[test_case(ffi::SQLITE_BUSY_SNAPSHOT; "snapshot")]
+    fn runtime_transaction_rolls_back_before_retry(code: c_int) {
+        let (_temp, state) = state_dir();
+        let database = SessionDatabase::open_state(&state).unwrap();
+        let retry = RuntimeRetry::new(None, &|| false);
+        let attempts = Cell::new(0);
+        database
+            .runtime_transaction(&retry, RUNTIME_OWNER_CHECKPOINT, |transaction| {
+                transaction.execute(
+                    "INSERT INTO state(scope, key, value, updated_at) VALUES (?1, ?1, 'null', 0)",
+                    params![ARTIFACT_NAME],
+                )?;
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 1 {
+                    return Err(sqlite_failure(code));
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(
+            database
+                .state_get::<Value>(ARTIFACT_NAME, ARTIFACT_NAME)
+                .unwrap(),
+            Some(Value::Null)
+        );
+    }
+
+    #[test]
+    fn runtime_transaction_cancellation_before_commit_rolls_back() {
+        let (_temp, state) = state_dir();
+        let database = SessionDatabase::open_state(&state).unwrap();
+        let cancelled = Cell::new(false);
+        let is_cancelled = || cancelled.get();
+        let retry = RuntimeRetry::new(None, &is_cancelled);
+        let result =
+            database.runtime_transaction(&retry, RUNTIME_OWNER_CHECKPOINT, |transaction| {
+                transaction.execute(
+                    "INSERT INTO state(scope, key, value, updated_at) VALUES (?1, ?1, 'null', 0)",
+                    params![ARTIFACT_NAME],
+                )?;
+                cancelled.set(true);
+                Ok(())
+            });
+        assert!(matches!(
+            result,
+            Err(SessionError::RuntimeCancelled {
+                operation: RUNTIME_OWNER_CHECKPOINT
+            })
+        ));
+        assert_eq!(
+            database
+                .state_get::<Value>(ARTIFACT_NAME, ARTIFACT_NAME)
+                .unwrap(),
+            None
+        );
+        assert!(database.connection.is_autocommit());
+    }
+
+    #[test]
+    fn runtime_transaction_retries_busy_commit_after_rollback() {
+        let (_temp, state) = state_dir();
+        let database = SessionDatabase::open_state(&state).unwrap();
+        database
+            .connection
+            .pragma_update(None, "journal_mode", "DELETE")
+            .unwrap();
+        let reader = Connection::open(database.path()).unwrap();
+        let transaction = reader.unchecked_transaction().unwrap();
+        transaction
+            .query_row("SELECT count(*) FROM state", [], |_| Ok(()))
+            .unwrap();
+        let reader = RefCell::new(Some(transaction));
+        let attempts = Cell::new(0);
+        let cancelled = || {
+            if attempts.get() == 1
+                && database.connection.is_autocommit()
+                && let Some(transaction) = reader.borrow_mut().take()
+            {
+                transaction.rollback().unwrap();
+            }
+            false
+        };
+        let retry = RuntimeRetry::new(None, &cancelled);
+        database
+            .runtime_transaction(&retry, RUNTIME_OWNER_CHECKPOINT, |transaction| {
+                attempts.set(attempts.get() + 1);
+                transaction.execute(
+                    "INSERT INTO state(scope, key, value, updated_at) VALUES (?1, ?1, 'null', 0)",
+                    params![ARTIFACT_NAME],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(attempts.get(), 2);
+        assert!(reader.borrow().is_none());
+        assert_eq!(
+            database
+                .state_get::<Value>(ARTIFACT_NAME, ARTIFACT_NAME)
+                .unwrap(),
+            Some(Value::Null)
+        );
+    }
+
+    unsafe extern "C" fn deny_rollback(
+        _: *mut c_void,
+        action: c_int,
+        operation: *const c_char,
+        _: *const c_char,
+        _: *const c_char,
+        _: *const c_char,
+    ) -> c_int {
+        if action == ffi::SQLITE_TRANSACTION
+            && !operation.is_null()
+            && unsafe { CStr::from_ptr(operation) } == c"ROLLBACK"
+        {
+            ffi::SQLITE_DENY
+        } else {
+            ffi::SQLITE_OK
+        }
+    }
+
+    #[test]
+    fn runtime_transaction_refuses_retry_when_rollback_fails() {
+        let (_temp, state) = state_dir();
+        let database = SessionDatabase::open_state(&state).unwrap();
+        assert_eq!(
+            unsafe {
+                ffi::sqlite3_set_authorizer(
+                    database.connection.handle(),
+                    Some(deny_rollback),
+                    null_mut(),
+                )
+            },
+            ffi::SQLITE_OK
+        );
+        let retry = RuntimeRetry::new(None, &|| false);
+        let attempts = Cell::new(0);
+        let result: Result<(), _> =
+            database.runtime_transaction(&retry, RUNTIME_OWNER_CHECKPOINT, |transaction| {
+                attempts.set(attempts.get() + 1);
+                transaction.execute(
+                    "INSERT INTO state(scope, key, value, updated_at) VALUES (?1, ?1, 'null', 0)",
+                    params![ARTIFACT_NAME],
+                )?;
+                Err(sqlite_failure(ffi::SQLITE_BUSY))
+            });
+        assert_eq!(
+            unsafe { ffi::sqlite3_set_authorizer(database.connection.handle(), None, null_mut()) },
+            ffi::SQLITE_OK
         );
         assert!(matches!(
             result,
-            Err(SessionError::RuntimeContention {
-                attempts: RUNTIME_MAX_ATTEMPTS,
+            Err(SessionError::RuntimeRollback {
+                operation: RUNTIME_OWNER_CHECKPOINT,
                 ..
             })
         ));
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(retry.retries.get(), 0);
+        assert!(!database.connection.is_autocommit());
+        database.connection.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(
+            database
+                .state_get::<Value>(ARTIFACT_NAME, ARTIFACT_NAME)
+                .unwrap(),
+            None
+        );
     }
 
     #[test_case(false; "before_attempt")]
@@ -6777,6 +7118,31 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
     }
 
     #[test]
+    fn runtime_initialization_retries_sqlite_writer() {
+        let (_temp, state) = state_dir();
+        let path = state.path().join(SESSIONS_DB_FILE);
+        let mut connection = Connection::open(&path).unwrap();
+        connection.busy_timeout(Duration::ZERO).unwrap();
+        let writer = Connection::open(&path).unwrap();
+        let writer = RefCell::new(Some(
+            Transaction::new_unchecked(&writer, TransactionBehavior::Immediate).unwrap(),
+        ));
+        let checks = Cell::new(0);
+        let cancelled = || {
+            checks.set(checks.get() + 1);
+            if checks.get() == 2 {
+                writer.borrow_mut().take().unwrap().rollback().unwrap();
+            }
+            false
+        };
+        let retry = RuntimeRetry::new(None, &cancelled);
+        initialize(&mut connection, &state, Some(&retry)).unwrap();
+        assert!(writer.borrow().is_none());
+        assert_eq!(retry.retries.get(), 1);
+        verify_current_schema(&connection).unwrap();
+    }
+
+    #[test]
     fn runtime_open_does_not_retry_migration_blockers() {
         let (_temp, state_dir) = state_dir();
         let database = SessionDatabase::open(&state_dir).unwrap();
@@ -6789,6 +7155,32 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             SessionDatabase::open_runtime(&state_dir, &retry),
             Err(SessionError::MigrationBlocked { .. })
         ));
+        assert_eq!(retry.retries.get(), 0);
+    }
+
+    #[test]
+    fn runtime_open_refuses_unbounded_migration() {
+        let (_temp, state) = state_dir();
+        let database = SessionDatabase::open_state(&state).unwrap();
+        database
+            .connection
+            .pragma_update(None, "user_version", OWNER_CHECKPOINT_PREVIOUS_SCHEMA)
+            .unwrap();
+        let path = database.path();
+        drop(database);
+        let retry = RuntimeRetry::new(None, &|| false);
+        assert!(matches!(
+            SessionDatabase::open_runtime(&state, &retry),
+            Err(SessionError::RuntimeMigrationRequired {
+                found: OWNER_CHECKPOINT_PREVIOUS_SCHEMA,
+                supported: SCHEMA_VERSION,
+            })
+        ));
+        let connection = Connection::open(path).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, OWNER_CHECKPOINT_PREVIOUS_SCHEMA);
         assert_eq!(retry.retries.get(), 0);
     }
 
@@ -6809,8 +7201,23 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         assert!(
             matches!(configure_current_schema(&database.connection), Err(SessionError::Sqlite(error)) if error.sqlite_error_code() == Some(ErrorCode::DatabaseBusy))
         );
-        transaction.rollback().unwrap();
-        configure_current_schema(&database.connection).unwrap();
+        let reader = RefCell::new(Some(transaction));
+        let checks = Cell::new(0);
+        let cancelled = || {
+            checks.set(checks.get() + 1);
+            if checks.get() == 2 {
+                reader.borrow_mut().take().unwrap().rollback().unwrap();
+            }
+            false
+        };
+        let retry = RuntimeRetry::new(None, &cancelled);
+        retry
+            .run(RUNTIME_CONNECTION_SETUP, || {
+                configure_current_schema(&database.connection)
+            })
+            .unwrap();
+        assert!(reader.borrow().is_none());
+        assert_eq!(retry.retries.get(), 1);
         let mode: String = database
             .connection
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
@@ -6919,6 +7326,128 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             "text": SHELL_OUTCOME,
             "task_event": {"task_id": SHELL_TASK, "invocation_id": SHELL_INVOCATION, "event_id": event}
         })
+    }
+
+    #[test_case(false; "eventual_checkpoint")]
+    #[test_case(true; "cancelled_checkpoint")]
+    fn runtime_owner_checkpoint_retries_writer_contention(cancel: bool) {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open_state(&state).unwrap();
+        let session = TestSession::new(MODEL, CWD);
+        let cursor = database.save(&session, None).unwrap();
+        database
+            .save_background_task(
+                session.id,
+                &checkpoint_shell_record(JobOwner::Child {
+                    invocation_id: CHILD_INVOCATION.into(),
+                }),
+            )
+            .unwrap();
+        let previous = vec![json!(OLD_REVIEW)];
+        database
+            .checkpoint_job_owner(session.id, CHILD_INVOCATION, CHILD_TASK, &previous)
+            .unwrap();
+        let writer = SessionDatabase::open_state(&state).unwrap();
+        let writer = RefCell::new(Some(
+            Transaction::new_unchecked(&writer.connection, TransactionBehavior::Immediate).unwrap(),
+        ));
+        let checks = Cell::new(0);
+        let cancelled = || {
+            checks.set(checks.get() + 1);
+            if checks.get() == 2 && !cancel {
+                writer.borrow_mut().take().unwrap().rollback().unwrap();
+            }
+            cancel && checks.get() >= 2
+        };
+        let retry = RuntimeRetry::new(None, &cancelled);
+        let messages = vec![checkpoint_shell_message(SHELL_EVENT)];
+        let result = database.checkpoint_job_owner_runtime(
+            session.id,
+            CHILD_INVOCATION,
+            CHILD_TASK,
+            &messages,
+            &retry,
+        );
+        if cancel {
+            assert!(matches!(
+                result,
+                Err(SessionError::RuntimeCancelled {
+                    operation: RUNTIME_OWNER_CHECKPOINT
+                })
+            ));
+            writer.borrow_mut().take().unwrap().rollback().unwrap();
+        } else {
+            result.unwrap();
+        }
+        assert_eq!(
+            database
+                .load_job_owner_checkpoint::<Value>(session.id, CHILD_INVOCATION, CHILD_TASK)
+                .unwrap(),
+            Some(if cancel { previous } else { messages })
+        );
+        assert_eq!(
+            database
+                .background_event_accepted(session.id, SHELL_EVENT)
+                .unwrap(),
+            !cancel
+        );
+        assert_eq!(
+            database.write_version(session.id).unwrap(),
+            Some(cursor.write_version())
+        );
+        assert!(
+            database
+                .load::<TestMessage, Value, Value>(session.id)
+                .unwrap()
+                .messages()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn runtime_owner_checkpoint_cancellation_rolls_back_history_and_receipts() {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open_state(&state).unwrap();
+        let session = TestSession::new(MODEL, CWD);
+        database.save(&session, None).unwrap();
+        database
+            .save_background_task(
+                session.id,
+                &checkpoint_shell_record(JobOwner::Child {
+                    invocation_id: CHILD_INVOCATION.into(),
+                }),
+            )
+            .unwrap();
+        let previous = vec![json!(OLD_REVIEW)];
+        database
+            .checkpoint_job_owner(session.id, CHILD_INVOCATION, CHILD_TASK, &previous)
+            .unwrap();
+        let cancelled = || !database.connection.is_autocommit();
+        let retry = RuntimeRetry::new(None, &cancelled);
+        let result = database.checkpoint_job_owner_runtime(
+            session.id,
+            CHILD_INVOCATION,
+            CHILD_TASK,
+            &[checkpoint_shell_message(SHELL_EVENT)],
+            &retry,
+        );
+        assert!(matches!(
+            result,
+            Err(SessionError::RuntimeCancelled {
+                operation: RUNTIME_OWNER_CHECKPOINT
+            })
+        ));
+        assert_eq!(
+            database
+                .load_job_owner_checkpoint::<Value>(session.id, CHILD_INVOCATION, CHILD_TASK)
+                .unwrap(),
+            Some(previous)
+        );
+        assert!(
+            !database
+                .background_event_accepted(session.id, SHELL_EVENT)
+                .unwrap()
+        );
     }
 
     #[test_case(false; "valid_receipt_round_trip")]

@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::cell::Cell;
 use std::fmt;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
@@ -272,12 +274,28 @@ impl JobScope {
             if self.generation != self.tasks.generation() {
                 return Err(STALE_INVOCATION.into());
             }
+            #[cfg(test)]
+            let save_checked = self.tasks.lock().save_checked.clone();
             smol::unblock(move || {
-                let database = SessionDatabase::open_state(&dir)
+                #[cfg(test)]
+                let saving = Cell::new(false);
+                let cancelled = || {
+                    #[cfg(test)]
+                    if saving.get()
+                        && let Some(checked) = &save_checked
+                    {
+                        let _ = checked.send(());
+                    }
+                    false
+                };
+                let retry = RuntimeRetry::new(None, &cancelled);
+                let database = SessionDatabase::open_runtime(&dir, &retry)
                     .map_err(|error| format!("job checkpoint connection setup: {error}"))?;
+                #[cfg(test)]
+                saving.set(true);
                 database
-                    .checkpoint_job_owner(session, &invocation, &task_id, &history)
-                    .map_err(|error| error.to_string())
+                    .checkpoint_job_owner_runtime(session, &invocation, &task_id, &history, &retry)
+                    .map_err(|error| format!("job checkpoint save: {error}"))
             })
             .await?;
         }
@@ -352,7 +370,7 @@ impl JobScope {
         admission.check()?;
         if let Some(record) = self
             .tasks
-            .retry_record(&self.owner, &metadata.call_id)
+            .retry_record(&self.owner, &metadata.call_id, &admission)
             .await?
         {
             return if record.payload == JobPayload::Shell(metadata) {
@@ -361,7 +379,10 @@ impl JobScope {
                 Err(RETRY_MISMATCH.into())
             };
         }
-        let gate = self.tasks.archive_settled(gate).await?;
+        let gate = self
+            .tasks
+            .archive_settled(gate, Some(admission.clone()))
+            .await?;
         admission.check()?;
         {
             let state = self.tasks.lock();
@@ -403,11 +424,7 @@ impl JobScope {
         let lease = smol::unblock(move || {
             reservation.check()?;
             let cancelled = || reservation.is_cancelled();
-            let deadline = match reservation.deadline {
-                Deadline::None => None,
-                Deadline::At(deadline) => Some(deadline),
-            };
-            let retry = RuntimeRetry::new(deadline, &cancelled);
+            let retry = RuntimeRetry::new(reservation.runtime_deadline(), &cancelled);
             let database = SessionDatabase::open_runtime(&dir, &retry)
                 .map_err(|error| format!("shell identity connection setup: {error}"))?;
             let lease = history.reserve_generated(&label, |id| {
@@ -1043,6 +1060,55 @@ mod tests {
                 .background_tasks(fixture.session.id)
                 .unwrap();
             assert_eq!(records.len(), usize::from(!stop && !cancel_caller));
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn shell_admission_cancels_busy_archive_before_launch() {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let scope = fixture.tasks.main_scope();
+            let card = scope
+                .admit_shell(metadata(), &fixture.history, |_, _| async { done() })
+                .await
+                .unwrap();
+            fixture.tasks.join_jobs().await.unwrap();
+            let mut record = fixture.tasks.record(&card.invocation_id).unwrap();
+            record.receipt_accepted = true;
+            for event in &mut record.events {
+                event.accepted = true;
+            }
+            fixture.tasks.persist(record).await.unwrap();
+            let (release, writer) = hold_writer(fixture.dir.clone()).await;
+            let checked = fixture.tasks.observe_saves_for_test();
+            let (trigger, cancel) = CancelToken::new();
+            let history = fixture.history.clone();
+            let caller = smol::spawn(async move {
+                scope
+                    .admit_shell_cancellable(
+                        ShellJobMetadata {
+                            call_id: OTHER.into(),
+                            ..metadata()
+                        },
+                        &history,
+                        &cancel,
+                        Deadline::None,
+                        |_, _| async { panic!("cancelled admission executed") },
+                    )
+                    .await
+            });
+            checked.recv_async().await.unwrap();
+            checked.recv_async().await.unwrap();
+            assert!(fixture.tasks.0.gate.try_lock_arc().is_none());
+            trigger.cancel();
+            let error = caller.await.unwrap_err();
+            assert!(error.contains(CANCELLED), "{error}");
+            assert!(fixture.tasks.0.gate.try_lock_arc().is_some());
+            assert_eq!(fixture.tasks.lock().records.len(), 1);
+            assert_eq!(fixture.history.active_count(), 0);
+            release.send(()).unwrap();
+            writer.await;
             fixture.tasks.shutdown().await.unwrap();
         });
     }

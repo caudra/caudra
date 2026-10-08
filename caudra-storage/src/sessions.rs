@@ -112,6 +112,16 @@ pub enum SessionError {
         #[source]
         source: SqliteError,
     },
+    #[error("{operation}: SQLite rollback failed; retry refused: {source}")]
+    RuntimeRollback {
+        operation: &'static str,
+        #[source]
+        source: SqliteError,
+    },
+    #[error(
+        "database schema {found} requires migration to {supported}; restart Caudra to upgrade before runtime persistence"
+    )]
+    RuntimeMigrationRequired { found: i64, supported: i64 },
     #[error("session {id} already exists")]
     AlreadyExists { id: CaudraId },
     #[error("session {id} is already open in another Caudra instance")]

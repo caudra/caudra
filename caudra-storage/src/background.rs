@@ -22,6 +22,7 @@ const INVALID_JOB_EVENT: &str =
     "job event does not match its recorded task, event, or owning invocation";
 const RUNTIME_IDENTITY_LOOKUP: &str = "identity lookup";
 const RUNTIME_BACKGROUND_SAVE: &str = "background record save";
+const RUNTIME_BACKGROUND_ARCHIVE: &str = "background archive";
 const RUNTIME_RECEIPT_LOOKUP: &str = "receipt lookup";
 pub(crate) const TABLES: &str = r#"
 CREATE TABLE background_tasks (
@@ -285,7 +286,6 @@ impl SessionDatabase {
         record: &TaskRecord,
         retry: &RuntimeRetry<'_>,
     ) -> Result<(), SessionError> {
-        self.connection().busy_timeout(Duration::ZERO)?;
         self.save_background_task_inner(session, record, Some(retry))
     }
 
@@ -516,20 +516,13 @@ impl SessionDatabase {
             return Ok(false);
         }
         let payload = serde_json::to_string(record).map_err(StorageError::from)?;
-        self.connection().busy_timeout(Duration::ZERO)?;
-        let transaction = retry.run("background archive", || {
-            Ok(Transaction::new_unchecked(
-                self.connection(),
-                TransactionBehavior::Immediate,
-            )?)
-        })?;
-        let changed = transaction.execute(
-            "UPDATE background_tasks SET archived = 1 WHERE session_id = ?1 AND invocation_id = ?2 AND payload = ?3",
-            params![session.as_bytes().as_slice(), record.invocation_id, payload],
-        )?;
-        retry.check("background archive")?;
-        transaction.commit()?;
-        Ok(changed == 1)
+        self.runtime_transaction(retry, RUNTIME_BACKGROUND_ARCHIVE, |transaction| {
+            let changed = transaction.execute(
+                "UPDATE background_tasks SET archived = 1 WHERE session_id = ?1 AND invocation_id = ?2 AND payload = ?3",
+                params![session.as_bytes().as_slice(), record.invocation_id, payload],
+            )?;
+            Ok(changed == 1)
+        })
     }
 
     pub fn save_background_task(
@@ -548,36 +541,6 @@ impl SessionDatabase {
     ) -> Result<(), SessionError> {
         let payload = serde_json::to_string(record).map_err(StorageError::from)?;
         Self::validate_len("background task", payload.len(), MAX_RECORD_BYTES)?;
-        let begin = || {
-            Ok(Transaction::new_unchecked(
-                self.connection(),
-                TransactionBehavior::Immediate,
-            )?)
-        };
-        let transaction = if let Some(retry) = retry {
-            retry.run(RUNTIME_BACKGROUND_SAVE, begin)?
-        } else {
-            begin()?
-        };
-        if let Some(retry) = retry {
-            retry.check(RUNTIME_BACKGROUND_SAVE)?;
-        }
-        let count: i64 = transaction.query_row(
-            "SELECT count(*) FROM background_tasks WHERE session_id = ?1 AND archived = 0 AND invocation_id != ?2",
-            params![session.as_bytes().as_slice(), record.invocation_id],
-            |row| row.get(0),
-        )?;
-        Self::validate_len(
-            "background resident invocations",
-            count as usize + 1,
-            MAX_INVOCATIONS,
-        )?;
-        let bytes: u32 = transaction.query_row("SELECT coalesce(sum(bytes), 0) FROM background_tasks WHERE session_id = ?1 AND archived = 0 AND invocation_id != ?2", params![session.as_bytes().as_slice(), record.invocation_id], |row| row.get(0))?;
-        Self::validate_len(
-            "background resident bytes",
-            (bytes as usize).saturating_add(payload.len()),
-            MAX_SESSION_BYTES,
-        )?;
         let last_sequence = sql_integer(
             record
                 .events
@@ -587,21 +550,44 @@ impl SessionDatabase {
                 .unwrap_or_default()
                 .max(record.sequence),
         )?;
-        let changed = transaction.execute(
-            "INSERT INTO background_tasks(session_id, invocation_id, payload, bytes, last_sequence) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(session_id, invocation_id) DO UPDATE SET payload = excluded.payload, bytes = excluded.bytes, last_sequence = excluded.last_sequence WHERE background_tasks.archived = 0",
-            params![session.as_bytes().as_slice(), record.invocation_id, payload, payload.len() as i64, last_sequence],
-        )?;
-        if changed != 1 {
-            return Err(SessionError::CorruptDatabaseValue {
-                field: "background archive",
-                reason: "archived invocations are read-only".into(),
-            });
-        }
+        let write = |transaction: &Transaction<'_>| {
+            let count: i64 = transaction.query_row(
+                "SELECT count(*) FROM background_tasks WHERE session_id = ?1 AND archived = 0 AND invocation_id != ?2",
+                params![session.as_bytes().as_slice(), record.invocation_id],
+                |row| row.get(0),
+            )?;
+            Self::validate_len(
+                "background resident invocations",
+                count as usize + 1,
+                MAX_INVOCATIONS,
+            )?;
+            let bytes: u32 = transaction.query_row("SELECT coalesce(sum(bytes), 0) FROM background_tasks WHERE session_id = ?1 AND archived = 0 AND invocation_id != ?2", params![session.as_bytes().as_slice(), record.invocation_id], |row| row.get(0))?;
+            Self::validate_len(
+                "background resident bytes",
+                (bytes as usize).saturating_add(payload.len()),
+                MAX_SESSION_BYTES,
+            )?;
+            let changed = transaction.execute(
+                "INSERT INTO background_tasks(session_id, invocation_id, payload, bytes, last_sequence) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(session_id, invocation_id) DO UPDATE SET payload = excluded.payload, bytes = excluded.bytes, last_sequence = excluded.last_sequence WHERE background_tasks.archived = 0",
+                params![session.as_bytes().as_slice(), record.invocation_id, payload, payload.len() as i64, last_sequence],
+            )?;
+            if changed != 1 {
+                return Err(SessionError::CorruptDatabaseValue {
+                    field: "background archive",
+                    reason: "archived invocations are read-only".into(),
+                });
+            }
+            Ok(())
+        };
         if let Some(retry) = retry {
-            retry.check(RUNTIME_BACKGROUND_SAVE)?;
+            self.runtime_transaction(retry, RUNTIME_BACKGROUND_SAVE, write)
+        } else {
+            let transaction =
+                Transaction::new_unchecked(self.connection(), TransactionBehavior::Immediate)?;
+            write(&transaction)?;
+            transaction.commit()?;
+            Ok(())
         }
-        transaction.commit()?;
-        Ok(())
     }
 
     pub fn background_event_accepted(
@@ -1008,7 +994,7 @@ mod tests {
         assert!(
             matches!(result, Err(SessionError::Sqlite(error)) if error.sqlite_error_code() == Some(ErrorCode::ConstraintViolation))
         );
-        assert_eq!(checks.get(), 4);
+        assert_eq!(checks.get(), 2);
         assert!(
             runtime
                 .background_tasks(missing_session)

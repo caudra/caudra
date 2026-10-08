@@ -4,8 +4,6 @@
 //! never runs anything. Background shells keep their authoritative lifecycle in
 //! `background_tasks`.
 
-use std::time::Duration;
-
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -25,6 +23,7 @@ pub const MAX_SHELL_COMMAND_BYTES: usize = 8 * 1024;
 pub const MAX_SHELL_WORKDIR_BYTES: usize = 1024;
 pub const MAX_SHELL_REASON_BYTES: usize = 2 * 1024;
 const RUNTIME_SHELL_SAVE: &str = "shell execution save";
+const RUNTIME_SHELL_INTERRUPT: &str = "shell execution interruption";
 const CREATED_FIELD: &str = "shell execution creation time";
 const BYTES_FIELD: &str = "shell execution bytes";
 const SUMMARY_KIND: &str = "shell execution summary";
@@ -157,7 +156,6 @@ impl SessionDatabase {
         output: Option<&Value>,
         retry: &RuntimeRetry<'_>,
     ) -> Result<bool, SessionError> {
-        self.connection().busy_timeout(Duration::ZERO)?;
         let summary = serde_json::to_string(record).map_err(StorageError::from)?;
         Self::validate_len(SUMMARY_KIND, summary.len(), MAX_SHELL_SUMMARY_BYTES)?;
         let output = output
@@ -168,37 +166,30 @@ impl SessionDatabase {
         Self::validate_len(OUTPUT_KIND, output_bytes, MAX_SHELL_OUTPUT_BYTES)?;
         let created = to_i64(record.created_at_ms, CREATED_FIELD)?;
         let bytes = to_i64(summary.len() + output_bytes, BYTES_FIELD)?;
-        let transaction = retry.run(RUNTIME_SHELL_SAVE, || {
-            Ok(Transaction::new_unchecked(
-                self.connection(),
-                TransactionBehavior::Immediate,
-            )?)
-        })?;
-        retry.check(RUNTIME_SHELL_SAVE)?;
-        let saved = transaction.execute(
-            "INSERT INTO shell_executions(session_id, execution_id, created_ms, active, summary, output, bytes) \
-             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7 WHERE EXISTS(SELECT 1 FROM sessions WHERE id = ?1) \
-             ON CONFLICT(session_id, execution_id) DO UPDATE SET active = excluded.active, \
-             summary = excluded.summary, output = excluded.output, bytes = excluded.bytes",
-            params![
-                session.as_bytes().as_slice(),
-                record.execution_id,
-                created,
-                record.state.is_active(),
-                summary,
-                output,
-                bytes
-            ],
-        )?;
-        transaction.execute(
-            "DELETE FROM shell_executions WHERE session_id = ?1 AND active = 0 AND execution_id NOT IN (\
-                SELECT execution_id FROM shell_executions WHERE session_id = ?1 AND active = 0 \
-                ORDER BY created_ms DESC, execution_id DESC LIMIT ?2)",
-            params![session.as_bytes().as_slice(), MAX_SHELL_EXECUTIONS as i64],
-        )?;
-        retry.check(RUNTIME_SHELL_SAVE)?;
-        transaction.commit()?;
-        Ok(saved > 0)
+        self.runtime_transaction(retry, RUNTIME_SHELL_SAVE, |transaction| {
+            let saved = transaction.execute(
+                "INSERT INTO shell_executions(session_id, execution_id, created_ms, active, summary, output, bytes) \
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7 WHERE EXISTS(SELECT 1 FROM sessions WHERE id = ?1) \
+                 ON CONFLICT(session_id, execution_id) DO UPDATE SET active = excluded.active, \
+                 summary = excluded.summary, output = excluded.output, bytes = excluded.bytes",
+                params![
+                    session.as_bytes().as_slice(),
+                    record.execution_id,
+                    created,
+                    record.state.is_active(),
+                    summary,
+                    output,
+                    bytes
+                ],
+            )?;
+            transaction.execute(
+                "DELETE FROM shell_executions WHERE session_id = ?1 AND active = 0 AND execution_id NOT IN (\
+                    SELECT execution_id FROM shell_executions WHERE session_id = ?1 AND active = 0 \
+                    ORDER BY created_ms DESC, execution_id DESC LIMIT ?2)",
+                params![session.as_bytes().as_slice(), MAX_SHELL_EXECUTIONS as i64],
+            )?;
+            Ok(saved > 0)
+        })
     }
 
     /// Newest first, strictly older than `before`. A record whose summary no
@@ -269,42 +260,67 @@ impl SessionDatabase {
         session: CaudraId,
         reason: &str,
     ) -> Result<usize, SessionError> {
-        let transaction =
-            Transaction::new_unchecked(self.connection(), TransactionBehavior::Immediate)?;
-        let unfinished = {
-            let mut statement = transaction.prepare(
+        self.interrupt_shell_executions_inner(session, reason, None)
+    }
+
+    pub fn interrupt_shell_executions_runtime(
+        &self,
+        session: CaudraId,
+        reason: &str,
+        retry: &RuntimeRetry<'_>,
+    ) -> Result<usize, SessionError> {
+        self.interrupt_shell_executions_inner(session, reason, Some(retry))
+    }
+
+    fn interrupt_shell_executions_inner(
+        &self,
+        session: CaudraId,
+        reason: &str,
+        retry: Option<&RuntimeRetry<'_>>,
+    ) -> Result<usize, SessionError> {
+        let write = |transaction: &Transaction<'_>| {
+            let unfinished = {
+                let mut statement = transaction.prepare(
                 "SELECT summary, coalesce(length(CAST(output AS BLOB)), 0) FROM shell_executions \
                  WHERE session_id = ?1 AND active = 1",
             )?;
-            let rows = statement.query_map(params![session.as_bytes().as_slice()], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })?;
-            rows.collect::<Result<Vec<_>, _>>()?
-        };
-        let mut interrupted = 0;
-        for (summary, output_bytes) in unfinished {
-            let mut record: ShellExecutionRecord = match serde_json::from_str(&summary) {
-                Ok(record) => record,
-                Err(error) => {
-                    warn!(%error, "unreadable unfinished shell execution summary");
-                    continue;
-                }
+                let rows = statement.query_map(params![session.as_bytes().as_slice()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()?
             };
-            record.state = ShellExecutionState::Interrupted;
-            record.reason.get_or_insert_with(|| reason.to_owned());
-            let summary = serde_json::to_string(&record).map_err(StorageError::from)?;
-            Self::validate_len(SUMMARY_KIND, summary.len(), MAX_SHELL_SUMMARY_BYTES)?;
-            interrupted += transaction.execute(
-                "UPDATE shell_executions SET active = 0, summary = ?3, bytes = ?4 \
+            let mut interrupted = 0;
+            for (summary, output_bytes) in unfinished {
+                let mut record: ShellExecutionRecord = match serde_json::from_str(&summary) {
+                    Ok(record) => record,
+                    Err(error) => {
+                        warn!(%error, "unreadable unfinished shell execution summary");
+                        continue;
+                    }
+                };
+                record.state = ShellExecutionState::Interrupted;
+                record.reason.get_or_insert_with(|| reason.to_owned());
+                let summary = serde_json::to_string(&record).map_err(StorageError::from)?;
+                Self::validate_len(SUMMARY_KIND, summary.len(), MAX_SHELL_SUMMARY_BYTES)?;
+                interrupted += transaction.execute(
+                    "UPDATE shell_executions SET active = 0, summary = ?3, bytes = ?4 \
                  WHERE session_id = ?1 AND execution_id = ?2",
-                params![
-                    session.as_bytes().as_slice(),
-                    record.execution_id,
-                    summary,
-                    to_i64(summary.len(), BYTES_FIELD)? + output_bytes
-                ],
-            )?;
+                    params![
+                        session.as_bytes().as_slice(),
+                        record.execution_id,
+                        summary,
+                        to_i64(summary.len(), BYTES_FIELD)? + output_bytes
+                    ],
+                )?;
+            }
+            Ok(interrupted)
+        };
+        if let Some(retry) = retry {
+            return self.runtime_transaction(retry, RUNTIME_SHELL_INTERRUPT, write);
         }
+        let transaction =
+            Transaction::new_unchecked(self.connection(), TransactionBehavior::Immediate)?;
+        let interrupted = write(&transaction)?;
         transaction.commit()?;
         Ok(interrupted)
     }
@@ -604,6 +620,54 @@ mod tests {
         assert_eq!(
             runtime.shell_executions(session, None, 10).unwrap(),
             [saved]
+        );
+    }
+
+    #[test_case(false; "empty_history")]
+    #[test_case(true; "unfinished_execution")]
+    fn runtime_interruption_retries_writer_contention(unfinished: bool) {
+        let (temp, database, session) = fixture();
+        let mut expected = record(0, ShellExecutionState::Running);
+        if unfinished {
+            save(&database, session, &expected, None).unwrap();
+            expected.state = ShellExecutionState::Interrupted;
+            expected.reason = Some(REASON.into());
+        }
+        let state = StateDir::from_path(temp.path().to_path_buf());
+        let runtime =
+            SessionDatabase::open_runtime(&state, &RuntimeRetry::new(None, &|| false)).unwrap();
+        let writer = RefCell::new(Some(
+            Transaction::new_unchecked(database.connection(), TransactionBehavior::Immediate)
+                .unwrap(),
+        ));
+        let checks = Cell::new(0);
+        let cancelled = || {
+            checks.set(checks.get() + 1);
+            if checks.get() == 2 {
+                writer.borrow_mut().take().unwrap().rollback().unwrap();
+            }
+            false
+        };
+        assert_eq!(
+            runtime
+                .interrupt_shell_executions_runtime(
+                    session,
+                    REASON,
+                    &RuntimeRetry::new(None, &cancelled)
+                )
+                .unwrap(),
+            usize::from(unfinished)
+        );
+        assert!(writer.borrow().is_none());
+        assert_eq!(
+            runtime
+                .shell_executions(session, None, MAX_SHELL_EXECUTIONS)
+                .unwrap(),
+            if unfinished {
+                vec![expected]
+            } else {
+                Vec::new()
+            }
         );
     }
 
