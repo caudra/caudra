@@ -3,7 +3,9 @@
 import copy
 import hashlib
 import importlib.util
+import os
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -35,6 +37,16 @@ PUBLISHED_ERROR = "Published releases must never be modified"
 INVENTORY_ERROR = "Asset inventory mismatch"
 UPLOAD_ERROR = "simulated interrupted upload"
 WORKFLOWS = Path(__file__).resolve().parent.parent / ".github/workflows"
+SMOKE_WORKER_WARNING = "Workcell python_execution is unavailable"
+SMOKE_STARTUP_ERROR = "resolve data directory: Permission denied"
+SMOKE_DIRECTORIES = (
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_RUNTIME_DIR",
+)
 
 
 class ReleaseTests(unittest.TestCase):
@@ -564,6 +576,95 @@ class ReleaseWorkflowTests(unittest.TestCase):
             self.assertIn("--version)", jobs[job])
             self.assertIn("${GITHUB_REF_NAME#v}", jobs[job])
         self.assertIn("-e GITHUB_REF_NAME", jobs["build-linux"])
+
+
+@unittest.skipUnless(
+    os.name == "posix" and shutil.which("bash"), "Unix and Bash required"
+)
+class NixSmokeTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="nix smoke ")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.record = self.root / "environment"
+        self.hooks = self.root / "hooks"
+        binary = self.root / "out/bin/caudra"
+        binary.parent.mkdir(parents=True)
+        binary.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' "
+            + " ".join(f'"${name}"' for name in SMOKE_DIRECTORIES)
+            + ' "$*" > "$SMOKE_RECORD"\n'
+            'printf "%s\\n" "$SMOKE_STDOUT"\n'
+            'printf "%s\\n" "$SMOKE_STDERR" >&2\n'
+            'exit "$SMOKE_STATUS"\n'
+        )
+        binary.chmod(0o755)
+        phases = re.findall(
+            r"installCheckPhase = ''\n(.*?)\n\s*'';",
+            (WORKFLOWS.parent.parent / "flake.nix").read_text(),
+            re.DOTALL,
+        )
+        self.assertEqual(len(phases), 1)
+        self.script = (
+            'runHook() { printf "%s\\n" "$1" >> "$SMOKE_HOOKS"; }\n' + phases[0]
+        )
+
+    def run_smoke(self, stdout, stderr="", status=0):
+        self.hooks.unlink(missing_ok=True)
+        return subprocess.run(
+            ["bash", "-euo", "pipefail", "-c", self.script],
+            cwd=self.root,
+            env={
+                **os.environ,
+                **dict.fromkeys(SMOKE_DIRECTORIES, "/homeless-shelter"),
+                "TMPDIR": str(self.root),
+                "out": str(self.root / "out"),
+                "SMOKE_RECORD": str(self.record),
+                "SMOKE_HOOKS": str(self.hooks),
+                "SMOKE_STDOUT": stdout,
+                "SMOKE_STDERR": stderr,
+                "SMOKE_STATUS": str(status),
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+
+    def test_success_uses_private_home_and_xdg_directories(self):
+        result = self.run_smoke("file_read\npython_execution")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        *directories, arguments = self.record.read_text().splitlines()
+        self.assertEqual(len(directories), len(SMOKE_DIRECTORIES))
+        for directory in directories:
+            path = Path(directory)
+            self.assertTrue(path.is_relative_to(self.root))
+            self.assertTrue(path.is_dir())
+            self.assertEqual(path.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(
+            arguments, "--model openai/gpt-5.1 tools --enabled-only --names"
+        )
+        self.assertEqual(
+            self.hooks.read_text().splitlines(), ["preInstallCheck", "postInstallCheck"]
+        )
+
+    def test_missing_worker_and_command_failures_report_captured_output(self):
+        for stdout, stderr, status in (
+            ("file_read", "", 0),
+            ("python_execution_unavailable", "", 0),
+            ("python_execution", SMOKE_WORKER_WARNING, 0),
+            ("python_execution", SMOKE_STARTUP_ERROR, 7),
+        ):
+            with self.subTest(stdout=stdout, stderr=stderr, status=status):
+                result = self.run_smoke(stdout, stderr, status)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(stdout, result.stderr)
+                if stderr:
+                    self.assertIn(stderr, result.stderr)
+                self.assertEqual(
+                    self.hooks.read_text().splitlines(), ["preInstallCheck"]
+                )
 
 
 if __name__ == "__main__":

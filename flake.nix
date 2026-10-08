@@ -279,9 +279,20 @@
               doInstallCheck = true;
               installCheckPhase = ''
                 runHook preInstallCheck
-                smoke_output="$(OPENAI_API_KEY=release-smoke \
-                  XDG_CACHE_HOME="$TMPDIR/cache" \
-                  $out/bin/caudra --model openai/gpt-5.1 tools --enabled-only --names 2>&1)" || exit 1
+                HOME="$(mktemp -d)"
+                export HOME
+                export XDG_CONFIG_HOME="$HOME/config"
+                export XDG_DATA_HOME="$HOME/data"
+                export XDG_STATE_HOME="$HOME/state"
+                export XDG_CACHE_HOME="$HOME/cache"
+                export XDG_RUNTIME_DIR="$HOME/runtime"
+                mkdir -m 700 "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" \
+                  "$XDG_CACHE_HOME" "$XDG_RUNTIME_DIR"
+                if ! smoke_output="$(OPENAI_API_KEY=release-smoke \
+                  "$out/bin/caudra" --model openai/gpt-5.1 tools --enabled-only --names 2>&1)"; then
+                  printf '%s\n' "$smoke_output" >&2
+                  exit 1
+                fi
                 if ! printf '%s\n' "$smoke_output" | grep -qx python_execution ||
                   printf '%s\n' "$smoke_output" | grep -q 'Workcell python_execution is unavailable'; then
                   printf '%s\n' "$smoke_output" >&2
