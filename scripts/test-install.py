@@ -300,7 +300,7 @@ class ReleaseCases(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="install-test-")
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve(strict=True)
         self.commands = self.root / "commands"
         self.commands.mkdir()
         self.install_dir = self.root / "custom prefix" / "bin"
@@ -469,6 +469,23 @@ class InstallTests(ReleaseCases):
         result = self.install()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assert_installed()
+
+    def test_install_with_symlinked_temporary_parent(self):
+        alias = self.root / "temporary alias"
+        alias.symlink_to(self.root, target_is_directory=True)
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "InstallTests.test_install_retains_complete_bundle_with_space_paths",
+            ],
+            env={**os.environ, "TMPDIR": str(alias)},
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_reinstall_preserves_unrelated_files(self):
         self.seed_binary()
