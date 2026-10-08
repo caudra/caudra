@@ -85,6 +85,13 @@
           '';
         };
 
+      materializeVendor = vendor: ''
+        cp -rL ${vendor} "$out"
+        chmod -R u+w "$out"
+        substituteInPlace "$out/config.toml" \
+          --replace-fail "${vendor}" "$out"
+      '';
+
       cargoLockParsed = builtins.fromTOML (builtins.readFile ./Cargo.lock);
 
       # Exact Cargo.lock source strings (with fragment) of all git deps
@@ -142,6 +149,9 @@
             hash = "sha256-tuDFwYLIprdVyAH47rqYiI4xU3RCuNdkBjIyVM1JeWE=";
           };
           montyVendorDeps = craneLib.vendorCargoDeps { src = montySrc; };
+          montyAttributionVendor = pkgs.runCommandLocal "monty-attribution-vendor" { } (
+            materializeVendor montyVendorDeps
+          );
           montyWorker = craneLib.buildPackage {
             pname = "caudra-monty-worker";
             version = "1.0.0";
@@ -232,7 +242,7 @@
                 cp -r ${montySrc}/. "$worker_source/"
                 chmod -R u+w "$worker_source"
                 mkdir -p "$worker_source/.cargo"
-                cp ${montyVendorDeps}/config.toml "$worker_source/.cargo/config.toml"
+                cp ${montyAttributionVendor}/config.toml "$worker_source/.cargo/config.toml"
                 CARGO_NET_OFFLINE=true python3 scripts/build-attribution.py \
                   --manifest-path Cargo.toml --package ${packageName} \
                   --target ${pkgs.stdenv.hostPlatform.rust.rustcTarget} \
@@ -272,6 +282,55 @@
 
       checks = forEachSystem (
         system: pkgs: {
+          vendor-attribution =
+            let
+              vendor = pkgs.runCommandLocal "attribution-vendor-fixture" { } ''
+                mkdir -p "$out/package/src" "$out/package/ancillary" "$out/sources"
+                printf '[package]\nname = "dependency"\nversion = "1.0.0"\n' > "$out/package/Cargo.toml"
+                printf 'pub fn dependency() {}\n' > "$out/package/src/lib.rs"
+                printf 'Copyright fixture authors\n' > "$out/package/ancillary/notice.txt"
+                printf '\000\377ancillary source\n' > "$out/package/ancillary/payload.dat"
+                ln -s "$out/package/ancillary/notice.txt" "$out/package/NOTICE"
+                ln -s "$out/package" "$out/sources/dependency-1.0.0"
+                ln -s "$out/sources" "$out/registry"
+                printf '[source.fixture]\ndirectory = "%s/registry"\n' "$out" > "$out/config.toml"
+              '';
+              materialized = pkgs.runCommandLocal "attribution-vendor-materialized" { } (
+                materializeVendor vendor
+              );
+            in
+            pkgs.runCommandLocal "check-vendor-attribution" { nativeBuildInputs = [ pkgs.python3 ]; } ''
+              python3 - <<'PY'
+              import importlib.util
+              from pathlib import Path
+              import tarfile
+              import tomllib
+
+              spec = importlib.util.spec_from_file_location("attribution", "${./scripts/build-attribution.py}")
+              attribution = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(attribution)
+              original = Path("${vendor}")
+              vendor = Path("${materialized}")
+              config = (vendor / "config.toml").read_text()
+              registry = Path(tomllib.loads(config)["source"]["fixture"]["directory"])
+              assert registry == vendor / "registry"
+              assert str(original) not in config
+              attribution.files(vendor)
+              crate = registry / "dependency-1.0.0"
+              assert {p.relative_to(crate).as_posix() for p in attribution.license_files(crate)} == {
+                  "NOTICE", "ancillary/notice.txt"
+              }
+              archive = Path("source.tar.gz")
+              attribution.source_archive(crate, archive)
+              with tarfile.open(archive) as source:
+                  assert set(source.getnames()) == {
+                      "Cargo.toml", "NOTICE", "src/lib.rs", "ancillary/notice.txt", "ancillary/payload.dat"
+                  }
+                  for member in source:
+                      assert source.extractfile(member).read() == (original / "package" / member.name).read_bytes()
+              PY
+              touch $out
+            '';
           dummy-src =
             let
               dummySrc = mkWorkspaceDummySrc (mkCraneLib pkgs);

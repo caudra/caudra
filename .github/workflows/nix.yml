@@ -89,6 +89,8 @@ jobs:
         run: nix build --no-update-lock-file .#checks.x86_64-linux.fmt
       - name: Check patched dependency sources
         run: nix build --no-update-lock-file .#checks.x86_64-linux.dummy-src
+      - name: Check attribution vendor preparation
+        run: nix build --no-update-lock-file .#checks.x86_64-linux.vendor-attribution
       - name: Build
         run: nix build --no-update-lock-file
 
