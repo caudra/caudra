@@ -537,15 +537,17 @@ fn node_metadata(parent: &File, name: &str) -> Result<NodeMetadata, BinaryError>
 mod tests {
     use super::{
         FileToolGroup, MAX_TRANSFER_INVENTORY_ENTRIES, TransferInventoryPolicy, TransferNodeKind,
-        WorkspacePath,
+        WorkspacePath, node_metadata,
     };
     use crate::BinaryError;
-    use crate::binary::{DIRECTORY_FLAGS, open_child, open_root};
-    use rustix::fs::{AtFlags, StatxFlags, statx};
+    use crate::binary::{DIRECTORY_FLAGS, open_child, open_metadata, open_root};
+    use rustix::fs::{AtFlags, FileType, Mode, StatxFlags, mknodat, statx};
     use rustix::io::Errno;
     use std::{
         fs,
-        os::unix::fs::{MetadataExt, symlink},
+        io::ErrorKind,
+        os::unix::fs::{MetadataExt, PermissionsExt, symlink},
+        path::Path,
     };
     use tokio_util::sync::CancellationToken;
     use workcell_host_contract::DirectoryNavigation;
@@ -707,6 +709,15 @@ mod tests {
             fs::write(root.path().join(name), b"content").unwrap();
         }
         symlink("/etc/passwd", root.path().join("link")).unwrap();
+        let directory = open_root(root.path()).unwrap();
+        mknodat(
+            &directory,
+            "pipe",
+            FileType::Fifo,
+            Mode::RUSR | Mode::WUSR,
+            0,
+        )
+        .unwrap();
         let files = FileToolGroup::new(root.path(), false, None).await.unwrap();
         let cwd = files.workspace_root().await.unwrap().handle;
         let policy = TransferInventoryPolicy {
@@ -732,6 +743,8 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(find("link").kind, TransferNodeKind::Symlink);
+        assert_eq!(find("pipe").kind, TransferNodeKind::Special);
+        assert_eq!(find("pipe").size_bytes, None);
         assert_eq!(find("other-repo").kind, TransferNodeKind::NestedRepository);
         assert!(find("src/hidden.txt").ignored);
         for path in ["ignored/no", "other-repo/no", "target/no", ".SSH/no"] {
@@ -813,52 +826,89 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn real_existing_mounts_are_classified_without_traversal_or_special_file_reads() {
+    async fn inventory_requires_read_access_to_searchable_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let restricted = root.path().join("restricted");
+        fs::create_dir(&restricted).unwrap();
+        fs::write(restricted.join("file"), b"content").unwrap();
+        let files = FileToolGroup::new(root.path(), false, None).await.unwrap();
+        let cwd = files.workspace_root().await.unwrap().handle;
+        for mode in [0o111, 0o700] {
+            fs::set_permissions(&restricted, fs::Permissions::from_mode(mode)).unwrap();
+            let access = fs::read_dir(&restricted);
+            let result = files
+                .transfer_inventory(
+                    &cwd,
+                    None,
+                    TransferInventoryPolicy::default(),
+                    &CancellationToken::new(),
+                )
+                .await;
+            fs::set_permissions(&restricted, fs::Permissions::from_mode(0o700)).unwrap();
+            match access {
+                Err(error) if error.kind() == ErrorKind::PermissionDenied => {
+                    assert!(matches!(result, Err(BinaryError::Inaccessible)));
+                }
+                Ok(_) => {
+                    let snapshot = result.unwrap();
+                    assert!(snapshot.complete);
+                    assert!(snapshot.entries.iter().any(|entry| {
+                        entry.path.as_str() == "restricted/file"
+                            && entry.kind == TransferNodeKind::File
+                    }));
+                }
+                Err(error) => panic!("unexpected directory access error: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_access_denials_are_not_classified_as_mounts() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("file"), b"content").unwrap();
+        let directory = open_root(root.path()).unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o000)).unwrap();
+        let access = open_metadata(&directory, "file");
+        let result = node_metadata(&directory, "file");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        match access {
+            Err(Errno::ACCESS) => assert!(matches!(result, Err(BinaryError::Inaccessible))),
+            Ok(_) => assert_eq!(result.unwrap().0, TransferNodeKind::File),
+            Err(error) => panic!("unexpected metadata access error: {error}"),
+        }
+        assert_eq!(
+            node_metadata(&directory, "file").unwrap().0,
+            TransferNodeKind::File
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_mounts_and_devices_are_classified_without_scanning_unrelated_directories() {
+        let root = open_root(Path::new("/dev")).unwrap();
+        assert_eq!(open_metadata(&root, "pts").unwrap_err(), Errno::XDEV);
+        assert_eq!(
+            node_metadata(&root, "pts").unwrap().0,
+            TransferNodeKind::Mount
+        );
+        assert_eq!(
+            node_metadata(&root, "null").unwrap().0,
+            TransferNodeKind::Special
+        );
         let files = FileToolGroup::new("/dev", false, None).await.unwrap();
         let cwd = files.workspace_root().await.unwrap().handle;
-        let snapshot = files
-            .transfer_inventory(
-                &cwd,
-                None,
-                TransferInventoryPolicy::default(),
-                &CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        assert!(
-            snapshot
-                .entries
-                .iter()
-                .any(|entry| entry.path.as_str() == "pts" && entry.kind == TransferNodeKind::Mount)
-        );
-        assert!(
-            !snapshot
-                .entries
-                .iter()
-                .any(|entry| entry.path.as_str().starts_with("pts/"))
-        );
-        assert!(
-            files
-                .open_binary(
-                    &cwd,
-                    &WorkspacePath::new("null").unwrap(),
-                    100,
-                    &CancellationToken::new()
-                )
-                .await
-                .is_err()
-        );
-        assert!(
-            files
-                .open_binary(
-                    &cwd,
-                    &WorkspacePath::new("shm/file").unwrap(),
-                    100,
-                    &CancellationToken::new()
-                )
-                .await
-                .is_err()
-        );
+        for path in ["null", "pts/ptmx", "shm/file"] {
+            assert!(matches!(
+                files
+                    .open_binary(
+                        &cwd,
+                        &WorkspacePath::new(path).unwrap(),
+                        100,
+                        &CancellationToken::new()
+                    )
+                    .await,
+                Err(BinaryError::Inaccessible)
+            ));
+        }
     }
 
     #[test]
