@@ -1310,10 +1310,13 @@ mod background_runtime {
                                 .map_err(|_| AgentError::Channel)
                         },
                         async {
-                            let event = event_rx
-                                .recv_async()
-                                .await
-                                .map_err(|_| AgentError::Channel)?;
+                            let Ok(event) = event_rx.recv_async().await else {
+                                return result
+                                    .recv_async()
+                                    .await
+                                    .map(Some)
+                                    .map_err(|_| AgentError::Channel);
+                            };
                             events
                                 .send_async(event)
                                 .await
