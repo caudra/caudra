@@ -321,24 +321,22 @@ class ReleaseTests(unittest.TestCase):
         self.assertIsNone(RELEASE.version("v0.2.0+build.1")[1])
         self.assertEqual(RELEASE.version("v0.2.0-rc.1")[1], "rc.1")
 
-    def test_release_notes_include_curated_content_and_exact_provenance(self):
-        notes = RELEASE.release_notes(TAG, COMMIT)
+    def test_release_notes_leave_title_and_source_to_release_metadata(self):
+        notes = RELEASE.release_notes(TAG)
         for expected in (
-            f"## {TITLE}",
             "Preview / prerelease.",
             CURATED_NOTES.strip(),
             COMPACT_POLICY,
-            f"Tag: `{TAG}`",
-            f"[{COMMIT}](https://github.com/caudra/caudra/commit/{COMMIT})",
-            "[Canonical documentation](https://caudra.ai/docs/)",
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, notes)
-        self.assertEqual(notes, RELEASE.release_notes(TAG, COMMIT))
-        self.assertNotIn(OTHER_COMMIT, notes)
+        for metadata in (TITLE, TAG, "github.com/caudra/caudra/commit/"):
+            with self.subTest(metadata=metadata):
+                self.assertNotIn(metadata, notes)
+        self.assertEqual(notes, RELEASE.release_notes(TAG))
 
     def test_stable_release_notes_do_not_claim_preview_status(self):
-        notes = RELEASE.release_notes("v0.2.0", COMMIT)
+        notes = RELEASE.release_notes("v0.2.0")
         self.assertIn("Stable release.", notes)
         self.assertNotIn("Preview / prerelease", notes)
 
@@ -353,13 +351,13 @@ class ReleaseTests(unittest.TestCase):
         ):
             with self.subTest(content=content), self.assertRaises(ValueError):
                 path.write_text(content)
-                RELEASE.release_notes(TAG, COMMIT)
+                RELEASE.release_notes(TAG)
         path.unlink()
         with self.assertRaisesRegex(ValueError, "Missing version-specific"):
-            RELEASE.release_notes(TAG, COMMIT)
+            RELEASE.release_notes(TAG)
         path.symlink_to(self.root / "release-notes" / "0.2.0.md")
         with self.assertRaisesRegex(ValueError, "Missing version-specific"):
-            RELEASE.release_notes(TAG, COMMIT)
+            RELEASE.release_notes(TAG)
 
     def test_attribution_variable_has_a_compact_default_and_strict_values(self):
         for value in ("", "false", "0", " FALSE ", "\t0\n"):
@@ -613,7 +611,7 @@ class ReleaseTests(unittest.TestCase):
             self.assertNotIn("--generate-notes", arguments)
             self.assertEqual(
                 arguments[arguments.index("--notes") + 1],
-                RELEASE.release_notes(TAG, COMMIT),
+                RELEASE.release_notes(TAG),
             )
 
     def test_latest_uses_semver_not_lexical_or_release_creation_order(self):
@@ -677,7 +675,7 @@ class ReleaseTests(unittest.TestCase):
             [
                 {
                     "name": TITLE,
-                    "body": RELEASE.release_notes(TAG, COMMIT),
+                    "body": RELEASE.release_notes(TAG),
                     "draft": False,
                     "prerelease": True,
                     "make_latest": "false",

@@ -90,10 +90,9 @@ def attribution_layout(value: str) -> str:
     return "expanded" if normalized in ("true", "1") else "compact"
 
 
-def release_notes(tag: str, sha: str, layout: str = "compact") -> str:
+def release_notes(tag: str, layout: str = "compact") -> str:
     version(tag)
     require(layout in ("compact", "expanded"), "Unknown attribution layout")
-    require(SHA.fullmatch(sha) is not None, "Release notes require an exact source SHA")
     directory = ROOT / "release-notes"
     path = directory / f"{tag[1:]}.md"
     require(
@@ -117,17 +116,9 @@ def release_notes(tag: str, sha: str, layout: str = "compact") -> str:
         if version(tag)[1] is not None
         else "Stable release."
     )
-    return f"""## {release_title(tag)}
-
-**Status:** {status}
+    return f"""**Status:** {status}
 
 {content}
-
-### Source and documentation
-
-- Tag: `{tag}`
-- Exact source: [{sha}](https://github.com/{REPOSITORY}/commit/{sha})
-- [Canonical documentation](https://caudra.ai/docs/)
 
 {POLICY_PREFIX}{layout} -->
 """
@@ -246,7 +237,7 @@ def guard(release_id: int, tag: str, sha: str) -> dict:
 
 
 def prepare(tag: str, sha: str, layout: str = "compact") -> None:
-    notes = release_notes(tag, sha, layout)
+    notes = release_notes(tag, layout)
     release = existing_draft(tag, sha)
     if release is None:
         gh(
@@ -555,7 +546,7 @@ def make_latest(tag: str, published: list[dict]) -> bool:
 
 
 def publish(tag: str, sha: str, directory: Path, layout: str = "compact") -> None:
-    notes = release_notes(tag, sha, layout)
+    notes = release_notes(tag, layout)
     release = existing_draft(tag, sha)
     if release is None:
         raise ValueError("Expected an existing verified draft")
@@ -636,7 +627,7 @@ def main() -> None:
     layout = arguments.layout or attribution_layout(
         os.environ.get("CAUDRA_EXPANDED_ATTRIBUTION", "")
     )
-    release_notes(tag, sha, layout)
+    release_notes(tag, layout)
     if arguments.command == "validate":
         release = existing_draft(tag, sha)
         if release is not None:
