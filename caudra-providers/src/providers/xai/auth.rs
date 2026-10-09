@@ -2,7 +2,7 @@ use std::io::{self, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::str;
-use std::sync::mpsc;
+use std::sync::{LazyLock, mpsc};
 use std::time::{Duration, Instant};
 use std::{env, fs, thread};
 
@@ -36,6 +36,11 @@ pub(crate) const TOKEN_AUTH: &str = "xai-grok-cli";
 pub(crate) const AUTHENTICATE_RESPONSE: &str = "authenticate-response";
 pub(crate) const CLIENT_IDENTIFIER: &str = "caudra";
 pub(crate) const CLI_BASE_URL: &str = "https://cli-chat-proxy.grok.com/v1";
+/// Sent as `x-grok-client-version`. The CLI proxy reads it as a Grok Build
+/// release and answers 426 below the minimum it serves, so this has to move
+/// when xAI raises that minimum: 1.0.13 was the floor in October 2026.
+pub(crate) const GROK_BUILD_VERSION: &str = "1.0.50";
+pub(crate) const CLIENT_VERSION_ENV: &str = "CAUDRA_XAI_CLIENT_VERSION";
 
 const CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
 const ISSUER: &str = "https://auth.x.ai";
@@ -65,6 +70,23 @@ const DEVICE_EXPIRED: &str = "xAI device authorization expired; run `caudra auth
 const CALLBACK_TIMEOUT_MSG: &str = "timed out waiting for xAI OAuth callback";
 const STATE_MISMATCH: &str = "xAI authorization failed: state mismatch";
 const RAW_CODE_MSG: &str = "raw xAI authorization codes are not accepted; paste the complete redirect URL containing both code and state";
+
+static CLIENT_VERSION: LazyLock<String> = LazyLock::new(|| {
+    let Some(raw) = env::var_os(CLIENT_VERSION_ENV) else {
+        return GROK_BUILD_VERSION.into();
+    };
+    match raw.to_str().and_then(client_version_override) {
+        Some(version) => version.into(),
+        None => {
+            warn!(
+                env = CLIENT_VERSION_ENV,
+                fallback = GROK_BUILD_VERSION,
+                "ignoring an xAI client version that is not one printable ASCII token"
+            );
+            GROK_BUILD_VERSION.into()
+        }
+    }
+});
 
 #[derive(Deserialize)]
 struct TokenResponse {
@@ -111,9 +133,18 @@ fn oauth_form_headers() -> Vec<(&'static str, String)> {
         ("content-type", "application/x-www-form-urlencoded".into()),
         ("accept", "application/json".into()),
         ("user-agent", crate::providers::user_agent().into()),
-        ("x-grok-client-version", env!("CARGO_PKG_VERSION").into()),
+        ("x-grok-client-version", client_version().into()),
         ("x-grok-client-surface", "cli".into()),
     ]
+}
+
+pub(crate) fn client_version() -> &'static str {
+    &CLIENT_VERSION
+}
+
+fn client_version_override(raw: &str) -> Option<&str> {
+    let version = raw.trim();
+    (!version.is_empty() && version.bytes().all(|b| b.is_ascii_graphic())).then_some(version)
 }
 
 fn post_form(url: &str, body: &str, timeout: Duration) -> Result<(u16, String), AgentError> {
@@ -188,10 +219,7 @@ fn oauth_headers(access: &str) -> Vec<(String, String)> {
             AUTHENTICATE_RESPONSE.into(),
         ),
         ("x-grok-client-identifier".into(), CLIENT_IDENTIFIER.into()),
-        (
-            "x-grok-client-version".into(),
-            env!("CARGO_PKG_VERSION").into(),
-        ),
+        ("x-grok-client-version".into(), client_version().into()),
         ("x-grok-client-mode".into(), client_mode().into()),
     ]
 }
@@ -955,6 +983,26 @@ mod tests {
     fn raw_authorization_codes_are_rejected() {
         let err = parse_callback_input("Abcdefghijklmnopqrstuvwxyz0123", "state").unwrap_err();
         assert_eq!(err.to_string(), RAW_CODE_MSG);
+    }
+
+    #[test_case("1.0.60", Some("1.0.60") ; "accepts_a_version")]
+    #[test_case(" 1.0.60\n", Some("1.0.60") ; "trims_surrounding_whitespace")]
+    #[test_case("", None ; "rejects_empty")]
+    #[test_case("   ", None ; "rejects_blank")]
+    #[test_case("1.0 60", None ; "rejects_an_inner_space")]
+    #[test_case("1.0.60\u{7f}", None ; "rejects_a_control_character")]
+    #[test_case("1.0.6\u{e9}", None ; "rejects_non_ascii")]
+    fn client_version_override_is_one_printable_token(raw: &str, expected: Option<&str>) {
+        assert_eq!(client_version_override(raw), expected);
+    }
+
+    #[test]
+    fn proxy_headers_declare_the_grok_build_version() {
+        let headers = oauth_headers("access");
+        let version = headers
+            .iter()
+            .find_map(|(name, value)| (name == "x-grok-client-version").then_some(value.as_str()));
+        assert_eq!(version, Some(client_version()));
     }
 
     #[test]

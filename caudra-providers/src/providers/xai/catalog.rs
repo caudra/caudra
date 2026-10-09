@@ -245,7 +245,7 @@ fn fetch_catalog(access: &str) -> FetchOutcome {
         .header("x-xai-token-auth", auth::TOKEN_AUTH)
         .header("x-authenticateresponse", auth::AUTHENTICATE_RESPONSE)
         .header("x-grok-client-identifier", auth::CLIENT_IDENTIFIER)
-        .header("x-grok-client-version", env!("CARGO_PKG_VERSION"))
+        .header("x-grok-client-version", auth::client_version())
         .header("x-grok-client-mode", "headless")
         .body(())
     {

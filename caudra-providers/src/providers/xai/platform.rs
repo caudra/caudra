@@ -6,6 +6,7 @@ use flume::Sender;
 use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
+use crate::error::{DETAIL_CAP, provider_detail};
 use crate::model::{Billing, Model};
 use crate::provider::{BoxFuture, Provider, WireRequest};
 use crate::providers::ResolvedAuth;
@@ -16,6 +17,10 @@ use crate::{
 };
 
 use super::{auth, catalog};
+
+const UPGRADE_REQUIRED: u16 = 426;
+const VERSION_REFUSED: &str = "xAI's Grok CLI proxy refused client version";
+const PROXY_SAID: &str = "The proxy said:";
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     slug: "xai",
@@ -185,6 +190,34 @@ fn random_id() -> String {
     format!("{:016x}{:016x}", fastrand::u64(..), fastrand::u64(..))
 }
 
+/// The proxy's own 426 text says to run `grok update`, which does nothing for
+/// Caudra, so the remedy goes first and the proxy's minimum version after it.
+fn explain_version_gate(error: AgentError) -> AgentError {
+    match error {
+        AgentError::Api {
+            status: UPGRADE_REQUIRED,
+            message,
+            retry_after,
+        } => {
+            let remedy = format!(
+                "{VERSION_REFUSED} {}; run `caudra update`, or set {} to the version it asks for",
+                auth::client_version(),
+                auth::CLIENT_VERSION_ENV,
+            );
+            let message = match provider_detail(&message, DETAIL_CAP) {
+                Some(detail) => format!("{remedy}. {PROXY_SAID} {detail}"),
+                None => remedy,
+            };
+            AgentError::Api {
+                status: UPGRADE_REQUIRED,
+                message,
+                retry_after,
+            }
+        }
+        error => error,
+    }
+}
+
 impl Provider for Xai {
     fn stream_message<'a>(
         &'a self,
@@ -219,6 +252,7 @@ impl Provider for Xai {
                     self.compat.stream_timeout(),
                 )
                 .await
+                .map_err(explain_version_gate)
             })
             .await
         })
@@ -339,6 +373,9 @@ mod tests {
     const LOGIN_REFRESH: &str = "xai-login-refresh";
     const API_KEY: &str = "xai-api-key";
     const TEST_BASE_URL: &str = "https://api.x.test/v1";
+    const VERSION_GATE_DETAIL: &str =
+        "Your Grok CLI version (1.0.50) is outdated. Please update to version 1.0.60 or later.";
+    const VERSION_GATE_BODY: &str = r#"{"error":"Your Grok CLI version (1.0.50) is outdated. Please update to version 1.0.60 or later."}"#;
 
     fn provider_with_login(state: &TempDir) -> Xai {
         let storage = StateDir::from_path(state.path().to_path_buf());
@@ -481,5 +518,33 @@ mod tests {
             headers: vec![("authorization".into(), "Bearer tok-123".into())],
         };
         assert_eq!(bearer_token(&auth).as_deref(), Some("tok-123"));
+    }
+
+    #[test]
+    fn version_gate_names_the_override_before_the_proxy_minimum() {
+        let error = explain_version_gate(AgentError::api(UPGRADE_REQUIRED, VERSION_GATE_BODY));
+
+        let AgentError::Api {
+            status, message, ..
+        } = &error
+        else {
+            panic!("a 426 must stay an API error, got {error:?}");
+        };
+        assert_eq!(*status, UPGRADE_REQUIRED);
+        assert!(message.starts_with(VERSION_REFUSED));
+        assert!(message.contains(auth::CLIENT_VERSION_ENV));
+        assert!(message.ends_with(&format!("{PROXY_SAID} {VERSION_GATE_DETAIL}")));
+    }
+
+    #[test_case(401 ; "auth_failure")]
+    #[test_case(500 ; "server_error")]
+    fn other_statuses_keep_the_proxy_message(status: u16) {
+        let error = explain_version_gate(AgentError::api(status, VERSION_GATE_BODY));
+
+        assert!(matches!(
+            error,
+            AgentError::Api { status: kept, ref message, .. }
+                if kept == status && message == VERSION_GATE_BODY
+        ));
     }
 }

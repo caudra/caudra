@@ -361,6 +361,8 @@ Routing defaults: grok-4.6 (Best)
 
 OAuth uses the same first-party xAI client as the official Grok CLI (`caudra auth login xai`). Browser login (PKCE) is the desktop default; device code is recommended over SSH or in a container. Tokens refresh automatically. After login, Caudra fetches your account catalog from `GET /v1/models-v2` on the Grok CLI proxy and caches it for 15 minutes. `XAI_BASE_URL` only redirects the public API-key endpoint, never the OAuth proxy.
 
+The Grok CLI proxy only serves clients that declare a recent Grok CLI version, so Caudra sends the version it was tested against. When xAI raises its minimum before you update Caudra, requests fail with HTTP 426 and the error names the version the proxy wants. Set `CAUDRA_XAI_CLIENT_VERSION` to that version to keep working until you update.
+
 If `~/.grok/auth.json` already exists, login offers to reuse it without writing that file.
 
 ### Aperture

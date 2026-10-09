@@ -22,7 +22,7 @@ const HOUR_SECS: u64 = 3_600;
 
 /// The transcript can afford a paragraph of provider text; the status bar is one
 /// clipped line, so it gets a much shorter slice of the same detail.
-const DETAIL_CAP: usize = 400;
+pub(crate) const DETAIL_CAP: usize = 400;
 const RETRY_DETAIL_CAP: usize = 120;
 const HTML_SNIFF_CHARS: usize = 16;
 const HTML_PREFIXES: [&str; 2] = ["<!doctype", "<html"];
@@ -387,7 +387,7 @@ fn labeled(label: &str, fallback: &str, body: &str, cap: usize) -> String {
 /// The provider's own explanation, pulled out of whatever shape it arrived in.
 /// A gateway error page is markup rather than an explanation, so it is dropped
 /// and the caller falls back to status-specific guidance.
-fn provider_detail(body: &str, cap: usize) -> Option<String> {
+pub(crate) fn provider_detail(body: &str, cap: usize) -> Option<String> {
     let body = body.trim();
     if body.is_empty() || is_html(body) {
         return None;
