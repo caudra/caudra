@@ -246,13 +246,23 @@ impl AgentError {
     }
 
     pub fn user_message(&self) -> String {
+        let message = self.user_message_without_wait();
+        // Retrying stopped somewhere the user cannot see; when the provider named a
+        // window, that window is the difference between "try again" and "wait".
+        match self.retry_after() {
+            Some(after) => format!("{message} (retry after {})", friendly_wait(after)),
+            None => message,
+        }
+    }
+
+    /// [`Self::user_message`] without the provider's retry window, for a caller
+    /// that counts the wait down itself instead of freezing it into the text.
+    pub fn user_message_without_wait(&self) -> String {
         match self {
             Self::Config { message } => message.clone(),
             Self::Api {
-                status,
-                message,
-                retry_after,
-            } => api_user_message(*status, message, *retry_after),
+                status, message, ..
+            } => api_user_message(*status, message),
             Self::Tool { tool, message } => format!("{tool}: {message}"),
             Self::Io(e) => format!("I/O error: {e}"),
             Self::Http(_) => "connection error, check your network".into(),
@@ -320,8 +330,8 @@ fn model_unavailable_message(message: &str) -> bool {
         || model_detail.contains("doesn't exist")
 }
 
-fn api_user_message(status: u16, body: &str, retry_after: Option<Duration>) -> String {
-    let message = match status {
+fn api_user_message(status: u16, body: &str) -> String {
+    match status {
         401 | 403 if is_html(body) => gateway_message(status).to_owned(),
         401 => format!(
             "{}{AUTH_HINT}",
@@ -337,12 +347,6 @@ fn api_user_message(status: u16, body: &str, retry_after: Option<Duration>) -> S
             };
             labeled(&label, &label, body, DETAIL_CAP)
         }
-    };
-    // Retrying stopped somewhere the user cannot see; when the provider named a
-    // window, that window is the difference between "try again" and "wait".
-    match retry_after {
-        Some(after) => format!("{message} (retry after {})", friendly_wait(after)),
-        None => message,
     }
 }
 
@@ -799,6 +803,17 @@ mod tests {
             rate_limited_after(Duration::from_secs(secs)).user_message(),
             expected
         );
+    }
+
+    #[test_case(Some(Duration::from_secs(240)) ; "with_window")]
+    #[test_case(None ; "without_window")]
+    fn user_message_without_wait_leaves_the_window_to_the_caller(after: Option<Duration>) {
+        let error = AgentError::Api {
+            status: 429,
+            message: String::new(),
+            retry_after: after,
+        };
+        assert_eq!(error.user_message_without_wait(), RATE_LIMIT_FALLBACK);
     }
 
     #[test]

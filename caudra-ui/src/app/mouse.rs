@@ -9,6 +9,7 @@ use crate::components::permission_prompt::PromptMouse;
 use crate::components::queue_panel::{QueueAction, QueueHit, QueueHitTarget};
 use crate::components::status_bar::{StatusBarHit, StatusBarHitTarget};
 use crate::components::stream_modal::StreamAction;
+use crate::components::usage_modal::UsageMouse;
 use crate::components::workflow_card::CardHit;
 use crate::components::{Action, Overlay};
 use crate::selection::{self, ContentRegion, EdgeScroll, Selection, SelectionState, SelectionZone};
@@ -263,9 +264,14 @@ impl App {
                     return self.run_footer_command(cmdline);
                 }
             }
-            // Neither of these reads the pointer for anything but its bar, and
-            // at most one is up, so the first taker wins and the other no-ops.
-            if self.usage_modal.handle_mouse(&event) || self.float_mgr.handle_mouse(&event) {
+            // At most one of these is up, so the first taker wins and the other
+            // no-ops.
+            match self.usage_modal.handle_mouse(&event) {
+                UsageMouse::Ignored => {}
+                UsageMouse::Consumed => return Vec::new(),
+                UsageMouse::Refresh => return vec![Action::ForceRefreshUsage],
+            }
+            if self.float_mgr.handle_mouse(&event) {
                 return Vec::new();
             }
         } else if self.permission_prompt.is_open() {

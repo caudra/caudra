@@ -1067,6 +1067,9 @@ pub enum Action {
     Unbind(ModelPurpose),
     RefreshModels,
     RefreshUsage,
+    /// A click on the quota's age: the user has seen the retry window and asks
+    /// anyway.
+    ForceRefreshUsage,
     RefreshStorage,
     Compact,
     ToggleMcp(String, bool),

@@ -483,6 +483,10 @@ pub struct Anthropic {
     system_prefix: Option<String>,
     stream_timeout: Duration,
     oauth_session_id: String,
+    /// The subscription plan from the OAuth profile. It does not change between
+    /// refreshes, so `/usage` asks once instead of spending the endpoint's tight
+    /// rate limit on it every time.
+    cached_plan: Mutex<Option<Option<String>>>,
     /// Env / `providers.toml` / inventory default, resolved once at construction.
     /// Reused by key rotation / reload so they do not re-parse providers.toml.
     resolved_base_url: Option<String>,
@@ -511,6 +515,7 @@ impl Anthropic {
             system_prefix: None,
             stream_timeout: timeouts.stream,
             oauth_session_id: random_id(),
+            cached_plan: Mutex::new(None),
             resolved_base_url,
         })
     }
@@ -530,6 +535,7 @@ impl Anthropic {
             system_prefix: None,
             stream_timeout: timeouts.stream,
             oauth_session_id: random_id(),
+            cached_plan: Mutex::new(None),
             // Custom / dynamic callers own their base URL; treating it as the
             // anthropic override would make every third-party endpoint look
             // first party and poll `/api/oauth/usage` against it.
@@ -905,6 +911,26 @@ impl Anthropic {
             serde_json::from_str(&self.do_oauth_get(auth, PROFILE_PATH).await?)?;
         Ok(profile_plan(&profile))
     }
+
+    /// A failure is not remembered, so the next refresh asks again.
+    async fn cached_profile_plan(&self) -> Option<String> {
+        if let Some(plan) = self.cached_plan.lock().unwrap().clone() {
+            return plan;
+        }
+        match self
+            .with_oauth_retry(|auth, _| async move { self.do_fetch_profile_plan(&auth).await })
+            .await
+        {
+            Ok(plan) => {
+                *self.cached_plan.lock().unwrap() = Some(plan.clone());
+                plan
+            }
+            Err(error) => {
+                warn!(%error, "failed to fetch Anthropic OAuth profile");
+                None
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1130,13 +1156,7 @@ impl Provider for Anthropic {
             let mut usage = self
                 .with_oauth_retry(|auth, _| async move { self.do_fetch_usage(&auth).await })
                 .await?;
-            match self
-                .with_oauth_retry(|auth, _| async move { self.do_fetch_profile_plan(&auth).await })
-                .await
-            {
-                Ok(plan) => usage.plan = plan,
-                Err(error) => warn!(%error, "failed to fetch Anthropic OAuth profile"),
-            }
+            usage.plan = self.cached_profile_plan().await;
             Ok(Some(usage))
         })
     }

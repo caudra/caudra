@@ -6,12 +6,12 @@ use arc_swap::ArcSwapOption;
 use caudra_config::ClockFormat;
 use caudra_grab::grab_scope;
 use caudra_providers::{
-    Billing, Model, ModelSpend, ProviderUsage, TokenUsage, add_cost, format_hit_rate,
+    AgentError, Billing, Model, ModelSpend, ProviderUsage, TokenUsage, add_cost, format_hit_rate,
     format_tokens, format_tokens_u64, model_cost,
 };
 use caudra_storage::sessions::StoredTokenUsage;
 use caudra_storage::usage_ledger::{LifetimeUsage, UsageSlice};
-use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use ratatui::Frame;
@@ -21,9 +21,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::components::keybindings::{Bind, key};
-use crate::components::modal::Modal;
+use crate::components::modal::{FooterHits, Modal};
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
-use crate::components::{ModalScroll, bar_area};
+use crate::components::{ModalScroll, bar_area, hover_style};
 use crate::repaint::{Dirty, Watch};
 use crate::theme;
 
@@ -48,21 +48,87 @@ const TOKEN_INTEGER_PADDING: &str = "   ";
 const RATE_COL: usize = 4;
 const COL_GAP: usize = 2;
 const NO_USAGE_ENDPOINT: &str = "no usage endpoint for this provider";
+const LOADING: &str = "loading…";
+const REFRESHING: &str = "refreshing…";
+const STALE_PREFIX: &str = "couldn't refresh: ";
+const STALE_FROM: &str = "showing figures from ";
+const FRESH_FROM: &str = "as of ";
+const NOTE_SEPARATOR: &str = " · ";
 /// What a subscription figure is: the API list price for the same tokens, with
 /// no invoice behind it.
 const SUBSCRIPTION_LINE: &str = "subscription (not billed)";
 const NOT_BILLED_MARK: &str = "~";
-const HOUR: i64 = 3600;
+const MINUTE: i64 = 60;
+const HOUR: i64 = 60 * MINUTE;
 const DAY: i64 = 24 * HOUR;
 const WEEK: i64 = 7 * DAY;
 
+/// A quota answer the provider gave, and when, so a failed refresh can keep
+/// showing it with its age.
+#[derive(Clone)]
+pub struct FetchedUsage {
+    pub usage: ProviderUsage,
+    pub fetched_at: Timestamp,
+}
+
 /// Live provider quota fetch, shared from the event loop. A detached task
 /// drops the answer into the slot, and [`UsageModal::poll`] is what notices.
+///
+/// Usage endpoints rate-limit far harder than chat does, so a refresh carries
+/// the last good answer forward instead of trading it for an error.
 pub enum UsageFetchState {
-    Loading,
-    Ready(ProviderUsage),
+    Loading {
+        last: Option<FetchedUsage>,
+    },
+    Ready(FetchedUsage),
     Unsupported,
-    Error(String),
+    Error {
+        message: String,
+        /// When the provider said to ask again; until then a refresh stays home.
+        retry_at: Option<Timestamp>,
+        last: Option<FetchedUsage>,
+    },
+}
+
+impl UsageFetchState {
+    pub fn settled(
+        last: Option<FetchedUsage>,
+        result: Result<Option<ProviderUsage>, AgentError>,
+        now: Timestamp,
+    ) -> Self {
+        match result {
+            Ok(Some(usage)) => Self::Ready(FetchedUsage {
+                usage,
+                fetched_at: now,
+            }),
+            Ok(None) => Self::Unsupported,
+            Err(error) => Self::Error {
+                message: error.user_message_without_wait(),
+                retry_at: error
+                    .retry_after()
+                    .and_then(|after| now.checked_add(after).ok()),
+                last,
+            },
+        }
+    }
+
+    pub fn last_good(&self) -> Option<&FetchedUsage> {
+        match self {
+            Self::Ready(fetched) => Some(fetched),
+            Self::Loading { last } | Self::Error { last, .. } => last.as_ref(),
+            Self::Unsupported => None,
+        }
+    }
+
+    /// Whether the figures' age is on screen as something to click. Not while
+    /// a fetch is in flight, which a second one would only race.
+    fn offers_refresh(&self) -> bool {
+        matches!(self, Self::Ready(_) | Self::Error { last: Some(_), .. })
+    }
+
+    pub fn cooling_down(&self, now: Timestamp) -> bool {
+        matches!(self, Self::Error { retry_at: Some(at), .. } if *at > now)
+    }
 }
 
 /// Which of the two answers the modal is showing: what this session spent, or
@@ -101,7 +167,17 @@ pub struct UsageModal {
     /// modal and this is what reaches them.
     pan_bar: Scrollbar,
     quota: Watch<UsageFetchState>,
+    /// The quota's age, which a click turns into a refresh.
+    refresh: FooterHits,
     popup: Rect,
+}
+
+/// What the pointer asked of the host. `Ignored` hands the event back.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum UsageMouse {
+    Ignored,
+    Consumed,
+    Refresh,
 }
 
 impl UsageModal {
@@ -113,6 +189,7 @@ impl UsageModal {
             scrollbar: Scrollbar::default(),
             pan_bar: Scrollbar::horizontal(),
             quota: Watch::default(),
+            refresh: FooterHits::default(),
             popup: Rect::default(),
         }
     }
@@ -138,6 +215,7 @@ impl UsageModal {
     pub fn toggle(&mut self) {
         self.open = !self.open;
         self.scroll.reset();
+        self.refresh.reset();
     }
 
     pub fn scope(&self) -> UsageScope {
@@ -157,26 +235,37 @@ impl UsageModal {
     pub fn close(&mut self) {
         self.open = false;
         self.scroll.reset();
+        self.refresh.reset();
     }
 
-    /// The modal reads nothing else from the pointer, so the two bars are all
-    /// there is to offer and a bool is all there is to say. They sit on different
-    /// rows, so at most one of them answers a press.
-    pub fn handle_mouse(&mut self, event: &MouseEvent) -> bool {
+    /// The quota's age is asked first, the way a footer control is: a press on
+    /// it is never the start of a sweep. The two bars sit on different rows, so
+    /// at most one of them answers a press.
+    pub(crate) fn handle_mouse(&mut self, event: &MouseEvent) -> UsageMouse {
+        if !self.open {
+            return UsageMouse::Ignored;
+        }
+        if self.refresh.handle_mouse(*event).is_some() {
+            return UsageMouse::Refresh;
+        }
+        if event.kind == MouseEventKind::Down(MouseButton::Left) && self.refresh.hovered().is_some()
+        {
+            return UsageMouse::Consumed;
+        }
         match self.scrollbar.handle(event) {
             ScrollbarMouse::Ignored => {}
-            ScrollbarMouse::Consumed => return true,
+            ScrollbarMouse::Consumed => return UsageMouse::Consumed,
             ScrollbarMouse::ScrollTo(top) => {
                 self.scroll.scroll_to(top as u16);
-                return true;
+                return UsageMouse::Consumed;
             }
         }
         match self.pan_bar.handle(event) {
-            ScrollbarMouse::Ignored => false,
-            ScrollbarMouse::Consumed => true,
+            ScrollbarMouse::Ignored => UsageMouse::Ignored,
+            ScrollbarMouse::Consumed => UsageMouse::Consumed,
             ScrollbarMouse::ScrollTo(column) => {
                 self.scroll.pan_to(column as u16);
-                true
+                UsageMouse::Consumed
             }
         }
     }
@@ -210,9 +299,9 @@ impl UsageModal {
         grab_scope!("usage_modal", area);
 
         let theme = theme::current();
-        let lines = match self.scope {
+        let (mut lines, refresh_row) = match self.scope {
             UsageScope::Session => build_lines(ctx, self.quota.get(), &theme),
-            UsageScope::Lifetime => build_lifetime_lines(ctx.lifetime, &theme),
+            UsageScope::Lifetime => (build_lifetime_lines(ctx.lifetime, &theme), None),
         };
 
         let total = lines.len() as u16;
@@ -235,6 +324,21 @@ impl UsageModal {
         self.scroll.fit_width(content_w, inner.width);
         let scroll = self.scroll.offset();
         let pan = self.scroll.pan();
+
+        let refresh_line = refresh_row.and_then(|row| Some((row, lines.get(row)?)));
+        self.refresh.set(
+            refresh_line
+                .and_then(|(row, line)| refresh_hit(line, row, inner, scroll, pan))
+                .into_iter()
+                .collect(),
+        );
+        if self.refresh.hovered().is_some()
+            && let Some(age) = refresh_row
+                .and_then(|row| lines.get_mut(row))
+                .and_then(|line| line.spans.last_mut())
+        {
+            age.style = hover_style(age.style, true);
+        }
 
         frame.render_widget(Paragraph::new(lines).scroll((scroll, pan)), inner);
 
@@ -276,12 +380,14 @@ impl UsageModal {
     }
 }
 
+/// The lines, and which of them ends in the quota's clickable age.
 fn build_lines(
     ctx: &UsageModalContext,
     quota: Option<&UsageFetchState>,
     theme: &crate::theme::Theme,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, Option<usize>) {
     let mut lines: Vec<Line> = Vec::new();
+    let mut refresh_row = None;
 
     lines.push(Line::from(Span::styled(
         format!("{PREFIX}Session total"),
@@ -297,11 +403,19 @@ fn build_lines(
             format!("{PREFIX}{} quota", ctx.model.provider_display_name()),
             theme.keybind_section,
         )));
-        lines.extend(quota_lines(state, theme, ctx.clock_format));
+        lines.extend(quota_lines(
+            state,
+            theme,
+            ctx.clock_format,
+            Timestamp::now(),
+        ));
+        if state.offers_refresh() {
+            refresh_row = lines.len().checked_sub(1);
+        }
     }
 
     if ctx.by_model.is_empty() {
-        return lines;
+        return (lines, refresh_row);
     }
 
     let mut models = model_rows(ctx);
@@ -316,7 +430,23 @@ fn build_lines(
     }
     lines.extend(breakdown_table("Per model", &models, theme));
 
-    lines
+    (lines, refresh_row)
+}
+
+/// Where the last span of `line`, drawn at `row` of an unwrapped paragraph
+/// scrolled to `scroll` and panned to `pan`, landed inside `area`, clipped to
+/// what is visible.
+fn refresh_hit(line: &Line, row: usize, area: Rect, scroll: u16, pan: u16) -> Option<Rect> {
+    let target = line.spans.last()?;
+    let row = u16::try_from(row).ok()?.checked_sub(scroll)?;
+    if row >= area.height {
+        return None;
+    }
+    let start = u16::try_from(line.width() - target.width()).ok()?;
+    let end = start.saturating_add(u16::try_from(target.width()).ok()?);
+    let left = start.max(pan) - pan;
+    let right = end.saturating_sub(pan).min(area.width);
+    (left < right).then(|| Rect::new(area.x + left, area.y + row, right - left, 1))
 }
 
 /// One line of a session breakdown, before it is laid out.
@@ -740,61 +870,134 @@ impl crate::components::Overlay for UsageModal {
     }
 }
 
+/// `now` decides whether a retry window is still ahead, so the countdown is
+/// worked out on every frame rather than frozen when the error arrived.
 fn quota_lines(
     state: &UsageFetchState,
+    theme: &crate::theme::Theme,
+    clock: ClockFormat,
+    now: Timestamp,
+) -> Vec<Line<'static>> {
+    let dim = theme.status_dim;
+    let note = |text: String| Line::from(Span::styled(format!("{PREFIX}{text}"), dim));
+    match state {
+        UsageFetchState::Loading { last: None } => vec![note(LOADING.into())],
+        UsageFetchState::Loading {
+            last: Some(fetched),
+        } => {
+            let mut out = limit_lines(&fetched.usage, theme, clock);
+            out.push(note(format!(
+                "{REFRESHING}{NOTE_SEPARATOR}{FRESH_FROM}{}",
+                fetched_clock(fetched, clock)
+            )));
+            out
+        }
+        UsageFetchState::Unsupported => vec![note(NO_USAGE_ENDPOINT.into())],
+        UsageFetchState::Ready(fetched) => {
+            let mut out = limit_lines(&fetched.usage, theme, clock);
+            out.push(aged_note(
+                String::new(),
+                format!("{FRESH_FROM}{}", fetched_clock(fetched, clock)),
+                dim,
+            ));
+            out
+        }
+        UsageFetchState::Error {
+            message,
+            retry_at,
+            last,
+        } => {
+            let mut text = match last {
+                Some(_) => format!("{STALE_PREFIX}{message}"),
+                None => message.clone(),
+            };
+            if let Some(wait) = retry_at
+                .map(|at| at.as_second() - now.as_second())
+                .filter(|secs| *secs > 0)
+            {
+                text.push_str(&format!("{NOTE_SEPARATOR}retry {}", retry_wait(wait)));
+            }
+            let Some(fetched) = last else {
+                return vec![note(text)];
+            };
+            let mut out = limit_lines(&fetched.usage, theme, clock);
+            text.push_str(NOTE_SEPARATOR);
+            out.push(aged_note(
+                text,
+                format!("{STALE_FROM}{}", fetched_clock(fetched, clock)),
+                dim,
+            ));
+            out
+        }
+    }
+}
+
+/// The figures' age is the line's last span on its own, which is what
+/// [`refresh_hit`] measures and the pointer marks.
+fn aged_note(lead: String, age: String, style: Style) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{PREFIX}{lead}"), style),
+        Span::styled(age, style),
+    ])
+}
+
+fn limit_lines(
+    usage: &ProviderUsage,
     theme: &crate::theme::Theme,
     clock: ClockFormat,
 ) -> Vec<Line<'static>> {
     let fg = Style::new().fg(theme.foreground);
     let dim = theme.status_dim;
-    match state {
-        UsageFetchState::Loading => {
-            vec![Line::from(Span::styled(format!("{PREFIX}loading…"), dim))]
+    let mut out = Vec::with_capacity(usage.limits.len() + 2);
+    if let Some(plan) = &usage.plan {
+        out.push(Line::from(Span::styled(
+            format!("{PREFIX}plan: {plan}"),
+            fg,
+        )));
+    }
+    let tz = TimeZone::system();
+    let label_w = usage
+        .limits
+        .iter()
+        .map(|l| l.label.chars().count())
+        .max()
+        .unwrap_or(0);
+    for limit in &usage.limits {
+        let mut spans = vec![Span::styled(
+            format!("{PREFIX}{:<label_w$}", limit.label),
+            fg,
+        )];
+        if let Some(pct) = limit.percentage {
+            spans.push(Span::styled(format!("{pct:>3}%"), theme.accent));
+            spans.push(Span::styled(" used", dim));
         }
-        UsageFetchState::Unsupported => vec![Line::from(Span::styled(
-            format!("{PREFIX}{NO_USAGE_ENDPOINT}"),
-            dim,
-        ))],
-        UsageFetchState::Error(msg) => {
-            vec![Line::from(Span::styled(format!("{PREFIX}{msg}"), dim))]
+        if let Some(detail) = &limit.detail {
+            spans.push(Span::styled(format!("  {detail}"), dim));
         }
-        UsageFetchState::Ready(usage) => {
-            let mut out = Vec::with_capacity(usage.limits.len() + 1);
-            if let Some(plan) = &usage.plan {
-                out.push(Line::from(Span::styled(
-                    format!("{PREFIX}plan: {plan}"),
-                    fg,
-                )));
-            }
-            let tz = TimeZone::system();
-            let label_w = usage
-                .limits
-                .iter()
-                .map(|l| l.label.chars().count())
-                .max()
-                .unwrap_or(0);
-            for limit in &usage.limits {
-                let mut spans = vec![Span::styled(
-                    format!("{PREFIX}{:<label_w$}", limit.label),
-                    fg,
-                )];
-                if let Some(pct) = limit.percentage {
-                    spans.push(Span::styled(format!("{pct:>3}%"), theme.accent));
-                    spans.push(Span::styled(" used", dim));
-                }
-                if let Some(detail) = &limit.detail {
-                    spans.push(Span::styled(format!("  {detail}"), dim));
-                }
-                if let Some(ms) = limit.reset_at {
-                    spans.push(Span::styled(
-                        format!("  Resets {}", format_reset(ms, &tz, clock)),
-                        dim,
-                    ));
-                }
-                out.push(Line::from(spans));
-            }
-            out
+        if let Some(ms) = limit.reset_at {
+            spans.push(Span::styled(
+                format!("  Resets {}", format_reset(ms, &tz, clock)),
+                dim,
+            ));
         }
+        out.push(Line::from(spans));
+    }
+    out
+}
+
+fn fetched_clock(fetched: &FetchedUsage, clock: ClockFormat) -> String {
+    fetched
+        .fetched_at
+        .to_zoned(TimeZone::system())
+        .strftime(crate::clock::hm(clock))
+        .to_string()
+}
+
+fn retry_wait(seconds: i64) -> String {
+    if seconds < MINUTE {
+        format!("in {seconds}s")
+    } else {
+        relative(seconds)
     }
 }
 
@@ -834,10 +1037,28 @@ mod tests {
     use crate::repaint::expect::{OWED, QUIET};
     use caudra_providers::UsageLimit;
     use caudra_workbench::scroll::{SCROLLBAR_STEP_FORWARD, SCROLLBAR_THUMB_HORIZONTAL};
-    use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+    use crossterm::event::KeyModifiers;
+    use ratatui::buffer::Buffer;
+    use ratatui::style::Modifier;
     use std::sync::Arc;
+    use std::time::Duration;
     use test_case::test_case;
 
+    const QUOTA_NOW_SECS: i64 = 1_800_000_000;
+    const RETRY_AHEAD_SECS: i64 = 240;
+    const RETRY_AHEAD_TEXT: &str = "in 4 min";
+    const ERROR_TEXT: &str = "rate limited";
+    const SESSION_LABEL: &str = "Current session";
+    const FROZEN_WAIT: &str = "retry after";
+    const STALE_KEPT: &str = "a failed refresh must not throw away the figures it had";
+    const AGE_SHOWN: &str = "quota figures always say when they were fetched";
+    const AGE_UNREACHABLE: &str = "the quota's age must be where a pointer reaches it";
+    const AGE_HOVER_MISSED: &str = "the whole age, and only it, must reverse under the pointer";
+    const AGE_PRESS_LEAKED: &str = "a press on the age is the modal's, not the start of a sweep";
+    /// After the prefix, seven columns: `start` lands at 9, `end` at 20.
+    const AGE_LEAD: &str = "lead · ";
+    const AGE_PHRASE: &str = "as of 12:00";
+    const AGE_AREA: Rect = Rect::new(10, 5, 30, 4);
     const RECORDED_COST: f64 = 0.123;
     const RECORDED_TEXT: &str = "0.123";
     const SUBSCRIPTION_COST: f64 = 4.567;
@@ -1282,14 +1503,12 @@ mod tests {
         assert!(modal.is_open());
     }
 
-    #[test]
-    fn quota_ready_lines_include_labels_and_percentages() {
-        let theme = crate::theme::current();
-        let usage = ProviderUsage {
+    fn quota_usage() -> ProviderUsage {
+        ProviderUsage {
             plan: Some("lite".into()),
             limits: vec![
                 UsageLimit {
-                    label: "Current session".into(),
+                    label: SESSION_LABEL.into(),
                     percentage: Some(16),
                     reset_at: Some(0),
                     detail: None,
@@ -1301,9 +1520,50 @@ mod tests {
                     detail: Some("$2.33 spent".into()),
                 },
             ],
-        };
-        let lines = quota_lines(&UsageFetchState::Ready(usage), &theme, ClockFormat::Hour24);
-        assert_eq!(lines.len(), 3);
+        }
+    }
+
+    fn fetched() -> FetchedUsage {
+        FetchedUsage {
+            usage: quota_usage(),
+            fetched_at: quota_now(),
+        }
+    }
+
+    fn quota_now() -> Timestamp {
+        Timestamp::from_second(QUOTA_NOW_SECS).unwrap()
+    }
+
+    fn rate_limited(retry_after: Option<Duration>) -> AgentError {
+        AgentError::Api {
+            status: 429,
+            message: String::new(),
+            retry_after,
+        }
+    }
+
+    fn lines_text(lines: &[Line]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    fn quota_text(state: &UsageFetchState, now: Timestamp) -> Vec<String> {
+        let theme = crate::theme::current();
+        lines_text(&quota_lines(state, &theme, ClockFormat::Hour24, now))
+    }
+
+    #[test]
+    fn quota_ready_lines_include_labels_and_percentages() {
+        let theme = crate::theme::current();
+        let lines = quota_lines(
+            &UsageFetchState::Ready(fetched()),
+            &theme,
+            ClockFormat::Hour24,
+            quota_now(),
+        );
+        assert_eq!(lines.len(), 4);
         assert!(
             lines[0]
                 .spans
@@ -1331,27 +1591,121 @@ mod tests {
                 .iter()
                 .any(|s| s.content.contains("$2.33 spent"))
         );
+        assert_eq!(
+            lines_text(&lines[3..]),
+            [format!(
+                "{PREFIX}{FRESH_FROM}{}",
+                fetched_clock(&fetched(), ClockFormat::Hour24)
+            )],
+            "{AGE_SHOWN}"
+        );
     }
 
     #[test]
     fn quota_non_terminal_states_render_single_line() {
-        let theme = crate::theme::current();
-        let clock = ClockFormat::Hour24;
+        let now = quota_now();
         assert_eq!(
-            quota_lines(&UsageFetchState::Loading, &theme, clock).len(),
-            1
+            quota_text(&UsageFetchState::Loading { last: None }, now),
+            [format!("{PREFIX}{LOADING}")]
         );
-        let unsupported = quota_lines(&UsageFetchState::Unsupported, &theme, clock);
-        assert_eq!(unsupported.len(), 1);
+        assert_eq!(
+            quota_text(&UsageFetchState::Unsupported, now),
+            [format!("{PREFIX}{NO_USAGE_ENDPOINT}")]
+        );
+        let error = UsageFetchState::Error {
+            message: ERROR_TEXT.into(),
+            retry_at: None,
+            last: None,
+        };
+        assert_eq!(quota_text(&error, now), [format!("{PREFIX}{ERROR_TEXT}")]);
+    }
+
+    #[test]
+    fn a_refresh_in_flight_keeps_the_last_figures_on_screen() {
+        let text = quota_text(
+            &UsageFetchState::Loading {
+                last: Some(fetched()),
+            },
+            quota_now(),
+        );
+        assert_eq!(text.len(), 4, "{text:?}");
+        assert!(text[1].contains(SESSION_LABEL), "{text:?}");
+        assert_eq!(
+            text[3],
+            format!(
+                "{PREFIX}{REFRESHING}{NOTE_SEPARATOR}{FRESH_FROM}{}",
+                fetched_clock(&fetched(), ClockFormat::Hour24)
+            ),
+            "{AGE_SHOWN}"
+        );
+    }
+
+    #[test_case(RETRY_AHEAD_SECS, true ; "inside_the_window")]
+    #[test_case(-RETRY_AHEAD_SECS, false ; "after_the_window")]
+    fn a_failed_refresh_keeps_the_figures_and_counts_the_window_down(offset: i64, counting: bool) {
+        let now = quota_now();
+        let state = UsageFetchState::Error {
+            message: ERROR_TEXT.into(),
+            retry_at: Some(Timestamp::from_second(QUOTA_NOW_SECS + offset).unwrap()),
+            last: Some(fetched()),
+        };
+        let text = quota_text(&state, now);
+        assert_eq!(text.len(), 4, "{text:?}");
+        assert!(text[1].contains(SESSION_LABEL), "{text:?}");
+        let note = &text[3];
         assert!(
-            unsupported[0]
-                .spans
-                .iter()
-                .any(|s| s.content.contains(NO_USAGE_ENDPOINT))
+            note.starts_with(&format!("{PREFIX}{STALE_PREFIX}{ERROR_TEXT}")),
+            "{note}"
         );
-        let err = quota_lines(&UsageFetchState::Error("nope".into()), &theme, clock);
-        assert_eq!(err.len(), 1);
-        assert!(err[0].spans.iter().any(|s| s.content.contains("nope")));
+        assert_eq!(note.contains(RETRY_AHEAD_TEXT), counting, "{note}");
+        assert!(note.contains(STALE_FROM), "{note}");
+    }
+
+    #[test]
+    fn a_first_fetch_that_fails_counts_the_window_down() {
+        let state = UsageFetchState::Error {
+            message: ERROR_TEXT.into(),
+            retry_at: Some(Timestamp::from_second(QUOTA_NOW_SECS + RETRY_AHEAD_SECS).unwrap()),
+            last: None,
+        };
+        assert_eq!(
+            quota_text(&state, quota_now()),
+            [format!(
+                "{PREFIX}{ERROR_TEXT}{NOTE_SEPARATOR}retry {RETRY_AHEAD_TEXT}"
+            )]
+        );
+    }
+
+    #[test_case(Some(Duration::from_secs(RETRY_AHEAD_SECS as u64)), true ; "provider_named_a_window")]
+    #[test_case(None, false ; "no_window")]
+    fn a_failed_fetch_carries_the_last_answer_and_the_window(
+        retry_after: Option<Duration>,
+        cooling: bool,
+    ) {
+        let now = quota_now();
+        let state = UsageFetchState::settled(Some(fetched()), Err(rate_limited(retry_after)), now);
+        assert!(state.last_good().is_some(), "{STALE_KEPT}");
+        let UsageFetchState::Error { message, .. } = &state else {
+            panic!("a failed fetch settles as an error");
+        };
+        assert!(!message.contains(FROZEN_WAIT), "{message}");
+        assert_eq!(state.cooling_down(now), cooling);
+        let after = Timestamp::from_second(QUOTA_NOW_SECS + RETRY_AHEAD_SECS).unwrap();
+        assert!(!state.cooling_down(after), "the window ends when it said");
+    }
+
+    #[test]
+    fn a_successful_fetch_replaces_the_last_answer() {
+        let later = Timestamp::from_second(QUOTA_NOW_SECS + RETRY_AHEAD_SECS).unwrap();
+        let state = UsageFetchState::settled(Some(fetched()), Ok(Some(quota_usage())), later);
+        assert_eq!(state.last_good().map(|f| f.fetched_at), Some(later));
+        assert!(!state.cooling_down(quota_now()));
+    }
+
+    #[test]
+    fn a_provider_without_an_endpoint_drops_the_last_answer() {
+        let state = UsageFetchState::settled(Some(fetched()), Ok(None), quota_now());
+        assert!(state.last_good().is_none());
     }
 
     fn stored(cost: Option<f64>) -> StoredTokenUsage {
@@ -1388,7 +1742,7 @@ mod tests {
             clock_format: ClockFormat::Hour24,
             lifetime: None,
         };
-        line_texts(&build_lines(&ctx, None, &crate::theme::current()))
+        line_texts(&build_lines(&ctx, None, &crate::theme::current()).0)
     }
 
     #[test_case(false; "single_provider")]
@@ -1683,6 +2037,14 @@ mod tests {
         width: u16,
         by_model: &HashMap<String, StoredTokenUsage>,
     ) -> String {
+        buffer_text(&draw_at(modal, width, by_model))
+    }
+
+    fn draw_at(
+        modal: &mut UsageModal,
+        width: u16,
+        by_model: &HashMap<String, StoredTokenUsage>,
+    ) -> Buffer {
         let backend = ratatui::backend::TestBackend::new(width, 30);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         let model = test_model();
@@ -1701,7 +2063,7 @@ mod tests {
                 modal.view(f, f.area(), &ctx);
             })
             .unwrap();
-        buffer_text(terminal.backend().buffer())
+        terminal.backend().buffer().clone()
     }
 
     /// A breakdown whose model id is long enough that the cost column cannot fit
@@ -1880,12 +2242,15 @@ mod tests {
         let clipped = render_at(&mut modal, NARROW_TERMINAL, &breakdown);
         // The bar runs along the bottom border row, inside the corners, and the
         // last cell of a track is the end of the document by definition.
-        assert!(modal.handle_mouse(&MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: arrow_column(&clipped, SCROLLBAR_STEP_FORWARD) - 2,
-            row: modal.popup.bottom() - 1,
-            modifiers: KeyModifiers::NONE,
-        }));
+        assert_eq!(
+            modal.handle_mouse(&MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: arrow_column(&clipped, SCROLLBAR_STEP_FORWARD) - 2,
+                row: modal.popup.bottom() - 1,
+                modifiers: KeyModifiers::NONE,
+            }),
+            UsageMouse::Consumed
+        );
 
         assert!(
             render_at(&mut modal, NARROW_TERMINAL, &breakdown).contains(RECORDED_TEXT),
@@ -1900,7 +2265,7 @@ mod tests {
     /// modal is not on screen, so it must not pick anything up.
     #[test]
     fn poll_owes_a_frame_only_for_a_value_the_open_modal_has_not_seen() {
-        let slot = slot(UsageFetchState::Loading);
+        let slot = slot(UsageFetchState::Loading { last: None });
         let mut modal = UsageModal::new();
 
         assert_eq!(
@@ -1946,6 +2311,85 @@ mod tests {
             render(&mut modal).contains(NO_USAGE_ENDPOINT),
             "a reopened modal still shows the last answer it saw"
         );
+    }
+
+    fn pointer(kind: MouseEventKind, at: Rect) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: at.x,
+            row: at.y,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn stale(retry_at: Option<Timestamp>) -> UsageFetchState {
+        UsageFetchState::Error {
+            message: ERROR_TEXT.into(),
+            retry_at,
+            last: Some(fetched()),
+        }
+    }
+
+    fn opened_on(state: UsageFetchState) -> UsageModal {
+        let mut modal = UsageModal::new();
+        modal.toggle();
+        assert_eq!(modal.poll(&slot(state)), Dirty::YES, "{OWED}");
+        modal
+    }
+
+    /// The age marks as one phrase under the pointer, and a press and release
+    /// on it asks for a refresh, even inside the retry window: that window is
+    /// on screen beside it, so the click is a decision, not an accident.
+    #[test_case(UsageFetchState::Ready(fetched()) ; "fresh")]
+    #[test_case(stale(Some(Timestamp::MAX)) ; "stale_inside_the_window")]
+    fn a_click_on_the_quota_age_asks_for_a_refresh(state: UsageFetchState) {
+        let mut modal = opened_on(state);
+        draw_at(&mut modal, WIDE_TERMINAL, &HashMap::new());
+        let hit = modal.refresh.hit(0);
+        assert!(!hit.is_empty(), "{AGE_UNREACHABLE}");
+
+        modal.handle_mouse(&pointer(MouseEventKind::Moved, hit));
+        let buffer = draw_at(&mut modal, WIDE_TERMINAL, &HashMap::new());
+        let reversed: Vec<Position> = buffer
+            .area
+            .positions()
+            .filter(|at| buffer[*at].modifier.contains(Modifier::REVERSED))
+            .collect();
+        assert!(
+            reversed.len() == usize::from(hit.width) && reversed.iter().all(|at| hit.contains(*at)),
+            "{AGE_HOVER_MISSED}: hit={hit:?} reversed={reversed:?}"
+        );
+
+        let press = modal.handle_mouse(&pointer(MouseEventKind::Down(MouseButton::Left), hit));
+        assert_eq!(press, UsageMouse::Consumed, "{AGE_PRESS_LEAKED}");
+        let release = modal.handle_mouse(&pointer(MouseEventKind::Up(MouseButton::Left), hit));
+        assert_eq!(release, UsageMouse::Refresh);
+    }
+
+    #[test_case(UsageFetchState::Loading { last: Some(fetched()) } ; "already_refreshing")]
+    #[test_case(UsageFetchState::Error { message: ERROR_TEXT.into(), retry_at: None, last: None } ; "nothing_fetched_yet")]
+    #[test_case(UsageFetchState::Unsupported ; "no_endpoint")]
+    fn only_figures_that_can_be_refreshed_offer_a_click(state: UsageFetchState) {
+        let mut modal = opened_on(state);
+        draw_at(&mut modal, WIDE_TERMINAL, &HashMap::new());
+        assert!(modal.refresh.hit(0).is_empty());
+    }
+
+    #[test_case(1, 0, 0, AGE_AREA, Some(Rect::new(19, 6, 11, 1)) ; "whole_phrase")]
+    #[test_case(1, 0, 12, AGE_AREA, Some(Rect::new(10, 6, 8, 1)) ; "panned_into")]
+    #[test_case(1, 0, 20, AGE_AREA, None ; "panned_past")]
+    #[test_case(1, 2, 0, AGE_AREA, None ; "scrolled_above")]
+    #[test_case(5, 0, 0, AGE_AREA, None ; "below_the_area")]
+    #[test_case(1, 0, 0, Rect::new(10, 5, 15, 4), Some(Rect::new(19, 6, 6, 1)) ; "cut_by_the_edge")]
+    fn the_age_hit_covers_only_what_is_drawn(
+        row: usize,
+        scroll: u16,
+        pan: u16,
+        area: Rect,
+        expected: Option<Rect>,
+    ) {
+        let line = aged_note(AGE_LEAD.into(), AGE_PHRASE.into(), Style::new());
+        assert_eq!(refresh_hit(&line, row, area, scroll, pan), expected);
     }
 
     #[test]

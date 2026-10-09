@@ -80,6 +80,7 @@ use crossterm::event::KeyEventKind;
 use crossterm::event::{
     Event, KeyModifiers, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
 };
+use jiff::Timestamp;
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -4579,6 +4580,7 @@ impl<'t> EventLoop<'t> {
             }
             Action::RefreshModels => self.refresh_models(),
             Action::RefreshUsage => self.refresh_usage(),
+            Action::ForceRefreshUsage => self.force_refresh_usage(),
             Action::RefreshStorage => self.refresh_storage(),
             Action::ManualExit => self.sessions[idx].notifications.on_manual_exit(),
         }
@@ -4667,16 +4669,39 @@ impl<'t> EventLoop<'t> {
         .detach();
     }
 
+    /// Inside the provider's retry window the modal already says when to try
+    /// again, and asking anyway only pushes that window further out.
     fn refresh_usage(&mut self) {
+        let previous = self.focused_app().usage_slot.load_full();
+        if previous
+            .as_deref()
+            .is_some_and(|state| state.cooling_down(Timestamp::now()))
+        {
+            return;
+        }
+        self.fetch_usage(previous.as_deref());
+    }
+
+    /// A double click lands twice before the modal has drawn `Loading`, and
+    /// only the first of them should ask.
+    fn force_refresh_usage(&mut self) {
+        let previous = self.focused_app().usage_slot.load_full();
+        if matches!(previous.as_deref(), Some(UsageFetchState::Loading { .. })) {
+            return;
+        }
+        self.fetch_usage(previous.as_deref());
+    }
+
+    fn fetch_usage(&mut self, previous: Option<&UsageFetchState>) {
         let provider = Arc::clone(&self.ctx.model_slot.load().provider);
         let slot = Arc::clone(&self.focused_app().usage_slot);
-        slot.store(Some(Arc::new(UsageFetchState::Loading)));
+        let last = previous.and_then(UsageFetchState::last_good).cloned();
+        slot.store(Some(Arc::new(UsageFetchState::Loading {
+            last: last.clone(),
+        })));
         smol::spawn(async move {
-            let state = match provider.fetch_usage().await {
-                Ok(Some(usage)) => UsageFetchState::Ready(usage),
-                Ok(None) => UsageFetchState::Unsupported,
-                Err(e) => UsageFetchState::Error(e.user_message()),
-            };
+            let result = provider.fetch_usage().await;
+            let state = UsageFetchState::settled(last, result, Timestamp::now());
             slot.store(Some(Arc::new(state)));
         })
         .detach();

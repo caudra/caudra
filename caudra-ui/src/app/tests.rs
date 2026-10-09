@@ -7758,7 +7758,7 @@ fn usage_quota_arriving_in_the_background_owes_a_frame() {
     let slot = Arc::clone(&app.usage_slot);
 
     assert_owes_one_frame(&mut app, || {
-        slot.store(Some(Arc::new(UsageFetchState::Loading)));
+        slot.store(Some(Arc::new(UsageFetchState::Loading { last: None })));
     });
 }
 
