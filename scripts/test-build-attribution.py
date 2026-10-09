@@ -8,10 +8,11 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-import tomllib
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+import tomllib
 
 SPEC = importlib.util.spec_from_file_location(
     "build_attribution", Path(__file__).with_name("build-attribution.py")
@@ -621,14 +622,17 @@ class AttributionTests(unittest.TestCase):
         self.assertEqual(record["selected_license"], ["Apache-2.0", "MPL-2.0"])
         self.assertEqual((output / license_path).read_bytes(), license_bytes)
         with tarfile.open(output / record["source_archive"], "r:gz") as archive:
-            self.assertEqual(archive.extractfile(grammar_path).read(), grammar_bytes)
+            grammar = archive.extractfile(grammar_path)
+            assert grammar is not None
+            self.assertEqual(grammar.read(), grammar_bytes)
         compact = self.root / "compact"
         attribution.write_compact_bundle(compact, output)
         self.assertIn(license_bytes, (compact / "THIRD_PARTY_NOTICES.txt").read_bytes())
         with tarfile.open(compact / attribution.EVIDENCE_ARCHIVE, "r:gz") as archive:
+            evidence = archive.extractfile(record["source_archive"])
+            assert evidence is not None
             self.assertEqual(
-                archive.extractfile(record["source_archive"]).read(),
-                (output / record["source_archive"]).read_bytes(),
+                evidence.read(), (output / record["source_archive"]).read_bytes()
             )
 
     def compact_fixture(self):

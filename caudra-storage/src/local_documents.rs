@@ -763,7 +763,6 @@ mod tests {
     const SESSION: &str = "session-a";
     const OTHER_SESSION: &str = "session-b";
     const NOTE: &str = "note.md";
-    #[cfg(unix)]
     const NESTED_NOTE: &str = "nested/note.md";
     const CANARY: &str = "local legacy secret";
     const REMOTE_CONTENT: &str = "remote note";

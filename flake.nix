@@ -60,6 +60,7 @@
             || (builtins.match ".*/plugins/.*" path != null)
             || (builtins.match ".*/prompts/.*" path != null)
             || (builtins.match ".*/themes/.*" path != null)
+            || (builtins.match ".*/caudra-highlight/syntaxes/.*" path != null)
             || (builtins.match ".*/words/.*" path != null)
             || (builtins.match ".*/decisions/questions/.*" path != null)
             || (builtins.match ".*/caudra-workflow/(builtins|skill)/.*" path != null)
