@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "path_base": "repository_root",
-  "scope": "The 40 previously assigned application/worker missing-text package versions plus seven exact-version macOS objc2 package dependencies. Excludes quote-use, quote-use-macros, siphasher, monty-typeshed and two-face package entries. Does not select build dependencies or audit embedded assets. Canonical license terms may be referenced from another collected package directory.",
+  "scope": "The 40 previously assigned application/worker missing-text package versions plus seven exact-version macOS objc2 package dependencies and the explicitly recorded sublime-rhai embedded asset. Excludes quote-use, quote-use-macros, siphasher, monty-typeshed and two-face package entries. Does not select build dependencies or audit other embedded assets. Canonical license terms may be referenced from another collected package directory.",
   "verification": "46 cached .crate SHA-256 values match root or actual worker Cargo.lock. The worker-root monty-runtime archive matches the exact-version crates.io sparse-index checksum because its own lockfile has no checksum. Cached manifests and .cargo_vcs_info.json match the archives. All 47 original manifests match their reported revision Git blobs byte-for-byte. Upstream ancestor legal files match pinned Git blob hashes. Legal texts are unmodified. Existing texts are referenced when exact sources and contents match. The seven objc2 packages explicitly link canonical MIT terms rather than supply full historical license files; those terms are identified separately, with their original text extraction and reuse recorded. Upstream Apple SDK licensing uncertainty remains unresolved.",
   "worker_source": {
     "manifest_pointer": "target/code-worker/source-manifest-path",
@@ -9,7 +9,41 @@
     "version": "1.0.0",
     "lockfile": "Cargo.lock beside the selected worker manifest"
   },
+  "embedded_assets": [
+    {
+      "name": "sublime-rhai",
+      "repository": "https://github.com/rhaiscript/sublime-rhai",
+      "revision": "3d973e99bb58df253f1e4b3c56baa776e2718451",
+      "revision_evidence": "GitHub commits/master API resolved to this revision on 2026-10-09.",
+      "upstream_path": "rhai.sublime-syntax",
+      "upstream_git_blob_sha1": "e66d1a5621c01512347ae0aa9159ecfc99f55bd7",
+      "path": "caudra-highlight/syntaxes/rhai.sublime-syntax",
+      "declared_license": "MPL-2.0",
+      "license_files": [
+        "THIRD_PARTY_LICENSES/SublimeRhai.txt"
+      ],
+      "modifications": [
+        "Replaced variable-width lookbehind and hexadecimal escape patterns for Syntect's fancy-regex backend.",
+        "Added current Rhai ranges, optional access, null coalescing, map delimiters and raw strings; corrected numeric boundaries, function boundaries, closure/operator disambiguation, nested comments and string escaping/interpolation."
+      ],
+      "notes": [
+        "The grammar and its local modifications remain MPL-2.0. Other caudra-highlight files retain their own licenses.",
+        "The attribution policy includes the verbatim license and archives the complete caudra-highlight source, including the modified grammar, for distribution.",
+        "The upstream LICENSE.md supplies no project-specific copyright notice. No copyright holder or year has been inferred from repository ownership or commit metadata."
+      ]
+    }
+  ],
   "files": [
+    {
+      "path": "THIRD_PARTY_LICENSES/SublimeRhai.txt",
+      "kind": "license",
+      "sha256": "1f44795b325d10714daea57abf931fd0703044a5ea0ec04827e36de21602c794",
+      "repository": "https://github.com/rhaiscript/sublime-rhai",
+      "revision": "3d973e99bb58df253f1e4b3c56baa776e2718451",
+      "upstream_path": "LICENSE.md",
+      "url": "https://raw.githubusercontent.com/rhaiscript/sublime-rhai/3d973e99bb58df253f1e4b3c56baa776e2718451/LICENSE.md",
+      "git_blob_sha1": "0afe08dc8c3814fe04b1bda7820b364c08f2daab"
+    },
     {
       "path": "THIRD_PARTY_LICENSES/Monty.txt",
       "kind": "license",

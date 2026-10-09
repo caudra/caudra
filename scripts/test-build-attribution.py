@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -579,6 +580,56 @@ class AttributionTests(unittest.TestCase):
                 attribution.digest((bundles[0] / entry["path"]).read_bytes()),
             )
         self.assertEqual((bundles[0] / "NOTICE").read_text(), "Root attribution")
+
+    def test_rhai_asset_policy_ships_license_and_modified_source(self):
+        repository = Path(__file__).resolve().parent.parent
+        version = tomllib.loads((repository / "Cargo.toml").read_text())["workspace"][
+            "package"
+        ]["version"]
+        policy = attribution.load_policy(repository)
+        self.assertIn(f"caudra-highlight@{version}", policy["packages"])
+        license_path = "THIRD_PARTY_LICENSES/SublimeRhai.txt"
+        grammar_path = "syntaxes/rhai.sublime-syntax"
+        license_bytes = (repository / license_path).read_bytes()
+        grammar_bytes = (repository / "caudra-highlight" / grammar_path).read_bytes()
+        (self.root / "THIRD_PARTY_LICENSES").mkdir()
+        (self.root / license_path).write_bytes(license_bytes)
+        (self.root / "LICENSE").write_bytes((repository / "LICENSE").read_bytes())
+        (self.root / "NOTICE.md").write_bytes((repository / "NOTICE.md").read_bytes())
+        (self.root / "Cargo.lock").write_text("version = 4\n")
+        package = self.package("caudra-highlight", "Apache-2.0")
+        package.update(version=version, source=None)
+        root = Path(package["manifest_path"]).parent
+        (root / "syntaxes").mkdir()
+        (root / grammar_path).write_bytes(grammar_bytes)
+        graphs = [
+            (
+                "artifact",
+                {
+                    "workspace_root": str(self.root),
+                    "artifact_root": package,
+                    "selected": [package],
+                },
+            )
+        ]
+        output = self.root / "evidence"
+        output.mkdir()
+        manifest = attribution.write_bundle(
+            output, self.root, graphs, "fixture-target", policy
+        )
+        record = manifest["packages"][0]
+        self.assertEqual(record["selected_license"], ["Apache-2.0", "MPL-2.0"])
+        self.assertEqual((output / license_path).read_bytes(), license_bytes)
+        with tarfile.open(output / record["source_archive"], "r:gz") as archive:
+            self.assertEqual(archive.extractfile(grammar_path).read(), grammar_bytes)
+        compact = self.root / "compact"
+        attribution.write_compact_bundle(compact, output)
+        self.assertIn(license_bytes, (compact / "THIRD_PARTY_NOTICES.txt").read_bytes())
+        with tarfile.open(compact / attribution.EVIDENCE_ARCHIVE, "r:gz") as archive:
+            self.assertEqual(
+                archive.extractfile(record["source_archive"]).read(),
+                (output / record["source_archive"]).read_bytes(),
+            )
 
     def compact_fixture(self):
         (self.root / "LICENSE").write_bytes(MIT.encode())

@@ -6,7 +6,7 @@ use syntect::highlighting::{
     FontStyle, HighlightIterator, HighlightState, Highlighter as SynHighlighter, Style as SynStyle,
     Theme,
 };
-use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
+use syntect::parsing::{ParseState, ScopeStack, SyntaxDefinition, SyntaxReference, SyntaxSet};
 use syntect::util::LinesWithEndings;
 
 use heredoc::Embedding;
@@ -14,6 +14,7 @@ use heredoc::Embedding;
 mod heredoc;
 
 const TOKEN_ALIASES: &[(&str, &str)] = &[("jsx", "js")];
+const RHAI_SYNTAX: &str = include_str!("../syntaxes/rhai.sublime-syntax");
 /// Every shell grammar's scope starts with this, and only shell lines can
 /// hand a heredoc body to another language.
 const SHELL_SCOPE: &str = "source.shell";
@@ -79,7 +80,20 @@ pub fn theme_color(name: &str) -> Option<Rgb> {
 }
 
 pub fn syntax_set() -> &'static SyntaxSet {
-    SYNTAX_SET.get_or_init(two_face::syntax::extra_newlines)
+    SYNTAX_SET.get_or_init(|| {
+        let syntaxes = two_face::syntax::extra_newlines();
+        match SyntaxDefinition::load_from_str(RHAI_SYNTAX, true, None) {
+            Ok(rhai) => {
+                let mut builder = syntaxes.into_builder();
+                builder.add(rhai);
+                builder.build()
+            }
+            Err(error) => {
+                tracing::error!(%error, "Failed to load bundled Rhai syntax");
+                syntaxes
+            }
+        }
+    })
 }
 
 pub fn normalize_text(text: &str) -> String {
@@ -380,13 +394,16 @@ impl CodeHighlighter {
 
 #[cfg(test)]
 mod tests {
+    use std::ptr;
     use std::str::FromStr;
 
     use super::*;
+    use syntect::easy::ScopeRegionIterator;
     use syntect::highlighting::{Color, ScopeSelectors, StyleModifier, ThemeItem};
     use test_case::test_case;
 
     const PYTHON_BODY: &str = "import os\nprint(os.getcwd())\n";
+    const RHAI_SCRIPT: &str = "let meta = #{ name: \"café\", enabled: true };\n/* outer\n/* nested */ still a comment\n*/\nlet report = `status:\n${if meta.enabled { \"ready\" } else { \"waiting\" }}`;\n";
     const KEYWORD: Color = Color {
         r: 200,
         g: 0,
@@ -516,6 +533,8 @@ mod tests {
     #[test_case("test.rs" => "Rust"; "rust_extension")]
     #[test_case("test.py" => "Python"; "python_extension")]
     #[test_case("test.go" => "Go"; "go_extension")]
+    #[test_case("automation.rhai" => "Rhai"; "rhai_extension")]
+    #[test_case("missing/directory/workflow.rhai" => "Rhai"; "rhai_without_local_file")]
     #[test_case("Makefile" => "Makefile"; "makefile_no_ext")]
     fn syntax_for_path_resolves(path: &str) -> String {
         warmup();
@@ -645,6 +664,140 @@ mod tests {
         assert_eq!(
             resumed.highlight_line("import os\n"),
             coloured("python", true, "import os\n")[0]
+        );
+    }
+
+    #[test]
+    fn rhai_grammar_loads() {
+        let syntax = SyntaxDefinition::load_from_str(RHAI_SYNTAX, true, None).unwrap();
+        assert_eq!(syntax.name, "Rhai");
+        assert_eq!(syntax.scope.build_string(), "source.rhai");
+    }
+
+    #[test_case("rhai"; "extension_token")]
+    #[test_case("Rhai"; "language_name")]
+    fn rhai_tokens_resolve(token: &str) {
+        assert_eq!(syntax_for_token(token).name, "Rhai");
+        assert!(ptr::eq(
+            syntax_for_token(token),
+            syntax_for_path("automation.rhai")
+        ));
+    }
+
+    fn rhai_scopes(code: &str) -> Vec<(String, ScopeStack)> {
+        let mut parser = ParseState::new(syntax_for_token("rhai"));
+        let mut stack = ScopeStack::new();
+        let mut regions = Vec::new();
+        for line in LinesWithEndings::from(code) {
+            let operations = parser.parse_line(line, syntax_set()).unwrap();
+            for (text, operation) in ScopeRegionIterator::new(&operations, line) {
+                stack.apply(operation).unwrap();
+                if !text.is_empty() {
+                    regions.push((text.to_owned(), stack.clone()));
+                }
+            }
+        }
+        assert_eq!(
+            regions
+                .iter()
+                .map(|(text, _)| text.as_str())
+                .collect::<String>(),
+            code
+        );
+        regions
+    }
+
+    #[test_case("let x = 42;", "let", "storage.type"; "binding")]
+    #[test_case("if ready { return true; }", "return", "keyword.control"; "keyword")]
+    #[test_case("let x = false;", "false", "constant.language.boolean"; "boolean")]
+    #[test_case("let x = 0x2a;", "0x2a", "constant.numeric"; "number")]
+    #[test_case("fn check(x) { x }", "check", "entity.name.function"; "function")]
+    #[test_case("run(event);", "run", "entity.name.function"; "call")]
+    #[test_case("let x = #{ ready: true };", "#{", "meta.brace.curly"; "map")]
+    #[test_case("let x = #{ ready: true };", "ready", "string.unquoted.label"; "map_key")]
+    #[test_case("let f = |value| value + 1;", "value", "variable.parameter.function"; "closure")]
+    #[test_case("items.map(|value| value + 1);", "value", "variable.parameter.function"; "inline_closure")]
+    #[test_case("let f = || 42;", "||", "meta.function.closure"; "empty_closure")]
+    #[test_case("let x = a || b;", "||", "keyword.operator.logical"; "logical_or")]
+    #[test_case("let x = a | b | c;", "|", "keyword.operator.bitwise"; "bitwise_or")]
+    #[test_case("x |= 2;", "|=", "keyword.operator.assignment"; "or_assignment")]
+    #[test_case("for x in 0..10 {}", "..", "keyword.operator.range"; "range")]
+    #[test_case("for x in 0..=10 {}", "..=", "keyword.operator.range"; "inclusive_range")]
+    #[test_case("let x = value ?? 42;", "??", "keyword.operator.logical"; "coalesce")]
+    #[test_case("let x = value?.field;", "?.", "keyword.operator.accessor"; "optional_access")]
+    #[test_case(r#"let s = "say \"hi\"";"#, r#"\""#, "constant.character.escape"; "quote_escape")]
+    #[test_case(r"let c = '\u0041';", r"'\u0041'", "string.quoted.single"; "unicode_character")]
+    #[test_case("/* outer\n/* inner */ still outer\n*/ let x = 1;", "still outer", "comment.block"; "nested_comment")]
+    #[test_case("/* // */ let x = 1;", "let", "storage.type"; "line_marker_in_block_comment")]
+    #[test_case("let s = `hello\n${if ready { 1 } else { 0 }}`;", "if", "keyword.control"; "interpolation")]
+    #[test_case(r"let s = `C:\path\file`;", r"\path", "string.interpolated"; "verbatim_template")]
+    #[test_case(r###"let s = ##"raw "# text"##;"###, "text", "string.quoted.double.raw"; "raw_string")]
+    fn rhai_token_has_scope(code: &str, token: &str, scope: &str) {
+        let selector = ScopeSelectors::from_str(scope).unwrap();
+        let start = code.find(token).unwrap();
+        let end = start + token.len();
+        let mut offset = 0;
+        for (text, stack) in rhai_scopes(code) {
+            let next = offset + text.len();
+            if offset < end && next > start {
+                assert!(
+                    selector.does_match(&stack.scopes).is_some(),
+                    "{text:?}: {stack:?}"
+                );
+            }
+            offset = next;
+        }
+    }
+
+    #[test_case(RHAI_SCRIPT; "multiline_script")]
+    #[test_case(include_str!("../../caudra-automation/tests/examples/goal-webhook.rhai"); "automation")]
+    #[test_case(include_str!("../../caudra-workflow/builtins/deep-research.rhai"); "workflow")]
+    fn rhai_scripts_parse_without_invalid_scopes(code: &str) {
+        let invalid = ScopeSelectors::from_str("invalid").unwrap();
+        for (text, stack) in rhai_scopes(code) {
+            assert!(
+                invalid.does_match(&stack.scopes).is_none(),
+                "{text:?}: {stack:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rhai_uses_theme_scopes() {
+        let mut highlighter = Highlighter::new(syntax_for_token("rhai"), scoped_theme());
+        let segments = highlighter.highlight_line("return \"ready\";\n");
+        assert!(
+            segments.iter().any(|segment| segment.text == "return"
+                && segment.fg == (KEYWORD.r, KEYWORD.g, KEYWORD.b))
+        );
+        assert!(segments.iter().any(|segment| segment.text.contains("ready")
+            && segment.fg == (STRING.r, STRING.g, STRING.b)));
+        assert_eq!(segments_text(&segments), "return \"ready\";");
+    }
+
+    #[test]
+    fn rhai_streaming_preserves_multiline_styles_and_text() {
+        let mut streaming = CodeHighlighter::new("rhai");
+        for (offset, _) in RHAI_SCRIPT.char_indices().skip(1) {
+            streaming.update(&RHAI_SCRIPT[..offset]);
+        }
+        assert_eq!(
+            streaming.update(RHAI_SCRIPT),
+            highlight_code("rhai", RHAI_SCRIPT, "")
+        );
+    }
+
+    #[test]
+    fn rhai_checkpoint_restores_multiline_state() {
+        let mut highlighter = Highlighter::new(syntax_for_token("rhai"), scoped_theme());
+        let mut lines = RHAI_SCRIPT.lines();
+        for line in lines.by_ref().take(2) {
+            highlighter.highlight_lines([line]);
+        }
+        let mut resumed = Highlighter::from_state(scoped_theme(), highlighter.snapshot());
+        assert_eq!(
+            resumed.highlight_lines(lines.clone()),
+            highlighter.highlight_lines(lines)
         );
     }
 }

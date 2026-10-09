@@ -18,6 +18,19 @@
     "THIRD_PARTY_LICENSES/additional/provenance.json"
   ],
   "packages": {
+    "caudra-highlight@0.2.0-preview.2": {
+      "expression": "Apache-2.0 AND MPL-2.0",
+      "reason": "The first-party highlighting implementation remains Apache-2.0. The embedded sublime-rhai grammar and local modifications remain MPL-2.0. Preserve its upstream license and ship the complete caudra-highlight source, including the modified grammar, using the existing MPL source-archive mechanism. This aggregate expression does not relicense individual files.",
+      "files": [
+        {
+          "path": "THIRD_PARTY_LICENSES/SublimeRhai.txt",
+          "sha256": "1f44795b325d10714daea57abf931fd0703044a5ea0ec04827e36de21602c794"
+        }
+      ],
+      "required_files": [
+        "supplements/THIRD_PARTY_LICENSES/SublimeRhai.txt"
+      ]
+    },
     "rmcp@3.0.0-beta.5": {
       "expression": "Apache-2.0 AND MIT",
       "reason": "Upstream repository LICENSE explicitly retains MIT for contributions without relicensing consent; documentation is separately CC-BY-4.0 and the complete upstream LICENSE is preserved.",

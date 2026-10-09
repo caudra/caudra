@@ -265,7 +265,8 @@ fn next_stride(line: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{CHECKPOINT_STRIDE, MAX_CACHED_ROWS, MAX_LOOKBACK, ViewportHighlighter};
-    use caudra_highlight::StyledSegment;
+    use caudra_highlight::{Highlighter, StyledSegment, syntax_for_path};
+    use test_case::test_case;
 
     const SAME_AS_COLD: &str =
         "a viewport resumed from a checkpoint must match one highlighted from the top";
@@ -275,6 +276,8 @@ mod tests {
     const NOT_CACHED: &str = "a window already worked out must be answered from the band";
     const WRONG_BAND: &str = "the band does not cover what the walk was asked for";
     const NOT_BOUNDED: &str = "a jump must not walk further than the lookback allows";
+    const RHAI_PATH: &str = "automation.rhai";
+    const RHAI_LINE: &str = "let value = \"é\";";
 
     fn source(count: usize) -> Vec<String> {
         (0..count)
@@ -325,6 +328,39 @@ mod tests {
         for (warm_line, cold_line) in warm_view.iter().zip(&cold_view) {
             assert_eq!(warm_line, cold_line, "{SAME_AS_COLD}");
         }
+    }
+
+    #[test_case(CHECKPOINT_STRIDE - 2, "// comment removed", &[]; "edit_before_checkpoint")]
+    #[test_case(CHECKPOINT_STRIDE + 1, "*/", &[CHECKPOINT_STRIDE]; "resume_inside_comment")]
+    fn rhai_edits_rebuild_multiline_state(edited: usize, replacement: &str, kept: &[usize]) {
+        assert_eq!(syntax_for_path(RHAI_PATH).name, "Rhai");
+        let first = CHECKPOINT_STRIDE * 2;
+        let last = first + 4;
+        let mut lines = vec![RHAI_LINE.to_owned(); last];
+        lines[CHECKPOINT_STRIDE - 2] = "/*".into();
+        lines[first + 2] = "*/".into();
+        let mut warm = ViewportHighlighter::new(RHAI_PATH, 0);
+        let original = view(&mut warm, &lines, first, last);
+        let expected =
+            Highlighter::for_path(RHAI_PATH).highlight_lines(lines.iter().map(String::as_str));
+        assert_eq!(original, expected[first..last]);
+        assert_eq!(warm.checkpoint_lines(), [CHECKPOINT_STRIDE, first]);
+
+        lines[edited] = replacement.into();
+        warm.invalidate_from(edited);
+        assert_eq!(warm.checkpoint_lines(), kept, "{DROPPED}");
+        assert_eq!(warm.band_range(), None, "{DROPPED}");
+        let rebuilt = view(&mut warm, &lines, first, last);
+        let mut cold = ViewportHighlighter::new(RHAI_PATH, 0);
+        assert_eq!(
+            rebuilt,
+            view(&mut cold, &lines, first, last),
+            "{SAME_AS_COLD}"
+        );
+        let expected =
+            Highlighter::for_path(RHAI_PATH).highlight_lines(lines.iter().map(String::as_str));
+        assert_eq!(rebuilt, expected[first..last]);
+        assert_eq!(text(&rebuilt), lines[first..last], "{SPANS_WHOLE_LINE}");
     }
 
     #[test]

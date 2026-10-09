@@ -1086,6 +1086,7 @@ dependencies = [
  "serde_json",
  "syntect",
  "test-case",
+ "tracing",
  "two-face",
 ]
 

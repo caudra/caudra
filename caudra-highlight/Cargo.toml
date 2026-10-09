@@ -11,6 +11,7 @@ rust-version.workspace = true
 [dependencies]
 serde_json = { workspace = true }
 syntect = { workspace = true }
+tracing = { workspace = true }
 two-face = { workspace = true }
 
 [dev-dependencies]

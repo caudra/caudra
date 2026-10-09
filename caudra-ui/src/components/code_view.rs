@@ -3771,6 +3771,83 @@ mod tests {
     use ratatui::style::Color;
 
     const READ_MAX_LINES: usize = 5;
+    const RHAI_PATH: &str = "automation.rhai";
+    const RHAI_CODE: &str = "/* comment\nlet hidden = true;\n*/\nlet message = \"é\";";
+    const RHAI_BEFORE: &str = "/* comment\nlet hidden = true;\n*/\nlet message = \"old\";";
+    const RHAI_PATCH: &str = "@@ -1,4 +1,4 @@\n /* comment\n let hidden = true;\n */\n-let message = \"old\";\n+let message = \"é\";\n";
+
+    fn assert_rhai_code_content(input: Option<&ToolInput>, output: Option<&ToolOutput>) {
+        let syntax = caudra_highlight::syntax_set()
+            .find_syntax_by_name("Rhai")
+            .unwrap();
+        let limits = RenderLimits {
+            budget: RHAI_CODE.lines().count(),
+            ..RenderLimits::default()
+        };
+        let highlighted = render_tool_content(input, output, true, limits.clone());
+        let plain = render_tool_content(input, output, false, limits);
+        assert_eq!(
+            highlighted.lines.iter().map(line_text).collect::<Vec<_>>(),
+            plain.lines.iter().map(line_text).collect::<Vec<_>>()
+        );
+        assert_eq!(highlighted.source.as_ref().unwrap().text, RHAI_CODE);
+        assert_eq!(plain.source.as_ref().unwrap().text, RHAI_CODE);
+        assert_eq!(highlighted.lines.len(), RHAI_CODE.lines().count());
+        let mut highlighter = caudra_highlight::Highlighter::for_syntax(syntax);
+        for ((highlighted, plain), code) in highlighted
+            .lines
+            .iter()
+            .zip(&plain.lines)
+            .zip(RHAI_CODE.lines())
+        {
+            let body = Line::from(highlighted.spans[1..].to_vec());
+            let expected = Line::from(highlight_spans(&mut highlighter, code));
+            assert_eq!(line_text(&body), code);
+            assert_eq!(styled_characters(&body), styled_characters(&expected));
+            assert_eq!(
+                styled_characters(&Line::from(plain.spans[1..].to_vec())),
+                styled_characters(&Line::from(fallback_span(code)))
+            );
+        }
+    }
+
+    #[test_case(false; "code")]
+    #[test_case(true; "script")]
+    fn rhai_structured_input_uses_syntax_styles_and_preserves_text(script: bool) {
+        assert_eq!(caudra_highlight::syntax_for_token("rhai").name, "Rhai");
+        let language = "rhai".into();
+        let code = RHAI_CODE.into();
+        let input = if script {
+            ToolInput::Script { language, code }
+        } else {
+            ToolInput::Code { language, code }
+        };
+        assert_rhai_code_content(Some(&input), None);
+    }
+
+    #[test_case(false; "read_code")]
+    #[test_case(true; "write_code")]
+    fn rhai_file_output_uses_syntax_styles_and_preserves_text(write: bool) {
+        assert_eq!(caudra_highlight::syntax_for_path(RHAI_PATH).name, "Rhai");
+        let path = RHAI_PATH.into();
+        let lines = RHAI_CODE.lines().map(String::from).collect();
+        let output = if write {
+            ToolOutput::WriteCode {
+                path,
+                lines,
+                byte_count: RHAI_CODE.len(),
+            }
+        } else {
+            ToolOutput::ReadCode {
+                path,
+                lines,
+                start_line: 1,
+                total_lines: RHAI_CODE.lines().count(),
+                instructions: None,
+            }
+        };
+        assert_rhai_code_content(None, Some(&output));
+    }
 
     #[test_case(20, 20, READ_MAX_LINES + 1 ; "truncates_with_ellipsis")]
     #[test_case(3,  3,  3                    ; "no_truncation_when_short")]
@@ -4571,6 +4648,84 @@ mod tests {
     const FLAG_MSG: &str = "the sync path asks for no highlighting and must not be parsed anyway";
     const BAND_MSG: &str =
         "a changed row wears its diff band under the syntax colour, not instead of it";
+
+    #[test_case(false; "diff")]
+    #[test_case(true; "patch")]
+    fn rhai_changes_keep_syntax_colours_diff_bands_and_plain_text(patch: bool) {
+        assert_eq!(caudra_highlight::syntax_for_path(RHAI_PATH).name, "Rhai");
+        let syntax = caudra_highlight::syntax_set()
+            .find_syntax_by_name("Rhai")
+            .unwrap();
+        let output = if patch {
+            ToolOutput::Patch {
+                files: vec![patched(RHAI_PATH, RHAI_PATCH)],
+            }
+        } else {
+            ToolOutput::Diff {
+                path: RHAI_PATH.into(),
+                before: RHAI_BEFORE.into(),
+                after: RHAI_CODE.into(),
+                summary: String::new(),
+            }
+        };
+        let highlighted = render_tool_content(None, Some(&output), true, RenderLimits::default());
+        let plain = render_tool_content(None, Some(&output), false, RenderLimits::default());
+        assert_eq!(
+            highlighted.lines.iter().map(line_text).collect::<Vec<_>>(),
+            plain.lines.iter().map(line_text).collect::<Vec<_>>()
+        );
+        let theme = theme::current();
+        for (source, marker, base, emphasis) in [
+            (
+                RHAI_BEFORE,
+                MARK_REMOVED,
+                theme.diff_old,
+                theme.diff_old_emphasis,
+            ),
+            (
+                RHAI_CODE,
+                MARK_ADDED,
+                theme.diff_new,
+                theme.diff_new_emphasis,
+            ),
+        ] {
+            let mut highlighter = caudra_highlight::Highlighter::for_syntax(syntax);
+            for (index, code) in source.lines().enumerate() {
+                let expected = Line::from(highlight_spans(&mut highlighter, code));
+                let row = highlighted
+                    .lines
+                    .iter()
+                    .position(|line| line_text(&Line::from(line.spans[1..].to_vec())) == code)
+                    .unwrap();
+                let actual = &highlighted.lines[row];
+                let actual_chars = styled_characters(&Line::from(actual.spans[1..].to_vec()));
+                let plain_chars =
+                    styled_characters(&Line::from(plain.lines[row].spans[1..].to_vec()));
+                let expected_chars = styled_characters(&expected);
+                let changed = index == source.lines().count() - 1;
+                if changed {
+                    assert!(actual.spans[0].content.contains(marker));
+                }
+                assert_eq!(actual_chars.len(), expected_chars.len());
+                for ((actual, expected), plain) in
+                    actual_chars.iter().zip(&expected_chars).zip(&plain_chars)
+                {
+                    assert_eq!(actual.0, expected.0);
+                    if changed {
+                        assert!(
+                            actual.1 == expected.1.patch(base)
+                                || actual.1 == expected.1.patch(emphasis),
+                            "{BAND_MSG}"
+                        );
+                        assert_eq!(plain.1, theme.code_block.patch(base), "{FLAG_MSG}");
+                    } else {
+                        assert_eq!(actual.1, expected.1);
+                        assert_eq!(plain.1, theme.code_block, "{FLAG_MSG}");
+                    }
+                }
+            }
+        }
+    }
 
     fn highlighted_patch() -> Vec<Line<'static>> {
         render_patch(&one_file(RUST_PATCH), true, UNCONSTRAINED_WIDTH)

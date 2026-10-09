@@ -1289,11 +1289,19 @@ fn render_table_compact(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use caudra_highlight::{Highlighter, syntax_for_token};
     use test_case::test_case;
 
     const TEST_WIDTH: u16 = 80;
     const CODE_BODY: &str = "let x = \"é界\";\n\n    x";
     const CODE_FENCE: &str = "```rust\nlet x = \"é界\";\n\n    x\n```";
+    const RHAI_FRAGMENTS: [&str; 5] = [
+        "/* comment\nlet hidden = true;",
+        "\n*/\nlet message = \"é",
+        "界\";",
+        "\nmessage",
+        "\n```",
+    ];
 
     fn lines_text(lines: &[Line]) -> Vec<String> {
         lines
@@ -1421,6 +1429,59 @@ mod tests {
         }
         assert_eq!(rows, expected);
         assert_eq!(source_text(CODE_FENCE, ranges), CODE_BODY);
+    }
+
+    #[test_case(TEST_WIDTH; "wide")]
+    #[test_case(12; "wrapped")]
+    fn streamed_rhai_fence_matches_fresh_syntax_and_preserves_source(width: u16) {
+        assert_eq!(syntax_for_token("rhai").name, "Rhai");
+        let mut renderer = Renderer::new();
+        let mut text = String::from("```rhai\n");
+        for fragment in RHAI_FRAGMENTS {
+            text.push_str(fragment);
+            let lines = renderer.render(&text, width, 0);
+            assert_eq!(lines, render(&text, width));
+            assert_eq!(
+                source_text(&text, lines.iter().filter_map(|line| line.source.clone())),
+                text
+            );
+            let body = text
+                .strip_prefix("```rhai\n")
+                .unwrap()
+                .trim_end_matches("\n```");
+            let expected = Highlighter::for_token("rhai").highlight_lines(body.lines());
+            let expected: Vec<_> = expected
+                .iter()
+                .flatten()
+                .flat_map(|segment| {
+                    segment
+                        .text
+                        .chars()
+                        .map(move |ch| (ch, StyleToken::from(segment)))
+                })
+                .collect();
+            let spans: Vec<_> = lines
+                .iter()
+                .filter(|line| line.kind == LineKind::Code)
+                .flat_map(|line| &line.spans)
+                .filter(|span| span.source != SpanSource::Chrome)
+                .collect();
+            let actual: Vec<_> = spans
+                .iter()
+                .flat_map(|span| span.text.chars().map(|ch| (ch, span.style.clone())))
+                .collect();
+            assert_eq!(actual, expected);
+            for span in spans {
+                let SpanSource::Range(source) = &span.source else {
+                    panic!("{span:?}");
+                };
+                assert!(source.verbatim);
+                assert_eq!(
+                    &text[source.range.start as usize..source.range.end as usize],
+                    span.text
+                );
+            }
+        }
     }
 
     fn math_spans(lines: &[Line]) -> Vec<&str> {

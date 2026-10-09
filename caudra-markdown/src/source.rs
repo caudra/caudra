@@ -312,6 +312,7 @@ mod tests {
     const TABBED_RUST: &str = "\tlet s = \"\tx\";";
     const INLINE_CODE: &str = "`x`";
     const FILLER: &str = "x";
+    const RHAI_BODY: &str = "/* comment\nlet hidden = true;\n*/\nlet message = \"é\";";
 
     fn line_text(line: &Line) -> String {
         line.spans.iter().map(|span| span.text.as_str()).collect()
@@ -338,6 +339,8 @@ mod tests {
     #[test_case("Some **bold**, *italic*, _under_, ~~gone~~ and ***both***"; "emphasis")]
     #[test_case("Call `run()` or ``a ` tick`` or `unclosed"; "inline_code")]
     #[test_case("```rust\nfn main() {\n\tprintln!(\"hi\");\n}\n```"; "fenced_block_with_language")]
+    #[test_case("```rhai\n\tlet message = \"é\";\n```"; "rhai_tabs_and_unicode")]
+    #[test_case("```rhai\n/* comment\nlet hidden = true;"; "rhai_incomplete_comment")]
     #[test_case("```\nplain **not bold**\n\n```\nafter"; "fenced_block_without_language")]
     #[test_case("```\nx\n```tail"; "fence_closed_mid_line")]
     #[test_case("- one\n  - nested **deep**\n    1. ordered\n* star\n+ plus"; "nested_lists")]
@@ -416,6 +419,51 @@ mod tests {
             "{:?}",
             body.spans
         );
+    }
+
+    #[test_case(false; "incomplete_fence")]
+    #[test_case(true; "closed_fence")]
+    fn rhai_fence_body_keeps_syntax_styles_and_source(closed: bool) {
+        assert_eq!(syntax_for_token("rhai").name, "Rhai");
+        let suffix = if closed { "\n```" } else { "" };
+        let text = format!("```rhai\n{RHAI_BODY}{suffix}");
+        let lines = source_lines(&text);
+        let expected = Highlighter::for_token("rhai").highlight_lines(RHAI_BODY.lines());
+        for (line, expected) in lines[1..].iter().zip(expected) {
+            let actual: Vec<_> = line
+                .spans
+                .iter()
+                .flat_map(|span| span.text.chars().map(|ch| (ch, span.style.clone())))
+                .collect();
+            let expected: Vec<_> = expected
+                .iter()
+                .flat_map(|segment| {
+                    segment
+                        .text
+                        .chars()
+                        .map(move |ch| (ch, StyleToken::from(segment)))
+                })
+                .collect();
+            assert_eq!(actual, expected);
+        }
+        assert_eq!(lines[0].spans[0].style, StyleToken::Syntax);
+        if closed {
+            assert_eq!(lines.last().unwrap().spans[0].style, StyleToken::Syntax);
+        }
+        assert_eq!(
+            lines.iter().map(line_text).collect::<Vec<_>>().join("\n"),
+            text
+        );
+        for span in lines.iter().flat_map(|line| &line.spans) {
+            let SpanSource::Range(source) = &span.source else {
+                panic!("{span:?}");
+            };
+            assert!(source.verbatim);
+            assert_eq!(
+                &text[source.range.start as usize..source.range.end as usize],
+                span.text
+            );
+        }
     }
 
     #[test_case("abc", "ab" => 2; "plain_prefix")]
