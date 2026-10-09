@@ -28,7 +28,6 @@ use crate::components::modal::{CLOSE_HINT, ESC_LABEL, FooterHits, FooterLine, SE
 use crate::components::{Overlay, counted, escape_terminal_controls, plain_char};
 use crate::theme::{self, Theme};
 
-#[cfg(test)]
 pub(crate) use self::projection::UNPREPARED;
 
 const TITLE_PREFIX: &str = " Projection - ";

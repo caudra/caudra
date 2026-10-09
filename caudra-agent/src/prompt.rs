@@ -185,6 +185,14 @@ pub const INSTRUCTIONS_APPEARED_PROMPT: &str = include_str!("prompts/instruction
 /// Shares the heading, and so the kind, with the announcement it supersedes.
 pub const INSTRUCTIONS_RESTORED_PROMPT: &str = include_str!("prompts/instructions_restored.md");
 pub const INSTRUCTIONS_CHANGED_MARKER: &str = "# Instructions changed";
+/// The memory view is frozen into the system prompt so the prompt stays
+/// cached. Entries other sessions write afterwards arrive here instead.
+pub const MEMORY_UPDATED_PROMPT: &str = include_str!("prompts/memory_updated.md");
+/// Withdraws the update once the view in the system prompt holds those entries.
+/// Shares the heading, and so the kind, with the update it supersedes.
+pub const MEMORY_REFRESHED_PROMPT: &str = include_str!("prompts/memory_refreshed.md");
+pub const MEMORY_UPDATED_MARKER: &str = "# Memory updated";
+pub const ENTRIES_SLOT: &str = "{entries}";
 pub const DIFF_SLOT: &str = "{diff}";
 pub const INSTRUCTIONS_SLOT: &str = "{instructions}";
 /// Not a [`Vars`](crate::template::Vars) entry: the model is per-run rather
@@ -221,11 +229,13 @@ pub const TASK_BUILD_CONTRACT: &str = "<system-reminder>\n# Host mode contract\n
 pub(crate) const STANDING_KINDS: &[&[&str]] = &[
     &[ENVIRONMENT_MARKER],
     &[INSTRUCTIONS_CHANGED_MARKER],
+    &[MEMORY_UPDATED_MARKER],
     &[TASK_MODE_MARKER],
     MODE_MARKERS,
 ];
 
 const INSTRUCTIONS_MARKER: &str = "{{instructions}}";
+const MEMORY_SEPARATOR: &str = "\n\n";
 const TASK_STYLE_HEADING: &str = "# Output discipline\n";
 const TASK_TOOLS_HEADING: &str = "# Tool usage\n";
 const RESEARCH_CONVENTIONS_HEADING: &str = "# Guidelines\n";
@@ -461,24 +471,14 @@ impl ResolvedSlots {
     /// Native tools cannot register prompt hints the way Lua plugins do: they
     /// register once at startup, long before a prompt exists, and the same
     /// registry serves filters that exclude them. Applying the hints here ties
-    /// each one to its tool actually being offered.
-    pub fn with_native_hints(&self, filter: &crate::tools::ToolFilter) -> Cow<'_, Self> {
-        self.with_native_hints_and_memory(filter, None)
-    }
-
-    pub fn with_native_hints_for_store<'a>(
-        &'a self,
+    /// each one to its tool actually being offered. `memory` is the memory
+    /// view, which only the system prompt carries: a subagent gets the tool
+    /// without the view.
+    pub fn with_native_hints(
+        &self,
         filter: &crate::tools::ToolFilter,
-        store: &'a caudra_storage::local_documents::LocalDocumentStore,
-    ) -> Cow<'a, Self> {
-        self.with_native_hints_and_memory(filter, Some(store))
-    }
-
-    fn with_native_hints_and_memory<'a>(
-        &'a self,
-        filter: &crate::tools::ToolFilter,
-        store: Option<&caudra_storage::local_documents::LocalDocumentStore>,
-    ) -> Cow<'a, Self> {
+        memory: Option<&str>,
+    ) -> Cow<'_, Self> {
         let hints: Vec<_> = NATIVE_HINTS
             .iter()
             .copied()
@@ -489,7 +489,8 @@ impl ResolvedSlots {
             )
             .filter(|(tool, ..)| filter.matches(tool))
             .collect();
-        if hints.is_empty() && !filter.matches(crate::tools::MEMORY_TOOL_NAME) {
+        let memory = memory.filter(|_| filter.matches(crate::tools::MEMORY_TOOL_NAME));
+        if hints.is_empty() && memory.is_none() {
             return Cow::Borrowed(self);
         }
         let mut slots = self.clone();
@@ -505,22 +506,13 @@ impl ResolvedSlots {
                 );
             }
         }
-        // The memory tag index is scanned from disk, so unlike the fixed hints
-        // it cannot live in a const table. It only reaches the system prompt:
-        // a subagent gets the tool, not the whole project's tag vocabulary.
-        let memory_line = store.map_or_else(
-            crate::tools::native::memory::prompt_tag_line_for_cwd,
-            crate::tools::native::memory::prompt_tag_line_for_store,
-        );
-        if filter.matches(crate::tools::MEMORY_TOOL_NAME)
-            && let Some(line) = memory_line
-        {
+        if let Some(view) = memory {
             slots.insert(
                 PromptId::System,
                 Slot::AfterInstructions,
                 SlotEntry {
                     plugin: Arc::from("native:memory"),
-                    content: line,
+                    content: format!("{MEMORY_SEPARATOR}{view}"),
                 },
             );
         }
@@ -863,7 +855,7 @@ pub fn assemble_task_with_filter(
 ) -> String {
     assemble_task(
         mode,
-        &slots.with_native_hints(filter),
+        &slots.with_native_hints(filter, None),
         instructions,
         profile,
     )
@@ -895,6 +887,8 @@ mod tests {
         "`batch`, `file_grep`, `file_apply_patch`, `task`, `file_index`";
     const GREP_ONLY_EFFICIENT_TOOLS: &str = "`file_grep`";
     const PLUGIN_EFFICIENT_TOOL: &str = "plugin_tool";
+    const INSTRUCTIONS: &str = "<instructions>project rules</instructions>";
+    const MEMORY_VIEW: &str = "# Memory\n\n<memory>\n0+1|note a.md\n</memory>\n";
     const EXECUTION_TEST_THRESHOLD: u64 = 937;
     const CUSTOM_EXECUTION_INSTRUCTION: &str =
         "User-authored background and foreground instructions remain intact.";
@@ -1168,7 +1162,11 @@ mod tests {
             &[(Slot::EfficientTools, PLUGIN_EFFICIENT_TOOL)],
         );
         let filter = ToolFilter::Only(vec![BATCH_TOOL_NAME.into()]);
-        let out = assemble(PromptId::System, &plugin.with_native_hints(&filter), "");
+        let out = assemble(
+            PromptId::System,
+            &plugin.with_native_hints(&filter, None),
+            "",
+        );
         assert!(
             out.contains(&format!(
                 "{EFFICIENT_TOOLS_LABEL} `{PLUGIN_EFFICIENT_TOOL}`, `{BATCH_TOOL_NAME}`."
@@ -1183,7 +1181,11 @@ mod tests {
     #[test_case(ToolFilter::Only(vec![SHELL_TOOL_NAME.into()]), None ; "none_offered")]
     fn efficient_tools_name_only_offered_tools(filter: ToolFilter, expected: Option<&str>) {
         let slots = ResolvedSlots::default();
-        let out = assemble(PromptId::System, &slots.with_native_hints(&filter), "");
+        let out = assemble(
+            PromptId::System,
+            &slots.with_native_hints(&filter, None),
+            "",
+        );
         match expected {
             Some(names) => assert!(
                 out.contains(&format!("{EFFICIENT_TOOLS_LABEL} {names}.")),
@@ -1197,13 +1199,28 @@ mod tests {
     #[test_case(ToolFilter::AllExcept(vec![FILE_INDEX_TOOL_NAME.into()]), false ; "disabled")]
     fn native_index_hints_follow_effective_filter(filter: ToolFilter, expected: bool) {
         let slots = ResolvedSlots::default();
-        let filtered = slots.with_native_hints(&filter);
+        let filtered = slots.with_native_hints(&filter, None);
         let output = assemble(PromptId::System, &filtered, "");
         assert_eq!(output.contains(INDEX_TOOL_USAGE), expected);
         assert_eq!(
             output.contains(&format!("`{FILE_INDEX_TOOL_NAME}`.")),
             expected
         );
+    }
+
+    #[test_case(ToolFilter::All, true ; "offered")]
+    #[test_case(ToolFilter::AllExcept(vec![crate::tools::MEMORY_TOOL_NAME.into()]), false ; "not_offered")]
+    fn memory_view_follows_the_instructions_when_the_tool_is_offered(
+        filter: ToolFilter,
+        expected: bool,
+    ) {
+        let slots = ResolvedSlots::default();
+        let filtered = slots.with_native_hints(&filter, Some(MEMORY_VIEW));
+        let output = assemble(PromptId::System, &filtered, INSTRUCTIONS);
+        assert_eq!(output.contains(MEMORY_VIEW), expected);
+        if expected {
+            assert!(at(&output, INSTRUCTIONS) < at(&output, MEMORY_VIEW));
+        }
     }
 
     #[test]

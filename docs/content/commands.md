@@ -28,7 +28,7 @@ A command with an Experiment entry exists only while that switch is on under `[e
 | `/stash` | Park the current prompt draft for later |  |  |
 | `/stash-pop` | Restore the most recently stashed prompt |  |  |
 | `/stash-list` | Browse stashed prompts |  |  |
-| `/memory` | View, edit, and delete memory files |  |  |
+| `/memory` | Inspect project memory: the view, its summary tree, and the notes |  |  |
 | `/tasks` | Browse tasks and steer running subagents |  |  |
 | `/shells` | Browse shell commands and stop running ones |  |  |
 | `/peers` | Browse live local messaging peers (experimental) | Main only | `cross_session_messaging` |
@@ -192,7 +192,7 @@ The summary shows the active model and window, estimated tokens by category, the
 
 `/skills` does the same for skills. It lists each skill with its file, its scope, and whether its body is already in the window, then every candidate directory with the state directory precedence gave it. It reads the disk when it opens, so it works before the first request. See [Skills](/docs/skills/#where-skills-live).
 
-Token counts are estimates. Deferred MCP definitions and memory or skill bodies stay on demand, and opening either report does not load them. The compact MCP catalog, memory tag index, and skill name and description list count when present. Full definitions and bodies count after the agent loads them.
+Token counts are estimates. Deferred MCP definitions and memory or skill bodies stay on demand, and opening either report does not load them. The compact MCP catalog, the [memory view](/docs/memory/#the-view), and the skill name and description list count when present. Full definitions and bodies count after the agent loads them.
 
 `/usage` is the cumulative view. It totals provider-reported tokens and priced spend for completed calls across the session, and its global view shows lifetime spend. Both scopes break the work down per model, and per provider once more than one served it, with a `hit` column for [cache hit rate](/docs/token-economy/#cache-hit-rate). See [Context](/docs/context/) for how requests are assembled and [Token Economy](/docs/token-economy/#lifetime-spend) for the spending ledger.
 
@@ -244,7 +244,7 @@ Extract is a [model job](/docs/providers/#model-jobs) and follows Fast unless bo
 
   While a main-session question form is waiting, press `F2` or click `Ask /btw` to clarify its choices. `Esc` returns to the unchanged form and stops any streaming side response. Reopening restores the clarification thread until the form is submitted, dismissed, or cancelled. Task and subagent questions do not support this action yet.
 - **`/extract`**: list every requirement the session has gathered so far. See [Requirements](#requirements).
-- **`/memory`**: open the memory file picker. `Enter` opens a note in the [workbench](/docs/workbench/#plans-memory-notes-and-prompt-drafts) to read or edit, and a note can be deleted from the list. See the `memory` tool under [Tools](/docs/tools/).
+- **`/memory`**: open the memory inspector: the view the model reads, the summary tree under each of its lines, and the notes. `Enter` on a note opens it in the [workbench](/docs/workbench/#plans-memory-notes-and-prompt-drafts) to read or edit. See [Memory](/docs/memory/#the-inspector) for its marks, modes, and keys.
 
 ## Custom commands
 

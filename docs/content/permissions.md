@@ -409,7 +409,7 @@ With [YOLO mode](#yolo-mode) on, plan mode skips these prompts too. YOLO approve
 
 Reading this project's plans and memory notes never asks, in plan mode or any other mode. The file and code tools may read the `plans/` and `memories/` directories under `…/state/caudra/projects/<project-id>/` (see [Directory layout](/docs/configuration/#directory-layout)). The allowance covers reads only, and another project's documents still ask. A symlink inside those directories cannot carry a read outside them. Tools in a remote workspace run on another machine, so they get no such allowance.
 
-Listing and reading notes with the `memory` tool needs no approval either, local or remote. Writing or deleting a note goes through the normal checks.
+Viewing, zooming, searching, and reading notes with the [`memory` tool](/docs/memory/#zoom-and-search) needs no approval either, local or remote. Writing or deleting a note goes through the normal checks.
 
 ## Read-only agents
 

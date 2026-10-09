@@ -1399,6 +1399,7 @@ mod background_runtime {
                 None,
                 AgentConfig {
                     generate_titles: false,
+                    summarize_memory: false,
                     compaction_requirements: false,
                     features: FeatureFlags::NONE.with(Feature::Workflows),
                     ..Default::default()

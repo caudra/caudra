@@ -322,6 +322,7 @@ pub fn run(
             | AgentEvent::QueueDrained
             | AgentEvent::Compacting
             | AgentEvent::CompactionDone
+            | AgentEvent::MemoryChanged
             | AgentEvent::SessionTitle { .. }
             | AgentEvent::StreamReset
             | AgentEvent::AuthRequired

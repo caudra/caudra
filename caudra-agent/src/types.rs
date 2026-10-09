@@ -45,6 +45,9 @@ pub const INDEX_TRUNCATED: &str = "[truncated]";
 /// restore sentinel, which already claims `u64::MAX`.
 pub const WORKFLOW_EVENT_RUN_ID: u64 = u64::MAX - 1;
 pub const BACKGROUND_EVENT_RUN_ID: u64 = u64::MAX - 2;
+/// The `run_id` the memory summarizer's events carry. It works between turns,
+/// so they belong to none.
+pub const MEMORY_EVENT_RUN_ID: u64 = u64::MAX - 3;
 /// How much of a run's report or result a transcript card quotes.
 pub const MAX_CARD_PREVIEW_BYTES: usize = 2048;
 /// Log lines a card keeps under its roster while the run works.
@@ -76,6 +79,10 @@ const MEMORY_NOTE_SEPARATOR: &str = "\n\n";
 const MEMORY_INDEX_SEPARATOR: &str = "\n";
 const MEMORY_NOTE_NOUN: &str = "note";
 const MEMORY_TAG_NOUN: &str = "tag";
+const MEMORY_PENDING_LABEL: &str = "pending";
+const MEMORY_HITS_HEADING: &str = "Notes matching";
+const MEMORY_HIT_BULLET: &str = "- ";
+const MEMORY_HIT_INDENT: &str = "  ";
 const LINE_NOUN: &str = "line";
 const TOOL_OUTPUT_LOADED: &str = "loaded";
 const PEER_SESSION_NOUN: &str = "session";
@@ -663,10 +670,10 @@ impl MemoryOrigin {
     }
 }
 
-/// One note a read returned: what it is called, what its body costs, what
-/// reaches it, and where it lives. The body has its frontmatter stripped, so
-/// `tags` is the only place tags are stated and the token count is what the
-/// model is actually charged.
+/// One note a read returned: what it is called, what its body costs, and
+/// where it lives. The body has its frontmatter stripped, so the token count
+/// is what the model is actually charged. Only notes from stored sessions
+/// carry `tags`, which were retired with the tag index.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryNote {
     pub name: String,
@@ -715,21 +722,70 @@ impl MemoryNoteEntry {
     }
 }
 
-/// A tag and the notes it reaches. A note carrying several tags appears under
-/// each of them, which is how `/memory` and the prompt's tag line already
-/// present the same index.
+/// A tag and the notes it reached, as stored sessions hold them. A note
+/// carrying several tags appears under each of them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryTagGroup {
     pub tag: String,
     pub notes: Vec<MemoryNoteEntry>,
 }
 
-/// What a memory browse answered with: whole notes for `read`, the tag index
-/// that reaches them for `list`.
+/// One line of the memory view, or one of the two lines a `zoom` opened a
+/// line into: what the `count` entries from entry `id` on say, with newlines
+/// as spaces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryLine {
+    pub id: u64,
+    pub count: u64,
+    pub text: String,
+    /// Not summarized yet, so the text only names what the line covers.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pending: bool,
+}
+
+impl MemoryLine {
+    /// `id+n|text`, the row the system prompt's view carries.
+    fn as_text(&self) -> String {
+        format!("{}+{}|{}", self.id, self.count, self.text)
+    }
+}
+
+/// A current note a `search` found.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryHit {
+    /// The entry that wrote the note's current text.
+    pub seq: u64,
+    pub name: String,
+    pub heading: String,
+    /// The body's first line holding a searched word, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<String>,
+}
+
+impl MemoryHit {
+    /// `- 547+1 flaky-tests.md: Flaky tests`, addressed as the entry `zoom`
+    /// reads whole, with the matching line under it.
+    fn as_text(&self) -> String {
+        let mut text = format!("{MEMORY_HIT_BULLET}{}+1 {}", self.seq, self.name);
+        if !self.heading.is_empty() {
+            let _ = write!(text, ": {}", self.heading);
+        }
+        if let Some(line) = &self.line {
+            let _ = write!(text, "\n{MEMORY_HIT_INDENT}{line}");
+        }
+        text
+    }
+}
+
+/// What a memory call answered with: whole notes for `read` and for the entry
+/// a `zoom` with `n` = 1 opened, lines of the summary tree for `view` and for
+/// any other `zoom`, and the notes a `search` found. `Index`, the tag index
+/// the retired `list` command returned, only comes back from stored sessions.
 ///
-/// `notices` are the lines that qualify the answer — tags ignored, files that
-/// would not read, nothing matched — and they lead, so a card can draw them
-/// apart from the notes and the model reads them before what they qualify.
+/// `notices` are the lines that qualify the answer — entries left out,
+/// nothing matched, what became of an entry — and they lead, so a card can
+/// draw them apart from the notes and the model reads them before what they
+/// qualify.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum MemoryOutput {
@@ -747,16 +803,35 @@ pub enum MemoryOutput {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         notices: Vec<String>,
     },
+    Lines {
+        /// What the lines cover, read before them.
+        heading: String,
+        lines: Vec<MemoryLine>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        notices: Vec<String>,
+    },
+    Hits {
+        query: String,
+        /// Best first.
+        hits: Vec<MemoryHit>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        notices: Vec<String>,
+    },
 }
 
 impl MemoryOutput {
     pub fn directory(&self) -> Option<&str> {
-        let (Self::Notes { directory, .. } | Self::Index { directory, .. }) = self;
-        directory.as_deref()
+        match self {
+            Self::Notes { directory, .. } | Self::Index { directory, .. } => directory.as_deref(),
+            Self::Lines { .. } | Self::Hits { .. } => None,
+        }
     }
 
     pub fn notices(&self) -> &[String] {
-        let (Self::Notes { notices, .. } | Self::Index { notices, .. }) = self;
+        let (Self::Notes { notices, .. }
+        | Self::Index { notices, .. }
+        | Self::Lines { notices, .. }
+        | Self::Hits { notices, .. }) = self;
         notices
     }
 
@@ -764,12 +839,15 @@ impl MemoryOutput {
         match self {
             Self::Notes { notes, .. } => notes.is_empty(),
             Self::Index { groups, .. } => groups.is_empty(),
+            Self::Lines { lines, .. } => lines.is_empty(),
+            Self::Hits { hits, .. } => hits.is_empty(),
         }
     }
 
-    /// `3 notes · 4.2k tokens` for a read, `18 notes · 7 tags` for a list.
-    /// A list counts distinct notes, because one carrying three tags is filed
-    /// three times and is still one note.
+    /// `3 notes · 4.2k tokens` for a read, `18 notes · 7 tags` for a list,
+    /// `72 lines · 2 pending` for a view, `4 notes` for a search. A list
+    /// counts distinct notes, because one carrying three tags is filed three
+    /// times and is still one note.
     pub fn annotation(&self) -> String {
         match self {
             Self::Notes { notes, .. } => format!(
@@ -790,14 +868,25 @@ impl MemoryOutput {
                     counted(groups.len(), MEMORY_TAG_NOUN)
                 )
             }
+            Self::Lines { lines, .. } => {
+                let shown = counted(lines.len(), LINE_NOUN);
+                match lines.iter().filter(|line| line.pending).count() {
+                    0 => shown,
+                    pending => format!(
+                        "{shown}{CARD_ANNOTATION_SEPARATOR}{pending} {MEMORY_PENDING_LABEL}"
+                    ),
+                }
+            }
+            Self::Hits { hits, .. } => counted(hits.len(), MEMORY_NOTE_NOUN),
         }
     }
 
     /// The one rendering of this answer as text: what the model reads, and what
     /// a reader copies out of the card.
     ///
-    /// The two shapes separate their parts differently because a note's body is
-    /// prose that needs air around it, while an index is already a list.
+    /// The shapes separate their parts differently because a note's body is
+    /// prose that needs air around it, while the other shapes are already
+    /// lists.
     pub fn as_display_text(&self) -> String {
         let (separator, body) = match self {
             Self::Notes { notes, .. } => (
@@ -818,6 +907,20 @@ impl MemoryOutput {
                     })
                     .collect(),
             ),
+            Self::Lines { heading, lines, .. } => (
+                MEMORY_INDEX_SEPARATOR,
+                headed(
+                    heading.clone(),
+                    lines.iter().map(MemoryLine::as_text).collect(),
+                ),
+            ),
+            Self::Hits { query, hits, .. } => (
+                MEMORY_INDEX_SEPARATOR,
+                headed(
+                    format!("{MEMORY_HITS_HEADING} \"{query}\", best first:"),
+                    hits.iter().map(MemoryHit::as_text).collect(),
+                ),
+            ),
         };
         let directory = self
             .directory()
@@ -834,6 +937,15 @@ impl MemoryOutput {
             None => listed,
         }
     }
+}
+
+/// A heading over its rows, or nothing when there are no rows for it to head,
+/// so an empty answer is its notices alone.
+fn headed(heading: String, mut rows: Vec<String>) -> Vec<String> {
+    if !rows.is_empty() {
+        rows.insert(0, heading);
+    }
+    rows
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2561,6 +2673,9 @@ pub enum AgentEvent {
     },
     Compacting,
     CompactionDone,
+    /// The project's memory changed outside a turn: the background summarizer
+    /// stored a line. An open memory inspector reloads.
+    MemoryChanged,
     /// A model-written name for the session, produced off the turn's critical
     /// path. Arrives at most once per session and may land after the run that
     /// triggered it has finished.
@@ -3722,6 +3837,131 @@ mod tests {
                 token_label(1)
             )
         );
+    }
+
+    /// Sessions stored while `list` existed hold its tag index. Nothing
+    /// produces one any more, but those sessions must still open and draw it.
+    #[test]
+    fn a_stored_tag_index_still_loads_and_renders() {
+        let stored = format!(
+            r#"{{"Memory":{{"kind":"index","directory":"{MEMORY_DIRECTORY}","groups":[{{"tag":"{MEMORY_TAG}","notes":[{{"name":"a.md","tokens":1,"origin":{{"kind":"file","path":"{MEMORY_DIRECTORY}/a.md"}}}}]}}]}}}}"#
+        );
+
+        let restored: ToolOutput = serde_json::from_str(&stored).expect("a stored index loads");
+
+        assert_eq!(
+            restored.as_text(),
+            format!(
+                "{MEMORY_DIRECTORY_LABEL}{MEMORY_DIRECTORY}\n\n\
+                 {MEMORY_TAG} (1)\n{MEMORY_INDEX_BULLET}a.md ({})\n",
+                token_label(1)
+            )
+        );
+        assert_eq!(
+            restored.annotation().as_deref(),
+            Some(format!("1 note{CARD_ANNOTATION_SEPARATOR}1 tag").as_str())
+        );
+    }
+
+    const VIEW_HEADING: &str = "3 entries in 2 lines, oldest first:";
+    const EMPTY_NOTICE: &str = "No memories yet.";
+
+    fn memory_line(id: u64, count: u64, text: &str, pending: bool) -> MemoryLine {
+        MemoryLine {
+            id,
+            count,
+            text: text.to_owned(),
+            pending,
+        }
+    }
+
+    /// A view reads as the block the system prompt carries: the heading, then
+    /// one addressed row per line, so the model can zoom any row it sees.
+    #[test]
+    fn a_view_renders_one_addressed_row_per_line_under_its_heading() {
+        const NOTICE: &str = "1 older entry is not in the view";
+        let output = ToolOutput::Memory(MemoryOutput::Lines {
+            heading: VIEW_HEADING.into(),
+            lines: Vec::from([
+                memory_line(0, 2, "a: first; b: second", false),
+                memory_line(2, 1, "(not summarized yet) note c.md: C", true),
+            ]),
+            notices: Vec::from([NOTICE.to_owned()]),
+        });
+
+        assert_eq!(
+            output.as_text(),
+            format!(
+                "{NOTICE}\n{VIEW_HEADING}\n0+2|a: first; b: second\n\
+                 2+1|(not summarized yet) note c.md: C"
+            )
+        );
+        assert_eq!(
+            output.annotation().as_deref(),
+            Some(format!("2 lines{CARD_ANNOTATION_SEPARATOR}1 {MEMORY_PENDING_LABEL}").as_str())
+        );
+    }
+
+    /// Each hit is addressed as the entry `zoom` reads whole, and the line that
+    /// matched sits under it, so the model can tell a passing mention from the
+    /// note it wants.
+    #[test]
+    fn a_search_renders_each_hit_with_the_line_that_matched() {
+        const QUERY: &str = "flaky";
+        let output = ToolOutput::Memory(MemoryOutput::Hits {
+            query: QUERY.into(),
+            hits: Vec::from([
+                MemoryHit {
+                    seq: 7,
+                    name: "flaky-tests.md".into(),
+                    heading: "Flaky tests".into(),
+                    line: Some("Retry the flaky suite once.".into()),
+                },
+                MemoryHit {
+                    seq: 3,
+                    name: "ci.md".into(),
+                    heading: String::new(),
+                    line: None,
+                },
+            ]),
+            notices: Vec::new(),
+        });
+
+        assert_eq!(
+            output.as_text(),
+            format!(
+                "{MEMORY_HITS_HEADING} \"{QUERY}\", best first:\n\
+                 {MEMORY_HIT_BULLET}7+1 flaky-tests.md: Flaky tests\n\
+                 {MEMORY_HIT_INDENT}Retry the flaky suite once.\n\
+                 {MEMORY_HIT_BULLET}3+1 ci.md"
+            )
+        );
+        assert_eq!(output.annotation().as_deref(), Some("2 notes"));
+    }
+
+    /// An answer with no rows is only what qualifies it: a heading over
+    /// nothing would read as an empty memory rather than an empty answer.
+    #[test_case(MemoryOutput::Lines { heading: VIEW_HEADING.into(), lines: Vec::new(), notices: Vec::from([EMPTY_NOTICE.to_owned()]) } ; "view")]
+    #[test_case(MemoryOutput::Hits { query: "x".into(), hits: Vec::new(), notices: Vec::from([EMPTY_NOTICE.to_owned()]) } ; "search")]
+    fn an_empty_answer_is_its_notices_alone(output: MemoryOutput) {
+        assert!(output.is_empty());
+        assert_eq!(output.as_display_text(), EMPTY_NOTICE);
+    }
+
+    /// The new shapes reopen from a stored session like the old ones.
+    #[test]
+    fn a_view_survives_being_stored_and_reopened() {
+        let output = ToolOutput::Memory(MemoryOutput::Lines {
+            heading: VIEW_HEADING.into(),
+            lines: Vec::from([memory_line(4, 2, "x", true)]),
+            notices: Vec::new(),
+        });
+
+        let stored = serde_json::to_string(&output).expect("a view serializes");
+        let restored: ToolOutput = serde_json::from_str(&stored).expect("and loads back");
+
+        assert_eq!(restored.as_text(), output.as_text());
+        assert_eq!(restored.annotation(), output.annotation());
     }
 
     const PEER_TARGET: &str = "calm-quick-fox-kind-brave-owl";

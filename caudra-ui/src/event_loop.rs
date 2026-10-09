@@ -1362,6 +1362,7 @@ impl SpawnCtx {
             self.config.features,
         );
         app.local_documents = self.local_documents.clone();
+        app.summarize_memory = self.config.summarize_memory;
         app.sandbox_live.connector = self.sandbox_connector.clone();
         app.sandbox_live.transfer_connector = self.transfer_connector.clone();
         app.sandbox_live.readiness = self.sandbox_readiness.clone();
@@ -5093,6 +5094,7 @@ mod tests {
             background_enabled: false,
             config: AgentConfig {
                 features: FeatureFlags::NONE,
+                summarize_memory: false,
                 ..Default::default()
             },
             automations: AutomationsConfig::default(),

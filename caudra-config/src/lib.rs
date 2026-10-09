@@ -1390,6 +1390,7 @@ pub struct AgentFileConfig {
     pub shell_execution: Option<ExecutionMode>,
     pub shell_async_threshold_secs: Option<u64>,
     pub generate_titles: Option<bool>,
+    pub summarize_memory: Option<bool>,
     pub stale_read_check: Option<bool>,
     pub tool_json_repair: Option<bool>,
     pub eager_batch_dispatch: Option<bool>,
@@ -1424,6 +1425,7 @@ impl AgentFileConfig {
             shell_execution,
             shell_async_threshold_secs,
             generate_titles,
+            summarize_memory,
             stale_read_check,
             tool_json_repair,
             eager_batch_dispatch,
@@ -2608,6 +2610,12 @@ pub struct AgentConfig {
 
     #[config(
         default = true,
+        desc = "Summarize memory notes in the background with the Memory model, so the memory view in the system prompt stays within its budget. When off, new notes reach the view only as titles and `memory search` still finds them"
+    )]
+    pub summarize_memory: bool,
+
+    #[config(
+        default = true,
         desc = "Block a write to a file that changed on disk since it was read, and point a failed edit or patch at the change"
     )]
     pub stale_read_check: bool,
@@ -2725,6 +2733,7 @@ impl AgentConfig {
                 .unwrap_or(DEFAULT_BACKGROUND_REMINDER_TURNS),
             todo_reminder: file.todo_reminder.unwrap_or(true),
             generate_titles: file.generate_titles.unwrap_or(true),
+            summarize_memory: file.summarize_memory.unwrap_or(true),
             stale_read_check: file.stale_read_check.unwrap_or(true),
             tool_json_repair: file.tool_json_repair.unwrap_or(true),
             eager_tool_dispatch: file
@@ -5229,6 +5238,48 @@ mod tests {
             raw.into_config(false).unwrap().agent.generate_titles,
             expected
         );
+    }
+
+    #[test_case(None,        true  ; "memory_summarized_by_default")]
+    #[test_case(Some(false), false ; "summarize_memory_disabled_in_config")]
+    fn summarize_memory_config(configured: Option<bool>, expected: bool) {
+        let raw = RawConfig {
+            agent: AgentFileConfig {
+                summarize_memory: configured,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert_eq!(
+            raw.into_config(false).unwrap().agent.summarize_memory,
+            expected
+        );
+    }
+
+    #[test_case(true, "", true; "true_survives_empty_overlay")]
+    #[test_case(true, "generate_titles = false", true; "true_survives_unrelated_overlay")]
+    #[test_case(true, "summarize_memory = false", false; "overlay_disables")]
+    #[test_case(false, "summarize_memory = true", true; "overlay_enables")]
+    fn summarize_memory_merge(base: bool, overlay: &str, expected: bool) {
+        let mut raw: RawConfig =
+            toml::from_str(&format!("[agent]\nsummarize_memory = {base}")).unwrap();
+        raw.merge(toml::from_str(&format!("[agent]\n{overlay}")).unwrap());
+        raw.merge(RawConfig::default());
+        assert_eq!(
+            raw.into_config(false).unwrap().agent.summarize_memory,
+            expected
+        );
+    }
+
+    #[test]
+    fn summarize_memory_config_metadata() {
+        assert!(AgentConfig::default().summarize_memory);
+        let field = AgentConfig::FIELDS
+            .iter()
+            .find(|f| f.name == "summarize_memory")
+            .expect("summarize_memory field not found");
+        assert_eq!(field.default.format_default(), "true");
     }
 
     #[test_case(None,        true  ; "requirements_appended_by_default")]

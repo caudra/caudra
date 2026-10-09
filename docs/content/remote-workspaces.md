@@ -166,13 +166,13 @@ Only global client MCP configuration is loaded. Local stdio extensions require e
 
 ## Client-owned documents and state
 
-Conversation records, retained tool output, credentials, approval records, and the remote-operation journal stay on the client. Plans and memory notes also stay local, scoped to the remote workspace identity. They are not remote repository paths. `Ctrl+O` and `/memory` open them in the [workbench](/docs/workbench/#plans-memory-notes-and-prompt-drafts), which saves them back to the same local store.
+Conversation records, retained tool output, credentials, approval records, and the remote-operation journal stay on the client. Plans and memory notes also stay local, scoped to the remote workspace identity. They are not remote repository paths. `Ctrl+O` opens the plan in the [workbench](/docs/workbench/#plans-memory-notes-and-prompt-drafts), and `Enter` on a note in `/memory` opens the note there. The workbench saves them back to the same local store.
 
 The [`plan` tool](/docs/tools/#plan) reads or replaces this session's plan the same way locally and remotely. The host chooses the target, and tool arguments cannot select another document or session. Implement and Clear-and-Implement include validated plan content in the model-visible Build request, even when the selected profile has no file tools. Clear-and-Implement copies a remote plan into a document the new session owns.
 
 Secure plan storage currently requires a Unix client. On Windows and other non-Unix clients, these storage operations return `UnsupportedPlatform`. A Unix Workcell server does not remove this client-side limitation.
 
-Use the `memory` tool to list, read, write, and delete named notes, just as in a local workspace. Writes replace the complete note. Plans use `plan` read/write. Workbench saves check document revisions and reject stale edits. Remote file tools cannot edit client plans or notes. Profile restrictions still apply. Listing or reading notes and reading the plan need no approval, and other calls go through the normal [permission checks](/docs/permissions/#plan-mode).
+The [`memory` tool](/docs/memory/#zoom-and-search) works as it does in a local workspace, and the journal of the notes stays on the client with them. Writes replace the complete note. Plans use `plan` read/write. Workbench saves check document revisions and reject stale edits. Remote file tools cannot edit client plans or notes. Profile restrictions still apply. Reading the plan, and viewing, zooming, searching, or reading notes, need no approval. Other calls go through the normal [permission checks](/docs/permissions/#plan-mode).
 
 Remote file contents and tool output can still enter model context and retained client output. Keeping the repository remote does not mean its content stays exclusively on the server.
 

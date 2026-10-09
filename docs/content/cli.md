@@ -442,7 +442,7 @@ caudra models --jobs --model anthropic/claude-sonnet-4-6
 
 The plain command streams every model Caudra currently knows about from built-ins, discovery, and catalogs. Each line starts with its model spec and may end with a Small, Fast, or Best supply marker. Warnings from discovery go to stderr.
 
-`--jobs` prints a table with **Job**, **Binding**, and **Resolved** columns for Chat, Plan, Subagent, Compact, Title, Goal, Extract, Fast, and Best. The optional global `--model` sets the anchor used to resolve the table and may appear before or after `models`. Without it, the normal saved, configured, or detected model becomes the anchor. It resolves from configuration and locally available model metadata, avoiding the all-provider discovery pass used by the plain command. See [Providers](/docs/providers/#model-jobs) for bindings, defaults, and marker meanings.
+`--jobs` prints a table with **Job**, **Binding**, and **Resolved** columns for Chat, Plan, Subagent, Compact, Title, Goal, Extract, Memory, Fast, and Best. The optional global `--model` sets the anchor used to resolve the table and may appear before or after `models`. Without it, the normal saved, configured, or detected model becomes the anchor. It resolves from configuration and locally available model metadata, avoiding the all-provider discovery pass used by the plain command. See [Providers](/docs/providers/#model-jobs) for bindings, defaults, and marker meanings.
 
 ### `caudra mcp`
 

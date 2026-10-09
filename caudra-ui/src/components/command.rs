@@ -211,7 +211,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "/memory",
-        description: "View, edit, and delete memory files",
+        description: "Inspect project memory: the view, its summary tree, and the notes",
         max_args: 0,
         scope: ChatScope::Any,
         features: &[],

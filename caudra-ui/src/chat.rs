@@ -337,7 +337,9 @@ impl Chat {
             AgentEvent::QueueBatchConsumed { items } => {
                 return ChatEventResult::QueueBatchConsumed { items };
             }
-            AgentEvent::QueueDrained | AgentEvent::SessionTitle { .. } => {}
+            AgentEvent::QueueDrained
+            | AgentEvent::SessionTitle { .. }
+            | AgentEvent::MemoryChanged => {}
             AgentEvent::StreamReset
             | AgentEvent::TaskAdmitted(_)
             | AgentEvent::Retry { .. }

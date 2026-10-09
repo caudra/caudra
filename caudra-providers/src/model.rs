@@ -803,6 +803,24 @@ impl Model {
         )
     }
 
+    /// [`Self::resolve`] for work billed beside the conversation, which must not
+    /// quietly run on the chat model. `None` when nothing chose a model: no
+    /// binding on the way, and the provider names none for the slot the purpose
+    /// falls back to, so the answer would only be `anchor` standing in.
+    pub fn resolve_dedicated(
+        purpose: ModelPurpose,
+        anchor: &Self,
+        policy: &ModelPolicy,
+    ) -> Result<Option<Self>, ModelError> {
+        Self::resolve_chosen(
+            purpose,
+            anchor,
+            policy,
+            &mut Vec::new(),
+            CatalogAccess::Warm,
+        )
+    }
+
     /// [`Self::resolve`] against a binding the caller already read, so a caller
     /// that reports which binding it used cannot resolve a different one.
     pub fn resolve_binding(
@@ -834,7 +852,8 @@ impl Model {
         let seen = &mut vec![purpose];
         match binding {
             Some(binding) => Self::follow(binding, anchor, policy, seen, catalog_access),
-            None => Self::auto(purpose, anchor, policy, seen, catalog_access),
+            None => Ok(Self::auto(purpose, anchor, policy, seen, catalog_access)?
+                .unwrap_or_else(|| anchor.clone())),
         }
     }
 
@@ -845,12 +864,27 @@ impl Model {
         seen: &mut Vec<ModelPurpose>,
         catalog_access: CatalogAccess,
     ) -> Result<Self, ModelError> {
+        Ok(
+            Self::resolve_chosen(purpose, anchor, policy, seen, catalog_access)?
+                .unwrap_or_else(|| anchor.clone()),
+        )
+    }
+
+    /// What a binding or the purpose's own rule chooses; `None` when neither
+    /// does and only the anchor is left.
+    fn resolve_chosen(
+        purpose: ModelPurpose,
+        anchor: &Self,
+        policy: &ModelPolicy,
+        seen: &mut Vec<ModelPurpose>,
+        catalog_access: CatalogAccess,
+    ) -> Result<Option<Self>, ModelError> {
         if seen.contains(&purpose) {
             return Err(ModelError::PurposeCycle(purpose));
         }
         seen.push(purpose);
         match model_registry::binding(purpose) {
-            Some(binding) => Self::follow(&binding, anchor, policy, seen, catalog_access),
+            Some(binding) => Self::follow(&binding, anchor, policy, seen, catalog_access).map(Some),
             None => Self::auto(purpose, anchor, policy, seen, catalog_access),
         }
     }
@@ -884,18 +918,20 @@ impl Model {
         policy: &ModelPolicy,
         seen: &mut Vec<ModelPurpose>,
         catalog_access: CatalogAccess,
-    ) -> Result<Self, ModelError> {
+    ) -> Result<Option<Self>, ModelError> {
         match purpose {
             ModelPurpose::Chat
             | ModelPurpose::Plan
             | ModelPurpose::Subagent
-            | ModelPurpose::Compact => Ok(anchor.clone()),
-            ModelPurpose::Title | ModelPurpose::Goal | ModelPurpose::Extract => {
-                Self::resolve_seen(ModelPurpose::Fast, anchor, policy, seen, catalog_access)
+            | ModelPurpose::Compact => Ok(Some(anchor.clone())),
+            ModelPurpose::Title
+            | ModelPurpose::Goal
+            | ModelPurpose::Extract
+            | ModelPurpose::Memory => {
+                Self::resolve_chosen(ModelPurpose::Fast, anchor, policy, seen, catalog_access)
             }
             ModelPurpose::Fast | ModelPurpose::Best => {
-                Ok(Self::provider_default(purpose, anchor, policy)
-                    .unwrap_or_else(|| anchor.clone()))
+                Ok(Self::provider_default(purpose, anchor, policy))
             }
         }
     }
@@ -1411,6 +1447,24 @@ mod tests {
         assert_eq!(model.spec(), chat.spec());
     }
 
+    /// Background work that bills on its own may not take the chat model as a
+    /// stand-in; the conversation's own purposes still answer with it.
+    #[test_case(ModelPurpose::Memory, &[], Some("openai/gpt-5.6-luna") ; "memory_takes_the_fast_model")]
+    #[test_case(ModelPurpose::Memory, &["anthropic/*"], None ; "memory_never_stands_in_the_anchor")]
+    #[test_case(ModelPurpose::Fast, &["anthropic/*"], None ; "fast_never_stands_in_the_anchor")]
+    #[test_case(ModelPurpose::Chat, &["anthropic/*"], Some(OPENAI_CHAT_SPEC) ; "chat_is_the_anchor_itself")]
+    fn dedicated_resolution_answers_only_with_a_chosen_model(
+        purpose: ModelPurpose,
+        allowed: &[&str],
+        expected: Option<&str>,
+    ) {
+        let chat = Model::from_spec(OPENAI_CHAT_SPEC).unwrap();
+
+        let model = Model::resolve_dedicated(purpose, &chat, &policy(allowed, &[])).unwrap();
+
+        assert_eq!(model.map(|model| model.spec()).as_deref(), expected);
+    }
+
     #[test_case(ModelPurpose::Chat, OPENAI_CHAT_SPEC ; "chat_keeps_anchor")]
     #[test_case(ModelPurpose::Plan, OPENAI_CHAT_SPEC ; "plan_keeps_anchor")]
     #[test_case(ModelPurpose::Subagent, OPENAI_CHAT_SPEC ; "subagent_keeps_anchor")]
@@ -1418,6 +1472,7 @@ mod tests {
     #[test_case(ModelPurpose::Title, "openai/gpt-5.6-luna" ; "title_uses_fast")]
     #[test_case(ModelPurpose::Goal, "openai/gpt-5.6-luna" ; "goal_uses_fast")]
     #[test_case(ModelPurpose::Extract, "openai/gpt-5.6-luna" ; "extract_uses_fast")]
+    #[test_case(ModelPurpose::Memory, "openai/gpt-5.6-luna" ; "memory_uses_fast")]
     #[test_case(ModelPurpose::Fast, "openai/gpt-5.6-luna" ; "fast_uses_small_default")]
     #[test_case(ModelPurpose::Best, "openai/gpt-5.6-sol" ; "best_uses_non_small_default")]
     fn automatic_purpose_resolution_uses_the_expected_lane(purpose: ModelPurpose, expected: &str) {

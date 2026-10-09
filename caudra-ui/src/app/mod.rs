@@ -71,7 +71,7 @@ use crate::components::login_picker::{LoginPicker, LoginPickerAction};
 use crate::components::logs_modal::{LogsAction, LogsModal};
 use crate::components::lua_float::FloatManager;
 use crate::components::mcp_picker::{McpPicker, McpPickerAction};
-use crate::components::memory_picker::MemoryPicker;
+use crate::components::memory_inspector::MemoryInspector;
 use crate::components::mention_popup::{MentionAction, MentionPopup};
 use crate::components::message_actions::{MessageActionKind, MessageActions, MessageActionsAction};
 use crate::components::messages::MessageActionTarget;
@@ -485,7 +485,11 @@ pub struct App {
     permission_ui: permission_editor::PermissionUi,
     parked_workbench: Option<Workbench>,
     permission_config_trust_deferred: bool,
-    pub(super) memory_picker: MemoryPicker,
+    pub(super) memory_inspector: MemoryInspector,
+    memory_reads: memory::MemoryReads,
+    /// Set by the event loop after construction: whether a summarizer writes
+    /// the memory's lines, which the inspector says when it does not.
+    pub(crate) summarize_memory: bool,
     pub(super) task_picker: TaskPicker,
     pub(super) shell_modal: ShellModal,
     pub(crate) peer_manager: PeerManager,
@@ -766,7 +770,9 @@ impl App {
             permission_ui: permission_editor::PermissionUi::default(),
             parked_workbench: None,
             permission_config_trust_deferred: false,
-            memory_picker: MemoryPicker::new(),
+            memory_inspector: MemoryInspector::new(),
+            memory_reads: memory::MemoryReads::default(),
+            summarize_memory: true,
             task_picker: TaskPicker::new(),
             shell_modal: ShellModal::new(),
             peer_manager: PeerManager::new(),
@@ -1870,7 +1876,11 @@ impl App {
             return None;
         }
         try_picker!(self.stash_picker);
-        try_picker!(self.memory_picker);
+        // Not `try_picker!`: the wheel scrolls the pane under the pointer.
+        if self.memory_inspector.is_open() {
+            self.memory_inspector.scroll_at(pos, delta);
+            return None;
+        }
         // Not `try_picker!`: the wheel walks the run list or scrolls the
         // section depending on which pane it is over.
         if self.workflow_inspector.is_open() {
@@ -2442,10 +2452,10 @@ impl App {
             let action = self.shell_modal.handle_key(key);
             return Some(self.handle_shell_modal_action(action));
         }
-        if self.memory_picker.is_open() {
-            guard_repeat!(false);
-            let action = self.memory_picker.handle_key(key);
-            return Some(self.handle_memory_picker_action(action));
+        if self.memory_inspector.is_open() {
+            guard_repeat!(self.memory_inspector.text_input_active());
+            let action = self.memory_inspector.handle_key(key);
+            return Some(self.handle_memory_action(action));
         }
         if self.workflow_inspector.is_open() {
             guard_repeat!(self.workflow_inspector.text_input_active());
@@ -4302,6 +4312,12 @@ impl App {
             }
             return vec![];
         }
+        // The summarizer reports under a run id of its own whenever it writes
+        // a line, which an open inspector reads again.
+        if let AgentEvent::MemoryChanged = envelope.event {
+            self.memory_changed();
+            return vec![];
+        }
         // Session state too, and a background shell reports its own gap long
         // after the run that started it retired.
         if let AgentEvent::Unrecorded { gap, notice } = envelope.event {
@@ -5278,7 +5294,7 @@ impl App {
             "/stash" => self.run_builtin(BuiltinAction::StashPush),
             "/stash-pop" => self.run_builtin(BuiltinAction::StashPop),
             "/stash-list" => self.run_builtin(BuiltinAction::StashList),
-            "/memory" => self.memory_browse(),
+            "/memory" => self.open_memory_inspector(),
             "/tasks" => self.execute_task_control(&cmd.args),
             "/shells" => self.shells_browse(),
             "/peers" => vec![Action::ListPeers],
@@ -5746,7 +5762,7 @@ impl App {
             &self.permissions_picker,
             &self.sandbox_manager,
             &self.stash_picker,
-            &self.memory_picker,
+            &self.memory_inspector,
             &self.task_picker,
             &self.shell_modal,
             &self.peer_manager,
@@ -5796,7 +5812,7 @@ impl App {
             &mut self.permissions_picker,
             &mut self.sandbox_manager,
             &mut self.stash_picker,
-            &mut self.memory_picker,
+            &mut self.memory_inspector,
             &mut self.task_picker,
             &mut self.shell_modal,
             &mut self.peer_manager,
@@ -6013,6 +6029,7 @@ impl App {
             | self.refresh_session_picker()
             | self.poll_workflow_replies()
             | self.poll_automations()
+            | self.poll_memory()
             | self.poll_task_controls()
             | self.poll_task_continuation()
             | self.poll_task_history()
@@ -6394,6 +6411,7 @@ impl App {
             Cadence::any(self.chats.iter().map(Chat::cadence)),
             self.which_key.cadence(),
             self.automation_cadence(),
+            self.memory_cadence(),
             // The `#` popup is not an overlay, so its spinner has to be asked
             // for here rather than through `overlays`.
             self.commit_popup.cadence(),
@@ -6519,7 +6537,10 @@ impl App {
         try_picker!(self.mcp_picker);
         try_picker!(self.permissions_picker);
         try_picker!(self.stash_picker);
-        try_picker!(self.memory_picker);
+        if let Some(action) = self.memory_inspector.handle_paste(text) {
+            self.handle_memory_action(action);
+            return;
+        }
         try_picker!(self.task_picker);
         try_picker!(self.shell_modal);
         if let Some(action) = self.workflow_inspector.handle_paste(text) {

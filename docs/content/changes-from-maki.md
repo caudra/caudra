@@ -45,7 +45,7 @@ Maki provided the native Rust TUI, Lua plugin system, provider integrations, MCP
 
 ## Model-aware reasoning and routing jobs
 
-**What changed:** [Reasoning controls](/docs/providers/) resolve against the selected model's declared toggle, effort levels, or token limits. Chat, Plan, Subagent, Compact, Title, Goal, Extract, Fast, and Best are separate model jobs. Plan-mode main turns can use a distinct model, and unbound subagents inherit the model currently running their parent. Provider catalogs carry small and default supply facts for Fast and Best routing rather than capability tiers.
+**What changed:** [Reasoning controls](/docs/providers/) resolve against the selected model's declared toggle, effort levels, or token limits. Chat, Plan, Subagent, Compact, Title, Goal, Extract, Memory, Fast, and Best are separate model jobs. Plan-mode main turns can use a distinct model, and unbound subagents inherit the model currently running their parent. Provider catalogs carry small and default supply facts for Fast and Best routing rather than capability tiers.
 
 **Why:** Provider-wide reasoning tables can advertise unsupported settings and send invalid requests. Model-declared controls keep the UI and request payload aligned with the model that receives them. Separate jobs make routing explicit, while supply facts avoid unsupported claims about model capability.
 

@@ -1542,6 +1542,7 @@ pub fn prompt(
 ) -> Result<()> {
     use crate::cli::PromptVariant;
     use caudra_agent::agent::{build_system_prompt, environment_block, load_instruction_text};
+    use caudra_agent::memory::baseline::{MemoryBaseline, open_store as open_memory_store};
     use caudra_agent::prompt::{
         PromptId, TASK_BUILD_CONTRACT, TASK_PLAN_CONTRACT, assemble_task_with_filter,
         plan_mode_prompt,
@@ -1667,11 +1668,16 @@ pub fn prompt(
     let filter = definitions.available_filter().for_mode(&mode);
     let output = match variant {
         PromptVariant::System => {
+            let memory = MemoryBaseline::adopt(
+                open_memory_store(runtime.local_documents(), Some(&storage), &cwd),
+                None,
+            );
             let system = build_system_prompt(
                 &instructions,
                 &slots,
                 &filter,
                 system_prompt_profile.as_deref(),
+                memory.view(),
             );
             let system = format!("{system}\n\n{}", environment_block(&vars, &model));
             if let Some(reminder) = plan_mode_prompt(&mode, |name| {

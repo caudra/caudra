@@ -1,0 +1,1182 @@
+//! The background summarizer: builds the tree's lines with a Fast model.
+//!
+//! A runtime keeps one [`Pump`] per memory. The pump folds the view, takes
+//! the nodes [`Tree::work`](super::tree::Tree::work) offers, most urgent
+//! first, leases each so other runtimes on the same journal leave it alone,
+//! asks the model for its line and stores it. Only a model chosen for the
+//! Memory purpose writes lines, never the chat model standing in for one:
+//! background spend nobody configured is spend nobody expects.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::Duration;
+
+use caudra_config::ModelPolicy;
+use caudra_providers::provider::{Provider, from_model_async};
+use caudra_providers::{
+    AgentError, CacheKey, ContentBlock, MIN_THINKING_BUDGET, Message, Model, ModelError,
+    ModelPurpose, RequestOptions, Role, Timeouts, TokenUsage,
+};
+use caudra_storage::StateDir;
+use caudra_storage::memory_journal::{Entry, MemoryJournal, MemoryJournalError, StoredNode};
+use caudra_storage::usage_ledger::{LedgerPurpose, TurnUsage, UsageLedger};
+use flume::Sender;
+use futures_lite::future::{self, Boxed};
+use serde_json::json;
+use smol::Task;
+use thiserror::Error;
+use tracing::{debug, info, warn};
+
+use super::store::{MemoryError, MemoryState, MemoryStore, leaf_kind, now_ms};
+use super::tree::{NODE, Part, VIEW, entry_text, scale};
+use crate::agent::requirements::{clean, response_text};
+use crate::nudge::Nudge;
+use crate::types::{AgentEvent, EventSender};
+
+/// Replies one node may take, all in one conversation, before the shortest
+/// is cut to fit.
+pub const TRIES: usize = 5;
+/// Nodes built at once: a merge can run while a leaf is written, and the
+/// user's rate limits are left for the conversation.
+pub const JOBS: usize = 2;
+/// How long a claim keeps other runtimes off a node.
+pub const LEASE: Duration = Duration::from_secs(120);
+/// How long a node that failed for a passing reason waits for its next
+/// attempt.
+pub const RETRY: Duration = Duration::from_secs(10);
+/// A reply slower than this is a failed try, so every try of a node fits
+/// inside its lease.
+const CALL_TIMEOUT: Duration = Duration::from_secs(LEASE.as_secs() / TRIES as u64);
+const LEASE_MS: i64 = LEASE.as_millis() as i64;
+/// A line is a few hundred tokens, but a model that reasons unconditionally
+/// draws its thinking budget from this same pool, and providers floor that
+/// budget at [`MIN_THINKING_BUDGET`].
+const OUTPUT_TOKENS: u32 = MIN_THINKING_BUDGET * 2;
+const SYSTEM: &str = include_str!("../prompts/memory_compact.md");
+const MEMORY_OPEN: &str = "<memory>\n";
+const MEMORY_CLOSE: &str = "</memory>";
+const COMPRESS: &str = "Compress this note into one line";
+const MERGE: &str = "Merge these two lines into one";
+const LIMIT_MARK: &str = "| ← LIMIT";
+
+/// The pump's clock and waits, behind a trait so tests decide when time
+/// passes.
+pub trait Timer: Send + Sync {
+    /// Unix milliseconds, which leases are stamped in.
+    fn now_ms(&self) -> i64;
+    /// Completes once `delay` has passed.
+    fn after(&self, delay: Duration) -> Boxed<()>;
+}
+
+struct SystemTimer;
+
+impl Timer for SystemTimer {
+    fn now_ms(&self) -> i64 {
+        now_ms()
+    }
+
+    fn after(&self, delay: Duration) -> Boxed<()> {
+        Box::pin(async move {
+            smol::Timer::after(delay).await;
+        })
+    }
+}
+
+/// The usage ledger, for a runtime that records no spend from the events it
+/// forwards.
+#[derive(Clone)]
+pub struct Ledger {
+    pub state: StateDir,
+    /// The project the spend is filed under.
+    pub cwd: String,
+}
+
+/// Where each call's spend goes: an event for the runtime, and the ledger
+/// when the runtime keeps none of its own.
+struct Spend {
+    events: EventSender,
+    ledger: Option<Ledger>,
+}
+
+impl Spend {
+    async fn report(&self, model: &Model, usage: TokenUsage) {
+        let cost = model.billed_cost(&usage, false);
+        self.events.try_send(AgentEvent::ModelUsage {
+            usage,
+            cost,
+            billing: model.billing,
+            provider: model.provider.to_string(),
+            model: model.id.clone(),
+            purpose: LedgerPurpose::Memory,
+        });
+        let Some(Ledger { state, cwd }) = self.ledger.clone() else {
+            return;
+        };
+        let turn = TurnUsage {
+            provider: model.provider.to_string(),
+            model: model.id.clone(),
+            cwd,
+            purpose: LedgerPurpose::Memory,
+            input: usage.input,
+            output: usage.output,
+            cache_creation: usage.cache_creation,
+            cache_read: usage.cache_read,
+            cost,
+            subscription: model.billing.is_subscription(),
+        };
+        if let Err(error) = smol::unblock(move || UsageLedger::open(&state)?.record(&turn)).await {
+            warn!(%error, model = %model.id, "memory summary spend not recorded in the usage ledger");
+        }
+    }
+}
+
+/// The model that writes the lines, and the provider that serves it.
+pub struct Summarizer {
+    provider: Arc<dyn Provider>,
+    model: Model,
+}
+
+impl Summarizer {
+    /// The Memory purpose resolved against the chat model, off the executor.
+    /// `None`, logged, when nothing chose a model for it, so the chat model
+    /// would only stand in, or when the chosen one will not load.
+    pub async fn resolve(
+        chat_provider: &Arc<dyn Provider>,
+        chat_model: &Model,
+        policy: &ModelPolicy,
+        timeouts: Timeouts,
+    ) -> Option<Self> {
+        let (anchor, policy) = (chat_model.clone(), policy.clone());
+        let resolved =
+            smol::unblock(move || Model::resolve_dedicated(ModelPurpose::Memory, &anchor, &policy))
+                .await;
+        Self::load(resolved, chat_provider, chat_model, timeouts).await
+    }
+
+    async fn load(
+        resolved: Result<Option<Model>, ModelError>,
+        chat_provider: &Arc<dyn Provider>,
+        chat_model: &Model,
+        timeouts: Timeouts,
+    ) -> Option<Self> {
+        let mut model = match resolved {
+            Ok(Some(model)) => model,
+            Ok(None) => {
+                info!(
+                    chat_model = %chat_model.spec(),
+                    purpose = %ModelPurpose::Memory,
+                    "memory summaries off: no model is chosen for memory work and the provider names no fast one"
+                );
+                return None;
+            }
+            Err(error) => {
+                warn!(
+                    %error,
+                    chat_model = %chat_model.spec(),
+                    purpose = %ModelPurpose::Memory,
+                    "memory summaries off: the memory model does not resolve"
+                );
+                return None;
+            }
+        };
+        model.max_output_tokens = Some(
+            model
+                .max_output_tokens
+                .map_or(OUTPUT_TOKENS, |cap| cap.min(OUTPUT_TOKENS)),
+        );
+        let provider = if model.provider == chat_model.provider {
+            chat_provider.adjust_model(&mut model);
+            Arc::clone(chat_provider)
+        } else {
+            match from_model_async(&mut model, timeouts).await {
+                Ok(provider) => Arc::from(provider),
+                Err(error) => {
+                    warn!(
+                        %error,
+                        model = %model.spec(),
+                        purpose = %ModelPurpose::Memory,
+                        "memory summaries off: the memory model's provider does not load"
+                    );
+                    return None;
+                }
+            }
+        };
+        Some(Self { provider, model })
+    }
+}
+
+/// Builds one memory's lines in the background until dropped.
+pub struct Pump {
+    store: Arc<MemoryStore>,
+    nudge: Nudge,
+    _task: Task<()>,
+}
+
+impl Pump {
+    /// Resolves the summarizer against the chat model, then builds every node
+    /// the view needs. Ends at once, logged, when there is no summarizer.
+    /// `ledger` is for a runtime that records no spend from `events`.
+    pub fn start(
+        store: Arc<MemoryStore>,
+        chat_provider: Arc<dyn Provider>,
+        chat_model: Model,
+        policy: Arc<ModelPolicy>,
+        timeouts: Timeouts,
+        events: EventSender,
+        ledger: Option<Ledger>,
+    ) -> Self {
+        let nudge = Nudge::default();
+        let task = smol::spawn({
+            let store = Arc::clone(&store);
+            let nudge = nudge.clone();
+            async move {
+                let Some(summarizer) =
+                    Summarizer::resolve(&chat_provider, &chat_model, &policy, timeouts).await
+                else {
+                    return;
+                };
+                let spend = Spend { events, ledger };
+                Arc::new(Shared::new(store, summarizer, spend, Arc::new(SystemTimer)))
+                    .run(nudge)
+                    .await;
+            }
+        });
+        Self {
+            store,
+            nudge,
+            _task: task,
+        }
+    }
+
+    pub fn store(&self) -> &Arc<MemoryStore> {
+        &self.store
+    }
+
+    /// Wakes the pump if it waits for work: entries may have arrived, and
+    /// nodes that failed for good get another attempt.
+    pub fn nudge(&self) {
+        self.nudge.notify();
+    }
+}
+
+/// Why a node was not built.
+#[derive(Debug, Error)]
+enum BuildError {
+    #[error(transparent)]
+    Model(#[from] AgentError),
+    #[error("the model answered with nothing")]
+    Empty,
+    #[error("entry {0} is gone from the journal")]
+    Gone(u64),
+    #[error(transparent)]
+    Memory(#[from] MemoryError),
+}
+
+impl BuildError {
+    /// Whether waiting may help: the provider was busy, limiting or out of
+    /// reach.
+    fn transient(&self) -> bool {
+        matches!(self, Self::Model(error) if error.is_retryable())
+    }
+}
+
+/// What a node is made from.
+enum Material {
+    /// The entry at this seq, compressed alone. Its body is read when the
+    /// build starts.
+    Entry(u64),
+    /// Two adjacent lines, merged.
+    Lines(String, String),
+}
+
+/// A node about to be built, with what the model reads for it.
+struct Job {
+    part: Part,
+    memory: String,
+    material: Material,
+}
+
+impl Job {
+    fn new(state: &MemoryState, parts: &[Part], part: Part) -> Option<Self> {
+        let tree = &state.tree;
+        let material = match part.children() {
+            None => Material::Entry(part.index),
+            Some([first, second]) => Material::Lines(
+                tree.built(&first)?.text.clone(),
+                tree.built(&second)?.text.clone(),
+            ),
+        };
+        Some(Self {
+            memory: memory_block(&tree.context(parts, &part)),
+            part,
+            material,
+        })
+    }
+}
+
+/// Why the pump woke.
+enum Wake {
+    Built(Part, Result<(), BuildError>),
+    /// A node that failed for a passing reason may be tried again.
+    Due(Part),
+}
+
+/// What a pump's builds share.
+struct Shared {
+    store: Arc<MemoryStore>,
+    summarizer: Summarizer,
+    spend: Spend,
+    timer: Arc<dyn Timer>,
+    /// Unique to this pump, so two pumps never build one node, even in one
+    /// process.
+    owner: String,
+    key: CacheKey,
+}
+
+impl Shared {
+    fn new(
+        store: Arc<MemoryStore>,
+        summarizer: Summarizer,
+        spend: Spend,
+        timer: Arc<dyn Timer>,
+    ) -> Self {
+        Self {
+            key: CacheKey::memory(store.scope()),
+            owner: format!("{}-{:016x}", std::process::id(), fastrand::u64(..)),
+            store,
+            summarizer,
+            spend,
+            timer,
+        }
+    }
+
+    async fn run(self: Arc<Self>, nudge: Nudge) {
+        let (wake_tx, wake_rx) = flume::unbounded();
+        let mut building: HashMap<Part, Task<()>> = HashMap::new();
+        let mut cooling: HashMap<Part, Task<()>> = HashMap::new();
+        let mut held: HashSet<Part> = HashSet::new();
+        let mut warned: HashSet<Part> = HashSet::new();
+        // Kept across wakes, so a nudge that lands while one is handled waits
+        // its turn instead of being lost.
+        let mut nudged = nudge.listen();
+        loop {
+            match self.load().await {
+                Ok(state) => self.start(
+                    &state,
+                    &mut building,
+                    |part| cooling.contains_key(part) || held.contains(part),
+                    &wake_tx,
+                ),
+                Err(error) => {
+                    warn!(scope = self.store.scope(), %error, "memory not loaded for summaries")
+                }
+            }
+            let woke = future::or(async { wake_rx.recv_async().await.ok() }, async {
+                (&mut nudged).await;
+                None
+            })
+            .await;
+            match woke {
+                Some(Wake::Built(part, result)) => {
+                    building.remove(&part);
+                    let Err(error) = result else {
+                        continue;
+                    };
+                    let transient = error.transient();
+                    if warned.insert(part.clone()) {
+                        warn!(scope = self.store.scope(), node = %part, %error, transient, "memory line not written");
+                    } else {
+                        debug!(scope = self.store.scope(), node = %part, %error, transient, "memory line not written again");
+                    }
+                    if transient {
+                        let task = self.cool(part.clone(), &wake_tx);
+                        cooling.insert(part, task);
+                    } else {
+                        held.insert(part);
+                    }
+                }
+                Some(Wake::Due(part)) => {
+                    cooling.remove(&part);
+                }
+                None => {
+                    nudged = nudge.listen();
+                    held.clear();
+                }
+            }
+        }
+    }
+
+    /// Starts the nodes the view needs, most urgent first, while fewer than
+    /// [`JOBS`] build. Skips nodes another pump holds and those `waiting`
+    /// keeps back.
+    fn start(
+        self: &Arc<Self>,
+        state: &MemoryState,
+        building: &mut HashMap<Part, Task<()>>,
+        waiting: impl Fn(&Part) -> bool,
+        wake: &Sender<Wake>,
+    ) {
+        let parts = state.tree.fold(VIEW);
+        let now_ms = self.timer.now_ms();
+        for part in state.tree.work(&parts) {
+            if building.len() >= JOBS {
+                break;
+            }
+            if building.contains_key(&part)
+                || waiting(&part)
+                || self.leased_elsewhere(&state.nodes, &part, now_ms)
+            {
+                continue;
+            }
+            let Some(job) = Job::new(state, &parts, part.clone()) else {
+                continue;
+            };
+            let task = smol::spawn({
+                let shared = Arc::clone(self);
+                let wake = wake.clone();
+                async move {
+                    let result = shared.build(&job).await;
+                    let _ = wake.send(Wake::Built(job.part, result));
+                }
+            });
+            building.insert(part, task);
+        }
+    }
+
+    fn cool(&self, part: Part, wake: &Sender<Wake>) -> Task<()> {
+        let (wait, wake) = (self.timer.after(RETRY), wake.clone());
+        smol::spawn(async move {
+            wait.await;
+            let _ = wake.send(Wake::Due(part));
+        })
+    }
+
+    fn leased_elsewhere(&self, nodes: &[StoredNode], part: &Part, now_ms: i64) -> bool {
+        nodes.iter().any(|node| {
+            node.level == part.level
+                && node.index == part.index
+                && node.text.is_none()
+                && node
+                    .lease_owner
+                    .as_deref()
+                    .is_some_and(|owner| owner != self.owner)
+                && node
+                    .lease_expires_ms
+                    .is_some_and(|expires| expires > now_ms)
+        })
+    }
+
+    /// Leases the node, writes its line and stores it. A failed node is
+    /// released at once, so no other runtime waits out the lease.
+    async fn build(&self, job: &Job) -> Result<(), BuildError> {
+        if !self.claim(&job.part).await? {
+            return Ok(());
+        }
+        match self.write(job).await {
+            Ok(stored) => {
+                if stored {
+                    self.spend.events.try_send(AgentEvent::MemoryChanged);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if let Err(release) = self.release(&job.part).await {
+                    warn!(scope = self.store.scope(), node = %job.part, error = %release, "memory lease not released");
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// False when the lease went meanwhile: the note was forgotten, or
+    /// another runtime took the node over.
+    async fn write(&self, job: &Job) -> Result<bool, BuildError> {
+        let step = match &job.material {
+            Material::Entry(seq) => {
+                let entry = self.entry(*seq).await?;
+                let kind = leaf_kind(&entry.meta);
+                step(COMPRESS, &entry_text(kind, &entry.meta.name, &entry.body))
+            }
+            Material::Lines(first, second) => {
+                step(MERGE, &format!("{}\n{}", flat(first), flat(second)))
+            }
+        };
+        let line = self.line(&job.memory, step).await?;
+        Ok(self.store_line(&job.part, line).await?)
+    }
+
+    /// Up to [`TRIES`] replies in one conversation, each one too long
+    /// answered with where it had to end. The first that fits wins, else the
+    /// shortest, cut to fit.
+    async fn line(&self, memory: &str, step: String) -> Result<String, BuildError> {
+        let mut messages = vec![Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: memory.to_owned(),
+                },
+                ContentBlock::Text { text: step },
+            ],
+            ..Message::default()
+        }];
+        let mut shortest = String::new();
+        for _ in 0..TRIES {
+            let reply = self.ask(&messages).await?;
+            if reply.len() <= NODE {
+                return Ok(reply);
+            }
+            messages.push(Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: reply.clone(),
+                }],
+                ..Message::default()
+            });
+            messages.push(Message::user(feedback(&reply)));
+            if shortest.is_empty() || reply.len() < shortest.len() {
+                shortest = reply;
+            }
+        }
+        Ok(cut(&shortest).trim_end().to_owned())
+    }
+
+    /// One reply, trimmed. Its spend is reported whatever it says.
+    async fn ask(&self, messages: &[Message]) -> Result<String, BuildError> {
+        let Summarizer { provider, model } = &self.summarizer;
+        // A provider fails a request whose event channel closed.
+        let (events, _events) = flume::unbounded();
+        let tools = json!([]);
+        let request = provider.stream_message(
+            model,
+            messages,
+            SYSTEM,
+            &tools,
+            &events,
+            RequestOptions::default().clamped(model),
+            Some(&self.key),
+        );
+        let timeout = self.timer.after(CALL_TIMEOUT);
+        let response = future::or(request, async {
+            timeout.await;
+            Err(AgentError::Timeout {
+                secs: CALL_TIMEOUT.as_secs(),
+            })
+        })
+        .await?;
+        self.spend.report(model, response.usage).await;
+        clean(&response_text(&response.message)).ok_or(BuildError::Empty)
+    }
+
+    async fn load(&self) -> Result<MemoryState, MemoryError> {
+        let store = Arc::clone(&self.store);
+        smol::unblock(move || store.load()).await
+    }
+
+    async fn journal<T: Send + 'static>(
+        &self,
+        query: impl FnOnce(&MemoryJournal, &str) -> Result<T, MemoryJournalError> + Send + 'static,
+    ) -> Result<T, MemoryError> {
+        let store = Arc::clone(&self.store);
+        smol::unblock(move || Ok(query(&store.journal(), store.scope())?)).await
+    }
+
+    async fn entry(&self, seq: u64) -> Result<Entry, BuildError> {
+        self.journal(move |journal, scope| journal.entry(scope, seq))
+            .await?
+            .ok_or(BuildError::Gone(seq))
+    }
+
+    async fn claim(&self, part: &Part) -> Result<bool, MemoryError> {
+        let (level, index, owner) = (part.level, part.index, self.owner.clone());
+        let now_ms = self.timer.now_ms();
+        self.journal(move |journal, scope| {
+            journal.claim(scope, level, index, &owner, now_ms, LEASE_MS)
+        })
+        .await
+    }
+
+    async fn release(&self, part: &Part) -> Result<(), MemoryError> {
+        let (level, index, owner) = (part.level, part.index, self.owner.clone());
+        self.journal(move |journal, scope| journal.release(scope, level, index, &owner))
+            .await
+    }
+
+    async fn store_line(&self, part: &Part, line: String) -> Result<bool, MemoryError> {
+        let (level, index, owner) = (part.level, part.index, self.owner.clone());
+        let (model, now_ms) = (self.summarizer.model.spec(), self.timer.now_ms());
+        self.journal(move |journal, scope| {
+            journal.store_node(scope, level, index, &owner, &line, &model, now_ms)
+        })
+        .await
+    }
+}
+
+/// The view up to the node, a line each and without addresses, so the model
+/// never learns to write them.
+fn memory_block(context: &[&str]) -> String {
+    let mut block = String::from(MEMORY_OPEN);
+    for line in context {
+        block.push_str(&flat(line));
+        block.push('\n');
+    }
+    block.push_str(MEMORY_CLOSE);
+    block
+}
+
+/// Models cannot count bytes, so the step shows the limit as a ruler.
+fn step(task: &str, material: &str) -> String {
+    format!("{}\n{task}, in at most {NODE} bytes:\n{material}", scale())
+}
+
+/// An overlong reply comes back cut where it had to end.
+fn feedback(reply: &str) -> String {
+    format!(
+        "That line is {} bytes; the limit is {NODE}. It must end where it is cut here:\n{}{LIMIT_MARK}",
+        reply.len(),
+        cut(reply)
+    )
+}
+
+fn cut(text: &str) -> &str {
+    &text[..text.floor_char_boundary(NODE)]
+}
+
+fn flat(line: &str) -> String {
+    line.replace(['\n', '\r'], " ")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::ops::Range;
+    use std::sync::Mutex;
+
+    use caudra_providers::model_registry::{self, Binding};
+    use caudra_providers::provider::BoxFuture;
+    use caudra_providers::{ModelInfo, ProviderEvent, StopReason, StreamResponse};
+    use caudra_storage::memory_journal::EntryOrigin;
+    use flume::Receiver;
+    use serde_json::Value;
+    use tempfile::TempDir;
+    use test_case::test_case;
+
+    use super::*;
+    use crate::memory::store::Source;
+    use crate::types::{Envelope, MEMORY_EVENT_RUN_ID};
+
+    const SCOPE: &str = "projects/compactor";
+    const SESSION: &str = "session-a";
+    const NOTES_DIR: &str = "memories";
+    const NOTE_SUFFIX: &str = ".md";
+    const CWD: &str = "/work/project";
+    const CHAT_SPEC: &str = "openai/gpt-5.6-sol";
+    const FAST_SPEC: &str = "openai/gpt-5.6-luna";
+    /// Puts the chat model's fast default out of reach.
+    const ONLY_ANTHROPIC: &str = "anthropic/*";
+    /// Four leaves, the two merges over them, and the one over those.
+    const NOTES: u64 = 4;
+    const NODES: usize = 7;
+    /// Too long for a note to stand as its own line.
+    const BODY_BYTES: usize = NODE + 64;
+    /// Two of these never fit one line, so every merge asks the model.
+    const LINE_BYTES: usize = NODE * 3 / 5;
+    const USAGE: TokenUsage = TokenUsage {
+        input: 120,
+        output: 30,
+        cache_creation: 0,
+        cache_read: 0,
+    };
+    const RATE_LIMITED: u16 = 429;
+    const SLOW_DOWN: &str = "slow down";
+    /// One narrow character, then wide ones, so the limit splits a character.
+    const NARROW: &str = "a";
+    const WIDE: &str = "é";
+    const WIDE_CHARS: usize = 300;
+    const OVERLONG_FEEDBACK: &str =
+        "That line is 601 bytes; the limit is 512. It must end where it is cut here:\n";
+    /// The last character boundary before the limit.
+    const OVERLONG_CUT: usize = NODE - 1;
+    /// How far past the limit each try runs.
+    const OVERRUNS: [usize; TRIES] = [300, 100, 200, 400, 250];
+    const SHORTEST_TRY: usize = 1;
+    const UNBUILT_LINE: &str = "a node read a line no reply had written yet";
+    const CONTEXT_INCOMPLETE: &str = "a node started before every line ahead of it was built";
+    const BUILT_TWICE: &str = "a node was asked for more than once";
+    const ONE_CONVERSATION: &str = "every try of a node is one conversation";
+    const RETRIED_EARLY: &str = "a passing failure was tried again before its timer fired";
+    const LEASE_KEPT: &str = "a failed node kept its lease";
+    const STOOD_IN: &str = "the pump ran with no model chosen for memory work";
+
+    /// Answers with its script, then with a fresh line each request, and
+    /// keeps every request with the line it answered.
+    struct ScriptedProvider {
+        script: Mutex<VecDeque<Result<String, AgentError>>>,
+        calls: Mutex<Vec<(Vec<Message>, Option<String>)>>,
+    }
+
+    impl ScriptedProvider {
+        fn new(script: impl IntoIterator<Item = Result<String, AgentError>>) -> Arc<Self> {
+            Arc::new(Self {
+                script: Mutex::new(script.into_iter().collect()),
+                calls: Mutex::default(),
+            })
+        }
+
+        fn calls(&self) -> Vec<(Vec<Message>, Option<String>)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl Provider for ScriptedProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            messages: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a CacheKey>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                let mut calls = self.calls.lock().unwrap();
+                let reply = self
+                    .script
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_else(|| Ok(line(calls.len())));
+                calls.push((messages.to_vec(), reply.as_ref().ok().cloned()));
+                reply.map(answer)
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    /// Time stands still, and a wait ends only when the test fires it.
+    struct ManualTimer {
+        now_ms: i64,
+        waits: Mutex<Vec<(Duration, Sender<()>)>>,
+        started: Sender<Duration>,
+    }
+
+    impl ManualTimer {
+        fn new() -> (Arc<Self>, Receiver<Duration>) {
+            let (started, waits) = flume::unbounded();
+            let timer = Self {
+                now_ms: now_ms(),
+                waits: Mutex::default(),
+                started,
+            };
+            (Arc::new(timer), waits)
+        }
+
+        /// Ends every wait of `delay` begun so far.
+        fn fire(&self, delay: Duration) {
+            self.waits.lock().unwrap().retain(|(wait, end)| {
+                let due = *wait == delay;
+                if due {
+                    let _ = end.send(());
+                }
+                !due
+            });
+        }
+    }
+
+    impl Timer for ManualTimer {
+        fn now_ms(&self) -> i64 {
+            self.now_ms
+        }
+
+        fn after(&self, delay: Duration) -> Boxed<()> {
+            let (end, ended) = flume::bounded(1);
+            self.waits.lock().unwrap().push((delay, end));
+            let _ = self.started.send(delay);
+            Box::pin(async move {
+                let _ = ended.recv_async().await;
+            })
+        }
+    }
+
+    struct Fixture {
+        state: TempDir,
+        store: Arc<MemoryStore>,
+    }
+
+    impl Fixture {
+        /// A memory of `notes` notes, each too long to be its own line.
+        fn new(notes: u64) -> Self {
+            let state = TempDir::new().unwrap();
+            let store = open(&state);
+            let origin = EntryOrigin::Session(SESSION.to_owned());
+            for seq in 0..notes {
+                let body = format!("{seq:x>BODY_BYTES$}");
+                store
+                    .write(&format!("{seq}{NOTE_SUFFIX}"), &body, &origin)
+                    .unwrap();
+            }
+            Self { state, store }
+        }
+
+        fn state_dir(&self) -> StateDir {
+            StateDir::from_path(self.state.path().to_path_buf())
+        }
+
+        fn first_line(&self) -> String {
+            let state = self.store.load().unwrap();
+            state.tree.built(&Part::leaf(0)).unwrap().text.clone()
+        }
+    }
+
+    /// A handle on the fixture's journal of its own, as another runtime has.
+    fn open(state: &TempDir) -> Arc<MemoryStore> {
+        let store = MemoryStore::open(
+            &StateDir::from_path(state.path().to_path_buf()),
+            SCOPE.to_owned(),
+            Source::Local(state.path().join(NOTES_DIR)),
+        );
+        Arc::new(store.unwrap())
+    }
+
+    fn spawn(
+        store: Arc<MemoryStore>,
+        provider: &Arc<ScriptedProvider>,
+        timer: &Arc<ManualTimer>,
+        events: Sender<Envelope>,
+        ledger: Option<Ledger>,
+    ) -> (Nudge, Task<()>) {
+        let summarizer = Summarizer {
+            provider: provider.clone(),
+            model: Model::from_spec(FAST_SPEC).unwrap(),
+        };
+        let spend = Spend {
+            events: EventSender::new(events, MEMORY_EVENT_RUN_ID),
+            ledger,
+        };
+        let shared = Shared::new(store, summarizer, spend, timer.clone());
+        let nudge = Nudge::default();
+        (nudge.clone(), smol::spawn(Arc::new(shared).run(nudge)))
+    }
+
+    /// The events up to the `count`th stored line, nudging `pumps` after each
+    /// so they contend for the next node.
+    async fn stored(
+        events: &Receiver<Envelope>,
+        count: usize,
+        pumps: &[&Nudge],
+    ) -> Vec<AgentEvent> {
+        let mut seen = Vec::new();
+        let mut stored = 0;
+        while stored < count {
+            match events.recv_async().await.unwrap().event {
+                AgentEvent::MemoryChanged => {
+                    stored += 1;
+                    pumps.iter().for_each(|pump| pump.notify());
+                }
+                event => seen.push(event),
+            }
+        }
+        seen
+    }
+
+    fn answer(text: String) -> StreamResponse {
+        StreamResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text { text }],
+                ..Message::default()
+            },
+            usage: USAGE,
+            stop_reason: Some(StopReason::EndTurn),
+            ..StreamResponse::default()
+        }
+    }
+
+    /// A line no other reply repeats, long enough that two never fit one.
+    fn line(index: usize) -> String {
+        format!("{index:0>LINE_BYTES$}")
+    }
+
+    fn texts(message: &Message) -> Vec<&str> {
+        message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The memory block and the step a node's conversation opens with.
+    fn request(messages: &[Message]) -> (&str, &str) {
+        let [memory, step] = texts(&messages[0])[..] else {
+            panic!("a node's conversation opens with the memory block and the step");
+        };
+        (memory, step)
+    }
+
+    fn context(memory: &str) -> impl Iterator<Item = &str> {
+        memory
+            .strip_prefix(MEMORY_OPEN)
+            .and_then(|rest| rest.strip_suffix(MEMORY_CLOSE))
+            .unwrap()
+            .lines()
+    }
+
+    /// The entries a step covers: the one a leaf compresses, or those of the
+    /// two lines a merge joins.
+    fn span(step: &str, covered: &HashMap<String, Range<u64>>) -> Range<u64> {
+        let mut lines = step.lines().skip(1);
+        let task = lines.next().unwrap();
+        let first = lines.next().unwrap();
+        if task.starts_with(COMPRESS) {
+            let name = first.rsplit(' ').next().unwrap();
+            let seq: u64 = name.strip_suffix(NOTE_SUFFIX).unwrap().parse().unwrap();
+            return seq..seq + 1;
+        }
+        let second = lines.next().unwrap();
+        let [first, second] = [first, second].map(|line| covered.get(line).expect(UNBUILT_LINE));
+        first.start..second.end
+    }
+
+    /// Rule 3: leaves go in order, a merge waits for its halves, and every
+    /// node reads the whole view ahead of it, so none starts before that is
+    /// built.
+    #[test]
+    fn every_node_starts_once_the_view_ahead_of_it_is_built() {
+        smol::block_on(async {
+            let fixture = Fixture::new(NOTES);
+            let provider = ScriptedProvider::new([]);
+            let (timer, _) = ManualTimer::new();
+            let (events_tx, events) = flume::unbounded();
+            let _pump = spawn(
+                Arc::clone(&fixture.store),
+                &provider,
+                &timer,
+                events_tx,
+                None,
+            );
+
+            stored(&events, NODES, &[]).await;
+
+            let mut covered: HashMap<String, Range<u64>> = HashMap::new();
+            for (messages, reply) in provider.calls() {
+                let (memory, step) = request(&messages);
+                let span = span(step, &covered);
+                let mut read = 0;
+                for line in context(memory) {
+                    let range = covered.get(line).expect(UNBUILT_LINE);
+                    assert_eq!(range.start, read, "{CONTEXT_INCOMPLETE}");
+                    read = range.end;
+                }
+                assert_eq!(read, span.start, "{CONTEXT_INCOMPLETE}");
+                covered.insert(reply.unwrap(), span);
+            }
+            let state = fixture.store.load().unwrap();
+            assert!(state.tree.work(&state.tree.fold(VIEW)).is_empty());
+        });
+    }
+
+    #[test]
+    fn two_pumps_on_one_journal_build_each_node_once() {
+        smol::block_on(async {
+            let fixture = Fixture::new(NOTES);
+            let provider = ScriptedProvider::new([]);
+            let (timer, _) = ManualTimer::new();
+            let (events_tx, events) = flume::unbounded();
+            let first_store = Arc::clone(&fixture.store);
+            let (first, _first) = spawn(first_store, &provider, &timer, events_tx.clone(), None);
+            let second_store = open(&fixture.state);
+            let (second, _second) = spawn(second_store, &provider, &timer, events_tx, None);
+
+            stored(&events, NODES, &[&first, &second]).await;
+
+            let calls = provider.calls();
+            let steps: HashSet<&str> = calls
+                .iter()
+                .map(|(messages, _)| request(messages).1)
+                .collect();
+            assert_eq!((calls.len(), steps.len()), (NODES, NODES), "{BUILT_TWICE}");
+        });
+    }
+
+    #[test]
+    fn an_overlong_reply_is_shown_where_it_had_to_end() {
+        smol::block_on(async {
+            let fixture = Fixture::new(1);
+            let overlong = format!("{NARROW}{}", WIDE.repeat(WIDE_CHARS));
+            let provider = ScriptedProvider::new([Ok(overlong.clone())]);
+            let (timer, _) = ManualTimer::new();
+            let (events_tx, events) = flume::unbounded();
+            let _pump = spawn(
+                Arc::clone(&fixture.store),
+                &provider,
+                &timer,
+                events_tx,
+                None,
+            );
+
+            stored(&events, 1, &[]).await;
+
+            let calls = provider.calls();
+            let (retry, reply) = &calls[1];
+            let feedback = format!(
+                "{OVERLONG_FEEDBACK}{}{LIMIT_MARK}",
+                &overlong[..OVERLONG_CUT]
+            );
+            assert_eq!(texts(&retry[1]), [overlong.as_str()]);
+            assert_eq!(texts(&retry[2]), [feedback.as_str()]);
+            assert_eq!(Some(fixture.first_line()), *reply);
+        });
+    }
+
+    #[test]
+    fn the_shortest_try_is_cut_to_fit_when_none_fits() {
+        smol::block_on(async {
+            let fixture = Fixture::new(1);
+            let tries: Vec<String> = OVERRUNS
+                .iter()
+                .zip('a'..)
+                .map(|(overrun, fill)| fill.to_string().repeat(NODE + overrun))
+                .collect();
+            let provider = ScriptedProvider::new(tries.iter().cloned().map(Ok));
+            let (timer, _) = ManualTimer::new();
+            let (events_tx, events) = flume::unbounded();
+            let _pump = spawn(
+                Arc::clone(&fixture.store),
+                &provider,
+                &timer,
+                events_tx,
+                None,
+            );
+
+            stored(&events, 1, &[]).await;
+
+            let calls = provider.calls();
+            assert_eq!(calls.len(), TRIES);
+            assert_eq!(
+                calls[TRIES - 1].0.len(),
+                2 * TRIES - 1,
+                "{ONE_CONVERSATION}"
+            );
+            assert_eq!(fixture.first_line(), tries[SHORTEST_TRY][..NODE]);
+        });
+    }
+
+    #[test]
+    fn a_passing_failure_is_tried_again_once_its_timer_fires() {
+        smol::block_on(async {
+            let fixture = Fixture::new(1);
+            let provider = ScriptedProvider::new([Err(AgentError::api(RATE_LIMITED, SLOW_DOWN))]);
+            let (timer, waits) = ManualTimer::new();
+            let (events_tx, events) = flume::unbounded();
+            let _pump = spawn(
+                Arc::clone(&fixture.store),
+                &provider,
+                &timer,
+                events_tx,
+                None,
+            );
+
+            while waits.recv_async().await.unwrap() != RETRY {}
+            assert_eq!(provider.calls().len(), 1, "{RETRIED_EARLY}");
+            assert!(
+                fixture.store.load().unwrap().nodes.is_empty(),
+                "{LEASE_KEPT}"
+            );
+
+            timer.fire(RETRY);
+            stored(&events, 1, &[]).await;
+            assert_eq!(provider.calls().len(), 2);
+        });
+    }
+
+    #[test]
+    fn every_call_reports_its_spend_as_memory_work() {
+        smol::block_on(async {
+            let fixture = Fixture::new(1);
+            let provider = ScriptedProvider::new([Ok(NARROW.repeat(NODE + 1))]);
+            let (timer, _) = ManualTimer::new();
+            let (events_tx, events) = flume::unbounded();
+            let ledger = Ledger {
+                state: fixture.state_dir(),
+                cwd: CWD.to_owned(),
+            };
+            let store = Arc::clone(&fixture.store);
+            let _pump = spawn(store, &provider, &timer, events_tx, Some(ledger));
+
+            let seen = stored(&events, 1, &[]).await;
+
+            let fast = Model::from_spec(FAST_SPEC).unwrap();
+            let spent: Vec<_> = seen
+                .into_iter()
+                .filter_map(|event| match event {
+                    AgentEvent::ModelUsage {
+                        usage,
+                        provider,
+                        model,
+                        purpose,
+                        ..
+                    } => Some((usage, provider, model, purpose)),
+                    _ => None,
+                })
+                .collect();
+            let call = (
+                USAGE,
+                fast.provider.to_string(),
+                fast.id,
+                LedgerPurpose::Memory,
+            );
+            assert_eq!(spent, [call.clone(), call]);
+            let rows = UsageLedger::open(&fixture.state_dir())
+                .unwrap()
+                .buckets(None)
+                .unwrap();
+            let recorded: u64 = rows
+                .iter()
+                .filter(|row| row.purpose == LedgerPurpose::Memory.storage_name() && row.cwd == CWD)
+                .map(|row| row.input)
+                .sum();
+            assert_eq!(recorded, 2 * u64::from(USAGE.input));
+        });
+    }
+
+    /// The chat model never stands in: with nothing chosen for memory work,
+    /// or a choice that does not resolve, the pump ends before asking.
+    #[test_case(None ; "nothing_chosen")]
+    #[test_case(Some(FAST_SPEC) ; "choice_not_allowed")]
+    fn without_a_model_for_memory_work_nothing_is_asked(bound: Option<&str>) {
+        smol::block_on(async {
+            let fixture = Fixture::new(1);
+            let state = fixture.state_dir();
+            if let Some(spec) = bound {
+                let binding = Binding::Exact(spec.to_owned());
+                model_registry::set_binding_and_persist(ModelPurpose::Memory, binding, &state)
+                    .unwrap();
+            }
+            let provider = ScriptedProvider::new([]);
+            let (events_tx, events) = flume::unbounded();
+            let _pump = Pump::start(
+                Arc::clone(&fixture.store),
+                provider.clone(),
+                Model::from_spec(CHAT_SPEC).unwrap(),
+                Arc::new(ModelPolicy::new(&[ONLY_ANTHROPIC.to_owned()], &[]).unwrap()),
+                Timeouts::default(),
+                EventSender::new(events_tx, MEMORY_EVENT_RUN_ID),
+                None,
+            );
+
+            let ended = events.recv_async().await.is_err();
+
+            if bound.is_some() {
+                model_registry::clear_binding_and_persist(ModelPurpose::Memory, &state).unwrap();
+            }
+            assert!(ended, "{STOOD_IN}");
+            assert!(provider.calls().is_empty(), "{STOOD_IN}");
+        });
+    }
+}

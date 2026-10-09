@@ -308,7 +308,7 @@ This is the fastest way to say "look at this" without typing the path or the lin
 Caudra opens its own text here as well. Each tab is named for what it holds, and the status row says the rest: `Plan · <file>`, `Memory · <note>`, or `Prompt · <chat>`.
 
 - **The plan.** `Ctrl+O` or `Ctrl+X o` opens this session's plan in a tab named `Plan`, in Plan or Build, and so does `Ctrl+O` on the plan form. `Ctrl+S` saves your edits. Implementing reads the plan from disk, so while its tab holds unsaved edits, Implement brings the tab back and asks you to save first. The plan form stays up behind the workbench and leaves every key to it. A plan the agent has not written yet has nothing to open, and the status bar says so.
-- **Memory notes.** `Enter` on a note in `/memory`, or a click on a note the `memory` tool shows in the transcript, opens it in a tab named after the note.
+- **Memory notes.** `Enter` on a note in the [`/memory` inspector](/docs/memory/#the-inspector), or a click on a note the `memory` tool shows in the transcript, opens it in a tab named after the note.
 - **The prompt draft.** `Ctrl+X e` in the composer opens what you have typed in a tab named `Prompt`, with every folded paste spelled out. `Ctrl+S` puts the draft back in the composer and keeps the workbench open. `Ctrl+X Enter` puts it back and closes the workbench, so you can send it.
 
 The plan and the notes live in the state directory, outside the project. When the agent rewrites the plan or saves a note, its tab reloads from that tool call, under the same rules as a [watched file](#when-the-agent-writes-the-same-file).

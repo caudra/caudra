@@ -12,6 +12,7 @@ use serde_json::Value;
 use crate::AgentMode;
 use crate::agent::{compaction_reserve, estimate_message_tokens};
 use crate::mcp::{McpRequestSnapshot, McpToolStatus};
+use crate::memory::tree::Block;
 use crate::prompt::profile::{BUILTIN_PROFILE_NAME, PromptProfileCatalog, TaskProfileBindings};
 use crate::tools::TOOL_SEARCH_TOOL_NAME;
 use crate::tools::native::{memory, skill};
@@ -213,7 +214,6 @@ pub struct ContextProfileInventory {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextMemoryFile {
     pub name: String,
-    pub tags: Vec<String>,
     pub on_load_tokens: u32,
 }
 
@@ -514,7 +514,6 @@ impl ContextInventory {
                     .into_iter()
                     .map(|note| ContextMemoryFile {
                         name: note.name,
-                        tags: note.tags,
                         on_load_tokens: note.on_load_tokens,
                     })
                     .collect(),
@@ -763,12 +762,13 @@ fn account_request(
 
 fn account_system(system: &str) -> (u32, u32) {
     let total = estimate_tokens_cached(system);
-    let Some(memory_prompt) = memory::prompt_tag_line_range(system) else {
+    let Some(memory_prompt) = Block::range(system) else {
         return (total, 0);
     };
+    let before = system[..memory_prompt.start].trim_end();
     let mut without_memory =
         String::with_capacity(system.len().saturating_sub(memory_prompt.len()));
-    without_memory.push_str(&system[..memory_prompt.start]);
+    without_memory.push_str(before);
     without_memory.push_str(&system[memory_prompt.end..]);
     let memory = total.saturating_sub(estimate_tokens_cached(&without_memory));
     (total.saturating_sub(memory), memory)
@@ -1096,11 +1096,11 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::memory::tree::{Line, Part};
 
     const MODEL_SPEC: &str = "anthropic/claude-sonnet-4-6";
     const SYSTEM_TEXT: &str = "system policy";
-    const MEMORY_PROMPT: &str =
-        "\n\nMemory tags (`memory` with `command=\"read\"` and `tags=[...]`): project\n";
+    const MEMORY_LINE: &str = "note conventions.md project convention";
     const USER_TEXT: &str = "finish the requested change";
     const MEMORY_RESULT: &str = "remember this project convention";
     const SKILL_RESULT: &str = "follow this deployment workflow";
@@ -1406,7 +1406,6 @@ mod tests {
             memory: ContextMemoryInventory {
                 files: vec![ContextMemoryFile {
                     name: "project.md".into(),
-                    tags: vec!["project".into()],
                     on_load_tokens: u32::MAX,
                 }],
                 ..ContextMemoryInventory::default()
@@ -1426,7 +1425,14 @@ mod tests {
             ]),
             ..ContextInventory::default()
         };
-        let system = format!("{SYSTEM_TEXT}{MEMORY_PROMPT}");
+        let view = Block {
+            hidden: 0,
+            lines: vec![Line {
+                part: Part::leaf(0),
+                text: MEMORY_LINE.into(),
+            }],
+        };
+        let system = format!("{SYSTEM_TEXT}\n\n{}", view.render());
         let messages = messages();
         let snapshot = ContextSnapshot::capture(ContextCapture {
             readiness: ContextReadiness::CapturedCurrentRequest,
@@ -2164,7 +2170,6 @@ mod tests {
             memory: ContextMemoryInventory {
                 files: vec![ContextMemoryFile {
                     name: "large.md".into(),
-                    tags: Vec::new(),
                     on_load_tokens: u32::MAX,
                 }],
                 ..ContextMemoryInventory::default()

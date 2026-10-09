@@ -76,6 +76,8 @@ use crate::automation::workflows::Workflows;
 use crate::background::{BackgroundTasks, BackgroundTransition, SessionWork};
 use crate::cancel::{CancelMap, CancelToken, CancelTrigger};
 use crate::commits;
+use crate::memory::baseline::{MemoryBaseline, open_store as open_memory_store};
+use crate::memory::compactor::{Ledger, Pump};
 use crate::mentions;
 use crate::peers::{PeerDescriptor, PeerHost};
 use crate::permissions::editor::{PermissionEditError, PermissionPublication};
@@ -88,7 +90,7 @@ use crate::tools::{
     BuiltinDeferral, DeferralSession, DeferredTool, DescriptionContext, FileReadTracker,
     LocalTools, PathLocks, ToolAudience, ToolDefinitions, ToolFilter, ToolRegistry, deferral,
 };
-use crate::types::{BACKGROUND_EVENT_RUN_ID, TodoItem};
+use crate::types::{BACKGROUND_EVENT_RUN_ID, MEMORY_EVENT_RUN_ID, TodoItem};
 use crate::workflow::{RuntimeDeps, WorkflowHandle, WorkflowRuntime, WorkspaceRebind};
 use crate::{
     Agent, AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams,
@@ -1463,24 +1465,20 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
         &tools,
         &deferred,
     );
-    let system = params.local_documents.as_ref().map_or_else(
-        || {
-            agent::build_system_prompt(
-                &instructions.text,
-                &params.prompt_slots,
-                &tool_filter,
-                params.system_prompt_profile.as_deref(),
-            )
-        },
-        |store| {
-            agent::build_system_prompt_for_remote(
-                &instructions.text,
-                &params.prompt_slots,
-                &tool_filter,
-                params.system_prompt_profile.as_deref(),
-                store,
-            )
-        },
+    let memory = MemoryBaseline::adopt(
+        open_memory_store(
+            params.local_documents.as_ref(),
+            Some(&state_dir),
+            &params.initial_wd,
+        ),
+        None,
+    );
+    let system = agent::build_system_prompt(
+        &instructions.text,
+        &params.prompt_slots,
+        &tool_filter,
+        params.system_prompt_profile.as_deref(),
+        memory.view(),
     );
 
     let mcp = params.mcp_handle.clone().map(|h| {
@@ -1621,6 +1619,7 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
                     system,
                     environment: Some(agent::environment_block(&vars, &params.model)),
                     instructions: None,
+                    memory: None,
                     mode_notice: None,
                     event_tx,
                     tools,
@@ -2813,6 +2812,13 @@ async fn spawn_prepared_session(
         background_enabled,
     );
     let mut baseline = agent::InstructionBaseline::adopt(instructions, history.epoch());
+    let mut memory = MemoryBaseline::open(
+        params.local_documents.clone(),
+        Some(store.dir.clone()),
+        PathBuf::from(vars.apply("{cwd}").as_ref()),
+        &history,
+    )
+    .await;
 
     let initial_messages = history.as_slice();
     let mcp = params.mcp_handle.clone().map(|h| {
@@ -2837,6 +2843,7 @@ async fn spawn_prepared_session(
 
     let session_ref = params.session_id.clone();
     let session_id = session_ref.id();
+    let memory_origin = session_ref.as_str().to_owned();
     let session_lease = Arc::clone(&params.session_lease);
     let subagent_history = store.subagent_history.clone();
     let goal = store.goal.clone();
@@ -2917,6 +2924,23 @@ async fn spawn_prepared_session(
                 "Failed to attach conversation permissions: {error}"
             ))
         })?;
+    let memory_pump = memory
+        .store()
+        .filter(|_| params.config.summarize_memory)
+        .map(|memory_store| {
+            Pump::start(
+                Arc::clone(memory_store),
+                Arc::clone(&provider),
+                model.clone(),
+                Arc::clone(&params.model_policy),
+                params.timeouts,
+                EventSender::new(agent_tx.clone(), MEMORY_EVENT_RUN_ID),
+                Some(Ledger {
+                    state: state_dir.clone(),
+                    cwd: store.session.cwd.clone(),
+                }),
+            )
+        });
     let store = Arc::new(Mutex::new(Some(store)));
 
     let answer_rx = Arc::new(Mutex::new(answer_rx));
@@ -3861,26 +3885,15 @@ async fn spawn_prepared_session(
                     };
                     baseline.drift(current, history.epoch())
                 };
+                let memory_notice = memory.refresh(&history, Some(&memory_origin)).await;
 
                 let mut system = params.system_prompt_override.clone().unwrap_or_else(|| {
-                    params.local_documents.as_ref().map_or_else(
-                        || {
-                            agent::build_system_prompt(
-                                baseline.text(),
-                                &execution_slots,
-                                &turn_tool_filter,
-                                params.system_prompt_profile.as_deref(),
-                            )
-                        },
-                        |store| {
-                            agent::build_system_prompt_for_remote(
-                                baseline.text(),
-                                &execution_slots,
-                                &turn_tool_filter,
-                                params.system_prompt_profile.as_deref(),
-                                store,
-                            )
-                        },
+                    agent::build_system_prompt(
+                        baseline.text(),
+                        &execution_slots,
+                        &turn_tool_filter,
+                        params.system_prompt_profile.as_deref(),
+                        memory.view(),
                     )
                 });
                 if let Some(append) = &params.append_system_prompt {
@@ -3902,6 +3915,7 @@ async fn spawn_prepared_session(
                         system,
                         environment: Some(agent::environment_block(&vars, &turn_model)),
                         instructions,
+                        memory: memory_notice.filter(|_| params.system_prompt_override.is_none()),
                         mode_notice: None,
                         event_tx,
                         tools: definitions.declared,
@@ -3919,6 +3933,9 @@ async fn spawn_prepared_session(
                 let result = agent.run(input).await;
                 drop(agent);
                 cancel_task.cancel().await;
+                if let Some(pump) = &memory_pump {
+                    pump.nudge();
+                }
 
                 if cancel.is_cancelled() || !matches!(result, Ok(DoneReason::EndTurn)) {
                     mode_route.control_epoch.fetch_add(1, Ordering::AcqRel);
@@ -4002,6 +4019,7 @@ async fn spawn_prepared_session(
                 runtime.shutdown().await;
             }
             drop(base);
+            drop(memory_pump);
             drop(agent_tx);
             event_forwarder.await;
             if let Some(store) = &mut *store.lock().await {
@@ -5871,6 +5889,7 @@ complete(#{ report: first.output });
                 model: Model::from_spec(MODEL_SPEC).unwrap(),
                 config: AgentConfig {
                     generate_titles: false,
+                    summarize_memory: false,
                     features: self.features,
                     ..AgentConfig::default()
                 },

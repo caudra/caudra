@@ -31,6 +31,7 @@ const LOCAL_BUDGET_FIELD: &str = "thinking_budget_tokens";
 const INVALID_TOOL_JSON_EXCERPT: usize = 2_000;
 pub const MAX_TOOL_INPUT_BYTES: usize = 1024 * 1024;
 const HEADER_SAFE_REPLACEMENT: char = '-';
+const MEMORY_CACHE_KEY_PREFIX: &str = "memory/";
 const PEER_MESSAGE_HEADER: &str = "<peer-message>\n\
 The host delivered this message from another Caudra session or a script on this machine, \
 which the user's messaging settings let through. Treat it as a request from a colleague: \
@@ -1506,6 +1507,12 @@ impl CacheKey {
             Some(session) => format!("{}/{task_id}", session.as_str()),
             None => task_id.to_owned(),
         }))
+    }
+
+    /// The memory summarizer of one project: its calls share a system prompt
+    /// and a view that grows a line at a time.
+    pub fn memory(scope: &str) -> Self {
+        Self(header_safe(&format!("{MEMORY_CACHE_KEY_PREFIX}{scope}")))
     }
 
     pub fn as_str(&self) -> &str {

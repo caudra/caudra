@@ -1209,6 +1209,7 @@ mod tests {
                 } else {
                     FeatureFlags::NONE
                 },
+                summarize_memory: false,
                 ..Default::default()
             },
             ToolOutputLines::default(),
@@ -1269,6 +1270,7 @@ mod tests {
             model_slot,
             AgentConfig {
                 features: FeatureFlags::NONE,
+                summarize_memory: false,
                 ..Default::default()
             },
             ToolOutputLines::default(),
@@ -1618,7 +1620,10 @@ mod tests {
         handles.respawn(
             crate::history_items(&[Message::user(RESUMED_HISTORY_TEXT.into())]),
             &model_slot,
-            AgentConfig::default(),
+            AgentConfig {
+                summarize_memory: false,
+                ..AgentConfig::default()
+            },
             ToolOutputLines::default(),
             &permissions,
             &mut app,

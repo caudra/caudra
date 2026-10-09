@@ -318,11 +318,11 @@ impl App {
             ) {
                 return actions;
             }
-        } else if self.memory_picker.is_open() {
+        } else if self.memory_inspector.is_open() {
             if let Some(actions) = self.route_overlay_mouse(
                 event,
-                |app, event| app.memory_picker.handle_mouse(event),
-                |app, action| app.handle_memory_picker_action(action),
+                |app, event| app.memory_inspector.handle_mouse(event),
+                |app, action| app.handle_memory_action(action),
             ) {
                 return actions;
             }
@@ -1394,7 +1394,7 @@ impl App {
         }
         dismiss!(self.permissions_picker);
         dismiss!(self.stash_picker);
-        dismiss!(self.memory_picker);
+        dismiss!(self.memory_inspector);
         dismiss!(self.workflow_inspector);
         dismiss!(self.workflow_catalog_picker);
         dismiss!(self.automation_inspector);

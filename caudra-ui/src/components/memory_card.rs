@@ -1,10 +1,13 @@
-//! The transcript card of a `memory` browse: the notes a read returned, or the
-//! tag index a list did.
+//! The transcript card of a `memory` call: the notes a read or a zoom into one
+//! entry returned, the lines a view or any other zoom showed, the notes a
+//! search found, or the tag index a stored session's list did.
 //!
-//! A note's own row is what the card promises — its name, what its body costs,
-//! and the tags that reach it — so those rows are pinned and the bodies are
-//! what a budget takes away. A collapsed card is then the index of what came
-//! back rather than the opening lines of whichever note happened to be first.
+//! A note's own row is what the card promises — its name and what its body
+//! costs — so those rows are pinned and the bodies are what a budget takes
+//! away. A collapsed card is then the index of what came back rather than the
+//! opening lines of whichever note happened to be first. Lines and search hits
+//! are drawn as the text the model read, so the card never tells a reader
+//! something the model was not told.
 
 use std::path::PathBuf;
 
@@ -37,10 +40,20 @@ pub(crate) fn render(
     width: u16,
 ) -> (Vec<Line<'static>>, Vec<Option<RowTarget>>, bool) {
     let mut card = Card::default();
-    card.push_notices(output.notices());
     match output {
-        MemoryOutput::Notes { notes, .. } => card.push_notes(notes, budget, width),
-        MemoryOutput::Index { groups, .. } => card.push_index(groups, budget),
+        MemoryOutput::Notes { notes, notices, .. } => {
+            card.push_notices(notices);
+            card.push_notes(notes, budget, width);
+        }
+        MemoryOutput::Index {
+            groups, notices, ..
+        } => {
+            card.push_notices(notices);
+            card.push_index(groups, budget);
+        }
+        MemoryOutput::Lines { .. } | MemoryOutput::Hits { .. } => {
+            card.push_text(&output.as_display_text(), budget);
+        }
     }
     (card.lines, card.rows, card.truncated)
 }
@@ -64,6 +77,7 @@ fn origins(output: &MemoryOutput) -> Vec<&MemoryOrigin> {
             .iter()
             .flat_map(|group| group.notes.iter().map(|note| &note.origin))
             .collect(),
+        MemoryOutput::Lines { .. } | MemoryOutput::Hits { .. } => Vec::new(),
     }
 }
 
@@ -144,6 +158,20 @@ impl Card {
                 }
                 index += 1;
             }
+        }
+        self.finish(hidden);
+    }
+
+    /// The text already leads with its notices, so they are not drawn apart.
+    fn push_text(&mut self, text: &str, budget: usize) {
+        let style = theme::current().tool;
+        let rows: Vec<&str> = text.lines().collect();
+        let (room, hidden) = body_window(rows.len(), budget);
+        for row in rows.into_iter().take(room) {
+            self.push(
+                Line::from(Span::styled(escape_terminal_controls(row), style)),
+                None,
+            );
         }
         self.finish(hidden);
     }
@@ -244,7 +272,7 @@ fn column_width(groups: &[MemoryTagGroup], measure: impl Fn(&MemoryNoteEntry) ->
 
 #[cfg(test)]
 mod tests {
-    use caudra_agent::MemoryOutput;
+    use caudra_agent::{MemoryHit, MemoryLine, MemoryOutput};
     use test_case::test_case;
 
     use super::*;
@@ -257,8 +285,13 @@ mod tests {
     const TAG: &str = "workcell";
     const REFERENCE: &str = "memory-aaaa";
     const REVISION: &str = "bbbb";
+    const VIEW_HEADING: &str = "4 entries in 3 lines, oldest first:";
+    const QUERY: &str = "flaky";
+    const HIDDEN_NOTICE: &str =
+        "The 3 oldest entries are left out until their summaries are written; search finds them.";
     const PINNED_MSG: &str = "a note's own row is never what a budget takes";
     const CLICK_MSG: &str = "a local note takes the click, a remote one cannot";
+    const MODEL_TEXT_MSG: &str = "the card draws the text the model read";
 
     fn file_note(name: &str) -> MemoryNote {
         MemoryNote {
@@ -294,6 +327,46 @@ mod tests {
         MemoryOutput::Index {
             directory: None,
             groups,
+            notices: Vec::new(),
+        }
+    }
+
+    fn view(notices: Vec<String>) -> MemoryOutput {
+        MemoryOutput::Lines {
+            heading: VIEW_HEADING.to_owned(),
+            lines: Vec::from([
+                MemoryLine {
+                    id: 0,
+                    count: 2,
+                    text: format!("{NOTE}: first. {OTHER}: second"),
+                    pending: false,
+                },
+                MemoryLine {
+                    id: 2,
+                    count: 1,
+                    text: format!("note {NOTE} first, rewritten"),
+                    pending: false,
+                },
+                MemoryLine {
+                    id: 3,
+                    count: 1,
+                    text: format!("(not summarized yet) note {OTHER}: Architecture"),
+                    pending: true,
+                },
+            ]),
+            notices,
+        }
+    }
+
+    fn search() -> MemoryOutput {
+        MemoryOutput::Hits {
+            query: QUERY.to_owned(),
+            hits: Vec::from([MemoryHit {
+                seq: 4,
+                name: NOTE.to_owned(),
+                heading: "Gotchas".to_owned(),
+                line: Some("Retry the flaky suite once.".to_owned()),
+            }]),
             notices: Vec::new(),
         }
     }
@@ -441,5 +514,30 @@ mod tests {
             rendered(&output, usize::MAX),
             Vec::from([NOTICE.to_owned()])
         );
+    }
+
+    #[test_case(view(Vec::from([HIDDEN_NOTICE.to_owned()])) ; "a_view_with_its_notice")]
+    #[test_case(view(Vec::new()) ; "a_view")]
+    #[test_case(search() ; "a_search")]
+    fn lines_and_hits_draw_the_text_the_model_read(output: MemoryOutput) {
+        let (lines, rows, truncated) = render(&output, usize::MAX, WIDTH);
+        let drawn: Vec<String> = lines.iter().map(text).collect();
+
+        assert!(!truncated);
+        assert_eq!(
+            drawn.join("\n"),
+            output.as_display_text(),
+            "{MODEL_TEXT_MSG}"
+        );
+        assert!(rows.iter().all(Option::is_none), "{CLICK_MSG}");
+    }
+
+    #[test]
+    fn a_collapsed_view_keeps_its_heading_and_counts_what_it_holds_back() {
+        let (lines, _, truncated) = render(&view(Vec::new()), 2, WIDTH);
+
+        assert!(truncated);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(text(&lines[0]), VIEW_HEADING);
     }
 }

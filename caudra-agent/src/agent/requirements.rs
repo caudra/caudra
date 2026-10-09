@@ -421,7 +421,7 @@ pub async fn extract(
     }
 }
 
-fn response_text(message: &Message) -> String {
+pub(crate) fn response_text(message: &Message) -> String {
     message
         .content
         .iter()
@@ -432,7 +432,9 @@ fn response_text(message: &Message) -> String {
         .collect()
 }
 
-fn clean(raw: &str) -> Option<String> {
+/// The answer with inline reasoning removed and trimmed; `None` when nothing
+/// is left.
+pub(crate) fn clean(raw: &str) -> Option<String> {
     let stripped = strip_thinking(raw);
     let text = stripped.trim();
     (!text.is_empty()).then(|| text.to_owned())

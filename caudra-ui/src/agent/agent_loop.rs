@@ -13,6 +13,8 @@ use caudra_agent::context::{
 };
 use caudra_agent::mcp::config::McpServerStatus;
 use caudra_agent::mcp::{McpHandle, McpRequestSnapshot, McpSession};
+use caudra_agent::memory::baseline::MemoryBaseline;
+use caudra_agent::memory::compactor::Pump;
 use caudra_agent::permissions::PermissionManager;
 use caudra_agent::prompt::ResolvedSlots;
 use caudra_agent::prompt::profile::{
@@ -26,7 +28,7 @@ use caudra_agent::tools::{
     BuiltinDeferral, DeferralSession, DeferredTool, DescriptionContext, FileReadTracker, PathLocks,
     ToolAudience, ToolDefinitions, ToolFilter, ToolRegistry, deferral,
 };
-use caudra_agent::types::TodoItem;
+use caudra_agent::types::{MEMORY_EVENT_RUN_ID, TodoItem};
 use caudra_agent::workflow::WorkflowHandle;
 use caudra_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams,
@@ -190,6 +192,10 @@ pub(super) struct AgentLoop {
     tool_output_store: Option<Arc<ToolOutputStore>>,
     vars: Vars,
     instructions: InstructionBaseline,
+    memory: MemoryBaseline,
+    /// Summarizes `memory`'s store while the loop lives. `None` when
+    /// summaries are off or there is no memory.
+    memory_pump: Option<Pump>,
     tools: Value,
     /// Withheld from `tools` until `tool_search` loads them. Rebuilt with
     /// `tools`, so a model switch reconsiders both halves together.
@@ -322,6 +328,8 @@ impl AgentLoop {
             tool_output_store,
             vars: Vars::default(),
             instructions: InstructionBaseline::default(),
+            memory: MemoryBaseline::default(),
+            memory_pump: None,
             tools: Value::Null,
             deferred: Vec::new(),
             mcp,
@@ -680,6 +688,13 @@ impl AgentLoop {
                 self.instructions.drift(current, self.history.epoch())
             }
         };
+        let memory = self
+            .memory
+            .refresh(
+                &self.history,
+                self.session_id.as_ref().map(SessionRef::as_str),
+            )
+            .await;
         self.mode.store(Arc::new(input.mode.clone()));
         self.plan = input.plan.clone();
         self.rebuild_tools(&effective_slot.model, &selected_slot.model, &input.thinking);
@@ -736,6 +751,7 @@ impl AgentLoop {
                 system,
                 environment: Some(agent::environment_block(&self.vars, &effective_slot.model)),
                 instructions,
+                memory,
                 mode_notice: None,
                 event_tx,
                 tools: self.tools.clone(),
@@ -769,6 +785,9 @@ impl AgentLoop {
             agent.run_batch(first, inputs).await
         };
         drop(agent);
+        if let Some(pump) = &self.memory_pump {
+            pump.nudge();
+        }
 
         self.clear_cancel_trigger(run_id);
 
@@ -980,11 +999,46 @@ impl AgentLoop {
     }
 
     /// Rewrites the system prompt to match disk, so it is only free while the
-    /// prefix cache is cold anyway: at startup, or on a change of directory.
+    /// prefix cache is cold anyway: at startup, or on a change of directory,
+    /// which can also put the session in another project's memory.
     async fn reload_instructions(&mut self) -> Result<(), AgentError> {
         let current = self.read_instructions().await?;
         self.instructions = InstructionBaseline::adopt(current, self.history.epoch());
+        self.memory = MemoryBaseline::open(
+            self.local_documents.clone(),
+            self.tool_output_store
+                .as_deref()
+                .map(ToolOutputStore::state_dir)
+                .cloned(),
+            PathBuf::from(self.vars.apply("{cwd}").as_ref()),
+            &self.history,
+        )
+        .await;
+        self.restart_memory_pump();
         Ok(())
+    }
+
+    /// One pump per memory: a change of directory that kept the memory keeps
+    /// its pump, and one that changed it replaces the pump.
+    fn restart_memory_pump(&mut self) {
+        let store = self.memory.store().filter(|_| self.config.summarize_memory);
+        if let (Some(pump), Some(store)) = (&self.memory_pump, store)
+            && Arc::ptr_eq(pump.store(), store)
+        {
+            return;
+        }
+        let slot = self.model_slot.load();
+        self.memory_pump = store.map(|store| {
+            Pump::start(
+                Arc::clone(store),
+                Arc::clone(&slot.provider),
+                slot.model.clone(),
+                Arc::clone(&self.model_policy),
+                self.timeouts,
+                EventSender::new(self.agent_tx.clone(), MEMORY_EVENT_RUN_ID),
+                None,
+            )
+        });
     }
 
     /// The array a request actually carries. `self.tools` is the declared base, and a run
@@ -1024,24 +1078,12 @@ impl AgentLoop {
             &self.tools,
             &self.deferred,
         );
-        self.local_documents.as_ref().map_or_else(
-            || {
-                agent::build_system_prompt(
-                    self.instructions.text(),
-                    &prompt_slots,
-                    tool_filter,
-                    self.system_prompt_profile.as_deref(),
-                )
-            },
-            |store| {
-                agent::build_system_prompt_for_remote(
-                    self.instructions.text(),
-                    &prompt_slots,
-                    tool_filter,
-                    self.system_prompt_profile.as_deref(),
-                    store,
-                )
-            },
+        agent::build_system_prompt(
+            self.instructions.text(),
+            &prompt_slots,
+            tool_filter,
+            self.system_prompt_profile.as_deref(),
+            self.memory.view(),
         )
     }
 

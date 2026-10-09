@@ -251,6 +251,7 @@ The `bash`, `python_execution`, and `task` entries apply only when `ui.scroll_ca
 | `shell_execution` | string | `auto` | - | Shell delivery: sync waits for termination, auto routes by requested timeout, async returns an admission receipt |
 | `shell_async_threshold_secs` | u64 | `120` | 1 | Requested shell timeout above which auto delivery returns an admission receipt; independent of the enforced execution deadline |
 | `generate_titles` | bool | `true` | - | Name a new session by summarizing its first prompt with the Title model |
+| `summarize_memory` | bool | `true` | - | Summarize memory notes in the background with the Memory model, so the memory view in the system prompt stays within its budget. When off, new notes reach the view only as titles and `memory search` still finds them |
 | `stale_read_check` | bool | `true` | - | Block a write to a file that changed on disk since it was read, and point a failed edit or patch at the change |
 | `tool_json_repair` | bool | `true` | - | Repair malformed tool JSON syntax locally, with one bounded isolated model fallback; independent of eager dispatch |
 | `eager_tool_dispatch` | bool | `true` | - | Start tools and batch children as soon as their complete arguments arrive, instead of waiting for the whole message |
@@ -720,10 +721,10 @@ All of these are added to the system prompt at the start of every session.
 
 ## Memory
 
-The `memory` tool and `/memory` command store small Markdown notes under the state directory, scoped per project:
+The `memory` tool keeps project notes as Markdown files under the state directory, scoped per project:
 
 `…/state/caudra/projects/<project-id>/memories/`
 
-(Linux/macOS: `~/.local/state/caudra/…`; Windows: `%APPDATA%\caudra\…`). Use them for non-obvious gotchas and decisions that should survive across sessions. They are separate from skills and from `AGENTS.md`.
+That is `~/.local/state/caudra/…` on Linux and macOS and `%APPDATA%\caudra\…` on Windows. A Fast model summarizes the notes in the background for the view in the system prompt. Set [`agent.summarize_memory`](#agent) to `false` to stop that spend. [Memory](/docs/memory/) covers the journal, the view, and the `/memory` inspector.
 
 Related pages: [Skills](/docs/skills/), [CLI](/docs/cli/), [Providers](/docs/providers/#providers-toml).

@@ -1,11 +1,13 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::fs;
+use std::io;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 
 use caudra_workspace::{LocalDocumentRef, MemoryRef, PlanRef, ProjectKey, SessionWorkspaceBinding};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -51,6 +53,14 @@ pub struct LocalDocument {
     pub name: Option<String>,
     pub content: String,
     pub revision: DocumentRevision,
+}
+
+/// What a note's directory entry tells without reading the note.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryFileStat {
+    pub name: String,
+    pub size: u64,
+    pub modified_ms: i64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -126,6 +136,10 @@ impl LocalDocumentStore {
 
     pub fn project_key(&self) -> &ProjectKey {
         self.aliases.project_key()
+    }
+
+    pub fn state_dir(&self) -> &StateDir {
+        &self.state_dir
     }
 
     pub fn create_plan(
@@ -272,29 +286,83 @@ impl LocalDocumentStore {
         project: &ProjectKey,
     ) -> Result<Vec<LocalDocument>, LocalDocumentError> {
         self.validate_project(project)?;
-        let mut seen = HashSet::new();
-        let mut documents = Vec::new();
-        for root in self.memory_read_dirs() {
-            if !root.exists() {
-                continue;
-            }
-            secure_directory(&root)?;
-            for (name, path) in memory_files(&root)? {
-                if documents.len() >= MAX_MEMORY_DOCUMENTS || !seen.insert(name.clone()) {
-                    continue;
-                }
+        self.memory_paths()?
+            .into_iter()
+            .take(MAX_MEMORY_DOCUMENTS)
+            .map(|(name, path)| {
                 let content = read_secure(&path)?;
-                let reference = self.memory_ref(&name)?;
-                documents.push(LocalDocument {
-                    reference: LocalDocumentRef::Memory(reference),
+                Ok(LocalDocument {
+                    reference: LocalDocumentRef::Memory(self.memory_ref(&name)?),
                     name: Some(name),
                     revision: revision(&content),
                     content,
-                });
-            }
-        }
-        documents.sort_by(|left, right| left.name.cmp(&right.name));
-        Ok(documents)
+                })
+            })
+            .collect()
+    }
+
+    /// Every note's size and modification time, read from its directory
+    /// entry, so finding what changed on disk opens no note. Unlike
+    /// [`Self::list_memories`], uncapped.
+    pub fn memory_stats(
+        &self,
+        project: &ProjectKey,
+    ) -> Result<Vec<MemoryFileStat>, LocalDocumentError> {
+        self.validate_project(project)?;
+        self.memory_paths()?
+            .into_iter()
+            .map(|(name, path)| {
+                let metadata = fs::metadata(&path)?;
+                Ok(MemoryFileStat {
+                    name,
+                    size: metadata.len(),
+                    modified_ms: Timestamp::try_from(metadata.modified()?)
+                        .map_err(io::Error::other)?
+                        .as_millisecond(),
+                })
+            })
+            .collect()
+    }
+
+    /// The note [`Self::memory_stats`] lists as `name`.
+    pub fn read_memory(
+        &self,
+        project: &ProjectKey,
+        name: &str,
+    ) -> Result<String, LocalDocumentError> {
+        self.validate_project(project)?;
+        let relative = memory_relative(name)?;
+        let path = self
+            .memory_read_dirs()
+            .iter()
+            .map(|root| secure_join(root, &relative))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .find(|path| path.is_file())
+            .ok_or(LocalDocumentError::WrongOwner)?;
+        read_secure(&path)
+    }
+
+    /// The reference that opens the note [`Self::memory_stats`] lists as
+    /// `name`.
+    pub fn memory_reference(
+        &self,
+        project: &ProjectKey,
+        name: &str,
+    ) -> Result<MemoryRef, LocalDocumentError> {
+        self.validate_project(project)?;
+        self.memory_ref(&normalized_name(&memory_relative(name)?))
+    }
+
+    /// Names this project's memory journal by the directory its notes are
+    /// written to, relative to the persistent root, so a linked worktree
+    /// shares its main checkout's journal as it shares its notes.
+    pub fn memory_scope(&self) -> Result<String, LocalDocumentError> {
+        let project = self.aliases.ensure_write_subdir(&self.state_dir)?;
+        let relative = project
+            .strip_prefix(self.state_dir.persistent_path())
+            .map_err(|_| LocalDocumentError::WrongOwner)?;
+        Ok(normalized_name(relative))
     }
 
     pub fn write_memory(
@@ -449,6 +517,25 @@ impl LocalDocumentStore {
                     .join(MEMORIES_DIR)
             })
             .collect()
+    }
+
+    /// Every note by name, from the first read directory holding that name.
+    fn memory_paths(&self) -> Result<Vec<(String, PathBuf)>, LocalDocumentError> {
+        let mut seen = HashSet::new();
+        let mut paths = Vec::new();
+        for root in self.memory_read_dirs() {
+            if !root.exists() {
+                continue;
+            }
+            secure_directory(&root)?;
+            paths.extend(
+                memory_files(&root)?
+                    .into_iter()
+                    .filter(|(name, _)| seen.insert(name.clone())),
+            );
+        }
+        paths.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(paths)
     }
 
     fn memory_write_dir(&self) -> Result<PathBuf, LocalDocumentError> {
@@ -655,7 +742,7 @@ fn memory_files(root: &Path) -> Result<Vec<(String, PathBuf)>, LocalDocumentErro
 mod tests {
     use super::{
         LocalDocumentError, LocalDocumentRef, LocalDocumentStore, LocalProjectAliases,
-        MEMORIES_DIR, ProjectKey, StateDir, fs,
+        MAX_MEMORY_DOCUMENTS, MEMORIES_DIR, ProjectKey, StateDir, fs,
     };
     use crate::plans::MAX_PLAN_BYTES;
     use crate::plans::tests::tempdir;
@@ -668,6 +755,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Barrier;
     use std::thread;
+    use std::time::{Duration, UNIX_EPOCH};
     use test_case::test_case;
 
     const PROJECT: &str = "remote-project";
@@ -684,6 +772,12 @@ mod tests {
     const WRONG_TEXT: &str = "the document holds the wrong text after a replace";
     const STALE_REPLACED: &str = "a replace went over a revision it never read";
     const LEGACY_PLAN: &str = "legacy.md";
+    const LEGACY_NOTE: &str = "legacy-note.md";
+    const LEGACY_CONTENT: &str = "a note only the legacy alias holds";
+    const UNLISTED: &str = "draft.txt";
+    const MISSING_NOTE: &str = "missing.md";
+    const ESCAPING_NOTE: &str = "../escape.md";
+    const MODIFIED_MS: u64 = 1_700_000_000_000;
     #[cfg(unix)]
     const LEGACY_MODE: u32 = 0o644;
     #[cfg(unix)]
@@ -1204,6 +1298,121 @@ mod tests {
     }
 
     #[test]
+    fn memory_stats_describe_the_notes_read_memory_reads() {
+        let (root, store, project) = store();
+        store.write_memory(&project, NOTE, REMOTE_CONTENT).unwrap();
+        let written = store.memory_write_dir().unwrap();
+        fs::write(written.join(UNLISTED), CANARY).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(written.join(NOTE))
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_millis(MODIFIED_MS))
+            .unwrap();
+        let legacy = store
+            .state_dir
+            .persistent_path()
+            .join(LocalProjectAliases::new(root.path(), project.clone()).legacy_subdir())
+            .join(MEMORIES_DIR);
+        create_dir_all(&legacy);
+        fs::write(legacy.join(NOTE), CANARY).unwrap();
+        fs::write(legacy.join(LEGACY_NOTE), LEGACY_CONTENT).unwrap();
+
+        let stats = store.memory_stats(&project).unwrap();
+
+        let sizes: Vec<(&str, u64)> = stats
+            .iter()
+            .map(|stat| (stat.name.as_str(), stat.size))
+            .collect();
+        assert_eq!(
+            sizes,
+            [
+                (LEGACY_NOTE, LEGACY_CONTENT.len() as u64),
+                (NOTE, REMOTE_CONTENT.len() as u64),
+            ]
+        );
+        assert_eq!(stats[1].modified_ms, MODIFIED_MS as i64);
+        assert_eq!(store.read_memory(&project, NOTE).unwrap(), REMOTE_CONTENT);
+        assert_eq!(
+            store.read_memory(&project, LEGACY_NOTE).unwrap(),
+            LEGACY_CONTENT
+        );
+    }
+
+    #[test]
+    fn memory_stats_are_uncapped_where_listing_is_capped() {
+        let (_root, store, project) = store();
+        let written = store.memory_write_dir().unwrap();
+        for index in 0..=MAX_MEMORY_DOCUMENTS {
+            fs::write(written.join(format!("{index}.md")), REMOTE_CONTENT).unwrap();
+        }
+
+        assert_eq!(
+            store.memory_stats(&project).unwrap().len(),
+            MAX_MEMORY_DOCUMENTS + 1
+        );
+        assert_eq!(
+            store.list_memories(&project).unwrap().len(),
+            MAX_MEMORY_DOCUMENTS
+        );
+    }
+
+    #[test_case(PROJECT, MISSING_NOTE, LocalDocumentError::WrongOwner; "missing_note")]
+    #[test_case(PROJECT, ESCAPING_NOTE, LocalDocumentError::InvalidMemoryName; "traversal")]
+    #[test_case(OTHER_PROJECT, NOTE, LocalDocumentError::WrongProject; "foreign_project")]
+    fn read_memory_refuses_what_is_not_this_projects_note(
+        project: &str,
+        name: &str,
+        expected: LocalDocumentError,
+    ) {
+        let (_root, store, own) = store();
+        store.write_memory(&own, NOTE, REMOTE_CONTENT).unwrap();
+
+        let read = store.read_memory(&ProjectKey::new(project).unwrap(), name);
+
+        assert_eq!(read.unwrap_err().to_string(), expected.to_string());
+    }
+
+    #[test_case(NOTE; "top_level")]
+    #[test_case(NESTED_NOTE; "nested")]
+    fn memory_reference_is_the_reference_writing_returned(name: &str) {
+        let (_root, store, project) = store();
+        let written = store.write_memory(&project, name, REMOTE_CONTENT).unwrap();
+
+        assert_eq!(store.memory_reference(&project, name).unwrap(), written);
+    }
+
+    #[test_case(false; "keyed_directory")]
+    #[test_case(true; "existing_legacy_directory")]
+    fn memory_scope_names_the_directory_notes_are_written_to(legacy: bool) {
+        let (root, store, project) = store();
+        let aliases = LocalProjectAliases::new(root.path(), project.clone());
+        let expected = if legacy {
+            aliases.legacy_subdir()
+        } else {
+            aliases.keyed_subdir()
+        };
+        if legacy {
+            create_dir_all(&store.state_dir.persistent_path().join(expected));
+        }
+
+        let scope = store.memory_scope().unwrap();
+        store.write_memory(&project, NOTE, REMOTE_CONTENT).unwrap();
+
+        assert_eq!(Path::new(&scope), expected);
+        assert!(
+            store
+                .state_dir
+                .persistent_path()
+                .join(&scope)
+                .join(MEMORIES_DIR)
+                .join(NOTE)
+                .is_file()
+        );
+        assert_eq!(store.memory_scope().unwrap(), scope);
+    }
+
+    #[test]
     fn traversal_and_symlinks_are_rejected() {
         let (_root, store, project) = store();
         assert!(matches!(
@@ -1221,6 +1430,10 @@ mod tests {
                 store.list_memories(&project),
                 Err(LocalDocumentError::Symlink)
             ));
+            assert!(matches!(
+                store.memory_stats(&project),
+                Err(LocalDocumentError::Symlink)
+            ));
 
             fs::remove_file(memory_dir.join("linked.md")).expect("remove symlink");
             let outside = _root.path().join("outside");
@@ -1229,6 +1442,10 @@ mod tests {
             symlink(&outside, memory_dir.join("linked")).expect("directory symlink");
             assert!(matches!(
                 store.delete_memory(&project, "linked/victim.md"),
+                Err(LocalDocumentError::Symlink)
+            ));
+            assert!(matches!(
+                store.read_memory(&project, "linked/victim.md"),
                 Err(LocalDocumentError::Symlink)
             ));
             assert!(outside.join("victim.md").exists());

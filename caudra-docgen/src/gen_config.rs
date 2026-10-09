@@ -1030,11 +1030,11 @@ All of these are added to the system prompt at the start of every session.
 
 ## Memory
 
-The `memory` tool and `/memory` command store small Markdown notes under the state directory, scoped per project:
+The `memory` tool keeps project notes as Markdown files under the state directory, scoped per project:
 
 `…/state/caudra/projects/<project-id>/memories/`
 
-(Linux/macOS: `~/.local/state/caudra/…`; Windows: `%APPDATA%\\caudra\\…`). Use them for non-obvious gotchas and decisions that should survive across sessions. They are separate from skills and from `AGENTS.md`.
+That is `~/.local/state/caudra/…` on Linux and macOS and `%APPDATA%\\caudra\\…` on Windows. A Fast model summarizes the notes in the background for the view in the system prompt. Set [`agent.summarize_memory`](#agent) to `false` to stop that spend. [Memory](/docs/memory/) covers the journal, the view, and the `/memory` inspector.
 
 Related pages: [Skills](/docs/skills/), [CLI](/docs/cli/), [Providers](/docs/providers/#providers-toml).",
         config_files = config_dir_files(),

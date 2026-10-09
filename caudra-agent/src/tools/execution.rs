@@ -306,6 +306,7 @@ mod tests {
                         &slots,
                         &ToolFilter::Only(TOOL_NAMES.iter().map(|name| (*name).into()).collect()),
                         None,
+                        None,
                     );
                     let effective_task = effective_task_execution(&config, task_cap);
                     let effective_shell = effective_shell_execution(&config, shell_cap);

@@ -84,29 +84,17 @@ pub fn is_instruction_file(name: &str) -> bool {
             .any(|f| *f == name || Path::new(f).file_name().is_some_and(|n| n == name))
 }
 
+/// `memory` is the memory view the session froze, see
+/// [`MemoryBaseline`](crate::memory::baseline::MemoryBaseline).
 pub fn build_system_prompt(
     instructions: &str,
     slots: &crate::prompt::ResolvedSlots,
     tool_filter: &crate::tools::ToolFilter,
     profile: Option<&SystemPromptProfile>,
+    memory: Option<&str>,
 ) -> String {
     crate::prompt::assemble_system(
-        &slots.with_native_hints(tool_filter),
-        instructions,
-        crate::prompt::STANDING_PROMPT,
-        profile,
-    )
-}
-
-pub fn build_system_prompt_for_remote(
-    instructions: &str,
-    slots: &crate::prompt::ResolvedSlots,
-    tool_filter: &crate::tools::ToolFilter,
-    profile: Option<&SystemPromptProfile>,
-    store: &caudra_storage::local_documents::LocalDocumentStore,
-) -> String {
-    crate::prompt::assemble_system(
-        &slots.with_native_hints_for_store(tool_filter, store),
+        &slots.with_native_hints(tool_filter, memory),
         instructions,
         crate::prompt::STANDING_PROMPT,
         profile,
@@ -527,6 +515,7 @@ mod tests {
             &crate::prompt::ResolvedSlots::default(),
             &crate::tools::ToolFilter::All,
             None,
+            None,
         )
     }
 
@@ -643,6 +632,7 @@ mod tests {
             &format!("\n{INSTR}"),
             &slots,
             &crate::tools::ToolFilter::All,
+            None,
             None,
         );
         let positions =

@@ -488,7 +488,9 @@ const PEERS: Inflection = ("Peers", "Peers", "Peers");
 /// argument and varies per call; the header carries it instead, and the tool
 /// emits the plain form once for the row to conjugate.
 const MEMORY_COMMANDS: &[(&str, Inflection)] = &[
-    ("list", ("list", "listing", "listed")),
+    ("view", ("view", "viewing", "viewed")),
+    ("zoom", ("zoom", "zooming", "zoomed")),
+    ("search", ("search", "searching", "searched")),
     ("read", ("read", "reading", "read")),
     ("write", ("write", "writing", "wrote")),
     ("delete", ("delete", "deleting", "deleted")),
@@ -534,7 +536,12 @@ const COMPACT_TOOLS: &[(&str, CompactTool)] = &[
     ),
     // `command` is folded by name rather than left to the containment check,
     // because the header spells the verb in a tense the argument never had.
-    tool_row("memory", '▤', MEMORY, &["content", "command", "path"]),
+    tool_row(
+        "memory",
+        '▤',
+        MEMORY,
+        &["content", "command", "path", "query", "id", "n"],
+    ),
     tool_row("sessions", '▤', SESSIONS, &[]),
     tool_row(LIST_SESSIONS_TOOL_NAME, '⇄', PEERS, &[]),
     tool_row(SEND_MESSAGE_TOOL_NAME, '⇄', PEERS, &["text"]),
@@ -3888,6 +3895,21 @@ mod tests {
                 Some(&raw),
                 None
             ),
+            None
+        );
+    }
+
+    /// A zoom's line and a search's words are the header's own subject, so
+    /// the row does not name them a second time.
+    #[test_case("zoomed 8+4", serde_json::json!({"command": "zoom", "id": 8, "n": 4}) ; "a_zoom")]
+    #[test_case(
+        "searched flaky suite",
+        serde_json::json!({"command": "search", "query": "flaky suite"})
+        ; "a_search"
+    )]
+    fn a_store_header_already_names_what_the_call_reads(header: &str, raw: Value) {
+        assert_eq!(
+            compact_args_for(MEMORY_TOOL_NAME, header, Some(&raw), None),
             None
         );
     }
@@ -7924,7 +7946,6 @@ mod tests {
                     "command": "write",
                     "path": "session-picker.md",
                     "content": NOTE_BODY,
-                    "tags": ["ui"],
                 })),
                 None,
             ),

@@ -868,7 +868,7 @@ fn memory_lines(snapshot: &ContextSnapshot, theme: &Theme) -> Vec<Line<'static>>
         labeled_line(
             "In context",
             format!(
-                "{} · definition {} · tag index {} · loaded bodies {}",
+                "{} · definition {} · view {} · loaded bodies {}",
                 token_label(inventory.request_tokens()),
                 token_label(inventory.definition_tokens),
                 token_label(inventory.prompt_tokens),
@@ -903,19 +903,6 @@ fn memory_lines(snapshot: &ContextSnapshot, theme: &Theme) -> Vec<Line<'static>>
             Span::styled("  on load · ", theme.status_dim),
             Span::raw(token_label(file.on_load_tokens)),
         ]));
-        let tags = if file.tags.is_empty() {
-            "no tags".to_owned()
-        } else {
-            file.tags
-                .iter()
-                .map(|tag| escape_terminal_controls(tag))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        lines.push(Line::from(Span::styled(
-            format!("  tags: {tags}"),
-            theme.item_desc,
-        )));
     }
     lines
 }
@@ -1075,7 +1062,6 @@ mod tests {
                     directory: Some(PathBuf::from("/tmp/memory")),
                     files: vec![ContextMemoryFile {
                         name: MEMORY_FILE.to_owned(),
-                        tags: vec!["project".to_owned()],
                         on_load_tokens: 120,
                     }],
                     unreadable_files: 1,

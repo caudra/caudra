@@ -69,12 +69,13 @@ pub enum ModelPurpose {
     Title,
     Goal,
     Extract,
+    Memory,
     Fast,
     Best,
 }
 
 impl ModelPurpose {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Chat,
         Self::Plan,
         Self::Subagent,
@@ -82,6 +83,7 @@ impl ModelPurpose {
         Self::Title,
         Self::Goal,
         Self::Extract,
+        Self::Memory,
         Self::Fast,
         Self::Best,
     ];
@@ -103,6 +105,7 @@ impl ModelPurpose {
             Self::Title => "Title",
             Self::Goal => "Goal",
             Self::Extract => "Extract",
+            Self::Memory => "Memory",
             Self::Fast => "Fast",
             Self::Best => "Best",
         }
@@ -117,6 +120,7 @@ impl ModelPurpose {
             Self::Title => "title",
             Self::Goal => "goal",
             Self::Extract => "extract",
+            Self::Memory => "memory",
             Self::Fast => "fast",
             Self::Best => "best",
         }
@@ -142,7 +146,7 @@ impl FromStr for ModelPurpose {
 
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "unknown model purpose '{0}', expected one of: chat, plan, subagent, compact, title, goal, extract, fast, best"
+    "unknown model purpose '{0}', expected one of: chat, plan, subagent, compact, title, goal, extract, memory, fast, best"
 )]
 pub struct UnknownPurpose(pub String);
 
@@ -1383,6 +1387,7 @@ best = "gpt-4.1"
     #[test_case("title", ModelPurpose::Title ; "title")]
     #[test_case("goal", ModelPurpose::Goal ; "goal")]
     #[test_case("extract", ModelPurpose::Extract ; "extract")]
+    #[test_case("memory", ModelPurpose::Memory ; "memory")]
     #[test_case("fast", ModelPurpose::Fast ; "fast")]
     #[test_case("best", ModelPurpose::Best ; "best")]
     fn purpose_parses_and_renders_the_same_name(input: &str, expected: ModelPurpose) {
@@ -1402,6 +1407,7 @@ best = "gpt-4.1"
                 ModelPurpose::Title,
                 ModelPurpose::Goal,
                 ModelPurpose::Extract,
+                ModelPurpose::Memory,
                 ModelPurpose::Fast,
                 ModelPurpose::Best,
             ]

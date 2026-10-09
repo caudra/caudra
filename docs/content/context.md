@@ -40,13 +40,13 @@ session start (paid every request)   on demand (paid when used)
 effective system prompt              file contents   file_read / file_index / file_grep
 tool definitions                     skill bodies    skill tool
 instruction files (AGENTS.md, ...)   memory notes    memory tool
-memory tag names                     subdir rules    first file_read there
+memory view (up to 32 KiB)           subdir rules    first file_read there
 skill names + descriptions           MCP tool defs   tool_search
 ```
 
-The left column is the fixed overhead of every single request, so Caudra keeps it small on purpose. A selected [system prompt profile](/docs/system-prompts/) changes the effective system prompt and its overhead. A skill contributes one description line, memories one list of tags, and a big MCP server one search tool. The bodies stay on disk until the agent asks.
+The left column is the fixed overhead of every single request, so Caudra keeps it small on purpose. A selected [system prompt profile](/docs/system-prompts/) changes the effective system prompt and its overhead. A skill contributes one description line, memory a [view of its notes](/docs/memory/#the-view) capped at 32 KiB, and a big MCP server one search tool. The bodies stay on disk until the agent asks.
 
-The `/context` views report what currently contributes without loading deferred material to size it. Large MCP installations contribute a compact `tool_search` catalog until the agent selects full definitions. Memory contributes its tag index and skills contribute their names and descriptions. A memory or skill body enters the transcript only when its tool reads it. These loads belong to the Main or task context that requested them.
+The `/context` views report what currently contributes without loading deferred material to size it. Large MCP installations contribute a compact `tool_search` catalog until the agent selects full definitions. Memory contributes its view and skills contribute their names and descriptions. A note or a skill body enters the transcript only when its tool reads it. These loads belong to the Main or task context that requested them.
 
 ## Mention a file with @
 
@@ -187,6 +187,7 @@ Part of what the model reads was written by Caudra rather than typed by you. The
 | Environment | At session start, and again whenever the date, working directory, or model changes |
 | Mode announcement | On the first message after you switch between plan and build |
 | Instruction change | On the first message after you edit or create an instruction file, and again to withdraw that when you put the file back |
+| Memory update | On the first message after a note changes outside this session, and again to withdraw that once the [memory view](/docs/memory/#when-the-view-changes) is taken again |
 | Goal check-in | While a goal is running, to report progress against it |
 | Continuation | After a nudge or a compaction, to say what the model should pick up |
 | Background work | Before an already-scheduled main request when task/workflow state changes or the configured response interval expires, and after successful compaction of a session with background work |
@@ -242,7 +243,7 @@ All four end up in context, but at different times and prices:
 |---|--------|-------|----------|
 | `AGENTS.md` | every session | every request | short rules: conventions, build commands, no-go areas |
 | [Skills](/docs/skills/) | when the agent picks one | a description line until then | long playbooks: release process, plugin authoring |
-| Memory | when the agent recalls a tag | tag names until then | gotchas the agent learns while working |
+| [Memory](/docs/memory/) | a summary view every session, a whole note on demand | the view, up to 32 KiB, on every request | gotchas the agent learns while working |
 | [Commands](/docs/commands/) | when you type `/name` | nothing until invoked | prompts you keep retyping |
 
 Rule of thumb: when `AGENTS.md` grows past a screen, the new material probably wants to be a skill. `AGENTS.md` is a tax on every request; a skill is a tax only on the sessions that need it.

@@ -511,7 +511,7 @@ mod tests {
         let decoded = published(
             MEMORY,
             &[
-                r##"{"command": "write", "path": "a.md", "tags": ["x"], "content": "# T"##,
+                r##"{"command": "write", "path": "a.md", "content": "# T"##,
                 r#"itle\nbody"}"#,
             ],
         );
@@ -523,7 +523,10 @@ mod tests {
     #[test]
     fn a_command_with_no_body_publishes_nothing() {
         let mut stream = BodyStream::new(MEMORY).unwrap();
-        assert_eq!(stream.absorb(r#"{"command": "list", "tags": ["x"]}"#), None);
+        assert_eq!(
+            stream.absorb(r#"{"command": "search", "query": "x"}"#),
+            None
+        );
         assert_eq!(stream.lines(), 1);
     }
 

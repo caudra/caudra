@@ -310,6 +310,12 @@ version = 1
 # Type: bool.
 # generate_titles = true
 
+# Summarize memory notes in the background with the Memory model, so the memory
+# view in the system prompt stays within its budget. When off, new notes reach
+# the view only as titles and `memory search` still finds them.
+# Type: bool.
+# summarize_memory = true
+
 # Block a write to a file that changed on disk since it was read, and point a
 # failed edit or patch at the change.
 # Type: bool.

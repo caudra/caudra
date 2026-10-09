@@ -17,7 +17,7 @@ Clear-and-Implement moves the plan to the new session, and the old session keeps
 
 Secure plan storage currently requires a Unix client. Windows and other non-Unix clients return `UnsupportedPlatform` for secure plan storage operations. This applies to local plans and client-owned plans for remote workspaces, regardless of the Workcell server's platform.
 
-The `memory` tool lists, reads, writes, and deletes named notes in local and remote workspaces. Writes replace the complete note. Remote notes stay on the client and cannot be edited through remote file tools. Workbench saves retain revision-conflict checks.
+The `memory` tool reads, writes, and deletes named notes in local and remote workspaces. Its `view`, `zoom`, and `search` commands find the notes worth reading, as [Memory](/docs/memory/#zoom-and-search) describes. Writes replace the complete note. Remote notes stay on the client and cannot be edited through remote file tools. Workbench saves retain revision-conflict checks.
 
 ## Disabling tools
 
@@ -414,14 +414,16 @@ Read or replace this session's plan. Use action='read' to inspect it or action='
 
 ### `memory` {#memory}
 
-Persistent, project-scoped scratchpad for learnings, patterns, decisions, and gotchas across sessions.
+Persistent, project-scoped memory across sessions. The main session's system prompt carries it as a view of one-line summaries, oldest first, and `view` shows it as it stands now.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `command` | string | yes | - `list [tags]`: tag-grouped index, no bodies.<br>- `read path\|tags`: one body (path) or collated bodies (tags).<br>- `write path tags content`: create or overwrite a note.<br>- `delete path` |
+| `command` | string | yes | - `view`: the memory view as it stands now.<br>- `zoom id n`: line id+n opened into the two lines it was made from; n=1 gives the entry whole.<br>- `search query`: the current notes holding the query's words, best first.<br>- `read path`: one note as it stands.<br>- `write path content`: create a note, or rewrite it whole.<br>- `delete path` |
 | `path` | string | no | Relative path, e.g. 'architecture.md'. |
-| `content` | string | no | Body for write (frontmatter added automatically). |
-| `tags` | array | no | snake_case tags. Filter for list/read; assigned on write (defaults to filename stem). |
+| `content` | string | no | The note's whole text. |
+| `query` | string | no | Words to find in the notes' names and text. |
+| `id` | integer | no | The id of line id+n. |
+| `n` | integer | no | The n of line id+n: how many entries it covers. |
 
 ### `skill` {#skill}
 

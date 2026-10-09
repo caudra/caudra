@@ -14,9 +14,9 @@ use std::path::{Path, PathBuf};
 
 use caudra_agent::ToolDoneEvent;
 use caudra_agent::tools::MEMORY_TOOL_NAME;
-use caudra_agent::tools::native::memory;
 use caudra_agent::tools::native::plan::{PlanTarget, PlanWriteResult};
 use caudra_storage::local_documents::{DocumentRevision, LocalDocument, LocalDocumentError};
+use caudra_storage::projects::project_document_dirs;
 use caudra_workbench::{DocumentKey, TabLabel};
 use caudra_workspace::{LocalDocumentRef, MemoryRef, PlanRef};
 
@@ -103,11 +103,11 @@ impl App {
     /// A note from `/memory` or a memory card, under its name within the notes
     /// directory rather than the path to it.
     pub(super) fn open_memory_note(&mut self, note: &Path) {
-        self.memory_picker.close();
-        let dir = memory::paths::state_dir(Path::new(&self.state.session.cwd));
-        let name = dir
-            .as_deref()
-            .and_then(|dir| note.strip_prefix(dir).ok())
+        self.memory_inspector.close();
+        let [_, notes] = project_document_dirs(&self.storage, Path::new(&self.state.session.cwd));
+        let name = note
+            .strip_prefix(&notes)
+            .ok()
             .or_else(|| note.file_name().map(Path::new))
             .unwrap_or(note)
             .to_string_lossy()
@@ -152,7 +152,7 @@ impl App {
 
     /// A remote workspace's note, which the store keeps under its name.
     pub(super) fn open_stored_note(&mut self, reference: MemoryRef) {
-        self.memory_picker.close();
+        self.memory_inspector.close();
         let session = self.state.session.id.to_string();
         let Some(document) = self.read_or_flash(&LocalDocumentRef::Memory(reference), &session)
         else {
@@ -464,7 +464,6 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
-    use caudra_agent::tools::native::memory::{BrowseEntry, browse_store};
     use caudra_agent::tools::native::plan::{self, PlanTarget, PlanWriteResult};
     use caudra_agent::tools::{
         BATCH_TOOL_NAME, FILE_WRITE_TOOL_NAME, MEMORY_TOOL_NAME, ToolEffect,
@@ -494,7 +493,7 @@ mod tests {
     };
     use crate::app::{App, KeyFocus, Mode, Msg, PlanState, PlanTrigger};
     use crate::components::keybindings::{Bind, key, leader};
-    use crate::components::memory_picker::MemoryPickerAction;
+    use crate::components::memory_inspector::MemoryAction;
     use crate::components::workbench::styles as workbench_styles;
     use crate::components::{Action, Status, key as press};
 
@@ -507,7 +506,6 @@ mod tests {
     const BATCH_PLAN_ID: &str = "batch-plan";
     const NOTE_FILE: &str = "arch.md";
     const NOTE_STATUS: &str = "Memory · arch.md";
-    const NOTE_TAG: &str = "arch";
     const EDIT: char = 'X';
     const PASTED: &str = "pasted";
     const TEMP_DIR: &str = "a temporary directory";
@@ -521,7 +519,7 @@ mod tests {
     const STALE_PLAN: &str = "the open plan missed the agent's rewrite";
     const SOURCE_REROOTED: &str = "opening the plan took the workbench from the policy source";
     const NOTE_NOT_OPENED: &str = "the note did not open in the workbench";
-    const PICKER_LEFT_UP: &str = "the picker stayed up over the note it opened";
+    const INSPECTOR_LEFT_UP: &str = "the inspector stayed up over the note it opened";
     const EMPHASIS_SOURCE: &str = "Keep **calm**";
     const EMPHASIS_RENDERED: &str = "Keep calm";
     const NOT_RENDERED: &str = "the plan is not painted the way the transcript paints Markdown";
@@ -897,23 +895,18 @@ mod tests {
     }
 
     #[test]
-    fn a_memory_note_opens_under_its_name_and_takes_the_picker_down() {
+    fn a_memory_note_opens_under_its_name_and_takes_the_inspector_down() {
         let project = TempDir::new().expect(TEMP_DIR);
         let notes = TempDir::new().expect(TEMP_DIR);
         let note = notes.path().join(NOTE_FILE);
         fs::write(&note, PLAN_TEXT).expect(WRITTEN);
         let mut app = test_app();
         app.state.session_mut().cwd = project.path().to_string_lossy().into_owned();
-        app.memory_picker.open(vec![BrowseEntry {
-            name: NOTE_FILE.into(),
-            tokens: 1,
-            tag: NOTE_TAG.into(),
-            tag_count: 1,
-        }]);
+        app.memory_inspector.open(None, String::new(), true);
 
         app.open_memory_note(&note);
 
-        assert!(!app.memory_picker.is_open(), "{PICKER_LEFT_UP}");
+        assert!(!app.memory_inspector.is_open(), "{INSPECTOR_LEFT_UP}");
         assert_eq!(app.workbench.layout().tabs, [note], "{NOTE_NOT_OPENED}");
         assert!(rendered(&mut app).contains(NOTE_STATUS), "{NOT_LABELLED}");
     }
@@ -1467,17 +1460,20 @@ mod tests {
     /// A remote note has no file to open, so `/memory` opens the store's copy
     /// under the note's name, and a save puts it back there.
     #[test]
-    fn a_remote_note_opens_from_the_picker_and_saves_to_its_store() {
+    fn a_remote_note_opens_from_the_inspector_and_saves_to_its_store() {
         let mut remote = remote();
         let note = LocalDocumentRef::Memory(remote.note(PLAN_TEXT));
-        let row = browse_store(&remote.store).expect(STORED)[0].1.name.clone();
-        remote.app.memory_browse();
+        remote.app.open_memory_inspector();
+        remote.app.await_memory_reply();
 
         remote
             .app
-            .handle_memory_picker_action(MemoryPickerAction::Open(row));
+            .handle_memory_action(MemoryAction::Open(NOTE_FILE.to_owned()));
 
-        assert!(!remote.app.memory_picker.is_open(), "{PICKER_LEFT_UP}");
+        assert!(
+            !remote.app.memory_inspector.is_open(),
+            "{INSPECTOR_LEFT_UP}"
+        );
         assert!(
             rendered(&mut remote.app).contains(NOTE_STATUS),
             "{NOT_LABELLED}"

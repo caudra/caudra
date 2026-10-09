@@ -3100,6 +3100,7 @@ impl EventPump {
             | AgentEvent::QueueDrained
             | AgentEvent::Compacting
             | AgentEvent::CompactionDone
+            | AgentEvent::MemoryChanged
             | AgentEvent::SessionTitle { .. }
             | AgentEvent::AuthRequired
             | AgentEvent::AuthRestored

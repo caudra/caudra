@@ -1,49 +1,55 @@
-//! `memory`: a project-scoped scratchpad that outlives a session.
+//! `memory`: the project's notes, kept across sessions.
 //!
-//! Notes live under the state directory, keyed by a hash of the project root,
-//! and are retrieved by tag rather than by path. The tag index is injected
-//! into the system prompt, which is what makes a note findable at all: the
-//! model cannot grep a directory it was never told about.
+//! Every write and delete is an entry in the project's memory journal, and the
+//! system prompt carries a view of the summary tree over that journal. `view`,
+//! `zoom` and `search` read the tree and the journal; `read`, `write` and
+//! `delete` act on one note by its name. Each call reconciles first, so a note
+//! edited outside the tool is an entry before the call looks.
 
 mod notes;
-pub mod paths;
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::fs;
+use std::env;
 use std::io;
-use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use caudra_providers::estimate_tokens;
-use caudra_storage::local_documents::{LocalDocument, LocalDocumentStore};
-use caudra_workspace::{LocalDocumentRef, MemoryRef, RecordScope};
+use caudra_storage::StateDir;
+use caudra_storage::local_documents::LocalDocumentStore;
+use caudra_storage::memory_journal::{
+    EntryKind, EntryMeta, EntryOrigin, MemoryJournalError, body_hash,
+};
+use caudra_workspace::RecordScope;
 use serde_json::Value;
+use tracing::warn;
 
+use crate::memory::search::terms;
+use crate::memory::snapshot::EntryStatus;
+use crate::memory::store::{MemoryError, MemoryStore, Source, leaf_kind, local_dir, note_name};
+use crate::memory::tree::{self, Part};
 use crate::permissions::{
     PermissionResource, PermissionResourceAccess, PermissionResourceKind, PermissionRisk,
+    hex_encode,
 };
 use crate::tools::registry::{
-    ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionIntent, PermissionScopes, Tool,
-    ToolEffect, ToolError, ToolExecResult, ToolFailure, ToolInvocation,
+    BoxFuture, ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionIntent,
+    PermissionScopes, Tool, ToolEffect, ToolError, ToolExecResult, ToolFailure, ToolInvocation,
 };
 use crate::tools::schema::{ParamKind, ParamSchema, Property, to_json_schema, validate};
 use crate::tools::{DescriptionContext, ToolContext};
-use crate::types::{
-    MemoryNote, MemoryNoteEntry, MemoryOrigin, MemoryOutput, MemoryTagGroup, ToolOutput,
-};
+use crate::types::{MemoryHit, MemoryLine, MemoryNote, MemoryOrigin, MemoryOutput, ToolOutput};
 
-pub const DESCRIPTION: &str = "Persistent, project-scoped scratchpad for learnings, patterns, decisions, and gotchas across sessions.
+pub const DESCRIPTION: &str = "Persistent, project-scoped memory across sessions. The main session's system prompt carries it as a view of one-line summaries, oldest first, and `view` shows it as it stands now.
 
-- Notes are retrieved by tag; reuse the tags from your system prompt when they fit.
-- Save important context before compaction or to build up project knowledge.
-- Keep entries concise and current. Delete outdated information.
-- Concision comes from dropping facts, never from dropping spaces or running words together. A note that cannot be read costs more than the tokens it saved.
-- Use `list` and `read` to find notes, then `write` or `delete` with the note's relative path. The same named operations work in local and remote sessions; remote notes expose no client host path.";
+- Save non-obvious knowledge: gotchas and their fixes, decisions and why, where things live, commands that work.
+- When a fact changes, rewrite the existing note under its name instead of adding a near-duplicate. That also brings it back to the recent end of the view.
+- Delete only notes that are wrong. Nothing needs pruning: older notes fold into summaries.
+- When a view line only mentions what you need, `zoom` into it or `search` before you rely on it.
+- Concision comes from dropping facts, never from dropping spaces or running words together. A note that cannot be read costs more than the tokens it saved.";
 
-pub const TOOL_USAGE: &str =
-    "- Proactively save non-obvious project gotchas and architecture decisions to **memory**.";
+pub const TOOL_USAGE: &str = "- Proactively save non-obvious project knowledge to **memory**, and rewrite a note under its name when its facts change.";
 
 /// Tools allowed to touch the notes directory without prompting. Notes sit
 /// outside the project, where an effectful tool would otherwise always ask on
@@ -64,7 +70,7 @@ pub const RULE_OWNER: &str = "native:memory";
 pub const LOCAL_MEMORY_RESOURCE: &str = "local_memory";
 
 pub fn permission_rules(cwd: &Path) -> Vec<caudra_config::PermissionRule> {
-    paths::state_dir(cwd)
+    local_dir(cwd)
         .into_iter()
         .flat_map(|dir| {
             let scope = format!("{}/**", dir.display());
@@ -79,19 +85,30 @@ pub fn permission_rules(cwd: &Path) -> Vec<caudra_config::PermissionRule> {
         .collect()
 }
 
-const COMMANDS: &[&str] = &["list", "read", "write", "delete"];
-/// What a remote note with no name of its own is called. The store allows it;
-/// a card and a text rendering both need something to print.
-const UNNAMED_REMOTE_NOTE: &str = "memory";
-const PROMPT_TAG_PREFIX: &str =
-    "\n\nMemory tags (`memory` with `command=\"read\"` and `tags=[...]`): ";
-const STATE_DIR_UNRESOLVED: &str = "cannot resolve state dir";
+const COMMANDS: &[&str] = &["view", "zoom", "search", "read", "write", "delete"];
+const CWD_UNRESOLVED: &str = "cannot resolve the working directory";
+const PATH_REQUIRED_FOR: &str = "'path' is required for";
+const ZOOM_NEEDS_LINE: &str = "'id' and 'n' are required for zoom";
+const SEARCH_NEEDS_QUERY: &str = "'query' is required for search";
+const SEARCH_NEEDS_WORDS: &str = "'query' has no words to search for";
+const WRITE_NEEDS_CONTENT: &str = "'content' is required for write";
+const NO_HITS: &str = "No current note holds these words.";
+const HIDDEN_ENTRIES: &str =
+    "oldest entries are left out until their summaries are written; search finds them.";
+const UNCHANGED: &str = "already says this";
+const KEPT_VERSIONS: &str = "zoom keeps earlier versions";
+const ENTRY_CURRENT: &str = "current";
+const REWRITTEN_BY: &str = "rewritten by entry";
+const DELETED_BY: &str = "deleted by entry";
+const ENTRY_FORGOTTEN: &str = "its text was purged";
 
 static COMMAND_PARAM: ParamSchema = ParamSchema::Enum {
     variants: COMMANDS,
-    description: "- `list [tags]`: tag-grouped index, no bodies.
-- `read path|tags`: one body (path) or collated bodies (tags).
-- `write path tags content`: create or overwrite a note.
+    description: "- `view`: the memory view as it stands now.
+- `zoom id n`: line id+n opened into the two lines it was made from; n=1 gives the entry whole.
+- `search query`: the current notes holding the query's words, best first.
+- `read path`: one note as it stands.
+- `write path content`: create a note, or rewrite it whole.
 - `delete path`",
 };
 static PATH_PARAM: ParamSchema = ParamSchema::Primitive {
@@ -100,21 +117,27 @@ static PATH_PARAM: ParamSchema = ParamSchema::Primitive {
 };
 static CONTENT_PARAM: ParamSchema = ParamSchema::Primitive {
     kind: ParamKind::String,
-    description: "Body for write (frontmatter added automatically).",
+    description: "The note's whole text.",
 };
-static TAG_PARAM: ParamSchema = ParamSchema::Primitive {
+static QUERY_PARAM: ParamSchema = ParamSchema::Primitive {
     kind: ParamKind::String,
-    description: "",
+    description: "Words to find in the notes' names and text.",
 };
-static TAGS_PARAM: ParamSchema = ParamSchema::Array {
-    items: &TAG_PARAM,
-    description: "snake_case tags. Filter for list/read; assigned on write (defaults to filename stem).",
+static ID_PARAM: ParamSchema = ParamSchema::Primitive {
+    kind: ParamKind::Integer,
+    description: "The id of line id+n.",
+};
+static N_PARAM: ParamSchema = ParamSchema::Primitive {
+    kind: ParamKind::Integer,
+    description: "The n of line id+n: how many entries it covers.",
 };
 static PROPERTIES: &[Property] = &[
     ("command", &COMMAND_PARAM, true, &[]),
     ("path", &PATH_PARAM, false, &[]),
     ("content", &CONTENT_PARAM, false, &[]),
-    ("tags", &TAGS_PARAM, false, &[]),
+    ("query", &QUERY_PARAM, false, &[]),
+    ("id", &ID_PARAM, false, &[]),
+    ("n", &N_PARAM, false, &[]),
 ];
 static SCHEMA: ParamSchema = ParamSchema::Object {
     properties: PROPERTIES,
@@ -123,6 +146,10 @@ static SCHEMA: ParamSchema = ParamSchema::Object {
 };
 static PERMISSION_CONTRACT: LazyLock<String> =
     LazyLock::new(|| super::permission_contract(&MemoryTool, ToolEffect::Mutating, DESCRIPTION));
+/// `/context` is measured on every request and would otherwise re-read every
+/// note each time; the cache keys on size and mtime, so a note just written
+/// is never stale.
+static TOKEN_CACHE: LazyLock<Mutex<notes::TokenCache>> = LazyLock::new(Mutex::default);
 
 pub fn permission_contract() -> &'static str {
     &PERMISSION_CONTRACT
@@ -130,7 +157,9 @@ pub fn permission_contract() -> &'static str {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Command {
-    List,
+    View,
+    Zoom,
+    Search,
     Read,
     Write,
     Delete,
@@ -139,7 +168,9 @@ enum Command {
 impl Command {
     fn parse(raw: &str) -> Option<Self> {
         match raw {
-            "list" => Some(Self::List),
+            "view" => Some(Self::View),
+            "zoom" => Some(Self::Zoom),
+            "search" => Some(Self::Search),
             "read" => Some(Self::Read),
             "write" => Some(Self::Write),
             "delete" => Some(Self::Delete),
@@ -149,7 +180,9 @@ impl Command {
 
     fn as_str(self) -> &'static str {
         match self {
-            Self::List => "list",
+            Self::View => "view",
+            Self::Zoom => "zoom",
+            Self::Search => "search",
             Self::Read => "read",
             Self::Write => "write",
             Self::Delete => "delete",
@@ -158,9 +191,13 @@ impl Command {
 
     fn access(self) -> PermissionResourceAccess {
         match self {
-            Self::List | Self::Read => PermissionResourceAccess::Read,
+            Self::View | Self::Zoom | Self::Search | Self::Read => PermissionResourceAccess::Read,
             Self::Write | Self::Delete => PermissionResourceAccess::Write,
         }
+    }
+
+    fn names_note(self) -> bool {
+        matches!(self, Self::Read | Self::Write | Self::Delete)
     }
 }
 
@@ -184,37 +221,7 @@ impl Tool for MemoryTool {
     }
 
     fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
-        let input = validate(&SCHEMA, input.clone())?;
-        let raw = input
-            .get("command")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ParseError::custom("command is required"))?;
-        let command = Command::parse(raw).ok_or_else(|| {
-            ParseError::custom(format!(
-                "unknown command '{raw}'. Valid commands: {}",
-                COMMANDS.join(", ")
-            ))
-        })?;
-        Ok(Box::new(MemoryCall {
-            command,
-            // Resolved once: permission scoping, mutation targets, and the run
-            // itself must agree on where the notes are, and three separate
-            // `current_dir` calls need not.
-            dir: std::env::current_dir()
-                .ok()
-                .and_then(|cwd| paths::state_dir(&cwd)),
-            path: string_field(&input, "path"),
-            content: string_field(&input, "content"),
-            tags: input
-                .get("tags")
-                .and_then(Value::as_array)
-                .map(|tags| {
-                    tags.iter()
-                        .filter_map(|tag| tag.as_str().map(str::to_owned))
-                        .collect()
-                })
-                .unwrap_or_default(),
-        }))
+        Ok(Box::new(MemoryCall::parse(input, env::current_dir().ok())?))
     }
 }
 
@@ -226,21 +233,10 @@ fn string_field(input: &Value, name: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// One note as the `/memory` picker shows it: a note carrying several tags
-/// appears once per tag, which is how the picker groups them.
-pub struct BrowseEntry {
-    pub name: String,
-    pub tokens: u32,
-    pub tag: String,
-    /// Notes sharing this tag, for the group header.
-    pub tag_count: usize,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryNoteInventory {
     pub name: String,
     pub on_load_tokens: u32,
-    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -251,12 +247,15 @@ pub struct MemoryInventory {
 }
 
 pub fn inventory(cwd: &Path) -> Option<MemoryInventory> {
-    let directory = paths::state_dir(cwd)?;
-    Some(inventory_dir(&directory, &TAG_CACHE))
+    let directory = local_dir(cwd).ok()?;
+    Some(inventory_dir(&directory, &TOKEN_CACHE))
 }
 
-fn inventory_dir(dir: &Path, cache: &Mutex<notes::TagCache>) -> MemoryInventory {
-    let (notes, warnings) = scan(dir, cache);
+fn inventory_dir(dir: &Path, cache: &Mutex<notes::TokenCache>) -> MemoryInventory {
+    let (notes, warnings) = notes::scan(
+        dir,
+        &mut cache.lock().unwrap_or_else(PoisonError::into_inner),
+    );
     MemoryInventory {
         directory: dir.to_path_buf(),
         notes: notes
@@ -264,547 +263,200 @@ fn inventory_dir(dir: &Path, cache: &Mutex<notes::TagCache>) -> MemoryInventory 
             .map(|note| MemoryNoteInventory {
                 name: note.name,
                 on_load_tokens: note.tokens,
-                tags: note.tags,
             })
             .collect(),
         unreadable_files: warnings.len(),
     }
 }
 
-/// What the `/memory` picker needs, without exposing the note internals.
-/// `None` when the notes directory cannot be resolved at all, which is a
-/// different failure from having no notes.
-pub fn browse(cwd: &Path) -> Option<(PathBuf, Vec<BrowseEntry>, usize)> {
-    let dir = paths::state_dir(cwd)?;
-    let (entries, unreadable) = browse_dir(&dir, &TAG_CACHE);
-    Some((dir, entries, unreadable))
-}
-
-fn browse_dir(dir: &Path, cache: &Mutex<notes::TagCache>) -> (Vec<BrowseEntry>, usize) {
-    let (found, warnings) = scan(dir, cache);
-    let entries = notes::group_by_tag(&found)
-        .into_iter()
-        .flat_map(|group| {
-            let count = group.files.len();
-            let tag = group.tag;
-            group
-                .files
-                .into_iter()
-                .map(move |(name, tokens)| BrowseEntry {
-                    name,
-                    tokens,
-                    tag: tag.clone(),
-                    tag_count: count,
-                })
-        })
-        .collect();
-    (entries, warnings.len())
-}
-
-pub fn browse_store(store: &LocalDocumentStore) -> Result<Vec<(MemoryRef, BrowseEntry)>, String> {
-    let documents = store
-        .list_memories(store.project_key())
-        .map_err(|error| error.to_string())?;
-    let mut groups = BTreeMap::<String, Vec<(MemoryRef, String, u32)>>::new();
-    for document in documents {
-        let LocalDocumentRef::Memory(reference) = &document.reference else {
-            continue;
-        };
-        let name = document.name.as_deref().unwrap_or_default();
-        let label = format!("{name} [{}]", reference.as_str());
-        let mut tags = document_tags(&document);
-        if tags.is_empty() {
-            tags.push(name.to_owned());
-        }
-        for tag in tags {
-            groups.entry(tag).or_default().push((
-                reference.clone(),
-                label.clone(),
-                estimate_tokens(&document.content),
-            ));
-        }
-    }
-    Ok(groups
-        .into_iter()
-        .flat_map(|(tag, files)| {
-            let tag_count = files.len();
-            files.into_iter().map(move |(reference, name, tokens)| {
-                (
-                    reference,
-                    BrowseEntry {
-                        name,
-                        tokens,
-                        tag: tag.clone(),
-                        tag_count,
-                    },
-                )
-            })
-        })
-        .collect())
-}
-
-/// Shared by the prompt's tag line and the tool's own scans. The prompt is
-/// rebuilt every turn and would otherwise re-read every note each time; the
-/// cache keys on size and mtime, so a note the tool just wrote is never stale.
-static TAG_CACHE: LazyLock<Mutex<notes::TagCache>> = LazyLock::new(Mutex::default);
-
-/// The prompt is built from the process working directory, the same ambient
-/// value the rest of the tools layer resolves paths against.
-pub fn prompt_tag_line_for_cwd() -> Option<String> {
-    prompt_tag_line(&std::env::current_dir().ok()?, &TAG_CACHE)
-}
-
-pub fn prompt_tag_line_for_store(store: &LocalDocumentStore) -> Option<String> {
-    let documents = store.list_memories(store.project_key()).ok()?;
-    let mut tags = documents
-        .iter()
-        .flat_map(|document| {
-            let (frontmatter, _) = notes::parse_frontmatter(&document.content);
-            frontmatter
-                .as_ref()
-                .and_then(|value| value.get("tags"))
-                .and_then(serde_yaml::Value::as_sequence)
-                .into_iter()
-                .flatten()
-                .filter_map(serde_yaml::Value::as_str)
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    tags.sort();
-    tags.dedup();
-    (!tags.is_empty()).then(|| format!("{PROMPT_TAG_PREFIX}{}\n", tags.join(", ")))
-}
-
-/// The tag index shown in the system prompt. Absent when there is nothing to
-/// say, so a project without notes spends no tokens on the feature.
-fn prompt_tag_line(cwd: &Path, cache: &Mutex<notes::TagCache>) -> Option<String> {
-    let dir = paths::state_dir(cwd)?;
-    let (found, warnings) = scan(&dir, cache);
-    let groups = notes::group_by_tag(&found);
-    if groups.is_empty() && warnings.is_empty() {
-        return None;
-    }
-    let mut line = groups
-        .iter()
-        .take(notes::MAX_TAGS)
-        .map(|group| group.tag.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    if groups.len() > notes::MAX_TAGS {
-        line.push_str(&format!(
-            " ... ({} tags omitted; use `list` to see all)",
-            groups.len() - notes::MAX_TAGS
-        ));
-    }
-    if !warnings.is_empty() {
-        if !line.is_empty() {
-            line.push(' ');
-        }
-        line.push_str(&format!("(unreadable: {})", warnings.len()));
-    }
-    Some(format!("{PROMPT_TAG_PREFIX}{line}\n"))
-}
-
-pub(crate) fn prompt_tag_line_range(system: &str) -> Option<Range<usize>> {
-    let start = system.rfind(PROMPT_TAG_PREFIX)?;
-    let content_start = start + PROMPT_TAG_PREFIX.len();
-    let end = content_start + system[content_start..].find('\n')? + 1;
-    Some(start..end)
-}
-
-fn scan(dir: &Path, cache: &Mutex<notes::TagCache>) -> (Vec<notes::Note>, Vec<String>) {
-    match cache.lock() {
-        Ok(mut cache) => notes::scan(dir, &mut cache),
-        // A poisoned cache is not worth failing a read over; it only ever
-        // holds derived data.
-        Err(_) => notes::scan(dir, &mut notes::TagCache::default()),
-    }
-}
-
 struct MemoryCall {
     command: Command,
-    dir: Option<PathBuf>,
+    /// Resolved once: permission scoping, mutation targets, and the run itself
+    /// must agree on whose notes these are, and separate `current_dir` calls
+    /// need not.
+    cwd: Option<PathBuf>,
     path: Option<String>,
     content: Option<String>,
-    tags: Vec<String>,
+    query: Option<String>,
+    id: Option<u64>,
+    n: Option<u64>,
 }
 
-impl MemoryCall {
-    /// Rejects combinations the schema cannot express: which of `path`,
-    /// `tags`, and `content` a command needs depends on the command.
-    fn validate(&self) -> Result<(), ToolError> {
-        let has_path = self.path.is_some();
-        let has_tags = !self.tags.is_empty();
-        match self.command {
-            Command::Read if has_path && has_tags => {
-                Err(invalid("provide 'path' or 'tags', not both"))
-            }
-            Command::Read if !has_path && !has_tags => {
-                Err(invalid("'path' or 'tags' is required for read"))
-            }
-            Command::Write if !has_path => Err(invalid("'path' is required for write")),
-            Command::Write if self.content.is_none() => {
-                Err(invalid("'content' is required for write"))
-            }
-            Command::Delete if !has_path => Err(invalid("'path' is required for delete")),
-            _ => Ok(()),
-        }
-    }
-
-    fn run(&self, dir: &Path, cache: &Mutex<notes::TagCache>) -> Result<Answer, ToolError> {
-        match self.command {
-            Command::List => Ok(Answer::Browse(self.list(dir, cache))),
-            Command::Read if !self.tags.is_empty() => {
-                self.read_by_tag(dir, cache).map(Answer::Browse)
-            }
-            Command::Read => self.read_by_path(dir).map(Answer::Browse),
-            Command::Write => self.write(dir).map(Answer::Receipt),
-            Command::Delete => self.delete(dir).map(Answer::Receipt),
-        }
-    }
-
-    fn list(&self, dir: &Path, cache: &Mutex<notes::TagCache>) -> MemoryOutput {
-        let directory = Some(dir.display().to_string());
-        let wanted = match self.tags.is_empty() {
-            true => None,
-            false => match notes::tags_for_filter(&self.tags) {
-                Ok(pair) => Some(pair),
-                Err(error) => return empty_index(directory, vec![error]),
-            },
-        };
-        let (found, read_warnings) = scan(dir, cache);
-        let all = notes::group_by_tag(&found);
-        let mut notices: Vec<String> = wanted
-            .as_ref()
-            .and_then(|(_, warning)| warning.clone())
-            .into_iter()
-            .chain(notes::unreadable_warning(&read_warnings))
-            .collect();
-        let groups: Vec<MemoryTagGroup> = all
-            .iter()
-            .filter(|group| {
-                wanted
-                    .as_ref()
-                    .is_none_or(|(want, _)| want.contains(&group.tag))
-            })
-            .map(|group| MemoryTagGroup {
-                tag: group.tag.clone(),
-                notes: group
-                    .files
-                    .iter()
-                    .map(|(name, tokens)| MemoryNoteEntry {
-                        name: name.clone(),
-                        tokens: *tokens,
-                        origin: file_origin(dir, name),
-                    })
-                    .collect(),
-            })
-            .collect();
-        if groups.is_empty() {
-            notices.push(match wanted.is_none() {
-                true => notes::NO_MEMORIES.to_owned(),
-                false => notes::NO_MATCH.to_owned(),
-            });
-        }
-        if wanted.is_none() && all.len() > notes::MAX_TAGS {
-            notices.push(prune_advisory());
-        }
-        MemoryOutput::Index {
-            directory,
-            groups,
-            notices,
-        }
-    }
-
-    fn read_by_tag(
-        &self,
-        dir: &Path,
-        cache: &Mutex<notes::TagCache>,
-    ) -> Result<MemoryOutput, ToolError> {
-        let (wanted, warning) = notes::tags_for_filter(&self.tags).map_err(invalid)?;
-        let (found, mut read_warnings) = scan(dir, cache);
-        let mut read = Vec::new();
-        for note in found
-            .iter()
-            .filter(|n| n.tags.iter().any(|t| wanted.contains(t)))
-        {
-            match fs::read_to_string(dir.join(&note.name)) {
-                Ok(content) => read.push(local_note(dir, &note.name, &content)),
-                Err(error) => read_warnings.push(format!("{}: {error}", note.name)),
-            }
-        }
-        let mut notices: Vec<String> = warning
-            .into_iter()
-            .chain(notes::unreadable_warning(&read_warnings))
-            .collect();
-        if read.is_empty() {
-            notices.push(notes::NO_MATCH.to_owned());
-        }
-        Ok(MemoryOutput::Notes {
-            directory: Some(dir.display().to_string()),
-            notes: read,
-            notices,
-        })
-    }
-
-    fn read_by_path(&self, dir: &Path) -> Result<MemoryOutput, ToolError> {
-        let path = self.resolved(dir)?;
-        let content = fs::read_to_string(&path).map_err(|error| io_error("read", &error))?;
-        let name = self.path.clone().unwrap_or_default();
-        Ok(MemoryOutput::Notes {
-            directory: Some(dir.display().to_string()),
-            notes: Vec::from([local_note(dir, &name, &content)]),
-            notices: Vec::new(),
-        })
-    }
-
-    fn write(&self, dir: &Path) -> Result<String, ToolError> {
-        let path = self.resolved(dir)?;
-        let content = self.content.clone().unwrap_or_default();
-        if let Some(error) = notes::write_size_error(&content) {
-            return Err(invalid(error));
-        }
-        let (tags, note) = notes::tags_for_write(&self.tags).map_err(invalid)?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| io_error("write", &error))?;
-        }
-        fs::write(
-            &path,
-            format!("{}{content}", notes::encode_frontmatter(&tags)),
-        )
-        .map_err(|error| io_error("write", &error))?;
-        let listed = if tags.is_empty() {
-            "none".to_owned()
-        } else {
-            tags.join(", ")
-        };
-        let suffix = note.map_or(String::new(), |note| format!("; {note}"));
-        Ok(format!(
-            "wrote {} (tags: {listed}){suffix}",
-            self.path.clone().unwrap_or_default()
-        ))
-    }
-
-    fn delete(&self, dir: &Path) -> Result<String, ToolError> {
-        let path = self.resolved(dir)?;
-        let name = self.path.clone().unwrap_or_default();
-        if !path.exists() {
-            return Err(missing(&name));
-        }
-        fs::remove_file(&path).map_err(|error| io_error("delete", &error))?;
-        Ok(format!("deleted {name}"))
-    }
-
-    fn resolved(&self, dir: &Path) -> Result<PathBuf, ToolError> {
-        paths::safe_resolve(dir, self.path.as_deref().unwrap_or_default()).map_err(invalid)
-    }
-
-    fn run_all(&self, cache: &Mutex<notes::TagCache>) -> Result<Answer, ToolError> {
-        self.validate()?;
-        let dir = self
-            .dir
-            .clone()
-            .ok_or_else(|| STATE_DIR_UNRESOLVED.to_owned())?;
-        self.run(&dir, cache)
-    }
+/// A call holding what its command needs. Which of the arguments that is
+/// depends on the command, which the schema cannot say.
+enum Request<'a> {
+    View,
+    Zoom { id: u64, n: u64 },
+    Search(&'a str),
+    Read(&'a str),
+    Write { path: &'a str, content: &'a str },
+    Delete(&'a str),
 }
 
-fn invalid(message: impl Into<String>) -> ToolError {
-    ToolError::new(ToolFailure::InvalidInput, message)
-}
-
-fn missing(name: &str) -> ToolError {
-    ToolError::new(ToolFailure::NotFound, format!("'{name}' does not exist"))
-}
-
-fn io_error(action: &str, error: &io::Error) -> ToolError {
-    ToolError::new(ToolFailure::from(error), format!("{action} error: {error}"))
-}
-
-/// What a command answered with. The two browsing commands return something a
-/// card draws; the two that change a note return the receipt for having done
-/// it, which is all there is to say.
+/// What a call answered with. A reading command returns what a card draws; a
+/// change returns the receipt for having made it, and the note's file when it
+/// is one on this host.
 enum Answer {
-    Browse(MemoryOutput),
-    Receipt(String),
-}
-
-fn file_origin(dir: &Path, name: &str) -> MemoryOrigin {
-    MemoryOrigin::File {
-        path: dir.join(name).to_string_lossy().into_owned(),
-    }
-}
-
-/// A note as the card and the model both read it: the body without its
-/// frontmatter, and the tags that frontmatter carried stated once.
-fn local_note(dir: &Path, name: &str, content: &str) -> MemoryNote {
-    let (frontmatter, body) = notes::parse_frontmatter(content);
-    MemoryNote {
-        name: name.to_owned(),
-        tokens: estimate_tokens(body),
-        tags: notes::tags_from_frontmatter(frontmatter.as_ref()).unwrap_or_default(),
-        origin: file_origin(dir, name),
-        body: body.to_owned(),
-    }
-}
-
-fn empty_index(directory: Option<String>, notices: Vec<String>) -> MemoryOutput {
-    MemoryOutput::Index {
-        directory,
-        groups: Vec::new(),
-        notices,
-    }
-}
-
-/// How much of a browse the model is charged for. The card draws from the
-/// structure and has its own row budget, so the byte cap is only ever about
-/// what a result costs the context window.
-fn capped_model_text(output: &MemoryOutput) -> String {
-    let hint = match output {
-        MemoryOutput::Notes { notes, .. } if notes.len() > 1 => notes::CAP_HINT_NARROW,
-        MemoryOutput::Notes { .. } => notes::CAP_HINT_REWRITE,
-        MemoryOutput::Index { .. } => notes::CAP_HINT_FILTER,
-    };
-    notes::cap(output.as_display_text(), hint)
-}
-
-fn prune_advisory() -> String {
-    format!(
-        "Consider removing or consolidating stale memories to stay under {} tags.",
-        notes::MAX_TAGS
-    )
-}
-
-impl ToolInvocation for MemoryCall {
-    fn start_header(&self) -> HeaderFuture {
-        let detail = self
-            .path
-            .clone()
-            .or_else(|| (!self.tags.is_empty()).then(|| self.tags.join(",")));
-        HeaderFuture::Ready(HeaderResult::plain(match detail {
-            Some(detail) => format!("{} {detail}", self.command.as_str()),
-            None => self.command.as_str().to_owned(),
-        }))
-    }
-
-    fn permission_scopes(&self) -> crate::tools::registry::BoxFuture<'_, Option<PermissionScopes>> {
-        Box::pin(async move {
-            let dir = self.dir.clone()?;
-            // A path-scoped call approves one file; a tag-scoped one has to
-            // cover the whole directory because it cannot name its targets yet.
-            let scope = match self.path.as_deref() {
-                Some(path) => paths::safe_resolve(&dir, path).unwrap_or(dir),
-                None => dir.join("**"),
-            };
-            Some(PermissionScopes {
-                scopes: vec![scope.to_string_lossy().into_owned()],
-                force_prompt: false,
-                plan_scoped: false,
-            })
-        })
-    }
-
-    fn preflight<'a>(
-        &'a self,
-        ctx: &'a ToolContext,
-    ) -> crate::tools::registry::BoxFuture<'a, Result<Option<PermissionIntent>, ToolError>> {
-        Box::pin(async move {
-            if ctx.workspace_session.is_none() {
-                return Ok(None);
-            }
-            scoped_store(ctx)?;
-            Ok(Some(self.remote_permission_intent()))
-        })
-    }
-
-    /// Browsing a scratchpad is a read; only the two commands that touch a
-    /// note carry the registered mutating effect.
-    fn call_effect(&self, registered: ToolEffect) -> ToolEffect {
-        match self.command {
-            Command::List | Command::Read => ToolEffect::ReadOnly,
-            Command::Write | Command::Delete => registered,
-        }
-    }
-
-    fn mutation_targets(&self, ctx: &ToolContext) -> Vec<PathBuf> {
-        if ctx.workspace_session.is_some() {
-            return Vec::new();
-        }
-        match (self.command, &self.dir, self.path.as_deref()) {
-            (Command::Write | Command::Delete, Some(dir), Some(path)) => {
-                paths::safe_resolve(dir, path).into_iter().collect()
-            }
-            _ => Vec::new(),
-        }
-    }
-
-    /// Notes are Caudra's own state, which no session's file revert covers.
-    fn record_scope(&self, _ctx: &ToolContext, _root: &Path) -> Option<RecordScope> {
-        None
-    }
-
-    fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
-        Box::pin(async move {
-            let answer = match self.run_for_context(ctx) {
-                Ok(answer) => answer,
-                Err(error) => {
-                    return ToolExecResult::failed(error.failure, format!("error: {error}"));
-                }
-            };
-            let receipt = match answer {
-                // A browse is drawn from its structure, and the model reads the
-                // one rendering of it that fits the context window.
-                Answer::Browse(output) => {
-                    let text = capped_model_text(&output);
-                    return ToolExecResult::from(Ok(ToolOutput::Memory(output)))
-                        .with_model_output(Some(text));
-                }
-                Answer::Receipt(receipt) => receipt,
-            };
-            // A write's reply is a receipt. The note is what the reader came
-            // for, and the model already has it, so only the receipt goes back.
-            let note = (self.command == Command::Write)
-                .then_some(self.content.as_deref())
-                .flatten()
-                .filter(|content| !content.trim().is_empty());
-            // Notes live outside the project, where no watch sees them change,
-            // so the host learns of the change from the result.
-            let changed = self
-                .mutation_targets(ctx)
-                .pop()
-                .map(|path| path.to_string_lossy().into_owned());
-            match note {
-                Some(note) => ToolExecResult::from(Ok(ToolOutput::Markdown(note.into())))
-                    .with_model_output(Some(receipt)),
-                None => ToolExecResult::from(Ok(ToolOutput::Markdown(receipt.into()))),
-            }
-            .with_written_path(changed)
-        })
-    }
-}
-
-fn scoped_store(ctx: &ToolContext) -> Result<&LocalDocumentStore, ToolError> {
-    let workspace = ctx
-        .workspace_session
-        .as_ref()
-        .ok_or("remote memory requires a remote workspace session")?;
-    let store = ctx
-        .local_documents
-        .as_ref()
-        .ok_or("local document store is unavailable")?;
-    store.validate_binding(workspace.binding())?;
-    Ok(store)
+    Found(MemoryOutput),
+    Changed {
+        receipt: String,
+        file: Option<PathBuf>,
+    },
 }
 
 impl MemoryCall {
+    fn parse(input: &Value, cwd: Option<PathBuf>) -> Result<Self, ParseError> {
+        let input = validate(&SCHEMA, input.clone())?;
+        let raw = input
+            .get("command")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ParseError::custom("command is required"))?;
+        let command = Command::parse(raw).ok_or_else(|| {
+            ParseError::custom(format!(
+                "unknown command '{raw}'. Valid commands: {}",
+                COMMANDS.join(", ")
+            ))
+        })?;
+        Ok(Self {
+            command,
+            cwd,
+            path: string_field(&input, "path"),
+            content: string_field(&input, "content"),
+            query: string_field(&input, "query"),
+            id: input.get("id").and_then(Value::as_u64),
+            n: input.get("n").and_then(Value::as_u64),
+        })
+    }
+
+    fn request(&self) -> Result<Request<'_>, ToolError> {
+        let path = || {
+            self.path
+                .as_deref()
+                .ok_or_else(|| invalid(format!("{PATH_REQUIRED_FOR} {}", self.command.as_str())))
+        };
+        Ok(match self.command {
+            Command::View => Request::View,
+            Command::Zoom => {
+                let (id, n) = self
+                    .id
+                    .zip(self.n)
+                    .ok_or_else(|| invalid(ZOOM_NEEDS_LINE))?;
+                Request::Zoom { id, n }
+            }
+            Command::Search => {
+                let query = self
+                    .query
+                    .as_deref()
+                    .ok_or_else(|| invalid(SEARCH_NEEDS_QUERY))?;
+                if terms(query).is_empty() {
+                    return Err(invalid(SEARCH_NEEDS_WORDS));
+                }
+                Request::Search(query)
+            }
+            Command::Read => Request::Read(path()?),
+            Command::Write => Request::Write {
+                path: path()?,
+                content: self
+                    .content
+                    .as_deref()
+                    .ok_or_else(|| invalid(WRITE_NEEDS_CONTENT))?,
+            },
+            Command::Delete => Request::Delete(path()?),
+        })
+    }
+
+    /// The local project's notes, or a remote session's, which the document
+    /// store keeps on this machine.
+    fn store(&self, ctx: &ToolContext) -> Result<Arc<MemoryStore>, ToolError> {
+        Ok(match ctx.workspace_session {
+            Some(_) => MemoryStore::for_documents(scoped_store(ctx)?)?,
+            None => {
+                let cwd = self.cwd.as_deref().ok_or(CWD_UNRESOLVED)?;
+                MemoryStore::for_cwd(&StateDir::resolve().map_err(MemoryError::from)?, cwd)?
+            }
+        })
+    }
+
+    /// Reconciles first, so the call sees notes edited outside the tool. A
+    /// failed reconcile only means those edits arrive later.
+    fn answer(
+        &self,
+        store: &MemoryStore,
+        request: Request<'_>,
+        origin: &EntryOrigin,
+    ) -> Result<Answer, ToolError> {
+        if let Err(error) = store.reconcile() {
+            warn!(
+                scope = store.scope(),
+                command = self.command.as_str(),
+                %error,
+                "memory notes not reconciled before a call"
+            );
+        }
+        match request {
+            Request::View => view(store).map(Answer::Found),
+            Request::Zoom { id, n } => zoom(store, id, n).map(Answer::Found),
+            Request::Search(query) => search(store, query).map(Answer::Found),
+            Request::Read(path) => read(store, path).map(Answer::Found),
+            Request::Write { path, content } => write(store, path, content, origin),
+            Request::Delete(path) => delete(store, path, origin),
+        }
+    }
+
+    /// A reading call is drawn from its structure, and the model reads the one
+    /// rendering of it that fits the context window. A change replies with its
+    /// receipt; a write draws the note it stored, which the model already has.
+    fn reply(&self, answer: Result<Answer, ToolError>) -> ToolExecResult {
+        let (receipt, file) = match answer {
+            Err(error) => return ToolExecResult::failed(error.failure, format!("error: {error}")),
+            Ok(Answer::Found(output)) => {
+                let text = capped_model_text(&output);
+                return ToolExecResult::from(Ok(ToolOutput::Memory(output)))
+                    .with_model_output(Some(text));
+            }
+            Ok(Answer::Changed { receipt, file }) => (receipt, file),
+        };
+        let note = (self.command == Command::Write)
+            .then_some(self.content.as_deref())
+            .flatten()
+            .filter(|content| !content.trim().is_empty());
+        // Notes live outside the project, where no watch sees them change, so
+        // the host learns of the change from the result.
+        let changed = file.map(|file| file.to_string_lossy().into_owned());
+        match note {
+            Some(note) => ToolExecResult::from(Ok(ToolOutput::Markdown(note.into())))
+                .with_model_output(Some(receipt)),
+            None => ToolExecResult::from(Ok(ToolOutput::Markdown(receipt.into()))),
+        }
+        .with_written_path(changed)
+    }
+
+    /// What the call acts on, as its header and a remote permission name it.
+    fn subject(&self) -> Option<String> {
+        match self.command {
+            Command::View => None,
+            Command::Zoom => self.id.zip(self.n).map(|(id, n)| format!("{id}+{n}")),
+            Command::Search => self.query.clone(),
+            Command::Read | Command::Write | Command::Delete => self.path.clone(),
+        }
+    }
+
+    fn notes_dir(&self) -> Option<PathBuf> {
+        local_dir(self.cwd.as_deref()?).ok()
+    }
+
+    /// The file of the note the call names, for the commands that name one.
+    fn note_file(&self, dir: &Path) -> Option<PathBuf> {
+        let path = self.path.as_deref().filter(|_| self.command.names_note())?;
+        Some(dir.join(note_name(path).ok()?))
+    }
+
     fn remote_permission_intent(&self) -> PermissionIntent {
-        let detail = self
-            .path
-            .as_deref()
-            .map(str::to_owned)
-            .unwrap_or_else(|| self.tags.join(","));
-        let scope = format!("local-memory:{}:{detail}", self.command.as_str());
+        let scope = format!(
+            "local-memory:{}:{}",
+            self.command.as_str(),
+            self.subject().unwrap_or_default()
+        );
         PermissionIntent::new(
             PermissionScopes::single(scope.clone()),
             vec![PermissionResource {
@@ -820,174 +472,388 @@ impl MemoryCall {
             PermissionRisk::Low,
         )
     }
+}
 
-    fn run_for_context(&self, ctx: &ToolContext) -> Result<Answer, ToolError> {
-        if ctx.workspace_session.is_none() {
-            return self.run_all(&TAG_CACHE);
-        }
-        self.validate()?;
-        let store = scoped_store(ctx)?;
-        let project = store.project_key();
-        let documents = store.list_memories(project)?;
+impl ToolInvocation for MemoryCall {
+    fn start_header(&self) -> HeaderFuture {
+        HeaderFuture::Ready(HeaderResult::plain(match self.subject() {
+            Some(subject) => format!("{} {subject}", self.command.as_str()),
+            None => self.command.as_str().to_owned(),
+        }))
+    }
+
+    fn permission_scopes(&self) -> BoxFuture<'_, Option<PermissionScopes>> {
+        Box::pin(async move {
+            let dir = self.notes_dir()?;
+            // A call naming a note approves that file; the rest read the whole
+            // directory.
+            let scope = self.note_file(&dir).unwrap_or_else(|| dir.join("**"));
+            Some(PermissionScopes {
+                scopes: vec![scope.to_string_lossy().into_owned()],
+                force_prompt: false,
+                plan_scoped: false,
+            })
+        })
+    }
+
+    fn preflight<'a>(
+        &'a self,
+        ctx: &'a ToolContext,
+    ) -> BoxFuture<'a, Result<Option<PermissionIntent>, ToolError>> {
+        Box::pin(async move {
+            if ctx.workspace_session.is_none() {
+                return Ok(None);
+            }
+            scoped_store(ctx)?;
+            Ok(Some(self.remote_permission_intent()))
+        })
+    }
+
+    /// Reading the memory is a read; only the two commands that change a note
+    /// carry the registered mutating effect.
+    fn call_effect(&self, registered: ToolEffect) -> ToolEffect {
         match self.command {
-            Command::List => Ok(Answer::Browse(self.remote_list(&documents))),
-            Command::Read if !self.tags.is_empty() => {
-                self.remote_read_by_tag(&documents).map(Answer::Browse)
-            }
-            Command::Read => self.remote_read_by_path(&documents).map(Answer::Browse),
-            Command::Write => self.remote_write(store, project).map(Answer::Receipt),
-            Command::Delete => self.remote_delete(store, project).map(Answer::Receipt),
+            Command::View | Command::Zoom | Command::Search | Command::Read => ToolEffect::ReadOnly,
+            Command::Write | Command::Delete => registered,
         }
     }
 
-    /// Grouped by tag exactly as a local list is, so the same card draws both.
-    /// A remote note has no path, so its reference is what names it.
-    fn remote_list(&self, documents: &[LocalDocument]) -> MemoryOutput {
-        let wanted = notes::tags_for_filter(&self.tags)
-            .ok()
-            .map(|(tags, _)| tags);
-        let mut by_tag = BTreeMap::<String, Vec<MemoryNoteEntry>>::new();
-        for document in documents {
-            let note = remote_note(document);
-            if wanted
-                .as_ref()
-                .is_some_and(|wanted| !note.tags.iter().any(|tag| wanted.contains(tag)))
-            {
-                continue;
-            }
-            for tag in &note.tags {
-                by_tag
-                    .entry(tag.clone())
-                    .or_default()
-                    .push(MemoryNoteEntry {
-                        name: note.name.clone(),
-                        tokens: note.tokens,
-                        origin: note.origin.clone(),
-                    });
-            }
+    fn mutation_targets(&self, ctx: &ToolContext) -> Vec<PathBuf> {
+        if ctx.workspace_session.is_some()
+            || self.command.access() == PermissionResourceAccess::Read
+        {
+            return Vec::new();
         }
-        let mut groups: Vec<MemoryTagGroup> = by_tag
+        self.notes_dir()
+            .and_then(|dir| self.note_file(&dir))
             .into_iter()
-            .map(|(tag, notes)| MemoryTagGroup { tag, notes })
-            .collect();
-        groups.sort_by(|a, b| b.notes.len().cmp(&a.notes.len()).then(a.tag.cmp(&b.tag)));
-        let notices = match groups.is_empty() {
-            true => Vec::from([notes::NO_MEMORIES.to_owned()]),
-            false => Vec::new(),
-        };
-        MemoryOutput::Index {
-            directory: None,
-            groups,
-            notices,
-        }
+            .collect()
     }
 
-    fn remote_read_by_tag(&self, documents: &[LocalDocument]) -> Result<MemoryOutput, ToolError> {
-        let (wanted, warning) = notes::tags_for_filter(&self.tags).map_err(invalid)?;
-        let read: Vec<MemoryNote> = documents
-            .iter()
-            .map(remote_note)
-            .filter(|note| note.tags.iter().any(|tag| wanted.contains(tag)))
-            .collect();
-        let mut notices: Vec<String> = warning.into_iter().collect();
-        if read.is_empty() {
-            notices.push(notes::NO_MATCH.to_owned());
-        }
-        Ok(MemoryOutput::Notes {
-            directory: None,
-            notes: read,
-            notices,
+    /// Notes are Caudra's own state, which no session's file revert covers.
+    fn record_scope(&self, _ctx: &ToolContext, _root: &Path) -> Option<RecordScope> {
+        None
+    }
+
+    fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
+        Box::pin(async move {
+            let answer = self.request().and_then(|request| {
+                let store = self.store(ctx)?;
+                self.answer(&store, request, &entry_origin(ctx))
+            });
+            self.reply(answer)
         })
-    }
-
-    fn remote_read_by_path(&self, documents: &[LocalDocument]) -> Result<MemoryOutput, ToolError> {
-        let name = self.path.as_deref().unwrap_or_default();
-        let document = documents
-            .iter()
-            .find(|document| document.name.as_deref() == Some(name))
-            .ok_or_else(|| missing(name))?;
-        Ok(MemoryOutput::Notes {
-            directory: None,
-            notes: Vec::from([remote_note(document)]),
-            notices: Vec::new(),
-        })
-    }
-
-    fn remote_write(
-        &self,
-        store: &LocalDocumentStore,
-        project: &caudra_workspace::ProjectKey,
-    ) -> Result<String, ToolError> {
-        let content = self.content.as_deref().unwrap_or_default();
-        if let Some(error) = notes::write_size_error(content) {
-            return Err(invalid(error));
-        }
-        let (tags, note) = notes::tags_for_write(&self.tags).map_err(invalid)?;
-        let body = format!("{}{content}", notes::encode_frontmatter(&tags));
-        let reference =
-            store.write_memory(project, self.path.as_deref().unwrap_or_default(), &body)?;
-        let suffix = note.map_or(String::new(), |note| format!("; {note}"));
-        Ok(format!("wrote memory_ref {}{suffix}", reference.as_str()))
-    }
-
-    fn remote_delete(
-        &self,
-        store: &LocalDocumentStore,
-        project: &caudra_workspace::ProjectKey,
-    ) -> Result<String, ToolError> {
-        let reference = store.delete_memory(project, self.path.as_deref().unwrap_or_default())?;
-        Ok(format!("deleted memory_ref {}", reference.as_str()))
     }
 }
 
-fn document_tags(document: &LocalDocument) -> Vec<String> {
-    let (frontmatter, _) = notes::parse_frontmatter(&document.content);
-    frontmatter
+fn scoped_store(ctx: &ToolContext) -> Result<&Arc<LocalDocumentStore>, ToolError> {
+    let workspace = ctx
+        .workspace_session
         .as_ref()
-        .and_then(|value| value.get("tags"))
-        .and_then(serde_yaml::Value::as_sequence)
-        .into_iter()
-        .flatten()
-        .filter_map(serde_yaml::Value::as_str)
-        .map(str::to_owned)
-        .collect()
+        .ok_or("remote memory requires a remote workspace session")?;
+    let store = ctx
+        .local_documents
+        .as_ref()
+        .ok_or("local document store is unavailable")?;
+    store.validate_binding(workspace.binding())?;
+    Ok(store)
 }
 
-/// The remote twin of [`local_note`]: the same note, named by the reference and
-/// revision that are the only way to reach it, and with the frontmatter split
-/// off so both sides report the body's own cost.
-fn remote_note(document: &LocalDocument) -> MemoryNote {
-    let (_, body) = notes::parse_frontmatter(&document.content);
-    MemoryNote {
-        name: document
-            .name
-            .clone()
-            .unwrap_or_else(|| UNNAMED_REMOTE_NOTE.to_owned()),
-        tokens: estimate_tokens(body),
-        tags: document_tags(document),
-        origin: MemoryOrigin::Document {
-            reference: reference_id(&document.reference).to_owned(),
-            revision: document.revision.as_str().to_owned(),
+fn entry_origin(ctx: &ToolContext) -> EntryOrigin {
+    ctx.session_id.as_ref().map_or(EntryOrigin::External, |id| {
+        EntryOrigin::Session(id.as_str().to_owned())
+    })
+}
+
+fn view(store: &MemoryStore) -> Result<MemoryOutput, ToolError> {
+    let block = store.view()?;
+    let mut notices = Vec::new();
+    if block.hidden > 0 {
+        notices.push(format!("The {} {HIDDEN_ENTRIES}", block.hidden));
+    } else if block.lines.is_empty() {
+        notices.push(notes::NO_MEMORIES.to_owned());
+    }
+    Ok(MemoryOutput::Lines {
+        heading: view_heading(block.through(), block.lines.len()),
+        lines: block
+            .lines
+            .iter()
+            .map(|line| memory_line(&line.part, &line.text, line.pending()))
+            .collect(),
+        notices,
+    })
+}
+
+/// `548 entries in 72 lines, oldest first:`.
+fn view_heading(entries: u64, lines: usize) -> String {
+    let entries = match entries {
+        1 => "1 entry".to_owned(),
+        entries => format!("{entries} entries"),
+    };
+    let lines = match lines {
+        1 => "1 line".to_owned(),
+        lines => format!("{lines} lines"),
+    };
+    format!("{entries} in {lines}, oldest first:")
+}
+
+/// The two lines `id+n` was made from, or for `n` = 1 the entry whole and
+/// what became of it.
+fn zoom(store: &MemoryStore, id: u64, n: u64) -> Result<MemoryOutput, ToolError> {
+    let entries = store
+        .journal()
+        .len(store.scope())
+        .map_err(MemoryError::from)?;
+    let part = tree::zoom(id, n, entries).map_err(|error| invalid(error.to_string()))?;
+    let Some(children) = part.children() else {
+        return entry(store, id);
+    };
+    let tree = store.load()?.tree;
+    Ok(MemoryOutput::Lines {
+        heading: format!("{part} was made from:"),
+        lines: children
+            .iter()
+            .map(|child| memory_line(child, &tree.line(child), !tree.is_built(child)))
+            .collect(),
+        notices: Vec::new(),
+    })
+}
+
+fn entry(store: &MemoryStore, seq: u64) -> Result<MemoryOutput, ToolError> {
+    let scope = store.scope();
+    let (entry, later) = store
+        .journal()
+        .read(|journal| Ok((journal.entry(scope, seq)?, journal.entries(scope, seq + 1)?)))
+        .map_err(MemoryError::from)?;
+    let entry = entry.ok_or_else(|| {
+        ToolError::new(ToolFailure::NotFound, format!("entry {seq} does not exist"))
+    })?;
+    let notice = status_notice(&entry.meta, status(&entry.meta, &later));
+    Ok(MemoryOutput::Notes {
+        directory: directory(store),
+        notes: Vec::from([memory_note(store, &entry.meta.name, entry.body)?]),
+        notices: Vec::from([notice]),
+    })
+}
+
+/// What became of the entry, told by the later entries of the same name.
+fn status(meta: &EntryMeta, later: &[EntryMeta]) -> EntryStatus {
+    if meta.forgotten {
+        return EntryStatus::Forgotten;
+    }
+    match later.iter().find(|next| next.name == meta.name) {
+        None => EntryStatus::Current,
+        Some(next) => match next.kind {
+            EntryKind::Note => EntryStatus::Rewritten(next.seq),
+            EntryKind::Delete => EntryStatus::Deleted(next.seq),
         },
-        body: body.to_owned(),
     }
 }
 
-fn reference_id(reference: &LocalDocumentRef) -> &str {
-    match reference {
-        LocalDocumentRef::Memory(reference) => reference.as_str(),
-        LocalDocumentRef::Plan(reference) => reference.as_str(),
+/// `Entry 12, note ci.md: rewritten by entry 40.`
+fn status_notice(meta: &EntryMeta, status: EntryStatus) -> String {
+    let status = match status {
+        EntryStatus::Current => ENTRY_CURRENT.to_owned(),
+        EntryStatus::Rewritten(seq) => format!("{REWRITTEN_BY} {seq}"),
+        EntryStatus::Deleted(seq) => format!("{DELETED_BY} {seq}"),
+        EntryStatus::Forgotten => ENTRY_FORGOTTEN.to_owned(),
+    };
+    format!(
+        "Entry {}, {} {}: {status}.",
+        meta.seq,
+        leaf_kind(meta).as_str(),
+        meta.name
+    )
+}
+
+fn search(store: &MemoryStore, query: &str) -> Result<MemoryOutput, ToolError> {
+    let hits: Vec<MemoryHit> = store
+        .search(query)?
+        .into_iter()
+        .map(|hit| MemoryHit {
+            seq: hit.seq,
+            name: hit.name,
+            heading: hit.heading,
+            line: hit.line,
+        })
+        .collect();
+    let notices = match hits.is_empty() {
+        true => Vec::from([NO_HITS.to_owned()]),
+        false => Vec::new(),
+    };
+    Ok(MemoryOutput::Hits {
+        query: query.to_owned(),
+        hits,
+        notices,
+    })
+}
+
+fn read(store: &MemoryStore, path: &str) -> Result<MemoryOutput, ToolError> {
+    let name = note_name(path)?;
+    let entry = store
+        .journal()
+        .live(store.scope(), &name)
+        .map_err(MemoryError::from)?
+        .ok_or_else(|| missing(&name))?;
+    Ok(MemoryOutput::Notes {
+        directory: directory(store),
+        notes: Vec::from([memory_note(store, &name, entry.body)?]),
+        notices: Vec::new(),
+    })
+}
+
+fn write(
+    store: &MemoryStore,
+    path: &str,
+    content: &str,
+    origin: &EntryOrigin,
+) -> Result<Answer, ToolError> {
+    if let Some(error) = notes::write_size_error(content) {
+        return Err(invalid(error));
+    }
+    let name = note_name(path)?;
+    let receipt = match store.write(&name, content, origin)? {
+        Some(seq) => format!("wrote {name} (entry {seq})"),
+        None => format!("{name} {UNCHANGED}"),
+    };
+    Ok(Answer::Changed {
+        receipt,
+        file: local_file(store, &name),
+    })
+}
+
+fn delete(store: &MemoryStore, path: &str, origin: &EntryOrigin) -> Result<Answer, ToolError> {
+    let name = note_name(path)?;
+    let receipt = match store.delete(&name, origin) {
+        Ok(Some(seq)) => format!("deleted {name} (entry {seq}; {KEPT_VERSIONS})"),
+        Ok(None) => format!("deleted {name}"),
+        Err(error) if not_found(&error) => return Err(missing(&name)),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(Answer::Changed {
+        receipt,
+        file: local_file(store, &name),
+    })
+}
+
+fn not_found(error: &MemoryError) -> bool {
+    matches!(
+        error,
+        MemoryError::Io(error) | MemoryError::Journal(MemoryJournalError::Io(error))
+            if error.kind() == io::ErrorKind::NotFound
+    )
+}
+
+/// The notes directory, which a reader can edit notes in. A remote session's
+/// notes have no path to name.
+fn directory(store: &MemoryStore) -> Option<String> {
+    match store.source() {
+        Source::Local(dir) => Some(dir.display().to_string()),
+        Source::Documents(_) => None,
+    }
+}
+
+fn local_file(store: &MemoryStore, name: &str) -> Option<PathBuf> {
+    match store.source() {
+        Source::Local(dir) => Some(dir.join(name)),
+        Source::Documents(_) => None,
+    }
+}
+
+/// A note as the card and the model both read it. A note on this host is
+/// named by its file; a remote one by its reference and the revision of the
+/// text shown, since it has no path on this host.
+fn memory_note(store: &MemoryStore, name: &str, body: String) -> Result<MemoryNote, ToolError> {
+    let origin = match store.source() {
+        Source::Local(dir) => MemoryOrigin::File {
+            path: dir.join(name).to_string_lossy().into_owned(),
+        },
+        Source::Documents(documents) => MemoryOrigin::Document {
+            reference: documents
+                .memory_reference(documents.project_key(), name)?
+                .as_str()
+                .to_owned(),
+            revision: hex_encode(&body_hash(&body)),
+        },
+    };
+    Ok(MemoryNote {
+        name: name.to_owned(),
+        tokens: estimate_tokens(&body),
+        tags: Vec::new(),
+        origin,
+        body,
+    })
+}
+
+fn memory_line(part: &Part, text: &str, pending: bool) -> MemoryLine {
+    MemoryLine {
+        id: part.start(),
+        count: part.count(),
+        text: text.replace(['\n', '\r'], " "),
+        pending,
+    }
+}
+
+/// How much of an answer the model is charged for. The card draws from the
+/// structure and has its own row budget, so the byte cap is only ever about
+/// what a result costs the context window.
+fn capped_model_text(output: &MemoryOutput) -> String {
+    let hint = match output {
+        MemoryOutput::Notes { .. } => notes::CAP_HINT_REWRITE,
+        MemoryOutput::Lines { .. } | MemoryOutput::Hits { .. } | MemoryOutput::Index { .. } => {
+            notes::CAP_HINT_ZOOM
+        }
+    };
+    notes::cap(output.as_display_text(), hint)
+}
+
+fn invalid(message: impl Into<String>) -> ToolError {
+    ToolError::new(ToolFailure::InvalidInput, message)
+}
+
+fn missing(name: &str) -> ToolError {
+    ToolError::new(ToolFailure::NotFound, format!("'{name}' does not exist"))
+}
+
+impl From<MemoryError> for ToolError {
+    fn from(error: MemoryError) -> Self {
+        if let MemoryError::Documents(error) = error {
+            return error.into();
+        }
+        let failure = match &error {
+            MemoryError::InvalidName { .. }
+            | MemoryError::TooLarge { .. }
+            | MemoryError::Journal(MemoryJournalError::TooLarge { .. }) => {
+                ToolFailure::InvalidInput
+            }
+            MemoryError::Io(error) | MemoryError::Journal(MemoryJournalError::Io(error)) => {
+                ToolFailure::from(error)
+            }
+            MemoryError::State(_) | MemoryError::Journal(_) | MemoryError::Documents(_) => {
+                ToolFailure::Other
+            }
+        };
+        Self::new(failure, error.to_string())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::slice;
-    use std::sync::Arc;
+    use std::fs;
+
+    use caudra_config::{
+        DefaultEffect, Effect, FeatureFlags, PermissionRule, PermissionsConfig, ToolKey,
+    };
+    use caudra_storage::id::SessionRef;
+    use serde_json::json;
+    use tempfile::TempDir;
+    use test_case::test_case;
 
     use super::*;
     use crate::AgentMode;
     use crate::agent::tool_dispatch::{self, Emit};
+    use crate::memory::store::{NAME_NOT_MARKDOWN, NAME_TRAVERSAL};
+    use crate::memory::tree::{NODE, PENDING, VIEW, ZoomError};
     use crate::permissions::{
         PERMISSION_DENIED_PREFIX, PermissionExecutorKind, PermissionManager, PermissionSubject,
     };
@@ -996,23 +862,654 @@ mod tests {
     use crate::tools::test_support::stub_ctx;
     use crate::tools::{MEMORY_TOOL_NAME, PLAN_WRITE_RESTRICTED};
     use crate::types::MEMORY_DIRECTORY_LABEL;
-    use caudra_config::{
-        DefaultEffect, Effect, FeatureFlags, PermissionRule, PermissionsConfig, ToolKey,
-    };
-    use caudra_providers::token_label;
-    use caudra_storage::StateDir;
-    use caudra_storage::id::SessionRef;
-    use caudra_storage::local_documents::DocumentRevision;
-    use caudra_workspace::MemoryRef;
-    use serde_json::json;
-    use tempfile::TempDir;
-    use test_case::test_case;
 
     const REGISTERED_EFFECT: ToolEffect = ToolEffect::Mutating;
+    const SCOPE: &str = "projects/test";
+    const MEMORIES: &str = "memories";
+    const SESSION: &str = "session-a";
+    const NOTE: &str = "a.md";
+    const OTHER: &str = "b.md";
+    const BODY: &str = "# Alpha\nfirst body";
+    const EDITED: &str = "# Alpha\nedited body";
+    const NOTE_BODY: &str = "# Session picker\n\nThe picker merges **two** sources.";
     const NOTE_PATH: &str = "note.md";
     const NOTE_CONTENT: &str = "retained memory";
-    const NOTE_TAG: &str = "architecture";
     const WRONG_OWNER: &str = "local document does not belong to this project or session";
+    const FOUND_MSG: &str = "a reading command answers with what a card draws";
+    const BODY_MSG: &str = "the reader sees the note, the model sees the receipt";
+    const CHANGED_NOTE_MSG: &str = "a local change names its note, and nothing else names one";
+    const INCOHERENT_MSG: &str = "a call missing what its command needs must not run";
+
+    struct Fixture {
+        _state: TempDir,
+        dir: PathBuf,
+        store: MemoryStore,
+    }
+
+    /// A store on a temporary state directory, which is the only way to run a
+    /// command without touching the developer's real notes.
+    fn fixture() -> Fixture {
+        let state = tempdir();
+        let dir = state.path().join(MEMORIES);
+        let store = MemoryStore::open(
+            &StateDir::from_path(state.path().to_path_buf()),
+            SCOPE.to_owned(),
+            Source::Local(dir.clone()),
+        )
+        .unwrap();
+        Fixture {
+            _state: state,
+            dir,
+            store,
+        }
+    }
+
+    impl Fixture {
+        fn answer(&self, input: Value) -> Result<Answer, ToolError> {
+            let call = call(input);
+            call.request()
+                .and_then(|request| call.answer(&self.store, request, &session()))
+        }
+
+        /// What the model reads: a reading command's one rendering, or a
+        /// change's receipt.
+        fn text(&self, input: Value) -> Result<String, ToolError> {
+            self.answer(input).map(|answer| match answer {
+                Answer::Found(output) => capped_model_text(&output),
+                Answer::Changed { receipt, .. } => receipt,
+            })
+        }
+
+        fn found(&self, input: Value) -> MemoryOutput {
+            match self.answer(input) {
+                Ok(Answer::Found(output)) => output,
+                Ok(Answer::Changed { receipt, .. }) => panic!("{FOUND_MSG}, got {receipt}"),
+                Err(error) => panic!("{FOUND_MSG}, got {error}"),
+            }
+        }
+
+        fn execute(&self, input: Value) -> ToolExecResult {
+            let call = call(input);
+            call.reply(
+                call.request()
+                    .and_then(|request| call.answer(&self.store, request, &session())),
+            )
+        }
+
+        fn write(&self, name: &str, content: &str) {
+            self.text(write_input(name, content)).unwrap();
+        }
+
+        fn put(&self, name: &str, content: &str) {
+            fs::create_dir_all(&self.dir).unwrap();
+            fs::write(self.dir.join(name), content).unwrap();
+        }
+    }
+
+    fn session() -> EntryOrigin {
+        EntryOrigin::Session(SESSION.to_owned())
+    }
+
+    fn call(input: Value) -> MemoryCall {
+        MemoryCall::parse(&input, None).expect("valid input")
+    }
+
+    fn call_at(input: Value, cwd: &Path) -> MemoryCall {
+        MemoryCall::parse(&input, Some(cwd.to_path_buf())).expect("valid input")
+    }
+
+    fn write_input(path: &str, content: &str) -> Value {
+        json!({ "command": "write", "path": path, "content": content })
+    }
+
+    fn zoom_input(id: u64, n: u64) -> Value {
+        json!({ "command": "zoom", "id": id, "n": n })
+    }
+
+    fn markdown(result: ToolExecResult) -> String {
+        match result.output.expect("a call that succeeded") {
+            ToolOutput::Markdown(text) => text.text,
+            other => panic!("{BODY_MSG}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_write_and_a_delete_name_the_entries_they_made() {
+        let notes = fixture();
+
+        assert_eq!(
+            notes.text(write_input(NOTE, BODY)).unwrap(),
+            format!("wrote {NOTE} (entry 0)")
+        );
+        assert_eq!(fs::read_to_string(notes.dir.join(NOTE)).unwrap(), BODY);
+        assert_eq!(
+            notes
+                .text(json!({ "command": "delete", "path": NOTE }))
+                .unwrap(),
+            format!("deleted {NOTE} (entry 1; {KEPT_VERSIONS})")
+        );
+        assert!(!notes.dir.join(NOTE).exists());
+    }
+
+    #[test]
+    fn rewriting_a_note_with_its_own_text_adds_no_entry() {
+        let notes = fixture();
+        notes.write(NOTE, BODY);
+
+        assert_eq!(
+            notes.text(write_input(NOTE, BODY)).unwrap(),
+            format!("{NOTE} {UNCHANGED}")
+        );
+        assert_eq!(notes.store.journal().len(SCOPE).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_change_is_recorded_as_the_calling_sessions() {
+        let mut ctx = stub_ctx(&AgentMode::Build);
+        assert_eq!(entry_origin(&ctx), EntryOrigin::External);
+
+        let session = SessionRef::generate();
+        let expected = EntryOrigin::Session(session.as_str().to_owned());
+        ctx.session_id = Some(session);
+
+        assert_eq!(entry_origin(&ctx), expected);
+    }
+
+    /// A note edited outside the tool is an entry before the call reads, and
+    /// reads back as the journal keeps it: without the tags earlier releases
+    /// kept in frontmatter.
+    #[test]
+    fn a_read_returns_a_note_edited_elsewhere_without_its_frontmatter() {
+        let notes = fixture();
+        notes.put(NOTE, &format!("---\ntags: [ui]\n---\n{NOTE_BODY}"));
+
+        let MemoryOutput::Notes {
+            notes: read,
+            notices,
+            directory,
+        } = notes.found(json!({ "command": "read", "path": NOTE }))
+        else {
+            panic!("{FOUND_MSG}");
+        };
+
+        assert!(notices.is_empty());
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].body, NOTE_BODY);
+        assert!(read[0].tags.is_empty());
+        assert_eq!(
+            read[0].origin.path(),
+            Some(notes.dir.join(NOTE).to_string_lossy().as_ref())
+        );
+        assert_eq!(directory, Some(notes.dir.display().to_string()));
+    }
+
+    #[test_case(json!({ "command": "read", "path": "gone.md" }) ; "reading")]
+    #[test_case(json!({ "command": "delete", "path": "gone.md" }) ; "deleting")]
+    fn a_missing_note_is_not_found(input: Value) {
+        let notes = fixture();
+        notes.write(NOTE, BODY);
+
+        let error = notes.text(input).unwrap_err();
+
+        assert_eq!(error.failure, ToolFailure::NotFound);
+        assert_eq!(error.message, missing("gone.md").message);
+    }
+
+    #[test]
+    fn a_traversing_path_is_refused_before_anything_is_written() {
+        let notes = fixture();
+
+        let error = notes.text(write_input("../escape.md", BODY)).unwrap_err();
+
+        assert_eq!(error.failure, ToolFailure::InvalidInput);
+        assert_eq!(error.message, NAME_TRAVERSAL);
+        assert!(!notes.dir.with_file_name("escape.md").exists());
+    }
+
+    #[test]
+    fn an_oversized_write_never_reaches_disk() {
+        let notes = fixture();
+
+        let error = notes
+            .text(write_input(NOTE, &"x".repeat(notes::MAX_FILE_BYTES + 1)))
+            .unwrap_err();
+
+        assert_eq!(error.failure, ToolFailure::InvalidInput);
+        assert!(!notes.dir.join(NOTE).exists());
+    }
+
+    #[test_case(json!({ "command": "read" }), format!("{PATH_REQUIRED_FOR} read") ; "read_needs_a_path")]
+    #[test_case(json!({ "command": "write", "content": "x" }), format!("{PATH_REQUIRED_FOR} write") ; "write_needs_a_path")]
+    #[test_case(json!({ "command": "write", "path": NOTE }), WRITE_NEEDS_CONTENT.to_owned() ; "write_needs_content")]
+    #[test_case(json!({ "command": "delete" }), format!("{PATH_REQUIRED_FOR} delete") ; "delete_needs_a_path")]
+    #[test_case(json!({ "command": "zoom", "id": 0 }), ZOOM_NEEDS_LINE.to_owned() ; "zoom_needs_n")]
+    #[test_case(json!({ "command": "zoom", "id": -1, "n": 1 }), ZOOM_NEEDS_LINE.to_owned() ; "zoom_needs_a_whole_id")]
+    #[test_case(json!({ "command": "search" }), SEARCH_NEEDS_QUERY.to_owned() ; "search_needs_a_query")]
+    #[test_case(json!({ "command": "search", "query": "-- !" }), SEARCH_NEEDS_WORDS.to_owned() ; "search_needs_words")]
+    fn an_incoherent_call_is_rejected(input: Value, expected: String) {
+        let Err(error) = call(input).request() else {
+            panic!("{INCOHERENT_MSG}");
+        };
+        assert_eq!(error.failure, ToolFailure::InvalidInput);
+        assert_eq!(error.message, expected);
+    }
+
+    #[test_case("list" ; "the_retired_list")]
+    #[test_case("tags" ; "the_retired_tags")]
+    fn an_unknown_command_is_refused_with_the_valid_ones(command: &str) {
+        let Err(error) = MemoryTool.parse(&json!({ "command": command })) else {
+            panic!("an unknown command must not parse");
+        };
+        let error = error.to_string();
+        assert!(error.contains(command), "{error}");
+        for valid in COMMANDS {
+            assert!(error.contains(valid), "{error}");
+        }
+    }
+
+    #[test_case(json!({ "command": "view" }), "view" ; "view")]
+    #[test_case(json!({ "command": "zoom", "id": 368, "n": 8 }), "zoom 368+8" ; "zoom")]
+    #[test_case(json!({ "command": "search", "query": "flaky tests" }), "search flaky tests" ; "search")]
+    #[test_case(json!({ "command": "read", "path": NOTE }), "read a.md" ; "read")]
+    fn the_header_describes_the_call(input: Value, expected: &str) {
+        let HeaderResult::Plain(header) = smol::block_on(call(input).start_header()) else {
+            panic!("memory headers are plain");
+        };
+        assert_eq!(header, expected);
+    }
+
+    #[test]
+    fn a_view_lists_one_addressed_line_per_entry_under_its_heading() {
+        let notes = fixture();
+        notes.write(NOTE, BODY);
+        notes.write(OTHER, EDITED);
+
+        assert_eq!(
+            notes.text(json!({ "command": "view" })).unwrap(),
+            format!(
+                "{}\n0+1|note {NOTE} {}\n1+1|note {OTHER} {}",
+                view_heading(2, 2),
+                BODY.replace('\n', " "),
+                EDITED.replace('\n', " ")
+            )
+        );
+    }
+
+    #[test]
+    fn an_empty_view_says_so() {
+        let output = fixture().found(json!({ "command": "view" }));
+
+        assert!(output.is_empty());
+        assert_eq!(output.notices(), [notes::NO_MEMORIES.to_owned()]);
+    }
+
+    /// Entries kept word for word and too long to merge without a model leave
+    /// the view over budget until they are summarized. What is left fills the
+    /// budget, and the model still reads all of it.
+    #[test]
+    fn a_view_over_budget_says_how_many_of_the_oldest_entries_it_leaves_out() {
+        let notes = fixture();
+        let body = "x".repeat(NODE - 32);
+        for index in 0..VIEW / NODE + 4 {
+            notes.write(&format!("n{index}.md"), &body);
+        }
+
+        let output = notes.found(json!({ "command": "view" }));
+
+        let [notice] = output.notices() else {
+            panic!("one notice: {:?}", output.notices());
+        };
+        assert!(notice.ends_with(HIDDEN_ENTRIES), "{notice}");
+        assert_eq!(capped_model_text(&output), output.as_display_text());
+    }
+
+    #[test_case(1, 1, "1 entry in 1 line, oldest first:" ; "one_of_each")]
+    #[test_case(548, 72, "548 entries in 72 lines, oldest first:" ; "many")]
+    fn a_view_heading_counts_entries_and_lines(entries: u64, lines: usize, expected: &str) {
+        assert_eq!(view_heading(entries, lines), expected);
+    }
+
+    #[test]
+    fn zoom_opens_a_line_into_the_two_it_was_made_from() {
+        let notes = fixture();
+        notes.write(NOTE, BODY);
+        notes.write(OTHER, &"x".repeat(NODE));
+
+        let MemoryOutput::Lines { heading, lines, .. } = notes.found(zoom_input(0, 2)) else {
+            panic!("{FOUND_MSG}");
+        };
+
+        assert_eq!(heading, "0+2 was made from:");
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| (line.id, line.count, line.pending))
+                .collect::<Vec<_>>(),
+            [(0, 1, false), (1, 1, true)]
+        );
+        assert_eq!(
+            lines[0].text,
+            format!("note {NOTE} {}", BODY.replace('\n', " "))
+        );
+        assert!(lines[1].text.starts_with(PENDING), "{}", lines[1].text);
+    }
+
+    /// Entries 0 to 3: `a.md` written then rewritten, `b.md` written then
+    /// deleted.
+    fn history() -> Fixture {
+        let notes = fixture();
+        notes.write(NOTE, BODY);
+        notes.write(NOTE, EDITED);
+        notes.write(OTHER, BODY);
+        notes
+            .text(json!({ "command": "delete", "path": OTHER }))
+            .unwrap();
+        notes
+    }
+
+    #[test_case(0, BODY, format!("note {NOTE}: {REWRITTEN_BY} 1") ; "a_rewritten_note")]
+    #[test_case(1, EDITED, format!("note {NOTE}: {ENTRY_CURRENT}") ; "the_current_note")]
+    #[test_case(2, BODY, format!("note {OTHER}: {DELETED_BY} 3") ; "a_deleted_note")]
+    #[test_case(3, "", format!("delete {OTHER}: {ENTRY_CURRENT}") ; "the_deletion_itself")]
+    fn zooming_into_one_entry_reads_it_whole_with_what_became_of_it(
+        seq: u64,
+        body: &str,
+        status: String,
+    ) {
+        let MemoryOutput::Notes {
+            notes: read,
+            notices,
+            ..
+        } = history().found(zoom_input(seq, 1))
+        else {
+            panic!("{FOUND_MSG}");
+        };
+
+        assert_eq!(notices, [format!("Entry {seq}, {status}.")]);
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].body, body);
+    }
+
+    #[test]
+    fn a_forgotten_entry_says_its_text_is_gone() {
+        let notes = fixture();
+        notes.write(NOTE, BODY);
+        notes.store.forget(NOTE).unwrap();
+
+        let MemoryOutput::Notes {
+            notes: read,
+            notices,
+            ..
+        } = notes.found(zoom_input(0, 1))
+        else {
+            panic!("{FOUND_MSG}");
+        };
+
+        assert_eq!(
+            notices,
+            [format!("Entry 0, forgotten {NOTE}: {ENTRY_FORGOTTEN}.")]
+        );
+        assert!(!read[0].body.contains(BODY), "{}", read[0].body);
+    }
+
+    #[test_case(0, 3, ZoomError::NotPowerOfTwo(3) ; "n_not_a_power_of_two")]
+    #[test_case(1, 2, ZoomError::Misaligned { id: 1, n: 2 } ; "id_not_a_multiple_of_n")]
+    #[test_case(0, 4, ZoomError::PastEnd { id: 0, n: 4, entries: 2 } ; "past_the_last_entry")]
+    fn a_zoom_off_the_tree_is_refused(id: u64, n: u64, expected: ZoomError) {
+        let notes = fixture();
+        notes.write(NOTE, BODY);
+        notes.write(OTHER, BODY);
+
+        let error = notes.text(zoom_input(id, n)).unwrap_err();
+
+        assert_eq!(error.failure, ToolFailure::InvalidInput);
+        assert_eq!(error.message, expected.to_string());
+    }
+
+    /// A word in a note's name outweighs one in its text, and of two notes
+    /// that match alike the newer comes first.
+    #[test]
+    fn search_ranks_name_matches_first_then_the_newest() {
+        let notes = fixture();
+        notes.write("flaky-tests.md", "# Flaky tests\nRetry the suite once.");
+        notes.write("ci.md", "# CI\nThe flaky suite runs nightly.");
+        notes.write("release.md", "# Release\nA flaky upload retries.");
+        notes.write("unrelated.md", "# Other\nNothing to see.");
+
+        let MemoryOutput::Hits { hits, notices, .. } =
+            notes.found(json!({ "command": "search", "query": "Flaky" }))
+        else {
+            panic!("{FOUND_MSG}");
+        };
+
+        assert!(notices.is_empty());
+        assert_eq!(
+            hits.iter()
+                .map(|hit| (hit.seq, hit.name.as_str()))
+                .collect::<Vec<_>>(),
+            [(0, "flaky-tests.md"), (2, "release.md"), (1, "ci.md")]
+        );
+        assert_eq!(hits[1].heading, "Release");
+        assert_eq!(hits[1].line.as_deref(), Some("A flaky upload retries."));
+    }
+
+    #[test]
+    fn a_search_that_finds_nothing_says_so() {
+        let notes = fixture();
+        notes.write(NOTE, BODY);
+
+        let output = notes.found(json!({ "command": "search", "query": "absent" }));
+
+        assert!(output.is_empty());
+        assert_eq!(output.as_display_text(), NO_HITS);
+    }
+
+    /// A reading call has one answer, so both sides read it: the reader gets
+    /// the structure the card draws, and the model the one rendering of it.
+    #[test_case(json!({ "command": "view" }) ; "a_view")]
+    #[test_case(zoom_input(0, 1) ; "a_zoom")]
+    #[test_case(json!({ "command": "search", "query": "picker" }) ; "a_search")]
+    #[test_case(json!({ "command": "read", "path": NOTE }) ; "a_read")]
+    fn a_reading_call_shows_the_model_what_the_reader_sees(input: Value) {
+        let notes = fixture();
+        notes.write(NOTE, NOTE_BODY);
+
+        let out = notes.execute(input);
+
+        let Ok(ToolOutput::Memory(output)) = &out.output else {
+            panic!("{FOUND_MSG}");
+        };
+        assert_eq!(
+            out.model_output.as_deref(),
+            Some(output.as_display_text().as_str())
+        );
+        assert!(output.as_display_text().contains("picker"));
+    }
+
+    #[test]
+    fn a_read_reports_the_directory_so_notes_can_be_edited() {
+        let notes = fixture();
+        notes.write(NOTE, BODY);
+
+        let out = notes
+            .text(json!({ "command": "read", "path": NOTE }))
+            .unwrap();
+
+        assert!(
+            out.starts_with(&format!("{MEMORY_DIRECTORY_LABEL}{}", notes.dir.display())),
+            "{out}"
+        );
+    }
+
+    /// A write's reply is a receipt, so rendering it is rendering nothing. The
+    /// note is what the reader came for, and the model wrote it and does not
+    /// need it back.
+    #[test]
+    fn a_write_draws_the_note_and_replies_with_its_receipt() {
+        let out = fixture().execute(write_input(NOTE, NOTE_BODY));
+
+        assert_eq!(out.model_output, Some(format!("wrote {NOTE} (entry 0)")));
+        assert_eq!(markdown(out), NOTE_BODY, "{BODY_MSG}");
+    }
+
+    /// Nothing to render is not a reason to render nothing: an empty note
+    /// would leave the row with no body at all, so the receipt stands in.
+    #[test]
+    fn a_blank_note_falls_back_to_its_receipt() {
+        let out = fixture().execute(write_input(NOTE, "  \n "));
+
+        assert_eq!(out.model_output, None, "{BODY_MSG}");
+        assert_eq!(markdown(out), format!("wrote {NOTE} (entry 0)"));
+    }
+
+    /// The notes live outside the project, so the host only learns a tab on
+    /// one is stale from the call that changed it.
+    #[test_case(write_input(NOTE, EDITED), true ; "a_write")]
+    #[test_case(json!({ "command": "delete", "path": NOTE }), true ; "a_delete")]
+    #[test_case(json!({ "command": "read", "path": NOTE }), false ; "a_read")]
+    fn a_local_change_names_the_note_it_changed(input: Value, changes: bool) {
+        let notes = fixture();
+        notes.write(NOTE, BODY);
+
+        let out = notes.execute(input);
+
+        let expected = changes.then(|| notes.dir.join(NOTE).to_string_lossy().into_owned());
+        assert_eq!(out.written_path, expected, "{CHANGED_NOTE_MSG}");
+    }
+
+    /// The call is refused before any store is opened, so a bad call never
+    /// touches the notes.
+    #[test]
+    fn a_failing_call_is_reported_as_a_tool_error() {
+        let parsed = MemoryTool
+            .parse(&json!({ "command": "read" }))
+            .expect("valid input");
+
+        let out = smol::block_on(parsed.execute(&stub_ctx(&AgentMode::Build)));
+
+        assert!(out.is_error);
+        assert_eq!(out.failure, Some(ToolFailure::InvalidInput));
+        assert!(out.output.unwrap_err().starts_with("error: "));
+    }
+
+    /// Write and delete declare their target so the permission layer can see
+    /// the file before it changes.
+    #[test_case(write_input(NOTE, BODY), true ; "a_write")]
+    #[test_case(json!({ "command": "delete", "path": NOTE }), true ; "a_delete")]
+    #[test_case(json!({ "command": "read", "path": NOTE }), false ; "a_read")]
+    #[test_case(json!({ "command": "view" }), false ; "a_view")]
+    fn a_mutating_call_declares_the_file_it_touches(input: Value, mutates: bool) {
+        let cwd = tempdir();
+        let dir = local_dir(cwd.path()).unwrap();
+
+        let targets = call_at(input, cwd.path()).mutation_targets(&stub_ctx(&AgentMode::Build));
+
+        let expected: Vec<PathBuf> = mutates.then(|| dir.join(NOTE)).into_iter().collect();
+        assert_eq!(targets, expected);
+    }
+
+    #[test]
+    fn a_note_is_never_recorded_even_inside_the_session_directory() {
+        let cwd = tempdir();
+        let write = call_at(write_input(NOTE, BODY), cwd.path());
+        assert_eq!(
+            write.record_scope(&stub_ctx(&AgentMode::Build), cwd.path()),
+            None
+        );
+    }
+
+    /// The registration is mutating so a change is gated; reading has to
+    /// report itself as the read it is or plan mode refuses it.
+    #[test_case("view", ToolEffect::ReadOnly ; "view_is_a_read")]
+    #[test_case("zoom", ToolEffect::ReadOnly ; "zoom_is_a_read")]
+    #[test_case("search", ToolEffect::ReadOnly ; "search_is_a_read")]
+    #[test_case("read", ToolEffect::ReadOnly ; "read_is_a_read")]
+    #[test_case("write", REGISTERED_EFFECT ; "write_keeps_the_registered_effect")]
+    #[test_case("delete", REGISTERED_EFFECT ; "delete_keeps_the_registered_effect")]
+    fn the_call_effect_follows_the_command(command: &str, expected: ToolEffect) {
+        let parsed = call(json!({ "command": command, "path": NOTE, "content": "x" }));
+        assert_eq!(parsed.call_effect(REGISTERED_EFFECT), expected);
+    }
+
+    #[test_case(json!({ "command": "view" }) ; "a_view")]
+    #[test_case(json!({ "command": "search", "query": "x", "path": NOTE }) ; "a_search")]
+    #[test_case(zoom_input(0, 1) ; "a_zoom")]
+    fn a_call_naming_no_note_asks_for_the_whole_directory(input: Value) {
+        let cwd = tempdir();
+        let dir = local_dir(cwd.path()).unwrap();
+
+        let scopes = smol::block_on(call_at(input, cwd.path()).permission_scopes()).unwrap();
+
+        assert_eq!(
+            scopes.scopes,
+            vec![dir.join("**").to_string_lossy().into_owned()]
+        );
+    }
+
+    #[test]
+    fn a_call_naming_a_note_asks_only_for_that_file() {
+        let cwd = tempdir();
+        let dir = local_dir(cwd.path()).unwrap();
+        let read = call_at(json!({ "command": "read", "path": NOTE }), cwd.path());
+
+        let scopes = smol::block_on(read.permission_scopes()).unwrap();
+
+        assert_eq!(
+            scopes.scopes,
+            vec![dir.join(NOTE).to_string_lossy().into_owned()]
+        );
+    }
+
+    /// Every note-touching tool needs a rule for every directory notes can
+    /// live in, or the model gets a prompt for its own scratchpad.
+    #[test]
+    fn permission_rules_cover_each_policy_tool() {
+        let temp = tempdir();
+        let rules = permission_rules(temp.path());
+        assert!(!rules.is_empty(), "the state directory always resolves");
+        for tool in POLICY_TOOLS {
+            assert!(
+                rules.iter().any(|rule| {
+                    matches!(&rule.tool, caudra_config::ToolKey::Native(name) if &**name == *tool)
+                }),
+                "no rule for {tool}"
+            );
+        }
+        assert!(
+            rules
+                .iter()
+                .all(|rule| rule.effect == caudra_config::Effect::Allow),
+            "memory rules only ever grant"
+        );
+        assert!(
+            rules
+                .iter()
+                .all(|rule| rule.scope.as_ref().is_some_and(|s| s.ends_with("/**"))),
+            "rules are directory-scoped"
+        );
+    }
+
+    #[test]
+    fn memory_inventory_lists_each_file_once_with_on_load_body_tokens() {
+        const INVENTORY_BODY: &str = "remember this exact convention";
+        let notes = fixture();
+        notes.put(
+            "project.md",
+            &format!("---\ntags: [project, rust]\n---\n{INVENTORY_BODY}"),
+        );
+
+        let found = inventory_dir(&notes.dir, &Mutex::new(notes::TokenCache::default()));
+
+        assert_eq!(found.directory, notes.dir);
+        assert_eq!(found.unreadable_files, 0);
+        assert_eq!(
+            found.notes,
+            [MemoryNoteInventory {
+                name: "project.md".to_owned(),
+                on_load_tokens: estimate_tokens(INVENTORY_BODY),
+            }]
+        );
+    }
 
     fn remote_context() -> (TempDir, ToolContext) {
         let root = tempdir();
@@ -1028,7 +1525,34 @@ mod tests {
         (root, ctx)
     }
 
-    #[test_case("list")]
+    async fn dispatch(ctx: &ToolContext, input: &Value) -> crate::types::ToolDoneEvent {
+        tool_dispatch::run(
+            &ctx.registry,
+            None,
+            input["command"].as_str().unwrap_or_default().into(),
+            MEMORY_TOOL_NAME,
+            input,
+            ctx,
+            Emit::Silent,
+        )
+        .await
+    }
+
+    /// One input every command can run with, so a test can cover them all.
+    fn any_command(command: &str) -> Value {
+        json!({
+            "command": command,
+            "path": NOTE_PATH,
+            "content": "overwrite",
+            "query": NOTE_CONTENT,
+            "id": 0,
+            "n": 1,
+        })
+    }
+
+    #[test_case("view")]
+    #[test_case("zoom")]
+    #[test_case("search")]
     #[test_case("read")]
     #[test_case("write")]
     #[test_case("delete")]
@@ -1040,16 +1564,9 @@ mod tests {
                 .write_memory(store.project_key(), NOTE_PATH, NOTE_CONTENT)
                 .unwrap();
             ctx.workspace_session = Some(workspace_for_principal("other"));
-            let done = tool_dispatch::run(
-                &ctx.registry,
-                None,
-                command.into(),
-                MEMORY_TOOL_NAME,
-                &json!({"command": command, "path": NOTE_PATH, "content": "overwrite"}),
-                &ctx,
-                Emit::Silent,
-            )
-            .await;
+
+            let done = dispatch(&ctx, &any_command(command)).await;
+
             assert!(done.is_error);
             assert_eq!(done.output.as_text(), WRONG_OWNER);
             assert_eq!(
@@ -1060,38 +1577,76 @@ mod tests {
     }
 
     #[test]
-    fn remote_named_crud_preserves_tags_and_exposes_no_host_path() {
+    fn remote_commands_work_by_name_and_expose_no_host_path() {
         smol::block_on(async {
             let (root, ctx) = remote_context();
             let store = ctx.local_documents.as_ref().unwrap();
             for input in [
-                json!({"command": "write", "path": NOTE_PATH, "content": NOTE_CONTENT, "tags": [NOTE_TAG]}),
-                json!({"command": "list"}),
-                json!({"command": "read", "path": NOTE_PATH}),
-                json!({"command": "read", "tags": [NOTE_TAG]}),
-                json!({"command": "delete", "path": NOTE_PATH}),
+                json!({ "command": "write", "path": NOTE_PATH, "content": NOTE_CONTENT }),
+                json!({ "command": "view" }),
+                json!({ "command": "search", "query": NOTE_CONTENT }),
+                zoom_input(0, 1),
+                json!({ "command": "read", "path": NOTE_PATH }),
+                json!({ "command": "delete", "path": NOTE_PATH }),
             ] {
-                let done = tool_dispatch::run(
-                    &ctx.registry,
-                    None,
-                    input["command"].as_str().unwrap().into(),
-                    MEMORY_TOOL_NAME,
-                    &input,
-                    &ctx,
-                    Emit::Silent,
-                )
-                .await;
+                let done = dispatch(&ctx, &input).await;
+
                 assert!(!done.is_error, "{}", done.output.as_text());
                 assert!(done.written_paths().next().is_none());
+                let reads = !matches!(input["command"].as_str(), Some("write" | "delete"));
                 for text in [done.output.as_text(), done.composed_model_output()] {
-                    assert!(!text.contains(root.path().to_str().unwrap()));
-                    if input["command"] == "read" {
-                        assert!(text.contains(NOTE_CONTENT));
-                        assert!(text.contains(NOTE_TAG));
-                    }
+                    assert!(!text.contains(root.path().to_str().unwrap()), "{text}");
+                    assert!(!reads || text.contains(NOTE_CONTENT), "{text}");
                 }
             }
             assert!(store.list_memories(store.project_key()).unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn a_remote_note_is_named_by_its_reference() {
+        smol::block_on(async {
+            let (_root, ctx) = remote_context();
+            let store = ctx.local_documents.as_ref().unwrap();
+            let reference = store
+                .write_memory(store.project_key(), NOTE_PATH, NOTE_CONTENT)
+                .unwrap();
+
+            let done = dispatch(&ctx, &json!({ "command": "read", "path": NOTE_PATH })).await;
+
+            let ToolOutput::Memory(MemoryOutput::Notes {
+                notes, directory, ..
+            }) = &done.output
+            else {
+                panic!("{FOUND_MSG}");
+            };
+            assert_eq!(*directory, None);
+            assert_eq!(
+                notes[0].origin.path(),
+                None,
+                "a remote note has no host path"
+            );
+            assert!(done.composed_model_output().contains(reference.as_str()));
+        });
+    }
+
+    #[test]
+    fn a_remote_note_must_be_markdown() {
+        smol::block_on(async {
+            let (_root, ctx) = remote_context();
+
+            let done = dispatch(
+                &ctx,
+                &json!({ "command": "write", "path": "note", "content": NOTE_CONTENT }),
+            )
+            .await;
+
+            assert!(done.is_error);
+            assert!(
+                done.output.as_text().contains(NAME_NOT_MARKDOWN),
+                "{}",
+                done.output.as_text()
+            );
         });
     }
 
@@ -1100,7 +1655,7 @@ mod tests {
     fn remote_memory_mutation_is_not_an_active_plan_write(command: &str) {
         smol::block_on(async {
             let (_root, mut ctx) = remote_context();
-            let store = ctx.local_documents.as_ref().unwrap();
+            let store = Arc::clone(ctx.local_documents.as_ref().unwrap());
             store
                 .write_memory(store.project_key(), NOTE_PATH, NOTE_CONTENT)
                 .unwrap();
@@ -1110,16 +1665,9 @@ mod tests {
                 .unwrap();
             ctx.mode = AgentMode::RemotePlan(plan);
             ctx.session_id = Some(session);
-            let done = tool_dispatch::run(
-                &ctx.registry,
-                None,
-                command.into(),
-                MEMORY_TOOL_NAME,
-                &json!({"command": command, "path": NOTE_PATH, "content": "overwrite"}),
-                &ctx,
-                Emit::Silent,
-            )
-            .await;
+
+            let done = dispatch(&ctx, &any_command(command)).await;
+
             assert!(done.is_error);
             assert_eq!(done.output.as_text(), PLAN_WRITE_RESTRICTED);
             assert_eq!(
@@ -1129,7 +1677,7 @@ mod tests {
         });
     }
 
-    /// Browsing remote notes needs no answer whatever the default, as browsing
+    /// Reading remote notes needs no answer whatever the default, as reading
     /// local ones already doesn't. Changing a note still waits for one, and a
     /// rule that names the tool still governs every command.
     #[test_case(DefaultEffect::Prompt, None; "default_prompt")]
@@ -1158,27 +1706,15 @@ mod tests {
                 root.path().to_path_buf(),
                 Arc::default(),
             ));
-            let store = ctx.local_documents.as_ref().unwrap();
+            let store = Arc::clone(ctx.local_documents.as_ref().unwrap());
             store
                 .write_memory(store.project_key(), NOTE_PATH, NOTE_CONTENT)
                 .unwrap();
-            for (command, browses) in [
-                ("list", true),
-                ("read", true),
-                ("write", false),
-                ("delete", false),
-            ] {
-                let done = tool_dispatch::run(
-                    &ctx.registry,
-                    None,
-                    command.into(),
-                    MEMORY_TOOL_NAME,
-                    &json!({"command": command, "path": NOTE_PATH, "content": "overwrite"}),
-                    &ctx,
-                    Emit::Silent,
-                )
-                .await;
-                if browses && effect.is_none() {
+            for command in COMMANDS {
+                let done = dispatch(&ctx, &any_command(command)).await;
+                let reads =
+                    call(any_command(command)).command.access() == PermissionResourceAccess::Read;
+                if reads && effect.is_none() {
                     assert!(!done.is_error, "{command}: {}", done.output.as_text());
                 } else {
                     assert!(
@@ -1195,698 +1731,20 @@ mod tests {
         });
     }
 
-    fn call(input: Value) -> Box<dyn ToolInvocation> {
-        MemoryTool.parse(&input).expect("valid input")
-    }
-
-    /// Points a parsed call at a temporary directory, which is the only way to
-    /// exercise it without writing into the developer's real notes.
-    fn call_in(input: Value, dir: &Path) -> MemoryCall {
-        let command = Command::parse(input["command"].as_str().expect("command")).expect("known");
-        MemoryCall {
-            command,
-            dir: Some(dir.to_path_buf()),
-            path: string_field(&input, "path"),
-            content: string_field(&input, "content"),
-            tags: input["tags"]
-                .as_array()
-                .map(|tags| {
-                    tags.iter()
-                        .filter_map(|tag| tag.as_str().map(str::to_owned))
-                        .collect()
-                })
-                .unwrap_or_default(),
-        }
-    }
-
-    /// Every command answers as text somewhere: a browse through the one
-    /// rendering both the model and the card's copy read, a mutation through
-    /// its receipt.
-    fn text(answer: Answer) -> String {
-        match answer {
-            Answer::Browse(output) => capped_model_text(&output),
-            Answer::Receipt(receipt) => receipt,
-        }
-    }
-
-    fn run(input: Value, dir: &Path) -> Result<String, String> {
-        let call = call_in(input, dir);
-        call.validate().map_err(|error| error.message)?;
-        call.run(dir, &Mutex::new(notes::TagCache::default()))
-            .map(text)
-            .map_err(|error| error.message)
-    }
-
-    fn browse(input: Value, dir: &Path) -> MemoryOutput {
-        match call_in(input, dir)
-            .run(dir, &Mutex::new(notes::TagCache::default()))
-            .expect("a browse that succeeded")
-        {
-            Answer::Browse(output) => output,
-            Answer::Receipt(receipt) => panic!("a browse answers with notes, got {receipt}"),
-        }
-    }
-
-    #[test]
-    fn a_write_stores_frontmatter_and_the_body() {
-        let temp = tempfile::tempdir().unwrap();
-        let out = run(
-            json!({ "command": "write", "path": "arch.md", "content": "body", "tags": ["arch"] }),
-            temp.path(),
-        )
-        .unwrap();
-        assert_eq!(out, "wrote arch.md (tags: arch)");
-        let stored = fs::read_to_string(temp.path().join("arch.md")).unwrap();
-        assert!(stored.starts_with("---\n"), "{stored}");
-        assert!(stored.ends_with("body"), "{stored}");
-    }
-
-    #[test]
-    fn a_write_creates_the_directory() {
-        let temp = tempfile::tempdir().unwrap();
-        let dir = temp.path().join("missing");
-        run(
-            json!({ "command": "write", "path": "a.md", "content": "x", "tags": ["t"] }),
-            &dir,
-        )
-        .unwrap();
-        assert!(dir.join("a.md").exists());
-    }
-
-    #[test]
-    fn a_write_without_tags_is_stored_untagged() {
-        let temp = tempfile::tempdir().unwrap();
-        let out = run(
-            json!({ "command": "write", "path": "a.md", "content": "x" }),
-            temp.path(),
-        )
-        .unwrap();
-        assert!(out.contains("tags: none"), "{out}");
-    }
-
-    #[test]
-    fn a_note_reads_back_by_path() {
-        let temp = tempfile::tempdir().unwrap();
-        run(
-            json!({ "command": "write", "path": "a.md", "content": "the body", "tags": ["t"] }),
-            temp.path(),
-        )
-        .unwrap();
-        let out = run(json!({ "command": "read", "path": "a.md" }), temp.path()).unwrap();
-        assert!(out.contains("the body"), "{out}");
-        assert!(out.contains("[t]"), "{out}");
-    }
-
-    #[test]
-    fn a_note_reads_back_by_tag() {
-        let temp = tempfile::tempdir().unwrap();
-        run(
-            json!({ "command": "write", "path": "a.md", "content": "tagged body", "tags": ["arch"] }),
-            temp.path(),
-        )
-        .unwrap();
-        let out = run(json!({ "command": "read", "tags": ["arch"] }), temp.path()).unwrap();
-        assert!(out.contains("tagged body"), "{out}");
-    }
-
-    /// The write path normalizes tags, so a read must normalize its filter the
-    /// same way or a note becomes unreachable by the tag it was filed under.
-    #[test]
-    fn a_tag_filter_is_normalized_like_the_stored_tag() {
-        let temp = tempfile::tempdir().unwrap();
-        run(
-            json!({ "command": "write", "path": "a.md", "content": "found", "tags": ["Build-System"] }),
-            temp.path(),
-        )
-        .unwrap();
-        let out = run(
-            json!({ "command": "read", "tags": ["build system"] }),
-            temp.path(),
-        )
-        .unwrap();
-        assert!(out.contains("found"), "{out}");
-    }
-
-    #[test]
-    fn a_tag_that_matches_nothing_says_so() {
-        let temp = tempfile::tempdir().unwrap();
-        run(
-            json!({ "command": "write", "path": "a.md", "content": "x", "tags": ["arch"] }),
-            temp.path(),
-        )
-        .unwrap();
-        let out = run(
-            json!({ "command": "read", "tags": ["absent"] }),
-            temp.path(),
-        )
-        .unwrap();
-        assert!(out.contains(notes::NO_MATCH), "{out}");
-    }
-
-    #[test]
-    fn an_empty_directory_lists_as_empty() {
-        let temp = tempfile::tempdir().unwrap();
-        let out = run(json!({ "command": "list" }), temp.path()).unwrap();
-        assert!(out.contains(notes::NO_MEMORIES), "{out}");
-    }
-
-    #[test]
-    fn a_list_groups_notes_under_their_tags() {
-        let temp = tempfile::tempdir().unwrap();
-        for name in ["a.md", "b.md"] {
-            run(
-                json!({ "command": "write", "path": name, "content": "x", "tags": ["shared"] }),
-                temp.path(),
-            )
-            .unwrap();
-        }
-        let out = run(json!({ "command": "list" }), temp.path()).unwrap();
-        assert!(out.contains("shared (2)"), "{out}");
-        assert!(
-            out.contains(&format!("  - a.md ({})", token_label(1))),
-            "{out}"
-        );
-    }
-
-    #[test]
-    fn a_delete_removes_the_file() {
-        let temp = tempfile::tempdir().unwrap();
-        run(
-            json!({ "command": "write", "path": "a.md", "content": "x", "tags": ["t"] }),
-            temp.path(),
-        )
-        .unwrap();
-        let out = run(json!({ "command": "delete", "path": "a.md" }), temp.path()).unwrap();
-        assert_eq!(out, "deleted a.md");
-        assert!(!temp.path().join("a.md").exists());
-    }
-
-    #[test]
-    fn deleting_a_missing_note_is_an_error() {
-        let temp = tempfile::tempdir().unwrap();
-        let error = run(
-            json!({ "command": "delete", "path": "gone.md" }),
-            temp.path(),
-        )
-        .unwrap_err();
-        assert!(error.contains("does not exist"), "{error}");
-    }
-
-    #[test]
-    fn an_oversized_write_never_reaches_disk() {
-        let temp = tempfile::tempdir().unwrap();
-        let huge = "x".repeat(notes::MAX_FILE_BYTES + 1);
-        let error = run(
-            json!({ "command": "write", "path": "a.md", "content": huge, "tags": ["t"] }),
-            temp.path(),
-        )
-        .unwrap_err();
-        assert!(error.contains("exceeds"), "{error}");
-        assert!(!temp.path().join("a.md").exists());
-    }
-
-    #[test]
-    fn a_traversing_path_is_refused() {
-        let temp = tempfile::tempdir().unwrap();
-        let error = run(
-            json!({ "command": "write", "path": "../escape.md", "content": "x" }),
-            temp.path(),
-        )
-        .unwrap_err();
-        assert_eq!(error, paths::PATH_TRAVERSAL);
-    }
-
-    #[test_case(json!({ "command": "read" }), "'path' or 'tags' is required" ; "read needs a selector")]
-    #[test_case(json!({ "command": "read", "path": "a.md", "tags": ["t"] }), "not both" ; "read takes one selector")]
-    #[test_case(json!({ "command": "write", "content": "x" }), "'path' is required" ; "write needs a path")]
-    #[test_case(json!({ "command": "write", "path": "a.md" }), "'content' is required" ; "write needs content")]
-    #[test_case(json!({ "command": "delete" }), "'path' is required" ; "delete needs a path")]
-    fn an_incoherent_call_is_rejected(input: Value, expected: &str) {
-        let error = call_in(input, Path::new("/memories"))
-            .validate()
-            .unwrap_err();
-        assert_eq!(error.failure, ToolFailure::InvalidInput);
-        assert!(error.message.contains(expected), "{error}");
-    }
-
-    #[test]
-    fn an_unknown_command_is_rejected_at_parse_time() {
-        let Err(error) = MemoryTool.parse(&json!({ "command": "purge" })) else {
-            panic!("an unknown command must not parse");
-        };
-        assert!(error.to_string().contains("purge"), "{error}");
-    }
-
-    /// The model routinely sends a bare string where the schema says array;
-    /// the shared validator wraps it, and this pins that the tool relies on it.
-    #[test]
-    fn a_single_tag_string_is_accepted() {
-        let parsed = MemoryTool
-            .parse(&json!({ "command": "read", "tags": "solo" }))
-            .unwrap();
-        let HeaderResult::Plain(header) = smol::block_on(parsed.start_header()) else {
-            panic!("memory headers are plain");
-        };
-        assert_eq!(header, "read solo");
-    }
-
-    #[test_case(json!({ "command": "list" }), "list" ; "bare command")]
-    #[test_case(json!({ "command": "read", "path": "a.md" }), "read a.md" ; "with a path")]
-    #[test_case(json!({ "command": "list", "tags": ["a", "b"] }), "list a,b" ; "with tags")]
-    fn the_header_describes_the_call(input: Value, expected: &str) {
-        let HeaderResult::Plain(header) = smol::block_on(call(input).start_header()) else {
-            panic!("memory headers are plain");
-        };
-        assert_eq!(header, expected);
-    }
-
-    /// `browse` resolves the real notes directory from the cwd, which tests
-    /// must not touch.
-    fn browse_in(dir: &Path) -> (Vec<BrowseEntry>, usize) {
-        browse_dir(dir, &Mutex::new(notes::TagCache::default()))
-    }
-
-    fn run_all(input: Value, dir: &Path) -> Result<String, String> {
-        call_in(input, dir)
-            .run_all(&Mutex::new(notes::TagCache::default()))
-            .map(text)
-            .map_err(|error| error.message)
-    }
-
-    #[test]
-    fn browsing_commands_report_the_directory_so_notes_can_be_edited() {
-        let temp = tempfile::tempdir().unwrap();
-        let out = run_all(json!({ "command": "list" }), temp.path()).unwrap();
-        assert!(out.starts_with(MEMORY_DIRECTORY_LABEL), "{out}");
-        assert!(out.contains(&temp.path().display().to_string()), "{out}");
-    }
-
-    #[test]
-    fn a_write_does_not_report_the_directory() {
-        let temp = tempfile::tempdir().unwrap();
-        let out = run_all(
-            json!({ "command": "write", "path": "a.md", "content": "x" }),
-            temp.path(),
-        )
-        .unwrap();
-        assert!(!out.starts_with(MEMORY_DIRECTORY_LABEL), "{out}");
-    }
-
-    const BODY_MSG: &str = "the reader sees the note, the model sees the receipt";
-    const BROWSE_MSG: &str = "a browse answers with one structure both sides read";
-    const NOTE_BODY: &str = "# Session picker\n\nThe picker merges **two** sources.";
-
-    fn execute_in(input: Value, dir: &Path) -> ToolExecResult {
-        let call = Box::new(call_in(input, dir));
-        smol::block_on(call.execute(&stub_ctx(&AgentMode::Build)))
-    }
-
-    fn markdown(result: ToolExecResult) -> String {
-        match result.output.expect("a call that succeeded") {
-            ToolOutput::Markdown(text) => text.text,
-            other => panic!("{BODY_MSG}, got {other:?}"),
-        }
-    }
-
-    #[test_case(json!({ "command": "read", "path": "missing.md" }), ToolFailure::NotFound ; "reading_a_missing_note")]
-    #[test_case(json!({ "command": "delete", "path": "missing.md" }), ToolFailure::NotFound ; "deleting_a_missing_note")]
-    #[test_case(json!({ "command": "write", "path": "../escape.md", "content": "x" }), ToolFailure::InvalidInput ; "writing_outside_the_notes")]
-    #[test_case(json!({ "command": "read", "path": "a.md", "tags": ["ui"] }), ToolFailure::InvalidInput ; "reading_by_path_and_tag")]
-    fn a_refused_command_states_why(input: Value, expected: ToolFailure) {
-        let temp = tempfile::tempdir().unwrap();
-        let result = execute_in(input, temp.path());
-        assert!(result.is_error);
-        assert_eq!(result.failure, Some(expected));
-    }
-
-    /// A write's reply is a receipt, so rendering it is rendering nothing. The
-    /// note is what the reader came for, and the model wrote it and does not
-    /// need it back.
-    #[test]
-    fn a_write_renders_the_note_and_replies_with_the_receipt() {
-        let temp = tempfile::tempdir().unwrap();
-        let out = execute_in(
-            json!({ "command": "write", "path": "a.md", "content": NOTE_BODY, "tags": ["ui"] }),
-            temp.path(),
-        );
-        assert_eq!(out.model_output.as_deref(), Some("wrote a.md (tags: ui)"));
-        assert_eq!(markdown(out), NOTE_BODY, "{BODY_MSG}");
-    }
-
-    /// Nothing to render is not a reason to render nothing: an empty note
-    /// would leave the row with no body at all, so the receipt stands in.
-    #[test]
-    fn a_blank_note_falls_back_to_its_receipt() {
-        let temp = tempfile::tempdir().unwrap();
-        let out = execute_in(
-            json!({ "command": "write", "path": "a.md", "content": "  \n " }),
-            temp.path(),
-        );
-        assert_eq!(out.model_output, None, "{BODY_MSG}");
-        assert!(markdown(out).starts_with("wrote a.md"), "{BODY_MSG}");
-    }
-
-    /// Browsing has one answer, so both sides read it: the reader gets the
-    /// structure the card draws, and the model gets the one rendering of that
-    /// same structure.
-    #[test_case("list" ; "a list")]
-    #[test_case("read" ; "a read")]
-    fn a_browsing_call_shows_the_model_what_the_reader_sees(command: &str) {
-        let temp = tempfile::tempdir().unwrap();
-        run(
-            json!({ "command": "write", "path": "a.md", "content": NOTE_BODY }),
-            temp.path(),
-        )
-        .unwrap();
-        let out = execute_in(json!({ "command": command, "path": "a.md" }), temp.path());
-        let ToolOutput::Memory(output) = out.output.expect("a browse that succeeded") else {
-            panic!("{BROWSE_MSG}");
-        };
-        assert_eq!(
-            out.model_output.as_deref(),
-            Some(output.as_display_text().as_str()),
-            "{BROWSE_MSG}"
-        );
-        assert!(
-            output.as_display_text().contains(MEMORY_DIRECTORY_LABEL),
-            "{BROWSE_MSG}"
-        );
-    }
-
-    const CHANGED_NOTE_MSG: &str = "a local change names its note, and nothing else names one";
-
-    /// The notes live outside the project, so the host only learns a tab on
-    /// one is stale from the call that changed it.
-    #[test_case(json!({ "command": "write", "path": "a.md", "content": "y" }), true ; "a write")]
-    #[test_case(json!({ "command": "delete", "path": "a.md" }), true ; "a delete")]
-    #[test_case(json!({ "command": "read", "path": "a.md" }), false ; "a read")]
-    fn a_local_change_names_the_note_it_changed(input: Value, changes: bool) {
-        let temp = tempfile::tempdir().unwrap();
-        run(
-            json!({ "command": "write", "path": "a.md", "content": "x" }),
-            temp.path(),
-        )
-        .unwrap();
-
-        let out = execute_in(input, temp.path());
-
-        let note = temp.path().join("a.md");
-        let expected = changes.then(|| note.to_string_lossy().into_owned());
-        assert_eq!(out.written_path, expected, "{CHANGED_NOTE_MSG}");
-    }
-
-    #[test]
-    fn a_failing_call_is_reported_as_a_tool_error() {
-        let out = smol::block_on(
-            call(json!({ "command": "read" })).execute(&stub_ctx(&AgentMode::Build)),
-        );
-        assert!(out.is_error);
-        assert!(out.output.unwrap_err().starts_with("error: "));
-    }
-
-    /// Write and delete declare their target so the permission layer can see
-    /// the file before it changes.
-    #[test]
-    fn a_mutating_call_declares_the_file_it_touches() {
-        let temp = tempfile::tempdir().unwrap();
-        let ctx = stub_ctx(&AgentMode::Build);
-        let write = call_in(
-            json!({ "command": "write", "path": "a.md", "content": "x" }),
-            temp.path(),
-        );
-        assert_eq!(write.mutation_targets(&ctx), vec![temp.path().join("a.md")]);
-        let list = call_in(json!({ "command": "list" }), temp.path());
-        assert!(list.mutation_targets(&ctx).is_empty());
-    }
-
-    #[test]
-    fn a_note_is_never_recorded_even_inside_the_session_directory() {
-        let temp = tempfile::tempdir().unwrap();
-        let write = call_in(
-            json!({ "command": "write", "path": "a.md", "content": "x" }),
-            temp.path(),
-        );
-        assert_eq!(
-            write.record_scope(&stub_ctx(&AgentMode::Build), temp.path()),
-            None
-        );
-    }
-
-    /// The registration is mutating so a write is gated; browsing has to
-    /// report itself as the read it is or plan mode refuses it.
-    #[test_case("list", ToolEffect::ReadOnly ; "list_is_a_read")]
-    #[test_case("read", ToolEffect::ReadOnly ; "read_is_a_read")]
-    #[test_case("write", REGISTERED_EFFECT ; "write_keeps_the_registered_effect")]
-    #[test_case("delete", REGISTERED_EFFECT ; "delete_keeps_the_registered_effect")]
-    fn the_call_effect_follows_the_command(command: &str, expected: ToolEffect) {
-        let parsed = call(json!({ "command": command, "path": "a.md", "content": "x" }));
-        assert_eq!(parsed.call_effect(REGISTERED_EFFECT), expected);
-    }
-
-    #[test]
-    fn a_tag_scoped_call_asks_for_the_whole_directory() {
-        let temp = tempfile::tempdir().unwrap();
-        let call = call_in(json!({ "command": "read", "tags": ["t"] }), temp.path());
-        let scopes = smol::block_on(call.permission_scopes()).unwrap();
-        assert_eq!(
-            scopes.scopes,
-            vec![temp.path().join("**").to_string_lossy().into_owned()]
-        );
-    }
-
-    #[test]
-    fn a_path_scoped_call_asks_only_for_that_file() {
-        let temp = tempfile::tempdir().unwrap();
-        let call = call_in(json!({ "command": "read", "path": "a.md" }), temp.path());
-        let scopes = smol::block_on(call.permission_scopes()).unwrap();
-        assert_eq!(
-            scopes.scopes,
-            vec![temp.path().join("a.md").to_string_lossy().into_owned()]
-        );
-    }
-
-    /// Every note-touching tool needs a rule for every directory notes can
-    /// live in, or the model gets a prompt for its own scratchpad.
-    #[test]
-    fn permission_rules_cover_each_policy_tool() {
-        let temp = tempfile::tempdir().unwrap();
-        let rules = permission_rules(temp.path());
-        assert!(!rules.is_empty(), "the state directory always resolves");
-        for tool in POLICY_TOOLS {
-            assert!(
-                rules.iter().any(|rule| {
-                    matches!(&rule.tool, caudra_config::ToolKey::Native(name) if &**name == *tool)
-                }),
-                "no rule for {tool}"
-            );
-        }
-        assert!(
-            rules
-                .iter()
-                .all(|rule| rule.effect == caudra_config::Effect::Allow),
-            "memory rules only ever grant"
-        );
-        assert!(
-            rules
-                .iter()
-                .all(|rule| rule.scope.as_ref().is_some_and(|s| s.ends_with("/**"))),
-            "rules are directory-scoped"
-        );
-    }
-
-    #[test]
-    fn browsing_lists_each_note_once_per_tag() {
-        let temp = tempfile::tempdir().unwrap();
-        run(
-            json!({ "command": "write", "path": "a.md", "content": "x", "tags": ["one", "two"] }),
-            temp.path(),
-        )
-        .unwrap();
-        let (entries, warnings) = browse_in(temp.path());
-        assert_eq!(warnings, 0);
-        let tags: Vec<_> = entries.iter().map(|entry| entry.tag.as_str()).collect();
-        assert_eq!(tags, vec!["one", "two"]);
-        assert!(entries.iter().all(|entry| entry.name == "a.md"));
-    }
-
-    #[test]
-    fn browsing_reports_how_many_notes_share_each_tag() {
-        let temp = tempfile::tempdir().unwrap();
-        for name in ["a.md", "b.md"] {
-            run(
-                json!({ "command": "write", "path": name, "content": "x", "tags": ["shared"] }),
-                temp.path(),
-            )
-            .unwrap();
-        }
-        let (entries, _) = browse_in(temp.path());
-        assert!(entries.iter().all(|entry| entry.tag_count == 2));
-    }
-
-    #[test]
-    fn browsing_an_empty_directory_yields_no_entries() {
-        let temp = tempfile::tempdir().unwrap();
-        assert!(browse_in(temp.path()).0.is_empty());
-    }
-
-    #[test]
-    fn memory_inventory_lists_each_file_once_with_on_load_body_tokens() {
-        const BODY: &str = "remember this exact convention";
-
-        let temp = tempfile::tempdir().unwrap();
-        fs::write(
-            temp.path().join("project.md"),
-            format!("---\ntags: [project, rust]\n---\n{BODY}"),
-        )
-        .unwrap();
-        let found = inventory_dir(temp.path(), &Mutex::new(notes::TagCache::default()));
-
-        assert_eq!(found.directory, temp.path());
-        assert_eq!(found.unreadable_files, 0);
-        assert_eq!(found.notes.len(), 1);
-        assert_eq!(found.notes[0].name, "project.md");
-        assert_eq!(found.notes[0].tags, vec!["project", "rust"]);
-        assert_eq!(
-            found.notes[0].on_load_tokens,
-            caudra_providers::estimate_tokens(BODY)
-        );
-    }
-
-    #[test]
-    fn a_project_without_notes_contributes_no_prompt_line() {
-        let temp = tempfile::tempdir().unwrap();
-        assert!(prompt_tag_line(temp.path(), &Mutex::new(notes::TagCache::default())).is_none());
-    }
-
-    const REMOTE_NAME: &str = "architecture.md";
-    const REMOTE_BODY: &str = "keep this";
-    const REMOTE_TAG: &str = "rust";
-    const CLIENT_STATE: &str = "/secret/client/state";
-
-    fn remote_document() -> (MemoryRef, LocalDocument) {
-        let reference = MemoryRef::new(format!("memory-{}", "a".repeat(64))).expect("memory ref");
-        let document = LocalDocument {
-            reference: LocalDocumentRef::Memory(reference.clone()),
-            name: Some(REMOTE_NAME.into()),
-            content: format!("---\ntags: [{REMOTE_TAG}]\n---\n{REMOTE_BODY}"),
-            revision: DocumentRevision::new("b".repeat(64)).expect("revision"),
-        };
-        (reference, document)
-    }
-
-    #[test]
-    fn remote_memory_browsing_returns_refs_without_a_directory() {
-        let (reference, document) = remote_document();
-        let state = Path::new(CLIENT_STATE);
-
-        let listed = call_in(json!({"command": "list"}), state)
-            .remote_list(slice::from_ref(&document))
-            .as_display_text();
-        let read = call_in(json!({"command": "read", "path": REMOTE_NAME}), state)
-            .remote_read_by_path(slice::from_ref(&document))
-            .expect("the named note")
-            .as_display_text();
-
-        assert!(listed.contains(reference.as_str()), "{listed}");
-        assert!(read.contains(reference.as_str()), "{read}");
-        assert!(!listed.contains(CLIENT_STATE), "{listed}");
-        assert!(!read.contains(CLIENT_STATE), "{read}");
-        assert!(!read.contains(MEMORY_DIRECTORY_LABEL), "{read}");
-    }
-
-    /// The reported divergence: a remote read handed the model the raw
-    /// frontmatter and a token count that included it, while a local read
-    /// stripped both. One structure, so one shape.
-    #[test]
-    fn a_remote_note_reads_like_a_local_one() {
-        let temp = tempfile::tempdir().unwrap();
-        let (_, document) = remote_document();
-        fs::write(temp.path().join(REMOTE_NAME), &document.content).unwrap();
-
-        let local = local_note(temp.path(), REMOTE_NAME, &document.content);
-        let remote = remote_note(&document);
-
-        assert_eq!(remote.headline(), local.headline());
-        assert_eq!(remote.body, REMOTE_BODY);
-        assert_eq!(remote.tags, vec![REMOTE_TAG]);
-        assert_eq!(remote.origin.path(), None, "a remote note has no host path");
-        assert_eq!(
-            local.origin.path(),
-            Some(temp.path().join(REMOTE_NAME).to_string_lossy().as_ref())
-        );
-    }
-
-    #[test]
-    fn a_read_carries_the_note_the_card_draws() {
-        let temp = tempfile::tempdir().unwrap();
-        run(
-            json!({ "command": "write", "path": "a.md", "content": NOTE_BODY, "tags": ["ui"] }),
-            temp.path(),
-        )
-        .unwrap();
-
-        let MemoryOutput::Notes { notes, notices, .. } =
-            browse(json!({ "command": "read", "path": "a.md" }), temp.path())
-        else {
-            panic!("{BROWSE_MSG}");
-        };
-
-        assert!(notices.is_empty());
-        assert_eq!(notes.len(), 1);
-        assert_eq!(notes[0].body, NOTE_BODY, "the body keeps its markdown");
-        assert_eq!(notes[0].tags, vec!["ui"], "and states its tags once");
-    }
-
-    /// The row a click opens. A note the model can reach by name is a file on
-    /// this host, and the card needs the whole path to open it.
-    #[test]
-    fn an_indexed_note_names_the_file_a_click_opens() {
-        let temp = tempfile::tempdir().unwrap();
-        run(
-            json!({ "command": "write", "path": "a.md", "content": "x", "tags": ["shared"] }),
-            temp.path(),
-        )
-        .unwrap();
-
-        let MemoryOutput::Index { groups, .. } = browse(json!({ "command": "list" }), temp.path())
-        else {
-            panic!("{BROWSE_MSG}");
-        };
-
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].tag, "shared");
-        assert_eq!(
-            groups[0].notes[0].origin.path(),
-            Some(temp.path().join("a.md").to_string_lossy().as_ref())
-        );
-    }
-
-    /// Nothing found is a notice rather than a body, so a card draws one dim
-    /// line instead of a note that is not there.
-    #[test_case(json!({ "command": "list" }), notes::NO_MEMORIES ; "an_empty_scratchpad")]
-    #[test_case(json!({ "command": "read", "tags": ["absent"] }), notes::NO_MATCH ; "a_filter_reaching_nothing")]
-    fn an_empty_browse_says_so_in_a_notice(input: Value, expected: &str) {
-        let temp = tempfile::tempdir().unwrap();
-        let output = browse(input, temp.path());
-
-        assert!(output.is_empty());
-        assert_eq!(output.notices(), [expected.to_owned()]);
-    }
-
-    #[test_case("list", PermissionResourceAccess::Read; "list_reads")]
-    #[test_case("read", PermissionResourceAccess::Read; "read_reads")]
-    #[test_case("write", PermissionResourceAccess::Write; "write_writes")]
-    #[test_case("delete", PermissionResourceAccess::Write; "delete_writes")]
+    #[test_case("view", "", PermissionResourceAccess::Read ; "view_reads")]
+    #[test_case("zoom", "0+1", PermissionResourceAccess::Read ; "zoom_reads")]
+    #[test_case("search", NOTE_CONTENT, PermissionResourceAccess::Read ; "search_reads")]
+    #[test_case("read", NOTE_PATH, PermissionResourceAccess::Read ; "read_reads")]
+    #[test_case("write", NOTE_PATH, PermissionResourceAccess::Write ; "write_writes")]
+    #[test_case("delete", NOTE_PATH, PermissionResourceAccess::Write ; "delete_writes")]
     fn remote_memory_permission_intent_uses_an_opaque_resource(
         command: &str,
+        subject: &str,
         access: PermissionResourceAccess,
     ) {
-        let call = call_in(
-            json!({"command": command, "path": REMOTE_NAME, "content": REMOTE_BODY}),
-            Path::new(CLIENT_STATE),
-        );
+        let state = tempdir();
 
-        let intent = call.remote_permission_intent();
+        let intent = call_at(any_command(command), state.path()).remote_permission_intent();
 
         assert_eq!(intent.resources.len(), 1);
         assert_eq!(
@@ -1897,10 +1755,14 @@ mod tests {
         );
         assert_eq!(
             intent.resources[0].value,
-            format!("local-memory:{command}:{REMOTE_NAME}")
+            format!("local-memory:{command}:{subject}")
         );
         assert_eq!(intent.resources[0].access, Some(access));
-        assert!(!intent.resources[0].value.contains(CLIENT_STATE));
+        assert!(
+            !intent.resources[0]
+                .value
+                .contains(state.path().to_str().unwrap())
+        );
     }
 
     #[test]

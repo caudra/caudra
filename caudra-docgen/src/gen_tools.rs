@@ -521,7 +521,7 @@ pub fn generate() -> String {
     writeln!(out, "\nImplement and Clear-and-Implement capture the validated content before they switch to Build or clear the session. The model-visible Build request opens with \"Implement the plan from `<path>`.\" for a local plan or \"Implement this session's plan.\" for a remote one, followed by the content, so implementation does not need a tool call to read the plan. A capture failure leaves the plan available and does not start implementation.").unwrap();
     writeln!(out, "\nClear-and-Implement moves the plan to the new session, and the old session keeps none. A local plan keeps its path. A remote plan is copied into a document the new session owns. If that copy fails, implementation still starts from the captured content and Caudra shows a warning.").unwrap();
     writeln!(out, "\nSecure plan storage currently requires a Unix client. Windows and other non-Unix clients return `UnsupportedPlatform` for secure plan storage operations. This applies to local plans and client-owned plans for remote workspaces, regardless of the Workcell server's platform.").unwrap();
-    writeln!(out, "\nThe `memory` tool lists, reads, writes, and deletes named notes in local and remote workspaces. Writes replace the complete note. Remote notes stay on the client and cannot be edited through remote file tools. Workbench saves retain revision-conflict checks.").unwrap();
+    writeln!(out, "\nThe `memory` tool reads, writes, and deletes named notes in local and remote workspaces. Its `view`, `zoom`, and `search` commands find the notes worth reading, as [Memory](/docs/memory/#zoom-and-search) describes. Writes replace the complete note. Remote notes stay on the client and cannot be edited through remote file tools. Workbench saves retain revision-conflict checks.").unwrap();
     write_disabling_section(&mut out);
     write_on_demand_section(&mut out);
 
@@ -641,7 +641,7 @@ mod tests {
             "A capture failure leaves the plan available",
             "Clear-and-Implement moves the plan to the new session",
             "Windows and other non-Unix clients return `UnsupportedPlatform`",
-            "The `memory` tool lists, reads, writes, and deletes named notes",
+            "The `memory` tool reads, writes, and deletes named notes",
             "Workbench saves retain revision-conflict checks",
             "A known-name direct call to an eligible lazy tool is valid",
         ];

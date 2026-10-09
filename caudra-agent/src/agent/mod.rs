@@ -39,12 +39,11 @@ pub use history::{
 pub(crate) use instructions::{INSTRUCTION_FILES, LOCAL_INSTRUCTION_FILE};
 pub use instructions::{
     InstructionBaseline, InstructionOrigin, InstructionScope, InstructionSource, Instructions,
-    LoadedInstructions, build_system_prompt, build_system_prompt_for_remote, environment_block,
-    find_remote_nested_instructions, find_subdirectory_instructions, is_instruction_file,
-    load_instruction_text, load_instructions, load_remote_instructions,
+    LoadedInstructions, build_system_prompt, environment_block, find_remote_nested_instructions,
+    find_subdirectory_instructions, is_instruction_file, load_instruction_text, load_instructions,
+    load_remote_instructions,
 };
 pub use provider_projection::{ProjectedHistory, project_for_inspection, project_request};
-pub(crate) use run::resolve_purpose_model_for_inspection;
 pub use run::{
     Agent, AgentParams, AgentRunParams, ModelRoute, estimate_message_tokens,
     resolve_compaction_model, resolve_model_for_purpose, resolve_purpose_model,
@@ -54,4 +53,5 @@ pub(crate) use run::{
     GOAL_MET_QUESTION, goal_prescreen_state, should_skip_goal, skill_questions, skill_shortlist,
     skill_state, suggested_skill,
 };
+pub(crate) use run::{last_announced, resolve_purpose_model_for_inspection};
 pub use steering::EMPTY_RULE as EMPTY_RESPONSE_RULE;

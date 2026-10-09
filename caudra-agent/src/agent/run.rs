@@ -379,6 +379,10 @@ pub struct AgentRunParams<'h> {
     /// since changed on disk. `None` when they match, and for a subagent, which
     /// reads them fresh at spawn.
     pub instructions: Option<String>,
+    /// The memory entries other sessions wrote since `system` froze the memory
+    /// view, or the withdrawal once it holds them. `None` for a subagent, which
+    /// gets no view.
+    pub memory: Option<String>,
     /// The mode a task was granted. `None` for the interactive modes, which the
     /// user toggles and which are therefore derived from the transcript.
     pub mode_notice: Option<String>,
@@ -398,6 +402,7 @@ pub struct Agent<'h> {
     system: String,
     environment: Option<String>,
     instructions: Option<String>,
+    memory: Option<String>,
     mode_notice: Option<String>,
     event_tx: EventSender,
     tools: Value,
@@ -571,6 +576,7 @@ impl<'h> Agent<'h> {
             system: run.system,
             environment: run.environment,
             instructions: run.instructions,
+            memory: run.memory,
             mode_notice: run.mode_notice,
             event_tx: run.event_tx,
             tools: run.tools,
@@ -1062,6 +1068,11 @@ impl<'h> Agent<'h> {
             self.history.as_slice(),
             crate::prompt::INSTRUCTIONS_CHANGED_MARKER,
             self.instructions.as_deref(),
+        ));
+        standing.extend(standing_notice(
+            self.history.as_slice(),
+            crate::prompt::MEMORY_UPDATED_MARKER,
+            self.memory.as_deref(),
         ));
         standing.extend(standing_notice(
             self.history.as_slice(),
@@ -3398,7 +3409,7 @@ pub(super) fn push_injected(history: &mut History, event_tx: &EventSender, messa
 }
 
 /// The text of the most recent standing reminder of the kind `markers` name.
-fn last_announced<'a>(history: &'a [Message], markers: &[&str]) -> Option<&'a str> {
+pub(crate) fn last_announced<'a>(history: &'a [Message], markers: &[&str]) -> Option<&'a str> {
     history
         .iter()
         .rev()
@@ -4441,6 +4452,8 @@ mod tests {
     const PROMPT_SEED: &str = "Here is how I review code.";
     const INSTRUCTIONS_CHANGED: &str =
         "<system-reminder>\n# Instructions changed\n\n+ be brief\n</system-reminder>";
+    const MEMORY_UPDATED: &str =
+        "<system-reminder>\n# Memory updated\n\n- 7+1 note cache.md: Cache\n</system-reminder>";
     const MENTION_BODY: &str = "<file path=\"a.rs\">fn main() {}</file>";
     /// Standing, not per turn: the block stays in the transcript and the
     /// contract says the most recent one is the one in force.
@@ -5581,6 +5594,7 @@ mod tests {
                 system: "system".into(),
                 environment: None,
                 instructions: None,
+                memory: None,
                 mode_notice: None,
                 event_tx: EventSender::new(raw_tx, 0),
                 tools: serde_json::json!([]),
@@ -6847,7 +6861,8 @@ mod tests {
     #[test_case(vec![turn(), environment_announcement(ENVIRONMENT), plan_announcement(), reply(), turn(), environment_announcement(ENVIRONMENT), plan_announcement(), reply()], 4, &[] ; "blocks_the_tail_states_stay_put")]
     #[test_case(vec![turn(), plan_announcement(), reply(), turn(), build_announcement(), reply()], 3, &[] ; "a_later_mode_in_the_tail_supersedes")]
     #[test_case(vec![turn(), environment_announcement(ENVIRONMENT), reply(), turn(), environment_announcement(ENVIRONMENT_NEXT_DAY), reply(), turn(), reply()], 6, &[4] ; "only_the_last_block_of_a_kind")]
-    #[test_case(vec![turn(), plan_announcement(), Message::observation(crate::prompt::TASK_PLAN_CONTRACT.into()), Message::observation(INSTRUCTIONS_CHANGED.into()), environment_announcement(ENVIRONMENT), reply()], 6, &[4, 3, 2, 1] ; "everything_summarized_in_announcement_order")]
+    #[test_case(vec![turn(), plan_announcement(), Message::observation(crate::prompt::TASK_PLAN_CONTRACT.into()), Message::observation(INSTRUCTIONS_CHANGED.into()), environment_announcement(ENVIRONMENT), Message::observation(MEMORY_UPDATED.into()), reply()], 7, &[4, 3, 5, 2, 1] ; "everything_summarized_in_announcement_order")]
+    #[test_case(vec![turn(), Message::observation(MEMORY_UPDATED.into()), reply(), turn(), reply()], 3, &[1] ; "a_memory_update_is_restated")]
     fn a_compaction_restates_the_kinds_its_tail_lacks(
         history: Vec<Message>,
         head_end: usize,

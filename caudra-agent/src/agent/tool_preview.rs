@@ -567,7 +567,7 @@ mod tests {
     #[test_case("file_glob", r#"{"pattern": "**/*.rs""#, Some("**/*.rs") ; "glob_pattern")]
     #[test_case(MEMORY, r#"{"command": "write", "path": "a.md""#, Some("write a.md") ; "both_headline_arguments")]
     #[test_case(MEMORY, r#"{"path": "a.md", "command": "write""#, Some("write a.md") ; "joined_in_table_order_not_arrival_order")]
-    #[test_case(MEMORY, r#"{"command": "list""#, Some("list") ; "one_of_two_arguments")]
+    #[test_case(MEMORY, r#"{"command": "view""#, Some("view") ; "one_of_two_arguments")]
     #[test_case("plan", r#"{"action": "read"}"#, Some("read") ; "plan_read")]
     #[test_case("plan", r##"{"action": "write", "content": "# Plan""##, Some("write") ; "plan_write")]
     #[test_case("plan", r##"{"content": "# Plan", "action": "write"}"##, Some("write") ; "plan_content_before_action")]
@@ -581,8 +581,8 @@ mod tests {
     /// A member the object never declares is not one still being written, so a
     /// call that omits a headline argument settles at the closing brace
     /// instead of being rescanned to the cap.
-    #[test_case(r#"{"command": "list""#, false ; "still_open")]
-    #[test_case(r#"{"command": "list"}"#, true ; "closed_without_the_second")]
+    #[test_case(r#"{"command": "view""#, false ; "still_open")]
+    #[test_case(r#"{"command": "view"}"#, true ; "closed_without_the_second")]
     #[test_case(r#"{"command": "write", "path": "a.md""#, true ; "both_arrived_whole")]
     #[test_case(r#"{"command": "write", "path": "a.m"#, false ; "second_still_arriving")]
     fn a_composite_preview_settles_when_it_cannot_grow(json: &str, expected: bool) {
