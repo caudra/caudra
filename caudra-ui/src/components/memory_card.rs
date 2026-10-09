@@ -5,21 +5,27 @@
 //! A note's own row is what the card promises — its name and what its body
 //! costs — so those rows are pinned and the bodies are what a budget takes
 //! away. A collapsed card is then the index of what came back rather than the
-//! opening lines of whichever note happened to be first. Lines and search hits
-//! are drawn as the text the model read, so the card never tells a reader
-//! something the model was not told.
+//! opening lines of whichever note happened to be first.
+//!
+//! Lines and hits are drawn from the fields the model's text is built from,
+//! laid out the way a read or a grep is: the address in a numbered column and
+//! the text hung beside it, so a long line never wraps back under its address.
+//! The card adds no words of its own.
 
 use std::path::PathBuf;
 
+use caudra_agent::memory::search::terms;
 use caudra_agent::{
-    MEMORY_TAG_SEPARATOR, MemoryNote, MemoryNoteEntry, MemoryOrigin, MemoryOutput, MemoryTagGroup,
+    MEMORY_TAG_SEPARATOR, MemoryHit, MemoryLine, MemoryNote, MemoryNoteEntry, MemoryOutput,
+    MemoryTagGroup,
 };
 use caudra_providers::token_label;
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
 use crate::components::code_view::{RowTarget, body_window, truncation_line};
-use crate::components::escape_terminal_controls;
+use crate::components::{escape_terminal_controls, hanging_spans, highlight, term_ranges};
 use crate::markdown::text_to_painted;
 use crate::theme;
 
@@ -31,6 +37,9 @@ const INDENT: &str = "  ";
 const INDENT_WIDTH: u16 = 2;
 const TAG_COUNT_OPEN: &str = " (";
 const TAG_COUNT_CLOSE: char = ')';
+/// Between an address and the text it addresses, as between a line number
+/// and its code.
+const ADDRESS_GAP: &str = " ";
 
 /// The card's lines, what each of them answers for, and whether a body was
 /// held back.
@@ -40,19 +49,15 @@ pub(crate) fn render(
     width: u16,
 ) -> (Vec<Line<'static>>, Vec<Option<RowTarget>>, bool) {
     let mut card = Card::default();
+    card.push_notices(output.notices());
     match output {
-        MemoryOutput::Notes { notes, notices, .. } => {
-            card.push_notices(notices);
-            card.push_notes(notes, budget, width);
+        MemoryOutput::Notes { notes, .. } => card.push_notes(notes, budget, width),
+        MemoryOutput::Index { groups, .. } => card.push_index(groups, budget),
+        MemoryOutput::Lines { lines, .. } => {
+            card.push_lines(&output.heading(), lines, budget, width);
         }
-        MemoryOutput::Index {
-            groups, notices, ..
-        } => {
-            card.push_notices(notices);
-            card.push_index(groups, budget);
-        }
-        MemoryOutput::Lines { .. } | MemoryOutput::Hits { .. } => {
-            card.push_text(&output.as_display_text(), budget);
+        MemoryOutput::Hits { query, hits, .. } => {
+            card.push_hits(&output.heading(), query, hits, budget, width);
         }
     }
     (card.lines, card.rows, card.truncated)
@@ -62,22 +67,25 @@ pub(crate) fn render(
 /// are held by reference and have no file on this host, so they answer `None`
 /// and the click falls through to the card's own control.
 pub(crate) fn note_path(output: &MemoryOutput, target: RowTarget) -> Option<PathBuf> {
-    origins(output)
-        .get(target.index())?
-        .path()
+    paths(output)
+        .get(target.index())
+        .copied()
+        .flatten()
         .map(PathBuf::from)
 }
 
-/// Every note the card drew, in the order it drew them. Both the renderer and
-/// the click path index this, so a target means the same note to each.
-fn origins(output: &MemoryOutput) -> Vec<&MemoryOrigin> {
+/// The file of every note the card drew, in the order it drew them. Both the
+/// renderer and the click path index this, so a target means the same note
+/// to each.
+fn paths(output: &MemoryOutput) -> Vec<Option<&str>> {
     match output {
-        MemoryOutput::Notes { notes, .. } => notes.iter().map(|note| &note.origin).collect(),
+        MemoryOutput::Notes { notes, .. } => notes.iter().map(|note| note.origin.path()).collect(),
         MemoryOutput::Index { groups, .. } => groups
             .iter()
-            .flat_map(|group| group.notes.iter().map(|note| &note.origin))
+            .flat_map(|group| group.notes.iter().map(|note| note.origin.path()))
             .collect(),
-        MemoryOutput::Lines { .. } | MemoryOutput::Hits { .. } => Vec::new(),
+        MemoryOutput::Hits { hits, .. } => hits.iter().map(|hit| hit.path.as_deref()).collect(),
+        MemoryOutput::Lines { .. } => Vec::new(),
     }
 }
 
@@ -96,13 +104,33 @@ impl Card {
         self.rows.push(target);
     }
 
+    /// Text hung beside `gutter`, already broken to `width` so its later rows
+    /// start under the text rather than under the gutter.
+    fn push_hung(
+        &mut self,
+        gutter: Span<'static>,
+        spans: Vec<Span<'static>>,
+        width: u16,
+        target: Option<RowTarget>,
+    ) {
+        for line in hanging_spans(gutter, spans, width) {
+            self.push(line, target);
+        }
+    }
+
+    fn push_dim(&mut self, text: &str) {
+        self.push(
+            Line::from(Span::styled(
+                escape_terminal_controls(text),
+                theme::current().tool_dim,
+            )),
+            None,
+        );
+    }
+
     fn push_notices(&mut self, notices: &[String]) {
-        let dim = theme::current().tool_dim;
         for notice in notices {
-            self.push(
-                Line::from(Span::styled(escape_terminal_controls(notice), dim)),
-                None,
-            );
+            self.push_dim(notice);
         }
     }
 
@@ -121,7 +149,7 @@ impl Card {
             budget.saturating_sub(pinned),
         );
         for (index, (note, body)) in notes.iter().zip(bodies).enumerate() {
-            let target = clickable(&note.origin, index);
+            let target = clickable(note.origin.path(), index);
             if index > 0 {
                 self.push(Line::default(), target);
             }
@@ -152,7 +180,7 @@ impl Card {
                 if drawn < room {
                     self.push(
                         index_row(note, name_width, tokens_width),
-                        clickable(&note.origin, index),
+                        clickable(note.origin.path(), index),
                     );
                     drawn += 1;
                 }
@@ -162,15 +190,71 @@ impl Card {
         self.finish(hidden);
     }
 
-    /// The text already leads with its notices, so they are not drawn apart.
-    fn push_text(&mut self, text: &str, budget: usize) {
-        let style = theme::current().tool;
-        let rows: Vec<&str> = text.lines().collect();
-        let (room, hidden) = body_window(rows.len(), budget);
-        for row in rows.into_iter().take(room) {
-            self.push(
-                Line::from(Span::styled(escape_terminal_controls(row), style)),
+    /// The heading stays, and the lines are what a budget takes, counted as
+    /// the model reads them rather than as they wrap.
+    fn push_lines(&mut self, heading: &str, lines: &[MemoryLine], budget: usize, width: u16) {
+        if lines.is_empty() {
+            return;
+        }
+        self.push_dim(heading);
+        let (room, hidden) = body_window(lines.len(), budget.saturating_sub(self.lines.len()));
+        let shown = &lines[..room];
+        let gutter = Gutter::new(shown.iter().map(MemoryLine::address));
+        let theme = theme::current();
+        for line in shown {
+            let style = match line.pending {
+                true => theme.tool_dim,
+                false => theme.tool,
+            };
+            self.push_hung(
+                gutter.address(&line.address()),
+                Vec::from([Span::styled(escape_terminal_controls(&line.text), style)]),
+                width,
                 None,
+            );
+        }
+        self.finish(hidden);
+    }
+
+    /// Like a read: every hit's own row is pinned, and the matching lines
+    /// under them are what a budget takes away.
+    fn push_hits(
+        &mut self,
+        heading: &str,
+        query: &str,
+        hits: &[MemoryHit],
+        budget: usize,
+        width: u16,
+    ) {
+        if hits.is_empty() {
+            return;
+        }
+        self.push_dim(heading);
+        let excerpts = hits.iter().filter(|hit| hit.line.is_some()).count();
+        let pinned = self.lines.len() + hits.len();
+        let (mut room, hidden) = body_window(excerpts, budget.saturating_sub(pinned));
+        let gutter = Gutter::new(hits.iter().map(MemoryHit::address));
+        let terms = terms(query);
+        let theme = theme::current();
+        for (index, hit) in hits.iter().enumerate() {
+            let target = clickable(hit.path.as_deref(), index);
+            let mut spans = marked(&hit.name, theme.tool_path, &terms);
+            if !hit.heading.is_empty() {
+                spans.push(Span::styled(
+                    format!("{GAP}{}", escape_terminal_controls(&hit.heading)),
+                    theme.tool,
+                ));
+            }
+            self.push_hung(gutter.address(&hit.address()), spans, width, target);
+            let Some(line) = hit.line.as_deref().filter(|_| room > 0) else {
+                continue;
+            };
+            room -= 1;
+            self.push_hung(
+                gutter.blank(),
+                marked(line, theme.tool_dim, &terms),
+                width,
+                target,
             );
         }
         self.finish(hidden);
@@ -185,10 +269,51 @@ impl Card {
     }
 }
 
+/// The column the addresses of one card stand in, right-aligned so the text
+/// beside them starts in one column, as line numbers keep code aligned.
+struct Gutter {
+    width: usize,
+}
+
+impl Gutter {
+    fn new(addresses: impl Iterator<Item = String>) -> Self {
+        Self {
+            width: addresses
+                .map(|address| address.width())
+                .max()
+                .unwrap_or_default(),
+        }
+    }
+
+    fn address(&self, address: &str) -> Span<'static> {
+        let width = self.width;
+        Span::styled(
+            format!("{address:>width$}{ADDRESS_GAP}"),
+            theme::current().diff_line_nr,
+        )
+    }
+
+    fn blank(&self) -> Span<'static> {
+        Span::raw(" ".repeat(self.width + ADDRESS_GAP.len()))
+    }
+}
+
+/// `text` in `style`, with the searched words in it marked the way a search
+/// marks its matches.
+fn marked(text: &str, style: Style, terms: &[String]) -> Vec<Span<'static>> {
+    let text = escape_terminal_controls(text);
+    let ranges = term_ranges(&text, terms);
+    highlight(
+        Vec::from([Span::styled(text, style)]),
+        &ranges,
+        theme::current().item_match,
+    )
+}
+
 /// Every row of a note answers for it, the way a batch child's rows do: an open
 /// note is one thing to click, not a header with unaddressed text beneath it.
-fn clickable(origin: &MemoryOrigin, index: usize) -> Option<RowTarget> {
-    origin.path().is_some().then_some(RowTarget::Item(index))
+fn clickable(path: Option<&str>, index: usize) -> Option<RowTarget> {
+    path.map(|_| RowTarget::Item(index))
 }
 
 /// The note's body as the document it is. Painted at the width it will sit at
@@ -272,7 +397,7 @@ fn column_width(groups: &[MemoryTagGroup], measure: impl Fn(&MemoryNoteEntry) ->
 
 #[cfg(test)]
 mod tests {
-    use caudra_agent::{MemoryHit, MemoryLine, MemoryOutput};
+    use caudra_agent::{MemoryHit, MemoryLine, MemoryOrigin, MemoryOutput};
     use test_case::test_case;
 
     use super::*;
@@ -291,7 +416,17 @@ mod tests {
         "The 3 oldest entries are left out until their summaries are written; search finds them.";
     const PINNED_MSG: &str = "a note's own row is never what a budget takes";
     const CLICK_MSG: &str = "a local note takes the click, a remote one cannot";
-    const MODEL_TEXT_MSG: &str = "the card draws the text the model read";
+    const MODEL_TEXT_MSG: &str = "the card draws every word the model read";
+    const HANG_MSG: &str = "a wrapped row starts under the text, never under the address";
+    const ALIGN_MSG: &str = "right-aligned addresses start every text in one column";
+    const DIM_MSG: &str = "the heading and a line not summarized yet are dimmed";
+    const MARK_MSG: &str = "the searched words are marked, whatever their case";
+    const COLLAPSE_MSG: &str = "a hit's own row is never what a budget takes";
+    const NARROW: u16 = 40;
+    const LONG_TEXT: &str =
+        "a summary line long enough that a narrow card has to break it over several rows";
+    const EXCERPT: &str = "Retry the FLAKY suite once.";
+    const MARKED_WORD: &str = "FLAKY";
 
     fn file_note(name: &str) -> MemoryNote {
         MemoryNote {
@@ -358,15 +493,43 @@ mod tests {
         }
     }
 
-    fn search() -> MemoryOutput {
+    fn hit(seq: u64, name: &str, path: Option<String>) -> MemoryHit {
+        MemoryHit {
+            seq,
+            name: name.to_owned(),
+            heading: "Gotchas".to_owned(),
+            line: Some(EXCERPT.to_owned()),
+            path,
+        }
+    }
+
+    fn hits(hits: Vec<MemoryHit>) -> MemoryOutput {
         MemoryOutput::Hits {
             query: QUERY.to_owned(),
-            hits: Vec::from([MemoryHit {
-                seq: 4,
-                name: NOTE.to_owned(),
-                heading: "Gotchas".to_owned(),
-                line: Some("Retry the flaky suite once.".to_owned()),
-            }]),
+            hits,
+            notices: Vec::new(),
+        }
+    }
+
+    fn search() -> MemoryOutput {
+        hits(Vec::from([
+            hit(4, NOTE, Some(format!("/notes/{NOTE}"))),
+            hit(120, OTHER, None),
+        ]))
+    }
+
+    fn lines(lines: &[(u64, u64, &str)]) -> MemoryOutput {
+        MemoryOutput::Lines {
+            heading: VIEW_HEADING.to_owned(),
+            lines: lines
+                .iter()
+                .map(|&(id, count, text)| MemoryLine {
+                    id,
+                    count,
+                    text: text.to_owned(),
+                    pending: false,
+                })
+                .collect(),
             notices: Vec::new(),
         }
     }
@@ -390,6 +553,14 @@ mod tests {
 
     fn rendered(output: &MemoryOutput, budget: usize) -> Vec<String> {
         render(output, budget, WIDTH).0.iter().map(text).collect()
+    }
+
+    fn rendered_at(output: &MemoryOutput, width: u16) -> Vec<String> {
+        render(output, usize::MAX, width)
+            .0
+            .iter()
+            .map(text)
+            .collect()
     }
 
     /// The point of the card: a budget that cannot fit the bodies still shows
@@ -516,20 +687,137 @@ mod tests {
         );
     }
 
+    fn words(text: &str) -> Vec<&str> {
+        text.split(|c: char| c.is_whitespace() || c == '|')
+            .map(|word| word.trim_end_matches(':'))
+            .filter(|word| !word.is_empty() && *word != "-")
+            .collect()
+    }
+
+    /// The card is laid out differently from the model's text, but holds every
+    /// word of it, in the same order.
     #[test_case(view(Vec::from([HIDDEN_NOTICE.to_owned()])) ; "a_view_with_its_notice")]
     #[test_case(view(Vec::new()) ; "a_view")]
     #[test_case(search() ; "a_search")]
-    fn lines_and_hits_draw_the_text_the_model_read(output: MemoryOutput) {
-        let (lines, rows, truncated) = render(&output, usize::MAX, WIDTH);
+    fn the_card_draws_every_word_the_model_read(output: MemoryOutput) {
+        let (lines, _, truncated) = render(&output, usize::MAX, WIDTH);
         let drawn: Vec<String> = lines.iter().map(text).collect();
+        let drawn = drawn.join("\n");
+        let model = output.as_display_text();
 
         assert!(!truncated);
-        assert_eq!(
-            drawn.join("\n"),
-            output.as_display_text(),
-            "{MODEL_TEXT_MSG}"
+        assert_eq!(words(&drawn), words(&model), "{MODEL_TEXT_MSG}");
+    }
+
+    #[test]
+    fn a_wrapped_line_hangs_under_its_text() {
+        let output = lines(&[(0, 32, LONG_TEXT), (32, 1, LONG_TEXT)]);
+        let drawn = rendered_at(&output, NARROW);
+        let address = "0+32 ";
+
+        assert!(drawn[1].starts_with(address), "{drawn:?}");
+        let continued: Vec<&String> = drawn[2..]
+            .iter()
+            .filter(|row| !row.trim_start().starts_with("32+1"))
+            .collect();
+        assert!(!continued.is_empty(), "{drawn:?}");
+        for row in continued {
+            assert!(
+                row.starts_with(&" ".repeat(address.len())),
+                "{HANG_MSG}: {drawn:?}"
+            );
+            assert!(
+                !row[address.len()..].starts_with(' '),
+                "{HANG_MSG}: {drawn:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn addresses_right_align_so_the_text_lines_up() {
+        let output = lines(&[(0, 32, OTHER), (624, 1, NOTE)]);
+        let drawn = rendered(&output, usize::MAX);
+
+        assert_eq!(drawn[1], format!(" 0+32 {OTHER}"), "{ALIGN_MSG}");
+        assert_eq!(drawn[2], format!("624+1 {NOTE}"), "{ALIGN_MSG}");
+        let drawn = rendered(&lines(&[(0, 1, OTHER), (624, 1, NOTE)]), usize::MAX);
+        assert_eq!(drawn[1].find(OTHER), drawn[2].find(NOTE), "{ALIGN_MSG}");
+    }
+
+    #[test]
+    fn the_heading_and_a_pending_line_are_dimmed() {
+        let theme = theme::current();
+        let (lines, _, _) = render(&view(Vec::new()), usize::MAX, WIDTH);
+        let text_style = |line: &Line<'static>| line.spans.last().unwrap().style;
+
+        assert_eq!(lines[0].spans[0].style, theme.tool_dim, "{DIM_MSG}");
+        assert_eq!(text_style(&lines[1]), theme.tool, "{DIM_MSG}");
+        assert_eq!(text_style(&lines[3]), theme.tool_dim, "{DIM_MSG}");
+        assert_eq!(lines[1].spans[0].style, theme.diff_line_nr);
+    }
+
+    #[test]
+    fn a_hit_marks_the_searched_words() {
+        let theme = theme::current();
+        let (lines, _, _) = render(&search(), usize::MAX, WIDTH);
+        let excerpt = lines
+            .iter()
+            .find(|line| text(line).contains(EXCERPT))
+            .unwrap();
+
+        let marked: Vec<&str> = excerpt
+            .spans
+            .iter()
+            .filter(|span| span.style == theme.tool_dim.patch(theme.item_match))
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(marked, [MARKED_WORD], "{MARK_MSG}");
+    }
+
+    #[test]
+    fn a_local_hit_takes_the_click_and_a_remote_one_cannot() {
+        let output = search();
+        let (lines, rows, _) = render(&output, usize::MAX, WIDTH);
+        let clicked: Vec<(String, Option<RowTarget>)> = lines
+            .iter()
+            .map(text)
+            .zip(rows)
+            .filter(|(_, row)| row.is_some())
+            .collect();
+
+        assert_eq!(clicked.len(), 2, "{CLICK_MSG}: {clicked:?}");
+        assert!(
+            clicked
+                .iter()
+                .all(|(row, target)| !row.contains(OTHER) && *target == Some(RowTarget::Item(0))),
+            "{CLICK_MSG}: {clicked:?}"
         );
-        assert!(rows.iter().all(Option::is_none), "{CLICK_MSG}");
+        assert_eq!(
+            note_path(&output, RowTarget::Item(0)),
+            Some(PathBuf::from(format!("/notes/{NOTE}")))
+        );
+        assert_eq!(note_path(&output, RowTarget::Item(1)), None, "{CLICK_MSG}");
+    }
+
+    #[test]
+    fn a_collapsed_search_keeps_every_hit_row_and_drops_excerpts() {
+        let output = search();
+        let (lines, _, truncated) = render(&output, 3, WIDTH);
+        let drawn: Vec<String> = lines.iter().map(text).collect();
+
+        assert!(truncated);
+        assert!(
+            drawn.iter().any(|row| row.contains(NOTE)),
+            "{COLLAPSE_MSG}: {drawn:?}"
+        );
+        assert!(
+            drawn.iter().any(|row| row.contains(OTHER)),
+            "{COLLAPSE_MSG}: {drawn:?}"
+        );
+        assert!(
+            !drawn.iter().any(|row| row.contains(EXCERPT)),
+            "{COLLAPSE_MSG}: {drawn:?}"
+        );
     }
 
     #[test]

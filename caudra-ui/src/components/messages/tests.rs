@@ -1487,7 +1487,7 @@ fn tool_done_updates_start_status(is_error: bool, expected: ToolStatus) {
 #[test_case(
     FILE_WRITE_TOOL_NAME,
     ToolOutput::WriteCode { path: "src/main.rs".into(), byte_count: 42, lines: vec!["fn main() {}".into()] },
-    Some("1 lines")
+    Some("1 line")
     ; "write_bytes"
 )]
 #[test_case(
@@ -1520,7 +1520,7 @@ fn tool_done_sets_annotation(tool: &'static str, output: ToolOutput, expected: O
 }
 
 #[test_case("line\n".repeat(200).as_str(), Some("2m timeout · 200 lines") ; "merges_start_and_output_annotations")]
-#[test_case("ok",                           Some("2m timeout · 1 lines") ; "merges_start_and_short_output")]
+#[test_case("ok",                           Some("2m timeout · 1 line")  ; "merges_start_and_short_output")]
 fn tool_done_annotation_merge(output: &str, expected: Option<&str>) {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     let mut event = start("t1", SHELL_TOOL_NAME);
@@ -7069,7 +7069,7 @@ fn a_compact_row_names_its_tool_with_a_sigil_and_label() {
     finished(&mut panel, &["t1"]);
     rebuild(&mut panel);
 
-    assert_eq!(first_line_text(&panel, 0), "⌕ Grepped t1 (1 lines)");
+    assert_eq!(first_line_text(&panel, 0), "⌕ Grepped t1 (1 line)");
 }
 
 /// The past tense asserts the call happened, so a failure has to fall back to
@@ -7140,7 +7140,7 @@ fn an_unknown_tool_falls_back_to_its_registered_name() {
     finished(&mut panel, &["t1"]);
     rebuild(&mut panel);
 
-    assert_eq!(first_line_text(&panel, 0), "⚙ mystery_tool t1 (1 lines)");
+    assert_eq!(first_line_text(&panel, 0), "⚙ mystery_tool t1 (1 line)");
 }
 
 #[test]

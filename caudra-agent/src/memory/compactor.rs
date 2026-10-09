@@ -58,6 +58,8 @@ const MEMORY_CLOSE: &str = "</memory>";
 const COMPRESS: &str = "Compress this note into one line";
 const MERGE: &str = "Merge these two lines into one";
 const LIMIT_MARK: &str = "| ← LIMIT";
+/// Separators a cut line would otherwise end on.
+const TRAILING: [char; 3] = [',', ';', ':'];
 
 /// The pump's clock and waits, behind a trait so tests decide when time
 /// passes.
@@ -495,18 +497,16 @@ impl Shared {
             Material::Entry(seq) => {
                 let entry = self.entry(*seq).await?;
                 let kind = leaf_kind(&entry.meta);
-                step(COMPRESS, &entry_text(kind, &entry.meta.name, &entry.body))
+                compress(&entry_text(kind, &entry.meta.name, &entry.body))
             }
-            Material::Lines(first, second) => {
-                step(MERGE, &format!("{}\n{}", flat(first), flat(second)))
-            }
+            Material::Lines(first, second) => merge(first, second),
         };
         let line = self.line(&job.memory, step).await?;
         Ok(self.store_line(&job.part, line).await?)
     }
 
     /// Up to [`TRIES`] replies in one conversation, each one too long
-    /// answered with where it had to end. The first that fits wins, else the
+    /// answered with how much of it fits. The first that fits wins, else the
     /// shortest, cut to fit.
     async fn line(&self, memory: &str, step: String) -> Result<String, BuildError> {
         let mut messages = vec![Message {
@@ -537,7 +537,7 @@ impl Shared {
                 shortest = reply;
             }
         }
-        Ok(cut(&shortest).trim_end().to_owned())
+        Ok(cut(&shortest).to_owned())
     }
 
     /// One reply, trimmed. Its spend is reported whatever it says.
@@ -623,22 +623,53 @@ fn memory_block(context: &[&str]) -> String {
     block
 }
 
-/// Models cannot count bytes, so the step shows the limit as a ruler.
-fn step(task: &str, material: &str) -> String {
-    format!("{}\n{task}, in at most {NODE} bytes:\n{material}", scale())
+fn compress(note: &str) -> String {
+    step(&format!("{COMPRESS}, in at most {NODE} bytes"), note)
 }
 
-/// An overlong reply comes back cut where it had to end.
-fn feedback(reply: &str) -> String {
-    format!(
-        "That line is {} bytes; the limit is {NODE}. It must end where it is cut here:\n{}{LIMIT_MARK}",
-        reply.len(),
-        cut(reply)
+/// Two full lines rarely fit one, and a model left to choose keeps the
+/// first whole and drops the second, so each is given its half.
+fn merge(first: &str, second: &str) -> String {
+    step(
+        &format!(
+            "{MERGE}, in at most {NODE} bytes, about {} for each, keeping every note name from both",
+            NODE / 2
+        ),
+        &format!("{}\n{}", flat(first), flat(second)),
     )
 }
 
-fn cut(text: &str) -> &str {
+/// Models cannot count bytes, so the step shows the limit as a ruler.
+fn step(task: &str, material: &str) -> String {
+    format!("{}\n{task}:\n{material}", scale())
+}
+
+/// An overlong reply comes back with how much of it fits, framed as a
+/// rewrite: asked where it had to end, models copied the cut, mid-word.
+fn feedback(reply: &str) -> String {
+    format!(
+        "That line is {} bytes, {} over the limit of {NODE}. Rewrite all of it shorter, keeping \
+         every note name, rather than ending it early. This much of it fits:\n{}{LIMIT_MARK}",
+        reply.len(),
+        reply.len() - NODE,
+        fitting(reply)
+    )
+}
+
+fn fitting(text: &str) -> &str {
     &text[..text.floor_char_boundary(NODE)]
+}
+
+/// The last resort for a reply that never fit: it ends after its last whole
+/// word, or where the limit falls when no word ends before it.
+fn cut(text: &str) -> &str {
+    let fits = fitting(text);
+    let whole = fits.len() == text.len() || text[fits.len()..].starts_with(char::is_whitespace);
+    let words = match fits.rfind(char::is_whitespace) {
+        Some(end) if !whole => &fits[..end],
+        _ => fits,
+    };
+    words.trim_end_matches(|c: char| c.is_whitespace() || TRAILING.contains(&c))
 }
 
 fn flat(line: &str) -> String {
@@ -692,8 +723,16 @@ mod tests {
     const NARROW: &str = "a";
     const WIDE: &str = "é";
     const WIDE_CHARS: usize = 300;
-    const OVERLONG_FEEDBACK: &str =
-        "That line is 601 bytes; the limit is 512. It must end where it is cut here:\n";
+    const OVERLONG_FEEDBACK: &str = "That line is 601 bytes, 89 over the limit of 512. Rewrite all \
+        of it shorter, keeping every note name, rather than ending it early. This much of it fits:\n";
+    const COMPRESS_TASK: &str = "Compress this note into one line, in at most 512 bytes:";
+    const MERGE_TASK: &str = "Merge these two lines into one, in at most 512 bytes, about 256 for \
+        each, keeping every note name from both:";
+    const FIRST: &str = "flaky-tests: retry the socket test";
+    const SECOND: &str = "release: tag after CI";
+    const WORD: &str = "word ";
+    const LISTED: &str = "word, ";
+    const TAIL: &str = " tail";
     /// The last character boundary before the limit.
     const OVERLONG_CUT: usize = NODE - 1;
     /// How far past the limit each try runs.
@@ -1004,8 +1043,25 @@ mod tests {
         });
     }
 
+    #[test_case(compress(FIRST), COMPRESS_TASK, &[FIRST] ; "a_leaf")]
+    #[test_case(merge(FIRST, SECOND), MERGE_TASK, &[FIRST, SECOND] ; "a_merge_gives_each_line_its_half")]
+    fn each_step_states_its_budget(step: String, task: &str, material: &[&str]) {
+        let lines: Vec<&str> = step.lines().collect();
+        assert_eq!(lines[0], scale());
+        assert_eq!(lines[1], task);
+        assert_eq!(lines[2..], *material);
+    }
+
+    #[test_case(WORD.repeat(NODE), WORD.repeat(NODE / WORD.len()).trim_end().to_owned() ; "after_the_last_whole_word")]
+    #[test_case(LISTED.repeat(NODE), LISTED.repeat(NODE / LISTED.len()).trim_end().trim_end_matches(',').to_owned() ; "without_the_separator_before_it")]
+    #[test_case(format!("{}{TAIL}", NARROW.repeat(NODE)), NARROW.repeat(NODE) ; "whole_when_the_limit_falls_between_words")]
+    #[test_case(NARROW.repeat(NODE + 1), NARROW.repeat(NODE) ; "at_the_limit_when_no_word_ends_before_it")]
+    fn a_reply_that_never_fit_is_cut(reply: String, line: String) {
+        assert_eq!(cut(&reply), line);
+    }
+
     #[test]
-    fn an_overlong_reply_is_shown_where_it_had_to_end() {
+    fn an_overlong_reply_is_shown_how_much_of_it_fits() {
         smol::block_on(async {
             let fixture = Fixture::new(1);
             let overlong = format!("{NARROW}{}", WIDE.repeat(WIDE_CHARS));

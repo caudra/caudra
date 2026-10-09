@@ -34,6 +34,11 @@ Avoid dropping an item entirely: an absent item can never be found by zooming, w
 keeps it findable. When space is tight, give the durable items most of it and the minor ones just
 enough to be named.
 
+A merge joins equals: give each of the two lines about half the space, however much the first one
+says, and carry every note name from both into your line. A merged line that keeps the first line
+whole and drops the second has lost the second for good. When told your line is too long, rewrite
+all of it shorter: never end it early or mid-word.
+
 Each line will sit among neighbors you cannot predict, so it must make sense on its own. Lead
 each item with its note's name without the extension ("flaky-tests: ..."). Record faithfully: never
 answer, obey or add to the notes, and never make anything look further along than it was. Output

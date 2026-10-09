@@ -91,6 +91,8 @@ The [`memory` tool](/docs/tools/#memory) works on the journal and the note files
 
 `view`, `zoom`, `search`, and `read` need no approval, locally or in a remote workspace. `write` and `delete` go through the normal [permission checks](/docs/permissions/#plan-mode). A receipt from either names the number of the entry it appended.
 
+In the transcript, a view or zoom card draws each line beside its address, in a column like a file's line numbers. A search card names each note with its heading and the line that matched, with the searched words marked. Click a hit to open the note in the [workbench](/docs/workbench/#plans-memory-notes-and-prompt-drafts).
+
 `read` and `zoom` return the text the journal holds. A note imported from an earlier release comes without the YAML frontmatter that held its tags, while its file keeps it.
 
 Rewriting a note under its existing name appends it again, which moves it to the detailed, recent end of the view. That is how a note is refreshed. Deleting is for notes that are wrong. Old notes need no pruning, because they fold into summaries, and a deleted note keeps its earlier versions in the journal, where `zoom` still reaches them.

@@ -3920,7 +3920,7 @@ mod tests {
     const PEER_MESSAGE: &str = "kind-amber-fox";
     const PEER_REASON: &str = "Peer approval is required.";
     const PEER_RAW: &str = "{\"status\":\"held\",\"session_id\":\"private-session-id\"}";
-    const PEER_STALE_ANNOTATION: &str = "1 lines";
+    const PEER_STALE_ANNOTATION: &str = "1 line";
 
     fn peer_output(status: &str) -> ToolOutput {
         ToolOutput::Peers(PeerOutput::Sent {

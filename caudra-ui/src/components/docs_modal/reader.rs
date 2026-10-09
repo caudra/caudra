@@ -14,11 +14,11 @@ use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::Line;
 
 use super::{PaneContext, Shown, clicked};
 use crate::components::document_view::{DocumentMouse, DocumentView, Jump, Painted};
-use crate::components::hover_style;
+use crate::components::{highlight, hover_style, term_ranges};
 use crate::markdown::{LinkMap, text_to_rows};
 use crate::provenance::{LineProvenance, Provenance};
 use crate::selection::line_text;
@@ -549,74 +549,6 @@ fn restyle(
     Painted::new(lines, Vec::new(), page.anchors.clone())
 }
 
-/// Where `terms` occur in `text`, ignoring ASCII case, merged where they
-/// overlap. Folding ASCII case keeps every byte where it was, so the ranges
-/// hold for `text` itself.
-fn term_ranges(text: &str, terms: &[String]) -> Vec<Range<usize>> {
-    let folded = text.to_ascii_lowercase();
-    let mut ranges: Vec<Range<usize>> = terms
-        .iter()
-        .filter(|term| !term.is_empty())
-        .flat_map(|term| {
-            folded
-                .match_indices(term.as_str())
-                .map(|(at, found)| at..at + found.len())
-        })
-        .collect();
-    ranges.sort_unstable_by_key(|range| (range.start, range.end));
-    let mut merged: Vec<Range<usize>> = Vec::new();
-    for range in ranges {
-        match merged.last_mut() {
-            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
-            _ => merged.push(range),
-        }
-    }
-    merged
-}
-
-/// Splits `spans` where `ranges` start and end and patches `style` onto what
-/// they cover. `ranges` are ascending byte ranges into the spans' joined text.
-fn highlight(
-    spans: Vec<Span<'static>>,
-    ranges: &[Range<usize>],
-    style: Style,
-) -> Vec<Span<'static>> {
-    let mut out = Vec::with_capacity(spans.len() + ranges.len() * 2);
-    let mut start = 0;
-    for span in spans {
-        let end = start + span.content.len();
-        let mut cut = start;
-        for range in ranges
-            .iter()
-            .filter(|range| range.start < end && range.end > start)
-        {
-            let from = range.start.max(start);
-            let to = range.end.min(end);
-            if from > cut {
-                out.push(Span::styled(
-                    span.content[cut - start..from - start].to_owned(),
-                    span.style,
-                ));
-            }
-            out.push(Span::styled(
-                span.content[from - start..to - start].to_owned(),
-                span.style.patch(style),
-            ));
-            cut = to;
-        }
-        if cut == start {
-            out.push(span);
-        } else if cut < end {
-            out.push(Span::styled(
-                span.content[cut - start..].to_owned(),
-                span.style,
-            ));
-        }
-        start = end;
-    }
-    out
-}
-
 /// The span drawn over display `column` of `line`.
 fn span_at(line: &Line<'_>, column: usize) -> Option<usize> {
     let mut end = 0;
@@ -628,50 +560,15 @@ fn span_at(line: &Line<'_>, column: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    use ratatui::text::Span;
     use test_case::test_case;
 
     use super::*;
 
-    const TERM: &str = "timeout";
-    const MIXED_CASE: &str = "A Timeout, then a TIMEOUT.";
-    const SPAN_HEAD: &str = "A Time";
-    const SPAN_TAIL: &str = "out, then";
     const MULTILINE_CODE: &str = "```text\nabcdefghij\nklmnop\n```";
     const BLANK_CODE: &str = "```text\nabcdefghij\n\nklmnop\n```";
-    /// Where "Timeout" sits in the two spans joined, straddling their seam.
-    const ACROSS_SPANS: Range<usize> = 2..9;
     /// The source line each of five rows shows, with no row for lines 1 and 3.
     const ROW_LINES: [usize; 5] = [0, 0, 2, 2, 4];
-
-    #[test]
-    fn terms_match_whatever_their_case() {
-        assert_eq!(
-            term_ranges(MIXED_CASE, &[TERM.to_owned()]),
-            vec![2..9, 18..25]
-        );
-    }
-
-    #[test_case(&["time", "timeout"], vec![2..9, 18..25] ; "nested")]
-    #[test_case(&["a t", "timeout"], vec![0..9, 16..25] ; "overlapping")]
-    fn overlapping_terms_merge(terms: &[&str], expected: Vec<Range<usize>>) {
-        let terms: Vec<String> = terms.iter().map(|term| term.to_string()).collect();
-        assert_eq!(term_ranges(MIXED_CASE, &terms), expected);
-    }
-
-    #[test]
-    fn highlight_splits_spans_and_keeps_their_text() {
-        let marked = Style::new().add_modifier(Modifier::BOLD);
-        let spans = vec![Span::raw(SPAN_HEAD), Span::raw(SPAN_TAIL)];
-        let split = highlight(spans, &[ACROSS_SPANS], marked);
-        let text: String = split.iter().map(|span| span.content.as_ref()).collect();
-        let highlighted: String = split
-            .iter()
-            .filter(|span| span.style == marked)
-            .map(|span| span.content.as_ref())
-            .collect();
-        assert_eq!(text, format!("{SPAN_HEAD}{SPAN_TAIL}"));
-        assert_eq!(highlighted, text[ACROSS_SPANS]);
-    }
 
     #[test]
     fn a_wrapped_link_is_one_link() {

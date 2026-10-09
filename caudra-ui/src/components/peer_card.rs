@@ -538,7 +538,7 @@ mod tests {
     const WORKSPACE: &str = "/workspace/review";
     const REASON: &str = "The destination is waiting for the reader to review this message.";
     const HOSTILE: &str = "**literal**\x1b]8;;evil\x07\r\n\t\u{85}\u{202e}";
-    const STALE_ANNOTATION: &str = "1 lines";
+    const STALE_ANNOTATION: &str = "1 line";
     const RAW_JSON: &str = "{\"status\":\"unknown\"}";
     const TOPIC: &str = "ci.failures";
     const OTHER_TOPIC: &str = "deploy.prod";

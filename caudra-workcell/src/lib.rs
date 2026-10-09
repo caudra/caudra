@@ -245,6 +245,8 @@ const GIT_REPOSITORY_NO: &str = "no";
 /// A diff on its own reads as a change that landed, so a result that changed
 /// nothing says so where the model cannot miss it.
 const NOT_APPLIED: &str = "[not applied: nothing was written]";
+const CODE_ONE_LINE: &str = "1 line";
+const CODE_LINES: &str = "lines";
 
 #[derive(Debug, thiserror::Error)]
 pub enum HostError {
@@ -1465,7 +1467,10 @@ fn input_header(input: &Input) -> String {
         Input::Websearch(input) => input.query.clone(),
         Input::Webfetch(input) => input.url.clone(),
         Input::Shell(input) => input.command.lines().next().unwrap_or_default().into(),
-        Input::Code(input) => format!("{} lines", input.code.lines().count()),
+        Input::Code(input) => match input.code.lines().count() {
+            1 => CODE_ONE_LINE.to_owned(),
+            count => format!("{count} {CODE_LINES}"),
+        },
         Input::CodeMap(input) => input.path.clone().unwrap_or_else(|| ".".into()),
         Input::CodeContext(input) => search_header(&input.task, input.path.as_deref()),
         Input::CodeRefs(input) => search_header(&input.symbol, input.path.as_deref()),

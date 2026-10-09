@@ -672,6 +672,7 @@ fn search(store: &MemoryStore, query: &str) -> Result<MemoryOutput, ToolError> {
         .into_iter()
         .map(|hit| MemoryHit {
             seq: hit.seq,
+            path: local_file(store, &hit.name).map(|file| file.to_string_lossy().into_owned()),
             name: hit.name,
             heading: hit.heading,
             line: hit.line,
@@ -1291,6 +1292,11 @@ mod tests {
         );
         assert_eq!(hits[1].heading, "Release");
         assert_eq!(hits[1].line.as_deref(), Some("A flaky upload retries."));
+        let release = notes.dir.join("release.md");
+        assert_eq!(
+            hits[1].path.as_deref(),
+            Some(release.to_string_lossy().as_ref())
+        );
     }
 
     #[test]

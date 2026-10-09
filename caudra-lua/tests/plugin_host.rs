@@ -2998,7 +2998,7 @@ caudra.api.register_tool({{
     assert_eq!(
         out,
         format!(
-            "child_done/5 items stream_done/streamed line/1 lines \
+            "child_done/5 items stream_done/streamed line/1 line \
              {USAGE_OUTPUT}/{USAGE_VALUE} boom/nil"
         )
     );
@@ -4715,7 +4715,7 @@ fn restore_rejects_an_error_that_never_reached_the_tool() {
 #[test_case::test_case(
     "memory",
     serde_json::json!({"command": "write", "path": "n.md", "content": "gamma"}),
-    "wrote n.md (1 lines)",
+    "wrote n.md (1 line)",
     &["gamma"]
     ; "memory_write_restores_saved_content"
 )]

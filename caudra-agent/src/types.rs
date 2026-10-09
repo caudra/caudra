@@ -445,7 +445,7 @@ impl TextOutput {
             Some(kind) if TOKEN_SIZED_KINDS.contains(&kind) => {
                 token_label(estimate_tokens_cached(&self.text))
             }
-            _ => format!("{} lines", self.text.lines().count()),
+            _ => counted(self.text.lines().count(), LINE_NOUN),
         }
     }
 }
@@ -744,9 +744,14 @@ pub struct MemoryLine {
 }
 
 impl MemoryLine {
+    /// `id+n`, the address `zoom` takes.
+    pub fn address(&self) -> String {
+        format!("{}+{}", self.id, self.count)
+    }
+
     /// `id+n|text`, the row the system prompt's view carries.
     fn as_text(&self) -> String {
-        format!("{}+{}|{}", self.id, self.count, self.text)
+        format!("{}|{}", self.address(), self.text)
     }
 }
 
@@ -760,13 +765,21 @@ pub struct MemoryHit {
     /// The body's first line holding a searched word, when it has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line: Option<String>,
+    /// The note's file on this host, so a click can open it. `None` for a
+    /// note held by reference. The model never reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 impl MemoryHit {
-    /// `- 547+1 flaky-tests.md: Flaky tests`, addressed as the entry `zoom`
-    /// reads whole, with the matching line under it.
+    /// `547+1`, the entry `zoom` reads whole.
+    pub fn address(&self) -> String {
+        format!("{}+1", self.seq)
+    }
+
+    /// `- 547+1 flaky-tests.md: Flaky tests`, with the matching line under it.
     fn as_text(&self) -> String {
-        let mut text = format!("{MEMORY_HIT_BULLET}{}+1 {}", self.seq, self.name);
+        let mut text = format!("{MEMORY_HIT_BULLET}{} {}", self.address(), self.name);
         if !self.heading.is_empty() {
             let _ = write!(text, ": {}", self.heading);
         }
@@ -833,6 +846,16 @@ impl MemoryOutput {
         | Self::Lines { notices, .. }
         | Self::Hits { notices, .. }) = self;
         notices
+    }
+
+    /// What the lines or hits cover, read before them. Notes and an index
+    /// have none.
+    pub fn heading(&self) -> String {
+        match self {
+            Self::Lines { heading, .. } => heading.clone(),
+            Self::Hits { query, .. } => format!("{MEMORY_HITS_HEADING} \"{query}\", best first:"),
+            Self::Notes { .. } | Self::Index { .. } => String::new(),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -907,17 +930,17 @@ impl MemoryOutput {
                     })
                     .collect(),
             ),
-            Self::Lines { heading, lines, .. } => (
+            Self::Lines { lines, .. } => (
                 MEMORY_INDEX_SEPARATOR,
                 headed(
-                    heading.clone(),
+                    self.heading(),
                     lines.iter().map(MemoryLine::as_text).collect(),
                 ),
             ),
-            Self::Hits { query, hits, .. } => (
+            Self::Hits { hits, .. } => (
                 MEMORY_INDEX_SEPARATOR,
                 headed(
-                    format!("{MEMORY_HITS_HEADING} \"{query}\", best first:"),
+                    self.heading(),
                     hits.iter().map(MemoryHit::as_text).collect(),
                 ),
             ),
@@ -1856,7 +1879,7 @@ fn written_size(byte_count: usize, lines: &[String]) -> String {
     if lines.is_empty() && byte_count > 0 {
         return format!("{byte_count} bytes");
     }
-    format!("{} lines", lines.len())
+    counted(lines.len(), LINE_NOUN)
 }
 
 impl ToolOutput {
@@ -1884,9 +1907,9 @@ impl ToolOutput {
                 let shown = lines.len();
                 Some(
                     if *total_lines == 0 || (*start_line == 1 && shown >= *total_lines) {
-                        format!("{shown} lines")
+                        counted(shown, LINE_NOUN)
                     } else if shown == 0 {
-                        format!("0 of {total_lines} lines")
+                        format!("0 of {}", counted(*total_lines, LINE_NOUN))
                     } else {
                         let end = start_line
                             .saturating_add(shown)
@@ -1920,7 +1943,7 @@ impl ToolOutput {
                 let n = t.text.lines().count();
                 Some(format!("{n} entries"))
             }
-            Self::Index(IndexOutput::File { lines, .. }) => Some(format!("{} lines", lines.len())),
+            Self::Index(IndexOutput::File { lines, .. }) => Some(counted(lines.len(), LINE_NOUN)),
             Self::Index(IndexOutput::Directory {
                 total_count,
                 truncated,
@@ -3916,12 +3939,14 @@ mod tests {
                     name: "flaky-tests.md".into(),
                     heading: "Flaky tests".into(),
                     line: Some("Retry the flaky suite once.".into()),
+                    path: Some("/notes/flaky-tests.md".into()),
                 },
                 MemoryHit {
                     seq: 3,
                     name: "ci.md".into(),
                     heading: String::new(),
                     line: None,
+                    path: None,
                 },
             ]),
             notices: Vec::new(),
@@ -4479,7 +4504,7 @@ mod tests {
         assert_eq!(output.annotation().as_deref(), Some("exit 0"));
     }
 
-    #[test_case(ToolOutput::Plain("ok".into()),                      Some("1 lines")     ; "plain_short_annotates")]
+    #[test_case(ToolOutput::Plain("ok".into()),                      Some("1 line")      ; "plain_short_annotates")]
     #[test_case(ToolOutput::Plain((0..20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n").into()), Some("20 lines") ; "plain_long_annotates")]
     #[test_case(ToolOutput::Plain(String::new().into()),             None                ; "plain_empty_no_annotation")]
     #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 1, lines: vec!["x".into(); 5], total_lines: 5, instructions: None }, Some("5 lines") ; "read_code_full_file")]
