@@ -14,5 +14,9 @@ syntect = { workspace = true }
 tracing = { workspace = true }
 two-face = { workspace = true }
 
+[build-dependencies]
+syntect = { workspace = true }
+two-face = { workspace = true }
+
 [dev-dependencies]
 test-case = { workspace = true }

@@ -2,11 +2,12 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::{Arc, OnceLock, RwLock};
 
+use syntect::dumps::from_uncompressed_data;
 use syntect::highlighting::{
     FontStyle, HighlightIterator, HighlightState, Highlighter as SynHighlighter, Style as SynStyle,
     Theme,
 };
-use syntect::parsing::{ParseState, ScopeStack, SyntaxDefinition, SyntaxReference, SyntaxSet};
+use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 use syntect::util::LinesWithEndings;
 
 use heredoc::Embedding;
@@ -14,7 +15,8 @@ use heredoc::Embedding;
 mod heredoc;
 
 const TOKEN_ALIASES: &[(&str, &str)] = &[("jsx", "js")];
-const RHAI_SYNTAX: &str = include_str!("../syntaxes/rhai.sublime-syntax");
+/// two-face's syntaxes with the bundled Rhai grammar, linked by build.rs.
+const SYNTAX_DUMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/syntaxes.packdump"));
 /// Every shell grammar's scope starts with this, and only shell lines can
 /// hand a heredoc body to another language.
 const SHELL_SCOPE: &str = "source.shell";
@@ -81,18 +83,10 @@ pub fn theme_color(name: &str) -> Option<Rgb> {
 
 pub fn syntax_set() -> &'static SyntaxSet {
     SYNTAX_SET.get_or_init(|| {
-        let syntaxes = two_face::syntax::extra_newlines();
-        match SyntaxDefinition::load_from_str(RHAI_SYNTAX, true, None) {
-            Ok(rhai) => {
-                let mut builder = syntaxes.into_builder();
-                builder.add(rhai);
-                builder.build()
-            }
-            Err(error) => {
-                tracing::error!(%error, "Failed to load bundled Rhai syntax");
-                syntaxes
-            }
-        }
+        from_uncompressed_data(SYNTAX_DUMP).unwrap_or_else(|error| {
+            tracing::error!(%error, "Failed to load the bundled syntax set");
+            two_face::syntax::extra_newlines()
+        })
     })
 }
 
@@ -400,7 +394,12 @@ mod tests {
     use super::*;
     use syntect::easy::ScopeRegionIterator;
     use syntect::highlighting::{Color, ScopeSelectors, StyleModifier, ThemeItem};
+    use syntect::parsing::Scope;
     use test_case::test_case;
+
+    const RHAI_NAME: &str = "Rhai";
+    const RHAI_SCOPE: &str = "source.rhai";
+    const TWO_FACE_TOKEN: &str = "rust";
 
     const PYTHON_BODY: &str = "import os\nprint(os.getcwd())\n";
     const RHAI_SCRIPT: &str = "let meta = #{ name: \"café\", enabled: true };\n/* outer\n/* nested */ still a comment\n*/\nlet report = `status:\n${if meta.enabled { \"ready\" } else { \"waiting\" }}`;\n";
@@ -668,10 +667,10 @@ mod tests {
     }
 
     #[test]
-    fn rhai_grammar_loads() {
-        let syntax = SyntaxDefinition::load_from_str(RHAI_SYNTAX, true, None).unwrap();
-        assert_eq!(syntax.name, "Rhai");
-        assert_eq!(syntax.scope.build_string(), "source.rhai");
+    fn the_bundled_set_links_rhai_into_two_face() {
+        let rhai = syntax_set().find_syntax_by_scope(Scope::new(RHAI_SCOPE).unwrap());
+        assert_eq!(rhai.map(|syntax| syntax.name.as_str()), Some(RHAI_NAME));
+        assert!(syntax_set().find_syntax_by_token(TWO_FACE_TOKEN).is_some());
     }
 
     #[test_case("rhai"; "extension_token")]
