@@ -495,6 +495,8 @@ async fn apply_change(
     rollback: &mut Vec<Rollback>,
     results: &mut Vec<WorkspaceMutationResult>,
 ) -> Result<(), WorkspaceError> {
+    #[cfg(test)]
+    tests::run_workspace_hook(tests::WorkspaceHookPhase::BeforeApply, change.path(), token);
     check_cancelled(token)?;
     match change {
         PreparedChange::Create {
@@ -1206,6 +1208,17 @@ enum PreparedChange {
 }
 
 impl PreparedChange {
+    #[cfg(test)]
+    fn path(&self) -> &Path {
+        match self {
+            Self::Create { path, .. }
+            | Self::Write { path, .. }
+            | Self::Mkdir { path, .. }
+            | Self::Delete { path, .. } => path,
+            Self::Rename { source, .. } => source,
+        }
+    }
+
     fn retained_bytes(&self) -> usize {
         let workspace_path = WorkspacePath::retained_bytes;
         match self {
@@ -3100,6 +3113,7 @@ mod tests {
         #[cfg(unix)]
         CwdOpened,
         BeforeRead,
+        BeforeApply,
     }
     type ListHook = Box<dyn FnOnce(&CancellationToken) + Send>;
     static LIST_HOOKS: OnceLock<Mutex<HashMap<(WorkspaceHookPhase, PathBuf), ListHook>>> =
@@ -4940,23 +4954,21 @@ mod tests {
             )
             .await
             .unwrap();
-        let token = CancellationToken::new();
-        let watcher_token = token.clone();
         let published = root.path().join("rolled-back.txt");
-        let watcher = tokio::spawn(async move {
-            loop {
-                if fs::metadata(&published).await.is_ok() {
-                    watcher_token.cancel();
-                    return;
-                }
-                tokio::task::yield_now().await;
-            }
-        });
+        let (first_published, observed) = sync_channel(1);
+        install_workspace_hook(
+            WorkspaceHookPhase::BeforeApply,
+            prepared.changes[1].path(),
+            move |token| {
+                first_published.send(published.exists()).unwrap();
+                token.cancel();
+            },
+        );
         let error = group
-            .execute_prepared_workspace_mutation(prepared, &token)
+            .execute_prepared_workspace_mutation(prepared, &CancellationToken::new())
             .await
             .unwrap_err();
-        watcher.await.unwrap();
+        assert!(observed.try_recv().unwrap());
         assert_eq!(error.code(), "rolled_back");
         assert!(!root.path().join("rolled-back.txt").exists());
     }
