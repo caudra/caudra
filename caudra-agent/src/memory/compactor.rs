@@ -5,7 +5,8 @@
 //! first, leases each so other runtimes on the same journal leave it alone,
 //! asks the model for its line and stores it. Only a model chosen for the
 //! Memory purpose writes lines, never the chat model standing in for one:
-//! background spend nobody configured is spend nobody expects.
+//! background spend nobody configured is spend nobody expects. The choice
+//! follows the session's chat model, so a switch reaches the next line.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -30,6 +31,7 @@ use tracing::{debug, info, warn};
 use super::store::{MemoryError, MemoryState, MemoryStore, leaf_kind, now_ms};
 use super::tree::{NODE, Part, VIEW, entry_text, scale};
 use crate::agent::requirements::{clean, response_text};
+use crate::agent::task_runner::ModelResolver;
 use crate::nudge::Nudge;
 use crate::types::{AgentEvent, EventSender};
 
@@ -207,6 +209,54 @@ impl Summarizer {
     }
 }
 
+/// Finds the summarizer for a chat model and the provider serving it.
+type Resolve = Arc<dyn Fn(Arc<dyn Provider>, Model) -> Boxed<Option<Summarizer>> + Send + Sync>;
+
+fn resolver(policy: Arc<ModelPolicy>, timeouts: Timeouts) -> Resolve {
+    Arc::new(move |provider, model| {
+        let policy = Arc::clone(&policy);
+        Box::pin(async move { Summarizer::resolve(&provider, &model, &policy, timeouts).await })
+    })
+}
+
+/// The summarizer for the chat model last seen, looked up again only when
+/// the session switches chat model or provider. Lines in progress keep the
+/// summarizer they started with.
+#[derive(Default)]
+struct Choice {
+    chat: Option<(Arc<dyn Provider>, String)>,
+    summarizer: Option<Arc<Summarizer>>,
+}
+
+impl Choice {
+    /// True when the chat model changed since the last look, and with it,
+    /// perhaps, the summarizer.
+    async fn follow(&mut self, chat: &ModelResolver, resolve: &Resolve) -> bool {
+        let (provider, model) = chat();
+        let spec = model.spec();
+        if self
+            .chat
+            .as_ref()
+            .is_some_and(|(seen, seen_spec)| Arc::ptr_eq(seen, &provider) && *seen_spec == spec)
+        {
+            return false;
+        }
+        self.summarizer = resolve(Arc::clone(&provider), Model::clone(&model))
+            .await
+            .map(Arc::new);
+        if let Some(summarizer) = &self.summarizer {
+            info!(
+                chat_model = %spec,
+                model = %summarizer.model.spec(),
+                purpose = %ModelPurpose::Memory,
+                "memory summaries follow the chat model"
+            );
+        }
+        self.chat = Some((provider, spec));
+        true
+    }
+}
+
 /// Builds one memory's lines in the background until dropped.
 pub struct Pump {
     store: Arc<MemoryStore>,
@@ -215,34 +265,27 @@ pub struct Pump {
 }
 
 impl Pump {
-    /// Resolves the summarizer against the chat model, then builds every node
-    /// the view needs. Ends at once, logged, when there is no summarizer.
-    /// `ledger` is for a runtime that records no spend from `events`.
+    /// Builds every node the view needs, each with the summarizer for the
+    /// chat model `chat` names when the node starts. Waits, logged, while
+    /// that chat model has no summarizer. `ledger` is for a runtime that
+    /// records no spend from `events`.
     pub fn start(
         store: Arc<MemoryStore>,
-        chat_provider: Arc<dyn Provider>,
-        chat_model: Model,
+        chat: ModelResolver,
         policy: Arc<ModelPolicy>,
         timeouts: Timeouts,
         events: EventSender,
         ledger: Option<Ledger>,
     ) -> Self {
         let nudge = Nudge::default();
-        let task = smol::spawn({
-            let store = Arc::clone(&store);
-            let nudge = nudge.clone();
-            async move {
-                let Some(summarizer) =
-                    Summarizer::resolve(&chat_provider, &chat_model, &policy, timeouts).await
-                else {
-                    return;
-                };
-                let spend = Spend { events, ledger };
-                Arc::new(Shared::new(store, summarizer, spend, Arc::new(SystemTimer)))
-                    .run(nudge)
-                    .await;
-            }
-        });
+        let shared = Shared::new(
+            Arc::clone(&store),
+            chat,
+            resolver(policy, timeouts),
+            Spend { events, ledger },
+            Arc::new(SystemTimer),
+        );
+        let task = smol::spawn(Arc::new(shared).run(nudge.clone()));
         Self {
             store,
             nudge,
@@ -291,15 +334,22 @@ enum Material {
     Lines(String, String),
 }
 
-/// A node about to be built, with what the model reads for it.
+/// A node about to be built, with what the model reads for it and the
+/// summarizer that writes it.
 struct Job {
     part: Part,
     memory: String,
     material: Material,
+    summarizer: Arc<Summarizer>,
 }
 
 impl Job {
-    fn new(state: &MemoryState, parts: &[Part], part: Part) -> Option<Self> {
+    fn new(
+        state: &MemoryState,
+        parts: &[Part],
+        part: Part,
+        summarizer: &Arc<Summarizer>,
+    ) -> Option<Self> {
         let tree = &state.tree;
         let material = match part.children() {
             None => Material::Entry(part.index),
@@ -312,6 +362,7 @@ impl Job {
             memory: memory_block(&tree.context(parts, &part)),
             part,
             material,
+            summarizer: Arc::clone(summarizer),
         })
     }
 }
@@ -326,7 +377,8 @@ enum Wake {
 /// What a pump's builds share.
 struct Shared {
     store: Arc<MemoryStore>,
-    summarizer: Summarizer,
+    chat: ModelResolver,
+    resolve: Resolve,
     spend: Spend,
     timer: Arc<dyn Timer>,
     /// Unique to this pump, so two pumps never build one node, even in one
@@ -338,7 +390,8 @@ struct Shared {
 impl Shared {
     fn new(
         store: Arc<MemoryStore>,
-        summarizer: Summarizer,
+        chat: ModelResolver,
+        resolve: Resolve,
         spend: Spend,
         timer: Arc<dyn Timer>,
     ) -> Self {
@@ -346,7 +399,8 @@ impl Shared {
             key: CacheKey::memory(store.scope()),
             owner: format!("{}-{:016x}", std::process::id(), fastrand::u64(..)),
             store,
-            summarizer,
+            chat,
+            resolve,
             spend,
             timer,
         }
@@ -358,19 +412,26 @@ impl Shared {
         let mut cooling: HashMap<Part, Task<()>> = HashMap::new();
         let mut held: HashSet<Part> = HashSet::new();
         let mut warned: HashSet<Part> = HashSet::new();
+        let mut choice = Choice::default();
         // Kept across wakes, so a nudge that lands while one is handled waits
         // its turn instead of being lost.
         let mut nudged = nudge.listen();
         loop {
-            match self.load().await {
-                Ok(state) => self.start(
-                    &state,
-                    &mut building,
-                    |part| cooling.contains_key(part) || held.contains(part),
-                    &wake_tx,
-                ),
-                Err(error) => {
-                    warn!(scope = self.store.scope(), %error, "memory not loaded for summaries")
+            if choice.follow(&self.chat, &self.resolve).await {
+                held.clear();
+            }
+            if let Some(summarizer) = &choice.summarizer {
+                match self.load().await {
+                    Ok(state) => self.start(
+                        &state,
+                        summarizer,
+                        &mut building,
+                        |part| cooling.contains_key(part) || held.contains(part),
+                        &wake_tx,
+                    ),
+                    Err(error) => {
+                        warn!(scope = self.store.scope(), %error, "memory not loaded for summaries")
+                    }
                 }
             }
             let woke = future::or(async { wake_rx.recv_async().await.ok() }, async {
@@ -414,6 +475,7 @@ impl Shared {
     fn start(
         self: &Arc<Self>,
         state: &MemoryState,
+        summarizer: &Arc<Summarizer>,
         building: &mut HashMap<Part, Task<()>>,
         waiting: impl Fn(&Part) -> bool,
         wake: &Sender<Wake>,
@@ -430,7 +492,7 @@ impl Shared {
             {
                 continue;
             }
-            let Some(job) = Job::new(state, &parts, part.clone()) else {
+            let Some(job) = Job::new(state, &parts, part.clone(), summarizer) else {
                 continue;
             };
             let task = smol::spawn({
@@ -501,14 +563,19 @@ impl Shared {
             }
             Material::Lines(first, second) => merge(first, second),
         };
-        let line = self.line(&job.memory, step).await?;
-        Ok(self.store_line(&job.part, line).await?)
+        let line = self.line(&job.summarizer, &job.memory, step).await?;
+        Ok(self.store_line(&job.part, &job.summarizer, line).await?)
     }
 
     /// Up to [`TRIES`] replies in one conversation, each one too long
     /// answered with how much of it fits. The first that fits wins, else the
     /// shortest, cut to fit.
-    async fn line(&self, memory: &str, step: String) -> Result<String, BuildError> {
+    async fn line(
+        &self,
+        summarizer: &Summarizer,
+        memory: &str,
+        step: String,
+    ) -> Result<String, BuildError> {
         let mut messages = vec![Message {
             role: Role::User,
             content: vec![
@@ -521,7 +588,7 @@ impl Shared {
         }];
         let mut shortest = String::new();
         for _ in 0..TRIES {
-            let reply = self.ask(&messages).await?;
+            let reply = self.ask(summarizer, &messages).await?;
             if reply.len() <= NODE {
                 return Ok(reply);
             }
@@ -541,8 +608,11 @@ impl Shared {
     }
 
     /// One reply, trimmed. Its spend is reported whatever it says.
-    async fn ask(&self, messages: &[Message]) -> Result<String, BuildError> {
-        let Summarizer { provider, model } = &self.summarizer;
+    async fn ask(
+        &self,
+        Summarizer { provider, model }: &Summarizer,
+        messages: &[Message],
+    ) -> Result<String, BuildError> {
         // A provider fails a request whose event channel closed.
         let (events, _events) = flume::unbounded();
         let tools = json!([]);
@@ -601,9 +671,14 @@ impl Shared {
             .await
     }
 
-    async fn store_line(&self, part: &Part, line: String) -> Result<bool, MemoryError> {
+    async fn store_line(
+        &self,
+        part: &Part,
+        summarizer: &Summarizer,
+        line: String,
+    ) -> Result<bool, MemoryError> {
         let (level, index, owner) = (part.level, part.index, self.owner.clone());
-        let (model, now_ms) = (self.summarizer.model.spec(), self.timer.now_ms());
+        let (model, now_ms) = (summarizer.model.spec(), self.timer.now_ms());
         self.journal(move |journal, scope| {
             journal.store_node(scope, level, index, &owner, &line, &model, now_ms)
         })
@@ -744,7 +819,8 @@ mod tests {
     const ONE_CONVERSATION: &str = "every try of a node is one conversation";
     const RETRIED_EARLY: &str = "a passing failure was tried again before its timer fired";
     const LEASE_KEPT: &str = "a failed node kept its lease";
-    const STOOD_IN: &str = "the pump ran with no model chosen for memory work";
+    const STOOD_IN: &str = "a chat model with no model chosen for memory work got a summarizer";
+    const SWITCH_MISSED: &str = "a line after a chat model switch went to the old summarizer";
 
     /// Answers with its script, then with a fresh line each request, and
     /// keeps every request with the line it answered.
@@ -887,15 +963,39 @@ mod tests {
         events: Sender<Envelope>,
         ledger: Option<Ledger>,
     ) -> (Nudge, Task<()>) {
-        let summarizer = Summarizer {
-            provider: provider.clone(),
-            model: Model::from_spec(FAST_SPEC).unwrap(),
-        };
+        let chat = Arc::new(Mutex::new(Arc::clone(provider)));
+        spawn_following(store, &chat, timer, events, ledger)
+    }
+
+    /// A pump whose session chats through whichever provider `chat` holds,
+    /// and whose summarizer is the Fast model on that provider.
+    fn spawn_following(
+        store: Arc<MemoryStore>,
+        chat: &Arc<Mutex<Arc<ScriptedProvider>>>,
+        timer: &Arc<ManualTimer>,
+        events: Sender<Envelope>,
+        ledger: Option<Ledger>,
+    ) -> (Nudge, Task<()>) {
+        let chat: ModelResolver = Arc::new({
+            let chat = Arc::clone(chat);
+            move || {
+                let provider: Arc<dyn Provider> = chat.lock().unwrap().clone();
+                (provider, Arc::new(Model::from_spec(CHAT_SPEC).unwrap()))
+            }
+        });
+        let resolve: Resolve = Arc::new(|provider, _| {
+            Box::pin(async move {
+                Some(Summarizer {
+                    provider,
+                    model: Model::from_spec(FAST_SPEC).unwrap(),
+                })
+            })
+        });
         let spend = Spend {
             events: EventSender::new(events, MEMORY_EVENT_RUN_ID),
             ledger,
         };
-        let shared = Shared::new(store, summarizer, spend, timer.clone());
+        let shared = Shared::new(store, chat, resolve, spend, timer.clone());
         let nudge = Nudge::default();
         (nudge.clone(), smol::spawn(Arc::new(shared).run(nudge)))
     }
@@ -1202,37 +1302,60 @@ mod tests {
     }
 
     /// The chat model never stands in: with nothing chosen for memory work,
-    /// or a choice that does not resolve, the pump ends before asking.
+    /// or a choice that does not resolve, there is no summarizer to start a
+    /// node with.
     #[test_case(None ; "nothing_chosen")]
     #[test_case(Some(FAST_SPEC) ; "choice_not_allowed")]
-    fn without_a_model_for_memory_work_nothing_is_asked(bound: Option<&str>) {
+    fn without_a_model_for_memory_work_none_is_chosen(bound: Option<&str>) {
         smol::block_on(async {
-            let fixture = Fixture::new(1);
-            let state = fixture.state_dir();
+            let state = TempDir::new().unwrap();
+            let state = StateDir::from_path(state.path().to_path_buf());
             if let Some(spec) = bound {
                 let binding = Binding::Exact(spec.to_owned());
                 model_registry::set_binding_and_persist(ModelPurpose::Memory, binding, &state)
                     .unwrap();
             }
-            let provider = ScriptedProvider::new([]);
-            let (events_tx, events) = flume::unbounded();
-            let _pump = Pump::start(
-                Arc::clone(&fixture.store),
-                provider.clone(),
-                Model::from_spec(CHAT_SPEC).unwrap(),
-                Arc::new(ModelPolicy::new(&[ONLY_ANTHROPIC.to_owned()], &[]).unwrap()),
-                Timeouts::default(),
-                EventSender::new(events_tx, MEMORY_EVENT_RUN_ID),
-                None,
-            );
+            let provider: Arc<dyn Provider> = ScriptedProvider::new([]);
+            let chat: ModelResolver = Arc::new(move || {
+                let model = Model::from_spec(CHAT_SPEC).unwrap();
+                (Arc::clone(&provider), Arc::new(model))
+            });
+            let policy = ModelPolicy::new(&[ONLY_ANTHROPIC.to_owned()], &[]).unwrap();
+            let resolve = resolver(Arc::new(policy), Timeouts::default());
+            let mut choice = Choice::default();
 
-            let ended = events.recv_async().await.is_err();
+            let looked = choice.follow(&chat, &resolve).await;
 
             if bound.is_some() {
                 model_registry::clear_binding_and_persist(ModelPurpose::Memory, &state).unwrap();
             }
-            assert!(ended, "{STOOD_IN}");
-            assert!(provider.calls().is_empty(), "{STOOD_IN}");
+            assert!(looked);
+            assert!(choice.summarizer.is_none(), "{STOOD_IN}");
+        });
+    }
+
+    /// A switch of chat model reaches the next attempt at a node, and the old
+    /// summarizer is asked nothing more. The node waits out a rate limit, so
+    /// the switch lands while nothing is being built.
+    #[test]
+    fn the_next_line_follows_a_switched_chat_model() {
+        smol::block_on(async {
+            let fixture = Fixture::new(1);
+            let before = ScriptedProvider::new([Err(AgentError::api(RATE_LIMITED, SLOW_DOWN))]);
+            let after = ScriptedProvider::new([]);
+            let chat = Arc::new(Mutex::new(Arc::clone(&before)));
+            let (timer, waits) = ManualTimer::new();
+            let (events_tx, events) = flume::unbounded();
+            let store = Arc::clone(&fixture.store);
+            let _pump = spawn_following(store, &chat, &timer, events_tx, None);
+            while waits.recv_async().await.unwrap() != RETRY {}
+
+            *chat.lock().unwrap() = Arc::clone(&after);
+            timer.fire(RETRY);
+            stored(&events, 1, &[]).await;
+
+            let calls = (before.calls().len(), after.calls().len());
+            assert_eq!(calls, (1, 1), "{SWITCH_MISSED}");
         });
     }
 }

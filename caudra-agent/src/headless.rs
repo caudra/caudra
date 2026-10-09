@@ -2924,14 +2924,27 @@ async fn spawn_prepared_session(
                 "Failed to attach conversation permissions: {error}"
             ))
         })?;
+    // Workflow agents and memory summaries resolve the provider when they
+    // start work, so a model switched mid-session reaches work that outlives
+    // the turn which switched it.
+    let live_model = Arc::new(ArcSwap::from_pointee((
+        Arc::clone(&provider),
+        Arc::new(model.clone()),
+    )));
+    let live_resolver = || -> ModelResolver {
+        let live_model = Arc::clone(&live_model);
+        Arc::new(move || {
+            let live = live_model.load();
+            (Arc::clone(&live.0), Arc::clone(&live.1))
+        })
+    };
     let memory_pump = memory
         .store()
         .filter(|_| params.config.summarize_memory)
         .map(|memory_store| {
             Pump::start(
                 Arc::clone(memory_store),
-                Arc::clone(&provider),
-                model.clone(),
+                live_resolver(),
                 Arc::clone(&params.model_policy),
                 params.timeouts,
                 EventSender::new(agent_tx.clone(), MEMORY_EVENT_RUN_ID),
@@ -2999,22 +3012,10 @@ async fn spawn_prepared_session(
         task_id: None,
     };
 
-    // Workflow agents resolve the provider at launch, so a model switched
-    // mid-session reaches runs that outlive the turn which switched it.
-    let live_model = Arc::new(ArcSwap::from_pointee((
-        Arc::clone(&provider),
-        Arc::new(model.clone()),
-    )));
     let mut runtime = match params.workflow_mode.take() {
         Some(mode) => {
             let mode = routed_mode(&mode_route, mode);
-            let model: ModelResolver = Arc::new({
-                let live_model = Arc::clone(&live_model);
-                move || {
-                    let live = live_model.load();
-                    (Arc::clone(&live.0), Arc::clone(&live.1))
-                }
-            });
+            let model = live_resolver();
             let subagent_cancels = Arc::new(CancelMap::new());
             let host = WorkflowHostContext::from_agent_params(
                 &base,

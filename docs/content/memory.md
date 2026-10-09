@@ -115,7 +115,7 @@ Subagents get the `memory` tool without the view.
 
 ## Summaries and spend
 
-The summaries come from the Memory model job. It follows Fast unless you bind it to another model in `/model`, as [Model jobs](/docs/providers/#model-jobs) describes. It never falls back to the Chat model. When neither job is bound and the Chat model's provider offers no Fast model of its own, or when the model cannot be loaded, nothing is summarized. The model is chosen when a session starts, so a new binding applies from the next session on.
+The summaries come from the Memory model job. It follows Fast unless you bind it to another model in `/model`, as [Model jobs](/docs/providers/#model-jobs) describes. It never falls back to the Chat model. When neither job is bound and the Chat model's provider offers no Fast model of its own, or when the model cannot be loaded, nothing is summarized. The model is chosen again each time you switch the Chat model, and the next line uses it, while a line being written finishes on the model it started with. Switching to a Chat model with no Memory model pauses summaries until you switch to one that has. A new binding applies after your next Chat model switch, or in the next session.
 
 Summaries are written while a TUI, SDK, or [ACP](/docs/acp/) session runs, two at a time. A one-shot `--print` run reads the view and writes notes, and leaves the summaries to the next long-running session.
 

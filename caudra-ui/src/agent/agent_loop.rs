@@ -5,7 +5,7 @@ use crate::app::background_delivery::DeliveryFence;
 use crate::app::file_revert::RecorderSlot;
 use arc_swap::ArcSwap;
 use caudra_agent::agent;
-use caudra_agent::agent::task_runner::{HostExtras, WorkflowHostContext};
+use caudra_agent::agent::task_runner::{HostExtras, ModelResolver, WorkflowHostContext};
 use caudra_agent::background::BackgroundTasks;
 use caudra_agent::context::{
     BuiltinToolsInput, ContextCapture, ContextInventory, ContextMcpInventory, ContextPublisher,
@@ -1027,12 +1027,17 @@ impl AgentLoop {
         {
             return;
         }
-        let slot = self.model_slot.load();
+        let chat: ModelResolver = Arc::new({
+            let model_slot = Arc::clone(&self.model_slot);
+            move || {
+                let slot = model_slot.load();
+                (Arc::clone(&slot.provider), Arc::new(slot.model.clone()))
+            }
+        });
         self.memory_pump = store.map(|store| {
             Pump::start(
                 Arc::clone(store),
-                Arc::clone(&slot.provider),
-                slot.model.clone(),
+                chat,
                 Arc::clone(&self.model_policy),
                 self.timeouts,
                 EventSender::new(self.agent_tx.clone(), MEMORY_EVENT_RUN_ID),
