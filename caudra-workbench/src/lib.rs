@@ -4781,6 +4781,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
     use std::path::{Path, PathBuf};
+    use std::thread;
     use std::time::{Duration, Instant, SystemTime};
     use tempfile::TempDir;
     use test_case::test_case;
@@ -4869,6 +4870,18 @@ mod tests {
     const MESSAGE_NOT_SHOWN: &str = "the commit tab does not say what the commit says";
     const CLICK_REOPENED: &str = "a click on an open commit must close it, not show it again";
     const INITIAL_MESSAGE: &str = "initial";
+    const WATCH_TIMEOUT: Duration = Duration::from_secs(10);
+    const WATCH_NOT_LIVE: &str = "the filesystem watcher did not finish registering";
+    const WATCH_NOT_RECONCILED: &str = "watch registration did not reconcile source control";
+    const WATCH_NO_COMMIT: &str = "a Git-only commit did not reach the graph through tick";
+    const WATCH_NO_CHANGE: &str = "a Git-only commit did not reach the collapsed pane through tick";
+    const WATCH_TOUCHED_FILES: &str = "Git metadata must not mark working files as touched";
+    const GRAPH_STALE: &str = "expanding the graph must reread its cached history";
+    const GRAPH_READ_WHILE_COLLAPSED: &str = "a collapsed graph must defer reading new history";
+    const GRAPH_SELECTION_LOST: &str = "refreshing history must retain the selected identity";
+    const WATCH_SUBDIRECTORY: &str = "src";
+    const LINKED_GIT_DIRECTORY: &str = ".git/worktrees/linked";
+    const LINKED_HEAD: &str = "ref: refs/heads/linked\n";
     const SUBJECT: &str = "rewrite the scheduler";
     const BODY: &str = "The old one woke every tick.";
     const COMMIT_NOT_LISTED: &str = "the graph does not list what the commit changed";
@@ -6849,8 +6862,12 @@ mod tests {
     }
 
     fn commit_message(workbench: &mut Workbench, message: &str) {
-        let workdir = workbench.scm.workdir().expect("a repository").to_path_buf();
-        let repo = gix::open(&workdir).expect("a repository");
+        write_commit(workbench.scm.workdir().expect("a repository"), message);
+        workbench.handle_key(key(keys::REFRESH.code));
+    }
+
+    fn write_commit(workdir: &Path, message: &str) -> String {
+        let repo = gix::open(workdir).expect("a repository");
         let index = repo.index_or_empty().expect("an index");
         let entries: Vec<Staged> = index
             .entries()
@@ -6870,8 +6887,180 @@ mod tests {
             time: "1700000000 +0000",
         };
         repo.commit_as(who, who, "HEAD", message, id, repo.head_id().ok())
-            .expect("a commit");
-        workbench.handle_key(key(keys::REFRESH.code));
+            .expect("a commit")
+            .to_string()
+    }
+
+    fn linked_worktree(common: &Path) -> TempDir {
+        let dir = TempDir::new().expect("a linked worktree");
+        let git_dir = common.join(LINKED_GIT_DIRECTORY);
+        fs::create_dir_all(&git_dir).unwrap();
+        fs::write(git_dir.join("HEAD"), LINKED_HEAD).unwrap();
+        fs::write(git_dir.join("commondir"), "../..\n").unwrap();
+        fs::write(
+            git_dir.join("gitdir"),
+            format!("{}\n", dir.path().join(".git").display()),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join(".git"),
+            format!("gitdir: {}\n", git_dir.display()),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn tick_until(
+        workbench: &mut Workbench,
+        ready: impl Fn(&Workbench, bool) -> bool,
+        failure: &str,
+    ) {
+        let deadline = Instant::now() + WATCH_TIMEOUT;
+        loop {
+            let (changed, _) = workbench.tick();
+            if ready(workbench, changed) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "{failure}");
+            thread::yield_now();
+        }
+    }
+
+    fn settle_watch_registration(workbench: &mut Workbench) {
+        let deadline = Instant::now() + WATCH_TIMEOUT;
+        while !workbench.watch.as_mut().expect(WATCH_NOT_LIVE).is_live() {
+            assert!(Instant::now() < deadline, "{WATCH_NOT_LIVE}");
+            thread::yield_now();
+        }
+        tick_until(workbench, |_, changed| changed, WATCH_NOT_RECONCILED);
+        assert!(!workbench.tick().0, "{WATCH_NOT_RECONCILED}");
+    }
+
+    #[test_case(false, false; "repository_root")]
+    #[test_case(false, true; "repository_subdirectory")]
+    #[test_case(true, false; "linked_worktree_root")]
+    #[test_case(true, true; "linked_worktree_subdirectory")]
+    fn git_only_commits_reach_the_graph_through_tick(linked: bool, nested: bool) {
+        let (dir, mut workbench) = repository();
+        let linked = linked.then(|| linked_worktree(dir.path()));
+        let root = linked.as_ref().unwrap_or(&dir).path();
+        let root = if nested {
+            let root = root.join(WATCH_SUBDIRECTORY);
+            fs::create_dir(&root).unwrap();
+            root
+        } else {
+            root.to_path_buf()
+        };
+        workbench.open(&root);
+        settle_watch_registration(&mut workbench);
+        assert!(workbench.scm_log().is_empty());
+
+        let first = write_commit(workbench.scm.workdir().unwrap(), INITIAL_MESSAGE);
+        tick_until(
+            &mut workbench,
+            |workbench, _| {
+                workbench
+                    .scm_log()
+                    .first()
+                    .is_some_and(|commit| first.starts_with(&commit.id))
+            },
+            WATCH_NO_COMMIT,
+        );
+        let first = workbench.scm_log()[0].id.clone();
+        assert!(workbench.scm.reveal_commit(&first));
+
+        let second = write_commit(workbench.scm.workdir().unwrap(), SUBJECT);
+        tick_until(
+            &mut workbench,
+            |workbench, _| {
+                workbench
+                    .scm_log()
+                    .first()
+                    .is_some_and(|commit| second.starts_with(&commit.id))
+            },
+            WATCH_NO_COMMIT,
+        );
+        assert_eq!(workbench.scm_log().len(), 2, "{WATCH_NO_COMMIT}");
+        assert_eq!(
+            workbench.scm.selected_commit().map(|commit| &commit.id),
+            Some(&first),
+            "{GRAPH_SELECTION_LOST}"
+        );
+        assert!(workbench.touched.is_empty(), "{WATCH_TOUCHED_FILES}");
+    }
+
+    #[test_case(false; "change_selection")]
+    #[test_case(true; "graph_header_selection")]
+    fn expanding_a_graph_rereads_nonempty_history(select_commit: bool) {
+        let (_dir, mut workbench) = repository();
+        commit_all(&mut workbench);
+        settle_watch_registration(&mut workbench);
+        let first = workbench.scm_log()[0].id.clone();
+        if select_commit {
+            assert!(workbench.scm.reveal_commit(&first));
+        }
+        workbench.scm.set_collapsed(Section::Graph, true);
+        let selected = selected_change(&workbench);
+        let cursor = workbench.scm.cursor();
+
+        let second = write_commit(workbench.scm.workdir().unwrap(), SUBJECT);
+        tick_until(&mut workbench, |_, changed| changed, WATCH_NO_CHANGE);
+        assert_eq!(workbench.scm_log().len(), 1, "{GRAPH_READ_WHILE_COLLAPSED}");
+        assert_eq!(
+            workbench.scm_log()[0].id,
+            first,
+            "{GRAPH_READ_WHILE_COLLAPSED}"
+        );
+
+        workbench.scm.set_collapsed(Section::Graph, false);
+
+        assert!(
+            second.starts_with(&workbench.scm_log()[0].id),
+            "{GRAPH_STALE}"
+        );
+        assert_eq!(workbench.scm_log().len(), 2, "{GRAPH_STALE}");
+        assert_eq!(workbench.scm.cursor(), cursor, "{GRAPH_SELECTION_LOST}");
+        assert_eq!(
+            selected_change(&workbench),
+            selected,
+            "{GRAPH_SELECTION_LOST}"
+        );
+    }
+
+    #[test]
+    fn revealing_a_commit_in_a_collapsed_graph_uses_its_refreshed_row() {
+        let (_dir, mut workbench) = repository();
+        commit_all(&mut workbench);
+        let first = workbench.scm_log()[0].id.clone();
+        workbench.scm.set_collapsed(Section::Graph, true);
+        let second = write_commit(workbench.scm.workdir().unwrap(), SUBJECT);
+
+        assert!(workbench.scm.reveal_commit(&first));
+
+        assert!(
+            second.starts_with(&workbench.scm_log()[0].id),
+            "{GRAPH_STALE}"
+        );
+        assert_eq!(
+            workbench.scm.selected_commit().map(|commit| &commit.id),
+            Some(&first),
+            "{GRAPH_SELECTION_LOST}"
+        );
+    }
+
+    #[test_case(false; "already_expanded")]
+    #[test_case(true; "collapsed")]
+    fn opening_an_empty_graph_initializes_its_history(collapsed: bool) {
+        let (_dir, mut workbench) = repository();
+        workbench.scm.set_collapsed(Section::Graph, collapsed);
+        let first = write_commit(workbench.scm.workdir().unwrap(), INITIAL_MESSAGE);
+
+        workbench.scm.set_collapsed(Section::Graph, false);
+
+        assert!(
+            first.starts_with(&workbench.scm_log()[0].id),
+            "{GRAPH_STALE}"
+        );
     }
 
     #[test]

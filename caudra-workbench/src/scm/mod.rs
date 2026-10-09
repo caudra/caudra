@@ -489,13 +489,14 @@ impl Scm {
     }
 
     pub fn set_collapsed(&mut self, section: Section, collapsed: bool) {
+        let was_collapsed = self.is_collapsed(section);
         self.sections[section.index()].collapsed = collapsed;
         if collapsed && self.cursor.section == section {
             self.cursor.row = None;
         }
         // The log is only walked while the graph is open, so opening it is the
         // moment that walk has to happen.
-        if !collapsed && section == Section::Graph && self.log.is_empty() {
+        if !collapsed && section == Section::Graph && (was_collapsed || self.log.is_empty()) {
             self.refresh();
         }
         self.follow_cursor();
@@ -1186,13 +1187,16 @@ impl Scm {
     /// it. Reports whether it found one, so a caller can say so rather than
     /// moving the reader somewhere they did not ask to go.
     pub fn reveal_commit(&mut self, id: &str) -> bool {
-        let Some(row) = (0..self.sections[Section::Graph.index()].rows.len()).find(|row| {
-            self.identity(Section::Graph, *row)
-                .is_some_and(|identity| identity.starts_with(id) || id.starts_with(&identity))
-        }) else {
+        let Some(identity) = (0..self.sections[Section::Graph.index()].rows.len())
+            .filter_map(|row| self.identity(Section::Graph, row))
+            .find(|identity| identity.starts_with(id) || id.starts_with(identity))
+        else {
             return false;
         };
         self.set_collapsed(Section::Graph, false);
+        let Some(row) = self.row_of(Section::Graph, &identity) else {
+            return false;
+        };
         self.cursor = Cursor {
             section: Section::Graph,
             row: Some(row),
